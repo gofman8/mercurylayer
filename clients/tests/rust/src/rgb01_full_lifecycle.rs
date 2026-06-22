@@ -55,7 +55,7 @@ async fn wait_for_address(client_config: &ClientConfig, address: &str, amount: u
 fn setup_rgb_wallet_and_issue(data_dir: &str, issue: bool) -> Result<(RgbWallet, Option<String>)> {
     let _ = fs::create_dir_all(data_dir);
     let mnemonic = RgbWallet::generate_mnemonic(NETWORK)?;
-    let mut rgb = RgbWallet::open(data_dir, &mnemonic, NETWORK, ELECTRUM_URL)?;
+    let mut rgb = RgbWallet::open(data_dir, &mnemonic, NETWORK, ELECTRUM_URL, RGB_PROXY)?;
 
     // Fund the RGB (BDK) wallet so it can create colorable UTXOs and pay witness fees.
     let address = rgb.get_address()?;
@@ -238,7 +238,6 @@ pub async fn execute() -> Result<()> {
     let _ = fs::remove_dir_all("./rgb-data");
 
     env::set_var("ML_NETWORK", "regtest");
-    let _ = RGB_PROXY; // transport endpoint for proxy-based consignment exchange (in-band used here)
 
     let client_config = mercuryrustlib::client_config::load().await;
 

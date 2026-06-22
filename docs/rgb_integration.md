@@ -31,20 +31,28 @@ signature-count rules already guarantee is the latest owner's.
 
 | Crate / module | Role | Notes |
 |---|---|---|
-| `rgb-lib` fork ([`UTEXO-Protocol/rgb-lib@feat/statechain`]) | RGB primitives | adds 3 thin methods (below) |
+| `rgb-lib` fork ([`UTEXO-Protocol/rgb-lib@feat/statechain`]) | RGB primitives | adds **1** method (below) |
 | `clients/libs/rust-rgb` (`mercury-rgb`) | bridge | string-only API; isolates RGB's `bitcoin`/`bdk` from Mercury's `bitcoin 0.30` |
 | `lib` (`mercurylib`) | core | colored-tx PSBT + sighash; relaxes single-output checks |
 | `clients/libs/rust` (`mercuryrustlib`) | orchestration | `rgb.rs`: build → color → blind-MuSig2-sign |
 | `clients/tests/rust` | E2E | `rgb01_full_lifecycle.rs` |
 
-### rgb-lib fork additions (`src/wallet/rust_only.rs`)
+### rgb-lib fork addition (`src/wallet/rust_only.rs`)
+
+Only **one** method is added, because it has no public equivalent:
 
 - `fund_statechain_utxo(address, amount_sat, contract_id, rgb_amount, fee_rate, blinding)` — deposit:
-  builds/colors/signs the funding tx that pays the statechain address and assigns the asset to it.
-- `color_statechain_psbt(psbt, contract_id, output_map, blinding)` — colors a Mercury-built PSBT
-  (inserts the OP_RETURN opret commitment), returns the modified PSBT + consignment bytes.
-- `accept_consignment(consignment, txid, vout, blinding)` — validates/accepts a consignment passed
-  in-band (rather than via the proxy), like `accept_transfer` but from bytes.
+  builds/colors/signs the funding tx that spends a colored UTXO, pays the statechain address and
+  assigns the asset to it. (rgb-lib has no public way to send a colored UTXO to an externally-owned
+  address — its `send`/`witness_receive` only target the wallet's own invoices.)
+
+Coloring and accepting use **only the public rgb-lib API**, exactly like rgb-lightning-node:
+
+- color: `color_psbt_and_consume` + `ColoringInfo`/`AssetColoringInfo` (done in the `mercury-rgb`
+  bridge via a base64-PSBT round-trip — the same `RgbLibPsbt::from_str(psbt.to_string())` trick RLN
+  uses).
+- accept: the in-band consignment bytes are re-posted to the local RGB proxy (`post_consignment`)
+  and validated via `accept_transfer` — no rgb-lib change needed.
 
 ### mercurylib additions (`lib/src/transaction.rs`)
 

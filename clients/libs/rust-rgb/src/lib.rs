@@ -6,6 +6,12 @@
 //! `bitcoin 0.30`. The only data crossing this boundary is strings: base64 PSBTs, hex txids and
 //! base64 consignments.
 //!
+//! This bridge uses only the **public** rgb-lib API - the same special-usage methods that
+//! rgb-lightning-node uses (`color_psbt_and_consume`, `post_consignment`, `accept_transfer`) - so
+//! the rgb-lib dependency needs no source changes for coloring/accepting. The single statechain
+//! addition in the rgb-lib fork is `fund_statechain_utxo` (deposit binding), which has no public
+//! equivalent because it spends a colored UTXO to an externally-owned (statechain) address.
+//!
 //! Model (RGB-over-statechain): the asset stays bound to the **statechain UTXO** (the `Tx0`
 //! outpoint) throughout the coin's off-chain life. Each Mercury transfer produces a *colored*
 //! backup transaction whose RGB transition closes the seal on the statechain UTXO and re-assigns
@@ -14,18 +20,21 @@
 //! the latest backup transaction. This mirrors how RGB is used over Lightning commitment txs.
 
 use std::collections::HashMap;
+use std::fs;
+use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rgb_lib::bitcoin::psbt::Psbt as RgbPsbt;
 use rgb_lib::wallet::{
-    rust_only::{check_indexer_url, IndexerProtocol},
-    RgbWalletOpsOffline, RgbWalletOpsOnline, SinglesigKeys, Wallet,
+    rust_only::{check_indexer_url, AssetColoringInfo, ColoringInfo, IndexerProtocol},
+    RgbWalletOpsOffline, RgbWalletOpsOnline, SinglesigKeys, TransportEndpoint, Wallet,
 };
 use rgb_lib::{
     generate_keys, restore_keys,
     keys::WitnessVersion,
     wallet::{DatabaseType, Online, OnlineOptions, WalletData},
-    Assignment, BitcoinNetwork,
+    Assignment, BitcoinNetwork, ContractId, FileContent, RgbTransport,
 };
 
 /// An rgb-lib wallet wired for use alongside a Mercury Layer wallet.
@@ -33,6 +42,8 @@ pub struct RgbWallet {
     wallet: Wallet,
     online: Online,
     indexer_url: String,
+    /// RGB proxy transport endpoint, e.g. `rpc://127.0.0.1:3000/json-rpc`.
+    proxy: String,
 }
 
 fn map_network(network: &str) -> Result<BitcoinNetwork> {
@@ -45,6 +56,14 @@ fn map_network(network: &str) -> Result<BitcoinNetwork> {
     })
 }
 
+fn unique_tmp(prefix: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), unique))
+}
+
 impl RgbWallet {
     /// Generate a fresh mnemonic for a new RGB wallet (taproot keychain).
     pub fn generate_mnemonic(network: &str) -> Result<String> {
@@ -53,12 +72,14 @@ impl RgbWallet {
     }
 
     /// Open (creating if needed) an rgb-lib wallet from a mnemonic and bring it online against the
-    /// given electrum `indexer_url`.
+    /// given electrum `indexer_url`. `proxy` is the RGB proxy transport endpoint
+    /// (e.g. `rpc://127.0.0.1:3000/json-rpc`), used for consignment exchange.
     pub fn open(
         data_dir: &str,
         mnemonic: &str,
         network: &str,
         indexer_url: &str,
+        proxy: &str,
     ) -> Result<Self> {
         let bitcoin_network = map_network(network)?;
 
@@ -90,6 +111,7 @@ impl RgbWallet {
             wallet,
             online,
             indexer_url: indexer_url.to_string(),
+            proxy: proxy.to_string(),
         })
     }
 
@@ -137,8 +159,9 @@ impl RgbWallet {
     /// with the OP_RETURN opret commitment added) and the consignment (base64) to relay to the
     /// receiver.
     ///
-    /// `output_map` maps *pre-coloring* output index -> asset amount. `blinding` is the
-    /// deterministic seal blinding (must be shared with the receiver so it can accept).
+    /// Uses the public `color_psbt_and_consume` (no rgb-lib source change). `output_map` maps
+    /// *pre-coloring* output index -> asset amount. `blinding` is the deterministic seal blinding
+    /// (must be shared with the receiver so it can accept).
     ///
     /// Returns `(colored_psbt_base64, consignment_base64)`.
     pub fn color(
@@ -148,24 +171,44 @@ impl RgbWallet {
         output_map: HashMap<u32, u64>,
         blinding: u64,
     ) -> Result<(String, String)> {
-        let (colored_psbt, consignments) = self.wallet.color_statechain_psbt(
-            psbt_base64.to_string(),
-            contract_id.to_string(),
-            output_map,
-            blinding,
-        )?;
+        let contract = ContractId::from_str(contract_id)
+            .map_err(|e| anyhow!("invalid contract id: {e}"))?;
+        let mut psbt = RgbPsbt::from_str(psbt_base64).map_err(|e| anyhow!("invalid psbt: {e}"))?;
 
-        let consignment = consignments
+        let coloring_info = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                contract,
+                AssetColoringInfo {
+                    output_map,
+                    static_blinding: Some(blinding),
+                },
+            )]),
+            static_blinding: Some(blinding),
+            nonce: None,
+        };
+
+        let transfers = self.wallet.color_psbt_and_consume(&mut psbt, coloring_info)?;
+        let transfer = transfers
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("color produced no consignment"))?;
 
-        Ok((colored_psbt, STANDARD.encode(consignment)))
+        let dir = unique_tmp("mercury-rgb-color");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        transfer
+            .save_file(&path)
+            .map_err(|e| anyhow!("could not serialize consignment: {e}"))?;
+        let bytes = fs::read(&path)?;
+        let _ = fs::remove_dir_all(&dir);
+
+        Ok((psbt.to_string(), STANDARD.encode(bytes)))
     }
 
     /// Validate and accept an incoming consignment (base64) relayed in-band by the Mercury transfer
-    /// message. `txid`/`vout` identify the witness-tx output that will hold the asset and `blinding`
-    /// is the seal blinding used by the sender while coloring.
+    /// message. The bytes are re-posted to the local RGB proxy and validated via the public
+    /// `accept_transfer` (no rgb-lib source change). `txid`/`vout` identify the witness-tx output
+    /// that will hold the asset and `blinding` is the seal blinding used by the sender.
     ///
     /// Returns the total fungible amount assigned to this wallet by the consignment.
     pub fn accept(
@@ -175,13 +218,32 @@ impl RgbWallet {
         vout: u32,
         blinding: u64,
     ) -> Result<u64> {
-        let consignment = STANDARD
+        let bytes = STANDARD
             .decode(consignment_base64)
             .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
 
+        let dir = unique_tmp("mercury-rgb-accept");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+
+        // Re-post the in-band consignment to the proxy under recipient_id = txid, so the public
+        // accept_transfer (which fetches by txid) validates exactly these bytes.
+        let http_endpoint = TransportEndpoint::new(self.proxy.clone())?.endpoint;
+        self.wallet.post_consignment(
+            &http_endpoint,
+            txid.to_string(),
+            &path,
+            txid.to_string(),
+            Some(vout),
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+
+        let transport =
+            RgbTransport::from_str(&self.proxy).map_err(|e| anyhow!("invalid proxy endpoint: {e}"))?;
         let (_transfer, assignments) =
             self.wallet
-                .accept_consignment(consignment, txid.to_string(), vout, blinding)?;
+                .accept_transfer(txid.to_string(), vout, transport, blinding)?;
 
         let received: u64 = assignments
             .into_iter()
@@ -197,9 +259,11 @@ impl RgbWallet {
     /// Deposit binding: build, color and sign the funding transaction that pays `amount_sat` to the
     /// statechain aggregated `address` and assigns `rgb_amount` of `contract_id` to that output.
     ///
-    /// Returns `(txid, vout, consignment_base64, signed_tx_hex)`. The caller broadcasts `signed_tx_hex`
-    /// (via the Mercury electrum client); once it confirms, the statechain UTXO `txid:vout` holds both
-    /// the bitcoins and the RGB allocation, and `consignment_base64` is the genesis-to-deposit proof.
+    /// This is the one operation with no public rgb-lib equivalent (it spends a colored UTXO to an
+    /// externally-owned address), so it uses the fork's `fund_statechain_utxo`.
+    ///
+    /// Returns `(txid, vout, consignment_base64, signed_tx_hex)`. The caller broadcasts
+    /// `signed_tx_hex` via the Mercury electrum client.
     pub fn fund_statechain(
         &mut self,
         address: &str,
@@ -218,38 +282,6 @@ impl RgbWallet {
             blinding,
         )?;
         Ok((txid, vout, STANDARD.encode(consignment), signed_tx_hex))
-    }
-
-    /// Find the UTXO in this wallet that holds an allocation of `contract_id`, returning
-    /// `(txid, vout, btc_amount)`. Used at deposit time to build the funding transaction that binds
-    /// the asset to the statechain UTXO (the funding tx spends this UTXO and pays the statechain
-    /// aggregated address).
-    pub fn asset_utxo(&mut self, contract_id: &str) -> Result<Option<(String, u32, u64)>> {
-        let unspents = self
-            .wallet
-            .list_unspents(Some(self.online.clone()), false, false)?;
-        for u in unspents {
-            for a in &u.rgb_allocations {
-                if a.asset_id.as_deref() == Some(contract_id) {
-                    if let Assignment::Fungible(amt) = a.assignment {
-                        if amt > 0 {
-                            return Ok(Some((
-                                u.utxo.outpoint.txid.clone(),
-                                u.utxo.outpoint.vout,
-                                u.utxo.btc_amount,
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Sign a PSBT (base64) with this wallet's keys, returning the signed PSBT (base64). Used to
-    /// sign the deposit funding transaction (whose input is one of this wallet's own UTXOs).
-    pub fn sign(&self, psbt_base64: &str) -> Result<String> {
-        Ok(self.wallet.sign_psbt(psbt_base64.to_string(), None)?)
     }
 
     pub fn indexer_url(&self) -> &str {
