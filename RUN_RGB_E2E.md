@@ -96,11 +96,18 @@ Set `RGB_E2E` to the number and `cargo +stable run`. Each is independent and sel
 | 4 | `rgb04_register_statechain_utxo.rs` | **Register primitive**: after `register_statechain`, `get_asset_balance`/`list_unspents` treat a statechain UTXO as an on-chain colorable UTXO; standard `blind_receive` reserves a statechain UTXO as the invoice seal. |
 | 5 | `rgb05_blinded_statechain_transfer.rs` | **statechain → statechain via a blinded invoice**: receiver invoices on its statechain UTXO; sender spends its statechain UTXO "to itself" + OP_RETURN committing to the receiver's seal; receiver settles via `refresh` → asset on its statechain UTXO; sender UTXO consumed. |
 | 6 | `rgb06_partial_transfer_change.rs` | **Partial transfer with change to a free statechain UTXO** (full on-chain parity): 600 → receiver's statechain UTXO, 400 change → sender's free statechain UTXO, sender UTXO consumed. Each transfer consumes a UTXO; sats move to the receiver via the statechain. |
+| 7 | `rgb07_anchor_refresh_self_transfer.rs` | **RGB anchor refresh via statechain self-transfer** (see [`docs/rgb_anchor_refresh.md`](docs/rgb_anchor_refresh.md)): refresh the RGB commitment on the same statechain UTXO X **without broadcasting**, by transferring the coin owner→owner. Each refresh produces a new SE-co-signed colored backup/exit tx (same X, lower nLockTime, `tx_n`+1, rotated key-share); X stays unspent (statechain-accepted) until `exit` broadcasts the latest tx (Bitcoin-confirmed). |
 
 The rgb-lib primitives this integration adds (all in `utexo-rgb-lib@feat/statechain`, no RGB protocol
 change): `fund_statechain_utxo` (re-colorable color deposit), `register_statechain_utxo` (statechain
 UTXO as a wallet-owned colorable UTXO), `AssetColoringInfo::blinded_map` in `color_psbt` (assign to
 existing outpoints), and `mark_utxos_spent`. See `docs/rgb_statechain_design.md` for the full design.
+
+The Mercury-side orchestration for flow 7 is `mercuryrustlib::rgb::refresh_rgb_anchor_self_transfer`
+(a colored statechain self-transfer); see `docs/rgb_anchor_refresh.md`. It needs two mercurylib
+relaxations so the existing validators accept a *colored* backup tx (one extra OP_RETURN output):
+OP_RETURN-tolerant output counts in `get_previous_outpoint` and
+`verify_if_locktime_is_reasonable_tx_version_and_output_size`.
 
 ## What the test exercises
 

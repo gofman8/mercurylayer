@@ -324,7 +324,7 @@ async fn create_backup_tx_to_receiver(client_config: &ClientConfig, coin: &mut C
     Ok(signed_tx)
 }
 
-async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
+pub async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
     
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/sender";

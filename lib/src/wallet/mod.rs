@@ -211,7 +211,9 @@ pub fn get_previous_outpoint(backup_tx: &BackupTx) -> Result<TxOutpoint, Mercury
         return Err(MercuryError::Tx1HasMoreThanOneInput);
     }
 
-    if tx1.output.len() > 1 {
+    // An RGB-colored backup tx carries one extra OP_RETURN (opret commitment) output besides the
+    // single spendable output, so count only non-OP_RETURN outputs against the "one output" rule.
+    if tx1.output.iter().filter(|o| !o.script_pubkey.is_op_return()).count() > 1 {
         return Err(MercuryError::Tx1HasMoreThanOneInput);
     }
 
