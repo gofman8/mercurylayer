@@ -144,8 +144,17 @@ commitment transaction before revoking the previous state.
   asset lands on its statechain UTXO B (`get_asset_balance` = 1000, allocation settled on B) and A is
   consumed on-chain. Uses the new `color_blinded` / `blinded_map` path. (`rgb05_blinded_statechain_transfer.rs`.)
 
-All four building blocks (deposit, register, witness exit, blinded transfer) are green, so the full
-"RGB the same way it works on-chain" flow — deposit → transfer (witness *or* blinded, with change to
-a free statechain UTXO) → exit to on-chain and back — is demonstrated end to end. The only remaining
-polish is the `StatechainResolver` (item 2b) so `Wallet::sync`/`refresh` never needs the "don't
-reconcile registered statechain txos" guard.
+- **Partial transfer with change to a free statechain UTXO (full on-chain parity).** Sender holds
+  1000 on statechain UTXO A; receiver blind-invoices 600 on its statechain UTXO B; the sender
+  blind-invoices its own 400 change onto a free statechain UTXO C; the sender spends A "to itself"
+  with one OP_RETURN committing 600 -> B and 400 -> C (two blinded beneficiaries in a single
+  transition via `blinded_map`). Receiver settles 600 on B, sender settles 400 change on C, A is
+  consumed and marked spent. End state: receiver `get_asset_balance` = 600 on B, sender = 400 on C -
+  each transfer consumes a UTXO and the change returns to a free statechain UTXO, identical to
+  on-chain RGB except the sats move to the receiver via the statechain. (`rgb06_partial_transfer_change.rs`.)
+
+All building blocks (deposit, register, witness exit, blinded transfer, partial transfer with change)
+are green, so the full "RGB the same way it works on-chain" flow — deposit → transfer (witness *or*
+blinded, partial with change to a free statechain UTXO) → exit to on-chain and back — is demonstrated
+end to end. The only remaining polish is the `StatechainResolver` (item 2b) so `Wallet::sync`/`refresh`
+never needs the "don't reconcile registered statechain txos" guard.

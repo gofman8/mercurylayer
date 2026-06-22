@@ -445,6 +445,20 @@ impl RgbWallet {
         )?)
     }
 
+    /// Mark registered statechain UTXO(s) (`txid:vout`) as spent in the DB - call after a transfer
+    /// consumes a statechain UTXO so `get_asset_balance` drops to just the change.
+    pub fn mark_spent(&self, outpoints: &[String]) -> Result<()> {
+        use rgb_lib::wallet::Outpoint;
+        let ops = outpoints
+            .iter()
+            .filter_map(|s| {
+                let (t, v) = s.rsplit_once(':')?;
+                Some(Outpoint { txid: t.to_string(), vout: v.parse().ok()? })
+            })
+            .collect();
+        Ok(self.wallet.mark_utxos_spent(ops)?)
+    }
+
     /// Standard rgb-lib **blinded receive** invoice for `amount`. The seal is one of this wallet's
     /// free colorable UTXOs - which, after `register_statechain`, can be a statechain UTXO. This is
     /// the user's "receiver creates an rgb invoice whose recipient_id references its statechain UTXO".
