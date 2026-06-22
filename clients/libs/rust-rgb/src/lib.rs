@@ -34,7 +34,7 @@ use rgb_lib::{
     generate_keys, restore_keys,
     keys::WitnessVersion,
     wallet::{DatabaseType, Online, OnlineOptions, WalletData},
-    Assignment, BitcoinNetwork, ContractId, FileContent, RgbTransport,
+    Assignment, AssetSchema, BitcoinNetwork, ContractId, FileContent, RgbTransport,
 };
 
 /// An rgb-lib wallet wired for use alongside a Mercury Layer wallet.
@@ -91,8 +91,12 @@ impl RgbWallet {
             bitcoin_network,
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: 1,
-            // Empty list means "support all schemas rgb-lib supports".
-            supported_schemas: vec![],
+            supported_schemas: vec![
+                AssetSchema::Nia,
+                AssetSchema::Uda,
+                AssetSchema::Cfa,
+                AssetSchema::Ifa,
+            ],
             reuse_addresses: false,
         };
 
@@ -121,11 +125,17 @@ impl RgbWallet {
         Ok(self.wallet.get_address()?)
     }
 
-    /// Create UTXOs in the RGB wallet (needed before issuance).
-    pub fn create_utxos(&mut self, fee_rate: u64) -> Result<u8> {
-        Ok(self
-            .wallet
-            .create_utxos(self.online.clone(), false, None, None, fee_rate, false)?)
+    /// Create `num` colorable UTXOs of `size` sats each in the RGB wallet (needed before issuance).
+    /// The size must be large enough to later fund the statechain deposit from the colored UTXO.
+    pub fn create_utxos(&mut self, num: u8, size: u32, fee_rate: u64) -> Result<u8> {
+        Ok(self.wallet.create_utxos(
+            self.online.clone(),
+            false,
+            Some(num),
+            Some(size),
+            fee_rate,
+            false,
+        )?)
     }
 
     /// Issue a NIA (Non-Inflatable Asset) and return its contract/asset id.
@@ -273,6 +283,11 @@ impl RgbWallet {
         fee_rate: u64,
         blinding: u64,
     ) -> Result<(String, u32, String, String)> {
+        // Sync the wallet's UTXO view first so an already-spent colored UTXO (e.g. consumed by a
+        // previous deposit) is not re-selected for this funding transaction.
+        let _ = self
+            .wallet
+            .list_unspents(Some(self.online.clone()), false, false)?;
         let (txid, vout, consignment, signed_tx_hex) = self.wallet.fund_statechain_utxo(
             address.to_string(),
             amount_sat,

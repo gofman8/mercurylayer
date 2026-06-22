@@ -15,7 +15,7 @@ pub mod rgb01_full_lifecycle;
 pub mod utils;
 use anyhow::{Result, Ok};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
 
     // Run only the RGB-over-statechain lifecycle test when RGB_E2E=1 (it needs the RGB proxy +

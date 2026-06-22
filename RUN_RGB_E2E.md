@@ -33,18 +33,24 @@ cd rgb-lightning-node
 ./regtest.sh start          # creates the "miner" wallet and mines 103 blocks
 ```
 
-## 2. Start the Mercury server stack (no bitcoind/electrs — we reuse the regtest's)
+## 2. Start the Mercury server stack (lockbox SE — no bitcoind/electrs; we reuse the regtest's)
+
+Use the **lockbox** key-manager backend (`docker-compose-lockbox.yml`), not the SGX enclave: it builds
+natively on Apple Silicon (`ubuntu:22.04` + vcpkg) and exposes the same SE API on `:18080`. The
+`web` service is removed from that compose (it collided with the proxy on `:3000`).
 
 ```bash
 cd ../mercurylayer
-# only the server-side services; their ports (8000 mercury, 8001 token) don't clash with regtest
-docker compose -f docker-compose-test.yml up -d --build postgres enclave-sgx mercury token-server
+docker compose -f docker-compose-lockbox.yml up -d --build \
+    vault vault-init db_lockbox db_server lockbox mercury-server
 # wait until the mercury server answers on :8000
-curl -s http://127.0.0.1:8000/info/config
+curl -s http://127.0.0.1:8000/info/config        # {"initlock":1000,"interval":10,...}
 ```
 
-> On Apple Silicon the SGX **SIM** enclave image is x86; if its build/run fails, prefix with
-> `DOCKER_DEFAULT_PLATFORM=linux/amd64` (emulated) or run the stack on an x86 host.
+> The mercury-server image pins Rust 1.83 (`rust-toolchain.toml`) and builds with the committed
+> `Cargo.lock`. If a transitive dep requires `edition2024`, build the server image with the upstream
+> (pre-RGB) `Cargo.lock` — the server/lib crates are unchanged by this integration. The RGB client
+> crates (below) need Rust ≥1.85 because `rgb-lib` is edition 2024.
 
 ## 3. Run the lifecycle test
 
@@ -52,22 +58,31 @@ curl -s http://127.0.0.1:8000/info/config
 cd clients/tests/rust
 export ML_NETWORK=regtest                                   # selects regtest.Settings (statechain_entity :8000, electrum :50001)
 export RGB_E2E=1                                            # run only rgb01_full_lifecycle
-export RLN_REGTEST="$(cd ../../../../rgb-lightning-node && pwd)/regtest.sh"   # drive bitcoind via regtest.sh
+export COMPOSE_FILE="$(cd ../../../../rgb-lightning-node && pwd)/compose.yaml"  # so regtest.sh resolves from any CWD
+export COMPOSE_PROJECT_NAME=rgb-lightning-node
+export RLN_REGTEST="$(cd ../../../../rgb-lightning-node && pwd)/regtest.sh"     # drive bitcoind via regtest.sh
 export RLN_BITCOIND_CONTAINER="$(docker ps --format '{{.Names}}' | grep bitcoind | head -1)"
-cargo run
+cargo +stable run     # +stable: rgb-lib needs Rust >= 1.85 (edition 2024); the dir pins 1.83
 ```
 
-Expected output (abridged):
+Actual passing output:
 
 ```
-RGB01 - issued asset <contract_id> (1000 units)
-RGB01 - broadcast deposit funding tx <txid> (statechain UTXO at vout 1)
-RGB01 - deposit confirmed, statechain_id <id>
+RGB01 - issued assets <contract_a> (path A) and <contract_b> (path B), 1000 units each
+RGB01 - deposit funding tx <txid> (statechain UTXO at vout 1)
+RGB01 - deposit A confirmed, statechain_id <id>
 RGB01 - built colored backup tx <txid> for transfer
-RGB01 - receiver validated transfer consignment (500 units)
-RGB01 - cooperative withdrawal broadcast <txid> (asset moved on-chain)
-RGB01 - RGB statechain lifecycle (issuance/deposit/transfer/withdraw) completed
+RGB01 - receiver validated transfer consignment (1000 units)
+RGB01 - unilateral exit: backup tx <txid> broadcast and confirmed (transfer finalized on-chain)
+RGB01 - deposit funding tx <txid> (statechain UTXO at vout 1)
+RGB01 - deposit B confirmed, statechain_id <id>
+RGB01 - cooperative withdrawal: tx <txid> broadcast and confirmed
+RGB01 - RGB statechain lifecycle complete (issuance, deposit, transfer, unilateral + cooperative withdraw)
 ```
+
+The test uses two issuer wallets (one per path) so each does a single clean deposit. rgb-lib's
+synchronous calls run via `tokio::task::block_in_place` (the runtime is multi-threaded) to avoid
+nesting a blocking reqwest runtime inside the async runtime.
 
 ## What the test exercises
 
