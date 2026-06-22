@@ -13,6 +13,7 @@ pub mod tm01_sender_double_spends;
 mod tv01;
 pub mod rgb01_full_lifecycle;
 pub mod rgb02_deposit_coop_exit;
+pub mod rgb03_exit_to_onchain;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -27,6 +28,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("2") {
         rgb02_deposit_coop_exit::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("3") {
+        rgb03_exit_to_onchain::execute().await?;
         return Ok(());
     }
 
