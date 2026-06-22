@@ -157,6 +157,68 @@ impl RgbWallet {
         Ok(self.wallet.get_asset_balance(asset_id.to_string())?.settled)
     }
 
+    /// Full RGB balance of an asset: `(settled, future, spendable)`.
+    pub fn balance(&self, asset_id: &str) -> Result<(u64, u64, u64)> {
+        let b = self.wallet.get_asset_balance(asset_id.to_string())?;
+        Ok((b.settled, b.future, b.spendable))
+    }
+
+    /// RGB allocations of an asset held on this wallet's UTXOs: `(outpoint, amount, settled)`.
+    pub fn list_allocations(&mut self, asset_id: &str) -> Result<Vec<(String, u64, bool)>> {
+        let unspents = self
+            .wallet
+            .list_unspents(Some(self.online.clone()), false, false)?;
+        let mut out = vec![];
+        for u in unspents {
+            for a in &u.rgb_allocations {
+                if a.asset_id.as_deref() == Some(asset_id) {
+                    if let Assignment::Fungible(amt) = a.assignment {
+                        out.push((
+                            format!("{}:{}", u.utxo.outpoint.txid, u.utxo.outpoint.vout),
+                            amt,
+                            a.settled,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Summary of this wallet's transfers for an asset: `(kind, status, amount, txid)`.
+    pub fn transfers(&self, asset_id: &str) -> Result<Vec<(String, String, u64, String)>> {
+        let transfers = self.wallet.list_transfers(Some(asset_id.to_string()))?;
+        Ok(transfers
+            .into_iter()
+            .map(|t| {
+                let amount: u64 = t
+                    .assignments
+                    .iter()
+                    .map(|a| match a {
+                        Assignment::Fungible(n) | Assignment::InflationRight(n) => *n,
+                        _ => 0,
+                    })
+                    .sum();
+                (
+                    format!("{:?}", t.kind),
+                    format!("{:?}", t.status),
+                    amount,
+                    t.txid.unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Fungible amount of `contract_id` allocated in the RGB runtime (stash) at a specific outpoint.
+    /// This is the source of truth for statechain transactions (built/broadcast outside rgb-lib's
+    /// own send flow), so it shows the asset actually sitting on - or having left - the statechain
+    /// UTXO, unlike `balance`/`transfers` which track rgb-lib's DB send accounting.
+    pub fn allocation_at(&self, contract_id: &str, txid: &str, vout: u32) -> Result<u64> {
+        Ok(self
+            .wallet
+            .runtime_allocation(contract_id.to_string(), txid.to_string(), vout)?)
+    }
+
     /// Sync RGB state with the indexer (settle pending transfers, update witnesses).
     pub fn refresh(&mut self, asset_id: Option<String>) -> Result<()> {
         self.wallet

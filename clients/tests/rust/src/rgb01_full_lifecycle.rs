@@ -51,6 +51,57 @@ async fn wait_for_address(client_config: &ClientConfig, address: &str, amount: u
     Ok(())
 }
 
+/// Return true if `txid:vout` is no longer in the unspent set of `address` (i.e. spent on-chain).
+async fn is_outpoint_spent(
+    client_config: &ClientConfig,
+    address: &str,
+    txid: &str,
+    vout: u32,
+) -> Result<bool> {
+    use electrum_client::bitcoin::Address;
+    use std::str::FromStr;
+    let address = Address::from_str(address)?.require_network(client_config.network)?;
+    let utxos = client_config
+        .electrum_client
+        .script_list_unspent(&address.script_pubkey())?;
+    Ok(!utxos
+        .iter()
+        .any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout))
+}
+
+/// Refresh and print the RGB state (balance, on-wallet allocations, transfers with status) for an
+/// asset, so the lifecycle is observable rather than asserted by log strings alone.
+fn dump_rgb_state(label: &str, rgb: &mut RgbWallet, asset_id: &str) {
+    tokio::task::block_in_place(|| {
+        let _ = rgb.refresh(Some(asset_id.to_string()));
+        match rgb.balance(asset_id) {
+            Ok((s, f, sp)) => {
+                println!("    [{label}] balance: settled={s} future={f} spendable={sp}")
+            }
+            Err(e) => println!("    [{label}] balance: <{e}>"),
+        }
+        match rgb.list_allocations(asset_id) {
+            Ok(allocs) if !allocs.is_empty() => {
+                for (op, amt, settled) in allocs {
+                    println!("    [{label}] allocation on {op}: amount={amt} settled={settled}");
+                }
+            }
+            Ok(_) => println!("    [{label}] allocation: none on this wallet's own UTXOs"),
+            Err(e) => println!("    [{label}] allocation: <{e}>"),
+        }
+        match rgb.transfers(asset_id) {
+            Ok(ts) => {
+                for (kind, status, amt, txid) in ts {
+                    println!(
+                        "    [{label}] transfer: kind={kind} status={status} amount={amt} txid={txid}"
+                    );
+                }
+            }
+            Err(e) => println!("    [{label}] transfers: <{e}>"),
+        }
+    });
+}
+
 /// Set up and fund an rgb-lib wallet, then issue a NIA asset; returns the wallet and contract id.
 fn setup_rgb_wallet_and_issue(data_dir: &str, issue: bool) -> Result<(RgbWallet, Option<String>)> {
     let _ = fs::create_dir_all(data_dir);
@@ -165,6 +216,8 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
         1000
     );
     println!("RGB01 - issued assets {contract_a} (path A) and {contract_b} (path B), 1000 units each");
+    println!("RGB01 - state after issuance:");
+    dump_rgb_state("sender_a", &mut rgb_sender_a, &contract_a);
 
     // Mercury wallets.
     let wallet1 = mercuryrustlib::wallet::create_wallet("rgb_wallet1", client_config).await?;
@@ -190,6 +243,15 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
         "RGB01 - deposit A confirmed, statechain_id {}",
         coin_a.statechain_id.clone().unwrap()
     );
+    // Prove (from the RGB stash) the asset is now bound to the statechain UTXO.
+    let sc_a_txid = coin_a.utxo_txid.clone().unwrap();
+    let sc_a_vout = coin_a.utxo_vout.unwrap();
+    let sc_a_addr = coin_a.aggregated_address.clone().unwrap();
+    let on_sc_a = tokio::task::block_in_place(|| {
+        rgb_sender_a.allocation_at(&contract_a, &sc_a_txid, sc_a_vout)
+    })?;
+    println!("RGB01 - after deposit A: RGB runtime shows statechain UTXO {sc_a_txid}:{sc_a_vout} holds {on_sc_a} units");
+    assert_eq!(on_sc_a, rgb_amount, "asset must be bound to the statechain UTXO after deposit");
 
     let recipient_address =
         mercuryrustlib::transfer_receiver::new_transfer_address(client_config, &wallet2.name)
@@ -228,21 +290,44 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
     assert_eq!(received, rgb_amount);
     println!("RGB01 - receiver validated transfer consignment ({received} units)");
 
-    // Unilateral exit: broadcast the (colored) backup tx and mine it. Broadcasting + confirming the
-    // witness tx is what finalizes the transfer's RGB transition on-chain. (The receiver already
-    // validated the consignment above; a settled per-asset balance would additionally require the
-    // receiver to have registered the asset via a prior blind/witness receive, which is outside this
-    // statechain flow.)
+    // Before the witness tx is broadcast the transition is *pending*: the new owner's output already
+    // holds the (unconfirmed) allocation, while the statechain UTXO still shows it as a pending spend
+    // (it is only released once the witness tx confirms). This is exactly the RGB-over-LN model.
+    let sc_a_pending = tokio::task::block_in_place(|| {
+        rgb_sender_a.allocation_at(&contract_a, &sc_a_txid, sc_a_vout)
+    })?;
+    let on_new_owner = tokio::task::block_in_place(|| {
+        rgb_sender_a.allocation_at(&contract_a, &transfer.txid, transfer.recipient_vout)
+    })?;
+    println!(
+        "RGB01 - after transfer (pending, witness not broadcast): statechain UTXO holds {sc_a_pending}, new-owner output {}:{} holds {on_new_owner}",
+        transfer.txid, transfer.recipient_vout
+    );
+    assert_eq!(on_new_owner, rgb_amount, "new owner's output must hold the asset after the transfer");
+
+    // Unilateral exit: broadcast the (colored) backup tx and mine it. The broadcast SUCCEEDS only
+    // because the statechain UTXO is unspent and the tx is valid, so a confirmed exit tx is itself
+    // proof the statechain UTXO was consumed on-chain by this colored transition.
     let tx_bytes = hex::decode(&transfer.signed_tx)?;
     let exit_txid = client_config
         .electrum_client
         .transaction_broadcast_raw(&tx_bytes)?;
     let core_addr = bitcoin_core::getnewaddress()?;
     let _ = bitcoin_core::generatetoaddress(client_config.confirmation_target, &core_addr)?;
+    tokio::task::block_in_place(|| rgb_sender_a.refresh(Some(contract_a.clone())))?;
+    let new_owner_final = tokio::task::block_in_place(|| {
+        rgb_sender_a.allocation_at(&contract_a, &transfer.txid, transfer.recipient_vout)
+    })?;
+    let sc_a_runtime = tokio::task::block_in_place(|| {
+        rgb_sender_a.allocation_at(&contract_a, &sc_a_txid, sc_a_vout)
+    })?;
+    // Confirm at the Bitcoin level that the statechain UTXO is now actually spent.
+    let sc_spent = is_outpoint_spent(client_config, &sc_a_addr, &sc_a_txid, sc_a_vout).await?;
     println!(
-        "RGB01 - unilateral exit: backup tx {} broadcast and confirmed (transfer finalized on-chain)",
-        exit_txid
+        "RGB01 - unilateral exit: backup tx {exit_txid} confirmed; new-owner output holds {new_owner_final} units; statechain UTXO spent on-chain = {sc_spent} (low-level runtime still lists {sc_a_runtime} as a conflicting/unreconciled spend, which the statechain model allows)"
     );
+    assert_eq!(new_owner_final, rgb_amount, "asset must be assigned to the new owner's output");
+    assert!(sc_spent, "the statechain UTXO must be spent on-chain by the exit tx");
 
     // ----------------------------------------------------------------------------------------
     // Path B: deposit -> cooperative withdrawal (colored withdrawal tx co-signed with the SE)
@@ -260,6 +345,14 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
         "RGB01 - deposit B confirmed, statechain_id {}",
         coin_b.statechain_id.clone().unwrap()
     );
+    let sc_b_txid = coin_b.utxo_txid.clone().unwrap();
+    let sc_b_vout = coin_b.utxo_vout.unwrap();
+    let sc_b_addr = coin_b.aggregated_address.clone().unwrap();
+    let on_sc_b = tokio::task::block_in_place(|| {
+        rgb_sender_b.allocation_at(&contract_b, &sc_b_txid, sc_b_vout)
+    })?;
+    println!("RGB01 - after deposit B: RGB runtime shows statechain UTXO {sc_b_txid}:{sc_b_vout} holds {on_sc_b} units");
+    assert_eq!(on_sc_b, rgb_amount, "asset must be bound to the statechain UTXO after deposit B");
 
     let withdrawal_address = bitcoin_core::getnewaddress()?;
     let mut coin_w = coin_b.clone();
@@ -287,10 +380,19 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
     let core_addr = bitcoin_core::getnewaddress()?;
     let _ = bitcoin_core::generatetoaddress(client_config.confirmation_target, &core_addr)?;
     tokio::task::block_in_place(|| rgb_sender_b.refresh(Some(contract_b.clone())))?;
+    // Prove the cooperative withdrawal moved the asset off the statechain UTXO to the withdrawal
+    // output: the asset is allocated to the withdrawal output and the statechain UTXO is spent
+    // on-chain by the (confirmed) colored withdrawal tx.
+    let on_withdrawal = tokio::task::block_in_place(|| {
+        rgb_sender_b.allocation_at(&contract_b, &withdraw.txid, withdraw.recipient_vout)
+    })?;
+    let sc_b_spent = is_outpoint_spent(client_config, &sc_b_addr, &sc_b_txid, sc_b_vout).await?;
     println!(
-        "RGB01 - cooperative withdrawal: tx {} broadcast and confirmed",
-        withdraw.txid
+        "RGB01 - cooperative withdrawal: tx {} confirmed; withdrawal output {}:{} holds {on_withdrawal} units; statechain UTXO spent on-chain = {sc_b_spent}",
+        withdraw.txid, withdraw.txid, withdraw.recipient_vout
     );
+    assert_eq!(on_withdrawal, rgb_amount, "asset must be assigned to the withdrawal output");
+    assert!(sc_b_spent, "the statechain UTXO must be spent on-chain by the withdrawal tx");
 
     println!(
         "RGB01 - RGB statechain lifecycle complete (issuance, deposit, transfer, unilateral + cooperative withdraw)"

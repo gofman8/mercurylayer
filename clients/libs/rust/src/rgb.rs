@@ -33,8 +33,9 @@ pub struct ColoredBackupTx {
     pub signed_tx: String,
     /// Txid of the signed transaction (the RGB witness txid the receiver accepts against).
     pub txid: String,
-    /// Index of the spendable output paying the recipient/owner (the asset seal). This is 1 because
-    /// rgb-lib places the OP_RETURN opret commitment at index 0.
+    /// Index of the spendable output paying the recipient/owner (the asset seal). It is the single
+    /// non-OP_RETURN output: vout 1 when rgb-lib placed the OP_RETURN first (taproot recipient), or
+    /// vout 0 when it appended the OP_RETURN last (non-taproot recipient).
     pub recipient_vout: u32,
     /// RGB consignment (base64) proving the transition. Relayed in-band to the receiver.
     pub consignment: String,
@@ -111,6 +112,15 @@ pub async fn create_colored_backup_tx(
     let colored_tx_hex =
         hex::encode(bitcoin::consensus::encode::serialize(&colored_unsigned_tx));
 
+    // The recipient/owner output is the (single) non-OP_RETURN output. rgb-lib places the OP_RETURN
+    // commitment first when a taproot output is present (so the recipient is at vout 1), but appends
+    // it last for non-taproot recipients (recipient stays at vout 0) - so compute it, don't assume.
+    let recipient_vout = colored_unsigned_tx
+        .output
+        .iter()
+        .position(|o| !o.script_pubkey.is_op_return())
+        .unwrap_or(0) as u32;
+
     // 5. Compute the blind-MuSig2 partial-signature session over the colored transaction (which now
     //    commits to the OP_RETURN), get the server's partial signature, and aggregate.
     let partial_sig_request =
@@ -137,7 +147,7 @@ pub async fn create_colored_backup_tx(
     Ok(ColoredBackupTx {
         signed_tx,
         txid,
-        recipient_vout: 1,
+        recipient_vout,
         consignment,
         blinding,
     })
