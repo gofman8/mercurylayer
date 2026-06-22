@@ -18,6 +18,8 @@ pub mod rgb04_register_statechain_utxo;
 pub mod rgb05_blinded_statechain_transfer;
 pub mod rgb06_partial_transfer_change;
 pub mod rgb07_anchor_refresh_self_transfer;
+pub mod rgb08_offchain_p2p_transfer;
+pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -52,6 +54,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("7") {
         rgb07_anchor_refresh_self_transfer::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
+        rgb08_offchain_p2p_transfer::execute().await?;
         return Ok(());
     }
 

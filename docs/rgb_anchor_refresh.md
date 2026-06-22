@@ -185,6 +185,28 @@ E2E: [`clients/tests/rust/src/rgb07_anchor_refresh_self_transfer.rs`](../clients
 Each of these steps prints a line and asserts the corresponding invariant; the inline comments in the
 test explain the flow step by step.
 
+### Off-chain P2P transfer to a real receiver (`rgb08`)
+
+The same machinery transfers to *another* party with **no Bitcoin transaction at all**:
+
+1. Receiver onboards its own statechain UTXO Y and creates a standard rgb-lib blinded invoice on it
+   (`blind_receive` → recipient_id referencing Y).
+2. Sender performs the self-transfer of X **but points the OP_RETURN transition at the receiver's
+   seal Y** (`refresh_rgb_anchor_self_transfer(..., beneficiary = Some(recipient_id))`). The bitcoin
+   output still pays the sender (sats stay with the sender); only the RGB asset is assigned to Y. The
+   exit tx is **not broadcast**.
+3. The sender hands the receiver the consignment (P2P). The receiver accepts by calling
+   `validate_consignment_offchain(consignment, exit_txid, …)` — rgb-lib's standard offchain validator
+   (`OffchainResolver`) checks the *unbroadcast* exit tx's OP_RETURN commits the asset to Y. No
+   broadcast, X still unspent. (`rgb08_offchain_p2p_transfer.rs`, green.)
+
+**Security (critical):** the receiver must accept *only* after `validate_consignment_offchain`
+succeeds — i.e. it has the sender's pre-signed exit tx (bundled in the consignment, its escape hatch)
+and that tx's OP_RETURN equals the transition assigning the asset to Y. Otherwise a malicious sender
+could later finalize a different exit and keep the asset. Soundness rests on the statechain trust
+model: the SE won't co-sign conflicting states (it drops the old key-share on each transfer) and the
+latest state has the lowest nLockTime, so the receiver's exit can be broadcast first.
+
 ### Failure cases and where each is enforced
 
 These are rejected by the existing Mercury + RGB validation layer (no extra code needed); the test

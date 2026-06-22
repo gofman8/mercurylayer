@@ -57,6 +57,11 @@ fn dump(label: &str, rgb: &mut RgbWallet, asset_id: &str) {
             Ok((s, f, sp)) => println!("    [{label}] balance: settled={s} future={f} spendable={sp}"),
             Err(e) => println!("    [{label}] balance: <{e}>"),
         }
+        if let Ok(us) = rgb.unspents_dump() {
+            for (op, sat, color, exists, nalloc, pending) in us {
+                println!("    [{label}] list_unspents: {op} sats={sat} colorable={color} exists={exists} allocations={nalloc} pending_blinded={pending}");
+            }
+        }
         if let Ok(a) = rgb.list_allocations(asset_id) {
             for (op, amt, settled) in a {
                 println!("    [{label}] allocation on {op}: amount={amt} settled={settled}");

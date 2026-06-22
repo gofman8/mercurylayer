@@ -124,10 +124,11 @@ pub async fn execute() -> Result<()> {
     println!("RGB07 - asset assigned to statechain UTXO X = {x_txid}:{x_vout} (balance {bal}); X unspent on-chain = {}", !is_outpoint_spent(&cc, &x_txid, x_vout));
     assert_eq!(bal, ISSUED);
     assert!(!is_outpoint_spent(&cc, &x_txid, x_vout), "X must be unspent at the start");
+    crate::rgb_dump::dump("owner after deposit+register (asset on statechain UTXO X)", &mut issuer, &contract);
 
     // ---- 2. REFRESH #1: self-transfer that re-commits the RGB anchor without broadcasting. ----
     let r1 = mercuryrustlib::rgb::refresh_rgb_anchor_self_transfer(
-        &cc, &issuer, wallet_name, &statechain_id, &contract, ISSUED, BLINDING + 1, NETWORK,
+        &cc, &issuer, wallet_name, &statechain_id, &contract, ISSUED, BLINDING + 1, NETWORK, None,
     ).await?;
     println!("RGB07 - refresh #1: status={:?} X={} tx_n {}->{} nLockTime {}->{} new_backup_txid={}",
         r1.status, r1.funding_outpoint, r1.previous_tx_n, r1.new_tx_n, r1.previous_nlocktime, r1.new_nlocktime, r1.new_backup_txid);
@@ -141,10 +142,11 @@ pub async fn execute() -> Result<()> {
     let new_auth = owner_auth_and_status(&cc, wallet_name, &statechain_id, CoinStatus::CONFIRMED).await?;
     assert_ne!(new_auth, r1.previous_owner_auth_pubkey, "INVARIANT: key-share rotated (auth pubkey changed)");
     println!("RGB07 - refresh #1 verified: same X, lower nLockTime, tx_n+1, key-share rotated, X still UNSPENT (statechain-accepted, not Bitcoin-confirmed)");
+    crate::rgb_dump::dump("owner after refresh #1 (new RGB commitment on the same X)", &mut issuer, &contract);
 
     // ---- 3. REFRESH #2: refresh again on the now-latest state. ----
     let r2 = mercuryrustlib::rgb::refresh_rgb_anchor_self_transfer(
-        &cc, &issuer, wallet_name, &statechain_id, &contract, ISSUED, BLINDING + 2, NETWORK,
+        &cc, &issuer, wallet_name, &statechain_id, &contract, ISSUED, BLINDING + 2, NETWORK, None,
     ).await?;
     println!("RGB07 - refresh #2: tx_n {}->{} nLockTime {}->{}", r2.previous_tx_n, r2.new_tx_n, r2.previous_nlocktime, r2.new_nlocktime);
     assert_eq!(r2.status, RgbStatechainStatus::RgbAnchorRefreshAccepted);

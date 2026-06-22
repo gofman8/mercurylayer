@@ -228,6 +228,7 @@ pub async fn refresh_rgb_anchor_self_transfer(
     rgb_amount: u64,
     blinding: u64,
     network: &str,
+    beneficiary: Option<&str>,
 ) -> Result<RgbAnchorRefresh> {
     use crate::sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet};
     use crate::utils::info_config;
@@ -310,6 +311,18 @@ pub async fn refresh_rgb_anchor_self_transfer(
     // Passing the current chain height instead would make the new locktime far too low.
     let first_backup_locktime = mercurylib::utils::get_blockheight(&coin_backups[0])?;
     let mut coin_for_color = coin.clone();
+    // The bitcoin output always pays the sender's own (self-transfer) address, so the sats stay with
+    // the sender. The RGB asset assignment is set by the OP_RETURN: `beneficiary = None` assigns to
+    // the self output (anchor self-refresh, rgb07); `Some(recipient_id)` assigns to a *receiver's*
+    // blinded seal (off-chain P2P transfer, rgb08) - the asset moves, the sats do not.
+    let blinded_vec: Vec<(String, u64)>;
+    let blinded = match beneficiary {
+        Some(rid) => {
+            blinded_vec = vec![(rid.to_string(), rgb_amount)];
+            Some(blinded_vec.as_slice())
+        }
+        None => None,
+    };
     let colored = create_colored_backup_tx(
         client_config,
         rgb,
@@ -325,7 +338,7 @@ pub async fn refresh_rgb_anchor_self_transfer(
         si.initlock,
         si.interval,
         blinding,
-        None,
+        blinded,
     )
     .await?;
     let new_nlocktime = tx_nlocktime(&colored.signed_tx)?;

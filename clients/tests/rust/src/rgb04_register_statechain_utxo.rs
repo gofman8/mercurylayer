@@ -198,6 +198,8 @@ pub async fn execute() -> Result<()> {
     assert!(*b_color && *b_exists, "statechain UTXO B must be a colorable existing UTXO");
     assert!(*b_pending >= 1, "blind_receive must have reserved the statechain UTXO B as the invoice seal");
 
+    crate::rgb_dump::dump("sender/issuer (asset registered on statechain UTXO A)", &mut issuer, &contract);
+    crate::rgb_dump::dump("receiver (free statechain UTXO B with pending blinded invoice)", &mut receiver, &contract);
     println!("RGB04 - SUCCESS: rgb-lib treats statechain UTXOs as on-chain colorable UTXOs - get_asset_balance/list_unspents surface A's allocation, and blind_receive's invoice seal is the statechain UTXO B.");
     Ok(())
 }

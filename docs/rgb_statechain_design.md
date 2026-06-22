@@ -1,9 +1,13 @@
 # RGB on statechains, the same way it works on-chain
 
 This document answers "**would this work?**" (yes) and specifies how to make `rgb-lib` treat
-statechain UTXOs exactly like on-chain UTXOs — so transfers consume a coin, change goes back to a
-free statechain UTXO, and the only difference from on-chain RGB is that the sats move to the receiver
-via the statechain instead of to a miner.
+statechain UTXOs exactly like on-chain UTXOs — so an asset can be deposited onto a statechain UTXO,
+transferred to another statechain owner, and exited back on-chain. Unlike on-chain RGB, a transfer
+needs no on-chain transaction and pays no miner fee: the **bitcoin sats stay with their owners** —
+the sender re-commits its *own* statechain coin to a new RGB state (spending it to itself with a new
+OP_RETURN), and the receiver receives the asset on a statechain UTXO it already controls. Only the
+RGB asset moves between parties; the sats do not. (See `rgb_anchor_refresh.md` for the off-chain,
+no-broadcast variant.)
 
 It is grounded in what was verified empirically against `UTEXO-Protocol/rgb-lib@dev` + Mercury Layer
 on a local regtest (see `RUN_RGB_E2E.md`, `rgb01_full_lifecycle.rs`, `rgb02_deposit_coop_exit.rs`).
@@ -51,10 +55,13 @@ UTXO plays in a channel.
    it with a standard `refresh`.
 ```
 
-Each transfer consumes the whole statechain UTXO (its sats are split between the receiver's new coin
-and the sender's change coin) — identical to on-chain RGB, except the sats are not burned as fees to
-a miner; they move to the receiver through the statechain. This matches your "multiple coins, change
-back to free allocation, each transfer consumes a UTXO" requirement.
+Each transfer re-commits the sender's statechain UTXO to a new RGB state (the sender spends it to
+itself) and assigns the asset to the receiver's seal + any change to a free statechain UTXO —
+identical to on-chain RGB, except no on-chain transaction or miner fee is involved and **no sats move
+between parties**: the sender keeps its coin's sats, and the receiver receives the asset on a
+statechain UTXO it already controls. This matches your "multiple coins, change back to free
+allocation, each transfer consumes a UTXO" requirement (the coin is consumed/re-committed, not paid
+to the receiver).
 
 ## What rgb-lib needs (the real, minimal changes)
 
@@ -151,7 +158,10 @@ commitment transaction before revoking the previous state.
   transition via `blinded_map`). Receiver settles 600 on B, sender settles 400 change on C, A is
   consumed and marked spent. End state: receiver `get_asset_balance` = 600 on B, sender = 400 on C -
   each transfer consumes a UTXO and the change returns to a free statechain UTXO, identical to
-  on-chain RGB except the sats move to the receiver via the statechain. (`rgb06_partial_transfer_change.rs`.)
+  on-chain RGB except no on-chain tx / miner fee is needed and the sats stay with their owners (the
+  sender spends A to itself; the receiver receives the asset on its own statechain UTXO). The
+  fully off-chain, no-broadcast variant is `rgb08` (see `rgb_anchor_refresh.md`).
+  (`rgb06_partial_transfer_change.rs`.)
 
 All building blocks (deposit, register, witness exit, blinded transfer, partial transfer with change)
 are green, so the full "RGB the same way it works on-chain" flow — deposit → transfer (witness *or*

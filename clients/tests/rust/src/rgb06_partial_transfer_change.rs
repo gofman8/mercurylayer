@@ -150,6 +150,8 @@ pub async fn execute() -> Result<()> {
     tokio::task::block_in_place(|| issuer.register_statechain(&txid_c, vout_c, COIN_SAT_C as u64, &contract, 0, &[]))?;
     let change_id = tokio::task::block_in_place(|| issuer.blind_receive(None, CHANGE_AMT))?;
     println!("RGB06 - receiver invoice {RECEIVE_AMT}@B={txid_b}:{vout_b}; change invoice {CHANGE_AMT}@C={txid_c}:{vout_c}");
+    crate::rgb_dump::dump("sender before transfer (full asset on A)", &mut issuer, &contract);
+    crate::rgb_dump::dump("receiver before transfer (invoice on B)", &mut receiver, &contract);
 
     // Sender spends A "to itself" + OP_RETURN committing RECEIVE_AMT -> B and CHANGE_AMT -> C.
     let exit_address = tokio::task::block_in_place(|| issuer.get_address())?;
@@ -202,6 +204,8 @@ pub async fn execute() -> Result<()> {
     assert!(tokio::task::block_in_place(|| is_outpoint_spent(&cc, &txid_a, vout_a)),
         "the sender's statechain UTXO A must be consumed on-chain");
 
+    crate::rgb_dump::dump("receiver after transfer (received amount on B)", &mut receiver, &contract);
+    crate::rgb_dump::dump("sender after transfer (change on C, A consumed)", &mut issuer, &contract);
     println!("RGB06 - SUCCESS: partial statechain->statechain transfer - {RECEIVE_AMT} to the receiver's statechain UTXO, {CHANGE_AMT} change back to a free statechain UTXO, A consumed (RGB the same way it works on-chain).");
     Ok(())
 }

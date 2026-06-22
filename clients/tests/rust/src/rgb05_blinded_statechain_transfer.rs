@@ -135,6 +135,7 @@ pub async fn execute() -> Result<()> {
     })?;
     let bal_sender = tokio::task::block_in_place(|| issuer.settled_balance(&contract))?;
     println!("RGB05 - sender holds {bal_sender} on statechain UTXO A = {txid_a}:{vout_a}");
+    crate::rgb_dump::dump("sender after deposit+register (asset on statechain UTXO A)", &mut issuer, &contract);
     assert_eq!(bal_sender, ISSUED);
 
     // -------- Receiver: onboard a free statechain UTXO B, register it, and blind_receive on it. --------
@@ -156,6 +157,7 @@ pub async fn execute() -> Result<()> {
     })?;
     let recipient_id = tokio::task::block_in_place(|| receiver.blind_receive(None, ISSUED))?;
     println!("RGB05 - receiver blinded invoice on its statechain UTXO B = {txid_b}:{vout_b} -> {recipient_id}");
+    crate::rgb_dump::dump("receiver before transfer (blinded invoice reserved on B)", &mut receiver, &contract);
 
     // -------- Sender: spend A "to itself" + OP_RETURN committing amount -> receiver's blinded seal. --------
     let exit_address = tokio::task::block_in_place(|| issuer.get_address())?;
@@ -188,6 +190,8 @@ pub async fn execute() -> Result<()> {
     }
 
     // -------- Proofs (standard rgb-lib methods). --------
+    crate::rgb_dump::dump("receiver after transfer (asset now on its statechain UTXO B)", &mut receiver, &contract);
+    crate::rgb_dump::dump("sender after transfer (asset left A)", &mut issuer, &contract);
     let recv_allocs = tokio::task::block_in_place(|| receiver.list_allocations(&contract))?;
     for (op, amt, settled) in &recv_allocs {
         println!("RGB05 - [standard rgb-lib] receiver allocation: {op} amount={amt} settled={settled}");

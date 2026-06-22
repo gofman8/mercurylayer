@@ -80,6 +80,11 @@ fn dump_rgb_state(label: &str, rgb: &mut RgbWallet, asset_id: &str) {
             }
             Err(e) => println!("    [{label}] balance: <{e}>"),
         }
+        if let Ok(us) = rgb.unspents_dump() {
+            for (op, sat, color, exists, nalloc, pending) in us {
+                println!("    [{label}] list_unspents: {op} sats={sat} colorable={color} exists={exists} allocations={nalloc} pending_blinded={pending}");
+            }
+        }
         match rgb.list_allocations(asset_id) {
             Ok(allocs) if !allocs.is_empty() => {
                 for (op, amt, settled) in allocs {
