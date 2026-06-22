@@ -65,6 +65,7 @@ pub async fn create_colored_backup_tx(
     initlock: u32,
     interval: u32,
     blinding: u64,
+    blinded: Option<&[(String, u64)]>,
 ) -> Result<ColoredBackupTx> {
     // 1. Generate and commit nonces, then fetch the server's public nonce (sign/first).
     let coin_nonce = mercurylib::transaction::create_and_commit_nonces(coin)?;
@@ -100,10 +101,16 @@ pub async fn create_colored_backup_tx(
     // 3. Color with rgb-lib: assign `rgb_amount` to the pre-coloring output index 0. rgb-lib inserts
     //    the OP_RETURN opret commitment (at index 0, shifting the recipient to index 1) and returns
     //    the modified PSBT plus the consignment.
-    let mut output_map = std::collections::HashMap::new();
-    output_map.insert(0u32, rgb_amount);
-    let (colored_psbt_b64, consignment) =
-        rgb.color(&unsigned_psbt_b64, contract_id, output_map, blinding)?;
+    let (colored_psbt_b64, consignment) = if let Some(blinded) = blinded {
+        // statechain->statechain: assign to blinded seals (receiver's statechain UTXO + change to a
+        // free statechain UTXO). The tx just spends the statechain UTXO to `to_address` ("to himself")
+        // and commits the transition via OP_RETURN; no asset goes to a witness vout of this tx.
+        rgb.color_blinded(&unsigned_psbt_b64, contract_id, blinded.to_vec(), blinding)?
+    } else {
+        let mut output_map = std::collections::HashMap::new();
+        output_map.insert(0u32, rgb_amount);
+        rgb.color(&unsigned_psbt_b64, contract_id, output_map, blinding)?
+    };
 
     // 4. Extract the colored unsigned transaction (bitcoin 0.30) and hex-encode it.
     let colored_psbt = Psbt::from_str(&colored_psbt_b64)

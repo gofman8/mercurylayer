@@ -86,15 +86,16 @@ back to free allocation, each transfer consumes a UTXO" requirement.
    the `StatechainResolver` analogous to the existing `OffchainResolver`. (a) is enough today; (b)
    is the clean long-term fix.
 
-3. **The one remaining gap — `color_psbt` beneficiaries.** `color_psbt` builds transition
-   beneficiaries **only from `output_map` (witness vouts = new outputs of the tx being colored)**. A
-   fully faithful statechain→statechain *blinded* transfer assigns `amount` to the receiver's
-   **existing** statechain UTXO (a `BuilderSeal::Concealed` from the `blind_receive` recipient_id)
-   and the **change to the sender's existing free statechain UTXO** — both *existing outpoints*, not
-   witness vouts. So `color_psbt` needs a small extension to accept blinded/existing-outpoint
-   beneficiaries (the logic rgb-lib's `send` already has for normal blinded recipients). The witness
-   half — receiver gets the asset on a *new* output of the sender's exit tx — already works today via
-   `output_map` (that is exactly `rgb03`'s exit-to-on-chain and the cooperative exit).
+3. **`color_psbt` blinded beneficiaries — IMPLEMENTED & PROVEN (`rgb05`).** `color_psbt` originally
+   built transition beneficiaries **only from `output_map` (witness vouts)**. It now also accepts
+   `AssetColoringInfo::blinded_map` (`recipient_id -> amount`): each `recipient_id` is parsed
+   (`XChainNet::<Beneficiary>::from_str(...).into_inner()` -> `Beneficiary::BlindedSeal(secret_seal)`)
+   into a `BuilderSeal::Concealed` and added to the transition — exactly the logic rgb-lib's `send`
+   uses for normal blinded recipients. This lets one transfer assign `amount` to the receiver's
+   **existing** statechain UTXO (its `blind_receive` seal) and route **change to a free statechain
+   UTXO** (another blinded seal) — both existing outpoints, no witness vout. ~30 lines in
+   `color_psbt`, all rgb-lib, no protocol change. (The witness half — receiver gets the asset on a
+   *new* output — also still works via `output_map`: that is `rgb03`'s exit-to-on-chain.)
 
 4. **Reuse, no change needed:** `color_psbt_and_consume` (build the transition + OP_RETURN),
    `witness_receive` / `blind_receive` (receiver seal — `blind_receive` now picks a statechain UTXO),
@@ -102,9 +103,9 @@ back to free allocation, each transfer consumes a UTXO" requirement.
    the unbroadcast exit tx), `refresh` (settle on exit). Mercury side: `get_unsigned_backup_psbt`
    (build the tx) + `get_partial_sig_request_for_colored_tx` (blind-MuSig2 sign the colored tx).
 
-With (1) (done) + (2a) (done) the statechain UTXO is a first-class colorable UTXO: `get_asset_balance`
-tracks it and `blind_receive` makes invoices on it. Adding (3) lets a single transfer assign the
-requested amount to the receiver and the **change to a free statechain UTXO**, finishing "RGB the
+With (1) (done) + (2a) (done) + (3) (done) the statechain UTXO is a first-class colorable UTXO:
+`get_asset_balance` tracks it, `blind_receive` makes invoices on it, and a transfer assigns the
+requested amount to the receiver's statechain UTXO and change to a free statechain UTXO — "RGB the
 same way it works on-chain."
 
 ## Security (your last point — critical)
@@ -136,6 +137,15 @@ commitment transaction before revoking the previous state.
   the spent on-chain source, not double-counted). Receiver: a *free* statechain UTXO is onboarded and
   registered, then standard `blind_receive` reserves it as the invoice seal (`pending_blinded`),
   i.e. the rgb invoice's `recipient_id` references the statechain UTXO. (`rgb04_register_statechain_utxo.rs`.)
-- **Gap to close** for a single deposit→partial-transfer-with-change→exit path with standard balances
-  on both sides throughout: item (3) above — extend `color_psbt` to assign to blinded/existing-outpoint
-  beneficiaries (receiver's statechain seal + change to a free statechain UTXO).
+- **Statechain -> statechain transfer via a standard rgb-lib blinded invoice.** The receiver
+  `blind_receive`s on its registered statechain UTXO B (the invoice's `recipient_id` references B);
+  the sender spends its statechain UTXO A "to itself" with an OP_RETURN committing the transition to
+  B's blinded seal (blind-MuSig2 co-signed); the receiver settles via standard `refresh`, so the
+  asset lands on its statechain UTXO B (`get_asset_balance` = 1000, allocation settled on B) and A is
+  consumed on-chain. Uses the new `color_blinded` / `blinded_map` path. (`rgb05_blinded_statechain_transfer.rs`.)
+
+All four building blocks (deposit, register, witness exit, blinded transfer) are green, so the full
+"RGB the same way it works on-chain" flow — deposit → transfer (witness *or* blinded, with change to
+a free statechain UTXO) → exit to on-chain and back — is demonstrated end to end. The only remaining
+polish is the `StatechainResolver` (item 2b) so `Wallet::sync`/`refresh` never needs the "don't
+reconcile registered statechain txos" guard.

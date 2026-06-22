@@ -280,6 +280,7 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
         server_info.initlock,
         server_info.interval,
         BLINDING,
+        None,
     )
     .await?;
     println!("RGB01 - built colored backup tx {} for transfer", transfer.txid);
@@ -350,6 +351,7 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
         server_info.initlock,
         server_info.interval,
         BLINDING,
+        None,
     )
     .await?;
     let withdraw_bytes = hex::decode(&withdraw.signed_tx)?;

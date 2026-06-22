@@ -137,7 +137,7 @@ pub async fn execute() -> Result<()> {
     let mut coin_w = coin.clone();
     let withdraw = mercuryrustlib::rgb::create_colored_backup_tx(
         &cc, &issuer, &mut coin_w, &contract, ISSUED, &exit_address, 1, true, None, NETWORK,
-        si.fee_rate_sats_per_byte, si.initlock, si.interval, BLINDING,
+        si.fee_rate_sats_per_byte, si.initlock, si.interval, BLINDING, None,
     )
     .await?;
     tokio::task::block_in_place(|| {

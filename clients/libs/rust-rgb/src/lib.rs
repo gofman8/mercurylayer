@@ -242,6 +242,7 @@ impl RgbWallet {
                 contract,
                 AssetColoringInfo {
                     output_map,
+                    blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
                 },
             )]),
@@ -264,6 +265,51 @@ impl RgbWallet {
         let bytes = fs::read(&path)?;
         let _ = fs::remove_dir_all(&dir);
 
+        Ok((psbt.to_string(), STANDARD.encode(bytes)))
+    }
+
+    /// Color a PSBT assigning to **blinded** beneficiaries (existing outpoints) rather than witness
+    /// vouts: `blinded` is a list of `(recipient_id, amount)` where each `recipient_id` is a
+    /// `blind_receive` blinded seal (e.g. on a statechain UTXO), enabling a statechain->statechain
+    /// transfer where the receiver receives on its own statechain UTXO and change goes to a free
+    /// statechain UTXO. Uses the public `color_psbt_and_consume` + the fork's `blinded_map`.
+    /// Returns `(colored_psbt_base64, consignment_base64)` - one consignment covering all beneficiaries.
+    pub fn color_blinded(
+        &self,
+        psbt_base64: &str,
+        contract_id: &str,
+        blinded: Vec<(String, u64)>,
+        blinding: u64,
+    ) -> Result<(String, String)> {
+        let contract = ContractId::from_str(contract_id)
+            .map_err(|e| anyhow!("invalid contract id: {e}"))?;
+        let mut psbt = RgbPsbt::from_str(psbt_base64).map_err(|e| anyhow!("invalid psbt: {e}"))?;
+        let blinded_map: HashMap<String, u64> = blinded.into_iter().collect();
+        let coloring_info = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                contract,
+                AssetColoringInfo {
+                    output_map: HashMap::new(),
+                    blinded_map,
+                    static_blinding: Some(blinding),
+                },
+            )]),
+            static_blinding: Some(blinding),
+            nonce: None,
+        };
+        let transfers = self.wallet.color_psbt_and_consume(&mut psbt, coloring_info)?;
+        let transfer = transfers
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("color produced no consignment"))?;
+        let dir = unique_tmp("mercury-rgb-color-blinded");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        transfer
+            .save_file(&path)
+            .map_err(|e| anyhow!("could not serialize consignment: {e}"))?;
+        let bytes = fs::read(&path)?;
+        let _ = fs::remove_dir_all(&dir);
         Ok((psbt.to_string(), STANDARD.encode(bytes)))
     }
 
