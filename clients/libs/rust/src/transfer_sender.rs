@@ -172,6 +172,8 @@ pub async fn create_backup_transactions(
             client_public_key: coin.user_pubkey.clone(),
             server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
             blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
+            rgb_consignment: None,
+            rgb_blinding: None,
         };
 
         filtered_transactions.push(backup_tx);

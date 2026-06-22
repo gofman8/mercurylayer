@@ -1,0 +1,16 @@
+[package]
+name = "mercury-rgb"
+version = "0.1.0"
+edition = "2021"
+description = "Bridge between Mercury Layer (statechains) and rgb-lib for issuing/transferring RGB assets bound to statechain UTXOs."
+
+# This crate intentionally depends on rgb-lib (which pulls in a newer `bitcoin`/`bdk` stack) while
+# the Mercury crates pin `bitcoin 0.30`. To avoid type clashes between the two `bitcoin` versions,
+# this bridge only ever exchanges *strings* (base64 PSBTs, hex txids, base64 consignments) with the
+# Mercury side - no Bitcoin types cross the boundary.
+[dependencies]
+# For the UTEXO fork deliverable, prefer the git form:
+#   rgb-lib = { git = "https://github.com/UTEXO-Protocol/rgb-lib", branch = "feat/statechain", default-features = false, features = ["electrum"] }
+rgb-lib = { path = "../../../../utexo-rgb-lib", default-features = false, features = ["electrum"] }
+anyhow = "1.0"
+base64 = "0.22"

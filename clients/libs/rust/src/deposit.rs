@@ -69,6 +69,8 @@ pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_ne
         client_public_key: coin.user_pubkey.clone(),
         server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
         blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
+        rgb_consignment: None,
+        rgb_blinding: None,
     };
 
     let block_height = Some(get_blockheight(&backup_tx)?);

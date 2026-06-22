@@ -11,6 +11,7 @@ pub mod tb04_simple_lightning_latch;
 pub mod tb05_timelock;
 pub mod tm01_sender_double_spends;
 mod tv01;
+pub mod rgb01_full_lifecycle;
 pub mod utils;
 use anyhow::{Result, Ok};
 

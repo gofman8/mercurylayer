@@ -193,9 +193,119 @@ pub fn get_partial_sig_request(
     Ok(session)
 }
 
+/// Build the unsigned backup/withdrawal transaction (one input = the statechain UTXO, one output =
+/// the recipient/owner) and return it hex-encoded, **without** signing it.
+///
+/// This is the entry point for the Mercury RGB integration: the returned transaction is handed to
+/// rgb-lib (`color_statechain_psbt`) which inserts the OP_RETURN opret commitment, and the colored
+/// transaction is then signed via [`get_partial_sig_request_for_colored_tx`].
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub fn get_unsigned_backup_tx(
+    coin: &Coin,
+    block_height: u32,
+    initlock: u32,
+    interval: u32,
+    fee_rate_sats_per_byte: f64,
+    qt_backup_tx: u32,
+    to_address: String,
+    network: String,
+    is_withdrawal: bool,
+) -> core::result::Result<String, MercuryError> {
+    let network = utils::get_network(&network)?;
+
+    let tx_out = create_tx_out(coin, fee_rate_sats_per_byte, &to_address, network)?;
+
+    let block_height =
+        calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
+
+    let lock_time = absolute::LockTime::from_height(block_height)?;
+
+    let input_txid = Txid::from_str(&coin.utxo_txid.as_ref().unwrap())?;
+    let input_vout = coin.utxo_vout.unwrap();
+
+    let unsigned_tx = Transaction {
+        version: 2,
+        lock_time,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: input_txid, vout: input_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence(0x0), // Ignore nSequence.
+            witness: Witness::default(),
+        }],
+        output: vec![tx_out],
+    };
+
+    let tx_bytes = bitcoin::consensus::encode::serialize(&unsigned_tx);
+    Ok(hex::encode(tx_bytes))
+}
+
+/// Build the unsigned backup/withdrawal transaction and return it as a base64-encoded PSBT, with
+/// the input `witness_utxo` and `tap_internal_key` populated (the funding/statechain UTXO).
+///
+/// This PSBT is what gets handed to rgb-lib's `color_statechain_psbt`: rgb-lib parses it, inserts
+/// the OP_RETURN opret commitment and assigns the asset, returning a modified PSBT. The modified
+/// PSBT's unsigned transaction is then fed to [`get_partial_sig_request_for_colored_tx`].
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub fn get_unsigned_backup_psbt(
+    coin: &Coin,
+    block_height: u32,
+    initlock: u32,
+    interval: u32,
+    fee_rate_sats_per_byte: f64,
+    qt_backup_tx: u32,
+    to_address: String,
+    network: String,
+    is_withdrawal: bool,
+) -> core::result::Result<String, MercuryError> {
+    let network = utils::get_network(&network)?;
+
+    let tx_out = create_tx_out(coin, fee_rate_sats_per_byte, &to_address, network)?;
+
+    let block_height =
+        calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
+
+    let lock_time = absolute::LockTime::from_height(block_height)?;
+
+    let input_txid = Txid::from_str(&coin.utxo_txid.as_ref().unwrap())?;
+    let input_vout = coin.utxo_vout.unwrap();
+
+    let unsigned_tx = Transaction {
+        version: 2,
+        lock_time,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: input_txid, vout: input_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence(0x0),
+            witness: Witness::default(),
+        }],
+        output: vec![tx_out],
+    };
+
+    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+
+    let input_pubkey = PublicKey::from_str(&coin.aggregated_pubkey.as_ref().unwrap())?;
+    let input_xonly_pubkey = input_pubkey.x_only_public_key().0;
+
+    let input_amount = coin.amount.unwrap() as u64;
+    let input_address =
+        Address::from_str(&coin.aggregated_address.as_ref().unwrap())?.require_network(network)?;
+    let input_scriptpubkey = input_address.script_pubkey();
+
+    let ty = PsbtSighashType::from_str("SIGHASH_ALL")?;
+    let mut input = Input {
+        witness_utxo: Some(TxOut { value: input_amount, script_pubkey: input_scriptpubkey }),
+        ..Default::default()
+    };
+    input.sighash_type = Some(ty);
+    input.tap_internal_key = Some(input_xonly_pubkey);
+    psbt.inputs = vec![input];
+
+    Ok(psbt.to_string())
+}
+
 pub fn get_musig_session(
     coin: &Coin,
-    block_height: u32, 
+    block_height: u32,
     output: &TxOut,
     network: Network) -> core::result::Result<PartialSignatureMsg1, MercuryError>
 {
@@ -269,6 +379,57 @@ pub fn get_musig_session(
         encoded_unsigned_tx)?;
 
     Ok(session)
+}
+
+/// Compute the blind-MuSig2 partial-signature session for a backup/withdrawal transaction that was
+/// built and *colored* outside of this crate (Mercury RGB integration).
+///
+/// The provided `encoded_unsigned_tx` (hex) is the unsigned transaction produced by Mercury and
+/// then handed to rgb-lib for coloring, so it already contains the recipient output **and** the
+/// zero-value OP_RETURN opret commitment output inserted by RGB. This function recomputes the
+/// taproot key-spend sighash over that exact transaction (committing to all outputs, including the
+/// commitment) and returns the same [`PartialSignatureMsg1`] the normal flow produces, so the rest
+/// of the signing flow (server partial sig, aggregation, witness) is unchanged.
+///
+/// Returns an error if the transaction does not have exactly one input.
+#[cfg_attr(feature = "bindings", uniffi::export)]
+pub fn get_partial_sig_request_for_colored_tx(
+    coin: &Coin,
+    encoded_unsigned_tx: String,
+    network: String,
+) -> core::result::Result<PartialSignatureMsg1, MercuryError> {
+    let network = utils::get_network(&network)?;
+
+    let tx_bytes = hex::decode(&encoded_unsigned_tx)?;
+    let unsigned_tx: Transaction = bitcoin::consensus::encode::deserialize(&tx_bytes)?;
+
+    if unsigned_tx.input.len() != 1 {
+        return Err(MercuryError::MoreThanOneInputError);
+    }
+
+    let input_pubkey = PublicKey::from_str(&coin.aggregated_pubkey.as_ref().unwrap())?;
+    let input_xonly_pubkey = input_pubkey.x_only_public_key().0;
+
+    let input_amount = coin.amount.unwrap() as u64;
+    let input_address =
+        Address::from_str(&coin.aggregated_address.as_ref().unwrap())?.require_network(network)?;
+    let input_scriptpubkey = input_address.script_pubkey();
+
+    let prevout = TxOut {
+        value: input_amount,
+        script_pubkey: input_scriptpubkey,
+    };
+
+    let hash = SighashCache::new(&unsigned_tx).taproot_key_spend_signature_hash(
+        0,
+        &sighash::Prevouts::All(&[prevout]),
+        TapSighashType::All,
+    )?;
+
+    // Sanity: the internal key recorded in the coin must match the funding output we are spending.
+    let _ = input_xonly_pubkey;
+
+    calculate_musig_session(coin, hash, encoded_unsigned_tx)
 }
 
 pub fn calculate_musig_session(

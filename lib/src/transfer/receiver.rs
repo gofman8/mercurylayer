@@ -218,7 +218,13 @@ pub fn verify_latest_backup_tx_pays_to_user_pubkey(transfer_msg: &TransferMsg, c
 
     let last_tx: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&last_bkp_tx.tx)?)?;
 
-    let output = &last_tx.output[0];
+    // Skip the OP_RETURN opret commitment output (present on RGB-enabled coins) and check the
+    // spendable output pays to the new owner's key.
+    let output = last_tx
+        .output
+        .iter()
+        .find(|o| !o.script_pubkey.is_op_return())
+        .ok_or(MercuryError::NoBackupTransactionFound)?;
 
     let aggregate_address = Address::p2tr(&Secp256k1::new(), client_pubkey_share.x_only_public_key().0, None, network);
 
@@ -371,7 +377,10 @@ pub fn verify_transaction_signature(tx_n_hex: &str, tx0_hex: &str, fee_rate_tole
 
     let msg: Message = hash.into();
 
-    let fee = tx0_output.value - tx_n.output[0].value;
+    // Sum all outputs (the OP_RETURN commitment output, if present, has zero value) so the fee is
+    // computed correctly regardless of whether the backup tx carries an RGB commitment.
+    let total_output_value: u64 = tx_n.output.iter().map(|o| o.value).sum();
+    let fee = tx0_output.value - total_output_value;
     let fee_rate = fee as f64 / tx_n.vsize() as f64;
 
     if (fee_rate + fee_rate_tolerance) < current_fee_rate_sats_per_byte {
@@ -420,7 +429,17 @@ pub fn verify_if_locktime_is_reasonable_tx_version_and_output_size(tx_n_hex: &st
         return Err(MercuryError::TransactionVersionError);
     }
 
-    if tx_n.output.len() > 1 {
+    // An RGB-enabled backup transaction carries exactly one extra zero-value OP_RETURN output
+    // holding the opret commitment. There must be exactly one spendable (non-OP_RETURN) output
+    // (paying the owner/recipient) and at most one OP_RETURN commitment output.
+    let op_return_outputs = tx_n.output.iter().filter(|o| o.script_pubkey.is_op_return()).count();
+    let payment_outputs = tx_n.output.len() - op_return_outputs;
+
+    if payment_outputs != 1 {
+        return Err(MercuryError::TxHasMoreThanOneOutput);
+    }
+
+    if op_return_outputs > 1 {
         return Err(MercuryError::TxHasMoreThanOneOutput);
     }
 
@@ -445,8 +464,10 @@ pub fn reconstruct_transaction(tx_n_hex: &str) -> Result<(), MercuryError> {
 
     let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
 
-    // this assumes that the transaction has only one input and one output (suposedly checked before)
-    let output = tx_n.output[0].clone();
+    // this assumes that the transaction has only one input (supposedly checked before). It may have
+    // one or two outputs: the recipient/owner output and, for RGB-enabled coins, a zero-value
+    // OP_RETURN opret commitment. All outputs are kept, in order, to verify canonical serialization.
+    let output = tx_n.output.clone();
     let input = tx_n.input[0].clone();
     let locktime = tx_n.lock_time;
 
@@ -454,7 +475,7 @@ pub fn reconstruct_transaction(tx_n_hex: &str) -> Result<(), MercuryError> {
         version: 2,
         lock_time: locktime,
         input: [input].to_vec(),
-        output: [output].to_vec(),
+        output,
     };
 
     let serialized_new_tx = hex::encode(bitcoin::consensus::encode::serialize(&new_tx));

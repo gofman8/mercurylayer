@@ -3,6 +3,7 @@ pub mod client_config;
 pub mod coin_status;
 pub mod deposit;
 pub mod lightning_latch;
+pub mod rgb;
 pub mod sqlite_manager;
 pub mod transaction;
 pub mod transfer_receiver;

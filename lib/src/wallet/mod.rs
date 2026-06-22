@@ -190,6 +190,16 @@ pub struct BackupTx {
     pub client_public_key: String,
     pub server_public_key: String,
     pub blinding_factor: String,
+    /// RGB consignment (base64) for this backup transaction, present only for RGB-enabled coins.
+    /// It proves the state transition that assigns the asset to this transaction's spendable output
+    /// once it is broadcast (cooperative withdrawal or unilateral exit). Relayed in-band with the
+    /// Mercury transfer message; the server treats it as opaque.
+    #[serde(default)]
+    pub rgb_consignment: Option<String>,
+    /// Blinding factor of the RGB seal used while coloring this transaction. The receiver needs it
+    /// to accept the consignment. Present only for RGB-enabled coins.
+    #[serde(default)]
+    pub rgb_blinding: Option<u64>,
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
