@@ -367,6 +367,75 @@ impl RgbWallet {
         Ok((txid, vout, STANDARD.encode(consignment), signed_tx_hex))
     }
 
+    /// Register a Mercury statechain UTXO as a wallet-owned colorable UTXO, so standard rgb-lib
+    /// methods (`get_asset_balance`, `list_unspents`, `blind_receive`) treat it exactly like an
+    /// on-chain UTXO (design-doc item 1). `rgb_amount == 0` registers a *free* coin (onboarding: a
+    /// statechain UTXO to receive on). Any allocation must already be in the stash (e.g. it was put
+    /// there by `fund_statechain` on this wallet). Returns the txo idx.
+    pub fn register_statechain(
+        &self,
+        txid: &str,
+        vout: u32,
+        btc_amount: u64,
+        contract_id: &str,
+        rgb_amount: u64,
+        spend_outpoints: &[String],
+    ) -> Result<i32> {
+        use rgb_lib::wallet::Outpoint;
+        let spend = spend_outpoints
+            .iter()
+            .filter_map(|s| {
+                let (t, v) = s.rsplit_once(':')?;
+                Some(Outpoint { txid: t.to_string(), vout: v.parse().ok()? })
+            })
+            .collect();
+        Ok(self.wallet.register_statechain_utxo(
+            txid.to_string(),
+            vout,
+            btc_amount,
+            contract_id.to_string(),
+            rgb_amount,
+            spend,
+        )?)
+    }
+
+    /// Standard rgb-lib **blinded receive** invoice for `amount`. The seal is one of this wallet's
+    /// free colorable UTXOs - which, after `register_statechain`, can be a statechain UTXO. This is
+    /// the user's "receiver creates an rgb invoice whose recipient_id references its statechain UTXO".
+    /// Returns the `recipient_id` (the blinded seal the sender assigns to).
+    pub fn blind_receive(&mut self, asset_id: Option<&str>, amount: u64) -> Result<String> {
+        let rd = self.wallet.blind_receive(
+            asset_id.map(|s| s.to_string()),
+            Assignment::Fungible(amount),
+            None,
+            vec![self.proxy.clone()],
+            0,
+        )?;
+        Ok(rd.recipient_id)
+    }
+
+    /// Dump this wallet's unspents as `(outpoint, btc_amount, colorable, exists, n_allocations,
+    /// pending_blinded)` - so a test can show that a registered statechain UTXO is treated as a
+    /// colorable on-chain UTXO (and, after `blind_receive`, carries a pending blinded seal).
+    pub fn unspents_dump(&mut self) -> Result<Vec<(String, u64, bool, bool, usize, u32)>> {
+        let unspents = self
+            .wallet
+            .list_unspents(Some(self.online.clone()), false, false)?;
+        Ok(unspents
+            .into_iter()
+            .map(|u| {
+                (
+                    format!("{}:{}", u.utxo.outpoint.txid, u.utxo.outpoint.vout),
+                    u.utxo.btc_amount,
+                    u.utxo.colorable,
+                    u.utxo.exists,
+                    u.rgb_allocations.len(),
+                    u.pending_blinded,
+                )
+            })
+            .collect())
+    }
+
     /// Deposit using rgb-lib's **standard** `send`: pay `amount_sat` to the statechain `address` as
     /// an RGB *witness* recipient assigned `rgb_amount` of `contract_id`. Because this goes through
     /// rgb-lib's normal transfer flow, all standard methods reflect it afterwards: the issuer's

@@ -58,35 +58,54 @@ back to free allocation, each transfer consumes a UTXO" requirement.
 
 ## What rgb-lib needs (the real, minimal changes)
 
-1. **`register_statechain_utxo(outpoint, sats)`** — insert an *externally-owned* outpoint into
-   rgb-lib's `txo` table as an existing wallet UTXO, bypassing the BDK ownership/descriptor check.
-   Source of truth for existence = the statechain, not the indexer. Touch points discovered while
-   investigating (`get_asset_balance` reads DB allocations on wallet txos; `set_txo` inserts a txo):
-   - `DbTxo` has no `colorable` column — colorability is *derived* from whether the txo's script
-     belongs to the colored keychain. A statechain UTXO is a MuSig key in neither keychain, so the
-     derivation must be extended to treat registered statechain outpoints as colorable.
-   - `list_unspents` enumerates **BDK**'s unspents (descriptor-owned) and joins DB allocations; it
-     must additionally include DB-registered statechain txos that BDK can't see.
-   - allocation mapping (`get_rgb_allocations`) already keys by outpoint, so once the txo is
-     registered and the stash holds the allocation (from a color-based deposit), the balance follows.
-   So it is a few coordinated touch points, not a one-liner - but all in rgb-lib, no protocol change.
+1. **`register_statechain_utxo(...)` — IMPLEMENTED & PROVEN (`rgb04`).** Inserts an
+   *externally-owned* statechain outpoint into rgb-lib's `txo` table as an existing wallet UTXO,
+   bypassing the BDK ownership/descriptor check, so standard `get_asset_balance` / `list_unspents` /
+   `blind_receive` treat it exactly like an on-chain colorable UTXO. What the investigation actually
+   found (simpler than feared):
+   - `DbTxo` has **no `colorable` column** — every txo in the `txo` table is colorable; BDK's own
+     outputs come in as `colorable:false`. So "register = `set_txo`": being in the table *is*
+     colorability. No keychain-derivation change needed.
+   - `list_unspents` already returns DB txos joined with allocations *plus* BDK internal unspents, so
+     a registered statechain txo shows up automatically — no BDK-enumeration change needed.
+   - `get_asset_balance`/`list_unspents` read **DB `coloring` rows**, not the stash. A color deposit
+     only updates the stash, so registration also synthesizes the settled `Receive`
+     coloring/asset_transfer/batch_transfer rows (the same rows issuance writes) to surface the
+     allocation, **and marks the consumed on-chain source UTXO `spent`** so the moved allocation is
+     not double-counted (`settled()` excludes spent txos). Net: the allocation *moves* from the spent
+     on-chain UTXO onto the statechain UTXO with the balance unchanged.
+   The whole primitive is ~60 lines in `rust_only.rs`, all rgb-lib, no protocol change.
 
-2. **A statechain-aware resolver/indexer** — when validating or syncing, treat a registered
-   statechain UTXO as "exists / confirmed" by consulting Mercury (the SE's published key-share list /
-   the deposit tx) instead of (or in addition to) the electrum/esplora indexer. rgb-lib already
-   abstracts this via `AnyResolver`/`Indexer`; add a `StatechainResolver` wrapper, analogous to the
-   existing `OffchainResolver`.
+2. **A statechain-aware resolver/indexer (partially needed).** One real caveat surfaced:
+   `reconcile_orphaned_colored_txos` (run only on the user-facing `Wallet::sync`/`refresh` path)
+   marks any colored txo that BDK can't see as **spent** — which would clobber a registered
+   statechain UTXO. Two options: (a) don't call `Wallet::sync` on a wallet holding registered
+   statechain UTXOs (the internal `sync_bdk_and_db_txos` used by `blind_receive`/`list_unspents`
+   does *not* reconcile, so balances/invoices are safe — this is what `rgb04` relies on), or
+   (b) teach `reconcile` to skip statechain-registered outpoints (consult Mercury for existence),
+   the `StatechainResolver` analogous to the existing `OffchainResolver`. (a) is enough today; (b)
+   is the clean long-term fix.
 
-3. **Reuse, no change needed:** `color_psbt_and_consume` (build the transition + OP_RETURN),
-   `witness_receive`/blinded invoices (receiver seal), `post_consignment`/`accept_transfer` and
-   `validate_consignment_offchain` (receiver validation of the unbroadcast exit tx), `refresh`
-   (settle on exit). Mercury side: `get_unsigned_backup_psbt` (build the tx, now with a change
-   output) + `get_partial_sig_request_for_colored_tx` (blind-MuSig2 sign the colored tx).
+3. **The one remaining gap — `color_psbt` beneficiaries.** `color_psbt` builds transition
+   beneficiaries **only from `output_map` (witness vouts = new outputs of the tx being colored)**. A
+   fully faithful statechain→statechain *blinded* transfer assigns `amount` to the receiver's
+   **existing** statechain UTXO (a `BuilderSeal::Concealed` from the `blind_receive` recipient_id)
+   and the **change to the sender's existing free statechain UTXO** — both *existing outpoints*, not
+   witness vouts. So `color_psbt` needs a small extension to accept blinded/existing-outpoint
+   beneficiaries (the logic rgb-lib's `send` already has for normal blinded recipients). The witness
+   half — receiver gets the asset on a *new* output of the sender's exit tx — already works today via
+   `output_map` (that is exactly `rgb03`'s exit-to-on-chain and the cooperative exit).
 
-With (1)+(2), the statechain UTXO is a first-class colorable UTXO: `send`/transfer from it assigns
-the requested amount to the receiver and the **change to a free statechain UTXO**, `get_asset_balance`
-tracks it, and the owner can always re-color it for the exit. That is "RGB the same way it works
-on-chain."
+4. **Reuse, no change needed:** `color_psbt_and_consume` (build the transition + OP_RETURN),
+   `witness_receive` / `blind_receive` (receiver seal — `blind_receive` now picks a statechain UTXO),
+   `post_consignment`/`accept_transfer` and `validate_consignment_offchain` (receiver validation of
+   the unbroadcast exit tx), `refresh` (settle on exit). Mercury side: `get_unsigned_backup_psbt`
+   (build the tx) + `get_partial_sig_request_for_colored_tx` (blind-MuSig2 sign the colored tx).
+
+With (1) (done) + (2a) (done) the statechain UTXO is a first-class colorable UTXO: `get_asset_balance`
+tracks it and `blind_receive` makes invoices on it. Adding (3) lets a single transfer assign the
+requested amount to the receiver and the **change to a free statechain UTXO**, finishing "RGB the
+same way it works on-chain."
 
 ## Security (your last point — critical)
 
@@ -99,14 +118,24 @@ which re-derives the commitment from the consignment and checks it against the e
 the witness tx is ever broadcast. This is the statechain analogue of an LN counterparty checking the
 commitment transaction before revoking the previous state.
 
-## Status / what is already proven on regtest
+## Status / what is already proven on regtest (all green)
 
-- **Deposit** with standard-method visibility: `create_statechain_utxo` (sats-sized, deposits the
-  free allocation) makes `get_asset_balance` drop 2000→0 with a `Send` in `list_transfers` and the
-  colored UTXO spent + change UTXO created. (`rgb02_deposit_coop_exit.rs`.)
-- **Transfer + unilateral/cooperative exit** end-to-end via the low-level color path, with the
-  receiver cryptographically validating the consignment and the statechain UTXO spent on-chain.
-  (`rgb01_full_lifecycle.rs`.)
-- **Gap to close** for full on-chain-parity: items (1) and (2) above — registering statechain UTXOs
-  as wallet-owned colorable UTXOs + the statechain resolver — so a single code path does
-  deposit→partial-transfer-with-change→exit with standard balances on both sides throughout.
+- **Full lifecycle** — deposit → transfer → unilateral exit, and deposit → cooperative withdraw —
+  end-to-end via the color path, with the receiver cryptographically validating the consignment and
+  the statechain UTXO spent on-chain. (`rgb01_full_lifecycle.rs`.)
+- **Deposit** with standard-method visibility: `create_statechain_utxo` (send-based) makes
+  `get_asset_balance` drop 2000→0 with a `Send` in `list_transfers` and the colored UTXO spent +
+  change UTXO created. (`rgb02_deposit_coop_exit.rs`.)
+- **Exit to on-chain via a standard rgb-lib witness invoice, and back.** The receiver settles a
+  statechain exit with the *same* `witness_receive` + `refresh` flow as on-chain RGB, so the asset
+  lands on its on-chain wallet (`get_asset_balance` = 1000); then it is re-deposited onto a fresh
+  statechain UTXO (exit output spent, new coin confirmed & re-colorable). (`rgb03_exit_to_onchain.rs`.)
+- **Statechain UTXOs as on-chain colorable UTXOs (the register primitive), proven with standard
+  methods.** Sender: after `register_statechain_utxo`, `get_asset_balance` reads 1000 and
+  `list_unspents` shows the statechain UTXO as `colorable/exists` carrying the allocation (moved off
+  the spent on-chain source, not double-counted). Receiver: a *free* statechain UTXO is onboarded and
+  registered, then standard `blind_receive` reserves it as the invoice seal (`pending_blinded`),
+  i.e. the rgb invoice's `recipient_id` references the statechain UTXO. (`rgb04_register_statechain_utxo.rs`.)
+- **Gap to close** for a single deposit→partial-transfer-with-change→exit path with standard balances
+  on both sides throughout: item (3) above — extend `color_psbt` to assign to blinded/existing-outpoint
+  beneficiaries (receiver's statechain seal + change to a free statechain UTXO).

@@ -14,6 +14,7 @@ mod tv01;
 pub mod rgb01_full_lifecycle;
 pub mod rgb02_deposit_coop_exit;
 pub mod rgb03_exit_to_onchain;
+pub mod rgb04_register_statechain_utxo;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -32,6 +33,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("3") {
         rgb03_exit_to_onchain::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("4") {
+        rgb04_register_statechain_utxo::execute().await?;
         return Ok(());
     }
 
