@@ -152,12 +152,11 @@ async fn do_deposit(
     )
     .await?;
 
-    // Deposit via rgb-lib's STANDARD `send`: pay the statechain address as a witness recipient and
-    // assign `rgb_amount` of the asset to it. This goes through rgb-lib's normal transfer
-    // bookkeeping, so standard methods (balance/transfers/list_unspents) update accordingly. `send`
-    // broadcasts the funding tx itself.
-    let (txid, vout) = tokio::task::block_in_place(|| {
-        rgb.deposit_via_send(
+    // Color-based deposit: keeps the statechain UTXO re-colorable by the owner so it can be
+    // transferred/exited later (a standard `send` deposit would mark the asset as sent away). The
+    // signed funding tx is broadcast by the caller.
+    let (txid, vout, _deposit_consignment, signed_funding_tx) = tokio::task::block_in_place(|| {
+        rgb.fund_statechain(
             &aggregated_address,
             coin_amount as u64,
             contract_id,
@@ -166,6 +165,10 @@ async fn do_deposit(
             BLINDING,
         )
     })?;
+    let funding_bytes = hex::decode(&signed_funding_tx)?;
+    let _ = client_config
+        .electrum_client
+        .transaction_broadcast_raw(&funding_bytes)?;
     println!("RGB01 - deposit funding tx {txid} (statechain UTXO at vout {vout})");
 
     wait_for_address(client_config, &aggregated_address, coin_amount).await?;
@@ -194,7 +197,11 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
     // on a fresh UTXO - this lets the standard rgb-lib methods show the balance dropping and the
     // allocation moving to a change UTXO. The transfer/withdraw then move the full 600 on the coin.
     let issued: u64 = 1000;
-    let rgb_amount: u64 = 600;
+    // Deposit/transfer/withdraw the full allocation (color_psbt has no automatic asset change, so a
+    // partial amount would be value-unbalanced). The standard-balance partial-deposit demo lives in
+    // rgb02 (send-based). Here the color-based deposit keeps the statechain UTXO re-colorable.
+    let rgb_amount: u64 = 1000;
+    let _ = issued;
 
     // ----------------------------------------------------------------------------------------
     // Phase 1 + 2: issuance. Two issuer wallets, one per path (transfer/unilateral and cooperative
@@ -244,18 +251,8 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
         coin_a.statechain_id.clone().unwrap()
     );
 
-    // [standard rgb-lib] After depositing 600 of 1000 to the statechain coin, the issuer's standard
-    // accounting must show: balance dropped to 400, a Send transfer, and the 400 RGB change moved to
-    // a NEW UTXO (the original issuance UTXO is spent and no longer listed).
-    println!("RGB01 - [standard rgb-lib] state after deposit A (sender_a sent {rgb_amount}, keeps {} change):", issued - rgb_amount);
-    dump_rgb_state("sender_a", &mut rgb_sender_a, &contract_a);
-    let bal_after_deposit =
-        tokio::task::block_in_place(|| rgb_sender_a.settled_balance(&contract_a))?;
-    assert_eq!(
-        bal_after_deposit,
-        issued - rgb_amount,
-        "issuer's standard balance must drop by the deposited amount"
-    );
+    // Color-based deposit keeps the asset re-colorable on the statechain UTXO (DB balance is not the
+    // tracking layer here - the stash is); the transfer below validates against it.
 
     // The asset is now bound to the statechain UTXO (proven by the deposit's standard-method diff
     // above and by the transfer below validating against it).
@@ -331,13 +328,6 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
     println!(
         "RGB01 - deposit B confirmed, statechain_id {}",
         coin_b.statechain_id.clone().unwrap()
-    );
-    println!("RGB01 - [standard rgb-lib] state after deposit B (sender_b sent {rgb_amount}, keeps {} change):", issued - rgb_amount);
-    dump_rgb_state("sender_b", &mut rgb_sender_b, &contract_b);
-    assert_eq!(
-        tokio::task::block_in_place(|| rgb_sender_b.settled_balance(&contract_b))?,
-        issued - rgb_amount,
-        "issuer's standard balance must drop by the deposited amount"
     );
     let sc_b_txid = coin_b.utxo_txid.clone().unwrap();
     let sc_b_vout = coin_b.utxo_vout.unwrap();

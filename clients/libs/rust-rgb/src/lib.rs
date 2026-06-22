@@ -340,6 +340,33 @@ impl RgbWallet {
         self.deposit_via_send(statechain_address, size_sat, contract_id, free, fee_rate, blinding)
     }
 
+    /// Color-based deposit that keeps the statechain UTXO **re-colorable** by the owner (so it can
+    /// later transfer/exit), unlike `create_statechain_utxo`/`deposit_via_send` which mark the asset
+    /// as sent away. Returns `(txid, vout, consignment_base64, signed_tx_hex)`; the caller broadcasts
+    /// `signed_tx_hex`.
+    pub fn fund_statechain(
+        &mut self,
+        address: &str,
+        amount_sat: u64,
+        contract_id: &str,
+        rgb_amount: u64,
+        fee_rate: u64,
+        blinding: u64,
+    ) -> Result<(String, u32, String, String)> {
+        let _ = self
+            .wallet
+            .list_unspents(Some(self.online.clone()), false, false)?;
+        let (txid, vout, consignment, signed_tx_hex) = self.wallet.fund_statechain_utxo(
+            address.to_string(),
+            amount_sat,
+            contract_id.to_string(),
+            rgb_amount,
+            fee_rate,
+            blinding,
+        )?;
+        Ok((txid, vout, STANDARD.encode(consignment), signed_tx_hex))
+    }
+
     /// Deposit using rgb-lib's **standard** `send`: pay `amount_sat` to the statechain `address` as
     /// an RGB *witness* recipient assigned `rgb_amount` of `contract_id`. Because this goes through
     /// rgb-lib's normal transfer flow, all standard methods reflect it afterwards: the issuer's

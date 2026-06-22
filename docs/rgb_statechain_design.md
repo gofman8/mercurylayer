@@ -58,11 +58,18 @@ back to free allocation, each transfer consumes a UTXO" requirement.
 
 ## What rgb-lib needs (the real, minimal changes)
 
-1. **`register_statechain_utxo(outpoint, sats, colorable=true)`** — insert an *externally-owned*
-   outpoint into rgb-lib's `txo` table as a colorable, existing wallet UTXO, bypassing the BDK
-   ownership/descriptor check. Source of truth for existence = the statechain, not the indexer. This
-   is the one genuinely new primitive; everything else already exists. (Model it on the bookkeeping
-   in `create_utxos_end_impl`, which records freshly created colorable UTXOs.)
+1. **`register_statechain_utxo(outpoint, sats)`** — insert an *externally-owned* outpoint into
+   rgb-lib's `txo` table as an existing wallet UTXO, bypassing the BDK ownership/descriptor check.
+   Source of truth for existence = the statechain, not the indexer. Touch points discovered while
+   investigating (`get_asset_balance` reads DB allocations on wallet txos; `set_txo` inserts a txo):
+   - `DbTxo` has no `colorable` column — colorability is *derived* from whether the txo's script
+     belongs to the colored keychain. A statechain UTXO is a MuSig key in neither keychain, so the
+     derivation must be extended to treat registered statechain outpoints as colorable.
+   - `list_unspents` enumerates **BDK**'s unspents (descriptor-owned) and joins DB allocations; it
+     must additionally include DB-registered statechain txos that BDK can't see.
+   - allocation mapping (`get_rgb_allocations`) already keys by outpoint, so once the txo is
+     registered and the stash holds the allocation (from a color-based deposit), the balance follows.
+   So it is a few coordinated touch points, not a one-liner - but all in rgb-lib, no protocol change.
 
 2. **A statechain-aware resolver/indexer** — when validating or syncing, treat a registered
    statechain UTXO as "exists / confirmed" by consulting Mercury (the SE's published key-share list /
