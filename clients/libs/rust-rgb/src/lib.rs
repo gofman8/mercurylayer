@@ -209,16 +209,6 @@ impl RgbWallet {
             .collect())
     }
 
-    /// Fungible amount of `contract_id` allocated in the RGB runtime (stash) at a specific outpoint.
-    /// This is the source of truth for statechain transactions (built/broadcast outside rgb-lib's
-    /// own send flow), so it shows the asset actually sitting on - or having left - the statechain
-    /// UTXO, unlike `balance`/`transfers` which track rgb-lib's DB send accounting.
-    pub fn allocation_at(&self, contract_id: &str, txid: &str, vout: u32) -> Result<u64> {
-        Ok(self
-            .wallet
-            .runtime_allocation(contract_id.to_string(), txid.to_string(), vout)?)
-    }
-
     /// Sync RGB state with the indexer (settle pending transfers, update witnesses).
     pub fn refresh(&mut self, asset_id: Option<String>) -> Result<()> {
         self.wallet
@@ -328,15 +318,36 @@ impl RgbWallet {
         Ok(received)
     }
 
-    /// Deposit binding: build, color and sign the funding transaction that pays `amount_sat` to the
-    /// statechain aggregated `address` and assigns `rgb_amount` of `contract_id` to that output.
+    /// Create a statechain UTXO of `size_sat` sats and deposit the wallet's **free allocation** of
+    /// `contract_id` onto it - the statechain analogue of rgb-lib's `create_utxos` (which creates
+    /// colorable UTXOs sized in sats). The deposited asset amount is the wallet's spendable balance
+    /// (not a passed rgb-amount); after this, `get_asset_balance(contract_id)` drops to 0.
     ///
-    /// This is the one operation with no public rgb-lib equivalent (it spends a colored UTXO to an
-    /// externally-owned address), so it uses the fork's `fund_statechain_utxo`.
-    ///
-    /// Returns `(txid, vout, consignment_base64, signed_tx_hex)`. The caller broadcasts
-    /// `signed_tx_hex` via the Mercury electrum client.
-    pub fn fund_statechain(
+    /// Returns `(txid, vout)` of the statechain UTXO.
+    pub fn create_statechain_utxo(
+        &mut self,
+        statechain_address: &str,
+        size_sat: u64,
+        contract_id: &str,
+        fee_rate: u64,
+        blinding: u64,
+    ) -> Result<(String, u32)> {
+        let free = self.wallet.get_asset_balance(contract_id.to_string())?.spendable;
+        if free == 0 {
+            return Err(anyhow!("no free allocation of {contract_id} to deposit"));
+        }
+        // Deposit the full free allocation onto a statechain UTXO of `size_sat` sats.
+        self.deposit_via_send(statechain_address, size_sat, contract_id, free, fee_rate, blinding)
+    }
+
+    /// Deposit using rgb-lib's **standard** `send`: pay `amount_sat` to the statechain `address` as
+    /// an RGB *witness* recipient assigned `rgb_amount` of `contract_id`. Because this goes through
+    /// rgb-lib's normal transfer flow, all standard methods reflect it afterwards: the issuer's
+    /// `balance` drops, `transfers` shows a `Send`, and `list_unspents` shows the spent colored UTXO
+    /// plus a new change UTXO (carrying any asset change). The witness output that becomes the
+    /// statechain UTXO is at vout 1 (rgb-lib places the OP_RETURN commitment at vout 0). `send`
+    /// broadcasts the funding tx itself. Returns `(txid, vout)`.
+    pub fn deposit_via_send(
         &mut self,
         address: &str,
         amount_sat: u64,
@@ -344,21 +355,100 @@ impl RgbWallet {
         rgb_amount: u64,
         fee_rate: u64,
         blinding: u64,
-    ) -> Result<(String, u32, String, String)> {
-        // Sync the wallet's UTXO view first so an already-spent colored UTXO (e.g. consumed by a
-        // previous deposit) is not re-selected for this funding transaction.
-        let _ = self
-            .wallet
-            .list_unspents(Some(self.online.clone()), false, false)?;
-        let (txid, vout, consignment, signed_tx_hex) = self.wallet.fund_statechain_utxo(
-            address.to_string(),
-            amount_sat,
-            contract_id.to_string(),
-            rgb_amount,
+    ) -> Result<(String, u32)> {
+        use rgb_lib::bitcoin::Address as BdkAddress;
+        use rgb_lib::utils::recipient_id_from_script_buf;
+        use rgb_lib::wallet::{Recipient, WitnessData};
+
+        let network = self.wallet.get_wallet_data().bitcoin_network;
+        let addr = BdkAddress::from_str(address)
+            .map_err(|e| anyhow!("invalid statechain address: {e}"))?
+            .assume_checked();
+        let recipient_id = recipient_id_from_script_buf(addr.script_pubkey(), network);
+
+        let recipient = Recipient {
+            recipient_id,
+            witness_data: Some(WitnessData {
+                amount_sat,
+                blinding: Some(blinding),
+            }),
+            assignment: Assignment::Fungible(rgb_amount),
+            transport_endpoints: vec![self.proxy.clone()],
+        };
+        let recipient_map = HashMap::from([(contract_id.to_string(), vec![recipient])]);
+
+        let res = self.wallet.send(
+            self.online.clone(),
+            recipient_map,
+            true, // donation: broadcast without recipient ACK (the statechain UTXO is external)
             fee_rate,
-            blinding,
+            1,
+            None,
+            None,
         )?;
-        Ok((txid, vout, STANDARD.encode(consignment), signed_tx_hex))
+        Ok((res.txid, 1))
+    }
+
+    /// Generate a standard rgb-lib **witness receive** invoice for `amount` (of any asset - the
+    /// contract is imported from the consignment on refresh). Registers a pending incoming transfer
+    /// and reserves the wallet's next address; returns the `recipient_id` (which encodes that
+    /// address). Used for the cooperative exit so the receiver settles via the normal `refresh` flow.
+    pub fn witness_receive(&mut self, amount: u64) -> Result<String> {
+        let rd = self.wallet.witness_receive(
+            None,
+            Assignment::Fungible(amount),
+            None,
+            vec![self.proxy.clone()],
+            1,
+        )?;
+        Ok(rd.recipient_id)
+    }
+
+    /// The bitcoin address that a witness `recipient_id` will be paid at (so the externally-built
+    /// colored withdrawal tx can pay it).
+    pub fn address_from_recipient_id(&self, recipient_id: &str) -> Result<String> {
+        use rgb_lib::bitcoin::{Address, Network};
+        use rgb_lib::utils::script_buf_from_recipient_id;
+
+        let script = script_buf_from_recipient_id(recipient_id.to_string())?
+            .ok_or_else(|| anyhow!("recipient_id is not a witness recipient"))?;
+        let net = match self.wallet.get_wallet_data().bitcoin_network {
+            BitcoinNetwork::Mainnet => Network::Bitcoin,
+            BitcoinNetwork::Regtest => Network::Regtest,
+            BitcoinNetwork::Signet | BitcoinNetwork::SignetCustom => Network::Signet,
+            _ => Network::Testnet, // Testnet/Testnet4 share the testnet address format
+        };
+        let addr = Address::from_script(&script, net)
+            .map_err(|e| anyhow!("could not derive address from recipient_id: {e}"))?;
+        Ok(addr.to_string())
+    }
+
+    /// Post a consignment (base64) to the RGB proxy under `recipient_id`, so the receiver's standard
+    /// `refresh` can fetch and settle it. `txid`/`vout` identify the witness output.
+    pub fn post_consignment(
+        &self,
+        recipient_id: &str,
+        consignment_base64: &str,
+        txid: &str,
+        vout: u32,
+    ) -> Result<()> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-post");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let http_endpoint = TransportEndpoint::new(self.proxy.clone())?.endpoint;
+        self.wallet.post_consignment(
+            &http_endpoint,
+            recipient_id.to_string(),
+            &path,
+            txid.to_string(),
+            Some(vout),
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     pub fn indexer_url(&self) -> &str {

@@ -12,6 +12,7 @@ pub mod tb05_timelock;
 pub mod tm01_sender_double_spends;
 mod tv01;
 pub mod rgb01_full_lifecycle;
+pub mod rgb02_deposit_coop_exit;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -22,6 +23,10 @@ async fn main() -> Result<()> {
     // indexer in addition to the Mercury stack). See docs/rgb_integration.md.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("1") {
         rgb01_full_lifecycle::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("2") {
+        rgb02_deposit_coop_exit::execute().await?;
         return Ok(());
     }
 
