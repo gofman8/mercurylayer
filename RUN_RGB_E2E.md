@@ -57,7 +57,7 @@ curl -s http://127.0.0.1:8000/info/config        # {"initlock":1000,"interval":1
 ```bash
 cd clients/tests/rust
 export ML_NETWORK=regtest                                   # selects regtest.Settings (statechain_entity :8000, electrum :50001)
-export RGB_E2E=1                                            # run only rgb01_full_lifecycle
+export RGB_E2E=1                                            # pick a flow 1..6 (see table below); rgb01 = full lifecycle
 export COMPOSE_FILE="$(cd ../../../../rgb-lightning-node && pwd)/compose.yaml"  # so regtest.sh resolves from any CWD
 export COMPOSE_PROJECT_NAME=rgb-lightning-node
 export RLN_REGTEST="$(cd ../../../../rgb-lightning-node && pwd)/regtest.sh"     # drive bitcoind via regtest.sh
@@ -83,6 +83,24 @@ RGB01 - RGB statechain lifecycle complete (issuance, deposit, transfer, unilater
 The test uses two issuer wallets (one per path) so each does a single clean deposit. rgb-lib's
 synchronous calls run via `tokio::task::block_in_place` (the runtime is multi-threaded) to avoid
 nesting a blocking reqwest runtime inside the async runtime.
+
+## The six RGB ⇄ statechain E2E flows (`RGB_E2E=1..6`)
+
+Set `RGB_E2E` to the number and `cargo +stable run`. Each is independent and self-contained; all green.
+
+| # | File | What it proves (with **standard rgb-lib methods**) |
+|---|---|---|
+| 1 | `rgb01_full_lifecycle.rs` | Issuance → deposit → transfer → **unilateral exit**, and deposit → **cooperative withdraw**; receiver validates the consignment; statechain UTXO spent on-chain. |
+| 2 | `rgb02_deposit_coop_exit.rs` | Deposit via standard `send`: `get_asset_balance` drops 2000→0, a `Send` in `list_transfers`, colored UTXO spent + change UTXO. |
+| 3 | `rgb03_exit_to_onchain.rs` | **Exit to on-chain via a standard witness invoice** (receiver `witness_receive` + `refresh` → on-chain balance 1000), then **re-deposit back** to a fresh statechain UTXO (round-trip). |
+| 4 | `rgb04_register_statechain_utxo.rs` | **Register primitive**: after `register_statechain`, `get_asset_balance`/`list_unspents` treat a statechain UTXO as an on-chain colorable UTXO; standard `blind_receive` reserves a statechain UTXO as the invoice seal. |
+| 5 | `rgb05_blinded_statechain_transfer.rs` | **statechain → statechain via a blinded invoice**: receiver invoices on its statechain UTXO; sender spends its statechain UTXO "to itself" + OP_RETURN committing to the receiver's seal; receiver settles via `refresh` → asset on its statechain UTXO; sender UTXO consumed. |
+| 6 | `rgb06_partial_transfer_change.rs` | **Partial transfer with change to a free statechain UTXO** (full on-chain parity): 600 → receiver's statechain UTXO, 400 change → sender's free statechain UTXO, sender UTXO consumed. Each transfer consumes a UTXO; sats move to the receiver via the statechain. |
+
+The rgb-lib primitives this integration adds (all in `utexo-rgb-lib@feat/statechain`, no RGB protocol
+change): `fund_statechain_utxo` (re-colorable color deposit), `register_statechain_utxo` (statechain
+UTXO as a wallet-owned colorable UTXO), `AssetColoringInfo::blinded_map` in `color_psbt` (assign to
+existing outpoints), and `mark_utxos_spent`. See `docs/rgb_statechain_design.md` for the full design.
 
 ## What the test exercises
 
