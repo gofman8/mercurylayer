@@ -1,0 +1,91 @@
+# Running the RGB ⇄ statechain E2E on a local regtest
+
+This runs the full RGB-over-statechain lifecycle (issuance → deposit → transfer → withdraw) against
+the **rgb-lightning-node** regtest (bitcoind + electrs:50001 + RGB proxy:3000) with the Mercury Layer
+server stack on top.
+
+## Prerequisites
+
+- Docker + `docker compose`, and Rust (stable).
+- Three repos checked out **side by side** (the `mercury-rgb` crate uses a path dependency on
+  `../../../../utexo-rgb-lib`, so the rgb-lib fork must sit next to `mercurylayer`):
+
+```
+workdir/
+├── mercurylayer/        # gofman8/mercurylayer @ feat/rgb-statechain
+├── utexo-rgb-lib/       # gofman8/rgb-lib       @ feat/statechain   (path-dep target)
+└── rgb-lightning-node/  # UTEXO-Protocol/rgb-lightning-node
+```
+
+```bash
+git clone -b feat/rgb-statechain https://github.com/gofman8/mercurylayer
+git clone -b feat/statechain     https://github.com/gofman8/rgb-lib utexo-rgb-lib
+git clone                        https://github.com/UTEXO-Protocol/rgb-lightning-node
+```
+
+> If you prefer the git dependency over the sibling checkout, edit
+> `mercurylayer/clients/libs/rust-rgb/Cargo.toml` to use the commented-out `rgb-lib = { git = … }` line.
+
+## 1. Start the regtest (bitcoind + electrs:50001 + proxy:3000)
+
+```bash
+cd rgb-lightning-node
+./regtest.sh start          # creates the "miner" wallet and mines 103 blocks
+```
+
+## 2. Start the Mercury server stack (no bitcoind/electrs — we reuse the regtest's)
+
+```bash
+cd ../mercurylayer
+# only the server-side services; their ports (8000 mercury, 8001 token) don't clash with regtest
+docker compose -f docker-compose-test.yml up -d --build postgres enclave-sgx mercury token-server
+# wait until the mercury server answers on :8000
+curl -s http://127.0.0.1:8000/info/config
+```
+
+> On Apple Silicon the SGX **SIM** enclave image is x86; if its build/run fails, prefix with
+> `DOCKER_DEFAULT_PLATFORM=linux/amd64` (emulated) or run the stack on an x86 host.
+
+## 3. Run the lifecycle test
+
+```bash
+cd clients/tests/rust
+export ML_NETWORK=regtest                                   # selects regtest.Settings (statechain_entity :8000, electrum :50001)
+export RGB_E2E=1                                            # run only rgb01_full_lifecycle
+export RLN_REGTEST="$(cd ../../../../rgb-lightning-node && pwd)/regtest.sh"   # drive bitcoind via regtest.sh
+export RLN_BITCOIND_CONTAINER="$(docker ps --format '{{.Names}}' | grep bitcoind | head -1)"
+cargo run
+```
+
+Expected output (abridged):
+
+```
+RGB01 - issued asset <contract_id> (1000 units)
+RGB01 - broadcast deposit funding tx <txid> (statechain UTXO at vout 1)
+RGB01 - deposit confirmed, statechain_id <id>
+RGB01 - built colored backup tx <txid> for transfer
+RGB01 - receiver validated transfer consignment (500 units)
+RGB01 - cooperative withdrawal broadcast <txid> (asset moved on-chain)
+RGB01 - RGB statechain lifecycle (issuance/deposit/transfer/withdraw) completed
+```
+
+## What the test exercises
+
+| Phase | How |
+|---|---|
+| Issuance | `RgbWallet::issue_nia` in the sender's rgb-lib wallet |
+| Deposit  | `fund_statechain` builds/colors/signs the funding tx paying the Mercury aggregated address (OP_RETURN opret), broadcast via electrs; Mercury sees the coin |
+| Transfer | `mercuryrustlib::rgb::create_colored_backup_tx` colors + blind-MuSig2-signs the backup tx; receiver validates the in-band consignment (unconfirmed witness, LN-style) |
+| Withdraw (cooperative) | colored withdrawal tx co-signed with the SE and broadcast → asset moves on-chain |
+| Withdraw (unilateral)  | instead of cooperating, broadcast the latest colored backup tx after its timelock |
+
+## Troubleshooting
+
+- **`No container found` / wrong bitcoind**: set `RLN_BITCOIND_CONTAINER` to the exact name from
+  `docker ps` (compose names it `<dir>-bitcoind-1`, usually `rgb-lightning-node-bitcoind-1`).
+- **electrum connection refused**: ensure `./regtest.sh start` finished (`electrs … finished full compaction`).
+- **proxy**: rgb01 relays consignments in-band; the proxy (`:3000`) is only used by rgb-lib for
+  transport-endpoint validation while going online.
+- **token/deposit fails**: check `docker compose logs token-server` — the deposit token flow needs the
+  token server up; for pure-regtest you can also wire a stub token.
+- Paste the failing output and I'll iterate on the specific call.

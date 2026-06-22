@@ -18,6 +18,13 @@ use anyhow::{Result, Ok};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
 
+    // Run only the RGB-over-statechain lifecycle test when RGB_E2E=1 (it needs the RGB proxy +
+    // indexer in addition to the Mercury stack). See docs/rgb_integration.md.
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("1") {
+        rgb01_full_lifecycle::execute().await?;
+        return Ok(());
+    }
+
     tb01_simple_transfer::execute().await?;
     tb02_transfer_address_reuse::execute().await?;
     tb03_simple_atomic_transfer::execute().await?;
