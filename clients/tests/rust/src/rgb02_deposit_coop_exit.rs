@@ -15,7 +15,6 @@
 use std::{env, fs, process::Command, thread, time::Duration};
 
 use anyhow::{anyhow, Result};
-use electrum_client::ElectrumApi;
 use mercury_rgb::RgbWallet;
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 

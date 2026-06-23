@@ -188,20 +188,42 @@ pub async fn execute() -> Result<()> {
         .clone();
     assert!(coin2.status == CoinStatus::CONFIRMED, "re-deposited statechain coin must confirm");
 
-    println!("RGB03 - [standard rgb-lib] receiver after re-deposit:");
-    dump("receiver", &mut receiver, &contract);
-    // Round-trip proof at the layer that is actually authoritative for a color deposit:
-    //  - the on-chain exit UTXO that held the asset is now SPENT (consumed by the re-deposit tx), and
-    //  - Mercury confirms the fresh statechain coin.
-    // The asset is committed (OP_RETURN) to the statechain UTXO and is re-colorable for a future exit,
-    // exactly like the onboarding deposit (rgb01 proves a color-deposited statechain UTXO can be exited).
-    // It does NOT yet show in DB `list_allocations` on the statechain outpoint - that needs the
-    // register primitive (design doc item 1: list_unspents/allocations are BDK/DB-backed).
+    let new_txid = coin2.utxo_txid.clone().ok_or(anyhow!("coin2 has no utxo_txid"))?;
+    let new_vout = coin2.utxo_vout.ok_or(anyhow!("coin2 has no utxo_vout"))?;
     let exit_outpoint = format!("{}:{}", withdraw.txid, withdraw.recipient_vout);
-    let spent = tokio::task::block_in_place(|| is_outpoint_spent(&cc, &withdraw.txid, withdraw.recipient_vout));
-    assert!(spent, "the on-chain exit UTXO {exit_outpoint} must be spent by the re-deposit");
-    assert!(coin2.status == CoinStatus::CONFIRMED, "the asset's new statechain coin must be confirmed");
 
-    println!("RGB03 - round-trip complete: asset exited to on-chain UTXO {exit_outpoint} (now spent) and returned to statechain UTXO {dtxid2}:{dvout2} (confirmed, re-colorable)");
+    // Update the receiver's local rgb-lib state to reflect the re-deposit: register the NEW statechain
+    // UTXO as a colorable wallet UTXO holding the asset, and mark the consumed exit output spent. The
+    // color deposit already moved the asset in the stash, but list_unspents/get_asset_balance are
+    // DB-backed (see rgb04), so without this the DB keeps showing the old (now spent) exit output.
+    tokio::task::block_in_place(|| {
+        receiver.register_statechain(&new_txid, new_vout, COIN_SAT2 as u64, &contract, ISSUED, &[exit_outpoint.clone()])
+    })?;
+
+    // Dump WITHOUT a refresh: a Wallet::sync (refresh) would run reconcile_orphaned_colored_txos and
+    // re-mark the BDK-invisible statechain UTXO spent (design-doc item 2). The internal syncs used by
+    // list_unspents/get_asset_balance do NOT reconcile, so the registered state is stable.
+    println!("RGB03 - [standard rgb-lib] receiver after re-deposit (asset back on statechain UTXO {new_txid}:{new_vout}):");
+    crate::rgb_dump::dump("receiver after re-deposit", &mut receiver, &contract);
+
+    // Round-trip proofs: balance preserved, the allocation now sits on the NEW statechain UTXO (the
+    // old exit output is gone), and the on-chain exit UTXO is spent.
+    let recv_bal_back = tokio::task::block_in_place(|| receiver.settled_balance(&contract))?;
+    assert_eq!(recv_bal_back, ISSUED, "balance preserved across the round-trip");
+    let allocs = tokio::task::block_in_place(|| receiver.list_allocations(&contract))?;
+    assert!(
+        allocs.iter().any(|(op, amt, settled)| op == &format!("{new_txid}:{new_vout}") && *amt == ISSUED && *settled),
+        "after re-deposit the asset must sit on the new statechain UTXO {new_txid}:{new_vout}"
+    );
+    assert!(
+        !allocs.iter().any(|(op, ..)| op == &exit_outpoint),
+        "the old (spent) exit output {exit_outpoint} must no longer hold the allocation"
+    );
+    assert!(
+        tokio::task::block_in_place(|| is_outpoint_spent(&cc, &withdraw.txid, withdraw.recipient_vout)),
+        "the on-chain exit UTXO {exit_outpoint} must be spent by the re-deposit"
+    );
+
+    println!("RGB03 - round-trip complete: asset exited to on-chain UTXO {exit_outpoint} (now spent), re-deposited, and rgb-lib state updated onto the new statechain UTXO {new_txid}:{new_vout} (balance {recv_bal_back})");
     Ok(())
 }
