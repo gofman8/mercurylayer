@@ -44,8 +44,20 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
-    
+
         return status::Custom(Status::Unauthorized, Json(response_body));
+    }
+
+    // SE single-use enforcement (off-chain RGB tree double-spend guard): a single-use coin may be
+    // terminally spent only ONCE. If it already has a finalized signature (a sign_second completed),
+    // refuse any further spend. Normal coins (single_use=false) keep the existing re-sign behaviour.
+    if crate::database::deposit::is_single_use(&statechain_entity.pool, &statechain_id).await
+        && crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await >= 1
+    {
+        let response_body = json!({
+            "message": "single-use coin already spent (SE refuses a second spend)"
+        });
+        return status::Custom(Status::Gone, Json(response_body));
     }
 
     // This situation should not happen, as this state is only possible if the client has called signFirst, but not signSecond

@@ -14,6 +14,7 @@ mod tv01;
 pub mod rgb01_offchain_split;
 pub mod rgb02_combine_transfer;
 pub mod rgb03_offchain_chain;
+pub mod rgb04_single_use;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -37,6 +38,11 @@ async fn main() -> Result<()> {
     // validate_offchain_chain over both un-broadcast witnesses. Off-chain DAG depth.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("3") {
         rgb03_offchain_chain::execute().await?;
+        return Ok(());
+    }
+    // SE single-use probe (RGB_E2E=4): the SE must refuse a 2nd conflicting spend of a node.
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("4") {
+        rgb04_single_use::execute().await?;
         return Ok(());
     }
 

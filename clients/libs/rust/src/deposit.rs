@@ -1,14 +1,24 @@
 use anyhow::{anyhow, Result, Ok};
-use mercurylib::{deposit::{create_deposit_msg1, create_aggregated_address}, wallet::{Wallet, BackupTx, Coin}, transaction:: get_user_backup_address, utils::get_blockheight};
+use mercurylib::{deposit::{create_deposit_msg1_with_single_use, create_aggregated_address}, wallet::{Wallet, BackupTx, Coin}, transaction:: get_user_backup_address, utils::get_blockheight};
 
 use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}, transaction::new_transaction, utils::info_config};
 
 pub async fn get_deposit_bitcoin_address(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32) -> Result<String> {
+    get_deposit_bitcoin_address_inner(client_config, wallet_name, token_id, amount, false).await
+}
+
+/// Open a **single-use** deposit address: the SE refuses any second spend once it co-signs one
+/// terminal spend of this coin (the off-chain RGB split/combine double-spend guard).
+pub async fn get_deposit_bitcoin_address_single_use(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32) -> Result<String> {
+    get_deposit_bitcoin_address_inner(client_config, wallet_name, token_id, amount, true).await
+}
+
+async fn get_deposit_bitcoin_address_inner(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32, single_use: bool) -> Result<String> {
 
     let token_id = uuid::Uuid::parse_str(&token_id)?;
     // println!("Deposit: {} {} {}", wallet_name, token_id, amount);
     let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let mut wallet = init(&client_config, &wallet, token_id).await?;
+    let mut wallet = init(&client_config, &wallet, token_id, single_use).await?;
 
     let coin = wallet.coins.last_mut().unwrap();
 
@@ -79,7 +89,7 @@ pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_ne
     Ok(backup_tx)
 }
 
-pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid::Uuid) -> Result<Wallet> {
+pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid::Uuid, single_use: bool) -> Result<Wallet> {
 
     let mut wallet = wallet.clone();
 
@@ -89,7 +99,7 @@ pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid:
 
     update_wallet(&client_config.pool, &wallet).await?;
 
-    let deposit_msg_1 = create_deposit_msg1(&coin, &token_id.to_string())?;
+    let deposit_msg_1 = create_deposit_msg1_with_single_use(&coin, &token_id.to_string(), single_use)?;
 
     // println!("deposit_msg_1: {:?}", deposit_msg_1);
 

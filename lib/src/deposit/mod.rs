@@ -25,6 +25,11 @@ pub struct DepositMsg1 {
     pub auth_key: String,
     pub token_id: String,
     pub signed_token_id: String,
+    /// Single-use coin: once the SE co-signs one terminal spend it refuses any further spend (the
+    /// off-chain RGB split/combine double-spend guard). Defaults to false (normal re-signable coin),
+    /// so existing clients are unaffected.
+    #[serde(default)]
+    pub single_use: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +56,12 @@ pub struct AggregatedPublicKey {
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn create_deposit_msg1(coin: &Coin, token_id: &str) -> Result<DepositMsg1, MercuryError>{
+    create_deposit_msg1_with_single_use(coin, token_id, false)
+}
+
+/// Like [`create_deposit_msg1`] but lets the caller request a **single-use** coin (the SE refuses any
+/// second spend once it co-signs one terminal spend — the off-chain RGB split/combine guard).
+pub fn create_deposit_msg1_with_single_use(coin: &Coin, token_id: &str, single_use: bool) -> Result<DepositMsg1, MercuryError>{
     let msg = Message::from_hashed_data::<sha256::Hash>(token_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();
@@ -64,6 +75,7 @@ pub fn create_deposit_msg1(coin: &Coin, token_id: &str) -> Result<DepositMsg1, M
         auth_key: auth_xonly_pubkey.to_string(),
         token_id: token_id.to_string(),
         signed_token_id: signed_token_id.to_string(),
+        single_use,
     };
 
     Ok(deposit_msg_1)
