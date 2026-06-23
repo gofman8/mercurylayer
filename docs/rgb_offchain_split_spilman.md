@@ -218,19 +218,35 @@ and `blinded_map` (multi-beneficiary transitions);
 5. **Multi-owner factory** — many distinct owners under one root, full pseudo-Spilman co-signing so
    each owner refuses invalid factory updates (Stage 5).
 
-## Build ladder
+## Working today (green E2E on regtest)
 
-- **Stage 1 (`rgb01`)** — depth-1 off-chain split: spend the root coin into **two witness-sealed
-  colored outputs** (sub-coins) in one un-broadcast tx; receiver validates off-chain; prove exit by
-  broadcasting and confirming both sub-allocations. *Composes existing primitives; proves "sub-coins
-  as un-broadcast tx outputs," the core departure from assigning to pre-funded coins.* **✅ green.**
-- **Stage 2 (`rgb02`)** — **chain** a second split off a sub-coin's reserve (two-deep un-broadcast
-  chain); extend off-chain validation to resolve the branch. *Proves chaining + chain validation.*
-- **Stage 3** — SE single-use ledger + a tree-tx builder abstraction in `mercurylib`. *Makes
-  sub-coins real statechain coins and makes double-spend structurally impossible at the SE.*
-- **Stage 4** — DW decrementing timelocks, `(SE & CLTV)` reserve, poisoning, active/dying epochs,
-  laddering. *Operator reclaim + in-place rebalance + bounded exit cost.*
-- **Stage 5** — multi-owner factory (one on-chain root amortized across many owners).
+| Flow | What it proves |
+|---|---|
+| `rgb01` (RGB_E2E=1) | **Off-chain split** — root coin → N colored witness sub-coins in one un-broadcast tx; validated off-chain; exit by broadcast |
+| `rgb02` (RGB_E2E=2) | **Combine (2-in)** — two statechain coins → recipient + change in one SE-co-signed (per-input) un-broadcast tx |
+| `rgb03` (RGB_E2E=3) | **2-deep off-chain chain** — un-broadcast split → un-broadcast combine; SE co-signs spends of un-broadcast outputs; validated via `validate_offchain_chain([split, combine])` (two un-broadcast witnesses) |
+| `rgb04` (RGB_E2E=4) | **SE single-use** — a single-use coin's conflicting second spend is REFUSED (off-chain double-spend guard) |
+| `rgb05` (RGB_E2E=5) | **Combine (3-in)** — three coins → one payment + change (the multi-input combine scales) |
 
-Stages 1–2 are pure RGB mechanics and reuse the existing stack. Stage 3 onward extends the Mercury SE
-protocol and should be reviewed before implementation.
+Together these are the off-chain RGB DAG: deposits (roots), transitions that **split and combine**
+(N→M) and **chain** (depth), validated off-chain, with the SE as the single-use enforcer.
+
+Run (stack up; see the `rgb-statechain-run-env` memory / below):
+```bash
+cd clients/tests/rust
+RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=5
+```
+The SE single-use check requires the `single_use` mercury-server build (migration 0002 + `sign_first`
+refusal); in this dev env it is deployed by `docker cp` + in-container `touch` + restart (the
+`docker compose build` cache does not pick up source changes here).
+
+## Next
+
+- **Robust single-use baseline** — the current `sign_first` threshold (`>=2` finalized sigs) suits
+  `fund_statechain`-deposited coins (1 deposit-backup sig); sub-coins opened without a backup need a
+  per-coin baseline (or single-use coins skipping the deposit backup).
+- **DW decrementing timelocks**, `(SE & CLTV)` reserve, poisoning, active/dying epochs, laddering —
+  operator reclaim + in-place rebalance + bounded unilateral-exit cost (Stage 4).
+- **Cooperative-collapse exit** — operator co-signs a single root→final-allocation tx instead of
+  broadcasting the branch (the normal 1-tx exit).
+- **Multi-owner factory** — one on-chain root amortized across many owners (full pseudo-Spilman).
