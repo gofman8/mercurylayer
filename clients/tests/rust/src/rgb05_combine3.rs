@@ -83,7 +83,7 @@ where
     let token = mercuryrustlib::deposit::get_token(cc).await?;
     let token_id = crate::utils::handle_token_response(cc, &token).await?;
     let sc_address =
-        mercuryrustlib::deposit::get_deposit_bitcoin_address(cc, &wallet.name, &token_id, size_sat).await?;
+        mercuryrustlib::deposit::get_deposit_bitcoin_address_single_use(cc, &wallet.name, &token_id, size_sat).await?;
     let _txid = fund(&sc_address)?;
     wait_for_address(cc, &sc_address, size_sat).await?;
     let core = bitcoin_core::getnewaddress()?;
@@ -97,7 +97,7 @@ async fn open_deposit_address(cc: &ClientConfig, wallet_name: &str, size_sat: u3
     mercuryrustlib::sqlite_manager::insert_wallet(&cc.pool, &wallet).await?;
     let token = mercuryrustlib::deposit::get_token(cc).await?;
     let token_id = crate::utils::handle_token_response(cc, &token).await?;
-    Ok(mercuryrustlib::deposit::get_deposit_bitcoin_address(cc, &wallet.name, &token_id, size_sat).await?)
+    Ok(mercuryrustlib::deposit::get_deposit_bitcoin_address_single_use(cc, &wallet.name, &token_id, size_sat).await?)
 }
 
 async fn coin_outpoint(cc: &ClientConfig, wallet_name: &str, sc_address: &str) -> Result<(String, u32, mercuryrustlib::Coin)> {
