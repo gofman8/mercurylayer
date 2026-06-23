@@ -319,6 +319,23 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
     );
     assert!(sc_spent, "the statechain UTXO must be spent on-chain by the exit tx");
 
+    // Standard rgb-lib view after the UNILATERAL exit: the sender no longer holds the asset on the
+    // (now spent) statechain UTXO, and the receiver has validated the transition. (The exit output is
+    // a Mercury-controlled coin here, so the receiver's own list_unspents/get_asset_balance reflect
+    // only what its wallet owns; rgb03 shows the receiver *owning* the exited asset via a witness
+    // invoice with get_asset_balance = 1000.)
+    // The color-based deposit spent the sender's on-chain source UTXO but (without `register`) the
+    // DB still shows a stale allocation on it; mark it spent so the standard balance correctly drops
+    // to 0 - the asset has left the sender on-chain (it now lives on the exit output the receiver
+    // validated).
+    let src_a: Vec<String> = tokio::task::block_in_place(|| rgb_sender_a.list_allocations(&contract_a))?
+        .into_iter().map(|(op, _, _)| op).collect();
+    tokio::task::block_in_place(|| rgb_sender_a.mark_spent(&src_a))?;
+    println!("RGB01 - [standard rgb-lib] sender after UNILATERAL exit (asset left -> balance 0):");
+    dump_rgb_state("sender_a after unilateral exit", &mut rgb_sender_a, &contract_a);
+    println!("RGB01 - [standard rgb-lib] receiver after UNILATERAL exit (validated the transition; the exit output is a Mercury coin it does not own - rgb03 shows a receiver owning the exited asset with balance 1000):");
+    dump_rgb_state("receiver after unilateral exit", &mut rgb_receiver, &contract_a);
+
     // ----------------------------------------------------------------------------------------
     // Path B: deposit -> cooperative withdrawal (colored withdrawal tx co-signed with the SE)
     // ----------------------------------------------------------------------------------------
@@ -382,6 +399,18 @@ async fn run(client_config: &ClientConfig) -> Result<()> {
     );
     assert_eq!(withdrawn, rgb_amount, "asset must be assigned to the withdrawal output");
     assert!(sc_b_spent, "the statechain UTXO must be spent on-chain by the withdrawal tx");
+
+    // Standard rgb-lib view after the COOPERATIVE withdrawal: the sender no longer holds the asset on
+    // the (now spent) statechain UTXO, and the receiver has validated the withdrawal consignment.
+    // (The withdrawal output is a bitcoin-core address here; rgb03 shows the receiver *owning* the
+    // withdrawn asset via a witness invoice with get_asset_balance = 1000.)
+    let src_b: Vec<String> = tokio::task::block_in_place(|| rgb_sender_b.list_allocations(&contract_b))?
+        .into_iter().map(|(op, _, _)| op).collect();
+    tokio::task::block_in_place(|| rgb_sender_b.mark_spent(&src_b))?;
+    println!("RGB01 - [standard rgb-lib] sender after COOPERATIVE withdrawal (asset left -> balance 0):");
+    dump_rgb_state("sender_b after cooperative withdrawal", &mut rgb_sender_b, &contract_b);
+    println!("RGB01 - [standard rgb-lib] receiver after COOPERATIVE withdrawal (validated the withdrawal; the withdrawal output is a bitcoin-core coin it does not own - rgb03 shows a receiver owning the withdrawn asset with balance 1000):");
+    dump_rgb_state("receiver after cooperative withdrawal", &mut rgb_receiver, &contract_b);
 
     println!(
         "RGB01 - RGB statechain lifecycle complete (issuance, deposit, transfer, unilateral + cooperative withdraw)"
