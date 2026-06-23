@@ -15,6 +15,7 @@ pub mod rgb01_offchain_split;
 pub mod rgb02_combine_transfer;
 pub mod rgb03_offchain_chain;
 pub mod rgb04_single_use;
+pub mod rgb05_combine3;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -43,6 +44,11 @@ async fn main() -> Result<()> {
     // SE single-use probe (RGB_E2E=4): the SE must refuse a 2nd conflicting spend of a node.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("4") {
         rgb04_single_use::execute().await?;
+        return Ok(());
+    }
+    // 3-input combine (RGB_E2E=5): many deposit coins -> one payment + change.
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("5") {
+        rgb05_combine3::execute().await?;
         return Ok(());
     }
 
