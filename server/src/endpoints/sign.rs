@@ -49,10 +49,13 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
     }
 
     // SE single-use enforcement (off-chain RGB tree double-spend guard): a single-use coin may be
-    // terminally spent only ONCE. If it already has a finalized signature (a sign_second completed),
-    // refuse any further spend. Normal coins (single_use=false) keep the existing re-sign behaviour.
+    // terminally spent only ONCE. The deposit creates one finalized signature (the unilateral-exit
+    // backup tx), and the terminal spend is the second; so the FIRST double-spend attempt is the
+    // third finalized signature. Refuse from there. Normal coins (single_use=false) keep the existing
+    // re-sign behaviour. (Coins funded differently than fund_statechain may have a different baseline
+    // than 1 deposit signature — see docs/rgb_offchain_split_se_protocol.md.)
     if crate::database::deposit::is_single_use(&statechain_entity.pool, &statechain_id).await
-        && crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await >= 1
+        && crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await >= 2
     {
         let response_body = json!({
             "message": "single-use coin already spent (SE refuses a second spend)"

@@ -132,16 +132,13 @@ pub async fn execute() -> Result<()> {
         &[(addr_b.clone(), OUT_SAT, ISSUED)], 1, true, None, NETWORK, si.initlock, si.interval, BLINDING,
     ).await;
 
-    let enforced = spend2.is_err();
     match &spend2 {
         Err(e) => println!("RGB04 - spend #2 REFUSED by the SE -> single-use ENFORCED \u{2713} ({e})"),
-        Ok(tx) => println!("RGB04 - spend #2 CO-SIGNED (tx {}) -> single-use NOT active in THIS server build; deploy the single-use mercury-server (migration 0002 + sign_first refusal) to enforce", tx.txid),
+        Ok(tx) => println!("RGB04 - spend #2 CO-SIGNED (tx {}) -> single-use NOT enforced (double-spend gap!)", tx.txid),
     }
+    assert!(spend2.is_err(),
+        "SE must REFUSE a second conflicting spend of a single-use node (off-chain double-spend guard)");
 
-    // The SE single-use ledger is implemented (mercurylib DepositMsg1.single_use + server sign_first
-    // refusal of a 2nd finalized signature on a single-use coin + migration 0002). This is a PROBE: it
-    // reports whether the running server enforces it. Once the single-use server build is deployed,
-    // change this to `assert!(enforced, ...)` to make it a hard double-spend guard test.
-    println!("RGB04 - probe complete: spend #1 co-signed OK; single-use enforced = {enforced}.");
+    println!("RGB04 - SUCCESS: SE enforces single-use - the conflicting second spend of ROOT was refused.");
     Ok(())
 }
