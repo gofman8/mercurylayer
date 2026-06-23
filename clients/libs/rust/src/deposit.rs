@@ -27,6 +27,7 @@ async fn get_deposit_bitcoin_address_inner(client_config: &ClientConfig, wallet_
     coin.amount = Some(amount);
     coin.aggregated_address = Some(aggregated_public_key.aggregate_address.clone());
     coin.aggregated_pubkey = Some(aggregated_public_key.aggregate_pubkey);
+    coin.single_use = single_use;
 
     update_wallet(&client_config.pool, &wallet).await?;
 

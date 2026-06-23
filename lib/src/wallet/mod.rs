@@ -106,6 +106,11 @@ pub struct Coin {
     pub withdrawal_address: Option<String>,
     pub status: CoinStatus,
     pub duplicate_index: u32,
+    /// Single-use coin (off-chain RGB tree node): the SE refuses any second spend, and the client
+    /// skips the deposit unilateral-exit backup tx (the tree branch is the exit), so the only SE
+    /// signature is the one terminal spend. Defaults false (normal re-signable coin).
+    #[serde(default)]
+    pub single_use: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
