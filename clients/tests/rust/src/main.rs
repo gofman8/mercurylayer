@@ -19,6 +19,7 @@ pub mod rgb05_combine3;
 pub mod rgb06_dag3;
 pub mod rgb07_epoch;
 pub mod rgb08_wide_combine;
+pub mod rgb09_factory;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -69,6 +70,12 @@ async fn main() -> Result<()> {
     // in one SE-co-signed tx -> recipient + change, exit in ONE on-chain tx (N deposits, 1 footprint).
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
         rgb08_wide_combine::execute().await?;
+        return Ok(());
+    }
+    // Multi-owner factory (RGB_E2E=9): one root UTXO split off-chain to N DISTINCT owner wallets, each
+    // independently validating + settling its own allocation; one exit tx materializes all (Stage 5).
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("9") {
+        rgb09_factory::execute().await?;
         return Ok(());
     }
 

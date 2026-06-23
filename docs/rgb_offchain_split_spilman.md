@@ -219,8 +219,11 @@ and `blinded_map` (multi-beneficiary transitions);
    on-chain counterpart — a reserve `(SE & CLTV)` timeout branch + DW decrementing `nSequence` +
    poisoning for *operator reclaim* and *in-place rebalance* — needs taproot script-path tweaking of
    the aggregate output key and folds into the multi-owner factory work (Stage 5).
-5. **Multi-owner factory** — many distinct owners under one root, full pseudo-Spilman co-signing so
-   each owner refuses invalid factory updates (Stage 5).
+5. **Multi-owner factory (Stage 5, core DONE)** — one on-chain root amortized across many *distinct*
+   owners (each a separate wallet with its own keys), demonstrated by `rgb09`: the operator splits the
+   root off-chain to N owners, each independently validates + exits its own allocation. The advanced
+   variant where owners JOINTLY control the root via n-of-n MuSig2 and co-sign in-place updates (so
+   each owner can refuse an invalid factory update) needs multi-party keygen in the lockbox — future.
 
 ## Working today (green E2E on regtest)
 
@@ -234,6 +237,7 @@ and `blinded_map` (multi-beneficiary transitions);
 | `rgb06` (RGB_E2E=6) | **3-level off-chain DAG** — split → combine → split, all un-broadcast; validated via `validate_offchain_chain([S1,S2,S3])`; exit by broadcasting the branch |
 | `rgb07` (RGB_E2E=7) | **Epoch deadline (Stage 4)** — SE co-signs inside the active period, REFUSES a new co-signature once its clock passes the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE call |
 | `rgb08` (RGB_E2E=8) | **Wide combine (scale)** — ROOT split into N=6 single-use+epoch sub-coins, then all 6 combined in one SE-co-signed tx → recipient + change, exited in a SINGLE on-chain tx (N deposits, one footprint — on-chain cost is constant regardless of deposit count) |
+| `rgb09` (RGB_E2E=9) | **Multi-owner factory (Stage 5)** — one root UTXO (single-use+epoch) split off-chain to N=3 **distinct owner wallets**; each independently validates its own allocation off-chain and settles it on-chain; one exit tx materializes every owner's coin (one root amortized across many sovereign owners) |
 
 Together these are the off-chain RGB DAG: deposits (roots), transitions that **split and combine**
 (N→M) and **chain** (depth), validated off-chain, with the SE as the single-use enforcer — and, with
@@ -244,7 +248,7 @@ double-spend-protected; `rgb01` stays on the normal deposit+backup path as regre
 Run (stack up; see the `rgb-statechain-run-env` memory / below):
 ```bash
 cd clients/tests/rust
-RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=8
+RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=9
 ```
 The SE single-use + epoch checks require the matching mercury-server build (migration 0002 single_use
 + 0003 epoch_deadline + the `sign_first` refusals); in this dev env it is deployed by `docker cp` +
@@ -257,7 +261,9 @@ in-container `touch` + restart (the `docker compose build` cache does not pick u
   the aggregate output key (the SE-enforced epoch deadline already gives the bounded-exit guarantee).
 - **Cooperative-collapse exit** — operator co-signs a single root→final-allocation tx instead of
   broadcasting the branch (the normal 1-tx exit).
-- **Multi-owner factory** — one on-chain root amortized across many owners (full pseudo-Spilman).
+- **n-of-n joint factory** — owners JOINTLY control the root (multi-party MuSig2 in the lockbox) and
+  co-sign in-place updates, so each owner can refuse an invalid factory update. The `rgb09` factory
+  already amortizes one root across many *distinct* owners (operator-distributes shape).
 
-Done: robust single-use (single-use coins skip the deposit backup → uniform `>=1` SE threshold) and
-the Stage 4 epoch deadline (above).
+Done: robust single-use (single-use coins skip the deposit backup → uniform `>=1` SE threshold), the
+Stage 4 epoch deadline, the `rgb08` wide-combine scale test, and the `rgb09` multi-owner factory.
