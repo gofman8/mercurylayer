@@ -13,6 +13,7 @@ pub mod tm01_sender_double_spends;
 mod tv01;
 pub mod rgb01_offchain_split;
 pub mod rgb02_combine_transfer;
+pub mod rgb03_offchain_chain;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -30,6 +31,12 @@ async fn main() -> Result<()> {
     // SE-co-signed tx -> recipient + change. See docs/rgb_offchain_split_spilman.md.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("2") {
         rgb02_combine_transfer::execute().await?;
+        return Ok(());
+    }
+    // 2-deep off-chain chain (RGB_E2E=3): un-broadcast split -> un-broadcast combine, validated via
+    // validate_offchain_chain over both un-broadcast witnesses. Off-chain DAG depth.
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("3") {
+        rgb03_offchain_chain::execute().await?;
         return Ok(());
     }
 
