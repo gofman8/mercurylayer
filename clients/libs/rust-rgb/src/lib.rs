@@ -343,6 +343,39 @@ impl RgbWallet {
         Ok((res.valid, detail))
     }
 
+    /// Validate a consignment **off-chain** whose witness is a CHAIN of un-broadcast transactions —
+    /// a multi-level off-chain split (Stage 2 of `docs/rgb_offchain_split_spilman.md`). `txids` is the
+    /// branch from the on-chain root down to the leaf (e.g. `[S1, S2]`); every one is resolved from
+    /// the consignment's bundled witnesses, so an un-broadcast *parent* need not be on-chain (unlike
+    /// [`Self::validate_offchain`], which only treats the single terminal txid as offchain).
+    pub fn validate_offchain_chain(
+        &self,
+        consignment_base64: &str,
+        txids: &[String],
+    ) -> Result<(bool, Option<String>)> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-validate-chain");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let network = self.wallet.get_wallet_data().bitcoin_network;
+        let res = rgb_lib::wallet::rust_only::validate_consignment_offchain_chain(
+            path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+            txids,
+            &self.indexer_url,
+            network,
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+        let detail = if res.valid {
+            res.warnings.map(|w| w.join("; "))
+        } else {
+            res.details.or(res.error)
+        };
+        Ok((res.valid, detail))
+    }
+
     /// Validate and accept an incoming consignment (base64) relayed in-band by the Mercury transfer
     /// message. The bytes are re-posted to the local RGB proxy and validated via the public
     /// `accept_transfer` (no rgb-lib source change). `txid`/`vout` identify the witness-tx output
