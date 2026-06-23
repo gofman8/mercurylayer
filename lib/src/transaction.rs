@@ -700,9 +700,187 @@ pub fn new_backup_transaction(
     });
 
     let signed_tx = psbt.extract_tx();
-    
+
     let tx_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
     let encoded_signed_tx = hex::encode(tx_bytes);
-    
+
     Ok(encoded_signed_tx)
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Multi-input ("combine") colored transactions — see docs/rgb_offchain_split_spilman.md.
+//
+// A combine spends N statechain coins (inputs) into M outputs in one transaction, carrying one RGB
+// transition that sums the inputs. Mercury is single-input by construction; these are the multi-input
+// generalizations of `get_unsigned_split_psbt` / `get_partial_sig_request_for_colored_tx` /
+// `new_backup_transaction`. Each input keeps its own blind-MuSig2 session ({owner_i, SE}); the SE
+// co-signs each. `coins` are matched to tx inputs by outpoint, so input ordering after coloring is
+// irrelevant.
+// ---------------------------------------------------------------------------------------------------
+
+/// Resolve a recipient address string (a Mercury transfer address or a plain bitcoin address) to a
+/// `ScriptBuf`, mirroring `create_tx_out`.
+fn resolve_output_scriptpubkey(addr: &str, network: Network) -> core::result::Result<ScriptBuf, MercuryError> {
+    let address = if addr.starts_with(crate::MAINNET_HRP) || addr.starts_with(crate::TESTNET_HRP) {
+        let (_, recipient_user_pubkey, _) = decode_transfer_address(addr)?;
+        Address::p2tr(&Secp256k1::new(), recipient_user_pubkey.x_only_public_key().0, None, network)
+    } else {
+        Address::from_str(addr)
+            .map_err(|_| MercuryError::InvalidBitcoinAddressError)?
+            .require_network(network)?
+    };
+    Ok(address.script_pubkey())
+}
+
+/// Build the unsigned **combine** tx as a base64 PSBT: N inputs (one per `coins` entry, the statechain
+/// coins being combined) and M outputs (one per `(address, sat_value)` in `outputs`). The sum of
+/// `outputs` sat values must be strictly less than the sum of the input amounts; the remainder is the
+/// on-exit fee. rgb-lib then colors this PSBT (consuming the inputs' allocations, inserting the single
+/// OP_RETURN opret commitment, and assigning the asset across the outputs via `output_map`).
+pub fn get_unsigned_combine_psbt(
+    coins: &[Coin],
+    block_height: u32,
+    initlock: u32,
+    interval: u32,
+    qt_backup_tx: u32,
+    outputs: Vec<(String, u64)>,
+    network: String,
+    is_withdrawal: bool,
+) -> core::result::Result<String, MercuryError> {
+    let network = utils::get_network(&network)?;
+
+    if coins.is_empty() {
+        return Err(MercuryError::EmptyInput);
+    }
+    let total_in: u64 = coins.iter().map(|c| c.amount.unwrap() as u64).sum();
+    let total_out: u64 = outputs.iter().map(|(_, v)| *v).sum();
+    if outputs.is_empty() || total_out >= total_in {
+        return Err(MercuryError::FeeTooLow);
+    }
+
+    let tx_outs: Vec<TxOut> = outputs
+        .iter()
+        .map(|(addr, value)| -> core::result::Result<TxOut, MercuryError> {
+            Ok(TxOut { value: *value, script_pubkey: resolve_output_scriptpubkey(addr, network)? })
+        })
+        .collect::<core::result::Result<_, _>>()?;
+
+    let block_height =
+        calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
+    let lock_time = absolute::LockTime::from_height(block_height)?;
+
+    let mut tx_ins = Vec::with_capacity(coins.len());
+    for c in coins {
+        let txid = Txid::from_str(c.utxo_txid.as_ref().unwrap())?;
+        let vout = c.utxo_vout.unwrap();
+        tx_ins.push(TxIn {
+            previous_output: OutPoint { txid, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence(0x0),
+            witness: Witness::default(),
+        });
+    }
+
+    let unsigned_tx = Transaction { version: 2, lock_time, input: tx_ins, output: tx_outs };
+    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+
+    let ty = PsbtSighashType::from_str("SIGHASH_ALL")?;
+    let mut psbt_inputs = Vec::with_capacity(coins.len());
+    for c in coins {
+        let input_pubkey = PublicKey::from_str(c.aggregated_pubkey.as_ref().unwrap())?;
+        let input_xonly_pubkey = input_pubkey.x_only_public_key().0;
+        let input_amount = c.amount.unwrap() as u64;
+        let input_address =
+            Address::from_str(c.aggregated_address.as_ref().unwrap())?.require_network(network)?;
+        let mut input = Input {
+            witness_utxo: Some(TxOut { value: input_amount, script_pubkey: input_address.script_pubkey() }),
+            ..Default::default()
+        };
+        input.sighash_type = Some(ty);
+        input.tap_internal_key = Some(input_xonly_pubkey);
+        psbt_inputs.push(input);
+    }
+    psbt.inputs = psbt_inputs;
+
+    Ok(psbt.to_string())
+}
+
+/// Per-input blind-MuSig2 sessions for a colored **multi-input** transaction. Returns one
+/// [`PartialSignatureMsg1`] per transaction input, in transaction-input order. Each input's taproot
+/// key-spend sighash is computed over **all** prevouts (`SIGHASH_ALL`), and `coins` are matched to
+/// inputs by outpoint, so any input reordering by the coloring step is handled. Every coin must have
+/// its nonce state populated (client nonce committed + server pubnonce fetched) beforehand.
+pub fn get_partial_sig_request_for_colored_tx_multi(
+    coins: &[Coin],
+    encoded_unsigned_tx: String,
+    network: String,
+) -> core::result::Result<Vec<PartialSignatureMsg1>, MercuryError> {
+    let network = utils::get_network(&network)?;
+
+    let tx_bytes = hex::decode(&encoded_unsigned_tx)?;
+    let unsigned_tx: Transaction = bitcoin::consensus::encode::deserialize(&tx_bytes)?;
+    if unsigned_tx.input.is_empty() {
+        return Err(MercuryError::EmptyInput);
+    }
+
+    // Match each tx input to its coin by outpoint and build prevouts in tx-input order.
+    let mut ordered_coins: Vec<&Coin> = Vec::with_capacity(unsigned_tx.input.len());
+    let mut prevouts: Vec<TxOut> = Vec::with_capacity(unsigned_tx.input.len());
+    for txin in unsigned_tx.input.iter() {
+        let op = txin.previous_output;
+        let op_txid = op.txid.to_string();
+        let coin = coins
+            .iter()
+            .find(|c| c.utxo_txid.as_deref() == Some(op_txid.as_str()) && c.utxo_vout == Some(op.vout))
+            .ok_or(MercuryError::CoinNotFound)?;
+        let input_amount = coin.amount.unwrap() as u64;
+        let input_address =
+            Address::from_str(coin.aggregated_address.as_ref().unwrap())?.require_network(network)?;
+        prevouts.push(TxOut { value: input_amount, script_pubkey: input_address.script_pubkey() });
+        ordered_coins.push(coin);
+    }
+
+    let mut sessions = Vec::with_capacity(ordered_coins.len());
+    for (i, coin) in ordered_coins.iter().enumerate() {
+        let hash = SighashCache::new(&unsigned_tx).taproot_key_spend_signature_hash(
+            i,
+            &sighash::Prevouts::All(&prevouts),
+            TapSighashType::All,
+        )?;
+        sessions.push(calculate_musig_session(coin, hash, encoded_unsigned_tx.clone())?);
+    }
+    Ok(sessions)
+}
+
+/// Attach N aggregated taproot key-spend signatures (one per input, in input order) to a colored
+/// multi-input transaction, returning the fully-signed tx (hex). The multi-input analogue of
+/// [`new_backup_transaction`].
+pub fn new_backup_transaction_multi(
+    encoded_unsigned_tx: String,
+    signatures_hex: Vec<String>,
+) -> core::result::Result<String, MercuryError> {
+    let tx_bytes = hex::decode(encoded_unsigned_tx)?;
+    let tx: Transaction = bitcoin::consensus::encode::deserialize(&tx_bytes)?;
+    let mut psbt = Psbt::from_unsigned_tx(tx)?;
+
+    if psbt.inputs.len() != signatures_hex.len() {
+        return Err(MercuryError::MoreThanOneInputError);
+    }
+
+    for (input, sig_hex) in psbt.inputs.iter_mut().zip(signatures_hex.iter()) {
+        let sig = Signature::from_str(sig_hex)?;
+        let final_signature = taproot::Signature { sig, hash_ty: TapSighashType::All };
+        input.tap_key_sig = Some(final_signature);
+        let mut script_witness: Witness = Witness::new();
+        script_witness.push(final_signature.to_vec());
+        input.final_script_witness = Some(script_witness);
+        input.partial_sigs = BTreeMap::new();
+        input.sighash_type = None;
+        input.redeem_script = None;
+        input.witness_script = None;
+        input.bip32_derivation = BTreeMap::new();
+    }
+
+    let signed_tx = psbt.extract_tx();
+    Ok(hex::encode(bitcoin::consensus::encode::serialize(&signed_tx)))
 }

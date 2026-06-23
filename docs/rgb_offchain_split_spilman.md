@@ -162,6 +162,41 @@ flowchart LR
     end
 ```
 
+## Relation to Spark (branches & leaves) — the forest model
+
+Spark (<https://docs.spark.money/learn/core-concepts>) is the closest production design, and its shape
+is the right target for "hundreds of deposits that combine and separate":
+
+- **One tree per deposit → a forest.** Each on-chain deposit becomes its own tree; the network is a
+  *forest* of them, not one shared root. (This supersedes the single-root SuperScalar framing — that
+  was the one-funder special case.)
+- **Leaves vs. branches.** *Leaves* are terminal, user-owned, and carry timelocks; *branches* are
+  non-terminal, have **no** timelock, and are spendable by the **sum of the keys of the leaves under
+  them**.
+- **Additive key-splitting.** Splitting a leaf is a tx whose child outputs get keys *split from* the
+  parent so that **Σ child keys = parent key**. Because children re-sum to the parent, leaves can be
+  **re-aggregated (combined) off-chain by key arithmetic** — no on-chain tx, no multi-input signing
+  for within-tree merges.
+- **Transfer = sign-and-forget** (statechain key handover — what Mercury already does). **Unilateral
+  exit** = broadcast the branch down to your leaf.
+
+**How our pieces map:**
+
+| Spark | This design (today) |
+|---|---|
+| Forest of per-deposit trees | Each Mercury deposit is an independent `{owner, SE}` statechain coin (a root) ✓ |
+| Split a leaf | `rgb01` — one coin → N colored witness sub-coins ✓ |
+| Aggregate / combine leaves | `rgb02` + `create_colored_combine_tx` — multi-input SE-co-signed tx (N coins → M outputs). Signing path proven green E2E at N=1; the per-input loop is identical for N≥2, which is blocked only on multi-coin deposit funding (an rgb-lib stale-UTXO quirk on this regtest) |
+| Transfer | `refresh_rgb_anchor_self_transfer` (key rotation) ✓ |
+| **Additive keys (Σ children = parent)** | **not yet** — we use independent per-coin keys, so combining needs a multi-input tx rather than key re-aggregation |
+
+So the functional shape (forest + split + combine) is in place. The **one refinement Spark adds** is
+*additive key derivation*: deriving each sub-coin's key as a split of its parent so within-tree
+combines are pure key arithmetic (cheaper than `rgb02`'s multi-input signing, and the basis for the
+"branch = sum of leaf keys" unilateral-exit structure). That is the recommended next architectural
+step; `rgb02`'s multi-input combine remains the primitive for *cross-tree* merges (different deposits),
+which Spark mediates through the operator regardless.
+
 ## What is new to build vs. reused
 
 **Reused:** `register_statechain` (sub-coin as wallet UTXO); `color_psbt` with `output_map` (witness)

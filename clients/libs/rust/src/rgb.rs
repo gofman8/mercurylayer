@@ -17,8 +17,10 @@ use anyhow::{anyhow, Result};
 use bitcoin::psbt::Psbt;
 use electrum_client::ElectrumApi;
 use mercurylib::transaction::{
-    create_signature, get_partial_sig_request_for_colored_tx, get_unsigned_backup_psbt,
-    get_unsigned_split_psbt, new_backup_transaction,
+    create_signature, get_partial_sig_request_for_colored_tx,
+    get_partial_sig_request_for_colored_tx_multi, get_unsigned_backup_psbt,
+    get_unsigned_combine_psbt, get_unsigned_split_psbt, new_backup_transaction,
+    new_backup_transaction_multi,
 };
 use mercurylib::wallet::Coin;
 use mercury_rgb::RgbWallet;
@@ -289,6 +291,142 @@ pub async fn create_colored_split_tx(
     let txid = tx.txid().to_string();
 
     Ok(ColoredSplitTx { signed_tx, txid, output_vouts, consignment, blinding })
+}
+
+/// Outcome of building a colored **combine** transaction — N statechain coins spent into M outputs in
+/// one un-broadcast, blind-MuSig2 co-signed transaction (the "combine + separate" half of the
+/// forest/DAG model in `docs/rgb_offchain_split_spilman.md`).
+pub struct ColoredCombineTx {
+    /// Fully signed (blind-MuSig2 per input) combine transaction, hex-encoded. NOT broadcast off-chain.
+    pub signed_tx: String,
+    /// Txid of the signed combine transaction (the RGB witness txid receivers validate against).
+    pub txid: String,
+    /// Post-coloring vout of each output, in the same order as the `outputs` argument.
+    pub output_vouts: Vec<u32>,
+    /// The consumed input outpoints (`txid:vout`), in tx-input order — the receiver passes these to
+    /// `validate_offchain_chain` so each un-broadcast input witness resolves from the consignment.
+    pub input_outpoints: Vec<String>,
+    /// RGB consignment (base64) proving the combine transition (sums all inputs across the outputs).
+    pub consignment: String,
+    /// Seal blinding used while coloring.
+    pub blinding: u64,
+}
+
+/// Build, color and blind-MuSig2-sign a **combine** transaction: spend `coins` (N registered
+/// statechain coins, each holding an allocation of `contract_id`) into the colored `outputs` (M
+/// sub-coins), committing one RGB transition that conserves `sum(inputs) = sum(outputs)`. The SE
+/// co-signs **each** input (Mercury's single-input rule is lifted via
+/// [`get_partial_sig_request_for_colored_tx_multi`] / [`new_backup_transaction_multi`]). The tx is
+/// **not** broadcast; receivers validate it off-chain ([`mercury_rgb::RgbWallet::validate_offchain_chain`]
+/// passing `input_outpoints`); broadcasting it is the unilateral exit.
+///
+/// Each coin in `coins` must be registered (`register_statechain`) so rgb-lib knows its input
+/// allocation, and must carry fresh nonce state — handled here (a `sign_first` round per input).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_colored_combine_tx(
+    client_config: &ClientConfig,
+    rgb: &RgbWallet,
+    coins: &mut [Coin],
+    contract_id: &str,
+    outputs: &[SplitOutput],
+    qt_backup_tx: u32,
+    is_withdrawal: bool,
+    block_height: Option<u32>,
+    network: &str,
+    initlock: u32,
+    interval: u32,
+    blinding: u64,
+) -> Result<ColoredCombineTx> {
+    if coins.is_empty() {
+        return Err(anyhow!("combine needs at least one input coin"));
+    }
+    if outputs.is_empty() {
+        return Err(anyhow!("combine needs at least one output"));
+    }
+
+    let block_height = match block_height {
+        Some(h) => h,
+        None => client_config.electrum_client.block_headers_subscribe_raw()?.height as u32,
+    };
+
+    // 1. Per-input nonce commitment + server first-round nonce.
+    for coin in coins.iter_mut() {
+        let coin_nonce = mercurylib::transaction::create_and_commit_nonces(coin)?;
+        coin.secret_nonce = Some(coin_nonce.secret_nonce.clone());
+        coin.public_nonce = Some(coin_nonce.public_nonce.clone());
+        coin.blinding_factor = Some(coin_nonce.blinding_factor.clone());
+        let server_public_nonce = sign_first(client_config, &coin_nonce.sign_first_request_payload).await?;
+        coin.server_public_nonce = Some(server_public_nonce);
+    }
+
+    // 2. Build the unsigned multi-input PSBT (N inputs = the coins, M outputs).
+    let out_pairs: Vec<(String, u64)> = outputs.iter().map(|(a, sat, _)| (a.clone(), *sat)).collect();
+    let unsigned_psbt_b64 = get_unsigned_combine_psbt(
+        coins,
+        block_height,
+        initlock,
+        interval,
+        qt_backup_tx,
+        out_pairs,
+        network.to_string(),
+        is_withdrawal,
+    )?;
+
+    // 3. Color: rgb-lib consumes every input allocation and assigns each rgb_amount to its output vout.
+    let mut output_map = std::collections::HashMap::new();
+    for (i, (_, _, rgb_amount)) in outputs.iter().enumerate() {
+        output_map.insert(i as u32, *rgb_amount);
+    }
+    let (colored_psbt_b64, consignment) = rgb.color(&unsigned_psbt_b64, contract_id, output_map, blinding)?;
+
+    let colored_psbt = Psbt::from_str(&colored_psbt_b64)
+        .map_err(|e| anyhow!("could not parse colored psbt: {e}"))?;
+    let colored_unsigned_tx = colored_psbt.unsigned_tx.clone();
+    let colored_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&colored_unsigned_tx));
+
+    let output_vouts: Vec<u32> = colored_unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| !o.script_pubkey.is_op_return())
+        .map(|(vout, _)| vout as u32)
+        .collect();
+    if output_vouts.len() != outputs.len() {
+        return Err(anyhow!(
+            "colored combine tx has {} spendable outputs, expected {}",
+            output_vouts.len(),
+            outputs.len()
+        ));
+    }
+
+    let input_outpoints: Vec<String> = colored_unsigned_tx
+        .input
+        .iter()
+        .map(|i| format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
+        .collect();
+
+    // 4. Per-input blind-MuSig2: sessions (in tx-input order) -> sign_second -> aggregate. One sig per input.
+    let sessions =
+        get_partial_sig_request_for_colored_tx_multi(coins, colored_tx_hex.clone(), network.to_string())?;
+    let mut signatures = Vec::with_capacity(sessions.len());
+    for session in sessions.iter() {
+        let server_partial_sig =
+            sign_second(client_config, &session.partial_signature_request_payload).await?;
+        let signature = create_signature(
+            session.msg.clone(),
+            session.client_partial_sig.clone(),
+            hex::encode(server_partial_sig.serialize()),
+            session.encoded_session.clone(),
+            session.output_pubkey.clone(),
+        )?;
+        signatures.push(signature);
+    }
+
+    let signed_tx = new_backup_transaction_multi(colored_tx_hex, signatures)?;
+    let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&signed_tx)?)?;
+    let txid = tx.txid().to_string();
+
+    Ok(ColoredCombineTx { signed_tx, txid, output_vouts, input_outpoints, consignment, blinding })
 }
 
 /// RGB-over-statechain status annotation, layered on top of the Mercury `CoinStatus`.

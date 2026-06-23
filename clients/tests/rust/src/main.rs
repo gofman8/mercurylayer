@@ -12,6 +12,7 @@ pub mod tb05_timelock;
 pub mod tm01_sender_double_spends;
 mod tv01;
 pub mod rgb01_offchain_split;
+pub mod rgb02_combine_transfer;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -23,6 +24,12 @@ async fn main() -> Result<()> {
     // the RGB proxy + electrum indexer in addition to the Mercury stack. Run with RGB_E2E=1.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("1") {
         rgb01_offchain_split::execute().await?;
+        return Ok(());
+    }
+    // Multi-input "combine" off-chain transition (RGB_E2E=2): spend N statechain coins in one
+    // SE-co-signed tx -> recipient + change. See docs/rgb_offchain_split_spilman.md.
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("2") {
+        rgb02_combine_transfer::execute().await?;
         return Ok(());
     }
 
