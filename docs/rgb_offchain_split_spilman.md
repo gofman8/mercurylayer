@@ -233,6 +233,7 @@ and `blinded_map` (multi-beneficiary transitions);
 | `rgb05` (RGB_E2E=5) | **Combine (3-in)** — three coins → one payment + change (the multi-input combine scales) |
 | `rgb06` (RGB_E2E=6) | **3-level off-chain DAG** — split → combine → split, all un-broadcast; validated via `validate_offchain_chain([S1,S2,S3])`; exit by broadcasting the branch |
 | `rgb07` (RGB_E2E=7) | **Epoch deadline (Stage 4)** — SE co-signs inside the active period, REFUSES a new co-signature once its clock passes the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE call |
+| `rgb08` (RGB_E2E=8) | **Wide combine (scale)** — ROOT split into N=6 single-use+epoch sub-coins, then all 6 combined in one SE-co-signed tx → recipient + change, exited in a SINGLE on-chain tx (N deposits, one footprint — on-chain cost is constant regardless of deposit count) |
 
 Together these are the off-chain RGB DAG: deposits (roots), transitions that **split and combine**
 (N→M) and **chain** (depth), validated off-chain, with the SE as the single-use enforcer — and, with
@@ -243,7 +244,7 @@ double-spend-protected; `rgb01` stays on the normal deposit+backup path as regre
 Run (stack up; see the `rgb-statechain-run-env` memory / below):
 ```bash
 cd clients/tests/rust
-RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=7
+RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=8
 ```
 The SE single-use + epoch checks require the matching mercury-server build (migration 0002 single_use
 + 0003 epoch_deadline + the `sign_first` refusals); in this dev env it is deployed by `docker cp` +

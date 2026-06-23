@@ -18,6 +18,7 @@ pub mod rgb04_single_use;
 pub mod rgb05_combine3;
 pub mod rgb06_dag3;
 pub mod rgb07_epoch;
+pub mod rgb08_wide_combine;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -62,6 +63,12 @@ async fn main() -> Result<()> {
     // past the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE call.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("7") {
         rgb07_epoch::execute().await?;
+        return Ok(());
+    }
+    // Wide-combine scale test (RGB_E2E=8): split ROOT into N single-use+epoch sub-coins, combine all N
+    // in one SE-co-signed tx -> recipient + change, exit in ONE on-chain tx (N deposits, 1 footprint).
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
+        rgb08_wide_combine::execute().await?;
         return Ok(());
     }
 
