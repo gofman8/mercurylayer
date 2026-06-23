@@ -186,7 +186,7 @@ is the right target for "hundreds of deposits that combine and separate":
 |---|---|
 | Forest of per-deposit trees | Each Mercury deposit is an independent `{owner, SE}` statechain coin (a root) ✓ |
 | Split a leaf | `rgb01` — one coin → N colored witness sub-coins ✓ |
-| Aggregate / combine leaves | `rgb02` + `create_colored_combine_tx` — multi-input SE-co-signed tx (N coins → M outputs). Signing path proven green E2E at N=1; the per-input loop is identical for N≥2, which is blocked only on multi-coin deposit funding (an rgb-lib stale-UTXO quirk on this regtest) |
+| Aggregate / combine leaves | `rgb02` + `create_colored_combine_tx` — multi-input SE-co-signed tx (N coins → M outputs). **Green E2E at N=2**: combine two statechain coins (600+400) → recipient 700 + change 300, SE co-signed per input, off-chain validated, exited. Inputs funded by splitting a confirmed ROOT to two Mercury deposit addresses (sidesteps an rgb-lib stale-UTXO quirk on multi-coin deposits) ✓ |
 | Transfer | `refresh_rgb_anchor_self_transfer` (key rotation) ✓ |
 | **Additive keys (Σ children = parent)** | **not yet** — we use independent per-coin keys, so combining needs a multi-input tx rather than key re-aggregation |
 
