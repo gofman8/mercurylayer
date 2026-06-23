@@ -18,7 +18,7 @@ use bitcoin::psbt::Psbt;
 use electrum_client::ElectrumApi;
 use mercurylib::transaction::{
     create_signature, get_partial_sig_request_for_colored_tx, get_unsigned_backup_psbt,
-    new_backup_transaction,
+    get_unsigned_split_psbt, new_backup_transaction,
 };
 use mercurylib::wallet::Coin;
 use mercury_rgb::RgbWallet;
@@ -160,8 +160,138 @@ pub async fn create_colored_backup_tx(
     })
 }
 
+/// A split output: `(address, sat_value, rgb_amount)` — the bitcoin address that receives the
+/// sub-coin, the sats it carries, and the RGB amount assigned to its witness seal.
+pub type SplitOutput = (String, u64, u64);
+
+/// Outcome of building a colored **split** transaction (off-chain RGB split, Stage 1 of
+/// `docs/rgb_offchain_split_spilman.md`).
+pub struct ColoredSplitTx {
+    /// Fully signed (blind-MuSig2) split transaction, hex-encoded. NOT broadcast in the off-chain
+    /// flow — it is the unilateral-exit escape hatch that materializes the sub-coins on-chain.
+    pub signed_tx: String,
+    /// Txid of the signed split transaction (the RGB witness txid the sub-coin owners validate against).
+    pub txid: String,
+    /// Post-coloring vout of each split output, in the same order as the `splits` argument. rgb-lib
+    /// inserts the OP_RETURN opret commitment, so these are computed from the colored tx, not assumed.
+    pub output_vouts: Vec<u32>,
+    /// RGB consignment (base64) proving the split transition (covers every sub-coin seal).
+    pub consignment: String,
+    /// Seal blinding used while coloring (a sub-coin owner needs it to validate/accept).
+    pub blinding: u64,
+}
+
+/// Build, color and blind-MuSig2-sign a **split** of an RGB-enabled statechain coin: spend the coin
+/// into several colored **witness** outputs (the sub-coins) in one transaction, committing a single
+/// RGB transition that assigns each `rgb_amount` to the corresponding output's seal.
+///
+/// This is the chaining primitive behind the off-chain split (pseudo-Spilman leaves): unlike
+/// [`create_colored_backup_tx`] (one recipient output, replacement model) it carves N sub-coins as
+/// the spend's own outputs, so a split costs **no** pre-funded statechain coins. The tx is co-signed
+/// by the SE exactly like a one-output backup ([`get_partial_sig_request_for_colored_tx`] is
+/// output-count agnostic) and is **not** broadcast — sub-coin owners validate it off-chain
+/// ([`mercury_rgb::RgbWallet::validate_offchain`]); broadcasting it is the unilateral exit.
+///
+/// `splits` is the list of `(address, sat_value, rgb_amount)` outputs. The sum of `sat_value`s must
+/// be less than the coin's sats (the remainder is the on-exit miner fee); the sum of `rgb_amount`s
+/// must equal the coin's full RGB allocation (RGB value conservation — validated by rgb-lib).
+#[allow(clippy::too_many_arguments)]
+pub async fn create_colored_split_tx(
+    client_config: &ClientConfig,
+    rgb: &RgbWallet,
+    coin: &mut Coin,
+    contract_id: &str,
+    splits: &[SplitOutput],
+    qt_backup_tx: u32,
+    is_withdrawal: bool,
+    block_height: Option<u32>,
+    network: &str,
+    initlock: u32,
+    interval: u32,
+    blinding: u64,
+) -> Result<ColoredSplitTx> {
+    if splits.is_empty() {
+        return Err(anyhow!("split must have at least one output"));
+    }
+
+    // 1. Nonce commitment + server first-round nonce (identical to create_colored_backup_tx).
+    let coin_nonce = mercurylib::transaction::create_and_commit_nonces(coin)?;
+    coin.secret_nonce = Some(coin_nonce.secret_nonce.clone());
+    coin.public_nonce = Some(coin_nonce.public_nonce.clone());
+    coin.blinding_factor = Some(coin_nonce.blinding_factor.clone());
+    let server_public_nonce = sign_first(client_config, &coin_nonce.sign_first_request_payload).await?;
+    coin.server_public_nonce = Some(server_public_nonce);
+
+    let block_height = match block_height {
+        Some(h) => h,
+        None => client_config.electrum_client.block_headers_subscribe_raw()?.height as u32,
+    };
+
+    // 2. Build the unsigned multi-output split PSBT (one input = the statechain coin, one output per
+    //    sub-coin). Pre-coloring output index i carries `splits[i]`.
+    let outputs: Vec<(String, u64)> = splits.iter().map(|(a, sat, _)| (a.clone(), *sat)).collect();
+    let unsigned_psbt_b64 = get_unsigned_split_psbt(
+        coin,
+        block_height,
+        initlock,
+        interval,
+        qt_backup_tx,
+        outputs,
+        network.to_string(),
+        is_withdrawal,
+    )?;
+
+    // 3. Color: assign each rgb_amount to its pre-coloring witness vout. rgb-lib inserts the single
+    //    OP_RETURN opret commitment and returns one consignment covering all sub-coin seals.
+    let mut output_map = std::collections::HashMap::new();
+    for (i, (_, _, rgb_amount)) in splits.iter().enumerate() {
+        output_map.insert(i as u32, *rgb_amount);
+    }
+    let (colored_psbt_b64, consignment) = rgb.color(&unsigned_psbt_b64, contract_id, output_map, blinding)?;
+
+    let colored_psbt = Psbt::from_str(&colored_psbt_b64)
+        .map_err(|e| anyhow!("could not parse colored psbt: {e}"))?;
+    let colored_unsigned_tx = colored_psbt.unsigned_tx.clone();
+    let colored_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&colored_unsigned_tx));
+
+    // The non-OP_RETURN outputs, in tx order, are the sub-coins in the same order as `splits`
+    // (rgb-lib preserves output order and only inserts the OP_RETURN). Map each split -> its vout.
+    let output_vouts: Vec<u32> = colored_unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| !o.script_pubkey.is_op_return())
+        .map(|(vout, _)| vout as u32)
+        .collect();
+    if output_vouts.len() != splits.len() {
+        return Err(anyhow!(
+            "colored split tx has {} spendable outputs, expected {}",
+            output_vouts.len(),
+            splits.len()
+        ));
+    }
+
+    // 4. Blind-MuSig2 partial-sign the colored tx (output-count agnostic on the SE side) and aggregate.
+    let partial_sig_request =
+        get_partial_sig_request_for_colored_tx(coin, colored_tx_hex.clone(), network.to_string())?;
+    let server_partial_sig =
+        sign_second(client_config, &partial_sig_request.partial_signature_request_payload).await?;
+    let signature = create_signature(
+        partial_sig_request.msg,
+        partial_sig_request.client_partial_sig,
+        hex::encode(server_partial_sig.serialize()),
+        partial_sig_request.encoded_session,
+        partial_sig_request.output_pubkey,
+    )?;
+
+    let signed_tx = new_backup_transaction(colored_tx_hex, signature)?;
+    let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&signed_tx)?)?;
+    let txid = tx.txid().to_string();
+
+    Ok(ColoredSplitTx { signed_tx, txid, output_vouts, consignment, blinding })
+}
+
 /// RGB-over-statechain status annotation, layered on top of the Mercury `CoinStatus`.
-/// See `docs/rgb_anchor_refresh.md` for the full state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RgbStatechainStatus {
     /// The RGB allocation is assigned to the statechain funding outpoint X.
@@ -211,7 +341,7 @@ pub struct RgbAnchorRefresh {
 /// new RGB transition (OP_RETURN opret), is blind-MuSig2 co-signed by the SE, and rotate the
 /// owner key-share - all via the standard Mercury transfer protocol, **without broadcasting**.
 ///
-/// Flow (see `docs/rgb_anchor_refresh.md`): `new_transfer_address` (same wallet) ->
+/// Flow: `new_transfer_address` (same wallet) ->
 /// `transfer/sender` (x1) -> colored backup tx via [`create_colored_backup_tx`] paying the
 /// self-transfer address -> `transfer/update_msg` -> [`crate::transfer_receiver::execute`]
 /// (key-share update + backup-tx/consignment validation).
@@ -313,8 +443,8 @@ pub async fn refresh_rgb_anchor_self_transfer(
     let mut coin_for_color = coin.clone();
     // The bitcoin output always pays the sender's own (self-transfer) address, so the sats stay with
     // the sender. The RGB asset assignment is set by the OP_RETURN: `beneficiary = None` assigns to
-    // the self output (anchor self-refresh, rgb07); `Some(recipient_id)` assigns to a *receiver's*
-    // blinded seal (off-chain P2P transfer, rgb08) - the asset moves, the sats do not.
+    // the self output (anchor self-refresh); `Some(recipient_id)` assigns to a *receiver's*
+    // blinded seal (off-chain P2P transfer) - the asset moves, the sats do not.
     let blinded_vec: Vec<(String, u64)>;
     let blinded = match beneficiary {
         Some(rid) => {

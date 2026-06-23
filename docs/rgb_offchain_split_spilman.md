@@ -1,0 +1,201 @@
+# Off-chain RGB splitting on statechains (pseudo-Spilman leaves)
+
+This document specifies how to **split an RGB allocation off-chain** on a Mercury statechain — one
+on-chain root UTXO fanned out into many sub-coins with **no on-chain transaction and no per-piece
+on-chain cost** until someone exits. It adapts ZmnSCPxj's *SuperScalar: laddered timeout-tree
+Decker-Wattenhofer factories with pseudo-Spilman leaves*
+(<https://delvingbitcoin.org/t/.../1242>, <https://delvingbitcoin.org/t/.../1143>) to RGB single-use
+seals on statechain coins.
+
+It builds on the statechain-as-RGB-seal primitives implemented in the `mercury_rgb` bridge crate
+(`clients/libs/rust-rgb`) and the orchestration in `clients/libs/rust/src/rgb.rs`. The only live RGB
+E2E is `rgb01_offchain_split` (Stage 1, `RGB_E2E=1`); the earlier exploratory flows were removed in the move to
+this architecture.
+
+## Why the existing flows are not enough
+
+The partial-transfer and no-broadcast-transfer flows (`color_blinded` + the anchor-refresh
+self-transfer) already move an allocation to **two** seals in one un-broadcast transition. But each
+destination seal must be a **separately-funded statechain coin** — its own on-chain UTXO, onboarded
+by its own Mercury deposit.
+So "split into N pieces" still costs **N on-chain UTXOs**, provisioned up front. That is redistribution
+among pre-existing coins, not true splitting.
+
+The goal here: carve N **new** sub-coins as **outputs of un-broadcast transactions** chained off a
+**single** on-chain root. Zero on-chain cost per piece; the root is the only thing that ever needs to
+be mined (and only on exit). This is exactly the SuperScalar factory property — amortize one on-chain
+UTXO across many sub-allocations.
+
+## Two invalidation regimes (do not conflate them)
+
+| | anchor-refresh / transfer (`refresh_rgb_anchor_self_transfer`) | off-chain split (this doc) |
+|---|---|---|
+| Model | **Replacement** — re-commit the *same* outpoint to a new state | **Chaining** — spend into *new* outpoints |
+| Outpoint | unchanged (X → X, sats stay) | new sub-coins (children of the spend) |
+| Stale-state defence | **decrementing nLockTime** (latest state wins the race) | **SE single-use per node** (no race needed — spends are sequential, a child can only confirm after its parent) |
+| Needs DW timelocks? | the nLockTime *is* the DW-style mechanism | **no** — only for *operator reclaim* and *in-place rebalance* (see Stage 4) |
+
+A sub-coin, once created by a split (chaining), can later be **transferred** by the anchor-refresh
+replacement model or **split again** by chaining. The two compose.
+
+## Mapping SuperScalar → RGB-on-statechain
+
+| SuperScalar | This design |
+|---|---|
+| LSP / coordinator `L` | Statechain operator (SE / lockbox) |
+| Clients `A`, `B`, … | RGB sub-coin owners (splitter + recipients) |
+| Funding UTXO + kickoff tx | The on-chain **root** statechain coin `F` and its kickoff |
+| Pseudo-Spilman **leaf** state tx | A **split state tx**: spends a reserve, carves sub-coins + a new reserve |
+| LN channel outputs (`A&L`, `B&L`) | **Sub-connectors** — `{owner, SE}` outputs that carry an RGB seal |
+| Factory reserve `A&B&L or (L&CSV)` | The **reserve** output — unallocated remainder, with an `(SE & CLTV)` timeout branch |
+| "Chain new state on top of old" (covenant-free honesty) | Each split tx **spends the prior reserve**; any party refuses to co-sign an invalid transition |
+| DW decrementing `nSequence` (432→288→144→0) | Stage 4 only: invalidate an **in-place** factory update; latest confirms first |
+| Old-state **poisoning** (`nLockTime`'d payout) | Stage 4 only: force the operator to publish the latest factory state |
+| Timeout-tree `L & CLTV` reclaim, active/dying periods | Stage 4: operator reclaims unexited funds after the epoch; clients must exit before the deadline |
+
+## Transaction structure
+
+```
+on-chain:
+   ┌─────────────────────────────┐
+   │  ROOT coin F  {owner, SE}    │  Mercury statechain coin, holds RGB allocation 1000
+   └──────────────┬──────────────┘  (seal = F:0; anchored by the deposit, on-chain)
+                  │  kickoff K (no timelock, n-of-n)   ── optional; F can be the first node directly
+                  ▼
+off-chain (un-broadcast, blind-MuSig2 co-signed with SE):
+   split state S1 :  in  F:0  (SE single-use)
+                     out S1:0  reserve  700  {owner, SE} (+ (SE&CLTV) in Stage 4)   ← tapret here
+                     out S1:1  sub-coin  300 {B, SE}                                  ← seal
+       RGB τ1: close(F:0) → { 700 @ tapret(S1:0), 300 @ tapret(S1:1) }
+                  │
+                  ▼  (chain the next split off the reserve)
+   split state S2 :  in  S1:0  (SE single-use)
+                     out S2:0  reserve  500  {owner, SE}                              ← tapret here
+                     out S2:1  sub-coin  200 {D, SE}                                  ← seal
+       RGB τ2: close(S1:0) → { 500 @ tapret(S2:0), 200 @ tapret(S2:1) }
+```
+
+Nothing above is broadcast. Each `S_i` is co-signed by `{controller-of-the-spent-reserve, SE}` and
+carries the RGB anchor (tapret) committing that split's transition. The sub-coins are **witness
+seals** on the un-broadcast tx's own outputs — they cost no on-chain UTXO.
+
+## RGB layer
+
+- The allocation lives on the **reserve seal** and is split by each transition into
+  `{recipient sub-seal, new reserve seal}`. Multiple beneficiaries in one transition is the
+  `color_psbt` `blinded_map` path — here using **witness** outputs (`output_map`) so the sub-coins
+  are the tx's own outputs.
+- **Off-chain validation of a *chain*.** A recipient of `S2:1` validates a consignment whose terminal
+  transition is anchored in a chain of **un-broadcast** witnesses `S1, S2` rooted at the **on-chain**
+  `F`. `validate_consignment_offchain` / `OffchainResolver` (in `mercury_rgb`) validates against
+  **one** un-broadcast witness; the new work is to resolve a **branch** of un-broadcast witnesses (Stage 2).
+
+## Security
+
+- **Single-use** is enforced by the SE refusing to co-sign a second spend of any node outpoint
+  (`F:0`, `S1:0`, …). Because splits chain sequentially (a child spends its parent), there is **no
+  old-vs-new race** within the split tree — a child cannot confirm before its parent. This is why
+  chaining needs no decrementing timelock (unlike the replacement model).
+- **No stale full-exit.** Depositing into the factory means the root coin's Mercury backup/exit *is*
+  the kickoff→chain, not a direct `1000 → owner` tx. So there is no conflicting "take it all" tx for
+  the owner to broadcast later.
+- **Unilateral exit** = broadcast the branch from the on-chain root down to your sub-coin (`F`'s spend
+  `S1`, then `S2`, …) and settle the RGB consignment (anchors are now mined). Exit cost grows with
+  chain depth — one tx per split on your path (the SuperScalar trade-off).
+- **Trust = SE honest + (Stage 4) exit before the epoch deadline.** Same profile as Spark/Ark; the
+  growing collusion surface of a revocation model is avoided entirely (see the revocation analysis in
+  the conversation that produced this design).
+
+## Architecture at a glance
+
+The split tree lives **off-chain**; only the root is ever on Bitcoin (until an exit). Each split is one
+un-broadcast, SE-co-signed transaction that consumes the prior reserve and carves a recipient sub-coin
+plus a new reserve, with the RGB transition committed in its tapret.
+
+```mermaid
+flowchart TD
+    F["ROOT coin F · ON-CHAIN · RGB 1000<br/>(2-of-2 owner+SE)"]
+    F --> S1{{"split tx S1<br/>un-broadcast · tapret τ1"}}
+    S1 --> R1["reserve 700 · S1:0<br/>(owner+SE)"]
+    S1 --> B["sub-coin 300 · S1:1<br/>→ owner B"]
+    R1 --> S2{{"split tx S2<br/>un-broadcast · tapret τ2"}}
+    S2 --> R2["reserve 500 · S2:0<br/>(owner+SE)"]
+    S2 --> D["sub-coin 200 · S2:1<br/>→ owner D"]
+```
+
+## Exit: cooperative (one tx) vs. unilateral (a branch)
+
+The tree is *materialized* on Bitcoin only when someone exits — and **the normal path is a single
+transaction**:
+
+- **Cooperative exit — ONE on-chain tx (the normal flow).** The owner and the SE jointly sign a fresh
+  transaction spending the on-chain ROOT directly to the owner's address for their amount; the SE
+  "collapses" the branch, so the intermediate split txs are never broadcast. No timelock wait — just a
+  2-of-2 spend. The RGB allocation rides in that tx's commitment and the receiver settles with a
+  standard `refresh`. This is how a healthy statechain leaves.
+- **Unilateral exit — a BRANCH of txs (only if the SE is uncooperative).** The owner broadcasts the
+  pre-signed chain from the on-chain root down to their sub-coin (ROOT-spend `S1`, then `S2`, … then
+  the sub-coin's exit). Number of txs = the sub-coin's depth in the tree; deeper = more txs and more
+  on-chain cost — the price of amortizing many sub-coins onto one UTXO. Decrementing relative-timelocks
+  (Stage 4) order the broadcasts so the latest state confirms first.
+
+| | Cooperative (normal) | Unilateral (fallback) |
+|---|---|---|
+| **Mercury (flat, no tree)** | 1 tx (fresh 2-of-2 spend) | 1 tx (your backup tx, after a locktime wait) |
+| **Spark / this design (tree)** | 1 tx (SE collapses your branch to a direct payout) | branch root→leaf, one tx per level, with timelock waits |
+
+So: **the normal flow is always a single on-chain transaction.** Broadcasting *multiple* transactions
+happens **only** on a unilateral exit, and **only** in tree-based systems (Spark, and our split tree
+once it is deeper than one level). Vanilla Mercury has no tree, so even its unilateral exit is one
+backup tx. In Stage 1 (`rgb01`, depth-1) the "exit" is the single split tx itself; deeper trees
+(Stage 2+) are where a unilateral exit becomes a multi-tx branch.
+
+```mermaid
+flowchart LR
+    subgraph COOP["Cooperative exit (normal) — 1 tx"]
+        direction TB
+        c1["owner + SE jointly sign<br/>a fresh spend of ROOT"] --> c2["on-chain payout to owner"]
+    end
+    subgraph UNI["Unilateral exit (SE down) — a branch"]
+        direction TB
+        u0["ROOT (on-chain)"] --> u1["broadcast S1"] --> u2["broadcast S2"] --> u3["broadcast sub-coin exit"]
+    end
+```
+
+## What is new to build vs. reused
+
+**Reused:** `register_statechain` (sub-coin as wallet UTXO); `color_psbt` with `output_map` (witness)
+and `blinded_map` (multi-beneficiary transitions);
+`refresh_rgb_anchor_self_transfer` / the Mercury `get_unsigned_backup_psbt` +
+`get_partial_sig_request_for_colored_tx` blind-MuSig2 co-sign; `validate_consignment_offchain` +
+`OffchainResolver`; `refresh` to settle on exit.
+
+**New:**
+1. **Multi-output colored split tx** — spend a reserve into ≥2 colored witness outputs + a reserve,
+   one transition, un-broadcast (Stage 1).
+2. **Off-chain *chain* validation** — `OffchainResolver` returns a whole branch of un-broadcast
+   witnesses rooted at an on-chain UTXO (Stage 2).
+3. **SE single-use ledger** — the lockbox tracks, per node outpoint, the one transition it co-signed,
+   and refuses conflicts (Stage 3).
+4. **Reserve output with `(SE & CLTV)` timeout branch + DW decrementing `nSequence` + poisoning** for
+   operator reclaim and in-place rebalance; active/dying epochs; laddering for unbounded updates
+   (Stage 4).
+5. **Multi-owner factory** — many distinct owners under one root, full pseudo-Spilman co-signing so
+   each owner refuses invalid factory updates (Stage 5).
+
+## Build ladder
+
+- **Stage 1 (`rgb01`)** — depth-1 off-chain split: spend the root coin into **two witness-sealed
+  colored outputs** (sub-coins) in one un-broadcast tx; receiver validates off-chain; prove exit by
+  broadcasting and confirming both sub-allocations. *Composes existing primitives; proves "sub-coins
+  as un-broadcast tx outputs," the core departure from assigning to pre-funded coins.* **✅ green.**
+- **Stage 2 (`rgb02`)** — **chain** a second split off a sub-coin's reserve (two-deep un-broadcast
+  chain); extend off-chain validation to resolve the branch. *Proves chaining + chain validation.*
+- **Stage 3** — SE single-use ledger + a tree-tx builder abstraction in `mercurylib`. *Makes
+  sub-coins real statechain coins and makes double-spend structurally impossible at the SE.*
+- **Stage 4** — DW decrementing timelocks, `(SE & CLTV)` reserve, poisoning, active/dying epochs,
+  laddering. *Operator reclaim + in-place rebalance + bounded exit cost.*
+- **Stage 5** — multi-owner factory (one on-chain root amortized across many owners).
+
+Stages 1–2 are pure RGB mechanics and reuse the existing stack. Stage 3 onward extends the Mercury SE
+protocol and should be reviewed before implementation.

@@ -11,14 +11,7 @@ pub mod tb04_simple_lightning_latch;
 pub mod tb05_timelock;
 pub mod tm01_sender_double_spends;
 mod tv01;
-pub mod rgb01_full_lifecycle;
-pub mod rgb02_deposit_coop_exit;
-pub mod rgb03_exit_to_onchain;
-pub mod rgb04_register_statechain_utxo;
-pub mod rgb05_blinded_statechain_transfer;
-pub mod rgb06_partial_transfer_change;
-pub mod rgb07_anchor_refresh_self_transfer;
-pub mod rgb08_offchain_p2p_transfer;
+pub mod rgb01_offchain_split;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -26,38 +19,10 @@ use anyhow::{Result, Ok};
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
 
-    // Run only the RGB-over-statechain lifecycle test when RGB_E2E=1 (it needs the RGB proxy +
-    // indexer in addition to the Mercury stack). See docs/rgb_integration.md.
+    // Off-chain RGB split via pseudo-Spilman leaves (see docs/rgb_offchain_split_spilman.md). Needs
+    // the RGB proxy + electrum indexer in addition to the Mercury stack. Run with RGB_E2E=1.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("1") {
-        rgb01_full_lifecycle::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("2") {
-        rgb02_deposit_coop_exit::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("3") {
-        rgb03_exit_to_onchain::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("4") {
-        rgb04_register_statechain_utxo::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("5") {
-        rgb05_blinded_statechain_transfer::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("6") {
-        rgb06_partial_transfer_change::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("7") {
-        rgb07_anchor_refresh_self_transfer::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
-        rgb08_offchain_p2p_transfer::execute().await?;
+        rgb01_offchain_split::execute().await?;
         return Ok(());
     }
 

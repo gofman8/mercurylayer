@@ -303,6 +303,102 @@ pub fn get_unsigned_backup_psbt(
     Ok(psbt.to_string())
 }
 
+/// Build the unsigned **split** backup tx as a base64 PSBT: one input (the statechain UTXO) and N
+/// spendable outputs, one per `(address, sat_value)` in `outputs`. Unlike [`get_unsigned_backup_psbt`]
+/// (a single recipient output), this carves the statechain coin into several outputs in one
+/// transaction — the foundation of an off-chain RGB split, where each output becomes a sub-coin that
+/// carries an RGB witness seal (see `docs/rgb_offchain_split_spilman.md`).
+///
+/// The caller owns the fee arithmetic: the sum of `outputs` sat values must be strictly less than the
+/// input amount; the remainder (`input_amount - sum`) is the miner fee that applies if/when the tx is
+/// broadcast on a unilateral exit. rgb-lib then colors this PSBT, inserting the single OP_RETURN opret
+/// commitment and assigning the asset across the output seals via a multi-entry `output_map`.
+///
+/// The signing path ([`get_partial_sig_request_for_colored_tx`]) is agnostic to the number of outputs
+/// (it only requires a single input), so the SE co-signs the split exactly like a one-output backup.
+/// The ≤1-spendable-output rule enforced on the *transfer/backup-verification* path
+/// (`verify_if_locktime_is_reasonable_tx_version_and_output_size`, `get_previous_outpoint`) is not on
+/// this build→color→sign→offchain-validate path, so a split is co-signable without relaxing it.
+pub fn get_unsigned_split_psbt(
+    coin: &Coin,
+    block_height: u32,
+    initlock: u32,
+    interval: u32,
+    qt_backup_tx: u32,
+    outputs: Vec<(String, u64)>,
+    network: String,
+    is_withdrawal: bool,
+) -> core::result::Result<String, MercuryError> {
+    let network = utils::get_network(&network)?;
+
+    let input_amount = coin.amount.unwrap() as u64;
+    let total_out: u64 = outputs.iter().map(|(_, v)| *v).sum();
+    // The remainder (input - sum) is the fee; a non-positive remainder means the split does not leave
+    // room for any fee.
+    if outputs.is_empty() || total_out >= input_amount {
+        return Err(MercuryError::FeeTooLow);
+    }
+
+    let tx_outs: Vec<TxOut> = outputs
+        .iter()
+        .map(|(addr, value)| -> core::result::Result<TxOut, MercuryError> {
+            // Accept both a Mercury transfer address (statechain destination) and a plain bitcoin
+            // address, mirroring `create_tx_out`.
+            let recipient_address = if addr.starts_with(crate::MAINNET_HRP)
+                || addr.starts_with(crate::TESTNET_HRP)
+            {
+                let (_, recipient_user_pubkey, _) = decode_transfer_address(addr)?;
+                Address::p2tr(&Secp256k1::new(), recipient_user_pubkey.x_only_public_key().0, None, network)
+            } else {
+                Address::from_str(addr)
+                    .map_err(|_| MercuryError::InvalidBitcoinAddressError)?
+                    .require_network(network)?
+            };
+            Ok(TxOut { value: *value, script_pubkey: recipient_address.script_pubkey() })
+        })
+        .collect::<core::result::Result<_, _>>()?;
+
+    let block_height =
+        calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
+
+    let lock_time = absolute::LockTime::from_height(block_height)?;
+
+    let input_txid = Txid::from_str(&coin.utxo_txid.as_ref().unwrap())?;
+    let input_vout = coin.utxo_vout.unwrap();
+
+    let unsigned_tx = Transaction {
+        version: 2,
+        lock_time,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: input_txid, vout: input_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence(0x0),
+            witness: Witness::default(),
+        }],
+        output: tx_outs,
+    };
+
+    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+
+    let input_pubkey = PublicKey::from_str(&coin.aggregated_pubkey.as_ref().unwrap())?;
+    let input_xonly_pubkey = input_pubkey.x_only_public_key().0;
+
+    let input_address =
+        Address::from_str(&coin.aggregated_address.as_ref().unwrap())?.require_network(network)?;
+    let input_scriptpubkey = input_address.script_pubkey();
+
+    let ty = PsbtSighashType::from_str("SIGHASH_ALL")?;
+    let mut input = Input {
+        witness_utxo: Some(TxOut { value: input_amount, script_pubkey: input_scriptpubkey }),
+        ..Default::default()
+    };
+    input.sighash_type = Some(ty);
+    input.tap_internal_key = Some(input_xonly_pubkey);
+    psbt.inputs = vec![input];
+
+    Ok(psbt.to_string())
+}
+
 pub fn get_musig_session(
     coin: &Coin,
     block_height: u32,
