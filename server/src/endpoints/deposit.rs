@@ -308,7 +308,8 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
 
     let server_pubkey = PublicKey::from_str(&server_pubkey_hex).unwrap();
 
-    crate::database::deposit::insert_new_deposit(&statechain_entity.pool, &token_id, &auth_key, &server_pubkey, &statechain_id, enclave_index as i32, deposit_msg1.single_use).await;
+    let epoch_deadline = deposit_msg1.epoch_deadline.map(|e| e as i64);
+    crate::database::deposit::insert_new_deposit(&statechain_entity.pool, &token_id, &auth_key, &server_pubkey, &statechain_id, enclave_index as i32, deposit_msg1.single_use, epoch_deadline).await;
 
     crate::database::deposit::set_token_spent(&statechain_entity.pool, &token_id).await;
 

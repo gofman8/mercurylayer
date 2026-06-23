@@ -30,6 +30,10 @@ pub struct DepositMsg1 {
     /// so existing clients are unaffected.
     #[serde(default)]
     pub single_use: bool,
+    /// Epoch deadline (unix seconds): the SE refuses to co-sign any new spend once its own clock
+    /// passes the deadline (Stage 4). None = no epoch. `serde(default)` keeps old clients working.
+    #[serde(default)]
+    pub epoch_deadline: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,12 +60,19 @@ pub struct AggregatedPublicKey {
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn create_deposit_msg1(coin: &Coin, token_id: &str) -> Result<DepositMsg1, MercuryError>{
-    create_deposit_msg1_with_single_use(coin, token_id, false)
+    create_deposit_msg1_with_options(coin, token_id, false, None)
 }
 
 /// Like [`create_deposit_msg1`] but lets the caller request a **single-use** coin (the SE refuses any
 /// second spend once it co-signs one terminal spend — the off-chain RGB split/combine guard).
 pub fn create_deposit_msg1_with_single_use(coin: &Coin, token_id: &str, single_use: bool) -> Result<DepositMsg1, MercuryError>{
+    create_deposit_msg1_with_options(coin, token_id, single_use, None)
+}
+
+/// Full-control variant: request single-use and/or an epoch deadline (unix seconds, Stage 4). The SE
+/// refuses any new co-signature once its clock passes `epoch_deadline`, so the owner must transact or
+/// exit before then; unilateral exit needs no SE co-signature.
+pub fn create_deposit_msg1_with_options(coin: &Coin, token_id: &str, single_use: bool, epoch_deadline: Option<u64>) -> Result<DepositMsg1, MercuryError>{
     let msg = Message::from_hashed_data::<sha256::Hash>(token_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();
@@ -76,6 +87,7 @@ pub fn create_deposit_msg1_with_single_use(coin: &Coin, token_id: &str, single_u
         token_id: token_id.to_string(),
         signed_token_id: signed_token_id.to_string(),
         single_use,
+        epoch_deadline,
     };
 
     Ok(deposit_msg_1)

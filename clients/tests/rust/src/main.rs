@@ -17,6 +17,7 @@ pub mod rgb03_offchain_chain;
 pub mod rgb04_single_use;
 pub mod rgb05_combine3;
 pub mod rgb06_dag3;
+pub mod rgb07_epoch;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -55,6 +56,12 @@ async fn main() -> Result<()> {
     // 3-level off-chain DAG (RGB_E2E=6): split -> combine -> split, all un-broadcast, 3-witness chain.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("6") {
         rgb06_dag3::execute().await?;
+        return Ok(());
+    }
+    // Stage 4 epoch deadline (RGB_E2E=7): SE co-signs in the active period, REFUSES a new co-signature
+    // past the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE call.
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("7") {
+        rgb07_epoch::execute().await?;
         return Ok(());
     }
 

@@ -95,9 +95,9 @@ pub async fn check_existing_key(pool: &sqlx::PgPool, auth_key: &XOnlyPublicKey) 
     }
 }
 
-pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &XOnlyPublicKey, server_public_key: &PublicKey, statechain_id: &String, enclave_index: i32, single_use: bool)  {
+pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &XOnlyPublicKey, server_public_key: &PublicKey, statechain_id: &String, enclave_index: i32, single_use: bool, epoch_deadline: Option<i64>)  {
 
-    let query = "INSERT INTO statechain_data (token_id, auth_xonly_public_key, server_public_key, statechain_id, enclave_index, single_use) VALUES ($1, $2, $3, $4, $5, $6)";
+    let query = "INSERT INTO statechain_data (token_id, auth_xonly_public_key, server_public_key, statechain_id, enclave_index, single_use, epoch_deadline) VALUES ($1, $2, $3, $4, $5, $6, $7)";
 
     let _ = sqlx::query(query)
         .bind(token_id)
@@ -106,9 +106,22 @@ pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &
         .bind(statechain_id)
         .bind(enclave_index)
         .bind(single_use)
+        .bind(epoch_deadline)
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// Epoch deadline (unix seconds) for a coin, or None if it has no epoch (Stage 4). The SE refuses to
+/// co-sign a new spend once its own clock passes this deadline; unilateral exit needs no SE signature.
+pub async fn get_epoch_deadline(pool: &sqlx::PgPool, statechain_id: &str) -> Option<i64> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT epoch_deadline FROM statechain_data WHERE statechain_id = $1")
+            .bind(statechain_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    row.and_then(|r| r.0)
 }
 
 /// True if the statechain coin was created as single-use (an off-chain RGB split/combine tree node).

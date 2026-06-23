@@ -1,19 +1,29 @@
 # SE / lockbox protocol changes for off-chain split sub-coins (Stage 2+3)
 
-**Status: PARTLY IMPLEMENTED + VERIFIED GREEN.** The single-use ledger (B below) is implemented and
-verified on regtest by `rgb04` (deposit a single-use coin, co-sign spend #1, conflicting spend #2 is
-REFUSED). The derived-deposit part (A) is not yet needed: `rgb03` shows the SE already co-signs spends
-of **un-broadcast** sub-coins (their funding tx need not be on chain), so off-chain tree depth works
-without a dedicated derive endpoint. Companion to `rgb_offchain_split_spilman.md` and the shipped Stage
-2 resolver enabler (`validate_consignment_offchain_chain`).
+**Status: IMPLEMENTED + VERIFIED GREEN.** The single-use ledger (B below) is implemented and verified
+on regtest by `rgb04` (deposit a single-use coin, co-sign spend #1, conflicting spend #2 is REFUSED),
+and applied to every node of the `rgb02`/`03`/`05`/`06` DAGs. The Stage 4 **epoch deadline** is also
+implemented and verified by `rgb07` (SE co-signs inside the active period, REFUSES a new co-signature
+past the deadline, exit needs no SE). The derived-deposit part (A) is not needed: `rgb03` shows the SE
+already co-signs spends of **un-broadcast** sub-coins (their funding tx need not be on chain), so
+off-chain tree depth works without a dedicated derive endpoint. Companion to
+`rgb_offchain_split_spilman.md` and the shipped Stage 2 resolver (`validate_consignment_offchain_chain`).
 
-> Implementation note (single-use threshold): a coin deposited via `fund_statechain` already carries
-> **one** finalized SE signature (the unilateral-exit backup), so the terminal spend is the 2nd and a
-> double-spend is the 3rd — `sign_first` refuses at `>= 2` finalized signatures. Coins funded another
-> way (e.g. split sub-coins opened with `get_deposit_bitcoin_address` and no backup tx) have a
-> different baseline; a fully uniform rule needs per-coin baseline tracking, or single-use coins
-> skipping the deposit backup. Deploy gotcha (dev env): `docker compose build` caches; deploy server
-> changes by `docker cp` + in-container `touch` + restart (see `rgb-statechain-integration` memory).
+> Implementation note (single-use threshold — ROBUST, shipped): single-use coins **skip the deposit
+> unilateral-exit backup tx** (`coin_status::check_deposit`; the tree branch is the exit), so a
+> single-use coin's only finalized SE signature is its one terminal spend. `sign_first` therefore
+> refuses uniformly at `>= 1` finalized signature, across all coin types (fund-deposited roots and
+> split/combine sub-coins, broadcast or un-broadcast). Normal coins (`single_use=false`) keep the
+> backup + re-sign behaviour.
+>
+> Implementation note (epoch deadline — Stage 4, shipped): `statechain_data.epoch_deadline` (unix
+> seconds, migration 0003, nullable). `sign_first` refuses any new co-signature once the SE's own
+> clock passes it (the server has no chain access, so it uses wall-clock; a production SE would use
+> its own node's block height). Unilateral exit broadcasts an already-co-signed branch and needs no SE
+> call, so the deadline never strands funds. NULL = no epoch (co-signable indefinitely).
+>
+> Deploy gotcha (dev env): `docker compose build` caches; deploy server changes by `docker cp` +
+> in-container `touch` + restart (see `rgb-statechain-integration` memory).
 
 ## Why this is needed
 

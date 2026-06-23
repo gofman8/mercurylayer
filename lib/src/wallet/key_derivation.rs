@@ -133,6 +133,7 @@ impl Wallet {
             status: CoinStatus::INITIALISED,
             duplicate_index: 0,
             single_use: false,
+            epoch_deadline: None,
         };
 
         Ok(coin)

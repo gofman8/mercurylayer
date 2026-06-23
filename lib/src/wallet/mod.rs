@@ -111,6 +111,12 @@ pub struct Coin {
     /// signature is the one terminal spend. Defaults false (normal re-signable coin).
     #[serde(default)]
     pub single_use: bool,
+    /// Epoch deadline (unix seconds): the SE refuses to co-sign any NEW spend of this coin once its
+    /// own clock passes the deadline (Stage 4 — the "active period"). Unilateral exit needs no SE
+    /// co-signature (you broadcast an already-co-signed branch), so the deadline only bounds when the
+    /// owner must transact/exit by. None = no epoch (coin is co-signable indefinitely).
+    #[serde(default)]
+    pub epoch_deadline: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

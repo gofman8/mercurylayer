@@ -212,9 +212,13 @@ and `blinded_map` (multi-beneficiary transitions);
    witnesses rooted at an on-chain UTXO (Stage 2).
 3. **SE single-use ledger** — the lockbox tracks, per node outpoint, the one transition it co-signed,
    and refuses conflicts (Stage 3).
-4. **Reserve output with `(SE & CLTV)` timeout branch + DW decrementing `nSequence` + poisoning** for
-   operator reclaim and in-place rebalance; active/dying epochs; laddering for unbounded updates
-   (Stage 4).
+4. **Epoch deadline (Stage 4, DONE)** — the SE refuses any new co-signature once its own clock passes
+   a coin's `epoch_deadline` (unix seconds; migration 0003 + the `sign_first` gate). Unilateral exit
+   needs no SE co-signature, so the deadline only bounds *when the owner must transact/exit by*; funds
+   are never stuck. This makes the trust model real: `SE honest + exit before the deadline`. The
+   on-chain counterpart — a reserve `(SE & CLTV)` timeout branch + DW decrementing `nSequence` +
+   poisoning for *operator reclaim* and *in-place rebalance* — needs taproot script-path tweaking of
+   the aggregate output key and folds into the multi-owner factory work (Stage 5).
 5. **Multi-owner factory** — many distinct owners under one root, full pseudo-Spilman co-signing so
    each owner refuses invalid factory updates (Stage 5).
 
@@ -227,26 +231,32 @@ and `blinded_map` (multi-beneficiary transitions);
 | `rgb03` (RGB_E2E=3) | **2-deep off-chain chain** — un-broadcast split → un-broadcast combine; SE co-signs spends of un-broadcast outputs; validated via `validate_offchain_chain([split, combine])` (two un-broadcast witnesses) |
 | `rgb04` (RGB_E2E=4) | **SE single-use** — a single-use coin's conflicting second spend is REFUSED (off-chain double-spend guard) |
 | `rgb05` (RGB_E2E=5) | **Combine (3-in)** — three coins → one payment + change (the multi-input combine scales) |
+| `rgb06` (RGB_E2E=6) | **3-level off-chain DAG** — split → combine → split, all un-broadcast; validated via `validate_offchain_chain([S1,S2,S3])`; exit by broadcasting the branch |
+| `rgb07` (RGB_E2E=7) | **Epoch deadline (Stage 4)** — SE co-signs inside the active period, REFUSES a new co-signature once its clock passes the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE call |
 
 Together these are the off-chain RGB DAG: deposits (roots), transitions that **split and combine**
-(N→M) and **chain** (depth), validated off-chain, with the SE as the single-use enforcer.
+(N→M) and **chain** (depth), validated off-chain, with the SE as the single-use enforcer — and, with
+the epoch deadline, a bounded exit window (`trust = SE honest + exit before the deadline`). All of
+`rgb02`/`03`/`05`/`06` deposit every node as a **single-use** coin, so the whole forest+DAG is SE
+double-spend-protected; `rgb01` stays on the normal deposit+backup path as regression coverage.
 
 Run (stack up; see the `rgb-statechain-run-env` memory / below):
 ```bash
 cd clients/tests/rust
-RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=5
+RGB_E2E=1 cargo +stable run   # ... up to RGB_E2E=7
 ```
-The SE single-use check requires the `single_use` mercury-server build (migration 0002 + `sign_first`
-refusal); in this dev env it is deployed by `docker cp` + in-container `touch` + restart (the
-`docker compose build` cache does not pick up source changes here).
+The SE single-use + epoch checks require the matching mercury-server build (migration 0002 single_use
++ 0003 epoch_deadline + the `sign_first` refusals); in this dev env it is deployed by `docker cp` +
+in-container `touch` + restart (the `docker compose build` cache does not pick up source changes here).
 
 ## Next
 
-- **Robust single-use baseline** — the current `sign_first` threshold (`>=2` finalized sigs) suits
-  `fund_statechain`-deposited coins (1 deposit-backup sig); sub-coins opened without a backup need a
-  per-coin baseline (or single-use coins skipping the deposit backup).
-- **DW decrementing timelocks**, `(SE & CLTV)` reserve, poisoning, active/dying epochs, laddering —
-  operator reclaim + in-place rebalance + bounded unilateral-exit cost (Stage 4).
+- **On-chain reserve reclaim** — a reserve `(SE & CLTV)` timeout branch + DW decrementing `nSequence`
+  + poisoning for *operator reclaim* and *in-place rebalance*. Needs taproot script-path tweaking of
+  the aggregate output key (the SE-enforced epoch deadline already gives the bounded-exit guarantee).
 - **Cooperative-collapse exit** — operator co-signs a single root→final-allocation tx instead of
   broadcasting the branch (the normal 1-tx exit).
 - **Multi-owner factory** — one on-chain root amortized across many owners (full pseudo-Spilman).
+
+Done: robust single-use (single-use coins skip the deposit backup → uniform `>=1` SE threshold) and
+the Stage 4 epoch deadline (above).
