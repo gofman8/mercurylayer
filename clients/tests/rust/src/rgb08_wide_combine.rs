@@ -1,8 +1,8 @@
-//! E2E (scale): **wide combine** — the "hundreds of deposits amortized into one on-chain tx" case.
-//! ROOT is split into N=6 SE-co-signable sub-coins (each 200 units, single-use + epoch-bounded), then
-//! ALL SIX are combined in ONE SE-co-signed (per-input) tx -> recipient 1000 + change 200, validated
-//! off-chain, then exited in a SINGLE on-chain transaction. N deposits, one exit footprint: the
-//! on-chain cost is constant regardless of how many coins are combined.
+//! E2E (scale): **wide combine** — the combine primitive scales to many inputs. A user manufactures
+//! N=6 sub-coins (by splitting one of their coins), then combines ALL SIX in ONE SE-co-signed
+//! (per-input) tx -> a single payment 1000 + change 200, validated off-chain, then exited in ONE
+//! on-chain tx. The point: combining N of your own coins into one payment is a single off-chain
+//! transition regardless of N — the same primitive as rgb05 (3-in), here at N=6.
 //!
 //! Run with RGB_E2E=8. Requires the regtest + Mercury (lockbox) stack.
 
@@ -185,7 +185,7 @@ pub async fn execute() -> Result<()> {
     let combine = mercuryrustlib::rgb::create_colored_combine_tx(
         &cc, &issuer, &mut inputs, &contract, &outputs, 1, true, None, NETWORK, si.initlock, si.interval, BLINDING,
     ).await?;
-    println!("RGB08 - built {}-input combine tx {} (one tx, one on-chain footprint)", combine.input_outpoints.len(), combine.txid);
+    println!("RGB08 - built {}-input combine tx {} (N coins -> one payment, one off-chain tx)", combine.input_outpoints.len(), combine.txid);
     let raw = hex::decode(&combine.signed_tx)?;
     let ctx: electrum_client::bitcoin::Transaction = electrum_client::bitcoin::consensus::deserialize(&raw)?;
     assert_eq!(ctx.input.len(), N, "combine must spend all {N} input coins");
@@ -197,7 +197,7 @@ pub async fn execute() -> Result<()> {
         receiver.post_consignment(&recv_id, &combine.consignment, &combine.txid, combine.output_vouts[0])?;
         issuer.post_consignment(&change_id, &combine.consignment, &combine.txid, combine.output_vouts[1])
     })?;
-    // Exit: ONE on-chain transaction for all N deposits.
+    // Exit: ONE on-chain transaction settles the combined payment.
     let _ = cc.electrum_client.transaction_broadcast_raw(&hex::decode(&combine.signed_tx)?)?;
     let spent_ops: Vec<String> = outpoints.iter().map(|(t, v)| format!("{t}:{v}")).collect();
     tokio::task::block_in_place(|| issuer.mark_spent(&spent_ops))?;
@@ -218,6 +218,6 @@ pub async fn execute() -> Result<()> {
         assert!(is_outpoint_spent(&cc, t, *v), "each input coin must be consumed by the combine");
     }
 
-    println!("RGB08 - SUCCESS: split ROOT into {N} single-use + epoch-bounded sub-coins, then combined ALL {N} in one SE-co-signed multi-input tx -> {RECV_AMT} to the receiver + {CHANGE_AMT} change, validated off-chain, exited in ONE on-chain tx. {N} deposits, one exit footprint - the on-chain cost is constant regardless of deposit count.");
+    println!("RGB08 - SUCCESS: manufactured {N} single-use + epoch-bounded sub-coins, then combined ALL {N} in one SE-co-signed multi-input tx -> {RECV_AMT} to the receiver + {CHANGE_AMT} change, validated off-chain, exited in ONE on-chain tx. Combining N of your own coins into one payment is a single off-chain transition regardless of N.");
     Ok(())
 }

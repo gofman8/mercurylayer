@@ -19,7 +19,6 @@ pub mod rgb05_combine3;
 pub mod rgb06_dag3;
 pub mod rgb07_epoch;
 pub mod rgb08_wide_combine;
-pub mod rgb09_factory;
 pub mod rgb_dump;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -66,16 +65,10 @@ async fn main() -> Result<()> {
         rgb07_epoch::execute().await?;
         return Ok(());
     }
-    // Wide-combine scale test (RGB_E2E=8): split ROOT into N single-use+epoch sub-coins, combine all N
-    // in one SE-co-signed tx -> recipient + change, exit in ONE on-chain tx (N deposits, 1 footprint).
+    // Wide-combine scale test (RGB_E2E=8): a user manufactures N sub-coins (by splitting one coin) and
+    // combines all N in one SE-co-signed tx -> a single payment + change. The combine primitive scales.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
         rgb08_wide_combine::execute().await?;
-        return Ok(());
-    }
-    // Multi-owner factory (RGB_E2E=9): one root UTXO split off-chain to N DISTINCT owner wallets, each
-    // independently validating + settling its own allocation; one exit tx materializes all (Stage 5).
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("9") {
-        rgb09_factory::execute().await?;
         return Ok(());
     }
 

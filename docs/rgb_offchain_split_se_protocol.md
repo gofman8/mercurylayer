@@ -54,7 +54,7 @@ make that possible, and the single-use rule that keeps it safe.
 ## The two gaps
 
 1. **Every coin needs a fresh deposit token.** Sub-coins must be created *without* a token (the whole
-   point is to amortize one on-chain deposit across many sub-coins).
+   point is to split one on-chain deposit into many sub-coins with no per-piece on-chain cost).
 2. **No hard "one spend per node" rule.** Today double-spend protection leans on key rotation +
    decrementing locktimes. A split tree has no locktime invalidation yet (that's Stage 4), so the SE
    must explicitly co-sign **at most one** spend of each node.
@@ -121,11 +121,13 @@ Spark/Ark (and strictly better than a revocation model — see `rgb_offchain_spl
 | DB | `statechain_data`: add `parent_statechain_id` (nullable) + status column; derived rows skip the token check |
 | `mercurylib`/`mercuryrustlib` | a `derive_deposit` client call; `create_colored_split_tx` already builds the multi-output tx — wire child registration before building S |
 
-## Deferred to Stage 4
+## Epoch deadline (done) and beyond
 
-Decrementing-locktime / Decker-Wattenhofer invalidation for **branch exit ordering**, the
-`(SE & CLTV)` reserve for **operator reclaim**, and old-state **poisoning**. Until then, tree
-single-use rests entirely on the SE's hard "one spend per node" rule (B).
+The **epoch deadline** is implemented (`rgb07`): the SE refuses any new co-signature once its clock
+passes a coin's deadline, so an owner must transact/exit before then; unilateral exit needs no SE.
+Branch-exit ordering for *deep* unilateral exits (decrementing-locktime / Decker-Wattenhofer) remains
+a future refinement. Tree single-use otherwise rests entirely on the SE's hard "one spend per node"
+rule (B).
 
 ## Open questions for review
 
