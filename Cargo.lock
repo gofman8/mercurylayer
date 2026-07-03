@@ -2743,9 +2743,11 @@ dependencies = [
  "mercury-rgb",
  "mercurylib",
  "mercuryrustlib",
+ "reqwest 0.11.22",
  "secp256k1-zkp",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 1.0.59",
  "tokio",
@@ -2758,6 +2760,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mercury-spark-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mercury-ssp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mercury-spark-sdk",
+ "rocket",
  "serde",
  "serde_json",
  "tokio",

@@ -9,6 +9,24 @@ use crate::{decode_transfer_address, error::MercuryError, wallet::{BackupTx, Coi
 
 use super::TransferMsg;
 
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct ExternalPaymentHashRequestPayload {
+    pub statechain_id: String,
+    pub auth_sig: String,
+    pub batch_id: String,
+    /// 32-byte hex payment hash (e.g. from a BOLT11 invoice).
+    pub payment_hash: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct UnlockByPreimageRequestPayload {
+    pub batch_id: String,
+    /// Hex preimage whose sha256 matches the latch's payment hash.
+    pub preimage: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PaymentHashRequestPayload {

@@ -1,7 +1,7 @@
 
 use crate::{client_config::ClientConfig, sqlite_manager::get_wallet};
 use anyhow::{anyhow, Result};
-use mercurylib::{transfer::sender::{PaymentHashRequestPayload, PaymentHashResponsePayload, TransferPreimageRequestPayload, TransferPreimageResponsePayload}, wallet::CoinStatus};
+use mercurylib::{transfer::sender::{ExternalPaymentHashRequestPayload, PaymentHashRequestPayload, PaymentHashResponsePayload, TransferPreimageRequestPayload, TransferPreimageResponsePayload, UnlockByPreimageRequestPayload}, wallet::CoinStatus};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -168,4 +168,74 @@ pub async fn get_payment_hash(client_config: &ClientConfig, batch_id: &str) -> R
     let payment_hash_response_payload: PaymentHashResponsePayload = serde_json::from_str(value.as_str())?;
 
     Ok(Some(payment_hash_response_payload.hash))
+}
+
+/// Latch v2: bind a coin to an EXTERNAL payment hash (e.g. a BOLT11 invoice hash). The SE stores
+/// the hash only; the resulting batch unlocks when anyone presents the preimage
+/// ([`unlock_by_preimage`]) — the submarine half of a pay-invoice swap. Returns the batch id to
+/// use in the subsequent `transfer_sender::execute(..., batch_id)`.
+pub async fn create_external_hash_latch(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    payment_hash: &str,
+) -> Result<String> {
+    let batch_id = uuid::Uuid::new_v4().to_string();
+
+    let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    let coin = wallet
+        .coins
+        .iter()
+        .filter(|c| c.statechain_id == Some(statechain_id.to_string()))
+        .min_by_key(|c| c.locktime.unwrap_or(u32::MAX))
+        .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
+
+    if coin.status != CoinStatus::CONFIRMED && coin.status != CoinStatus::IN_TRANSFER {
+        return Err(anyhow!(
+            "Coin status must be CONFIRMED or IN_TRANSFER. The current status is {}",
+            coin.status
+        ));
+    }
+
+    let payload = ExternalPaymentHashRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        auth_sig: coin.signed_statechain_id.clone().unwrap(),
+        batch_id: batch_id.clone(),
+        payment_hash: payment_hash.to_string(),
+    };
+
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/transfer/paymenthash/external", client_config.statechain_entity))
+        .json(&payload)
+        .send()
+        .await?;
+    if response.status() != 200 {
+        return Err(anyhow!(response.text().await?));
+    }
+    Ok(batch_id)
+}
+
+/// Latch v2: unlock a batch by presenting the preimage of its external payment hash. Anyone with
+/// the preimage may call this (knowledge of it proves the corresponding Lightning payment
+/// settled).
+pub async fn unlock_by_preimage(
+    client_config: &ClientConfig,
+    batch_id: &str,
+    preimage: &str,
+) -> Result<()> {
+    let payload = UnlockByPreimageRequestPayload {
+        batch_id: batch_id.to_string(),
+        preimage: preimage.to_string(),
+    };
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/transfer/unlock/preimage", client_config.statechain_entity))
+        .json(&payload)
+        .send()
+        .await?;
+    if response.status() != 200 {
+        return Err(anyhow!(response.text().await?));
+    }
+    Ok(())
 }

@@ -380,6 +380,16 @@ impl SparkWallet {
         Ok(self.record().await?.activities)
     }
 
+    /// The underlying Mercury client config (advanced integrations, e.g. the SSP service).
+    pub fn client_config(&self) -> &ClientConfig {
+        &self.inner.cc
+    }
+
+    /// This wallet's name in the local database.
+    pub fn wallet_name(&self) -> &str {
+        &self.inner.config.wallet_name
+    }
+
     pub(crate) async fn record(&self) -> Result<WalletRecord> {
         get_wallet(&self.inner.cc.pool, &self.inner.config.wallet_name).await
     }

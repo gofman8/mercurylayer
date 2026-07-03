@@ -14,6 +14,12 @@ use crate::server::StateChainEntity;
 #[get("/transfer/paymenthash/<batch_id>")]
 pub async fn get_paymenthash(statechain_entity: &State<StateChainEntity>, batch_id: &str) -> status::Custom<Json<Value>> {
 
+    // External latches store the payment hash directly (no SE preimage).
+    if let Some(hash) = crate::database::lightning_latch::get_external_payment_hash_by_batch_id(&statechain_entity.pool, batch_id).await {
+        let response_body = json!(PaymentHashResponsePayload { hash });
+        return status::Custom(Status::Ok, Json(response_body));
+    }
+
     let pre_image = crate::database::lightning_latch::get_preimage_by_batch_id(&statechain_entity.pool, batch_id).await;
 
     if pre_image.is_none() {
@@ -125,4 +131,84 @@ pub async fn transfer_preimage(statechain_entity: &State<StateChainEntity>, tran
 
     return status::Custom(Status::Ok, Json(response_body));
 
+}
+
+/// Lightning latch v2 — register a latch bound to an EXTERNAL payment hash (e.g. the hash of a
+/// BOLT11 invoice the counterparty will pay). The SE never learns the preimage in advance; the
+/// batch unlocks when someone presents it (`/transfer/unlock/preimage`). This is the submarine
+/// half of the pay-invoice swap: the coin becomes claimable by the receiver exactly when the
+/// Lightning payment (whose settlement reveals the preimage) has been made.
+#[post("/transfer/paymenthash/external", format = "json", data = "<payload>")]
+pub async fn post_paymenthash_external(statechain_entity: &State<StateChainEntity>, payload: Json<mercurylib::transfer::sender::ExternalPaymentHashRequestPayload>) -> status::Custom<Json<Value>> {
+
+    let statechain_id = payload.0.statechain_id.clone();
+    let signed_statechain_id = payload.0.auth_sig.clone();
+    let batch_id = payload.0.batch_id.clone();
+    let payment_hash = payload.0.payment_hash.clone();
+
+    if payment_hash.len() != 64 || hex::decode(&payment_hash).is_err() {
+        let response_body = json!({ "message": "payment_hash must be 32 bytes hex" });
+        return status::Custom(Status::BadRequest, Json(response_body));
+    }
+
+    if !crate::endpoints::utils::validate_signature(&statechain_entity.pool, &signed_statechain_id, &statechain_id).await {
+        let response_body = json!({ "message": "Signature does not match authentication key." });
+        return status::Custom(Status::InternalServerError, Json(response_body));
+    }
+
+    let sender_auth_key = super::utils::get_auth_key_by_statechain_id(&statechain_entity.pool, &statechain_id).await.unwrap();
+
+    let now = chrono::Utc::now();
+    let expires_at = now + Duration::seconds(90000); // 25h, same window as classic latches
+
+    crate::database::lightning_latch::insert_paymenthash_external(&statechain_entity.pool, &statechain_id, &sender_auth_key, &batch_id, &payment_hash, &expires_at).await;
+
+    let response_body = json!(PaymentHashResponsePayload { hash: payment_hash });
+    return status::Custom(Status::Ok, Json(response_body));
+}
+
+/// Lightning latch v2 — unlock a latched batch by presenting the preimage of its (external)
+/// payment hash. No signature needed: knowledge of the preimage IS the authorization (it can
+/// only have come from settling the corresponding Lightning payment). Equivalent to the sender's
+/// confirm for every coin in the batch.
+#[post("/transfer/unlock/preimage", format = "json", data = "<payload>")]
+pub async fn unlock_by_preimage(statechain_entity: &State<StateChainEntity>, payload: Json<mercurylib::transfer::sender::UnlockByPreimageRequestPayload>) -> status::Custom<Json<Value>> {
+
+    let batch_id = payload.0.batch_id.clone();
+    let preimage = payload.0.preimage.clone();
+
+    let stored_hash = crate::database::lightning_latch::get_external_payment_hash_by_batch_id(&statechain_entity.pool, &batch_id).await;
+
+    let stored_hash = match stored_hash {
+        Some(h) => h,
+        None => {
+            let response_body = json!({ "message": "No external latch for this batch" });
+            return status::Custom(Status::NotFound, Json(response_body));
+        }
+    };
+
+    let preimage_bytes = match hex::decode(&preimage) {
+        Ok(b) => b,
+        Err(_) => {
+            let response_body = json!({ "message": "preimage must be hex" });
+            return status::Custom(Status::BadRequest, Json(response_body));
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&preimage_bytes);
+    let digest = hex::encode(hasher.finalize());
+
+    if digest != stored_hash {
+        let response_body = json!({ "message": "preimage does not match the payment hash" });
+        return status::Custom(Status::Forbidden, Json(response_body));
+    }
+
+    let ids = crate::database::lightning_latch::get_statechain_ids_by_batch_id(&statechain_entity.pool, &batch_id).await;
+    for statechain_id in &ids {
+        // Sender-side confirm (locked2), exactly like the classic sender unlock.
+        crate::database::transfer_receiver::update_unlock_transfer(&statechain_entity.pool, true, statechain_id).await;
+    }
+
+    let response_body = json!({ "message": "Success", "unlocked": ids });
+    status::Custom(Status::Ok, Json(response_body))
 }

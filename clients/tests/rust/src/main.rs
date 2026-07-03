@@ -24,6 +24,8 @@ pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
 pub mod sdk03_lightning_swap;
 pub mod sdk04_adversarial;
+pub mod sdk05_lightning_pay;
+pub mod sdk06_lightning_receive;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -47,6 +49,16 @@ async fn main() -> Result<()> {
     // settlement; preimage matches the payment hash (Spark SSP preimage-swap parity).
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("3") {
         sdk03_lightning_swap::execute().await?;
+        return Ok(());
+    }
+    // Mercury -> Lightning via SSP (SDK_E2E=5): pay a real BOLT11 from statechain balance.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("5") {
+        sdk05_lightning_pay::execute().await?;
+        return Ok(());
+    }
+    // Lightning -> Mercury via SSP (SDK_E2E=6): receive a real LN payment as a statechain coin.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("6") {
+        sdk06_lightning_receive::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

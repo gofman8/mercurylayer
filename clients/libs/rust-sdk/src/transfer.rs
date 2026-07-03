@@ -119,6 +119,37 @@ impl SparkWallet {
         })
     }
 
+    /// Ensure this wallet holds a CONFIRMED coin of exactly `sats`, minting one via an
+    /// off-chain split when needed. Returns its statechain id. (The amount-maker behind
+    /// single-coin flows: Lightning swaps, latch transfers.)
+    pub async fn ensure_exact_coin(&self, sats: u64) -> Result<String> {
+        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+            .await?;
+        let record = self.record().await?;
+        if let Some(c) = record.coins.iter().find(|c| {
+            c.status == CoinStatus::CONFIRMED
+                && c.duplicate_index == 0
+                && c.amount.unwrap_or_default() as u64 == sats
+        }) {
+            return Ok(c.statechain_id.clone().unwrap_or_default());
+        }
+        // Split the smallest coin that can cover the piece + fee reserve.
+        let parent = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| {
+                let a = c.amount.unwrap_or_default() as u64;
+                a > sats + split_fee_reserve(a)
+            })
+            .min_by_key(|c| c.amount.unwrap_or_default())
+            .and_then(|c| c.statechain_id.clone())
+            .ok_or_else(|| anyhow!("no coin large enough to mint {sats} sats"))?;
+        drop(record);
+        let (piece, _change) = self.split_coin(&parent, sats).await?;
+        Ok(piece)
+    }
+
     /// Split a confirmed coin into (`piece_sats`, remainder) **off-chain**: one SE-co-signed,
     /// un-broadcast transaction whose outputs are two fresh single-use statechain coins owned by
     /// this wallet. Returns (piece statechain_id, change statechain_id). Broadcasting the split tx

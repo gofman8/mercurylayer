@@ -23,6 +23,7 @@ pub mod config;
 pub mod events;
 pub mod lightning;
 pub mod select;
+pub mod ssp;
 pub mod tokens;
 pub mod transfer;
 pub mod types;
