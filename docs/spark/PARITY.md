@@ -1,5 +1,9 @@
 # Spark ↔ Mercury+RGB feature parity matrix
 
+> **Verification (final):** full suite green in one pass on regtest — SDK_E2E=1..4 (wallet flow,
+> tokens, lightning swap, adversarial), RGB_E2E=1..8 (off-chain DAG primitives), and the complete
+> upstream Mercury suite (tb01–tb05, tm01, ta01–ta03, tv01). 13/13 PASS.
+
 Target: every user-visible Spark feature (docs.spark.money + `@buildonspark/spark-sdk` +
 `@buildonspark/issuer-sdk`) implemented on Mercury Layer with a **single SE** (blind-MuSig2 2-of-2,
 lockbox) instead of FROST multi-operator, and **RGB** (UTEXO-Protocol/rgb-lib) instead of the
