@@ -252,6 +252,15 @@ impl SparkWallet {
         .map(|v| v.len() as u32)
         .unwrap_or(0);
         let server_info = mercuryrustlib::utils::info_config(&self.inner.cc).await?;
+        // Terminal-spend guard on the carrier: one more co-signature (the colored split), then
+        // the SE refuses everything — the token branch cannot be double-spent.
+        mercuryrustlib::lightning_latch::set_spend_budget(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+            1,
+        )
+        .await?;
         let splits = vec![
             (piece_addr.clone(), TOKEN_PIECE_SATS, token_amount),
             (change_addr.clone(), change_sats, token_change),

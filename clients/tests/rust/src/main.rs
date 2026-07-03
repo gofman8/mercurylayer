@@ -27,6 +27,7 @@ pub mod sdk04_adversarial;
 pub mod sdk05_lightning_pay;
 pub mod sdk06_lightning_receive;
 pub mod sdk07_unilateral_exit;
+pub mod sdk08_terminal_node;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -66,6 +67,11 @@ async fn main() -> Result<()> {
     // the backup locktime, exit completes with zero SE involvement.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("7") {
         sdk07_unilateral_exit::execute().await?;
+        return Ok(());
+    }
+    // Terminal-node enforcement (SDK_E2E=8): the SE refuses any co-signature on a split parent.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("8") {
+        sdk08_terminal_node::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

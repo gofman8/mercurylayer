@@ -207,6 +207,16 @@ impl SparkWallet {
         .await
         .map(|v| v.len() as u32)
         .unwrap_or(0);
+        // Make the parent TERMINAL at the SE before co-signing the split: exactly one more
+        // co-signature is allowed (the split itself). No later withdraw/transfer/backup of the
+        // parent can be signed — the branch cannot be double-spent even by a malicious sender.
+        mercuryrustlib::lightning_latch::set_spend_budget(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            1,
+        )
+        .await?;
         let mut parent = parent;
         let signed = self
             .sign_split_tx(

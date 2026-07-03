@@ -12,6 +12,7 @@ Full Spark (buildonspark) feature parity on Mercury Layer with a **single statec
 - [Tokens on RGB](learn/tokens.md) — issuance, lifecycle, why there is no freeze
 - [Lightning](learn/lightning.md) — preimage swaps on the Mercury latch
 - [Deposits & exits](learn/exits.md) — cooperative vs unilateral, the timelock ladder
+- [Invalidation & granularity](learn/invalidation.md) — Spark/Ark/Second/SuperScalar comparison, terminal nodes, measured exit costs
 
 ## Build
 

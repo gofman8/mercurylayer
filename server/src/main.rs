@@ -152,6 +152,8 @@ async fn main() {
             endpoints::lightning_latch::transfer_preimage,
             endpoints::lightning_latch::post_paymenthash_external,
             endpoints::lightning_latch::unlock_by_preimage,
+            endpoints::lightning_latch::set_spend_budget,
+            endpoints::lightning_latch::get_spend_budget,
             endpoints::transfer_sender::transfer_sender,
             endpoints::transfer_sender::transfer_update_msg,
             endpoints::transfer_receiver::get_msg_addr,

@@ -63,6 +63,18 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
         return status::Custom(Status::Gone, Json(response_body));
     }
 
+    // Terminal-spend budget (off-chain tree nodes): once the owner sets a budget, no
+    // co-signature beyond it — a split/combine node is one-shot regardless of who asks.
+    if let Some(budget) = crate::database::deposit::get_sig_budget(&statechain_entity.pool, &statechain_id).await {
+        let count = crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await;
+        if count >= budget as i64 {
+            let response_body = json!({
+                "message": "spend budget exhausted (terminal node: SE refuses further co-signatures)"
+            });
+            return status::Custom(Status::Gone, Json(response_body));
+        }
+    }
+
     // SE epoch-deadline enforcement (Stage 4 — off-chain RGB tree exit window): once the SE's own
     // clock passes a coin's epoch deadline, it refuses to co-sign ANY new spend. The owner must have
     // transacted or exited before then; unilateral exit needs no SE co-signature (the owner just

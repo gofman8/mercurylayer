@@ -160,3 +160,28 @@ pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str)  {
         .await
         .unwrap();
 }
+
+/// Set an absolute co-signature budget: current finalized count + `remaining`. The SE refuses
+/// sign_first once the count reaches the budget.
+pub async fn set_sig_budget(pool: &sqlx::PgPool, statechain_id: &str, remaining: i32) -> i64 {
+    let count = count_finalized_signatures(pool, statechain_id).await;
+    let budget = count + remaining as i64;
+    let query = "UPDATE statechain_data SET sig_budget = $1 WHERE statechain_id = $2";
+    let _ = sqlx::query(query)
+        .bind(budget as i32)
+        .bind(statechain_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    budget
+}
+
+pub async fn get_sig_budget(pool: &sqlx::PgPool, statechain_id: &str) -> Option<i32> {
+    let query = "SELECT sig_budget FROM statechain_data WHERE statechain_id = $1";
+    let row = sqlx::query(query)
+        .bind(statechain_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+    row.and_then(|r| sqlx::Row::get::<Option<i32>, _>(&r, 0))
+}

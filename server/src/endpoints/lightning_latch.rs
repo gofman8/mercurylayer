@@ -212,3 +212,43 @@ pub async fn unlock_by_preimage(statechain_entity: &State<StateChainEntity>, pay
     let response_body = json!({ "message": "Success", "unlocked": ids });
     status::Custom(Status::Ok, Json(response_body))
 }
+
+#[derive(serde::Deserialize)]
+pub struct SpendBudgetRequest {
+    pub statechain_id: String,
+    pub auth_sig: String,
+    pub remaining: i32,
+}
+
+/// Mark a coin terminal: after `remaining` more co-signatures (typically 1 — the structural
+/// split/combine spend), the SE refuses everything. Owner-signed; irreversible.
+#[post("/statechain/spend_budget", format = "json", data = "<payload>")]
+pub async fn set_spend_budget(statechain_entity: &State<StateChainEntity>, payload: Json<SpendBudgetRequest>) -> status::Custom<Json<Value>> {
+    let statechain_id = payload.0.statechain_id.clone();
+    if payload.0.remaining < 0 || payload.0.remaining > 1 {
+        let response_body = json!({ "message": "remaining must be 0 or 1" });
+        return status::Custom(Status::BadRequest, Json(response_body));
+    }
+    if !crate::endpoints::utils::validate_signature(&statechain_entity.pool, &payload.0.auth_sig, &statechain_id).await {
+        let response_body = json!({ "message": "Signature does not match authentication key." });
+        return status::Custom(Status::Forbidden, Json(response_body));
+    }
+    let budget = crate::database::deposit::set_sig_budget(&statechain_entity.pool, &statechain_id, payload.0.remaining).await;
+    let response_body = json!({ "message": "Success", "sig_budget": budget });
+    status::Custom(Status::Ok, Json(response_body))
+}
+
+/// Public terminal-state query: receivers of branch transfers verify the parent node cannot be
+/// co-signed again (budget set and exhausted).
+#[get("/statechain/spend_budget/<statechain_id>")]
+pub async fn get_spend_budget(statechain_entity: &State<StateChainEntity>, statechain_id: &str) -> status::Custom<Json<Value>> {
+    let budget = crate::database::deposit::get_sig_budget(&statechain_entity.pool, statechain_id).await;
+    let finalized = crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, statechain_id).await;
+    let exhausted = budget.map(|b| finalized >= b as i64).unwrap_or(false);
+    let response_body = json!({
+        "sig_budget": budget,
+        "finalized": finalized,
+        "terminal": exhausted,
+    });
+    status::Custom(Status::Ok, Json(response_body))
+}

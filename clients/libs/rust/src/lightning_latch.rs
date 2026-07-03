@@ -239,3 +239,55 @@ pub async fn unlock_by_preimage(
     }
     Ok(())
 }
+
+/// Mark a coin terminal at the SE: after `remaining` more co-signatures the SE refuses all
+/// further ones. Call with remaining=1 immediately before a structural (split/combine) spend.
+pub async fn set_spend_budget(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    remaining: i32,
+) -> Result<()> {
+    let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+    let coin = wallet
+        .coins
+        .iter()
+        .filter(|c| c.statechain_id == Some(statechain_id.to_string()))
+        .min_by_key(|c| c.locktime.unwrap_or(u32::MAX))
+        .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/statechain/spend_budget", client_config.statechain_entity))
+        .json(&serde_json::json!({
+            "statechain_id": statechain_id,
+            "auth_sig": coin.signed_statechain_id.clone().unwrap(),
+            "remaining": remaining,
+        }))
+        .send()
+        .await?;
+    if response.status() != 200 {
+        return Err(anyhow!(response.text().await?));
+    }
+    Ok(())
+}
+
+/// Terminal-state of a coin at the SE: (sig_budget, finalized, terminal).
+pub async fn get_spend_budget(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+) -> Result<(Option<i32>, i64, bool)> {
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .get(&format!("{}/statechain/spend_budget/{}", client_config.statechain_entity, statechain_id))
+        .send()
+        .await?;
+    if response.status() != 200 {
+        return Err(anyhow!(response.text().await?));
+    }
+    let v: serde_json::Value = response.json().await?;
+    Ok((
+        v.get("sig_budget").and_then(|x| x.as_i64()).map(|x| x as i32),
+        v.get("finalized").and_then(|x| x.as_i64()).unwrap_or(0),
+        v.get("terminal").and_then(|x| x.as_bool()).unwrap_or(false),
+    ))
+}
