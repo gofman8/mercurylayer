@@ -188,43 +188,66 @@ impl SparkWallet {
             bitcoin::consensus::encode::deserialize(&hex::decode(&signed)?)?;
         let txid = tx.txid().to_string();
 
-        // Register the sub-coins: patch the freshly-initialised coin records onto the un-broadcast
-        // outputs and persist the exit branch (parent's split tx) for each.
+        // Register both sub-coins (coin records + backups + shared branch).
+        let (piece_id, change_id) = self
+            .register_split_subcoins(
+                statechain_id,
+                &signed,
+                &txid,
+                &[
+                    (piece_addr.clone(), 0, piece_sats),
+                    (change_addr.clone(), 1, change_sats),
+                ],
+            )
+            .await?;
+        Ok((piece_id, change_id))
+    }
+
+    /// Register the outputs of a signed (un-broadcast) split tx as wallet coins: patch the
+    /// freshly-initialised coin records onto the outputs, mark the parent spent, give each
+    /// sub-coin its own first backup tx + locktime, and persist the shared exit branch under
+    /// "branch-<id>". `outputs` is `[(aggregated_address, vout, sats), ...]`; returns the
+    /// statechain ids in the same order (currently piece, change).
+    pub(crate) async fn register_split_subcoins(
+        &self,
+        parent_statechain_id: &str,
+        signed_split_tx_hex: &str,
+        split_txid: &str,
+        outputs: &[(String, u32, u64)],
+    ) -> Result<(String, String)> {
         let mut record = self.record().await?;
-        let mut piece_id = String::new();
-        let mut change_id = String::new();
+        let mut ids: Vec<String> = vec![String::new(); outputs.len()];
         for coin in record.coins.iter_mut() {
             let addr = coin.aggregated_address.clone().unwrap_or_default();
-            if addr == piece_addr && coin.status == CoinStatus::INITIALISED {
-                coin.utxo_txid = Some(txid.clone());
-                coin.utxo_vout = Some(0);
-                coin.amount = Some(u32::try_from(piece_sats)?);
-                coin.status = CoinStatus::CONFIRMED;
-                piece_id = coin.statechain_id.clone().unwrap_or_default();
-            } else if addr == change_addr && coin.status == CoinStatus::INITIALISED {
-                coin.utxo_txid = Some(txid.clone());
-                coin.utxo_vout = Some(1);
-                coin.amount = Some(u32::try_from(change_sats)?);
-                coin.status = CoinStatus::CONFIRMED;
-                change_id = coin.statechain_id.clone().unwrap_or_default();
-            } else if coin.statechain_id.as_deref() == Some(statechain_id)
+            if coin.status == CoinStatus::INITIALISED {
+                if let Some((i, (_, vout, sats))) =
+                    outputs.iter().enumerate().find(|(_, (a, _, _))| *a == addr)
+                {
+                    coin.utxo_txid = Some(split_txid.to_string());
+                    coin.utxo_vout = Some(*vout);
+                    coin.amount = Some(u32::try_from(*sats)?);
+                    coin.status = CoinStatus::CONFIRMED;
+                    ids[i] = coin.statechain_id.clone().unwrap_or_default();
+                    continue;
+                }
+            }
+            if coin.statechain_id.as_deref() == Some(parent_statechain_id)
                 && coin.duplicate_index == 0
             {
-                // Parent is terminally spent by the split (SE single-use enforces exactly-once).
+                // Parent is terminally spent by the split.
                 coin.status = CoinStatus::WITHDRAWN;
             }
         }
-        if piece_id.is_empty() || change_id.is_empty() {
+        if ids.iter().any(|i| i.is_empty()) {
             return Err(anyhow!("split sub-coin registration failed"));
         }
 
-        // Give each sub-coin its own first backup tx (unilateral exit leaf: branch then backup)
-        // and set its locktime — required by the transfer path and the exit-race ordering.
+        // Each sub-coin gets its own first backup tx (exit leaf) + locktime.
         let network = self.inner.config.network.to_string();
         let mut sub_backups: Vec<(String, mercurylib::wallet::BackupTx)> = Vec::new();
         for coin in record.coins.iter_mut() {
             let id = coin.statechain_id.clone().unwrap_or_default();
-            if (id == piece_id || id == change_id) && coin.status == CoinStatus::CONFIRMED {
+            if ids.contains(&id) && coin.status == CoinStatus::CONFIRMED {
                 let bkp =
                     mercuryrustlib::deposit::create_tx1(&self.inner.cc, coin, &network, 1).await?;
                 coin.locktime = Some(mercurylib::utils::get_blockheight(&bkp)?);
@@ -233,10 +256,9 @@ impl SparkWallet {
         }
         self.save_record(&record).await?;
 
-        // Persist per-coin backups and the shared exit branch (the signed split tx).
         let branch = mercurylib::wallet::BackupTx {
             tx_n: 1,
-            tx: signed.clone(),
+            tx: signed_split_tx_hex.to_string(),
             client_public_nonce: String::new(),
             server_public_nonce: String::new(),
             client_public_key: String::new(),
@@ -262,7 +284,7 @@ impl SparkWallet {
             .await?;
         }
 
-        Ok((piece_id, change_id))
+        Ok((ids[0].clone(), ids[1].clone()))
     }
 
     /// Blind-MuSig2 co-sign a multi-output spend of `coin` (the plain-BTC split; the RGB-colored

@@ -22,6 +22,7 @@
 pub mod config;
 pub mod events;
 pub mod select;
+pub mod tokens;
 pub mod transfer;
 pub mod types;
 pub mod wallet;

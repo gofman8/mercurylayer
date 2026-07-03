@@ -18,6 +18,8 @@ pub(crate) struct Inner {
     pub token_pool: Mutex<Vec<String>>,
     /// Guards wallet-record read-modify-write cycles within this process.
     pub wallet_lock: Mutex<()>,
+    /// Lazily-opened RGB engine (token support); None until first token operation.
+    pub rgb: Mutex<Option<mercury_rgb::RgbWallet>>,
 }
 
 /// Spark-parity wallet on Mercury+RGB. Cheap to clone; all clones share state.
@@ -72,6 +74,7 @@ impl SparkWallet {
                 events_tx,
                 token_pool: Mutex::new(Vec::new()),
                 wallet_lock: Mutex::new(()),
+                rgb: Mutex::new(None),
             }),
         };
         Ok((wallet, mnemonic_out))
@@ -112,10 +115,12 @@ impl SparkWallet {
         Ok(addr)
     }
 
-    /// Balance across all coins (plus token balances once token support is wired).
+    /// Balance across all coins, including per-asset token balances (when configured).
     pub async fn get_balance(&self) -> Result<Balance> {
         let record = self.record().await?;
-        Ok(compute_balance(&record))
+        let mut balance = compute_balance(&record);
+        balance.tokens = self.get_token_balances().await.unwrap_or_default();
+        Ok(balance)
     }
 
     /// Provide a pre-paid, confirmed deposit-token id. Each statechain slot (deposit address or
@@ -204,6 +209,22 @@ impl SparkWallet {
             let _ = self.inner.events_tx.send(WalletEvent::TransferClaimed {
                 statechain_ids: receive.received_statechain_ids.clone(),
             });
+            // Token hook: coins that arrived with a consignment get validated + booked.
+            for id in &receive.received_statechain_ids {
+                match self.accept_incoming_tokens(id).await {
+                    Ok(Some((asset_id, amount))) => {
+                        let _ = self.inner.events_tx.send(WalletEvent::TokenTransferClaimed {
+                            asset_id,
+                            amount,
+                            statechain_id: id.clone(),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        println!("token accept error for {id}: {e}");
+                    }
+                }
+            }
         }
         if !confirmed_deposits.is_empty() || !receive.received_statechain_ids.is_empty() {
             let _ = self.inner.events_tx.send(WalletEvent::BalanceUpdate {
@@ -268,24 +289,36 @@ impl SparkWallet {
         Ok(withdrawn)
     }
 
-    /// Broadcast the stored exit branch of a coin, root-first, if one exists. Already-confirmed
-    /// branch txs (shared with a sibling coin's earlier exit) are skipped silently.
-    pub(crate) async fn broadcast_branch_if_any(&self, statechain_id: &str) -> Result<()> {
-        if let Ok(branch) = mercuryrustlib::sqlite_manager::get_backup_txs(
+    /// Broadcast the stored exit branch of a coin, root-first, if one exists. Returns whether a
+    /// branch exists. Broadcast errors for already-confirmed branch txs (shared with a sibling
+    /// coin's earlier exit) are tolerated; other errors surface.
+    pub(crate) async fn broadcast_branch_if_any(&self, statechain_id: &str) -> Result<bool> {
+        let branch = match mercuryrustlib::sqlite_manager::get_backup_txs(
             &self.inner.cc.pool,
             &self.inner.config.wallet_name,
             &format!("branch-{statechain_id}"),
         )
         .await
         {
-            use electrum_client::ElectrumApi;
-            for b in branch.iter() {
-                let tx: bitcoin::Transaction =
-                    bitcoin::consensus::encode::deserialize(&hex::decode(&b.tx)?)?;
-                let _ = self.inner.cc.electrum_client.transaction_broadcast(&tx);
+            Ok(b) if !b.is_empty() => b,
+            _ => return Ok(false),
+        };
+        use electrum_client::ElectrumApi;
+        for b in branch.iter() {
+            let tx: bitcoin::Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&b.tx)?)?;
+            match self.inner.cc.electrum_client.transaction_broadcast(&tx) {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Tolerate an already-materialized branch (sibling exit / rebroadcast).
+                    if !(msg.contains("already") || msg.contains("in block chain") || msg.contains("txn-mempool-conflict")) {
+                        return Err(anyhow!("branch broadcast failed for {statechain_id}: {msg}"));
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Unilateral exit: broadcast the pre-signed backup transaction(s) for the given coins (or all
@@ -308,16 +341,35 @@ impl SparkWallet {
         let mut exited = Vec::new();
         for id in ids {
             // Off-chain sub-coins first materialize their funding: broadcast the exit branch
-            // (stored under "branch-<id>") root-first, then the coin's own backup tx.
-            self.broadcast_branch_if_any(&id).await?;
-            mercuryrustlib::broadcast_backup_tx::execute(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &id,
-                to_address.clone(),
-                None,
-            )
-            .await?;
+            // (stored under "branch-<id>") root-first, then the coin's own latest backup tx.
+            let has_branch = self.broadcast_branch_if_any(&id).await?;
+            if has_branch {
+                // Branch coin: broadcast the stored pre-signed backup as-is (subject to its
+                // locktime — unilateral exits wait out the handover-protection window).
+                let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+                    &self.inner.cc.pool,
+                    &self.inner.config.wallet_name,
+                    &id,
+                )
+                .await?;
+                let latest = backups
+                    .iter()
+                    .max_by_key(|b| b.tx_n)
+                    .ok_or_else(|| anyhow!("no backup tx stored for {id}"))?;
+                use electrum_client::ElectrumApi;
+                let tx: bitcoin::Transaction =
+                    bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
+                self.inner.cc.electrum_client.transaction_broadcast(&tx)?;
+            } else {
+                mercuryrustlib::broadcast_backup_tx::execute(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &id,
+                    to_address.clone(),
+                    None,
+                )
+                .await?;
+            }
             exited.push(id);
         }
         Ok(exited)

@@ -247,7 +247,11 @@ pub async fn create_colored_split_tx(
     //    OP_RETURN opret commitment and returns one consignment covering all sub-coin seals.
     let mut output_map = std::collections::HashMap::new();
     for (i, (_, _, rgb_amount)) in splits.iter().enumerate() {
-        output_map.insert(i as u32, *rgb_amount);
+        // rgb_amount == 0 marks a sats-only output (e.g. the change of an exact-allocation token
+        // transfer) - leave it uncolored rather than assigning a zero allocation.
+        if *rgb_amount > 0 {
+            output_map.insert(i as u32, *rgb_amount);
+        }
     }
     let (colored_psbt_b64, consignment) = rgb.color(&unsigned_psbt_b64, contract_id, output_map, blinding)?;
 

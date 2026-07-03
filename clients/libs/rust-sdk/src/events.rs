@@ -10,4 +10,10 @@ pub enum WalletEvent {
     TransferClaimed { statechain_ids: Vec<String> },
     /// Balance changed for any reason (deposit, claim, send).
     BalanceUpdate { balance: Balance },
+    /// An incoming token transfer was validated (off-chain consignment) and booked.
+    TokenTransferClaimed {
+        asset_id: String,
+        amount: u64,
+        statechain_id: String,
+    },
 }

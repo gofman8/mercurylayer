@@ -152,6 +152,16 @@ impl RgbWallet {
         Ok(asset.asset_id)
     }
 
+    /// List NIA assets known to this wallet: (asset_id, ticker, name, precision).
+    pub fn list_assets(&self) -> Result<Vec<(String, String, String, u8)>> {
+        let assets = self.wallet.list_assets(vec![])?;
+        let mut out = Vec::new();
+        for a in assets.nia.unwrap_or_default() {
+            out.push((a.asset_id, a.ticker, a.name, a.precision));
+        }
+        Ok(out)
+    }
+
     /// Settled balance of an asset in this wallet.
     pub fn settled_balance(&self, asset_id: &str) -> Result<u64> {
         Ok(self.wallet.get_asset_balance(asset_id.to_string())?.settled)
@@ -348,6 +358,60 @@ impl RgbWallet {
     /// branch from the on-chain root down to the leaf (e.g. `[S1, S2]`); every one is resolved from
     /// the consignment's bundled witnesses, so an un-broadcast *parent* need not be on-chain (unlike
     /// [`Self::validate_offchain`], which only treats the single terminal txid as offchain).
+    /// Import the asset (contract) carried by a consignment into this wallet's stash, validating
+    /// against a chain of un-broadcast witnesses. Required before a receiver can register/spend an
+    /// allocation of a contract it has never seen.
+    pub fn import_asset_offchain(
+        &self,
+        consignment_base64: &str,
+        txids: &[String],
+    ) -> Result<()> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-import");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let consignment = rgb_lib::wallet::rust_only::load_transfer(
+            path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+        self.wallet.save_new_asset(consignment, txids)?;
+        Ok(())
+    }
+
+    /// Structured off-chain chain validation for SDK receivers: like
+    /// [`Self::validate_offchain_chain`] but also returning the consignment's verified contract
+    /// id (only meaningful when valid).
+    pub fn validate_offchain_chain_info(
+        &self,
+        consignment_base64: &str,
+        txids: &[String],
+    ) -> Result<(bool, Option<String>, Option<String>)> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-validate-chain-info");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let network = self.wallet.get_wallet_data().bitcoin_network;
+        let res = rgb_lib::wallet::rust_only::validate_consignment_offchain_chain(
+            path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+            txids,
+            &self.indexer_url,
+            network,
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+        let detail = if res.valid {
+            res.warnings.map(|w| w.join("; "))
+        } else {
+            res.details.or(res.error)
+        };
+        Ok((res.valid, detail, res.contract_id))
+    }
+
     pub fn validate_offchain_chain(
         &self,
         consignment_base64: &str,

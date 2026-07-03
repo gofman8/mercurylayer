@@ -21,6 +21,7 @@ pub mod rgb07_epoch;
 pub mod rgb08_wide_combine;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
+pub mod sdk02_token_flow;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -31,6 +32,12 @@ async fn main() -> Result<()> {
     // off-chain-split transfer (exact amount w/ change) -> auto-claim -> cooperative exit.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("1") {
         sdk01_wallet_flow::execute().await?;
+        return Ok(());
+    }
+    // SDK token flow (SDK_E2E=2): issue RGB asset onto a statechain coin -> off-chain token
+    // transfer (colored split + consignment in the transfer msg) -> verified booking -> exit.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("2") {
+        sdk02_token_flow::execute().await?;
         return Ok(());
     }
     // Off-chain RGB split via pseudo-Spilman leaves (see docs/rgb_offchain_split_spilman.md). Needs
