@@ -321,13 +321,63 @@ impl SparkWallet {
         Ok(true)
     }
 
-    /// Unilateral exit: broadcast the pre-signed backup transaction(s) for the given coins (or all
-    /// confirmed coins). Needs no SE cooperation; subject to the backup locktime.
+    /// Estimate the cost and readiness of unilaterally exiting a coin: how many transactions,
+    /// their total vsize (fee = vsize x feerate via [`crate::types::ExitCostEstimate::fee_sats_at`]),
+    /// and how many blocks remain until the backup's locktime allows broadcast.
+    pub async fn estimate_exit_cost(&self, statechain_id: &str) -> Result<crate::types::ExitCostEstimate> {
+        use electrum_client::ElectrumApi;
+        let branch = mercuryrustlib::sqlite_manager::get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            &format!("branch-{statechain_id}"),
+        )
+        .await
+        .unwrap_or_default();
+        let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?;
+        let latest = backups
+            .iter()
+            .max_by_key(|b| b.tx_n)
+            .ok_or_else(|| anyhow!("no backup tx stored for {statechain_id}"))?;
+
+        let mut branch_vbytes = 0u64;
+        for b in &branch {
+            let tx: bitcoin::Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&b.tx)?)?;
+            branch_vbytes += tx.vsize() as u64;
+        }
+        let backup_tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
+        let backup_vbytes = backup_tx.vsize() as u64;
+
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let locktime = mercurylib::utils::get_blockheight(latest)?;
+        let wait_blocks = locktime.saturating_sub(tip);
+
+        Ok(crate::types::ExitCostEstimate {
+            statechain_id: statechain_id.to_string(),
+            branch_txs: branch.len() as u32,
+            branch_vbytes,
+            backup_vbytes,
+            total_vbytes: branch_vbytes + backup_vbytes,
+            wait_blocks,
+        })
+    }
+
+    /// Unilateral exit: broadcast the exit branch (immediately valid) and the latest pre-signed
+    /// backup tx for each coin. Needs no SE cooperation. A backup whose locktime has not been
+    /// reached is reported as `complete=false` with the remaining `wait_blocks` — call again
+    /// once the chain advances (the branch stays out either way).
     pub async fn unilateral_exit(
         &self,
         statechain_ids: Option<Vec<String>>,
-        to_address: Option<String>,
-    ) -> Result<Vec<String>> {
+        _to_address: Option<String>,
+    ) -> Result<Vec<crate::types::ExitStatus>> {
+        use electrum_client::ElectrumApi;
         let record = self.record().await?;
         let ids: Vec<String> = match statechain_ids {
             Some(ids) => ids,
@@ -338,41 +388,54 @@ impl SparkWallet {
                 .filter_map(|c| c.statechain_id.clone())
                 .collect(),
         };
-        let mut exited = Vec::new();
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let mut statuses = Vec::new();
         for id in ids {
-            // Off-chain sub-coins first materialize their funding: broadcast the exit branch
-            // (stored under "branch-<id>") root-first, then the coin's own latest backup tx.
-            let has_branch = self.broadcast_branch_if_any(&id).await?;
-            if has_branch {
-                // Branch coin: broadcast the stored pre-signed backup as-is (subject to its
-                // locktime — unilateral exits wait out the handover-protection window).
-                let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-                    &self.inner.cc.pool,
-                    &self.inner.config.wallet_name,
-                    &id,
-                )
-                .await?;
-                let latest = backups
-                    .iter()
-                    .max_by_key(|b| b.tx_n)
-                    .ok_or_else(|| anyhow!("no backup tx stored for {id}"))?;
-                use electrum_client::ElectrumApi;
-                let tx: bitcoin::Transaction =
-                    bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
-                self.inner.cc.electrum_client.transaction_broadcast(&tx)?;
-            } else {
-                mercuryrustlib::broadcast_backup_tx::execute(
-                    &self.inner.cc,
-                    &self.inner.config.wallet_name,
-                    &id,
-                    to_address.clone(),
-                    None,
-                )
-                .await?;
+            // Materialize the coin's funding first (no locktime on branch txs).
+            self.broadcast_branch_if_any(&id).await?;
+
+            let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?;
+            let latest = backups
+                .iter()
+                .max_by_key(|b| b.tx_n)
+                .ok_or_else(|| anyhow!("no backup tx stored for {id}"))?;
+            let locktime = mercurylib::utils::get_blockheight(latest)?;
+            if locktime > tip {
+                statuses.push(crate::types::ExitStatus {
+                    statechain_id: id,
+                    complete: false,
+                    wait_blocks: locktime - tip,
+                });
+                continue;
             }
-            exited.push(id);
+            let tx: bitcoin::Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
+            match self.inner.cc.electrum_client.transaction_broadcast(&tx) {
+                Ok(_) => statuses.push(crate::types::ExitStatus {
+                    statechain_id: id,
+                    complete: true,
+                    wait_blocks: 0,
+                }),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already") || msg.contains("in block chain") {
+                        statuses.push(crate::types::ExitStatus {
+                            statechain_id: id,
+                            complete: true,
+                            wait_blocks: 0,
+                        });
+                    } else {
+                        return Err(anyhow!("backup broadcast failed for {id}: {msg}"));
+                    }
+                }
+            }
         }
-        Ok(exited)
+        Ok(statuses)
     }
 
     /// Transfer history (deposits, sends, receives).

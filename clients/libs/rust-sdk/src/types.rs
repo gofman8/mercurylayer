@@ -76,3 +76,34 @@ pub enum SdkError {
     #[error("token support is not configured (set rgb_proxy_url + rgb_data_dir)")]
     TokensNotConfigured,
 }
+
+/// Cost/readiness estimate for unilaterally exiting one coin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExitCostEstimate {
+    pub statechain_id: String,
+    /// Number of branch txs that must confirm before the backup (0 for flat coins).
+    pub branch_txs: u32,
+    pub branch_vbytes: u64,
+    pub backup_vbytes: u64,
+    pub total_vbytes: u64,
+    /// Blocks until the backup tx's locktime allows broadcast (0 = ready now).
+    pub wait_blocks: u32,
+}
+
+impl ExitCostEstimate {
+    /// Total miner fee at a given feerate (sat/vB). Branch txs carry their own pre-committed
+    /// fees (the split's fee reserve); this covers everything broadcast fresh at `rate`.
+    pub fn fee_sats_at(&self, rate_sat_vb: f64) -> u64 {
+        (self.total_vbytes as f64 * rate_sat_vb).ceil() as u64
+    }
+}
+
+/// Outcome of a unilateral-exit attempt for one coin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExitStatus {
+    pub statechain_id: String,
+    /// Branch (if any) and backup both broadcast.
+    pub complete: bool,
+    /// When not complete: blocks remaining until the backup is final.
+    pub wait_blocks: u32,
+}

@@ -26,6 +26,7 @@ pub mod sdk03_lightning_swap;
 pub mod sdk04_adversarial;
 pub mod sdk05_lightning_pay;
 pub mod sdk06_lightning_receive;
+pub mod sdk07_unilateral_exit;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -59,6 +60,12 @@ async fn main() -> Result<()> {
     // Lightning -> Mercury via SSP (SDK_E2E=6): receive a real LN payment as a statechain coin.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("6") {
         sdk06_lightning_receive::execute().await?;
+        return Ok(());
+    }
+    // Practical unilateral exit (SDK_E2E=7): estimate cost+wait, branch out instantly, mine past
+    // the backup locktime, exit completes with zero SE involvement.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("7") {
+        sdk07_unilateral_exit::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

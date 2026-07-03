@@ -31,5 +31,5 @@ pub mod wallet;
 
 pub use config::SdkConfig;
 pub use events::WalletEvent;
-pub use types::{Balance, ClaimResult, DepositAddressInfo, SdkError, TokenBalance, TransferResult};
+pub use types::{Balance, ClaimResult, DepositAddressInfo, ExitCostEstimate, ExitStatus, SdkError, TokenBalance, TransferResult};
 pub use wallet::SparkWallet;
