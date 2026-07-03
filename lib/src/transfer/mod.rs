@@ -97,6 +97,12 @@ pub struct TransferMsg {
     pub backup_transactions: Vec<BackupTx>,
     pub t1: [u8; 32],
     pub user_public_key: String,
+    /// Exit branch for a coin whose funding tx is un-broadcast (an off-chain split/combine
+    /// sub-coin): fully-signed raw txs (hex), root-first, from a spend of an ON-CHAIN outpoint
+    /// down to the tx that funds this coin. Empty for ordinary on-chain coins; serde-default
+    /// keeps the message wire-compatible with vanilla wallets.
+    #[serde(default)]
+    pub branch_txs: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

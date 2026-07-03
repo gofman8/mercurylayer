@@ -2733,6 +2733,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury-spark-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitcoin 0.30.1",
+ "electrum-client 0.18.0",
+ "hex",
+ "mercury-rgb",
+ "mercurylib",
+ "mercuryrustlib",
+ "secp256k1-zkp",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.59",
+ "tokio",
+ "uuid 1.4.1",
+]
+
+[[package]]
 name = "mercury-wasm"
 version = "0.1.0"
 dependencies = [
@@ -4220,6 +4240,7 @@ dependencies = [
  "electrum-client 0.18.0",
  "hex",
  "mercury-rgb",
+ "mercury-spark-sdk",
  "mercuryrustlib",
  "serde",
  "serde_json",

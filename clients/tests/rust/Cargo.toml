@@ -9,6 +9,7 @@ edition = "2021"
 anyhow = "1.0"
 mercuryrustlib = { path = "../../libs/rust" }
 mercury-rgb = { path = "../../libs/rust-rgb" }
+mercury-spark-sdk = { path = "../../libs/rust-sdk" }
 tokio = { version = "1.27.0", features = ["full"] }
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"

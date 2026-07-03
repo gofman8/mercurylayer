@@ -54,6 +54,7 @@ fn ffi_to_transfer_msg(ffi_msg: FFITransferMsg) -> Result<TransferMsg, MercuryEr
         backup_transactions: ffi_msg.backup_transactions,
         t1: t1_array,
         user_public_key: ffi_msg.user_public_key,
+        branch_txs: Vec::new(),
     })
 }
 

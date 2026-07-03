@@ -39,6 +39,38 @@ fn check_and_set_settings() -> String {
 }
 
 impl ClientConfig {
+    /// Programmatic constructor for SDK embedders (no Settings.toml). Creates the sqlite
+    /// database if missing and runs this crate's migrations.
+    pub async fn from_params(
+        statechain_entity: String,
+        electrum_server: String,
+        electrum_type: String,
+        network: Network,
+        database_file: String,
+        confirmation_target: u32,
+    ) -> Result<Self> {
+        if !Sqlite::database_exists(&database_file).await.unwrap_or(false) {
+            Sqlite::create_database(&database_file).await?;
+        }
+        let pool: sqlx::Pool<Sqlite> = SqlitePool::connect(&database_file).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+
+        let electrum_client = electrum_client::Client::new(electrum_server.as_str())?;
+
+        Ok(ClientConfig {
+            statechain_entity,
+            electrum_client,
+            electrum_server_url: electrum_server,
+            electrum_type,
+            network,
+            fee_rate_tolerance: 5.0,
+            confirmation_target,
+            pool,
+            tor_proxy: None,
+            max_fee_rate: 1.0,
+        })
+    }
+
     pub async fn load() -> Self {
 
         let settings_filename = check_and_set_settings();

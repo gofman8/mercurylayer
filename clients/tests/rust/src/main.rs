@@ -20,12 +20,19 @@ pub mod rgb06_dag3;
 pub mod rgb07_epoch;
 pub mod rgb08_wide_combine;
 pub mod rgb_dump;
+pub mod sdk01_wallet_flow;
 pub mod utils;
 use anyhow::{Result, Ok};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
 
+    // mercury-spark-sdk smoke (SDK_E2E=1): deposit -> exact-subset transfer -> auto-claim ->
+    // off-chain-split transfer (exact amount w/ change) -> auto-claim -> cooperative exit.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("1") {
+        sdk01_wallet_flow::execute().await?;
+        return Ok(());
+    }
     // Off-chain RGB split via pseudo-Spilman leaves (see docs/rgb_offchain_split_spilman.md). Needs
     // the RGB proxy + electrum indexer in addition to the Mercury stack. Run with RGB_E2E=1.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("1") {

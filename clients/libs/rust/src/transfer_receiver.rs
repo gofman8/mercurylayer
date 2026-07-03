@@ -295,7 +295,24 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
   
         let tx0_outpoint = mercurylib::transfer::receiver::get_tx0_outpoint(backup_transactions)?;
 
-        let tx0_hex = get_tx0(&client_config.electrum_client, &tx0_outpoint.txid).await?;
+        let (tx0_hex, funding_from_branch) = get_tx0_or_branch(
+            &client_config.electrum_client,
+            &tx0_outpoint.txid,
+            &transfer_msg.branch_txs,
+        )
+        .await?;
+        if funding_from_branch {
+            // Un-broadcast funding (off-chain sub-coin): the exit branch substitutes for the
+            // on-chain checks — root must be on-chain/unspent/confirmed and every branch tx
+            // consensus-valid.
+            validate_branch(
+                &client_config.electrum_client,
+                &transfer_msg.branch_txs,
+                network,
+                client_config.confirmation_target,
+            )
+            .await?;
+        }
 
         if index == 0 {
             let is_transfer_signature_valid = mercurylib::transfer::receiver::verify_transfer_signature(&new_user_pubkey, &tx0_outpoint, &transfer_msg)?; 
@@ -329,10 +346,12 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             return Err(anyhow::anyhow!("num_sigs is not correct".to_string()));
         }
 
-        let (is_tx0_output_unspent, _) = verify_tx0_output_is_unspent_and_confirmed(&client_config.electrum_client, &tx0_outpoint, &tx0_hex, &network, client_config.confirmation_target).await?;
+        if !funding_from_branch {
+            let (is_tx0_output_unspent, _) = verify_tx0_output_is_unspent_and_confirmed(&client_config.electrum_client, &tx0_outpoint, &tx0_hex, &network, client_config.confirmation_target).await?;
 
-        if !is_tx0_output_unspent {
-            return Err(anyhow::anyhow!("tx0 output is spent or not confirmed".to_string()));
+            if !is_tx0_output_unspent {
+                return Err(anyhow::anyhow!("tx0 output is spent or not confirmed".to_string()));
+            }
         }
 
         let current_fee_rate_sats_per_byte = if info_config.fee_rate_sats_per_byte > client_config.max_fee_rate {
@@ -379,12 +398,28 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
         if index == 0 {
 
             let tx0_outpoint = mercurylib::transfer::receiver::get_tx0_outpoint(backup_transactions)?;
-            let tx0_hex = get_tx0(&client_config.electrum_client, &tx0_outpoint.txid).await?;
+            let (tx0_hex, funding_from_branch) = get_tx0_or_branch(
+                &client_config.electrum_client,
+                &tx0_outpoint.txid,
+                &transfer_msg.branch_txs,
+            )
+            .await?;
 
             let statechain_info = utils::get_statechain_info(&transfer_msg.statechain_id, &client_config).await?;   
             let statechain_info = statechain_info.unwrap();
 
-            let (_, tx0_status) = verify_tx0_output_is_unspent_and_confirmed(&client_config.electrum_client, &tx0_outpoint, &tx0_hex, &network, client_config.confirmation_target).await?;
+            let tx0_status = if funding_from_branch {
+                validate_branch(
+                    &client_config.electrum_client,
+                    &transfer_msg.branch_txs,
+                    network,
+                    client_config.confirmation_target,
+                )
+                .await?
+            } else {
+                let (_, s) = verify_tx0_output_is_unspent_and_confirmed(&client_config.electrum_client, &tx0_outpoint, &tx0_hex, &network, client_config.confirmation_target).await?;
+                s
+            };
 
             let backup_tx = backup_transactions.last().unwrap();
 
@@ -447,12 +482,45 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
 
             insert_or_update_backup_txs(&client_config.pool, wallet_name, &transfer_msg.statechain_id, &transfer_msg.backup_transactions).await?;
 
+            // Persist the exit branch (if any) so unilateral exit can broadcast it before the
+            // leaf backups. Stored under a derived key next to the coin's backups.
+            if !transfer_msg.branch_txs.is_empty() {
+                let branch: Vec<mercurylib::wallet::BackupTx> = transfer_msg
+                    .branch_txs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tx)| mercurylib::wallet::BackupTx {
+                        tx_n: (i + 1) as u32,
+                        tx: tx.clone(),
+                        client_public_nonce: String::new(),
+                        server_public_nonce: String::new(),
+                        client_public_key: String::new(),
+                        server_public_key: String::new(),
+                        blinding_factor: String::new(),
+                        rgb_consignment: None,
+                        rgb_blinding: None,
+                    })
+                    .collect();
+                insert_or_update_backup_txs(
+                    &client_config.pool,
+                    wallet_name,
+                    &format!("branch-{}", transfer_msg.statechain_id),
+                    &branch,
+                )
+                .await?;
+            }
+
             transfer_receive_result.is_batch_locked = false;
             transfer_receive_result.statechain_id = Some(transfer_msg.statechain_id.clone());
         } else {
 
             let tx0_outpoint = mercurylib::transfer::receiver::get_tx0_outpoint(backup_transactions)?;
-            let tx0_hex = get_tx0(&client_config.electrum_client, &tx0_outpoint.txid).await?;
+            let (tx0_hex, _) = get_tx0_or_branch(
+                &client_config.electrum_client,
+                &tx0_outpoint.txid,
+                &transfer_msg.branch_txs,
+            )
+            .await?;
 
             let first_backup_tx = backup_transactions.first().unwrap();
 
@@ -484,6 +552,105 @@ async fn get_tx0(electrum_client: &electrum_client::Client, tx0_txid: &str) -> R
     let tx0_hex = hex::encode(&tx_bytes[0]);
 
     Ok(tx0_hex)
+}
+
+/// Resolve the funding tx of a coin: on-chain first, else from the transfer message's exit
+/// branch (an off-chain split/combine sub-coin whose funding tx is un-broadcast). Returns the
+/// funding tx hex and whether it came from the branch.
+async fn get_tx0_or_branch(
+    electrum_client: &electrum_client::Client,
+    tx0_txid: &str,
+    branch_txs: &[String],
+) -> Result<(String, bool)> {
+    if let std::result::Result::Ok(hex) = get_tx0(electrum_client, tx0_txid).await {
+        return Ok((hex, false));
+    }
+    for tx_hex in branch_txs {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(tx_hex)?)?;
+        if tx.txid().to_string() == tx0_txid {
+            return Ok((tx_hex.clone(), true));
+        }
+    }
+    Err(anyhow!("funding tx {} not on-chain and not in the exit branch", tx0_txid))
+}
+
+/// Validate an exit branch: fully-signed txs, root-first, each spending its predecessor, with the
+/// root spending an ON-CHAIN outpoint that must be unspent and confirmed. Script-verifies every
+/// branch input (consensus rules), so a co-signed-but-invalid chain cannot be accepted. Returns
+/// the coin status derived from the root confirmation depth.
+async fn validate_branch(
+    electrum_client: &electrum_client::Client,
+    branch_txs: &[String],
+    network: &str,
+    confirmation_target: u32,
+) -> Result<CoinStatus> {
+    use bitcoin::OutPoint;
+    use std::collections::HashMap;
+
+    if branch_txs.is_empty() {
+        return Err(anyhow!("empty exit branch"));
+    }
+    let mut txs: Vec<bitcoin::Transaction> = Vec::new();
+    for tx_hex in branch_txs {
+        txs.push(bitcoin::consensus::encode::deserialize(&hex::decode(tx_hex)?)?);
+    }
+    let branch_ids: std::collections::HashSet<String> =
+        txs.iter().map(|t| t.txid().to_string()).collect();
+
+    // Collect all prevouts: from earlier branch txs, or (for the root) from chain.
+    let mut prevouts: HashMap<OutPoint, bitcoin::TxOut> = HashMap::new();
+    let mut root_outpoint: Option<mercurylib::transfer::TxOutpoint> = None;
+    for tx in &txs {
+        for input in &tx.input {
+            let prev_txid = input.previous_output.txid.to_string();
+            if branch_ids.contains(&prev_txid) {
+                let parent = txs.iter().find(|t| t.txid().to_string() == prev_txid).unwrap();
+                let out = parent
+                    .output
+                    .get(input.previous_output.vout as usize)
+                    .ok_or_else(|| anyhow!("branch link references missing output"))?;
+                prevouts.insert(input.previous_output, out.clone());
+            } else {
+                // Root input: must be on-chain, unspent and confirmed.
+                let root_hex = get_tx0(electrum_client, &prev_txid).await?;
+                let root_tx: bitcoin::Transaction =
+                    bitcoin::consensus::encode::deserialize(&hex::decode(&root_hex)?)?;
+                let out = root_tx
+                    .output
+                    .get(input.previous_output.vout as usize)
+                    .ok_or_else(|| anyhow!("branch root references missing output"))?;
+                prevouts.insert(input.previous_output, out.clone());
+                let outpoint = mercurylib::transfer::TxOutpoint {
+                    txid: prev_txid.clone(),
+                    vout: input.previous_output.vout,
+                };
+                let (unspent, status) = verify_tx0_output_is_unspent_and_confirmed(
+                    electrum_client,
+                    &outpoint,
+                    &root_hex,
+                    network,
+                    confirmation_target,
+                )
+                .await?;
+                if !unspent {
+                    return Err(anyhow!("exit-branch root output is spent"));
+                }
+                if root_outpoint.is_none() {
+                    root_outpoint = Some(outpoint);
+                }
+                if status != CoinStatus::CONFIRMED {
+                    return Err(anyhow!("exit-branch root is not confirmed"));
+                }
+            }
+        }
+    }
+    // Consensus-verify every branch tx against its prevouts (signatures + scripts).
+    for tx in &txs {
+        tx.verify(|op| prevouts.get(op).cloned())
+            .map_err(|e| anyhow!("exit-branch tx {} fails script verification: {e}", tx.txid()))?;
+    }
+    Ok(CoinStatus::CONFIRMED)
 }
 
 async fn verify_tx0_output_is_unspent_and_confirmed(electrum_client: &electrum_client::Client, tx0_outpoint: &mercurylib::transfer::TxOutpoint, tx0_hex: &str, network: &str, confirmation_target: u32) -> Result<(bool, CoinStatus)> {

@@ -3,7 +3,7 @@ use std::{cmp::Ordering, str::FromStr};
 use crate::{client_config::ClientConfig, deposit::create_tx1, sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet}, transaction::new_transaction, utils::info_config};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use mercurylib::{decode_transfer_address, transfer::sender::{create_transfer_signature, create_transfer_update_msg, TransferSenderRequestPayload, TransferSenderResponsePayload}, utils::get_blockheight, wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus, Wallet}};
+use mercurylib::{decode_transfer_address, transfer::sender::{create_transfer_signature, create_transfer_update_msg_with_branch, TransferSenderRequestPayload, TransferSenderResponsePayload}, utils::get_blockheight, wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus, Wallet}};
 use electrum_client::ElectrumApi;
 
 pub async fn create_backup_transactions(
@@ -261,7 +261,15 @@ pub async fn execute(
 
     let backup_transactions = create_backup_transactions(client_config, recipient_address, &mut wallet, &statechain_id, duplicated_indexes).await?;
 
-    let transfer_update_msg_request_payload = create_transfer_update_msg(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions)?;
+    // Off-chain sub-coins carry an exit branch (stored under "branch-<id>"): fully-signed txs
+    // linking the un-broadcast funding tx to an on-chain outpoint. Attach it so the receiver can
+    // validate and later unilaterally exit.
+    let branch_txs: Vec<String> = get_backup_txs(&client_config.pool, &wallet.name, &format!("branch-{}", statechain_id))
+        .await
+        .map(|txs| txs.iter().map(|b| b.tx.clone()).collect())
+        .unwrap_or_default();
+
+    let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs)?;
 
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/update_msg";
