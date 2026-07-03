@@ -23,6 +23,7 @@ pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
 pub mod sdk03_lightning_swap;
+pub mod sdk04_adversarial;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -45,6 +46,12 @@ async fn main() -> Result<()> {
     // settlement; preimage matches the payment hash (Spark SSP preimage-swap parity).
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("3") {
         sdk03_lightning_swap::execute().await?;
+        return Ok(());
+    }
+    // SDK adversarial guard rails (SDK_E2E=4): typed refusals, split-parent double-spend refusal,
+    // idempotent claims, double-withdraw refusal.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("4") {
+        sdk04_adversarial::execute().await?;
         return Ok(());
     }
     // Off-chain RGB split via pseudo-Spilman leaves (see docs/rgb_offchain_split_spilman.md). Needs
