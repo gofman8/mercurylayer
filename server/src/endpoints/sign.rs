@@ -44,8 +44,41 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
-    
+
         return status::Custom(Status::Unauthorized, Json(response_body));
+    }
+
+    // SE single-use enforcement (off-chain RGB tree double-spend guard): a single-use coin may be
+    // terminally spent only ONCE. The client skips the deposit unilateral-exit backup for single-use
+    // coins, so the terminal spend is the coin's FIRST finalized signature and the first double-spend
+    // attempt is the second — refuse from >= 1. Uniform across all single-use coins (fund-deposited
+    // roots and split/combine sub-coins, broadcast or un-broadcast). Normal coins (single_use=false)
+    // keep the existing re-sign behaviour.
+    if crate::database::deposit::is_single_use(&statechain_entity.pool, &statechain_id).await
+        && crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await >= 1
+    {
+        let response_body = json!({
+            "message": "single-use coin already spent (SE refuses a second spend)"
+        });
+        return status::Custom(Status::Gone, Json(response_body));
+    }
+
+    // SE epoch-deadline enforcement (Stage 4 — off-chain RGB tree exit window): once the SE's own
+    // clock passes a coin's epoch deadline, it refuses to co-sign ANY new spend. The owner must have
+    // transacted or exited before then; unilateral exit needs no SE co-signature (the owner just
+    // broadcasts an already-co-signed branch), so funds are never stuck. Coins without an epoch
+    // (epoch_deadline = NULL) are co-signable indefinitely, exactly as before.
+    if let Some(deadline) = crate::database::deposit::get_epoch_deadline(&statechain_entity.pool, &statechain_id).await {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if now >= deadline {
+            let response_body = json!({
+                "message": format!("epoch deadline passed (now={} >= deadline={}); coin must be exited unilaterally, SE refuses new co-signatures", now, deadline)
+            });
+            return status::Custom(Status::Gone, Json(response_body));
+        }
     }
 
     // This situation should not happen, as this state is only possible if the client has called signFirst, but not signSecond

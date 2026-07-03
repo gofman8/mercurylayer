@@ -106,6 +106,17 @@ pub struct Coin {
     pub withdrawal_address: Option<String>,
     pub status: CoinStatus,
     pub duplicate_index: u32,
+    /// Single-use coin (off-chain RGB tree node): the SE refuses any second spend, and the client
+    /// skips the deposit unilateral-exit backup tx (the tree branch is the exit), so the only SE
+    /// signature is the one terminal spend. Defaults false (normal re-signable coin).
+    #[serde(default)]
+    pub single_use: bool,
+    /// Epoch deadline (unix seconds): the SE refuses to co-sign any NEW spend of this coin once its
+    /// own clock passes the deadline (Stage 4 — the "active period"). Unilateral exit needs no SE
+    /// co-signature (you broadcast an already-co-signed branch), so the deadline only bounds when the
+    /// owner must transact/exit by. None = no epoch (coin is co-signable indefinitely).
+    #[serde(default)]
+    pub epoch_deadline: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -190,6 +201,16 @@ pub struct BackupTx {
     pub client_public_key: String,
     pub server_public_key: String,
     pub blinding_factor: String,
+    /// RGB consignment (base64) for this backup transaction, present only for RGB-enabled coins.
+    /// It proves the state transition that assigns the asset to this transaction's spendable output
+    /// once it is broadcast (cooperative withdrawal or unilateral exit). Relayed in-band with the
+    /// Mercury transfer message; the server treats it as opaque.
+    #[serde(default)]
+    pub rgb_consignment: Option<String>,
+    /// Blinding factor of the RGB seal used while coloring this transaction. The receiver needs it
+    /// to accept the consignment. Present only for RGB-enabled coins.
+    #[serde(default)]
+    pub rgb_blinding: Option<u64>,
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
@@ -201,7 +222,9 @@ pub fn get_previous_outpoint(backup_tx: &BackupTx) -> Result<TxOutpoint, Mercury
         return Err(MercuryError::Tx1HasMoreThanOneInput);
     }
 
-    if tx1.output.len() > 1 {
+    // An RGB-colored backup tx carries one extra OP_RETURN (opret commitment) output besides the
+    // single spendable output, so count only non-OP_RETURN outputs against the "one output" rule.
+    if tx1.output.iter().filter(|o| !o.script_pubkey.is_op_return()).count() > 1 {
         return Err(MercuryError::Tx1HasMoreThanOneInput);
     }
 

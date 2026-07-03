@@ -172,6 +172,8 @@ pub async fn create_backup_transactions(
             client_public_key: coin.user_pubkey.clone(),
             server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
             blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
+            rgb_consignment: None,
+            rgb_blinding: None,
         };
 
         filtered_transactions.push(backup_tx);
@@ -322,7 +324,7 @@ async fn create_backup_tx_to_receiver(client_config: &ClientConfig, coin: &mut C
     Ok(signed_tx)
 }
 
-async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
+pub async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
     
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/sender";

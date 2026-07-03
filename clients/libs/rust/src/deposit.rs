@@ -1,14 +1,31 @@
 use anyhow::{anyhow, Result, Ok};
-use mercurylib::{deposit::{create_deposit_msg1, create_aggregated_address}, wallet::{Wallet, BackupTx, Coin}, transaction:: get_user_backup_address, utils::get_blockheight};
+use mercurylib::{deposit::{create_deposit_msg1_with_options, create_aggregated_address}, wallet::{Wallet, BackupTx, Coin}, transaction:: get_user_backup_address, utils::get_blockheight};
 
 use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}, transaction::new_transaction, utils::info_config};
 
 pub async fn get_deposit_bitcoin_address(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32) -> Result<String> {
+    get_deposit_bitcoin_address_inner(client_config, wallet_name, token_id, amount, false, None).await
+}
+
+/// Open a **single-use** deposit address: the SE refuses any second spend once it co-signs one
+/// terminal spend of this coin (the off-chain RGB split/combine double-spend guard).
+pub async fn get_deposit_bitcoin_address_single_use(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32) -> Result<String> {
+    get_deposit_bitcoin_address_inner(client_config, wallet_name, token_id, amount, true, None).await
+}
+
+/// Open a single-use deposit address with an **epoch deadline** (unix seconds, Stage 4): the SE
+/// refuses to co-sign any new spend once its own clock passes `epoch_deadline`, so the owner must
+/// transact or exit before then. Unilateral exit needs no SE co-signature.
+pub async fn get_deposit_bitcoin_address_single_use_epoch(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32, epoch_deadline: u64) -> Result<String> {
+    get_deposit_bitcoin_address_inner(client_config, wallet_name, token_id, amount, true, Some(epoch_deadline)).await
+}
+
+async fn get_deposit_bitcoin_address_inner(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32, single_use: bool, epoch_deadline: Option<u64>) -> Result<String> {
 
     let token_id = uuid::Uuid::parse_str(&token_id)?;
     // println!("Deposit: {} {} {}", wallet_name, token_id, amount);
     let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let mut wallet = init(&client_config, &wallet, token_id).await?;
+    let mut wallet = init(&client_config, &wallet, token_id, single_use, epoch_deadline).await?;
 
     let coin = wallet.coins.last_mut().unwrap();
 
@@ -17,6 +34,8 @@ pub async fn get_deposit_bitcoin_address(client_config: &ClientConfig, wallet_na
     coin.amount = Some(amount);
     coin.aggregated_address = Some(aggregated_public_key.aggregate_address.clone());
     coin.aggregated_pubkey = Some(aggregated_public_key.aggregate_pubkey);
+    coin.single_use = single_use;
+    coin.epoch_deadline = epoch_deadline;
 
     update_wallet(&client_config.pool, &wallet).await?;
 
@@ -69,6 +88,8 @@ pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_ne
         client_public_key: coin.user_pubkey.clone(),
         server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
         blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
+        rgb_consignment: None,
+        rgb_blinding: None,
     };
 
     let block_height = Some(get_blockheight(&backup_tx)?);
@@ -77,7 +98,7 @@ pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_ne
     Ok(backup_tx)
 }
 
-pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid::Uuid) -> Result<Wallet> {
+pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid::Uuid, single_use: bool, epoch_deadline: Option<u64>) -> Result<Wallet> {
 
     let mut wallet = wallet.clone();
 
@@ -87,7 +108,7 @@ pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid:
 
     update_wallet(&client_config.pool, &wallet).await?;
 
-    let deposit_msg_1 = create_deposit_msg1(&coin, &token_id.to_string())?;
+    let deposit_msg_1 = create_deposit_msg1_with_options(&coin, &token_id.to_string(), single_use, epoch_deadline)?;
 
     // println!("deposit_msg_1: {:?}", deposit_msg_1);
 

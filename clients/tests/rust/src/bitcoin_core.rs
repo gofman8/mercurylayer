@@ -1,5 +1,30 @@
-use std::{process::Command, thread};
+use std::{env, process::Command, thread};
 use anyhow::{anyhow, Result, Ok};
+
+// When `RLN_REGTEST` points at the rgb-lightning-node `regtest.sh` script, bitcoind is driven
+// through that regtest harness (bitcoind + electrs:50001 + proxy:3000) instead of the Mercury
+// token-servers `esplora-container`. This lets the RGB e2e run against the rgb-lightning-node
+// regtest as requested, without breaking the existing tests (which use the default path).
+fn rln_script() -> Option<String> {
+    env::var("RLN_REGTEST").ok().filter(|s| !s.is_empty())
+}
+
+fn rln_bitcoind_container() -> String {
+    env::var("RLN_BITCOIND_CONTAINER")
+        .unwrap_or_else(|_| "rgb-lightning-node-bitcoind-1".to_string())
+}
+
+fn run(cmd: &mut Command) -> Result<String> {
+    let output = cmd.output().map_err(|e| anyhow!("failed to spawn command: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(anyhow!(
+            "command failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
 
 pub fn get_container_id() -> Result<String> {
     // First, get the container ID by running the docker ps command
@@ -44,6 +69,13 @@ pub fn sendtoaddress(amount_in_sats: u32, address: &str) -> Result<String> {
 
     let amount = amount_in_sats as f64 / 100_000_000.0;
 
+    if let Some(script) = rln_script() {
+        return run(Command::new(&script)
+            .arg("sendtoaddress")
+            .arg(address)
+            .arg(format!("{:.8}", amount)));
+    }
+
     let bitcoin_command = format!(
         "cli sendtoaddress {} {}", address, amount
     );
@@ -52,6 +84,13 @@ pub fn sendtoaddress(amount_in_sats: u32, address: &str) -> Result<String> {
 }
 
 pub fn generatetoaddress(num_blocks: u32, address: &str) -> Result<String> {
+
+    if let Some(script) = rln_script() {
+        // regtest.sh mines to its own "miner" wallet; the destination address is irrelevant here.
+        let res = run(Command::new(&script).arg("mine").arg(num_blocks.to_string()));
+        thread::sleep(std::time::Duration::from_secs(1));
+        return res;
+    }
 
     let bitcoin_command = format!(
         "cli generatetoaddress {} {}", num_blocks, address
@@ -66,6 +105,18 @@ pub fn generatetoaddress(num_blocks: u32, address: &str) -> Result<String> {
 }
 
 pub fn getnewaddress() -> Result<String> {
+
+    if rln_script().is_some() {
+        return run(Command::new("docker")
+            .arg("exec")
+            .arg("-u")
+            .arg("blits")
+            .arg(rln_bitcoind_container())
+            .arg("bitcoin-cli")
+            .arg("-regtest")
+            .arg("-rpcwallet=miner")
+            .arg("getnewaddress"));
+    }
 
     let bitcoin_command = format!(
         "cli getnewaddress"

@@ -11,7 +11,9 @@ use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wal
 
 struct DepositResult {
     activity: Activity,
-    backup_tx: BackupTx,
+    /// None for single-use coins (off-chain RGB tree nodes): they skip the unilateral-exit backup tx,
+    /// so the SE produces exactly one signature (the terminal spend) and single-use is `>=1`.
+    backup_tx: Option<BackupTx>,
 }
 
 async fn check_deposit(client_config: &ClientConfig, coin: &mut Coin, wallet_netwotk: &str) -> Result<Option<DepositResult>> {
@@ -68,7 +70,13 @@ async fn check_deposit(client_config: &ClientConfig, coin: &mut Coin, wallet_net
     
         coin.status = CoinStatus::IN_MEMPOOL;
 
-        let backup_tx = create_tx1(client_config, coin, wallet_netwotk, 1u32).await?;
+        // Single-use coins skip the unilateral-exit backup tx (the tree branch is the exit), so the SE
+        // co-signs only the one terminal spend and single-use enforcement is a clean `>= 1`.
+        let backup_tx = if coin.single_use {
+            None
+        } else {
+            Some(create_tx1(client_config, coin, wallet_netwotk, 1u32).await?)
+        };
 
         let activity_utxo = format!("{}:{}", utxo.tx_hash.to_string(), utxo.tx_pos);
 
@@ -243,10 +251,10 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
             if deposit_result.is_some() {
                 let deposit_result = deposit_result.unwrap();
                 let activity = deposit_result.activity;
-                let backup_tx = deposit_result.backup_tx;
-
                 wallet.activities.push(activity);
-                insert_backup_txs(&client_config.pool, &wallet.name, &coin.statechain_id.as_ref().unwrap(), &[backup_tx].to_vec()).await?;
+                if let Some(backup_tx) = deposit_result.backup_tx {
+                    insert_backup_txs(&client_config.pool, &wallet.name, &coin.statechain_id.as_ref().unwrap(), &[backup_tx].to_vec()).await?;
+                }
             }
         } else if coin.status == CoinStatus::IN_TRANSFER {
 

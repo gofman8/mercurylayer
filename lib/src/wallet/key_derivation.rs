@@ -132,6 +132,8 @@ impl Wallet {
             withdrawal_address: None,
             status: CoinStatus::INITIALISED,
             duplicate_index: 0,
+            single_use: false,
+            epoch_deadline: None,
         };
 
         Ok(coin)
