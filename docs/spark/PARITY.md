@@ -27,23 +27,23 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 
 | Spark method | Status | Mechanism |
 |---|---|---|
-| `initialize({mnemonic, network, options})` | NEW | wallet create/restore from mnemonic (Mercury key derivation), config = SE URL + electrum + RGB proxy |
-| `getIdentityPublicKey` / `getSparkAddress` | NEW | identity key = wallet root; bech32m address encode |
-| `getBalance` (BTC + tokenBalances) | NEW | sum coin amounts by status + rgb-lib per-asset balances across registered coins |
-| `getSingleUseDepositAddress` | NATIVE | Mercury deposit init → aggregated address |
+| `initialize({mnemonic, network, options})` | **DONE** | `SparkWallet::initialize(SdkConfig, Option<mnemonic>)` |
+| `getIdentityPublicKey` / `getSparkAddress` | **DONE** | stable `ml1…/tml1…` statechain address |
+| `getBalance` (BTC + tokenBalances) | **DONE** | available/pending/in-transfer sats + per-asset RGB balances |
+| `getSingleUseDepositAddress` | **DONE** | `get_deposit_address(amount)` |
 | `getStaticDepositAddress` / `queryStaticDepositAddresses` | PARTIAL | Mercury addresses are per-coin; SDK re-issues a fresh deposit slot bound to the same key on use + duplicate detection (`check_for_duplicated`) covers reuse. Documented difference. |
-| `claimDeposit` / auto-claim | NEW | SDK polling loop: detect UTXO at deposit address → update coin → auto-confirm (Spark's deposit-confirmation polling equivalent) |
-| `transfer({receiverSparkAddress, amountSats})` | NATIVE+NEW | Mercury transfer_sender/receiver (key handover, statechain_id rotation) wrapped with **automatic amount-making**: exact-amount coin = auto split/combine of owned coins before transfer |
-| `transferTokens({tokenId, receiver, amount})` | PORT+NEW | RGB transfer over statechain: colored split (change stays) / anchor-refresh self-transfer / off-chain consignment + validate_offchain_chain |
+| `claimDeposit` / auto-claim | **DONE** | `claim()` + `start_background()` watcher, `DepositConfirmed` events |
+| `transfer({receiverSparkAddress, amountSats})` | **DONE** | exact-subset selection OR off-chain split minting the exact amount; **branch-carrying transfers** let receivers verify un-broadcast sub-coins (consensus-validated back to an on-chain root) |
+| `transferTokens({tokenId, receiver, amount})` | **DONE** | colored off-chain split + handover; consignment rides the transfer message; receiver books under the consignment's VERIFIED contract id (sdk02 green) |
 | `getTransfers` / `getTransfer` | NEW | activity log (Mercury activities + RGB transfers) |
-| `payLightningInvoice` | NATIVE (protocol) | Mercury **lightning latch** (server endpoints on dev): preimage-gated transfer to the LSP counterparty = Spark's preimage swap REASON_SEND |
+| `payLightningInvoice` | **DONE (legs)** | `start_lightning_swap` / `get_swap_payment_hash` / `settle_lightning_swap` on the Mercury latch (sdk03 green); BOLT11 orchestration stays in the LSP's node |
 | `createLightningInvoice` | PARTIAL | latch receive leg: invoice created by LSP with payment_hash bound to a latch transfer; SDK exposes the flow. Single SE holds the preimage gate (Spark splits it across SOs via VSS — N/A with one SE). |
-| `withdraw({onchainAddress, exitSpeed})` | NATIVE | Mercury withdraw: SE co-signs direct spend to L1 address (no SSP/connector needed). exitSpeed → fee rate. |
-| `unilateralExit` / `checkTimelock` | NATIVE+PORT | flat coin: broadcast backup tx after locktime; tree sub-coin: broadcast the branch (split/combine chain) — RGB anchors settle on broadcast |
+| `withdraw({onchainAddress, exitSpeed})` | **DONE** | SE co-signed direct spend; sub-coin branches auto-materialize; fee_rate param = exitSpeed |
+| `unilateralExit` / `checkTimelock` | **DONE** | branch (no locktime) + stored pre-signed backup (locktime-gated); coin locktimes visible on the record |
 | `getWithdrawalFeeQuote` / fee estimates | NEW | electrum fee estimation; simple quote (no SSP pricing) |
-| events (`TransferClaimed`, `DepositConfirmed`, balance updates) | NEW | SDK event loop (poll-based; Mercury has no server stream) → PARTIAL: no server push, documented |
+| events (`TransferClaimed`, `DepositConfirmed`, balance updates) | **DONE (poll)** | broadcast-channel events from the watcher; + `TokenTransferClaimed`; no server push (documented) |
 | `signMessageWithIdentityKey` / validate | NEW | Schnorr sign/verify with identity key |
-| leaf optimization / `optimizeLeaves` / swap service | N/A→NEW | unnecessary as a service: exact amounts via multi-input combine + split (PORT). SDK still auto-consolidates dust coins (combine) opportunistically. |
+| leaf optimization / `optimizeLeaves` / swap service | N/A (superseded) | exact amounts are native (off-chain split); no SSP swap pools needed. Opportunistic dust consolidation = backlog. |
 | HTLC create/claim (`createHTLC`, `claimHTLC`) | PARTIAL | Mercury atomic transfer (tb03) + latch = preimage-gated transfers; generic HTLC API in SDK backlog |
 | Spark invoices (`createSatsInvoice`, `fulfillSparkInvoice`) | NEW | invoice fields in the address encoding + SDK fulfil (auto pay to embedded amount/asset) |
 | webhooks | N/A | server-side feature; poll/events instead (documented) |
@@ -52,11 +52,11 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 
 | Spark method | Status | RGB mechanism |
 |---|---|---|
-| `createToken({name, ticker, decimals, maxSupply, isFreezable})` | NEW | `issue_asset_nia` (fixed supply) or `issue_asset_ifa` (inflatable) on a statechain-funded UTXO; metadata = RGB contract fields |
+| `createToken({name, ticker, decimals, maxSupply, isFreezable})` | **DONE** | `issue_token` — NIA issued + deposited onto a statechain coin in one colored tx (sdk02 green) |
 | `mintTokens` | PARTIAL | NIA: full supply at issuance (mint-at-create). IFA: inflate op = true mint. SDK picks by asset schema. |
 | `burnTokens` | PARTIAL | IFA burn op; NIA: send-to-provably-unspendable documented |
 | `freezeTokens` / `unfreezeTokens` | N/A | RGB has no issuer freeze for fungible assets — client-side validation makes issuer freeze meaningless without consensus. Documented with rationale (this is a *feature* of RGB's trust model). |
-| `getIssuerTokenBalances` / metadata / distribution | NEW | rgb-lib balance/metadata per contract; distribution = issued − burned |
+| `getIssuerTokenBalances` / metadata / distribution | **DONE** | `get_token_balances` (settled/total per asset) |
 | token identifier (bech32m `btkn1…`) | NEW | RGB contract id (already string-encoded) exposed as the token identifier |
 
 ## Test parity (tracks)
