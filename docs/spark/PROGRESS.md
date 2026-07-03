@@ -26,7 +26,7 @@ single-use+epoch inside trees, decrementing backups on flat coins.
 
 | Step | Status | Notes |
 |---|---|---|
-| RLN-1 harness: RLN API survey + 2-node regtest LN setup + BOLT11 smoke | **in progress** | |
+| RLN-1 harness: RLN API survey + 2-node regtest LN setup + BOLT11 smoke | **DONE** | rln.rs harness; LN_SMOKE=1 green (real channel + payment). RLN bin: build UTEXO fork w/ `git submodule update --init` first. Hodl invoices: /lninvoice payment_hash param + /claimhodlinvoice. Latch facts: preimage release gated on locked=false (confirm-first) ✓ receive-flow atomic as-is; batch EXPIRY kills the claim (no auto-unlock) → pay-flow needs SE unlock-by-preimage extension. |
 | RLN-2 SSP service (swap-out = pay invoice, swap-in = receive) + SDK client + E2E both directions | pending | SDK_E2E=5 (pay), SDK_E2E=6 (receive) |
 | RLN-3 practical unilateral exit: sdk07 E2E (mine past locktime) + estimate_exit_cost + docs | pending | |
 | RLN-4 invalidation design doc (Spark/Ark/Second/SuperScalar) + single-use on tree nodes + epoch on leaves | pending | |

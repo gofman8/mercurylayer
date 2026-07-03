@@ -24,6 +24,7 @@ pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
 pub mod sdk03_lightning_swap;
 pub mod sdk04_adversarial;
+pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
 
@@ -46,6 +47,19 @@ async fn main() -> Result<()> {
     // settlement; preimage matches the payment hash (Spark SSP preimage-swap parity).
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("3") {
         sdk03_lightning_swap::execute().await?;
+        return Ok(());
+    }
+    // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
+    if std::env::var("LN_SMOKE").as_deref() == std::result::Result::Ok("1") {
+        let (a, b) = rln::setup_ln_pair("/tmp/rln-smoke").await?;
+        let invoice = b.ln_invoice(100_000, None, 300).await?;
+        let hash = a.send_payment(&invoice).await?;
+        for _ in 0..30 {
+            if b.invoice_status(&invoice).await? == "Succeeded" { break; }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        assert_eq!(b.invoice_status(&invoice).await?, "Succeeded");
+        println!("LN SMOKE - SUCCESS: A paid B's 100k-msat invoice over a real channel (hash {hash})");
         return Ok(());
     }
     // SDK adversarial guard rails (SDK_E2E=4): typed refusals, split-parent double-spend refusal,
