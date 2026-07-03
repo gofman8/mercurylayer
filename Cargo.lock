@@ -2753,6 +2753,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercury-spark-sdkd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mercury-spark-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mercury-wasm"
 version = "0.1.0"
 dependencies = [

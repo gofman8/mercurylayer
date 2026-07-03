@@ -1,0 +1,16 @@
+[package]
+name = "mercury-spark-sdkd"
+version = "0.1.0"
+edition = "2021"
+description = "JSON-lines (stdio) daemon exposing mercury-spark-sdk to non-Rust SDKs (nodejs/web)."
+
+[[bin]]
+name = "mercury-spark-sdkd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0.163", features = ["derive"] }
+serde_json = "1.0.96"
+tokio = { version = "1.27.0", features = ["full"] }
+mercury-spark-sdk = { path = "../../libs/rust-sdk" }
