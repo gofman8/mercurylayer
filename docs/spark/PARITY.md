@@ -38,7 +38,8 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 | `getStaticDepositAddress` / `queryStaticDepositAddresses` | PARTIAL | Mercury addresses are per-coin; SDK re-issues a fresh deposit slot bound to the same key on use + duplicate detection (`check_for_duplicated`) covers reuse. Documented difference. |
 | `claimDeposit` / auto-claim | **DONE** | `claim()` + `start_background()` watcher, `DepositConfirmed` events |
 | `transfer({receiverSparkAddress, amountSats})` | **DONE** | exact-subset selection OR off-chain split minting the exact amount; **branch-carrying transfers** let receivers verify un-broadcast sub-coins (consensus-validated back to an on-chain root) |
-| `transferTokens({tokenId, receiver, amount})` | **DONE** | colored off-chain split + handover; consignment rides the transfer message; receiver books under the consignment's VERIFIED contract id (sdk02 green) |
+| `transferTokens({tokenId, receiver, amount})` | **DONE** | colored off-chain split + handover; consignment rides the transfer message; receiver books the consignment-VERIFIED contract id AND the consignment-derived AMOUNT (envelope amount is only a cross-checked hint — G2, sdk02) |
+| `batchTransferTokens` | **DONE** | one colored split -> N recipient pieces + change, per-piece envelopes (G3, sdk09) |
 | `getTransfers` / `getTransfer` | NEW | activity log (Mercury activities + RGB transfers) |
 | `payLightningInvoice` | **DONE (legs)** | `start_lightning_swap` / `get_swap_payment_hash` / `settle_lightning_swap` on the Mercury latch (sdk03 green); BOLT11 orchestration stays in the LSP's node |
 | `createLightningInvoice` | PARTIAL | latch receive leg: invoice created by LSP with payment_hash bound to a latch transfer; SDK exposes the flow. Single SE holds the preimage gate (Spark splits it across SOs via VSS — N/A with one SE). |
@@ -57,8 +58,8 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 | Spark method | Status | RGB mechanism |
 |---|---|---|
 | `createToken({name, ticker, decimals, maxSupply, isFreezable})` | **DONE** | `issue_token` — NIA issued + deposited onto a statechain coin in one colored tx (sdk02 green) |
-| `mintTokens` | PARTIAL | NIA: full supply at issuance (mint-at-create). IFA: inflate op = true mint. SDK picks by asset schema. |
-| `burnTokens` | PARTIAL | IFA burn op; NIA: send-to-provably-unspendable documented |
+| `mintTokens` (IFA) | **DONE** | `issue_inflatable_token` (IFA) + `mint_tokens` = on-chain inflate in the engine, minted supply bound to a fresh statechain coin (G3, sdk09). NIA supply is fixed at issuance by design. |
+| `burnTokens` | **DONE** | `burn_tokens` burns engine-held free balance (on-chain). Statechain-bound supply must be exited first (documented). |
 | `freezeTokens` / `unfreezeTokens` | N/A | RGB has no issuer freeze for fungible assets — client-side validation makes issuer freeze meaningless without consensus. Documented with rationale (this is a *feature* of RGB's trust model). |
 | `getIssuerTokenBalances` / metadata / distribution | **DONE** | `get_token_balances` (settled/total per asset) |
 | token identifier (bech32m `btkn1…`) | NEW | RGB contract id (already string-encoded) exposed as the token identifier |

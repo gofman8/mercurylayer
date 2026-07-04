@@ -17,7 +17,15 @@ Branches: mercurylayer `feat/spark` · rgb-lib `feat/spark` (both on gofman8/UTE
 | P5 nodejs binding (`mercury-spark-sdkd` daemon + @mercury/spark-sdk) | 769fd34 | stdio protocol driven live |
 | P8 final verification 13/13 | 439e2f4 | SDK1-4 + RGB1-8 + upstream in one pass |
 
-## In progress — RLN + SSP directive (2026-07-03)
+## Gap closure (2026-07-04) — all three remaining gaps CLOSED
+
+| Gap | Status | Proof |
+|---|---|---|
+| G1 receiver-side terminal-parent verification | **DONE** (f8ede8a) | TransferMsg.terminal_parents; receiver GET /statechain/spend_budget per ancestor requires terminal; SDK records ancestor chain per sub-coin. sdk10 GREEN (honest accepted, non-terminal-ancestor REJECTED). |
+| G2 consignment-derived token amounts | **DONE** (d9e043a/c337354) | rgb-lib offchain_assigned_amount + bridge accept_offchain_amount; receiver books consignment amount, envelope amount is a cross-checked hint. sdk02 GREEN. |
+| G3 IFA + mint + burn + batch | **DONE** (f8ede8a) | issue_inflatable_token / mint_tokens (on-chain inflate bound to coin) / burn_tokens / batch_transfer_tokens (N recipients, one split). sdk09 GREEN. |
+
+## Historical — RLN + SSP directive (2026-07-03)
 
 Requirements: real Lightning flows over UTEXO-Protocol/rgb-lightning-node (both directions,
 tested on regtest); an actual **SSP service**; practical unilateral exit (tests + cost
