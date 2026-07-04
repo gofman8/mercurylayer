@@ -77,6 +77,36 @@ pub enum SdkError {
     TokensNotConfigured,
 }
 
+/// A spendable/known coin, for the query API (Spark's leaf/UTXO inventory).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoinInfo {
+    pub statechain_id: Option<String>,
+    pub amount_sats: u64,
+    pub status: String,
+    pub utxo_txid: Option<String>,
+    pub utxo_vout: Option<u32>,
+    /// True for an off-chain sub-coin (its funding tx is un-broadcast).
+    pub off_chain: bool,
+}
+
+/// Fee quote for a withdrawal / cooperative exit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WithdrawalFeeQuote {
+    pub n_coins: u32,
+    pub est_vbytes: u64,
+    pub fee_rate_sat_vb: f64,
+    pub fee_sats: u64,
+}
+
+/// One token-contract transaction (query API): (kind, status, amount, txid).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenTx {
+    pub kind: String,
+    pub status: String,
+    pub amount: u64,
+    pub txid: String,
+}
+
 /// Cost/readiness estimate for unilaterally exiting one coin.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExitCostEstimate {

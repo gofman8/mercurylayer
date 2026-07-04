@@ -296,6 +296,27 @@ impl SparkWallet {
         Ok((txid, vout))
     }
 
+    /// L1 (Bitcoin) address for token operations — where to send sats to fund issuance/mint.
+    /// Alias of [`Self::get_token_funding_address`]; mirrors Spark's `getTokenL1Address`.
+    pub async fn get_token_l1_address(&self) -> Result<String> {
+        self.get_token_funding_address().await
+    }
+
+    /// Transaction history for a token contract (Spark's `queryTokenTransactions`):
+    /// `(kind, status, amount, txid)` per transfer known to the RGB engine.
+    pub async fn query_token_transactions(&self, asset_id: &str) -> Result<Vec<crate::types::TokenTx>> {
+        if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
+            return Err(SdkError::TokensNotConfigured.into());
+        }
+        let rgb = self.rgb().await?;
+        let w = rgb.as_ref().unwrap();
+        let rows = tokio::task::block_in_place(|| w.transfers(asset_id))?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, status, amount, txid)| crate::types::TokenTx { kind, status, amount, txid })
+            .collect())
+    }
+
     /// Token balances across this wallet's registered coins.
     pub async fn get_token_balances(&self) -> Result<Vec<TokenBalance>> {
         if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {

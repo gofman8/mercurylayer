@@ -85,16 +85,55 @@ impl SparkWallet {
         self.inner.events_tx.subscribe()
     }
 
-    /// The wallet's identity public key (first derived user key).
-    pub async fn get_identity_public_key(&self) -> Result<String> {
+    /// Fixed derivation path for the wallet's stable identity key (distinct from coin keys at
+    /// m/86h/0h/0h and auth keys at m/89h/0h/0h).
+    const IDENTITY_PATH: &'static str = "m/1000h/0h/0h";
+
+    /// The wallet's stable identity keypair, deterministically derived from the seed — it does not
+    /// change as coins come and go (unlike per-coin keys).
+    async fn identity_keypair(&self) -> Result<(bitcoin::secp256k1::SecretKey, bitcoin::secp256k1::PublicKey)> {
         let record = self.record().await?;
-        let coin = record
-            .coins
-            .first()
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| record.get_new_coin().map_err(|e| anyhow!("{e:?}")))?;
-        Ok(coin.user_pubkey)
+        let kd = record
+            .generate_new_key(Self::IDENTITY_PATH, 0, 0)
+            .map_err(|e| anyhow!("identity key derivation failed: {e:?}"))?;
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&kd.secret_key.secret_bytes())?;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        Ok((sk, pk))
+    }
+
+    /// The wallet's stable identity public key (hex, 33-byte compressed).
+    pub async fn get_identity_public_key(&self) -> Result<String> {
+        let (_, pk) = self.identity_keypair().await?;
+        Ok(hex::encode(pk.serialize()))
+    }
+
+    /// Sign a message with the identity key (BIP340 Schnorr over sha256(message)). Returns the
+    /// 64-byte signature (hex). Mirrors Spark's `signMessageWithIdentityKey`.
+    pub async fn sign_message_with_identity_key(&self, message: &[u8]) -> Result<String> {
+        use bitcoin::secp256k1::{KeyPair, Message, Secp256k1};
+        use sha2::{Digest, Sha256};
+        let (sk, _) = self.identity_keypair().await?;
+        let secp = Secp256k1::new();
+        let keypair = KeyPair::from_secret_key(&secp, &sk);
+        let digest = Sha256::digest(message);
+        let msg = Message::from_slice(&digest)?;
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        Ok(hex::encode(sig.as_ref()))
+    }
+
+    /// Verify a Schnorr signature over sha256(message) against a compressed identity public key
+    /// (hex). Mirrors Spark's `validateMessageWithIdentityKey`.
+    pub fn validate_message_with_identity_key(message: &[u8], signature_hex: &str, public_key_hex: &str) -> Result<bool> {
+        use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
+        let secp = Secp256k1::new();
+        let sig = Signature::from_slice(&hex::decode(signature_hex)?)?;
+        let pk = bitcoin::secp256k1::PublicKey::from_slice(&hex::decode(public_key_hex)?)?;
+        let xonly = XOnlyPublicKey::from(pk);
+        let digest = Sha256::digest(message);
+        let msg = Message::from_slice(&digest)?;
+        Ok(secp.verify_schnorr(&sig, &msg, &xonly).is_ok())
     }
 
     /// The wallet's stable statechain address (bech32m `ml1…`/`tml1…`) — hand this to senders.
@@ -443,6 +482,88 @@ impl SparkWallet {
         Ok(self.record().await?.activities)
     }
 
+    /// Transfer history restricted to sends/receives (Spark's `getTransfers`). Deposits/withdraws
+    /// come from `get_activities`.
+    pub async fn get_transfers(&self) -> Result<Vec<mercurylib::wallet::Activity>> {
+        Ok(self
+            .record()
+            .await?
+            .activities
+            .into_iter()
+            .filter(|a| a.action == "Transfer" || a.action == "Receive")
+            .collect())
+    }
+
+    /// Look up a single activity by its utxo (`txid:vout` or `txid`), Spark's `getTransfer(id)`.
+    pub async fn get_transfer(&self, utxo: &str) -> Result<Option<mercurylib::wallet::Activity>> {
+        Ok(self
+            .record()
+            .await?
+            .activities
+            .into_iter()
+            .find(|a| a.utxo == utxo || a.utxo.starts_with(utxo)))
+    }
+
+    /// The wallet's coins (Spark's leaf/UTXO inventory). Off-chain sub-coins are flagged.
+    pub async fn list_coins(&self) -> Result<Vec<crate::types::CoinInfo>> {
+        let record = self.record().await?;
+        let mut out = Vec::new();
+        for c in &record.coins {
+            if c.duplicate_index != 0 {
+                continue;
+            }
+            let has_branch = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("branch-{}", c.statechain_id.clone().unwrap_or_default()),
+            )
+            .await
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+            out.push(crate::types::CoinInfo {
+                statechain_id: c.statechain_id.clone(),
+                amount_sats: c.amount.unwrap_or_default() as u64,
+                status: format!("{}", c.status),
+                utxo_txid: c.utxo_txid.clone(),
+                utxo_vout: c.utxo_vout,
+                off_chain: has_branch,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Estimate the cooperative-withdrawal fee for `coins` (or all confirmed coins) at the current
+    /// electrum-estimated feerate. Spark's `getWithdrawalFeeQuote`.
+    pub async fn get_withdrawal_fee_quote(
+        &self,
+        statechain_ids: Option<Vec<String>>,
+    ) -> Result<crate::types::WithdrawalFeeQuote> {
+        use electrum_client::ElectrumApi;
+        let record = self.record().await?;
+        let n = match &statechain_ids {
+            Some(ids) => ids.len() as u32,
+            None => record
+                .coins
+                .iter()
+                .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+                .count() as u32,
+        };
+        // Electrum estimatefee returns BTC/kvB; convert to sat/vB, floor at 1.
+        let btc_per_kvb = self.inner.cc.electrum_client.estimate_fee(2).unwrap_or(0.0);
+        let mut fee_rate = (btc_per_kvb * 100_000.0).max(1.0); // BTC/kvB -> sat/vB
+        if !fee_rate.is_finite() {
+            fee_rate = 1.0;
+        }
+        // A cooperative withdraw is ~1 taproot key-spend input + 1 output ≈ 111 vB per coin.
+        let est_vbytes = (n as u64) * 111;
+        Ok(crate::types::WithdrawalFeeQuote {
+            n_coins: n,
+            est_vbytes,
+            fee_rate_sat_vb: fee_rate,
+            fee_sats: (est_vbytes as f64 * fee_rate).ceil() as u64,
+        })
+    }
+
     /// The underlying Mercury client config (advanced integrations, e.g. the SSP service).
     pub fn client_config(&self) -> &ClientConfig {
         &self.inner.cc
@@ -511,4 +632,32 @@ async fn build_wallet_record(
         record.mnemonic = m.to_string();
     }
     Ok(record)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::SparkWallet;
+    use bitcoin::secp256k1::{KeyPair, Message, Secp256k1};
+    use sha2::{Digest, Sha256};
+
+    // REQ (message signing): a Schnorr signature over sha256(msg) validates against the signer's
+    // compressed pubkey, and a tampered message does not.
+    #[test]
+    fn sign_validate_roundtrip() {
+        let secp = Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x42u8; 32]).unwrap();
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let pk_hex = hex::encode(pk.serialize());
+
+        let msg = b"spark parity attestation";
+        let digest = Sha256::digest(msg);
+        let m = Message::from_slice(&digest).unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(&m, &kp);
+        let sig_hex = hex::encode(sig.as_ref());
+
+        assert!(SparkWallet::validate_message_with_identity_key(msg, &sig_hex, &pk_hex).unwrap());
+        // tampered message fails
+        assert!(!SparkWallet::validate_message_with_identity_key(b"other message", &sig_hex, &pk_hex).unwrap());
+    }
 }

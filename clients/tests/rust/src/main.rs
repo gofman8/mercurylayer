@@ -30,6 +30,7 @@ pub mod sdk07_unilateral_exit;
 pub mod sdk08_terminal_node;
 pub mod sdk09_ifa_batch;
 pub mod sdk10_terminal_parent_verify;
+pub mod sdk11_parity_methods;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -92,6 +93,11 @@ async fn main() -> Result<()> {
     // Receiver terminal-parent verification (SDK_E2E=10): G1 adversarial.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("10") {
         sdk10_terminal_parent_verify::execute().await?;
+        return Ok(());
+    }
+    // Parity methods (SDK_E2E=11): identity signing, multi-recipient sats, Spark invoices, queries.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("11") {
+        sdk11_parity_methods::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

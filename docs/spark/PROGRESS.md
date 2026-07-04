@@ -17,6 +17,24 @@ Branches: mercurylayer `feat/spark` · rgb-lib `feat/spark` (both on gofman8/UTE
 | P5 nodejs binding (`mercury-spark-sdkd` daemon + @mercury/spark-sdk) | 769fd34 | stdio protocol driven live |
 | P8 final verification 13/13 | 439e2f4 | SDK1-4 + RGB1-8 + upstream in one pass |
 
+## Parity audit + new methods (2026-07-04)
+
+Fresh 3-way audit (SDK surface, protocol/proto/SIP, docs.spark.money) vs our impl. ~80% parity;
+remaining gaps are either N/A-by-design (leaf renewal, token freeze, preimage VSS, operator
+discovery, wallet-privacy, connector-tx atomicity, instant/SSP-liquidity deposits, webhooks->events)
+or ecosystem/partner (Privy, Grid, bridges, LNURL). Buildable user-facing gaps CLOSED:
+
+| Method | Status | Where |
+|---|---|---|
+| signMessage/validate (P-B) | **DONE** | sign_message_with_identity_key / validate_… (stable identity key m/1000h/0h/0h); unit + sdk11 |
+| transferV2 multi-recipient (P-D) | **DONE** | transfer_many(recipients) — one split -> N pieces + change; sdk11 |
+| Spark invoices (P-E) | **DONE** | create_sats_invoice/create_tokens_invoice/fulfill_spark_invoice (+ decode/expiry); unit + sdk11 |
+| get_transfers/get_transfer, list_coins (P-A) | **DONE** | wallet activity + coin inventory; sdk11 |
+| getWithdrawalFeeQuote (P-F) | **DONE** | get_withdrawal_fee_quote via electrum estimatefee; sdk11 |
+| getTokenL1Address, queryTokenTransactions (P-C) | **DONE** | get_token_l1_address / query_token_transactions; sdk11 |
+
+SPEC §13 (REQ-26..30, ERR-11) + PARITY rows flipped to DONE. Unit tests 17 pass. E2E: sdk11.
+
 ## Spec, tests, traced run (2026-07-04)
 
 | Item | Status | Notes |

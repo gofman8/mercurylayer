@@ -292,6 +292,28 @@ strictly finer than fixed-denomination leaves.
 
 ---
 
+## 13. Query, utility & invoice API
+
+Client-side conveniences (no new SE state); mirror Spark's query/signing/invoice surface.
+
+**REQ-26** `sign_message_with_identity_key(msg)` MUST produce a BIP340 Schnorr signature over
+`sha256(msg)` under a STABLE identity key (derived at `m/1000h/0h/0h`, unchanged as coins come and
+go); `validate_message_with_identity_key(msg, sig, pubkey)` MUST verify it and reject a tampered
+message.
+**REQ-27** `transfer_many(recipients)` MUST pay each recipient its exact amount from one off-chain
+split (N pieces + change), with the same branch + terminal-parent guarantees as a single transfer
+(REQ-17/REQ-18).
+**REQ-28** `create_sats_invoice`/`create_tokens_invoice` MUST encode {address, amount, asset?,
+memo?, expiry?} into a `sparkinv1…` string that round-trips through `decode_spark_invoice`;
+`fulfill_spark_invoice` MUST reject an expired invoice (ERR-11) and otherwise pay the embedded
+amount/asset to the embedded address.
+**REQ-29** `list_coins`/`get_transfers`/`get_transfer` MUST reflect the wallet's current coins and
+activity; `get_withdrawal_fee_quote` MUST return a positive fee at the electrum-estimated rate.
+**REQ-30** `get_token_l1_address` returns the RGB engine funding address; `query_token_transactions`
+returns the contract's transfer history.
+
+- **ERR-11** `fulfill_spark_invoice` on an expired invoice → `invoice expired at …`.
+
 ## 12. Traceability
 
 Each requirement/invariant is verified by at least one test. Pure-logic items have unit tests;
@@ -318,6 +340,10 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | ERR-9 | `sdk04` (`unit::select` insufficient) |
 | ERR-10 | `sdk04` (double-withdraw / split-parent refusal) |
 | INV-22 | `sdk01`/`sdk09` (exact-amount splits) |
+| REQ-26 | `sdk11`; `unit::identity_tests::sign_validate_roundtrip` |
+| REQ-27 | `sdk11` (multi-recipient) |
+| REQ-28, ERR-11 | `sdk11`; `unit::invoice::tests` (roundtrip, reject) |
+| REQ-29, REQ-30 | `sdk11` (query API + fee quote) |
 
 Unit tests live in `clients/libs/rust-sdk/src/*` (`#[cfg(test)]`); E2E dispatch via
 `SDK_E2E`/`RGB_E2E` in `clients/tests/rust`; upstream Mercury suite runs by default.

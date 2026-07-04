@@ -119,6 +119,123 @@ impl SparkWallet {
         })
     }
 
+    /// Send sats to MANY recipients in one off-chain split (Spark's multi-receiver transfer): one
+    /// SE-co-signed tx carves one piece per recipient (its exact amount) plus this wallet's
+    /// change; each piece is handed over. Returns one `TransferResult` per recipient.
+    pub async fn transfer_many(
+        &self,
+        recipients: &[(String, u64)],
+    ) -> Result<Vec<TransferResult>> {
+        if recipients.is_empty() {
+            return Err(anyhow!("no recipients"));
+        }
+        let total: u64 = recipients.iter().map(|(_, a)| *a).sum();
+
+        let _guard = self.inner.wallet_lock.lock().await;
+        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+            .await?;
+        let record = self.record().await?;
+
+        // Carrier: a confirmed coin large enough for all pieces + fee reserve.
+        let carrier = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| {
+                let a = c.amount.unwrap_or_default() as u64;
+                a > total + split_fee_reserve(a)
+            })
+            .min_by_key(|c| c.amount.unwrap_or_default())
+            .cloned()
+            .ok_or_else(|| anyhow!("no confirmed coin large enough for {total} sats + fee"))?;
+        let carrier_id = carrier.statechain_id.clone().unwrap();
+        let parent_sats = carrier.amount.unwrap_or_default() as u64;
+        let fee_reserve = split_fee_reserve(parent_sats);
+        let change_sats = parent_sats - total - fee_reserve;
+
+        // One fresh slot per recipient piece + one change slot; build the N+1 plain split.
+        let mut outputs: Vec<(String, u64)> = Vec::with_capacity(recipients.len() + 1);
+        let mut piece_addrs: Vec<String> = Vec::with_capacity(recipients.len());
+        for (_, amount) in recipients {
+            let tk = self.take_token().await?;
+            let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &tk,
+                u32::try_from(*amount)?,
+            )
+            .await?;
+            outputs.push((addr.clone(), *amount));
+            piece_addrs.push(addr);
+        }
+        let change_tk = self.take_token().await?;
+        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &change_tk,
+            u32::try_from(change_sats)?,
+        )
+        .await?;
+        outputs.push((change_addr.clone(), change_sats));
+
+        // Terminal-guard the carrier (one split), then co-sign the un-broadcast split.
+        mercuryrustlib::lightning_latch::set_spend_budget(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+            1,
+        )
+        .await?;
+        let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+        )
+        .await
+        .map(|v| v.len() as u32)
+        .unwrap_or(0);
+        let mut carrier_coin = carrier;
+        let signed = self
+            .sign_split_tx(&mut carrier_coin, &outputs, parent_backups + 1)
+            .await?;
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&signed)?)?;
+        let txid = tx.txid().to_string();
+
+        // Register all sub-coins (plain split has no OP_RETURN, so vout i = i).
+        let reg: Vec<(String, u32, u64)> = outputs
+            .iter()
+            .enumerate()
+            .map(|(i, (addr, sats))| (addr.clone(), i as u32, *sats))
+            .collect();
+        let ids = self
+            .register_split_subcoins_n(&carrier_id, &signed, &txid, &reg)
+            .await?;
+
+        // Hand each recipient its piece.
+        let mut results = Vec::with_capacity(recipients.len());
+        for (i, (recipient, amount)) in recipients.iter().enumerate() {
+            let piece_id = ids[i].clone();
+            mercuryrustlib::transfer_sender::execute(
+                &self.inner.cc,
+                recipient,
+                &self.inner.config.wallet_name,
+                &piece_id,
+                None,
+                false,
+                None,
+            )
+            .await?;
+            results.push(TransferResult {
+                receiver_address: recipient.clone(),
+                total_sats: *amount,
+                coins: vec![TransferredCoin { statechain_id: piece_id, amount_sats: *amount }],
+                used_split: true,
+            });
+        }
+        Ok(results)
+    }
+
     /// Ensure this wallet holds a CONFIRMED coin of exactly `sats`, minting one via an
     /// off-chain split when needed. Returns its statechain id. (The amount-maker behind
     /// single-coin flows: Lightning swaps, latch transfers.)

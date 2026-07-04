@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod events;
+pub mod invoice;
 pub mod lightning;
 pub mod select;
 pub mod ssp;
@@ -31,5 +32,6 @@ pub mod wallet;
 
 pub use config::SdkConfig;
 pub use events::WalletEvent;
-pub use types::{Balance, ClaimResult, DepositAddressInfo, ExitCostEstimate, ExitStatus, SdkError, TokenBalance, TransferResult};
+pub use types::{Balance, ClaimResult, CoinInfo, DepositAddressInfo, ExitCostEstimate, ExitStatus, SdkError, TokenBalance, TokenTx, TransferResult, WithdrawalFeeQuote};
+pub use invoice::{SparkInvoice, decode_spark_invoice, encode_spark_invoice};
 pub use wallet::SparkWallet;

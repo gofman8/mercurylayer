@@ -40,17 +40,19 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 | `transfer({receiverSparkAddress, amountSats})` | **DONE** | exact-subset selection OR off-chain split minting the exact amount; **branch-carrying transfers** let receivers verify un-broadcast sub-coins (consensus-validated back to an on-chain root) |
 | `transferTokens({tokenId, receiver, amount})` | **DONE** | colored off-chain split + handover; consignment rides the transfer message; receiver books the consignment-VERIFIED contract id AND the consignment-derived AMOUNT (envelope amount is only a cross-checked hint — G2, sdk02) |
 | `batchTransferTokens` | **DONE** | one colored split -> N recipient pieces + change, per-piece envelopes (G3, sdk09) |
-| `getTransfers` / `getTransfer` | NEW | activity log (Mercury activities + RGB transfers) |
+| `getTransfers` / `getTransfer` | **DONE** | `get_transfers()` / `get_transfer(utxo)` over the wallet activity log (sdk11) |
+| `transferV2` (multi-recipient sats) | **DONE** | `transfer_many(recipients)` — one off-chain split -> N recipient pieces + change (sdk11) |
+| `list leaves/UTXOs` | **DONE** | `list_coins()` — coin inventory with status + off-chain flag (sdk11) |
 | `payLightningInvoice` | **DONE (legs)** | `start_lightning_swap` / `get_swap_payment_hash` / `settle_lightning_swap` on the Mercury latch (sdk03 green); BOLT11 orchestration stays in the LSP's node |
 | `createLightningInvoice` | PARTIAL | latch receive leg: invoice created by LSP with payment_hash bound to a latch transfer; SDK exposes the flow. Single SE holds the preimage gate (Spark splits it across SOs via VSS — N/A with one SE). |
 | `withdraw({onchainAddress, exitSpeed})` | **DONE** | SE co-signed direct spend; sub-coin branches auto-materialize; fee_rate param = exitSpeed |
 | `unilateralExit` / `checkTimelock` | **DONE** | branch (no locktime) + stored pre-signed backup (locktime-gated); coin locktimes visible on the record |
-| `getWithdrawalFeeQuote` / fee estimates | NEW | electrum fee estimation; simple quote (no SSP pricing) |
+| `getWithdrawalFeeQuote` / fee estimates | **DONE** | `get_withdrawal_fee_quote()` via electrum estimatefee (~111 vB/coin); `estimate_exit_cost` for unilateral (sdk07/sdk11) |
 | events (`TransferClaimed`, `DepositConfirmed`, balance updates) | **DONE (poll)** | broadcast-channel events from the watcher; + `TokenTransferClaimed`; no server push (documented) |
-| `signMessageWithIdentityKey` / validate | NEW | Schnorr sign/verify with identity key |
+| `signMessageWithIdentityKey` / validate | **DONE** | `sign_message_with_identity_key` / `validate_message_with_identity_key` — BIP340 Schnorr over a stable identity key at m/1000h/0h/0h (sdk11 + unit) |
 | leaf optimization / `optimizeLeaves` / swap service | N/A (superseded) | exact amounts are native (off-chain split); no SSP swap pools needed. Opportunistic dust consolidation = backlog. |
 | HTLC create/claim (`createHTLC`, `claimHTLC`) | PARTIAL | Mercury atomic transfer (tb03) + latch = preimage-gated transfers; generic HTLC API in SDK backlog |
-| Spark invoices (`createSatsInvoice`, `fulfillSparkInvoice`) | NEW | invoice fields in the address encoding + SDK fulfil (auto pay to embedded amount/asset) |
+| Spark invoices (`createSatsInvoice`, `createTokensInvoice`, `fulfillSparkInvoice`) | **DONE** | `create_sats_invoice` / `create_tokens_invoice` (encode address+amount+asset+memo+expiry) + `fulfill_spark_invoice` (decode, expiry-check, auto-pay); sdk11 + unit roundtrip |
 | webhooks | N/A | server-side feature; poll/events instead (documented) |
 
 ## Issuer SDK (IssuerSparkWallet → `mercury-issuer-sdk`)
@@ -62,6 +64,8 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 | `burnTokens` | **DONE** | `burn_tokens` burns engine-held free balance (on-chain). Statechain-bound supply must be exited first (documented). |
 | `freezeTokens` / `unfreezeTokens` | N/A | RGB has no issuer freeze for fungible assets — client-side validation makes issuer freeze meaningless without consensus. Documented with rationale (this is a *feature* of RGB's trust model). |
 | `getIssuerTokenBalances` / metadata / distribution | **DONE** | `get_token_balances` (settled/total per asset) |
+| `getTokenL1Address` | **DONE** | `get_token_l1_address` (RGB engine funding address) |
+| `queryTokenTransactions` | **DONE** | `query_token_transactions(asset)` -> (kind,status,amount,txid) from rgb-lib |
 | token identifier (bech32m `btkn1…`) | NEW | RGB contract id (already string-encoded) exposed as the token identifier |
 
 ## Test parity (tracks)
