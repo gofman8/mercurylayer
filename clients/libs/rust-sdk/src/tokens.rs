@@ -163,7 +163,10 @@ impl SparkWallet {
             let w = rgb.as_mut().unwrap();
             let inflation = inflation_amounts.clone();
             tokio::task::block_in_place(move || -> Result<(String, Vec<String>)> {
-                w.create_utxos(1, (deposit_sats * 4) as u32, 2)?;
+                // One colorable UTXO per allocation (the fungible supply + each inflation-right)
+                // plus a spare for the fund/witness txs; max_allocations_per_utxo is 1.
+                let utxos = (inflation.len() as u8).saturating_add(2);
+                w.create_utxos(utxos, (deposit_sats * 4) as u32, 2)?;
                 let asset_id = w.issue_ifa(ticker, name, precision, vec![supply], inflation)?;
                 let sources = w
                     .list_allocations(&asset_id)?
@@ -190,18 +193,31 @@ impl SparkWallet {
         inflation_amounts: Vec<u64>,
     ) -> Result<(String, u64)> {
         let deposit_sats: u64 = 10_000;
+        // Snapshot the allocations that already exist (incl. registered statechain coins, which
+        // list_allocations reports as colorable UTXOs) so we can isolate ONLY the freshly-minted
+        // one afterwards — otherwise binding would wrongly consume already-bound supply.
+        let before: std::collections::HashSet<String> = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().unwrap();
+            tokio::task::block_in_place(|| w.list_allocations(asset_id))?
+                .into_iter()
+                .map(|(op, _, _)| op)
+                .collect()
+        };
+
         // 1. Inflate in the engine (on-chain broadcast). Ensure a colorable UTXO exists first.
         let (inflate_txid, minted) = {
             let mut rgb = self.rgb().await?;
             let w = rgb.as_mut().unwrap();
             let inflation = inflation_amounts.clone();
             tokio::task::block_in_place(move || -> Result<(String, u64)> {
-                let _ = w.create_utxos(1, (deposit_sats * 4) as u32, 2);
+                let _ = w.create_utxos(2, (deposit_sats * 4) as u32, 2);
                 w.inflate(asset_id, inflation, 2)
             })?
         };
 
-        // 2. Wait for the inflate to confirm and the minted fungible allocation to settle.
+        // 2. Wait for the inflate to confirm and the NEW (post-snapshot) fungible allocation to
+        //    settle; use only that as the bind source.
         let mut sources: Vec<String> = Vec::new();
         for _ in 0..90 {
             let allocs = {
@@ -212,9 +228,14 @@ impl SparkWallet {
                     w.list_allocations(asset_id)
                 })?
             };
-            let settled: u64 = allocs.iter().filter(|(_, _, s)| *s).map(|(_, a, _)| *a).sum();
+            let fresh: Vec<(String, u64)> = allocs
+                .into_iter()
+                .filter(|(op, _, s)| *s && !before.contains(op))
+                .map(|(op, a, _)| (op, a))
+                .collect();
+            let settled: u64 = fresh.iter().map(|(_, a)| *a).sum();
             if settled >= minted {
-                sources = allocs.into_iter().filter(|(_, _, s)| *s).map(|(op, _, _)| op).collect();
+                sources = fresh.into_iter().map(|(op, _)| op).collect();
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -548,7 +569,7 @@ impl SparkWallet {
             }
         }
         let (mut carrier, carrier_amount) = carrier.ok_or_else(|| {
-            anyhow!("no single coin carries >= {total} of {asset_id} for the batch")
+            anyhow!("no confirmed coin carries >= {total} of {asset_id} for the batch")
         })?;
         let carrier_id = carrier.statechain_id.clone().unwrap();
         let carrier_sats = carrier.amount.unwrap_or_default() as u64;

@@ -28,6 +28,8 @@ pub mod sdk05_lightning_pay;
 pub mod sdk06_lightning_receive;
 pub mod sdk07_unilateral_exit;
 pub mod sdk08_terminal_node;
+pub mod sdk09_ifa_batch;
+pub mod sdk10_terminal_parent_verify;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -80,6 +82,16 @@ async fn main() -> Result<()> {
     // Terminal-node enforcement (SDK_E2E=8): the SE refuses any co-signature on a split parent.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("8") {
         sdk08_terminal_node::execute().await?;
+        return Ok(());
+    }
+    // IFA issuance + mint + batch token transfer (SDK_E2E=9): G3.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("9") {
+        sdk09_ifa_batch::execute().await?;
+        return Ok(());
+    }
+    // Receiver terminal-parent verification (SDK_E2E=10): G1 adversarial.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("10") {
+        sdk10_terminal_parent_verify::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
