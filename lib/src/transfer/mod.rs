@@ -103,6 +103,12 @@ pub struct TransferMsg {
     /// keeps the message wire-compatible with vanilla wallets.
     #[serde(default)]
     pub branch_txs: Vec<String>,
+    /// Statechain ids of the structural ancestor nodes (the split/combine parents) that produced
+    /// this sub-coin. The receiver must verify each is TERMINAL at the SE (its spend budget is
+    /// exhausted) before accepting — otherwise a malicious sender could later double-spend an
+    /// ancestor and invalidate the branch. Empty for ordinary on-chain coins.
+    #[serde(default)]
+    pub terminal_parents: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

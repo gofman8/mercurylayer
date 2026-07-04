@@ -269,7 +269,14 @@ pub async fn execute(
         .map(|txs| txs.iter().map(|b| b.tx.clone()).collect())
         .unwrap_or_default();
 
-    let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs)?;
+    // Structural ancestor statechain ids (stored under "parents-<id>", each row's tx field holds
+    // one id) that the receiver must verify are terminal at the SE before accepting the sub-coin.
+    let terminal_parents: Vec<String> = get_backup_txs(&client_config.pool, &wallet.name, &format!("parents-{}", statechain_id))
+        .await
+        .map(|txs| txs.iter().map(|b| b.tx.clone()).collect())
+        .unwrap_or_default();
+
+    let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs, &terminal_parents)?;
 
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/update_msg";

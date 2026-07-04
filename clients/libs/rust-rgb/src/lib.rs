@@ -152,11 +152,66 @@ impl RgbWallet {
         Ok(asset.asset_id)
     }
 
-    /// List NIA assets known to this wallet: (asset_id, ticker, name, precision).
+    /// Issue an IFA (Inflatable Fungible Asset): `amounts` are minted now, `inflation_amounts` are
+    /// inflation-right the issuer can later realize with [`Self::inflate`]. Offline (no broadcast),
+    /// like [`Self::issue_nia`]. Returns the contract/asset id.
+    pub fn issue_ifa(
+        &self,
+        ticker: &str,
+        name: &str,
+        precision: u8,
+        amounts: Vec<u64>,
+        inflation_amounts: Vec<u64>,
+    ) -> Result<String> {
+        let asset = self.wallet.issue_asset_ifa(
+            ticker.to_string(),
+            name.to_string(),
+            precision,
+            amounts,
+            inflation_amounts,
+            None,
+        )?;
+        Ok(asset.asset_id)
+    }
+
+    /// Realize `inflation_amounts` of an IFA's inflation-right as new fungible supply in this
+    /// wallet's RGB engine. **ON-CHAIN**: broadcasts a witness tx (inflation is a contract state
+    /// transition — there is no off-chain variant in RGB). Returns `(txid, minted_total)`.
+    pub fn inflate(
+        &mut self,
+        asset_id: &str,
+        inflation_amounts: Vec<u64>,
+        fee_rate: u64,
+    ) -> Result<(String, u64)> {
+        let minted: u64 = inflation_amounts.iter().sum();
+        let res = self.wallet.inflate(
+            self.online.clone(),
+            asset_id.to_string(),
+            inflation_amounts,
+            fee_rate,
+            1,
+        )?;
+        Ok((res.txid, minted))
+    }
+
+    /// Burn `amount` of an asset's FREE (engine-held) balance. **ON-CHAIN**: broadcasts a witness
+    /// tx. Statechain-bound supply must be exited back into the engine before it can be burned.
+    /// Returns the burn txid.
+    pub fn burn(&mut self, asset_id: &str, amount: u64, fee_rate: u64) -> Result<String> {
+        let res = self
+            .wallet
+            .burn(self.online.clone(), asset_id.to_string(), amount, fee_rate, 1)?;
+        Ok(res.txid)
+    }
+
+    /// List NIA + IFA assets known to this wallet: (asset_id, ticker, name, precision).
     pub fn list_assets(&self) -> Result<Vec<(String, String, String, u8)>> {
         let assets = self.wallet.list_assets(vec![])?;
         let mut out = Vec::new();
         for a in assets.nia.unwrap_or_default() {
+            out.push((a.asset_id, a.ticker, a.name, a.precision));
+        }
+        for a in assets.ifa.unwrap_or_default() {
             out.push((a.asset_id, a.ticker, a.name, a.precision));
         }
         Ok(out)
@@ -379,6 +434,33 @@ impl RgbWallet {
         let _ = fs::remove_dir_all(&dir);
         self.wallet.save_new_asset(consignment, txids)?;
         Ok(())
+    }
+
+    /// Off-chain validate `consignment_base64` against the un-broadcast branch `txids` and return
+    /// the fungible amount the consignment assigns to the receiver's OWN witness outpoint
+    /// (`witness_txid`:`vout`). The consignment-derived amount — a receiver books this instead of
+    /// trusting a sender-supplied value.
+    pub fn accept_offchain_amount(
+        &self,
+        consignment_base64: &str,
+        txids: &[String],
+        witness_txid: &str,
+        vout: u32,
+    ) -> Result<u64> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-offchain-amount");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let consignment = rgb_lib::wallet::rust_only::load_transfer(
+            path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+        Ok(self
+            .wallet
+            .offchain_assigned_amount(consignment, txids, witness_txid, vout)?)
     }
 
     /// Structured off-chain chain validation for SDK receivers: like

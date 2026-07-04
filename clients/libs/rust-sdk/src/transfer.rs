@@ -256,6 +256,22 @@ impl SparkWallet {
         split_txid: &str,
         outputs: &[(String, u32, u64)],
     ) -> Result<(String, String)> {
+        let ids = self
+            .register_split_subcoins_n(parent_statechain_id, signed_split_tx_hex, split_txid, outputs)
+            .await?;
+        Ok((ids[0].clone(), ids[1].clone()))
+    }
+
+    /// N-output variant of [`Self::register_split_subcoins`]: returns the statechain ids of every
+    /// registered sub-coin, in the same order as `outputs`. Used by batch token transfers where a
+    /// single colored split funds many recipient pieces + one change.
+    pub(crate) async fn register_split_subcoins_n(
+        &self,
+        parent_statechain_id: &str,
+        signed_split_tx_hex: &str,
+        split_txid: &str,
+        outputs: &[(String, u32, u64)],
+    ) -> Result<Vec<String>> {
         let mut record = self.record().await?;
         let mut ids: Vec<String> = vec![String::new(); outputs.len()];
         for coin in record.coins.iter_mut() {
@@ -325,7 +341,45 @@ impl SparkWallet {
             .await?;
         }
 
-        Ok((ids[0].clone(), ids[1].clone()))
+        // Record the structural ancestor chain (stored under "parents-<id>", one id per row) so a
+        // future transfer of the sub-coin can prove to its receiver that every ancestor is
+        // terminal at the SE. ancestors = this split's parent plus that parent's own ancestors.
+        let mut ancestors: Vec<String> = vec![parent_statechain_id.to_string()];
+        if let Ok(inherited) = mercuryrustlib::sqlite_manager::get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            &format!("parents-{parent_statechain_id}"),
+        )
+        .await
+        {
+            ancestors.extend(inherited.iter().map(|b| b.tx.clone()));
+        }
+        let parent_rows: Vec<mercurylib::wallet::BackupTx> = ancestors
+            .iter()
+            .enumerate()
+            .map(|(i, id)| mercurylib::wallet::BackupTx {
+                tx_n: (i + 1) as u32,
+                tx: id.clone(),
+                client_public_nonce: String::new(),
+                server_public_nonce: String::new(),
+                client_public_key: String::new(),
+                server_public_key: String::new(),
+                blinding_factor: String::new(),
+                rgb_consignment: None,
+                rgb_blinding: None,
+            })
+            .collect();
+        for id in &ids {
+            mercuryrustlib::sqlite_manager::insert_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("parents-{id}"),
+                &parent_rows,
+            )
+            .await?;
+        }
+
+        Ok(ids)
     }
 
     /// Blind-MuSig2 co-sign a multi-output spend of `coin` (the plain-BTC split; the RGB-colored

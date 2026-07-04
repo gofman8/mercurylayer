@@ -282,6 +282,37 @@ pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Vec<Vec
     result
 }
 
+/// Verify every structural ancestor node is TERMINAL at the SE (its spend budget is exhausted), so
+/// the sender cannot double-spend a parent and invalidate this sub-coin's branch. Queries
+/// `GET /statechain/spend_budget/<id>` per parent and requires `terminal == true`.
+async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String]) -> Result<()> {
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let client = client_config.get_reqwest_client()?;
+    for parent_id in parents {
+        let url = format!(
+            "{}/statechain/spend_budget/{}",
+            client_config.statechain_entity, parent_id
+        );
+        let resp = client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "could not query terminal state of parent {parent_id}: {}",
+                resp.status()
+            ));
+        }
+        let v: serde_json::Value = resp.json().await?;
+        let terminal = v.get("terminal").and_then(|t| t.as_bool()).unwrap_or(false);
+        if !terminal {
+            return Err(anyhow!(
+                "structural parent {parent_id} is NOT terminal at the SE — rejecting sub-coin (the sender could still double-spend it)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, enc_message: &str, network: &str, info_config: &InfoConfig, blockheight: u32) -> Result<()> {
 
     let client_auth_key = coin.auth_privkey.clone();
@@ -312,6 +343,11 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
                 client_config.confirmation_target,
             )
             .await?;
+            // And every structural ancestor node must be TERMINAL at the SE (its spend budget is
+            // exhausted), so the sender can no longer double-spend a parent and invalidate the
+            // branch. This is the receiver's independent guarantee — it does not trust that the
+            // sender set the budget.
+            verify_terminal_parents(client_config, &transfer_msg.terminal_parents).await?;
         }
 
         if index == 0 {

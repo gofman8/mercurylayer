@@ -26,7 +26,8 @@ const TOKEN_PIECE_SATS: u64 = 1_500;
 pub(crate) struct ConsignmentEnvelope {
     /// Consignment, base64.
     pub c: String,
-    /// Token amount assigned to the receiver's sub-coin (validated contract-side on receive).
+    /// Advisory amount hint. NOT trusted: the receiver re-derives the booked amount from the
+    /// consignment (`accept_offchain_amount`) and rejects the transfer if this disagrees.
     pub a: u64,
     /// Sats on the sub-coin.
     pub s: u64,
@@ -141,6 +142,137 @@ impl SparkWallet {
             })?;
         }
         Ok(asset_id)
+    }
+
+    /// Issue an IFA (inflatable) token. `supply` is minted now and bound to a fresh statechain
+    /// coin exactly like [`Self::issue_token`]; `inflation_amounts` reserve inflation-right the
+    /// issuer can later realize with [`Self::mint_tokens`]. `list_allocations` returns only the
+    /// fungible allocation, so binding the supply never consumes the (InflationRight) reserve.
+    /// Returns the asset id.
+    pub async fn issue_inflatable_token(
+        &self,
+        ticker: &str,
+        name: &str,
+        precision: u8,
+        supply: u64,
+        inflation_amounts: Vec<u64>,
+    ) -> Result<String> {
+        let deposit_sats: u64 = 10_000;
+        let (asset_id, sources) = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().unwrap();
+            let inflation = inflation_amounts.clone();
+            tokio::task::block_in_place(move || -> Result<(String, Vec<String>)> {
+                w.create_utxos(1, (deposit_sats * 4) as u32, 2)?;
+                let asset_id = w.issue_ifa(ticker, name, precision, vec![supply], inflation)?;
+                let sources = w
+                    .list_allocations(&asset_id)?
+                    .into_iter()
+                    .map(|(op, _, _)| op)
+                    .collect();
+                Ok((asset_id, sources))
+            })?
+        };
+        self.bind_engine_supply(&asset_id, supply, deposit_sats, &sources).await?;
+        Ok(asset_id)
+    }
+
+    /// Realize `inflation_amounts` of an IFA's inflation-right as new supply and bind it to a fresh
+    /// statechain coin. **This broadcasts an on-chain tx in the RGB engine** (inflation is a
+    /// contract state transition — there is no off-chain variant); the newly-minted allocation is
+    /// then bound like issuance. Returns `(inflate_txid, minted_total)`.
+    ///
+    /// Requires the inflate tx to confirm before the minted allocation is spendable — on regtest
+    /// the caller must be mining (e.g. a background miner); in production real blocks provide it.
+    pub async fn mint_tokens(
+        &self,
+        asset_id: &str,
+        inflation_amounts: Vec<u64>,
+    ) -> Result<(String, u64)> {
+        let deposit_sats: u64 = 10_000;
+        // 1. Inflate in the engine (on-chain broadcast). Ensure a colorable UTXO exists first.
+        let (inflate_txid, minted) = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().unwrap();
+            let inflation = inflation_amounts.clone();
+            tokio::task::block_in_place(move || -> Result<(String, u64)> {
+                let _ = w.create_utxos(1, (deposit_sats * 4) as u32, 2);
+                w.inflate(asset_id, inflation, 2)
+            })?
+        };
+
+        // 2. Wait for the inflate to confirm and the minted fungible allocation to settle.
+        let mut sources: Vec<String> = Vec::new();
+        for _ in 0..90 {
+            let allocs = {
+                let mut rgb = self.rgb().await?;
+                let w = rgb.as_mut().unwrap();
+                tokio::task::block_in_place(|| -> Result<Vec<(String, u64, bool)>> {
+                    let _ = w.refresh(Some(asset_id.to_string()));
+                    w.list_allocations(asset_id)
+                })?
+            };
+            let settled: u64 = allocs.iter().filter(|(_, _, s)| *s).map(|(_, a, _)| *a).sum();
+            if settled >= minted {
+                sources = allocs.into_iter().filter(|(_, _, s)| *s).map(|(op, _, _)| op).collect();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if sources.is_empty() {
+            return Err(anyhow!("minted allocation for {asset_id} did not settle (is the chain advancing?)"));
+        }
+
+        // 3. Bind the minted supply to a fresh statechain coin.
+        self.bind_engine_supply(asset_id, minted, deposit_sats, &sources).await?;
+        Ok((inflate_txid, minted))
+    }
+
+    /// Burn `amount` of an asset's FREE (engine-held) balance. **On-chain** in the RGB engine.
+    /// Statechain-bound supply must be exited back into the engine first (documented limitation).
+    /// Returns the burn txid.
+    pub async fn burn_tokens(&self, asset_id: &str, amount: u64) -> Result<String> {
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().unwrap();
+        tokio::task::block_in_place(|| w.burn(asset_id, amount, 2))
+    }
+
+    /// Bind an engine-held fungible allocation of `amount` to a fresh statechain coin: fund the
+    /// coin colored (one on-chain tx) and register it as the carrier. Shared by issuance and mint.
+    async fn bind_engine_supply(
+        &self,
+        asset_id: &str,
+        amount: u64,
+        deposit_sats: u64,
+        sources: &[String],
+    ) -> Result<(String, u32)> {
+        let token = self.take_token().await?;
+        let sc_address = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &token,
+            u32::try_from(deposit_sats)?,
+        )
+        .await?;
+        let (txid, vout) = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().unwrap();
+            let (txid, vout, _c, signed_tx) = tokio::task::block_in_place(|| {
+                w.fund_statechain(&sc_address, deposit_sats, asset_id, amount, 2, TOKEN_BLINDING)
+            })?;
+            use electrum_client::ElectrumApi;
+            let raw = hex::decode(&signed_tx)?;
+            let _ = self.inner.cc.electrum_client.transaction_broadcast_raw(&raw)?;
+            (txid, vout)
+        };
+        {
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            tokio::task::block_in_place(|| {
+                w.register_statechain(&txid, vout, deposit_sats, asset_id, amount, sources)
+            })?;
+        }
+        Ok((txid, vout))
     }
 
     /// Token balances across this wallet's registered coins.
@@ -373,6 +505,211 @@ impl SparkWallet {
         })
     }
 
+    /// Send `asset_id` to MANY recipients in a single off-chain colored split: one SE-co-signed
+    /// tx carves one piece per recipient (its exact amount) plus this wallet's change. Each piece
+    /// is handed over with its own consignment envelope. Returns one `TransferResult` per recipient.
+    pub async fn batch_transfer_tokens(
+        &self,
+        asset_id: &str,
+        transfers: &[(String, u64)],
+    ) -> Result<Vec<TransferResult>> {
+        if transfers.is_empty() {
+            return Err(anyhow!("no recipients"));
+        }
+        let total: u64 = transfers.iter().map(|(_, a)| *a).sum();
+        let n = transfers.len();
+
+        let _guard = self.inner.wallet_lock.lock().await;
+        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+            .await?;
+        let record = self.record().await?;
+
+        // Carrier: a confirmed coin holding >= total of the asset.
+        let allocations = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().unwrap();
+            tokio::task::block_in_place(|| w.list_allocations(asset_id))?
+        };
+        let mut carrier: Option<(mercurylib::wallet::Coin, u64)> = None;
+        for coin in record.coins.iter() {
+            if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 {
+                continue;
+            }
+            let op = format!(
+                "{}:{}",
+                coin.utxo_txid.clone().unwrap_or_default(),
+                coin.utxo_vout.unwrap_or_default()
+            );
+            if let Some((_, amt, _)) = allocations.iter().find(|(o, _, s)| *o == op && *s) {
+                if *amt >= total {
+                    carrier = Some((coin.clone(), *amt));
+                    break;
+                }
+            }
+        }
+        let (mut carrier, carrier_amount) = carrier.ok_or_else(|| {
+            anyhow!("no single coin carries >= {total} of {asset_id} for the batch")
+        })?;
+        let carrier_id = carrier.statechain_id.clone().unwrap();
+        let carrier_sats = carrier.amount.unwrap_or_default() as u64;
+        let fee_reserve = (carrier_sats / 100).clamp(300, 2_000);
+        let pieces_sats = TOKEN_PIECE_SATS * n as u64;
+        if pieces_sats + fee_reserve >= carrier_sats {
+            return Err(anyhow!(
+                "carrier coin too small ({carrier_sats} sats) for {n} pieces + fee"
+            ));
+        }
+        let change_sats = carrier_sats - pieces_sats - fee_reserve;
+        let token_change = carrier_amount - total;
+
+        // One fresh slot per recipient piece + one for change; build the N+1 colored split.
+        let mut splits: Vec<(String, u64, u64)> = Vec::with_capacity(n + 1);
+        let mut piece_addrs: Vec<String> = Vec::with_capacity(n);
+        for (_, amount) in transfers {
+            let tk = self.take_token().await?;
+            let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &tk,
+                u32::try_from(TOKEN_PIECE_SATS)?,
+            )
+            .await?;
+            splits.push((addr.clone(), TOKEN_PIECE_SATS, *amount));
+            piece_addrs.push(addr);
+        }
+        let change_tk = self.take_token().await?;
+        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &change_tk,
+            u32::try_from(change_sats)?,
+        )
+        .await?;
+        splits.push((change_addr.clone(), change_sats, token_change));
+
+        let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+        )
+        .await
+        .map(|v| v.len() as u32)
+        .unwrap_or(0);
+        let server_info = mercuryrustlib::utils::info_config(&self.inner.cc).await?;
+        // One colored split spends the carrier once -> spend budget 1.
+        mercuryrustlib::lightning_latch::set_spend_budget(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+            1,
+        )
+        .await?;
+        let split = {
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            mercuryrustlib::rgb::create_colored_split_tx(
+                &self.inner.cc,
+                w,
+                &mut carrier,
+                asset_id,
+                &splits,
+                parent_backups + 1,
+                false,
+                None,
+                &self.inner.config.network.to_string(),
+                server_info.initlock,
+                server_info.interval,
+                TOKEN_BLINDING,
+            )
+            .await?
+        };
+
+        // Register every sub-coin (pieces + change).
+        let outputs: Vec<(String, u32, u64)> = splits
+            .iter()
+            .enumerate()
+            .map(|(i, (addr, sats, _))| (addr.clone(), split.output_vouts[i], *sats))
+            .collect();
+        let ids = self
+            .register_split_subcoins_n(&carrier_id, &split.signed_tx, &split.txid, &outputs)
+            .await?;
+        let change_vout = split.output_vouts[n];
+
+        // RGB-register the change (or mark the carrier fully spent).
+        {
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            let carrier_op = format!(
+                "{}:{}",
+                carrier.utxo_txid.clone().unwrap_or_default(),
+                carrier.utxo_vout.unwrap_or_default()
+            );
+            tokio::task::block_in_place(|| -> Result<()> {
+                if token_change > 0 {
+                    w.register_statechain(
+                        &split.txid,
+                        change_vout,
+                        change_sats,
+                        asset_id,
+                        token_change,
+                        &[carrier_op],
+                    )?;
+                } else {
+                    w.mark_spent(&[carrier_op])?;
+                }
+                Ok(())
+            })?;
+        }
+
+        // Per-piece envelope (own amount) + hand over to each recipient.
+        let mut results = Vec::with_capacity(n);
+        for (i, (recipient, amount)) in transfers.iter().enumerate() {
+            let piece_id = ids[i].clone();
+            let envelope = serde_json::to_string(&ConsignmentEnvelope {
+                c: split.consignment.clone(),
+                a: *amount,
+                s: TOKEN_PIECE_SATS,
+            })?;
+            let mut backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &piece_id,
+            )
+            .await?;
+            if let Some(first) = backups.first_mut() {
+                first.rgb_consignment = Some(envelope);
+                first.rgb_blinding = Some(TOKEN_BLINDING);
+            }
+            mercuryrustlib::sqlite_manager::update_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &piece_id,
+                &backups,
+            )
+            .await?;
+            mercuryrustlib::transfer_sender::execute(
+                &self.inner.cc,
+                recipient,
+                &self.inner.config.wallet_name,
+                &piece_id,
+                None,
+                false,
+                None,
+            )
+            .await?;
+            results.push(TransferResult {
+                receiver_address: recipient.clone(),
+                total_sats: TOKEN_PIECE_SATS,
+                coins: vec![TransferredCoin {
+                    statechain_id: piece_id,
+                    amount_sats: TOKEN_PIECE_SATS,
+                }],
+                used_split: true,
+            });
+        }
+        Ok(results)
+    }
+
     /// Receive-side token hook, called by `claim()` for each newly claimed coin: if its backup
     /// rows carry a consignment envelope, validate the consignment off-chain against the coin's
     /// exit branch and book the balance under the consignment's verified contract id.
@@ -437,13 +774,25 @@ impl SparkWallet {
         }
         let contract_id =
             contract_id.ok_or_else(|| anyhow!("validated consignment without contract id"))?;
+        // Book the amount the CONSIGNMENT assigns to our own witness outpoint — the cryptographic
+        // source of truth. The envelope amount (env.a) is only a hint we cross-check; a lying
+        // sender cannot inflate the booked balance because the consignment governs it.
+        let booked = tokio::task::block_in_place(|| {
+            w.accept_offchain_amount(&env.c, &txids, &txid, vout)
+        })?;
+        if booked != env.a {
+            return Err(anyhow!(
+                "token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
+                env.a
+            ));
+        }
         tokio::task::block_in_place(|| -> Result<()> {
             // First sight of this contract: import it (genesis + history) into the stash so the
             // allocation rows have their asset to reference — validated against the same branch.
             w.import_asset_offchain(&env.c, &txids)?;
-            w.register_statechain(&txid, vout, sats, &contract_id, env.a, &[])?;
+            w.register_statechain(&txid, vout, sats, &contract_id, booked, &[])?;
             Ok(())
         })?;
-        Ok(Some((contract_id, env.a)))
+        Ok(Some((contract_id, booked)))
     }
 }
