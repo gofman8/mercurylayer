@@ -35,6 +35,14 @@ use anyhow::{Result, Ok};
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
 
+    // Trace logging is opt-in via RUST_LOG (no-op when unset): surfaces reqwest/rgb-lib/SDK
+    // log lines so the full-suite run can be reviewed for anomalies (delays, retries, errors).
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("off"),
+    )
+    .format_timestamp_millis()
+    .try_init();
+
     // mercury-spark-sdk smoke (SDK_E2E=1): deposit -> exact-subset transfer -> auto-claim ->
     // off-chain-split transfer (exact amount w/ change) -> auto-claim -> cooperative exit.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("1") {
