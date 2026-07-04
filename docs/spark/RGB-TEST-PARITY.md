@@ -102,8 +102,12 @@ Prioritised remaining work (each becomes an `rgbNN` when its bridge gap is fille
   covered by `rgb14`.)
 - **Funding reorg** (`revert_genesis`, `reorg_history`): a resolver-switch harness + `get_witness_ord`
   surface.
-- **UDA transfer**: a data-allocation path on `fund_statechain`/`register_statechain`/`list_allocations`
-  (currently Fungible-only).
+- **UDA transfer**: the statechain deposit path is Fungible-only — `fund_statechain_utxo`
+  (rgb-lib `rust_only.rs`, the `matches!(… Assignment::Fungible(amt) …)` source filter) and
+  `register_statechain_utxo` (which books `Assignment::Fungible(rgb_amount)`) both need a
+  `NonFungible` branch, `list_allocations` must surface non-fungible allocations, and the colored-tx
+  builders' amount-based `output_map` must map to a token assignment rather than a u64 amount. A
+  multi-function rgb-lib fork change with non-trivial rgb-std token/data semantics.
 - **Collaborative transfer** (`collaborative_transfer`): a multi-owner `create_colored_combine_tx`
   where each input is co-signed by its own owner's blind-MuSig2.
 
