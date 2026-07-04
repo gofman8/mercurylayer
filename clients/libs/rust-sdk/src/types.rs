@@ -107,3 +107,57 @@ pub struct ExitStatus {
     /// When not complete: blocks remaining until the backup is final.
     pub wait_blocks: u32,
 }
+
+/// Pure mirror of the SE's terminal predicate (§3.6 SPEC): a node is terminal iff a spend budget
+/// is set and the finalized-signature count has reached it. Documented here so clients can reason
+/// about terminal state; the authoritative value comes from `GET /statechain/spend_budget`.
+pub fn is_terminal(sig_budget: Option<i64>, finalized: i64) -> bool {
+    matches!(sig_budget, Some(b) if finalized >= b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // INV-17: exit-cost arithmetic.
+    #[test]
+    fn exit_cost_math() {
+        let e = ExitCostEstimate {
+            statechain_id: "x".into(),
+            branch_txs: 1,
+            branch_vbytes: 155,
+            backup_vbytes: 112,
+            total_vbytes: 267,
+            wait_blocks: 990,
+        };
+        assert_eq!(e.total_vbytes, e.branch_vbytes + e.backup_vbytes);
+        assert_eq!(e.fee_sats_at(2.0), 534); // ceil(267*2)
+        assert_eq!(e.fee_sats_at(30.0), 8010);
+        // fractional rate rounds up
+        assert_eq!(e.fee_sats_at(1.5), 401); // ceil(267*1.5=400.5)
+    }
+
+    // §3.6 / REQ-13: terminal predicate.
+    #[test]
+    fn terminal_predicate() {
+        assert!(!is_terminal(None, 5)); // no budget -> never terminal
+        assert!(!is_terminal(Some(2), 1)); // budget set, not reached
+        assert!(is_terminal(Some(2), 2)); // reached
+        assert!(is_terminal(Some(2), 3)); // exceeded
+    }
+
+    // ERR-6 / ERR-9: typed error messages carry the actionable fields.
+    #[test]
+    fn error_semantics() {
+        let e = SdkError::TokenPaymentRequired {
+            token_id: "tok".into(),
+            deposit_address: "bcrt1qx".into(),
+            fee_sats: 100,
+        };
+        let m = e.to_string();
+        assert!(m.contains("100") && m.contains("bcrt1qx") && m.contains("tok"));
+        let e = SdkError::InsufficientBalance { requested_sats: 200, available_sats: 40 };
+        let m = e.to_string();
+        assert!(m.contains("insufficient balance") && m.contains("200") && m.contains("40"));
+    }
+}

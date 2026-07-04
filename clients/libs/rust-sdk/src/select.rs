@@ -155,4 +155,31 @@ mod tests {
             Plan::Insufficient { available: 100 }
         );
     }
+
+    // INV-9: WithSplit structural invariants.
+    #[test]
+    fn with_split_invariants() {
+        let cs = coins(&[500, 300]); // no exact subset for 600
+        match plan(&cs, 600) {
+            Plan::WithSplit { whole, split, split_amount } => {
+                let whole_sum: u64 = whole.iter().map(|&i| cs[i].amount_sats).sum();
+                assert!(whole_sum < 600, "whole < target");
+                assert_eq!(split_amount, 600 - whole_sum, "split covers the deficit");
+                assert!(cs[split].amount_sats > split_amount, "split coin exceeds the piece");
+            }
+            p => panic!("expected split, got {p:?}"),
+        }
+    }
+
+    // INV-9: exact subset sums to target exactly.
+    #[test]
+    fn exact_sums_to_target() {
+        let cs = coins(&[500, 300, 200]);
+        if let Some(idx) = exact_subset(&cs, 700) {
+            let sum: u64 = idx.iter().map(|&i| cs[i].amount_sats).sum();
+            assert_eq!(sum, 700);
+        } else {
+            panic!("expected exact subset");
+        }
+    }
 }

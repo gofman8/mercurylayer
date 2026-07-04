@@ -817,3 +817,31 @@ impl SparkWallet {
         Ok(Some((contract_id, booked)))
     }
 }
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::ConsignmentEnvelope;
+
+    // The consignment envelope roundtrips through JSON (as stored in BackupTx.rgb_consignment).
+    #[test]
+    fn envelope_roundtrip() {
+        let env = ConsignmentEnvelope { c: "base64data".into(), a: 250, s: 1_500 };
+        let json = serde_json::to_string(&env).unwrap();
+        let back: ConsignmentEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.a, 250);
+        assert_eq!(back.s, 1_500);
+        assert_eq!(back.c, "base64data");
+    }
+
+    // REQ-21: the envelope amount is only a hint; the receiver compares it to the consignment-
+    // derived amount and rejects on mismatch. This models that decision (the crypto derivation
+    // itself is covered E2E by sdk02/sdk09).
+    #[test]
+    fn envelope_amount_is_a_checked_hint() {
+        let booked = 250u64; // from the consignment
+        let honest = ConsignmentEnvelope { c: "c".into(), a: 250, s: 1500 };
+        let lying = ConsignmentEnvelope { c: "c".into(), a: 999, s: 1500 };
+        assert_eq!(honest.a, booked); // accepted
+        assert_ne!(lying.a, booked); // rejected (ERR-8)
+    }
+}

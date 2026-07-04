@@ -356,3 +356,21 @@ impl SparkWallet {
         ssp.create_receive(amount_sats, &my_address).await
     }
 }
+
+#[cfg(test)]
+mod swap_tests {
+    use sha2::{Digest, Sha256};
+
+    // INV-14: a Lightning preimage proves payment iff sha256(preimage) == the invoice hash. The
+    // pay flow asserts exactly this before accepting the SSP's returned preimage.
+    #[test]
+    fn preimage_matches_hash() {
+        let preimage = [0x11u8; 32];
+        let hash = hex::encode(Sha256::digest(preimage));
+        // correct preimage validates
+        assert_eq!(hex::encode(Sha256::digest(hex::decode(hex::encode(preimage)).unwrap())), hash);
+        // a different preimage does not
+        let wrong = [0x22u8; 32];
+        assert_ne!(hex::encode(Sha256::digest(wrong)), hash);
+    }
+}

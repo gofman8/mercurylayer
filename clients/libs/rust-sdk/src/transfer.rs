@@ -448,3 +448,22 @@ fn split_fee_reserve(parent_sats: u64) -> u64 {
     // ~200 vB at a couple sat/vB, floored so tiny test coins still split.
     (parent_sats / 100).clamp(300, 2_000)
 }
+
+#[cfg(test)]
+mod split_math_tests {
+    use super::*;
+
+    // INV-10: fee reserve clamps to [300, 2000] at ~1%; change = parent - piece - reserve.
+    #[test]
+    fn fee_reserve_and_change() {
+        assert_eq!(split_fee_reserve(10_000), 300); // 100 -> floored to 300
+        assert_eq!(split_fee_reserve(100_000), 1_000); // 1%
+        assert_eq!(split_fee_reserve(1_000_000), 2_000); // 10000 -> capped
+        // change is consistent for a valid split
+        let parent = 40_000u64;
+        let piece = 15_000u64;
+        let reserve = split_fee_reserve(parent);
+        assert!(piece + reserve < parent);
+        assert_eq!(parent - piece - reserve, 40_000 - 15_000 - 400);
+    }
+}
