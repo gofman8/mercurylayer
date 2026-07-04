@@ -64,18 +64,28 @@ pub async fn insert_new_signature_data(pool: &sqlx::PgPool, server_pubnonce: &st
     transaction.commit().await.unwrap();
 }
 
-pub async fn update_signature_data_challenge(pool: &sqlx::PgPool, server_pub_nonce: &str, challenge: &str, statechain_id: &str)  {
+/// Bind a challenge (message) to a server nonce, ONCE. Returns true iff the challenge was set —
+/// either because it was previously NULL, or because it exactly equals the same challenge (an
+/// idempotent client retry). Returns FALSE if the row already carries a DIFFERENT challenge: that
+/// is a second sign_second reusing one nonce over a different message, which would let the enclave
+/// produce two MuSig2 partial signatures with the same secnonce and leak the SE's key share
+/// (catastrophic — defeats the 2-of-2 and every off-chain single-use/budget guard). The `WHERE`
+/// clause makes the check-and-set atomic, so concurrent finalizes cannot both win.
+pub async fn update_signature_data_challenge(pool: &sqlx::PgPool, server_pub_nonce: &str, challenge: &str, statechain_id: &str) -> bool {
 
     let query = "\
         UPDATE statechain_signature_data \
         SET challenge = $1 \
-        WHERE statechain_id = $2 AND server_pubnonce= $3";
+        WHERE statechain_id = $2 AND server_pubnonce = $3 \
+        AND (challenge IS NULL OR challenge = $1)";
 
-    let _ = sqlx::query(query)
+    let result = sqlx::query(query)
         .bind(challenge)
         .bind(statechain_id)
         .bind(server_pub_nonce)
         .execute(pool)
         .await
         .unwrap();
+
+    result.rows_affected() == 1
 }

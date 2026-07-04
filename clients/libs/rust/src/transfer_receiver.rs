@@ -285,9 +285,30 @@ pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Vec<Vec
 /// Verify every structural ancestor node is TERMINAL at the SE (its spend budget is exhausted), so
 /// the sender cannot double-spend a parent and invalidate this sub-coin's branch. Queries
 /// `GET /statechain/spend_budget/<id>` per parent and requires `terminal == true`.
-async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String]) -> Result<()> {
-    if parents.is_empty() {
-        return Ok(());
+/// INV-20 hardening: a branch-funded sub-coin must name at least one terminal ancestor per branch
+/// hop. `branch_len` is the number of un-broadcast txs in the exit branch (each spends a parent
+/// node; a combine spends several, so the true ancestor count is `>= branch_len`). The receiver
+/// therefore requires `n_parents >= max(branch_len, 1)` — an empty or short list means the sender
+/// omitted an ancestor it could still double-spend, so the sub-coin is refused. `.max(1)` guards the
+/// degenerate `branch_len == 0` call (this fn is only reached when funding_from_branch, i.e. len>=1).
+pub(crate) fn terminal_parents_sufficient(n_parents: usize, branch_len: usize) -> bool {
+    n_parents >= branch_len.max(1)
+}
+
+async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String], branch_len: usize) -> Result<()> {
+    // A branch-funded sub-coin ALWAYS has structural ancestors: at least one per branch hop (each
+    // branch tx spends a parent node; a combine spends several). If the sender names FEWER ancestors
+    // than the branch has hops, it is hiding one it could still double-spend — the receiver must not
+    // trust the sender to enumerate its own parents. An empty list is the degenerate case of this and
+    // was previously accepted (the bug): reject it. `single_use` on every off-chain sub-coin makes
+    // intermediate nodes terminal at the SE regardless, so the only sender-dependent ancestor left is
+    // the on-chain root, which this check forces the sender to name and prove terminal.
+    if !terminal_parents_sufficient(parents.len(), branch_len) {
+        return Err(anyhow!(
+            "off-chain sub-coin names {} terminal ancestor(s) but its exit branch has {} hop(s) — refusing (the sender may be hiding a non-terminal, double-spendable ancestor)",
+            parents.len(),
+            branch_len
+        ));
     }
     let client = client_config.get_reqwest_client()?;
     for parent_id in parents {
@@ -347,7 +368,7 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             // exhausted), so the sender can no longer double-spend a parent and invalidate the
             // branch. This is the receiver's independent guarantee — it does not trust that the
             // sender set the budget.
-            verify_terminal_parents(client_config, &transfer_msg.terminal_parents).await?;
+            verify_terminal_parents(client_config, &transfer_msg.terminal_parents, transfer_msg.branch_txs.len()).await?;
         }
 
         if index == 0 {
@@ -681,8 +702,27 @@ async fn validate_branch(
             }
         }
     }
-    // Consensus-verify every branch tx against its prevouts (signatures + scripts).
+    // Consensus-verify every branch tx against its prevouts (signatures + scripts) AND check value
+    // conservation. `tx.verify` runs script/signature checks but NOT the fee rule, so a malicious
+    // sender could hand the receiver a branch whose txs create value (Σ outputs > Σ inputs); those
+    // scripts pass here but the network would reject the tx, leaving the receiver holding a coin it
+    // can never exit on-chain while the sender keeps the real funds. Require a non-negative fee at
+    // every hop so the whole branch is actually broadcastable.
     for tx in &txs {
+        let in_value: u64 = tx
+            .input
+            .iter()
+            .map(|i| prevouts.get(&i.previous_output).map(|o| o.value).unwrap_or(0))
+            .sum();
+        let out_value: u64 = tx.output.iter().map(|o| o.value).sum();
+        if out_value > in_value {
+            return Err(anyhow!(
+                "exit-branch tx {} creates value (outputs {} sats > inputs {} sats) — not broadcastable, so the branch is unexitable; rejecting",
+                tx.txid(),
+                out_value,
+                in_value
+            ));
+        }
         tx.verify(|op| prevouts.get(op).cloned())
             .map_err(|e| anyhow!("exit-branch tx {} fails script verification: {e}", tx.txid()))?;
     }
@@ -787,4 +827,46 @@ async fn send_transfer_receiver_request_payload(client_config: &ClientConfig, tr
             return Err(anyhow::anyhow!("{}: {}", "Failed to update transfer message".to_string(), value));
         }
     
+}
+#[cfg(test)]
+mod terminal_parents_tests {
+    use super::terminal_parents_sufficient;
+
+    // INV-20: the receiver must reject a branch-funded sub-coin whose sender names FEWER terminal
+    // ancestors than the branch has hops (the previously-accepted empty list is the len==0 case).
+    #[test]
+    fn empty_parents_on_a_branch_is_rejected() {
+        // 1-hop branch, zero named ancestors -> reject (the confirmed exploit).
+        assert!(!terminal_parents_sufficient(0, 1));
+        // deeper branches with an empty list -> reject.
+        assert!(!terminal_parents_sufficient(0, 3));
+    }
+
+    #[test]
+    fn fewer_parents_than_hops_is_rejected() {
+        // 3-hop branch but only 1 ancestor named (a single terminal "decoy") -> reject.
+        assert!(!terminal_parents_sufficient(1, 3));
+        assert!(!terminal_parents_sufficient(2, 3));
+    }
+
+    #[test]
+    fn one_parent_per_hop_is_accepted() {
+        // honest SDK: ancestors == branch depth.
+        assert!(terminal_parents_sufficient(1, 1));
+        assert!(terminal_parents_sufficient(2, 2));
+        assert!(terminal_parents_sufficient(3, 3));
+    }
+
+    #[test]
+    fn more_parents_than_hops_is_accepted() {
+        // a combine hop consumes several ancestors -> more parents than branch txs is fine.
+        assert!(terminal_parents_sufficient(4, 2));
+    }
+
+    #[test]
+    fn degenerate_zero_branch_still_requires_a_parent() {
+        // defensive: max(1) means "no ancestors named" is never sufficient.
+        assert!(!terminal_parents_sufficient(0, 0));
+        assert!(terminal_parents_sufficient(1, 0));
+    }
 }

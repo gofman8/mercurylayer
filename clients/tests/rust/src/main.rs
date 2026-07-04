@@ -31,6 +31,7 @@ pub mod sdk08_terminal_node;
 pub mod sdk09_ifa_batch;
 pub mod sdk10_terminal_parent_verify;
 pub mod sdk11_parity_methods;
+pub mod sdk12_adversarial;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -98,6 +99,11 @@ async fn main() -> Result<()> {
     // Parity methods (SDK_E2E=11): identity signing, multi-recipient sats, Spark invoices, queries.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("11") {
         sdk11_parity_methods::execute().await?;
+        return Ok(());
+    }
+    // Adversarial regressions (SDK_E2E=12): single_use sub-coins, honest branch accept, nonce reuse.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("12") {
+        sdk12_adversarial::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

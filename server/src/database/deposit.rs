@@ -165,7 +165,14 @@ pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str)  {
 /// sign_first once the count reaches the budget.
 pub async fn set_sig_budget(pool: &sqlx::PgPool, statechain_id: &str, remaining: i32) -> i64 {
     let count = count_finalized_signatures(pool, statechain_id).await;
-    let budget = count + remaining as i64;
+    let mut budget = count + remaining as i64;
+    // MONOTONIC: a budget may only TIGHTEN, never loosen. Without this, an owner who already
+    // terminally spent a node (finalized == budget) could call set_spend_budget again — the
+    // relative `count + remaining` would compute a HIGHER budget and re-open the node for a second,
+    // conflicting spend (off-chain double-spend / INV-19 fork). Clamp to any existing budget.
+    if let Some(existing) = get_sig_budget(pool, statechain_id).await {
+        budget = budget.min(existing as i64);
+    }
     let query = "UPDATE statechain_data SET sig_budget = $1 WHERE statechain_id = $2";
     let _ = sqlx::query(query)
         .bind(budget as i32)

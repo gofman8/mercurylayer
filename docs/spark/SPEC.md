@@ -266,11 +266,34 @@ parent (its input is the parent's output), so there is no old-vs-new race within
 **INV-19 (fork prevention)** The SE refuses a second spend of any node (single-use / spend budget),
 so a node cannot be forked into two conflicting children.
 **INV-20 (terminal ancestors)** A sub-coin's receiver only accepts it if every structural ancestor
-is terminal at the SE (REQ-17) — a malicious sender cannot double-spend a parent afterwards.
+is terminal at the SE (REQ-17) — a malicious sender cannot double-spend a parent afterwards. The
+receiver derives the required ancestor count from the branch itself: it requires at least one named
+terminal ancestor **per branch hop** (`n_parents ≥ branch_len`, `≥ 1`), so a sender cannot hide a
+non-terminal, double-spendable ancestor by shipping an empty or short `terminal_parents` list
+(ERR-7). Verified by `unit::terminal_parents_tests` + `sdk10`.
 **INV-21 (bounded lifetime)** With `epoch_deadline` set, the SE stops co-signing new state past the
 deadline; unilateral exit still works forever (needs no SE), so funds are never swept.
 **INV-22 (UTXO granularity)** Exact amounts are native (1-sat resolution) via off-chain split —
 strictly finer than fixed-denomination leaves.
+**INV-23 (nonce single-use)** The SE binds each server nonce to exactly ONE challenge: `sign/second`
+sets the challenge atomically only if it was NULL (or identical — idempotent retry) and otherwise
+refuses (ERR-12). A second finalize over one nonce with a different message is therefore impossible,
+which is what makes the blind-MuSig2 scheme safe against an owner who controls the raw signing
+requests — without it, two partial signatures over one secnonce would leak the SE's key share and
+yield two co-signed conflicting spends while `count_finalized_signatures` (and hence single-use /
+budget / epoch enforcement) counted only one. Verified by `sdk12` Part C.
+**INV-24 (budget monotonic)** `set_spend_budget` may only TIGHTEN a coin's `sig_budget`
+(`new = min(existing, count+remaining)`); it can never raise it, so an already-terminal node cannot
+be re-opened for a second conflicting spend. Verified by `sdk08` (unchanged terminal behaviour).
+**INV-25 (branch value conservation)** The receiver's `validate_branch` rejects any exit branch whose
+txs create value (`Σ outputs > Σ inputs` at any hop): `tx.verify` checks scripts but not the fee
+rule, so without this a sender could hand over a coin whose branch is script-valid yet un-broadcastable
+(the receiver could never exit on-chain while the sender keeps the funds). Verified by `sdk12`/`sdk10`
+(honest branches still accepted).
+**INV-26 (received amount = spendable only)** A transfer's received token amount counts only
+`Fungible` assignments, never `InflationRight` (the right to mint). Booking an inflation right as
+spendable balance would let a right-holder inflate a receiver's balance out of nothing
+(conserves INV-12/INV-13). Verified by `sdk09`.
 
 ---
 
@@ -289,6 +312,8 @@ strictly finer than fixed-denomination leaves.
   envelope claimed Y`.
 - **ERR-9** `InsufficientBalance{requested, available}` on over-balance transfer.
 - **ERR-10** double-withdraw / spend of a non-CONFIRMED coin → refused with the coin's status.
+- **ERR-12** second `sign/second` reusing a server nonce over a different message → HTTP 409
+  `server nonce already finalized with a different challenge`.
 
 ---
 
@@ -344,6 +369,33 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-27 | `sdk11` (multi-recipient) |
 | REQ-28, ERR-11 | `sdk11`; `unit::invoice::tests` (roundtrip, reject) |
 | REQ-29, REQ-30 | `sdk11` (query API + fee quote) |
+| INV-20 (ancestor-count binding), ERR-7 | `unit::terminal_parents_tests`, `sdk10`, `sdk12` (honest accept) |
+| INV-23, ERR-12 | `sdk12` Part C (nonce-reuse refused) |
+| INV-24 | `sdk08` (terminal node stays terminal) |
+| INV-25 | `sdk10`/`sdk12` (honest branch accepted; value-inflating branch rejected) |
+| INV-26 | `sdk09` (IFA received amount = fungible only) |
+
+## 14. Known limitations (adversarial review)
+
+Findings from the adversarial review that are **documented assumptions**, not code changes:
+
+- **Blind-SE ancestor binding.** The SE stores no per-`statechain_id` funding outpoint (it is blind),
+  so the receiver cannot cryptographically bind `terminal_parents` ids to specific branch outpoints.
+  INV-20's count check defeats omission; full defence against *substitution* of terminal decoys relies
+  on the receiver holding the fully-signed branch and being able to exit immediately (win the race for
+  the on-chain root). Honest senders always set each node terminal.
+- **Batch atomicity.** `transfer_many` / `batch_transfer_tokens` hand off pieces independently; there
+  is no all-or-nothing guarantee across recipients. A dropped hand-off leaves that piece reclaimable
+  by the sender (the split parent is terminal, so no double-spend), but the batch is not atomic.
+- **Amount width.** Coin sats are booked as `u32` (`tx0_output.value as u32`); a single coin above
+  ~42.9 BTC would truncate. Out of range for the intended per-coin sizes; not guarded.
+- **Mint concurrency.** `mint_tokens` isolates the freshly-minted allocation by a before/after snapshot
+  and does NOT hold the wallet lock across its (minutes-long) on-chain confirmation wait, to avoid
+  blocking the background claim watcher. A concurrent same-asset receive into the *same* wallet during
+  a mint could be misattributed — issuers must not mint and receive the same asset concurrently.
+- **Unilateral-exit fees.** Exit broadcasts pre-signed fixed-fee branch/backup txs with no CPFP/RBF
+  fee-bump; in a fee spike an exit may confirm slowly. The decrementing-locktime ladder (INV-5) still
+  guarantees the latest state wins the race.
 
 Unit tests live in `clients/libs/rust-sdk/src/*` (`#[cfg(test)]`); E2E dispatch via
 `SDK_E2E`/`RGB_E2E` in `clients/tests/rust`; upstream Mercury suite runs by default.

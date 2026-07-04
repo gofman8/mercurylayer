@@ -188,7 +188,18 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
     let challenge = session.get_challenge_from_session();
     let challenge_str = hex::encode(challenge);
 
-    crate::database::sign::update_signature_data_challenge(&statechain_entity.pool, &server_pub_nonce, &challenge_str, &statechain_id).await;
+    // Bind this challenge to the server nonce atomically and ONCE. If the nonce was already
+    // finalized with a DIFFERENT challenge, refuse before calling the enclave: signing twice with
+    // one secnonce over two messages leaks the SE key share (MuSig2 nonce reuse) and would also let
+    // an owner obtain two co-signed conflicting spends of a single-use/budgeted off-chain node while
+    // the finalized-signature counter shows only one (INV-19 fork-prevention bypass).
+    let challenge_bound = crate::database::sign::update_signature_data_challenge(&statechain_entity.pool, &server_pub_nonce, &challenge_str, &statechain_id).await;
+    if !challenge_bound {
+        let response_body = json!({
+            "message": "server nonce already finalized with a different challenge — refusing to co-sign again (nonce reuse would leak the SE key share). Call sign/first for a fresh nonce."
+        });
+        return status::Custom(Status::Conflict, Json(response_body));
+    }
 
     let value = match request.json(&partial_signature_request_payload).send().await {
         Ok(response) => {
