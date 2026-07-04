@@ -23,6 +23,7 @@ pub mod rgb09_send_receive_blinded_witness;
 pub mod rgb10_history_and_selftransfer;
 pub mod rgb11_issue_schemas_uda_cfa;
 pub mod rgb12_validate_offchain_negative;
+pub mod rgb13_consignment_integrity;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
@@ -188,6 +189,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("12") {
         rgb12_validate_offchain_negative::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("13") {
+        rgb13_consignment_integrity::execute().await?;
         return Ok(());
     }
 

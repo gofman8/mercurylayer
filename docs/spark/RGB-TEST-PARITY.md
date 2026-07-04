@@ -40,6 +40,7 @@ internals, or LN channels — identical whether the witness is a plain UTXO or a
 | **`rgb10`** | `check_fungible_history`, `send_to_oneself` | transfer history + self-transfer over statechain |
 | **`rgb11`** | `issue_nia/uda/cfa/ifa` | all four schemas issue over statechain; CFA transfers like NIA |
 | **`rgb12`** | `validate_consignment_unknown_tx`, `receive_from_unbroadcasted_transfer_to_blinded` | off-chain resolver rejects a consignment missing an ancestor witness |
+| **`rgb13`** | `validate_consignment_*_fail` family (integrity) | receiver rejects a payload-tampered consignment and one presented against the wrong witness |
 | `sdk02` | basic NIA flow | issue + off-chain token transfer via the SDK |
 | `sdk09` | `issue_ifa`, `ifa_inflation`, multi-recipient | IFA issuance + on-chain mint (inflate) + batch transfer |
 
@@ -85,10 +86,11 @@ internals, or LN channels — identical whether the witness is a plain UTXO or a
 
 Prioritised remaining work (each becomes an `rgbNN` when its bridge gap is filled):
 
-- **Consignment tamper-rejection** (`validate_consignment_chain_fail/genesis_fail/bundles_fail/
-  commitments_fail/typesystem_fail`): needs an in-crate rust-only tamper helper (load a `Transfer`,
-  mutate genesis `chain_net`/`schema_id` / bundle / op_return, re-serialise) fed to
-  `validate_offchain_chain` expecting rejection.
+- **Semantic consignment tamper-rejection** (`validate_consignment_chain_fail/genesis_fail/
+  bundles_fail/commitments_fail/typesystem_fail`): `rgb13` already covers payload-integrity and
+  wrong-witness rejection via byte-level tamper; the remaining field-level SEMANTIC cases (a
+  well-formed consignment with a mutated `chain_net`/`schema_id`) need an in-crate rust-only tamper
+  helper (load a `Transfer`, mutate the field, re-serialise) fed to `validate_offchain_chain`.
 - **Multi-allocation / multi-asset per coin** (`multiple_transitions_per_vin`, `multiasset_transfer`,
   `invoice_reuse`): a multi-allocation register path + a `create_colored_multiasset_tx` builder.
 - **Issuance-outpoint control & metadata** (`issue_nia_multiple_utxos`, `issue_cfa_multiple_utxos`):
