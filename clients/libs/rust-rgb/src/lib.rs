@@ -266,6 +266,26 @@ impl RgbWallet {
         Ok(out)
     }
 
+    /// Contract metadata for an asset: `(schema, ticker, name, precision, initial_supply,
+    /// max_supply, details)`. `schema` is one of "Nia"/"Uda"/"Cfa"/"Ifa"; for a non-inflatable asset
+    /// `max_supply == initial_supply`, and for an IFA `max_supply == initial_supply + inflation
+    /// right`. `ticker`/`details` are "" when absent. Mirrors rgb-lib `get_asset_metadata`.
+    pub fn asset_metadata(
+        &self,
+        asset_id: &str,
+    ) -> Result<(String, String, String, u8, u64, u64, u64)> {
+        let m = self.wallet.get_asset_metadata(asset_id.to_string())?;
+        Ok((
+            format!("{:?}", m.asset_schema),
+            m.ticker.unwrap_or_default(),
+            m.name,
+            m.precision,
+            m.initial_supply,
+            m.max_supply,
+            m.known_circulating_supply,
+        ))
+    }
+
     /// Settled balance of an asset in this wallet.
     pub fn settled_balance(&self, asset_id: &str) -> Result<u64> {
         Ok(self.wallet.get_asset_balance(asset_id.to_string())?.settled)

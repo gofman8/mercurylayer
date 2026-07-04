@@ -41,6 +41,7 @@ internals, or LN channels — identical whether the witness is a plain UTXO or a
 | **`rgb11`** | `issue_nia/uda/cfa/ifa` | all four schemas issue over statechain; CFA transfers like NIA |
 | **`rgb12`** | `validate_consignment_unknown_tx`, `receive_from_unbroadcasted_transfer_to_blinded` | off-chain resolver rejects a consignment missing an ancestor witness |
 | **`rgb13`** | `validate_consignment_*_fail` family (integrity) | receiver rejects a payload-tampered consignment and one presented against the wrong witness |
+| **`rgb14`** | `issue_nia/cfa/ifa` (metadata), IFA supply invariants | full contract metadata (schema/ticker/name/precision/supply) is faithful; IFA `max = initial + inflation right`, and realizing the right raises circulating supply to the cap |
 | `sdk02` | basic NIA flow | issue + off-chain token transfer via the SDK |
 | `sdk09` | `issue_ifa`, `ifa_inflation`, multi-recipient | IFA issuance + on-chain mint (inflate) + batch transfer |
 
@@ -93,10 +94,12 @@ Prioritised remaining work (each becomes an `rgbNN` when its bridge gap is fille
   helper (load a `Transfer`, mutate the field, re-serialise) fed to `validate_offchain_chain`.
 - **Multi-allocation / multi-asset per coin** (`multiple_transitions_per_vin`, `multiasset_transfer`,
   `invoice_reuse`): a multi-allocation register path + a `create_colored_multiasset_tx` builder.
-- **Issuance-outpoint control & metadata** (`issue_nia_multiple_utxos`, `issue_cfa_multiple_utxos`):
-  an issuance-outpoints arg + an asset-metadata getter.
-- **IFA over statechain deeper** (`ifa_zero_issuance_with_inflation`, `validate_consignment_ifa`):
-  IFA supply getters + an explicit-outpoint `inflate` variant.
+- **Issuance-outpoint control** (`issue_nia_multiple_utxos`, `issue_cfa_multiple_utxos`): an
+  issuance-outpoints arg to place each amount on a caller-chosen coin. (The asset-metadata getter is
+  now done — `asset_metadata`, covered by `rgb14`.)
+- **IFA over statechain deeper** (`ifa_zero_issuance_with_inflation`, `validate_consignment_ifa`): an
+  explicit-outpoint `inflate` variant. (IFA supply getters — max/initial/circulating — are now done,
+  covered by `rgb14`.)
 - **Funding reorg** (`revert_genesis`, `reorg_history`): a resolver-switch harness + `get_witness_ord`
   surface.
 - **UDA transfer**: a data-allocation path on `fund_statechain`/`register_statechain`/`list_allocations`
