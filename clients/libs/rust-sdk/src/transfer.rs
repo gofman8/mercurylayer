@@ -430,8 +430,21 @@ impl SparkWallet {
         }
         self.save_record(&record).await?;
 
-        let branch = mercurylib::wallet::BackupTx {
-            tx_n: 1,
+        // The exit branch is stored root-first: every un-broadcast tx from an ON-CHAIN outpoint
+        // down to this split. When the parent is itself an off-chain sub-coin it already carries a
+        // branch (its own chain from the on-chain root); inherit that and append this split as the
+        // final hop. Otherwise the branch root's input would be the parent's un-broadcast funding
+        // tx, which the receiver cannot resolve on-chain (validate_branch would fail resolving it).
+        let mut branch_txs: Vec<mercurylib::wallet::BackupTx> =
+            mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("branch-{parent_statechain_id}"),
+            )
+            .await
+            .unwrap_or_default();
+        branch_txs.push(mercurylib::wallet::BackupTx {
+            tx_n: (branch_txs.len() + 1) as u32,
             tx: signed_split_tx_hex.to_string(),
             client_public_nonce: String::new(),
             server_public_nonce: String::new(),
@@ -440,7 +453,7 @@ impl SparkWallet {
             blinding_factor: String::new(),
             rgb_consignment: None,
             rgb_blinding: None,
-        };
+        });
         for (id, bkp) in &sub_backups {
             mercuryrustlib::sqlite_manager::insert_backup_txs(
                 &self.inner.cc.pool,
@@ -453,7 +466,7 @@ impl SparkWallet {
                 &self.inner.cc.pool,
                 &self.inner.config.wallet_name,
                 &format!("branch-{id}"),
-                &vec![branch.clone()],
+                &branch_txs,
             )
             .await?;
         }
