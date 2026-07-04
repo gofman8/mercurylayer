@@ -17,6 +17,16 @@ Branches: mercurylayer `feat/spark` · rgb-lib `feat/spark` (both on gofman8/UTE
 | P5 nodejs binding (`mercury-spark-sdkd` daemon + @mercury/spark-sdk) | 769fd34 | stdio protocol driven live |
 | P8 final verification 13/13 | 439e2f4 | SDK1-4 + RGB1-8 + upstream in one pass |
 
+## Spec, tests, traced run (2026-07-04)
+
+| Item | Status | Notes |
+|---|---|---|
+| SPEC.md | **DONE** (512fa4b) | normative spec: roles/trust, data model, full SE API + state transitions, deposit/transfer/split/combine, tokens (RGB, consignment amount, IFA/mint/burn/batch), LN swaps (atomicity), exits+cost, invalidation invariants, error semantics; numbered REQ/INV/ERR with a traceability table mapping each to a test. |
+| Unit tests | **DONE** (512fa4b) | mercury-spark-sdk: 13 pass + doctest — exit-cost math, terminal predicate, error semantics, select invariants (INV-9), split fee/change (INV-10), envelope serde + amount-hint (REQ-21), preimage-hash (INV-14). `cargo +stable test -p mercury-spark-sdk`. |
+| New E2E | **DONE** | sdk09 (IFA issue+mint+batch, G3), sdk10 (terminal-parent verify honest+adversarial, G1). Runner auto-discovers SDK 1-10 + RGB 1-8. |
+| Traced launch | **DONE** | clients/tests/run_all_suites.sh (TRACE=1 -> client reqwest/rgb-lib logs; per-test docker-log snapshots of server/lockbox/electrs). Server RUST_LOG enabled in compose (rocket request logs) + fixed a pre-existing web-block YAML quoting bug so compose can recreate services. Full traced run: TRACE=1 LOGDIR=/tmp/spark_suite_logs ./clients/tests/run_all_suites.sh |
+| Adversarial log review | **PENDING (Opus)** | review /tmp/spark_suite_logs for delay/replay/malform/reorder gaps the spec misses -> new tests + fixes. |
+
 ## Gap closure (2026-07-04) — all three remaining gaps CLOSED
 
 | Gap | Status | Proof |
