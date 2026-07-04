@@ -19,6 +19,9 @@ pub mod rgb05_combine3;
 pub mod rgb06_dag3;
 pub mod rgb07_epoch;
 pub mod rgb08_wide_combine;
+pub mod rgb09_send_receive_blinded_witness;
+pub mod rgb10_history_and_selftransfer;
+pub mod rgb12_validate_offchain_negative;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
@@ -168,6 +171,18 @@ async fn main() -> Result<()> {
     // combines all N in one SE-co-signed tx -> a single payment + change. The combine primitive scales.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
         rgb08_wide_combine::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("9") {
+        rgb09_send_receive_blinded_witness::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("10") {
+        rgb10_history_and_selftransfer::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("12") {
+        rgb12_validate_offchain_negative::execute().await?;
         return Ok(());
     }
 

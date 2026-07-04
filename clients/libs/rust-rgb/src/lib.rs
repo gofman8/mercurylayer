@@ -174,6 +174,48 @@ impl RgbWallet {
         Ok(asset.asset_id)
     }
 
+    /// Issue a UDA (Unique Digital Asset — a single-token NFT). Offline (no broadcast). `details`
+    /// and media are optional; tests typically pass `None`/empty. Returns the contract/asset id.
+    pub fn issue_uda(
+        &self,
+        ticker: &str,
+        name: &str,
+        details: Option<&str>,
+        precision: u8,
+        media_file_path: Option<&str>,
+        attachments_file_paths: Vec<String>,
+    ) -> Result<String> {
+        let asset = self.wallet.issue_asset_uda(
+            ticker.to_string(),
+            name.to_string(),
+            details.map(|s| s.to_string()),
+            precision,
+            media_file_path.map(|s| s.to_string()),
+            attachments_file_paths,
+        )?;
+        Ok(asset.asset_id)
+    }
+
+    /// Issue a CFA (Collectible Fungible Asset). Offline (no broadcast). Like NIA but with a `name`
+    /// (no ticker), optional `details` and optional media. Returns the contract/asset id.
+    pub fn issue_cfa(
+        &self,
+        name: &str,
+        details: Option<&str>,
+        precision: u8,
+        amounts: Vec<u64>,
+        file_path: Option<&str>,
+    ) -> Result<String> {
+        let asset = self.wallet.issue_asset_cfa(
+            name.to_string(),
+            details.map(|s| s.to_string()),
+            precision,
+            amounts,
+            file_path.map(|s| s.to_string()),
+        )?;
+        Ok(asset.asset_id)
+    }
+
     /// Realize `inflation_amounts` of an IFA's inflation-right as new fungible supply in this
     /// wallet's RGB engine. **ON-CHAIN**: broadcasts a witness tx (inflation is a contract state
     /// transition — there is no off-chain variant in RGB). Returns `(txid, minted_total)`.
@@ -213,6 +255,13 @@ impl RgbWallet {
         }
         for a in assets.ifa.unwrap_or_default() {
             out.push((a.asset_id, a.ticker, a.name, a.precision));
+        }
+        for a in assets.uda.unwrap_or_default() {
+            out.push((a.asset_id, a.ticker, a.name, a.precision));
+        }
+        for a in assets.cfa.unwrap_or_default() {
+            // CFA has no ticker; expose the name in both slots so callers can match by name.
+            out.push((a.asset_id, a.name.clone(), a.name, a.precision));
         }
         Ok(out)
     }
