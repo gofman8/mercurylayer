@@ -1,5 +1,25 @@
 use sqlx::Row;
 
+/// Serialize the whole `sign/first` critical section per `statechain_id`. Two concurrent `sign/first`
+/// calls otherwise both pass the NULL-challenge dedup and each make the enclave seal a fresh secnonce,
+/// the second overwriting the first — leaving two server pubnonce rows mapped to one sealed secnonce.
+/// The enclave-side single-use consume already prevents that from being SIGNED with twice (the real
+/// nonce-reuse defence), but serializing here additionally stops the wasted generation and the
+/// in-flight-session stranding (a self/replay-inducible DoS). A transaction-scoped advisory lock keyed
+/// by `hashtext('signfirst', statechain_id)` auto-releases on commit/rollback, so a crashed handler
+/// never leaks the lock. Returns the held transaction; keep it alive until the section is done.
+pub async fn acquire_signfirst_lock<'a>(
+    pool: &'a sqlx::PgPool,
+    statechain_id: &str,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('signfirst'), hashtext($1))")
+        .bind(statechain_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 pub async fn get_server_pubnonce_from_null_challenge(pool: &sqlx::PgPool, statechain_id: &str) -> Option<String> {
 
     let query = "SELECT server_pubnonce \

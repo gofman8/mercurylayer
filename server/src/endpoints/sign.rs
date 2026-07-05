@@ -16,6 +16,12 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
 
     let statechain_entity = statechain_entity.inner();
 
+    // Serialize sign/first for this coin (defence-in-depth for the nonce-reuse guard + stops the
+    // in-flight-session stranding DoS). Held for the whole handler; a transaction-scoped advisory
+    // lock auto-releases when `_signfirst_lock` drops on return. Fail-open on a DB hiccup: the
+    // enclave-side single-use consume remains the authoritative one-signature-per-secnonce guard.
+    let _signfirst_lock = crate::database::sign::acquire_signfirst_lock(&statechain_entity.pool, &statechain_id).await.ok();
+
     let enclave_index = crate::database::utils::get_enclave_index_from_database(&statechain_entity.pool, &statechain_id).await;
 
     let enclave_index = match enclave_index {

@@ -94,7 +94,13 @@ namespace lockbox {
             memset(serialized_server_pubnonce, 0, sizeof(serialized_server_pubnonce));
 
             std::string error_message;
-            bool data_loaded = db_manager::load_generated_key_data(
+            // Atomically load AND consume the sealed secnonce (row-locked, nulled in the same txn).
+            // This enforces one-signature-per-secnonce AT THE ENCLAVE: a second partial-signature
+            // request for the same statechain_id — whether racing this one or arriving after — finds
+            // the secnonce already NULL and is refused below. That closes the MuSig2 nonce-reuse key
+            // leak that the server-side per-nonce challenge binding alone cannot (two concurrent
+            // sign/first calls yield two pubnonce rows mapping to one sealed secnonce).
+            bool data_loaded = db_manager::load_and_consume_secnonce(
                 statechain_id,
                 encrypted_keypair,
                 encrypted_secnonce,
@@ -112,7 +118,10 @@ namespace lockbox {
             bool is_sealed_secnonce_empty = encrypted_secnonce == nullptr;
 
             if (is_sealed_keypair_empty || is_sealed_secnonce_empty) {
-                return crow::response(400, "Empty sealed keypair or sealed secnonce!");
+                // Secnonce already consumed (or never generated): refuse rather than sign again.
+                // Signing a second time with the same secnonce over a different challenge would
+                // leak the SE key share. The client must call sign/first for a fresh nonce.
+                return crow::response(400, "Empty sealed keypair or sealed secnonce (secnonce already consumed — refusing to prevent nonce reuse)!");
             }
 
             auto response = enclave::partial_signature(

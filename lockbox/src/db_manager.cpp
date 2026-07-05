@@ -212,11 +212,107 @@ namespace db_manager {
         }
     }
 
+    bool load_and_consume_secnonce(
+        const std::string& statechain_id,
+        std::unique_ptr<utils::chacha20_poly1305_encrypted_data>& encrypted_keypair,
+        std::unique_ptr<utils::chacha20_poly1305_encrypted_data>& encrypted_secnonce,
+        unsigned char* public_nonce, const size_t public_nonce_size,
+        std::string& error_message)
+    {
+        auto database_connection_string = getDatabaseConnectionString();
+
+        try
+        {
+            pqxx::connection conn(database_connection_string);
+            if (!conn.is_open()) {
+                error_message = "Failed to connect to the database!";
+                return false;
+            }
+
+            // Single transaction: FOR UPDATE locks the row so a concurrent partial-signature call
+            // for the same statechain_id serializes behind us. We read the sealed secnonce and, in
+            // the SAME transaction, null it. The loser of the race observes a NULL secnonce.
+            pqxx::work txn(conn);
+
+            std::string select_query =
+                "SELECT sealed_keypair, sealed_secnonce, public_nonce FROM generated_public_key "
+                "WHERE statechain_id = $1 FOR UPDATE;";
+
+            pqxx::result result = txn.exec_params(select_query, statechain_id);
+
+            if (result.empty()) {
+                error_message = "Failed to retrieve keypair. No data found !";
+                return false;
+            }
+
+            auto sealed_keypair_field = result[0]["sealed_keypair"];
+            auto sealed_secnonce_field = result[0]["sealed_secnonce"];
+            auto public_nonce_field = result[0]["public_nonce"];
+
+            if (sealed_keypair_field.is_null()) {
+                encrypted_keypair.reset();
+            } else if (encrypted_keypair != nullptr) {
+                auto sealed_keypair_view = sealed_keypair_field.as<std::basic_string<std::byte>>();
+
+                std::vector<unsigned char> sealed_keypair(sealed_keypair_view.size());
+                memcpy(sealed_keypair.data(), sealed_keypair_view.data(), sealed_keypair_view.size());
+
+                if (!deserialize(sealed_keypair.data(), encrypted_keypair.get())) {
+                    error_message = "Failed to deserialize keypair!";
+                    return false;
+                }
+            }
+
+            bool had_secnonce = false;
+            if (sealed_secnonce_field.is_null()) {
+                encrypted_secnonce.reset();
+            } else if (encrypted_secnonce != nullptr) {
+                auto sealed_secnonce_view = sealed_secnonce_field.as<std::basic_string<std::byte>>();
+
+                std::vector<unsigned char> sealed_secnonce(sealed_secnonce_view.size());
+                memcpy(sealed_secnonce.data(), sealed_secnonce_view.data(), sealed_secnonce_view.size());
+
+                if (!deserialize(sealed_secnonce.data(), encrypted_secnonce.get())) {
+                    error_message = "Failed to deserialize secnonce!";
+                    return false;
+                }
+                had_secnonce = true;
+            }
+
+            if (!public_nonce_field.is_null() && public_nonce != nullptr) {
+                auto public_nonce_view = public_nonce_field.as<std::basic_string<std::byte>>();
+
+                if (public_nonce_view.size() != public_nonce_size) {
+                    error_message = "Failed to retrieve public nonce. Different size than expected !";
+                    return false;
+                }
+
+                memcpy(public_nonce, public_nonce_view.data(), public_nonce_size);
+            }
+
+            // Consume the secnonce in the same transaction so it can never be signed with twice.
+            if (had_secnonce) {
+                txn.exec_params(
+                    "UPDATE generated_public_key SET sealed_secnonce = NULL WHERE statechain_id = $1;",
+                    statechain_id);
+            }
+            txn.commit();
+
+            conn.close();
+            return true;
+        }
+        catch (std::exception const &e)
+        {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     bool update_sealed_secnonce(
-        const std::string& statechain_id, 
-        unsigned char* serialized_server_pubnonce, const size_t serialized_server_pubnonce_size, 
-        const utils::chacha20_poly1305_encrypted_data& encrypted_secnonce, 
-        std::string& error_message) 
+        const std::string& statechain_id,
+        unsigned char* serialized_server_pubnonce, const size_t serialized_server_pubnonce_size,
+        const utils::chacha20_poly1305_encrypted_data& encrypted_secnonce,
+        std::string& error_message)
     {
         auto database_connection_string = getDatabaseConnectionString();
 
