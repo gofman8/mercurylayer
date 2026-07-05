@@ -16,10 +16,34 @@
 //!   precondition of taking the Lightning money.
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::wallet::SparkWallet;
+
+/// The user-facing SSP interface: the three swap operations a wallet performs against an SSP,
+/// plus `info`. Implemented by the in-process [`SspService`] (embeds the SSP's own wallet + RLN
+/// node) AND by the remote [`SspClient`] (HTTP to a deployed `mercury-ssp` server). Wallet swap
+/// methods take `&impl Ssp`, so the SAME `wallet.pay_lightning_invoice(&ssp, ..)` call works
+/// whether `ssp` is local (tests/embedded) or a remote service (production). Note: `settle_receive`
+/// is deliberately NOT on this trait — it is an SSP-backend operation, never something a user does.
+#[async_trait]
+pub trait Ssp: Send + Sync {
+    async fn info(&self) -> Result<SspInfo>;
+    async fn quote_pay(&self, invoice: &str) -> Result<PayQuote>;
+    /// Pay the invoice for the coin the user already latch-transferred under `batch_id`; returns
+    /// the Lightning preimage (the user's proof of payment).
+    async fn execute_pay(&self, invoice: &str, batch_id: &str) -> Result<String>;
+    async fn create_receive(&self, amount_sats: u64, receiver_address: &str) -> Result<ReceiveSwap>;
+}
+
+/// SSP identity/fee, from `GET /info`.
+#[derive(Clone, Debug)]
+pub struct SspInfo {
+    pub ssp_address: String,
+    pub fee_sats: u64,
+}
 
 /// Minimal HTTP client for a running rgb-lightning-node daemon.
 #[derive(Clone)]
@@ -155,11 +179,14 @@ pub struct PayQuote {
     pub ssp_address: String,
 }
 
-/// An open Lightning-receive swap on the SSP side.
+/// An open Lightning-receive swap. `statechain_id` is the SSP-side coin being handed over: it is
+/// `Some` when produced locally by [`SspService::create_receive`] (the SSP drives settlement), and
+/// `None` when returned by the remote [`SspClient`] (a user only receives the invoice; the SSP
+/// server settles). `settle_receive` (SSP-side) requires it to be `Some`.
 #[derive(Clone, Debug)]
 pub struct ReceiveSwap {
     pub batch_id: String,
-    pub statechain_id: String,
+    pub statechain_id: Option<String>,
     pub invoice: String,
     pub payment_hash: String,
 }
@@ -300,7 +327,7 @@ impl SspService {
             .await?;
         Ok(ReceiveSwap {
             batch_id: pre.batch_id,
-            statechain_id,
+            statechain_id: Some(statechain_id),
             invoice,
             payment_hash: pre.hash,
         })
@@ -310,6 +337,12 @@ impl SspService {
     /// (releasing the coin to the receiver — the SE will not reveal the preimage before this),
     /// retrieve the preimage and claim the HODL invoice. Returns once the invoice is settled.
     pub async fn settle_receive(&self, swap: &ReceiveSwap) -> Result<()> {
+        // settle_receive is SSP-side: the swap must carry the coin it minted. A remote-client swap
+        // (statechain_id = None) is settled by the SSP server that created it, never here.
+        let statechain_id = swap
+            .statechain_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("settle_receive requires a local (SSP-side) swap with a statechain_id"))?;
         // Wait for the HTLC.
         let mut pending = false;
         for _ in 0..90 {
@@ -330,7 +363,7 @@ impl SspService {
         mercuryrustlib::lightning_latch::confirm_pending_invoice(
             self.wallet.client_config(),
             self.wallet.wallet_name(),
-            &swap.statechain_id,
+            statechain_id,
         )
         .await?;
         let mut preimage: Option<String> = None;
@@ -338,7 +371,7 @@ impl SspService {
             match mercuryrustlib::lightning_latch::retrieve_pre_image(
                 self.wallet.client_config(),
                 self.wallet.wallet_name(),
-                &swap.statechain_id,
+                statechain_id,
                 &swap.batch_id,
             )
             .await
@@ -363,54 +396,229 @@ impl SspService {
     }
 }
 
+/// The local SSP satisfies [`Ssp`] by forwarding to its inherent methods (fully-qualified to avoid
+/// the trait/inherent name clash). Behaviour is byte-for-byte the inherent methods.
+#[async_trait]
+impl Ssp for SspService {
+    async fn info(&self) -> Result<SspInfo> {
+        Ok(SspInfo {
+            ssp_address: self.wallet.get_spark_address().await?,
+            fee_sats: self.fee_sats,
+        })
+    }
+    async fn quote_pay(&self, invoice: &str) -> Result<PayQuote> {
+        SspService::quote_pay(self, invoice).await
+    }
+    async fn execute_pay(&self, invoice: &str, batch_id: &str) -> Result<String> {
+        SspService::execute_pay(self, invoice, batch_id).await
+    }
+    async fn create_receive(&self, amount_sats: u64, receiver_address: &str) -> Result<ReceiveSwap> {
+        SspService::create_receive(self, amount_sats, receiver_address).await
+    }
+}
+
+/// Remote SSP over HTTP — the client half of the `mercury-ssp` server. A user with only their own
+/// wallet swaps against a DEPLOYED SSP: `SspClient::new(url)` then the same
+/// `wallet.pay_lightning_invoice(&client, invoice)` / `wallet.create_lightning_invoice(&client, n)`
+/// calls as the in-process path. Mirrors the server's `/info /quote /pay /receive` one-to-one.
+#[derive(Clone)]
+pub struct SspClient {
+    pub base: String,
+    http: reqwest::Client,
+}
+
+impl SspClient {
+    pub fn new(base_url: &str) -> Self {
+        SspClient {
+            base: base_url.trim_end_matches('/').to_string(),
+            // /pay blocks on the SSP's LN-settlement loop (up to ~120s); allow generous headroom.
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(150))
+                .build()
+                .unwrap(),
+        }
+    }
+
+    /// POST returning JSON. The server answers HTTP 200 with `{"error": ".."}` on failure, so we
+    /// MUST inspect the error field rather than trust the status — otherwise a failed quote/pay
+    /// deserializes into a bogus PayQuote / empty preimage.
+    async fn post(&self, path: &str, body: Value) -> Result<Value> {
+        let v: Value = self
+            .http
+            .post(format!("{}/{path}", self.base))
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+            return Err(anyhow!("ssp /{path}: {e}"));
+        }
+        Ok(v)
+    }
+}
+
+#[async_trait]
+impl Ssp for SspClient {
+    async fn info(&self) -> Result<SspInfo> {
+        let v: Value = self
+            .http
+            .get(format!("{}/info", self.base))
+            .send()
+            .await?
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+            return Err(anyhow!("ssp /info: {e}"));
+        }
+        Ok(SspInfo {
+            ssp_address: v["spark_address"].as_str().unwrap_or_default().to_string(),
+            fee_sats: v["fee_sats"].as_u64().unwrap_or(0),
+        })
+    }
+    async fn quote_pay(&self, invoice: &str) -> Result<PayQuote> {
+        let v = self.post("quote", json!({ "invoice": invoice })).await?;
+        Ok(PayQuote {
+            amount_sats: v["amount_sats"].as_u64().unwrap_or(0),
+            fee_sats: v["fee_sats"].as_u64().unwrap_or(0),
+            payment_hash: v["payment_hash"].as_str().unwrap_or_default().to_string(),
+            ssp_address: v["ssp_address"].as_str().unwrap_or_default().to_string(),
+        })
+    }
+    async fn execute_pay(&self, invoice: &str, batch_id: &str) -> Result<String> {
+        let v = self
+            .post("pay", json!({ "invoice": invoice, "batch_id": batch_id }))
+            .await?;
+        v["preimage"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("ssp /pay: no preimage in response"))
+    }
+    async fn create_receive(&self, amount_sats: u64, receiver_address: &str) -> Result<ReceiveSwap> {
+        let v = self
+            .post(
+                "receive",
+                json!({ "amount_sats": amount_sats, "receiver_address": receiver_address }),
+            )
+            .await?;
+        Ok(ReceiveSwap {
+            batch_id: v["batch_id"].as_str().unwrap_or_default().to_string(),
+            statechain_id: None, // the SSP server owns + settles the coin
+            invoice: v["invoice"].as_str().unwrap_or_default().to_string(),
+            payment_hash: v["payment_hash"].as_str().unwrap_or_default().to_string(),
+        })
+    }
+}
+
 impl SparkWallet {
     /// USER SIDE — pay a BOLT11 invoice through an SSP: quote, mint the exact coin (off-chain
     /// split if needed), latch it to the invoice's payment hash and hand it over, then let the
     /// SSP pay. Returns the preimage — cryptographic proof the invoice was paid. Trustless both
-    /// ways: no payment → the latch expires and the coin stays yours.
-    pub async fn pay_lightning_invoice(&self, ssp: &SspService, invoice: &str) -> Result<String> {
-        let quote = ssp.quote_pay(invoice).await?;
-        let total = quote.amount_sats + quote.fee_sats;
-        let coin_id = self.ensure_exact_coin(total).await?;
-        let batch_id = mercuryrustlib::lightning_latch::create_external_hash_latch(
-            self.client_config(),
-            self.wallet_name(),
-            &coin_id,
-            &quote.payment_hash,
-        )
-        .await?;
-        mercuryrustlib::transfer_sender::execute(
-            self.client_config(),
-            &quote.ssp_address,
-            self.wallet_name(),
-            &coin_id,
-            None,
-            false,
-            Some(batch_id.clone()),
-        )
-        .await?;
+    /// ways: no payment → the latch expires and the coin stays yours. `ssp` may be a local
+    /// [`SspService`] or a remote [`SspClient`].
+    pub async fn pay_lightning_invoice(&self, ssp: &impl Ssp, invoice: &str) -> Result<String> {
+        self.pay_lightning_invoice_reclaimable(ssp, invoice)
+            .await
+            .map_err(|(_coin_id, e)| e)
+    }
 
-        let preimage = ssp.execute_pay(invoice, &batch_id).await?;
-
-        // Verify the proof of payment.
-        use sha2::{Digest, Sha256};
-        let digest = hex::encode(Sha256::digest(hex::decode(&preimage)?));
-        if digest != quote.payment_hash {
-            return Err(anyhow!("SSP returned an invalid preimage"));
+    /// Like [`Self::pay_lightning_invoice`], but on failure returns the latched coin's statechain id
+    /// alongside the error so the caller can [`Self::reclaim_lightning_payment`] it once the SE
+    /// `batch_timeout` elapses. `Ok` is the preimage; `Err` is `(coin_statechain_id, error)`. The
+    /// coin id is `None`-encoded as an empty string only if the failure happened before the coin was
+    /// even minted (quote/mint stage) — in that case nothing was latched, so nothing to reclaim.
+    pub async fn pay_lightning_invoice_reclaimable(
+        &self,
+        ssp: &impl Ssp,
+        invoice: &str,
+    ) -> std::result::Result<String, (String, anyhow::Error)> {
+        let pre = async {
+            let quote = ssp.quote_pay(invoice).await?;
+            let total = quote.amount_sats + quote.fee_sats;
+            let coin_id = self.ensure_exact_coin(total).await?;
+            Ok::<_, anyhow::Error>((quote, coin_id))
         }
-        Ok(preimage)
+        .await;
+        let (quote, coin_id) = match pre {
+            Ok(v) => v,
+            Err(e) => return Err((String::new(), e)), // nothing latched yet
+        };
+
+        // From here the coin exists and gets latched: any failure is reclaimable via `coin_id`.
+        let latch_and_pay = async {
+            let batch_id = mercuryrustlib::lightning_latch::create_external_hash_latch(
+                self.client_config(),
+                self.wallet_name(),
+                &coin_id,
+                &quote.payment_hash,
+            )
+            .await?;
+            mercuryrustlib::transfer_sender::execute(
+                self.client_config(),
+                &quote.ssp_address,
+                self.wallet_name(),
+                &coin_id,
+                None,
+                false,
+                Some(batch_id.clone()),
+            )
+            .await?;
+
+            let preimage = ssp.execute_pay(invoice, &batch_id).await?;
+
+            // Verify the proof of payment.
+            use sha2::{Digest, Sha256};
+            let digest = hex::encode(Sha256::digest(hex::decode(&preimage)?));
+            if digest != quote.payment_hash {
+                return Err(anyhow!("SSP returned an invalid preimage"));
+            }
+            Ok::<_, anyhow::Error>(preimage)
+        }
+        .await;
+
+        latch_and_pay.map_err(|e| (coin_id, e))
     }
 
     /// USER SIDE — receive Lightning into a statechain coin via an SSP: returns a BOLT11 invoice
     /// to hand to the payer. When it is paid, the SSP releases the coin and the background
-    /// watcher claims it (TransferClaimed event).
+    /// watcher claims it (TransferClaimed event). `ssp` may be local or remote.
     pub async fn create_lightning_invoice(
         &self,
-        ssp: &SspService,
+        ssp: &impl Ssp,
         amount_sats: u64,
     ) -> Result<ReceiveSwap> {
         let my_address = self.get_spark_address().await?;
         ssp.create_receive(amount_sats, &my_address).await
+    }
+
+    /// USER SIDE — reclaim a coin whose pay swap NEVER settled. When [`Self::pay_lightning_invoice`]
+    /// (or `execute_pay`) returns an error because the SSP could not pay, the coin was latch-locked
+    /// to the SSP but never unlocked — the key handover never completed, so it is still yours. Once
+    /// the SE `batch_timeout` window has elapsed the latch is no longer held; re-transfer the coin
+    /// to yourself (a fresh, un-batched transfer) to clear the stale batch-locked transfer and take
+    /// full custody again. Returns the new statechain id of the reclaimed coin.
+    ///
+    /// SAFETY: only call this after you are CERTAIN the pay failed. A client-side timeout on
+    /// [`SspClient`] is NOT proof of failure — the SSP may have paid; verify via the SSP/preimage
+    /// before reclaiming, or you risk the SSP claiming the coin AND you reclaiming it.
+    pub async fn reclaim_lightning_payment(&self, coin_statechain_id: &str) -> Result<()> {
+        let me = self.get_spark_address().await?;
+        // Fresh, un-batched transfer of the specific coin back to ourselves: the SE drops the stale
+        // batch-locked transfer row and the coin's key rotates back under our control.
+        mercuryrustlib::transfer_sender::execute(
+            self.client_config(),
+            &me,
+            self.wallet_name(),
+            coin_statechain_id,
+            None,
+            false,
+            None,
+        )
+        .await?;
+        let _ = self.claim().await; // pull the reclaimed coin back in
+        Ok(())
     }
 }
 
