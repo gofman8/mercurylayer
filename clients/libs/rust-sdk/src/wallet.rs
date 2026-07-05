@@ -397,6 +397,21 @@ impl SparkWallet {
         let locktime = mercurylib::utils::get_blockheight(latest)?;
         let wait_blocks = locktime.saturating_sub(tip);
 
+        // Safety deadline (off-chain sub-coins only): the earliest height an ANCESTOR could broadcast
+        // its stale backup to race you. The decrementing-locktime ladder drops one `interval` per hop,
+        // so the immediate parent's backup locktime is exactly one interval ABOVE this coin's leaf
+        // backup — and being the shallowest ancestor it matures earliest, making it the binding
+        // deadline. You must broadcast your (locktime-free) branch before it. A flat on-chain coin has
+        // no off-chain ancestor, so there is no such deadline.
+        let exit_deadline_block = if branch.is_empty() {
+            None
+        } else {
+            match mercuryrustlib::utils::info_config(&self.inner.cc).await {
+                std::result::Result::Ok(si) => Some(locktime + si.interval),
+                Err(_) => None, // SE unreachable: a watchtower should cache the interval to compute this offline
+            }
+        };
+
         Ok(crate::types::ExitCostEstimate {
             statechain_id: statechain_id.to_string(),
             branch_txs: branch.len() as u32,
@@ -404,6 +419,7 @@ impl SparkWallet {
             backup_vbytes,
             total_vbytes: branch_vbytes + backup_vbytes,
             wait_blocks,
+            exit_deadline_block,
         })
     }
 

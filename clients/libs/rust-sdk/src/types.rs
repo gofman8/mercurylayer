@@ -116,8 +116,18 @@ pub struct ExitCostEstimate {
     pub branch_vbytes: u64,
     pub backup_vbytes: u64,
     pub total_vbytes: u64,
-    /// Blocks until the backup tx's locktime allows broadcast (0 = ready now).
+    /// Blocks until the backup tx's locktime allows broadcast (0 = ready now). This is when the
+    /// exit COMPLETES (the backup sweeps to your address); it is NOT the safety deadline.
     pub wait_blocks: u32,
+    /// SAFETY DEADLINE (block height) for an off-chain sub-coin: the earliest height at which an
+    /// ANCESTOR could broadcast its own stale backup and race you. You must broadcast your exit
+    /// BRANCH (which is locktime-free) before this height. It is the immediate parent's backup
+    /// locktime = your leaf backup locktime + one ladder `interval` (the earliest-maturing ancestor,
+    /// since the ladder decrements one interval per hop). `None` for a flat on-chain coin (no
+    /// off-chain ancestor can race you). A watchtower MUST use this — not `wait_blocks` — to decide
+    /// when to force-exit; using the coin's own backup or the deposit root's locktime would exit at
+    /// the wrong time and could lose the race.
+    pub exit_deadline_block: Option<u32>,
 }
 
 impl ExitCostEstimate {
@@ -159,6 +169,7 @@ mod tests {
             backup_vbytes: 112,
             total_vbytes: 267,
             wait_blocks: 990,
+            exit_deadline_block: Some(1990),
         };
         assert_eq!(e.total_vbytes, e.branch_vbytes + e.backup_vbytes);
         assert_eq!(e.fee_sats_at(2.0), 534); // ceil(267*2)
