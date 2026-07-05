@@ -43,6 +43,10 @@ pub mod sdk14_watcher_race;
 pub mod sdk15_fresh_doublesign;
 pub mod sdk16_onboarding;
 pub mod sdk17_oor_chain;
+pub mod sdk18_pay_failure_reclaim;
+pub mod sdk19_receive_failure;
+pub mod sdk20_adversarial_gate;
+pub mod sdk21_remote_sspclient;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -136,6 +140,26 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("17") {
         sdk17_oor_chain::execute().await?;
+        return Ok(());
+    }
+    // Lightning PAY failure + reclaim (SDK_E2E=18): unroutable pay -> SSP claims nothing -> reclaim.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("18") {
+        sdk18_pay_failure_reclaim::execute().await?;
+        return Ok(());
+    }
+    // Lightning RECEIVE failure (SDK_E2E=19): never paid -> no preimage, receiver can't claim.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("19") {
+        sdk19_receive_failure::execute().await?;
+        return Ok(());
+    }
+    // Adversarial SSP gate (SDK_E2E=20): C2 wrong-recipient + C3 undersized -> SSP refuses to pay.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("20") {
+        sdk20_adversarial_gate::execute().await?;
+        return Ok(());
+    }
+    // Remote SspClient over HTTP (SDK_E2E=21): pay + receive against a deployed mercury-ssp server.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("21") {
+        sdk21_remote_sspclient::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
