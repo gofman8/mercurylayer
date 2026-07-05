@@ -39,6 +39,7 @@ pub mod sdk10_terminal_parent_verify;
 pub mod sdk11_parity_methods;
 pub mod sdk12_adversarial;
 pub mod sdk13_stale_state;
+pub mod sdk14_watcher_race;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -116,6 +117,10 @@ async fn main() -> Result<()> {
     // Stale-state broadcast (SDK_E2E=13): old-state claw-back is rejected/defeated + watcher detects.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("13") {
         sdk13_stale_state::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("14") {
+        sdk14_watcher_race::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
