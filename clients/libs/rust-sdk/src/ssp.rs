@@ -117,6 +117,35 @@ impl RlnClient {
     }
 }
 
+/// Pure pre-payment gate (review C2/C3): before the SSP pays a Lightning invoice, every coin
+/// latched to the swap must be a pending transfer addressed to the SSP (present in `pending`, which
+/// is built ONLY from transfers the SSP can decrypt with its own key) and their total value must
+/// cover `quote_sats` (invoice + fee). Returns the total on success. Extracted for unit testing.
+fn check_latched_coins(
+    latched_ids: &[String],
+    pending: &[(String, u64)],
+    quote_sats: u64,
+) -> Result<u64> {
+    if latched_ids.is_empty() {
+        return Err(anyhow!("no coin latched to this swap — refusing to pay"));
+    }
+    let mut total: u64 = 0;
+    for sid in latched_ids {
+        let amt = pending
+            .iter()
+            .find(|(s, _)| s == sid)
+            .map(|(_, a)| *a)
+            .ok_or_else(|| anyhow!("latched coin {sid} is not a pending transfer addressed to the SSP — refusing to pay"))?;
+        total = total.saturating_add(amt);
+    }
+    if total < quote_sats {
+        return Err(anyhow!(
+            "latched coin value {total} sats is below the required {quote_sats} (invoice + fee) — refusing to pay"
+        ));
+    }
+    Ok(total)
+}
+
 /// Quote for paying a BOLT11 through the SSP.
 #[derive(Clone, Debug)]
 pub struct PayQuote {
@@ -180,9 +209,29 @@ impl SspService {
             return Err(anyhow!("latch hash does not match the invoice payment hash"));
         }
 
-        // The latched transfer must be addressed to us (claim shows batch-locked, not absent).
+        // PRE-PAYMENT GATE (review C2/C3): identify which coin(s) this batch will hand us and
+        // validate them BEFORE paying real Lightning money. Each latched coin must be (a) a pending
+        // transfer genuinely addressed to the SSP — proven because `peek_pending_transfers` only
+        // returns transfers this wallet can DECRYPT with its own auth key — and (b) collectively
+        // worth at least the invoice + fee. Without (a) we would pay for a coin sent to someone
+        // else; without (b) for an undersized coin. Both are unbounded fund-loss otherwise.
         let quote_sats = amt_msat / 1000 + self.fee_sats;
-        let _ = quote_sats; // amount enforcement happens when claiming the coin below
+        let latched_ids = mercuryrustlib::lightning_latch::get_statechain_ids_by_batch_id(
+            self.wallet.client_config(),
+            batch_id,
+        )
+        .await?;
+        if latched_ids.is_empty() {
+            return Err(anyhow!("no coin latched under batch {batch_id} — refusing to pay"));
+        }
+        let pending = mercuryrustlib::transfer_receiver::peek_pending_transfers(
+            self.wallet.client_config(),
+            self.wallet.wallet_name(),
+        )
+        .await?;
+        let pending_pairs: Vec<(String, u64)> =
+            pending.into_iter().map(|p| (p.statechain_id, p.amount)).collect();
+        check_latched_coins(&latched_ids, &pending_pairs, quote_sats)?;
 
         // Pay the invoice over Lightning.
         self.rln.send_payment(invoice).await?;
@@ -207,11 +256,19 @@ impl SspService {
             &preimage,
         )
         .await?;
-        let claim = self.wallet.claim().await?;
-        if claim.claimed_transfers == 0 {
+        let mut claimed = self.wallet.claim().await?.claimed_transfers;
+        if claimed == 0 {
             // One retry: relay/claim timing.
             tokio::time::sleep(Duration::from_secs(2)).await;
-            self.wallet.claim().await?;
+            claimed = self.wallet.claim().await?.claimed_transfers;
+        }
+        if claimed == 0 {
+            // We paid over Lightning but could not take custody of the latched coin. Do NOT report
+            // success (review M3): surface it so the operator can investigate the latch/preimage
+            // rather than silently eating the loss.
+            return Err(anyhow!(
+                "paid the Lightning invoice for batch {batch_id} but claimed 0 transfers — the latched coin was not received; investigate before retrying"
+            ));
         }
         Ok(preimage)
     }
@@ -372,5 +429,51 @@ mod swap_tests {
         // a different preimage does not
         let wrong = [0x22u8; 32];
         assert_ne!(hex::encode(Sha256::digest(wrong)), hash);
+    }
+
+    // review C2/C3: the SSP pre-payment gate. Uses the module-private helper directly.
+    use super::check_latched_coins;
+
+    fn pend(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+        pairs.iter().map(|(s, a)| (s.to_string(), *a)).collect()
+    }
+
+    #[test]
+    fn gate_accepts_addressed_and_sufficient() {
+        // coin addressed to us, worth exactly invoice+fee
+        let ids = vec!["sc1".to_string()];
+        let pending = pend(&[("sc1", 25_000), ("other", 9)]);
+        assert_eq!(check_latched_coins(&ids, &pending, 25_000).unwrap(), 25_000);
+    }
+
+    #[test]
+    fn gate_rejects_coin_not_addressed_to_ssp() {
+        // C2: the latched id is NOT among our decryptable pending transfers.
+        let ids = vec!["sc_attacker".to_string()];
+        let pending = pend(&[("sc1", 100_000)]);
+        assert!(check_latched_coins(&ids, &pending, 25_000).is_err());
+    }
+
+    #[test]
+    fn gate_rejects_undersized_coin() {
+        // C3: addressed to us, but below invoice+fee.
+        let ids = vec!["sc1".to_string()];
+        let pending = pend(&[("sc1", 24_999)]);
+        assert!(check_latched_coins(&ids, &pending, 25_000).is_err());
+    }
+
+    #[test]
+    fn gate_rejects_empty_latch() {
+        assert!(check_latched_coins(&[], &pend(&[("sc1", 1_000)]), 1).is_err());
+    }
+
+    #[test]
+    fn gate_sums_multiple_latched_coins() {
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let pending = pend(&[("a", 10_000), ("b", 16_000)]);
+        assert_eq!(check_latched_coins(&ids, &pending, 25_000).unwrap(), 26_000);
+        // but if one of them isn't ours, reject wholesale
+        let ids2 = vec!["a".to_string(), "c".to_string()];
+        assert!(check_latched_coins(&ids2, &pending, 1).is_err());
     }
 }

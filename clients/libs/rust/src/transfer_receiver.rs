@@ -241,6 +241,89 @@ async fn get_msg_addr(auth_pubkey: &str, client_config: &ClientConfig) -> Result
     Ok(response.list_enc_transfer_msg)
 }
 
+/// A pending incoming transfer this wallet can see WITHOUT unlocking or claiming it. The transfer
+/// message is decrypted with the wallet's own auth key, so a transfer appears here ONLY if it is
+/// genuinely addressed to this wallet; the amount is read from the funding tx0 (or, for an off-chain
+/// sub-coin, its exit branch). Batch-locked transfers appear here too — the peek stops before the
+/// receiver/unlock step that the batch lock gates. The SSP uses this to verify, BEFORE paying a
+/// Lightning invoice, that the coin latched to the swap is (a) really addressed to it and (b) worth
+/// at least the invoice + fee (review C2/C3): without both checks it would pay for a coin sent to
+/// someone else, or an undersized coin.
+#[derive(Clone, Debug)]
+pub struct PendingTransferInfo {
+    pub statechain_id: String,
+    pub amount: u64,
+}
+
+pub async fn peek_pending_transfers(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+) -> Result<Vec<PendingTransferInfo>> {
+    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+
+    // Map each auth pubkey to a private key that can decrypt messages addressed to it.
+    let mut privkey_by_pubkey: HashMap<String, String> = HashMap::new();
+    for coin in wallet.coins.iter() {
+        privkey_by_pubkey
+            .entry(coin.auth_pubkey.clone())
+            .or_insert_with(|| coin.auth_privkey.clone());
+    }
+
+    let mut out: Vec<PendingTransferInfo> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for (auth_pubkey, auth_privkey) in privkey_by_pubkey.iter() {
+        let enc_messages = match get_msg_addr(auth_pubkey, client_config).await {
+            std::result::Result::Ok(m) => m,
+            Err(_) => continue,
+        };
+        for enc_message in enc_messages {
+            let transfer_msg = match mercurylib::transfer::receiver::decrypt_transfer_msg(
+                &enc_message,
+                auth_privkey,
+            ) {
+                std::result::Result::Ok(m) => m,
+                Err(_) => continue, // not addressed to us / undecryptable
+            };
+            if !seen.insert(transfer_msg.statechain_id.clone()) {
+                continue;
+            }
+            // Amount from the funding tx0 (index-0 backup group), read on-chain or from the branch.
+            let groups = split_backup_transactions(&transfer_msg.backup_transactions);
+            let amount = if let Some(first_group) = groups.first() {
+                match mercurylib::transfer::receiver::get_tx0_outpoint(first_group) {
+                    std::result::Result::Ok(tx0_outpoint) => {
+                        match get_tx0_or_branch(
+                            &client_config.electrum_client,
+                            &tx0_outpoint.txid,
+                            &transfer_msg.branch_txs,
+                        )
+                        .await
+                        {
+                            std::result::Result::Ok((tx0_hex, _)) => {
+                                mercurylib::transfer::receiver::get_amount_from_tx0(
+                                    &tx0_hex,
+                                    &tx0_outpoint,
+                                )
+                                .unwrap_or(0)
+                            }
+                            Err(_) => 0,
+                        }
+                    }
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            };
+            out.push(PendingTransferInfo {
+                statechain_id: transfer_msg.statechain_id,
+                amount,
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Vec<Vec<BackupTx>> {
     // HashMap to store grouped transactions
     let mut grouped_txs: HashMap<(String, u32), Vec<BackupTx>> = HashMap::new();

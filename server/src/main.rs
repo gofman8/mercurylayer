@@ -148,6 +148,7 @@ async fn main() {
             endpoints::sign::sign_first,
             endpoints::sign::sign_second,
             endpoints::lightning_latch::get_paymenthash,
+            endpoints::lightning_latch::get_batch_statechains,
             endpoints::lightning_latch::post_paymenthash,
             endpoints::lightning_latch::transfer_preimage,
             endpoints::lightning_latch::post_paymenthash_external,

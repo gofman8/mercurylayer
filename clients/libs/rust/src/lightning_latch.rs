@@ -170,6 +170,31 @@ pub async fn get_payment_hash(client_config: &ClientConfig, batch_id: &str) -> R
     Ok(Some(payment_hash_response_payload.hash))
 }
 
+/// The statechain ids latched under a batch (SSP pre-payment validation). Returns an empty vec if
+/// the SE has no latch for the batch.
+pub async fn get_statechain_ids_by_batch_id(client_config: &ClientConfig, batch_id: &str) -> Result<Vec<String>> {
+
+    let path = format!("transfer/batch_statechains/{}", batch_id);
+
+    let client = client_config.get_reqwest_client()?;
+    let request = client.get(&format!("{}/{}", client_config.statechain_entity, path));
+
+    let response = request.send().await?;
+
+    if response.status() != 200 {
+        let response_body = response.text().await?;
+        return Err(anyhow!(response_body));
+    }
+
+    let value: serde_json::Value = serde_json::from_str(response.text().await?.as_str())?;
+    let ids = value
+        .get("statechain_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    Ok(ids)
+}
+
 /// Latch v2: bind a coin to an EXTERNAL payment hash (e.g. a BOLT11 invoice hash). The SE stores
 /// the hash only; the resulting batch unlocks when anyone presents the preimage
 /// ([`unlock_by_preimage`]) — the submarine half of a pay-invoice swap. Returns the batch id to

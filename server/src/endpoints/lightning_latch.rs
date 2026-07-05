@@ -48,6 +48,16 @@ pub async fn get_paymenthash(statechain_entity: &State<StateChainEntity>, batch_
     return status::Custom(Status::Ok, Json(response_body));
 }
 
+/// The statechain ids latched under a batch. The SSP uses this to identify WHICH coin(s) a
+/// pay-invoice swap will hand it, so it can verify — before paying — that each is addressed to it
+/// and worth at least the invoice + fee (review C2/C3). Batch ids are random UUIDs shared only
+/// between the swap participants, so exposing the mapping is not a meaningful information leak.
+#[get("/transfer/batch_statechains/<batch_id>")]
+pub async fn get_batch_statechains(statechain_entity: &State<StateChainEntity>, batch_id: &str) -> status::Custom<Json<Value>> {
+    let statechain_ids = crate::database::lightning_latch::get_statechain_ids_by_batch_id(&statechain_entity.pool, batch_id).await;
+    status::Custom(Status::Ok, Json(json!({ "statechain_ids": statechain_ids })))
+}
+
 #[post("/transfer/paymenthash", format = "json", data = "<payment_hash_payload>")]
 pub async fn post_paymenthash(statechain_entity: &State<StateChainEntity>, payment_hash_payload: Json<PaymentHashRequestPayload>) -> status::Custom<Json<Value>>  {
 
@@ -204,6 +214,13 @@ pub async fn unlock_by_preimage(statechain_entity: &State<StateChainEntity>, pay
     }
 
     let ids = crate::database::lightning_latch::get_statechain_ids_by_batch_id(&statechain_entity.pool, &batch_id).await;
+    if ids.is_empty() {
+        // No coins latched under this batch: a correct preimage that flips NOTHING must not read as
+        // Success (review M3), or a caller (e.g. the SSP) can believe a swap settled when no coin
+        // was ever unlocked.
+        let response_body = json!({ "message": "No coins latched under this batch (nothing to unlock)" });
+        return status::Custom(Status::NotFound, Json(response_body));
+    }
     for statechain_id in &ids {
         // Sender-side confirm (locked2), exactly like the classic sender unlock.
         crate::database::transfer_receiver::update_unlock_transfer(&statechain_entity.pool, true, statechain_id).await;
