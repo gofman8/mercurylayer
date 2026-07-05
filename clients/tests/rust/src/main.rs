@@ -41,6 +41,7 @@ pub mod sdk12_adversarial;
 pub mod sdk13_stale_state;
 pub mod sdk14_watcher_race;
 pub mod sdk15_fresh_doublesign;
+pub mod sdk16_onboarding;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -126,6 +127,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("15") {
         sdk15_fresh_doublesign::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("16") {
+        sdk16_onboarding::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
