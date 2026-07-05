@@ -9,8 +9,10 @@ description = "Bridge between Mercury Layer (statechains) and rgb-lib for issuin
 # this bridge only ever exchanges *strings* (base64 PSBTs, hex txids, base64 consignments) with the
 # Mercury side - no Bitcoin types cross the boundary.
 [dependencies]
-# For the UTEXO fork deliverable, prefer the git form:
-#   rgb-lib = { git = "https://github.com/UTEXO-Protocol/rgb-lib", branch = "feat/statechain", default-features = false, features = ["electrum"] }
+# rgb-lib is our statechain fork at gofman8/rgb-lib (branch feat/spark). The active dep is a path to
+# the local checkout of that fork (its git `origin` is https://github.com/gofman8/rgb-lib) so rgb-lib
+# edits take effect on rebuild; the equivalent git form for a checkout-free build is:
+#   rgb-lib = { git = "https://github.com/gofman8/rgb-lib", branch = "feat/spark", default-features = false, features = ["electrum"] }
 rgb-lib = { path = "../../../../utexo-rgb-lib", default-features = false, features = ["electrum"] }
 anyhow = "1.0"
 base64 = "0.22"
