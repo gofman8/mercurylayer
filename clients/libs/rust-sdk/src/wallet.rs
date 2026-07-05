@@ -157,7 +157,8 @@ impl SparkWallet {
     /// Balance across all coins, including per-asset token balances (when configured).
     pub async fn get_balance(&self) -> Result<Balance> {
         let record = self.record().await?;
-        let mut balance = compute_balance(&record);
+        let carriers = self.token_carrier_outpoints().await.unwrap_or_default();
+        let mut balance = compute_balance_excluding(&record, &carriers);
         balance.tokens = self.get_token_balances().await.unwrap_or_default();
         Ok(balance)
     }
@@ -632,10 +633,33 @@ fn coin_key(c: &Coin) -> String {
     )
 }
 
+/// The coin's on-chain outpoint (`"txid:vout"`), matching rgb-lib's allocation outpoint format so a
+/// token-carrier coin can be recognised and kept out of plain-BTC selection/balance (review H2).
+/// `None` when the funding utxo is not yet known.
+pub(crate) fn coin_outpoint(c: &Coin) -> Option<String> {
+    match (c.utxo_txid.as_ref(), c.utxo_vout) {
+        (Some(txid), Some(vout)) => Some(format!("{txid}:{vout}")),
+        _ => None,
+    }
+}
+
 pub(crate) fn compute_balance(record: &WalletRecord) -> Balance {
+    compute_balance_excluding(record, &std::collections::HashSet::new())
+}
+
+/// Like [`compute_balance`] but treats coins in `carriers` (token-carrier outpoints, `"txid:vout"`)
+/// as NOT spendable BTC — their sats are excluded from every BTC bucket because spending them as
+/// plain sats would destroy the RGB allocation (review H2). Those sats surface only via `tokens`.
+pub(crate) fn compute_balance_excluding(
+    record: &WalletRecord,
+    carriers: &std::collections::HashSet<String>,
+) -> Balance {
     let mut b = Balance::default();
     for c in &record.coins {
         if c.duplicate_index != 0 {
+            continue;
+        }
+        if coin_outpoint(c).map_or(false, |o| carriers.contains(&o)) {
             continue;
         }
         let sats = c.amount.unwrap_or_default() as u64;

@@ -19,7 +19,13 @@ use std::str::FromStr;
 
 use crate::select::{self, Candidate, Plan};
 use crate::types::{SdkError, TransferResult, TransferredCoin};
-use crate::wallet::SparkWallet;
+use crate::wallet::{coin_outpoint, SparkWallet};
+
+/// True if this coin's utxo currently carries an RGB token allocation. Such coins must never be
+/// selected for a plain-BTC spend — doing so destroys the allocation (review H2).
+fn is_token_carrier(c: &Coin, carriers: &std::collections::HashSet<String>) -> bool {
+    coin_outpoint(c).map_or(false, |o| carriers.contains(&o))
+}
 
 impl SparkWallet {
     /// Send `amount_sats` to a statechain address. Exact amounts always work: the SDK either finds
@@ -31,11 +37,13 @@ impl SparkWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
+        let carriers = self.token_carrier_outpoints().await?;
 
         let spendable: Vec<&Coin> = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !is_token_carrier(c, &carriers))
             .collect();
         let candidates: Vec<Candidate> = spendable
             .iter()
@@ -135,12 +143,14 @@ impl SparkWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
+        let carriers = self.token_carrier_outpoints().await?;
 
-        // Carrier: a confirmed coin large enough for all pieces + fee reserve.
+        // Parent: a confirmed, non-token-carrier coin large enough for all pieces + fee reserve.
         let carrier = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !is_token_carrier(c, &carriers))
             .filter(|c| {
                 let a = c.amount.unwrap_or_default() as u64;
                 a > total + split_fee_reserve(a)
@@ -243,18 +253,21 @@ impl SparkWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
+        let carriers = self.token_carrier_outpoints().await?;
         if let Some(c) = record.coins.iter().find(|c| {
             c.status == CoinStatus::CONFIRMED
                 && c.duplicate_index == 0
                 && c.amount.unwrap_or_default() as u64 == sats
+                && !is_token_carrier(c, &carriers)
         }) {
             return Ok(c.statechain_id.clone().unwrap_or_default());
         }
-        // Split the smallest coin that can cover the piece + fee reserve.
+        // Split the smallest non-token-carrier coin that can cover the piece + fee reserve.
         let parent = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !is_token_carrier(c, &carriers))
             .filter(|c| {
                 let a = c.amount.unwrap_or_default() as u64;
                 a > sats + split_fee_reserve(a)
@@ -283,6 +296,14 @@ impl SparkWallet {
             })
             .cloned()
             .ok_or_else(|| anyhow!("no confirmed coin with statechain id {statechain_id}"))?;
+        // A plain-BTC split must never consume a token carrier (review H2): its RGB allocation
+        // would be destroyed. Token moves go through the colored-split path instead.
+        let carriers = self.token_carrier_outpoints().await?;
+        if is_token_carrier(&parent, &carriers) {
+            return Err(anyhow!(
+                "coin {statechain_id} carries an RGB token allocation; splitting it as plain BTC would destroy the token — use a token transfer or pick a different coin"
+            ));
+        }
         let parent_sats = parent.amount.unwrap_or_default() as u64;
         // Reserve a miner-fee margin for the (only-on-exit) broadcast of the split tx.
         let fee_reserve = split_fee_reserve(parent_sats);

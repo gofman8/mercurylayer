@@ -341,6 +341,29 @@ impl SparkWallet {
         })
     }
 
+    /// Outpoints (`"txid:vout"`) of every coin that currently carries an RGB token allocation.
+    /// BTC coin-selection and the spendable-BTC balance MUST exclude these: spending a token
+    /// carrier as ordinary sats destroys its RGB allocation with no warning (review H2). Empty when
+    /// token support is not configured (the common pure-BTC wallet — no RGB engine is opened).
+    pub(crate) async fn token_carrier_outpoints(
+        &self,
+    ) -> Result<std::collections::HashSet<String>> {
+        if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().unwrap();
+        tokio::task::block_in_place(|| -> Result<std::collections::HashSet<String>> {
+            let mut out = std::collections::HashSet::new();
+            for (asset_id, _ticker, _name, _precision) in w.list_assets()? {
+                for (outpoint, _amt, _settled) in w.list_allocations(&asset_id)? {
+                    out.insert(outpoint);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Send `token_amount` of `asset_id` to a statechain address, entirely off-chain: colored
     /// split (exact token piece + change back to this wallet) then branch-carrying key handover
     /// of the piece coin. The receiver's SDK auto-claims, validates the consignment off-chain and
