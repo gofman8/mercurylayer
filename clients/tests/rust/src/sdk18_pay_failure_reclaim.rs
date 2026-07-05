@@ -68,6 +68,18 @@ pub async fn execute() -> Result<()> {
         Err((cid, e)) => (cid, e),
     };
     assert!(!coin_id.is_empty(), "the failure must carry the latched coin id for reclaim");
+    // Pin the CAUSE: it must be a Lightning routing failure, NOT the pre-payment gate or a mint
+    // error (which would make this a false-pass — the test would be green without ever exercising
+    // the failure path it claims). (review test-rigor [4])
+    let msg = err.to_string();
+    assert!(
+        msg.contains("lightning payment failed") || msg.contains("did not settle"),
+        "the failure must be an LN routing failure, got: {msg}"
+    );
+    assert!(
+        !msg.contains("refusing to pay"),
+        "the failure must NOT be the pre-payment gate, got: {msg}"
+    );
     println!("SDK18 - pay failed as expected (coin {coin_id}): {err}");
 
     // The SSP paid nothing and claimed nothing.
@@ -90,6 +102,15 @@ pub async fn execute() -> Result<()> {
         "the coin is latched (in transfer), so available dropped ({alice_latched} < {alice_pre})"
     );
     println!("SDK18 - coin is latched to the SSP; alice available now {alice_latched}");
+
+    // The latch must HOLD during the swap window: reclaiming BEFORE batch_timeout must be REFUSED
+    // by the SE (otherwise a user could reclaim while the SSP is mid-payment). (review test-rigor [9])
+    let early = alice.reclaim_lightning_payment(&coin_id).await;
+    assert!(
+        early.is_err(),
+        "reclaim before batch_timeout must be refused (the coin is locked to the SSP)"
+    );
+    println!("SDK18 - reclaim correctly BLOCKED before the batch_timeout \u{2713}");
 
     // Reclaim: after the batch_timeout (120s) the latch no longer holds; re-take custody.
     println!("SDK18 - waiting out the 120s batch_timeout before reclaim...");

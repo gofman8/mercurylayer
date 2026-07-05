@@ -431,29 +431,44 @@ impl SspClient {
     pub fn new(base_url: &str) -> Self {
         SspClient {
             base: base_url.trim_end_matches('/').to_string(),
-            // /pay blocks on the SSP's LN-settlement loop (up to ~120s); allow generous headroom.
+            // /pay blocks on the SSP's LN-settlement loop (~120s of polls) PLUS unlock+claim+SE
+            // round-trips, so a SUCCESSFUL pay can approach ~150s+. The client timeout MUST exceed
+            // the server's true worst case, or a genuine success surfaces as a timeout that is
+            // indistinguishable from failure and could trigger an unsafe reclaim (review H1). 240s.
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(150))
+                .timeout(Duration::from_secs(240))
                 .build()
                 .unwrap(),
         }
     }
 
-    /// POST returning JSON. The server answers HTTP 200 with `{"error": ".."}` on failure, so we
-    /// MUST inspect the error field rather than trust the status — otherwise a failed quote/pay
-    /// deserializes into a bogus PayQuote / empty preimage.
+    /// POST returning a JSON OBJECT. Robust error detection (review [1]/[13]): a failure may arrive
+    /// as (a) the server's own HTTP-200 `{"error": ".."}`, (b) a Rocket catcher (4xx/5xx) whose body
+    /// is `{"error": {..object..}}` or HTML, or (c) a non-JSON/empty body. We treat any non-2xx
+    /// status, any `error` field, or a body that is not a JSON object as an error — never letting a
+    /// failure deserialize into a bogus all-zero PayQuote / empty preimage.
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let v: Value = self
-            .http
-            .post(format!("{}/{path}", self.base))
-            .json(&body)
-            .send()
-            .await?
-            .json()
+        self.request(self.http.post(format!("{}/{path}", self.base)).json(&body), path)
             .await
-            .unwrap_or(Value::Null);
-        if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
-            return Err(anyhow!("ssp /{path}: {e}"));
+    }
+
+    async fn request(&self, rb: reqwest::RequestBuilder, path: &str) -> Result<Value> {
+        let resp = rb.header("Accept", "application/json").send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if !status.is_success() {
+            let detail = v
+                .get("error")
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| text.chars().take(200).collect());
+            return Err(anyhow!("ssp /{path} -> {status}: {detail}"));
+        }
+        if let Some(e) = v.get("error") {
+            return Err(anyhow!("ssp /{path}: {}", e));
+        }
+        if !v.is_object() {
+            return Err(anyhow!("ssp /{path}: non-object response body"));
         }
         Ok(v)
     }
@@ -462,19 +477,13 @@ impl SspClient {
 #[async_trait]
 impl Ssp for SspClient {
     async fn info(&self) -> Result<SspInfo> {
-        let v: Value = self
-            .http
-            .get(format!("{}/info", self.base))
-            .send()
-            .await?
-            .json()
-            .await
-            .unwrap_or(Value::Null);
-        if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
-            return Err(anyhow!("ssp /info: {e}"));
+        let v = self.request(self.http.get(format!("{}/info", self.base)), "info").await?;
+        let addr = v["spark_address"].as_str().unwrap_or_default();
+        if addr.is_empty() {
+            return Err(anyhow!("ssp /info: no spark_address (server not ready?)"));
         }
         Ok(SspInfo {
-            ssp_address: v["spark_address"].as_str().unwrap_or_default().to_string(),
+            ssp_address: addr.to_string(),
             fee_sats: v["fee_sats"].as_u64().unwrap_or(0),
         })
     }
@@ -600,9 +609,18 @@ impl SparkWallet {
     /// to yourself (a fresh, un-batched transfer) to clear the stale batch-locked transfer and take
     /// full custody again. Returns the new statechain id of the reclaimed coin.
     ///
-    /// SAFETY: only call this after you are CERTAIN the pay failed. A client-side timeout on
-    /// [`SspClient`] is NOT proof of failure — the SSP may have paid; verify via the SSP/preimage
-    /// before reclaiming, or you risk the SSP claiming the coin AND you reclaiming it.
+    /// SAFETY — read before automating (review H1/[2]): reclaim is only safe when the SSP will
+    /// NOT settle. Two error cases are NOT proof of that and must NOT auto-trigger a reclaim:
+    ///   1. A client-side timeout talking to a remote [`SspClient`] — the SSP may have paid and be
+    ///      about to claim. (The 240s client timeout is sized above the server's worst case to make
+    ///      this rare, but a re-queryable SSP `/pay` status endpoint is the real fix — TODO.)
+    ///   2. An `execute_pay` error AFTER the SSP revealed the preimage (paid, then its claim step
+    ///      hiccuped) — the SSP's background watcher will still claim, so reclaiming here double-
+    ///      spends the SSP.
+    /// The SE's batch lock only protects you until `batch_timeout`; after that this call succeeds
+    /// even if the SSP paid. So only reclaim once you have POSITIVELY confirmed non-payment (e.g. no
+    /// preimage exists for the invoice hash). This method itself only enforces the SE's batch-lock
+    /// (it fails before `batch_timeout`); the non-payment confirmation is the caller's obligation.
     pub async fn reclaim_lightning_payment(&self, coin_statechain_id: &str) -> Result<()> {
         let me = self.get_spark_address().await?;
         // Fresh, un-batched transfer of the specific coin back to ourselves: the SE drops the stale

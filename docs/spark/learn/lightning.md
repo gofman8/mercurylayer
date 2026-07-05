@@ -97,6 +97,25 @@ Tests: `sdk05` (pay), `sdk06` (receive), `sdk18` (pay-failure + reclaim), `sdk19
 backend supports them, but the SDK/SSP swap path is sats-only today. Reuses the same `Ssp` /
 `SspClient` seam (planned `sdk23`).
 
+### Before exposing a public SSP (production hardening)
+
+The `mercury-ssp` server is fine as a single-tenant / testnet service but is NOT yet safe to expose
+on the internet (adversarial-review findings, all server-side):
+
+- **Auth + rate-limit.** `/pay` and `/receive` are unauthenticated and unthrottled — a fund-moving
+  surface open to any caller. `/receive` in particular commits SSP capital *before* the payer is on
+  the hook (it splits + latches a coin and opens a HODL invoice per call), so an anonymous loop is a
+  liquidity-griefing DoS. Put the server behind an API key / signed-request guard + a rate limiter,
+  bind it to localhost behind a reverse proxy, and only commit the coin once the payer's HTLC is
+  pending.
+- **Idempotency.** `/pay` has no per-`batch_id` dedup; concurrent/duplicate calls waste worker slots
+  and can double-attempt. Serialize per batch and cache the preimage; add a `/pay/status?batch_id`
+  endpoint so a client that timed out re-queries instead of reclaiming (this is the real fix for the
+  reclaim-ambiguity hazard — see `reclaim_lightning_payment`'s SAFETY note).
+- **Proper HTTP status codes.** The server answers `200 {"error":..}` on failures, so edge
+  rate-limiters/WAFs and monitoring can't see abuse. Return 4xx/5xx; the SDK's `SspClient` already
+  keys on status first, so this is a server-only change.
+
 ## Difference from Spark
 
 Spark splits the preimage across operators with verifiable secret sharing (needed because any

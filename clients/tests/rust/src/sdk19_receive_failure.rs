@@ -60,6 +60,16 @@ pub async fn execute() -> Result<()> {
     // No payment. The SE must not release the preimage: settle_receive would time out; here we
     // assert the fund-safety invariant directly (cheaply) rather than waiting out its 180s loop.
     let sid = swap.statechain_id.clone().ok_or_else(|| anyhow!("local swap should carry a statechain_id"))?;
+
+    // First confirm the latch is correctly WIRED at the SE (the batch is registered on this hash),
+    // so the withheld-preimage assertion below is attributable to non-payment — not a broken
+    // batch_id/auth that would make retrieve_pre_image error for an unrelated reason. (test-rigor [5])
+    let se_hash = mercuryrustlib::lightning_latch::get_payment_hash(ssp.wallet.client_config(), &swap.batch_id)
+        .await?
+        .ok_or_else(|| anyhow!("SE has no latch for this batch — wiring is broken, not a withholding test"))?;
+    assert_eq!(se_hash, swap.payment_hash, "the SE latch is registered on the swap's payment hash");
+    println!("SDK19 - latch correctly wired at the SE (hash matches) \u{2713}");
+
     let got_preimage = mercuryrustlib::lightning_latch::retrieve_pre_image(
         ssp.wallet.client_config(),
         ssp.wallet.wallet_name(),

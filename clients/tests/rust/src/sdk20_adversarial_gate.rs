@@ -133,9 +133,12 @@ pub async fn execute() -> Result<()> {
     let r_c3 = ssp.execute_pay(&invoice_c3, &batch_c3).await;
     let e_c3 = r_c3.expect_err("SSP must REFUSE an undersized coin (C3)");
     println!("SDK20 - C3 refused: {e_c3}");
+    let m_c3 = e_c3.to_string();
+    // Pin the OBSERVED numbers so an amount-read-as-0 regression cannot false-pass the amount gate
+    // (a coin read as 0 would still be "below the required", but the true value must be seen). ([6])
     assert!(
-        e_c3.to_string().contains("below the required"),
-        "C3 must fail the amount check, got: {e_c3}"
+        m_c3.contains("below the required") && m_c3.contains("10000") && m_c3.contains("25000"),
+        "C3 must report the true undersized value (10000) vs required (25000), got: {m_c3}"
     );
     assert_ne!(
         merchant_node.invoice_status(&invoice_c3).await?,
