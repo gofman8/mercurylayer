@@ -10,6 +10,25 @@ use crate::config::SdkConfig;
 use crate::events::WalletEvent;
 use crate::types::{Balance, ClaimResult, DepositAddressInfo, SdkError};
 
+/// A complete off-line recovery bundle for a wallet (review H3). Contains everything that lives
+/// ONLY on the owner's disk and that the SE cannot re-serve after a claim: the full wallet record
+/// (mnemonic + coins + activity), every backup row (the pre-signed exit ladder, the off-chain
+/// `branch-*` exit branches, and the `parents-*` terminal-ancestor lists), and the RGB engine seed.
+/// NOTE: the RGB *stash* (contracts/consignments under `rgb_data_dir`) is NOT embedded — copy that
+/// directory too; from re-obtainable consignments the stash can be rebuilt, but not from the seed
+/// alone.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RecoveryBundle {
+    pub version: u32,
+    pub wallet_name: String,
+    pub wallet: WalletRecord,
+    /// (statechain_id-or-pseudo-key, raw txs JSON) for every backup row.
+    pub backups: Vec<(String, String)>,
+    /// The RGB engine's BIP39 seed (from `rgb_data_dir/rgb.mnemonic`), if the wallet uses tokens.
+    pub rgb_mnemonic: Option<String>,
+    pub notes: String,
+}
+
 pub(crate) struct Inner {
     pub cc: ClientConfig,
     pub config: SdkConfig,
@@ -29,8 +48,16 @@ pub struct SparkWallet {
 }
 
 impl SparkWallet {
-    /// Create or load a wallet. Returns the wallet and its mnemonic (persist it — it is the
-    /// only backup needed to restore the statechain keys).
+    /// Create or load a wallet. Returns the wallet and its mnemonic.
+    ///
+    /// ⚠️ BACKUP: the mnemonic ALONE is **not** a sufficient backup (review H3). It restores the
+    /// wallet's key hierarchy, but NOT the per-coin exit material that only the owner holds and the
+    /// SE cannot re-serve after a claim: the pre-signed backup ladder, the off-chain exit branches
+    /// (`branch-*`), the terminal-ancestor lists (`parents-*`), and — for token wallets — the entire
+    /// RGB stash (under a SEPARATE `rgb.mnemonic` inside `rgb_data_dir`). Losing `wallet.db` (or
+    /// `rgb_data_dir`) is **total loss** of every off-chain coin and token, even with the mnemonic.
+    /// Back up the whole recovery bundle with [`Self::export_recovery_bundle`] and restore it with
+    /// [`Self::import_recovery_bundle`]; also copy `rgb_data_dir` for token wallets.
     ///
     /// - No wallet named `config.wallet_name` in the database: a new one is created, from
     ///   `mnemonic` if given, freshly generated otherwise.
@@ -65,6 +92,101 @@ impl SparkWallet {
             }
         };
         let mnemonic_out = record.mnemonic.clone();
+
+        let (events_tx, _) = broadcast::channel(256);
+        let wallet = SparkWallet {
+            inner: Arc::new(Inner {
+                cc,
+                config,
+                events_tx,
+                token_pool: Mutex::new(Vec::new()),
+                wallet_lock: Mutex::new(()),
+                rgb: Mutex::new(None),
+            }),
+        };
+        Ok((wallet, mnemonic_out))
+    }
+
+    /// Export a full [`RecoveryBundle`] as JSON (review H3): the wallet record, every backup row
+    /// (exit ladder + `branch-*` + `parents-*`), and the RGB engine seed. This — plus a copy of
+    /// `rgb_data_dir` for token wallets — is the ONLY complete backup; the mnemonic alone is not.
+    /// Store it securely: it contains the wallet seed. Re-export after any transfer/claim/split,
+    /// since those mint new coins and exit material.
+    pub async fn export_recovery_bundle(&self) -> Result<String> {
+        let record = self.record().await?;
+        let backups = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await?;
+        let rgb_mnemonic = self.inner.config.rgb_data_dir.as_ref().and_then(|dir| {
+            std::fs::read_to_string(std::path::Path::new(dir).join("rgb.mnemonic"))
+                .ok()
+                .map(|s| s.trim().to_string())
+        });
+        let bundle = RecoveryBundle {
+            version: 1,
+            wallet_name: self.inner.config.wallet_name.clone(),
+            wallet: record,
+            backups,
+            rgb_mnemonic,
+            notes: "Complete recovery bundle. For token wallets also copy the entire rgb_data_dir \
+                    (the RGB stash of contracts/consignments is NOT embedded here). Re-export after \
+                    every transfer/claim/split."
+                .to_string(),
+        };
+        Ok(serde_json::to_string_pretty(&bundle)?)
+    }
+
+    /// Restore a wallet from a [`RecoveryBundle`] JSON produced by [`Self::export_recovery_bundle`]
+    /// into a FRESH database (`config.database_file`). Recreates the wallet record and all backup
+    /// rows, and re-seeds the RGB engine (`rgb.mnemonic`) if `config.rgb_data_dir` is set — remember
+    /// to also restore the rgb_data_dir stash contents for token balances. Fails if a wallet of the
+    /// same name already exists in the target database.
+    pub async fn import_recovery_bundle(config: SdkConfig, bundle_json: &str) -> Result<(Self, String)> {
+        let bundle: RecoveryBundle = serde_json::from_str(bundle_json)?;
+        let cc = ClientConfig::from_params(
+            config.statechain_entity_url.clone(),
+            config.electrum_url.clone(),
+            config.electrum_type.clone(),
+            config.network,
+            config.database_file.clone(),
+            config.confirmation_target,
+        )
+        .await?;
+
+        if get_wallet(&cc.pool, &config.wallet_name).await.is_ok() {
+            return Err(anyhow!(
+                "wallet '{}' already exists in the target database; import into a fresh database_file",
+                config.wallet_name
+            ));
+        }
+
+        // Restore the wallet record under the target name.
+        let mut record = bundle.wallet;
+        record.name = config.wallet_name.clone();
+        let mnemonic_out = record.mnemonic.clone();
+        insert_wallet(&cc.pool, &record).await?;
+
+        // Restore every backup row (exit ladder, branch-*, parents-*).
+        for (key, txs_json) in &bundle.backups {
+            mercuryrustlib::sqlite_manager::insert_raw_backup_txs(
+                &cc.pool,
+                &config.wallet_name,
+                key,
+                txs_json,
+            )
+            .await?;
+        }
+
+        // Re-seed the RGB engine (stash contents must be restored separately by copying rgb_data_dir).
+        if let (Some(dir), Some(m)) = (config.rgb_data_dir.as_ref(), bundle.rgb_mnemonic.as_ref()) {
+            std::fs::create_dir_all(dir)?;
+            let p = std::path::Path::new(dir).join("rgb.mnemonic");
+            if !p.exists() {
+                std::fs::write(p, m)?;
+            }
+        }
 
         let (events_tx, _) = broadcast::channel(256);
         let wallet = SparkWallet {

@@ -29,9 +29,11 @@ use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    // Create (or restore — pass Some(mnemonic)) a wallet. PERSIST THE MNEMONIC.
+    // Create (or re-open — pass Some(mnemonic)) a wallet.
     let (wallet, mnemonic) = SparkWallet::initialize(SdkConfig::regtest("alice"), None).await?;
-    println!("backup phrase: {mnemonic}");
+    println!("seed phrase: {mnemonic}");
+    // NOTE: the mnemonic alone is NOT a full backup — off-chain exit material lives only on disk.
+    // Use wallet.export_recovery_bundle() for a complete backup (see the Wallet SDK guide).
 
     // Receive address (stable, shareable).
     println!("my address: {}", wallet.get_spark_address().await?);

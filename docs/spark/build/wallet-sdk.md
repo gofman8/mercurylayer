@@ -5,11 +5,33 @@ Crate: `mercury-spark-sdk` (`clients/libs/rust-sdk`). Everything below is on `Sp
 ## Create / restore
 
 ```rust
-// New wallet (mnemonic generated — persist it!)
+// New wallet (mnemonic generated)
 let (wallet, mnemonic) = SparkWallet::initialize(SdkConfig::regtest("alice"), None).await?;
 
-// Restore
+// Re-open a wallet whose database_file still exists (same mnemonic)
 let (wallet, _) = SparkWallet::initialize(SdkConfig::regtest("alice"), Some(&mnemonic)).await?;
+```
+
+> ⚠️ **The mnemonic ALONE is not a sufficient backup.** It restores the key hierarchy, but off-chain
+> statechain funds are only safe if you can *exit* them, and the exit material lives ONLY on your
+> disk — the SE cannot re-serve it after a claim: the pre-signed backup ladder, the off-chain exit
+> branches, the terminal-ancestor lists, and (for token wallets) the entire RGB stash under a
+> *separate* `rgb.mnemonic` inside `rgb_data_dir`. **Losing `wallet.db` or `rgb_data_dir` is total
+> loss of every off-chain coin and token, even with the mnemonic.**
+
+### Full backup / restore
+
+```rust
+// Back up EVERYTHING (wallet record + exit ladder + branches + terminal parents + RGB seed).
+// Re-export after every transfer/claim/split. Store securely — it contains the wallet seed.
+let bundle_json = wallet.export_recovery_bundle().await?;
+std::fs::write("alice-recovery.json", &bundle_json)?;
+// For token wallets, ALSO copy the whole rgb_data_dir (the RGB stash is not embedded in the bundle).
+
+// Restore into a fresh database_file:
+let cfg = SdkConfig::regtest("alice"); // point database_file at a fresh path
+let (wallet, _) = SparkWallet::import_recovery_bundle(cfg, &bundle_json).await?;
+// Then restore rgb_data_dir contents for token balances.
 ```
 
 `SdkConfig` fields: SE URL, electrum, network, sqlite `database_file`, `confirmation_target`,

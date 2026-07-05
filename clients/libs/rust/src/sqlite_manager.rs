@@ -106,6 +106,33 @@ pub async fn get_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_i
     Ok(backup_txs)
 }
 
+/// Every backup row for a wallet as `(statechain_id_key, raw_txs_json)`, including the pseudo-keys
+/// `branch-<id>` (off-chain exit branch) and `parents-<id>` (terminal-ancestor list). Used to
+/// export a full recovery bundle: this exit material lives ONLY on the owner's disk and the SE
+/// cannot re-serve it after a claim.
+pub async fn get_all_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str) -> Result<Vec<(String, String)>> {
+    let query = "SELECT statechain_id, txs FROM backup_txs WHERE wallet_name = $1";
+    let rows = sqlx::query(query).bind(wallet_name).fetch_all(pool).await?;
+    Ok(rows.iter().map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))).collect())
+}
+
+/// Insert a raw backup row (statechain_id key + txs JSON string) verbatim, replacing any existing
+/// row for that key. Used by recovery-bundle import to restore branch-*/parents-*/backup rows.
+pub async fn insert_raw_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, txs_json: &str) -> Result<()> {
+    let _ = sqlx::query("DELETE FROM backup_txs WHERE statechain_id = $1 AND wallet_name = $2")
+        .bind(statechain_id)
+        .bind(wallet_name)
+        .execute(pool)
+        .await?;
+    sqlx::query("INSERT INTO backup_txs (statechain_id, wallet_name, txs) VALUES ($1, $2, $3)")
+        .bind(statechain_id)
+        .bind(wallet_name)
+        .bind(txs_json)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn insert_or_update_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, backup_txs: &Vec<BackupTx>) -> Result<()> {
 
     let mut transaction = pool.begin().await?;
