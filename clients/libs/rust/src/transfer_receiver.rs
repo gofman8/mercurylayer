@@ -567,6 +567,38 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
                 .await?;
             }
 
+            // Persist the structural ancestor chain (the terminal_parents the sender named) under
+            // "parents-<id>", one id per BackupTx.tx row — the same convention register_split_subcoins
+            // uses on the sender side. This lets THIS receiver, if it later re-transfers the sub-coin
+            // off-chain, pass on the FULL ancestor set (its grandparents included). Without it a
+            // second off-chain hop would name too few ancestors and be rejected by the receiver's
+            // terminal-parent count check (INV-20).
+            if !transfer_msg.terminal_parents.is_empty() {
+                let parents: Vec<mercurylib::wallet::BackupTx> = transfer_msg
+                    .terminal_parents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| mercurylib::wallet::BackupTx {
+                        tx_n: (i + 1) as u32,
+                        tx: id.clone(),
+                        client_public_nonce: String::new(),
+                        server_public_nonce: String::new(),
+                        client_public_key: String::new(),
+                        server_public_key: String::new(),
+                        blinding_factor: String::new(),
+                        rgb_consignment: None,
+                        rgb_blinding: None,
+                    })
+                    .collect();
+                insert_or_update_backup_txs(
+                    &client_config.pool,
+                    wallet_name,
+                    &format!("parents-{}", transfer_msg.statechain_id),
+                    &parents,
+                )
+                .await?;
+            }
+
             transfer_receive_result.is_batch_locked = false;
             transfer_receive_result.statechain_id = Some(transfer_msg.statechain_id.clone());
         } else {
