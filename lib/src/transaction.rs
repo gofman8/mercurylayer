@@ -116,9 +116,20 @@ pub fn create_tx_out(
     const BACKUP_TX_SIZE: u64 = 112; // virtual size one input P2TR and one output P2TR
     // 163 is the real size one input P2TR and one output P2TR
 
+    // P2TR dust threshold: an output at or below this is non-standard/unspendable.
+    const DUST_LIMIT: u64 = 330;
+
     let input_amount = coin.amount.unwrap() as u64;
     let absolute_fee = (BACKUP_TX_SIZE as f64 * fee_rate_sats_per_byte).ceil() as u64;
-    let amount_out = input_amount - absolute_fee;
+    // Checked, dust-guarded (review M2): an unchecked `input - fee` underflow-panics when the fee
+    // exceeds the input, and an output below the dust limit yields an un-broadcastable backup that
+    // permanently strands the coin. Reject both rather than build a stuck backup.
+    let amount_out = input_amount
+        .checked_sub(absolute_fee)
+        .ok_or(MercuryError::FeeTooLow)?;
+    if amount_out < DUST_LIMIT {
+        return Err(MercuryError::FeeTooLow);
+    }
 
     let recipient_address = if to_address.starts_with(crate::MAINNET_HRP) || to_address.starts_with(crate::TESTNET_HRP) {
         let (_, recipient_user_pubkey, _) = decode_transfer_address(to_address)?;
