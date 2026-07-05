@@ -16,4 +16,9 @@ pub enum WalletEvent {
         amount: u64,
         statechain_id: String,
     },
+    /// A unilateral-exit branch broadcast hit a mempool conflict: a DIFFERENT transaction is
+    /// already spending the branch root, i.e. someone is racing this exit (e.g. a malicious sender
+    /// front-running with a competing spend). The exit did NOT go through as-is; the app should
+    /// fee-bump / alert / re-attempt rather than assume the coin exited.
+    ExitBranchConflict { statechain_id: String },
 }

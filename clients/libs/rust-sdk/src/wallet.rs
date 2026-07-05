@@ -350,8 +350,22 @@ impl SparkWallet {
                 Ok(_) => {}
                 Err(e) => {
                     let msg = e.to_string();
-                    // Tolerate an already-materialized branch (sibling exit / rebroadcast).
-                    if !(msg.contains("already") || msg.contains("in block chain") || msg.contains("txn-mempool-conflict")) {
+                    // A mempool conflict means a DIFFERENT tx already spends this branch input — a
+                    // competing spend racing our exit (a malicious sender front-running the branch
+                    // root), NOT an idempotent rebroadcast of our own tx. It must NOT be swallowed
+                    // as success (review H1): emit a distinct event and fail so the caller can
+                    // fee-bump / alert instead of believing the coin exited.
+                    if msg.contains("txn-mempool-conflict") || msg.contains("conflict") {
+                        let _ = self.inner.events_tx.send(WalletEvent::ExitBranchConflict {
+                            statechain_id: statechain_id.to_string(),
+                        });
+                        return Err(anyhow!(
+                            "exit branch for {statechain_id} conflicts with an existing mempool spend of its root — the exit is being RACED by a competing spend; fee-bump or investigate (do not assume the coin exited): {msg}"
+                        ));
+                    }
+                    // Tolerate ONLY an idempotent rebroadcast of our OWN branch tx (already in the
+                    // mempool, or already mined). Anything else is a real failure.
+                    if !(msg.contains("already") || msg.contains("in block chain")) {
                         return Err(anyhow!("branch broadcast failed for {statechain_id}: {msg}"));
                     }
                 }
