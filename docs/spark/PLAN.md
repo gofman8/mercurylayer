@@ -72,3 +72,39 @@ local regtest+lockbox stack; documented runner.
    consensus meaning; we document this as a trust-model difference, not a gap to fake.
 4. **Events are poll-driven.** Mercury has no push stream; the SDK emits the same event set from a
    poller so app code is portable from Spark.
+
+## Post-review remediation backlog (2026-07)
+
+Source: the [second adversarial review](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass)
+(verdict **NOT production-ready**). **P0 blocks mainnet** and must be fixed + re-reviewed. Status is
+tracked here as items land; each P0 gets a regression test.
+
+### P0 — mainnet blockers
+
+| # | Item | Closes | Status |
+|---|------|--------|--------|
+| P0-1 | **Enclave secnonce single-use.** In `partial_signature`/`generate_partial_signature`, atomically load-and-null `sealed_secnonce` in one DB txn and refuse to sign if absent (`lockbox/src/server.cpp:118` + `db_manager.cpp` `update_sealed_secnonce`). Add per-`statechain_id` serialization of `sign/first` (`SELECT … FOR UPDATE` spanning nonce-gen + insert, or a partial unique index on `statechain_signature_data WHERE challenge IS NULL`). | C1 (nonce-reuse → key-share leak → theft) + L1 (sign/first race DoS) | ☐ |
+| P0-2 | **SSP pre-payment gate.** Before `send_payment`: resolve latched `statechain_id`(s), require pending transfer `new_user_auth_public_key == SSP` key AND coin amount `≥ amt_msat/1000 + fee_sats`; abort otherwise. After payment: `claimed_transfers==0` is a hard error. Server: `unlock_by_preimage` returns a distinct non-Success when 0 rows flip. | C2 + C3 + M3 | ☐ |
+| P0-3 | **Branch/split locktime.** Set branch/split locktime to 0/low-constant (honor INV-4) OR anchor to the parent's own ladder base (`get_blockheight` of parent's first backup), not the live tip. Both `transfer.rs` and `rgb.rs` split paths. | H5 (exit-race inversion) | ☐ |
+| P0-4 | **Branch broadcast conflict not swallowed.** `broadcast_branch_if_any` (`wallet.rs:354`): drop `txn-mempool-conflict` from tolerated set for branch txs; surface a distinct competing-spend event; only tolerate `already`/`in block chain` for our OWN branch txid. | H1 | ☐ |
+| P0-5 | **Token-carrier exclusion.** Persist a token-carrier flag at registration; exclude carriers from every BTC selection path (`transfer`/`transfer_many`/`ensure_exact_coin`/`split_coin`); segregate carrier sats out of `available_sats`. | H2 (token destruction) | ☐ |
+| P0-6 | **Backup truth + recovery bundle.** Immediately correct `wallet.rs:32-33` + learn docs (mnemonic ALONE is insufficient; `wallet.db` + `rgb_data_dir` loss = total loss). Then ship recovery-bundle export/import (coin+backup + `branch-*`/`parents-*` + RGB stash) OR derive the RGB seed from the wallet mnemonic. | H3 | ☐ |
+
+### P1 — pre-mainnet hardening
+
+| # | Item | Closes |
+|---|------|--------|
+| P1-1 | Decouple LN-latch batches from the 120 s `batch_timeout`; gate `validate_batch` on the latch's own `expires_at`; refuse `send_payment` without ample batch time. | H4 |
+| P1-2 | Make incoming-token booking retriable: each `claim()`, scan CONFIRMED coins with a consignment-bearing backup but no booked allocation and re-run `accept_incoming_tokens` (idempotent). | H6 |
+| P1-3 | `create_tx_out`: `checked_sub` and reject when `input ≤ absolute_fee + DUST_LIMIT` (330 P2TR); enforce a dust floor at split/combine. | M2 |
+| P1-4 | Bind owner auth sigs to `(statechain_id ‖ endpoint_tag ‖ server nonce/expiry)` + mutating params; reject seen-nonce/stale. Prioritize `withdraw`/`complete`/`transfer`/`set_spend_budget`. | M1 |
+
+### P2 — robustness / DX / privacy
+
+| # | Item | Closes |
+|---|------|--------|
+| P2-1 | Replace request-path unwraps in `utils.rs` (auth `RowNotFound`, `Signature`/`PublicKey`/`XOnlyPublicKey` parse) with graceful 401; uniform Unauthorized closes the existence oracle. | L2 |
+| P2-2 | Promote the sdk14 watchtower to first-class SDK behavior behind a config flag (compute each off-chain coin's `exit_deadline_block`, auto-broadcast branch + exit at tip+margin); add `WalletEvent::ExitDeadlineApproaching`; document the online obligation loudly. | L7 |
+| P2-3 | `unilateral_exit`: distinguish flat-coin (legit no branch) from missing/corrupt branch via `coin.single_use`; return a distinct hard error. | L5 |
+| P2-4 | RGB privacy: per-output random blinding threaded through the split path; prune each recipient's consignment to only its own piece (replace fixed `TOKEN_BLINDING=777` + shared consignment). | L3 |
+| P2-5 | DB hygiene: run expired-row DELETE + TTL-GC of unconsumed token / expired external-latch rows; per-IP rate-limit the no-server `get_token` path; document the single authoritative latch clock. | L4, L6 |

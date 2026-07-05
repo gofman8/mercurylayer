@@ -397,5 +397,12 @@ Findings from the adversarial review that are **documented assumptions**, not co
   fee-bump; in a fee spike an exit may confirm slowly. The decrementing-locktime ladder (INV-5) still
   guarantees the latest state wins the race.
 
+> **Open blockers (2026-07-05 review).** The second adversarial review found issues that are **not**
+> accepted limitations but **open P0/P1 defects** being remediated: an enclave nonce-reuse crypto break
+> (C1), two SSP fund-loss bugs (C2/C3), a split-locktime exit-race inversion (H5), branch-conflict
+> masking (H1), token-carrier destruction (H2), and a mnemonic-only-backup durability gap (H3). Until
+> the P0 items in [PLAN.md](PLAN.md#post-review-remediation-backlog-2026-07) land and are re-reviewed,
+> the system is **NOT production-ready**. See [REVIEW.md](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass).
+
 Unit tests live in `clients/libs/rust-sdk/src/*` (`#[cfg(test)]`); E2E dispatch via
 `SDK_E2E`/`RGB_E2E` in `clients/tests/rust`; upstream Mercury suite runs by default.
