@@ -64,6 +64,14 @@ design (blind 2-of-2) **except** that the enclave nonce bug (C1) breaks exactly 
 unilateral-exit ladder is sound in the happy path and most spec limitations are honestly disclosed.
 The P0 blockers below must be fixed and re-reviewed before any mainnet exposure.
 
+> **Remediation update (2026-07-05):** all six P0 blockers now have fixes landed on `feat/spark`
+> (C1 enclave single-use secnonce + sign/first serialization; C2/C3/M3 SSP pre-payment gate; H5
+> locktime-free split branch; H1 branch-conflict surfaced; H2 token-carrier exclusion; H3 recovery
+> bundle + corrected docs). Two caveats remain before mainnet: the **SGX lockbox must be rebuilt and
+> redeployed** for P0-1's enclave consume to take effect, and the **full E2E suite (regtest +
+> lockbox + RLN) must be run** against these changes and the result **re-reviewed**. Status table:
+> [PLAN.md](PLAN.md#post-review-remediation-backlog-2026-07). P1/P2 items are still open.
+
 > No review proves the absence of vulnerabilities. Treat this as one input; before mainnet, run
 > repeated independent reviews, protocol/property fuzzing (nonce lifecycle, split-locktime arithmetic,
 > SSP settlement races), and a professional third-party audit.

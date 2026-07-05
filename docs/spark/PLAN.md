@@ -79,16 +79,19 @@ Source: the [second adversarial review](REVIEW.md#second-adversarial-review-2026
 (verdict **NOT production-ready**). **P0 blocks mainnet** and must be fixed + re-reviewed. Status is
 tracked here as items land; each P0 gets a regression test.
 
-### P0 — mainnet blockers
+### P0 — mainnet blockers  ·  ALL LANDED on `feat/spark` (2026-07-05)
 
 | # | Item | Closes | Status |
 |---|------|--------|--------|
-| P0-1 | **Enclave secnonce single-use.** In `partial_signature`/`generate_partial_signature`, atomically load-and-null `sealed_secnonce` in one DB txn and refuse to sign if absent (`lockbox/src/server.cpp:118` + `db_manager.cpp` `update_sealed_secnonce`). Add per-`statechain_id` serialization of `sign/first` (`SELECT … FOR UPDATE` spanning nonce-gen + insert, or a partial unique index on `statechain_signature_data WHERE challenge IS NULL`). | C1 (nonce-reuse → key-share leak → theft) + L1 (sign/first race DoS) | ☐ |
-| P0-2 | **SSP pre-payment gate.** Before `send_payment`: resolve latched `statechain_id`(s), require pending transfer `new_user_auth_public_key == SSP` key AND coin amount `≥ amt_msat/1000 + fee_sats`; abort otherwise. After payment: `claimed_transfers==0` is a hard error. Server: `unlock_by_preimage` returns a distinct non-Success when 0 rows flip. | C2 + C3 + M3 | ☐ |
-| P0-3 | **Branch/split locktime.** Set branch/split locktime to 0/low-constant (honor INV-4) OR anchor to the parent's own ladder base (`get_blockheight` of parent's first backup), not the live tip. Both `transfer.rs` and `rgb.rs` split paths. | H5 (exit-race inversion) | ☐ |
-| P0-4 | **Branch broadcast conflict not swallowed.** `broadcast_branch_if_any` (`wallet.rs:354`): drop `txn-mempool-conflict` from tolerated set for branch txs; surface a distinct competing-spend event; only tolerate `already`/`in block chain` for our OWN branch txid. | H1 | ☐ |
-| P0-5 | **Token-carrier exclusion.** Persist a token-carrier flag at registration; exclude carriers from every BTC selection path (`transfer`/`transfer_many`/`ensure_exact_coin`/`split_coin`); segregate carrier sats out of `available_sats`. | H2 (token destruction) | ☐ |
-| P0-6 | **Backup truth + recovery bundle.** Immediately correct `wallet.rs:32-33` + learn docs (mnemonic ALONE is insufficient; `wallet.db` + `rgb_data_dir` loss = total loss). Then ship recovery-bundle export/import (coin+backup + `branch-*`/`parents-*` + RGB stash) OR derive the RGB seed from the wallet mnemonic. | H3 | ☐ |
+| P0-1 | **Enclave secnonce single-use.** `lockbox` `load_and_consume_secnonce` atomically `SELECT … FOR UPDATE` + null `sealed_secnonce` in one txn; `generate_partial_signature` refuses (400) when absent. Server: `acquire_signfirst_lock` serializes `sign/first` per `statechain_id` (tx-scoped advisory lock). | C1 (nonce-reuse → key-share leak → theft) + L1 (sign/first race DoS) | ✅ **code done; lockbox needs SGX rebuild+redeploy** |
+| P0-2 | **SSP pre-payment gate.** New `GET /transfer/batch_statechains` + `peek_pending_transfers` (decrypt-only): `execute_pay` requires every latched coin addressed to the SSP AND total ≥ invoice+fee before `send_payment`; `claimed_transfers==0` is a hard error; server `unlock_by_preimage` returns 404 on 0 rows. 6 unit tests. | C2 + C3 + M3 | ✅ |
+| P0-3 | **Branch/split locktime.** `get_unsigned_split_psbt` sets a non-withdrawal split branch to locktime height 0 (INV-4) — unconditionally broadcastable, always below any deposit-anchored parent backup. Both split paths. mercurylib unit test. | H5 (exit-race inversion) | ✅ |
+| P0-4 | **Branch broadcast conflict not swallowed.** `broadcast_branch_if_any` drops `txn-mempool-conflict` from tolerated set, emits `WalletEvent::ExitBranchConflict`, returns a hard error; tolerates only `already`/`in block chain`. | H1 | ✅ |
+| P0-5 | **Token-carrier exclusion.** `token_carrier_outpoints()` (rgb-lib allocations) excludes carriers from all four BTC selection paths; `split_coin` hard-refuses a carrier; `compute_balance_excluding` drops carrier sats from BTC buckets. | H2 (token destruction) | ✅ |
+| P0-6 | **Backup truth + recovery bundle.** `export_recovery_bundle`/`import_recovery_bundle` (wallet record + all backup/branch-*/parents-* rows + RGB seed); corrected `initialize()` docs + getting-started/wallet-sdk. RGB stash dir still copied separately (embed = follow-up). | H3 | ✅ |
+
+> **Remaining before mainnet:** rebuild + redeploy the SGX lockbox so P0-1's enclave consume takes
+> effect; run the full E2E suite (regtest + lockbox + RLN) against these fixes; then re-review.
 
 ### P1 — pre-mainnet hardening
 
