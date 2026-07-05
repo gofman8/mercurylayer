@@ -335,8 +335,11 @@ impl SparkWallet {
         .await?;
 
         // Build + blind-MuSig2 co-sign the un-broadcast split tx (plain BTC: no coloring step).
-        // qt = parent's backup count + 1 so the split's locktime sits one decrement BELOW the
-        // parent's own backup — the branch always wins the exit race against stale parent state.
+        // The split IS the child's exit branch and is now locktime-FREE (INV-4 / review H5), so it
+        // is unconditionally broadcastable and always matures below the parent's deposit-anchored
+        // backup — winning the exit race regardless of tip. `qt_backup_tx` no longer sets the split
+        // locktime (it did, tip-relative, which could invert the race); kept only for signature
+        // shape / withdrawal reuse.
         let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
             &self.inner.cc.pool,
             &self.inner.config.wallet_name,

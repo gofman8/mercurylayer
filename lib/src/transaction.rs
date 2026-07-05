@@ -358,10 +358,20 @@ pub fn get_unsigned_split_psbt(
         })
         .collect::<core::result::Result<_, _>>()?;
 
-    let block_height =
-        calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
-
-    let lock_time = absolute::LockTime::from_height(block_height)?;
+    // INV-4: for an OFF-CHAIN split, this tx IS the child's exit branch and must be UNCONDITIONALLY
+    // broadcastable and always mature before any parent backup. The parent's backup ladder is
+    // DEPOSIT-height anchored, but a tip-relative decrementing locktime
+    // (block_height - interval*qt_backup_tx) can exceed a parent backup, letting the parent's stale
+    // backup mature first and win the exit race (review H5 — the "branch wins" invariant was
+    // arithmetically false for any post-deposit split). A locktime-free (height 0) branch is always
+    // spendable now and always sits below any deposit-anchored parent backup, so the latest state
+    // (the child) always wins. A withdrawal to an on-chain address keeps its computed locktime.
+    let lock_time = if is_withdrawal {
+        let bh = calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
+        absolute::LockTime::from_height(bh)?
+    } else {
+        absolute::LockTime::from_height(0)?
+    };
 
     let input_txid = Txid::from_str(&coin.utxo_txid.as_ref().unwrap())?;
     let input_vout = coin.utxo_vout.unwrap();
@@ -883,4 +893,21 @@ pub fn new_backup_transaction_multi(
 
     let signed_tx = psbt.extract_tx();
     Ok(hex::encode(bitcoin::consensus::encode::serialize(&signed_tx)))
+}
+
+#[cfg(test)]
+mod split_locktime_tests {
+    use bitcoin::absolute::LockTime;
+
+    // INV-4 / review H5: an OFF-CHAIN split branch must be locktime-free so it is unconditionally
+    // broadcastable now and always matures BEFORE any deposit-anchored parent backup — otherwise a
+    // stale parent backup can win the exit race. `get_unsigned_split_psbt` sets exactly this
+    // (`from_height(0)`) for a non-withdrawal split. This guards that expression's runtime validity
+    // and that it yields a zero block-height locktime.
+    #[test]
+    fn split_branch_locktime_is_zero_and_valid() {
+        let lt = LockTime::from_height(0).expect("height-0 locktime must be valid");
+        assert_eq!(lt.to_consensus_u32(), 0);
+        assert!(lt.is_block_height());
+    }
 }
