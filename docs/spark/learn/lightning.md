@@ -62,6 +62,15 @@ Both directions are the **HTLC preimage swap** on the latch (external-hash varia
 latch-bound to the invoice's payment hash, and the LN preimage is simultaneously the user's proof
 of payment and the SSP's key to unlock the coin. Neither side can cheat.
 
+On **receive**, the SSP's invoice is a real **HODL invoice** from the rgb-lightning-node fork:
+passing an external `payment_hash` to `/lninvoice` makes it `InvoiceType::Hodl`, so the payer's
+incoming HTLC is *held* (not auto-settled) until the SSP has released the coin and can settle with
+the SE preimage via `/claimhodlinvoice`. The full HODL lifecycle is wired: **create** (external hash
+→ hold), **settle** (`settle_receive` → `/claimhodlinvoice`), and **abort** (`cancel_receive` →
+`/cancelhodlinvoice`, which fails the held HTLC back to the payer as an immediate refund and closes
+the invoice — used when a swap is abandoned *before* the coin is released, so the SSP never gives up
+the coin and the refund without also being paid).
+
 **Failure is trustless.** If a pay never settles (no route, SSP declines), the SSP reveals no
 preimage and never claims — the coin stays yours. Once the SE `batch_timeout` elapses, reclaim it:
 
@@ -110,8 +119,10 @@ hands the SSP a **colored coin** batch-locked to the invoice hash (`latch_tokens
 consignment rides the transfer message), the SSP pays the asset over its colored channel, and the LN
 preimage unlocks the coin (the SSP now holds the asset on statechain). For a RECEIVE the SSP
 colored-transfers an asset coin to the user under an **SE-held preimage** (`latch_tokens_se_preimage`)
-and issues an RGB HODL invoice; when the payer pays the asset over LN, the SSP releases the coin and
-claims the HTLC. The SSP stays asset-neutral (it converts asset units between the rails, minus fee).
+and issues an RGB **HODL invoice** (same fork mechanism as the sats path — external payment hash →
+`InvoiceType::Hodl`); when the payer pays the asset over LN, the HTLC is held until the SSP releases
+the coin and claims it via `/claimhodlinvoice` (or refunds via `/cancelhodlinvoice` on abort). The
+SSP stays asset-neutral (it converts asset units between the rails, minus fee).
 
 The pre-payment gate keeps the C2 recipient check for both; the sats C3 amount check applies to sats
 invoices, and for RGB the SSP verifies (post-claim) that its statechain asset balance grew by the

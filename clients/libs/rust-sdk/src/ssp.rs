@@ -263,6 +263,21 @@ impl RlnClient {
         .await?;
         Ok(())
     }
+
+    /// Cancel a held HODL invoice: fail its in-flight HTLC back to the payer (immediate refund) and
+    /// close the invoice so no late payer can pay into an abandoned swap. This is the abort leg of
+    /// the fork's HODL lifecycle (`InvoiceType::Hodl` + `/claimhodlinvoice` + `/cancelhodlinvoice`).
+    /// Best-effort: an invoice with no pending HTLC just gets marked cancelled.
+    ///
+    /// SAFETY: only cancel a RECEIVE swap *before* the SSP has released its coin to the user
+    /// (`confirm_pending_invoice`). Cancelling after release refunds the payer while the user keeps
+    /// the coin — an SSP loss. `settle_receive` only reaches `claim_hodl`, never `cancel_hodl`,
+    /// after the release point.
+    pub async fn cancel_hodl(&self, payment_hash: &str) -> Result<()> {
+        self.post("cancelhodlinvoice", json!({ "payment_hash": payment_hash }))
+            .await?;
+        Ok(())
+    }
 }
 
 /// Pure pre-payment gate (review C2/C3): before the SSP pays a Lightning invoice, every coin
@@ -535,9 +550,11 @@ impl SspService {
         })
     }
 
-    /// Drive a receive swap to completion: once the payer's HTLC is pending, confirm the latch
-    /// (releasing the coin to the receiver — the SE will not reveal the preimage before this),
-    /// retrieve the preimage and claim the HODL invoice. Returns once the invoice is settled.
+    /// Drive a receive swap to completion: once the payer's HTLC is HELD by the HODL invoice
+    /// (status `Claimable`), confirm the latch (releasing the coin to the receiver — the SE will not
+    /// reveal the preimage before this), retrieve the preimage and claim the HODL invoice via
+    /// `/claimhodlinvoice`. Returns once the invoice is settled. If no HTLC is ever held, aborts and
+    /// cancels the invoice (`/cancelhodlinvoice`) so the coin is never released for free.
     pub async fn settle_receive(&self, swap: &ReceiveSwap) -> Result<()> {
         // settle_receive is SSP-side: the swap must carry the coin it minted. A remote-client swap
         // (statechain_id = None) is settled by the SSP server that created it, never here.
@@ -545,17 +562,27 @@ impl SspService {
             .statechain_id
             .as_deref()
             .ok_or_else(|| anyhow!("settle_receive requires a local (SSP-side) swap with a statechain_id"))?;
-        // Wait for the HTLC.
-        let mut pending = false;
+        // Wait for the payer's HTLC to actually be HELD. On the fork a HODL invoice parks the
+        // incoming HTLC in `Claimable` (ldk PaymentClaimable → held, not auto-settled); a freshly
+        // issued invoice is `Pending` from the instant it exists, so we must NOT key on `Pending`
+        // (that would release the coin before any payment). `Claimable` = money locked at our node
+        // and ready to settle; `Claiming`/`Succeeded` = already progressing. This is the whole point
+        // of using a HODL invoice: release the coin only once the payer is committed.
+        let mut held = false;
         for _ in 0..90 {
-            let st = self.rln.invoice_status(&swap.invoice).await?;
-            if st == "Pending" || st == "Succeeded" {
-                pending = true;
-                break;
+            match self.rln.invoice_status(&swap.invoice).await?.as_str() {
+                "Claimable" | "Claiming" | "Succeeded" => {
+                    held = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_secs(2)).await,
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        if !pending {
+        if !held {
+            // Nothing was released yet (the coin release below is what authorizes the SE preimage),
+            // so it is safe to abort: cancel the HODL invoice to close it (and refund any HTLC that
+            // arrives late). The SSP reclaims its still-latched coin after the batch window.
+            let _ = self.rln.cancel_hodl(&swap.payment_hash).await;
             return Err(anyhow!("no HTLC arrived for the receive swap"));
         }
 
@@ -595,6 +622,17 @@ impl SspService {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         Err(anyhow!("hodl invoice did not settle"))
+    }
+
+    /// Abort a receive swap before it settles: cancel the HODL invoice (refunds the payer's HTLC if
+    /// one is already held, and closes the invoice). Call this instead of `settle_receive` when the
+    /// SSP decides not to proceed — e.g. the payer never shows, or a policy declines the swap.
+    ///
+    /// SAFETY: only valid *before* `settle_receive` has released the coin (`confirm_pending_invoice`).
+    /// Once the coin is released the SSP must claim, not cancel; cancelling then refunds the payer
+    /// while the user keeps the coin. The still-latched coin is reclaimed after the SE batch window.
+    pub async fn cancel_receive(&self, swap: &ReceiveSwap) -> Result<()> {
+        self.rln.cancel_hodl(&swap.payment_hash).await
     }
 }
 
