@@ -113,6 +113,11 @@ impl SparkWallet {
     /// Store it securely: it contains the wallet seed. Re-export after any transfer/claim/split,
     /// since those mint new coins and exit material.
     pub async fn export_recovery_bundle(&self) -> Result<String> {
+        // Audit [27]: hold the wallet lock across BOTH reads so the coin record and the backup rows
+        // are one consistent snapshot. Without it, a concurrent background claim/split (which writes
+        // the record before the backup rows in register_split_subcoins) could yield a torn bundle
+        // that restores a coin with no exit material — silent unrecoverable off-chain funds.
+        let _guard = self.inner.wallet_lock.lock().await;
         let record = self.record().await?;
         let backups = mercuryrustlib::sqlite_manager::get_all_backup_txs(
             &self.inner.cc.pool,

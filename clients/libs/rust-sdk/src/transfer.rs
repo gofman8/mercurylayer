@@ -607,7 +607,7 @@ impl SparkWallet {
 }
 
 /// Miner-fee margin left in a split tx for its (exit-only) broadcast.
-fn split_fee_reserve(parent_sats: u64) -> u64 {
+pub(crate) fn split_fee_reserve(parent_sats: u64) -> u64 {
     // ~200 vB at a couple sat/vB, floored so tiny test coins still split.
     (parent_sats / 100).clamp(300, 2_000)
 }

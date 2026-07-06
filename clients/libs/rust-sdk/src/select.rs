@@ -96,10 +96,19 @@ pub fn plan(coins: &[Candidate], target: u64) -> Plan {
             }
         }
     }
-    // Find the smallest unused coin that can cover the remainder and split it.
+    // Find the smallest unused coin that can cover the remainder AND leave room for the split's fee
+    // reserve plus a non-dust change (audit [29]). Filtering only on `amount > remaining` would pick
+    // a coin the split path then rejects (piece + fee_reserve >= parent, or a sub-dust change),
+    // failing an otherwise-fundable payment at the small-remainder boundary the split path exists for.
+    const DUST_LIMIT: u64 = 330;
     let mut candidates: Vec<&Candidate> = coins
         .iter()
-        .filter(|c| !whole.contains(&c.index) && c.amount_sats > remaining)
+        .filter(|c| {
+            !whole.contains(&c.index)
+                && remaining >= DUST_LIMIT
+                && c.amount_sats
+                    > remaining + crate::transfer::split_fee_reserve(c.amount_sats) + DUST_LIMIT
+        })
         .collect();
     candidates.sort_by_key(|c| c.amount_sats);
     match candidates.first() {
