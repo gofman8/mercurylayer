@@ -21,22 +21,35 @@ pub async fn get_auth_key_by_statechain_id(pool: &sqlx::PgPool, statechain_id: &
 
     match row {
         Ok(row) => {
-            let public_key_bytes = row.get::<Option<Vec<u8>>, _>("auth_xonly_public_key");
-            let pk = XOnlyPublicKey::from_slice(&public_key_bytes.unwrap()).unwrap();
-            return Ok(pk);
+            // A NULL/invalid key column must not panic the worker: treat it as not-found.
+            let public_key_bytes = match row.get::<Option<Vec<u8>>, _>("auth_xonly_public_key") {
+                Some(b) => b,
+                None => return Err(sqlx::Error::RowNotFound),
+            };
+            match XOnlyPublicKey::from_slice(&public_key_bytes) {
+                Ok(pk) => Ok(pk),
+                Err(_) => Err(sqlx::Error::RowNotFound),
+            }
         },
         Err(err) => {
-            return Err(err);
+            Err(err)
         }
-    };
+    }
 
 }
 
 pub async fn validate_signature_given_public_key(signed_message_hex: &str, statechain_id: &str, auth_key: &str) -> bool {
 
-    let auth_key = PublicKey::from_str(auth_key).unwrap().x_only_public_key().0;
-
-    let signed_message = Signature::from_str(signed_message_hex).unwrap();
+    // Attacker-controlled inputs must never panic the worker (review L2): a malformed key or
+    // signature is simply an invalid (unauthorized) request -> return false.
+    let auth_key = match PublicKey::from_str(auth_key) {
+        Ok(k) => k.x_only_public_key().0,
+        Err(_) => return false,
+    };
+    let signed_message = match Signature::from_str(signed_message_hex) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
     let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();
@@ -45,9 +58,16 @@ pub async fn validate_signature_given_public_key(signed_message_hex: &str, state
 
 pub async fn validate_signature(pool: &sqlx::PgPool, signed_message_hex: &str, statechain_id: &str) -> bool {
 
-    let auth_key = get_auth_key_by_statechain_id(pool, statechain_id).await.unwrap();
-
-    let signed_message = Signature::from_str(signed_message_hex).unwrap();
+    // Do NOT unwrap: get_auth_key can fail with RowNotFound OR PoolTimedOut (under load). Either way
+    // the request is unauthorized/unservable -> return false instead of panicking the worker thread.
+    let auth_key = match get_auth_key_by_statechain_id(pool, statechain_id).await {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let signed_message = match Signature::from_str(signed_message_hex) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
     let msg = Message::from_hashed_data::<sha256::Hash>(statechain_id.to_string().as_bytes());
 
     let secp = Secp256k1::new();

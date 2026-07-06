@@ -6,17 +6,25 @@ pub async fn get_enclave_index_from_database(pool: &sqlx::PgPool, statechain_id:
         FROM statechain_data \
         WHERE statechain_id = $1";
 
-    let row = sqlx::query(query)
+    // Do NOT unwrap: under load the pool can time out (PoolTimedOut). A panic here crashes the
+    // worker thread and returns an unparseable 500. Return None gracefully so the endpoint replies
+    // with a clean "enclave index not found" error instead of panicking.
+    let row = match sqlx::query(query)
         .bind(statechain_id)
         .fetch_optional(pool)
         .await
-        .unwrap();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("get_enclave_index_from_database query error: {e}");
+            return None;
+        }
+    };
 
-    if row.is_none() {
-        return None;
-    }
-
-    let row = row.unwrap();
+    let row = match row {
+        Some(r) => r,
+        None => return None,
+    };
 
     let enclave_index: i32 = row.get("enclave_index");
 

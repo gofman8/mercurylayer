@@ -85,10 +85,15 @@ pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload
     let value = response.text().await?;
 
     if status != StatusCode::OK{
-        
-        let error_message: Value = serde_json::from_str(value.as_str())?;
-        
-        return Err(anyhow::anyhow!("{}", error_message["message"].as_str().unwrap()));
+        // The SE's error body is usually {"message": ".."}, but under load a panic/5xx can return a
+        // different JSON shape (Rocket's default {"error": {..}}) or non-JSON. Never unwrap the
+        // "message" field — fall back to the raw body so a server hiccup surfaces as a clean Err
+        // instead of a client-side panic that crashes the caller's task.
+        let detail = serde_json::from_str::<Value>(value.as_str())
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| value.clone());
+        return Err(anyhow::anyhow!("sign/first failed ({}): {}", status, detail));
     }
 
     let sign_first_response_payload: mercurylib::transaction::SignFirstResponsePayload = serde_json::from_str(value.as_str())?;
