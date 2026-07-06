@@ -45,6 +45,24 @@ pub struct SspInfo {
     pub fee_sats: u64,
 }
 
+/// A decoded BOLT11 invoice. For an RGB invoice `asset_id`/`asset_amount` are `Some`.
+#[derive(Clone, Debug)]
+pub struct DecodedInvoice {
+    pub amt_msat: u64,
+    pub payment_hash: String,
+    pub asset_id: Option<String>,
+    pub asset_amount: Option<u64>,
+}
+
+/// RGB asset balance on an RLN node (on-chain + off-chain lightning liquidity).
+#[derive(Clone, Debug)]
+pub struct AssetBalance {
+    pub settled: u64,
+    pub spendable: u64,
+    pub offchain_inbound: u64,
+    pub offchain_outbound: u64,
+}
+
 /// Minimal HTTP client for a running rgb-lightning-node daemon.
 #[derive(Clone)]
 pub struct RlnClient {
@@ -72,18 +90,50 @@ impl RlnClient {
     }
 
     pub async fn decode_invoice(&self, invoice: &str) -> Result<(u64, String)> {
+        let d = self.decode(invoice).await?;
+        Ok((d.amt_msat, d.payment_hash))
+    }
+
+    /// Full decode: sats amount, payment hash, and (for an RGB invoice) the asset id + amount.
+    pub async fn decode(&self, invoice: &str) -> Result<DecodedInvoice> {
         let v = self.post("decodelninvoice", json!({ "invoice": invoice })).await?;
-        let amt_msat = v.get("amt_msat").and_then(|x| x.as_u64()).unwrap_or(0);
-        let hash = v
-            .get("payment_hash")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("invoice without payment_hash"))?
-            .to_string();
-        Ok((amt_msat, hash))
+        Ok(DecodedInvoice {
+            amt_msat: v.get("amt_msat").and_then(|x| x.as_u64()).unwrap_or(0),
+            payment_hash: v
+                .get("payment_hash")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("invoice without payment_hash"))?
+                .to_string(),
+            asset_id: v.get("asset_id").and_then(|x| x.as_str()).map(|s| s.to_string()),
+            asset_amount: v.get("asset_amount").and_then(|x| x.as_u64()),
+        })
     }
 
     pub async fn ln_invoice(&self, amt_msat: u64, payment_hash: Option<&str>, expiry_sec: u64) -> Result<String> {
-        let mut body = json!({ "amt_msat": amt_msat, "expiry_sec": expiry_sec });
+        self.ln_invoice_asset(Some(amt_msat), None, None, payment_hash, expiry_sec).await
+    }
+
+    /// Create a BOLT11 invoice, optionally carrying an RGB asset (`asset_id` + `asset_amount`) and/or
+    /// a HODL `payment_hash`. For an RGB invoice `amt_msat` may be None (the node picks the sats
+    /// carrier); for a sats invoice pass `Some(amt_msat)`.
+    pub async fn ln_invoice_asset(
+        &self,
+        amt_msat: Option<u64>,
+        asset_id: Option<&str>,
+        asset_amount: Option<u64>,
+        payment_hash: Option<&str>,
+        expiry_sec: u64,
+    ) -> Result<String> {
+        let mut body = json!({ "expiry_sec": expiry_sec });
+        if let Some(a) = amt_msat {
+            body["amt_msat"] = json!(a);
+        }
+        if let Some(id) = asset_id {
+            body["asset_id"] = json!(id);
+        }
+        if let Some(a) = asset_amount {
+            body["asset_amount"] = json!(a);
+        }
         if let Some(h) = payment_hash {
             body["payment_hash"] = json!(h);
         }
@@ -94,6 +144,61 @@ impl RlnClient {
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow!("no invoice in response"))?
             .to_string())
+    }
+
+    /// Issue a NIA (fungible) RGB asset on this node; returns the contract/asset id. (Test/issuer.)
+    pub async fn issue_asset(&self, amount: u64, ticker: &str, name: &str, precision: u8) -> Result<String> {
+        Ok(self
+            .post(
+                "issueassetnia",
+                json!({ "amounts": [amount], "ticker": ticker, "name": name, "precision": precision }),
+            )
+            .await?
+            .get("asset")
+            .and_then(|a| a.get("asset_id"))
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("no asset_id in issueassetnia response"))?
+            .to_string())
+    }
+
+    /// On-chain + off-chain asset balance for `asset_id`.
+    pub async fn asset_balance(&self, asset_id: &str) -> Result<AssetBalance> {
+        let v = self.post("assetbalance", json!({ "asset_id": asset_id })).await?;
+        Ok(AssetBalance {
+            settled: v.get("settled").and_then(|x| x.as_u64()).unwrap_or(0),
+            spendable: v.get("spendable").and_then(|x| x.as_u64()).unwrap_or(0),
+            offchain_inbound: v.get("offchain_inbound").and_then(|x| x.as_u64()).unwrap_or(0),
+            offchain_outbound: v.get("offchain_outbound").and_then(|x| x.as_u64()).unwrap_or(0),
+        })
+    }
+
+    /// Open a COLORED channel carrying `asset_amount` of `asset_id`, pushing `push_asset_amount`
+    /// to the peer so both directions can move the asset. (Test setup.)
+    pub async fn open_asset_channel(
+        &self,
+        peer_pubkey: &str,
+        peer_port: u16,
+        capacity_sat: u64,
+        push_msat: u64,
+        asset_id: &str,
+        asset_amount: u64,
+        push_asset_amount: u64,
+    ) -> Result<()> {
+        self.post(
+            "openchannel",
+            json!({
+                "peer_pubkey_and_opt_addr": format!("{peer_pubkey}@127.0.0.1:{peer_port}"),
+                "capacity_sat": capacity_sat,
+                "push_msat": push_msat,
+                "asset_id": asset_id,
+                "asset_amount": asset_amount,
+                "push_asset_amount": push_asset_amount,
+                "public": true,
+                "with_anchors": true
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn send_payment(&self, invoice: &str) -> Result<String> {
@@ -170,13 +275,16 @@ fn check_latched_coins(
     Ok(total)
 }
 
-/// Quote for paying a BOLT11 through the SSP.
+/// Quote for paying a BOLT11 through the SSP. For an RGB invoice `asset_id`/`asset_amount` are set
+/// and `amount_sats` is the sats carrier the colored coin must hold.
 #[derive(Clone, Debug)]
 pub struct PayQuote {
     pub amount_sats: u64,
     pub fee_sats: u64,
     pub payment_hash: String,
     pub ssp_address: String,
+    pub asset_id: Option<String>,
+    pub asset_amount: Option<u64>,
 }
 
 /// An open Lightning-receive swap. `statechain_id` is the SSP-side coin being handed over: it is
@@ -189,6 +297,9 @@ pub struct ReceiveSwap {
     pub statechain_id: Option<String>,
     pub invoice: String,
     pub payment_hash: String,
+    /// For an RGB receive swap: the asset the coin carries and how much.
+    pub asset_id: Option<String>,
+    pub asset_amount: Option<u64>,
 }
 
 /// The SSP service: a statechain wallet + an RLN node. Instantiable in-process (tests, embedded
@@ -205,17 +316,22 @@ impl SspService {
         SspService { wallet, rln, fee_sats }
     }
 
-    /// Quote paying `invoice`: how many sats the user must latch over, and to which address.
+    /// Quote paying `invoice`: what the user must latch over (sats, or an RGB asset amount), and to
+    /// which address. For an RGB invoice the value is `asset_amount` of `asset_id`; `amount_sats` is
+    /// then 0 (the colored coin carries the SDK's fixed sats carrier, validated separately).
     pub async fn quote_pay(&self, invoice: &str) -> Result<PayQuote> {
-        let (amt_msat, payment_hash) = self.rln.decode_invoice(invoice).await?;
-        if amt_msat == 0 {
+        let d = self.rln.decode(invoice).await?;
+        if d.asset_id.is_none() && d.amt_msat == 0 {
             return Err(anyhow!("zero-amount invoices not supported"));
         }
+        let amount_sats = if d.asset_id.is_some() { 0 } else { d.amt_msat / 1000 };
         Ok(PayQuote {
-            amount_sats: amt_msat / 1000,
+            amount_sats,
             fee_sats: self.fee_sats,
-            payment_hash,
+            payment_hash: d.payment_hash,
             ssp_address: self.wallet.get_spark_address().await?,
+            asset_id: d.asset_id,
+            asset_amount: d.asset_amount,
         })
     }
 
@@ -223,7 +339,8 @@ impl SspService {
     /// the invoice's payment hash. Pays the invoice, unlocks the coin with the LN preimage,
     /// claims it, and returns the preimage (the user's proof of payment).
     pub async fn execute_pay(&self, invoice: &str, batch_id: &str) -> Result<String> {
-        let (amt_msat, invoice_hash) = self.rln.decode_invoice(invoice).await?;
+        let d = self.rln.decode(invoice).await?;
+        let invoice_hash = d.payment_hash.clone();
 
         // The latch must be bound to this exact invoice.
         let latched_hash = mercuryrustlib::lightning_latch::get_payment_hash(
@@ -237,12 +354,12 @@ impl SspService {
         }
 
         // PRE-PAYMENT GATE (review C2/C3): identify which coin(s) this batch will hand us and
-        // validate them BEFORE paying real Lightning money. Each latched coin must be (a) a pending
-        // transfer genuinely addressed to the SSP — proven because `peek_pending_transfers` only
-        // returns transfers this wallet can DECRYPT with its own auth key — and (b) collectively
-        // worth at least the invoice + fee. Without (a) we would pay for a coin sent to someone
-        // else; without (b) for an undersized coin. Both are unbounded fund-loss otherwise.
-        let quote_sats = amt_msat / 1000 + self.fee_sats;
+        // validate them BEFORE paying. Each latched coin must be a pending transfer genuinely
+        // addressed to the SSP — proven because `peek_pending_transfers` only returns transfers this
+        // wallet can DECRYPT with its own auth key. For a SATS invoice the coins must also cover
+        // invoice+fee. For an RGB invoice the coins carry a fixed sats carrier + the asset in their
+        // consignment; the asset amount is verified when the coin is claimed (accept_incoming_tokens
+        // validates the consignment) and re-checked below against the SSP's asset balance delta.
         let latched_ids = mercuryrustlib::lightning_latch::get_statechain_ids_by_batch_id(
             self.wallet.client_config(),
             batch_id,
@@ -256,9 +373,27 @@ impl SspService {
             self.wallet.wallet_name(),
         )
         .await?;
-        let pending_pairs: Vec<(String, u64)> =
-            pending.into_iter().map(|p| (p.statechain_id, p.amount)).collect();
-        check_latched_coins(&latched_ids, &pending_pairs, quote_sats)?;
+        let pending_ids: std::collections::HashSet<String> =
+            pending.iter().map(|p| p.statechain_id.clone()).collect();
+        for sid in &latched_ids {
+            if !pending_ids.contains(sid) {
+                return Err(anyhow!(
+                    "latched coin {sid} is not a pending transfer addressed to the SSP — refusing to pay"
+                ));
+            }
+        }
+        // SATS invoice: also enforce the value gate. (RGB: asset value checked post-claim.)
+        let asset_before = if let Some(asset_id) = &d.asset_id {
+            self.wallet.get_token_balances().await.ok().and_then(|bs| {
+                bs.iter().find(|b| &b.asset_id == asset_id).map(|b| b.balance)
+            }).unwrap_or(0)
+        } else {
+            let quote_sats = d.amt_msat / 1000 + self.fee_sats;
+            let pending_pairs: Vec<(String, u64)> =
+                pending.iter().map(|p| (p.statechain_id.clone(), p.amount)).collect();
+            check_latched_coins(&latched_ids, &pending_pairs, quote_sats)?;
+            0
+        };
 
         // Pay the invoice over Lightning.
         self.rln.send_payment(invoice).await?;
@@ -297,6 +432,23 @@ impl SspService {
                 "paid the Lightning invoice for batch {batch_id} but claimed 0 transfers — the latched coin was not received; investigate before retrying"
             ));
         }
+        // RGB invoice: the claim validated + booked the coin's consignment. Confirm the SSP actually
+        // received at least the invoice's asset amount (its statechain asset balance grew by that).
+        if let (Some(asset_id), Some(asset_amount)) = (&d.asset_id, d.asset_amount) {
+            let after = self
+                .wallet
+                .get_token_balances()
+                .await
+                .ok()
+                .and_then(|bs| bs.iter().find(|b| &b.asset_id == asset_id).map(|b| b.balance))
+                .unwrap_or(0);
+            if after < asset_before.saturating_add(asset_amount) {
+                return Err(anyhow!(
+                    "paid the RGB invoice but the SSP received {} of {asset_id}, less than the {asset_amount} owed (before {asset_before}, after {after})",
+                    after.saturating_sub(asset_before)
+                ));
+            }
+        }
         Ok(preimage)
     }
 
@@ -330,6 +482,37 @@ impl SspService {
             statechain_id: Some(statechain_id),
             invoice,
             payment_hash: pre.hash,
+            asset_id: None,
+            asset_amount: None,
+        })
+    }
+
+    /// Open an RGB receive swap: latch a COLORED coin carrying `asset_amount` of `asset_id` over to
+    /// `receiver_address` under an SE-held preimage, and issue an RGB HODL invoice on that hash. The
+    /// payer pays the RGB invoice (sending the asset over Lightning); [`Self::settle_receive`] then
+    /// releases the coin and claims the HTLC. The SE-preimage gating makes coin release a
+    /// precondition of the SSP taking the Lightning asset.
+    pub async fn create_receive_asset(
+        &self,
+        asset_id: &str,
+        asset_amount: u64,
+        receiver_address: &str,
+    ) -> Result<ReceiveSwap> {
+        let (batch_id, piece_id, hash) = self
+            .wallet
+            .latch_tokens_se_preimage(asset_id, receiver_address, asset_amount)
+            .await?;
+        let invoice = self
+            .rln
+            .ln_invoice_asset(None, Some(asset_id), Some(asset_amount), Some(&hash), 3600)
+            .await?;
+        Ok(ReceiveSwap {
+            batch_id,
+            statechain_id: Some(piece_id),
+            invoice,
+            payment_hash: hash,
+            asset_id: Some(asset_id.to_string()),
+            asset_amount: Some(asset_amount),
         })
     }
 
@@ -494,6 +677,8 @@ impl Ssp for SspClient {
             fee_sats: v["fee_sats"].as_u64().unwrap_or(0),
             payment_hash: v["payment_hash"].as_str().unwrap_or_default().to_string(),
             ssp_address: v["ssp_address"].as_str().unwrap_or_default().to_string(),
+            asset_id: v["asset_id"].as_str().map(|s| s.to_string()),
+            asset_amount: v["asset_amount"].as_u64(),
         })
     }
     async fn execute_pay(&self, invoice: &str, batch_id: &str) -> Result<String> {
@@ -517,6 +702,8 @@ impl Ssp for SspClient {
             statechain_id: None, // the SSP server owns + settles the coin
             invoice: v["invoice"].as_str().unwrap_or_default().to_string(),
             payment_hash: v["payment_hash"].as_str().unwrap_or_default().to_string(),
+            asset_id: v["asset_id"].as_str().map(|s| s.to_string()),
+            asset_amount: v["asset_amount"].as_u64(),
         })
     }
 }
@@ -543,15 +730,37 @@ impl SparkWallet {
         ssp: &impl Ssp,
         invoice: &str,
     ) -> std::result::Result<String, (String, anyhow::Error)> {
-        let pre = async {
-            let quote = ssp.quote_pay(invoice).await?;
-            let total = quote.amount_sats + quote.fee_sats;
-            let coin_id = self.ensure_exact_coin(total).await?;
-            Ok::<_, anyhow::Error>((quote, coin_id))
+        let quote = match ssp.quote_pay(invoice).await {
+            Ok(q) => q,
+            Err(e) => return Err((String::new(), e)),
+        };
+
+        // RGB PAY (statechain asset → Lightning asset): latch a COLORED coin carrying the asset to
+        // the SSP under the invoice hash, then let the SSP pay the RGB Lightning invoice.
+        if let (Some(asset_id), Some(asset_amount)) = (quote.asset_id.clone(), quote.asset_amount) {
+            let (batch_id, piece_id) = match self
+                .latch_tokens(&asset_id, &quote.ssp_address, asset_amount, &quote.payment_hash)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return Err((String::new(), e)),
+            };
+            let paid = async {
+                let preimage = ssp.execute_pay(invoice, &batch_id).await?;
+                use sha2::{Digest, Sha256};
+                let digest = hex::encode(Sha256::digest(hex::decode(&preimage)?));
+                if digest != quote.payment_hash {
+                    return Err(anyhow!("SSP returned an invalid preimage"));
+                }
+                Ok::<_, anyhow::Error>(preimage)
+            }
+            .await;
+            return paid.map_err(|e| (piece_id, e));
         }
-        .await;
-        let (quote, coin_id) = match pre {
-            Ok(v) => v,
+
+        // SATS PAY: mint the exact coin, then latch it.
+        let coin_id = match self.ensure_exact_coin(quote.amount_sats + quote.fee_sats).await {
+            Ok(c) => c,
             Err(e) => return Err((String::new(), e)), // nothing latched yet
         };
 
@@ -600,6 +809,21 @@ impl SparkWallet {
     ) -> Result<ReceiveSwap> {
         let my_address = self.get_spark_address().await?;
         ssp.create_receive(amount_sats, &my_address).await
+    }
+
+    /// USER SIDE — receive an RGB ASSET from Lightning onto a statechain coin via an SSP: returns an
+    /// RGB BOLT11 invoice to hand to the payer. When it is paid over a colored channel, the SSP
+    /// releases the colored coin (carrying `asset_amount` of `asset_id`) and this wallet's background
+    /// watcher claims it (validating the consignment off-chain). Local SSP only (the colored transfer
+    /// uses the SSP's statechain wallet); a remote `/receive_asset` endpoint is a follow-up.
+    pub async fn create_lightning_invoice_asset(
+        &self,
+        ssp: &SspService,
+        asset_id: &str,
+        asset_amount: u64,
+    ) -> Result<ReceiveSwap> {
+        let my_address = self.get_spark_address().await?;
+        ssp.create_receive_asset(asset_id, asset_amount, &my_address).await
     }
 
     /// USER SIDE — reclaim a coin whose pay swap NEVER settled. When [`Self::pay_lightning_invoice`]

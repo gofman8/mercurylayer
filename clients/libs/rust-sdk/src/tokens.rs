@@ -21,6 +21,25 @@ pub(crate) const TOKEN_BLINDING: u64 = 777;
 /// Sats carried by a token-piece sub-coin (just above dust; the token is the payload).
 const TOKEN_PIECE_SATS: u64 = 1_500;
 
+/// How a colored transfer's piece is handed over.
+pub(crate) enum ColoredLatch {
+    /// Plain transfer (no latch).
+    None,
+    /// Batch-locked to an external payment hash (Lightning PAY: receiver claims on the preimage).
+    ExternalHash(String),
+    /// Batch-locked to an SE-generated preimage (Lightning RECEIVE: the SE reveals the preimage only
+    /// after the coin is released).
+    SePreimage,
+}
+
+/// Output of a colored transfer, with any latch artifacts.
+pub(crate) struct ColoredTransferOut {
+    pub result: TransferResult,
+    pub piece_id: String,
+    pub batch_id: Option<String>,
+    pub se_hash: Option<String>,
+}
+
 /// Envelope stored in `BackupTx.rgb_consignment` so a token transfer is self-describing.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ConsignmentEnvelope {
@@ -368,12 +387,62 @@ impl SparkWallet {
     /// split (exact token piece + change back to this wallet) then branch-carrying key handover
     /// of the piece coin. The receiver's SDK auto-claims, validates the consignment off-chain and
     /// books the balance.
+    /// Send `token_amount` of `asset_id` to `receiver_address`, entirely off-chain (colored split).
     pub async fn transfer_tokens(
         &self,
         asset_id: &str,
         receiver_address: &str,
         token_amount: u64,
     ) -> Result<TransferResult> {
+        Ok(self
+            .colored_transfer(asset_id, receiver_address, token_amount, ColoredLatch::None)
+            .await?
+            .result)
+    }
+
+    /// Colored transfer LATCHED to an EXTERNAL payment hash (the RGB half of a Lightning PAY: the
+    /// user hands a colored coin to the SSP, claimable only once the invoice preimage is revealed).
+    /// Returns `(batch_id, piece_statechain_id)`.
+    pub async fn latch_tokens(
+        &self,
+        asset_id: &str,
+        receiver_address: &str,
+        token_amount: u64,
+        payment_hash: &str,
+    ) -> Result<(String, String)> {
+        let out = self
+            .colored_transfer(asset_id, receiver_address, token_amount, ColoredLatch::ExternalHash(payment_hash.to_string()))
+            .await?;
+        let batch = out.batch_id.ok_or_else(|| anyhow!("colored latch did not produce a batch id"))?;
+        Ok((batch, out.piece_id))
+    }
+
+    /// Colored transfer LATCHED to an SE-HELD preimage (the RGB half of a Lightning RECEIVE: the SSP
+    /// hands a colored coin to the user; the SE reveals the preimage only once the coin is released,
+    /// so the SSP can't take the HTLC without releasing). Returns `(batch_id, piece_statechain_id,
+    /// payment_hash)`.
+    pub async fn latch_tokens_se_preimage(
+        &self,
+        asset_id: &str,
+        receiver_address: &str,
+        token_amount: u64,
+    ) -> Result<(String, String, String)> {
+        let out = self
+            .colored_transfer(asset_id, receiver_address, token_amount, ColoredLatch::SePreimage)
+            .await?;
+        let batch = out.batch_id.ok_or_else(|| anyhow!("colored SE-preimage latch produced no batch id"))?;
+        let hash = out.se_hash.ok_or_else(|| anyhow!("colored SE-preimage latch produced no payment hash"))?;
+        Ok((batch, out.piece_id, hash))
+    }
+
+    /// Core colored transfer with an optional latch mode. Returns the pieces + any latch outputs.
+    async fn colored_transfer(
+        &self,
+        asset_id: &str,
+        receiver_address: &str,
+        token_amount: u64,
+        latch: ColoredLatch,
+    ) -> Result<ColoredTransferOut> {
         let _guard = self.inner.wallet_lock.lock().await;
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
@@ -546,7 +615,34 @@ impl SparkWallet {
         )
         .await?;
 
-        // Hand the piece over.
+        // If latching (Lightning swap), bind the piece BEFORE handing it over so the receiver's
+        // claim stays locked until the preimage is revealed.
+        let (batch_id, se_hash) = match &latch {
+            ColoredLatch::None => (None, None),
+            ColoredLatch::ExternalHash(hash) => (
+                Some(
+                    mercuryrustlib::lightning_latch::create_external_hash_latch(
+                        &self.inner.cc,
+                        &self.inner.config.wallet_name,
+                        &piece_id,
+                        hash,
+                    )
+                    .await?,
+                ),
+                None,
+            ),
+            ColoredLatch::SePreimage => {
+                let pre = mercuryrustlib::lightning_latch::create_pre_image(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &piece_id,
+                )
+                .await?;
+                (Some(pre.batch_id), Some(pre.hash))
+            }
+        };
+
+        // Hand the piece over (plain, or batch-locked when latching).
         mercuryrustlib::transfer_sender::execute(
             &self.inner.cc,
             receiver_address,
@@ -554,19 +650,24 @@ impl SparkWallet {
             &piece_id,
             None,
             false,
-            None,
+            batch_id.clone(),
         )
         .await?;
 
         let _ = change_id;
-        Ok(TransferResult {
-            receiver_address: receiver_address.to_string(),
-            total_sats: TOKEN_PIECE_SATS,
-            coins: vec![TransferredCoin {
-                statechain_id: piece_id,
-                amount_sats: TOKEN_PIECE_SATS,
-            }],
-            used_split: true,
+        Ok(ColoredTransferOut {
+            result: TransferResult {
+                receiver_address: receiver_address.to_string(),
+                total_sats: TOKEN_PIECE_SATS,
+                coins: vec![TransferredCoin {
+                    statechain_id: piece_id.clone(),
+                    amount_sats: TOKEN_PIECE_SATS,
+                }],
+                used_split: true,
+            },
+            piece_id,
+            batch_id,
+            se_hash,
         })
     }
 
