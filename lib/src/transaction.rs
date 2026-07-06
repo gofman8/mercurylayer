@@ -349,6 +349,15 @@ pub fn get_unsigned_split_psbt(
     if outputs.is_empty() || total_out >= input_amount {
         return Err(MercuryError::FeeTooLow);
     }
+    // Dust floor (audit [9], INV-4): every split output becomes a sub-coin whose funding IS its exit
+    // branch. A below-dust output makes the co-signed split tx non-standard / unrelayable, so once
+    // the parent is consumed (single-use) BOTH sub-coins — and any RGB allocation on them — have no
+    // on-chain exit. Reject any sub-dust output BEFORE the SE co-signs, while the parent is still
+    // spendable. P2TR dust is 330 sats.
+    const DUST_LIMIT: u64 = 330;
+    if outputs.iter().any(|(_, v)| *v < DUST_LIMIT) {
+        return Err(MercuryError::FeeTooLow);
+    }
 
     let tx_outs: Vec<TxOut> = outputs
         .iter()
@@ -786,9 +795,17 @@ pub fn get_unsigned_combine_psbt(
         })
         .collect::<core::result::Result<_, _>>()?;
 
-    let block_height =
-        calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
-    let lock_time = absolute::LockTime::from_height(block_height)?;
+    // INV-4 (audit [12]): identical to the split path — an OFF-CHAIN combine branch must be
+    // unconditionally broadcastable (locktime 0) so it always matures below any deposit-anchored
+    // parent backup and the latest state wins the exit race. A tip-relative decrementing locktime
+    // would re-introduce the H5 inversion the instant combine is wired for non-withdrawal use. A
+    // withdrawal to an on-chain address keeps its computed locktime.
+    let lock_time = if is_withdrawal {
+        let bh = calculate_block_height(block_height, initlock, interval, qt_backup_tx, is_withdrawal)?;
+        absolute::LockTime::from_height(bh)?
+    } else {
+        absolute::LockTime::from_height(0)?
+    };
 
     let mut tx_ins = Vec::with_capacity(coins.len());
     for c in coins {

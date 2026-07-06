@@ -313,6 +313,15 @@ impl SparkWallet {
             ));
         }
         let change_sats = parent_sats - piece_sats - fee_reserve;
+        // Dust floor (audit [9]): both sub-coin funding outputs must be standard/relayable, else the
+        // co-signed split tx is unbroadcastable and — once the parent is consumed — strands both
+        // sub-coins with no on-chain exit. Reject BEFORE touching the parent. P2TR dust = 330 sats.
+        const DUST_LIMIT: u64 = 330;
+        if piece_sats < DUST_LIMIT || change_sats < DUST_LIMIT {
+            return Err(anyhow!(
+                "split would create a sub-dust output (piece {piece_sats}, change {change_sats}, dust floor {DUST_LIMIT}) — the split tx would be unbroadcastable"
+            ));
+        }
 
         // Two fresh statechain slots owned by this wallet (SE handshake only — no on-chain tx).
         // Normal coins: sub-coin security is Mercury's decrementing-locktime scheme, with the

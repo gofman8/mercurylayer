@@ -279,7 +279,17 @@ impl SparkWallet {
     /// Balance across all coins, including per-asset token balances (when configured).
     pub async fn get_balance(&self) -> Result<Balance> {
         let record = self.record().await?;
-        let carriers = self.token_carrier_outpoints().await.unwrap_or_default();
+        // Fail CLOSED for token wallets (audit [23]): if RGB state is unavailable we cannot know
+        // which coins are carriers, and silently counting a carrier's sats as spendable BTC would
+        // invite an RGB-destroying spend. For a non-token wallet there are no carriers, so an empty
+        // set is correct.
+        let carriers = if self.inner.config.rgb_data_dir.is_some()
+            && self.inner.config.rgb_proxy_url.is_some()
+        {
+            self.token_carrier_outpoints().await?
+        } else {
+            self.token_carrier_outpoints().await.unwrap_or_default()
+        };
         let mut balance = compute_balance_excluding(&record, &carriers);
         balance.tokens = self.get_token_balances().await.unwrap_or_default();
         Ok(balance)
@@ -388,6 +398,45 @@ impl SparkWallet {
                 }
             }
         }
+
+        // Retriable token booking (audit [8], review H6): a transient RGB-proxy/indexer error during
+        // the claim pass above leaves the Mercury coin CONFIRMED but its token allocation unbooked and
+        // permanently invisible. On EVERY claim pass, rescan CONFIRMED coins that carry a consignment
+        // but have no booked allocation and re-run accept_incoming_tokens (idempotent). Because the
+        // background watcher calls claim() on an interval, this is the retry loop.
+        if self.inner.config.rgb_data_dir.is_some() && self.inner.config.rgb_proxy_url.is_some() {
+            let booked = self.token_carrier_outpoints().await.unwrap_or_default();
+            let handled: std::collections::HashSet<&str> =
+                receive.received_statechain_ids.iter().map(|s| s.as_str()).collect();
+            for coin in after
+                .coins
+                .iter()
+                .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            {
+                let Some(id) = coin.statechain_id.as_deref() else { continue };
+                if handled.contains(id) {
+                    continue; // already attempted this pass
+                }
+                if coin_outpoint(coin).map_or(false, |o| booked.contains(&o)) {
+                    continue; // already booked
+                }
+                // accept_incoming_tokens cheaply returns Ok(None) if the coin carries no consignment,
+                // so this only does real work for genuinely stranded token coins.
+                match self.accept_incoming_tokens(id).await {
+                    Ok(Some((asset_id, amount))) => {
+                        let _ = self.inner.events_tx.send(WalletEvent::TokenTransferClaimed {
+                            asset_id,
+                            amount,
+                            statechain_id: id.to_string(),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        println!("token rebook retry for {id}: {e}");
+                    }
+                }
+            }
+        }
         if !confirmed_deposits.is_empty() || !receive.received_statechain_ids.is_empty() {
             let _ = self.inner.events_tx.send(WalletEvent::BalanceUpdate {
                 balance: compute_balance(&after),
@@ -423,12 +472,28 @@ impl SparkWallet {
         fee_rate: Option<f64>,
     ) -> Result<Vec<String>> {
         let record = self.record().await?;
+        // Never sweep a token-carrier coin into an RGB-unaware L1 spend (destroys the allocation —
+        // audit [7]). Exclude carriers from the withdraw-everything default; if the caller names a
+        // carrier explicitly, hard-error so the loss is never silent.
+        let carriers = self.token_carrier_outpoints().await?;
         let ids: Vec<String> = match statechain_ids {
-            Some(ids) => ids,
+            Some(ids) => {
+                for id in &ids {
+                    if let Some(c) = record.coins.iter().find(|c| c.statechain_id.as_deref() == Some(id)) {
+                        if is_token_carrier(c, &carriers) {
+                            return Err(anyhow!(
+                                "coin {id} carries an RGB allocation; withdrawing it as plain BTC would destroy the tokens — move the asset off this coin first"
+                            ));
+                        }
+                    }
+                }
+                ids
+            }
             None => record
                 .coins
                 .iter()
                 .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+                .filter(|c| !is_token_carrier(c, &carriers))
                 .filter_map(|c| c.statechain_id.clone())
                 .collect(),
         };
@@ -535,18 +600,19 @@ impl SparkWallet {
         let wait_blocks = locktime.saturating_sub(tip);
 
         // Safety deadline (off-chain sub-coins only): the earliest height an ANCESTOR could broadcast
-        // its stale backup to race you. The decrementing-locktime ladder drops one `interval` per hop,
-        // so the immediate parent's backup locktime is exactly one interval ABOVE this coin's leaf
-        // backup — and being the shallowest ancestor it matures earliest, making it the binding
-        // deadline. You must broadcast your (locktime-free) branch before it. A flat on-chain coin has
-        // no off-chain ancestor, so there is no such deadline.
+        // its stale backup to race you; you MUST broadcast your (locktime-free) branch before it.
+        //
+        // Audit [10]/H5: `leaf_locktime + interval` is WRONG. A post-deposit split anchors the leaf
+        // backup at the SPLIT tip (H_split + initlock - interval*qt), while ancestor backups are
+        // anchored at the DEPOSIT tip. For an aged/transferred coin H_split >> H_deposit, so
+        // leaf+interval overstates the real deadline by thousands of blocks — a watchtower honoring
+        // it would exit AFTER a deposit-anchored ancestor backup already matured (clawback). Anchor
+        // the deadline to the branch ROOT's on-chain deposit height instead: L0 = H_deposit + initlock
+        // is deposit-anchored, split-tip-independent, and a safe (early) bound over all ancestors.
         let exit_deadline_block = if branch.is_empty() {
             None
         } else {
-            match mercuryrustlib::utils::info_config(&self.inner.cc).await {
-                std::result::Result::Ok(si) => Some(locktime + si.interval),
-                Err(_) => None, // SE unreachable: a watchtower should cache the interval to compute this offline
-            }
+            self.deposit_anchored_exit_deadline(&branch).await
         };
 
         Ok(crate::types::ExitCostEstimate {
@@ -560,6 +626,40 @@ impl SparkWallet {
         })
     }
 
+    /// The deposit-anchored exit-race deadline (audit [10]): resolve the branch ROOT's on-chain
+    /// funding-deposit confirmation height `H_deposit` and return `H_deposit + initlock`. This is
+    /// deposit-anchored (independent of the split tip), so it is a safe (early) bound over every
+    /// ancestor's backup maturity. Returns `None` if the SE config or the on-chain deposit height
+    /// cannot be resolved (an offline watchtower must cache `initlock` and the deposit height to
+    /// compute this itself — never fall back to `leaf_locktime + interval`).
+    async fn deposit_anchored_exit_deadline(
+        &self,
+        branch: &[mercurylib::wallet::BackupTx],
+    ) -> Option<u32> {
+        use electrum_client::ElectrumApi;
+        let initlock = mercuryrustlib::utils::info_config(&self.inner.cc).await.ok()?.initlock;
+        // Branch is stored root-first; the root's single input spends the on-chain deposit outpoint.
+        let root = branch.iter().min_by_key(|b| b.tx_n)?;
+        let root_tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&root.tx).ok()?).ok()?;
+        let deposit_outpoint = root_tx.input.first()?.previous_output;
+        // Fetch the deposit funding tx to read the scriptPubKey being spent, then find that tx's
+        // confirmation height in the address history.
+        let dep_tx = self
+            .inner
+            .cc
+            .electrum_client
+            .transaction_get(&deposit_outpoint.txid)
+            .ok()?;
+        let spk = &dep_tx.output.get(deposit_outpoint.vout as usize)?.script_pubkey;
+        let history = self.inner.cc.electrum_client.script_get_history(spk).ok()?;
+        let h_deposit = history
+            .iter()
+            .find(|h| h.tx_hash == deposit_outpoint.txid && h.height > 0)
+            .map(|h| h.height as u32)?;
+        Some(h_deposit + initlock)
+    }
+
     /// Unilateral exit: broadcast the exit branch (immediately valid) and the latest pre-signed
     /// backup tx for each coin. Needs no SE cooperation. A backup whose locktime has not been
     /// reached is reported as `complete=false` with the remaining `wait_blocks` — call again
@@ -571,12 +671,28 @@ impl SparkWallet {
     ) -> Result<Vec<crate::types::ExitStatus>> {
         use electrum_client::ElectrumApi;
         let record = self.record().await?;
+        // Same carrier guard as withdraw (audit [7]): a unilateral exit broadcasts an RGB-unaware
+        // spend, so a carrier coin must be excluded from the exit-everything default and rejected if
+        // named explicitly.
+        let carriers = self.token_carrier_outpoints().await?;
         let ids: Vec<String> = match statechain_ids {
-            Some(ids) => ids,
+            Some(ids) => {
+                for id in &ids {
+                    if let Some(c) = record.coins.iter().find(|c| c.statechain_id.as_deref() == Some(id)) {
+                        if is_token_carrier(c, &carriers) {
+                            return Err(anyhow!(
+                                "coin {id} carries an RGB allocation; a plain unilateral exit would destroy the tokens — move the asset off this coin first"
+                            ));
+                        }
+                    }
+                }
+                ids
+            }
             None => record
                 .coins
                 .iter()
                 .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+                .filter(|c| !is_token_carrier(c, &carriers))
                 .filter_map(|c| c.statechain_id.clone())
                 .collect(),
         };
@@ -763,6 +879,13 @@ pub(crate) fn coin_outpoint(c: &Coin) -> Option<String> {
         (Some(txid), Some(vout)) => Some(format!("{txid}:{vout}")),
         _ => None,
     }
+}
+
+/// True if this coin's utxo currently carries an RGB token allocation. Such a coin must NEVER be
+/// selected for a plain-BTC spend — transfer, withdraw, unilateral exit, or an LN swap — because an
+/// RGB-unaware spend of the carrier destroys the allocation (review H2 + audit-2026-07 [6]/[7]).
+pub(crate) fn is_token_carrier(c: &Coin, carriers: &std::collections::HashSet<String>) -> bool {
+    coin_outpoint(c).map_or(false, |o| carriers.contains(&o))
 }
 
 pub(crate) fn compute_balance(record: &WalletRecord) -> Balance {

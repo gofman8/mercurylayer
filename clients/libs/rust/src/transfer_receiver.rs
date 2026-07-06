@@ -817,6 +817,25 @@ async fn validate_branch(
             }
         }
     }
+    // INV-4 (audit [11]): a structural branch tx must be IMMEDIATELY broadcastable — no unreached
+    // locktime. The blind SE never constrains a branch's nLockTime, so a malicious sender could ship
+    // a branch tx with a far-future locktime; the receiver would book the coin CONFIRMED yet be
+    // unable to exit, while the sender's matured parent/deposit backup later sweeps the shared root
+    // outpoint back to themselves (total loss of received value). Reject any branch tx whose locktime
+    // is not already satisfied at the receiver's current tip.
+    let tip = electrum_client.block_headers_subscribe_raw()?.height as u32;
+    for tx in &txs {
+        let lock_time = tx.lock_time.to_consensus_u32();
+        if lock_time > tip {
+            return Err(anyhow!(
+                "exit-branch tx {} has an unreached locktime {} (tip {}) — not immediately broadcastable, violates INV-4; rejecting",
+                tx.txid(),
+                lock_time,
+                tip
+            ));
+        }
+    }
+
     // Consensus-verify every branch tx against its prevouts (signatures + scripts) AND check value
     // conservation. `tx.verify` runs script/signature checks but NOT the fee rule, so a malicious
     // sender could hand the receiver a branch whose txs create value (Σ outputs > Σ inputs); those

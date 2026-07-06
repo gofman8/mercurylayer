@@ -40,14 +40,27 @@ impl SparkWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
+        // Never auto-select a token-carrier coin for an LN swap — handing the carrier to the LSP as
+        // plain BTC destroys the RGB allocation (audit [6]). Fail closed if RGB state is unavailable.
+        let carriers = self.token_carrier_outpoints().await?;
         let coin_id = match statechain_id {
-            Some(id) => id,
+            Some(id) => {
+                if let Some(c) = record.coins.iter().find(|c| c.statechain_id.as_deref() == Some(&id)) {
+                    if crate::wallet::is_token_carrier(c, &carriers) {
+                        return Err(anyhow!(
+                            "coin {id} carries an RGB allocation; swapping it over Lightning as plain BTC would destroy the tokens"
+                        ));
+                    }
+                }
+                id
+            }
             None => record
                 .coins
                 .iter()
                 .filter(|c| {
                     c.status == mercurylib::wallet::CoinStatus::CONFIRMED && c.duplicate_index == 0
                 })
+                .filter(|c| !crate::wallet::is_token_carrier(c, &carriers))
                 .max_by_key(|c| c.amount.unwrap_or_default())
                 .and_then(|c| c.statechain_id.clone())
                 .ok_or_else(|| anyhow!("no confirmed coin to swap"))?,
