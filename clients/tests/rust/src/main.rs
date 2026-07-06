@@ -47,6 +47,9 @@ pub mod sdk18_pay_failure_reclaim;
 pub mod sdk19_receive_failure;
 pub mod sdk20_adversarial_gate;
 pub mod sdk21_remote_sspclient;
+pub mod chaos22_concurrent_users;
+pub mod chaos22_cheats;
+pub mod chaos22_oracle;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -160,6 +163,12 @@ async fn main() -> Result<()> {
     // Remote SspClient over HTTP (SDK_E2E=21): pay + receive against a deployed mercury-ssp server.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("21") {
         sdk21_remote_sspclient::execute().await?;
+        return Ok(());
+    }
+    // Concurrent chaos/property test (SDK_E2E=22): N users act in parallel (enter/send/receive/
+    // split/exit/withdraw) + cheat (broadcast old state); a spec-invariant oracle audits the trace.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("22") {
+        chaos22_concurrent_users::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

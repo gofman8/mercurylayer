@@ -1,0 +1,582 @@
+//! Chaos / property test (SDK_E2E=22): N users act CONCURRENTLY against the live SE + lockbox,
+//! doing weighted-random actions — enter (deposit), send, receive (claim), split, unilateral exit,
+//! cooperative withdraw — and occasionally CHEATING (broadcasting stale state to try to claw a coin
+//! back). Every attempt+result is traced to a JSONL file. After a quiescent settle, an oracle
+//! replays the trace + queries final state and asserts the spec invariants: no value is created
+//! (INV-1/13/25), no old-state cheat ever succeeded (INV-5/18/19), balances stay non-negative
+//! (INV-9), claims are idempotent (INV-8), and every action outcome was EXPECTED (either success or
+//! a spec-sanctioned refusal — never an unclassified error).
+//!
+//! Config (env): CHAOS_USERS (default 5), CHAOS_SECS (default 20), CHAOS_WHALES (default 2),
+//! CHAOS_DEPOSIT_SATS (default 2_000_000), CHAOS_INFLIGHT (default 12, caps concurrent signing to
+//! respect the SE pool), CHAOS_CHEAT_PROB (default 0.06), CHAOS_SEED (default 42).
+//!
+//! Run (smoke): SDK_E2E=22 CHAOS_USERS=5 CHAOS_SECS=20 ML_NETWORK=regtest RLN_REGTEST=.../regtest.sh
+//!   ... cargo run     (full: CHAOS_USERS=100 CHAOS_SECS=180 CHAOS_WHALES=8 CHAOS_INFLIGHT=20)
+
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercuryrustlib::client_config::ClientConfig;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use serde_json::json;
+use tokio::sync::{Mutex, Semaphore};
+
+use crate::bitcoin_core;
+use crate::chaos22_oracle;
+
+// ------------------------------------------------------------------------------------------------
+// Config
+// ------------------------------------------------------------------------------------------------
+
+pub struct Cfg {
+    pub users: usize,
+    pub secs: u64,
+    pub whales: usize,
+    pub deposit_sats: u64,
+    pub inflight: usize,
+    pub cheat_prob: f64,
+    pub seed: u64,
+    pub run_dir: String,
+}
+
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+fn env_u64(k: &str, d: u64) -> u64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+fn env_f64(k: &str, d: f64) -> f64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+impl Cfg {
+    fn from_env() -> Self {
+        let users = env_usize("CHAOS_USERS", 5).max(1);
+        let whales = env_usize("CHAOS_WHALES", 2).clamp(1, users);
+        Cfg {
+            users,
+            secs: env_u64("CHAOS_SECS", 20),
+            whales,
+            deposit_sats: env_u64("CHAOS_DEPOSIT_SATS", 2_000_000),
+            inflight: env_usize("CHAOS_INFLIGHT", 12).max(1),
+            cheat_prob: env_f64("CHAOS_CHEAT_PROB", 0.06),
+            seed: env_u64("CHAOS_SEED", 42),
+            run_dir: std::env::var("CHAOS_RUN_DIR")
+                .unwrap_or_else(|_| "/tmp/chaos22".to_string()),
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Trace: one JSONL line per attempt/result, wall-clock ordered.
+// ------------------------------------------------------------------------------------------------
+
+pub struct Trace {
+    seq: AtomicU64,
+    file: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Trace {
+    fn new(path: &str) -> Result<Self> {
+        let f = std::fs::File::create(path)?;
+        Ok(Trace {
+            seq: AtomicU64::new(0),
+            file: std::sync::Mutex::new(std::io::BufWriter::new(f)),
+        })
+    }
+    /// Emit one event. `extra` carries action-specific fields.
+    pub fn emit(&self, actor: usize, action: &str, phase: &str, outcome: &str, extra: serde_json::Value) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let mut ev = json!({
+            "seq": seq, "actor": actor, "action": action, "phase": phase, "outcome": outcome,
+        });
+        if let (Some(obj), Some(ex)) = (ev.as_object_mut(), extra.as_object()) {
+            for (k, v) in ex {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(f, "{}", ev);
+            let _ = f.flush();
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Outcome classification: under chaos, MANY actions legitimately fail. Distinguish spec-sanctioned
+// refusals / contention from real invariant breaches. This is the heart of "everything as expected".
+// ------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Class {
+    Ok,
+    /// A legitimate, spec-expected failure under concurrency (not a bug).
+    Contention(&'static str),
+    /// An unexpected error — a candidate bug. Recorded as a breach.
+    Breach,
+}
+
+/// Map an error to a class by its message. Expected-contention substrings come from the SDK/SE
+/// error surface; anything unmatched is a Breach the oracle will flag.
+pub fn classify(err: &anyhow::Error) -> Class {
+    let m = err.to_string().to_lowercase();
+    let expected: &[(&str, &str)] = &[
+        ("insufficient balance", "insufficient"),
+        ("no exact coin", "no-exact"),
+        ("no confirmed coin", "no-coin"),
+        ("no coin large enough", "no-coin"),
+        ("no coin with statechain", "no-coin"),
+        ("deposit token payment required", "token"),
+        ("token support is not configured", "token-cfg"),
+        ("single-use", "terminal"),
+        ("spend budget", "terminal"),
+        ("already spent", "terminal"),
+        ("epoch deadline", "epoch"),
+        ("nonce already finalized", "nonce-guard"),
+        ("nonce reuse", "nonce-guard"),
+        ("batch locked", "batch-lock"),
+        ("statecoinbatchlocked", "batch-lock"),
+        ("txn-mempool-conflict", "mempool-conflict"),
+        ("conflicts with an existing mempool", "mempool-conflict"),
+        ("non-final", "non-final"),
+        ("bad-txns-inputs-missingorspent", "input-spent"),
+        ("missingorspent", "input-spent"),
+        ("did not confirm", "confirm-lag"),
+        ("no backup tx stored", "no-coin"),
+        ("piece", "split-fit"),
+        ("does not fit", "split-fit"),
+        ("dust", "dust"),
+        ("feetoolow", "dust"),
+    ];
+    for (needle, tag) in expected {
+        if m.contains(needle) {
+            return Class::Contention(tag);
+        }
+    }
+    Class::Breach
+}
+
+// ------------------------------------------------------------------------------------------------
+// Users + registry
+// ------------------------------------------------------------------------------------------------
+
+pub struct UserHandle {
+    pub idx: usize,
+    pub wallet: SparkWallet,
+    pub address: String,
+    pub is_whale: bool,
+}
+
+pub struct Registry {
+    pub users: Vec<Arc<UserHandle>>,
+    pub total_deposited: AtomicU64,
+    pub by_addr: HashMap<String, usize>,
+}
+
+// ------------------------------------------------------------------------------------------------
+// Token faucet (shared): fetch prepaid deposit-token slots from the SE.
+// ------------------------------------------------------------------------------------------------
+
+async fn refill_tokens(user: &UserHandle, cc: &ClientConfig, n: usize) {
+    for _ in 0..n {
+        match mercuryrustlib::deposit::get_token(cc).await {
+            Ok(tok) => match crate::utils::handle_token_response(cc, &tok).await {
+                Ok(id) => user.wallet.add_prepaid_token(&id).await,
+                Err(_) => break,
+            },
+            Err(_) => break,
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Entry point
+// ------------------------------------------------------------------------------------------------
+
+pub async fn execute() -> Result<()> {
+    let cfg = Cfg::from_env();
+    let _ = std::fs::remove_dir_all(&cfg.run_dir);
+    std::fs::create_dir_all(&cfg.run_dir)?;
+    let trace_path = format!("{}/chaos.jsonl", cfg.run_dir);
+    let trace = Arc::new(Trace::new(&trace_path)?);
+    let bitcoin = Arc::new(Mutex::new(())); // serialize all bitcoin-core shell-outs
+    let sign_sem = Arc::new(Semaphore::new(cfg.inflight)); // cap concurrent SE co-signing
+    let faucet_cc = mercuryrustlib::client_config::load().await;
+
+    println!(
+        "CHAOS22 - starting: {} users, {} whales, {}s, deposit {} sats, inflight {}, cheat_prob {}",
+        cfg.users, cfg.whales, cfg.secs, cfg.deposit_sats, cfg.inflight, cfg.cheat_prob
+    );
+
+    // --- build users (per-user db + rgb dir; tokens/pure-sats only) ------------------------------
+    let mut users: Vec<Arc<UserHandle>> = Vec::with_capacity(cfg.users);
+    let mut by_addr = HashMap::new();
+    for i in 0..cfg.users {
+        let mut sc = SdkConfig::regtest(&format!("chaos_{i}"));
+        sc.database_file = format!("{}/wallet-{i}.db", cfg.run_dir);
+        sc.rgb_data_dir = None; // pure-sats chaos (RGB-over-chaos is a follow-up)
+        sc.rgb_proxy_url = None;
+        let (w, _) = SparkWallet::initialize(sc, None).await?;
+        let address = w.get_spark_address().await?;
+        by_addr.insert(address.clone(), i);
+        users.push(Arc::new(UserHandle { idx: i, wallet: w, address, is_whale: i < cfg.whales }));
+    }
+    let registry = Arc::new(Registry { users, total_deposited: AtomicU64::new(0), by_addr });
+    println!("CHAOS22 - {} wallets built (per-user db)", cfg.users);
+
+    // --- fund whales: one batched mempool + one 3-block mine + parallel claim --------------------
+    let mut deposit_addrs: Vec<(usize, String)> = Vec::new();
+    for u in registry.users.iter().filter(|u| u.is_whale) {
+        refill_tokens(u, &faucet_cc, 24).await; // deposit slot + many split slots
+        let addr = u.wallet.get_deposit_address(cfg.deposit_sats).await?;
+        deposit_addrs.push((u.idx, addr));
+    }
+    {
+        let _g = bitcoin.lock().await;
+        for (_i, addr) in &deposit_addrs {
+            bitcoin_core::sendtoaddress(cfg.deposit_sats as u32, addr)?;
+        }
+        let core = bitcoin_core::getnewaddress()?;
+        bitcoin_core::generatetoaddress(3, &core)?;
+    }
+    for u in registry.users.iter().filter(|u| u.is_whale) {
+        let mut waited = 0;
+        loop {
+            u.wallet.claim().await?;
+            if u.wallet.get_balance().await?.available_sats >= cfg.deposit_sats {
+                break;
+            }
+            waited += 1;
+            if waited > 90 {
+                return Err(anyhow!("whale {} deposit never confirmed", u.idx));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        registry.total_deposited.fetch_add(cfg.deposit_sats, Ordering::SeqCst);
+        trace.emit(u.idx, "deposit", "confirm", "ok",
+            json!({ "amount": cfg.deposit_sats, "balance_after": cfg.deposit_sats }));
+    }
+    let d_total = registry.total_deposited.load(Ordering::SeqCst);
+    println!("CHAOS22 - whales funded: D = {d_total} sats deposited");
+
+    // --- circulate value off-chain so every non-whale user has something to act with -------------
+    let whales: Vec<usize> = registry.users.iter().filter(|u| u.is_whale).map(|u| u.idx).collect();
+    let per_user = (cfg.deposit_sats / (cfg.users as u64 / cfg.whales as u64 + 1) / 4).max(20_000);
+    for (k, u) in registry.users.iter().enumerate() {
+        if u.is_whale {
+            continue;
+        }
+        let whale = &registry.users[whales[k % whales.len()]];
+        let _permit = sign_sem.acquire().await.unwrap();
+        match whale.wallet.transfer(&u.address, per_user).await {
+            Ok(_) => {
+                drop(_permit);
+                for _ in 0..20 {
+                    if u.wallet.claim().await.map(|r| r.claimed_transfers).unwrap_or(0) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                trace.emit(whale.idx, "seed_transfer", "result", "ok",
+                    json!({ "to": u.idx, "amount": per_user }));
+            }
+            Err(e) => {
+                trace.emit(whale.idx, "seed_transfer", "result", "err",
+                    json!({ "to": u.idx, "amount": per_user, "error": e.to_string() }));
+            }
+        }
+        // keep the receiver stocked with split tokens for the chaos loop
+        refill_tokens(u, &faucet_cc, 12).await;
+    }
+    println!("CHAOS22 - value circulated off-chain to all users");
+
+    // --- background miner: confirms trickle deposits + matures exit locktimes ---------------------
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let miner = {
+        let bitcoin = bitcoin.clone();
+        let mut stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *stop_rx.borrow() {
+                    break;
+                }
+                {
+                    let _g = bitcoin.lock().await;
+                    if let Ok(core) = bitcoin_core::getnewaddress() {
+                        let _ = bitcoin_core::generatetoaddress(1, &core);
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = stop_rx.changed() => {}
+                }
+            }
+        })
+    };
+
+    // --- spawn the concurrent user tasks ----------------------------------------------------------
+    let deadline = Instant::now() + Duration::from_secs(cfg.secs);
+    let mut tasks = Vec::new();
+    for u in registry.users.iter().cloned() {
+        let registry = registry.clone();
+        let trace = trace.clone();
+        let bitcoin = bitcoin.clone();
+        let sign_sem = sign_sem.clone();
+        let faucet_cc2 = mercuryrustlib::client_config::load().await;
+        let seed = cfg.seed + u.idx as u64;
+        let cheat_prob = cfg.cheat_prob;
+        tasks.push(tokio::spawn(async move {
+            run_user(u, registry, trace, bitcoin, sign_sem, faucet_cc2, deadline, seed, cheat_prob).await
+        }));
+    }
+    println!("CHAOS22 - {} user tasks running for {}s...", cfg.users, cfg.secs);
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    // --- settle to quiescence: everyone claims, mine to mature/confirm ----------------------------
+    println!("CHAOS22 - settling to quiescence...");
+    for _round in 0..4 {
+        for u in registry.users.iter() {
+            let _ = u.wallet.claim().await;
+        }
+        {
+            let _g = bitcoin.lock().await;
+            if let Ok(core) = bitcoin_core::getnewaddress() {
+                let _ = bitcoin_core::generatetoaddress(3, &core);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let _ = stop_tx.send(true);
+    let _ = miner.await;
+
+    // --- oracle -----------------------------------------------------------------------------------
+    // D = ALL value injected (whale deposits + every in-run deposit attempt). This is an UPPER bound
+    // on injected value: a deposit that didn't fully land just makes accounted < D (a bigger deficit),
+    // never inflation. So `Σ SE balances <= D` is a robust no-value-created check.
+    let d_total = registry.total_deposited.load(Ordering::SeqCst);
+    println!("CHAOS22 - running invariant oracle over {trace_path}... (D={d_total})");
+    let report = chaos22_oracle::run(&trace_path, &registry, d_total).await?;
+    println!("{}", report.summary());
+    if !report.breaches.is_empty() {
+        for b in &report.breaches {
+            println!("CHAOS22 BREACH: {b}");
+        }
+        return Err(anyhow!("chaos oracle found {} invariant breach(es)", report.breaches.len()));
+    }
+    println!(
+        "CHAOS22 - SUCCESS: {} users x {}s, actions ok={} contention={} cheats_refused={}, value conserved (D={} accounted={} fees/reserve={}), no cheat succeeded, all outcomes expected.",
+        cfg.users, cfg.secs, report.ok, report.contention, report.cheats_refused,
+        d_total, report.accounted, report.deficit
+    );
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------------------
+// Per-user weighted-random action loop
+// ------------------------------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn run_user(
+    me: Arc<UserHandle>,
+    registry: Arc<Registry>,
+    trace: Arc<Trace>,
+    bitcoin: Arc<Mutex<()>>,
+    sign_sem: Arc<Semaphore>,
+    faucet_cc: ClientConfig,
+    deadline: Instant,
+    seed: u64,
+    cheat_prob: f64,
+) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    // (action, weight)
+    let actions = [
+        ("send", 30u32),
+        ("claim", 30),
+        ("split", 12),
+        ("read", 8),
+        ("exit", 5),
+        ("withdraw", 4),
+        ("deposit", 3),
+    ];
+    let total_w: u32 = actions.iter().map(|(_, w)| *w).sum();
+
+    while Instant::now() < deadline {
+        let jitter = rng.gen_range(50..600);
+        tokio::time::sleep(Duration::from_millis(jitter)).await;
+
+        // occasional cheat
+        if rng.gen_bool(cheat_prob) {
+            crate::chaos22_cheats::run_random_cheat(&me, &registry, &trace, &bitcoin, &mut rng).await;
+            continue;
+        }
+
+        // pick a weighted action
+        let mut pick = rng.gen_range(0..total_w);
+        let mut chosen = "read";
+        for (a, w) in &actions {
+            if pick < *w {
+                chosen = a;
+                break;
+            }
+            pick -= *w;
+        }
+
+        let bal = match me.wallet.get_balance().await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        match chosen {
+            "read" => {
+                let coins = me.wallet.list_coins().await.map(|c| c.len()).unwrap_or(0);
+                trace.emit(me.idx, "read", "result", "ok",
+                    json!({ "available": bal.available_sats, "in_transfer": bal.in_transfer_sats, "pending": bal.pending_sats, "coins": coins }));
+            }
+            "send" => {
+                if bal.available_sats < 30_000 || registry.users.len() < 2 {
+                    continue;
+                }
+                let to = loop {
+                    let j = rng.gen_range(0..registry.users.len());
+                    if j != me.idx {
+                        break j;
+                    }
+                };
+                let amount = rng.gen_range(10_000..(bal.available_sats / 2).max(10_001));
+                let to_addr = registry.users[to].address.clone();
+                trace.emit(me.idx, "send", "attempt", "start",
+                    json!({ "to": to, "amount": amount, "avail_before": bal.available_sats }));
+                let permit = sign_sem.acquire().await.unwrap();
+                let r = me.wallet.transfer(&to_addr, amount).await;
+                drop(permit);
+                emit_result(&trace, me.idx, "send", &r.map(|res| json!({
+                    "to": to, "amount": amount, "coins": res.coins.len(), "used_split": res.used_split
+                })));
+                // top up split tokens now and then
+                if rng.gen_bool(0.3) {
+                    refill_tokens(&me, &faucet_cc, 6).await;
+                }
+            }
+            "claim" => {
+                let r = me.wallet.claim().await;
+                match &r {
+                    Ok(res) => trace.emit(me.idx, "claim", "result", "ok",
+                        json!({ "claimed": res.claimed_transfers, "avail_after": me.wallet.get_balance().await.map(|b| b.available_sats).unwrap_or(0) })),
+                    Err(e) => emit_err(&trace, me.idx, "claim", e),
+                }
+            }
+            "split" => {
+                if bal.available_sats < 50_000 {
+                    continue;
+                }
+                // pick a confirmed coin and split a random piece off it
+                let coins = me.wallet.list_coins().await.unwrap_or_default();
+                let cand = coins.iter().find(|c| c.status == "CONFIRMED" && c.amount_sats > 40_000);
+                let Some(c) = cand else { continue };
+                let Some(id) = c.statechain_id.clone() else { continue };
+                let piece = rng.gen_range(5_000..(c.amount_sats / 2).max(5_001));
+                trace.emit(me.idx, "split", "attempt", "start",
+                    json!({ "coin": id, "parent_sats": c.amount_sats, "piece": piece }));
+                let permit = sign_sem.acquire().await.unwrap();
+                let r = me.wallet.split_coin(&id, piece).await;
+                drop(permit);
+                emit_result(&trace, me.idx, "split",
+                    &r.map(|(p, ch)| json!({ "piece_id": p, "change_id": ch, "piece": piece })));
+                if rng.gen_bool(0.5) {
+                    refill_tokens(&me, &faucet_cc, 4).await;
+                }
+            }
+            "exit" => {
+                let coins = me.wallet.list_coins().await.unwrap_or_default();
+                let cand = coins.iter().find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some());
+                let Some(c) = cand else { continue };
+                let id = c.statechain_id.clone().unwrap();
+                trace.emit(me.idx, "exit", "attempt", "start", json!({ "coin": id, "amount": c.amount_sats }));
+                let permit = sign_sem.acquire().await.unwrap();
+                let _g = bitcoin.lock().await; // exit broadcasts branch txs
+                let r = me.wallet.unilateral_exit(Some(vec![id.clone()]), None).await;
+                drop(_g);
+                drop(permit);
+                match &r {
+                    Ok(st) => {
+                        let complete = st.first().map(|s| s.complete).unwrap_or(false);
+                        trace.emit(me.idx, "exit", "result", if complete { "ok" } else { "pending" },
+                            json!({ "coin": id, "amount": c.amount_sats, "complete": complete,
+                                    "wait_blocks": st.first().map(|s| s.wait_blocks).unwrap_or(0) }));
+                    }
+                    Err(e) => emit_err(&trace, me.idx, "exit", e),
+                }
+            }
+            "withdraw" => {
+                let coins = me.wallet.list_coins().await.unwrap_or_default();
+                let cand = coins.iter().find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some());
+                let Some(c) = cand else { continue };
+                let id = c.statechain_id.clone().unwrap();
+                let to = {
+                    let _g = bitcoin.lock().await;
+                    bitcoin_core::getnewaddress()
+                };
+                let Ok(to) = to else { continue };
+                trace.emit(me.idx, "withdraw", "attempt", "start", json!({ "coin": id, "amount": c.amount_sats }));
+                let permit = sign_sem.acquire().await.unwrap();
+                let _g = bitcoin.lock().await;
+                let r = me.wallet.withdraw(&to, Some(vec![id.clone()]), None).await;
+                drop(_g);
+                drop(permit);
+                emit_result(&trace, me.idx, "withdraw", &r.map(|w| json!({ "coin": id, "amount": c.amount_sats, "withdrawn": w.len() })));
+            }
+            "deposit" => {
+                // an in-run enter: a fresh on-chain deposit that the miner will confirm.
+                refill_tokens(&me, &faucet_cc, 2).await;
+                let amount = 500_000u64;
+                let addr = match me.wallet.get_deposit_address(amount).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        emit_err(&trace, me.idx, "deposit", &e);
+                        continue;
+                    }
+                };
+                {
+                    let _g = bitcoin.lock().await;
+                    if bitcoin_core::sendtoaddress(amount as u32, &addr).is_ok() {
+                        registry.total_deposited.fetch_add(amount, Ordering::SeqCst);
+                        trace.emit(me.idx, "deposit", "confirm", "ok",
+                            json!({ "amount": amount, "balance_after": amount }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn emit_result(trace: &Trace, actor: usize, action: &str, r: &Result<serde_json::Value>) {
+    match r {
+        Ok(v) => trace.emit(actor, action, "result", "ok", v.clone()),
+        Err(e) => emit_err(trace, actor, action, e),
+    }
+}
+
+fn emit_err(trace: &Trace, actor: usize, action: &str, e: &anyhow::Error) {
+    let class = classify(e);
+    let outcome = match &class {
+        Class::Contention(_) => "contention",
+        Class::Breach => "breach",
+        Class::Ok => "ok",
+    };
+    let tag = match class {
+        Class::Contention(t) => t,
+        Class::Breach => "unclassified",
+        Class::Ok => "ok",
+    };
+    trace.emit(actor, action, "result", outcome, json!({ "error": e.to_string(), "class": tag }));
+}
