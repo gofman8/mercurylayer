@@ -311,7 +311,8 @@ pub async fn execute() -> Result<()> {
 
     // --- circulate value off-chain CONCURRENTLY (bounded by sign_sem) so every user has value -----
     let whales: Vec<usize> = registry.users.iter().filter(|u| u.is_whale).map(|u| u.idx).collect();
-    let per_user = (cfg.deposit_sats / (cfg.users as u64 / cfg.whales as u64 + 1) / 4).max(20_000);
+    // Give every user ample circulation headroom so deep respend chains don't dust out mid-run.
+    let per_user = (cfg.deposit_sats / (cfg.users as u64 / cfg.whales as u64 + 1) / 4).max(40_000);
     let mut circ = Vec::new();
     for (k, u) in registry.users.iter().enumerate() {
         if u.is_whale {
@@ -447,15 +448,21 @@ async fn run_user(
     // Ensure this user has some deposit-token slots to split/deposit with.
     refill_tokens(&me, 8, &bitcoin).await;
     let mut rng = StdRng::seed_from_u64(seed);
+    // Per-user DAG-deepening preference in [0.30, 0.89]: how often, when the user is holding an
+    // off-chain sub-coin, it RESPENDS that sub-coin (split/transfer it onward) instead of doing a
+    // flat action — each respend adds a hop, so branches accumulate depth across the run.
+    let depth_pref = 0.30 + ((seed % 60) as f64) / 100.0;
     // (action, weight)
     let actions = [
-        ("send", 30u32),
-        ("claim", 30),
-        ("split", 12),
-        ("read", 8),
-        ("exit", 5),
+        ("send", 24u32),
+        ("claim", 26),
+        ("respend", 16), // deepen: respend the freshest off-chain sub-coin (split OR transfer onward)
+        ("split", 8),
+        ("exit_deep", 5), // valid exit at a DAG point: prefer an off-chain sub-coin
+        ("exit", 4),
         ("withdraw", 4),
         ("deposit", 3),
+        ("read", 4),
     ];
     let total_w: u32 = actions.iter().map(|(_, w)| *w).sum();
 
@@ -485,6 +492,14 @@ async fn run_user(
             Err(_) => continue,
         };
 
+        // DAG-deepening bias: independent of the weighted pick, with probability `depth_pref` steer
+        // this iteration toward RESPENDING an off-chain sub-coin so the branch grows another hop
+        // (instead of flattening via claims/reads). `respend` self-falls-back to a normal split if
+        // the user holds no off-chain sub-coin yet, so the bias always makes progress toward depth.
+        if chosen != "respend" && !matches!(chosen, "exit" | "exit_deep" | "withdraw") && rng.gen_bool(depth_pref) {
+            chosen = "respend";
+        }
+
         match chosen {
             "read" => {
                 let coins = me.wallet.list_coins().await.map(|c| c.len()).unwrap_or(0);
@@ -504,12 +519,12 @@ async fn run_user(
                 let amount = rng.gen_range(10_000..(bal.available_sats / 2).max(10_001));
                 let to_addr = registry.users[to].address.clone();
                 trace.emit(me.idx, "send", "attempt", "start",
-                    json!({ "to": to, "amount": amount, "avail_before": bal.available_sats }));
+                    json!({ "from": me.idx, "to": to, "amount": amount, "avail_before": bal.available_sats }));
                 let permit = sign_sem.acquire().await.unwrap();
                 let r = me.wallet.transfer(&to_addr, amount).await;
                 drop(permit);
                 emit_result(&trace, me.idx, "send", &r.map(|res| json!({
-                    "to": to, "amount": amount, "coins": res.coins.len(), "used_split": res.used_split
+                    "from": me.idx, "to": to, "amount": amount, "coins": res.coins.len(), "used_split": res.used_split
                 })));
                 // top up split tokens now and then
                 if rng.gen_bool(0.3) {
@@ -517,11 +532,32 @@ async fn run_user(
                 }
             }
             "claim" => {
+                // snapshot owned statechain_ids so we can report exactly which coins were received
+                let before: std::collections::HashSet<String> = me
+                    .wallet
+                    .list_coins()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| c.statechain_id)
+                    .collect();
                 let _permit = sign_sem.acquire().await.unwrap(); // bound total concurrent SE load
                 let r = me.wallet.claim().await;
+                drop(_permit);
                 match &r {
-                    Ok(res) => trace.emit(me.idx, "claim", "result", "ok",
-                        json!({ "claimed": res.claimed_transfers, "avail_after": me.wallet.get_balance().await.map(|b| b.available_sats).unwrap_or(0) })),
+                    Ok(res) => {
+                        let claimed_ids: Vec<String> = if res.claimed_transfers > 0 {
+                            me.wallet.list_coins().await.unwrap_or_default().into_iter()
+                                .filter_map(|c| c.statechain_id)
+                                .filter(|id| !before.contains(id))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        trace.emit(me.idx, "claim", "result", "ok",
+                            json!({ "claimed": res.claimed_transfers, "claimed_ids": claimed_ids,
+                                    "avail_after": me.wallet.get_balance().await.map(|b| b.available_sats).unwrap_or(0) }));
+                    }
                     Err(e) => emit_err(&trace, me.idx, "claim", e),
                 }
             }
@@ -541,17 +577,78 @@ async fn run_user(
                 let r = me.wallet.split_coin(&id, piece).await;
                 drop(permit);
                 emit_result(&trace, me.idx, "split",
-                    &r.map(|(p, ch)| json!({ "piece_id": p, "change_id": ch, "piece": piece })));
+                    &r.map(|(p, ch)| json!({ "parent_id": id, "piece_id": p, "change_id": ch, "piece": piece })));
                 if rng.gen_bool(0.5) {
                     refill_tokens(&me, 4, &bitcoin).await;
                 }
             }
-            "exit" => {
+            // DEEPEN: respend the freshest OFF-CHAIN sub-coin (a DAG node), adding one hop to its
+            // branch. Split a piece off it, or transfer the whole sub-coin onward to another user
+            // (transfer_sender::execute targets THIS specific coin, unlike wallet.transfer which
+            // re-selects). Falls back to splitting any confirmed coin to seed depth if none off-chain.
+            "respend" => {
                 let coins = me.wallet.list_coins().await.unwrap_or_default();
-                let cand = coins.iter().find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some());
+                let off = coins.iter()
+                    .filter(|c| c.status == "CONFIRMED" && c.off_chain && c.statechain_id.is_some() && c.amount_sats > 12_000)
+                    .max_by_key(|c| c.amount_sats);
+                let target = off.or_else(|| coins.iter()
+                    .find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some() && c.amount_sats > 40_000));
+                let Some(c) = target else { continue };
+                let id = c.statechain_id.clone().unwrap();
+                let was_offchain = c.off_chain;
+                // transfer onward (adds a claim-gated hop) unless the coin is small, then split.
+                if c.amount_sats <= 24_000 || (registry.users.len() >= 2 && rng.gen_bool(0.45)) {
+                    let to = loop {
+                        let j = rng.gen_range(0..registry.users.len());
+                        if j != me.idx { break j; }
+                    };
+                    let to_addr = registry.users[to].address.clone();
+                    trace.emit(me.idx, "send", "attempt", "start",
+                        json!({ "from": me.idx, "to": to, "amount": c.amount_sats, "coin": id, "respend": true, "was_offchain": was_offchain }));
+                    let permit = sign_sem.acquire().await.unwrap();
+                    let cc = me.wallet.client_config();
+                    let name = me.wallet.wallet_name();
+                    let r = mercuryrustlib::transfer_sender::execute(cc, &to_addr, name, &id, None, false, None).await;
+                    drop(permit);
+                    match &r {
+                        Ok(_) => trace.emit(me.idx, "send", "result", "ok",
+                            json!({ "from": me.idx, "to": to, "amount": c.amount_sats, "coin": id, "respend": true })),
+                        Err(e) => emit_err(&trace, me.idx, "send", &anyhow!("{e}")),
+                    }
+                } else {
+                    let piece = rng.gen_range(5_000..(c.amount_sats / 2).max(5_001));
+                    trace.emit(me.idx, "split", "attempt", "start",
+                        json!({ "coin": id, "parent_sats": c.amount_sats, "piece": piece, "respend": true, "was_offchain": was_offchain }));
+                    let permit = sign_sem.acquire().await.unwrap();
+                    let r = me.wallet.split_coin(&id, piece).await;
+                    drop(permit);
+                    emit_result(&trace, me.idx, "split",
+                        &r.map(|(p, ch)| json!({ "parent_id": id, "piece_id": p, "change_id": ch, "piece": piece, "respend": true })));
+                }
+                if rng.gen_bool(0.3) {
+                    refill_tokens(&me, 4, &bitcoin).await;
+                }
+            }
+            // exit: prefer a deposit-ROOT coin (flat, never split/transferred) — the shallow DAG case.
+            // exit_deep: prefer an OFF-CHAIN sub-coin — a valid unilateral exit at a DAG interior/leaf,
+            // which broadcasts the branch chain then the backup. Both record the funding outpoint so
+            // the oracle can audit on-chain that it was spent by the legit exit (and by nobody else).
+            "exit" | "exit_deep" => {
+                let coins = me.wallet.list_coins().await.unwrap_or_default();
+                let cand = if chosen == "exit_deep" {
+                    coins.iter().find(|c| c.status == "CONFIRMED" && c.off_chain && c.statechain_id.is_some())
+                        .or_else(|| coins.iter().find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some()))
+                } else {
+                    coins.iter().find(|c| c.status == "CONFIRMED" && !c.off_chain && c.statechain_id.is_some())
+                        .or_else(|| coins.iter().find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some()))
+                };
                 let Some(c) = cand else { continue };
                 let id = c.statechain_id.clone().unwrap();
-                trace.emit(me.idx, "exit", "attempt", "start", json!({ "coin": id, "amount": c.amount_sats }));
+                let o_txid = c.utxo_txid.clone();
+                let o_vout = c.utxo_vout.unwrap_or(0);
+                let off_chain = c.off_chain;
+                trace.emit(me.idx, "exit", "attempt", "start",
+                    json!({ "coin": id, "amount": c.amount_sats, "off_chain": off_chain, "deep": chosen == "exit_deep" }));
                 let permit = sign_sem.acquire().await.unwrap();
                 let _g = bitcoin.lock().await; // exit broadcasts branch txs
                 let r = me.wallet.unilateral_exit(Some(vec![id.clone()]), None).await;
@@ -561,7 +658,8 @@ async fn run_user(
                     Ok(st) => {
                         let complete = st.first().map(|s| s.complete).unwrap_or(false);
                         trace.emit(me.idx, "exit", "result", if complete { "ok" } else { "pending" },
-                            json!({ "coin": id, "amount": c.amount_sats, "complete": complete,
+                            json!({ "coin": id, "amount": c.amount_sats, "complete": complete, "off_chain": off_chain,
+                                    "o_txid": o_txid, "o_vout": o_vout,
                                     "wait_blocks": st.first().map(|s| s.wait_blocks).unwrap_or(0) }));
                     }
                     Err(e) => emit_err(&trace, me.idx, "exit", e),
@@ -572,6 +670,8 @@ async fn run_user(
                 let cand = coins.iter().find(|c| c.status == "CONFIRMED" && c.statechain_id.is_some());
                 let Some(c) = cand else { continue };
                 let id = c.statechain_id.clone().unwrap();
+                let o_txid = c.utxo_txid.clone();
+                let o_vout = c.utxo_vout.unwrap_or(0);
                 let to = {
                     let _g = bitcoin.lock().await;
                     bitcoin_core::getnewaddress()
@@ -583,7 +683,8 @@ async fn run_user(
                 let r = me.wallet.withdraw(&to, Some(vec![id.clone()]), None).await;
                 drop(_g);
                 drop(permit);
-                emit_result(&trace, me.idx, "withdraw", &r.map(|w| json!({ "coin": id, "amount": c.amount_sats, "withdrawn": w.len() })));
+                emit_result(&trace, me.idx, "withdraw",
+                    &r.map(|w| json!({ "coin": id, "amount": c.amount_sats, "withdrawn": w.len(), "o_txid": o_txid, "o_vout": o_vout })));
             }
             "deposit" => {
                 // an in-run enter: a fresh on-chain deposit that the miner will confirm.
