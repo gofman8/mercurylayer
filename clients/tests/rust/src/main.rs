@@ -50,6 +50,7 @@ pub mod sdk21_remote_sspclient;
 pub mod chaos22_concurrent_users;
 pub mod chaos22_cheats;
 pub mod chaos22_oracle;
+pub mod sdk23_rgb_ln_swap;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -169,6 +170,12 @@ async fn main() -> Result<()> {
     // split/exit/withdraw) + cheat (broadcast old state); a spec-invariant oracle audits the trace.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("22") {
         chaos22_concurrent_users::execute().await?;
+        return Ok(());
+    }
+    // RGB assets over Lightning (SDK_E2E=23): issue -> colored channel -> asset invoice -> pay,
+    // driven by the SDK's RlnClient asset methods (the LN half of a statechain<->LN RGB swap).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("23") {
+        sdk23_rgb_ln_swap::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

@@ -93,9 +93,31 @@ Tests: `sdk05` (pay), `sdk06` (receive), `sdk18` (pay-failure + reclaim), `sdk19
 > and bounds this (reclaim only after `batch_timeout`), but the reconciliation is a **server-side
 > fix** (collapse to one authoritative latch clock); flagged to the SE team, out of SDK scope.
 
-**RGB assets over Lightning** (colored channels / asset invoices) are a scoped follow-up: the RLN
-backend supports them, but the SDK/SSP swap path is sats-only today. Reuses the same `Ssp` /
-`SspClient` seam (planned `sdk23`).
+## RGB assets over Lightning
+
+The swap also moves **RGB assets**, not just sats — statechain RGB ⇄ Lightning RGB, both ways, over
+rgb-lightning-node **colored channels**. The user API is unchanged; the SSP bridges the two rails:
+
+```rust
+// PAY: an RGB Lightning invoice, paid from a statechain RGB coin.
+let preimage = wallet.pay_lightning_invoice(&ssp, rgb_bolt11).await?;   // asset auto-detected
+// RECEIVE: get an RGB invoice; when paid, an asset-carrying coin lands on your statechain.
+let swap = wallet.create_lightning_invoice_asset(&ssp, &asset_id, 250).await?;
+```
+
+Mechanics: `RlnClient::decode` reads the invoice's `asset_id`/`asset_amount`; for a PAY the wallet
+hands the SSP a **colored coin** batch-locked to the invoice hash (`latch_tokens` — the RGB
+consignment rides the transfer message), the SSP pays the asset over its colored channel, and the LN
+preimage unlocks the coin (the SSP now holds the asset on statechain). For a RECEIVE the SSP
+colored-transfers an asset coin to the user under an **SE-held preimage** (`latch_tokens_se_preimage`)
+and issues an RGB HODL invoice; when the payer pays the asset over LN, the SSP releases the coin and
+claims the HTLC. The SSP stays asset-neutral (it converts asset units between the rails, minus fee).
+
+The pre-payment gate keeps the C2 recipient check for both; the sats C3 amount check applies to sats
+invoices, and for RGB the SSP verifies (post-claim) that its statechain asset balance grew by the
+invoice amount. *Pre-payment asset-amount validation (peek + validate the consignment before paying)
+is a hardening follow-up.* Tests: `sdk23` drives the full colored-channel asset payment
+(issue → colored channel → asset invoice → decode → pay → balance shift) via `RlnClient`.
 
 ### Before exposing a public SSP (production hardening)
 

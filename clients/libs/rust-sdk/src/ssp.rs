@@ -125,6 +125,9 @@ impl RlnClient {
         expiry_sec: u64,
     ) -> Result<String> {
         let mut body = json!({ "expiry_sec": expiry_sec });
+        // An RGB invoice still needs a small sats HTLC carrier (RLN requires amt_msat >= 1). Default
+        // one when the caller only specified an asset.
+        let amt_msat = amt_msat.or_else(|| asset_id.map(|_| 3_000_000));
         if let Some(a) = amt_msat {
             body["amt_msat"] = json!(a);
         }
@@ -144,6 +147,22 @@ impl RlnClient {
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow!("no invoice in response"))?
             .to_string())
+    }
+
+    /// Create colorable UTXOs on this node (prerequisite for issuing / receiving RGB assets).
+    pub async fn create_utxos(&self, num: u8, size_sat: Option<u32>) -> Result<()> {
+        let mut body = json!({ "up_to": false, "num": num, "fee_rate": 2, "skip_sync": false });
+        if let Some(s) = size_sat {
+            body["size"] = json!(s);
+        }
+        self.post("createutxos", body).await?;
+        Ok(())
+    }
+
+    /// Refresh pending RGB transfers (accept incoming consignments).
+    pub async fn refresh(&self) -> Result<()> {
+        self.post("refreshtransfers", json!({})).await?;
+        Ok(())
     }
 
     /// Issue a NIA (fungible) RGB asset on this node; returns the contract/asset id. (Test/issuer.)
