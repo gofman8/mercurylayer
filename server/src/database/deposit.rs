@@ -112,40 +112,44 @@ pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &
         .unwrap();
 }
 
+// Audit [1]: the fork-prevention guards below MUST fail CLOSED. They return `Result` so a DB error
+// (e.g. pool exhaustion under load) propagates to `sign/first`, which then refuses to co-sign — a
+// blind SE that cannot read a coin's single-use/budget/epoch state must never substitute a
+// permissive default (which would let it co-sign a second conflicting spend => off-chain
+// double-spend / INV-19 fork). A row being ABSENT is still the benign default (not single-use / no
+// budget / no epoch); only an actual query error is fatal.
+
 /// Epoch deadline (unix seconds) for a coin, or None if it has no epoch (Stage 4). The SE refuses to
 /// co-sign a new spend once its own clock passes this deadline; unilateral exit needs no SE signature.
-pub async fn get_epoch_deadline(pool: &sqlx::PgPool, statechain_id: &str) -> Option<i64> {
+pub async fn get_epoch_deadline(pool: &sqlx::PgPool, statechain_id: &str) -> Result<Option<i64>, sqlx::Error> {
     let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT epoch_deadline FROM statechain_data WHERE statechain_id = $1")
             .bind(statechain_id)
             .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-    row.and_then(|r| r.0)
+            .await?;
+    Ok(row.and_then(|r| r.0))
 }
 
 /// True if the statechain coin was created as single-use (an off-chain RGB split/combine tree node).
-pub async fn is_single_use(pool: &sqlx::PgPool, statechain_id: &str) -> bool {
+pub async fn is_single_use(pool: &sqlx::PgPool, statechain_id: &str) -> Result<bool, sqlx::Error> {
     let row: Option<(bool,)> =
         sqlx::query_as("SELECT single_use FROM statechain_data WHERE statechain_id = $1")
             .bind(statechain_id)
             .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-    row.map(|r| r.0).unwrap_or(false)
+            .await?;
+    Ok(row.map(|r| r.0).unwrap_or(false))
 }
 
 /// Count of FINALIZED signatures (challenge set, i.e. a sign_second completed) for a coin. A
 /// single-use coin with >= 1 finalized signature has already been terminally spent, so the SE must
 /// refuse any further spend.
-pub async fn count_finalized_signatures(pool: &sqlx::PgPool, statechain_id: &str) -> i64 {
+pub async fn count_finalized_signatures(pool: &sqlx::PgPool, statechain_id: &str) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM statechain_signature_data WHERE statechain_id = $1 AND challenge IS NOT NULL")
         .bind(statechain_id)
         .fetch_one(pool)
-        .await
-        .unwrap_or((0,));
-    row.0
+        .await?;
+    Ok(row.0)
 }
 
 pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str)  {
@@ -163,32 +167,31 @@ pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str)  {
 
 /// Set an absolute co-signature budget: current finalized count + `remaining`. The SE refuses
 /// sign_first once the count reaches the budget.
-pub async fn set_sig_budget(pool: &sqlx::PgPool, statechain_id: &str, remaining: i32) -> i64 {
-    let count = count_finalized_signatures(pool, statechain_id).await;
+pub async fn set_sig_budget(pool: &sqlx::PgPool, statechain_id: &str, remaining: i32) -> Result<i64, sqlx::Error> {
+    let count = count_finalized_signatures(pool, statechain_id).await?;
     let mut budget = count + remaining as i64;
     // MONOTONIC: a budget may only TIGHTEN, never loosen. Without this, an owner who already
     // terminally spent a node (finalized == budget) could call set_spend_budget again — the
     // relative `count + remaining` would compute a HIGHER budget and re-open the node for a second,
-    // conflicting spend (off-chain double-spend / INV-19 fork). Clamp to any existing budget.
-    if let Some(existing) = get_sig_budget(pool, statechain_id).await {
+    // conflicting spend (off-chain double-spend / INV-19 fork). Clamp to any existing budget. Fail
+    // closed on a read error (audit [1]) — never write a loosened budget from a partial read.
+    if let Some(existing) = get_sig_budget(pool, statechain_id).await? {
         budget = budget.min(existing as i64);
     }
     let query = "UPDATE statechain_data SET sig_budget = $1 WHERE statechain_id = $2";
-    let _ = sqlx::query(query)
+    sqlx::query(query)
         .bind(budget as i32)
         .bind(statechain_id)
         .execute(pool)
-        .await
-        .unwrap();
-    budget
+        .await?;
+    Ok(budget)
 }
 
-pub async fn get_sig_budget(pool: &sqlx::PgPool, statechain_id: &str) -> Option<i32> {
+pub async fn get_sig_budget(pool: &sqlx::PgPool, statechain_id: &str) -> Result<Option<i32>, sqlx::Error> {
     let query = "SELECT sig_budget FROM statechain_data WHERE statechain_id = $1";
     let row = sqlx::query(query)
         .bind(statechain_id)
         .fetch_optional(pool)
-        .await
-        .unwrap();
-    row.and_then(|r| sqlx::Row::get::<Option<i32>, _>(&r, 0))
+        .await?;
+    Ok(row.and_then(|r| sqlx::Row::get::<Option<i32>, _>(&r, 0)))
 }

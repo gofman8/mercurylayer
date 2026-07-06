@@ -180,9 +180,16 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
 
     let statechain_entity = statechain_entity.inner();
 
-    let auth_key = XOnlyPublicKey::from_str(&deposit_msg1.auth_key).unwrap();
+    // Audit [19]: 400 on malformed pre-auth input instead of panicking (per-request DoS surface).
+    let auth_key = match XOnlyPublicKey::from_str(&deposit_msg1.auth_key) {
+        Ok(k) => k,
+        Err(_) => return status::Custom(Status::BadRequest, Json(json!({ "message": "invalid auth_key" }))),
+    };
     let token_id = deposit_msg1.token_id.clone();
-    let signed_token_id = Signature::from_str(&deposit_msg1.signed_token_id.to_string()).unwrap();
+    let signed_token_id = match Signature::from_str(&deposit_msg1.signed_token_id.to_string()) {
+        Ok(s) => s,
+        Err(_) => return status::Custom(Status::BadRequest, Json(json!({ "message": "invalid signed_token_id" }))),
+    };
 
     let msg = Message::from_hashed_data::<sha256::Hash>(token_id.to_string().as_bytes());
 

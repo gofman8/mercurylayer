@@ -250,7 +250,16 @@ pub async fn set_spend_budget(statechain_entity: &State<StateChainEntity>, paylo
         let response_body = json!({ "message": "Signature does not match authentication key." });
         return status::Custom(Status::Forbidden, Json(response_body));
     }
-    let budget = crate::database::deposit::set_sig_budget(&statechain_entity.pool, &statechain_id, payload.0.remaining).await;
+    let budget = match crate::database::deposit::set_sig_budget(&statechain_entity.pool, &statechain_id, payload.0.remaining).await {
+        Ok(b) => b,
+        Err(_) => {
+            // Fail closed (audit [1]): never report success on a budget write we could not complete.
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "spend-budget update temporarily unavailable" })),
+            );
+        }
+    };
     let response_body = json!({ "message": "Success", "sig_budget": budget });
     status::Custom(Status::Ok, Json(response_body))
 }
@@ -259,8 +268,17 @@ pub async fn set_spend_budget(statechain_entity: &State<StateChainEntity>, paylo
 /// co-signed again (budget set and exhausted).
 #[get("/statechain/spend_budget/<statechain_id>")]
 pub async fn get_spend_budget(statechain_entity: &State<StateChainEntity>, statechain_id: &str) -> status::Custom<Json<Value>> {
-    let budget = crate::database::deposit::get_sig_budget(&statechain_entity.pool, statechain_id).await;
-    let finalized = crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, statechain_id).await;
+    // A receiver relies on this to prove a parent node is terminal (audit [1]): if the SE cannot
+    // read the state it must NOT report a permissive `terminal=false` / `budget=null` that could let
+    // the receiver accept a still-spendable ancestor. Fail closed (503) on a DB error.
+    let budget = match crate::database::deposit::get_sig_budget(&statechain_entity.pool, statechain_id).await {
+        Ok(b) => b,
+        Err(_) => return status::Custom(Status::ServiceUnavailable, Json(json!({ "message": "spend-budget state temporarily unavailable" }))),
+    };
+    let finalized = match crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, statechain_id).await {
+        Ok(f) => f,
+        Err(_) => return status::Custom(Status::ServiceUnavailable, Json(json!({ "message": "spend-budget state temporarily unavailable" }))),
+    };
     let exhausted = budget.map(|b| finalized >= b as i64).unwrap_or(false);
     let response_body = json!({
         "sig_budget": budget,

@@ -254,9 +254,16 @@ pub fn get_amount_from_tx0(tx0_hex: &str, tx0_outpoint: &TxOutpoint,) -> Result<
 
     let tx0: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx0_hex)?)?;
 
-    assert!(tx0_outpoint.txid == tx0.txid().to_string());
-
-    Ok(tx0.output[tx0_outpoint.vout as usize].value)
+    // Audit [24]: return errors instead of panicking on an attacker-shaped tx0/outpoint. A crafted
+    // decryptable transfer message could otherwise abort the SSP peek task via an out-of-range vout.
+    if tx0_outpoint.txid != tx0.txid().to_string() {
+        return Err(MercuryError::ParseError);
+    }
+    let out = tx0
+        .output
+        .get(tx0_outpoint.vout as usize)
+        .ok_or(MercuryError::OutOfRangeError)?;
+    Ok(out.value)
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]

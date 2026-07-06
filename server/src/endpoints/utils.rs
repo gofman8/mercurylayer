@@ -100,19 +100,20 @@ pub async fn info_keylist(statechain_entity: &State<StateChainEntity>) -> status
     SELECT server_public_key, statechain_id \
     FROM statechain_data";  
 
+    // Audit [21]: degrade gracefully (empty) instead of panicking a request handler on a pool error.
     let rows = sqlx::query(query)
     .fetch_all(&statechain_entity.pool)
     .await
-    .unwrap();
+    .unwrap_or_default();
 
     let query_sigs = "\
     SELECT tx_n, statechain_id, created_at::TEXT \
-    FROM statechain_signature_data";  
+    FROM statechain_signature_data";
 
     let rows_sigs = sqlx::query(query_sigs)
     .fetch_all(&statechain_entity.pool)
     .await
-    .unwrap();
+    .unwrap_or_default();
 
     let mut result = Vec::<mercurylib::utils::PubKeyInfo>::new();
 

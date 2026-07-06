@@ -28,11 +28,16 @@ pub async fn get_server_pubnonce_from_null_challenge(pool: &sqlx::PgPool, statec
         AND challenge is NULL \
         ORDER BY created_at ASC";
 
-    let row = sqlx::query(query)
+    // Audit [21]/L1: on a pool error return None (start a fresh session) rather than panicking; the
+    // enclave's atomic secnonce consume + the null-challenge dedup make a fresh start safe.
+    let row = match sqlx::query(query)
         .bind(statechain_id)
         .fetch_optional(pool)
         .await
-        .unwrap();
+    {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
 
     if row.is_none()
     {

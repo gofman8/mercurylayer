@@ -231,7 +231,11 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
     let t2 = transfer_receiver_request_payload.t2.clone();
     let auth_sign = transfer_receiver_request_payload.auth_sig.clone();
 
-    let signed_message = Signature::from_str(&auth_sign).unwrap();
+    // Audit [19]: 400 on a malformed signature instead of panicking.
+    let signed_message = match Signature::from_str(&auth_sign) {
+        Ok(s) => s,
+        Err(_) => return status::Custom(Status::BadRequest, Json(json!({ "message": "invalid auth_sig" }))),
+    };
     let msg = Message::from_hashed_data::<sha256::Hash>(t2.as_bytes());
 
     let secp = Secp256k1::new();

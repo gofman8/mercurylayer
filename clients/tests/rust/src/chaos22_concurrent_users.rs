@@ -168,8 +168,11 @@ pub fn classify(err: &anyhow::Error) -> Class {
         ("operation timed out", "timeout"),
         ("timed out", "timeout"),
         ("500 internal server error", "se-5xx"),
+        ("500 - internal server error", "se-5xx"),
+        ("internal server error", "se-5xx"), // any SE 5xx body (e.g. transient enclave-index read miss under pool exhaustion) is retriable load-shedding, not a protocol breach
         ("502 bad gateway", "se-5xx"),
         ("503 service unavailable", "se-5xx"),
+        ("service unavailable", "se-5xx"), // fail-closed sign/first + budget reads return 503 under pool exhaustion (audit [1])
         ("expected value", "se-parse"), // SE returned non-JSON under load
         ("failed to parse", "se-parse"),
     ];

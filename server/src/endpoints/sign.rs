@@ -60,9 +60,27 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
     // attempt is the second — refuse from >= 1. Uniform across all single-use coins (fund-deposited
     // roots and split/combine sub-coins, broadcast or un-broadcast). Normal coins (single_use=false)
     // keep the existing re-sign behaviour.
-    if crate::database::deposit::is_single_use(&statechain_entity.pool, &statechain_id).await
-        && crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await >= 1
-    {
+    // Audit [1]: read the fork-prevention state, failing CLOSED (503) on ANY DB error. If the blind
+    // SE cannot read a coin's single-use/budget/epoch state it MUST refuse to co-sign — substituting
+    // a permissive default under pool exhaustion would let it co-sign a second conflicting spend of a
+    // terminal node (off-chain double-spend / INV-19 fork). Read the finalized count ONCE and reuse.
+    macro_rules! fail_closed {
+        () => {{
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "SE co-sign state temporarily unavailable; refusing to co-sign (fail-closed)" })),
+            );
+        }};
+    }
+    let single_use = match crate::database::deposit::is_single_use(&statechain_entity.pool, &statechain_id).await {
+        Ok(v) => v,
+        Err(_) => fail_closed!(),
+    };
+    let finalized = match crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await {
+        Ok(v) => v,
+        Err(_) => fail_closed!(),
+    };
+    if single_use && finalized >= 1 {
         let response_body = json!({
             "message": "single-use coin already spent (SE refuses a second spend)"
         });
@@ -71,9 +89,12 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
 
     // Terminal-spend budget (off-chain tree nodes): once the owner sets a budget, no
     // co-signature beyond it — a split/combine node is one-shot regardless of who asks.
-    if let Some(budget) = crate::database::deposit::get_sig_budget(&statechain_entity.pool, &statechain_id).await {
-        let count = crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await;
-        if count >= budget as i64 {
+    let budget = match crate::database::deposit::get_sig_budget(&statechain_entity.pool, &statechain_id).await {
+        Ok(v) => v,
+        Err(_) => fail_closed!(),
+    };
+    if let Some(budget) = budget {
+        if finalized >= budget as i64 {
             let response_body = json!({
                 "message": "spend budget exhausted (terminal node: SE refuses further co-signatures)"
             });
@@ -86,7 +107,11 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
     // transacted or exited before then; unilateral exit needs no SE co-signature (the owner just
     // broadcasts an already-co-signed branch), so funds are never stuck. Coins without an epoch
     // (epoch_deadline = NULL) are co-signable indefinitely, exactly as before.
-    if let Some(deadline) = crate::database::deposit::get_epoch_deadline(&statechain_entity.pool, &statechain_id).await {
+    let epoch_deadline = match crate::database::deposit::get_epoch_deadline(&statechain_entity.pool, &statechain_id).await {
+        Ok(v) => v,
+        Err(_) => fail_closed!(),
+    };
+    if let Some(deadline) = epoch_deadline {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -189,7 +214,18 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
     let session = partial_signature_request_payload.session.clone();
     let server_pub_nonce = partial_signature_request_payload.server_pub_nonce.clone();
 
-    let session_bytes: [u8; 133] = hex::decode(&session).unwrap().try_into().unwrap();
+    // Audit [18]: return 400 on a malformed session instead of panicking (a bad hex string or wrong
+    // length would otherwise abort the request handler). MusigSession::from_slice takes a fixed
+    // [u8;133] and is infallible once the length is right.
+    let session_bytes: [u8; 133] = match hex::decode(&session).ok().and_then(|b| b.try_into().ok()) {
+        Some(b) => b,
+        None => {
+            return status::Custom(
+                Status::BadRequest,
+                Json(json!({ "message": "malformed MuSig session (expected 133-byte hex)" })),
+            );
+        }
+    };
     let session = MusigSession::from_slice(session_bytes);
     let challenge = session.get_challenge_from_session();
     let challenge_str = hex::encode(challenge);
