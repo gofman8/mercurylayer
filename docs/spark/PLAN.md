@@ -106,7 +106,7 @@ tracked here as items land; each P0 gets a regression test.
 
 | # | Item | Closes |
 |---|------|--------|
-| P2-1 | Replace request-path unwraps in `utils.rs` (auth `RowNotFound`, `Signature`/`PublicKey`/`XOnlyPublicKey` parse) with graceful 401; uniform Unauthorized closes the existence oracle. | L2 |
+| P2-1 | ✅ Replaced request-path unwraps in `endpoints/utils.rs` (auth `RowNotFound`/`PoolTimedOut`, `Signature`/`PublicKey`/`XOnlyPublicKey` parse) + `database/utils.rs` (enclave-index pool timeout) with graceful `false`/`None`; raised the SE pool 10→50. **Empirically found by the chaos test (SDK_E2E=22) under concurrent load — these `unwrap()`s panicked the SE worker on pool exhaustion.** | L2 |
 | P2-2 | Promote the sdk14 watchtower to first-class SDK behavior behind a config flag (compute each off-chain coin's `exit_deadline_block`, auto-broadcast branch + exit at tip+margin); add `WalletEvent::ExitDeadlineApproaching`; document the online obligation loudly. | L7 |
 | P2-3 | `unilateral_exit`: distinguish flat-coin (legit no branch) from missing/corrupt branch via `coin.single_use`; return a distinct hard error. | L5 |
 | P2-4 | RGB privacy: per-output random blinding threaded through the split path; prune each recipient's consignment to only its own piece (replace fixed `TOKEN_BLINDING=777` + shared consignment). | L3 |
