@@ -74,6 +74,49 @@ pub async fn validate_signature(pool: &sqlx::PgPool, signed_message_hex: &str, s
     secp.verify_schnorr(&signed_message, &msg, &auth_key).is_ok()
 }
 
+/// Single-use, endpoint-bound owner-auth validation (audit [15]). `auth_field` is `"<nonce>:<sig>"`
+/// where `<sig>` is a schnorr signature by the coin's auth key over `sha256(nonce|endpoint)`. The
+/// signature is verified AND the nonce is atomically consumed (issued for this statechain_id,
+/// unexpired, not previously used) — so a captured signature cannot be replayed against an
+/// irreversible owner operation, nor redirected to a different endpoint. Fails closed on any
+/// malformed input, bad signature, or already-used/expired/unknown nonce.
+pub async fn validate_signature_nonce(
+    pool: &sqlx::PgPool,
+    auth_field: &str,
+    statechain_id: &str,
+    endpoint: &str,
+) -> bool {
+    let (nonce, signed_message_hex) = match auth_field.split_once(':') {
+        Some((n, s)) if !n.is_empty() && !s.is_empty() => (n, s),
+        _ => return false, // legacy/malformed auth is not accepted on a nonce-protected endpoint
+    };
+    let auth_key = match get_auth_key_by_statechain_id(pool, statechain_id).await {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let signed_message = match Signature::from_str(signed_message_hex) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let msg = Message::from_hashed_data::<sha256::Hash>(format!("{nonce}|{endpoint}").as_bytes());
+    let secp = Secp256k1::new();
+    if !secp.verify_schnorr(&signed_message, &msg, &auth_key).is_ok() {
+        return false;
+    }
+    // Consume the nonce only after the signature is valid (a bad sig cannot burn an owner's nonce).
+    // The consume is atomic + single-use; a replay of a valid (nonce,sig) fails here (already used).
+    crate::database::auth_nonce::consume_auth_nonce(pool, nonce, statechain_id).await
+}
+
+/// Issue a fresh single-use owner-auth challenge for a coin (audit [15]).
+#[get("/auth/challenge/<statechain_id>")]
+pub async fn auth_challenge(statechain_entity: &State<StateChainEntity>, statechain_id: &str) -> status::Custom<Json<Value>> {
+    match crate::database::auth_nonce::issue_auth_nonce(&statechain_entity.pool, statechain_id).await {
+        Some(nonce) => status::Custom(Status::Ok, Json(json!({ "nonce": nonce }))),
+        None => status::Custom(Status::ServiceUnavailable, Json(json!({ "message": "could not issue auth challenge" }))),
+    }
+}
+
 #[get("/info/config")]
 pub async fn info_config() -> status::Custom<Json<Value>> {
 

@@ -5,3 +5,4 @@ pub mod deposit;
 pub mod utils;
 pub mod lightning_latch;
 pub mod sign;
+pub mod auth_nonce;

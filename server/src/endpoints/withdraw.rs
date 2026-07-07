@@ -34,7 +34,9 @@ pub async fn withdraw_complete(statechain_entity: &State<StateChainEntity>, dele
     let statechain_id = delete_statechain_payload.0.statechain_id.clone();
     let signed_statechain_id = delete_statechain_payload.0.signed_statechain_id.clone();
 
-    if !crate::endpoints::utils::validate_signature(&statechain_entity.pool, &signed_statechain_id, &statechain_id).await {
+    // Audit [15]: withdraw is IRREVERSIBLE — require a single-use, endpoint-bound owner-auth token
+    // ("<nonce>:<sig>") so a captured signature cannot be replayed to destroy the coin's SE state.
+    if !crate::endpoints::utils::validate_signature_nonce(&statechain_entity.pool, &signed_statechain_id, &statechain_id, "withdraw/complete").await {
 
         let response_body = json!({
             "message": "Signature does not match authentication key."

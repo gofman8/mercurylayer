@@ -129,7 +129,9 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str, statechain
 
     wallet.activities.push(activity);
 
-    let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap().to_string();
+    // Audit [15]: single-use, endpoint-bound owner auth for the irreversible withdraw/complete.
+    let signed_statechain_id =
+        crate::utils::fresh_auth(&client_config, statechain_id, coin, "withdraw/complete").await?;
 
     update_wallet(&client_config.pool, &wallet).await?;
 

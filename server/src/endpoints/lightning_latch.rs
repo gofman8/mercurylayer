@@ -255,7 +255,9 @@ pub async fn set_spend_budget(statechain_entity: &State<StateChainEntity>, paylo
         let response_body = json!({ "message": "remaining must be 0 or 1" });
         return status::Custom(Status::BadRequest, Json(response_body));
     }
-    if !crate::endpoints::utils::validate_signature(&statechain_entity.pool, &payload.0.auth_sig, &statechain_id).await {
+    // Audit [15]: set_spend_budget is IRREVERSIBLE (bricks the node to exit-only) — require a
+    // single-use, endpoint-bound owner-auth token so a captured signature cannot be replayed.
+    if !crate::endpoints::utils::validate_signature_nonce(&statechain_entity.pool, &payload.0.auth_sig, &statechain_id, "statechain/spend_budget").await {
         let response_body = json!({ "message": "Signature does not match authentication key." });
         return status::Custom(Status::Forbidden, Json(response_body));
     }

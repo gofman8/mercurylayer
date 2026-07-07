@@ -164,6 +164,7 @@ async fn main() {
             endpoints::withdraw::withdraw_complete,
             utils::info_config,
             utils::info_keylist,
+            utils::auth_challenge,
             all_options,
         ])
         .register("/", catchers![

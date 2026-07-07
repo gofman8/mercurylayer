@@ -280,12 +280,14 @@ pub async fn set_spend_budget(
         .filter(|c| c.statechain_id == Some(statechain_id.to_string()))
         .min_by_key(|c| c.locktime.unwrap_or(u32::MAX))
         .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
+    // Audit [15]: single-use, endpoint-bound owner auth (not the static signed_statechain_id).
+    let auth_sig = crate::utils::fresh_auth(client_config, statechain_id, coin, "statechain/spend_budget").await?;
     let client = client_config.get_reqwest_client()?;
     let response = client
         .post(&format!("{}/statechain/spend_budget", client_config.statechain_entity))
         .json(&serde_json::json!({
             "statechain_id": statechain_id,
-            "auth_sig": coin.signed_statechain_id.clone().unwrap(),
+            "auth_sig": auth_sig,
             "remaining": remaining,
         }))
         .send()

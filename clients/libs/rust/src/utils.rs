@@ -72,6 +72,33 @@ pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConf
     Ok(Some(response))
 }
 
+/// Fetch a single-use SE auth challenge and return an endpoint-bound owner-auth token
+/// `"<nonce>:<sig>"` for `coin` (audit [15]). Signs `sha256(nonce|endpoint)` with the coin's auth
+/// key so a captured signature cannot be replayed against an irreversible owner op. Use in place of
+/// the static `coin.signed_statechain_id` on nonce-protected endpoints.
+pub async fn fresh_auth(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+    coin: &mercurylib::wallet::Coin,
+    endpoint: &str,
+) -> Result<String> {
+    let client = client_config.get_reqwest_client()?;
+    let resp = client
+        .get(&format!("{}/auth/challenge/{}", client_config.statechain_entity, statechain_id))
+        .send()
+        .await?;
+    if resp.status() != StatusCode::OK {
+        return Err(anyhow!("auth challenge failed: {}", resp.text().await?));
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let nonce = v
+        .get("nonce")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow!("no nonce in auth challenge response"))?;
+    let sig = mercurylib::transfer::receiver::sign_message(&format!("{nonce}|{endpoint}"), coin)?;
+    Ok(format!("{nonce}:{sig}"))
+}
+
 pub async fn complete_withdraw(statechain_id: &str, signed_statechain_id: &str, client_config: &ClientConfig) -> Result<()> {
 
     let endpoint = client_config.statechain_entity.clone();
