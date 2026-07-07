@@ -100,7 +100,7 @@ pub fn plan(coins: &[Candidate], target: u64) -> Plan {
     // reserve plus a non-dust change (audit [29]). Filtering only on `amount > remaining` would pick
     // a coin the split path then rejects (piece + fee_reserve >= parent, or a sub-dust change),
     // failing an otherwise-fundable payment at the small-remainder boundary the split path exists for.
-    const DUST_LIMIT: u64 = 330;
+    use crate::transfer::DUST_LIMIT;
     let mut candidates: Vec<&Candidate> = coins
         .iter()
         .filter(|c| {

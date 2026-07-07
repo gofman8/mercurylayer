@@ -79,9 +79,18 @@ pub async fn post_paymenthash(statechain_entity: &State<StateChainEntity>, payme
     let buffer = rand::thread_rng().gen::<[u8; 32]>();
     let pre_image = hex::encode(buffer.clone());
 
+    // Audit [2]/[5]: the RECEIVE latch clock must be SHORTER than the payer's HODL HTLC deadline so
+    // that if the receiver does not claim in time the coin reverts to the SSP (and the payer is
+    // refunded) rather than the receiver keeping the coin while the HTLC times out. It must also be
+    // LONGER than honest multi-hop LN settlement. The SDK issues the HODL invoice with a 3600 s
+    // horizon; default the latch to 3000 s (50 min) — ample for settlement, ~600 s below the HTLC.
+    // validate_batch and get_preimage both gate on THIS clock. Overridable via RECEIVE_LATCH_TIMEOUT.
+    let latch_secs: i64 = std::env::var("RECEIVE_LATCH_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
     let now = chrono::Utc::now();
-    let expiry_time = Duration::seconds(90000); // 25h
-    let expires_at = now + expiry_time;
+    let expires_at = now + Duration::seconds(latch_secs);
 
     crate::database::lightning_latch::insert_paymenthash(&statechain_entity.pool, &statechain_id, &sender_auth_key, &batch_id, &pre_image, &expires_at).await;
 

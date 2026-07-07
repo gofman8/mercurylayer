@@ -53,12 +53,18 @@ pub async fn is_lightning_latch(pool: &sqlx::PgPool, statechain_id: &str, sender
 
 pub async fn get_preimage(pool: &sqlx::PgPool, statechain_id: &str, sender_auth_key: &XOnlyPublicKey, batch_id: &str) -> Option<String> {
 
+    // Audit [2]/[5]: refuse the preimage once the latch has EXPIRED. The receiver's claim gate
+    // (validate_batch) and this preimage gate are enforced against the SAME latch clock, and the
+    // latch expires BEFORE the payer's HODL HTLC. So either the receiver claims in time (the SSP can
+    // then retrieve the preimage and settle the HTLC) or the latch expires and BOTH the receiver's
+    // claim AND the SSP's HTLC-claim fail — the coin never leaves the SSP while the payer is refunded.
     let query = "SELECT pre_image FROM \
         lightning_latch \
         WHERE statechain_id = $1 \
         AND sender_auth_xonly_public_key = $2 \
         AND batch_id = $3
-        AND locked = false";
+        AND locked = false
+        AND expires_at > now()";
 
     let row = sqlx::query(query)
         .bind(statechain_id)
@@ -79,6 +85,15 @@ pub async fn get_preimage(pool: &sqlx::PgPool, statechain_id: &str, sender_auth_
 
     Some(pre_image)
 
+}
+
+/// Latch expiry for a batch (audit [2]): looked up by batch_id alone — no sender_auth_key needed, so
+/// `validate_batch` can gate an LN-latch batch on the latch's OWN clock instead of the short
+/// `batch_timeout`. Returns None when the batch has no lightning_latch row (a plain transfer batch).
+pub async fn get_latch_expiry_by_batch_id(pool: &sqlx::PgPool, batch_id: &str) -> Option<DateTime<Utc>> {
+    let query = "SELECT expires_at FROM lightning_latch WHERE batch_id = $1 LIMIT 1";
+    let row = sqlx::query(query).bind(batch_id).fetch_optional(pool).await.ok()??;
+    Some(row.get(0))
 }
 
 pub async fn get_preimage_by_batch_id(pool: &sqlx::PgPool, batch_id: &str) -> Option<String> {

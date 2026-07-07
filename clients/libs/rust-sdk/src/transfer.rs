@@ -305,23 +305,9 @@ impl SparkWallet {
             ));
         }
         let parent_sats = parent.amount.unwrap_or_default() as u64;
-        // Reserve a miner-fee margin for the (only-on-exit) broadcast of the split tx.
-        let fee_reserve = split_fee_reserve(parent_sats);
-        if piece_sats + fee_reserve >= parent_sats {
-            return Err(anyhow!(
-                "piece {piece_sats} + fee reserve {fee_reserve} does not fit in coin of {parent_sats} sats"
-            ));
-        }
-        let change_sats = parent_sats - piece_sats - fee_reserve;
-        // Dust floor (audit [9]): both sub-coin funding outputs must be standard/relayable, else the
-        // co-signed split tx is unbroadcastable and — once the parent is consumed — strands both
-        // sub-coins with no on-chain exit. Reject BEFORE touching the parent. P2TR dust = 330 sats.
-        const DUST_LIMIT: u64 = 330;
-        if piece_sats < DUST_LIMIT || change_sats < DUST_LIMIT {
-            return Err(anyhow!(
-                "split would create a sub-dust output (piece {piece_sats}, change {change_sats}, dust floor {DUST_LIMIT}) — the split tx would be unbroadcastable"
-            ));
-        }
+        // Pure admission guard (fee-reserve fit + dust floor on both outputs) — shared with the
+        // invalidation model tests. Rejects BEFORE touching the parent.
+        let (change_sats, _fee_reserve) = split_amounts(parent_sats, piece_sats)?;
 
         // Two fresh statechain slots owned by this wallet (SE handshake only — no on-chain tx).
         // Normal coins: sub-coin security is Mercury's decrementing-locktime scheme, with the
@@ -610,6 +596,35 @@ impl SparkWallet {
 pub(crate) fn split_fee_reserve(parent_sats: u64) -> u64 {
     // ~200 vB at a couple sat/vB, floored so tiny test coins still split.
     (parent_sats / 100).clamp(300, 2_000)
+}
+
+/// Dust floor for every split output (audit [9]): a P2TR output below 330 sats is
+/// non-standard/unrelayable, so a split tx containing one is unbroadcastable and — once the
+/// parent is consumed — strands both sub-coins with no on-chain exit. Shared with the planner
+/// (`select::plan`) and the invalidation model tests.
+pub(crate) const DUST_LIMIT: u64 = 330;
+
+/// The split executor's pure admission guard: fee reserve + fit + dust floor for splitting
+/// `piece_sats` out of a `parent_sats` coin. Returns `(change_sats, fee_reserve)` when the split
+/// is admissible. Called by [`SparkWallet::split_coin`] before touching the parent, and by the
+/// invalidation model (`invalidation_model.rs::split_size_floor`) as the executable boundary
+/// spec — change the guard here and that test fails until its documentation is updated too.
+pub(crate) fn split_amounts(parent_sats: u64, piece_sats: u64) -> Result<(u64, u64)> {
+    // Reserve a miner-fee margin for the (only-on-exit) broadcast of the split tx.
+    let fee_reserve = split_fee_reserve(parent_sats);
+    if piece_sats + fee_reserve >= parent_sats {
+        return Err(anyhow!(
+            "piece {piece_sats} + fee reserve {fee_reserve} does not fit in coin of {parent_sats} sats"
+        ));
+    }
+    let change_sats = parent_sats - piece_sats - fee_reserve;
+    // Dust floor (audit [9]): both sub-coin funding outputs must be standard/relayable.
+    if piece_sats < DUST_LIMIT || change_sats < DUST_LIMIT {
+        return Err(anyhow!(
+            "split would create a sub-dust output (piece {piece_sats}, change {change_sats}, dust floor {DUST_LIMIT}) — the split tx would be unbroadcastable"
+        ));
+    }
+    Ok((change_sats, fee_reserve))
 }
 
 #[cfg(test)]

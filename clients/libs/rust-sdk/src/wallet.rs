@@ -662,7 +662,7 @@ impl SparkWallet {
             .iter()
             .find(|h| h.tx_hash == deposit_outpoint.txid && h.height > 0)
             .map(|h| h.height as u32)?;
-        Some(h_deposit + initlock)
+        Some(deposit_anchored_deadline(h_deposit, initlock))
     }
 
     /// Unilateral exit: broadcast the exit branch (immediately valid) and the latest pre-signed
@@ -876,6 +876,18 @@ impl SparkWallet {
     pub(crate) async fn save_record(&self, record: &WalletRecord) -> Result<()> {
         update_wallet(&self.inner.cc.pool, record).await
     }
+}
+
+/// The pure formula behind [`SparkWallet::deposit_anchored_exit_deadline`] (audit [10] fix):
+/// `H_deposit + initlock`, deposit-anchored and split-tip-independent. Deliberately k-UNAWARE —
+/// it does not subtract the parent's pre-split hop count, so for a parent transferred k times
+/// before the split it is LATE by `k·interval` blocks versus the true min-ancestor maturity.
+/// That residual is OPEN audit item [17]. The invalidation model
+/// (`invalidation_model.rs::deposit_anchored_deadline_exactness_domain`) calls this function
+/// directly, so a k-aware fix here fails that test loudly and forces the [17] documentation
+/// (test + INVALIDATION-SPEC.md §6) to be updated in the same change.
+pub(crate) fn deposit_anchored_deadline(h_deposit: u32, initlock: u32) -> u32 {
+    h_deposit + initlock
 }
 
 /// Coins in a given status, as stable keys.

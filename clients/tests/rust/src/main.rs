@@ -52,6 +52,9 @@ pub mod chaos22_cheats;
 pub mod chaos22_oracle;
 pub mod sdk23_rgb_ln_swap;
 pub mod sdk24_receive_cancel;
+pub mod sdk25_receive_delayed_claim;
+pub mod sdk26_invalidation_scale;
+pub mod sdk27_invalidation_time;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -183,6 +186,28 @@ async fn main() -> Result<()> {
     // fork's HODL invoice -> SSP cancels via /cancelhodlinvoice -> payer refunded, SSP keeps its coin.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("24") {
         sdk24_receive_cancel::execute().await?;
+        return Ok(());
+    }
+    // Adversarial delayed-claim (SDK_E2E=25): a receiver who delays past the coordinated SE latch
+    // window gets nothing; the SSP keeps the coin and the payer is refunded (audit [2]/[5]).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("25") {
+        sdk25_receive_delayed_claim::execute().await?;
+        return Ok(());
+    }
+    // Invalidation at SCALE (SDK_E2E=26): depth-4 off-chain split chain (each parent publicly
+    // terminal, branch rows == depth, measured exit vsizes per depth as 'ECON depth=...' lines),
+    // a 3-wide transfer_many fan-out from ONE split, and a full unilateral exit of the deepest
+    // leaf (whole branch instantly broadcast, backup after its own fresh ~initlock ladder).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("26") {
+        sdk26_invalidation_scale::execute().await?;
+        return Ok(());
+    }
+    // Invalidation over TIME (SDK_E2E=27): exact one-interval ladder decrement across 6 full-coin
+    // hops, the sharp exit-maturity boundary (wait_blocks==2 at locktime-2, completes at the
+    // locktime), the OPEN audit-[17] deadline gap on a k=2 pre-transferred parent (WARN line with
+    // the exact gap), and the SE epoch gate on the plain-sats deposit path.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("27") {
+        sdk27_invalidation_time::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

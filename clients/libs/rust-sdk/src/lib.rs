@@ -21,6 +21,8 @@
 
 pub mod config;
 pub mod events;
+#[cfg(test)]
+mod invalidation_model;
 pub mod invoice;
 pub mod lightning;
 pub mod select;

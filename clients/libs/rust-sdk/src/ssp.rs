@@ -589,6 +589,15 @@ impl SspService {
         // Release the coin, then (and only then) the SE reveals the preimage. The latch flips
         // once BOTH sides have unlocked — the receiver's side happens on their (background)
         // claim attempt — so retry the retrieve until the SE releases it.
+        //
+        // Audit [2]/[5] atomicity: the SE latch clock is now COORDINATED (server-side) — the
+        // receiver's claim gate (validate_batch, minus a grace) and the SSP's preimage retrieval
+        // (get_preimage) are both bound to the SAME latch expiry, which is set SHORTER than the
+        // payer's HODL HTLC. So confirm_pending_invoice no longer irrevocably hands over the coin:
+        // the receiver's key rotation only completes while the latch is valid, and the SSP can always
+        // retrieve the preimage within the grace window after any successful claim. If the receiver
+        // never claims, the retrieve loop below exhausts — and it is then SAFE to cancel the HODL
+        // (refund the payer), because the coordinated clock guarantees the coin stayed with the SSP.
         mercuryrustlib::lightning_latch::confirm_pending_invoice(
             self.wallet.client_config(),
             self.wallet.wallet_name(),
@@ -612,8 +621,18 @@ impl SspService {
                 Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
             }
         }
-        let preimage =
-            preimage.ok_or_else(|| anyhow!("SE did not release the preimage (receiver has not claimed?)"))?;
+        let preimage = match preimage {
+            Some(p) => p,
+            None => {
+                // The receiver never claimed within the latch window. The coordinated clock kept the
+                // coin with the SSP (the receiver could not complete its latch-gated key rotation), so
+                // cancel the held HTLC to refund the payer promptly rather than leaving it to time out.
+                let _ = self.rln.cancel_hodl(&swap.payment_hash).await;
+                return Err(anyhow!(
+                    "SE did not release the preimage (receiver did not claim in the latch window); HTLC cancelled, coin retained by SSP"
+                ));
+            }
+        };
         self.rln.claim_hodl(&swap.payment_hash, &preimage).await?;
         for _ in 0..30 {
             if self.rln.invoice_status(&swap.invoice).await? == "Succeeded" {

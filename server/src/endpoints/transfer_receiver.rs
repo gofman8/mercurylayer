@@ -162,12 +162,34 @@ pub async fn validate_batch(statechain_entity: &State<StateChainEntity>, statech
 
         let (batch_id, batch_time) = batch_info.unwrap();
 
-        if is_batch_expired(batch_time) {
-            // the batch time has not expired. It is possible to add a new coin to the batch.
-            return BatchTransferReceiveValidationResult::ExpiredBatchTimeError("Batch time has expired".to_string());
+        // Audit [2] (H4): a Lightning-latch batch is governed by the latch's OWN expiry, NOT the
+        // short `batch_timeout` (deployed as low as 20 s). Keying the claim gate on `batch_timeout`
+        // makes an honest receiver miss the window on any LN settlement slower than that. Gate an
+        // LN-latch batch on `lightning_latch.expires_at` (the coordinated clock, shorter than the
+        // payer's HODL HTLC); a plain transfer batch still uses `batch_timeout`.
+        let latch_expiry =
+            crate::database::lightning_latch::get_latch_expiry_by_batch_id(&statechain_entity.pool, &batch_id).await;
+        let expired = match latch_expiry {
+            // The receiver's claim window closes a GRACE period BEFORE the latch's own expiry, while
+            // the SSP's preimage retrieval (get_preimage) is allowed right up to expiry. This
+            // guarantees the SSP always has `grace` seconds to settle the HTLC after the receiver's
+            // last possible claim — closing the boundary race where a claim lands microseconds before
+            // expiry but the SSP's settle lands just after.
+            Some(exp) => {
+                let grace_secs: i64 = std::env::var("RECEIVE_LATCH_GRACE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300);
+                chrono::Utc::now() > (exp - chrono::Duration::seconds(grace_secs))
+            }
+            None => is_batch_expired(batch_time),
+        };
+
+        if expired {
+            return BatchTransferReceiveValidationResult::ExpiredBatchTimeError("Batch/latch time has expired".to_string());
         } else {
-            
-            // batch not expired. Check if all coins are unlocked.
+
+            // not expired. Check if all coins are unlocked.
             let all_coins_unlocked = crate::database::transfer::is_all_coins_unlocked(&statechain_entity.pool, &batch_id).await;
 
             if all_coins_unlocked {
