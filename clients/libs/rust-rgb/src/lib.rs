@@ -631,11 +631,14 @@ impl RgbWallet {
             self.wallet
                 .accept_transfer(txid.to_string(), vout, transport, blinding)?;
 
+        // Audit [22] / INV-26: count only spendable Fungible amount as received value. An
+        // InflationRight is NOT spendable balance (it moves solely via the mint path); booking it as
+        // received would inflate the receiver's balance out of nothing. Mirrors offchain_assigned_amount.
         let received: u64 = assignments
             .into_iter()
             .map(|a| match a {
-                Assignment::Fungible(amt) | Assignment::InflationRight(amt) => amt,
-                Assignment::NonFungible | Assignment::Any => 0,
+                Assignment::Fungible(amt) => amt,
+                Assignment::InflationRight(_) | Assignment::NonFungible | Assignment::Any => 0,
             })
             .sum();
 

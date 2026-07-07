@@ -705,7 +705,28 @@ impl SparkWallet {
         let mut statuses = Vec::new();
         for id in ids {
             // Materialize the coin's funding first (no locktime on branch txs).
-            self.broadcast_branch_if_any(&id).await?;
+            let has_branch = self.broadcast_branch_if_any(&id).await?;
+            // Audit [20]: distinguish a genuinely FLAT coin (on-chain funding, legitimately no branch)
+            // from a sub-coin whose exit branch is MISSING (e.g. restored from mnemonic without the
+            // recovery bundle). If there is no branch AND the coin's own funding txid is not on-chain,
+            // the branch is required but absent — broadcasting the leaf backup would fail with an
+            // opaque "missing inputs". Surface an explicit, actionable error instead.
+            if !has_branch {
+                let funding_txid = record
+                    .coins
+                    .iter()
+                    .find(|c| c.statechain_id.as_deref() == Some(&id))
+                    .and_then(|c| c.utxo_txid.clone());
+                if let Some(txid_str) = funding_txid {
+                    if let Ok(txid) = txid_str.parse::<bitcoin::Txid>() {
+                        if self.inner.cc.electrum_client.transaction_get(&txid).is_err() {
+                            return Err(anyhow!(
+                                "sub-coin {id} has no stored exit branch (branch-{id} missing) and its funding {txid_str} is un-broadcast — it cannot be exited; restore the recovery bundle (branch-* rows)"
+                            ));
+                        }
+                    }
+                }
+            }
 
             let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
                 &self.inner.cc.pool,

@@ -147,14 +147,24 @@ mod tests {
 
     #[test]
     fn no_exact_plans_split() {
-        match plan(&coins(&[500, 300]), 600) {
+        match plan(&coins(&[5000, 3000]), 6000) {
             Plan::WithSplit { whole, split, split_amount } => {
                 assert_eq!(whole, vec![0]);
                 assert_eq!(split, 1);
-                assert_eq!(split_amount, 100);
+                assert_eq!(split_amount, 1000);
             }
             p => panic!("unexpected plan {p:?}"),
         }
+    }
+
+    // Audit [29]: a remainder below the dust floor cannot be minted by a split (the piece would be
+    // un-broadcastable); plan() must refuse rather than hand the split path a doomed piece.
+    #[test]
+    fn sub_dust_remainder_is_refused() {
+        assert_eq!(
+            plan(&coins(&[500, 300]), 600),
+            Plan::Insufficient { available: 800 }
+        );
     }
 
     #[test]
@@ -165,16 +175,21 @@ mod tests {
         );
     }
 
-    // INV-9: WithSplit structural invariants.
+    // INV-9: WithSplit structural invariants (post-audit-[29]: the split coin must also cover the
+    // fee reserve and leave non-dust change).
     #[test]
     fn with_split_invariants() {
-        let cs = coins(&[500, 300]); // no exact subset for 600
-        match plan(&cs, 600) {
+        let cs = coins(&[5000, 3000]); // no exact subset for 6000
+        match plan(&cs, 6000) {
             Plan::WithSplit { whole, split, split_amount } => {
                 let whole_sum: u64 = whole.iter().map(|&i| cs[i].amount_sats).sum();
-                assert!(whole_sum < 600, "whole < target");
-                assert_eq!(split_amount, 600 - whole_sum, "split covers the deficit");
-                assert!(cs[split].amount_sats > split_amount, "split coin exceeds the piece");
+                assert!(whole_sum < 6000, "whole < target");
+                assert_eq!(split_amount, 6000 - whole_sum, "split covers the deficit");
+                let parent = cs[split].amount_sats;
+                assert!(
+                    parent > split_amount + crate::transfer::split_fee_reserve(parent) + 330,
+                    "split coin covers piece + fee reserve + non-dust change"
+                );
             }
             p => panic!("expected split, got {p:?}"),
         }
