@@ -21,4 +21,8 @@ pub enum WalletEvent {
     /// front-running with a competing spend). The exit did NOT go through as-is; the app should
     /// fee-bump / alert / re-attempt rather than assume the coin exited.
     ExitBranchConflict { statechain_id: String },
+    /// An off-chain sub-coin is within the safety margin of its exit-race deadline (audit [17]):
+    /// an ancestor could soon broadcast a stale backup. `auto_exit_due` broadcasts the locktime-free
+    /// exit branch when this fires; an offline owner MUST run a watchtower that does the same.
+    ExitDeadlineApproaching { statechain_id: String, deadline_block: u32, tip: u32 },
 }

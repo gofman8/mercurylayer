@@ -14,11 +14,21 @@ pub async fn get_token_no_server(statechain_entity: &State<StateChainEntity>, co
             "error": "Internal Server Error",
             "message": "Token generation not supported on mainnet."
         });
-    
+
         return status::Custom(Status::InternalServerError, Json(response_body));
     }
 
-    let token_id = uuid::Uuid::new_v4().to_string();   
+    // Audit [26]: this endpoint is unauthenticated on non-mainnet, so cap the number of unspent
+    // token rows to bound DB write-amplification if a caller loops it (testnet/staging griefing).
+    const MAX_UNSPENT_TOKENS: i64 = 100_000;
+    if crate::database::deposit::count_unspent_tokens(&statechain_entity.pool).await >= MAX_UNSPENT_TOKENS {
+        return status::Custom(
+            Status::TooManyRequests,
+            Json(json!({ "message": "too many outstanding deposit tokens; consume some before requesting more" })),
+        );
+    }
+
+    let token_id = uuid::Uuid::new_v4().to_string();
 
     crate::database::deposit::insert_new_token(&statechain_entity.pool, &token_id).await;
 

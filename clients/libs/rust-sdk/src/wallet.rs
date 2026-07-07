@@ -468,6 +468,50 @@ impl SparkWallet {
         })
     }
 
+    /// Watchtower pass (audit [17], review L7/P2-2): force-exit any owned OFF-CHAIN sub-coin whose
+    /// exit-race deadline is within `margin_blocks` of the current tip. The exit branch is
+    /// locktime-free, so broadcasting it early is always safe and cheap; doing so before an ancestor
+    /// can broadcast a stale backup is the ONLY defence for an off-chain coin. The deadline is the
+    /// deposit-anchored `exit_deadline_block` from `estimate_exit_cost` (audit [10]). Emits
+    /// `ExitDeadlineApproaching` for each coin acted on and returns the exited statechain_ids.
+    ///
+    /// Call this on an interval from your own loop (or alongside `claim()`), especially for wallets
+    /// that hold received off-chain sub-coins — an offline owner is otherwise exposed to clawback.
+    pub async fn auto_exit_due(&self, margin_blocks: u32) -> Result<Vec<String>> {
+        use electrum_client::ElectrumApi;
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let record = self.record().await?;
+        let carriers = self.token_carrier_outpoints().await.unwrap_or_default();
+        let ids: Vec<String> = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !is_token_carrier(c, &carriers))
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        let mut exited = Vec::new();
+        for id in ids {
+            let est = match self.estimate_exit_cost(&id).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            // Only off-chain sub-coins carry an exit-race deadline (flat coins return None).
+            let Some(deadline) = est.exit_deadline_block else { continue };
+            if tip + margin_blocks < deadline {
+                continue; // still comfortably ahead of the deadline
+            }
+            let _ = self.inner.events_tx.send(WalletEvent::ExitDeadlineApproaching {
+                statechain_id: id.clone(),
+                deadline_block: deadline,
+                tip,
+            });
+            if self.unilateral_exit(Some(vec![id.clone()]), None).await.is_ok() {
+                exited.push(id);
+            }
+        }
+        Ok(exited)
+    }
+
     /// Cooperative exit: withdraw specific coins (or `None` = all confirmed coins) to an on-chain
     /// address. One on-chain transaction per coin, SE co-signed, no timelock wait.
     pub async fn withdraw(

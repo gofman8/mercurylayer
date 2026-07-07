@@ -63,6 +63,20 @@ pub async fn validate_batch_transfer(statechain_entity: &State<StateChainEntity>
         if batch_time.is_some() {
             let batch_time = batch_time.unwrap();
 
+            // Audit [16] (batch poisoning): for a LIGHTNING-LATCH batch, only coins the originator
+            // actually latched may join. Otherwise any owner who learns the batch_id could inject a
+            // never-unlocked coin and keep is_all_coins_unlocked false until timeout, blocking every
+            // honest receiver in the batch (griefing DoS + tied-up SSP capital). The SSP creates a
+            // lightning_latch row per member, so require the joining coin to be one of them.
+            let is_latch_batch = crate::database::lightning_latch::get_latch_expiry_by_batch_id(&statechain_entity.pool, new_batch_id).await.is_some();
+            if is_latch_batch
+                && !crate::database::lightning_latch::statechain_in_latch_batch(&statechain_entity.pool, statechain_id, new_batch_id).await
+            {
+                return BatchTransferValidationResult::StatecoinBatchLockedError(
+                    "coin is not an authorized member of this lightning-latch batch".to_string(),
+                );
+            }
+
             if !is_batch_expired(batch_time) {
                 // the batch time has not expired. It is possible to add a new coin to the batch.
                 return BatchTransferValidationResult::Success

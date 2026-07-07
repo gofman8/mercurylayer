@@ -87,6 +87,17 @@ pub async fn get_preimage(pool: &sqlx::PgPool, statechain_id: &str, sender_auth_
 
 }
 
+/// True if `statechain_id` is a latched member of `batch_id` (audit [16]): used to reject an
+/// uninvited coin trying to poison a lightning-latch batch. No sender_auth_key needed.
+pub async fn statechain_in_latch_batch(pool: &sqlx::PgPool, statechain_id: &str, batch_id: &str) -> bool {
+    let query = "SELECT EXISTS (SELECT 1 FROM lightning_latch WHERE statechain_id = $1 AND batch_id = $2)";
+    match sqlx::query(query).bind(statechain_id).bind(batch_id).fetch_one(pool).await {
+        Ok(row) => row.get(0),
+        // Fail CLOSED: if we cannot verify membership, do not admit the coin to a latch batch.
+        Err(_) => false,
+    }
+}
+
 /// Latch expiry for a batch (audit [2]): looked up by batch_id alone — no sender_auth_key needed, so
 /// `validate_batch` can gate an LN-latch batch on the latch's OWN clock instead of the short
 /// `batch_timeout`. Returns None when the batch has no lightning_latch row (a plain transfer batch).

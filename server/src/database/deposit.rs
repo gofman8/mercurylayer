@@ -152,6 +152,17 @@ pub async fn count_finalized_signatures(pool: &sqlx::PgPool, statechain_id: &str
     Ok(row.0)
 }
 
+/// Count of outstanding (unspent) deposit tokens (audit [26]): used to cap the unauthenticated
+/// non-mainnet get_token faucet so it cannot amplify DB writes unboundedly.
+pub async fn count_unspent_tokens(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM tokens WHERE spent = false")
+        .fetch_one(pool)
+        .await
+        .map(|r| r.0)
+        // Fail CLOSED (return the cap) so a read error throttles rather than opens the faucet.
+        .unwrap_or(i64::MAX)
+}
+
 pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str)  {
 
     let query = "INSERT INTO tokens (token_id, confirmed, spent) VALUES ($1, $2, $3)";
