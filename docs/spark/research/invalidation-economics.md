@@ -365,11 +365,12 @@ number) whenever the SE looks unhealthy.
 
 ## 7. Parameter sensitivity (initlock / interval)
 
-All rows keep the 100-hop ratio. "Brick exposure" = time locked out of funds if a griefing
-attacker sets the coin's spend budget to zero on day 0 (open audit [15]: owner-auth replay ⇒
-unilateral-exit-only; no theft) — the victim waits the full fresh ladder.
+All rows keep the 100-hop ratio. "Forced-unilateral exposure" = time locked out of funds if a
+coin is forced down the unilateral path on day 0 — e.g. the SE dies, or (historically) the audit-
+[15] replay brick, closed in AUDIT UPDATE 3 by single-use endpoint-bound auth on
+`set_spend_budget`/`withdraw/complete` — the owner waits the full fresh ladder.
 
-| initlock/interval | Horizon (initlock/144) | Hop capacity | Exclusive exit window (interval) | Day-0 brick exposure |
+| initlock/interval | Horizon (initlock/144) | Hop capacity | Exclusive exit window (interval) | Day-0 forced-unilateral exposure |
 |---|---|---|---|---|
 | 500 / 5 | 3.5 d | 100 | 5 blk ≈ 50 min | 3.5 d |
 | 1000 / 10 (deployed) | 6.9 d | 100 | 10 blk ≈ 100 min | 6.9 d |
@@ -379,7 +380,7 @@ unilateral-exit-only; no theft) — the victim waits the full fresh ladder.
 The trade-off, in one line each:
 
 - **initlock up** ⇒ longer holding horizon, ~linearly fewer saver rolls/year (§4c) — but equally
-  longer worst-case unilateral wait, fresh-sub-coin wait (§6) and griefing-brick exposure.
+  longer worst-case unilateral wait, fresh-sub-coin wait (§6) and forced-unilateral exposure.
 - **interval up** (at fixed ratio) ⇒ a wider exclusive window in which *only* the current owner's
   backup is valid — 50 minutes (500/5) is uncomfortably tight against a fee spike + full mempool;
   16.7 h (10000/100) comfortably covers confirmation variance — but each hop then burns more
@@ -428,9 +429,10 @@ Honesty section — status per [AUDIT-2026-07.md](../AUDIT-2026-07.md) remediati
   The exactness domain and the binding mitigation are stated normatively in
   [INVALIDATION-SPEC.md §6.2](../INVALIDATION-SPEC.md) (IVL-INV-10 / IVL-REQ-16: eager
   materialization, or a conservative `M·interval` margin via `auto_exit_due`).
-- **[15] (open): griefing brick** prices into §7's exposure column — an attacker replaying
-  owner-auth can force a coin down the unilateral path (full `initlock` wait), destroying its
-  time-to-money without stealing it.
+- **[15] (closed, AUDIT UPDATE 3): griefing brick** — the replay that could force a coin down
+  the unilateral path (full `initlock` wait, no theft) is no longer possible on the irreversible
+  endpoints; §7's forced-unilateral exposure column survives as the price of an SE failure, not
+  of an attack.
 - **sdk26 (`SDK_E2E=26`, `sdk26_invalidation_scale`): measurements folded into §3b** (2026-07-07
   run): per-hop branch delta exactly 155 vB at depths 1–4; depth-4 totals 732 vB; 3-wide fan-out
   split 241 vB; full depth-4 unilateral exit executed on regtest (branch instant, backup after

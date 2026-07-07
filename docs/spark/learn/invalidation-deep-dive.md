@@ -409,17 +409,22 @@ rejected at exit time with a "restore the recovery bundle" error (audit [20]) ra
 opaquely. **Outcome:** full self-custody from the first second, zero on-chain onboarding cost —
 but the recovery bundle, not just the seed, is what must be backed up.
 
-### 5.10 The griefing case: a replayed owner-auth signature (audit [15], open)
+### 5.10 The griefing case: a replayed owner-auth signature (audit [15], closed)
 
-Owner authentication is currently a static signature over `sha256(statechain_id)`, replayable
-across owner endpoints by anyone who observes one request (a logging proxy, a TLS terminator, an
-SSP in the path). The worst replay: `set_spend_budget` with `remaining = 0`, which — because the
-budget is monotonic and irreversible — bricks the coin to **unilateral-exit-only**. What the
-attacker does *not* get: the funds. The ladder and branch need no SE, so the owner exits
-on-chain and keeps everything; the loss is the off-chain utility of the coin plus exit fees plus
-the `wait_blocks` wait. The planned fix binds auth signatures to
-`(statechain_id ‖ endpoint ‖ SE nonce ‖ params)`. **Outcome:** irreversible inconvenience, not
-theft; until [15] lands, keep the SE connection path clean of interception points.
+Owner authentication was historically a static signature over `sha256(statechain_id)`,
+replayable across owner endpoints by anyone who observed one request (a logging proxy, a TLS
+terminator, an SSP in the path). The worst replay: `set_spend_budget` with `remaining = 0`,
+which — because the budget is monotonic and irreversible — bricks the coin to
+**unilateral-exit-only**. What the attacker never got: the funds. The ladder and branch need no
+SE, so the owner exits on-chain and keeps everything; the loss was the off-chain utility of the
+coin plus exit fees plus the `wait_blocks` wait. **Closed in audit UPDATE 3:** the two
+irreversible endpoints (`set_spend_budget`, `withdraw/complete`) now demand a single-use,
+endpoint-bound challenge — a 5-minute SE nonce (`GET /auth/challenge/<sid>`) signed as
+`sha256(nonce ‖ endpoint)` and atomically consumed — so a captured signature can no longer be
+replayed or redirected. The lower-harm `transfer`/`sign` endpoints deliberately keep the static
+auth (harm bounded by the coin protocol and the enclave's nonce consume). **Outcome:** the brick
+attack is no longer possible; the wait-cost arithmetic below survives as the price of any
+*voluntary* forced-unilateral situation (e.g. SE failure).
 
 ## 6. The UX perspective
 
@@ -477,10 +482,9 @@ is nearly full (~7 days deployed). The branch confirms immediately (securing the
 every ancestor), but the money reaches your plain address only after the leaf wait. Coop exit,
 when the SE is alive, is always the fast path.
 
-**Sharp edges, honestly, as of 2026-07** (post remediation UPDATE 2: all 11 HIGH findings,
-including the LN-atomicity cluster, fixed + verified; mainnet still gated on the SGX enclave
-rebuild, a re-audit, and a third-party audit): still open are [15] auth-replay (a replay can
-brick a coin to unilateral-exit-only, §5.10 — griefing, scheduled as its own workstream) and the
+**Sharp edges, honestly, as of 2026-07** (post remediation UPDATE 3: all 11 HIGH findings and
+all griefing/DoS MEDIUMs — incl. the [15] brick, §5.10 — fixed + verified; mainnet still gated on
+the SGX enclave rebuild, a re-audit, and a third-party audit): still open is the
 conveyed-locktimes half of [17] — the reported deadline can be `k·interval` too late, which the
 `auto_exit_due` margin must absorb; no RBF on any pre-signed tx (CPFP only); recovery
 bundle (backup ladder + branch rows) is not seed-derivable — for any coin, flat included (H3);

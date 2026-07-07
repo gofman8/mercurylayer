@@ -339,7 +339,7 @@ Attacker capability matrix (what each class can and cannot achieve):
 | Malicious sender of a sub-coin | Attempt branch-root front-running (detected as `ExitBranchConflict`); try to convey a locktimed/value-creating/short-ancestor branch (all rejected at claim) | Double-spend a terminal parent at the SE (budget consumed pre-co-sign, IVL-REQ-7); re-open a budget (IVL-INV-7) | sdk08, sdk10, rgb04 |
 | Malicious SE alone | Refuse service (owner exits unilaterally, REQ-2/24); co-sign a fresh conflicting state → carries a *current* locktime, so no ladder advantage → plain first-seen race | Move funds without the owner's key (SPEC REQ-1); covertly violate a published budget — `GET spend_budget` is public (IVL-INV-9) | sdk15 |
 | SE + old owner collusion | Fresh double-sign = the same plain race; on structural nodes the extra signature is publicly attributable via the terminal audit | Win retroactively via the ladder; hide the misbehaviour from auditors | sdk15 |
-| Observer replaying an owner auth sig (audit **[15]**, open) | Call `set_spend_budget remaining=0` → brick the coin to unilateral-exit-only; or destroy SE co-sign state via `withdraw/complete`. Irreversible **griefing, not theft** | Steal funds; forge a transfer | AUDIT-2026-07 [15] |
+| Observer replaying an owner auth sig (audit **[15]**, closed UPDATE 3) | Historically: `set_spend_budget remaining=0` → brick to unilateral-exit-only, or destroy SE co-sign state via `withdraw/complete`. Both now require a single-use, endpoint-bound challenge (`GET /auth/challenge/<sid>`, sig over `sha256(nonce‖endpoint)`, atomically consumed) — a captured signature can no longer be replayed or redirected | Steal funds; forge a transfer; replay onto the two irreversible endpoints | AUDIT-2026-07 [15] |
 
 **IVL-INV-12 (trust floor).** The residual trust assumption is exactly: *the SE honestly refuses
 conflicting/expired state*. If it does not, invalidation degrades to a fair on-chain broadcast
@@ -414,11 +414,16 @@ spec.
    (IVL-REQ-16 option 2), or the branch must be broadcast eagerly (option 1). An online receiver
    is always safe; an owner offline longer than their margin is exposed only if an ancestor was
    transferred more than `margin_blocks / interval` times before splitting.
-2. **[15] (OPEN, MEDIUM) — owner-auth replay griefing.** The owner auth signature is a static
-   `sha256(statechain_id)` replayable across owner endpoints, including the irreversible
-   `set_spend_budget remaining=0`. Impact on invalidation: an observer in the request path can
-   *brick* a coin to unilateral-exit-only (griefing/DoS, no theft). The terminal predicate itself
-   remains sound — the attack tightens budgets, it never loosens them (IVL-INV-7).
+2. **[15] (CLOSED for the irreversible ops, AUDIT UPDATE 3) — owner-auth replay griefing.** The
+   static `sha256(statechain_id)` owner auth was replayable; an observer in the request path
+   could *brick* a coin to unilateral-exit-only via `set_spend_budget remaining=0` (griefing/DoS,
+   no theft). Fixed for the two irreversible targets: `set_spend_budget` and `withdraw/complete`
+   now require a single-use, endpoint-bound SE challenge (5-minute nonce from
+   `GET /auth/challenge/<sid>`, signature over `sha256(nonce‖endpoint)`, atomically consumed).
+   The lower-harm `transfer`/`sign` endpoints intentionally keep the static auth (harm bounded by
+   the coin protocol + enclave consume); the `fresh_auth` mechanism exists to extend coverage.
+   The terminal predicate was sound throughout — the attack tightened budgets, never loosened
+   them (IVL-INV-7).
 3. **Blind-SE ancestor substitution (accepted, SPEC §14).** IVL-REQ-12's count check defeats
    omission of ancestors, not substitution of terminal decoys; the defence is that the receiver
    holds the fully-signed branch and can exit immediately.
@@ -439,10 +444,10 @@ spec.
    not reproducible until the rebuild lands, so layer 2's deployment story is operationally
    unverified even though the deployed code is correct.
 
-Audit status ([AUDIT-2026-07.md](AUDIT-2026-07.md), remediation UPDATE 2): every CONFIRMED
-fund-loss/theft finding (all 11 HIGH, including the LN-atomicity cluster) is fixed and verified on
-the live stack. The remaining open items are exactly items 1, 2 and 6 above — [17]'s
-conveyed-locktimes half, [15] (griefing-only, scheduled as a dedicated workstream), and the SGX
-enclave rebuild — plus [28] (LOW, conservative-safe by design). Mainnet remains gated on the
-operational blockers: the SGX rebuild, a full E2E re-run + independent re-audit, and a
-professional third-party audit.
+Audit status ([AUDIT-2026-07.md](AUDIT-2026-07.md), remediation UPDATE 3): every CONFIRMED
+fund-loss/theft finding (all 11 HIGH, including the LN-atomicity cluster) AND all griefing/DoS
+MEDIUMs (incl. [15]'s irreversible-op replay and [16] batch poisoning) are fixed and verified on
+the live stack. The remaining open items are item 1 above ([17]'s conveyed-locktimes half),
+[13] (enclave pubnonce binding — inert until the SGX rebuild it ships with), and [28] (LOW,
+conservative-safe by design). Mainnet remains gated on the operational blockers: the SGX rebuild,
+a full E2E re-run + independent re-audit, and a professional third-party audit.
