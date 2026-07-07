@@ -299,9 +299,10 @@ pub async fn execute() -> Result<()> {
 
     // The gap: the reported deadline is LATER than the true earliest hostile maturity by
     // k*interval minus the confirm/co-sign offset. A watchtower honoring `reported` on a
-    // pre-transferred parent would act ~2*interval blocks TOO LATE. OPEN audit item [17]: the
-    // receiver cannot compute the true min-ancestor deadline locally (ancestor backup locktimes
-    // are not conveyed) and there is no background auto-exit.
+    // pre-transferred parent would act ~2*interval blocks TOO LATE. Audit item [17], half-closed:
+    // `auto_exit_due(margin_blocks)` (batch 5) acts on this deadline, but the receiver still
+    // cannot compute the true min-ancestor deadline locally (ancestor backup locktimes are not
+    // conveyed) — the margin argument must absorb exactly this gap.
     let gap = reported as i64 - true_earliest as i64;
     assert_eq!(
         gap,
@@ -313,7 +314,7 @@ pub async fn execute() -> Result<()> {
         "the reported deadline is too late by at least one full interval — audit [17] is material"
     );
     println!(
-        "WARN deadline-gap: reported={reported} true={true_earliest} gap={gap} (k=2 hops x interval={interval}, confirm_delta={delta}) — OPEN audit [17]: exit_deadline_block is safe only for never-transferred parents; an offline receiver past block {true_earliest} is exposed"
+        "WARN deadline-gap: reported={reported} true={true_earliest} gap={gap} (k=2 hops x interval={interval}, confirm_delta={delta}) — audit [17] conveyed-locktimes half still open: exit_deadline_block is exact only for never-transferred parents; auto_exit_due's margin_blocks must absorb this gap, else an offline receiver past block {true_earliest} is exposed"
     );
 
     // ===== (d) EPOCH OVER TIME on the sats path =================================================

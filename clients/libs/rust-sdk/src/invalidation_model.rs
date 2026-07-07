@@ -182,8 +182,9 @@ fn exclusive_window_width_is_interval() {
 // transferred before the split (k = 0), and LATE by k·interval otherwise — a watchtower
 // honoring it could exit after a stale ancestor backup already matured. An ONLINE receiver is
 // always safe (it can broadcast the locktime-free branch immediately); a receiver offline past
-// the true deadline is exposed. This residual is open audit [17] (conveyed ancestor locktimes +
-// background auto-exit); do not read this test as proof the deadline is safe in general.
+// the true deadline is exposed. Audit [17] is half-closed: `auto_exit_due(margin_blocks)`
+// (batch 5) acts on this deadline, but ancestor locktimes are still not conveyed, so the margin
+// must absorb the k·interval gap; do not read this test as proof the deadline is safe in general.
 #[test]
 fn deposit_anchored_deadline_exactness_domain() {
     let (initlock, interval) = DEPLOYED;

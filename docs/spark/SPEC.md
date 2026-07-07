@@ -261,6 +261,11 @@ on-chain.
 
 ## 10. Invalidation & security invariants
 
+> The normative specification of the old-state invalidation mechanism (ladder formula, parameter
+> constraints, receiver obligations, exit deadlines and their exactness domain, attacker matrix)
+> is [INVALIDATION-SPEC.md](INVALIDATION-SPEC.md) (IVL-REQ/IVL-INV/IVL-ERR numbering). The items
+> below are the system-level summary; where they overlap, INVALIDATION-SPEC.md is authoritative.
+
 **INV-18 (no old state)** Split/combine spend into NEW outpoints; a child cannot confirm before its
 parent (its input is the parent's output), so there is no old-vs-new race within a tree.
 **INV-19 (fork prevention)** The SE refuses a second spend of any node (single-use / spend budget),
@@ -351,7 +356,7 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-4, REQ-14, ERR-6, INV-7 | `sdk01` deposit; `unit::token_payment_required` |
 | REQ-5, ERR-1 | `rgb04` (single-use refusal) |
 | REQ-6, ERR-2, INV-21 | `rgb07` (epoch deadline) |
-| REQ-7, REQ-13, REQ-18, ERR-3, INV-19 | `sdk08` (terminal node), `unit::spend_budget` |
+| REQ-7, REQ-13, REQ-18, ERR-3, INV-19 | `sdk08` (terminal node), `unit::types::terminal_predicate`, `unit::invalidation_model::terminal_predicate_matrix` |
 | REQ-8, REQ-9, REQ-15, REQ-16, INV-5, INV-8 | `sdk01`, `sdk04`, upstream `tb01/tb05/tm01/ta02/ta03` |
 | REQ-10, ERR-4 | `sdk03` (latch locked pre-settlement) |
 | REQ-11, REQ-12, ERR-5, REQ-23, INV-14 | `sdk05` (pay), `unit::hash_preimage` |

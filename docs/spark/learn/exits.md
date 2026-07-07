@@ -1,5 +1,10 @@
 # Deposits and exits
 
+> Exit timing, deadlines and pricing are specified normatively in
+> [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (§6) and explained in depth — with cost tables —
+> in [invalidation-deep-dive.md](invalidation-deep-dive.md) and
+> [invalidation-economics.md](../research/invalidation-economics.md).
+
 ## Deposits
 
 `get_deposit_address(amount)` performs the SE handshake and returns a taproot address whose key

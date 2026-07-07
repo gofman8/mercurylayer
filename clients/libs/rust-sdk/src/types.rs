@@ -121,12 +121,14 @@ pub struct ExitCostEstimate {
     pub wait_blocks: u32,
     /// SAFETY DEADLINE (block height) for an off-chain sub-coin: the earliest height at which an
     /// ANCESTOR could broadcast its own stale backup and race you. You must broadcast your exit
-    /// BRANCH (which is locktime-free) before this height. It is the immediate parent's backup
-    /// locktime = your leaf backup locktime + one ladder `interval` (the earliest-maturing ancestor,
-    /// since the ladder decrements one interval per hop). `None` for a flat on-chain coin (no
-    /// off-chain ancestor can race you). A watchtower MUST use this — not `wait_blocks` — to decide
-    /// when to force-exit; using the coin's own backup or the deposit root's locktime would exit at
-    /// the wrong time and could lose the race.
+    /// BRANCH (which is locktime-free) before this height. Computed DEPOSIT-ANCHORED (audit [10]):
+    /// the branch root's funding-confirmation height + `initlock` — the maturity of the root
+    /// deposit's FIRST backup. If an ancestor was transferred k times before being split, its
+    /// retained stale backup matures `k·interval` blocks EARLIER than this value (audit [17]:
+    /// ancestor locktimes are not conveyed to receivers), so treat the deadline as an upper bound
+    /// and act with a margin — or simply broadcast the branch eagerly; `auto_exit_due` does this.
+    /// `None` for a flat on-chain coin (no off-chain ancestor can race you). A watchtower MUST use
+    /// this — not `wait_blocks` (which is when the exit COMPLETES) — to decide when to force-exit.
     pub exit_deadline_block: Option<u32>,
 }
 

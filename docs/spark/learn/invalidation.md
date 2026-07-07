@@ -1,5 +1,9 @@
 # Old-state invalidation & UTXO granularity — design and comparison
 
+> Short comparison page. For the full explainer — lifecycle walkthroughs, over-time behaviour,
+> failure scenarios, UX, and FAQ — see [invalidation-deep-dive.md](invalidation-deep-dive.md);
+> the normative requirements live in [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md).
+
 How do you stop a previous owner (or a malicious current owner) from using old off-chain state?
 Every L2 answers differently. This page compares the designs we reviewed — Spark, Ark (and
 Second's implementation), SuperScalar, vanilla Mercury — and specifies ours, which layers an
