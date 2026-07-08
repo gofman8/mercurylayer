@@ -161,7 +161,10 @@ reject otherwise (ERR-7).
 `select::plan(coins, target)` returns `Exact(subset)` if a subset sums to `target`, else
 `WithSplit{whole, split, split_amount}`, else `Insufficient{available}`.
 **INV-9** `Exact(s)` ⟹ `Σ coins[s] = target`. `WithSplit` ⟹ `Σ whole < target ∧ split_amount =
-target − Σ whole ∧ coins[split] > split_amount`. `Insufficient` ⟺ `Σ coins < target`.
+target − Σ whole ∧ coins[split] > split_amount`. `Insufficient` ⟸ `Σ coins < target` — but the
+reverse does **not** hold: since audit [29] the planner also returns `Insufficient` when the
+remainder can only be minted as a sub-dust piece (no split candidate covers
+`remainder + fee_reserve + 330`). See [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) GRN-REQ-5.
 
 ---
 

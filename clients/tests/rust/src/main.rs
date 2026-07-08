@@ -55,6 +55,8 @@ pub mod sdk24_receive_cancel;
 pub mod sdk25_receive_delayed_claim;
 pub mod sdk26_invalidation_scale;
 pub mod sdk27_invalidation_time;
+pub mod sdk28_granularity_sats;
+pub mod sdk29_granularity_tokens;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -208,6 +210,22 @@ async fn main() -> Result<()> {
     // the exact gap), and the SE epoch gate on the plain-sats deposit path.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("27") {
         sdk27_invalidation_time::execute().await?;
+        return Ok(());
+    }
+    // Granularity, plain sats (SDK_E2E=28): exact-subset payments (no split), an exact off-chain
+    // split (12_345 out of 100k, change 86_655, parent publicly terminal), the sub-dust boundary
+    // refusal (typed error, coin untouched) + 330-sat minimum piece, and a depth-2 re-split of a
+    // received piece (~155 vB per branch level, measured as ECON lines).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("28") {
+        sdk28_granularity_sats::execute().await?;
+        return Ok(());
+    }
+    // Granularity, RGB tokens (SDK_E2E=29): raw-unit precision (0.10 / 0.01 booked exactly), a
+    // depth-2 token exit (colored branch broadcast, opret anchors + allocation settled on-chain
+    // on the exited outpoint), spent-carrier change becoming plain splittable BTC, and the
+    // one-carrier-per-transfer limitation (typed error; 60+40 works where 100 fails).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("29") {
+        sdk29_granularity_tokens::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

@@ -19,7 +19,8 @@ use crate::wallet::SparkWallet;
 /// a fixed value is fine; randomize per-transfer once bindings expose it end-to-end).
 pub(crate) const TOKEN_BLINDING: u64 = 777;
 /// Sats carried by a token-piece sub-coin (just above dust; the token is the payload).
-const TOKEN_PIECE_SATS: u64 = 1_500;
+/// `pub(crate)` so the granularity model (`granularity_model.rs`) can pin the carrier floor.
+pub(crate) const TOKEN_PIECE_SATS: u64 = 1_500;
 
 /// How a colored transfer's piece is handed over.
 pub(crate) enum ColoredLatch {

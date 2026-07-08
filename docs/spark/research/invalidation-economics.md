@@ -3,7 +3,9 @@
 Companion to [learn/invalidation.md](../learn/invalidation.md) (mechanism comparison),
 [learn/invalidation-deep-dive.md](../learn/invalidation-deep-dive.md) (long-form explainer),
 [learn/exits.md](../learn/exits.md) (exit flows), [SPEC.md](../SPEC.md) (normative REQ/INV/ERR)
-and [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (normative IVL-REQ/IVL-INV).
+and [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (normative IVL-REQ/IVL-INV). Partial-amounts
+pricing (split bounds, token packaging, fragmentation) **extends** this page in
+[granularity-economics.md](granularity-economics.md).
 This page prices the invalidation design: what it costs to enter, to hold, to transact, and to
 leave — cooperatively or unilaterally — and how those costs scale with feerate, tree depth, coin
 size and time.
@@ -117,7 +119,7 @@ every round; LN amortizes over the channel's life. See §8.
 
 ### 3a. Cooperative withdraw
 
-One SE co-signed on-chain tx **per coin**, no timelock wait (`wallet.rs:473-522`). Sub-coins
+One SE co-signed on-chain tx **per coin**, no timelock wait (`wallet.rs:517-565`). Sub-coins
 materialize their branch first (adds the branch vB — same figures as §3b, minus the wait).
 
 | Withdraw tx | vB | @1 | @2 | @5 | @10 | @30 | @100 | @300 sat/vB |
@@ -299,8 +301,9 @@ costs:
 
 - **Sender:** the fee reserve `clamp(parent_sats/100, 300, 2000)` sats, deducted from the parent —
   and *burned*, not escrowed: the branch tx carrying it is broadcast on every exit path,
-  cooperative or unilateral (`wallet.rs:473-522` materializes the branch before any withdraw).
-  Regressive below ~30k-sat parents (§5: 30% of a 1,000-sat parent, 0.002% of 1 BTC).
+  cooperative or unilateral (`wallet.rs:517-565` — `broadcast_branch_if_any` at `:551-553` runs
+  before any withdraw). Regressive below ~30k-sat parents (§5: 30% of a 1,000-sat parent,
+  0.002% of 1 BTC).
 - **Receiver:** **+155 vB / +1 depth** inherited on the future exit, plus a fresh ≈`initlock`
   unilateral wait on the new leaf ladder (§6).
 

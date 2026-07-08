@@ -1,5 +1,8 @@
 # Tokens on RGB
 
+> How partial token amounts work — colored splits, raw units vs precision, the 1500-sat piece,
+> exit behaviour — is covered end-to-end in the [granularity deep dive](granularity-deep-dive.md).
+
 ## Hello RGB
 
 The token standard here is **RGB**, not a server-side token ledger. An RGB asset is a
@@ -14,12 +17,12 @@ splits, branch-verified receiving, and unilateral exit.
 
 | Spark BTKN | Here |
 |---|---|
-| `createToken` (name, ticker, decimals, maxSupply) | `issue_token` — RGB NIA, full supply at issuance |
-| `mintTokens` | NIA: supply fixed at issuance. IFA (inflatable) assets support inflation — roadmap |
+| `createToken` (name, ticker, decimals, maxSupply) | `issue_token` (NIA, full supply at issuance) / `issue_inflatable_token` (IFA) |
+| `mintTokens` | `mint_tokens` — IFA on-chain inflate, newly-minted allocation bound to a fresh statechain coin (NIA supply stays fixed); [SPEC §7](../SPEC.md#7-tokens-rgb) REQ-20, `sdk09` |
 | `transferTokens` | `transfer_tokens` — colored off-chain split + handover |
-| `batchTransferTokens` | loop of `transfer_tokens` (batch API roadmap) |
+| `batchTransferTokens` | `batch_transfer_tokens` — one colored split, N pieces + change ([SPEC §7](../SPEC.md#7-tokens-rgb), `sdk09`) |
 | `freezeTokens` / `unfreezeTokens` | **N/A by design** — see below |
-| `burnTokens` | send-to-unspendable (NIA) / IFA burn — roadmap |
+| `burnTokens` | `burn_tokens` — burns engine-held free balance on-chain; statechain-bound supply must exit first ([SPEC §7](../SPEC.md#7-tokens-rgb)) |
 | token identifier (`btkn1…`) | RGB contract id (`rgb:…`) |
 
 ## Issuance
@@ -58,6 +61,13 @@ should not issue on client-validated rails.
 
 ## Exits with tokens
 
-Cooperative or unilateral, the coin's exit materializes the branch on-chain; the RGB anchors
-confirm with it and the allocation becomes an ordinary on-chain RGB holding, spendable with any
-rgb-lib wallet.
+A token-carrying coin refuses the plain exit operations: `withdraw` and `unilateral_exit` exclude
+carriers from their defaults and hard-error when a carrier is named (an RGB-unaware sweep would
+destroy the allocation), and the `auto_exit_due` watchtower skips them. Token exit means
+**materializing the coin's branch on-chain** — today a manual broadcast of the stored branch rows
+(or a co-descendant's exit doing it for free), not a one-call SDK operation: the RGB anchors
+confirm with the branch and the allocation becomes an ordinary on-chain RGB holding, spendable
+with any rgb-lib wallet. Onward movement of the settled allocation still needs the SE (no colored
+unilateral path is shipped). Step-by-step:
+[granularity deep dive §5.6](granularity-deep-dive.md); normative:
+[GRANULARITY-SPEC](../GRANULARITY-SPEC.md) GRN-REQ-14 / GRN-INV-14.

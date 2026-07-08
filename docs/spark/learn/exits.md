@@ -4,6 +4,9 @@
 > [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (§6) and explained in depth — with cost tables —
 > in [invalidation-deep-dive.md](invalidation-deep-dive.md) and
 > [invalidation-economics.md](../research/invalidation-economics.md).
+> Token-carrier coins exit differently — both plain paths refuse them; see
+> [tokens.md "Exits with tokens"](tokens.md#exits-with-tokens) and
+> [GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md) GRN-INV-14.
 
 ## Deposits
 

@@ -64,8 +64,10 @@ co-signature ever) — the strictest form, used by the RGB DAG flows (`RGB_E2E=4
 
 Spark leaves are fixed denominations; exact amounts need SSP swap pools. Ark re-mints change each
 round. Here, **exact amounts are a native off-chain operation**: one SE-co-signed split mints any
-piece + change (1-sat resolution), chainable to any depth, each piece a full coin with its own
-ladder. Granularity is strictly better than both.
+piece + change (1-sat resolution above a 330-sat dust floor), chainable to any depth, each piece a
+full coin with its own ladder. Granularity is strictly better than both. Exact bounds, token
+packaging and pricing: the granularity pack — [deep dive](granularity-deep-dive.md),
+[GRANULARITY-SPEC](../GRANULARITY-SPEC.md), [economics](../research/granularity-economics.md).
 
 ## Unilateral exit economics (measured, `SDK_E2E=7`)
 

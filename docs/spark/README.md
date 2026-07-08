@@ -13,6 +13,7 @@ Full Spark (buildonspark) feature parity on Mercury Layer with a **single statec
 - [Lightning](learn/lightning.md) — preimage swaps on the Mercury latch
 - [Deposits & exits](learn/exits.md) — cooperative vs unilateral, the timelock ladder
 - [Invalidation & granularity](learn/invalidation.md) — Spark/Ark/Second/SuperScalar comparison, terminal nodes, measured exit costs
+- [Partial amounts (granularity)](learn/granularity-deep-dive.md) — paying 0.1 out of 1, token packaging, the floors; normative: [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md), pricing: [research/granularity-economics.md](research/granularity-economics.md)
 
 ## Build
 

@@ -1,5 +1,8 @@
 # Transfers
 
+> How partial amounts work under the hood — splits, invalidation effects, exit costs, floors —
+> is covered end-to-end in the [granularity deep dive](granularity-deep-dive.md).
+
 ## What a transfer is
 
 Mercury transfers move **whole coins** by key handover (like Spark moves whole leaves):
