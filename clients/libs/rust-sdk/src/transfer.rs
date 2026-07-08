@@ -54,7 +54,10 @@ impl SparkWallet {
             })
             .collect();
 
-        let plan = select::plan(&candidates, amount_sats);
+        // Plan with the backup-fee floor so any proposed split's piece and change can each fund
+        // their own backup (not merely clear dust) — the split executor enforces the same floor.
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        let plan = select::plan_with_floor(&candidates, amount_sats, min_output);
         let (mut to_send, used_split): (Vec<String>, bool) = match plan {
             Plan::Insufficient { available } => {
                 return Err(SdkError::InsufficientBalance {
@@ -145,7 +148,18 @@ impl SparkWallet {
         let record = self.record().await?;
         let carriers = self.token_carrier_outpoints().await?;
 
-        // Parent: a confirmed, non-token-carrier coin large enough for all pieces + fee reserve.
+        // Every piece and the change must clear the backup-fee floor (dust + each sub-coin's own
+        // backup fee) so no output is a stranded coin. Reject up-front — before any parent is made
+        // terminal — so a doomed batch never pins a carrier's spend budget.
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
+            return Err(anyhow!(
+                "recipient amount {amt} is below the minimum viable piece {min_output} (dust floor + backup fee) — it could not fund its own backup"
+            ));
+        }
+
+        // Parent: a confirmed, non-token-carrier coin large enough for all pieces + fee reserve AND
+        // a change output that itself clears the backup-fee floor.
         let carrier = record
             .coins
             .iter()
@@ -153,11 +167,11 @@ impl SparkWallet {
             .filter(|c| !is_token_carrier(c, &carriers))
             .filter(|c| {
                 let a = c.amount.unwrap_or_default() as u64;
-                a > total + split_fee_reserve(a)
+                a > total + split_fee_reserve(a) + min_output
             })
             .min_by_key(|c| c.amount.unwrap_or_default())
             .cloned()
-            .ok_or_else(|| anyhow!("no confirmed coin large enough for {total} sats + fee"))?;
+            .ok_or_else(|| anyhow!("no confirmed coin large enough for {total} sats + fee + non-dust change"))?;
         let carrier_id = carrier.statechain_id.clone().unwrap();
         let parent_sats = carrier.amount.unwrap_or_default() as u64;
         let fee_reserve = split_fee_reserve(parent_sats);
@@ -305,9 +319,15 @@ impl SparkWallet {
             ));
         }
         let parent_sats = parent.amount.unwrap_or_default() as u64;
-        // Pure admission guard (fee-reserve fit + dust floor on both outputs) — shared with the
-        // invalidation model tests. Rejects BEFORE touching the parent.
-        let (change_sats, _fee_reserve) = split_amounts(parent_sats, piece_sats)?;
+        // Admission guard (fee-reserve fit + backup-fee floor on both outputs) — rejects BEFORE
+        // touching the parent. The floor is the dust limit PLUS each sub-coin's own backup fee at
+        // the rate create_tx1 will use: a piece in [330, 330+backup_fee) would be a valid split
+        // output whose backup is FeeTooLow, and admitting it here (then making the parent terminal)
+        // would strand the parent to unilateral-exit-only. Guarding up-front keeps the parent
+        // spendable on refusal.
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        let (change_sats, _fee_reserve) =
+            split_amounts_floored(parent_sats, piece_sats, min_output)?;
 
         // Two fresh statechain slots owned by this wallet (SE handshake only — no on-chain tx).
         // Normal coins: sub-coin security is Mercury's decrementing-locktime scheme, with the
@@ -604,12 +624,33 @@ pub(crate) fn split_fee_reserve(parent_sats: u64) -> u64 {
 /// (`select::plan`) and the invalidation model tests.
 pub(crate) const DUST_LIMIT: u64 = 330;
 
-/// The split executor's pure admission guard: fee reserve + fit + dust floor for splitting
-/// `piece_sats` out of a `parent_sats` coin. Returns `(change_sats, fee_reserve)` when the split
-/// is admissible. Called by [`SparkWallet::split_coin`] before touching the parent, and by the
-/// invalidation model (`invalidation_model.rs::split_size_floor`) as the executable boundary
-/// spec — change the guard here and that test fails until its documentation is updated too.
-pub(crate) fn split_amounts(parent_sats: u64, piece_sats: u64) -> Result<(u64, u64)> {
+/// Measured vsize of a sub-coin's own backup tx (1-in-1-out P2TR keyspend). The backup sweeps
+/// `sub_coin_sats − ceil(BACKUP_TX_VBYTES · fee_rate)`, which must itself clear the dust floor.
+pub(crate) const BACKUP_TX_VBYTES: u64 = 112;
+
+/// The minimum VIABLE value for a split sub-coin output at backup feerate `fee_rate_sats_per_byte`:
+/// the P2TR dust floor PLUS the fee the sub-coin's own backup tx must pay. A split output below
+/// this is a valid tx output but a coin that can never be exited — its backup would sweep below
+/// dust (`create_tx1` → `MercuryError::FeeTooLow`, lib/src/transaction.rs). Admitting it and then
+/// consuming the parent (spend budget → terminal) strands the parent to unilateral-exit-only.
+/// `fee_rate_sats_per_byte` MUST be the rate `create_tx1` uses = `min(SE quote, max_fee_rate)`.
+pub(crate) fn min_split_output(fee_rate_sats_per_byte: f64) -> u64 {
+    DUST_LIMIT + (BACKUP_TX_VBYTES as f64 * fee_rate_sats_per_byte).ceil() as u64
+}
+
+/// The backup feerate `create_tx1` will use for this wallet's sub-coins: `min(SE quote, max)`.
+pub(crate) async fn backup_fee_rate(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<f64> {
+    let info = mercuryrustlib::utils::info_config(cc).await?;
+    Ok(info.fee_rate_sats_per_byte.min(cc.max_fee_rate))
+}
+
+/// The split executor's pure admission guard with an explicit per-output floor: fee reserve + fit
+/// + `min_output` on both sub-coins. Returns `(change_sats, fee_reserve)` when admissible.
+pub(crate) fn split_amounts_floored(
+    parent_sats: u64,
+    piece_sats: u64,
+    min_output: u64,
+) -> Result<(u64, u64)> {
     // Reserve a miner-fee margin for the (only-on-exit) broadcast of the split tx.
     let fee_reserve = split_fee_reserve(parent_sats);
     if piece_sats + fee_reserve >= parent_sats {
@@ -618,13 +659,23 @@ pub(crate) fn split_amounts(parent_sats: u64, piece_sats: u64) -> Result<(u64, u
         ));
     }
     let change_sats = parent_sats - piece_sats - fee_reserve;
-    // Dust floor (audit [9]): both sub-coin funding outputs must be standard/relayable.
-    if piece_sats < DUST_LIMIT || change_sats < DUST_LIMIT {
+    // Both sub-coin funding outputs must clear `min_output`: the dust floor (audit [9]) plus, when
+    // the caller passes the backup-fee floor (`min_split_output`), enough to fund each sub-coin's
+    // own backup so neither is stranded (audit: backup-fee floor / GRN-INV-1b).
+    if piece_sats < min_output || change_sats < min_output {
         return Err(anyhow!(
-            "split would create a sub-dust output (piece {piece_sats}, change {change_sats}, dust floor {DUST_LIMIT}) — the split tx would be unbroadcastable"
+            "split would create an unviable output (piece {piece_sats}, change {change_sats}, minimum {min_output}) — each sub-coin must clear the {DUST_LIMIT}-sat dust floor AND fund its own backup; the split tx or a sub-coin backup would be unbroadcastable"
         ));
     }
     Ok((change_sats, fee_reserve))
+}
+
+/// The split executor's pure admission guard at the bare dust floor (fee reserve + fit + 330 on
+/// both outputs). This is the DUST-only check; callers on the live signing path use
+/// [`split_amounts_floored`] with [`min_split_output`] so a sub-coin can also fund its own backup.
+/// Called by the invalidation/granularity model tests as the executable dust-boundary spec.
+pub(crate) fn split_amounts(parent_sats: u64, piece_sats: u64) -> Result<(u64, u64)> {
+    split_amounts_floored(parent_sats, piece_sats, DUST_LIMIT)
 }
 
 #[cfg(test)]

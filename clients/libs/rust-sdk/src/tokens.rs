@@ -490,6 +490,19 @@ impl SparkWallet {
         let change_sats = carrier_sats - TOKEN_PIECE_SATS - fee_reserve;
         let token_change = carrier_amount - token_amount;
 
+        // Backup-fee floor: the 1_500-sat piece and the change must each fund their own backup at
+        // the live feerate, else create_tx1 rejects the backup as FeeTooLow AFTER the carrier is
+        // made terminal — stranding it. Refuse up-front (carrier untouched). At feerates above
+        // ~10 sat/vB the fixed 1_500-sat packaging itself falls below the floor, so a token
+        // transfer is correctly refused rather than stranding the carrier.
+        let min_output =
+            crate::transfer::min_split_output(crate::transfer::backup_fee_rate(&self.inner.cc).await?);
+        if TOKEN_PIECE_SATS < min_output || change_sats < min_output {
+            return Err(anyhow!(
+                "token split output below the minimum viable size {min_output} at the current feerate (piece {TOKEN_PIECE_SATS} sats, change {change_sats} sats) — a sub-coin could not fund its own backup"
+            ));
+        }
+
         // Fresh slots for piece and change.
         let token_a = self.take_token().await?;
         let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
@@ -728,6 +741,16 @@ impl SparkWallet {
         }
         let change_sats = carrier_sats - pieces_sats - fee_reserve;
         let token_change = carrier_amount - total;
+
+        // Backup-fee floor on every piece (each 1_500 sats) and the change — reject before the
+        // carrier is made terminal so a doomed batch never strands it (see the single-transfer note).
+        let min_output =
+            crate::transfer::min_split_output(crate::transfer::backup_fee_rate(&self.inner.cc).await?);
+        if TOKEN_PIECE_SATS < min_output || change_sats < min_output {
+            return Err(anyhow!(
+                "batch token split output below the minimum viable size {min_output} at the current feerate (piece {TOKEN_PIECE_SATS} sats, change {change_sats} sats) — a sub-coin could not fund its own backup"
+            ));
+        }
 
         // One fresh slot per recipient piece + one for change; build the N+1 colored split.
         let mut splits: Vec<(String, u64, u64)> = Vec::with_capacity(n + 1);

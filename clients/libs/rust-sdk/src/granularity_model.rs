@@ -96,42 +96,49 @@ fn split_bounds_exact_boundary() {
     assert!(split_amounts(630, DUST_LIMIT).is_err(), "330 + 300 == 630: no room for change");
 }
 
-// GRN-INV-1b: the 330-sat DUST floor above (what `split_amounts` enforces) is NOT the minimum
-// *mintable* piece. Each sub-coin also needs a valid backup, and `create_tx1` sweeps
-// `piece − ceil(BACKUP_TX_SIZE·fee_rate)` and rejects it below the dust floor (FeeTooLow,
-// lib/src/transaction.rs:122-132). So the true minimum mintable piece is `330 + ceil(112·rate)`
-// — 442 sats at 1 sat/vB (measured by sdk28: backup_fee=112, min_mintable_piece=442). This test
-// pins that arithmetic and documents the GUARD GAP: `split_amounts` admits the doomed [330, 442)
-// band, which the executor only rejects AFTER making the parent terminal (stranding it). Encoded
-// so that when the guard is fixed to reject the band up-front, the boundary here is the reference.
+// GRN-INV-1b: the 330-sat DUST floor is NOT the minimum *mintable* piece. Each sub-coin also needs
+// a valid backup, and `create_tx1` sweeps `piece − ceil(BACKUP_VB·fee_rate)` and rejects it below
+// the dust floor (FeeTooLow, lib/src/transaction.rs:122-132). So the true minimum mintable piece is
+// `330 + ceil(112·rate)` — 442 sats at 1 sat/vB (measured by sdk28). The signing path enforces this
+// via `split_amounts_floored(parent, piece, min_split_output(fee_rate))` BEFORE the parent is made
+// terminal, so a sub-viable piece is refused with the parent untouched (was: admitted, then the
+// backup failed post-terminal, stranding the parent — bug fixed). The bare `split_amounts` keeps
+// the dust-only floor for the model's dust-boundary tests.
 #[test]
 fn backup_fee_floor_is_the_true_mintable_minimum() {
-    // Minimum mintable piece at a given backup feerate (sat/vB): 330 + ceil(112 * rate).
-    let min_mintable = |rate: f64| DUST_LIMIT + (BACKUP_VB as f64 * rate).ceil() as u64;
-    assert_eq!(min_mintable(1.0), 442, "330 + ceil(112*1) = 442 (sdk28 measured)");
-    assert_eq!(min_mintable(2.0), 554, "330 + 224");
-    assert_eq!(min_mintable(10.0), 1450, "330 + 1120 — the floor climbs with feerate");
+    use crate::transfer::{min_split_output, split_amounts_floored};
+    // The REAL floor helper: 330 + ceil(112 * rate).
+    assert_eq!(min_split_output(1.0), 442, "330 + ceil(112*1) = 442 (sdk28 measured)");
+    assert_eq!(min_split_output(2.0), 554, "330 + 224");
+    assert_eq!(min_split_output(10.0), 1450, "330 + 1120 — the floor climbs with feerate");
 
-    // The GUARD GAP: split_amounts (the pure admission guard) accepts a 330-sat piece out of a
-    // 2_000-sat parent, but that piece is NOT mintable (its 330-sat sub-coin cannot back itself at
-    // 1 sat/vB: 330 - 112 = 218 < 330). The doomed band is [330, 442) at 1 sat/vB. (Parent 2_000
-    // leaves ample change so the dust guard on change never confounds the piece-floor point.)
+    // The bare dust guard still admits a 330 piece (it only checks the split-output dust floor)…
     assert!(
         split_amounts(2_000, DUST_LIMIT).is_ok(),
-        "the pure guard admits a 330 piece (dust floor only) — the backup-fee shortfall is unguarded"
+        "the dust-only guard admits a 330 piece (used by the dust-boundary model tests)"
     );
-    assert!(
-        split_amounts(2_000, min_mintable(1.0)).is_ok(),
-        "a 442-sat piece is both dust-valid AND backup-viable at 1 sat/vB"
-    );
-    // Every piece in the doomed band passes the dust guard but is not mintable.
+    // …but the FEE-AWARE guard the signing path uses REJECTS the whole doomed [330, 442) band,
+    // up-front, so the parent is never made terminal for a piece that cannot back itself.
+    let floor = min_split_output(1.0);
     for piece in [DUST_LIMIT, 400, 441] {
+        assert!(piece < floor);
         assert!(
-            split_amounts(2_000, piece).is_ok(),
-            "piece {piece} passes the dust guard (the gap: not yet rejected for the backup-fee shortfall)"
+            split_amounts_floored(2_000, piece, floor).is_err(),
+            "piece {piece} < 442 must be refused by the backup-fee floor (no stranding)"
         );
-        assert!(piece < min_mintable(1.0), "…yet {piece} < 442, so its backup is FeeTooLow");
     }
+    // At the floor and above, both piece and change are backup-viable → admitted.
+    assert!(
+        split_amounts_floored(2_000, floor, floor).is_ok(),
+        "a 442-sat piece is dust-valid AND backup-viable at 1 sat/vB"
+    );
+    // The floor also binds on CHANGE: a piece leaving change in [330, 442) is refused.
+    // parent 900, piece 442, reserve 300 → change 158 (< floor) → refused; parent 1_184 → change 442.
+    assert!(split_amounts_floored(1_184, floor, floor).is_ok(), "change 442 exactly = floor");
+    assert!(
+        split_amounts_floored(1_100, floor, floor).is_err(),
+        "change 358 (< 442) is refused by the backup-fee floor"
+    );
 }
 
 // GRN conservation: piece + change + reserve == parent for every admitted split — no sat is

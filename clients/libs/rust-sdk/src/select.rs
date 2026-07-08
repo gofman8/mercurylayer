@@ -71,8 +71,18 @@ pub fn exact_subset(coins: &[Candidate], target: u64) -> Option<Vec<usize>> {
     None
 }
 
-/// Plan a payment of `target` sats over the candidate coins.
+/// Plan a payment of `target` sats over the candidate coins, using the bare dust floor as the
+/// per-output minimum. The live signing path uses [`plan_with_floor`] with the backup-fee floor so
+/// the piece it proposes is not just non-dust but also able to fund its own backup.
 pub fn plan(coins: &[Candidate], target: u64) -> Plan {
+    plan_with_floor(coins, target, crate::transfer::DUST_LIMIT)
+}
+
+/// Plan a payment, requiring both the minted piece and its change to be `>= min_output`. Callers
+/// on the signing path pass `crate::transfer::min_split_output(fee_rate)` so a proposed split is
+/// executor-admissible (piece and change each clear the dust floor AND fund their own backup),
+/// never a doomed split that would strand the parent.
+pub fn plan_with_floor(coins: &[Candidate], target: u64, min_output: u64) -> Plan {
     let available: u64 = coins.iter().map(|c| c.amount_sats).sum();
     if available < target {
         return Plan::Insufficient { available };
@@ -97,17 +107,17 @@ pub fn plan(coins: &[Candidate], target: u64) -> Plan {
         }
     }
     // Find the smallest unused coin that can cover the remainder AND leave room for the split's fee
-    // reserve plus a non-dust change (audit [29]). Filtering only on `amount > remaining` would pick
-    // a coin the split path then rejects (piece + fee_reserve >= parent, or a sub-dust change),
-    // failing an otherwise-fundable payment at the small-remainder boundary the split path exists for.
-    use crate::transfer::DUST_LIMIT;
+    // reserve plus a change that clears `min_output` (audit [29] + backup-fee floor). Filtering only
+    // on `amount > remaining` would pick a coin the split path then rejects (piece + fee_reserve >=
+    // parent, or a sub-viable change/piece), failing an otherwise-fundable payment; requiring the
+    // piece itself to clear `min_output` avoids proposing a split whose piece cannot back itself.
     let mut candidates: Vec<&Candidate> = coins
         .iter()
         .filter(|c| {
             !whole.contains(&c.index)
-                && remaining >= DUST_LIMIT
+                && remaining >= min_output
                 && c.amount_sats
-                    > remaining + crate::transfer::split_fee_reserve(c.amount_sats) + DUST_LIMIT
+                    > remaining + crate::transfer::split_fee_reserve(c.amount_sats) + min_output
         })
         .collect();
     candidates.sort_by_key(|c| c.amount_sats);
@@ -117,7 +127,7 @@ pub fn plan(coins: &[Candidate], target: u64) -> Plan {
             split: c.index,
             split_amount: remaining,
         },
-        // Shouldn't happen when available >= target, but keep a safe fallback.
+        // No coin can mint the remainder as a viable piece with non-dust change.
         None => Plan::Insufficient { available },
     }
 }

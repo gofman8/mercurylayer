@@ -5,16 +5,17 @@
 //! (SPEC REQ-21/22, INV-13). Every token send is a COLORED off-chain split: the piece carries
 //! exactly TOKEN_PIECE_SATS = 1_500 sats (packaging) + the exact token amount (payload).
 //!
-//! Each same-asset receive lands in a DISTINCT first-sight wallet (bob/carol/dave/erin): the RGB
-//! accept path re-imports an asset's genesis on every receive, so a wallet receiving the SAME
-//! asset twice currently fails to book the second allocation (UNIQUE constraint on asset.id) — a
-//! known limitation flagged for fix. This test proves granularity without depending on that fix.
+//! DOUBLE-RECEIVE: bob receives PT2 three times (10, 1, then the full remaining 9_985) and his
+//! balance SUMS each time (10 → 11 → 9_996). The RGB accept path is idempotent on an already-known
+//! asset (the genesis is imported only on first sight); a wallet receiving the same asset twice
+//! books both allocations. (This was a bug — every receive re-imported the genesis and hit a
+//! UNIQUE constraint, stranding the second allocation — now fixed in the rgb-lib fork.)
 //!
 //! (a) PRECISION + TINY: alice issues PT2 (precision 2, supply 10_000 raw = "100.00") and sends
-//!     bob 10 raw units ("0.10"), then dave 1 raw unit ("0.01" — the minimum representable amount).
-//!     Each books EXACTLY the consignment-derived amount (bob 10, dave 1); alice's change follows
-//!     raw-unit conservation (9_990 → 9_985 across all part-(a)/(b) sends). The colored split tx
-//!     vsize is measured from the branch row (plain split reference: 155 vB; the colored tx adds
+//!     bob 10 raw units ("0.10"), then 1 raw unit ("0.01" — the minimum representable amount).
+//!     bob books EXACTLY the consignment-derived amounts (10, then a summed 11); alice's change
+//!     follows raw-unit conservation (9_990 → 9_985 across all part-(a)/(b) sends). The colored
+//!     split tx vsize is measured from the branch row (plain split reference: 155 vB; the colored tx adds
 //!     one OP_RETURN opret output).
 //! (b) TOKEN EXIT AT DEPTH 2: carol receives 4 raw units on a DEPTH-2 sub-coin (a colored
 //!     re-split of alice's depth-1 change carrier; bob's received 1_500-sat piece CANNOT re-split
@@ -186,17 +187,14 @@ pub async fn execute() -> Result<()> {
     let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_alice"), None).await?;
     let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_bob"), None).await?;
     let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_carol"), None).await?;
-    // Distinct receivers per same-asset receive: the RGB accept path re-imports an asset's genesis
-    // on EVERY receive, so a wallet receiving the SAME asset twice currently fails to book the
-    // second allocation (UNIQUE constraint on asset.id — a known limitation, flagged for fix; see
-    // the RGB double-receive task). Each receive below therefore lands in a wallet seeing that
-    // asset for the FIRST time, so this test exercises granularity without depending on the fix.
+    // bob deliberately receives PT2 MULTIPLE times (10, then 1, then the full remaining 9_985) to
+    // prove the double-receive fix: the RGB accept path is now idempotent on an already-known asset
+    // (was: re-importing the genesis on every receive hit a UNIQUE constraint and stranded the
+    // second allocation). dave first-sees a DIFFERENT asset (QTK) in part (d).
     let (dave, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_dave"), None).await?;
-    let (erin, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_erin"), None).await?;
     let bob_addr = bob.get_spark_address().await?;
     let carol_addr = carol.get_spark_address().await?;
     let dave_addr = dave.get_spark_address().await?;
-    let erin_addr = erin.get_spark_address().await?;
 
     // Fund alice's RGB engine (issuance + IFA + mint witness txs are the ISSUER's on-chain cost).
     let rgb_fund = alice.get_token_funding_address().await?;
@@ -294,15 +292,16 @@ pub async fn execute() -> Result<()> {
     assert_eq!(est.branch_txs, 2, "carol's token piece is a DEPTH-2 sub-coin");
     println!("SDK29 - carol received 4 raw units on a depth-2 coin (2-tx colored branch)");
 
-    // ===== (a) continued — the 1-raw-unit minimum ("0.01") ======================================
-    // To dave (a FIRST-sight receiver of PT2 — see the distinct-receiver note above).
+    // ===== (a) continued — the 1-raw-unit minimum ("0.01"), and DOUBLE-RECEIVE ==================
+    // Second PT2 receive to bob (who already holds 10): the accept path is idempotent, so bob's
+    // balance SUMS (10 → 11) instead of stranding the second allocation.
     add_tokens(&cc, &alice, 2).await?;
-    let r3 = alice.transfer_tokens(&asset_p2, &dave_addr, 1).await?;
+    let r3 = alice.transfer_tokens(&asset_p2, &bob_addr, 1).await?;
     assert_eq!(r3.coins.len(), 1, "a 1-raw-unit send still mints one full 1_500-sat piece");
-    wait_token_balance(&dave, &asset_p2, 1).await?;
-    assert_eq!(token_balance(&dave, &asset_p2).await?, 1, "the 1-raw-unit send booked exactly 1");
+    wait_token_balance(&bob, &asset_p2, 11).await?;
+    assert_eq!(token_balance(&bob, &asset_p2).await?, 11, "second receive SUMS: 10 + 1 = 11");
     assert_eq!(token_balance(&alice, &asset_p2).await?, 9_985);
-    println!("SDK29 - TINY: 1 raw unit (\"0.01\", the minimum) sent and booked exactly");
+    println!("SDK29 - TINY + DOUBLE-RECEIVE: 1 raw unit booked exactly; bob's 2nd PT2 receipt summed to 11");
 
     // ===== (c) SPENT-CARRIER CHANGE: full-allocation send frees the change as PLAIN BTC =========
     // alice's current carrier: change of the 1-raw-unit split — 4_600 sats, 9_985 raw, depth 3.
@@ -325,12 +324,13 @@ pub async fn execute() -> Result<()> {
         "all of alice's sats ride the carrier — none spendable as BTC"
     );
 
-    // Send the ENTIRE remaining allocation to erin (a FIRST-sight PT2 receiver): token_change == 0
-    // → alice's change sub-coin is PLAIN.
+    // Send the ENTIRE remaining allocation to bob (his THIRD PT2 receipt — proves repeated
+    // double-receive): token_change == 0 → alice's change sub-coin is PLAIN; bob sums to 9_996.
     add_tokens(&cc, &alice, 2).await?;
-    let r4 = alice.transfer_tokens(&asset_p2, &erin_addr, 9_985).await?;
+    let r4 = alice.transfer_tokens(&asset_p2, &bob_addr, 9_985).await?;
     assert_eq!(r4.coins.len(), 1, "a full-allocation send is still one piece (+ plain change)");
-    wait_token_balance(&erin, &asset_p2, 9_985).await?;
+    wait_token_balance(&bob, &asset_p2, 9_996).await?;
+    assert_eq!(token_balance(&bob, &asset_p2).await?, 9_996, "third receive SUMS: 11 + 9_985");
     assert_eq!(token_balance(&alice, &asset_p2).await?, 0, "alice's PT2 allocation fully spent");
 
     // The change (4_600 − 1_500 − 300 = 2_800 sats) is now an ordinary BTC sub-coin: it shows up
@@ -558,9 +558,8 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK29 - ONE-CARRIER LIMIT (demonstrated): {msg}");
 
-    // Carrier-sized amounts DO work: 60 (full carrier A) + 40 (from carrier B) as two transfers.
-    // bob first-sees QTK on the 60 (fine even though he holds PT2 — different asset); the 40 goes
-    // to dave (first-sight QTK) to avoid the same-asset double-receive limitation.
+    // Carrier-sized amounts DO work: 60 (full carrier A) to bob + 40 (from carrier B) to dave, as
+    // two transfers (the one-carrier limit means 100 in one shot is impossible; two pieces do it).
     add_tokens(&cc, &alice, 2).await?;
     let r5 = alice.transfer_tokens(&asset_q, &bob_addr, 60).await?;
     assert_eq!(r5.coins.len(), 1);
@@ -574,7 +573,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK29 - split payment 60 + 40 succeeded (two transfers, one per carrier)");
 
     println!(
-        "SDK29 - SUCCESS: token granularity is exact to 1 RAW unit (precision is metadata only; 0.10 and 0.01 booked exactly), a depth-2 token piece exits by broadcasting its colored branch (witnesses + opret anchors confirm; 4 units settled on-chain on the exited outpoint, independently validated against the indexer; the uncolored backup is deliberately NOT landed — it would destroy the allocation), a fully-spent carrier's change becomes ordinary splittable BTC, and one-carrier-per-transfer is the enforced limitation (typed error; 60+40 works, 100 does not; combine not shipped in the SDK)."
+        "SDK29 - SUCCESS: token granularity is exact to 1 RAW unit (precision is metadata only; 0.10 and 0.01 booked exactly), a wallet can receive the SAME asset repeatedly and its balance SUMS (bob 10 → 11 → 9_996 — double-receive fixed), a depth-2 token piece exits by broadcasting its colored branch (witnesses + opret anchors confirm; 4 units settled on-chain on the exited outpoint, independently validated against the indexer; the uncolored backup is deliberately NOT landed — it would destroy the allocation), a fully-spent carrier's change becomes ordinary splittable BTC, and one-carrier-per-transfer is the enforced limitation (typed error; 60+40 works, 100 does not; combine not shipped in the SDK)."
     );
     Ok(())
 }

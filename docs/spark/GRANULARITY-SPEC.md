@@ -144,15 +144,17 @@ un-broadcast tx (transfer.rs:287-381).
   `sub_coin_sats − ceil(BACKUP_TX_SIZE·fee_rate)` and rejects it below the dust floor
   (`MercuryError::FeeTooLow`, lib/src/transaction.rs:122-132; `BACKUP_TX_SIZE = 112` vB,
   `fee_rate = min(SE-quoted, client max_fee_rate)`). So the minimum **mintable** piece (and change)
-  is `330 + ceil(112·fee_rate)` — **442 sats at 1 sat/vB** (measured, sdk28:
-  `backup_fee=112 min_mintable_piece=442`), rising with feerate. A 330-sat piece is a valid split
-  output whose *backup* is un-broadcastable, so it cannot be minted into a usable coin. **Guard
-  gap (known limitation, flagged for fix):** `split_amounts` (and the planner filter) enforce only
-  the 330 floor, not the backup-fee floor, so a piece in `[330, 330 + ceil(112·fee_rate))` passes
-  admission, the parent is made terminal (GRN-REQ-7) and the split co-signed, and only *then* does
-  the piece backup fail — stranding the parent to unilateral-exit-only (degradation class of the
-  audit [15] brick; no theft, funds recoverable via the parent's own backup). The fix raises the
-  admission floor to `330 + backup_fee` on every split path, checked before the terminal-guard.
+  is `min_split_output(fee_rate) = 330 + ceil(112·fee_rate)` — **442 sats at 1 sat/vB** (measured,
+  sdk28: `backup_fee=112 min_mintable_piece=442`), rising with feerate. A 330-sat piece is a valid
+  split output whose *backup* is un-broadcastable, so it cannot be minted into a usable coin.
+  **Enforced (FIXED):** every split path validates both outputs against `min_split_output(fee_rate)`
+  *before* the parent is made terminal — `split_coin` and `transfer_many` via `split_amounts_floored`
+  (transfer.rs), the colored `transfer_tokens`/`batch_transfer_tokens` paths (tokens.rs), and the
+  planner via `select::plan_with_floor`. A piece in `[330, min_split_output)` is refused with the
+  parent untouched. Previously the guard checked only the 330 dust floor, so such a piece passed
+  admission, the parent was made terminal, and only *then* did the backup fail (`FeeTooLow`) —
+  stranding the parent to unilateral-exit-only (degradation class of the audit [15] brick; no
+  theft). The bare-dust `split_amounts` remains only for the model's dust-boundary tests.
 - **GRN-INV-2 (resolution domain)** For a given parent, every
   `piece ∈ [330, parent − fee_reserve − 330]` is admissible, at 1-sat steps (SPEC INV-22).
 - **GRN-INV-3 (tx shape)** A plain split tx has locktime 0 (IVL-INV-5 = SPEC INV-4), exactly one
@@ -166,16 +168,12 @@ un-broadcast tx (transfer.rs:287-381).
 - **GRN-REQ-8 (transfer_many — refines SPEC REQ-27)** `transfer_many(recipients)` MUST carve all
   N recipient pieces plus one change in ONE split tx (N+1 outputs, no OP_RETURN, so vout i = i;
   transfer.rs:133-247). Parent selection: the **smallest** confirmed, non-carrier coin with
-  `amount > total + fee_reserve(amount)` (transfer.rs:149-160);
-  `change = parent − Σ amounts − fee_reserve`. *Note (sharp edge):* unlike `transfer`, this
-  parent filter does not add the +330 change margin and the SDK does not pre-check per-piece
-  dust; a sub-330 piece or change is only caught by the lib floor (GRN-ERR-5) *after* the
-  terminal-guard, leaving the parent pinned to exactly one remaining co-signature (recoverable —
-  the budget admits precisely the one structural co-sign a corrected retry needs; monotonicity
-  per IVL-INV-7). This late-dust edge is currently **spec-only**: `sdk28`'s boundary part
-  exercises the single-coin `transfer` refusal and the 330-sat minimum piece (not
-  `transfer_many`), and `granularity_model.rs` pins `split_amounts`/`plan`, which this filter
-  bypasses — a dedicated `transfer_many` boundary probe remains a test gap.
+  `amount > total + fee_reserve(amount) + min_split_output(fee_rate)` (so the change itself clears
+  the backup-fee floor); `change = parent − Σ amounts − fee_reserve`. **Up-front guard (FIXED):**
+  before the parent is made terminal, `transfer_many` rejects any recipient amount below
+  `min_split_output(fee_rate)`, and the parent filter guarantees a backup-viable change — so a
+  boundary-violating batch is refused with the parent untouched, no longer pinning its spend
+  budget after the terminal-guard.
 - **GRN-REQ-9 (ensure_exact_coin)** `ensure_exact_coin(sats)` MUST reuse an existing confirmed
   non-carrier coin of exactly `sats` if one exists, else split the smallest sufficient coin
   (same filter as GRN-REQ-8) to mint it (transfer.rs:249-281). This is the amount-maker behind
@@ -211,14 +209,15 @@ un-broadcast tx (transfer.rs:287-381).
   `token_change > 0` the change output is colored with it and registered as the residual carrier;
   when `token_change = 0` the change output is uncolored and the change coin is **plain BTC**
   (tokens.rs:578-593; §6).
-- **GRN-INV-6 (minimum carrier)** Derivation: `1500 (piece) + fee_reserve (>= 300) +
-  change (>= 330)` ⇒ the minimum carrier for a token send is **2130 sats**. Layering: the SDK
-  guard only rejects `1500 + fee_reserve >= carrier_sats` (tokens.rs:485-489, GRN-ERR-9), i.e.
-  admits carriers ≥ 1801; carriers in [1801, 2129] then fail the lib dust floor on change
-  (GRN-ERR-5) — *after* the terminal-guard, with the same recoverable one-co-sign pinning as
-  GRN-REQ-8's note. Batch: min carrier = `1500·N + reserve + 330`, layered the same way — the
-  SDK guard rejects only `1500·N + fee_reserve >= carrier_sats` (tokens.rs:723-728); the +330
-  change floor is again the lib backstop (GRN-ERR-5), reached after the terminal-guard.
+- **GRN-INV-6 (minimum carrier)** Dust-only derivation: `1500 (piece) + fee_reserve (>= 300) +
+  change (>= 330)` ⇒ **2130 sats**. With the backup-fee floor now enforced on the colored path
+  (change and the 1500-sat piece must each clear `min_split_output(fee_rate)`), the **live minimum
+  carrier is `1500 + fee_reserve + min_split_output(fee_rate)` = 2242 sats at 1 sat/vB**, refused
+  UP-FRONT before the terminal-guard (tokens.rs, after the fit guard). The old layering — SDK fit
+  guard admits ≥ 1801, then [1801, 2129] fail the lib dust floor on change *after* the terminal
+  guard — no longer applies: the backup-fee check now rejects the whole `[1801, 2242)` band before
+  the carrier is made terminal, so no carrier is pinned. Batch: min carrier =
+  `1500·N + reserve + min_split_output(fee_rate)`, guarded the same way (tokens.rs).
 - **GRN-INV-7 (colored tx shape — refines SPEC INV-11)** rgb-lib inserts exactly ONE OP_RETURN
   (the opret commitment); the sub-coin vouts MUST be recomputed from the colored tx by filtering
   non-OP_RETURN outputs in order, and their count MUST equal the split-entry count
@@ -458,20 +457,17 @@ None of these may be omitted when citing this spec.
     some fundable targets are refused, and the planner is one sat stricter than the executor at
     every boundary (GRN-REQ-5 note; economics §2). Multi-coin plans are handed over sequentially,
     not atomically (GRN-REQ-4 note; SPEC §14).
-13. **Backup-fee floor is unguarded — a sub-viable piece strands its parent (GRN-INV-1b).** The
-    split admission checks only the 330-sat dust floor, not that each sub-coin can fund its own
-    backup (`330 + ceil(112·fee_rate)` ≈ 442 sats at 1 sat/vB). A piece in `[330, 442)` passes
-    admission, the parent is made terminal, the split is co-signed, and only then does the piece
-    backup fail (`FeeTooLow`) — stranding the parent to unilateral-exit-only (no theft; funds
-    recoverable via the parent's own backup). Reachable via `transfer` for small payments. Fix:
-    raise the admission floor to `330 + backup_fee` on every split path, before the terminal-guard.
-    Measured by sdk28 (min mintable = 442); flagged for fix.
-14. **A wallet cannot receive the SAME asset twice.** `accept_incoming_tokens` re-imports the
-    asset genesis on every receive (tokens.rs:956-960 → `import_asset_offchain` →
-    `save_new_asset`), so a wallet that already holds asset `X` fails to book a second, separate
-    allocation of `X` (`UNIQUE constraint failed: asset.id`), and the retriable-booking path
-    (wallet.rs:430-442) retries this PERMANENT error every claim, spinning the watcher. "Receive
-    the same token twice" is a normal flow. Fix: make `save_new_asset` idempotent on an
-    already-known asset (skip the metadata insert; the runtime contract import + allocation
-    registration still run) and classify the constraint error as terminal. Until fixed, each
-    receiver must be first-sight per asset (sdk29 routes each receive to a distinct wallet).
+13. **Backup-fee floor (GRN-INV-1b) — FIXED.** The split admission now requires each sub-coin
+    output to clear `330 + ceil(112·fee_rate)` (`min_split_output`, ≈ 442 sats at 1 sat/vB), not
+    just the 330-sat dust floor, on every split path (`split_coin`, `transfer_many`, colored
+    `transfer_tokens`/`batch_transfer_tokens`, and `select::plan_with_floor`), checked BEFORE the
+    parent is made terminal. A sub-viable piece is refused with the parent untouched — previously
+    it was admitted, made the parent terminal, then failed at backup creation (`FeeTooLow`),
+    stranding the parent to unilateral-exit-only. Verified by sdk28 (330 refused cleanly, true
+    minimum mintable piece = 442) and `unit::granularity_model::backup_fee_floor_is_the_true_mintable_minimum`.
+14. **Same-asset double-receive — FIXED.** A wallet can now receive a second, separate allocation
+    of an asset it already holds. `save_new_asset` (rgb-lib fork, offline.rs:1710) is idempotent on
+    an already-known asset: it skips the duplicate asset-metadata insert (which previously hit
+    `UNIQUE constraint failed: asset.id` and stranded the second allocation) while the runtime
+    contract import (new transitions) and the allocation registration still run. Verified by sdk29
+    (bob receives PT2 three times: 10 → 11 → 9,996, balance sums each time).

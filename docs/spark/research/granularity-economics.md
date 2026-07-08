@@ -29,7 +29,7 @@ prices (all verified in code):
 | Min **mintable** piece (backup-fee floor) | **`330 + ceil(112·fee_rate)` = 442 sats @1 sat/vB** (measured, sdk28) | `lib/src/transaction.rs:122-132` (GRN-INV-1b) — the piece's own backup must sweep above dust |
 | Fee reserve per split | `clamp(parent/100, 300, 2000)` sats | `transfer.rs:596-599` |
 | Token piece packaging | **`TOKEN_PIECE_SATS` = 1,500 sats** | `clients/libs/rust-sdk/src/tokens.rs:23` (GRN-REQ-11) |
-| Min token carrier | **2,130 sats** (1,500 + 300 + 330 — two-guard nuance in §3) | `tokens.rs:483-488` + `lib/src/transaction.rs:357-360` (GRN-INV-6) |
+| Min token carrier | **~2,242 sats** at 1 sat/vB (1,500 + 300 + 442 backup-fee floor; dust-only derivation is 2,130 — see §3/§8) | `tokens.rs` colored-split floor + `lib/src/transaction.rs` (GRN-INV-6) |
 | Extra split output | **+43 vB** each (*model*, exactly consistent with the measured 241 = 155 + 2·43) | P2TR output weight; sdk26 |
 | Colored split OP_RETURN | **+43 vB** (measured, sdk29: colored split = 198 vB vs plain 155) | one opret per colored tx, `clients/libs/rust/src/rgb.rs:246-271` |
 | Coin amount cap | u32 ⇒ **4,294,967,295 sats ≈ 42.9 BTC** | [SPEC.md §14](../SPEC.md#14-known-limitations-adversarial-review); split path errors via `u32::try_from` (`transfer.rs:320,328`) |
@@ -87,10 +87,11 @@ exactly** (GRN-INV-1; pinned by the unit boundary matrix
 the sub-coin's own backup tx (112 vB) must sweep `330 − ceil(112·fee_rate)`, which is below dust —
 so `create_tx1` rejects it (`FeeTooLow`, GRN-INV-1b). The true minimum mintable piece (and change)
 is `330 + ceil(112·fee_rate)` = **442 sats at 1 sat/vB** (measured, sdk28), scaling with feerate.
-The tables below label the low end "330 (dust floor)" for the executor's admission math, but the
-smallest piece that yields a *usable* coin is 442+; targets in `[330, 442)` currently pass the
-planner and executor guards yet strand the parent at backup-creation time (a guard gap flagged for
-fix — GRN-INV-1b). Read the "330" rows as "442 at 1 sat/vB" for real payability.
+The tables below label the low end "330 (dust floor)" for the executor's bare admission math, but
+the smallest piece that yields a *usable* coin is 442+ at 1 sat/vB. The planner
+(`plan_with_floor`) and every split path now enforce `min_split_output(fee_rate)` up-front (GRN-INV-1b,
+fixed), so targets in `[330, 442)` are refused cleanly with the coin untouched — never stranded.
+Read the "330" rows as "442 at 1 sat/vB" for real payability.
 
 Given a wallet's coin set, `transfer(address, t)` resolves per `select::plan`
 (`select.rs:75-122`):
@@ -130,7 +131,7 @@ bands below; everything else is payable):
 | Target | Outcome | Path / reason |
 |---|---|---|
 | 329 | REFUSED | sub-dust residue, no exact subset |
-| 330–441 | planner-admitted but **not mintable** | passes the dust guard, but the piece's backup is FeeTooLow (< 442 at 1 sat/vB, GRN-INV-1b) — currently strands the parent (guard gap, flagged for fix) |
+| 330–441 | REFUSED (below the mintable floor) | clears the 330 dust floor but not the backup-fee floor (442 at 1 sat/vB, GRN-INV-1b) — the piece could not fund its own backup; refused up-front, coin untouched |
 | 442 | payable | split 1,200 → piece 442, change 458 (the true minimum mintable piece at 1 sat/vB) |
 | 1,200 / 21,200 / 71,200 | payable, zero premium | exact subsets |
 | 1,201–1,529 | REFUSED (greedy shadow) | greedy takes 1,200 whole, strands a 1–329-sat residue — though splitting 50,000 directly for the same piece is executor-admissible |
@@ -389,18 +390,19 @@ reserve `clamp(·/100, 300, 2000)`):
 - **Received token pieces are terminal at the SDK layer** (1,500 < 2,130, §3): hold or exit; no
   re-send. Whether this is intended scope or a gap to close alongside combine is an open design
   question; it is a *derived* consequence of the fixed packaging, not a documented decision.
-- **A wallet cannot receive the same asset twice** (GRN-INV limitation 14). The accept path
-  re-imports the asset genesis on every receive, so a second separate allocation of an already-held
-  asset fails to book (`UNIQUE constraint failed: asset.id`), and the retriable-booking watcher
-  spins on the permanent error. This compounds the fragmentation economics above: the "pay 60 + 40"
-  workaround for the one-carrier limit only works if the two pieces land at *different* first-sight
-  receivers. A merchant taking repeated payments in one asset is blocked until the accept path is
-  made idempotent (flagged for fix). No value is lost — the consignment persists in the backup rows.
-- **The minimum *mintable* piece is 442 sats (at 1 sat/vB), not 330** (GRN-INV-1b, §2). The split
-  guard checks only the 330-sat dust floor, not the sub-coin's backup-fee floor
-  (`330 + ceil(112·fee_rate)`), so a piece in `[330, 442)` is admitted, the parent made terminal,
-  and the backup then fails — stranding the parent to unilateral-exit-only. Reachable via `transfer`
-  for small payments; flagged for fix (raise the admission floor before the terminal-guard).
+- **A wallet CAN now receive the same asset twice (fixed).** The accept path was re-importing the
+  asset genesis on every receive, so a second separate allocation of an already-held asset failed
+  to book (`UNIQUE constraint failed: asset.id`) and the retriable-booking watcher spun on the
+  permanent error. `save_new_asset` is now idempotent on a known asset, so balances sum — the
+  "pay 60 + 40" workaround for the one-carrier limit works at a single receiver, and a merchant
+  can take repeated payments in one asset (verified by sdk29: bob 10 → 11 → 9,996).
+- **The minimum *mintable* piece is 442 sats (at 1 sat/vB), not 330 (fixed floor)** (GRN-INV-1b, §2).
+  The split guard now enforces the backup-fee floor `min_split_output(fee_rate) = 330 + ceil(112·fee_rate)`
+  on every path before the terminal-guard, so a piece in `[330, 442)` is refused cleanly with the
+  parent untouched (previously it was admitted, the parent made terminal, then the backup failed —
+  stranding the parent). This slightly raises the effective minimum token carrier too: change must
+  clear 442, so the live floor is ~2,242 sats at 1 sat/vB (the 2,130 rows below are the dust-only
+  derivation).
 - **Planner conservatism** (§2): greedy whole-coin selection refuses some fundable targets and is
   1 sat stricter than the executor at every boundary. Cheap to fix; currently the honest answer
   to "why did my transfer fail with sufficient balance" may be "ordering".

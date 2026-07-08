@@ -303,28 +303,27 @@ Workarounds today: pay in two transfers (60 + 40 — the receiver gets two piece
 receiver accept two invoices. **Outcome:** typed failure, funds untouched; the one-carrier limit
 is the sharpest known granularity edge (roadmap: SDK combine).
 
-### 5.2b Receiving the same asset twice → currently fails to book
+### 5.2b Receiving the same asset twice → works (balance sums)
 
-A wallet that already holds asset X and receives a *second, separate* allocation of X cannot book
-it: the accept path re-imports X's genesis on every receive, and the RGB stash rejects the
-duplicate (`UNIQUE constraint failed: asset.id`). Worse, the retriable-booking watcher treats this
-permanent error as transient and retries it every claim. This breaks a completely normal flow — a
-merchant taking two payments in the same token, or the "pay 60 + 40" workaround above landing both
-pieces at one receiver. **Workaround today:** each receiver must be first-sight per asset (split
-the 40 to a *different* wallet, or consolidate off-band). **Outcome:** the second receipt is
-stranded (no loss — the consignment survives in the backup rows and books once the accept path is
-made idempotent). Fix flagged; until it lands, treat statechain token receivers as one-asset-once.
-This is why `sdk29` routes every same-asset receive to a distinct wallet.
+A wallet that already holds asset X and receives a *second, separate* allocation of X books it and
+its balance **sums**. The accept path imports X's genesis only on *first sight* (idempotent on an
+already-known asset); the second receive brings in the new transitions and registers the new
+allocation. This is the normal flow behind a merchant taking repeated payments in one token, or
+the "pay 60 + 40" split above landing both pieces at one receiver. **Outcome:** both allocations
+book; balances add up. *This was a bug* — the accept path used to re-import the genesis on every
+receive, hit a `UNIQUE constraint`, and strand the second allocation while the retriable-booking
+watcher spun on the permanent error — now fixed in the rgb-lib fork. Verified by `sdk29` (bob
+receives PT2 three times: 10 → 11 → 9,996).
 
 ### 5.3 Tiny amounts: the floors, and why
 
 | Floor | Value | Why |
 |---|---|---|
 | Split-output dust floor | **330 sats** | P2TR dust: a sub-330 split output makes the branch non-standard/unrelayable — the sub-coins would be stranded with no exit (audit [9]; enforced **sender-side** in the planner, the split guard and the PSBT builder; receiver-side branch validation checks linkage/locktime/conservation/scripts, *not* output standardness — a hostile non-SDK sender could still hand over a stranded branch, a known gap) |
-| Smallest **mintable** BTC piece | **≈ 442 sats** (`330 + backup fee`, at 1 sat/vB) | 330 is only the split-output floor; the piece's own backup (112 vB) must sweep above dust after its fee, so a 330-sat piece fails at backup creation (measured, sdk28: min mintable = 442). **Guard gap:** the current guard checks only 330, so a piece in `[330, 442)` is admitted and the parent made terminal *before* the backup fails — stranding it (flagged for fix; see the split-guard task) |
+| Smallest **mintable** BTC piece | **≈ 442 sats** (`330 + backup fee`, at 1 sat/vB) | 330 is only the split-output floor; the piece's own backup (112 vB) must sweep above dust after its fee, so a 330-sat piece can't back itself (measured, sdk28: min mintable = 442). The split guard enforces `min_split_output(fee_rate) = 330 + ceil(112·fee_rate)` on both outputs *before* the parent is made terminal (fixed), so a `[330, 442)` piece is refused cleanly with the coin untouched — never stranded |
 | Smallest splittable coin | **960 sats** | `330 (piece) + 300 (reserve floor) + 330 (change)`; at exactly 960 the only admissible piece is 330 (change lands exactly on the floor); at 959 every split is refused. The planner is 1 sat stricter: `transfer()` demands a 961-sat coin where a manual `split_coin` accepts 960 ([granularity-economics §2](../research/granularity-economics.md)) |
 | Smallest token send | **1 raw unit** | amounts are u64 units; rgb-lib conserves them exactly; sub-unit resolution does not exist (that is what `precision` display-scaling is for) |
-| Smallest token-capable carrier | **2,130 sats** | `1,500 (piece) + 300 (reserve) + 330 (change)`. The SDK's own guard ("carrier coin too small") fires at ≤ 1,800; carriers of 1,801–2,129 pass it but fail the PSBT builder's dust floor on the change output — the effective floor is 2,130 |
+| Smallest token-capable carrier | **~2,242 sats** (at 1 sat/vB) | `1,500 (piece) + 300 (reserve) + 442 (change, backup-fee floor)`. The fit guard ("carrier coin too small") fires at ≤ 1,800; the backup-fee floor then requires the change to clear ~442, refusing the whole [1,801, 2,242) band up-front (the dust-only derivation gives 2,130; the enforced floor is 2,242 and rises with feerate) |
 | Smallest exit-viable coin | **≈ 442 sats** | the backup output must clear dust after its fee ([economics §5](../research/invalidation-economics.md)) |
 
 Above the ~442-sat mint floor, resolution is exactly **1 sat**: any piece in
@@ -463,17 +462,14 @@ amount, statechain_id}` (raw units), `BalanceUpdate`, plus the exit-side events
 Plain-BTC balance excludes carrier sats entirely (they are packaging, not spendable BTC — and
 the arithmetic fails closed if RGB state is unreadable, audit [23]).
 
-**The sharp edges, honestly:** one carrier per token transfer (§5.2); **a wallet cannot receive
-the same asset twice** — the accept path re-imports the genesis and strands the second receipt
-until made idempotent (§5.2b, flagged for fix); **received token pieces are terminal at the SDK
-layer** — 1,500 sats of packaging is below the 2,130-sat carrier floor, so tokens you receive can
-be held or exited but not re-sent off-chain until combine/top-up ships (§2b; quantified in
-[granularity-economics §3/§8](../research/granularity-economics.md)); **the minimum *mintable*
-piece is ~442 sats, not 330** — a 330–441-sat piece is admitted but strands its parent at backup
-creation (backup-fee floor unguarded, §5.3, flagged for fix); fragmentation with no combine
-(§5.5); the 330/960/2,130-sat floors (§5.3), some checked late enough to pin a parent to one
-remaining co-signature (§5.3 outcome); every token piece carries exactly 1,500 sats of packaging
-whose exit economics are poor in a spike (§4);
+**The sharp edges, honestly:** one carrier per token transfer (§5.2); **received token pieces are
+terminal at the SDK layer** — 1,500 sats of packaging is below the token-carrier floor, so tokens
+you receive can be held or exited but not re-sent off-chain until combine/top-up ships (§2b;
+quantified in [granularity-economics §3/§8](../research/granularity-economics.md)); fragmentation
+with no combine (§5.5); the split-output floors — 330-sat dust, ~442-sat *mintable* piece (backup-
+fee floor, now enforced up-front so it refuses rather than strands, §5.3), ~2,242-sat token-viable
+carrier (§5.3); every token piece carries exactly 1,500 sats of packaging whose exit economics are
+poor in a spike (§4);
 seal blinding is a **fixed constant** in SDK token flows (a design simplification — acceptable
 because the consignment travels owner-encrypted, flagged for randomization once bindings allow);
 the consignment and branch rows are recovery-bundle material, not seed-derivable; and the
@@ -484,10 +480,10 @@ planner conservatism — not "too poor" (§5.4).
 
 **Can I send 1 sat?** Not as a minted piece. Split outputs must clear the 330-sat dust floor, and
 the piece's own backup must sweep above dust after its fee, so the smallest piece you can actually
-mint is `330 + backup_fee` ≈ **442 sats at 1 sat/vB** (measured, sdk28) — `plan()` refuses
-sub-dust remainders outright, and a 330–441-sat piece currently fails at backup creation (a guard
-gap flagged for fix). A pre-existing tiny coin can still move whole. Above ~442, resolution is
-1 sat. See [economics §5](../research/invalidation-economics.md).
+mint is `330 + backup_fee` ≈ **442 sats at 1 sat/vB** (measured, sdk28) — the planner and the split
+guard both enforce this floor up-front, so a 330–441-sat piece is refused cleanly (coin untouched),
+never stranded. A pre-existing tiny coin can still move whole. Above ~442, resolution is 1 sat.
+See [economics §5](../research/invalidation-economics.md).
 
 **Why did my receiver get 3 coins for one payment?** An exact subset of the sender's coins summed
 to your amount, so each was handed over whole (§5.4) — cheaper for everyone than splitting. Sum
