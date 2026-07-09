@@ -519,10 +519,13 @@ impl SparkWallet {
         tokio::spawn(async move {
             loop {
                 let _ = wallet.claim().await;
-                // Proactively re-anchor coins nearing their ladder floor so they are already fresh by
-                // the time the user transfers — this is what keeps auto-refresh invisible (the
-                // in-transfer wait is only a fallback for coins the background loop hasn't caught).
-                if wallet.inner.config.auto_refresh {
+                // OPTIONAL proactive re-anchor: only when the wallet opts into
+                // `background_auto_refresh` (default OFF). We deliberately do NOT re-anchor coins in
+                // the background as a routine — the refresh cost is folded into `transfer()` as a
+                // payment fee (see `quote_transfer` / `auto_refresh_before_spend`), so the user pays
+                // it visibly exactly when a send needs it, not silently in an idle loop. Deadline
+                // safety (below) still runs unconditionally.
+                if wallet.inner.config.auto_refresh && wallet.inner.config.background_auto_refresh {
                     let _ = wallet
                         .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
                         .await;

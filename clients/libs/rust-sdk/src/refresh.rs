@@ -151,9 +151,22 @@ impl SparkWallet {
                 None => backup_fee_rate(&self.inner.cc).await?,
             };
             let fee_sats = (BACKUP_TX_VBYTES as f64 * rate).ceil() as u64;
-            let amount_out = amount.checked_sub(fee_sats).ok_or_else(|| {
-                anyhow!("coin {statechain_id} ({amount} sats) is too small to cover the refresh fee {fee_sats} sats")
-            })?;
+            // B4 terminal case: if the coin can't cover its renewal fee (and leave a non-dust
+            // refreshed output), it is stuck on its own — surface a typed error so callers can
+            // distinguish "combine me to rescue" from a generic failure. It is NOT lost.
+            let amount_out = match amount
+                .checked_sub(fee_sats)
+                .filter(|out| *out >= crate::transfer::DUST_LIMIT)
+            {
+                Some(o) => o,
+                None => {
+                    return Err(anyhow::Error::new(crate::types::SdkError::CoinBelowMaintenanceCost {
+                        statechain_id: statechain_id.to_string(),
+                        amount_sats: amount,
+                        fee_sats,
+                    }))
+                }
+            };
 
             // 3. Fresh deposit aggregate for EXACTLY amount_out (mints a new statechain_id). The
             //    slot is DERIVED from the coin being refreshed — a re-anchor re-houses value the SE
@@ -240,6 +253,13 @@ impl SparkWallet {
         } else {
             std::collections::HashSet::new()
         };
+        // Skip coins that cannot cover their own re-anchor fee (B4 terminal case): re-anchoring them
+        // would fail (fee >= value). They are NOT lost — they stay in the wallet and can be rescued
+        // by COMBINING with another coin (the aggregate covers the fee) — so don't churn on them.
+        let refresh_fee: u64 = {
+            let rate = crate::transfer::backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
+            (BACKUP_TX_VBYTES as f64 * rate).ceil() as u64
+        };
         // Build the due list BEFORE any per-coin lock — `reanchor` takes the wallet lock itself.
         let due: Vec<String> = record
             .coins
@@ -247,6 +267,7 @@ impl SparkWallet {
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
             .filter(|c| !crate::wallet::is_token_carrier(c, &carriers))
             .filter(|c| coin_near_final(c, tip, margin_blocks))
+            .filter(|c| c.amount.unwrap_or_default() as u64 > refresh_fee)
             .filter_map(|c| c.statechain_id.clone())
             .collect();
         drop(record);

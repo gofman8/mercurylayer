@@ -136,6 +136,81 @@ impl SparkWallet {
         })
     }
 
+    /// Preview the all-in cost of sending `amount_sats` (B4 economics): the transfer's own
+    /// split-reserve fee PLUS any on-chain renewal (re-anchor) this send triggers because a coin it
+    /// uses is due for refresh — so the app shows the user ONE fee, like a payment, instead of a
+    /// balance quietly shrinking in the background. `renewal_fee_sats` is 0 until a coin the send
+    /// would use is at the renewal boundary, so the fee only rises when renewal is actually due.
+    /// Stuck coins (value ≤ their renewal fee) are reported separately and excluded from `fundable`.
+    /// Best-effort estimate; `transfer` applies the real charge.
+    pub async fn quote_transfer(&self, amount_sats: u64) -> Result<crate::types::TransferQuote> {
+        use electrum_client::ElectrumApi;
+        let record = self.record().await?;
+        let carriers = self.token_carrier_outpoints().await.unwrap_or_default();
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let margin = self.inner.config.auto_refresh_margin_blocks;
+        let rate = backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
+        let refresh_fee = (BACKUP_TX_VBYTES as f64 * rate).ceil() as u64;
+
+        let spendable: Vec<&Coin> = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !is_token_carrier(c, &carriers))
+            .collect();
+        let amt = |c: &&Coin| c.amount.unwrap_or_default() as u64;
+
+        // A coin whose value is at/below its renewal fee cannot self-refresh (rescue by combining).
+        let stuck_coins: Vec<String> = spendable
+            .iter()
+            .filter(|c| amt(c) <= refresh_fee)
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        let usable: Vec<&&Coin> = spendable.iter().filter(|c| amt(c) > refresh_fee).collect();
+        let usable_total: u64 = usable.iter().map(|c| amt(c)).sum();
+
+        // Renewal is due if any usable coin is within the auto-refresh margin of its ladder floor.
+        let renewal_due = usable
+            .iter()
+            .any(|c| c.locktime.map_or(false, |l| l.saturating_sub(tip) <= margin));
+        let renewal_fee_sats = if renewal_due { refresh_fee } else { 0 };
+
+        // Split-reserve fee applies only when no exact subset exists (a split is needed).
+        let candidates: Vec<Candidate> = usable
+            .iter()
+            .enumerate()
+            .map(|(index, c)| Candidate { index, amount_sats: amt(c) })
+            .collect();
+        let network_fee_sats = match select::plan(&candidates, amount_sats) {
+            Plan::WithSplit { split, .. } => split_fee_reserve(candidates[split].amount_sats),
+            _ => 0,
+        };
+
+        let total_fee_sats = network_fee_sats + renewal_fee_sats;
+        let fundable = usable_total >= amount_sats.saturating_add(total_fee_sats);
+        let note = if !fundable {
+            format!(
+                "not fundable from non-stuck coins: usable {usable_total} < need {}{}",
+                amount_sats.saturating_add(total_fee_sats),
+                if stuck_coins.is_empty() { String::new() } else { format!(" ({} stuck coin(s) — combine to rescue)", stuck_coins.len()) }
+            )
+        } else if renewal_due {
+            "includes a renewal (re-anchor) fee — a coin this send uses is due for refresh".to_string()
+        } else {
+            "no renewal due for this send".to_string()
+        };
+
+        Ok(crate::types::TransferQuote {
+            amount_sats,
+            network_fee_sats,
+            renewal_fee_sats,
+            total_fee_sats,
+            fundable,
+            stuck_coins,
+            note,
+        })
+    }
+
     /// Send sats to MANY recipients in one off-chain split (Spark's multi-receiver transfer): one
     /// SE-co-signed tx carves one piece per recipient (its exact amount) plus this wallet's
     /// change; each piece is handed over. Returns one `TransferResult` per recipient.

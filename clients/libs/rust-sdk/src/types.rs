@@ -75,6 +75,38 @@ pub enum SdkError {
     NoExactAmount { requested_sats: u64 },
     #[error("token support is not configured (set rgb_proxy_url + rgb_data_dir)")]
     TokensNotConfigured,
+    /// Terminal dust case (B4 / refresh economics): a coin's value is at or below its renewal
+    /// (re-anchor) fee, so it cannot pay to keep itself alive and cannot be moved on its own. It is
+    /// not lost — combine it with another coin (the aggregate can cover the fee) — but on its own
+    /// there is nothing to do. The SDK excludes such coins from routine auto-refresh; this error
+    /// surfaces only when a stuck coin is the sole way to fund a payment.
+    #[error("coin {statechain_id} ({amount_sats} sats) cannot cover its {fee_sats}-sat renewal fee — its maintenance cost exceeds its value; combine it with another coin to rescue it")]
+    CoinBelowMaintenanceCost {
+        statechain_id: String,
+        amount_sats: u64,
+        fee_sats: u64,
+    },
+}
+
+/// A cost preview for a send (B4 / refresh economics): the renewal (re-anchor) cost is folded into
+/// the transfer's fee and paid on-demand, like a payment fee — so the app can show the user the
+/// TOTAL up front instead of a coin silently shrinking in the background. `renewal_fee_sats` is the
+/// re-anchor cost this particular send will trigger (0 when no coin it touches is due), so the fee
+/// only rises at the renewal boundary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TransferQuote {
+    pub amount_sats: u64,
+    /// Reserved miner/split fee for the transfer itself.
+    pub network_fee_sats: u64,
+    /// On-chain re-anchor cost this send triggers because a coin it uses is due for renewal (0 = none).
+    pub renewal_fee_sats: u64,
+    /// `network_fee_sats + renewal_fee_sats` — the all-in cost, presented like a payment fee.
+    pub total_fee_sats: u64,
+    /// Whether the wallet can cover `amount_sats + total_fee_sats` from non-stuck coins.
+    pub fundable: bool,
+    /// statechain_ids of coins whose value is below their renewal fee (stuck unless combined).
+    pub stuck_coins: Vec<String>,
+    pub note: String,
 }
 
 /// A spendable/known coin, for the query API (Spark's leaf/UTXO inventory).

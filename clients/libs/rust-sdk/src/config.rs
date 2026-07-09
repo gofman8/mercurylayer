@@ -35,6 +35,13 @@ pub struct SdkConfig {
     /// re-anchors a coin. Must exceed the SE `interval` so a whole-coin handover still validates;
     /// well under `initlock` so refresh triggers only late in the horizon. Default 144 (~1 day).
     pub auto_refresh_margin_blocks: u32,
+    /// Whether the BACKGROUND watcher also runs a routine ladder-margin refresh (re-anchoring idle
+    /// coins with no user action). Default **false**: refresh is folded into `transfer` and paid
+    /// on-demand as part of the payment fee (B4 economics), so a running wallet never silently
+    /// shrinks a balance in the background. Deadline safety for idle wallets is provided by
+    /// `auto_exit` (which force-exits/materializes a coin only when it truly nears its exit-race
+    /// deadline). Enable this only if you want proactive background re-anchoring despite the surprise.
+    pub background_auto_refresh: bool,
     /// Run the `auto_exit_due` watchtower pass from the background watcher: force-exit plain
     /// off-chain sub-coins / MATERIALIZE token carriers approaching their exit-race deadline, so an
     /// idle owner cannot be clawed back by an ancestor's stale backup. On by default. Both actions
@@ -66,6 +73,7 @@ impl SdkConfig {
             poll_interval_secs: 5,
             auto_refresh: true,
             auto_refresh_margin_blocks: 144,
+            background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
         }
@@ -87,6 +95,7 @@ impl SdkConfig {
             poll_interval_secs: 30,
             auto_refresh: true,
             auto_refresh_margin_blocks: 144,
+            background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
         }
