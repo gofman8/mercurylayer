@@ -62,6 +62,7 @@ pub mod sdk31_token_combine;
 pub mod sdk32_token_over_time;
 pub mod sdk33_auto_refresh;
 pub mod sdk34_token_watchtower;
+pub mod sdk35_trust_boundaries;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -263,6 +264,12 @@ async fn main() -> Result<()> {
     // clawback; issued/flat carriers (no branch) are left untouched.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("34") {
         sdk34_token_watchtower::execute().await?;
+        return Ok(());
+    }
+    // Trust boundaries (SDK_E2E=35): keyless watch-bundle watchtower (custody-free delegation,
+    // multiple towers idempotent, clawback defeated) + receiver rejects a floored handover.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("35") {
+        sdk35_trust_boundaries::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

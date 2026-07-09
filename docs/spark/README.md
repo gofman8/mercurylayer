@@ -7,7 +7,7 @@ Full Spark (buildonspark) feature parity on Mercury Layer with a **single statec
 
 - [TL;DR](learn/tldr.md) — what this is in one page
 - [Core concepts](learn/core-concepts.md) — SE, coins & sub-coins (trees & leaves), transfers, exits
-- [Trust model](learn/trust-model.md) — what you trust and why exits never need permission
+- [Trust model](learn/trust-model.md) — what you trust and why exits never need permission; the full party-by-party matrix incl. watchtowers/indexers and the irreducible boundaries: [TRUST-MODEL.md](TRUST-MODEL.md)
 - [Transfers](learn/transfers.md) — key handover, the exact-amount maker, branch verification
 - [Tokens on RGB](learn/tokens.md) — issuance, lifecycle, why there is no freeze
 - [Lightning](learn/lightning.md) — preimage swaps on the Mercury latch

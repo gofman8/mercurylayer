@@ -35,6 +35,18 @@ pub struct SdkConfig {
     /// re-anchors a coin. Must exceed the SE `interval` so a whole-coin handover still validates;
     /// well under `initlock` so refresh triggers only late in the horizon. Default 144 (~1 day).
     pub auto_refresh_margin_blocks: u32,
+    /// Run the `auto_exit_due` watchtower pass from the background watcher: force-exit plain
+    /// off-chain sub-coins / MATERIALIZE token carriers approaching their exit-race deadline, so an
+    /// idle owner cannot be clawed back by an ancestor's stale backup. On by default. Both actions
+    /// broadcast only the owner's own pre-signed transactions (settling coins on-chain to the
+    /// owner); disable for wallets that schedule `auto_exit_due` themselves or delegate to
+    /// external watch bundles.
+    pub auto_exit: bool,
+    /// Deadline margin (blocks) for the background `auto_exit_due` pass. Must absorb the audit-[17]
+    /// gap (the deposit-anchored deadline is late by `k·interval` for a parent transferred `k`
+    /// times pre-split) plus confirmation latency and congestion: choose `≥ k_max·interval + 144`.
+    /// Default 288 (~2 days; covers k ≤ 14 pre-split hops on the deployed 1000/10 profile).
+    pub auto_exit_margin_blocks: u32,
 }
 
 impl SdkConfig {
@@ -54,6 +66,8 @@ impl SdkConfig {
             poll_interval_secs: 5,
             auto_refresh: true,
             auto_refresh_margin_blocks: 144,
+            auto_exit: true,
+            auto_exit_margin_blocks: 288,
         }
     }
 
@@ -73,6 +87,8 @@ impl SdkConfig {
             poll_interval_secs: 30,
             auto_refresh: true,
             auto_refresh_margin_blocks: 144,
+            auto_exit: true,
+            auto_exit_margin_blocks: 288,
         }
     }
 }

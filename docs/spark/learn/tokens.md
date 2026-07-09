@@ -103,9 +103,10 @@ the root deadline (~7 days) the *sender's* own backup matures and a malicious se
 sweep the shared funding, but the `auto_exit_due` watchtower now **auto-materializes** a received
 carrier as it nears that deadline (broadcasting its branch, emitting `TokenCarrierMaterialized`),
 spending the shared root in time so the clawback can never land — the same automatic protection plain
-coins get (SPEC §9.5 / REQ-33, `sdk34`). Run the watcher (or call `auto_exit_due` on an interval) and
-an idle receiver is safe; a lone piece should still be combined or exited before it can be spent
-onward.
+coins get (SPEC §9.5 / REQ-33, `sdk34`). The background watcher runs this pass by default
+(`SdkConfig::auto_exit`); the duty is also delegable keyless to any external watchtower via
+`export_watch_bundle` (SPEC REQ-34, `sdk35`). A lone piece should still be combined or exited before
+it can be spent onward.
 
 **Summary:** never lost; cooperative operations (with the SE) work throughout; a received token's
 unilateral materialization works forever if the shared root is unspent — and the watchtower now keeps

@@ -90,7 +90,10 @@ encodes as `sparkinv1<hex(json)>`; `decode_spark_invoice(&str) -> SparkInvoice` 
 |---|---|---|
 | `withdraw` | `(to: &str, coins: Option<Vec<String>>, fee_rate: Option<f64>) -> Vec<String>` | cooperative; branches auto-materialize |
 | `unilateral_exit` | `(coins: Option<Vec<String>>, to: Option<String>) -> Vec<String>` | branch + stored backup (locktime-gated) |
-| `auto_exit_due` | `(margin_blocks: u32) -> Vec<String>` | broadcast branches whose exit-race deadline is within `margin_blocks` of tip; trigger for `ExitDeadlineApproaching` |
+| `auto_exit_due` | `(margin_blocks: u32) -> Vec<String>` | watchtower pass: force-exit plain sub-coins / MATERIALIZE token carriers (branch-only) within `margin_blocks` of the deadline; run by the background watcher each poll when `auto_exit` (default on, margin `auto_exit_margin_blocks`=288) |
+| `auto_refresh_due` | `(margin_blocks: u32) -> Vec<RefreshResult>` | re-anchor confirmed non-carrier coins whose ladder headroom ≤ margin; run by the background watcher and before every `transfer`/`transfer_many` when `auto_refresh` (default on, margin `auto_refresh_margin_blocks`=144) |
+| `export_watch_bundle` | `() -> String` | KEYLESS watch bundle (JSON `WatchBundle`): per off-chain coin, branch txs + deadline (+ backup for plain coins; carriers are branch-only) — no key material; safe to hand to untrusted watchtowers |
+| `watchtower::watch_pass` | `(bundle: &WatchBundle, electrum: &Client, margin_blocks: u32) -> (Vec<String>, Vec<String>)` | free function: one keyless watch iteration (acted ids, errors) from a bundle + electrum only — no wallet/DB/SE/keys; idempotent across multiple towers |
 | `estimate_exit_cost` | `(statechain_id: &str) -> ExitCostEstimate` | projected unilateral-exit cost for a coin |
 | `get_withdrawal_fee_quote` | `(statechain_ids: Option<Vec<String>>) -> WithdrawalFeeQuote` | cooperative-withdrawal fee quote |
 
@@ -103,7 +106,9 @@ encodes as `sparkinv1<hex(json)>`; `decode_spark_invoice(&str) -> SparkInvoice` 
 | `TokenTransferClaimed` | `{asset_id, amount, statechain_id}` |
 | `BalanceUpdate` | `{balance}` |
 | `ExitBranchConflict` | `{statechain_id}` — a competing tx is spending the branch root; fee-bump/re-attempt |
-| `ExitDeadlineApproaching` | `{statechain_id, deadline_block, tip}` — sub-coin near its exit-race deadline; run `auto_exit_due` or a watchtower |
+| `ExitDeadlineApproaching` | `{statechain_id, deadline_block, tip}` — sub-coin near its exit-race deadline; `auto_exit_due` acts on it |
+| `CoinRefreshed` | `{old_statechain_id, new_statechain_id, fee_sats}` — auto-refresh re-anchored a coin; re-export the recovery/watch bundles |
+| `TokenCarrierMaterialized` | `{statechain_id, deadline_block, tip}` — the watchtower settled a received token carrier on-chain (branch-only) before its clawback deadline |
 
 ## Errors (`SdkError`)
 
@@ -116,5 +121,6 @@ available_sats}` · `NoExactAmount{requested_sats}` · `TokensNotConfigured`.
 `ClaimResult{claimed_transfers, confirmed_deposits}`, `LightningSwap{batch_id, payment_hash,
 statechain_id}`, `SparkInvoice{version, address, amount, asset_id, memo, expiry_unix}`,
 `RefreshResult{old_statechain_id, new_statechain_id, old_amount_sats, new_amount_sats, fee_sats,
-refresh_txid, rebate_sats}`, `TokenTx`, `ExitCostEstimate`, `WithdrawalFeeQuote` — all `serde`
-serializable for bindings.
+refresh_txid, rebate_sats}`, `TokenTx`, `ExitCostEstimate`, `WithdrawalFeeQuote`,
+`WatchBundle{version, wallet_name, entries}` / `WatchEntry{statechain_id, token_carrier,
+deadline_block, branch_txs, backup_tx?, backup_locktime?}` — all `serde` serializable for bindings.

@@ -471,6 +471,14 @@ impl SparkWallet {
                         .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
                         .await;
                 }
+                // Watchtower pass: protect off-chain coins nearing their exit-race deadline —
+                // force-exit plain sub-coins, MATERIALIZE token carriers (REQ-33). Default-on so an
+                // idle receiver is protected without scheduling anything.
+                if wallet.inner.config.auto_exit {
+                    let _ = wallet
+                        .auto_exit_due(wallet.inner.config.auto_exit_margin_blocks)
+                        .await;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             }
         })

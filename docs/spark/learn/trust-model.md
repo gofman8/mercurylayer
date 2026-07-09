@@ -1,5 +1,10 @@
 # Trust model
 
+> This is the short version. The complete party-by-party matrix — sender, receiver, SE,
+> watchtower, Bitcoin indexer, RGB proxy, operators; what each verifies vs trusts, with code and
+> test citations, and the numbered list of boundaries that cannot be removed — is
+> [TRUST-MODEL.md](../TRUST-MODEL.md).
+
 ## What you trust, exactly
 
 | Property | Guarantee | Mechanism |

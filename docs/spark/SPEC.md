@@ -295,13 +295,24 @@ CARRIERS are excluded (a plain re-anchor would destroy the allocation — see §
 ### 9.5 Watchtower (automatic deadline protection)
 `auto_exit_due(margin)`: a maintenance pass that protects any owned OFF-CHAIN coin within `margin`
 blocks of its deposit-anchored exit-race deadline (§9.3), before an ancestor can broadcast a stale
-backup.
+backup. The background watcher MUST run it each poll when `SdkConfig::auto_exit` is set (default),
+with `auto_exit_margin_blocks` (default 288 ≈ 2 days — sized to absorb the audit-[17] `k·interval`
+gap plus congestion/reorg slack).
 **REQ-33** For a **plain** sub-coin the watchtower MUST force a unilateral exit (§9.2). For a
 **received token carrier** — which the plain exit refuses — it MUST instead MATERIALIZE the coin by
 broadcasting ONLY its exit branch (settling the RGB allocation on-chain and spending the shared
 root), NEVER the sats-sweeping backup; it emits `TokenCarrierMaterialized`. An issued/flat carrier
 has no exit branch (no ancestor, no clawback risk) and MUST be skipped. This gives a received token
 the same automatic clawback protection plain coins already have. `sdk34`.
+
+**REQ-34 (keyless watch delegation)** `export_watch_bundle()` MUST emit, per off-chain coin, only
+pre-signed exit material and public metadata — the exit branch, the deadline, and (plain coins
+only) the latest backup tx — and MUST contain no key material; a token carrier's entry MUST omit
+the backup tx entirely (structurally denying an RGB-destroying sweep). `watch_pass(bundle,
+electrum, margin)` MUST protect the bundled coins using only an electrum connection (no wallet,
+DB, SE, or keys), tolerate idempotent re-broadcasts (so N independent watchtowers compose), and
+surface genuine rejections. The full trust analysis is [TRUST-MODEL.md](TRUST-MODEL.md) §5.
+`sdk35`.
 
 ---
 
@@ -424,6 +435,7 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-31 (refresh / re-anchor) | `sdk30` (refresh + sponsored refresh) |
 | REQ-32 (auto-refresh in transfer) | `sdk33` (maintenance pass, embedded transfer, opt-out) |
 | REQ-33 (watchtower carrier materialize) | `sdk34` (received-carrier auto-materialize, clawback defeated) |
+| REQ-34 (keyless watch delegation) | `sdk35` (keyless bundle, 2 towers idempotent, malicious-sender rejection); `unit::watchtower::tests` |
 | INV-20 (ancestor-count binding), ERR-7 | `unit::terminal_parents_tests`, `sdk10`, `sdk12` (honest accept) |
 | INV-23, ERR-12 | `sdk12` Part C (nonce-reuse refused) |
 | INV-24 | `sdk08` (terminal node stays terminal) |

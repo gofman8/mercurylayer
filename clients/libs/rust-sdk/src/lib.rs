@@ -34,6 +34,7 @@ pub mod tokens;
 pub mod transfer;
 pub mod types;
 pub mod wallet;
+pub mod watchtower;
 
 pub use config::SdkConfig;
 pub use events::WalletEvent;
@@ -41,3 +42,4 @@ pub use types::{Balance, ClaimResult, CoinInfo, DepositAddressInfo, ExitCostEsti
 pub use invoice::{SparkInvoice, decode_spark_invoice, encode_spark_invoice};
 pub use refresh::RefreshResult;
 pub use wallet::SparkWallet;
+pub use watchtower::{watch_pass, WatchBundle, WatchEntry};
