@@ -25,4 +25,14 @@ pub enum WalletEvent {
     /// an ancestor could soon broadcast a stale backup. `auto_exit_due` broadcasts the locktime-free
     /// exit branch when this fires; an offline owner MUST run a watchtower that does the same.
     ExitDeadlineApproaching { statechain_id: String, deadline_block: u32, tip: u32 },
+    /// A coin nearing its backup-ladder floor was automatically **re-anchored** (refreshed): the old
+    /// coin is spent on-chain and a fresh full-ladder coin (`amount − fee`) is confirming. Emitted by
+    /// the `auto_refresh_due` maintenance pass (the background watcher and the pre-spend hook of
+    /// `transfer`), so an aging coin is refreshed before the user's action with only the fee visible.
+    CoinRefreshed { old_statechain_id: String, new_statechain_id: String, fee_sats: u64 },
+    /// A received **token-carrier** sub-coin nearing its clawback deadline was automatically
+    /// materialized on-chain (its exit branch was broadcast), settling the RGB allocation so a
+    /// malicious sender can no longer claw back the shared root. Emitted by `auto_exit_due`; the
+    /// plain (RGB-unaware) exit path still refuses carriers, so this is their dedicated protection.
+    TokenCarrierMaterialized { statechain_id: String, deadline_block: u32, tip: u32 },
 }

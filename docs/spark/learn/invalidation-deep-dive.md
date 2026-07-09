@@ -463,6 +463,16 @@ a funded operator rebates the fee off-chain). Because the refresh fee (~112 sats
 floor and off-chain amounts can't be sub-dust, the operator rebate is rounded up to the smallest
 payable piece (`fee + 330`), so the user ends *at least* whole. Verified by `SDK_E2E=30`.
 
+**You usually never call it — auto-refresh does.** With `SdkConfig::auto_refresh` on (the default), the
+SDK re-anchors an aging coin *for* you: a maintenance pass (`auto_refresh_due(margin)`) refreshes any
+confirmed coin whose headroom has fallen to `auto_refresh_margin_blocks` (default 144 ≈ 1 day), and
+`transfer`/`transfer_many` run it before selecting coins — so a coin close to its floor is refreshed
+transparently *before* your send, the re-anchor fee the only visible effect (you never hit a
+`LocktimeTooLow` handover failure or hand a receiver a coin past its deadline). The background watcher
+also runs the pass each poll, so coins are usually already fresh by the time you transact. Token
+carriers are excluded (a plain re-anchor would destroy the allocation — the watchtower materializes
+them instead; see [tokens.md](tokens.md#exits-with-tokens)). Verified by `SDK_E2E=33` (SPEC REQ-32).
+
 **If they do nothing:** a flat coin is untouchable by anyone until the *current owner's* locktime
 (≈ horizon minus `k·interval/144` days), then exclusively theirs for `interval` blocks, then
 exposed to whichever past owner shows up first. A sub-coin is additionally exposed from the root

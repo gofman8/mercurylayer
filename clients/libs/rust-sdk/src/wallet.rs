@@ -463,20 +463,39 @@ impl SparkWallet {
         tokio::spawn(async move {
             loop {
                 let _ = wallet.claim().await;
+                // Proactively re-anchor coins nearing their ladder floor so they are already fresh by
+                // the time the user transfers — this is what keeps auto-refresh invisible (the
+                // in-transfer wait is only a fallback for coins the background loop hasn't caught).
+                if wallet.inner.config.auto_refresh {
+                    let _ = wallet
+                        .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
+                        .await;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
             }
         })
     }
 
-    /// Watchtower pass (audit [17], review L7/P2-2): force-exit any owned OFF-CHAIN sub-coin whose
-    /// exit-race deadline is within `margin_blocks` of the current tip. The exit branch is
-    /// locktime-free, so broadcasting it early is always safe and cheap; doing so before an ancestor
-    /// can broadcast a stale backup is the ONLY defence for an off-chain coin. The deadline is the
-    /// deposit-anchored `exit_deadline_block` from `estimate_exit_cost` (audit [10]). Emits
-    /// `ExitDeadlineApproaching` for each coin acted on and returns the exited statechain_ids.
+    /// Watchtower pass (audit [17], review L7/P2-2): protect any owned OFF-CHAIN coin whose
+    /// exit-race deadline is within `margin_blocks` of the current tip, before an ancestor can
+    /// broadcast a stale backup (the ONLY defence for an off-chain coin — its exit branch is
+    /// locktime-free, so broadcasting it early is always safe and cheap). Two coin kinds, two
+    /// mechanisms:
     ///
-    /// Call this on an interval from your own loop (or alongside `claim()`), especially for wallets
-    /// that hold received off-chain sub-coins — an offline owner is otherwise exposed to clawback.
+    /// - **Plain sub-coins** are force-EXITED via [`Self::unilateral_exit`] (branch + latest backup)
+    ///   — emits [`WalletEvent::ExitDeadlineApproaching`].
+    /// - **Received token carriers** cannot take the plain exit (an RGB-unaware sweep would destroy
+    ///   the allocation), so they are instead MATERIALIZED — broadcasting *only* the exit branch
+    ///   settles the RGB allocation on-chain and wins the clawback race, WITHOUT the sats-sweeping
+    ///   backup. Emits [`WalletEvent::TokenCarrierMaterialized`]. An issued/flat carrier has no exit
+    ///   branch (no deadline, no ancestor, no clawback risk) and is naturally skipped. This closes
+    ///   the gap that `sdk32` surfaced: before, `auto_exit_due` skipped carriers entirely, leaving a
+    ///   received token with no automatic clawback protection.
+    ///
+    /// The deadline is the deposit-anchored `exit_deadline_block` from `estimate_exit_cost`
+    /// (audit [10]). Returns the statechain_ids acted on. Call on an interval from your own loop (or
+    /// alongside `claim()`), especially for wallets holding received off-chain coins/tokens — an
+    /// offline owner is otherwise exposed to clawback.
     pub async fn auto_exit_due(&self, margin_blocks: u32) -> Result<Vec<String>> {
         use electrum_client::ElectrumApi;
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
@@ -506,6 +525,40 @@ impl SparkWallet {
                 tip,
             });
             if self.unilateral_exit(Some(vec![id.clone()]), None).await.is_ok() {
+                exited.push(id);
+            }
+        }
+
+        // Received token carriers: MATERIALIZE (branch only) — never plain-exit (that destroys the
+        // allocation). Disjoint from the loop above (which excluded carriers). An issued/flat carrier
+        // has no branch → estimate_exit_cost yields no deadline → it is skipped.
+        let carrier_ids: Vec<String> = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| is_token_carrier(c, &carriers))
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        for id in carrier_ids {
+            let est = match self.estimate_exit_cost(&id).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let Some(deadline) = est.exit_deadline_block else { continue };
+            if tip + margin_blocks < deadline {
+                continue;
+            }
+            let _ = self.inner.events_tx.send(WalletEvent::TokenCarrierMaterialized {
+                statechain_id: id.clone(),
+                deadline_block: deadline,
+                tip,
+            });
+            // Materialize = broadcast the exit branch ONLY (settles the RGB allocation on-chain and
+            // spends the shared root, defeating the sender's clawback). The plain backup is
+            // deliberately NOT broadcast — it would sweep the sats and destroy the allocation. A
+            // conflict/failure leaves it for a later pass (broadcast_branch_if_any already alerted
+            // via ExitBranchConflict on a racing spend).
+            if self.broadcast_branch_if_any(&id).await.unwrap_or(false) {
                 exited.push(id);
             }
         }

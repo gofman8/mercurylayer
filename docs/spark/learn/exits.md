@@ -4,10 +4,12 @@
 > [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (§6) and explained in depth — with cost tables —
 > in [invalidation-deep-dive.md](invalidation-deep-dive.md) and
 > [invalidation-economics.md](../research/invalidation-economics.md).
-> Token-carrier coins exit differently — both plain paths refuse them, and the `auto_exit_due`
-> watchtower silently skips them too, so token pieces get **no** automated deadline protection and
-> must be materialized manually; see
-> [tokens.md "Exits with tokens"](tokens.md#exits-with-tokens) and
+> Token-carrier coins exit differently — both plain paths refuse them (an RGB-unaware sweep destroys
+> the allocation), so a carrier exits by **materializing** its branch. The `auto_exit_due` watchtower
+> now does this automatically for a received carrier nearing its clawback deadline (branch-only,
+> emitting `TokenCarrierMaterialized`), so token pieces get the same automated deadline protection
+> plain coins do (SPEC §9.5 / REQ-33, `sdk34`); an issued/flat carrier has no ancestor and is left
+> untouched. See [tokens.md "Exits with tokens"](tokens.md#exits-with-tokens) and
 > [GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md) GRN-INV-14.
 
 ## Deposits

@@ -33,6 +33,12 @@ impl SparkWallet {
     /// asynchronously (their SDK background watcher, or any Mercury wallet's receive flow for the
     /// exact-subset path).
     pub async fn transfer(&self, receiver_address: &str, amount_sats: u64) -> Result<TransferResult> {
+        // Auto-refresh (embedded state transition): re-anchor any near-final coin BEFORE selecting
+        // coins to spend, so an aging coin never fails a handover or hands the receiver a coin past
+        // its exit-race deadline. Transparent to the caller — the re-anchor fee is the only visible
+        // effect. No-op (negligible cost) when disabled or nothing is near its floor. Runs before the
+        // wallet lock since it (and its confirm-wait) take the lock themselves.
+        let _ = self.auto_refresh_before_spend().await?;
         let _guard = self.inner.wallet_lock.lock().await;
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
@@ -142,6 +148,8 @@ impl SparkWallet {
         }
         let total: u64 = recipients.iter().map(|(_, a)| *a).sum();
 
+        // Auto-refresh near-final coins before the parent is selected (see `transfer`).
+        let _ = self.auto_refresh_before_spend().await?;
         let _guard = self.inner.wallet_lock.lock().await;
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;

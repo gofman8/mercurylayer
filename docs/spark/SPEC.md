@@ -283,6 +283,26 @@ exits unilaterally (§9.2) instead. The fee is drawn from the coin (single-input
 user-pays variant yields `amount − fee`; `refresh_sponsored` reimburses that fee OFF-CHAIN from a
 funded sponsor (rebate `fee + dust`), leaving the user ≥ whole.
 
+**REQ-32 (auto-refresh)** When `SdkConfig::auto_refresh` is set (default), the SDK MUST re-anchor a
+coin nearing its ladder floor BEFORE the coin is spent, transparently: `auto_refresh_due(margin)`
+re-anchors every confirmed, non-carrier coin whose headroom (`locktime − tip`) is ≤
+`auto_refresh_margin_blocks`, and `transfer`/`transfer_many` MUST run this (and await the fresh
+coins' confirmation) before selecting coins, so an aging coin never fails a handover or hands a
+receiver a coin past its exit-race deadline — the re-anchor fee is the only visible effect. The
+background watcher MUST also run the pass each poll so coins are refreshed proactively. Token
+CARRIERS are excluded (a plain re-anchor would destroy the allocation — see §9.5). `sdk33`.
+
+### 9.5 Watchtower (automatic deadline protection)
+`auto_exit_due(margin)`: a maintenance pass that protects any owned OFF-CHAIN coin within `margin`
+blocks of its deposit-anchored exit-race deadline (§9.3), before an ancestor can broadcast a stale
+backup.
+**REQ-33** For a **plain** sub-coin the watchtower MUST force a unilateral exit (§9.2). For a
+**received token carrier** — which the plain exit refuses — it MUST instead MATERIALIZE the coin by
+broadcasting ONLY its exit branch (settling the RGB allocation on-chain and spending the shared
+root), NEVER the sats-sweeping backup; it emits `TokenCarrierMaterialized`. An issued/flat carrier
+has no exit branch (no ancestor, no clawback risk) and MUST be skipped. This gives a received token
+the same automatic clawback protection plain coins already have. `sdk34`.
+
 ---
 
 ## 10. Invalidation & security invariants
@@ -402,6 +422,8 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-28, ERR-11 | `sdk11`; `unit::invoice::tests` (roundtrip, reject) |
 | REQ-29, REQ-30 | `sdk11` (query API + fee quote) |
 | REQ-31 (refresh / re-anchor) | `sdk30` (refresh + sponsored refresh) |
+| REQ-32 (auto-refresh in transfer) | `sdk33` (maintenance pass, embedded transfer, opt-out) |
+| REQ-33 (watchtower carrier materialize) | `sdk34` (received-carrier auto-materialize, clawback defeated) |
 | INV-20 (ancestor-count binding), ERR-7 | `unit::terminal_parents_tests`, `sdk10`, `sdk12` (honest accept) |
 | INV-23, ERR-12 | `sdk12` Part C (nonce-reuse refused) |
 | INV-24 | `sdk08` (terminal node stays terminal) |

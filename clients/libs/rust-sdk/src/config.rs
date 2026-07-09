@@ -25,6 +25,16 @@ pub struct SdkConfig {
     pub deposit_token_id: Option<String>,
     /// Poll interval for the background claim/deposit watcher.
     pub poll_interval_secs: u64,
+    /// Automatically re-anchor (refresh) a coin whose backup ladder is nearing its floor before it
+    /// is spent, so an aging coin never becomes un-transferable or hands a receiver a coin already
+    /// past its exit-race deadline. On by default. The re-anchor fee comes from the coin; the
+    /// background watcher also refreshes proactively so the pre-spend hook rarely has to wait for the
+    /// re-anchor to confirm. Disable for wallets that manage refresh explicitly.
+    pub auto_refresh: bool,
+    /// Ladder headroom (blocks below the current backup locktime) at or under which `auto_refresh`
+    /// re-anchors a coin. Must exceed the SE `interval` so a whole-coin handover still validates;
+    /// well under `initlock` so refresh triggers only late in the horizon. Default 144 (~1 day).
+    pub auto_refresh_margin_blocks: u32,
 }
 
 impl SdkConfig {
@@ -42,6 +52,8 @@ impl SdkConfig {
             rgb_data_dir: Some(format!("./rgb-data-{}", wallet_name)),
             deposit_token_id: None,
             poll_interval_secs: 5,
+            auto_refresh: true,
+            auto_refresh_margin_blocks: 144,
         }
     }
 
@@ -59,6 +71,8 @@ impl SdkConfig {
             rgb_data_dir: None,
             deposit_token_id: None,
             poll_interval_secs: 30,
+            auto_refresh: true,
+            auto_refresh_margin_blocks: 144,
         }
     }
 }

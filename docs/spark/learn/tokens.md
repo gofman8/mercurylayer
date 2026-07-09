@@ -69,12 +69,13 @@ should not issue on client-validated rails.
 
 A token-carrying coin refuses the plain exit operations: `withdraw` and `unilateral_exit` exclude
 carriers from their defaults and hard-error when a carrier is named (an RGB-unaware sweep would
-destroy the allocation), and the `auto_exit_due` watchtower skips them. Token exit means
-**materializing the coin's branch on-chain** — today a manual broadcast of the stored branch rows
-(or a co-descendant's exit doing it for free), not a one-call SDK operation: the RGB anchors
-confirm with the branch and the allocation becomes an ordinary on-chain RGB holding, spendable
-with any rgb-lib wallet. Onward movement of the settled allocation still needs the SE (no colored
-unilateral path is shipped). Step-by-step:
+destroy the allocation). Token exit means **materializing the coin's branch on-chain**: broadcasting
+the stored branch rows (or a co-descendant's exit doing it for free) — the RGB anchors confirm with
+the branch and the allocation becomes an ordinary on-chain RGB holding, spendable with any rgb-lib
+wallet. Onward movement of the settled allocation still needs the SE (no colored unilateral path is
+shipped). The `auto_exit_due` watchtower now does this **automatically** for a received carrier
+nearing its clawback deadline (branch-only, emitting `TokenCarrierMaterialized`), so you no longer
+have to materialize by hand to stay safe (SPEC §9.5 / REQ-33, `sdk34`). Step-by-step:
 [granularity deep dive §5.6](granularity-deep-dive.md); normative:
 [GRANULARITY-SPEC](../GRANULARITY-SPEC.md) GRN-REQ-14 / GRN-INV-14.
 
@@ -95,14 +96,18 @@ sendable cooperatively; SE-dependent to move without a colored exit path.
 
 **Tokens you received (a *sub-coin* carrier).** Also not lost, and here you have a **SE-free**
 option: the exit branch is locktime-zero, so broadcasting it *materializes* the allocation on-chain
-any time — even a year later — as long as the shared root is still unspent. Two caveats: a lone
-1,500-sat received piece is below the carrier floor, so it can't be re-sent on its own (hold,
-combine with another piece, or exit); and there is a **real clawback danger with long inactivity**.
-Past the root deadline (~7 days), the *sender's* own backup matures, and a malicious sender can
-sweep the shared funding out from under you. You are safe only if you materialize before then — and
-today the `auto_exit_due` watchtower **skips token carriers**, so received tokens have **no
-automatic protection**. Treat a received off-chain token like any off-chain sub-coin: exit (or move)
-it well before the deadline; don't leave it sitting for a year.
+any time — even a year later — as long as the shared root is still unspent. One caveat remains: a
+lone 1,500-sat received piece is below the carrier floor, so it can't be re-sent on its own (hold,
+combine with another piece, or exit). The former clawback danger is now handled automatically: past
+the root deadline (~7 days) the *sender's* own backup matures and a malicious sender could otherwise
+sweep the shared funding, but the `auto_exit_due` watchtower now **auto-materializes** a received
+carrier as it nears that deadline (broadcasting its branch, emitting `TokenCarrierMaterialized`),
+spending the shared root in time so the clawback can never land — the same automatic protection plain
+coins get (SPEC §9.5 / REQ-33, `sdk34`). Run the watcher (or call `auto_exit_due` on an interval) and
+an idle receiver is safe; a lone piece should still be combined or exited before it can be spent
+onward.
 
 **Summary:** never lost; cooperative operations (with the SE) work throughout; a received token's
-unilateral materialization works forever *if you don't miss the root deadline*.
+unilateral materialization works forever if the shared root is unspent — and the watchtower now keeps
+it unspent for you by materializing before the root deadline, so even an offline receiver is
+protected.

@@ -30,8 +30,9 @@
 //!   [`SparkWallet::rebate_refresh_fee`] so a remote sponsor can drive it.
 
 use anyhow::{anyhow, Result};
-use mercurylib::wallet::CoinStatus;
+use mercurylib::wallet::{Coin, CoinStatus};
 
+use crate::events::WalletEvent;
 use crate::transfer::{backup_fee_rate, BACKUP_TX_VBYTES};
 use crate::types::TransferResult;
 use crate::wallet::SparkWallet;
@@ -192,6 +193,128 @@ impl SparkWallet {
             rebate_sats: 0,
         })
     }
+
+    /// The wallet-maintenance **auto-refresh** pass: re-anchor every confirmed, non-carrier coin
+    /// whose backup ladder is within `margin_blocks` of its floor, so an aging coin is refreshed
+    /// *before* it becomes un-transferable (a whole-coin handover of a floored coin is rejected by
+    /// the receiver, `LocktimeTooLow`) and before it would hand a receiver a sub-coin already past
+    /// its exit-race deadline. Each re-anchor is user-pays (the fee comes from the coin), one
+    /// on-chain tx; the fresh coins confirm asynchronously (via `claim`/the watcher), so this call
+    /// does NOT block on confirmation.
+    ///
+    /// Token CARRIERS are skipped — a plain re-anchor would destroy the RGB allocation; their
+    /// near-deadline protection is [`Self::auto_exit_due`], which *materializes* them instead. A coin
+    /// too small to cover the fee, or already spent by a concurrent pass, is skipped rather than
+    /// failing the pass. Returns one [`RefreshResult`] per coin refreshed and emits
+    /// [`WalletEvent::CoinRefreshed`] for each. The background watcher calls this every poll, so in
+    /// practice coins are kept fresh proactively; `transfer` also calls it (and waits) as a safety net.
+    pub async fn auto_refresh_due(&self, margin_blocks: u32) -> Result<Vec<RefreshResult>> {
+        use electrum_client::ElectrumApi;
+        // Refresh statuses so a just-confirmed re-anchor is not re-refreshed and headrooms are current.
+        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+            .await?;
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let record = self.record().await?;
+        // Fail CLOSED: for a token wallet whose carriers we cannot enumerate, skip the whole pass —
+        // never risk plain-refreshing (destroying) a carrier. Non-token wallets have no carriers.
+        let carriers = if self.inner.config.rgb_data_dir.is_some()
+            && self.inner.config.rgb_proxy_url.is_some()
+        {
+            match self.token_carrier_outpoints().await {
+                Ok(c) => c,
+                Err(_) => return Ok(vec![]),
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+        // Build the due list BEFORE any per-coin lock — `reanchor` takes the wallet lock itself.
+        let due: Vec<String> = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !crate::wallet::is_token_carrier(c, &carriers))
+            .filter(|c| coin_near_final(c, tip, margin_blocks))
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        drop(record);
+
+        let mut refreshed = Vec::new();
+        for id in due {
+            match self.reanchor(&id, None).await {
+                Ok(res) => {
+                    let _ = self.inner.events_tx.send(WalletEvent::CoinRefreshed {
+                        old_statechain_id: res.old_statechain_id.clone(),
+                        new_statechain_id: res.new_statechain_id.clone(),
+                        fee_sats: res.fee_sats,
+                    });
+                    refreshed.push(res);
+                }
+                // Skip a coin a concurrent pass already refreshed (now WITHDRAWN) or one too small
+                // to cover the fee — don't abort the maintenance pass over one coin.
+                Err(_) => continue,
+            }
+        }
+        Ok(refreshed)
+    }
+
+    /// Pre-spend auto-refresh hook (see [`Self::auto_refresh_due`]): when `auto_refresh` is enabled,
+    /// re-anchor any near-final coin before a transfer selects it, then WAIT for the fresh coins to
+    /// confirm so the spend can use them. This is what makes an aging coin transparent to the caller
+    /// — the transfer simply succeeds, with the re-anchor fee the only visible effect. A no-op
+    /// (empty vec, negligible overhead: one `update_coins` + tip read) when nothing is near its
+    /// floor, which is the common case. Called before `transfer`/`transfer_many` acquire the wallet
+    /// lock (both `auto_refresh_due` and the confirm-wait take it themselves).
+    pub(crate) async fn auto_refresh_before_spend(&self) -> Result<Vec<RefreshResult>> {
+        if !self.inner.config.auto_refresh {
+            return Ok(vec![]);
+        }
+        let refreshed = self
+            .auto_refresh_due(self.inner.config.auto_refresh_margin_blocks)
+            .await?;
+        if !refreshed.is_empty() {
+            let new_ids: Vec<String> =
+                refreshed.iter().map(|r| r.new_statechain_id.clone()).collect();
+            self.await_ids_confirmed(&new_ids).await?;
+        }
+        Ok(refreshed)
+    }
+
+    /// Poll `claim()` until every id in `ids` is CONFIRMED (its re-anchor deposit tx reached the
+    /// confirmation target), bounded so it can never hang forever. This is the unavoidable
+    /// in-transfer latency of an on-chain refresh; the background watcher pre-empts it by refreshing
+    /// before the user acts, so this wait is a rare fallback.
+    async fn await_ids_confirmed(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // ~120 polls at 1s ≈ a 2-minute ceiling: ample for regtest and typical mainnet confirmation.
+        for _ in 0..120 {
+            let _ = self.claim().await;
+            let record = self.record().await?;
+            let all_confirmed = ids.iter().all(|id| {
+                record.coins.iter().any(|c| {
+                    c.statechain_id.as_deref() == Some(id.as_str())
+                        && c.duplicate_index == 0
+                        && c.status == CoinStatus::CONFIRMED
+                })
+            });
+            if all_confirmed {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+        Err(anyhow!(
+            "auto-refresh: a re-anchored coin has not confirmed within the wait window; the transfer will succeed once it confirms — retry shortly (or rely on the background refresh loop to pre-empt this)"
+        ))
+    }
+}
+
+/// A coin is "near final" — due for auto-refresh — when its backup-ladder headroom (`locktime −
+/// tip`) has fallen to `margin_blocks` or below. A CONFIRMED coin always has a locktime; one without
+/// (never happens on this path) is treated as not-due. `saturating_sub` makes an already-floored
+/// coin (locktime ≤ tip) report zero headroom, so it is always due.
+fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {
+    c.locktime.map_or(false, |l| l.saturating_sub(tip) <= margin_blocks)
 }
 
 #[cfg(test)]

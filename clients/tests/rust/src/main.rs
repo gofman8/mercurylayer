@@ -60,6 +60,8 @@ pub mod sdk29_granularity_tokens;
 pub mod sdk30_refresh;
 pub mod sdk31_token_combine;
 pub mod sdk32_token_over_time;
+pub mod sdk33_auto_refresh;
+pub mod sdk34_token_watchtower;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -247,6 +249,20 @@ async fn main() -> Result<()> {
     // test not-lost / cooperative send / unilateral materialization / the received-token clawback window.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("32") {
         sdk32_token_over_time::execute().await?;
+        return Ok(());
+    }
+    // Auto-refresh embedded in transfer (SDK_E2E=33): a coin nearing its ladder floor is re-anchored
+    // automatically before it is spent — the maintenance pass, the transparent in-transfer refresh
+    // (fee the only visible effect), and the opt-out.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("33") {
+        sdk33_auto_refresh::execute().await?;
+        return Ok(());
+    }
+    // Token-carrier watchtower (SDK_E2E=34): auto_exit_due now auto-materializes a received token
+    // carrier before its clawback deadline (branch-only), defeating the sender's stale-backup
+    // clawback; issued/flat carriers (no branch) are left untouched.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("34") {
+        sdk34_token_watchtower::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
