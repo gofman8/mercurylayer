@@ -60,6 +60,11 @@ pub struct ServerConfig {
     pub nostr_info: Option<NostrInfo>,
     /// URL of the token server
     pub token_server_url: Option<String>,
+    /// Allow FREE deposit-token generation on mainnet (no token server). Deliberate operator
+    /// opt-in: onboarding runs unpriced, with the outstanding-token cap (audit [26]) as the only
+    /// spam brake — the deposit-token *pricing* machinery is deferred until spam actually appears.
+    /// Ignored when `token_server_url` is set. Default: false (mainnet refuses free tokens).
+    pub free_tokens_on_mainnet: bool,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +91,7 @@ impl Default for ServerConfig {
             db_name: String::from("mercury"),
             nostr_info: None,
             token_server_url: None,
+            free_tokens_on_mainnet: false,
         }
     }
 }
@@ -199,6 +205,9 @@ impl ServerConfig {
             db_name: get_env_or_config("db_name", "DB_NAME"),
             nostr_info: get_env_or_config_nostr_info("nostr_info", "NOSTR_INFO"),
             token_server_url: get_optional_env_or_config("token_server_url", "TOKEN_SERVER_URL"),
+            free_tokens_on_mainnet: get_optional_env_or_config("free_tokens_on_mainnet", "FREE_TOKENS_ON_MAINNET")
+                .map(|s| s.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 

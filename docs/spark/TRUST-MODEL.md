@@ -265,12 +265,16 @@ needed for custody**, by construction:
   recipient, and refresh too). Rationale: a slot is a permanent SE liability (enclave share, DB,
   co-signing duty), and a *blind* SE has no other billing point — transfers are free and
   unmetered, so the pay-once-per-slot model is the statechain fee model. With no token server
-  configured the SE mints **free** tokens itself (this deployment; refused on mainnet —
-  `server/src/endpoints/deposit.rs`, capped per audit [26]); with one configured, the wallet
+  configured the SE mints **free** tokens itself (`server/src/endpoints/deposit.rs`, capped per
+  audit [26]); on mainnet this requires the explicit operator opt-in
+  `free_tokens_on_mainnet = true`. **Deployment strategy (decided)**: production runs FREE —
+  onboarding unpriced, the audit-[26] outstanding-token cap as the standing spam brake — and the
+  pricing machinery (token server, derived-slot exemption) is deferred until spam actually
+  appears. If pricing is ever enabled, note every 2-output split and every (auto-)refresh
+  consumes a slot too, so a paid deployment must price near zero or exempt derived slots
+  (shipped token-server default is 10,000 sats). With a token server configured, the wallet
   reaches it **through the SE** (never directly; honest relay of pricing is part of the §3
-  trust) and pays the advertised fee on-chain (shipped default 10,000 sats — a paid deployment
-  must price near zero or exempt derived slots, else every 2-output split costs 2× the fee).
-  Worst case = losing one prepaid onboarding fee; it never touches existing coins
+  trust). Worst case = losing one prepaid onboarding fee; it never touches existing coins
   (`SdkError::TokenPaymentRequired` surfaces cost instead of silently paying).
 - **Refresh sponsor** (`refresh_sponsored`): rebates the refresh fee off-chain *after* the
   re-anchor. A sponsor that stiffs you costs exactly `fee` sats (you keep the refreshed coin);

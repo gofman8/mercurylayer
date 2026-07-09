@@ -9,17 +9,20 @@ use crate::{server::StateChainEntity, server_config::Enclave};
 
 pub async fn get_token_no_server(statechain_entity: &State<StateChainEntity>, config: &crate::server_config::ServerConfig) -> status::Custom<Json<Value>>  {
 
-    if config.network == "mainnet" {
+    // Free token generation on mainnet is a deliberate operator OPT-IN (`free_tokens_on_mainnet`):
+    // run onboarding unpriced and defer the pricing machinery until spam actually appears — the
+    // outstanding-token cap below (audit [26]) stays on as the spam brake either way.
+    if config.network == "mainnet" && !config.free_tokens_on_mainnet {
         let response_body = json!({
             "error": "Internal Server Error",
-            "message": "Token generation not supported on mainnet."
+            "message": "Token generation not supported on mainnet (set free_tokens_on_mainnet = true to allow free onboarding, or configure token_server_url)."
         });
 
         return status::Custom(Status::InternalServerError, Json(response_body));
     }
 
-    // Audit [26]: this endpoint is unauthenticated on non-mainnet, so cap the number of unspent
-    // token rows to bound DB write-amplification if a caller loops it (testnet/staging griefing).
+    // Audit [26]: this endpoint is unauthenticated when free, so cap the number of unspent
+    // token rows to bound DB write-amplification if a caller loops it.
     const MAX_UNSPENT_TOKENS: i64 = 100_000;
     if crate::database::deposit::count_unspent_tokens(&statechain_entity.pool).await >= MAX_UNSPENT_TOKENS {
         return status::Custom(
