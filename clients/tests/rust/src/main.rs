@@ -64,6 +64,7 @@ pub mod sdk33_auto_refresh;
 pub mod sdk34_token_watchtower;
 pub mod sdk35_trust_boundaries;
 pub mod sdk36_derived_tokens;
+pub mod sdk37_ssp_value_gate;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -278,6 +279,12 @@ async fn main() -> Result<()> {
     // onboarding still charges; owner-auth (single-use nonce) + per-parent lifetime cap enforced.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("36") {
         sdk36_derived_tokens::execute().await?;
+        return Ok(());
+    }
+    // SSP value gate (SDK_E2E=37): peek_pending_transfers branch-validates sats [3] +
+    // validate_pending_token derives the true consignment asset/amount [4] — over SE+RGB, no RLN.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("37") {
+        sdk37_ssp_value_gate::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

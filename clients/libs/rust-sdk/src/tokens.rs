@@ -1359,7 +1359,7 @@ impl UtexoWallet {
     /// amount is trustworthy. Read-only: `validate_offchain_chain_info` and `accept_offchain_amount`
     /// load the consignment into a temp dir and query it, mutating neither the stash nor the wallet,
     /// so it does not disturb the later `accept_incoming_tokens` booking.
-    pub(crate) async fn validate_pending_token(
+    pub async fn validate_pending_token(
         &self,
         consignment_env: &str,
         branch_txs: &[String],
