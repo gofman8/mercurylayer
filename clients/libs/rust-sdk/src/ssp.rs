@@ -416,8 +416,46 @@ impl SspService {
                 ));
             }
         }
-        // SATS invoice: also enforce the value gate. (RGB: asset value checked post-claim.)
+        // VALUE GATE — enforced BEFORE paying (reviews C2/C3; audit [3]/[4]).
         let asset_before = if let Some(asset_id) = &d.asset_id {
+            // RGB invoice: the latched coins must cryptographically carry >= the invoiced amount of
+            // the invoiced asset. We CANNOT defer this to post-claim: a HODL swap forces us to pay
+            // before we can claim, and the blind SE co-signs any colored value, so an attacker could
+            // latch a 1-USDT (or wrong-asset) coin against a 10k-USDT invoice and the post-payment
+            // balance-delta check (below) would fire only after the Lightning money is gone. Validate
+            // each latched coin's consignment NOW (audit [4]).
+            let asset_amount = d.asset_amount.ok_or_else(|| {
+                anyhow!("RGB invoice for {asset_id} carries no asset amount — refusing to pay")
+            })?;
+            let mut covered: u64 = 0;
+            for sid in &latched_ids {
+                let p = pending
+                    .iter()
+                    .find(|p| &p.statechain_id == sid)
+                    .ok_or_else(|| anyhow!("latched coin {sid} not in the pending set"))?;
+                let env = p.rgb_consignment.as_deref().ok_or_else(|| {
+                    anyhow!("latched coin {sid} carries no RGB consignment — refusing to pay an RGB invoice")
+                })?;
+                let (contract_id, booked) = self
+                    .wallet
+                    .validate_pending_token(env, &p.branch_txs, &p.funding_txid, p.funding_vout)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("pre-payment RGB validation failed for {sid}: {e} — refusing to pay")
+                    })?;
+                if &contract_id != asset_id {
+                    return Err(anyhow!(
+                        "latched coin {sid} carries asset {contract_id}, not the invoiced {asset_id} — refusing to pay"
+                    ));
+                }
+                covered = covered.saturating_add(booked);
+            }
+            if covered < asset_amount {
+                return Err(anyhow!(
+                    "latched coins carry {covered} of {asset_id}, less than the invoiced {asset_amount} — refusing to pay"
+                ));
+            }
+            // Snapshot for the post-payment backstop check.
             self.wallet.get_token_balances().await.ok().and_then(|bs| {
                 bs.iter().find(|b| &b.asset_id == asset_id).map(|b| b.balance)
             }).unwrap_or(0)
@@ -466,8 +504,8 @@ impl SspService {
                 "paid the Lightning invoice for batch {batch_id} but claimed 0 transfers — the latched coin was not received; investigate before retrying"
             ));
         }
-        // RGB invoice: the claim validated + booked the coin's consignment. Confirm the SSP actually
-        // received at least the invoice's asset amount (its statechain asset balance grew by that).
+        // RGB invoice backstop: the colored value was already gated pre-payment (audit [4] above);
+        // re-confirm post-claim that the SSP's asset balance actually grew by the invoiced amount.
         if let (Some(asset_id), Some(asset_amount)) = (&d.asset_id, d.asset_amount) {
             let after = self
                 .wallet

@@ -252,7 +252,17 @@ async fn get_msg_addr(auth_pubkey: &str, client_config: &ClientConfig) -> Result
 #[derive(Clone, Debug)]
 pub struct PendingTransferInfo {
     pub statechain_id: String,
+    /// Sats funding this coin, **branch-validated** (audit [3]): 0 if the branch fails validation,
+    /// so a value gate cannot be tricked by an attacker-inflated un-broadcast leaf.
     pub amount: u64,
+    /// The coin's RGB consignment envelope (`BackupTx.rgb_consignment`), if it carries a token.
+    /// A caller can validate the colored value pre-payment via `validate_pending_token` (audit [4]).
+    pub rgb_consignment: Option<String>,
+    /// The coin's own funding outpoint (the RGB witness for consignment validation).
+    pub funding_txid: String,
+    pub funding_vout: u32,
+    /// The un-broadcast exit branch (raw tx hex, root-first) the consignment resolves against.
+    pub branch_txs: Vec<String>,
 }
 
 pub async fn peek_pending_transfers(
@@ -290,9 +300,13 @@ pub async fn peek_pending_transfers(
             }
             // Amount from the funding tx0 (index-0 backup group), read on-chain or from the branch.
             let groups = split_backup_transactions(&transfer_msg.backup_transactions);
+            let mut funding_txid = String::new();
+            let mut funding_vout = 0u32;
             let amount = if let Some(first_group) = groups.first() {
                 match mercurylib::transfer::receiver::get_tx0_outpoint(first_group) {
                     std::result::Result::Ok(tx0_outpoint) => {
+                        funding_txid = tx0_outpoint.txid.clone();
+                        funding_vout = tx0_outpoint.vout;
                         match get_tx0_or_branch(
                             &client_config.electrum_client,
                             &tx0_outpoint.txid,
@@ -300,12 +314,47 @@ pub async fn peek_pending_transfers(
                         )
                         .await
                         {
-                            std::result::Result::Ok((tx0_hex, _)) => {
-                                mercurylib::transfer::receiver::get_amount_from_tx0(
-                                    &tx0_hex,
-                                    &tx0_outpoint,
-                                )
-                                .unwrap_or(0)
+                            std::result::Result::Ok((tx0_hex, funding_from_branch)) => {
+                                // SECURITY (audit [3]): a branch-derived amount is
+                                // attacker-controlled — the blind SE co-signs ANY leaf output value,
+                                // so an un-broadcast sub-coin's funding tx can claim any amount. A
+                                // caller that gates a decision on this amount (the SSP pre-payment
+                                // value gate) MUST NOT trust it until the branch is validated. Run
+                                // the SAME branch + terminal-ancestor checks the claim path runs; on
+                                // ANY failure report amount 0 so the value gate rejects it. An
+                                // on-chain (non-branch) funding tx0 is already authoritative.
+                                let trusted = if funding_from_branch {
+                                    validate_branch(
+                                        &client_config.electrum_client,
+                                        &transfer_msg.branch_txs,
+                                        &wallet.network,
+                                        client_config.confirmation_target,
+                                    )
+                                    .await
+                                    .is_ok()
+                                        && match required_terminal_ancestors(&transfer_msg.branch_txs)
+                                        {
+                                            std::result::Result::Ok(req) => verify_terminal_parents(
+                                                client_config,
+                                                &transfer_msg.terminal_parents,
+                                                req,
+                                            )
+                                            .await
+                                            .is_ok(),
+                                            Err(_) => false,
+                                        }
+                                } else {
+                                    true
+                                };
+                                if trusted {
+                                    mercurylib::transfer::receiver::get_amount_from_tx0(
+                                        &tx0_hex,
+                                        &tx0_outpoint,
+                                    )
+                                    .unwrap_or(0)
+                                } else {
+                                    0
+                                }
                             }
                             Err(_) => 0,
                         }
@@ -315,9 +364,20 @@ pub async fn peek_pending_transfers(
             } else {
                 0
             };
+            // Carry the coin's RGB consignment envelope (if any) + its witness outpoint so a caller
+            // can validate the COLORED value pre-payment too (audit [4]); the sats `amount` above is
+            // now branch-validated (audit [3]).
+            let rgb_consignment = transfer_msg
+                .backup_transactions
+                .iter()
+                .find_map(|b| b.rgb_consignment.clone());
             out.push(PendingTransferInfo {
                 statechain_id: transfer_msg.statechain_id,
                 amount,
+                rgb_consignment,
+                funding_txid,
+                funding_vout,
+                branch_txs: transfer_msg.branch_txs.clone(),
             });
         }
     }

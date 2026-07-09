@@ -1280,6 +1280,50 @@ impl SparkWallet {
         })?;
         Ok(Some((contract_id, booked)))
     }
+
+    /// Validate a PENDING (un-claimed) token transfer's consignment WITHOUT booking it, returning
+    /// `(contract_id, booked_amount)` — the amount the consignment *cryptographically* assigns to
+    /// the coin's witness outpoint `funding_txid:vout`. Security gate for audit [4]: the SSP's
+    /// pre-payment check calls this to verify a latched colored coin actually carries the invoiced
+    /// asset + amount BEFORE it pays the Lightning invoice. A HODL swap forces payment before the
+    /// coin can be claimed, so the post-claim balance-delta check is a backstop, not the gate; and
+    /// the envelope's advisory `env.a` is attacker-controlled, so only this consignment-derived
+    /// amount is trustworthy. Read-only: `validate_offchain_chain_info` and `accept_offchain_amount`
+    /// load the consignment into a temp dir and query it, mutating neither the stash nor the wallet,
+    /// so it does not disturb the later `accept_incoming_tokens` booking.
+    pub(crate) async fn validate_pending_token(
+        &self,
+        consignment_env: &str,
+        branch_txs: &[String],
+        funding_txid: &str,
+        funding_vout: u32,
+    ) -> Result<(String, u64)> {
+        let env: ConsignmentEnvelope = serde_json::from_str(consignment_env)
+            .map_err(|e| anyhow!("malformed consignment envelope: {e}"))?;
+        let mut txids = Vec::new();
+        for b in branch_txs {
+            let tx: bitcoin::Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(b)?)?;
+            txids.push(tx.txid().to_string());
+        }
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("RGB engine not configured"))?;
+        let (valid, detail, contract_id) = tokio::task::block_in_place(|| {
+            w.validate_offchain_chain_info(&env.c, &txids)
+        })?;
+        if !valid {
+            return Err(anyhow!(
+                "pending token consignment INVALID: {}",
+                detail.unwrap_or_default()
+            ));
+        }
+        let contract_id =
+            contract_id.ok_or_else(|| anyhow!("validated consignment without contract id"))?;
+        let booked = tokio::task::block_in_place(|| {
+            w.accept_offchain_amount(&env.c, &txids, funding_txid, funding_vout)
+        })?;
+        Ok((contract_id, booked))
+    }
 }
 
 #[cfg(test)]
