@@ -259,10 +259,19 @@ needed for custody**, by construction:
 ## 7. Optional operators, and the boundaries that cannot be solved
 
 **Optional operators** (all custody-free):
-- **Deposit-token server**: sells onboarding slots — reached **through the SE** (the wallet never
-  contacts it directly; the SE relays pricing/payment details, so honest relay is part of the §3
-  trust). Worst case = losing one prepaid onboarding fee; it never touches existing coins
-  (`SdkError::TokenPaymentRequired` surfaces cost).
+- **Deposit-token server** — *no relation to RGB tokens*: a "deposit token" is an **onboarding
+  voucher**, upstream Mercury Layer's anti-spam + operator-revenue gate. Every new statechain
+  slot consumes one (each on-chain deposit — and note: each split output, `transfer_many`
+  recipient, and refresh too). Rationale: a slot is a permanent SE liability (enclave share, DB,
+  co-signing duty), and a *blind* SE has no other billing point — transfers are free and
+  unmetered, so the pay-once-per-slot model is the statechain fee model. With no token server
+  configured the SE mints **free** tokens itself (this deployment; refused on mainnet —
+  `server/src/endpoints/deposit.rs`, capped per audit [26]); with one configured, the wallet
+  reaches it **through the SE** (never directly; honest relay of pricing is part of the §3
+  trust) and pays the advertised fee on-chain (shipped default 10,000 sats — a paid deployment
+  must price near zero or exempt derived slots, else every 2-output split costs 2× the fee).
+  Worst case = losing one prepaid onboarding fee; it never touches existing coins
+  (`SdkError::TokenPaymentRequired` surfaces cost instead of silently paying).
 - **Refresh sponsor** (`refresh_sponsored`): rebates the refresh fee off-chain *after* the
   re-anchor. A sponsor that stiffs you costs exactly `fee` sats (you keep the refreshed coin);
   the failure surfaces as an explicit error ("re-anchor succeeded but the sponsor rebate
