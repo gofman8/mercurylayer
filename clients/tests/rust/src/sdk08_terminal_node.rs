@@ -10,7 +10,7 @@
 //! Run: SDK_E2E=8 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -26,7 +26,7 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk8_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk8_alice"), None).await?;
 
     // Fund alice.
     let t = prepaid_token(&cc).await?;

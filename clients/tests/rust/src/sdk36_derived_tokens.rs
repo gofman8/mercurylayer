@@ -33,7 +33,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -49,7 +49,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 /// Deposit `amount` to `w` using a REAL onboarding token, mine, and wait for the CONFIRMED coin.
 async fn deposit_confirmed_coin(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     amount: u32,
 ) -> Result<mercuryrustlib::Coin> {
@@ -120,9 +120,9 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk36_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk36_bob"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk36_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk36_bob"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     // ===== (a) SPLIT NEVER TOUCHES THE POOL ======================================================
     let coin_a = deposit_confirmed_coin(&cc, &alice, "sdk36_alice", 50_000).await?;

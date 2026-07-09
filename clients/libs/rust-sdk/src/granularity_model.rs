@@ -1,6 +1,6 @@
 //! Executable model of coin granularity (partial amounts) — the executable companion of
-//! `docs/spark/GRANULARITY-SPEC.md` (sibling of `invalidation_model.rs`, the companion of
-//! `docs/spark/INVALIDATION-SPEC.md` — the invalidation mechanics themselves live there and are
+//! `docs/utexo/GRANULARITY-SPEC.md` (sibling of `invalidation_model.rs`, the companion of
+//! `docs/utexo/INVALIDATION-SPEC.md` — the invalidation mechanics themselves live there and are
 //! NOT restated here).
 //!
 //! Pure logic only: no network, no DB, no running stack. Wherever a callable pure function

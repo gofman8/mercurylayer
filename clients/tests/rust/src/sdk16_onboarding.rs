@@ -6,7 +6,7 @@
 //! Run: SDK_E2E=16 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -16,7 +16,7 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
     crate::utils::handle_token_response(cc, &token).await
 }
 
-async fn claim_until_sats(w: &SparkWallet, want: u64) -> Result<()> {
+async fn claim_until_sats(w: &UtexoWallet, want: u64) -> Result<()> {
     for _ in 0..40 {
         w.claim().await?;
         if w.get_balance().await?.available_sats == want {
@@ -27,7 +27,7 @@ async fn claim_until_sats(w: &SparkWallet, want: u64) -> Result<()> {
     Err(anyhow!("did not receive {want} sats"))
 }
 
-async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
+async fn token_balance(w: &UtexoWallet, asset: &str) -> Result<u64> {
     Ok(w.get_token_balances().await?.into_iter().find(|t| t.asset_id == asset).map(|t| t.balance).unwrap_or(0))
 }
 
@@ -44,10 +44,10 @@ pub async fn execute() -> Result<()> {
     alice_cfg.rgb_data_dir = Some("./rgb-data-sdk16_alice".to_string());
     let mut bob_cfg = SdkConfig::regtest("sdk16_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk16_bob".to_string());
-    let (alice, _) = SparkWallet::initialize(alice_cfg, None).await?;
+    let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     // bob: a BRAND-NEW wallet — nothing but an identity/address.
-    let (bob, _) = SparkWallet::initialize(bob_cfg, None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     // Enter with nothing: zero sats, zero tokens.
     let start = bob.get_balance().await?;

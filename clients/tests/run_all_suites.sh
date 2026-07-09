@@ -2,7 +2,7 @@
 #
 # run_all_suites.sh — launch the full Spark-parity test matrix with trace logging.
 #
-# Runs: unit tests (mercury-spark-sdk), every SDK_E2E=N and RGB_E2E=N flow discovered in the
+# Runs: unit tests (mercury-utexo-sdk), every SDK_E2E=N and RGB_E2E=N flow discovered in the
 # test dispatch, the RLN Lightning smoke (LN_SMOKE=1), and the upstream Mercury suite. Captures
 # per-test stdout/stderr plus time-sliced docker logs (mercury-server, lockbox, electrs) so the
 # run can be reviewed for anomalies (delays, retries, malformed/late/replayed messages).
@@ -14,13 +14,13 @@
 # Usage:
 #   ./run_all_suites.sh                 # everything
 #   ONLY="SDK_E2E=1 SDK_E2E=8" ./run_all_suites.sh   # a subset
-#   TRACE=1 ./run_all_suites.sh         # RUST_LOG=info,mercury_spark_sdk=debug for the client
+#   TRACE=1 ./run_all_suites.sh         # RUST_LOG=info,mercury_utexo_sdk=debug for the client
 #   SKIP_LN=1 ./run_all_suites.sh       # skip the slow RLN-backed flows (5,6 + LN smoke)
 set -u
 
 REPO="/Users/gofman/Claude/mercurylayer"
 TESTS="$REPO/clients/tests/rust"
-LOGDIR="${LOGDIR:-/tmp/spark_suite_logs}"
+LOGDIR="${LOGDIR:-/tmp/utexo_suite_logs}"
 SUMMARY="$LOGDIR/summary.txt"
 
 source "$HOME/.cargo/env" 2>/dev/null || true
@@ -33,7 +33,7 @@ export RLN_REGTEST="${RLN_REGTEST:-/Users/gofman/Claude/rgb-lightning-node/regte
 export RLN_BITCOIND_CONTAINER="${RLN_BITCOIND_CONTAINER:-rgb-lightning-node-bitcoind-1}"
 
 if [ "${TRACE:-0}" = "1" ]; then
-  export RUST_LOG="${RUST_LOG:-info,mercury_spark_sdk=debug,mercuryrustlib=debug,reqwest=info}"
+  export RUST_LOG="${RUST_LOG:-info,mercury_utexo_sdk=debug,mercuryrustlib=debug,reqwest=info}"
 fi
 
 mkdir -p "$LOGDIR"
@@ -77,8 +77,8 @@ run() {
 
 # --- unit tests first (fast, no stack) ---
 if [ -z "${ONLY:-}" ] || grep -qw "UNIT" <<<"${ONLY:-}"; then
-  echo "== unit: mercury-spark-sdk ==" | tee -a "$SUMMARY"
-  ( cd "$REPO" && cargo +stable test -p mercury-spark-sdk > "$LOGDIR/UNIT.log" 2>&1 )
+  echo "== unit: mercury-utexo-sdk ==" | tee -a "$SUMMARY"
+  ( cd "$REPO" && cargo +stable test -p mercury-utexo-sdk > "$LOGDIR/UNIT.log" 2>&1 )
   if grep -qE "test result: ok" "$LOGDIR/UNIT.log"; then
     echo "UNIT           -> PASS" | tee -a "$SUMMARY"
   else

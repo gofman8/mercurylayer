@@ -1,7 +1,7 @@
 //! mercury-ssp — the SSP service over HTTP.
 //!
-//! Wraps `mercury_spark_sdk::ssp::SspService` (a statechain wallet + an RLN Lightning node):
-//!   GET  /info                    -> { spark_address, fee_sats }
+//! Wraps `mercury_utexo_sdk::ssp::SspService` (a statechain wallet + an RLN Lightning node):
+//!   GET  /info                    -> { utexo_address, fee_sats }
 //!   POST /quote   { invoice }     -> { amount_sats, fee_sats, payment_hash, ssp_address }
 //!   POST /pay     { invoice, batch_id } -> { preimage }         (user latched the coin first)
 //!   POST /receive { amount_sats, receiver_address } -> { invoice, batch_id, payment_hash }
@@ -13,8 +13,8 @@
 #[macro_use]
 extern crate rocket;
 
-use mercury_spark_sdk::ssp::{RlnClient, SspService};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::ssp::{RlnClient, SspService};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use rocket::serde::json::Json;
 use rocket::State;
 use serde::{Deserialize, Serialize};
@@ -53,8 +53,8 @@ fn err(e: anyhow::Error) -> Json<Value> {
 
 #[get("/info")]
 async fn info(app: &State<App>) -> Json<Value> {
-    match app.ssp.wallet.get_spark_address().await {
-        Ok(addr) => Json(json!({ "spark_address": addr, "fee_sats": app.ssp.fee_sats })),
+    match app.ssp.wallet.get_utexo_address().await {
+        Ok(addr) => Json(json!({ "utexo_address": addr, "fee_sats": app.ssp.fee_sats })),
         Err(e) => err(e),
     }
 }
@@ -121,7 +121,7 @@ async fn rocket() -> _ {
         cfg.database_file = db;
     }
 
-    let (wallet, _mnemonic) = SparkWallet::initialize(cfg, None)
+    let (wallet, _mnemonic) = UtexoWallet::initialize(cfg, None)
         .await
         .expect("SSP wallet init failed");
     // Keep claiming incoming latched coins (pay swaps) automatically.

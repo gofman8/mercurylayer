@@ -7,8 +7,8 @@
 //! Run: SDK_E2E=21 ML_NETWORK=regtest RLN_REGTEST=.../regtest.sh cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::{RlnClient, Ssp, SspClient};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::ssp::{RlnClient, Ssp, SspClient};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use sha2::{Digest, Sha256};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -45,7 +45,7 @@ pub async fn execute() -> Result<()> {
     {
         let mut cfg = SdkConfig::regtest("sdk21_ssp");
         cfg.database_file = ssp_db.to_string();
-        let (ssp_wallet, _) = SparkWallet::initialize(cfg, None).await?;
+        let (ssp_wallet, _) = UtexoWallet::initialize(cfg, None).await?;
         let t = prepaid_token(&cc).await?;
         ssp_wallet.add_prepaid_token(&t).await;
         let addr = ssp_wallet.get_deposit_address(100_000).await?;
@@ -113,7 +113,7 @@ pub async fn execute() -> Result<()> {
     }
 
     // --- PAY (Mercury -> Lightning) through the REMOTE SSP ----------------------------------------
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk21_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk21_alice"), None).await?;
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(50_000).await?;
@@ -145,7 +145,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK21 - PAY via remote SSP: invoice Succeeded, valid preimage \u{2713}");
 
     // --- RECEIVE (Lightning -> Mercury) through the REMOTE SSP ------------------------------------
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk21_bob"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk21_bob"), None).await?;
     let mut bob_events = bob.subscribe();
     let bob_bg = bob.start_background();
     let swap = bob.create_lightning_invoice(&ssp, 20_000).await?;

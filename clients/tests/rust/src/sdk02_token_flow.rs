@@ -1,4 +1,4 @@
-//! E2E: mercury-spark-sdk token flow — issuer-SDK parity on RGB rails.
+//! E2E: mercury-utexo-sdk token flow — issuer-SDK parity on RGB rails.
 //!
 //! alice issues 1000 TKN (RGB NIA) straight onto a statechain coin, then pays bob 250 TKN
 //! **off-chain**: colored split (exact piece + change) + branch-carrying key handover with the
@@ -9,7 +9,7 @@
 //! Run: SDK_E2E=2 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -34,9 +34,9 @@ pub async fn execute() -> Result<()> {
     let mut bob_cfg = SdkConfig::regtest("sdk2_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk2_bob".to_string());
 
-    let (alice, _) = SparkWallet::initialize(alice_cfg, None).await?;
-    let (bob, _) = SparkWallet::initialize(bob_cfg, None).await?;
-    let bob_address = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
+    let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
+    let bob_address = bob.get_utexo_address().await?;
     println!("SDK02 - wallets up; bob address: {bob_address}");
 
     // --- Fund alice's RGB engine (issuance needs a colorable UTXO + witness fees) -------------

@@ -1,18 +1,18 @@
 //! Spark invoices: a self-describing payment request a payer can fulfill in one call. Encodes the
 //! recipient's spark address plus the requested amount, optional asset (sats when absent), memo,
-//! and expiry. Mirrors Spark's `createSatsInvoice`/`createTokensInvoice`/`fulfillSparkInvoice`.
+//! and expiry. Mirrors Spark's `createSatsInvoice`/`createTokensInvoice`/`fulfillUtexoInvoice`.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::types::TransferResult;
-use crate::wallet::SparkWallet;
+use crate::wallet::UtexoWallet;
 
 /// Scheme prefix for the encoded invoice string.
-const SCHEME: &str = "sparkinv1";
+const SCHEME: &str = "utexoinv1";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct SparkInvoice {
+pub struct UtexoInvoice {
     pub version: u8,
     /// Recipient statechain address (ml1…/tml1…).
     pub address: String,
@@ -25,14 +25,14 @@ pub struct SparkInvoice {
     pub expiry_unix: Option<u64>,
 }
 
-/// Encode an invoice as `sparkinv1<hex(json)>`.
-pub fn encode_spark_invoice(inv: &SparkInvoice) -> Result<String> {
+/// Encode an invoice as `utexoinv1<hex(json)>`.
+pub fn encode_utexo_invoice(inv: &UtexoInvoice) -> Result<String> {
     let json = serde_json::to_vec(inv)?;
     Ok(format!("{SCHEME}{}", hex::encode(json)))
 }
 
-/// Decode a `sparkinv1…` invoice string.
-pub fn decode_spark_invoice(s: &str) -> Result<SparkInvoice> {
+/// Decode a `utexoinv1…` invoice string.
+pub fn decode_utexo_invoice(s: &str) -> Result<UtexoInvoice> {
     let body = s
         .strip_prefix(SCHEME)
         .ok_or_else(|| anyhow!("not a spark invoice (missing {SCHEME} prefix)"))?;
@@ -40,7 +40,7 @@ pub fn decode_spark_invoice(s: &str) -> Result<SparkInvoice> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// Create a sats payment request payable to this wallet. Spark's `createSatsInvoice`.
     pub async fn create_sats_invoice(
         &self,
@@ -48,8 +48,8 @@ impl SparkWallet {
         memo: Option<String>,
         expiry_unix: Option<u64>,
     ) -> Result<String> {
-        let address = self.get_spark_address().await?;
-        encode_spark_invoice(&SparkInvoice {
+        let address = self.get_utexo_address().await?;
+        encode_utexo_invoice(&UtexoInvoice {
             version: 1,
             address,
             amount,
@@ -67,8 +67,8 @@ impl SparkWallet {
         memo: Option<String>,
         expiry_unix: Option<u64>,
     ) -> Result<String> {
-        let address = self.get_spark_address().await?;
-        encode_spark_invoice(&SparkInvoice {
+        let address = self.get_utexo_address().await?;
+        encode_utexo_invoice(&UtexoInvoice {
             version: 1,
             address,
             amount,
@@ -79,9 +79,9 @@ impl SparkWallet {
     }
 
     /// Pay a Spark invoice: decode it, check expiry, and transfer the requested sats or tokens to
-    /// the embedded address. Spark's `fulfillSparkInvoice`.
-    pub async fn fulfill_spark_invoice(&self, invoice: &str) -> Result<TransferResult> {
-        let inv = decode_spark_invoice(invoice)?;
+    /// the embedded address. Spark's `fulfillUtexoInvoice`.
+    pub async fn fulfill_utexo_invoice(&self, invoice: &str) -> Result<TransferResult> {
+        let inv = decode_utexo_invoice(invoice)?;
         if let Some(exp) = inv.expiry_unix {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn roundtrip_sats() {
-        let inv = SparkInvoice {
+        let inv = UtexoInvoice {
             version: 1,
             address: "tml1qexample".into(),
             amount: 25_000,
@@ -112,14 +112,14 @@ mod tests {
             memo: Some("coffee".into()),
             expiry_unix: Some(1_900_000_000),
         };
-        let enc = encode_spark_invoice(&inv).unwrap();
-        assert!(enc.starts_with("sparkinv1"));
-        assert_eq!(decode_spark_invoice(&enc).unwrap(), inv);
+        let enc = encode_utexo_invoice(&inv).unwrap();
+        assert!(enc.starts_with("utexoinv1"));
+        assert_eq!(decode_utexo_invoice(&enc).unwrap(), inv);
     }
 
     #[test]
     fn roundtrip_tokens() {
-        let inv = SparkInvoice {
+        let inv = UtexoInvoice {
             version: 1,
             address: "tml1qexample".into(),
             amount: 250,
@@ -127,13 +127,13 @@ mod tests {
             memo: None,
             expiry_unix: None,
         };
-        let enc = encode_spark_invoice(&inv).unwrap();
-        assert_eq!(decode_spark_invoice(&enc).unwrap(), inv);
+        let enc = encode_utexo_invoice(&inv).unwrap();
+        assert_eq!(decode_utexo_invoice(&enc).unwrap(), inv);
     }
 
     #[test]
     fn rejects_non_invoice() {
-        assert!(decode_spark_invoice("lnbc1...").is_err());
-        assert!(decode_spark_invoice("sparkinv1zznothex").is_err());
+        assert!(decode_utexo_invoice("lnbc1...").is_err());
+        assert!(decode_utexo_invoice("utexoinv1zznothex").is_err());
     }
 }

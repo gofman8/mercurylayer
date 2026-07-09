@@ -7,17 +7,17 @@ libraries, no framework, no npm dependencies:
 browser SPA (public/, vanilla JS)
    │  REST + SSE
 server.js (zero-dep Node bridge, 1:1 method forwarding)
-   │  @mercury/spark-sdk  (clients/libs/nodejs-spark)
-mercury-spark-sdkd (JSON-lines daemon)
+   │  @mercury/utexo-sdk  (clients/libs/nodejs-utexo)
+mercury-utexo-sdkd (JSON-lines daemon)
    │
-mercury-spark-sdk (Rust) — off-chain splits, receiver verification, auto-refresh,
+mercury-utexo-sdk (Rust) — off-chain splits, receiver verification, auto-refresh,
                             watchtower, RGB — against the SE + electrum
 ```
 
 ## Run (regtest)
 
 ```sh
-cargo build -p mercury-spark-sdkd          # once, from the repo root
+cargo build -p mercury-utexo-sdkd          # once, from the repo root
 node clients/apps/web-wallet/server.js     # http://localhost:8787
 ```
 

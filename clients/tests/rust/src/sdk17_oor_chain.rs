@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -33,7 +33,7 @@ fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
     !listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout)
 }
 
-async fn claim_one(w: &SparkWallet) -> Result<()> {
+async fn claim_one(w: &UtexoWallet) -> Result<()> {
     for _ in 0..30 {
         if w.claim().await?.claimed_transfers >= 1 {
             return Ok(());
@@ -50,11 +50,11 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk17_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk17_bob"), None).await?;
-    let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk17_carol"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
-    let carol_addr = carol.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk17_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk17_bob"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk17_carol"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
+    let carol_addr = carol.get_utexo_address().await?;
 
     // alice deposits — this is the ONLY on-chain funding tx in the whole flow.
     let t = prepaid_token(&cc).await?;

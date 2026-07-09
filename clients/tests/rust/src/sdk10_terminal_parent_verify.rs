@@ -9,7 +9,7 @@
 //! Run: SDK_E2E=10 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -19,7 +19,7 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
     crate::utils::handle_token_response(cc, &token).await
 }
 
-async fn deposit(alice: &SparkWallet, cc: &mercuryrustlib::client_config::ClientConfig, amount: u64) -> Result<()> {
+async fn deposit(alice: &UtexoWallet, cc: &mercuryrustlib::client_config::ClientConfig, amount: u64) -> Result<()> {
     let t = prepaid_token(cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(amount).await?;
@@ -45,9 +45,9 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk10_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk10_bob"), None).await?;
-    let bob_address = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk10_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk10_bob"), None).await?;
+    let bob_address = bob.get_utexo_address().await?;
 
     // Three deposits: C=40k (split, positive), D=30k (split, negative), E=20k (never split).
     for amount in [40_000u64, 30_000, 20_000] {

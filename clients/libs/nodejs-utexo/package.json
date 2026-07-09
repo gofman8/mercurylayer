@@ -1,0 +1,11 @@
+{
+  "name": "@mercury/utexo-sdk",
+  "version": "0.1.0",
+  "description": "Spark-parity wallet SDK for Mercury Layer + RGB (node client over mercury-utexo-sdkd)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node test/smoke.js"
+  },
+  "license": "MIT"
+}

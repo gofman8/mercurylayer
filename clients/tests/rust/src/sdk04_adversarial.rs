@@ -11,7 +11,7 @@
 //! latch locking.) Run: SDK_E2E=4 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -27,9 +27,9 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk4_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk4_bob"), None).await?;
-    let bob_address = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk4_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk4_bob"), None).await?;
+    let bob_address = bob.get_utexo_address().await?;
 
     // Fund alice with one 40k coin.
     let t = prepaid_token(&cc).await?;

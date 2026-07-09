@@ -54,7 +54,7 @@ async fn steal_after_send(
         Ok(c) => c,
         Err(_) => return,
     };
-    let elig = |c: &&mercury_spark_sdk::types::CoinInfo| {
+    let elig = |c: &&mercury_utexo_sdk::types::CoinInfo| {
         c.status == "CONFIRMED" && c.statechain_id.is_some() && c.utxo_txid.is_some()
             && c.amount_sats >= 15_000
     };
@@ -143,7 +143,7 @@ async fn steal_after_split(
         Ok(c) => c,
         Err(_) => return,
     };
-    let elig = |c: &&mercury_spark_sdk::types::CoinInfo| {
+    let elig = |c: &&mercury_utexo_sdk::types::CoinInfo| {
         c.status == "CONFIRMED" && c.statechain_id.is_some() && c.utxo_txid.is_some()
             && c.amount_sats >= 30_000
     };

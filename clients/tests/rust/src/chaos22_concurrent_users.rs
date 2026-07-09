@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde_json::json;
@@ -190,7 +190,7 @@ pub fn classify(err: &anyhow::Error) -> Class {
 
 pub struct UserHandle {
     pub idx: usize,
-    pub wallet: SparkWallet,
+    pub wallet: UtexoWallet,
     pub address: String,
     pub is_whale: bool,
 }
@@ -258,8 +258,8 @@ pub async fn execute() -> Result<()> {
             sc.database_file = format!("{run_dir}/wallet-{i}.db");
             sc.rgb_data_dir = None; // pure-sats chaos (RGB-over-chaos is a follow-up)
             sc.rgb_proxy_url = None;
-            let (w, _) = SparkWallet::initialize(sc, None).await?;
-            let address = w.get_spark_address().await?;
+            let (w, _) = UtexoWallet::initialize(sc, None).await?;
+            let address = w.get_utexo_address().await?;
             Ok::<_, anyhow::Error>(UserHandle { idx: i, wallet: w, address, is_whale: i < whales_n })
         }));
     }

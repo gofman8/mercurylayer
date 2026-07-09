@@ -1,5 +1,5 @@
 // web-wallet bridge — a zero-dependency Node server that puts an HTTP/SSE face on
-// @mercury/spark-sdk (which itself is a thin JSON-lines client over mercury-spark-sdkd, so the
+// @mercury/utexo-sdk (which itself is a thin JSON-lines client over mercury-utexo-sdkd, so the
 // complete Rust SDK — off-chain splits, branch verification, auto-refresh, watchtower — runs
 // underneath). No protocol logic lives here: every route is a 1:1 forward to an SDK method.
 //
@@ -7,7 +7,7 @@
 //
 // Env:
 //   PORT        HTTP port (default 8787)
-//   ML_DAEMON   path to mercury-spark-sdkd (default: ../../../target/debug/mercury-spark-sdkd)
+//   ML_DAEMON   path to mercury-utexo-sdkd (default: ../../../target/debug/mercury-utexo-sdkd)
 //   ML_NETWORK  regtest | mainnet (default regtest)
 //   DATA_DIR    wallet databases + RGB state (default ./data)  ← BACK THIS UP with the mnemonic
 //   SE_URL / ELECTRUM_URL  overrides for mainnet
@@ -19,23 +19,24 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { SparkWallet } = require('../../libs/nodejs-spark');
+const { UtexoWallet } = require('../../libs/nodejs-utexo');
 
 const PORT = Number(process.env.PORT || 8787);
 const NETWORK = process.env.ML_NETWORK || 'regtest';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const DAEMON = process.env.ML_DAEMON
-  || path.resolve(__dirname, '../../../target/debug/mercury-spark-sdkd');
+  || path.resolve(__dirname, '../../../target/debug/mercury-utexo-sdkd');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MARKER = path.join(DATA_DIR, 'wallet.json');
 
 const state = {
-  wallet: null,       // SparkWallet
+  wallet: null,       // UtexoWallet
   walletName: null,
   address: null,
   fundingAddress: null, // cached RGB funding address — every fetch REVEALS a new index, and the
                         // engine's fast sync only watches a small window of recent reveals, so
                         // handing out a fresh one per request would orphan already-funded ones
+  tokensEnabled: false, // RGB assets live? (regtest default, or RGB_PROXY_URL supplied)
   sse: new Set(),     // live event-stream responses
 };
 
@@ -80,14 +81,14 @@ async function openWallet(walletName, mnemonic) {
   state.tokensEnabled = NETWORK === 'regtest' || !!process.env.RGB_PROXY_URL;
   if (mnemonic) opts.mnemonic = mnemonic;
 
-  const { wallet, mnemonic: out } = await SparkWallet.initialize(opts);
+  const { wallet, mnemonic: out } = await UtexoWallet.initialize(opts);
   for (const ev of FORWARDED_EVENTS) wallet.on(ev, (data) => pushEvent(ev, data || {}));
   wallet.on('daemonExit', (code) => pushEvent('DaemonExit', { code }));
   await wallet.startBackground(); // deposits confirm + incoming transfers claim automatically
 
   state.wallet = wallet;
   state.walletName = walletName;
-  state.address = await wallet.getSparkAddress();
+  state.address = await wallet.getUtexoAddress();
   fs.writeFileSync(MARKER, JSON.stringify({ walletName }));
   return { mnemonic: out, address: state.address };
 }
@@ -150,6 +151,7 @@ async function api(req, res, url) {
         walletName: state.walletName,
         network: NETWORK,
         address: state.address,
+        tokensEnabled: state.tokensEnabled,
       });
 
     case 'POST /api/wallet': {
@@ -180,7 +182,7 @@ async function api(req, res, url) {
       const { address, amountSats } = await readBody(req);
       if (!address) return json(res, 400, { error: 'address required' });
       if (!Number.isInteger(amountSats) || amountSats <= 0) return json(res, 400, { error: 'amountSats: positive integer required' });
-      const result = await needWallet().transfer({ receiverSparkAddress: address, amountSats });
+      const result = await needWallet().transfer({ receiverUtexoAddress: address, amountSats });
       pushEvent('Sent', result);
       return json(res, 200, result);
     }
@@ -188,7 +190,9 @@ async function api(req, res, url) {
     case 'POST /api/withdraw': {
       const { address, feeRate } = await readBody(req);
       if (!address) return json(res, 400, { error: 'address required' });
-      const txids = await needWallet().withdraw({ toAddress: address, feeRate: feeRate || null });
+      // nodejs-utexo mirrors Spark's naming: the param is `onchainAddress` (review-found: passing
+      // `toAddress` made every withdrawal die with "param 'to_address' required").
+      const txids = await needWallet().withdraw({ onchainAddress: address, feeRate: feeRate || null });
       return json(res, 200, { txids });
     }
 
@@ -209,7 +213,9 @@ async function api(req, res, url) {
       const { ticker, name, precision, supply } = await readBody(req);
       if (!TICKER_RE.test(ticker || '')) return json(res, 400, { error: 'ticker: 1-8 uppercase letters/digits, starting with a letter' });
       if (!name || name.length > 40) return json(res, 400, { error: 'name: 1-40 characters' });
-      if (!Number.isInteger(precision) || precision < 0 || precision > 18) return json(res, 400, { error: 'precision: integer 0-18' });
+      // rgb-lib allows precision up to 18, but amounts cross this bridge as JSON numbers, which
+      // round above 2^53 raw units — precision 8 keeps ~90M whole tokens safely representable.
+      if (!Number.isInteger(precision) || precision < 0 || precision > 8) return json(res, 400, { error: 'precision: integer 0-8' });
       if (!Number.isSafeInteger(supply) || supply <= 0) return json(res, 400, { error: 'supply: positive integer (raw units)' });
       // One on-chain tx (the colored carrier deposit) — takes a few seconds on regtest.
       const assetId = await needWallet().issueToken({ ticker, name, precision, supply });
@@ -223,7 +229,7 @@ async function api(req, res, url) {
       if (!address) return json(res, 400, { error: 'address required' });
       if (!Number.isSafeInteger(amount) || amount <= 0) return json(res, 400, { error: 'amount: positive integer (raw units)' });
       const result = await needWallet().transferTokens({
-        tokenIdentifier: assetId, receiverSparkAddress: address, tokenAmount: amount,
+        tokenIdentifier: assetId, receiverUtexoAddress: address, tokenAmount: amount,
       });
       pushEvent('TokenSent', { assetId, amount });
       return json(res, 200, result);

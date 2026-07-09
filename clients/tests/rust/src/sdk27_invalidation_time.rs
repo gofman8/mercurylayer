@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::{bitcoin_core, electrs};
@@ -61,7 +61,7 @@ async fn wait_tip_at_least(cc: &ClientConfig, target: u32) -> Result<u32> {
 }
 
 /// Claim exactly one incoming transfer, polling for message propagation.
-async fn claim_one(w: &SparkWallet) -> Result<()> {
+async fn claim_one(w: &UtexoWallet) -> Result<()> {
     for _ in 0..30 {
         if w.claim().await?.claimed_transfers >= 1 {
             return Ok(());
@@ -74,7 +74,7 @@ async fn claim_one(w: &SparkWallet) -> Result<()> {
 /// Deposit `amount` to `w`, mine, and poll claim until the wallet holds the CONFIRMED coin.
 async fn deposit_confirmed_coin(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     amount: u32,
 ) -> Result<mercuryrustlib::Coin> {
@@ -102,8 +102,8 @@ async fn deposit_confirmed_coin(
 /// One full-amount native hop (no split): sender -> receiver. Returns the RECEIVING wallet's
 /// coin locktime after the claim (the receiver's own newest pre-signed backup).
 async fn hop(
-    sender: &SparkWallet,
-    receiver: &SparkWallet,
+    sender: &UtexoWallet,
+    receiver: &UtexoWallet,
     receiver_name: &str,
     cc: &ClientConfig,
     receiver_addr: &str,
@@ -152,10 +152,10 @@ pub async fn execute() -> Result<()> {
     let (initlock, interval) = (si.initlock, si.interval);
     println!("SDK27 - server ladder profile: initlock={initlock} interval={interval} (capacity {} hops)", initlock / interval);
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk27_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk27_bob"), None).await?;
-    let alice_addr = alice.get_spark_address().await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk27_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk27_bob"), None).await?;
+    let alice_addr = alice.get_utexo_address().await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     // ===== (a) LADDER OVER HOPS: EXACT one-interval decrement per hop ===========================
     let dep = deposit_confirmed_coin(&cc, &alice, "sdk27_alice", 50_000).await?;
@@ -319,7 +319,7 @@ pub async fn execute() -> Result<()> {
 
     // ===== (d) EPOCH OVER TIME on the sats path =================================================
     // The lib-level sats deposit API exposes epoch (get_deposit_bitcoin_address_single_use_epoch,
-    // clients/libs/rust/src/deposit.rs); the SparkWallet wrapper does not, so this leg drives
+    // clients/libs/rust/src/deposit.rs); the UtexoWallet wrapper does not, so this leg drives
     // mercuryrustlib directly (same DB, same SE). Single-use deposits skip the tx0 co-sign
     // (coin_status.rs), so the coin is FRESH (0 finalized signatures) and a refusal can only be
     // the epoch gate — not single-use.

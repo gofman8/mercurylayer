@@ -3,7 +3,7 @@
 //!
 //! A statechain coin's decrementing-`nLockTime` ladder is a finite budget: `initlock` blocks of
 //! headroom, spent by BOTH hops (`interval` per transfer) and wall-clock time (~144 blocks/day) —
-//! see [INVALIDATION-SPEC.md](../../../docs/spark/INVALIDATION-SPEC.md). When it nears the floor the
+//! see [INVALIDATION-SPEC.md](../../../docs/utexo/INVALIDATION-SPEC.md). When it nears the floor the
 //! coin becomes un-transferable (the receiver rejects a backup whose locktime is at/below the tip,
 //! `MercuryError::LocktimeTooLow`) and must be moved to L1. There is deliberately no off-chain
 //! renewal (a split-to-self resets a *leaf* ladder but not the tree's root deadline). `refresh` is
@@ -21,13 +21,13 @@
 //! blind co-signer with no on-chain wallet and cannot co-fund it). The two "ways" differ in whether
 //! the user is reimbursed:
 //!
-//! - [`SparkWallet::refresh`] — **user pays**. The refreshed coin is `amount − fee`.
-//! - [`SparkWallet::refresh_sponsored`] — **operator pays**. The re-anchor runs as above, then a
+//! - [`UtexoWallet::refresh`] — **user pays**. The refreshed coin is `amount − fee`.
+//! - [`UtexoWallet::refresh_sponsored`] — **operator pays**. The re-anchor runs as above, then a
 //!   funded operator sponsor reimburses the fee OFF-CHAIN (an instant, free statechain transfer), so
 //!   the user's TOTAL balance is preserved. The user ends with two coins: the refreshed
 //!   `amount − fee` coin plus a `fee` rebate coin. The sponsor is any funded wallet/service (in a
 //!   deployment, an SSP-like operator); the rebate half is also exposed as
-//!   [`SparkWallet::rebate_refresh_fee`] so a remote sponsor can drive it.
+//!   [`UtexoWallet::rebate_refresh_fee`] so a remote sponsor can drive it.
 
 use anyhow::{anyhow, Result};
 use mercurylib::wallet::{Coin, CoinStatus};
@@ -35,7 +35,7 @@ use mercurylib::wallet::{Coin, CoinStatus};
 use crate::events::WalletEvent;
 use crate::transfer::{backup_fee_rate, BACKUP_TX_VBYTES};
 use crate::types::TransferResult;
-use crate::wallet::SparkWallet;
+use crate::wallet::UtexoWallet;
 
 /// Outcome of a refresh: the old coin is spent on-chain (its backups are now dead) and a new coin
 /// with a fresh ladder is (or is becoming) confirmed at a fresh aggregate.
@@ -51,13 +51,13 @@ pub struct RefreshResult {
     pub fee_sats: u64,
     /// The re-anchor tx (also the fresh deposit's funding tx).
     pub refresh_txid: String,
-    /// Sats an operator sponsor reimbursed off-chain (`0` for the user-pays [`SparkWallet::refresh`];
-    /// `fee_sats + DUST_LIMIT` after [`SparkWallet::refresh_sponsored`] — the smallest off-chain-payable
+    /// Sats an operator sponsor reimbursed off-chain (`0` for the user-pays [`UtexoWallet::refresh`];
+    /// `fee_sats + DUST_LIMIT` after [`UtexoWallet::refresh_sponsored`] — the smallest off-chain-payable
     /// amount covering the sub-dust fee, so the user ends ≥ whole).
     pub rebate_sats: u64,
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// **User-pays** refresh: re-anchor `statechain_id` on-chain into a fresh aggregate, resetting
     /// its ladder and root deadline. The fee is taken from the coin (refreshed coin = `amount −
     /// fee`). One on-chain transaction; the previous outpoint is spent, so all old backups are
@@ -84,7 +84,7 @@ impl SparkWallet {
     pub async fn refresh_sponsored(
         &self,
         statechain_id: &str,
-        sponsor: &SparkWallet,
+        sponsor: &UtexoWallet,
         fee_rate: Option<f64>,
     ) -> Result<RefreshResult> {
         let mut res = self.reanchor(statechain_id, fee_rate).await?;
@@ -94,7 +94,7 @@ impl SparkWallet {
         let rebate = res.fee_sats + crate::transfer::DUST_LIMIT;
         // Reimburse off-chain to this wallet's stable receive address. The re-anchor above already
         // released the wallet lock, so this (and the sponsor's own transfer) do not deadlock.
-        let user_addr = self.get_spark_address().await?;
+        let user_addr = self.get_utexo_address().await?;
         sponsor
             .rebate_refresh_fee(&user_addr, rebate)
             .await
@@ -103,15 +103,15 @@ impl SparkWallet {
         Ok(res)
     }
 
-    /// Operator side of a sponsored refresh: send `fee_sats` off-chain to `to_spark_address` to
+    /// Operator side of a sponsored refresh: send `fee_sats` off-chain to `to_utexo_address` to
     /// reimburse a user's refresh fee. A thin, discoverable wrapper over [`Self::transfer`] — a
     /// remote sponsor service calls this after (or when notified that) the user re-anchored.
     pub async fn rebate_refresh_fee(
         &self,
-        to_spark_address: &str,
+        to_utexo_address: &str,
         fee_sats: u64,
     ) -> Result<TransferResult> {
-        self.transfer(to_spark_address, fee_sats).await
+        self.transfer(to_utexo_address, fee_sats).await
     }
 
     /// The shared re-anchor primitive (fee physically from the coin). See [`Self::refresh`].

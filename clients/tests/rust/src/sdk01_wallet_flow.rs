@@ -1,4 +1,4 @@
-//! E2E: mercury-spark-sdk happy path — the Spark-parity UX on Mercury.
+//! E2E: mercury-utexo-sdk happy path — the Spark-parity UX on Mercury.
 //!
 //! alice deposits on-chain, then pays bob twice off-chain:
 //!   1. an exact-subset amount (native key handover, any Mercury wallet could receive it),
@@ -9,7 +9,7 @@
 //! Run: SDK_E2E=1 ML_NETWORK=regtest cargo run   (regtest + lockbox stack up)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -28,11 +28,11 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
 
     let (alice, alice_mnemonic) =
-        SparkWallet::initialize(SdkConfig::regtest("sdk_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk_bob"), None).await?;
+        UtexoWallet::initialize(SdkConfig::regtest("sdk_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk_bob"), None).await?;
     println!("SDK01 - wallets up (alice mnemonic: {} words)", alice_mnemonic.split_whitespace().count());
 
-    let bob_address = bob.get_spark_address().await?;
+    let bob_address = bob.get_utexo_address().await?;
     println!("SDK01 - bob spark address: {bob_address}");
 
     // --- Deposit: two coins for alice (60k + 40k) --------------------------------------------

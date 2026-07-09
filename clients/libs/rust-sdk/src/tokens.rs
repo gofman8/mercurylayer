@@ -13,7 +13,7 @@ use mercurylib::wallet::CoinStatus;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{SdkError, TokenBalance, TransferResult, TransferredCoin};
-use crate::wallet::SparkWallet;
+use crate::wallet::UtexoWallet;
 
 /// Seal blinding used for SDK token flows (both sides derive validation from the consignment, so
 /// a fixed value is fine; randomize per-transfer once bindings expose it end-to-end).
@@ -53,7 +53,7 @@ pub(crate) struct ConsignmentEnvelope {
     pub s: u64,
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// Open (lazily) this wallet's RGB engine. Token support requires `rgb_proxy_url` and
     /// `rgb_data_dir` in the config.
     pub(crate) async fn rgb(&self) -> Result<tokio::sync::MutexGuard<'_, Option<RgbWallet>>> {

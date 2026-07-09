@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -39,7 +39,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     crate::utils::handle_token_response(cc, &token).await
 }
 
-async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn add_tokens(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
@@ -82,7 +82,7 @@ fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> Result<bool> {
 /// Returns the coin record (statechain id, outpoint, locktime of the deposit backup).
 async fn deposit_confirmed_coin(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     amount: u32,
 ) -> Result<mercuryrustlib::Coin> {
@@ -108,7 +108,7 @@ async fn deposit_confirmed_coin(
 }
 
 /// Poll claim until `n` incoming transfers have been claimed in total.
-async fn claim_n(w: &SparkWallet, n: u32) -> Result<()> {
+async fn claim_n(w: &UtexoWallet, n: u32) -> Result<()> {
     let mut got = 0u32;
     for _ in 0..60 {
         got += w.claim().await?.claimed_transfers;
@@ -130,7 +130,7 @@ pub async fn execute() -> Result<()> {
     let initlock = si.initlock;
     let interval = si.interval;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk26_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk26_alice"), None).await?;
 
     // ===== (a)+(b) DEPTH LADDER: one 200k coin split 4 times in a chain =========================
     let deposit = deposit_confirmed_coin(&cc, &alice, "sdk26_alice", 200_000).await?;
@@ -253,9 +253,9 @@ pub async fn execute() -> Result<()> {
     println!("SDK26 - depth ladder complete: 4 splits, every parent publicly terminal, branch grows ~155 vB/hop");
 
     // ===== (c) WIDTH: one split fans out to 3 recipient pieces + change =========================
-    let (dave, _) = SparkWallet::initialize(SdkConfig::regtest("sdk26_dave"), None).await?;
-    let (erin, _) = SparkWallet::initialize(SdkConfig::regtest("sdk26_erin"), None).await?;
-    let erin_addr = erin.get_spark_address().await?;
+    let (dave, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk26_dave"), None).await?;
+    let (erin, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk26_erin"), None).await?;
+    let erin_addr = erin.get_utexo_address().await?;
 
     let dave_dep = deposit_confirmed_coin(&cc, &dave, "sdk26_dave", 100_000).await?;
     let dave_parent = dave_dep

@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use crate::select::{self, Candidate, Plan};
 use crate::types::{SdkError, TransferResult, TransferredCoin};
-use crate::wallet::{coin_outpoint, SparkWallet};
+use crate::wallet::{coin_outpoint, UtexoWallet};
 
 /// True if this coin's utxo currently carries an RGB token allocation. Such coins must never be
 /// selected for a plain-BTC spend — doing so destroys the allocation (review H2).
@@ -27,7 +27,7 @@ fn is_token_carrier(c: &Coin, carriers: &std::collections::HashSet<String>) -> b
     coin_outpoint(c).map_or(false, |o| carriers.contains(&o))
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// Send `amount_sats` to a statechain address. Exact amounts always work: the SDK either finds
     /// an exact subset of coins or mints one via an off-chain split. The receiver claims
     /// asynchronously (their SDK background watcher, or any Mercury wallet's receive flow for the

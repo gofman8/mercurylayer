@@ -1,5 +1,5 @@
 //! Executable model of the old-state invalidation mechanism — the executable companion of
-//! `docs/spark/INVALIDATION-SPEC.md`.
+//! `docs/utexo/INVALIDATION-SPEC.md`.
 //!
 //! Pure logic only: no network, no DB, no running stack. Wherever a callable pure function
 //! exists these tests call the REAL one:
@@ -10,7 +10,7 @@
 //! - [`crate::transfer::split_amounts`] — the split executor's admission guard (fit + dust),
 //! - [`crate::select::plan`] — payment planning / split-floor refusal,
 //! - [`crate::wallet::deposit_anchored_deadline`] — the pure formula inside the async/electrum
-//!   `SparkWallet::deposit_anchored_exit_deadline`,
+//!   `UtexoWallet::deposit_anchored_exit_deadline`,
 //! - [`crate::types::ExitCostEstimate::fee_sats_at`] and [`crate::types::is_terminal`].
 //!
 //! Only quantities with no callable pure implementation are modelled here, each with a citation
@@ -165,11 +165,11 @@ fn exclusive_window_width_is_interval() {
     }
 }
 
-// OPEN audit item [17] (docs/spark/AUDIT-2026-07.md), encoded as executable knowledge.
+// OPEN audit item [17] (docs/utexo/AUDIT-2026-07.md), encoded as executable knowledge.
 //
 // For an off-chain sub-coin the exit branch is locktime-free; safety requires broadcasting it
 // before the EARLIEST ancestor stale backup matures. The implemented deadline
-// (`SparkWallet::deposit_anchored_exit_deadline`, wallet.rs:634-666, the audit-[10] fix) is
+// (`UtexoWallet::deposit_anchored_exit_deadline`, wallet.rs:634-666, the audit-[10] fix) is
 // deposit-anchored: `H_deposit + initlock`. Only the electrum resolution of `H_deposit` is
 // async; the formula itself is the callable `crate::wallet::deposit_anchored_deadline`, which
 // this test invokes DIRECTLY — so when the deadline is made k-aware (the audit-[17] fix) this

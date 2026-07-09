@@ -1,4 +1,4 @@
-//! mercury-spark-sdkd — JSON-lines stdio daemon over mercury-spark-sdk.
+//! mercury-utexo-sdkd — JSON-lines stdio daemon over mercury-utexo-sdk.
 //!
 //! Protocol: one JSON object per line on stdin/stdout.
 //!   request:  {"id": 1, "method": "get_balance", "params": {...}}
@@ -11,13 +11,13 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 struct State {
-    wallet: Option<SparkWallet>,
+    wallet: Option<UtexoWallet>,
     bg: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -66,7 +66,7 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
     if method == "initialize" {
         let cfg = cfg_from_params(params)?;
         let mnemonic = params.get("mnemonic").and_then(|v| v.as_str());
-        let (wallet, out_mnemonic) = SparkWallet::initialize(cfg, mnemonic).await?;
+        let (wallet, out_mnemonic) = UtexoWallet::initialize(cfg, mnemonic).await?;
         let mut st = state.lock().await;
         st.wallet = Some(wallet);
         return Ok(json!({ "mnemonic": out_mnemonic }));
@@ -94,7 +94,7 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
     };
 
     Ok(match method {
-        "get_spark_address" => json!(wallet.get_spark_address().await?),
+        "get_utexo_address" => json!(wallet.get_utexo_address().await?),
         "get_identity_public_key" => json!(wallet.get_identity_public_key().await?),
         "get_balance" => serde_json::to_value(wallet.get_balance().await?)?,
         "get_token_balances" => {
@@ -216,7 +216,7 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
         }
         "get_swap_payment_hash" => json!(wallet.get_swap_payment_hash(&p("batch_id")?).await?),
         "settle_lightning_swap" => {
-            let swap = mercury_spark_sdk::lightning::LightningSwap {
+            let swap = mercury_utexo_sdk::lightning::LightningSwap {
                 batch_id: p("batch_id")?,
                 payment_hash: params
                     .get("payment_hash")

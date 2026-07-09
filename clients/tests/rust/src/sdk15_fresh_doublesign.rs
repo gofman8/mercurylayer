@@ -13,7 +13,7 @@
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -30,7 +30,7 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk15_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk15_alice"), None).await?;
 
     // Fund a NORMAL statechain coin (single_use=false, no budget) -> the SE permits re-signing, which
     // is exactly what a malicious SE ignoring single-use would do for an off-chain node.

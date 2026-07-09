@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -38,7 +38,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 /// Deposit `amount` to `w`, mine, and poll claim until the wallet holds the CONFIRMED coin.
 async fn deposit_confirmed_coin(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     amount: u32,
 ) -> Result<mercuryrustlib::Coin> {
@@ -96,9 +96,9 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk30_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk30_bob"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk30_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk30_bob"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     let info = mercuryrustlib::utils::info_config(&cc).await?;
     let initlock = info.initlock;
@@ -205,8 +205,8 @@ pub async fn execute() -> Result<()> {
 
     // ===== (c) OPERATOR PAYS (off-chain rebate) ==================================================
     // carol is the user; a funded operator wallet reimburses the on-chain fee off-chain.
-    let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk30_carol"), None).await?;
-    let (operator, _) = SparkWallet::initialize(SdkConfig::regtest("sdk30_operator"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk30_carol"), None).await?;
+    let (operator, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk30_operator"), None).await?;
     let c0 = deposit_confirmed_coin(&cc, &carol, "sdk30_carol", 40_000).await?;
     let cid = c0.statechain_id.clone().ok_or_else(|| anyhow!("carol deposit has no id"))?;
     // Fund the operator so it can rebate off-chain.

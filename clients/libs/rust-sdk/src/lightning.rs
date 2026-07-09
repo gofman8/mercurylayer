@@ -12,7 +12,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::wallet::SparkWallet;
+use crate::wallet::UtexoWallet;
 
 /// An in-flight Lightning swap: the coin is latch-transferred; the Lightning payment for
 /// `payment_hash` settles it.
@@ -25,7 +25,7 @@ pub struct LightningSwap {
     pub statechain_id: String,
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// Start a Lightning swap: latch-transfer the coin with `statechain_id` (or the largest
     /// confirmed coin) to `counterparty_address` (the LSP), locked on a fresh SE-held preimage.
     /// Hand the returned `payment_hash` to the counterparty — they pay your Lightning invoice

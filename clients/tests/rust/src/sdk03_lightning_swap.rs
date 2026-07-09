@@ -1,4 +1,4 @@
-//! E2E: mercury-spark-sdk Lightning-swap legs — Spark's SSP preimage swap on the Mercury latch.
+//! E2E: mercury-utexo-sdk Lightning-swap legs — Spark's SSP preimage swap on the Mercury latch.
 //!
 //! alice swaps a statechain coin to bob (the LSP role) locked on an SE-held preimage:
 //! bob's claim stays LOCKED until alice settles (simulating "Lightning payment received"), then
@@ -6,7 +6,7 @@
 //! HTLC-settlement invariant. Run: SDK_E2E=3 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -23,9 +23,9 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk3_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk3_bob"), None).await?;
-    let bob_address = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk3_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk3_bob"), None).await?;
+    let bob_address = bob.get_utexo_address().await?;
 
     // alice deposits one coin.
     let t = prepaid_token(&cc).await?;

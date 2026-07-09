@@ -8,8 +8,8 @@
 //! Run: SDK_E2E=5 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::{RlnClient, SspService};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::ssp::{RlnClient, SspService};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -31,11 +31,11 @@ pub async fn execute() -> Result<()> {
     println!("SDK05 - LN pair up (channel usable)");
 
     // SSP: statechain wallet + its RLN node. No coins needed for the pay direction.
-    let (ssp_wallet, _) = SparkWallet::initialize(SdkConfig::regtest("sdk5_ssp"), None).await?;
+    let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk5_ssp"), None).await?;
     let ssp = SspService::new(ssp_wallet, RlnClient::new(&ssp_node.api), 0);
 
     // alice: 50k statechain balance.
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk5_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk5_alice"), None).await?;
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(50_000).await?;

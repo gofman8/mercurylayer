@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -40,7 +40,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 
 /// Pre-pay `n` deposit tokens into the wallet's pool (each deposit / split output / re-anchor
 /// consumes one).
-async fn prepay(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn prepay(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
@@ -51,7 +51,7 @@ async fn prepay(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
 /// Deposit `amount` to `w`, mine, and poll claim until the wallet holds the CONFIRMED coin.
 async fn deposit_confirmed_coin(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     amount: u32,
 ) -> Result<mercuryrustlib::Coin> {
@@ -133,7 +133,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK33 - server ladder: initlock={initlock} interval={}; auto_refresh margin={margin}", info.interval);
 
     // ===== (A) MAINTENANCE PASS ==================================================================
-    let (alice, _) = SparkWallet::initialize(cfg("sdk33_alice", true, margin), None).await?;
+    let (alice, _) = UtexoWallet::initialize(cfg("sdk33_alice", true, margin), None).await?;
     prepay(&cc, &alice, 8).await?;
 
     let coin0 = deposit_confirmed_coin(&cc, &alice, "sdk33_alice", DEP).await?;
@@ -207,9 +207,9 @@ pub async fn execute() -> Result<()> {
 
     // ===== (B) EMBEDDED IN transfer() ============================================================
     // Fresh wallets so exactly one aged coin exists.
-    let (alice_b, _) = SparkWallet::initialize(cfg("sdk33_carol", true, margin), None).await?;
-    let (bob_b, _) = SparkWallet::initialize(cfg("sdk33_bob", true, margin), None).await?;
-    let bob_b_addr = bob_b.get_spark_address().await?;
+    let (alice_b, _) = UtexoWallet::initialize(cfg("sdk33_carol", true, margin), None).await?;
+    let (bob_b, _) = UtexoWallet::initialize(cfg("sdk33_bob", true, margin), None).await?;
+    let bob_b_addr = bob_b.get_utexo_address().await?;
     prepay(&cc, &alice_b, 8).await?;
 
     let aged = deposit_confirmed_coin(&cc, &alice_b, "sdk33_carol", DEP).await?;
@@ -277,9 +277,9 @@ pub async fn execute() -> Result<()> {
     );
 
     // ===== (C) OPT-OUT ===========================================================================
-    let (alice_c, _) = SparkWallet::initialize(cfg("sdk33_dave", false, margin), None).await?;
-    let (bob_c, _) = SparkWallet::initialize(cfg("sdk33_bob2", false, margin), None).await?;
-    let bob_c_addr = bob_c.get_spark_address().await?;
+    let (alice_c, _) = UtexoWallet::initialize(cfg("sdk33_dave", false, margin), None).await?;
+    let (bob_c, _) = UtexoWallet::initialize(cfg("sdk33_bob2", false, margin), None).await?;
+    let bob_c_addr = bob_c.get_utexo_address().await?;
     prepay(&cc, &alice_c, 6).await?;
 
     let aged_c = deposit_confirmed_coin(&cc, &alice_c, "sdk33_dave", DEP).await?;

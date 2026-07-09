@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::wallet::SparkWallet;
+use crate::wallet::UtexoWallet;
 
 /// The user-facing SSP interface: the three swap operations a wallet performs against an SSP,
 /// plus `info`. Implemented by the in-process [`SspService`] (embeds the SSP's own wallet + RLN
@@ -339,14 +339,14 @@ pub struct ReceiveSwap {
 /// The SSP service: a statechain wallet + an RLN node. Instantiable in-process (tests, embedded
 /// LSPs) or wrapped by the `mercury-ssp` HTTP binary.
 pub struct SspService {
-    pub wallet: SparkWallet,
+    pub wallet: UtexoWallet,
     pub rln: RlnClient,
     /// Flat service fee added on pay quotes (sats).
     pub fee_sats: u64,
 }
 
 impl SspService {
-    pub fn new(wallet: SparkWallet, rln: RlnClient, fee_sats: u64) -> Self {
+    pub fn new(wallet: UtexoWallet, rln: RlnClient, fee_sats: u64) -> Self {
         SspService { wallet, rln, fee_sats }
     }
 
@@ -363,7 +363,7 @@ impl SspService {
             amount_sats,
             fee_sats: self.fee_sats,
             payment_hash: d.payment_hash,
-            ssp_address: self.wallet.get_spark_address().await?,
+            ssp_address: self.wallet.get_utexo_address().await?,
             asset_id: d.asset_id,
             asset_amount: d.asset_amount,
         })
@@ -699,7 +699,7 @@ impl SspService {
 impl Ssp for SspService {
     async fn info(&self) -> Result<SspInfo> {
         Ok(SspInfo {
-            ssp_address: self.wallet.get_spark_address().await?,
+            ssp_address: self.wallet.get_utexo_address().await?,
             fee_sats: self.fee_sats,
         })
     }
@@ -775,9 +775,9 @@ impl SspClient {
 impl Ssp for SspClient {
     async fn info(&self) -> Result<SspInfo> {
         let v = self.request(self.http.get(format!("{}/info", self.base)), "info").await?;
-        let addr = v["spark_address"].as_str().unwrap_or_default();
+        let addr = v["utexo_address"].as_str().unwrap_or_default();
         if addr.is_empty() {
-            return Err(anyhow!("ssp /info: no spark_address (server not ready?)"));
+            return Err(anyhow!("ssp /info: no utexo_address (server not ready?)"));
         }
         Ok(SspInfo {
             ssp_address: addr.to_string(),
@@ -822,7 +822,7 @@ impl Ssp for SspClient {
     }
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// USER SIDE — pay a BOLT11 invoice through an SSP: quote, mint the exact coin (off-chain
     /// split if needed), latch it to the invoice's payment hash and hand it over, then let the
     /// SSP pay. Returns the preimage — cryptographic proof the invoice was paid. Trustless both
@@ -921,7 +921,7 @@ impl SparkWallet {
         ssp: &impl Ssp,
         amount_sats: u64,
     ) -> Result<ReceiveSwap> {
-        let my_address = self.get_spark_address().await?;
+        let my_address = self.get_utexo_address().await?;
         ssp.create_receive(amount_sats, &my_address).await
     }
 
@@ -936,7 +936,7 @@ impl SparkWallet {
         asset_id: &str,
         asset_amount: u64,
     ) -> Result<ReceiveSwap> {
-        let my_address = self.get_spark_address().await?;
+        let my_address = self.get_utexo_address().await?;
         ssp.create_receive_asset(asset_id, asset_amount, &my_address).await
     }
 
@@ -960,7 +960,7 @@ impl SparkWallet {
     /// preimage exists for the invoice hash). This method itself only enforces the SE's batch-lock
     /// (it fails before `batch_timeout`); the non-payment confirmation is the caller's obligation.
     pub async fn reclaim_lightning_payment(&self, coin_statechain_id: &str) -> Result<()> {
-        let me = self.get_spark_address().await?;
+        let me = self.get_utexo_address().await?;
         // Fresh, un-batched transfer of the specific coin back to ourselves: the SE drops the stale
         // batch-locked transfer row and the coin's key rotates back under our control.
         mercuryrustlib::transfer_sender::execute(

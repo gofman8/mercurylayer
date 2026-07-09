@@ -27,13 +27,13 @@
 //!     branch level costs ~155 vB (one 1-in-2-out split tx, band 100..=250 like sdk26).
 //!
 //! Run: SDK_E2E=28 ML_NETWORK=regtest cargo run
-//! Cross-refs: SPEC.md REQ-15/17/18, INV-9/10; docs/spark/learn/transfers.md (amount maker);
+//! Cross-refs: SPEC.md REQ-15/17/18, INV-9/10; docs/utexo/learn/transfers.md (amount maker);
 //! sdk26 (depth/width economics baseline).
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SdkError, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, SdkError, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -43,7 +43,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     crate::utils::handle_token_response(cc, &token).await
 }
 
-async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn add_tokens(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
@@ -54,7 +54,7 @@ async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> 
 /// Deposit `amount` to `w`, mine, and poll claim until the wallet holds the CONFIRMED coin.
 async fn deposit_confirmed_coin(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     amount: u32,
 ) -> Result<mercuryrustlib::Coin> {
@@ -80,7 +80,7 @@ async fn deposit_confirmed_coin(
 }
 
 /// Poll claim until `n` incoming transfers have been claimed in total.
-async fn claim_n(w: &SparkWallet, n: u32) -> Result<()> {
+async fn claim_n(w: &UtexoWallet, n: u32) -> Result<()> {
     let mut got = 0u32;
     for _ in 0..60 {
         got += w.claim().await?.claimed_transfers;
@@ -144,12 +144,12 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk28_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk28_bob"), None).await?;
-    let (dan, _) = SparkWallet::initialize(SdkConfig::regtest("sdk28_dan"), None).await?;
-    let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk28_carol"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
-    let carol_addr = carol.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk28_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk28_bob"), None).await?;
+    let (dan, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk28_dan"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk28_carol"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
+    let carol_addr = carol.get_utexo_address().await?;
 
     // ===== (a) EXACT SUBSET: 30k + 20k + 50k, pay 50k twice — no split either time ==============
     deposit_confirmed_coin(&cc, &alice, "sdk28_alice", 30_000).await?;
@@ -289,7 +289,7 @@ pub async fn execute() -> Result<()> {
     // (FeeTooLow). Probe on a THROWAWAY coin (the current guard checks this only AFTER co-signing
     // the split, so the probe consumes that coin — hence a fresh one). Accept any error: today it
     // is FeeTooLow post-split; after the split-guard fix it becomes a clean pre-terminal refusal.
-    let (eve, _) = SparkWallet::initialize(SdkConfig::regtest("sdk28_eve"), None).await?;
+    let (eve, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk28_eve"), None).await?;
     let _ = deposit_confirmed_coin(&cc, &eve, "sdk28_eve", 5_000).await?;
     add_tokens(&cc, &eve, 2).await?;
     let sub_dust = eve.transfer(&carol_addr, 330).await;

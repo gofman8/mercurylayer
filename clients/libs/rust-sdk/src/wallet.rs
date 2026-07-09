@@ -45,11 +45,11 @@ pub(crate) struct Inner {
 
 /// Spark-parity wallet on Mercury+RGB. Cheap to clone; all clones share state.
 #[derive(Clone)]
-pub struct SparkWallet {
+pub struct UtexoWallet {
     pub(crate) inner: Arc<Inner>,
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// Create or load a wallet. Returns the wallet and its mnemonic.
     ///
     /// ⚠️ BACKUP: the mnemonic ALONE is **not** a sufficient backup (review H3). It restores the
@@ -96,7 +96,7 @@ impl SparkWallet {
         let mnemonic_out = record.mnemonic.clone();
 
         let (events_tx, _) = broadcast::channel(256);
-        let wallet = SparkWallet {
+        let wallet = UtexoWallet {
             inner: Arc::new(Inner {
                 cc,
                 config,
@@ -196,7 +196,7 @@ impl SparkWallet {
         }
 
         let (events_tx, _) = broadcast::channel(256);
-        let wallet = SparkWallet {
+        let wallet = UtexoWallet {
             inner: Arc::new(Inner {
                 cc,
                 config,
@@ -267,7 +267,7 @@ impl SparkWallet {
 
     /// The wallet's stable statechain address (bech32m `ml1…`/`tml1…`) — hand this to senders.
     /// Reuse is supported; each incoming transfer lands on its own coin.
-    pub async fn get_spark_address(&self) -> Result<String> {
+    pub async fn get_utexo_address(&self) -> Result<String> {
         let _guard = self.inner.wallet_lock.lock().await;
         let record = self.record().await?;
         if let Some(c) = record.coins.first() {
@@ -1041,7 +1041,7 @@ impl SparkWallet {
     }
 }
 
-/// The pure formula behind [`SparkWallet::deposit_anchored_exit_deadline`] (audit [10] fix):
+/// The pure formula behind [`UtexoWallet::deposit_anchored_exit_deadline`] (audit [10] fix):
 /// `H_deposit + initlock`, deposit-anchored and split-tip-independent. Deliberately k-UNAWARE —
 /// it does not subtract the parent's pre-split hop count, so for a parent transferred k times
 /// before the split it is LATE by `k·interval` blocks versus the true min-ancestor maturity.
@@ -1191,7 +1191,7 @@ mod broadcast_tests {
 
 #[cfg(test)]
 mod identity_tests {
-    use super::SparkWallet;
+    use super::UtexoWallet;
     use bitcoin::secp256k1::{KeyPair, Message, Secp256k1};
     use sha2::{Digest, Sha256};
 
@@ -1211,8 +1211,8 @@ mod identity_tests {
         let sig = secp.sign_schnorr_no_aux_rand(&m, &kp);
         let sig_hex = hex::encode(sig.as_ref());
 
-        assert!(SparkWallet::validate_message_with_identity_key(msg, &sig_hex, &pk_hex).unwrap());
+        assert!(UtexoWallet::validate_message_with_identity_key(msg, &sig_hex, &pk_hex).unwrap());
         // tampered message fails
-        assert!(!SparkWallet::validate_message_with_identity_key(b"other message", &sig_hex, &pk_hex).unwrap());
+        assert!(!UtexoWallet::validate_message_with_identity_key(b"other message", &sig_hex, &pk_hex).unwrap());
     }
 }

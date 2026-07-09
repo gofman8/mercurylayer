@@ -1,5 +1,5 @@
 // utexo wallet UI — a thin view over the bridge's REST/SSE API (which is itself a 1:1 face on
-// @mercury/spark-sdk). No wallet logic lives here: format, render, forward.
+// @mercury/utexo-sdk). No wallet logic lives here: format, render, forward.
 
 const $ = (id) => document.getElementById(id);
 
@@ -95,8 +95,12 @@ function paintBadge(el, t) {
 // ---------------------------------------------------------------- state + rendering
 
 let myAddress = null;
+let tokensEnabled = true; // from /api/status — mainnet without an RGB proxy runs sats-only
 let tokens = [];          // last fetched token balances
 let currentAsset = null;  // asset open in the asset sheet
+// In-flight guards: closing a sheet does NOT abort the SDK call behind it, so reopening must
+// land back on the progress pane — never on a resubmittable form (review-found double-spend).
+const busy = { issue: false, send: false, sendAsset: null };
 
 async function refreshBalance() {
   try {
@@ -139,6 +143,7 @@ async function refreshActivity() {
 }
 
 async function refreshTokens() {
+  if (!tokensEnabled) return;
   try {
     tokens = await api('/api/tokens');
     const list = $('asset-list');
@@ -165,6 +170,15 @@ async function refreshTokens() {
       li.onclick = () => openAsset(t);
       list.appendChild(li);
     }
+    // Keep an OPEN asset sheet honest: re-render its hero from the fresh balances (it would
+    // otherwise show a pre-send/pre-receive snapshot until closed and reopened).
+    if (currentAsset && !$('modal-asset').classList.contains('hidden')) {
+      const fresh = tokens.find((x) => x.asset_id === currentAsset.asset_id);
+      if (fresh) {
+        currentAsset = fresh;
+        renderAssetHero(fresh);
+      }
+    }
   } catch { /* wallet not open yet */ }
 }
 
@@ -172,9 +186,15 @@ const refreshAll = () => { refreshBalance(); refreshActivity(); refreshTokens();
 
 function enterHome(status) {
   myAddress = status.address;
+  tokensEnabled = status.tokensEnabled !== false;
   $('net-pill').textContent = status.network;
   $('wallet-pill').textContent = status.walletName;
   $('my-address').textContent = myAddress;
+  // Sats-only deployment (no RGB proxy configured): hide the assets feature entirely rather
+  // than advertise receives that could never be booked.
+  $('assets-card').classList.toggle('hidden', !tokensEnabled);
+  $('receive-assets-hint').classList.toggle('hidden', !tokensEnabled);
+  $('receive-sats-hint').classList.toggle('hidden', tokensEnabled);
   show('screen-home');
   refreshAll();
 }
@@ -263,13 +283,13 @@ $('btn-receive').onclick = () => {
   drawQr($('qr-spark'), myAddress);
 };
 
-$('tab-spark').onclick = () => {
-  $('tab-spark').classList.add('active'); $('tab-onchain').classList.remove('active');
-  $('pane-spark').classList.remove('hidden'); $('pane-onchain').classList.add('hidden');
+$('tab-utexo').onclick = () => {
+  $('tab-utexo').classList.add('active'); $('tab-onchain').classList.remove('active');
+  $('pane-utexo').classList.remove('hidden'); $('pane-onchain').classList.add('hidden');
 };
 $('tab-onchain').onclick = () => {
-  $('tab-onchain').classList.add('active'); $('tab-spark').classList.remove('active');
-  $('pane-onchain').classList.remove('hidden'); $('pane-spark').classList.add('hidden');
+  $('tab-onchain').classList.add('active'); $('tab-utexo').classList.remove('active');
+  $('pane-onchain').classList.remove('hidden'); $('pane-utexo').classList.add('hidden');
 };
 
 $('btn-gen-deposit').onclick = async () => {
@@ -331,11 +351,14 @@ $('btn-do-send').onclick = async () => {
 // ---------------------------------------------------------------- assets: issue
 
 $('btn-issue').onclick = async () => {
-  $('issue-form').classList.remove('hidden');
-  $('issue-progress').classList.add('hidden');
+  // An issuance is still running (its sheet was closed over it): reopen ON the progress pane —
+  // resetting to the form would invite a duplicate on-chain issuance (review-found).
+  $('issue-form').classList.toggle('hidden', busy.issue);
+  $('issue-progress').classList.toggle('hidden', !busy.issue);
   $('issue-done').classList.add('hidden');
   $('issue-error').classList.add('hidden');
   $('modal-issue').classList.remove('hidden');
+  if (busy.issue) return;
   try {
     const { address } = await api('/api/tokens/funding-address');
     $('funding-address').textContent = address;
@@ -347,26 +370,35 @@ $('btn-issue').onclick = async () => {
 $('issue-ticker').addEventListener('input', (e) => { e.target.value = e.target.value.toUpperCase(); });
 
 $('btn-do-issue').onclick = async () => {
+  if (busy.issue) return;
   const err = $('issue-error');
   err.classList.add('hidden');
   try {
-    const precision = Number($('issue-precision').value);
-    if (!Number.isInteger(precision) || precision < 0 || precision > 18) throw new Error('Decimals: 0-18');
+    // Validate the RAW string: an emptied number input yields '' and Number('') === 0, which
+    // would silently mint an irreversible 0-decimals asset (review-found).
+    const precisionRaw = $('issue-precision').value.trim();
+    if (!/^\d+$/.test(precisionRaw) || Number(precisionRaw) > 8) {
+      throw new Error('Decimals: a number from 0 to 8');
+    }
+    const precision = Number(precisionRaw);
     const payload = {
       ticker: $('issue-ticker').value.trim(),
       name: $('issue-name').value.trim(),
       precision,
       supply: toRawUnits($('issue-supply').value, precision),
     };
+    busy.issue = true;
     $('issue-form').classList.add('hidden');
     $('issue-progress').classList.remove('hidden');
     await api('/api/tokens/issue', payload);
+    busy.issue = false;
     $('issue-progress').classList.add('hidden');
     $('issue-summary').textContent =
       `${payload.ticker} issued — the full supply is on a statechain coin, ready to send off-chain.`;
     $('issue-done').classList.remove('hidden');
     refreshAll();
   } catch (e) {
+    busy.issue = false;
     $('issue-progress').classList.add('hidden');
     $('issue-form').classList.remove('hidden');
     err.textContent = e.message;
@@ -376,24 +408,34 @@ $('btn-do-issue').onclick = async () => {
 
 // ---------------------------------------------------------------- assets: details + send
 
-function openAsset(t) {
-  currentAsset = t;
+/// Hero portion of the asset sheet (badge, balance, incoming chip) — rendered on open AND
+/// re-rendered by refreshTokens while the sheet stays open, so the balance never goes stale.
+function renderAssetHero(t) {
   $('asset-title').textContent = t.name || t.ticker || 'Asset';
   paintBadge($('asset-badge'), t);
   $('asset-balance').textContent = fromRawUnits(t.balance, t.precision);
   $('asset-ticker-lbl').textContent = t.ticker || '';
-  const unsettled = (t.total || 0) - (t.balance || 0);
-  $('asset-pending').classList.toggle('hidden', unsettled <= 0);
-  if (unsettled > 0) $('asset-pending').textContent = `+ ${fromRawUnits(unsettled, t.precision)} incoming`;
+  const unsettled = (BigInt(t.total || 0) - BigInt(t.balance || 0));
+  $('asset-pending').classList.toggle('hidden', unsettled <= 0n);
+  if (unsettled > 0n) $('asset-pending').textContent = `+ ${fromRawUnits(unsettled, t.precision)} incoming`;
   $('asset-id').textContent = t.asset_id;
-  $('asset-send-form').classList.remove('hidden');
-  $('asset-send-progress').classList.add('hidden');
+}
+
+function openAsset(t) {
+  // A send is still in flight (sheet was closed over it): reopen the SENDING asset on its
+  // progress pane instead of a resubmittable form — a retry here would transfer twice.
+  if (busy.send) t = busy.sendAsset;
+  currentAsset = t;
+  renderAssetHero(t);
+  $('asset-send-form').classList.toggle('hidden', busy.send);
+  $('asset-send-progress').classList.toggle('hidden', !busy.send);
   $('asset-send-done').classList.add('hidden');
   $('asset-send-error').classList.add('hidden');
   $('modal-asset').classList.remove('hidden');
 }
 
 $('btn-do-asset-send').onclick = async () => {
+  if (busy.send) return;
   const err = $('asset-send-error');
   err.classList.add('hidden');
   const address = $('asset-send-address').value.trim();
@@ -402,18 +444,25 @@ $('btn-do-asset-send').onclick = async () => {
     err.classList.remove('hidden');
     return;
   }
+  const asset = currentAsset;
   try {
-    const amount = toRawUnits($('asset-send-amount').value, currentAsset.precision);
+    const amount = toRawUnits($('asset-send-amount').value, asset.precision);
+    busy.send = true;
+    busy.sendAsset = asset;
     $('asset-send-form').classList.add('hidden');
     $('asset-send-progress').classList.remove('hidden');
-    await api('/api/tokens/send', { assetId: currentAsset.asset_id, address, amount });
+    await api('/api/tokens/send', { assetId: asset.asset_id, address, amount });
+    busy.send = false;
+    busy.sendAsset = null;
     $('asset-send-progress').classList.add('hidden');
     $('asset-send-summary').textContent =
-      `Sent ${fromRawUnits(amount, currentAsset.precision)} ${currentAsset.ticker || ''}`;
+      `Sent ${fromRawUnits(amount, asset.precision)} ${asset.ticker || ''}`;
     $('asset-send-done').classList.remove('hidden');
     $('asset-send-address').value = ''; $('asset-send-amount').value = '';
     refreshAll();
   } catch (e) {
+    busy.send = false;
+    busy.sendAsset = null;
     $('asset-send-progress').classList.add('hidden');
     $('asset-send-form').classList.remove('hidden');
     err.textContent = e.message;

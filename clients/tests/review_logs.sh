@@ -6,9 +6,9 @@
 # repeated identical requests (replay surface), and per-test wall-clock (delay surface). Run after
 # `TRACE=1 ./run_all_suites.sh`.
 #
-# Usage: ./review_logs.sh [LOGDIR]   (default /tmp/spark_suite_logs)
+# Usage: ./review_logs.sh [LOGDIR]   (default /tmp/utexo_suite_logs)
 set -u
-LOGDIR="${1:-/tmp/spark_suite_logs}"
+LOGDIR="${1:-/tmp/utexo_suite_logs}"
 [ -d "$LOGDIR" ] || { echo "no logdir $LOGDIR"; exit 1; }
 
 sec() { printf '\n===== %s =====\n' "$1"; }

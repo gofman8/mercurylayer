@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -34,17 +34,17 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
     crate::utils::handle_token_response(cc, &token).await
 }
-async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn add_tokens(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
     }
     Ok(())
 }
-async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
+async fn token_balance(w: &UtexoWallet, asset: &str) -> Result<u64> {
     Ok(w.get_token_balances().await?.into_iter().find(|t| t.asset_id == asset).map(|t| t.balance).unwrap_or(0))
 }
-async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<()> {
+async fn wait_token_balance(w: &UtexoWallet, asset: &str, want: u64) -> Result<()> {
     for _ in 0..60 {
         w.claim().await?;
         if token_balance(w, asset).await? == want {
@@ -54,7 +54,7 @@ async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<(
     }
     Err(anyhow!("settled balance of {asset} did not reach {want}"))
 }
-async fn wait_carrier(cc: &ClientConfig, w: &SparkWallet, name: &str, core: &str, asset: &str, units: u64) -> Result<mercuryrustlib::Coin> {
+async fn wait_carrier(cc: &ClientConfig, w: &UtexoWallet, name: &str, core: &str, asset: &str, units: u64) -> Result<mercuryrustlib::Coin> {
     for _ in 0..60 {
         bitcoin_core::generatetoaddress(1, core)?;
         w.claim().await?;
@@ -115,11 +115,11 @@ pub async fn execute() -> Result<()> {
     let core = bitcoin_core::getnewaddress()?;
     let initlock = mercuryrustlib::utils::info_config(&cc).await?.initlock;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk32_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk32_bob"), None).await?;
-    let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk32_carol"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
-    let carol_addr = carol.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_bob"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_carol"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
+    let carol_addr = carol.get_utexo_address().await?;
 
     let rgb_fund = alice.get_token_funding_address().await?;
     bitcoin_core::sendtoaddress(600_000, &rgb_fund)?;

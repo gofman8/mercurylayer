@@ -14,8 +14,8 @@
 //! Run: SDK_E2E=20 ML_NETWORK=regtest RLN_REGTEST=.../regtest.sh cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::{RlnClient, SspService};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::ssp::{RlnClient, SspService};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::{bitcoin_core, rln};
@@ -28,7 +28,7 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
 /// Fund `wallet` with `sats` on a confirmed statechain coin.
 async fn fund(
     cc: &mercuryrustlib::client_config::ClientConfig,
-    wallet: &SparkWallet,
+    wallet: &UtexoWallet,
     sats: u64,
 ) -> Result<()> {
     let t = prepaid_token(cc).await?;
@@ -59,14 +59,14 @@ pub async fn execute() -> Result<()> {
     let (merchant_node, ssp_node) = rln::setup_ln_pair("/tmp/rln-sdk20").await?;
     println!("SDK20 - LN pair up");
 
-    let (ssp_wallet, _) = SparkWallet::initialize(SdkConfig::regtest("sdk20_ssp"), None).await?;
+    let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_ssp"), None).await?;
     let ssp = SspService::new(ssp_wallet, RlnClient::new(&ssp_node.api), 0);
-    let ssp_address = ssp.wallet.get_spark_address().await?;
+    let ssp_address = ssp.wallet.get_utexo_address().await?;
 
     // attacker (alice) funded; a THIRD party (bob) for the wrong-recipient case.
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk20_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk20_bob"), None).await?;
-    let bob_address = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_bob"), None).await?;
+    let bob_address = bob.get_utexo_address().await?;
     fund(&cc, &alice, 100_000).await?;
     // alice needs split slots to mint exact coins.
     for _ in 0..4 {

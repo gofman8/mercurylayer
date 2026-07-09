@@ -8,7 +8,7 @@
 //! Run: SDK_E2E=9 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
     crate::utils::handle_token_response(cc, &token).await
 }
 
-fn token_balance(b: &mercury_spark_sdk::Balance, asset: &str) -> u64 {
+fn token_balance(b: &mercury_utexo_sdk::Balance, asset: &str) -> u64 {
     b.tokens.iter().find(|t| t.asset_id == asset).map(|t| t.balance).unwrap_or(0)
 }
 
@@ -53,11 +53,11 @@ pub async fn execute() -> Result<()> {
         cfg.rgb_data_dir = Some(format!("./rgb-data-{name}"));
         cfg
     };
-    let (alice, _) = SparkWallet::initialize(mk("sdk9_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(mk("sdk9_bob"), None).await?;
-    let (carol, _) = SparkWallet::initialize(mk("sdk9_carol"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
-    let carol_addr = carol.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(mk("sdk9_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(mk("sdk9_bob"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(mk("sdk9_carol"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
+    let carol_addr = carol.get_utexo_address().await?;
 
     // Fund alice's RGB engine for issuance + mint witness txs.
     let rgb_fund = alice.get_token_funding_address().await?;

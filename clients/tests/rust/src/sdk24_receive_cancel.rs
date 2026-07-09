@@ -16,8 +16,8 @@
 //! Run: SDK_E2E=24 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::{RlnClient, SspService};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::ssp::{RlnClient, SspService};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::{bitcoin_core, rln};
@@ -38,7 +38,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK24 - LN pair up");
 
     // SSP: funded statechain wallet (fronts the coin) + its RLN node.
-    let (ssp_wallet, _) = SparkWallet::initialize(SdkConfig::regtest("sdk24_ssp"), None).await?;
+    let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk24_ssp"), None).await?;
     let t = prepaid_token(&cc).await?;
     ssp_wallet.add_prepaid_token(&t).await;
     let addr = ssp_wallet.get_deposit_address(100_000).await?;
@@ -63,7 +63,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK24 - SSP funded: {} sats", ssp.wallet.get_balance().await?.available_sats);
 
     // Receiver asks for an invoice; the SSP latches the coin + issues the HODL invoice.
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk24_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk24_alice"), None).await?;
     let swap = alice.create_lightning_invoice(&ssp, 20_000).await?;
     println!(
         "SDK24 - SSP issued HODL invoice + latched the coin (hash {})",

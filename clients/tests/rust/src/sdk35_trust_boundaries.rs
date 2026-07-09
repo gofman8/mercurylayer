@@ -1,5 +1,5 @@
 //! E2E (trust boundaries): the trust relationships a user actually has — watchtower, sender,
-//! receiver — exercised adversarially. Companion to [docs/spark/TRUST-MODEL.md].
+//! receiver — exercised adversarially. Companion to [docs/utexo/TRUST-MODEL.md].
 //!
 //! WATCHTOWER TRUST = NONE (custody-free delegation):
 //! (A) KEYLESS: bob exports a `WatchBundle` — fully-signed exit material only. The test asserts the
@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{watch_pass, SdkConfig, SparkWallet, WatchBundle};
+use mercury_utexo_sdk::{watch_pass, SdkConfig, UtexoWallet, WatchBundle};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -41,17 +41,17 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
     crate::utils::handle_token_response(cc, &token).await
 }
-async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn add_tokens(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
     }
     Ok(())
 }
-async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
+async fn token_balance(w: &UtexoWallet, asset: &str) -> Result<u64> {
     Ok(w.get_token_balances().await?.into_iter().find(|t| t.asset_id == asset).map(|t| t.balance).unwrap_or(0))
 }
-async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<()> {
+async fn wait_token_balance(w: &UtexoWallet, asset: &str, want: u64) -> Result<()> {
     for _ in 0..60 {
         w.claim().await?;
         if token_balance(w, asset).await? == want {
@@ -61,7 +61,7 @@ async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<(
     }
     Err(anyhow!("settled balance of {asset} did not reach {want}"))
 }
-async fn wait_carrier(cc: &ClientConfig, w: &SparkWallet, name: &str, core: &str, asset: &str, units: u64) -> Result<mercuryrustlib::Coin> {
+async fn wait_carrier(cc: &ClientConfig, w: &UtexoWallet, name: &str, core: &str, asset: &str, units: u64) -> Result<mercuryrustlib::Coin> {
     for _ in 0..60 {
         bitcoin_core::generatetoaddress(1, core)?;
         w.claim().await?;
@@ -75,7 +75,7 @@ async fn wait_carrier(cc: &ClientConfig, w: &SparkWallet, name: &str, core: &str
     }
     Err(anyhow!("{name}: {units} of {asset} carrier did not confirm"))
 }
-async fn deposit_confirmed_coin(cc: &ClientConfig, w: &SparkWallet, wallet_name: &str, amount: u32) -> Result<mercuryrustlib::Coin> {
+async fn deposit_confirmed_coin(cc: &ClientConfig, w: &UtexoWallet, wallet_name: &str, amount: u32) -> Result<mercuryrustlib::Coin> {
     let addr = w.get_deposit_address(amount as u64).await?;
     bitcoin_core::sendtoaddress(amount, &addr)?;
     let core = bitcoin_core::getnewaddress()?;
@@ -129,15 +129,15 @@ pub async fn execute() -> Result<()> {
     let core = bitcoin_core::getnewaddress()?;
     let initlock = mercuryrustlib::utils::info_config(&cc).await?.initlock;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk35_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk35_bob"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk35_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk35_bob"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
     // carol: auto_refresh OFF so her coin genuinely floors for scenario (D).
     let mut carol_cfg = SdkConfig::regtest("sdk35_carol");
     carol_cfg.auto_refresh = false;
-    let (carol, _) = SparkWallet::initialize(carol_cfg, None).await?;
-    let (dave, _) = SparkWallet::initialize(SdkConfig::regtest("sdk35_dave"), None).await?;
-    let dave_addr = dave.get_spark_address().await?;
+    let (carol, _) = UtexoWallet::initialize(carol_cfg, None).await?;
+    let (dave, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk35_dave"), None).await?;
+    let dave_addr = dave.get_utexo_address().await?;
 
     // carol's coin is deposited FIRST so the aging below floors it by scenario (D).
     let carol_coin = deposit_confirmed_coin(&cc, &carol, "sdk35_carol", 30_000).await?;
@@ -271,6 +271,6 @@ pub async fn execute() -> Result<()> {
     assert_eq!(dave.get_balance().await?.available_sats, 0, "dave books nothing — he never accepts an already-raceable coin");
     println!("SDK35 - (D2) MALICIOUS sender (falsified local locktime, sender guard bypassed): the handover went out, and dave's receiver validation refused the coin anyway (claimed 0, balance 0) — the receiver verifies the sender's ladder, he never trusts it");
 
-    println!("SDK35 - SUCCESS: trust boundaries hold. WATCHTOWER: delegation is custody-free — the watch bundle carries zero key material (carrier entries are structurally sweep-proof), a keyless third party with only electrum access protects sats AND tokens, multiple independent watchtowers are idempotent, early broadcast only settles the owner's coins to the owner, and the malicious sender's matured backups all fail. SENDER→RECEIVER: no trust — the honest client refuses to send a floored coin, and even a malicious sender who bypasses that guard is rejected by the receiver's independent validation (LocktimeTooLow). See docs/spark/TRUST-MODEL.md for the full matrix.");
+    println!("SDK35 - SUCCESS: trust boundaries hold. WATCHTOWER: delegation is custody-free — the watch bundle carries zero key material (carrier entries are structurally sweep-proof), a keyless third party with only electrum access protects sats AND tokens, multiple independent watchtowers are idempotent, early broadcast only settles the owner's coins to the owner, and the malicious sender's matured backups all fail. SENDER→RECEIVER: no trust — the honest client refuses to send a floored coin, and even a malicious sender who bypasses that guard is rejected by the receiver's independent validation (LocktimeTooLow). See docs/utexo/TRUST-MODEL.md for the full matrix.");
     Ok(())
 }

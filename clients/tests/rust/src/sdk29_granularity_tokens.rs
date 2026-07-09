@@ -61,7 +61,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
 use mercury_rgb::RgbWallet;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -74,7 +74,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     crate::utils::handle_token_response(cc, &token).await
 }
 
-async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn add_tokens(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
@@ -82,7 +82,7 @@ async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> 
     Ok(())
 }
 
-async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
+async fn token_balance(w: &UtexoWallet, asset: &str) -> Result<u64> {
     Ok(w.get_token_balances()
         .await?
         .into_iter()
@@ -92,7 +92,7 @@ async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
 }
 
 /// Poll claim until the SETTLED balance of `asset` is exactly `want`.
-async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<()> {
+async fn wait_token_balance(w: &UtexoWallet, asset: &str, want: u64) -> Result<()> {
     for _ in 0..60 {
         w.claim().await?;
         if token_balance(w, asset).await? == want {
@@ -108,7 +108,7 @@ async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<(
 /// on `available_sats` would deadlock: carrier sats are EXCLUDED from the BTC balance (H2/[23]).
 async fn wait_carriers_confirmed(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     core: &str,
     asset: &str,
@@ -184,17 +184,17 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_bob"), None).await?;
-    let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_carol"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk29_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk29_bob"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk29_carol"), None).await?;
     // bob deliberately receives PT2 MULTIPLE times (10, then 1, then the full remaining 9_985) to
     // prove the double-receive fix: the RGB accept path is now idempotent on an already-known asset
     // (was: re-importing the genesis on every receive hit a UNIQUE constraint and stranded the
     // second allocation). dave first-sees a DIFFERENT asset (QTK) in part (d).
-    let (dave, _) = SparkWallet::initialize(SdkConfig::regtest("sdk29_dave"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
-    let carol_addr = carol.get_spark_address().await?;
-    let dave_addr = dave.get_spark_address().await?;
+    let (dave, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk29_dave"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
+    let carol_addr = carol.get_utexo_address().await?;
+    let dave_addr = dave.get_utexo_address().await?;
 
     // Fund alice's RGB engine (issuance + IFA + mint witness txs are the ISSUER's on-chain cost).
     let rgb_fund = alice.get_token_funding_address().await?;

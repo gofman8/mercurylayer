@@ -8,8 +8,8 @@
 //! Run: SDK_E2E=18 ML_NETWORK=regtest RLN_REGTEST=.../regtest.sh cargo run  (>2min: crosses 120s)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::{RlnClient, SspService};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::ssp::{RlnClient, SspService};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::{bitcoin_core, rln};
@@ -29,11 +29,11 @@ pub async fn execute() -> Result<()> {
     let (merchant_node, ssp_node) = rln::setup_ln_pair("/tmp/rln-sdk18").await?;
     println!("SDK18 - LN pair up (SSP outbound ~300k)");
 
-    let (ssp_wallet, _) = SparkWallet::initialize(SdkConfig::regtest("sdk18_ssp"), None).await?;
+    let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk18_ssp"), None).await?;
     let ssp = SspService::new(ssp_wallet, RlnClient::new(&ssp_node.api), 0);
 
     // alice funded 500k so she can mint a 400k coin.
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk18_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk18_alice"), None).await?;
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(500_000).await?;

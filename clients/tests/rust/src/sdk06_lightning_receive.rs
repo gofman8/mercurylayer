@@ -9,8 +9,8 @@
 //! Run: SDK_E2E=6 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::{RlnClient, SspService};
-use mercury_spark_sdk::{SdkConfig, SparkWallet, WalletEvent};
+use mercury_utexo_sdk::ssp::{RlnClient, SspService};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use std::time::Duration;
 
 use crate::{bitcoin_core, rln};
@@ -31,7 +31,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK06 - LN pair up");
 
     // SSP: funded statechain wallet (it fronts the coin) + its RLN node.
-    let (ssp_wallet, _) = SparkWallet::initialize(SdkConfig::regtest("sdk6_ssp"), None).await?;
+    let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk6_ssp"), None).await?;
     let t = prepaid_token(&cc).await?;
     ssp_wallet.add_prepaid_token(&t).await;
     let addr = ssp_wallet.get_deposit_address(100_000).await?;
@@ -56,7 +56,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK06 - SSP funded: 100k sats");
 
     // alice: brand-new wallet. No deposit, no on-chain anything.
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk6_alice"), None).await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk6_alice"), None).await?;
     let mut alice_events = alice.subscribe();
     let alice_bg = alice.start_background();
 

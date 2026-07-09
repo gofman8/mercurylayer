@@ -22,7 +22,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -33,7 +33,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 }
 
 /// Claim exactly one incoming transfer, polling for message propagation.
-async fn claim_one(w: &SparkWallet) -> Result<()> {
+async fn claim_one(w: &UtexoWallet) -> Result<()> {
     for _ in 0..30 {
         if w.claim().await?.claimed_transfers >= 1 {
             return Ok(());
@@ -143,7 +143,7 @@ async fn branch_root_txid(cc: &ClientConfig, wallet_name: &str, piece_id: &str) 
     Ok(tx.txid().to_string())
 }
 
-async fn fund_and_confirm(cc: &ClientConfig, alice: &SparkWallet, amount: u32) -> Result<()> {
+async fn fund_and_confirm(cc: &ClientConfig, alice: &UtexoWallet, amount: u32) -> Result<()> {
     let t = prepaid_token(cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(amount as u64).await?;
@@ -169,9 +169,9 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk13_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk13_bob"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk13_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk13_bob"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     // =====================================================================================
     // SCENARIO 1 — DEFENDED: the watcher exits the branch before the stale backup can win.

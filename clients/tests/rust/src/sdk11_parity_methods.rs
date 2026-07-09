@@ -3,7 +3,7 @@
 //! query/history API. Run: SDK_E2E=11 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::bitcoin_core;
@@ -19,11 +19,11 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk11_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk11_bob"), None).await?;
-    let (carol, _) = SparkWallet::initialize(SdkConfig::regtest("sdk11_carol"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
-    let carol_addr = carol.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk11_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk11_bob"), None).await?;
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk11_carol"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
+    let carol_addr = carol.get_utexo_address().await?;
 
     // --- P-B: identity message signing ---------------------------------------------------------
     let pubkey = alice.get_identity_public_key().await?;
@@ -32,11 +32,11 @@ pub async fn execute() -> Result<()> {
     let msg = b"spark parity attestation";
     let sig = alice.sign_message_with_identity_key(msg).await?;
     assert!(
-        SparkWallet::validate_message_with_identity_key(msg, &sig, &pubkey)?,
+        UtexoWallet::validate_message_with_identity_key(msg, &sig, &pubkey)?,
         "valid signature verifies"
     );
     assert!(
-        !SparkWallet::validate_message_with_identity_key(b"tampered", &sig, &pubkey)?,
+        !UtexoWallet::validate_message_with_identity_key(b"tampered", &sig, &pubkey)?,
         "tampered message fails"
     );
     println!("SDK11 - P-B: identity message sign + verify OK (stable key)");
@@ -80,12 +80,12 @@ pub async fn execute() -> Result<()> {
         alice.add_prepaid_token(&t).await;
     }
     let invoice = carol.create_sats_invoice(5_000, Some("for coffee".into()), None).await?;
-    assert!(invoice.starts_with("sparkinv1"));
+    assert!(invoice.starts_with("utexoinv1"));
     // Expired invoice is refused.
     let expired = carol.create_sats_invoice(1, None, Some(1)).await?;
-    assert!(alice.fulfill_spark_invoice(&expired).await.is_err(), "expired invoice refused");
+    assert!(alice.fulfill_utexo_invoice(&expired).await.is_err(), "expired invoice refused");
     // Valid invoice pays.
-    alice.fulfill_spark_invoice(&invoice).await?;
+    alice.fulfill_utexo_invoice(&invoice).await?;
     assert_eq!(carol.claim().await?.claimed_transfers, 1, "carol claims the invoice payment");
     assert_eq!(carol.get_balance().await?.available_sats, 20_000, "carol 15k + 5k invoice");
     println!("SDK11 - P-E: Spark invoice created + fulfilled (expired one refused)");

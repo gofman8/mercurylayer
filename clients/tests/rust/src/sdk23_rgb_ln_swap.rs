@@ -12,7 +12,7 @@
 //! Run: SDK_E2E=23 ML_NETWORK=regtest RLN_REGTEST=.../regtest.sh cargo run
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::ssp::RlnClient;
+use mercury_utexo_sdk::ssp::RlnClient;
 use serde_json::{json, Value};
 use std::time::Duration;
 

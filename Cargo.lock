@@ -2746,7 +2746,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "mercury-spark-sdk"
+name = "mercury-ssp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mercury-utexo-sdk",
+ "rocket",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mercury-utexo-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2769,23 +2781,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mercury-spark-sdkd"
+name = "mercury-utexo-sdkd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "mercury-spark-sdk",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mercury-ssp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "mercury-spark-sdk",
- "rocket",
+ "mercury-utexo-sdk",
  "serde",
  "serde_json",
  "tokio",
@@ -4280,7 +4280,7 @@ dependencies = [
  "env_logger 0.10.2",
  "hex",
  "mercury-rgb",
- "mercury-spark-sdk",
+ "mercury-utexo-sdk",
  "mercurylib",
  "mercuryrustlib",
  "rand 0.8.5",

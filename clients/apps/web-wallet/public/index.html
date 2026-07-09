@@ -80,7 +80,7 @@
         </button>
       </div>
 
-      <div class="card">
+      <div id="assets-card" class="card">
         <div class="card-head">
           <div class="card-title">Assets</div>
           <button id="btn-issue" class="mini">+ issue</button>
@@ -109,13 +109,15 @@
           <button class="x" data-close="modal-receive">✕</button>
         </div>
         <div class="tabs">
-          <button id="tab-spark" class="tab active">Instant</button>
+          <button id="tab-utexo" class="tab active">Instant</button>
           <button id="tab-onchain" class="tab">On-chain</button>
         </div>
 
-        <div id="pane-spark" class="pane">
-          <p class="hint">Share your address — sats <b>and RGB assets</b> both arrive here,
-            land instantly, and claim themselves in the background. Free.</p>
+        <div id="pane-utexo" class="pane">
+          <p id="receive-assets-hint" class="hint">Share your address — sats <b>and RGB assets</b>
+            both arrive here, land instantly, and claim themselves in the background. Free.</p>
+          <p id="receive-sats-hint" class="hint hidden">Share your address — incoming transfers
+            land instantly and claim themselves in the background. Free.</p>
           <div class="qr-box"><div id="qr-spark"></div></div>
           <div class="addr-row"><code id="spark-address"></code>
             <button class="mini" data-copy="spark-address">copy</button></div>

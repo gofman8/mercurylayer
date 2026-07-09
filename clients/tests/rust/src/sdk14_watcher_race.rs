@@ -14,7 +14,7 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -69,7 +69,7 @@ async fn capture_stale(cc: &ClientConfig, wallet_name: &str, amount: u32) -> Res
     })
 }
 
-async fn fund_and_confirm(cc: &ClientConfig, alice: &SparkWallet, amount: u32) -> Result<()> {
+async fn fund_and_confirm(cc: &ClientConfig, alice: &UtexoWallet, amount: u32) -> Result<()> {
     let t = prepaid_token(cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(amount as u64).await?;
@@ -95,9 +95,9 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk14_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk14_bob"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk14_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk14_bob"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     // alice pays bob 15k off-chain; bob receives a branch sub-coin.
     fund_and_confirm(&cc, &alice, 40_000).await?;

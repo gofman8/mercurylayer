@@ -1,12 +1,12 @@
 //! Self-hostable, **keyless** watchtower support.
 //!
 //! An off-chain coin's only defence is broadcasting its pre-signed exit material before an
-//! ancestor's stale backup matures (see `SparkWallet::auto_exit_due`, the in-process watchtower).
+//! ancestor's stale backup matures (see `UtexoWallet::auto_exit_due`, the in-process watchtower).
 //! Everything a watchtower must broadcast is **already fully signed** — the exit branch and the
 //! backup transactions need no keys to use and pay only to the owner. So watching can be delegated
 //! to any machine or third party WITHOUT trusting it with custody:
 //!
-//! - [`SparkWallet::export_watch_bundle`] exports a [`WatchBundle`]: for every off-chain coin, its
+//! - [`UtexoWallet::export_watch_bundle`] exports a [`WatchBundle`]: for every off-chain coin, its
 //!   exit branch (locktime-free, root-first), its clawback deadline, and — for plain coins only —
 //!   its latest backup tx. **No private material**: no mnemonic, no key shares, no RGB seed. The
 //!   worst a malicious/buggy watchtower can do with it is broadcast EARLY, which settles the
@@ -28,7 +28,7 @@ use anyhow::{anyhow, Result};
 use electrum_client::ElectrumApi;
 use mercurylib::wallet::CoinStatus;
 
-use crate::wallet::SparkWallet;
+use crate::wallet::UtexoWallet;
 
 /// One watched coin: everything needed to protect it, nothing needed to steal it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -58,7 +58,7 @@ pub struct WatchBundle {
     pub entries: Vec<WatchEntry>,
 }
 
-impl SparkWallet {
+impl UtexoWallet {
     /// Export the [`WatchBundle`] for this wallet's CONFIRMED off-chain coins (flat coins have no
     /// exit branch and no ancestor race, so there is nothing to watch for them). The bundle is
     /// serialized JSON, safe to hand to an untrusted watchtower: it contains only fully-signed

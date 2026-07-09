@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use mercury_spark_sdk::{SdkConfig, SparkWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
@@ -35,7 +35,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     crate::utils::handle_token_response(cc, &token).await
 }
 
-async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> {
+async fn add_tokens(cc: &ClientConfig, w: &UtexoWallet, n: usize) -> Result<()> {
     for _ in 0..n {
         let t = prepaid_token(cc).await?;
         w.add_prepaid_token(&t).await;
@@ -43,7 +43,7 @@ async fn add_tokens(cc: &ClientConfig, w: &SparkWallet, n: usize) -> Result<()> 
     Ok(())
 }
 
-async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
+async fn token_balance(w: &UtexoWallet, asset: &str) -> Result<u64> {
     Ok(w.get_token_balances()
         .await?
         .into_iter()
@@ -52,7 +52,7 @@ async fn token_balance(w: &SparkWallet, asset: &str) -> Result<u64> {
         .unwrap_or(0))
 }
 
-async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<()> {
+async fn wait_token_balance(w: &UtexoWallet, asset: &str, want: u64) -> Result<()> {
     for _ in 0..60 {
         w.claim().await?;
         if token_balance(w, asset).await? == want {
@@ -65,7 +65,7 @@ async fn wait_token_balance(w: &SparkWallet, asset: &str, want: u64) -> Result<(
 
 async fn wait_carriers_confirmed(
     cc: &ClientConfig,
-    w: &SparkWallet,
+    w: &UtexoWallet,
     wallet_name: &str,
     core: &str,
     asset: &str,
@@ -116,9 +116,9 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = SparkWallet::initialize(SdkConfig::regtest("sdk31_alice"), None).await?;
-    let (bob, _) = SparkWallet::initialize(SdkConfig::regtest("sdk31_bob"), None).await?;
-    let bob_addr = bob.get_spark_address().await?;
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk31_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk31_bob"), None).await?;
+    let bob_addr = bob.get_utexo_address().await?;
 
     // Fund alice's RGB engine (issuance + mint witnesses).
     let rgb_fund = alice.get_token_funding_address().await?;

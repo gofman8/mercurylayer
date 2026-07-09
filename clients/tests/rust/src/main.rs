@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     .format_timestamp_millis()
     .try_init();
 
-    // mercury-spark-sdk smoke (SDK_E2E=1): deposit -> exact-subset transfer -> auto-claim ->
+    // mercury-utexo-sdk smoke (SDK_E2E=1): deposit -> exact-subset transfer -> auto-claim ->
     // off-chain-split transfer (exact amount w/ change) -> auto-claim -> cooperative exit.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("1") {
         sdk01_wallet_flow::execute().await?;
