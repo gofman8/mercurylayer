@@ -88,9 +88,11 @@ co-signed again. Terminal status is **publicly auditable** via `GET /statechain/
 receiver trusts neither sender nor SE blindly. On receive it checks the backup ladder decrements
 and signature count (REQ-16); for off-chain sub-coins it additionally runs `validate_branch`
 (root on-chain, unspent, confirmed; every branch tx locktime `≤ tip` — INV-4, audit [11]; value
-conservation Σout ≤ Σin per hop — INV-25; full script/signature verification) and
-`verify_terminal_parents` (the sender must name at least as many structural ancestors as the
-branch has hops — INV-20 — and each must report `terminal: true` at the SE, ERR-7). Blind-SE
+conservation Σout ≤ Σin per hop — INV-25; rejection of any non-tree branch that consumes an
+outpoint more than once; full script/signature verification) and
+`verify_terminal_parents` (the sender must name at least one terminal ancestor per structural
+input the branch consumes (Σ inputs — so a multi-input combine names all N) — INV-20 — and each
+must report `terminal: true` at the SE, ERR-7). Blind-SE
 caveat ([SPEC.md §14](../SPEC.md#14-known-limitations-adversarial-review)): ancestor *ids* are
 not cryptographically bound to branch
 outpoints, so the count check defeats omission, not substitution; the compensating control is

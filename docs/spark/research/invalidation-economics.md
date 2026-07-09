@@ -14,12 +14,12 @@ size and time.
 
 | Anchor | Value | Source |
 |---|---|---|
-| Backup tx vsize (1-in-1-out P2TR keyspend) | **112 vB** | `lib/src/transaction.rs:116` (`BACKUP_TX_SIZE`), unit tests `clients/libs/rust-sdk/src/types.rs:158-179`, `SDK_E2E=7` |
-| Split branch tx vsize (1-in-2-out P2TR) | **155 vB** | measured, `types.rs:168`, `SDK_E2E=7` |
-| Depth-1 exit total | **267 vB** | 155 + 112, measured (`types.rs:170-174`) |
+| Backup tx vsize (1-in-1-out P2TR keyspend) | **112 vB** | `lib/src/transaction.rs:116` (`BACKUP_TX_SIZE`); `SDK_E2E=7` measures it on-chain (the `types.rs:167-181` `exit_cost_math` constants are unit-test illustrations, not measurements) |
+| Split branch tx vsize (1-in-2-out P2TR) | **155 vB** | measured, `SDK_E2E=7` |
+| Depth-1 exit total | **267 vB** | 155 + 112, measured (`SDK_E2E=7`) |
 | Cooperative withdraw tx | **~111–140 vB** | measured range, 1-in-1-out P2TR spend |
-| Split fee reserve | **`clamp(parent_sats/100, 300, 2000)` sats** | `clients/libs/rust-sdk/src/transfer.rs:596-599` (INV-10) |
-| Dust floor on every split output & backup output | **330 sats** | `lib/src/transaction.rs:119` (`DUST_LIMIT`), audit [9] |
+| Split fee reserve | **`clamp(parent_sats/100, 300, 2000)` sats** | `clients/libs/rust-sdk/src/transfer.rs:781-783` (`split_fee_reserve`, INV-10) |
+| Dust floor on every split output & backup output | **330 sats** | `lib/src/transaction.rs:120` (`DUST_LIMIT`), audit [9] |
 | Exit fee formula | `fee = ceil(total_vbytes × rate)` | `types.rs:136-138` (INV-17) |
 
 **Profiles.** A = deployed `initlock 1000 / interval 10` (`server/Settings.toml:2-3`);
@@ -34,17 +34,18 @@ B = code default `10000 / 100` (`server/src/server_config.rs:69-70`). Both give
 ## 1. The exit cost model
 
 A unilateral exit of a depth-N sub-coin broadcasts **N branch txs + 1 backup tx**; a flat
-(deposit) coin broadcasts the backup only (`wallet.rs:672-773`).
+(deposit) coin broadcasts the backup only (`wallet.rs:717-818`, `unilateral_exit`).
 
 ```
 total_vbytes(N) = 112 + Σ branch_vsize_i          ≈ 112 + 155·N   (split-only chain)
 fee_at(r)       = ceil(total_vbytes × r)          (types.rs:136-138, INV-17)
-wait_blocks     = max(0, backup_locktime − tip)   (wallet.rs:603-605)
+wait_blocks     = max(0, backup_locktime − tip)   (wallet.rs:650)
 backup_locktime = h_cosign + initlock − interval·k   (lib/src/transaction.rs:148-163)
 ```
 
 Combine hops are larger — roughly +57.5 vB per extra P2TR input (*model*; `SDK_E2E=26` measures
-split-only chains per depth — combine chains remain unmeasured). `estimate_exit_cost` (`wallet.rs:573-632`) does not model anything: it
+split-only chains per depth; a single 2-input colored combine is measured by sdk31 (~255 vB), but
+multi-hop combine chains remain unmeasured). `estimate_exit_cost` (`wallet.rs:618-677`) does not model anything: it
 decodes the actual pre-signed txs and sums their real vsizes.
 
 **Who pre-pays what, and when:**
@@ -90,7 +91,7 @@ wallet's input type (all rows except P2TR *model* estimates from standard input/
 
 Each deposit also consumes a **deposit token** from the SE's token server (anti-spam). Its price
 is SE-configured, not protocol-fixed; when payment is required the SDK surfaces
-`TokenPaymentRequired { fee_sats, deposit_address }` (ERR-6, `types.rs:193-199`). Treat it as a
+`TokenPaymentRequired { fee_sats, deposit_address }` (ERR-6, `types.rs:63-68`). Treat it as a
 per-deposit constant `T` sats in any TCO below.
 
 ### 2b. Off-chain receive — zero on-chain cost
@@ -127,10 +128,13 @@ materialize their branch first (adds the branch vB — same figures as §3b, min
 | lower anchor | 111 | 111 | 222 | 555 | 1,110 | 3,330 | 11,100 | 33,300 |
 | upper anchor | 140 | 140 | 280 | 700 | 1,400 | 4,200 | 14,000 | 42,000 |
 
-**N coins cost N txs today.** Plain-BTC combine is *not* a shipped SDK operation — a colored
-combine exists at lib level only (`create_colored_combine_tx`,
-`clients/libs/rust/src/rgb.rs:330`, exercised by rgb02/05/08), so "combine N coins, withdraw
-once" is a future optimization, not a current path.
+**N plain-BTC coins cost N txs today.** A multi-carrier **colored** combine is now a shipped SDK
+operation — `SparkWallet::colored_combine_transfer` (`clients/libs/rust-sdk/src/tokens.rs:708`,
+`SDK_E2E=31`) combines N carriers of an asset into one SE-co-signed colored combine tx (registered
+via `register_combine_subcoins`, `transfer.rs:564`), over the lib-level primitive
+`create_colored_combine_tx` (`clients/libs/rust/src/rgb.rs:330`, exercised by rgb02/05/08).
+**Plain-BTC** combine, however, is still *not* a shipped SDK operation, so "combine N BTC coins,
+withdraw once" remains a future optimization, not a current path.
 
 ### 3b. Unilateral exit — full pricing
 
@@ -227,7 +231,7 @@ rescue at all.
 Each transfer burns `interval` blocks of ladder headroom; the chain tip burns ~144 blocks/day
 regardless — and the two burns are **additive**, not whichever-first: receiver validation rejects
 any transfer whose newest backup locktime is at or below the tip (`LocktimeTooLow`,
-`lib/src/transfer/receiver.rs:461`), so at a sustained hop rate ρ hops/day the off-chain
+`lib/src/transfer/receiver.rs:462`), so at a sustained hop rate ρ hops/day the off-chain
 (transferable) life is exactly
 
 ```
@@ -246,7 +250,8 @@ half the idle horizon.
 Most real coins are time-dominated: the horizon (initlock/144 days) binds long before the 100-hop
 budget does. Sub-coins get a *fresh* leaf ladder at split time (`h_split + initlock`,
 `transfer.rs:438-449`) — depth does not consume interval — but the **tree's** off-chain life stays
-bounded by the root deadline `H_deposit + initlock` (`wallet.rs:634-666`, audit [10]); see the
+bounded by the root deadline `H_deposit + initlock` (`deposit_anchored_exit_deadline`, `wallet.rs:685-711`;
+pure fn `deposit_anchored_deadline`, `wallet.rs:934`; audit [10]); see the
 open-item caveat in §9.
 
 ### 4b. Price of each lifetime-extension option
@@ -256,7 +261,7 @@ and their prices:
 
 | Option | On-chain now | On-chain later | Locked/burned now | What it actually extends |
 |---|---|---|---|---|
-| **Refresh (re-anchor)** | **1 tx ≈ 112 vB** (SE-co-signed spend → fresh aggregate) + deposit token `T` | — | fee 112 sats @1 sat/vB (user-paid, or **operator-rebated off-chain** so your total is whole) | everything: brand-new coin, fresh full ladder, fresh root; old outpoint spent (old backups die). Measured, `SDK_E2E=30`. |
+| **Refresh (re-anchor)** | **1 tx ≈ 112 vB** (SE-co-signed spend → fresh aggregate) + deposit token `T` | — | fee 112 sats @1 sat/vB (user-paid, or **operator-rebated off-chain** so your total ends ≥ whole — the rebate is `fee + 330-sat dust floor`, over-covering by the dust floor since a sub-dust fee can't be rebated exactly off-chain; sdk30 asserts carol ends at 40,330 for a 40,000 coin) | everything: brand-new coin, fresh full ladder, fresh root; old outpoint spent (old backups die). Measured, `SDK_E2E=30`. |
 | **Withdraw + redeposit** | 2 txs ≈ 294 vB (140 + 154) + token `T` | — | — | same as refresh, but two txs — refresh supersedes it |
 | **Self-split** | 0 vB | +155 vB on the future exit (branch grows one hop) | fee reserve 300–2,000 sats (becomes the branch fee) | the **leaf ladder** only (fresh 100 hops); the root deadline `H_deposit+initlock` is *not* moved |
 | **Branch materialization** | branch txs (155·depth vB, fee = pre-paid reserves) | — | — | converts the sub-coin to a flat coin; the governing deadline becomes the leaf's own ladder (`h_split + initlock`) |
@@ -315,7 +320,7 @@ to) the right size.
 
 ## 5. Size effects
 
-**Fee reserve as % of coin value** (`clamp(parent/100, 300, 2000)`, `transfer.rs:596-599`):
+**Fee reserve as % of coin value** (`clamp(parent/100, 300, 2000)`, `split_fee_reserve`, `transfer.rs:781-783`):
 
 | Parent size | Reserve | % of value |
 |---|---|---|
@@ -424,7 +429,7 @@ Honesty section — status per [AUDIT-2026-07.md](../AUDIT-2026-07.md) remediati
 11 HIGH findings fixed + verified; mainnet still gated on the SGX rebuild + re-audit):
 
 - **[17] (half-closed): the true safety deadline can be earlier than the implemented one.** The
-  implemented `exit_deadline_block = H_deposit + initlock` (`wallet.rs:634-666`) is exact for
+  implemented `exit_deadline_block = H_deposit + initlock` (`deposit_anchored_deadline`, `wallet.rs:934`) is exact for
   unsplit-fresh parents but **late by k·interval** when the parent had k transfer hops before the
   split — the splitter's own retained backup matures at `H_deposit + initlock − k·interval`. An
   online receiver is unaffected (broadcast the locktime-free branch immediately and the point is
@@ -441,6 +446,8 @@ Honesty section — status per [AUDIT-2026-07.md](../AUDIT-2026-07.md) remediati
 - **sdk26 (`SDK_E2E=26`, `sdk26_invalidation_scale`): measurements folded into §3b** (2026-07-07
   run): per-hop branch delta exactly 155 vB at depths 1–4; depth-4 totals 732 vB; 3-wide fan-out
   split 241 vB; full depth-4 unilateral exit executed on regtest (branch instant, backup after
-  997-block wait, funds at the owner's backup address). Combine-hop sizes (§1) remain unmeasured.
+  997-block wait, funds at the owner's backup address). A single 2-input colored combine is now
+  measured by sdk31 (`combine_tx.vsize()`, `sdk31_token_combine.rs:204`, ~255 vB); multi-hop combine
+  CHAINS (§1) remain unmeasured.
 - **Batching (future):** plain-BTC combine-then-withdraw would turn §3a's N-tx cost into ~1 tx;
   today it does not exist as an SDK operation.

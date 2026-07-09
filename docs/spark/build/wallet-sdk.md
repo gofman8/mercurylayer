@@ -101,6 +101,13 @@ while let Ok(ev) = events.recv().await {
 // hold + send (issuance: see the issuer guide)
 let tokens = wallet.get_token_balances().await?;
 wallet.transfer_tokens(&asset_id, &bob_address, 250).await?;
+
+// Multi-recipient colored split: ONE SE-co-signed tx carves one piece per recipient
+// (its exact amount) plus this wallet's change; each piece ships its own consignment.
+// Returns one TransferResult per recipient, in order.
+let results = wallet
+    .batch_transfer_tokens(&asset_id, &[(bob_address.clone(), 250), (carol_address, 100)])
+    .await?;
 ```
 
 ## Lightning swap legs
@@ -120,6 +127,29 @@ wallet.withdraw("bc1p…", None /* all coins */, None /* fee rate */).await?;
 
 // Unilateral (no SE; branch + pre-signed backup, locktime-gated):
 wallet.unilateral_exit(None, None).await?;
+```
+
+## Refresh (re-anchor)
+
+A statechain coin's decrementing-`nLockTime` backup ladder is a finite budget: as it nears the
+floor the coin becomes un-transferable and must be reset on L1. `refresh` is that reset — ONE
+SE-co-signed transaction spends the coin's current outpoint into a fresh deposit aggregate (new
+`statechain_id`, same owner, fresh full ladder + fresh root deadline). The old outpoint is now
+spent, so every previous owner's backup is permanently invalidated. The fresh coin confirms
+asynchronously (watcher/`claim()`), like a deposit. Refresh is cooperative (needs the SE); if the
+SE is gone, exit unilaterally instead. The coin must be `CONFIRMED`, carry no RGB allocation, and
+be large enough to cover the fee above the dust floor.
+
+```rust
+// User pays: the on-chain fee comes from the coin, so the refreshed coin is amount − fee.
+// fee_rate (sat/vB) is capped at max_fee_rate; None uses the SE-quoted rate.
+let r = wallet.refresh(&statechain_id, None).await?;
+// r.old_statechain_id (now spent) / r.new_statechain_id / r.new_amount_sats == amount − fee
+
+// Operator pays: same on-chain re-anchor, then a funded `sponsor` wallet reimburses the fee
+// OFF-CHAIN (instant, free) so the user's total balance ends ≥ whole. r.rebate_sats reports
+// the amount rebated (≥ fee_sats).
+let r = wallet.refresh_sponsored(&statechain_id, &sponsor, None).await?;
 ```
 
 ## History

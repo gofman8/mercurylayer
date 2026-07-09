@@ -11,6 +11,10 @@
 | `start_background` | `() -> JoinHandle<()>` | claim/deposit watcher at `poll_interval_secs`; `abort()` to stop |
 | `get_identity_public_key` | `() -> String` | |
 | `get_spark_address` | `() -> String` | stable bech32m statechain address |
+| `export_recovery_bundle` | `() -> String` | canonical encrypted backup blob (see wallet-sdk) |
+| `import_recovery_bundle` | `(SdkConfig, bundle_json: &str) -> (SparkWallet, String)` | restore from an exported bundle |
+| `sign_message_with_identity_key` | `(message: &[u8]) -> String` | detached signature (hex) over the message |
+| `validate_message_with_identity_key` | `(message: &[u8], signature_hex: &str, public_key_hex: &str) -> bool` | static verifier for the above |
 
 ### Balance & history
 
@@ -19,6 +23,9 @@
 | `get_balance` | `() -> Balance` | `{available_sats, pending_sats, in_transfer_sats, tokens}` |
 | `get_token_balances` | `() -> Vec<TokenBalance>` | empty when RGB not configured |
 | `get_activities` | `() -> Vec<Activity>` | deposits / sends / receives |
+| `get_transfers` | `() -> Vec<Activity>` | sends / receives only (Spark's `getTransfers`) |
+| `get_transfer` | `(utxo: &str) -> Option<Activity>` | single activity by `txid:vout` or `txid` |
+| `list_coins` | `() -> Vec<CoinInfo>` | coin inventory with `status` + `off_chain` flag |
 
 ### Deposit
 
@@ -34,14 +41,24 @@
 |---|---|---|
 | `transfer` | `(receiver: &str, amount_sats: u64) -> TransferResult` | exact subset or off-chain split; `used_split` reports which |
 | `split_coin` | `(statechain_id: &str, piece_sats: u64) -> (String, String)` | explicit off-chain split (piece id, change id) |
-| `transfer_tokens` | `(asset_id: &str, receiver: &str, amount: u64) -> TransferResult` | colored split + handover; consignment in-message |
+| `transfer_tokens` | `(asset_id: &str, receiver: &str, amount: u64) -> TransferResult` | colored split OR multi-carrier combine + handover; consignment in-message (combines several carriers when one carrier is insufficient — sdk31) |
+| `transfer_many` | `(recipients: &[(String, u64)]) -> Vec<TransferResult>` | one off-chain split → N pieces (one per recipient) + change |
+| `refresh` | `(statechain_id: &str, fee_rate: Option<f64>) -> RefreshResult` | user-pays on-chain re-anchor; resets ladder + root deadline; old backups invalidated |
+| `refresh_sponsored` | `(statechain_id: &str, sponsor: &SparkWallet, fee_rate: Option<f64>) -> RefreshResult` | same re-anchor, then operator sponsor rebates the fee off-chain (`rebate_sats` ≥ `fee_sats`) |
+| `rebate_refresh_fee` | `(to_spark_address: &str, fee_sats: u64) -> TransferResult` | sponsor side; thin wrapper over `transfer` |
 
 ### Tokens (issuer)
 
 | Method | Signature | Notes |
 |---|---|---|
 | `get_token_funding_address` | `() -> String` | fund the RGB engine before issuing |
+| `get_token_l1_address` | `() -> String` | alias of `get_token_funding_address` |
 | `issue_token` | `(ticker, name, precision, supply) -> String` | RGB NIA onto a fresh statechain coin; returns `rgb:…` asset id |
+| `issue_inflatable_token` | `(ticker, name, precision, supply, inflation_amounts: Vec<u64>) -> String` | inflatable (CFA-style) issuance with reserved inflation rights |
+| `mint_tokens` | `(asset_id: &str, inflation_amounts: Vec<u64>) -> (String, u64)` | mint against reserved inflation rights; returns `(txid, minted)` |
+| `burn_tokens` | `(asset_id: &str, amount: u64) -> String` | burn held supply; returns txid |
+| `batch_transfer_tokens` | `(asset_id: &str, transfers: &[(String, u64)]) -> Vec<TransferResult>` | one colored tx to many recipients |
+| `query_token_transactions` | `(asset_id: &str) -> Vec<TokenTx>` | RGB-engine transfer history (`getTokenTransactions`) |
 
 ### Lightning
 
@@ -50,6 +67,22 @@
 | `start_lightning_swap` | `(counterparty: &str, coin: Option<String>) -> LightningSwap` | latch transfer locked on an SE preimage |
 | `get_swap_payment_hash` | `(batch_id: &str) -> Option<String>` | counterparty-side verification |
 | `settle_lightning_swap` | `(&LightningSwap) -> String` | unlock + preimage (hex) |
+| `latch_tokens` | `(asset_id: &str, receiver_address: &str, token_amount: u64, payment_hash: &str) -> (String, String)` | colored transfer latched on an external payment hash |
+
+### Invoices
+
+Self-describing payment requests. An invoice encodes the recipient's spark address plus the requested
+amount, optional asset (sats when absent), memo, and expiry, and a payer fulfills it in one call.
+
+| Method | Signature | Notes |
+|---|---|---|
+| `create_sats_invoice` | `(amount: u64, memo: Option<String>, expiry_unix: Option<u64>) -> String` | sats request payable to this wallet; returns a `sparkinv1…` string |
+| `create_tokens_invoice` | `(asset_id: &str, amount: u64, memo: Option<String>, expiry_unix: Option<u64>) -> String` | token request payable to this wallet |
+| `fulfill_spark_invoice` | `(invoice: &str) -> TransferResult` | decode, check expiry, then `transfer`/`transfer_tokens` to the embedded address; errors if expired |
+
+Free functions (re-exported from the crate root): `encode_spark_invoice(&SparkInvoice) -> String`
+encodes as `sparkinv1<hex(json)>`; `decode_spark_invoice(&str) -> SparkInvoice` parses one back
+(errors on a missing `sparkinv1` prefix or bad hex).
 
 ### Exit
 
@@ -57,6 +90,9 @@
 |---|---|---|
 | `withdraw` | `(to: &str, coins: Option<Vec<String>>, fee_rate: Option<f64>) -> Vec<String>` | cooperative; branches auto-materialize |
 | `unilateral_exit` | `(coins: Option<Vec<String>>, to: Option<String>) -> Vec<String>` | branch + stored backup (locktime-gated) |
+| `auto_exit_due` | `(margin_blocks: u32) -> Vec<String>` | broadcast branches whose exit-race deadline is within `margin_blocks` of tip; trigger for `ExitDeadlineApproaching` |
+| `estimate_exit_cost` | `(statechain_id: &str) -> ExitCostEstimate` | projected unilateral-exit cost for a coin |
+| `get_withdrawal_fee_quote` | `(statechain_ids: Option<Vec<String>>) -> WithdrawalFeeQuote` | cooperative-withdrawal fee quote |
 
 ## Events (`WalletEvent`)
 
@@ -66,6 +102,8 @@
 | `TransferClaimed` | `{statechain_ids}` |
 | `TokenTransferClaimed` | `{asset_id, amount, statechain_id}` |
 | `BalanceUpdate` | `{balance}` |
+| `ExitBranchConflict` | `{statechain_id}` — a competing tx is spending the branch root; fee-bump/re-attempt |
+| `ExitDeadlineApproaching` | `{statechain_id, deadline_block, tip}` — sub-coin near its exit-race deadline; run `auto_exit_due` or a watchtower |
 
 ## Errors (`SdkError`)
 
@@ -76,4 +114,7 @@ available_sats}` · `NoExactAmount{requested_sats}` · `TokensNotConfigured`.
 
 `Balance`, `TokenBalance`, `TransferResult{receiver_address, total_sats, coins, used_split}`,
 `ClaimResult{claimed_transfers, confirmed_deposits}`, `LightningSwap{batch_id, payment_hash,
-statechain_id}` — all `serde` serializable for bindings.
+statechain_id}`, `SparkInvoice{version, address, amount, asset_id, memo, expiry_unix}`,
+`RefreshResult{old_statechain_id, new_statechain_id, old_amount_sats, new_amount_sats, fee_sats,
+refresh_txid, rebate_sats}`, `TokenTx`, `ExitCostEstimate`, `WithdrawalFeeQuote` — all `serde`
+serializable for bindings.

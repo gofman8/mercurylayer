@@ -4,7 +4,9 @@
 > [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (§6) and explained in depth — with cost tables —
 > in [invalidation-deep-dive.md](invalidation-deep-dive.md) and
 > [invalidation-economics.md](../research/invalidation-economics.md).
-> Token-carrier coins exit differently — both plain paths refuse them; see
+> Token-carrier coins exit differently — both plain paths refuse them, and the `auto_exit_due`
+> watchtower silently skips them too, so token pieces get **no** automated deadline protection and
+> must be materialized manually; see
 > [tokens.md "Exits with tokens"](tokens.md#exits-with-tokens) and
 > [GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md) GRN-INV-14.
 
@@ -46,6 +48,16 @@ co-signature on a direct spend does the whole job.
 
 Nothing in this path talks to the SE. The obligations are timeliness ones: exit (or refresh)
 before your locktime floor approaches, as in vanilla Mercury.
+
+## Refresh (re-anchor)
+
+Instead of exiting, you can **reset** a coin's lifetime on-chain. `refresh(statechain_id, fee_rate?)`
+re-anchors the coin into a fresh aggregate (one SE-co-signed on-chain tx, ~112 vB), spending the old
+outpoint — which invalidates all old backups and hands the coin a fresh ladder and root deadline. The
+fee is drawn from the coin (user-pays); `refresh_sponsored(...)` layers an off-chain operator rebate on
+top so the user ends ≥ whole. This is the shipped lifetime-extension option — cheaper than a full exit
+and re-deposit. See [invalidation-economics.md](../research/invalidation-economics.md) §4b for the cost
+model.
 
 ## Timelock summary
 

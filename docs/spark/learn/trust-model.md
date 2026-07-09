@@ -7,7 +7,7 @@
 | SE cannot steal | cryptographic | 2-of-2 keys: the SE holds one share, never the full key |
 | You can always exit | cryptographic (+ timeliness) | pre-signed backup txs; branches for sub-coins; no SE cooperation needed |
 | Current owner wins the exit race | economic/timelock | decrementing locktimes: your backup unlocks before any previous owner's |
-| No double-spend of off-chain state | SE honesty | the SE refuses to co-sign conflicting spends (blind, but sequence-aware); optional per-coin `single_use` hard rule |
+| No double-spend of off-chain state | SE honesty + receiver-verified | the SE refuses to co-sign conflicting spends (blind, but sequence-aware); optional per-coin `single_use` hard rule; plus, for received off-chain sub-coins, the receiver independently proves every branch ancestor is terminal at the SE before accepting (`verify_terminal_parents`), so branch double-spend is receiver-verified, not merely trusted |
 | Token correctness | cryptographic | RGB client-side validation — the SE never sees or vouches for token state |
 
 Spark distributes the "refuses conflicting state" role across n operators with FROST (honest if
@@ -29,6 +29,17 @@ backstop. Nothing about *custody* rests on the SE in either design.
 1. The transfer signature binds the coin to *their* key.
 2. The **exit branch**: every branch tx is consensus-valid (scripts + signatures verified
    locally), links parent→child, and terminates at an on-chain, unspent, confirmed root.
+   The branch is also a **tree** — no outpoint is consumed twice (`reject_non_tree_branch`) —
+   and every branch tx is immediately broadcastable (locktime already satisfied at the
+   receiver's tip, INV-4) and conserves value (Σ outputs ≤ Σ inputs at every hop, so no hop
+   creates sats).
 3. The backup chain: latest backup pays the receiver; locktimes decrement correctly.
 4. For tokens: the RGB consignment validates off-chain against the same branch, and the balance
    is booked under the consignment's **verified** contract id.
+5. **Every structural ancestor the branch consumes is terminal at the SE.** The receiver
+   independently queries `GET /statechain/spend_budget/<id>` per ancestor and requires one named
+   terminal ancestor per structural *input* across the whole branch (Σ inputs, via
+   `required_terminal_ancestors` / `verify_terminal_parents`) — so a combine of N carriers forces
+   all N to be named and terminal. This makes double-spend prevention a receiver-verified
+   guarantee — a malicious *sender* cannot double-spend a parent to invalidate the branch —
+   rather than resting solely on SE honesty.

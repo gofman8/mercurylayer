@@ -469,8 +469,9 @@ amount, statechain_id}` (raw units), `BalanceUpdate`, plus the exit-side events
 Plain-BTC balance excludes carrier sats entirely (they are packaging, not spendable BTC — and
 the arithmetic fails closed if RGB state is unreadable, audit [23]).
 
-**The sharp edges, honestly:** one carrier per token transfer (§5.2); **received token pieces are
-terminal at the SDK layer** — 1,500 sats of packaging is below the token-carrier floor, so tokens
+**The sharp edges, honestly:** a receiver cannot aggregate the 1,500-sat pieces they are handed —
+below the carrier floor (§5.2; sender-side combine across carriers now ships, so the *sending* limit
+is gone); **received token pieces are terminal at the SDK layer** — 1,500 sats of packaging is below the token-carrier floor, so tokens
 you receive can be held or exited but not re-sent off-chain until combine/top-up ships (§2b;
 quantified in [granularity-economics §3/§8](../research/granularity-economics.md)); fragmentation
 with no combine (§5.5); the split-output floors — 330-sat dust, ~442-sat *mintable* piece (backup-
@@ -508,8 +509,9 @@ constant (`TOKEN_PIECE_SATS`) keeps token pieces uniform; the token amount is th
 sats — below the 2,130-sat minimum carrier (§5.3) — so a `transfer_tokens` drawing on it always
 fails with *"carrier coin too small"*. SDK token rails are structurally **one-hop**: an issuer or
 holder with a fat carrier fans out; receivers hold or exit (settlement and the asset itself are
-unaffected, §5.6). No value of the packaging constant fixes this; the fix is an SDK combine or
-top-up (roadmap, §5.2) — the arithmetic is worked in
+unaffected, §5.6). No value of the packaging constant fixes this; the fix is combining several received pieces
+(sender-side combine has **shipped**, §5.2 — though it cannot rescue a lone 1,500-sat piece) or
+variable/top-up packaging (still open) — the arithmetic is worked in
 [granularity-economics §3/§7](../research/granularity-economics.md).
 
 **What if the envelope lies about the token amount?** You book what the *consignment* assigns to

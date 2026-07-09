@@ -46,7 +46,7 @@ for their own items; this document wins for GRN-* items.
 - **GRN-REQ-1 (width)** The SDK API takes sat amounts as `u64`; each coin's amount is *booked* as
   `u32` (cap 4,294,967,295 sats ≈ 42.9 BTC — SPEC §14 "Amount width"). On the split path an
   over-cap output MUST error, not truncate: every registered sub-coin amount goes through
-  `u32::try_from` (clients/libs/rust-sdk/src/transfer.rs:421). Other paths cast unchecked
+  `u32::try_from` (clients/libs/rust-sdk/src/transfer.rs:441, `register_split_subcoins_n`). Other paths cast unchecked
   (SPEC §14); the cap is an accepted limitation, out of intended per-coin range.
 - **Resolution.** Above the dust floor, sats granularity is exact to 1 sat (SPEC INV-22): any
   piece in the GRN-INV-2 domain is mintable at 1-sat steps.
@@ -77,7 +77,8 @@ for their own items; this document wins for GRN-* items.
 ## 2. Payment planning (sats)
 
 `transfer(address, amount)` plans over confirmed, non-carrier coins via `select::plan`
-(clients/libs/rust-sdk/src/select.rs:75-123; transfer.rs:35-127).
+(clients/libs/rust-sdk/src/select.rs:85-133 `plan_with_floor`, a 2-line wrapper `plan` at 77-79;
+transfer.rs:35-127).
 
 - **GRN-REQ-4 (plan semantics — refines SPEC REQ-15/INV-9)** `plan(coins, target)` MUST return
   exactly one of:
@@ -96,9 +97,9 @@ for their own items; this document wins for GRN-* items.
   any multi-coin path.
 - **GRN-REQ-5 (split-candidate admission — audit [29])** The split candidate MUST satisfy
   `remaining >= 330` AND `candidate_sats > remaining + fee_reserve(candidate_sats) + 330`
-  (select.rs:103-113) — i.e. the planner only picks a coin the split executor (§3) will accept,
+  (select.rs:114-122) — i.e. the planner only picks a coin the split executor (§3) will accept,
   leaving a non-dust change. A remainder below 330 sats MUST yield `Insufficient` **even when the
-  wallet balance covers the target** (unit `sub_dust_remainder_is_refused`, select.rs:163-168):
+  wallet balance covers the target** (unit `sub_dust_remainder_is_refused`, select.rs:172-178):
   a sub-dust piece would make the split tx unbroadcastable (GRN-INV-1).
 
   *Note (planner conservatism — the planner is incomplete and 1 sat stricter than the executor):*
@@ -106,7 +107,7 @@ for their own items; this document wins for GRN-* items.
   NOT imply that no payable composition exists — coins {1,000; 970}, target 1,300 is refused
   (`Insufficient{available: 1970}`) though payable by hand (economics §2 "greedy shadow"; the
   workaround is a manual `split_coin` + `transfer`). And because the admission filter is strictly
-  `candidate > remaining + reserve + 330` (select.rs:110) while the executor admits equality
+  `candidate > remaining + reserve + 330` (select.rs:119-120) while the executor admits equality
   (GRN-INV-1), the planner is one sat more conservative at every boundary: for a 330-sat
   remainder it first accepts a **961**-sat candidate, while a direct `split_coin` admits the
   960-sat parent — in the safe direction (audit [29]: the planner never picks a parent the
@@ -124,11 +125,12 @@ for their own items; this document wins for GRN-* items.
 un-broadcast tx (transfer.rs:287-381).
 
 - **GRN-INV-1 (admission rule — refines SPEC INV-10)** With
-  `fee_reserve = clamp(parent/100, 300, 2000)` sats (`split_fee_reserve`, transfer.rs:596-599),
-  a split of `piece` out of `parent` is admissible **iff** (`split_amounts`, transfer.rs:612-628):
+  `fee_reserve = clamp(parent/100, 300, 2000)` sats (`split_fee_reserve`, transfer.rs:781-784),
+  a split of `piece` out of `parent` is admissible **iff** (`split_amounts`, transfer.rs:842-844 —
+  a thin wrapper over `split_amounts_floored`, transfer.rs:814-836):
   1. `piece + fee_reserve < parent` (strict; `>=` errors GRN-ERR-3), and
   2. `piece >= 330` and `change = parent − piece − fee_reserve >= 330`
-     (`DUST_LIMIT = 330`, transfer.rs:605; audit [9]).
+     (`DUST_LIMIT = 330`, transfer.rs:790; audit [9]).
 
   **Exact boundary.** The dust floor on `change` binds first: `parent >= piece + reserve + 330`.
   The minimum splittable parent is therefore **960 sats exactly** — at `parent = 960`
@@ -140,10 +142,12 @@ un-broadcast tx (transfer.rs:287-381).
 
   **GRN-INV-1b (backup-fee floor — the true minimum *mintable* piece).** The 330-sat dust floor
   above guards the split-tx *output*; it is necessary but **not** sufficient for a usable
-  sub-coin. Each sub-coin also needs a valid backup tx, and `create_tx1` sweeps
+  sub-coin. Each sub-coin also needs a valid backup tx: `create_tx1` (deposit.rs:46) selects
+  `fee_rate = min(SE quote, max_fee_rate)` and the dust/fee rejection happens in `create_tx_out`,
+  which sweeps
   `sub_coin_sats − ceil(BACKUP_TX_SIZE·fee_rate)` and rejects it below the dust floor
-  (`MercuryError::FeeTooLow`, lib/src/transaction.rs:122-132; `BACKUP_TX_SIZE = 112` vB,
-  `fee_rate = min(SE-quoted, client max_fee_rate)`). So the minimum **mintable** piece (and change)
+  (`MercuryError::FeeTooLow`, lib/src/transaction.rs:116-132; FeeTooLow at 129/131;
+  `BACKUP_TX_SIZE = 112` vB). So the minimum **mintable** piece (and change)
   is `min_split_output(fee_rate) = 330 + ceil(112·fee_rate)` — **442 sats at 1 sat/vB** (measured,
   sdk28: `backup_fee=112 min_mintable_piece=442`), rising with feerate. A 330-sat piece is a valid
   split output whose *backup* is un-broadcastable, so it cannot be minted into a usable coin.
@@ -197,7 +201,7 @@ un-broadcast tx (transfer.rs:287-381).
   `SplitOutput = (address, sats, rgb_amount)` (rgb.rs:165-167). An output with `rgb_amount = 0`
   is left **uncolored** — plain sats, no zero-value allocation (rgb.rs:248-255).
 - **GRN-REQ-11 (fixed piece sats)** Every token piece MUST carry exactly
-  `TOKEN_PIECE_SATS = 1500` sats (tokens.rs:23, 531-534, 744). Rationale: the sats are packaging
+  `TOKEN_PIECE_SATS = 1500` sats (tokens.rs:23 const, 559 single, 834 combine, 1051 batch). Rationale: the sats are packaging
   (comfortably above the 330 floor, with margin for the piece's own backup fee, §7); the token
   amount is the payload. The receiver's booked BTC for a token receive is therefore always
   1500 sats per piece, independent of token value. *Consequence (one-hop):* 1,500 is below the
@@ -205,10 +209,10 @@ un-broadcast tx (transfer.rs:287-381).
   `transfer_tokens` — the receiver holds or exits (§11 limitation 10; economics §3).
 - **GRN-INV-5 (change formulas)** For a single-recipient colored split:
   `change_sats = carrier_sats − 1500 − fee_reserve` (same reserve clamp as GRN-INV-1,
-  tokens.rs:484-490) AND `token_change = carrier_amount − token_amount` (tokens.rs:491). When
+  tokens.rs:504) AND `token_change = carrier_amount − token_amount` (tokens.rs:505). When
   `token_change > 0` the change output is colored with it and registered as the residual carrier;
   when `token_change = 0` the change output is uncolored and the change coin is **plain BTC**
-  (tokens.rs:578-593; §6).
+  (tokens.rs:606-617; §6).
 - **GRN-INV-6 (minimum carrier)** Dust-only derivation: `1500 (piece) + fee_reserve (>= 300) +
   change (>= 330)` ⇒ **2130 sats**. With the backup-fee floor now enforced on the colored path
   (change and the 1500-sat piece must each clear `min_split_output(fee_rate)`), the **live minimum
@@ -245,21 +249,21 @@ un-broadcast tx (transfer.rs:287-381).
   branch validation (IVL-REQ-11), terminal ancestors (IVL-REQ-12 = SPEC REQ-17/ERR-7). For a
   token piece it MUST additionally:
   1. validate the envelope's consignment off-chain against the branch txids
-     (`validate_offchain_chain_info`, tokens.rs:931-941; rust-rgb lib.rs:538-564);
+     (`validate_offchain_chain_info`, tokens.rs:1240-1242; rust-rgb lib.rs:538-564);
   2. book **the amount the consignment assigns to the receiver's own witness outpoint**
      (`accept_offchain_amount`, rust-rgb lib.rs:512-533) — SPEC REQ-21. The envelope hint `a` is
-     advisory ONLY: `booked != a` MUST reject (tokens.rs:947-955, GRN-ERR-11 = ERR-8);
+     advisory ONLY: `booked != a` MUST reject (tokens.rs:1254-1262, GRN-ERR-11 = ERR-8);
   3. book under the consignment's cryptographically verified `contract_id`, never a
      sender-claimed id (tokens.rs:942-943; SPEC REQ-22);
   4. count Fungible assignments only — an InflationRight never books as balance (SPEC INV-26).
 
   Only after all of the above does `register_statechain` record the allocation
-  (tokens.rs:956-962). A lying sender can neither inflate the booked amount (the consignment
+  (tokens.rs:1263-1269). A lying sender can neither inflate the booked amount (the consignment
   governs) nor redirect it to a different contract.
 
   *Receiver-configuration hazard (silent token loss).* Steps 1-4 run only when the receiving
   wallet has token support configured: `accept_incoming_tokens` returns `Ok(None)` without
-  validating anything when `rgb_data_dir`/`rgb_proxy_url` are unset (tokens.rs:884-886). Such a
+  validating anything when `rgb_data_dir`/`rgb_proxy_url` are unset (tokens.rs:1191-1193). Such a
   receiver books the piece as plain 1,500-sat BTC, no token event fires, and — with no RGB
   engine — `token_carrier_outpoints` is empty (tokens.rs:364-385), so NONE of the GRN-REQ-14
   carrier guards apply: the receiver can split/withdraw/exit the packaging and permanently
@@ -375,15 +379,15 @@ Message strings verified in code; `{}` are runtime values.
 | ID | Trigger | Exact behaviour | Where | SPEC |
 |---|---|---|---|---|
 | GRN-ERR-1 | balance < target (the same typed error also surfaces GRN-ERR-2's planner refusals) | `insufficient balance: requested {r} sats, available {a}` (`SdkError::InsufficientBalance`) | types.rs:69-73; transfer.rs:59-65 | ERR-9 |
-| GRN-ERR-2 | planner cannot mint the remainder despite sufficient balance: remainder < 330, OR no unused coin > remainder + fee_reserve + 330 (both audit [29]; the latter asserted E2E by sdk28 — 4,800 from a single 5,000-sat coin) | same `Insufficient`/ERR-9 refusal | select.rs:103-121; unit `sub_dust_remainder_is_refused` | ERR-9 |
+| GRN-ERR-2 | planner cannot mint the remainder despite sufficient balance: remainder < 330, OR no unused coin > remainder + fee_reserve + 330 (both audit [29]; the latter asserted E2E by sdk28 — 4,800 from a single 5,000-sat coin) | same `Insufficient`/ERR-9 refusal | select.rs:114-122; unit `sub_dust_remainder_is_refused` (select.rs:172-178) | ERR-9 |
 | GRN-ERR-3 | piece + reserve ≥ parent | `piece {p} + fee reserve {f} does not fit in coin of {n} sats` | transfer.rs:615-619 | INV-10 |
-| GRN-ERR-4 | sub-dust piece/change (plain split) | `split would create a sub-dust output (piece {p}, change {c}, dust floor 330) — the split tx would be unbroadcastable` | transfer.rs:621-626 | audit [9] |
+| GRN-ERR-4 | sub-dust piece/change (plain split) | `split would create an unviable output (piece {p}, change {c}, minimum {min_output}) — each sub-coin must clear the 330-sat dust floor AND fund its own backup; the split tx or a sub-coin backup would be unbroadcastable` | transfer.rs:831-833 | audit [9] |
 | GRN-ERR-5 | any split output < 330, or no fee room, at PSBT build | `MercuryError::FeeTooLow` (backstop for transfer_many + colored paths) | lib/src/transaction.rs:346-360 | audit [9] |
 | GRN-ERR-6 | no parent big enough | `no confirmed coin large enough for {total} sats + fee` / `no coin large enough to mint {sats} sats` | transfer.rs:160, 277 | — |
 | GRN-ERR-7 | plain split of a carrier | `coin {id} carries an RGB token allocation; splitting it as plain BTC would destroy the token — use a token transfer or pick a different coin` | transfer.rs:302-306 | audit [7] |
 | GRN-ERR-8 | withdraw / unilateral exit naming a carrier | `coin {id} carries an RGB allocation; withdrawing it as plain BTC would destroy the tokens — move the asset off this coin first` / `…a plain unilateral exit would destroy the tokens — move the asset off this coin first` | wallet.rs:532-536, 731-735 | audit [7] |
-| GRN-ERR-9 | carrier sats too small for a token split | `carrier coin too small ({c} sats) for a token split` / batch: `carrier coin too small ({c} sats) for {n} pieces + fee` | tokens.rs:485-489, 723-728 | — |
-| GRN-ERR-10 | total asset balance across carriers is below the amount (after trying single-carrier then combine) | `insufficient {asset}: wallet holds {total} across {n} carrier(s), need {amount}` / `no combination of carriers covers {amount} … with enough sats` (tokens.rs) / batch: `no confirmed coin carries >= {total} of {asset} for the batch` | tokens.rs (`colored_combine_transfer`), 717-719 | — |
+| GRN-ERR-9 | carrier sats too small for a token split | `carrier coin too small ({c} sats) for a token split` / batch: `carrier coin too small ({c} sats) for {n} pieces + fee` | tokens.rs:499-503, 1021-1024 | — |
+| GRN-ERR-10 | total asset balance across carriers is below the amount (after trying single-carrier then combine) | `insufficient {asset}: wallet holds {total} across {n} carrier(s), need {amount}` / `no combination of carriers covers {amount} … with enough sats` (tokens.rs:764) / batch: `no confirmed coin carries >= {total} of {asset} for the batch` (tokens.rs:1015) | tokens.rs:741, 764, 1015 | — |
 | GRN-ERR-11 | consignment/envelope mismatch or invalid consignment at claim | `token consignment assigns {booked} to this coin but the envelope claimed {a} — rejecting` / `incoming token consignment INVALID: {detail}` | tokens.rs:936-955 | ERR-8 |
 | GRN-ERR-12 | fulfilling an expired invoice | `invoice expired at {exp} (now {now})` | invoice.rs:85-93 | ERR-11 |
 | GRN-ERR-13 | a split output's deposit-token slot is unpaid (SE charges for tokens) | `deposit token payment required: pay {fee_sats} sats to {deposit_address} (token {token_id}), then retry` (`SdkError::TokenPaymentRequired`); raised BEFORE the terminal-guard on every split path (§3 note) | types.rs:63-68; take_token call sites transfer.rs:315-330, tokens.rs:494-509, 736-755 | — |
@@ -467,7 +471,7 @@ None of these may be omitted when citing this spec.
     it). Fix is combine/top-up or variable packaging. Asserted by sdk29 (typed refusal on a
     1,500-sat received piece).
 11. **A receiver without token support silently books packaging only.** `accept_incoming_tokens`
-    is a no-op when `rgb_data_dir`/`rgb_proxy_url` are unset (tokens.rs:884-886): the piece books
+    is a no-op when `rgb_data_dir`/`rgb_proxy_url` are unset (tokens.rs:1191-1193): the piece books
     as plain 1,500-sat BTC, no carrier guard applies (empty carrier set), and the allocation is
     destroyable by the receiver's ordinary BTC operations. Senders cannot detect the receiver's
     configuration from the address (GRN-REQ-13 hazard note). The consignment survives in the

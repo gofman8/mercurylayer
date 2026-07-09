@@ -25,7 +25,7 @@ and deposit-token economics are out of scope (see SPEC.md §7–8).
 | **coin** | A P2TR UTXO locked to a 2-of-2 MuSig2 aggregate of owner share + SE share. A *flat* coin's funding output is on-chain. |
 | **sub-coin** | A coin whose funding tx is a pre-signed, **un-broadcast** split/combine tx. Its funds exist off-chain until materialized. |
 | **structural node** | A coin consumed by a split/combine (the "parent"). It must become *terminal* at the SE. |
-| **exit branch** | The ordered list (root-first) of un-broadcast structural txs from an on-chain outpoint down to a sub-coin's funding output. Stored under `branch-<statechain_id>` (clients/libs/rust-sdk/src/transfer.rs:452-491). |
+| **exit branch** | The ordered list (root-first) of un-broadcast structural txs from an on-chain outpoint down to a sub-coin's funding output. Built and stored under `branch-<statechain_id>` (clients/libs/rust-sdk/src/transfer.rs:477-510; `insert_backup_txs` under `branch-<id>` at :504-510). |
 | **backup ladder** | The sequence of pre-signed backup txs for one coin, one per ownership hop, with strictly decrementing absolute locktimes. |
 | **stale state** | Any backup tx or co-signed spend held by a *previous* owner of a coin (or ancestor). |
 | **terminal** | The SE's public predicate: `sig_budget` set ∧ `finalized >= sig_budget` (IVL-INV-8) — the SE will never co-sign the node again. Publicly checkable via `GET /statechain/spend_budget` (server/src/endpoints/lightning_latch.rs:291-297). |
@@ -143,7 +143,7 @@ below binds combine if and when it is wired; today only split ships end-to-end.
   locktime would be anchored at the *split* tip, which can invert the exit race; height 0 always
   wins against any locktimed ancestor backup *if broadcast in time* (§6).
 - **IVL-INV-6 (value conservation — = SPEC INV-25)** Each branch tx satisfies
-  Σ outputs <= Σ inputs; the receiver enforces this (clients/libs/rust/src/transfer_receiver.rs:845-859)
+  Σ outputs <= Σ inputs; the receiver enforces this (clients/libs/rust/src/transfer_receiver.rs:897-914)
   because `tx.verify` alone does not check the fee rule, and a value-creating tx is
   consensus-invalid, i.e. an unexitable branch.
 - **IVL-REQ-5 (spend-budget endpoint)** `POST /statechain/spend_budget`
@@ -151,10 +151,11 @@ below binds combine if and when it is wired; today only split ships end-to-end.
   remaining}` with `remaining ∈ {0, 1}` (else 400 `remaining must be 0 or 1`), MUST verify the
   owner auth signature (else 403), and sets
   `sig_budget = min(existing_budget, finalized + remaining)` — the monotonic clamp of IVL-INV-7
-  (server/src/database/deposit.rs:170-188), never the unclamped `finalized + remaining`.
+  (server/src/database/deposit.rs:181-192, min-clamp at :189-190), never the unclamped
+  `finalized + remaining`.
 - **IVL-INV-7 (monotonic tightening — = SPEC INV-24)** A budget may only TIGHTEN:
   `new_budget = min(existing_budget, finalized + remaining)`
-  (server/src/database/deposit.rs:170-188). Without the clamp, a re-issued relative budget after a
+  (server/src/database/deposit.rs:181-192, min-clamp at :189-190). Without the clamp, a re-issued relative budget after a
   terminal spend would re-open the node for a conflicting second spend (INV-19 fork).
 - **IVL-INV-8 (terminal predicate)** `terminal := sig_budget set ∧ finalized >= sig_budget`, where
   `finalized = COUNT(statechain_signature_data WHERE challenge IS NOT NULL)`
@@ -214,24 +215,42 @@ invalidate. Each failure aborts the claim before the coin is booked.
   `num_sigs is not correct`.
 - **IVL-REQ-11 (tx0 / branch validation — = SPEC REQ-16 + INV-4/25)** For the funding side the
   receiver MUST either resolve tx0 on-chain, or, for a branch-carried sub-coin, run
-  `validate_branch` (clients/libs/rust/src/transfer_receiver.rs:754-864), which MUST enforce ALL
+  `validate_branch` (clients/libs/rust/src/transfer_receiver.rs:796-916), which MUST enforce ALL
   of:
-  1. non-empty branch, every tx fully signed and each spending its predecessor's outputs (linkage,
-     :763-785);
-  2. the root input(s) on-chain, **unspent and confirmed** (:800-816; errors `exit-branch root
+  0. the branch is a **TREE** — no outpoint consumed by more than one branch input, whether across
+     two txs or as a duplicate input within one combine tx (`reject_non_tree_branch`,
+     transfer_receiver.rs:394-407, called first at :823; error `exit branch consumes outpoint ...
+     more than once — non-tree branch / internal double-spend`). A repeated prevout is script-valid
+     per input yet un-broadcastable as a whole (the two spends are mutually exclusive on-chain), so
+     the coin it funds would be unexitable (fund stranding). Unit-tested (`non_tree_branch_is_rejected`);
+  1. non-empty branch, every tx fully signed and each spending its predecessor's outputs (linkage /
+     prevout collection, :826-871);
+  2. the root input(s) on-chain, **unspent and confirmed** (:852-868; errors `exit-branch root
      output is spent` / `exit-branch root is not confirmed`), where *confirmed* means
      `confirmations >= confirmation_target` from the receiver's own client config
-     (transfer_receiver.rs:866-885) — depth is a receiver-local policy, not a protocol constant;
-  3. **every branch tx's locktime already satisfied**: `nLockTime <= tip` (:826-837, audit [11];
+     (`verify_tx0_output_is_unspent_and_confirmed`, transfer_receiver.rs:918-951) — depth is a
+     receiver-local policy, not a protocol constant. A root whose electrum height is 0
+     (mempool/0-conf) is treated as UNCONFIRMED: the confirmations math is guarded by `height > 0`
+     (:940), so an RBF-able mempool root (or any of N combine roots) is rejected rather than
+     mis-booked as confirmed — without the guard `blockheight - 0 + 1` trivially clears
+     confirmation_target;
+  3. **every branch tx's locktime already satisfied**: `nLockTime <= tip` (:879-889, audit [11];
      error `...unreached locktime ... violates INV-4`) — otherwise the receiver would book a coin
      it cannot exit while the sender's matured backup sweeps the root;
-  4. per-hop value conservation Σout <= Σin (:845-859, IVL-INV-6);
-  5. full consensus script verification of every input against its prevout (:860-862).
+  4. per-hop value conservation Σout <= Σin (:897-914, IVL-INV-6);
+  5. full consensus script verification of every input against its prevout (:912-913).
 - **IVL-REQ-12 (terminal ancestors — = SPEC REQ-17/INV-20, ERR-7)** For a branch-carried sub-coin
-  the receiver MUST require `n_parents >= max(branch_len, 1)` conveyed structural ancestors
-  (`terminal_parents_sufficient`, transfer_receiver.rs:377-379; error `...names N terminal
-  ancestor(s) but its exit branch has M hop(s)`) and then, **for each ancestor**, query
-  `GET /statechain/spend_budget/<id>` and require `terminal == true` (transfer_receiver.rs:396-416;
+  the receiver MUST require `n_parents >= max(required_terminal_ancestors, 1)` conveyed structural
+  ancestors, where `required_terminal_ancestors = Σ tx.input.len()` over all branch txs
+  (`required_terminal_ancestors`, transfer_receiver.rs:409-417; consumed at :495) — one terminal
+  ancestor per structural **INPUT**, not per hop, so a multi-input combine forces all N inputs
+  named + terminal (for a linear split chain each tx has one input, so this equals the hop count).
+  The predicate is `terminal_parents_sufficient(n_parents, required) = n_parents >= required.max(1)`
+  (transfer_receiver.rs:377-379); the shortfall error is `off-chain sub-coin names N terminal
+  ancestor(s) but its exit branch consumes M structural input(s) — refusing (the sender may be
+  hiding a non-terminal, double-spendable ancestor; a combine of N carriers needs all N named +
+  terminal)` (transfer_receiver.rs:429-433). Then, **for each ancestor**, query
+  `GET /statechain/spend_budget/<id>` and require `terminal == true` (transfer_receiver.rs:436-455;
   error `structural parent <id> is NOT terminal at the SE`). A non-2xx budget query MUST also
   reject (`could not query terminal state of parent ...`) — never assume terminal on silence.
   *Caveat (SPEC §14):* ancestor ids are not cryptographically bound to branch outpoints (the SE is
@@ -242,31 +261,33 @@ invalidate. Each failure aborts the claim before the coin is booked.
 ### 6.1 Unilateral exit algorithm
 
 - **IVL-REQ-13 (branch first, conflicts are hard errors)** `unilateral_exit`
-  (clients/libs/rust-sdk/src/wallet.rs:672-773) MUST broadcast the stored exit branch root-first
-  before touching the backup (`broadcast_branch_if_any`, wallet.rs:527-568). A mempool conflict on
+  (clients/libs/rust-sdk/src/wallet.rs:717) MUST broadcast the stored exit branch root-first
+  before touching the backup (`broadcast_branch_if_any`, wallet.rs:571-613). A mempool conflict on
   a branch tx means a competing spend of the same input — the exit is being RACED — and MUST
-  surface as a hard error plus `WalletEvent::ExitBranchConflict` (wallet.rs:551-558, audit H1
-  fix), never be swallowed as an idempotent success. Only `already ...`/`in block chain`
-  rebroadcast errors are tolerated (wallet.rs:559-566). Note: a *sibling* sub-coin owner (e.g. the
+  surface as a hard error plus `WalletEvent::ExitBranchConflict` (wallet.rs:596-601, audit H1
+  fix), never be swallowed as an idempotent success. Only idempotent-rebroadcast errors are
+  tolerated — `is_idempotent_rebroadcast` (wallet.rs:1028-1038): already in block chain / already
+  in utxo set / txn-already-known / already in mempool / already have transaction — checked at
+  :606. Note: a *sibling* sub-coin owner (e.g. the
   split's change-holder) broadcasting the shared branch is benign, not a race — the branch txs are
   byte-identical, so the rebroadcast hits exactly this tolerated already-known case;
   `ExitBranchConflict` requires a *different* spend of the same input.
 - **IVL-REQ-14 (locktime gate, re-callable — = SPEC REQ-25)** The latest backup is broadcast only
   if `locktime <= tip`; otherwise the call MUST return
   `ExitStatus{complete: false, wait_blocks: locktime − tip}` and MUST be safely re-callable — the
-  branch stays broadcast either way (wallet.rs:741-749).
+  branch stays broadcast either way (wallet.rs:787-793).
 - **IVL-REQ-15 (missing branch is explicit)** If a coin has no stored branch AND its funding txid
   is not on-chain, exit MUST fail with an explicit "restore the recovery bundle (`branch-*` rows)"
-  error rather than broadcast an unfunded backup (wallet.rs:714-729; audit [20]).
+  error rather than broadcast an unfunded backup (wallet.rs:759-773; audit [20]).
 
 **Cooperative materialization.** `withdraw` broadcasts the branch first, then one SE-co-signed
 withdrawal tx per coin with no locktime wait (wallet.rs:473-522, branch materialization at :509).
 
 ### 6.2 The exit deadline and its exactness domain
 
-`estimate_exit_cost` (wallet.rs:573-632) reports, for branch-carrying coins,
+`estimate_exit_cost` (wallet.rs:618) reports, for branch-carrying coins,
 `exit_deadline_block = H_deposit_confirmation + initlock` — the branch root's on-chain deposit
-confirmation height plus initlock (`deposit_anchored_exit_deadline`, wallet.rs:640-666; audit [10]
+confirmation height plus initlock (`deposit_anchored_exit_deadline`, wallet.rs:685-710; audit [10]
 fix). This is the height by which the (locktime-free) branch MUST be on-chain to beat ancestor
 stale backups.
 
@@ -316,8 +337,8 @@ stale backups.
 | IVL-ERR-3 | `finalized >= sig_budget` | HTTP 410 `spend budget exhausted (terminal node: SE refuses further co-signatures)` (sign.rs:96-103) | ERR-3 |
 | IVL-ERR-4 | DB error reading single-use/budget/epoch state, or budget read/write failure | HTTP 503 fail-closed, refuse to co-sign / report / write (sign.rs:63-82; lightning_latch.rs:262-290) | — |
 | IVL-ERR-5 | `remaining ∉ {0,1}` on POST spend_budget; bad auth sig | HTTP 400 `remaining must be 0 or 1`; HTTP 403 (lightning_latch.rs:254-261) | — |
-| IVL-ERR-6 | non-terminal / unqueryable ancestor at claim | client error `structural parent … is NOT terminal at the SE` / `could not query terminal state…` (transfer_receiver.rs:396-416) | ERR-7 |
-| IVL-ERR-7 | branch fails receiver validation (linkage, spent/unconfirmed root, unreached locktime, value creation, script) | client errors per check (transfer_receiver.rs:754-864), claim aborted | INV-4/25 |
+| IVL-ERR-6 | too-few / non-terminal / unqueryable ancestor at claim | client errors: shortfall `off-chain sub-coin names N terminal ancestor(s) but its exit branch consumes M structural input(s)` (transfer_receiver.rs:429-433); `structural parent … is NOT terminal at the SE` / `could not query terminal state…` (transfer_receiver.rs:436-455) | ERR-7 |
+| IVL-ERR-7 | branch fails receiver validation (non-tree/internal double-spend, linkage, spent/unconfirmed root, unreached locktime, value creation, script) | client errors per check (transfer_receiver.rs:796-916), claim aborted | INV-4/25 |
 | IVL-ERR-8 | exit branch conflicts in mempool; ladder locktime unreached; missing branch | hard error + `ExitBranchConflict` event (wallet.rs:551-558); `ExitStatus{complete:false, wait_blocks}` (wallet.rs:741-749); explicit restore error (wallet.rs:714-729) | REQ-25 |
 | IVL-ERR-9 | server-nonce reuse over a different message at `sign/second` | HTTP 409, single-active-state (SPEC INV-23; sdk12 Part C) | ERR-12 |
 
@@ -357,15 +378,15 @@ exact effects:
 
 | Option | On-chain cost | Effect on deadlines |
 |---|---|---|
-| **Refresh (re-anchor)** — `SparkWallet::refresh` / `refresh_sponsored` (`clients/libs/rust-sdk/src/refresh.rs`) | **1 tx** (SE-co-signed spend of the coin's outpoint → a fresh aggregate) | Brand-new coin: new `H_anchor`, full `initlock` horizon and full ladder capacity; the old outpoint is spent so all old backups die. Fee **user-paid** (refreshed coin = `amount − fee`) or **operator-paid** (off-chain rebate preserves the user's total; the SE holds no funds and cannot co-fund the tx — it stays a single-input spend). Cooperative (needs the SE); verified by `SDK_E2E=30`. |
+| **Refresh (re-anchor)** — `SparkWallet::refresh` / `refresh_sponsored` (`clients/libs/rust-sdk/src/refresh.rs`) | **1 tx + 1 deposit token** (SE-co-signed spend of the coin's outpoint → a fresh aggregate; the fresh `get_deposit_address` at refresh.rs:158 consumes a pre-paid deposit token via `take_token`, wallet.rs:334) | Brand-new coin: new `H_anchor`, full `initlock` horizon and full ladder capacity; the old outpoint is spent so all old backups die. Fee **user-paid** (refreshed coin = `amount − fee`) or **operator-paid** (off-chain rebate preserves the user's total; the SE holds no funds and cannot co-fund the tx — it stays a single-input spend). Cooperative (needs the SE); verified by `SDK_E2E=30`. |
 | Cooperative withdraw + re-deposit | 2 txs (withdraw + new funding) | Same brand-new-coin effect as refresh, but two on-chain txs — refresh supersedes it. |
 | Materialize the branch (sub-coins) | branch txs (pre-paid reserves, §6) | Sub-coin becomes a *flat* coin; its OWN fresh ladder (anchored `H_split + initlock`, see below) now solely governs — ancestor deadlines vanish. |
 | Keep transacting before deadlines | none | Does NOT extend anything: each hop *lowers* the leaf locktime by `interval`; the root deadline (§6.2) is untouched. |
 
 **Fresh sub-ladders.** Each split output receives a fresh first backup via `create_tx1` with
-`qt_backup_tx = 0` (clients/libs/rust-sdk/src/transfer.rs:438-449 →
-clients/libs/rust/src/deposit.rs:46-70, which passes 0 as `new_transaction`'s qt argument; the
-`tx_n` parameter only labels the stored row). Hence sub-coin ladder anchor = `H_split + initlock`:
+`qt_backup_tx = 0` (call at clients/libs/rust-sdk/src/transfer.rs:465 →
+clients/libs/rust/src/deposit.rs:46-70, which passes 0 as `new_transaction`'s qt argument at
+deposit.rs:62; the `tx_n = 1` parameter only labels the stored row). Hence sub-coin ladder anchor = `H_split + initlock`:
 tree *depth* does not consume ladder capacity — each leaf gets its own
 `floor(initlock/interval)`-hop budget. Note the UX consequence: a freshly received sub-coin's
 unilateral exit waits ≈ `initlock` blocks (≈ 6.9 days on the deployed profile) minus hops already
@@ -386,11 +407,11 @@ possible after it forever.
 | IVL-REQ-2 | `unit::invalidation_model` (clients/libs/rust-sdk/src/invalidation_model.rs) — ladder math, capacity, window width |
 | IVL-INV-1..4 | SDK_E2E=27 `sdk27_invalidation_time` — ladder over time, maturity boundary; `unit::invalidation_model` |
 | IVL-REQ-4, IVL-INV-15, IVL-REQ-10 | sdk04/sdk17 (multi-hop transfer + claim), upstream Mercury receiver suite; mercurylib receiver checks (lib/src/transfer/receiver.rs:270-352, locktime bounds :455-467) |
-| IVL-INV-5, IVL-INV-6, IVL-REQ-11 | sdk12 (honest branch accepted), rgb03/rgb06 (DAG depth 2–3); chaos sdk22 (oracle asserts value conservation INV-1/13/25 and cheat refusal INV-5/18/19, chaos22_oracle.rs:5-12; INV-4 exercised implicitly — the cheats lose to the locktime-0 branch) |
+| IVL-INV-5, IVL-INV-6, IVL-REQ-11 | sdk12 (honest branch accepted), rgb03/rgb06 (DAG depth 2–3); chaos sdk22 (oracle asserts value conservation INV-1/13/25 and cheat refusal INV-5/18/19, chaos22_oracle.rs:5-12; INV-4 exercised implicitly — the cheats lose to the locktime-0 branch); `unit` tree check `non_tree_branch_is_rejected` (clients/libs/rust/src/transfer_receiver.rs:1073-1106) |
 | IVL-REQ-5..7, IVL-INV-7..9 | sdk08 (terminal node), `unit::types::terminal_predicate` (clients/libs/rust-sdk/src/types.rs:183-190), `unit::invalidation_model::terminal_predicate_matrix` (invalidation_model.rs:379-394, incl. the audit-[15] `(Some(0), 0)` brick row), rgb04 (single-use) |
 | IVL-REQ-8 | rgb04 |
 | IVL-REQ-9 | rgb07 (epoch, RGB path); SDK_E2E=27 `sdk27_invalidation_time` part d (epoch on the plain-sats path) |
-| IVL-REQ-12 | sdk10 (terminal-parent verify), `unit` terminal-parents count (clients/libs/rust/src/transfer_receiver.rs:966-1006) |
+| IVL-REQ-12 | sdk10 (terminal-parent verify), `unit` terminal-parents count + Σ-inputs (clients/libs/rust/src/transfer_receiver.rs:1040-1144, incl. `required_ancestors_counts_inputs_not_hops` :1046-1068 — the Σ-inputs combine rule — and the `terminal_parents_sufficient` cases :1110-1144) |
 | IVL-REQ-13..15 | sdk07 (exit + cost), sdk12 (branch exit), sdk13 (stale clawback defeated), audit [20] regression |
 | IVL-INV-10, IVL-REQ-16 | sdk14 (watchtower race + deadline/fee quantification); SDK_E2E=27 `sdk27_invalidation_time` part c — deadline-gap arithmetic on a k=2 pre-transferred parent; `unit::invalidation_model` |
 | IVL-ERR-1..9 | sdk08/rgb04 (410s), rgb07 + sdk27 part d (410 epoch, IVL-ERR-2), sdk12 Part C (409 nonce reuse), sdk13/sdk14 (race outcomes), receiver unit tests |

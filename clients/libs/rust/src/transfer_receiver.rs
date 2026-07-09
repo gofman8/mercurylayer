@@ -421,10 +421,12 @@ async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String
     // consumes (a split tx spends ONE parent; a combine tx spends N). If the sender names FEWER
     // ancestors than the branch has inputs, it is hiding one it could still double-spend — the
     // receiver must not trust the sender to enumerate its own parents. An empty list is the
-    // degenerate case of this and was previously accepted (the bug): reject it. `single_use` on
-    // every off-chain sub-coin makes intermediate nodes terminal at the SE regardless, so the
-    // sender-dependent ancestors left are the on-chain root(s) — which this check forces the sender
-    // to name and prove terminal, INCLUDING every input of a multi-input combine.
+    // degenerate case of this and was previously accepted (the bug): reject it. Terminality here is
+    // BUDGET-based, not single_use: SDK sub-coins are opened `single_use=false` (get_deposit_address
+    // → deposit.rs; see the sibling comment at validate_branch), so an ancestor is terminal only
+    // because the SDK set its spend budget to 1 before co-signing the split/combine (IVL-REQ-7). This
+    // check forces the sender to name every structural input and prove each terminal at the SE,
+    // INCLUDING every input of a multi-input combine.
     if !terminal_parents_sufficient(parents.len(), required_ancestors) {
         return Err(anyhow!(
             "off-chain sub-coin names {} terminal ancestor(s) but its exit branch consumes {} structural input(s) — refusing (the sender may be hiding a non-terminal, double-spendable ancestor; a combine of N carriers needs all N named + terminal)",

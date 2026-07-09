@@ -13,7 +13,8 @@ token state.
 
 On this layer, allocations live on **statechain coins and off-chain sub-coins**, so token
 payments inherit everything sats have: instant off-chain transfers, exact amounts via colored
-splits, branch-verified receiving, and unilateral exit.
+splits, branch-verified receiving, and a unilateral exit path (materialize the branch on-chain —
+see [Exits with tokens](#exits-with-tokens); it is not the plain one-tx sweep sats get).
 
 | Spark BTKN | Here |
 |---|---|
@@ -50,6 +51,11 @@ bob's watcher:
 balances: alice 750 / bob 250 — zero on-chain footprint
 ```
 
+If no single carrier holds the amount, the SDK **combines** several carriers of the asset (N
+inputs → exact piece + change) in one SE-co-signed colored combine tx (`colored_combine_transfer`
+in `tokens.rs`). This changes which coins are consumed and the shape of the receiver's branch: the
+receiver validates the multi-input branch and requires **all N input carriers to be terminal**.
+
 ## Why there is no freeze
 
 Spark tokens can be issuer-frozen because operators enforce token state. RGB is
@@ -71,3 +77,32 @@ with any rgb-lib wallet. Onward movement of the settled allocation still needs t
 unilateral path is shipped). Step-by-step:
 [granularity deep dive §5.6](granularity-deep-dive.md); normative:
 [GRANULARITY-SPEC](../GRANULARITY-SPEC.md) GRN-REQ-14 / GRN-INV-14.
+
+## Tokens over time — holding, and doing nothing
+
+*"If I issue or receive tokens and then do nothing for a year, do I lose them?"* No — tokens are
+never lost by inactivity. But how you got them changes what still works (all verified end-to-end by
+`SDK_E2E=32`, which idles the chain well past every backup-ladder horizon):
+
+**Tokens you issued or minted (a *flat* carrier, funded on-chain).** The carrier's own backup
+ladder floors after a horizon (~7 days on the deployed profile), but that does **not** stop you
+sending: a token transfer is a colored *split*, and the piece it mints gets a **fresh** ladder
+(`create_tx1`, `qt=0`), so you can keep sending forever with the SE. There is **no clawback risk**
+(nothing sits above a flat carrier in the tree). The only limit: movement needs the SE — a *plain*
+unilateral exit is refused (it would sweep the sats and destroy the allocation), so an issued
+carrier's tokens stay anchored on-chain until the SE co-signs a colored spend. So: not lost, always
+sendable cooperatively; SE-dependent to move without a colored exit path.
+
+**Tokens you received (a *sub-coin* carrier).** Also not lost, and here you have a **SE-free**
+option: the exit branch is locktime-zero, so broadcasting it *materializes* the allocation on-chain
+any time — even a year later — as long as the shared root is still unspent. Two caveats: a lone
+1,500-sat received piece is below the carrier floor, so it can't be re-sent on its own (hold,
+combine with another piece, or exit); and there is a **real clawback danger with long inactivity**.
+Past the root deadline (~7 days), the *sender's* own backup matures, and a malicious sender can
+sweep the shared funding out from under you. You are safe only if you materialize before then — and
+today the `auto_exit_due` watchtower **skips token carriers**, so received tokens have **no
+automatic protection**. Treat a received off-chain token like any off-chain sub-coin: exit (or move)
+it well before the deadline; don't leave it sitting for a year.
+
+**Summary:** never lost; cooperative operations (with the SE) work throughout; a received token's
+unilateral materialization works forever *if you don't miss the root deadline*.

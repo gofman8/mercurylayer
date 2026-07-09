@@ -59,6 +59,7 @@ pub mod sdk28_granularity_sats;
 pub mod sdk29_granularity_tokens;
 pub mod sdk30_refresh;
 pub mod sdk31_token_combine;
+pub mod sdk32_token_over_time;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -240,6 +241,12 @@ async fn main() -> Result<()> {
     // colored combine; receiver validates the multi-input branch + requires ALL carriers terminal.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("31") {
         sdk31_token_combine::execute().await?;
+        return Ok(());
+    }
+    // Tokens over time (SDK_E2E=32): issue/receive tokens, idle past every ladder horizon, then
+    // test not-lost / cooperative send / unilateral materialization / the received-token clawback window.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("32") {
+        sdk32_token_over_time::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

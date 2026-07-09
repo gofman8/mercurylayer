@@ -66,6 +66,11 @@ transfer hands the new owner a backup one `interval` lower.
 **INV-5** For any coin, the current owner's latest backup locktime is strictly lower than every
 previous owner's backup locktime (current owner wins the exit race).
 
+The ladder is a finite budget (`initlock` blocks, spent by each transfer and by wall-clock time).
+When it nears the floor the coin can be moved to L1 by exit (§9), or COOPERATIVELY re-anchored
+on-chain via `refresh` (§9.4, REQ-31) — a fresh SE-co-signed spend into a new aggregate that resets
+the ladder and root deadline. There is deliberately no off-chain ladder renewal.
+
 ### 2.5 Ancestor record
 For each sub-coin, its structural ancestors (the split/combine parents) are stored under
 `parents-<statechain_id>` (parent id + inherited ancestors).
@@ -163,8 +168,11 @@ reject otherwise (ERR-7).
 **INV-9** `Exact(s)` ⟹ `Σ coins[s] = target`. `WithSplit` ⟹ `Σ whole < target ∧ split_amount =
 target − Σ whole ∧ coins[split] > split_amount`. `Insufficient` ⟸ `Σ coins < target` — but the
 reverse does **not** hold: since audit [29] the planner also returns `Insufficient` when the
-remainder can only be minted as a sub-dust piece (no split candidate covers
-`remainder + fee_reserve + 330`). See [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) GRN-REQ-5.
+remainder can only be minted as an unviable piece (no split candidate covers
+`remainder + fee_reserve + min_split_output`, where `min_split_output = 330` (dust) `+` the sub-coin's
+own backup fee at the live rate = `330 + ceil(112 · fee_rate)`; the planner also requires
+`remainder ≥ min_split_output` so the minted piece can fund its own backup — `select.rs:114-121`).
+See [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) GRN-REQ-5.
 
 ---
 
@@ -205,14 +213,17 @@ exited first.
 
 **Transfer.** `transfer_tokens`/`batch_transfer_tokens`: a colored off-chain split carves the
 recipient piece(s) + change; the consignment rides `BackupTx.rgb_consignment` as a
-`ConsignmentEnvelope{c, a, s}`.
+`ConsignmentEnvelope{c, a, s}`. When no single carrier holds the requested amount, the transfer
+automatically COMBINEs several carriers of the same asset (`colored_combine_transfer`) into one
+SE-co-signed colored combine tx (N input carriers → recipient piece + change), conserving the
+asset's allocation across all combined inputs.
 **REQ-21 (G2)** The receiver MUST book the amount the CONSIGNMENT assigns to its own witness
 outpoint (`accept_offchain_amount`), treating the envelope amount `a` only as a cross-checked hint;
 a mismatch MUST reject the transfer (ERR-8).
 **REQ-22** The receiver MUST book under the consignment's cryptographically-verified `contract_id`,
 not a sender-claimed id.
 **INV-13** Token conservation: for a (batch) transfer, `Σ recipient amounts + change =
-carrier allocation`.
+Σ allocations of the combined input carriers` (a single-carrier transfer is the N=1 case).
 **N/A** RGB has no issuer freeze (no consensus enforcement point); documented, not faked.
 
 ---
@@ -259,6 +270,18 @@ on-chain.
 `estimate_exit_cost(coin)` → `{branch_txs, branch_vbytes, backup_vbytes, total_vbytes, wait_blocks}`.
 **INV-17** `total_vbytes = branch_vbytes + backup_vbytes` (measured from the actual pre-signed txs);
 `fee_sats_at(rate) = ceil(total_vbytes · rate)`; `wait_blocks = max(0, backup_locktime − tip)`.
+
+### 9.4 Refresh (cooperative on-chain re-anchor)
+`refresh(id, fee_rate?)` / `refresh_sponsored(id, sponsor, fee_rate?)`: one SE-co-signed single-input
+spend of the coin's current 2-of-2 outpoint into a FRESH deposit aggregate (a new `statechain_id`,
+same owner; a sub-coin's exit branch is materialized first). This resets both the backup ladder and
+the tree's root deadline, avoiding the ladder floor without going to L1.
+**REQ-31** `refresh` MUST spend the current outpoint into a fresh aggregate that gets a fresh full
+ladder and a fresh root deadline; because the old outpoint is now spent, EVERY previous owner's
+backup is permanently invalidated. It is COOPERATIVE — it needs the SE; if the SE is gone the owner
+exits unilaterally (§9.2) instead. The fee is drawn from the coin (single-input, blind SE), so the
+user-pays variant yields `amount − fee`; `refresh_sponsored` reimburses that fee OFF-CHAIN from a
+funded sponsor (rebate `fee + dust`), leaving the user ≥ whole.
 
 ---
 
@@ -355,20 +378,21 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | Item | Test |
 |---|---|
 | REQ-1, REQ-3 | design (2-of-2 keys); exercised by every co-sign flow |
-| REQ-2, REQ-24, REQ-25, INV-16, INV-17 | `sdk07` (unilateral exit + cost), `unit::exit_cost` |
-| REQ-4, REQ-14, ERR-6, INV-7 | `sdk01` deposit; `unit::token_payment_required` |
+| REQ-2, REQ-24, REQ-25, INV-16, INV-17 | `sdk07` (unilateral exit + cost), `unit::types::tests::exit_cost_math`, `unit::invalidation_model::exit_cost_scaling_model` |
+| REQ-4, REQ-14, ERR-6, INV-7 | `sdk01` deposit; `unit::types::tests::error_semantics` |
 | REQ-5, ERR-1 | `rgb04` (single-use refusal) |
 | REQ-6, ERR-2, INV-21 | `rgb07` (epoch deadline) |
 | REQ-7, REQ-13, REQ-18, ERR-3, INV-19 | `sdk08` (terminal node), `unit::types::terminal_predicate`, `unit::invalidation_model::terminal_predicate_matrix` |
 | REQ-8, REQ-9, REQ-15, REQ-16, INV-5, INV-8 | `sdk01`, `sdk04`, upstream `tb01/tb05/tm01/ta02/ta03` |
 | REQ-10, ERR-4 | `sdk03` (latch locked pre-settlement) |
-| REQ-11, REQ-12, ERR-5, REQ-23, INV-14 | `sdk05` (pay), `unit::hash_preimage` |
+| REQ-11, REQ-12, ERR-5, REQ-23, INV-14 | `sdk05` (pay), `unit::ssp::swap_tests::preimage_matches_hash` |
 | INV-15 | `sdk06` (receive) |
 | REQ-15, INV-9 | `sdk01`; `unit::select` (exact/split/insufficient) |
 | REQ-17, INV-20, ERR-7 | `sdk10` (terminal-parent verify: honest accept, non-terminal reject) |
 | REQ-18, INV-10, INV-11 | `sdk01`/`sdk08`; `unit::split_math` |
 | INV-18, INV-19 | `rgb03`/`rgb06` (off-chain DAG), `rgb04` |
 | REQ-19, REQ-20, INV-12, INV-13 | `sdk09` (IFA issue + mint + batch) |
+| REQ-21/INV-13 (multi-carrier combine) | `sdk31` (token combine) |
 | REQ-21, REQ-22, ERR-8 | `sdk02`, `sdk09`; `unit::envelope` |
 | ERR-9 | `sdk04` (`unit::select` insufficient) |
 | ERR-10 | `sdk04` (double-withdraw / split-parent refusal) |
@@ -377,6 +401,7 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-27 | `sdk11` (multi-recipient) |
 | REQ-28, ERR-11 | `sdk11`; `unit::invoice::tests` (roundtrip, reject) |
 | REQ-29, REQ-30 | `sdk11` (query API + fee quote) |
+| REQ-31 (refresh / re-anchor) | `sdk30` (refresh + sponsored refresh) |
 | INV-20 (ancestor-count binding), ERR-7 | `unit::terminal_parents_tests`, `sdk10`, `sdk12` (honest accept) |
 | INV-23, ERR-12 | `sdk12` Part C (nonce-reuse refused) |
 | INV-24 | `sdk08` (terminal node stays terminal) |
@@ -395,8 +420,8 @@ Findings from the adversarial review that are **documented assumptions**, not co
 - **Batch atomicity.** `transfer_many` / `batch_transfer_tokens` hand off pieces independently; there
   is no all-or-nothing guarantee across recipients. A dropped hand-off leaves that piece reclaimable
   by the sender (the split parent is terminal, so no double-spend), but the batch is not atomic.
-- **Amount width.** Coin sats are booked as `u32` (`tx0_output.value as u32`); a single coin above
-  ~42.9 BTC would truncate. Out of range for the intended per-coin sizes; not guarded.
+- **Amount width.** Coin sats are booked as `u32` (`utxo.value as u32`, `coin_status.rs`); a single
+  coin above ~42.9 BTC would truncate. Out of range for the intended per-coin sizes; not guarded.
 - **Mint concurrency.** `mint_tokens` isolates the freshly-minted allocation by a before/after snapshot
   and does NOT hold the wallet lock across its (minutes-long) on-chain confirmation wait, to avoid
   blocking the background claim watcher. A concurrent same-asset receive into the *same* wallet during
@@ -405,12 +430,16 @@ Findings from the adversarial review that are **documented assumptions**, not co
   fee-bump; in a fee spike an exit may confirm slowly. The decrementing-locktime ladder (INV-5) still
   guarantees the latest state wins the race.
 
-> **Open blockers (2026-07-05 review).** The second adversarial review found issues that are **not**
-> accepted limitations but **open P0/P1 defects** being remediated: an enclave nonce-reuse crypto break
-> (C1), two SSP fund-loss bugs (C2/C3), a split-locktime exit-race inversion (H5), branch-conflict
-> masking (H1), token-carrier destruction (H2), and a mnemonic-only-backup durability gap (H3). Until
-> the P0 items in [PLAN.md](PLAN.md#post-review-remediation-backlog-2026-07) land and are re-reviewed,
-> the system is **NOT production-ready**. See [REVIEW.md](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass).
+> **P0 remediation status (2026-07-05 review).** The second adversarial review's six P0 blockers are
+> now **FIXED on `feat/spark`** and verifiable in code: the enclave/challenge nonce-reuse crypto break
+> (C1 — challenge-binding refuses reuse, `sign.rs`), the two SSP fund-loss bugs (C2/C3 — SSP
+> pre-payment recipient/amount gate, `ssp.rs`), the split-locktime exit-race inversion (H5 — branch
+> txs are now locktime-free, INV-4), branch-conflict masking (H1 — `reject_non_tree_branch`,
+> `transfer_receiver.rs`), token-carrier destruction (H2 — carrier excluded from plain-BTC split,
+> `transfer.rs`), and the mnemonic-only-backup durability gap (H3 — recovery bundle). Two caveats
+> remain before mainnet: the **SGX lockbox must be rebuilt and redeployed** for the enclave-side
+> single-use secnonce to take effect, and the **full E2E suite (regtest + lockbox + RLN) must be re-run
+> and the result re-reviewed**. See [REVIEW.md](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass).
 
 Unit tests live in `clients/libs/rust-sdk/src/*` (`#[cfg(test)]`); E2E dispatch via
 `SDK_E2E`/`RGB_E2E` in `clients/tests/rust`; upstream Mercury suite runs by default.

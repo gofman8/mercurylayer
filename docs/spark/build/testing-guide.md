@@ -28,12 +28,44 @@ export RLN_BITCOIND_CONTAINER=rgb-lightning-node-bitcoind-1   # for the test fau
 | 1 | `sdk01_wallet_flow` | deposit → exact-subset transfer → auto-claim → **off-chain-split transfer** (branch-verified) → auto-claim → cooperative exit |
 | 2 | `sdk02_token_flow` | issue 1000 TKN → **off-chain token transfer** (consignment in-message, verified contract) → balances 750/250 → exit |
 | 3 | `sdk03_lightning_swap` | latch swap: hash verified with SE, claim locked pre-settlement, preimage settles the hash |
+| 4 | `sdk04_adversarial` | SDK guard rails: typed refusals, split-parent double-spend refusal, honest branch accept, idempotent claims, double-withdraw refusal |
+| 5 | `sdk05_lightning_pay` | Mercury → Lightning via SSP: pay a real BOLT11 from statechain balance |
+| 6 | `sdk06_lightning_receive` | Lightning → Mercury via SSP: receive a real LN payment as a statechain coin |
+| 7 | `sdk07_unilateral_exit` | practical unilateral exit: branch out instantly, mine past backup locktime, exit with zero SE involvement |
+| 8 | `sdk08_terminal_node` | terminal-node enforcement: SE refuses any co-signature on a split parent |
+| 9 | `sdk09_ifa_batch` | IFA issuance + mint + batch token transfer |
+| 10 | `sdk10_terminal_parent_verify` | receiver terminal-parent verification (adversarial) |
+| 11 | `sdk11_parity_methods` | parity methods: identity signing, multi-recipient sats, Spark invoices, queries |
+| 12 | `sdk12_adversarial` | adversarial regressions: single_use sub-coins, honest branch accept, nonce reuse |
+| 13 | `sdk13_stale_state` | stale-state broadcast rejected/defeated + watcher detects |
+| 14 | `sdk14_watcher_race` | watcher race |
+| 15 | `sdk15_fresh_doublesign` | fresh double-sign |
+| 16 | `sdk16_onboarding` | onboarding |
+| 17 | `sdk17_oor_chain` | out-of-round chain |
+| 18 | `sdk18_pay_failure_reclaim` | Lightning PAY failure + reclaim: unroutable pay → SSP claims nothing → reclaim |
+| 19 | `sdk19_receive_failure` | Lightning RECEIVE failure: never paid → no preimage, receiver can't claim |
+| 20 | `sdk20_adversarial_gate` | adversarial SSP gate: wrong-recipient + undersized → SSP refuses to pay |
+| 21 | `sdk21_remote_sspclient` | remote SspClient over HTTP: pay + receive against a deployed mercury-ssp server |
+| 23 | `sdk23_rgb_ln_swap` | RGB assets over Lightning: issue → colored channel → asset invoice → pay |
+| 24 | `sdk24_receive_cancel` | LN → Mercury receive aborted after payment: SSP cancels HODL invoice → payer refunded |
+| 25 | `sdk25_receive_delayed_claim` | adversarial delayed-claim: receiver past the SE latch window gets nothing, payer refunded |
+| 26 | `sdk26_invalidation_scale` | invalidation at scale: depth-4 off-chain split chain, 3-wide fan-out, deepest-leaf unilateral exit |
+| 27 | `sdk27_invalidation_time` | invalidation over time: one-interval ladder decrement, exit-maturity boundary, audit-[17] deadline gap, SE epoch gate |
+| 28 | `sdk28_granularity_sats` | granularity (plain sats): exact-subset payments, exact off-chain split, sub-dust refusal + 330-sat min piece, depth-2 re-split |
+| 29 | `sdk29_granularity_tokens` | granularity (RGB tokens): raw-unit precision, depth-2 token exit, spent-carrier change → plain BTC, one-carrier-per-transfer limit |
+| 30 | `sdk30_refresh` | refresh / re-anchor: reset a coin's ladder + root deadline in one on-chain tx; old backups dead, user pays the fee |
+| 31 | `sdk31_token_combine` | multi-carrier token combine: pay an amount spanning several carriers via one colored combine; receiver requires ALL carriers terminal |
+| 32 | `sdk32_token_over_time` | tokens over time: idle past every ladder horizon, then not-lost / cooperative send / unilateral materialization / received-token clawback window |
 
-### Off-chain DAG primitives (`RGB_E2E=1..8`)
+> `SDK_E2E=22` is the concurrent chaos test — see [its dedicated section](#concurrent-chaos--property-test-sdk_e2e22) below. The
+> full dispatch lives in `clients/tests/rust/src/main.rs` (`SDK_E2E=1..32`).
+
+### Off-chain DAG primitives (`RGB_E2E=1..14`)
 
 The low-level suite under the SDK: off-chain split (1), 2-input combine (2), 2-deep un-broadcast
 chain (3), SE single-use refusal (4), 3-input combine (5), 3-level DAG (6), epoch deadline (7),
-wide combine (8).
+wide combine (8), blinded/witness send-receive (9), history + self-transfer (10), UDA/CFA schemas
+(11), validate-offchain negative (12), consignment integrity (13), metadata + IFA supply (14).
 
 ### Upstream Mercury suite (default `cargo +stable run`)
 

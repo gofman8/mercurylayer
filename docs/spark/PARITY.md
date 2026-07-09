@@ -1,8 +1,10 @@
 # Spark ↔ Mercury+RGB feature parity matrix
 
-> **Verification (final):** full suite green in one pass on regtest — SDK_E2E=1..4 (wallet flow,
-> tokens, lightning swap, adversarial), RGB_E2E=1..8 (off-chain DAG primitives), and the complete
-> upstream Mercury suite (tb01–tb05, tm01, ta01–ta03, tv01). 13/13 PASS.
+> **Verification (final):** full suite green on regtest — SDK_E2E=1..31 (wallet flow, tokens,
+> lightning swap+pay+receive, exits, parity methods, adversarial/chaos, granularity, refresh, token
+> combine), RGB_E2E=1..14 (off-chain DAG primitives + blinded transfer, history, UDA/CFA/IFA
+> issuance), and the complete upstream Mercury suite (tb01–tb05, tm01, ta01–ta03, tv01). See the CI
+> matrix for the authoritative pass count rather than a frozen number here.
 
 Target: every user-visible Spark feature (docs.spark.money + `@buildonspark/spark-sdk` +
 `@buildonspark/issuer-sdk`) implemented on Mercury Layer with a **single SE** (blind-MuSig2 2-of-2,
@@ -45,6 +47,7 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 | `list leaves/UTXOs` | **DONE** | `list_coins()` — coin inventory with status + off-chain flag (sdk11) |
 | `payLightningInvoice` | **DONE (legs)** | `start_lightning_swap` / `get_swap_payment_hash` / `settle_lightning_swap` on the Mercury latch (sdk03 green); BOLT11 orchestration stays in the LSP's node |
 | `createLightningInvoice` | PARTIAL | latch receive leg: invoice created by LSP with payment_hash bound to a latch transfer; SDK exposes the flow. Single SE holds the preimage gate (Spark splits it across SOs via VSS — N/A with one SE). |
+| RGB-asset Lightning swaps (colored channel / asset invoice / pay) | **DONE (legs)** | colored statechain latch (`tokens.rs::latch_tokens` for pay, `latch_tokens_se_preimage` for receive) + `SspClient` asset legs (`ssp.rs::create_receive_asset` / `ln_invoice_asset`); the LN half (issue -> colored channel -> asset invoice -> decode+pay over `RlnClient`) is verified end-to-end by sdk23. A full cross-rail swap additionally needs the asset bridge onto a statechain coin (documented follow-up). |
 | `withdraw({onchainAddress, exitSpeed})` | **DONE** | SE co-signed direct spend; sub-coin branches auto-materialize; fee_rate param = exitSpeed |
 | `unilateralExit` / `checkTimelock` | **DONE** | branch (no locktime) + stored pre-signed backup (locktime-gated); coin locktimes visible on the record |
 | `getWithdrawalFeeQuote` / fee estimates | **DONE** | `get_withdrawal_fee_quote()` via electrum estimatefee (~111 vB/coin); `estimate_exit_cost` for unilateral (sdk07/sdk11) |

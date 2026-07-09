@@ -36,6 +36,13 @@ on-chain deposit (root)
 - **Width is free**: splitting into N pieces is one off-chain tx.
 - **Depth costs on exit**: a unilateral exit broadcasts the branch — one tx per level.
 
+A **combine** goes the other way: one SE-co-signed tx spends N sub-coins into fewer (or one)
+outputs, and the output's exit branch becomes the *union* of all N inputs' sub-branches plus the
+combine tx. The tree therefore becomes a DAG at the combine node — a sub-coin's exit branch can
+name more than one ancestor per structural input — but it is still a tree over *outpoints* (only
+disjoint input sub-branches are combined; a shared ancestor is rejected). This is why the receiver
+requires **Σ-inputs terminal ancestors**: one terminal per structural input, not one per branch.
+
 ## Transfers
 
 A transfer is a **key handover**: the sender pre-signs the receiver's backup, the SE rotates its

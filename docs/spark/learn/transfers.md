@@ -26,6 +26,11 @@ No block confirmation, no fee, sub-second, fully async.
   **exit branch** inside the transfer message and verifies it end-to-end (consensus-valid txs
   back to an on-chain root). Sender keeps the change as a normal coin.
 
+  "Split one coin" is the single-carrier, single-recipient case. Off-chain splits also come in a
+  **fan-out** form (`transfer_many` / `batch_transfer_tokens`: one tx carves N recipient pieces
+  plus change) and, for tokens, a **fan-in** form (`colored_combine_transfer`: N carriers of an
+  asset combine into one piece plus change, N inputs → 2 outputs).
+
 Spark achieves the same UX with SSP swap pools (fixed leaf denominations swapped server-side);
 here exact amounts are a first-class off-chain operation with no third party.
 
