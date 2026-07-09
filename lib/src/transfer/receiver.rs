@@ -704,3 +704,69 @@ pub fn get_new_key_info(server_public_key_hex: &str, coin: &Coin, statechain_id:
         amount: tx0_output.value as u32,
     })
 }
+#[cfg(test)]
+mod transfer_signature_tests {
+    //! Receiver check R1 (TRUST-MODEL §2): the receiver verifies the SENDER's Schnorr signature
+    //! binding the coin's outpoint to the RECEIVER's new pubkey, so a handover message not
+    //! authorized by the coin's owner — or replayed to bind a different receiver — is rejected.
+    //! This exercises the REJECT paths (the positive path runs on every successful claim E2E).
+    use super::*;
+    use secp256k1_zkp::KeyPair;
+
+    fn msg_from(sender: &KeyPair, sig: &Signature) -> TransferMsg {
+        TransferMsg {
+            statechain_id: "sc".to_string(),
+            transfer_signature: sig.to_string(),
+            backup_transactions: vec![],
+            t1: [0u8; 32],
+            user_public_key: PublicKey::from_keypair(sender).to_string(),
+            branch_txs: vec![],
+            terminal_parents: vec![],
+        }
+    }
+
+    fn sign_over(secp: &Secp256k1<secp256k1_zkp::All>, sender: &KeyPair, txid: &str, vout: u32, bound_pk: &PublicKey) -> Signature {
+        let input_txid = Txid::from_str(txid).unwrap();
+        let mut data = Vec::<u8>::new();
+        data.extend_from_slice(&input_txid[..]);
+        data.extend_from_slice(&vout.to_le_bytes());
+        data.extend_from_slice(&bound_pk.serialize()[..]);
+        let m = Message::from_hashed_data::<sha256::Hash>(&data);
+        secp.sign_schnorr(&m, sender)
+    }
+
+    #[test]
+    fn accepts_valid_rejects_forged_transfer_signature() {
+        let secp = Secp256k1::new();
+        let mut rng = secp256k1_zkp::rand::thread_rng();
+        let sender = KeyPair::new(&secp, &mut rng);
+        let receiver_pk = PublicKey::from_secret_key(&secp, &SecretKey::new(&mut rng));
+        let txid = "1111111111111111111111111111111111111111111111111111111111111111";
+        let vout = 1u32;
+        let outpoint = TxOutpoint { txid: txid.to_string(), vout };
+
+        // Valid: signed by the sender over (txid || vout || receiver_pk) → accepted.
+        let good = sign_over(&secp, &sender, txid, vout, &receiver_pk);
+        let m = msg_from(&sender, &good);
+        assert!(verify_transfer_signature(&receiver_pk.to_string(), &outpoint, &m).unwrap(),
+            "a correctly-bound sender signature must verify");
+
+        // Reject: replay to a DIFFERENT receiver (the signature no longer binds the new pubkey).
+        let other_pk = PublicKey::from_secret_key(&secp, &SecretKey::new(&mut rng));
+        assert!(!verify_transfer_signature(&other_pk.to_string(), &outpoint, &m).unwrap(),
+            "a signature bound to receiver A must not authorize a handover to receiver B");
+
+        // Reject: same signature against a DIFFERENT outpoint (vout tampered).
+        let outpoint2 = TxOutpoint { txid: txid.to_string(), vout: 2 };
+        assert!(!verify_transfer_signature(&receiver_pk.to_string(), &outpoint2, &m).unwrap(),
+            "a signature over outpoint vout=1 must not authorize spending vout=2");
+
+        // Reject: forged by an ATTACKER key over the correct data, but the message claims the
+        // honest sender's pubkey (a malicious sender substituting a signature they don't own).
+        let attacker = KeyPair::new(&secp, &mut rng);
+        let forged = sign_over(&secp, &attacker, txid, vout, &receiver_pk);
+        let m_forged = msg_from(&sender, &forged); // user_public_key = honest sender, sig by attacker
+        assert!(!verify_transfer_signature(&receiver_pk.to_string(), &outpoint, &m_forged).unwrap(),
+            "a signature not produced by the claimed sender key must be rejected");
+    }
+}
