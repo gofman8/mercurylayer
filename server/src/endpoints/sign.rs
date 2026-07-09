@@ -282,12 +282,36 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
     let response: PartialSignatureResponsePayload = match serde_json::from_str(value.as_str()) {
         Ok(r) => r,
         Err(_) => {
+            // Lockbox failure AFTER the challenge write: with the finality split (finding 2) the
+            // spend budget is NOT consumed, because `challenge IS NOT NULL` no longer counts as
+            // finalized — only `partial_sig_issued`, which we have not set. The owner can retry.
             let response_body = json!({
                 "message": format!("enclave returned an unparseable sign/second response: {}", value)
             });
             return status::Custom(Status::BadGateway, Json(response_body));
         }
     };
+
+    // A valid partial signature was issued: NOW record it as finalized (external review finding 2).
+    // Fail CLOSED on a DB error — the count increment happens after the enclave co-signs, so a
+    // silently-dropped marker would UNDER-count finalized signatures and could re-open a terminal
+    // single-use/budgeted node to a second conflicting co-signature (INV-19 fork). Returning an
+    // error makes the client retry the whole round rather than believe an unrecorded sign succeeded.
+    match crate::database::sign::set_partial_sig_issued(&statechain_entity.pool, &server_pub_nonce, &statechain_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({ "message": "could not record the issued signature (no matching signing row) — retry" })),
+            );
+        }
+        Err(_) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({ "message": "could not record the issued signature — retry" })),
+            );
+        }
+    }
 
     let response_body = json!(response);
 

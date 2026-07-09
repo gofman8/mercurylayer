@@ -42,7 +42,7 @@ impl UtexoWallet {
         let record = self.record().await?;
         // Never auto-select a token-carrier coin for an LN swap — handing the carrier to the LSP as
         // plain BTC destroys the RGB allocation (audit [6]). Fail closed if RGB state is unavailable.
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
         let coin_id = match statechain_id {
             Some(id) => {
                 if let Some(c) = record.coins.iter().find(|c| c.statechain_id.as_deref() == Some(&id)) {

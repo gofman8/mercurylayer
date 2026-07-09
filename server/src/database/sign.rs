@@ -114,3 +114,27 @@ pub async fn update_signature_data_challenge(pool: &sqlx::PgPool, server_pub_non
 
     result.rows_affected() == 1
 }
+
+/// Mark that the lockbox actually ISSUED a partial signature for this (statechain_id, server nonce)
+/// — the second half of the finality split (external review finding 2). Called ONLY after a valid
+/// partial signature is parsed from the enclave, so `count_finalized_signatures` (which now counts
+/// `partial_sig_issued`) never counts a failed/aborted signing round against the owner's spend
+/// budget. Keyed by `server_pubnonce`, the same key `update_signature_data_challenge` uses, so it
+/// hits exactly the one row this signing round created. Returns Err on any DB error so the caller
+/// can fail CLOSED (audit [1]): the increment now happens AFTER the enclave co-signs, so a silently
+/// lost marker would UNDER-count finalized signatures — the dangerous direction that could re-open a
+/// terminal node to a second conflicting co-signature (INV-19 fork).
+pub async fn set_partial_sig_issued(pool: &sqlx::PgPool, server_pub_nonce: &str, statechain_id: &str) -> Result<bool, sqlx::Error> {
+    let query = "\
+        UPDATE statechain_signature_data \
+        SET partial_sig_issued = true \
+        WHERE statechain_id = $1 AND server_pubnonce = $2";
+
+    let result = sqlx::query(query)
+        .bind(statechain_id)
+        .bind(server_pub_nonce)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected() >= 1)
+}

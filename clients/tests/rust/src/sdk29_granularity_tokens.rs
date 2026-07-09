@@ -43,11 +43,12 @@
 //!     — her change sub-coin comes out PLAIN: its sats appear in available_sats (carrier sats are
 //!     excluded, review H2/audit [23]) and a plain `split_coin` on it SUCCEEDS, where the same
 //!     call was REFUSED (typed carrier error) while the coin still carried the allocation.
-//! (d) ONE CARRIER PER TRANSFER: alice ends up holding the SAME asset on TWO carriers (IFA issue
+//! (d) CROSS-CARRIER COMBINE: alice ends up holding the SAME asset on TWO carriers (IFA issue
 //!     60 + on-chain mint 50 bound to a second coin — the cleanest in-SDK construction). Paying
-//!     100 fails with the TYPED one-carrier error (exact message asserted + printed); paying 60
-//!     and 40 as two transfers succeeds. Colored combine exists only at lib level (rgb02/05/08);
-//!     it is NOT an SDK operation — documented limitation.
+//!     100 — larger than any single carrier — now SUCCEEDS: `transfer_tokens` falls through to a
+//!     TRANSPARENT colored combine (both carriers → one piece + change) so bob receives 100 and
+//!     alice keeps a 10-unit change. (Combine is now a shipped SDK operation; dedicated coverage in
+//!     sdk31. This section used to assert a one-carrier refusal, from before combine was wired in.)
 //!
 //! Run: SDK_E2E=29 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 //! Cross-refs: SPEC.md REQ-21/22, INV-11/13/16/26; sdk02/sdk09 (token flows), sdk26 (economics),
@@ -545,35 +546,22 @@ pub async fn execute() -> Result<()> {
     wait_carriers_confirmed(&cc, &alice, "sdk29_alice", &core, &asset_q, 110, 2).await?;
     println!("SDK29 - minted +50 (inflate {mint_txid}): alice holds 110 QTK on TWO carriers (60 + 50)");
 
-    // 110 available, but no SINGLE carrier holds 100: the transfer must fail with the TYPED
-    // one-carrier error (colored combine is a lib-level primitive only — not an SDK operation).
-    let err = alice
-        .transfer_tokens(&asset_q, &bob_addr, 100)
-        .await
-        .expect_err("100 across two carriers must be refused (one carrier per transfer)");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("no single coin carries >= 100 of") && msg.contains("combine not yet wired"),
-        "expected the one-carrier refusal, got: {msg}"
-    );
-    println!("SDK29 - ONE-CARRIER LIMIT (demonstrated): {msg}");
-
-    // Carrier-sized amounts DO work: 60 (full carrier A) to bob + 40 (from carrier B) to dave, as
-    // two transfers (the one-carrier limit means 100 in one shot is impossible; two pieces do it).
-    add_tokens(&cc, &alice, 2).await?;
-    let r5 = alice.transfer_tokens(&asset_q, &bob_addr, 60).await?;
-    assert_eq!(r5.coins.len(), 1);
-    wait_token_balance(&bob, &asset_q, 60).await?;
-    add_tokens(&cc, &alice, 2).await?;
-    let r6 = alice.transfer_tokens(&asset_q, &dave_addr, 40).await?;
-    assert_eq!(r6.coins.len(), 1);
-    wait_token_balance(&dave, &asset_q, 40).await?;
-    assert_eq!(token_balance(&bob, &asset_q).await?, 60, "bob keeps his 60 QTK (carrier A)");
-    assert_eq!(token_balance(&alice, &asset_q).await?, 10, "10 QTK change stays on carrier B");
-    println!("SDK29 - split payment 60 + 40 succeeded (two transfers, one per carrier)");
+    // 110 available across TWO carriers (60 + 50), no SINGLE carrier holds 100. `transfer_tokens`
+    // now spans carriers TRANSPARENTLY: when no single carrier covers the amount, colored_transfer
+    // falls through to a colored COMBINE (both carriers → one piece + change) in one SE-co-signed
+    // tx (dedicated coverage in sdk31). So 100 in one shot SUCCEEDS: bob receives 100, alice keeps a
+    // 10-unit change. (This assertion was updated when combine was wired into the SDK — it used to
+    // expect a one-carrier refusal, from before combine shipped.)
+    add_tokens(&cc, &alice, 3).await?;
+    let r5 = alice.transfer_tokens(&asset_q, &bob_addr, 100).await?;
+    assert_eq!(r5.coins.len(), 1, "the combine hands the receiver a single piece coin");
+    wait_token_balance(&bob, &asset_q, 100).await?;
+    assert_eq!(token_balance(&bob, &asset_q).await?, 100, "bob receives the full 100 QTK via combine");
+    assert_eq!(token_balance(&alice, &asset_q).await?, 10, "alice keeps the 10 QTK combine change");
+    println!("SDK29 - CROSS-CARRIER COMBINE: transfer_tokens(100) spanned both carriers transparently (bob 100, alice 10 change)");
 
     println!(
-        "SDK29 - SUCCESS: token granularity is exact to 1 RAW unit (precision is metadata only; 0.10 and 0.01 booked exactly), a wallet can receive the SAME asset repeatedly and its balance SUMS (bob 10 → 11 → 9_996 — double-receive fixed), a depth-2 token piece exits by broadcasting its colored branch (witnesses + opret anchors confirm; 4 units settled on-chain on the exited outpoint, independently validated against the indexer; the uncolored backup is deliberately NOT landed — it would destroy the allocation), a fully-spent carrier's change becomes ordinary splittable BTC, and one-carrier-per-transfer is the enforced limitation (typed error; 60+40 works, 100 does not; combine not shipped in the SDK)."
+        "SDK29 - SUCCESS: token granularity is exact to 1 RAW unit (precision is metadata only; 0.10 and 0.01 booked exactly), a wallet can receive the SAME asset repeatedly and its balance SUMS (bob 10 → 11 → 9_996 — double-receive fixed), a depth-2 token piece exits by broadcasting its colored branch (witnesses + opret anchors confirm; 4 units settled on-chain on the exited outpoint, independently validated against the indexer; the uncolored backup is deliberately NOT landed — it would destroy the allocation), a fully-spent carrier's change becomes ordinary splittable BTC, and a payment larger than any single carrier is served by a TRANSPARENT colored combine (100 across a 60 + 50 pair; combine now shipped in the SDK — sdk31)."
     );
     Ok(())
 }

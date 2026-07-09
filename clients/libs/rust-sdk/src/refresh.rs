@@ -136,7 +136,7 @@ impl UtexoWallet {
                 ));
             }
             let amount = coin.amount.unwrap_or_default() as u64;
-            let carriers = self.token_carrier_outpoints().await?;
+            let carriers = self.unspendable_as_btc_outpoints().await?;
             if crate::wallet::coin_outpoint(coin).map_or(false, |o| carriers.contains(&o)) {
                 return Err(anyhow!(
                     "coin {statechain_id} carries an RGB allocation; refreshing it as a plain re-anchor would destroy the tokens — move the asset off this coin first"
@@ -246,7 +246,7 @@ impl UtexoWallet {
         let carriers = if self.inner.config.rgb_data_dir.is_some()
             && self.inner.config.rgb_proxy_url.is_some()
         {
-            match self.token_carrier_outpoints().await {
+            match self.unspendable_as_btc_outpoints().await {
                 Ok(c) => c,
                 Err(_) => return Ok(vec![]),
             }

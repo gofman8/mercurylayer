@@ -146,22 +146,45 @@ pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid:
 /// currently owns (`parent_coin`, id `parent_statechain_id`) — for slots created by SE-co-signed
 /// flows over it: off-chain split pieces/change, combine outputs, a refresh re-anchor. Owner-auth
 /// is the audit-[15] single-use challenge signed with the parent coin's auth key, so only the
-/// current owner can draw on the parent's allowance. Errors when the SE predates the endpoint,
-/// has derived issuance disabled, or the parent's lifetime allowance is exhausted — callers fall
-/// back to normal (possibly paid) tokens.
+/// current owner can draw on the parent's allowance.
+///
+/// Three outcomes, so the caller never silently spends paid onboarding tokens on a transient fault
+/// (external review finding 4):
+/// - `Ok(Some(ids))` — issued.
+/// - `Ok(None)` — the SE does not OFFER derived issuance at all (endpoint absent → 404, or disabled
+///   → 403). This is the only case where legacy onboarding-token fallback is appropriate.
+/// - `Err(_)` — a real failure: transient (5xx), auth (401), allowance exhausted (429), or a
+///   malformed reply. The caller MUST surface this, not quietly consume prepaid/paid tokens.
 pub async fn get_derived_tokens(
     client_config: &ClientConfig,
     parent_coin: &Coin,
     parent_statechain_id: &str,
     count: u32,
-) -> Result<Vec<String>> {
-    let auth_sig = crate::utils::fresh_auth(
-        client_config,
-        parent_statechain_id,
+) -> Result<Option<Vec<String>>> {
+    let client = client_config.get_reqwest_client()?;
+
+    // Fetch the owner-auth challenge inline so a 404 here (a server predating audit-[15]/derived
+    // tokens) collapses to the same "not offered" outcome as a 404 on the derived route itself.
+    let challenge_resp = client
+        .get(&format!("{}/auth/challenge/{}", client_config.statechain_entity, parent_statechain_id))
+        .send()
+        .await?;
+    if challenge_resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if challenge_resp.status() != reqwest::StatusCode::OK {
+        return Err(anyhow!("auth challenge failed: {}", challenge_resp.text().await?));
+    }
+    let v: serde_json::Value = challenge_resp.json().await?;
+    let nonce = v
+        .get("nonce")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow!("no nonce in auth challenge response"))?;
+    let sig = mercurylib::transfer::receiver::sign_message(
+        &format!("{nonce}|deposit/get_derived_token"),
         parent_coin,
-        "deposit/get_derived_token",
-    )
-    .await?;
+    )?;
+    let auth_sig = format!("{nonce}:{sig}");
 
     let payload = mercurylib::deposit::DerivedTokenRequest {
         statechain_id: parent_statechain_id.to_string(),
@@ -169,16 +192,21 @@ pub async fn get_derived_tokens(
         count,
     };
 
-    let client = client_config.get_reqwest_client()?;
     let response = client
         .post(&format!("{}/deposit/get_derived_token", client_config.statechain_entity))
         .json(&payload)
         .send()
         .await?;
 
-    if response.status() != 200 {
-        let response_body = response.text().await?;
-        return Err(anyhow!(response_body));
+    let status = response.status();
+    // 404 (route not mounted) or 403 (derived issuance disabled by the operator): the server does
+    // not offer derived tokens → the caller may use the legacy onboarding path.
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(None);
+    }
+    if status != reqwest::StatusCode::OK {
+        // Transient / auth / allowance-exhausted: a genuine failure the caller must surface.
+        return Err(anyhow!("derived-token request failed ({status}): {}", response.text().await?));
     }
 
     let value = response.text().await?;
@@ -189,7 +217,7 @@ pub async fn get_derived_tokens(
             resp.token_ids.len()
         ));
     }
-    Ok(resp.token_ids)
+    Ok(Some(resp.token_ids))
 }
 
 pub async fn get_token(client_config: &ClientConfig) -> Result<mercurylib::deposit::TokenResponse> {

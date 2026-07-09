@@ -140,12 +140,15 @@ pub async fn is_single_use(pool: &sqlx::PgPool, statechain_id: &str) -> Result<b
     Ok(row.map(|r| r.0).unwrap_or(false))
 }
 
-/// Count of FINALIZED signatures (challenge set, i.e. a sign_second completed) for a coin. A
-/// single-use coin with >= 1 finalized signature has already been terminally spent, so the SE must
-/// refuse any further spend.
+/// Count of FINALIZED signatures for a coin: sign_second rounds where the lockbox actually ISSUED a
+/// partial signature (`partial_sig_issued`). A single-use coin with >= 1 finalized signature has
+/// already been terminally spent, so the SE must refuse any further spend. External review finding
+/// 2: this counts `partial_sig_issued`, NOT `challenge IS NOT NULL` — the challenge is bound before
+/// the lockbox call (as the nonce-reuse guard), so counting it would burn the owner's spend budget
+/// on a transient lockbox failure that produced no usable signature.
 pub async fn count_finalized_signatures(pool: &sqlx::PgPool, statechain_id: &str) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM statechain_signature_data WHERE statechain_id = $1 AND challenge IS NOT NULL")
+        "SELECT COUNT(*) FROM statechain_signature_data WHERE statechain_id = $1 AND partial_sig_issued = true")
         .bind(statechain_id)
         .fetch_one(pool)
         .await?;

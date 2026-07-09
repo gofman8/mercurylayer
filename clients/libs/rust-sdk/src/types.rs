@@ -48,6 +48,35 @@ pub struct TransferResult {
 pub struct ClaimResult {
     pub claimed_transfers: u32,
     pub confirmed_deposits: Vec<DepositAddressInfo>,
+    /// Per-statechain outcome for coins that arrived carrying an RGB token consignment (external
+    /// review finding 5). A claimed sats transfer and its token booking are separate steps: the
+    /// Mercury coin can be CONFIRMED while RGB acceptance is still pending or has failed. These let
+    /// an app show token status instead of trusting `claimed_transfers` to mean "tokens received".
+    pub token_results: Vec<TokenClaimStatus>,
+}
+
+/// Outcome of booking an incoming token consignment for one claimed coin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenClaimStatus {
+    pub statechain_id: String,
+    pub state: TokenClaimState,
+    /// Booked asset id + amount when `state == Booked`.
+    pub asset_id: Option<String>,
+    pub amount: Option<u64>,
+    /// Human-readable reason when `state == Pending` or `Rejected`.
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenClaimState {
+    /// Consignment validated and the allocation is booked.
+    Booked,
+    /// Consignment present but not yet booked (transient RGB error) — the coin is quarantined from
+    /// plain-BTC spends and retried on the next claim pass.
+    Pending,
+    /// Consignment permanently invalid (griefer's garbage / amount mismatch) — the coin is NOT a
+    /// token carrier; its sats are ordinary spendable BTC.
+    Rejected,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

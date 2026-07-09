@@ -125,16 +125,32 @@ pub async fn transfer_unlock(statechain_entity: &State<StateChainEntity>, transf
 
     let is_current_owner_signature = crate::endpoints::utils::validate_signature(&statechain_entity.pool, &signed_statechain_id, &statechain_id).await;
 
-    if !is_current_owner_signature && auth_pub_key.is_some() && !crate::endpoints::utils::validate_signature_given_public_key(&signed_statechain_id, &statechain_id, &auth_pub_key.unwrap()).await {
-
+    // Authorize the unlock (external review finding 1): accept ONLY when the current-owner signature
+    // validates (registered auth key — clears `locked2`, the owner side) OR an `auth_pub_key` is
+    // supplied AND the signature validates under it (the receiver signs with their not-yet-registered
+    // new key — clears `locked`, the receiver side; see transfer_receiver.rs::unlock_statecoin).
+    // The previous condition only rejected when `auth_pub_key` was *present* and invalid, so a
+    // MISSING `auth_pub_key` with a bad `auth_sig` fell straight through to the DB write — letting
+    // anyone who knows a statechain_id clear the receiver-side lock with no valid signature at all.
+    let is_new_owner_signature = match &auth_pub_key {
+        Some(pk) => crate::endpoints::utils::validate_signature_given_public_key(&signed_statechain_id, &statechain_id, pk).await,
+        None => false,
+    };
+    if !is_current_owner_signature && !is_new_owner_signature {
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
-    
+
         return status::Custom(Status::Forbidden, Json(response_body));
     }
 
-    crate::database::transfer_receiver::update_unlock_transfer(&statechain_entity.pool, is_current_owner_signature, &statechain_id).await;
+    // `is_current_owner_signature` still selects WHICH lock bit is cleared (owner → locked2,
+    // receiver → locked); we now only reach here once one of the two signatures is valid.
+    if let Err(e) = crate::database::transfer_receiver::update_unlock_transfer(&statechain_entity.pool, is_current_owner_signature, &statechain_id).await {
+        // Typed not-found / DB error instead of a panic on an unknown statechain_id (the old
+        // fetch_one().unwrap() 500-crashed the handler on any id that does not exist).
+        return status::Custom(Status::NotFound, Json(json!({ "message": e })));
+    }
 
     let response_body = json!({
         "message": "Success"

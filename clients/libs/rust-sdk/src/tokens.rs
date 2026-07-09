@@ -384,6 +384,67 @@ impl UtexoWallet {
         })
     }
 
+    /// Outpoints of CONFIRMED coins that carry an incoming RGB **consignment** in their backup rows
+    /// but whose allocation is NOT yet booked in the engine — a *pending* token carrier (external
+    /// review finding 5). A transient RGB-proxy/indexer error during `accept_incoming_tokens` leaves
+    /// such a coin CONFIRMED yet absent from [`Self::token_carrier_outpoints`] (which lists only
+    /// booked allocations), so until the retry loop books it, plain-BTC selection would happily
+    /// spend it and DESTROY the allocation — including `auto_refresh_due`, which would re-anchor it.
+    /// These outpoints must be quarantined from every plain-BTC path exactly like booked carriers.
+    pub(crate) async fn consignment_bearing_outpoints(
+        &self,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
+            return Ok(out);
+        }
+        let record = self.record().await?;
+        for coin in record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+        {
+            let Some(id) = coin.statechain_id.as_deref() else { continue };
+            let Some(outpoint) = crate::wallet::coin_outpoint(coin) else { continue };
+            // A coin whose consignment was PERMANENTLY rejected (griefer's garbage, marked by
+            // claim()) is NOT quarantined — its sats are ordinary BTC the owner may spend.
+            let rejected = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("token-rejected-{id}"),
+            )
+            .await
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+            if rejected {
+                continue;
+            }
+            let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                id,
+            )
+            .await
+            .unwrap_or_default();
+            if backups.iter().any(|b| b.rgb_consignment.is_some()) {
+                out.insert(outpoint);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The full set of outpoints that must NEVER be spent as plain BTC: booked token carriers UNION
+    /// pending (consignment-bearing, not-yet-booked) carriers. Every plain-BTC selection/spend path
+    /// (transfer, split, combine parent-pick, withdraw, unilateral exit, auto-refresh) uses this so
+    /// a token coin — booked or still settling — is never swept as sats (review H2 + finding 5).
+    pub(crate) async fn unspendable_as_btc_outpoints(
+        &self,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut set = self.token_carrier_outpoints().await?;
+        set.extend(self.consignment_bearing_outpoints().await?);
+        Ok(set)
+    }
+
     /// Send `token_amount` of `asset_id` to a statechain address, entirely off-chain: colored
     /// split (exact token piece + change back to this wallet) then branch-carrying key handover
     /// of the piece coin. The receiver's SDK auto-claims, validates the consignment off-chain and
@@ -1252,8 +1313,13 @@ impl UtexoWallet {
             w.validate_offchain_chain_info(&env.c, &txids)
         })?;
         if !valid {
+            // PERMANENT-INVALID prefix (external review finding 5): a consignment that fails
+            // cryptographic validation is never going to book. claim() matches this exact prefix to
+            // un-quarantine the coin (so a griefer cannot lock a victim's sats forever by attaching a
+            // garbage consignment) — as distinct from a TRANSIENT RGB-proxy/indexer error (no prefix),
+            // which keeps the coin quarantined and retried.
             return Err(anyhow!(
-                "incoming token consignment INVALID: {}",
+                "PERMANENT-INVALID: incoming token consignment INVALID: {}",
                 detail.unwrap_or_default()
             ));
         }
@@ -1266,8 +1332,10 @@ impl UtexoWallet {
             w.accept_offchain_amount(&env.c, &txids, &txid, vout)
         })?;
         if booked != env.a {
+            // PERMANENT-INVALID (see above): the consignment cryptographically assigns a different
+            // amount than the envelope claimed — a lying sender; this will never book.
             return Err(anyhow!(
-                "token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
+                "PERMANENT-INVALID: token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
                 env.a
             ));
         }

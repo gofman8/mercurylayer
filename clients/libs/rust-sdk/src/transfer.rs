@@ -43,7 +43,7 @@ impl UtexoWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
 
         let spendable: Vec<&Coin> = record
             .coins
@@ -146,7 +146,7 @@ impl UtexoWallet {
     pub async fn quote_transfer(&self, amount_sats: u64) -> Result<crate::types::TransferQuote> {
         use electrum_client::ElectrumApi;
         let record = self.record().await?;
-        let carriers = self.token_carrier_outpoints().await.unwrap_or_default();
+        let carriers = self.unspendable_as_btc_outpoints().await.unwrap_or_default();
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let margin = self.inner.config.auto_refresh_margin_blocks;
         let rate = backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
@@ -229,7 +229,7 @@ impl UtexoWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
 
         // Every piece and the change must clear the backup-fee floor (dust + each sub-coin's own
         // backup fee) so no output is a stranded coin. Reject up-front — before any parent is made
@@ -353,7 +353,7 @@ impl UtexoWallet {
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
         if let Some(c) = record.coins.iter().find(|c| {
             c.status == CoinStatus::CONFIRMED
                 && c.duplicate_index == 0
@@ -398,7 +398,7 @@ impl UtexoWallet {
             .ok_or_else(|| anyhow!("no confirmed coin with statechain id {statechain_id}"))?;
         // A plain-BTC split must never consume a token carrier (review H2): its RGB allocation
         // would be destroyed. Token moves go through the colored-split path instead.
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
         if is_token_carrier(&parent, &carriers) {
             return Err(anyhow!(
                 "coin {statechain_id} carries an RGB token allocation; splitting it as plain BTC would destroy the token — use a token transfer or pick a different coin"

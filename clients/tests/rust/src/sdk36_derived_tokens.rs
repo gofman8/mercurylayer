@@ -196,7 +196,9 @@ pub async fn execute() -> Result<()> {
     // d1: direct mint against the (now spent, still registered) parent A — the allowance is per
     // statechain LIFETIME, so the split's own 2 tokens count toward it.
     let parent_coin = coin_by_id(&cc, "sdk36_alice", &id_a).await?;
-    let toks = mercuryrustlib::deposit::get_derived_tokens(&cc, &parent_coin, &id_a, 2).await?;
+    let toks = mercuryrustlib::deposit::get_derived_tokens(&cc, &parent_coin, &id_a, 2)
+        .await?
+        .expect("this SE offers derived issuance (Some), not None");
     assert_eq!(toks.len(), 2);
     assert_ne!(toks[0], toks[1]);
     // A derived token is confirmed-at-birth: it funds a slot with no token-server involvement.

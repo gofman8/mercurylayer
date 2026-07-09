@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::config::SdkConfig;
 use crate::events::WalletEvent;
-use crate::types::{Balance, ClaimResult, DepositAddressInfo, SdkError};
+use crate::types::{Balance, ClaimResult, DepositAddressInfo, SdkError, TokenClaimState, TokenClaimStatus};
 
 /// A complete off-line recovery bundle for a wallet (review H3). Contains everything that lives
 /// ONLY on the owner's disk and that the SE cannot re-serve after a claim: the full wallet record
@@ -293,9 +293,9 @@ impl UtexoWallet {
         let carriers = if self.inner.config.rgb_data_dir.is_some()
             && self.inner.config.rgb_proxy_url.is_some()
         {
-            self.token_carrier_outpoints().await?
+            self.unspendable_as_btc_outpoints().await?
         } else {
-            self.token_carrier_outpoints().await.unwrap_or_default()
+            self.unspendable_as_btc_outpoints().await.unwrap_or_default()
         };
         let mut balance = compute_balance_excluding(&record, &carriers);
         balance.tokens = self.get_token_balances().await.unwrap_or_default();
@@ -342,10 +342,13 @@ impl UtexoWallet {
     /// for zero new on-chain surface). One SE round-trip authorizes the whole batch (a single
     /// consumed auth nonce).
     ///
-    /// Falls back to [`Self::take_token`] per slot when the SE predates the endpoint, has derived
-    /// issuance disabled, or the parent's lifetime allowance is exhausted — preserving the old
-    /// behaviour (free deployments keep working; a paid deployment surfaces
-    /// `TokenPaymentRequired` instead of silently paying).
+    /// Falls back to onboarding tokens ([`Self::take_token`]) ONLY when the SE genuinely does not
+    /// offer derived issuance — the endpoint is absent (old server) or the operator disabled it
+    /// (`get_derived_tokens` → `Ok(None)`). A TRANSIENT or refused failure (proxy/DB down, auth
+    /// error, or the parent's lifetime allowance exhausted) is SURFACED, never silently paid for:
+    /// external review finding 4 flagged that the old blanket fallback would quietly spend prepaid
+    /// onboarding tokens (real money in a paid deployment) on a momentary derived-endpoint blip. A
+    /// caller that truly wants to pay can catch the error and call [`Self::take_token`] itself.
     pub(crate) async fn take_derived_tokens(
         &self,
         parent_statechain_id: &str,
@@ -360,28 +363,34 @@ impl UtexoWallet {
             })
             .cloned();
         drop(record);
-        if let Some(parent) = parent {
-            match mercuryrustlib::deposit::get_derived_tokens(
-                &self.inner.cc,
-                &parent,
-                parent_statechain_id,
-                u32::try_from(n)?,
-            )
-            .await
-            {
-                Ok(ids) => return Ok(ids),
-                Err(e) => {
-                    println!(
-                        "derived-token request for parent {parent_statechain_id} failed ({e}); falling back to onboarding tokens"
-                    );
+        // No parent coin locally (shouldn't happen on a derived path) — fall back to onboarding.
+        let Some(parent) = parent else {
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(self.take_token().await?);
+            }
+            return Ok(out);
+        };
+        match mercuryrustlib::deposit::get_derived_tokens(
+            &self.inner.cc,
+            &parent,
+            parent_statechain_id,
+            u32::try_from(n)?,
+        )
+        .await?
+        {
+            // Issued — free, vouched by the parent.
+            Some(ids) => Ok(ids),
+            // Server does not offer derived issuance at all: legacy onboarding path (free in
+            // no-server mode; a paid deployment surfaces `TokenPaymentRequired` from take_token).
+            None => {
+                let mut out = Vec::with_capacity(n);
+                for _ in 0..n {
+                    out.push(self.take_token().await?);
                 }
+                Ok(out)
             }
         }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(self.take_token().await?);
-        }
-        Ok(out)
     }
 
     /// Fresh single-use Bitcoin deposit address for `amount_sats`. Full Mercury security: the
@@ -438,25 +447,17 @@ impl UtexoWallet {
                 amount_sats: d.amount_sats,
             });
         }
+        // Per-statechain token outcomes for this pass (external review finding 5). Keyed so a coin
+        // touched by both the freshly-claimed loop and the retry rescan is recorded once.
+        let mut token_status: std::collections::HashMap<String, TokenClaimStatus> =
+            std::collections::HashMap::new();
         if !receive.received_statechain_ids.is_empty() {
             let _ = self.inner.events_tx.send(WalletEvent::TransferClaimed {
                 statechain_ids: receive.received_statechain_ids.clone(),
             });
             // Token hook: coins that arrived with a consignment get validated + booked.
             for id in &receive.received_statechain_ids {
-                match self.accept_incoming_tokens(id).await {
-                    Ok(Some((asset_id, amount))) => {
-                        let _ = self.inner.events_tx.send(WalletEvent::TokenTransferClaimed {
-                            asset_id,
-                            amount,
-                            statechain_id: id.clone(),
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        println!("token accept error for {id}: {e}");
-                    }
-                }
+                self.book_incoming_token(id, &mut token_status).await;
             }
         }
 
@@ -467,35 +468,19 @@ impl UtexoWallet {
         // background watcher calls claim() on an interval, this is the retry loop.
         if self.inner.config.rgb_data_dir.is_some() && self.inner.config.rgb_proxy_url.is_some() {
             let booked = self.token_carrier_outpoints().await.unwrap_or_default();
-            let handled: std::collections::HashSet<&str> =
-                receive.received_statechain_ids.iter().map(|s| s.as_str()).collect();
             for coin in after
                 .coins
                 .iter()
                 .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
             {
                 let Some(id) = coin.statechain_id.as_deref() else { continue };
-                if handled.contains(id) {
+                if token_status.contains_key(id) {
                     continue; // already attempted this pass
                 }
                 if coin_outpoint(coin).map_or(false, |o| booked.contains(&o)) {
                     continue; // already booked
                 }
-                // accept_incoming_tokens cheaply returns Ok(None) if the coin carries no consignment,
-                // so this only does real work for genuinely stranded token coins.
-                match self.accept_incoming_tokens(id).await {
-                    Ok(Some((asset_id, amount))) => {
-                        let _ = self.inner.events_tx.send(WalletEvent::TokenTransferClaimed {
-                            asset_id,
-                            amount,
-                            statechain_id: id.to_string(),
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        println!("token rebook retry for {id}: {e}");
-                    }
-                }
+                self.book_incoming_token(id, &mut token_status).await;
             }
         }
         if !confirmed_deposits.is_empty() || !receive.received_statechain_ids.is_empty() {
@@ -507,7 +492,80 @@ impl UtexoWallet {
         Ok(ClaimResult {
             claimed_transfers: receive.received_statechain_ids.len() as u32,
             confirmed_deposits,
+            token_results: token_status.into_values().collect(),
         })
+    }
+
+    /// Attempt to book an incoming token consignment for one claimed coin, recording the outcome in
+    /// `status` (external review finding 5). A `Ok(None)` (no consignment) records nothing — the coin
+    /// is plain sats. A booked allocation emits `TokenTransferClaimed`. A `PERMANENT-INVALID` error
+    /// writes a `token-rejected-<id>` marker so [`Self::consignment_bearing_outpoints`] stops
+    /// quarantining the coin (a griefer must not lock a victim's sats forever with a garbage
+    /// consignment). A transient error leaves the coin quarantined and marked `Pending` for retry.
+    async fn book_incoming_token(
+        &self,
+        id: &str,
+        status: &mut std::collections::HashMap<String, TokenClaimStatus>,
+    ) {
+        match self.accept_incoming_tokens(id).await {
+            Ok(Some((asset_id, amount))) => {
+                let _ = self.inner.events_tx.send(WalletEvent::TokenTransferClaimed {
+                    asset_id: asset_id.clone(),
+                    amount,
+                    statechain_id: id.to_string(),
+                });
+                status.insert(id.to_string(), TokenClaimStatus {
+                    statechain_id: id.to_string(),
+                    state: TokenClaimState::Booked,
+                    asset_id: Some(asset_id),
+                    amount: Some(amount),
+                    detail: None,
+                });
+            }
+            Ok(None) => {} // no consignment on this coin — plain sats, nothing to record
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("PERMANENT-INVALID") {
+                    // Un-quarantine: durably mark the coin so its sats become ordinary spendable BTC.
+                    let marker = vec![mercurylib::wallet::BackupTx {
+                        tx_n: 0,
+                        tx: String::new(),
+                        client_public_nonce: String::new(),
+                        server_public_nonce: String::new(),
+                        client_public_key: String::new(),
+                        server_public_key: String::new(),
+                        blinding_factor: String::new(),
+                        rgb_consignment: None,
+                        rgb_blinding: None,
+                    }];
+                    let _ = mercuryrustlib::sqlite_manager::insert_backup_txs(
+                        &self.inner.cc.pool,
+                        &self.inner.config.wallet_name,
+                        &format!("token-rejected-{id}"),
+                        &marker,
+                    )
+                    .await;
+                    println!("token accept PERMANENTLY rejected for {id}: {msg}");
+                    status.insert(id.to_string(), TokenClaimStatus {
+                        statechain_id: id.to_string(),
+                        state: TokenClaimState::Rejected,
+                        asset_id: None,
+                        amount: None,
+                        detail: Some(msg),
+                    });
+                } else {
+                    // Transient: coin stays quarantined from plain-BTC spends; retried next pass.
+                    println!("token accept pending (transient) for {id}: {msg}");
+                    status.insert(id.to_string(), TokenClaimStatus {
+                        statechain_id: id.to_string(),
+                        state: TokenClaimState::Pending,
+                        asset_id: None,
+                        amount: None,
+                        detail: Some(msg),
+                    });
+                }
+            }
+        }
     }
 
     /// Start the background watcher (deposit confirmation + incoming-transfer auto-claim).
@@ -565,7 +623,7 @@ impl UtexoWallet {
         use electrum_client::ElectrumApi;
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let record = self.record().await?;
-        let carriers = self.token_carrier_outpoints().await.unwrap_or_default();
+        let carriers = self.unspendable_as_btc_outpoints().await.unwrap_or_default();
         let ids: Vec<String> = record
             .coins
             .iter()
@@ -642,7 +700,7 @@ impl UtexoWallet {
         // Never sweep a token-carrier coin into an RGB-unaware L1 spend (destroys the allocation —
         // audit [7]). Exclude carriers from the withdraw-everything default; if the caller names a
         // carrier explicitly, hard-error so the loss is never silent.
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
         let ids: Vec<String> = match statechain_ids {
             Some(ids) => {
                 for id in &ids {
@@ -842,7 +900,7 @@ impl UtexoWallet {
         // Same carrier guard as withdraw (audit [7]): a unilateral exit broadcasts an RGB-unaware
         // spend, so a carrier coin must be excluded from the exit-everything default and rejected if
         // named explicitly.
-        let carriers = self.token_carrier_outpoints().await?;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
         let ids: Vec<String> = match statechain_ids {
             Some(ids) => {
                 for id in &ids {

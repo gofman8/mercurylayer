@@ -224,7 +224,11 @@ pub async fn update_statechain(pool: &sqlx::PgPool, auth_key: &XOnlyPublicKey, s
     transaction.commit().await.unwrap();
 }
 
-pub async fn update_unlock_transfer(pool: &sqlx::PgPool, is_current_owner: bool, statechain_id: &str)  {
+/// Clear one lock bit of a transfer (owner → `locked2`, receiver → `locked`) and, once both are
+/// clear, release any associated Lightning latch. Returns a typed `Err(message)` instead of
+/// panicking when the statechain_id has no transfer row (external review finding 1: the old
+/// `fetch_one().unwrap()` 500-crashed the handler on an unknown id) or on any DB error.
+pub async fn update_unlock_transfer(pool: &sqlx::PgPool, is_current_owner: bool, statechain_id: &str) -> Result<(), String> {
 
     let locked_field = if is_current_owner { "locked2" } else { "locked" };
 
@@ -232,45 +236,53 @@ pub async fn update_unlock_transfer(pool: &sqlx::PgPool, is_current_owner: bool,
         SET {} = false, updated_at = NOW() \
         WHERE statechain_id = $1", locked_field);
 
-    let _ = sqlx::query(&query)
+    let updated = sqlx::query(&query)
         .bind(statechain_id)
         .execute(pool)
         .await
-        .unwrap();
+        .map_err(|e| format!("could not update transfer lock: {e}"))?;
 
+    // No row for this statechain_id: nothing to unlock — report cleanly rather than reading back a
+    // row that does not exist.
+    if updated.rows_affected() == 0 {
+        return Err("no transfer found for this statechain id".to_string());
+    }
 
-        let query = "SELECT locked, locked2, batch_id \
-            FROM statechain_transfer \
-            WHERE statechain_id = $1";
+    let query = "SELECT locked, locked2, batch_id \
+        FROM statechain_transfer \
+        WHERE statechain_id = $1";
 
-        let row = sqlx::query(query)
-            .bind(statechain_id)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let row = match sqlx::query(query)
+        .bind(statechain_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("could not read transfer lock state: {e}"))?
+    {
+        Some(r) => r,
+        None => return Err("no transfer found for this statechain id".to_string()),
+    };
 
-        let locked: bool = row.get(0);
-        let locked2: bool = row.get(1);
-        let batch_id: Option<String> = row.get(2);
+    let locked: bool = row.get(0);
+    let locked2: bool = row.get(1);
+    let batch_id: Option<String> = row.get(2);
 
-        // if there is no lightning latch operation, the update below will have no effect
+    // if there is no lightning latch operation, the update below will have no effect
 
-        if batch_id.is_some() && !locked && !locked2 {
+    if let Some(batch_id) = batch_id {
+        if !locked && !locked2 {
             let query = "UPDATE lightning_latch \
                 SET locked = false, updated_at = NOW() \
                 WHERE statechain_id = $1
                 AND batch_id = $2";
 
-            let _ = sqlx::query(query)
+            sqlx::query(query)
                 .bind(statechain_id)
-                .bind(batch_id.unwrap())
+                .bind(batch_id)
                 .execute(pool)
                 .await
-                .unwrap();
-
-        
+                .map_err(|e| format!("could not release lightning latch: {e}"))?;
         }
+    }
 
-    
-
+    Ok(())
 }

@@ -72,7 +72,7 @@ impl UtexoWallet {
         let carriers = if self.inner.config.rgb_data_dir.is_some()
             && self.inner.config.rgb_proxy_url.is_some()
         {
-            self.token_carrier_outpoints().await?
+            self.unspendable_as_btc_outpoints().await?
         } else {
             std::collections::HashSet::new()
         };
