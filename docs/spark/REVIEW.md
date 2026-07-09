@@ -70,7 +70,12 @@ The P0 blockers below must be fixed and re-reviewed before any mainnet exposure.
 > bundle + corrected docs). Two caveats remain before mainnet: the **SGX lockbox must be rebuilt and
 > redeployed** for P0-1's enclave consume to take effect, and the **full E2E suite (regtest +
 > lockbox + RLN) must be run** against these changes and the result **re-reviewed**. Status table:
-> [PLAN.md](PLAN.md#post-review-remediation-backlog-2026-07). P1/P2 items are still open.
+> [PLAN.md](PLAN.md#post-review-remediation-backlog-2026-07). NOTE (superseded): most of this
+> backlog has since landed — P1-1 (H4 latch timeout), P1-2 (H6 retriable booking), P1-3 (dust
+> floors), P2-2 (auto_exit_due, now default-on), P2-3 ([20] exit diagnostics) and the irreversible
+> half of P1-4 ([15]) are fixed and verified. The authoritative current status lives in
+> [AUDIT-2026-07.md](AUDIT-2026-07.md); genuinely still open is P2-4 (per-transfer blinding
+> randomization + consignment pruning).
 
 > No review proves the absence of vulnerabilities. Treat this as one input; before mainnet, run
 > repeated independent reviews, protocol/property fuzzing (nonce lifecycle, split-locktime arithmetic,

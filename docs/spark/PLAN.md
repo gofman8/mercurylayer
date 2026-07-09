@@ -99,7 +99,7 @@ tracked here as items land; each P0 gets a regression test.
 |---|------|--------|
 | P1-1 | Decouple LN-latch batches from the 120 s `batch_timeout`; gate `validate_batch` on the latch's own `expires_at`; refuse `send_payment` without ample batch time. | H4 |
 | P1-2 | Make incoming-token booking retriable: each `claim()`, scan CONFIRMED coins with a consignment-bearing backup but no booked allocation and re-run `accept_incoming_tokens` (idempotent). | H6 |
-| P1-3 | ✅ `create_tx_out`: `checked_sub` + reject when `input − fee < DUST_LIMIT` (330 P2TR). *(Split/combine-time dust floor still TODO.)* | M2 |
+| P1-3 | ✅ `create_tx_out`: `checked_sub` + reject when `input − fee < DUST_LIMIT` (330 P2TR). *(Split/combine-time dust floor ✅ shipped — `min_split_output` = 330 + backup fee, enforced on every split/combine/colored path; `transfer.rs:816`, audit [9].)* | M2 |
 | P1-4 | Bind owner auth sigs to `(statechain_id ‖ endpoint_tag ‖ server nonce/expiry)` + mutating params; reject seen-nonce/stale. Prioritize `withdraw`/`complete`/`transfer`/`set_spend_budget`. | M1 |
 
 ### P2 — robustness / DX / privacy

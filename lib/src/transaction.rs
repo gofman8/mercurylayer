@@ -136,7 +136,13 @@ pub fn create_tx_out(
         let new_address = Address::p2tr(&Secp256k1::new(), recipient_user_pubkey.x_only_public_key().0, None, network);
         new_address
     } else {
-        let new_address = Address::from_str(&to_address).unwrap().require_network(network)?;
+        // Validate the address instead of unwrapping: a malformed to_address must surface as a
+        // typed error, not panic the client (this runs AFTER a sign/first nonce has been committed,
+        // so a panic here also strands that nonce). In-repo callers pre-validate; this guards the
+        // library boundary for any external caller.
+        let new_address = Address::from_str(&to_address)
+            .map_err(|_| MercuryError::InvalidBitcoinAddressError)?
+            .require_network(network)?;
         new_address
     };
 

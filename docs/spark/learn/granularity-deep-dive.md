@@ -380,11 +380,14 @@ You hold 10 units on a 1,500-sat piece (depth d); the SE stops answering.
    rows (the fully-signed colored splits), the consignment, your key share, the plain backup.
 2. **Materialize the branch.** The branch txs are ordinary consensus-final transactions —
    broadcast them root-first with any tool (`sendrawtransaction`; they are in the recovery
-   bundle). Honest caveats: `unilateral_exit(piece_id)` will *refuse* — the piece is a carrier
-   and that op is a plain sweep (§4) — and the shipped `auto_exit_due` watchtower **skips
-   carriers**, so this broadcast is on you — or on any co-descendant exiting first, with a
-   caveat: in this scenario the sender's change coin holds the residual 90 units and is itself a
-   carrier, so its exit is the same manual route, not an automatic SDK path; only a *plain*
+   bundle). Honest caveat: `unilateral_exit(piece_id)` will *refuse* — the piece is a carrier
+   and that op is a plain sweep (§4). But you rarely need to broadcast by hand: since REQ-33 the
+   `auto_exit_due` watchtower **materializes** a received carrier near its deadline (branch-only,
+   never a plain sweep — `wallet.rs`, `SDK_E2E=34`), and it runs from the background watcher by
+   default (`SdkConfig::auto_exit`) — so the manual broadcast is the fallback for a wallet that
+   isn't running a watcher (or a delegated keyless tower). A co-descendant exiting first also
+   materializes the branch for free; in this scenario the sender's change coin holds the residual
+   90 units and is itself a carrier, so it takes the same (now automatic) route; only a *plain*
    co-descendant (e.g. the uncolored change of a later full-allocation spend) materializes the
    shared branch for free via the normal SDK exit paths. Do it before the tree's root
    deadline, like any sub-coin exit.

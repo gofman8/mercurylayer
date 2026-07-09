@@ -206,9 +206,9 @@ pub async fn validate_batch(statechain_entity: &State<StateChainEntity>, statech
 #[post("/transfer/receiver", format = "json", data = "<transfer_receiver_request_payload>")]
 pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, transfer_receiver_request_payload: Json<TransferReceiverRequestPayload>) -> status::Custom<Json<Value>> {
 
-    // TODO: check if the statechain_id is within a batch and if it is, check if the batch is still open or expired.
-    // If open, check all coins are unlocked. If not, return 400 error.
-    // If expired, return 400 error.
+    // Batch gate: if this statechain is in a batch, reject unless the batch is open with all coins
+    // unlocked (and not expired). Implemented by validate_batch below (incl. the Lightning-latch
+    // expiry-minus-grace refinement, audit [2]/H4).
     let batch_validation_result = validate_batch(&statechain_entity, &transfer_receiver_request_payload.statechain_id).await;
 
     match batch_validation_result {

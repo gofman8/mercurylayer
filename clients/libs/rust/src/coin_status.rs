@@ -47,6 +47,15 @@ async fn check_deposit(client_config: &ClientConfig, coin: &mut Coin, wallet_net
 
     let utxo = utxo.unwrap();
 
+    // Coin amounts are stored as u32 sats (SPEC §14 "amount width"). Refuse to book a deposit whose
+    // value would silently truncate on the `as u32` cast below, rather than mis-accounting it.
+    if utxo.value > u32::MAX as u64 {
+        return Err(anyhow!(
+            "deposit UTXO value {} sats exceeds the u32 coin-amount ceiling (~42.9 BTC); refusing to book a truncated amount",
+            utxo.value
+        ));
+    }
+
     // IN_MEMPOOL. there is nothing to do
     if utxo.height == 0 && coin.status == CoinStatus::IN_MEMPOOL {
         return Ok(None);
@@ -217,6 +226,15 @@ async fn check_for_duplicated(client_config: &ClientConfig, existing_coins: &Vec
             });
 
             if utxo_exists {
+                continue;
+            }
+
+            // u32 amount ceiling (SPEC §14): skip an oversized duplicate rather than truncate it.
+            if unspent.value > u32::MAX as u64 {
+                println!(
+                    "skipping duplicate UTXO {}:{} — value {} sats exceeds the u32 coin-amount ceiling",
+                    unspent.tx_hash, unspent.tx_pos, unspent.value
+                );
                 continue;
             }
 

@@ -43,7 +43,7 @@ SPEC §13 (REQ-26..30, ERR-11) + PARITY rows flipped to DONE. Unit tests 17 pass
 | Unit tests | **DONE** (512fa4b) | mercury-spark-sdk: 13 pass + doctest — exit-cost math, terminal predicate, error semantics, select invariants (INV-9), split fee/change (INV-10), envelope serde + amount-hint (REQ-21), preimage-hash (INV-14). `cargo +stable test -p mercury-spark-sdk`. |
 | New E2E | **DONE** | sdk09 (IFA issue+mint+batch, G3), sdk10 (terminal-parent verify honest+adversarial, G1). Runner auto-discovers SDK 1-10 + RGB 1-8. |
 | Traced launch | **DONE** | clients/tests/run_all_suites.sh (TRACE=1 -> client reqwest/rgb-lib logs; per-test docker-log snapshots of server/lockbox/electrs). Server RUST_LOG enabled in compose (rocket request logs) + fixed a pre-existing web-block YAML quoting bug so compose can recreate services. Full traced run: TRACE=1 LOGDIR=/tmp/spark_suite_logs ./clients/tests/run_all_suites.sh |
-| Adversarial log review | **PENDING (Opus)** | review /tmp/spark_suite_logs for delay/replay/malform/reorder gaps the spec misses -> new tests + fixes. |
+| Adversarial log review | **DONE** | performed and documented in [REVIEW.md](REVIEW.md) (per-dimension finders over the real code + full-suite trace logs: 13 candidates → 10 confirmed → fixes incl. MuSig2 nonce reuse, budget monotonicity, branch value inflation; new tests sdk08/09/10/12; SPEC §14 assumptions). Superseded by the 2026-07 mainnet audit ([AUDIT-2026-07.md](AUDIT-2026-07.md)). |
 
 ## Gap closure (2026-07-04) — all three remaining gaps CLOSED
 
