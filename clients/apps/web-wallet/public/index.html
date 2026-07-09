@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>utexo wallet</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ============================== onboarding ============================== -->
+    <section id="screen-onboard" class="screen">
+      <div class="hero">
+        <div class="brand-mark">⚡</div>
+        <h1>utexo <span>wallet</span></h1>
+        <p class="tagline">Self-custodial bitcoin that moves instantly.<br>
+          Off-chain speed, on-chain exit — always.</p>
+      </div>
+      <div class="card">
+        <label for="wallet-name">Wallet name</label>
+        <input id="wallet-name" type="text" value="my-wallet" spellcheck="false" autocomplete="off">
+        <button id="btn-create" class="btn btn-primary">Create new wallet</button>
+        <button id="btn-show-restore" class="btn btn-ghost">I have a recovery phrase</button>
+        <div id="restore-panel" class="hidden">
+          <label for="restore-mnemonic">Recovery phrase (12 words)</label>
+          <textarea id="restore-mnemonic" rows="3" spellcheck="false" autocomplete="off"
+            placeholder="alpha bravo charlie …"></textarea>
+          <button id="btn-restore" class="btn btn-primary">Restore wallet</button>
+        </div>
+        <p id="onboard-error" class="error hidden"></p>
+      </div>
+    </section>
+
+    <!-- ============================== backup ================================= -->
+    <section id="screen-backup" class="screen hidden">
+      <div class="hero small">
+        <h2>Your recovery phrase</h2>
+        <p class="tagline">Write these 12 words down, in order, somewhere safe.</p>
+      </div>
+      <div class="card">
+        <ol id="mnemonic-grid" class="mnemonic-grid"></ol>
+        <button id="btn-copy-mnemonic" class="btn btn-ghost">Copy phrase</button>
+        <div class="notice">
+          The phrase restores your <b>keys</b>. Your off-chain coin history also lives in this
+          wallet's data directory — keep the app's data (or a recovery-bundle export) backed up
+          alongside the phrase for full recovery.
+        </div>
+        <button id="btn-backup-done" class="btn btn-primary">I've saved my recovery phrase</button>
+      </div>
+    </section>
+
+    <!-- ============================== home =================================== -->
+    <section id="screen-home" class="screen hidden">
+      <header class="topbar">
+        <div class="brand-inline">⚡ <b>utexo</b></div>
+        <div class="top-right">
+          <span id="net-pill" class="pill">regtest</span>
+          <span id="wallet-pill" class="pill pill-dim"></span>
+        </div>
+      </header>
+
+      <div class="balance-block">
+        <div class="balance-label">Balance</div>
+        <div class="balance-main"><span id="balance-sats">0</span><span class="unit">sats</span></div>
+        <div id="balance-btc" class="balance-sub">0.00000000 BTC</div>
+        <div id="balance-pending" class="chip hidden"></div>
+      </div>
+
+      <div class="action-row">
+        <button id="btn-receive" class="btn btn-big btn-primary">
+          <svg viewBox="0 0 24 24"><path d="M12 4v12m0 0l-5-5m5 5l5-5M5 20h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Receive
+        </button>
+        <button id="btn-send" class="btn btn-big btn-secondary">
+          <svg viewBox="0 0 24 24"><path d="M12 20V8m0 0l-5 5m5-5l5 5M5 4h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Send
+        </button>
+      </div>
+
+      <div class="card activity-card">
+        <div class="card-title">Activity</div>
+        <ul id="activity-list" class="activity-list"></ul>
+        <div id="activity-empty" class="empty">No activity yet — hit <b>Receive</b> to get your first sats.</div>
+      </div>
+
+      <footer class="foot">
+        <span id="my-address" class="addr" title="your spark address"></span>
+        <button id="btn-copy-address" class="mini">copy</button>
+      </footer>
+    </section>
+
+    <!-- ============================== receive modal ========================== -->
+    <div id="modal-receive" class="overlay hidden">
+      <div class="sheet">
+        <div class="sheet-head">
+          <h3>Receive</h3>
+          <button class="x" data-close="modal-receive">✕</button>
+        </div>
+        <div class="tabs">
+          <button id="tab-spark" class="tab active">Instant</button>
+          <button id="tab-onchain" class="tab">On-chain</button>
+        </div>
+
+        <div id="pane-spark" class="pane">
+          <p class="hint">Share your address — incoming transfers land instantly and claim
+            themselves in the background. Free.</p>
+          <div class="qr-box"><div id="qr-spark"></div></div>
+          <div class="addr-row"><code id="spark-address"></code>
+            <button class="mini" data-copy="spark-address">copy</button></div>
+        </div>
+
+        <div id="pane-onchain" class="pane hidden">
+          <p class="hint">Move on-chain bitcoin into the wallet. One address per exact amount;
+            spendable after 2 confirmations.</p>
+          <label for="deposit-amount">Amount (sats)</label>
+          <div class="inline-form">
+            <input id="deposit-amount" type="number" min="1" placeholder="50000">
+            <button id="btn-gen-deposit" class="btn btn-primary slim">Generate</button>
+          </div>
+          <div id="deposit-result" class="hidden">
+            <div class="qr-box"><div id="qr-deposit"></div></div>
+            <div class="addr-row"><code id="deposit-address"></code>
+              <button class="mini" data-copy="deposit-address">copy</button></div>
+            <p class="hint">Send <b id="deposit-exact"></b> sats exactly to this address.</p>
+          </div>
+          <p id="receive-error" class="error hidden"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================== send modal ============================= -->
+    <div id="modal-send" class="overlay hidden">
+      <div class="sheet">
+        <div class="sheet-head">
+          <h3>Send</h3>
+          <button class="x" data-close="modal-send">✕</button>
+        </div>
+        <div id="send-form">
+          <label for="send-address">To (spark address)</label>
+          <input id="send-address" type="text" placeholder="tml1…" spellcheck="false" autocomplete="off">
+          <label for="send-amount">Amount (sats)</label>
+          <input id="send-amount" type="number" min="1" placeholder="15000">
+          <p class="hint">Instant &amp; free — any amount, exact to the sat.</p>
+          <button id="btn-do-send" class="btn btn-primary">Send</button>
+          <p id="send-error" class="error hidden"></p>
+        </div>
+        <div id="send-progress" class="center hidden">
+          <div class="spinner"></div>
+          <p class="hint">Signing with the statechain entity…</p>
+        </div>
+        <div id="send-done" class="center hidden">
+          <div class="bigcheck">✓</div>
+          <p id="send-summary"></p>
+          <button class="btn btn-ghost" data-close="modal-send">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toasts"></div>
+  </div>
+
+  <script src="/vendor/qrcode.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

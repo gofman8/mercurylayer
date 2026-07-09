@@ -128,6 +128,22 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "BalanceUpdate",
                                 serde_json::to_value(balance).unwrap_or(Value::Null),
                             ),
+                            WalletEvent::ExitBranchConflict { statechain_id } => (
+                                "ExitBranchConflict",
+                                json!({"statechain_id": statechain_id}),
+                            ),
+                            WalletEvent::ExitDeadlineApproaching { statechain_id, deadline_block, tip } => (
+                                "ExitDeadlineApproaching",
+                                json!({"statechain_id": statechain_id, "deadline_block": deadline_block, "tip": tip}),
+                            ),
+                            WalletEvent::CoinRefreshed { old_statechain_id, new_statechain_id, fee_sats } => (
+                                "CoinRefreshed",
+                                json!({"old_statechain_id": old_statechain_id, "new_statechain_id": new_statechain_id, "fee_sats": fee_sats}),
+                            ),
+                            WalletEvent::TokenCarrierMaterialized { statechain_id, deadline_block, tip } => (
+                                "TokenCarrierMaterialized",
+                                json!({"statechain_id": statechain_id, "deadline_block": deadline_block, "tip": tip}),
+                            ),
                         };
                         let line = json!({"event": name, "data": data}).to_string();
                         let mut out = tokio::io::stdout();
