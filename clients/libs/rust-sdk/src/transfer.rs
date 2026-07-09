@@ -551,6 +551,171 @@ impl SparkWallet {
         Ok(ids)
     }
 
+    /// Register the sub-coins of a COMBINE (N input carriers → M outputs, e.g. piece + change).
+    /// Mirrors [`Self::register_split_subcoins_n`] but the branch is a DAG: each output's exit
+    /// branch is the UNION of all N inputs' sub-branches (root-first) plus the combine tx, and its
+    /// ancestor list is the union of every input carrier id + that input's inherited ancestors — so
+    /// the receiver's per-structural-input terminal check (Σ branch inputs) is satisfied with exactly
+    /// one named terminal ancestor per combined input.
+    ///
+    /// Only DISJOINT input sub-branches are supported (no two inputs share an ancestor tx); a shared
+    /// ancestor (a re-merging DAG) is rejected — rare, and it would make the ancestor-count bookkeeping
+    /// ambiguous. Flat carriers (on-chain funding, empty branch) are the trivially-disjoint common case.
+    pub(crate) async fn register_combine_subcoins(
+        &self,
+        parent_ids: &[String],
+        signed_combine_tx_hex: &str,
+        combine_txid: &str,
+        outputs: &[(String, u32, u64)],
+    ) -> Result<Vec<String>> {
+        let mut record = self.record().await?;
+        let mut ids: Vec<String> = vec![String::new(); outputs.len()];
+        for coin in record.coins.iter_mut() {
+            let addr = coin.aggregated_address.clone().unwrap_or_default();
+            if coin.status == CoinStatus::INITIALISED {
+                if let Some((i, (_, vout, sats))) =
+                    outputs.iter().enumerate().find(|(_, (a, _, _))| *a == addr)
+                {
+                    coin.utxo_txid = Some(combine_txid.to_string());
+                    coin.utxo_vout = Some(*vout);
+                    coin.amount = Some(u32::try_from(*sats)?);
+                    coin.status = CoinStatus::CONFIRMED;
+                    ids[i] = coin.statechain_id.clone().unwrap_or_default();
+                    continue;
+                }
+            }
+            // Every combined input carrier is terminally spent by the combine.
+            if coin.duplicate_index == 0
+                && coin
+                    .statechain_id
+                    .as_deref()
+                    .map_or(false, |sid| parent_ids.iter().any(|p| p == sid))
+            {
+                coin.status = CoinStatus::WITHDRAWN;
+            }
+        }
+        if ids.iter().any(|i| i.is_empty()) {
+            return Err(anyhow!("combine sub-coin registration failed"));
+        }
+
+        // Fresh first backup (exit leaf) per output sub-coin.
+        let network = self.inner.config.network.to_string();
+        let mut sub_backups: Vec<(String, mercurylib::wallet::BackupTx)> = Vec::new();
+        for coin in record.coins.iter_mut() {
+            let id = coin.statechain_id.clone().unwrap_or_default();
+            if ids.contains(&id) && coin.status == CoinStatus::CONFIRMED {
+                let bkp =
+                    mercuryrustlib::deposit::create_tx1(&self.inner.cc, coin, &network, 1).await?;
+                coin.locktime = Some(mercurylib::utils::get_blockheight(&bkp)?);
+                sub_backups.push((id, bkp));
+            }
+        }
+        self.save_record(&record).await?;
+
+        // Merge the input sub-branches (root-first) — rejecting any shared ancestor tx — then append
+        // the combine as the final hop. For flat carriers every sub-branch is empty, so the merged
+        // branch is just [combine].
+        let mut merged_branch: Vec<mercurylib::wallet::BackupTx> = Vec::new();
+        let mut seen_txids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pid in parent_ids {
+            let sub = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("branch-{pid}"),
+            )
+            .await
+            .unwrap_or_default();
+            for b in sub {
+                let txid = bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(
+                    &hex::decode(&b.tx)?,
+                )?
+                .txid()
+                .to_string();
+                if !seen_txids.insert(txid) {
+                    return Err(anyhow!(
+                        "combine of carriers sharing a common ancestor is not supported — pick independent carriers"
+                    ));
+                }
+                merged_branch.push(b);
+            }
+        }
+        // Re-number and append the combine tx last (the receiver validates by txid lookup, but keep
+        // tx_n contiguous and root-first for clarity).
+        for (i, b) in merged_branch.iter_mut().enumerate() {
+            b.tx_n = (i + 1) as u32;
+        }
+        merged_branch.push(mercurylib::wallet::BackupTx {
+            tx_n: (merged_branch.len() + 1) as u32,
+            tx: signed_combine_tx_hex.to_string(),
+            client_public_nonce: String::new(),
+            server_public_nonce: String::new(),
+            client_public_key: String::new(),
+            server_public_key: String::new(),
+            blinding_factor: String::new(),
+            rgb_consignment: None,
+            rgb_blinding: None,
+        });
+        for (id, bkp) in &sub_backups {
+            mercuryrustlib::sqlite_manager::insert_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                id,
+                &vec![bkp.clone()],
+            )
+            .await?;
+            mercuryrustlib::sqlite_manager::insert_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("branch-{id}"),
+                &merged_branch,
+            )
+            .await?;
+        }
+
+        // Ancestor list = every input carrier id + that input's own inherited ancestors. Because the
+        // sub-branches are disjoint, these are all distinct, so the count equals the receiver's
+        // required-terminal-ancestor count (Σ inputs across the merged branch).
+        let mut ancestors: Vec<String> = Vec::new();
+        for pid in parent_ids {
+            ancestors.push(pid.clone());
+            if let Ok(inherited) = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("parents-{pid}"),
+            )
+            .await
+            {
+                ancestors.extend(inherited.iter().map(|b| b.tx.clone()));
+            }
+        }
+        let parent_rows: Vec<mercurylib::wallet::BackupTx> = ancestors
+            .iter()
+            .enumerate()
+            .map(|(i, id)| mercurylib::wallet::BackupTx {
+                tx_n: (i + 1) as u32,
+                tx: id.clone(),
+                client_public_nonce: String::new(),
+                server_public_nonce: String::new(),
+                client_public_key: String::new(),
+                server_public_key: String::new(),
+                blinding_factor: String::new(),
+                rgb_consignment: None,
+                rgb_blinding: None,
+            })
+            .collect();
+        for id in &ids {
+            mercuryrustlib::sqlite_manager::insert_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &format!("parents-{id}"),
+                &parent_rows,
+            )
+            .await?;
+        }
+
+        Ok(ids)
+    }
+
     /// Blind-MuSig2 co-sign a multi-output spend of `coin` (the plain-BTC split; the RGB-colored
     /// variant lives in `mercuryrustlib::rgb::create_colored_split_tx`). `qt_backup_tx` positions
     /// the split's locktime in the decrement ladder (backup count + 1 beats the parent's backup).

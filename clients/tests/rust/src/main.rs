@@ -58,6 +58,7 @@ pub mod sdk27_invalidation_time;
 pub mod sdk28_granularity_sats;
 pub mod sdk29_granularity_tokens;
 pub mod sdk30_refresh;
+pub mod sdk31_token_combine;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -233,6 +234,12 @@ async fn main() -> Result<()> {
     // old outpoint spent (old backups dead), fresh coin at a fresh ladder, user pays the fee.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("30") {
         sdk30_refresh::execute().await?;
+        return Ok(());
+    }
+    // Multi-carrier token combine (SDK_E2E=31): pay an amount spanning several carriers via one
+    // colored combine; receiver validates the multi-input branch + requires ALL carriers terminal.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("31") {
+        sdk31_token_combine::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

@@ -473,9 +473,23 @@ impl SparkWallet {
                 }
             }
         }
-        let (mut carrier, carrier_amount) = carrier.ok_or_else(|| {
-            anyhow!("no single coin carries >= {token_amount} of {asset_id} (multi-coin token combine not yet wired)")
-        })?;
+        let (mut carrier, carrier_amount) = match carrier {
+            Some(c) => c,
+            None => {
+                // No single carrier covers the amount: combine several carriers of this asset into
+                // one payment (piece + change) in a single SE-co-signed colored combine tx.
+                return self
+                    .colored_combine_transfer(
+                        asset_id,
+                        receiver_address,
+                        token_amount,
+                        latch,
+                        record,
+                        allocations,
+                    )
+                    .await;
+            }
+        };
         let carrier_id = carrier
             .statechain_id
             .clone()
@@ -657,6 +671,276 @@ impl SparkWallet {
         };
 
         // Hand the piece over (plain, or batch-locked when latching).
+        mercuryrustlib::transfer_sender::execute(
+            &self.inner.cc,
+            receiver_address,
+            &self.inner.config.wallet_name,
+            &piece_id,
+            None,
+            false,
+            batch_id.clone(),
+        )
+        .await?;
+
+        let _ = change_id;
+        Ok(ColoredTransferOut {
+            result: TransferResult {
+                receiver_address: receiver_address.to_string(),
+                total_sats: TOKEN_PIECE_SATS,
+                coins: vec![TransferredCoin {
+                    statechain_id: piece_id.clone(),
+                    amount_sats: TOKEN_PIECE_SATS,
+                }],
+                used_split: true,
+            },
+            piece_id,
+            batch_id,
+            se_hash,
+        })
+    }
+
+    /// Multi-carrier colored transfer: when no single carrier holds `token_amount`, COMBINE several
+    /// carriers of `asset_id` into one payment (piece + change) in a single SE-co-signed colored
+    /// combine tx (N inputs → 2 outputs). Every combined carrier is made terminal first; the receiver
+    /// validates the multi-input branch and (via the per-structural-input terminal check) requires
+    /// ALL N carriers to be terminal. Caller MUST hold `wallet_lock` (this runs inside
+    /// `colored_transfer`'s lock and does not re-take it).
+    async fn colored_combine_transfer(
+        &self,
+        asset_id: &str,
+        receiver_address: &str,
+        token_amount: u64,
+        latch: ColoredLatch,
+        record: mercurylib::wallet::Wallet,
+        allocations: Vec<(String, u64, bool)>,
+    ) -> Result<ColoredTransferOut> {
+        // 1. Select a minimal set of confirmed, settled carriers of this asset, largest allocation
+        //    first, until their allocations sum to >= token_amount; then top up with more carriers
+        //    if the summed SATS cannot fund the piece + change + fee.
+        let min_output =
+            crate::transfer::min_split_output(crate::transfer::backup_fee_rate(&self.inner.cc).await?);
+        let mut candidates: Vec<(mercurylib::wallet::Coin, u64)> = Vec::new();
+        for coin in record.coins.iter() {
+            if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 {
+                continue;
+            }
+            let op = format!(
+                "{}:{}",
+                coin.utxo_txid.clone().unwrap_or_default(),
+                coin.utxo_vout.unwrap_or_default()
+            );
+            if let Some((_, amt, _)) =
+                allocations.iter().find(|(o, _, settled)| *o == op && *settled)
+            {
+                candidates.push((coin.clone(), *amt));
+            }
+        }
+        let total_alloc: u64 = candidates.iter().map(|(_, a)| *a).sum();
+        if total_alloc < token_amount {
+            return Err(anyhow!(
+                "insufficient {asset_id}: wallet holds {total_alloc} across {} carrier(s), need {token_amount}",
+                candidates.len()
+            ));
+        }
+        // Largest allocation first (fewest inputs); the combine reserve grows with total sats.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut selected: Vec<(mercurylib::wallet::Coin, u64)> = Vec::new();
+        let mut sel_alloc = 0u64;
+        let mut sel_sats = 0u64;
+        for c in candidates.into_iter() {
+            if sel_alloc >= token_amount
+                && sel_sats > TOKEN_PIECE_SATS + (sel_sats / 100).clamp(300, 2_000) + min_output
+            {
+                break;
+            }
+            sel_sats += c.0.amount.unwrap_or_default() as u64;
+            sel_alloc += c.1;
+            selected.push(c);
+        }
+        if selected.len() < 2 {
+            // A single carrier would have been found by the caller's scan; <2 here means the only
+            // sufficient carrier is a token carrier we already rejected, so treat as unsupported.
+            return Err(anyhow!(
+                "no combination of carriers covers {token_amount} of {asset_id} with enough sats"
+            ));
+        }
+
+        // 2. Amounts. Piece carries the exact token_amount; change keeps the rest across all inputs.
+        let combined_sats: u64 = selected.iter().map(|(c, _)| c.amount.unwrap_or_default() as u64).sum();
+        let combined_alloc: u64 = selected.iter().map(|(_, a)| *a).sum();
+        let fee_reserve = (combined_sats / 100).clamp(300, 2_000);
+        if TOKEN_PIECE_SATS + fee_reserve + min_output >= combined_sats {
+            return Err(anyhow!(
+                "combined carriers hold too few sats ({combined_sats}) to fund a token piece + change + fee at the current feerate"
+            ));
+        }
+        let change_sats = combined_sats - TOKEN_PIECE_SATS - fee_reserve;
+        let token_change = combined_alloc - token_amount;
+        if TOKEN_PIECE_SATS < min_output || change_sats < min_output {
+            return Err(anyhow!(
+                "combine output below the minimum viable size {min_output} (piece {TOKEN_PIECE_SATS}, change {change_sats}) — a sub-coin could not fund its own backup"
+            ));
+        }
+
+        // 3. Fresh slots for the piece + change.
+        let token_a = self.take_token().await?;
+        let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &token_a,
+            u32::try_from(TOKEN_PIECE_SATS)?,
+        )
+        .await?;
+        let token_b = self.take_token().await?;
+        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &token_b,
+            u32::try_from(change_sats)?,
+        )
+        .await?;
+
+        // 4. Make EVERY input carrier terminal at the SE before co-signing the combine — so none can
+        //    be double-spent to invalidate the branch (the receiver independently verifies this).
+        let carrier_ids: Vec<String> = selected
+            .iter()
+            .map(|(c, _)| c.statechain_id.clone().unwrap_or_default())
+            .collect();
+        let carrier_ops: Vec<String> = selected
+            .iter()
+            .map(|(c, _)| {
+                format!(
+                    "{}:{}",
+                    c.utxo_txid.clone().unwrap_or_default(),
+                    c.utxo_vout.unwrap_or_default()
+                )
+            })
+            .collect();
+        for id in &carrier_ids {
+            mercuryrustlib::lightning_latch::set_spend_budget(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                id,
+                1,
+            )
+            .await?;
+        }
+
+        // 5. Build + per-input blind-MuSig2 co-sign the un-broadcast colored combine (locktime 0).
+        let server_info = mercuryrustlib::utils::info_config(&self.inner.cc).await?;
+        let mut input_coins: Vec<mercurylib::wallet::Coin> =
+            selected.iter().map(|(c, _)| c.clone()).collect();
+        let splits: Vec<(String, u64, u64)> = vec![
+            (piece_addr.clone(), TOKEN_PIECE_SATS, token_amount),
+            (change_addr.clone(), change_sats, token_change),
+        ];
+        let combine = {
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            mercuryrustlib::rgb::create_colored_combine_tx(
+                &self.inner.cc,
+                w,
+                &mut input_coins,
+                asset_id,
+                &splits,
+                1,
+                false,
+                None,
+                &self.inner.config.network.to_string(),
+                server_info.initlock,
+                server_info.interval,
+                TOKEN_BLINDING,
+            )
+            .await?
+        };
+        let piece_vout = combine.output_vouts[0];
+        let change_vout = combine.output_vouts[1];
+
+        // 6. Register both sub-coins (merged DAG branch = all inputs' sub-branches + combine tx;
+        //    ancestors = every carrier + its inherited ancestors). Then RGB-register the change with
+        //    ALL input carrier outpoints as its sources, or mark them all spent on a full-allocation send.
+        let ids = self
+            .register_combine_subcoins(
+                &carrier_ids,
+                &combine.signed_tx,
+                &combine.txid,
+                &[
+                    (piece_addr.clone(), piece_vout, TOKEN_PIECE_SATS),
+                    (change_addr.clone(), change_vout, change_sats),
+                ],
+            )
+            .await?;
+        let piece_id = ids[0].clone();
+        let change_id = ids[1].clone();
+        {
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            tokio::task::block_in_place(|| -> Result<()> {
+                if token_change > 0 {
+                    w.register_statechain(
+                        &combine.txid,
+                        change_vout,
+                        change_sats,
+                        asset_id,
+                        token_change,
+                        &carrier_ops,
+                    )?;
+                } else {
+                    w.mark_spent(&carrier_ops)?;
+                }
+                Ok(())
+            })?;
+        }
+
+        // 7. Attach the consignment envelope to the piece's backup so it rides the transfer message.
+        let envelope = serde_json::to_string(&ConsignmentEnvelope {
+            c: combine.consignment.clone(),
+            a: token_amount,
+            s: TOKEN_PIECE_SATS,
+        })?;
+        let mut piece_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            &piece_id,
+        )
+        .await?;
+        if let Some(first) = piece_backups.first_mut() {
+            first.rgb_consignment = Some(envelope);
+            first.rgb_blinding = Some(TOKEN_BLINDING);
+        }
+        mercuryrustlib::sqlite_manager::update_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            &piece_id,
+            &piece_backups,
+        )
+        .await?;
+
+        // 8. Optional latch, then hand the piece over — identical to the single-carrier path.
+        let (batch_id, se_hash) = match &latch {
+            ColoredLatch::None => (None, None),
+            ColoredLatch::ExternalHash(hash) => (
+                Some(
+                    mercuryrustlib::lightning_latch::create_external_hash_latch(
+                        &self.inner.cc,
+                        &self.inner.config.wallet_name,
+                        &piece_id,
+                        hash,
+                    )
+                    .await?,
+                ),
+                None,
+            ),
+            ColoredLatch::SePreimage => {
+                let pre = mercuryrustlib::lightning_latch::create_pre_image(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &piece_id,
+                )
+                .await?;
+                (Some(pre.batch_id), Some(pre.hash))
+            }
+        };
         mercuryrustlib::transfer_sender::execute(
             &self.inner.cc,
             receiver_address,

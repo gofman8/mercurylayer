@@ -374,23 +374,62 @@ pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Vec<Vec
 /// therefore requires `n_parents >= max(branch_len, 1)` — an empty or short list means the sender
 /// omitted an ancestor it could still double-spend, so the sub-coin is refused. `.max(1)` guards the
 /// degenerate `branch_len == 0` call (this fn is only reached when funding_from_branch, i.e. len>=1).
-pub(crate) fn terminal_parents_sufficient(n_parents: usize, branch_len: usize) -> bool {
-    n_parents >= branch_len.max(1)
+pub(crate) fn terminal_parents_sufficient(n_parents: usize, required_ancestors: usize) -> bool {
+    n_parents >= required_ancestors.max(1)
 }
 
-async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String], branch_len: usize) -> Result<()> {
-    // A branch-funded sub-coin ALWAYS has structural ancestors: at least one per branch hop (each
-    // branch tx spends a parent node; a combine spends several). If the sender names FEWER ancestors
-    // than the branch has hops, it is hiding one it could still double-spend — the receiver must not
-    // trust the sender to enumerate its own parents. An empty list is the degenerate case of this and
-    // was previously accepted (the bug): reject it. `single_use` on every off-chain sub-coin makes
-    // intermediate nodes terminal at the SE regardless, so the only sender-dependent ancestor left is
-    // the on-chain root, which this check forces the sender to name and prove terminal.
-    if !terminal_parents_sufficient(parents.len(), branch_len) {
+/// The number of terminal ancestors an exit branch MUST name: the total number of structural
+/// inputs it consumes — i.e. `Σ inputs` over all branch txs. Every input of every branch tx spends
+/// a statechain node (an on-chain root or an intra-branch sub-coin) that could be double-spent to
+/// invalidate the branch unless it is terminal at the SE, so each must be named and proven terminal.
+///
+/// For a linear split chain this equals the number of hops (each split tx has exactly one input),
+/// so it is a no-op there. For a COMBINE tx it is the input count `N` — closing the hole where the
+/// old per-hop count (`branch_len`) required only ONE terminal ancestor for an N-input combine,
+/// letting a sender combine a terminal carrier with `N-1` non-terminal, double-spendable ones.
+/// Reject an exit branch that is not a TREE (D1): every outpoint it consumes must be spent by
+/// exactly ONE branch input. A repeated prevout means two branch spends conflict on-chain — only one
+/// can confirm — so the branch is un-broadcastable and any coin it funds is unexitable. See
+/// `validate_branch` for why per-input script/value checks miss this.
+fn reject_non_tree_branch(txs: &[bitcoin::Transaction]) -> Result<()> {
+    let mut consumed: HashSet<bitcoin::OutPoint> = HashSet::new();
+    for tx in txs {
+        for input in &tx.input {
+            if !consumed.insert(input.previous_output) {
+                return Err(anyhow!(
+                    "exit branch consumes outpoint {} more than once — non-tree branch / internal double-spend; rejecting (it could never confirm on-chain)",
+                    input.previous_output
+                ));
+            }
+        }
+    }
+    std::result::Result::Ok(())
+}
+
+pub(crate) fn required_terminal_ancestors(branch_txs: &[String]) -> Result<usize> {
+    let mut total = 0usize;
+    for tx_hex in branch_txs {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(tx_hex)?)?;
+        total += tx.input.len();
+    }
+    std::result::Result::Ok(total)
+}
+
+async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String], required_ancestors: usize) -> Result<()> {
+    // A branch-funded sub-coin ALWAYS has structural ancestors: one per structural INPUT the branch
+    // consumes (a split tx spends ONE parent; a combine tx spends N). If the sender names FEWER
+    // ancestors than the branch has inputs, it is hiding one it could still double-spend — the
+    // receiver must not trust the sender to enumerate its own parents. An empty list is the
+    // degenerate case of this and was previously accepted (the bug): reject it. `single_use` on
+    // every off-chain sub-coin makes intermediate nodes terminal at the SE regardless, so the
+    // sender-dependent ancestors left are the on-chain root(s) — which this check forces the sender
+    // to name and prove terminal, INCLUDING every input of a multi-input combine.
+    if !terminal_parents_sufficient(parents.len(), required_ancestors) {
         return Err(anyhow!(
-            "off-chain sub-coin names {} terminal ancestor(s) but its exit branch has {} hop(s) — refusing (the sender may be hiding a non-terminal, double-spendable ancestor)",
+            "off-chain sub-coin names {} terminal ancestor(s) but its exit branch consumes {} structural input(s) — refusing (the sender may be hiding a non-terminal, double-spendable ancestor; a combine of N carriers needs all N named + terminal)",
             parents.len(),
-            branch_len
+            required_ancestors
         ));
     }
     let client = client_config.get_reqwest_client()?;
@@ -451,7 +490,10 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             // exhausted), so the sender can no longer double-spend a parent and invalidate the
             // branch. This is the receiver's independent guarantee — it does not trust that the
             // sender set the budget.
-            verify_terminal_parents(client_config, &transfer_msg.terminal_parents, transfer_msg.branch_txs.len()).await?;
+            // Require one terminal ancestor per structural INPUT across the branch (Σ inputs), not
+            // per hop — so a multi-input combine forces ALL its inputs to be named + terminal.
+            let required_ancestors = required_terminal_ancestors(&transfer_msg.branch_txs)?;
+            verify_terminal_parents(client_config, &transfer_msg.terminal_parents, required_ancestors).await?;
         }
 
         if index == 0 {
@@ -770,6 +812,16 @@ async fn validate_branch(
     let branch_ids: std::collections::HashSet<String> =
         txs.iter().map(|t| t.txid().to_string()).collect();
 
+    // The exit branch MUST be a TREE: every outpoint it consumes is spent by exactly one branch
+    // input (D1). A non-tree branch — two branch txs (e.g. two inputs of a combine) spending the
+    // SAME outpoint — is script-valid per-input yet UN-BROADCASTABLE as a whole: the two spends are
+    // mutually exclusive on-chain, so a tx consuming both can never confirm. A token carrier is
+    // `single_use=false`, so the SE re-signs it freely and a malicious sender can obtain two
+    // conflicting co-signed spends of one carrier; without this guard the receiver books a CONFIRMED
+    // coin that can never exit (fund stranding). Checked BEFORE prevout resolution because both
+    // `tx.verify` and the per-tx value loop resolve a shared outpoint independently and would pass.
+    reject_non_tree_branch(&txs)?;
+
     // Collect all prevouts: from earlier branch txs, or (for the root) from chain.
     let mut prevouts: HashMap<OutPoint, bitcoin::TxOut> = HashMap::new();
     let mut root_outpoint: Option<mercurylib::transfer::TxOutpoint> = None;
@@ -880,12 +932,17 @@ async fn verify_tx0_output_is_unspent_and_confirmed(electrum_client: &electrum_c
 
     for unspent in res {
         if (unspent.tx_hash.to_string() == tx0_outpoint.txid) && (unspent.tx_pos as u32 == tx0_outpoint.vout) {
-            let confirmations = blockheight - unspent.height + 1;
-
-            if confirmations as u32 >= confirmation_target {
-                status = CoinStatus::CONFIRMED;
+            // Electrum reports height 0 for a MEMPOOL (0-conf) utxo. Guard the confirmations math
+            // with `height > 0` (as coin_status.rs does): without it, `blockheight - 0 + 1` is a huge
+            // number that trivially clears confirmation_target, mis-booking an RBF-able mempool root
+            // as CONFIRMED — a combine multiplies this (N roots). A 0-conf root stays UNCONFIRMED so
+            // the caller rejects the branch as unconfirmed.
+            if unspent.height > 0 {
+                let confirmations = blockheight - unspent.height + 1;
+                if confirmations as u32 >= confirmation_target {
+                    status = CoinStatus::CONFIRMED;
+                }
             }
-
             return Ok((true, status));
         }
     }
@@ -964,7 +1021,89 @@ async fn send_transfer_receiver_request_payload(client_config: &ClientConfig, tr
 }
 #[cfg(test)]
 mod terminal_parents_tests {
-    use super::terminal_parents_sufficient;
+    use super::{required_terminal_ancestors, terminal_parents_sufficient};
+
+    // Build a raw (non-witness) tx hex with `n_inputs` inputs and one output — version-agnostic
+    // consensus encoding, enough for the input-count check (n_inputs < 253 so the varint is 1 byte).
+    fn tx_hex_with_inputs(n_inputs: usize) -> String {
+        let mut h = String::from("02000000"); // version 2
+        h.push_str(&format!("{:02x}", n_inputs)); // input count (compact size, < 253)
+        for i in 0..n_inputs {
+            h.push_str(&format!("{:02x}", i as u8).repeat(32)); // 32-byte prevout txid
+            h.push_str("00000000"); // prevout vout = 0
+            h.push_str("00"); // empty scriptSig
+            h.push_str("ffffffff"); // sequence
+        }
+        h.push_str("01"); // one output
+        h.push_str("e803000000000000"); // value = 1000 sats
+        h.push_str("00"); // empty scriptPubKey
+        h.push_str("00000000"); // locktime 0
+        h
+    }
+
+    // required_terminal_ancestors = Σ inputs over branch txs (NOT the hop/tx count). A combine tx
+    // with N inputs demands N terminal ancestors, closing the multi-carrier double-spend hole.
+    #[test]
+    fn required_ancestors_counts_inputs_not_hops() {
+        // Linear split chain: three 1-input txs -> 3 (unchanged; == hop count).
+        let split_chain = vec![tx_hex_with_inputs(1), tx_hex_with_inputs(1), tx_hex_with_inputs(1)];
+        assert_eq!(required_terminal_ancestors(&split_chain).unwrap(), 3);
+
+        // A single 2-input COMBINE (one hop) -> 2 required, not 1.
+        let combine2 = vec![tx_hex_with_inputs(2)];
+        assert_eq!(required_terminal_ancestors(&combine2).unwrap(), 2);
+        // The old per-hop rule would have required only 1; the sender could hide the 2nd input.
+        assert!(!terminal_parents_sufficient(1, required_terminal_ancestors(&combine2).unwrap()));
+        assert!(terminal_parents_sufficient(2, required_terminal_ancestors(&combine2).unwrap()));
+
+        // A wide 6-input combine -> 6.
+        let combine6 = vec![tx_hex_with_inputs(6)];
+        assert_eq!(required_terminal_ancestors(&combine6).unwrap(), 6);
+        assert!(!terminal_parents_sufficient(5, 6));
+        assert!(terminal_parents_sufficient(6, 6));
+
+        // Combine (N=3) then split (1) -> 3 + 1 = 4.
+        let combine_then_split = vec![tx_hex_with_inputs(3), tx_hex_with_inputs(1)];
+        assert_eq!(required_terminal_ancestors(&combine_then_split).unwrap(), 4);
+    }
+
+    // D1: an exit branch must be a TREE. A non-tree branch (a repeated prevout, across txs or within
+    // one combine tx) is un-broadcastable and must be rejected — else a receiver books a coin that
+    // can never confirm on-chain (fund stranding).
+    #[test]
+    fn non_tree_branch_is_rejected() {
+        use super::reject_non_tree_branch;
+        let de = |h: &str| -> bitcoin::Transaction {
+            bitcoin::consensus::encode::deserialize(&hex::decode(h).unwrap()).unwrap()
+        };
+        // A single tx with two DISTINCT inputs (00..:0 and 01..:0) is a tree.
+        assert!(reject_non_tree_branch(&[de(&tx_hex_with_inputs(2))]).is_ok(), "distinct inputs = tree");
+        // Two txs BOTH spending 00..:0 → conflicting spends of one outpoint → non-tree, rejected.
+        assert!(
+            reject_non_tree_branch(&[de(&tx_hex_with_inputs(1)), de(&tx_hex_with_inputs(1))]).is_err(),
+            "two branch txs spending the same outpoint must be rejected"
+        );
+        // A single combine tx with a DUPLICATE input (00..:0 twice) → non-tree, rejected.
+        let dup_input_tx = {
+            let mut h = String::from("02000000");
+            h.push_str("02");
+            for _ in 0..2 {
+                h.push_str(&"00".repeat(32));
+                h.push_str("00000000");
+                h.push_str("00");
+                h.push_str("ffffffff");
+            }
+            h.push_str("01");
+            h.push_str("e803000000000000");
+            h.push_str("00");
+            h.push_str("00000000");
+            h
+        };
+        assert!(
+            reject_non_tree_branch(&[de(&dup_input_tx)]).is_err(),
+            "a combine tx with a duplicate input must be rejected"
+        );
+    }
 
     // INV-20: the receiver must reject a branch-funded sub-coin whose sender names FEWER terminal
     // ancestors than the branch has hops (the previously-accepted empty list is the len==0 case).

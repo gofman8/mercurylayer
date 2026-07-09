@@ -291,14 +291,30 @@ un-broadcast tx (transfer.rs:287-381).
   | `start_lightning_swap` auto-select | excluded (audit [6]) | lightning.rs |
   | `get_balance` spendable sats | carrier sats excluded; fails CLOSED for token wallets (audit [23]) | wallet.rs:284-299 |
 
-- **GRN-INV-11 (one carrier per transfer; one allocation per carrier)** A token transfer draws on
-  a SINGLE carrier holding `>= amount` of the asset (tokens.rs:452-478); allocations spread over
-  multiple carriers CANNOT be merged into one payment — the typed failure is GRN-ERR-10 even when
-  the wallet's total asset balance suffices (colored combine exists only at lib level,
-  `create_colored_combine_tx`, rgb.rs:330, exercised by rgb02/05/08 — not an SDK operation).
-  Additionally the SDK opens its rgb-lib wallet with `max_allocations_per_utxo: 1`
-  (rust-rgb lib.rs:93), so a carrier holds exactly ONE allocation of ONE contract in these flows;
-  multi-asset carriers are out of scope by configuration.
+- **GRN-INV-11 (multi-carrier combine; one allocation per carrier)** A token transfer first tries a
+  SINGLE carrier holding `>= amount` (tokens.rs:452-478); if none holds enough, the SDK **COMBINES**
+  several carriers of the asset into one payment via `colored_combine_transfer` (tokens.rs) — a
+  single SE-co-signed colored combine tx (N inputs → piece + change) built with
+  `create_colored_combine_tx` (rgb.rs:330). Every combined carrier is made terminal first, and the
+  receiver requires ALL N terminal (GRN-INV-11b). Only when the total asset balance across carriers
+  is below `amount` does it fail, with a typed insufficient error (GRN-ERR-10). Verified by
+  `SDK_E2E=31` (60 + 50 across two carriers pays 100). The SDK opens its rgb-lib wallet with
+  `max_allocations_per_utxo: 1` (rust-rgb lib.rs:93), so a carrier holds exactly ONE allocation of
+  ONE contract; multi-asset carriers are out of scope by configuration.
+- **GRN-INV-11b (combine branch safety — receiver invariants)** A combined sub-coin's exit branch
+  is a MULTI-INPUT DAG (the combine tx consumes N carriers). The receiver's `validate_branch`
+  enforces, for the combine as for any branch: (1) it is a **tree** — no outpoint is consumed by
+  two branch inputs (`reject_non_tree_branch`, transfer_receiver.rs); a non-tree branch is
+  un-broadcastable (two conflicting spends of one outpoint) and would strand the receiver, which
+  matters because token carriers are `single_use=false` so the SE re-signs them freely; (2) every
+  on-chain root is unspent AND **confirmed** (`height > 0`, not a 0-conf mempool utxo); (3) value
+  conservation per tx across ALL N inputs (SPEC INV-25); (4) locktime-free (SPEC INV-4). The
+  terminal-ancestor count is `Σ inputs` across the branch (one per structural input, not per hop),
+  so an N-input combine names + proves N terminal ancestors. **Substitution caveat (SPEC §14):** the
+  blind SE binds no id to an outpoint, so the receiver's count check defeats OMISSION of ancestors,
+  not SUBSTITUTION of terminal decoys for the real carriers; the residual defence is that the
+  receiver holds the fully-signed (locktime-0) combine branch and MUST be able to exit immediately —
+  the same guarantee as for splits, and why an online receiver is safe.
 - **Sats-on-carrier are not independently splittable.** The only way sats leave a carrier is
   inside a colored split (piece 1500 / change residual) — GRN-REQ-10 forbids the plain path.
   A sibling change-holder broadcasting the shared branch is benign (byte-identical txs,
@@ -367,7 +383,7 @@ Message strings verified in code; `{}` are runtime values.
 | GRN-ERR-7 | plain split of a carrier | `coin {id} carries an RGB token allocation; splitting it as plain BTC would destroy the token — use a token transfer or pick a different coin` | transfer.rs:302-306 | audit [7] |
 | GRN-ERR-8 | withdraw / unilateral exit naming a carrier | `coin {id} carries an RGB allocation; withdrawing it as plain BTC would destroy the tokens — move the asset off this coin first` / `…a plain unilateral exit would destroy the tokens — move the asset off this coin first` | wallet.rs:532-536, 731-735 | audit [7] |
 | GRN-ERR-9 | carrier sats too small for a token split | `carrier coin too small ({c} sats) for a token split` / batch: `carrier coin too small ({c} sats) for {n} pieces + fee` | tokens.rs:485-489, 723-728 | — |
-| GRN-ERR-10 | no single carrier covers the asset amount | `no single coin carries >= {amt} of {asset} (multi-coin token combine not yet wired)` / batch: `no confirmed coin carries >= {total} of {asset} for the batch` | tokens.rs:476-478, 717-719 | — |
+| GRN-ERR-10 | total asset balance across carriers is below the amount (after trying single-carrier then combine) | `insufficient {asset}: wallet holds {total} across {n} carrier(s), need {amount}` / `no combination of carriers covers {amount} … with enough sats` (tokens.rs) / batch: `no confirmed coin carries >= {total} of {asset} for the batch` | tokens.rs (`colored_combine_transfer`), 717-719 | — |
 | GRN-ERR-11 | consignment/envelope mismatch or invalid consignment at claim | `token consignment assigns {booked} to this coin but the envelope claimed {a} — rejecting` / `incoming token consignment INVALID: {detail}` | tokens.rs:936-955 | ERR-8 |
 | GRN-ERR-12 | fulfilling an expired invoice | `invoice expired at {exp} (now {now})` | invoice.rs:85-93 | ERR-11 |
 | GRN-ERR-13 | a split output's deposit-token slot is unpaid (SE charges for tokens) | `deposit token payment required: pay {fee_sats} sats to {deposit_address} (token {token_id}), then retry` (`SdkError::TokenPaymentRequired`); raised BEFORE the terminal-guard on every split path (§3 note) | types.rs:63-68; take_token call sites transfer.rs:315-330, tokens.rs:494-509, 736-755 | — |
@@ -401,7 +417,7 @@ Tests marked **(new)** were added in the granularity test pass (E2E slots 28/29 
 | GRN-INV-7 | rgb01/rgb03 (output_vouts over OP_RETURN); SPEC INV-11 rows |
 | GRN-INV-9 | sdk02/sdk09 (conservation); chaos sdk22 oracle (INV-13) |
 | GRN-REQ-13, GRN-ERR-11 | sdk02, sdk09, rgb13 (consignment integrity / ERR-8); `unit::envelope` (tokens.rs:967-993) |
-| GRN-INV-10/11, GRN-ERR-10 | rgb03/rgb06 (chained colored splits); **sdk29 (new)** — single-carrier insufficiency: carriers 60+50, pay 100 ⇒ typed error |
+| GRN-INV-10/11/11b, GRN-ERR-10 | rgb03/rgb06 (chained colored splits); **sdk31 (new)** — multi-carrier COMBINE: carriers 60+50 pay 100 in one 2-input colored combine, receiver requires 2 terminal ancestors, combined coin exits on-chain; over-balance ⇒ typed insufficient error; `unit::transfer_receiver::terminal_parents_tests` (required-ancestors = Σ inputs; non-tree branch rejected) |
 | GRN-INV-12/13 | sdk26 (depth/width scaling, measured); INVALIDATION-SPEC §10 rows |
 | GRN-INV-14 | rgb01-06 (materialized colored exits, lib level); **sdk29 (new)** — token exit at depth 2 with on-chain settlement of the exact partial amount (branch broadcast performed manually via raw txs, per the GRN-INV-14 manual-broadcast note) |
 | GRN-REQ-15, GRN-ERR-12 | sdk11; `unit::invoice::tests` |
@@ -415,9 +431,12 @@ executable spec until this document is updated.
 
 None of these may be omitted when citing this spec.
 
-1. **One carrier per transfer / no SDK combine.** A payment cannot merge allocations across
-   carriers (GRN-INV-11); colored combine is a lib-level primitive only (rgb02/05/08). Roadmap:
-   wire combine into the SDK, after which GRN-ERR-10 becomes reachable only on true insufficiency.
+1. **Multi-carrier combine — SHIPPED.** A payment spanning several carriers is minted by one
+   SE-co-signed colored combine (GRN-INV-11/11b; `SDK_E2E=31`); GRN-ERR-10 now fires only on true
+   insufficiency. Remaining edges: the sender-side `register_combine_subcoins` rejects combining
+   carriers that share a common ancestor (disjoint sub-branches only — rare); and the blind-SE
+   SUBSTITUTION caveat (SPEC §14) applies to a combined coin exactly as to a split (an online
+   receiver must exit promptly to win the race).
 2. **One allocation per carrier UTXO.** By SDK configuration (`max_allocations_per_utxo: 1`,
    rust-rgb lib.rs:93) — an rgb-lib wallet option, not an RGB protocol limit.
 3. **Fixed `TOKEN_BLINDING = 777`** (GRN-INV-8): a design simplification, safe only because

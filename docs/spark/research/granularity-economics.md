@@ -377,16 +377,15 @@ reserve `clamp(·/100, 300, 2000)`):
 
 ## 8. Known limitations (honesty section)
 
-- **One carrier per transfer, quantified** (GRN-INV-11). `transfer_tokens` draws on a *single*
-  carrier; two carriers holding 60 + 50 TKN cannot pay 110 — typed refusal
-  `"no single coin carries >= …(multi-coin token combine not yet wired)"` (GRN-ERR-10,
-  `tokens.rs:475-477`).
-  Paying 110 as two transfers (60 + 50) costs the sender **2×1,500 packaging + 2 reserves** and
-  leaves the receiver **two** pieces: ~620 vB of future colored exit (2 × ~310, §6 *model*)
-  versus ~310 for the single-transfer counterfactual — **2× the exit weight, forever**, since
-  pieces can't be merged at the receiver either. A colored combine exists at lib level only
-  (`create_colored_combine_tx`, `rgb.rs:330`; rgb02/05/08) — combine-when-shipped fixes both the
-  sender-side refusal and the receiver-side fragmentation.
+- **Multi-carrier combine — SHIPPED, and its cost** (GRN-INV-11). `transfer_tokens` now combines
+  carriers when no single one suffices: two carriers holding 60 + 50 pay 100 in ONE SE-co-signed
+  colored combine (N inputs → piece + change), measured **255 vB for 2 inputs** (`SDK_E2E=31`).
+  This is strictly cheaper than the old workaround (two 60 + 40 transfers = 2×1,500 packaging + 2
+  reserves, leaving the receiver two pieces ≈ 620 vB of future exit): one combine gives the receiver
+  ONE piece (~310 vB future exit) and merges the sender's carriers. The combine input adds ~50 vB
+  per extra P2TR input over a plain split; a 2-input combine's exit branch is a single ~255 vB tx.
+  The receiver-side safety guards (tree branch, N terminal ancestors, confirmed roots) add no
+  on-chain cost.
 - **Received token pieces are terminal at the SDK layer** (1,500 < 2,130, §3): hold or exit; no
   re-send. Whether this is intended scope or a gap to close alongside combine is an open design
   question; it is a *derived* consequence of the fixed packaging, not a documented decision.

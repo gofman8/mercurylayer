@@ -292,16 +292,23 @@ coins are **depth 2**: their branch is now two txs (Alice's split, then Bob's), 
 **Outcome:** works exactly like any payment; the receiver-side checks now walk a 2-hop branch,
 and the new owner inherits 155 vB more exit weight.
 
-### 5.2 Wallet holds 60 + 50 TKN on two carriers, pays 100 → refused
+### 5.2 Wallet holds 60 + 50 TKN on two carriers, pays 100 → COMBINED
 
-`transfer_tokens` draws on a **single carrier coin**: it scans for one confirmed coin whose
-outpoint carries ≥ 100 of the asset, finds none, and errors — verbatim: *"no single coin carries
->= 100 of ⟨asset⟩ (multi-coin token combine not yet wired)"*. Allocations spread across carriers
-cannot be merged into one payment: a colored **combine** exists as a lib-level primitive
-(`create_colored_combine_tx`, exercised by `RGB_E2E=2/5/8`) but is not an SDK operation.
-Workarounds today: pay in two transfers (60 + 40 — the receiver gets two pieces), or have the
-receiver accept two invoices. **Outcome:** typed failure, funds untouched; the one-carrier limit
-is the sharpest known granularity edge (roadmap: SDK combine).
+`transfer_tokens` first tries a **single carrier** holding ≥ 100; finding none, it **combines**
+carriers automatically. It selects the fewest carriers of the asset whose allocations sum to ≥ 100
+(here both), makes each terminal at the SE, and mints the payment in ONE SE-co-signed colored
+combine tx — N inputs → the recipient's piece (exactly 100) + your change (10). bob gets a single
+piece; you keep a 10-unit change carrier. Only if your *total* asset balance is below 100 does it
+fail, with a typed insufficient error. Verified by `SDK_E2E=31` (60 + 50 pays 100).
+
+**Security — the combine does not weaken invalidation.** A combined coin's exit branch is a
+multi-input DAG. The receiver requires **one terminal ancestor per structural input** (`Σ inputs`,
+not per hop), so a 2-input combine forces *both* carriers named and terminal — a sender cannot
+combine a good carrier with a double-spendable one and hide it. `validate_branch` also rejects a
+**non-tree** branch (two branch inputs spending the same outpoint — which could never confirm) and
+requires every on-chain root **confirmed** (not a 0-conf mempool utxo). Residual (as for splits):
+the blind SE binds no id to an outpoint, so an online receiver should exit the combined piece
+promptly — the locktime-0 branch lets it win the race (SPEC §14 substitution caveat).
 
 ### 5.2b Receiving the same asset twice → works (balance sums)
 
@@ -509,11 +516,10 @@ top-up (roadmap, §5.2) — the arithmetic is worked in
 your outpoint; an envelope that disagrees gets the whole transfer rejected (ERR-8). Lying buys
 the sender a failed payment, never an inflated balance (§2b).
 
-**Can I merge my token change back into one carrier?** Not via the SDK yet — the one-carrier
-limit (§5.2) and its lib-level combine primitive are the roadmap item. Until then: pay in
-multiple transfers. The receiver cannot aggregate either — their 1,500-sat pieces are below the
-carrier floor (previous question), so the fragmentation persists until combine ships
-([granularity-economics §8](../research/granularity-economics.md)).
+**Can I pay across several carriers at once?** Yes — `transfer_tokens` combines them automatically
+when no single carrier covers the amount (§5.2). It's a sender-side operation: it merges *your*
+carriers into one payment. (A receiver still can't aggregate the incoming 1,500-sat pieces they're
+handed — those are below the carrier floor — so receiver-side fragmentation is a separate item.)
 
 **Does splitting reset my 7-day clock?** The *leaf's*, yes — each sub-coin gets a fresh ladder at
 split height. The *tree's*, no — the root deadline `H_deposit + initlock` never moves (§3;
