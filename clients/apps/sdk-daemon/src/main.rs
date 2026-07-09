@@ -97,7 +97,26 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
         "get_spark_address" => json!(wallet.get_spark_address().await?),
         "get_identity_public_key" => json!(wallet.get_identity_public_key().await?),
         "get_balance" => serde_json::to_value(wallet.get_balance().await?)?,
-        "get_token_balances" => serde_json::to_value(wallet.get_token_balances().await?)?,
+        "get_token_balances" => {
+            // Token balances are u64 RAW units and must not ride JSON as numbers: every JS
+            // consumer parses JSON numbers as f64 doubles and silently rounds above 2^53 (an
+            // 18-decimals asset gets there with a supply of 10). Balances travel as STRINGS;
+            // amounts a client SENDS stay numbers (clients cap them at MAX_SAFE_INTEGER).
+            Value::Array(
+                wallet
+                    .get_token_balances()
+                    .await?
+                    .into_iter()
+                    .map(|t| {
+                        json!({
+                            "asset_id": t.asset_id, "ticker": t.ticker, "name": t.name,
+                            "precision": t.precision,
+                            "balance": t.balance.to_string(), "total": t.total.to_string(),
+                        })
+                    })
+                    .collect(),
+            )
+        }
         "get_deposit_address" => json!(wallet.get_deposit_address(pu64("amount_sats")?).await?),
         "add_prepaid_token" => {
             wallet.add_prepaid_token(&p("token_id")?).await;
@@ -122,7 +141,9 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                             ),
                             WalletEvent::TokenTransferClaimed { asset_id, amount, statechain_id } => (
                                 "TokenTransferClaimed",
-                                json!({"asset_id": asset_id, "amount": amount, "statechain_id": statechain_id}),
+                                // amount = u64 raw units — as a STRING (same reason as
+                                // get_token_balances: JS doubles round above 2^53).
+                                json!({"asset_id": asset_id, "amount": amount.to_string(), "statechain_id": statechain_id}),
                             ),
                             WalletEvent::BalanceUpdate { balance } => (
                                 "BalanceUpdate",

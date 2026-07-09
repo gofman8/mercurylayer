@@ -139,15 +139,26 @@ impl ClientConfig {
 
     pub fn get_reqwest_client(&self) -> Result<reqwest::Client> {
 
+        // Bound every SE request so a hung/black-holing SE cannot pin the caller's task forever
+        // (adversarial-log review, DELAY dimension: the core client previously built bare clients
+        // with no timeout, unlike the SSP client). 120s is far longer than any single SE JSON
+        // round-trip — deposit confirmation etc. are client-side polling loops of separate quick
+        // calls, not one long request — so this only fires on a genuine stall, converting an
+        // infinite hang into a clean error.
+        let timeout = std::time::Duration::from_secs(120);
+
         match self.tor_proxy {
             Some(ref proxy) => {
                 let proxy = reqwest::Proxy::all(proxy)?;
                 Ok(reqwest::Client::builder()
                     .proxy(proxy)
+                    .timeout(timeout)
                     .build()?)
             },
-            None => Ok(reqwest::Client::new()),
-            
+            None => Ok(reqwest::Client::builder()
+                .timeout(timeout)
+                .build()?),
+
         }
     }
 }

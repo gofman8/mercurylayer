@@ -55,9 +55,48 @@ function show(screen) {
   $(screen).classList.remove('hidden');
 }
 
+// ---------------------------------------------------------------- asset units
+// TokenBalance amounts are RAW units scaled by `precision`. Convert via BigInt so a
+// large supply never hits float rounding; the wire still carries a safe integer.
+
+function toRawUnits(str, precision) {
+  const s = String(str).trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) throw new Error('Enter a plain number, e.g. 12.50');
+  const [ints, frac = ''] = s.split('.');
+  if (frac.length > precision) throw new Error(`This asset has ${precision} decimal place${precision === 1 ? '' : 's'} max`);
+  const raw = BigInt(ints + frac.padEnd(precision, '0'));
+  if (raw <= 0n) throw new Error('Amount must be positive');
+  if (raw > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Amount too large');
+  return Number(raw);
+}
+
+const groupDigits = (s) => s.replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+
+function fromRawUnits(raw, precision) {
+  const s = BigInt(raw ?? 0).toString().padStart(precision + 1, '0');
+  if (!precision) return groupDigits(s);
+  const ints = s.slice(0, -precision);
+  const frac = s.slice(-precision).replace(/0+$/, '');
+  return groupDigits(ints) + (frac ? '.' + frac : '');
+}
+
+// Deterministic badge colour per asset id — assets stay visually recognisable.
+function badgeHue(id) {
+  let h = 0;
+  for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return h;
+}
+function paintBadge(el, t) {
+  el.textContent = (t.ticker || '??').slice(0, 3);
+  const h = badgeHue(t.asset_id);
+  el.style.background = `linear-gradient(140deg, hsl(${h} 70% 62%), hsl(${(h + 40) % 360} 75% 55%))`;
+}
+
 // ---------------------------------------------------------------- state + rendering
 
 let myAddress = null;
+let tokens = [];          // last fetched token balances
+let currentAsset = null;  // asset open in the asset sheet
 
 async function refreshBalance() {
   try {
@@ -99,7 +138,37 @@ async function refreshActivity() {
   } catch { /* wallet not open yet */ }
 }
 
-const refreshAll = () => { refreshBalance(); refreshActivity(); };
+async function refreshTokens() {
+  try {
+    tokens = await api('/api/tokens');
+    const list = $('asset-list');
+    list.innerHTML = '';
+    $('asset-empty').classList.toggle('hidden', tokens.length > 0);
+    for (const t of tokens) {
+      const li = document.createElement('li');
+      const badge = document.createElement('div');
+      badge.className = 'asset-badge';
+      paintBadge(badge, t);
+      const unsettled = (t.total || 0) - (t.balance || 0);
+      const main = document.createElement('div');
+      main.className = 'asset-main';
+      main.innerHTML = `
+        <div class="asset-name"></div>
+        <div class="asset-sub"></div>`;
+      main.querySelector('.asset-name').textContent = t.name || t.ticker || 'asset';
+      main.querySelector('.asset-sub').textContent =
+        (t.ticker || '') + (unsettled > 0 ? ` · +${fromRawUnits(unsettled, t.precision)} incoming` : '');
+      const amount = document.createElement('div');
+      amount.className = 'asset-amount';
+      amount.textContent = fromRawUnits(t.balance, t.precision);
+      li.append(badge, main, amount);
+      li.onclick = () => openAsset(t);
+      list.appendChild(li);
+    }
+  } catch { /* wallet not open yet */ }
+}
+
+const refreshAll = () => { refreshBalance(); refreshActivity(); refreshTokens(); };
 
 function enterHome(status) {
   myAddress = status.address;
@@ -124,6 +193,12 @@ function connectEvents() {
     refreshAll();
   });
   es.addEventListener('BalanceUpdate', refreshBalance);
+  es.addEventListener('TokenTransferClaimed', async (e) => {
+    const d = JSON.parse(e.data);
+    await refreshTokens(); // learn the asset's ticker/precision before announcing it
+    const t = tokens.find((x) => x.asset_id === d.asset_id);
+    toast(`Received ${t ? fromRawUnits(d.amount, t.precision) : d.amount} ${t?.ticker || 'asset units'}`, 'good');
+  });
   es.addEventListener('CoinRefreshed', (e) => {
     const d = JSON.parse(e.data);
     toast(`Coin auto-refreshed (fee ${fmtSats(d.fee_sats)} sats)`);
@@ -248,6 +323,99 @@ $('btn-do-send').onclick = async () => {
   } catch (e) {
     $('send-progress').classList.add('hidden');
     $('send-form').classList.remove('hidden');
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  }
+};
+
+// ---------------------------------------------------------------- assets: issue
+
+$('btn-issue').onclick = async () => {
+  $('issue-form').classList.remove('hidden');
+  $('issue-progress').classList.add('hidden');
+  $('issue-done').classList.add('hidden');
+  $('issue-error').classList.add('hidden');
+  $('modal-issue').classList.remove('hidden');
+  try {
+    const { address } = await api('/api/tokens/funding-address');
+    $('funding-address').textContent = address;
+  } catch (e) {
+    $('funding-address').textContent = `unavailable: ${e.message}`;
+  }
+};
+
+$('issue-ticker').addEventListener('input', (e) => { e.target.value = e.target.value.toUpperCase(); });
+
+$('btn-do-issue').onclick = async () => {
+  const err = $('issue-error');
+  err.classList.add('hidden');
+  try {
+    const precision = Number($('issue-precision').value);
+    if (!Number.isInteger(precision) || precision < 0 || precision > 18) throw new Error('Decimals: 0-18');
+    const payload = {
+      ticker: $('issue-ticker').value.trim(),
+      name: $('issue-name').value.trim(),
+      precision,
+      supply: toRawUnits($('issue-supply').value, precision),
+    };
+    $('issue-form').classList.add('hidden');
+    $('issue-progress').classList.remove('hidden');
+    await api('/api/tokens/issue', payload);
+    $('issue-progress').classList.add('hidden');
+    $('issue-summary').textContent =
+      `${payload.ticker} issued — the full supply is on a statechain coin, ready to send off-chain.`;
+    $('issue-done').classList.remove('hidden');
+    refreshAll();
+  } catch (e) {
+    $('issue-progress').classList.add('hidden');
+    $('issue-form').classList.remove('hidden');
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  }
+};
+
+// ---------------------------------------------------------------- assets: details + send
+
+function openAsset(t) {
+  currentAsset = t;
+  $('asset-title').textContent = t.name || t.ticker || 'Asset';
+  paintBadge($('asset-badge'), t);
+  $('asset-balance').textContent = fromRawUnits(t.balance, t.precision);
+  $('asset-ticker-lbl').textContent = t.ticker || '';
+  const unsettled = (t.total || 0) - (t.balance || 0);
+  $('asset-pending').classList.toggle('hidden', unsettled <= 0);
+  if (unsettled > 0) $('asset-pending').textContent = `+ ${fromRawUnits(unsettled, t.precision)} incoming`;
+  $('asset-id').textContent = t.asset_id;
+  $('asset-send-form').classList.remove('hidden');
+  $('asset-send-progress').classList.add('hidden');
+  $('asset-send-done').classList.add('hidden');
+  $('asset-send-error').classList.add('hidden');
+  $('modal-asset').classList.remove('hidden');
+}
+
+$('btn-do-asset-send').onclick = async () => {
+  const err = $('asset-send-error');
+  err.classList.add('hidden');
+  const address = $('asset-send-address').value.trim();
+  if (!/^(t?ml1|t?sp1)/.test(address)) {
+    err.textContent = 'That does not look like a spark address.';
+    err.classList.remove('hidden');
+    return;
+  }
+  try {
+    const amount = toRawUnits($('asset-send-amount').value, currentAsset.precision);
+    $('asset-send-form').classList.add('hidden');
+    $('asset-send-progress').classList.remove('hidden');
+    await api('/api/tokens/send', { assetId: currentAsset.asset_id, address, amount });
+    $('asset-send-progress').classList.add('hidden');
+    $('asset-send-summary').textContent =
+      `Sent ${fromRawUnits(amount, currentAsset.precision)} ${currentAsset.ticker || ''}`;
+    $('asset-send-done').classList.remove('hidden');
+    $('asset-send-address').value = ''; $('asset-send-amount').value = '';
+    refreshAll();
+  } catch (e) {
+    $('asset-send-progress').classList.add('hidden');
+    $('asset-send-form').classList.remove('hidden');
     err.textContent = e.message;
     err.classList.remove('hidden');
   }

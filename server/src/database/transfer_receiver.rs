@@ -120,15 +120,20 @@ pub async fn get_auth_pubkey_and_x1(pool: &sqlx::PgPool, statechain_id: &str) ->
         FROM statechain_transfer \
         WHERE statechain_id = $1";
 
-    let row = sqlx::query(query)
+    // fetch_optional, NOT fetch_one().unwrap(): fetch_one returns Err(RowNotFound) for an unknown
+    // statechain_id, and this function runs BEFORE auth in POST /transfer/receiver, so the old
+    // .unwrap() let any unauthenticated caller panic the handler (500) with a random statechain_id —
+    // a pre-auth DoS and an existence oracle (a coin WITH a pending transfer answered differently
+    // from one without). Returning None makes the endpoint's existing `is_none()` guard emit a
+    // uniform 404 (adversarial-log review, MALFORM/REORDER).
+    let row = match sqlx::query(query)
         .bind(statechain_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .unwrap();
-
-    if row.is_empty() {
-        return None;
-    }
+    {
+        Ok(Some(r)) => r,
+        _ => return None,
+    };
 
     let new_user_auth_public_key_bytes = row.get::<Vec<u8>, _>(0);
     let new_user_auth_public_key = PublicKey::from_slice(&new_user_auth_public_key_bytes).unwrap();
@@ -145,11 +150,16 @@ pub async fn is_key_already_updated(pool: &sqlx::PgPool, statechain_id: &str) ->
         FROM statechain_transfer \
         WHERE statechain_id = $1";
 
-    let row = sqlx::query(query)
+    // fetch_optional, not fetch_one().unwrap(): a missing row must not panic the handler. Absent
+    // row → treat as not-yet-updated (adversarial-log review, panic-hardening).
+    let row = match sqlx::query(query)
         .bind(statechain_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .unwrap();
+    {
+        Ok(Some(r)) => r,
+        _ => return false,
+    };
 
     let key_updated: bool = row.get(0);
 
@@ -163,11 +173,16 @@ pub async fn get_server_public_key(pool: &sqlx::PgPool, statechain_id: &str) -> 
         FROM statechain_data \
         WHERE statechain_id = $1";
 
-    let row = sqlx::query(query)
+    // fetch_optional, not fetch_one().unwrap(): a missing statechain_data row must not panic the
+    // handler — return None so the endpoint reports it cleanly (adversarial-log review).
+    let row = match sqlx::query(query)
         .bind(statechain_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
-        .unwrap();
+    {
+        Ok(Some(r)) => r,
+        _ => return None,
+    };
 
     let server_public_key_bytes: Vec<u8> = row.get(0);
 

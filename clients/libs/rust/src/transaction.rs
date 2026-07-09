@@ -114,7 +114,25 @@ pub async fn sign_second(client_config: &ClientConfig, partial_sig_request: &Par
     let client = client_config.get_reqwest_client()?;
     let request = client.post(&format!("{}/{}", endpoint, path));
 
-    let value = request.json(&partial_sig_request).send().await?.text().await?;
+    let response = request.json(&partial_sig_request).send().await?;
+
+    let status = response.status();
+
+    let value = response.text().await?;
+
+    if status != StatusCode::OK {
+        // Mirror sign/first (which already checks status): the SE's error body is {"message": ..}.
+        // A 409 here is the SE REFUSING MuSig2 nonce reuse — signing twice over one secnonce with a
+        // different challenge would leak the SE key share (INVALIDATION-SPEC IVL-ERR-9); a 400 is a
+        // malformed session. Surface the typed status so the caller can distinguish "SE refused" from
+        // "garbage response" instead of failing on an opaque serde parse error (adversarial-log
+        // review: sign/second previously swallowed the status and mis-reported these refusals).
+        let detail = serde_json::from_str::<Value>(value.as_str())
+            .ok()
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| value.clone());
+        return Err(anyhow::anyhow!("sign/second failed ({}): {}", status, detail));
+    }
 
     let response: PartialSignatureResponsePayload = serde_json::from_str(value.as_str())?;
 

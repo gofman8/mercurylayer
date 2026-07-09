@@ -108,7 +108,14 @@ impl RgbWallet {
         let online = wallet.go_online(OnlineOptions {
             indexer_url: indexer_url.to_string(),
             skip_consistency_check: true,
-            vanilla_sync_lookback: 0,
+            // Fast vanilla syncs only cover revealed addresses from `last_used (or last_revealed)
+            // - lookback` up to `last_revealed`. Every `get_address` call reveals a NEW index, so
+            // with lookback 0 an address funded BEFORE a later reveal falls out of the window and
+            // its UTXO becomes invisible ("Insufficient bitcoin funds ... available '0'" from
+            // create_utxos while the coins sit confirmed on-chain). A small margin keeps recent
+            // funding addresses in scope; long-idle wallets still rely on callers not to reveal
+            // more than this many addresses between funding and spending.
+            vanilla_sync_lookback: 20,
         })?;
 
         Ok(Self {

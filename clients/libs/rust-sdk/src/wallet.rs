@@ -519,12 +519,10 @@ impl SparkWallet {
         tokio::spawn(async move {
             loop {
                 let _ = wallet.claim().await;
-                // OPTIONAL proactive re-anchor: only when the wallet opts into
-                // `background_auto_refresh` (default OFF). We deliberately do NOT re-anchor coins in
-                // the background as a routine — the refresh cost is folded into `transfer()` as a
-                // payment fee (see `quote_transfer` / `auto_refresh_before_spend`), so the user pays
-                // it visibly exactly when a send needs it, not silently in an idle loop. Deadline
-                // safety (below) still runs unconditionally.
+                // Routine background re-anchoring is OFF by default (B4 economics): refresh is folded
+                // into `transfer` and paid on-demand as part of the payment fee, so a running wallet
+                // never silently shrinks a balance in the background. Only run it here if the operator
+                // explicitly opted in. Deadline safety for idle wallets is the `auto_exit` pass below.
                 if wallet.inner.config.auto_refresh && wallet.inner.config.background_auto_refresh {
                     let _ = wallet
                         .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
@@ -721,8 +719,9 @@ impl SparkWallet {
                         ));
                     }
                     // Tolerate ONLY an idempotent rebroadcast of our OWN branch tx (already in the
-                    // mempool, or already mined). Anything else is a real failure.
-                    if !(msg.contains("already") || msg.contains("in block chain")) {
+                    // mempool, or already mined). Anything else — including a double-spend/conflict
+                    // rejection that happens to contain "already" — is a real failure.
+                    if !is_idempotent_rebroadcast(&msg) {
                         return Err(anyhow!("branch broadcast failed for {statechain_id}: {msg}"));
                     }
                 }
@@ -921,7 +920,7 @@ impl SparkWallet {
                 }),
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("already") || msg.contains("in block chain") {
+                    if is_idempotent_rebroadcast(&msg) {
                         statuses.push(crate::types::ExitStatus {
                             statechain_id: id,
                             complete: true,
@@ -1133,6 +1132,61 @@ async fn build_wallet_record(
         record.mnemonic = m.to_string();
     }
     Ok(record)
+}
+
+/// Classify a broadcast-error string: `true` iff it denotes an idempotent rebroadcast of a tx we
+/// already submitted — the tx is already in the mempool or already mined — which is safe to treat
+/// as success. Everything else is a real failure, INCLUDING errors that merely happen to contain
+/// the word "already" (e.g. "inputs already spent", "bad-txns-inputs-already-spent"), which mean
+/// the branch was REJECTED and must surface. Adversarial-log review (SDK_E2E chaos): the previous
+/// bare `msg.contains("already")` would have swallowed a double-spend/conflict rejection as an
+/// exit "success". The accepted phrases are the concrete bitcoind/electrs signals (case-folded):
+/// bitcoind -27 emits "already in block chain" (older) or "outputs already in utxo set" (newer;
+/// observed in SDK_E2E_7), and an already-accepted mempool tx is "txn-already-known".
+pub(crate) fn is_idempotent_rebroadcast(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const ACCEPTED: &[&str] = &[
+        "already in block chain",   // bitcoind -27: tx already mined
+        "already in utxo set",      // bitcoind -27 (newer wording): outputs already in utxo set
+        "txn-already-known",        // bitcoind: our tx is already accepted in the mempool
+        "already in mempool",       // wording variant across backends
+        "already have transaction", // wording variant across backends
+    ];
+    ACCEPTED.iter().any(|needle| m.contains(needle))
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::is_idempotent_rebroadcast;
+
+    // Idempotent rebroadcasts of our OWN tx (already in mempool / already mined) are tolerated.
+    #[test]
+    fn tolerates_already_broadcast_or_mined() {
+        for msg in [
+            "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction already in block chain\"}",
+            "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Transaction outputs already in utxo set\"}",
+            "bad-txns-inputs error: txn-already-known",
+            "Transaction already in mempool",
+            "server error: already have transaction",
+        ] {
+            assert!(is_idempotent_rebroadcast(msg), "should tolerate: {msg}");
+        }
+    }
+
+    // A rejection that merely CONTAINS "already" is NOT idempotent — it must surface as a failure.
+    // These are the cases the old `contains("already")` heuristic wrongly swallowed as success.
+    #[test]
+    fn rejects_conflict_and_double_spend_bearing_already() {
+        for msg in [
+            "bad-txns-inputs-already-spent",           // double-spend: our exit was beaten
+            "sendrawtransaction RPC error: inputs already spent",
+            "txn-mempool-conflict",                    // a different tx already spends the input
+            "insufficient fee, rejected",              // unrelated rejection, no "already"
+            "missing inputs",
+        ] {
+            assert!(!is_idempotent_rebroadcast(msg), "should reject: {msg}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -33,6 +33,9 @@ const state = {
   wallet: null,       // SparkWallet
   walletName: null,
   address: null,
+  fundingAddress: null, // cached RGB funding address — every fetch REVEALS a new index, and the
+                        // engine's fast sync only watches a small window of recent reveals, so
+                        // handing out a fresh one per request would orphan already-funded ones
   sse: new Set(),     // live event-stream responses
 };
 
@@ -47,6 +50,9 @@ const FORWARDED_EVENTS = [
   'DepositConfirmed', 'TransferClaimed', 'BalanceUpdate', 'TokenTransferClaimed',
   'CoinRefreshed', 'ExitDeadlineApproaching', 'ExitBranchConflict', 'TokenCarrierMaterialized',
 ];
+
+// RGB asset rules (rgb-lib NIA): ticker 1-8 uppercase ASCII, name 1-40 chars, precision 0-18.
+const TICKER_RE = /^[A-Z][A-Z0-9]{0,7}$/;
 
 // ---------------------------------------------------------------------------- wallet lifecycle
 
@@ -67,6 +73,11 @@ async function openWallet(walletName, mnemonic) {
   };
   if (process.env.SE_URL) opts.statechainEntityUrl = process.env.SE_URL;
   if (process.env.ELECTRUM_URL) opts.electrumUrl = process.env.ELECTRUM_URL;
+  // The SDK defaults an RGB proxy only on regtest; on mainnet token support silently stays off
+  // unless the operator supplies one — so plumb it through and tell the UI (via /api/status)
+  // whether assets are live, instead of advertising a feature that can never book a transfer.
+  if (process.env.RGB_PROXY_URL) opts.rgbProxyUrl = process.env.RGB_PROXY_URL;
+  state.tokensEnabled = NETWORK === 'regtest' || !!process.env.RGB_PROXY_URL;
   if (mnemonic) opts.mnemonic = mnemonic;
 
   const { wallet, mnemonic: out } = await SparkWallet.initialize(opts);
@@ -183,6 +194,40 @@ async function api(req, res, url) {
 
     case 'POST /api/claim':
       return json(res, 200, await needWallet().claim());
+
+    // ---------------- RGB assets (raw units on the wire; the UI scales by `precision`) ----------
+
+    case 'GET /api/tokens':
+      return json(res, 200, await needWallet().getTokenBalances());
+
+    case 'GET /api/tokens/funding-address': {
+      if (!state.fundingAddress) state.fundingAddress = await needWallet().getTokenFundingAddress();
+      return json(res, 200, { address: state.fundingAddress });
+    }
+
+    case 'POST /api/tokens/issue': {
+      const { ticker, name, precision, supply } = await readBody(req);
+      if (!TICKER_RE.test(ticker || '')) return json(res, 400, { error: 'ticker: 1-8 uppercase letters/digits, starting with a letter' });
+      if (!name || name.length > 40) return json(res, 400, { error: 'name: 1-40 characters' });
+      if (!Number.isInteger(precision) || precision < 0 || precision > 18) return json(res, 400, { error: 'precision: integer 0-18' });
+      if (!Number.isSafeInteger(supply) || supply <= 0) return json(res, 400, { error: 'supply: positive integer (raw units)' });
+      // One on-chain tx (the colored carrier deposit) — takes a few seconds on regtest.
+      const assetId = await needWallet().issueToken({ ticker, name, precision, supply });
+      pushEvent('AssetIssued', { assetId, ticker });
+      return json(res, 200, { assetId });
+    }
+
+    case 'POST /api/tokens/send': {
+      const { assetId, address, amount } = await readBody(req);
+      if (!assetId) return json(res, 400, { error: 'assetId required' });
+      if (!address) return json(res, 400, { error: 'address required' });
+      if (!Number.isSafeInteger(amount) || amount <= 0) return json(res, 400, { error: 'amount: positive integer (raw units)' });
+      const result = await needWallet().transferTokens({
+        tokenIdentifier: assetId, receiverSparkAddress: address, tokenAmount: amount,
+      });
+      pushEvent('TokenSent', { assetId, amount });
+      return json(res, 200, result);
+    }
 
     case 'GET /api/events': {
       res.writeHead(200, {

@@ -154,7 +154,18 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
         },
     };
 
-    let response: mercurylib::transaction::SignFirstResponsePayload = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    // Do NOT panic on an unparseable enclave body: `.expect(...)` here aborts the request handler and
+    // returns a 500 with no typed error (adversarial-log review, MALFORM). Return a clean 502 so a
+    // malformed/errored lockbox reply cannot crash the endpoint.
+    let response: mercurylib::transaction::SignFirstResponsePayload = match serde_json::from_str(value.as_str()) {
+        Ok(r) => r,
+        Err(_) => {
+            let response_body = json!({
+                "message": format!("enclave returned an unparseable sign/first response: {}", value)
+            });
+            return status::Custom(Status::BadGateway, Json(response_body));
+        }
+    };
 
     let mut server_pubnonce_hex = response.server_pubnonce.clone();
 
@@ -263,7 +274,20 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
         partial_sig: &'r str,
     }
 
-    let response: PartialSignatureResponsePayload = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    // Do NOT panic on an unparseable enclave body. This path is reachable by an ordinary client
+    // RETRY of sign/second: the challenge re-binds idempotently (update_signature_data_challenge)
+    // and the enclave is called again, but it has already consumed that secnonce and returns an
+    // error body rather than a partial signature — `.expect(...)` would 500-crash the handler
+    // (adversarial-log review, REPLAY/MALFORM). Return a clean 502 instead.
+    let response: PartialSignatureResponsePayload = match serde_json::from_str(value.as_str()) {
+        Ok(r) => r,
+        Err(_) => {
+            let response_body = json!({
+                "message": format!("enclave returned an unparseable sign/second response: {}", value)
+            });
+            return status::Custom(Status::BadGateway, Json(response_body));
+        }
+    };
 
     let response_body = json!(response);
 

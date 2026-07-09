@@ -80,6 +80,15 @@
         </button>
       </div>
 
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Assets</div>
+          <button id="btn-issue" class="mini">+ issue</button>
+        </div>
+        <ul id="asset-list" class="asset-list"></ul>
+        <div id="asset-empty" class="empty slim-empty">No assets yet — receive one, or issue your own.</div>
+      </div>
+
       <div class="card activity-card">
         <div class="card-title">Activity</div>
         <ul id="activity-list" class="activity-list"></ul>
@@ -105,8 +114,8 @@
         </div>
 
         <div id="pane-spark" class="pane">
-          <p class="hint">Share your address — incoming transfers land instantly and claim
-            themselves in the background. Free.</p>
+          <p class="hint">Share your address — sats <b>and RGB assets</b> both arrive here,
+            land instantly, and claim themselves in the background. Free.</p>
           <div class="qr-box"><div id="qr-spark"></div></div>
           <div class="addr-row"><code id="spark-address"></code>
             <button class="mini" data-copy="spark-address">copy</button></div>
@@ -155,6 +164,83 @@
           <div class="bigcheck">✓</div>
           <p id="send-summary"></p>
           <button class="btn btn-ghost" data-close="modal-send">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================== issue asset modal ====================== -->
+    <div id="modal-issue" class="overlay hidden">
+      <div class="sheet">
+        <div class="sheet-head">
+          <h3>Issue an asset</h3>
+          <button class="x" data-close="modal-issue">✕</button>
+        </div>
+        <div id="issue-form">
+          <div class="notice">
+            Issuance writes <b>one on-chain transaction</b>, paid by the wallet's RGB funding
+            address. Top it up first (≈ 60 000 sats covers it):
+            <div class="addr-row tight"><code id="funding-address">…</code>
+              <button class="mini" data-copy="funding-address">copy</button></div>
+          </div>
+          <div class="two-col">
+            <div><label for="issue-ticker">Ticker</label>
+              <input id="issue-ticker" type="text" placeholder="USDT" maxlength="8" spellcheck="false"></div>
+            <div><label for="issue-precision">Decimals</label>
+              <input id="issue-precision" type="number" min="0" max="18" value="2"></div>
+          </div>
+          <label for="issue-name">Name</label>
+          <input id="issue-name" type="text" placeholder="Tether USD" maxlength="40">
+          <label for="issue-supply">Total supply</label>
+          <input id="issue-supply" type="text" inputmode="decimal" placeholder="1000000">
+          <p class="hint">Fixed at issuance (RGB NIA). The full supply lands on a statechain coin
+            in this wallet, ready to send off-chain.</p>
+          <button id="btn-do-issue" class="btn btn-primary">Issue asset</button>
+          <p id="issue-error" class="error hidden"></p>
+        </div>
+        <div id="issue-progress" class="center hidden">
+          <div class="spinner"></div>
+          <p class="hint">Issuing — coloring a statechain coin (one on-chain tx)…</p>
+        </div>
+        <div id="issue-done" class="center hidden">
+          <div class="bigcheck">✓</div>
+          <p id="issue-summary"></p>
+          <button class="btn btn-ghost" data-close="modal-issue">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================== asset modal (details + send) =========== -->
+    <div id="modal-asset" class="overlay hidden">
+      <div class="sheet">
+        <div class="sheet-head">
+          <h3 id="asset-title">Asset</h3>
+          <button class="x" data-close="modal-asset">✕</button>
+        </div>
+        <div class="asset-hero">
+          <div id="asset-badge" class="asset-badge big"></div>
+          <div class="asset-hero-balance"><span id="asset-balance">0</span> <span id="asset-ticker-lbl"></span></div>
+          <div id="asset-pending" class="chip hidden"></div>
+        </div>
+        <div class="addr-row tight"><code id="asset-id"></code>
+          <button class="mini" data-copy="asset-id">copy</button></div>
+        <div id="asset-send-form">
+          <label for="asset-send-address">To (spark address)</label>
+          <input id="asset-send-address" type="text" placeholder="tml1…" spellcheck="false" autocomplete="off">
+          <label for="asset-send-amount">Amount</label>
+          <input id="asset-send-amount" type="text" inputmode="decimal" placeholder="0.00">
+          <p class="hint">Instant &amp; off-chain — the receiver validates the RGB consignment
+            client-side and books it automatically.</p>
+          <button id="btn-do-asset-send" class="btn btn-primary">Send</button>
+          <p id="asset-send-error" class="error hidden"></p>
+        </div>
+        <div id="asset-send-progress" class="center hidden">
+          <div class="spinner"></div>
+          <p class="hint">Colored split + key handover…</p>
+        </div>
+        <div id="asset-send-done" class="center hidden">
+          <div class="bigcheck">✓</div>
+          <p id="asset-send-summary"></p>
+          <button class="btn btn-ghost" data-close="modal-asset">Done</button>
         </div>
       </div>
     </div>
