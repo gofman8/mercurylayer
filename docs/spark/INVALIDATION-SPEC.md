@@ -349,15 +349,16 @@ floor empirically.
 
 ## 9. Lifetime and renewal
 
-**IVL-INV-13 (no ladder renewal).** There is NO mechanism to reset or extend an existing coin's
-ladder — no renew/refresh endpoint exists in the server or SDK (verified by search; contrast
-Spark's `renew_leaf`, [research/protocol-notes.md](research/protocol-notes.md)). A coin's
-off-chain lifetime is
-bounded at deposit time. The three lifetime-extension options and their exact effects:
+**IVL-INV-13 (no *off-chain* ladder renewal; on-chain refresh exists).** There is NO mechanism to
+reset or extend an existing coin's ladder purely off-chain (contrast Spark's `renew_leaf`,
+[research/protocol-notes.md](research/protocol-notes.md)) — a coin's off-chain lifetime is bounded
+at deposit time and only an on-chain touch resets it. The lifetime-extension options and their
+exact effects:
 
 | Option | On-chain cost | Effect on deadlines |
 |---|---|---|
-| Cooperative withdraw + re-deposit | 2 txs (withdraw + new funding) | Brand-new coin: new `H_anchor`, full `initlock` horizon and full ladder capacity. |
+| **Refresh (re-anchor)** — `SparkWallet::refresh` / `refresh_sponsored` (`clients/libs/rust-sdk/src/refresh.rs`) | **1 tx** (SE-co-signed spend of the coin's outpoint → a fresh aggregate) | Brand-new coin: new `H_anchor`, full `initlock` horizon and full ladder capacity; the old outpoint is spent so all old backups die. Fee **user-paid** (refreshed coin = `amount − fee`) or **operator-paid** (off-chain rebate preserves the user's total; the SE holds no funds and cannot co-fund the tx — it stays a single-input spend). Cooperative (needs the SE); verified by `SDK_E2E=30`. |
+| Cooperative withdraw + re-deposit | 2 txs (withdraw + new funding) | Same brand-new-coin effect as refresh, but two on-chain txs — refresh supersedes it. |
 | Materialize the branch (sub-coins) | branch txs (pre-paid reserves, §6) | Sub-coin becomes a *flat* coin; its OWN fresh ladder (anchored `H_split + initlock`, see below) now solely governs — ancestor deadlines vanish. |
 | Keep transacting before deadlines | none | Does NOT extend anything: each hop *lowers* the leaf locktime by `interval`; the root deadline (§6.2) is untouched. |
 
@@ -395,6 +396,7 @@ possible after it forever.
 | IVL-ERR-1..9 | sdk08/rgb04 (410s), rgb07 + sdk27 part d (410 epoch, IVL-ERR-2), sdk12 Part C (409 nonce reuse), sdk13/sdk14 (race outcomes), receiver unit tests |
 | IVL-INV-11, IVL-INV-12 | sdk13, sdk14, sdk15 (malicious-SE trust floor); chaos sdk22 |
 | IVL-INV-13, IVL-INV-14, exit-cost scaling | SDK_E2E=26 `sdk26_invalidation_scale` — depth scaling + measured exit costs; sdk07 (267 vB depth-1: 155 vB branch + 112 vB backup, types.rs:158-200) |
+| IVL-INV-13 (refresh re-anchor, both fee modes) | SDK_E2E=30 `sdk30_refresh` — user-pays (fee from coin) + operator-pays (off-chain rebate); horizon reset (headroom 700→999≈initlock), old outpoint spent, refreshed coin spendable; `unit::refresh::refresh_fee_and_amount_arithmetic` |
 
 E2E dispatch: clients/tests/rust/src/main.rs (`SDK_E2E=N ML_NETWORK=regtest cargo run` from
 clients/tests/rust); all tests above exist as of this revision.

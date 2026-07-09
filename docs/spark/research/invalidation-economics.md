@@ -251,18 +251,20 @@ open-item caveat in §9.
 
 ### 4b. Price of each lifetime-extension option
 
-There is **no ladder-renewal endpoint** (verified: none exists). The options and their prices:
+There is **no off-chain ladder-renewal**; resetting a coin costs an on-chain touch. The options
+and their prices:
 
 | Option | On-chain now | On-chain later | Locked/burned now | What it actually extends |
 |---|---|---|---|---|
+| **Refresh (re-anchor)** | **1 tx ≈ 112 vB** (SE-co-signed spend → fresh aggregate) + deposit token `T` | — | fee 112 sats @1 sat/vB (user-paid, or **operator-rebated off-chain** so your total is whole) | everything: brand-new coin, fresh full ladder, fresh root; old outpoint spent (old backups die). Measured, `SDK_E2E=30`. |
+| **Withdraw + redeposit** | 2 txs ≈ 294 vB (140 + 154) + token `T` | — | — | same as refresh, but two txs — refresh supersedes it |
 | **Self-split** | 0 vB | +155 vB on the future exit (branch grows one hop) | fee reserve 300–2,000 sats (becomes the branch fee) | the **leaf ladder** only (fresh 100 hops); the root deadline `H_deposit+initlock` is *not* moved |
-| **Withdraw + redeposit** | 2 txs ≈ 294 vB (140 + 154) + deposit token `T` | — | — | everything: brand-new coin, new ladder, new root |
 | **Branch materialization** | branch txs (155·depth vB, fee = pre-paid reserves) | — | — | converts the sub-coin to a flat coin; the governing deadline becomes the leaf's own ladder (`h_split + initlock`) |
 
-Materialization is the cheap renewal (155 vB per horizon vs 294 vB + token), with two catches:
-its feerate was frozen at split time (reserve ⇒ ~1.9–12.9 sat/vB — slow to confirm in a high-fee
-regime), and a "self-split then materialize each horizon" rolling loop is a *derived strategy*,
-not a tested SDK flow (*model*).
+**Refresh is the cheapest full reset** (112 vB in one tx vs 294 vB across two for withdraw+redeposit),
+and its fee can be shifted to an operator (off-chain rebate — the blind SE holds no funds, so it
+cannot co-fund the tx). Self-split/materialization stay useful for *leaf-only* extension without a
+full re-anchor. A "refresh each horizon" rolling loop costs ~112 vB + token per horizon.
 
 ### 4c. Worked one-year TCO
 

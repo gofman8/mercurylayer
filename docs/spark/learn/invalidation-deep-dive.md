@@ -230,15 +230,17 @@ blocks later the first stale backup is final and every further block adds one mo
 the set of people who could race. There is no alarm bell in the protocol other than this number;
 wallets should treat a low `wait_blocks` as "spend, withdraw, or exit now".
 
-**There is no renewal.** No endpoint refreshes a ladder (verified: no renew/refresh path exists
-in the code). This is deliberate — Spark's `renew_leaf` churn is what we traded away — so the
-only lifetime-extension options are real operations with real costs:
+**There is no *off-chain* renewal — but there is a one-tx on-chain refresh.** No endpoint renews a
+ladder purely off-chain (Spark's `renew_leaf` churn is what we traded away). Resetting a coin
+always costs an on-chain touch — but `refresh` makes it a **single** transaction (vs. the two of
+withdraw+redeposit). The lifetime-extension options, with real costs:
 
 | Option | What it extends | What it does NOT extend | Cost |
 |---|---|---|---|
+| **Refresh (re-anchor)** — `refresh` / `refresh_sponsored` | **Everything** — a brand-new coin, fresh `initlock` horizon, fresh 100-hop budget; the old outpoint is spent so all old backups die | — | **1 on-chain tx** (~112 vB SE-co-signed spend → fresh aggregate) + a deposit token. Fee **user-paid** (coin = amount − fee) or **operator-paid** (a funded sponsor rebates the fee off-chain, keeping your total whole). Cooperative (needs the SE). |
 | Self-split (split to yourself) | The *leaf* ladder: new sub-coin anchors at `H_split + initlock`, fresh 100-hop budget | The **root deadline** `H_deposit + initlock` — unchanged, still bounds the whole tree | One SE co-sign; 300–2,000 sats fee reserve locked into the branch; +155 vB of future exit weight |
 | Materialize the branch | Puts the sub-coin's funding on-chain; the coin becomes flat and its **own** ladder (`H_split + initlock`) now governs — the root deadline no longer applies | Its own ladder (already ticking since the split) | Branch miner fees (pre-committed reserves; N×~155 vB confirm now) |
-| Cooperative withdraw + redeposit | Everything — a brand-new coin, fresh `initlock`, fresh hop budget | — | 2 on-chain txs (withdraw ~111–140 vB + new funding ~111–154 vB; the [economics doc](../research/invalidation-economics.md)'s TCO prices the pair at 294 vB) + a new deposit token (`SdkError::TokenPaymentRequired` if the SE charges) |
+| Cooperative withdraw + redeposit | Everything — a brand-new coin, fresh `initlock`, fresh hop budget | — | 2 on-chain txs — **refresh supersedes this** (same result in one tx) |
 
 **The deadline, exactly.** `exit_deadline_block = H_deposit_root + initlock` (deposit-anchored,
 audit [10]) is a *safe, early* bound over ancestor maturities in one case and **too late** in
@@ -442,12 +444,22 @@ require action:
 
 | Trigger | Deadline | Action |
 |---|---|---|
-| `wait_blocks` approaching 0 on a held coin | before your own locktime `L_k` | spend, coop-withdraw, or exit |
+| `wait_blocks` approaching 0 on a held coin | before your own locktime `L_k` | spend, coop-withdraw, exit, **or `refresh` it** (one-tx re-anchor: fresh ladder, keep transacting) |
+| A long-held coin nearing its ladder horizon | before it floors out | `refresh` (user-pays) or `refresh_sponsored` (operator rebates the fee off-chain) — one on-chain tx resets the coin |
 | Holding a sub-coin, going offline | before `exit_deadline_block` minus an assumed `M·interval` margin (IVL-REQ-16; [17]) | broadcast the branch first, or have a watchtower run `auto_exit_due(M·interval)` |
 | `ExitDeadlineApproaching` event | within your margin | `auto_exit_due` already broadcast the branch — confirm it lands |
 | `ExitBranchConflict` event | immediately | CPFP/alert/re-attempt; treat the exit as contested |
 | `TokenPaymentRequired` on deposit | before depositing | pay `fee_sats`, retry |
 | SE unreachable and you want out | none — any time | `unilateral_exit`, re-call after `wait_blocks` |
+
+**Refresh, in one line.** `refresh(coin)` re-anchors a coin in a single SE-co-signed on-chain tx —
+spending its outpoint into a fresh aggregate, which resets the ladder + root deadline and kills all
+old backups (the outpoint is spent). It's the cheapest full reset (~112 vB, vs. two txs for
+withdraw+redeposit) and is cooperative (needs the SE; if the SE is gone, exit instead). Two fee
+models: **user-pays** (`refresh` — coin = amount − fee) or **operator-pays** (`refresh_sponsored` —
+a funded operator rebates the fee off-chain). Because the refresh fee (~112 sats) is below the dust
+floor and off-chain amounts can't be sub-dust, the operator rebate is rounded up to the smallest
+payable piece (`fee + 330`), so the user ends *at least* whole. Verified by `SDK_E2E=30`.
 
 **If they do nothing:** a flat coin is untouchable by anyone until the *current owner's* locktime
 (≈ horizon minus `k·interval/144` days), then exclusively theirs for `interval` blocks, then
@@ -591,7 +603,7 @@ heights as §6's "if they do nothing" — not to everything you hold.
 | | **Ours** | **Spark** | **Ark / Second** | **Mercury (vanilla)** |
 |---|---|---|---|---|
 | Lifetime bound | Absolute: `initlock` blocks from deposit (6.9 d / 69 d), 100 hops; per-coin epoch optional | Relative ladder 2000, −100/hop; effectively unbounded *if* renewed | Round expiry (~weeks), hard | Absolute ladder, one horizon, no refusal layer |
-| Renewal | **None by design**; extend via self-split (leaf only), branch materialization, or withdraw+redeposit | `renew_leaf` churn at ≤300 blocks, needs SO | Mandatory per-round refresh participation | None |
+| Renewal | No *off-chain* renewal; **on-chain refresh** (`refresh`) re-anchors in 1 tx — fee user- or operator-paid; plus self-split (leaf only) / branch materialization | `renew_leaf` churn at ≤300 blocks, needs SO | Mandatory per-round refresh participation | None |
 | Idle coin over time | Ages by calendar; must exit before horizon | Ages per hop; rots if renewal missed | Swept to server if round missed | Ages by calendar |
 | Operator dies | All exits pre-signed; wait ≤ `initlock`, funds whole | Unilateral path exists; timelock race | Exit window critical; miss it → server sweeps | Same as ours (ladder only) |
 | Stale state over time | Non-final → exclusive window → watched race; branches beat ancestors before root deadline | Timelock race; operator key-deletion honest-1-of-n | Dies at expiry (the same knife that threatens users) | Timelock race only |

@@ -57,6 +57,7 @@ pub mod sdk26_invalidation_scale;
 pub mod sdk27_invalidation_time;
 pub mod sdk28_granularity_sats;
 pub mod sdk29_granularity_tokens;
+pub mod sdk30_refresh;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -226,6 +227,12 @@ async fn main() -> Result<()> {
     // one-carrier-per-transfer limitation (typed error; 60+40 works where 100 fails).
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("29") {
         sdk29_granularity_tokens::execute().await?;
+        return Ok(());
+    }
+    // Refresh / re-anchor (SDK_E2E=30): reset a coin's ladder + root deadline in one on-chain tx;
+    // old outpoint spent (old backups dead), fresh coin at a fresh ladder, user pays the fee.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("30") {
+        sdk30_refresh::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
