@@ -56,8 +56,9 @@ function show(screen) {
 }
 
 // ---------------------------------------------------------------- asset units
-// TokenBalance amounts are RAW units scaled by `precision`. Convert via BigInt so a
-// large supply never hits float rounding; the wire still carries a safe integer.
+// TokenBalance amounts are RAW units scaled by `precision`. Balances ARRIVE as strings (u64
+// would round above 2^53 as a JSON number); amounts we SEND go as numbers, hard-capped at
+// Number.MAX_SAFE_INTEGER — with issuance precision capped at 8, real supplies stay well below.
 
 function toRawUnits(str, precision) {
   const s = String(str).trim();
@@ -154,7 +155,8 @@ async function refreshTokens() {
       const badge = document.createElement('div');
       badge.className = 'asset-badge';
       paintBadge(badge, t);
-      const unsettled = (t.total || 0) - (t.balance || 0);
+      // Balances arrive as STRINGS (u64 must not ride JSON as numbers) — subtract as BigInt.
+      const unsettled = BigInt(t.total || 0) - BigInt(t.balance || 0);
       const main = document.createElement('div');
       main.className = 'asset-main';
       main.innerHTML = `
@@ -162,7 +164,7 @@ async function refreshTokens() {
         <div class="asset-sub"></div>`;
       main.querySelector('.asset-name').textContent = t.name || t.ticker || 'asset';
       main.querySelector('.asset-sub').textContent =
-        (t.ticker || '') + (unsettled > 0 ? ` · +${fromRawUnits(unsettled, t.precision)} incoming` : '');
+        (t.ticker || '') + (unsettled > 0n ? ` · +${fromRawUnits(unsettled, t.precision)} incoming` : '');
       const amount = document.createElement('div');
       amount.className = 'asset-amount';
       amount.textContent = fromRawUnits(t.balance, t.precision);
@@ -327,7 +329,7 @@ $('btn-do-send').onclick = async () => {
   const err = $('send-error');
   err.classList.add('hidden');
   if (!/^(t?ml1|t?sp1)/.test(address)) {
-    err.textContent = 'That does not look like a spark address.';
+    err.textContent = 'That does not look like a Utexo address.';
     err.classList.remove('hidden');
     return;
   }
@@ -440,7 +442,7 @@ $('btn-do-asset-send').onclick = async () => {
   err.classList.add('hidden');
   const address = $('asset-send-address').value.trim();
   if (!/^(t?ml1|t?sp1)/.test(address)) {
-    err.textContent = 'That does not look like a spark address.';
+    err.textContent = 'That does not look like a Utexo address.';
     err.classList.remove('hidden');
     return;
   }

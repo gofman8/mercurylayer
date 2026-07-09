@@ -152,8 +152,10 @@ textarea { resize: vertical; }
 }
 .asset-badge.big { width: 56px; height: 56px; font-size: 17px; margin: 0 auto; }
 .asset-main { flex: 1; min-width: 0; }
-.asset-name { font-weight: 600; font-size: 15px; }
-.asset-sub { color: var(--dim); font-size: 12.5px; }
+/* Asset name/ticker are SENDER-CONTROLLED for received assets — an unbreakable 40-char name
+   must ellipsize, not deface the layout on every re-render (review-found). */
+.asset-name { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asset-sub { color: var(--dim); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .asset-amount { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 15px; }
 .slim-empty { padding: 16px 10px; }
 
@@ -231,7 +233,8 @@ textarea { resize: vertical; }
 }
 @keyframes rise { from { transform: translateY(30px); opacity: 0.4; } to { transform: none; opacity: 1; } }
 .sheet-head { display: flex; justify-content: space-between; align-items: center; }
-.sheet-head h3 { font-size: 20px; }
+/* min-width + ellipsis: the asset sheet title carries a sender-controlled asset name. */
+.sheet-head h3 { font-size: 20px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .x {
   background: var(--card-2); border: 1px solid var(--line); color: var(--dim);
   width: 32px; height: 32px; border-radius: 10px; cursor: pointer; font-size: 13px;

@@ -179,8 +179,9 @@
         </div>
         <div id="issue-form">
           <div class="notice">
-            Issuance writes <b>one on-chain transaction</b>, paid by the wallet's RGB funding
-            address. Top it up first (≈ 60 000 sats covers it):
+            Issuance writes <b>two on-chain transactions</b> (a UTXO-prep spend, then the colored
+            carrier deposit), paid by the wallet's RGB funding address. Top it up first
+            (≈ 60 000 sats covers it):
             <div class="addr-row tight"><code id="funding-address">…</code>
               <button class="mini" data-copy="funding-address">copy</button></div>
           </div>
@@ -188,7 +189,7 @@
             <div><label for="issue-ticker">Ticker</label>
               <input id="issue-ticker" type="text" placeholder="USDT" maxlength="8" spellcheck="false"></div>
             <div><label for="issue-precision">Decimals</label>
-              <input id="issue-precision" type="number" min="0" max="18" value="2"></div>
+              <input id="issue-precision" type="number" min="0" max="8" value="2"></div>
           </div>
           <label for="issue-name">Name</label>
           <input id="issue-name" type="text" placeholder="Tether USD" maxlength="40">
@@ -201,7 +202,7 @@
         </div>
         <div id="issue-progress" class="center hidden">
           <div class="spinner"></div>
-          <p class="hint">Issuing — coloring a statechain coin (one on-chain tx)…</p>
+          <p class="hint">Issuing — coloring a statechain coin (on-chain)…</p>
         </div>
         <div id="issue-done" class="center hidden">
           <div class="bigcheck">✓</div>

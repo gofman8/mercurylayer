@@ -30,7 +30,7 @@ different `PORT`+`DATA_DIR` to demo transfers.
 - create / restore (12-word phrase) with an honest backup notice (the phrase restores keys; the
   `DATA_DIR` holds off-chain exit material — back up both)
 - balance (available / incoming), activity feed
-- receive: instant spark address (QR) or exact-amount on-chain deposit (QR, `bitcoin:` URI)
+- receive: instant utexo address (QR) or exact-amount on-chain deposit (QR, `bitcoin:` URI)
 - send: instant, free, exact-to-the-sat statechain transfers (auto-split under the hood)
 - live toasts from SDK events: deposits confirming, incoming transfers auto-claiming,
   auto-refresh, watchtower warnings
