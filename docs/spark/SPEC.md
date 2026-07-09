@@ -86,6 +86,12 @@ SE (owner-encrypted); the SE never deserializes `TransferMsg`.
 - `POST /deposit/init` `{token_id, auth_key, ...}` → `{server_pubkey, statechain_id, ...}`.
   Registers a new coin key-share. **REQ-4** MUST require a valid deposit token.
   `single_use` and `epoch_deadline` MAY be set at init.
+- `POST /deposit/get_derived_token` `{statechain_id, auth_sig, count}` → `{token_ids}` — FREE
+  **derived-slot** vouchers for slots created by SE-co-signed flows over the named EXISTING
+  statechain (split pieces/change, combine outputs, refresh re-anchors). `auth_sig` is the
+  single-use endpoint-bound owner challenge (`"<nonce>:<sig>"`, audit [15]); one consumed nonce
+  authorizes the whole `count` batch. Never routed to the token server; works on any network.
+  See REQ-35 / ERR-13.
 
 ### 3.2 Signing (blind MuSig2)
 - `POST /sign/first` `{statechain_id, signed_statechain_id, ...}` → `{server_pubnonce}`.
@@ -142,6 +148,19 @@ first backup tx (`create_tx1`, locktime `h+initlock`), flips the coin to `CONFIR
 
 **REQ-14** A deposit slot MUST consume a deposit token; if payment is required the SDK MUST surface
 `SdkError::TokenPaymentRequired` rather than silently proceeding (ERR-6).
+**REQ-35 (derived slots)** A slot minted by an SE-co-signed flow over an existing statechain — an
+off-chain split piece/change, a `transfer_many` recipient/change, a combine output, a refresh
+re-anchor — is a **derived slot**: it re-houses value already inside the SE, so the SDK MUST fund
+it with a FREE derived token (`deposit/get_derived_token`, vouched by the parent statechain) and
+MUST NOT draw on pooled/prepaid onboarding tokens (in a token-server deployment those cost the
+onboarding fee — a 2-output split must not cost 2× it). The SE MUST gate issuance on (i) the
+parent's CURRENT-owner auth (single-use nonce, consumed only on a valid signature), (ii) a
+per-parent LIFETIME cap (`max_derived_tokens_per_statechain`, default 64; 0 disables), and (iii)
+the global outstanding-token cap (audit [26]), and MUST mark issued tokens with their parent
+(`tokens.derived_from`). Fresh ON-CHAIN onboarding (a deposit address, a token-issuance carrier)
+still consumes a normal token per REQ-14. Fallback: when the SE predates/disables the endpoint or
+the allowance is exhausted, the SDK falls back to onboarding tokens (pre-REQ-35 behaviour).
+The blind SE cannot verify how a slot is later funded (TRUST-MODEL §7 records the residual).
 **INV-7** After a deposit confirms, `get_balance().available_sats` increases by the deposit amount.
 
 ---
@@ -376,6 +395,9 @@ spendable balance would let a right-holder inflate a receiver's balance out of n
 - **ERR-10** double-withdraw / spend of a non-CONFIRMED coin → refused with the coin's status.
 - **ERR-12** second `sign/second` reusing a server nonce over a different message → HTTP 409
   `server nonce already finalized with a different challenge`.
+- **ERR-13** derived-token refusals: bad, replayed, or non-owner `auth_sig` → HTTP 401; `count`
+  outside `1..=cap` → HTTP 400 `count must be between`; lifetime allowance exceeded → HTTP 429
+  `lifetime derived tokens`; issuance disabled (`cap = 0`) → HTTP 403.
 
 ---
 
@@ -436,6 +458,7 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-32 (auto-refresh in transfer) | `sdk33` (maintenance pass, embedded transfer, opt-out) |
 | REQ-33 (watchtower carrier materialize) | `sdk34` (received-carrier auto-materialize, clawback defeated) |
 | REQ-34 (keyless watch delegation) | `sdk35` (keyless bundle, 2 towers idempotent, malicious-sender rejection); `unit::watchtower::tests` |
+| REQ-35, ERR-13 (derived slots) | `sdk36` (poisoned-pool split/refresh, onboarding still charges, direct mint, caps, garbage/replayed/non-owner auth); `mercurylib unit::deposit::derived_token_tests` |
 | INV-20 (ancestor-count binding), ERR-7 | `unit::terminal_parents_tests`, `sdk10`, `sdk12` (honest accept) |
 | INV-23, ERR-12 | `sdk12` Part C (nonce-reuse refused) |
 | INV-24 | `sdk08` (terminal node stays terminal) |

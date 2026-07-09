@@ -144,6 +144,7 @@ async fn main() {
         .mount("/", routes![
             endpoints::deposit::post_deposit,
             endpoints::deposit::get_token,
+            endpoints::deposit::get_derived_token,
             // endpoints::deposit::token_init,
             endpoints::sign::sign_first,
             endpoints::sign::sign_second,

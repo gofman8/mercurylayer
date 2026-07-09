@@ -176,6 +176,43 @@ pub async fn insert_new_token(pool: &sqlx::PgPool, token_id: &str)  {
         .unwrap();
 }
 
+/// LIFETIME count of derived tokens attributed to `parent_statechain_id` — spent tokens included,
+/// deliberately: the per-parent allowance is a lifetime bound, else a parent could mint, consume,
+/// and re-mint free slots forever. Errors propagate so the endpoint fails CLOSED (refuses issuance
+/// on a partial read — audit [1] discipline).
+pub async fn count_derived_tokens(pool: &sqlx::PgPool, parent_statechain_id: &str) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tokens WHERE derived_from = $1")
+        .bind(parent_statechain_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// Mint `n` fresh derived-slot tokens vouched by `parent_statechain_id`, in one transaction.
+/// Confirmed-at-birth and payment-free: a derived slot re-houses value already inside the SE, so
+/// `post_deposit` must accept the token without consulting the token server.
+pub async fn insert_new_derived_tokens(
+    pool: &sqlx::PgPool,
+    parent_statechain_id: &str,
+    n: u32,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let mut token_ids = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let token_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO tokens (token_id, confirmed, spent, derived_from) VALUES ($1, true, false, $2)",
+        )
+        .bind(&token_id)
+        .bind(parent_statechain_id)
+        .execute(&mut *transaction)
+        .await?;
+        token_ids.push(token_id);
+    }
+    transaction.commit().await?;
+    Ok(token_ids)
+}
+
 /// Set an absolute co-signature budget: current finalized count + `remaining`. The SE refuses
 /// sign_first once the count reaches the budget.
 pub async fn set_sig_budget(pool: &sqlx::PgPool, statechain_id: &str, remaining: i32) -> Result<i64, sqlx::Error> {

@@ -142,6 +142,56 @@ pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid:
     Ok(wallet)
 }
 
+/// Mint `count` FREE **derived-slot** deposit tokens vouched by an existing statechain this wallet
+/// currently owns (`parent_coin`, id `parent_statechain_id`) — for slots created by SE-co-signed
+/// flows over it: off-chain split pieces/change, combine outputs, a refresh re-anchor. Owner-auth
+/// is the audit-[15] single-use challenge signed with the parent coin's auth key, so only the
+/// current owner can draw on the parent's allowance. Errors when the SE predates the endpoint,
+/// has derived issuance disabled, or the parent's lifetime allowance is exhausted — callers fall
+/// back to normal (possibly paid) tokens.
+pub async fn get_derived_tokens(
+    client_config: &ClientConfig,
+    parent_coin: &Coin,
+    parent_statechain_id: &str,
+    count: u32,
+) -> Result<Vec<String>> {
+    let auth_sig = crate::utils::fresh_auth(
+        client_config,
+        parent_statechain_id,
+        parent_coin,
+        "deposit/get_derived_token",
+    )
+    .await?;
+
+    let payload = mercurylib::deposit::DerivedTokenRequest {
+        statechain_id: parent_statechain_id.to_string(),
+        auth_sig,
+        count,
+    };
+
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/deposit/get_derived_token", client_config.statechain_entity))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if response.status() != 200 {
+        let response_body = response.text().await?;
+        return Err(anyhow!(response_body));
+    }
+
+    let value = response.text().await?;
+    let resp: mercurylib::deposit::DerivedTokenResponse = serde_json::from_str(value.as_str())?;
+    if resp.token_ids.len() != count as usize {
+        return Err(anyhow!(
+            "SE returned {} derived tokens, expected {count}",
+            resp.token_ids.len()
+        ));
+    }
+    Ok(resp.token_ids)
+}
+
 pub async fn get_token(client_config: &ClientConfig) -> Result<mercurylib::deposit::TokenResponse> {
 
     let endpoint = client_config.statechain_entity.clone();

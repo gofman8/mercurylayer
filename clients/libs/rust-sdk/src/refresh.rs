@@ -155,8 +155,21 @@ impl SparkWallet {
                 anyhow!("coin {statechain_id} ({amount} sats) is too small to cover the refresh fee {fee_sats} sats")
             })?;
 
-            // 3. Fresh deposit aggregate for EXACTLY amount_out (mints a new statechain_id).
-            let fresh_addr = self.get_deposit_address(amount_out).await?;
+            // 3. Fresh deposit aggregate for EXACTLY amount_out (mints a new statechain_id). The
+            //    slot is DERIVED from the coin being refreshed — a re-anchor re-houses value the SE
+            //    already carries (old slot dies, new slot born), so it uses a free SE voucher, not
+            //    an onboarding token from the paid pool.
+            let slot_token = self
+                .take_derived_tokens(statechain_id, 1)
+                .await?
+                .remove(0);
+            let fresh_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &slot_token,
+                u32::try_from(amount_out)?,
+            )
+            .await?;
             let after_dep = self.record().await?;
             let new_statechain_id = after_dep
                 .coins

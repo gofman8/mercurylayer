@@ -517,8 +517,10 @@ impl SparkWallet {
             ));
         }
 
-        // Fresh slots for piece and change.
-        let token_a = self.take_token().await?;
+        // Fresh slots for piece and change — DERIVED from the carrier (free SE vouchers; a
+        // colored split re-houses the carrier's value, no new on-chain onboarding).
+        let mut slot_tokens = self.take_derived_tokens(&carrier_id, 2).await?;
+        let token_a = slot_tokens.remove(0);
         let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -526,7 +528,7 @@ impl SparkWallet {
             u32::try_from(TOKEN_PIECE_SATS)?,
         )
         .await?;
-        let token_b = self.take_token().await?;
+        let token_b = slot_tokens.remove(0);
         let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -782,8 +784,15 @@ impl SparkWallet {
             ));
         }
 
-        // 3. Fresh slots for the piece + change.
-        let token_a = self.take_token().await?;
+        // 3. Fresh slots for the piece + change — DERIVED slots; any consumed input carrier can
+        //    vouch (they are all being re-housed by this combine), so use the first selected.
+        let voucher_parent = selected[0]
+            .0
+            .statechain_id
+            .clone()
+            .ok_or_else(|| anyhow!("selected carrier without statechain id"))?;
+        let mut slot_tokens = self.take_derived_tokens(&voucher_parent, 2).await?;
+        let token_a = slot_tokens.remove(0);
         let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -791,7 +800,7 @@ impl SparkWallet {
             u32::try_from(TOKEN_PIECE_SATS)?,
         )
         .await?;
-        let token_b = self.take_token().await?;
+        let token_b = slot_tokens.remove(0);
         let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1036,11 +1045,13 @@ impl SparkWallet {
             ));
         }
 
-        // One fresh slot per recipient piece + one for change; build the N+1 colored split.
+        // One fresh slot per recipient piece + one for change; build the N+1 colored split. All
+        // N+1 slots are DERIVED from the carrier (one free voucher batch, one auth nonce).
+        let mut slot_tokens = self.take_derived_tokens(&carrier_id, n + 1).await?;
         let mut splits: Vec<(String, u64, u64)> = Vec::with_capacity(n + 1);
         let mut piece_addrs: Vec<String> = Vec::with_capacity(n);
         for (_, amount) in transfers {
-            let tk = self.take_token().await?;
+            let tk = slot_tokens.remove(0);
             let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
                 &self.inner.cc,
                 &self.inner.config.wallet_name,
@@ -1051,7 +1062,7 @@ impl SparkWallet {
             splits.push((addr.clone(), TOKEN_PIECE_SATS, *amount));
             piece_addrs.push(addr);
         }
-        let change_tk = self.take_token().await?;
+        let change_tk = slot_tokens.remove(0);
         let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,

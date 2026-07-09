@@ -19,6 +19,37 @@ pub struct TokenResponse {
     pub confirmation_target: u64,
 }
 
+/// Request for FREE **derived-slot** deposit tokens (`POST /deposit/get_derived_token`): vouchers
+/// for statechain slots created by SE-co-signed flows over an EXISTING statechain the requester
+/// currently owns — off-chain split pieces/change, combine outputs, refresh re-anchors. These
+/// slots re-house value already inside the SE, so they are not charged the on-chain onboarding
+/// fee. `auth_sig` is the single-use endpoint-bound challenge response `"<nonce>:<sig>"` (audit
+/// [15]): a schnorr signature by the PARENT's current auth key over
+/// `sha256(nonce|"deposit/get_derived_token")`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DerivedTokenRequest {
+    /// The parent statechain acting as the voucher (must exist at the SE; requester must own it).
+    pub statechain_id: String,
+    /// `"<nonce>:<sig>"` over the `deposit/get_derived_token` endpoint (see above).
+    pub auth_sig: String,
+    /// Tokens to mint under this one challenge — a split needs 2 (piece+change), a
+    /// `transfer_many` batch N+1, a refresh 1. Counted against the parent's LIFETIME allowance
+    /// (`max_derived_tokens_per_statechain`). Default 1.
+    #[serde(default = "default_derived_token_count")]
+    pub count: u32,
+}
+
+fn default_derived_token_count() -> u32 {
+    1
+}
+
+/// Response to [`DerivedTokenRequest`]: the minted token ids, already CONFIRMED and payment-free
+/// (each funds one `deposit/init/pod` like any other token).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DerivedTokenResponse {
+    pub token_ids: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct DepositMsg1 {
@@ -136,4 +167,21 @@ pub fn create_aggregated_address(coin: &Coin, network: String) -> Result<Aggrega
         aggregate_address: aggregate_address.to_string(),
     })
 
+}
+
+#[cfg(test)]
+mod derived_token_tests {
+    use super::DerivedTokenRequest;
+
+    // Wire-compat: `count` is optional and defaults to 1, so a minimal client that only ever needs
+    // one derived slot (e.g. a refresh) can omit it.
+    #[test]
+    fn count_defaults_to_one() {
+        let req: DerivedTokenRequest =
+            serde_json::from_str(r#"{"statechain_id":"abc","auth_sig":"n:s"}"#).unwrap();
+        assert_eq!(req.count, 1);
+        let req: DerivedTokenRequest =
+            serde_json::from_str(r#"{"statechain_id":"abc","auth_sig":"n:s","count":7}"#).unwrap();
+        assert_eq!(req.count, 7);
+    }
 }

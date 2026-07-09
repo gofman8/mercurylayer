@@ -261,21 +261,37 @@ needed for custody**, by construction:
 **Optional operators** (all custody-free):
 - **Deposit-token server** — *no relation to RGB tokens*: a "deposit token" is an **onboarding
   voucher**, upstream Mercury Layer's anti-spam + operator-revenue gate. Every new statechain
-  slot consumes one (each on-chain deposit — and note: each split output, `transfer_many`
-  recipient, and refresh too). Rationale: a slot is a permanent SE liability (enclave share, DB,
-  co-signing duty), and a *blind* SE has no other billing point — transfers are free and
-  unmetered, so the pay-once-per-slot model is the statechain fee model. With no token server
-  configured the SE mints **free** tokens itself (`server/src/endpoints/deposit.rs`, capped per
-  audit [26]); on mainnet this requires the explicit operator opt-in
-  `free_tokens_on_mainnet = true`. **Deployment strategy (decided)**: production runs FREE —
-  onboarding unpriced, the audit-[26] outstanding-token cap as the standing spam brake — and the
-  pricing machinery (token server, derived-slot exemption) is deferred until spam actually
-  appears. If pricing is ever enabled, note every 2-output split and every (auto-)refresh
-  consumes a slot too, so a paid deployment must price near zero or exempt derived slots
-  (shipped token-server default is 10,000 sats). With a token server configured, the wallet
-  reaches it **through the SE** (never directly; honest relay of pricing is part of the §3
-  trust). Worst case = losing one prepaid onboarding fee; it never touches existing coins
-  (`SdkError::TokenPaymentRequired` surfaces cost instead of silently paying).
+  slot consumes one, but slots come in two classes (REQ-35, `sdk36`):
+  - **Onboarding slots** — fresh on-chain value entering the SE (a deposit address, a token
+    issuance carrier). These consume a normal token: free from the SE when no token server is
+    configured (`server/src/endpoints/deposit.rs`, capped per audit [26]; on mainnet only with
+    the explicit operator opt-in `free_tokens_on_mainnet = true`), priced by the token server
+    otherwise. Rationale: a slot is a permanent SE liability (enclave share, DB, co-signing
+    duty), and a *blind* SE has no other billing point — transfers are free and unmetered, so
+    pay-once-per-slot is the statechain fee model.
+  - **Derived slots** — outputs of SE-co-signed flows over an *existing* statechain (off-chain
+    split pieces/change, `transfer_many` recipients, combine outputs, refresh re-anchors).
+    These re-house value already inside the SE, adding no on-chain onboarding surface, so they
+    are **free**: the SE mints derived tokens itself (`POST /deposit/get_derived_token`, any
+    network, never routed to the token server), gated on the parent's CURRENT-owner auth (the
+    audit-[15] single-use nonce) and a per-parent **lifetime** cap
+    (`max_derived_tokens_per_statechain`, default 64; 0 disables derived issuance). Without
+    this, a paid deployment would charge every 2-output split 2× the onboarding fee (shipped
+    token-server default is 10,000 sats) and every (auto-)refresh 1×, for zero new on-chain
+    surface. The SDK never spends pooled/prepaid onboarding tokens on a derived slot, and falls
+    back to them only if the SE lacks or refuses the endpoint. *Residual (blind SE)*: the SE
+    cannot see how a slot is later funded, so a dishonest owner can point a fresh L1 deposit at
+    a derived slot and dodge the fee for that slot — bounded by the per-parent lifetime cap and
+    the audit-[26] outstanding-token cap, eliminable only by unblinding deposits or disabling
+    derived issuance (`max_derived_tokens_per_statechain = 0`).
+
+  **Deployment strategy (decided)**: production runs FREE — onboarding unpriced, the audit-[26]
+  outstanding-token cap as the standing spam brake — and token-server pricing is deferred until
+  spam actually appears; the derived-slot exemption above is what makes enabling it economically
+  sane later. With a token server configured, the wallet reaches it **through the SE** (never
+  directly; honest relay of pricing is part of the §3 trust). Worst case = losing one prepaid
+  onboarding fee; it never touches existing coins (`SdkError::TokenPaymentRequired` surfaces
+  cost instead of silently paying).
 - **Refresh sponsor** (`refresh_sponsored`): rebates the refresh fee off-chain *after* the
   re-anchor. A sponsor that stiffs you costs exactly `fee` sats (you keep the refreshed coin);
   the failure surfaces as an explicit error ("re-anchor succeeded but the sponsor rebate

@@ -9,6 +9,7 @@ db_port = 5432
 db_name = "mercury"
 token_server_url = "http://localhost:8001" # URL of the token server (optional)
 # free_tokens_on_mainnet = true # opt-in: FREE deposit tokens on mainnet (no token server); onboarding runs unpriced, audit-[26] cap is the spam brake; add pricing only if spam appears
+# max_derived_tokens_per_statechain = 64 # lifetime cap on FREE derived-slot tokens per parent statechain (splits/combines/refresh); 0 disables derived issuance
 
 [nostr_info]
 relay_server = "wss://relay.damus.io/"

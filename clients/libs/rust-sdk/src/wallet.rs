@@ -33,7 +33,9 @@ pub(crate) struct Inner {
     pub cc: ClientConfig,
     pub config: SdkConfig,
     pub events_tx: broadcast::Sender<WalletEvent>,
-    /// Pre-paid deposit-token ids, consumed one per statechain slot (deposit or split output).
+    /// Pre-paid ONBOARDING deposit-token ids, consumed one per fresh on-chain slot (deposit
+    /// address, issuance carrier). Derived slots (split/combine/refresh outputs) never draw on
+    /// this pool — they use free SE-minted derived tokens (`take_derived_tokens`).
     pub token_pool: Mutex<Vec<String>>,
     /// Guards wallet-record read-modify-write cycles within this process.
     pub wallet_lock: Mutex<()>,
@@ -300,14 +302,19 @@ impl SparkWallet {
         Ok(balance)
     }
 
-    /// Provide a pre-paid, confirmed deposit-token id. Each statechain slot (deposit address or
-    /// off-chain split output) consumes one token. Without pooled tokens the SDK requests one from
-    /// the SE and surfaces `SdkError::TokenPaymentRequired` if it is not free.
+    /// Provide a pre-paid, confirmed deposit-token id. Each fresh ON-CHAIN onboarding slot (a
+    /// deposit address, a token issuance carrier) consumes one pooled token. Slots minted by
+    /// SE-co-signed flows over an existing statechain — split outputs, combine outputs, refresh
+    /// re-anchors — do NOT draw on the pool: they use free DERIVED tokens vouched by the parent
+    /// coin ([`Self::take_derived_tokens`]). Without pooled tokens the SDK requests one from the
+    /// SE and surfaces `SdkError::TokenPaymentRequired` if it is not free.
     pub async fn add_prepaid_token(&self, token_id: &str) {
         self.inner.token_pool.lock().await.push(token_id.to_string());
     }
 
-    /// Take a usable token id: pooled first, then config default, then ask the SE.
+    /// Take a usable ONBOARDING token id: pooled first, then config default, then ask the SE.
+    /// For a derived slot (split/combine/refresh) use [`Self::take_derived_tokens`] instead —
+    /// onboarding tokens cost real money in a paid deployment.
     pub(crate) async fn take_token(&self) -> Result<String> {
         if let Some(t) = self.inner.token_pool.lock().await.pop() {
             return Ok(t);
@@ -326,6 +333,55 @@ impl SparkWallet {
             .into());
         }
         Ok(token.token_id)
+    }
+
+    /// Take `n` DERIVED-slot token ids vouched by `parent_statechain_id` — the free tokens the SE
+    /// mints for slots created by co-signed flows over an existing statechain (split piece/change,
+    /// combine outputs, a refresh re-anchor). Never draws on the prepaid pool (that is onboarding
+    /// money: with a paid token server a 2-output split would otherwise cost 2× the onboarding fee
+    /// for zero new on-chain surface). One SE round-trip authorizes the whole batch (a single
+    /// consumed auth nonce).
+    ///
+    /// Falls back to [`Self::take_token`] per slot when the SE predates the endpoint, has derived
+    /// issuance disabled, or the parent's lifetime allowance is exhausted — preserving the old
+    /// behaviour (free deployments keep working; a paid deployment surfaces
+    /// `TokenPaymentRequired` instead of silently paying).
+    pub(crate) async fn take_derived_tokens(
+        &self,
+        parent_statechain_id: &str,
+        n: usize,
+    ) -> Result<Vec<String>> {
+        let record = self.record().await?;
+        let parent = record
+            .coins
+            .iter()
+            .find(|c| {
+                c.statechain_id.as_deref() == Some(parent_statechain_id) && c.duplicate_index == 0
+            })
+            .cloned();
+        drop(record);
+        if let Some(parent) = parent {
+            match mercuryrustlib::deposit::get_derived_tokens(
+                &self.inner.cc,
+                &parent,
+                parent_statechain_id,
+                u32::try_from(n)?,
+            )
+            .await
+            {
+                Ok(ids) => return Ok(ids),
+                Err(e) => {
+                    println!(
+                        "derived-token request for parent {parent_statechain_id} failed ({e}); falling back to onboarding tokens"
+                    );
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.take_token().await?);
+        }
+        Ok(out)
     }
 
     /// Fresh single-use Bitcoin deposit address for `amount_sats`. Full Mercury security: the

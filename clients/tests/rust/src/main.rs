@@ -63,6 +63,7 @@ pub mod sdk32_token_over_time;
 pub mod sdk33_auto_refresh;
 pub mod sdk34_token_watchtower;
 pub mod sdk35_trust_boundaries;
+pub mod sdk36_derived_tokens;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -270,6 +271,13 @@ async fn main() -> Result<()> {
     // multiple towers idempotent, clawback defeated) + receiver rejects a floored handover.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("35") {
         sdk35_trust_boundaries::execute().await?;
+        return Ok(());
+    }
+    // Derived deposit tokens (SDK_E2E=36): split/combine/refresh slots are FREE derived slots
+    // (SE-minted vouchers against the parent statechain — never the paid onboarding pool);
+    // onboarding still charges; owner-auth (single-use nonce) + per-parent lifetime cap enforced.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("36") {
+        sdk36_derived_tokens::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

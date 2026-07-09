@@ -7,6 +7,11 @@ use serde::{Serialize, Deserialize};
 use serde_json::{Value, json};
 use crate::{server::StateChainEntity, server_config::Enclave};
 
+/// Audit [26]: cap on outstanding (unspent) token rows, bounding DB write-amplification from
+/// looped issuance. Checked by BOTH the free faucet (`get_token_no_server`, unauthenticated) and
+/// the derived-token endpoint (`get_derived_token`, authenticated but free).
+const MAX_UNSPENT_TOKENS: i64 = 100_000;
+
 pub async fn get_token_no_server(statechain_entity: &State<StateChainEntity>, config: &crate::server_config::ServerConfig) -> status::Custom<Json<Value>>  {
 
     // Free token generation on mainnet is a deliberate operator OPT-IN (`free_tokens_on_mainnet`):
@@ -23,7 +28,6 @@ pub async fn get_token_no_server(statechain_entity: &State<StateChainEntity>, co
 
     // Audit [26]: this endpoint is unauthenticated when free, so cap the number of unspent
     // token rows to bound DB write-amplification if a caller loops it.
-    const MAX_UNSPENT_TOKENS: i64 = 100_000;
     if crate::database::deposit::count_unspent_tokens(&statechain_entity.pool).await >= MAX_UNSPENT_TOKENS {
         return status::Custom(
             Status::TooManyRequests,
@@ -104,6 +108,116 @@ pub async fn get_token(statechain_entity: &State<StateChainEntity>) -> status::C
         return get_token_no_server(statechain_entity, &config).await;
     } else {
         return get_token_from_server(&config).await;
+    }
+}
+
+/// FREE **derived-slot** tokens: vouchers for statechain slots created by SE-co-signed flows over
+/// an EXISTING statechain — off-chain split pieces/change, combine outputs, refresh re-anchors.
+/// Such slots re-house value already inside the SE (no new on-chain onboarding surface), so they
+/// are never routed to the token server: the SE mints them itself, on any network, marked with
+/// their parent (`tokens.derived_from`).
+///
+/// Gates, in order:
+/// 1. issuance enabled (`max_derived_tokens_per_statechain > 0`);
+/// 2. requested `count` within the per-parent allowance;
+/// 3. global outstanding-token cap (audit [26], shared with the faucet);
+/// 4. OWNER auth: the audit-[15] single-use endpoint-bound challenge, signed by the parent's
+///    CURRENT auth key — one consumed nonce mints the whole batch (a `transfer_many` needs N+1
+///    slots but one authorization);
+/// 5. per-parent LIFETIME cap, counted over `derived_from` (spent tokens included) — fail CLOSED
+///    on a read error.
+///
+/// The blind SE cannot see how a slot is later funded, so a dishonest owner could point a fresh
+/// L1 deposit at a derived slot to dodge a paid deployment's onboarding fee; the lifetime cap
+/// bounds that, and `max_derived_tokens_per_statechain = 0` disables the endpoint outright
+/// (TRUST-MODEL §7 records the residual).
+#[post("/deposit/get_derived_token", format = "json", data = "<payload>")]
+pub async fn get_derived_token(
+    statechain_entity: &State<StateChainEntity>,
+    payload: Json<mercurylib::deposit::DerivedTokenRequest>,
+) -> status::Custom<Json<Value>> {
+    let config = crate::server_config::ServerConfig::load();
+    let cap = config.max_derived_tokens_per_statechain;
+
+    if cap == 0 {
+        return status::Custom(
+            Status::Forbidden,
+            Json(json!({ "message": "derived-token issuance is disabled on this server; use deposit/get_token" })),
+        );
+    }
+    let count = payload.count;
+    if count == 0 || count > cap {
+        return status::Custom(
+            Status::BadRequest,
+            Json(json!({ "message": format!("count must be between 1 and {cap}") })),
+        );
+    }
+    // Audit [26]: the same outstanding-token brake as the faucet — authenticated callers must not
+    // amplify DB writes unboundedly either.
+    if crate::database::deposit::count_unspent_tokens(&statechain_entity.pool).await
+        >= MAX_UNSPENT_TOKENS
+    {
+        return status::Custom(
+            Status::TooManyRequests,
+            Json(json!({ "message": "too many outstanding deposit tokens; consume some before requesting more" })),
+        );
+    }
+    // Owner auth: consumes the single-use nonce ONLY on a valid signature; also proves the parent
+    // statechain exists (the auth key is looked up in statechain_data). Checked BEFORE the
+    // per-parent count so an unauthenticated caller cannot probe issuance counts by statechain_id.
+    if !crate::endpoints::utils::validate_signature_nonce(
+        &statechain_entity.pool,
+        &payload.auth_sig,
+        &payload.statechain_id,
+        "deposit/get_derived_token",
+    )
+    .await
+    {
+        return status::Custom(
+            Status::Unauthorized,
+            Json(json!({ "message": "signature does not match the statechain's authentication key (fresh auth/challenge nonce required)" })),
+        );
+    }
+    // Per-parent LIFETIME allowance — fail CLOSED on a read error (audit [1] discipline).
+    let issued = match crate::database::deposit::count_derived_tokens(
+        &statechain_entity.pool,
+        &payload.statechain_id,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(_) => {
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "could not read the derived-token allowance; retry" })),
+            );
+        }
+    };
+    if issued + count as i64 > cap as i64 {
+        return status::Custom(
+            Status::TooManyRequests,
+            Json(json!({ "message": format!(
+                "statechain {} has {} of its {cap} lifetime derived tokens already issued; {count} more would exceed the allowance",
+                payload.statechain_id, issued
+            ) })),
+        );
+    }
+
+    match crate::database::deposit::insert_new_derived_tokens(
+        &statechain_entity.pool,
+        &payload.statechain_id,
+        count,
+    )
+    .await
+    {
+        Ok(token_ids) => status::Custom(
+            Status::Ok,
+            Json(json!(mercurylib::deposit::DerivedTokenResponse { token_ids })),
+        ),
+        Err(_) => status::Custom(
+            Status::ServiceUnavailable,
+            Json(json!({ "message": "could not mint derived tokens; retry" })),
+        ),
     }
 }
 

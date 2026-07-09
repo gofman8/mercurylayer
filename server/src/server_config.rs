@@ -65,6 +65,14 @@ pub struct ServerConfig {
     /// spam brake — the deposit-token *pricing* machinery is deferred until spam actually appears.
     /// Ignored when `token_server_url` is set. Default: false (mainnet refuses free tokens).
     pub free_tokens_on_mainnet: bool,
+    /// LIFETIME cap on FREE derived-slot tokens per parent statechain
+    /// (`POST /deposit/get_derived_token`). A derived slot is minted by an SE-co-signed flow over
+    /// an existing statechain (split piece+change = 2 tokens, a `transfer_many` batch N+1, a
+    /// refresh 1) and re-houses value already inside the SE, so it is not charged the on-chain
+    /// onboarding fee. The cap bounds free-slot minting per owned statechain (the blind SE cannot
+    /// see how a slot is later funded — TRUST-MODEL §7). 0 disables derived issuance entirely
+    /// (every slot then needs a normal, possibly paid, deposit token). Default: 64.
+    pub max_derived_tokens_per_statechain: u32,
 }
 
 impl Default for ServerConfig {
@@ -92,6 +100,7 @@ impl Default for ServerConfig {
             nostr_info: None,
             token_server_url: None,
             free_tokens_on_mainnet: false,
+            max_derived_tokens_per_statechain: 64,
         }
     }
 }
@@ -208,6 +217,12 @@ impl ServerConfig {
             free_tokens_on_mainnet: get_optional_env_or_config("free_tokens_on_mainnet", "FREE_TOKENS_ON_MAINNET")
                 .map(|s| s.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            max_derived_tokens_per_statechain: get_optional_env_or_config(
+                "max_derived_tokens_per_statechain",
+                "MAX_DERIVED_TOKENS_PER_STATECHAIN",
+            )
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(64),
         }
     }
 

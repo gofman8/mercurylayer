@@ -185,11 +185,14 @@ impl SparkWallet {
         let fee_reserve = split_fee_reserve(parent_sats);
         let change_sats = parent_sats - total - fee_reserve;
 
-        // One fresh slot per recipient piece + one change slot; build the N+1 plain split.
+        // One fresh slot per recipient piece + one change slot; build the N+1 plain split. All
+        // N+1 slots are DERIVED from the carrier (one free SE voucher batch, one auth nonce) —
+        // never the paid pool.
+        let mut slot_tokens = self.take_derived_tokens(&carrier_id, recipients.len() + 1).await?;
         let mut outputs: Vec<(String, u64)> = Vec::with_capacity(recipients.len() + 1);
         let mut piece_addrs: Vec<String> = Vec::with_capacity(recipients.len());
         for (_, amount) in recipients {
-            let tk = self.take_token().await?;
+            let tk = slot_tokens.remove(0);
             let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
                 &self.inner.cc,
                 &self.inner.config.wallet_name,
@@ -200,7 +203,7 @@ impl SparkWallet {
             outputs.push((addr.clone(), *amount));
             piece_addrs.push(addr);
         }
-        let change_tk = self.take_token().await?;
+        let change_tk = slot_tokens.remove(0);
         let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -339,8 +342,11 @@ impl SparkWallet {
 
         // Two fresh statechain slots owned by this wallet (SE handshake only — no on-chain tx).
         // Normal coins: sub-coin security is Mercury's decrementing-locktime scheme, with the
-        // split tx as the shared exit branch below the parent's deposit backup.
-        let token_a = self.take_token().await?;
+        // split tx as the shared exit branch below the parent's deposit backup. The slots are
+        // DERIVED (they re-house this parent's value, adding no on-chain onboarding surface), so
+        // their tokens are free SE-minted vouchers against the parent — never the paid pool.
+        let mut slot_tokens = self.take_derived_tokens(statechain_id, 2).await?;
+        let token_a = slot_tokens.remove(0);
         let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -348,7 +354,7 @@ impl SparkWallet {
             u32::try_from(piece_sats)?,
         )
         .await?;
-        let token_b = self.take_token().await?;
+        let token_b = slot_tokens.remove(0);
         let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
