@@ -2,7 +2,7 @@
 name = "mercury-ssp"
 version = "0.1.0"
 edition = "2021"
-description = "SSP (Spark Service Provider parity) HTTP service: Mercury<->Lightning swaps over an rgb-lightning-node."
+description = "SSP (Utexo Service Provider, Spark-compatible API) HTTP service: Mercury<->Lightning swaps over an rgb-lightning-node."
 
 [[bin]]
 name = "mercury-ssp"

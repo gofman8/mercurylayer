@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         sdk10_terminal_parent_verify::execute().await?;
         return Ok(());
     }
-    // Parity methods (SDK_E2E=11): identity signing, multi-recipient sats, Spark invoices, queries.
+    // Parity methods (SDK_E2E=11): identity signing, multi-recipient sats, Utexo invoices (Spark-compatible), queries.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("11") {
         sdk11_parity_methods::execute().await?;
         return Ok(());

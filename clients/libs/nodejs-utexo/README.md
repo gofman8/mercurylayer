@@ -1,6 +1,6 @@
 # @mercury/utexo-sdk (node)
 
-Spark-parity wallet SDK for node, mirroring `@buildonspark/spark-sdk`'s method surface
+Utexo wallet SDK for node (Spark-compatible API), mirroring `@buildonspark/spark-sdk`'s method surface
 (camelCase) on Mercury+RGB. It is a thin JSON-lines client over the `mercury-utexo-sdkd`
 daemon, so the complete Rust SDK — off-chain splits, branch verification, RGB validation —
 runs underneath with no protocol reimplementation in JS.

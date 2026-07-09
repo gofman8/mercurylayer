@@ -43,7 +43,7 @@ pub(crate) struct Inner {
     pub rgb: Mutex<Option<mercury_rgb::RgbWallet>>,
 }
 
-/// Spark-parity wallet on Mercury+RGB. Cheap to clone; all clones share state.
+/// Utexo wallet (Spark-compatible API) on Mercury+RGB. Cheap to clone; all clones share state.
 #[derive(Clone)]
 pub struct UtexoWallet {
     pub(crate) inner: Arc<Inner>,

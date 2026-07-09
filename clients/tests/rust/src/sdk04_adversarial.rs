@@ -1,4 +1,4 @@
-//! E2E (adversarial): SDK guard rails — the Spark-mirror negative cases the SDK itself owns.
+//! E2E (adversarial): SDK guard rails — the Utexo negative cases the SDK itself owns.
 //!
 //! 1. InsufficientBalance: transfer above balance is refused with a typed error.
 //! 2. Double-spend of a split parent: after an off-chain split, the parent coin is terminally

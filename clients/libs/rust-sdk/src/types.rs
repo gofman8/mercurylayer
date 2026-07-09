@@ -109,7 +109,7 @@ pub struct TransferQuote {
     pub note: String,
 }
 
-/// A spendable/known coin, for the query API (Spark's leaf/UTXO inventory).
+/// A spendable/known coin, for the query API (the Utexo leaf/UTXO inventory, like Spark's).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoinInfo {
     pub statechain_id: Option<String>,

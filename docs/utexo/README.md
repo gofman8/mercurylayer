@@ -1,6 +1,6 @@
-# Spark-parity on Mercury + RGB — documentation
+# Utexo on Mercury + RGB — documentation
 
-Full Spark (buildonspark) feature parity on Mercury Layer with a **single statechain entity**
+Utexo brings full Spark (buildonspark) feature parity to Mercury Layer with a **single statechain entity**
 (blind-MuSig2 2-of-2, no FROST multi-operator) and **RGB** as the token standard.
 
 ## Learn

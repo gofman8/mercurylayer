@@ -1,6 +1,6 @@
 //! # mercury-utexo-sdk
 //!
-//! Spark-parity wallet SDK for Mercury Layer statechains with RGB assets.
+//! Utexo wallet SDK (Spark-compatible API) for Mercury Layer statechains with RGB assets.
 //!
 //! The API mirrors `@buildonspark/spark-sdk` (`UtexoWallet`) on a **single-SE** Mercury backend
 //! (blind-MuSig2 2-of-2 owner+SE) with **RGB** as the token standard. Every low-level concern —

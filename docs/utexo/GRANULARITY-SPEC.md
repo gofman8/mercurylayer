@@ -1,7 +1,7 @@
 # Coin Granularity (Partial Amounts) — Normative Specification
 
-This document is the authoritative reference for **coin granularity**: how the Spark-parity SDK
-pays, splits, and books *partial amounts* — sats below a coin's size and token amounts below a
+This document is the authoritative reference for **coin granularity**: how the Utexo SDK
+(Spark-compatible API) pays, splits, and books *partial amounts* — sats below a coin's size and token amounts below a
 carrier's allocation. Requirements are numbered **GRN-REQ-n**, invariants **GRN-INV-n**, error
 semantics **GRN-ERR-n**; MUST / MUST NOT / SHOULD / MAY are RFC-2119. Items overlapping the
 system spec cite [SPEC.md](SPEC.md) (REQ-n / INV-n / ERR-n) and the invalidation spec
@@ -267,7 +267,7 @@ un-broadcast tx (transfer.rs:287-381).
   receiver books the piece as plain 1,500-sat BTC, no token event fires, and — with no RGB
   engine — `token_carrier_outpoints` is empty (tokens.rs:364-385), so NONE of the GRN-REQ-14
   carrier guards apply: the receiver can split/withdraw/exit the packaging and permanently
-  destroy the allocation. Spark addresses do not encode token capability, so a sender CANNOT
+  destroy the allocation. Utexo addresses do not encode token capability, so a sender CANNOT
   detect this. A receiver MUST have RGB configured before claiming token pieces; the consignment
   does remain in the claimed coin's backup rows, but recovery after late reconfiguration is
   untested (§11 limitation 11).

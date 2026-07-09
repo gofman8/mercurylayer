@@ -1,7 +1,7 @@
 # Old-State Invalidation — Normative Specification
 
 This document is the single authoritative reference for the old-state invalidation mechanism of
-the Mercury-Layer statechain fork (Spark parity work, `feat/spark`). It specifies *how a
+the Mercury-Layer statechain fork (Utexo, Spark-compatible API; `feat/spark`). It specifies *how a
 previously valid off-chain state is made unspendable-in-practice* when ownership moves, and what
 every party MUST do to keep that guarantee. Requirements are numbered **IVL-REQ-n**, invariants
 **IVL-INV-n**, error semantics **IVL-ERR-n**; the key words MUST / MUST NOT / SHOULD / MAY are

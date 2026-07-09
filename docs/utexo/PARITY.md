@@ -79,7 +79,7 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
    conflicting spend → SE refusal, wrong preimage).
 2. **rgb-lib-mirror** — the rgb-lib on-chain suite (issue/send/receive/witness/blinded/fail cases)
    re-expressed over statechain coins.
-3. **rgb-lib e2e over spark-layer** — issue → deposit → off-chain DAG (split/combine/transfer) →
+3. **rgb-lib e2e over utexo-layer** — issue → deposit → off-chain DAG (split/combine/transfer) →
    exit → on-chain spend round-trips.
 
 ## Docs parity (sitemap)

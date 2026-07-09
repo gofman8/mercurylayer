@@ -1,4 +1,4 @@
-//! E2E: mercury-utexo-sdk happy path — the Spark-parity UX on Mercury.
+//! E2E: mercury-utexo-sdk happy path — the Utexo UX (Spark-compatible API) on Mercury.
 //!
 //! alice deposits on-chain, then pays bob twice off-chain:
 //!   1. an exact-subset amount (native key handover, any Mercury wallet could receive it),
@@ -33,7 +33,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK01 - wallets up (alice mnemonic: {} words)", alice_mnemonic.split_whitespace().count());
 
     let bob_address = bob.get_utexo_address().await?;
-    println!("SDK01 - bob spark address: {bob_address}");
+    println!("SDK01 - bob utexo address: {bob_address}");
 
     // --- Deposit: two coins for alice (60k + 40k) --------------------------------------------
     for amount in [60_000u64, 40_000] {

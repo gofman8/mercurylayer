@@ -1,4 +1,4 @@
-# Progress tracker — Spark parity on Mercury + RGB
+# Progress tracker — Utexo (Spark-compatible API) on Mercury + RGB
 
 Working file: updated at every push so work is resumable at any point.
 Branches: mercurylayer `feat/spark` · rgb-lib `feat/spark` (both on gofman8/UTEXO-Protocol).
@@ -28,7 +28,7 @@ or ecosystem/partner (Privy, Grid, bridges, LNURL). Buildable user-facing gaps C
 |---|---|---|
 | signMessage/validate (P-B) | **DONE** | sign_message_with_identity_key / validate_… (stable identity key m/1000h/0h/0h); unit + sdk11 |
 | transferV2 multi-recipient (P-D) | **DONE** | transfer_many(recipients) — one split -> N pieces + change; sdk11 |
-| Spark invoices (P-E) | **DONE** | create_sats_invoice/create_tokens_invoice/fulfill_utexo_invoice (+ decode/expiry); unit + sdk11 |
+| Utexo invoices (P-E) | **DONE** | create_sats_invoice/create_tokens_invoice/fulfill_utexo_invoice (+ decode/expiry); unit + sdk11 |
 | get_transfers/get_transfer, list_coins (P-A) | **DONE** | wallet activity + coin inventory; sdk11 |
 | getWithdrawalFeeQuote (P-F) | **DONE** | get_withdrawal_fee_quote via electrum estimatefee; sdk11 |
 | getTokenL1Address, queryTokenTransactions (P-C) | **DONE** | get_token_l1_address / query_token_transactions; sdk11 |

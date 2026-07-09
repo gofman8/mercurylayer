@@ -1,5 +1,5 @@
-//! Spark invoices: a self-describing payment request a payer can fulfill in one call. Encodes the
-//! recipient's spark address plus the requested amount, optional asset (sats when absent), memo,
+//! Utexo invoices: a self-describing payment request a payer can fulfill in one call. Encodes the
+//! recipient's utexo address plus the requested amount, optional asset (sats when absent), memo,
 //! and expiry. Mirrors Spark's `createSatsInvoice`/`createTokensInvoice`/`fulfillUtexoInvoice`.
 
 use anyhow::{anyhow, Result};
@@ -35,7 +35,7 @@ pub fn encode_utexo_invoice(inv: &UtexoInvoice) -> Result<String> {
 pub fn decode_utexo_invoice(s: &str) -> Result<UtexoInvoice> {
     let body = s
         .strip_prefix(SCHEME)
-        .ok_or_else(|| anyhow!("not a spark invoice (missing {SCHEME} prefix)"))?;
+        .ok_or_else(|| anyhow!("not a utexo invoice (missing {SCHEME} prefix)"))?;
     let bytes = hex::decode(body).map_err(|e| anyhow!("bad invoice hex: {e}"))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -78,7 +78,7 @@ impl UtexoWallet {
         })
     }
 
-    /// Pay a Spark invoice: decode it, check expiry, and transfer the requested sats or tokens to
+    /// Pay a Utexo invoice: decode it, check expiry, and transfer the requested sats or tokens to
     /// the embedded address. Spark's `fulfillUtexoInvoice`.
     pub async fn fulfill_utexo_invoice(&self, invoice: &str) -> Result<TransferResult> {
         let inv = decode_utexo_invoice(invoice)?;

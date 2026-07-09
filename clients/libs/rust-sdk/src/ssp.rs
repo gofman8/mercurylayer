@@ -1,4 +1,4 @@
-//! SSP (Spark Service Provider parity): the Mercury↔Lightning gateway.
+//! SSP (Utexo Service Provider, a Spark-compatible gateway): the Mercury↔Lightning gateway.
 //!
 //! An SSP holds a statechain wallet and an RLN (rgb-lightning-node) Lightning node, and serves
 //! two atomic swaps:

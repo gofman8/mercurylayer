@@ -1,6 +1,6 @@
-# Mercury + RGB Spark-parity — System Specification
+# Mercury + RGB Utexo — System Specification
 
-Normative specification of the Spark-parity system built on Mercury Layer statechains with RGB
+Normative specification of the Utexo system built on Mercury Layer statechains with RGB
 assets and a single statechain entity (SE). Requirements are labelled **REQ-n**, invariants
 **INV-n**, and error semantics **ERR-n**. Each is mapped to a verifying test in
 [§12 Traceability](#12-traceability). Keywords MUST/SHOULD/MAY per RFC 2119.

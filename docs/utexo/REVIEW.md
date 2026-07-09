@@ -1,6 +1,6 @@
 # Adversarial security review
 
-An adversarial pass over the Spark-parity statechain + RGB fork, looking for behaviours the spec did
+An adversarial pass over the Utexo statechain + RGB fork, looking for behaviours the spec did
 not cover — places where a message or value can be **delayed, replayed, malformed, reordered, or
 changed** for an attacker's gain. Findings were produced by per-dimension finders reading the real
 code + the full-suite trace logs, then each was independently verified against the actual defence

@@ -1,4 +1,4 @@
-# Build plan: Spark parity on Mercury (single SE) + RGB
+# Build plan: Utexo (Spark-compatible API) on Mercury (single SE) + RGB
 
 Companion to [PARITY.md](PARITY.md). Branches: mercurylayer `feat/spark` (from `dev`),
 UTEXO-Protocol/rgb-lib `feat/spark` (from `dev`, only absolutely-necessary changes).
@@ -54,7 +54,7 @@ mint (IFA inflate), burn (IFA), balances/metadata/distribution; freeze documente
 **P6 — docs.** The sitemap in PARITY.md, mirroring docs.spark.money style (concept pages short,
 build pages code-first with expected output).
 
-**P7 — tests.** Three tracks (utexo-mirror, rgb-lib-mirror, e2e-over-spark) runnable against the
+**P7 — tests.** Three tracks (utexo-mirror, rgb-lib-mirror, e2e-over-utexo) runnable against the
 local regtest+lockbox stack; documented runner.
 
 **P8 — hardening + final parity report.**

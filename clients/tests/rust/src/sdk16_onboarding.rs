@@ -53,7 +53,7 @@ pub async fn execute() -> Result<()> {
     let start = bob.get_balance().await?;
     assert_eq!(start.available_sats, 0, "bob starts with no BTC");
     assert!(start.tokens.is_empty(), "bob starts with no tokens");
-    println!("SDK16 - bob entered the statechain with NOTHING (0 sats, 0 tokens), only a spark address");
+    println!("SDK16 - bob entered the statechain with NOTHING (0 sats, 0 tokens), only a utexo address");
 
     // The sender (alice) funds herself and issues an RGB asset to distribute.
     let t = prepaid_token(&cc).await?;

@@ -71,7 +71,7 @@
 
 ### Invoices
 
-Self-describing payment requests. An invoice encodes the recipient's spark address plus the requested
+Self-describing payment requests. An invoice encodes the recipient's utexo address plus the requested
 amount, optional asset (sats when absent), memo, and expiry, and a payer fulfills it in one call.
 
 | Method | Signature | Notes |

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_all_suites.sh — launch the full Spark-parity test matrix with trace logging.
+# run_all_suites.sh — launch the full Utexo test matrix with trace logging.
 #
 # Runs: unit tests (mercury-utexo-sdk), every SDK_E2E=N and RGB_E2E=N flow discovered in the
 # test dispatch, the RLN Lightning smoke (LN_SMOKE=1), and the upstream Mercury suite. Captures

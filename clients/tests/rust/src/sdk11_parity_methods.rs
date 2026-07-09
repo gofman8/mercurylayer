@@ -1,5 +1,5 @@
-//! E2E (parity): the newly-added Spark-parity SDK methods — identity message signing,
-//! multi-recipient sats transfer (transferV2), Spark invoices (create + fulfill), and the
+//! E2E (parity): the newly-added Utexo SDK methods (Spark-compatible API) — identity message signing,
+//! multi-recipient sats transfer (transferV2), Utexo invoices (create + fulfill), and the
 //! query/history API. Run: SDK_E2E=11 ML_NETWORK=regtest cargo run
 
 use anyhow::{anyhow, Result};
@@ -74,7 +74,7 @@ pub async fn execute() -> Result<()> {
     assert_eq!(carol.get_balance().await?.available_sats, 15_000, "carol got 15k");
     println!("SDK11 - P-D: one split -> bob 10k + carol 15k (multi-recipient)");
 
-    // --- P-E: Spark invoice create + fulfill ---------------------------------------------------
+    // --- P-E: Utexo invoice create + fulfill ---------------------------------------------------
     for _ in 0..2 {
         let t = prepaid_token(&cc).await?;
         alice.add_prepaid_token(&t).await;
@@ -88,7 +88,7 @@ pub async fn execute() -> Result<()> {
     alice.fulfill_utexo_invoice(&invoice).await?;
     assert_eq!(carol.claim().await?.claimed_transfers, 1, "carol claims the invoice payment");
     assert_eq!(carol.get_balance().await?.available_sats, 20_000, "carol 15k + 5k invoice");
-    println!("SDK11 - P-E: Spark invoice created + fulfilled (expired one refused)");
+    println!("SDK11 - P-E: Utexo invoice created + fulfilled (expired one refused)");
 
     // --- P-A/F: query API ----------------------------------------------------------------------
     let coins = alice.list_coins().await?;
@@ -102,6 +102,6 @@ pub async fn execute() -> Result<()> {
         coins.len(), transfers.len(), quote.fee_sats, quote.fee_rate_sat_vb
     );
 
-    println!("SDK11 - SUCCESS: identity signing, multi-recipient sats transfer, Spark invoices (create/fulfill/expiry), and the query/history + fee-quote API all work. Parity gaps closed.");
+    println!("SDK11 - SUCCESS: identity signing, multi-recipient sats transfer, Utexo invoices (create/fulfill/expiry), and the query/history + fee-quote API all work. Parity gaps closed.");
     Ok(())
 }

@@ -2,7 +2,7 @@
 name = "mercury-utexo-sdk"
 version = "0.1.0"
 edition = "2021"
-description = "Spark-parity wallet SDK for Mercury Layer statechains with RGB assets: frictionless deposits, off-chain transfers, exact-amount payments (off-chain split/combine), tokens, and exits."
+description = "Utexo wallet SDK (Spark-compatible API) for Mercury Layer statechains with RGB assets: frictionless deposits, off-chain transfers, exact-amount payments (off-chain split/combine), tokens, and exits."
 
 [lib]
 name = "mercury_utexo_sdk"
