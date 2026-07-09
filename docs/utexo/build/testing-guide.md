@@ -80,7 +80,7 @@ regression-clean against it.
 cargo +stable test -p mercury-utexo-sdk   # coin selection, config, doctest
 ```
 
-## Adversarial coverage map (Spark-mirror)
+## Adversarial coverage map (mirrors Spark)
 
 | Spark test theme | Covered by |
 |---|---|

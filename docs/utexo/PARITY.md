@@ -73,7 +73,7 @@ difference · **N/A** = not applicable to the single-SE / RGB design (rationale 
 
 ## Test parity (tracks)
 
-1. **Spark-mirror integration tests** — deposit (single + static-reuse + double-claim), transfer
+1. **Integration tests mirroring Spark** — deposit (single + static-reuse + double-claim), transfer
    (basic, multi-leaf, interrupt/recovery, double-claim refusal), split/combine (exact amounts),
    coop exit, unilateral exit (timelock + branch), latch/LN legs, adversarial (duplicate leaf,
    conflicting spend → SE refusal, wrong preimage).
