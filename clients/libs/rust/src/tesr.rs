@@ -60,6 +60,11 @@ pub struct TesrBundle {
     pub levels: Vec<TesrLevel>,
     /// Renewal counter at the current (deepest) level.
     pub m: u32,
+    /// The relative-timelock schedule this coin runs on (mainnet/regtest preset). Drives the
+    /// param-based cadence in [`renew_auto`] / [`rollover_auto`]; defaults to mainnet for bundles
+    /// persisted before this field existed.
+    #[serde(default)]
+    pub params: mercurylib::tesr::TesrParams,
 }
 
 impl TesrBundle {
@@ -132,7 +137,36 @@ pub async fn establish(
             state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
         }],
         m: 0,
+        params: mercurylib::tesr::TesrParams::for_network(network),
     })
+}
+
+/// Establish a coin's ladder using its network's canonical [`TesrParams`] schedule (initial extension
+/// `E0` and state `D0`), instead of hand-picked CSVs — the production entry point.
+pub async fn establish_auto(
+    cc: &ClientConfig,
+    coin: &mut Coin,
+    owner_exit_address: &str,
+    network: &str,
+) -> Result<TesrBundle> {
+    let p = mercurylib::tesr::TesrParams::for_network(network);
+    establish(cc, coin, owner_exit_address, p.ext_csv(0), p.state_csv(0), p.committed_fee_rate, network).await
+}
+
+/// Off-chain renewal at the schedule cadence: the new extension takes CSV `E0 − (m+1)·δE` and the
+/// fresh state `D0`, both from the bundle's [`TesrParams`]. Returns `true` if a rollover is due
+/// afterwards (`m` reached `m_max`), so the caller rolls over before the extension floor.
+pub async fn renew_auto(cc: &ClientConfig, coin: &mut Coin, bundle: &mut TesrBundle) -> Result<bool> {
+    let p = bundle.params;
+    let next_m = (bundle.m + 1) as u16;
+    renew(cc, coin, bundle, p.ext_csv(next_m), p.state_csv(0)).await?;
+    Ok(p.needs_rollover(bundle.m as u16))
+}
+
+/// Off-chain rollover at the schedule cadence: a fresh level with extension `E0` and state `D0`.
+pub async fn rollover_auto(cc: &ClientConfig, coin: &mut Coin, bundle: &mut TesrBundle) -> Result<()> {
+    let p = bundle.params;
+    rollover(cc, coin, bundle, p.ext_csv(0), p.state_csv(0)).await
 }
 
 /// Persist a bundle under `tesr-<statechain_id>` (replaces any prior bundle for the coin).

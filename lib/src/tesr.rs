@@ -24,6 +24,7 @@ use bitcoin::{
     sighash::{self, SighashCache, TapSighashType},
     Address, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     error::MercuryError,
@@ -64,6 +65,79 @@ pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64>
 /// disable bit (bit 31) are both clear.
 pub fn csv_blocks(blocks: u16) -> Sequence {
     Sequence(blocks as u32)
+}
+
+/// Protocol parameters for the TES-R ladder — the relative-timelock schedule the wallet uses to size
+/// each tier and to decide when to renew or roll over. Mainnet defaults are from
+/// `docs/utexo/V2-DESIGN.md` §5.2; in production the SE serves them via `/info/config` so a receiver
+/// can detect a per-victim parameter split, but they are pure protocol constants (no fund is at
+/// stake in getting them "wrong" — only exit-wait length and renewal cadence).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TesrParams {
+    /// State-tier initial CSV `D0` (blocks): the head start the current owner has over a stale state.
+    pub d0: u16,
+    /// Per-transfer state decrement `δ`.
+    pub delta: u16,
+    /// State floor `D_floor`: when the next state would fall below this, renew.
+    pub d_floor: u16,
+    /// Extension-tier initial CSV `E0`.
+    pub e0: u16,
+    /// Per-renewal extension decrement `δE`.
+    pub delta_e: u16,
+    /// Extension floor `E_floor`: when the next extension would fall below this, roll over.
+    pub e_floor: u16,
+    /// Renewals allowed before a forced rollover (never operate at the extension floor).
+    pub m_max: u16,
+    /// Committed self-funding fee rate (sat/vB) baked into each pre-signed tier tx.
+    pub committed_fee_rate: f64,
+}
+
+impl Default for TesrParams {
+    fn default() -> Self {
+        Self::mainnet()
+    }
+}
+
+impl TesrParams {
+    /// Mainnet defaults (V2-DESIGN §5.2): 36-block (~6 h) head starts, ~17 extension epochs, forced
+    /// rollover at m=15, 2 sat/vB committed fee.
+    pub fn mainnet() -> Self {
+        Self { d0: 1440, delta: 36, d_floor: 144, e0: 720, delta_e: 36, e_floor: 144, m_max: 15, committed_fee_rate: 2.0 }
+    }
+
+    /// Test-scale schedule for regtest (fast to mine a full lifecycle).
+    pub fn regtest() -> Self {
+        Self { d0: 24, delta: 6, d_floor: 6, e0: 12, delta_e: 3, e_floor: 3, m_max: 2, committed_fee_rate: 2.0 }
+    }
+
+    /// The mainnet or regtest preset for a network string (`"bitcoin"` → mainnet, else regtest).
+    pub fn for_network(network: &str) -> Self {
+        if network.eq_ignore_ascii_case("bitcoin") || network.eq_ignore_ascii_case("mainnet") {
+            Self::mainnet()
+        } else {
+            Self::regtest()
+        }
+    }
+
+    /// State CSV at state-count `k`: `D0 − k·δ`, clamped to the floor.
+    pub fn state_csv(&self, k: u16) -> u16 {
+        self.d0.saturating_sub(k.saturating_mul(self.delta)).max(self.d_floor)
+    }
+
+    /// Extension CSV at renewal epoch `m`: `E0 − m·δE`, clamped to the floor.
+    pub fn ext_csv(&self, m: u16) -> u16 {
+        self.e0.saturating_sub(m.saturating_mul(self.delta_e)).max(self.e_floor)
+    }
+
+    /// True once the NEXT state (`k+1`) would fall below the floor — renew before spending again.
+    pub fn needs_renewal(&self, k: u16) -> bool {
+        self.d0.saturating_sub(k.saturating_add(1).saturating_mul(self.delta)) < self.d_floor
+    }
+
+    /// True once the renewal budget is spent (`m ≥ m_max`) — roll over to a fresh level instead.
+    pub fn needs_rollover(&self, m: u16) -> bool {
+        m >= self.m_max
+    }
 }
 
 /// nSequence for the trigger tier: relative-timelock DISABLED, still RBF-signalling. `T` spends the
@@ -252,6 +326,38 @@ mod tests {
         assert_eq!(tier_out_value(100_000, 2.0), Some(100_000 - 248 - 240));
         // Too small → terminal dust case.
         assert_eq!(tier_out_value(300, 2.0), None);
+    }
+
+    #[test]
+    fn params_schedule_decrements_and_clamps() {
+        let p = TesrParams::mainnet();
+        // State CSV decrements by δ each transfer, clamped at the floor.
+        assert_eq!(p.state_csv(0), 1440);
+        assert_eq!(p.state_csv(1), 1440 - 36);
+        assert_eq!(p.state_csv(10_000), p.d_floor, "clamped at floor, never underflows");
+        // Extension CSV decrements by δE each renewal, clamped at the floor.
+        assert_eq!(p.ext_csv(0), 720);
+        assert_eq!(p.ext_csv(1), 720 - 36);
+        assert_eq!(p.ext_csv(10_000), p.e_floor);
+    }
+
+    #[test]
+    fn params_renewal_and_rollover_thresholds() {
+        let p = TesrParams::regtest(); // d0=24, δ=6, floor=6  → renew when next state < 6
+        // next state = d0 - (k+1)*δ ; renew when that < d_floor(6): k+1 > 3 → k >= 3.
+        assert!(!p.needs_renewal(0));
+        assert!(!p.needs_renewal(2));
+        assert!(p.needs_renewal(3), "24 - 4*6 = 0 < 6 → must renew");
+        // Rollover at the renewal cap m_max=2.
+        assert!(!p.needs_rollover(1));
+        assert!(p.needs_rollover(2));
+    }
+
+    #[test]
+    fn params_network_presets() {
+        assert_eq!(TesrParams::for_network("bitcoin"), TesrParams::mainnet());
+        assert_eq!(TesrParams::for_network("regtest"), TesrParams::regtest());
+        assert_eq!(TesrParams::for_network("signet"), TesrParams::regtest());
     }
 
     #[test]
