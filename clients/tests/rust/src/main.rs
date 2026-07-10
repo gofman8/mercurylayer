@@ -69,6 +69,7 @@ pub mod sdk38_sponsor_stiff;
 pub mod sdk39_depth2_token_exit;
 pub mod sdk40_tesr_consensus;
 pub mod sdk41_tesr_transfer;
+pub mod sdk42_tesr_lifecycle;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -313,6 +314,12 @@ async fn main() -> Result<()> {
     // the exit race and Alice cannot claw back.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("41") {
         sdk41_tesr_transfer::execute().await?;
+        return Ok(());
+    }
+    // TES-R wallet lifecycle + persistence (SDK_E2E=42): establish → renew off-chain → persist →
+    // reload from DB → unilateral exit from the reloaded bundle.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("42") {
+        sdk42_tesr_lifecycle::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
