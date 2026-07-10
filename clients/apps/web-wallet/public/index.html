@@ -23,12 +23,27 @@
         <label for="wallet-name">Wallet name</label>
         <input id="wallet-name" type="text" value="my-wallet" spellcheck="false" autocomplete="off">
         <button id="btn-create" class="btn btn-primary">Create new wallet</button>
-        <button id="btn-show-restore" class="btn btn-ghost">I have a recovery phrase</button>
+        <button id="btn-show-restore" class="btn btn-ghost">Restore an existing wallet</button>
         <div id="restore-panel" class="hidden">
-          <label for="restore-mnemonic">Recovery phrase (12 words)</label>
-          <textarea id="restore-mnemonic" rows="3" spellcheck="false" autocomplete="off"
-            placeholder="alpha bravo charlie …"></textarea>
-          <button id="btn-restore" class="btn btn-primary">Restore wallet</button>
+          <div class="tabs">
+            <button id="rtab-bundle" class="tab active">Backup file</button>
+            <button id="rtab-phrase" class="tab">Recovery phrase</button>
+          </div>
+          <div id="rpane-bundle" class="pane">
+            <p class="hint">The <b>complete</b> restore — keys plus every off-chain coin, exit branch,
+              and token seed. Choose the <code>.json</code> backup you exported from this wallet.</p>
+            <input id="restore-file" type="file" accept="application/json,.json">
+            <button id="btn-restore-bundle" class="btn btn-primary">Restore from backup</button>
+          </div>
+          <div id="rpane-phrase" class="pane hidden">
+            <label for="restore-mnemonic">Recovery phrase (12 words)</label>
+            <textarea id="restore-mnemonic" rows="3" spellcheck="false" autocomplete="off"
+              placeholder="alpha bravo charlie …"></textarea>
+            <div class="notice">The phrase alone restores <b>keys only</b>. Off-chain coins, exit
+              branches, and tokens live in this wallet's data — use a <b>backup file</b> for a full
+              restore. A phrase-only restore recovers on-chain deposits, not off-chain balances.</div>
+            <button id="btn-restore" class="btn btn-primary">Restore from phrase</button>
+          </div>
         </div>
         <p id="onboard-error" class="error hidden"></p>
       </div>
@@ -59,6 +74,7 @@
         <div class="top-right">
           <span id="net-pill" class="pill">regtest</span>
           <span id="wallet-pill" class="pill pill-dim"></span>
+          <button id="btn-backup" class="mini" title="Download a full backup of this wallet">Back up</button>
         </div>
       </header>
 
@@ -149,8 +165,12 @@
           <h3>Send</h3>
           <button class="x" data-close="modal-send">✕</button>
         </div>
-        <div id="send-form">
-          <label for="send-address">To (spark address)</label>
+        <div class="tabs">
+          <button id="stab-instant" class="tab active">Instant</button>
+          <button id="stab-onchain" class="tab">On-chain</button>
+        </div>
+        <div id="send-form" class="pane">
+          <label for="send-address">To (utexo address)</label>
           <input id="send-address" type="text" placeholder="tml1…" spellcheck="false" autocomplete="off">
           <label for="send-amount">Amount (sats)</label>
           <input id="send-amount" type="number" min="1" placeholder="15000">
@@ -158,9 +178,17 @@
           <button id="btn-do-send" class="btn btn-primary">Send</button>
           <p id="send-error" class="error hidden"></p>
         </div>
+        <div id="withdraw-form" class="pane hidden">
+          <label for="withdraw-address">To (bitcoin address)</label>
+          <input id="withdraw-address" type="text" placeholder="bcrt1…" spellcheck="false" autocomplete="off">
+          <p class="hint">Cooperative exit — every confirmed coin is swept on-chain to this address,
+            SE co-signed, no timelock wait. (Token-carrier coins are kept back automatically.)</p>
+          <button id="btn-do-withdraw" class="btn btn-primary">Withdraw all</button>
+          <p id="withdraw-error" class="error hidden"></p>
+        </div>
         <div id="send-progress" class="center hidden">
           <div class="spinner"></div>
-          <p class="hint">Signing with the statechain entity…</p>
+          <p id="send-progress-msg" class="hint">Signing with the statechain entity…</p>
         </div>
         <div id="send-done" class="center hidden">
           <div class="bigcheck">✓</div>

@@ -277,6 +277,35 @@ $('btn-restore').onclick = () => {
   createOrRestore(words);
 };
 
+// Restore sub-tabs: full backup file vs keys-only phrase.
+$('rtab-bundle').onclick = () => {
+  $('rtab-bundle').classList.add('active'); $('rtab-phrase').classList.remove('active');
+  $('rpane-bundle').classList.remove('hidden'); $('rpane-phrase').classList.add('hidden');
+};
+$('rtab-phrase').onclick = () => {
+  $('rtab-phrase').classList.add('active'); $('rtab-bundle').classList.remove('active');
+  $('rpane-phrase').classList.remove('hidden'); $('rpane-bundle').classList.add('hidden');
+};
+
+$('btn-restore-bundle').onclick = async () => {
+  const err = $('onboard-error');
+  err.classList.add('hidden');
+  const walletName = $('wallet-name').value.trim();
+  const file = $('restore-file').files[0];
+  if (!file) { err.textContent = 'Choose a backup file first.'; err.classList.remove('hidden'); return; }
+  try {
+    $('btn-restore-bundle').disabled = true;
+    const bundle = await file.text();
+    await api('/api/wallet/restore', { walletName, bundle });
+    enterHome(await api('/api/status'));
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  } finally {
+    $('btn-restore-bundle').disabled = false;
+  }
+};
+
 // ---------------------------------------------------------------- receive
 
 $('btn-receive').onclick = () => {
@@ -313,15 +342,24 @@ $('btn-gen-deposit').onclick = async () => {
   }
 };
 
-// ---------------------------------------------------------------- send
+// ---------------------------------------------------------------- send + withdraw
 
-$('btn-send').onclick = () => {
-  $('send-form').classList.remove('hidden');
+function openSend(tab = 'instant') {
   $('send-progress').classList.add('hidden');
   $('send-done').classList.add('hidden');
   $('send-error').classList.add('hidden');
+  $('withdraw-error').classList.add('hidden');
+  const onchain = tab === 'onchain';
+  $('stab-instant').classList.toggle('active', !onchain);
+  $('stab-onchain').classList.toggle('active', onchain);
+  $('send-form').classList.toggle('hidden', onchain);
+  $('withdraw-form').classList.toggle('hidden', !onchain);
   $('modal-send').classList.remove('hidden');
-};
+}
+
+$('btn-send').onclick = () => openSend('instant');
+$('stab-instant').onclick = () => openSend('instant');
+$('stab-onchain').onclick = () => openSend('onchain');
 
 $('btn-do-send').onclick = async () => {
   const address = $('send-address').value.trim();
@@ -334,6 +372,7 @@ $('btn-do-send').onclick = async () => {
     return;
   }
   $('send-form').classList.add('hidden');
+  $('send-progress-msg').textContent = 'Signing with the statechain entity…';
   $('send-progress').classList.remove('hidden');
   try {
     const res = await api('/api/send', { address, amountSats });
@@ -347,6 +386,55 @@ $('btn-do-send').onclick = async () => {
     $('send-form').classList.remove('hidden');
     err.textContent = e.message;
     err.classList.remove('hidden');
+  }
+};
+
+$('btn-do-withdraw').onclick = async () => {
+  const address = $('withdraw-address').value.trim();
+  const err = $('withdraw-error');
+  err.classList.add('hidden');
+  if (!/^(bc1|tb1|bcrt1|[13mn2])/.test(address)) {
+    err.textContent = 'That does not look like a bitcoin address.';
+    err.classList.remove('hidden');
+    return;
+  }
+  $('withdraw-form').classList.add('hidden');
+  $('send-progress-msg').textContent = 'Co-signing on-chain withdrawal…';
+  $('send-progress').classList.remove('hidden');
+  try {
+    const res = await api('/api/withdraw', { address });
+    $('send-progress').classList.add('hidden');
+    const n = (res.txids || []).length;
+    $('send-summary').textContent = n
+      ? `Withdrawn ${n} coin${n === 1 ? '' : 's'} on-chain`
+      : 'Nothing to withdraw';
+    $('send-done').classList.remove('hidden');
+    $('withdraw-address').value = '';
+    refreshAll();
+  } catch (e) {
+    $('send-progress').classList.add('hidden');
+    $('withdraw-form').classList.remove('hidden');
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  }
+};
+
+// ---------------------------------------------------------------- backup (B7)
+
+$('btn-backup').onclick = async () => {
+  try {
+    const { walletName, bundle } = await api('/api/recovery/export');
+    const blob = new Blob([bundle], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `utexo-backup-${walletName}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+    toast('Backup downloaded — store it with your recovery phrase', 'good');
+  } catch (e) {
+    toast(`Backup failed: ${e.message}`, 'bad');
   }
 };
 

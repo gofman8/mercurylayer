@@ -31,6 +31,24 @@ class UtexoWallet extends EventEmitter {
     return { wallet, mnemonic };
   }
 
+  /** Restore a wallet from a full recovery bundle (review B7) into a FRESH database. */
+  static async importRecoveryBundle(options, bundleJson) {
+    const wallet = new UtexoWallet(options);
+    await wallet._start();
+    const { mnemonic } = await wallet._call('import_recovery_bundle', {
+      wallet_name: options.walletName,
+      network: options.network || 'regtest',
+      statechain_entity_url: options.statechainEntityUrl,
+      electrum_url: options.electrumUrl,
+      database_file: options.databaseFile,
+      rgb_proxy_url: options.rgbProxyUrl,
+      rgb_data_dir: options.rgbDataDir,
+      poll_interval_secs: options.pollIntervalSecs,
+      bundle_json: bundleJson,
+    });
+    return { wallet, mnemonic };
+  }
+
   constructor(options) {
     super();
     this._options = options;
@@ -70,6 +88,8 @@ class UtexoWallet extends EventEmitter {
 
   // --- identity & balance -------------------------------------------------------------------
   getUtexoAddress() { return this._call('get_utexo_address'); }
+  /** Full backup: wallet record + all backup rows (exit ladder/branch/parents) + RGB seed (B7). */
+  exportRecoveryBundle() { return this._call('export_recovery_bundle'); }
   getIdentityPublicKey() { return this._call('get_identity_public_key'); }
   getBalance() { return this._call('get_balance'); }
   getTokenBalances() { return this._call('get_token_balances'); }

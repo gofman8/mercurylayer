@@ -93,6 +93,37 @@ async function openWallet(walletName, mnemonic) {
   return { mnemonic: out, address: state.address };
 }
 
+// Restore a wallet from a full recovery bundle (review B7) into a fresh DB, then open it. Shares
+// openWallet's config/event wiring; the only difference is UtexoWallet.importRecoveryBundle instead
+// of initialize, which recreates the wallet record AND every backup row (exit ladder/branch/parents)
+// + re-seeds the RGB engine.
+async function restoreWallet(walletName, bundleJson) {
+  if (state.wallet) throw new Error(`this instance already serves wallet '${state.walletName}' — one wallet per instance`);
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const opts = {
+    walletName,
+    network: NETWORK,
+    daemonPath: DAEMON,
+    databaseFile: path.join(DATA_DIR, `${walletName}.db`),
+    rgbDataDir: path.join(DATA_DIR, `rgb-${walletName}`),
+  };
+  if (process.env.SE_URL) opts.statechainEntityUrl = process.env.SE_URL;
+  if (process.env.ELECTRUM_URL) opts.electrumUrl = process.env.ELECTRUM_URL;
+  if (process.env.RGB_PROXY_URL) opts.rgbProxyUrl = process.env.RGB_PROXY_URL;
+  state.tokensEnabled = NETWORK === 'regtest' || !!process.env.RGB_PROXY_URL;
+
+  const { wallet } = await UtexoWallet.importRecoveryBundle(opts, bundleJson);
+  for (const ev of FORWARDED_EVENTS) wallet.on(ev, (data) => pushEvent(ev, data || {}));
+  wallet.on('daemonExit', (code) => pushEvent('DaemonExit', { code }));
+  await wallet.startBackground();
+
+  state.wallet = wallet;
+  state.walletName = walletName;
+  state.address = await wallet.getUtexoAddress();
+  fs.writeFileSync(MARKER, JSON.stringify({ walletName }));
+  return { address: state.address };
+}
+
 // Re-open the last wallet on boot so refresh/restart lands back in it.
 async function reopenLastWallet() {
   try {
@@ -140,6 +171,32 @@ function needWallet() {
   return state.wallet;
 }
 
+// ---------------------------------------------------------------------------- safe-by-default guard
+// The bridge holds the wallet keys and exposes a seed-exporting endpoint, so it MUST NOT be reachable
+// from another origin or via DNS-rebinding. The server binds loopback only; on top of that:
+//  - the Host header must be localhost/127.0.0.1 (defeats DNS-rebinding, where a malicious site
+//    resolves its own domain to 127.0.0.1 and the browser sends that domain as Host);
+//  - a cross-origin request (Origin header whose host isn't ours) is rejected (defeats a web page
+//    fetching the API / CSRF).
+// Same-origin requests from the app itself carry either no Origin (same-origin GET) or an Origin
+// matching the page, so the real UI is unaffected.
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+function hostOnly(value) {
+  if (!value) return null;
+  try { return new URL(value.includes('://') ? value : `http://${value}`).hostname.replace(/^\[|\]$/g, ''); }
+  catch { return null; }
+}
+function guardOrigin(req) {
+  const host = hostOnly(req.headers.host);
+  if (!LOCAL_HOSTS.has(host)) return `refused: Host '${req.headers.host}' is not loopback`;
+  const origin = req.headers.origin;
+  if (origin) {
+    const oh = hostOnly(origin);
+    if (!LOCAL_HOSTS.has(oh)) return `refused: cross-origin request from '${origin}'`;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------- routes
 
 async function api(req, res, url) {
@@ -161,6 +218,23 @@ async function api(req, res, url) {
       }
       const out = await openWallet(walletName, mnemonic || null);
       return json(res, 200, { walletName, ...out });
+    }
+
+    case 'POST /api/wallet/restore': {
+      const { walletName, bundle } = await readBody(req);
+      if (!walletName || !/^[a-zA-Z0-9_-]{1,40}$/.test(walletName)) {
+        return json(res, 400, { error: 'walletName: 1-40 chars, letters/digits/_/-' });
+      }
+      if (typeof bundle !== 'string' || !bundle.trim()) return json(res, 400, { error: 'bundle (recovery JSON) required' });
+      const out = await restoreWallet(walletName, bundle);
+      return json(res, 200, { walletName, ...out });
+    }
+
+    case 'GET /api/recovery/export': {
+      // Full backup (review B7): the mnemonic alone restores keys but NOT the per-coin exit material
+      // the SE cannot re-serve. This bundle carries all of it; the UI hands it to the user as a file.
+      const bundle = await needWallet().exportRecoveryBundle();
+      return json(res, 200, { walletName: state.walletName, bundle });
     }
 
     case 'GET /api/balance':
@@ -253,8 +327,12 @@ async function api(req, res, url) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
+    // Every request (static + API) must be same-origin loopback — the bridge holds keys and can
+    // export the seed; a foreign origin or rebound host is refused before any handler runs.
+    const refusal = guardOrigin(req);
+    if (refusal) return json(res, 403, { error: refusal });
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     return serveStatic(res, url.pathname);
   } catch (e) {
@@ -262,8 +340,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, async () => {
-  console.log(`web-wallet on http://localhost:${PORT} (network=${NETWORK}, data=${DATA_DIR})`);
+// Bind LOOPBACK only — never 0.0.0.0. This wallet has no network-facing auth; it is a local app.
+server.listen(PORT, '127.0.0.1', async () => {
+  console.log(`web-wallet on http://127.0.0.1:${PORT} (network=${NETWORK}, data=${DATA_DIR})`);
   console.log(`daemon: ${DAEMON}`);
   await reopenLastWallet();
 });

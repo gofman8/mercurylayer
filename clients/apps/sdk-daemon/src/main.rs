@@ -72,6 +72,20 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
         return Ok(json!({ "mnemonic": out_mnemonic }));
     }
 
+    // import_recovery_bundle also runs without a wallet (it CREATES one from a full backup — the
+    // complete recovery of local exit material the SE cannot re-serve; review B7).
+    if method == "import_recovery_bundle" {
+        let cfg = cfg_from_params(params)?;
+        let bundle = params
+            .get("bundle_json")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("bundle_json required"))?;
+        let (wallet, out_mnemonic) = UtexoWallet::import_recovery_bundle(cfg, bundle).await?;
+        let mut st = state.lock().await;
+        st.wallet = Some(wallet);
+        return Ok(json!({ "mnemonic": out_mnemonic }));
+    }
+
     let wallet = {
         let st = state.lock().await;
         st.wallet
@@ -95,6 +109,7 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
 
     Ok(match method {
         "get_utexo_address" => json!(wallet.get_utexo_address().await?),
+        "export_recovery_bundle" => json!(wallet.export_recovery_bundle().await?),
         "get_identity_public_key" => json!(wallet.get_identity_public_key().await?),
         "get_balance" => serde_json::to_value(wallet.get_balance().await?)?,
         "get_token_balances" => {
