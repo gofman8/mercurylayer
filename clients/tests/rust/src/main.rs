@@ -70,6 +70,7 @@ pub mod sdk39_depth2_token_exit;
 pub mod sdk40_tesr_consensus;
 pub mod sdk41_tesr_transfer;
 pub mod sdk42_tesr_lifecycle;
+pub mod sdk43_tesr_rollover;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -320,6 +321,10 @@ async fn main() -> Result<()> {
     // reload from DB → unilateral exit from the reloaded bundle.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("42") {
         sdk42_tesr_lifecycle::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("43") {
+        sdk43_tesr_rollover::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

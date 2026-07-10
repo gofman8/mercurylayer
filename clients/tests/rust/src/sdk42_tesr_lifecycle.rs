@@ -45,12 +45,12 @@ pub async fn execute() -> Result<()> {
     let mut bundle =
         mercuryrustlib::tesr::establish(&cc, &mut coin, &owner_exit, CSV_E, CSV_D, FEE_RATE, NETWORK).await?;
     mercuryrustlib::tesr::persist(&cc, wallet, &bundle).await?;
-    println!("SDK42 - established + persisted ladder for {sid}: T={} X={}(csv {CSV_E})", bundle.trigger.txid, bundle.extension.txid);
+    println!("SDK42 - established + persisted ladder for {sid}: T={} X={}(csv {CSV_E})", bundle.trigger.txid, bundle.current().extension.txid);
 
     // ---- 2. Off-chain renewal (lower-CSV extension), persist the updated bundle. ----
     mercuryrustlib::tesr::renew(&cc, &mut coin, &mut bundle, CSV_E_RENEWED, CSV_D).await?;
     mercuryrustlib::tesr::persist(&cc, wallet, &bundle).await?;
-    let renewed_ext_txid = bundle.extension.txid.clone();
+    let renewed_ext_txid = bundle.current().extension.txid.clone();
     println!("SDK42 - renewed off-chain (0 on-chain bytes): m={}, new X={}(csv {CSV_E_RENEWED})", bundle.m, renewed_ext_txid);
 
     // ---- 3. RELOAD from disk (as a fresh wallet session) and verify it round-trips. ----
@@ -59,26 +59,27 @@ pub async fn execute() -> Result<()> {
         .await?
         .ok_or(anyhow!("bundle did not persist"))?;
     assert_eq!(reloaded.m, 1, "reloaded bundle reflects the renewal");
-    assert_eq!(reloaded.extension.csv, Some(CSV_E_RENEWED), "reloaded extension has the renewed CSV");
-    assert_eq!(reloaded.extension.txid, renewed_ext_txid, "reloaded extension is the renewed one");
+    assert_eq!(reloaded.current().extension.csv, Some(CSV_E_RENEWED), "reloaded extension has the renewed CSV");
+    assert_eq!(reloaded.current().extension.txid, renewed_ext_txid, "reloaded extension is the renewed one");
     assert_eq!(reloaded.statechain_id, sid, "bundle keyed to the coin");
-    println!("SDK42 - ✓ bundle reloaded from DB intact (m={}, extension csv {:?})", reloaded.m, reloaded.extension.csv);
+    println!("SDK42 - ✓ bundle reloaded from DB intact (m={}, extension csv {:?})", reloaded.m, reloaded.current().extension.csv);
 
     // Un-broadcast immunity: the coin sat with a full renewed ladder, F never touched.
     assert!(!is_outpoint_spent(&cc, &f_txid, f_vout), "F still UNSPENT before exit — nothing aged");
 
-    // ---- 4. Unilateral exit purely from the RELOADED bundle. ----
-    let ext_csv = reloaded.extension.csv.unwrap();
-    let state_csv = reloaded.state.csv.unwrap();
+    // ---- 4. Unilateral exit purely from the RELOADED bundle (trigger → extension → state). ----
+    let exit_state = reloaded.current().state.clone();
+    let ext_csv = reloaded.current().extension.csv.unwrap();
+    let state_csv = reloaded.current().state.csv.unwrap();
     let _ = broadcast(&cc, &reloaded.trigger.signed_tx)?;
     let _ = mine(ext_csv as u32); // trigger confirmed + ext_csv confs
-    let _ = broadcast(&cc, &reloaded.extension.signed_tx)?;
+    let _ = broadcast(&cc, &reloaded.current().extension.signed_tx)?;
     let _ = mine(state_csv as u32); // extension confirmed + state_csv confs
-    let _ = broadcast(&cc, &reloaded.state.signed_tx)?;
+    let _ = broadcast(&cc, &exit_state.signed_tx)?;
     let _ = mine(1)?;
-    assert!(tx_exists(&cc, &reloaded.state.txid), "state confirms");
+    assert!(tx_exists(&cc, &exit_state.txid), "state confirms");
     assert!(is_outpoint_spent(&cc, &f_txid, f_vout), "F consumed by the exit");
-    assert!(wait_for_address(&cc, &owner_exit, reloaded.state.out_value as u32).await.is_ok(), "owner funded on exit");
-    println!("SDK42 - ✓ PASS: persisted V2 coin renewed off-chain, reloaded from disk, and exited ({} sat to owner)", reloaded.state.out_value);
+    assert!(wait_for_address(&cc, &owner_exit, exit_state.out_value as u32).await.is_ok(), "owner funded on exit");
+    println!("SDK42 - ✓ PASS: persisted V2 coin renewed off-chain, reloaded from disk, and exited ({} sat to owner)", exit_state.out_value);
     Ok(())
 }

@@ -31,8 +31,17 @@ pub struct TesrTier {
     pub csv: Option<u16>,
 }
 
-/// A coin's persisted TES-R ladder — everything an owner or a keyless tower needs to renew or exit
-/// the coin, held on the owner's disk (the SE never sees it). Persisted under the `tesr-<id>` key.
+/// One depth LEVEL of the ladder: an extension and the state hanging off it. For a non-final level
+/// the state is a SELF-SPLIT paying the aggregate `A` (its output hosts the next level — this is the
+/// off-chain rollover); the final level's state is the exit leg to the owner.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TesrLevel {
+    pub extension: TesrTier,
+    pub state: TesrTier,
+}
+
+/// A coin's persisted TES-R ladder — everything an owner or a keyless tower needs to renew, roll over
+/// or exit the coin, held on the owner's disk (the SE never sees it). Persisted under `tesr-<id>`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TesrBundle {
     pub version: u32,
@@ -47,21 +56,39 @@ pub struct TesrBundle {
     pub f_vout: u32,
     pub f_value: u64,
     pub trigger: TesrTier,
-    /// Current (possibly renewed) extension — replaces horizontally, lowest CSV wins.
-    pub extension: TesrTier,
-    /// Current state (exit leg to the owner).
-    pub state: TesrTier,
-    /// Renewal counter (extension epoch) and state counter and rollover depth.
+    /// One entry per rollover depth level; the LAST level's state is the exit leg to the owner.
+    pub levels: Vec<TesrLevel>,
+    /// Renewal counter at the current (deepest) level.
     pub m: u32,
-    pub k: u32,
-    pub level: u32,
 }
 
 impl TesrBundle {
-    /// The tier txs in unilateral-exit order: broadcast `trigger`, then `extension` after its CSV
-    /// blocks confirm on the trigger, then `state` after its CSV blocks confirm on the extension.
-    pub fn exit_sequence(&self) -> [&TesrTier; 3] {
-        [&self.trigger, &self.extension, &self.state]
+    /// The current (deepest) level.
+    pub fn current(&self) -> &TesrLevel {
+        self.levels.last().expect("a bundle always has >= 1 level")
+    }
+    /// Rollover depth (0 = a single level).
+    pub fn level(&self) -> u32 {
+        (self.levels.len() as u32).saturating_sub(1)
+    }
+    /// The prevout (txid, value) the current level's extension spends: the trigger at level 0, else
+    /// the previous level's self-split state.
+    fn current_parent(&self) -> (String, u64) {
+        let n = self.levels.len();
+        if n <= 1 {
+            (self.trigger.txid.clone(), self.trigger.out_value)
+        } else {
+            (self.levels[n - 2].state.txid.clone(), self.levels[n - 2].state.out_value)
+        }
+    }
+    /// All tier txs in unilateral-exit order: trigger, then (extension, state) for each level.
+    pub fn exit_tiers(&self) -> Vec<&TesrTier> {
+        let mut v = vec![&self.trigger];
+        for l in &self.levels {
+            v.push(&l.extension);
+            v.push(&l.state);
+        }
+        v
     }
 }
 
@@ -100,11 +127,11 @@ pub async fn establish(
         f_vout,
         f_value,
         trigger: TesrTier { txid: t.txid, signed_tx: t_signed, out_value: t.out_value, csv: None },
-        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e) },
-        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+        levels: vec![TesrLevel {
+            extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e) },
+            state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+        }],
         m: 0,
-        k: 0,
-        level: 0,
     })
 }
 
@@ -142,23 +169,66 @@ pub async fn renew(
     csv_e_new: u16,
     csv_d: u16,
 ) -> Result<()> {
-    let x = mercurylib::tesr::build_extension(
-        &bundle.trigger.txid,
-        bundle.trigger.out_value,
-        &bundle.agg_address,
-        &bundle.network,
-        csv_e_new,
-        bundle.fee_rate,
-    )?;
-    let x_signed = cosign_tier(cc, coin, x.tx_hex.clone(), bundle.trigger.out_value, &bundle.network).await?;
+    let (parent_txid, parent_val) = bundle.current_parent();
+    let x = mercurylib::tesr::build_extension(&parent_txid, parent_val, &bundle.agg_address, &bundle.network, csv_e_new, bundle.fee_rate)?;
+    let x_signed = cosign_tier(cc, coin, x.tx_hex.clone(), parent_val, &bundle.network).await?;
     let s = mercurylib::tesr::build_state(&x.txid, x.out_value, &bundle.owner_exit_address, &bundle.network, csv_d, bundle.fee_rate)?;
     let s_signed = cosign_tier(cc, coin, s.tx_hex.clone(), x.out_value, &bundle.network).await?;
 
-    bundle.extension = TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e_new) };
-    bundle.state = TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) };
+    let last = bundle.levels.len() - 1;
+    bundle.levels[last] = TesrLevel {
+        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e_new) },
+        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+    };
     bundle.m += 1;
-    bundle.k = 0;
     Ok(())
+}
+
+/// Off-chain ROLLOVER at epoch exhaustion: instead of an on-chain compaction, convert the current
+/// level's state into a SELF-SPLIT paying `A` and hang a FRESH level (extension + owner state) off it
+/// — a new renewal budget, unbounded off-chain depth, ZERO on-chain bytes. Persist afterwards. The
+/// only cost is +2 pre-signed txs (~248 vB) of *contingent* exit weight and +1 unilateral-exit level.
+pub async fn rollover(
+    cc: &ClientConfig,
+    coin: &mut Coin,
+    bundle: &mut TesrBundle,
+    csv_e: u16,
+    csv_d: u16,
+) -> Result<()> {
+    let cur_ext = bundle.current().extension.clone();
+    let state_csv = bundle.current().state.csv.unwrap_or(csv_d);
+
+    // 1. Re-sign the current level's state as a self-split paying A (so a child level can hang off it).
+    let s_roll = mercurylib::tesr::build_state(&cur_ext.txid, cur_ext.out_value, &bundle.agg_address, &bundle.network, state_csv, bundle.fee_rate)?;
+    let s_roll_signed = cosign_tier(cc, coin, s_roll.tx_hex.clone(), cur_ext.out_value, &bundle.network).await?;
+
+    // 2. Fresh level off the self-split output: new extension + owner-exit state.
+    let x2 = mercurylib::tesr::build_extension(&s_roll.txid, s_roll.out_value, &bundle.agg_address, &bundle.network, csv_e, bundle.fee_rate)?;
+    let x2_signed = cosign_tier(cc, coin, x2.tx_hex.clone(), s_roll.out_value, &bundle.network).await?;
+    let s2 = mercurylib::tesr::build_state(&x2.txid, x2.out_value, &bundle.owner_exit_address, &bundle.network, csv_d, bundle.fee_rate)?;
+    let s2_signed = cosign_tier(cc, coin, s2.tx_hex.clone(), x2.out_value, &bundle.network).await?;
+
+    let last = bundle.levels.len() - 1;
+    bundle.levels[last].state = TesrTier { txid: s_roll.txid, signed_tx: s_roll_signed, out_value: s_roll.out_value, csv: Some(state_csv) };
+    bundle.levels.push(TesrLevel {
+        extension: TesrTier { txid: x2.txid, signed_tx: x2_signed, out_value: x2.out_value, csv: Some(csv_e) },
+        state: TesrTier { txid: s2.txid, signed_tx: s2_signed, out_value: s2.out_value, csv: Some(csv_d) },
+    });
+    bundle.m = 0; // fresh renewal budget at the new level
+    Ok(())
+}
+
+/// Cooperative DE-TRIGGER: blind-co-sign a fresh no-timelock spend of `T.out[0]` paying `to_address`,
+/// returning the signed tx. Broadcasting it in response to a hostile trigger confirms before any
+/// pre-signed extension can mature, collapsing griefing to a priced nuisance and killing the ladder.
+pub async fn cosign_detrigger(
+    cc: &ClientConfig,
+    coin: &mut Coin,
+    bundle: &TesrBundle,
+    to_address: &str,
+) -> Result<String> {
+    let de = mercurylib::tesr::build_detrigger(&bundle.trigger.txid, bundle.trigger.out_value, to_address, &bundle.network, bundle.fee_rate)?;
+    cosign_tier(cc, coin, de.tx_hex.clone(), bundle.trigger.out_value, &bundle.network).await
 }
 
 /// Blind-co-sign one TES-R tier transaction end-to-end against the SE and return the signed tx hex.
