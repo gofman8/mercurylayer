@@ -131,6 +131,27 @@ pub async fn transfer_preimage(statechain_entity: &State<StateChainEntity>, tran
     let previous_user_auth_key = PublicKey::from_str(&previous_user_auth_key).unwrap();
     let previous_user_auth_key = previous_user_auth_key.x_only_public_key().0;
 
+    // Audit [2] (H4) completeness: refuse to release the preimage once the latch has FULLY expired.
+    // `validate_batch` closes the receiver's claim window a grace period BEFORE expiry and lets the
+    // SSP fetch the preimage right up to expiry (so an honest SSP always has time to settle after
+    // the receiver's last claim). But AFTER expiry the receiver can no longer claim at all, so
+    // handing the preimage out here would let the SSP settle the HTLC (get paid) while the coin was
+    // never transferred — the exact atomicity break the finding describes. Fail CLOSED: if the
+    // expiry cannot be read, refuse (a preimage leaked past the window is unrecoverable).
+    match crate::database::lightning_latch::get_latch_expiry_by_batch_id(&statechain_entity.pool, &batch_id).await {
+        Some(exp) if chrono::Utc::now() <= exp => {}
+        Some(_) => {
+            return status::Custom(Status::Gone, Json(json!({
+                "message": "latch has expired — the preimage is no longer released (the swap window closed)"
+            })));
+        }
+        None => {
+            return status::Custom(Status::ServiceUnavailable, Json(json!({
+                "message": "could not read latch expiry; refusing to release the preimage"
+            })));
+        }
+    }
+
     let pre_image = crate::database::lightning_latch::get_preimage(&statechain_entity.pool, &statechain_id, &previous_user_auth_key, &batch_id).await;
 
     if pre_image.is_none() {
