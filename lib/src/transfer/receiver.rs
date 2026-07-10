@@ -267,8 +267,16 @@ pub fn get_amount_from_tx0(tx0_hex: &str, tx0_outpoint: &TxOutpoint,) -> Result<
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
+/// A valid backup ladder decrements by EXACTLY `interval` per hop (INV-5 / receiver check R5): the
+/// current owner holds the lowest locktime. Returns false for a wrong gap OR a non-decreasing ladder
+/// (`checked_sub` yields `None` when `current > prev`, so a forged increasing ladder is rejected
+/// cleanly instead of underflow-panicking).
+pub fn ladder_decrements_by_interval(prev_lock_time: u32, current_lock_time: u32, interval: u32) -> bool {
+    prev_lock_time.checked_sub(current_lock_time) == Some(interval)
+}
+
 pub fn validate_signature_scheme(
-    backup_transactions: &Vec<BackupTx>, 
+    backup_transactions: &Vec<BackupTx>,
     statechain_info: &StatechainInfoResponsePayload, 
     tx0_hex: &str, 
     current_blockheight: u32,
@@ -330,7 +338,11 @@ pub fn validate_signature_scheme(
         if previous_lock_time.is_some() {
             let prev_lock_time = previous_lock_time.unwrap();
             let current_lock_time = crate::utils::get_blockheight(&backup_tx)?;
-            if (prev_lock_time - current_lock_time) as i32 != interval as i32 {
+            // Each hop's backup MUST decrement the locktime by EXACTLY `interval` (INV-5): the
+            // current owner's backup is the lowest, so a stale one matures later. `checked_sub`
+            // also rejects a non-decreasing ladder without underflow-panicking (the old
+            // `prev - current` u32 subtraction would panic in debug on a forged increasing ladder).
+            if !ladder_decrements_by_interval(prev_lock_time, current_lock_time, interval) {
                 println!("interval is not correct");
                 sig_scheme_validation = false;
                 break;
@@ -733,6 +745,24 @@ mod transfer_signature_tests {
         data.extend_from_slice(&bound_pk.serialize()[..]);
         let m = Message::from_hashed_data::<sha256::Hash>(&data);
         secp.sign_schnorr(&m, sender)
+    }
+
+    // Receiver check R5 (TRUST-MODEL §2): the backup ladder must decrement by EXACTLY the SE's
+    // interval per hop — a wrong gap (hidden intermediate owner / forged spacing) or a
+    // non-decreasing ladder is rejected, the latter without underflow-panicking.
+    #[test]
+    fn ladder_interval_check_rejects_wrong_and_increasing() {
+        use super::ladder_decrements_by_interval as ok;
+        // Exact decrement of `interval` → accepted (deployed 10, defaults 100).
+        assert!(ok(1000, 990, 10));
+        assert!(ok(10_000, 9_900, 100));
+        // Wrong gap → rejected.
+        assert!(!ok(1000, 991, 10), "9-block gap must be rejected when interval is 10");
+        assert!(!ok(1000, 980, 10), "20-block gap must be rejected when interval is 10");
+        // Equal locktimes (no decrement) → rejected.
+        assert!(!ok(1000, 1000, 10));
+        // Increasing ladder (a forged backup maturing LATER than its parent) → rejected, no panic.
+        assert!(!ok(990, 1000, 10), "an increasing ladder must be rejected cleanly (no u32 underflow panic)");
     }
 
     #[test]
