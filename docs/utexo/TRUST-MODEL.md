@@ -55,11 +55,11 @@ receiver's machine):
 
 | # | Check | Defeats | Code | Proven by |
 |---|---|---|---|---|
-| R1 | Sender's Schnorr signature binding the coin's outpoint to the receiver's new pubkey (`tx0_txid ‖ vout ‖ new_user_pubkey`) | handover messages not authorized by the coin's owner | `verify_transfer_signature` (`lib/src/transfer/receiver.rs:160-180`, checked for the index-0 backup group) | every successful claim (`sdk01` et al.); no dedicated tamper-negative yet |
+| R1 | Sender's Schnorr signature binding the coin's outpoint to the receiver's new pubkey (`tx0_txid ‖ vout ‖ new_user_pubkey`) | handover messages not authorized by the coin's owner | `verify_transfer_signature` (`lib/src/transfer/receiver.rs:160-180`, checked for the index-0 backup group) | every successful claim (`sdk01` et al.); reject paths in `unit::transfer_signature_tests` (replay-to-other-receiver, wrong-outpoint, forged-by-non-owner) |
 | R2 | The receiver's NEW share + new server share combine to the coin's on-chain aggregate pubkey (else `IncorrectAggregatedPublicKey`); sender-key/t1 supporting checks | SE or sender handing over key material that doesn't control the coin | `get_new_key_info` (`lib/src/transfer/receiver.rs:664-692`); `validate_tx0_output_pubkey`, `validate_t1pub` | every claim (`sdk01` et al.) |
 | R3 | Funding tx0 output pays the expected aggregate (`validate_tx0_output_pubkey`); outpoint **unspent** (all coins). Confirmation is a hard reject only for **exit-branch roots** (unspent **and height > 0** with ≥ `confirmation_target` — the combine-review mempool-root fix); a plain coin's claim completes and is booked `UNCONFIRMED` until `coin_status` confirms it | fake or spent funding; a sub-coin branch rooted in an unconfirmed/mempool tx | `verify_tx0_output_is_unspent_and_confirmed` (`transfer_receiver.rs:534-538`); `validate_branch` root checks (`transfer_receiver.rs:854-870, 942-947`) | every claim; `sdk31` (combine root); the height-0 branch-root path has no dedicated test yet |
 | R4 | Backup-ladder locktime in `(tip, tip + initlock]` — rejects `LocktimeTooLow` (an already-raceable floored ladder) and `LocktimeTooHigh` (a ladder locked *above* a fresh deposit's, which would overstate your safe window while ancestors' real backups matured) | being handed an **already-raceable** coin, or a forged over-long ladder | `lib/src/transfer/receiver.rs:461-466` | `SDK_E2E=35` (D2: malicious sender bypasses his own client's guard; receiver still rejects) |
-| R5 | Signature count at the SE == backup-tx count; ladder decrements exactly `interval` per hop | hidden intermediate owners; sender keeping extra co-signed states | `transfer_receiver.rs:529` (count); `validate_signature_scheme` (`lib/src/transfer/receiver.rs:330-338`) | every claim; no dedicated wrong-count/wrong-interval negative yet |
+| R5 | Signature count at the SE == backup-tx count; ladder decrements exactly `interval` per hop | hidden intermediate owners; sender keeping extra co-signed states | `transfer_receiver.rs:529` (count); `ladder_decrements_by_interval` in `validate_signature_scheme` (`lib/src/transfer/receiver.rs`) | every claim; interval reject paths in `unit::transfer_signature_tests::ladder_interval_check_rejects_wrong_and_increasing` (wrong gap, equal, increasing — no underflow panic); the count-mismatch reject remains E2E-implicit |
 | R6 | **Branch validation** (sub-coins): every branch tx consensus-valid and connected root→leaf; root input on-chain, unspent, confirmed; every branch locktime ≤ tip (INV-4); value conservation per hop (INV-25); **non-tree branches rejected** (an outpoint consumed twice) | fabricated or double-spending exit branches | `validate_branch`, `reject_non_tree_branch` | `sdk10`, `terminal_parents_tests` |
 | R7 | **Terminal ancestors** (sub-coins): one named ancestor per structural input the branch consumes (Σ inputs, so an N-carrier combine names all N), each reporting `terminal: true` at the SE | sender double-spending a branch parent via a fresh SE co-signature | `required_terminal_ancestors`, `verify_terminal_parents` | `sdk10`, `sdk31` VERIFY log |
 | R8 | **RGB consignment** fully client-validated; amount booked = what the consignment assigns to the receiver's outpoint, under the cryptographically-derived contract id | token forgery, wrong-asset or wrong-amount claims — no proxy or issuer is trusted for token *rules or amounts* (chain anchoring resolves through the wallet's indexer and inherits §4/B3) | `accept_incoming_tokens` (REQ-21/22) | `sdk02`, `rgb13` |
@@ -295,7 +295,8 @@ needed for custody**, by construction:
 - **Refresh sponsor** (`refresh_sponsored`): rebates the refresh fee off-chain *after* the
   re-anchor. A sponsor that stiffs you costs exactly `fee` sats (you keep the refreshed coin);
   the failure surfaces as an explicit error ("re-anchor succeeded but the sponsor rebate
-  failed", `refresh.rs:98-101`; `sdk30` covers the happy path — no stiffing E2E yet).
+  failed", `refresh.rs:98-101`; happy path `sdk30`, **stiffing bounded-loss `sdk38`** — a broke
+  sponsor errors while the user keeps the refreshed amount−fee coin).
 - **SSP** (Lightning): swaps are preimage-atomic (`sdk03/05/06`, adversarial `sdk18-20`) — the
   SSP is trusted for liveness and quotes, not funds.
 
@@ -330,7 +331,12 @@ relationship not listed on this page, that is a documentation bug: please open a
 | Token carrier auto-materialized before clawback deadline; issued carrier untouched | `SDK_E2E=34` |
 | Auto-refresh keeps coins off the floor invisibly; opt-out respected | `SDK_E2E=33` |
 | Terminal ancestors: per-input requirement + non-tree rejection | `sdk10`, `sdk31`, unit `terminal_parents_tests` |
-| Mempool-root (height 0) rejection for branch roots | code `transfer_receiver.rs:942-947`; no dedicated test yet |
+| SSP pre-payment value gate reads TRUE coin value ([3] SATS branch-validated peek, [4] RGB consignment-derived amount) | `sdk37`; `sdk20` (SATS gate through real `execute_pay` + RLN) |
+| Transfer-signature (R1) + ladder-interval (R5) reject paths | `unit::transfer_signature_tests` |
+| Sponsored-refresh bounded loss (stiffing sponsor → user keeps refreshed coin) | `sdk38` |
+| Depth-2 colored sub-coin exits on-chain, allocation preserved | `sdk39` |
+| Mempool-root (height 0) rejection for branch roots | code `transfer_receiver.rs:942-947`; **RESIDUAL — no E2E**: an honest SDK flow cannot produce a 0-conf branch root (splitting needs a confirmed parent); reaching it requires a forged transfer message, so only the confirmed-root positive (`sdk31`) is exercised |
+| SSP RGB pay through Lightning ([4] gate wiring end-to-end) | **RESIDUAL — no E2E**: needs the (unimplemented) cross-rail RGB latch bridge; the gate's validation logic is proven by `sdk37` and its SATS wiring by `sdk20` |
 | SE nonce atomicity (no double-sign behind the receiver's back) | `sdk12` |
 | Fresh double-sign trust floor — an SE *willing* to double-sign creates a race (the honest counter-example) | `sdk15` |
 | SE refusal ≠ seizure (unilateral exit without SE) | `sdk07`, `sdk08` |

@@ -398,8 +398,10 @@ You hold 10 units on a 1,500-sat piece (depth d); the SE stops answering.
    cooperative spends resume. If it never does, the plain backup can reclaim ≈ 1,388 sats after
    the leaf-ladder wait — at the price of abandoning the allocation (no colored unilateral exit
    is shipped; §4). **Outcome:** the token state is secured unilaterally and permanently; only
-   *onward movement* of the settled allocation still wants a live SE today. (No E2E yet covers
-   a depth ≥ 2 token exit end-to-end — flagged as a test gap.)
+   *onward movement* of the settled allocation still wants a live SE today. (A depth-2 colored exit
+   is verified end-to-end by `SDK_E2E=39`: two successive token transfers build a piece whose exit
+   branch is `[split1, split2]`, and broadcasting both root-first materializes the whole chain
+   on-chain with the allocation preserved.)
 
 ### 5.7 The change coin after the token is fully spent
 
