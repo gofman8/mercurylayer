@@ -11,7 +11,10 @@ use std::time::Duration;
 
 const BITCOIND_RPC_USER: &str = "user";
 const BITCOIND_RPC_PASSWORD: &str = "password";
-const BITCOIND_RPC_HOST: &str = "localhost";
+// Force IPv4: on macOS "localhost" resolves to ::1 (IPv6) first, and bitcoind's rpcallowip only
+// permits the IPv4 docker gateway, so an IPv6 connection is rejected 403 (FailedBitcoindConnection).
+// This was the entire-LN-suite blocker; 127.0.0.1 pins the working IPv4 path.
+const BITCOIND_RPC_HOST: &str = "127.0.0.1";
 const BITCOIND_RPC_PORT: u16 = 18443;
 const INDEXER_URL: &str = "127.0.0.1:50001";
 const PROXY_ENDPOINT: &str = "rpc://127.0.0.1:3000/json-rpc";
