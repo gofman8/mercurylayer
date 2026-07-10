@@ -34,7 +34,7 @@ const COIN_SAT: u32 = 100_000;
 const CSV_E: u16 = 4; // extension relative-timelock (blocks)
 const CSV_D: u16 = 6; // state relative-timelock (blocks)
 
-async fn wait_for_address(cc: &ClientConfig, address: &str, amount: u32) -> Result<()> {
+pub(crate) async fn wait_for_address(cc: &ClientConfig, address: &str, amount: u32) -> Result<()> {
     for _ in 0..60 {
         if electrs::check_address(cc, address, amount).await? {
             return Ok(());
@@ -45,7 +45,7 @@ async fn wait_for_address(cc: &ClientConfig, address: &str, amount: u32) -> Resu
 }
 
 /// True iff `txid:vout` is no longer in the UTXO set (i.e. it has been spent / never existed unspent).
-fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
+pub(crate) fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
     use electrum_client::bitcoin::Txid;
     let raw = match cc.electrum_client.transaction_get_raw(&Txid::from_str(txid).unwrap()) {
         std::result::Result::Ok(r) => r,
@@ -58,17 +58,17 @@ fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
     !listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout)
 }
 
-fn tx_exists(cc: &ClientConfig, txid: &str) -> bool {
+pub(crate) fn tx_exists(cc: &ClientConfig, txid: &str) -> bool {
     use electrum_client::bitcoin::Txid;
     cc.electrum_client.transaction_get_raw(&Txid::from_str(txid).unwrap()).is_ok()
 }
 
-fn broadcast(cc: &ClientConfig, tx_hex: &str) -> Result<String> {
+pub(crate) fn broadcast(cc: &ClientConfig, tx_hex: &str) -> Result<String> {
     let raw = hex::decode(tx_hex)?;
     Ok(cc.electrum_client.transaction_broadcast_raw(&raw)?.to_string())
 }
 
-fn mine(n: u32) -> Result<()> {
+pub(crate) fn mine(n: u32) -> Result<()> {
     let core = bitcoin_core::getnewaddress()?;
     let _ = bitcoin_core::generatetoaddress(n, &core)?;
     thread::sleep(Duration::from_millis(500));
@@ -76,7 +76,7 @@ fn mine(n: u32) -> Result<()> {
 }
 
 /// Deposit a fresh statechain coin of `COIN_SAT` to a new wallet; return its confirmed `Coin` (F).
-async fn deposit_coin(cc: &ClientConfig, wallet_name: &str) -> Result<Coin> {
+pub(crate) async fn deposit_coin(cc: &ClientConfig, wallet_name: &str) -> Result<Coin> {
     let wallet = mercuryrustlib::wallet::create_wallet(wallet_name, cc).await?;
     mercuryrustlib::sqlite_manager::insert_wallet(&cc.pool, &wallet).await?;
     let token = mercuryrustlib::deposit::get_token(cc).await?;
