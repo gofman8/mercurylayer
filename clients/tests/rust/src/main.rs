@@ -65,6 +65,8 @@ pub mod sdk34_token_watchtower;
 pub mod sdk35_trust_boundaries;
 pub mod sdk36_derived_tokens;
 pub mod sdk37_ssp_value_gate;
+pub mod sdk38_sponsor_stiff;
+pub mod sdk39_depth2_token_exit;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -285,6 +287,18 @@ async fn main() -> Result<()> {
     // validate_pending_token derives the true consignment asset/amount [4] — over SE+RGB, no RLN.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("37") {
         sdk37_ssp_value_gate::execute().await?;
+        return Ok(());
+    }
+    // Sponsored-refresh bounded loss (SDK_E2E=38): a broke sponsor makes refresh_sponsored error
+    // but the user keeps the refreshed amount-fee coin.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("38") {
+        sdk38_sponsor_stiff::execute().await?;
+        return Ok(());
+    }
+    // Depth-2 token exit (SDK_E2E=39): a token piece two colored-splits deep materializes on-chain,
+    // preserving the RGB allocation.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("39") {
+        sdk39_depth2_token_exit::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
