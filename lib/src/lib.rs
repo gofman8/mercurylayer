@@ -4,6 +4,7 @@ pub mod withdraw;
 pub mod wallet;
 pub mod utils;
 pub mod transaction;
+pub mod tesr;
 pub mod unifii_interface;
 pub mod error;
 

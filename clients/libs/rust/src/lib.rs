@@ -5,6 +5,7 @@ pub mod deposit;
 pub mod lightning_latch;
 pub mod rgb;
 pub mod sqlite_manager;
+pub mod tesr;
 pub mod transaction;
 pub mod transfer_receiver;
 pub mod transfer_sender;

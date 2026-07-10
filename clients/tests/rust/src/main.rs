@@ -67,6 +67,7 @@ pub mod sdk36_derived_tokens;
 pub mod sdk37_ssp_value_gate;
 pub mod sdk38_sponsor_stiff;
 pub mod sdk39_depth2_token_exit;
+pub mod sdk40_tesr_consensus;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -299,6 +300,12 @@ async fn main() -> Result<()> {
     // preserving the RGB allocation.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("39") {
         sdk39_depth2_token_exit::execute().await?;
+        return Ok(());
+    }
+    // TES-R (Utexo V2) consensus core (SDK_E2E=40): un-broadcast immunity, CSV enforcement, full
+    // unilateral exit, and cooperative de-trigger — co-signed by the unchanged blind SE.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("40") {
+        sdk40_tesr_consensus::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
