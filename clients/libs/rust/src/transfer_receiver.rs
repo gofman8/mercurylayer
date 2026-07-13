@@ -586,7 +586,23 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             return Err(anyhow::anyhow!("Latest Backup Tx does not pay to the expected public key".to_string()));
         }
 
-        if statechain_info.num_sigs != transfer_msg.backup_transactions.len() as u32 {
+        if transfer_msg.protocol_version >= 2 {
+            // TES-R (Utexo V2) coin: verify the conveyed exit ladder and its EXACT sig-count via the
+            // R′ verifier (crate::tesr::verify_bundle), which enforces
+            // `se_num_sigs == v1_backups + tier_count` (no hidden co-signed state) plus a valid exit
+            // chain — the V2 analogue of the flat V1 backup-count linchpin below.
+            let ladder = transfer_msg
+                .tesr_ladder
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("v2 transfer is missing its TES-R ladder"))?;
+            let bundle: crate::tesr::TesrBundle = serde_json::from_str(ladder)
+                .map_err(|e| anyhow::anyhow!("malformed TES-R ladder: {e}"))?;
+            crate::tesr::verify_bundle(
+                &bundle,
+                statechain_info.num_sigs,
+                transfer_msg.backup_transactions.len() as u32,
+            )?;
+        } else if statechain_info.num_sigs != transfer_msg.backup_transactions.len() as u32 {
             return Err(anyhow::anyhow!("num_sigs is not correct".to_string()));
         }
 

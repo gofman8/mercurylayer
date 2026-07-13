@@ -734,6 +734,8 @@ mod transfer_signature_tests {
             user_public_key: PublicKey::from_keypair(sender).to_string(),
             branch_txs: vec![],
             terminal_parents: vec![],
+            protocol_version: 0,
+            tesr_ladder: None,
         }
     }
 

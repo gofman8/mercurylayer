@@ -109,6 +109,15 @@ pub struct TransferMsg {
     /// ancestor and invalidate the branch. Empty for ordinary on-chain coins.
     #[serde(default)]
     pub terminal_parents: Vec<String>,
+    /// TES-R (Utexo V2) protocol version of this transfer. `0`/absent = V1 (the flat backup-count
+    /// check). When `>= 2` the receiver verifies the conveyed exit ladder and its exact sig-count
+    /// instead. serde-default keeps the message wire-compatible with V1 wallets.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// JSON-serialized TES-R exit ladder (`mercuryrustlib::tesr::TesrBundle`) conveyed for R′
+    /// verification; present only when `protocol_version >= 2`.
+    #[serde(default)]
+    pub tesr_ladder: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

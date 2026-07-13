@@ -56,6 +56,8 @@ fn ffi_to_transfer_msg(ffi_msg: FFITransferMsg) -> Result<TransferMsg, MercuryEr
         user_public_key: ffi_msg.user_public_key,
         branch_txs: Vec::new(),
         terminal_parents: Vec::new(),
+        protocol_version: 0,
+        tesr_ladder: None,
     })
 }
 
