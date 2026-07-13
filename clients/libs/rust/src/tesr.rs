@@ -325,6 +325,176 @@ pub fn watch_pass(cc: &ClientConfig, bundle: &TesrBundle) -> Vec<String> {
     acted
 }
 
+fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
+    use electrum_client::bitcoin::Network;
+    match network.to_ascii_lowercase().as_str() {
+        "bitcoin" | "mainnet" => Network::Bitcoin,
+        "testnet" => Network::Testnet,
+        "signet" => Network::Signet,
+        _ => Network::Regtest,
+    }
+}
+
+/// **Receiver R′ verification (V2-DESIGN §5.11).** Soundly verify a conveyed TES-R ladder before
+/// accepting a coin: it must be a valid unilateral-exit chain over the on-chain funding UTXO `F`, and
+/// the SE's PUBLIC finalized-signature count must EXACTLY account for its tiers (plus any pre-TES-R
+/// V1 backups). Exact equality is the linchpin — it makes a hidden extra co-signed state (a
+/// double-spend the receiver can't see) impossible, and prevents padding the ladder with junk. Checks:
+///   1. the trigger spends `F` (no relative-timelock) and pays the aggregate key `A`;
+///   2. every later tier spends its parent's `out[0]`, carries a BIP-68 block CSV within the coin's
+///      schedule bounds, and pays `A` — except the final state, which pays the owner;
+///   3. `se_num_sigs == v1_backups + <number of tiers>`.
+/// This is a PURE function (no network) so it is unit-testable and reusable by the transfer receiver.
+pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction, Txid};
+
+    let net = net_from_str(&bundle.network);
+    let spk_of = |addr: &str| -> Result<_> {
+        Ok(Address::from_str(addr)
+            .map_err(|_| anyhow::anyhow!("bad address {addr}"))?
+            .require_network(net)
+            .map_err(|_| anyhow::anyhow!("address {addr} wrong network"))?
+            .script_pubkey())
+    };
+    let agg_spk = spk_of(&bundle.agg_address)?;
+    let owner_spk = spk_of(&bundle.owner_exit_address)?;
+
+    let tiers = bundle.exit_tiers(); // [trigger, ext0, state0, ext1, state1, ...]
+    if tiers.len() < 3 || (tiers.len() - 1) % 2 != 0 {
+        return Err(anyhow::anyhow!("malformed ladder: expected trigger + N*(extension,state)"));
+    }
+
+    let txs: Vec<Transaction> = tiers
+        .iter()
+        .map(|t| {
+            let raw = hex::decode(&t.signed_tx).map_err(|_| anyhow::anyhow!("bad tier hex"))?;
+            deserialize::<Transaction>(&raw).map_err(|_| anyhow::anyhow!("bad tier tx"))
+        })
+        .collect::<Result<_>>()?;
+
+    // 1. Trigger spends F and pays A.
+    let t = &txs[0];
+    if t.input.len() != 1
+        || t.input[0].previous_output.txid != Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?
+        || t.input[0].previous_output.vout != bundle.f_vout
+    {
+        return Err(anyhow::anyhow!("trigger does not spend the funding UTXO F"));
+    }
+    if t.output.is_empty() || t.output[0].script_pubkey != agg_spk {
+        return Err(anyhow::anyhow!("trigger does not pay the aggregate key A"));
+    }
+
+    // 2. Each later tier spends its parent's out[0], within schedule bounds, paying A (or owner if final).
+    let p = &bundle.params;
+    for i in 1..txs.len() {
+        let tx = &txs[i];
+        if tx.input.len() != 1
+            || tx.input[0].previous_output.txid != txs[i - 1].txid()
+            || tx.input[0].previous_output.vout != 0
+        {
+            return Err(anyhow::anyhow!("tier {i} does not spend its parent's output"));
+        }
+        let seq = tx.input[0].sequence.0;
+        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+            return Err(anyhow::anyhow!("tier {i} is not a BIP-68 block relative-timelock"));
+        }
+        let csv = seq as u16;
+        let is_extension = i % 2 == 1;
+        let (lo, hi) = if is_extension { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+        if csv < lo || csv > hi {
+            return Err(anyhow::anyhow!("tier {i} CSV {csv} outside schedule bounds [{lo},{hi}]"));
+        }
+        let is_final = i == txs.len() - 1;
+        let want = if is_final { &owner_spk } else { &agg_spk };
+        if tx.output.is_empty() || &tx.output[0].script_pubkey != want {
+            return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
+        }
+    }
+
+    // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for the ladder.
+    let expected = v1_backups + tiers.len() as u32;
+    if se_num_sigs != expected {
+        return Err(anyhow::anyhow!(
+            "num_sigs mismatch: SE issued {se_num_sigs}, ladder+backups account for {expected} — possible hidden state"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    const AGG: &str = "bcrt1p83afnxgnczlsqvd20swjlnr3kcm7hvz9p338dgueetjz2tx6vvjs05rsfy";
+    const OWNER: &str = "bcrt1qv23qwf82jw5k68juxnlxx06yz8plu0mrfrqvws";
+    const F_TXID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    // A schedule-conformant single-level bundle (unsigned tiers — verify_bundle checks structure).
+    fn sample_bundle() -> TesrBundle {
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let f_value = 100_000u64;
+        let t = mercurylib::tesr::build_trigger(F_TXID, 0, f_value, AGG, "regtest", p.committed_fee_rate).unwrap();
+        let x = mercurylib::tesr::build_extension(&t.txid, t.out_value, AGG, "regtest", p.ext_csv(0), p.committed_fee_rate).unwrap();
+        let s = mercurylib::tesr::build_state(&x.txid, x.out_value, OWNER, "regtest", p.state_csv(0), p.committed_fee_rate).unwrap();
+        TesrBundle {
+            version: 1, statechain_id: "sid".into(), network: "regtest".into(),
+            fee_rate: p.committed_fee_rate, agg_address: AGG.into(), owner_exit_address: OWNER.into(),
+            f_txid: F_TXID.into(), f_vout: 0, f_value,
+            trigger: TesrTier { txid: t.txid, signed_tx: t.tx_hex, out_value: t.out_value, csv: None },
+            levels: vec![TesrLevel {
+                extension: TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)) },
+                state: TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)) },
+            }],
+            m: 0, params: p,
+        }
+    }
+
+    #[test]
+    fn accepts_a_sound_ladder() {
+        let b = sample_bundle();
+        // trigger + extension + state = 3 tiers, 0 V1 backups.
+        assert!(verify_bundle(&b, 3, 0).is_ok());
+    }
+
+    #[test]
+    fn rejects_hidden_extra_sig() {
+        let b = sample_bundle();
+        // SE issued one MORE sig than the ladder accounts for → a hidden state → reject.
+        assert!(verify_bundle(&b, 4, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_undercount() {
+        let b = sample_bundle();
+        assert!(verify_bundle(&b, 2, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_broken_prevout_link() {
+        let mut b = sample_bundle();
+        // Point the extension at the wrong parent by corrupting the trigger txid it references:
+        // rebuild the extension off a bogus parent.
+        let p = b.params;
+        let bogus = mercurylib::tesr::build_extension(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            b.trigger.out_value, AGG, "regtest", p.ext_csv(0), p.committed_fee_rate,
+        ).unwrap();
+        b.levels[0].extension = TesrTier { txid: bogus.txid, signed_tx: bogus.tx_hex, out_value: bogus.out_value, csv: Some(p.ext_csv(0)) };
+        assert!(verify_bundle(&b, 3, 0).is_err(), "extension not linked to the trigger must be rejected");
+    }
+
+    #[test]
+    fn rejects_final_state_not_paying_owner() {
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let mut b = sample_bundle();
+        // Rebuild the final state paying A instead of the owner.
+        let x = &b.levels[0].extension;
+        let s = mercurylib::tesr::build_state(&x.txid, x.out_value, AGG, "regtest", p.state_csv(0), p.committed_fee_rate).unwrap();
+        b.levels[0].state = TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)) };
+        assert!(verify_bundle(&b, 3, 0).is_err(), "final state must pay the owner");
+    }
+}
+
 /// Blind-co-sign one TES-R tier transaction end-to-end against the SE and return the signed tx hex.
 ///
 /// * `unsigned_tx_hex` — a tier tx built by `mercurylib::tesr::build_{trigger,extension,state}`.
