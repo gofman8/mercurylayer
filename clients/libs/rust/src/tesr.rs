@@ -5,7 +5,10 @@
 //! same MuSig2 flow as a V1 backup. This module wires [`mercurylib::tesr::cosign_tier_request`] into
 //! that round-trip and returns the fully-signed, broadcast-ready tier tx.
 
+use std::str::FromStr;
+
 use anyhow::Result;
+use electrum_client::ElectrumApi;
 use mercurylib::{
     tesr::cosign_tier_request,
     transaction::{create_signature, new_backup_transaction},
@@ -263,6 +266,63 @@ pub async fn cosign_detrigger(
 ) -> Result<String> {
     let de = mercurylib::tesr::build_detrigger(&bundle.trigger.txid, bundle.trigger.out_value, to_address, &bundle.network, bundle.fee_rate)?;
     cosign_tier(cc, coin, de.tx_hex.clone(), bundle.trigger.out_value, &bundle.network).await
+}
+
+/// True iff `txid` is known to the chain backend (confirmed or in mempool).
+fn tx_known(cc: &ClientConfig, txid: &str) -> bool {
+    match electrum_client::bitcoin::Txid::from_str(txid) {
+        Ok(t) => cc.electrum_client.transaction_get_raw(&t).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// True iff `txid:vout` is no longer unspent (its funding UTXO has been consumed).
+fn outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
+    let t = match electrum_client::bitcoin::Txid::from_str(txid) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let raw = match cc.electrum_client.transaction_get_raw(&t) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let tx: electrum_client::bitcoin::Transaction = match electrum_client::bitcoin::consensus::deserialize(&raw) {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    let spk = &tx.output[vout as usize].script_pubkey;
+    let listed = cc.electrum_client.script_list_unspent(spk).unwrap_or_default();
+    !listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout)
+}
+
+/// **WatchBundle v2 (keyless watchtower).** One reactive pass: if the coin's funding UTXO `F` has
+/// been spent — i.e. someone broadcast the trigger — drive the OWNER's unilateral exit by
+/// broadcasting each pre-signed tier in order as its relative-timelock matures. Keyless: it holds
+/// only the pre-signed [`TesrBundle`] (every tier pays the owner) and NEVER co-signs, so a delegated
+/// tower can defend an offline owner without any key material. Idempotent — call once per new block
+/// from a tower loop; already-confirmed tiers are skipped and a not-yet-mature tier just retries next
+/// pass. Returns the tier txids broadcast this pass.
+pub fn watch_pass(cc: &ClientConfig, bundle: &TesrBundle) -> Vec<String> {
+    // Defend only once the coin has actually been triggered on-chain — an idle un-broadcast coin
+    // never ages, so there is nothing to do until F is spent.
+    if !outpoint_spent(cc, &bundle.f_txid, bundle.f_vout) {
+        return vec![];
+    }
+    let mut acted = Vec::new();
+    for tier in bundle.exit_tiers() {
+        if tx_known(cc, &tier.txid) {
+            continue; // already on-chain / in mempool
+        }
+        let raw = match hex::decode(&tier.signed_tx) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        match cc.electrum_client.transaction_broadcast_raw(&raw) {
+            Ok(_) => acted.push(tier.txid.clone()),
+            Err(_) => break, // CSV not met yet / parent unconfirmed — retry on the next pass
+        }
+    }
+    acted
 }
 
 /// Blind-co-sign one TES-R tier transaction end-to-end against the SE and return the signed tx hex.
