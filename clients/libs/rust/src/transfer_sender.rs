@@ -276,7 +276,18 @@ pub async fn execute(
         .map(|txs| txs.iter().map(|b| b.tx.clone()).collect())
         .unwrap_or_default();
 
-    let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs, &terminal_parents)?;
+    // TES-R (Utexo V2): if this coin has a persisted exit ladder, convey it so the receiver can run
+    // the R′ verification (crate::tesr::verify_bundle) instead of the flat V1 backup-count check.
+    // Absent (an ordinary V1 coin) → protocol_version 0, and the receiver takes the V1 path.
+    let (protocol_version, tesr_ladder) = match crate::tesr::load(client_config, wallet_name, &statechain_id).await {
+        Ok(Some(bundle)) => match serde_json::to_string(&bundle) {
+            Ok(json) => (2u32, Some(json)),
+            Err(_) => (0u32, None),
+        },
+        _ => (0u32, None),
+    };
+
+    let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs, &terminal_parents, protocol_version, tesr_ladder)?;
 
     let endpoint = client_config.statechain_entity.clone();
     let path = "transfer/update_msg";

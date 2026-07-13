@@ -107,13 +107,13 @@ pub fn create_transfer_signature(recipient_address: &str, input_txid: &str, inpu
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin, transfer_signature: &str, backup_transactions: &Vec<BackupTx>) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
-    create_transfer_update_msg_with_branch(x1, recipient_address, coin, transfer_signature, backup_transactions, &Vec::new(), &Vec::new())
+    create_transfer_update_msg_with_branch(x1, recipient_address, coin, transfer_signature, backup_transactions, &Vec::new(), &Vec::new(), 0, None)
 }
 
 /// Like [`create_transfer_update_msg`] but attaching an exit branch (fully-signed raw txs hex,
 /// root-first) and the `terminal_parents` (ancestor statechain ids the receiver must verify are
 /// terminal at the SE) for a coin whose funding tx is un-broadcast — an off-chain sub-coin.
-pub fn create_transfer_update_msg_with_branch(x1: &str, recipient_address: &str, coin: &Coin, transfer_signature: &str, backup_transactions: &Vec<BackupTx>, branch_txs: &Vec<String>, terminal_parents: &Vec<String>) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
+pub fn create_transfer_update_msg_with_branch(x1: &str, recipient_address: &str, coin: &Coin, transfer_signature: &str, backup_transactions: &Vec<BackupTx>, branch_txs: &Vec<String>, terminal_parents: &Vec<String>, protocol_version: u32, tesr_ladder: Option<String>) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
 
     let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;  
 
@@ -137,8 +137,8 @@ pub fn create_transfer_update_msg_with_branch(x1: &str, recipient_address: &str,
         user_public_key: client_public_key,
         branch_txs: branch_txs.to_owned(),
         terminal_parents: terminal_parents.to_owned(),
-        protocol_version: 0,
-        tesr_ladder: None,
+        protocol_version,
+        tesr_ladder,
     };
 
     let transfer_msg_json = json!(&transfer_msg);
