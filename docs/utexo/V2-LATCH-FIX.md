@@ -38,27 +38,45 @@ gates receiver progress on the preimage); (B) is pure client.
 > `tesr_ladder` field" construction was unbuildable — the whole `TransferMsg` is one opaque ECIES blob the
 > server cannot parse.
 
-### 2.1 Withhold the WHOLE message until unlock [S1]
+> **Revised per confirmation review (round 4): C1 SSP descriptor, polarity, plain-batch belt applied.**
+
+### 2.1 Withhold the WHOLE message until unlock [S1] + a pre-pay coin descriptor for the SSP [C1]
 The whole `TransferMsg { …, tesr_ladder }` is ECIES-encrypted to the receiver's auth key as **one opaque
 blob** (`lib/src/transfer/sender.rs:132-151`); the server stores/serves exactly that ciphertext
 (`get_statechain_transfer_messages` → `get_msg_addr:108-116`) and cannot decrypt or drop a field. So the
 gate is **whole-message withholding**: `get_msg_addr` joins `statechain_transfer → lightning_latch` and,
-for any coin whose latch is **live and not yet `locked2`**, withholds the *entire* `encrypted_transfer_msg`;
-it serves the blob only once `locked2` is set. Gate strictly on **`locked2`**, NOT on
-`is_all_coins_unlocked` (which requires the receiver to have already decrypted the msg to clear `locked` —
-circular, and would deadlock the external latch). Commit ⇒ receiver fetches the msg, adopts `S'`,
-finalizes. Rollback ⇒ receiver never fetched the msg ⇒ never holds `S'`.
+for any coin whose latch is **live and un-committed, withholds the entire `encrypted_transfer_msg` while
+`locked2 == true`**, serving it **iff `locked2 == false`** (the commit path clears `locked2=false`;
+`insert_new_transfer` sets `locked2 = is_lightning_latch = true`, `transfer_sender.rs:99-100`; withhold
+*during* lock, serve *after* commit — never the inverse). Gate on `locked2` only, NOT
+`is_all_coins_unlocked` (circular — it needs the decrypted msg to clear `locked`, deadlocking the latch).
+
+**SSP pre-payment descriptor [C1 — resolves the pay-invoice deadlock].** In the pay-invoice swap the SSP
+**is** the receiver and must run its mandatory value/asset gate (`execute_pay` → `peek_pending_transfers`
+→ `get_msg_addr`, audit [3]/[4]) BEFORE it pays and BEFORE commit — but whole-message withholding hides
+the coin from that peek. Resolution: the sender also posts an **owner-signed coin descriptor**
+`{statechain_id, batch_id, funding_amount, recipient_pubkey, rgb_consignment?}` signed by the sender's
+auth key, served pre-commit via a new `/transfer/coin_descriptor/<batch_id>` (or an extra field on
+`batch_statechains`). The SSP validates value ≥ invoice + recipient == its key + consignment against the
+descriptor and pays; the descriptor carries **no `tesr_ladder`/`S'`**, so it is not a broadcastable claim.
+The full msg (with `S'`) is released only at commit, giving the SSP its unilateral-exit ladder *after*
+paying. **Trust note:** the SSP's pre-pay guarantee is value+recipient+consignment (owner-signed) plus
+SE-liveness for the post-commit ladder — acceptable because the SSP is the operator-aligned swap
+counterparty, not an arbitrary user; a fully-trustless receiver would need an adaptor-signature on `S'`
+(out of scope, tracked as a future hardening). The descriptor is amount/recipient/consignment only — it
+reveals nothing the `batch_statechains` mapping doesn't already, and no pre-signed state.
 
 Because the server cannot tell a V1 blob from a V2 blob (both opaque), add a **plaintext
-`protocol_version` marker** to the `transfer_update_msg` upload so the gate scopes to V2 only; absent that,
-accept that V1-latch msgs are *also* withheld until `locked2` and carry a **V1-latch regression test**
-proving the classic swap still completes (the V1 receiver re-polls `get_msg_addr` post-unlock — confirm
-`execute()` does). A withheld-msg receiver's `validate_encrypted_message` simply errors "missing TES-R
-ladder" and waits (`clients/libs/rust/src/transfer_receiver.rs:597`) — "nothing but wait" holds; the old
-"V1 fields harmlessly served" premise is deleted. A V2 transfer with **no** latch (`batch_id=None`) is
-served normally (the sdk49 path). **Latch-before-msg [S3/M-upload]:** `get_msg_addr` must withhold any
-V2 ladder blob whose `statechain_id` has an *unresolved* latch OR whose latch row does not yet exist for
-its `batch_id` — so an upload-before-latch window cannot serve an un-gated ladder.
+`protocol_version` marker** to `transfer_update_msg` so the gate scopes to V2 only; absent that, accept
+that V1-latch msgs are also withheld until commit and carry a **V1-latch regression test** (the V1
+receiver re-polls `get_msg_addr` post-commit — confirm `execute()` does). A withheld-msg receiver's
+`validate_encrypted_message` errors "missing TES-R ladder" and waits
+(`clients/libs/rust/src/transfer_receiver.rs:597`). A V2 transfer with **no** latch (`batch_id=None`) is
+served normally (sdk49). **Latch-before-msg / plain-batch belt [S3, scoped]:** withhold a V2 blob whose
+`statechain_id` has a **live LN latch** (`is_lightning_latch` batch) that is not yet committed OR whose LN
+latch row does not yet exist for its `batch_id`; a **plain** (non-LN) batch (`is_lightning_latch=false`,
+`locked2=false`, no `lightning_latch` row) is served normally — the belt applies only to LN-latch batches,
+so it cannot brick a plain V2 batch transfer.
 
 ### 2.2 Finality = one DB compare-and-swap on `resolved` [S3]
 Do **not** gate commit on a wall-clock compare (two decoupled clocks let a late `unlock_by_preimage`
@@ -130,22 +148,38 @@ extension untouched. +1 co-sign, +1 disclosure — balanced.
 
 ### 3.1 Write-ahead discipline (kills every crash-brick finding)
 Two rules make the enclave count and the disclosed set never diverge unrecoverably:
-1. **Write-ahead marker**: before *any* latched presign co-sign, persist a marker
-   `{batch_id, orphan_txid, orphan_csv, orphan_out_value, pre_presign_sig_count, expires_at}`. The tier
-   txid/csv are deterministic pre-witness (`lib/src/tesr.rs`), so no signature is needed. If the co-sign
-   then fails (SE 409/network/crash), `reconcile` reads the live count: if it did **not** advance past
-   `pre_presign_sig_count`, the co-sign never landed ⇒ the marker is a phantom ⇒ discard it without
-   folding (fixes the phantom-fold overcount).
+1. **Write-ahead marker on EVERY latched co-sign [C5]**: before *any* co-sign in a latched flow — the
+   presign of `S'` AND each recovery `renew_state_only` co-sign — persist a marker
+   `{batch_id, cosign_txid, cosign_csv, out_value, pre_cosign_sig_count, kind}`. The tier txid/csv are
+   deterministic pre-witness (`lib/src/tesr.rs`), so no signature is needed. If the co-sign then fails (SE
+   409/network/crash), `reconcile` reads the live count: if it did **not** advance past
+   `pre_cosign_sig_count`, the co-sign never landed ⇒ phantom ⇒ discard without folding (fixes phantom-fold
+   overcount). If it DID advance but the tx was never persisted (crash mid-recovery), the co-signed tier is
+   an orphan the client can no longer re-sign (MuSig2 nonce guard, `sign.rs`); `reconcile` folds it into
+   `superseded_states` by its marker CSV and renews below it — **uniformly, exactly like a presign orphan**.
+   So a crashed recovery renew is just another orphan the next `reconcile` pass absorbs; the loop converges
+   (each pass discloses the outstanding orphan + renews strictly below), degrading to `NEEDS_EXIT_OR_REFRESH`
+   only when state runway is finally exhausted — which is the honest "safe exit/refresh", not a brick.
 2. **Write-ahead disclosure**: every SE co-sign (the presign, and each of recovery's renew co-signs) is
    immediately followed by persisting its disclosure into the bundle *before* the next co-sign or convey.
    So `disclosed` is at most one co-sign behind `se`, and `reconcile` closes that residue on re-entry. A
    mid-recovery crash therefore never leaves an un-disclosed co-sign that a later run double-counts.
 
-### 3.2 verify_bundle maturity extension (still needed for general renewals)
-Recovery is state-only (§3), but ordinary DW renewals *do* create superseded extensions, and today
-`verify_bundle` step 4 race-checks only states. **Extend it** to also reject any superseded *extension*
-whose CSV ≤ the current extension CSV — independently correct and required so a state-only recovery bundle
-that co-exists with prior real renewals still verifies. Pure client, backward-compatible.
+### 3.2 verify_bundle maturity extension — PER-PREVOUT [C4]
+Ordinary DW renewals create superseded extensions, and today `verify_bundle` step 4 race-checks only
+states. Extend it to race-check superseded extensions too — **but per-prevout, not flat**. A flat "reject
+any superseded ext CSV ≤ current ext CSV" wrongly rejects a **rolled-over** ladder: `rollover`
+(`tesr.rs:243-272`) installs a fresh deepest extension at a *different prevout* (the self-split output) and
+never clears `superseded_extensions`, so on regtest a renewed→rolled-over coin has superseded exts {12,9}
+vs a fresh deepest ext at 12, and `12 ≤ 12` falsely rejects. Superseded level-0 extensions spend the
+*trigger* output; they only race the level-0 current extension, not the level-1 extension (a different
+prevout). **Correct check:** for each superseded extension, compare its CSV **only against the current
+extension that shares its `input[0].previous_output`** (i.e. the extension at the same ladder level);
+require the current one strictly lower. Superseded extensions of earlier (rolled-over) levels are counted
+(step 3) but race-checked only against the extension they actually contend with. This is why recovery is
+state-only (§3): it never adds a superseded extension, so it never trips even a flat check — but the
+per-prevout fix is needed so a *rolled-over* coin can be latch-recovered without `reconcile`'s
+`assert verify_bundle` panicking. Pure client, backward-compatible.
 
 ### 3.3 Presign guards up front (near-floor is a THEFT edge; budgeted/epoch coins) [S2/M1]
 - **State runway:** if `S'` would land within δ of the floor, recovery cannot place the owner state
@@ -185,7 +219,7 @@ exitable" claim was **false** for mnemonic-only restore. Correct policy:
 | **rollback** (expiry, `SETTLED_FINAL`) | ladder never released | sender `reconcile`s: fold orphan, renew-below, persist | coin whole, transferable |
 | crash after co-sign, before marker | count +1, marker present (written first) | `reconcile` sees deficit, folds by marker CSV | recovered |
 | crash after marker, co-sign failed | count unchanged, marker present | `reconcile` sees no deficit vs pre_presign_sig_count → discard phantom marker | no overcount |
-| crash mid-recovery-renew | count +1, disclosed write-ahead | `reconcile` re-runs under the per-coin lock, closes residual deficit | recovered |
+| crash mid-recovery-renew | count +1, renew co-sign has its own write-ahead marker [C5] | `reconcile` re-run folds the orphaned renew tier by its marker CSV + renews below it (uniform with a presign orphan) | recovered (or safe exit/refresh at runway exhaustion) |
 | **mnemonic-only** restore (no recovery bundle) | count +N, no coin/ladder/marker | nothing off-chain survives; only `import_recovery_bundle` recovers | coin needs its recovery bundle (true of every V2 coin) — NOT mnemonic-exitable |
 
 ## 5. Why it is safe
