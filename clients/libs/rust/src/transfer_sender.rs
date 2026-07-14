@@ -248,7 +248,23 @@ pub async fn execute(
     let statechain_id = coin.statechain_id.as_ref().unwrap().clone();
     let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap().clone();
 
-    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;  
+    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
+
+    // ATOMICITY GUARD (V2-DESIGN §5.5 / §5.12, TES-fixable #5). Refuse a Lightning-latched transfer of
+    // a V2 (TES-R) coin BEFORE any server interaction. The Model A co-sign of the receiver-paying state
+    // S' is NOT gated by the swap preimage (presign_receiver_state co-signs unconditionally and records
+    // nothing locally); if the swap rolled back, that orphan SE co-sign would silently unbalance a later
+    // verify_bundle and brick the coin. The clean fix is server-side preimage-gating of the tier co-sign
+    // (deferred with the /renew-counters server work). Until then, fail loudly here — LN swaps run on V1
+    // coins. Checked ahead of get_new_x1 so no batch is registered for a transfer we will not complete.
+    if batch_id.is_some()
+        && matches!(crate::tesr::load(client_config, wallet_name, &statechain_id).await, Ok(Some(_)))
+    {
+        return Err(anyhow::anyhow!(
+            "Lightning-latched transfer of a V2 (TES-R) coin is not supported yet: the Model A co-sign is not preimage-gated (V2-DESIGN TES-fixable #5). Use a V1 coin for LN swaps."
+        ));
+    }
+
     let x1 = get_new_x1(&client_config, &statechain_id, &signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await?;
 
     let input_txid = coin.utxo_txid.as_ref().unwrap();

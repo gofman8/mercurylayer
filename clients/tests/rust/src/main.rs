@@ -80,6 +80,7 @@ pub mod sdk49_model_a_transfer;
 pub mod sdk50_v2_unilateral_exit;
 pub mod sdk51_v2_watchtower;
 pub mod sdk52_v2_rgb_carrier;
+pub mod sdk53_v2_latch_guard;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -370,6 +371,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("52") {
         sdk52_v2_rgb_carrier::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("53") {
+        sdk53_v2_latch_guard::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
