@@ -1,9 +1,39 @@
 # V2 LN-latch atomicity — client-side rollback recovery (Option A)
 
-Status: **design, pre-implementation.** Chosen path (the server-DB design in `V2-SERVER-LATCH.md` was
-reviewed FLAWED — it targets the enclave-sourced counter and breaks the fork guards). This achieves
-atomic LN-latched V2 transfers with **no server or enclave change**, keeping the enclave `sig_count` as
-the authoritative anti-theft counter. Implement only after adversarial review of THIS doc.
+> ## ⛔ VERDICT: FLAWED as pure client-side — but the review pinned the root cause and the real fix.
+>
+> Adversarial review (5 lenses) found a **FATAL theft window** that no client-only scheme can close,
+> plus a **FATAL crash-safety** gap and 10 SERIOUS:
+>
+> - **Receiver obtains `S'` before commit ⇒ theft.** The augmented bundle `{trigger, extension, S'}` is
+>   ECIES-encrypted to the receiver and posted at `update_msg` time; `/transfer/get_msg_addr`
+>   (`transfer_receiver.rs:92-116`) has **no latch gate** (only the key-rotation `/transfer/receiver` at
+>   `:228` does). The receiver decrypts `S'` (pays them, csv `k+1`) before any preimage. On rollback the
+>   sender keeps the coin at current `S_k` (csv `k`, matures **later** than `S'`), so the receiver
+>   broadcasts trigger+extension+`S'` and takes the coin; the sender's keyless watchtower can only
+>   broadcast the **losing** `S_k`. By the time the sender detects rollback and renews-below, the
+>   receiver already holds `S'`. §5's "the sender's own state matures first" is false pre-recovery.
+> - **Crash between presign and marker-write ⇒ unrecoverable brick.** The enclave `sig_count` increments
+>   at co-sign; if the process dies before the (separate, later) marker persists, the orphan exists with
+>   no recovery handle. Fix: **write-ahead marker** (before the co-sign) + snapshot the pre-presign
+>   sig_count.
+>
+> **Root cause (fundamental):** Model A conveys a usable, receiver-paying `S'` *before* the atomic
+> commit; any rollback hands the receiver a stealable claim. The counter/recovery bookkeeping was never
+> the real problem.
+>
+> **The real fix (§9): gate DELIVERY of the V2 bundle on batch-unlock.** Withhold the encrypted
+> `tesr_ladder` from the receiver until the preimage unlocks the batch (the same gate the key-rotation
+> already uses — *no* enclave change, *no* new trust surface). Then on rollback the receiver never
+> obtains `S'`, so it is held only by the sender — which makes the §3 client-side recovery's core
+> assumption TRUE and closes the theft window. Combine: **gate-delivery (small server change) +
+> write-ahead marker + §3 client recovery.** The sdk53 refusal STAYS until this ships and sdk54/55 pass.
+> Everything below the line is the pure-client design (insufficient alone); §9 is the corrected path.
+>
+> ---
+
+Status: **superseded by §9 (see verdict).** Pure client-side recovery, kept for the record — sound for
+the *counting/CSV* mechanics (§3) but NOT for the theft window, which needs the §9 server delivery-gate.
 
 ## 1. Premise (what the review established)
 
@@ -129,3 +159,60 @@ without waiting for the next transfer.
   renewals.)
 - OQ-5: Crash between "write marker" and "convey" (orphan exists at enclave, marker exists, transfer not
   sent) vs between "convey" and "commit". Enumerate and show each resolves to commit-or-rollback correctly.
+
+---
+
+## 9. Corrected path (post-review) — gate bundle DELIVERY on unlock + write-ahead marker + §3 recovery
+
+The two FATALs both trace to one fact: the receiver can obtain the fully-signed `S'` (encrypted to it,
+posted at `update_msg`) with **no latch gate on retrieval**, so a rollback leaves it holding a stealable
+claim. Fix that one fact and the client recovery becomes sound.
+
+### 9.1 Server: withhold the V2 bundle until the batch unlocks (small, no enclave, same trust surface)
+
+For a transfer that is **latched** (a live `lightning_latch` row exists for the statechain_id) AND carries
+a `tesr_ladder` (V2), the server must not hand the encrypted ladder to the receiver until the batch is
+unlocked — the *same* gate the key-rotation `/transfer/receiver` already applies (`transfer_receiver.rs:228`
+→ `validate_batch`). Concretely, `get_msg_addr` (`transfer_receiver.rs:92-116`) returns the transfer msg
+with its `tesr_ladder` field **stripped/withheld** while the coin is a latched, not-yet-unlocked batch
+member (`statechain_in_latch_batch` && not unlocked), and serves it in full only after unlock. This is not
+an enclave change and not a new trust surface — the operator already gates receiver progress on the
+preimage; we extend the same gate to the bundle bytes.
+
+- **Commit** (preimage revealed → `update_unlock_transfer`): the receiver now fetches the full ladder,
+  adopts `S'`, finalizes. = sdk49.
+- **Rollback** (latch expires): the receiver **never** receives the ladder ⇒ never holds `S'` ⇒ cannot
+  broadcast it. `S'` is held only by the sender. The theft window is closed.
+
+### 9.2 Client: write-ahead marker + §3 recovery (now sound)
+
+With 9.1 in place, on rollback `S'` is held only by the sender, so §3 recovery (disclose `S'` +
+renew strictly below) restores the count balance and CSV-race with no theft exposure. Apply the review's
+crash-safety fixes:
+
+- **Write-ahead marker** (fixes FATAL-2): persist the marker `{batch_id, orphan_txid, orphan_csv,
+  pre_presign_sig_count}` **before** the presign co-sign. `verify_bundle` only reads superseded `.csv`
+  and `.len()`, never `signed_tx`, and the tier txid is deterministic, so the marker needs no signature.
+- **Reconcile against the live enclave count, not marker presence** (fixes the idempotency SERIOUS):
+  recovery reads `se_num_sigs`, computes the deficit vs the persisted bundle's `expected`, and closes
+  exactly that deficit; re-entry is gated on `expected < se_num_sigs`, so a re-run of a completed/partial
+  recovery adds nothing. Persist after each recovery co-sign.
+- **Use raw `renew()` with an explicit csv `= orphan_csv − δ`** (never `renew_auto`, which resets to D0
+  and breaks the maturity check); renew is always +2/+2 (extension+state), both disclosed.
+- **Near-floor is a THEFT edge, not benign** (fixes that SERIOUS): if the coin cannot be renewed strictly
+  below `S'`, recovery must FORCE resolution before the latch can be exploited — the coin must be exited
+  or refreshed *proactively while still safe*, not left "exitable later". Preferred: **forbid the presign
+  when `S'` would land within one δ of the floor** (reject the latched transfer up front, same shape as
+  the sdk53 guard but floor-scoped), so recovery always has room. This bounds the problem instead of
+  racing it.
+
+### 9.3 Order of work (each gated on its own review + green E2E)
+
+1. Server 9.1 (withhold latched V2 bundle) + a regtest E2E proving the receiver cannot fetch the ladder
+   pre-unlock and can post-unlock.
+2. Client write-ahead marker + §3/9.2 recovery + the floor-scoped presign guard.
+3. sdk54 (commit) / sdk55 (rollback→recover→re-transfer) / sdk55b (near-floor→refuse) / sdk56 (regression)
+   against a live RLN pair.
+4. Only then remove the sdk53 refusal.
+
+Until all four land, **the sdk53 refusal stays** and LN swaps run on V1 coins — the system is safe today.
