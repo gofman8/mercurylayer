@@ -30,6 +30,9 @@ pub enum WalletEvent {
     /// the `auto_refresh_due` maintenance pass (the background watcher and the pre-spend hook of
     /// `transfer`), so an aging coin is refreshed before the user's action with only the fee visible.
     CoinRefreshed { old_statechain_id: String, new_statechain_id: String, fee_sats: u64 },
+    /// A fresh confirmed deposit had its TES-R (V2) exit ladder auto-established at claim
+    /// (`deposit_protocol_version >= 2`); the coin is now transferable via the R′ path.
+    LadderEstablished { statechain_id: String },
     /// A received **token-carrier** sub-coin nearing its clawback deadline was automatically
     /// materialized on-chain (its exit branch was broadcast), settling the RGB allocation so a
     /// malicious sender can no longer claw back the shared root. Emitted by `auto_exit_due`; the

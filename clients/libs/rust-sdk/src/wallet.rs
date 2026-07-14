@@ -447,6 +447,38 @@ impl UtexoWallet {
                 amount_sats: d.amount_sats,
             });
         }
+
+        // V2DEF-2 (Stage 2a): auto-establish a TES-R exit ladder for fresh V2-native deposits, so the
+        // coin transfers via the R′ path. Config-gated (`deposit_protocol_version >= 2`); at the
+        // default 1 this whole block is skipped and claim() is byte-identical to V1. Only CONFIRMED,
+        // non-duplicate, non-single-use root coins with no existing ladder qualify (idempotent). The
+        // exit payee is the coin's seed-derived `backup_address` (recoverable from the mnemonic — the
+        // same key V1's tx1 pays), NEVER an out-of-wallet address. Establish failures leave the coin
+        // as V1 (its tx1 still exits); the resumable retry is a later stage.
+        if self.inner.config.deposit_protocol_version >= 2 {
+            let mut rec = self.record().await?;
+            let network = rec.network.clone();
+            for coin in rec.coins.iter_mut() {
+                let sid = match &coin.statechain_id { Some(s) => s.clone(), None => continue };
+                if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 || coin.single_use {
+                    continue;
+                }
+                match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
+                    Ok(Some(_)) => continue, // already established — idempotent
+                    Ok(None) => {}
+                    Err(_) => continue,
+                }
+                let payee = coin.backup_address.clone();
+                match mercuryrustlib::tesr::establish_auto(&self.inner.cc, coin, &payee, &network).await {
+                    Ok(bundle) => {
+                        if mercuryrustlib::tesr::persist(&self.inner.cc, &self.inner.config.wallet_name, &bundle).await.is_ok() {
+                            let _ = self.inner.events_tx.send(WalletEvent::LadderEstablished { statechain_id: sid });
+                        }
+                    }
+                    Err(_) => { /* leave as V1: its tx1 backup still exits; resumable retry is a later stage */ }
+                }
+            }
+        }
         // Per-statechain token outcomes for this pass (external review finding 5). Keyed so a coin
         // touched by both the freshly-claimed loop and the retry rescan is recorded once.
         let mut token_status: std::collections::HashMap<String, TokenClaimStatus> =

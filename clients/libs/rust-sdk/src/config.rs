@@ -54,6 +54,17 @@ pub struct SdkConfig {
     /// times pre-split) plus confirmation latency and congestion: choose `≥ k_max·interval + 144`.
     /// Default 288 (~2 days; covers k ≤ 14 pre-split hops on the deployed 1000/10 profile).
     pub auto_exit_margin_blocks: u32,
+    /// Protocol version for NEW deposits (V2DEF-2). `1` = V1 (the current default during migration:
+    /// a deposit is byte-identical to today, so V1 sig-count tests are unaffected). `2` = TES-R
+    /// native: `claim()` auto-establishes + persists a tier ladder for each fresh confirmed coin, so
+    /// it transfers via the R′ path. Seeded from env `UTEXO_PROTOCOL_DEFAULT` if set.
+    pub deposit_protocol_version: u32,
+}
+
+/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT` (default `1` during
+/// the V1→TES-R migration). Flip to `2` only once the migration (V2DEF-2..5) is complete.
+fn deposit_protocol_default() -> u32 {
+    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1)
 }
 
 impl SdkConfig {
@@ -76,6 +87,7 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
+            deposit_protocol_version: deposit_protocol_default(),
         }
     }
 
@@ -98,6 +110,7 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
+            deposit_protocol_version: deposit_protocol_default(),
         }
     }
 }
