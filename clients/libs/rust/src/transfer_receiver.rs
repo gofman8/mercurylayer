@@ -620,19 +620,24 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             info_config.fee_rate_sats_per_byte
         };
 
-        let previous_lock_time = mercurylib::transfer::receiver::validate_signature_scheme(
-            backup_transactions, 
-            &statechain_info, 
-            &tx0_hex, 
-            blockheight,
-            client_config.fee_rate_tolerance, 
-            current_fee_rate_sats_per_byte,
-            info_config.initlock,
-            info_config.interval);
-    
-        if previous_lock_time.is_err() {
-            let error = previous_lock_time.err().unwrap();
-            return Err(anyhow!("Signature scheme validation failed. Error {}", error.to_string()));
+        // The V1 decrementing-locktime backup ladder check applies only to V1 coins. A TES-R (V2)
+        // coin does not use that ladder — its exit assurance is the tier ladder, already verified by
+        // the R′ check (crate::tesr::verify_bundle) at the num_sigs gate above — so it is skipped here.
+        if transfer_msg.protocol_version < 2 {
+            let previous_lock_time = mercurylib::transfer::receiver::validate_signature_scheme(
+                backup_transactions,
+                &statechain_info,
+                &tx0_hex,
+                blockheight,
+                client_config.fee_rate_tolerance,
+                current_fee_rate_sats_per_byte,
+                info_config.initlock,
+                info_config.interval);
+
+            if previous_lock_time.is_err() {
+                let error = previous_lock_time.err().unwrap();
+                return Err(anyhow!("Signature scheme validation failed. Error {}", error.to_string()));
+            }
         }
     }
 

@@ -74,6 +74,7 @@ pub mod sdk43_tesr_rollover;
 pub mod sdk44_tesr_params;
 pub mod sdk45_tesr_watchtower;
 pub mod sdk46_tesr_rprime;
+pub mod sdk47_tesr_rprime_transfer;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -340,6 +341,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("46") {
         sdk46_tesr_rprime::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("47") {
+        sdk47_tesr_rprime_transfer::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
