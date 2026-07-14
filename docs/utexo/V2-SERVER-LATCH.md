@@ -1,8 +1,36 @@
 # V2 Server change — preimage-gated Model A co-sign (provisional / batch-tagged finality)
 
-Status: **design, pre-implementation.** Governs the one server-side change that unblocks full V1 removal
-(V2DEF-6). Everything else in the V2 migration is done and validated (sdk40–53, 14 green E2Es); this is
-the last dependency. Implement with fresh context after adversarial review.
+> ## ⛔ VERDICT: FLAWED — DO NOT IMPLEMENT AS WRITTEN (adversarial review, 5 lenses + synthesis)
+>
+> The batch-tagged-finality mechanism below **targets the wrong counter** and would **introduce a
+> fund-loss double-spend**. Two FATALs, both confirmed against the code:
+>
+> 1. **`num_sigs` is the enclave `sig_count`, not `count_finalized_signatures`.** The receiver reads
+>    `num_sigs` from the lockbox `signature_count/{id}` endpoint (`transfer_receiver.rs:46-67`, →
+>    `lockbox/src/server.cpp:135`), incremented unconditionally on every partial signature and blind to
+>    `batch_id`. Tagging rows in the server DB changes nothing `verify_bundle` reads, so the rollback-
+>    brick is **unfixed** — and §2.3/§7 delete the sdk53 guard, re-enabling the brick.
+> 2. **The single-use/budget fork guards DO read `count_finalized_signatures`** (`sign.rs:83,97`).
+>    Excluding provisional rows there lets an owner tag a *real* terminal spend with a fabricated,
+>    unvalidated `batch_id` → the row is skipped → the `finalized >= 1` / budget guard never fires →
+>    **N conflicting broadcastable spends of a one-shot RGB node (INV-19 fork, fund-loss).** The
+>    `sign.rs:295-299` comment exists precisely to prevent this under-counting; the design re-opens it.
+>
+> Plus two SERIOUS (once `num_sigs` is DB-sourced): promote is not atomic with `update_unlock_transfer`
+> (crash → valid coin rejected); `unlock_by_preimage` has no expiry guard and the promote races the
+> cleanup DELETE.
+>
+> **Consequence for the plan:** a "server + DB only, no enclave rebuild" fix is **impossible** — the
+> counter `verify_bundle` consumes is the enclave's. The real options are enumerated in
+> **§8 Corrected options** at the bottom. The sdk53 refusal **stays** until one of them ships and an
+> E2E proves rollback→re-transfer balances against the enclave-sourced counter. Everything below the
+> line is the REJECTED design, kept for the record.
+>
+> ---
+
+Status: **REJECTED design (see verdict above), kept for the record.** Governs the one change that
+unblocks full V1 removal (V2DEF-6). Everything else in the V2 migration is done and validated
+(sdk40–53, 14 green E2Es); this is the last dependency.
 
 ## 1. The problem (why LN swaps can't use V2 coins today)
 
@@ -163,3 +191,42 @@ consider mainnet. The enclave/lockbox image is **not** rebuilt (no enclave chang
 Removing the sdk53 refusal + green sdk54/55/56 closes the LN-latch dependency. Then V2DEF-5 (flip
 `UTEXO_PROTOCOL_DEFAULT` to 2, migrate the suite) and V2DEF-6 (delete V1, purge docs) can proceed with no
 remaining functional gap.
+
+---
+
+## 8. Corrected options (post-review — supersedes §2–§7)
+
+The review proved the counter `verify_bundle` reads is the **enclave** `sig_count`, incremented on every
+co-sign with no rollback. Any fix must reconcile *that* counter with a rolled-back presign. Four ways:
+
+- **Option A — client-side rollback-recovery (no server/enclave change). RECOMMENDED.**
+  Full-disclosure counting already reconciles `verify_bundle`'s `expected` with the enclave `sig_count`
+  (that is how sdk49 balances). So an orphaned `S'` is fixed *on the client* by disclosing it. Flow:
+  a latched presign records a local `pending-latch{batch_id, S'}` marker. Before the coin's next
+  transfer (or on a maintenance pass), the sender resolves each marker: batch **committed** ⇒ the coin
+  is gone, drop the marker; batch **expired/rolled-back** ⇒ fold `S'` into `superseded_states` **and**
+  renew the coin to a state strictly *below* `S'` (CSV `≤ owner_current − 2δ`) so the CSV-race check
+  still holds, then drop the marker. After recovery `expected == enclave sig_count` again and the coin
+  transfers. **Safety:** between rollback and recovery the coin fails *safe* — a transfer attempt makes
+  the receiver's `verify_bundle` reject (num_sigs > disclosed), never a fund loss; unilateral exit is
+  fine because the never-conveyed `S'` is held only by the sender, whose own state matures first. No
+  enclave rebuild, no server-trust change, no new fork-guard surface. Cost: a stateful client recovery
+  path + a renewal co-sign on the rare rollback. This sidesteps **every** finding above (they were all
+  specific to the server-DB mechanism).
+- **Option B — enclave rebuild (batch-aware `sig_count`).** Make the enclave hold a presign provisional,
+  promote on unlock, skip on rollback. True server-side gating, enclave stays the trust anchor — but an
+  SGX enclave rebuild + redeploy, the highest-risk change in the system. Contradicts the "no enclave"
+  premise entirely.
+- **Option C — re-source `num_sigs` to the server DB.** Serve `num_sigs` from `count_finalized_signatures`
+  (batch-aware) instead of the enclave, split into `count_finalized` (receiver-facing, excludes
+  provisional) vs `count_issued` (fork-gates, counts all), validate `batch_id` membership at
+  `sign_second`, forbid tagging single_use/budgeted coins, and make promote+unlock transactional with an
+  expiry guard (findings 1–4). **Weakens the trust model:** the operator (not the tamper-resistant
+  enclave) becomes the authority on the anti-theft count — a malicious operator could under-report to
+  hide a co-signed state. Large surface, security regression. Not recommended.
+- **Option D — keep the sdk53 guard permanently.** LN swaps stay on V1 coins; the SDK keeps a V1
+  "swap coin" lane even after V2 default. Zero new risk, but V1 is not fully removed (contradicts the
+  V2DEF-6 goal).
+
+**Recommendation: Option A.** It achieves full V1 removal, keeps the enclave as the trust anchor, needs
+no server/enclave surgery, and fails safe. Its own design + adversarial review should precede code.
