@@ -14,8 +14,10 @@ implementation. No code until that confirmation returns SOUND.
 
 `verify_bundle` accepts a coin iff **(count)** `se_num_sigs == disclosed(bundle)` where
 `disclosed = v1_backups + exit_tiers.len() + superseded_states.len() + superseded_extensions.len()`, AND
-**(maturity)** the current state's CSV is strictly below every superseded *state* CSV, and the current
-extension's CSV is strictly below every superseded *extension* CSV. `se_num_sigs` is the **enclave**
+**(maturity)** the current state's CSV is strictly below every superseded *state* CSV, and — **per ladder
+level (per-prevout)** — each superseded *extension* is strictly above the current extension **that shares
+its input prevout** (a flat all-vs-all extension check is wrong for rolled-over ladders; see §3.2/C4).
+`se_num_sigs` is the **enclave**
 `sig_count` (`transfer_receiver.rs:46-67` → lockbox), incremented on every co-sign, never rolled back.
 So the client's job is only ever: **disclose every co-sign the enclave made, and keep the owner-paying
 current the soonest-maturing.** Two problems break this for a latched transfer — the receiver getting `S'`
@@ -51,20 +53,30 @@ for any coin whose latch is **live and un-committed, withholds the entire `encry
 *during* lock, serve *after* commit — never the inverse). Gate on `locked2` only, NOT
 `is_all_coins_unlocked` (circular — it needs the decrypted msg to clear `locked`, deadlocking the latch).
 
-**SSP pre-payment descriptor [C1 — resolves the pay-invoice deadlock].** In the pay-invoice swap the SSP
-**is** the receiver and must run its mandatory value/asset gate (`execute_pay` → `peek_pending_transfers`
-→ `get_msg_addr`, audit [3]/[4]) BEFORE it pays and BEFORE commit — but whole-message withholding hides
-the coin from that peek. Resolution: the sender also posts an **owner-signed coin descriptor**
-`{statechain_id, batch_id, funding_amount, recipient_pubkey, rgb_consignment?}` signed by the sender's
-auth key, served pre-commit via a new `/transfer/coin_descriptor/<batch_id>` (or an extra field on
-`batch_statechains`). The SSP validates value ≥ invoice + recipient == its key + consignment against the
-descriptor and pays; the descriptor carries **no `tesr_ladder`/`S'`**, so it is not a broadcastable claim.
-The full msg (with `S'`) is released only at commit, giving the SSP its unilateral-exit ladder *after*
-paying. **Trust note:** the SSP's pre-pay guarantee is value+recipient+consignment (owner-signed) plus
-SE-liveness for the post-commit ladder — acceptable because the SSP is the operator-aligned swap
-counterparty, not an arbitrary user; a fully-trustless receiver would need an adaptor-signature on `S'`
-(out of scope, tracked as a future hardening). The descriptor is amount/recipient/consignment only — it
-reveals nothing the `batch_statechains` mapping doesn't already, and no pre-signed state.
+**SSP pre-payment validation against SE-AUTHORITATIVE data [C1 — corrected: the sender is the adversary].**
+In the pay-invoice swap the SSP **is** the receiver and must run its value/recipient/asset gate
+(`execute_pay` → `peek_pending_transfers`, audit [3]/[4]) BEFORE it pays — but whole-message withholding
+hides the coin from that peek. The **sender is the adversary here**, so the pre-pay data must be
+SE-authoritative, NOT sender-asserted (a sender-signed `recipient_pubkey` is forgeable: the sender
+addresses the coin to a collaborator via `new_user_auth_key` yet claims `recipient=SSP` → SSP pays,
+collaborator claims → fund-loss). The existing gate's recipient proof is *decryptability*; replace it with
+an SE-authoritative check:
+- **Recipient:** the SSP reads the coin's **SE-stored `new_user_auth_key`** (set by the sender's
+  `transfer_sender::execute`, stored plaintext, `transfer_sender.rs:126-148`) via a batch-scoped read
+  (extend `batch_statechains` to return `new_user_auth_key` per member) and requires it **== its own auth
+  key**. Unforgeable: it is the very key the commit-time key-rotation will use, so a coin the SSP validates
+  is provably addressed to the SSP.
+- **Sats value:** the SSP reads the **on-chain funding UTXO `F`** (public, `f_txid:f_vout` from
+  `batch_statechains`) and requires `value(F) ≥ invoice + fee` — recomputed from the chain, not a declared
+  number. (Equivalently the SE serves an authoritative `funding_amount`; the chain is simplest.)
+- **RGB value:** for a token swap the sender provides the **consignment + witness** (not a sats claim) and
+  the SSP re-runs `validate_pending_token` (audit [4]) against the actual witness, exactly as today.
+
+None of this is a broadcastable claim (no `tesr_ladder`/`S'`); the full msg with `S'` is released only at
+commit as the SSP's post-pay exit ladder. **Trust note:** with recipient+value SE-authoritative, the only
+residual the SSP trusts is SE-liveness for the post-commit ladder it receives (its unilateral-exit safety)
+— acceptable for the operator-aligned SSP; a fully-trustless receiver would need an adaptor-signature on
+`S'` (future hardening). No pre-signed state is ever revealed pre-commit.
 
 Because the server cannot tell a V1 blob from a V2 blob (both opaque), add a **plaintext
 `protocol_version` marker** to `transfer_update_msg` so the gate scopes to V2 only; absent that, accept
@@ -120,22 +132,32 @@ idempotent and crash-re-runnable:
 ```
 reconcile(coin):                                # holds per-coin advisory lock
   bundle = load(coin);  se = signature_count(coin)          # live enclave truth (fail-safe: unreachable ⇒ return WAIT)
-  if disclosed(bundle) == se: drop_marker(coin); return OK   # already balanced
-  # deficit orphan co-signs exist. Fold each by the CSV its marker recorded:
-  for each marker m of coin (a presign records {orphan_txid, orphan_csv, pre_presign_sig_count}):
-      if se <= m.pre_presign_sig_count: discard m            # phantom: co-sign never landed (S-phantom)
+  if terminal_flag(coin): return NEEDS_EXIT_OR_REFRESH        # sticky: a prior pass could not restore maturity [C-reconcile]
+  # EARLY-EXIT REQUIRES COUNT **AND** MATURITY — count alone can be balanced while a folded superseded
+  # state sits below the un-renewed current (verify_bundle step 4 would reject). [C-reconcile]
+  if disclosed(bundle) == se AND verify_bundle(bundle, se).is_ok(): drop_marker(coin); return OK
+  # deficit orphan co-signs (or a folded-not-yet-renewed maturity gap) exist. Fold each orphan by marker CSV:
+  for each marker m of coin (every latched co-sign records {orphan_txid, orphan_csv, pre_cosign_sig_count}):
+      if se <= m.pre_cosign_sig_count: discard m             # phantom: co-sign never landed
       elif orphan not already in superseded_states:
           push {txid,csv,out_value} to superseded_states; persist(bundle)   # write-ahead disclosure
-  if disclosed(bundle) < se: return NEEDS_EXIT_OR_REFRESH     # orphans at UNKNOWN csv (marker lost) — never guess
-  # Every orphan disclosed. Restore maturity dominance with a STATE-ONLY renew [S2]:
-  target = (min superseded state csv) - δ
-  if target < d_floor: return NEEDS_EXIT_OR_REFRESH          # no runway (guarded up front by §3.3, belt-and-suspenders)
-  r = renew_state_only(bundle, target)                        # ONE co-sign; re-sign only the state, NOT the extension
-  if r == SE_REFUSED: return NEEDS_EXIT_OR_REFRESH            # budget/single-use/epoch refused the renew (M1)
-  persist(bundle)                                             # disclose the +1 before returning
+  if disclosed(bundle) < se: set_terminal_flag(coin); return NEEDS_EXIT_OR_REFRESH  # orphans at UNKNOWN csv (marker lost)
+  # Every orphan disclosed. Restore maturity dominance with a STATE-ONLY renew [S2], UNCONDITIONALLY while
+  # any superseded state csv <= current state csv (do NOT gate this on the count, which is already balanced):
+  while (min superseded state csv) <= current state csv:
+      target = (min superseded state csv) - δ
+      if target < d_floor: set_terminal_flag(coin); return NEEDS_EXIT_OR_REFRESH      # runway exhausted (safe)
+      r = renew_state_only(bundle, target)                   # ONE co-sign; re-sign only the state, NOT the extension
+      if r == SE_REFUSED: set_terminal_flag(coin); return NEEDS_EXIT_OR_REFRESH        # budget/single-use/epoch (M1)
+      persist(bundle)                                        # disclose the +1 before the next co-sign / return
   assert verify_bundle(bundle, signature_count(coin))         # count AND maturity (states + extensions)
   drop_marker(coin); return OK
 ```
+
+The `terminal_flag` is **sticky** [C-reconcile]: once a pass cannot restore maturity (no runway / SE refused
+/ unknown-CSV orphan), it persists so a later count-only-balanced re-entry cannot silently drop the marker
+and leave the coin maturity-violated. The marker is dropped only on the fully-verified success path. Clearing
+the terminal flag requires an explicit `refresh` (which re-anchors the coin to a fresh runway).
 
 **Why state-only [S2].** A latched presign lowered only a *state* (`presign_receiver_state` pushes only
 `superseded_states`, never a superseded extension — `tesr.rs:307`), so only a *state* needs re-signing to
