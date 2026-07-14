@@ -211,6 +211,25 @@ fn spk_from_address(address: &str, network: &str) -> Result<ScriptBuf, MercuryEr
         .script_pubkey())
 }
 
+/// The plain P2TR address a TES-R state should pay for `address` (Model A `owner_exit_address`).
+/// A Mercury transfer address resolves to the recipient's derived `P2TR(recipient_user_pubkey)` — the
+/// SAME key V1's `create_tx_out` pays and that the recipient holds; a plain address is returned as-is.
+/// The receiver compares this against `get_user_backup_address(coin)` to confirm the ladder pays it.
+pub fn payee_address(address: &str, network: &str) -> Result<String, MercuryError> {
+    let net = get_network(network)?;
+    if address.starts_with(crate::MAINNET_HRP) || address.starts_with(crate::TESTNET_HRP) {
+        let (_, recipient_user_pubkey, _) = crate::decode_transfer_address(address)?;
+        return Ok(Address::p2tr(
+            &secp256k1_zkp::Secp256k1::new(),
+            recipient_user_pubkey.x_only_public_key().0,
+            None,
+            net,
+        )
+        .to_string());
+    }
+    Ok(address.to_string())
+}
+
 /// TRIGGER `T`: spends the funding UTXO `F`, no relative-timelock. Pays `to_address` = P2TR(A) so the
 /// coin's own key can co-op de-trigger or the ladder can hang beneath it. `FeeTooHigh` if `F` is too
 /// small to carry another tier (the terminal maintenance-cost case).

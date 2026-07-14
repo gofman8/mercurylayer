@@ -602,6 +602,16 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
                 statechain_info.num_sigs,
                 transfer_msg.backup_transactions.len() as u32,
             )?;
+            // Model A fund-safety gate: the ladder's final state MUST exit to the RECEIVER's own
+            // seed-derived key (P2TR of this coin's user_pubkey). Without this, a sender could set
+            // owner_exit_address + pre-sign S' to pay a third party while still passing verify_bundle.
+            let my_backup = mercurylib::transaction::get_user_backup_address(coin, network.to_string())
+                .map_err(|_| anyhow::anyhow!("cannot derive the receiver's backup address"))?;
+            if bundle.owner_exit_address != my_backup {
+                return Err(anyhow::anyhow!(
+                    "v2 transfer rejected: the conveyed ladder does not exit to the receiver's own key"
+                ));
+            }
         } else if statechain_info.num_sigs != transfer_msg.backup_transactions.len() as u32 {
             return Err(anyhow::anyhow!("num_sigs is not correct".to_string()));
         }
@@ -831,6 +841,17 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
                 amount,
                 index: index as u32,
             });
+        }
+    }
+
+    // Model A adoption: the conveyed ladder was verified (validate_encrypted_message: verify_bundle +
+    // exits-to-my-key). Persist it under the received coin's statechain_id so the receiver now OWNS a
+    // complete, self-paying exit chain and can transfer/exit/renew it — no SE cooperation needed.
+    if transfer_msg.protocol_version >= 2 {
+        if let Some(ladder) = &transfer_msg.tesr_ladder {
+            if let std::result::Result::Ok(bundle) = serde_json::from_str::<crate::tesr::TesrBundle>(ladder) {
+                let _ = crate::tesr::persist(client_config, wallet_name, &bundle).await;
+            }
         }
     }
 

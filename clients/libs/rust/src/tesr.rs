@@ -63,6 +63,16 @@ pub struct TesrBundle {
     pub levels: Vec<TesrLevel>,
     /// Renewal counter at the current (deepest) level.
     pub m: u32,
+    /// SUPERSEDED states — every owner-paying state the SE co-signed that a later renewal/rollover/
+    /// transfer replaced. Kept for FULL-DISCLOSURE counting (V2-MIGRATION): the SE counts their
+    /// co-signs, so verify_bundle must see them or num_sigs won't balance; and the current state must
+    /// be at a strictly LOWER CSV than every one of these (it matures first, so a retained stale state
+    /// loses the race). Not part of the exit chain.
+    #[serde(default)]
+    pub superseded_states: Vec<TesrTier>,
+    /// SUPERSEDED extensions (from renewals) — kept only so their co-signs are counted.
+    #[serde(default)]
+    pub superseded_extensions: Vec<TesrTier>,
     /// The relative-timelock schedule this coin runs on (mainnet/regtest preset). Drives the
     /// param-based cadence in [`renew_auto`] / [`rollover_auto`]; defaults to mainnet for bundles
     /// persisted before this field existed.
@@ -140,6 +150,8 @@ pub async fn establish(
             state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
         }],
         m: 0,
+        superseded_states: Vec::new(),
+        superseded_extensions: Vec::new(),
         params: mercurylib::tesr::TesrParams::for_network(network),
     })
 }
@@ -213,6 +225,9 @@ pub async fn renew(
     let s_signed = cosign_tier(cc, coin, s.tx_hex.clone(), x.out_value, &bundle.network).await?;
 
     let last = bundle.levels.len() - 1;
+    // Full-disclosure: the replaced extension + state were co-signed; keep them so verify_bundle counts them.
+    bundle.superseded_extensions.push(bundle.levels[last].extension.clone());
+    bundle.superseded_states.push(bundle.levels[last].state.clone());
     bundle.levels[last] = TesrLevel {
         extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e_new) },
         state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
@@ -246,6 +261,8 @@ pub async fn rollover(
     let s2_signed = cosign_tier(cc, coin, s2.tx_hex.clone(), x2.out_value, &bundle.network).await?;
 
     let last = bundle.levels.len() - 1;
+    // Full-disclosure: the old owner-paying state is replaced by the self-split; keep it for counting.
+    bundle.superseded_states.push(bundle.levels[last].state.clone());
     bundle.levels[last].state = TesrTier { txid: s_roll.txid, signed_tx: s_roll_signed, out_value: s_roll.out_value, csv: Some(state_csv) };
     bundle.levels.push(TesrLevel {
         extension: TesrTier { txid: x2.txid, signed_tx: x2_signed, out_value: x2.out_value, csv: Some(csv_e) },
@@ -253,6 +270,43 @@ pub async fn rollover(
     });
     bundle.m = 0; // fresh renewal budget at the new level
     Ok(())
+}
+
+/// Model A (V2-MIGRATION §"receiver ladder adoption"): while still owning the coin, pre-sign the
+/// RECEIVER-paying state `S'` so the receiver gets a complete, verifiable exit chain paying THEM.
+/// `S'` spends the deepest extension's output, pays the recipient's derived P2TR (from a Mercury
+/// transfer address), and carries CSV `= current_state_csv − δ` (one lower, so it matures before the
+/// sender's retained state). Returns the augmented bundle to convey (final state = `S'`,
+/// `owner_exit_address` = the recipient's key). Co-signs on a CLONE so the caller's coin is untouched
+/// for the rest of the transfer. Errors if the state CSV is at the floor (renew/rollover first).
+pub async fn presign_receiver_state(
+    cc: &ClientConfig,
+    coin: &Coin,
+    bundle: &TesrBundle,
+    recipient_address: &str,
+) -> Result<TesrBundle> {
+    let p = bundle.params;
+    let cur_csv = bundle.current().state.csv.ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+    let new_csv = cur_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| anyhow::anyhow!("state CSV at the floor — renew/rollover before transferring"))?;
+
+    let payee = mercurylib::tesr::payee_address(recipient_address, &bundle.network)?;
+    let ext = bundle.current().extension.clone();
+    let s = mercurylib::tesr::build_state(&ext.txid, ext.out_value, &payee, &bundle.network, new_csv, bundle.fee_rate)?;
+
+    let mut c = coin.clone();
+    let s_signed = cosign_tier(cc, &mut c, s.tx_hex.clone(), ext.out_value, &bundle.network).await?;
+
+    let mut b = bundle.clone();
+    b.owner_exit_address = payee;
+    let last = b.levels.len() - 1;
+    // Full-disclosure: the sender's own (now stale) state was co-signed; keep it so verify_bundle
+    // counts it — and it sits at a HIGHER CSV than S', so it loses the maturity race to the receiver.
+    b.superseded_states.push(b.levels[last].state.clone());
+    b.levels[last].state = TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(new_csv) };
+    Ok(b)
 }
 
 /// Cooperative DE-TRIGGER: blind-co-sign a fresh no-timelock spend of `T.out[0]` paying `to_address`,
@@ -411,12 +465,30 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
         }
     }
 
-    // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for the ladder.
-    let expected = v1_backups + tiers.len() as u32;
+    // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for EVERY co-signed
+    //    tier — the exit chain PLUS the superseded states/extensions (full-disclosure counting). A
+    //    hidden co-signed state bumps num_sigs without appearing here ⟹ reject.
+    let expected = v1_backups
+        + tiers.len() as u32
+        + bundle.superseded_states.len() as u32
+        + bundle.superseded_extensions.len() as u32;
     if se_num_sigs != expected {
         return Err(anyhow::anyhow!(
-            "num_sigs mismatch: SE issued {se_num_sigs}, ladder+backups account for {expected} — possible hidden state"
+            "num_sigs mismatch: SE issued {se_num_sigs}, disclosed tiers+backups account for {expected} — possible hidden state"
         ));
+    }
+
+    // 4. Maturity-race safety: the current owner-paying state must mature BEFORE any superseded state
+    //    (a stale state a prior owner might retain). Its CSV must be strictly the lowest.
+    let final_csv = txs.last().unwrap().input[0].sequence.0 & 0xFFFF;
+    for s in &bundle.superseded_states {
+        if let Some(csv) = s.csv {
+            if (csv as u32) <= final_csv {
+                return Err(anyhow::anyhow!(
+                    "a superseded state has CSV {csv} <= the current state's {final_csv} — it could out-race the owner"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -445,7 +517,7 @@ mod verify_tests {
                 extension: TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)) },
                 state: TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)) },
             }],
-            m: 0, params: p,
+            m: 0, superseded_states: vec![], superseded_extensions: vec![], params: p,
         }
     }
 

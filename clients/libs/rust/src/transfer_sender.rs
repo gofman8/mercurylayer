@@ -280,10 +280,19 @@ pub async fn execute(
     // the R′ verification (crate::tesr::verify_bundle) instead of the flat V1 backup-count check.
     // Absent (an ordinary V1 coin) → protocol_version 0, and the receiver takes the V1 path.
     let (protocol_version, tesr_ladder) = match crate::tesr::load(client_config, wallet_name, &statechain_id).await {
-        Ok(Some(bundle)) => match serde_json::to_string(&bundle) {
-            Ok(json) => (2u32, Some(json)),
-            Err(_) => (0u32, None),
-        },
+        Ok(Some(bundle)) => {
+            // Model A: while we still own the coin, pre-sign the RECEIVER-paying state S' (pays the
+            // recipient, one δ lower CSV) and convey the augmented bundle, so the receiver adopts a
+            // complete exit chain paying them. Falls back to V1 on any error (the coin still exits
+            // via its tx1 backup).
+            match crate::tesr::presign_receiver_state(client_config, &coin, &bundle, recipient_address).await {
+                Ok(augmented) => match serde_json::to_string(&augmented) {
+                    Ok(json) => (2u32, Some(json)),
+                    Err(_) => (0u32, None),
+                },
+                Err(_) => (0u32, None),
+            }
+        }
         _ => (0u32, None),
     };
 
