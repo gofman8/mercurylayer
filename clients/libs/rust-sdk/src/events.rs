@@ -33,6 +33,11 @@ pub enum WalletEvent {
     /// A fresh confirmed deposit had its TES-R (V2) exit ladder auto-established at claim
     /// (`deposit_protocol_version >= 2`); the coin is now transferable via the R′ path.
     LadderEstablished { statechain_id: String },
+    /// A V2 coin was found **triggered** (its funding `F` was spent — a contested exit) and the
+    /// owner's watchtower pass (`defend_ladders`) raced the ladder, broadcasting `tiers_broadcast`
+    /// tier tx(s) this pass. The adopted current state carries the strictly-lowest CSV, so it matures
+    /// first and the funds land at the owner's own key. Emitted per pass until the exit completes.
+    LadderDefended { statechain_id: String, tiers_broadcast: u32 },
     /// A received **token-carrier** sub-coin nearing its clawback deadline was automatically
     /// materialized on-chain (its exit branch was broadcast), settling the RGB allocation so a
     /// malicious sender can no longer claw back the shared root. Emitted by `auto_exit_due`; the

@@ -720,6 +720,46 @@ impl UtexoWallet {
         Ok(exited)
     }
 
+    /// **V2 watchtower pass (owner-run, keyless-style).** For every coin carrying an adopted TES-R
+    /// ladder, run one [`watch_pass`](mercuryrustlib::tesr::watch_pass). If the coin has NOT been
+    /// triggered (funding `F` still unspent) this is a no-op — an idle V2 coin never ages, so there is
+    /// nothing to defend and no routine renewal is needed. If someone HAS triggered it (a contested
+    /// exit: a prior owner racing a stale state, or a griefer), this races the owner's tiers; because
+    /// the adopted current state carries the strictly-lowest CSV (enforced at adoption by
+    /// `verify_bundle`), it matures first and wins, landing the funds at the owner's own key.
+    /// Idempotent and incremental — call once per block from a background loop; already-broadcast
+    /// tiers are skipped and a not-yet-mature tier retries next pass. A delegated tower runs the same
+    /// pass against the owner's pre-signed bundle with NO key material. Returns the statechain_ids
+    /// that had at least one tier broadcast this pass.
+    pub async fn defend_ladders(&self) -> Result<Vec<String>> {
+        let record = self.record().await?;
+        let mut acted = Vec::new();
+        for c in &record.coins {
+            if c.duplicate_index != 0 {
+                continue;
+            }
+            let Some(id) = c.statechain_id.clone() else { continue };
+            let Some(bundle) = mercuryrustlib::tesr::load(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let broadcast = mercuryrustlib::tesr::watch_pass(&self.inner.cc, &bundle);
+            if !broadcast.is_empty() {
+                let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
+                    statechain_id: id.clone(),
+                    tiers_broadcast: broadcast.len() as u32,
+                });
+                acted.push(id);
+            }
+        }
+        Ok(acted)
+    }
+
     /// Cooperative exit: withdraw specific coins (or `None` = all confirmed coins) to an on-chain
     /// address. One on-chain transaction per coin, SE co-signed, no timelock wait.
     pub async fn withdraw(
