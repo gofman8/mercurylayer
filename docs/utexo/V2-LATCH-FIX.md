@@ -53,30 +53,35 @@ for any coin whose latch is **live and un-committed, withholds the entire `encry
 *during* lock, serve *after* commit — never the inverse). Gate on `locked2` only, NOT
 `is_all_coins_unlocked` (circular — it needs the decrypted msg to clear `locked`, deadlocking the latch).
 
-**SSP pre-payment validation against SE-AUTHORITATIVE data [C1 — corrected: the sender is the adversary].**
-In the pay-invoice swap the SSP **is** the receiver and must run its value/recipient/asset gate
-(`execute_pay` → `peek_pending_transfers`, audit [3]/[4]) BEFORE it pays — but whole-message withholding
-hides the coin from that peek. The **sender is the adversary here**, so the pre-pay data must be
-SE-authoritative, NOT sender-asserted (a sender-signed `recipient_pubkey` is forgeable: the sender
-addresses the coin to a collaborator via `new_user_auth_key` yet claims `recipient=SSP` → SSP pays,
-collaborator claims → fund-loss). The existing gate's recipient proof is *decryptability*; replace it with
-an SE-authoritative check:
-- **Recipient:** the SSP reads the coin's **SE-stored `new_user_auth_key`** (set by the sender's
-  `transfer_sender::execute`, stored plaintext, `transfer_sender.rs:126-148`) via a batch-scoped read
-  (extend `batch_statechains` to return `new_user_auth_key` per member) and requires it **== its own auth
-  key**. Unforgeable: it is the very key the commit-time key-rotation will use, so a coin the SSP validates
-  is provably addressed to the SSP.
-- **Sats value:** the SSP reads the **on-chain funding UTXO `F`** (public, `f_txid:f_vout` from
-  `batch_statechains`) and requires `value(F) ≥ invoice + fee` — recomputed from the chain, not a declared
-  number. (Equivalently the SE serves an authoritative `funding_amount`; the chain is simplest.)
-- **RGB value:** for a token swap the sender provides the **consignment + witness** (not a sats claim) and
-  the SSP re-runs `validate_pending_token` (audit [4]) against the actual witness, exactly as today.
+**TWO-BLOB SPLIT for the SSP pay-invoice peek [C1 — final: separate the validation view from `S'`].**
+In the pay-invoice swap the SSP **is** the receiver and must run its full value/recipient/asset gate
+(`execute_pay` → `peek_pending_transfers`, audit [3]/[4]) BEFORE it pays. That gate needs to **decrypt and
+validate** the coin's real transfer artifacts — the V1-style `backup_transactions`/branch (→
+`validate_branch` + terminal-ancestor, the authoritative sats value), the RGB consignment+witness (→
+`validate_pending_token`), and the key-rotation material — and decryptability itself is the recipient
+proof. None of these substitutes work: an auth-key read proves *addressing* but not *claimability* (a
+garbage withheld blob still passes); `value(F)` is not chain-readable for an **un-broadcast V2 sub-coin**
+(`split_coin`, `transfer.rs:385`); a separately-shown consignment isn't bound to the withheld blob.
 
-None of this is a broadcastable claim (no `tesr_ladder`/`S'`); the full msg with `S'` is released only at
-commit as the SSP's post-pay exit ladder. **Trust note:** with recipient+value SE-authoritative, the only
-residual the SSP trusts is SE-liveness for the post-commit ladder it receives (its unilateral-exit safety)
-— acceptable for the operator-aligned SSP; a fully-trustless receiver would need an adaptor-signature on
-`S'` (future hardening). No pre-signed state is ever revealed pre-commit.
+Resolution: the **sender encrypts the transfer message as TWO ECIES blobs** to the receiver's auth key:
+- `enc_preview` = `{statechain_id, backup_transactions (branch), t1, key-rotation material, rgb_consignment}`
+  — i.e. essentially the **V1 transfer message**, everything the receiver's existing gate validates. It is
+  **NOT** a broadcastable claim on the coin (the V1 backups pay the *sender*; the key-rotation is
+  commit-gated) and contains **no `tesr_ladder`/`S'`**.
+- `enc_ladder` = `{tesr_ladder = augmented bundle with S'}` — the V2 unilateral-exit ladder.
+
+The server serves `enc_preview` **always** (pre-commit) so the SSP runs its **existing gate unchanged**
+(decrypt → recipient-by-decryptability + `validate_branch` value + `validate_pending_token`), and withholds
+`enc_ladder` until `locked2==false` (commit). The SSP's fund-safety comes entirely from `enc_preview` —
+which validates the coin's **ownership transfer + value**, exactly as a V1 latched swap does today, so the
+SSP path barely changes. `enc_ladder` (`S'`) is delivered post-commit as an **additive** unilateral-exit
+enhancement: if it is garbage/invalid (`verify_bundle` fails post-commit), the SSP has still validated and
+received the coin via `enc_preview` and simply falls back to a **cooperative** exit (SE-assisted) — a
+graceful degradation, **not** a fund-loss. Rollback ⇒ `enc_ladder` never released ⇒ the receiver never
+holds `S'` ⇒ no theft. **Trust note:** the SSP's pre-pay guarantee (own the coin, worth ≥ invoice) is the
+same as V1's and needs no new trust; the only V2-specific residual is SE-liveness for its unilateral-exit
+ladder, which the operator-aligned SSP already accepts. This subsumes the earlier "strip a field"
+(unbuildable on one blob) and "SE-authoritative substitute" (proves addressing not claimability) attempts.
 
 Because the server cannot tell a V1 blob from a V2 blob (both opaque), add a **plaintext
 `protocol_version` marker** to `transfer_update_msg` so the gate scopes to V2 only; absent that, accept
