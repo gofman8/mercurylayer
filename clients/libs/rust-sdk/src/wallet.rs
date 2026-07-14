@@ -458,9 +458,30 @@ impl UtexoWallet {
         if self.inner.config.deposit_protocol_version >= 2 {
             let mut rec = self.record().await?;
             let network = rec.network.clone();
+            // Terminal-freeze invariant (V2-DESIGN §5.10, rule 1): RGB rides the signed-once colored
+            // carrier model and is NEVER anchored on the renewable T/X/S ladder — a plain tier spend
+            // would destroy the allocation. So an RGB carrier must not get a ladder. `single_use`
+            // catches terminalized/combine carriers, but a resting issuance/received carrier holding
+            // an allocation need not be single_use, so we also exclude the RGB carrier set. Fail CLOSED
+            // for a token wallet whose RGB state is momentarily unavailable: skip establishing this
+            // pass (leave coins as V1) rather than risk laddering a carrier — the next claim() retries.
+            let carriers = if self.inner.config.rgb_data_dir.is_some()
+                && self.inner.config.rgb_proxy_url.is_some()
+            {
+                self.unspendable_as_btc_outpoints().await.map(Some).unwrap_or(None)
+            } else {
+                Some(std::collections::HashSet::new())
+            };
+            // `None` = a token wallet whose RGB state is momentarily unavailable → skip establishing
+            // this pass rather than risk laddering a carrier; the next claim() retries.
             for coin in rec.coins.iter_mut() {
+                let Some(carriers) = carriers.as_ref() else { break };
                 let sid = match &coin.statechain_id { Some(s) => s.clone(), None => continue };
-                if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 || coin.single_use {
+                if coin.status != CoinStatus::CONFIRMED
+                    || coin.duplicate_index != 0
+                    || coin.single_use
+                    || is_token_carrier(coin, carriers)
+                {
                     continue;
                 }
                 match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
