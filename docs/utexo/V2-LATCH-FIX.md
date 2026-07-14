@@ -1,9 +1,14 @@
 # V2 LN-latch atomicity — complete design (delivery-gate + reconcile-recovery)
 
-Status: **design, pause-before-coding** (per decision). This is the full, standalone spec for making
-LN-latched V2 transfers atomic. It supersedes the sketches in `V2-SERVER-LATCH.md` (rejected: wrong
-counter) and `V2-LATCH-RECOVERY.md` §1–8 (rejected alone: theft window). It pre-addresses every FATAL and
-SERIOUS from both adversarial reviews (mapping in §10). **No code until this doc is reviewed SOUND.**
+Status: **design, pause-before-coding** (per decision). Full standalone spec for making LN-latched V2
+transfers atomic. Supersedes `V2-SERVER-LATCH.md` (rejected: wrong counter) and `V2-LATCH-RECOVERY.md`
+§1–8 (rejected alone: theft window).
+
+**Review history:** review 1 (server-DB) → FATAL. review 2 (pure client) → FATAL theft window. review 3
+(this doc's v1) → **SOUND-WITH-EDITS, no FATAL** — the approach is validated; 7 SERIOUS + 2 MINOR were
+precise, bounded edits. **All 7 SERIOUS edits are now applied inline (tagged [S1]–[S7], [M1]/[M2]);** the
+two core re-specs (S1 whole-message withholding, S2 state-only renew) need a confirmation review before
+implementation. No code until that confirmation returns SOUND.
 
 ## 0. The one invariant everything serves
 
@@ -29,61 +34,99 @@ gates receiver progress on the preimage); (B) is pure client.
 
 ## 2. (A) Server delivery-gate
 
-### 2.1 Withhold the ladder until unlock
-`get_msg_addr` (`transfer_receiver.rs:92-116`) currently returns the transfer msg — including the
-ECIES-encrypted `tesr_ladder` — with no latch gate. Change: if the coin is a member of a **live,
-not-yet-unlocked** latch batch, return the msg with `tesr_ladder` **omitted** (V1 fields only, which are
-harmless — they pay the *sender*, not the receiver). Serve the full msg (with ladder) only once the batch
-is unlocked (`locked2` flipped by `update_unlock_transfer`). Commit ⇒ receiver fetches ladder, adopts `S'`,
-finalizes. Rollback ⇒ receiver never fetched the ladder ⇒ never holds `S'`.
+> **Revised per review 3 (SOUND-WITH-EDITS): S1, S3, S5, S6 applied below.** The prior "strip the
+> `tesr_ladder` field" construction was unbuildable — the whole `TransferMsg` is one opaque ECIES blob the
+> server cannot parse.
 
-Membership/unlock test: reuse the receiver-side batch state the key-rotation endpoint already consults
-(`validate_batch` / `locked2`), not a bespoke query. A V2 transfer with **no** latch (`batch_id=None`)
-is served normally (unchanged — this is the sdk49 path).
+### 2.1 Withhold the WHOLE message until unlock [S1]
+The whole `TransferMsg { …, tesr_ladder }` is ECIES-encrypted to the receiver's auth key as **one opaque
+blob** (`lib/src/transfer/sender.rs:132-151`); the server stores/serves exactly that ciphertext
+(`get_statechain_transfer_messages` → `get_msg_addr:108-116`) and cannot decrypt or drop a field. So the
+gate is **whole-message withholding**: `get_msg_addr` joins `statechain_transfer → lightning_latch` and,
+for any coin whose latch is **live and not yet `locked2`**, withholds the *entire* `encrypted_transfer_msg`;
+it serves the blob only once `locked2` is set. Gate strictly on **`locked2`**, NOT on
+`is_all_coins_unlocked` (which requires the receiver to have already decrypted the msg to clear `locked` —
+circular, and would deadlock the external latch). Commit ⇒ receiver fetches the msg, adopts `S'`,
+finalizes. Rollback ⇒ receiver never fetched the msg ⇒ never holds `S'`.
 
-### 2.2 Authoritative rollback signal (not client-guessed expiry)
-Recovery (B) must only fire on a state that can **never** commit. Two server facts break a naive
-client-expiry check:
-- `unlock_by_preimage` (`lightning_latch.rs:215-261`) has **no expiry guard** (unlike `transfer_preimage`
-  at `:141-153`). So a preimage presented after the client thinks the latch expired still commits ⇒ a
-  client that renewed-below meanwhile would have clawed back a committed coin (fund-loss). **Fix:** add the
-  same fail-closed expiry guard to `unlock_by_preimage`, so "expired" is final.
-- Latch rows are **reaped** (`insert_paymenthash` runs `DELETE ... WHERE expires_at < now()`,
-  `lightning_latch.rs:13`), so `get_latch_expiry_by_batch_id` returns `None` for BOTH "expired/gone" and
-  "transient DB error" — indistinguishable, and the *normal* rolled-back end-state is a reaped row.
-  **Fix:** a **resolved/consumed flag** on the latch row; reap only rows that are resolved
-  (committed or explicitly expired), and expose a tri-state `/transfer/latch_status/<batch_id>` →
-  `LIVE | SETTLED_FINAL | UNKNOWN`. Recovery acts only on `SETTLED_FINAL`+not-committed; `UNKNOWN` ⇒ wait.
-  The client also records `expires_at` in its marker at presign time as a secondary witness.
+Because the server cannot tell a V1 blob from a V2 blob (both opaque), add a **plaintext
+`protocol_version` marker** to the `transfer_update_msg` upload so the gate scopes to V2 only; absent that,
+accept that V1-latch msgs are *also* withheld until `locked2` and carry a **V1-latch regression test**
+proving the classic swap still completes (the V1 receiver re-polls `get_msg_addr` post-unlock — confirm
+`execute()` does). A withheld-msg receiver's `validate_encrypted_message` simply errors "missing TES-R
+ladder" and waits (`clients/libs/rust/src/transfer_receiver.rs:597`) — "nothing but wait" holds; the old
+"V1 fields harmlessly served" premise is deleted. A V2 transfer with **no** latch (`batch_id=None`) is
+served normally (the sdk49 path). **Latch-before-msg [S3/M-upload]:** `get_msg_addr` must withhold any
+V2 ladder blob whose `statechain_id` has an *unresolved* latch OR whose latch row does not yet exist for
+its `batch_id` — so an upload-before-latch window cannot serve an un-gated ladder.
 
-### 2.3 Concurrency: block any transfer of a still-latched coin
-`statechain_in_latch_batch` only guards the anti-poisoning path (`transfer_sender.rs:71-78`); a **plain**
-re-transfer (`batch_id=None`) of a latched coin is gated only by the short `batch_timeout` (120s), not by
-latch liveness. **Fix:** gate `transfer_sender` to refuse **any** transfer of a coin that currently has a
-live `lightning_latch` row (per-statechain latch-live query), regardless of the new `batch_id`; and the
-client refuses a second transfer of a coin with an unresolved local marker. This makes §4's "do nothing
-while live" sound.
+### 2.2 Finality = one DB compare-and-swap on `resolved` [S3]
+Do **not** gate commit on a wall-clock compare (two decoupled clocks let a late `unlock_by_preimage`
+commit after the client saw the latch expired → clawback fund-loss). Add a `resolved` column
+(`NULL | 'committed' | 'expired'`) and make it the single serialization point:
+- **Commit** (any `locked2`-flip path — `unlock_by_preimage` AND `transfer_unlock` AND `transfer_preimage`)
+  runs, in one transaction: `UPDATE lightning_latch SET resolved='committed' WHERE batch_id=$1 AND resolved
+  IS NULL AND expires_at > now()` and flips `locked2` **iff that UPDATE hit the row**.
+- **Expiry sweeper**: `UPDATE … SET resolved='expired' WHERE resolved IS NULL AND expires_at <= now()`
+  (eager, not lazy).
+- **Status** `/transfer/latch_status/<batch_id>` and recovery read `resolved` only:
+  `LIVE (NULL)` / `SETTLED('committed'|'expired')` / `UNKNOWN (DB error)`. Recovery acts only on
+  `resolved='expired'`; `UNKNOWN` ⇒ wait. "Expired is final" is now a CAS immune to clock skew.
+
+### 2.3 Concurrency: refuse a *conflicting* transfer of a live-latched coin [S6]
+Define **`live := row exists AND resolved IS NULL AND expires_at > now()`** everywhere. The initiation
+transfer of the swap (`start_lightning_swap` inserts the latch **then** calls `execute(.., Some(batch))`,
+`lightning.rs:69-85`) must NOT be refused — so refuse a transfer only when the coin has a **live** latch
+with `batch_id ≠ new_batch_id` (or `None`) **and** a transfer msg for that live batch already exists. The
+client also refuses a second transfer of a coin with an unresolved local marker. Commit sets
+`resolved='committed'` (2.2) so a received coin unfreezes immediately; the eager sweeper resolves
+rolled-back rows to `'expired'` so they neither block re-transfer nor strand recovery.
+
+### 2.4 Reap timing [S5]
+Never reap a `resolved='committed'` row before its `expires_at` — reap on `resolved='expired' OR (resolved
+='committed' AND expires_at < now())`. Otherwise a committed row reaped at unlock collapses `validate_batch`
+to the short `batch_timeout` (120s) < LN settlement time, stranding the receiver's finalize. Simpler
+alternative: make `validate_batch` return `Success` whenever `is_all_coins_unlocked` regardless of an
+absent latch clock (a fully-unlocked batch is terminal).
 
 ## 3. (B) Client recovery — the reconcile primitive
 
+> **Revised per review 3: S2 (state-only renew), S4 (serialized), M1 (refused-renew fallback) applied.**
+
 The core operation is **`reconcile(coin)`**, keyed on the authoritative enclave count, not on marker
-presence. It is idempotent and crash-re-runnable:
+presence. It runs under a **per-coin persisted advisory lock** (same shape as `acquire_signfirst_lock`,
+`sign.rs:23`) so two concurrent runs (a maintenance pass + a transfer-triggered recovery, or two wallet
+instances) cannot each renew and double-count [S4]. The whole fold→renew→persist is one critical section;
+idempotent and crash-re-runnable:
 
 ```
-reconcile(coin):
-  bundle  = load(coin);  se = signature_count(coin)         # live enclave truth
+reconcile(coin):                                # holds per-coin advisory lock
+  bundle = load(coin);  se = signature_count(coin)          # live enclave truth (fail-safe: unreachable ⇒ return WAIT)
   if disclosed(bundle) == se: drop_marker(coin); return OK   # already balanced
-  # deficit = se - disclosed(bundle) orphan co-signs exist. Recover their CSVs:
-  for each orphan CSV known from the marker(s) (a presign records {txid, csv}):
-      if that tier is not already in superseded_states: push it; persist(bundle)   # write-ahead disclosure
-  # If a marker is MISSING (e.g. mnemonic restore) but deficit remains, orphans exist at UNKNOWN CSV:
-  if disclosed(bundle) < se: return NEEDS_EXIT_OR_REFRESH     # cannot safely renew-below unknown CSVs
-  # Now every orphan is disclosed. Restore maturity dominance:
-  renew_below(bundle, target_state_csv = min(all superseded state csv) - δ,
-                      target_ext_csv   = min(all superseded ext   csv) - δ)   # raw renew(), persist per co-sign
-  assert verify_bundle(bundle, signature_count(coin))  # count AND maturity, both checks
+  # deficit orphan co-signs exist. Fold each by the CSV its marker recorded:
+  for each marker m of coin (a presign records {orphan_txid, orphan_csv, pre_presign_sig_count}):
+      if se <= m.pre_presign_sig_count: discard m            # phantom: co-sign never landed (S-phantom)
+      elif orphan not already in superseded_states:
+          push {txid,csv,out_value} to superseded_states; persist(bundle)   # write-ahead disclosure
+  if disclosed(bundle) < se: return NEEDS_EXIT_OR_REFRESH     # orphans at UNKNOWN csv (marker lost) — never guess
+  # Every orphan disclosed. Restore maturity dominance with a STATE-ONLY renew [S2]:
+  target = (min superseded state csv) - δ
+  if target < d_floor: return NEEDS_EXIT_OR_REFRESH          # no runway (guarded up front by §3.3, belt-and-suspenders)
+  r = renew_state_only(bundle, target)                        # ONE co-sign; re-sign only the state, NOT the extension
+  if r == SE_REFUSED: return NEEDS_EXIT_OR_REFRESH            # budget/single-use/epoch refused the renew (M1)
+  persist(bundle)                                             # disclose the +1 before returning
+  assert verify_bundle(bundle, signature_count(coin))         # count AND maturity (states + extensions)
   drop_marker(coin); return OK
 ```
+
+**Why state-only [S2].** A latched presign lowered only a *state* (`presign_receiver_state` pushes only
+`superseded_states`, never a superseded extension — `tesr.rs:307`), so only a *state* needs re-signing to
+regain maturity dominance. Reusing raw `renew()` (always +2, extension+state) is wrong here: on the common
+first-transfer rollback `superseded_extensions` is empty so `min(∅)−δ` is undefined, and on mainnet
+(`δ==δ_e==36`) it would install a new extension *equal to* a superseded one, failing the extended step-4
+check. So recovery adds a **`renew_state_only(bundle, csv_d)`** primitive: build+co-sign a fresh state at
+`csv_d` spending the current extension's output, push the old state to `superseded_states`, leave the
+extension untouched. +1 co-sign, +1 disclosure — balanced.
 
 ### 3.1 Write-ahead discipline (kills every crash-brick finding)
 Two rules make the enclave count and the disclosed set never diverge unrecoverably:
@@ -98,28 +141,40 @@ Two rules make the enclave count and the disclosed set never diverge unrecoverab
    So `disclosed` is at most one co-sign behind `se`, and `reconcile` closes that residue on re-entry. A
    mid-recovery crash therefore never leaves an un-disclosed co-sign that a later run double-counts.
 
-### 3.2 renew-below mechanics
-Recovery calls **raw `renew()`** (never `renew_auto`, which resets state CSV to D0 and breaks maturity),
-with an explicit state CSV `= (min superseded state CSV) − δ` **and** extension CSV `= (min superseded
-ext CSV) − δ` — strictly below *every* superseded tier of its kind (preserves the DW monotonic-extension
-invariant). `renew()` is always +2 co-signs (extension+state), both disclosed. `verify_bundle` step 4 is
-**extended** to also reject any superseded *extension* whose CSV ≤ the current extension CSV (today it only
-race-checks states).
+### 3.2 verify_bundle maturity extension (still needed for general renewals)
+Recovery is state-only (§3), but ordinary DW renewals *do* create superseded extensions, and today
+`verify_bundle` step 4 race-checks only states. **Extend it** to also reject any superseded *extension*
+whose CSV ≤ the current extension CSV — independently correct and required so a state-only recovery bundle
+that co-exists with prior real renewals still verifies. Pure client, backward-compatible.
 
-### 3.3 Floor-scoped presign guard (near-floor is a THEFT edge, not liveness)
-If `S'` lands within δ of the floor, recovery cannot place the owner state strictly below it, and — with
-the receiver holding `S'` per the theft path — that is unrecoverable theft, not a benign "exit-only". So
-**refuse the latched presign up front** unless `state_csv(k) − 2δ ≥ d_floor` (reserve ≥ 2δ of runway).
-Same shape as the sdk53 guard but floor-scoped: a coin too near its floor does its LN swap only after a
-`refresh` restores runway. This bounds the edge instead of racing it.
+### 3.3 Presign guards up front (near-floor is a THEFT edge; budgeted/epoch coins) [S2/M1]
+- **State runway:** if `S'` would land within δ of the floor, recovery cannot place the owner state
+  strictly below it, and — with the receiver holding `S'` on the theft path — that is unrecoverable theft,
+  not benign "exit-only". **Refuse the latched presign up front** unless `state_csv(k) − 2δ ≥ d_floor`
+  (reserve ≥ 2δ of *state* runway). Recovery is state-only, so it consumes no *extension* runway — the
+  extension-floor concern does not arise. Repeated rollbacks on one coin each consume one state level;
+  when runway is exhausted the coin degrades gracefully to `refresh` (§3.4), never to theft.
+- **Budget/epoch:** recovery's renew is an SE co-sign that the untouched fork guards can refuse
+  (single-use, `sig_budget`, epoch-deadline — `sign.rs:83-124`). So also **refuse the latched presign up
+  front** on a single-use / budgeted / epoch-deadlined coin (a carrier is already never laddered, sdk52).
+  Then recovery's renew can always proceed; if it is nonetheless refused, `reconcile` returns
+  `NEEDS_EXIT_OR_REFRESH` rather than asserting.
 
-### 3.4 Mnemonic-restore
-`backup_txs` (holding both `tesr-<id>` and the marker) are **not** restored from the 12-word mnemonic
-(`sqlite_manager.rs`), so a restored wallet loses its markers. Mitigation: (a) the recovery bundle export
-(existing feature) MUST include markers, exported atomically with the marker write; (b) absent that, a
-restored still-owned coin whose `se_num_sigs` exceeds its disclosed tier count has orphans at **unknown**
-CSV ⇒ `reconcile` returns `NEEDS_EXIT_OR_REFRESH` (funds safe, coin exitable/refreshable) rather than
-guessing a CSV. Never silently brick.
+Same shape as the sdk53 guard but scoped: a coin that fails either guard does its LN swap only after a
+`refresh`. This bounds the edges instead of racing them.
+
+### 3.4 Mnemonic-restore [S7 — corrected: not "exitable", `import_recovery_bundle` is the sole recovery]
+`backup_txs` hold BOTH the `tesr-<id>` bundle AND the marker, and **neither is derived from the 12-word
+mnemonic** (`sqlite_manager.rs`). So a mnemonic-**only** restore recovers *nothing* off-chain: no coin, no
+ladder, no marker — `F` is a bare `P2TR(A)` whose un-broadcast trigger is gone. The earlier "funds safe,
+exitable" claim was **false** for mnemonic-only restore. Correct policy:
+- The **recovery-bundle export** (existing `export_recovery_bundle`) is the ONLY recovery for a latch-
+  orphaned V2 coin, and it MUST include markers. Make export **mandatory/automatic** for any coin that
+  enters a latched transfer (write-ahead with the marker), so a latched coin always has an off-wallet
+  recovery artifact.
+- With the recovery bundle imported, `reconcile` runs normally. Without it, the coin is unrecoverable by
+  mnemonic alone — a property already true of every V2 coin (the ladder is off-chain), now made explicit
+  and forced for latched coins. Never claim mnemonic-only exitability.
 
 ## 4. Commit / rollback / crash state machine
 
@@ -130,8 +185,8 @@ guessing a CSV. Never silently brick.
 | **rollback** (expiry, `SETTLED_FINAL`) | ladder never released | sender `reconcile`s: fold orphan, renew-below, persist | coin whole, transferable |
 | crash after co-sign, before marker | count +1, marker present (written first) | `reconcile` sees deficit, folds by marker CSV | recovered |
 | crash after marker, co-sign failed | count unchanged, marker present | `reconcile` sees no deficit vs pre_presign_sig_count → discard phantom marker | no overcount |
-| crash mid-recovery-renew | count +1/+2, each disclosed write-ahead | `reconcile` re-runs from persisted bundle, closes residual deficit | recovered |
-| mnemonic restore, orphan outstanding | count +1, no marker | `reconcile` → NEEDS_EXIT_OR_REFRESH | funds safe, exitable |
+| crash mid-recovery-renew | count +1, disclosed write-ahead | `reconcile` re-runs under the per-coin lock, closes residual deficit | recovered |
+| **mnemonic-only** restore (no recovery bundle) | count +N, no coin/ladder/marker | nothing off-chain survives; only `import_recovery_bundle` recovers | coin needs its recovery bundle (true of every V2 coin) — NOT mnemonic-exitable |
 
 ## 5. Why it is safe
 - **Theft window closed:** on rollback the receiver never obtains `S'` (2.1), so only the sender holds it,
