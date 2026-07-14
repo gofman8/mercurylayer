@@ -187,9 +187,23 @@ fn encode(tx: &Transaction) -> TierTx {
     }
 }
 
-/// The scriptPubKey for a bech32(m) address string on `network`.
+/// The scriptPubKey a TES-R tier output should pay for `address` on `network`. Two forms, mirroring
+/// `create_tx_out` exactly so a state tier can pay a transfer recipient (Model A, V2-MIGRATION):
+/// - a **Mercury transfer address** (`utexoinv…`/`tml…` HRP) → the recipient's DERIVED
+///   `P2TR(recipient_user_pubkey)`, so the sender can pre-sign the receiver-paying state `S'`;
+/// - a plain bech32(m) address → itself.
 fn spk_from_address(address: &str, network: &str) -> Result<ScriptBuf, MercuryError> {
     let net = get_network(network)?;
+    if address.starts_with(crate::MAINNET_HRP) || address.starts_with(crate::TESTNET_HRP) {
+        let (_, recipient_user_pubkey, _) = crate::decode_transfer_address(address)?;
+        return Ok(Address::p2tr(
+            &secp256k1_zkp::Secp256k1::new(),
+            recipient_user_pubkey.x_only_public_key().0,
+            None,
+            net,
+        )
+        .script_pubkey());
+    }
     Ok(Address::from_str(address)
         .map_err(|_| MercuryError::InvalidBitcoinAddressError)?
         .require_network(net)
@@ -351,6 +365,34 @@ mod tests {
         // Rollover at the renewal cap m_max=2.
         assert!(!p.needs_rollover(1));
         assert!(p.needs_rollover(2));
+    }
+
+    #[test]
+    fn spk_resolves_plain_and_mercury_addresses() {
+        // Plain bech32m P2TR → itself (34-byte OP_1 <32>).
+        let plain = spk_from_address(
+            "bcrt1p83afnxgnczlsqvd20swjlnr3kcm7hvz9p338dgueetjz2tx6vvjs05rsfy",
+            "regtest",
+        )
+        .expect("plain address resolves");
+        assert_eq!(plain.as_bytes().len(), 34);
+        assert_eq!(plain.as_bytes()[0], 0x51);
+        assert_eq!(plain.as_bytes()[1], 0x20);
+
+        // Mercury transfer address → the recipient's DERIVED P2TR (Model A payee), matching
+        // create_tx_out exactly. A real regtest transfer address (from sdk01).
+        let mercury = "tml1qqp65hkjf3rq03fypj26nuvr6j8hr5gjktqdwkvkkamkl7kj5pa0ffgz7ckag5keskjjjdc9l6s9n9sj5ntrrx20umsuh5manvcc0gczlh5qgquuch";
+        let via_helper = spk_from_address(mercury, "regtest").expect("mercury address resolves");
+        let (_, upk, _) = crate::decode_transfer_address(mercury).unwrap();
+        let expected = Address::p2tr(
+            &secp256k1_zkp::Secp256k1::new(),
+            upk.x_only_public_key().0,
+            None,
+            bitcoin::Network::Regtest,
+        )
+        .script_pubkey();
+        assert_eq!(via_helper, expected, "mercury address resolves to P2TR(recipient_user_pubkey)");
+        assert_eq!(via_helper.as_bytes().len(), 34, "and it is a P2TR output");
     }
 
     #[test]
