@@ -957,6 +957,24 @@ impl UtexoWallet {
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let mut statuses = Vec::new();
         for id in ids {
+            // V2 (TES-R) coin: if a ladder was adopted (deposit-established or received via Model A),
+            // the unilateral exit runs the tier chain — trigger spends F, then each extension/state as
+            // its relative-CSV matures — NOT the V1 absolute-locktime backup. exit_pass is idempotent
+            // and incremental: it advances the ladder as far as maturity allows on each call, so an
+            // owner (or a background loop) calls unilateral_exit once per block until `complete`.
+            if let Some(bundle) =
+                mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &id).await?
+            {
+                let (_broadcast, done) = mercuryrustlib::tesr::exit_pass(&self.inner.cc, &bundle);
+                let wait_blocks = if done {
+                    0
+                } else {
+                    mercuryrustlib::tesr::next_exit_tier(&self.inner.cc, &bundle).unwrap_or(0) as u32
+                };
+                statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
+                continue;
+            }
+
             // Materialize the coin's funding first (no locktime on branch txs).
             let has_branch = self.broadcast_branch_if_any(&id).await?;
             // Audit [20]: distinguish a genuinely FLAT coin (on-chain funding, legitimately no branch)

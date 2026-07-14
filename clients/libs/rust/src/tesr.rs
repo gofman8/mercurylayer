@@ -379,6 +379,43 @@ pub fn watch_pass(cc: &ClientConfig, bundle: &TesrBundle) -> Vec<String> {
     acted
 }
 
+/// **Owner-initiated unilateral exit of a V2 coin.** Like [`watch_pass`], but this KICKS OFF the exit
+/// by spending `F` with the trigger — a tower defends an already-triggered coin and never initiates,
+/// whereas an owner walking away must start the clock. Broadcasts the trigger (if `F` is still unspent)
+/// and then every subsequent tier whose relative-CSV is now met, in exit order, stopping at the first
+/// not-yet-mature tier. Idempotent and incremental: call once per block (already-confirmed/known tiers
+/// are skipped). Returns `(txids_broadcast_this_pass, done)` where `done` is true once the final exit
+/// state is on-chain or in the mempool — i.e. the funds are committed to the owner's exit address.
+pub fn exit_pass(cc: &ClientConfig, bundle: &TesrBundle) -> (Vec<String>, bool) {
+    let mut acted = Vec::new();
+    for tier in bundle.exit_tiers() {
+        if tx_known(cc, &tier.txid) {
+            continue; // already on-chain / in mempool
+        }
+        let raw = match hex::decode(&tier.signed_tx) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        match cc.electrum_client.transaction_broadcast_raw(&raw) {
+            Ok(_) => acted.push(tier.txid.clone()),
+            Err(_) => break, // CSV not met yet / parent unconfirmed — retry on the next pass
+        }
+    }
+    let done = tx_known(cc, &bundle.current().state.txid);
+    (acted, done)
+}
+
+/// The first tier not yet on-chain in exit order, and its relative-CSV (a wait-time hint). `None` once
+/// the exit is complete. Used to report `ExitStatus.wait_blocks` for a V2 unilateral exit.
+pub fn next_exit_tier(cc: &ClientConfig, bundle: &TesrBundle) -> Option<u16> {
+    for tier in bundle.exit_tiers() {
+        if !tx_known(cc, &tier.txid) {
+            return Some(tier.csv.unwrap_or(0));
+        }
+    }
+    None
+}
+
 fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
     use electrum_client::bitcoin::Network;
     match network.to_ascii_lowercase().as_str() {
