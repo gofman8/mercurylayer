@@ -1,14 +1,35 @@
 # V2 LN-latch atomicity — complete design (delivery-gate + reconcile-recovery)
 
-Status: **design, pause-before-coding** (per decision). Full standalone spec for making LN-latched V2
-transfers atomic. Supersedes `V2-SERVER-LATCH.md` (rejected: wrong counter) and `V2-LATCH-RECOVERY.md`
-§1–8 (rejected alone: theft window).
+> ## VERDICT after 6 review rounds: CORE SOUND; the SSP-mediated LN swap needs ADAPTOR SIGNATURES.
+>
+> **What is SOUND (ruled so, review round 5):** the client **reconcile-recovery** (§3) and the design's
+> internal consistency. The **delivery-gate + reconcile** mechanism correctly makes a *direct* (P2P,
+> receiver-not-pre-validating) latched V2 transfer atomic.
+>
+> **The fundamental wall (review round 6, FATAL, verified in code):** the SSP-mediated **pay-invoice**
+> swap requires the SSP to *validate ownership of the coin pre-payment*, and **any** conveyed transfer
+> material that proves ownership is *also* a broadcastable claim — the last V1 backup pays the RECEIVER
+> (`transfer_sender.rs:165`) and the receiver's gate requires it (`transfer_receiver.rs:583`). So
+> "SSP can validate pre-pay" and "rolled-back receiver holds no claim" are the **same capability** and
+> cannot both hold with any plaintext/decryptable pre-commit artifact. Four attempts (field-strip,
+> SE-authoritative read, two-blob split) each hit this wall. The **only** clean resolution is an
+> **adaptor signature** on the receiver-paying material, completable solely by the LN preimage (valid but
+> non-broadcastable pre-commit) — real cryptographic work, likely touching the co-signing path.
+>
+> **Strategic consequence.** The delivery-gate + reconcile is only needed for *latched* V2 transfers,
+> i.e. the LN path. Removing V1 for **every non-LN flow** needs **none** of this — V2 already handles
+> direct transfers (sdk49), deposits, exits, watchtower, RGB (all validated). So: **remove V1 for non-LN
+> now** (flip default, migrate tests, delete V1 non-LN code; keep V1 solely as the LN-swap lane + the
+> sdk53 guard); treat **atomic latched V2 via adaptor signatures** as a dedicated future effort to retire
+> the last V1 lane. Everything below is the (sound-for-direct) delivery-gate + reconcile design, retained
+> for that future effort. The sdk53 guard stays; the system is safe today.
 
-**Review history:** review 1 (server-DB) → FATAL. review 2 (pure client) → FATAL theft window. review 3
-(this doc's v1) → **SOUND-WITH-EDITS, no FATAL** — the approach is validated; 7 SERIOUS + 2 MINOR were
-precise, bounded edits. **All 7 SERIOUS edits are now applied inline (tagged [S1]–[S7], [M1]/[M2]);** the
-two core re-specs (S1 whole-message withholding, S2 state-only renew) need a confirmation review before
-implementation. No code until that confirmation returns SOUND.
+Status: **design captured; core sound, SSP path needs adaptor sigs (see verdict).** Supersedes
+`V2-SERVER-LATCH.md` (rejected: wrong counter) and `V2-LATCH-RECOVERY.md` §1–8 (rejected: theft window).
+
+**Review history:** r1 (server-DB) → FATAL wrong-counter. r2 (pure client) → FATAL theft. r3 → SOUND-
+WITH-EDITS (7 SERIOUS, applied). r4 → 3 SERIOUS (applied). r5 → core SOUND; SSP FATAL (sender-forgeable),
+fixed→two-blob. r6 → two-blob FATAL: **the receiver-paying-claim wall is fundamental** → adaptor sigs.
 
 ## 0. The one invariant everything serves
 
