@@ -18,6 +18,8 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
 }
 
 pub async fn execute() -> Result<()> {
+    // LN swaps require a V1 coin until adaptor-sig LN lands (V2-MIGRATION-PLAN); pin regardless of the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }

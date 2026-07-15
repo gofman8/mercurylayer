@@ -47,6 +47,8 @@ async fn fund_and_utxos(node: &rln::RlnNode, client: &RlnClient) -> Result<()> {
 }
 
 pub async fn execute() -> Result<()> {
+    // LN swaps require a V1 coin until adaptor-sig LN lands (V2-MIGRATION-PLAN); pin regardless of the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     // Two RLN nodes: A = issuer/payer, B = receiver.
     let a = rln::RlnNode::start("/tmp/rln-sdk23/a", 3111, 9845, true).await?;
     let b = rln::RlnNode::start("/tmp/rln-sdk23/b", 3112, 9846, true).await?;
