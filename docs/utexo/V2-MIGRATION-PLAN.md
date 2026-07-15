@@ -41,6 +41,26 @@ Delete only V1 code that V2 fully replaces AND that the LN lane does not use:
 sdk53 guard, `create_backup_tx_to_receiver`, the V1 receiver path for latched transfers. These retire only
 when adaptor-sig LN lands.
 
+## Empirical findings (from migrating sdk02 ✅ + probing sdk16)
+Per-test migration divides into two kinds, learned by running under V2 on the live stack:
+1. **Assertion tweak (trivial)** — e.g. sdk02 (DONE, green): a token carrier's sats are excluded from
+   `available_sats` (carrier ⊥ ladder), so any `available_sats >= N` "carrier confirmed" check must
+   become a settled-allocation / coin-status check. One-line change.
+2. **Needs a V2-safe carrier-confirmed helper (non-trivial)** — e.g. sdk16: the engine token balance
+   settles BEFORE the statechain carrier COIN confirms, and the old proxy `available_sats >= pre+10_000`
+   (the carrier's sats appearing) no longer works under V2. Dropping it breaks the wait → the next
+   `transfer_tokens` finds "0 carriers". **Reusable fix:** a helper that polls the RAW coin list for a
+   CONFIRMED non-dup coin of the carrier's sat amount — exactly what sdk52 does
+   (`get_wallet(...).coins.iter().find(|c| c.status==CONFIRMED && c.amount==Some(carrier_amt))`). This
+   unblocks the whole token-test class (sdk02/16/29/31/32/34/36/39). Build it once in `utils`, reuse.
+3. Some tests also exercise V2 **split + Model A + ladder exit** (sdk16's `transfer`+`unilateral_exit`)
+   — paths beyond sdk49's direct transfer; migrating them doubles as validation that V2 split-transfer
+   works, and may surface real gaps to fix (not just test edits).
+
+Recommended order for the token/RGB class: land the shared `wait_carrier_coin_confirmed` helper first,
+then migrate sdk02/16/29/31/32/34/36/39 using it; then the sats/adversarial class; then flip the default.
+
 ## Sequencing note
 This is a ~42-test migration + a careful V1 deletion — substantial and best done in validated batches
 against the live stack, not one big push. Each step above is independently committable and green-gated.
+Status: LN tests pinned V1 (done); sdk02 migrated V2 (done); ~27 non-LN tests + the default flip remain.
