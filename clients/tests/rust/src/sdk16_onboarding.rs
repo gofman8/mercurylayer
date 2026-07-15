@@ -38,6 +38,7 @@ pub async fn execute() -> Result<()> {
     for d in ["./rgb-data-sdk16_alice", "./rgb-data-sdk16_bob"] {
         let _ = std::fs::remove_dir_all(d);
     }
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2"); // V2DEF-5: onboarding on V2-native wallets
     let cc = mercuryrustlib::client_config::load().await;
 
     let mut alice_cfg = SdkConfig::regtest("sdk16_alice");
@@ -70,18 +71,24 @@ pub async fn execute() -> Result<()> {
     bitcoin_core::generatetoaddress(3, &core)?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     for _ in 0..4 { let t = prepaid_token(&cc).await?; alice.add_prepaid_token(&t).await; }
-    let alice_sats_pre = alice.get_balance().await?.available_sats;
     let asset = alice.issue_token("ONB", "Onboarding token", 0, 1000).await?;
-    // Wait for the colored carrier COIN to CONFIRM — i.e. its 10k sats appear in alice's balance AND
-    // the supply is bound to it. (The engine token balance settles earlier than the statechain coin.)
+    // Wait for the colored carrier COIN to CONFIRM. V2DEF-5: under V2 the carrier's sats are excluded
+    // from available_sats (carrier ⊥ ladder), and the engine token balance settles BEFORE the statechain
+    // coin, so the old `available_sats >= pre+10_000` proxy no longer signals the coin confirmed. The
+    // version-agnostic signal is the raw coin count: alice now has TWO confirmed non-dup coins (the 60k
+    // deposit + the issuance carrier) AND the supply is bound.
     let mut ready = false;
     for _ in 0..40 {
         bitcoin_core::generatetoaddress(1, &core)?;
         alice.claim().await?;
+        let n_confirmed = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk16_alice")
+            .await?
+            .coins
+            .iter()
+            .filter(|c| c.status == mercuryrustlib::CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .count();
         let b = alice.get_balance().await?;
-        if b.available_sats >= alice_sats_pre + 10_000
-            && b.tokens.iter().any(|t| t.asset_id == asset && t.balance >= 1000)
-        {
+        if n_confirmed >= 2 && b.tokens.iter().any(|t| t.asset_id == asset && t.balance >= 1000) {
             ready = true;
             break;
         }
