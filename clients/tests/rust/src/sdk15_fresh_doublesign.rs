@@ -24,6 +24,10 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 }
 
 pub async fn execute() -> Result<()> {
+    // V2DEF-5: this test exercises V1-specific mechanisms (decrementing-locktime stale-state /
+    // invalidation / re-anchor) that V2 replaces for roots but that remain for V1 split sub-coins &
+    // the LN lane. Pin V1 so it stays a V1-lane regression test under the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
