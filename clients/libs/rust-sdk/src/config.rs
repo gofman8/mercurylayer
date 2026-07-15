@@ -62,7 +62,8 @@ pub struct SdkConfig {
 }
 
 /// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT` (default `1` during
-/// the V1→TES-R migration). Flip to `2` only once the migration (V2DEF-2..5) is complete.
+/// the V1→TES-R migration; flips to `2` at the END of V2DEF-5 once every non-LN test is V2-migrated —
+/// see `docs/utexo/V2-MIGRATION-PLAN.md`). Tests migrate one at a time by setting the env var to `2`.
 fn deposit_protocol_default() -> u32 {
     std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1)
 }

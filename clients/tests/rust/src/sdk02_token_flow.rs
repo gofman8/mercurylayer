@@ -26,6 +26,7 @@ pub async fn execute() -> Result<()> {
     for d in ["./rgb-data-sdk2_alice", "./rgb-data-sdk2_bob"] {
         let _ = std::fs::remove_dir_all(d);
     }
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2"); // V2DEF-5: token flow on V2-native wallets
 
     let cc = mercuryrustlib::client_config::load().await;
 
@@ -58,10 +59,11 @@ pub async fn execute() -> Result<()> {
     loop {
         alice.claim().await?;
         let b = alice.get_balance().await?;
-        if b.available_sats >= 10_000 && !b.tokens.is_empty() {
+        // V2DEF-5: a token carrier's sats are excluded from available_sats (carrier ⊥ ladder), so the
+        // carrier-confirmed signal is the settled RGB allocation, not a sats threshold.
+        if !b.tokens.is_empty() && b.tokens[0].balance == 1000 {
             println!(
-                "SDK02 - alice token carrier confirmed: {} sats, {} {} settled",
-                b.available_sats,
+                "SDK02 - alice token carrier confirmed: {} {} settled",
                 b.tokens[0].balance,
                 b.tokens[0].ticker.clone().unwrap_or_default()
             );
