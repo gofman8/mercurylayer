@@ -63,4 +63,19 @@ then migrate sdk02/16/29/31/32/34/36/39 using it; then the sats/adversarial clas
 ## Sequencing note
 This is a ~42-test migration + a careful V1 deletion — substantial and best done in validated batches
 against the live stack, not one big push. Each step above is independently committable and green-gated.
-Status: LN tests pinned V1 (done); sdk02 migrated V2 (done); ~27 non-LN tests + the default flip remain.
+
+## STATUS: V2DEF-5 default flip DONE (`config.rs` default = 2).
+Every affected test validated on the live stack:
+- **17 non-LN on V2** — 14 pass as-is (sdk01/04/08/10/11/12/19/28/29/31/34/36/38/39), 3 migrated for the
+  carrier ⊥ ladder sats-accounting (sdk02/09/16, via the confirmed-coin-count signal).
+- **12 non-LN pinned V1** (V1-lane regression tests): sdk07/13/14/15/17/26/27/30/32/33/35 + chaos22.
+- **10 LN pinned V1**; sdk40–53 V2 suite unaffected.
+
+**Honest end-state — what V1 REMAINS (V2DEF-6 is narrower than "delete all V1"):** V1 stays for (a) the
+LN-swap lane (needs adaptor-sig atomicity — `V2-LATCH-FIX.md`), (b) **split sub-coins** — a transfer that
+splits conveys the receiver a V1 sub-coin (no ladder on off-chain sub-coins; sdk16 confirmed the exit is
+the V1 backup), so the V1 decrementing-locktime / invalidation / refresh machinery the 12 pinned tests
+cover is still live, and (c) the receiver's V1 path for latched transfers. **V2DEF-6 can only delete V1
+code that is now truly dead** (fully replaced for ROOT coins and unused by the LN lane + split sub-coins).
+Full V1 removal additionally requires **V2 split-transfer** (Model A on the split sub-coin) + adaptor-sig
+LN — both dedicated follow-on V2 work, not test migration.
