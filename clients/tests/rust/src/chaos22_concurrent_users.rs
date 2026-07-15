@@ -232,6 +232,8 @@ async fn refill_tokens(user: &UserHandle, n: usize, bitcoin: &Mutex<()>) {
 // ------------------------------------------------------------------------------------------------
 
 pub async fn execute() -> Result<()> {
+    // V2DEF-5: pin V1 — stresses V1 invalidation/stale-state under concurrency (V2 has different CSV semantics). V1-lane regression test under the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     let cfg = Cfg::from_env();
     let _ = std::fs::remove_dir_all(&cfg.run_dir);
     std::fs::create_dir_all(&cfg.run_dir)?;

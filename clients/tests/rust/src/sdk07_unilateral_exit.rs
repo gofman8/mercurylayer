@@ -23,6 +23,8 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
 }
 
 pub async fn execute() -> Result<()> {
+    // V2DEF-5: pin V1 — asserts the V1 990-block decrementing-locktime backup exit (V2 exits via the ladder, sdk50). V1-lane regression test under the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }

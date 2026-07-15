@@ -119,6 +119,8 @@ fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> Result<bool> {
     Ok(!cc.electrum_client.script_list_unspent(spk)?.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout))
 }
 pub async fn execute() -> Result<()> {
+    // V2DEF-5: pin V1 — receiver validation asserts V1 LocktimeTooLow (V2 uses CSV, not decrementing locktime). V1-lane regression test under the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }

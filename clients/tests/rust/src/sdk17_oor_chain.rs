@@ -44,6 +44,8 @@ async fn claim_one(w: &UtexoWallet) -> Result<()> {
 }
 
 pub async fn execute() -> Result<()> {
+    // V2DEF-5: pin V1 — OOR exit timing is V1-specific (V2 ladder exit is multi-step, not one-block); the OOR/off-chain-hop semantics themselves hold under V1. V1-lane regression test under the V2 default.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }

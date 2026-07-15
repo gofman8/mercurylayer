@@ -107,9 +107,20 @@ pub async fn execute() -> Result<()> {
 
     // The RGB balance settles immediately (register synthesizes rows), but the two carrier deposit
     // coins must be electrum-CONFIRMED before they can be spent by the colored split. Wait for both.
+    // V2DEF-5: a carrier's sats are excluded from available_sats (carrier ⊥ ladder), so the signal is
+    // the raw confirmed-coin count (both carriers), not a sats threshold.
     let mut waited = 0;
-    while alice.get_balance().await?.available_sats < 20_000 {
+    loop {
         alice.claim().await?;
+        let n = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk9_alice")
+            .await?
+            .coins
+            .iter()
+            .filter(|c| c.status == mercuryrustlib::CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .count();
+        if n >= 2 {
+            break;
+        }
         waited += 1;
         if waited > 60 {
             stop_miner();
