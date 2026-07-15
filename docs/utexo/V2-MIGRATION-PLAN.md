@@ -29,7 +29,22 @@ be created V1** (`deposit_protocol_version = 1`). This is an accepted interim UX
 4. **LN guide doc**: state that LN swaps require a V1 coin in this interim.
 5. Re-run sdk40–53 (V2 suite) + the pinned LN suite → all green.
 
-## V2DEF-6 — delete V1 non-LN code (LAST, only after V2DEF-5 fully green)
+## ⛔ V2DEF-6 status: BLOCKED (verified — V1 is load-bearing, not dead)
+The `/loop` end-goal "fully switch to V2 + delete every V1 artifact" is **not achievable now**, confirmed by
+code probe: `create_backup_tx_to_receiver` (`transfer_sender.rs:350`) and `new_backup_transaction`
+(`lib/src/transaction.rs:697`) — the V1 receiver-paying backup + core backup builder — are reachable from
+**two live, non-LN paths**, so almost no V1 code is truly dead:
+1. **Split sub-coins.** A transfer that splits conveys a V1 sub-coin (no ladder off-chain); sdk16 confirmed
+   the receiver exits via the V1 backup. → deleting V1 exit/transfer/backup breaks every split payment.
+2. **LN-swap lane.** Latched transfers use the V1 receiver path behind the sdk53 guard. → needs adaptor-sig
+   atomicity (`V2-LATCH-FIX.md`, 6-round verdict) before V1 can go.
+**Prerequisites to UNBLOCK full V1 removal** (each a dedicated follow-on V2 effort, NOT test migration or
+autonomous grind): **(P1) V2 split-transfer** — Model A on the split sub-coin so a split conveys a V2
+laddered coin; retires the split V1 lane + lets the 12 pinned V1-semantic tests migrate to V2. **(P2)
+adaptor-sig LN** — retires the LN V1 lane. Only after P1+P2 can V2DEF-6 delete V1 code and purge V1 from
+docs. Until then a "delete all V1 artifacts" pass would delete docs for CODE THAT STILL RUNS — wrong.
+
+## V2DEF-6 — delete V1 non-LN code (LAST — BLOCKED on P1+P2 above)
 Delete only V1 code that V2 fully replaces AND that the LN lane does not use:
 - V1 exit ladder / decrementing-locktime backup path for **non-carrier, non-LN** coins (V2 uses the TES-R
   ladder + reconcile; exit routing already V2 via sdk50).
