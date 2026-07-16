@@ -484,6 +484,25 @@ impl UtexoWallet {
                 {
                     continue;
                 }
+                // ROOT-ONLY [B0]: only a coin whose funding `F` is ON-CHAIN may be laddered. A split
+                // SUB-COIN's F is an un-broadcast split output, so its ladder's trigger has no prevout
+                // to spend: `unilateral_exit`'s V2 branch takes `exit_pass` (skipping the branch
+                // materialisation), the trigger broadcast fails, and the coin stalls forever reporting
+                // `wait_blocks: 0` — effectively unexitable via the SDK. Test the property that actually
+                // matters rather than a proxy: F must be a known on-chain tx. Fail CLOSED — if electrum
+                // cannot confirm F, skip this pass (a missed ladder is harmless and the next claim()
+                // retries; a laddered sub-coin is not). Laddering a sub-coin properly (V2 split-transfer,
+                // Model A on the split piece) is separate follow-on work.
+                let f_on_chain = {
+                    use electrum_client::ElectrumApi;
+                    match coin.utxo_txid.as_ref().and_then(|t| t.parse::<bitcoin::Txid>().ok()) {
+                        Some(txid) => self.inner.cc.electrum_client.transaction_get(&txid).is_ok(),
+                        None => false,
+                    }
+                };
+                if !f_on_chain {
+                    continue;
+                }
                 match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
                     Ok(Some(_)) => continue, // already established — idempotent
                     Ok(None) => {}
