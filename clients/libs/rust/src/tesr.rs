@@ -502,32 +502,157 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
         }
     }
 
+    // ---- Superseded tiers: PARSE + LADDER-LINK + SIGNATURE-VERIFY before they may be counted [S1].
+    //
+    // The count in check 3 is the anti-theft linchpin, so EVERY term of it must correspond to a real,
+    // co-signed tier OF THIS LADDER. Previously `superseded_*` were only `.len()`-counted — never
+    // parsed, linked or signature-checked — and the CSV race-check skipped `csv: None`. A sender
+    // holding a hidden low-CSV state could pad one junk entry (`signed_tx: ""`, `csv: None`) to make
+    // `expected` match the inflated `num_sigs`, get ACCEPTED, then broadcast the hidden state and take
+    // the coin back. Parsing alone is NOT sufficient either: a structurally valid but never-co-signed
+    // tx would still pad the count. Only a valid signature by `A` proves a tier consumed a co-sign.
+    //
+    // `prevout_value_of` maps a parent txid → the value its `out[0]` carries, which is exactly the
+    // prevout value the child's taproot key-spend sighash commits to (mirrors `cosign_tier_request`).
+    let mut prevout_value_of: std::collections::HashMap<Txid, u64> = std::collections::HashMap::new();
+    prevout_value_of.insert(
+        Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?,
+        bundle.f_value,
+    );
+    for t in tiers.iter() {
+        prevout_value_of.insert(Txid::from_str(&t.txid).map_err(|_| anyhow::anyhow!("bad tier txid"))?, t.out_value);
+    }
+    for t in bundle.superseded_states.iter().chain(bundle.superseded_extensions.iter()) {
+        if let Ok(id) = Txid::from_str(&t.txid) {
+            prevout_value_of.insert(id, t.out_value);
+        }
+    }
+
+    // Every counted tier (exit chain AND superseded) must verify as a genuine co-sign by A.
+    for (i, tx) in txs.iter().enumerate() {
+        let parent = tx.input[0].previous_output.txid;
+        let value = *prevout_value_of
+            .get(&parent)
+            .ok_or_else(|| anyhow::anyhow!("tier {i} spends an outpoint outside this ladder"))?;
+        verify_tier_cosigned(tx, value, &agg_spk)
+            .map_err(|e| anyhow::anyhow!("exit tier {i} is not co-signed by A: {e}"))?;
+    }
+
+    let final_csv = txs.last().unwrap().input[0].sequence.0 & 0xFFFF;
+    let mut superseded_ok: u32 = 0;
+    for (kind, list) in [
+        ("state", &bundle.superseded_states),
+        ("extension", &bundle.superseded_extensions),
+    ] {
+        for (j, s) in list.iter().enumerate() {
+            // (a) parse — no unparseable entry may contribute to `expected`.
+            let raw = hex::decode(&s.signed_tx)
+                .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: bad hex"))?;
+            let tx: Transaction = deserialize(&raw)
+                .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: not a transaction"))?;
+            if tx.input.len() != 1 || tx.output.is_empty() {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: malformed tier"));
+            }
+            if tx.txid().to_string() != s.txid {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: txid does not match its tx"));
+            }
+            // (b) ladder linkage — it must spend a tier of THIS ladder at out[0].
+            let parent = tx.input[0].previous_output.txid;
+            if tx.input[0].previous_output.vout != 0 {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: does not spend a tier's out[0]"));
+            }
+            let value = *prevout_value_of
+                .get(&parent)
+                .ok_or_else(|| anyhow::anyhow!("superseded {kind} {j}: spends an outpoint outside this ladder"))?;
+            // (c) signature — proves it actually consumed an SE co-sign.
+            verify_tier_cosigned(&tx, value, &agg_spk)
+                .map_err(|e| anyhow::anyhow!("superseded {kind} {j} is not co-signed by A: {e}"))?;
+            // (d) CSV is REQUIRED (never skippable) and must be a BIP-68 block relative-timelock in
+            //     schedule bounds; a superseded STATE must mature strictly AFTER the current state.
+            let seq = tx.input[0].sequence.0;
+            if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: not a BIP-68 block relative-timelock"));
+            }
+            let csv = seq as u16;
+            let declared = s.csv.ok_or_else(|| anyhow::anyhow!("superseded {kind} {j}: no CSV declared"))?;
+            if declared != csv {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: declared CSV {declared} != tx CSV {csv}"));
+            }
+            let (lo, hi) = if kind == "extension" { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+            if csv < lo || csv > hi {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: CSV {csv} outside bounds [{lo},{hi}]"));
+            }
+            if kind == "state" && (csv as u32) <= final_csv {
+                return Err(anyhow::anyhow!(
+                    "superseded state {j} has CSV {csv} <= the current state's {final_csv} — it could out-race the owner"
+                ));
+            }
+            superseded_ok += 1;
+        }
+    }
+
     // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for EVERY co-signed
-    //    tier — the exit chain PLUS the superseded states/extensions (full-disclosure counting). A
-    //    hidden co-signed state bumps num_sigs without appearing here ⟹ reject.
-    let expected = v1_backups
-        + tiers.len() as u32
-        + bundle.superseded_states.len() as u32
-        + bundle.superseded_extensions.len() as u32;
+    //    tier — the exit chain PLUS the superseded states/extensions (full-disclosure counting). Every
+    //    term below is now a VERIFIED co-sign of this ladder (above), so the count cannot be padded.
+    //    A hidden co-signed state bumps num_sigs without appearing here ⟹ reject.
+    let expected = v1_backups + tiers.len() as u32 + superseded_ok;
     if se_num_sigs != expected {
         return Err(anyhow::anyhow!(
             "num_sigs mismatch: SE issued {se_num_sigs}, disclosed tiers+backups account for {expected} — possible hidden state"
         ));
     }
-
-    // 4. Maturity-race safety: the current owner-paying state must mature BEFORE any superseded state
-    //    (a stale state a prior owner might retain). Its CSV must be strictly the lowest.
-    let final_csv = txs.last().unwrap().input[0].sequence.0 & 0xFFFF;
-    for s in &bundle.superseded_states {
-        if let Some(csv) = s.csv {
-            if (csv as u32) <= final_csv {
-                return Err(anyhow::anyhow!(
-                    "a superseded state has CSV {csv} <= the current state's {final_csv} — it could out-race the owner"
-                ));
-            }
-        }
-    }
     Ok(())
+}
+
+/// Verify a tier tx carries a genuine SE/owner co-signature by the aggregate key `A` — i.e. that it
+/// actually consumed one of the SE's finalized signatures. Consensus-style: the taproot key-spend
+/// signature must verify against the OUTPUT key in `agg_spk`'s witness program over the sighash that
+/// `cosign_tier_request` commits to (`TxOut { value: prevout_value, script_pubkey: agg_spk }`,
+/// `TapSighashType::All`). Without this, a structurally valid but never-co-signed tx could pad
+/// `verify_bundle`'s count and mask a hidden state [S1].
+fn verify_tier_cosigned(
+    tx: &electrum_client::bitcoin::Transaction,
+    prevout_value: u64,
+    agg_spk: &electrum_client::bitcoin::ScriptBuf,
+) -> Result<()> {
+    use electrum_client::bitcoin::{
+        secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        TxOut,
+    };
+
+    let prog = agg_spk.as_bytes();
+    if prog.len() != 34 || prog[0] != 0x51 || prog[1] != 0x20 {
+        return Err(anyhow::anyhow!("aggregate address is not a v1 taproot output"));
+    }
+    let output_key = XOnlyPublicKey::from_slice(&prog[2..34])
+        .map_err(|_| anyhow::anyhow!("bad taproot output key"))?;
+
+    let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };
+    let sighash = SighashCache::new(tx)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+        .map_err(|e| anyhow::anyhow!("sighash: {e}"))?;
+
+    let wit = tx.input[0].witness.to_vec();
+    if wit.len() != 1 {
+        return Err(anyhow::anyhow!("witness is not a single key-spend signature"));
+    }
+    let sig = match wit[0].len() {
+        64 => schnorr::Signature::from_slice(&wit[0]),
+        65 => {
+            if wit[0][64] != TapSighashType::All as u8 {
+                return Err(anyhow::anyhow!("tier is not SIGHASH_ALL"));
+            }
+            schnorr::Signature::from_slice(&wit[0][..64])
+        }
+        n => return Err(anyhow::anyhow!("bad signature length {n}")),
+    }
+    .map_err(|_| anyhow::anyhow!("malformed schnorr signature"))?;
+
+    let msg = Message::from_slice(sighash.as_ref()).map_err(|_| anyhow::anyhow!("bad sighash"))?;
+    Secp256k1::verification_only()
+        .verify_schnorr(&sig, &msg, &output_key)
+        .map_err(|_| anyhow::anyhow!("signature does not verify against the aggregate key A"))
 }
 
 #[cfg(test)]
