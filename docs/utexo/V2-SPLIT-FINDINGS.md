@@ -1,9 +1,62 @@
-# V2 split-transfer design — FLAWED verdict + two FATAL holes found in the LIVE V2 lane
+# V2 split-transfer design — FLAWED verdict + FATAL holes found in the LIVE V2 lane
 
-Source: the V2-split-transfer design + adversarial review workflow (3 probes → design → 3 lenses → ruling).
-**All three lenses returned FLAWED.** Critically, the two FATALs are **NOT split-specific — they are live on
-the flat V2 transfer lane**, which the default flip (1b2c881) had made the default. **The default has been
-reverted to V1 (`config.rs`) until they are fixed.**
+## 🔴 B1 — LIVE THEFT VECTOR (was shipped in the V2 default at 434d334; default REVERTED)
+
+**Not a future design constraint — an exploitable theft in the shipped default. No collusion, one SDK call.**
+
+| Fact | Evidence |
+|---|---|
+| `T` has NO timelock, spends `F`, fully co-signed at `establish` | `lib/src/tesr.rs:145` (`TRIGGER_SEQUENCE=0xFFFF_FFFD`), `:159` `lock_time:0`, asserted `:352-353`; co-signed `clients/libs/rust/src/tesr.rs:130` |
+| The split tx spends the SAME `F` | `lib/src/transaction.rs:402-412` builds its input from `coin.utxo_txid/vout`; `clients/libs/rust/src/tesr.rs:125-126` sets `f_txid/f_vout` from the same fields |
+| `split_coin` had NO ladder check | `clients/libs/rust-sdk/src/transfer.rs:387-406` — guards were CONFIRMED / !dup / !carrier only |
+| Every V2 transfer leaves the SENDER a retained `T` | `presign_receiver_state` clones and never deletes (`tesr.rs:299,302`); there is NO deletion path for `tesr-*` |
+| The SDK performs the attack | `unilateral_exit(Some(ids))` filters the explicit-id branch on carrier status only (`wallet.rs:1016-1028`), then `exit_pass` broadcasts `T` with no `outpoint_spent` gate (`tesr.rs:389-406`) |
+
+**Attack:** Alice receives a V2 coin → pays Bob a non-exact amount (⟹ `split_coin`; Bob gets a **V1**
+sub-coin, `transfer_sender.rs:312`, funded by the un-broadcast split tx) → Alice `unilateral_exit`s the
+PARENT. `T` confirms, `F` is consumed, **Bob's split tx is permanently dead**, Alice's ladder pays her the
+full parent value.
+
+**The race is rigged:** `T` is v3/TRUC + P2A — fee-bumpable by anyone, forever. The split tx is v2 with a
+frozen fee and no RBF headroom (the parent's SE budget is set to exactly 1 and the split consumes it,
+`transfer.rs:458-464`). Alice wins deterministically.
+
+**Bob's due diligence is meaningless:** his `terminal_parents` check (`transfer_sender.rs:290-294`) returns
+true. He cannot see `T` — the ladder is never conveyed on the V1 lane and the SE has never seen it
+(`tesr.rs:47`).
+
+**The code's load-bearing claim is FALSE for V2** (`transfer.rs:455-457`: *"No later withdraw/transfer/
+backup of the parent can be signed — the branch cannot be double-spent even by a malicious sender"*). It
+rests on the V1 premise that every spend of `F` needs a FRESH SE co-sign. V2 breaks it at the root: `T` was
+co-signed at `establish`, long before `set_spend_budget`. **A budget bounds future co-signs; it cannot
+retract an issued signature.** Strictly WORSE than V1, where the parent's backup is locktimed above the
+branch and the branch always matures first (INV-4).
+
+### Status
+- **Default REVERTED to V1** (V2 opt-in via env) — exposure closed.
+- **HF-1 landed**: `split_coin` refuses a laddered coin (hard error beats silently voiding the receiver).
+- **Follow-ups still open**: HF-2 (teach the planner `splittable`, so HF-1 doesn't turn into a hard
+  transfer() failure when a safe coin exists); HF-3 (same gate in `mint_piece`, `transfer.rs:365-380`);
+  HF-4 (`unilateral_exit` explicit-id branch must filter on `CoinStatus` — a WITHDRAWN parent must not be
+  exitable; stops the SDK being the weapon and kills the accidental-loss variant); HF-5 (delete the false
+  claim at `transfer.rs:455-457`).
+
+### THE FIX — in-ladder split (V2-DESIGN §5.4), not a gate
+The gate is a feature amputation: `presign_receiver_state` runs on EVERY V2 transfer, so essentially every
+circulating V2 coin is conveyed-ladder ⟹ V2 coins could not pay non-exact amounts (violating REQ-2). Its
+escape hatch (`reanchor`, 112 vB + a confirmation per non-exact payment) negates V2's "0 vB rent / ~320×
+footprint win" — and may not even work (does `withdraw` on a conveyed V2 coin have SE sign-budget headroom?
+external review F2 / migration 0008 — MUST be checked).
+
+V2-DESIGN §5.4 already specifies the answer: a split `SP` is a **state tier** spending `X_m.out[0]` at
+`nSequence Δ_{k+1}`, N child resting outputs, Σout = Σin − fee_committed, + P2A; **no trigger needed** (SP
+is itself un-broadcast). `build_trigger` (`lib/src/tesr.rs:236-248`) is the ONLY builder that touches
+`f_txid/f_vout`; every other tier spends its parent's output and `verify_bundle` enforces it
+(`clients/libs/rust/src/tesr.rs:481-487`). So an SP is a **DESCENDANT of `T`, not a rival** — a retained
+trigger has nothing to race. This dissolves B1 rather than mitigating it, and makes split pieces real V2
+coins (retiring the V1 split lane + letting the 12 V1-pinned tests migrate).
+
+---
 
 ## S1 — FATAL (fund-loss): `verify_bundle`'s exact-count linchpin is paddable
 `clients/libs/rust/src/tesr.rs:508-529`.

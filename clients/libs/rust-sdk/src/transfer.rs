@@ -404,6 +404,29 @@ impl UtexoWallet {
                 "coin {statechain_id} carries an RGB token allocation; splitting it as plain BTC would destroy the token — use a token transfer or pick a different coin"
             ));
         }
+        // [B1] NEVER split a coin that carries a TES-R ladder. The trigger `T` has NO timelock
+        // (`TRIGGER_SEQUENCE = 0xFFFF_FFFD`) and is fully co-signed at `establish`, so every prior owner
+        // of a Model-A-conveyed coin retains a broadcastable `T` that spends `F` — and the split tx
+        // spends the SAME `F`. A prior owner can therefore `unilateral_exit` the parent at any time,
+        // consume `F`, and permanently kill this split, voiding the sub-coin its receiver paid for,
+        // while their ladder pays them the full parent value. The race is rigged: `T` is v3/TRUC with a
+        // P2A anchor (fee-bumpable by anyone, forever) vs a v2 split tx with a frozen fee and no RBF
+        // headroom. The receiver cannot detect the exposure: the ladder is not conveyed on the V1 lane
+        // and the SE has never seen it, so their `terminal_parents` check returns true and means
+        // nothing. NOTE the spend-budget does NOT protect here — it bounds FUTURE co-signs, and `T` was
+        // co-signed long before `set_spend_budget` (this is why `transfer.rs`'s "the branch cannot be
+        // double-spent even by a malicious sender" claim does not hold for V2 parents).
+        // The real fix is the IN-LADDER split (V2-DESIGN §5.4): a split as a STATE tier spending
+        // `X_m.out[0]` is a DESCENDANT of `T`, not a rival for `F`, so a retained trigger has nothing to
+        // race. Until that ships, refuse — a hard error beats silently voiding the receiver's coin.
+        if mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, statechain_id)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow!(
+                "coin {statechain_id} has a V2 (TES-R) exit ladder and cannot be split: a prior owner may hold a no-timelock trigger over its funding UTXO and could void the split, voiding the receiver's sub-coin [B1]. Use an exact-amount transfer, pick an un-laddered coin, or re-anchor this coin first."
+            ));
+        }
         let parent_sats = parent.amount.unwrap_or_default() as u64;
         // Admission guard (fee-reserve fit + backup-fee floor on both outputs) — rejects BEFORE
         // touching the parent. The floor is the dust limit PLUS each sub-coin's own backup fee at

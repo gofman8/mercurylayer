@@ -61,23 +61,29 @@ pub struct SdkConfig {
     pub deposit_protocol_version: u32,
 }
 
-/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT`. **Default `2` (V2 /
-/// TES-R)**: new deposits auto-establish an exit ladder and transfer via the R′ path.
+/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT`.
 ///
-/// The two FATALs that forced an earlier revert are fixed AND attack-tested — every attacker-supplied
-/// term of `verify_bundle`'s anti-theft equation is now verified, not merely counted:
-///   S1 — every counted tier (exit chain AND superseded) must be parsed, ladder-linked, CSV-required
-///        (in-bounds; a superseded state strictly above the current) **and signature-verified against
-///        the aggregate key `A`** (`verify_tier_cosigned`) — parsing alone never proved a co-sign.
-///        Proven by **sdk54**: junk / `csv:None` / never-co-signed / out-racing entries all REJECTED.
-///   S2 — the conveyed V1 backups are validated on the V2 lane via `validate_backup_chain_v2`, keeping
-///        INV-5 (`ladder_decrements_by_interval`). Proven by **sdk55**: duplicate padding and ladder
-///        inversion REJECTED with real signatures.
-/// LN-swap flows must still pin `1` — a V2 coin is refused by the sdk53 latch guard (the Model A
-/// co-sign is not preimage-gated; see `docs/utexo/V2-LATCH-FIX.md`). Split sub-coins are also still V1
-/// (`docs/utexo/V2-SPLIT-FINDINGS.md`).
+/// **REVERTED TO `1` — B1 IS A LIVE THEFT VECTOR WHEN A LADDERED COIN IS SPLIT.** (S1/S2 were fixed and
+/// attack-proven — sdk54/sdk55 — but they are not the only hole.) See `docs/utexo/V2-SPLIT-FINDINGS.md`:
+///   The trigger `T` carries NO timelock (`TRIGGER_SEQUENCE = 0xFFFF_FFFD`, `lib/src/tesr.rs:145`) and is
+///   fully co-signed at `establish`. Every prior owner of a Model-A-conveyed coin keeps a broadcastable
+///   `T` that spends `F`. A split tx spends the SAME `F`. So: Alice receives a V2 coin → pays Bob a
+///   non-exact amount (split ⟹ Bob gets a V1 sub-coin funded by the un-broadcast split tx) → Alice
+///   `unilateral_exit`s the PARENT; `T` consumes `F`, Bob's split tx is permanently dead, and Alice's
+///   ladder pays her the full parent value. No collusion, one SDK call. The fee race is rigged: `T` is
+///   v3/TRUC + P2A (bumpable by anyone, forever) vs a v2 split tx with a frozen fee and no RBF headroom.
+///   The `terminal_parents` due-diligence Bob performs returns true and is MEANINGLESS — the ladder is
+///   never conveyed on the V1 lane and the SE has never seen it. Strictly WORSE than V1, where the
+///   parent's backup is locktimed above the branch and the branch always matures first (INV-4).
+///   The code's load-bearing claim ("the branch cannot be double-spent even by a malicious sender",
+///   `transfer.rs:455-457`) rests on the V1 premise that every spend of `F` needs a FRESH co-sign — V2
+///   breaks it: `T` was co-signed long before `set_spend_budget`. A budget bounds future co-signs; it
+///   cannot retract an issued signature.
+/// FIX = the in-ladder split (V2-DESIGN §5.4): a split is a STATE tier spending `X_m.out[0]`, a
+/// DESCENDANT of `T` rather than a rival for `F` — then a retained trigger has nothing to race.
+/// Do NOT flip back to `2` until that lands with adversarial E2Es. V2 stays opt-in via the env var.
 fn deposit_protocol_default() -> u32 {
-    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(2)
+    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1)
 }
 
 impl SdkConfig {
