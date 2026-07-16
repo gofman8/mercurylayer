@@ -221,7 +221,70 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
         return status::Custom(Status::Unauthorized, Json(response_body));
     }
 
-    let partial_signature_request_payload = partial_signature_request_payload.0.clone(); 
+    // [S1] RE-CHECK THE FORK GATES HERE, NOT ONLY IN sign/first.
+    //
+    // Every terminality gate (single-use, spend-budget, epoch-deadline) used to live exclusively in
+    // sign/first. But a signing session is TWO calls and the first one's state is DURABLE: a
+    // null-challenge row is deliberately re-served (`get_server_pubnonce_from_null_challenge`) and the
+    // sealed secnonce persists in the lockbox. So an owner could open sign/first BEFORE the node became
+    // terminal, let the node be terminalized (e.g. `set_spend_budget` at split time, or the node's
+    // first single-use spend), and then complete the DANGLING session via sign/second — which checked
+    // none of the gates — obtaining a SECOND conflicting co-signature of a terminal node. That defeats
+    // exactly the guarantee the split/RGB tree rests on (INV-19 fork prevention) and is reachable on the
+    // V1 single_use lane, not just V2. The gates must hold at the moment the signature is ISSUED.
+    //
+    // Fail CLOSED on any DB error, identically to sign/first: if the SE cannot read a coin's
+    // fork-prevention state it must refuse to co-sign rather than assume a permissive default.
+    macro_rules! fail_closed_second {
+        () => {{
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "SE co-sign state temporarily unavailable; refusing to co-sign (fail-closed)" })),
+            );
+        }};
+    }
+    let single_use = match crate::database::deposit::is_single_use(&statechain_entity.pool, &statechain_id).await {
+        Ok(v) => v,
+        Err(_) => fail_closed_second!(),
+    };
+    let finalized = match crate::database::deposit::count_finalized_signatures(&statechain_entity.pool, &statechain_id).await {
+        Ok(v) => v,
+        Err(_) => fail_closed_second!(),
+    };
+    if single_use && finalized >= 1 {
+        return status::Custom(
+            Status::Gone,
+            Json(json!({ "message": "single-use coin already spent (SE refuses a second spend)" })),
+        );
+    }
+    match crate::database::deposit::get_sig_budget(&statechain_entity.pool, &statechain_id).await {
+        Ok(Some(budget)) if finalized >= budget as i64 => {
+            return status::Custom(
+                Status::Gone,
+                Json(json!({ "message": "spend budget exhausted (terminal node: SE refuses further co-signatures)" })),
+            );
+        }
+        Ok(_) => {}
+        Err(_) => fail_closed_second!(),
+    }
+    match crate::database::deposit::get_epoch_deadline(&statechain_entity.pool, &statechain_id).await {
+        Ok(Some(deadline)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if now >= deadline {
+                return status::Custom(
+                    Status::Gone,
+                    Json(json!({ "message": format!("epoch deadline passed (now={} >= deadline={}); coin must be exited unilaterally, SE refuses new co-signatures", now, deadline) })),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(_) => fail_closed_second!(),
+    }
+
+    let partial_signature_request_payload = partial_signature_request_payload.0.clone();
     let session = partial_signature_request_payload.session.clone();
     let server_pub_nonce = partial_signature_request_payload.server_pub_nonce.clone();
 
