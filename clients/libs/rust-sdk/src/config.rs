@@ -61,23 +61,23 @@ pub struct SdkConfig {
     pub deposit_protocol_version: u32,
 }
 
-/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT`.
+/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT`. **Default `2` (V2 /
+/// TES-R)**: new deposits auto-establish an exit ladder and transfer via the R′ path.
 ///
-/// **REVERTED TO `1` — V2 IS NOT SAFE AS A DEFAULT YET.** The V2 receiver check `verify_bundle` has two
-/// FATAL holes (found by the V2-split-transfer design review, `docs/utexo/V2-SPLIT-FINDINGS.md`):
-///   S1 — `expected = v1_backups + tiers + superseded_states.len() + superseded_extensions.len()`, but
-///        superseded entries are never parsed/linked/signature-checked and check 4 skips `csv: None`.
-///        A sender holding a hidden low-CSV state pads one junk entry ⟹ the count matches ⟹ ACCEPTED
-///        ⟹ the sender later broadcasts the hidden state and takes the coin.
-///   S2 — `v1_backups` is `transfer_msg.backup_transactions.len()` (attacker-supplied) and the V1
-///        structural check (`validate_signature_scheme`) is gated off for `protocol_version >= 2`, so
-///        a padded/locktime-inverted backup vector is unvalidated — a strict V1→V2 regression.
-/// Three of four terms in the anti-theft equation are attacker-controlled. Do NOT flip back to `2`
-/// until both are fixed (every counted tier must be parsed, ladder-linked, in-bounds AND signature-
-/// verified against A) and an adversarial review + E2E prove padding/inversion are REJECTED.
-/// V2 remains available opt-in via the env var for tests.
+/// The two FATALs that forced an earlier revert are fixed AND attack-tested — every attacker-supplied
+/// term of `verify_bundle`'s anti-theft equation is now verified, not merely counted:
+///   S1 — every counted tier (exit chain AND superseded) must be parsed, ladder-linked, CSV-required
+///        (in-bounds; a superseded state strictly above the current) **and signature-verified against
+///        the aggregate key `A`** (`verify_tier_cosigned`) — parsing alone never proved a co-sign.
+///        Proven by **sdk54**: junk / `csv:None` / never-co-signed / out-racing entries all REJECTED.
+///   S2 — the conveyed V1 backups are validated on the V2 lane via `validate_backup_chain_v2`, keeping
+///        INV-5 (`ladder_decrements_by_interval`). Proven by **sdk55**: duplicate padding and ladder
+///        inversion REJECTED with real signatures.
+/// LN-swap flows must still pin `1` — a V2 coin is refused by the sdk53 latch guard (the Model A
+/// co-sign is not preimage-gated; see `docs/utexo/V2-LATCH-FIX.md`). Split sub-coins are also still V1
+/// (`docs/utexo/V2-SPLIT-FINDINGS.md`).
 fn deposit_protocol_default() -> u32 {
-    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1)
+    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(2)
 }
 
 impl SdkConfig {
