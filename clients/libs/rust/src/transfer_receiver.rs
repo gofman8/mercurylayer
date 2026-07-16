@@ -630,11 +630,31 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             info_config.fee_rate_sats_per_byte
         };
 
-        // The V1 decrementing-locktime backup ladder check applies only to V1 coins. A TES-R (V2)
-        // coin does not use that ladder — its exit assurance is the tier ladder, already verified by
-        // the R′ check (crate::tesr::verify_bundle) at the num_sigs gate above — so it is skipped here.
-        if transfer_msg.protocol_version < 2 {
-            let previous_lock_time = mercurylib::transfer::receiver::validate_signature_scheme(
+        // [S2] The conveyed V1 backups MUST be validated on BOTH lanes. This was previously gated to
+        // `protocol_version < 2` on the reasoning that "a V2 coin does not use that ladder" — which was
+        // WRONG: a V2 coin still conveys V1 backups AND still feeds their COUNT into verify_bundle's
+        // anti-theft equation above (`v1_backups = backup_transactions.len()`). Skipping this left that
+        // term attacker-supplied and structurally unvalidated, so a sender could (a) pad the vector with
+        // duplicate tx1s — same prevout ⟹ one group, first-by-tx_n and .last() unchanged — to inflate
+        // `expected` and absorb a hidden co-signed state, or (b) invert the ladder, building the
+        // receiver-paying backup at L+interval while retaining their own at L, so their stale backup
+        // matures FIRST. `ladder_decrements_by_interval` (INV-5) is the only defence against (b) and it
+        // lived solely in here. A strict V1→V2 regression; both lanes now run it.
+        let previous_lock_time = if transfer_msg.protocol_version >= 2 {
+            // V2: the tiers consume SE co-sign slots, so a backup's `tx_n` no longer aligns with the
+            // SE's per-co-sign `statechain_info` index and the blinded-musig lookup would read a
+            // TIER's blinding info. Run the structural chain validation, which keeps INV-5 — the
+            // defence against both S2 attacks (duplicate padding and ladder inversion).
+            mercurylib::transfer::receiver::validate_backup_chain_v2(
+                backup_transactions,
+                &tx0_hex,
+                blockheight,
+                client_config.fee_rate_tolerance,
+                current_fee_rate_sats_per_byte,
+                info_config.initlock,
+                info_config.interval)
+        } else {
+            mercurylib::transfer::receiver::validate_signature_scheme(
                 backup_transactions,
                 &statechain_info,
                 &tx0_hex,
@@ -642,12 +662,12 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
                 client_config.fee_rate_tolerance,
                 current_fee_rate_sats_per_byte,
                 info_config.initlock,
-                info_config.interval);
+                info_config.interval)
+        };
 
-            if previous_lock_time.is_err() {
-                let error = previous_lock_time.err().unwrap();
-                return Err(anyhow!("Signature scheme validation failed. Error {}", error.to_string()));
-            }
+        if previous_lock_time.is_err() {
+            let error = previous_lock_time.err().unwrap();
+            return Err(anyhow!("Signature scheme validation failed. Error {}", error.to_string()));
         }
     }
 
