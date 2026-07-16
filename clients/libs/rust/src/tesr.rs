@@ -512,27 +512,57 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
     // the coin back. Parsing alone is NOT sufficient either: a structurally valid but never-co-signed
     // tx would still pad the count. Only a valid signature by `A` proves a tier consumed a co-sign.
     //
-    // `prevout_value_of` maps a parent txid → the value its `out[0]` carries, which is exactly the
-    // prevout value the child's taproot key-spend sighash commits to (mirrors `cosign_tier_request`).
-    let mut prevout_value_of: std::collections::HashMap<Txid, u64> = std::collections::HashMap::new();
+    // `prevout_value_of` maps (parent txid, vout) → the value that output carries — exactly the prevout
+    // value the child's taproot key-spend sighash commits to (mirrors `cosign_tier_request`). Two
+    // properties matter:
+    //   * keyed PER-OUTPUT, not per-txid. A tier may legitimately hang off any `out[j]` of its parent —
+    //     that is how an in-ladder split state (V2-DESIGN §5.4) hosts N children, and the mechanism that
+    //     dissolves B1 (a split that DESCENDS from the trigger instead of racing it for `F`). A
+    //     txid-only map silently assumed `out[0]` and would mis-value every child but the first.
+    //   * values are read from the PARSED transactions, never from the declared `out_value` field, which
+    //     is attacker-supplied. The tx is the authority; there is no reason to consult the claim.
+    let mut prevout_value_of: std::collections::HashMap<(Txid, u32), u64> = std::collections::HashMap::new();
     prevout_value_of.insert(
-        Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?,
+        (Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?, bundle.f_vout),
         bundle.f_value,
     );
-    for t in tiers.iter() {
-        prevout_value_of.insert(Txid::from_str(&t.txid).map_err(|_| anyhow::anyhow!("bad tier txid"))?, t.out_value);
+    for tx in txs.iter() {
+        let id = tx.txid();
+        for (vout, o) in tx.output.iter().enumerate() {
+            prevout_value_of.insert((id, vout as u32), o.value);
+        }
     }
-    for t in bundle.superseded_states.iter().chain(bundle.superseded_extensions.iter()) {
-        if let Ok(id) = Txid::from_str(&t.txid) {
-            prevout_value_of.insert(id, t.out_value);
+    // Superseded tiers are parsed up-front so their outputs can also serve as parents (e.g. a superseded
+    // extension's state after a renewal) and so no unparseable entry reaches the checks below.
+    let mut superseded_parsed: Vec<(&'static str, usize, &TesrTier, Transaction)> = Vec::new();
+    for (kind, list) in [
+        ("state", &bundle.superseded_states),
+        ("extension", &bundle.superseded_extensions),
+    ] {
+        for (j, s) in list.iter().enumerate() {
+            let raw = hex::decode(&s.signed_tx)
+                .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: bad hex"))?;
+            let tx: Transaction = deserialize(&raw)
+                .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: not a transaction"))?;
+            if tx.input.len() != 1 || tx.output.is_empty() {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: malformed tier"));
+            }
+            if tx.txid().to_string() != s.txid {
+                return Err(anyhow::anyhow!("superseded {kind} {j}: txid does not match its tx"));
+            }
+            let id = tx.txid();
+            for (vout, o) in tx.output.iter().enumerate() {
+                prevout_value_of.insert((id, vout as u32), o.value);
+            }
+            superseded_parsed.push((kind, j, s, tx));
         }
     }
 
     // Every counted tier (exit chain AND superseded) must verify as a genuine co-sign by A.
     for (i, tx) in txs.iter().enumerate() {
-        let parent = tx.input[0].previous_output.txid;
+        let op = tx.input[0].previous_output;
         let value = *prevout_value_of
-            .get(&parent)
+            .get(&(op.txid, op.vout))
             .ok_or_else(|| anyhow::anyhow!("tier {i} spends an outpoint outside this ladder"))?;
         verify_tier_cosigned(tx, value, &agg_spk)
             .map_err(|e| anyhow::anyhow!("exit tier {i} is not co-signed by A: {e}"))?;
@@ -548,70 +578,56 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
     //        race-UNCHECKED. A genuinely co-signed X_evil at e_floor + its child S_evil both verify
     //        against A and balance the count, but X_evil matures far ahead of the honest extension and
     //        its state pays the attacker — outright theft. Extensions are now checked identically.
-    let mut live_csv_by_parent: std::collections::HashMap<Txid, u32> = std::collections::HashMap::new();
+    // Keyed per-OUTPUT for the same reason as `prevout_value_of`: a split state hosts a child on each
+    // `out[j]`, so "the live tier over this outpoint" is only well-defined per (txid, vout).
+    let mut live_csv_by_outpoint: std::collections::HashMap<(Txid, u32), u32> =
+        std::collections::HashMap::new();
     for i in 1..txs.len() {
-        live_csv_by_parent.insert(txs[i - 1].txid(), txs[i].input[0].sequence.0 & 0xFFFF);
+        let op = txs[i].input[0].previous_output;
+        live_csv_by_outpoint.insert((op.txid, op.vout), txs[i].input[0].sequence.0 & 0xFFFF);
     }
     let mut superseded_ok: u32 = 0;
-    for (kind, list) in [
-        ("state", &bundle.superseded_states),
-        ("extension", &bundle.superseded_extensions),
-    ] {
-        for (j, s) in list.iter().enumerate() {
-            // (a) parse — no unparseable entry may contribute to `expected`.
-            let raw = hex::decode(&s.signed_tx)
-                .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: bad hex"))?;
-            let tx: Transaction = deserialize(&raw)
-                .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: not a transaction"))?;
-            if tx.input.len() != 1 || tx.output.is_empty() {
-                return Err(anyhow::anyhow!("superseded {kind} {j}: malformed tier"));
-            }
-            if tx.txid().to_string() != s.txid {
-                return Err(anyhow::anyhow!("superseded {kind} {j}: txid does not match its tx"));
-            }
-            // (b) ladder linkage — it must spend a tier of THIS ladder at out[0].
-            let parent = tx.input[0].previous_output.txid;
-            if tx.input[0].previous_output.vout != 0 {
-                return Err(anyhow::anyhow!("superseded {kind} {j}: does not spend a tier's out[0]"));
-            }
-            let value = *prevout_value_of
-                .get(&parent)
-                .ok_or_else(|| anyhow::anyhow!("superseded {kind} {j}: spends an outpoint outside this ladder"))?;
-            // (c) signature — proves it actually consumed an SE co-sign.
-            verify_tier_cosigned(&tx, value, &agg_spk)
-                .map_err(|e| anyhow::anyhow!("superseded {kind} {j} is not co-signed by A: {e}"))?;
-            // (d) CSV is REQUIRED (never skippable) and must be a BIP-68 block relative-timelock in
-            //     schedule bounds; a superseded STATE must mature strictly AFTER the current state.
-            let seq = tx.input[0].sequence.0;
-            if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
-                return Err(anyhow::anyhow!("superseded {kind} {j}: not a BIP-68 block relative-timelock"));
-            }
-            let csv = seq as u16;
-            let declared = s.csv.ok_or_else(|| anyhow::anyhow!("superseded {kind} {j}: no CSV declared"))?;
-            if declared != csv {
-                return Err(anyhow::anyhow!("superseded {kind} {j}: declared CSV {declared} != tx CSV {csv}"));
-            }
-            let (lo, hi) = if kind == "extension" { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
-            if csv < lo || csv > hi {
-                return Err(anyhow::anyhow!("superseded {kind} {j}: CSV {csv} outside bounds [{lo},{hi}]"));
-            }
-            // (e) RACE CHECK — applies to superseded EXTENSIONS and STATES alike [S-1], and compares
-            //     against the LIVE tier spending the SAME outpoint [S-2], never a global final_csv.
-            //     A superseded tier must mature strictly AFTER the live tier it contends with; a tier
-            //     that contends with nothing in the exit chain is an orphan branch and is refused
-            //     (it would otherwise pass "by construction" while still being broadcastable).
-            let live_csv = *live_csv_by_parent.get(&parent).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "superseded {kind} {j} contends with no live tier (spends {parent}, which the exit chain does not) — orphan branch"
-                )
-            })?;
-            if (csv as u32) <= live_csv {
-                return Err(anyhow::anyhow!(
-                    "superseded {kind} {j} has CSV {csv} <= the live tier's {live_csv} over the same outpoint — it could out-race the owner"
-                ));
-            }
-            superseded_ok += 1;
+    for (kind, j, s, tx) in superseded_parsed.iter() {
+        let (kind, j) = (*kind, *j);
+        // (a) parsed + txid-bound already (pre-pass above) — no unparseable entry reaches here.
+        // (b) ladder linkage — it must spend an output of a tier of THIS ladder.
+        let op = tx.input[0].previous_output;
+        let value = *prevout_value_of
+            .get(&(op.txid, op.vout))
+            .ok_or_else(|| anyhow::anyhow!("superseded {kind} {j}: spends an outpoint outside this ladder"))?;
+        // (c) signature — proves it actually consumed an SE co-sign.
+        verify_tier_cosigned(tx, value, &agg_spk)
+            .map_err(|e| anyhow::anyhow!("superseded {kind} {j} is not co-signed by A: {e}"))?;
+        // (d) CSV is REQUIRED (never skippable), a BIP-68 block relative-timelock, in schedule bounds.
+        let seq = tx.input[0].sequence.0;
+        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+            return Err(anyhow::anyhow!("superseded {kind} {j}: not a BIP-68 block relative-timelock"));
         }
+        let csv = seq as u16;
+        let declared = s.csv.ok_or_else(|| anyhow::anyhow!("superseded {kind} {j}: no CSV declared"))?;
+        if declared != csv {
+            return Err(anyhow::anyhow!("superseded {kind} {j}: declared CSV {declared} != tx CSV {csv}"));
+        }
+        let (lo, hi) = if kind == "extension" { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+        if csv < lo || csv > hi {
+            return Err(anyhow::anyhow!("superseded {kind} {j}: CSV {csv} outside bounds [{lo},{hi}]"));
+        }
+        // (e) RACE CHECK — EXTENSIONS and STATES alike [S-1], against the LIVE tier spending the SAME
+        //     outpoint [S-2], never a global final_csv. A superseded tier must mature strictly AFTER the
+        //     tier it actually contends with; one that contends with nothing in the exit chain is an
+        //     orphan branch and is refused (it would otherwise pass vacuously while still broadcastable).
+        let live_csv = *live_csv_by_outpoint.get(&(op.txid, op.vout)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "superseded {kind} {j} contends with no live tier (spends {}:{}, which the exit chain does not) — orphan branch",
+                op.txid, op.vout
+            )
+        })?;
+        if (csv as u32) <= live_csv {
+            return Err(anyhow::anyhow!(
+                "superseded {kind} {j} has CSV {csv} <= the live tier's {live_csv} over the same outpoint — it could out-race the owner"
+            ));
+        }
+        superseded_ok += 1;
     }
 
     // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for EVERY co-signed
