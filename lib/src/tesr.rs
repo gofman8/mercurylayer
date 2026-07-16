@@ -278,6 +278,76 @@ pub fn build_state(
     Ok(encode(&build_tier_tx(txid, 0, csv_blocks(csv_d), spk, out_value)))
 }
 
+/// vbytes of one extra P2TR resting output (8 value + 1 length + 34 scriptPubKey).
+pub const P2TR_OUT_VBYTES: u64 = 43;
+
+/// Committed fee for a tier carrying `n_payload` value outputs (plus the P2A anchor). `TIER_VBYTES` is
+/// sized for the 1-payload base case, so each extra child adds `P2TR_OUT_VBYTES`. A split state MUST
+/// use this rather than [`committed_fee`], or it underpays and cannot relay standalone.
+pub fn committed_fee_for_outputs(n_payload: usize, fee_rate_sats_per_vb: f64) -> u64 {
+    let extra = (n_payload.saturating_sub(1)) as u64 * P2TR_OUT_VBYTES;
+    ((TIER_VBYTES + extra) as f64 * fee_rate_sats_per_vb).ceil() as u64
+}
+
+/// Total value available to the `n_payload` children of a tier = parent value − committed fee − P2A.
+/// `None` if the parent cannot carry the tier at all.
+pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f64) -> Option<u64> {
+    prev_value.checked_sub(committed_fee_for_outputs(n_payload, fee_rate_sats_per_vb) + P2A_VALUE)
+}
+
+/// **SPLIT STATE `SP`** — the in-ladder split (V2-DESIGN §5.4). Spends `X_m.out[0]` under
+/// relative-timelock `csv_d`, paying `children` (exact amounts) plus the P2A anchor.
+///
+/// This is what dissolves **B1**. A V1-style split spends the coin's funding `F` — and so does the
+/// trigger `T`, which every prior owner of a Model-A-conveyed coin retains, un-timelocked and already
+/// co-signed. That makes a V1 split a rival of `T` for `F`, and the race is rigged (v3/TRUC + P2A
+/// beats a fee-frozen v2 tx), so a prior owner can void the split and take the coin. `SP` instead
+/// spends `X_m.out[0]`: it **descends from `T` rather than racing it**, so a retained trigger has
+/// nothing to contend with — it can only start the clock on the current owner's own chain. Note
+/// `build_trigger` is the ONLY builder that touches `f_txid/f_vout`.
+///
+/// Each child resting output then hosts its own extension+state tiers; no child needs its own trigger
+/// because `SP` is itself un-broadcast (nothing ticks until it confirms).
+///
+/// `Σ children == tier_out_total(x_out_value, children.len(), fee_rate)` is REQUIRED — value
+/// conservation is checked here rather than trusted, so a caller cannot silently mint or burn.
+pub fn build_split_state(
+    x_txid: &str,
+    x_out_value: u64,
+    children: &[(String, u64)],
+    network: &str,
+    csv_d: u16,
+    fee_rate: f64,
+) -> Result<TierTx, MercuryError> {
+    if children.is_empty() {
+        return Err(MercuryError::FeeTooHigh);
+    }
+    let txid = Txid::from_str(x_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
+    let available = tier_out_total(x_out_value, children.len(), fee_rate).ok_or(MercuryError::FeeTooHigh)?;
+    let total: u64 = children.iter().map(|(_, v)| *v).sum();
+    if total != available {
+        // Σout must equal Σin − fee_committed exactly (V2-DESIGN §5.4).
+        return Err(MercuryError::FeeTooHigh);
+    }
+    let mut output = Vec::with_capacity(children.len() + 1);
+    for (address, value) in children {
+        output.push(TxOut { value: *value, script_pubkey: spk_from_address(address, network)? });
+    }
+    output.push(TxOut { value: P2A_VALUE, script_pubkey: p2a_script() });
+    let tx = Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::from_consensus(0),
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: csv_blocks(csv_d),
+            witness: Witness::default(),
+        }],
+        output,
+    };
+    Ok(encode(&tx))
+}
+
 /// COOPERATIVE DE-TRIGGER: a FRESH spend of `T.out[0]` with the relative-timelock DISABLED (paying
 /// `to_address`). Because it has no CSV wait while every pre-signed extension needs `E ≥ E_floor`
 /// confirmations, it confirms first — collapsing a hostile trigger to a priced nuisance and killing
@@ -332,6 +402,66 @@ pub fn cosign_tier_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guaranteed-valid regtest P2TR address, derived rather than hardcoded (a bad bech32m literal
+    /// would make these tests fail inside spk_from_address and prove nothing).
+    fn test_addr() -> String {
+        let xonly = bitcoin::secp256k1::XOnlyPublicKey::from_slice(
+            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap(),
+        )
+        .unwrap();
+        Address::p2tr(&bitcoin::secp256k1::Secp256k1::new(), xonly, None, bitcoin::Network::Regtest)
+            .to_string()
+    }
+
+    #[test]
+    fn split_state_conserves_value_and_scales_the_fee() {
+        // A 3-output split state must: spend X.out[0] under the CSV, pay the exact children, anchor
+        // with P2A last, stay v3, and pay a fee scaled to its REAL size (not the 2-output base).
+        let x = "0000000000000000000000000000000000000000000000000000000000000001";
+        let a = test_addr();
+        let a = a.as_str();
+        let (x_val, rate) = (200_000u64, 2.0);
+        let avail = tier_out_total(x_val, 3, rate).unwrap();
+        // Fee scales: 3 payload outputs cost 2 extra P2TR outputs vs the base tier.
+        assert_eq!(
+            committed_fee_for_outputs(3, rate),
+            ((TIER_VBYTES + 2 * P2TR_OUT_VBYTES) as f64 * rate).ceil() as u64
+        );
+        assert!(committed_fee_for_outputs(3, rate) > committed_fee(rate), "fee must scale with outputs");
+        assert_eq!(committed_fee_for_outputs(1, rate), committed_fee(rate), "1 payload == the base tier");
+
+        let kids = vec![(a.to_string(), 1_000u64), (a.to_string(), 2_000u64), (a.to_string(), avail - 3_000)];
+        let sp = build_split_state(x, x_val, &kids, "regtest", 18, rate).unwrap();
+        let tx: Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&sp.tx_hex).unwrap()).unwrap();
+        assert_eq!(tx.version, 3);
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.input[0].previous_output.vout, 0, "SP spends X.out[0] — NOT the funding F [B1]");
+        assert_eq!(tx.input[0].sequence, csv_blocks(18));
+        assert_eq!(tx.output.len(), 4, "3 children + P2A");
+        assert_eq!(tx.output[3].value, P2A_VALUE);
+        assert_eq!(tx.output[3].script_pubkey, p2a_script(), "P2A anchors last");
+        let paid: u64 = tx.output[..3].iter().map(|o| o.value).sum();
+        assert_eq!(paid, avail, "Σout == Σin − fee_committed (no mint, no burn)");
+        assert_eq!(paid + P2A_VALUE + committed_fee_for_outputs(3, rate), x_val);
+    }
+
+    #[test]
+    fn split_state_rejects_value_mismatch() {
+        let x = "0000000000000000000000000000000000000000000000000000000000000001";
+        let a = test_addr();
+        let a = a.as_str();
+        let avail = tier_out_total(200_000, 2, 2.0).unwrap();
+        // Minting: Σ children exceeds what the parent carries.
+        assert!(build_split_state(x, 200_000, &[(a.into(), avail), (a.into(), 1)], "regtest", 18, 2.0).is_err());
+        // Burning: Σ children falls short (value would silently vanish to fee).
+        assert!(build_split_state(x, 200_000, &[(a.into(), 10), (a.into(), 10)], "regtest", 18, 2.0).is_err());
+        // Exact: accepted.
+        assert!(build_split_state(x, 200_000, &[(a.into(), 10), (a.into(), avail - 10)], "regtest", 18, 2.0).is_ok());
+        // No children at all.
+        assert!(build_split_state(x, 200_000, &[], "regtest", 18, 2.0).is_err());
+    }
 
     #[test]
     fn p2a_script_is_op1_4e73() {
