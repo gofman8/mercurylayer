@@ -298,13 +298,18 @@ pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f
 /// **SPLIT STATE `SP`** — the in-ladder split (V2-DESIGN §5.4). Spends `X_m.out[0]` under
 /// relative-timelock `csv_d`, paying `children` (exact amounts) plus the P2A anchor.
 ///
-/// This is what dissolves **B1**. A V1-style split spends the coin's funding `F` — and so does the
-/// trigger `T`, which every prior owner of a Model-A-conveyed coin retains, un-timelocked and already
-/// co-signed. That makes a V1 split a rival of `T` for `F`, and the race is rigged (v3/TRUC + P2A
-/// beats a fee-frozen v2 tx), so a prior owner can void the split and take the coin. `SP` instead
-/// spends `X_m.out[0]`: it **descends from `T` rather than racing it**, so a retained trigger has
-/// nothing to contend with — it can only start the clock on the current owner's own chain. Note
-/// `build_trigger` is the ONLY builder that touches `f_txid/f_vout`.
+/// This addresses (does NOT fully dissolve) **B1**. A V1-style split spends the coin's funding `F` — and
+/// so does the trigger `T`, which every prior owner of a Model-A-conveyed coin retains, un-timelocked and
+/// already co-signed. `SP` instead spends `X_m.out[0]`, so it **descends from `T` rather than racing it**:
+/// a retained trigger can only start the clock on the current owner's own chain.
+///
+/// ⚠️ B1 is **RELOCATED, not dissolved** (split-child-bundle design review). The *trigger* stops being a
+/// rival, but the parent's own retained STATE over `X_m.out[0]` becomes one. A child spending `SP.out[j]`
+/// is only safe if it verifies the PARENT's full-disclosure census (parent num_sigs == parent's disclosed
+/// tiers), which is only meaningful if the parent is terminalized AND that terminality is enforced at
+/// co-sign time. See `docs/utexo/V2-SPLIT-FINDINGS.md` — that census currently rests on server/enclave
+/// guarantees that do not hold (the enclave has NO notion of terminality; sign/second must re-check the
+/// gates — fixed 9d63f15). `build_trigger` is the ONLY builder that touches `f_txid/f_vout`.
 ///
 /// Each child resting output then hosts its own extension+state tiers; no child needs its own trigger
 /// because `SP` is itself un-broadcast (nothing ticks until it confirms).
