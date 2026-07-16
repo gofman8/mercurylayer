@@ -538,7 +538,20 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
             .map_err(|e| anyhow::anyhow!("exit tier {i} is not co-signed by A: {e}"))?;
     }
 
-    let final_csv = txs.last().unwrap().input[0].sequence.0 & 0xFFFF;
+    // PER-PREVOUT race map [S-1/S-2]: for each outpoint the exit chain spends, the CSV of the LIVE tier
+    // that spends it. A superseded tier only ever contends with the exit tier consuming the SAME
+    // outpoint, so that — not a global `final_csv` — is what it must be compared against.
+    //   S-2: comparing every superseded entry to `txs.last()`'s CSV is meaningless across unrelated
+    //        outpoints (post-rollover a level-0 superseded state was compared to the level-1 final
+    //        state — they never contend), and it also bricks honest renew→transfer sequences.
+    //   S-1: the old check was additionally gated on `kind == "state"`, leaving superseded EXTENSIONS
+    //        race-UNCHECKED. A genuinely co-signed X_evil at e_floor + its child S_evil both verify
+    //        against A and balance the count, but X_evil matures far ahead of the honest extension and
+    //        its state pays the attacker — outright theft. Extensions are now checked identically.
+    let mut live_csv_by_parent: std::collections::HashMap<Txid, u32> = std::collections::HashMap::new();
+    for i in 1..txs.len() {
+        live_csv_by_parent.insert(txs[i - 1].txid(), txs[i].input[0].sequence.0 & 0xFFFF);
+    }
     let mut superseded_ok: u32 = 0;
     for (kind, list) in [
         ("state", &bundle.superseded_states),
@@ -582,9 +595,19 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
             if csv < lo || csv > hi {
                 return Err(anyhow::anyhow!("superseded {kind} {j}: CSV {csv} outside bounds [{lo},{hi}]"));
             }
-            if kind == "state" && (csv as u32) <= final_csv {
+            // (e) RACE CHECK — applies to superseded EXTENSIONS and STATES alike [S-1], and compares
+            //     against the LIVE tier spending the SAME outpoint [S-2], never a global final_csv.
+            //     A superseded tier must mature strictly AFTER the live tier it contends with; a tier
+            //     that contends with nothing in the exit chain is an orphan branch and is refused
+            //     (it would otherwise pass "by construction" while still being broadcastable).
+            let live_csv = *live_csv_by_parent.get(&parent).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "superseded {kind} {j} contends with no live tier (spends {parent}, which the exit chain does not) — orphan branch"
+                )
+            })?;
+            if (csv as u32) <= live_csv {
                 return Err(anyhow::anyhow!(
-                    "superseded state {j} has CSV {csv} <= the current state's {final_csv} — it could out-race the owner"
+                    "superseded {kind} {j} has CSV {csv} <= the live tier's {live_csv} over the same outpoint — it could out-race the owner"
                 ));
             }
             superseded_ok += 1;

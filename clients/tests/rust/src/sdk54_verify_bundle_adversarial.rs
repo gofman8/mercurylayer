@@ -101,6 +101,24 @@ pub async fn execute() -> Result<()> {
     d.superseded_states.push(cur_state); // same CSV as current ⟹ not strictly above
     must_reject(&d, se + 1, 1, "ATTACK D (superseded state at/below the current CSV)")?;
 
+    // --- ATTACK E [S-1]: a superseded EXTENSION that OUT-RACES the live one. -------------------------
+    // The race check used to be gated on `kind == "state"`, so superseded EXTENSIONS were only
+    // bounds-checked. A genuinely co-signed X_evil low in [e_floor,e0] verifies against A and balances
+    // the count, but matures far ahead of the live extension — then its child state pays the attacker.
+    // Modelled here by replaying the LIVE extension as a "superseded" one: same outpoint, and its CSV is
+    // NOT strictly above the live tier's, so it must be refused.
+    let mut e = bundle.clone();
+    e.superseded_extensions.push(bundle.current().extension.clone());
+    must_reject(&e, se + 1, 1, "ATTACK E (superseded extension racing the live one)")?;
+
+    // --- ATTACK F [S-2]: an ORPHAN superseded tier contending with nothing in the exit chain. --------
+    // The old check compared every entry to a global `final_csv` from txs.last(), so a tier over an
+    // unrelated outpoint passed "by construction". The trigger spends F — no live tier contends with F
+    // besides the trigger itself — so replaying it as a superseded state must be refused as an orphan.
+    let mut f = bundle.clone();
+    f.superseded_states.push(bundle.trigger.clone());
+    must_reject(&f, se + 1, 1, "ATTACK F (orphan superseded tier over an uncontended outpoint)")?;
+
     // --- The honest bundle is still accepted after all of that. -------------------------------------
     verify_bundle(&bundle, se, 1).map_err(|e| anyhow!("honest bundle must still verify, got: {e}"))?;
 
