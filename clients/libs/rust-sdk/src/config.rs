@@ -61,11 +61,23 @@ pub struct SdkConfig {
     pub deposit_protocol_version: u32,
 }
 
-/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT` (default `1` during
-/// the V1→TES-R migration; flips to `2` at the END of V2DEF-5 once every non-LN test is V2-migrated —
-/// see `docs/utexo/V2-MIGRATION-PLAN.md`). Tests migrate one at a time by setting the env var to `2`.
+/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT`.
+///
+/// **REVERTED TO `1` — V2 IS NOT SAFE AS A DEFAULT YET.** The V2 receiver check `verify_bundle` has two
+/// FATAL holes (found by the V2-split-transfer design review, `docs/utexo/V2-SPLIT-FINDINGS.md`):
+///   S1 — `expected = v1_backups + tiers + superseded_states.len() + superseded_extensions.len()`, but
+///        superseded entries are never parsed/linked/signature-checked and check 4 skips `csv: None`.
+///        A sender holding a hidden low-CSV state pads one junk entry ⟹ the count matches ⟹ ACCEPTED
+///        ⟹ the sender later broadcasts the hidden state and takes the coin.
+///   S2 — `v1_backups` is `transfer_msg.backup_transactions.len()` (attacker-supplied) and the V1
+///        structural check (`validate_signature_scheme`) is gated off for `protocol_version >= 2`, so
+///        a padded/locktime-inverted backup vector is unvalidated — a strict V1→V2 regression.
+/// Three of four terms in the anti-theft equation are attacker-controlled. Do NOT flip back to `2`
+/// until both are fixed (every counted tier must be parsed, ladder-linked, in-bounds AND signature-
+/// verified against A) and an adversarial review + E2E prove padding/inversion are REJECTED.
+/// V2 remains available opt-in via the env var for tests.
 fn deposit_protocol_default() -> u32 {
-    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(2)
+    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(1)
 }
 
 impl SdkConfig {
