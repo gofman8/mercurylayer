@@ -363,7 +363,13 @@ impl UtexoWallet {
             return Ok(c.statechain_id.clone().unwrap_or_default());
         }
         // Split the smallest non-token-carrier coin that can cover the piece + fee reserve.
-        let parent = record
+        // [HF-3 / B1] ...and that is UN-LADDERED. `split_coin` refuses a laddered parent (a prior
+        // owner's retained no-timelock trigger could void the split and destroy the payee's sub-coin),
+        // so picking the smallest coin blindly would hard-fail whenever that coin happens to carry a
+        // ladder — even with a perfectly splittable coin sitting in the wallet. Ladder state lives in
+        // the wallet db, so this filter must be async: collect + sort first, then pick the smallest
+        // splittable one.
+        let mut candidates: Vec<(u64, String)> = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
@@ -372,10 +378,23 @@ impl UtexoWallet {
                 let a = c.amount.unwrap_or_default() as u64;
                 a > sats + split_fee_reserve(a)
             })
-            .min_by_key(|c| c.amount.unwrap_or_default())
-            .and_then(|c| c.statechain_id.clone())
-            .ok_or_else(|| anyhow!("no coin large enough to mint {sats} sats"))?;
+            .filter_map(|c| c.statechain_id.clone().map(|id| (c.amount.unwrap_or_default() as u64, id)))
+            .collect();
+        candidates.sort_by_key(|(amount, _)| *amount);
         drop(record);
+        let mut chosen: Option<String> = None;
+        for (_, id) in candidates {
+            if mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &id)
+                .await?
+                .is_none()
+            {
+                chosen = Some(id);
+                break;
+            }
+        }
+        let parent = chosen.ok_or_else(|| {
+            anyhow!("no splittable coin large enough to mint {sats} sats (coins carrying a V2 exit ladder cannot be split [B1] — use an exact amount or re-anchor)")
+        })?;
         let (piece, _change) = self.split_coin(&parent, sats).await?;
         Ok(piece)
     }
@@ -476,8 +495,18 @@ impl UtexoWallet {
         .map(|v| v.len() as u32)
         .unwrap_or(0);
         // Make the parent TERMINAL at the SE before co-signing the split: exactly one more
-        // co-signature is allowed (the split itself). No later withdraw/transfer/backup of the
-        // parent can be signed — the branch cannot be double-spent even by a malicious sender.
+        // co-signature is allowed (the split itself), so no later withdraw/transfer/backup of the
+        // parent can be signed.
+        //
+        // [HF-5 / B1] SCOPE — this does NOT mean "the branch cannot be double-spent even by a malicious
+        // sender" (the claim that stood here). That holds only under the V1 premise that EVERY spend of
+        // the parent's funding `F` needs a FRESH SE co-signature. A budget bounds FUTURE co-signs; it
+        // cannot RETRACT one already issued. A V2 parent's trigger `T` was co-signed back at `establish`
+        // — long before this call — carries no timelock, and spends `F` directly, so a retained `T`
+        // double-spends the branch regardless of any budget set here. That is B1. Splitting a laddered
+        // coin is therefore refused up-front in `split_coin`; the real fix is the in-ladder split
+        // (V2-DESIGN §5.4), where the split is a state tier DESCENDING from `T` rather than a rival for
+        // `F`. Keep this comment honest: the budget is a co-sign bound, not a spend bound.
         mercuryrustlib::lightning_latch::set_spend_budget(
             &self.inner.cc,
             &self.inner.config.wallet_name,

@@ -1022,6 +1022,22 @@ impl UtexoWallet {
                                 "coin {id} carries an RGB allocation; a plain unilateral exit would destroy the tokens — move the asset off this coin first"
                             ));
                         }
+                        // [HF-4 / B1] Never exit a coin that is no longer ours to exit. The explicit-id
+                        // branch previously filtered on carrier status ALONE — so a WITHDRAWN parent (a
+                        // coin already consumed by a split, `register_split_subcoins_n` sets that status)
+                        // could still be exited. On a V2 parent that is precisely the B1 theft: its
+                        // retained no-timelock trigger spends F, killing the split tx that funds the
+                        // receiver's sub-coin, while the ladder pays the splitter the full parent value.
+                        // This does not by itself fix B1 (an attacker can patch their client — the real
+                        // fix is the in-ladder split, V2-DESIGN §5.4), but the SDK must not be the weapon,
+                        // and it kills the accidental-loss variant where an honest user exits a spent
+                        // parent and destroys their own payee's coin.
+                        if c.status != CoinStatus::CONFIRMED {
+                            return Err(anyhow!(
+                                "coin {id} is not CONFIRMED (status {}) — it has already been spent/transferred and must not be exited; exiting a withdrawn parent would invalidate the sub-coins funded by its split [B1]",
+                                c.status
+                            ));
+                        }
                     }
                 }
                 ids
