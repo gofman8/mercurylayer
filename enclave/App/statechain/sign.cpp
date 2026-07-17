@@ -94,7 +94,20 @@ namespace signature {
         memset(serialized_server_pubnonce, 0, sizeof(serialized_server_pubnonce));
 
         std::string error_message;
-        bool data_loaded = db_manager::load_generated_key_data(
+        // [P0-1 / SGX LANE] CONSUME the secnonce as we load it — do NOT use the non-consuming
+        // load_generated_key_data here.
+        //
+        // This lane previously loaded the sealed secnonce with a plain, non-transactional SELECT and
+        // never cleared it, so the empty-secnonce guard below could never fire. An owner could call
+        // sign/second repeatedly against ONE sign/first nonce with DIFFERENT messages and obtain
+        // s1 = k + c1*x and s2 = k + c2*x over the same nonce k, revealing the SE's secret key share
+        // x = (s1 - s2) / (c1 - c2). With the SE's share plus their own, the coin's full aggregate key
+        // is reconstructible and every coordinator-side gate (single_use, sig_budget, epoch_deadline,
+        // terminality) becomes irrelevant — the attacker no longer needs the SE to sign at all.
+        //
+        // The lockbox lane has consumed the secnonce since P0-1 (lockbox/src/server.cpp:103); this SGX
+        // lane was missed, and the E2E suite runs against the lockbox, so the gap stayed green.
+        bool data_loaded = db_manager::load_and_consume_secnonce(
             statechain_id,
             encrypted_keypair,
             encrypted_secnonce,
@@ -112,7 +125,9 @@ namespace signature {
         bool is_sealed_secnonce_empty = encrypted_secnonce == nullptr;
 
         if (is_sealed_keypair_empty || is_sealed_secnonce_empty) {
-            return crow::response(400, "Empty sealed keypair or sealed secnonce!");
+            // Secnonce already consumed (or never generated): refuse rather than sign again.
+            // The client must call sign/first for a fresh nonce.
+            return crow::response(400, "Empty sealed keypair or sealed secnonce (secnonce already consumed — refusing to prevent nonce reuse)!");
         }
 
         unsigned char serialized_partial_sig[32];

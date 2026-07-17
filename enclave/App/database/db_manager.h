@@ -26,10 +26,25 @@ namespace db_manager {
         unsigned char* public_nonce, const size_t public_nonce_size, 
         std::string& error_message);
 
+    // [P0-1 / SGX LANE] Load the key data AND consume the sealed secnonce in one transaction.
+    //
+    // MUST be used instead of load_generated_key_data on any path that produces a partial signature.
+    // A secnonce that survives a signing round can be signed with a SECOND time over a DIFFERENT
+    // message, and two Schnorr/MuSig2 partial sigs sharing a nonce algebraically reveal the SE's
+    // secret key share:  s1 = k + c1*x, s2 = k + c2*x  =>  x = (s1 - s2) / (c1 - c2).
+    // The lockbox lane has had this guard since P0-1 (lockbox/src/db_manager.cpp:215); this SGX lane
+    // did not, which is why it is added here.
+    bool load_and_consume_secnonce(
+        const std::string& statechain_id,
+        std::unique_ptr<chacha20_poly1305_encrypted_data>& encrypted_keypair,
+        std::unique_ptr<chacha20_poly1305_encrypted_data>& encrypted_secnonce,
+        unsigned char* public_nonce, const size_t public_nonce_size,
+        std::string& error_message);
+
     bool update_sealed_secnonce(
-        const std::string& statechain_id, 
-        unsigned char* serialized_server_pubnonce, const size_t serialized_server_pubnonce_size, 
-        const chacha20_poly1305_encrypted_data& encrypted_secnonce, 
+        const std::string& statechain_id,
+        unsigned char* serialized_server_pubnonce, const size_t serialized_server_pubnonce_size,
+        const chacha20_poly1305_encrypted_data& encrypted_secnonce,
         std::string& error_message);
 
     bool update_sig_count(const std::string& statechain_id);
