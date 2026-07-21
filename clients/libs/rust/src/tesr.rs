@@ -247,11 +247,34 @@ pub async fn rollover(
     csv_e: u16,
     csv_d: u16,
 ) -> Result<()> {
+    let p = bundle.params;
     let cur_ext = bundle.current().extension.clone();
-    let state_csv = bundle.current().state.csv.unwrap_or(csv_d);
+    let cur_state_csv = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
 
     // 1. Re-sign the current level's state as a self-split paying A (so a child level can hang off it).
-    let s_roll = mercurylib::tesr::build_state(&cur_ext.txid, cur_ext.out_value, &bundle.agg_address, &bundle.network, state_csv, bundle.fee_rate)?;
+    //
+    // [S3] The self-split spends the SAME prevout as the current owner-paying state (both spend X_L:0),
+    // so it is a RIVAL of that state, not an independent tier. It can only supersede it by maturing
+    // FIRST — i.e. at a strictly LOWER CSV — exactly as presign_receiver_state does for S'. Building it
+    // at the current (undecremented) CSV made it an EQUAL-CSV twin of the retained old state, which
+    // verify_bundle's per-prevout race check rejects (`(csv as u32) <= live_csv`), so every rolled-over
+    // coin failed verification. It went unnoticed because sdk43 never called verify_bundle. Since
+    // rollover is mandatory at m_max, that was the terminal state of every long-lived coin.
+    //
+    // Consequence: rollover now CONSUMES one state rung (see V2-DESIGN footprint note). If the state
+    // CSV is already at the floor, a self-split rollover is impossible and the coin must exit or
+    // on-chain re-anchor.
+    let roll_csv = cur_state_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| anyhow::anyhow!(
+            "state CSV at the floor — cannot self-split rollover; exit or on-chain re-anchor"
+        ))?;
+    let s_roll = mercurylib::tesr::build_state(&cur_ext.txid, cur_ext.out_value, &bundle.agg_address, &bundle.network, roll_csv, bundle.fee_rate)?;
     let s_roll_signed = cosign_tier(cc, coin, s_roll.tx_hex.clone(), cur_ext.out_value, &bundle.network).await?;
 
     // 2. Fresh level off the self-split output: new extension + owner-exit state.
@@ -263,7 +286,7 @@ pub async fn rollover(
     let last = bundle.levels.len() - 1;
     // Full-disclosure: the old owner-paying state is replaced by the self-split; keep it for counting.
     bundle.superseded_states.push(bundle.levels[last].state.clone());
-    bundle.levels[last].state = TesrTier { txid: s_roll.txid, signed_tx: s_roll_signed, out_value: s_roll.out_value, csv: Some(state_csv) };
+    bundle.levels[last].state = TesrTier { txid: s_roll.txid, signed_tx: s_roll_signed, out_value: s_roll.out_value, csv: Some(roll_csv) };
     bundle.levels.push(TesrLevel {
         extension: TesrTier { txid: x2.txid, signed_tx: x2_signed, out_value: x2.out_value, csv: Some(csv_e) },
         state: TesrTier { txid: s2.txid, signed_tx: s2_signed, out_value: s2.out_value, csv: Some(csv_d) },
@@ -586,7 +609,31 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
         let op = txs[i].input[0].previous_output;
         live_csv_by_outpoint.insert((op.txid, op.vout), txs[i].input[0].sequence.0 & 0xFFFF);
     }
-    let mut superseded_ok: u32 = 0;
+    // Static per-tier validation (parse/linkage/co-sign/CSV) followed by a NON-CONFIRMABILITY fixpoint.
+    //
+    // A disclosed superseded tier is safe to count iff it can never CONFIRM and out-race the owner. There
+    // are two ways it is proven non-confirmable:
+    //   (i)  DIRECT CONTENTION: it spends the same outpoint as a LIVE exit tier, and its CSV is strictly
+    //        greater — it loses the maturity race (lower CSV wins). This is the presign/transfer case
+    //        (old state and S' both spend the live extension's out[0]).
+    //   (ii) TRANSITIVE DEATH: its parent (the tier whose output it spends) is itself a superseded tier
+    //        proven non-confirmable — so this tier's prevout is never created on-chain. This is the RENEW
+    //        case: renew supersedes BOTH the extension and the state, so the old state spends the OLD
+    //        (superseded) extension's out[0], which no LIVE tier spends. The old extension loses its own
+    //        race for T.out[0] to the new extension, so it can never confirm, so the old state can never
+    //        confirm. Rejecting it as an "orphan" (the earlier check did) wrongly bricked every renewed
+    //        coin — uncaught because no test ran renew + verify_bundle together.
+    // A tier that is NEITHER out-raced by a live tier NOR rooted (transitively) in such a losing race is a
+    // real orphan/threat and is refused. Cycles never root in a live contention, so they are never marked
+    // dead ⟹ never accepted.
+    struct Sup {
+        kind: &'static str,
+        j: usize,
+        prevout: (Txid, u32),
+        csv: u32,
+        outputs: Vec<(Txid, u32)>,
+    }
+    let mut sups: Vec<Sup> = Vec::with_capacity(superseded_parsed.len());
     for (kind, j, s, tx) in superseded_parsed.iter() {
         let (kind, j) = (*kind, *j);
         // (a) parsed + txid-bound already (pre-pass above) — no unparseable entry reaches here.
@@ -612,23 +659,62 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
         if csv < lo || csv > hi {
             return Err(anyhow::anyhow!("superseded {kind} {j}: CSV {csv} outside bounds [{lo},{hi}]"));
         }
-        // (e) RACE CHECK — EXTENSIONS and STATES alike [S-1], against the LIVE tier spending the SAME
-        //     outpoint [S-2], never a global final_csv. A superseded tier must mature strictly AFTER the
-        //     tier it actually contends with; one that contends with nothing in the exit chain is an
-        //     orphan branch and is refused (it would otherwise pass vacuously while still broadcastable).
-        let live_csv = *live_csv_by_outpoint.get(&(op.txid, op.vout)).ok_or_else(|| {
-            anyhow::anyhow!(
-                "superseded {kind} {j} contends with no live tier (spends {}:{}, which the exit chain does not) — orphan branch",
-                op.txid, op.vout
-            )
-        })?;
-        if (csv as u32) <= live_csv {
+        let outputs = tx
+            .output
+            .iter()
+            .enumerate()
+            .map(|(v, _)| (tx.txid(), v as u32))
+            .collect();
+        sups.push(Sup { kind, j, prevout: (op.txid, op.vout), csv: csv as u32, outputs });
+    }
+
+    // (e) NON-CONFIRMABILITY. Seed from direct contention with a live tier; propagate transitive death.
+    let mut dead = vec![false; sups.len()];
+    let mut dead_outputs: std::collections::HashSet<(Txid, u32)> = std::collections::HashSet::new();
+    for (idx, sup) in sups.iter().enumerate() {
+        if let Some(&live_csv) = live_csv_by_outpoint.get(&sup.prevout) {
+            // Directly contends with a live tier over the SAME outpoint — it MUST lose the race, or it
+            // could mature first and steal. (This is [S-1/S-2]: extensions and states alike, against the
+            // live tier spending the same outpoint, never a global final_csv.)
+            if sup.csv <= live_csv {
+                return Err(anyhow::anyhow!(
+                    "superseded {} {} has CSV {} <= the live tier's {} over the same outpoint — it could out-race the owner",
+                    sup.kind, sup.j, sup.csv, live_csv
+                ));
+            }
+            dead[idx] = true;
+            for o in &sup.outputs {
+                dead_outputs.insert(*o);
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for idx in 0..sups.len() {
+            if dead[idx] {
+                continue;
+            }
+            if dead_outputs.contains(&sups[idx].prevout) {
+                dead[idx] = true;
+                for o in sups[idx].outputs.clone() {
+                    dead_outputs.insert(o);
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (idx, sup) in sups.iter().enumerate() {
+        if !dead[idx] {
             return Err(anyhow::anyhow!(
-                "superseded {kind} {j} has CSV {csv} <= the live tier's {live_csv} over the same outpoint — it could out-race the owner"
+                "superseded {} {} is neither out-raced by a live tier nor transitively dead (spends {}:{}) — orphan/threat branch",
+                sup.kind, sup.j, sup.prevout.0, sup.prevout.1
             ));
         }
-        superseded_ok += 1;
     }
+    let superseded_ok: u32 = sups.len() as u32;
 
     // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for EVERY co-signed
     //    tier — the exit chain PLUS the superseded states/extensions (full-disclosure counting). Every
