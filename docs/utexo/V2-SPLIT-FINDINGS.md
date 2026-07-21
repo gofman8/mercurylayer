@@ -176,3 +176,56 @@ that **do not currently hold**. Verdict: **FLAWED — not implementable until th
    parent-state rival) is only closed by a census that rests on #2. Until #2 lands, V2 stays opt-in and
    splits of laddered coins stay refused (HF-1). Do NOT flip the default.
 4. Follow-on: adaptor-sig LN (V2-LATCH-FIX.md) for the LN lane.
+
+---
+
+## O-1 RESOLUTION (2026-07-21) — V2 CAN be made sound; the count census is the right mechanism
+
+The O-1 counter-machine review (the missing TESR-3 foundation) settled the central question:
+
+> **A blind SE CAN support a receiver-verifiable "no hidden state" property — by COUNTING signing rounds,
+> not by seeing messages. Counting is orthogonal to blindness.**
+
+- A **label** census (`{level,m,k}`, as V2-DESIGN:208 specified) is genuinely impossible — a blind SE
+  cannot verify a declared coordinate matches the signed message (Theorem 1). That machine is dead; do NOT
+  build it.
+- The shipped `verify_bundle` uses a **COUNT** census (`num_sigs == v1_backups + tiers + superseded`),
+  which is sound: the SE observes each signing round regardless of blindness. The retry-brick is **a
+  missing cache, not an information barrier**. The CTL/semi-blind redesign was REJECTED (it would trade
+  away blindness for a guarantee obtainable free).
+
+### Fixes landed + VERIFIED on the live stack (regtest + lockbox)
+- **S3 rollover equal-CSV twin** + **verify_bundle transitive-death** (a8e05a7): rollover now decrements
+  the self-split CSV (mirrors presign); the orphan check now accepts transitively-dead superseded tiers
+  (renewed coins) while rejecting real orphans/threats via a non-confirmability fixpoint. sdk43 now runs
+  verify_bundle (it never did); sdk54 (incl. new **attack G**, 88e2a50) + sdk55/46/48 reject every attack;
+  sdk44/47/49/50 green.
+
+### Fixes landed, compile-clean, awaiting a coordinated redeploy / SGX build to ACTIVATE
+- **SGX secnonce single-use** (9cfe48f) — P0 key-extraction on the production lane; needs Linux+SGX build
+  + the reuse-over-two-messages attack test. See docs / memory `sgx-lane-untested-gap`.
+- **sign/second fork gates** (9d63f15), **get_statechain_info NULL-challenge panic** (42a39fe),
+  **sign/first fail-open lock → fail-closed** (549d9d2) — all server-side; activate on redeploy.
+- **S7 nodejs/web fail-closed on V2 coins** (ca76dfc).
+
+### BLOCKED (not a client patch; needs infra or protocol design)
+- **Keystone — retry-safety response cache** (the last thing gating V2-as-default): lockbox caches the
+  partial sig keyed on the challenge (return cached on retry, no re-sign / no increment; nonce-reuse guard
+  preserved); coordinator caches likewise; client persists the session and retries `sign/second` — never
+  restarts `sign/first`. This makes the count census retry-safe (a lost response no longer bricks a coin).
+  BLOCKED because the lockbox is C++ that cannot be built on the dev host (heavy vcpkg/google-cloud-cpp);
+  needs a CI/Linux build to implement+verify. The client-retry half has only marginal value without the
+  cache and is deferred to land together.
+- **S5 — presign abandonment burns/bricks ladder rungs**: presign co-signs S' on a CLONE (num_sigs++)
+  without updating the sender's persisted bundle, so an abandoned/failed transfer leaves num_sigs above
+  what any future bundle discloses ⟹ every future receiver rejects (count mismatch) ⟹ brick; a malicious
+  receiver can trigger it in one round-trip. The sound fix is a receiver-liveness gate (don't co-sign for a
+  no-show) or a reclaim operation (re-sign the owner state one rung lower, disclosing the abandoned S' as
+  superseded) — a protocol feature coupled to the keystone's idempotent presign, NOT to be improvised.
+- **S1 — lockbox port 18080 published + unauthenticated** (confirmed live: `0.0.0.0:18080`): anyone
+  reaching it calls sign/first+sign/second directly, bypassing every coordinator gate and voiding the
+  census. Fix = authenticate the lockbox↔coordinator channel (shared secret/mTLS; lockbox rebuild) +
+  unpublish the host port on co-located topologies. BLOCKED on lockbox rebuild + a deploy/topology call.
+
+**Do NOT flip the default to V2 until the keystone lands and is verified.** With it, V2's count census is
+sound and retry-safe, and the in-ladder split (B1) rides on top of a trustworthy parent census.
