@@ -122,6 +122,30 @@ pub async fn execute() -> Result<()> {
     // --- The honest bundle is still accepted after all of that. -------------------------------------
     verify_bundle(&bundle, se, 1).map_err(|e| anyhow!("honest bundle must still verify, got: {e}"))?;
 
-    println!("SDK54 - ✓ PASS: the count is unpaddable — junk, csv:None, never-co-signed and out-racing entries are all REJECTED; honest bundles still verify");
+    // --- TRANSITIVE-DEATH path (renew supersedes BOTH the extension and the state). ------------------
+    // After a renew the old state spends the OLD (superseded) extension's out[0], which no LIVE tier
+    // spends. It is safely dead — its parent lost its own race for T:0 and can never confirm — so
+    // verify_bundle must ACCEPT it. (Before the transitive-death fix this bricked every renewed coin.)
+    let mut renewed = bundle.clone();
+    mercuryrustlib::tesr::renew_auto(&cc, &mut alice, &mut renewed).await?;
+    let se_renew = mercuryrustlib::utils::get_statechain_info(&sid, &cc)
+        .await?
+        .ok_or(anyhow!("no statechain_info"))?
+        .num_sigs;
+    verify_bundle(&renewed, se_renew, 1)
+        .map_err(|e| anyhow!("renewed bundle must verify (transitive-death ACCEPT path), got: {e}"))?;
+    println!("SDK54 - control: renewed bundle verifies — superseded state over a dead extension ACCEPTED (num_sigs={se_renew})");
+
+    // --- ATTACK G: a superseded STATE whose parent extension is NOT disclosed as a dead tier. --------
+    // The renewed bundle's superseded state is only safe because its parent superseded extension is
+    // disclosed AND provably dead. Drop that parent extension: the state now roots in NOTHING dead, so
+    // it must be refused (it could otherwise pad the count while remaining broadcastable if its parent
+    // could somehow confirm). We pass the count that MATCHES the reduced disclosure (se_renew − 1) so the
+    // rejection is the STRUCTURAL orphan/linkage check, not a count mismatch.
+    let mut g = renewed.clone();
+    g.superseded_extensions.pop(); // remove the dead parent; the superseded state now has no dead root
+    must_reject(&g, se_renew - 1, 1, "ATTACK G (superseded state with no disclosed dead parent)")?;
+
+    println!("SDK54 - ✓ PASS: the count is unpaddable — junk, csv:None, never-co-signed, out-racing, orphan and parentless entries are all REJECTED; honest and renewed bundles verify");
     Ok(())
 }
