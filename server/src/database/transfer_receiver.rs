@@ -7,22 +7,34 @@ pub async fn get_statechain_info(pool: &sqlx::PgPool, statechain_id: &str) -> Ve
 
     let mut result = Vec::<StatechainInfo>::new();
 
+    // Only FINALISED sessions belong in receiver-verification info. A row whose `challenge` is NULL is a
+    // dangling session — sign/first ran but sign/second has not — so it carries no finalised signature
+    // and no conveyed backup corresponds to it. Excluding it (a) matches count_finalized_signatures'
+    // `partial_sig_issued = true` semantics and (b) removes a griefing DoS: a `row.get::<String>()` on a
+    // NULL `challenge` panics the whole request worker, so anyone (or any interrupted honest flow) that
+    // left a dangling sign/first would make /info/statechain un-fetchable and the coin unverifiable.
     let query = "\
         SELECT statechain_id, server_pubnonce, challenge, tx_n \
         FROM statechain_signature_data \
-        WHERE statechain_id = $1 \
+        WHERE statechain_id = $1 AND challenge IS NOT NULL \
         ORDER BY created_at ASC";
 
-    let rows = sqlx::query(query)
-        .bind(statechain_id)
-        .fetch_all(pool)
-        .await
-        .unwrap();
+    let rows = match sqlx::query(query).bind(statechain_id).fetch_all(pool).await {
+        Ok(rows) => rows,
+        // Fail closed: a DB error here must not panic the worker. An empty info set makes the receiver
+        // refuse the coin (safe) rather than crash the endpoint for every caller.
+        Err(_) => return result,
+    };
 
     for row in rows {
+        // Defensive second line against the panic: even with the SQL filter, read `challenge` as nullable
+        // and skip any NULL rather than `get`-panicking.
+        let challenge: String = match row.try_get(2) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
         let statechain_id: String = row.get(0);
         let server_pubnonce: String = row.get(1);
-        let challenge: String = row.get(2);
         let tx_n: i32 = row.get(3);
 
         let statechain_transfer = StatechainInfo {
