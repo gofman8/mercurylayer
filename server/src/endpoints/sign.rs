@@ -18,9 +18,23 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
 
     // Serialize sign/first for this coin (defence-in-depth for the nonce-reuse guard + stops the
     // in-flight-session stranding DoS). Held for the whole handler; a transaction-scoped advisory
-    // lock auto-releases when `_signfirst_lock` drops on return. Fail-open on a DB hiccup: the
-    // enclave-side single-use consume remains the authoritative one-signature-per-secnonce guard.
-    let _signfirst_lock = crate::database::sign::acquire_signfirst_lock(&statechain_entity.pool, &statechain_id).await.ok();
+    // lock auto-releases when `_signfirst_lock` drops on return.
+    //
+    // [S9] FAIL CLOSED. This was `.ok()` — a DB hiccup dropped the lock and let sign/first proceed
+    // UNSERIALIZED, which permits two concurrent sign/first for one coin to each seal a fresh secnonce
+    // (the second overwriting the first) and strand an in-flight session (a self/replay-inducible DoS).
+    // The old comment rationalized this as "the enclave consume is authoritative" — but that consume was
+    // itself MISSING on the SGX lane until 9cfe48f, and it does not address the stranding race at all. A
+    // safety lock that silently no-ops on failure is not a safety lock: refuse (503, retryable) instead.
+    let _signfirst_lock = match crate::database::sign::acquire_signfirst_lock(&statechain_entity.pool, &statechain_id).await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "sign/first serialization lock unavailable; retry (fail-closed)" })),
+            );
+        }
+    };
 
     let enclave_index = crate::database::utils::get_enclave_index_from_database(&statechain_entity.pool, &statechain_id).await;
 
