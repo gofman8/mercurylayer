@@ -94,6 +94,19 @@ namespace signature {
         memset(serialized_server_pubnonce, 0, sizeof(serialized_server_pubnonce));
 
         std::string error_message;
+
+        // [KEYSTONE / SGX LANE] Idempotent signing-round cache — mirror of lockbox/src/server.cpp
+        // (11edbae, verified via sdk56). Checked BEFORE consuming the secnonce: a retry of the SAME
+        // session returns the cached partial sig (no re-sign, no re-increment), so a lost sign/second
+        // response cannot desync sig_count and brick the coin. A DIFFERENT session after consume still
+        // 400s below, so the nonce-reuse guard is unchanged.
+        std::string session_key = key_to_string(serialized_session.data(), serialized_session.size());
+        std::string cached_partial_sig;
+        if (db_manager::get_cached_partial_sig(statechain_id, session_key, cached_partial_sig)) {
+            crow::json::wvalue cached_result({{"partial_sig", cached_partial_sig}});
+            return crow::response{cached_result};
+        }
+
         // [P0-1 / SGX LANE] CONSUME the secnonce as we load it — do NOT use the non-consuming
         // load_generated_key_data here.
         //
@@ -149,12 +162,17 @@ namespace signature {
             return crow::response(500, "Enclave Generate Signature failed ");
         }
 
-        bool sig_count_updated = db_manager::update_sig_count(statechain_id);
-        if (!sig_count_updated) {
-            return crow::response(500, "Failed to update signature count!");
-        }
-
         auto partial_sig_hex = key_to_string(serialized_partial_sig, sizeof(serialized_partial_sig));
+
+        // [KEYSTONE / SGX LANE] Cache the produced sig AND increment sig_count ATOMICALLY (mirror of the
+        // lockbox lane), replacing the standalone update_sig_count. Either both happen (a retry gets the
+        // cached sig, counted once) or neither (client restarts sign/first cleanly, no phantom count).
+        std::string store_error;
+        bool stored = db_manager::store_partial_sig_and_increment(
+            statechain_id, session_key, partial_sig_hex, store_error);
+        if (!stored) {
+            return crow::response(500, "Failed to persist signature count: " + store_error);
+        }
 
         crow::json::wvalue result({{"partial_sig", partial_sig_hex}});
         return crow::response{result};

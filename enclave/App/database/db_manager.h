@@ -49,6 +49,23 @@ namespace db_manager {
 
     bool update_sig_count(const std::string& statechain_id);
 
+    // [KEYSTONE / SGX LANE] Retry-safety signing-round cache — a direct mirror of the lockbox lane
+    // (lockbox/src/db_manager.cpp, commit 11edbae, verified via sdk56). A retry of the SAME session
+    // returns the cached partial sig with NO re-sign and NO re-increment, so a lost sign/second response
+    // cannot desync sig_count from the client's tier set and brick the coin. See db_manager.h on the
+    // lockbox lane for the full rationale. NOT verifiable on this host (no SGX SDK) — mirrors code that
+    // IS verified; must be built + retry-tested on Linux+SGX before mainnet.
+    bool get_cached_partial_sig(
+        const std::string& statechain_id,
+        const std::string& session_key,
+        std::string& out_partial_sig);
+
+    bool store_partial_sig_and_increment(
+        const std::string& statechain_id,
+        const std::string& session_key,
+        const std::string& partial_sig,
+        std::string& error_message);
+
     bool signature_count(const std::string& statechain_id, int& sig_count);
 
     bool update_sealed_keypair(
