@@ -422,6 +422,20 @@ pub async fn load_child(cc: &ClientConfig, wallet_name: &str, child_statechain_i
     Ok(None)
 }
 
+/// Statechain ids of all coins that are RECEIVED in-ladder split child CLAIMS (a persisted `ctesr-<id>`
+/// bundle). These are exit-only until materialized — a caller must exclude them from off-chain spend
+/// selection (they hold no SE co-signing relationship; their funding `SP.out[j]` is un-broadcast).
+/// One wallet-DB read. See [[v2-child-retransfer-unsound]] for why they cannot be re-transferred off-chain.
+pub async fn child_claim_sids(cc: &ClientConfig, wallet_name: &str) -> Result<std::collections::HashSet<String>> {
+    let mut set = std::collections::HashSet::new();
+    for (k, _json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if let Some(sid) = k.strip_prefix("ctesr-") {
+            set.insert(sid.to_string());
+        }
+    }
+    Ok(set)
+}
+
 /// The full unilateral-exit chain of a split child, in broadcast order:
 /// `T -> X_m -> SP` (parent segment) then `ext_child -> state_child`. Each entry is
 /// `(signed_tx_hex, relative_csv)` — the trigger has no CSV.

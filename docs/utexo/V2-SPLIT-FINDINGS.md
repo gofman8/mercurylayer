@@ -48,11 +48,23 @@ branch and the branch always matures first (INV-4).
 - **HF-2 mooted**: the planner no longer needs a `splittable` hint — `transfer()` splits laddered coins
   in-ladder instead of hard-failing.
 - **Follow-ups still open before flipping the default**:
-  - **Received-child first-classness**: a received in-ladder split child is an EXIT-ONLY claim (funding =
-    un-broadcast `SP.out[j]`; the receiver holds no SE co-signing key). `withdraw()` now routes it to a
-    unilateral exit (materialize to the receiver's own key) instead of crashing, but **co-op withdraw /
-    off-chain re-transfer of a received child to a third party** still needs the SE pending-transfer lock
-    (the deferred "V2 re-transfer"). Until then a received non-exact payment is force-close-to-self only.
+  - **Received-child first-classness — SOUND MODEL = exit-only claim** (adversarial review 2026-07-22,
+    workflow wf_ead9b877-719). A received in-ladder split child is an EXIT-ONLY claim: funding =
+    un-broadcast `SP.out[j]`, and the receiver holds no SE co-signing key — only the pre-signed exit chain
+    that (Model A) pays the receiver's own key. **Co-op WITHDRAW of a child = its unilateral exit** (the
+    exit IS the withdrawal; `withdraw()` routes a child to `unilateral_exit` → `exit_child_pass`,
+    multi-block by CSV). `transfer()` **excludes** child claims from spend selection — off-chain
+    re-transfer of an un-materialized child is not supported; materialize (broadcast SP) first, then it is
+    a normal on-chain-funded coin.
+    - ❌ **The "SE handover + budget-reopen" idea to make a child first-class off-chain is UNSOUND — do
+      NOT build it.** `arm_child_reopen(sid, new_auth)` with a sender-supplied target lets a malicious
+      sender arm the reopen to its OWN key, self-complete the handover, reopen the budget for itself, and
+      co-sign a no-CSV key-spend of `SP.out[j]` that beats the receiver's CSV-delayed exit — **B1
+      re-armed, theft**. Even binding the marker to the real recipient, a child's headless off-chain
+      funding has no on-chain root, so a second-hop re-transfer cannot be census-verified downstream.
+    - ⟹ Flipping V2 default makes received non-exact payments exit-only claims (re-spend = materialize) —
+      a **product decision** (sdk01's instant co-op-withdraw assumption becomes a multi-block chain op),
+      not just an engineering gate.
   - **Census baseline generalization**: `verify_conveyed_child` assumes a **fresh-deposit parent**
     (`PARENT_V2_BASELINE = 1` V1 backup). A received/renewed parent has a different `num_sigs` history, so
     splitting it currently fails the census (fails CLOSED — safe, but functionally blocked).

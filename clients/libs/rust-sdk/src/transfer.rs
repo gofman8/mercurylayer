@@ -44,12 +44,28 @@ impl UtexoWallet {
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
+        // Received in-ladder split CHILD claims are exit-only (funding is the un-broadcast SP.out[j];
+        // no SE co-signing key held). They cannot be spent off-chain — exclude them from selection so a
+        // payment never tries to re-transfer one (which would fail with no SE relationship). To spend a
+        // received non-exact payment, materialize it first (`withdraw`/`unilateral_exit` runs its exit
+        // chain). See v2-child-retransfer-unsound: off-chain child re-transfer is not soundly verifiable.
+        let child_claims = mercuryrustlib::tesr::child_claim_sids(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+        )
+        .await?;
 
         let spendable: Vec<&Coin> = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
             .filter(|c| !is_token_carrier(c, &carriers))
+            .filter(|c| {
+                c.statechain_id
+                    .as_deref()
+                    .map(|s| !child_claims.contains(s))
+                    .unwrap_or(true)
+            })
             .collect();
         let candidates: Vec<Candidate> = spendable
             .iter()
