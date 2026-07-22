@@ -848,6 +848,16 @@ impl UtexoWallet {
                 .is_some()
             {
                 let _ = self.unilateral_exit(Some(vec![id.clone()]), None).await?;
+                // The child's value is now committed to its (multi-block) exit — mark it WITHDRAWING so
+                // it leaves the spendable balance immediately, mirroring a cooperative withdraw
+                // (withdraw::execute sets the same status). Its exit chain completes over several blocks.
+                let mut rec = self.record().await?;
+                for c in rec.coins.iter_mut() {
+                    if c.statechain_id.as_deref() == Some(id.as_str()) {
+                        c.status = CoinStatus::WITHDRAWING;
+                    }
+                }
+                self.save_record(&rec).await?;
                 withdrawn.push(id);
                 continue;
             }
