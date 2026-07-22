@@ -120,8 +120,16 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk36_alice"), None).await?;
-    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk36_bob"), None).await?;
+    // V1-LANE TEST: this exercises the `split_coin` primitive (a self-split into FIRST-CLASS sub-coins).
+    // Under V2 a laddered coin splits only IN-LADDER (transfer()/in_ladder_pay → exit-only children), so
+    // `split_coin` refuses a laddered coin (HF-1 / B1). Pin V1 so the derived-token + split_coin path
+    // under test still applies; revisit/migrate/delete when V1 is removed.
+    let mut cfg_a = SdkConfig::regtest("sdk36_alice");
+    cfg_a.deposit_protocol_version = 1;
+    let mut cfg_b = SdkConfig::regtest("sdk36_bob");
+    cfg_b.deposit_protocol_version = 1;
+    let (alice, _) = UtexoWallet::initialize(cfg_a, None).await?;
+    let (bob, _) = UtexoWallet::initialize(cfg_b, None).await?;
     let bob_addr = bob.get_utexo_address().await?;
 
     // ===== (a) SPLIT NEVER TOUCHES THE POOL ======================================================
