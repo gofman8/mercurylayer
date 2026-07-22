@@ -80,6 +80,32 @@ pub struct TesrBundle {
     pub params: mercurylib::tesr::TesrParams,
 }
 
+/// [in-ladder split] A split child's exit bundle. It spans TWO aggregates: the ancestor segment
+/// (`T, X_m, SP`) under the PARENT's aggregate `A_parent` (rooted at the on-chain funding `F`), and the
+/// child's own headless ladder (`ext_child, state_child`) under `A_child` = the key `SP.out[sp_vout]`
+/// pays. `verify_child_bundle` (the 8-check Stage-2 predicate, ruling wqvoxvusg) proves the child is
+/// safe from a hidden parent state rivalling `SP` over `X_m.out[0]` WITHOUT any SGX change.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChildTesrBundle {
+    /// The PARENT segment as an ordinary TES-R bundle: exit chain `T -> X_m -> SP`, with `SP` the
+    /// current (terminal) state paying the children+P2A, and the parent's old owner state `S_0`
+    /// disclosed in `superseded_states` (it rivals `SP` over `X_m.out[0]` and must lose the race).
+    pub parent: TesrBundle,
+    pub parent_statechain_id: String,
+    /// Which `SP` output funds this child (`j`).
+    pub sp_vout: u32,
+    pub child_statechain_id: String,
+    /// The child receiver's own exit key (Model A: the final child state must pay THIS).
+    pub child_owner_exit_address: String,
+    /// Child ladder: `child_extension` spends `SP.out[sp_vout]`; `child_state` spends its `out[0]`.
+    pub child_extension: TesrTier,
+    pub child_state: TesrTier,
+    #[serde(default)]
+    pub child_superseded_states: Vec<TesrTier>,
+    #[serde(default)]
+    pub child_superseded_extensions: Vec<TesrTier>,
+}
+
 impl TesrBundle {
     /// The current (deepest) level.
     pub fn current(&self) -> &TesrLevel {
@@ -769,6 +795,156 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
             "num_sigs mismatch: SE issued {se_num_sigs}, disclosed tiers+backups account for {expected} — possible hidden state"
         ));
     }
+    Ok(())
+}
+
+/// [in-ladder split] The x-only taproot key (hex) of a v1 taproot scriptPubKey, or an error if `spk`
+/// is not `OP_1 <32-byte push>`.
+fn taproot_key_hex(spk: &[u8]) -> Result<String> {
+    if spk.len() != 34 || spk[0] != 0x51 || spk[1] != 0x20 {
+        return Err(anyhow::anyhow!("not a v1 taproot scriptPubKey"));
+    }
+    Ok(hex::encode(&spk[2..34]).to_lowercase())
+}
+
+/// [in-ladder split] Verify a split child's exit bundle — the 8-check Stage-2 predicate (ruling
+/// wqvoxvusg). Proves the child is safe from a hidden parent state rivalling `SP` over `X_m.out[0]`
+/// with NO SGX: soundness rests on the on-chain root of `A_parent`, the authoritative server aggregate
+/// records (Stage 1, UNIQUE), the exact-equality censuses, and coordinator-enforced terminality.
+///
+/// PURE + unit-testable: all authoritative values are passed in (the caller fetches them from chain +
+/// `/info/statechain`). `parent_f_onchain_spk_hex` is `F.output[f_vout].script_pubkey` read from the
+/// chain (the caller having confirmed `F` unspent+confirmed at `cb.parent.f_txid/f_vout`); the
+/// `*_aggregate_pubkey` are the server's recorded aggregates (None ⟹ fail-closed).
+///
+/// ⚠️ DORMANT + UNREVIEWED: nothing calls this for a live split yet (HF-1 still refuses to split a
+/// laddered coin). It must pass the split E2E + an adversarial test suite + an independent review before
+/// HF-1 is removed. Conservative for now: a child that has been renewed/transferred (non-empty child
+/// superseded sets) is REJECTED rather than under-validated — that path is future work.
+pub fn verify_child_bundle(
+    cb: &ChildTesrBundle,
+    parent_f_onchain_spk_hex: &str,
+    parent_num_sigs: u32,
+    parent_v1_backups: u32,
+    parent_aggregate_pubkey: Option<&str>,
+    child_num_sigs: u32,
+    child_v1_backups: u32,
+    child_aggregate_pubkey: Option<&str>,
+    receiver_backup_address: &str,
+) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
+
+    // [1] ON-CHAIN ROOT: A_parent := taproot key of the fetched on-chain F.spk. Bind the parent
+    //     segment's declared aggregate to it — the co-sign key is anchored to the on-chain funding,
+    //     not a sender field. (This closes the "sender picks a decoy F" path together with [2].)
+    let f_spk = hex::decode(parent_f_onchain_spk_hex).map_err(|_| anyhow::anyhow!("bad F spk hex"))?;
+    let a_parent = taproot_key_hex(&f_spk)?;
+    let net = net_from_str(&cb.parent.network);
+    let parent_agg_spk = Address::from_str(&cb.parent.agg_address)
+        .map_err(|_| anyhow::anyhow!("bad parent agg_address"))?
+        .require_network(net)
+        .map_err(|_| anyhow::anyhow!("parent agg_address wrong network"))?
+        .script_pubkey();
+    if taproot_key_hex(parent_agg_spk.as_bytes())? != a_parent {
+        return Err(anyhow::anyhow!("parent agg_address does not match the on-chain F aggregate"));
+    }
+
+    // [2] PARENT AGGREGATE AUTHORITY: the server's recorded aggregate for parent_sid must be non-NULL
+    //     (fail-closed) and == A_parent. UNIQUE(aggregate_xonly) ⟹ only the REAL parent sid can hold
+    //     A_parent, so a decoy parent_sid (whose counter a sender could pump) can never match here.
+    let p_agg = parent_aggregate_pubkey
+        .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for parent sid (fail-closed)"))?
+        .to_lowercase();
+    if p_agg != a_parent {
+        return Err(anyhow::anyhow!("parent sid's server aggregate != A_parent (decoy parent)"));
+    }
+
+    // [3]+[4] PARENT SEGMENT + CENSUS: verify_bundle over the parent proves every parent tier is
+    //     co-signed under A_parent(=agg_address, now bound to on-chain F), SP is the current state,
+    //     S_0 is disclosed as superseded and OUT-RACED by SP over X_m.out[0], and the exact-equality
+    //     census holds (num_sigs(parent_sid) accounts for exactly the disclosed tiers).
+    verify_bundle(&cb.parent, parent_num_sigs, parent_v1_backups)
+        .map_err(|e| anyhow::anyhow!("parent segment/census invalid: {e}"))?;
+
+    // Parse SP (the parent's current, terminal state) — it hosts the children on its outputs.
+    let sp_tx: Transaction = deserialize(
+        &hex::decode(&cb.parent.current().state.signed_tx).map_err(|_| anyhow::anyhow!("bad SP hex"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("SP is not a transaction"))?;
+    let sp_txid = sp_tx.txid();
+    let sp_out = sp_tx
+        .output
+        .get(cb.sp_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("SP has no output {}", cb.sp_vout))?;
+
+    // [5] CHILD AGGREGATE AUTHORITY: A_child := SP.out[j].spk (parsed from SP, not declared). The
+    //     server's recorded aggregate for child_sid must be non-NULL and == A_child. SP is un-broadcast
+    //     so A_child has no on-chain root — its authority is the UNIQUE server registration (child_sid
+    //     must be server-created at split time, not sender-chosen).
+    let a_child = taproot_key_hex(sp_out.script_pubkey.as_bytes())?;
+    let c_agg = child_aggregate_pubkey
+        .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for child sid (fail-closed)"))?
+        .to_lowercase();
+    if c_agg != a_child {
+        return Err(anyhow::anyhow!("child sid's server aggregate != SP.out[j] key (decoy child)"));
+    }
+
+    // [6] CHILD SEGMENT + CENSUS, verified under A_child (attribution is KEY-DERIVED — check [7] — since
+    //     each tier is verified against SP.out[j]'s key, not a sender-filled segment field).
+    if !cb.child_superseded_states.is_empty() || !cb.child_superseded_extensions.is_empty() {
+        return Err(anyhow::anyhow!(
+            "child has superseded tiers (renewed/transferred child) — not yet supported by verify_child_bundle"
+        ));
+    }
+    let child_agg_spk = sp_out.script_pubkey.clone();
+
+    // ext_child spends exactly SP.out[j], co-signed by A_child.
+    let ext_tx: Transaction = deserialize(
+        &hex::decode(&cb.child_extension.signed_tx).map_err(|_| anyhow::anyhow!("bad child ext hex"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
+    let ext_in = ext_tx.input.first().ok_or_else(|| anyhow::anyhow!("child ext has no input"))?;
+    if ext_tx.input.len() != 1 || ext_in.previous_output.txid != sp_txid || ext_in.previous_output.vout != cb.sp_vout {
+        return Err(anyhow::anyhow!("child extension does not spend SP.out[j]"));
+    }
+    verify_tier_cosigned(&ext_tx, sp_out.value, &child_agg_spk)
+        .map_err(|e| anyhow::anyhow!("child extension not co-signed by A_child: {e}"))?;
+
+    // state_child spends ext_child.out[0], co-signed by A_child.
+    let ext_out0 = ext_tx.output.first().ok_or_else(|| anyhow::anyhow!("child ext has no out0"))?;
+    let st_tx: Transaction = deserialize(
+        &hex::decode(&cb.child_state.signed_tx).map_err(|_| anyhow::anyhow!("bad child state hex"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("child state is not a transaction"))?;
+    let st_in = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("child state has no input"))?;
+    if st_tx.input.len() != 1 || st_in.previous_output.txid != ext_tx.txid() || st_in.previous_output.vout != 0 {
+        return Err(anyhow::anyhow!("child state does not spend ext_child.out[0]"));
+    }
+    verify_tier_cosigned(&st_tx, ext_out0.value, &child_agg_spk)
+        .map_err(|e| anyhow::anyhow!("child state not co-signed by A_child: {e}"))?;
+
+    // MODEL A: the final child state must pay the RECEIVER's own key.
+    let recv_spk = Address::from_str(receiver_backup_address)
+        .map_err(|_| anyhow::anyhow!("bad receiver backup address"))?
+        .require_network(net)
+        .map_err(|_| anyhow::anyhow!("receiver backup address wrong network"))?
+        .script_pubkey();
+    let recv_key = taproot_key_hex(recv_spk.as_bytes())?;
+    let st_out0 = st_tx.output.first().ok_or_else(|| anyhow::anyhow!("child state has no out0"))?;
+    if taproot_key_hex(st_out0.script_pubkey.as_bytes())? != recv_key {
+        return Err(anyhow::anyhow!("child state does not pay the receiver's key (Model A violated)"));
+    }
+
+    // [6 cont.] CHILD CENSUS exact-equality: a fresh split child discloses exactly ext_child +
+    //     state_child (2 co-signs) on top of any V1 backups. A hidden child co-sign would push
+    //     child_num_sigs above this ⟹ reject.
+    let child_expected = child_v1_backups + 2;
+    if child_num_sigs != child_expected {
+        return Err(anyhow::anyhow!(
+            "child num_sigs mismatch: SE issued {child_num_sigs}, disclosed accounts for {child_expected} — possible hidden child state"
+        ));
+    }
+
     Ok(())
 }
 
