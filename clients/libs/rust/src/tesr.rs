@@ -168,6 +168,49 @@ pub async fn establish_auto(
     establish(cc, coin, owner_exit_address, p.ext_csv(0), p.state_csv(0), p.committed_fee_rate, network).await
 }
 
+/// [in-ladder split] A split child's headless ladder: extension spends `SP.out[j]`, state spends the
+/// extension's `out[0]` and pays the owner. No trigger — `SP` is un-broadcast, so the child's clock
+/// only starts once `SP` confirms on a unilateral exit. Both tiers are co-signed under the CHILD's
+/// aggregate (`child_coin.aggregated_address` == `SP.out[j]`'s scriptPubKey).
+pub struct ChildLadder {
+    pub extension: TesrTier,
+    pub state: TesrTier,
+}
+
+/// [in-ladder split] Co-sign a split child's headless ladder (extension + owner state) rooting at
+/// `SP.out[sp_vout]`. The child coin is a fresh statechain node whose aggregate is `SP.out[j]`'s key;
+/// this is the child-segment analogue of [`establish`] with no trigger. Persist/convey afterwards.
+pub async fn establish_child(
+    cc: &ClientConfig,
+    child_coin: &mut Coin,
+    sp_txid: &str,
+    sp_vout: u32,
+    sp_out_value: u64,
+    owner_exit_address: &str,
+    csv_e: u16,
+    csv_d: u16,
+    fee_rate: f64,
+    network: &str,
+) -> Result<ChildLadder> {
+    let agg = child_coin
+        .aggregated_address
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))?;
+
+    // Extension roots at the assigned SP output, under the child's aggregate.
+    let x = mercurylib::tesr::build_extension_from(sp_txid, sp_vout, sp_out_value, &agg, network, csv_e, fee_rate)?;
+    let x_signed = cosign_tier(cc, child_coin, x.tx_hex.clone(), sp_out_value, network).await?;
+
+    // Owner state spends the extension's out[0], pays the owner-exit key.
+    let s = mercurylib::tesr::build_state_from(&x.txid, 0, x.out_value, owner_exit_address, network, csv_d, fee_rate)?;
+    let s_signed = cosign_tier(cc, child_coin, s.tx_hex.clone(), x.out_value, network).await?;
+
+    Ok(ChildLadder {
+        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e) },
+        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+    })
+}
+
 /// Off-chain renewal at the schedule cadence: the new extension takes CSV `E0 − (m+1)·δE` and the
 /// fresh state `D0`, both from the bundle's [`TesrParams`]. Returns `true` if a rollover is due
 /// afterwards (`m` reached `m_max`), so the caller rolls over before the extension floor.
