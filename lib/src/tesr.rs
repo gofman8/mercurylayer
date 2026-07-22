@@ -278,6 +278,42 @@ pub fn build_state(
     Ok(encode(&build_tier_tx(txid, 0, csv_blocks(csv_d), spk, out_value)))
 }
 
+/// [in-ladder split] Like [`build_extension`] but roots at an ARBITRARY output `(prev_txid, prev_vout)`
+/// instead of the trigger's `out[0]`. A split child's ladder hangs off `SP.out[j]` (j = the child's
+/// index), so its first extension spends that specific output, under the CHILD's aggregate address.
+pub fn build_extension_from(
+    prev_txid: &str,
+    prev_vout: u32,
+    prev_out_value: u64,
+    to_address: &str,
+    network: &str,
+    csv_e: u16,
+    fee_rate: f64,
+) -> Result<TierTx, MercuryError> {
+    let txid = Txid::from_str(prev_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
+    let out_value = tier_out_value(prev_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
+    let spk = spk_from_address(to_address, network)?;
+    Ok(encode(&build_tier_tx(txid, prev_vout, csv_blocks(csv_e), spk, out_value)))
+}
+
+/// [in-ladder split] Like [`build_state`] but roots at an ARBITRARY output `(prev_txid, prev_vout)`.
+/// A split child's owner state spends its extension's `out[0]`, so `prev_vout` is 0 in the common case,
+/// but the explicit form keeps the child builders symmetric with [`build_extension_from`].
+pub fn build_state_from(
+    prev_txid: &str,
+    prev_vout: u32,
+    prev_out_value: u64,
+    owner_address: &str,
+    network: &str,
+    csv_d: u16,
+    fee_rate: f64,
+) -> Result<TierTx, MercuryError> {
+    let txid = Txid::from_str(prev_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
+    let out_value = tier_out_value(prev_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
+    let spk = spk_from_address(owner_address, network)?;
+    Ok(encode(&build_tier_tx(txid, prev_vout, csv_blocks(csv_d), spk, out_value)))
+}
+
 /// vbytes of one extra P2TR resting output (8 value + 1 length + 34 scriptPubKey).
 pub const P2TR_OUT_VBYTES: u64 = 43;
 
@@ -466,6 +502,34 @@ mod tests {
         assert!(build_split_state(x, 200_000, &[(a.into(), 10), (a.into(), avail - 10)], "regtest", 18, 2.0).is_ok());
         // No children at all.
         assert!(build_split_state(x, 200_000, &[], "regtest", 18, 2.0).is_err());
+    }
+
+    #[test]
+    fn child_builders_root_at_the_assigned_split_output() {
+        // A split child's ladder hangs off SP.out[j] for an ARBITRARY j — not out[0]. The child's first
+        // extension must spend exactly (sp_txid, j); its state then spends the extension's out[0].
+        let sp = "0000000000000000000000000000000000000000000000000000000000000abc";
+        let a = test_addr();
+        let (val, rate) = (150_000u64, 2.0);
+
+        for j in [0u32, 1, 2, 7] {
+            let ext = build_extension_from(sp, j, val, &a, "regtest", 12, rate).unwrap();
+            let etx: Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&ext.tx_hex).unwrap()).unwrap();
+            assert_eq!(etx.version, 3);
+            assert_eq!(etx.input[0].previous_output.vout, j, "child extension roots at SP.out[j]");
+            assert_eq!(etx.input[0].previous_output.txid.to_string(), sp);
+            assert_eq!(etx.input[0].sequence, csv_blocks(12));
+            assert_eq!(etx.output[1].value, P2A_VALUE, "P2A anchor present");
+
+            // The child state spends the extension's out[0].
+            let st = build_state_from(&ext.txid, 0, ext.out_value, &a, "regtest", 24, rate).unwrap();
+            let stx: Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&st.tx_hex).unwrap()).unwrap();
+            assert_eq!(stx.input[0].previous_output.txid.to_string(), ext.txid);
+            assert_eq!(stx.input[0].previous_output.vout, 0);
+            assert_eq!(stx.input[0].sequence, csv_blocks(24));
+        }
     }
 
     #[test]
