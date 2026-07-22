@@ -880,8 +880,43 @@ pub async fn cosign_tier(
 
     let partial = cosign_tier_request(coin, unsigned_tx_hex, prevout_value, network.to_string())?;
 
-    let server_partial_sig =
-        sign_second(client_config, &partial.partial_signature_request_payload).await?;
+    // [KEYSTONE / client half] Retry the SAME sign/second — NEVER restart sign/first here.
+    //
+    // Restarting sign/first would mint a fresh secnonce and a fresh SE co-sign, so sig_count would run
+    // ahead of the one tier we actually keep, and the receiver census (num_sigs == v1_backups + tiers +
+    // superseded) could never rebalance ⟹ the coin bricks. Resending the IDENTICAL payload is idempotent
+    // at the lockbox (same session ⟹ cached partial sig, no re-sign, no re-increment — see the lockbox
+    // signed_session_cache), so a lost sign/second response is recovered with the exact same signature.
+    //
+    // Retrying the same session is ALWAYS safe: it can only return the already-produced sig, produce it
+    // once (secnonce still sealed), or 400 (a different session already consumed the secnonce — which
+    // cannot happen for THIS session). If every attempt fails, we surface the error; the only
+    // unrecoverable case (a crash between the enclave consume and the atomic store) left NO count
+    // increment, so a caller that restarts the whole cosign is also safe. Bounded so a genuinely down SE
+    // still returns promptly.
+    let mut server_partial_sig = None;
+    let mut last_err = None;
+    for attempt in 0u32..5 {
+        match sign_second(client_config, &partial.partial_signature_request_payload).await {
+            Ok(sig) => {
+                server_partial_sig = Some(sig);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+    }
+    let server_partial_sig = match server_partial_sig {
+        Some(sig) => sig,
+        None => return Err(anyhow::anyhow!(
+            "sign/second failed after retries (session unchanged, no double-count): {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )),
+    };
 
     let signature = create_signature(
         partial.msg,
