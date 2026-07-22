@@ -142,6 +142,9 @@ pub async fn execute() -> Result<()> {
     ] {
         let _ = std::fs::remove_dir_all(d);
     }
+    // V1-LANE TEST: exercises split-based sats granularity (V1 branch sub-coins). V2 splits only
+    // IN-LADDER (exit-only children with different tier-fee amounts). Pin V1 until V1 is deleted.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     let cc = mercuryrustlib::client_config::load().await;
 
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk28_alice"), None).await?;

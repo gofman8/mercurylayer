@@ -22,6 +22,9 @@ pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
+    // V1-LANE TEST: exercises mint-via-split / branch receive-failure cases (V1 mechanisms). V2 splits
+    // only IN-LADDER (exit-only children), so split_coin refuses a laddered coin. Pin V1 until V1 deleted.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     let cc = mercuryrustlib::client_config::load().await;
 
     let (_payer_node, ssp_node) = rln::setup_ln_pair("/tmp/rln-sdk19").await?;

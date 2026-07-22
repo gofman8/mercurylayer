@@ -34,6 +34,9 @@ pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
+    // V1-LANE TEST: exercises single_use sub-coins / branch-model adversarial cases (V1 mechanisms).
+    // V2 replaces them with the in-ladder split (exit-only children). Pin V1 until V1 is deleted.
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     let cc = mercuryrustlib::client_config::load().await;
 
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk12_alice"), None).await?;
