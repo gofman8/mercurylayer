@@ -529,6 +529,15 @@ fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
 ///   3. `se_num_sigs == v1_backups + <number of tiers>`.
 /// This is a PURE function (no network) so it is unit-testable and reusable by the transfer receiver.
 pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> Result<()> {
+    // Ordinary bundle: the final state pays the owner. (A split parent uses verify_bundle_ex(true).)
+    verify_bundle_ex(bundle, se_num_sigs, v1_backups, false)
+}
+
+/// As [`verify_bundle`], but when `final_is_split` the FINAL tier is an in-ladder split state `SP` that
+/// pays the children (not the owner), so its output-payee check is skipped here — each child's outputs
+/// are verified against its own aggregate by [`verify_child_bundle`]. Everything else (co-signs under
+/// `A`, the per-outpoint race, the exact-equality census) is unchanged.
+fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, final_is_split: bool) -> Result<()> {
     use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction, Txid};
 
     let net = net_from_str(&bundle.network);
@@ -588,9 +597,14 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
             return Err(anyhow::anyhow!("tier {i} CSV {csv} outside schedule bounds [{lo},{hi}]"));
         }
         let is_final = i == txs.len() - 1;
-        let want = if is_final { &owner_spk } else { &agg_spk };
-        if tx.output.is_empty() || &tx.output[0].script_pubkey != want {
-            return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
+        if is_final && final_is_split {
+            // SP (split state) pays the children, not the owner; its outputs are verified per-child by
+            // verify_child_bundle (A_child == SP.out[j]). Skip the single-owner payee check here.
+        } else {
+            let want = if is_final { &owner_spk } else { &agg_spk };
+            if tx.output.is_empty() || &tx.output[0].script_pubkey != want {
+                return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
+            }
         }
     }
 
@@ -832,14 +846,29 @@ pub fn verify_child_bundle(
     child_aggregate_pubkey: Option<&str>,
     receiver_backup_address: &str,
 ) -> Result<()> {
-    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
+    use electrum_client::bitcoin::{
+        consensus::deserialize,
+        secp256k1::{Secp256k1, XOnlyPublicKey},
+        Address, Transaction,
+    };
+    let secp = Secp256k1::verification_only();
+    let net = net_from_str(&cb.parent.network);
+
+    // The server records the UNTWEAKED aggregate x-only; an on-chain scriptPubKey commits to the
+    // BIP-341-TWEAKED output key. So to compare a recorded aggregate to a key read from a spk, tweak the
+    // recorded aggregate first (P2TR with no script tree) and take the resulting output key.
+    let tweaked_key_hex = |agg_xonly_hex: &str| -> Result<String> {
+        let xonly = XOnlyPublicKey::from_str(agg_xonly_hex)
+            .map_err(|_| anyhow::anyhow!("bad aggregate x-only hex"))?;
+        let spk = Address::p2tr(&secp, xonly, None, net).script_pubkey();
+        taproot_key_hex(spk.as_bytes())
+    };
 
     // [1] ON-CHAIN ROOT: A_parent := taproot key of the fetched on-chain F.spk. Bind the parent
     //     segment's declared aggregate to it — the co-sign key is anchored to the on-chain funding,
     //     not a sender field. (This closes the "sender picks a decoy F" path together with [2].)
     let f_spk = hex::decode(parent_f_onchain_spk_hex).map_err(|_| anyhow::anyhow!("bad F spk hex"))?;
     let a_parent = taproot_key_hex(&f_spk)?;
-    let net = net_from_str(&cb.parent.network);
     let parent_agg_spk = Address::from_str(&cb.parent.agg_address)
         .map_err(|_| anyhow::anyhow!("bad parent agg_address"))?
         .require_network(net)
@@ -853,9 +882,8 @@ pub fn verify_child_bundle(
     //     (fail-closed) and == A_parent. UNIQUE(aggregate_xonly) ⟹ only the REAL parent sid can hold
     //     A_parent, so a decoy parent_sid (whose counter a sender could pump) can never match here.
     let p_agg = parent_aggregate_pubkey
-        .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for parent sid (fail-closed)"))?
-        .to_lowercase();
-    if p_agg != a_parent {
+        .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for parent sid (fail-closed)"))?;
+    if tweaked_key_hex(p_agg)? != a_parent {
         return Err(anyhow::anyhow!("parent sid's server aggregate != A_parent (decoy parent)"));
     }
 
@@ -863,7 +891,7 @@ pub fn verify_child_bundle(
     //     co-signed under A_parent(=agg_address, now bound to on-chain F), SP is the current state,
     //     S_0 is disclosed as superseded and OUT-RACED by SP over X_m.out[0], and the exact-equality
     //     census holds (num_sigs(parent_sid) accounts for exactly the disclosed tiers).
-    verify_bundle(&cb.parent, parent_num_sigs, parent_v1_backups)
+    verify_bundle_ex(&cb.parent, parent_num_sigs, parent_v1_backups, true)
         .map_err(|e| anyhow::anyhow!("parent segment/census invalid: {e}"))?;
 
     // Parse SP (the parent's current, terminal state) — it hosts the children on its outputs.
@@ -883,9 +911,8 @@ pub fn verify_child_bundle(
     //     must be server-created at split time, not sender-chosen).
     let a_child = taproot_key_hex(sp_out.script_pubkey.as_bytes())?;
     let c_agg = child_aggregate_pubkey
-        .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for child sid (fail-closed)"))?
-        .to_lowercase();
-    if c_agg != a_child {
+        .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for child sid (fail-closed)"))?;
+    if tweaked_key_hex(c_agg)? != a_child {
         return Err(anyhow::anyhow!("child sid's server aggregate != SP.out[j] key (decoy child)"));
     }
 
