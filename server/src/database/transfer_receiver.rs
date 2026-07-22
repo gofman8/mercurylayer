@@ -76,6 +76,22 @@ pub async fn get_enclave_pubkey(pool: &sqlx::PgPool, statechain_id: &str) -> Opt
     Some(enclave_public_key)
 }
 
+/// [FATAL-B] The authoritative aggregate x-only key the server recorded for this coin at deposit, as
+/// hex. `None` for coins deposited before the owner-share binding (the column is NULL). Fail-safe: any
+/// DB/read error returns None, so the receiver falls back to the legacy path rather than the endpoint
+/// panicking.
+pub async fn get_aggregate_pubkey(pool: &sqlx::PgPool, statechain_id: &str) -> Option<String> {
+    let query = "SELECT aggregate_xonly FROM statechain_data WHERE statechain_id = $1";
+
+    let row = match sqlx::query(query).bind(statechain_id).fetch_optional(pool).await {
+        Ok(Some(r)) => r,
+        _ => return None,
+    };
+
+    let bytes: Option<Vec<u8>> = row.try_get::<Option<Vec<u8>>, _>("aggregate_xonly").ok().flatten();
+    bytes.map(hex::encode)
+}
+
 pub async fn get_x1pub(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
 
     let query = "SELECT x1 \

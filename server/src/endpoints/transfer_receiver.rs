@@ -76,11 +76,14 @@ pub async fn statechain_info(statechain_entity: &State<StateChainEntity>, statec
         x1_pub = Some(x1_pubkey.unwrap().to_string());
     }
 
+    let aggregate_pubkey = crate::database::transfer_receiver::get_aggregate_pubkey(&statechain_entity.pool, &statechain_id).await;
+
     let statechain_info_response_payload = StatechainInfoResponsePayload {
         enclave_public_key: enclave_public_key.to_string(),
         num_sigs: num_sigs as u32,
         statechain_info,
         x1_pub,
+        aggregate_pubkey,
     };
     
     let response_body = json!(statechain_info_response_payload);

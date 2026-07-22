@@ -95,9 +95,14 @@ pub async fn check_existing_key(pool: &sqlx::PgPool, auth_key: &XOnlyPublicKey) 
     }
 }
 
-pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &XOnlyPublicKey, server_public_key: &PublicKey, statechain_id: &String, enclave_index: i32, single_use: bool, epoch_deadline: Option<i64>)  {
+pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &XOnlyPublicKey, server_public_key: &PublicKey, statechain_id: &String, enclave_index: i32, single_use: bool, epoch_deadline: Option<i64>, user_public_key: Option<&PublicKey>, aggregate_xonly: Option<&[u8; 32]>)  {
 
-    let query = "INSERT INTO statechain_data (token_id, auth_xonly_public_key, server_public_key, statechain_id, enclave_index, single_use, epoch_deadline) VALUES ($1, $2, $3, $4, $5, $6, $7)";
+    let query = "INSERT INTO statechain_data (token_id, auth_xonly_public_key, server_public_key, statechain_id, enclave_index, single_use, epoch_deadline, user_public_key, aggregate_xonly) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+    // [FATAL-B] user_public_key + aggregate_xonly are NULL for old clients; aggregate_xonly is UNIQUE so
+    // the same aggregate can never be registered at two statechain_ids (the decoy binding is rejected).
+    let user_pk_bytes: Option<Vec<u8>> = user_public_key.map(|pk| pk.serialize().to_vec());
+    let aggregate_bytes: Option<Vec<u8>> = aggregate_xonly.map(|a| a.to_vec());
 
     let _ = sqlx::query(query)
         .bind(token_id)
@@ -107,6 +112,8 @@ pub async fn insert_new_deposit(pool: &sqlx::PgPool, token_id: &str, auth_key: &
         .bind(enclave_index)
         .bind(single_use)
         .bind(epoch_deadline)
+        .bind(user_pk_bytes)
+        .bind(aggregate_bytes)
         .execute(pool)
         .await
         .unwrap();

@@ -75,6 +75,13 @@ pub struct StatechainInfoResponsePayload {
     pub num_sigs: u32,
     pub statechain_info: Vec<StatechainInfo>,
     pub x1_pub: Option<String>,
+    /// [FATAL-B] The AUTHORITATIVE aggregate x-only key the server recorded for this statechain_id at
+    /// deposit (owner_share + enclave_share), hex. `None` for coins deposited before the owner-share
+    /// binding (old clients/servers). A receiver checks a coin's on-chain aggregate against this instead
+    /// of trusting a sender-supplied owner key, closing the split decoy-counter path. `serde(default)`
+    /// keeps old clients/servers interoperable.
+    #[serde(default)]
+    pub aggregate_pubkey: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -65,6 +65,13 @@ pub struct DepositMsg1 {
     /// passes the deadline (Stage 4). None = no epoch. `serde(default)` keeps old clients working.
     #[serde(default)]
     pub epoch_deadline: Option<u64>,
+    /// The owner's SIGNING-share pubkey (not the auth key). Sent so the server can compute and record
+    /// the coin's aggregate (owner_share + enclave_share) with a UNIQUE binding per statechain_id —
+    /// the authoritative sid->aggregate record a receiver checks, closing the split decoy-counter
+    /// attack (FATAL-B). Empty string from old clients (`serde(default)`) → the server records no
+    /// aggregate for that coin and the receiver falls back to the legacy path.
+    #[serde(default)]
+    pub user_public_key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,6 +126,7 @@ pub fn create_deposit_msg1_with_options(coin: &Coin, token_id: &str, single_use:
         signed_token_id: signed_token_id.to_string(),
         single_use,
         epoch_deadline,
+        user_public_key: coin.user_pubkey.clone(),
     };
 
     Ok(deposit_msg_1)

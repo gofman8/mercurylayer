@@ -442,8 +442,26 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
 
     let server_pubkey = PublicKey::from_str(&server_pubkey_hex).unwrap();
 
+    // [FATAL-B] Bind statechain_id -> aggregate authoritatively. If the client sent its owner signing
+    // share, compute the coin's aggregate x-only key (owner_share + enclave_share) and record it UNIQUE
+    // per sid, so a receiver can later verify a coin's on-chain aggregate against this server record
+    // instead of a sender-supplied user key — closing the split decoy-counter path. Old clients send an
+    // empty user_public_key => store NULLs and keep the legacy behaviour.
+    let (user_pubkey_opt, aggregate_xonly_opt): (Option<PublicKey>, Option<[u8; 32]>) =
+        if deposit_msg1.user_public_key.trim().is_empty() {
+            (None, None)
+        } else {
+            match PublicKey::from_str(&deposit_msg1.user_public_key) {
+                Ok(user_pk) => match user_pk.combine(&server_pubkey) {
+                    Ok(agg) => (Some(user_pk), Some(agg.x_only_public_key().0.serialize())),
+                    Err(_) => return status::Custom(Status::BadRequest, Json(json!({ "message": "invalid user_public_key (aggregate combine failed)" }))),
+                },
+                Err(_) => return status::Custom(Status::BadRequest, Json(json!({ "message": "invalid user_public_key" }))),
+            }
+        };
+
     let epoch_deadline = deposit_msg1.epoch_deadline.map(|e| e as i64);
-    crate::database::deposit::insert_new_deposit(&statechain_entity.pool, &token_id, &auth_key, &server_pubkey, &statechain_id, enclave_index as i32, deposit_msg1.single_use, epoch_deadline).await;
+    crate::database::deposit::insert_new_deposit(&statechain_entity.pool, &token_id, &auth_key, &server_pubkey, &statechain_id, enclave_index as i32, deposit_msg1.single_use, epoch_deadline, user_pubkey_opt.as_ref(), aggregate_xonly_opt.as_ref()).await;
 
     crate::database::deposit::set_token_spent(&statechain_entity.pool, &token_id).await;
 
