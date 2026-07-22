@@ -48,6 +48,35 @@ namespace db_manager {
 
     bool update_sig_count(const std::string& statechain_id);
 
+    // [KEYSTONE / retry-safety] Idempotent signing-round cache.
+    //
+    // A signing round is TWO calls (sign/first seals a secnonce; sign/second produces the partial sig and
+    // increments sig_count). If the sign/second RESPONSE is lost in flight, sig_count has advanced but the
+    // client holds no tier; a naive retry re-consumes a now-empty secnonce → 400 → the SE count and the
+    // client's disclosed tier set desynchronise PERMANENTLY, which bricks the coin (its receiver census
+    // `num_sigs == v1_backups + tiers + superseded` can never rebalance). This is a BENIGN failure — no
+    // attacker needed — and it is the last thing gating V2-as-default.
+    //
+    // Fix: cache the produced partial sig keyed on (statechain_id, session). A retry that presents the SAME
+    // session returns the cached sig WITHOUT re-signing and WITHOUT re-incrementing. A DIFFERENT session
+    // after the secnonce is consumed still 400s, so the MuSig2 nonce-reuse guard is untouched.
+    //
+    // get_cached_partial_sig: true + out_partial_sig set iff a row exists for (statechain_id, session_key).
+    bool get_cached_partial_sig(
+        const std::string& statechain_id,
+        const std::string& session_key,
+        std::string& out_partial_sig);
+
+    // store_partial_sig_and_increment: in ONE transaction, insert the cache row AND increment sig_count —
+    // both or neither. The increment is bound to the INSERT actually adding a row (ON CONFLICT DO NOTHING
+    // + affected-rows guard), so a session can never be double-counted. Replaces the standalone
+    // update_sig_count on the produce path.
+    bool store_partial_sig_and_increment(
+        const std::string& statechain_id,
+        const std::string& session_key,
+        const std::string& partial_sig,
+        std::string& error_message);
+
     bool signature_count(const std::string& statechain_id, int& sig_count);
 
     bool update_sealed_keypair(

@@ -386,6 +386,104 @@ namespace db_manager {
         }
     }
 
+    // [KEYSTONE] See db_manager.h. Look up a previously-produced partial sig for an EXACT session replay.
+    bool get_cached_partial_sig(
+        const std::string& statechain_id,
+        const std::string& session_key,
+        std::string& out_partial_sig)
+    {
+        auto database_connection_string = getDatabaseConnectionString();
+
+        try
+        {
+            pqxx::connection conn(database_connection_string);
+            if (!conn.is_open()) {
+                return false;
+            }
+
+            pqxx::work txn(conn);
+            // Create-if-absent so a lookup before the first store never throws (older coins predate this).
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS signed_session_cache ("
+                "statechain_id varchar(50) NOT NULL, "
+                "session_key varchar NOT NULL, "
+                "partial_sig varchar NOT NULL, "
+                "PRIMARY KEY (statechain_id, session_key));");
+
+            pqxx::result r = txn.exec_params(
+                "SELECT partial_sig FROM signed_session_cache "
+                "WHERE statechain_id = $1 AND session_key = $2;",
+                statechain_id, session_key);
+            txn.commit();
+
+            if (r.empty() || r[0]["partial_sig"].is_null()) {
+                return false;
+            }
+            out_partial_sig = r[0]["partial_sig"].as<std::string>();
+            return true;
+        }
+        catch (std::exception const &e)
+        {
+            // Fail SAFE, not open: on any cache error report "no cached sig" so the caller falls through
+            // to the normal consume+sign path (which the secnonce single-use still guards). Worst case a
+            // retry that could have been served from cache instead 400s — degrades to pre-cache behaviour,
+            // never a double-sign.
+            return false;
+        }
+    }
+
+    // [KEYSTONE] See db_manager.h. Atomically: insert the cache row AND increment sig_count, both or
+    // neither, and count at most once per session.
+    bool store_partial_sig_and_increment(
+        const std::string& statechain_id,
+        const std::string& session_key,
+        const std::string& partial_sig,
+        std::string& error_message)
+    {
+        auto database_connection_string = getDatabaseConnectionString();
+
+        try
+        {
+            pqxx::connection conn(database_connection_string);
+            if (!conn.is_open()) {
+                error_message = "Failed to connect to the database!";
+                return false;
+            }
+
+            pqxx::work txn(conn);
+
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS signed_session_cache ("
+                "statechain_id varchar(50) NOT NULL, "
+                "session_key varchar NOT NULL, "
+                "partial_sig varchar NOT NULL, "
+                "PRIMARY KEY (statechain_id, session_key));");
+
+            // Insert the produced sig. ON CONFLICT DO NOTHING makes a re-store of the SAME session a
+            // no-op, and the increment below is gated on a row ACTUALLY being inserted, so the SE count
+            // can never be inflated by a duplicate store of one session.
+            pqxx::result ins = txn.exec_params(
+                "INSERT INTO signed_session_cache (statechain_id, session_key, partial_sig) "
+                "VALUES ($1, $2, $3) ON CONFLICT (statechain_id, session_key) DO NOTHING;",
+                statechain_id, session_key, partial_sig);
+
+            if (ins.affected_rows() == 1) {
+                txn.exec_params(
+                    "UPDATE generated_public_key SET sig_count = sig_count + 1 WHERE statechain_id = $1;",
+                    statechain_id);
+            }
+
+            txn.commit();
+            conn.close();
+            return true;
+        }
+        catch (std::exception const &e)
+        {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     bool signature_count(const std::string& statechain_id, int& sig_count) {
 
         auto database_connection_string = getDatabaseConnectionString();

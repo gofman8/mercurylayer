@@ -83,6 +83,7 @@ pub mod sdk52_v2_rgb_carrier;
 pub mod sdk53_v2_latch_guard;
 pub mod sdk54_verify_bundle_adversarial;
 pub mod sdk55_backup_chain_adversarial;
+pub mod sdk56_keystone_retry_idempotent;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -385,6 +386,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("55") {
         sdk55_backup_chain_adversarial::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("56") {
+        sdk56_keystone_retry_idempotent::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

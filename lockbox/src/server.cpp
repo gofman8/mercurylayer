@@ -94,6 +94,21 @@ namespace lockbox {
             memset(serialized_server_pubnonce, 0, sizeof(serialized_server_pubnonce));
 
             std::string error_message;
+
+            // [KEYSTONE / retry-safety] Idempotent signing-round cache — checked BEFORE consuming the
+            // secnonce. The session bytes are the client's exact message commitment, so an identical
+            // sign/second retry (same session) is served the SAME partial sig from cache: no re-sign, no
+            // re-increment of sig_count. This closes the window where a lost sign/second RESPONSE would
+            // otherwise leave sig_count advanced with no tier on the client, desynchronising the receiver
+            // census and bricking the coin. A DIFFERENT session after the secnonce is consumed falls
+            // through to the guard below and 400s, so the nonce-reuse defence is unchanged.
+            std::string session_key = utils::key_to_string(serialized_session.data(), serialized_session.size());
+            std::string cached_partial_sig;
+            if (db_manager::get_cached_partial_sig(statechain_id, session_key, cached_partial_sig)) {
+                crow::json::wvalue cached_result({{"partial_sig", cached_partial_sig}});
+                return crow::response{cached_result};
+            }
+
             // Atomically load AND consume the sealed secnonce (row-locked, nulled in the same txn).
             // This enforces one-signature-per-secnonce AT THE ENCLAVE: a second partial-signature
             // request for the same statechain_id — whether racing this one or arriving after — finds
@@ -132,12 +147,22 @@ namespace lockbox {
                 serialized_session.data(), serialized_session.size(),
                 serialized_server_pubnonce);
 
-            bool sig_count_updated = db_manager::update_sig_count(statechain_id);
-            if (!sig_count_updated) {
-                return crow::response(500, "Failed to update signature count!");
-            }
-
             auto partial_sig_hex = utils::key_to_string(response.partial_sig_data, sizeof(response.partial_sig_data));
+
+            // [KEYSTONE] Cache the produced sig AND increment sig_count ATOMICALLY (both or neither),
+            // replacing the standalone update_sig_count. Ordering matters for retry-safety:
+            //   - crash AFTER this commit, response lost  ⟹ retry hits the cache above, gets this exact
+            //     sig; sig_count counted exactly once. SAFE.
+            //   - crash BETWEEN the secnonce consume and this commit ⟹ no cache row AND no increment, so
+            //     the client sees a failure, restarts sign/first (mints a fresh secnonce, overwriting the
+            //     consumed one) and re-signs; the count advances once for the one tier it ends up with.
+            //     No phantom increment ⟹ no desync. SAFE.
+            std::string store_error;
+            bool stored = db_manager::store_partial_sig_and_increment(
+                statechain_id, session_key, partial_sig_hex, store_error);
+            if (!stored) {
+                return crow::response(500, "Failed to persist signature count: " + store_error);
+            }
 
             crow::json::wvalue result({{"partial_sig", partial_sig_hex}});
             return crow::response{result};
