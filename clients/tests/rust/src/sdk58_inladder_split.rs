@@ -117,7 +117,28 @@ pub async fn execute() -> Result<()> {
     ok(vcb(pa, false, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "H (parent NOT terminal — a rival trigger over F could still be co-signed)")?;
     ok(vcb(pa, parent_terminal, parent_num_sigs, ca, false, child_num_sigs, &receiver), "I (child NOT terminal — a rival state over SP.out[j] could still be co-signed)")?;
 
-    println!("SDK58 - ✓ PASS: split child ACCEPTED; NULL/decoy aggregates, hidden parent/child states, Model-A violation, AND non-terminal parent/child all REJECTED. B1 fix verified with no SGX.");
+    // ---- THE PAYOFF: exit the child through the FULL pre-co-signed chain; the receiver is paid. -------
+    // F -> T -> X_m -> SP -> ext_child -> state_child(receiver). Every tx is already co-signed; the
+    // recipient exits unilaterally (no keyupdate needed — the child is terminal, exit uses signed txs).
+    use crate::sdk40_tesr_consensus::{broadcast, mine, tx_exists, wait_for_address};
+    let mut chain: Vec<(String, Option<u16>)> =
+        cb.parent.exit_tiers().iter().map(|t| (t.signed_tx.clone(), t.csv)).collect();
+    chain.push((cb.child_extension.signed_tx.clone(), cb.child_extension.csv));
+    chain.push((cb.child_state.signed_tx.clone(), cb.child_state.csv));
+    let _ = broadcast(&cc, &chain[0].0)?; // trigger — no timelock, F is on-chain
+    for (signed, csv) in &chain[1..] {
+        let _ = mine(csv.unwrap() as u32);
+        let _ = broadcast(&cc, signed)?;
+    }
+    let _ = mine(1)?;
+    assert!(tx_exists(&cc, &cb.child_state.txid), "child final state confirms on-chain");
+    assert!(
+        wait_for_address(&cc, &receiver, cb.child_state.out_value as u32).await.is_ok(),
+        "the split child's value lands at the RECEIVER's key"
+    );
+    println!("SDK58 - child EXITED: {} sat landed at the receiver via the pre-signed chain.", cb.child_state.out_value);
+
+    println!("SDK58 - ✓ PASS: split child ACCEPTED; 9 attacks REJECTED (aggregates/hidden-state/Model-A/terminality); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
     Ok(())
 }
 
