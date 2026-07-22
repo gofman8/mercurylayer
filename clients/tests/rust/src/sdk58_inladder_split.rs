@@ -72,13 +72,19 @@ pub async fn execute() -> Result<()> {
     let child_agg = aggregate(&cc, &child_sid).await?;
     println!("SDK58 - parent num_sigs={parent_num_sigs} (baseline {parent_baseline}); child num_sigs={child_num_sigs} (baseline {child_baseline})");
 
+    // Terminality — the DURABLE guarantee the receiver must query (fail-closed), not just the census.
+    let (_, _, parent_terminal) = mercuryrustlib::lightning_latch::get_spend_budget(&cc, &parent_sid).await?;
+    let (_, _, child_terminal) = mercuryrustlib::lightning_latch::get_spend_budget(&cc, &child_sid).await?;
+    assert!(parent_terminal, "parent must be terminal after the split (budget=1, consumed by SP)");
+    assert!(child_terminal, "child must be terminal after F1 (set_spend_budget child, 0)");
+
     mercuryrustlib::tesr::verify_child_bundle(
         &cb, &f_spk_hex,
-        parent_num_sigs, parent_baseline, parent_agg.as_deref(),
-        child_num_sigs, child_baseline, child_agg.as_deref(),
+        parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
+        child_num_sigs, child_baseline, child_agg.as_deref(), child_terminal,
         &receiver,
     ).map_err(|e| anyhow!("verify_child_bundle REJECTED a valid split child: {e}"))?;
-    println!("SDK58 - control: valid split child ACCEPTED.");
+    println!("SDK58 - control: valid split child ACCEPTED (parent+child terminal).");
 
     // ---- ADVERSARIAL: every tampering of the authoritative inputs must REJECT. ---------------------
     let ok = |r: Result<()>, attack: &str| -> Result<()> {
@@ -95,23 +101,23 @@ pub async fn execute() -> Result<()> {
         let x = XOnlyPublicKey::from_slice(&hex::decode("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9").unwrap()).unwrap();
         Address::p2tr(&Secp256k1::new(), x, None, Network::Regtest).to_string()
     };
+    // Convenience: verify_child_bundle with all-valid args (override individual fields per attack).
+    let vcb = |p_agg: Option<&str>, p_term: bool, p_ns: u32, c_agg: Option<&str>, c_term: bool, c_ns: u32, recv: &str| {
+        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, c_term, recv)
+    };
+    let (pa, ca) = (parent_agg.as_deref(), child_agg.as_deref());
 
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, None, child_num_sigs, child_baseline, child_agg.as_deref(), &receiver),
-       "A (parent aggregate NULL — fail-closed)")?;
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, None, &receiver),
-       "B (child aggregate NULL — fail-closed)")?;
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, Some(decoy_xonly), child_num_sigs, child_baseline, child_agg.as_deref(), &receiver),
-       "C (decoy parent aggregate != A_parent)")?;
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, Some(decoy_xonly), &receiver),
-       "D (decoy child aggregate != SP.out[j])")?;
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs + 1, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, child_agg.as_deref(), &receiver),
-       "E (hidden parent state: parent num_sigs one higher)")?;
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs + 1, child_baseline, child_agg.as_deref(), &receiver),
-       "F (hidden child state: child num_sigs one higher)")?;
-    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, child_agg.as_deref(), &other_recv),
-       "G (Model A violated: child state pays not-the-receiver)")?;
+    ok(vcb(None, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "A (parent aggregate NULL — fail-closed)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, None, child_terminal, child_num_sigs, &receiver), "B (child aggregate NULL — fail-closed)")?;
+    ok(vcb(Some(decoy_xonly), parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "C (decoy parent aggregate != A_parent)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, Some(decoy_xonly), child_terminal, child_num_sigs, &receiver), "D (decoy child aggregate != SP.out[j])")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs + 1, ca, child_terminal, child_num_sigs, &receiver), "E (hidden parent state: parent num_sigs one higher)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs + 1, &receiver), "F (hidden child state: child num_sigs one higher)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &other_recv), "G (Model A violated: child state pays not-the-receiver)")?;
+    ok(vcb(pa, false, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "H (parent NOT terminal — a rival trigger over F could still be co-signed)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, false, child_num_sigs, &receiver), "I (child NOT terminal — a rival state over SP.out[j] could still be co-signed)")?;
 
-    println!("SDK58 - ✓ PASS: in-ladder split child ACCEPTED; and NULL/decoy aggregates, hidden parent/child states, and Model-A violation all REJECTED. B1 fix verified with no SGX.");
+    println!("SDK58 - ✓ PASS: split child ACCEPTED; NULL/decoy aggregates, hidden parent/child states, Model-A violation, AND non-terminal parent/child all REJECTED. B1 fix verified with no SGX.");
     Ok(())
 }
 

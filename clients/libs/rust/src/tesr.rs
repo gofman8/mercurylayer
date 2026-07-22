@@ -325,6 +325,13 @@ pub async fn in_ladder_split(
             .statechain_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
+        // [F1] TERMINALIZE the child (budget = current finalized + 0), so the SE refuses ANY further
+        // child co-sign. Without this the child is re-signable and the sender could co-sign a hidden
+        // rival state over SP.out[j] paying themselves, then race the honest child on the parent's exit
+        // — theft. Mirrors the parent's set_spend_budget(parent_sid, 1) above. The receiver additionally
+        // VERIFIES this via get_spend_budget (see verify_child_bundle's child_terminal), so a sender that
+        // skips this step is caught, not trusted.
+        crate::lightning_latch::set_spend_budget(cc, wallet_name, &child_sid, 0).await?;
         bundles.push(ChildTesrBundle {
             parent: parent_seg.clone(),
             parent_statechain_id: parent_sid.clone(),
@@ -944,11 +951,29 @@ pub fn verify_child_bundle(
     parent_num_sigs: u32,
     parent_v1_backups: u32,
     parent_aggregate_pubkey: Option<&str>,
+    parent_terminal: bool,
     child_num_sigs: u32,
     child_v1_backups: u32,
     child_aggregate_pubkey: Option<&str>,
+    child_terminal: bool,
     receiver_backup_address: &str,
 ) -> Result<()> {
+    // [F2] TERMINALITY IS THE DURABLE GUARANTEE — the census (num_sigs) is only a snapshot (TOCTOU): a
+    // sender who skips set_spend_budget passes the count, then gets the SE to co-sign a rival AFTER this
+    // check. The receiver MUST query /statechain/spend_budget for BOTH sids (fail-closed) and require
+    // terminal==true: once terminal, the SE refuses every further co-sign, so no rival can appear. A
+    // non-terminal parent could still be given a rival trigger T' over the live on-chain F; a
+    // non-terminal child a rival state over SP.out[j].
+    if !parent_terminal {
+        return Err(anyhow::anyhow!(
+            "parent sid is NOT terminal — a rival state over F/X_m.out[0] could still be co-signed (fail-closed)"
+        ));
+    }
+    if !child_terminal {
+        return Err(anyhow::anyhow!(
+            "child sid is NOT terminal — a rival state over SP.out[j] could still be co-signed (fail-closed)"
+        ));
+    }
     use electrum_client::bitcoin::{
         consensus::deserialize,
         secp256k1::{Secp256k1, XOnlyPublicKey},
@@ -1039,6 +1064,17 @@ pub fn verify_child_bundle(
     }
     verify_tier_cosigned(&ext_tx, sp_out.value, &child_agg_spk)
         .map_err(|e| anyhow::anyhow!("child extension not co-signed by A_child: {e}"))?;
+    // [F4] child extension CSV: a valid BIP-68 block relative-timelock within the extension schedule.
+    {
+        let seq = ext_tx.input[0].sequence.0;
+        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+            return Err(anyhow::anyhow!("child extension: not a BIP-68 block relative-timelock"));
+        }
+        let (csv, p) = (seq as u16, cb.parent.params);
+        if csv < p.e_floor || csv > p.e0 {
+            return Err(anyhow::anyhow!("child extension CSV {csv} outside [{},{}]", p.e_floor, p.e0));
+        }
+    }
 
     // state_child spends ext_child.out[0], co-signed by A_child.
     let ext_out0 = ext_tx.output.first().ok_or_else(|| anyhow::anyhow!("child ext has no out0"))?;
@@ -1052,6 +1088,17 @@ pub fn verify_child_bundle(
     }
     verify_tier_cosigned(&st_tx, ext_out0.value, &child_agg_spk)
         .map_err(|e| anyhow::anyhow!("child state not co-signed by A_child: {e}"))?;
+    // [F4] child state CSV: a valid BIP-68 block relative-timelock within the state schedule.
+    {
+        let seq = st_tx.input[0].sequence.0;
+        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+            return Err(anyhow::anyhow!("child state: not a BIP-68 block relative-timelock"));
+        }
+        let (csv, p) = (seq as u16, cb.parent.params);
+        if csv < p.d_floor || csv > p.d0 {
+            return Err(anyhow::anyhow!("child state CSV {csv} outside [{},{}]", p.d_floor, p.d0));
+        }
+    }
 
     // MODEL A: the final child state must pay the RECEIVER's own key.
     let recv_spk = Address::from_str(receiver_backup_address)
