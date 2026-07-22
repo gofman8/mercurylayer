@@ -33,13 +33,31 @@ retract an issued signature.** Strictly WORSE than V1, where the parent's backup
 branch and the branch always matures first (INV-4).
 
 ### Status
-- **Default REVERTED to V1** (V2 opt-in via env) — exposure closed.
-- **HF-1 landed**: `split_coin` refuses a laddered coin (hard error beats silently voiding the receiver).
-- **Follow-ups still open**: HF-2 (teach the planner `splittable`, so HF-1 doesn't turn into a hard
-  transfer() failure when a safe coin exists); HF-3 (same gate in `mint_piece`, `transfer.rs:365-380`);
-  HF-4 (`unilateral_exit` explicit-id branch must filter on `CoinStatus` — a WITHDRAWN parent must not be
-  exitable; stops the SDK being the weapon and kills the accidental-loss variant); HF-5 (delete the false
-  claim at `transfer.rs:455-457`).
+- **Default STILL V1** (V2 opt-in via `UTEXO_PROTOCOL_DEFAULT=2`) — exposure closed.
+- **HF-1 landed**: `split_coin` refuses a laddered coin (the direct API); `transfer()` no longer hits it
+  — a laddered non-exact payment now routes to the in-ladder split (below).
+- **✅ IN-LADDER SPLIT LANDED + PROVEN (commit 019637b, 6fd77cf)** — the real B1 fix (see next section).
+  `transfer()` on a laddered coin runs `in_ladder_pay`: `SP` is a STATE tier spending `X_m.out[0]`
+  (a descendant of `T`, never a rival for `F`), the PIECE child pays the recipient (Model A) and is
+  conveyed as a `ChildTesrBundle` to their mailbox, the CHANGE child pays self. The receiver's `claim()`
+  adopts it via `verify_child_bundle` — the 8-check Stage-2 predicate that binds `A_parent` to the
+  on-chain `F`, checks the parent+child **exact-equality censuses**, and requires BOTH sids **terminal**
+  (queried from `/statechain/spend_budget`, fail-closed) so no rival state can still be co-signed. Proven:
+  **sdk58** (control ACCEPT + 9 adversarial REJECTs incl. non-terminality) and **sdk59** (Alice pays Bob
+  a non-exact amount over the SDK, Bob adopts + unilaterally exits, funds land at Bob's key).
+- **HF-2 mooted**: the planner no longer needs a `splittable` hint — `transfer()` splits laddered coins
+  in-ladder instead of hard-failing.
+- **Follow-ups still open before flipping the default**:
+  - **Received-child first-classness**: a received in-ladder split child is an EXIT-ONLY claim (funding =
+    un-broadcast `SP.out[j]`; the receiver holds no SE co-signing key). `withdraw()` now routes it to a
+    unilateral exit (materialize to the receiver's own key) instead of crashing, but **co-op withdraw /
+    off-chain re-transfer of a received child to a third party** still needs the SE pending-transfer lock
+    (the deferred "V2 re-transfer"). Until then a received non-exact payment is force-close-to-self only.
+  - **Census baseline generalization**: `verify_conveyed_child` assumes a **fresh-deposit parent**
+    (`PARENT_V2_BASELINE = 1` V1 backup). A received/renewed parent has a different `num_sigs` history, so
+    splitting it currently fails the census (fails CLOSED — safe, but functionally blocked).
+  - HF-3 (same gate in `mint_piece`), HF-4 (landed: `unilateral_exit` filters `CoinStatus`), HF-5 (delete
+    the false claim at `transfer.rs`).
 
 ### THE FIX — in-ladder split (V2-DESIGN §5.4), not a gate
 The gate is a feature amputation: `presign_receiver_state` runs on EVERY V2 transfer, so essentially every
