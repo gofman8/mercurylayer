@@ -65,6 +65,14 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::transaction::sign_first(&cc, &coin_nonce.sign_first_request_payload).await?;
     coin.server_public_nonce = Some(server_public_nonce);
 
+    // [NULL-challenge / 42a39fe] We are now mid-session: sign/first has run, sign/second has not, so this
+    // coin has a dangling row with a NULL challenge. Reading /info/statechain here MUST NOT 500 — before
+    // the server fix it panicked on `row.get::<String>(challenge)`, which would DoS every receiver during
+    // exactly this (retry) window. Proven live here.
+    let dangling = num_sigs(&cc, &sid).await
+        .map_err(|e| anyhow!("NULL-challenge regression: /info/statechain failed during a dangling sign/first: {e}"))?;
+    println!("SDK56 - /info/statechain OK during a dangling sign/first (num_sigs={dangling}) — NULL-challenge fix live");
+
     let partial = mercurylib::tesr::cosign_tier_request(&coin, t.tx_hex.clone(), f_value, NETWORK.to_string())?;
 
     // First sign/second — the real one. Count advances by exactly 1.
