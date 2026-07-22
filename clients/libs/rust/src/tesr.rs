@@ -237,6 +237,109 @@ pub async fn establish_child(
     })
 }
 
+/// [in-ladder split] The production sender for an in-ladder split (B1 fix, V2-DESIGN §5.4). Builds
+/// `SP` — a STATE tier spending `X_m.out[0]` (a DESCENDANT of the trigger, NOT a rival for `F`), paying
+/// each child statechain coin's aggregate — terminalizes the parent (budget 1, consumed by `SP`),
+/// co-signs `SP` under `A_parent`, discloses the old owner state `S_0` as superseded (out-raced by `SP`
+/// one rung lower), and establishes each child's headless ladder off `SP.out[j]` paying its recipient.
+/// Returns one [`ChildTesrBundle`] per child for conveyance; the receiver checks each with
+/// [`verify_child_bundle`]. The child coins must already be SE-registered (their aggregate is what `SP`
+/// pays); `children` is `(child_coin, recipient_owner_exit_address, value_sats)` and is mutated as each
+/// child ladder is co-signed. Value is conserved: `Σ value == tier_out_total(X_m.out[0], N)`.
+pub async fn in_ladder_split(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    parent_coin: &mut Coin,
+    bundle: &TesrBundle,
+    children: &mut [(Coin, String, u64)],
+) -> Result<Vec<ChildTesrBundle>> {
+    let p = bundle.params;
+    let x_m = bundle.current().extension.clone();
+    let s0_csv = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+    // SP must OUT-RACE S_0 over X_m.out[0]: one rung lower, floored (consumes a state rung).
+    let sp_csv = s0_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| anyhow::anyhow!("state CSV at the floor — renew/rollover before splitting"))?;
+
+    let n = children.len();
+    if n == 0 {
+        return Err(anyhow::anyhow!("in-ladder split needs at least one child"));
+    }
+    // Value conservation — no mint, no burn (build_split_state re-checks, but fail early with context).
+    let total = mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
+        .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?;
+    let sum: u64 = children.iter().map(|(_, _, v)| *v).sum();
+    if sum != total {
+        return Err(anyhow::anyhow!(
+            "child values sum to {sum} but must equal {total} (= X_m.out[0] − committed fee)"
+        ));
+    }
+
+    // SP pays each child's aggregate address, in order (SP.out[j] == children[j]).
+    let payees: Vec<(String, u64)> = children
+        .iter()
+        .map(|(c, _, v)| {
+            c.aggregated_address
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))
+                .map(|a| (a, *v))
+        })
+        .collect::<Result<_>>()?;
+    let sp = mercurylib::tesr::build_split_state(
+        &x_m.txid, x_m.out_value, &payees, &bundle.network, sp_csv, bundle.fee_rate,
+    )?;
+
+    // Terminalize the parent (SP consumes the last budget slot) and co-sign SP under A_parent.
+    let parent_sid = parent_coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("parent coin has no statechain_id"))?;
+    crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
+    let sp_signed = cosign_tier(cc, parent_coin, sp.tx_hex.clone(), x_m.out_value, &bundle.network).await?;
+
+    // Parent segment shared by every child bundle: SP is the current (terminal) state; S_0 superseded.
+    let mut parent_seg = bundle.clone();
+    let last = parent_seg.levels.len() - 1;
+    parent_seg.superseded_states.push(parent_seg.levels[last].state.clone());
+    parent_seg.levels[last].state = TesrTier {
+        txid: sp.txid.clone(),
+        signed_tx: sp_signed,
+        out_value: total,
+        csv: Some(sp_csv),
+    };
+
+    // Each child: headless ladder off SP.out[j], paying its recipient (Model A).
+    let mut bundles = Vec::with_capacity(n);
+    for (j, (child_coin, recipient, value)) in children.iter_mut().enumerate() {
+        let ladder = establish_child(
+            cc, child_coin, &sp.txid, j as u32, *value, recipient,
+            p.ext_csv(0), p.state_csv(0), bundle.fee_rate, &bundle.network,
+        )
+        .await?;
+        let child_sid = child_coin
+            .statechain_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
+        bundles.push(ChildTesrBundle {
+            parent: parent_seg.clone(),
+            parent_statechain_id: parent_sid.clone(),
+            sp_vout: j as u32,
+            child_statechain_id: child_sid,
+            child_owner_exit_address: recipient.clone(),
+            child_extension: ladder.extension,
+            child_state: ladder.state,
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+        });
+    }
+    Ok(bundles)
+}
+
 /// Off-chain renewal at the schedule cadence: the new extension takes CSV `E0 − (m+1)·δE` and the
 /// fresh state `D0`, both from the bundle's [`TesrParams`]. Returns `true` if a rollover is due
 /// afterwards (`m` reached `m_max`), so the caller rolls over before the extension floor.

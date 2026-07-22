@@ -44,56 +44,22 @@ pub async fn execute() -> Result<()> {
     let owner_exit = crate::bitcoin_core::getnewaddress()?;
     let bundle = mercuryrustlib::tesr::establish_auto(&cc, &mut parent, &owner_exit, NETWORK).await?;
 
-    // X_m (deepest extension) hosts the split state SP on its out[0]. S_0 is the current owner state.
-    let x_m = bundle.current().extension.clone();
-    let p = bundle.params;
-    let s0_csv = bundle.current().state.csv.ok_or(anyhow!("S_0 has no csv"))?;
-    // SP must OUT-RACE S_0 over X_m.out[0]: one rung lower.
-    let sp_csv = s0_csv.checked_sub(p.delta).filter(|c| *c >= p.d_floor).ok_or(anyhow!("state at floor"))?;
-
     // --- Create the child statechain coin FIRST so SP can pay its aggregate A_child. ----------------
+    let x_m = bundle.current().extension.clone();
     let child_value = mercurylib::tesr::tier_out_total(x_m.out_value, 1, FEE_RATE).ok_or(anyhow!("fee too high"))?;
     let child_token = prepaid_token(&cc).await?;
     let child_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(&cc, wallet, &child_token, u32::try_from(child_value)?).await?;
-    // The child coin now exists (SE handshake done): statechain_id + aggregate == child_addr, no on-chain utxo.
     let child = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet).await?
         .coins.iter().find(|c| c.aggregated_address.as_deref() == Some(&child_addr)).cloned()
         .ok_or(anyhow!("child coin not found"))?;
     let child_sid = child.statechain_id.clone().ok_or(anyhow!("no child sid"))?;
     let child_baseline = num_sigs(&cc, &child_sid).await?;
 
-    // --- Build SP (spends X_m.out[0], pays the child), terminalize the parent, co-sign SP. ----------
-    let sp = mercurylib::tesr::build_split_state(&x_m.txid, x_m.out_value, &[(child_addr.clone(), child_value)], NETWORK, sp_csv, FEE_RATE)?;
-    mercuryrustlib::lightning_latch::set_spend_budget(&cc, wallet, &parent_sid, 1).await?;
-    let sp_signed = mercuryrustlib::tesr::cosign_tier(&cc, &mut parent, sp.tx_hex.clone(), x_m.out_value, NETWORK).await?;
-
-    // --- Establish the child's headless ladder off SP.out[0], paying the receiver (Model A). --------
+    // --- Split IN-LADDER via the PRODUCTION sender (promoted from this test's earlier inline logic). -
     let receiver = crate::sdk58_inladder_split::taproot_addr();
-    let mut child_coin = child.clone();
-    let child_ladder = mercuryrustlib::tesr::establish_child(
-        &cc, &mut child_coin, &sp.txid, 0, child_value, &receiver,
-        p.ext_csv(0), p.state_csv(0), FEE_RATE, NETWORK,
-    ).await?;
-
-    // --- Assemble the parent segment with SP as the current (terminal) state, S_0 superseded. -------
-    let mut parent_seg = bundle.clone();
-    let last = parent_seg.levels.len() - 1;
-    parent_seg.superseded_states.push(parent_seg.levels[last].state.clone());
-    parent_seg.levels[last].state = mercuryrustlib::tesr::TesrTier {
-        txid: sp.txid.clone(), signed_tx: sp_signed, out_value: child_value, csv: Some(sp_csv),
-    };
-
-    let cb = mercuryrustlib::tesr::ChildTesrBundle {
-        parent: parent_seg,
-        parent_statechain_id: parent_sid.clone(),
-        sp_vout: 0,
-        child_statechain_id: child_sid.clone(),
-        child_owner_exit_address: receiver.clone(),
-        child_extension: child_ladder.extension,
-        child_state: child_ladder.state,
-        child_superseded_states: vec![],
-        child_superseded_extensions: vec![],
-    };
+    let mut children = vec![(child.clone(), receiver.clone(), child_value)];
+    let bundles = mercuryrustlib::tesr::in_ladder_split(&cc, wallet, &mut parent, &bundle, &mut children).await?;
+    let cb = bundles.into_iter().next().ok_or(anyhow!("in_ladder_split returned no child bundle"))?;
 
     // --- Fetch authoritative values a real child receiver would fetch. ------------------------------
     let f_txid = electrum_client::bitcoin::Txid::from_str(&bundle.f_txid).map_err(|_| anyhow!("bad f_txid"))?;
