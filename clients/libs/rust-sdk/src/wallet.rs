@@ -1071,6 +1071,22 @@ impl UtexoWallet {
                 continue;
             }
 
+            // [in-ladder split] A received/change split CHILD claim (funded by an un-broadcast SP.out[j]):
+            // exit its full pre-co-signed chain (T -> X_m -> SP -> ext_child -> state_child) via
+            // exit_child_pass — keyless, every tier already signed, the final state pays this wallet's key.
+            if let Some(cb) =
+                mercuryrustlib::tesr::load_child(&self.inner.cc, &self.inner.config.wallet_name, &id).await?
+            {
+                let (_broadcast, done) = mercuryrustlib::tesr::exit_child_pass(&self.inner.cc, &cb);
+                let wait_blocks = if done {
+                    0
+                } else {
+                    mercuryrustlib::tesr::next_child_exit_tier(&self.inner.cc, &cb).unwrap_or(0) as u32
+                };
+                statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
+                continue;
+            }
+
             // Materialize the coin's funding first (no locktime on branch txs).
             let has_branch = self.broadcast_branch_if_any(&id).await?;
             // Audit [20]: distinguish a genuinely FLAT coin (on-chain funding, legitimately no branch)

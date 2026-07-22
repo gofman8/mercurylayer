@@ -86,6 +86,7 @@ pub mod sdk55_backup_chain_adversarial;
 pub mod sdk56_keystone_retry_idempotent;
 pub mod sdk57_owner_share_binding;
 pub mod sdk58_inladder_split;
+pub mod sdk59_inladder_pay;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -400,6 +401,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("58") {
         sdk58_inladder_split::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("59") {
+        sdk59_inladder_pay::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

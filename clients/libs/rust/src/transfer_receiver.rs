@@ -119,7 +119,7 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<
 
                 let mut coin = coin.unwrap();
 
-                let is_msg_valid = validate_encrypted_message(client_config, &coin, enc_message, &wallet.network, &info_config, blockheight).await;
+                let is_msg_valid = validate_encrypted_message(client_config, &coin, enc_message, &wallet.network, &wallet.name, &info_config, blockheight).await;
 
                 if is_msg_valid.is_err() {
                     println!("Validation error: {}", is_msg_valid.err().unwrap().to_string());
@@ -169,7 +169,7 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<
 
                 let mut new_coin = new_coin.unwrap();
 
-                let is_msg_valid = validate_encrypted_message(client_config, &new_coin, enc_message, &wallet.network, &info_config, blockheight).await;
+                let is_msg_valid = validate_encrypted_message(client_config, &new_coin, enc_message, &wallet.network, &wallet.name, &info_config, blockheight).await;
 
                 if is_msg_valid.is_err() {
                     println!("Validation error: {}", is_msg_valid.err().unwrap().to_string());
@@ -518,12 +518,31 @@ async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String
     Ok(())
 }
 
-async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, enc_message: &str, network: &str, info_config: &InfoConfig, blockheight: u32) -> Result<()> {
+async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, enc_message: &str, network: &str, wallet_name: &str, info_config: &InfoConfig, blockheight: u32) -> Result<()> {
 
     let client_auth_key = coin.auth_privkey.clone();
     let new_user_pubkey = coin.user_pubkey.clone();
 
     let transfer_msg = mercurylib::transfer::receiver::decrypt_transfer_msg(enc_message, &client_auth_key)?;
+
+    // [in-ladder split] A split-child payment carries NO key handover and NO backup ladder — just the
+    // child's exit bundle. Verify it against authoritative on-chain + SE values (verify_child_bundle:
+    // parent F on-chain, parent+child terminal, child pays THIS coin's key) and skip the V1/V2
+    // backup-chain checks below (there are none to validate).
+    if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
+        let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
+            .map_err(|e| anyhow::anyhow!("malformed child TES-R bundle: {e}"))?;
+        // Idempotency (mirrors the flat-transfer pattern where a re-received coin fails validation and
+        // is skipped): if this child is already adopted, FAIL validation so the receive loop skips it
+        // rather than booking a duplicate. get_msg_addr is non-destructive, so the message is re-served.
+        if crate::tesr::load_child(client_config, wallet_name, &cb.child_statechain_id).await?.is_some() {
+            return Err(anyhow::anyhow!("split child {} already adopted", cb.child_statechain_id));
+        }
+        let my_backup = mercurylib::transaction::get_user_backup_address(coin, network.to_string())
+            .map_err(|_| anyhow::anyhow!("cannot derive the receiver's backup address"))?;
+        crate::tesr::verify_conveyed_child(client_config, &my_backup, &cb).await?;
+        return Ok(());
+    }
 
     let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions);
 
@@ -685,6 +704,64 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
     let client_auth_key = coin.auth_privkey.clone();
 
     let transfer_msg = mercurylib::transfer::receiver::decrypt_transfer_msg(enc_message, &client_auth_key)?;
+
+    // [in-ladder split] Adopt a conveyed split child (already verified in validate_encrypted_message):
+    // persist its exit bundle and book THIS placeholder coin as the child's exitable claim. No SE
+    // handover — the child is un-broadcast (funded by SP.out[j]) and every tier is pre-co-signed to pay
+    // this coin's own key, so the receiver exits it keylessly via `exit_child_pass`.
+    if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
+        let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
+            .map_err(|e| anyhow::anyhow!("malformed child TES-R bundle: {e}"))?;
+        // Idempotency: a prior claim already adopted this child (get_msg_addr is non-destructive, so
+        // the message is re-served on every claim). Do nothing — booking again would duplicate the coin.
+        if crate::tesr::load_child(client_config, wallet_name, &cb.child_statechain_id).await?.is_some() {
+            return Ok(transfer_receive_result);
+        }
+        crate::tesr::persist_child(client_config, wallet_name, &cb).await?;
+
+        // SP.out[j] is the (un-broadcast) funding outpoint of the child claim.
+        use bitcoin::consensus::deserialize;
+        let sp_tx: bitcoin::Transaction =
+            deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+        let sp_txid = sp_tx.txid().to_string();
+        let sp_out = sp_tx
+            .output
+            .get(cb.sp_vout as usize)
+            .ok_or_else(|| anyhow::anyhow!("SP has no output {}", cb.sp_vout))?;
+        // The coin's amount is its UTXO value = SP.out[j] (the child's funding); the child's exit
+        // leaves child_state.out_value after its own tier fees, mirroring how any coin's on-chain
+        // exit costs fees on top of its face value.
+        let child_value = sp_out.value as u32;
+        // A_child address (SP.out[j]) — un-broadcast, so no on-chain duplicate can exist there; set it
+        // so the coin has a valid aggregated_address (check_for_duplicated dereferences it).
+        let net = match network.to_ascii_lowercase().as_str() {
+            "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
+            "testnet" => bitcoin::Network::Testnet,
+            "signet" => bitcoin::Network::Signet,
+            _ => bitcoin::Network::Regtest,
+        };
+        let child_agg_address = bitcoin::Address::from_script(&sp_out.script_pubkey, net)
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+
+        coin.statechain_id = Some(cb.child_statechain_id.clone());
+        coin.aggregated_address = Some(child_agg_address);
+        coin.utxo_txid = Some(sp_txid.clone());
+        coin.utxo_vout = Some(cb.sp_vout);
+        coin.amount = Some(child_value);
+        coin.status = CoinStatus::CONFIRMED;
+
+        let date = Utc::now().to_rfc3339();
+        activities.push(Activity {
+            utxo: sp_txid,
+            amount: child_value,
+            action: "Receive".to_string(),
+            date,
+        });
+
+        transfer_receive_result.statechain_id = Some(cb.child_statechain_id.clone());
+        return Ok(transfer_receive_result);
+    }
 
     let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions);
 

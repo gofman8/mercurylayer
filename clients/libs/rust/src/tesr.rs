@@ -386,6 +386,227 @@ pub async fn load(cc: &ClientConfig, wallet_name: &str, statechain_id: &str) -> 
     Ok(None)
 }
 
+/// V1-backup baseline of a V2-NATIVE **on-chain PARENT** coin. `sig_count` starts at 0
+/// (`generated_public_key DEFAULT 0`); the coin's on-chain deposit confirmation co-signs exactly ONE V1
+/// backup tx (`coin_status::check_deposit` → `create_tx1` for a non-single-use coin) before the ladder
+/// is established. So a V2-native parent has `num_sigs == 1 + <established tiers>`. A split-child
+/// receiver — who cannot observe the parent's pre-establish history — relies on this constant to run
+/// `verify_child_bundle`'s exact-equality census independently of the sender.
+pub const PARENT_V2_BASELINE: u32 = 1;
+
+/// V1-backup baseline of a split **CHILD** slot: it is an SE-registered key that is NEVER funded
+/// on-chain (its funding is the un-broadcast `SP.out[j]`), so `check_deposit`/`create_tx1` never runs
+/// for it and `num_sigs` counts ONLY the two child tiers co-signed at split time. Baseline `0`.
+pub const CHILD_V2_BASELINE: u32 = 0;
+
+/// Persist a split child bundle under `ctesr-<child_statechain_id>` (replaces any prior).
+pub async fn persist_child(cc: &ClientConfig, wallet_name: &str, cb: &ChildTesrBundle) -> Result<()> {
+    let json = serde_json::to_string(cb)?;
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("ctesr-{}", cb.child_statechain_id),
+        &json,
+    )
+    .await
+}
+
+/// Load a coin's persisted split child bundle from the wallet DB, if any.
+pub async fn load_child(cc: &ClientConfig, wallet_name: &str, child_statechain_id: &str) -> Result<Option<ChildTesrBundle>> {
+    let key = format!("ctesr-{child_statechain_id}");
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if k == key {
+            return Ok(Some(serde_json::from_str(&json)?));
+        }
+    }
+    Ok(None)
+}
+
+/// The full unilateral-exit chain of a split child, in broadcast order:
+/// `T -> X_m -> SP` (parent segment) then `ext_child -> state_child`. Each entry is
+/// `(signed_tx_hex, relative_csv)` — the trigger has no CSV.
+pub fn child_exit_chain(cb: &ChildTesrBundle) -> Vec<(String, Option<u16>)> {
+    let mut chain: Vec<(String, Option<u16>)> =
+        cb.parent.exit_tiers().iter().map(|t| (t.signed_tx.clone(), t.csv)).collect();
+    chain.push((cb.child_extension.signed_tx.clone(), cb.child_extension.csv));
+    chain.push((cb.child_state.signed_tx.clone(), cb.child_state.csv));
+    chain
+}
+
+/// **Owner-initiated unilateral exit of a split CHILD coin.** Broadcasts the child's full pre-co-signed
+/// chain (`T -> X_m -> SP -> ext_child -> state_child`) in order, each tier once its relative-CSV is met,
+/// stopping at the first not-yet-mature tier. Keyless (the receiver never co-signs — every tx is already
+/// signed and `state_child` pays the receiver's own key). Idempotent: call once per block; already-known
+/// tiers are skipped. Returns `(txids_broadcast_this_pass, done)` — `done` once `state_child` is
+/// on-chain/in-mempool, i.e. the child value is committed to the receiver.
+pub fn exit_child_pass(cc: &ClientConfig, cb: &ChildTesrBundle) -> (Vec<String>, bool) {
+    let mut acted = Vec::new();
+    for (signed, _csv) in child_exit_chain(cb) {
+        let raw = match hex::decode(&signed) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        // Derive the txid to skip already-known tiers without re-broadcasting.
+        let txid = {
+            use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+            match deserialize::<Transaction>(&raw) {
+                Ok(tx) => tx.txid().to_string(),
+                Err(_) => break,
+            }
+        };
+        if tx_known(cc, &txid) {
+            continue;
+        }
+        match cc.electrum_client.transaction_broadcast_raw(&raw) {
+            Ok(_) => acted.push(txid),
+            Err(_) => break, // CSV not met / parent unconfirmed — retry next pass
+        }
+    }
+    let done = tx_known(cc, &cb.child_state.txid);
+    (acted, done)
+}
+
+/// The relative-CSV of the first child-exit tier not yet on-chain (a wait-time hint), or `None` once the
+/// child exit is complete. Mirrors [`next_exit_tier`] for a split child chain.
+pub fn next_child_exit_tier(cc: &ClientConfig, cb: &ChildTesrBundle) -> Option<u16> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    for (signed, csv) in child_exit_chain(cb) {
+        let raw = match hex::decode(&signed) {
+            Ok(r) => r,
+            Err(_) => return Some(csv.unwrap_or(0)),
+        };
+        let txid = match deserialize::<Transaction>(&raw) {
+            Ok(tx) => tx.txid().to_string(),
+            Err(_) => return Some(csv.unwrap_or(0)),
+        };
+        if !tx_known(cc, &txid) {
+            return Some(csv.unwrap_or(0));
+        }
+    }
+    None
+}
+
+/// Fetch the authoritative inputs a split-child receiver needs and run [`verify_child_bundle`] — the
+/// verify-ONLY core (no persistence). Reads `F.spk` from chain, the parent+child
+/// `num_sigs`/`aggregate_pubkey` from `/info/statechain`, and both terminality flags from
+/// `/statechain/spend_budget` (fail-closed), and checks the child pays `receiver_backup_address`
+/// (Model A). Returns the child's exit value on success. Used by claim()'s validation pass.
+pub async fn verify_conveyed_child(
+    cc: &ClientConfig,
+    receiver_backup_address: &str,
+    cb: &ChildTesrBundle,
+) -> Result<u64> {
+    use electrum_client::bitcoin::Txid;
+    // F.spk from chain (also proves F is known to the chain; unspent/confirmed is enforced by the
+    // terminality of the parent — a terminal parent's only live spend is the disclosed T).
+    let f_txid = Txid::from_str(&cb.parent.f_txid)
+        .map_err(|_| anyhow::anyhow!("bad parent F txid"))?;
+    let f_tx = cc
+        .electrum_client
+        .transaction_get(&f_txid)
+        .map_err(|_| anyhow::anyhow!("parent F {} not found on chain", cb.parent.f_txid))?;
+    let f_out = f_tx
+        .output
+        .get(cb.parent.f_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("parent F has no output {}", cb.parent.f_vout))?;
+    let f_spk_hex = hex::encode(f_out.script_pubkey.as_bytes());
+
+    let p_info = crate::utils::get_statechain_info(&cb.parent_statechain_id, cc)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no statechain info for parent sid"))?;
+    let c_info = crate::utils::get_statechain_info(&cb.child_statechain_id, cc)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no statechain info for child sid"))?;
+
+    let (_, _, parent_terminal) =
+        crate::lightning_latch::get_spend_budget(cc, &cb.parent_statechain_id).await?;
+    let (_, _, child_terminal) =
+        crate::lightning_latch::get_spend_budget(cc, &cb.child_statechain_id).await?;
+
+    verify_child_bundle(
+        cb,
+        &f_spk_hex,
+        p_info.num_sigs,
+        PARENT_V2_BASELINE,
+        p_info.aggregate_pubkey.as_deref(),
+        parent_terminal,
+        c_info.num_sigs,
+        CHILD_V2_BASELINE,
+        c_info.aggregate_pubkey.as_deref(),
+        child_terminal,
+        receiver_backup_address,
+    )?;
+    Ok(cb.child_state.out_value)
+}
+
+/// [`verify_conveyed_child`] + persist the bundle so the receiver can [`exit_child_pass`] it. The
+/// RECEIVER side of an in-ladder split payment (the analogue of adopting a conveyed `tesr_ladder`).
+pub async fn adopt_child_bundle(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    receiver_backup_address: &str,
+    cb: &ChildTesrBundle,
+) -> Result<u64> {
+    let value = verify_conveyed_child(cc, receiver_backup_address, cb).await?;
+    persist_child(cc, wallet_name, cb).await?;
+    Ok(value)
+}
+
+/// Conveys a split **child** bundle to `recipient_address` by posting an encrypted mailbox message
+/// (`child_tesr_bundle` set, `protocol_version = 3`) via `transfer/update_msg`. The `child_coin` is the
+/// sender-owned piece slot whose `signed_statechain_id` authorises the post. The receiver picks it up in
+/// claim() and runs [`adopt_child_bundle`].
+pub async fn convey_child_bundle(
+    cc: &ClientConfig,
+    recipient_address: &str,
+    child_coin: &Coin,
+    cb: &ChildTesrBundle,
+) -> Result<()> {
+    let statechain_id = child_coin
+        .statechain_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("piece child coin has no statechain_id"))?;
+    let signed_statechain_id = child_coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("piece child coin has no signed_statechain_id"))?;
+    let (_, _, recipient_auth_pubkey) =
+        mercurylib::decode_transfer_address(recipient_address)?;
+
+    // `transfer/update_msg` is an UPDATE keyed on (statechain_id, new_user_auth_key); the row is
+    // created by the `transfer/sender` init call. A child conveyance has no key handover, but we still
+    // call it to CREATE the mailbox row (the returned x1 is unused — the child pre-pays the receiver's
+    // key, no blinding needed). Without this the update_msg silently no-ops (0 rows) and the receiver
+    // never sees the message.
+    crate::transfer_sender::get_new_x1(
+        cc,
+        statechain_id,
+        signed_statechain_id,
+        &recipient_auth_pubkey.to_string(),
+        None,
+    )
+    .await?;
+
+    let json = serde_json::to_string(cb)?;
+    let payload = mercurylib::transfer::sender::create_child_conveyance_update_msg(
+        recipient_address,
+        child_coin,
+        &json,
+    )?;
+    let endpoint = cc.statechain_entity.clone();
+    let client = cc.get_reqwest_client()?;
+    let status = client
+        .post(&format!("{}/transfer/update_msg", endpoint))
+        .json(&payload)
+        .send()
+        .await?
+        .status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("failed to convey child bundle (update_msg {status})"));
+    }
+    Ok(())
+}
+
 /// Off-chain RENEWAL: co-sign a new extension `X_{m+1}` with a strictly LOWER CSV
 /// (Decker-Wattenhofer replace-by-lower-timelock) plus a fresh state `S'_0`, replacing the current
 /// tiers in `bundle`. Zero on-chain bytes; once the trigger is broadcast, the superseded extension

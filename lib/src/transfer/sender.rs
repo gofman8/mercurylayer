@@ -110,6 +110,60 @@ pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin
     create_transfer_update_msg_with_branch(x1, recipient_address, coin, transfer_signature, backup_transactions, &Vec::new(), &Vec::new(), 0, None)
 }
 
+/// [in-ladder split] Build the mailbox message that conveys a split **child** bundle to the receiver.
+///
+/// Unlike a normal transfer this carries NO key handover: the child is a Model-A coin whose final state
+/// already pays the receiver's own key, so there is no `x1`/`t1` blinding and no backup ladder. The
+/// message sets `child_tesr_bundle` (JSON `ChildTesrBundle`) and `protocol_version = 3`; the receiver's
+/// claim() detects that field and takes the `verify_child_bundle` + adopt path instead of the handover.
+///
+/// `child_coin` is the sender-owned piece child (its `statechain_id` + `signed_statechain_id` authorise
+/// the `update_msg` post, since the sender created that slot at split time); the message is encrypted to
+/// `recipient_address`'s auth key so only the receiver's mailbox can read it. No `transfer_signature`/`t1`
+/// binding is needed — the child bundle only verifies against the receiver whose key `state_child` pays,
+/// so a replay to any other recipient fails Model A.
+pub fn create_child_conveyance_update_msg(
+    recipient_address: &str,
+    child_coin: &Coin,
+    child_tesr_bundle_json: &str,
+) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
+    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
+
+    let statechain_id = child_coin
+        .statechain_id
+        .as_ref()
+        .ok_or(MercuryError::SecpError)?;
+    let signed_statechain_id = child_coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or(MercuryError::SecpError)?;
+
+    let transfer_msg = TransferMsg {
+        statechain_id: statechain_id.to_string(),
+        transfer_signature: String::new(),
+        backup_transactions: Vec::new(),
+        t1: [0u8; 32],
+        user_public_key: child_coin.user_pubkey.clone(),
+        branch_txs: Vec::new(),
+        terminal_parents: Vec::new(),
+        protocol_version: 3,
+        tesr_ladder: None,
+        child_tesr_bundle: Some(child_tesr_bundle_json.to_string()),
+    };
+
+    let transfer_msg_json_str = serde_json::to_string_pretty(&json!(&transfer_msg))?;
+    let serialized_new_auth_pubkey = &recipient_auth_pubkey.serialize();
+    let encrypted_msg = ecies::encrypt(serialized_new_auth_pubkey, transfer_msg_json_str.as_bytes())
+        .map_err(|_| MercuryError::SecpError)?;
+
+    Ok(TransferUpdateMsgRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        auth_sig: signed_statechain_id.to_string(),
+        new_user_auth_key: recipient_auth_pubkey.to_string(),
+        enc_transfer_msg: hex::encode(&encrypted_msg),
+    })
+}
+
 /// Like [`create_transfer_update_msg`] but attaching an exit branch (fully-signed raw txs hex,
 /// root-first) and the `terminal_parents` (ancestor statechain ids the receiver must verify are
 /// terminal at the SE) for a coin whose funding tx is un-broadcast — an off-chain sub-coin.

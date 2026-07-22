@@ -64,6 +64,9 @@ impl UtexoWallet {
         // their own backup (not merely clear dust) — the split executor enforces the same floor.
         let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
         let plan = select::plan_with_floor(&candidates, amount_sats, min_output);
+        // An in-ladder split payment (V2 laddered coin) is conveyed directly to the recipient inside
+        // the split, not handed over in the loop below; track its piece for the returned result.
+        let mut inladder_piece: Option<(String, u64)> = None;
         let (mut to_send, used_split): (Vec<String>, bool) = match plan {
             Plan::Insufficient { available } => {
                 return Err(SdkError::InsufficientBalance {
@@ -94,10 +97,30 @@ impl UtexoWallet {
                     .ok_or_else(|| anyhow!("coin without statechain id"))?;
                 drop(spendable);
                 drop(record);
-                let (piece_id, _change_id) =
-                    self.split_coin(&split_coin_id, split_amount).await?;
-                ids.push(piece_id);
-                (ids, true)
+                // A V2 (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock trigger
+                // could void the split [B1]. Do an IN-LADDER split payment instead: `SP` descends from
+                // the trigger, the piece child pays the recipient (Model A), and the piece bundle is
+                // conveyed directly to their mailbox (no key handover). The change stays with us.
+                if mercuryrustlib::tesr::load(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &split_coin_id,
+                )
+                .await?
+                .is_some()
+                {
+                    let (piece_id, _change_id) = self
+                        .in_ladder_pay(&split_coin_id, receiver_address, split_amount)
+                        .await?;
+                    inladder_piece = Some((piece_id, split_amount));
+                    // `ids` = the whole coins (still handed over below); the piece is already conveyed.
+                    (ids, true)
+                } else {
+                    let (piece_id, _change_id) =
+                        self.split_coin(&split_coin_id, split_amount).await?;
+                    ids.push(piece_id);
+                    (ids, true)
+                }
             }
         };
 
@@ -125,6 +148,15 @@ impl UtexoWallet {
             coins.push(TransferredCoin {
                 statechain_id: id,
                 amount_sats: amount,
+            });
+        }
+
+        // The in-ladder split piece was conveyed directly to the recipient (not through the handover
+        // loop); include it in the result so the caller sees the full amount sent.
+        if let Some((piece_id, piece_amount)) = inladder_piece {
+            coins.push(TransferredCoin {
+                statechain_id: piece_id,
+                amount_sats: piece_amount,
             });
         }
 
@@ -539,6 +571,173 @@ impl UtexoWallet {
             )
             .await?;
         Ok((piece_id, change_id))
+    }
+
+    /// **In-ladder split payment of a V2 (TES-R) coin** (the B1-safe replacement for the refused
+    /// `split_coin` path). The split IS the payment: `SP` is a STATE tier spending `X_m.out[0]` (a
+    /// DESCENDANT of the trigger, never a rival for `F`), with two children — the PIECE, whose headless
+    /// ladder pays the recipient (Model A), and the CHANGE, paying this wallet back. The piece child
+    /// bundle is conveyed to `recipient_address` via the mailbox (`convey_child_bundle`); the recipient's
+    /// claim() adopts it with `verify_child_bundle`. The change child bundle is persisted locally as an
+    /// exitable claim. Returns `(piece_child_sid, change_child_sid)`.
+    ///
+    /// Value is conserved by the split builder: `piece + change == tier_out_total(X_m.out[0], 2)`, so
+    /// `change` is derived (not free) and `piece` must leave room for a viable change output.
+    pub async fn in_ladder_pay(
+        &self,
+        parent_statechain_id: &str,
+        recipient_address: &str,
+        piece_sats: u64,
+    ) -> Result<(String, String)> {
+        let network = self.inner.config.network.to_string();
+        let bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            parent_statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("coin {parent_statechain_id} has no TES-R ladder to split in-ladder"))?;
+
+        // piece + change == the split total (X_m.out[0] − committed fee for 2 children).
+        let x_m = bundle.current().extension.clone();
+        let total = mercurylib::tesr::tier_out_total(x_m.out_value, 2, bundle.fee_rate)
+            .ok_or_else(|| anyhow!("committed fee too high to split this coin into two"))?;
+        if piece_sats >= total {
+            return Err(anyhow!(
+                "payment {piece_sats} sat leaves no change: an in-ladder split of this coin can pay at most {} sat (total {total} minus a viable change output)",
+                total.saturating_sub(1)
+            ));
+        }
+        let change_sats = total - piece_sats;
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        if piece_sats < min_output || change_sats < min_output {
+            return Err(anyhow!(
+                "in-ladder split needs both piece ({piece_sats}) and change ({change_sats}) >= {min_output} sat"
+            ));
+        }
+
+        // Two fresh SE-registered child slots (DERIVED — free vouchers against the parent's value).
+        let mut slot_tokens = self.take_derived_tokens(parent_statechain_id, 2).await?;
+        let piece_child = self.create_child_slot(&slot_tokens.remove(0), piece_sats).await?;
+        let change_child = self.create_child_slot(&slot_tokens.remove(0), change_sats).await?;
+
+        // Model A payees: piece -> recipient's exit key; change -> this change slot's own key.
+        let payee = mercurylib::tesr::payee_address(recipient_address, &network)?;
+        let self_change_backup =
+            mercurylib::transaction::get_user_backup_address(&change_child, network.clone())?;
+
+        let mut parent = self
+            .record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(parent_statechain_id) && c.duplicate_index == 0)
+            .cloned()
+            .ok_or_else(|| anyhow!("parent coin {parent_statechain_id} not found"))?;
+
+        let mut children = vec![
+            (piece_child.clone(), payee, piece_sats),
+            (change_child.clone(), self_change_backup, change_sats),
+        ];
+        let bundles = mercuryrustlib::tesr::in_ladder_split(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mut parent,
+            &bundle,
+            &mut children,
+        )
+        .await?;
+        let piece_bundle = &bundles[0];
+        let change_bundle = &bundles[1];
+
+        // Convey the piece child to the recipient's mailbox (auth = the piece slot we own).
+        mercuryrustlib::tesr::convey_child_bundle(
+            &self.inner.cc,
+            recipient_address,
+            &children[0].0,
+            piece_bundle,
+        )
+        .await?;
+
+        // Persist the change child as an exitable self-claim; book both slots + the spent parent.
+        mercuryrustlib::tesr::persist_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            change_bundle,
+        )
+        .await?;
+        let sp_txid = {
+            use bitcoin::consensus::encode::deserialize;
+            let sp: bitcoin::Transaction =
+                deserialize(&hex::decode(&change_bundle.parent.current().state.signed_tx)?)?;
+            sp.txid().to_string()
+        };
+        self.book_inladder_split_coins(
+            parent_statechain_id,
+            &sp_txid,
+            piece_child.statechain_id.as_deref().unwrap_or_default(),
+            change_child.statechain_id.as_deref().unwrap_or_default(),
+            change_sats,
+        )
+        .await?;
+
+        Ok((
+            piece_child.statechain_id.clone().unwrap_or_default(),
+            change_child.statechain_id.clone().unwrap_or_default(),
+        ))
+    }
+
+    /// Create one SE-registered child slot funded by a derived token, returning its `Coin` (with
+    /// statechain_id + auth). The slot's aggregate is what `SP.out[j]` pays in the in-ladder split.
+    async fn create_child_slot(&self, token_id: &str, amount_sats: u64) -> Result<Coin> {
+        let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            token_id,
+            u32::try_from(amount_sats)?,
+        )
+        .await?;
+        self.record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.aggregated_address.as_deref() == Some(&addr))
+            .cloned()
+            .ok_or_else(|| anyhow!("child slot coin not found for {addr}"))
+    }
+
+    /// Book the coin records after an in-ladder split payment: the parent is spent (WITHDRAWN), the
+    /// piece slot is sent to the recipient (WITHDRAWN — its value left this wallet), and the change slot
+    /// becomes a CONFIRMED exitable claim funded by the un-broadcast `SP.out[1]`.
+    async fn book_inladder_split_coins(
+        &self,
+        parent_statechain_id: &str,
+        sp_txid: &str,
+        piece_child_sid: &str,
+        change_child_sid: &str,
+        change_sats: u64,
+    ) -> Result<()> {
+        let mut record = self.record().await?;
+        for coin in record.coins.iter_mut() {
+            match coin.statechain_id.as_deref() {
+                Some(sid) if sid == parent_statechain_id && coin.duplicate_index == 0 => {
+                    coin.status = CoinStatus::WITHDRAWN;
+                }
+                Some(sid) if sid == piece_child_sid => {
+                    // Value conveyed to the recipient — no longer this wallet's to spend.
+                    coin.status = CoinStatus::WITHDRAWN;
+                }
+                Some(sid) if sid == change_child_sid => {
+                    coin.utxo_txid = Some(sp_txid.to_string());
+                    coin.utxo_vout = Some(1);
+                    coin.amount = Some(u32::try_from(change_sats)?);
+                    coin.status = CoinStatus::CONFIRMED;
+                }
+                _ => {}
+            }
+        }
+        self.save_record(&record).await?;
+        Ok(())
     }
 
     /// Register the outputs of a signed (un-broadcast) split tx as wallet coins: patch the
