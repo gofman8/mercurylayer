@@ -836,6 +836,21 @@ impl UtexoWallet {
         };
         let mut withdrawn = Vec::new();
         for id in ids {
+            // A received in-ladder split CHILD claim is exit-only: its funding is the un-broadcast
+            // SP.out[j] and this wallet holds no SE co-signing key for it (only the pre-signed exit
+            // chain, whose final state already pays this wallet's own key). It therefore cannot be
+            // COOPERATIVELY withdrawn to an arbitrary address — route it to the unilateral exit
+            // (materialize the chain; funds land at this wallet's key) instead of crashing in
+            // withdraw::execute (which finds no backup/statechain rows). Re-transfer / co-op withdraw
+            // of a received child to a third-party address is the SE-lock follow-on (V2 re-transfer).
+            if mercuryrustlib::tesr::load_child(&self.inner.cc, &self.inner.config.wallet_name, &id)
+                .await?
+                .is_some()
+            {
+                let _ = self.unilateral_exit(Some(vec![id.clone()]), None).await?;
+                withdrawn.push(id);
+                continue;
+            }
             // An off-chain sub-coin's funding tx is un-broadcast: materialize its exit branch
             // first so the withdraw spend has an on-chain input. Idempotent for shared branches.
             self.broadcast_branch_if_any(&id).await?;
