@@ -798,6 +798,7 @@ mod transfer_signature_tests {
             terminal_parents: vec![],
             protocol_version: 0,
             tesr_ladder: None,
+            child_tesr_bundle: None,
         }
     }
 

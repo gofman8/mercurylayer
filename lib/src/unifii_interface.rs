@@ -58,6 +58,7 @@ fn ffi_to_transfer_msg(ffi_msg: FFITransferMsg) -> Result<TransferMsg, MercuryEr
         terminal_parents: Vec::new(),
         protocol_version: 0,
         tesr_ladder: None,
+        child_tesr_bundle: None,
     })
 }
 

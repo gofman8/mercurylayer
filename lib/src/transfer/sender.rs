@@ -139,6 +139,7 @@ pub fn create_transfer_update_msg_with_branch(x1: &str, recipient_address: &str,
         terminal_parents: terminal_parents.to_owned(),
         protocol_version,
         tesr_ladder,
+        child_tesr_bundle: None,
     };
 
     let transfer_msg_json = json!(&transfer_msg);

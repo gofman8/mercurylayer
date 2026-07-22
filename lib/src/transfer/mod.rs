@@ -118,6 +118,13 @@ pub struct TransferMsg {
     /// verification; present only when `protocol_version >= 2`.
     #[serde(default)]
     pub tesr_ladder: Option<String>,
+    /// JSON-serialized in-ladder split child bundle (`mercuryrustlib::tesr::ChildTesrBundle`) conveyed
+    /// when this transfer is a NON-EXACT payment funded by splitting a laddered coin (protocol_version
+    /// `>= 3`). The receiver verifies it with `verify_child_bundle` (parent `F` on-chain, child `F` =
+    /// the un-broadcast `SP.out[j]`, both sids terminal) instead of the plain ladder. serde-default keeps
+    /// the message wire-compatible with V1/V2 wallets.
+    #[serde(default)]
+    pub child_tesr_bundle: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
