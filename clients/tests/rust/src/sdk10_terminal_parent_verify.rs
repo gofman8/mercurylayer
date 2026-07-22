@@ -43,6 +43,10 @@ pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
+    // V1-LANE TEST: exercises split_coin / branch sub-coins (a V1 mechanism). Under V2 a laddered coin
+    // splits only IN-LADDER (transfer/in_ladder_pay → exit-only children), so split_coin refuses it
+    // (HF-1/B1). Pin V1 until V1 is deleted (then migrate/remove).
+    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     let cc = mercuryrustlib::client_config::load().await;
 
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk10_alice"), None).await?;
