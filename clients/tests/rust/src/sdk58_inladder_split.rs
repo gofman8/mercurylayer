@@ -112,8 +112,40 @@ pub async fn execute() -> Result<()> {
         child_num_sigs, child_baseline, child_agg.as_deref(),
         &receiver,
     ).map_err(|e| anyhow!("verify_child_bundle REJECTED a valid split child: {e}"))?;
+    println!("SDK58 - control: valid split child ACCEPTED.");
 
-    println!("SDK58 - ✓ PASS: in-ladder split child bundle ACCEPTED — two-aggregate census sound, A_parent on-chain-rooted, A_child == SP.out[0], Model A holds. B1 fix verified with no SGX.");
+    // ---- ADVERSARIAL: every tampering of the authoritative inputs must REJECT. ---------------------
+    let ok = |r: Result<()>, attack: &str| -> Result<()> {
+        match r {
+            Ok(()) => Err(anyhow!("SECURITY: {attack} was ACCEPTED")),
+            Err(e) => { println!("SDK58 - {attack} correctly REJECTED: {e}"); Ok(()) }
+        }
+    };
+    // A VALID but wrong x-only (a decoy aggregate — exercises the != check, not a parse failure) + a
+    // not-the-receiver P2TR key.
+    let decoy_xonly = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    let other_recv = {
+        use electrum_client::bitcoin::{secp256k1::{Secp256k1, XOnlyPublicKey}, Address, Network};
+        let x = XOnlyPublicKey::from_slice(&hex::decode("f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9").unwrap()).unwrap();
+        Address::p2tr(&Secp256k1::new(), x, None, Network::Regtest).to_string()
+    };
+
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, None, child_num_sigs, child_baseline, child_agg.as_deref(), &receiver),
+       "A (parent aggregate NULL — fail-closed)")?;
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, None, &receiver),
+       "B (child aggregate NULL — fail-closed)")?;
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, Some(decoy_xonly), child_num_sigs, child_baseline, child_agg.as_deref(), &receiver),
+       "C (decoy parent aggregate != A_parent)")?;
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, Some(decoy_xonly), &receiver),
+       "D (decoy child aggregate != SP.out[j])")?;
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs + 1, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, child_agg.as_deref(), &receiver),
+       "E (hidden parent state: parent num_sigs one higher)")?;
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs + 1, child_baseline, child_agg.as_deref(), &receiver),
+       "F (hidden child state: child num_sigs one higher)")?;
+    ok(mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, parent_num_sigs, parent_baseline, parent_agg.as_deref(), child_num_sigs, child_baseline, child_agg.as_deref(), &other_recv),
+       "G (Model A violated: child state pays not-the-receiver)")?;
+
+    println!("SDK58 - ✓ PASS: in-ladder split child ACCEPTED; and NULL/decoy aggregates, hidden parent/child states, and Model-A violation all REJECTED. B1 fix verified with no SGX.");
     Ok(())
 }
 
