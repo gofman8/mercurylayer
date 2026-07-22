@@ -229,3 +229,38 @@ The O-1 counter-machine review (the missing TESR-3 foundation) settled the centr
 
 **Do NOT flip the default to V2 until the keystone lands and is verified.** With it, V2's count census is
 sound and retry-safe, and the in-ladder split (B1) rides on top of a trustworthy parent census.
+
+---
+
+## KEYSTONE DONE (2026-07-22) + the V2-completion gate chain
+
+The keystone LANDED and is VERIFIED (see the memory + commits 11edbae/5b5b698/ea09c01): the lockbox caches
+the partial sig keyed on the session and increments sig_count atomically; the client retries the same
+sign/second. sdk56 proves the signing round is idempotent under retry (num_sigs counted once across 3
+replays). Server + lockbox redeployed from latest source; full V2 suite green.
+
+**To reach "V2 default + V1 deleted" the remaining gates are, in order:**
+
+1. **S5 (presign-abandonment brick) — NEEDS A SERVER-SIDE PROTOCOL CHANGE (design ruling, workflow
+   wab9jyo5b).** A purely client-side fix is IMPOSSIBLE — three independent FATALs, S-1 dispositive:
+   the V2 transfer path co-signs a RECEIVER-PAYING V1 BACKUP on every attempt (transfer_sender.rs:278 ->
+   create_backup_tx_to_receiver), whose locktime is IDENTICAL across abandons; splicing journaled backups
+   into the conveyed list hits INV-5 (ladder_decrements_by_interval, receiver.rs:274) — which cannot loosen
+   without reopening the S2 hidden-state defense — and NOT splicing leaves v1_backups short => verify_bundle
+   num_sigs mismatch. Both horns BRICK. FIX = **receiver-liveness gate**: add a receiver-signed commitment
+   to the transfer protocol; the SE co-signs BOTH the V1 backup AND S' ONLY against that commitment, so a
+   no-show strands nothing (this is the work already flagged at transfer_sender.rs:257). Latent note
+   (limitation, independent of S5): the receiver-paying V1 backup a V2 coin co-signs descends from tx0's
+   output, which T also spends — a latent on-chain rival of T on EVERY successful V2 transfer; deserves its
+   own verification pass.
+2. **In-ladder split (B1)** — enables V2 non-exact payments (split_coin refuses laddered coins today,
+   transfer.rs:426). Redesign in progress (workflow w7s7jxly2) now that the parent census is trustworthy.
+3. **Adaptor-sig LN = "finish lightning swaps"** — LN rides the V1 batch_id latch (lightning.rs); deleting
+   V1 breaks it. Needs adaptor signatures (server/protocol).
+4. Then: flip deposit_protocol_default -> 2; delete V1 (verifier lane, validate_signature_scheme,
+   v1_backups, batch_id latch, migrate tests); rewrite all docs/utexo/*.
+
+**Every remaining gate is server/SE/protocol work, not a client patch** — V2's safety rests on the blind
+SE (counting + gating). The build/deploy cycle is proven (incremental Docker rebuild + docker cp + restart),
+so it is feasible; it is a real backend program, done gate by gate with adversarial review + live-stack
+verification. Do NOT flip default or delete V1 until gates 1-3 land + are verified.
