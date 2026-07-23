@@ -68,6 +68,15 @@ transfer). Coordinator-side, lockbox-testable. It also hardens every V2 transfer
   pending-transfer lock (open on `insert_new_transfer`, checked in `sign_first`/`sign_second`, released on
   `key_updated` or batch timeout). Reject re-address of an open pending row (`insert_new_transfer` DELETE)
   while a transfer is in flight.
+  - **⚠ ORDERING PITFALL (verified):** in `clients/libs/rust/src/transfer_sender.rs::execute`, `get_new_x1`
+    (line 268 — opens the transfer) runs BEFORE the sender's own pre-signs: `create_backup_transactions`
+    (line 278, `create_tx1`) and `presign_receiver_state` (line 304, co-signs `S'`). A pending-lock that
+    refuses co-signs once a transfer is open would therefore BLOCK the sender's own legitimate pre-signs
+    and break EVERY transfer. **The lock is only safe if `execute` is first re-ordered to do ALL sender
+    pre-signs (backups + `S'`) BEFORE `get_new_x1`** — they need no `x1` (only `t1 = o1 + x1` in
+    `create_transfer_update_msg` does). Then, once the transfer is open, no further co-sign is legitimate,
+    so refusing them is safe by construction. Re-run the full transfer suite (sdk41/49/50 + the split
+    tests) to prove no regression before relying on the lock.
 - Census (`clients/libs/rust/src/tesr.rs verify_child_bundle`): generalize to N hops
   (`Σ conveyed_tiers` across the ancestor chain rooted at on-chain `F`), per V2-MIGRATION.md:393-394.
 - E2E (sdk60): Alice pays Bob a non-exact amount; Bob adopts + COMPLETES the handover (first-class); Bob
