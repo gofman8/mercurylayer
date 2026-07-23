@@ -151,6 +151,45 @@ cannot be reclaimed off-chain on rollback → forced on-chain exit). Enclave-enf
 terminalization is future hardening (Phase 3) that buys anti-collusion, **not** a precondition for
 retiring sdk53.
 
+## 2b. NON-EXACT PAY — adopted design: LATCHED CHILD CONVEYANCE (workflow `wf_ddcd3049-7ac`)
+
+Real invoices are non-exact, and splitting a V2 laddered coin yields an in-ladder-split CHILD conveyed
+via `convey_child_bundle` (a mailbox/adopt path, censused by `verify_conveyed_child`) that the exact
+lane's `verify_bundle` census does not handle. A 3-variant design + 4-lens adversarial workflow picked
+**latched-child-conveyance** (feasibility SOUND; the other two DISQUALIFIED — `promote-then-standard`
+needs the forbidden child reopen / an on-chain re-anchor; `ssp-change` enlarges the operator-trust bar
+to the whole over-collateralized coin).
+
+**Why it's the smallest sound change:** `convey_child_bundle` ALREADY calls `get_new_x1`, so the child
+gets a real `statechain_transfer` row — the exact-lane HODL latch (`create_external_hash_latch`,
+`unlock_by_preimage`, `is_all_coins_unlocked`, the `locked/locked2` bits) reuses **verbatim** on the
+child sid. The child stays **exit-only** (no reopen, no key-handover, no `sig_count` decrement), so it
+sidesteps both the `v2-child-retransfer` unsoundness AND the orphan-`S'` brick (the SSP co-signs
+nothing on the child). Trust delta vs exact: **none in magnitude** — the SSP can broadcast the piece's
+`SP→ext_child→state_child` to take the *piece* (`invoice+fee`, ≤ the exact-lane whole-coin exposure)
+on rollback, at the same V1 operator-trust bar; the change slice is trustless (self-owned, un-conveyed,
+unilaterally exitable); no double-recovery (piece and change share `X_m.out[0]`). RECEIVE adds **zero**
+trust (the piece pays the user, who censuses + exits it).
+
+**⚠️ Step 0 — MANDATORY value-binding fix (a live theft, LANDED).** The workflow found (and code
+confirmed) that `verify_conveyed_child` returned the *sender-declared* `cb.child_state.out_value`
+(tesr.rs:553) and `verify_child_bundle`'s Model-A check bound only `st_out0`'s KEY, never its value
+(tesr.rs:1345-1348) — `verify_tier_cosigned` binds the co-sign to the INPUT amount, not the output
+split, and the blind SE co-signs any distribution. So a payer crafts `state_child` paying the receiver
+a few sats while declaring a large `out_value` (remainder to a 2nd output back to itself) → any value
+gate trusting the declared field pays the full invoice for a near-worthless piece. **This is live on
+the shipped child census (sdk59), not just non-exact LN.** Fix (landed): bind
+`st_out0.value == cb.child_state.out_value` in `verify_child_bundle`, making the returned value
+trustworthy. Adversarial regression = sdk65 case A.
+
+**Remaining impl (Steps 1–6):** thread `batch_id` through `convey_child_bundle`→`get_new_x1`; a latched
+`in_ladder_pay` variant (book the piece `IN_TRANSFER`, `create_external_hash_latch` on the piece sid
+before conveyance); a CHILD-bundle branch in `peek_pending_transfers` (run `verify_conveyed_child`,
+fail-closed) for the SSP pre-pay census; a child-adoption latch gate (don't `persist_child` while the
+child's batch is locked; a read-only `GET /transfer/batch_locked/{sid}`); the SDK entry
+`pay_lightning_invoice_inladder`; and `sdk65` (happy + value-theft-reject + hidden-child + rollback
+no-double-recovery). All lockbox-testable; no new SE co-sign on the child ⟹ no SGX signing change.
+
 ## 3. Trust assumption (drop-in for TRUST-MODEL.md)
 
 > **RECEIVE (LN → statecoin)** needs no operator trust for safety: the SSP fronts its own coin, the

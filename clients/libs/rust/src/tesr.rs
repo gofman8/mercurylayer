@@ -1346,6 +1346,21 @@ pub fn verify_child_bundle(
     if taproot_key_hex(st_out0.script_pubkey.as_bytes())? != recv_key {
         return Err(anyhow::anyhow!("child state does not pay the receiver's key (Model A violated)"));
     }
+    // [value-binding — child value-gate spoof] Bind the receiver-paying output's VALUE to the bundle's
+    // declared `out_value`. `verify_tier_cosigned` binds the co-sign to the INPUT amount, not the
+    // output split, and the blind SE co-signs ANY output distribution — so without this a payer crafts
+    // `state_child.out[0]` paying the receiver a few sats while declaring a large `out_value` (remainder
+    // to a second output back to itself), and any value gate that trusts the declared field (the SSP's
+    // pre-pay value gate — audit) pays the full invoice for a near-worthless piece. out[0] is forced to
+    // be the receiver payment by the key check above (a P2A anchor or change can only be a LATER
+    // output), so binding `out[0].value == out_value` makes `verify_conveyed_child`'s returned value
+    // trustworthy. Live on the shipped child census (sdk59), not just non-exact LN.
+    if st_out0.value != cb.child_state.out_value {
+        return Err(anyhow::anyhow!(
+            "child state out[0] pays {} sat but the bundle declares out_value {} — value-gate spoof",
+            st_out0.value, cb.child_state.out_value
+        ));
+    }
 
     // [6 cont.] CHILD CENSUS exact-equality: a fresh split child discloses exactly ext_child +
     //     state_child (2 co-signs) on top of any V1 backups. A hidden child co-sign would push
