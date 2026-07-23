@@ -67,9 +67,15 @@ transfer). Coordinator-side, lockbox-testable. It also hardens every V2 transfer
   + conveyed_tiers`, checked at receive) closes any PRE-conveyance rival, and the **pending-lock** (an open
   transfer on the child) closes any POST-conveyance rival. So `in_ladder_split` drops
   `set_spend_budget(child_sid, 0)` and `verify_child_bundle` drops the `child_terminal` requirement (KEEP
-  `parent_terminal` + the census). **INTERDEPENDENT:** dropping `child_terminal` is only safe TOGETHER
-  with the receiver completing the handover (which locks out the sender via auth rotation); they must land
-  as one coherent change, not piecemeal.
+  `parent_terminal` + the census). **INTERDEPENDENT — verified while implementing:** dropping
+  `child_terminal` is only safe TOGETHER with the receiver completing the handover. Terminality and the
+  handover (auth rotation) are PERMANENT lockouts; the pending-transfer lock is TEMPORARY (1-hour expiry).
+  If a child is left non-terminal + exit-only (no handover) and held past the pending-lock's expiry, the
+  still-owner sender can co-sign a rival that out-races the receiver's exit — theft. So `in_ladder_split`
+  dropping the child budget, `verify_child_bundle` dropping `child_terminal`, `convey_child_bundle`
+  conveying the handover material, and the receiver COMPLETING the handover must land as ONE change. (A
+  first attempt this session dropped terminality first and was reverted to the safe state to avoid
+  shipping the exit-after-expiry theft window — confirming the interdependency in code.)
 
 ## Implementation targets
 - Client sender (`clients/libs/rust-sdk/src/transfer.rs in_ladder_pay`, `clients/libs/rust/src/tesr.rs
