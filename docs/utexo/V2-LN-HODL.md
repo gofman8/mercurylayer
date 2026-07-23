@@ -61,12 +61,31 @@ The SSP fronts **its own** statecoin under a HODL invoice.
 The SSP owns the coin throughout its risk window and the HTLC is held before release — **the user
 cannot be robbed and the SSP cannot be robbed.** (All four adversarial lenses agree on RECEIVE.)
 
-**The core security fix (closes the real flaw):** today `get_preimage`
-(`server/src/database/lightning_latch.rs:60-67`) releases on `locked=false AND expires_at>now()` —
-it does **not** check the transfer actually completed. Tighten it to also require
-`key_updated = true` (join `lightning_latch.batch_id → statechain_transfer.key_updated`), binding the
-SSP's ability to get paid to the coin having genuinely been delivered to the user. This is exactly the
-"release `t` only on real completion, not on a bare lock-bit + expiry" property.
+**The core security fix (closes the real flaw) — and a sequencing caveat found while tracing it:**
+today `get_preimage` (`server/src/database/lightning_latch.rs:60-67`) releases on
+`locked=false AND expires_at>now()`. The synthesis proposed also requiring `key_updated = true`
+(bind the SSP's payout to the coin actually being delivered).
+
+**⚠️ This must NOT be applied globally — it deadlocks the `sender-settles-first` lane.** Two shipped
+flows retrieve the preimage in opposite orders relative to the receiver's key-update:
+- **`settle_receive`** (`ssp.rs:639-661`): the SSP `confirm_pending_invoice` (clears `locked2`), then
+  the receiver claims in the background (clears `locked` AND, now that the batch is fully unlocked,
+  sets `key_updated=true`), then the SSP **retries** `retrieve_pre_image`. Here `key_updated=true`
+  precedes retrieval — the fix is safe and correct.
+- **`sdk03` / `settle_lightning_swap`** (sender-settles-first): the receiver's *first* claim clears
+  `locked` but leaves `key_updated=false` (batch still `locked2`); the **sender** then settles,
+  which clears `locked2` AND retrieves the preimage — *before* the receiver completes. A global
+  `key_updated=true` gate would deadlock: settle needs the preimage → preimage needs `key_updated`
+  → `key_updated` needs `locked2=false` → which settle itself provides. Circular.
+
+Resolution: **scope the completion-binding to the RECEIVE (HODL) lane** — e.g. gate on `key_updated`
+only for latch rows created by `post_paymenthash` in the SSP-fronts-the-coin flow, keyed off a
+per-latch flag — OR rely on the **existing coordinated-clock atomicity** already documented at
+`ssp.rs:631-638` (Audit [2]/[5]: the receiver's claim gate and the SSP's `get_preimage` are bound to
+the same latch expiry, set shorter than the payer's HODL HTLC), which already gives RECEIVE its
+"coin stays with the SSP unless the receiver completes in-window" guarantee **without** a
+`key_updated` gate. The `key_updated` bind is a *strengthening* of an already-safe RECEIVE flow, not a
+prerequisite — do it scoped, or not at all, but never globally.
 
 ### PAY (statecoin → LN): sound at the V1 bar, ships second, no enclave change
 The user pays an external merchant BOLT11 (hash `H`) with a statecoin.
