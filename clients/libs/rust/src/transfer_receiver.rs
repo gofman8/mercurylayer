@@ -263,6 +263,13 @@ pub struct PendingTransferInfo {
     pub funding_vout: u32,
     /// The un-broadcast exit branch (raw tx hex, root-first) the consignment resolves against.
     pub branch_txs: Vec<String>,
+    /// Pre-pay ladder census (V2-LN-HODL.md): `true` iff this coin is safe to accept-before-paying —
+    /// a V1 coin (no ladder) is trivially `true`; a V2 (TES-R) coin is `true` only if its conveyed
+    /// ladder passes `verify_bundle`'s `num_sigs == v1_backups + tiers` against the LIVE enclave
+    /// sig-count (so no hidden lower-CSV state is present). The SSP's pre-pay gate MUST refuse to pay
+    /// for any latched coin whose `ladder_census_ok` is `false`. Fails CLOSED (`false`) if the ladder
+    /// is missing/malformed or the enclave sig-count cannot be read.
+    pub ladder_census_ok: bool,
 }
 
 pub async fn peek_pending_transfers(
@@ -371,6 +378,34 @@ pub async fn peek_pending_transfers(
                 .backup_transactions
                 .iter()
                 .find_map(|b| b.rgb_consignment.clone());
+            // PRE-PAY LADDER CENSUS (V2-LN-HODL.md §2 PAY). A V2/TES-R coin conveys an exit ladder;
+            // it is only safe for a paying party (the SSP) to accept BEFORE paying if the ladder
+            // satisfies `verify_bundle`'s `se_num_sigs == v1_backups + tiers` against the coin's LIVE
+            // enclave sig-count — otherwise the sender may hold a hidden lower-CSV state that out-races
+            // the conveyed S' after the irreversible Lightning leg. This is the exact census the
+            // receiver runs at claim time (transfer_receiver.rs ~:619), hoisted ahead of payment. V1
+            // coins have no ladder → trivially ok. Fail CLOSED on any read/parse failure.
+            let ladder_census_ok = if transfer_msg.protocol_version >= 2 {
+                match transfer_msg.tesr_ladder.as_ref() {
+                    Some(ladder_json) => match serde_json::from_str::<crate::tesr::TesrBundle>(ladder_json) {
+                        std::result::Result::Ok(bundle) => {
+                            match crate::utils::get_statechain_info(&transfer_msg.statechain_id, client_config).await {
+                                std::result::Result::Ok(Some(info)) => crate::tesr::verify_bundle(
+                                    &bundle,
+                                    info.num_sigs,
+                                    transfer_msg.backup_transactions.len() as u32,
+                                )
+                                .is_ok(),
+                                _ => false,
+                            }
+                        }
+                        Err(_) => false,
+                    },
+                    None => false,
+                }
+            } else {
+                true
+            };
             out.push(PendingTransferInfo {
                 statechain_id: transfer_msg.statechain_id,
                 amount,
@@ -378,6 +413,7 @@ pub async fn peek_pending_transfers(
                 funding_txid,
                 funding_vout,
                 branch_txs: transfer_msg.branch_txs.clone(),
+                ladder_census_ok,
             });
         }
     }

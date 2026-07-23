@@ -416,6 +416,23 @@ impl SspService {
                 ));
             }
         }
+        // PRE-PAY LADDER CENSUS (V2-LN-HODL.md §2 PAY). For a V2 (TES-R) latched coin, run the
+        // receiver's `verify_bundle` census (num_sigs == v1_backups + tiers, read from the
+        // enclave-authoritative sig-count) BEFORE the irreversible Lightning leg. This closes the
+        // rob-SSP hidden-`S*` vector: a sender who co-signed a lower-CSV state omitted from the
+        // conveyed ladder inflates num_sigs → the census fails → we refuse to pay. V1 coins have no
+        // ladder and pass trivially. `peek_pending_transfers` computed this per coin (fail-closed).
+        for sid in &latched_ids {
+            let p = pending
+                .iter()
+                .find(|p| &p.statechain_id == sid)
+                .ok_or_else(|| anyhow!("latched coin {sid} not in the pending set"))?;
+            if !p.ladder_census_ok {
+                return Err(anyhow!(
+                    "latched coin {sid} failed the pre-pay ladder census (hidden state / num_sigs mismatch, or unreadable) — refusing to pay"
+                ));
+            }
+        }
         // VALUE GATE — enforced BEFORE paying (reviews C2/C3; audit [3]/[4]).
         let asset_before = if let Some(asset_id) = &d.asset_id {
             // RGB invoice: the latched coins must cryptographically carry >= the invoiced amount of
