@@ -140,6 +140,28 @@ pub async fn transfer_sender(statechain_entity: &State<StateChainEntity>, transf
         return status::Custom(Status::BadRequest, Json(response_body));
     }
 
+    // [RE-ADDRESS GUARD — V2-CHILD-FIRSTCLASS.md] Refuse to open a transfer to a DIFFERENT receiver when
+    // this coin already has an OPEN (conveyed, uncompleted) transfer to another key. `insert_new_transfer`
+    // DELETEs the prior row by statechain_id, so without this a still-owner sender could re-address an
+    // already-conveyed (victim-accepted) transfer to an attacker key it controls — the self-reopen
+    // re-address vector the child-firstclass review found. A same-auth retry is allowed (idempotent).
+    // Fail CLOSED on a DB error.
+    match crate::database::transfer_sender::has_open_transfer_to_other_auth(&statechain_entity.pool, &statechain_id, &new_user_auth_key).await {
+        Ok(true) => {
+            return status::Custom(
+                Status::Conflict,
+                Json(json!({ "message": "coin already has an open transfer to a different recipient; complete or let it expire before re-addressing" })),
+            );
+        }
+        Ok(false) => {}
+        Err(_) => {
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "transfer-state check unavailable; refusing to open a transfer (fail-closed)" })),
+            );
+        }
+    }
+
     let secret_x1 = SecretKey::new(&mut rand::thread_rng());
 
     let s_x1 = Scalar::from(secret_x1);

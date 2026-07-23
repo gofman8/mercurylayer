@@ -138,6 +138,24 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
         }
     }
 
+    // [PENDING-TRANSFER LOCK — V2-CHILD-FIRSTCLASS.md] While a transfer of this coin is OPEN (conveyed
+    // but not yet completed by the receiver), the SE refuses ANY co-sign. After the transfer_sender
+    // re-order every legitimate sender pre-sign (backups + Model-A S') completes BEFORE `get_new_x1`
+    // opens the transfer, so no honest co-sign happens during the open window — refusing here closes the
+    // TOCTOU where a still-owner sender co-signs a lower-CSV rival that out-races the receiver's conveyed
+    // state, and the dangling sign/first + late sign/second variant. Fail CLOSED on a DB error like the
+    // other gates. Expiry is inside the query (never-claimed transfers release after an hour; no victim).
+    match crate::database::transfer_sender::has_open_transfer(&statechain_entity.pool, &statechain_id).await {
+        Ok(true) => {
+            return status::Custom(
+                Status::Conflict,
+                Json(json!({ "message": "coin has an open transfer (SE refuses co-signatures until it completes or expires)" })),
+            );
+        }
+        Ok(false) => {}
+        Err(_) => fail_closed!(),
+    }
+
     // This situation should not happen, as this state is only possible if the client has called signFirst, but not signSecond
     // In this case, the server should have already stored server_pubnonce in the database and the challenge is still null because the client did not call signSecond
     let server_pubnonce_hex = crate::database::sign::get_server_pubnonce_from_null_challenge(&statechain_entity.pool, &statechain_id).await;
@@ -295,6 +313,21 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
             }
         }
         Ok(None) => {}
+        Err(_) => fail_closed_second!(),
+    }
+
+    // [PENDING-TRANSFER LOCK — V2-CHILD-FIRSTCLASS.md] Refuse to FINALIZE a co-sign while a transfer of
+    // this coin is open. Enforced at sign_second (not only sign_first) so a sender that opened sign_first
+    // BEFORE the transfer cannot complete the dangling session AFTER it to slot a lower-CSV rival — the
+    // gates must hold at the moment the signature is ISSUED. Fail CLOSED on a DB error.
+    match crate::database::transfer_sender::has_open_transfer(&statechain_entity.pool, &statechain_id).await {
+        Ok(true) => {
+            return status::Custom(
+                Status::Conflict,
+                Json(json!({ "message": "coin has an open transfer (SE refuses to finalize a co-signature until it completes or expires)" })),
+            );
+        }
+        Ok(false) => {}
         Err(_) => fail_closed_second!(),
     }
 
