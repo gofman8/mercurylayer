@@ -17,8 +17,13 @@ Decision produced by an understand → design(×4) → adversarial-verify(×4 le
   SSP over a live channel, census passing both pre-pay and at claim. `sdk37` (SSP value gate) GREEN =
   no regression; `sdk53` repurposed to pin that the guard is lifted; `sdk03` (V1 latch) GREEN.
   Commits: `b5aad4e` (census) + the guard-lift/sdk63.
-- **Verified scope:** the EXACT-amount PAY **success path** (no split). The non-exact PAY (in-ladder
-  split feeding the latch) and the RECEIVE-on-V2 lane are the next units.
+- **RECEIVE on V2 — LANDED + VERIFIED.** `sdk64` GREEN: a zero-on-chain wallet receives a real LN
+  payment as a V2 (TES-R laddered) coin — the SSP fronts an exact V2 coin (guard lifted), the HODL
+  HTLC is held, and `settle_receive`'s coordinated clock gates the SE preimage on coin release. No
+  operator trust needed for RECEIVE (the SSP owns the coin throughout its window). Both LN directions
+  now work for V2 exact amounts.
+- **Verified scope:** the EXACT-amount PAY + RECEIVE **success paths** (no split). The non-exact lanes
+  (in-ladder split feeding the latch) are the next unit.
 - **⚠️ ROLLBACK (failure path) is worse than V1 — precisely characterized (correction).** On a V1 pay
   failure, `reclaim_lightning_payment` (a self-transfer back to the user) returns a fully re-usable
   coin (sdk18). On V2 it does NOT: the failed latch already co-signed the orphan `S'` (sig_count +1,
