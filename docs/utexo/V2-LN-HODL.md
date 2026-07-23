@@ -17,9 +17,26 @@ Decision produced by an understand → design(×4) → adversarial-verify(×4 le
   SSP over a live channel, census passing both pre-pay and at claim. `sdk37` (SSP value gate) GREEN =
   no regression; `sdk53` repurposed to pin that the guard is lifted; `sdk03` (V1 latch) GREEN.
   Commits: `b5aad4e` (census) + the guard-lift/sdk63.
-- **Verified scope:** the EXACT-amount PAY (no split). The non-exact PAY (in-ladder split feeding the
-  latch) and the RECEIVE-on-V2 lane are the next units; the RESIDUAL orphan-`S'` brick on rollback is
-  documented below (recoverable, not theft).
+- **Verified scope:** the EXACT-amount PAY **success path** (no split). The non-exact PAY (in-ladder
+  split feeding the latch) and the RECEIVE-on-V2 lane are the next units.
+- **⚠️ ROLLBACK (failure path) is worse than V1 — precisely characterized (correction).** On a V1 pay
+  failure, `reclaim_lightning_payment` (a self-transfer back to the user) returns a fully re-usable
+  coin (sdk18). On V2 it does NOT: the failed latch already co-signed the orphan `S'` (sig_count +1,
+  recorded nowhere locally), so the reclaim's self-transfer conveys a ladder whose disclosed tiers are
+  one short of the enclave `sig_count`, and `verify_bundle` at claim REJECTS — the **off-chain reclaim
+  bricks.** Funds are still SAFE: the user recovers via `unilateral_exit` (on-chain, uses the
+  pre-signed original ladder, not `verify_bundle`), under the same operator-trust that the SSP will not
+  broadcast the conveyed `S'` (V1 bar). Net: **success path = no worse than V1; failure path costs an
+  on-chain exit** until the orphan is reconciled.
+- **The clean fix (scoped SE reconcile — the real "no worse than V1" for the failure path):** on an
+  authenticated reclaim of a rolled-back latch, the SE decrements the coin's `sig_count` by exactly the
+  orphan `S'` it co-signed for that batch (bounded, single-use, batch-scoped), so the reclaim's
+  self-transfer census balances again and off-chain reclaim is restored. This is a server workstream
+  (a coordinator-authoritative count decrement, tightly scoped so it can never hide a real state) — the
+  accurate replacement for the earlier hand-wave that "a refresh restores re-transfer" (refresh works
+  too, but is itself an on-chain re-anchor, i.e. same cost class as exit). Optional enclave
+  terminalization (Phase 3) does NOT help here — terminalizing the latched coin makes rollback WORSE
+  (the coin's only permitted spend becomes the SSP-paying `S'`).
 
 ---
 
