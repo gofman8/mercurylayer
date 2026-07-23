@@ -57,6 +57,20 @@ sender's co-signs on that `statechain_id` until the transfer completes (`key_upd
 NOT block the sender's own pre-sign of the receiver-paying state (do the pre-sign BEFORE opening the
 transfer). Coordinator-side, lockbox-testable. It also hardens every V2 transfer.
 
+## Progress
+- **✅ Pending-transfer lock LANDED + VERIFIED + DEPLOYED (commit 19e6668).** `sign_first`/`sign_second`
+  refuse a co-sign while a transfer of the coin is open; `get_new_x1` rejects re-addressing an open
+  transfer to a different recipient. Safe after the `get_new_x1` re-order (7e23891). Verified sdk49/41/01
+  (transfers) + sdk58/59 (in-ladder split) green on the live server. This is the enabling primitive.
+- **Refined child security model (replaces terminalize+reopen):** with the pending-lock live, the child
+  is NO LONGER terminalized. Its anti-hidden-state safety is: the **census** (`child_num_sigs == v1_backups
+  + conveyed_tiers`, checked at receive) closes any PRE-conveyance rival, and the **pending-lock** (an open
+  transfer on the child) closes any POST-conveyance rival. So `in_ladder_split` drops
+  `set_spend_budget(child_sid, 0)` and `verify_child_bundle` drops the `child_terminal` requirement (KEEP
+  `parent_terminal` + the census). **INTERDEPENDENT:** dropping `child_terminal` is only safe TOGETHER
+  with the receiver completing the handover (which locks out the sender via auth rotation); they must land
+  as one coherent change, not piecemeal.
+
 ## Implementation targets
 - Client sender (`clients/libs/rust-sdk/src/transfer.rs in_ladder_pay`, `clients/libs/rust/src/tesr.rs
   convey_child_bundle`): stop terminalizing the child; build + convey the handover material (t1 /
