@@ -250,20 +250,21 @@ pub async fn execute(
 
     let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
 
-    // ATOMICITY GUARD (V2-DESIGN §5.5 / §5.12, TES-fixable #5). Refuse a Lightning-latched transfer of
-    // a V2 (TES-R) coin BEFORE any server interaction. The Model A co-sign of the receiver-paying state
-    // S' is NOT gated by the swap preimage (presign_receiver_state co-signs unconditionally and records
-    // nothing locally); if the swap rolled back, that orphan SE co-sign would silently unbalance a later
-    // verify_bundle and brick the coin. The clean fix is server-side preimage-gating of the tier co-sign
-    // (deferred with the /renew-counters server work). Until then, fail loudly here — LN swaps run on V1
-    // coins. Checked ahead of get_new_x1 so no batch is registered for a transfer we will not complete.
-    if batch_id.is_some()
-        && matches!(crate::tesr::load(client_config, wallet_name, &statechain_id).await, Ok(Some(_)))
-    {
-        return Err(anyhow::anyhow!(
-            "Lightning-latched transfer of a V2 (TES-R) coin is not supported yet: the Model A co-sign is not preimage-gated (V2-DESIGN TES-fixable #5). Use a V1 coin for LN swaps."
-        ));
-    }
+    // LIGHTNING-LATCHED V2 (TES-R) TRANSFER — enabled via the HODL-latch pivot (V2-LN-HODL.md),
+    // superseding the old blanket refusal. The Model A co-sign of the receiver-paying state S' is still
+    // NOT preimage-gated (presign_receiver_state co-signs S' on a clone, unconditionally). What makes it
+    // SAFE at the V1/operator-trust bar:
+    //   * rob-SSP (a hidden lower-CSV S* the sender co-signed but omitted from the conveyed ladder) is
+    //     blocked by the SSP's PRE-PAY CENSUS — peek_pending_transfers now runs verify_bundle
+    //     (num_sigs == v1_backups + tiers, read from the enclave-authoritative sig_count) BEFORE
+    //     send_payment (ssp.rs execute_pay), so an inflated count is refused before the LN leg.
+    //   * rob-USER (the SSP broadcasting the conveyed, broadcastable S' without paying) rests on
+    //     operator trust — identical to the shipped V1 LN lane (get_msg_addr already serves S' pre-pay).
+    // RESIDUAL (recoverable, not theft): on ROLLBACK the orphan S' co-sign inflates the reclaimed coin's
+    // sig_count, so a later verify_bundle bricks re-transfer — the coin stays fully exitable, and a
+    // refresh() re-anchor restores re-transferability. Optional enclave latch-scoped terminalization
+    // (V2-LN-HODL.md Phase 3) removes this residual but is not required to lift the guard. See sdk53
+    // (guard test, now V1-pinned) and the new sdk63 (V2 PAY happy path).
 
     // NOTE: `get_new_x1` (which OPENS the transfer at the coordinator) is intentionally deferred to
     // AFTER all of the sender's own pre-signs below (transfer_signature, backup_transactions, and the

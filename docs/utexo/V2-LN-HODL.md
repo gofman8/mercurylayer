@@ -8,6 +8,19 @@ pinned stack today, needs no new cryptographic primitive, and lifts LN swaps ont
 Decision produced by an understand → design(×4) → adversarial-verify(×4 lenses) → synthesize workflow
 (`wf_d84cbc10-6c5`), then the two load-bearing claims were re-verified directly against the code.
 
+## STATUS (2026-07-23)
+
+- **PAY on V2 — LANDED + VERIFIED (the user-facing blocker is removed).** The census-in-pre-pay is
+  implemented (`peek_pending_transfers` → `PendingTransferInfo.ladder_census_ok`; enforced in
+  `ssp.rs execute_pay` before `send_payment`), the sdk53 guard is lifted
+  (`transfer_sender.rs`), and **`sdk63` is GREEN**: a V2 (TES-R) coin pays a real BOLT11 through the
+  SSP over a live channel, census passing both pre-pay and at claim. `sdk37` (SSP value gate) GREEN =
+  no regression; `sdk53` repurposed to pin that the guard is lifted; `sdk03` (V1 latch) GREEN.
+  Commits: `b5aad4e` (census) + the guard-lift/sdk63.
+- **Verified scope:** the EXACT-amount PAY (no split). The non-exact PAY (in-ladder split feeding the
+  latch) and the RECEIVE-on-V2 lane are the next units; the RESIDUAL orphan-`S'` brick on rollback is
+  documented below (recoverable, not theft).
+
 ---
 
 ## 0. The reframe that unblocks everything
