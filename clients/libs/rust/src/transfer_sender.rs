@@ -265,8 +265,13 @@ pub async fn execute(
         ));
     }
 
-    let x1 = get_new_x1(&client_config, &statechain_id, &signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await?;
-
+    // NOTE: `get_new_x1` (which OPENS the transfer at the coordinator) is intentionally deferred to
+    // AFTER all of the sender's own pre-signs below (transfer_signature, backup_transactions, and the
+    // Model-A `presign_receiver_state` S'). None of those need `x1` (only `t1 = o1 + x1`, built inside
+    // create_transfer_update_msg, does). Opening the transfer last means (a) a failed pre-sign never
+    // orphans a pending statechain_transfer row, and (b) it is safe for the coordinator to refuse ANY
+    // co-sign once a transfer is open (the pending-transfer lock, V2-CHILD-FIRSTCLASS.md) — every
+    // legitimate sender co-sign has already happened before the transfer is opened.
     let input_txid = coin.utxo_txid.as_ref().unwrap();
     let input_vout = coin.utxo_vout.unwrap();
     let client_seckey = coin.user_privkey.as_ref();
@@ -311,6 +316,10 @@ pub async fn execute(
         }
         _ => (0u32, None),
     };
+
+    // Open the transfer at the coordinator now, AFTER every sender pre-sign above (see the note by
+    // `input_txid`). Returns x1 for the t1 blinding tweak.
+    let x1 = get_new_x1(&client_config, &statechain_id, &signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await?;
 
     let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs, &terminal_parents, protocol_version, tesr_ladder)?;
 
