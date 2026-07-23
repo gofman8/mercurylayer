@@ -1,5 +1,13 @@
 # V2 Lightning swaps via adaptor signatures — design + blocker
 
+**⚠️ SUPERSEDED (2026-07-23) by `V2-LN-HODL.md`.** This adaptor-sig approach is BLOCKED on external
+PTLC. The adopted design pivots to a HODL-invoice latch at the existing V1/operator-trust bar — which
+is FEASIBLE on the pinned stack today and needs no PTLC and no new cryptographic primitive. The key
+insight that unblocks it: the PAY-direction "wall" below is not a defect the adaptor fixes on any
+shippable lane — it *is* the V1 trust model (serving `S'` pre-pay is already the shipped behavior).
+Read `V2-LN-HODL.md` for the current plan; this file is retained for the adaptor design + the
+adversarial findings (esp. finding 1, still relevant as optional Phase-3 hardening).**
+
 **Status (2026-07-23): DESIGNED + ADVERSARIALLY REVIEWED. BLOCKED for the primary direction on an
 external Lightning-layer dependency (PTLC). LN stays on the V1 lane; the V1 lane therefore cannot be
 deleted yet.**
