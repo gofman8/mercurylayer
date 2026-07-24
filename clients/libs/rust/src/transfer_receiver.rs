@@ -778,6 +778,19 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
         }
         crate::tesr::persist_child(client_config, wallet_name, &cb).await?;
 
+        // [non-exact LN RECEIVE, V2-LN-HODL.md §2b] Clear the RECEIVER-side lock on the piece's
+        // conveyance row. For a latched conveyance this is what signals "the receiver has claimed": once
+        // the owner (SSP) has also confirmed (`confirm_pending_invoice`), both lock bits are false and
+        // the SE releases the HODL preimage (server update_unlock_transfer → lightning_latch.locked). No
+        // key handover happens (the child pre-pays this coin's key), so this is the child analogue of
+        // the standard receive's `unlock_statecoin`. Harmless for a plain child (its row is already
+        // unlocked and carries no latch) and best-effort (a failure just leaves the SSP to retry/cancel).
+        if let std::result::Result::Ok(signed) =
+            mercurylib::transfer::receiver::sign_message(&cb.child_statechain_id, coin)
+        {
+            let _ = unlock_statecoin(client_config, &cb.child_statechain_id, &signed, &coin.auth_pubkey).await;
+        }
+
         // SP.out[j] is the (un-broadcast) funding outpoint of the child claim.
         use bitcoin::consensus::deserialize;
         let sp_tx: bitcoin::Transaction =

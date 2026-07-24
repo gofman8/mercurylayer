@@ -26,6 +26,13 @@ Decision produced by an understand → design(×4) → adversarial-verify(×4 le
   `pay_lightning_invoice_inladder`. No adoption latch gate is needed — the conveyed child is inherently
   broadcastable by the SSP (`exit_child_pass`), so the piece is at the exact-lane operator-trust bar
   (Step-0 value-binding fix + census close rob-SSP). **V2 wallets can now pay arbitrary amounts over LN.**
+- **NON-EXACT RECEIVE on V2 — LANDED + VERIFIED (completes LN symmetry).** `sdk67` GREEN: a zero-on-chain
+  wallet receives an ARBITRARY LN amount as a V2 coin — the SSP holds only a laddered coin, so
+  `create_receive` falls back to an in-ladder split, conveying a piece worth the invoice under an
+  SE-minted preimage (the `InLadderLatch::ClassicMinted` mode of `in_ladder_pay`; the child adoption now
+  clears the receiver-side lock so `settle_receive`'s SE-preimage retrieval unblocks). Both LN
+  directions now support arbitrary amounts on V2 — the last functional gap before the V1 LN lane can be
+  deleted (V1 RECEIVE handled any amount by splitting).
 - **RECEIVE on V2 — LANDED + VERIFIED.** `sdk64` GREEN: a zero-on-chain wallet receives a real LN
   payment as a V2 (TES-R laddered) coin — the SSP fronts an exact V2 coin (guard lifted), the HODL
   HTLC is held, and `settle_receive`'s coordinated clock gates the SE preimage on coin release. No

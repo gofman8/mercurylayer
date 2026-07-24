@@ -18,6 +18,19 @@ use mercurylib::wallet::{Coin, CoinStatus};
 use std::str::FromStr;
 
 use crate::select::{self, Candidate, Plan};
+
+/// How the PIECE child of an in-ladder split is latched for a non-exact Lightning swap
+/// (V2-LN-HODL.md §2b). Plain in-ladder payments use [`InLadderLatch::None`].
+pub enum InLadderLatch<'a> {
+    /// Not a Lightning swap — convey the piece outright.
+    None,
+    /// Non-exact PAY: latch the piece to a known merchant-invoice payment hash. The SSP censuses +
+    /// pays; settlement reveals the preimage that unlocks the piece.
+    External(&'a str),
+    /// Non-exact RECEIVE: the SE mints the preimage; the returned hash goes into the SSP's HODL
+    /// invoice and `settle_receive` retrieves the preimage from the SE to release + claim.
+    ClassicMinted,
+}
 use crate::types::{SdkError, TransferResult, TransferredCoin};
 use crate::wallet::{coin_outpoint, UtexoWallet};
 
@@ -126,7 +139,7 @@ impl UtexoWallet {
                 .is_some()
                 {
                     let (piece_id, _change_id, _batch) = self
-                        .in_ladder_pay(&split_coin_id, receiver_address, split_amount, None)
+                        .in_ladder_pay(&split_coin_id, receiver_address, split_amount, InLadderLatch::None)
                         .await?;
                     inladder_piece = Some((piece_id, split_amount));
                     // `ids` = the whole coins (still handed over below); the piece is already conveyed.
@@ -600,20 +613,22 @@ impl UtexoWallet {
     /// Value is conserved by the split builder: `piece + change == tier_out_total(X_m.out[0], 2)`, so
     /// `change` is derived (not free) and `piece` must leave room for a viable change output.
     ///
-    /// `latch_hash = Some(payment_hash)` makes this a **non-exact Lightning PAY** (V2-LN-HODL.md §2b):
-    /// the PIECE child is registered under an external-hash latch bound to the invoice and conveyed
-    /// batch-locked, so an SSP can identify + census it (`verify_conveyed_child`) before paying. The
-    /// piece then sits at the same operator-trust bar as the exact-lane `S'` (the SSP can exit the
-    /// conveyed piece regardless of payment — bounded to the piece; the change is self-owned and
-    /// trustless; no double-recovery, both share `X_m.out[0]`). Returns the latch `batch_id` (3rd tuple
-    /// element) for `execute_pay`; `None` when `latch_hash` is `None` (a plain in-ladder payment).
+    /// A non-`None` `latch` makes this a **non-exact Lightning swap** (V2-LN-HODL.md §2b): the PIECE
+    /// child is registered under a latch bound to the invoice and conveyed batch-locked, so the paying
+    /// party can identify + census it (`verify_conveyed_child`) before releasing the other leg. The
+    /// piece then sits at the same operator-trust bar as the exact-lane `S'` (bounded to the piece; the
+    /// change is self-owned and trustless; no double-recovery, both share `X_m.out[0]`). The 3rd tuple
+    /// element is the latch `(batch_id, payment_hash)` (`None` for a plain in-ladder payment):
+    ///   * [`InLadderLatch::External`] — PAY: latch to a known merchant-invoice hash.
+    ///   * [`InLadderLatch::ClassicMinted`] — RECEIVE: the SE mints the preimage; the returned hash goes
+    ///     into the SSP's HODL invoice and `settle_receive` retrieves the preimage from the SE.
     pub async fn in_ladder_pay(
         &self,
         parent_statechain_id: &str,
         recipient_address: &str,
         piece_sats: u64,
-        latch_hash: Option<&str>,
-    ) -> Result<(String, String, Option<String>)> {
+        latch: InLadderLatch<'_>,
+    ) -> Result<(String, String, Option<(String, String)>)> {
         let network = self.inner.config.network.to_string();
         let bundle = mercuryrustlib::tesr::load(
             &self.inner.cc,
@@ -682,19 +697,44 @@ impl UtexoWallet {
         // adopts once it pays. Latch first, then convey: convey's `get_new_x1` runs `insert_new_transfer`,
         // which marks the child mailbox row a lightning latch only if the latch row already exists.
         let piece_sid = piece_child.statechain_id.clone().unwrap_or_default();
-        let latch_batch: Option<String> = if let Some(hash) = latch_hash {
-            self.set_coin_status(&piece_sid, CoinStatus::IN_TRANSFER).await?;
-            let batch_id = mercuryrustlib::lightning_latch::create_external_hash_latch(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &piece_sid,
-                hash,
-            )
-            .await?;
-            Some(batch_id)
-        } else {
-            None
+        let latch: Option<(String, String)> = match latch {
+            InLadderLatch::None => None,
+            InLadderLatch::External(hash) => {
+                self.set_coin_status(&piece_sid, CoinStatus::IN_TRANSFER).await?;
+                let batch_id = mercuryrustlib::lightning_latch::create_external_hash_latch(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &piece_sid,
+                    hash,
+                )
+                .await?;
+                Some((batch_id, hash.to_string()))
+            }
+            InLadderLatch::ClassicMinted => {
+                // The classic SE latch (`create_pre_image`) sanity-checks `coin.locktime`; a fresh
+                // un-broadcast child slot has none, and the child exits via CSV (not an absolute
+                // locktime), so stamp a placeholder (inherited from the parent) purely to pass it.
+                let placeholder_lock = parent.locktime.or(Some(0));
+                {
+                    let mut record = self.record().await?;
+                    for coin in record.coins.iter_mut() {
+                        if coin.statechain_id.as_deref() == Some(&piece_sid) {
+                            coin.status = CoinStatus::IN_TRANSFER;
+                            coin.locktime = placeholder_lock;
+                        }
+                    }
+                    self.save_record(&record).await?;
+                }
+                let pre = mercuryrustlib::lightning_latch::create_pre_image(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &piece_sid,
+                )
+                .await?;
+                Some((pre.batch_id, pre.hash))
+            }
         };
+        let latch_batch: Option<String> = latch.as_ref().map(|(b, _)| b.clone());
 
         // Convey the piece child to the recipient's mailbox (auth = the piece slot we own).
         mercuryrustlib::tesr::convey_child_bundle(
@@ -736,7 +776,7 @@ impl UtexoWallet {
         )
         .await?;
 
-        Ok((piece_sid, change_child.statechain_id.clone().unwrap_or_default(), latch_batch))
+        Ok((piece_sid, change_child.statechain_id.clone().unwrap_or_default(), latch))
     }
 
     /// Set a single coin's status by statechain_id in the local wallet db.

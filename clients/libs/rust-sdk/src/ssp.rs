@@ -545,35 +545,97 @@ impl SspService {
     /// invoice on the latch's SE-held payment hash. The payer pays the invoice; call
     /// [`Self::settle_receive`] to drive settlement.
     pub async fn create_receive(&self, amount_sats: u64, receiver_address: &str) -> Result<ReceiveSwap> {
-        let statechain_id = self.wallet.ensure_exact_coin(amount_sats).await?;
-        let pre = mercuryrustlib::lightning_latch::create_pre_image(
-            self.wallet.client_config(),
-            self.wallet.wallet_name(),
-            &statechain_id,
-        )
-        .await?;
-        mercuryrustlib::transfer_sender::execute(
-            self.wallet.client_config(),
-            receiver_address,
-            self.wallet.wallet_name(),
-            &statechain_id,
-            None,
-            false,
-            Some(pre.batch_id.clone()),
-        )
-        .await?;
-        let invoice = self
-            .rln
-            .ln_invoice(amount_sats * 1000, Some(&pre.hash), 3600)
-            .await?;
-        Ok(ReceiveSwap {
-            batch_id: pre.batch_id,
-            statechain_id: Some(statechain_id),
-            invoice,
-            payment_hash: pre.hash,
-            asset_id: None,
-            asset_amount: None,
-        })
+        // Prefer an exact coin (no split). If the SSP holds only V2-laddered coins (which cannot be
+        // split exactly), fall back to a NON-EXACT in-ladder split: convey a piece worth `amount` to
+        // the user, latched under an SE-minted preimage (V2-LN-HODL.md §2b). `settle_receive` works
+        // unchanged on the piece sid (confirm + retrieve the SE preimage → claim the HODL HTLC).
+        match self.wallet.ensure_exact_coin(amount_sats).await {
+            Ok(statechain_id) => {
+                let pre = mercuryrustlib::lightning_latch::create_pre_image(
+                    self.wallet.client_config(),
+                    self.wallet.wallet_name(),
+                    &statechain_id,
+                )
+                .await?;
+                mercuryrustlib::transfer_sender::execute(
+                    self.wallet.client_config(),
+                    receiver_address,
+                    self.wallet.wallet_name(),
+                    &statechain_id,
+                    None,
+                    false,
+                    Some(pre.batch_id.clone()),
+                )
+                .await?;
+                let invoice = self
+                    .rln
+                    .ln_invoice(amount_sats * 1000, Some(&pre.hash), 3600)
+                    .await?;
+                Ok(ReceiveSwap {
+                    batch_id: pre.batch_id,
+                    statechain_id: Some(statechain_id),
+                    invoice,
+                    payment_hash: pre.hash,
+                    asset_id: None,
+                    asset_amount: None,
+                })
+            }
+            Err(_) => {
+                // The piece's own exit consumes tier fees before it pays the user, so oversize by a
+                // reserve; the SSP bears it (its cost of fronting a non-exact amount).
+                const IN_LADDER_TIER_RESERVE: u64 = 2000;
+                let piece_sats = amount_sats + IN_LADDER_TIER_RESERVE;
+                let parent = self.largest_laddered_coin(piece_sats).await?;
+                let (piece_id, _change_id, latch) = self
+                    .wallet
+                    .in_ladder_pay(
+                        &parent,
+                        receiver_address,
+                        piece_sats,
+                        crate::transfer::InLadderLatch::ClassicMinted,
+                    )
+                    .await?;
+                let (batch_id, hash) =
+                    latch.ok_or_else(|| anyhow!("in_ladder_pay did not mint a latch"))?;
+                let invoice = self.rln.ln_invoice(amount_sats * 1000, Some(&hash), 3600).await?;
+                Ok(ReceiveSwap {
+                    batch_id,
+                    statechain_id: Some(piece_id),
+                    invoice,
+                    payment_hash: hash,
+                    asset_id: None,
+                    asset_amount: None,
+                })
+            }
+        }
+    }
+
+    /// The SSP's largest confirmed, V2-laddered coin able to fund an in-ladder split of `min_sats`
+    /// (so a viable change output remains). Used to front a non-exact RECEIVE.
+    async fn largest_laddered_coin(&self, min_sats: u64) -> Result<String> {
+        let wallet =
+            mercuryrustlib::sqlite_manager::get_wallet(&self.wallet.client_config().pool, self.wallet.wallet_name())
+                .await?;
+        let mut candidates: Vec<(u64, String)> = wallet
+            .coins
+            .iter()
+            .filter(|c| {
+                c.status == mercuryrustlib::CoinStatus::CONFIRMED
+                    && c.duplicate_index == 0
+                    && c.amount.unwrap_or(0) as u64 > min_sats + 1000
+            })
+            .filter_map(|c| c.statechain_id.clone().map(|id| (c.amount.unwrap_or(0) as u64, id)))
+            .collect();
+        candidates.sort_by_key(|(a, _)| std::cmp::Reverse(*a));
+        for (_, id) in candidates {
+            if mercuryrustlib::tesr::load(self.wallet.client_config(), self.wallet.wallet_name(), &id)
+                .await?
+                .is_some()
+            {
+                return Ok(id);
+            }
+        }
+        Err(anyhow!("no laddered coin large enough to front {min_sats} sats for a non-exact receive"))
     }
 
     /// Open an RGB receive swap: latch a COLORED coin carrying `asset_amount` of `asset_id` over to
@@ -951,10 +1013,15 @@ impl UtexoWallet {
         // paid exactly what the value gate reads, `child_state.out_value`).
         const IN_LADDER_TIER_RESERVE: u64 = 2000;
         let piece_sats = quote.amount_sats + quote.fee_sats + IN_LADDER_TIER_RESERVE;
-        let (piece_id, change_id, batch_id) = self
-            .in_ladder_pay(parent_statechain_id, &quote.ssp_address, piece_sats, Some(&quote.payment_hash))
+        let (piece_id, change_id, latch) = self
+            .in_ladder_pay(
+                parent_statechain_id,
+                &quote.ssp_address,
+                piece_sats,
+                crate::transfer::InLadderLatch::External(&quote.payment_hash),
+            )
             .await?;
-        let batch_id = batch_id.ok_or_else(|| anyhow!("in_ladder_pay did not return a latch batch"))?;
+        let (batch_id, _hash) = latch.ok_or_else(|| anyhow!("in_ladder_pay did not return a latch batch"))?;
 
         let paid = async {
             let preimage = ssp.execute_pay(invoice, &batch_id).await?;
