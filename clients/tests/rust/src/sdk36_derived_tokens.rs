@@ -120,16 +120,13 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    // V1-LANE TEST: this exercises the `split_coin` primitive (a self-split into FIRST-CLASS sub-coins).
-    // Under V2 a laddered coin splits only IN-LADDER (transfer()/in_ladder_pay → exit-only children), so
-    // `split_coin` refuses a laddered coin (HF-1 / B1). Pin V1 so the derived-token + split_coin path
-    // under test still applies; revisit/migrate/delete when V1 is removed.
-    let mut cfg_a = SdkConfig::regtest("sdk36_alice");
-    cfg_a.deposit_protocol_version = 1;
-    let mut cfg_b = SdkConfig::regtest("sdk36_bob");
-    cfg_b.deposit_protocol_version = 1;
-    let (alice, _) = UtexoWallet::initialize(cfg_a, None).await?;
-    let (bob, _) = UtexoWallet::initialize(cfg_b, None).await?;
+    // V2 (TES-R) DEFAULT: a laddered coin cannot self-split into FIRST-CLASS sub-coins (`split_coin`
+    // is refused [B1] — a prior owner's no-timelock trigger could void it). The V2 replacement is the
+    // IN-LADDER split PAYMENT (`in_ladder_pay` → exit-only children descending from the trigger), which
+    // funds its two child slots from FREE derived tokens exactly as the old split did — so the
+    // derived-token economics under test are identical, now carried by the in-ladder split.
+    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk36_alice"), None).await?;
+    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk36_bob"), None).await?;
     let bob_addr = bob.get_utexo_address().await?;
 
     // ===== (a) SPLIT NEVER TOUCHES THE POOL ======================================================
@@ -139,19 +136,20 @@ pub async fn execute() -> Result<()> {
     // consume this bogus token and die inside deposit/init/pod.
     alice.add_prepaid_token(SENTINEL_TOKEN).await;
 
-    let (piece_id, change_id) = alice.split_coin(&id_a, 15_000).await?;
-    println!("SDK36 - (a) off-chain split with a poisoned pool succeeded: piece {piece_id}, change {change_id}");
-    let piece = coin_by_id(&cc, "sdk36_alice", &piece_id).await?;
+    // V2 in-ladder split PAYMENT: fuses the split with the hand-off — pays bob the 15k piece directly
+    // (piece child conveyed via Model A) and keeps the change, both child slots funded by FREE derived
+    // tokens. Had this wrongly drawn on the onboarding pool it would have consumed the sentinel and
+    // died in deposit/init/pod. Consumes exactly 2 derived tokens against id_a (as `split_coin` did),
+    // so the lifetime-allowance arithmetic in (d3) below is unchanged.
+    let (piece_id, change_id, _latch) = alice
+        .in_ladder_pay(&id_a, &bob_addr, 15_000, mercury_utexo_sdk::transfer::InLadderLatch::None)
+        .await?;
+    println!("SDK36 - (a) in-ladder split payment with a poisoned pool succeeded: piece {piece_id} -> bob, change {change_id}");
+    // The piece left alice's wallet (conveyed to bob); the change stays a confirmed exitable coin.
     let change = coin_by_id(&cc, "sdk36_alice", &change_id).await?;
-    assert_eq!(piece.status, CoinStatus::CONFIRMED);
-    assert_eq!(piece.amount, Some(15_000));
-    assert_eq!(change.status, CoinStatus::CONFIRMED);
+    assert_eq!(change.status, CoinStatus::CONFIRMED, "alice keeps the change as a confirmed coin");
 
-    // The derived-slot piece is an ordinary transferable coin: hand it to bob.
-    mercuryrustlib::transfer_sender::execute(
-        &cc, &bob_addr, "sdk36_alice", &piece_id, None, false, None,
-    )
-    .await?;
+    // bob claims the conveyed piece child directly (in_ladder_pay already conveyed it — no separate transfer).
     let mut bob_got = false;
     for _ in 0..30 {
         let r = bob.claim().await?;

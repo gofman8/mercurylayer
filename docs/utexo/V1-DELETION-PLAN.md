@@ -62,25 +62,40 @@ implementation + test (then port it). Specifically decide:
 
 - **9 of 29 V1-pinned tests removed** (suite compiles green after each): LN core sdk03/05/06 (V2:
   sdk63/64/65/67/68), invalidation sdk26/27 + sats-granularity sdk28 (obsolete under TES-R),
-  exit/terminal sdk07/08/10 (V2: sdk50/58). Commits 617f1af, 7059c72, 33e0c12.
-- **Discovered blocker for the TOKEN tests (sdk36/32, RGB-LN sdk23):** migrating them to V2 fails at
-  `coin ... has a V2 exit ladder and cannot be split [B1]` — the token/derived-token flow splits a coin,
-  which V2 refuses (HF-1). They need the **colored in-ladder split** ported to V2 (the colored analogue
-  of the sats in-ladder split that LN non-exact now uses). That is a substantial feature port, a
-  prerequisite before those tests can migrate. Kept V1-pinned until then.
-- **Migration is per-test, not a bulk unpin:** many tests exercise a V1-only mechanism (`split_coin`
-  double-spend, V1 backup exit) that behaves differently on V2, so each needs adaptation + a live
-  verification run — a large, careful effort, not a sweep.
+  exit/terminal sdk07/08/10 (V2: sdk50/58). Commits 617f1af, 7059c72, 33e0c12. **20 tests remain pinned.**
+- **CORRECTION — the "colored in-ladder split" blocker was a MISDIAGNOSIS.** Re-reading the code: the
+  `[B1]` "cannot be split" guard lives ONLY in the plain-BTC self-split `split_coin`
+  (`clients/libs/rust-sdk/src/transfer.rs:487-509`). The COLORED (RGB) path is entirely separate —
+  `colored_transfer` → `create_colored_split_tx` (`tokens.rs:453` / `rgb.rs:201`) — never calls
+  `split_coin`, so it never hits B1. It already uses free derived tokens + a spend-budget=1 terminal
+  guard. **A colored in-ladder split does not need to be built.** The real remaining work is per-test
+  migration, of three kinds:
+  1. **sats `split_coin` users** (sdk36 derived-deposit-tokens — a *sats* onboarding-token test, not
+     colored): rewrite the `split_coin` + `transfer(piece)` two-step to a single V2 `in_ladder_pay`
+     (`transfer.rs:625`), which already uses derived tokens (so the sentinel-pool assertion survives).
+  2. **V1-aging assertions** (sdk32 tokens-over-time): its premise — a carrier's backup ladder FLOORS
+     after a "year" of idling, creating clawback danger — is exactly what TES-R eliminates (idle coins
+     never age). This needs a V2 REWRITE asserting the OPPOSITE property (idle carrier never ages /
+     never lost), not an unpin.
+  3. **colored path on V2** (sdk23 RGB-LN, colored parts of sdk32): `create_colored_split_tx` +
+     `latch_tokens`/`latch_tokens_se_preimage` already exist; needs a live run to confirm behavior and
+     one open soundness check (splitting a CONVEYED carrier has no B1-style guard — safe for an
+     issuer's own carrier, unverified for a received one).
+- **Migration is per-test, not a bulk unpin:** each test needs adaptation + a live verification run —
+  a large, careful effort, not a sweep. E2E runs cannot be parallelized (one bitcoind/mercury-server,
+  shared `wallet.db` CWD).
 
 ## Remaining work, grouped by what it needs
 
 | Group | Tests | Needs |
 |---|---|---|
-| Token / split-using | sdk32, sdk36, sdk23 | **port the colored in-ladder split to V2** first |
-| LN scenarios | sdk18, sdk19, sdk21, sdk24, sdk25 | port receive-fail/cancel/delayed/remote/RGB-LN to V2 (sdk18 also = the sole batch-expiry test) |
+| sats split_coin → in_ladder_pay | sdk36 | rewrite to `in_ladder_pay` (feature EXISTS; no port) |
+| V1-aging → V2 "never ages" | sdk32 | rewrite assertions to TES-R semantics (no flooring/clawback) |
+| colored path on V2 | sdk23 | live-run `latch_tokens` colored LN on V2; confirm colored split soundness |
+| LN scenarios | sdk18, sdk19, sdk21, sdk24, sdk25 | port receive-fail/cancel/delayed/remote to V2 (sdk18 also = the sole batch-expiry test) |
 | Stale / race (security) | sdk13, sdk14, sdk15 | port the ladder's stale-state + double-sign race to V2 |
 | Adversarial | sdk04, sdk12, sdk20 | adapt (keep agnostic guards, drop V1-split cases covered by sdk58) |
-| Refresh / trust / value-gate | sdk30, sdk33, sdk35, sdk37 | migrate (may hit the split blocker) |
+| Refresh / trust / value-gate | sdk30, sdk33, sdk35, sdk37 | migrate to V2 re-anchor / peek census |
 | OOR / chaos | sdk17, chaos22 | assess / port |
 
 Then: remove the `protocol_version < 2` branches + the `UTEXO_PROTOCOL_DEFAULT` / `deposit_protocol_version`
