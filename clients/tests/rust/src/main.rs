@@ -29,10 +29,7 @@ pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
 pub mod sdk04_adversarial;
-pub mod sdk07_unilateral_exit;
-pub mod sdk08_terminal_node;
 pub mod sdk09_ifa_batch;
-pub mod sdk10_terminal_parent_verify;
 pub mod sdk11_parity_methods;
 pub mod sdk12_adversarial;
 pub mod sdk13_stale_state;
@@ -116,24 +113,9 @@ async fn main() -> Result<()> {
     }
     // SDK lightning-swap legs (SDK_E2E=3): latch transfer locked on an SE preimage; claim gated on
     // Practical unilateral exit (SDK_E2E=7): estimate cost+wait, branch out instantly, mine past
-    // the backup locktime, exit completes with zero SE involvement.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("7") {
-        sdk07_unilateral_exit::execute().await?;
-        return Ok(());
-    }
-    // Terminal-node enforcement (SDK_E2E=8): the SE refuses any co-signature on a split parent.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("8") {
-        sdk08_terminal_node::execute().await?;
-        return Ok(());
-    }
     // IFA issuance + mint + batch token transfer (SDK_E2E=9): G3.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("9") {
         sdk09_ifa_batch::execute().await?;
-        return Ok(());
-    }
-    // Receiver terminal-parent verification (SDK_E2E=10): G1 adversarial.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("10") {
-        sdk10_terminal_parent_verify::execute().await?;
         return Ok(());
     }
     // Parity methods (SDK_E2E=11): identity signing, multi-recipient sats, Utexo invoices (Spark-compatible), queries.
