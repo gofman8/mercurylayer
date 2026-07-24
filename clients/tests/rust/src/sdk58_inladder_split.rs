@@ -116,6 +116,21 @@ pub async fn execute() -> Result<()> {
     ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &other_recv), "G (Model A violated: child state pays not-the-receiver)")?;
     ok(vcb(pa, false, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "H (parent NOT terminal — a rival trigger over F could still be co-signed)")?;
     ok(vcb(pa, parent_terminal, parent_num_sigs, ca, false, child_num_sigs, &receiver), "I (child NOT terminal — a rival state over SP.out[j] could still be co-signed)")?;
+    // J (VALUE-GATE SPOOF): declare a larger `out_value` than `state_child.out[0]` actually pays. A
+    // payer crafting a near-worthless piece while claiming invoice value would pass a value gate that
+    // trusts the declared field (the SSP pre-pay census). verify_child_bundle binds out[0].value to the
+    // declared out_value, so this MUST reject. Proves the value-binding fix by breaking it.
+    {
+        let mut spoof = cb.clone();
+        spoof.child_state.out_value += 10_000;
+        let r = mercuryrustlib::tesr::verify_child_bundle(
+            &spoof, &f_spk_hex,
+            parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
+            child_num_sigs, child_baseline, child_agg.as_deref(), child_terminal,
+            &receiver,
+        );
+        ok(r, "J (value-gate spoof: declared out_value > state_child.out[0].value)")?;
+    }
 
     // ---- THE PAYOFF: exit the child through the FULL pre-co-signed chain; the receiver is paid. -------
     // F -> T -> X_m -> SP -> ext_child -> state_child(receiver). Every tx is already co-signed; the
@@ -138,7 +153,7 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK58 - child EXITED: {} sat landed at the receiver via the pre-signed chain.", cb.child_state.out_value);
 
-    println!("SDK58 - ✓ PASS: split child ACCEPTED; 9 attacks REJECTED (aggregates/hidden-state/Model-A/terminality); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
+    println!("SDK58 - ✓ PASS: split child ACCEPTED; 10 attacks REJECTED (aggregates/hidden-state/Model-A/terminality/value-spoof); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
     Ok(())
 }
 
