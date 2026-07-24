@@ -951,17 +951,54 @@ impl UtexoWallet {
         // paid exactly what the value gate reads, `child_state.out_value`).
         const IN_LADDER_TIER_RESERVE: u64 = 2000;
         let piece_sats = quote.amount_sats + quote.fee_sats + IN_LADDER_TIER_RESERVE;
-        let (_piece_id, _change_id, batch_id) = self
+        let (piece_id, change_id, batch_id) = self
             .in_ladder_pay(parent_statechain_id, &quote.ssp_address, piece_sats, Some(&quote.payment_hash))
             .await?;
         let batch_id = batch_id.ok_or_else(|| anyhow!("in_ladder_pay did not return a latch batch"))?;
-        let preimage = ssp.execute_pay(invoice, &batch_id).await?;
-        use sha2::{Digest, Sha256};
-        let digest = hex::encode(Sha256::digest(hex::decode(&preimage)?));
-        if digest != quote.payment_hash {
-            return Err(anyhow!("SSP returned an invalid preimage"));
+
+        let paid = async {
+            let preimage = ssp.execute_pay(invoice, &batch_id).await?;
+            use sha2::{Digest, Sha256};
+            let digest = hex::encode(Sha256::digest(hex::decode(&preimage)?));
+            if digest != quote.payment_hash {
+                return Err(anyhow!("SSP returned an invalid preimage"));
+            }
+            Ok::<_, anyhow::Error>(preimage)
         }
-        Ok(preimage)
+        .await;
+
+        // ROLLBACK on failure: the split is un-broadcast, so on an LN-pay failure the OPTIMISTIC booking
+        // (parent WITHDRAWN, change CONFIRMED) is wrong — realizing the change means broadcasting SP,
+        // which hands the SSP the piece for nothing. Restore the parent as exitable and drop the
+        // conveyed piece + optimistic change so the user recovers the WHOLE parent (via unilateral exit,
+        // trusting the SSP not to broadcast SP first — the exact-lane operator-trust bar; re-transfer is
+        // orphan-bricked until a refresh, but the value is intact).
+        if paid.is_err() {
+            self.rollback_inladder_split(parent_statechain_id, &piece_id, &change_id).await?;
+        }
+        paid
+    }
+
+    /// Undo an un-broadcast in-ladder split whose latched LN pay failed: restore the parent to
+    /// CONFIRMED (exitable) and drop the conveyed piece + optimistic change bookings.
+    async fn rollback_inladder_split(
+        &self,
+        parent_statechain_id: &str,
+        piece_child_sid: &str,
+        change_child_sid: &str,
+    ) -> Result<()> {
+        let mut record = self.record().await?;
+        record.coins.retain(|c| {
+            let sid = c.statechain_id.as_deref();
+            sid != Some(piece_child_sid) && sid != Some(change_child_sid)
+        });
+        for coin in record.coins.iter_mut() {
+            if coin.statechain_id.as_deref() == Some(parent_statechain_id) && coin.duplicate_index == 0 {
+                coin.status = mercuryrustlib::CoinStatus::CONFIRMED;
+            }
+        }
+        self.save_record(&record).await?;
+        Ok(())
     }
 
     /// USER SIDE — receive Lightning into a statechain coin via an SSP: returns a BOLT11 invoice
