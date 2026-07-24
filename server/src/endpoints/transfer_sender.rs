@@ -146,7 +146,7 @@ pub async fn transfer_sender(statechain_entity: &State<StateChainEntity>, transf
     // already-conveyed (victim-accepted) transfer to an attacker key it controls — the self-reopen
     // re-address vector the child-firstclass review found. A same-auth retry is allowed (idempotent).
     // Fail CLOSED on a DB error.
-    match crate::database::transfer_sender::has_open_transfer_to_other_auth(&statechain_entity.pool, &statechain_id, &new_user_auth_key).await {
+    match crate::database::transfer_sender::has_open_transfer_to_other_auth(&statechain_entity.pool, &statechain_id, &new_user_auth_key, crate::server_config::ServerConfig::load().batch_timeout as i64).await {
         Ok(true) => {
             return status::Custom(
                 Status::Conflict,

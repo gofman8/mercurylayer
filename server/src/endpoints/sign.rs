@@ -145,7 +145,7 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
     // TOCTOU where a still-owner sender co-signs a lower-CSV rival that out-races the receiver's conveyed
     // state, and the dangling sign/first + late sign/second variant. Fail CLOSED on a DB error like the
     // other gates. Expiry is inside the query (never-claimed transfers release after an hour; no victim).
-    match crate::database::transfer_sender::has_open_transfer(&statechain_entity.pool, &statechain_id).await {
+    match crate::database::transfer_sender::has_open_transfer(&statechain_entity.pool, &statechain_id, crate::server_config::ServerConfig::load().batch_timeout as i64).await {
         Ok(true) => {
             return status::Custom(
                 Status::Conflict,
@@ -320,7 +320,7 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
     // this coin is open. Enforced at sign_second (not only sign_first) so a sender that opened sign_first
     // BEFORE the transfer cannot complete the dangling session AFTER it to slot a lower-CSV rival — the
     // gates must hold at the moment the signature is ISSUED. Fail CLOSED on a DB error.
-    match crate::database::transfer_sender::has_open_transfer(&statechain_entity.pool, &statechain_id).await {
+    match crate::database::transfer_sender::has_open_transfer(&statechain_entity.pool, &statechain_id, crate::server_config::ServerConfig::load().batch_timeout as i64).await {
         Ok(true) => {
             return status::Custom(
                 Status::Conflict,

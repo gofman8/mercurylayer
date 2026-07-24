@@ -57,13 +57,21 @@ pub async fn get_batch_time_by_batch_id(pool: &sqlx::PgPool, batch_id: &str) -> 
 /// cannot co-sign a lower-CSV rival that would out-race the receiver's conveyed state. Expiry only affects
 /// the never-claimed case (no victim: an unclaimed payment was never accepted). Returns Result so the
 /// sign gate can FAIL CLOSED on a DB error, exactly like the single-use/budget/epoch gates.
-pub async fn has_open_transfer(pool: &sqlx::PgPool, statechain_id: &str) -> Result<bool, sqlx::Error> {
+pub async fn has_open_transfer(pool: &sqlx::PgPool, statechain_id: &str, batch_timeout_secs: i64) -> Result<bool, sqlx::Error> {
+    // A BATCH (Lightning-latch) transfer is only "open" until its batch expires: once `batch_time +
+    // batch_timeout` passes, the receiver can NEVER complete it (no preimage arrived), so the sender's
+    // reclaim is legitimate and must be allowed to co-sign — otherwise the 1-hour window would wedge the
+    // coin between the (120s) batch_timeout and 1h. Non-batch (P2P / child-firstclass) transfers have
+    // `batch_id IS NULL` and keep the full 1-hour lock. `batch_id IS NULL` short-circuits so a null
+    // `batch_time` is never compared.
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM statechain_transfer \
          WHERE statechain_id = $1 AND key_updated = false \
-         AND updated_at > NOW() - INTERVAL '1 hour')",
+         AND updated_at > NOW() - INTERVAL '1 hour' \
+         AND (batch_id IS NULL OR batch_time > NOW() - make_interval(secs => $2::int)))",
     )
     .bind(statechain_id)
+    .bind(batch_timeout_secs)
     .fetch_one(pool)
     .await?;
     Ok(row.get::<bool, _>(0))
@@ -78,15 +86,20 @@ pub async fn has_open_transfer_to_other_auth(
     pool: &sqlx::PgPool,
     statechain_id: &str,
     new_user_auth: &PublicKey,
+    batch_timeout_secs: i64,
 ) -> Result<bool, sqlx::Error> {
+    // Same batch-expiry scoping as `has_open_transfer`: an expired-batch transfer no longer blocks a
+    // re-address (the sender's reclaim to its own key after the swap window is legitimate).
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM statechain_transfer \
          WHERE statechain_id = $1 AND key_updated = false \
          AND updated_at > NOW() - INTERVAL '1 hour' \
+         AND (batch_id IS NULL OR batch_time > NOW() - make_interval(secs => $3::int)) \
          AND new_user_auth_public_key <> $2)",
     )
     .bind(statechain_id)
     .bind(new_user_auth.serialize())
+    .bind(batch_timeout_secs)
     .fetch_one(pool)
     .await?;
     Ok(row.get::<bool, _>(0))

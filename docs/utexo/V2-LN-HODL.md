@@ -40,15 +40,19 @@ Decision produced by an understand → design(×4) → adversarial-verify(×4 le
   now work for V2 exact amounts.
 - **Verified scope:** the EXACT-amount PAY + RECEIVE **success paths** (no split). The non-exact lanes
   (in-ladder split feeding the latch) are the next unit.
-- **⚠️ ROLLBACK (failure path) is worse than V1 — precisely characterized (correction).** On a V1 pay
-  failure, `reclaim_lightning_payment` (a self-transfer back to the user) returns a fully re-usable
-  coin (sdk18). On V2 it does NOT: the failed latch already co-signed the orphan `S'` (sig_count +1,
-  recorded nowhere locally), so the reclaim's self-transfer conveys a ladder whose disclosed tiers are
-  one short of the enclave `sig_count`, and `verify_bundle` at claim REJECTS — the **off-chain reclaim
-  bricks.** Funds are still SAFE: the user recovers via `unilateral_exit` (on-chain, uses the
-  pre-signed original ladder, not `verify_bundle`), under the same operator-trust that the SSP will not
-  broadcast the conveyed `S'` (V1 bar). Net: **success path = no worse than V1; failure path costs an
-  on-chain exit** until the orphan is reconciled.
+- **ROLLBACK (failure path) — handled, on-chain-recoverable (sdk66/sdk68).** On a V1 pay failure,
+  `reclaim_lightning_payment` (a self-transfer) returns a fully re-usable coin (sdk18). On V2 the naive
+  self-transfer BRICKS — the failed latch already co-signed the orphan `S'` (sig_count +1), so the
+  reclaim's own presign leaves the disclosed ladder one tier short of the enclave `sig_count` and
+  `verify_bundle` rejects. Fixed by direction:
+  - **Non-exact PAY** (`sdk66`): the split is un-broadcast, so `pay_lightning_invoice_inladder` rolls
+    back the optimistic booking — the user recovers the WHOLE parent.
+  - **Whole-coin exact PAY** (`sdk68`): `reclaim_lightning_payment` detects a V2 coin and restores it
+    locally as exitable instead of the bricking self-transfer.
+  Both leave the coin recoverable via `unilateral_exit` (on-chain, at the same operator-trust bar the
+  success path uses). **Residual:** re-transfer stays orphan-bricked until a `refresh()` re-anchor; full
+  OFF-chain reuse (V1 parity on the failure path) needs a scoped coordinator-side `sig_count` reconcile
+  — security-sensitive, its own review, tracked below.
 - **The clean fix (scoped SE reconcile — the real "no worse than V1" for the failure path):** on an
   authenticated reclaim of a rolled-back latch, the SE decrements the coin's `sig_count` by exactly the
   orphan `S'` it co-signed for that batch (bounded, single-use, batch-scoped), so the reclaim's
