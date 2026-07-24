@@ -125,8 +125,8 @@ impl UtexoWallet {
                 .await?
                 .is_some()
                 {
-                    let (piece_id, _change_id) = self
-                        .in_ladder_pay(&split_coin_id, receiver_address, split_amount)
+                    let (piece_id, _change_id, _batch) = self
+                        .in_ladder_pay(&split_coin_id, receiver_address, split_amount, None)
                         .await?;
                     inladder_piece = Some((piece_id, split_amount));
                     // `ids` = the whole coins (still handed over below); the piece is already conveyed.
@@ -595,16 +595,25 @@ impl UtexoWallet {
     /// ladder pays the recipient (Model A), and the CHANGE, paying this wallet back. The piece child
     /// bundle is conveyed to `recipient_address` via the mailbox (`convey_child_bundle`); the recipient's
     /// claim() adopts it with `verify_child_bundle`. The change child bundle is persisted locally as an
-    /// exitable claim. Returns `(piece_child_sid, change_child_sid)`.
+    /// exitable claim. Returns `(piece_child_sid, change_child_sid, latch_batch_id)`.
     ///
     /// Value is conserved by the split builder: `piece + change == tier_out_total(X_m.out[0], 2)`, so
     /// `change` is derived (not free) and `piece` must leave room for a viable change output.
+    ///
+    /// `latch_hash = Some(payment_hash)` makes this a **non-exact Lightning PAY** (V2-LN-HODL.md §2b):
+    /// the PIECE child is registered under an external-hash latch bound to the invoice and conveyed
+    /// batch-locked, so an SSP can identify + census it (`verify_conveyed_child`) before paying. The
+    /// piece then sits at the same operator-trust bar as the exact-lane `S'` (the SSP can exit the
+    /// conveyed piece regardless of payment — bounded to the piece; the change is self-owned and
+    /// trustless; no double-recovery, both share `X_m.out[0]`). Returns the latch `batch_id` (3rd tuple
+    /// element) for `execute_pay`; `None` when `latch_hash` is `None` (a plain in-ladder payment).
     pub async fn in_ladder_pay(
         &self,
         parent_statechain_id: &str,
         recipient_address: &str,
         piece_sats: u64,
-    ) -> Result<(String, String)> {
+        latch_hash: Option<&str>,
+    ) -> Result<(String, String, Option<String>)> {
         let network = self.inner.config.network.to_string();
         let bundle = mercuryrustlib::tesr::load(
             &self.inner.cc,
@@ -666,12 +675,34 @@ impl UtexoWallet {
         let piece_bundle = &bundles[0];
         let change_bundle = &bundles[1];
 
+        // [non-exact LN latch, V2-LN-HODL.md §2b] If a payment hash is given, register the external-hash
+        // latch on the PIECE child (so the SSP finds it via the batch and censuses it pre-pay) BEFORE
+        // conveying, and book the piece IN_TRANSFER so `create_external_hash_latch`'s CONFIRMED|IN_TRANSFER
+        // status check passes and the piece stays a valid latched-pending coin (not WITHDRAWN) the SSP
+        // adopts once it pays. Latch first, then convey: convey's `get_new_x1` runs `insert_new_transfer`,
+        // which marks the child mailbox row a lightning latch only if the latch row already exists.
+        let piece_sid = piece_child.statechain_id.clone().unwrap_or_default();
+        let latch_batch: Option<String> = if let Some(hash) = latch_hash {
+            self.set_coin_status(&piece_sid, CoinStatus::IN_TRANSFER).await?;
+            let batch_id = mercuryrustlib::lightning_latch::create_external_hash_latch(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &piece_sid,
+                hash,
+            )
+            .await?;
+            Some(batch_id)
+        } else {
+            None
+        };
+
         // Convey the piece child to the recipient's mailbox (auth = the piece slot we own).
         mercuryrustlib::tesr::convey_child_bundle(
             &self.inner.cc,
             recipient_address,
             &children[0].0,
             piece_bundle,
+            latch_batch.clone(),
         )
         .await?;
 
@@ -688,19 +719,36 @@ impl UtexoWallet {
                 deserialize(&hex::decode(&change_bundle.parent.current().state.signed_tx)?)?;
             sp.txid().to_string()
         };
+        // A latched piece stays IN_TRANSFER (conveyed but pending payment; the SSP adopts on pay); a
+        // plain conveyed piece is WITHDRAWN (given away outright).
+        let piece_status = if latch_batch.is_some() {
+            CoinStatus::IN_TRANSFER
+        } else {
+            CoinStatus::WITHDRAWN
+        };
         self.book_inladder_split_coins(
             parent_statechain_id,
             &sp_txid,
-            piece_child.statechain_id.as_deref().unwrap_or_default(),
+            &piece_sid,
             change_child.statechain_id.as_deref().unwrap_or_default(),
             change_sats,
+            piece_status,
         )
         .await?;
 
-        Ok((
-            piece_child.statechain_id.clone().unwrap_or_default(),
-            change_child.statechain_id.clone().unwrap_or_default(),
-        ))
+        Ok((piece_sid, change_child.statechain_id.clone().unwrap_or_default(), latch_batch))
+    }
+
+    /// Set a single coin's status by statechain_id in the local wallet db.
+    async fn set_coin_status(&self, statechain_id: &str, status: CoinStatus) -> Result<()> {
+        let mut record = self.record().await?;
+        for coin in record.coins.iter_mut() {
+            if coin.statechain_id.as_deref() == Some(statechain_id) {
+                coin.status = status.clone();
+            }
+        }
+        self.save_record(&record).await?;
+        Ok(())
     }
 
     /// Create one SE-registered child slot funded by a derived token, returning its `Coin` (with
@@ -732,6 +780,7 @@ impl UtexoWallet {
         piece_child_sid: &str,
         change_child_sid: &str,
         change_sats: u64,
+        piece_status: CoinStatus,
     ) -> Result<()> {
         let mut record = self.record().await?;
         for coin in record.coins.iter_mut() {
@@ -740,8 +789,9 @@ impl UtexoWallet {
                     coin.status = CoinStatus::WITHDRAWN;
                 }
                 Some(sid) if sid == piece_child_sid => {
-                    // Value conveyed to the recipient — no longer this wallet's to spend.
-                    coin.status = CoinStatus::WITHDRAWN;
+                    // Plain conveyance: value given to the recipient (WITHDRAWN). Latched LN piece:
+                    // IN_TRANSFER (conveyed but pending payment; the SSP adopts it once it pays).
+                    coin.status = piece_status.clone();
                 }
                 Some(sid) if sid == change_child_sid => {
                     coin.utxo_txid = Some(sp_txid.to_string());

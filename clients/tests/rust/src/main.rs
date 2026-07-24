@@ -89,6 +89,7 @@ pub mod sdk58_inladder_split;
 pub mod sdk59_inladder_pay;
 pub mod sdk63_v2_lightning_pay;
 pub mod sdk64_v2_lightning_receive;
+pub mod sdk65_inladder_lightning_pay;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -415,6 +416,10 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("64") {
         sdk64_v2_lightning_receive::execute().await?;
+        return Ok(());
+    }
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("65") {
+        sdk65_inladder_lightning_pay::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

@@ -378,15 +378,36 @@ pub async fn peek_pending_transfers(
                 .backup_transactions
                 .iter()
                 .find_map(|b| b.rgb_consignment.clone());
-            // PRE-PAY LADDER CENSUS (V2-LN-HODL.md §2 PAY). A V2/TES-R coin conveys an exit ladder;
-            // it is only safe for a paying party (the SSP) to accept BEFORE paying if the ladder
-            // satisfies `verify_bundle`'s `se_num_sigs == v1_backups + tiers` against the coin's LIVE
-            // enclave sig-count — otherwise the sender may hold a hidden lower-CSV state that out-races
-            // the conveyed S' after the irreversible Lightning leg. This is the exact census the
-            // receiver runs at claim time (transfer_receiver.rs ~:619), hoisted ahead of payment. V1
-            // coins have no ladder → trivially ok. Fail CLOSED on any read/parse failure.
-            let ladder_census_ok = if transfer_msg.protocol_version >= 2 {
-                match transfer_msg.tesr_ladder.as_ref() {
+            // PRE-PAY CENSUS (V2-LN-HODL.md §2/§2b). A paying party (the SSP) must validate a conveyed
+            // coin BEFORE the irreversible Lightning leg. Two shapes:
+            //   * a flat V2/TES-R ladder → `verify_bundle` (`num_sigs == v1_backups + tiers` vs the LIVE
+            //     enclave sig-count), catching a hidden lower-CSV state that would out-race the conveyed
+            //     S' after payment;
+            //   * an in-ladder-split CHILD bundle (non-exact PAY, protocol_version 3) →
+            //     `verify_conveyed_child` (child pays THIS wallet's key + parent/child census +
+            //     terminality). Its returned value is the trustworthy piece amount (value-binding fix),
+            //     so it OVERRIDES the branch-derived sats `amount` (a child has no on-chain funding to
+            //     read). The receiver runs the same census at claim time; this hoists it ahead of pay.
+            // V1 coins have no ladder → trivially ok. Fail CLOSED on any parse/read failure.
+            let (ladder_census_ok, child_amount) = if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
+                let backup = wallet
+                    .coins
+                    .iter()
+                    .find(|c| &c.auth_pubkey == auth_pubkey)
+                    .and_then(|c| {
+                        mercurylib::transaction::get_user_backup_address(c, wallet.network.clone()).ok()
+                    });
+                match (serde_json::from_str::<crate::tesr::ChildTesrBundle>(cb_json), backup) {
+                    (std::result::Result::Ok(cb), Some(bk)) => {
+                        match crate::tesr::verify_conveyed_child(client_config, &bk, &cb).await {
+                            std::result::Result::Ok(v) => (true, Some(v)),
+                            Err(_) => (false, None),
+                        }
+                    }
+                    _ => (false, None),
+                }
+            } else if transfer_msg.protocol_version >= 2 {
+                let ok = match transfer_msg.tesr_ladder.as_ref() {
                     Some(ladder_json) => match serde_json::from_str::<crate::tesr::TesrBundle>(ladder_json) {
                         std::result::Result::Ok(bundle) => {
                             match crate::utils::get_statechain_info(&transfer_msg.statechain_id, client_config).await {
@@ -402,10 +423,12 @@ pub async fn peek_pending_transfers(
                         Err(_) => false,
                     },
                     None => false,
-                }
+                };
+                (ok, None)
             } else {
-                true
+                (true, None)
             };
+            let amount = child_amount.unwrap_or(amount);
             out.push(PendingTransferInfo {
                 statechain_id: transfer_msg.statechain_id,
                 amount,

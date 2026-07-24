@@ -17,6 +17,15 @@ Decision produced by an understand → design(×4) → adversarial-verify(×4 le
   SSP over a live channel, census passing both pre-pay and at claim. `sdk37` (SSP value gate) GREEN =
   no regression; `sdk53` repurposed to pin that the guard is lifted; `sdk03` (V1 latch) GREEN.
   Commits: `b5aad4e` (census) + the guard-lift/sdk63.
+- **NON-EXACT PAY on V2 — LANDED + VERIFIED.** `sdk65` GREEN: a NON-EXACT BOLT11 paid from a single V2
+  coin via a latched in-ladder split — the piece child was censused (`verify_conveyed_child`) BEFORE
+  `send_payment` and adopted by the SSP after; the change stayed with the user (SSP owns 27 000, user
+  change 21 450, merchant paid). Steps 1–5 landed: `batch_id` threaded through `convey_child_bundle`; a
+  latched `in_ladder_pay` (piece booked IN_TRANSFER + external-hash latch); a CHILD-bundle branch in
+  `peek_pending_transfers` (`verify_conveyed_child`, fail-closed, value from the parsed piece);
+  `pay_lightning_invoice_inladder`. No adoption latch gate is needed — the conveyed child is inherently
+  broadcastable by the SSP (`exit_child_pass`), so the piece is at the exact-lane operator-trust bar
+  (Step-0 value-binding fix + census close rob-SSP). **V2 wallets can now pay arbitrary amounts over LN.**
 - **RECEIVE on V2 — LANDED + VERIFIED.** `sdk64` GREEN: a zero-on-chain wallet receives a real LN
   payment as a V2 (TES-R laddered) coin — the SSP fronts an exact V2 coin (guard lifted), the HODL
   HTLC is held, and `settle_receive`'s coordinated clock gates the SE preimage on coin release. No

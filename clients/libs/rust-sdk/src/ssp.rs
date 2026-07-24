@@ -930,6 +930,40 @@ impl UtexoWallet {
         latch_and_pay.map_err(|e| (coin_id, e))
     }
 
+    /// USER SIDE — pay a BOLT11 for a NON-EXACT amount from a single V2 (TES-R) laddered coin
+    /// (V2-LN-HODL.md §2b). Splits `parent_statechain_id` IN-LADDER into a PIECE that pays the SSP
+    /// (sized to cover the invoice + fee + the piece's own exit-tier reserve) and a CHANGE that stays
+    /// self-owned, latches the piece to the invoice hash, and lets the SSP census + pay it. The piece
+    /// sits at the same operator-trust bar as the exact lane (`S'`); the change is trustless. On failure
+    /// the change is retained and the piece dies with the un-broadcast split (recover the parent value).
+    pub async fn pay_lightning_invoice_inladder(
+        &self,
+        ssp: &impl Ssp,
+        invoice: &str,
+        parent_statechain_id: &str,
+    ) -> Result<String> {
+        let quote = ssp.quote_pay(invoice).await?;
+        if quote.asset_id.is_some() {
+            return Err(anyhow!("RGB non-exact in-ladder Lightning pay is not supported yet"));
+        }
+        // The piece's OWN exit consumes two tier fees (ext + state) before it pays the SSP, so oversize
+        // the piece funding by a tier reserve; any surplus accrues to the piece (self-safe — the SSP is
+        // paid exactly what the value gate reads, `child_state.out_value`).
+        const IN_LADDER_TIER_RESERVE: u64 = 2000;
+        let piece_sats = quote.amount_sats + quote.fee_sats + IN_LADDER_TIER_RESERVE;
+        let (_piece_id, _change_id, batch_id) = self
+            .in_ladder_pay(parent_statechain_id, &quote.ssp_address, piece_sats, Some(&quote.payment_hash))
+            .await?;
+        let batch_id = batch_id.ok_or_else(|| anyhow!("in_ladder_pay did not return a latch batch"))?;
+        let preimage = ssp.execute_pay(invoice, &batch_id).await?;
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(hex::decode(&preimage)?));
+        if digest != quote.payment_hash {
+            return Err(anyhow!("SSP returned an invalid preimage"));
+        }
+        Ok(preimage)
+    }
+
     /// USER SIDE — receive Lightning into a statechain coin via an SSP: returns a BOLT11 invoice
     /// to hand to the payer. When it is paid, the SSP releases the coin and the background
     /// watcher claims it (TransferClaimed event). `ssp` may be local or remote.

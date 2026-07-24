@@ -575,6 +575,7 @@ pub async fn convey_child_bundle(
     recipient_address: &str,
     child_coin: &Coin,
     cb: &ChildTesrBundle,
+    batch_id: Option<String>,
 ) -> Result<()> {
     let statechain_id = child_coin
         .statechain_id
@@ -592,12 +593,18 @@ pub async fn convey_child_bundle(
     // call it to CREATE the mailbox row (the returned x1 is unused — the child pre-pays the receiver's
     // key, no blinding needed). Without this the update_msg silently no-ops (0 rows) and the receiver
     // never sees the message.
+    //
+    // [non-exact LN latch, V2-LN-HODL.md Step 1] `batch_id = Some` makes the child mailbox row born
+    // batch-locked: `insert_new_transfer` sets locked=true and locked2=is_lightning_latch, so the
+    // receiver (SSP) must not adopt the piece until the LN preimage flips locked2 via
+    // `unlock_by_preimage`. The piece sid must already carry an external-hash latch (registered by the
+    // latched `in_ladder_pay`) for the server to mark the row a lightning latch.
     crate::transfer_sender::get_new_x1(
         cc,
         statechain_id,
         signed_statechain_id,
         &recipient_auth_pubkey.to_string(),
-        None,
+        batch_id,
     )
     .await?;
 
