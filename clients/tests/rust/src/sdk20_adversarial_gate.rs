@@ -50,8 +50,9 @@ async fn fund(
 }
 
 pub async fn execute() -> Result<()> {
-    // LN swaps require a V1 coin until adaptor-sig LN lands (V2-MIGRATION-PLAN); pin regardless of the V2 default.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default. The pre-pay SSP gate under test (recipient + census + value)
+    // is already V2-aware; conveying an EXACT-amount V2 coin also exercises the pre-pay verify_bundle
+    // ladder census that the V1 lane could not — strengthening the test at no cost.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -69,11 +70,27 @@ pub async fn execute() -> Result<()> {
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_alice"), None).await?;
     let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_bob"), None).await?;
     let bob_address = bob.get_utexo_address().await?;
-    fund(&cc, &alice, 100_000).await?;
-    // alice needs split slots to mint exact coins.
-    for _ in 0..4 {
-        let t = prepaid_token(&cc).await?;
-        alice.add_prepaid_token(&t).await;
+    // alice holds TWO EXACT V2 (TES-R) coins so `ensure_exact_coin(25_000)` / `(10_000)` each return a
+    // coin WHOLE (early exact-match, no split — V2 refuses splitting a laddered coin [B1]). The
+    // in-ladder split uses FREE derived tokens, so the old "split slots" prepaid top-up is gone.
+    let t = prepaid_token(&cc).await?;
+    alice.add_prepaid_token(&t).await;
+    let addr = alice.get_deposit_address(25_000).await?;
+    bitcoin_core::sendtoaddress(25_000, &addr)?;
+    let t = prepaid_token(&cc).await?;
+    alice.add_prepaid_token(&t).await;
+    let addr = alice.get_deposit_address(10_000).await?;
+    bitcoin_core::sendtoaddress(10_000, &addr)?;
+    let core = bitcoin_core::getnewaddress()?;
+    bitcoin_core::generatetoaddress(3, &core)?;
+    let mut waited = 0;
+    while alice.get_balance().await?.available_sats != 35_000 {
+        alice.claim().await?;
+        waited += 1;
+        if waited > 60 {
+            return Err(anyhow!("alice's exact deposits did not confirm"));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
     println!("SDK20 - SSP + attacker(alice) + third-party(bob) ready");
 

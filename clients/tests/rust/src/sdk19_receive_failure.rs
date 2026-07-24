@@ -22,34 +22,32 @@ pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
-    // V1-LANE TEST: exercises mint-via-split / branch receive-failure cases (V1 mechanisms). V2 splits
-    // only IN-LADDER (exit-only children), so split_coin refuses a laddered coin. Pin V1 until V1 deleted.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default. RECEIVE works on V2 via the HODL latch (sdk64/sdk67); the
+    // receive-FAILURE (withholding) property is SE-side and protocol-agnostic.
     let cc = mercuryrustlib::client_config::load().await;
 
     let (_payer_node, ssp_node) = rln::setup_ln_pair("/tmp/rln-sdk19").await?;
     println!("SDK19 - LN pair up");
 
-    // SSP fronts the coin.
+    // SSP fronts an EXACT-amount V2 (TES-R) coin so create_receive -> ensure_exact_coin returns it
+    // whole (no in-ladder split) — isolates the receive-failure/withholding property from the split
+    // machinery (mirrors sdk64). In-ladder split uses FREE derived tokens; no "split slots" top-up.
+    let amount: u64 = 20_000;
     let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk19_ssp"), None).await?;
     let t = prepaid_token(&cc).await?;
     ssp_wallet.add_prepaid_token(&t).await;
-    let addr = ssp_wallet.get_deposit_address(100_000).await?;
-    bitcoin_core::sendtoaddress(100_000, &addr)?;
+    let addr = ssp_wallet.get_deposit_address(amount).await?;
+    bitcoin_core::sendtoaddress(amount as u32, &addr)?;
     let core = bitcoin_core::getnewaddress()?;
     bitcoin_core::generatetoaddress(3, &core)?;
     let mut waited = 0;
-    while ssp_wallet.get_balance().await?.available_sats != 100_000 {
+    while ssp_wallet.get_balance().await?.available_sats != amount {
         ssp_wallet.claim().await?;
         waited += 1;
         if waited > 60 {
             return Err(anyhow!("SSP deposit did not confirm"));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    for _ in 0..2 {
-        let t = prepaid_token(&cc).await?;
-        ssp_wallet.add_prepaid_token(&t).await;
     }
     let ssp = SspService::new(ssp_wallet, RlnClient::new(&ssp_node.api), 0);
     let ssp_before = ssp.wallet.get_balance().await?.available_sats;

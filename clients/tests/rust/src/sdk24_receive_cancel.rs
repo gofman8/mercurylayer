@@ -28,8 +28,9 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
 }
 
 pub async fn execute() -> Result<()> {
-    // LN swaps require a V1 coin until adaptor-sig LN lands (V2-MIGRATION-PLAN); pin regardless of the V2 default.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default. RECEIVE works on V2 via the HODL latch (sdk64/sdk67); the
+    // cancel/abort path (create_lightning_invoice / cancel_receive / retrieve_pre_image) is SE-side
+    // and protocol-agnostic.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -41,25 +42,25 @@ pub async fn execute() -> Result<()> {
 
     // SSP: funded statechain wallet (fronts the coin) + its RLN node.
     let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk24_ssp"), None).await?;
+    // SSP fronts an EXACT-amount V2 (TES-R) coin so create_receive -> ensure_exact_coin returns it
+    // whole (no in-ladder split) — this isolates the receive-cancel/abort property from the split
+    // machinery (mirrors sdk64's happy-path funding). The in-ladder split uses FREE derived tokens,
+    // so the old "2 split slots" prepaid top-up is no longer needed.
+    let amount: u64 = 20_000;
     let t = prepaid_token(&cc).await?;
     ssp_wallet.add_prepaid_token(&t).await;
-    let addr = ssp_wallet.get_deposit_address(100_000).await?;
-    bitcoin_core::sendtoaddress(100_000, &addr)?;
+    let addr = ssp_wallet.get_deposit_address(amount).await?;
+    bitcoin_core::sendtoaddress(amount as u32, &addr)?;
     let core = bitcoin_core::getnewaddress()?;
     bitcoin_core::generatetoaddress(3, &core)?;
     let mut waited = 0;
-    while ssp_wallet.get_balance().await?.available_sats != 100_000 {
+    while ssp_wallet.get_balance().await?.available_sats != amount {
         ssp_wallet.claim().await?;
         waited += 1;
         if waited > 60 {
             return Err(anyhow!("SSP deposit did not confirm"));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-    // The receive swap mints the exact 20k coin off-chain (2 split slots).
-    for _ in 0..2 {
-        let t = prepaid_token(&cc).await?;
-        ssp_wallet.add_prepaid_token(&t).await;
     }
     let ssp = SspService::new(ssp_wallet, RlnClient::new(&ssp_node.api), 0);
     println!("SDK24 - SSP funded: {} sats", ssp.wallet.get_balance().await?.available_sats);
