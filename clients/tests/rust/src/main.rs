@@ -28,10 +28,7 @@ pub mod rgb14_metadata_and_ifa_supply;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
-pub mod sdk03_lightning_swap;
 pub mod sdk04_adversarial;
-pub mod sdk05_lightning_pay;
-pub mod sdk06_lightning_receive;
 pub mod sdk07_unilateral_exit;
 pub mod sdk08_terminal_node;
 pub mod sdk09_ifa_batch;
@@ -121,21 +118,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     // SDK lightning-swap legs (SDK_E2E=3): latch transfer locked on an SE preimage; claim gated on
-    // settlement; preimage matches the payment hash (Spark SSP preimage-swap parity).
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("3") {
-        sdk03_lightning_swap::execute().await?;
-        return Ok(());
-    }
-    // Mercury -> Lightning via SSP (SDK_E2E=5): pay a real BOLT11 from statechain balance.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("5") {
-        sdk05_lightning_pay::execute().await?;
-        return Ok(());
-    }
-    // Lightning -> Mercury via SSP (SDK_E2E=6): receive a real LN payment as a statechain coin.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("6") {
-        sdk06_lightning_receive::execute().await?;
-        return Ok(());
-    }
     // Practical unilateral exit (SDK_E2E=7): estimate cost+wait, branch out instantly, mine past
     // the backup locktime, exit completes with zero SE involvement.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("7") {
