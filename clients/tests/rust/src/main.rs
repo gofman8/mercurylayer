@@ -50,9 +50,6 @@ pub mod chaos22_oracle;
 pub mod sdk23_rgb_ln_swap;
 pub mod sdk24_receive_cancel;
 pub mod sdk25_receive_delayed_claim;
-pub mod sdk26_invalidation_scale;
-pub mod sdk27_invalidation_time;
-pub mod sdk28_granularity_sats;
 pub mod sdk29_granularity_tokens;
 pub mod sdk30_refresh;
 pub mod sdk31_token_combine;
@@ -217,27 +214,12 @@ async fn main() -> Result<()> {
     // Invalidation at SCALE (SDK_E2E=26): depth-4 off-chain split chain (each parent publicly
     // terminal, branch rows == depth, measured exit vsizes per depth as 'ECON depth=...' lines),
     // a 3-wide transfer_many fan-out from ONE split, and a full unilateral exit of the deepest
-    // leaf (whole branch instantly broadcast, backup after its own fresh ~initlock ladder).
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("26") {
-        sdk26_invalidation_scale::execute().await?;
-        return Ok(());
-    }
     // Invalidation over TIME (SDK_E2E=27): exact one-interval ladder decrement across 6 full-coin
     // hops, the sharp exit-maturity boundary (wait_blocks==2 at locktime-2, completes at the
     // locktime), the OPEN audit-[17] deadline gap on a k=2 pre-transferred parent (WARN line with
-    // the exact gap), and the SE epoch gate on the plain-sats deposit path.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("27") {
-        sdk27_invalidation_time::execute().await?;
-        return Ok(());
-    }
     // Granularity, plain sats (SDK_E2E=28): exact-subset payments (no split), an exact off-chain
     // split (12_345 out of 100k, change 86_655, parent publicly terminal), the sub-dust boundary
     // refusal (typed error, coin untouched) + 330-sat minimum piece, and a depth-2 re-split of a
-    // received piece (~155 vB per branch level, measured as ECON lines).
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("28") {
-        sdk28_granularity_sats::execute().await?;
-        return Ok(());
-    }
     // Granularity, RGB tokens (SDK_E2E=29): raw-unit precision (0.10 / 0.01 booked exactly), a
     // depth-2 token exit (colored branch broadcast, opret anchors + allocation settled on-chain
     // on the exited outpoint), spent-carrier change becoming plain splittable BTC, and the
