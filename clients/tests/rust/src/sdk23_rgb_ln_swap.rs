@@ -47,8 +47,9 @@ async fn fund_and_utxos(node: &rln::RlnNode, client: &RlnClient) -> Result<()> {
 }
 
 pub async fn execute() -> Result<()> {
-    // LN swaps require a V1 coin until adaptor-sig LN lands (V2-MIGRATION-PLAN); pin regardless of the V2 default.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default: this is an RGB-asset-over-Lightning swap on the RLN rail
+    // (RlnClient) and touches no statechain coin, so it is protocol-agnostic. (LN over V2 works
+    // fully via the HODL latch — sdk63-68 — so the old adaptor-sig pin is obsolete.)
     // Two RLN nodes: A = issuer/payer, B = receiver.
     let a = rln::RlnNode::start("/tmp/rln-sdk23/a", 3111, 9845, true).await?;
     let b = rln::RlnNode::start("/tmp/rln-sdk23/b", 3112, 9846, true).await?;
