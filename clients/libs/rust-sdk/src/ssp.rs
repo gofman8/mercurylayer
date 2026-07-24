@@ -1115,8 +1115,31 @@ impl UtexoWallet {
     /// preimage exists for the invoice hash). This method itself only enforces the SE's batch-lock
     /// (it fails before `batch_timeout`); the non-payment confirmation is the caller's obligation.
     pub async fn reclaim_lightning_payment(&self, coin_statechain_id: &str) -> Result<()> {
+        // V2 (TES-R) coin: the self-transfer below would BRICK. The failed latch already co-signed an
+        // orphan `S'` (presign_receiver_state, unconditional), so a reclaim self-transfer co-signs a
+        // SECOND state and its `verify_bundle` claim rejects on the inflated `sig_count`. But the latch
+        // never completed (no preimage → no key handover), so the coin is still ours. Restore it locally
+        // as exitable: the value is recoverable via `unilateral_exit` (the ladder is intact), at the
+        // exact-lane operator-trust bar (the SSP holds the broadcastable `S'` and is trusted not to race
+        // it — identical to the exact PAY lane). Re-transfer stays orphan-bricked until a `refresh()`
+        // re-anchor; full off-chain reuse would need a scoped SE `sig_count` reconcile (separate,
+        // security-reviewed). V1 coins have no orphan and reclaim cleanly off-chain via the self-transfer.
+        if mercuryrustlib::tesr::load(self.client_config(), self.wallet_name(), coin_statechain_id)
+            .await?
+            .is_some()
+        {
+            let mut record = self.record().await?;
+            for coin in record.coins.iter_mut() {
+                if coin.statechain_id.as_deref() == Some(coin_statechain_id) && coin.duplicate_index == 0 {
+                    coin.status = mercuryrustlib::CoinStatus::CONFIRMED;
+                }
+            }
+            self.save_record(&record).await?;
+            return Ok(());
+        }
+
         let me = self.get_utexo_address().await?;
-        // Fresh, un-batched transfer of the specific coin back to ourselves: the SE drops the stale
+        // V1: fresh, un-batched transfer of the specific coin back to ourselves — the SE drops the stale
         // batch-locked transfer row and the coin's key rotates back under our control.
         mercuryrustlib::transfer_sender::execute(
             self.client_config(),
