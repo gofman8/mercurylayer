@@ -58,7 +58,35 @@ implementation + test (then port it). Specifically decide:
 5. **Docs sweep**: remove every "V1"/"V2" distinction from `docs/utexo/**` and the learn/build guides —
    there is one protocol.
 
-## Why not now
+## Progress (2026-07-24)
+
+- **9 of 29 V1-pinned tests removed** (suite compiles green after each): LN core sdk03/05/06 (V2:
+  sdk63/64/65/67/68), invalidation sdk26/27 + sats-granularity sdk28 (obsolete under TES-R),
+  exit/terminal sdk07/08/10 (V2: sdk50/58). Commits 617f1af, 7059c72, 33e0c12.
+- **Discovered blocker for the TOKEN tests (sdk36/32, RGB-LN sdk23):** migrating them to V2 fails at
+  `coin ... has a V2 exit ladder and cannot be split [B1]` — the token/derived-token flow splits a coin,
+  which V2 refuses (HF-1). They need the **colored in-ladder split** ported to V2 (the colored analogue
+  of the sats in-ladder split that LN non-exact now uses). That is a substantial feature port, a
+  prerequisite before those tests can migrate. Kept V1-pinned until then.
+- **Migration is per-test, not a bulk unpin:** many tests exercise a V1-only mechanism (`split_coin`
+  double-spend, V1 backup exit) that behaves differently on V2, so each needs adaptation + a live
+  verification run — a large, careful effort, not a sweep.
+
+## Remaining work, grouped by what it needs
+
+| Group | Tests | Needs |
+|---|---|---|
+| Token / split-using | sdk32, sdk36, sdk23 | **port the colored in-ladder split to V2** first |
+| LN scenarios | sdk18, sdk19, sdk21, sdk24, sdk25 | port receive-fail/cancel/delayed/remote/RGB-LN to V2 (sdk18 also = the sole batch-expiry test) |
+| Stale / race (security) | sdk13, sdk14, sdk15 | port the ladder's stale-state + double-sign race to V2 |
+| Adversarial | sdk04, sdk12, sdk20 | adapt (keep agnostic guards, drop V1-split cases covered by sdk58) |
+| Refresh / trust / value-gate | sdk30, sdk33, sdk35, sdk37 | migrate (may hit the split blocker) |
+| OOR / chaos | sdk17, chaos22 | assess / port |
+
+Then: remove the `protocol_version < 2` branches + the `UTEXO_PROTOCOL_DEFAULT` / `deposit_protocol_version`
+escape hatch, and the docs sweep.
+
+## Why not all at once
 
 The deletion is **all-or-nothing at the lane level** (one shared code path), and its prerequisites
 (porting/retiring invalidation, refresh, granularity, stale/race for V2) are a large program in their
