@@ -127,6 +127,30 @@ is gated on its covering V2 test being verified GREEN first (never drop a securi
 | Concurrency | chaos22 | the ONLY concurrency test — retiring is invalid; port cheats to the V2 vector |
 | Out-of-round | sdk17 | the one genuine feature gap (see above) |
 
+## Defects the migration exposed (fixed here, not test artifacts)
+
+**D1 — in-ladder split admission guard was too weak, and could STRAND the parent.**
+`in_ladder_pay` admitted a piece that merely cleared the V1 backup-fee floor
+(`min_split_output` = dust + backup fee = 442 sat at 2 sat/vB). But an in-ladder CHILD is not a bare
+output: `establish_child` hangs the child's OWN extension + state tiers off `SP.out[j]`, each burning
+`committed_fee + P2A_VALUE` (488 sat each), and the final state output must still clear dust — a real
+floor of **1306 sat**. Worse, `establish_child` runs *after* `set_spend_budget(parent, 1)` and the
+`SP` co-sign, so a piece in the 442..1306 window terminalized the parent and *then* died with
+`FeeTooHigh`, leaving the parent stranded to unilateral-exit-only.
+Fix: new `mercurylib::tesr::min_child_value(fee_rate, dust)` and `in_ladder_pay` now takes
+`max(backup-fee floor, min_child_value)` as its admission guard — refusing BEFORE the parent is
+touched, the same discipline `split_coin` already used.
+
+**D2 — `refresh_sponsored` was broken on V2** (found by sdk30 part (c), which failed with
+`re-anchor succeeded but the sponsor rebate failed: FeeTooHigh`). It sized the operator's rebate at
+`fee + DUST_LIMIT` = 442 using V1 reasoning, which lands exactly inside the D1 window, so a sponsored
+refresh could not complete — after the user had already paid the on-chain re-anchor fee. Fix: the
+rebate is now `max(fee + DUST_LIMIT, min_child_value)`; the operator absorbs the difference and the
+user still ends ≥ whole.
+
+Both were latent in the shipped V2 default and are only reachable through small off-chain payments —
+exactly what a V1-era test suite never exercised on the V2 lane.
+
 ### Run recipe (learned the hard way)
 
 ```

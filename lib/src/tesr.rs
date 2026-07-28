@@ -60,6 +60,22 @@ pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64>
     prev_value.checked_sub(committed_fee(fee_rate_sats_per_vb) + P2A_VALUE)
 }
 
+/// The smallest value an in-ladder split CHILD can carry and still be exitable.
+///
+/// A child of an in-ladder split is not a bare output: `establish_child` hangs the child's OWN
+/// headless ladder off `SP.out[j]` — an extension tier and a state tier — and each tier burns
+/// `committed_fee(rate) + P2A_VALUE`. The child's final state output must then still clear the
+/// caller's dust floor to be broadcastable.
+///
+/// This is strictly larger than the plain backup-fee floor (`DUST_LIMIT + backup fee`) that sized
+/// V1 sub-coins, and it is the value an admission guard MUST use: `establish_child` runs *after*
+/// the parent's spend budget is consumed and `SP` is co-signed, so a child admitted below this
+/// dies with [`MercuryError::FeeTooHigh`] once the parent is already terminal — stranding the
+/// parent to unilateral-exit-only.
+pub fn min_child_value(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
+    2 * (committed_fee(fee_rate_sats_per_vb) + P2A_VALUE) + dust_limit
+}
+
 /// nSequence for a BIP-68 relative-block-height lock of `blocks` (the tx must be v≥2; TES-R tiers are
 /// v3). For a block-height lock the raw value equals `blocks` — the type flag (bit 22) and the
 /// disable bit (bit 31) are both clear.

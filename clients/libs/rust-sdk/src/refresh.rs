@@ -52,8 +52,8 @@ pub struct RefreshResult {
     /// The re-anchor tx (also the fresh deposit's funding tx).
     pub refresh_txid: String,
     /// Sats an operator sponsor reimbursed off-chain (`0` for the user-pays [`UtexoWallet::refresh`];
-    /// `fee_sats + DUST_LIMIT` after [`UtexoWallet::refresh_sponsored`] — the smallest off-chain-payable
-    /// amount covering the sub-dust fee, so the user ends ≥ whole).
+    /// after [`UtexoWallet::refresh_sponsored`] the smallest OFF-CHAIN-PAYABLE amount covering the
+    /// sub-dust fee — `max(fee_sats + DUST_LIMIT, min_child_value)` — so the user ends ≥ whole).
     pub rebate_sats: u64,
 }
 
@@ -75,12 +75,14 @@ impl UtexoWallet {
     /// by an OFF-CHAIN rebate from `sponsor` to this wallet so the user is made (at least) whole.
     ///
     /// The refresh fee (~112 sats at 1 sat/vB) is BELOW the dust floor, and an off-chain transfer
-    /// can't mint a piece below `min_split_output` (dust + the piece's own backup fee). So the
-    /// smallest amount the operator can send off-chain that covers the fee is
-    /// `fee_sats + DUST_LIMIT`; the sponsor rebates that, over-compensating the user by the dust
-    /// floor (330 sats). `rebate_sats` reports the actual amount rebated (≥ `fee_sats`), so the
-    /// user's total balance ends ≥ the original. The rebate arrives as a normal incoming transfer;
-    /// claim it via the watcher/`claim()`. `sponsor` is a funded operator wallet.
+    /// can't mint a piece below `min_split_output` (dust + the piece's own backup fee), and on a
+    /// TES-R sponsor coin the rebate is paid by an IN-LADDER split whose child funds its own
+    /// extension + state tier before clearing dust (`min_child_value`, 1306 sat at the default
+    /// 2 sat/vB). The sponsor therefore rebates `max(fee_sats + DUST_LIMIT, min_child_value)`,
+    /// over-compensating the user by the difference. `rebate_sats` reports the actual amount
+    /// rebated (≥ `fee_sats`), so the user's total balance ends ≥ the original. The rebate arrives
+    /// as a normal incoming transfer; claim it via the watcher/`claim()`. `sponsor` is a funded
+    /// operator wallet.
     pub async fn refresh_sponsored(
         &self,
         statechain_id: &str,
@@ -88,10 +90,21 @@ impl UtexoWallet {
         fee_rate: Option<f64>,
     ) -> Result<RefreshResult> {
         let mut res = self.reanchor(statechain_id, fee_rate).await?;
-        // The rebate must be off-chain-payable: at least the fee, but no smaller than a mintable
-        // piece. Since min_split_output(rate) == DUST_LIMIT + fee for this 112-vB tx, the tightest
-        // payable rebate is fee + DUST_LIMIT (the operator absorbs the dust-floor rounding).
-        let rebate = res.fee_sats + crate::transfer::DUST_LIMIT;
+        // The rebate must be OFF-CHAIN-PAYABLE, i.e. at least a mintable piece — otherwise the
+        // sponsor's own `transfer` refuses and the user is left having paid the re-anchor fee.
+        // Two floors apply; take the larger:
+        //  * `fee + DUST_LIMIT` — the V1-era floor (min_split_output for this 112-vB tx), and
+        //  * `min_child_value` — on a TES-R sponsor coin the rebate is paid by an IN-LADDER split,
+        //    and the child carries its own extension + state tier before it can clear dust. At the
+        //    default 2 sat/vB that is 2*(248+240)+330 = 1306 sat, well above the old 442, so the
+        //    old sizing made a sponsored refresh fail outright (`FeeTooHigh`).
+        // The operator absorbs the difference; the user is still made (at least) whole.
+        let ladder_floor = mercurylib::tesr::min_child_value(
+            mercurylib::tesr::TesrParams::for_network(&self.inner.config.network.to_string())
+                .committed_fee_rate,
+            crate::transfer::DUST_LIMIT,
+        );
+        let rebate = (res.fee_sats + crate::transfer::DUST_LIMIT).max(ladder_floor);
         // Reimburse off-chain to this wallet's stable receive address. The re-anchor above already
         // released the wallet lock, so this (and the sponsor's own transfer) do not deadlock.
         let user_addr = self.get_utexo_address().await?;

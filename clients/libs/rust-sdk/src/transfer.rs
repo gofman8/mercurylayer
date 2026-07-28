@@ -649,10 +649,22 @@ impl UtexoWallet {
             ));
         }
         let change_sats = total - piece_sats;
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        // Admission guard. BOTH floors apply and the LARGER binds:
+        //  * the backup-fee floor (dust + the sub-coin's own backup fee), as for a V1 sub-coin; and
+        //  * `min_child_value` — an in-ladder child gets its OWN two-tier ladder (extension + state)
+        //    from `establish_child`, each tier burning `committed_fee + P2A_VALUE`, and its final
+        //    state output must still clear dust.
+        // The second floor is the load-bearing one here: `establish_child` runs AFTER the parent's
+        // spend budget is consumed and `SP` is co-signed, so admitting a child below it terminalizes
+        // the parent and THEN fails with FeeTooHigh, stranding the parent to unilateral-exit-only.
+        // Refusing up-front keeps the parent fully spendable (same discipline as `split_coin`).
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
+            .max(mercurylib::tesr::min_child_value(bundle.fee_rate, DUST_LIMIT));
         if piece_sats < min_output || change_sats < min_output {
             return Err(anyhow!(
-                "in-ladder split needs both piece ({piece_sats}) and change ({change_sats}) >= {min_output} sat"
+                "in-ladder split needs both piece ({piece_sats}) and change ({change_sats}) >= {min_output} sat \
+                 (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
+                bundle.fee_rate
             ));
         }
 

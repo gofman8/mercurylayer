@@ -1,22 +1,34 @@
-//! E2E (tokens over time): what happens to statechain tokens if you ISSUE or RECEIVE them and then
-//! do NOTHING for a long time (well past every backup-ladder horizon — a "year" is far beyond the
-//! ~7-day deployed horizon). Answers, empirically: are they lost? can you still send them, exit
-//! unilaterally, or exit cooperatively?
+//! E2E (tokens over time, V2/TES-R): what happens to statechain tokens if you ISSUE or RECEIVE them
+//! and then do NOTHING for a long time (a "year" of blocks, far beyond any deployed horizon)?
+//! Answers, empirically: are they lost? can you still send them, exit unilaterally, or exit
+//! cooperatively?
 //!
-//! (A) ISSUED tokens (flat carrier), long idle: the carrier's own backup ladder FLOORS (its locktime
-//!     drops below the tip as the chain advances), yet the tokens are NOT lost and are STILL
-//!     sendable — a token transfer is a colored SPLIT and the piece gets a FRESH ladder
-//!     (`create_tx1`, qt=0), so a floored carrier does not block sending. Movement needs the SE
-//!     (a plain unilateral exit is refused — it would destroy the allocation); issued tokens have
-//!     NO ancestor, so there is NO clawback risk.
-//! (B) RECEIVED tokens (sub-coin carrier), long idle: still NOT lost. UNILATERAL materialization
-//!     works forever — the exit branch is locktime-0, so broadcasting it settles the allocation
-//!     on-chain any time (provided the shared root is still unspent). A single 1,500-sat received
-//!     piece is below the carrier floor, so it can't be re-sent alone (hold / combine / exit).
-//! (C) The DANGER for received tokens: after the wait, the SENDER's carrier backup has ALSO matured,
-//!     so a malicious sender could sweep the shared root and claw the tokens back — UNLESS you
-//!     materialized first. The received holder must exit before the root deadline; there is no
-//!     automatic protection for token carriers today (`auto_exit_due` skips carriers).
+//! Under the V2 default a plain BTC coin NEVER ages (its TES-R ladder is a relative CSV on an
+//! un-broadcast trigger — 0 vB rent while idle), and an RGB **carrier** is never laddered at all:
+//! terminal-freeze (V2-DESIGN §5.10 rule 1), because RGB rides the signed-once colored-split model
+//! and a plain tier spend of a carrier would destroy the allocation. So, for tokens:
+//!
+//! (A) ISSUED tokens (flat carrier), long idle: the carrier is TERMINAL-FROZEN — `tesr::load` → None,
+//!     it carries no ladder, only the signed-once deposit backup that is its plain exit. The tokens
+//!     are NOT lost and are STILL sendable: a token transfer is a colored SPLIT
+//!     (`create_colored_split_tx`), a path that never touches the ladder, so no amount of idling can
+//!     make an allocation un-sendable. Movement needs the SE (a plain unilateral exit is REFUSED — it
+//!     would destroy the allocation); issued tokens have NO ancestor, so there is NO clawback risk.
+//! (B) RECEIVED tokens (colored sub-coin), long idle: still NOT lost, and terminal-frozen too.
+//!     UNILATERAL materialization works forever — the colored exit branch is nLockTime **0**
+//!     (INV-4 / review H5: a branch must always be broadcastable now and always mature before any
+//!     deposit-anchored parent backup), so broadcasting it settles the allocation on-chain at any
+//!     height, provided the shared root is still unspent. A single 1,500-sat received piece is below
+//!     the carrier floor, so it can't be re-sent alone (hold / combine / exit).
+//! (C) The residual DANGER for received tokens. V2 closes the SE side and only the SE side: the
+//!     colored split sets the carrier's spend budget to 1, so afterwards the carrier is TERMINAL at
+//!     the SE and the sender can never obtain a FRESH co-signed sweep. What V2 does not remove is the
+//!     sender's ONE pre-signed deposit backup — TES-R deliberately never covers a carrier, so that
+//!     backup is still a plain absolute-locktime tx and it matures at `deposit_height + initlock`.
+//!     Past that a malicious sender could sweep the shared root and claw the tokens back — UNLESS you
+//!     materialized first (which you can do from the very first block, your branch being locktime-0).
+//!     A received holder must exit before the root deadline; the background `auto_exit_due` pass
+//!     materializes a due carrier, but only for a wallet that is running the watcher.
 //!
 //! Run: SDK_E2E=32 ML_NETWORK=regtest cargo run
 
@@ -105,10 +117,9 @@ async fn coin_of(cc: &ClientConfig, name: &str, id: &str) -> Result<mercuryrustl
 }
 
 pub async fn execute() -> Result<()> {
-    // V2DEF-5: this test exercises V1-specific mechanisms (decrementing-locktime stale-state /
-    // invalidation / re-anchor) that V2 replaces for roots but that remain for V1 split sub-coins &
-    // the LN lane. Pin V1 so it stays a V1-lane regression test under the V2 default.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // No protocol pin: this runs on the V2 (TES-R) default. That is the point of the test — under V2
+    // an idle plain coin never ages, and an RGB carrier is deliberately kept OFF the ladder
+    // (terminal-freeze), so "what happens to tokens left alone for a year?" has a V2-specific answer.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -119,7 +130,9 @@ pub async fn execute() -> Result<()> {
     let core = bitcoin_core::getnewaddress()?;
     let initlock = mercuryrustlib::utils::info_config(&cc).await?.initlock;
 
-    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_alice"), None).await?;
+    let alice_cfg = SdkConfig::regtest("sdk32_alice");
+    assert!(alice_cfg.deposit_protocol_version >= 2, "V2 (TES-R) default active — this test is single-protocol");
+    let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_bob"), None).await?;
     let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_carol"), None).await?;
     let bob_addr = bob.get_utexo_address().await?;
@@ -130,20 +143,31 @@ pub async fn execute() -> Result<()> {
     bitcoin_core::generatetoaddress(3, &core)?;
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    // ===== (A) ISSUED tokens (flat carrier) idle well past the ladder horizon ====================
+    // ===== (A) ISSUED tokens (flat carrier) idle for a "year" ====================================
     add_tokens(&cc, &alice, 1).await?;
     let asset = alice.issue_token("YR", "Year Token", 0, 1000).await?;
     let carrier = wait_carrier(&cc, &alice, "sdk32_alice", &core, &asset, 1000).await?;
     let carrier_id = carrier.statechain_id.clone().ok_or_else(|| anyhow!("carrier has no id"))?;
-    let l0 = carrier.locktime.ok_or_else(|| anyhow!("carrier has no backup locktime"))?;
-    println!("SDK32 - alice issued 1000 {asset} on a flat carrier; backup ladder L0={l0}, initlock={initlock}");
+    // Terminal-freeze invariant (V2-DESIGN §5.10 rule 1; same check as sdk52): an RGB carrier must
+    // NEVER be anchored on the renewable T/X/S ladder — a plain tier spend would destroy the
+    // allocation. Its only plain exit is the signed-once deposit backup; the asset moves by colored
+    // split. So "does the carrier age?" is the wrong question here — it has no ladder to age.
+    assert!(
+        mercuryrustlib::tesr::load(&cc, "sdk32_alice", &carrier_id).await?.is_none(),
+        "the RGB carrier {carrier_id} must NOT carry a TES-R ladder (terminal-freeze §5.10 rule 1)"
+    );
+    let l0 = carrier.locktime.ok_or_else(|| anyhow!("carrier has no deposit-backup locktime"))?;
+    println!("SDK32 - alice issued 1000 {asset} on a flat carrier; carrier is TERMINAL-FROZEN (no TES-R ladder), deposit-backup locktime L0={l0}, initlock={initlock}");
 
-    // Do nothing for a "year": advance the chain far past L0 (the 1000-block ladder floors ~7 days in).
+    // Do nothing for a "year": advance the chain far past every horizon (initlock + 500 blocks).
     let tip_yr = mine_and_sync(&cc, &core, initlock + 500)?;
-    assert!(l0 < tip_yr, "the carrier's own backup ladder has FLOORED (L0={l0} < tip={tip_yr})");
     alice.claim().await?;
     assert_eq!(token_balance(&alice, &asset).await?, 1000, "the tokens are NOT lost after long inactivity");
-    println!("SDK32 - (A) after ~{} idle blocks the carrier ladder is FLOORED (L0={l0} < tip={tip_yr}), yet alice still holds all 1000 {asset}", initlock + 500);
+    assert!(
+        mercuryrustlib::tesr::load(&cc, "sdk32_alice", &carrier_id).await?.is_none(),
+        "idling must not ladder the carrier — claim() keeps honouring terminal-freeze after {} blocks", initlock + 500
+    );
+    println!("SDK32 - (A) after ~{} idle blocks (tip={tip_yr}) alice still holds all 1000 {asset}, and the carrier is STILL terminal-frozen — an idle allocation simply does not age", initlock + 500);
 
     // A PLAIN unilateral exit of the (still-current) issued carrier is REFUSED — it would sweep the
     // sats and destroy the allocation. Issued tokens are anchored on-chain and move only via the SE
@@ -152,34 +176,47 @@ pub async fn execute() -> Result<()> {
     assert!(plain_exit.is_err(), "a plain unilateral exit of a token carrier must be refused (carrier guard)");
     println!("SDK32 - (A) a plain unilateral exit of the issued carrier is refused (would destroy tokens); issued tokens move only via the SE, are never lost, and have NO clawback risk");
 
-    // COOPERATIVE SEND still works despite the floored ladder — the piece gets a FRESH ladder.
+    // COOPERATIVE SEND still works after the long idle — the colored-split path never touches a
+    // ladder, so there is nothing about the passage of time that can block it.
     add_tokens(&cc, &alice, 3).await?;
     let r = alice.transfer_tokens(&asset, &bob_addr, 250).await?;
+    assert!(r.used_split, "a token transfer is an off-chain colored SPLIT");
     let bob_piece = r.coins[0].statechain_id.clone();
     wait_token_balance(&bob, &asset, 250).await?;
-    assert_eq!(token_balance(&alice, &asset).await?, 750, "alice sent 250 from a floored carrier");
-    let bob_coin = coin_of(&cc, "sdk32_bob", &bob_piece).await?;
-    let bob_l = bob_coin.locktime.ok_or_else(|| anyhow!("bob piece no locktime"))?;
-    let tip_now = tip(&cc)?;
+    assert_eq!(token_balance(&alice, &asset).await?, 750, "alice sent 250 from a long-idle carrier");
+    assert_eq!(token_balance(&bob, &asset).await?, 250, "bob booked the 250-unit colored piece");
+    // Terminal-freeze holds on the RECEIVING side too: the piece is a colored sub-coin, never a
+    // laddered coin. Its exit is the locktime-0 branch asserted in (B), not a T/X/S tier.
     assert!(
-        bob_l as i64 - tip_now as i64 > (initlock as i64) - 20,
-        "bob's received piece has a FRESH ladder (headroom ~initlock: L={bob_l}, tip={tip_now})"
+        mercuryrustlib::tesr::load(&cc, "sdk32_bob", &bob_piece).await?.is_none(),
+        "bob's received colored sub-coin must NOT be laddered either (terminal-freeze)"
     );
-    println!("SDK32 - (A) COOPERATIVE SEND works after a year: alice→bob 250 (balances 750/250); bob's piece has a FRESH ladder (headroom {} ≈ initlock) — a floored carrier does NOT block sending", bob_l as i64 - tip_now as i64);
+    println!("SDK32 - (A) COOPERATIVE SEND works after a year: alice→bob 250 (balances 750/250), both sides terminal-frozen (no ladder on either carrier) — long inactivity does NOT block sending");
 
-    // ===== (B) RECEIVED tokens (sub-coin carrier) idle well past the horizon =====================
+    // ===== (B) RECEIVED tokens (colored sub-coin) idle for another "year" ========================
     // bob's 250-piece branch = the colored split tx; its root is alice's carrier outpoint.
     let branch = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk32_bob", &format!("branch-{bob_piece}")).await?;
     assert_eq!(branch.len(), 1, "bob's piece is a depth-1 sub-coin (branch = the colored split)");
+    // INV-4 / review H5: an off-chain colored branch is built with nLockTime 0, so it is
+    // UNCONDITIONALLY broadcastable now and always sits below any deposit-anchored parent backup —
+    // the latest state (the child) always wins the exit race. This is what makes "materialization
+    // works forever" true no matter how long bob idles.
+    assert_eq!(
+        mercurylib::utils::get_blockheight(&branch[0]).unwrap_or(u32::MAX),
+        0,
+        "bob's exit branch must be locktime-0 (always spendable, always ahead of the sender's backup)"
+    );
     let split_tx = parse_tx(&branch[0].tx)?;
     let root = split_tx.input[0].previous_output;
 
     let tip_yr2 = mine_and_sync(&cc, &core, initlock + 500)?;
     bob.claim().await?;
     assert_eq!(token_balance(&bob, &asset).await?, 250, "bob's received tokens are NOT lost after long inactivity");
+    // Non-load-bearing note: the piece also carries a deposit-style backup row, whose absolute
+    // locktime is long past. It is irrelevant either way — bob's exit is the locktime-0 branch above,
+    // which is spendable at ANY height.
     let bob_l2 = coin_of(&cc, "sdk32_bob", &bob_piece).await?.locktime.unwrap_or(0);
-    assert!(bob_l2 < tip_yr2, "bob's own piece backup ladder has also floored (L={bob_l2} < tip={tip_yr2})");
-    println!("SDK32 - (B) after another ~{} idle blocks bob still holds 250 {asset}; his piece ladder floored too (L={bob_l2} < tip={tip_yr2})", initlock + 500);
+    println!("SDK32 - (B) after another ~{} idle blocks (tip={tip_yr2}) bob still holds 250 {asset}; his piece's plain backup row sits at L={bob_l2}, but his real exit is the locktime-0 colored branch", initlock + 500);
 
     // A single 1,500-sat received piece is below the carrier floor → cannot be re-sent alone.
     let resend = bob.transfer_tokens(&asset, &carol_addr, 100).await;
@@ -206,16 +243,32 @@ pub async fn execute() -> Result<()> {
     assert_eq!(token_balance(&bob, &asset).await?, 250, "250 units materialize on-chain (unilateral exit preserves the tokens)");
     println!("SDK32 - (B) UNILATERAL materialization works after a year: bob broadcast the locktime-0 branch, spent the root, and settled 250 {asset} on-chain — tokens preserved without the SE");
 
-    // ===== (C) the clawback WINDOW for received tokens ==========================================
-    // Alice's carrier backup (L0) matured long ago (L0 < tip), so a MALICIOUS sender could have swept
-    // the shared root before bob materialized — clawing the tokens back. bob was safe only because he
-    // exited. This is why a received holder must materialize before the root deadline.
+    // ===== (C) the residual clawback WINDOW for received tokens =================================
+    // V2 closes the SE half of this and only the SE half. The colored split set the carrier's spend
+    // budget to 1 (tokens.rs), so the carrier is now TERMINAL at the SE: alice can never obtain a
+    // FRESH co-signature to sweep the shared root (this is exactly the property bob's receiver-side
+    // `verify_terminal_parents` demanded before booking the piece). What V2 does NOT remove is her ONE
+    // pre-signed deposit backup: TES-R deliberately never covers a carrier (terminal-freeze), so that
+    // backup is still a plain absolute-locktime tx and it matured long ago. A MALICIOUS sender could
+    // therefore have swept the root before bob materialized — clawing the tokens back. bob was safe
+    // because he exited, and he could exit at ANY height (his branch is locktime-0). This is why a
+    // received holder must materialize before the root deadline.
+    let (sig_budget, finalized, terminal) =
+        mercuryrustlib::lightning_latch::get_spend_budget(&cc, &carrier_id).await?;
+    assert!(
+        terminal,
+        "the carrier must be TERMINAL at the SE after its one colored split (budget {sig_budget:?}, finalized {finalized}) — the sender must never be able to obtain a FRESH co-signed sweep of the shared root"
+    );
+    assert!(
+        mercuryrustlib::tesr::load(&cc, "sdk32_alice", &carrier_id).await?.is_none(),
+        "the carrier stays terminal-frozen (no TES-R ladder) — which is precisely why the sender's pre-signed deposit backup remains the residual clawback vector"
+    );
     let alice_backup = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk32_alice", &carrier_id).await?;
     let alice_bk_lock = alice_backup.first().map(|b| mercurylib::utils::get_blockheight(b).unwrap_or(0)).unwrap_or(0);
     let tip_c = tip(&cc)?;
     assert!(alice_bk_lock <= tip_c, "the SENDER's carrier backup matured (L0={alice_bk_lock} <= tip={tip_c}) — clawback was possible");
-    println!("SDK32 - (C) CLAWBACK WINDOW: the sender's carrier backup matured at {alice_bk_lock} (tip {tip_c}); a malicious sender could have swept the root had bob stayed idle — received tokens MUST be materialized before the root deadline (auto_exit_due does not cover carriers today)");
+    println!("SDK32 - (C) CLAWBACK WINDOW (residual under V2): the carrier is TERMINAL at the SE (budget {sig_budget:?}, finalized {finalized} — no fresh co-signed sweep possible) and un-laddered, but the sender's single pre-signed deposit backup matured at {alice_bk_lock} (tip {tip_c}); a malicious sender could have swept the root had bob stayed idle — received tokens MUST be materialized before the root deadline (the background auto_exit_due pass does this only for a wallet running the watcher)");
 
-    println!("SDK32 - SUCCESS: tokens are NEVER LOST by inactivity. ISSUED tokens (flat carrier): the ladder floors but they stay sendable (piece gets a fresh ladder) and move via the SE — no clawback risk, but a plain unilateral exit would destroy them. RECEIVED tokens (sub-coin): unilateral materialization works forever (locktime-0 branch) and preserves them IF the shared root is still unspent — but a lone piece can't be re-sent, and a malicious sender can claw back past the root deadline, so a received holder should exit promptly. Cooperative operations (with the SE) work throughout.");
+    println!("SDK32 - SUCCESS: tokens are NEVER LOST by inactivity on V2. ISSUED tokens (flat carrier): the carrier is terminal-frozen — never laddered, so it never ages — and stays fully sendable via the colored-split path, which no passage of time can block; no clawback risk (no ancestor), but a plain unilateral exit would destroy the allocation and is refused. RECEIVED tokens (colored sub-coin): also terminal-frozen; unilateral materialization works forever because the exit branch is locktime-0, and it preserves the allocation as long as the shared root is unspent — but a lone piece can't be re-sent. Residual risk: V2 makes the carrier TERMINAL at the SE (no fresh co-signed sweep), yet the sender's one pre-signed deposit backup still matures, so a received holder should exit promptly. Cooperative operations (with the SE) work throughout.");
     Ok(())
 }
