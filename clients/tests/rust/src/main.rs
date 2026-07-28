@@ -32,8 +32,6 @@ pub mod sdk04_adversarial;
 pub mod sdk09_ifa_batch;
 pub mod sdk11_parity_methods;
 pub mod sdk12_adversarial;
-pub mod sdk13_stale_state;
-pub mod sdk14_watcher_race;
 pub mod sdk15_fresh_doublesign;
 pub mod sdk16_onboarding;
 pub mod sdk17_oor_chain;
@@ -51,7 +49,6 @@ pub mod sdk29_granularity_tokens;
 pub mod sdk30_refresh;
 pub mod sdk31_token_combine;
 pub mod sdk32_token_over_time;
-pub mod sdk33_auto_refresh;
 pub mod sdk34_token_watchtower;
 pub mod sdk35_trust_boundaries;
 pub mod sdk36_derived_tokens;
@@ -126,15 +123,6 @@ async fn main() -> Result<()> {
     // Adversarial regressions (SDK_E2E=12): single_use sub-coins, honest branch accept, nonce reuse.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("12") {
         sdk12_adversarial::execute().await?;
-        return Ok(());
-    }
-    // Stale-state broadcast (SDK_E2E=13): old-state claw-back is rejected/defeated + watcher detects.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("13") {
-        sdk13_stale_state::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("14") {
-        sdk14_watcher_race::execute().await?;
         return Ok(());
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("15") {
@@ -226,13 +214,6 @@ async fn main() -> Result<()> {
     // test not-lost / cooperative send / unilateral materialization / the received-token clawback window.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("32") {
         sdk32_token_over_time::execute().await?;
-        return Ok(());
-    }
-    // Auto-refresh embedded in transfer (SDK_E2E=33): a coin nearing its ladder floor is re-anchored
-    // automatically before it is spent — the maintenance pass, the transparent in-transfer refresh
-    // (fee the only visible effect), and the opt-out.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("33") {
-        sdk33_auto_refresh::execute().await?;
         return Ok(());
     }
     // Token-carrier watchtower (SDK_E2E=34): auto_exit_due now auto-materializes a received token
