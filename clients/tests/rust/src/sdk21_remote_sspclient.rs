@@ -28,8 +28,10 @@ impl Drop for SspServer {
 }
 
 pub async fn execute() -> Result<()> {
-    // LN swaps require a V1 coin until adaptor-sig LN lands (V2-MIGRATION-PLAN); pin regardless of the V2 default.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default: pay_lightning_invoice / create_lightning_invoice auto-route a
+    // laddered V2 coin through the in-ladder split (in_ladder_pay / ensure_exact_coin), and the remote
+    // SspClient's execute_pay / create_receive / settle_receive already handle V2 (sdk63-67). The
+    // adaptor-sig blocker is gone — LN runs on V2 via the HODL latch.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -173,7 +175,16 @@ pub async fn execute() -> Result<()> {
     bob_bg.abort();
     let _ = pay_task.await;
     println!("SDK21 - bob claimed his coin ({} coin) from the remote receive", claimed.len());
-    assert_eq!(bob.get_balance().await?.available_sats, 20_000, "bob owns 20k");
+    // On V2 the SSP holds only LADDERED coins, so `create_receive` fronts the 20k through an
+    // IN-LADDER split rather than an exact coin. The piece is deliberately oversized by the
+    // tier reserve (the SSP bears it — its cost of fronting a non-exact amount), because the
+    // piece's own exit tiers are paid out of it. So the receiver ends up with AT LEAST the
+    // invoiced amount — never less (same assertion shape as sdk67).
+    let bob_sats = bob.get_balance().await?.available_sats;
+    assert!(
+        bob_sats >= 20_000,
+        "bob must receive at least the 20k he invoiced (in-ladder piece is oversized by the tier reserve), got {bob_sats}"
+    );
 
     println!("SDK21 - SUCCESS: both swap directions work against a DEPLOYED mercury-ssp over HTTP via SspClient — the same wallet calls as in-process. Remote SSP is production-usable from the SDK.");
     Ok(())

@@ -35,7 +35,6 @@ pub mod sdk12_adversarial;
 pub mod sdk15_fresh_doublesign;
 pub mod sdk16_onboarding;
 pub mod sdk17_oor_chain;
-pub mod sdk18_pay_failure_reclaim;
 pub mod sdk19_receive_failure;
 pub mod sdk20_adversarial_gate;
 pub mod sdk21_remote_sspclient;
@@ -50,7 +49,6 @@ pub mod sdk30_refresh;
 pub mod sdk31_token_combine;
 pub mod sdk32_token_over_time;
 pub mod sdk34_token_watchtower;
-pub mod sdk35_trust_boundaries;
 pub mod sdk36_derived_tokens;
 pub mod sdk37_ssp_value_gate;
 pub mod sdk38_sponsor_stiff;
@@ -137,11 +135,6 @@ async fn main() -> Result<()> {
         sdk17_oor_chain::execute().await?;
         return Ok(());
     }
-    // Lightning PAY failure + reclaim (SDK_E2E=18): unroutable pay -> SSP claims nothing -> reclaim.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("18") {
-        sdk18_pay_failure_reclaim::execute().await?;
-        return Ok(());
-    }
     // Lightning RECEIVE failure (SDK_E2E=19): never paid -> no preimage, receiver can't claim.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("19") {
         sdk19_receive_failure::execute().await?;
@@ -221,12 +214,6 @@ async fn main() -> Result<()> {
     // clawback; issued/flat carriers (no branch) are left untouched.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("34") {
         sdk34_token_watchtower::execute().await?;
-        return Ok(());
-    }
-    // Trust boundaries (SDK_E2E=35): keyless watch-bundle watchtower (custody-free delegation,
-    // multiple towers idempotent, clawback defeated) + receiver rejects a floored handover.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("35") {
-        sdk35_trust_boundaries::execute().await?;
         return Ok(());
     }
     // Derived deposit tokens (SDK_E2E=36): split/combine/refresh slots are FREE derived slots

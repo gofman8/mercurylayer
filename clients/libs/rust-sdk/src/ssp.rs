@@ -951,10 +951,24 @@ impl UtexoWallet {
             return paid.map_err(|e| (piece_id, e));
         }
 
-        // SATS PAY: mint the exact coin, then latch it.
+        // SATS PAY: mint the exact coin, then latch it. If the wallet holds only V2-laddered coins
+        // (which cannot be split exactly — [B1]), fall back to the NON-EXACT IN-LADDER lane, the same
+        // way `SspService::create_receive` does on the receive side. Without this the one-call pay API
+        // is unusable on V2 unless the wallet happens to already hold a coin of the exact size.
         let coin_id = match self.ensure_exact_coin(quote.amount_sats + quote.fee_sats).await {
             Ok(c) => c,
-            Err(e) => return Err((String::new(), e)), // nothing latched yet
+            Err(e) => {
+                match self.largest_laddered_coin_for_pay(quote.amount_sats + quote.fee_sats).await {
+                    Some(parent) => {
+                        return self
+                            .pay_lightning_invoice_inladder(ssp, invoice, &parent)
+                            .await
+                            .map_err(|err| (String::new(), err));
+                    }
+                    // No laddered coin big enough either — surface the original mint error.
+                    None => return Err((String::new(), e)), // nothing latched yet
+                }
+            }
         };
 
         // From here the coin exists and gets latched: any failure is reclaimable via `coin_id`.
@@ -998,6 +1012,40 @@ impl UtexoWallet {
     /// self-owned, latches the piece to the invoice hash, and lets the SSP census + pay it. The piece
     /// sits at the same operator-trust bar as the exact lane (`S'`); the change is trustless. On failure
     /// the change is retained and the piece dies with the un-broadcast split (recover the parent value).
+    /// The largest CONFIRMED coin that carries a TES-R ladder and is big enough to fund an in-ladder
+    /// piece of `min_sats` (plus the piece's tier reserve and a viable change). Used to auto-route a
+    /// non-exact Lightning PAY when no exact coin can be minted. `None` if the wallet has none.
+    async fn largest_laddered_coin_for_pay(&self, min_sats: u64) -> Option<String> {
+        let wallet =
+            mercuryrustlib::sqlite_manager::get_wallet(&self.client_config().pool, self.wallet_name())
+                .await
+                .ok()?;
+        // Leave room for the piece's tier reserve AND a change output above the in-ladder floor.
+        let headroom = min_sats + 2_000 + 2_000;
+        let mut candidates: Vec<(u64, String)> = wallet
+            .coins
+            .iter()
+            .filter(|c| {
+                c.status == mercuryrustlib::CoinStatus::CONFIRMED
+                    && c.duplicate_index == 0
+                    && c.amount.unwrap_or(0) as u64 > headroom
+            })
+            .filter_map(|c| c.statechain_id.clone().map(|id| (c.amount.unwrap_or(0) as u64, id)))
+            .collect();
+        candidates.sort_by_key(|(a, _)| std::cmp::Reverse(*a));
+        for (_, id) in candidates {
+            if mercuryrustlib::tesr::load(self.client_config(), self.wallet_name(), &id)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub async fn pay_lightning_invoice_inladder(
         &self,
         ssp: &impl Ssp,

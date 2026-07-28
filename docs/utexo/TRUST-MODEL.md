@@ -58,10 +58,10 @@ receiver's machine):
 | R1 | Sender's Schnorr signature binding the coin's outpoint to the receiver's new pubkey (`tx0_txid ‖ vout ‖ new_user_pubkey`) | handover messages not authorized by the coin's owner | `verify_transfer_signature` (`lib/src/transfer/receiver.rs:160-180`, checked for the index-0 backup group) | every successful claim (`sdk01` et al.); reject paths in `unit::transfer_signature_tests` (replay-to-other-receiver, wrong-outpoint, forged-by-non-owner) |
 | R2 | The receiver's NEW share + new server share combine to the coin's on-chain aggregate pubkey (else `IncorrectAggregatedPublicKey`); sender-key/t1 supporting checks | SE or sender handing over key material that doesn't control the coin | `get_new_key_info` (`lib/src/transfer/receiver.rs:664-692`); `validate_tx0_output_pubkey`, `validate_t1pub` | every claim (`sdk01` et al.) |
 | R3 | Funding tx0 output pays the expected aggregate (`validate_tx0_output_pubkey`); outpoint **unspent** (all coins). Confirmation is a hard reject only for **exit-branch roots** (unspent **and height > 0** with ≥ `confirmation_target` — the combine-review mempool-root fix); a plain coin's claim completes and is booked `UNCONFIRMED` until `coin_status` confirms it | fake or spent funding; a sub-coin branch rooted in an unconfirmed/mempool tx | `verify_tx0_output_is_unspent_and_confirmed` (`transfer_receiver.rs:534-538`); `validate_branch` root checks (`transfer_receiver.rs:854-870, 942-947`) | every claim; `sdk31` (combine root); the height-0 branch-root path has no dedicated test yet |
-| R4 | Backup-ladder locktime in `(tip, tip + initlock]` — rejects `LocktimeTooLow` (an already-raceable floored ladder) and `LocktimeTooHigh` (a ladder locked *above* a fresh deposit's, which would overstate your safe window while ancestors' real backups matured) | being handed an **already-raceable** coin, or a forged over-long ladder | `lib/src/transfer/receiver.rs:461-466` | `SDK_E2E=35` (D2: malicious sender bypasses his own client's guard; receiver still rejects) |
+| R4 | Backup-ladder locktime in `(tip, tip + initlock]` — rejects `LocktimeTooLow` (an already-raceable floored ladder) and `LocktimeTooHigh` (a ladder locked *above* a fresh deposit's, which would overstate your safe window while ancestors' real backups matured) | being handed an **already-raceable** coin, or a forged over-long ladder | `lib/src/transfer/receiver.rs:461-466` | `sdk54`/`sdk46` (V2 R′ `verify_bundle` census: a malicious sender bypassing his own client's guard is still rejected by the receiver) |
 | R5 | Signature count at the SE == backup-tx count; ladder decrements exactly `interval` per hop | hidden intermediate owners; sender keeping extra co-signed states | `transfer_receiver.rs:529` (count); `ladder_decrements_by_interval` in `validate_signature_scheme` (`lib/src/transfer/receiver.rs`) | every claim; interval reject paths in `unit::transfer_signature_tests::ladder_interval_check_rejects_wrong_and_increasing` (wrong gap, equal, increasing — no underflow panic); the count-mismatch reject remains E2E-implicit |
-| R6 | **Branch validation** (sub-coins): every branch tx consensus-valid and connected root→leaf; root input on-chain, unspent, confirmed; every branch locktime ≤ tip (INV-4); value conservation per hop (INV-25); **non-tree branches rejected** (an outpoint consumed twice) | fabricated or double-spending exit branches | `validate_branch`, `reject_non_tree_branch` | `sdk10`, `terminal_parents_tests` |
-| R7 | **Terminal ancestors** (sub-coins): one named ancestor per structural input the branch consumes (Σ inputs, so an N-carrier combine names all N), each reporting `terminal: true` at the SE | sender double-spending a branch parent via a fresh SE co-signature | `required_terminal_ancestors`, `verify_terminal_parents` | `sdk10`, `sdk31` VERIFY log |
+| R6 | **Branch validation** (sub-coins): every branch tx consensus-valid and connected root→leaf; root input on-chain, unspent, confirmed; every branch locktime ≤ tip (INV-4); value conservation per hop (INV-25); **non-tree branches rejected** (an outpoint consumed twice) | fabricated or double-spending exit branches | `validate_branch`, `reject_non_tree_branch` | `sdk58`, `terminal_parents_tests` |
+| R7 | **Terminal ancestors** (sub-coins): one named ancestor per structural input the branch consumes (Σ inputs, so an N-carrier combine names all N), each reporting `terminal: true` at the SE | sender double-spending a branch parent via a fresh SE co-signature | `required_terminal_ancestors`, `verify_terminal_parents` | `sdk58`, `sdk31` VERIFY log |
 | R8 | **RGB consignment** fully client-validated; amount booked = what the consignment assigns to the receiver's outpoint, under the cryptographically-derived contract id | token forgery, wrong-asset or wrong-amount claims — no proxy or issuer is trusted for token *rules or amounts* (chain anchoring resolves through the wallet's indexer and inherits §4/B3) | `accept_incoming_tokens` (REQ-21/22) | `sdk02`, `rgb13` |
 
 *Parameter provenance:* R4/R5's window parameters (`initlock`, `interval`) come from the SE's
@@ -201,7 +201,7 @@ needed for custody**, by construction:
   your own process; "trusting the watchtower" here means trusting your own machine to be on
   **while you hold off-chain coins** (a wallet that is entirely offline past deadlines is B4's
   case — delegate, or exit before going dark).
-- **Keyless delegation** (`SDK_E2E=35`): everything a watchtower must broadcast is *already
+- **Keyless delegation** (`sdk45`): everything a watchtower must broadcast is *already
   fully signed* and *pays only the owner*. `export_watch_bundle()` emits exactly that — branch
   txs, deadlines, and (plain coins only) the latest backup tx. **No key-material fields exist on
   the bundle types at all** (unit-tested), and the E2E asserts the wallet's mnemonic and
@@ -215,13 +215,13 @@ needed for custody**, by construction:
   as a re-export trigger).
 - **The worst a malicious/buggy watchtower can do**: broadcast *early* — which settles the
   owner's coins on-chain **to the owner** (safe; costs only the off-chain-ness; proven in
-  `SDK_E2E=35(B)`: bob keeps his sats and all 250 tokens) — or *not act* (the identical risk as
+  `sdk34`: bob keeps his sats and all 250 tokens) — or *not act* (the identical risk as
   running no watchtower). It cannot redirect funds (it has no keys) and it cannot destroy tokens
   (a carrier's bundle entry structurally contains **no backup tx**, only the materializing
   branch).
 - **Multiple watchtowers compose safely**: they all hold the same pre-signed transactions, so
   they can never conflict — a second tower's broadcast is an idempotent re-broadcast
-  (`SDK_E2E=35(B)`, two independent towers). Redundancy is pure upside; diversity of *indexer
+  (`sdk45`, two independent towers). Redundancy is pure upside; diversity of *indexer
   connections* also hedges §4.
 - **What remains trusted: availability.** *Someone* — your process, your cron, a third party, or
   several of them — must be awake inside the margin before a deadline. That is the (c) in the
@@ -297,7 +297,7 @@ needed for custody**, by construction:
   the failure surfaces as an explicit error ("re-anchor succeeded but the sponsor rebate
   failed", `refresh.rs:98-101`; happy path `sdk30`, **stiffing bounded-loss `sdk38`** — a broke
   sponsor errors while the user keeps the refreshed amount−fee coin).
-- **SSP** (Lightning): swaps are preimage-atomic (`sdk03/05/06`, adversarial `sdk18-20`) — the
+- **SSP** (Lightning): swaps are preimage-atomic (`sdk63`/`sdk64`/`sdk67`, adversarial `sdk19`/`sdk20`/`sdk24`) — the
   SSP is trusted for liveness and quotes, not funds.
 
 ### The honest list: boundaries that remain (numbered, with their mitigations)
@@ -325,12 +325,12 @@ relationship not listed on this page, that is a documentation bug: please open a
 
 | Claim | Test |
 |---|---|
-| Receiver rejects floored/raceable handover even from a guard-bypassing malicious sender | `SDK_E2E=35` (D1 honest guard, D2 malicious bypass → `LocktimeTooLow`) |
-| Watch bundle is keyless; keyless tower protects sats + tokens; two towers idempotent; early broadcast safe | `SDK_E2E=35` (A)(B) |
-| Malicious sender's matured stale backups all fail after materialization | `SDK_E2E=35` (C), `sdk13`, `sdk34` (E) |
+| Receiver rejects a raceable handover even from a guard-bypassing malicious sender | `sdk54`, `sdk46` (V2 R′ census: no hidden lower-CSV state; current state strictly lowest) |
+| Watch bundle is keyless (no key material); keyless tower defends an offline owner; two independent towers idempotent | `sdk45`, `sdk51`, `sdk34` |
+| Malicious sender's matured stale state fails after materialization; the honest owner's lowest-CSV state wins the race | `sdk51`, `sdk40` (PART 2), `sdk32` (C), `sdk34` (E) |
 | Token carrier auto-materialized before clawback deadline; issued carrier untouched | `SDK_E2E=34` |
 | Auto-refresh keeps coins off the floor invisibly; opt-out respected | `SDK_E2E=33` |
-| Terminal ancestors: per-input requirement + non-tree rejection | `sdk10`, `sdk31`, unit `terminal_parents_tests` |
+| Terminal ancestors: per-input requirement + non-tree rejection | `sdk58`, `sdk31`, unit `terminal_parents_tests` |
 | SSP pre-payment value gate reads TRUE coin value ([3] SATS branch-validated peek, [4] RGB consignment-derived amount) | `sdk37`; `sdk20` (SATS gate through real `execute_pay` + RLN) |
 | Transfer-signature (R1) + ladder-interval (R5) reject paths | `unit::transfer_signature_tests` |
 | Sponsored-refresh bounded loss (stiffing sponsor → user keeps refreshed coin) | `sdk38` |
@@ -340,7 +340,7 @@ relationship not listed on this page, that is a documentation bug: please open a
 | SE nonce atomicity (no double-sign behind the receiver's back) | `sdk12` |
 | Fresh double-sign trust floor — an SE *willing* to double-sign creates a race (the honest counter-example) | `sdk15` |
 | SE refusal ≠ seizure (unilateral exit without SE) | `sdk07`, `sdk08` |
-| Stale-state clawback defeated by ladder + watcher | `sdk13`, `sdk14` |
+| Stale-state clawback defeated by the CSV ladder + watchtower | `sdk51`, `sdk40` (PART 2), `sdk45` |
 | Token state client-validated (forged/invalid consignments rejected) | `rgb12`, `rgb13` |
-| SSP swap atomicity + adversarial refusals | `sdk03/05/06`, `sdk18/19/20` |
+| SSP swap atomicity + adversarial refusals | `sdk63`/`sdk64`/`sdk67`, `sdk19`/`sdk20`/`sdk24`, failure/rollback `sdk66`/`sdk68` |
 | Sender pre-claim cancel = overwrite-by-resend (impossible after claim); SSP latch abort; receiver-failure paths | `tm01`, `sdk24`, `sdk19` |
