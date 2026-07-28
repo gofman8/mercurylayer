@@ -51,9 +51,29 @@ pub async fn execute() -> Result<()> {
     // ---- 2. The tower loads ONLY the persisted bundle — keyless (no coin, no keys). ----
     let tower_bundle = mercuryrustlib::tesr::load(&cc, wallet, &sid).await?.ok_or(anyhow!("no bundle"))?;
     assert!(!is_outpoint_spent(&cc, &f_txid, f_vout), "F still UNSPENT — nothing to defend yet");
+
+    // CUSTODY-FREE, literally: the serialized bundle a user hands a third-party tower carries the
+    // pre-signed ladder and NOTHING that could move funds on its own. (Back-filled from the retired
+    // sdk35 trust-boundaries test, which held the only assertion of this property.)
+    let serialized = serde_json::to_string(&tower_bundle)?;
+    for secret in ["mnemonic", "seckey", "secret", "private", "privkey", "xpriv"] {
+        assert!(
+            !serialized.to_lowercase().contains(secret),
+            "the watch bundle must carry NO key material, but it contains {secret:?} — delegating to a tower would hand over custody"
+        );
+    }
+    println!("SDK45 - the persisted bundle carries zero key material (custody-free delegation) ✓");
+
     // Before any trigger, the tower is idle.
     assert!(mercuryrustlib::tesr::watch_pass(&cc, &tower_bundle).is_empty(), "idle: no trigger, no action");
-    println!("SDK45 - keyless tower loaded the bundle; idle while the coin sits un-broadcast");
+    // A SECOND, INDEPENDENT tower over the SAME bundle is harmlessly idempotent — towers need no
+    // coordination, so a user may delegate to several. (Also back-filled from sdk35.)
+    let tower_bundle_b = mercuryrustlib::tesr::load(&cc, wallet, &sid).await?.ok_or(anyhow!("no bundle"))?;
+    assert!(
+        mercuryrustlib::tesr::watch_pass(&cc, &tower_bundle_b).is_empty(),
+        "a second independent tower must also be idle (no trigger) — watch_pass is idempotent, so redundant towers never conflict"
+    );
+    println!("SDK45 - keyless tower loaded the bundle; idle while the coin sits un-broadcast (a 2nd independent tower is idempotent) ✓");
 
     // ---- 3. A griefer broadcasts the trigger; the tower reacts per block. ----
     let _ = broadcast(&cc, &trigger_tx)?;

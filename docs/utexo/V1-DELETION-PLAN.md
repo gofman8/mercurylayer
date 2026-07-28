@@ -85,18 +85,64 @@ implementation + test (then port it). Specifically decide:
   a large, careful effort, not a sweep. E2E runs cannot be parallelized (one bitcoind/mercury-server,
   shared `wallet.db` CWD).
 
-## Remaining work, grouped by what it needs
+## Full migration map (2026-07-28)
+
+A 21-agent classification pass produced a per-test verdict + concrete migration plan for all 20
+remaining V1-pinned tests, saved verbatim at `V1-MIGRATION-MAP.json` (read the `migration_plan` and
+`risk` fields before touching a test). Headline: **19 of 20 need NO feature work** — they are test
+rewrites or retirements. Exactly ONE genuine feature gap exists:
+
+- **sdk17 (out-of-round chain)** — V2 cannot re-transfer a RECEIVED in-ladder split child off-chain
+  (`ctesr-` child bundles are exit-only and excluded from re-conveyance). This is the known
+  child-re-transfer design item. Decide: implement first-class re-transferable children (key
+  handover + terminalize + reopen bound to the conveyance recipient + N-hop census), or retire sdk17
+  and defer the property. **The V1-lane removal is gated on this decision.**
+
+## Status (2026-07-28) — 8 of 20 cleared, 12 remain
+
+Every migration is verified GREEN on the live V2 + RLN regtest stack before commit; every retirement
+is gated on its covering V2 test being verified GREEN first (never drop a security assertion).
+
+| Test | Action | Result |
+|---|---|---|
+| sdk36 derived tokens | `split_coin` + transfer → one `in_ladder_pay` | ✅ GREEN (558d9fc) |
+| sdk23 RGB-over-LN | pure unpin (protocol-agnostic RLN rail) | ✅ GREEN (b823bda) |
+| sdk19 receive-failure | exact-coin funding (no split) | ✅ GREEN (1289966) |
+| sdk20 adversarial gate | two exact deposits; now also exercises the V2 pre-pay census | ✅ GREEN (1289966) |
+| sdk24 receive-cancel | exact-coin funding | ✅ GREEN (1289966) |
+| sdk13 stale-state | RETIRED — no absolute-locktime backup under TES-R | ✅ covered by sdk51 (GREEN) |
+| sdk14 watcher-race | RETIRED — idle coins never age; CSV order decides | ✅ covered by sdk51/40/50/45/58 |
+| sdk33 auto-refresh | RETIRED — no ladder floor to approach (0 vB rent) | ✅ covered by sdk43 (GREEN) |
+
+**Remaining 12:**
 
 | Group | Tests | Needs |
 |---|---|---|
-| sats split_coin → in_ladder_pay | sdk36 | rewrite to `in_ladder_pay` (feature EXISTS; no port) |
-| V1-aging → V2 "never ages" | sdk32 | rewrite assertions to TES-R semantics (no flooring/clawback) |
-| colored path on V2 | sdk23 | live-run `latch_tokens` colored LN on V2; confirm colored split soundness |
-| LN scenarios | sdk18, sdk19, sdk21, sdk24, sdk25 | port receive-fail/cancel/delayed/remote to V2 (sdk18 also = the sole batch-expiry test) |
-| Stale / race (security) | sdk13, sdk14, sdk15 | port the ladder's stale-state + double-sign race to V2 |
-| Adversarial | sdk04, sdk12, sdk20 | adapt (keep agnostic guards, drop V1-split cases covered by sdk58) |
-| Refresh / trust / value-gate | sdk30, sdk33, sdk35, sdk37 | migrate to V2 re-anchor / peek census |
-| OOR / chaos | sdk17, chaos22 | assess / port |
+| Token / refresh / value-gate | sdk30, sdk32, sdk37 | assertion rewrites to TES-R semantics (in flight) |
+| Adversarial / race | sdk04, sdk12, sdk15 | keep a REAL cheat, retarget to the V2 clawback vector (in flight) |
+| Trust boundaries | sdk35 | retire — back-fill assertions landed in sdk45 (no-key-material + 2nd-tower idempotence) |
+| LN pay-failure | sdk18 | retire once sdk68 is re-verified GREEN (sdk66 already GREEN) |
+| LN remote transport | sdk21 | unpinned; blocked on the `mercury-ssp` binary not binding :8100 (infra, not protocol) |
+| LN delayed-claim | sdk25 | unpinned + exact-coin funded; needs a short SE `RECEIVE_LATCH_TIMEOUT` to run |
+| Concurrency | chaos22 | the ONLY concurrency test — retiring is invalid; port cheats to the V2 vector |
+| Out-of-round | sdk17 | the one genuine feature gap (see above) |
+
+### Run recipe (learned the hard way)
+
+```
+cd clients/tests/rust
+SDK_E2E=<n> ML_NETWORK=regtest \
+  RLN_REGTEST=$HOME/Claude/rgb-lightning-node/regtest.sh \
+  COMPOSE_FILE=$HOME/Claude/rgb-lightning-node/compose.yaml \
+  cargo +stable run
+```
+
+- **`cargo +stable` is mandatory** — the default `cargo` in a non-interactive shell resolves to 1.83,
+  which cannot parse `utexo-rgb-lib`'s `edition2024` manifest.
+- **`RLN_REGTEST` is mandatory** — without it the harness looks for `esplora-container` (absent) and
+  dies with "No container found".
+- If bitcoind has been idle/restarted it re-enters IBD and electrs stalls on
+  "waiting for 0 blocks (IBD)"; mine 2 blocks (`generatetoaddress`, wallet `miner`) to clear it.
 
 Then: remove the `protocol_version < 2` branches + the `UTEXO_PROTOCOL_DEFAULT` / `deposit_protocol_version`
 escape hatch, and the docs sweep.
