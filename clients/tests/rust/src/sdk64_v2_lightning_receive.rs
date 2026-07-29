@@ -8,7 +8,7 @@
 //!
 //! To isolate the guard-lift from the in-ladder-split machinery, the SSP fronts an EXACT coin
 //! (`create_receive` → `ensure_exact_coin` returns it whole, no split). NOTE: no
-//! `UTEXO_PROTOCOL_DEFAULT` pin — this runs on the real V2 default, so the SSP's coin is V2 and the
+//! the SSP's coin is laddered and the
 //! latched transfer exercises the (now-lifted) sdk53 path.
 //!
 //! Run: SDK_E2E=64 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)

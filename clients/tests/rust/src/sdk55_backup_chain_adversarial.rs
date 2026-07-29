@@ -28,7 +28,6 @@ pub async fn execute() -> Result<()> {
     let _ = std::process::Command::new("rm").arg("wallet.db").arg("wallet.db-shm").arg("wallet.db-wal").output();
     let _ = fs::remove_dir_all("./rgb-data-sdk55");
     env::set_var("ML_NETWORK", "regtest");
-    env::set_var("UTEXO_PROTOCOL_DEFAULT", "2");
     let cc = mercuryrustlib::client_config::load().await;
 
     // --- A real V2 coin, transferred once so the backup chain has TWO real hops (tx1 → tx2). --------

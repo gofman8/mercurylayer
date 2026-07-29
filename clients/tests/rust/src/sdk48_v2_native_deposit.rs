@@ -1,6 +1,6 @@
 //! E2E (SDK_E2E=48) — **V2DEF-2 Stage 2a: V2-native deposit** on the live SE + real bitcoind.
 //!
-//! With `deposit_protocol_version = 2` (env `UTEXO_PROTOCOL_DEFAULT=2`), the SDK `claim()` pass
+//! The SDK `claim()` pass
 //! auto-establishes + persists a TES-R exit ladder for each fresh CONFIRMED deposit — so the coin
 //! is V2-native without any manual `establish` call. Proven here against the live SE:
 //!   - a ladder is auto-persisted (`tesr-<id>`), exiting to the wallet's seed-derived backup_address
@@ -30,11 +30,10 @@ pub async fn execute() -> Result<()> {
     let _ = std::fs::remove_dir_all("./rgb-data-sdk48_alice");
     std::env::set_var("ML_NETWORK", "regtest");
     // V2-native deposits: the SDK claim() hook auto-establishes the TES-R ladder.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2");
 
     let cc = mercuryrustlib::client_config::load().await;
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk48_alice"), None).await?;
-    assert!(SdkConfig::regtest("sdk48_alice").deposit_protocol_version >= 2, "config picked up V2 default");
+    // (there is no protocol switch any more — every deposit is laddered)
 
     // Deposit + confirm; claim() auto-establishes the ladder during the confirm loop.
     let amount = 100_000u32;

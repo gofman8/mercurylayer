@@ -131,7 +131,7 @@ pub async fn execute() -> Result<()> {
     let initlock = mercuryrustlib::utils::info_config(&cc).await?.initlock;
 
     let alice_cfg = SdkConfig::regtest("sdk32_alice");
-    assert!(alice_cfg.deposit_protocol_version >= 2, "V2 (TES-R) default active — this test is single-protocol");
+    // (single protocol: every plain deposit is laddered; RGB carriers deliberately are not)
     let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_bob"), None).await?;
     let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_carol"), None).await?;

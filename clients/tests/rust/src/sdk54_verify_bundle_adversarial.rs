@@ -38,7 +38,6 @@ pub async fn execute() -> Result<()> {
     let _ = std::process::Command::new("rm").arg("wallet.db").arg("wallet.db-shm").arg("wallet.db-wal").output();
     let _ = fs::remove_dir_all("./rgb-data-sdk54");
     env::set_var("ML_NETWORK", "regtest");
-    env::set_var("UTEXO_PROTOCOL_DEFAULT", "2");
     let cc = mercuryrustlib::client_config::load().await;
 
     // --- A REAL ladder, co-signed by the live SE. -------------------------------------------------

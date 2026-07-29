@@ -54,37 +54,30 @@ pub struct SdkConfig {
     /// times pre-split) plus confirmation latency and congestion: choose `≥ k_max·interval + 144`.
     /// Default 288 (~2 days; covers k ≤ 14 pre-split hops on the deployed 1000/10 profile).
     pub auto_exit_margin_blocks: u32,
-    /// Protocol version for NEW deposits (V2DEF-2). `1` = V1 (the current default during migration:
-    /// a deposit is byte-identical to today, so V1 sig-count tests are unaffected). `2` = TES-R
-    /// native: `claim()` auto-establishes + persists a tier ladder for each fresh confirmed coin, so
-    /// it transfers via the R′ path. Seeded from env `UTEXO_PROTOCOL_DEFAULT` if set.
-    pub deposit_protocol_version: u32,
 }
 
-/// Default protocol version for new deposits, from env `UTEXO_PROTOCOL_DEFAULT`.
+/// THERE IS ONE PROTOCOL. Every fresh confirmed root coin is laddered (TES-R) by `claim()` — the
+/// `UTEXO_PROTOCOL_DEFAULT` / `deposit_protocol_version` escape hatch that could opt a deposit back
+/// into the flat pre-TES-R shape is GONE, and no test pins it any more.
 ///
-/// **DEFAULT = `2` (TES-R / Utexo V2).** The B1 theft vector that reverted this to `1` twice — a retained
-/// no-timelock trigger `T` voiding a naive split of a laddered coin — is CLOSED by the **in-ladder split**
-/// (V2-DESIGN §5.4): a split is now a STATE tier `SP` spending `X_m.out[0]`, a DESCENDANT of `T` rather
-/// than a rival for `F`, so a retained trigger has nothing to race. Landed + attack-proven:
-///   - sdk58: `verify_child_bundle` accepts a real split child; 9 adversarial cases REJECT (decoy
-///     aggregates, hidden parent/child state, Model-A violation, parent/child non-terminality).
-///   - sdk59: an end-to-end in-ladder split PAYMENT over the SDK (`transfer()` → `in_ladder_pay`),
-///     receiver adopts via `verify_child_bundle` and unilaterally exits; funds land at the receiver.
-/// Plus S1/S2 (sdk54/sdk55). See `docs/utexo/V2-SPLIT-FINDINGS.md`.
+/// The B1 theft vector that twice reverted the default — a retained no-timelock trigger `T` voiding a
+/// naive split of a laddered coin — is CLOSED by the in-ladder split (V2-DESIGN §5.4): a split is a
+/// STATE tier `SP` spending `X_m.out[0]`, a DESCENDANT of `T` rather than a rival for `F`, so a
+/// retained trigger has nothing to race. Attack-proven by sdk58 (11 adversarial cases REJECT) and
+/// sdk59 (end-to-end split payment), plus S1/S2 (sdk54/sdk55).
 ///
-/// V2 SEMANTIC: a RECEIVED non-exact (split-child) payment is FIRST-CLASS. Its claim completes the
-/// standard SE key handover, so the receiver co-owns `A_child` (invariant across the rotation, which is
-/// what keeps the pre-signed exit chain valid) and the sender is locked out. It can be paid onward
-/// off-chain, whole, via `child_retransfer` — each hop co-signs a fresh lower-CSV state and discloses
-/// the one it replaces for the receiver's census (`docs/utexo/V2-CHILD-FIRSTCLASS.md`, sdk60).
-/// Two limits remain: its funding `SP.out[j]` is un-broadcast, so a COOPERATIVE withdrawal to an
-/// arbitrary address still routes to the unilateral exit; and a child cannot itself be split in-ladder
-/// yet, so it is spendable only whole. (The rejected alternative — "SE handover + budget-reopen" — was
-/// adversarially unsound; the sound design conveys the handover instead of reopening a budget.)
-fn deposit_protocol_default() -> u32 {
-    std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(2)
-}
+/// A RECEIVED non-exact (split-child) payment is FIRST-CLASS: its claim completes the standard SE key
+/// handover, so the receiver co-owns `A_child` (invariant across the rotation, which is what keeps the
+/// pre-signed exit chain valid) and the sender is locked out. It can be paid onward off-chain — whole
+/// via `child_retransfer`, or split via `child_in_ladder_pay` — each hop co-signing a fresh lower-CSV
+/// state and disclosing the one it replaces for the receiver's census
+/// (`docs/utexo/V2-CHILD-FIRSTCLASS.md`; sdk60 two hops, sdk17 a partial second hop).
+///
+/// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
+///   * an **RGB carrier** must never be laddered (a plain tier spend would destroy the allocation), so
+///     it keeps the flat signed-once backup shape and transfers by backup-chain handover;
+///   * a **split sub-coin** whose funding is un-broadcast cannot root a trigger [B0].
+/// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead V1 code.
 
 impl SdkConfig {
     /// Local regtest stack defaults (matches `regtest.Settings.toml` of the repo's test harness).
@@ -106,7 +99,6 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
-            deposit_protocol_version: deposit_protocol_default(),
         }
     }
 
@@ -129,7 +121,6 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
-            deposit_protocol_version: deposit_protocol_default(),
         }
     }
 }

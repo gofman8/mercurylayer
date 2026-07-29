@@ -2,7 +2,7 @@
 //!
 //! The end-to-end proof that the in-ladder split (sdk58's `verify_child_bundle` core) is a usable
 //! payment through `UtexoWallet::transfer` / `claim` / `unilateral_exit`, NOT just a verifier. With
-//! V2 deposits (`deposit_protocol_version = 2`), Alice's coin auto-establishes a TES-R ladder; a
+//! Alice's deposit auto-establishes a TES-R ladder; a
 //! non-exact payment to Bob can no longer be split as plain BTC (B1), so `transfer()` runs the
 //! IN-LADDER split: `SP` descends from the trigger, the PIECE child pays Bob (Model A) and is conveyed
 //! to his mailbox, the CHANGE child pays Alice back. Bob's `claim()` adopts the child via
@@ -28,9 +28,7 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
 
 /// A V2-native SDK wallet (auto-establishes ladders at claim/deposit).
 async fn v2_wallet(name: &str) -> Result<UtexoWallet> {
-    let mut cfg = SdkConfig::regtest(name);
-    cfg.deposit_protocol_version = 2; // opt into TES-R (V2) — the in-ladder split path
-    let (w, _) = UtexoWallet::initialize(cfg, None).await?;
+    let (w, _) = UtexoWallet::initialize(SdkConfig::regtest(name), None).await?;
     Ok(w)
 }
 

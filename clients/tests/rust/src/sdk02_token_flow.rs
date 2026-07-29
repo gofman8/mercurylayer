@@ -26,7 +26,6 @@ pub async fn execute() -> Result<()> {
     for d in ["./rgb-data-sdk2_alice", "./rgb-data-sdk2_bob"] {
         let _ = std::fs::remove_dir_all(d);
     }
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2"); // V2DEF-5: token flow on V2-native wallets
 
     let cc = mercuryrustlib::client_config::load().await;
 

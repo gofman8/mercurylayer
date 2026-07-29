@@ -7,7 +7,6 @@
 //! presence) pays the HODL invoice; `settle_receive` (unchanged — it operates on the piece sid) releases
 //! the piece and claims the HTLC; Alice's watcher adopts the piece.
 //!
-//! No `UTEXO_PROTOCOL_DEFAULT` pin — runs on the real V2 default.
 //! Run: SDK_E2E=67 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)
 
 use anyhow::{anyhow, Result};

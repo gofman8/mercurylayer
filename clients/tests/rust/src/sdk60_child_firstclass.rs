@@ -44,9 +44,7 @@ async fn num_sigs(cc: &mercuryrustlib::client_config::ClientConfig, sid: &str) -
 }
 
 async fn v2_wallet(name: &str) -> Result<UtexoWallet> {
-    let mut cfg = SdkConfig::regtest(name);
-    cfg.deposit_protocol_version = 2;
-    let (w, _) = UtexoWallet::initialize(cfg, None).await?;
+    let (w, _) = UtexoWallet::initialize(SdkConfig::regtest(name), None).await?;
     Ok(w)
 }
 

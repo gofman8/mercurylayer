@@ -24,7 +24,6 @@ pub async fn execute() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all("./rgb-data-sdk51_alice");
     std::env::set_var("ML_NETWORK", "regtest");
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2");
 
     let cc = mercuryrustlib::client_config::load().await;
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk51_alice"), None).await?;

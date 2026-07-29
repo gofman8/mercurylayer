@@ -1,7 +1,7 @@
 //! E2E (SDK_E2E=50) — **V2DEF-3: the SDK `unilateral_exit()` routes a V2 coin through its ladder**.
 //!
 //! sdk49 drove the tier chain by hand through `mercuryrustlib`. This proves the *public SDK* surface:
-//! a V2-native wallet (`UTEXO_PROTOCOL_DEFAULT=2`, deposit auto-established a ladder) calls
+//! a wallet whose deposit auto-established a ladder calls
 //! `wallet.unilateral_exit()` and the SDK — with no ladder knowledge required by the caller — walks the
 //! TES-R chain (trigger → extension → state) as each relative-CSV matures, reporting `wait_blocks`
 //! between tiers, until the funds land at the wallet's own seed-derived backup address. No V1
@@ -26,7 +26,6 @@ pub async fn execute() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all("./rgb-data-sdk50_alice");
     std::env::set_var("ML_NETWORK", "regtest");
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2");
 
     let cc = mercuryrustlib::client_config::load().await;
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk50_alice"), None).await?;

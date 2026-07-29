@@ -31,7 +31,7 @@ pub enum WalletEvent {
     /// `transfer`), so an aging coin is refreshed before the user's action with only the fee visible.
     CoinRefreshed { old_statechain_id: String, new_statechain_id: String, fee_sats: u64 },
     /// A fresh confirmed deposit had its TES-R (V2) exit ladder auto-established at claim
-    /// (`deposit_protocol_version >= 2`); the coin is now transferable via the R′ path.
+    /// the coin is now transferable via the R′ path.
     LadderEstablished { statechain_id: String },
     /// A V2 coin was found **triggered** (its funding `F` was spent — a contested exit) and the
     /// owner's watchtower pass (`defend_ladders`) raced the ladder, broadcasting `tiers_broadcast`

@@ -448,14 +448,13 @@ impl UtexoWallet {
             });
         }
 
-        // V2DEF-2 (Stage 2a): auto-establish a TES-R exit ladder for fresh V2-native deposits, so the
-        // coin transfers via the R′ path. Config-gated (`deposit_protocol_version >= 2`); at the
-        // default 1 this whole block is skipped and claim() is byte-identical to V1. Only CONFIRMED,
-        // non-duplicate, non-single-use root coins with no existing ladder qualify (idempotent). The
-        // exit payee is the coin's seed-derived `backup_address` (recoverable from the mnemonic — the
-        // same key V1's tx1 pays), NEVER an out-of-wallet address. Establish failures leave the coin
-        // as V1 (its tx1 still exits); the resumable retry is a later stage.
-        if self.inner.config.deposit_protocol_version >= 2 {
+        // Auto-establish the TES-R exit ladder for every fresh deposit — unconditional, there is one
+        // protocol. Only CONFIRMED, non-duplicate, non-single-use ROOT coins with no existing ladder
+        // qualify (idempotent). The exit payee is the coin's seed-derived `backup_address`
+        // (recoverable from the mnemonic), NEVER an out-of-wallet address. An establish failure
+        // leaves the coin un-laddered — still exitable via its signed-once backup — and the next
+        // claim() retries.
+        {
             let mut rec = self.record().await?;
             let network = rec.network.clone();
             // Terminal-freeze invariant (V2-DESIGN §5.10, rule 1): RGB rides the signed-once colored
@@ -464,7 +463,7 @@ impl UtexoWallet {
             // catches terminalized/combine carriers, but a resting issuance/received carrier holding
             // an allocation need not be single_use, so we also exclude the RGB carrier set. Fail CLOSED
             // for a token wallet whose RGB state is momentarily unavailable: skip establishing this
-            // pass (leave coins as V1) rather than risk laddering a carrier — the next claim() retries.
+            // pass (leave coins un-laddered) rather than risk laddering a carrier — next claim() retries.
             let carriers = if self.inner.config.rgb_data_dir.is_some()
                 && self.inner.config.rgb_proxy_url.is_some()
             {

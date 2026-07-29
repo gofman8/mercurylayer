@@ -8,7 +8,7 @@
 //!
 //! To isolate the census + guard-lift from the in-ladder-split machinery, alice deposits the EXACT
 //! invoice amount so `ensure_exact_coin` uses the whole V2 coin (no split). NOTE: no
-//! `UTEXO_PROTOCOL_DEFAULT` pin — this runs on the real V2 default.
+//! 
 //!
 //! Run: SDK_E2E=63 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)
 

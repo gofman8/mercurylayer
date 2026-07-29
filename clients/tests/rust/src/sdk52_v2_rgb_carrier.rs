@@ -1,7 +1,7 @@
 //! E2E (SDK_E2E=52) — **V2DEF-4: RGB terminal-freeze — a carrier is NEVER laddered**.
 //!
 //! The carrier ⊥ ladder invariant (V2-DESIGN §5.10 rule 1): with V2 default on
-//! (`UTEXO_PROTOCOL_DEFAULT=2`), a plain BTC deposit auto-establishes a renewable TES-R ladder, but an
+//! a plain BTC deposit auto-establishes a renewable TES-R ladder, but an
 //! RGB **carrier** must NOT — RGB rides the signed-once colored-split model (terminal-frozen, never
 //! renewed); a plain T/X/S spend of a carrier would destroy the allocation. Proven here on the live
 //! stack: in one V2-native + RGB wallet, the plain coin carries a ladder and the token carrier carries
@@ -32,14 +32,13 @@ pub async fn execute() -> Result<()> {
         let _ = std::fs::remove_dir_all(d);
     }
     std::env::set_var("ML_NETWORK", "regtest");
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "2"); // V2-native: claim() auto-establishes ladders
 
     let cc = mercuryrustlib::client_config::load().await;
     let mut alice_cfg = SdkConfig::regtest("sdk52_alice");
     alice_cfg.rgb_data_dir = Some("./rgb-data-sdk52_alice".to_string());
     let mut bob_cfg = SdkConfig::regtest("sdk52_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk52_bob".to_string());
-    assert!(alice_cfg.deposit_protocol_version >= 2, "V2 default active");
+    // (single protocol: every plain deposit is laddered; a carrier deliberately is not)
 
     let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;

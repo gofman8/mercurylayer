@@ -8,7 +8,6 @@
 //! `verify_conveyed_child` on the CHILD bundle before `send_payment`. The piece sits at the same
 //! operator-trust bar as the exact `S'`; the change is self-owned.
 //!
-//! No `UTEXO_PROTOCOL_DEFAULT` pin — runs on the real V2 default.
 //! Run: SDK_E2E=65 ML_NETWORK=regtest cargo run  (regtest + lockbox stack + RLN binary built)
 
 use anyhow::{anyhow, Result};
