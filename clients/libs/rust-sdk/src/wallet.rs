@@ -457,7 +457,7 @@ impl UtexoWallet {
         {
             let mut rec = self.record().await?;
             let network = rec.network.clone();
-            // Terminal-freeze invariant (V2-DESIGN §5.10, rule 1): RGB rides the signed-once colored
+            // Terminal-freeze invariant (PROTOCOL.md §5.10, rule 1): RGB rides the signed-once colored
             // carrier model and is NEVER anchored on the renewable T/X/S ladder — a plain tier spend
             // would destroy the allocation. So an RGB carrier must not get a ladder. `single_use`
             // catches terminalized/combine carriers, but a resting issuance/received carrier holding
@@ -1052,7 +1052,7 @@ impl UtexoWallet {
                         // retained no-timelock trigger spends F, killing the split tx that funds the
                         // receiver's sub-coin, while the ladder pays the splitter the full parent value.
                         // This does not by itself fix B1 (an attacker can patch their client — the real
-                        // fix is the in-ladder split, V2-DESIGN §5.4), but the SDK must not be the weapon,
+                        // fix is the in-ladder split, PROTOCOL.md §5.4), but the SDK must not be the weapon,
                         // and it kills the accidental-loss variant where an honest user exits a spent
                         // parent and destroys their own payee's coin.
                         if c.status != CoinStatus::CONFIRMED {

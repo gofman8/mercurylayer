@@ -20,7 +20,7 @@ use std::str::FromStr;
 use crate::select::{self, Candidate, Plan};
 
 /// How the PIECE child of an in-ladder split is latched for a non-exact Lightning swap
-/// (V2-LN-HODL.md §2b). Plain in-ladder payments use [`InLadderLatch::None`].
+/// (LIGHTNING.md §2b). Plain in-ladder payments use [`InLadderLatch::None`].
 pub enum InLadderLatch<'a> {
     /// Not a Lightning swap — convey the piece outright.
     None,
@@ -507,7 +507,7 @@ impl UtexoWallet {
             }
         }
         let parent = chosen.ok_or_else(|| {
-            anyhow!("no splittable coin large enough to mint {sats} sats (coins carrying a V2 exit ladder cannot be split [B1] — use an exact amount or re-anchor)")
+            anyhow!("no splittable coin large enough to mint {sats} sats (coins carrying a TES-R exit ladder cannot be split [B1] — use an exact amount or re-anchor)")
         })?;
         let (piece, _change) = self.split_coin(&parent, sats).await?;
         Ok(piece)
@@ -549,7 +549,7 @@ impl UtexoWallet {
         // nothing. NOTE the spend-budget does NOT protect here — it bounds FUTURE co-signs, and `T` was
         // co-signed long before `set_spend_budget` (this is why `transfer.rs`'s "the branch cannot be
         // double-spent even by a malicious sender" claim does not hold for V2 parents).
-        // The real fix is the IN-LADDER split (V2-DESIGN §5.4): a split as a STATE tier spending
+        // The real fix is the IN-LADDER split (PROTOCOL.md §5.4): a split as a STATE tier spending
         // `X_m.out[0]` is a DESCENDANT of `T`, not a rival for `F`, so a retained trigger has nothing to
         // race. Until that ships, refuse — a hard error beats silently voiding the receiver's coin.
         if mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, statechain_id)
@@ -557,7 +557,7 @@ impl UtexoWallet {
             .is_some()
         {
             return Err(anyhow!(
-                "coin {statechain_id} has a V2 (TES-R) exit ladder and cannot be split: a prior owner may hold a no-timelock trigger over its funding UTXO and could void the split, voiding the receiver's sub-coin [B1]. Use an exact-amount transfer, pick an un-laddered coin, or re-anchor this coin first."
+                "coin {statechain_id} has a TES-R exit ladder and cannot be split: a prior owner may hold a no-timelock trigger over its funding UTXO and could void the split, voiding the receiver's sub-coin [B1]. Use an exact-amount transfer, pick an un-laddered coin, or re-anchor this coin first."
             ));
         }
         let parent_sats = parent.amount.unwrap_or_default() as u64;
@@ -619,7 +619,7 @@ impl UtexoWallet {
         // — long before this call — carries no timelock, and spends `F` directly, so a retained `T`
         // double-spends the branch regardless of any budget set here. That is B1. Splitting a laddered
         // coin is therefore refused up-front in `split_coin`; the real fix is the in-ladder split
-        // (V2-DESIGN §5.4), where the split is a state tier DESCENDING from `T` rather than a rival for
+        // (PROTOCOL.md §5.4), where the split is a state tier DESCENDING from `T` rather than a rival for
         // `F`. Keep this comment honest: the budget is a co-sign bound, not a spend bound.
         mercuryrustlib::lightning_latch::set_spend_budget(
             &self.inner.cc,
@@ -666,7 +666,7 @@ impl UtexoWallet {
     /// Value is conserved by the split builder: `piece + change == tier_out_total(X_m.out[0], 2)`, so
     /// `change` is derived (not free) and `piece` must leave room for a viable change output.
     ///
-    /// A non-`None` `latch` makes this a **non-exact Lightning swap** (V2-LN-HODL.md §2b): the PIECE
+    /// A non-`None` `latch` makes this a **non-exact Lightning swap** (LIGHTNING.md §2b): the PIECE
     /// child is registered under a latch bound to the invoice and conveyed batch-locked, so the paying
     /// party can identify + census it (`verify_conveyed_child`) before releasing the other leg. The
     /// piece then sits at the same operator-trust bar as the exact-lane `S'` (bounded to the piece; the
@@ -860,7 +860,7 @@ impl UtexoWallet {
         let piece_bundle = &bundles[0];
         let change_bundle = &bundles[1];
 
-        // [non-exact LN latch, V2-LN-HODL.md §2b] If a payment hash is given, register the external-hash
+        // [non-exact LN latch, LIGHTNING.md §2b] If a payment hash is given, register the external-hash
         // latch on the PIECE child (so the SSP finds it via the batch and censuses it pre-pay) BEFORE
         // conveying, and book the piece IN_TRANSFER so `create_external_hash_latch`'s CONFIRMED|IN_TRANSFER
         // status check passes and the piece stays a valid latched-pending coin (not WITHDRAWN) the SSP

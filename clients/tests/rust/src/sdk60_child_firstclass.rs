@@ -3,7 +3,7 @@
 //! This is the Spark-parity property the in-ladder split was missing. Until now a received non-exact
 //! payment (an in-ladder split CHILD) was an exit-only claim: you could materialize it on-chain, but
 //! you could not pay it onward off-chain. It is now a first-class coin
-//! (`docs/utexo/V2-CHILD-FIRSTCLASS.md`):
+//! (`docs/utexo/CHILDREN.md`):
 //!
 //!   * Alice pays Bob a NON-EXACT amount ⟹ in-ladder split; the piece child is conveyed WITH the
 //!     standard key handover.

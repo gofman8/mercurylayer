@@ -2,7 +2,7 @@
 //! real bitcoind.
 //!
 //! Where sdk40-43 pass hand-picked CSVs, this drives the whole lifecycle from the canonical
-//! `TesrParams` schedule (mainnet defaults in V2-DESIGN §5.2; regtest preset here) via the
+//! `TesrParams` schedule (mainnet defaults in PROTOCOL.md §5.2; regtest preset here) via the
 //! production entry points `establish_auto` / `renew_auto` / `rollover_auto`: the wallet renews at the
 //! schedule's decrementing extension CSV until the renewal budget is spent, then rolls over — exactly
 //! the cadence a real wallet runs — and still exits correctly against real consensus.

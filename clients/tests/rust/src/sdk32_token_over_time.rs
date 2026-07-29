@@ -5,7 +5,7 @@
 //!
 //! Under the V2 default a plain BTC coin NEVER ages (its TES-R ladder is a relative CSV on an
 //! un-broadcast trigger — 0 vB rent while idle), and an RGB **carrier** is never laddered at all:
-//! terminal-freeze (V2-DESIGN §5.10 rule 1), because RGB rides the signed-once colored-split model
+//! terminal-freeze (PROTOCOL.md §5.10 rule 1), because RGB rides the signed-once colored-split model
 //! and a plain tier spend of a carrier would destroy the allocation. So, for tokens:
 //!
 //! (A) ISSUED tokens (flat carrier), long idle: the carrier is TERMINAL-FROZEN — `tesr::load` → None,
@@ -148,7 +148,7 @@ pub async fn execute() -> Result<()> {
     let asset = alice.issue_token("YR", "Year Token", 0, 1000).await?;
     let carrier = wait_carrier(&cc, &alice, "sdk32_alice", &core, &asset, 1000).await?;
     let carrier_id = carrier.statechain_id.clone().ok_or_else(|| anyhow!("carrier has no id"))?;
-    // Terminal-freeze invariant (V2-DESIGN §5.10 rule 1; same check as sdk52): an RGB carrier must
+    // Terminal-freeze invariant (PROTOCOL.md §5.10 rule 1; same check as sdk52): an RGB carrier must
     // NEVER be anchored on the renewable T/X/S ladder — a plain tier spend would destroy the
     // allocation. Its only plain exit is the signed-once deposit backup; the asset moves by colored
     // split. So "does the carrier age?" is the wrong question here — it has no ladder to age.

@@ -1,4 +1,4 @@
-//! E2E (SDK_E2E=67) — **NON-EXACT V2 Lightning RECEIVE via a latched in-ladder split** (V2-LN-HODL.md).
+//! E2E (SDK_E2E=67) — **NON-EXACT V2 Lightning RECEIVE via a latched in-ladder split** (LIGHTNING.md).
 //!
 //! The RECEIVE symmetry of sdk65, and the last piece needed before the V1 LN lane can be deleted (V1
 //! RECEIVE handled any amount by splitting the SSP's coin). The SSP holds only a large V2-laddered

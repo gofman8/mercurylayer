@@ -61,7 +61,7 @@ pub struct SdkConfig {
 /// into the flat pre-TES-R shape is GONE, and no test pins it any more.
 ///
 /// The B1 theft vector that twice reverted the default — a retained no-timelock trigger `T` voiding a
-/// naive split of a laddered coin — is CLOSED by the in-ladder split (V2-DESIGN §5.4): a split is a
+/// naive split of a laddered coin — is CLOSED by the in-ladder split (PROTOCOL.md §5.4): a split is a
 /// STATE tier `SP` spending `X_m.out[0]`, a DESCENDANT of `T` rather than a rival for `F`, so a
 /// retained trigger has nothing to race. Attack-proven by sdk58 (11 adversarial cases REJECT) and
 /// sdk59 (end-to-end split payment), plus S1/S2 (sdk54/sdk55).
@@ -71,7 +71,7 @@ pub struct SdkConfig {
 /// pre-signed exit chain valid) and the sender is locked out. It can be paid onward off-chain — whole
 /// via `child_retransfer`, or split via `child_in_ladder_pay` — each hop co-signing a fresh lower-CSV
 /// state and disclosing the one it replaces for the receiver's census
-/// (`docs/utexo/V2-CHILD-FIRSTCLASS.md`; sdk60 two hops, sdk17 a partial second hop).
+/// (`docs/utexo/CHILDREN.md`; sdk60 two hops, sdk17 a partial second hop).
 ///
 /// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
 ///   * an **RGB carrier** must never be laddered (a plain tier spend would destroy the allocation), so

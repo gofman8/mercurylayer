@@ -107,8 +107,6 @@ async fn main() -> Result<()> {
         sdk02_token_flow::execute().await?;
         return Ok(());
     }
-    // SDK lightning-swap legs (SDK_E2E=3): latch transfer locked on an SE preimage; claim gated on
-    // Practical unilateral exit (SDK_E2E=7): estimate cost+wait, branch out instantly, mine past
     // IFA issuance + mint + batch token transfer (SDK_E2E=9): G3.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("9") {
         sdk09_ifa_batch::execute().await?;
@@ -175,15 +173,6 @@ async fn main() -> Result<()> {
         sdk25_receive_delayed_claim::execute().await?;
         return Ok(());
     }
-    // Invalidation at SCALE (SDK_E2E=26): depth-4 off-chain split chain (each parent publicly
-    // terminal, branch rows == depth, measured exit vsizes per depth as 'ECON depth=...' lines),
-    // a 3-wide transfer_many fan-out from ONE split, and a full unilateral exit of the deepest
-    // Invalidation over TIME (SDK_E2E=27): exact one-interval ladder decrement across 6 full-coin
-    // hops, the sharp exit-maturity boundary (wait_blocks==2 at locktime-2, completes at the
-    // locktime), the OPEN audit-[17] deadline gap on a k=2 pre-transferred parent (WARN line with
-    // Granularity, plain sats (SDK_E2E=28): exact-subset payments (no split), an exact off-chain
-    // split (12_345 out of 100k, change 86_655, parent publicly terminal), the sub-dust boundary
-    // refusal (typed error, coin untouched) + 330-sat minimum piece, and a depth-2 re-split of a
     // Granularity, RGB tokens (SDK_E2E=29): raw-unit precision (0.10 / 0.01 booked exactly), a
     // depth-2 token exit (colored branch broadcast, opret anchors + allocation settled on-chain
     // on the exited outpoint), spent-carrier change becoming plain splittable BTC, and the

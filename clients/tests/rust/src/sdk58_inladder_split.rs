@@ -77,7 +77,7 @@ pub async fn execute() -> Result<()> {
     let (_, _, child_terminal) = mercuryrustlib::lightning_latch::get_spend_budget(&cc, &child_sid).await?;
     assert!(parent_terminal, "parent must be terminal after the split (budget=1, consumed by SP)");
     // The child is deliberately NOT terminalized any more: the receiver completes the key handover and
-    // becomes a first-class owner (V2-CHILD-FIRSTCLASS.md). Its census is made durable by that handover
+    // becomes a first-class owner (CHILDREN.md). Its census is made durable by that handover
     // plus the coordinator's pending-transfer lock, not by terminality. (The LN-latched lane still
     // terminalizes its piece; the verifier tolerates either.)
     assert!(!child_terminal, "a plain (unlatched) split child must stay NON-terminal so it can be re-transferred");

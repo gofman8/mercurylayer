@@ -250,7 +250,7 @@ pub async fn execute(
 
     let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
 
-    // LIGHTNING-LATCHED V2 (TES-R) TRANSFER — enabled via the HODL-latch pivot (V2-LN-HODL.md),
+    // LIGHTNING-LATCHED V2 (TES-R) TRANSFER — enabled via the HODL-latch pivot (LIGHTNING.md),
     // superseding the old blanket refusal. The Model A co-sign of the receiver-paying state S' is still
     // NOT preimage-gated (presign_receiver_state co-signs S' on a clone, unconditionally). What makes it
     // SAFE at the V1/operator-trust bar:
@@ -263,7 +263,7 @@ pub async fn execute(
     // RESIDUAL (recoverable, not theft): on ROLLBACK the orphan S' co-sign inflates the reclaimed coin's
     // sig_count, so a later verify_bundle bricks re-transfer — the coin stays fully exitable, and a
     // refresh() re-anchor restores re-transferability. Optional enclave latch-scoped terminalization
-    // (V2-LN-HODL.md Phase 3) removes this residual but is not required to lift the guard. See sdk53
+    // (LIGHTNING.md Phase 3) removes this residual but is not required to lift the guard. See sdk53
     // (guard test, now V1-pinned) and the new sdk63 (V2 PAY happy path).
 
     // NOTE: `get_new_x1` (which OPENS the transfer at the coordinator) is intentionally deferred to
@@ -271,7 +271,7 @@ pub async fn execute(
     // Model-A `presign_receiver_state` S'). None of those need `x1` (only `t1 = o1 + x1`, built inside
     // create_transfer_update_msg, does). Opening the transfer last means (a) a failed pre-sign never
     // orphans a pending statechain_transfer row, and (b) it is safe for the coordinator to refuse ANY
-    // co-sign once a transfer is open (the pending-transfer lock, V2-CHILD-FIRSTCLASS.md) — every
+    // co-sign once a transfer is open (the pending-transfer lock, CHILDREN.md) — every
     // legitimate sender co-sign has already happened before the transfer is opened.
     let input_txid = coin.utxo_txid.as_ref().unwrap();
     let input_vout = coin.utxo_vout.unwrap();

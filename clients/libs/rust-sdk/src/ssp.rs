@@ -416,7 +416,7 @@ impl SspService {
                 ));
             }
         }
-        // PRE-PAY LADDER CENSUS (V2-LN-HODL.md §2 PAY). For a V2 (TES-R) latched coin, run the
+        // PRE-PAY LADDER CENSUS (LIGHTNING.md §2 PAY). For a V2 (TES-R) latched coin, run the
         // receiver's `verify_bundle` census (num_sigs == v1_backups + tiers, read from the
         // enclave-authoritative sig-count) BEFORE the irreversible Lightning leg. This closes the
         // rob-SSP hidden-`S*` vector: a sender who co-signed a lower-CSV state omitted from the
@@ -547,7 +547,7 @@ impl SspService {
     pub async fn create_receive(&self, amount_sats: u64, receiver_address: &str) -> Result<ReceiveSwap> {
         // Prefer an exact coin (no split). If the SSP holds only V2-laddered coins (which cannot be
         // split exactly), fall back to a NON-EXACT in-ladder split: convey a piece worth `amount` to
-        // the user, latched under an SE-minted preimage (V2-LN-HODL.md §2b). `settle_receive` works
+        // the user, latched under an SE-minted preimage (LIGHTNING.md §2b). `settle_receive` works
         // unchanged on the piece sid (confirm + retrieve the SE preimage → claim the HODL HTLC).
         match self.wallet.ensure_exact_coin(amount_sats).await {
             Ok(statechain_id) => {
@@ -1007,7 +1007,7 @@ impl UtexoWallet {
     }
 
     /// USER SIDE — pay a BOLT11 for a NON-EXACT amount from a single V2 (TES-R) laddered coin
-    /// (V2-LN-HODL.md §2b). Splits `parent_statechain_id` IN-LADDER into a PIECE that pays the SSP
+    /// (LIGHTNING.md §2b). Splits `parent_statechain_id` IN-LADDER into a PIECE that pays the SSP
     /// (sized to cover the invoice + fee + the piece's own exit-tier reserve) and a CHANGE that stays
     /// self-owned, latches the piece to the invoice hash, and lets the SSP census + pay it. The piece
     /// sits at the same operator-trust bar as the exact lane (`S'`); the change is trustless. On failure

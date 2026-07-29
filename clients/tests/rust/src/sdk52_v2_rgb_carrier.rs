@@ -1,6 +1,6 @@
 //! E2E (SDK_E2E=52) — **V2DEF-4: RGB terminal-freeze — a carrier is NEVER laddered**.
 //!
-//! The carrier ⊥ ladder invariant (V2-DESIGN §5.10 rule 1): with V2 default on
+//! The carrier ⊥ ladder invariant (PROTOCOL.md §5.10 rule 1): with V2 default on
 //! a plain BTC deposit auto-establishes a renewable TES-R ladder, but an
 //! RGB **carrier** must NOT — RGB rides the signed-once colored-split model (terminal-frozen, never
 //! renewed); a plain T/X/S spend of a carrier would destroy the allocation. Proven here on the live

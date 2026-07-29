@@ -11,18 +11,46 @@ Mercury) see [learn/invalidation.md](learn/invalidation.md); for the long-form e
 [learn/invalidation-deep-dive.md](learn/invalidation-deep-dive.md); for fee/size/time pricing see
 [research/invalidation-economics.md](research/invalidation-economics.md); for exit mechanics see
 [learn/exits.md](learn/exits.md); for open audit findings see
-[AUDIT-2026-07.md](AUDIT-2026-07.md).
+[AUDIT-2026-07.md](AUDIT-2026-07.md). For the **laddered** coin shape's own stale-state machinery
+(relative-CSV tiers + census — see §0) see [PROTOCOL.md](PROTOCOL.md) and
+[CHILDREN.md](CHILDREN.md).
 
 ## 0. Scope, terminology, relationship to SPEC.md
 
-**Scope.** Invalidation of stale ownership states for both flat coins (backup-timelock ladder) and
-off-chain sub-coins (structural exit branches), the SE-side hard refusals that back them, the
-receiver-side validation duties, and the deadline/watchtower model. LN swaps, RGB token semantics
-and deposit-token economics are out of scope (see SPEC.md §7–8).
+**One protocol, two coin shapes.** There is ONE protocol. `claim()` establishes a TES-R exit ladder
+for every fresh confirmed ROOT coin, unconditionally; the `deposit_protocol_version` /
+`UTEXO_PROTOCOL_DEFAULT` escape hatch that could opt a deposit out of it is DELETED, and no test
+pins the flat shape as a selectable "version". What remains is two coin **shapes**, both current:
+
+* **LADDERED** — every plain deposit. An un-broadcast **relative-CSV** tier chain (trigger `T` →
+  extension `X_m` → state `S`) established by `claim()`. Stale ownership state on this shape is
+  invalidated by **CSV ordering** plus the receiver's `verify_bundle` / `verify_child_bundle` census
+  and the keyless watchtower — **not** by the absolute-locktime ladder of §2. That mechanism is
+  specified in [PROTOCOL.md](PROTOCOL.md) and [CHILDREN.md](CHILDREN.md).
+* **UN-LADDERED** — a coin that deliberately never gets a ladder: an **RGB carrier**, which MUST
+  never be laddered because a plain tier spend would destroy the allocation (terminal freeze,
+  PROTOCOL.md §5.10; the carrier exclusion is enforced fail-closed in `claim()`,
+  clients/libs/rust-sdk/src/wallet.rs, proven by sdk52), and a split **sub-coin**, whose funding
+  output is un-broadcast and therefore cannot root a trigger [B0]. These keep the signed-once
+  backup and transfer by **backup-chain handover**.
+
+**This document specifies the UN-LADDERED shape's invalidation** — the absolute-locktime backup
+ladder (§2) and the structural exit branch (§3) — together with the parts shared by both shapes:
+the SE's spend-budget/terminality predicate (§3, which is equally what terminalizes the parent of
+an in-ladder split), epochs (§4), the error semantics (§7) and the defence-layer analysis (§8).
+That path is **load-bearing for RGB tokens**; it is neither legacy nor dead code, and nothing here
+describes a migration in progress. Clauses that are specific to one shape say so.
+
+**Scope.** Invalidation of stale ownership states for both un-laddered flat coins (backup-timelock
+ladder) and off-chain sub-coins (structural exit branches), the SE-side hard refusals that back
+them, the receiver-side validation duties, and the deadline/watchtower model. LN swaps, RGB token
+semantics and deposit-token economics are out of scope (see SPEC.md §7–8).
 
 | Term | Meaning |
 |---|---|
 | **coin** | A P2TR UTXO locked to a 2-of-2 MuSig2 aggregate of owner share + SE share. A *flat* coin's funding output is on-chain. |
+| **laddered coin** | A coin carrying a TES-R relative-CSV tier chain (`T → X_m → S`), established by `claim()` on every fresh confirmed root deposit. Exits by walking the tier chain, not by this document's backup ladder. Out of scope here except where §0 says otherwise. |
+| **un-laddered coin** | A coin deliberately without a tier chain — an RGB carrier (terminal freeze) or a split sub-coin (un-broadcast funding, [B0]). Exits by exit branch + signed-once backup; this is the shape §2/§3 specify. |
 | **sub-coin** | A coin whose funding tx is a pre-signed, **un-broadcast** split/combine tx. Its funds exist off-chain until materialized. |
 | **structural node** | A coin consumed by a split/combine (the "parent"). It must become *terminal* at the SE. |
 | **exit branch** | The ordered list (root-first) of un-broadcast structural txs from an on-chain outpoint down to a sub-coin's funding output. Built and stored under `branch-<statechain_id>` (clients/libs/rust-sdk/src/transfer.rs:477-510; `insert_backup_txs` under `branch-<id>` at :504-510). |
@@ -73,7 +101,16 @@ Defaults are set in server/src/server_config.rs:69-70. Clients obtain the live v
   race margin; raising it by growing `initlock` lengthens exit waits. There is no in-protocol
   renegotiation of either parameter for an existing coin (§9).
 
-## 2. The backup ladder (flat coins)
+## 2. The backup ladder (un-laddered coins)
+
+*Shape scope (§0).* This section governs the **un-laddered** shape — RGB carriers and split
+sub-coins — whose ownership hops are backup-chain handovers. A **laddered** coin still carries the
+deposit backup `tx1` that was co-signed when its funding was first seen, and the conveyed-backup
+COUNT still feeds the receiver's `verify_bundle` equation (`se_num_sigs = <conveyed backups> +
+<tier count>`, the `v1_backups` term in code — which is why the decrement rule of IVL-REQ-4 is
+enforced on that lane too, sdk55), but its
+*exit* runs the relative-CSV tier chain and never this ladder
+(`UtexoWallet::unilateral_exit` takes the TES-R branch first, clients/libs/rust-sdk/src/wallet.rs).
 
 Ground truth: `calculate_block_height` (lib/src/transaction.rs:148-163). For backup tx number
 `qt` (qt = 0 is the first backup, co-signed when the deposit is first seen; each transfer
@@ -101,8 +138,16 @@ constructs them (`calculate_block_height`) and receiver-side validation rejects 
 - **IVL-INV-3 (exclusive window)** The current owner after k hops has the exclusive broadcast
   window `[L_k, L_{k−1})`, exactly `interval` blocks wide. Before L_k *nobody* can broadcast any
   ladder state — the only spend path is SE co-signing. From L_{k−1} onward the ladder degrades to
-  a first-seen broadcast race (proven: sdk13 ladder defeat of a stale clawback, sdk14 watchtower
-  race under fee pressure).
+  a first-seen broadcast race. Evidence: the ORDERING that makes the window exclusive is enforced
+  at claim time and is adversarially tested by **sdk55**, which rejects both a padded ladder and an
+  **inverted** one (the sender keeping the earlier-maturing backup — precisely the attack this
+  invariant exists to stop); the laddered shape's analogue of the race is **sdk40 PART 2** (a stale
+  state can never confirm once the owner de-triggers) and **sdk51** (the watchtower defends a
+  hostile trigger and the owner's strictly-lowest-CSV state matures first).
+  **Coverage note:** the two E2Es that actually broadcast a matured stale backup and won the race
+  on-chain — sdk13 and sdk14 — were retired with the invalidation suite. No live test re-runs that
+  on-chain race on the un-laddered lane; the invariant is asserted by receiver-side rejection
+  (sdk55) and by the `unit::invalidation_model` ladder math, not by a live race.
 - **IVL-INV-4 (capacity)** A coin supports at most `floor(initlock / interval)` transfers before
   L_k reaches H_anchor; the SDK-independent wall-clock bound is that the current owner's backup
   matures `(initlock − k·interval)` blocks after H_anchor regardless of transfer activity.
@@ -115,8 +160,15 @@ constructs them (`calculate_block_height`) and receiver-side validation rejects 
   surfaced as `SignatureSchemeValidationError`),
   that at least one backup exists (receiver.rs:347-349), and that the SE-reported signature count
   matches the conveyed ladder: `statechain_info.num_sigs == backup_transactions.len()`
-  (clients/libs/rust/src/transfer_receiver.rs:485-486, error `num_sigs is not correct`). Failure
+  (clients/libs/rust/src/transfer_receiver.rs, error `num_sigs is not correct`). Failure
   of any check MUST abort the claim; the coin is never booked.
+  *Both shapes (§0).* The count equation above is the **un-laddered** handover's form. A laddered
+  handover conveys a TES-R bundle instead, and the receiver runs the same linchpin in its R′ form —
+  `verify_bundle` enforces `se_num_sigs == v1_backups + tier_count`, which still consumes
+  `backup_transactions.len()` as a term, so the decrement rule (`ladder_decrements_by_interval`) is
+  enforced on that lane too. sdk55 is the adversarial proof: without it a sender could PAD the
+  conveyed backups to absorb a hidden co-signed state, or INVERT the ladder so their own backup
+  matures first. sdk46 validates the R′ count formula against the real SE's `num_sigs`.
 - **IVL-INV-15 (receive-time freshness; capacity exhaustion is receiver-rejected)** Because the
   IVL-REQ-4 bounds apply to *every* conveyed backup, two guarantees follow: (1) a receiver can
   never be handed a coin any of whose ladder states has already matured — no end-of-life coin
@@ -131,11 +183,20 @@ Off-chain split/combine creates sub-coins whose funding is un-broadcast. Stale-s
 does NOT come from the ladder — it comes from making the consumed parent *terminal* and the branch
 *unconditionally broadcastable*.
 
-*Combine status.* Combine is specified here for completeness: the locktime-free rule is enforced
-in lib for the combine path too (audit [12] fix) and a colored combine exists at lib level
-(`create_colored_combine_tx`, clients/libs/rust/src/rgb.rs:330, exercised by rgb02/05/08), but
-plain-BTC combine is NOT currently exposed as an SDK operation. Every "split/combine" requirement
-below binds combine if and when it is wired; today only split ships end-to-end.
+*Shape scope (§0).* This branch model is the **un-laddered** shape's split — it is what an RGB
+colored split produces and how token pieces travel. A **laddered** coin is never split this way: a
+non-exact payment out of it routes to the **in-ladder split** instead (`in_ladder_pay`, PROTOCOL.md
+§5.4), where the split is a STATE tier `SP` descending from the trigger rather than a rival branch
+rooted at the funding outpoint. The SE-side terminality machinery below (IVL-REQ-5..7, IVL-INV-7..9)
+is **shared**: it is exactly what terminalizes an in-ladder split parent too.
+
+*Combine status.* The locktime-free rule is enforced in lib for the combine path too (audit [12]
+fix) and a colored combine exists at lib level (`create_colored_combine_tx`,
+clients/libs/rust/src/rgb.rs, exercised by rgb02/05/08). A **multi-carrier colored** combine now
+also ships as an SDK operation — a token payment spanning several carriers produces one N-input
+combine tx whose branch the receiver validates under the full Σ-inputs ancestor rule (sdk31). A
+**plain-BTC** combine is still NOT exposed as an SDK operation; every "split/combine" requirement
+below binds it if and when it is wired.
 
 - **IVL-INV-5 (locktime-free branch — = SPEC INV-4)** Every non-withdrawal structural tx MUST
   carry `nLockTime = 0` (lib/src/transaction.rs:389-394; audit H5 fix, combine mirrored per audit
@@ -168,9 +229,14 @@ below binds combine if and when it is wired; today only split ships end-to-end.
   than reporting success on a failed update (lightning_latch.rs:262-271).
 - **IVL-REQ-7 (SDK ordering — = SPEC REQ-18)** The SDK MUST set the parent's spend budget to
   `remaining = 1` IMMEDIATELY BEFORE requesting the split/combine co-signature
-  (clients/libs/rust-sdk/src/transfer.rs:346-355). The structural co-sign then *consumes* the
+  (`set_spend_budget` immediately before the split co-sign, clients/libs/rust-sdk/src/transfer.rs).
+  The structural co-sign then *consumes* the
   budget, leaving the parent terminal. No later transfer/withdraw/backup of the parent can be
-  signed — even by a malicious sender who kept its keys.
+  signed — even by a malicious sender who kept its keys. The same ordering binds the laddered
+  shape's in-ladder split (`in_ladder_pay` / `child_in_ladder_pay`), where the budget is consumed by
+  the STATE tier `SP`: sdk04 case 2 proves the SE then refuses a second in-ladder split of that node
+  and the wallet refuses a second full-value spend, and sdk58 proves the terminalized parent's
+  superseded state is disclosed for the receiver's census.
 - **IVL-REQ-8 (single-use deposits — RGB tree roots only)** Deposit roots of the RGB off-chain
   DAG flows SHOULD be opened single-use via the dedicated API
   (`get_deposit_bitcoin_address_single_use`, clients/libs/rust/src/deposit.rs:10-14; exercised by
@@ -210,9 +276,12 @@ invalidate. Each failure aborts the claim before the coin is booked.
 - **IVL-REQ-10 (transfer binding + ladder)** The receiver MUST decrypt and verify the transfer
   message against its own auth key, verify every backup's transaction signature and blinded-MuSig2
   scheme against the SE's statechain info, and run the full ladder validation of IVL-REQ-4
-  including the `num_sigs` cross-check (lib/src/transfer/receiver.rs:270-352;
-  clients/libs/rust/src/transfer_receiver.rs:485-486). Error: `SignatureSchemeValidationError` /
-  `num_sigs is not correct`.
+  including the `num_sigs` cross-check in whichever form the conveyance takes (IVL-REQ-4:
+  `num_sigs == backup_transactions.len()` on the un-laddered lane, `verify_bundle`'s
+  `se_num_sigs == v1_backups + tier_count` on the laddered one) — lib/src/transfer/receiver.rs;
+  clients/libs/rust/src/transfer_receiver.rs. Error: `SignatureSchemeValidationError` /
+  `num_sigs is not correct`. Evidence: sdk17 (multi-hop claim), sdk55 (padding/inversion),
+  sdk46 (R′ count vs the live SE).
 - **IVL-REQ-11 (tx0 / branch validation — = SPEC REQ-16 + INV-4/25)** For the funding side the
   receiver MUST either resolve tx0 on-chain, or, for a branch-carried sub-coin, run
   `validate_branch` (clients/libs/rust/src/transfer_receiver.rs:796-916), which MUST enforce ALL
@@ -260,36 +329,51 @@ invalidate. Each failure aborts the claim before the coin is booked.
 
 ### 6.1 Unilateral exit algorithm
 
+*Shape scope (§0).* `UtexoWallet::unilateral_exit` dispatches on shape, in order: a **laddered**
+coin runs its tier chain via `tesr::exit_pass` (sdk50); a received **in-ladder split child** runs
+`tesr::exit_child_pass` over the full pre-signed chain `T → X_m → SP → ext_child → state_child`
+(sdk60, sdk17); everything else — the **un-laddered** shape — takes the branch-then-backup algorithm
+specified below.
+
 - **IVL-REQ-13 (branch first, conflicts are hard errors)** `unilateral_exit`
-  (clients/libs/rust-sdk/src/wallet.rs:717) MUST broadcast the stored exit branch root-first
-  before touching the backup (`broadcast_branch_if_any`, wallet.rs:571-613). A mempool conflict on
+  (clients/libs/rust-sdk/src/wallet.rs) MUST broadcast the stored exit branch root-first
+  before touching the backup (`broadcast_branch_if_any`, wallet.rs). A mempool conflict on
   a branch tx means a competing spend of the same input — the exit is being RACED — and MUST
-  surface as a hard error plus `WalletEvent::ExitBranchConflict` (wallet.rs:596-601, audit H1
-  fix), never be swallowed as an idempotent success. Only idempotent-rebroadcast errors are
-  tolerated — `is_idempotent_rebroadcast` (wallet.rs:1028-1038): already in block chain / already
-  in utxo set / txn-already-known / already in mempool / already have transaction — checked at
-  :606. Note: a *sibling* sub-coin owner (e.g. the
+  surface as a hard error plus `WalletEvent::ExitBranchConflict` (`broadcast_branch_if_any`, audit
+  H1 fix), never be swallowed as an idempotent success. Only idempotent-rebroadcast errors are
+  tolerated — `is_idempotent_rebroadcast` (wallet.rs): already in block chain / already
+  in utxo set / txn-already-known / already in mempool / already have transaction. Note: a
+  *sibling* sub-coin owner (e.g. the
   split's change-holder) broadcasting the shared branch is benign, not a race — the branch txs are
   byte-identical, so the rebroadcast hits exactly this tolerated already-known case;
   `ExitBranchConflict` requires a *different* spend of the same input.
 - **IVL-REQ-14 (locktime gate, re-callable — = SPEC REQ-25)** The latest backup is broadcast only
   if `locktime <= tip`; otherwise the call MUST return
   `ExitStatus{complete: false, wait_blocks: locktime − tip}` and MUST be safely re-callable — the
-  branch stays broadcast either way (wallet.rs:787-793).
+  branch stays broadcast either way (wallet.rs).
 - **IVL-REQ-15 (missing branch is explicit)** If a coin has no stored branch AND its funding txid
   is not on-chain, exit MUST fail with an explicit "restore the recovery bundle (`branch-*` rows)"
-  error rather than broadcast an unfunded backup (wallet.rs:759-773; audit [20]).
+  error rather than broadcast an unfunded backup (wallet.rs; audit [20]).
 
 **Cooperative materialization.** `withdraw` broadcasts the branch first, then one SE-co-signed
-withdrawal tx per coin with no locktime wait (wallet.rs:473-522, branch materialization at :509).
+withdrawal tx per coin with no locktime wait (`UtexoWallet::withdraw` → `broadcast_branch_if_any`
+→ `withdraw::execute`). One shape exception: a received **in-ladder split child** has no confirmed
+outpoint for a cooperative withdraw to spend (its funding `SP.out[j]` is un-broadcast), so
+`withdraw` routes it to the unilateral exit and books it `WITHDRAWING`. Such a coin has neither a
+withdrawal tx nor a withdrawal address — its progress is tracked by the pre-signed chain — and the
+status poll MUST return cleanly for it rather than demanding `tx_withdraw`/`tx_cpfp`
+(`check_withdrawal`, clients/libs/rust/src/coin_status.rs; before this fix every later poll on such
+a coin errored permanently, found by chaos22 on the live stack).
 
 ### 6.2 The exit deadline and its exactness domain
 
-`estimate_exit_cost` (wallet.rs:618) reports, for branch-carrying coins,
+`estimate_exit_cost` (clients/libs/rust-sdk/src/wallet.rs) reports, for branch-carrying coins,
 `exit_deadline_block = H_deposit_confirmation + initlock` — the branch root's on-chain deposit
-confirmation height plus initlock (`deposit_anchored_exit_deadline`, wallet.rs:685-710; audit [10]
+confirmation height plus initlock (`deposit_anchored_exit_deadline`, wallet.rs; audit [10]
 fix). This is the height by which the (locktime-free) branch MUST be on-chain to beat ancestor
-stale backups.
+stale backups. It is an **un-laddered-shape** quantity: a laddered coin has no absolute deadline at
+all — its tier chain is un-broadcast, so it never ages and carries 0 vB of rent (sdk30 part a mines
+300 blocks and the exit chain is byte-identical afterwards).
 
 - **IVL-INV-10 (exactness domain — state it precisely)** The true earliest hostile maturity is
   `min` over all ancestor backup locktimes. For an ancestor transferred `k` times before the split
@@ -345,7 +429,9 @@ stale backups.
 ## 8. Security analysis (normative invariants)
 
 **IVL-INV-11 (four defence layers).** Old state is invalidated by the conjunction of:
-(1) the **timelock ladder** ordering honest exit races (§2); (2) **SE hard refusal** of
+(1) **timelock ordering** of honest exit races — the absolute-locktime ladder on the un-laddered
+shape (§2), the relative-CSV tier chain plus the receiver's census on the laddered shape (§0,
+PROTOCOL.md); (2) **SE hard refusal** of
 conflicting/expired state — single-active-state nonce binding (SPEC INV-23; the enclave's atomic
 secnonce consume, lockbox/src/db_manager.cpp:294-297, is the authoritative guard; the advisory
 per-coin lock in sign.rs:19-23 is fail-open defence-in-depth), spend budget, single-use, epoch
@@ -356,8 +442,9 @@ Attacker capability matrix (what each class can and cannot achieve):
 
 | Attacker | Can | Cannot | Evidence |
 |---|---|---|---|
-| Previous owner (flat coin) | Broadcast their stale backup once `L_{k'}` matures — a race the current owner wins with an `interval`-block head start | Broadcast before their locktime; get the SE to re-sign old state | sdk13, sdk14 |
-| Malicious sender of a sub-coin | Attempt branch-root front-running (detected as `ExitBranchConflict`); try to convey a locktimed/value-creating/short-ancestor branch (all rejected at claim) | Double-spend a terminal parent at the SE (budget consumed pre-co-sign, IVL-REQ-7); re-open a budget (IVL-INV-7) | sdk08, sdk10, rgb04 |
+| Previous owner (un-laddered coin) | Broadcast their stale backup once `L_{k'}` matures — a race the current owner wins with an `interval`-block head start | Broadcast before their locktime; get the SE to re-sign old state; convey a padded or INVERTED ladder that would give them the earlier maturity | sdk55 (padding + inversion rejected); sdk34 (E) — a stale carrier backup fails outright once the receiver has materialized the shared root. *No live E2E re-runs the on-chain race itself (sdk13/sdk14 retired).* |
+| Previous owner (laddered coin) | Broadcast a superseded state / a hostile trigger, starting the CSV clock | Beat the current owner: the current state carries the strictly-lowest CSV and matures first; a de-trigger kills the stale tier outright | sdk40 PART 2, sdk51, sdk45 (keyless tower), chaos22 `steal_after_split` |
+| Malicious sender of a sub-coin | Attempt branch-root front-running (detected as `ExitBranchConflict`); try to convey a locktimed/value-creating/short-ancestor branch (all rejected at claim) | Double-spend a terminal parent at the SE (budget consumed pre-co-sign, IVL-REQ-7); re-open a budget (IVL-INV-7) | sdk04 case 2 (terminalized parent, second spend refused), sdk58 (11 adversarial census cases REJECT), rgb04 (single-use 410), sdk39 (depth-2 branch exit) |
 | Malicious SE alone | Refuse service (owner exits unilaterally, REQ-2/24); co-sign a fresh conflicting state → carries a *current* locktime, so no ladder advantage → plain first-seen race | Move funds without the owner's key (SPEC REQ-1); covertly violate a published budget — `GET spend_budget` is public (IVL-INV-9) | sdk15 |
 | SE + old owner collusion | Fresh double-sign = the same plain race; on structural nodes the extra signature is publicly attributable via the terminal audit | Win retroactively via the ladder; hide the misbehaviour from auditors | sdk15 |
 | Observer replaying an owner auth sig (audit **[15]**, closed UPDATE 3) | Historically: `set_spend_budget remaining=0` → brick to unilateral-exit-only, or destroy SE co-sign state via `withdraw/complete`. Both now require a single-use, endpoint-bound challenge (`GET /auth/challenge/<sid>`, sig over `sha256(nonce‖endpoint)`, atomically consumed) — a captured signature can no longer be replayed or redirected | Steal funds; forge a transfer; replay onto the two irreversible endpoints | AUDIT-2026-07 [15] |
@@ -370,23 +457,30 @@ floor empirically.
 
 ## 9. Lifetime and renewal
 
-**IVL-INV-13 (no *off-chain* ladder renewal; on-chain refresh exists).** There is NO mechanism to
-reset or extend an existing coin's ladder purely off-chain (contrast Spark's `renew_leaf`,
-[research/protocol-notes.md](research/protocol-notes.md)) — a coin's off-chain lifetime is bounded
-at deposit time and only an on-chain touch resets it. The lifetime-extension options and their
-exact effects:
+**IVL-INV-13 (no *off-chain* renewal of a BACKUP ladder; on-chain refresh exists).** There is NO
+mechanism to reset or extend an **un-laddered** coin's absolute-locktime backup ladder purely
+off-chain — its off-chain lifetime is bounded at deposit time and only an on-chain touch resets it.
+
+*Shape scope (§0) — this is NOT a system-wide limit any more.* The **laddered** shape has exactly
+the property this invariant used to say the system lacked (the old contrast with Spark's
+`renew_leaf`, [research/protocol-notes.md](research/protocol-notes.md)): a TES-R ladder is renewed
+off-chain by replacing its extension horizontally, and when the extension-CSV budget is exhausted it
+**rolls over** off-chain into a fresh level — unbounded off-chain state transitions at 0 vB of
+on-chain cost (PROTOCOL.md §5.6, proven end-to-end by **sdk43**, which renews, rolls over, renews
+again, reloads from disk and then exits the whole deep chain). Idle laddered coins therefore never
+age at all (sdk30 part a). The table below is the un-laddered shape's lifetime-extension menu:
 
 | Option | On-chain cost | Effect on deadlines |
 |---|---|---|
-| **Refresh (re-anchor)** — `UtexoWallet::refresh` / `refresh_sponsored` (`clients/libs/rust-sdk/src/refresh.rs`) | **1 tx + 1 deposit token** (SE-co-signed spend of the coin's outpoint → a fresh aggregate; the fresh `get_deposit_address` at refresh.rs:158 consumes a pre-paid deposit token via `take_token`, wallet.rs:334) | Brand-new coin: new `H_anchor`, full `initlock` horizon and full ladder capacity; the old outpoint is spent so all old backups die. Fee **user-paid** (refreshed coin = `amount − fee`) or **operator-paid** (off-chain rebate preserves the user's total; the SE holds no funds and cannot co-fund the tx — it stays a single-input spend). Cooperative (needs the SE); verified by `SDK_E2E=30`. |
+| **Refresh (re-anchor)** — `UtexoWallet::refresh` / `refresh_sponsored` (`clients/libs/rust-sdk/src/refresh.rs`) | **1 tx + 1 deposit token** (SE-co-signed spend of the coin's outpoint → a fresh aggregate; the fresh `get_deposit_address` at refresh.rs:158 consumes a pre-paid deposit token via `take_token`, wallet.rs:334) | Brand-new coin: new `H_anchor`, full `initlock` horizon and full ladder capacity; the old outpoint is spent so all old backups die. Fee **user-paid** (refreshed coin = `amount − fee`) or **operator-paid** (off-chain rebate preserves the user's total; the SE holds no funds and cannot co-fund the tx — it stays a single-input spend). Cooperative (needs the SE); verified by `SDK_E2E=30` (part a re-anchor, part b still-spendable, part c sponsored). **Sponsored-mode floor:** the operator's rebate is itself paid by an in-ladder split, so it must clear `max(fee + DUST_LIMIT, min_child_value)` — `min_child_value` is 1306 sat at 2 sat/vB, not the old `fee + dust` = 442. Sizing the rebate into that dead window made a sponsored refresh fail *after* the user had already paid the on-chain fee; fixed, and pinned by sdk30 part c. |
 | Cooperative withdraw + re-deposit | 2 txs (withdraw + new funding) | Same brand-new-coin effect as refresh, but two on-chain txs — refresh supersedes it. |
 | Materialize the branch (sub-coins) | branch txs (pre-paid reserves, §6) | Sub-coin becomes a *flat* coin; its OWN fresh ladder (anchored `H_split + initlock`, see below) now solely governs — ancestor deadlines vanish. |
 | Keep transacting before deadlines | none | Does NOT extend anything: each hop *lowers* the leaf locktime by `interval`; the root deadline (§6.2) is untouched. |
 
 **Fresh sub-ladders.** Each split output receives a fresh first backup via `create_tx1` with
-`qt_backup_tx = 0` (call at clients/libs/rust-sdk/src/transfer.rs:465 →
-clients/libs/rust/src/deposit.rs:46-70, which passes 0 as `new_transaction`'s qt argument at
-deposit.rs:62; the `tx_n = 1` parameter only labels the stored row). Hence sub-coin ladder anchor = `H_split + initlock`:
+`qt_backup_tx = 0` (call in `register_split_subcoins*`, clients/libs/rust-sdk/src/transfer.rs →
+clients/libs/rust/src/deposit.rs, which passes 0 as `new_transaction`'s qt argument;
+the `tx_n = 1` parameter only labels the stored row). Hence sub-coin ladder anchor = `H_split + initlock`:
 tree *depth* does not consume ladder capacity — each leaf gets its own
 `floor(initlock/interval)`-hop budget. Note the UX consequence: a freshly received sub-coin's
 unilateral exit waits ≈ `initlock` blocks (≈ 6.9 days on the deployed profile) minus hops already
@@ -405,22 +499,37 @@ possible after it forever.
 |---|---|
 | IVL-REQ-1 | not unit-testable (the unit model hardcodes both profiles as fixtures by design, invalidation_model.rs:37-41); verified by the config fetch on every deposit (clients/libs/rust/src/deposit.rs:50-69), exercised by every SDK E2E, plus receiver-side ladder validation against the fetched values (§5) |
 | IVL-REQ-2 | `unit::invalidation_model` (clients/libs/rust-sdk/src/invalidation_model.rs) — ladder math, capacity, window width |
-| IVL-INV-1..4 | SDK_E2E=27 `sdk27_invalidation_time` — ladder over time, maturity boundary; `unit::invalidation_model` |
-| IVL-REQ-4, IVL-INV-15, IVL-REQ-10 | sdk04/sdk17 (multi-hop transfer + claim), upstream Mercury receiver suite; mercurylib receiver checks (lib/src/transfer/receiver.rs:270-352, locktime bounds :455-467) |
-| IVL-INV-5, IVL-INV-6, IVL-REQ-11 | sdk12 (honest branch accepted), rgb03/rgb06 (DAG depth 2–3); chaos sdk22 (oracle asserts value conservation INV-1/13/25 and cheat refusal INV-5/18/19, chaos22_oracle.rs:5-12; INV-4 exercised implicitly — the cheats lose to the locktime-0 branch); `unit` tree check `non_tree_branch_is_rejected` (clients/libs/rust/src/transfer_receiver.rs:1073-1106) |
-| IVL-REQ-5..7, IVL-INV-7..9 | sdk08 (terminal node), `unit::types::terminal_predicate` (clients/libs/rust-sdk/src/types.rs:183-190), `unit::invalidation_model::terminal_predicate_matrix` (invalidation_model.rs:379-394, incl. the audit-[15] `(Some(0), 0)` brick row), rgb04 (single-use) |
+| IVL-INV-1..4 | `unit::invalidation_model` (ladder math, maturity boundary, capacity, window width); sdk55 (adversarial: a padded or INVERTED conveyed ladder is rejected by `ladder_decrements_by_interval`). **Gap:** no live E2E walks a ladder over wall-clock time — see the coverage note below |
+| IVL-REQ-4, IVL-INV-15, IVL-REQ-10 | sdk17 (multi-hop transfer + claim, incl. a partial second hop), sdk55 (padding/inversion rejected), upstream Mercury receiver suite; mercurylib receiver checks (lib/src/transfer/receiver.rs, `validate_backup_chain*` + the per-backup locktime bounds) |
+| IVL-INV-5, IVL-INV-6, IVL-REQ-11 | sdk31 (b) (honest branch accepted at claim — a 2-input colored combine — with the branch/terminal invariants re-derived and printed), sdk39 (depth-2 token exit: both branch txs broadcast root-first, allocation preserved), rgb03/rgb06 (off-chain DAG depth 2–3 built and exited); chaos22 (oracle asserts value conservation INV-1/13/25 and cheat refusal INV-5/18/19, chaos22_oracle.rs; its stuck-coin detector now accepts exit material of EITHER kind — backup chain or TES-R ladder); `unit` tree check `non_tree_branch_is_rejected` (clients/libs/rust/src/transfer_receiver.rs) |
+| IVL-REQ-5..7, IVL-INV-7..9 | sdk04 case 2 (the split TERMINALIZES the parent at the SE; a second spend is refused by both the wallet and the SE), sdk58 (the terminalized parent's superseded state is disclosed and the census proves it out-raced), `unit::types::terminal_predicate`, `unit::invalidation_model::terminal_predicate_matrix` (incl. the audit-[15] `(Some(0), 0)` brick row), rgb04 (single-use) |
 | IVL-REQ-8 | rgb04 |
-| IVL-REQ-9 | rgb07 (epoch, RGB path); SDK_E2E=27 `sdk27_invalidation_time` part d (epoch on the plain-sats path) |
-| IVL-REQ-12 | sdk10 (terminal-parent verify), `unit` terminal-parents count + Σ-inputs (clients/libs/rust/src/transfer_receiver.rs:1040-1144, incl. `required_ancestors_counts_inputs_not_hops` :1046-1068 — the Σ-inputs combine rule — and the `terminal_parents_sufficient` cases :1110-1144) |
-| IVL-REQ-13..15 | sdk07 (exit + cost), sdk12 (branch exit), sdk13 (stale clawback defeated), audit [20] regression |
-| IVL-INV-10, IVL-REQ-16 | sdk14 (watchtower race + deadline/fee quantification); SDK_E2E=27 `sdk27_invalidation_time` part c — deadline-gap arithmetic on a k=2 pre-transferred parent; `unit::invalidation_model` |
-| IVL-ERR-1..9 | sdk08/rgb04 (410s), rgb07 + sdk27 part d (410 epoch, IVL-ERR-2), sdk12 Part C (409 nonce reuse), sdk13/sdk14 (race outcomes), receiver unit tests |
-| IVL-INV-11, IVL-INV-12 | sdk13, sdk14, sdk15 (malicious-SE trust floor); chaos sdk22 |
-| IVL-INV-13, IVL-INV-14, exit-cost scaling | SDK_E2E=26 `sdk26_invalidation_scale` — depth scaling + measured exit costs; sdk07 (267 vB depth-1: 155 vB branch + 112 vB backup, types.rs:158-200) |
-| IVL-INV-13 (refresh re-anchor, both fee modes) | SDK_E2E=30 `sdk30_refresh` — user-pays (fee from coin) + operator-pays (off-chain rebate); horizon reset (headroom 700→999≈initlock), old outpoint spent, refreshed coin spendable; `unit::refresh::refresh_fee_and_amount_arithmetic` |
+| IVL-REQ-9 | rgb07 (epoch: `sign/first` refused past the deadline, unilateral exit still live afterwards). The plain-sats epoch case that sdk27 part d carried is no longer covered by an E2E — see the coverage note below |
+| IVL-REQ-12 | sdk31 (b) — the Σ-**inputs** rule on the real path: a 2-input combine forces 2 named + terminal ancestors, and bob books the piece only after enforcing it; sdk39 (depth-2 branch, same check at claim), `unit` terminal-parents count + Σ-inputs (clients/libs/rust/src/transfer_receiver.rs `terminal_parents_tests`, incl. `required_ancestors_counts_inputs_not_hops` — the Σ-inputs combine rule — and the `terminal_parents_sufficient` cases) |
+| IVL-REQ-13..15 | sdk31 (c) (unilateral exit of a branch-carried coin: the 2-input combine broadcasts, both carrier outpoints are spent so the old carriers' backups are dead, then the leaf backup matures), sdk39 (depth-2 branch materialized root-first, then the sub-coin settles), sdk34 (D)/(E) (watchtower materializes a carrier's branch; the sender's later stale backup then FAILS — the clawback is defeated), sdk50 (SDK unilateral exit on the laddered shape, for contrast), audit [20] regression |
+| IVL-INV-10, IVL-REQ-16 | sdk34 (`auto_exit_due` at the deposit-anchored deadline: no-op far from D, materializes within margin, clawback defeated past D), sdk45 (a KEYLESS watch bundle drives an offline owner's exit — option-1 discipline on the laddered shape), `unit::invalidation_model`. **Gap:** the k=2 deadline-gap arithmetic that sdk27 part c asserted is now covered only by the unit model |
+| IVL-ERR-1..9 | rgb04 (410 single-use), rgb07 (410 epoch, IVL-ERR-2), sdk04 case 2 (410 budget exhausted / terminal), sdk12 Part C (409 nonce reuse), sdk58 (branch/census rejections), sdk40 PART 2 + sdk51 (race outcomes: a stale state cannot confirm), receiver unit tests |
+| IVL-INV-11, IVL-INV-12 | sdk15 (malicious-SE trust floor — fresh double-sign degrades to a plain race), sdk40 PART 2 (stale state dies at consensus), sdk51 (watchtower defends a hostile trigger), sdk45 (keyless tower), sdk52 (a carrier is never laddered — layer-1 shape invariant); chaos22 (no cheat succeeds, no value created, no double custody, under concurrency) |
+| IVL-INV-13, IVL-INV-14, exit-cost scaling | sdk39 (a depth-2 branch really exits, end to end), sdk31 (c) (a WIDE branch — one 2-input combine tx — exits); the exit-cost model itself is `unit` (`types.rs` `ExitCostEstimate`). **Gap:** the measured depth/width scaling table came from sdk26 and is no longer regenerated by any live test — see the coverage note below |
+| IVL-INV-13 (laddered shape: unbounded OFF-chain renewal) | SDK_E2E=43 `sdk43_tesr_rollover` — renew, roll over off-chain into a fresh level, renew again, reload from disk, exit the whole deep chain; SDK_E2E=30 part a (mine 300 blocks: an idle laddered coin is byte-identical afterwards, 0 vB rent) |
+| IVL-INV-13 (refresh re-anchor, both fee modes) | SDK_E2E=30 `sdk30_refresh` — user-pays (fee from coin) + operator-pays (off-chain rebate, sized at `max(fee + DUST_LIMIT, min_child_value)`); old outpoint spent, refreshed coin spendable; `unit::refresh::refresh_fee_and_amount_arithmetic` |
 
 E2E dispatch: clients/tests/rust/src/main.rs (`SDK_E2E=N ML_NETWORK=regtest cargo run` from
-clients/tests/rust); all tests above exist as of this revision.
+clients/tests/rust); every test named in the table above exists as of this revision. Tests that were
+retired — and must never be cited as coverage again — are listed immediately below.
+
+**Coverage note — tests retired with the one-protocol consolidation.** The following E2Es no longer
+exist, and no claim above may be read as covered by them. Where the property survives, the row
+above names its live replacement; where it does not, the gap is stated rather than papered over.
+
+| Retired | Disposition |
+|---|---|
+| sdk26 `sdk26_invalidation_scale`, sdk27 `sdk27_invalidation_time` | **Obsolete as system-wide claims.** They measured how a coin *ages* toward its ladder floor. A laddered coin never ages (its tier chain is un-broadcast, 0 vB rent) and the ladder + terminality subsume the property. What they uniquely asserted and nothing replaces: the wall-clock ladder walk (IVL-INV-1..4), the plain-sats epoch case (IVL-REQ-9), the k=2 deadline-gap arithmetic (IVL-INV-10) and the measured depth/width exit-cost scaling. All four are now carried by `unit::invalidation_model` and the RGB-path E2Es only. |
+| sdk13, sdk14 | Retired. The on-chain stale-backup race they ran has no live replacement on the un-laddered lane (see IVL-INV-3). Their *outcomes* are asserted structurally instead: sdk55 (inverted ladder rejected at claim), sdk34 (E) (a stale carrier backup fails after materialization), and on the laddered shape sdk40 PART 2, sdk51, sdk45. |
+| sdk07, sdk08, sdk10 | Retired with the flat exit/terminal suite. Replaced by sdk50 (unilateral exit through the SDK) and sdk58 (11 adversarial cases against the child-bundle census), plus sdk39 for the branch-carried exit and sdk04 case 2 for SE-side terminality. |
+| sdk28 (sats granularity), sdk33 (auto-refresh) | **Obsolete.** The in-ladder split has its own fee model (`tier_out_total` / `committed_fee_for_outputs` / `min_child_value`, lib/src/tesr.rs), and there is no ladder floor to approach — unbounded off-chain renewal is sdk43. |
+| sdk35 (trust boundaries) | Back-filled into sdk45 (the watch bundle carries NO key material; a second independent tower is idempotent), sdk52 (a carrier is never laddered), sdk51, and sdk46/47/54 (the R′ census). |
+| sdk03, sdk05, sdk06, sdk18 (LN) | Out of scope here (SPEC §7); replaced by sdk63/64/67 (+ sdk65 non-exact, sdk66/sdk68 failure paths). |
 
 ## 11. Known limitations & open items
 
@@ -436,7 +545,13 @@ spec.
    pre-transferred ancestors and the `margin_blocks` argument must absorb that error
    (IVL-REQ-16 option 2), or the branch must be broadcast eagerly (option 1). An online receiver
    is always safe; an owner offline longer than their margin is exposed only if an ancestor was
-   transferred more than `margin_blocks / interval` times before splitting.
+   transferred more than `margin_blocks / interval` times before splitting. Scope shrank with the
+   one-protocol consolidation but did NOT close: the residual is an **un-laddered-shape** exposure
+   (RGB carriers and split sub-coins), since a laddered coin has no ancestor-backup deadline at all.
+   Live coverage of the mitigation is sdk34 (`auto_exit_due` materializes a received carrier within
+   margin and the sender's later stale backup then fails); default margin is
+   `SdkConfig::auto_exit_margin_blocks = 288` (k ≤ 14 pre-split hops on the deployed 1000/10
+   profile).
 2. **[15] (CLOSED for the irreversible ops, AUDIT UPDATE 3) — owner-auth replay griefing.** The
    static `sha256(statechain_id)` owner auth was replayable; an observer in the request path
    could *brick* a coin to unilateral-exit-only via `set_spend_budget remaining=0` (griefing/DoS,
@@ -451,12 +566,21 @@ spec.
    omission of ancestors, not substitution of terminal decoys; the defence is that the receiver
    holds the fully-signed branch and can exit immediately.
 4. **Fixed-fee pre-signed exits (accepted, SPEC §14).** Branch txs carry only the split-time fee
-   reserve (`(parent_sats/100).clamp(300, 2000)` sats, transfer.rs:596-599), and no fee-bump
+   reserve (`(parent_sats/100).clamp(300, 2000)` sats, `split_fee_reserve` in
+   clients/libs/rust-sdk/src/transfer.rs), and no fee-bump
    support — neither CPFP nor RBF — exists anywhere in the SDK (SPEC §14's "no CPFP/RBF
    fee-bump"). A *manual* CPFP child on the backup is possible in principle, since its sole
    spendable output pays the owner's own P2TR key (lib/src/transaction.rs:166-173), but nothing
    constructs one. In a fee spike an exit confirms slowly; the ladder ordering (IVL-INV-2) still
-   holds, but IVL-REQ-16 margins SHOULD account for confirmation latency (quantified in sdk14).
+   holds, but IVL-REQ-16 margins SHOULD account for confirmation latency. (The quantification that
+   sdk14 used to produce is gone with it; no live test re-measures exit confirmation under fee
+   pressure — see the §10 coverage note.)
+   *The in-ladder split does NOT use this reserve.* It has its own fee model — `tier_out_total` /
+   `committed_fee_for_outputs` and a `min_child_value` admission floor (lib/src/tesr.rs) — because a
+   child must fund its OWN two tiers plus dust, not one branch hop. Sizing that guard with the old
+   `fee + dust` = 442 backup floor admitted children below the real 1306-sat (2 sat/vB) minimum,
+   which terminalized the parent and THEN failed, stranding it; the guard now uses
+   `min_child_value` (fix pinned by sdk30 part c and exercised throughout sdk58/sdk59).
 5. **u32 amount width (accepted, SPEC §14).** Coin sats are booked as `u32`; several paths cast
    with `as u32` and would silently truncate above ~42.9 BTC (e.g.
    clients/libs/rust/src/coin_status.rs:229), while the split path errors via `u32::try_from`

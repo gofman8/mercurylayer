@@ -50,7 +50,7 @@ pub async fn get_batch_time_by_batch_id(pool: &sqlx::PgPool, batch_id: &str) -> 
 }
 
 
-/// [pending-transfer lock, V2-CHILD-FIRSTCLASS.md] True if `statechain_id` has an OPEN transfer — a row
+/// [pending-transfer lock, CHILDREN.md] True if `statechain_id` has an OPEN transfer — a row
 /// not yet completed (`key_updated = false`) and not yet expired (opened within the last hour). While a
 /// transfer is open the SE refuses any co-sign of the coin (the sender's legitimate pre-signs all happen
 /// BEFORE `get_new_x1` opens the transfer — see transfer_sender.rs re-order), so a still-owner sender

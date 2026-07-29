@@ -1,4 +1,4 @@
-//! E2E (SDK_E2E=68) — **V2 whole-coin exact-PAY failure → clean reclaim** (V2-LN-HODL.md §STATUS).
+//! E2E (SDK_E2E=68) — **V2 whole-coin exact-PAY failure → clean reclaim** (LIGHTNING.md §STATUS).
 //!
 //! Closes the flagged SE-reconcile gap on the failure path. When a V2 wallet pays a BOLT11 whose amount
 //! exactly equals one of its coins, `pay_lightning_invoice` uses the WHOLE-coin latch (no split). If the

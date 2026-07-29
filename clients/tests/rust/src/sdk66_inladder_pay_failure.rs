@@ -1,4 +1,4 @@
-//! E2E (SDK_E2E=66) — **NON-EXACT V2 Lightning PAY failure → clean rollback** (V2-LN-HODL.md §2b).
+//! E2E (SDK_E2E=66) — **NON-EXACT V2 Lightning PAY failure → clean rollback** (LIGHTNING.md §2b).
 //!
 //! The failure path of the latched in-ladder split: Alice tries to pay a BOLT11 that exceeds the SSP's
 //! outbound liquidity (unroutable), so `send_payment` FAILS after the coin was already split + the piece

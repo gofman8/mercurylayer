@@ -297,7 +297,7 @@ pub fn ladder_decrements_by_interval(prev_lock_time: u32, current_lock_time: u32
 ///
 /// RESIDUAL: the V1 backups' blinded-MuSig commitments are not verified on the V2 lane (the tiers are,
 /// via `verify_bundle`'s signature check). Closing it needs the SE's `tx_n` ↔ co-sign indexing to
-/// distinguish tier co-signs from backup co-signs — tracked in `docs/utexo/V2-SPLIT-FINDINGS.md`.
+/// distinguish tier co-signs from backup co-signs — tracked in `docs/utexo/history/SPLIT-FINDINGS.md`.
 pub fn validate_backup_chain_v2(
     backup_transactions: &Vec<BackupTx>,
     tx0_hex: &str,

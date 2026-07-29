@@ -1,4 +1,4 @@
-//! E2E (SDK_E2E=53) — **the LN-latch guard is now LIFTED (HODL-latch pivot, V2-LN-HODL.md)**.
+//! E2E (SDK_E2E=53) — **the LN-latch guard is now LIFTED (HODL-latch pivot, LIGHTNING.md)**.
 //!
 //! History: this test used to prove `transfer_sender` REFUSED a Lightning-latched transfer of a V2
 //! (TES-R) coin, because the Model A co-sign of S' is not preimage-gated. The HODL-latch pivot lifts
@@ -35,7 +35,7 @@ pub async fn execute() -> Result<()> {
     let bob_addr = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk53_bob").await?;
 
     // --- A LATCHED transfer (batch_id set) of a V2 coin must now OPEN (guard lifted). ---------------
-    // Safety is provided by the SSP's pre-pay census + operator trust (V2-LN-HODL.md), not a refusal.
+    // Safety is provided by the SSP's pre-pay census + operator trust (LIGHTNING.md), not a refusal.
     let batch_id = format!("sdk53-batch-{}", uuid::Uuid::new_v4());
     let latched = mercuryrustlib::transfer_sender::execute(
         &cc, &bob_addr, "sdk53_alice", &sid, None, false, Some(batch_id),

@@ -1,7 +1,26 @@
-# Utexo V2 — renewal & invalidation redesign
+# Utexo TES-R — renewal & invalidation design (the shipped protocol)
 
-**Status**: chosen architecture, post-adversarial-review. This document supersedes the V1 calendar-refresh
-model described in `learn/invalidation-deep-dive.md` §1b/§6 for all new deposits once shipped.
+**Status: SHIPPED — this is the protocol.** TES-R is not a proposal or a lane any more: `claim()`
+establishes a trigger/extension/state ladder for **every fresh confirmed ROOT coin, unconditionally**.
+The `deposit_protocol_version` field and the `UTEXO_PROTOCOL_DEFAULT` escape hatch that could opt a
+deposit back into the flat pre-TES-R shape are **deleted**, and zero tests pin the old lane. This
+document supersedes the calendar-refresh model described in `learn/invalidation-deep-dive.md` §1b/§6.
+
+**One protocol, two coin SHAPES — both current.** "Un-laddered" is a *shape*, not a legacy lane:
+- **Laddered**: every plain deposit — trigger T → extension X_m → state S, relative CSV, un-broadcast.
+- **Un-laddered**: an **RGB carrier** is deliberately never laddered (a plain tier spend would destroy
+  the allocation — the terminal-freeze rule of §5.10; pinned by sdk52), and a **split sub-coin whose
+  funding is un-broadcast** cannot root a trigger (B0 — a trigger over an unconfirmed prevout is
+  unbroadcastable). These keep the signed-once backup and transfer by backup-chain handover. That path
+  is **load-bearing for RGB tokens**, not dead code — and it keeps the calendar machinery that
+  §5.2 / §5.10 / §9-Phase-3 below expected to disappear (see the **[Shipped]** corrections there).
+
+**How to read the rest.** §1 and §5–§7 are normative and describe running code. §2, §3, §8 and §9
+compare against the **pre-migration absolute-ladder baseline** ("V1"); that baseline is retained as the
+*rationale for this design* and is no longer a shipped option. Sections where implementation amended
+the design are tagged **[Shipped]** in place: §5.4 (in-ladder split + first-class children), §5.10.4
+and §5.2 (carrier deadlines survive on the un-laddered shape), §5.12 (the latch is a HODL-invoice
+latch), §9 (migration complete).
 
 **Chosen architecture**: **TES-R** — *Trigger / Extension / State with self-split Rollover*.
 It is a composition: the `csv-trigger` (TES) candidate is the chassis; two load-bearing elements are
@@ -35,7 +54,11 @@ confiscation-by-design** — nothing in TES-R ever pays the operator by timeout.
 
 ---
 
-## 2. Why V1's absolute ladder cannot scale (the block-space wall)
+## 2. Why the absolute ladder cannot scale (the block-space wall)
+
+*(Historical rationale for the whole design. The absolute-ladder deposit path no longer exists — no
+deposit is ever anchored to a decrementing absolute nLockTime ladder. "V1" below means that
+pre-migration baseline.)*
 
 V1 anchors every coin's decrementing nLockTime ladder to an **absolute** deposit height. Staying alive
 requires an on-chain re-anchor (refresh, 112 vB) per coin per ~initlock (~1,008 blocks ≈ 7 days),
@@ -62,7 +85,10 @@ age at all.
 
 ## 3. Comparison landscape
 
-| | **V1 (Mercury Utexo)** | **Spark** | **Ark** | **SuperScalar** | **V2 (TES-R)** |
+*(The **V1** column is the pre-migration baseline, kept because every number in this design is measured
+against it. It is not a shipped alternative — the shipped protocol is the last column.)*
+
+| | **V1 (pre-migration baseline)** | **Spark** | **Ark** | **SuperScalar** | **TES-R (shipped)** |
 |---|---|---|---|---|---|
 | Idle on-chain footprint | 5,840 vB/coin-yr (112 vB per ~7d) | **0** | Refresh per round or lose funds | Per-factory ladder txs (~monthly, amortized /N) | **0** |
 | Renewal mechanism | On-chain re-anchor per coin | Off-chain re-sign with operator group (`renew_leaf`) | On-chain round through ASP | New factory before dying period | **Off-chain**: DW lower-CSV extension re-sign; self-split rollover at epoch exhaustion |
@@ -121,7 +147,7 @@ Three candidates, six adversarial reviews. Verdict logic:
 
 ## 5. The chosen architecture: TES-R
 
-### 5.1 What is kept from V1, unchanged
+### 5.1 What the redesign did not touch (carried over unchanged)
 
 Single blind-MuSig2 SE (signs only 32-byte sighashes); key-share rotation s_n + e_n = const with
 enclave deletion of old shares; per-node spend budgets / terminality with public receipts
@@ -157,6 +183,11 @@ published in the SE's signed nostr record so a receiver can detect a per-victim 
 | Hop budget per depth level | 36 × 16 = **576 transfers** | between depth-increments; see §5.6 |
 | Worst flat unilateral wait | E0 + D0 = 2,160 blocks ≈ **15 days**, decreasing 36 blocks/hop | |
 
+**[Shipped]** these are `TesrParams::mainnet()` in `lib/src/tesr.rs` verbatim (d0 1440 / δ 36 /
+d_floor 144, e0 720 / δE 36 / e_floor 144, m_max 15, committed fee 2 sat/vB); a `TesrParams::regtest()`
+preset (24/6/6, 12/3/3, m_max 2) exists only so a full lifecycle fits in a test's mining budget.
+`sdk44` pins the schedule arithmetic (`state_csv`/`ext_csv`/`needs_renewal`/`needs_rollover`).
+
 δ = 36 (≈6 h) rather than the TES draft's 24 (≈4 h): both economics reviews flagged the head start as
 the single parameter everything stands on, and mainnet has sustained >4 h full-block spikes. The
 budget sensitivity is stated honestly: δ = 24 → 1,350 hops/level; **36 → 576**; 72 → 162; 144 → 45.
@@ -166,7 +197,15 @@ Because rollover (§5.6) is off-chain, even conservative δ only trades exit wei
 confirms; T has no timelock. So **nothing anywhere matures until someone broadcasts T on-chain**. An
 idle coin — and an entire idle split/combine DAG — never ages. No calendar deadlines, no refresh rent,
 no root-deadline materializations. The whole audit-[17]/B6 class (deposit-anchored deadline
-arithmetic) is deleted wholesale, along with `auto_exit_due`'s calendar machinery.
+arithmetic) is deleted **for laddered coins**.
+
+**[Shipped correction]** it is *not* deleted wholesale: the un-laddered shape (RGB carriers, §5.10;
+sub-coins over un-broadcast funding, B0) still rests on the signed-once **absolute-locktime** backup,
+so it still has a root deadline and still needs materialization before it. `auto_exit_due` and
+`exit_deadline_block` therefore **survive, scoped to that shape** (`SdkConfig::auto_exit`, default on,
+margin 288 blocks), and are exercised live by sdk34 (carrier watchtower materializes before the
+deadline) and sdk32 (the residual clawback window on an un-laddered carrier). A laddered coin has no
+deadline for them to act on.
 
 ### 5.3 Fees [Amendment: TES-fixable #2 + Grove reviewer's pinning finding, merged]
 
@@ -194,6 +233,37 @@ un-broadcast, so nothing ticks until it confirms. A combine CB carries per-input
 input's Δ (BIP-112 is per-input); Σ-inputs terminal-ancestor verification (R7) unchanged. Child coins
 get fresh slots via the free derived-token path (REQ-35 analog).
 
+**[Shipped] — the in-ladder split, and why it is the only split.** A split is a **state tier** (`SP`
+spending `X_m.out[0]`), i.e. a *descendant* of T, never a rival for F. That is what closes the theft
+vector that twice reverted the default: a past owner's retained no-timelock trigger has nothing to
+race, because the split does not compete for the funding outpoint. Attack-proven by **sdk58** (11
+adversarial cases, all REJECT) and **sdk59** (end-to-end split payment), with the bundle/backup-chain
+adversarial cases in **sdk54/sdk55**.
+
+**[Shipped] — admission floor (defect D1, fixed).** A child is not a bare output: `establish_child`
+hangs the child's OWN extension + state tiers off `SP.out[j]`, each burning committed fee + P2A, and
+the final state output must still clear dust. The guard originally used the old backup-fee floor
+(442 sat at 2 sat/vB), so a piece in the 442..1306 window **terminalized the parent and then failed**,
+stranding it to unilateral-exit-only. The floor is now `mercurylib::tesr::min_child_value(fee_rate,
+dust)` (1306 sat at 2 sat/vB), checked **before** the parent is terminalized.
+
+**[Shipped] — received children are FIRST-CLASS** (`CHILDREN.md`). The child claim completes
+the standard SE key handover: `A_child` is invariant across the rotation (`sender_share + SE_old ==
+receiver_share + SE_new`), which is exactly what keeps the pre-signed child exit chain valid, while the
+sender is permanently locked out (auth rotated). A child is then payable onward off-chain — **whole**
+via `child_retransfer`, or **split** via `child_in_ladder_pay` (a depth-2 `ancestors` chain). Each hop
+costs exactly **one co-signature** and discloses exactly **one superseded state**, which the receiver's
+census counts and proves out-raced. Evidence: **sdk60** (alice→bob→carol whole re-transfer, the funding
+outpoint unspent throughout) and **sdk17** (partial second hop). The **child is deliberately not
+terminalized** — the census closes any pre-conveyance rival and the handover closes every later one;
+the one exception is the Lightning-latched piece (§5.12), which stays terminalized.
+
+**[Shipped] — B0, root-only laddering.** `claim()` ladders a coin only when its funding output is a
+**confirmed on-chain root**. A sub-coin whose funding is an un-broadcast split output cannot root a
+trigger (the trigger would have no prevout to spend, and a v3 tier cannot relay over an unconfirmed v2
+parent), so such a coin travels the un-laddered shape instead — checked fail-closed against electrum,
+never inferred.
+
 ### 5.5 Renewal (pure off-chain; the common case)
 
 When Δ_{k+1} would fall below D_floor, the SDK runs renewal inside `transfer()` — replacing V1's
@@ -219,6 +289,14 @@ tier — renewal replaces horizontally, tree depth stays constant across all epo
 and categorically stronger than Spark's key-deletion promise, but it is a race, not an axiom. Enclave
 single-active-state refusal remains the second, independent layer.
 
+**[Shipped] evidence**: **sdk51** — someone else spends F (a prior owner racing a stale state, or a
+griefer); the owner runs only `defend_ladders()` and the strictly-lowest-CSV current state matures
+first, so the funds land at the owner's key. **sdk40 PART 1** — BIP-68 is enforced by real consensus
+(X is rejected before E confirmations of T, S before D of X) and nothing ages while un-broadcast.
+**sdk40 PART 2** — a stale ladder is killed outright at the consensus level (X′ can never confirm once
+its prevout is gone). **sdk43** — unbounded off-chain renew → rollover → renew, zero on-chain bytes,
+then a unilateral exit through the whole deep chain. **sdk42** — the full laddered lifecycle.
+
 ### 5.6 Rollover at epoch exhaustion (the Grove import — mandatory on-chain touch DELETED)
 
 The TES draft forced an on-chain compaction after epoch exhaustion. TES-R instead performs an
@@ -241,6 +319,13 @@ is pre-signed against the known template output *before* broadcast, closing the 
 Net budget between on-chain touches (default policy): 576 × 4 depth levels ≈ **2,300 transfers per
 112 vB** — and a user who tolerates depth may set the cap higher and touch the chain *never*.
 
+**[Shipped]** rollover runs unattended inside `transfer()`: **sdk43** drives renew → rollover → renew
+past epoch exhaustion and shows the funding outpoint untouched. The solo-compaction path is the
+re-anchor of **sdk30** (both fee models). Defect **D2** was here: `refresh_sponsored` sized the
+operator's rebate into the dead 442..1306 window of D1, so a *sponsored* refresh failed **after** the
+user had already paid the on-chain fee; the rebate is now `max(fee + DUST_LIMIT, min_child_value)` and
+the operator absorbs the difference.
+
 ### 5.7 Race analysis
 
 | Adversary | Holds | Attack | Honest defence (keyless-tower executable) | Winner | Watching assumption |
@@ -254,6 +339,15 @@ Net budget between on-chain touches (default policy): 576 × 4 depth levels ≈ 
 | Trigger griefer (any past owner, anonymous) | T | Broadcast T to force cost | **Co-op de-trigger: 111 vB, coin fully restored (§5.8)** | **Honest**; attacker pays ~276 vB to cost the victim ~111 vB | SE alive; else falls to row 1 |
 | Malicious/buggy tower | Bundle (all pre-signed, pays owner only) | Broadcast early / not act | — | **Honest** (early = settles to owner; inaction = no tower) | — |
 | Mempool pinner | — | Pin packages | TRUC 1P1C + sibling eviction + committed base fee + P2A | **Honest** | Standard fee-bumping |
+
+**[Shipped] where each row is exercised**: rows 1–3 (stale state / old epoch / ancestor race) —
+**sdk51** (a watchtower defends against a hostile trigger end-to-end) and **sdk40 PART 2** (the stale
+state dies at consensus); the honest defence's pre-signed material — **sdk50** (unilateral exit
+through the full tier chain) and **sdk45** (the keyless bundle drives it with no key material);
+adversarial rejection of forged/hidden structure — **sdk58** (11 cases), **sdk54**, **sdk55**. Rows 4–6
+(hacked SE) are arithmetic properties of 2-of-2, not test-observable beyond the co-sign gates
+(**sdk56/sdk57**, retry-idempotence and owner-share binding). Row 3's "no calendar deadline exists"
+holds for a **laddered** sub-coin; the un-laddered shape keeps its root deadline (§5.10.4).
 
 **The traded property, stated plainly**: V1's unconditional ~7-day no-watch window is exchanged for
 *perpetual but alarm-driven* watching. No theft tx can become valid until ≥144 blocks (~1 day) after a
@@ -287,6 +381,11 @@ colored self-transition (~155 vB, tapret). Consequences:
 - The de-trigger requires SE liveness — it is a UX/cost shield, never a safety dependency (the
   unilateral tree always exists).
 
+**[Shipped]** built by `mercurylib::tesr::build_detrigger` / co-signed by `cosign_detrigger`, and
+proven end-to-end by **sdk40 PART 2**: a griefer broadcasts T′, the owner's fresh no-timelock spend of
+T′.out[0] confirms immediately, and X′ can never confirm afterwards even past E blocks. The colored
+(~155 vB tapret) variant and the mass-grief prioritization policy (R-1 / O-6) are not test-covered.
+
 ### 5.9 Exit costs
 
 - **Cooperative** (normal path): 1 fresh co-signed tx ≈ 111 vB, instant, batchable — unchanged.
@@ -302,11 +401,16 @@ colored self-transition (~155 vB, tapret). Consequences:
 - **Token materialization**: confirm through the last colored tx (branch only, 2d+1 txs); no final
   state needed; allocation settles on the resting output.
 
+**[Shipped]** the unilateral path is driven end-to-end by **sdk50** (and by the keyless tower in
+**sdk45**). Defect **D4** was here: a *child* routed to a unilateral exit was booked `WITHDRAWING`
+even though a unilateral exit produces no withdrawal transaction, so status polling errored forever —
+the child now reports the unilateral shape it actually has.
+
 ### 5.10 RGB integration [Amendment — resolves the colored-extension contradiction found by BOTH reviews]
 
 The TES draft's "per-hop re-signed colored defensive extension" is **deleted** — it contradicted the
 signed-once rule and forked into either 54-fold budget collapse or Spark-grade enclave-trust
-(accepted finding). The V2 rule set:
+(accepted finding). The rule set:
 
 1. **RGB transitions anchor ONLY in signed-once transactions**: colored splits/combines (SP/CB) and
    colored self-transitions (de-trigger re-anchors, rollover self-splits). Plain T/X/S never host
@@ -321,15 +425,26 @@ signed-once rule and forked into either 54-fold budget collapse or Spark-grade e
    T/X/SP chain as witness txs — more branch, same model).
 3. **Seals sit on resting outputs** of un-broadcast colored txs; token transfers remain colored splits
    minting fresh receiver pieces — token DAG depth grows per token hop exactly as in V1 (no
-   regression; carrier economics = V1 carrier economics, minus all calendar deadlines).
-4. **Carrier defense** = materialize the colored branch only (REQ-33 semantics minus the calendar),
-   per-tier CSV head starts as §5.7 row 3. An idle received token carrier has **no materialization
-   deadline, ever** — the V1 "received tokens must materialize by the root deadline" machinery is
-   deleted.
+   regression; carrier economics = V1 carrier economics — **including its calendar deadlines**, per the
+   correction in 4 below; the draft wrote "minus all calendar deadlines" and that was wrong).
+4. **Carrier defense** = materialize the colored branch only (REQ-33 semantics), per-tier CSV head
+   starts as §5.7 row 3. **[Shipped correction — the draft over-claimed here]**: because rule 1 forbids
+   laddering a carrier at all, a carrier never gains the CSV tiers that would delete its calendar. It
+   keeps the signed-once **absolute-locktime** backup, so a received token carrier **does** still have
+   a root-deadline materialization duty, and REQ-33's `auto_exit_due` machinery is retained for exactly
+   this shape (default on; sdk34 materializes before the deadline, sdk32 documents the residual
+   clawback window if nobody does). Only *laddered* coins have no deadline. This is the price of
+   terminal-freeze and is deliberate, not a migration leftover.
 5. **SE blindness fully preserved**: a colored sighash is byte-indistinguishable from a plain one;
    renewal/rollover/de-trigger sign sats-structure or owner-built colored self-transitions the SE
    never parses; consignments stay P2P (ECIES via relay). No batch coordinator exists at launch, so
    the coordinator-sees-carriers concern from review is moot.
+
+**[Shipped] evidence**: **sdk52** pins rule 1, the invariant everything else here rests on — in one
+wallet the plain coin carries a ladder and the token carrier carries **none**, and an off-chain RGB
+transfer still settles. **sdk32** pins the terminal-freeze semantics over time (carrier terminal at the
+SE, un-laddered, no fresh co-signed sweep possible) and the residual clawback window of point 4. The
+RGB suites (`rgb*`, `ta*`, `tb*`) run over the shipped protocol unchanged.
 
 ### 5.11 Receiver verification at claim (R′ set)
 
@@ -343,11 +458,34 @@ check for colored ancestry. (R8) RGB consignment client-validated, un-broadcast 
 All txs v3, committed-fee + single P2A, Σout = Σin − fee. **[Amendment, TES-fixable #6]**: hard depth
 cap (reject depth > 8 regardless of policy) + claim-time validation DoS pricing.
 
-### 5.12 Lightning latch
+**[Shipped]** the R′ set is enforced at claim: **sdk46** (R5′ against the *real* SE counter — the SE
+increments by exactly the tier count, `verify_bundle` accepts the true count and rejects a hidden extra
+signature), **sdk47** (R′ across a transfer), **sdk54** (adversarial `verify_bundle`), **sdk55**
+(backup-chain adversarial), **sdk58** (11 adversarial in-ladder-split cases). The census generalizes to
+N hops for first-class children (`se_num_sigs == v1_backups + Σ conveyed_tiers`): each hop discloses
+exactly one superseded state, so an undisclosed rival shows up as a count mismatch — **sdk60**,
+**sdk17**.
 
-Transfer shape is unchanged, so the latch composes as in V1; per §5.5 the renewal co-signs bundled
-into a latched transfer are gated by the same preimage — atomic with the state co-sign. No
+### 5.12 Lightning latch **[Shipped — it is a HODL-invoice latch]**
+
+Transfer shape is unchanged, so the latch composes over the ladder; per §5.5 the renewal co-signs
+bundled into a latched transfer are gated by the same preimage — atomic with the state co-sign. No
 half-renewed state is observable to the SSP (was open problem #9; now normative).
+
+The shipped latch is the **HODL-invoice** construction (`LIGHTNING.md`, which supersedes the
+adaptor-signature sketch that preceded it — PTLCs do not exist in the routing network). Lightning
+works **both directions on the ladder**: **sdk63** (pay), **sdk64** (receive), **sdk67** (receive out
+of an in-ladder split), **sdk65** (non-exact pay), with the failure/rollback paths in **sdk68** (exact
+reclaim after a pay failure) and **sdk66** (non-exact rollback); **sdk53** pins the latch guard.
+
+**This is the one case that stays terminalized.** The LN-latched piece sits unclaimed past the
+pending-transfer lock's window (the SSP settles on its own schedule), so the temporary lock cannot be
+what protects it — the piece is terminalized instead, a permanent lockout. Every other in-ladder child
+is *not* terminalized (§5.4): it is protected by the census plus the key handover.
+
+Defect **D3** was here: the one-call Lightning PAY API minted its input via `ensure_exact_coin` and so
+refused **every laddered coin** — i.e. every coin the protocol produces. It now pays from the ladder
+directly.
 
 ### 5.13 Watchtowers (WatchBundle v2)
 
@@ -361,14 +499,27 @@ coin, funded w.r.t. anchors; the bundle carries fee-child templates. Funding rai
 a tower fee bond sized to ~2 spike bumps (~2 × 152 vB × 50 sat/vB ≈ 15,000 sats, operator-carried and
 priced into the onboarding fee per the delegation refinement). Multiple towers compose idempotently.
 
+**[Shipped]** **sdk45** is the evidence for the two properties this section rests on: the watch bundle
+carries **no key material**, and a **second independent tower is idempotent** (both explicitly
+asserted there). **sdk51** runs the state machine against a real hostile trigger (and is a no-op while
+the coin is idle — an un-broadcast coin never ages, so there is nothing to defend). The carrier-side
+counterpart — materializing a colored branch before its deadline — is **sdk34** (§5.10.4). What is
+**not implemented**: the package-aware broadcast. `watch_pass` (and `exit_pass`) walk the tiers with
+per-tx `transaction_broadcast_raw` and attach no P2A fee child — the committed fee of §5.3 carries each
+tier at ordinary rates, but the amendment above is a specification, not shipped code, and no test
+exercises spike-time fee bumping (§9).
+
 ---
 
 ## 6. Requirement-by-requirement verification
 
 **REQ 1 — off-chain forever / activity-scaled footprint: MET (per the refinement; near-categorical).**
-Idle coins: 0 vB forever — no rent, no deadlines, no forced materializations (V1's entire
-5,840 vB/coin-yr class deleted). Off-chain transitions: 576 hops per depth level, rollover is
-off-chain, so hop count is **unlimited without any mandatory chain touch**; the default depth-3
+Idle **laddered** coins: 0 vB forever — no rent, no deadlines, no forced materializations (V1's entire
+5,840 vB/coin-yr class deleted). **[Shipped caveat]** an idle **un-laddered** coin (RGB carrier, B0
+sub-coin) also pays 0 vB rent, but it keeps its absolute-locktime root deadline, so a *received*
+carrier still owes one materialization before that deadline (§5.10.4) — activity-scaled, but not
+deadline-free. Off-chain transitions: 576 hops per depth level, rollover is off-chain (sdk43), so hop
+count is **unlimited without any mandatory chain touch**; the default depth-3
 compaction policy is an optional optimization costing 112 vB per ~2,300 transfers ≈ 0.05 vB/transfer,
 executed by the SDK/operator inside `transfer()` and priced into that transfer's fee — the user never
 acts personally. *Residual*: a hostile ex-owner can force a coin one 111-vB co-op re-anchor at ~2.5×
@@ -407,12 +558,16 @@ coordinator (the other REQ4 gap) does not ship. Exit-time RGB disclosure unchang
   stampede exists, though — untriggered coins idle safely under a dead SE forever.)
 - **R-2 No unconditional no-watch window**: a received coin must be watched (delegated, keyless,
   prepaid) from the moment of receipt, forever. Alarm-driven with ≥1 day notice, but a downgrade in
-  kind from V1's first-window, accepted deliberately.
+  kind from V1's first-window, accepted deliberately. **[Shipped]** on the un-laddered shape the duty
+  is *calendar*-driven instead (materialize before the root deadline, §5.10.4) — sdk32 is the standing
+  record of what happens to a received carrier whose owner never acts.
 - **R-3 B1 unchanged**: the statechain trust unit (enclave share-deletion) remains the floor, as in
   V1 and every statechain.
 - **R-4 δ=36 head starts vs sustained congestion**: a fee spike outlasting the head start converts
   the CSV edge into a pure fee race; committed fees + P2A + funded towers are the answer, and δ is a
-  dial (open problem O-2 quantifies against mainnet history before mainnet ship).
+  dial (open problem O-2 quantifies against mainnet history before mainnet ship). **[Shipped gap]**
+  only the committed-fee half exists today — the tower broadcasts tier-by-tier and attaches no fee
+  child (§5.13), so this risk is currently carried, not mitigated.
 - **R-5 Deep-DAG unilateral latency**: depth-3 worst ≈ 60 days (coop exit instant); geometric
   schedules cap it ≈ 30 days at reduced budgets (O-4).
 - **R-6 Enclave counter machine {level, m, k} is safety-relevant** for receiver verification; needs
@@ -426,8 +581,8 @@ Primitives: P2TR in 57.5 / out 43 / overhead 10.5 / P2A out 13 vB; tier tx 124 v
 solo compaction 112 vB. All corrected figures from the economics review adopted (the draft's 58-vB
 batched claim and 0.04 vB/transfer are **rejected**; no output netting exists).
 
-**7.1 Per coin**
-| | V1 | TES-R |
+**7.1 Per coin** (the V1 column is the pre-migration baseline, §3)
+| | V1 (baseline) | TES-R (shipped) |
 |---|---|---|
 | Idle coin | 5,840 vB/yr | **0 vB/yr** |
 | Active, 10 tx/day, default depth-3 policy | 5,840 vB/yr (rent dominates) | 3,650 hops/yr ÷ ~2,300/compaction ≈ 1.6 × 112 ≈ **~180 vB/yr** (≈0.05 vB/transfer) |
@@ -488,7 +643,9 @@ with bank-run moments); actuarial fee-model insolvency in the tail (13-month fro
 market); (k+1)× enclave share blast radius on an unattested SGX. Not even useful as a bridge: TES-R
 migration is a single re-anchor per coin (§9), self-funding within one week of avoided V1 rent.
 Salvaged ideas: P2A-on-everything, tower-executed maintenance (made off-chain), conveyed-locktimes
-(moot — V2 has no calendar deadlines to convey; audit [17] closes by deletion).
+(moot for laddered coins — they have no calendar deadlines to convey. **[Shipped correction]** audit
+[17] therefore does *not* close by deletion: it survives on the un-laddered shape, absorbed by the
+`auto_exit_margin_blocks` default of 288 blocks (≥ k_max·interval + 144), not solved.)
 
 ### 8.3 TES as drafted — AMENDED, not adopted verbatim
 Accepted and folded: renewal-auth replay fix; committed-fee restoration; package-aware funded towers;
@@ -502,48 +659,89 @@ any alternative).
 
 ---
 
-## 9. Migration path from V1
+## 9. Migration path from V1 — **COMPLETE**
 
-**Phase 0 — ship, no behavior change**: server: generalized counters {level, m, k, total_sigs},
+*(Historical plan, kept intact; outcomes annotated. The migration is done: there is one protocol, the
+`deposit_protocol_version` / `UTEXO_PROTOCOL_DEFAULT` escape hatch is deleted, and no test pins the old
+lane. The per-test migration record lives in git history and `history/MIGRATION.md`.)*
+
+**Phase 0 — ship, no behavior change** — *DONE*: server: generalized counters {level, m, k, total_sigs},
 `POST /renew/init` (challenge-nonce rail), config + nostr record; SDK: TES-R builders in
 `transaction.rs` (CSV tiers, v3, committed fee + P2A, public H_tag tweaks), WatchBundle v2 +
 package-aware `watch_pass` with fee wallet, R′ receiver checks behind a version tag in the transfer
 message (receivers handle both ladder types during migration). Enclave: **cryptographically
 unchanged** (blind MuSig2 + one-shot nonces suffice); only the counter state machine needs the
 INV-23/24-grade spec (O-1) — no SGX rebuild required for launch, decoupling from mainnet-audit [13].
+*Outcome*: shipped, with two deltas. (a) The transfer-message version tag that let receivers handle
+both ladder types is gone with the escape hatch — receivers now dispatch on the coin's **shape**
+(laddered vs un-laddered), not on a protocol number. (b) **`watch_pass` is NOT package-aware**: it
+broadcasts tier by tier with `transaction_broadcast_raw` and attaches no P2A fee child, so
+TES-fixable #4 (§5.13) is *specified but unimplemented*. It is adequate at ordinary fee rates
+(committed fees make each tier self-relaying) and is the known gap under a sustained spike (R-4).
 
-**Phase 1 — new deposits are TES-R**: T co-signed at deposit detection (same B5 onboarding window
-semantics as today's tx1 moment).
+**Phase 1 — new deposits are TES-R** — *DONE, and now unconditional*: `claim()` co-signs T for every
+fresh **confirmed root** coin (same B5 onboarding-window semantics as the old tx1 moment). The two
+deliberate exceptions are shapes, not opt-outs: RGB carriers (§5.10) and sub-coins over un-broadcast
+funding (B0, §5.4).
 
-**Phase 2 — V1 coin conversion**: one final on-chain re-anchor per coin (exactly today's 112-vB
-refresh, `refresh_sponsored` rail reusable), reborn as TES-R at depth 0. 1M coins × 112 vB = 112M vB
-one-time ≈ one week of V1's avoided rent — **the migration pays for itself within ~7 days**; schedule
-over weeks. Un-broadcast V1 sub-coin DAGs migrate at their next transfer (auto-refresh hook) or
-before their V1 root deadline (existing auto_exit_due covers stragglers until converted).
+**Phase 2 — V1 coin conversion** — *DONE (rail retained)*: one final on-chain re-anchor per coin
+(the 112-vB refresh, `refresh_sponsored` rail reusable), reborn as TES-R at depth 0. 1M coins ×
+112 vB = 112M vB one-time ≈ one week of V1's avoided rent — **the migration pays for itself within
+~7 days**; schedule over weeks. Un-broadcast sub-coin DAGs migrated at their next transfer
+(auto-refresh hook) or before their root deadline (`auto_exit_due` covered stragglers). The re-anchor
+and sponsored-rebate paths survive as ordinary maintenance (§5.6; defect D2 was found here).
 
-**Phase 3 — delete V1 calendar machinery**: `exit_deadline_block`, `auto_exit_due` scheduling,
-refresh-token-slot economics, B6/[17] margin arithmetic — all removed once no V1 coins remain. RGB:
-no protocol change (anchoring rules of §5.10 are a constraint tightening, enforced at co-sign time);
-rgb-lib needs only the existing un-broadcast-witness validation, now exercised over deeper chains —
-dedicated adversarial suite required (O-3).
+**Phase 3 — delete V1 calendar machinery** — *PARTLY DONE, deliberately*: refresh-token-slot economics
+and the B6/[17] margin arithmetic are gone from the laddered path, but `exit_deadline_block` and the
+`auto_exit_due` pass are **kept** — they are what defends the un-laddered shape, which is permanent
+(§5.2 / §5.10.4). "Removed once no V1 coins remain" was written on the assumption every coin would end
+up laddered; that assumption is false for RGB carriers. RGB: no protocol change (the anchoring rules of
+§5.10 are a constraint tightening, enforced at co-sign time); rgb-lib needs only the existing
+un-broadcast-witness validation, now exercised over deeper chains — dedicated adversarial suite still
+open (O-3).
 
-**Test plan**: extend SDK_E2E to — renewal races (renew vs transfer vs split interleavings, INV-23/24
-analog), co-op de-trigger under hostile trigger, per-tier tower defense with package relay, rollover +
-depth-cap compaction, colored branch materialization with terminal-freeze, latch-gated renewal
-atomicity, mixed V1/V2 estates.
+**Test coverage (live, replaces the Phase-0 test plan)** — every item below names a test that exists
+today:
+
+| Property | Live evidence |
+|---|---|
+| Laddered deposit + full lifecycle | sdk48, sdk42, sdk44 (schedule params) |
+| Transfer over the ladder (Model A) | sdk41, sdk49, sdk40 |
+| Renewal → rollover → renewal, unbounded, 0 vB | **sdk43** |
+| CSV enforced by real consensus; stale ladder dies once its prevout is spent | **sdk40** PART 1 / PART 2 |
+| Cooperative de-trigger defeats a hostile trigger | **sdk40 PART 2** |
+| Unilateral exit through the tier chain (public SDK surface) | **sdk50** |
+| Watchtower defends a triggered coin; keyless bundle, idempotent second tower | **sdk51**, **sdk45** |
+| Receiver verification R′ / census | sdk46, sdk47, **sdk54**, sdk55 |
+| In-ladder split (adversarial + end-to-end) | **sdk58** (11 cases), sdk59 |
+| First-class children (whole / partial onward hop) | **sdk60**, **sdk17** |
+| RGB carrier never laddered; terminal-freeze over time | **sdk52**, sdk32; carrier materialization sdk34 |
+| Lightning both directions on the ladder (HODL latch) | **sdk63**, **sdk64**, **sdk67**; sdk65 non-exact; sdk66/sdk68 failure paths; sdk53 latch guard |
+| Concurrency / DAG invariants | chaos22 |
+
+Not covered by any live test, and honestly open: **package-relay tower defense** and P2A fee-child
+attachment under a real fee spike (§5.3 / §5.13 — not merely untested, *unimplemented*: no
+`submitpackage` caller exists), the **colored** de-trigger variant (§5.8), and mass-grief
+prioritization (R-1 / O-6). Those remain design-level claims. The earlier plan's "mixed V1/V2 estates"
+item is void: no mixed estate can exist.
 
 ---
 
 ## 10. Open problems & future work
 
-- **O-1 (blocking)**: formal spec + audit of the enclave counter machine {level, m, k} — receivers
-  verify tree shape against it; a missed interleaving is a double-spend. INV-23/24-grade treatment
-  before mainnet.
+- **O-1 (blocking, STILL OPEN)**: formal spec + audit of the enclave counter machine {level, m, k} —
+  receivers verify tree shape against it; a missed interleaving is a double-spend. INV-23/24-grade
+  treatment before mainnet. *Partially de-risked in practice*: the census is exercised adversarially by
+  sdk54/sdk55/sdk58 and across hops by sdk46/47/60/17, and retry-idempotence of the counter by sdk56 —
+  but no formal spec exists, so this stays blocking.
 - **O-2 (blocking dial)**: δ/δE vs sustained mainnet congestion — quantify head-start survival
-  against 2023–24 spike history; δ=36 is the provisional default, with the budget table of §5.2 as
-  the trade space.
+  against 2023–24 spike history; δ=36 is the shipped default (`TesrParams::mainnet()`, arithmetic
+  pinned by sdk44), with the budget table of §5.2 as the trade space. The congestion study itself is
+  not done.
 - **O-3**: rgb-lib adversarial suite for deep un-broadcast witness chains (terminal-freeze removes
-  superseded-witness ambiguity, but depth and DoS bounds need tests).
+  superseded-witness ambiguity, but depth and DoS bounds need tests). *Status*: the never-laddered
+  carrier rule and terminal-freeze semantics are pinned (sdk52, sdk32) and the `rgb*`/`ta*`/`tb*`
+  suites run over the shipped protocol; the depth/DoS adversarial suite is still missing.
 - **O-4**: deep-DAG unilateral latency — geometric per-level E0/D0 schedules (worst wait <30 days at
   any depth) vs per-level hop budgets; ship as a dial with a chosen default.
 - **O-5**: tower fee-bond actuarial sizing + refund/receipt rail (operator-signed per-bump rebates,
@@ -553,9 +751,13 @@ atomicity, mixed V1/V2 estates.
   coin count.
 - **O-7**: relay-policy dependence — v3/P2A/1P1C are policy, not consensus; maintain the
   miner-direct-submission fallback and re-verify at each Core release.
-- **O-8**: batched compaction (post-launch): non-interactive constructions only (the interactive
-  MuSig2 coordinator stays dead); pre-signed T′ against the template before broadcast is mandatory if
-  revived.
+- **O-8**: batched compaction (post-launch, **not shipped**): non-interactive constructions only (the
+  interactive MuSig2 coordinator stays dead); pre-signed T′ against the template before broadcast is
+  mandatory if revived.
+- **O-9 [new, from the migration]**: `child_in_ladder_pay` splits a child through a depth-2 `ancestors`
+  chain (§5.4). The N-hop census generalizes, but the interaction of *depth* with the hard depth cap of
+  §5.11 and with the min_child_value floor (D1) at each level is only exercised to depth 2 (sdk17,
+  sdk60). Deeper child chains need their own adversarial pass before they are relied on.
 - **Covenant future work**: **CTV** would let one on-chain output commit to the whole T/X/S tree (and
   make factories safe — no signer cohort to collude, deleting B1-F — reviving Grove-style shared-UTXO
   amortization for onboarding, the natural Phase-4). **APO/ANYPREVOUT** would make state txs
@@ -564,6 +766,16 @@ atomicity, mixed V1/V2 estates.
   required: TES-R ships on today's Bitcoin.
 
 ---
+
+*Implementation ledger (added when the migration completed): four defects the build exposed are fixed
+and recorded where they bite — **D1** in-ladder-split admission floor (§5.4), **D2** sponsored-refresh
+rebate sized into D1's dead window (§5.6), **D3** the one-call Lightning PAY API refusing every
+laddered coin (§5.12), **D4** a unilaterally-exiting child booked `WITHDRAWING` (§5.9). Four of the
+draft's claims were over-stated and are corrected in place rather than deleted: the calendar machinery
+(and audit [17]) survives on the un-laddered shape (§5.2, §5.10.3/4, §8.2, §9 Phase 3), the latch is a
+HODL-invoice latch and its piece stays terminalized (§5.12), children are first-class rather than
+exit-only (§5.4), and TES-fixable #4 (package-aware tower broadcast) is **specified but unimplemented**
+(§5.13, §9 Phase 0) — the one place this document describes something that does not yet exist in code.*
 
 *Adversarial findings ledger: TES review-1 FATAL#1 defanged (§5.8), FATAL#2 accepted-as-tolerated
 (§5.7); TES review-1 fixables 1–7 folded; TES review-2 corrections (compaction 103 vB, exit 828 vB,

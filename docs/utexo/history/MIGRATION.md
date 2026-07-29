@@ -1,12 +1,101 @@
 # Utexo V2 migration — remove V1, make TES-R the only path
 
-Status: architecture-approved migration spec. No code lands from this document itself; a
-future session executes it stage by stage (V2DEF-2 … V2DEF-6). Every stage is gated on the
-live SE + Core-30 bitcoind E2E matrix staying green.
+**Status (2026-07-29): EXECUTED — the migration is DONE. This file is now the historical record
+of the plan and the reasoning behind it; it is no longer a to-do list.** V2DEF-2 … V2DEF-6 all
+ran on the live SE + Core-30 bitcoind matrix. The end state is in "Outcome — as executed" below;
+each stage's reasoning is kept verbatim underneath with **SUPERSEDED / OUTCOME** notes where
+execution diverged from the plan, and every test id named in a stage has been repointed to the
+suite that is actually live today.
 
 This spec folds in the adversarial review of the two fund-safety pieces (receiver adoption
 and RGB/Lightning). Two FATAL findings forced a model change and are resolved here; the
 accepted/rejected findings are cited inline.
+
+---
+
+## Outcome — as executed (2026-07-29)
+
+Read this before any stage below; where the two disagree, this section is current.
+
+**1. There is ONE protocol.** `deposit_protocol_version` and the `UTEXO_PROTOCOL_DEFAULT` env are
+**deleted**. `claim()` establishes a TES-R ladder for every fresh confirmed ROOT coin,
+unconditionally. Zero tests pin the old lane. The staged flag designed in V2DEF-2 ("the mode gate")
+and V2DEF-5 ("compat knob") did its job — a per-suite double-run through the flip — and was then
+removed; there is no longer a knob that can opt a deposit out of the ladder.
+
+**2. ONE protocol, TWO coin SHAPES — both current.** The un-laddered path is **not** "V1" and not
+legacy:
+
+- **LADDERED** — every plain deposit: trigger `T` → extension `X_m` → state `S`, relative CSV, all
+  un-broadcast.
+- **UN-LADDERED** — an **RGB carrier** is deliberately never laddered (a plain tier spend would
+  destroy the allocation — terminal-freeze, PROTOCOL.md §5.10; proven by **sdk52**), and a **split
+  sub-coin whose funding is un-broadcast cannot root a trigger** [B0]. These coins keep the
+  signed-once backup and transfer by backup-chain handover.
+
+That lane is **load-bearing for RGB tokens**, so the V2DEF-6 excisions aimed at it did **not** run:
+`validate_signature_scheme`, `create_tx1`, and the non-bundle receiver branch are all still in the
+tree and still exercised. `TransferMsg.protocol_version` survived as promised, but its meaning
+changed: it is now a **conveyance-shape discriminant**, not a protocol selector — `0` = un-laddered
+backup-chain handover, `2` = TES-R bundle, `3` = legacy child conveyance without handover, `4` =
+child conveyance **with** the standard key handover.
+
+**3. Model A shipped exactly as specified** (sender pre-signs the receiver-paying state; the
+receiver verifies, never trusts). Proven end-to-end by **sdk49** — Bob adopts and then unilaterally
+exits the conveyed chain to his own key.
+
+**4. Received split children are FIRST-CLASS** (`docs/utexo/CHILDREN.md`, which builds
+directly on the multi-hop census requirement stated below in V2DEF-3). The claim completes the
+**standard SE key handover**, so the receiver co-owns `A_child` — invariant across the rotation,
+which is exactly what keeps the pre-signed exit chain valid — and the sender is permanently locked
+out. A child is paid onward off-chain **whole** (`child_retransfer`) or **split**
+(`child_in_ladder_pay`, a depth-2 `ancestors` chain). Each hop costs exactly one co-signature and
+discloses exactly one superseded state, which the receiver's census counts and proves out-raced.
+**sdk60** (alice → bob → carol with the funding outpoint unspent throughout) and **sdk17** (partial
+second hop) are the proofs. The exit-only child conveyance was a shipping simplification and is gone.
+
+**5. The in-ladder split closed B1.** A split is a STATE tier `SP` spending `X_m.out[0]` — a
+descendant of `T`, not a rival for `F` — so a retained trigger has nothing to race. **sdk58** (11
+adversarial cases, all REJECT) + **sdk59** (end-to-end split payment).
+
+**6. Lightning works both directions on the ladder via the HODL latch** (`docs/utexo/LIGHTNING.md`,
+which supersedes the adaptor-signature detour and V2DEF-4's latch sketch): **sdk63** (V2 pay),
+**sdk64** (V2 receive), **sdk67** (in-ladder receive), plus **sdk65** (non-exact pay) and the failure
+paths **sdk66** / **sdk68**. The LN-latched piece is the **one** case that stays terminalized — it
+sits unclaimed past the pending-transfer lock's window.
+
+**7. On-chain refresh survived.** V2DEF-6's "delete `refresh.rs` entire file" did **not** run: the
+`refresh_sponsored` product decision was resolved as **KEEP**, and `refresh` / `refresh_sponsored` /
+`reanchor` / `auto_refresh_due` plus the `TransferQuote` renewal-fee fields are all still shipping.
+**sdk30** and **sdk38** are live.
+
+### Deleted test ids → where their claims live now
+
+Nothing below lost coverage silently; a claim that genuinely became meaningless is marked
+*obsolete* with the reason.
+
+| Deleted | Its claim is now proven by |
+|---|---|
+| sdk03, sdk05, sdk06 (LN core) | **sdk63** (V2 pay), **sdk64** (V2 receive), **sdk67** (in-ladder receive); **sdk65** non-exact; **sdk66/sdk68** failure paths |
+| sdk07, sdk08, sdk10 (exit / terminal) | **sdk50** (SDK-level unilateral exit walks the tier chain), **sdk58** (11 adversarial exit/terminal cases) |
+| sdk13, sdk14 (stale state / watcher race) | **sdk51** (watchtower defends a hostile trigger), **sdk40 PART 2** (a stale state dies at consensus), **sdk45** (keyless tower) |
+| sdk18 (LN pay-failure reclaim) | **sdk68** (exact) + **sdk66** (non-exact rollback) |
+| sdk26, sdk27 (invalidation scale/time) | *obsolete under TES-R* — idle coins never age (0 vB rent); the ladder + terminality subsume the finite-ladder rent model. No repoint exists because the phenomenon does not. |
+| sdk28 (sats granularity) | *obsolete* — the in-ladder split carries its own fee model (`tier_out_total` / `committed_fee_for_outputs` / `min_child_value`); the old backup-fee floor no longer governs a split |
+| sdk33 (auto-refresh) | *obsolete* — there is no ladder floor to approach (0 vB rent); unbounded **off-chain** renewal is **sdk43** |
+| sdk35 (trust boundaries) | **sdk45** (the watch bundle carries NO key material; a 2nd independent tower is idempotent — both back-filled into sdk45 before sdk35 was retired), **sdk52** (a carrier is never laddered), **sdk51**, **sdk46/47/54** (R′ census) |
+
+### Defects found and fixed while executing this migration
+
+- **D1** — the in-ladder split admission guard used the old backup-fee floor (442 sat), but a child
+  funds its **own** two tiers + dust ⟹ `min_child_value` (1306 sat at 2 sat/vB). Admitting below it
+  terminalized the parent and *then* failed, stranding it.
+- **D2** — `refresh_sponsored` sized its rebate into that same dead window, so a sponsored refresh
+  failed **after** the user had already paid the on-chain fee.
+- **D3** — the one-call Lightning PAY API minted via `ensure_exact_coin` and therefore refused every
+  laddered coin (i.e. every coin).
+- **D4** — a child routed to a **unilateral** exit was marked `WITHDRAWING` but has no withdrawal
+  tx, so status polling errored forever.
 
 ---
 
@@ -40,6 +129,15 @@ Hard principles, held at every stage:
 6. **Blind single-SE, exact-amount off-chain split/combine, RGB blind P2P, Lightning latch**
    are all preserved unchanged in kind.
 
+> **How principles 1–3 actually resolved.** The goal was met — there is one protocol and no way to
+> opt a deposit out of the ladder — but "the V1 design gone" turned out to mean *the escape hatch and
+> the aging-ladder mechanics*, not *every non-laddered transaction shape*. The signed-once backup
+> chain survives as the **un-laddered shape**, because an RGB carrier must never be laddered and an
+> un-broadcast-funded sub-coin cannot root a trigger. Principle 3's unreachable-guard gate is what
+> caught this before anything was cut. Principles 4–6 held: no linchpin was weakened, no soft fork is
+> needed, and the split/combine + RGB blind P2P surfaces are intact (Lightning is preserved in kind
+> but re-mechanised as a HODL latch — see V2DEF-4).
+
 ### The one architectural decision that governs everything below
 
 The adversarial review of receiver adoption returned a **FATAL** verdict against "Model B"
@@ -57,7 +155,7 @@ other piece in this migration is re-expressed on top of Model A; where an input 
 V2 is already a **complete payment path**, validated live on the SE + Core-30:
 deposit → establish → transfer(R′) → receive → exit / renew / rollover.
 
-- `docs/utexo/V2-DESIGN.md` — TES-R design (Trigger/Extension/State CSV tiers, all un-broadcast;
+- `docs/utexo/PROTOCOL.md` — TES-R design (Trigger/Extension/State CSV tiers, all un-broadcast;
   off-chain renewal; rollover; co-op de-trigger; R′ receiver check §5.11; RGB terminal-freeze
   §5.10).
 - `lib/src/tesr.rs` — tier builders (`build_trigger/extension/state/detrigger`, v3 + CSV + P2A),
@@ -66,10 +164,12 @@ deposit → establish → transfer(R′) → receive → exit / renew / rollover
 - `clients/libs/rust/src/tesr.rs` — `TesrBundle` (trigger + `Vec<TesrLevel{extension,state}>` +
   `m` + params; persisted under `tesr-<id>` via `insert_raw_backup_txs`), `establish`/
   `establish_auto`, `renew`/`renew_auto`, `rollover`/`rollover_auto`, `cosign_detrigger`,
-  `persist`/`load`, `exit_tiers`, `watch_pass` (keyless tower), and **`verify_bundle` at
-  `tesr.rs:348`**, which enforces `se_num_sigs == v1_backups + tiers.len()` over the tiers
-  **present in the conveyed bundle**. This equality is the hinge of the whole migration
-  (see the fund-safety core).
+  `persist`/`load`, `exit_tiers`, `watch_pass` (keyless tower), and **`verify_bundle`** (as executed
+  it lives at `clients/libs/rust/src/tesr.rs:1194`, over `verify_bundle_ex`, with the child census
+  `verify_child_bundle` alongside it), which enforces `se_num_sigs == v1_backups + tiers.len()`
+  over the tiers **present in the conveyed bundle**. This equality is the hinge of the whole
+  migration (see the fund-safety core) and survived execution unchanged in kind — the shipped form
+  adds a `superseded_ok` term for the state each hop legitimately discloses and replaces.
 - `clients/libs/rust/src/transfer_sender.rs::execute()` — loads a coin's persisted bundle and
   conveys it (`TransferMsg.protocol_version=2` + `tesr_ladder` JSON) via
   `create_transfer_update_msg_with_branch`.
@@ -78,12 +178,17 @@ deposit → establish → transfer(R′) → receive → exit / renew / rollover
   ~623) are gated behind `protocol_version < 2`; `>= 2` runs `verify_bundle` instead.
 - `lib/src/transfer/mod.rs` — `TransferMsg` carries serde-default `protocol_version` + `tesr_ladder`.
 - E2E green: sdk40 (consensus core), sdk41 (clean transfer + lock-out after rotation), sdk42
-  (persistence), sdk43 (rollover), sdk44 (schedule cadence), sdk45 (keyless watchtower), sdk46
-  (R′ count vs live SE), sdk47 (FULL R′ transfer).
+  (persistence), sdk43 (rollover — also the home of unbounded **off-chain** renewal coverage),
+  sdk44 (schedule cadence), sdk45 (keyless watchtower — later back-filled with the trust-boundary
+  claims retired from sdk35), sdk46 (R′ count vs live SE), sdk47 (FULL R′ transfer). All eight are
+  still live.
 
-What is **not** yet built and is the subject of this migration: V2-native deposit, routing the
-wallet's four flows (transfer/exit/renewal/watchtower) through TES-R by default, RGB + Lightning
-on the tier model, migrating the ~50 suites, and deleting V1.
+What was **not** yet built when this spec was written, and is the subject of the stages below:
+V2-native deposit, routing the wallet's four flows (transfer/exit/renewal/watchtower) through TES-R
+by default, RGB + Lightning on the tier model, migrating the ~50 suites, and removing the second
+lane. **All of it has since landed** — with the two corrections recorded in "Outcome — as executed":
+the un-laddered shape was kept (it is load-bearing for RGB carriers and un-broadcast-funded
+sub-coins, not dead code), and Lightning ships on a HODL latch rather than the sketch in V2DEF-4.
 
 ---
 
@@ -262,14 +367,23 @@ Two equivalent gates exist; this spec uses **both, layered**:
 2. **Establish gate = an explicit config flag** so deposit *decides whether to create* a bundle:
    add `deposit_protocol_version: u32` to `SdkConfig` (seeded from env `UTEXO_PROTOCOL_DEFAULT`),
    **default `1`** in both `regtest()` and `mainnet()` during migration. Auto-establish runs only
-   when `== 2`. With the default at 1, no deposit gains extra SE co-signs, so every V1 suite that
-   asserts `num_sigs == backup_count` (sdk10/sdk12) is byte-for-byte unaffected.
+   when `== 2`. With the default at 1, no deposit gains extra SE co-signs, so every suite that
+   asserts `num_sigs == backup_count` (sdk10/sdk12 at the time of writing) is byte-for-byte
+   unaffected.
+
+   > **OUTCOME.** Gate 1 (bundle presence) is what shipped and is still the routing truth. Gate 2
+   > was a **migration scaffold only**: `deposit_protocol_version` and `UTEXO_PROTOCOL_DEFAULT` were
+   > carried through the flip and then **deleted**. `claim()` now establishes a ladder for every
+   > fresh confirmed ROOT coin unconditionally, and nothing can opt a deposit out. Of the two
+   > count-asserting suites named here, **sdk10 is gone** (its exit/terminal claims live in **sdk50**
+   > and **sdk58**); **sdk12** is live and now asserts the tier counts.
 
 ### The establish hook
 
 In the SDK `claim()` pass (`wallet.rs`), after the second `update_coins`, for each coin where:
 `status == CONFIRMED` **and** `duplicate_index == 0` **and** `!single_use` **and**
-`deposit_protocol_version >= 2` **and** `tesr::load(...) == None` (idempotency) — call
+`deposit_protocol_version >= 2` (**as executed: this clause is gone — the hook is unconditional**)
+**and** `tesr::load(...) == None` (idempotency) — call
 `tesr::establish_auto(&cc, &mut coin, &coin.backup_address, network)` then `tesr::persist`, save
 the coin, emit `WalletEvent::LadderEstablished{statechain_id}`.
 
@@ -282,7 +396,10 @@ the coin, emit `WalletEvent::LadderEstablished{statechain_id}`.
   pre-signed tiers.
 - **`single_use` and duplicate coins are excluded** — single-use RGB tree nodes have their own
   branch-exit model and are not re-signable; excluding them keeps the off-chain split/combine DAG
-  and RGB blind carriers untouched.
+  and RGB blind carriers untouched. **This exclusion is permanent, not transitional:** it is what
+  makes the UN-LADDERED shape a first-class lane rather than a leftover (an RGB carrier must never
+  be laddered — PROTOCOL.md §5.10; **sdk52**), joined by any split sub-coin whose funding is
+  un-broadcast and therefore cannot root a trigger [B0].
 
 ### Does a V2-native coin still need a V1 `tx1`? — staged
 
@@ -299,6 +416,15 @@ the coin, emit `WalletEvent::LadderEstablished{statechain_id}`.
   migration in V2DEF-3.
 - **Stage 2c:** flip `SdkConfig` default to `2`. Ships only after the ~50 V1 suites are migrated
   or pinned (V2DEF-5) and after the partial-establish atomicity fix (below).
+
+> **OUTCOME — Stage 2a is the shipped shape; 2b was never taken, deliberately.** A laddered root
+> coin still gets its one signed-once backup at deposit confirmation (`coin_status::check_deposit`
+> → `create_tx1`), so the census baseline is a **constant**, pinned in code as
+> `tesr::PARENT_V2_BASELINE = 1` (with `CHILD_V2_BASELINE = 0` for a split child slot, which is never
+> funded on-chain and so never runs `check_deposit`). Those two constants are what let a split-child
+> receiver — who cannot observe the parent's pre-establish history — run `verify_child_bundle`'s
+> exact-equality census **independently of the sender**. Stage 2c happened and then went further: the
+> flag itself was deleted, so the ladder is unconditional rather than defaulted.
 
 ### Partial-establish atomicity (accepted open risk — must fix before Stage 2c)
 
@@ -321,9 +447,11 @@ new `clients/tests/rust/src/sdk48_v2_native_deposit.rs`.
 
 - Coexistence: at flag 1, `get_deposit_address`/`check_deposit`/`claim()` are byte-identical to
   today. At flag 2 (Stage 2a) tiers are *added on top of* the unchanged `tx1` — a strict superset;
-  the coin is still a valid V1 coin whose `tx1` exit works AND carries a conveyable ladder. Mixed
-  V1/V2 estates interoperate (receiver dispatches on `protocol_version`; sender conveys a bundle
-  only if `tesr::load` finds one).
+  the coin's signed-once backup exit still works AND it carries a conveyable ladder. Mixed estates
+  interoperate (receiver dispatches on the conveyance shape; sender conveys a bundle only if
+  `tesr::load` finds one). **As executed this stopped being "coexistence during a migration" and
+  became the steady state: one protocol, a laddered shape and an un-laddered shape, dispatched by
+  bundle presence.**
 - Fund-safety: L1 via `verify_bundle` (2a: 4; 2b: 3); L4 via seed-derived `backup_address`; L2 via
   schedule-driven decrementing CSV; L3 via identical blind-MuSig2 round-trip (no enclave rebuild).
 - Gating tests: **sdk48** (auto-persist, payee == `backup_address`, `num_sigs` == stage count,
@@ -331,6 +459,10 @@ new `clients/tests/rust/src/sdk48_v2_native_deposit.rs`.
   exclusion (single_use + duplicate ⟹ no ladder); resume/failure (inject mid-establish SE failure,
   re-run `claim()`, assert `num_sigs == tiers.len()`, transfers green); **regression** — full ~50
   suites at flag 1 with unchanged `num_sigs`.
+  **Landed as `sdk48_v2_native_deposit` (live).** The resume/idempotency half also has a dedicated
+  survivor, **sdk56** (keystone retry is idempotent); the exclusion half is **sdk52** (a carrier
+  never gains a ladder). The "full suite at flag 1" regression was a migration-time gate only — the
+  flag is gone, so the standing regression is simply the whole live matrix.
 
 ---
 
@@ -370,9 +502,15 @@ when a flow acts. **No `Coin.protocol_version` field** — avoids the 2-write co
   relative timelock matures), idempotent across passes. Factor a shared
   `broadcast_exit_tiers(bundle)` reused by `watch_pass`.
 - **Cooperative withdraw (`wallet.rs::withdraw`, `refresh.rs`):** `withdraw::execute` already does
-  a fresh SE co-signed spend of the coin's current on-chain outpoint `F`; for V2 just skip
-  `broadcast_branch_if_any` (V2 has no `branch-*` rows). The coin goes terminal (WITHDRAWING →
+  a fresh SE co-signed spend of the coin's current on-chain outpoint `F`; for a laddered coin just
+  skip `broadcast_branch_if_any` (it has no `branch-*` rows). The coin goes terminal (WITHDRAWING →
   WITHDRAWN), so the extra co-sign of `F` never affects a later receiver's R′ count.
+
+  > **OUTCOME.** Cooperative withdraw never needed its own suite: with one protocol, every coin
+  > `sdk01` withdraws is laddered, so `sdk01` (deposit → transfer → cooperative exit to L1) is the
+  > live coverage, with `sdk11` covering the withdrawal fee quote. **D4** was found here — a split
+  > child routed to a **unilateral** exit was marked `WITHDRAWING` even though it has no withdrawal
+  > tx, so status polling errored forever; the two exits now report distinct terminal states.
 
 ### Watchtower
 
@@ -386,6 +524,12 @@ background pass for CSV-budget maintenance. `export_watch_bundle` emits the `tes
 a V2 coin (a plain re-anchor would strand the bundle); public `refresh()` on a V2 coin routes to
 off-chain `tesr_renew`.
 
+> **OUTCOME.** This is what shipped, and it is why `refresh.rs` was *not* deleted in V2DEF-6: the
+> on-chain re-anchor still serves the un-laddered shape, and `refresh_sponsored` was kept as a
+> product feature (**sdk30**, **sdk38** live). **D2** was found here — `refresh_sponsored` sized its
+> rebate into the dead window below `min_child_value`, so the sponsored leg failed *after* the user
+> had already paid the on-chain fee; the rebate is now `max(fee + DUST_LIMIT, min_child_value)`.
+
 ### The `num_sigs` cross-hop concern — resolved
 
 The input flagged "cumulative `num_sigs` across a hop breaks the next receiver's exact count" as a
@@ -394,11 +538,25 @@ each hop adds exactly one state (`+1`) and that state is **conveyed** in the bun
 `se_num_sigs == v1_backups + tiers.len()` holds at every hop, multi-hop, and after renew/rollover.
 The only precondition is the exact-`num_sigs` definition above (finalized co-signs only).
 
+> **OUTCOME — this multi-hop census is what made received split children first-class**
+> (`docs/utexo/CHILDREN.md` builds on this paragraph). Each hop costs **exactly one**
+> co-signature and discloses **exactly one** superseded state, which the receiver's census counts
+> and proves out-raced — so a child is paid onward off-chain **whole** (`child_retransfer`) or
+> **split** (`child_in_ladder_pay`, a depth-2 `ancestors` chain) with no on-chain footprint. The
+> claim completes the **standard SE key handover**, so the receiver co-owns `A_child` (invariant
+> across the rotation — which is precisely what keeps the pre-signed exit chain valid) and the
+> sender is permanently locked out. Proven by **sdk60** (alice → bob → carol, funding outpoint
+> unspent throughout) and **sdk17** (partial second hop). The child census runs against the
+> `PARENT_V2_BASELINE`/`CHILD_V2_BASELINE` constants, so the receiver never trusts a sender-supplied
+> count.
+
 ### Files touched
 
 `clients/libs/rust-sdk/src/{wallet.rs,transfer.rs,refresh.rs,watchtower.rs,config.rs,lib.rs}`,
 `clients/libs/rust/src/{tesr.rs,transfer_sender.rs}`, new
-`clients/tests/rust/src/{sdk49_wallet_v2_transfer.rs,sdk50_wallet_v2_watchtower.rs,sdk51_wallet_v2_withdraw.rs}`.
+`clients/tests/rust/src/{sdk49_wallet_v2_transfer.rs,sdk50_wallet_v2_watchtower.rs,sdk51_wallet_v2_withdraw.rs}`
+— **as landed the three suites are `sdk49_model_a_transfer.rs`, `sdk50_v2_unilateral_exit.rs`,
+`sdk51_v2_watchtower.rs`** (cooperative withdraw folded into `sdk01`; see the note above).
 
 ### Coexistence / fund-safety / gating tests
 
@@ -410,13 +568,17 @@ The only precondition is the exact-`num_sigs` definition above (finalized co-sig
   trigger also spends `F`) is handled by keeping the coin non-spendable until the re-anchor
   **confirms**, and by a co-op de-trigger of Alice's trigger if she races it (document the F-level
   race).
-- Gating tests: **sdk49** default-V2 transfer (assert off-chain renew, no reanchor tx; conveyed
-  deepest state pays Bob; Bob `unilateral_exit` confirms the whole chain); **sdk50** background V2
-  watchtower (griefer broadcasts trigger ⟹ `watch_pass` drives Bob's exit; idle V2 coin ⟹ zero
-  on-chain footprint over many polls); **sdk51** cooperative V2 withdraw (no branch broadcast, coin
-  terminal); **latch-abort regression** (an aborted latched renewal advances `num_sigs` by **zero**,
-  coin re-transfers clean); **mis-route guard** (coin with neither bundle nor V1 rows ⟹ hard-error,
-  never silent mis-route); full ~50-suite regression green.
+- Gating tests, **as landed** (the numbering shifted by one from the plan):
+  **sdk49** Model-A transfer (conveyed deepest state pays Bob; Bob adopts and `unilateral_exit`
+  confirms the whole chain); **sdk50** the *SDK* `unilateral_exit()` walking the tier chain as each
+  relative CSV matures, with no signed-once backup broadcast; **sdk51** background watchtower
+  (someone else spends `F` ⟹ `defend_ladders()` drives the owner's exit; idle coin ⟹ zero on-chain
+  footprint over many polls); cooperative withdraw → **sdk01**; **latch-abort / failed-pay
+  regression** (an aborted latch leaves the coin re-transferable and its count clean) → **sdk68**
+  (exact) and **sdk66** (non-exact rollback), with **sdk53** pinning that the old blanket LN-latch
+  refusal is lifted; **census cannot be padded or inverted** (the property behind "never a silent
+  mis-route") → **sdk54** (`verify_bundle` count padding, S1) and **sdk55** (conveyed backup chain
+  padding/inversion, S2); whole-matrix regression green.
 
 ---
 
@@ -434,6 +596,11 @@ rollover, no materialization deadline.** Justification: (1) idle carriers are un
 never age; (2) terminal-freeze — every colored ancestor is set `spend_budget=1` and terminalized
 **before** its colored child is co-signed, so each seal has exactly one valid closing; (3) a token
 "hop" is a **new** colored split (new DAG node), not a horizontal re-sign.
+
+> **OUTCOME.** This is the shipped carrier model, and it is the reason the **UN-LADDERED shape is
+> permanent**: a carrier must never gain a T/X/S ladder, because a plain tier spend would destroy the
+> allocation (PROTOCOL.md §5.10). **sdk52** pins it on the live stack — in one wallet the plain coin
+> carries a ladder, the carrier carries none, and an off-chain RGB transfer still settles.
 
 ### Two structural rules that resolve the RGB FATAL findings
 
@@ -518,6 +685,19 @@ by the same preimage" bites **sats coins only** (carriers never renew): when `tr
 latch batch primitive, **no new SE endpoint, no enclave change.** Tie-in to the sats core's exact-
 `num_sigs` rule: an aborted latch batch advances `num_sigs` by **zero** (else the coin is poisoned).
 
+> **SUPERSEDED by `docs/utexo/LIGHTNING.md`.** The carrier half above is what shipped; the *sats*
+> half is not. Gating the Model-A `S'` co-sign on a preimage cannot work — the SSP must validate
+> ownership **before** it pays, and any ownership proof it can validate is also broadcastable — so
+> the sats lane pivoted to a **HODL-invoice latch** at the same trust bar: the SSP runs a **pre-pay
+> census** (`verify_bundle` over the conveyed ladder, `num_sigs` read from the enclave sig-count)
+> and only then calls `send_payment`. Lightning now works **both directions on the ladder**:
+> **sdk63** (V2 pay), **sdk64** (V2 receive), **sdk67** (in-ladder receive), **sdk65** (non-exact
+> pay), and the failure paths **sdk66** (non-exact rollback) / **sdk68** (exact reclaim). The blanket
+> refusal of a latched laddered transfer is lifted — **sdk53** pins that. **The LN-latched piece is
+> the ONE case that stays terminalized**: it sits unclaimed past the pending-transfer lock's window.
+> **D3** was found here — the one-call Lightning PAY API minted via `ensure_exact_coin` and so
+> refused every laddered coin, i.e. every coin.
+
 ### Files touched
 
 `clients/libs/rust/src/rgb.rs`, `lib/src/transaction.rs`, `lib/src/tesr.rs`,
@@ -537,13 +717,15 @@ latch batch primitive, **no new SE endpoint, no enclave change.** Tie-in to the 
   signed-once txs; L4 via broadcasting the pre-signed colored ancestor chain to the resting output;
   L3 blind SE unchanged (colored v3 sighash indistinguishable). LN atomicity: latch preserved,
   `validate_pending_token` still fires pre-payment.
-- Gating tests: v2 colored split + combine E2E (assert v3/`lock_time=0`/P2A/BIP-68 CSV, booked ==
-  consignment amount); sig-count-neutrality regression; **terminal-freeze adversarial** (ancestor
-  with `num_sigs > 1` rejected; honest single-closing accepted); **fresh-`F` assertion** (no path
-  colors a sats-tiered coin); P2A-aware vout mapping; downgrade-dispatch test (sender-crafted
-  colored `v2` cannot route to the weaker path); multi-owner-split exit (sender confirms split at
-  handover); token-only CPFP under fee spike (tower-funded bump); latch HODL swap; latch-abort
-  `num_sigs`-neutral; mixed V1/V2 estate; O-3 deep-branch DoS suite.
+- Gating tests, **as landed**: **sdk52** is the anchor suite — carrier ⊥ ladder (the fresh-`F` /
+  "no path ladders a carrier" assertion) with an off-chain RGB transfer settling alongside a laddered
+  coin. Colored split/combine + booked-vs-consignment stay on **sdk02**, **sdk09**, **sdk29**,
+  **sdk31**, **sdk39** and the whole **rgb01–rgb14** family (all live, all sig-count-neutral as
+  predicted); the carrier watchtower/materialization half is **sdk32** + **sdk34**. Terminal-freeze
+  and count-padding adversarials are **sdk54**/**sdk55**. Lightning is the HODL suite set
+  **sdk63/64/65/66/67/68** (+ **sdk23** RGB↔LN swap, **tb04** latch), not the preimage-gated-renewal
+  sketch above. Still-open (no dedicated suite, tracked in "Residual risks"): token-only CPFP under a
+  fee spike, and the multi-owner-split exit ordering.
 
 ---
 
@@ -552,6 +734,10 @@ latch batch primitive, **no new SE endpoint, no enclave change.** Tie-in to the 
 The matrix is dispatched from `clients/tests/rust/src/main.rs` via `SDK_E2E`/`RGB_E2E` indices and
 run by `clients/tests/run_all_suites.sh`. Migration toggles the `UTEXO_PROTOCOL_DEFAULT` knob
 (V2DEF-2) per run; `run_all_suites.sh` passes it alongside `SDK_E2E` so each suite is pinned.
+
+> **The knob is gone.** It existed only for the double-run phases below; today every suite runs on
+> the one protocol and nothing is pinned. The dispositions of every id named in this stage are in
+> the OUTCOME block after the buckets — read that before trusting a test id here.
 
 ### Inventory — five buckets (`clients/tests/rust/src`)
 
@@ -596,9 +782,53 @@ flip them LAST within Group D and give them a full double-run.**
 `UPSTREAM` (original Mercury V1 library suite) is intrinsically V1 and dies with V1 code — freeze at
 a git tag or drop from the matrix in Phase 4.
 
+### OUTCOME — the actual disposition of every id named above
+
+The plan's buckets survived; several verdicts did not. **Retirement discipline held throughout: a
+suite was deleted only after its surviving property was re-verified green inside a live suite in the
+same session, back-filling the property first where it was unique** (that is how sdk35's claims got
+into sdk45).
+
+- **A (exit mechanics).** `sdk07`, `sdk08`, `sdk10` — **deleted**; their claims are **sdk50** (the
+  SDK walks the tier chain to a unilateral exit) and **sdk58** (11 adversarial exit/terminal cases,
+  all REJECT). `sdk13`, `sdk14` — **deleted**; their claims are **sdk51** (the watchtower defends a
+  hostile trigger), **sdk40 PART 2** (a stale state dies at consensus) and **sdk45** (keyless tower).
+  `sdk26`/`sdk27` — **deleted, not repointed**: under TES-R idle coins never age (0 vB rent) and the
+  ladder + terminality subsume the finite-ladder rent model, so the invalidation phenomenon they
+  measured no longer exists. `tb05_timelock` — **kept and re-expressed** (tier count + relative CSV);
+  it is live. `tv01` — live.
+- **B (refresh).** The product decision was resolved as **KEEP**, so the bucket was *not* deleted:
+  `sdk30_refresh` and `sdk38_sponsor_stiff` are **live**, and `refresh`/`refresh_sponsored`/
+  `reanchor` still ship for the un-laddered shape. Only `sdk33_auto_refresh` was **deleted**, as
+  *obsolete*: there is no ladder floor to approach any more; unbounded **off-chain** renewal is
+  covered by **sdk43**. Separately `sdk28` (sats granularity) was **deleted as obsolete** — the
+  in-ladder split has its own fee model (`tier_out_total` / `committed_fee_for_outputs` /
+  `min_child_value`) and the old backup-fee floor no longer governs a split. **D1** came out of that
+  fee model: the split admission guard still used the 442-sat backup floor, but a child funds its own
+  two tiers + dust ⟹ `min_child_value` (1306 sat at 2 sat/vB); admitting below it terminalized the
+  parent and *then* failed, stranding it.
+- **C (deadline / watchtower).** `sdk34` and `sdk32` — **kept and updated in place**, both live.
+  `sdk35_trust_boundaries` — **deleted**, but only after its unique claims were back-filled: the
+  watch bundle carries **no key material** and a **second independent tower is idempotent** now live
+  in **sdk45**; the carrier-never-laddered boundary in **sdk52**; the defence itself in **sdk51**;
+  the census boundary in **sdk46/47/54**.
+- **D.** The list as written names ids that no longer exist. Live today: sdk01, sdk02, sdk04, sdk09,
+  sdk11, sdk12, sdk15, sdk16, sdk17, sdk19, sdk20, sdk21, sdk23, sdk24, sdk25, sdk29–32, sdk34,
+  sdk36–68, chaos22, tb01–05, ta01–03, tm01, tv01, rgb01–14. Deleted from the group: sdk03, sdk05,
+  sdk06 (LN core → **sdk63/64/67**, plus **sdk65** non-exact and **sdk66/68** failure), sdk18 (LN
+  pay-failure reclaim → **sdk68** exact, **sdk66** non-exact rollback), sdk08/sdk10 (→ A above),
+  sdk28 (→ B above). The RGB family did flip last and is green.
+- **E.** sdk40–47 are still the backbone/oracle, now joined by sdk48–68.
+
+**The two suites that took longest to clear** were `sdk17` (needed first-class children — the last
+genuine feature gap, closed by the key-handover child conveyance) and `chaos22` (the only concurrency
+suite). Both are live on the one protocol.
+
 ### The required new fund-safety suite (hard prerequisite, not optional)
 
-**sdk48 — Model A pre-sign + stale-sender-tier race** (no current suite proves this): after Alice
+**sdk48 — Model A pre-sign + stale-sender-tier race** (**landed as `sdk49_model_a_transfer`** — the
+number sdk48 went to the V2-native-deposit suite; **sdk54** is its adversarial companion, attacking
+the count this suite assumes honest): after Alice
 transfers, assert (a) the **sender-pre-signed** `S'_{k+1}` pays **Bob** and matures strictly before
 Alice's retained `S_k` (win the CSV race on `X_m.out[0]`); (b) `se_num_sigs` accounts for the full
 disclosed bundle with **no hidden co-sign** (`== v1_backups + tiers.len()`, checked vs the live SE);
@@ -611,6 +841,11 @@ Explicit selector on `ClientConfig` (`protocol_default: u8`, seeded from `UTEXO_
 default 1) consumed at deposit/receive: `==2` ⟹ auto-establish (skip V1 backup generation);
 `==1` ⟹ exact current behavior. `transfer_sender.rs:282` already selects `protocol_version=2` iff a
 bundle exists, so the knob only controls *whether a bundle is created*.
+
+> **DELETED.** The knob (and its `UTEXO_PROTOCOL_DEFAULT` env) was scaffolding for the phased flip
+> and no longer exists in `SdkConfig`/`ClientConfig`. What survives is the half that was never a
+> knob: the sender still selects the conveyance shape by asking whether a bundle exists
+> (`tesr::load`), and `claim()` establishes one for every fresh confirmed root coin unconditionally.
 
 ### Order
 
@@ -628,6 +863,13 @@ bundle exists, so the knob only controls *whether a bundle is created*.
   `v1_backups` term goes to 0 for pure-V2 sats coins, so **sdk46/47 expected counts must change in
   lockstep** with the deposit-tier change (`se_num_sigs == tiers.len()`).
 
+> **OUTCOME — Phases 0–4 all ran, with one correction.** The `v1_backups → 0` prediction was
+> **wrong** and was not taken: Stage 2b never landed, so a laddered root coin still carries its one
+> signed-once backup and the baseline is the constant `tesr::PARENT_V2_BASELINE = 1` (a split child
+> slot, never funded on-chain, is `CHILD_V2_BASELINE = 0`). sdk46/47 kept counting
+> `se_num_sigs == v1_backups + tiers`, and that conveyed-backup term is itself attacker-facing —
+> **sdk55** exists because it was briefly left unvalidated on the laddered lane.
+
 ### Files touched / tests
 
 `clients/tests/rust/src/main.rs`, `clients/tests/run_all_suites.sh`,
@@ -640,18 +882,41 @@ Phase 2 doubles Group-D runtime (many slow live-SE/LN suites) — gate the doubl
 
 ## Stage V2DEF-6 — delete V1 code + purge docs
 
+> **OUTCOME — this stage ran, but its premise was corrected mid-flight and the excision is
+> deliberately PARTIAL.** The pre-deletion unreachable-guard proof is what corrected it: the
+> non-bundle receiver branch is **not** dead code. It is the UN-LADDERED shape — RGB carriers, which
+> must never be laddered (a plain tier spend destroys the allocation), and split sub-coins whose
+> un-broadcast funding cannot root a trigger [B0]. So the lane **stayed**, and with it
+> `validate_signature_scheme`, `ladder_decrements_by_interval` (now the defence proven by **sdk55**),
+> and `create_tx1`. What actually got removed is the thing that made two *protocols*: the
+> `deposit_protocol_version` / `UTEXO_PROTOCOL_DEFAULT` escape hatch. `protocol_version` on the wire
+> stopped being a protocol selector and became a **conveyance-shape discriminant** — `0` un-laddered
+> backup-chain handover, `2` TES-R bundle, `3` legacy child conveyance, `4` child conveyance **with**
+> the key handover. Read every "DELETE" below against the per-group notes.
+
 Entry gate (all three must hold): (1) V2 is the default (sender always emits `protocol_version=2` +
 `tesr_ladder`); (2) every E2E suite is migrated (V2DEF-5); (3) no V1 coins can be minted
 (deposit→establish is the only path). **Pre-deletion proof:** run the full matrix with
 `panic!`/assert-unreachable planted in `validate_signature_scheme` and the `protocol_version < 2`
-receiver branch; a green run proves those paths are dead **before** excision.
+receiver branch; a green run proves those paths are dead **before** excision. *(Gate (1) and (2) hold.
+Gate (3) holds for root coins — every fresh confirmed root coin is laddered by `claim()`,
+unconditionally. The pre-deletion proof is what disproved the assumption behind the excision: those
+branches are reachable **by design**, for carriers and un-broadcast-funded sub-coins.)*
 
 This is a **surgical excision, not a file-level `rm`.** The blind-MuSig2 co-sign engine, deposit
 keygen, transfer key-rotation, off-chain split/combine PSBT builders, RGB coloring, withdraw, the
 keyless watch bundle, and `get_backup_txs` persistence are **SHARED infra that TES-R itself calls**
 (`lib/src/transaction.rs` co-sign primitives at `tesr.rs:527,535`) and **MUST survive.**
 
-### DELETE — Group A (pure V1 ladder, lib)
+### DELETE — Group A (pure V1 ladder, lib) — **NOT EXECUTED**
+
+> The whole group was cancelled by the pre-deletion proof. `validate_signature_scheme` is still
+> called on the un-laddered lane, and `ladder_decrements_by_interval` (INV-5) turned out to be
+> load-bearing on the **laddered** lane too: a laddered coin still conveys its signed-once backups
+> and still feeds their count into `verify_bundle`, so INV-5 is what stops a sender padding or
+> inverting that term — the two attacks in **sdk55**. `create_tx1` and `get_user_backup_address`
+> likewise survive (Stage 2b was never taken). The "MOVE, don't delete" caution on
+> `verify_blinded_musig_scheme` et al. was correct and is now moot — nothing was deleted.
 
 - `lib/src/transaction.rs`: `get_unsigned_backup_tx` (zero callers — but it is a `#[uniffi::export]`
   binding; confirm no nodejs/web-wallet FFI consumer before deleting — open risk); `calculate_block_height`
@@ -664,7 +929,16 @@ keyless watch bundle, and `get_backup_txs` persistence are **SHARED infra that T
   (open risk):** `verify_blinded_musig_scheme`'s SE-challenge soundness check and the sequence/reconstruct
   canonical-form checks may be legitimately reusable by branch/tier validation; **MOVE, don't delete**, if so.
 
-### DELETE — Group B (SDK on-chain refresh)
+### DELETE — Group B (SDK on-chain refresh) — **NOT EXECUTED**
+
+> The blocking product decision (below, "`refresh_sponsored` … blocks deleting sdk30/38") was
+> resolved as **KEEP**. `refresh.rs` is intact — `refresh`, `refresh_sponsored`, `rebate_refresh_fee`,
+> `reanchor`, `auto_refresh_due`, `auto_refresh_before_spend`, `RefreshResult` — as are the
+> `auto_refresh*` config fields and `TransferQuote`'s `renewal_fee_sats`/`stuck_coins` (so the
+> flagged API break never happened). **sdk30** and **sdk38** are live. Only the *laddered* lane is
+> off it: a re-anchor of a laddered coin would strand its bundle, so that path renews off-chain
+> instead. **D2** was fixed here (sponsored rebate sized into the dead window below
+> `min_child_value`, failing after the user had paid the on-chain fee).
 
 - `clients/libs/rust-sdk/src/refresh.rs` — **entire file** (`refresh`, `refresh_sponsored`,
   `rebate_refresh_fee`, `reanchor`, `auto_refresh_due`, `auto_refresh_before_spend`, `coin_near_final`,
@@ -677,7 +951,13 @@ keyless watch bundle, and `get_backup_txs` persistence are **SHARED infra that T
 - `wallet.rs`: delete the `auto_refresh_due` background call. `tokens.rs`: fix the `auto_refresh_due`
   doc-comment.
 
-### EDIT — Group C (deposit backup + generic tx flow lose ladder args)
+### EDIT — Group C (deposit backup + generic tx flow lose ladder args) — **PARTIAL**
+
+> `create_tx1` **stayed**: a laddered root coin still gets exactly one signed-once backup at deposit
+> confirmation (`coin_status::check_deposit`), which is what pins the census baseline to a constant
+> (`tesr::PARENT_V2_BASELINE = 1`) that a split-child receiver can rely on without observing the
+> parent's history. The `initlock`/`interval` plumbing cleanups did happen where the laddered lane
+> owns the flow; the un-laddered lane still uses them.
 
 - `deposit.rs`: delete `create_tx1` (+ `coin.locktime` set). V2 deposit → `tesr.establish`.
 - `clients/libs/rust/src/transaction.rs`: keep `new_transaction` (withdraw needs it) but drop
@@ -687,7 +967,20 @@ keyless watch bundle, and `get_backup_txs` persistence are **SHARED infra that T
 - `lib/src/transaction.rs`: drop `initlock`/`interval`/`qt_backup_tx` from the split/combine/backup
   PSBT builders + `get_partial_sig_request`; `rgb.rs` updates its calls.
 
-### EDIT — Group D (protocol_version gates → unconditional V2)
+### EDIT — Group D (protocol_version gates → unconditional V2) — **RE-AIMED**
+
+> `verify_bundle` did **not** become unconditional and `tesr_ladder` did **not** become mandatory,
+> because a carrier legitimately conveys no ladder. Instead the receiver **hard-selects on the
+> conveyance shape**, which is exactly the anti-downgrade rule V2DEF-4 demanded: bundle ⟹ tier
+> census; no bundle ⟹ backup-chain validation (`validate_backup_chain_v2` + INV-5, attacked in
+> **sdk55**); child bundle ⟹ `verify_conveyed_child` / `verify_child_bundle`, with
+> `protocol_version = 4` additionally requiring the key handover to complete before the coin is
+> usable. Every value the census compares against is fetched **authoritatively** — the funding
+> outpoint from chain, `num_sigs` from the live SE via `/info/statechain` — never from the message,
+> which is what makes the shape selection safe. The negative test that shipped is therefore not
+> "reject a message without a ladder" but "**a sender cannot pad or invert the count its shape is
+> checked against**" — **sdk54**/**sdk55**. The same census also runs **pre-pay** on the SSP side
+> before an irreversible Lightning leg (LIGHTNING.md §2).
 
 - `clients/libs/rust/src/transfer_receiver.rs`: make `verify_bundle(...)` unconditional; delete the
   `else if statechain_info.num_sigs != backup_transactions.len()` V1 branch and the whole
@@ -717,10 +1010,28 @@ count (already required by V2DEF-5); update **sdk46/47** to `se_num_sigs == tier
 commit as the deposit-tier change. Delete V1-only suites in the same commit that removes their APIs so CI
 does not compile-fail.
 
+> **OUTCOME.** Deleted: `sdk13`, `sdk14`, `sdk26`, `sdk27`, `sdk33` (plus, from other buckets,
+> `sdk03/05/06`, `sdk07/08/10`, `sdk18`, `sdk28`, `sdk35`). **Kept:** `sdk30` (refresh stayed a
+> product feature) and `tb05` (re-expressed as tier count + relative CSV). `chaos22` was re-expressed,
+> not gutted — it is the only concurrency suite and is live. `sdk12` migrated to the tier counts and
+> is live; `sdk10` was deleted, its claims absorbed by **sdk50**/**sdk58**. `sdk46/47` were **not**
+> changed to `se_num_sigs == tiers.len()` — see the Phase-4 note in V2DEF-5: the signed-once backup
+> baseline stayed at 1. Every id deleted here is repointed in "Deleted test ids → where their claims
+> live now" at the top of this file; the two entries with **no** repoint (`sdk26`/`sdk27` and
+> `sdk28`/`sdk33`) are obsolete-by-construction, and the reason is recorded there rather than dropped.
+
 ### DOCS PURGE (keep only TES-R; retain the name "protocol version 2")
 
+> **Executed by the 2026-07-29 docs sweep**, with the checklist below amended by what actually
+> shipped: docs must describe **one protocol with two coin shapes**, never "V1/V2 coexisting" and
+> never "the V1 lane" — the un-laddered shape is current and load-bearing for RGB carriers and
+> un-broadcast-funded sub-coins. `refresh()`/`refresh_sponsored`/`auto_refresh` API docs are
+> **kept**, not removed (the feature shipped). Every doc that cited a now-deleted test id had that
+> citation repointed to a live suite, or the coverage claim removed outright where the property is
+> obsolete — no doc may claim evidence that no longer exists.
+
 - Rewrite V2-only: `SPEC.md`, `TRUST-MODEL.md`, `learn/{core-concepts,transfers,exits,trust-model,tldr}.md`
-  — remove decrementing-ladder / initlock-interval / 7-day-refresh prose; fold `V2-DESIGN.md` in as
+  — remove decrementing-ladder / initlock-interval / 7-day-refresh prose; fold `PROTOCOL.md` in as
   canonical.
 - Remove/rewrite the finite-ladder rent model wholesale: `INVALIDATION-SPEC.md`,
   `learn/{invalidation,invalidation-deep-dive}.md`, `research/invalidation-economics.md` — V2 eliminates
@@ -739,9 +1050,14 @@ does not compile-fail.
   the strictly-stronger `se_num_sigs == v1_backups + tiers.len()`. **CAUTION:** `v1_backups` is really
   "non-tier SE co-signs" and still counts RGB-colored backups even after V1 is gone — do **not** assume it
   goes to 0; audit the count balances for a pure-V2 RGB coin, and consider renaming to `non_tier_cosigns`
-  (open risk).
-- **L2** — delete the absolute-`nLockTime` ladder check only because `verify_bundle` validates the V2
-  decrementing-**relative**-CSV chain (same "latest matures first").
+  (open risk). **The caution was right.** `v1_backups` never went to 0 — it is 1 for every laddered
+  root coin (`PARENT_V2_BASELINE`) and 0 only for a never-funded split-child slot
+  (`CHILD_V2_BASELINE`), and the term is attacker-supplied, so it is validated in its own right by
+  INV-5 (**sdk55**). The shipped equation also carries a `superseded_ok` term for the state each hop
+  legitimately discloses; **sdk54** is the suite proving that term cannot be padded.
+- **L2** — the absolute-`nLockTime` ladder check was **not** deleted: `verify_bundle` validates the
+  decrementing-**relative**-CSV chain on the laddered shape, and `ladder_decrements_by_interval`
+  still validates the conveyed signed-once backups on both shapes (same "latest matures first").
 - **L3/L4** — exit MATERIAL (split/combine builders, `exit_tiers`, keyless bundle + `watch_pass`) is in
   the KEEP set; only the V1 absolute-locktime backup sweep is deleted, replaced by the tier chain
   broadcast. Non-custody untouched (none of the deleted code is on keygen/rotation/co-sign).
@@ -757,13 +1073,16 @@ does not compile-fail.
 
 ## Per-stage summary — files, coexistence/gating, fund-safety, live gate tests
 
-| Stage | Core change | Coexistence / gate | Fund-safety preservation | Live tests that gate it |
+Columns 2–4 are the plan-time view (kept as written). The last column is **as landed** — every id in
+it is a suite that exists today.
+
+| Stage | Core change | Coexistence / gate | Fund-safety preservation | Live tests that gate it (as landed) |
 |---|---|---|---|---|
-| **V2DEF-2** V2-native deposit | auto-establish + persist ladder at CONFIRMED, behind `deposit_protocol_version` (default 1) | flag 1 = byte-identical V1; flag 2 (2a) adds tiers over unchanged `tx1` (superset) | L1 `verify_bundle` (4→3); L4 seed-derived `backup_address`; L2 schedule CSV; L3 no enclave rebuild | sdk48 (auto/payee/count/verify/transfer), idempotency, exclusion, resume-after-failure, full V1 regression at flag 1 |
-| **V2DEF-3** route wallet flows | dispatch on bundle-presence; Model A sender pre-sign; off-chain renew; `watch_pass`; V2 withdraw | lands dormant (no bundle ⟹ V1 branch); flip = V2DEF-2 flag | L1 full-disclosure count (cross-hop safe); L2 `k+1` lower CSV; L4 at claim (no pending-ladder); F-race handled by confirm-before-spend | sdk49/50/51, latch-abort `num_sigs`-neutral, mis-route guard, full regression |
-| **V2DEF-4** RGB + LN on tiers | colored split/combine → v3/CSV/P2A; count-based terminal-freeze; carriers fresh-`F`; SE-authenticated dispatch; latch composition | format gated; new V1 colored issuance off at first stage; sig-count-neutral (sdk02/09 unchanged) | L1 `num_sigs==1`/ancestor (fresh-`F`); terminal-freeze count sole gate; anchors in signed-once tx; L4 broadcast colored chain | v3-split/combine, terminal-freeze adversarial, fresh-`F` assertion, P2A vout mapping, downgrade-dispatch, multi-owner-split exit, token-only CPFP, latch HODL + abort, O-3 DoS |
-| **V2DEF-5** migrate ~50 suites | knob-gated per-run flip; replace A/B/C, flip D, add sdk48 | Phase 0 baseline-identical; Phase 2 double-run both flags | L1 sdk46/47 vs live SE; L2 sdk07/13/14 CSV form; L4 sdk48 at-claim exit | Phase-by-phase full matrix green; isolated CWD per suite |
-| **V2DEF-6** delete V1 + docs | surgical excision; keep shared infra; rewrite watchtower; purge docs | pre-deletion unreachable-guard proves V1 paths dead | L1/L2 substituted by `verify_bundle` before deletion; L3/L4 material in KEEP set | sdk40–47 green; RGB rgb09–13; split/combine sdk28/29/31/39; withdraw; LN; `cargo build -D warnings`; new reject-V1-message test |
+| **V2DEF-2** V2-native deposit | auto-establish + persist ladder at CONFIRMED, behind `deposit_protocol_version` (default 1) | flag 1 = byte-identical; flag 2 (2a) adds tiers over the unchanged signed-once backup (superset). *Flag since deleted — establish is unconditional* | L1 `verify_bundle` (baseline stayed at 1 backup + tiers); L4 seed-derived `backup_address`; L2 schedule CSV; L3 no enclave rebuild | **sdk48** (auto/payee/count/verify/transfer); idempotency/resume → **sdk56**; exclusion (carrier gets no ladder) → **sdk52** |
+| **V2DEF-3** route wallet flows | dispatch on bundle-presence; Model A sender pre-sign; off-chain renew; `watch_pass`; withdraw | lands dormant (no bundle ⟹ un-laddered branch); flip = V2DEF-2 flag | L1 full-disclosure count (cross-hop safe); L2 `k+1` lower CSV; L4 at claim (no pending-ladder); F-race handled by confirm-before-spend | **sdk49** (Model A), **sdk50** (SDK unilateral exit), **sdk51** (watchtower), **sdk01** (cooperative withdraw), **sdk54/55** (census adversarial) |
+| **V2DEF-4** RGB + LN on tiers | colored split/combine → v3/CSV/P2A; count-based terminal-freeze; carriers fresh-`F`; SE-authenticated dispatch; latch composition | format gated; sig-count-neutral (sdk02/09 unchanged) | L1 `num_sigs==1`/ancestor (fresh-`F`); terminal-freeze count sole gate; anchors in signed-once tx; L4 broadcast colored chain | **sdk52** (carrier ⊥ ladder), **sdk02/09/29/31/39** + **rgb01–14** (colored split/combine), **sdk32/34** (carrier watchtower), **sdk54/55**; LN = **sdk63/64/65/66/67/68** (+ **sdk23**, **tb04**, **sdk53** guard lifted) |
+| **V2DEF-5** migrate ~50 suites | knob-gated per-run flip; replace A/B/C, flip D, add the Model-A proof | Phase 0 baseline-identical; Phase 2 double-run both flags; knob then deleted | L1 sdk46/47 vs live SE; L2 CSV form in **sdk50/51**; L4 at-claim exit in **sdk49** | whole matrix green on the one protocol; isolated CWD per suite |
+| **V2DEF-6** delete the escape hatch + purge docs | partial, surgical excision: the flag goes, the un-laddered shape STAYS; watchtower rewritten; docs purged | unreachable-guard run showed the non-bundle branch is reachable **by design** (carriers, un-broadcast-funded sub-coins) | L1/L2 substituted by `verify_bundle` + INV-5 before anything was removed; L3/L4 material in KEEP set | **sdk40–68** green; **rgb01–14**; split/combine **sdk29/31/39/58/59**; **sdk60/17** (child hops); withdraw **sdk01**; LN **sdk63–68**; `cargo build -D warnings` |
 
 ---
 
@@ -784,6 +1103,14 @@ does not compile-fail.
 6. **V2DEF-5** test migration Phases 0–3; land **sdk48** (Model A fund-safety proof) in Phase 1.
 7. **V2DEF-2 Stage 2c** (flip default to 2) — after suites migrated and atomicity fixed.
 8. **V2DEF-6** delete V1 + docs (Phase 4), after the pre-deletion unreachable-guard run is green.
+
+> **DONE, in this order, with two documented deviations:** step 4 (Stage 2b, drop the signed-once
+> backup) was **not taken** — the baseline constant is better than a zero — and step 8 became a
+> partial excision that removed the protocol-selecting flag while keeping the un-laddered shape. The
+> Model-A proof landed as **sdk49**. Two things not in this list turned out to be prerequisites and
+> were built along the way: the **in-ladder split** (B1's real fix — sdk58/sdk59) and **first-class
+> children** via the standard key handover (sdk60/sdk17), without which the last suites could not
+> come off the old lane.
 
 ### Accepted adversarial findings (folded in)
 
@@ -820,19 +1147,29 @@ does not compile-fail.
 - **Rejected: Model A's stated weakness ("safety depends on the sender's honest CSV choice")** — false;
   R′ verifies the CSV. (Per the review.)
 
-### Residual risks to track through execution
+### Residual risks — status after execution
 
-- **O-2 (`δ` vs congestion):** size `d_floor`/`δ` so the receiver's `k+1` state wins the maturity race
-  under mainnet fee spikes; gates the near-floor re-anchor threshold.
-- **Bundle growth on hot coins:** bounded by re-anchor at the floor (resets to 3 tiers), but confirm the
-  transfer fee model (B4 refresh-as-fee → now folded into the adopt-time re-anchor) prices it and that a
-  quote surfaces it.
-- **`v1_backups` naming/audit** in `verify_bundle` (still counts RGB-colored backups after V1 is gone) —
-  audit the count balances for a pure-V2 RGB coin; consider renaming to `non_tier_cosigns`.
-- **Shared-infra reuse in Group A deletion** (`verify_blinded_musig_scheme` et al.) — MOVE, don't delete,
-  if branch/tier validation depends on them.
-- **FFI/API breaks:** `get_unsigned_backup_tx` (`#[uniffi::export]`), `TransferQuote` shape — coordinate
-  with nodejs daemon + web-wallet bridge.
-- **Server/enclave `num_sigs` semantics:** memory says no enclave rebuild is needed, but confirm the SE's
-  counter matches `verify_bundle`'s expectation once V1 client backups stop being created.
-- **`refresh_sponsored` product decision** — blocks deleting sdk30/38.
+- **O-2 (`δ` vs congestion): STILL OPEN.** Size `d_floor`/`δ` so the receiver's `k+1` state wins the
+  maturity race under mainnet fee spikes; gates the near-floor re-anchor threshold. Nothing in the
+  regtest matrix can settle a mainnet fee-spike margin.
+- **Bundle growth on hot coins: bounded, priced.** The re-anchor at the floor resets the bundle, and
+  the transfer fee model (B4 refresh-as-fee) survived the migration, so `quote_transfer` still
+  surfaces the renewal component to the user.
+- **`v1_backups` naming/audit: RESOLVED as an audit, still un-renamed.** It never went to 0 — the
+  balances are pinned as `PARENT_V2_BASELINE = 1` / `CHILD_V2_BASELINE = 0`, the term is validated by
+  INV-5 (**sdk55**), and the shipped equation adds `superseded_ok` (**sdk54**). The `non_tier_cosigns`
+  rename was not done; the name still reads as if it counted a dead protocol.
+- **Shared-infra reuse in Group A deletion: MOOT** — Group A was not executed;
+  `verify_blinded_musig_scheme` and friends were never moved or deleted.
+- **FFI/API breaks: DID NOT HAPPEN.** `get_unsigned_backup_tx` is still exported and `TransferQuote`
+  kept `renewal_fee_sats`/`stuck_coins`, so the nodejs daemon and web-wallet bridge needed no
+  coordination.
+- **Server/enclave `num_sigs` semantics: CONFIRMED SUFFICIENT** for the shipped equation (no enclave
+  rebuild was needed), and the signed-once backups never stopped being created, so the scenario this
+  risk worried about did not arise. The **SGX lane remains the standing caveat**: every suite named in
+  this document runs against the dev lockbox, not the production enclave.
+- **`refresh_sponsored` product decision: RESOLVED — KEEP.** sdk30/38 stay; **D2** (rebate sized into
+  the dead window below `min_child_value`) was found and fixed as a consequence.
+- **Still uncovered, carried forward from V2DEF-4:** token-only CPFP under a fee spike (a pure-token
+  wallet with no sats to bump P2A) and the multi-owner colored split's TRUC sibling ordering. Both
+  mitigations are specified above; neither has a dedicated live suite.

@@ -19,6 +19,14 @@ the receiver validates the exit branch with `validate_offchain_chain` and books 
 consignment. This is a strict superset of on-chain RGB: the same consignment/validation machinery
 runs, only the witness output lives on a statechain coin.
 
+**An RGB carrier is never laddered.** There is one protocol on the statechain, in two coin shapes.
+A plain deposit is laddered by `claim()` (a TES-R trigger → extension → state chain, relative CSV,
+un-broadcast). A coin carrying an RGB allocation deliberately is **not**: a plain tier spend would
+destroy the allocation, so a carrier keeps the signed-once colored backup chain and transfers by
+backup-chain handover (terminal-freeze, `PROTOCOL.md` §5.10 rule 1). That un-laddered shape is what
+every `rgb*` test below exercises; `sdk52` proves the invariant directly — in one wallet the plain
+coin carries a ladder, the token carrier carries none, and the off-chain RGB transfer still settles.
+
 ## Coverage summary
 
 62 upstream tests classified: **13 MIRROR** (behave identically over a statechain coin, expressible
@@ -80,8 +88,10 @@ internals, or LN channels — identical whether the witness is a plain UTXO or a
    engine/schema-internal, orthogonal to statechain; would be ADAPT only if the bridge exposed them.
 6. **Query-layer & Lightning** — `pagination_filters::*` (rgb-lib query cursors, statechain-invariant;
    off-chain transfers aren't broadcast so `listtransactions` is moot); LN channel/swap/HTLC tests
-   from rgb-lightning-node are covered by our Lightning-latch swap tests (`sdk03`/`sdk05`/`sdk06`,
-   `LN_SMOKE`) — RGB-over-statechain and RGB-over-LN are different rails.
+   from rgb-lightning-node are covered by our HODL-latch Lightning tests over the TES-R ladder
+   (`sdk63` PAY and `sdk64` RECEIVE on an exact coin, `sdk65` PAY and `sdk67` RECEIVE for a non-exact
+   amount via an in-ladder split, `sdk66`/`sdk68` for pay-failure reclaim, plus `LN_SMOKE`) —
+   RGB-over-statechain and RGB-over-LN are different rails.
 
 ## ADAPT — mirrorable next, and the bridge additions they need
 
@@ -111,4 +121,4 @@ Prioritised remaining work (each becomes an `rgbNN` when its bridge gap is fille
 - **Collaborative transfer** (`collaborative_transfer`): a multi-owner `create_colored_combine_tx`
   where each input is co-signed by its own owner's blind-MuSig2.
 
-Run the implemented tests with `RGB_E2E=1..12` on the regtest + Mercury (lockbox) + rgb-proxy stack.
+Run the implemented tests with `RGB_E2E=1..14` on the regtest + Mercury (lockbox) + rgb-proxy stack.

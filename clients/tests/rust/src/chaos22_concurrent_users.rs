@@ -163,11 +163,11 @@ pub fn classify(err: &anyhow::Error) -> Class {
         //  * a child too small to split into a viable piece + change (each grandchild must fund its own
         //    two tiers and clear dust). The refusal happens BEFORE anything is co-signed.
         ("leaves no change", "split-fit"),
-        // V2 concurrency refusals — the system CORRECTLY refusing a racing action, not a bug:
+        // Concurrency refusals — the system CORRECTLY refusing a racing action, not a bug:
         //  * another task spent/transferred the coin first, so it is no longer CONFIRMED. Refusing to
         //    exit a WITHDRAWN parent is the [B1] guard doing its job (exiting it would invalidate the
         //    sub-coins its split funded). NOTE this is the "already spent/transferred" refusal, NOT
-        //    the "has a V2 exit ladder and cannot be split" one — that one must stay UNCLASSIFIED so a
+        //    the "has a TES-R exit ladder and cannot be split" one — that one must stay UNCLASSIFIED so a
         //    real routing regression still shows up as a breach.
         ("already been spent/transferred", "raced-spend"),
         //  * the coin was handed over concurrently and its auth key rotated, so our co-sign is now

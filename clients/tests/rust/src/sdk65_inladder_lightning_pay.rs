@@ -1,4 +1,4 @@
-//! E2E (SDK_E2E=65) — **NON-EXACT V2 Lightning PAY via a latched in-ladder split** (V2-LN-HODL.md §2b).
+//! E2E (SDK_E2E=65) — **NON-EXACT V2 Lightning PAY via a latched in-ladder split** (LIGHTNING.md §2b).
 //!
 //! The usability gap the exact lane (sdk63) leaves: real invoices are arbitrary amounts, and splitting
 //! a V2 laddered coin yields an in-ladder-split CHILD conveyed via a mailbox that the exact-lane census

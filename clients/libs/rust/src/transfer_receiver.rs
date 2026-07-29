@@ -263,7 +263,7 @@ pub struct PendingTransferInfo {
     pub funding_vout: u32,
     /// The un-broadcast exit branch (raw tx hex, root-first) the consignment resolves against.
     pub branch_txs: Vec<String>,
-    /// Pre-pay ladder census (V2-LN-HODL.md): `true` iff this coin is safe to accept-before-paying —
+    /// Pre-pay ladder census (LIGHTNING.md): `true` iff this coin is safe to accept-before-paying —
     /// a V1 coin (no ladder) is trivially `true`; a V2 (TES-R) coin is `true` only if its conveyed
     /// ladder passes `verify_bundle`'s `num_sigs == v1_backups + tiers` against the LIVE enclave
     /// sig-count (so no hidden lower-CSV state is present). The SSP's pre-pay gate MUST refuse to pay
@@ -378,7 +378,7 @@ pub async fn peek_pending_transfers(
                 .backup_transactions
                 .iter()
                 .find_map(|b| b.rgb_consignment.clone());
-            // PRE-PAY CENSUS (V2-LN-HODL.md §2/§2b). A paying party (the SSP) must validate a conveyed
+            // PRE-PAY CENSUS (LIGHTNING.md §2/§2b). A paying party (the SSP) must validate a conveyed
             // coin BEFORE the irreversible Lightning leg. Two shapes:
             //   * a flat V2/TES-R ladder → `verify_bundle` (`num_sigs == v1_backups + tiers` vs the LIVE
             //     enclave sig-count), catching a hidden lower-CSV state that would out-race the conveyed
@@ -796,7 +796,7 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
     // `protocol_version >= 4` carries the STANDARD key handover, so the receiver COMPLETES it here: the
     // SE rotates its share leaving the child aggregate `A_child` INVARIANT (the pre-signed child ladder
     // stays valid) and re-points auth to this wallet, which permanently locks the sender out. That makes
-    // the child a FIRST-CLASS coin, not merely an exitable claim (docs/utexo/V2-CHILD-FIRSTCLASS.md).
+    // the child a FIRST-CLASS coin, not merely an exitable claim (docs/utexo/CHILDREN.md).
     // Version 3 is the legacy no-handover conveyance and is still adopted exit-only.
     if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
         let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
@@ -868,7 +868,7 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
                 .ok_or_else(|| anyhow::anyhow!("no statechain info for child {}", cb.child_statechain_id))?;
 
         // Clear the RECEIVER-side lock BEFORE completing the handover (the flat lane does the same).
-        // [non-exact LN RECEIVE, V2-LN-HODL.md §2b] For a latched conveyance this is what signals "the
+        // [non-exact LN RECEIVE, LIGHTNING.md §2b] For a latched conveyance this is what signals "the
         // receiver has claimed": once the owner (SSP) has also confirmed, both lock bits are false and
         // the SE releases the HODL preimage. The auth key has not rotated yet, so sign with this
         // wallet's own auth key. NOT best-effort any more — the handover below depends on it.

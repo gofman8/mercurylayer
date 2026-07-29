@@ -4,7 +4,7 @@
 //! Renewal replaces an extension horizontally but the extension-CSV budget is finite. At exhaustion,
 //! TES-R does NOT touch the chain: it ROLLS OVER off-chain — the current level's state becomes a
 //! self-split paying the aggregate A, and a fresh level (extension + owner state) hangs off it. This
-//! gives unbounded off-chain state transitions with zero on-chain bytes (V2-DESIGN §5.6), the
+//! gives unbounded off-chain state transitions with zero on-chain bytes (PROTOCOL.md §5.6), the
 //! "users can be off-chain forever" property.
 //!
 //! Flow:

@@ -1,6 +1,6 @@
 //! TES-R (Trigger / Extension / State) transaction tier builders for Utexo V2.
 //!
-//! See `docs/utexo/V2-DESIGN.md`. A coin's funding UTXO `F` (P2TR of the aggregate key `A`) rests
+//! See `docs/utexo/PROTOCOL.md`. A coin's funding UTXO `F` (P2TR of the aggregate key `A`) rests
 //! on-chain; above it hangs a pre-signed, **un-broadcast** tree of three tiers, all v3 (TRUC) with a
 //! P2A anchor for fee-bumping:
 //!
@@ -85,7 +85,7 @@ pub fn csv_blocks(blocks: u16) -> Sequence {
 
 /// Protocol parameters for the TES-R ladder — the relative-timelock schedule the wallet uses to size
 /// each tier and to decide when to renew or roll over. Mainnet defaults are from
-/// `docs/utexo/V2-DESIGN.md` §5.2; in production the SE serves them via `/info/config` so a receiver
+/// `docs/utexo/PROTOCOL.md` §5.2; in production the SE serves them via `/info/config` so a receiver
 /// can detect a per-victim parameter split, but they are pure protocol constants (no fund is at
 /// stake in getting them "wrong" — only exit-wait length and renewal cadence).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,7 +115,7 @@ impl Default for TesrParams {
 }
 
 impl TesrParams {
-    /// Mainnet defaults (V2-DESIGN §5.2): 36-block (~6 h) head starts, ~17 extension epochs, forced
+    /// Mainnet defaults (PROTOCOL.md §5.2): 36-block (~6 h) head starts, ~17 extension epochs, forced
     /// rollover at m=15, 2 sat/vB committed fee.
     pub fn mainnet() -> Self {
         Self { d0: 1440, delta: 36, d_floor: 144, e0: 720, delta_e: 36, e_floor: 144, m_max: 15, committed_fee_rate: 2.0 }
@@ -347,7 +347,7 @@ pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f
     prev_value.checked_sub(committed_fee_for_outputs(n_payload, fee_rate_sats_per_vb) + P2A_VALUE)
 }
 
-/// **SPLIT STATE `SP`** — the in-ladder split (V2-DESIGN §5.4). Spends `X_m.out[0]` under
+/// **SPLIT STATE `SP`** — the in-ladder split (PROTOCOL.md §5.4). Spends `X_m.out[0]` under
 /// relative-timelock `csv_d`, paying `children` (exact amounts) plus the P2A anchor.
 ///
 /// This addresses (does NOT fully dissolve) **B1**. A V1-style split spends the coin's funding `F` — and
@@ -359,7 +359,7 @@ pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f
 /// rival, but the parent's own retained STATE over `X_m.out[0]` becomes one. A child spending `SP.out[j]`
 /// is only safe if it verifies the PARENT's full-disclosure census (parent num_sigs == parent's disclosed
 /// tiers), which is only meaningful if the parent is terminalized AND that terminality is enforced at
-/// co-sign time. See `docs/utexo/V2-SPLIT-FINDINGS.md` — that census currently rests on server/enclave
+/// co-sign time. See `docs/utexo/history/SPLIT-FINDINGS.md` — that census currently rests on server/enclave
 /// guarantees that do not hold (the enclave has NO notion of terminality; sign/second must re-check the
 /// gates — fixed 9d63f15). `build_trigger` is the ONLY builder that touches `f_txid/f_vout`.
 ///
@@ -383,7 +383,7 @@ pub fn build_split_state(
     let available = tier_out_total(x_out_value, children.len(), fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let total: u64 = children.iter().map(|(_, v)| *v).sum();
     if total != available {
-        // Σout must equal Σin − fee_committed exactly (V2-DESIGN §5.4).
+        // Σout must equal Σin − fee_committed exactly (PROTOCOL.md §5.4).
         return Err(MercuryError::FeeTooHigh);
     }
     let mut output = Vec::with_capacity(children.len() + 1);

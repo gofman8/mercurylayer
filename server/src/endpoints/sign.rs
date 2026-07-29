@@ -138,7 +138,7 @@ pub async fn sign_first(statechain_entity: &State<StateChainEntity>, sign_first_
         }
     }
 
-    // [PENDING-TRANSFER LOCK — V2-CHILD-FIRSTCLASS.md] While a transfer of this coin is OPEN (conveyed
+    // [PENDING-TRANSFER LOCK — CHILDREN.md] While a transfer of this coin is OPEN (conveyed
     // but not yet completed by the receiver), the SE refuses ANY co-sign. After the transfer_sender
     // re-order every legitimate sender pre-sign (backups + Model-A S') completes BEFORE `get_new_x1`
     // opens the transfer, so no honest co-sign happens during the open window — refusing here closes the
@@ -316,7 +316,7 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
         Err(_) => fail_closed_second!(),
     }
 
-    // [PENDING-TRANSFER LOCK — V2-CHILD-FIRSTCLASS.md] Refuse to FINALIZE a co-sign while a transfer of
+    // [PENDING-TRANSFER LOCK — CHILDREN.md] Refuse to FINALIZE a co-sign while a transfer of
     // this coin is open. Enforced at sign_second (not only sign_first) so a sender that opened sign_first
     // BEFORE the transfer cannot complete the dangling session AFTER it to slot a lower-CSV rival — the
     // gates must hold at the moment the signature is ISSUED. Fail CLOSED on a DB error.

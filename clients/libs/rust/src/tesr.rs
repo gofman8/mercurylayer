@@ -273,7 +273,7 @@ pub async fn establish_child(
     })
 }
 
-/// [in-ladder split] The production sender for an in-ladder split (B1 fix, V2-DESIGN §5.4). Builds
+/// [in-ladder split] The production sender for an in-ladder split (B1 fix, PROTOCOL.md §5.4). Builds
 /// `SP` — a STATE tier spending `X_m.out[0]` (a DESCENDANT of the trigger, NOT a rival for `F`), paying
 /// each child statechain coin's aggregate — terminalizes the parent (budget 1, consumed by `SP`),
 /// co-signs `SP` under `A_parent`, discloses the old owner state `S_0` as superseded (out-raced by `SP`
@@ -362,7 +362,7 @@ pub async fn in_ladder_split(
             .clone()
             .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
         // [F1] The child is deliberately left NON-terminal, so the receiver can complete the standard
-        // key handover and hold a first-class, re-transferable coin (V2-CHILD-FIRSTCLASS.md). A child
+        // key handover and hold a first-class, re-transferable coin (CHILDREN.md). A child
         // is not defenceless without terminality — two mechanisms cover the two windows:
         //   * PRE-conveyance: a rival the sender co-signed over SP.out[j] before conveying is caught by
         //     the exact-equality census (`child_num_sigs == CHILD_V2_BASELINE + tiers + superseded`),
@@ -842,7 +842,7 @@ pub async fn child_retransfer(
 /// STANDARD key-handover material (`transfer_signature` + blinded `t1`). The `child_coin` is the
 /// sender-owned piece slot whose `signed_statechain_id` authorises the post. The receiver picks it up
 /// in claim(), runs [`verify_child_bundle`] and then COMPLETES the handover, so the child becomes a
-/// first-class coin and the sender is locked out (`docs/utexo/V2-CHILD-FIRSTCLASS.md`).
+/// first-class coin and the sender is locked out (`docs/utexo/CHILDREN.md`).
 pub async fn convey_child_bundle(
     cc: &ClientConfig,
     recipient_address: &str,
@@ -903,7 +903,7 @@ pub async fn convey_child_bundle(
     // key handover, and ARMS the coordinator's pending-transfer lock on this slot (which is what closes
     // the post-conveyance rival window for the child).
     //
-    // [non-exact LN latch, V2-LN-HODL.md Step 1] `batch_id = Some` makes the child mailbox row born
+    // [non-exact LN latch, LIGHTNING.md Step 1] `batch_id = Some` makes the child mailbox row born
     // batch-locked: `insert_new_transfer` sets locked=true and locked2=is_lightning_latch, so the
     // receiver (SSP) must not adopt the piece until the LN preimage flips locked2 via
     // `unlock_by_preimage`. The piece sid must already carry an external-hash latch (registered by the
@@ -997,7 +997,7 @@ pub async fn rollover(
     // coin failed verification. It went unnoticed because sdk43 never called verify_bundle. Since
     // rollover is mandatory at m_max, that was the terminal state of every long-lived coin.
     //
-    // Consequence: rollover now CONSUMES one state rung (see V2-DESIGN footprint note). If the state
+    // Consequence: rollover now CONSUMES one state rung (see PROTOCOL.md footprint note). If the state
     // CSV is already at the floor, a self-split rollover is impossible and the coin must exit or
     // on-chain re-anchor.
     let roll_csv = cur_state_csv
@@ -1181,7 +1181,7 @@ fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
     }
 }
 
-/// **Receiver R′ verification (V2-DESIGN §5.11).** Soundly verify a conveyed TES-R ladder before
+/// **Receiver R′ verification (PROTOCOL.md §5.11).** Soundly verify a conveyed TES-R ladder before
 /// accepting a coin: it must be a valid unilateral-exit chain over the on-chain funding UTXO `F`, and
 /// the SE's PUBLIC finalized-signature count must EXACTLY account for its tiers (plus any pre-TES-R
 /// V1 backups). Exact equality is the linchpin — it makes a hidden extra co-signed state (a
@@ -1438,7 +1438,7 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
     // value the child's taproot key-spend sighash commits to (mirrors `cosign_tier_request`). Two
     // properties matter:
     //   * keyed PER-OUTPUT, not per-txid. A tier may legitimately hang off any `out[j]` of its parent —
-    //     that is how an in-ladder split state (V2-DESIGN §5.4) hosts N children, and the mechanism that
+    //     that is how an in-ladder split state (PROTOCOL.md §5.4) hosts N children, and the mechanism that
     //     dissolves B1 (a split that DESCENDS from the trigger instead of racing it for `F`). A
     //     txid-only map silently assumed `out[0]` and would mis-value every child but the first.
     //   * values are read from the PARSED transactions, never from the declared `out_value` field, which
@@ -1553,7 +1553,7 @@ pub fn verify_child_bundle(
     // COMPLETES the key handover during this same claim, which rotates the SE share and the auth key,
     // locking the sender out PERMANENTLY. The coordinator's pending-transfer lock (armed when
     // `convey_child_bundle` opened the transfer) covers the gap between this census and that
-    // completion. See V2-CHILD-FIRSTCLASS.md. NOTE the verifier must TOLERATE a terminal child — the
+    // completion. See CHILDREN.md. NOTE the verifier must TOLERATE a terminal child — the
     // Lightning-latched lane deliberately keeps one — it simply no longer checks.
     if !parent_terminal {
         return Err(anyhow::anyhow!(

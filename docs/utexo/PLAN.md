@@ -3,6 +3,29 @@
 Companion to [PARITY.md](PARITY.md). Branches: mercurylayer `feat/spark` (from `dev`),
 UTEXO-Protocol/rgb-lib `feat/spark` (from `dev`, only absolutely-necessary changes).
 
+> **Status (2026-07-29) — the plan is done; the shipped protocol is TES-R, and it is the only one.**
+> All phases below landed on `feat/spark`. `deposit_protocol_version` and the `UTEXO_PROTOCOL_DEFAULT`
+> env are **deleted**: `claim()` establishes a ladder (trigger T → extension X_m → state S, relative
+> CSV, all un-broadcast) for every fresh confirmed root coin, unconditionally. One protocol, two coin
+> **shapes**, both current:
+> - **Laddered** — every plain deposit. Idle coins never age, renewal is off-chain and unbounded.
+> - **Un-laddered** — an RGB **carrier** is deliberately never laddered (a plain tier spend would
+>   destroy the allocation; terminal-freeze, [PROTOCOL.md](PROTOCOL.md) §5.10, sdk52), and a split
+>   sub-coin whose funding is un-broadcast cannot root a trigger [B0]. These keep the signed-once
+>   backup and transfer by backup-chain handover. This path is load-bearing for RGB tokens, not
+>   legacy and not dead code.
+>
+> Received split children are **first-class** ([CHILDREN.md](CHILDREN.md)): the
+> claim completes the standard SE key handover (the receiver co-owns A_child across the rotation, so
+> the pre-signed exit chain stays valid, and the sender is permanently locked out), and a child is
+> paid onward off-chain WHOLE (`child_retransfer`) or SPLIT (`child_in_ladder_pay`, a depth-2
+> `ancestors` chain). Each hop costs one co-signature and discloses one superseded state, which the
+> receiver's census counts and proves out-raced — sdk60 (alice→bob→carol, funding outpoint unspent
+> throughout) and sdk17 (partial second hop).
+>
+> Everything below is kept as the historical record of the build. Where a decision or a backlog item
+> was superseded or has since landed, that is marked inline; the original reasoning is untouched.
+
 ## Ground rules
 
 - **Single SE**: Mercury's blind-MuSig2 2-of-2 (server + lockbox). Everything Spark does with FROST
@@ -48,6 +71,11 @@ mint (IFA inflate), burn (IFA), balances/metadata/distribution; freeze documente
 
 **P4 — Lightning.** Wrap Mercury lightning-latch endpoints as `pay_lightning_invoice` /
 `create_lightning_invoice` legs (LSP counterparty = SSP role); E2E for the latch protocol legs.
+*Shipped as the HODL-invoice latch, working both directions on the ladder
+([LIGHTNING.md](LIGHTNING.md)): sdk63 / sdk64 / sdk67 cover the core legs, sdk65 the non-exact
+amount, sdk66 / sdk68 the failure-and-reclaim paths. The LN-latched piece is the one case that stays
+terminalized — it sits unclaimed past the pending-transfer lock's window. Fixed along the way: the
+one-call PAY API minted via `ensure_exact_coin` and therefore refused every laddered coin (D3).*
 
 **P5 — bindings.** nodejs (clients/libs/nodejs pattern) + web/wasm exposure of the SDK surface.
 
@@ -68,6 +96,12 @@ local regtest+lockbox stack; documented runner.
    (child spends parent), so the SE's one-spend-per-node rule + epoch deadline give the same
    guarantee Spark gets from decrementing timelocks + renewal, without renewal churn. Flat coins
    keep Mercury's native decrementing backups.
+   > *Superseded for the laddered shape.* TES-R replaced the decrementing backup on plain deposits
+   > with the trigger/extension/state ladder: idle coins never age (0 vB rent) and renewal is
+   > off-chain and unbounded (sdk43). The reasoning still holds where it was written for: the
+   > **un-laddered** shape — RGB carriers and un-broadcast split sub-coins — still runs on chained
+   > sub-coins that can't race plus the one-spend-per-node rule and the deadline. See
+   > [PROTOCOL.md](PROTOCOL.md).
 3. **RGB freeze is N/A by design.** Client-side validation means an issuer freeze list has no
    consensus meaning; we document this as a trust-model difference, not a gap to fake.
 4. **Events are poll-driven.** Mercury has no push stream; the SDK emits the same event set from a
@@ -99,7 +133,7 @@ tracked here as items land; each P0 gets a regression test.
 |---|------|--------|
 | P1-1 | Decouple LN-latch batches from the 120 s `batch_timeout`; gate `validate_batch` on the latch's own `expires_at`; refuse `send_payment` without ample batch time. | H4 |
 | P1-2 | Make incoming-token booking retriable: each `claim()`, scan CONFIRMED coins with a consignment-bearing backup but no booked allocation and re-run `accept_incoming_tokens` (idempotent). | H6 |
-| P1-3 | ✅ `create_tx_out`: `checked_sub` + reject when `input − fee < DUST_LIMIT` (330 P2TR). *(Split/combine-time dust floor ✅ shipped — `min_split_output` = 330 + backup fee, enforced on every split/combine/colored path; `transfer.rs:816`, audit [9].)* | M2 |
+| P1-3 | ✅ `create_tx_out`: `checked_sub` + reject when `input − fee < DUST_LIMIT` (330 P2TR). *(Split/combine-time dust floor ✅ shipped — `min_split_output` = 330 + backup fee, enforced on every split/combine/colored path; `transfer.rs:816`, audit [9].)* *(The in-ladder split carries its own floor: a child funds its OWN two tiers + dust, so admission is gated on `min_child_value` — 1306 sat at 2 sat/vB, from `tier_out_total` / `committed_fee_for_outputs` — not the 442-sat backup-fee floor. Using the old floor admitted a split that terminalized the parent and THEN failed, stranding it; fixed (D1). Sponsored refresh sized its rebate into that same dead window, so it failed after the user had already paid the on-chain fee; fixed (D2).)* | M2 |
 | P1-4 | Bind owner auth sigs to `(statechain_id ‖ endpoint_tag ‖ server nonce/expiry)` + mutating params; reject seen-nonce/stale. Prioritize `withdraw`/`complete`/`transfer`/`set_spend_budget`. | M1 |
 
 ### P2 — robustness / DX / privacy
@@ -107,7 +141,7 @@ tracked here as items land; each P0 gets a regression test.
 | # | Item | Closes |
 |---|------|--------|
 | P2-1 | ✅ Replaced request-path unwraps in `endpoints/utils.rs` (auth `RowNotFound`/`PoolTimedOut`, `Signature`/`PublicKey`/`XOnlyPublicKey` parse) + `database/utils.rs` (enclave-index pool timeout) with graceful `false`/`None`; raised the SE pool 10→50. **Empirically found by the chaos test (SDK_E2E=22) under concurrent load — these `unwrap()`s panicked the SE worker on pool exhaustion.** | L2 |
-| P2-2 | Promote the sdk14 watchtower to first-class SDK behavior behind a config flag (compute each off-chain coin's `exit_deadline_block`, auto-broadcast branch + exit at tip+margin); add `WalletEvent::ExitDeadlineApproaching`; document the online obligation loudly. | L7 |
-| P2-3 | `unilateral_exit`: distinguish flat-coin (legit no branch) from missing/corrupt branch via `coin.single_use`; return a distinct hard error. | L5 |
+| P2-2 | ✅ The watchtower is first-class SDK behavior behind the `auto_exit` config flag (default **on**): `watchtower.rs` computes each off-chain coin's `exit_deadline_block` and auto-broadcasts branch + exit at tip + `auto_exit_margin_blocks` (288); `WalletEvent::ExitDeadlineApproaching` is emitted; the online obligation is documented in [TRUST-MODEL.md](TRUST-MODEL.md). Evidence: **sdk51** (a tower defends a laddered coin against a hostile trigger) and **sdk45** (keyless watch bundle — it carries no key material, and a second independent tower is idempotent). | L7 |
+| P2-3 | ✅ `unilateral_exit` distinguishes a legitimately branch-less coin from a missing/corrupt branch — via the coin's own funding txid being on-chain rather than `coin.single_use` (audit [20]) — and returns an explicit, actionable error instead of an opaque "missing inputs". *(Also fixed here: a received split child is routed to a UNILATERAL exit, since its funding `SP.out[j]` is un-broadcast and a cooperative withdraw has no outpoint to spend, but it was then marked `WITHDRAWING` with no withdrawal tx, so `check_withdrawal` errored on every later status poll for the life of the coin (D4). A `WITHDRAWING` coin with neither txid nor withdrawal address is now tracked by its pre-signed exit chain.)* Evidence: **sdk50** (unilateral exit), **sdk58** (11 adversarial in-ladder-split cases). | L5 |
 | P2-4 | RGB privacy: per-output random blinding threaded through the split path; prune each recipient's consignment to only its own piece (replace fixed `TOKEN_BLINDING=777` + shared consignment). | L3 |
 | P2-5 | DB hygiene: run expired-row DELETE + TTL-GC of unconsumed token / expired external-latch rows; per-IP rate-limit the no-server `get_token` path; document the single authoritative latch clock. | L4, L6 |

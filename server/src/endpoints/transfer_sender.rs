@@ -140,7 +140,7 @@ pub async fn transfer_sender(statechain_entity: &State<StateChainEntity>, transf
         return status::Custom(Status::BadRequest, Json(response_body));
     }
 
-    // [RE-ADDRESS GUARD — V2-CHILD-FIRSTCLASS.md] Refuse to open a transfer to a DIFFERENT receiver when
+    // [RE-ADDRESS GUARD — CHILDREN.md] Refuse to open a transfer to a DIFFERENT receiver when
     // this coin already has an OPEN (conveyed, uncompleted) transfer to another key. `insert_new_transfer`
     // DELETEs the prior row by statechain_id, so without this a still-owner sender could re-address an
     // already-conveyed (victim-accepted) transfer to an attacker key it controls — the self-reopen
