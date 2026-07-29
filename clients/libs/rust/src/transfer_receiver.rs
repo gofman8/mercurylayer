@@ -584,10 +584,11 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
 
     let transfer_msg = mercurylib::transfer::receiver::decrypt_transfer_msg(enc_message, &client_auth_key)?;
 
-    // [in-ladder split] A split-child payment carries NO key handover and NO backup ladder — just the
-    // child's exit bundle. Verify it against authoritative on-chain + SE values (verify_child_bundle:
-    // parent F on-chain, parent+child terminal, child pays THIS coin's key) and skip the V1/V2
-    // backup-chain checks below (there are none to validate).
+    // [in-ladder split] A split-child payment carries the child's exit bundle (and, from
+    // `protocol_version >= 4`, the key-handover material) but NO backup ladder. Verify the bundle
+    // against authoritative on-chain + SE values (verify_child_bundle: parent F on-chain, parent+child
+    // terminal, child pays THIS coin's key) and skip the V1/V2 backup-chain checks below (there are
+    // none to validate).
     if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
         let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
             .map_err(|e| anyhow::anyhow!("malformed child TES-R bundle: {e}"))?;
@@ -600,6 +601,29 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
         let my_backup = mercurylib::transaction::get_user_backup_address(coin, network.to_string())
             .map_err(|_| anyhow::anyhow!("cannot derive the receiver's backup address"))?;
         crate::tesr::verify_conveyed_child(client_config, &my_backup, &cb).await?;
+
+        // A handover-carrying conveyance must also prove the SENDER authorised THIS recipient over the
+        // child's funding outpoint — the same binding the flat lane checks. Without it a conveyance
+        // could be replayed toward a different receiver key.
+        if transfer_msg.protocol_version >= 4 {
+            use bitcoin::consensus::deserialize;
+            let sp_tx: bitcoin::Transaction =
+                deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+            let sp_outpoint = mercurylib::transfer::TxOutpoint {
+                txid: sp_tx.txid().to_string(),
+                vout: cb.sp_vout,
+            };
+            if !mercurylib::transfer::receiver::verify_transfer_signature(
+                &coin.user_pubkey,
+                &sp_outpoint,
+                &transfer_msg,
+            )? {
+                return Err(anyhow::anyhow!(
+                    "invalid transfer signature on the conveyed child {}",
+                    cb.child_statechain_id
+                ));
+            }
+        }
         return Ok(());
     }
 
@@ -764,10 +788,12 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
 
     let transfer_msg = mercurylib::transfer::receiver::decrypt_transfer_msg(enc_message, &client_auth_key)?;
 
-    // [in-ladder split] Adopt a conveyed split child (already verified in validate_encrypted_message):
-    // persist its exit bundle and book THIS placeholder coin as the child's exitable claim. No SE
-    // handover — the child is un-broadcast (funded by SP.out[j]) and every tier is pre-co-signed to pay
-    // this coin's own key, so the receiver exits it keylessly via `exit_child_pass`.
+    // [in-ladder split] Adopt a conveyed split child (already verified in validate_encrypted_message).
+    // `protocol_version >= 4` carries the STANDARD key handover, so the receiver COMPLETES it here: the
+    // SE rotates its share leaving the child aggregate `A_child` INVARIANT (the pre-signed child ladder
+    // stays valid) and re-points auth to this wallet, which permanently locks the sender out. That makes
+    // the child a FIRST-CLASS coin, not merely an exitable claim (docs/utexo/V2-CHILD-FIRSTCLASS.md).
+    // Version 3 is the legacy no-handover conveyance and is still adopted exit-only.
     if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
         let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
             .map_err(|e| anyhow::anyhow!("malformed child TES-R bundle: {e}"))?;
@@ -776,59 +802,128 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
         if crate::tesr::load_child(client_config, wallet_name, &cb.child_statechain_id).await?.is_some() {
             return Ok(transfer_receive_result);
         }
-        crate::tesr::persist_child(client_config, wallet_name, &cb).await?;
 
-        // [non-exact LN RECEIVE, V2-LN-HODL.md §2b] Clear the RECEIVER-side lock on the piece's
-        // conveyance row. For a latched conveyance this is what signals "the receiver has claimed": once
-        // the owner (SSP) has also confirmed (`confirm_pending_invoice`), both lock bits are false and
-        // the SE releases the HODL preimage (server update_unlock_transfer → lightning_latch.locked). No
-        // key handover happens (the child pre-pays this coin's key), so this is the child analogue of
-        // the standard receive's `unlock_statecoin`. Harmless for a plain child (its row is already
-        // unlocked and carries no latch) and best-effort (a failure just leaves the SSP to retry/cancel).
-        if let std::result::Result::Ok(signed) =
-            mercurylib::transfer::receiver::sign_message(&cb.child_statechain_id, coin)
-        {
-            let _ = unlock_statecoin(client_config, &cb.child_statechain_id, &signed, &coin.auth_pubkey).await;
-        }
-
-        // SP.out[j] is the (un-broadcast) funding outpoint of the child claim.
+        // SP.out[j] is the (un-broadcast) funding outpoint of the child.
         use bitcoin::consensus::deserialize;
-        let sp_tx: bitcoin::Transaction =
-            deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+        let sp_hex = cb.parent.current().state.signed_tx.clone();
+        let sp_tx: bitcoin::Transaction = deserialize(&hex::decode(&sp_hex)?)?;
         let sp_txid = sp_tx.txid().to_string();
         let sp_out = sp_tx
             .output
             .get(cb.sp_vout as usize)
-            .ok_or_else(|| anyhow::anyhow!("SP has no output {}", cb.sp_vout))?;
-        // The coin's amount is its UTXO value = SP.out[j] (the child's funding); the child's exit
-        // leaves child_state.out_value after its own tier fees, mirroring how any coin's on-chain
-        // exit costs fees on top of its face value.
-        let child_value = sp_out.value as u32;
-        // A_child address (SP.out[j]) — un-broadcast, so no on-chain duplicate can exist there; set it
-        // so the coin has a valid aggregated_address (check_for_duplicated dereferences it).
-        let net = match network.to_ascii_lowercase().as_str() {
-            "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
-            "testnet" => bitcoin::Network::Testnet,
-            "signet" => bitcoin::Network::Signet,
-            _ => bitcoin::Network::Regtest,
+            .ok_or_else(|| anyhow::anyhow!("SP has no output {}", cb.sp_vout))?
+            .clone();
+        let sp_outpoint = mercurylib::transfer::TxOutpoint {
+            txid: sp_txid.clone(),
+            vout: cb.sp_vout,
         };
-        let child_agg_address = bitcoin::Address::from_script(&sp_out.script_pubkey, net)
-            .map(|a| a.to_string())
-            .unwrap_or_default();
 
+        if transfer_msg.protocol_version < 4 {
+            // LEGACY (v3) — no handover material was conveyed. Adopt exit-only, exactly as before.
+            crate::tesr::persist_child(client_config, wallet_name, &cb).await?;
+            if let std::result::Result::Ok(signed) =
+                mercurylib::transfer::receiver::sign_message(&cb.child_statechain_id, coin)
+            {
+                let _ = unlock_statecoin(client_config, &cb.child_statechain_id, &signed, &coin.auth_pubkey).await;
+            }
+            let net = match network.to_ascii_lowercase().as_str() {
+                "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
+                "testnet" => bitcoin::Network::Testnet,
+                "signet" => bitcoin::Network::Signet,
+                _ => bitcoin::Network::Regtest,
+            };
+            let child_agg_address = bitcoin::Address::from_script(&sp_out.script_pubkey, net)
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            coin.statechain_id = Some(cb.child_statechain_id.clone());
+            coin.aggregated_address = Some(child_agg_address);
+            coin.utxo_txid = Some(sp_txid.clone());
+            coin.utxo_vout = Some(cb.sp_vout);
+            coin.amount = Some(sp_out.value as u32);
+            coin.status = CoinStatus::CONFIRMED;
+            activities.push(Activity {
+                utxo: sp_txid,
+                amount: sp_out.value as u32,
+                action: "Receive".to_string(),
+                date: Utc::now().to_rfc3339(),
+            });
+            transfer_receive_result.statechain_id = Some(cb.child_statechain_id.clone());
+            return Ok(transfer_receive_result);
+        }
+
+        // The SE's blinding factor for THIS child slot (x1_pub), needed to validate t1 and derive t2.
+        let statechain_info =
+            crate::utils::get_statechain_info(&cb.child_statechain_id, client_config)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no statechain info for child {}", cb.child_statechain_id))?;
+
+        // Clear the RECEIVER-side lock BEFORE completing the handover (the flat lane does the same).
+        // [non-exact LN RECEIVE, V2-LN-HODL.md §2b] For a latched conveyance this is what signals "the
+        // receiver has claimed": once the owner (SSP) has also confirmed, both lock bits are false and
+        // the SE releases the HODL preimage. The auth key has not rotated yet, so sign with this
+        // wallet's own auth key. NOT best-effort any more — the handover below depends on it.
+        let signed_for_unlock =
+            mercurylib::transfer::receiver::sign_message(&cb.child_statechain_id, coin)?;
+        unlock_statecoin(client_config, &cb.child_statechain_id, &signed_for_unlock, &coin.auth_pubkey)
+            .await?;
+
+        // Complete the key handover: /transfer/receiver rotates the SE share and the auth key.
+        let payload = mercurylib::transfer::receiver::create_transfer_receiver_request_payload(
+            &statechain_info,
+            &transfer_msg,
+            coin,
+        )?;
+        let server_public_key_hex = match send_transfer_receiver_request_payload(client_config, &payload).await {
+            std::result::Result::Ok(res) => {
+                // Batch-locked: return BEFORE any coin mutation and BEFORE persist_child, so the next
+                // claim re-serves the message and adopts cleanly once the batch unlocks.
+                if res.is_batch_locked {
+                    return Ok(MessageResult {
+                        is_batch_locked: true,
+                        statechain_id: None,
+                        duplicated_coins: Vec::new(),
+                    });
+                }
+                res.server_pubkey
+                    .ok_or_else(|| anyhow::anyhow!("transfer/receiver returned no server pubkey"))?
+            }
+            Err(err) => return Err(anyhow::anyhow!("Error: {}", err.to_string())),
+        };
+
+        // Passing the UN-BROADCAST SP as `tx0_hex` makes this REQUIRE that the rotated aggregate equals
+        // `SP.out[j]`'s output key — i.e. proof that `A_child` is invariant, so every pre-signed child
+        // tier is still valid under the new share split.
+        let new_key_info = mercurylib::transfer::receiver::get_new_key_info(
+            &server_public_key_hex,
+            coin,
+            &cb.child_statechain_id,
+            &sp_outpoint,
+            &sp_hex,
+            network,
+        )?;
+
+        coin.server_pubkey = Some(server_public_key_hex);
+        coin.aggregated_pubkey = Some(new_key_info.aggregate_pubkey);
+        coin.aggregated_address = Some(new_key_info.aggregate_address);
         coin.statechain_id = Some(cb.child_statechain_id.clone());
-        coin.aggregated_address = Some(child_agg_address);
+        coin.signed_statechain_id = Some(new_key_info.signed_statechain_id.clone());
+        coin.amount = Some(new_key_info.amount);
         coin.utxo_txid = Some(sp_txid.clone());
         coin.utxo_vout = Some(cb.sp_vout);
-        coin.amount = Some(child_value);
+        // `locktime` stays None ON PURPOSE: a child exits by RELATIVE CSV, it has no absolute-locktime
+        // backup. Setting Some(0) would make the coin permanently "near its floor", so every quote would
+        // bill a phantom re-anchor and the maintenance pass would try to refresh it forever.
         coin.status = CoinStatus::CONFIRMED;
 
-        let date = Utc::now().to_rfc3339();
+        // Persist the child bundle LAST — it is the adoption marker, so any failure above leaves the
+        // message re-claimable rather than half-adopted.
+        crate::tesr::persist_child(client_config, wallet_name, &cb).await?;
+
         activities.push(Activity {
             utxo: sp_txid,
-            amount: child_value,
+            amount: new_key_info.amount,
             action: "Receive".to_string(),
-            date,
+            date: Utc::now().to_rfc3339(),
         });
 
         transfer_receive_result.statechain_id = Some(cb.child_statechain_id.clone());

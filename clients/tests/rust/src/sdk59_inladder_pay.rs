@@ -84,7 +84,8 @@ pub async fn execute() -> Result<()> {
     assert_eq!(r.total_sats, PAY, "the payment total is the piece amount");
     println!("SDK59 - alice paid bob {PAY} via IN-LADDER split ({} piece coin conveyed)", r.coins.len());
 
-    // --- Bob claims: adopts the conveyed child via verify_child_bundle (no key handover). ----------
+    // --- Bob claims: censuses the conveyed child (verify_child_bundle) then COMPLETES the standard
+    // key handover, so the child becomes a first-class coin and alice is locked out of it. ----------
     let mut waited = 0;
     let bob_child_sid = loop {
         bob.claim().await?;
@@ -108,7 +109,39 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::load_child(&cc, "sdk59_bob", &bob_child_sid).await?.is_some(),
         "bob must have adopted (persisted) the child bundle"
     );
-    println!("SDK59 - bob adopted the split child (sid {bob_child_sid}, {PAY} sat) via verify_child_bundle");
+
+    // FIRST-CLASS: bob did not merely book an exit bundle — he COMPLETED the standard key handover,
+    // so the SE rotated its share (and bob's auth key) for the child slot. The payoff is structural:
+    // the coin now carries the full 2-of-2 material, and its aggregate is UNCHANGED — still exactly
+    // the key `SP.out[j]` pays — which is what keeps every pre-signed child tier valid.
+    let bob_child_coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk59_bob")
+        .await?
+        .coins
+        .iter()
+        .find(|c| c.statechain_id.as_deref() == Some(&bob_child_sid))
+        .cloned()
+        .ok_or(anyhow!("bob child coin missing"))?;
+    assert!(bob_child_coin.server_pubkey.is_some(), "handover completed: the child carries the SE's rotated share");
+    assert!(bob_child_coin.aggregated_pubkey.is_some(), "handover completed: the child has its 2-of-2 aggregate");
+    assert!(bob_child_coin.signed_statechain_id.is_some(), "handover completed: bob holds the SE's ownership attestation");
+    assert_eq!(bob_child_coin.status, mercurylib::wallet::CoinStatus::CONFIRMED, "an adopted child is a confirmed, spendable coin");
+    // A_child INVARIANCE — the rotated aggregate must still be the address SP.out[j] pays.
+    {
+        use electrum_client::bitcoin as btc;
+        let cb = mercuryrustlib::tesr::load_child(&cc, "sdk59_bob", &bob_child_sid).await?.unwrap();
+        let sp: btc::Transaction =
+            btc::consensus::deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+        let sp_out = sp.output.get(cb.sp_vout as usize).ok_or(anyhow!("SP has no such output"))?;
+        let want = btc::Address::from_script(&sp_out.script_pubkey, btc::Network::Regtest)?.to_string();
+        assert_eq!(
+            bob_child_coin.aggregated_address.as_deref(), Some(want.as_str()),
+            "A_child must be INVARIANT across the handover — otherwise every pre-signed child tier is dead"
+        );
+    }
+    // The exit ladder must NOT look like a V1 absolute-locktime coin: a child exits by relative CSV.
+    // A stamped locktime here would mark the coin permanently due for re-anchor and bill every quote.
+    assert!(bob_child_coin.locktime.is_none(), "a child has no absolute-locktime backup; locktime must stay None");
+    println!("SDK59 - bob adopted the split child (sid {bob_child_sid}, {PAY} sat): census verified, key handover COMPLETED, A_child invariant — a FIRST-CLASS coin");
 
     // --- Alice keeps the change as an exitable child claim. ---------------------------------------
     let alice_change = alice.get_balance().await?.available_sats;

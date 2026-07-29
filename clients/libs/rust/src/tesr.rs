@@ -567,9 +567,11 @@ pub async fn adopt_child_bundle(
 }
 
 /// Conveys a split **child** bundle to `recipient_address` by posting an encrypted mailbox message
-/// (`child_tesr_bundle` set, `protocol_version = 3`) via `transfer/update_msg`. The `child_coin` is the
-/// sender-owned piece slot whose `signed_statechain_id` authorises the post. The receiver picks it up in
-/// claim() and runs [`adopt_child_bundle`].
+/// (`child_tesr_bundle` set, `protocol_version = 4`) via `transfer/update_msg`, together with the
+/// STANDARD key-handover material (`transfer_signature` + blinded `t1`). The `child_coin` is the
+/// sender-owned piece slot whose `signed_statechain_id` authorises the post. The receiver picks it up
+/// in claim(), runs [`verify_child_bundle`] and then COMPLETES the handover, so the child becomes a
+/// first-class coin and the sender is locked out (`docs/utexo/V2-CHILD-FIRSTCLASS.md`).
 pub async fn convey_child_bundle(
     cc: &ClientConfig,
     recipient_address: &str,
@@ -587,19 +589,48 @@ pub async fn convey_child_bundle(
         .ok_or_else(|| anyhow::anyhow!("piece child coin has no signed_statechain_id"))?;
     let (_, _, recipient_auth_pubkey) =
         mercurylib::decode_transfer_address(recipient_address)?;
+    // The bundle must describe the very slot we are conveying, or the receiver would census one coin
+    // and complete the handover on another.
+    if cb.child_statechain_id != *statechain_id {
+        return Err(anyhow::anyhow!(
+            "child bundle statechain id {} does not match the conveyed slot {statechain_id}",
+            cb.child_statechain_id
+        ));
+    }
+
+    // The child's funding outpoint is `SP.out[sp_vout]` of the UN-BROADCAST split state — the child
+    // slot's own `utxo_txid`/`utxo_vout` are None (a derived slot is never funded on-chain), so derive
+    // it from the bundle. This is the outpoint the transfer signature commits to, and the same one the
+    // receiver reconstructs when it validates.
+    let sp_txid = {
+        use bitcoin::consensus::encode::deserialize;
+        let sp: bitcoin::Transaction =
+            deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+        sp.txid().to_string()
+    };
+
+    // Sender-side binding, built BEFORE the transfer is opened: once `get_new_x1` runs, the coordinator's
+    // pending-transfer lock refuses further co-signs on this slot, so every sender-side signature must
+    // already exist (the same discipline `transfer_sender::execute` follows).
+    let transfer_signature = mercurylib::transfer::sender::create_transfer_signature(
+        recipient_address,
+        &sp_txid,
+        cb.sp_vout,
+        &child_coin.user_privkey,
+    )?;
 
     // `transfer/update_msg` is an UPDATE keyed on (statechain_id, new_user_auth_key); the row is
-    // created by the `transfer/sender` init call. A child conveyance has no key handover, but we still
-    // call it to CREATE the mailbox row (the returned x1 is unused — the child pre-pays the receiver's
-    // key, no blinding needed). Without this the update_msg silently no-ops (0 rows) and the receiver
-    // never sees the message.
+    // created by this `transfer/sender` init call — without it the update_msg silently no-ops (0 rows)
+    // and the receiver never sees the message. It also returns `x1`, the SE's blinding factor for the
+    // key handover, and ARMS the coordinator's pending-transfer lock on this slot (which is what closes
+    // the post-conveyance rival window for the child).
     //
     // [non-exact LN latch, V2-LN-HODL.md Step 1] `batch_id = Some` makes the child mailbox row born
     // batch-locked: `insert_new_transfer` sets locked=true and locked2=is_lightning_latch, so the
     // receiver (SSP) must not adopt the piece until the LN preimage flips locked2 via
     // `unlock_by_preimage`. The piece sid must already carry an external-hash latch (registered by the
     // latched `in_ladder_pay`) for the server to mark the row a lightning latch.
-    crate::transfer_sender::get_new_x1(
+    let x1 = crate::transfer_sender::get_new_x1(
         cc,
         statechain_id,
         signed_statechain_id,
@@ -610,8 +641,10 @@ pub async fn convey_child_bundle(
 
     let json = serde_json::to_string(cb)?;
     let payload = mercurylib::transfer::sender::create_child_conveyance_update_msg(
+        &x1,
         recipient_address,
         child_coin,
+        &transfer_signature,
         &json,
     )?;
     let endpoint = cc.statechain_entity.clone();

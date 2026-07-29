@@ -112,19 +112,32 @@ pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin
 
 /// [in-ladder split] Build the mailbox message that conveys a split **child** bundle to the receiver.
 ///
-/// Unlike a normal transfer this carries NO key handover: the child is a Model-A coin whose final state
-/// already pays the receiver's own key, so there is no `x1`/`t1` blinding and no backup ladder. The
-/// message sets `child_tesr_bundle` (JSON `ChildTesrBundle`) and `protocol_version = 3`; the receiver's
-/// claim() detects that field and takes the `verify_child_bundle` + adopt path instead of the handover.
+/// This carries the STANDARD Mercury key-handover (`transfer_signature` + the blinded `t1 = o1 + x1`)
+/// alongside the child bundle, so the receiver can complete `/transfer/receiver`: the SE rotates its
+/// share, leaving the child aggregate `A_child` INVARIANT (so the pre-signed child ladder stays valid)
+/// while the sender's auth key is rotated out and it is permanently locked out of the child. That is
+/// what makes a received child a FIRST-CLASS coin rather than an exit-only claim
+/// (`docs/utexo/V2-CHILD-FIRSTCLASS.md`).
+///
+/// The message also sets `child_tesr_bundle` (JSON `ChildTesrBundle`) and `protocol_version = 4`; the
+/// receiver's claim() detects that field and runs `verify_child_bundle` (census + parent terminality)
+/// BEFORE completing the handover. `protocol_version = 3` is the legacy no-handover conveyance and is
+/// still adoptable exit-only.
+///
+/// `backup_transactions` stays EMPTY (a child slot is never funded on-chain, so `create_tx1` never ran
+/// for it — `CHILD_V2_BASELINE = 0`), and `branch_txs`/`terminal_parents` stay EMPTY on purpose: the
+/// ancestor chain `F → T → X_m → SP` already travels inside `ChildTesrBundle.parent` and is validated
+/// there. Routing it through `branch_txs` would trip `required_terminal_ancestors`, which counts one
+/// named ancestor per structural input (3: T, X_m, SP) while the chain holds exactly ONE statechain node.
 ///
 /// `child_coin` is the sender-owned piece child (its `statechain_id` + `signed_statechain_id` authorise
 /// the `update_msg` post, since the sender created that slot at split time); the message is encrypted to
-/// `recipient_address`'s auth key so only the receiver's mailbox can read it. No `transfer_signature`/`t1`
-/// binding is needed — the child bundle only verifies against the receiver whose key `state_child` pays,
-/// so a replay to any other recipient fails Model A.
+/// `recipient_address`'s auth key so only the receiver's mailbox can read it.
 pub fn create_child_conveyance_update_msg(
+    x1: &str,
     recipient_address: &str,
     child_coin: &Coin,
+    transfer_signature: &str,
     child_tesr_bundle_json: &str,
 ) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
     let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
@@ -138,15 +151,23 @@ pub fn create_child_conveyance_update_msg(
         .as_ref()
         .ok_or(MercuryError::SecpError)?;
 
+    // The blinded handover secret, exactly as the flat lane builds it (see
+    // `create_transfer_update_msg_with_branch`): t1 = o1 + x1, where o1 is this child slot's owner key.
+    let client_seckey = PrivateKey::from_wif(&child_coin.user_privkey)?.inner;
+    let x1 = hex::decode(x1)?;
+    let x1: [u8; 32] = x1.try_into().map_err(|_| MercuryError::SecpError)?;
+    let x1 = Scalar::from_be_bytes(x1)?;
+    let t1 = client_seckey.add_tweak(&x1)?;
+
     let transfer_msg = TransferMsg {
         statechain_id: statechain_id.to_string(),
-        transfer_signature: String::new(),
+        transfer_signature: transfer_signature.to_string(),
         backup_transactions: Vec::new(),
-        t1: [0u8; 32],
+        t1: t1.secret_bytes(),
         user_public_key: child_coin.user_pubkey.clone(),
         branch_txs: Vec::new(),
         terminal_parents: Vec::new(),
-        protocol_version: 3,
+        protocol_version: 4,
         tesr_ladder: None,
         child_tesr_bundle: Some(child_tesr_bundle_json.to_string()),
     };

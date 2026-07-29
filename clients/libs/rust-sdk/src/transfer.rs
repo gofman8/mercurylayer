@@ -57,11 +57,14 @@ impl UtexoWallet {
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
-        // Received in-ladder split CHILD claims are exit-only (funding is the un-broadcast SP.out[j];
-        // no SE co-signing key held). They cannot be spent off-chain — exclude them from selection so a
-        // payment never tries to re-transfer one (which would fail with no SE relationship). To spend a
-        // received non-exact payment, materialize it first (`withdraw`/`unilateral_exit` runs its exit
-        // chain). See v2-child-retransfer-unsound: off-chain child re-transfer is not soundly verifiable.
+        // Received in-ladder split CHILD claims are still EXIT-ONLY. Since the handover landed
+        // (V2-CHILD-FIRSTCLASS.md Commit A) the receiver DOES co-own `A_child` — the SE rotated its
+        // share at claim and the sender is locked out — but the child is still TERMINALIZED at the
+        // split, so the SE will co-sign nothing further over it and it cannot be re-transferred
+        // off-chain yet. Exclude such coins from selection so a payment never tries. To spend a
+        // received non-exact payment today, materialize it first (`withdraw`/`unilateral_exit` runs
+        // its exit chain). Dropping terminality is Commit B, and it is only sound TOGETHER with the
+        // N-hop census and the onward re-transfer route — see the plan doc.
         let child_claims = mercuryrustlib::tesr::child_claim_sids(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -129,7 +132,8 @@ impl UtexoWallet {
                 // A V2 (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock trigger
                 // could void the split [B1]. Do an IN-LADDER split payment instead: `SP` descends from
                 // the trigger, the piece child pays the recipient (Model A), and the piece bundle is
-                // conveyed directly to their mailbox (no key handover). The change stays with us.
+                // conveyed directly to their mailbox WITH the standard key handover (the receiver
+                // completes it at claim, so the child is first-class). The change stays with us.
                 if mercuryrustlib::tesr::load(
                     &self.inner.cc,
                     &self.inner.config.wallet_name,
