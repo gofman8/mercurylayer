@@ -57,15 +57,15 @@ impl UtexoWallet {
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
-        // Received in-ladder split CHILD claims are still EXIT-ONLY. Since the handover landed
-        // (V2-CHILD-FIRSTCLASS.md Commit A) the receiver DOES co-own `A_child` — the SE rotated its
-        // share at claim and the sender is locked out — but the child is still TERMINALIZED at the
-        // split, so the SE will co-sign nothing further over it and it cannot be re-transferred
-        // off-chain yet. Exclude such coins from selection so a payment never tries. To spend a
-        // received non-exact payment today, materialize it first (`withdraw`/`unilateral_exit` runs
-        // its exit chain). Dropping terminality is Commit B, and it is only sound TOGETHER with the
-        // N-hop census and the onward re-transfer route — see the plan doc.
-        let child_claims = mercuryrustlib::tesr::child_claim_sids(
+        // Received in-ladder split CHILDREN are now FIRST-CLASS: the receiver co-owns `A_child` (the
+        // handover completed at claim) and the child is left non-terminal, so it can be re-transferred
+        // off-chain via `child_retransfer` — Spark-parity multi-hop with zero on-chain footprint.
+        //
+        // They are spendable only WHOLE, though. A child cannot itself be split in-ladder yet (that is
+        // the child-level split, Commit C), so they are excluded from the SPLIT candidate set and
+        // selected only when an exact/whole-coin plan uses them. Keeping them out of the split pool
+        // also stops a selected child from silently falling through to the B1-unsafe `split_coin`.
+        let child_bundles = mercuryrustlib::tesr::child_claim_sids(
             &self.inner.cc,
             &self.inner.config.wallet_name,
         )
@@ -76,19 +76,21 @@ impl UtexoWallet {
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
             .filter(|c| !is_token_carrier(c, &carriers))
-            .filter(|c| {
-                c.statechain_id
-                    .as_deref()
-                    .map(|s| !child_claims.contains(s))
-                    .unwrap_or(true)
-            })
             .collect();
+        // Children participate as WHOLE coins only: `splittable = false` keeps them out of the split
+        // slot, so the planner may satisfy an exact/whole plan with them but will never choose one to
+        // split (a child-level split is Commit C).
         let candidates: Vec<Candidate> = spendable
             .iter()
             .enumerate()
             .map(|(index, c)| Candidate {
                 index,
                 amount_sats: c.amount.unwrap_or_default() as u64,
+                splittable: c
+                    .statechain_id
+                    .as_deref()
+                    .map(|s| !child_bundles.contains(s))
+                    .unwrap_or(true),
             })
             .collect();
 
@@ -168,6 +170,38 @@ impl UtexoWallet {
                 .filter_map(|c| c.amount)
                 .next_back()
                 .unwrap_or_default() as u64;
+            // A received in-ladder CHILD takes its own onward route. It has no `tesr-` ladder and no V1
+            // backup chain, so `transfer_sender::execute` would mis-handle it; `child_retransfer`
+            // co-signs a fresh lower-CSV state over `ext_child.out[0]` paying the new recipient and
+            // discloses the replaced state for the receiver's census.
+            if let Some(cb) = mercuryrustlib::tesr::load_child(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?
+            {
+                let mut child_coin = record
+                    .coins
+                    .iter()
+                    .find(|c| c.statechain_id.as_deref() == Some(id.as_str()) && c.duplicate_index == 0)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("child coin {id} not found in the wallet"))?;
+                mercuryrustlib::tesr::child_retransfer(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &mut child_coin,
+                    &cb,
+                    receiver_address,
+                )
+                .await?;
+                self.set_coin_status(&id, CoinStatus::WITHDRAWN).await?;
+                coins.push(TransferredCoin {
+                    statechain_id: id,
+                    amount_sats: amount,
+                });
+                continue;
+            }
             mercuryrustlib::transfer_sender::execute(
                 &self.inner.cc,
                 receiver_address,
@@ -244,7 +278,9 @@ impl UtexoWallet {
         let candidates: Vec<Candidate> = usable
             .iter()
             .enumerate()
-            .map(|(index, c)| Candidate { index, amount_sats: amt(c) })
+            // Quoting only: treat every usable coin as splittable so the quote is not skewed by
+            // whether the wallet happens to hold children (the executor applies the real rule).
+            .map(|(index, c)| Candidate { index, amount_sats: amt(c), splittable: true })
             .collect();
         let network_fee_sats = match select::plan(&candidates, amount_sats) {
             Plan::WithSplit { split, .. } => split_fee_reserve(candidates[split].amount_sats),
@@ -751,6 +787,25 @@ impl UtexoWallet {
             }
         };
         let latch_batch: Option<String> = latch.as_ref().map(|(b, _)| b.clone());
+
+        // [LN carve-out] A LATCHED piece is deliberately left unclaimed until a Lightning preimage
+        // lands — which is exactly the situation the temporary pending-transfer lock does NOT cover
+        // (it expires with the batch window, and the receiver cannot complete the handover until the
+        // latch releases). So for the latched lane, and only there, keep the child TERMINAL: the SE
+        // will co-sign nothing further over it, closing the post-expiry rival window permanently.
+        // Plain in-ladder payments rely on the pending lock + the receiver's prompt handover instead.
+        // Placement matters: `set_spend_budget` authenticates with the child's auth key
+        // (`fresh_auth`), so it must run while WE still own that key — i.e. before the receiver's
+        // key update, and therefore before conveyance.
+        if latch_batch.is_some() {
+            mercuryrustlib::lightning_latch::set_spend_budget(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &piece_sid,
+                0,
+            )
+            .await?;
+        }
 
         // Convey the piece child to the recipient's mailbox (auth = the piece slot we own).
         mercuryrustlib::tesr::convey_child_bundle(

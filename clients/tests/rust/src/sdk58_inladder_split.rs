@@ -76,15 +76,19 @@ pub async fn execute() -> Result<()> {
     let (_, _, parent_terminal) = mercuryrustlib::lightning_latch::get_spend_budget(&cc, &parent_sid).await?;
     let (_, _, child_terminal) = mercuryrustlib::lightning_latch::get_spend_budget(&cc, &child_sid).await?;
     assert!(parent_terminal, "parent must be terminal after the split (budget=1, consumed by SP)");
-    assert!(child_terminal, "child must be terminal after F1 (set_spend_budget child, 0)");
+    // The child is deliberately NOT terminalized any more: the receiver completes the key handover and
+    // becomes a first-class owner (V2-CHILD-FIRSTCLASS.md). Its census is made durable by that handover
+    // plus the coordinator's pending-transfer lock, not by terminality. (The LN-latched lane still
+    // terminalizes its piece; the verifier tolerates either.)
+    assert!(!child_terminal, "a plain (unlatched) split child must stay NON-terminal so it can be re-transferred");
 
     mercuryrustlib::tesr::verify_child_bundle(
         &cb, &f_spk_hex,
         parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
-        child_num_sigs, child_baseline, child_agg.as_deref(), child_terminal,
+        child_num_sigs, child_baseline, child_agg.as_deref(),
         &receiver,
     ).map_err(|e| anyhow!("verify_child_bundle REJECTED a valid split child: {e}"))?;
-    println!("SDK58 - control: valid split child ACCEPTED (parent+child terminal).");
+    println!("SDK58 - control: valid split child ACCEPTED (parent terminal; child non-terminal by design).");
 
     // ---- ADVERSARIAL: every tampering of the authoritative inputs must REJECT. ---------------------
     let ok = |r: Result<()>, attack: &str| -> Result<()> {
@@ -102,20 +106,59 @@ pub async fn execute() -> Result<()> {
         Address::p2tr(&Secp256k1::new(), x, None, Network::Regtest).to_string()
     };
     // Convenience: verify_child_bundle with all-valid args (override individual fields per attack).
-    let vcb = |p_agg: Option<&str>, p_term: bool, p_ns: u32, c_agg: Option<&str>, c_term: bool, c_ns: u32, recv: &str| {
-        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, c_term, recv)
+    let vcb = |p_agg: Option<&str>, p_term: bool, p_ns: u32, c_agg: Option<&str>, c_ns: u32, recv: &str| {
+        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, recv)
     };
     let (pa, ca) = (parent_agg.as_deref(), child_agg.as_deref());
 
-    ok(vcb(None, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "A (parent aggregate NULL — fail-closed)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, None, child_terminal, child_num_sigs, &receiver), "B (child aggregate NULL — fail-closed)")?;
-    ok(vcb(Some(decoy_xonly), parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "C (decoy parent aggregate != A_parent)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, Some(decoy_xonly), child_terminal, child_num_sigs, &receiver), "D (decoy child aggregate != SP.out[j])")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs + 1, ca, child_terminal, child_num_sigs, &receiver), "E (hidden parent state: parent num_sigs one higher)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs + 1, &receiver), "F (hidden child state: child num_sigs one higher)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_terminal, child_num_sigs, &other_recv), "G (Model A violated: child state pays not-the-receiver)")?;
-    ok(vcb(pa, false, parent_num_sigs, ca, child_terminal, child_num_sigs, &receiver), "H (parent NOT terminal — a rival trigger over F could still be co-signed)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, false, child_num_sigs, &receiver), "I (child NOT terminal — a rival state over SP.out[j] could still be co-signed)")?;
+    ok(vcb(None, parent_terminal, parent_num_sigs, ca, child_num_sigs, &receiver), "A (parent aggregate NULL — fail-closed)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, None, child_num_sigs, &receiver), "B (child aggregate NULL — fail-closed)")?;
+    ok(vcb(Some(decoy_xonly), parent_terminal, parent_num_sigs, ca, child_num_sigs, &receiver), "C (decoy parent aggregate != A_parent)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, Some(decoy_xonly), child_num_sigs, &receiver), "D (decoy child aggregate != SP.out[j])")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs + 1, ca, child_num_sigs, &receiver), "E (hidden parent state: parent num_sigs one higher)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_num_sigs + 1, &receiver), "F (hidden child state: child num_sigs one higher)")?;
+    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_num_sigs, &other_recv), "G (Model A violated: child state pays not-the-receiver)")?;
+    ok(vcb(pa, false, parent_num_sigs, ca, child_num_sigs, &receiver), "H (parent NOT terminal — a rival trigger over F could still be co-signed)")?;
+    // I is REPLACED, not dropped. The old I asserted a synthetic `child_terminal = false` flag, which no
+    // longer exists: a child is deliberately non-terminal so it can be re-transferred, and its safety
+    // now rests on the CHILD SUPERSEDED CENSUS. These two attacks exercise that census directly and are
+    // strictly stronger than the flag was — they forge the actual objects the census counts.
+    //
+    // I' (RIVAL RACE): disclose a child superseded state whose CSV is <= the LIVE child state's over the
+    // same outpoint. A superseded tier is only safe to count because it LOSES the maturity race; one
+    // that ties or wins could confirm first and pay the attacker.
+    {
+        let mut rival = cb.clone();
+        let live = rival.child_state.clone();
+        let mut sup = live.clone();
+        sup.csv = live.csv.map(|c| c.saturating_sub(1)); // strictly LOWER CSV ⟹ matures FIRST
+        rival.child_superseded_states.push(sup);
+        let r = mercuryrustlib::tesr::verify_child_bundle(
+            &rival, &f_spk_hex,
+            parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
+            child_num_sigs + 1, child_baseline, child_agg.as_deref(),
+            &receiver,
+        );
+        ok(r, "I' (child superseded state at a CSV <= the live state's — could out-race the owner)")?;
+    }
+    // I'' (COUNT PADDING, the [S1] class — reachable on the child segment for the first time): pad the
+    // child's superseded list with a structurally plausible entry that was never co-signed by A_child,
+    // to make the census balance an inflated num_sigs. Only a valid signature proves a tier consumed a
+    // co-sign, so this MUST reject.
+    {
+        let mut padded = cb.clone();
+        let mut junk = padded.child_state.clone();
+        junk.csv = junk.csv.map(|c| c.saturating_add(1)); // would lose the race — but is not co-signed
+        junk.txid = "0".repeat(64);
+        padded.child_superseded_states.push(junk);
+        let r = mercuryrustlib::tesr::verify_child_bundle(
+            &padded, &f_spk_hex,
+            parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
+            child_num_sigs + 1, child_baseline, child_agg.as_deref(),
+            &receiver,
+        );
+        ok(r, "I'' (padded child superseded entry, not co-signed by A_child — count padding)")?;
+    }
     // J (VALUE-GATE SPOOF): declare a larger `out_value` than `state_child.out[0]` actually pays. A
     // payer crafting a near-worthless piece while claiming invoice value would pass a value gate that
     // trusts the declared field (the SSP pre-pay census). verify_child_bundle binds out[0].value to the
@@ -126,7 +169,7 @@ pub async fn execute() -> Result<()> {
         let r = mercuryrustlib::tesr::verify_child_bundle(
             &spoof, &f_spk_hex,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
-            child_num_sigs, child_baseline, child_agg.as_deref(), child_terminal,
+            child_num_sigs, child_baseline, child_agg.as_deref(),
             &receiver,
         );
         ok(r, "J (value-gate spoof: declared out_value > state_child.out[0].value)")?;
@@ -153,7 +196,7 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK58 - child EXITED: {} sat landed at the receiver via the pre-signed chain.", cb.child_state.out_value);
 
-    println!("SDK58 - ✓ PASS: split child ACCEPTED; 10 attacks REJECTED (aggregates/hidden-state/Model-A/terminality/value-spoof); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
+    println!("SDK58 - ✓ PASS: split child ACCEPTED (non-terminal by design — it is handed over, not frozen); 11 attacks REJECTED (aggregates/hidden-state/Model-A/parent-terminality/child-superseded race + count-padding/value-spoof); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
     Ok(())
 }
 

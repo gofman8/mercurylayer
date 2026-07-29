@@ -325,13 +325,18 @@ pub async fn in_ladder_split(
             .statechain_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
-        // [F1] TERMINALIZE the child (budget = current finalized + 0), so the SE refuses ANY further
-        // child co-sign. Without this the child is re-signable and the sender could co-sign a hidden
-        // rival state over SP.out[j] paying themselves, then race the honest child on the parent's exit
-        // — theft. Mirrors the parent's set_spend_budget(parent_sid, 1) above. The receiver additionally
-        // VERIFIES this via get_spend_budget (see verify_child_bundle's child_terminal), so a sender that
-        // skips this step is caught, not trusted.
-        crate::lightning_latch::set_spend_budget(cc, wallet_name, &child_sid, 0).await?;
+        // [F1] The child is deliberately left NON-terminal, so the receiver can complete the standard
+        // key handover and hold a first-class, re-transferable coin (V2-CHILD-FIRSTCLASS.md). A child
+        // is not defenceless without terminality — two mechanisms cover the two windows:
+        //   * PRE-conveyance: a rival the sender co-signed over SP.out[j] before conveying is caught by
+        //     the exact-equality census (`child_num_sigs == CHILD_V2_BASELINE + tiers + superseded`),
+        //     which the receiver checks against the SE's authoritative count.
+        //   * POST-conveyance: `convey_child_bundle`'s `get_new_x1` opens a transfer on the child, and
+        //     the coordinator's pending-transfer lock then refuses every further sender co-sign until
+        //     the transfer completes — at which point the receiver's auth rotation makes the lockout
+        //     PERMANENT. (The temporary lock is what bridges census → key_updated.)
+        // The LATCHED lane is the exception and re-applies terminality in `in_ladder_pay`: there the
+        // piece sits unclaimed until an LN preimage lands, i.e. deliberately past the lock's window.
         bundles.push(ChildTesrBundle {
             parent: parent_seg.clone(),
             parent_statechain_id: parent_sid.clone(),
@@ -422,10 +427,12 @@ pub async fn load_child(cc: &ClientConfig, wallet_name: &str, child_statechain_i
     Ok(None)
 }
 
-/// Statechain ids of all coins that are RECEIVED in-ladder split child CLAIMS (a persisted `ctesr-<id>`
-/// bundle). These are exit-only until materialized — a caller must exclude them from off-chain spend
-/// selection (they hold no SE co-signing relationship; their funding `SP.out[j]` is un-broadcast).
-/// One wallet-DB read. See [[v2-child-retransfer-unsound]] for why they cannot be re-transferred off-chain.
+/// Statechain ids of all coins backed by a RECEIVED in-ladder split child bundle (a persisted
+/// `ctesr-<id>`). These are FIRST-CLASS coins — the claim completed the SE key handover, so they can be
+/// paid onward off-chain via [`child_retransfer`] — but their funding `SP.out[j]` is un-broadcast, so
+/// callers use this set to treat them specially: spendable only WHOLE (never chosen as the coin to
+/// split), and withdrawn by unilateral exit rather than a cooperative on-chain withdrawal.
+/// One wallet-DB read.
 pub async fn child_claim_sids(cc: &ClientConfig, wallet_name: &str) -> Result<std::collections::HashSet<String>> {
     let mut set = std::collections::HashSet::new();
     for (k, _json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
@@ -532,10 +539,10 @@ pub async fn verify_conveyed_child(
         .await?
         .ok_or_else(|| anyhow::anyhow!("no statechain info for child sid"))?;
 
+    // Only the PARENT's terminality is fetched: the child's census is made durable by the handover the
+    // receiver completes in this same claim, not by terminality (see verify_child_bundle's [F2]).
     let (_, _, parent_terminal) =
         crate::lightning_latch::get_spend_budget(cc, &cb.parent_statechain_id).await?;
-    let (_, _, child_terminal) =
-        crate::lightning_latch::get_spend_budget(cc, &cb.child_statechain_id).await?;
 
     verify_child_bundle(
         cb,
@@ -547,7 +554,6 @@ pub async fn verify_conveyed_child(
         c_info.num_sigs,
         CHILD_V2_BASELINE,
         c_info.aggregate_pubkey.as_deref(),
-        child_terminal,
         receiver_backup_address,
     )?;
     Ok(cb.child_state.out_value)
@@ -564,6 +570,83 @@ pub async fn adopt_child_bundle(
     let value = verify_conveyed_child(cc, receiver_backup_address, cb).await?;
     persist_child(cc, wallet_name, cb).await?;
     Ok(value)
+}
+
+/// ONWARD HOP — re-transfer a whole received CHILD off-chain to a new owner (Spark parity).
+///
+/// A received child cannot go through `transfer_sender::execute`: it has no `tesr-` bundle (only
+/// `ctesr-`), so that path would fall through to the B1-unsafe plain split, and it has no V1 backup
+/// chain to hand over. This is the child's own Model-A transfer instead:
+///
+///   * build a NEW child state over `ext_child.out[0]` one δ lower (replace-by-lower-timelock), paying
+///     the NEW recipient's exit key — so the fresh state matures BEFORE the one it replaces and wins
+///     the race for that outpoint;
+///   * co-sign it under `A_child` — possible only because the receiver completed the key handover when
+///     it adopted the child (Commit A); the sender of THIS hop is the current owner;
+///   * disclose the state it replaced in `child_superseded_states` (full-disclosure counting), which the
+///     receiver's census then counts and proves non-confirmable;
+///   * convey the updated bundle with the standard handover, exactly like the first hop.
+///
+/// Net effect per hop: EXACTLY +1 `num_sigs` and +1 superseded entry, which is what
+/// `verify_child_bundle`'s child census expects (`baseline + 2 + superseded`).
+pub async fn child_retransfer(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &mut Coin,
+    cb: &ChildTesrBundle,
+    recipient_address: &str,
+) -> Result<ChildTesrBundle> {
+    let p = cb.parent.params;
+    // Replace-by-lower-timelock: the new state must mature strictly before the one it supersedes, and
+    // must not sink below the schedule floor (at the floor the coin must be re-anchored, not re-sent).
+    let old_csv = cb
+        .child_state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("child state has no CSV — cannot re-transfer"))?;
+    let new_csv = old_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| anyhow::anyhow!(
+            "child state CSV {old_csv} is at the floor ({}) — exit or re-anchor it instead of re-sending",
+            p.d_floor
+        ))?;
+
+    // The new state spends the SAME outpoint as the one it replaces: ext_child.out[0].
+    let payee = mercurylib::tesr::payee_address(recipient_address, &cb.parent.network)?;
+    let st = mercurylib::tesr::build_state_from(
+        &cb.child_extension.txid,
+        0,
+        cb.child_extension.out_value,
+        &payee,
+        &cb.parent.network,
+        new_csv,
+        cb.parent.fee_rate,
+    )?;
+    let signed = cosign_tier(
+        cc,
+        child_coin,
+        st.tx_hex.clone(),
+        cb.child_extension.out_value,
+        &cb.parent.network,
+    )
+    .await?;
+
+    let mut next = cb.clone();
+    // Full disclosure: the state we just replaced is now superseded (it loses the race for
+    // ext_child.out[0] to the lower-CSV state above) and must be counted by the receiver's census.
+    next.child_superseded_states.push(next.child_state.clone());
+    next.child_state = TesrTier {
+        txid: st.txid.clone(),
+        signed_tx: signed,
+        out_value: st.out_value,
+        csv: Some(new_csv),
+    };
+    next.child_owner_exit_address = payee;
+
+    convey_child_bundle(cc, recipient_address, child_coin, &next, None).await?;
+    // Book the hop locally: the child has left this wallet.
+    persist_child(cc, wallet_name, &next).await?;
+    Ok(next)
 }
 
 /// Conveys a split **child** bundle to `recipient_address` by posting an encrypted mailbox message
@@ -922,114 +1005,32 @@ pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> 
 /// pays the children (not the owner), so its output-payee check is skipped here — each child's outputs
 /// are verified against its own aggregate by [`verify_child_bundle`]. Everything else (co-signs under
 /// `A`, the per-outpoint race, the exact-equality census) is unchanged.
-fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, final_is_split: bool) -> Result<()> {
-    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction, Txid};
-
-    let net = net_from_str(&bundle.network);
-    let spk_of = |addr: &str| -> Result<_> {
-        Ok(Address::from_str(addr)
-            .map_err(|_| anyhow::anyhow!("bad address {addr}"))?
-            .require_network(net)
-            .map_err(|_| anyhow::anyhow!("address {addr} wrong network"))?
-            .script_pubkey())
-    };
-    let agg_spk = spk_of(&bundle.agg_address)?;
-    let owner_spk = spk_of(&bundle.owner_exit_address)?;
-
-    let tiers = bundle.exit_tiers(); // [trigger, ext0, state0, ext1, state1, ...]
-    if tiers.len() < 3 || (tiers.len() - 1) % 2 != 0 {
-        return Err(anyhow::anyhow!("malformed ladder: expected trigger + N*(extension,state)"));
-    }
-
-    let txs: Vec<Transaction> = tiers
-        .iter()
-        .map(|t| {
-            let raw = hex::decode(&t.signed_tx).map_err(|_| anyhow::anyhow!("bad tier hex"))?;
-            deserialize::<Transaction>(&raw).map_err(|_| anyhow::anyhow!("bad tier tx"))
-        })
-        .collect::<Result<_>>()?;
-
-    // 1. Trigger spends F and pays A.
-    let t = &txs[0];
-    if t.input.len() != 1
-        || t.input[0].previous_output.txid != Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?
-        || t.input[0].previous_output.vout != bundle.f_vout
-    {
-        return Err(anyhow::anyhow!("trigger does not spend the funding UTXO F"));
-    }
-    if t.output.is_empty() || t.output[0].script_pubkey != agg_spk {
-        return Err(anyhow::anyhow!("trigger does not pay the aggregate key A"));
-    }
-
-    // 2. Each later tier spends its parent's out[0], within schedule bounds, paying A (or owner if final).
-    let p = &bundle.params;
-    for i in 1..txs.len() {
-        let tx = &txs[i];
-        if tx.input.len() != 1
-            || tx.input[0].previous_output.txid != txs[i - 1].txid()
-            || tx.input[0].previous_output.vout != 0
-        {
-            return Err(anyhow::anyhow!("tier {i} does not spend its parent's output"));
-        }
-        let seq = tx.input[0].sequence.0;
-        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
-            return Err(anyhow::anyhow!("tier {i} is not a BIP-68 block relative-timelock"));
-        }
-        let csv = seq as u16;
-        let is_extension = i % 2 == 1;
-        let (lo, hi) = if is_extension { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
-        if csv < lo || csv > hi {
-            return Err(anyhow::anyhow!("tier {i} CSV {csv} outside schedule bounds [{lo},{hi}]"));
-        }
-        let is_final = i == txs.len() - 1;
-        if is_final && final_is_split {
-            // SP (split state) pays the children, not the owner; its outputs are verified per-child by
-            // verify_child_bundle (A_child == SP.out[j]). Skip the single-owner payee check here.
-        } else {
-            let want = if is_final { &owner_spk } else { &agg_spk };
-            if tx.output.is_empty() || &tx.output[0].script_pubkey != want {
-                return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
-            }
-        }
-    }
-
-    // ---- Superseded tiers: PARSE + LADDER-LINK + SIGNATURE-VERIFY before they may be counted [S1].
-    //
-    // The count in check 3 is the anti-theft linchpin, so EVERY term of it must correspond to a real,
-    // co-signed tier OF THIS LADDER. Previously `superseded_*` were only `.len()`-counted — never
-    // parsed, linked or signature-checked — and the CSV race-check skipped `csv: None`. A sender
-    // holding a hidden low-CSV state could pad one junk entry (`signed_tx: ""`, `csv: None`) to make
-    // `expected` match the inflated `num_sigs`, get ACCEPTED, then broadcast the hidden state and take
-    // the coin back. Parsing alone is NOT sufficient either: a structurally valid but never-co-signed
-    // tx would still pad the count. Only a valid signature by `A` proves a tier consumed a co-sign.
-    //
-    // `prevout_value_of` maps (parent txid, vout) → the value that output carries — exactly the prevout
-    // value the child's taproot key-spend sighash commits to (mirrors `cosign_tier_request`). Two
-    // properties matter:
-    //   * keyed PER-OUTPUT, not per-txid. A tier may legitimately hang off any `out[j]` of its parent —
-    //     that is how an in-ladder split state (V2-DESIGN §5.4) hosts N children, and the mechanism that
-    //     dissolves B1 (a split that DESCENDS from the trigger instead of racing it for `F`). A
-    //     txid-only map silently assumed `out[0]` and would mis-value every child but the first.
-    //   * values are read from the PARSED transactions, never from the declared `out_value` field, which
-    //     is attacker-supplied. The tx is the authority; there is no reason to consult the claim.
-    let mut prevout_value_of: std::collections::HashMap<(Txid, u32), u64> = std::collections::HashMap::new();
-    prevout_value_of.insert(
-        (Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?, bundle.f_vout),
-        bundle.f_value,
-    );
-    for tx in txs.iter() {
-        let id = tx.txid();
-        for (vout, o) in tx.output.iter().enumerate() {
-            prevout_value_of.insert((id, vout as u32), o.value);
-        }
-    }
-    // Superseded tiers are parsed up-front so their outputs can also serve as parents (e.g. a superseded
-    // extension's state after a renewal) and so no unparseable entry reaches the checks below.
+/// Validate + count a segment's DISCLOSED SUPERSEDED tiers, returning how many were accepted.
+///
+/// Shared by the root ladder (`verify_bundle_ex`) and a split CHILD's own segment, so the two can
+/// never drift: a second copy of this battery is exactly how the `[S1]` count-padding class returns.
+/// The caller supplies the segment's aggregate scriptPubKey, its schedule params, the running
+/// `prevout_value_of` map (this fn INSERTS every superseded output into it before validating, so a
+/// superseded tier may legitimately parent another — the renewal/transitive-death case), and the
+/// per-outpoint CSV of the LIVE tier spending it.
+///
+/// Every returned entry has been: parsed, txid-bound, ladder-linked, verified as a genuine co-sign by
+/// the aggregate key, CSV-checked within the schedule bounds, and proven NON-CONFIRMABLE — either it
+/// directly loses a maturity race to the live tier over the same outpoint, or its prevout is
+/// transitively never created. Anything else is an orphan/threat branch and is refused.
+fn verify_superseded_segment(
+    sup_states: &[TesrTier],
+    sup_exts: &[TesrTier],
+    agg_spk: &electrum_client::bitcoin::ScriptBuf,
+    p: &mercurylib::tesr::TesrParams,
+    prevout_value_of: &mut std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64>,
+    live_csv_by_outpoint: &std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u32>,
+) -> Result<u32> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction, Txid};
+    // Parsed up-front so their outputs can also serve as parents (e.g. a superseded extension's state
+    // after a renewal) and so no unparseable entry reaches the checks below.
     let mut superseded_parsed: Vec<(&'static str, usize, &TesrTier, Transaction)> = Vec::new();
-    for (kind, list) in [
-        ("state", &bundle.superseded_states),
-        ("extension", &bundle.superseded_extensions),
-    ] {
+    for (kind, list) in [("state", sup_states), ("extension", sup_exts)] {
         for (j, s) in list.iter().enumerate() {
             let raw = hex::decode(&s.signed_tx)
                 .map_err(|_| anyhow::anyhow!("superseded {kind} {j}: bad hex"))?;
@@ -1049,34 +1050,6 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
         }
     }
 
-    // Every counted tier (exit chain AND superseded) must verify as a genuine co-sign by A.
-    for (i, tx) in txs.iter().enumerate() {
-        let op = tx.input[0].previous_output;
-        let value = *prevout_value_of
-            .get(&(op.txid, op.vout))
-            .ok_or_else(|| anyhow::anyhow!("tier {i} spends an outpoint outside this ladder"))?;
-        verify_tier_cosigned(tx, value, &agg_spk)
-            .map_err(|e| anyhow::anyhow!("exit tier {i} is not co-signed by A: {e}"))?;
-    }
-
-    // PER-PREVOUT race map [S-1/S-2]: for each outpoint the exit chain spends, the CSV of the LIVE tier
-    // that spends it. A superseded tier only ever contends with the exit tier consuming the SAME
-    // outpoint, so that — not a global `final_csv` — is what it must be compared against.
-    //   S-2: comparing every superseded entry to `txs.last()`'s CSV is meaningless across unrelated
-    //        outpoints (post-rollover a level-0 superseded state was compared to the level-1 final
-    //        state — they never contend), and it also bricks honest renew→transfer sequences.
-    //   S-1: the old check was additionally gated on `kind == "state"`, leaving superseded EXTENSIONS
-    //        race-UNCHECKED. A genuinely co-signed X_evil at e_floor + its child S_evil both verify
-    //        against A and balance the count, but X_evil matures far ahead of the honest extension and
-    //        its state pays the attacker — outright theft. Extensions are now checked identically.
-    // Keyed per-OUTPUT for the same reason as `prevout_value_of`: a split state hosts a child on each
-    // `out[j]`, so "the live tier over this outpoint" is only well-defined per (txid, vout).
-    let mut live_csv_by_outpoint: std::collections::HashMap<(Txid, u32), u32> =
-        std::collections::HashMap::new();
-    for i in 1..txs.len() {
-        let op = txs[i].input[0].previous_output;
-        live_csv_by_outpoint.insert((op.txid, op.vout), txs[i].input[0].sequence.0 & 0xFFFF);
-    }
     // Static per-tier validation (parse/linkage/co-sign/CSV) followed by a NON-CONFIRMABILITY fixpoint.
     //
     // A disclosed superseded tier is safe to count iff it can never CONFIRM and out-race the owner. There
@@ -1182,7 +1155,146 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
             ));
         }
     }
-    let superseded_ok: u32 = sups.len() as u32;
+    Ok(sups.len() as u32)
+}
+
+fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, final_is_split: bool) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction, Txid};
+
+    let net = net_from_str(&bundle.network);
+    let spk_of = |addr: &str| -> Result<_> {
+        Ok(Address::from_str(addr)
+            .map_err(|_| anyhow::anyhow!("bad address {addr}"))?
+            .require_network(net)
+            .map_err(|_| anyhow::anyhow!("address {addr} wrong network"))?
+            .script_pubkey())
+    };
+    let agg_spk = spk_of(&bundle.agg_address)?;
+    let owner_spk = spk_of(&bundle.owner_exit_address)?;
+
+    let tiers = bundle.exit_tiers(); // [trigger, ext0, state0, ext1, state1, ...]
+    if tiers.len() < 3 || (tiers.len() - 1) % 2 != 0 {
+        return Err(anyhow::anyhow!("malformed ladder: expected trigger + N*(extension,state)"));
+    }
+
+    let txs: Vec<Transaction> = tiers
+        .iter()
+        .map(|t| {
+            let raw = hex::decode(&t.signed_tx).map_err(|_| anyhow::anyhow!("bad tier hex"))?;
+            deserialize::<Transaction>(&raw).map_err(|_| anyhow::anyhow!("bad tier tx"))
+        })
+        .collect::<Result<_>>()?;
+
+    // 1. Trigger spends F and pays A.
+    let t = &txs[0];
+    if t.input.len() != 1
+        || t.input[0].previous_output.txid != Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?
+        || t.input[0].previous_output.vout != bundle.f_vout
+    {
+        return Err(anyhow::anyhow!("trigger does not spend the funding UTXO F"));
+    }
+    if t.output.is_empty() || t.output[0].script_pubkey != agg_spk {
+        return Err(anyhow::anyhow!("trigger does not pay the aggregate key A"));
+    }
+
+    // 2. Each later tier spends its parent's out[0], within schedule bounds, paying A (or owner if final).
+    let p = &bundle.params;
+    for i in 1..txs.len() {
+        let tx = &txs[i];
+        if tx.input.len() != 1
+            || tx.input[0].previous_output.txid != txs[i - 1].txid()
+            || tx.input[0].previous_output.vout != 0
+        {
+            return Err(anyhow::anyhow!("tier {i} does not spend its parent's output"));
+        }
+        let seq = tx.input[0].sequence.0;
+        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+            return Err(anyhow::anyhow!("tier {i} is not a BIP-68 block relative-timelock"));
+        }
+        let csv = seq as u16;
+        let is_extension = i % 2 == 1;
+        let (lo, hi) = if is_extension { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+        if csv < lo || csv > hi {
+            return Err(anyhow::anyhow!("tier {i} CSV {csv} outside schedule bounds [{lo},{hi}]"));
+        }
+        let is_final = i == txs.len() - 1;
+        if is_final && final_is_split {
+            // SP (split state) pays the children, not the owner; its outputs are verified per-child by
+            // verify_child_bundle (A_child == SP.out[j]). Skip the single-owner payee check here.
+        } else {
+            let want = if is_final { &owner_spk } else { &agg_spk };
+            if tx.output.is_empty() || &tx.output[0].script_pubkey != want {
+                return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
+            }
+        }
+    }
+
+    // ---- Superseded tiers: PARSE + LADDER-LINK + SIGNATURE-VERIFY before they may be counted [S1].
+    //
+    // The count in check 3 is the anti-theft linchpin, so EVERY term of it must correspond to a real,
+    // co-signed tier OF THIS LADDER. Previously `superseded_*` were only `.len()`-counted — never
+    // parsed, linked or signature-checked — and the CSV race-check skipped `csv: None`. A sender
+    // holding a hidden low-CSV state could pad one junk entry (`signed_tx: ""`, `csv: None`) to make
+    // `expected` match the inflated `num_sigs`, get ACCEPTED, then broadcast the hidden state and take
+    // the coin back. Parsing alone is NOT sufficient either: a structurally valid but never-co-signed
+    // tx would still pad the count. Only a valid signature by `A` proves a tier consumed a co-sign.
+    //
+    // `prevout_value_of` maps (parent txid, vout) → the value that output carries — exactly the prevout
+    // value the child's taproot key-spend sighash commits to (mirrors `cosign_tier_request`). Two
+    // properties matter:
+    //   * keyed PER-OUTPUT, not per-txid. A tier may legitimately hang off any `out[j]` of its parent —
+    //     that is how an in-ladder split state (V2-DESIGN §5.4) hosts N children, and the mechanism that
+    //     dissolves B1 (a split that DESCENDS from the trigger instead of racing it for `F`). A
+    //     txid-only map silently assumed `out[0]` and would mis-value every child but the first.
+    //   * values are read from the PARSED transactions, never from the declared `out_value` field, which
+    //     is attacker-supplied. The tx is the authority; there is no reason to consult the claim.
+    let mut prevout_value_of: std::collections::HashMap<(Txid, u32), u64> = std::collections::HashMap::new();
+    prevout_value_of.insert(
+        (Txid::from_str(&bundle.f_txid).map_err(|_| anyhow::anyhow!("bad F txid"))?, bundle.f_vout),
+        bundle.f_value,
+    );
+    for tx in txs.iter() {
+        let id = tx.txid();
+        for (vout, o) in tx.output.iter().enumerate() {
+            prevout_value_of.insert((id, vout as u32), o.value);
+        }
+    }
+    // Every counted tier (exit chain AND superseded) must verify as a genuine co-sign by A.
+    for (i, tx) in txs.iter().enumerate() {
+        let op = tx.input[0].previous_output;
+        let value = *prevout_value_of
+            .get(&(op.txid, op.vout))
+            .ok_or_else(|| anyhow::anyhow!("tier {i} spends an outpoint outside this ladder"))?;
+        verify_tier_cosigned(tx, value, &agg_spk)
+            .map_err(|e| anyhow::anyhow!("exit tier {i} is not co-signed by A: {e}"))?;
+    }
+
+    // PER-PREVOUT race map [S-1/S-2]: for each outpoint the exit chain spends, the CSV of the LIVE tier
+    // that spends it. A superseded tier only ever contends with the exit tier consuming the SAME
+    // outpoint, so that — not a global `final_csv` — is what it must be compared against.
+    //   S-2: comparing every superseded entry to `txs.last()`'s CSV is meaningless across unrelated
+    //        outpoints (post-rollover a level-0 superseded state was compared to the level-1 final
+    //        state — they never contend), and it also bricks honest renew→transfer sequences.
+    //   S-1: the old check was additionally gated on `kind == "state"`, leaving superseded EXTENSIONS
+    //        race-UNCHECKED. A genuinely co-signed X_evil at e_floor + its child S_evil both verify
+    //        against A and balance the count, but X_evil matures far ahead of the honest extension and
+    //        its state pays the attacker — outright theft. Extensions are now checked identically.
+    // Keyed per-OUTPUT for the same reason as `prevout_value_of`: a split state hosts a child on each
+    // `out[j]`, so "the live tier over this outpoint" is only well-defined per (txid, vout).
+    let mut live_csv_by_outpoint: std::collections::HashMap<(Txid, u32), u32> =
+        std::collections::HashMap::new();
+    for i in 1..txs.len() {
+        let op = txs[i].input[0].previous_output;
+        live_csv_by_outpoint.insert((op.txid, op.vout), txs[i].input[0].sequence.0 & 0xFFFF);
+    }
+    let superseded_ok = verify_superseded_segment(
+        &bundle.superseded_states,
+        &bundle.superseded_extensions,
+        &agg_spk,
+        &p,
+        &mut prevout_value_of,
+        &live_csv_by_outpoint,
+    )?;
 
     // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for EVERY co-signed
     //    tier — the exit chain PLUS the superseded states/extensions (full-disclosure counting). Every
@@ -1230,23 +1342,26 @@ pub fn verify_child_bundle(
     child_num_sigs: u32,
     child_v1_backups: u32,
     child_aggregate_pubkey: Option<&str>,
-    child_terminal: bool,
     receiver_backup_address: &str,
 ) -> Result<()> {
-    // [F2] TERMINALITY IS THE DURABLE GUARANTEE — the census (num_sigs) is only a snapshot (TOCTOU): a
-    // sender who skips set_spend_budget passes the count, then gets the SE to co-sign a rival AFTER this
-    // check. The receiver MUST query /statechain/spend_budget for BOTH sids (fail-closed) and require
-    // terminal==true: once terminal, the SE refuses every further co-sign, so no rival can appear. A
-    // non-terminal parent could still be given a rival trigger T' over the live on-chain F; a
-    // non-terminal child a rival state over SP.out[j].
+    // [F2] The two segments are secured DIFFERENTLY, because only one of them is being handed over.
+    //
+    // PARENT (ancestor segment) — terminality is load-bearing and still REQUIRED. Its census is a
+    // snapshot nobody in this transfer can refresh: the receiver never takes ownership of the parent,
+    // so a sender who skipped `set_spend_budget` could pass the count here and then have the SE
+    // co-sign a rival trigger T' over the live on-chain F afterwards. Terminal ⟹ the SE refuses
+    // every further co-sign ⟹ the snapshot is durable. Fail-closed.
+    //
+    // CHILD (leaf segment) — terminality is NOT required, and requiring it would make the child
+    // exit-only forever. Its census is made durable by a different, stronger mechanism: the receiver
+    // COMPLETES the key handover during this same claim, which rotates the SE share and the auth key,
+    // locking the sender out PERMANENTLY. The coordinator's pending-transfer lock (armed when
+    // `convey_child_bundle` opened the transfer) covers the gap between this census and that
+    // completion. See V2-CHILD-FIRSTCLASS.md. NOTE the verifier must TOLERATE a terminal child — the
+    // Lightning-latched lane deliberately keeps one — it simply no longer checks.
     if !parent_terminal {
         return Err(anyhow::anyhow!(
             "parent sid is NOT terminal — a rival state over F/X_m.out[0] could still be co-signed (fail-closed)"
-        ));
-    }
-    if !child_terminal {
-        return Err(anyhow::anyhow!(
-            "child sid is NOT terminal — a rival state over SP.out[j] could still be co-signed (fail-closed)"
         ));
     }
     use electrum_client::bitcoin::{
@@ -1321,11 +1436,6 @@ pub fn verify_child_bundle(
 
     // [6] CHILD SEGMENT + CENSUS, verified under A_child (attribution is KEY-DERIVED — check [7] — since
     //     each tier is verified against SP.out[j]'s key, not a sender-filled segment field).
-    if !cb.child_superseded_states.is_empty() || !cb.child_superseded_extensions.is_empty() {
-        return Err(anyhow::anyhow!(
-            "child has superseded tiers (renewed/transferred child) — not yet supported by verify_child_bundle"
-        ));
-    }
     let child_agg_spk = sp_out.script_pubkey.clone();
 
     // ext_child spends exactly SP.out[j], co-signed by A_child.
@@ -1402,10 +1512,46 @@ pub fn verify_child_bundle(
         ));
     }
 
-    // [6 cont.] CHILD CENSUS exact-equality: a fresh split child discloses exactly ext_child +
-    //     state_child (2 co-signs) on top of any V1 backups. A hidden child co-sign would push
-    //     child_num_sigs above this ⟹ reject.
-    let child_expected = child_v1_backups + 2;
+    // [6 cont.] CHILD SUPERSEDED SEGMENT. A child that has been RE-TRANSFERRED discloses the states it
+    // replaced (one per hop), each of which consumed a real co-sign and so must be counted — but only
+    // after being proven non-confirmable, exactly like the root ladder's. Same shared battery, so the
+    // two can never drift.
+    //
+    // Seeding differs from `verify_bundle_ex` in one way worth stating: that function seeds `live` from
+    // `txs[1..]` because a root ladder's first tier is the TRIGGER, which carries no CSV. A child
+    // segment is HEADLESS — it starts at its extension, which does have a CSV — so BOTH child tiers
+    // seed the live map.
+    let child_superseded_ok = {
+        use electrum_client::bitcoin::Txid as _Txid;
+        let mut child_prevouts: std::collections::HashMap<(_Txid, u32), u64> =
+            std::collections::HashMap::new();
+        child_prevouts.insert((sp_txid, cb.sp_vout), sp_out.value);
+        for tx in [&ext_tx, &st_tx] {
+            let id = tx.txid();
+            for (vout, o) in tx.output.iter().enumerate() {
+                child_prevouts.insert((id, vout as u32), o.value);
+            }
+        }
+        let mut child_live: std::collections::HashMap<(_Txid, u32), u32> =
+            std::collections::HashMap::new();
+        child_live.insert((sp_txid, cb.sp_vout), ext_tx.input[0].sequence.0 & 0xFFFF);
+        child_live.insert((ext_tx.txid(), 0), st_tx.input[0].sequence.0 & 0xFFFF);
+        verify_superseded_segment(
+            &cb.child_superseded_states,
+            &cb.child_superseded_extensions,
+            &child_agg_spk,
+            &cb.parent.params,
+            &mut child_prevouts,
+            &child_live,
+        )?
+    };
+
+    // [6 cont.] CHILD CENSUS exact-equality: the child discloses exactly ext_child + state_child (2
+    //     co-signs) plus one superseded state per onward hop, on top of any V1 backups (a derived slot
+    //     has none — CHILD_V2_BASELINE = 0). A hidden child co-sign would push child_num_sigs above
+    //     this ⟹ reject. Key handovers are census-NEUTRAL (the enclave bumps sig_count only when it
+    //     signs), so an adopted child counts the same as a conveyed one.
+    let child_expected = child_v1_backups + 2 + child_superseded_ok;
     if child_num_sigs != child_expected {
         return Err(anyhow::anyhow!(
             "child num_sigs mismatch: SE issued {child_num_sigs}, disclosed accounts for {child_expected} — possible hidden child state"

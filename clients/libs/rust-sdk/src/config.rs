@@ -73,13 +73,15 @@ pub struct SdkConfig {
 ///     receiver adopts via `verify_child_bundle` and unilaterally exits; funds land at the receiver.
 /// Plus S1/S2 (sdk54/sdk55). See `docs/utexo/V2-SPLIT-FINDINGS.md`.
 ///
-/// KNOWN V2 SEMANTIC (documented, safe): a RECEIVED non-exact (split-child) payment is an EXIT-ONLY
-/// claim — its funding `SP.out[j]` is un-broadcast and the receiver holds no SE co-signing key, only the
-/// pre-signed exit chain that pays its own key (Model A). To re-spend it, materialize it (its unilateral
-/// exit IS the cooperative withdrawal). Off-chain re-transfer of an un-materialized child is not
-/// supported (the "SE handover + budget-reopen" that would enable it is adversarially UNSOUND — sender
-/// self-reopen re-arms B1; see v2-child-retransfer-unsound). Exact-amount received payments (Model-A
-/// transfers) are fully first-class.
+/// V2 SEMANTIC: a RECEIVED non-exact (split-child) payment is FIRST-CLASS. Its claim completes the
+/// standard SE key handover, so the receiver co-owns `A_child` (invariant across the rotation, which is
+/// what keeps the pre-signed exit chain valid) and the sender is locked out. It can be paid onward
+/// off-chain, whole, via `child_retransfer` — each hop co-signs a fresh lower-CSV state and discloses
+/// the one it replaces for the receiver's census (`docs/utexo/V2-CHILD-FIRSTCLASS.md`, sdk60).
+/// Two limits remain: its funding `SP.out[j]` is un-broadcast, so a COOPERATIVE withdrawal to an
+/// arbitrary address still routes to the unilateral exit; and a child cannot itself be split in-ladder
+/// yet, so it is spendable only whole. (The rejected alternative — "SE handover + budget-reopen" — was
+/// adversarially unsound; the sound design conveys the handover instead of reopening a budget.)
 fn deposit_protocol_default() -> u32 {
     std::env::var("UTEXO_PROTOCOL_DEFAULT").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(2)
 }

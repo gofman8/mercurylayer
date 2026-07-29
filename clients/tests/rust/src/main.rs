@@ -73,6 +73,7 @@ pub mod sdk56_keystone_retry_idempotent;
 pub mod sdk57_owner_share_binding;
 pub mod sdk58_inladder_split;
 pub mod sdk59_inladder_pay;
+pub mod sdk60_child_firstclass;
 pub mod sdk63_v2_lightning_pay;
 pub mod sdk64_v2_lightning_receive;
 pub mod sdk65_inladder_lightning_pay;
@@ -325,6 +326,12 @@ async fn main() -> Result<()> {
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("59") {
         sdk59_inladder_pay::execute().await?;
+        return Ok(());
+    }
+    // First-class children (SDK_E2E=60): a RECEIVED in-ladder split child is re-transferred OFF-CHAIN
+    // (alice -> bob -> carol) and only carol's exit touches the chain — Spark-parity multi-hop.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("60") {
+        sdk60_child_firstclass::execute().await?;
         return Ok(());
     }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("63") {

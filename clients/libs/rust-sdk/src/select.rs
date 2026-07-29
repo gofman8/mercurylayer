@@ -10,6 +10,10 @@ pub struct Candidate {
     /// Index into the caller's coin list.
     pub index: usize,
     pub amount_sats: u64,
+    /// May this coin be chosen as the SPLIT coin? A received in-ladder split child is spendable only
+    /// whole (a child-level split is not implemented), so it is offered for exact/whole plans but
+    /// never selected to be split.
+    pub splittable: bool,
 }
 
 /// Outcome of planning a payment of `target` sats.
@@ -114,7 +118,8 @@ pub fn plan_with_floor(coins: &[Candidate], target: u64, min_output: u64) -> Pla
     let mut candidates: Vec<&Candidate> = coins
         .iter()
         .filter(|c| {
-            !whole.contains(&c.index)
+            c.splittable
+                && !whole.contains(&c.index)
                 && remaining >= min_output
                 && c.amount_sats
                     > remaining + crate::transfer::split_fee_reserve(c.amount_sats) + min_output
@@ -139,7 +144,7 @@ mod tests {
     fn coins(v: &[u64]) -> Vec<Candidate> {
         v.iter()
             .enumerate()
-            .map(|(index, &amount_sats)| Candidate { index, amount_sats })
+            .map(|(index, &amount_sats)| Candidate { index, amount_sats, splittable: true })
             .collect()
     }
 
