@@ -45,11 +45,17 @@ pub(crate) async fn wait_for_address(cc: &ClientConfig, address: &str, amount: u
 }
 
 /// True iff `txid:vout` is no longer in the UTXO set (i.e. it has been spent / never existed unspent).
+///
+/// An electrum failure PANICS rather than returning a guess. Both callers assert in BOTH directions
+/// ("still unspent" early, "finally spent" late), so any fixed fallback makes one of those directions
+/// fail OPEN — silently passing a test whose chain state was never actually observed. (sdk17 used to
+/// keep a private copy returning `true` here and sdk40 `false`, so the two disagreed and each leaked a
+/// different fail-open; there is now one copy and it refuses to guess.)
 pub(crate) fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
     use electrum_client::bitcoin::Txid;
     let raw = match cc.electrum_client.transaction_get_raw(&Txid::from_str(txid).unwrap()) {
         std::result::Result::Ok(r) => r,
-        _ => return false,
+        Err(e) => panic!("electrum could not fetch {txid} — cannot assert whether {txid}:{vout} is spent: {e}"),
     };
     let tx: electrum_client::bitcoin::Transaction =
         electrum_client::bitcoin::consensus::deserialize(&raw).unwrap();

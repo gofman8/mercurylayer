@@ -20,18 +20,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     crate::utils::handle_token_response(cc, &token).await
 }
 
-fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
-    use electrum_client::bitcoin::Txid;
-    let raw = match cc.electrum_client.transaction_get_raw(&Txid::from_str(txid).unwrap()) {
-        std::result::Result::Ok(r) => r,
-        _ => return true,
-    };
-    let tx: electrum_client::bitcoin::Transaction =
-        electrum_client::bitcoin::consensus::deserialize(&raw).unwrap();
-    let spk = &tx.output[vout as usize].script_pubkey;
-    let listed = cc.electrum_client.script_list_unspent(spk).unwrap_or_default();
-    !listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout)
-}
+use crate::sdk40_tesr_consensus::is_outpoint_spent;
 
 async fn claim_one(w: &UtexoWallet) -> Result<()> {
     for _ in 0..30 {
@@ -44,15 +33,10 @@ async fn claim_one(w: &UtexoWallet) -> Result<()> {
 }
 
 pub async fn execute() -> Result<()> {
-    // STILL V1-PINNED — the last one, and the reason is precise. Hop 2 below sends 10 000 of Bob's
-    // 20 000 RECEIVED sub-coin: a NON-EXACT split of a child. Children became first-class on V2
-    // (V2-CHILD-FIRSTCLASS.md Commit B — sdk60 moves a whole child alice->bob->carol off-chain), but a
-    // child-level in-ladder SPLIT needs a depth-2 ancestor chain in the bundle, which is Commit C
-    // (see docs/utexo/V2-CHILD-FIRSTCLASS-PLAN.md §C1-C6). Un-pinned today this fails cleanly with
-    // "insufficient balance" — the planner correctly refuses to split a child rather than falling
-    // through to the B1-unsafe plain split. Do NOT un-pin by making hop 2 a whole-child transfer:
-    // that would silently drop this test'"'"'s partial-second-hop coverage (sdk60 already covers whole).
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default. Hop 1 is a root in-ladder split; hop 2 re-spends a NON-EXACT
+    // part of Bob's RECEIVED child, which is a CHILD-LEVEL in-ladder split (the child's state is
+    // replaced by a split state paying two grandchildren, and the child becomes an intermediate
+    // `ancestors` segment in each grandchild's bundle). Carol's exit therefore walks a depth-2 chain.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -111,11 +95,47 @@ pub async fn execute() -> Result<()> {
 
     // --- Only the final unilateral exit touches the chain -----------------------------------------
     let carol_coin = r2.coins[0].statechain_id.clone();
-    let _ = carol.unilateral_exit(Some(vec![carol_coin.clone()]), None).await?;
-    bitcoin_core::generatetoaddress(1, &core)?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Carol's exit key — the PAYOFF assertion below checks the value actually lands there, which the
+    // V1 version of this test never verified (it only checked that O got spent).
+    let carol_exit_key = {
+        let c = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk17_carol")
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(&carol_coin))
+            .cloned()
+            .ok_or_else(|| anyhow!("carol's coin missing"))?;
+        mercurylib::transaction::get_user_backup_address(&c, "regtest".to_string())?
+    };
+    // The V2 exit walks a DEPTH-2 chain: F -> T -> X_m -> SP -> ext_child -> CSP -> ext_gc -> state_gc,
+    // one relative timelock at a time.
+    let mut passes = 0;
+    loop {
+        let st = carol.unilateral_exit(Some(vec![carol_coin.clone()]), None).await?;
+        let s = st.into_iter().next().ok_or_else(|| anyhow!("no exit status"))?;
+        if s.complete {
+            break;
+        }
+        bitcoin_core::generatetoaddress(s.wait_blocks.max(1) + 1, &core)?;
+        passes += 1;
+        if passes > 40 {
+            return Err(anyhow!("carol's exit did not complete"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    bitcoin_core::generatetoaddress(2, &core)?;
     assert!(is_outpoint_spent(&cc, &o_txid, o_vout), "carol's exit finally spends O on-chain");
-    println!("SDK17 - carol exited unilaterally -> O is finally spent on-chain (the branch broadcast) \u{2713}");
+    // PAYOFF: the value must be sitting at CAROL's own key, not merely "O is spent".
+    {
+        use electrum_client::ElectrumApi;
+        use electrum_client::bitcoin::Address;
+        let addr = Address::from_str(&carol_exit_key)?.assume_checked();
+        let listed = cc.electrum_client.script_list_unspent(&addr.script_pubkey()).unwrap_or_default();
+        let total: u64 = listed.iter().map(|u| u.value).sum();
+        assert!(total > 0, "carol's exit must pay her own key ({carol_exit_key}), found nothing");
+        println!("SDK17 - carol's exit paid her own key: {total} sat at {carol_exit_key} ✓");
+    }
+    println!("SDK17 - carol exited unilaterally after {passes} pass(es) -> O is finally spent on-chain \u{2713}");
 
     println!("SDK17 - SUCCESS: value moved alice -> bob -> carol across TWO out-of-round hops with ZERO on-chain footprint (the funding outpoint stayed unspent the whole time); only carol's final unilateral exit touched the chain. This is the Ark/Arkade out-of-round + redeem semantics (and Spark's off-chain leaf transfer) achieved over a Mercury statechain.");
     Ok(())

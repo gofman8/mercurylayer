@@ -104,6 +104,42 @@ pub struct ChildTesrBundle {
     pub child_superseded_states: Vec<TesrTier>,
     #[serde(default)]
     pub child_superseded_extensions: Vec<TesrTier>,
+    /// INTERMEDIATE child segments, root→leaf, when this child descends from another child (a
+    /// child-level in-ladder split). Empty for a depth-1 child, which is why it is `serde(default)`:
+    /// every already-persisted `ctesr-*` row and every in-flight mailbox message keeps deserializing.
+    ///
+    /// `sp_vout` is always relative to the IMMEDIATELY PRECEDING segment — `parent.current().state`
+    /// when this is empty, otherwise `ancestors.last().state`.
+    #[serde(default)]
+    pub ancestors: Vec<ChildSegment>,
+}
+
+/// One INTERMEDIATE child segment of a multi-level child chain: the split state that funds the next
+/// level, plus the ladder that hangs off it. Its `state` is the split (`SP`-like) tier whose
+/// `out[next_vout]` funds the segment below.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChildSegment {
+    /// This segment's statechain id (an ancestor of the leaf child; must be TERMINAL at the SE).
+    pub statechain_id: String,
+    /// Which output of the PRECEDING segment's `state` funds THIS segment (the preceding segment is
+    /// `parent.current().state` for `ancestors[0]`, else `ancestors[i-1].state`).
+    pub funding_vout: u32,
+    /// The segment's own ladder: `extension` spends its funding outpoint, `state` spends ext.out[0].
+    pub extension: TesrTier,
+    pub state: TesrTier,
+    #[serde(default)]
+    pub superseded_states: Vec<TesrTier>,
+    #[serde(default)]
+    pub superseded_extensions: Vec<TesrTier>,
+}
+
+/// The SE-authoritative facts a verifier needs about ONE intermediate child segment. Supplied by the
+/// caller (fetched from `/info/statechain` + `/statechain/spend_budget`), never taken from the bundle.
+#[derive(Debug, Clone)]
+pub struct AncestorFacts {
+    pub num_sigs: u32,
+    pub aggregate_pubkey: Option<String>,
+    pub terminal: bool,
 }
 
 impl TesrBundle {
@@ -347,6 +383,7 @@ pub async fn in_ladder_split(
             child_state: ladder.state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
+            ancestors: vec![],
         });
     }
     Ok(bundles)
@@ -449,6 +486,14 @@ pub async fn child_claim_sids(cc: &ClientConfig, wallet_name: &str) -> Result<st
 pub fn child_exit_chain(cb: &ChildTesrBundle) -> Vec<(String, Option<u16>)> {
     let mut chain: Vec<(String, Option<u16>)> =
         cb.parent.exit_tiers().iter().map(|t| (t.signed_tx.clone(), t.csv)).collect();
+    // Splice EVERY intermediate segment, root→leaf, before the leaf's own tiers. Omitting these is
+    // not a mere verification gap — the leaf's funding outpoint would never be created on-chain, so
+    // the exit would stall forever and the value would be UNRECOVERABLE. Order is the broadcast
+    // order: each segment's extension, then its state (which funds the next level down).
+    for seg in cb.ancestors.iter() {
+        chain.push((seg.extension.signed_tx.clone(), seg.extension.csv));
+        chain.push((seg.state.signed_tx.clone(), seg.state.csv));
+    }
     chain.push((cb.child_extension.signed_tx.clone(), cb.child_extension.csv));
     chain.push((cb.child_state.signed_tx.clone(), cb.child_state.csv));
     chain
@@ -544,6 +589,21 @@ pub async fn verify_conveyed_child(
     let (_, _, parent_terminal) =
         crate::lightning_latch::get_spend_budget(cc, &cb.parent_statechain_id).await?;
 
+    // Each INTERMEDIATE segment is an ancestor (not handed over here), so it must be terminal and its
+    // census must balance — fetch the SE's authoritative facts for each, in root→leaf order.
+    let mut ancestor_facts: Vec<AncestorFacts> = Vec::with_capacity(cb.ancestors.len());
+    for seg in cb.ancestors.iter() {
+        let info = crate::utils::get_statechain_info(&seg.statechain_id, cc)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no statechain info for ancestor {}", seg.statechain_id))?;
+        let (_, _, terminal) = crate::lightning_latch::get_spend_budget(cc, &seg.statechain_id).await?;
+        ancestor_facts.push(AncestorFacts {
+            num_sigs: info.num_sigs,
+            aggregate_pubkey: info.aggregate_pubkey.clone(),
+            terminal,
+        });
+    }
+
     verify_child_bundle(
         cb,
         &f_spk_hex,
@@ -554,6 +614,7 @@ pub async fn verify_conveyed_child(
         c_info.num_sigs,
         CHILD_V2_BASELINE,
         c_info.aggregate_pubkey.as_deref(),
+        &ancestor_facts,
         receiver_backup_address,
     )?;
     Ok(cb.child_state.out_value)
@@ -570,6 +631,133 @@ pub async fn adopt_child_bundle(
     let value = verify_conveyed_child(cc, receiver_backup_address, cb).await?;
     persist_child(cc, wallet_name, cb).await?;
     Ok(value)
+}
+
+/// CHILD-LEVEL IN-LADDER SPLIT — pay a NON-EXACT amount out of a received child.
+///
+/// The child analogue of `in_ladder_split`. The child's own state is replaced by a SPLIT state `CSP`
+/// (one δ lower, so it out-races the state it replaces over `ext_child.out[0]`) paying N grandchildren;
+/// each grandchild then gets its own headless ladder off `CSP.out[j]`. The child itself becomes an
+/// INTERMEDIATE segment in each grandchild's bundle: it is terminalized (it is an ancestor now, not a
+/// coin being handed over), and the receiver's `verify_child_bundle` walks it via `cb.ancestors`.
+///
+/// Returns one bundle per grandchild, in `children` order.
+pub async fn child_in_ladder_split(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &mut Coin,
+    cb: &ChildTesrBundle,
+    children: &mut [(Coin, String, u64)],
+) -> Result<Vec<ChildTesrBundle>> {
+    let p = cb.parent.params;
+    let n = children.len();
+    if n == 0 {
+        return Err(anyhow::anyhow!("a child split needs at least one grandchild"));
+    }
+    let old_csv = cb
+        .child_state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("child state has no CSV — cannot split"))?;
+    // CSP must OUT-RACE the state it replaces over ext_child.out[0]: one rung lower, floored.
+    let csp_csv = old_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| anyhow::anyhow!(
+            "child state CSV {old_csv} is at the floor ({}) — exit or re-anchor instead of splitting",
+            p.d_floor
+        ))?;
+
+    // Value conservation: the grandchildren share the split total exactly (no mint, no burn).
+    let total = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, n, cb.parent.fee_rate)
+        .ok_or_else(|| anyhow::anyhow!("committed fee too high to split this child into {n}"))?;
+    let sum: u64 = children.iter().map(|(_, _, v)| *v).sum();
+    if sum != total {
+        return Err(anyhow::anyhow!(
+            "grandchild values sum to {sum} but must equal {total} (= ext_child.out[0] − committed fee)"
+        ));
+    }
+
+    // CSP pays each grandchild's aggregate address, in order (CSP.out[j] == children[j]).
+    let payees: Vec<(String, u64)> = children
+        .iter()
+        .map(|(c, _, v)| {
+            c.aggregated_address
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("grandchild coin has no aggregated_address"))
+                .map(|a| (a, *v))
+        })
+        .collect::<Result<_>>()?;
+    let csp = mercurylib::tesr::build_split_state(
+        &cb.child_extension.txid,
+        cb.child_extension.out_value,
+        &payees,
+        &cb.parent.network,
+        csp_csv,
+        cb.parent.fee_rate,
+    )?;
+
+    // Terminalize the CHILD (it becomes an ancestor segment) and co-sign CSP under A_child.
+    let child_sid = child_coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
+    crate::lightning_latch::set_spend_budget(cc, wallet_name, &child_sid, 1).await?;
+    let csp_signed = cosign_tier(
+        cc,
+        child_coin,
+        csp.tx_hex.clone(),
+        cb.child_extension.out_value,
+        &cb.parent.network,
+    )
+    .await?;
+
+    // The child segment as the grandchildren will see it: CSP is its current state, and the state CSP
+    // replaced is disclosed as superseded (it loses the race for ext_child.out[0]).
+    let mut seg_superseded = cb.child_superseded_states.clone();
+    seg_superseded.push(cb.child_state.clone());
+    let child_segment = ChildSegment {
+        statechain_id: child_sid.clone(),
+        funding_vout: cb.sp_vout,
+        extension: cb.child_extension.clone(),
+        state: TesrTier {
+            txid: csp.txid.clone(),
+            signed_tx: csp_signed,
+            out_value: total,
+            csv: Some(csp_csv),
+        },
+        superseded_states: seg_superseded,
+        superseded_extensions: cb.child_superseded_extensions.clone(),
+    };
+
+    let mut bundles = Vec::with_capacity(n);
+    for (j, (gc_coin, recipient, value)) in children.iter_mut().enumerate() {
+        let ladder = establish_child(
+            cc, gc_coin, &csp.txid, j as u32, *value, recipient,
+            p.ext_csv(0), p.state_csv(0), cb.parent.fee_rate, &cb.parent.network,
+        )
+        .await?;
+        let gc_sid = gc_coin
+            .statechain_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("grandchild coin has no statechain_id"))?;
+        // Grandchildren are left NON-terminal for the same reason children are: the receiver completes
+        // the key handover and takes first-class ownership (see in_ladder_split's [F1]).
+        let mut ancestors = cb.ancestors.clone();
+        ancestors.push(child_segment.clone());
+        bundles.push(ChildTesrBundle {
+            parent: cb.parent.clone(),
+            parent_statechain_id: cb.parent_statechain_id.clone(),
+            sp_vout: j as u32,
+            child_statechain_id: gc_sid,
+            child_owner_exit_address: recipient.clone(),
+            child_extension: ladder.extension,
+            child_state: ladder.state,
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+            ancestors,
+        });
+    }
+    Ok(bundles)
 }
 
 /// ONWARD HOP — re-transfer a whole received CHILD off-chain to a new owner (Spark parity).
@@ -687,8 +875,15 @@ pub async fn convey_child_bundle(
     // receiver reconstructs when it validates.
     let sp_txid = {
         use bitcoin::consensus::encode::deserialize;
-        let sp: bitcoin::Transaction =
-            deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+        // The child's funding tx is the segment DIRECTLY above it: the parent's SP for a depth-1
+        // child, else the deepest intermediate segment's state. This must match exactly what the
+        // receiver reconstructs when it verifies the transfer signature.
+        let funding_hex = cb
+            .ancestors
+            .last()
+            .map(|a| a.state.signed_tx.clone())
+            .unwrap_or_else(|| cb.parent.current().state.signed_tx.clone());
+        let sp: bitcoin::Transaction = deserialize(&hex::decode(&funding_hex)?)?;
         sp.txid().to_string()
     };
 
@@ -1342,6 +1537,7 @@ pub fn verify_child_bundle(
     child_num_sigs: u32,
     child_v1_backups: u32,
     child_aggregate_pubkey: Option<&str>,
+    ancestor_facts: &[AncestorFacts],
     receiver_backup_address: &str,
 ) -> Result<()> {
     // [F2] The two segments are secured DIFFERENTLY, because only one of them is being handed over.
@@ -1417,11 +1613,121 @@ pub fn verify_child_bundle(
         &hex::decode(&cb.parent.current().state.signed_tx).map_err(|_| anyhow::anyhow!("bad SP hex"))?,
     )
     .map_err(|_| anyhow::anyhow!("SP is not a transaction"))?;
-    let sp_txid = sp_tx.txid();
-    let sp_out = sp_tx
+
+    // [4b] INTERMEDIATE CHILD SEGMENTS (a child that descends from another child). Walk them root→leaf,
+    //      advancing the funding pointer; the leaf checks below then run unchanged at any depth.
+    //
+    //      An ancestor segment is NOT being handed over in this transfer, so — exactly like the parent —
+    //      its census is a snapshot the receiver cannot refresh, and terminality is what makes it
+    //      durable. Fail closed on any mismatch of supplied facts.
+    if ancestor_facts.len() != cb.ancestors.len() {
+        return Err(anyhow::anyhow!(
+            "ancestor facts ({}) do not match disclosed ancestor segments ({}) — fail-closed",
+            ancestor_facts.len(),
+            cb.ancestors.len()
+        ));
+    }
+    let mut cur_tx = sp_tx.clone();
+    for (i, seg) in cb.ancestors.iter().enumerate() {
+        let facts = &ancestor_facts[i];
+        let fund_out = cur_tx
+            .output
+            .get(seg.funding_vout as usize)
+            .ok_or_else(|| anyhow::anyhow!("ancestor {i}: funding tx has no output {}", seg.funding_vout))?
+            .clone();
+        let fund_txid = cur_tx.txid();
+        let seg_spk = fund_out.script_pubkey.clone();
+        // The segment's aggregate is KEY-DERIVED from the output it spends, then bound to the server's
+        // recorded aggregate for its statechain id.
+        let a_seg = taproot_key_hex(seg_spk.as_bytes())?;
+        let seg_agg = facts
+            .aggregate_pubkey
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("ancestor {i}: server recorded no aggregate (fail-closed)"))?;
+        if tweaked_key_hex(seg_agg)? != a_seg {
+            return Err(anyhow::anyhow!("ancestor {i}: server aggregate != its funding output key (decoy)"));
+        }
+        if !facts.terminal {
+            return Err(anyhow::anyhow!(
+                "ancestor {i} is NOT terminal — a rival state over its funding outpoint could still be co-signed (fail-closed)"
+            ));
+        }
+        // ext spends the funding outpoint; state spends ext.out[0]; both co-signed by A_seg.
+        let ext_tx: Transaction = deserialize(
+            &hex::decode(&seg.extension.signed_tx).map_err(|_| anyhow::anyhow!("ancestor {i}: bad ext hex"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("ancestor {i}: extension is not a transaction"))?;
+        let ein = ext_tx.input.first().ok_or_else(|| anyhow::anyhow!("ancestor {i}: ext has no input"))?;
+        if ext_tx.input.len() != 1
+            || ein.previous_output.txid != fund_txid
+            || ein.previous_output.vout != seg.funding_vout
+        {
+            return Err(anyhow::anyhow!("ancestor {i}: extension does not spend its funding outpoint"));
+        }
+        verify_tier_cosigned(&ext_tx, fund_out.value, &seg_spk)
+            .map_err(|e| anyhow::anyhow!("ancestor {i}: extension not co-signed by its aggregate: {e}"))?;
+        let ext0 = ext_tx.output.first().ok_or_else(|| anyhow::anyhow!("ancestor {i}: ext has no out0"))?.clone();
+        let st_tx: Transaction = deserialize(
+            &hex::decode(&seg.state.signed_tx).map_err(|_| anyhow::anyhow!("ancestor {i}: bad state hex"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("ancestor {i}: state is not a transaction"))?;
+        let sin = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("ancestor {i}: state has no input"))?;
+        if st_tx.input.len() != 1 || sin.previous_output.txid != ext_tx.txid() || sin.previous_output.vout != 0 {
+            return Err(anyhow::anyhow!("ancestor {i}: state does not spend its extension's out[0]"));
+        }
+        verify_tier_cosigned(&st_tx, ext0.value, &seg_spk)
+            .map_err(|e| anyhow::anyhow!("ancestor {i}: state not co-signed by its aggregate: {e}"))?;
+        // CSV bounds for both tiers.
+        for (kind, tx) in [("extension", &ext_tx), ("state", &st_tx)] {
+            let seq = tx.input[0].sequence.0;
+            if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+                return Err(anyhow::anyhow!("ancestor {i} {kind}: not a BIP-68 block relative-timelock"));
+            }
+            let csv = seq as u16;
+            let p = cb.parent.params;
+            let (lo, hi) = if kind == "extension" { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+            if csv < lo || csv > hi {
+                return Err(anyhow::anyhow!("ancestor {i} {kind}: CSV {csv} outside [{lo},{hi}]"));
+            }
+        }
+        // Superseded battery + exact-equality census for this segment (same shared logic as everywhere).
+        let seg_superseded_ok = {
+            let mut prevouts: std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64> = std::collections::HashMap::new();
+            prevouts.insert((fund_txid, seg.funding_vout), fund_out.value);
+            for tx in [&ext_tx, &st_tx] {
+                let id = tx.txid();
+                for (v, o) in tx.output.iter().enumerate() {
+                    prevouts.insert((id, v as u32), o.value);
+                }
+            }
+            let mut live: std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u32> = std::collections::HashMap::new();
+            live.insert((fund_txid, seg.funding_vout), ext_tx.input[0].sequence.0 & 0xFFFF);
+            live.insert((ext_tx.txid(), 0), st_tx.input[0].sequence.0 & 0xFFFF);
+            verify_superseded_segment(
+                &seg.superseded_states,
+                &seg.superseded_extensions,
+                &seg_spk,
+                &cb.parent.params,
+                &mut prevouts,
+                &live,
+            )
+            .map_err(|e| anyhow::anyhow!("ancestor {i}: {e}"))?
+        };
+        let expected = CHILD_V2_BASELINE + 2 + seg_superseded_ok;
+        if facts.num_sigs != expected {
+            return Err(anyhow::anyhow!(
+                "ancestor {i} num_sigs mismatch: SE issued {}, disclosed accounts for {expected} — possible hidden state",
+                facts.num_sigs
+            ));
+        }
+        cur_tx = st_tx;
+    }
+
+    let sp_txid = cur_tx.txid();
+    let sp_out = cur_tx
         .output
         .get(cb.sp_vout as usize)
-        .ok_or_else(|| anyhow::anyhow!("SP has no output {}", cb.sp_vout))?;
+        .ok_or_else(|| anyhow::anyhow!("funding tx has no output {}", cb.sp_vout))?;
 
     // [5] CHILD AGGREGATE AUTHORITY: A_child := SP.out[j].spk (parsed from SP, not declared). The
     //     server's recorded aggregate for child_sid must be non-NULL and == A_child. SP is un-broadcast

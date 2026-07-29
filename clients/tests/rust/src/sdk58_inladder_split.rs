@@ -86,6 +86,7 @@ pub async fn execute() -> Result<()> {
         &cb, &f_spk_hex,
         parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
         child_num_sigs, child_baseline, child_agg.as_deref(),
+        &[],
         &receiver,
     ).map_err(|e| anyhow!("verify_child_bundle REJECTED a valid split child: {e}"))?;
     println!("SDK58 - control: valid split child ACCEPTED (parent terminal; child non-terminal by design).");
@@ -107,7 +108,7 @@ pub async fn execute() -> Result<()> {
     };
     // Convenience: verify_child_bundle with all-valid args (override individual fields per attack).
     let vcb = |p_agg: Option<&str>, p_term: bool, p_ns: u32, c_agg: Option<&str>, c_ns: u32, recv: &str| {
-        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, recv)
+        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, &[], recv)
     };
     let (pa, ca) = (parent_agg.as_deref(), child_agg.as_deref());
 
@@ -137,6 +138,7 @@ pub async fn execute() -> Result<()> {
             &rival, &f_spk_hex,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs + 1, child_baseline, child_agg.as_deref(),
+            &[],
             &receiver,
         );
         ok(r, "I' (child superseded state at a CSV <= the live state's — could out-race the owner)")?;
@@ -155,6 +157,7 @@ pub async fn execute() -> Result<()> {
             &padded, &f_spk_hex,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs + 1, child_baseline, child_agg.as_deref(),
+            &[],
             &receiver,
         );
         ok(r, "I'' (padded child superseded entry, not co-signed by A_child — count padding)")?;
@@ -170,6 +173,7 @@ pub async fn execute() -> Result<()> {
             &spoof, &f_spk_hex,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs, child_baseline, child_agg.as_deref(),
+            &[],
             &receiver,
         );
         ok(r, "J (value-gate spoof: declared out_value > state_child.out[0].value)")?;

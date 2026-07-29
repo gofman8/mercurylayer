@@ -86,11 +86,9 @@ impl UtexoWallet {
             .map(|(index, c)| Candidate {
                 index,
                 amount_sats: c.amount.unwrap_or_default() as u64,
-                splittable: c
-                    .statechain_id
-                    .as_deref()
-                    .map(|s| !child_bundles.contains(s))
-                    .unwrap_or(true),
+                // Children ARE splittable now (child-level in-ladder split, Commit C): a non-exact
+                // payment selecting a child routes to `child_in_ladder_pay` below.
+                splittable: true,
             })
             .collect();
 
@@ -136,7 +134,22 @@ impl UtexoWallet {
                 // the trigger, the piece child pays the recipient (Model A), and the piece bundle is
                 // conveyed directly to their mailbox WITH the standard key handover (the receiver
                 // completes it at claim, so the child is first-class). The change stays with us.
-                if mercuryrustlib::tesr::load(
+                // A received CHILD splits at its own level (its state is replaced by a split state
+                // paying two grandchildren); a root coin splits in-ladder off its trigger.
+                if mercuryrustlib::tesr::load_child(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &split_coin_id,
+                )
+                .await?
+                .is_some()
+                {
+                    let (piece_id, _change_id) = self
+                        .child_in_ladder_pay(&split_coin_id, receiver_address, split_amount)
+                        .await?;
+                    inladder_piece = Some((piece_id, split_amount));
+                    (ids, true)
+                } else if mercuryrustlib::tesr::load(
                     &self.inner.cc,
                     &self.inner.config.wallet_name,
                     &split_coin_id,
@@ -657,6 +670,111 @@ impl UtexoWallet {
     /// child is registered under a latch bound to the invoice and conveyed batch-locked, so the paying
     /// party can identify + census it (`verify_conveyed_child`) before releasing the other leg. The
     /// piece then sits at the same operator-trust bar as the exact-lane `S'` (bounded to the piece; the
+    /// NON-EXACT payment out of a RECEIVED child (a child-level in-ladder split). The child's state is
+    /// replaced by a split state paying two grandchildren — the PIECE to `recipient_address` and the
+    /// CHANGE back to us — and the child becomes an intermediate segment in each grandchild's bundle.
+    /// Returns `(piece_sid, change_sid)`.
+    pub async fn child_in_ladder_pay(
+        &self,
+        child_statechain_id: &str,
+        recipient_address: &str,
+        piece_sats: u64,
+    ) -> Result<(String, String)> {
+        let network = self.inner.config.network.to_string();
+        let cb = mercuryrustlib::tesr::load_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            child_statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("coin {child_statechain_id} is not a received split child"))?;
+
+        // piece + change == the child's split total (ext_child.out[0] − committed fee for 2).
+        let total = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, 2, cb.parent.fee_rate)
+            .ok_or_else(|| anyhow!("committed fee too high to split this child into two"))?;
+        if piece_sats >= total {
+            return Err(anyhow!(
+                "payment {piece_sats} sat leaves no change: splitting this child can pay at most {} sat",
+                total.saturating_sub(1)
+            ));
+        }
+        let change_sats = total - piece_sats;
+        // Same two floors as the root split: a grandchild also funds its own extension + state tier
+        // before it can clear dust, and the child is terminalized BEFORE those are built.
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
+            .max(mercurylib::tesr::min_child_value(cb.parent.fee_rate, DUST_LIMIT));
+        if piece_sats < min_output || change_sats < min_output {
+            return Err(anyhow!(
+                "a child split needs both piece ({piece_sats}) and change ({change_sats}) >= {min_output} sat"
+            ));
+        }
+
+        let mut slot_tokens = self.take_derived_tokens(child_statechain_id, 2).await?;
+        let piece_gc = self.create_child_slot(&slot_tokens.remove(0), piece_sats).await?;
+        let change_gc = self.create_child_slot(&slot_tokens.remove(0), change_sats).await?;
+        let payee = mercurylib::tesr::payee_address(recipient_address, &network)?;
+        let self_change_backup =
+            mercurylib::transaction::get_user_backup_address(&change_gc, network.clone())?;
+
+        let mut child_coin = self
+            .record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(child_statechain_id) && c.duplicate_index == 0)
+            .cloned()
+            .ok_or_else(|| anyhow!("child coin {child_statechain_id} not found"))?;
+
+        let mut grandchildren = vec![
+            (piece_gc.clone(), payee, piece_sats),
+            (change_gc.clone(), self_change_backup, change_sats),
+        ];
+        let bundles = mercuryrustlib::tesr::child_in_ladder_split(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mut child_coin,
+            &cb,
+            &mut grandchildren,
+        )
+        .await?;
+
+        let piece_sid = piece_gc.statechain_id.clone().unwrap_or_default();
+        let change_sid = change_gc.statechain_id.clone().unwrap_or_default();
+        // Convey the piece grandchild (with the standard handover) and keep the change locally.
+        mercuryrustlib::tesr::convey_child_bundle(
+            &self.inner.cc,
+            recipient_address,
+            &grandchildren[0].0,
+            &bundles[0],
+            None,
+        )
+        .await?;
+        mercuryrustlib::tesr::persist_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &bundles[1],
+        )
+        .await?;
+
+        // Book: the spent child is gone, the piece left, the change is a fresh confirmed claim.
+        {
+            let mut record = self.record().await?;
+            for coin in record.coins.iter_mut() {
+                match coin.statechain_id.as_deref() {
+                    Some(sid) if sid == child_statechain_id => coin.status = CoinStatus::WITHDRAWN,
+                    Some(sid) if sid == piece_sid => coin.status = CoinStatus::WITHDRAWN,
+                    Some(sid) if sid == change_sid => {
+                        coin.status = CoinStatus::CONFIRMED;
+                        coin.amount = Some(change_sats as u32);
+                    }
+                    _ => {}
+                }
+            }
+            self.save_record(&record).await?;
+        }
+        Ok((piece_sid, change_sid))
+    }
+
     /// change is self-owned and trustless; no double-recovery, both share `X_m.out[0]`). The 3rd tuple
     /// element is the latch `(batch_id, payment_hash)` (`None` for a plain in-ladder payment):
     ///   * [`InLadderLatch::External`] — PAY: latch to a known merchant-invoice hash.

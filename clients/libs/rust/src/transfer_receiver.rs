@@ -607,8 +607,12 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
         // could be replayed toward a different receiver key.
         if transfer_msg.protocol_version >= 4 {
             use bitcoin::consensus::deserialize;
-            let sp_tx: bitcoin::Transaction =
-                deserialize(&hex::decode(&cb.parent.current().state.signed_tx)?)?;
+            let funding_hex = cb
+                .ancestors
+                .last()
+                .map(|a| a.state.signed_tx.clone())
+                .unwrap_or_else(|| cb.parent.current().state.signed_tx.clone());
+            let sp_tx: bitcoin::Transaction = deserialize(&hex::decode(&funding_hex)?)?;
             let sp_outpoint = mercurylib::transfer::TxOutpoint {
                 txid: sp_tx.txid().to_string(),
                 vout: cb.sp_vout,
@@ -805,7 +809,13 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
 
         // SP.out[j] is the (un-broadcast) funding outpoint of the child.
         use bitcoin::consensus::deserialize;
-        let sp_hex = cb.parent.current().state.signed_tx.clone();
+        // The child's funding tx is the LAST segment above it: the parent's SP for a depth-1 child,
+        // otherwise the deepest intermediate segment's state.
+        let sp_hex = cb
+            .ancestors
+            .last()
+            .map(|a| a.state.signed_tx.clone())
+            .unwrap_or_else(|| cb.parent.current().state.signed_tx.clone());
         let sp_tx: bitcoin::Transaction = deserialize(&hex::decode(&sp_hex)?)?;
         let sp_txid = sp_tx.txid().to_string();
         let sp_out = sp_tx
