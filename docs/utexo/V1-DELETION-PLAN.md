@@ -57,7 +57,7 @@ no key material, and a second independent tower is idempotent).
 
 | Test | Needs |
 |---|---|
-| `sdk17_oor_chain` | the ONE genuine feature gap — first-class children (see `V2-CHILD-FIRSTCLASS.md`, design settled, "Implement"). Both its hops are non-exact and hop 2 re-spends a RECEIVED child, which today is exit-only. |
+| `sdk17_oor_chain` | needs **Commit C** (child-level in-ladder split). Commits A + B LANDED and VERIFIED: a received child is now first-class and re-transferable off-chain whole (`sdk60`: alice→bob→carol, `F` unspent throughout, +1 co-sign and +1 disclosed superseded state per hop, carol exits). sdk17's hop 2 is a NON-EXACT split of a child (10k of bob's 20k), which needs a depth-2 `ancestors` chain in `ChildTesrBundle` — plan §C1-C6. Un-pinned today it fails CLEANLY ("insufficient balance"): the planner refuses to split a child rather than fall through to the B1-unsafe path. |
 | `chaos22_concurrent_users` | the ONLY concurrency test — retiring is invalid. Swap `split_coin`→`in_ladder_pay` in the DAG actions and retarget the `steal_after_split`/`steal_after_send` cheats to the V2 clawback vector (a superseded ladder tier / hidden low-CSV state, the sdk54/55 shape), keeping the oracle's outpoint-single-spender + value-conservation + double-custody invariants. |
 
 ### Doc coverage claims must be repointed when a test dies

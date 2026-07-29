@@ -44,7 +44,14 @@ async fn claim_one(w: &UtexoWallet) -> Result<()> {
 }
 
 pub async fn execute() -> Result<()> {
-    // V2DEF-5: pin V1 — OOR exit timing is V1-specific (V2 ladder exit is multi-step, not one-block); the OOR/off-chain-hop semantics themselves hold under V1. V1-lane regression test under the V2 default.
+    // STILL V1-PINNED — the last one, and the reason is precise. Hop 2 below sends 10 000 of Bob's
+    // 20 000 RECEIVED sub-coin: a NON-EXACT split of a child. Children became first-class on V2
+    // (V2-CHILD-FIRSTCLASS.md Commit B — sdk60 moves a whole child alice->bob->carol off-chain), but a
+    // child-level in-ladder SPLIT needs a depth-2 ancestor chain in the bundle, which is Commit C
+    // (see docs/utexo/V2-CHILD-FIRSTCLASS-PLAN.md §C1-C6). Un-pinned today this fails cleanly with
+    // "insufficient balance" — the planner correctly refuses to split a child rather than falling
+    // through to the B1-unsafe plain split. Do NOT un-pin by making hop 2 a whole-child transfer:
+    // that would silently drop this test'"'"'s partial-second-hop coverage (sdk60 already covers whole).
     std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
