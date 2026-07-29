@@ -156,24 +156,31 @@ async fn steal_after_split(
     let o_vout = coin.utxo_vout.unwrap_or(0);
     let parent_sats = coin.amount_sats;
 
-    // Capture the stale (pre-split) backup for this coin.
-    let backups = match mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, name, &id).await {
-        Ok(b) if !b.is_empty() => b,
-        _ => return,
+    // Capture the coin's CURRENT ladder state BEFORE the split. On V2 this is the clawback vector:
+    // the in-ladder split replaces this state with `SP` over the SAME outpoint (X_m.out[0]) at a
+    // strictly LOWER CSV, so the captured one becomes SUPERSEDED and must lose the maturity race.
+    // (The V1 cheat captured the absolute-locktime backup; TES-R has none — this is its analogue.)
+    let bundle = match mercuryrustlib::tesr::load(cc, name, &id).await {
+        Ok(Some(b)) => b,
+        _ => return, // not a laddered root (e.g. a received child) — nothing to stage here
     };
-    let stale = backups.iter().max_by_key(|b| b.tx_n).unwrap().tx.clone();
-    let stale_txid = match hex::decode(&stale)
-        .ok()
-        .and_then(|raw| electrum_client::bitcoin::consensus::deserialize::<electrum_client::bitcoin::Transaction>(&raw).ok())
-    {
-        Some(tx) => tx.txid().to_string(),
-        None => return,
-    };
+    let stale = bundle.current().state.signed_tx.clone();
+    let stale_txid = bundle.current().state.txid.clone();
 
-    // Legitimately SPLIT the coin — value moves into fresh sub-coins; the captured backup is now stale.
+    // Legitimately SPLIT the coin in-ladder — value moves into fresh children and the captured state
+    // is superseded. Pay ourselves so the cheat needs no peer.
     let piece = rng.gen_range(5_000..(parent_sats / 2).max(5_001));
-    if me.wallet.split_coin(&id, piece).await.is_err() {
-        // Couldn't split (contention); nothing staged, skip quietly.
+    let self_addr = match me.wallet.get_utexo_address().await {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    if me
+        .wallet
+        .in_ladder_pay(&id, &self_addr, piece, mercury_utexo_sdk::transfer::InLadderLatch::None)
+        .await
+        .is_err()
+    {
+        // Couldn't split (contention / floors); nothing staged, skip quietly.
         return;
     }
 
@@ -193,7 +200,7 @@ async fn steal_after_split(
         "result",
         if refused { "refused" } else { "succeeded" },
         json!({
-            "cheat": "stale_branch_after_split",
+            "cheat": "superseded_state_after_split",
             "coin": id,
             "o_txid": o_txid,
             "o_vout": o_vout,

@@ -152,6 +152,15 @@ async fn check_withdrawal(client_config: &ClientConfig, coin: &mut Coin) -> Resu
     }
 
     if txid.is_none() {
+        // A coin can be WITHDRAWING because of a UNILATERAL exit rather than a cooperative one — an
+        // in-ladder split child is routed that way, since its funding `SP.out[j]` is un-broadcast and
+        // there is no confirmed outpoint for a cooperative withdraw to spend. Such a coin has neither
+        // a withdrawal tx NOR a withdrawal address: its progress is tracked by the pre-signed exit
+        // chain, not by watching one txid. Nothing to check here — treating it as an error made every
+        // subsequent status poll fail for the life of the coin.
+        if coin.withdrawal_address.is_none() {
+            return Ok(());
+        }
         return Err(anyhow!("Coin does not have tx_withdraw or tx_cpfp"));
     }
 

@@ -153,6 +153,29 @@ pub fn classify(err: &anyhow::Error) -> Class {
         ("does not fit", "split-fit"),
         ("dust", "dust"),
         ("feetoolow", "dust"),
+        // V2 protocol LIMITS — finite by design, hit legitimately in a long chaos run:
+        //  * replace-by-lower-timelock has finite depth. Each onward hop of a child costs one CSV rung
+        //    (d0 24 -> 18 -> 12 -> 6 = d_floor on regtest); at the floor the coin must be exited or
+        //    re-anchored rather than re-sent. This is the same finite-budget property V1's
+        //    decrementing ladder had, and refusing at the floor is what stops a hop from creating a
+        //    state that cannot out-race the one it replaces.
+        ("at the floor", "csv-floor"),
+        //  * a child too small to split into a viable piece + change (each grandchild must fund its own
+        //    two tiers and clear dust). The refusal happens BEFORE anything is co-signed.
+        ("leaves no change", "split-fit"),
+        // V2 concurrency refusals — the system CORRECTLY refusing a racing action, not a bug:
+        //  * another task spent/transferred the coin first, so it is no longer CONFIRMED. Refusing to
+        //    exit a WITHDRAWN parent is the [B1] guard doing its job (exiting it would invalidate the
+        //    sub-coins its split funded). NOTE this is the "already spent/transferred" refusal, NOT
+        //    the "has a V2 exit ladder and cannot be split" one — that one must stay UNCLASSIFIED so a
+        //    real routing regression still shows up as a breach.
+        ("already been spent/transferred", "raced-spend"),
+        //  * the coin was handed over concurrently and its auth key rotated, so our co-sign is now
+        //    unauthorised. That rotation IS the permanent lockout first-class children rely on.
+        ("signature does not match authentication key", "raced-handover"),
+        //    (the derived-token endpoint words the same refusal differently, and additionally 401s on a
+        //    REPLAYED challenge nonce — audit-[15] single-use auth — which two racing tasks can hit.)
+        ("fresh auth/challenge nonce required", "raced-handover"),
         // Infra contention under heavy concurrency: the request safely FAILED (no state change),
         // so it is expected load-shedding, not a protocol bug.
         ("pool timed out", "pool"),
@@ -232,8 +255,11 @@ async fn refill_tokens(user: &UserHandle, n: usize, bitcoin: &Mutex<()>) {
 // ------------------------------------------------------------------------------------------------
 
 pub async fn execute() -> Result<()> {
-    // V2DEF-5: pin V1 — stresses V1 invalidation/stale-state under concurrency (V2 has different CSV semantics). V1-lane regression test under the V2 default.
-    std::env::set_var("UTEXO_PROTOCOL_DEFAULT", "1");
+    // Runs on the V2 (TES-R) default. The DAG-deepening actions go through the in-ladder split
+    // (`in_ladder_pay` for a laddered root, `child_in_ladder_pay` for a received child), and the
+    // clawback cheat broadcasts a SUPERSEDED ladder state instead of a V1 absolute-locktime backup —
+    // the V2 vector. The oracle's invariants (value conservation, single custody, outpoint
+    // single-spender, no stuck coins) are protocol-agnostic and unchanged.
     let cfg = Cfg::from_env();
     let _ = std::fs::remove_dir_all(&cfg.run_dir);
     std::fs::create_dir_all(&cfg.run_dir)?;
@@ -575,14 +601,30 @@ async fn run_user(
                 let cand = coins.iter().find(|c| c.status == "CONFIRMED" && c.amount_sats > 40_000);
                 let Some(c) = cand else { continue };
                 let Some(id) = c.statechain_id.clone() else { continue };
+                if registry.users.len() < 2 {
+                    continue;
+                }
                 let piece = rng.gen_range(5_000..(c.amount_sats / 2).max(5_001));
+                // V2: a laddered coin cannot be self-split [B1]; the split IS a payment. `in_ladder_pay`
+                // conveys the piece (Model A) to a peer and keeps the change, deepening the DAG at the
+                // receiver — the same structure the old `split_coin` produced locally.
+                let to = loop {
+                    let j = rng.gen_range(0..registry.users.len());
+                    if j != me.idx {
+                        break j;
+                    }
+                };
+                let to_addr = registry.users[to].address.clone();
                 trace.emit(me.idx, "split", "attempt", "start",
-                    json!({ "coin": id, "parent_sats": c.amount_sats, "piece": piece }));
+                    json!({ "coin": id, "parent_sats": c.amount_sats, "piece": piece, "to": to }));
                 let permit = sign_sem.acquire().await.unwrap();
-                let r = me.wallet.split_coin(&id, piece).await;
+                // `transfer` dispatches on the coin's shape: a laddered ROOT goes through
+                // `in_ladder_pay`, a received CHILD through `child_in_ladder_pay`. Calling
+                // `in_ladder_pay` directly would fail on a child ("no TES-R ladder to split").
+                let r = me.wallet.transfer(&to_addr, piece).await;
                 drop(permit);
                 emit_result(&trace, me.idx, "split",
-                    &r.map(|(p, ch)| json!({ "parent_id": id, "piece_id": p, "change_id": ch, "piece": piece })));
+                    &r.map(|tr| json!({ "parent_id": id, "piece": piece, "to": to, "sent": tr.total_sats, "used_split": tr.used_split })));
                 if rng.gen_bool(0.5) {
                     refill_tokens(&me, 4, &bitcoin).await;
                 }
@@ -613,22 +655,43 @@ async fn run_user(
                     let permit = sign_sem.acquire().await.unwrap();
                     let cc = me.wallet.client_config();
                     let name = me.wallet.wallet_name();
-                    let r = mercuryrustlib::transfer_sender::execute(cc, &to_addr, name, &id, None, false, None).await;
+                    // A received in-ladder CHILD has no statechain/backup rows, so
+                    // `transfer_sender::execute` cannot move it — it goes through `child_retransfer`
+                    // (a fresh lower-CSV state + the replaced state disclosed). `wallet.transfer`
+                    // dispatches on exactly that, so route children through it.
+                    let is_child = mercuryrustlib::tesr::load_child(cc, name, &id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    let r = if is_child {
+                        me.wallet.transfer(&to_addr, c.amount_sats).await.map(|_| ())
+                    } else {
+                        mercuryrustlib::transfer_sender::execute(cc, &to_addr, name, &id, None, false, None).await
+                    };
                     drop(permit);
                     match &r {
                         Ok(_) => trace.emit(me.idx, "send", "result", "ok",
                             json!({ "from": me.idx, "to": to, "amount": c.amount_sats, "coin": id, "respend": true })),
                         Err(e) => emit_err(&trace, me.idx, "send", &anyhow!("{e}")),
                     }
-                } else {
+                } else if registry.users.len() >= 2 {
                     let piece = rng.gen_range(5_000..(c.amount_sats / 2).max(5_001));
+                    let to = loop {
+                        let j = rng.gen_range(0..registry.users.len());
+                        if j != me.idx { break j; }
+                    };
+                    let to_addr = registry.users[to].address.clone();
+                    // V2 DEEPEN: `transfer` auto-routes — a laddered ROOT goes through `in_ladder_pay`,
+                    // a received CHILD through `child_in_ladder_pay` (a child-level split, which is
+                    // exactly the depth-2 chain sdk17 exercises). Either way the DAG gains a hop.
                     trace.emit(me.idx, "split", "attempt", "start",
-                        json!({ "coin": id, "parent_sats": c.amount_sats, "piece": piece, "respend": true, "was_offchain": was_offchain }));
+                        json!({ "coin": id, "parent_sats": c.amount_sats, "piece": piece, "respend": true, "was_offchain": was_offchain, "to": to }));
                     let permit = sign_sem.acquire().await.unwrap();
-                    let r = me.wallet.split_coin(&id, piece).await;
+                    let r = me.wallet.transfer(&to_addr, piece).await;
                     drop(permit);
                     emit_result(&trace, me.idx, "split",
-                        &r.map(|(p, ch)| json!({ "parent_id": id, "piece_id": p, "change_id": ch, "piece": piece, "respend": true })));
+                        &r.map(|tr| json!({ "parent_id": id, "piece": piece, "respend": true, "sent": tr.total_sats })));
                 }
                 if rng.gen_bool(0.3) {
                     refill_tokens(&me, 4, &bitcoin).await;

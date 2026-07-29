@@ -215,18 +215,31 @@ pub async fn run(
             let Some(id) = c.statechain_id.clone() else { continue };
             report.live_coins += 1;
             custody.entry(id.clone()).or_default().push(u.idx);
-            // depth proxy + stuck detection use the coin's stored backup chain.
+            // Depth proxy + stuck detection, in TES-R terms. On V2 a coin's exit is its LADDER, not a
+            // V1 backup chain: a root carries a `tesr-` bundle (exit_tiers) and a received child a
+            // `ctesr-` bundle (its ancestors + its own two tiers). A child legitimately has ZERO V1
+            // backup rows (CHILD_V2_BASELINE = 0), so keying "stuck" on an empty backup list alone
+            // would flag every healthy child as money loss.
             let backups = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, name, &id)
                 .await
                 .unwrap_or_default();
-            report.max_branch_depth = report.max_branch_depth.max(backups.len() as u64);
-            if c.off_chain && backups.is_empty() {
-                // A sub-coin with no backup can only be spent co-operatively; if it ALSO can't be
-                // exited, its value is unrecoverable. Triple-confirm before flagging money loss.
+            let tesr_depth = match mercuryrustlib::tesr::load(cc, name, &id).await {
+                Ok(Some(b)) => b.exit_tiers().len() as u64,
+                _ => match mercuryrustlib::tesr::load_child(cc, name, &id).await {
+                    // ancestors × (ext+state) + the leaf's own two tiers + the parent's exit chain.
+                    Ok(Some(cb)) => (cb.ancestors.len() as u64) * 2 + 2 + cb.parent.exit_tiers().len() as u64,
+                    _ => 0,
+                },
+            };
+            report.max_branch_depth = report.max_branch_depth.max(backups.len() as u64).max(tesr_depth);
+            let has_exit_material = !backups.is_empty() || tesr_depth > 0;
+            if c.off_chain && !has_exit_material {
+                // No backup chain AND no ladder: the coin can only be spent co-operatively; if it
+                // ALSO can't be exited, its value is unrecoverable. Triple-confirm before flagging.
                 if u.wallet.estimate_exit_cost(&id).await.is_err() {
                     report.stuck_coins += 1;
                     report.breaches.push(format!(
-                        "MONEY LOSS: user {} holds live off-chain sub-coin {} with NO backup and NO exit path (unrecoverable {} sats)",
+                        "MONEY LOSS: user {} holds live off-chain sub-coin {} with NO backup chain, NO TES-R ladder and NO exit path (unrecoverable {} sats)",
                         u.idx, id, c.amount_sats
                     ));
                 }
