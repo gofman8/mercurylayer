@@ -19,6 +19,16 @@
 //!   broadcasts the trigger, the owner only ever calls `start_background()`, and the coin must still
 //!   exit to the owner's own key.
 //!
+//! * **[C1] the deadline itself was still computed silently.** F3 was hardened at the SHELL (the
+//!   carrier enumeration) but not at the load-bearing INPUT. `deposit_anchored_exit_deadline` was
+//!   built entirely of `.ok()?`, so an unreachable SE config, an unreadable chain lookup or a
+//!   missing deposit-history entry each produced the same `None` a flat coin produces — and `None`
+//!   means "no deadline", so `auto_exit_due` SKIPPED the coin. The watcher could still conclude
+//!   "nothing is due" from a total inability to tell. PART C drives a REAL uncomputable deadline (a
+//!   branch whose root spends an outpoint that is not on-chain) and proves the coin is reported
+//!   BLIND through the same `WatchtowerBlind` + retained-fault machinery — while a genuinely
+//!   deadline-free flat coin (C1's control) stays quiet.
+//!
 //! Run: SDK_E2E=72 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
 use std::time::Duration;
@@ -50,6 +60,7 @@ pub async fn execute() -> Result<()> {
     let _ = std::fs::remove_dir_all("./rgb-data-sdk72_blind");
     let _ = std::fs::remove_file("./rgb-data-sdk72_blind");
     let _ = std::fs::remove_dir_all("./rgb-data-sdk72_alice");
+    let _ = std::fs::remove_dir_all("./rgb-data-sdk72_carol");
     std::env::set_var("ML_NETWORK", "regtest");
 
     let cc = mercuryrustlib::client_config::load().await;
@@ -248,10 +259,200 @@ pub async fn execute() -> Result<()> {
         alice.watchtower_faults().await
     );
 
+    // ================================================================================ PART C [C1]
+    // The load-bearing INPUT, not the shell. PART A proved the pass is loud when the CARRIER
+    // ENUMERATION fails. This proves it is loud when the DEADLINE COMPUTATION fails — the step the
+    // previous round left silent.
+    //
+    // `deposit_anchored_exit_deadline` was built entirely of `.ok()?`: an unreachable SE config, an
+    // unreadable chain lookup, or a missing deposit-history entry each yielded `None` — the SAME
+    // `None` a flat coin with genuinely no deadline yields. `auto_exit_due` then read that as
+    // "nothing is due" and SKIPPED the coin, i.e. concluded the wallet was safe from a total
+    // inability to tell. This is precisely the protection a received RGB token depends on.
+    //
+    // The fault is real, not mocked: the coin is given an exit BRANCH whose root spends a funding
+    // outpoint that does not exist on-chain, so the chain lookup inside the deadline computation
+    // genuinely fails. Nothing in the SDK is stubbed.
+    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk72_carol"), None).await?;
+    let mut crx = carol.subscribe();
+
+    let token = mercuryrustlib::deposit::get_token(&cc).await?;
+    let t = crate::utils::handle_token_response(&cc, &token).await?;
+    carol.add_prepaid_token(&t).await;
+    let caddr = carol.get_deposit_address(amount as u64).await?;
+    bitcoin_core::sendtoaddress(amount, &caddr)?;
+    bitcoin_core::generatetoaddress(3, &core)?;
+    let mut cconfirmed = false;
+    for _ in 0..60 {
+        carol.claim().await?;
+        if carol.get_balance().await?.available_sats >= amount as u64 {
+            cconfirmed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(cconfirmed, "C: deposit did not confirm");
+    let csid = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk72_carol")
+        .await?
+        .coins
+        .iter()
+        .find(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+        .and_then(|c| c.statechain_id.clone())
+        .ok_or(anyhow!("C: no confirmed coin"))?;
+
+    // C1. CONTROL — the "genuinely no deadline" shape. A flat on-chain coin has no exit branch, so
+    //     no ancestor can race it. `None` here is a real answer and the pass must stay QUIET; if
+    //     this half regressed into an alert, the fix would be worthless (every wallet would cry
+    //     wolf and the signal would be ignored).
+    let est = carol.estimate_exit_cost(&csid).await?;
+    assert_eq!(est.branch_txs, 0, "C1: a fresh deposit is flat — no exit branch");
+    assert!(est.exit_deadline_block.is_none(), "C1: a flat coin has no exit deadline");
+    assert!(
+        !est.deadline_is_unknown(),
+        "C1: a flat coin's absent deadline is SAFE, not blind — it must not be reported as blindness"
+    );
+    let quiet = carol
+        .auto_exit_due(288)
+        .await
+        .map_err(|e| anyhow!("C1: a wallet of flat coins is genuinely idle, not blind: {e}"))?;
+    assert!(quiet.is_empty(), "C1: nothing is due on a fresh flat deposit");
+    assert!(
+        !carol.is_watchtower_blind().await,
+        "C1: a verified-idle pass retains no fault: {:?}",
+        carol.watchtower_faults().await
+    );
+    let _ = drain(&mut crx);
+    println!("SDK72 - C1 control: a flat coin's absent deadline stays quiet (no false alarm)");
+
+    // C2. THE FAULT. Give the coin an exit branch whose ROOT spends a funding outpoint that is not
+    //     on-chain — the shape of every real cause (SE config unreachable, electrum down, deposit
+    //     not yet in the address history): the coin definitely HAS a deadline and definitely CAN be
+    //     raced, and the deadline definitely cannot be computed.
+    {
+        use electrum_client::bitcoin::{consensus, Transaction, Txid};
+        use std::str::FromStr;
+        let real = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk72_carol", &csid)
+            .await?;
+        let latest = real
+            .iter()
+            .max_by_key(|b| b.tx_n)
+            .ok_or(anyhow!("C2: no backup tx to build a branch from"))?;
+        let mut tx: Transaction = consensus::deserialize(&hex::decode(&latest.tx)?)?;
+        // A valid, well-formed transaction (so vsize accounting still works and the failure is
+        // ISOLATED to the chain lookup) that spends a funding outpoint nobody has ever seen.
+        tx.input[0].previous_output.txid = Txid::from_str(
+            "dead00000000000000000000000000000000000000000000000000000000beef",
+        )?;
+        let fake = mercurylib::wallet::BackupTx {
+            tx_n: 1,
+            tx: hex::encode(consensus::serialize(&tx)),
+            client_public_nonce: latest.client_public_nonce.clone(),
+            server_public_nonce: latest.server_public_nonce.clone(),
+            client_public_key: latest.client_public_key.clone(),
+            server_public_key: latest.server_public_key.clone(),
+            blinding_factor: latest.blinding_factor.clone(),
+            rgb_consignment: None,
+            rgb_blinding: None,
+        };
+        mercuryrustlib::sqlite_manager::insert_or_update_backup_txs(
+            &cc.pool,
+            "sdk72_carol",
+            &format!("branch-{csid}"),
+            &vec![fake],
+        )
+        .await?;
+    }
+
+    // C3. The two shapes are INDISTINGUISHABLE by `exit_deadline_block` alone — that is the whole
+    //     defect — so the estimate must carry the distinction explicitly.
+    let est = carol.estimate_exit_cost(&csid).await?;
+    assert_eq!(est.branch_txs, 1, "C3: the coin now has an exit branch, so a deadline exists");
+    assert_eq!(
+        est.exit_deadline_block, None,
+        "C3: same Option value as the flat coin in C1 — proving the old encoding could not tell \
+         'no deadline' from 'I could not compute one'"
+    );
+    assert!(
+        est.deadline_is_unknown(),
+        "C3 [C1] REGRESSION: an uncomputable deadline on a branch-bearing coin must be reported as \
+         BLIND; it is reported as a plain absent deadline, which every consumer reads as 'safe'"
+    );
+    println!(
+        "SDK72 - C3 uncomputable deadline surfaced: {}",
+        est.exit_deadline_blind.clone().unwrap_or_default()
+    );
+
+    // C4. THE FINDING. The near-deadline pass must NOT conclude "nothing is due".
+    let pass = carol.auto_exit_due(288).await;
+    let cerr = match pass {
+        Ok(acted) => {
+            return Err(anyhow!(
+                "C4 [C1] REGRESSION: auto_exit_due returned Ok({acted:?}) while it could not \
+                 compute {csid}'s exit-race deadline — the watcher is reporting 'nothing is due' \
+                 from an inability to tell, which is exactly what a received RGB token's clawback \
+                 protection hangs on"
+            ))
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        cerr.contains("BLIND") && cerr.contains(&csid),
+        "C4: the error must name the blind coin, got: {cerr}"
+    );
+    println!("SDK72 - C4 auto_exit_due refused: {cerr}");
+
+    // C5. It is LOUD and RETAINED — routed into the SAME WatchtowerBlind / WatchtowerFault
+    //     machinery PART A exercises, not into a bespoke channel an app would have to learn about.
+    let cevs = drain(&mut crx);
+    assert!(
+        cevs.iter().any(|e| matches!(
+            e,
+            WalletEvent::WatchtowerBlind { pass, .. } if *pass == WatchtowerPass::AutoExit
+        )),
+        "C5 [C1]: an uncomputable deadline must emit WatchtowerBlind{{AutoExit}}; got {cevs:?}"
+    );
+    let cfaults = carol.watchtower_faults().await;
+    assert_eq!(cfaults.len(), 1, "C5: exactly one blind pass, got {cfaults:?}");
+    assert_eq!(cfaults[0].pass, WatchtowerPass::AutoExit, "C5: AutoExit is the blind pass");
+    assert!(carol.is_watchtower_blind().await, "C5: the wallet reports itself blind");
+    println!("SDK72 - C5 retained fault: {:?}", cfaults[0]);
+
+    // C6. The OTHER consumer of the same deadline fails closed too: a keyless watch bundle that
+    //     silently omitted this coin would hand a watchtower a bundle that protects nothing, and
+    //     the export would still report success.
+    let bundle_out = carol.export_watch_bundle().await;
+    assert!(
+        bundle_out.is_err(),
+        "C6 [C1]: export_watch_bundle must refuse to omit a coin whose deadline is unknown"
+    );
+    println!("SDK72 - C6 export_watch_bundle refused: {}", bundle_out.unwrap_err());
+
+    // C7. RECOVERY — not a one-way latch. Restore the coin to its genuinely branch-free shape; the
+    //     next pass must go quiet again and CLEAR the retained fault.
+    mercuryrustlib::sqlite_manager::insert_or_update_backup_txs(
+        &cc.pool,
+        "sdk72_carol",
+        &format!("branch-{csid}"),
+        &Vec::new(),
+    )
+    .await?;
+    let quiet = carol
+        .auto_exit_due(288)
+        .await
+        .map_err(|e| anyhow!("C7: the pass must succeed once the coin is flat again: {e}"))?;
+    assert!(quiet.is_empty(), "C7: nothing due");
+    assert!(
+        !carol.is_watchtower_blind().await,
+        "C7: a pass that saw everything clears the retained fault: {:?}",
+        carol.watchtower_faults().await
+    );
+    println!("SDK72 - ✓ PART C: uncomputable deadline ⇒ BLIND (never 'nothing due'); repaired ⇒ cleared");
+
     println!(
         "SDK72 - ✓ PASS: [F3] a blind watcher reports Err + WatchtowerBlind + a retained fault \
          (never a manufactured empty carrier set); [F2] start_background() alone defended a hostile \
-         trigger and raced {exit_value} sat to the owner's key"
+         trigger and raced {exit_value} sat to the owner's key; [C1] an UNCOMPUTABLE exit-race \
+         deadline is reported as BLIND while a genuinely absent one stays quiet"
     );
     Ok(())
 }

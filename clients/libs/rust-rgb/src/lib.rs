@@ -37,6 +37,56 @@ use rgb_lib::{
     Assignment, AssetSchema, BitcoinNetwork, ConsignmentExt, ContractId, FileContent, RgbTransport,
 };
 
+/// Why an off-chain consignment validation did not come back valid.
+///
+/// This MIRRORS the taxonomy the rgb-lib fork already publishes and does not invent a new one.
+/// `rgb_lib::wallet::rust_only::validate_consignment_offchain_chain` matches on rgbstd's
+/// `ValidationError` and reports the arm in `ValidateConsignmentResult::error`:
+///
+/// * `Err(ValidationError::InvalidConsignment(_))` -> `error = Some("invalid")` — the consignment
+///   itself does not validate. Re-running it a thousand times cannot change that verdict.
+/// * `Err(ValidationError::ResolverError(_))`      -> `error = Some("resolver")` — validation never
+///   reached a verdict because a witness could not be resolved (indexer / electrum / esplora down,
+///   timing out, rate-limiting, mid-reorg). The consignment may well be perfectly good.
+///
+/// Both arms set `valid: false`, so a caller that reads only the boolean treats a five-second
+/// network blip as proof of forgery. Anything that acts irreversibly on "invalid" — above all the
+/// claim path, which UN-QUARANTINES the coin and thereby throws away its RGB protection for good —
+/// must branch on this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationVerdict {
+    /// The consignment validated.
+    Valid,
+    /// A real, reproducible verdict of INVALID from the RGB validator. Permanent.
+    PermanentlyInvalid,
+    /// No verdict was reached: a witness could not be resolved. Transient — retry later.
+    Unresolved,
+}
+
+impl ValidationVerdict {
+    /// Map one `ValidateConsignmentResult` (`valid` + `error` tag) onto this enum.
+    ///
+    /// Fails CLOSED on anything unrecognised: an `error` tag this bridge does not know is treated as
+    /// [`Self::Unresolved`], i.e. transient. That is the safe direction — a caller keeps retrying and
+    /// keeps its quarantine — whereas guessing `PermanentlyInvalid` would irreversibly discard
+    /// protection on the strength of a string this code has never seen before. If rgb-lib ever gains
+    /// a third *permanent* arm, it must be added here explicitly.
+    pub fn from_rgb_lib(valid: bool, error: Option<&str>) -> Self {
+        if valid {
+            return Self::Valid;
+        }
+        match error {
+            Some("invalid") => Self::PermanentlyInvalid,
+            _ => Self::Unresolved,
+        }
+    }
+
+    /// True only for a verdict that may be acted on irreversibly.
+    pub fn is_permanently_invalid(self) -> bool {
+        matches!(self, Self::PermanentlyInvalid)
+    }
+}
+
 /// The witness txid of every bundle carried by `consignment_base64`, in the consignment's own
 /// bundle order.
 ///
@@ -590,12 +640,17 @@ impl RgbWallet {
 
     /// Structured off-chain chain validation for SDK receivers: like
     /// [`Self::validate_offchain_chain`] but also returning the consignment's verified contract
-    /// id (only meaningful when valid).
+    /// id (only meaningful when valid) AND — critically — *why* a non-valid verdict came back.
+    ///
+    /// The boolean alone is not enough for the receiver: rgb-lib reports `valid == false` both for a
+    /// consignment that is cryptographically broken (permanent) and for one it simply could not
+    /// resolve because the indexer/electrum backend was unreachable (transient). Collapsing the two
+    /// makes a network blip look exactly like a griefer's garbage. See [`ValidationVerdict`].
     pub fn validate_offchain_chain_info(
         &self,
         consignment_base64: &str,
         txids: &[String],
-    ) -> Result<(bool, Option<String>, Option<String>)> {
+    ) -> Result<(ValidationVerdict, Option<String>, Option<String>)> {
         let bytes = STANDARD
             .decode(consignment_base64)
             .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
@@ -614,9 +669,13 @@ impl RgbWallet {
         let detail = if res.valid {
             res.warnings.map(|w| w.join("; "))
         } else {
-            res.details.or(res.error)
+            res.details.or_else(|| res.error.clone())
         };
-        Ok((res.valid, detail, res.contract_id))
+        Ok((
+            ValidationVerdict::from_rgb_lib(res.valid, res.error.as_deref()),
+            detail,
+            res.contract_id,
+        ))
     }
 
     pub fn validate_offchain_chain(

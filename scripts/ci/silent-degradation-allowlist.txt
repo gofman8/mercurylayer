@@ -1,0 +1,386 @@
+# ================================================================================================
+# ALLOWLIST for scripts/ci/deny-silent-degradation.sh — the SILENT-DEGRADATION class.
+# ================================================================================================
+#
+# Every line below is a swallow site that has been READ and whose FAILURE DIRECTION has been
+# decided. The question that decides it, and the only one that matters:
+#
+#     if this expression fails, does the code end up doing MORE WORK or LESS PROTECTION?
+#
+# MORE WORK is fine (re-attempting an idempotent booking, quarantining a coin, rejecting a transfer,
+# throttling a faucet, returning a too-low estimate that makes MORE coins eligible). LESS PROTECTION
+# is the bug this repo keeps re-growing: an empty carrier set that reads as "no carriers to
+# protect", an empty UTXO vector that reads as "spent", an absent deadline that reads as "nothing
+# due", an empty branch-witness set that reads as "no exit branch to broadcast".
+#
+# FORMAT  (TAB-separated; the reason MUST be a `#` comment directly above the entry)
+#
+#     # <why this one is safe, in terms of the direction it fails toward>
+#     <count><TAB><path from repo root><TAB><pattern-id><TAB><the normalised source line>
+#
+# `count` is how many times that exact line appears in that file. A SECOND identical swallow in the
+# same file is a new site and fails the guard until the count is raised deliberately.
+#
+# Keyed on the normalised LINE, not the line number, so unrelated edits above it do not churn this
+# file and two sessions editing one file do not collide.
+#
+# Regenerate the data lines (NOT the reasons) with:  SD_DUMP=1 scripts/ci/deny-silent-degradation.sh
+#
+# ------------------------------------------------------------------------------------------------
+# Some entries below are marked `⚠️ SUSPECT`. They are allowlisted ONLY so this guard reflects the
+# tree exactly as it stands today — they are NOT endorsed, and every one of them lives in a file
+# another session owns this round. Each says what is wrong with it. Do not copy their shape; grep
+# this file for `SUSPECT` before starting the next round.
+# ------------------------------------------------------------------------------------------------
+
+# ================================================================================================
+# clients/libs/rust-sdk — wallet SDK
+# ================================================================================================
+# Unit-test probe of the split-amount model's REFUSAL boundary. `.is_err()` here is the property
+# being asserted, not a classifier taking a lenient branch. (Only reached the guard because the
+# assert! macro spans several lines, so the `assert` filter did not see it on this line.)
+1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts(2_129, TOKEN_PIECE_SATS).is_err(),
+#
+# Same: unit-test refusal-boundary probe.
+1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts(959, DUST_LIMIT).is_err(),
+#
+# Same: unit-test refusal-boundary probe.
+1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts_floored(1_100, floor, floor).is_err(),
+#
+# Same: unit-test refusal-boundary probe.
+1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts_floored(2_000, piece, floor).is_err(),
+#
+# Unit test asserting that calculate_block_height UNDERFLOW-PANICS under overflow checks — the
+# `.is_err()` is on a catch_unwind result and IS the assertion.
+1	clients/libs/rust-sdk/src/invalidation_model.rs	is_err-classifier	caught.is_err(),
+#
+# auto_refresh_due()'s fee-estimation fallback, used ONLY to compute `refresh_fee`, which is a
+# LOWER BOUND filter (`amount > refresh_fee`) on which coins to attempt. 1.0 sat/vB is the
+# floor, so a failed estimate lets MORE coins into the due list, not fewer. The real fee is
+# computed inside reanchor(); a coin that cannot cover it fails there and is skipped. More work.
+1	clients/libs/rust-sdk/src/refresh.rs	await-unwrap_or	let rate = crate::transfer::backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
+#
+# reanchor() reading back `tx_withdraw` for the RefreshResult.refresh_txid REPORTING field, after
+# the withdraw has already succeeded. An empty txid string is cosmetic: the re-anchor is done and
+# the fresh coin is tracked by statechain_id, not by this string. No protection decision reads it.
+1	clients/libs/rust-sdk/src/refresh.rs	chain-after-await	.unwrap_or_default();
+#
+# PER-COIN skip inside the auto_refresh_due maintenance loop, NOT a pass-level swallow (the
+# pass-level one at the carrier enumeration was the round-4 fix — it now returns Err). One coin
+# failing must not abandon the other coins, the loop re-runs on the very next watcher poll, and
+# the coin's DEADLINE protection is auto_exit_due, not this pass. Fails toward retry.
+# KNOWN GAP, deliberately not closed here: a permanently failing coin is skipped forever and
+# silently. Closing it properly needs a `WatchtowerPass::AutoRefresh` variant in events.rs so it
+# can go through note_watchtower_blind() like the other two passes; events.rs is owned by another
+# session this round. Tracked in the round report.
+1	clients/libs/rust-sdk/src/refresh.rs	err-continue	Err(_) => continue,
+#
+# Unit test in `absence_vs_unreadable_tests` asserting that read_backup_rows returns Err (not an
+# empty vector) for an unreadable database — i.e. a test OF this very class. The assertion itself.
+1	clients/libs/rust-sdk/src/tokens.rs	is_err-classifier	out.is_err(),
+#
+# backup_bundle(): reading the optional `rgb.mnemonic` file into the recovery bundle. Absent or
+# unreadable -> the bundle carries no RGB mnemonic, which is the correct value for a non-token
+# wallet and is the pre-existing behaviour for a token wallet whose mnemonic the user stores
+# elsewhere. It cannot make the wallet believe a coin is safe. Ordinary Option-shaped optionality.
+1	clients/libs/rust-sdk/src/wallet.rs	chain-after-await	.ok()
+#
+# Inside the in-crate #[cfg(test)] fake-Electrum stub: a broken pipe ends that connection's echo
+# loop. Test scaffolding, no production path, and it fails toward closing the socket.
+1	clients/libs/rust-sdk/src/watchtower.rs	is_err-classifier	if stream.write_all(resp.as_bytes()).is_err() {
+#
+
+# ================================================================================================
+# clients/libs/rust-sdk/src/ssp.rs — SSP + Lightning client
+# ================================================================================================
+# ⚠️ SUSPECT — the opening line of the `asset_before` snapshot of the RGB post-payment backstop;
+# the guard sees the same chain twice, so the full verdict is written on the sibling entry
+# `chain-after-await  .unwrap_or(0);` in this same file. Short version: a failed balance read
+# yields before=0, which makes the later short-pay check pass trivially — it DISABLES the
+# backstop instead of tripping it.
+1	clients/libs/rust-sdk/src/ssp.rs	await-ok	self.wallet.get_token_balances().await.ok().and_then(|bs| {
+#
+# RLN HTTP helper: an unparseable body becomes Null purely so the NON-success branch can quote
+# something in its error. The status code, not the body, decides success — `if !status
+# .is_success() { return Err(..) }` is the next line. A garbled 200 yields Null to the caller,
+# which every caller then fails to destructure. Never turns a failure into a success.
+1	clients/libs/rust-sdk/src/ssp.rs	await-unwrap_or	let v: Value = resp.json().await.unwrap_or(Value::Null);
+#
+# Same shape in the ssp HTTP helper: the body is read only to build the error detail; the status
+# code gates success.
+1	clients/libs/rust-sdk/src/ssp.rs	await-unwrap_or_default	let text = resp.text().await.unwrap_or_default();
+#
+# Two sites, both the RGB post-payment backstop's balance reads. The AFTER read (pay_invoice
+# post-claim) is safe in the strong sense: a failed read yields 0, and `after < before + owed`
+# is then trivially TRUE, so the swap is reported as SHORT-PAID and the call returns Err. Fails
+# toward accusing the SSP, i.e. toward strictness. The BEFORE read (the `asset_before` snapshot,
+# entries `await-ok` and `chain-after-await .unwrap_or(0);` in this same file) is NOT safe — see
+# its own ⚠️ SUSPECT note.
+2	clients/libs/rust-sdk/src/ssp.rs	chain-after-await	.ok()
+#
+# largest_laddered_coin_for_pay(): an unreadable wallet row yields None = 'no laddered coin big
+# enough to auto-route this pay', so the caller refuses to route instead of routing a coin it
+# could not read. Fails toward refusing the payment.
+1	clients/libs/rust-sdk/src/ssp.rs	chain-after-await	.ok()?;
+#
+# invoice_status(): a response with no `status` field reports the literal "Unknown". Callers
+# poll for the exact string "Paid"/"Settled", so "Unknown" keeps them WAITING rather than
+# concluding settlement. Fails toward not-yet-paid.
+1	clients/libs/rust-sdk/src/ssp.rs	chain-after-await	.unwrap_or("Unknown")
+#
+# ⚠️ SUSPECT — the `asset_before` half of the RGB post-payment backstop (its other line is the
+# `await-ok` entry in this same file). A failed balance read yields 0, and
+# the later check `after < asset_before + asset_amount` then reduces to `after < asset_amount`,
+# which a wallet that already held the asset passes trivially. So a transient RGB read failure
+# DISABLES the post-payment short-pay backstop instead of tripping it — a swallow that fails
+# toward less protection, in a check whose whole purpose is to catch a short-paid RGB invoice.
+# ssp.rs is outside this session's file scope; reported, not edited. The AFTER read still fails
+# closed, so the backstop is weakened, not removed.
+1	clients/libs/rust-sdk/src/ssp.rs	chain-after-await	.unwrap_or(0);
+#
+# The in-ladder-split LN pay ROLLBACK trigger: on a failed pay it restores the parent as
+# exitable and drops the optimistic bookings. `.is_err()` is the right classifier here precisely
+# because EVERY failure cause must roll back; the error itself is returned to the caller
+# immediately after (`paid` is the return value, not discarded). Fails toward undoing the split.
+1	clients/libs/rust-sdk/src/ssp.rs	is_err-classifier	if paid.is_err() {
+#
+# Same site, matched by the single-line `.ok()?` pattern as well.
+1	clients/libs/rust-sdk/src/ssp.rs	ok-question	.ok()?;
+#
+
+# ================================================================================================
+# clients/libs/rust — mercuryrustlib
+# ================================================================================================
+# Two sites (the two constructors). 'cannot tell whether the sqlite file exists' -> assume it
+# does NOT and call create_database, which is a no-op-or-error on an existing file. Fails toward
+# attempting creation, and any real fault surfaces from create_database/connect on the next line.
+2	clients/libs/rust/src/client_config.rs	await-unwrap_or	if !Sqlite::database_exists(&database_file).await.unwrap_or(false) {
+#
+# `settings.get_string("tor_proxy")` — an ABSENT optional config key is reported as Err by the
+# config crate, so this arm IS the 'key not set' case. None = no Tor proxy = direct connection,
+# the documented default. Every other key in this function is `.unwrap()`ed and would panic.
+1	clients/libs/rust/src/client_config.rs	err-empty	Err(_) => None,
+#
+# Parsing `statechain_ids` out of the SE's latch response: the non-200 case has already returned
+# Err above, so this only fires on a 200 whose JSON lacks the array. An empty id list makes the
+# caller believe NOTHING was latched, which is the conservative reading of a malformed success —
+# and the endpoint that consumes it (unlock_by_preimage) now refuses to report Success on an
+# empty batch (review M3).
+1	clients/libs/rust/src/lightning_latch.rs	chain-after-await	.unwrap_or_default();
+#
+# A `.filter()` predicate over backup rows: `get_previous_outpoint(b)` failing to parse a row
+# means that row is NOT one of this coin's backups, so it is excluded. An unparseable row must
+# not be admitted into a coin's backup history. Fails toward excluding unknown material.
+1	clients/libs/rust/src/rgb.rs	chain-after-await	.unwrap_or(false)
+#
+# Unit test asserting the precheck REJECTS a mismatched binding. This is the assertion, not a
+# classifier. (Note the historical bug this same file documents: production code that used
+# `precheck(..).is_err()` to license the flat lane on ANY error cause was the defect, and it has
+# been replaced by a typed cause — that call site is gone, only the test remains.)
+1	clients/libs/rust/src/tesr.rs	is_err-classifier	ladder_binding_precheck("sid", "zz", Some(OTHER_XONLY), "regtest").is_err(),
+#
+# Two sites in get_pending_transfers: (a) a mailbox address we cannot fetch, (b) a message whose
+# backup vector will not split into groups ([R3] — this used to PANIC on attacker-controlled
+# input). Both DROP an unparseable inbound offer rather than surfacing it as a payable pending
+# transfer with invented fields. Fails toward not showing the user a transfer.
+2	clients/libs/rust/src/transfer_receiver.rs	err-continue	Err(_) => continue,
+#
+# A mailbox holds messages for many auth keys; a message this key cannot decrypt is simply not
+# ours. Skipping it is the protocol, not a swallow.
+1	clients/libs/rust/src/transfer_receiver.rs	err-continue	Err(_) => continue, // not addressed to us / undecryptable
+#
+# Two sites: the DISPLAYED amount of a pending transfer when tx0 cannot be read on-chain or is
+# not trusted. 0 is the pessimistic value — the SSP's pre-pay value gate (check_latched_coins)
+# and the receiver both REFUSE a coin whose amount does not cover the quote, so a 0 rejects the
+# transfer. Fails toward rejecting.
+2	clients/libs/rust/src/transfer_receiver.rs	err-empty	Err(_) => 0,
+#
+# Same function: 'could not establish that this funding tx is trusted/on-chain' -> not trusted.
+# Fails toward distrust.
+1	clients/libs/rust/src/transfer_receiver.rs	err-empty	Err(_) => false,
+#
+# Two sites (existing coin / new coin): a message that fails validation is logged and SKIPPED —
+# the coin is not accepted. Fails closed.
+2	clients/libs/rust/src/transfer_receiver.rs	is_err-classifier	if is_msg_valid.is_err() {
+#
+# Two sites: a message that fails processing is logged and SKIPPED. Fails closed.
+2	clients/libs/rust/src/transfer_receiver.rs	is_err-classifier	if message_result.is_err() {
+#
+# Cannot derive the initialized-state coin -> skip the message. Fails closed.
+1	clients/libs/rust/src/transfer_receiver.rs	is_err-classifier	if new_coin.is_err() {
+#
+# Signature-scheme validation: returns Err to the caller (rejects the transfer). Fails closed.
+1	clients/libs/rust/src/transfer_receiver.rs	is_err-classifier	if previous_lock_time.is_err() {
+#
+# Unit test asserting the D1 non-tree-branch rejection fires. The assertion itself.
+1	clients/libs/rust/src/transfer_receiver.rs	is_err-classifier	reject_non_tree_branch(&[de(&dup_input_tx)]).is_err(),
+#
+# Same unit test, the two-input case.
+1	clients/libs/rust/src/transfer_receiver.rs	is_err-classifier	reject_non_tree_branch(&[de(&tx_hex_with_inputs(1)), de(&tx_hex_with_inputs(1))]).is_err(),
+#
+# Body of the coordinator's transfer/sender response, read only to build the message. The
+# non-success branch returns Err either way; a body we cannot read cannot become a success.
+1	clients/libs/rust/src/transfer_sender.rs	await-unwrap_or	let text = response.text().await.unwrap_or("Unexpected error".to_string());
+#
+# read_raw_backup_row(): an unreadable backup table yields None = 'no such raw row'. Its two
+# callers (tesr-<sid>, ladderskip-<sid>) treat None as 'this coin has no recorded TES-R bundle /
+# no recorded skip reason', which routes the coin down the CONSERVATIVE flat lane rather than
+# asserting a ladder that may not exist.
+1	clients/libs/rust/src/transfer_sender.rs	chain-after-await	.ok()?
+#
+# ⚠️ SUSPECT — TWO sites in the transfer-sender payload build: `branch-<id>` (the exit branch the
+# RECEIVER needs to unilaterally exit the sub-coin) and `parents-<id>` (the terminal-ancestor ids
+# the receiver must verify). A DB read error sends an EMPTY branch / EMPTY parent list, and the
+# receiver's own checks then have nothing to reject — the coin arrives looking flat and
+# ancestor-free. This is the round-3 'empty branch-witness set' shape at the SENDER. It is not
+# exploitable by the sender for free (an empty branch means the receiver cannot exit, so the
+# sender loses the payment too), which is why it is a latent correctness bug rather than a theft
+# vector — but it must fail closed. transfer_sender.rs is not in this session's file scope.
+2	clients/libs/rust/src/transfer_sender.rs	chain-after-await	.unwrap_or_default();
+#
+# Same site, matched by the single-line pattern too.
+1	clients/libs/rust/src/transfer_sender.rs	ok-question	.ok()?
+#
+# ladder-skip REASON string parsing (a diagnostic shown to the user as WalletEvent::LadderSkipped).
+# Unparseable -> no reason reported. Cosmetic; no spend decision reads it.
+1	clients/libs/rust/src/transfer_sender.rs	ok-question	let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+#
+
+# ================================================================================================
+# clients/libs/rust-rgb — rgb-lib wrapper
+# ================================================================================================
+# Two sites, both parsing a caller-supplied "txid:vout" string inside a filter_map. An
+# unparseable vout drops that outpoint from the list passed to rgb-lib. Both callers
+# (spend-outpoint marking and mark_spent) act on outpoints they themselves constructed, so a
+# parse failure is a programming error, and dropping is safer than fabricating a vout.
+2	clients/libs/rust-rgb/src/lib.rs	ok-question	Some(Outpoint { txid: t.to_string(), vout: v.parse().ok()? })
+#
+
+# ================================================================================================
+# lib/ — mercurylib protocol core
+# ================================================================================================
+# Same gauntlet: blinded-MuSig scheme validation. Rejects.
+1	lib/src/transfer/receiver.rs	is_err-classifier	if is_blinded_musig_scheme_valid.is_err() {
+#
+# verify_transfer_signature and friends: each `.is_err()` REJECTS the incoming transfer. These
+# five are the receiver's validation gauntlet — every one of them fails closed by construction.
+1	lib/src/transfer/receiver.rs	is_err-classifier	if is_signature_valid.is_err() {
+#
+# Same gauntlet: the backup tx must reconstruct byte-for-byte. Rejects.
+1	lib/src/transfer/receiver.rs	is_err-classifier	if reconstruct_transaction(&backup_tx.tx).is_err() {
+#
+# Same gauntlet: locktime / version / output-count validation. Rejects.
+1	lib/src/transfer/receiver.rs	is_err-classifier	if verify_if_locktime_is_reasonable_tx_version_and_output_size(&backup_tx.tx, current_blockheight, lockheight_init).is_err() {
+#
+# Same gauntlet: nSequence validation. Rejects.
+1	lib/src/transfer/receiver.rs	is_err-classifier	if verify_transaction_sequence(&backup_tx.tx).is_err() {
+#
+# ECIES encryption of the transfer message failed -> return MercuryError::SecpError. The transfer
+# does not happen. Fails closed.
+1	lib/src/transfer/sender.rs	is_err-classifier	if encrypted_msg.is_err() {
+#
+# Same filter_map, the consensus-deserialize half.
+1	lib/src/wallet/cpfp_tx.rs	ok-question	let tx: Transaction = bitcoin::consensus::deserialize(&tx_bytes).ok()?;
+#
+# latest_backup_tx_pays_to_user_pubkey()'s filter_map: a backup row whose hex will not decode is
+# not a candidate for CPFP. Dropping an undecodable row is the only safe reading — the function
+# returns Err when NO row matches, so dropping cannot manufacture a false positive.
+1	lib/src/wallet/cpfp_tx.rs	ok-question	let tx_bytes = hex::decode(&bkp_tx.tx).ok()?;
+#
+
+# ================================================================================================
+# server/src — statechain entity (SE)
+# ================================================================================================
+# issue_auth_nonce(): a failed INSERT returns None, so no nonce is handed out and the caller
+# cannot authenticate the irreversible op it wanted. Fails closed.
+1	server/src/database/auth_nonce.rs	err-empty	Err(_) => None,
+#
+# consume_auth_nonce(): a DB error returns false = 'not consumed' = the op is REFUSED. This is
+# the single most important fail-closed in the SE and is commented as such in the source.
+1	server/src/database/auth_nonce.rs	err-empty	Err(_) => false,
+#
+# count_unspent_tokens(): the count is compared against the faucet CAP, so i64::MAX means 'over
+# cap' and THROTTLES the unauthenticated faucet. A read error closes the faucet rather than
+# opening it. Commented as fail-closed in the source (audit [26]).
+1	server/src/database/deposit.rs	chain-after-await	.unwrap_or(i64::MAX)
+#
+# Deposit-token / budget membership check: 'cannot verify' -> not a member -> refuse. Fails closed.
+1	server/src/database/deposit.rs	err-empty	Err(_) => false,
+#
+# get_token_status(): both RowNotFound and any other DB error return None = 'unknown token', and
+# the caller refuses the deposit. Fails closed. (Dead code today — kept for the token faucet.)
+1	server/src/database/deposit.rs	is_err-classifier	if row.is_err() {
+#
+# ⚠️ SUSPECT — get_latch_expiry_by_batch_id(): None means 'this batch has no lightning_latch row',
+# and validate_batch then falls back to the SHORT plain batch_timeout instead of the latch's own
+# clock (audit [2]). A DB error therefore reads as 'not an LN latch' and shortens the window the
+# batch is allowed to stay locked. The direction (a batch expiring EARLY, i.e. the sender keeps
+# the coin) is the safer of the two for the SE, which is why it is listed rather than fixed here,
+# but a `Result`-returning variant would be strictly better. server/src/database is outside this
+# session's file scope.
+1	server/src/database/lightning_latch.rs	await-ok	let row = sqlx::query(query).bind(batch_id).fetch_optional(pool).await.ok()??;
+#
+# Latch batch-membership check: 'cannot verify membership' -> do not admit the coin to the latch
+# batch. Fails closed, commented as such.
+1	server/src/database/lightning_latch.rs	err-empty	Err(_) => false,
+#
+# Same site, matched by the single-line `.ok()?` pattern too.
+1	server/src/database/lightning_latch.rs	ok-question	let row = sqlx::query(query).bind(batch_id).fetch_optional(pool).await.ok()??;
+#
+# get_statechain_transfer_infos(): a row whose `challenge` column is NULL/unreadable is skipped
+# rather than `get`-panicking the handler. A missing info row makes the RECEIVER refuse the coin
+# (it cannot complete the transfer), which is the safe outcome. The surrounding `Err(_) => return
+# result` on the whole query carries the same commented rationale.
+1	server/src/database/transfer_receiver.rs	err-continue	Err(_) => continue,
+#
+# Input validation on the external payment hash: a non-hex or wrong-length hash is REJECTED with
+# 400. Fails closed.
+1	server/src/endpoints/lightning_latch.rs	is_err-classifier	if payment_hash.len() != 64 || hex::decode(&payment_hash).is_err() {
+#
+# Reading the wall clock for the epoch-deadline check. `SystemTime::now().duration_since(
+# UNIX_EPOCH)` can only fail if the host clock is before 1970. (Matched only because the
+# chain-lookback sees the `.await` of get_epoch_deadline five lines up — a false positive of the
+# heuristic, kept rather than special-cased so the heuristic stays simple.)
+1	server/src/endpoints/sign.rs	chain-after-await	.unwrap_or(0);
+#
+# get_msg_addr: an unparseable auth pubkey is rejected before any DB access. Fails closed.
+1	server/src/endpoints/transfer_receiver.rs	is_err-classifier	if new_user_auth_public_key.is_err() {
+#
+# Two sites in GET /info/keylist, a read-only PUBLIC INFORMATIONAL listing of server pubkeys.
+# Audit [21] deliberately made a pool error degrade to an empty list instead of panicking the
+# request handler. No coin protection, no authorisation and no spend decision reads this endpoint;
+# an empty keylist is a visibly broken response, not a permissive one.
+2	server/src/endpoints/utils.rs	chain-after-await	.unwrap_or_default();
+#
+# The enclave delete_statechain call failed -> return 500 and, crucially, do NOT reach
+# delete_statechain_db on the next line. The SE keeps the row it could not prove was deleted
+# enclave-side. Fails closed.
+1	server/src/endpoints/withdraw.rs	is_err-classifier	if response.is_err() {
+#
+
+# ================================================================================================
+# clients/libs/rust-sdk/src/transfer.rs — DEFERRED (file owned by another session this round; reported, not edited)
+# ================================================================================================
+# Same fee-floor fallback as refresh.rs: 1.0 sat/vB is the lower bound, so a failed estimate
+# UNDER-states the renewal fee in the quote. Under-stating makes more coins look fundable, which
+# is a wrong quote, not a lost coin. Deferred with the file.
+1	clients/libs/rust-sdk/src/transfer.rs	await-unwrap_or	let rate = backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
+#
+# ⚠️ SUSPECT — quote_transfer(): an empty carrier set makes is_token_carrier() false for every
+# coin, so an RGB CARRIER is quoted as spendable plain BTC. Quote-only (transfer itself
+# re-derives the set), but it is the exact F3 shape and it is one refactor away from being the
+# selection path. Deferred: transfer.rs is another session's file this round.
+1	clients/libs/rust-sdk/src/transfer.rs	await-unwrap_or_default	let carriers = self.unspendable_as_btc_outpoints().await.unwrap_or_default();
+#
+# Two sites: `parent_backups` = the count of existing backup rows, used only to pick the NEXT
+# tx_n for the split's backup row. A 0 from a failed read would COLLIDE with an existing tx_n
+# rather than drop a row; the split then fails or overwrites. Deferred with the file.
+2	clients/libs/rust-sdk/src/transfer.rs	chain-after-await	.unwrap_or(0);
+#
+# ⚠️ SUSPECT — two sites, both `get_backup_txs("branch-<id>")` for exit-branch assembly: one
+# appends the new split tx to the parent's branch, one collects ancestors' branches. An empty
+# vector from a DB error silently TRUNCATES the exit branch stored for the child, i.e. hands the
+# receiver a sub-coin it cannot unilaterally exit. Same shape as the round-3 branch-witness HIGH.
+# Deferred: transfer.rs is another session's file this round.
+2	clients/libs/rust-sdk/src/transfer.rs	chain-after-await	.unwrap_or_default();
+#

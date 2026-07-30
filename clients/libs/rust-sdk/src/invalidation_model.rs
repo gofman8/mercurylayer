@@ -295,6 +295,7 @@ fn synthetic_exit_estimate(depth: u32) -> ExitCostEstimate {
         total_vbytes: branch_vbytes + backup_vbytes,
         wait_blocks: 0,
         exit_deadline_block: None,
+        exit_deadline_blind: None,
     }
 }
 

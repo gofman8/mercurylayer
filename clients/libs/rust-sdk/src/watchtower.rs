@@ -99,20 +99,27 @@ impl UtexoWallet {
             // silently DROPPED from the bundle and the watchtower it was handed to never watched
             // it, while the export reported success. A bundle that is quietly missing entries is
             // worse than no bundle at all, so this fails CLOSED.
-            let branch = mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("branch-{id}"),
-            )
-            .await
-            .map_err(|e| {
-                anyhow!("cannot read the exit branch of {id} — refusing to export a watch bundle \
-                         that would silently omit it: {e}")
-            })?;
+            //
+            // [class] ...and the fix must not swing the other way either: `get_backup_txs` is a
+            // `fetch_one`, so it also returns `Err` for a row that is simply ABSENT — the ordinary
+            // flat coin. Bare `?` on it would make this export fail for every plain deposit.
+            // `read_exit_branch` is the read that separates the two: `Ok(vec![])` is a verified
+            // absence, `Err` is a real fault.
+            let branch = self.read_exit_branch(&id).await?;
             if branch.is_empty() {
                 continue; // flat coin: on-chain funding, no ancestor can race it
             }
             let est = self.estimate_exit_cost(&id).await?;
+            // [C1] `branch` is non-empty here (checked above), so this coin HAS a deadline. A
+            // missing `exit_deadline_block` at this point is therefore never "flat coin, nothing
+            // can race it" — it is "I could not compute it", and silently `continue`ing on it would
+            // drop the entry from the exported bundle exactly like the `unwrap_or_default()` the
+            // comment above describes. Same fail-closed rule.
+            if let Some(reason) = est.exit_deadline_blind.as_deref() {
+                return Err(anyhow!(
+                    "refusing to export a watch bundle that silently omits {id}: {reason}"
+                ));
+            }
             let Some(deadline) = est.exit_deadline_block else { continue };
             let carrier = crate::wallet::is_token_carrier(coin, &carriers);
             let (backup_tx, backup_locktime) = if carrier {

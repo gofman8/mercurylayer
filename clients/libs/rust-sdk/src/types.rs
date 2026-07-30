@@ -190,7 +190,29 @@ pub struct ExitCostEstimate {
     /// and act with a margin — or simply broadcast the branch eagerly; `auto_exit_due` does this.
     /// `None` for a flat on-chain coin (no off-chain ancestor can race you). A watchtower MUST use
     /// this — not `wait_blocks` (which is when the exit COMPLETES) — to decide when to force-exit.
+    ///
+    /// ⚠️ `None` ALONE IS NOT "SAFE". Read it together with [`Self::exit_deadline_blind`]: `None`
+    /// means "safe" only when `exit_deadline_blind` is also `None`. See
+    /// [`Self::deadline_is_unknown`].
     pub exit_deadline_block: Option<u32>,
+    /// **Why `exit_deadline_block` is `None` (external review C1).** The coin HAS an exit branch —
+    /// so a deadline exists and an ancestor CAN race it — but the deadline could not be computed
+    /// (unreachable SE config, unreadable chain lookup, or a missing deposit-confirmation history
+    /// entry). `Some(reason)` therefore means **"I could not tell"**, never "nothing is due".
+    ///
+    /// The distinction is the whole point: `deposit_anchored_exit_deadline` used to be built
+    /// entirely of `.ok()?`, so any one of those three faults produced the same `None` a genuinely
+    /// deadline-free flat coin produces — and `auto_exit_due` skipped the coin, concluding "nothing
+    /// is due" from a total inability to tell. That is exactly the protection a received RGB token
+    /// depends on. A consumer must treat `Some(_)` here as BLIND: the wallet's own
+    /// [`crate::UtexoWallet::auto_exit_due`] routes it into
+    /// [`crate::WalletEvent::WatchtowerBlind`] + a retained
+    /// [`crate::WatchtowerFault`], and `build_watch_bundle` refuses to export a bundle containing
+    /// one.
+    ///
+    /// Always `None` for a flat coin (no branch ⟹ genuinely no deadline).
+    #[serde(default)]
+    pub exit_deadline_blind: Option<String>,
 }
 
 impl ExitCostEstimate {
@@ -198,6 +220,12 @@ impl ExitCostEstimate {
     /// fees (the split's fee reserve); this covers everything broadcast fresh at `rate`.
     pub fn fee_sats_at(&self, rate_sat_vb: f64) -> u64 {
         (self.total_vbytes as f64 * rate_sat_vb).ceil() as u64
+    }
+
+    /// `true` iff this coin has a race-able exit branch whose deadline could NOT be computed — i.e.
+    /// the caller is BLIND about it and must not read the absent `exit_deadline_block` as "safe".
+    pub fn deadline_is_unknown(&self) -> bool {
+        self.exit_deadline_blind.is_some()
     }
 }
 
@@ -233,12 +261,54 @@ mod tests {
             total_vbytes: 267,
             wait_blocks: 990,
             exit_deadline_block: Some(1990),
+            exit_deadline_blind: None,
         };
         assert_eq!(e.total_vbytes, e.branch_vbytes + e.backup_vbytes);
         assert_eq!(e.fee_sats_at(2.0), 534); // ceil(267*2)
         assert_eq!(e.fee_sats_at(30.0), 8010);
         // fractional rate rounds up
         assert_eq!(e.fee_sats_at(1.5), 401); // ceil(267*1.5=400.5)
+        assert!(!e.deadline_is_unknown(), "a computed deadline is not blind");
+    }
+
+    /// [C1] "No deadline" and "I could not compute a deadline" must NOT be the same value.
+    ///
+    /// Both shapes carry `exit_deadline_block == None`, which is precisely why the old
+    /// single-`Option` encoding was load-bearing for the silent-degradation class: a watchtower read
+    /// the `None` produced by an unreachable SE / unreadable chain lookup as the `None` produced by
+    /// a flat coin with no ancestor, and skipped the coin. `deadline_is_unknown` is the predicate
+    /// that separates them; anything deadline-critical must branch on IT, not on the `Option`.
+    #[test]
+    fn absent_deadline_is_not_the_same_as_uncomputable_deadline() {
+        let base = ExitCostEstimate {
+            statechain_id: "x".into(),
+            branch_txs: 0,
+            branch_vbytes: 0,
+            backup_vbytes: 112,
+            total_vbytes: 112,
+            wait_blocks: 0,
+            exit_deadline_block: None,
+            exit_deadline_blind: None,
+        };
+        // Flat coin: no branch ⟹ genuinely nothing can race it.
+        assert!(!base.deadline_is_unknown(), "a flat coin is NOT blind, it is safe");
+
+        // Branch present but the deadline could not be resolved: same `None`, opposite meaning.
+        let blind = ExitCostEstimate {
+            branch_txs: 1,
+            branch_vbytes: 155,
+            total_vbytes: 267,
+            exit_deadline_blind: Some("SE config unreachable".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            blind.exit_deadline_block, base.exit_deadline_block,
+            "the two shapes are indistinguishable by `exit_deadline_block` alone — that is the bug"
+        );
+        assert!(
+            blind.deadline_is_unknown(),
+            "an uncomputable deadline must report BLIND, never 'nothing is due'"
+        );
     }
 
     // §3.6 / REQ-13: terminal predicate.

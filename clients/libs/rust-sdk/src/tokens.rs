@@ -8,7 +8,7 @@
 //! off-chain against the branch and books the balance under the consignment's verified contract.
 
 use anyhow::{anyhow, Result};
-use mercury_rgb::RgbWallet;
+use mercury_rgb::{RgbWallet, ValidationVerdict};
 use mercurylib::wallet::CoinStatus;
 use mercuryrustlib::rgb::{TierRole, TierSeal};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,30 @@ use crate::wallet::UtexoWallet;
 // Every colouring in this module now derives its blinding from a `TierSeal`
 // (`H(statechain_id ‖ role ‖ tier_index ‖ rung)`), which is unique over the whole
 // `(parent outpoint, role, index)` space and deterministically re-derivable by the receiver.
+// RECORDED SAFE DEFAULTS IN THIS FILE — reviewed, deliberately left alone.
+// ------------------------------------------------------------------------
+// The audited defect class is a failure that presents as a benign empty/idle result, and the class
+// is defined by DIRECTION, not by spelling: a default that leads to MORE work or LESS spending is
+// safe; one that leads to LESS protection is the bug. The remaining `unwrap_or_default()`s here are
+// all of the first kind, and are listed so the next reviewer does not have to re-derive it:
+//
+//  * `format!("{}:{}", coin.utxo_txid.clone().unwrap_or_default(), coin.utxo_vout.unwrap_or_default())`
+//    — building an outpoint key for a coin, in the carrier-selection loops. A coin missing a txid
+//    yields ":0", which matches NO RGB allocation, so the coin is simply not selected as a carrier.
+//    The failure direction is "spend nothing", i.e. fail closed. (The later `carrier_op` uses of the
+//    same shape are on a coin that was ALREADY selected by matching a real allocation with this very
+//    key, so a missing txid there is unreachable by construction.)
+//  * `coin.amount.unwrap_or_default()` — a coin of unknown value reads as 0 sats, which fails the
+//    "carrier too small" and backup-fee-floor checks below and refuses the operation. Fail closed.
+//  * `rec.piece_id.clone().unwrap_or_default()` in the recovery REPORT — a display field on an
+//    outcome struct. The durable state is the journal row, which is unaffected.
+//  * the `SystemTime::duration_since(UNIX_EPOCH)` fallback in `journal_upsert` — a timestamp used
+//    only to order the open-entry scan. A pre-1970 clock degrades ordering, never durability.
+//
+// Everything that reads a coin's PROTECTION (backup rows, exit branch, consignment envelope, spend
+// generation, rejection marker) goes through `read_backup_rows`, which refuses to turn an unreadable
+// database into an empty answer. `scripts/ci/deny-swallowed-backup-reads.sh` keeps it that way.
+
 /// Sats carried by a token-piece sub-coin (just above dust; the token is the payload).
 /// `pub(crate)` so the granularity model (`granularity_model.rs`) can pin the carrier floor.
 pub(crate) const TOKEN_PIECE_SATS: u64 = 1_500;
@@ -119,6 +143,84 @@ pub(crate) struct ConsignmentEnvelope {
     pub s: u64,
 }
 
+/// Read one backup-row key, separating a GENUINE absence from an INABILITY TO TELL.
+///
+/// This distinction is the whole point. `sqlite_manager::get_backup_txs` reports both outcomes
+/// through `Err`: sqlx's `RowNotFound` (and the equivalent empty-row guard) means the key really has
+/// no row — a true, informative "there is nothing here" — while any other error means the read
+/// failed and the caller learned NOTHING. Every `.unwrap_or_default()` / `Err(_) => …` on this
+/// function collapsed the two, so a locked, corrupted or closed database produced a confident empty
+/// answer: no branch witnesses, no consignment, no carrier. Callers then acted on that emptiness.
+///
+/// `Ok(None)` = the row genuinely does not exist. `Err(_)` = the database could not be read, and the
+/// caller must fail rather than substitute a default.
+async fn read_backup_rows(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+    key: &str,
+) -> Result<Option<Vec<mercurylib::wallet::BackupTx>>> {
+    match mercuryrustlib::sqlite_manager::get_backup_txs(pool, wallet_name, key).await {
+        Ok(rows) => Ok(Some(rows)),
+        Err(e) => {
+            let missing = matches!(
+                e.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::RowNotFound)
+            ) || e.to_string().contains("Statechain id not found");
+            if missing {
+                Ok(None)
+            } else {
+                Err(anyhow!("backup rows for '{key}' could not be read: {e}"))
+            }
+        }
+    }
+}
+
+/// The sentinel `book_incoming_token` matches to decide a rejection is PERMANENT (and therefore that
+/// the coin may be un-quarantined). Declared once, next to the only code allowed to emit it.
+pub(crate) const PERMANENT_INVALID_SENTINEL: &str = "PERMANENT-INVALID";
+
+/// Remove the permanent-rejection sentinel from untrusted text before it is interpolated into a
+/// TRANSIENT error message.
+///
+/// The receiver classifies transient vs permanent by looking for [`PERMANENT_INVALID_SENTINEL`]
+/// anywhere in the error string, and some of the text quoted into these errors originates in a
+/// consignment an attacker wrote. Without this, a griefer could embed the sentinel in a payload that
+/// surfaces in a resolver-failure detail and thereby trigger the irreversible un-quarantine from a
+/// transient path. Scrubbing keeps the classification honest no matter what the input says.
+pub(crate) fn scrub_permanent_sentinel(detail: &str) -> String {
+    detail.replace(PERMANENT_INVALID_SENTINEL, "<redacted-marker>")
+}
+
+/// Turn a non-`Valid` RGB verdict into the receiver's error, choosing whether it may carry the
+/// permanent-rejection sentinel. `None` means the consignment validated.
+///
+/// C2 lives here. This is deliberately PURE — no RGB engine, no network, no wallet — so the one
+/// decision that can irreversibly strip a carrier's protection is unit-testable in isolation, which
+/// is how `a_transient_resolver_failure_keeps_a_genuine_carrier_quarantined` pins it.
+pub(crate) fn verdict_rejection(
+    verdict: ValidationVerdict,
+    detail: Option<&str>,
+) -> Option<anyhow::Error> {
+    match verdict {
+        ValidationVerdict::Valid => None,
+        // The validator reached a real verdict of INVALID. Only this may un-quarantine.
+        ValidationVerdict::PermanentlyInvalid => Some(anyhow!(
+            "{PERMANENT_INVALID_SENTINEL}: token consignment INVALID: {}",
+            detail.unwrap_or_default()
+        )),
+        // TRANSIENT: no verdict was reached. No sentinel => the coin stays quarantined and the
+        // claim is retried. `detail` is SCRUBBED because it is attacker-influenced text (a resolver
+        // failure quotes material from a consignment a griefer may have authored) and the receiver
+        // classifies by SUBSTRING: an un-scrubbed detail carrying the sentinel would let a griefer
+        // trigger from this very branch the permanent un-quarantine it exists to prevent.
+        ValidationVerdict::Unresolved => Some(anyhow!(
+            "token consignment could not be validated (RGB resolver/indexer unreachable) — carrier \
+             stays QUARANTINED, will retry: {}",
+            scrub_permanent_sentinel(detail.unwrap_or("no detail"))
+        )),
+    }
+}
+
 /// Derive the branch witness txids a consignment chain resolves against, from the raw (hex) branch
 /// transactions. Shared so the pre-payment gate and the claim path resolve the SAME witness set.
 pub(crate) fn branch_witness_txids(branch_txs: &[String]) -> Result<Vec<String>> {
@@ -143,9 +245,28 @@ pub(crate) fn branch_witness_txids(branch_txs: &[String]) -> Result<Vec<String>>
 /// irreversible invoice, and the SAME coin then failed PERMANENT-INVALID at claim. Two predicates
 /// that must be kept in sync by hand is the bug; one predicate cannot disagree with itself.
 ///
-/// Fails CLOSED and always with the `PERMANENT-INVALID:` prefix that `claim()` matches to
-/// un-quarantine a coin whose consignment can never book (as distinct from an un-prefixed TRANSIENT
-/// RGB-proxy/indexer error, which keeps the coin quarantined and retried).
+/// Fails CLOSED. The `PERMANENT-INVALID:` prefix is emitted ONLY for a verdict the RGB validator
+/// actually reached — see the C2 note below — because `claim()` matches that prefix to
+/// UN-QUARANTINE the coin, which irreversibly discards its RGB protection.
+///
+/// C2 — WHY THIS FUNCTION BRANCHES ON A VERDICT AND NOT ON A BOOLEAN
+/// ----------------------------------------------------------------
+/// `validate_offchain_chain_info` used to return a bare `valid: bool`, and every falsy answer was
+/// labelled `PERMANENT-INVALID:`. But rgb-lib returns `valid == false` for TWO different things:
+/// a consignment that genuinely fails validation, and a validation that never reached a verdict
+/// because a witness could not be resolved (indexer/electrum down, timing out, mid-reorg). The
+/// second is transient and routine. Under the old code a five-second resolver outage during
+/// `claim()` was laundered into a PERMANENT rejection: `book_incoming_token` wrote the durable
+/// `token-rejected-<id>` marker, `consignment_bearing_outpoints` stopped quarantining the coin, and
+/// a GENUINE carrier holding a real allocation became ordinary spendable BTC — after which any
+/// plain-BTC path (transfer, withdraw, auto-refresh re-anchor) would spend it and destroy the
+/// allocation. Nothing ever re-quarantines it: the marker is durable and the un-quarantine is
+/// one-way. A transient failure must therefore leave the carrier QUARANTINED and merely surface
+/// blindness, which is what [`ValidationVerdict::Unresolved`] does here.
+///
+/// The permanent/transient split is rgb-lib's own (`ValidateConsignmentResult::error` is `"invalid"`
+/// vs `"resolver"`, straight off rgbstd's `ValidationError` arms) and is mirrored, not invented; see
+/// [`ValidationVerdict::from_rgb_lib`], which also fails closed on an unrecognised tag.
 pub(crate) fn verify_consignment_assignment(
     w: &mut RgbWallet,
     env: &ConsignmentEnvelope,
@@ -153,16 +274,16 @@ pub(crate) fn verify_consignment_assignment(
     witness_txid: &str,
     witness_vout: u32,
 ) -> Result<(String, u64)> {
-    let (valid, detail, contract_id) =
+    let (verdict, detail, contract_id) =
         tokio::task::block_in_place(|| w.validate_offchain_chain_info(&env.c, branch_txids))?;
-    if !valid {
-        return Err(anyhow!(
-            "PERMANENT-INVALID: token consignment INVALID: {}",
-            detail.unwrap_or_default()
-        ));
+    if let Some(e) = verdict_rejection(verdict, detail.as_deref()) {
+        return Err(e);
     }
-    let contract_id =
-        contract_id.ok_or_else(|| anyhow!("validated consignment without contract id"))?;
+    let contract_id = contract_id.ok_or_else(|| {
+        // Un-prefixed on purpose: "valid but no contract id" is a shape this bridge does not
+        // understand, so it is treated as transient and the carrier keeps its quarantine.
+        anyhow!("validated consignment without contract id — carrier stays QUARANTINED")
+    })?;
     // The amount the CONSIGNMENT assigns to our own witness outpoint — the cryptographic source of
     // truth. The envelope amount (env.a) is only a hint we cross-check; a lying sender cannot
     // inflate the derived amount because the consignment governs it.
@@ -170,8 +291,9 @@ pub(crate) fn verify_consignment_assignment(
         w.accept_offchain_amount(&env.c, branch_txids, witness_txid, witness_vout)
     })?;
     if booked != env.a {
+        // Permanent by construction: both numbers are already in hand and no retry can change them.
         return Err(anyhow!(
-            "PERMANENT-INVALID: token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
+            "{PERMANENT_INVALID_SENTINEL}: token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
             env.a
         ));
     }
@@ -300,7 +422,39 @@ pub struct StructuralSpendRecord {
     // ---- present from `Registered` onward ----
     pub piece_id: Option<String>,
     pub change_id: Option<String>,
+    /// BATCH lane only (`lane == "colored_batch_split"`): one entry per recipient piece, in the
+    /// caller's `transfers` order. The single/combine lanes leave this empty and keep using
+    /// `piece_*` / `change_*`.
+    ///
+    /// `#[serde(default)]` so journal rows written before this field existed still deserialize —
+    /// `journal_open_entries` treats an unparseable row as a hard error (correctly), which would
+    /// otherwise turn an upgrade into a wallet that cannot open.
+    #[serde(default)]
+    pub batch_pieces: Vec<BatchPiece>,
 }
+
+/// One recipient piece of a journalled BATCH colored split.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPiece {
+    /// Statechain address this piece is handed to.
+    pub recipient: String,
+    /// Deposit address of the piece's derived slot (how the sub-coin is recognised at registration).
+    pub addr: String,
+    pub sats: u64,
+    /// Token amount assigned to THIS piece (the envelope's `a`).
+    pub token_amount: u64,
+    // ---- present from `Signed` onward ----
+    pub vout: Option<u32>,
+    // ---- present from `Registered` onward ----
+    pub piece_id: Option<String>,
+    /// Set once this piece's key handover has actually completed. Journalled per piece so a crash
+    /// part-way through an N-recipient hand-over never re-sends a piece that already left.
+    #[serde(default)]
+    pub handed_over: bool,
+}
+
+/// Journal lane tag of the N-recipient colored split (`batch_transfer_tokens`).
+pub(crate) const LANE_BATCH_SPLIT: &str = "colored_batch_split";
 
 /// What the recovery reader did with one journalled spend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -820,28 +974,57 @@ impl UtexoWallet {
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
         {
+            // A coin with no statechain id or no outpoint cannot be referenced by BTC coin
+            // selection at all (selection keys on the outpoint), so skipping it removes no
+            // protection — unlike the DB reads below, whose absence is a real answer about a real
+            // coin.
             let Some(id) = coin.statechain_id.as_deref() else { continue };
             let Some(outpoint) = crate::wallet::coin_outpoint(coin) else { continue };
             // A coin whose consignment was PERMANENTLY rejected (griefer's garbage, marked by
             // claim()) is NOT quarantined — its sats are ordinary BTC the owner may spend.
-            let rejected = mercuryrustlib::sqlite_manager::get_backup_txs(
+            //
+            // This read is NOT allowed to fail silently either, even though its swallow leaned the
+            // safe way (a DB error read as "not rejected" over-quarantines). The enumeration is the
+            // input to every carrier check downstream, so an unreadable DB must stop the caller, not
+            // hand it a confident-looking answer assembled from failures.
+            let rejected = read_backup_rows(
                 &self.inner.cc.pool,
                 &self.inner.config.wallet_name,
                 &format!("token-rejected-{id}"),
             )
             .await
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+            .map_err(|e| {
+                anyhow!(
+                    "cannot enumerate token carriers: the rejection marker of {id} could not be \
+                     read ({e}) — refusing to report a carrier set built from an unreadable database"
+                )
+            })?
+            .is_some_and(|v| !v.is_empty());
             if rejected {
                 continue;
             }
-            let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+            // THE load-bearing read. Its old `.unwrap_or_default()` turned a DB read failure into an
+            // EMPTY backup list, i.e. into "this coin bears no consignment", i.e. into "not a
+            // carrier" — and the coin then flowed into plain-BTC selection, where spending it
+            // DESTROYS the RGB allocation with no warning. A database that cannot be read is not
+            // evidence that a coin is safe to spend.
+            let Some(backups) = read_backup_rows(
                 &self.inner.cc.pool,
                 &self.inner.config.wallet_name,
                 id,
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                anyhow!(
+                    "cannot enumerate token carriers: the backup rows of {id} could not be read \
+                     ({e}) — refusing to report a carrier set built from an unreadable database"
+                )
+            })?
+            else {
+                // Genuinely no backup row for this coin (a real answer, not a failed read): it
+                // carries no consignment, so it is not a pending carrier.
+                continue;
+            };
             if backups.iter().any(|b| b.rgb_consignment.is_some()) {
                 out.insert(outpoint);
             }
@@ -864,6 +1047,33 @@ impl UtexoWallet {
     // ---------------------------------------------------------------------------------------
     // F7 — journal plumbing + the recovery reader.
     // ---------------------------------------------------------------------------------------
+
+    /// A carrier's spend generation: the number of backup rows it has accumulated.
+    ///
+    /// Load-bearing twice over. It is the `tier_index` of the RGB seal (`create_colored_split_tx`
+    /// gets `generation + 1`) and it is an input to the seal blinding, so it must be the REAL count.
+    /// The three call sites used to read it as `.map(len).unwrap_or(0)`: an unreadable database
+    /// silently produced generation 0, which re-derives a seal this carrier may already have used —
+    /// and two RGB transitions over the same parent with the same blinding collapse to one BundleId,
+    /// after which the loser's consignment embeds the rival's witness and the allocation is simply
+    /// unclaimable off-chain (the collision this module's `TierSeal` exists to prevent). Zero is a
+    /// real generation, never a stand-in for "could not read".
+    async fn carrier_spend_generation(&self, carrier_id: &str) -> Result<u32> {
+        let rows = read_backup_rows(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            carrier_id,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "refusing to colour a split over carrier {carrier_id}: its spend generation could \
+                 not be read ({e}) — guessing it would risk an RGB seal collision"
+            )
+        })?;
+        // A genuinely absent row means no backups yet: generation 0, a true answer.
+        Ok(rows.map_or(0, |v| v.len() as u32))
+    }
 
     /// Commit a structural-spend record at its current stage. Durable on return.
     async fn journal_write(&self, rec: &StructuralSpendRecord) -> Result<()> {
@@ -927,7 +1137,16 @@ impl UtexoWallet {
                     self.journal_stage(&mut rec, stage).await?;
                     outcome
                 }
-                // The signed child material survived: rebuild everything downstream of it.
+                // The signed child material survived: rebuild everything downstream of it. The tail
+                // is lane-specific — the batch lane's transaction has N+1 outputs and N envelopes,
+                // which `finish_structural_spend`'s two-output shape cannot describe.
+                _ if rec.lane == LANE_BATCH_SPLIT => {
+                    self.finish_structural_batch_spend(&mut rec, false).await?;
+                    StructuralSpendOutcome::Replayed {
+                        piece_id: rec.piece_id.clone().unwrap_or_default(),
+                        handed_over: false,
+                    }
+                }
                 _ => {
                     self.finish_structural_spend(&mut rec, None).await?;
                     StructuralSpendOutcome::Replayed {
@@ -1109,6 +1328,175 @@ impl UtexoWallet {
         Ok((batch_id, se_hash))
     }
 
+    /// THE tail of the N-recipient colored split (`batch_transfer_tokens`), shared by the live path
+    /// and the recovery reader exactly as [`Self::finish_structural_spend`] is for the other lanes,
+    /// so the replay can never drift from what really ran.
+    ///
+    /// F7 for the batch lane. This lane previously had NO journal at all: it pinned the carrier's
+    /// spend budget, took the one irreplaceable co-signature, and then did N+1 sub-coin
+    /// registrations, an RGB stash mutation, N envelope writes and N hand-overs entirely in process
+    /// memory. A crash anywhere in that stretch destroyed the cooperative path for the carrier AND
+    /// every piece derived from it, with nothing on disk to say it had happened — the same
+    /// terminalize-before-persist window F7 closed for the single and combine lanes, left open here
+    /// only because the record's two-output shape did not fit N recipients.
+    ///
+    /// `hand_over == false` means "replay": local state is rebuilt and every piece that had not yet
+    /// left stays in THIS wallet, because a hand-over is a payment the caller must re-authorise.
+    /// Pieces that DID leave are recorded per piece and are never re-sent.
+    async fn finish_structural_batch_spend(
+        &self,
+        rec: &mut StructuralSpendRecord,
+        hand_over: bool,
+    ) -> Result<Vec<TransferResult>> {
+        let signed_tx = rec
+            .signed_tx
+            .clone()
+            .ok_or_else(|| anyhow!("batch journal entry {} has no signed tx", rec.op_id))?;
+        let txid = rec
+            .txid
+            .clone()
+            .ok_or_else(|| anyhow!("batch journal entry {} has no txid", rec.op_id))?;
+        let change_vout = rec
+            .change_vout
+            .ok_or_else(|| anyhow!("batch journal entry {} has no change vout", rec.op_id))?;
+        if rec.batch_pieces.is_empty() {
+            return Err(anyhow!(
+                "batch journal entry {} carries no pieces — refusing to replay a batch whose \
+                 recipient set is unknown",
+                rec.op_id
+            ));
+        }
+
+        if rec.stage == StructuralStage::Signed {
+            let mut outputs: Vec<(String, u32, u64)> = Vec::with_capacity(rec.batch_pieces.len() + 1);
+            for (i, p) in rec.batch_pieces.iter().enumerate() {
+                let vout = p.vout.ok_or_else(|| {
+                    anyhow!("batch journal entry {} has no vout for piece {i}", rec.op_id)
+                })?;
+                outputs.push((p.addr.clone(), vout, p.sats));
+            }
+            outputs.push((rec.change_addr.clone(), change_vout, rec.change_sats));
+            let ids = self
+                .register_split_subcoins_n(&rec.carrier_ids[0], &signed_tx, &txid, &outputs)
+                .await?;
+            for (i, p) in rec.batch_pieces.iter_mut().enumerate() {
+                p.piece_id = Some(ids[i].clone());
+            }
+            rec.piece_id = rec.batch_pieces[0].piece_id.clone();
+            rec.change_id = ids.last().cloned();
+            self.journal_stage(rec, StructuralStage::Registered).await?;
+        }
+
+        if rec.stage == StructuralStage::Registered {
+            // NOT idempotent (a second `register_statechain` double-books the change) — hence the
+            // stage journalled around it.
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            let asset_id = rec.asset_id.clone();
+            let token_change = rec.token_change;
+            let change_sats = rec.change_sats;
+            let carrier_ops = rec.carrier_ops.clone();
+            tokio::task::block_in_place(|| -> Result<()> {
+                if token_change > 0 {
+                    w.register_statechain(
+                        &txid,
+                        change_vout,
+                        change_sats,
+                        &asset_id,
+                        token_change,
+                        &carrier_ops,
+                    )?;
+                } else {
+                    w.mark_spent(&carrier_ops)?;
+                }
+                Ok(())
+            })?;
+            drop(rgb);
+            self.journal_stage(rec, StructuralStage::Colored).await?;
+        }
+
+        if rec.stage == StructuralStage::Colored {
+            let consignment = rec
+                .consignment
+                .clone()
+                .ok_or_else(|| anyhow!("batch journal entry {} has no consignment", rec.op_id))?;
+            let blinding = rec.blinding;
+            for (i, p) in rec.batch_pieces.clone().iter().enumerate() {
+                let piece_id = p.piece_id.clone().ok_or_else(|| {
+                    anyhow!("batch journal entry {} has no piece id for piece {i}", rec.op_id)
+                })?;
+                // Each piece gets the SAME consignment but its OWN amount: the receiver re-derives
+                // the assignment from the consignment and rejects any envelope that disagrees.
+                let envelope = serde_json::to_string(&ConsignmentEnvelope {
+                    c: consignment.clone(),
+                    a: p.token_amount,
+                    s: p.sats,
+                })?;
+                let mut backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+                    &self.inner.cc.pool,
+                    &self.inner.config.wallet_name,
+                    &piece_id,
+                )
+                .await?;
+                if let Some(first) = backups.first_mut() {
+                    first.rgb_consignment = Some(envelope);
+                    first.rgb_blinding = blinding;
+                }
+                mercuryrustlib::sqlite_manager::update_backup_txs(
+                    &self.inner.cc.pool,
+                    &self.inner.config.wallet_name,
+                    &piece_id,
+                    &backups,
+                )
+                .await?;
+            }
+            self.journal_stage(rec, StructuralStage::Enveloped).await?;
+        }
+
+        if !hand_over {
+            // Replay: local state is whole again and the un-sent pieces stay here. Closing the entry
+            // releases the carrier from the selection ban — it is spent, and the pieces are ordinary
+            // coins of this wallet the caller can re-send.
+            self.journal_stage(rec, StructuralStage::Committed).await?;
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(rec.batch_pieces.len());
+        for i in 0..rec.batch_pieces.len() {
+            let p = rec.batch_pieces[i].clone();
+            let piece_id = p.piece_id.clone().ok_or_else(|| {
+                anyhow!("batch journal entry {} has no piece id for piece {i}", rec.op_id)
+            })?;
+            if !p.handed_over {
+                mercuryrustlib::transfer_sender::execute(
+                    &self.inner.cc,
+                    &p.recipient,
+                    &self.inner.config.wallet_name,
+                    &piece_id,
+                    None,
+                    false,
+                    None,
+                )
+                .await?;
+                // Journalled per piece, BEFORE the next hand-over starts: a crash here must not
+                // leave a piece that already left the wallet looking un-sent.
+                rec.batch_pieces[i].handed_over = true;
+                self.journal_write(rec).await?;
+            }
+            results.push(TransferResult {
+                receiver_address: p.recipient.clone(),
+                total_sats: p.sats,
+                coins: vec![TransferredCoin {
+                    statechain_id: piece_id,
+                    amount_sats: p.sats,
+                }],
+                used_split: true,
+            });
+        }
+        self.journal_stage(rec, StructuralStage::Committed).await?;
+        Ok(results)
+    }
+
     /// Send `token_amount` of `asset_id` to a statechain address, entirely off-chain: colored
     /// split (exact token piece + change back to this wallet) then branch-carrying key handover
     /// of the piece coin. The receiver's SDK auto-claims, validates the consignment off-chain and
@@ -1279,14 +1667,7 @@ impl UtexoWallet {
 
         // Colored split: piece carries the exact token amount; change keeps the rest (or is a
         // plain sats output when the transfer consumes the full allocation).
-        let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &carrier_id,
-        )
-        .await
-        .map(|v| v.len() as u32)
-        .unwrap_or(0);
+        let parent_backups = self.carrier_spend_generation(&carrier_id).await?;
         let server_info = mercuryrustlib::utils::info_config(&self.inner.cc).await?;
 
         // F7 WRITE-AHEAD: the plan becomes durable BEFORE the carrier is terminalized, so a crash in
@@ -1320,6 +1701,7 @@ impl UtexoWallet {
             blinding: None,
             piece_id: None,
             change_id: None,
+            batch_pieces: Vec::new(),
         };
         self.journal_write(&journal).await?;
 
@@ -1570,6 +1952,7 @@ impl UtexoWallet {
             blinding: None,
             piece_id: None,
             change_id: None,
+            batch_pieces: Vec::new(),
         };
         self.journal_write(&journal).await?;
 
@@ -1689,6 +2072,12 @@ impl UtexoWallet {
         let n = transfers.len();
 
         let _guard = self.inner.wallet_lock.lock().await;
+        // F7, as in `colored_transfer`: heal any half-done structural spend BEFORE picking a carrier
+        // so a new batch can never race the replay of an old one over the same coin, and never
+        // select a carrier whose co-signature was already consumed by a lost spend.
+        self.recover_structural_spends_locked().await?;
+        let banned = journal_stranded_carriers(&self.inner.cc.pool, &self.inner.config.wallet_name)
+            .await?;
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
@@ -1702,6 +2091,14 @@ impl UtexoWallet {
         let mut carrier: Option<(mercurylib::wallet::Coin, u64)> = None;
         for coin in record.coins.iter() {
             if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 {
+                continue;
+            }
+            // A carrier whose cooperative path is gone can never be co-signed again — fail closed.
+            if coin
+                .statechain_id
+                .as_deref()
+                .map_or(false, |sid| banned.iter().any(|b| b == sid))
+            {
                 continue;
             }
             let op = format!(
@@ -1768,16 +2165,61 @@ impl UtexoWallet {
         .await?;
         splits.push((change_addr.clone(), change_sats, token_change));
 
-        let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &carrier_id,
-        )
-        .await
-        .map(|v| v.len() as u32)
-        .unwrap_or(0);
+        let parent_backups = self.carrier_spend_generation(&carrier_id).await?;
         let server_info = mercuryrustlib::utils::info_config(&self.inner.cc).await?;
-        // One colored split spends the carrier once -> spend budget 1.
+
+        // F7 WRITE-AHEAD: the plan becomes durable BEFORE the carrier is terminalized, so a crash in
+        // the pre-signature window is classifiable by the recovery reader instead of silent. This
+        // lane had no journal at all until now — see `finish_structural_batch_spend`.
+        let carrier_op = format!(
+            "{}:{}",
+            carrier.utxo_txid.clone().unwrap_or_default(),
+            carrier.utxo_vout.unwrap_or_default()
+        );
+        let mut journal = StructuralSpendRecord {
+            op_id: uuid::Uuid::new_v4().to_string(),
+            lane: LANE_BATCH_SPLIT.to_string(),
+            stage: StructuralStage::Prepared,
+            asset_id: asset_id.to_string(),
+            // Diagnostics only for this lane: the real per-piece recipients live in `batch_pieces`.
+            receiver_address: format!("{n} recipients"),
+            token_amount: total,
+            token_change,
+            carrier_ids: vec![carrier_id.clone()],
+            carrier_ops: vec![carrier_op],
+            slot_tokens: vec![change_tk.clone()],
+            piece_addr: piece_addrs[0].clone(),
+            change_addr: change_addr.clone(),
+            piece_sats: TOKEN_PIECE_SATS,
+            change_sats,
+            // A batch is never latched, so a replay may legitimately finish the local rebuild.
+            latched: false,
+            signed_tx: None,
+            txid: None,
+            piece_vout: None,
+            change_vout: None,
+            consignment: None,
+            blinding: None,
+            piece_id: None,
+            change_id: None,
+            batch_pieces: transfers
+                .iter()
+                .zip(piece_addrs.iter())
+                .map(|((recipient, amount), addr)| BatchPiece {
+                    recipient: recipient.clone(),
+                    addr: addr.clone(),
+                    sats: TOKEN_PIECE_SATS,
+                    token_amount: *amount,
+                    vout: None,
+                    piece_id: None,
+                    handed_over: false,
+                })
+                .collect(),
+        };
+        self.journal_write(&journal).await?;
+
+        // One colored split spends the carrier once -> spend budget 1. MUST stay ahead of the
+        // co-signature (see the journal module note).
         mercuryrustlib::lightning_latch::set_spend_budget(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1785,6 +2227,7 @@ impl UtexoWallet {
             1,
         )
         .await?;
+        crash_point("after_structural_terminalize");
         // Same seal derivation as the single-recipient split, but in a DISJOINT rung space. The
         // arity alone does not keep the two lanes apart: this function rejects only an EMPTY
         // recipient list, so `n == 1` is reachable and gives `splits.len() == 2` — exactly the
@@ -1813,90 +2256,26 @@ impl UtexoWallet {
             .await?
         };
 
-        // Register every sub-coin (pieces + change).
-        let outputs: Vec<(String, u32, u64)> = splits
-            .iter()
-            .enumerate()
-            .map(|(i, (addr, sats, _))| (addr.clone(), split.output_vouts[i], *sats))
-            .collect();
-        let ids = self
-            .register_split_subcoins_n(&carrier_id, &split.signed_tx, &split.txid, &outputs)
-            .await?;
-        let change_vout = split.output_vouts[n];
-
-        // RGB-register the change (or mark the carrier fully spent).
-        {
-            let rgb = self.rgb().await?;
-            let w = rgb.as_ref().unwrap();
-            let carrier_op = format!(
-                "{}:{}",
-                carrier.utxo_txid.clone().unwrap_or_default(),
-                carrier.utxo_vout.unwrap_or_default()
-            );
-            tokio::task::block_in_place(|| -> Result<()> {
-                if token_change > 0 {
-                    w.register_statechain(
-                        &split.txid,
-                        change_vout,
-                        change_sats,
-                        asset_id,
-                        token_change,
-                        &[carrier_op],
-                    )?;
-                } else {
-                    w.mark_spent(&[carrier_op])?;
-                }
-                Ok(())
-            })?;
+        // F7 COMMIT POINT: the co-signature is spent and irreplaceable, so the signed child material
+        // is made durable HERE — before the N+1 sub-coin registrations, the RGB stash mutation, the
+        // N envelope writes and the N hand-overs. Everything after this line is replayable from the
+        // journal by `recover_structural_spends`.
+        journal.signed_tx = Some(split.signed_tx.clone());
+        journal.txid = Some(split.txid.clone());
+        journal.consignment = Some(split.consignment.clone());
+        journal.blinding = Some(split.blinding);
+        for (i, p) in journal.batch_pieces.iter_mut().enumerate() {
+            p.vout = Some(split.output_vouts[i]);
         }
+        journal.piece_vout = Some(split.output_vouts[0]);
+        journal.change_vout = Some(split.output_vouts[n]);
+        self.journal_stage(&mut journal, StructuralStage::Signed)
+            .await?;
+        crash_point("after_structural_sign");
 
-        // Per-piece envelope (own amount) + hand over to each recipient.
-        let mut results = Vec::with_capacity(n);
-        for (i, (recipient, amount)) in transfers.iter().enumerate() {
-            let piece_id = ids[i].clone();
-            let envelope = serde_json::to_string(&ConsignmentEnvelope {
-                c: split.consignment.clone(),
-                a: *amount,
-                s: TOKEN_PIECE_SATS,
-            })?;
-            let mut backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &piece_id,
-            )
-            .await?;
-            if let Some(first) = backups.first_mut() {
-                first.rgb_consignment = Some(envelope);
-                first.rgb_blinding = Some(split.blinding);
-            }
-            mercuryrustlib::sqlite_manager::update_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &piece_id,
-                &backups,
-            )
-            .await?;
-            mercuryrustlib::transfer_sender::execute(
-                &self.inner.cc,
-                recipient,
-                &self.inner.config.wallet_name,
-                &piece_id,
-                None,
-                false,
-                None,
-            )
-            .await?;
-            results.push(TransferResult {
-                receiver_address: recipient.clone(),
-                total_sats: TOKEN_PIECE_SATS,
-                coins: vec![TransferredCoin {
-                    statechain_id: piece_id,
-                    amount_sats: TOKEN_PIECE_SATS,
-                }],
-                used_split: true,
-            });
-        }
-        Ok(results)
+        // Registration -> RGB change -> envelopes -> hand-overs, each stage journalled. THE SAME
+        // code the recovery reader runs, so a replay cannot drift from the live path.
+        self.finish_structural_batch_spend(&mut journal, true).await
     }
 
     /// Receive-side token hook, called by `claim()` for each newly claimed coin: if its backup
@@ -1906,15 +2285,20 @@ impl UtexoWallet {
         if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
             return Ok(None);
         }
-        let backups = match mercuryrustlib::sqlite_manager::get_backup_txs(
+        // `Ok(None)` is read by `book_incoming_token` as "this coin is plain sats, nothing to
+        // record" — a CLEAN ABSENCE that records no status and leaves nothing to retry. The old
+        // `Err(_) => return Ok(None)` handed that verdict to every failure of this read, so a coin
+        // whose backup rows were momentarily unreadable was silently classified as carrying no
+        // token at all. Only a genuinely missing row may say that now; a failed read propagates as a
+        // transient error, which keeps the coin quarantined and marked Pending for the next pass.
+        let Some(backups) = read_backup_rows(
             &self.inner.cc.pool,
             &self.inner.config.wallet_name,
             statechain_id,
         )
-        .await
-        {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
+        .await?
+        else {
+            return Ok(None);
         };
         let envelope = backups.iter().find_map(|b| b.rgb_consignment.clone());
         let Some(envelope) = envelope else {
@@ -1924,14 +2308,25 @@ impl UtexoWallet {
             .map_err(|e| anyhow!("malformed consignment envelope: {e}"))?;
 
         // Branch txids: the un-broadcast witnesses the consignment chain resolves against.
-        let branch = mercuryrustlib::sqlite_manager::get_backup_txs(
+        //
+        // This set is THE input to validation. Its old `.unwrap_or_default()` manufactured an EMPTY
+        // witness set out of a DB read failure, and an empty set does not fail loudly — it makes the
+        // validator try to resolve the branch from the indexer, which cannot see un-broadcast
+        // transactions, so it comes back "not valid". Before C2 that verdict was labelled
+        // PERMANENT-INVALID and un-quarantined a perfectly genuine carrier; even after C2 it wastes
+        // the pass on a question we already knew we could not answer. A missing branch row is still
+        // a legitimate shape (an on-chain witness needs no off-chain branch) and yields an empty set
+        // — but only when the row is genuinely absent, never when the read failed.
+        let raw_branch: Vec<String> = read_backup_rows(
             &self.inner.cc.pool,
             &self.inner.config.wallet_name,
             &format!("branch-{statechain_id}"),
         )
-        .await
-        .unwrap_or_default();
-        let raw_branch: Vec<String> = branch.iter().map(|b| b.tx.clone()).collect();
+        .await?
+        .into_iter()
+        .flatten()
+        .map(|b| b.tx)
+        .collect();
         let txids = branch_witness_txids(&raw_branch)?;
 
         let record = self.record().await?;
@@ -2139,6 +2534,176 @@ mod split_seal_tests {
     }
 }
 
+/// C2 — a TRANSIENT RGB-resolver failure must never be laundered into a PERMANENT, irreversible
+/// un-quarantine of a genuine carrier.
+///
+/// The un-quarantine is one-way: `book_incoming_token` writes a durable `token-rejected-<id>` row,
+/// `consignment_bearing_outpoints` then stops treating the coin as a carrier, and any plain-BTC path
+/// may spend it and destroy the RGB allocation. Nothing re-quarantines it. So the ONLY thing allowed
+/// to trigger it is a verdict the RGB validator actually reached.
+#[cfg(test)]
+mod transient_vs_permanent_tests {
+    use super::{
+        scrub_permanent_sentinel, verdict_rejection, ValidationVerdict, PERMANENT_INVALID_SENTINEL,
+    };
+
+    /// THE receiver's real classifier, restated from `wallet.rs::book_incoming_token`:
+    /// `if msg.contains("PERMANENT-INVALID") { un-quarantine } else { stay quarantined, retry }`.
+    /// Everything below asserts through this so the tests measure the decision production makes.
+    fn un_quarantines(err: &anyhow::Error) -> bool {
+        err.to_string().contains(PERMANENT_INVALID_SENTINEL)
+    }
+
+    /// The headline: the resolver was down, the carrier is genuine, and it stays QUARANTINED.
+    #[test]
+    fn a_transient_resolver_failure_keeps_a_genuine_carrier_quarantined() {
+        // Exactly what rgb-lib reports when a witness cannot be resolved: valid == false with the
+        // "resolver" tag. Before C2 the receiver saw only `valid == false` and called it permanent.
+        let verdict = ValidationVerdict::from_rgb_lib(false, Some("resolver"));
+        assert_eq!(verdict, ValidationVerdict::Unresolved);
+
+        let err = verdict_rejection(verdict, Some("electrum: connection refused"))
+            .expect("an unresolved consignment must still be an error — fail closed");
+        assert!(
+            !un_quarantines(&err),
+            "a transient resolver outage must NOT un-quarantine the carrier; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("QUARANTINED"),
+            "the transient error should say the carrier is being kept: {err}"
+        );
+    }
+
+    /// The other half: a real INVALID verdict still un-quarantines, so a griefer cannot lock a
+    /// victim's sats forever with a garbage consignment. Hardening must not cost this.
+    #[test]
+    fn a_genuine_invalid_verdict_still_un_quarantines() {
+        let verdict = ValidationVerdict::from_rgb_lib(false, Some("invalid"));
+        assert_eq!(verdict, ValidationVerdict::PermanentlyInvalid);
+        let err = verdict_rejection(verdict, Some("operation not in consignment"))
+            .expect("an invalid consignment is an error");
+        assert!(un_quarantines(&err), "a real INVALID verdict must un-quarantine: {err}");
+    }
+
+    /// A valid consignment produces no rejection at all.
+    #[test]
+    fn a_valid_consignment_is_not_rejected() {
+        assert_eq!(ValidationVerdict::from_rgb_lib(true, None), ValidationVerdict::Valid);
+        assert!(verdict_rejection(ValidationVerdict::Valid, None).is_none());
+    }
+
+    /// An `error` tag this bridge has never seen must fail CLOSED — transient, keep the quarantine,
+    /// keep retrying — and never be guessed into a permanent rejection.
+    #[test]
+    fn an_unrecognised_failure_tag_is_treated_as_transient() {
+        for tag in [None, Some(""), Some("weird-new-arm"), Some("INVALID"), Some("Resolver")] {
+            let verdict = ValidationVerdict::from_rgb_lib(false, tag);
+            assert_eq!(
+                verdict,
+                ValidationVerdict::Unresolved,
+                "unrecognised tag {tag:?} must fail closed to transient"
+            );
+            let err = verdict_rejection(verdict, None).expect("still an error");
+            assert!(
+                !un_quarantines(&err),
+                "unrecognised tag {tag:?} must not un-quarantine: {err}"
+            );
+        }
+    }
+
+    /// The classifier matches on a SUBSTRING, and the detail quoted into a transient error is
+    /// attacker-influenced. A griefer who plants the sentinel in that text must not thereby win the
+    /// permanent un-quarantine.
+    #[test]
+    fn an_attacker_cannot_smuggle_the_sentinel_through_a_transient_detail() {
+        let hostile = "resolver died while reading PERMANENT-INVALID: pay no attention";
+        let err = verdict_rejection(ValidationVerdict::Unresolved, Some(hostile))
+            .expect("still an error");
+        assert!(
+            !un_quarantines(&err),
+            "a sentinel planted in untrusted detail must be scrubbed; got: {err}"
+        );
+        assert!(
+            scrub_permanent_sentinel(hostile).contains("<redacted-marker>"),
+            "the scrubber should leave a visible trace of what it removed"
+        );
+    }
+}
+
+/// The other half of the class in this file: a database that cannot be READ must never be reported
+/// as a database that says NOTHING IS THERE.
+#[cfg(test)]
+mod absence_vs_unreadable_tests {
+    use super::read_backup_rows;
+
+    async fn pool() -> sqlx::Pool<sqlx::Sqlite> {
+        sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite")
+    }
+
+    /// No `backup_txs` table at all models an unreadable/absent schema — the read FAILED, so the
+    /// caller must be told, not handed an empty answer that reads as "this coin bears no token".
+    #[tokio::test]
+    async fn an_unreadable_database_is_an_error_not_an_empty_answer() {
+        let p = pool().await;
+        let out = read_backup_rows(&p, "w", "branch-sid").await;
+        assert!(
+            out.is_err(),
+            "a failed read must propagate; got {:?}",
+            out.map(|o| o.map(|v| v.len()))
+        );
+    }
+
+    /// With the table present and no matching row, the absence is GENUINE and is reported as such —
+    /// this is the shape a coin with an on-chain witness (no off-chain branch) legitimately has.
+    #[tokio::test]
+    async fn a_genuinely_missing_row_is_a_real_absence() {
+        let p = pool().await;
+        sqlx::query(
+            "CREATE TABLE backup_txs (statechain_id TEXT, wallet_name TEXT, txs TEXT)",
+        )
+        .execute(&p)
+        .await
+        .expect("create table");
+        let out = read_backup_rows(&p, "w", "branch-sid").await.expect("read ok");
+        assert!(out.is_none(), "a missing row is a real 'nothing here', not a failure");
+    }
+
+    /// And a row that IS there comes back intact.
+    #[tokio::test]
+    async fn an_existing_row_is_returned() {
+        let p = pool().await;
+        sqlx::query("CREATE TABLE backup_txs (statechain_id TEXT, wallet_name TEXT, txs TEXT)")
+            .execute(&p)
+            .await
+            .expect("create table");
+        let txs = serde_json::json!([{
+            "tx_n": 1,
+            "tx": "0200beef",
+            "client_public_nonce": "",
+            "server_public_nonce": "",
+            "client_public_key": "",
+            "server_public_key": "",
+            "blinding_factor": "",
+        }])
+        .to_string();
+        sqlx::query("INSERT INTO backup_txs (statechain_id, wallet_name, txs) VALUES ($1,$2,$3)")
+            .bind("branch-sid")
+            .bind("w")
+            .bind(&txs)
+            .execute(&p)
+            .await
+            .expect("insert");
+        let out = read_backup_rows(&p, "w", "branch-sid")
+            .await
+            .expect("read ok")
+            .expect("row present");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tx, "0200beef");
+    }
+}
+
 /// F7 — the durable prepare/commit journal that keeps a structural colored spend recoverable across
 /// a crash between "the parent's spend budget is terminalized" and "the signed child material is
 /// persisted".
@@ -2185,6 +2750,7 @@ mod structural_journal_tests {
             blinding: None,
             piece_id: None,
             change_id: None,
+            batch_pieces: Vec::new(),
         }
     }
 

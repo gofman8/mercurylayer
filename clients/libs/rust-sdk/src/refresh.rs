@@ -247,6 +247,11 @@ impl UtexoWallet {
     /// failing the pass. Returns one [`RefreshResult`] per coin refreshed and emits
     /// [`WalletEvent::CoinRefreshed`] for each. The background watcher calls this every poll, so in
     /// practice coins are kept fresh proactively; `transfer` also calls it (and waits) as a safety net.
+    ///
+    /// **`Ok(vec![])` means "nothing was due", never "I could not tell".** If the carrier set of a
+    /// token wallet cannot be enumerated the pass returns `Err` rather than an empty vector: it
+    /// still refuses to re-anchor anything (fail closed — a plain re-anchor destroys a carrier's
+    /// RGB allocation), but it says so instead of presenting a total blindness as a clean pass.
     pub async fn auto_refresh_due(&self, margin_blocks: u32) -> Result<Vec<RefreshResult>> {
         use electrum_client::ElectrumApi;
         // Refresh statuses so a just-confirmed re-anchor is not re-refreshed and headrooms are current.
@@ -254,15 +259,27 @@ impl UtexoWallet {
             .await?;
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let record = self.record().await?;
-        // Fail CLOSED: for a token wallet whose carriers we cannot enumerate, skip the whole pass —
-        // never risk plain-refreshing (destroying) a carrier. Non-token wallets have no carriers.
+        // Fail CLOSED **and LOUD**: for a token wallet whose carriers we cannot enumerate we must
+        // not re-anchor anything (a plain re-anchor of a carrier DESTROYS its RGB allocation) — but
+        // `Ok(vec![])` is a lie, and it is exactly the silent-degradation shape this codebase keeps
+        // re-growing: "nothing was due" and "I could not tell what was due" become the same answer.
+        //
+        // A skipped pass is not harmless here. `auto_refresh_due` is what keeps an aging coin
+        // transferable (a coin at its ladder floor is rejected by the receiver, `LocktimeTooLow`),
+        // and `auto_refresh_before_spend` calls it with `?` immediately before a transfer selects
+        // coins. If the carrier set is unreadable then the transfer's OWN carrier exclusion is
+        // equally unreadable, so failing the spend outright is the strictly-safer answer, not a
+        // regression. The background watcher ignores the result and simply retries next poll.
         let carriers = if self.inner.config.rgb_data_dir.is_some()
             && self.inner.config.rgb_proxy_url.is_some()
         {
-            match self.unspendable_as_btc_outpoints().await {
-                Ok(c) => c,
-                Err(_) => return Ok(vec![]),
-            }
+            self.unspendable_as_btc_outpoints().await.map_err(|e| {
+                anyhow!(
+                    "auto_refresh_due: BLIND — could not enumerate this wallet's RGB token \
+                     carriers, so no coin can be safely re-anchored (a plain re-anchor of a \
+                     carrier destroys its allocation). Refusing to report an empty pass: {e}"
+                )
+            })?
         } else {
             std::collections::HashSet::new()
         };

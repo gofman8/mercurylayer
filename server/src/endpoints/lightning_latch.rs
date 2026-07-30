@@ -251,12 +251,34 @@ pub async fn unlock_by_preimage(statechain_entity: &State<StateChainEntity>, pay
         let response_body = json!({ "message": "No coins latched under this batch (nothing to unlock)" });
         return status::Custom(Status::NotFound, Json(response_body));
     }
+    // Fail CLOSED on a per-coin unlock failure. The `Result` of `update_unlock_transfer` used to be
+    // DROPPED here (an unused-`must_use` warning), so a DB fault — or a batch row naming a
+    // statechain_id with no transfer — left the coin LATCHED while this endpoint answered
+    // `"Success", "unlocked": [<every id>]`. That is the same defect class as review M3 two lines
+    // above (a preimage that flips nothing must not read as Success), just one level finer: a
+    // preimage that flips only SOME of the batch must not read as Success either, or the SSP
+    // believes a Lightning swap settled against coins that are still locked.
+    let mut unlocked: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
     for statechain_id in &ids {
         // Sender-side confirm (locked2), exactly like the classic sender unlock.
-        crate::database::transfer_receiver::update_unlock_transfer(&statechain_entity.pool, true, statechain_id).await;
+        match crate::database::transfer_receiver::update_unlock_transfer(&statechain_entity.pool, true, statechain_id).await {
+            Ok(()) => unlocked.push(statechain_id.clone()),
+            Err(e) => failed.push(json!({ "statechain_id": statechain_id, "error": e })),
+        }
+    }
+    if !failed.is_empty() {
+        // Retryable, and safe to retry: the preimage check above is stateless and each unlock is
+        // idempotent, so the caller re-presents the same preimage until every coin is reported.
+        let response_body = json!({
+            "message": "Batch only partially unlocked",
+            "unlocked": unlocked,
+            "failed": failed,
+        });
+        return status::Custom(Status::ServiceUnavailable, Json(response_body));
     }
 
-    let response_body = json!({ "message": "Success", "unlocked": ids });
+    let response_body = json!({ "message": "Success", "unlocked": unlocked });
     status::Custom(Status::Ok, Json(response_body))
 }
 

@@ -386,7 +386,15 @@ impl UtexoWallet {
             anyhow!("cannot compute balance: RGB token-carrier state is unavailable ({e}) — a carrier's sats must never be reported as spendable BTC")
         })?;
         let mut balance = compute_balance_excluding(&record, &carriers);
-        balance.tokens = self.get_token_balances().await.unwrap_or_default();
+        // [HIGH] ...and then the very next line swallowed the RGB engine. `unwrap_or_default()` here
+        // made an unreadable stash report `tokens: []`, i.e. "you hold no tokens" — the same benign
+        // empty result the argument four lines above rejects for the sats side, and a strictly worse
+        // one: an owner reading a zero token balance has no reason to run the near-deadline
+        // materialisation, and the ~6.9-day clawback deadline on a received carrier keeps running.
+        // If the carrier enumeration succeeded but the per-asset balances cannot be read, say so.
+        balance.tokens = self.get_token_balances().await.map_err(|e| {
+            anyhow!("cannot compute balance: RGB token balances are unavailable ({e}) — reporting an empty token list would tell the owner they hold nothing while a received carrier's clawback deadline keeps running")
+        })?;
         Ok(balance)
     }
 
@@ -573,6 +581,12 @@ impl UtexoWallet {
             // an allocation need not be single_use, so we also exclude the RGB carrier set. Fail CLOSED
             // for a token wallet whose RGB state is momentarily unavailable: skip establishing this
             // pass (leave coins un-laddered) rather than risk laddering a carrier — next claim() retries.
+            // AUDITED-SWALLOW: fails toward LESS work but MORE safety — `None` means "RGB state
+            // unavailable", and the only thing skipped is ESTABLISHING a ladder. An un-laddered coin
+            // keeps its absolute-locktime backup and stays exitable, whereas laddering a carrier
+            // would destroy its RGB allocation. It is also surfaced (`note_flat` +
+            // `LadderSkipped{RgbStateUnavailable}`) and retried on the next claim(), so it is not
+            // silent. Propagating instead would abort the whole claim pass over a transient blip.
             let carriers = if self.inner.config.rgb_data_dir.is_some()
                 && self.inner.config.rgb_proxy_url.is_some()
             {
@@ -585,6 +599,8 @@ impl UtexoWallet {
             // old blanket `break`, the affected coins are now recorded + surfaced so the app knows
             // the whole wallet is flat-only this pass.
             let rgb_state_unavailable = carriers.is_none();
+            // AUDITED-SWALLOW: the `None` case is already captured in `rgb_state_unavailable` above
+            // and drives the `note_flat` below; this default only supplies an unused empty set.
             let carriers = carriers.unwrap_or_default();
             for coin in rec.coins.iter_mut() {
                 let sid = match &coin.statechain_id { Some(s) => s.clone(), None => continue };
@@ -632,6 +648,10 @@ impl UtexoWallet {
                     // the coin is untransferable until the row is restored, and it used to reach
                     // that refusal with no record and no event whatsoever. The coin stays
                     // withdrawable and unilaterally exitable throughout.
+                    // AUDITED-SWALLOW: fails toward MORE safety and is LOUD — an unreadable ladder
+                    // row must not be overwritten by establishing a second ladder, and the coin is
+                    // recorded + evented as flat-only (`LadderUnreadable`) rather than dropped. Note
+                    // `note_flat` itself is `?`, so the RECORDING of this cannot be swallowed.
                     Err(_) => {
                         self.note_flat(&sid, 0, LadderSkipReason::LadderUnreadable).await?;
                         continue;
@@ -800,6 +820,24 @@ impl UtexoWallet {
         // but have no booked allocation and re-run accept_incoming_tokens (idempotent). Because the
         // background watcher calls claim() on an interval, this is the retry loop.
         if self.inner.config.rgb_data_dir.is_some() && self.inner.config.rgb_proxy_url.is_some() {
+            // ⚠️ AUDITED-SWALLOW, DELIBERATELY LEFT IN PLACE (external review, this exact class).
+            // This is the ONE `unwrap_or_default()` on a carrier set in this file that fails toward
+            // MORE work rather than less, so it is safe and must NOT be "fixed" to match its
+            // neighbours:
+            //
+            //   `booked` is used ONLY at the `continue` below, as a "this coin is already booked,
+            //   skip it" filter. An empty set therefore makes the filter match NOTHING, so EVERY
+            //   confirmed coin is re-run through `book_incoming_token` — which is idempotent (that
+            //   is this rescan's whole premise: it exists to retry transient RGB faults). The
+            //   failure mode is redundant re-booking attempts, i.e. wasted work, never a skipped
+            //   coin.
+            //
+            // Contrast `auto_exit_due` / `get_balance`, where the same defaulted-empty set means
+            // "no carriers exist" and DISARMS a protection. Direction, not spelling, is what makes
+            // a swallow a bug. (The enclosing `claim()` still returns Ok here on purpose: a broken
+            // RGB engine must not stop plain-BTC coins from being claimed; the resulting per-coin
+            // outcomes are reported in `ClaimResult::token_results` as Pending/Rejected.)
+            // AUDITED-SWALLOW: fails toward MORE work (argument above) — never toward less.
             let booked = self.token_carrier_outpoints().await.unwrap_or_default();
             for coin in after
                 .coins
@@ -1100,6 +1138,9 @@ impl UtexoWallet {
                 // for nothing. An un-triggered coin is a no-op either way (`watch_pass` returns
                 // early while F is unspent). If the tip cannot be read, run anyway — being unsure is
                 // a reason to defend, not to skip.
+                // AUDITED-SWALLOW: fails toward MORE work — an unreadable tip yields `None`, and
+                // the `None => true` arm below runs the ladder defence ANYWAY. Being unsure is a
+                // reason to defend, not to skip.
                 let tip_now = {
                     use electrum_client::ElectrumApi;
                     wallet
@@ -1200,13 +1241,51 @@ impl UtexoWallet {
             .filter_map(|c| c.statechain_id.clone())
             .collect();
         let mut exited = Vec::new();
+        // [C1/HIGH] Coins this pass could NOT decide about. Collected rather than propagated
+        // immediately (same contract as `defend_ladders_inner`): the protection of the OTHER coins
+        // is time-critical and must not be cancelled by one unreadable row — but the pass must not
+        // return `Ok` either, because `Ok` is read by the background loop and by
+        // `note_watchtower_ok` as "this wallet is protected".
+        let mut blind: Vec<String> = Vec::new();
         for id in ids {
+            // Gate on a VERIFIED branch read first: only a coin with an exit branch has a deadline
+            // at all, and only `read_exit_branch` can tell "this coin has none" from "I could not
+            // look". Doing this before `estimate_exit_cost` also keeps a genuinely flat coin's
+            // unrelated failures (e.g. no stored backup row) from being reported as blindness — a
+            // watchtower that cries wolf on healthy wallets is a watchtower nobody reads.
+            match self.read_exit_branch(&id).await {
+                Ok(b) if b.is_empty() => continue, // verified flat: no ancestor can race it
+                Ok(_) => {}
+                Err(e) => {
+                    blind.push(format!("{id} ({e})"));
+                    continue;
+                }
+            }
             let est = match self.estimate_exit_cost(&id).await {
                 Ok(e) => e,
-                Err(_) => continue,
+                // Was `Err(_) => continue`: an unreadable estimate silently dropped a coin from the
+                // near-deadline pass, and the pass still reported success.
+                Err(e) => {
+                    blind.push(format!("{id} (exit-cost estimate unreadable: {e})"));
+                    continue;
+                }
             };
-            // Only off-chain sub-coins carry an exit-race deadline (flat coins return None).
-            let Some(deadline) = est.exit_deadline_block else { continue };
+            // [C1] "I could not compute a deadline" is NOT "there is no deadline". Check the blind
+            // reason BEFORE the `Option`, because both shapes carry `exit_deadline_block == None`.
+            if let Some(reason) = est.exit_deadline_blind.as_deref() {
+                blind.push(format!("{id} ({reason})"));
+                continue;
+            }
+            // The branch is non-empty (verified above), so a deadline MUST be either known or
+            // blind. If it is somehow neither, fail closed rather than skip: "no deadline" on a
+            // branch-bearing coin is never a safe answer.
+            let Some(deadline) = est.exit_deadline_block else {
+                blind.push(format!(
+                    "{id} (has an exit branch but reported neither a deadline nor a reason — \
+                     refusing to assume it is safe)"
+                ));
+                continue;
+            };
             if tip + margin_blocks < deadline {
                 continue; // still comfortably ahead of the deadline
             }
@@ -1215,14 +1294,20 @@ impl UtexoWallet {
                 deadline_block: deadline,
                 tip,
             });
-            if self.unilateral_exit(Some(vec![id.clone()]), None).await.is_ok() {
-                exited.push(id);
+            // `.is_ok()` used as a classifier discarded the reason a DUE coin failed to exit, and the
+            // pass still returned `Ok` ⟹ `note_watchtower_ok`. A coin inside its margin that did not
+            // exit is the definition of unprotected: record it.
+            match self.unilateral_exit(Some(vec![id.clone()]), None).await {
+                Ok(_) => exited.push(id),
+                Err(e) => blind.push(format!(
+                    "{id} (DUE at block {deadline}, tip {tip}, but the forced exit failed: {e})"
+                )),
             }
         }
 
         // Received token carriers: MATERIALIZE (branch only) — never plain-exit (that destroys the
         // allocation). Disjoint from the loop above (which excluded carriers). An issued/flat carrier
-        // has no branch → estimate_exit_cost yields no deadline → it is skipped.
+        // has no branch → VERIFIED no deadline → it is skipped (and only then).
         let carrier_ids: Vec<String> = record
             .coins
             .iter()
@@ -1231,11 +1316,38 @@ impl UtexoWallet {
             .filter_map(|c| c.statechain_id.clone())
             .collect();
         for id in carrier_ids {
+            // Same verified gate as the plain loop. An ISSUED carrier is genuinely branch-free and
+            // genuinely unraceable; a RECEIVED carrier whose branch row cannot be read is the most
+            // dangerous coin in the wallet, and the two must never share an exit path here.
+            match self.read_exit_branch(&id).await {
+                Ok(b) if b.is_empty() => continue, // verified: issued/flat carrier, no clawback risk
+                Ok(_) => {}
+                Err(e) => {
+                    blind.push(format!("{id} (token carrier; {e})"));
+                    continue;
+                }
+            }
             let est = match self.estimate_exit_cost(&id).await {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(e) => {
+                    blind.push(format!("{id} (token carrier; exit-cost estimate unreadable: {e})"));
+                    continue;
+                }
             };
-            let Some(deadline) = est.exit_deadline_block else { continue };
+            // [C1] THE finding. This is the loop the reviewer named: a received RGB token carrier's
+            // ONLY clawback protection is being materialised here before its ~6.9-day root deadline.
+            // An uncomputable deadline used to reach the `else { continue }` below and vanish.
+            if let Some(reason) = est.exit_deadline_blind.as_deref() {
+                blind.push(format!("{id} (token carrier; {reason})"));
+                continue;
+            }
+            let Some(deadline) = est.exit_deadline_block else {
+                blind.push(format!(
+                    "{id} (token carrier has an exit branch but reported neither a deadline nor a \
+                     reason — refusing to assume its RGB allocation is safe)"
+                ));
+                continue;
+            };
             if tip + margin_blocks < deadline {
                 continue;
             }
@@ -1248,10 +1360,39 @@ impl UtexoWallet {
             // spends the shared root, defeating the sender's clawback). The plain backup is
             // deliberately NOT broadcast — it would sweep the sats and destroy the allocation. A
             // conflict/failure leaves it for a later pass (broadcast_branch_if_any already alerted
-            // via ExitBranchConflict on a racing spend).
-            if self.broadcast_branch_if_any(&id).await.unwrap_or(false) {
-                exited.push(id);
+            // via ExitBranchConflict on a racing spend) — but it is recorded as BLIND, because this
+            // carrier is INSIDE its margin and did NOT get materialised. `unwrap_or(false)` here
+            // discarded exactly that: the pass then returned `Ok` and the wallet reported itself
+            // protected while a due carrier sat unprotected.
+            match self.broadcast_branch_if_any(&id).await {
+                Ok(true) => exited.push(id),
+                Ok(false) => blind.push(format!(
+                    "{id} (token carrier is DUE at block {deadline} but has no stored exit branch to \
+                     materialise — it cannot be protected)"
+                )),
+                Err(e) => blind.push(format!(
+                    "{id} (token carrier is DUE at block {deadline}; materialising its exit branch \
+                     failed: {e})"
+                )),
             }
+        }
+        if !blind.is_empty() {
+            // Deliberately an `Err`, not a quiet `Ok(exited)`: `auto_exit_due` maps `Ok` to
+            // `note_watchtower_ok`, i.e. to "this wallet's clawback protection ran with full
+            // visibility". Coins actually protected this pass have already emitted their events, so
+            // nothing is lost by failing here.
+            //
+            // NOTE the deliberate non-action: a blind coin is NOT force-materialised on suspicion.
+            // Broadcasting an exit branch is cheap but not free, and a single electrum blip would
+            // otherwise dump every off-chain coin in the wallet on-chain. Fail-closed for a WATCHER
+            // means refusing to claim protection, not spending money on an unverified premise.
+            return Err(anyhow!(
+                "near-deadline protection is BLIND on {} coin(s) — their exit-race deadline could \
+                 not be computed, so 'nothing is due' cannot be distinguished from 'I could not \
+                 tell', and a received token on them can be clawed back unopposed: {}",
+                blind.len(),
+                blind.join(", ")
+            ));
         }
         Ok(exited)
     }
@@ -1324,13 +1465,32 @@ impl UtexoWallet {
             // electrum connection masquerade as a quiet, well-defended coin.
             match mercuryrustlib::tesr::watch_pass(&self.inner.cc.electrum_client, &bundle) {
                 mercuryrustlib::tesr::WatchState::Idle => {} // F unspent: verifiably nothing to do
-                mercuryrustlib::tesr::WatchState::Acted { ids, .. } => {
+                // [HIGH / F2+F4 join] `Acted { ids, .. }` DISCARDED `failures`. That field exists
+                // precisely so a caller can tell a ladder that is WAITING (its next tier's
+                // relative-CSV has not matured — the normal steady state of a contested exit) from
+                // one that is being RACED or is dead (the tier's input was spent by a competing tx,
+                // the backend rejected it, the stored hex is unusable). Both looked identical:
+                // `ids` empty, no event, no fault, pass returns `Ok`. Classify, and treat anything
+                // that is not a recognised "not yet" as blindness — an owner whose exit is being
+                // out-raced learns about it on the NEXT pass instead of never.
+                mercuryrustlib::tesr::WatchState::Acted { ids, failures } => {
                     if !ids.is_empty() {
                         let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
                             statechain_id: id.clone(),
                             tiers_broadcast: ids.len() as u32,
                         });
-                        acted.push(id);
+                        acted.push(id.clone());
+                    }
+                    let hard: Vec<&String> = failures
+                        .iter()
+                        .filter(|f| !ladder_failure_is_waiting(f))
+                        .collect();
+                    if !hard.is_empty() {
+                        blind.push(format!(
+                            "{id} (tier broadcast REJECTED for a reason that is not an immature \
+                             CSV — the exit may be raced or unusable: {})",
+                            hard.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")
+                        ));
                     }
                 }
                 mercuryrustlib::tesr::WatchState::Blind { reason } => {
@@ -1427,20 +1587,67 @@ impl UtexoWallet {
         Ok(withdrawn)
     }
 
+    /// Read a coin's `branch-<id>` exit branch, distinguishing the two answers the raw storage call
+    /// **cannot** distinguish. This is the root cause of most of the swallows in this file.
+    ///
+    /// `sqlite_manager::get_backup_txs` is a `fetch_one`, so a MISSING row (a genuinely flat coin:
+    /// on-chain funding, no ancestor, no deadline) and a FAILED read (unreadable/locked/corrupt DB)
+    /// both come back as `Err`. Every caller therefore had to collapse the two — `unwrap_or_default()`
+    /// in `estimate_exit_cost`, `_ => return Ok(false)` in `broadcast_branch_if_any`,
+    /// `.unwrap_or(false)` in `list_coins` — and collapsing them IS the silent-degradation class:
+    /// an unreadable database then presents a raceable off-chain sub-coin as a safe flat one, so the
+    /// deadline vanishes, the watchtower skips it, and the exit branch that beats the clawback is
+    /// never broadcast. A `?` alone would be worse, not better: it would make every flat coin an
+    /// error.
+    ///
+    /// So read the wallet's whole backup table with `fetch_all` — where "no rows" is a SUCCESSFUL
+    /// empty result — and look the key up in it:
+    ///
+    /// - `Ok(vec![])` — **verified**: this coin has no exit branch.
+    /// - `Ok(rows)` — the branch, root-first by `tx_n`.
+    /// - `Err(_)` — the store could not be read or the row is corrupt. Never "no branch".
+    pub(crate) async fn read_exit_branch(
+        &self,
+        statechain_id: &str,
+    ) -> Result<Vec<mercurylib::wallet::BackupTx>> {
+        let rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "cannot read the backup store while looking for the exit branch of \
+                 {statechain_id} ({e}) — refusing to report 'no exit branch' from a failed read"
+            )
+        })?;
+        let key = format!("branch-{statechain_id}");
+        let Some((_, json)) = rows.into_iter().find(|(k, _)| *k == key) else {
+            return Ok(Vec::new()); // verified absent: a flat coin
+        };
+        serde_json::from_str(&json).map_err(|e| {
+            anyhow!(
+                "the stored exit branch of {statechain_id} is corrupt and cannot be parsed ({e}) — \
+                 refusing to read a corrupt row as 'this coin has no exit branch'"
+            )
+        })
+    }
+
     /// Broadcast the stored exit branch of a coin, root-first, if one exists. Returns whether a
     /// branch exists. Broadcast errors for already-confirmed branch txs (shared with a sibling
     /// coin's earlier exit) are tolerated; other errors surface.
+    ///
+    /// **[HIGH] A DB read failure is NOT "this coin has no exit branch".** The catch-all arm used
+    /// to be `_ => return Ok(false)`, which folded an unreadable wallet DB into the flat-coin
+    /// answer and made this function DECLINE to broadcast the one thing that saves the coin — while
+    /// returning `Ok`, so `auto_exit_due`'s materialisation loop counted it as "nothing to do" and
+    /// `withdraw` proceeded to spend an input that was never materialised. Only a **verified**
+    /// absence (see [`Self::read_exit_branch`]) may answer `false`.
     pub(crate) async fn broadcast_branch_if_any(&self, statechain_id: &str) -> Result<bool> {
-        let branch = match mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &format!("branch-{statechain_id}"),
-        )
-        .await
-        {
-            Ok(b) if !b.is_empty() => b,
-            _ => return Ok(false),
-        };
+        let branch = self.read_exit_branch(statechain_id).await?;
+        if branch.is_empty() {
+            return Ok(false); // verified: this coin genuinely has no exit branch
+        }
         use electrum_client::ElectrumApi;
         for b in branch.iter() {
             let tx: bitcoin::Transaction =
@@ -1477,15 +1684,21 @@ impl UtexoWallet {
     /// Estimate the cost and readiness of unilaterally exiting a coin: how many transactions,
     /// their total vsize (fee = vsize x feerate via [`crate::types::ExitCostEstimate::fee_sats_at`]),
     /// and how many blocks remain until the backup's locktime allows broadcast.
+    ///
+    /// **[C1] Two distinct "no deadline" answers.** `exit_deadline_block == None` with
+    /// `exit_deadline_blind == None` means the coin is flat and genuinely unraceable;
+    /// `exit_deadline_blind == Some(reason)` means the coin HAS a branch and the deadline could not
+    /// be computed. Callers that act on deadlines MUST branch on
+    /// [`crate::types::ExitCostEstimate::deadline_is_unknown`] — see `auto_exit_due`.
     pub async fn estimate_exit_cost(&self, statechain_id: &str) -> Result<crate::types::ExitCostEstimate> {
         use electrum_client::ElectrumApi;
-        let branch = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &format!("branch-{statechain_id}"),
-        )
-        .await
-        .unwrap_or_default();
+        // [HIGH] NOT `unwrap_or_default()`. A DB read failure used to manufacture an EMPTY branch,
+        // which is byte-for-byte the flat-coin answer: `branch_txs: 0`, no branch vbytes, and —
+        // fatally — `exit_deadline_block: None` on the `branch.is_empty()` arm below. An unreadable
+        // wallet DB therefore reported a raceable off-chain sub-coin as a safe on-chain one, and
+        // every deadline consumer (auto_exit_due, export_watch_bundle) skipped it. Fail closed:
+        // `read_exit_branch` returns an empty vec ONLY for a verified-absent row.
+        let branch = self.read_exit_branch(statechain_id).await?;
         let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
             &self.inner.cc.pool,
             &self.inner.config.wallet_name,
@@ -1521,10 +1734,24 @@ impl UtexoWallet {
         // it would exit AFTER a deposit-anchored ancestor backup already matured (clawback). Anchor
         // the deadline to the branch ROOT's on-chain deposit height instead: L0 = H_deposit + initlock
         // is deposit-anchored, split-tip-independent, and a safe (early) bound over all ancestors.
-        let exit_deadline_block = if branch.is_empty() {
-            None
+        //
+        // [C1] The tri-state. `branch.is_empty()` is the ONLY shape that legitimately has no
+        // deadline; anything else that comes back without one is BLINDNESS, and is reported as such
+        // instead of being folded into the same `None`.
+        let (exit_deadline_block, exit_deadline_blind) = if branch.is_empty() {
+            (None, None) // flat/on-chain coin: no ancestor exists to race it. Genuinely safe.
         } else {
-            self.deposit_anchored_exit_deadline(&branch).await
+            match self.deposit_anchored_exit_deadline(&branch).await {
+                Ok(d) => (Some(d), None),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "the exit-race deadline of {statechain_id} could NOT be computed ({e}) — \
+                         this coin has an exit branch, so an ancestor CAN race it; absence of a \
+                         deadline here means blindness, not safety"
+                    )),
+                ),
+            }
         };
 
         Ok(crate::types::ExitCostEstimate {
@@ -1535,26 +1762,50 @@ impl UtexoWallet {
             total_vbytes: branch_vbytes + backup_vbytes,
             wait_blocks,
             exit_deadline_block,
+            exit_deadline_blind,
         })
     }
 
     /// The deposit-anchored exit-race deadline (audit [10]): resolve the branch ROOT's on-chain
     /// funding-deposit confirmation height `H_deposit` and return `H_deposit + initlock`. This is
     /// deposit-anchored (independent of the split tip), so it is a safe (early) bound over every
-    /// ancestor's backup maturity. Returns `None` if the SE config or the on-chain deposit height
-    /// cannot be resolved (an offline watchtower must cache `initlock` and the deposit height to
-    /// compute this itself — never fall back to `leaf_locktime + interval`).
+    /// ancestor's backup maturity. An offline watchtower must cache `initlock` and the deposit
+    /// height to compute this itself — never fall back to `leaf_locktime + interval`.
+    ///
+    /// **[C1] Returns `Result`, not `Option`.** This function is only ever called for a coin that
+    /// HAS an exit branch, i.e. for a coin that definitely has a deadline and definitely can be
+    /// raced by an ancestor. Every step below can fail for a reason that has nothing to do with the
+    /// coin being safe — the SE config is unreachable, electrum is down, the deposit is not yet in
+    /// the address history. The whole body used to be `.ok()?`, so all of those collapsed into the
+    /// SAME `None` that a genuinely deadline-free flat coin yields, and `auto_exit_due` skipped the
+    /// coin: the watcher concluded "nothing is due" from a total inability to tell, on exactly the
+    /// coins whose only clawback protection it is. Each failure now carries a reason, and the
+    /// caller lifts it into `ExitCostEstimate::exit_deadline_blind` ⟹ `WatchtowerBlind` + a
+    /// retained `WatchtowerFault`.
     async fn deposit_anchored_exit_deadline(
         &self,
         branch: &[mercurylib::wallet::BackupTx],
-    ) -> Option<u32> {
+    ) -> Result<u32> {
         use electrum_client::ElectrumApi;
-        let initlock = mercuryrustlib::utils::info_config(&self.inner.cc).await.ok()?.initlock;
+        let initlock = mercuryrustlib::utils::info_config(&self.inner.cc)
+            .await
+            .map_err(|e| anyhow!("SE config unreachable, so `initlock` is unknown: {e}"))?
+            .initlock;
         // Branch is stored root-first; the root's single input spends the on-chain deposit outpoint.
-        let root = branch.iter().min_by_key(|b| b.tx_n)?;
+        let root = branch
+            .iter()
+            .min_by_key(|b| b.tx_n)
+            .ok_or_else(|| anyhow!("exit branch is empty — no root tx to anchor the deadline to"))?;
         let root_tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&hex::decode(&root.tx).ok()?).ok()?;
-        let deposit_outpoint = root_tx.input.first()?.previous_output;
+            bitcoin::consensus::encode::deserialize(&hex::decode(&root.tx).map_err(|e| {
+                anyhow!("exit-branch root tx is not valid hex: {e}")
+            })?)
+            .map_err(|e| anyhow!("exit-branch root tx does not deserialize: {e}"))?;
+        let deposit_outpoint = root_tx
+            .input
+            .first()
+            .ok_or_else(|| anyhow!("exit-branch root tx has no input to anchor the deadline to"))?
+            .previous_output;
         // Fetch the deposit funding tx to read the scriptPubKey being spent, then find that tx's
         // confirmation height in the address history.
         let dep_tx = self
@@ -1562,14 +1813,41 @@ impl UtexoWallet {
             .cc
             .electrum_client
             .transaction_get(&deposit_outpoint.txid)
-            .ok()?;
-        let spk = &dep_tx.output.get(deposit_outpoint.vout as usize)?.script_pubkey;
-        let history = self.inner.cc.electrum_client.script_get_history(spk).ok()?;
+            .map_err(|e| {
+                anyhow!(
+                    "could not fetch the branch root's funding tx {}: {e}",
+                    deposit_outpoint.txid
+                )
+            })?;
+        let spk = &dep_tx
+            .output
+            .get(deposit_outpoint.vout as usize)
+            .ok_or_else(|| {
+                anyhow!(
+                    "funding tx {} has no output {}",
+                    deposit_outpoint.txid,
+                    deposit_outpoint.vout
+                )
+            })?
+            .script_pubkey;
+        let history = self
+            .inner
+            .cc
+            .electrum_client
+            .script_get_history(spk)
+            .map_err(|e| anyhow!("could not read the deposit address history: {e}"))?;
         let h_deposit = history
             .iter()
             .find(|h| h.tx_hash == deposit_outpoint.txid && h.height > 0)
-            .map(|h| h.height as u32)?;
-        Some(deposit_anchored_deadline(h_deposit, initlock))
+            .map(|h| h.height as u32)
+            .ok_or_else(|| {
+                anyhow!(
+                    "the branch root's deposit {} is not confirmed in the address history yet, so \
+                     its anchor height is unknown",
+                    deposit_outpoint.txid
+                )
+            })?;
+        Ok(deposit_anchored_deadline(h_deposit, initlock))
     }
 
     /// Unilateral exit: broadcast the exit branch (immediately valid) and the latest pre-signed
@@ -1644,6 +1922,9 @@ impl UtexoWallet {
                 let wait_blocks = if done {
                     0
                 } else {
+                    // AUDITED-SWALLOW: `?` already propagates an unreadable backend; the remaining
+                    // `None` means "no further tier is waiting", so 0 is the true wait. It reports
+                    // the exit as ready SOONER, i.e. it can only cause an extra pass, never a skip.
                     mercuryrustlib::tesr::next_exit_tier(&self.inner.cc.electrum_client, &bundle)?
                         .unwrap_or(0) as u32
                 };
@@ -1663,6 +1944,8 @@ impl UtexoWallet {
                 let wait_blocks = if done {
                     0
                 } else {
+                    // AUDITED-SWALLOW: same as the parent-ladder case above — `?` covers the blind
+                    // backend, `None` genuinely means no tier is pending.
                     mercuryrustlib::tesr::next_child_exit_tier(&self.inner.cc.electrum_client, &cb)?
                         .unwrap_or(0) as u32
                 };
@@ -1685,6 +1968,9 @@ impl UtexoWallet {
                     .and_then(|c| c.utxo_txid.clone());
                 if let Some(txid_str) = funding_txid {
                     if let Ok(txid) = txid_str.parse::<bitcoin::Txid>() {
+                        // AUDITED-SWALLOW: fails toward LOUDER — an unreachable backend classifies
+                        // as "funding not on chain" and produces the explicit "restore the recovery
+                        // bundle" error instead of an opaque `missing inputs` broadcast rejection.
                         if self.inner.cc.electrum_client.transaction_get(&txid).is_err() {
                             return Err(anyhow!(
                                 "sub-coin {id} has no stored exit branch (branch-{id} missing) and its funding {txid_str} is un-broadcast — it cannot be exited; restore the recovery bundle (branch-* rows)"
@@ -1773,16 +2059,19 @@ impl UtexoWallet {
             if c.duplicate_index != 0 {
                 continue;
             }
-            let has_branch = mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("branch-{}", c.statechain_id.clone().unwrap_or_default()),
-            )
-            .await
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+            // [class] `.unwrap_or(false)` here reported a coin whose branch row could not be READ as
+            // `off_chain: false` — i.e. it showed a raceable off-chain sub-coin as a settled
+            // on-chain one, in the listing an owner uses to decide whether anything needs exiting.
+            // Propagate: `list_coins` already returns `Result`, and a listing that quietly lies
+            // about which coins are off-chain is worse than no listing.
+            let has_branch = match c.statechain_id.as_deref() {
+                Some(sid) => !self.read_exit_branch(sid).await?.is_empty(),
+                None => false, // no statechain_id ⟹ no `branch-<id>` key can exist for it
+            };
             out.push(crate::types::CoinInfo {
                 statechain_id: c.statechain_id.clone(),
+                // AUDITED-SWALLOW: display-only default on an `Option<u32>` field, not a fallible
+                // read — an amount-less coin renders as 0 sat and decides no protection.
                 amount_sats: c.amount.unwrap_or_default() as u64,
                 status: format!("{}", c.status),
                 utxo_txid: c.utxo_txid.clone(),
@@ -1946,6 +2235,27 @@ async fn build_wallet_record(
 /// exit "success". The accepted phrases are the concrete bitcoind/electrs signals (case-folded):
 /// bitcoind -27 emits "already in block chain" (older) or "outputs already in utxo set" (newer;
 /// observed in SDK_E2E_7), and an already-accepted mempool tx is "txn-already-known".
+/// Classify a TES-R tier-broadcast rejection reported in [`mercuryrustlib::tesr::WatchState::Acted`]'s
+/// `failures`: `true` iff it means **"not yet"** (the tier's relative-CSV has not matured, or its
+/// parent is not confirmed deep enough for BIP68 to count), which is the ordinary steady state of a
+/// contested exit walking up the ladder one block at a time.
+///
+/// Everything else — a conflict, a spent input, a policy rejection, an unusable tx — means the tier
+/// will NOT go out by waiting, and `defend_ladders` reports it as blindness. The list is
+/// deliberately CLOSED (unknown wording ⟹ not waiting ⟹ loud): a new backend wording that we
+/// mis-read as "raced" costs an alert, whereas one we mis-read as "waiting" costs the coin.
+pub(crate) fn ladder_failure_is_waiting(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const WAITING: &[&str] = &[
+        "non-bip68-final",   // bitcoind: relative timelock (CSV) not satisfied yet
+        "non-final",         // bitcoind: nLockTime not reached (also covers non-BIP68-final)
+        "bad-txns-nonfinal", // wording variant
+    ];
+    // An idempotent rebroadcast is not a failure at all (the tier is already out) — tolerate it
+    // here too, since `tx_known` and the broadcast can race across passes.
+    WAITING.iter().any(|needle| m.contains(needle)) || is_idempotent_rebroadcast(msg)
+}
+
 pub(crate) fn is_idempotent_rebroadcast(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     const ACCEPTED: &[&str] = &[
@@ -2017,5 +2327,135 @@ mod identity_tests {
         assert!(UtexoWallet::validate_message_with_identity_key(msg, &sig_hex, &pk_hex).unwrap());
         // tampered message fails
         assert!(!UtexoWallet::validate_message_with_identity_key(b"other message", &sig_hex, &pk_hex).unwrap());
+    }
+}
+
+/// **The silent-degradation guard for this file, enforced instead of remembered.**
+///
+/// Three review rounds fixed this class one site at a time and the next round always found more,
+/// because the fix is invisible: the corrected code looks exactly like the broken code minus a
+/// `unwrap_or_default()`. So the property is checked mechanically, on this file's own source, at
+/// `cargo test` time.
+///
+/// The rule is NOT "never swallow". A swallow that fails toward MORE work is fine (see the audited
+/// one in `claim`'s token rescan). The rule is: **where a swallow is combined with a
+/// protection-deciding SUBJECT — the exit branch, the exit deadline, the carrier set, the ladder
+/// bundle — it must carry an `AUDITED-SWALLOW:` note saying which direction it fails in.** That
+/// makes the dangerous cases impossible to add silently, and forces the next author to write down
+/// the direction argument this class keeps getting wrong.
+#[cfg(test)]
+mod silent_degradation_guard {
+    /// Spellings that turn a failure into a benign-looking value.
+    const SWALLOWS: &[&str] = &[
+        "unwrap_or_default()",
+        "unwrap_or(",
+        ".ok()?",
+        ".ok()\n",
+        "Err(_) =>",
+        "is_err()",
+        "is_ok()",
+    ];
+
+    /// Reads whose failure decides whether a coin is PROTECTED. A swallow next to one of these is
+    /// how "I could not look" becomes "there is nothing to do".
+    const PROTECTION_SUBJECTS: &[&str] = &[
+        "get_backup_txs",
+        "read_exit_branch",
+        "estimate_exit_cost",
+        "exit_deadline",
+        "deposit_anchored_exit_deadline",
+        "unspendable_as_btc_outpoints",
+        "token_carrier_outpoints",
+        "get_token_balances",
+        "broadcast_branch_if_any",
+        "watch_pass",
+        "tesr::load",
+    ];
+
+    /// The escape hatch: an explicit, argued exception.
+    const MARKER: &str = "AUDITED-SWALLOW";
+
+    /// How far back to look for the statement's start and for the marker comment.
+    const LOOKBACK: usize = 14;
+
+    fn source() -> &'static str {
+        include_str!("wallet.rs")
+    }
+
+    #[test]
+    fn no_unaudited_swallow_next_to_a_protection_decision() {
+        let src = source();
+        let all: Vec<&str> = src.lines().collect();
+        // Stop at this module: it necessarily contains the forbidden spellings as data.
+        let end = all
+            .iter()
+            .position(|l| l.starts_with("mod silent_degradation_guard {"))
+            .unwrap_or(all.len());
+        let lines = &all[..end];
+        assert!(end > 1000, "the guard must scan the whole file, not a truncated prefix");
+        let mut offenders = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") || code.starts_with("///") {
+                continue; // prose describing the class is not the class
+            }
+            if !SWALLOWS.iter().any(|s| line.contains(s.trim_end_matches('\n'))) {
+                continue;
+            }
+            let start = i.saturating_sub(LOOKBACK);
+            let window = lines[start..=i].join("\n");
+            // Only care when the swallow sits next to something protection-deciding...
+            if !PROTECTION_SUBJECTS.iter().any(|s| window.contains(s)) {
+                continue;
+            }
+            // ...and has no argued exception recorded next to it.
+            if window.contains(MARKER) {
+                continue;
+            }
+            offenders.push(format!("wallet.rs:{}: {}", i + 1, line.trim()));
+        }
+        assert!(
+            offenders.is_empty(),
+            "unaudited swallow(s) on a protection-deciding read. Each of these turns a failure \
+             into a benign-looking empty/false/None, which is how a dead chain backend or an \
+             unreadable DB becomes 'nothing is due'. Either propagate the error, or add an \
+             `{MARKER}:` comment above it stating which direction it fails in (toward MORE work is \
+             safe, toward LESS protection is the bug):\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The guard must be able to FAIL, otherwise it is decoration.
+    #[test]
+    fn guard_catches_a_planted_regression() {
+        let planted = "\
+            let branch = get_backup_txs(&pool, &name, &key).await.unwrap_or_default();\n";
+        let lines: Vec<&str> = planted.lines().collect();
+        let hit = lines.iter().enumerate().any(|(i, line)| {
+            let window = lines[i.saturating_sub(LOOKBACK)..=i].join("\n");
+            SWALLOWS.iter().any(|s| line.contains(s.trim_end_matches('\n')))
+                && PROTECTION_SUBJECTS.iter().any(|s| window.contains(s))
+                && !window.contains(MARKER)
+        });
+        assert!(hit, "the guard would not catch the exact regression it exists to prevent");
+    }
+
+    /// ...and it must NOT fire on the audited exception, or the marker is worthless.
+    #[test]
+    fn guard_accepts_an_audited_swallow() {
+        let audited = "\
+            // AUDITED-SWALLOW: fails toward MORE work — an empty set re-attempts every coin.\n\
+            let booked = self.token_carrier_outpoints().await.unwrap_or_default();\n";
+        let lines: Vec<&str> = audited.lines().collect();
+        let hit = lines.iter().enumerate().any(|(i, line)| {
+            if line.trim_start().starts_with("//") {
+                return false;
+            }
+            let window = lines[i.saturating_sub(LOOKBACK)..=i].join("\n");
+            SWALLOWS.iter().any(|s| line.contains(s.trim_end_matches('\n')))
+                && PROTECTION_SUBJECTS.iter().any(|s| window.contains(s))
+                && !window.contains(MARKER)
+        });
+        assert!(!hit, "an explicitly audited swallow must be accepted, or nobody will use the marker");
     }
 }

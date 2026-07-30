@@ -365,6 +365,7 @@ fn token_packaging_exit_economics() {
         total_vbytes: BACKUP_VB,
         wait_blocks: 0,
         exit_deadline_block: None,
+        exit_deadline_blind: None,
     };
 
     // Exact ceil arithmetic on both sides of the threshold.
@@ -401,6 +402,7 @@ fn width_vs_depth_weight_model() {
         total_vbytes: BACKUP_VB + BRANCH_VB * k,
         wait_blocks: 0,
         exit_deadline_block: None,
+        exit_deadline_blind: None,
     };
     // A width piece: depth 1, its backup plus its attributed share of the ONE shared split tx.
     let width_piece = ExitCostEstimate {
@@ -411,6 +413,7 @@ fn width_vs_depth_weight_model() {
         total_vbytes: BACKUP_VB + WIDTH_PER_PIECE_SHARE_VB,
         wait_blocks: 0,
         exit_deadline_block: None,
+        exit_deadline_blind: None,
     };
     let depth_last_coin = |k: u64| depth_estimate(k).total_vbytes;
     // Aggregate over k pieces from a depth chain: piece i at depth i.
