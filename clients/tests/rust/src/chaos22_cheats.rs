@@ -156,10 +156,11 @@ async fn steal_after_split(
     let o_vout = coin.utxo_vout.unwrap_or(0);
     let parent_sats = coin.amount_sats;
 
-    // Capture the coin's CURRENT ladder state BEFORE the split. On V2 this is the clawback vector:
-    // the in-ladder split replaces this state with `SP` over the SAME outpoint (X_m.out[0]) at a
+    // Capture the coin's CURRENT ladder state BEFORE the split — the clawback vector on a laddered
+    // coin: the in-ladder split replaces this state with `SP` over the SAME outpoint (X_m.out[0]) at a
     // strictly LOWER CSV, so the captured one becomes SUPERSEDED and must lose the maturity race.
-    // (The V1 cheat captured the absolute-locktime backup; TES-R has none — this is its analogue.)
+    // (On an un-laddered coin the equivalent cheat captures the absolute-locktime backup; a laddered
+    // coin has no such backup — the superseded state is its analogue.)
     let bundle = match mercuryrustlib::tesr::load(cc, name, &id).await {
         Ok(Some(b)) => b,
         _ => return, // not a laddered root (e.g. a received child) — nothing to stage here

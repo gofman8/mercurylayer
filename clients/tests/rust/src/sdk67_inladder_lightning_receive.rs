@@ -1,8 +1,8 @@
-//! E2E (SDK_E2E=67) — **NON-EXACT V2 Lightning RECEIVE via a latched in-ladder split** (LIGHTNING.md).
+//! E2E (SDK_E2E=67) — **NON-EXACT Lightning RECEIVE via a latched in-ladder split** (LIGHTNING.md).
 //!
-//! The RECEIVE symmetry of sdk65, and the last piece needed before the V1 LN lane can be deleted (V1
-//! RECEIVE handled any amount by splitting the SSP's coin). The SSP holds only a large V2-laddered
-//! coin, so `create_receive` cannot mint an exact coin — it falls back to an IN-LADDER split, conveying
+//! The RECEIVE symmetry of sdk65, and the last piece needed before the pre-TES-R LN lane could be
+//! deleted (it handled any amount by splitting the SSP's un-laddered coin). The SSP holds only a large
+//! laddered coin, so `create_receive` cannot mint an exact coin — it falls back to an IN-LADDER split, conveying
 //! a piece worth the invoiced amount to the user under an SE-minted preimage. Alice (zero on-chain
 //! presence) pays the HODL invoice; `settle_receive` (unchanged — it operates on the piece sid) releases
 //! the piece and claims the HTLC; Alice's watcher adopts the piece.
@@ -30,7 +30,7 @@ pub async fn execute() -> Result<()> {
     let (payer_node, ssp_node) = rln::setup_ln_pair("/tmp/rln-sdk67").await?;
     println!("SDK67 - LN pair up");
 
-    // SSP: a single LARGE V2-laddered coin (100k). ensure_exact_coin(20k) can't split it exactly ⟹
+    // SSP: a single LARGE laddered coin (100k). ensure_exact_coin(20k) can't split it exactly ⟹
     // create_receive falls back to the in-ladder split.
     let (ssp_wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk67_ssp"), None).await?;
     let t = prepaid_token(&cc).await?;
@@ -50,7 +50,7 @@ pub async fn execute() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     let ssp = SspService::new(ssp_wallet, RlnClient::new(&ssp_node.api), 0);
-    println!("SDK67 - SSP funded: one {ssp_deposit}-sat V2 laddered coin");
+    println!("SDK67 - SSP funded: one {ssp_deposit}-sat laddered coin");
 
     // alice: brand-new wallet, no on-chain presence. Receives a NON-EXACT amount vs the SSP's coin.
     let amount: u64 = 20_000;
@@ -83,7 +83,7 @@ pub async fn execute() -> Result<()> {
     alice_bg.abort();
     println!("SDK67 - alice claimed her piece ({} coin)", claimed.len());
 
-    // alice received a V2 piece worth at least the invoiced amount; it carries a child exit bundle.
+    // alice received a piece worth at least the invoiced amount; it carries a child exit bundle.
     let alice_bal = alice.get_balance().await?;
     assert!(
         alice_bal.available_sats >= amount,
@@ -99,6 +99,6 @@ pub async fn execute() -> Result<()> {
     assert_eq!(payer_status, "Succeeded", "payer's outbound payment settled");
     println!("SDK67 - alice's piece: {} sat (child bundle)", alice_bal.available_sats);
 
-    println!("SDK67 - ✓ SUCCESS: NON-EXACT Lightning RECEIVE into a V2 coin. The SSP had only a laddered coin, so create_receive in-ladder-split off a piece worth the invoice and conveyed it under an SE-minted preimage; alice paid the HODL and adopted the piece. Both LN directions now support arbitrary amounts on V2.");
+    println!("SDK67 - ✓ SUCCESS: NON-EXACT Lightning RECEIVE into a TES-R coin. The SSP had only a laddered coin, so create_receive in-ladder-split off a piece worth the invoice and conveyed it under an SE-minted preimage; alice paid the HODL and adopted the piece. Both LN directions now support arbitrary amounts on laddered coins.");
     Ok(())
 }

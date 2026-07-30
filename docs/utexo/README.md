@@ -41,7 +41,7 @@ descendant of the trigger — admission floor `min_child_value` = 1306 sat at 2 
 received children** (the claim completes the SE key handover, so a received piece pays onward
 off-chain, whole or split); **Lightning both directions** on the ladder via a HODL-invoice latch.
 
-> **Status** — one protocol (TES-R). **Zero tests pin a legacy lane.** Live suite
+> **Status** — one protocol (TES-R). **Zero tests pin the pre-TES-R design.** Live suite
 > `SDK_E2E=1..68` (not contiguous — some numbers were retired) plus the `chaos22` fuzzer, alongside
 > `RGB_E2E=1..14` and the complete upstream Mercury suite.
 
@@ -151,7 +151,7 @@ Condensed study notes and pricing models. *Researchers and designers.*
 Both files open with a status block saying what actually shipped; read [PROTOCOL.md](PROTOCOL.md)
 for the live protocol.
 
-- [MIGRATION.md](history/MIGRATION.md) — the plan and adversarial reasoning behind removing the old
-  lane and making TES-R the only path. **Executed.**
+- [MIGRATION.md](history/MIGRATION.md) — the plan and adversarial reasoning behind removing the
+  pre-TES-R design and making TES-R the only path. **Executed.**
 - [SPLIT-FINDINGS.md](history/SPLIT-FINDINGS.md) — the split-transfer review audit trail: the B1
   theft vector, the census holes, the child-bundle FATALs. **All closed or superseded.**

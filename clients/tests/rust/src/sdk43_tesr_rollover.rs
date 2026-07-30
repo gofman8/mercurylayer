@@ -55,7 +55,8 @@ pub async fn execute() -> Result<()> {
     let f_txid = coin.utxo_txid.clone().ok_or(anyhow!("no F txid"))?;
     let f_vout = coin.utxo_vout.ok_or(anyhow!("no F vout"))?;
     let owner_exit = bitcoin_core::getnewaddress()?;
-    // V1 baseline: the deposit's co-sign count, before any tier is established. This is v1_backups.
+    // Baseline: the deposit's co-sign count, before any tier is established — the signed-once backup
+    // transactions conveyed with the coin. This is flat_backups.
     let baseline = num_sigs(&cc, &sid).await?;
     let mut b = mercuryrustlib::tesr::establish(&cc, &mut coin, &owner_exit, CSV_E, CSV_D, FEE_RATE, NETWORK).await?;
 

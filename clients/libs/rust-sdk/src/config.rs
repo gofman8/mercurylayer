@@ -77,7 +77,8 @@ pub struct SdkConfig {
 ///   * an **RGB carrier** must never be laddered (a plain tier spend would destroy the allocation), so
 ///     it keeps the flat signed-once backup shape and transfers by backup-chain handover;
 ///   * a **split sub-coin** whose funding is un-broadcast cannot root a trigger [B0].
-/// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead V1 code.
+/// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead code left over
+/// from the pre-TES-R design.
 
 impl SdkConfig {
     /// Local regtest stack defaults (matches `regtest.Settings.toml` of the repo's test harness).

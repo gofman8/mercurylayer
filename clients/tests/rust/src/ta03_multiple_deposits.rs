@@ -132,7 +132,10 @@ async fn basic_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2:
 
     let info_config = mercuryrustlib::utils::info_config(&client_config).await?;
 
-    let split_backup_transactions = mercuryrustlib::transfer_receiver::split_backup_transactions(&backup_transactions);
+    // [R3] `split_backup_transactions` is now fallible (it used to `.expect()` and panic on a
+    // malformed backup tx — a remote DoS from either acceptance path). Here the vector is our own, so
+    // `?` is the honest way to surface an unexpected failure.
+    let split_backup_transactions = mercuryrustlib::transfer_receiver::split_backup_transactions(&backup_transactions)?;
 
     for (index, bk_txs) in split_backup_transactions.iter().enumerate() {
         if index == 0 {

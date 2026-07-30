@@ -93,7 +93,7 @@ impl UtexoWallet {
         // The rebate must be OFF-CHAIN-PAYABLE, i.e. at least a mintable piece — otherwise the
         // sponsor's own `transfer` refuses and the user is left having paid the re-anchor fee.
         // Two floors apply; take the larger:
-        //  * `fee + DUST_LIMIT` — the V1-era floor (min_split_output for this 112-vB tx), and
+        //  * `fee + DUST_LIMIT` — the un-laddered floor (min_split_output for this 112-vB tx), and
         //  * `min_child_value` — on a TES-R sponsor coin the rebate is paid by an IN-LADDER split,
         //    and the child carries its own extension + state tier before it can clear dust. At the
         //    default 2 sat/vB that is 2*(248+240)+330 = 1306 sat, well above the old 442, so the

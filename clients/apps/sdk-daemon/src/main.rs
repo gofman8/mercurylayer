@@ -180,6 +180,14 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "TokenCarrierMaterialized",
                                 json!({"statechain_id": statechain_id, "deadline_block": deadline_block, "tip": tip}),
                             ),
+                            WalletEvent::LadderEstablished { statechain_id } => (
+                                "LadderEstablished",
+                                json!({"statechain_id": statechain_id}),
+                            ),
+                            WalletEvent::LadderDefended { statechain_id, tiers_broadcast } => (
+                                "LadderDefended",
+                                json!({"statechain_id": statechain_id, "tiers_broadcast": tiers_broadcast}),
+                            ),
                         };
                         let line = json!({"event": name, "data": data}).to_string();
                         let mut out = tokio::io::stdout();

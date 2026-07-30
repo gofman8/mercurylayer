@@ -1,0 +1,8 @@
+[package]
+name = "ci-guards"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Repo invariants enforced as tests (no dependencies, always cheap to run)"
+
+[dependencies]

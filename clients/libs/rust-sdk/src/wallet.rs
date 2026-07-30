@@ -485,27 +485,80 @@ impl UtexoWallet {
                 }
                 // ROOT-ONLY [B0]: only a coin whose funding `F` is ON-CHAIN may be laddered. A split
                 // SUB-COIN's F is an un-broadcast split output, so its ladder's trigger has no prevout
-                // to spend: `unilateral_exit`'s V2 branch takes `exit_pass` (skipping the branch
+                // to spend: `unilateral_exit`'s laddered branch takes `exit_pass` (skipping the branch
                 // materialisation), the trigger broadcast fails, and the coin stalls forever reporting
                 // `wait_blocks: 0` — effectively unexitable via the SDK. Test the property that actually
                 // matters rather than a proxy: F must be a known on-chain tx. Fail CLOSED — if electrum
                 // cannot confirm F, skip this pass (a missed ladder is harmless and the next claim()
-                // retries; a laddered sub-coin is not). Laddering a sub-coin properly (V2 split-transfer,
-                // Model A on the split piece) is separate follow-on work.
-                let f_on_chain = {
+                // retries; a laddered sub-coin is not). Laddering a sub-coin properly is the in-ladder
+                // split's job (`in_ladder_pay`: `establish_child` gives each split child its own two-tier
+                // ladder, Model A on the piece), never this pass's.
+                //
+                // The on-chain funding OUTPUT (not merely "is F on chain") is also what [R5] below
+                // needs, so read it once and keep the scriptPubKey.
+                let f_spk_hex = {
                     use electrum_client::ElectrumApi;
-                    match coin.utxo_txid.as_ref().and_then(|t| t.parse::<bitcoin::Txid>().ok()) {
-                        Some(txid) => self.inner.cc.electrum_client.transaction_get(&txid).is_ok(),
-                        None => false,
+                    let tx0 = coin
+                        .utxo_txid
+                        .as_ref()
+                        .and_then(|t| t.parse::<bitcoin::Txid>().ok())
+                        .and_then(|txid| self.inner.cc.electrum_client.transaction_get(&txid).ok());
+                    match (tx0, coin.utxo_vout) {
+                        (Some(tx0), Some(vout)) => tx0
+                            .output
+                            .get(vout as usize)
+                            .map(|o| hex::encode(o.script_pubkey.as_bytes())),
+                        _ => None,
                     }
                 };
-                if !f_on_chain {
-                    continue;
-                }
+                let Some(f_spk_hex) = f_spk_hex else { continue };
                 match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
                     Ok(Some(_)) => continue, // already established — idempotent
                     Ok(None) => {}
                     Err(_) => continue,
+                }
+                // [R5] BINDABILITY GATE. A receiver accepts a conveyed ladder only through
+                // `verify_bundle_bound`, which fails CLOSED unless the COORDINATOR has an aggregate on
+                // record for the sid and that aggregate is the key controlling `F`. The aggregate column
+                // arrived with migration 0009 and was backfilled forward only, so pre-0009 rows are NULL
+                // — and those coins are otherwise ordinary confirmed on-chain roots that sail through
+                // every test above. Laddering one produces a bundle no receiver can bind. The
+                // acceptance-path rule is right and stays untouched (relaxing it is exactly the C-1
+                // decoy-ladder hole); what must change is that we never build a ladder that cannot be
+                // bound. Fail CLOSED here too — a coordinator we cannot reach, or a record we cannot
+                // read, means we do not know the coin is bindable, so we do not ladder it this pass.
+                //
+                // ⚠️ HONEST SCOPE: skipping does NOT restore transferability, but not for the reason an
+                // earlier draft of this comment gave. The claim path's flat lane still ACCEPTS
+                // `protocol_version < 2` — the unconditional floor was implemented, shown to break
+                // sdk41, and deliberately narrowed to a version/payload consistency check (a sender may
+                // not ship ladder material while asking to be judged by pre-ladder rules). So a legacy
+                // no-aggregate coin conveyed as version 0 still claims today. What it cannot do is carry
+                // a BOUND ladder, because there is no coordinator aggregate to bind against. Its value is
+                // still recoverable (on-chain withdrawal and its signed-once backup exit are untouched),
+                // but it cannot move off-chain until the COORDINATOR backfills `aggregate_xonly` for the
+                // legacy rows from its own columns (`x_only(user_public_key + server_public_key)` — the
+                // same value deposit-init records today, no client input). That is the completing fix
+                // and it lives server-side.
+                //
+                // What skipping buys here: establishing a ladder co-signs three tiers through the SE,
+                // which is IRREVERSIBLE — it burns signature budget and permanently raises the sid's
+                // `num_sigs` — on a coin that gains nothing, and it persists an unclaimable bundle that
+                // would later be conveyed as authentic. And it is self-healing: once the coordinator
+                // backfills, the next claim() pass ladders the coin with no client change.
+                let se_agg = match mercuryrustlib::utils::get_statechain_info(&sid, &self.inner.cc).await {
+                    Ok(Some(info)) => info.aggregate_pubkey.clone(),
+                    _ => continue, // coordinator unreachable / no record → not known bindable → skip
+                };
+                if mercuryrustlib::tesr::ladder_binding_precheck(
+                    &sid,
+                    &f_spk_hex,
+                    se_agg.as_deref(),
+                    &network,
+                )
+                .is_err()
+                {
+                    continue;
                 }
                 let payee = coin.backup_address.clone();
                 match mercuryrustlib::tesr::establish_auto(&self.inner.cc, coin, &payee, &network).await {
@@ -514,7 +567,7 @@ impl UtexoWallet {
                             let _ = self.inner.events_tx.send(WalletEvent::LadderEstablished { statechain_id: sid });
                         }
                     }
-                    Err(_) => { /* leave as V1: its tx1 backup still exits; resumable retry is a later stage */ }
+                    Err(_) => { /* leave un-laddered: its tx1 backup still exits; resumable retry is a later stage */ }
                 }
             }
         }
@@ -759,9 +812,9 @@ impl UtexoWallet {
         Ok(exited)
     }
 
-    /// **V2 watchtower pass (owner-run, keyless-style).** For every coin carrying an adopted TES-R
+    /// **TES-R watchtower pass (owner-run, keyless-style).** For every coin carrying an adopted TES-R
     /// ladder, run one [`watch_pass`](mercuryrustlib::tesr::watch_pass). If the coin has NOT been
-    /// triggered (funding `F` still unspent) this is a no-op — an idle V2 coin never ages, so there is
+    /// triggered (funding `F` still unspent) this is a no-op — an idle laddered coin never ages, so there is
     /// nothing to defend and no routine renewal is needed. If someone HAS triggered it (a contested
     /// exit: a prior owner racing a stale state, or a griefer), this races the owner's tiers; because
     /// the adopted current state carries the strictly-lowest CSV (enforced at adoption by
@@ -1048,7 +1101,7 @@ impl UtexoWallet {
                         // [HF-4 / B1] Never exit a coin that is no longer ours to exit. The explicit-id
                         // branch previously filtered on carrier status ALONE — so a WITHDRAWN parent (a
                         // coin already consumed by a split, `register_split_subcoins_n` sets that status)
-                        // could still be exited. On a V2 parent that is precisely the B1 theft: its
+                        // could still be exited. On a laddered parent that is precisely the B1 theft: its
                         // retained no-timelock trigger spends F, killing the split tx that funds the
                         // receiver's sub-coin, while the ladder pays the splitter the full parent value.
                         // This does not by itself fix B1 (an attacker can patch their client — the real
@@ -1076,9 +1129,9 @@ impl UtexoWallet {
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let mut statuses = Vec::new();
         for id in ids {
-            // V2 (TES-R) coin: if a ladder was adopted (deposit-established or received via Model A),
+            // Laddered (TES-R) coin: if a ladder was adopted (deposit-established or received via Model A),
             // the unilateral exit runs the tier chain — trigger spends F, then each extension/state as
-            // its relative-CSV matures — NOT the V1 absolute-locktime backup. exit_pass is idempotent
+            // its relative-CSV matures — NOT the un-laddered absolute-locktime backup. exit_pass is idempotent
             // and incremental: it advances the ladder as far as maturity allows on each call, so an
             // owner (or a background loop) calls unilateral_exit once per block until `complete`.
             if let Some(bundle) =

@@ -50,9 +50,9 @@ async fn fund(
 }
 
 pub async fn execute() -> Result<()> {
-    // Runs on the V2 (TES-R) default. The pre-pay SSP gate under test (recipient + census + value)
-    // is already V2-aware; conveying an EXACT-amount V2 coin also exercises the pre-pay verify_bundle
-    // ladder census that the V1 lane could not — strengthening the test at no cost.
+    // Runs on laddered (TES-R) coins. The pre-pay SSP gate under test (recipient + census + value)
+    // is ladder-aware; conveying an EXACT-amount laddered coin also exercises the pre-pay verify_bundle
+    // ladder census that an un-laddered coin could not — strengthening the test at no cost.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -70,8 +70,8 @@ pub async fn execute() -> Result<()> {
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_alice"), None).await?;
     let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk20_bob"), None).await?;
     let bob_address = bob.get_utexo_address().await?;
-    // alice holds TWO EXACT V2 (TES-R) coins so `ensure_exact_coin(25_000)` / `(10_000)` each return a
-    // coin WHOLE (early exact-match, no split — V2 refuses splitting a laddered coin [B1]). The
+    // alice holds TWO EXACT laddered (TES-R) coins so `ensure_exact_coin(25_000)` / `(10_000)` each return a
+    // coin WHOLE (early exact-match, no split — a laddered coin is never split as plain BTC [B1]). The
     // in-ladder split uses FREE derived tokens, so the old "split slots" prepaid top-up is gone.
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;

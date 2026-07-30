@@ -1,8 +1,9 @@
 //! E2E (SDK_E2E=47) — **full R′ transfer: a pre-established TES-R ladder carried across a transfer**.
 //!
-//! The exact flow sdk41 could NOT complete (it tripped the V1 receiver's V1-only checks). With the
-//! ladder conveyed in a protocol_version=2 message and the receiver's V1 checks (num_sigs +
-//! decrementing-ladder) gated behind version<2 in favour of the R′ verifier, the transfer completes.
+//! The exact flow sdk41 could NOT complete (it tripped the un-laddered receive path's checks). With
+//! the ladder conveyed in a protocol_version=2 message, the receiver's flat
+//! `num_sigs == backup_transactions.len()` equality is replaced by the R′ verifier's count equation
+//! (the decrementing-ladder structural check still runs on both paths), so the transfer completes.
 //!
 //! Run with SDK_E2E=47 (needs the regtest + Mercury lockbox stack, Core 28+).
 
@@ -32,7 +33,7 @@ pub async fn execute() -> Result<()> {
     mercuryrustlib::sqlite_manager::insert_wallet(&cc.pool, &bob_wallet).await?;
     let bob_addr = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk47_bob").await?;
     mercuryrustlib::transfer_sender::execute(&cc, &bob_addr, "sdk47_alice", &sid, None, false, None).await?;
-    println!("SDK47 - Alice sent the transfer (ladder conveyed in a V2 message)");
+    println!("SDK47 - Alice sent the transfer (ladder conveyed in a protocol_version=2 message)");
 
     let received = mercuryrustlib::transfer_receiver::execute(&cc, "sdk47_bob").await?;
     println!("SDK47 - Bob receive result: {:?}", received.received_statechain_ids);

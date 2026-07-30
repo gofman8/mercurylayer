@@ -181,14 +181,15 @@ const processEncryptedMessage = async (clientConfig, electrumClient, db, coin, e
         throw new Error("Latest Backup Tx does not pay to the expected public key");
     }
 
-    // [S7] FAIL CLOSED on a V2 (TES-R) coin. This JS client cannot run the R′ ladder verifier
-    // (verify_bundle), so it must NOT fall through to the V1 flat `num_sigs == backups.length` check
-    // below: that check does not detect a retained hidden state, so a malicious V2 sender could pad
-    // backups to match num_sigs and later broadcast a lower-CSV state to take the coin back. Refuse
-    // rather than mis-verify. (Receive V2 coins with the Rust SDK until the ladder verifier is ported.)
+    // [S7] FAIL CLOSED on a laddered (TES-R) coin. This JS client cannot run the R′ ladder verifier
+    // (verify_bundle), so it must NOT fall through to the un-laddered flat `num_sigs == backups.length`
+    // check below: that check does not detect a retained hidden state, so a malicious sender of a
+    // laddered coin could pad backups to match num_sigs and later broadcast a lower-CSV state to take
+    // the coin back. Refuse rather than mis-verify. (Receive laddered coins with the Rust SDK until the
+    // ladder verifier is ported.)
     if (transferMsg.protocol_version >= 2 ||
         (transferMsg.tesr_ladder !== undefined && transferMsg.tesr_ladder !== null)) {
-        throw new Error("V2 (TES-R) coin: this client cannot verify the exit ladder — refusing (fail-closed); receive it with the Rust SDK");
+        throw new Error("Laddered (TES-R) coin: this client cannot verify the exit ladder — refusing (fail-closed); receive it with the Rust SDK");
     }
 
     if (statechainInfo.num_sigs != transferMsg.backup_transactions.length) {

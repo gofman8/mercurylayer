@@ -1,11 +1,12 @@
-//! E2E (SDK_E2E=50) — **V2DEF-3: the SDK `unilateral_exit()` routes a V2 coin through its ladder**.
+//! E2E (SDK_E2E=50) — **V2DEF-3: the SDK `unilateral_exit()` routes a laddered coin through its
+//! ladder**.
 //!
 //! sdk49 drove the tier chain by hand through `mercuryrustlib`. This proves the *public SDK* surface:
 //! a wallet whose deposit auto-established a ladder calls
 //! `wallet.unilateral_exit()` and the SDK — with no ladder knowledge required by the caller — walks the
 //! TES-R chain (trigger → extension → state) as each relative-CSV matures, reporting `wait_blocks`
-//! between tiers, until the funds land at the wallet's own seed-derived backup address. No V1
-//! absolute-locktime backup is broadcast.
+//! between tiers, until the funds land at the wallet's own seed-derived backup address. No
+//! absolute-locktime backup transaction is broadcast.
 //!
 //! Run with SDK_E2E=50 (needs the regtest + Mercury lockbox stack, Core 28+).
 
@@ -30,7 +31,7 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk50_alice"), None).await?;
 
-    // --- V2-native deposit: claim() auto-establishes the ladder during the confirm loop. -----------
+    // --- Deposit: claim() auto-establishes the ladder during the confirm loop. ---------------------
     let amount = 100_000u32;
     let token = mercuryrustlib::deposit::get_token(&cc).await?;
     let t = crate::utils::handle_token_response(&cc, &token).await?;
@@ -67,7 +68,7 @@ pub async fn execute() -> Result<()> {
     let exit_value = bundle.current().state.out_value;
     assert_eq!(exit_addr, coin.backup_address, "ladder exits to the wallet's own backup_address");
     assert!(!is_outpoint_spent(&cc, &f_txid, f_vout), "F unspent before the exit");
-    println!("SDK50 - V2-native coin {sid}: exiting via the ladder ({} tiers) to the wallet's backup_address", bundle.exit_tiers().len());
+    println!("SDK50 - laddered coin {sid}: exiting via the ladder ({} tiers) to the wallet's backup_address", bundle.exit_tiers().len());
 
     // --- Drive the SDK exit: each call advances the ladder as far as CSV maturity allows. ----------
     // The caller never touches a tier tx — unilateral_exit() broadcasts the trigger, then reports how
@@ -86,7 +87,7 @@ pub async fn execute() -> Result<()> {
     }
     bitcoin_core::generatetoaddress(2, &core)?; // confirm the final exit state
 
-    // --- The funds are the owner's, on-chain, at his own key. F is consumed; no V1 backup was used. -
+    // --- The funds are the owner's, on-chain, at his own key. F is consumed; no backup tx was used. -
     assert!(tx_exists(&cc, &bundle.current().state.txid), "the exit state confirmed on-chain");
     assert!(is_outpoint_spent(&cc, &f_txid, f_vout), "F consumed by the ladder exit");
     assert!(
@@ -97,6 +98,6 @@ pub async fn execute() -> Result<()> {
     let again = alice.unilateral_exit(Some(vec![sid.clone()]), None).await?;
     assert!(again[0].complete && again[0].wait_blocks == 0, "a completed exit stays complete");
 
-    println!("SDK50 - ✓ PASS: wallet.unilateral_exit() walked the TES-R ladder to completion ({exit_value} sat at the owner's key, F spent, no V1 backup)");
+    println!("SDK50 - ✓ PASS: wallet.unilateral_exit() walked the TES-R ladder to completion ({exit_value} sat at the owner's key, F spent, no absolute-locktime backup)");
     Ok(())
 }

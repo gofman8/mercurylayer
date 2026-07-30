@@ -1,15 +1,16 @@
 //! E2E (SDK_E2E=59) — **in-ladder split PAYMENT over the real SDK API: Alice pays Bob, Bob exits**.
 //!
 //! The end-to-end proof that the in-ladder split (sdk58's `verify_child_bundle` core) is a usable
-//! payment through `UtexoWallet::transfer` / `claim` / `unilateral_exit`, NOT just a verifier. With
+//! payment through `UtexoWallet::transfer` / `claim` / `unilateral_exit`, NOT just a verifier.
 //! Alice's deposit auto-establishes a TES-R ladder; a
-//! non-exact payment to Bob can no longer be split as plain BTC (B1), so `transfer()` runs the
+//! non-exact payment to Bob cannot be split as plain BTC (B1), so `transfer()` runs the
 //! IN-LADDER split: `SP` descends from the trigger, the PIECE child pays Bob (Model A) and is conveyed
 //! to his mailbox, the CHANGE child pays Alice back. Bob's `claim()` adopts the child via
 //! `verify_child_bundle` (parent F on-chain, both sids terminal); Bob then `unilateral_exit`s the child
 //! and the funds land at Bob's own key. Alice keeps the change.
 //!
-//! This is the transfer/claim integration the split needed to make V2 the default. Run: SDK_E2E=59.
+//! This is the transfer/claim integration the split needed to become the default payment path for a
+//! laddered coin. Run: SDK_E2E=59.
 
 use std::time::Duration;
 
@@ -26,8 +27,8 @@ async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Resu
     crate::utils::handle_token_response(cc, &token).await
 }
 
-/// A V2-native SDK wallet (auto-establishes ladders at claim/deposit).
-async fn v2_wallet(name: &str) -> Result<UtexoWallet> {
+/// A ladder-native SDK wallet (auto-establishes ladders at claim/deposit).
+async fn ladder_wallet(name: &str) -> Result<UtexoWallet> {
     let (w, _) = UtexoWallet::initialize(SdkConfig::regtest(name), None).await?;
     Ok(w)
 }
@@ -38,11 +39,11 @@ pub async fn execute() -> Result<()> {
     }
     let cc = mercuryrustlib::client_config::load().await;
 
-    let alice = v2_wallet("sdk59_alice").await?;
-    let bob = v2_wallet("sdk59_bob").await?;
+    let alice = ladder_wallet("sdk59_alice").await?;
+    let bob = ladder_wallet("sdk59_bob").await?;
     let bob_address = bob.get_utexo_address().await?;
 
-    // --- Alice deposits a single V2 coin; claim() auto-establishes its TES-R ladder. -------------
+    // --- Alice deposits a single coin; claim() auto-establishes its TES-R ladder. ----------------
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(DEPOSIT).await?;
@@ -62,7 +63,7 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    // Confirm the coin is laddered (V2) — otherwise this would test the old plain-BTC split path.
+    // Confirm the coin is laddered — otherwise this would test the un-laddered plain-BTC split path.
     let alice_sid = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk59_alice")
         .await?
         .coins
@@ -72,7 +73,7 @@ pub async fn execute() -> Result<()> {
         .ok_or(anyhow!("alice has no confirmed coin"))?;
     assert!(
         mercuryrustlib::tesr::load(&cc, "sdk59_alice", &alice_sid).await?.is_some(),
-        "alice's coin must carry a TES-R ladder (V2) for an in-ladder split"
+        "alice's coin must carry a TES-R ladder for an in-ladder split"
     );
     println!("SDK59 - alice deposited {DEPOSIT} and auto-established a ladder (sid {alice_sid})");
 
@@ -136,7 +137,7 @@ pub async fn execute() -> Result<()> {
             "A_child must be INVARIANT across the handover — otherwise every pre-signed child tier is dead"
         );
     }
-    // The exit ladder must NOT look like a V1 absolute-locktime coin: a child exits by relative CSV.
+    // The exit must NOT look like an un-laddered absolute-locktime coin: a child exits by relative CSV.
     // A stamped locktime here would mark the coin permanently due for re-anchor and bill every quote.
     assert!(bob_child_coin.locktime.is_none(), "a child has no absolute-locktime backup; locktime must stay None");
     println!("SDK59 - bob adopted the split child (sid {bob_child_sid}, {PAY} sat): census verified, key handover COMPLETED, A_child invariant — a FIRST-CLASS coin");

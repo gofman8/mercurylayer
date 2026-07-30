@@ -215,11 +215,11 @@ pub async fn run(
             let Some(id) = c.statechain_id.clone() else { continue };
             report.live_coins += 1;
             custody.entry(id.clone()).or_default().push(u.idx);
-            // Depth proxy + stuck detection, in TES-R terms. On V2 a coin's exit is its LADDER, not a
-            // V1 backup chain: a root carries a `tesr-` bundle (exit_tiers) and a received child a
-            // `ctesr-` bundle (its ancestors + its own two tiers). A child legitimately has ZERO V1
-            // backup rows (CHILD_V2_BASELINE = 0), so keying "stuck" on an empty backup list alone
-            // would flag every healthy child as money loss.
+            // Depth proxy + stuck detection, in TES-R terms. A laddered coin's exit is its LADDER,
+            // not a flat backup chain: a root carries a `tesr-` bundle (exit_tiers) and a received
+            // child a `ctesr-` bundle (its ancestors + its own two tiers). A child legitimately has
+            // ZERO flat backup rows (CHILD_V2_BASELINE = 0), so keying "stuck" on an empty backup
+            // list alone would flag every healthy child as money loss.
             let backups = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, name, &id)
                 .await
                 .unwrap_or_default();

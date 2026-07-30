@@ -1,5 +1,5 @@
 //! E2E (adversarial): SDK guard rails — the Utexo negative cases the SDK itself owns, on the
-//! V2 (TES-R) lane.
+//! laddered (TES-R) coin shape.
 //!
 //! 1. InsufficientBalance: transfer above balance is refused with a typed error.
 //! 2. Double-spend of a split parent: a non-exact payment out of a laddered coin runs the IN-LADDER
@@ -30,7 +30,7 @@ pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
-    // V2 (TES-R) is the default protocol: `claim()` auto-establishes an exit ladder on a fresh
+    // TES-R ladders every fresh root coin: `claim()` auto-establishes an exit ladder on a fresh
     // deposit, so alice's coin is LADDERED. A laddered coin can never be self-split as plain BTC
     // ([B1] — a prior owner's no-timelock trigger could void the split), so a non-exact payment is
     // routed to the IN-LADDER split instead: `SP` descends from the trigger, the piece child pays
@@ -78,13 +78,13 @@ pub async fn execute() -> Result<()> {
         .find(|c| c.status == mercuryrustlib::CoinStatus::CONFIRMED)
         .and_then(|c| c.statechain_id.clone())
         .ok_or_else(|| anyhow!("no confirmed coin"))?;
-    // Fail loudly rather than silently testing the old plain-BTC split path: this case only means
-    // anything if the parent actually carries a V2 ladder.
+    // Fail loudly rather than silently testing the un-laddered plain-BTC split path: this case only means
+    // anything if the parent actually carries a TES-R ladder.
     assert!(
         mercuryrustlib::tesr::load(&cc, "sdk4_alice", &parent_id).await?.is_some(),
-        "alice's coin must carry a TES-R ladder (V2) — otherwise this is not the in-ladder split path"
+        "alice's coin must carry a TES-R ladder — otherwise this is not the in-ladder split path"
     );
-    // No "split slot" top-ups needed on V2: both child slots are funded by FREE derived tokens.
+    // No "split slot" top-ups needed in-ladder: both child slots are funded by FREE derived tokens.
     // The split IS the payment — the 15k piece child is conveyed straight to bob (Model A), so
     // there is no separate hand-off of the piece afterwards.
     let r = alice.transfer(&bob_address, 15_000).await?;
@@ -115,7 +115,7 @@ pub async fn execute() -> Result<()> {
         .map(|_| ())
         .unwrap_err();
     println!("SDK04 - double-spend of the split parent refused: {err}");
-    // ...and, faithfully to the V1 property this replaces, a direct second split of the SAME parent
+    // ...and, faithfully to the pre-TES-R property this replaces, a direct second split of the SAME parent
     // statechain id is refused too — the SE refuses to co-sign a second SP over a terminal node.
     // This is the load-bearing assertion: without it the parent could yield a second payment.
     let err = alice

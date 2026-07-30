@@ -14,16 +14,25 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
-use bitcoin::psbt::Psbt;
+use bitcoin::hashes::{sha256, Hash as BitcoinHash, HashEngine};
+use bitcoin::psbt::{Input as PsbtInput, Psbt, PsbtSighashType};
+use bitcoin::{
+    absolute, Address, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+};
 use electrum_client::ElectrumApi;
+use mercurylib::tesr::{
+    committed_fee_for_outputs, p2a_script, payee_address, P2A_SCRIPT_BYTES, P2A_VALUE,
+};
 use mercurylib::transaction::{
     create_signature, get_partial_sig_request_for_colored_tx,
     get_partial_sig_request_for_colored_tx_multi, get_unsigned_backup_psbt,
     get_unsigned_combine_psbt, get_unsigned_split_psbt, new_backup_transaction,
     new_backup_transaction_multi,
 };
+use mercurylib::utils::get_network;
 use mercurylib::wallet::Coin;
-use mercury_rgb::RgbWallet;
+use mercury_rgb::{consignment_witness_txids, RgbWallet};
+use serde::{Deserialize, Serialize};
 
 use crate::client_config::ClientConfig;
 use crate::transaction::{sign_first, sign_second};
@@ -36,8 +45,10 @@ pub struct ColoredBackupTx {
     /// Txid of the signed transaction (the RGB witness txid the receiver accepts against).
     pub txid: String,
     /// Index of the spendable output paying the recipient/owner (the asset seal). It is the single
-    /// non-OP_RETURN output: vout 1 when rgb-lib placed the OP_RETURN first (taproot recipient), or
-    /// vout 0 when it appended the OP_RETURN last (non-taproot recipient).
+    /// PAYLOAD output — neither the OP_RETURN commitment nor a P2A anchor (see
+    /// [`colored_payload_vouts`]): vout 1 when rgb-lib placed the OP_RETURN first (taproot
+    /// recipient), or vout 0 when it appended the OP_RETURN last (non-taproot recipient). Derived
+    /// and asserted, never assumed.
     pub recipient_vout: u32,
     /// RGB consignment (base64) proving the transition. Relayed in-band to the receiver.
     pub consignment: String,
@@ -121,14 +132,28 @@ pub async fn create_colored_backup_tx(
     let colored_tx_hex =
         hex::encode(bitcoin::consensus::encode::serialize(&colored_unsigned_tx));
 
-    // The recipient/owner output is the (single) non-OP_RETURN output. rgb-lib places the OP_RETURN
-    // commitment first when a taproot output is present (so the recipient is at vout 1), but appends
-    // it last for non-taproot recipients (recipient stays at vout 0) - so compute it, don't assume.
-    let recipient_vout = colored_unsigned_tx
-        .output
-        .iter()
-        .position(|o| !o.script_pubkey.is_op_return())
-        .unwrap_or(0) as u32;
+    // The recipient/owner output is the (single) PAYLOAD output: neither the RGB `opret` commitment
+    // nor a P2A anchor. rgb-lib places the OP_RETURN commitment first when a taproot output is
+    // present (so the recipient is at vout 1), but appends it last for non-taproot recipients
+    // (recipient stays at vout 0) - so compute it, don't assume.
+    //
+    // ⚠️ Hardened per `docs/utexo/CTESR-GATE.md` §4.3. The previous derivation
+    // (`position(|o| !o.script_pubkey.is_op_return()).unwrap_or(0)`) was correct only *by accident*
+    // for the one-payload case: it returns the wrong vout for any tx with a second non-opret output
+    // (a P2A anchor, a change output, a multi-payload split), and its `unwrap_or(0)` turned "there
+    // is no spendable output at all" into "vout 0" — which, on a coloured tx, is the opret. It is
+    // now an explicit derivation with an asserted cardinality, so any such shape fails CLOSED.
+    let payload_vouts = colored_payload_vouts(&colored_unsigned_tx);
+    if payload_vouts.len() != 1 {
+        return Err(anyhow!(
+            "colored backup tx has {} payload outputs (expected exactly 1); \
+             payload vouts {:?} of {} outputs",
+            payload_vouts.len(),
+            payload_vouts,
+            colored_unsigned_tx.output.len()
+        ));
+    }
+    let recipient_vout = payload_vouts[0];
 
     // 5. Compute the blind-MuSig2 partial-signature session over the colored transaction (which now
     //    commits to the OP_RETURN), get the server's partial signature, and aggregate.
@@ -260,15 +285,11 @@ pub async fn create_colored_split_tx(
     let colored_unsigned_tx = colored_psbt.unsigned_tx.clone();
     let colored_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&colored_unsigned_tx));
 
-    // The non-OP_RETURN outputs, in tx order, are the sub-coins in the same order as `splits`
-    // (rgb-lib preserves output order and only inserts the OP_RETURN). Map each split -> its vout.
-    let output_vouts: Vec<u32> = colored_unsigned_tx
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| !o.script_pubkey.is_op_return())
-        .map(|(vout, _)| vout as u32)
-        .collect();
+    // The PAYLOAD outputs, in tx order, are the sub-coins in the same order as `splits` (rgb-lib
+    // preserves output order and only inserts the OP_RETURN). Map each split -> its vout. Note this
+    // lane never carries a P2A anchor today, so excluding it is a no-op here — but it is the correct
+    // derivation, and the `!= splits.len()` guard below still fails CLOSED either way.
+    let output_vouts: Vec<u32> = colored_payload_vouts(&colored_unsigned_tx);
     if output_vouts.len() != splits.len() {
         return Err(anyhow!(
             "colored split tx has {} spendable outputs, expected {}",
@@ -388,13 +409,7 @@ pub async fn create_colored_combine_tx(
     let colored_unsigned_tx = colored_psbt.unsigned_tx.clone();
     let colored_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&colored_unsigned_tx));
 
-    let output_vouts: Vec<u32> = colored_unsigned_tx
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| !o.script_pubkey.is_op_return())
-        .map(|(vout, _)| vout as u32)
-        .collect();
+    let output_vouts: Vec<u32> = colored_payload_vouts(&colored_unsigned_tx);
     if output_vouts.len() != outputs.len() {
         return Err(anyhow!(
             "colored combine tx has {} spendable outputs, expected {}",
@@ -694,4 +709,647 @@ fn tx_nlocktime(tx_hex: &str) -> Result<u32> {
     let tx: bitcoin::Transaction =
         bitcoin::consensus::encode::deserialize(&hex::decode(tx_hex)?)?;
     Ok(tx.lock_time.to_consensus_u32())
+}
+
+// =================================================================================================
+// CTES-R — per-tier seal blinding, and the coloured tier builder
+//
+// Gate decision: `docs/utexo/CTESR-GATE.md` §3.1 (blinding), §3.4 (fee), §3.5 (builder), §4.3
+// (hardened vout derivation). Nothing here is wired into the live TES-R ladder — this is the
+// unit-level foundation the "colour a live T over a real F" commit is built on.
+// =================================================================================================
+
+/// Domain-separation tag for the CTES-R seal-blinding derivation.
+///
+/// If the derivation inputs ever change, bump the `/v1` suffix — never edit the bytes in place. An
+/// old and a new derivation must not be able to produce the same blinding for different tiers, and
+/// a version bump is what makes a sender/receiver mismatch loud (the receiver's `accept` fails)
+/// instead of silent.
+const SEAL_BLINDING_TAG: &[u8] = b"mercury/utexo/ctesr/seal-blinding/v1";
+
+/// What a coloured transition IS, structurally — one byte of the seal-blinding domain.
+///
+/// Rival transitions over the SAME parent output are the NORMAL case in CTES-R: a renewal replaces
+/// `X_m` over `T`'s payload output, a transfer replaces `S_k` over `X`'s payload output. The role is
+/// the first thing that separates them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TierRole {
+    /// The on-chain deposit transition that binds an allocation to a fresh statechain UTXO `F`.
+    Funding,
+    /// TRIGGER `T` — spends `F`, no relative timelock.
+    Trigger,
+    /// EXTENSION `X_m` — spends `T`'s payload output; `tier_index` is the renewal epoch `m`.
+    Extension,
+    /// STATE `S_k` — spends `X_m`'s payload output; `tier_index` is the state counter `k`.
+    State,
+    /// SPLIT STATE `SP` — a state tier with N payload outputs (the in-ladder split).
+    SplitState,
+    /// Cooperative DE-TRIGGER — a fresh, timelock-disabled spend of `T`'s payload output.
+    Detrigger,
+    /// Un-laddered colored backup / withdrawal transaction (the legacy carrier lane).
+    Backup,
+    /// Un-laddered colored split (the legacy token-piece lane).
+    Split,
+    /// Un-laddered colored combine (N carriers -> M pieces).
+    Combine,
+}
+
+impl TierRole {
+    /// STABLE wire tag. **Never renumber.** A changed tag silently changes every blinding derived
+    /// from it, which desynchronises sender and receiver on coins that are already in flight.
+    pub const fn tag(self) -> u8 {
+        match self {
+            TierRole::Funding => 0x01,
+            TierRole::Trigger => 0x02,
+            TierRole::Extension => 0x03,
+            TierRole::State => 0x04,
+            TierRole::SplitState => 0x05,
+            TierRole::Detrigger => 0x06,
+            TierRole::Backup => 0x07,
+            TierRole::Split => 0x08,
+            TierRole::Combine => 0x09,
+        }
+    }
+}
+
+/// The identity of ONE coloured transition's seal — everything the blinding is derived from.
+///
+/// **Why this exists.** rgb-lib commits the seal blinding into the `OpId`
+/// (`Assign::conceal -> SecretSeal -> AssignmentCommitment.seal`), and a `TransitionBundle`'s id
+/// commits *only* its `input_map`. So two transitions over the same parent outpoint, with the same
+/// amounts and the same blinding, collapse to ONE `OpId` and ONE `BundleId`; rgb-lib then resolves
+/// that BundleId to whichever rival witness has the numerically smallest **internal** (LE) txid — an
+/// arbitrary hash lottery uncorrelated with recency. The loser's consignment embeds the rival's
+/// witness and **no branch the receiver can try will validate**
+/// (`docs/utexo/CTESR-GATE.md` §2.2). The single global `TOKEN_BLINDING = 777` armed exactly that.
+///
+/// **The uniqueness obligation.** Uniqueness must hold over the whole
+/// `(parent outpoint, role, index)` space: two tiers sharing a parent output must NEVER share a
+/// blinding. Within one coin `(role, tier_index, rung)` separates rivals; across coins
+/// `statechain_id` does.
+///
+/// **Receiver derivability.** The receiver needs the identical value for
+/// `RgbWallet::accept(txid, vout, blinding)`, so every input must be data it already holds from the
+/// transfer message: the coin's `statechain_id`, and the tier's role/index/rung, which are implied
+/// by the disclosed tier the consignment is about. It must **derive**, never trust a sender-supplied
+/// blinding field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierSeal {
+    /// The `statechain_id` of the coin whose ladder this transition belongs to.
+    ///
+    /// Exception, and the only one: a [`TierRole::Funding`] transition runs *before* the coin has a
+    /// statechain_id (the deposit has not confirmed yet), so it passes the unique deposit address it
+    /// is funding instead. Nothing derives a funding blinding on the receiving side.
+    pub statechain_id: String,
+    /// What the transition structurally is.
+    pub role: TierRole,
+    /// The tier's counter within its role: the renewal epoch `m` for an extension, the state counter
+    /// `k` for a state, the spend generation for a legacy split/backup.
+    pub tier_index: u32,
+    /// Free discriminator for transitions that would otherwise share
+    /// `(statechain_id, role, tier_index)` — the child index `j` of an in-ladder split, the ladder
+    /// generation after an on-chain re-anchor, or a transition's payload arity. `0` when there is
+    /// nothing to discriminate.
+    pub rung: u32,
+}
+
+impl TierSeal {
+    pub fn new(statechain_id: impl Into<String>, role: TierRole, tier_index: u32, rung: u32) -> Self {
+        Self { statechain_id: statechain_id.into(), role, tier_index, rung }
+    }
+
+    /// The seal blinding for this tier. Deterministic; both parties derive it independently.
+    pub fn blinding(&self) -> u64 {
+        tier_blinding(&self.statechain_id, self.role, self.tier_index, self.rung)
+    }
+}
+
+/// `blinding = BE_u64(SHA256(tag ‖ len(id) ‖ id ‖ role ‖ tier_index ‖ rung)[..8])`.
+///
+/// The length prefix on `id` is load-bearing: without it `("ab", role, …)` and `("a", …)` could be
+/// made to hash the same byte string, which is precisely the collision this derivation exists to
+/// prevent. All integers are big-endian so the derivation is byte-for-byte reproducible by any other
+/// implementation (the receiver may not be this crate).
+pub fn tier_blinding(statechain_id: &str, role: TierRole, tier_index: u32, rung: u32) -> u64 {
+    let mut engine = sha256::Hash::engine();
+    engine.input(SEAL_BLINDING_TAG);
+    engine.input(&(statechain_id.len() as u64).to_be_bytes());
+    engine.input(statechain_id.as_bytes());
+    engine.input(&[role.tag()]);
+    engine.input(&tier_index.to_be_bytes());
+    engine.input(&rung.to_be_bytes());
+    let digest = sha256::Hash::from_engine(engine).to_byte_array();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head)
+}
+
+/// True for the standard Pay-to-Anchor script `OP_1 <0x4e73>`.
+fn is_p2a(script_pubkey: &ScriptBuf) -> bool {
+    script_pubkey.as_bytes() == P2A_SCRIPT_BYTES
+}
+
+/// The PAYLOAD (value-carrying) output indices of a coloured transaction, in ascending vout order:
+/// every output that is **neither** the RGB `opret` commitment **nor** the P2A anchor.
+///
+/// `docs/utexo/CTESR-GATE.md` §3.5/§4.3: the P2A anchor script is *not* an OP_RETURN
+/// (`is_op_return = false`, `is_v1_p2tr = false`, `is_witness_program = true`), so the older
+/// `!is_op_return` filter counts it as a payload — observed tripping `create_colored_split_tx`'s own
+/// `output_vouts.len() != splits.len()` guard at both n=1 and n=3. Callers must still assert the
+/// cardinality they expect; this function only classifies.
+pub fn colored_payload_vouts(tx: &Transaction) -> Vec<u32> {
+    tx.output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| !o.script_pubkey.is_op_return() && !is_p2a(&o.script_pubkey))
+        .map(|(vout, _)| vout as u32)
+        .collect()
+}
+
+/// The committed fee a **coloured** tier must bake in: `committed_fee_for_outputs(n_payload + 1)`.
+///
+/// `docs/utexo/CTESR-GATE.md` §3.4. The `opret` output serialises to exactly 43 bytes (8 value + 1
+/// length + 34 scriptPubKey = `6a20` + a 32-byte MPC commitment), which is exactly
+/// `P2TR_OUT_VBYTES`, so "one more payload output" is not an approximation — it is the identity.
+/// Measured exact (2.000 sat/vB) on the coloured transaction at n=1 and n=3. Using the uncoloured
+/// `committed_fee_for_outputs(n_payload, …)` underpays every coloured tier by a constant
+/// `43 × rate` sats regardless of `n`, which breaks the self-funding property that lets a pre-signed
+/// tier relay and confirm standalone without its P2A anchor.
+pub fn colored_committed_fee(n_payload: usize, fee_rate_sats_per_vb: f64) -> u64 {
+    committed_fee_for_outputs(n_payload + 1, fee_rate_sats_per_vb)
+}
+
+/// Total value available to the payload outputs of a coloured tier = parent value − the coloured
+/// committed fee − the P2A anchor. `None` when the parent cannot carry another coloured tier.
+pub fn colored_tier_out_total(
+    prev_value: u64,
+    n_payload: usize,
+    fee_rate_sats_per_vb: f64,
+) -> Option<u64> {
+    prev_value.checked_sub(colored_committed_fee(n_payload, fee_rate_sats_per_vb) + P2A_VALUE)
+}
+
+/// [`colored_tier_out_total`] for the ordinary one-payload tier (`T` / `X_m` / `S_k`).
+pub fn colored_tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64> {
+    colored_tier_out_total(prev_value, 1, fee_rate_sats_per_vb)
+}
+
+/// One payload output of a coloured tier, as built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColoredPayloadOut {
+    /// **Post-colouring** output index. Derived, never assumed — see [`colored_payload_vouts`].
+    pub vout: u32,
+    /// Sats on the output.
+    pub value: u64,
+    /// Its scriptPubKey, hex. A child tier spends `(txid, vout)` and must see this script.
+    pub script_pubkey_hex: String,
+}
+
+/// What to colour. One input (the parent tier's payload output), N payload outputs, one P2A anchor.
+pub struct ColoredTierSpec<'a> {
+    /// RGB contract whose allocation rides this ladder.
+    pub contract_id: &'a str,
+    /// Parent outpoint: the payload output of the tier above (or the funding UTXO `F` for `T`).
+    pub prev_txid: &'a str,
+    pub prev_vout: u32,
+    /// Value of the parent output. Load-bearing twice: the fee arithmetic, and the taproot sighash
+    /// that will later co-sign this tier.
+    pub prev_value: u64,
+    /// scriptPubKey of the parent output, hex.
+    pub prev_spk_hex: &'a str,
+    /// Raw nSequence: `TRIGGER_SEQUENCE` for `T`/de-trigger, `csv_blocks(csv)` for `X_m`/`S_k`/`SP`.
+    pub sequence: u32,
+    /// Payload outputs, in order: `(address, sats, rgb_amount)`. `rgb_amount == 0` leaves an output
+    /// uncoloured (a sats-only child). `Σ sats` MUST equal
+    /// [`colored_tier_out_total`]`(prev_value, payloads.len(), fee_rate)`.
+    pub payloads: &'a [(String, u64, u64)],
+    pub network: &'a str,
+    pub fee_rate: f64,
+    /// Optional second separator for rival transitions (`ColoringInfo.nonce`). Belt-and-braces only;
+    /// the [`TierSeal`] is what the receiver re-derives.
+    pub nonce: Option<u64>,
+}
+
+/// A coloured, **unsigned**, un-broadcast tier.
+pub struct ColoredTier {
+    /// The coloured unsigned transaction, hex. Feed this to `mercurylib::tesr::cosign_tier_request`.
+    pub tx_hex: String,
+    /// The coloured PSBT, base64 (what rgb-lib returned).
+    pub psbt_base64: String,
+    /// Txid — stable across signing (a key-spend adds only witness data), so a child tier can be
+    /// built on it before this one is co-signed.
+    pub txid: String,
+    /// Payload outputs with their EXPLICIT post-colouring vouts, in the order given in the spec.
+    pub payloads: Vec<ColoredPayloadOut>,
+    /// Index of the RGB `opret` commitment output.
+    pub opret_vout: u32,
+    /// Index of the P2A anchor output.
+    pub p2a_vout: u32,
+    /// The RGB consignment (base64) proving this transition.
+    pub consignment: String,
+    /// The seal blinding actually used — derived from the [`TierSeal`], never supplied by a caller.
+    pub blinding: u64,
+    /// Fee baked into the transaction (`prev_value − Σ outputs`).
+    pub committed_fee: u64,
+    /// vsize of this transaction once a taproot key-spend witness (one 64-byte Schnorr signature) is
+    /// attached — the size it will actually relay at. `committed_fee / signed_vsize` is the
+    /// effective rate, and the two together are what §3.4 pins to exactly 2.000 sat/vB.
+    pub signed_vsize: u64,
+}
+
+impl ColoredTier {
+    /// Post-colouring vouts of the payload outputs, in spec order.
+    pub fn payload_vouts(&self) -> Vec<u32> {
+        self.payloads.iter().map(|p| p.vout).collect()
+    }
+}
+
+/// vsize of a tier tx once a taproot key-spend witness (one 64-byte Schnorr sig per input) is on it.
+fn signed_vsize(tx: &Transaction) -> u64 {
+    let mut probe = tx.clone();
+    for input in probe.input.iter_mut() {
+        let mut witness = Witness::new();
+        witness.push(vec![0u8; 64]);
+        input.witness = witness;
+    }
+    probe.vsize() as u64
+}
+
+/// The scriptPubKey a tier output pays for `address` — mirrors `mercurylib::tesr`'s own
+/// (private) `spk_from_address` via the public [`payee_address`], so a Mercury transfer address
+/// resolves to the recipient's derived `P2TR(recipient_user_pubkey)` exactly as an uncoloured tier
+/// would pay it.
+fn tier_out_spk(address: &str, network: &str) -> Result<ScriptBuf> {
+    let plain = payee_address(address, network).map_err(|e| anyhow!("bad tier payee: {e:?}"))?;
+    let net = get_network(network).map_err(|e| anyhow!("bad network: {e:?}"))?;
+    Ok(Address::from_str(&plain)
+        .map_err(|e| anyhow!("tier payee {plain} is not an address: {e}"))?
+        .require_network(net)
+        .map_err(|e| anyhow!("tier payee {plain} is on the wrong network: {e}"))?
+        .script_pubkey())
+}
+
+/// **Build and colour ONE TES-R tier**, returning EXPLICIT payload vouts.
+///
+/// This is the CTES-R tier builder mandated by `docs/utexo/CTESR-GATE.md` §3.5. It deliberately does
+/// **not** reuse [`create_colored_split_tx`]: that function's `!is_op_return` vout filter counts the
+/// P2A anchor as a payload and trips its own length guard (observed at n=1 and n=3).
+///
+/// It handles both tier shapes — a one-payload `T`/`X_m`/`S_k` and an N-payload split state `SP` —
+/// because they differ only in `payloads.len()`.
+///
+/// Four things it enforces, all of them fail-closed:
+///
+/// 1. **Value conservation.** `Σ payload sats` must equal
+///    [`colored_tier_out_total`], i.e. the fee is exactly [`colored_committed_fee`]`(n, rate)` =
+///    `committed_fee_for_outputs(n + 1, rate)`. A caller cannot silently mint, burn or underpay.
+/// 2. **Explicit payload vouts.** Derived from the coloured transaction by excluding BOTH the opret
+///    and the P2A anchor, then cross-checked output-by-output against what was asked for (script and
+///    value, in order). Nothing positional is assumed — "the opret is index 0" is a consequence of
+///    the fork's `opreturn_first`, not a rule, and the P2A anchor is not what triggers it.
+/// 3. **Per-tier seal blinding.** The blinding comes from the [`TierSeal`]; there is no way to pass
+///    a constant.
+/// 4. **The build-time collision assert.** The returned consignment MUST carry a bundle whose
+///    `pub_witness` is this tier's own txid. If it does not, the blinding collided with a rival
+///    transition over the same parent output and rgb-lib kept the rival with the smaller internal
+///    txid — so this consignment is unvalidatable by anyone. Fail here, loudly, rather than handing
+///    it to a receiver who can only report "not known to the resolver".
+///
+/// The tier comes back **unsigned and un-broadcast**; co-signing is the caller's next step.
+pub fn build_colored_tier(
+    rgb: &RgbWallet,
+    spec: &ColoredTierSpec<'_>,
+    seal: &TierSeal,
+) -> Result<ColoredTier> {
+    if spec.payloads.is_empty() {
+        return Err(anyhow!("a coloured tier needs at least one payload output"));
+    }
+    let n_payload = spec.payloads.len();
+
+    // 1. Value conservation, against the COLOURED fee (§3.4).
+    let available = colored_tier_out_total(spec.prev_value, n_payload, spec.fee_rate).ok_or_else(
+        || {
+            anyhow!(
+                "parent value {} cannot carry a coloured {n_payload}-payload tier at {} sat/vB \
+                 (needs {} fee + {} anchor)",
+                spec.prev_value,
+                spec.fee_rate,
+                colored_committed_fee(n_payload, spec.fee_rate),
+                P2A_VALUE
+            )
+        },
+    )?;
+    let requested: u64 = spec.payloads.iter().map(|(_, sats, _)| *sats).sum();
+    if requested != available {
+        return Err(anyhow!(
+            "coloured tier value conservation: payloads sum to {requested} sat but the parent \
+             affords exactly {available} sat (fee {} + anchor {})",
+            colored_committed_fee(n_payload, spec.fee_rate),
+            P2A_VALUE
+        ));
+    }
+
+    // 2. Build the uncoloured tier: [payload…, P2A]. nVersion 3 (TRUC), no absolute locktime —
+    //    the same shape `mercurylib::tesr::build_tier_tx` / `build_split_state` produce.
+    let prev_txid = Txid::from_str(spec.prev_txid)
+        .map_err(|e| anyhow!("bad parent txid {}: {e}", spec.prev_txid))?;
+    let mut output = Vec::with_capacity(n_payload + 1);
+    for (address, sats, _) in spec.payloads {
+        output.push(TxOut { value: *sats, script_pubkey: tier_out_spk(address, spec.network)? });
+    }
+    output.push(TxOut { value: P2A_VALUE, script_pubkey: p2a_script() });
+    let tier = Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::from_consensus(0),
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: prev_txid, vout: spec.prev_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(spec.sequence),
+            witness: Witness::default(),
+        }],
+        output,
+    };
+
+    // 3. PSBT with the parent's witness_utxo (rgb-lib needs the prevout to place the opret and to
+    //    know which allocation is being spent).
+    let mut psbt = Psbt::from_unsigned_tx(tier.clone())
+        .map_err(|e| anyhow!("could not build the tier psbt: {e}"))?;
+    let mut input = PsbtInput {
+        witness_utxo: Some(TxOut {
+            value: spec.prev_value,
+            script_pubkey: ScriptBuf::from(
+                hex::decode(spec.prev_spk_hex)
+                    .map_err(|e| anyhow!("bad parent scriptPubKey hex: {e}"))?,
+            ),
+        }),
+        ..Default::default()
+    };
+    input.sighash_type = Some(
+        PsbtSighashType::from_str("SIGHASH_ALL").map_err(|e| anyhow!("sighash type: {e}"))?,
+    );
+    psbt.inputs = vec![input];
+
+    // 4. Colour. The blinding is DERIVED — a caller cannot pass a constant.
+    let blinding = seal.blinding();
+    let mut output_map = std::collections::HashMap::new();
+    for (i, (_, _, rgb_amount)) in spec.payloads.iter().enumerate() {
+        if *rgb_amount > 0 {
+            output_map.insert(i as u32, *rgb_amount);
+        }
+    }
+    if output_map.is_empty() {
+        return Err(anyhow!("a coloured tier must assign a non-zero amount to some payload output"));
+    }
+    let (colored_psbt_b64, consignment) = rgb.color_with_nonce(
+        &psbt.to_string(),
+        spec.contract_id,
+        output_map,
+        blinding,
+        spec.nonce,
+    )?;
+
+    let colored_psbt = Psbt::from_str(&colored_psbt_b64)
+        .map_err(|e| anyhow!("could not parse the coloured tier psbt: {e}"))?;
+    let colored = colored_psbt.unsigned_tx.clone();
+    let txid = colored.txid().to_string();
+
+    // 5. EXPLICIT payload vouts — excluding both the opret and the P2A anchor — then cross-checked
+    //    against what was asked for, in order. Nothing positional is assumed.
+    let opret_vouts: Vec<u32> = colored
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey.is_op_return())
+        .map(|(v, _)| v as u32)
+        .collect();
+    if opret_vouts.len() != 1 {
+        return Err(anyhow!(
+            "coloured tier {txid} carries {} OP_RETURN outputs, expected exactly 1",
+            opret_vouts.len()
+        ));
+    }
+    let p2a_vouts: Vec<u32> = colored
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| is_p2a(&o.script_pubkey))
+        .map(|(v, _)| v as u32)
+        .collect();
+    if p2a_vouts.len() != 1 {
+        return Err(anyhow!(
+            "coloured tier {txid} carries {} P2A anchor outputs, expected exactly 1",
+            p2a_vouts.len()
+        ));
+    }
+    let payload_vouts = colored_payload_vouts(&colored);
+    if payload_vouts.len() != n_payload {
+        return Err(anyhow!(
+            "coloured tier {txid} has {} payload outputs, expected {n_payload} (opret at {:?}, \
+             P2A at {:?}, {} outputs total)",
+            payload_vouts.len(),
+            opret_vouts,
+            p2a_vouts,
+            colored.output.len()
+        ));
+    }
+    let mut payloads = Vec::with_capacity(n_payload);
+    for (i, vout) in payload_vouts.iter().enumerate() {
+        let got = &colored.output[*vout as usize];
+        let want = &tier.output[i];
+        if got.script_pubkey != want.script_pubkey || got.value != want.value {
+            return Err(anyhow!(
+                "coloured tier {txid} reordered or rewrote payload {i}: expected {} sat to {}, \
+                 found {} sat to {} at vout {vout}",
+                want.value,
+                hex::encode(want.script_pubkey.as_bytes()),
+                got.value,
+                hex::encode(got.script_pubkey.as_bytes())
+            ));
+        }
+        payloads.push(ColoredPayloadOut {
+            vout: *vout,
+            value: got.value,
+            script_pubkey_hex: hex::encode(got.script_pubkey.as_bytes()),
+        });
+    }
+
+    // 6. Fee, re-derived from the coloured transaction rather than trusted.
+    let out_total: u64 = colored.output.iter().map(|o| o.value).sum();
+    let committed_fee = spec
+        .prev_value
+        .checked_sub(out_total)
+        .ok_or_else(|| anyhow!("coloured tier {txid} spends more than its parent holds"))?;
+    let expected_fee = colored_committed_fee(n_payload, spec.fee_rate);
+    if committed_fee != expected_fee {
+        return Err(anyhow!(
+            "coloured tier {txid} committed {committed_fee} sat of fee, expected {expected_fee} \
+             (= committed_fee_for_outputs({}, {}))",
+            n_payload + 1,
+            spec.fee_rate
+        ));
+    }
+
+    // 7. THE BUILD-TIME COLLISION ASSERT (§3.1). The consignment must carry this tier's own witness.
+    let witnesses = consignment_witness_txids(&consignment)?;
+    if !witnesses.iter().any(|w| w == &txid) {
+        return Err(anyhow!(
+            "coloured tier {txid}: its OWN witness is absent from the consignment it just produced \
+             (bundled witnesses: {witnesses:?}). The seal blinding {blinding} derived from \
+             {seal:?} collided with a rival transition over the same parent output {}:{} — rgb-lib \
+             merged them into one BundleId and kept the rival with the smaller internal txid. This \
+             consignment is unvalidatable by ANY receiver; fix the TierSeal derivation.",
+            spec.prev_txid,
+            spec.prev_vout
+        ));
+    }
+
+    Ok(ColoredTier {
+        tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&colored)),
+        psbt_base64: colored_psbt_b64,
+        txid,
+        payloads,
+        opret_vout: opret_vouts[0],
+        p2a_vout: p2a_vouts[0],
+        consignment,
+        blinding,
+        committed_fee,
+        signed_vsize: signed_vsize(&colored),
+    })
+}
+
+#[cfg(test)]
+mod ctesr_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const ROLES: [TierRole; 9] = [
+        TierRole::Funding,
+        TierRole::Trigger,
+        TierRole::Extension,
+        TierRole::State,
+        TierRole::SplitState,
+        TierRole::Detrigger,
+        TierRole::Backup,
+        TierRole::Split,
+        TierRole::Combine,
+    ];
+
+    #[test]
+    fn the_blinding_is_deterministic() {
+        let a = tier_blinding("sid-1", TierRole::Extension, 3, 0);
+        let b = tier_blinding("sid-1", TierRole::Extension, 3, 0);
+        assert_eq!(a, b, "both parties must derive the identical blinding");
+        assert_eq!(TierSeal::new("sid-1", TierRole::Extension, 3, 0).blinding(), a);
+    }
+
+    #[test]
+    fn role_tags_are_distinct() {
+        let tags: HashSet<u8> = ROLES.iter().map(|r| r.tag()).collect();
+        assert_eq!(tags.len(), ROLES.len(), "two roles share a wire tag");
+    }
+
+    /// The whole `(role, tier_index, rung)` space for ONE coin must be collision-free — that is the
+    /// space rival tiers over the same parent output live in.
+    #[test]
+    fn every_tier_of_one_coin_gets_its_own_blinding() {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut n = 0usize;
+        for role in ROLES {
+            for index in 0..64u32 {
+                for rung in 0..8u32 {
+                    assert!(
+                        seen.insert(tier_blinding("statechain-id-under-test", role, index, rung)),
+                        "blinding collision at {role:?} index={index} rung={rung}"
+                    );
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(seen.len(), n);
+    }
+
+    #[test]
+    fn different_coins_never_share_a_blinding() {
+        let mut seen: HashSet<u64> = HashSet::new();
+        for i in 0..512u32 {
+            let sid = format!("sid-{i}");
+            assert!(
+                seen.insert(tier_blinding(&sid, TierRole::State, 0, 0)),
+                "two coins share the blinding of their first state tier"
+            );
+        }
+    }
+
+    /// The length prefix is what stops `id ‖ role` from being reachable two ways.
+    #[test]
+    fn the_id_is_length_prefixed() {
+        assert_ne!(
+            tier_blinding("ab", TierRole::Extension, 0, 0),
+            tier_blinding("a", TierRole::Extension, 0, 0)
+        );
+        // 'b' == 0x62; no role tag is 0x62, but pin the general property anyway.
+        assert_ne!(
+            tier_blinding("ab", TierRole::Trigger, 0, 0),
+            tier_blinding("a", TierRole::Trigger, 0, 0)
+        );
+    }
+
+    /// §3.4 — the coloured fee is the uncoloured fee for one MORE output, because the opret is
+    /// exactly `P2TR_OUT_VBYTES`. Pinned at the two arities E1 measured.
+    #[test]
+    fn the_coloured_fee_is_the_uncoloured_fee_plus_one_output() {
+        let rate = 2.0;
+        assert_eq!(colored_committed_fee(1, rate), committed_fee_for_outputs(2, rate));
+        assert_eq!(colored_committed_fee(3, rate), committed_fee_for_outputs(4, rate));
+        // (TIER_VBYTES 124 + 43) * 2 = 334 over the measured 167 vB coloured 1-payload tier.
+        assert_eq!(colored_committed_fee(1, rate), 334);
+        // (124 + 3*43) * 2 = 506 over the measured 253 vB coloured 3-payload split state.
+        assert_eq!(colored_committed_fee(3, rate), 506);
+        assert!(
+            colored_committed_fee(1, rate) > mercurylib::tesr::committed_fee(rate),
+            "a coloured tier must pay MORE than an uncoloured one, or it cannot relay standalone"
+        );
+    }
+
+    #[test]
+    fn the_coloured_budget_leaves_room_for_the_anchor_and_the_fee() {
+        let rate = 2.0;
+        let parent = 50_000u64;
+        let total = colored_tier_out_total(parent, 3, rate).unwrap();
+        assert_eq!(total + colored_committed_fee(3, rate) + P2A_VALUE, parent);
+        assert_eq!(colored_tier_out_value(parent, rate), colored_tier_out_total(parent, 1, rate));
+        // A parent that cannot even cover the coloured fee must say so rather than underflow.
+        assert!(colored_tier_out_total(100, 1, rate).is_none());
+    }
+
+    #[test]
+    fn payload_vouts_exclude_both_the_opret_and_the_anchor() {
+        let opret = TxOut {
+            value: 0,
+            script_pubkey: ScriptBuf::from(hex::decode(format!("6a20{}", "11".repeat(32))).unwrap()),
+        };
+        assert!(opret.script_pubkey.is_op_return());
+        let payload = TxOut {
+            value: 10_000,
+            script_pubkey: ScriptBuf::from(hex::decode(format!("5120{}", "22".repeat(32))).unwrap()),
+        };
+        let anchor = TxOut { value: P2A_VALUE, script_pubkey: p2a_script() };
+        let tx = Transaction {
+            version: 3,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![],
+            output: vec![opret, payload.clone(), payload.clone(), anchor],
+        };
+        assert_eq!(colored_payload_vouts(&tx), vec![1, 2]);
+        // The accident CTESR-GATE §4.3 names: the naive filter counts the anchor as a payload.
+        let naive: Vec<u32> = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| !o.script_pubkey.is_op_return())
+            .map(|(v, _)| v as u32)
+            .collect();
+        assert_eq!(naive, vec![1, 2, 3], "the P2A anchor is not an OP_RETURN");
+        assert!(!p2a_script().is_op_return());
+    }
 }

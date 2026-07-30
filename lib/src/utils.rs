@@ -41,7 +41,11 @@ pub fn get_network(network: &str) -> Result<bitcoin::Network, MercuryError> {
         "signet" => Ok(bitcoin::Network::Signet),
         "testnet" => Ok(bitcoin::Network::Testnet),
         "regtest" => Ok(bitcoin::Network::Regtest),
-        "bitcoin" => Ok(bitcoin::Network::Bitcoin),
+        // Both spellings map to mainnet. rust-bitcoin's own name is "bitcoin", but the deployment
+        // configs (docker-compose-main.yml `BITCOIN_NETWORK`) and lib's own test say "mainnet" —
+        // and rejecting that is why the mainnet compose was never runnable (AUDIT-2026-07-30,
+        // Tier 0 item 5). Accept both rather than making one of them wrong.
+        "bitcoin" | "mainnet" => Ok(bitcoin::Network::Bitcoin),
         _ => Err(MercuryError::NetworkConversionError)
     }
 }

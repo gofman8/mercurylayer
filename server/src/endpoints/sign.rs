@@ -262,8 +262,9 @@ pub async fn sign_second (statechain_entity: &State<StateChainEntity>, partial_s
     // terminal, let the node be terminalized (e.g. `set_spend_budget` at split time, or the node's
     // first single-use spend), and then complete the DANGLING session via sign/second — which checked
     // none of the gates — obtaining a SECOND conflicting co-signature of a terminal node. That defeats
-    // exactly the guarantee the split/RGB tree rests on (INV-19 fork prevention) and is reachable on the
-    // V1 single_use lane, not just V2. The gates must hold at the moment the signature is ISSUED.
+    // exactly the guarantee the split/RGB tree rests on (INV-19 fork prevention) and is reachable
+    // through the `single_use` gate as well as the spend-budget one. The gates must hold at the moment
+    // the signature is ISSUED.
     //
     // Fail CLOSED on any DB error, identically to sign/first: if the SE cannot read a coin's
     // fork-prevention state it must refuse to co-sign rather than assume a permissive default.

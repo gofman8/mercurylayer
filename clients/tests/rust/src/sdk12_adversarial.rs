@@ -1,14 +1,15 @@
-//! E2E (adversarial): regression tests for the security-review fixes, on the **V2 (TES-R) default**.
+//! E2E (adversarial): regression tests for the security-review fixes, on **laddered (TES-R) coins**.
 //!
-//! - Part B (value flow on V2): a non-exact payment out of a laddered coin can no longer be split as
-//!   plain BTC [B1], so `transfer()` auto-routes to the IN-LADDER split — `SP` descends from the
-//!   trigger, the PIECE child pays the recipient (Model A) and is conveyed to their mailbox, the
-//!   CHANGE child pays the sender back. The receiver adopts the piece through the
+//! - Part B (value flow out of a laddered coin): a non-exact payment out of one can no longer be
+//!   split as plain BTC [B1], so `transfer()` auto-routes to the IN-LADDER split — `SP` descends
+//!   from the trigger, the PIECE child pays the recipient (Model A) and is conveyed to their
+//!   mailbox, the CHANGE child pays the sender back. The receiver adopts the piece through the
 //!   `verify_child_bundle` census (`branch_txs` empty, `ladder_census_ok`) and is credited the exact
-//!   amount. V1's branch model — single_use sub-coins plus the receiver's `terminal_parents` ancestor
-//!   guard — does not exist on V2; the full in-ladder payment property (adopt + unilateral exit +
-//!   funds at the receiver's own key) is owned by sdk59 and the adversarial census cases by sdk58, so
-//!   here this is a value-flow smoke check that the payment lands.
+//!   amount. The plain-BTC branch model — single_use sub-coins plus the receiver's
+//!   `terminal_parents` ancestor guard, which still governs UN-LADDERED coins — does not apply to
+//!   a laddered coin; the full in-ladder payment property (adopt + unilateral exit + funds at the
+//!   receiver's own key) is owned by sdk59 and the adversarial census cases by sdk58, so here this
+//!   is a value-flow smoke check that the payment lands.
 //! - Part C (finding 0, MuSig2 nonce reuse): one /sign/first followed by TWO /sign/second over the
 //!   SAME server nonce but DIFFERENT messages must be refused on the second call. Reusing a secnonce
 //!   over two messages would leak the SE key share and yield two co-signed conflicting spends of one
@@ -23,10 +24,11 @@
 //! Parts C and D are **protocol-agnostic SE/lockbox-level guards** (the sealed secnonce in
 //! lockbox/src/enclave.cpp + server/src/endpoints/sign.rs; the unlock authorization in
 //! server/src/endpoints/transfer_receiver.rs). They are keyed on a coin's statechain_id, hold
-//! identically under V1 and V2, and are tested NOWHERE ELSE — they must survive every migration.
+//! identically for laddered and un-laddered coins alike (and held unchanged across the TES-R
+//! migration), and are tested NOWHERE ELSE — they must survive every migration.
 //!
-//! Off-chain double-spend prevention itself is, on V2, the parent/change/piece terminality plus the
-//! receiver-side `verify_child_bundle` census (sdk58) and `verify_bundle` (sdk54/sdk55).
+//! Off-chain double-spend prevention itself is, under TES-R, the parent/change/piece terminality
+//! plus the receiver-side `verify_child_bundle` census (sdk58) and `verify_bundle` (sdk54/sdk55).
 //!
 //! Run: SDK_E2E=12 ML_NETWORK=regtest cargo run
 
@@ -50,10 +52,11 @@ pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
-    // Runs on the V2 (TES-R) default — no protocol pin. Every deposit below auto-establishes a CSV
+    // Runs on TES-R — there is no protocol switch. Every deposit below auto-establishes a CSV
     // exit ladder at claim(), so alice's non-exact payment exercises the in-ladder split rather than
-    // the V1 branch model, and bob's probe coin is a laddered V2 coin. The SE-level guards in Parts C
-    // and D are protocol-agnostic and must hold on V2 exactly as they did on V1.
+    // the plain-BTC branch model, and bob's probe coin is a laddered coin. The SE-level guards in
+    // Parts C and D are protocol-agnostic and must hold on a laddered coin exactly as they do on an
+    // un-laddered one.
     let cc = mercuryrustlib::client_config::load().await;
 
     let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk12_alice"), None).await?;
@@ -76,8 +79,8 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    // The coin must actually be laddered, otherwise Part B would silently test the old plain-BTC
-    // split path instead of the in-ladder split.
+    // The coin must actually be laddered, otherwise Part B would silently test the plain-BTC
+    // branch-split path instead of the in-ladder split.
     let alice_sid = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk12_alice")
         .await?
         .coins
@@ -87,9 +90,9 @@ pub async fn execute() -> Result<()> {
         .ok_or_else(|| anyhow!("alice has no confirmed coin"))?;
     assert!(
         mercuryrustlib::tesr::load(&cc, "sdk12_alice", &alice_sid).await?.is_some(),
-        "alice's coin must carry a TES-R ladder (V2 default)"
+        "alice's coin must carry a TES-R ladder (every root deposit is laddered)"
     );
-    println!("SDK12 - alice funded {DEPOSIT} on V2 (ladder established, sid {alice_sid})");
+    println!("SDK12 - alice funded {DEPOSIT} (ladder established, sid {alice_sid})");
 
     // The two split child slots are funded by FREE derived tokens (take_derived_tokens), so no
     // prepaid-token top-up is needed for the split any more.
@@ -101,7 +104,7 @@ pub async fn execute() -> Result<()> {
         "a {PAY} payment out of a single {DEPOSIT} laddered coin must go through the IN-LADDER split"
     );
     // Poll the balance instead of `claimed_transfers`: adopting a conveyed child bundle is not the
-    // V1 branch-transfer claim and need not bump that counter (sdk59's pattern).
+    // ordinary statechain transfer claim and need not bump that counter (sdk59's pattern).
     let mut waited = 0;
     while bob.get_balance().await?.available_sats != PAY {
         bob.claim().await?;
@@ -120,7 +123,7 @@ pub async fn execute() -> Result<()> {
 
     // --- Part C setup: a coin with a LIVE 2-of-2 for the raw MuSig2 probe ------------------------
     // The child bob just adopted is EXIT-ONLY (Model A conveyance: bob holds no SE co-signing key for
-    // it), so it cannot drive /sign/first + /sign/second at all. Give bob his own fresh V2 deposit
+    // it), so it cannot drive /sign/first + /sign/second at all. Give bob his own fresh deposit
     // instead — a normal statechain coin (single_use = false, no spend budget) whose ladder leaves the
     // 2-of-2 live. That is exactly the state in which the secnonce single-use guard must hold.
     let t = prepaid_token(&cc).await?;
@@ -156,7 +159,7 @@ pub async fn execute() -> Result<()> {
         .ok_or_else(|| anyhow!("victim has no statechain id"))?;
     assert!(
         mercuryrustlib::tesr::load(&cc, "sdk12_bob", &victim_sid).await?.is_some(),
-        "the nonce-reuse probe must run against a V2 (TES-R laddered) coin"
+        "the nonce-reuse probe must run against a TES-R laddered coin"
     );
     println!("SDK12 - probe coin {victim_sid} ({PROBE} sat, laddered, live 2-of-2)");
 
@@ -233,6 +236,6 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK12 - Part D: /transfer/unlock rejects bad-sig + null auth_pub_key with 403 \u{2713} (finding 1 — no auth bypass, no panic)");
 
-    println!("SDK12 - SUCCESS: V2 in-ladder split payment credits the receiver; MuSig2 nonce reuse refused on a laddered coin; unauthenticated unlock rejected.");
+    println!("SDK12 - SUCCESS: the in-ladder split payment credits the receiver; MuSig2 nonce reuse refused on a laddered coin; unauthenticated unlock rejected.");
     Ok(())
 }

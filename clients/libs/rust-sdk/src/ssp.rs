@@ -4,7 +4,7 @@
 //! two atomic swaps:
 //!
 //! - **Pay** (Mercury → Lightning): the user latch-transfers an exact coin to the SSP bound to
-//!   the invoice's payment hash (SE latch v2, external hash). The SSP pays the BOLT11; LN
+//!   the invoice's payment hash (the SE's external-hash latch). The SSP pays the BOLT11; LN
 //!   settlement hands it the preimage, which is simultaneously (a) the user's proof of payment
 //!   and (b) the SSP's key to unlock the coin at the SE (`/transfer/unlock/preimage`). Neither
 //!   side can cheat: no payment → latch expires, the user keeps the coin; payment → the SSP can
@@ -284,6 +284,11 @@ impl RlnClient {
 /// latched to the swap must be a pending transfer addressed to the SSP (present in `pending`, which
 /// is built ONLY from transfers the SSP can decrypt with its own key) and their total value must
 /// cover `quote_sats` (invoice + fee). Returns the total on success. Extracted for unit testing.
+///
+/// The `pending` amounts this is fed are the CENSUS-BOUND values (`PendingTransferInfo::amount`):
+/// branch-derived for a flat ladder, `verify_conveyed_child`-derived for a child piece. The caller
+/// must have already rejected every coin whose `ladder_census_ok` is `false`, because an un-censused
+/// amount is a sender-declared number and this function would happily sum attacker-chosen values.
 fn check_latched_coins(
     latched_ids: &[String],
     pending: &[(String, u64)],
@@ -391,9 +396,11 @@ impl SspService {
         // validate them BEFORE paying. Each latched coin must be a pending transfer genuinely
         // addressed to the SSP — proven because `peek_pending_transfers` only returns transfers this
         // wallet can DECRYPT with its own auth key. For a SATS invoice the coins must also cover
-        // invoice+fee. For an RGB invoice the coins carry a fixed sats carrier + the asset in their
-        // consignment; the asset amount is verified when the coin is claimed (accept_incoming_tokens
-        // validates the consignment) and re-checked below against the SSP's asset balance delta.
+        // invoice+fee, measured on the census-bound amount. For an RGB invoice the coins carry a fixed
+        // sats carrier + the asset in their consignment; the asset's contract id and amount are derived
+        // cryptographically BEFORE paying (`validate_pending_token`, audit [4]) — deferring them to
+        // claim time is not an option under a HODL swap — and the SSP's balance delta is re-checked
+        // post-claim only as a backstop.
         let latched_ids = mercuryrustlib::lightning_latch::get_statechain_ids_by_batch_id(
             self.wallet.client_config(),
             batch_id,
@@ -416,12 +423,33 @@ impl SspService {
                 ));
             }
         }
-        // PRE-PAY LADDER CENSUS (LIGHTNING.md §2 PAY). For a V2 (TES-R) latched coin, run the
-        // receiver's `verify_bundle` census (num_sigs == v1_backups + tiers, read from the
-        // enclave-authoritative sig-count) BEFORE the irreversible Lightning leg. This closes the
-        // rob-SSP hidden-`S*` vector: a sender who co-signed a lower-CSV state omitted from the
-        // conveyed ladder inflates num_sigs → the census fails → we refuse to pay. V1 coins have no
-        // ladder and pass trivially. `peek_pending_transfers` computed this per coin (fail-closed).
+        // PRE-PAY LADDER CENSUS (LIGHTNING.md §2 PAY). EVERY latched coin must clear a census that
+        // actually RAN before the irreversible Lightning leg — after [D1] there is no coin shape that
+        // passes trivially. `peek_pending_transfers` computes `ladder_census_ok` per coin, fail-closed,
+        // on one of exactly two lanes, both of which end in a census that must SUCCEED:
+        //   * FLAT TES-R ladder (`protocol_version >= MIN_PREPAY_PROTOCOL_VERSION = 2`) →
+        //     `verify_bundle_bound`, which requires
+        //       - the EXACT-EQUALITY count (num_sigs == flat_backups + tiers + disclosed-superseded,
+        //         against the enclave-authoritative sig-count), closing the rob-SSP hidden-`S*` vector:
+        //         a sender who co-signed a lower-CSV state omitted from the conveyed ladder inflates
+        //         num_sigs, the census fails, and we refuse to pay; and
+        //       - the [C-1] COIN BINDING — the ladder must describe the coin whose `statechain_id` we
+        //         latched (funding outpoint + on-chain value + on-chain aggregate + the coordinator's
+        //         recorded aggregate for that sid), not merely be internally consistent. Without it a
+        //         self-signed decoy ladder over an attacker-controlled outpoint, padded so the count
+        //         balances, would have satisfied this gate while the sender kept the real trigger; and
+        //       - the [D2] MODEL-A OWNER-EXIT BINDING — the ladder must exit to the PROSPECTIVE OWNER's
+        //         (i.e. THIS wallet's) seed-derived backup key, so a perfectly coin-bound ladder that
+        //         pays a third party on exit cannot take our Lightning money.
+        //   * IN-LADDER-SPLIT CHILD bundle (`protocol_version >= MIN_PREPAY_CHILD_PROTOCOL_VERSION = 3`)
+        //     → `verify_conveyed_child`, bound to the LATCHED sid, not already adopted, over a live
+        //     on-chain parent root ([D3]). Its census-bound exit value — not any sender-declared hint —
+        //     is what `PendingTransferInfo::amount` then reports to the SATS value gate below.
+        // Anything else is a REJECTION, not a pass: an un-laddered coin, a coin declaring
+        // `protocol_version < 2` (or a child bundle under 3), a missing/malformed ladder, an
+        // off-chain/spent/unconfirmed funding UTXO, an exit address that is not ours, or an unreadable
+        // enclave sig-count all report `ladder_census_ok = false` and are refused here. That is the
+        // intended ONE-COIN-TYPE behaviour: the un-laddered branch-coin shape is not payable over LN.
         for sid in &latched_ids {
             let p = pending
                 .iter()
@@ -429,7 +457,7 @@ impl SspService {
                 .ok_or_else(|| anyhow!("latched coin {sid} not in the pending set"))?;
             if !p.ladder_census_ok {
                 return Err(anyhow!(
-                    "latched coin {sid} failed the pre-pay ladder census (hidden state / num_sigs mismatch, or unreadable) — refusing to pay"
+                    "latched coin {sid} failed the pre-pay ladder census (un-laddered or below the pre-pay protocol-version floor, hidden state / num_sigs mismatch, coin or owner-exit binding failure, dead funding output, or unreadable) — refusing to pay"
                 ));
             }
         }
@@ -545,7 +573,7 @@ impl SspService {
     /// invoice on the latch's SE-held payment hash. The payer pays the invoice; call
     /// [`Self::settle_receive`] to drive settlement.
     pub async fn create_receive(&self, amount_sats: u64, receiver_address: &str) -> Result<ReceiveSwap> {
-        // Prefer an exact coin (no split). If the SSP holds only V2-laddered coins (which cannot be
+        // Prefer an exact coin (no split). If the SSP holds only laddered coins (which cannot be
         // split exactly), fall back to a NON-EXACT in-ladder split: convey a piece worth `amount` to
         // the user, latched under an SE-minted preimage (LIGHTNING.md §2b). `settle_receive` works
         // unchanged on the piece sid (confirm + retrieve the SE preimage → claim the HODL HTLC).
@@ -610,7 +638,7 @@ impl SspService {
         }
     }
 
-    /// The SSP's largest confirmed, V2-laddered coin able to fund an in-ladder split of `min_sats`
+    /// The SSP's largest confirmed, laddered coin able to fund an in-ladder split of `min_sats`
     /// (so a viable change output remains). Used to front a non-exact RECEIVE.
     async fn largest_laddered_coin(&self, min_sats: u64) -> Result<String> {
         let wallet =
@@ -951,10 +979,10 @@ impl UtexoWallet {
             return paid.map_err(|e| (piece_id, e));
         }
 
-        // SATS PAY: mint the exact coin, then latch it. If the wallet holds only V2-laddered coins
+        // SATS PAY: mint the exact coin, then latch it. If the wallet holds only laddered coins
         // (which cannot be split exactly — [B1]), fall back to the NON-EXACT IN-LADDER lane, the same
         // way `SspService::create_receive` does on the receive side. Without this the one-call pay API
-        // is unusable on V2 unless the wallet happens to already hold a coin of the exact size.
+        // is unusable on laddered coins unless the wallet happens to already hold one of the exact size.
         let coin_id = match self.ensure_exact_coin(quote.amount_sats + quote.fee_sats).await {
             Ok(c) => c,
             Err(e) => {
@@ -1006,7 +1034,7 @@ impl UtexoWallet {
         latch_and_pay.map_err(|e| (coin_id, e))
     }
 
-    /// USER SIDE — pay a BOLT11 for a NON-EXACT amount from a single V2 (TES-R) laddered coin
+    /// USER SIDE — pay a BOLT11 for a NON-EXACT amount from a single laddered (TES-R) coin
     /// (LIGHTNING.md §2b). Splits `parent_statechain_id` IN-LADDER into a PIECE that pays the SSP
     /// (sized to cover the invoice + fee + the piece's own exit-tier reserve) and a CHANGE that stays
     /// self-owned, latches the piece to the invoice hash, and lets the SSP census + pay it. The piece
@@ -1163,7 +1191,7 @@ impl UtexoWallet {
     /// preimage exists for the invoice hash). This method itself only enforces the SE's batch-lock
     /// (it fails before `batch_timeout`); the non-payment confirmation is the caller's obligation.
     pub async fn reclaim_lightning_payment(&self, coin_statechain_id: &str) -> Result<()> {
-        // V2 (TES-R) coin: the self-transfer below would BRICK. The failed latch already co-signed an
+        // Laddered (TES-R) coin: the self-transfer below would BRICK. The failed latch already co-signed an
         // orphan `S'` (presign_receiver_state, unconditional), so a reclaim self-transfer co-signs a
         // SECOND state and its `verify_bundle` claim rejects on the inflated `sig_count`. But the latch
         // never completed (no preimage → no key handover), so the coin is still ours. Restore it locally
@@ -1171,7 +1199,8 @@ impl UtexoWallet {
         // exact-lane operator-trust bar (the SSP holds the broadcastable `S'` and is trusted not to race
         // it — identical to the exact PAY lane). Re-transfer stays orphan-bricked until a `refresh()`
         // re-anchor; full off-chain reuse would need a scoped SE `sig_count` reconcile (separate,
-        // security-reviewed). V1 coins have no orphan and reclaim cleanly off-chain via the self-transfer.
+        // security-reviewed). Un-laddered coins have no orphan and reclaim cleanly off-chain via the
+        // self-transfer below.
         if mercuryrustlib::tesr::load(self.client_config(), self.wallet_name(), coin_statechain_id)
             .await?
             .is_some()
@@ -1187,7 +1216,7 @@ impl UtexoWallet {
         }
 
         let me = self.get_utexo_address().await?;
-        // V1: fresh, un-batched transfer of the specific coin back to ourselves — the SE drops the stale
+        // Un-laddered coin: fresh, un-batched transfer of the specific coin back to ourselves — the SE drops the stale
         // batch-locked transfer row and the coin's key rotates back under our control.
         mercuryrustlib::transfer_sender::execute(
             self.client_config(),

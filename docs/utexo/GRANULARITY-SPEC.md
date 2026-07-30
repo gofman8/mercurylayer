@@ -198,10 +198,11 @@ admission floor is `min_child_value`, not the backup floor of GRN-INV-1b.
   which splits a freed sub-coin at exactly `330 + ceil(112·r)`), rising with feerate. A 330-sat
   piece is a valid split output whose *backup* is un-broadcastable, so it cannot be minted into a
   usable coin.
-  **Enforced (FIXED):** every split path validates both outputs against `min_split_output(fee_rate)`
-  *before* the parent is made terminal — `split_coin` and `transfer_many` via `split_amounts_floored`
-  (transfer.rs), the colored `transfer_tokens`/`batch_transfer_tokens` paths (tokens.rs), and the
-  planner via `select::plan_with_floor`. A piece in `[330, min_split_output)` is refused with the
+  **Enforced (FIXED):** every split path validates EVERY output against `min_split_output(fee_rate)`
+  *before* the parent is made terminal — `split_coin` via `split_amounts_floored` and `transfer_many`
+  via its own per-recipient guard (transfer.rs), the colored `transfer_tokens`/`batch_transfer_tokens`
+  paths (tokens.rs), and the planner via `select::plan_with_floor`. On the LADDERED lane the larger
+  GRN-INV-1c floor binds instead (limitation 13). A piece in `[330, min_split_output)` is refused with the
   parent untouched. Previously the guard checked only the 330 dust floor, so such a piece passed
   admission, the parent was made terminal, and only *then* did the backup fail (`FeeTooLow`) —
   stranding the parent to unilateral-exit-only (degradation class of the audit [15] brick; no
@@ -233,21 +234,39 @@ admission floor is `min_child_value`, not the backup floor of GRN-INV-1b.
   (transfer.rs:704-705, 819-820) — `sdk58` asserts the parent IS terminal after `SP` is co-signed
   and that an unlatched split CHILD stays NON-terminal so it can be re-transferred.
 - **GRN-REQ-8 (transfer_many — refines SPEC REQ-27)** `transfer_many(recipients)` MUST carve all
-  N recipient pieces plus one change in ONE split tx (N+1 outputs, no OP_RETURN, so vout i = i;
-  transfer.rs:331-461). Parent selection: the **smallest** confirmed, non-carrier coin with
-  `amount > total + fee_reserve(amount) + min_split_output(fee_rate)` (so the change itself clears
-  the backup-fee floor); `change = parent − Σ amounts − fee_reserve`. **Up-front guard (FIXED):**
-  before the parent is made terminal, `transfer_many` rejects any recipient amount below
-  `min_split_output(fee_rate)` (transfer.rs:351-356), and the parent filter guarantees a
-  backup-viable change — so a boundary-violating batch is refused with the parent untouched, no
-  longer pinning its spend budget after the terminal-guard.
+  N recipient pieces plus one change in ONE split tx (N+1 outputs) and MUST dispatch on the parent's
+  SHAPE, exactly as `transfer` does (GRN-REQ-4 note) — a plain split of a **laddered** parent is the
+  [B1] shape `split_coin` hard-refuses, so `transfer_many` must never build one
+  (transfer.rs:370-603):
 
-  *GAP (documented, NOT fixed — §11 limitation 15):* unlike `split_coin`, `transfer_many`'s parent
-  filter excludes carriers but NOT **laddered** coins (transfer.rs:359-372), so it will plain-split a
-  laddered parent — the exact [B1] shape `split_coin` hard-refuses. It has no in-ladder route yet
-  (`in_ladder_pay` carves one piece + change, not N). Prefer N sequential `transfer()` calls, which
-  route per parent shape (GRN-REQ-4 note), until `transfer_many` either refuses laddered parents or
-  gains a multi-child in-ladder split.
+  | parent shape | route | split tx |
+  |---|---|---|
+  | laddered ROOT coin | `in_ladder_pay_many` (transfer.rs:1255) | one split state `SP` over `X_m.out[0]` — N children + change + P2A |
+  | received in-ladder CHILD | `child_in_ladder_pay_many` (transfer.rs:930) | one `CSP` over `ext_child.out[0]` — N grandchildren + change + P2A |
+  | un-laddered coin (plain sub-coin) | the plain split | N+1 outputs, no OP_RETURN, so vout i = i |
+
+  Because `claim()` ladders every fresh confirmed root coin unconditionally, the **in-ladder route is
+  the default**; the plain split now serves only un-laddered sub-coins (whose funding outpoint no
+  trigger can spend, so nothing can race it). Both in-ladder routes convey each recipient's child
+  bundle through the mailbox WITH the standard key handover, so every piece is a first-class coin the
+  recipient adopts at claim — and each records a `"Transfer"` history row (transfer.rs:1476), which an
+  in-ladder payment otherwise lacks (it never calls `transfer_sender::execute`).
+
+  Parent selection is therefore **shape-aware** (transfer.rs:399-476): candidates are sorted
+  smallest-first as before, but each one's real capacity is computed per route —
+  `tier_out_total(X_m.out[0], N+1, fee_rate)` in-ladder (the coin's value net of its already-committed
+  tier fees) vs `amount > total + fee_reserve(amount) + min_split_output(fee_rate)` plain — and the
+  first candidate that fits wins. Judging a laddered coin on `coin.amount` alone would admit parents
+  the in-ladder route cannot fund.
+
+  **Up-front guards (before any parent is made terminal):** `transfer_many` rejects any recipient
+  amount below `min_split_output(fee_rate)` (transfer.rs:391-397), and each in-ladder route re-checks
+  every output — pieces AND change — against the larger GRN-INV-1c floor
+  `max(min_split_output, min_child_value(fee_rate, DUST_LIMIT))` (transfer.rs:976-987, 1323-1335),
+  since every child funds its own extension + state tier before it must clear dust. Value is
+  conserved by the builder: `Σ pieces + change == tier_out_total(X_m.out[0], N+1)`, so the change is
+  derived, not free. Covered by `sdk69` (laddered parent, one `SP` with 2 pieces + change, the [B1]
+  retained-trigger attack executed for real) and `sdk11` (route asserted, not just the amounts).
 - **GRN-REQ-9 (ensure_exact_coin)** `ensure_exact_coin(sats)` MUST reuse an existing confirmed
   non-carrier coin of exactly `sats` if one exists, else split the smallest sufficient coin
   (same filter as GRN-REQ-8) to mint it (transfer.rs:466-513). Because `split_coin` refuses a
@@ -368,8 +387,8 @@ admission floor is `min_child_value`, not the backup floor of GRN-INV-1b.
 
   | Operation | Carrier handling | Where |
   |---|---|---|
-  | `transfer` / `transfer_many` / `ensure_exact_coin` selection | silently excluded from candidates | transfer.rs:76, 364, 474-486 |
-  | `split_coin` (named) | hard error | transfer.rs:534-538 (GRN-ERR-7) |
+  | `transfer` / `transfer_many` / `ensure_exact_coin` selection | silently excluded from candidates | transfer.rs:107, 408, 618-633 |
+  | `split_coin` (named) | hard error | transfer.rs:677-681 (GRN-ERR-7) |
   | `withdraw` default / named | excluded / hard error | wallet.rs:814-825 (GRN-ERR-8) |
   | `unilateral_exit` default / named | excluded / hard error | wallet.rs:1038-1049 (GRN-ERR-8) |
   | `auto_exit_due` watchtower sweep | excluded from the plain-exit loop, then **MATERIALIZED** in a second pass (branch only, no sats-sweeping backup) — a received carrier DOES get deadline protection (GRN-INV-14) | wallet.rs:698-704 (exclusion), 726-760 (materialize) |
@@ -521,9 +540,9 @@ coin; rows below name the live replacement, and say so explicitly where nothing 
 |---|---|
 | GRN-REQ-4/5/6, GRN-ERR-1/2 | sdk01 (exact subset, then a non-exact payment through `transfer()`); sdk59 (the in-ladder route of a `WithSplit` plan, end to end: Alice pays Bob, Bob claims + exits the child); sdk60 (whole-child re-transfer alice→bob→carol), sdk17 (partial second hop); `unit::select`, `unit::granularity_model::plan_paths_matrix` (all four plan paths over the real planner). **Gap:** the no-admissible-split-candidate refusal (sdk28's 4,800-from-5,000 case) now has UNIT evidence only |
 | GRN-INV-1/1b/2, GRN-ERR-3/4/5 | `unit::split_math_tests` (transfer.rs:1482+); **unit `granularity_model.rs`** — boundary matrix over the real `split_amounts`/`split_fee_reserve`/`select::plan` (dust floor 330, min parent 960 ± 1, reserve-clamp interactions; the planner-side 961 pin is `unit::invalidation_model::split_size_floor`) and `backup_fee_floor_is_the_true_mintable_minimum` (the whole `[330, 442)` band refused up-front, floor climbing with feerate); **sdk29** — E2E: a freed sub-coin is split at exactly the TRUE minimum mintable piece `330 + backup_fee` (442 at 1 sat/vB) and both outputs confirm (replaces sdk28's measurement) |
-| GRN-INV-1c (in-ladder floor, D1) | sdk30 (sponsored rebate sized at `max(fee + DUST_LIMIT, min_child_value)`, the 1306-at-2-sat/vB identity — the D2 regression that made `refresh_sponsored` fail after the user had paid the on-chain fee); sdk58/sdk59 (admitted children exit), sdk17 (child-level split) |
+| GRN-INV-1c (in-ladder floor, D1) | sdk30 (sponsored rebate sized at `max(fee + DUST_LIMIT, min_child_value)`, the 1306-at-2-sat/vB identity — the D2 regression that made `refresh_sponsored` fail after the user had paid the on-chain fee); sdk58/sdk59 (admitted children exit), sdk17 (child-level split); the floor is applied per-output on the multi-child batch routes too (transfer.rs:976-987, 1323-1335) |
 | GRN-REQ-7 (terminal ordering) | sdk58 (parent IS terminal once `SP` is co-signed; an unlatched child stays NON-terminal so it can be re-transferred); sdk50 (unilateral exit of a laddered coin); SPEC REQ-18 rows |
-| GRN-REQ-8 (transfer_many) | sdk11 (multi-recipient). **Gap:** no test covers the laddered-parent case — see the GRN-REQ-8 gap note and §11 limitation 15 |
+| GRN-REQ-8 (transfer_many) | **sdk69** — the LADDERED-parent route: the plain split of that parent is refused, `transfer_many` carves one `SP` with 2 recipient children + change + P2A off `X_m.out[0]`, the batch stays off-chain, and the [B1] attack is then executed for real (alice broadcasts her retained trigger, spending `F`) with both recipients still exiting for their exact amounts; **sdk11** — multi-recipient parity, now asserting the ROUTE (both pieces are children of ONE `SP`, at `SP.out[0]`/`SP.out[1]`) and not just the amounts |
 | GRN-INV-13 (width vs depth) | `unit::granularity_model::width_vs_depth_weight_model` (112/155/241 vB pinned, width beats depth for every k ≥ 2 through the real `fee_sats_at`), cross-pinned by `unit::invalidation_model::exit_cost_scaling_model`. The E2E that measured the vsizes (sdk26) is retired; no live E2E re-measures them |
 | GRN-REQ-9 | sdk63/sdk64 (Lightning pay/receive on the ladder via the HODL latch — the exact leg still uses `ensure_exact_coin`); sdk65/sdk67 (the NON-EXACT in-ladder fallback that makes the one-call APIs usable on laddered coins — D3); sdk66/sdk68 (pay-failure reclaim, non-exact and exact) |
 | GRN-REQ-10/14, GRN-ERR-7/8 | audit [6][7] fix verification; **sdk29** — spent-carrier change is plain BTC (surfaces in `available_sats`; plain `split_coin` succeeds — GRN-INV-10's transfer/withdraw claim rides the shared predicate, not a direct assert) and the typed carrier refusal on `unilateral_exit` + the exit-everything sweep; sdk34 (the watchtower's carrier lane: skip an issued/flat carrier, MATERIALIZE a received one); sdk52 (a carrier is never laddered — the terminal-freeze row) |
@@ -614,15 +633,22 @@ None of these may be omitted when citing this spec.
     `UNIQUE constraint failed: asset.id` and stranded the second allocation) while the runtime
     contract import (new transitions) and the allocation registration still run. Verified by sdk29
     (bob receives PT2 three times: 10 → 11 → 9,996, balance sums each time).
-15. **`transfer_many` has no in-ladder route and does not refuse laddered parents — OPEN.** Its
-    parent filter excludes carriers only (transfer.rs:359-372), so on an ordinary wallet — where
-    every root deposit is laddered (§0) — a batch plain-splits a laddered coin: exactly the [B1]
-    shape `split_coin` hard-refuses, because a prior owner of a Model-A-conveyed parent retains a
-    no-timelock trigger over the same funding outpoint and could void the whole batch. No test
-    covers this. Until it is fixed, batch payers SHOULD issue N sequential `transfer()` calls, which
-    dispatch per parent shape (GRN-REQ-4 note). `in_ladder_pay` carves one piece + change only, so
-    the fix is either a refusal or a multi-child `SP` (`build_split_state` already accepts N
-    children, lib/src/tesr.rs:369-390).
+15. ~~**`transfer_many` has no in-ladder route and does not refuse laddered parents**~~ — **FIXED
+    (multi-child in-ladder split).** Its parent filter used to exclude carriers only, so on an
+    ordinary wallet — where every root deposit is laddered (§0) — a batch plain-split a laddered
+    coin: exactly the [B1] shape `split_coin` hard-refuses, because whoever retains the parent's
+    no-timelock trigger over the same funding outpoint could void the whole batch and kill every
+    recipient's piece at once. `transfer_many` now dispatches on the parent's shape like `transfer`
+    does (GRN-REQ-8): a laddered ROOT goes through `in_ladder_pay_many` (one `SP` over `X_m.out[0]`
+    carving N children + change), a received CHILD through `child_in_ladder_pay_many` (one `CSP` at
+    the child's level), and only an un-laddered coin still takes the plain split. `build_split_state`
+    and `in_ladder_split`/`child_in_ladder_split` already accepted N children (lib/src/tesr.rs:371,
+    clients/libs/rust/src/tesr.rs:285, 645), so the fix is in the SDK's routing + selection +
+    per-output floors, not the tier builders. Covered by **sdk69**, which pays two recipients out of
+    one laddered parent and then executes the B1 attack for real — alice broadcasts her retained
+    trigger, consuming `F`; both recipients still exit unilaterally for their exact amounts, because
+    `SP` descends from that trigger rather than racing it. `sdk11` now asserts the route (both pieces
+    are children of ONE `SP`, at `SP.out[0]`/`SP.out[1]`), not merely the amounts.
 16. **Status polling of a unilaterally-exiting child — FIXED (D4).** `withdraw` routes an in-ladder
     child to `unilateral_exit` (its funding `SP.out[j]` is un-broadcast, so a cooperative withdraw
     has no outpoint to spend) and marks it `WITHDRAWING` (wallet.rs:838-859). Such a coin has

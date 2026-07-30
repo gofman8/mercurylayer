@@ -16,9 +16,10 @@ document supersedes the calendar-refresh model described in `learn/invalidation-
   §5.2 / §5.10 / §9-Phase-3 below expected to disappear (see the **[Shipped]** corrections there).
 
 **How to read the rest.** §1 and §5–§7 are normative and describe running code. §2, §3, §8 and §9
-compare against the **pre-migration absolute-ladder baseline** ("V1"); that baseline is retained as the
-*rationale for this design* and is no longer a shipped option. Sections where implementation amended
-the design are tagged **[Shipped]** in place: §5.4 (in-ladder split + first-class children), §5.10.4
+compare against the **pre-migration absolute-ladder baseline** (the pre-TES-R design); that baseline
+is retained as the *rationale for this design* and is no longer a shipped option. Sections where
+implementation amended the design are tagged **[Shipped]** in place: §5.4 (in-ladder split +
+first-class children), §5.10.4
 and §5.2 (carrier deadlines survive on the un-laddered shape), §5.12 (the latch is a HODL-invoice
 latch), §9 (migration complete).
 
@@ -57,12 +58,12 @@ confiscation-by-design** — nothing in TES-R ever pays the operator by timeout.
 ## 2. Why the absolute ladder cannot scale (the block-space wall)
 
 *(Historical rationale for the whole design. The absolute-ladder deposit path no longer exists — no
-deposit is ever anchored to a decrementing absolute nLockTime ladder. "V1" below means that
-pre-migration baseline.)*
+deposit is ever anchored to a decrementing absolute nLockTime ladder. "The pre-TES-R design" below
+means that pre-migration baseline.)*
 
-V1 anchors every coin's decrementing nLockTime ladder to an **absolute** deposit height. Staying alive
-requires an on-chain re-anchor (refresh, 112 vB) per coin per ~initlock (~1,008 blocks ≈ 7 days),
-regardless of activity:
+The pre-TES-R design anchored every coin's decrementing nLockTime ladder to an **absolute** deposit
+height. Staying alive required an on-chain re-anchor (refresh, 112 vB) per coin per ~initlock
+(~1,008 blocks ≈ 7 days), regardless of activity:
 
 - **Idle rent**: 112 vB × 52,560/1,008 ≈ **5,840 vB per coin-year** — independent of whether the coin
   ever moves.
@@ -85,10 +86,12 @@ age at all.
 
 ## 3. Comparison landscape
 
-*(The **V1** column is the pre-migration baseline, kept because every number in this design is measured
-against it. It is not a shipped alternative — the shipped protocol is the last column.)*
+*(The **Baseline** column is the pre-TES-R design of §2 — every coin anchored to a decrementing
+absolute nLockTime ladder from its deposit height, with a calendar deadline and idle rent. It is kept
+because every number in this design is measured against it, and it is not a shipped alternative — the
+shipped protocol is the last column.)*
 
-| | **V1 (pre-migration baseline)** | **Spark** | **Ark** | **SuperScalar** | **TES-R (shipped)** |
+| | **Baseline (pre-TES-R)** | **Spark** | **Ark** | **SuperScalar** | **TES-R (shipped)** |
 |---|---|---|---|---|---|
 | Idle on-chain footprint | 5,840 vB/coin-yr (112 vB per ~7d) | **0** | Refresh per round or lose funds | Per-factory ladder txs (~monthly, amortized /N) | **0** |
 | Renewal mechanism | On-chain re-anchor per coin | Off-chain re-sign with operator group (`renew_leaf`) | On-chain round through ASP | New factory before dying period | **Off-chain**: DW lower-CSV extension re-sign; self-split rollover at epoch exhaustion |
@@ -118,9 +121,10 @@ Three candidates, six adversarial reviews. Verdict logic:
   rotates; a Sybil-originated factory (or hacked-SE + original-cohort collusion, "B1-F") fresh-spends
   the root and confiscates all 64 coins — including received-and-untouched ones — via private relay,
   with no race the victims can enter and no receiver-side check that can price it. It also deletes
-  V1's one absolute guarantee (self-deposited never-transferred coin safe against SE alone). Both
-  reviewers converged on this; one additionally showed the factory buys almost nothing (input-bound
-  amortization: ~101.5 vB/user real vs ~111 solo, a one-time ~10–50 vB saving) while its **Primitive 2
+  the baseline's one absolute guarantee (self-deposited never-transferred coin safe against SE alone),
+  which REQ3 obliges us to preserve. Both reviewers converged on this; one additionally showed the
+  factory buys almost nothing (input-bound amortization: ~101.5 vB/user real vs ~111 solo, a one-time
+  ~10–50 vB saving) while its **Primitive 2
   — the CSV trigger ladder — delivers 100% of the headline win standalone**. We accept that salvage
   verdict: the trigger-ladder ideas (co-op de-trigger, self-split renewal, tower fee bond) are folded
   into TES-R; the factory is rejected (revisited only under covenants, §10).
@@ -211,8 +215,9 @@ deadline for them to act on.
 
 Every pre-signed tx (T, X, S, SP, CB) is **nVersion=3 (TRUC)** and carries:
 1. a **small committed fee** drawn from the coin (target ~2 sat/vB at signing; Σout = Σin −
-   fee_committed) so the base case relays and confirms standalone — restoring V1's self-funding
-   property and removing the chicken-and-egg the review found in the all-zero-fee draft; and
+   fee_committed) so the base case relays and confirms standalone — restoring the self-funding
+   property the signed-once backup chain always had, and removing the chicken-and-egg the review
+   found in the all-zero-fee draft; and
 2. a **240-sat P2A anchor** (OP_1 0x4e73, anyone-can-spend) so any party — owner, keyless tower,
    operator — attaches a live-rate fee child (~152 vB: 41 P2A-in + 57.5 funding-in + 43 change + 10.5)
    during spikes.
@@ -221,7 +226,8 @@ TRUC's 1P1C topology + sibling eviction gives pinning resistance (each tier conf
 is valid, so no long vulnerable chains); v3+P2A is relay *policy*, not consensus — the
 miner-direct-submission fallback is documented, the same bet Lightning anchors make [Amendment:
 economics-fixable "state the policy dependence"]. The committed fee is small and bounded-stale (it is
-a floor, not the whole fee), so V1's 2–13 sat/vB stranded-reserve pathology does not return in force.
+a floor, not the whole fee), so the backup-fee model's 2–13 sat/vB stranded-reserve pathology does not
+return in force.
 
 ### 5.4 Splits, combines, sub-coins
 
@@ -266,8 +272,8 @@ never inferred.
 
 ### 5.5 Renewal (pure off-chain; the common case)
 
-When Δ_{k+1} would fall below D_floor, the SDK runs renewal inside `transfer()` — replacing V1's
-on-chain auto-refresh with **zero on-chain bytes**:
+When Δ_{k+1} would fall below D_floor, the SDK runs renewal inside `transfer()` — replacing the
+pre-TES-R on-chain auto-refresh with **zero on-chain bytes**:
 
 1. `POST /renew/init {statechain_id, challenge_response}` — **[Amendment, TES-fixable #1]** bound to
    the single-use endpoint-bound challenge nonce (the audit-[15] rail already in the codebase), and
@@ -285,9 +291,9 @@ every older extension in the CSV race for T.out[0]; every pre-renewal state hang
 that can now never confirm. This is Decker-Wattenhofer replace-by-lower-timelock at one dedicated
 tier — renewal replaces horizontally, tree depth stays constant across all epochs. Honesty note
 (accepted from review): "consensus-dead" is *race-conditional* — the newest extension must win a
-≥36-block-edge race after a public trigger. That is strictly stronger than V1's post-window position
-and categorically stronger than Spark's key-deletion promise, but it is a race, not an axiom. Enclave
-single-active-state refusal remains the second, independent layer.
+≥36-block-edge race after a public trigger. That is strictly stronger than the baseline's post-window
+position and categorically stronger than Spark's key-deletion promise, but it is a race, not an
+axiom. Enclave single-active-state refusal remains the second, independent layer.
 
 **[Shipped] evidence**: **sdk51** — someone else spends F (a prior owner racing a stale state, or a
 griefer); the owner runs only `defend_ladders()` and the strictly-lowest-CSV current state matures
@@ -306,8 +312,9 @@ extension + state tiers (fresh 576-hop budget). Cost: zero on-chain; +2 pre-sign
 *contingent* exit weight and +1 depth level. The parent is terminalized — frozen forever (see §5.10).
 
 **Compaction becomes an optional depth-capping policy, not a liveness requirement.** Default SDK
-policy: when depth > 3, the next transfer triggers a **solo compaction** = exactly V1's refresh
-(112 vB, non-interactive, existing code path), reborn at depth 0, priced into that transfer's fee.
+policy: when depth > 3, the next transfer triggers a **solo compaction** = exactly the pre-TES-R
+on-chain re-anchor (`refresh`: 112 vB, non-interactive, existing code path), reborn at depth 0,
+priced into that transfer's fee.
 **[Amendment, TES-fixable #2 (economics review)]** the interactive MuSig2 batch coordinator is
 **dropped at launch**: batching saves only 112 → ~103 vB/coin (corrected: 57.5 in + 43 out + amortized
 overhead — the draft's "58 vB with output netting" was wrong, no netting exists) while interactive
@@ -332,9 +339,9 @@ the operator absorbs the difference.
 |---|---|---|---|---|---|
 | Previous owner, same epoch | T, X_m, stale S_j | Broadcast T; at +E_m broadcast X_m; wait Δ_j | Tower sees F spent (loud, on-chain); **preferred: co-op de-trigger (§5.8)**; else broadcast S_k at +Δ_k | **Honest**, ≥36-block (~6 h) CSV edge per tier + fee race | ≥1 tower reacting within a window that opens with ≥E_m + Δ_k ≥ 288 blocks (~2 days) of total notice |
 | Previous owner, old epoch m′ | T, X_{m′}, old states | Broadcast T; wait E_{m′} | Co-op de-trigger, or broadcast X_m at +E_m — every epoch-m′ state's parent becomes unconfirmable | **Honest**, edge 36·(m−m′) ≥ 36 blocks | Tower awake within the edge, after ≥E_m ≥ 144 blocks of prior notice |
-| Ancestor's past owner vs my sub-coin | Root chain + stale S_j at some level | Confirm T, X; broadcast stale S_j before my SP | Tower broadcasts SP at Δ_{k+1} (undercuts by ≥36); per-tier repeat | **Honest**, per-tier ≥36-block edge; **no calendar deadline exists** (V1's [17]/B6 class deleted) | Per-tier reaction; ≥144 blocks notice before ANY hostile tx is final |
+| Ancestor's past owner vs my sub-coin | Root chain + stale S_j at some level | Confirm T, X; broadcast stale S_j before my SP | Tower broadcasts SP at Δ_{k+1} (undercuts by ≥36); per-tier repeat | **Honest**, per-tier ≥36-block edge; **no calendar deadline exists** (the pre-TES-R [17]/B6 class deleted) | Per-tier reaction; ≥144 blocks notice before ANY hostile tx is final |
 | Hacked SE alone | e_n (1 of 2-of-2) | Nothing signs; can only refuse (freeze ≠ seize) | Unilateral tree pre-signed, needs nobody | **Honest, unconditionally** | None |
-| Hacked SE + past owner w/ retained pre-rotation share (**B1**) | Full key of F | Fresh no-timelock spend, private relay | Race with pre-signed material; blindness blocks target selection; public counter receipts attribute | **Adversary favored — byte-identical to V1's B1**, the statechain trust unit, unchanged in kind and mitigations | Enclave deletion + attestation ops; settled coins immune |
+| Hacked SE + past owner w/ retained pre-rotation share (**B1**) | Full key of F | Fresh no-timelock spend, private relay | Race with pre-signed material; blindness blocks target selection; public counter receipts attribute | **Adversary favored — byte-identical to the pre-TES-R B1**, the statechain trust unit, unchanged in kind and mitigations | Enclave deletion + attestation ops; settled coins immune |
 | Hacked SE + thief, coin received PRE-hack, untouched | e_n only | Cannot produce owner's partial | 2-of-2 arithmetic | **Honest, unconditionally** (REQ-3 core case) | None |
 | Trigger griefer (any past owner, anonymous) | T | Broadcast T to force cost | **Co-op de-trigger: 111 vB, coin fully restored (§5.8)** | **Honest**; attacker pays ~276 vB to cost the victim ~111 vB | SE alive; else falls to row 1 |
 | Malicious/buggy tower | Bundle (all pre-signed, pays owner only) | Broadcast early / not act | — | **Honest** (early = settles to owner; inaction = no tower) | — |
@@ -349,11 +356,11 @@ adversarial rejection of forged/hidden structure — **sdk58** (11 cases), **sdk
 (**sdk56/sdk57**, retry-idempotence and owner-share binding). Row 3's "no calendar deadline exists"
 holds for a **laddered** sub-coin; the un-laddered shape keeps its root deadline (§5.10.4).
 
-**The traded property, stated plainly**: V1's unconditional ~7-day no-watch window is exchanged for
-*perpetual but alarm-driven* watching. No theft tx can become valid until ≥144 blocks (~1 day) after a
-**publicly visible on-chain trigger** spends F — strictly more defender notice than V1's silent
-calendar maturities and post-window minutes-scale mempool races. Missed liveness is never
-confiscation-by-design: nothing expires, nothing sweeps to the operator; loss requires a real
+**The traded property, stated plainly**: the pre-TES-R design's unconditional ~7-day no-watch window
+is exchanged for *perpetual but alarm-driven* watching. No theft tx can become valid until ≥144 blocks
+(~1 day) after a **publicly visible on-chain trigger** spends F — strictly more defender notice than
+that design's silent calendar maturities and post-window minutes-scale mempool races. Missed liveness
+is never confiscation-by-design: nothing expires, nothing sweeps to the operator; loss requires a real
 adversary winning a telegraphed public race while every tower slept through ≥1 day of alarm. This is
 exactly the race class the hard constraints tolerate. (The reviewer's "trigger + offline victim =
 theft" FATAL is this row; we accept the downgrade-in-kind — no safe unwatched holding period — as the
@@ -415,7 +422,7 @@ signed-once rule and forked into either 54-fold budget collapse or Spark-grade e
 1. **RGB transitions anchor ONLY in signed-once transactions**: colored splits/combines (SP/CB) and
    colored self-transitions (de-trigger re-anchors, rollover self-splits). Plain T/X/S never host
    anchors and are sats-only (token-destroying if used on a carrier; structurally omitted from
-   carrier watch bundles, exactly as V1).
+   carrier watch bundles, exactly as the token-destroying plain backup always has been).
 2. **Terminal-freeze invariant**: a colored tx only ever spends outputs of **terminalized** structure.
    Terminalization (spend_budget → terminal, public receipt) happens before the colored co-sign, as
    today — and the SE **refuses renewal on terminal nodes**, so no ancestor of any RGB anchor is ever
@@ -424,9 +431,10 @@ signed-once rule and forked into either 54-fold budget collapse or Spark-grade e
    to today's already-supported un-broadcast-carrier validation (consignments carry the un-broadcast
    T/X/SP chain as witness txs — more branch, same model).
 3. **Seals sit on resting outputs** of un-broadcast colored txs; token transfers remain colored splits
-   minting fresh receiver pieces — token DAG depth grows per token hop exactly as in V1 (no
-   regression; carrier economics = V1 carrier economics — **including its calendar deadlines**, per the
-   correction in 4 below; the draft wrote "minus all calendar deadlines" and that was wrong).
+   minting fresh receiver pieces — token DAG depth grows per token hop exactly as it did before the
+   migration (no regression; carrier economics are unchanged from the pre-TES-R design — **including
+   its calendar deadlines**, per the correction in 4 below; the draft wrote "minus all calendar
+   deadlines" and that was wrong).
 4. **Carrier defense** = materialize the colored branch only (REQ-33 semantics), per-tier CSV head
    starts as §5.7 row 3. **[Shipped correction — the draft over-claimed here]**: because rule 1 forbids
    laddering a carrier at all, a carrier never gains the CSV tiers that would delete its calendar. It
@@ -452,9 +460,10 @@ Derived from public data; any deviation = reject: (R3′) F on-chain, unspent, p
 no timelock; tier outputs pay A + the public H_tag tweaks; current extension has nSequence exactly
 E0 − m·δE and the new state exactly D0 − (k+1)·δ against the SE's **publicly-served counters**, with
 headroom ≥ receiver policy. (R5′) SE signature count == exact expected tree size (counters endpoint) —
-any hidden extra co-signed state/extension shows as a count mismatch, same linchpin as V1's R5. (R6′/
-R7′) per-level branch validation + Σ-inputs terminal ancestors, now including the terminal-freeze
-check for colored ancestry. (R8) RGB consignment client-validated, un-broadcast witnesses allowed.
+any hidden extra co-signed state/extension shows as a count mismatch, same linchpin as R5 in the
+pre-TES-R receiver set. (R6′/R7′) per-level branch validation + Σ-inputs terminal ancestors, now
+including the terminal-freeze check for colored ancestry. (R8) RGB consignment client-validated,
+un-broadcast witnesses allowed.
 All txs v3, committed-fee + single P2A, Σout = Σin − fee. **[Amendment, TES-fixable #6]**: hard depth
 cap (reject depth > 8 regardless of policy) + claim-time validation DoS pricing.
 
@@ -462,7 +471,7 @@ cap (reject depth > 8 regardless of policy) + claim-time validation DoS pricing.
 increments by exactly the tier count, `verify_bundle` accepts the true count and rejects a hidden extra
 signature), **sdk47** (R′ across a transfer), **sdk54** (adversarial `verify_bundle`), **sdk55**
 (backup-chain adversarial), **sdk58** (11 adversarial in-ladder-split cases). The census generalizes to
-N hops for first-class children (`se_num_sigs == v1_backups + Σ conveyed_tiers`): each hop discloses
+N hops for first-class children (`se_num_sigs == flat_backups + Σ conveyed_tiers`): each hop discloses
 exactly one superseded state, so an undisclosed rival shows up as a count mismatch — **sdk60**,
 **sdk17**.
 
@@ -487,7 +496,7 @@ Defect **D3** was here: the one-call Lightning PAY API minted its input via `ens
 refused **every laddered coin** — i.e. every coin the protocol produces. It now pays from the ladder
 directly.
 
-### 5.13 Watchtowers (WatchBundle v2)
+### 5.13 Watchtowers (the keyless TES-R watch bundle)
 
 {trigger, newest extension, newest state or SP chain, per-tier CSV schedule, fee-child templates} —
 all pre-signed, pays only the owner, zero key material (REQ-34 preserved). `watch_pass` becomes a
@@ -514,10 +523,11 @@ exercises spike-time fee bumping (§9).
 ## 6. Requirement-by-requirement verification
 
 **REQ 1 — off-chain forever / activity-scaled footprint: MET (per the refinement; near-categorical).**
-Idle **laddered** coins: 0 vB forever — no rent, no deadlines, no forced materializations (V1's entire
-5,840 vB/coin-yr class deleted). **[Shipped caveat]** an idle **un-laddered** coin (RGB carrier, B0
-sub-coin) also pays 0 vB rent, but it keeps its absolute-locktime root deadline, so a *received*
-carrier still owes one materialization before that deadline (§5.10.4) — activity-scaled, but not
+Idle **laddered** coins: 0 vB forever — no rent, no deadlines, no forced materializations (the
+baseline's entire 5,840 vB/coin-yr rent class deleted). **[Shipped caveat]** an idle **un-laddered**
+coin (RGB carrier, B0 sub-coin) also pays 0 vB rent, but it keeps its absolute-locktime root
+deadline, so a *received* carrier still owes one materialization before that deadline (§5.10.4) —
+activity-scaled, but not
 deadline-free. Off-chain transitions: 576 hops per depth level, rollover is off-chain (sdk43), so hop
 count is **unlimited without any mandatory chain touch**; the default depth-3
 compaction policy is an optional optimization costing 112 vB per ~2,300 transfers ≈ 0.05 vB/transfer,
@@ -554,15 +564,16 @@ coordinator (the other REQ4 gap) does not ship. Exit-time RGB disclosure unchang
 - **R-1 Correlated SE-death + mass trigger grief**: with the SE dead, de-trigger is unavailable and
   every triggered coin fights per-tier races; defense capacity saturates around ~10⁵–10⁶
   simultaneous triggers/day, beyond which small coins are not worth defending at spike rates. Never
-  confiscation; bounded by the attacker paying ~2.5× the defender per coin. (No V1-style 7-day exit
-  stampede exists, though — untriggered coins idle safely under a dead SE forever.)
+  confiscation; bounded by the attacker paying ~2.5× the defender per coin. (No 7-day exit stampede of
+  the pre-TES-R kind exists, though — untriggered coins idle safely under a dead SE forever.)
 - **R-2 No unconditional no-watch window**: a received coin must be watched (delegated, keyless,
   prepaid) from the moment of receipt, forever. Alarm-driven with ≥1 day notice, but a downgrade in
-  kind from V1's first-window, accepted deliberately. **[Shipped]** on the un-laddered shape the duty
-  is *calendar*-driven instead (materialize before the root deadline, §5.10.4) — sdk32 is the standing
+  kind from the pre-TES-R first-window guarantee, accepted deliberately. **[Shipped]** on the
+  un-laddered shape the duty is *calendar*-driven instead (materialize before the root deadline,
+  §5.10.4) — sdk32 is the standing
   record of what happens to a received carrier whose owner never acts.
 - **R-3 B1 unchanged**: the statechain trust unit (enclave share-deletion) remains the floor, as in
-  V1 and every statechain.
+  the pre-TES-R design and every statechain.
 - **R-4 δ=36 head starts vs sustained congestion**: a fee spike outlasting the head start converts
   the CSV edge into a pure fee race; committed fees + P2A + funded towers are the answer, and δ is a
   dial (open problem O-2 quantifies against mainnet history before mainnet ship). **[Shipped gap]**
@@ -581,8 +592,8 @@ Primitives: P2TR in 57.5 / out 43 / overhead 10.5 / P2A out 13 vB; tier tx 124 v
 solo compaction 112 vB. All corrected figures from the economics review adopted (the draft's 58-vB
 batched claim and 0.04 vB/transfer are **rejected**; no output netting exists).
 
-**7.1 Per coin** (the V1 column is the pre-migration baseline, §3)
-| | V1 (baseline) | TES-R (shipped) |
+**7.1 Per coin** (the Baseline column is the pre-TES-R design of §2–§3)
+| | Baseline (pre-TES-R) | TES-R (shipped) |
 |---|---|---|
 | Idle coin | 5,840 vB/yr | **0 vB/yr** |
 | Active, 10 tx/day, default depth-3 policy | 5,840 vB/yr (rent dominates) | 3,650 hops/yr ÷ ~2,300/compaction ≈ 1.6 × 112 ≈ **~180 vB/yr** (≈0.05 vB/transfer) |
@@ -590,17 +601,18 @@ batched claim and 0.04 vB/transfer are **rejected**; no output netting exists).
 
 **7.2 System, 1M-vB blocks, 52,560 blocks/yr, 10% of coins active at 10 tx/day (aggressive):**
 - **1M coins**: idle 900k → 0; active 100k × ~180 ≈ 18M vB/yr ≈ **342 vB/block ≈ 0.034%** of block
-  space (V1: 111,111 vB/block ≈ 11.1% — a **~320× reduction**). Plus churn: 20%/yr deposit+exit at
-  ~111 + ~372–828 vB adds ~0.2–0.4% — present in every design including Spark.
-- **10M coins**: ≈ **0.34%** (+ churn) — vs V1's physically impossible 111%. **100M coins ≈ 3.4%** —
-  the "hundreds of millions TVL" target is reachable if value concentrates realistically.
+  space (baseline: 111,111 vB/block ≈ 11.1% — a **~320× reduction**). Plus churn: 20%/yr
+  deposit+exit at ~111 + ~372–828 vB adds ~0.2–0.4% — present in every design including Spark.
+- **10M coins**: ≈ **0.34%** (+ churn) — vs the baseline's physically impossible 111%.
+  **100M coins ≈ 3.4%** — the "hundreds of millions TVL" target is reachable if value concentrates
+  realistically.
 - Fully idle custody TVL is exactly free at any scale.
 
 **7.3 The fee model (per the delegation refinement)**
 - Onboarding fee: deposit tx share (~58–111 vB) + tower fee bond (~15k sats, actuarially sized) +
   tower infra (~$0.001/coin-yr: 10M outpoint subscriptions ≈ one indexed node ≈ $3–6k/yr, ~15 GB
-  bundles). No idle-rent prefund line exists — the item that made V1 unpriceable ($292/coin for 5
-  idle years) is gone.
+  bundles). No idle-rent prefund line exists — the item that made the pre-TES-R design unpriceable
+  ($292/coin for 5 idle years) is gone.
 - Per-transfer fee: carries the amortized compaction share (≈0.05 vB) + committed-fee top-ups +
   renewal (0 vB, 2 co-signs). Users never see or perform a maintenance action.
 - Grief insurance: a small per-transfer tower-insurance component funds de-trigger re-anchors
@@ -621,9 +633,9 @@ them itself, distributes leaves to real victims who pass every R-check — lets 
 hacked-SE + original cohort, **B1-F**) fresh-spend F_root via private relay and confiscate all 64
 coins in one confirmation, *including received-and-untouched coins*, destroying every RGB allocation
 below. No timelock gates a fresh signature; the victims' pre-signed tree loses a race they cannot see.
-This deletes V1's one absolute guarantee (self-deposited never-transferred coin safe vs SE alone) and
-breaks REQ3's "preserve or improve" — unfixably, because the amortization *is* the shared multisig,
-which cannot include current holders and whose signer independence Bitcoin cannot prove.
+This deletes the baseline's one absolute guarantee (self-deposited never-transferred coin safe vs SE
+alone) and breaks REQ3's "preserve or improve" — unfixably, because the amortization *is* the shared
+multisig, which cannot include current holders and whose signer independence Bitcoin cannot prove.
 **Cost-benefit inversion (accepted)**: amortization is input-bound — ~101.5 vB/user real (with change
 outputs) vs ~111 solo, a one-time ~10–50 vB saving — while the ceremony succeeds with p ≈ 0.98⁶⁴ ≈ 27%
 per attempt and free-join griefing stalls onboarding. The factory's Primitive 2 (CSV trigger ladders,
@@ -638,10 +650,11 @@ C-90 = 505 vB/coin-yr idle → 0.96% of block space at 1M coins, **9.6% at 10M, 
 flat coins only; an idle *received sub-coin* is still bounded by its root deadline, and extending it
 requires either materializing (footprint spike) or all-descendant re-signing (multi-party liveness) —
 "unsolved in general" per its own open problems, i.e. REQ1 fails for exactly the split/combine feature
-REQ2 forces us to keep. Additional: 90-day unilateral/SE-death wait (13× worse than V1, correlated
-with bank-run moments); actuarial fee-model insolvency in the tail (13-month frozen fees, no forward
-market); (k+1)× enclave share blast radius on an unattested SGX. Not even useful as a bridge: TES-R
-migration is a single re-anchor per coin (§9), self-funding within one week of avoided V1 rent.
+REQ2 forces us to keep. Additional: 90-day unilateral/SE-death wait (13× worse than the baseline's
+~7 days, correlated with bank-run moments); actuarial fee-model insolvency in the tail (13-month
+frozen fees, no forward market); (k+1)× enclave share blast radius on an unattested SGX. Not even
+useful as a bridge: TES-R migration is a single re-anchor per coin (§9), self-funding within one week
+of the avoided baseline rent.
 Salvaged ideas: P2A-on-everything, tower-executed maintenance (made off-chain), conveyed-locktimes
 (moot for laddered coins — they have no calendar deadlines to convey. **[Shipped correction]** audit
 [17] therefore does *not* close by deletion: it survives on the un-laddered shape, absorbed by the
@@ -659,7 +672,7 @@ any alternative).
 
 ---
 
-## 9. Migration path from V1 — **COMPLETE**
+## 9. Migration path off the pre-TES-R design — **COMPLETE**
 
 *(Historical plan, kept intact; outcomes annotated. The migration is done: there is one protocol, the
 `deposit_protocol_version` / `UTEXO_PROTOCOL_DEFAULT` escape hatch is deleted, and no test pins the old
@@ -667,7 +680,7 @@ lane. The per-test migration record lives in git history and `history/MIGRATION.
 
 **Phase 0 — ship, no behavior change** — *DONE*: server: generalized counters {level, m, k, total_sigs},
 `POST /renew/init` (challenge-nonce rail), config + nostr record; SDK: TES-R builders in
-`transaction.rs` (CSV tiers, v3, committed fee + P2A, public H_tag tweaks), WatchBundle v2 +
+`transaction.rs` (CSV tiers, v3, committed fee + P2A, public H_tag tweaks), the TES-R watch bundle +
 package-aware `watch_pass` with fee wallet, R′ receiver checks behind a version tag in the transfer
 message (receivers handle both ladder types during migration). Enclave: **cryptographically
 unchanged** (blind MuSig2 + one-shot nonces suffice); only the counter state machine needs the
@@ -684,19 +697,21 @@ fresh **confirmed root** coin (same B5 onboarding-window semantics as the old tx
 deliberate exceptions are shapes, not opt-outs: RGB carriers (§5.10) and sub-coins over un-broadcast
 funding (B0, §5.4).
 
-**Phase 2 — V1 coin conversion** — *DONE (rail retained)*: one final on-chain re-anchor per coin
-(the 112-vB refresh, `refresh_sponsored` rail reusable), reborn as TES-R at depth 0. 1M coins ×
-112 vB = 112M vB one-time ≈ one week of V1's avoided rent — **the migration pays for itself within
-~7 days**; schedule over weeks. Un-broadcast sub-coin DAGs migrated at their next transfer
+**Phase 2 — converting the pre-TES-R coins** — *DONE (rail retained)*: one final on-chain re-anchor per
+coin (the 112-vB refresh, `refresh_sponsored` rail reusable), reborn as TES-R at depth 0. 1M coins ×
+112 vB = 112M vB one-time ≈ one week of the avoided baseline rent — **the migration pays for itself
+within ~7 days**; schedule over weeks. Un-broadcast sub-coin DAGs migrated at their next transfer
 (auto-refresh hook) or before their root deadline (`auto_exit_due` covered stragglers). The re-anchor
 and sponsored-rebate paths survive as ordinary maintenance (§5.6; defect D2 was found here).
 
-**Phase 3 — delete V1 calendar machinery** — *PARTLY DONE, deliberately*: refresh-token-slot economics
-and the B6/[17] margin arithmetic are gone from the laddered path, but `exit_deadline_block` and the
+**Phase 3 — delete the pre-TES-R calendar machinery** — *PARTLY DONE, deliberately*:
+refresh-token-slot economics and the B6/[17] margin arithmetic are gone from the laddered path, but
+`exit_deadline_block` and the
 `auto_exit_due` pass are **kept** — they are what defends the un-laddered shape, which is permanent
-(§5.2 / §5.10.4). "Removed once no V1 coins remain" was written on the assumption every coin would end
-up laddered; that assumption is false for RGB carriers. RGB: no protocol change (the anchoring rules of
-§5.10 are a constraint tightening, enforced at co-sign time); rgb-lib needs only the existing
+(§5.2 / §5.10.4). The plan's "removed once the conversion completes" clause was written on the
+assumption every coin would end up laddered; that assumption is false for RGB carriers. RGB: no
+protocol change (the anchoring rules of §5.10 are a constraint tightening, enforced at co-sign time);
+rgb-lib needs only the existing
 un-broadcast-witness validation, now exercised over deeper chains — dedicated adversarial suite still
 open (O-3).
 
@@ -722,8 +737,8 @@ today:
 Not covered by any live test, and honestly open: **package-relay tower defense** and P2A fee-child
 attachment under a real fee spike (§5.3 / §5.13 — not merely untested, *unimplemented*: no
 `submitpackage` caller exists), the **colored** de-trigger variant (§5.8), and mass-grief
-prioritization (R-1 / O-6). Those remain design-level claims. The earlier plan's "mixed V1/V2 estates"
-item is void: no mixed estate can exist.
+prioritization (R-1 / O-6). Those remain design-level claims. The earlier plan's "mixed-protocol
+estates" item is void: no mixed estate can exist.
 
 ---
 

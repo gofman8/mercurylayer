@@ -1,4 +1,4 @@
-//! TES-R (Trigger / Extension / State) transaction tier builders for Utexo V2.
+//! TES-R (Trigger / Extension / State) transaction tier builders for Mercury Utexo.
 //!
 //! See `docs/utexo/PROTOCOL.md`. A coin's funding UTXO `F` (P2TR of the aggregate key `A`) rests
 //! on-chain; above it hangs a pre-signed, **un-broadcast** tree of three tiers, all v3 (TRUC) with a
@@ -49,7 +49,8 @@ pub fn p2a_script() -> ScriptBuf {
 }
 
 /// Committed fee (sats) baked into a tier tx at `fee_rate_sats_per_vb`, so the base case relays and
-/// confirms standalone (restoring V1's self-funding property); the P2A anchor tops it up in a spike.
+/// confirms standalone (the same self-funding property a backup tx of an un-laddered coin has); the
+/// P2A anchor tops it up in a spike.
 pub fn committed_fee(fee_rate_sats_per_vb: f64) -> u64 {
     (TIER_VBYTES as f64 * fee_rate_sats_per_vb).ceil() as u64
 }
@@ -67,8 +68,8 @@ pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64>
 /// `committed_fee(rate) + P2A_VALUE`. The child's final state output must then still clear the
 /// caller's dust floor to be broadcastable.
 ///
-/// This is strictly larger than the plain backup-fee floor (`DUST_LIMIT + backup fee`) that sized
-/// V1 sub-coins, and it is the value an admission guard MUST use: `establish_child` runs *after*
+/// This is strictly larger than the plain backup-fee floor (`DUST_LIMIT + backup fee`) that sizes
+/// un-laddered sub-coins, and it is the value an admission guard MUST use: `establish_child` runs *after*
 /// the parent's spend budget is consumed and `SP` is co-signed, so a child admitted below this
 /// dies with [`MercuryError::FeeTooHigh`] once the parent is already terminal — stranding the
 /// parent to unilateral-exit-only.
@@ -186,6 +187,21 @@ pub fn build_tier_tx(
     }
 }
 
+/// **THE payload-vout accessor.** The output index at which a tier's PAYLOAD (value-carrying,
+/// P2TR(A)-or-payee) outputs begin. Every chaining site — "the child spends its parent's payload
+/// output", "the tier pays `A` on its payload output", the `live_csv_by_outpoint` census key — must
+/// read this rather than assuming `0`.
+///
+/// It is `0` today because a tier is `[payload…, P2A]`. Under CTES-R a coloured tier is
+/// `[opret, payload…, P2A]` (the fork sets `opreturn_first = true` whenever any output is P2TR, and
+/// the P2A anchor is *not* P2TR — see `docs/utexo/CTESR-GATE.md` §2.1(a)), so every payload shifts by
+/// one. Routing every site through this one name is what makes wiring colouring a change of ONE
+/// value instead of an audit of a dozen literals.
+///
+/// Do NOT hard-code "the opret is index 0" anywhere; derive payload vouts from the builder's
+/// [`TierTx::payload_vout`], never from a positional assumption.
+pub const UNCOLORED_PAYLOAD_VOUT: u32 = 0;
+
 /// Encoded (hex) result of building a tier tx, plus the value it pays forward (the prevout value the
 /// child tier will spend) and its txid. The txid is stable across signing (a key-spend adds only
 /// witness data), so a child tier can reference its parent before the parent is co-signed.
@@ -193,18 +209,30 @@ pub struct TierTx {
     pub txid: String,
     pub tx_hex: String,
     pub out_value: u64,
+    /// Index of this tier's FIRST payload output — [`UNCOLORED_PAYLOAD_VOUT`] today. `out_value` is
+    /// read from THIS output, and a child tier spends `(txid, payload_vout)`.
+    pub payload_vout: u32,
 }
 
-fn encode(tx: &Transaction) -> TierTx {
-    TierTx {
+/// Encode a built tier, reading its forward value from the PAYLOAD output rather than `output[0]`.
+/// Fails closed if `payload_vout` is out of range (a builder bug, or a coloured shape whose payload
+/// index was mis-derived) rather than panicking or silently reading the wrong output.
+fn encode(tx: &Transaction, payload_vout: u32) -> Result<TierTx, MercuryError> {
+    let payload = tx
+        .output
+        .get(payload_vout as usize)
+        .ok_or(MercuryError::TransactionReconstructionError)?;
+    Ok(TierTx {
         txid: tx.txid().to_string(),
         tx_hex: hex::encode(bitcoin::consensus::encode::serialize(tx)),
-        out_value: tx.output[0].value,
-    }
+        out_value: payload.value,
+        payload_vout,
+    })
 }
 
 /// The scriptPubKey a TES-R tier output should pay for `address` on `network`. Two forms, mirroring
-/// `create_tx_out` exactly so a state tier can pay a transfer recipient (Model A, V2-MIGRATION):
+/// `create_tx_out` exactly so a state tier can pay a transfer recipient (Model A,
+/// `docs/utexo/history/MIGRATION.md`):
 /// - a **Mercury transfer address** (`utexoinv…`/`tml…` HRP) → the recipient's DERIVED
 ///   `P2TR(recipient_user_pubkey)`, so the sender can pre-sign the receiver-paying state `S'`;
 /// - a plain bech32(m) address → itself.
@@ -229,7 +257,8 @@ fn spk_from_address(address: &str, network: &str) -> Result<ScriptBuf, MercuryEr
 
 /// The plain P2TR address a TES-R state should pay for `address` (Model A `owner_exit_address`).
 /// A Mercury transfer address resolves to the recipient's derived `P2TR(recipient_user_pubkey)` — the
-/// SAME key V1's `create_tx_out` pays and that the recipient holds; a plain address is returned as-is.
+/// SAME key the backup chain's `create_tx_out` pays and that the recipient holds; a plain address is
+/// returned as-is.
 /// The receiver compares this against `get_user_backup_address(coin)` to confirm the ladder pays it.
 pub fn payee_address(address: &str, network: &str) -> Result<String, MercuryError> {
     let net = get_network(network)?;
@@ -260,10 +289,11 @@ pub fn build_trigger(
     let txid = Txid::from_str(f_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
     let out_value = tier_out_value(f_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let spk = spk_from_address(to_address, network)?;
-    Ok(encode(&build_tier_tx(txid, f_vout, TRIGGER_SEQUENCE, spk, out_value)))
+    encode(&build_tier_tx(txid, f_vout, TRIGGER_SEQUENCE, spk, out_value), UNCOLORED_PAYLOAD_VOUT)
 }
 
-/// EXTENSION `X_m`: spends `T.out[0]` under relative-timelock `csv_e = E0 − m·δE`, paying P2TR(A).
+/// EXTENSION `X_m`: spends the trigger's PAYLOAD output under relative-timelock `csv_e = E0 − m·δE`,
+/// paying P2TR(A).
 pub fn build_extension(
     t_txid: &str,
     t_out_value: u64,
@@ -275,10 +305,14 @@ pub fn build_extension(
     let txid = Txid::from_str(t_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
     let out_value = tier_out_value(t_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let spk = spk_from_address(to_address, network)?;
-    Ok(encode(&build_tier_tx(txid, 0, csv_blocks(csv_e), spk, out_value)))
+    encode(
+        &build_tier_tx(txid, UNCOLORED_PAYLOAD_VOUT, csv_blocks(csv_e), spk, out_value),
+        UNCOLORED_PAYLOAD_VOUT,
+    )
 }
 
-/// STATE `S_k`: spends `X_m.out[0]` under relative-timelock `csv_d = D0 − k·δ`, paying `owner_address`
+/// STATE `S_k`: spends the extension's PAYLOAD output under relative-timelock `csv_d = D0 − k·δ`,
+/// paying `owner_address`
 /// (for a resting off-chain state this is P2TR(A); for a unilateral exit, the owner's own address).
 pub fn build_state(
     x_txid: &str,
@@ -291,7 +325,10 @@ pub fn build_state(
     let txid = Txid::from_str(x_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
     let out_value = tier_out_value(x_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let spk = spk_from_address(owner_address, network)?;
-    Ok(encode(&build_tier_tx(txid, 0, csv_blocks(csv_d), spk, out_value)))
+    encode(
+        &build_tier_tx(txid, UNCOLORED_PAYLOAD_VOUT, csv_blocks(csv_d), spk, out_value),
+        UNCOLORED_PAYLOAD_VOUT,
+    )
 }
 
 /// [in-ladder split] Like [`build_extension`] but roots at an ARBITRARY output `(prev_txid, prev_vout)`
@@ -309,7 +346,7 @@ pub fn build_extension_from(
     let txid = Txid::from_str(prev_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
     let out_value = tier_out_value(prev_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let spk = spk_from_address(to_address, network)?;
-    Ok(encode(&build_tier_tx(txid, prev_vout, csv_blocks(csv_e), spk, out_value)))
+    encode(&build_tier_tx(txid, prev_vout, csv_blocks(csv_e), spk, out_value), UNCOLORED_PAYLOAD_VOUT)
 }
 
 /// [in-ladder split] Like [`build_state`] but roots at an ARBITRARY output `(prev_txid, prev_vout)`.
@@ -327,7 +364,7 @@ pub fn build_state_from(
     let txid = Txid::from_str(prev_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
     let out_value = tier_out_value(prev_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let spk = spk_from_address(owner_address, network)?;
-    Ok(encode(&build_tier_tx(txid, prev_vout, csv_blocks(csv_d), spk, out_value)))
+    encode(&build_tier_tx(txid, prev_vout, csv_blocks(csv_d), spk, out_value), UNCOLORED_PAYLOAD_VOUT)
 }
 
 /// vbytes of one extra P2TR resting output (8 value + 1 length + 34 scriptPubKey).
@@ -350,7 +387,7 @@ pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f
 /// **SPLIT STATE `SP`** — the in-ladder split (PROTOCOL.md §5.4). Spends `X_m.out[0]` under
 /// relative-timelock `csv_d`, paying `children` (exact amounts) plus the P2A anchor.
 ///
-/// This addresses (does NOT fully dissolve) **B1**. A V1-style split spends the coin's funding `F` — and
+/// This addresses (does NOT fully dissolve) **B1**. An un-laddered split spends the coin's funding `F` — and
 /// so does the trigger `T`, which every prior owner of a Model-A-conveyed coin retains, un-timelocked and
 /// already co-signed. `SP` instead spends `X_m.out[0]`, so it **descends from `T` rather than racing it**:
 /// a retained trigger can only start the clock on the current owner's own chain.
@@ -395,14 +432,16 @@ pub fn build_split_state(
         version: 3,
         lock_time: absolute::LockTime::from_consensus(0),
         input: vec![TxIn {
-            previous_output: OutPoint { txid, vout: 0 },
+            // SP spends the extension's PAYLOAD output — not a positional `0`. Child `j` then lands at
+            // `payload_vout + j` (see the returned [`TierTx::payload_vout`]).
+            previous_output: OutPoint { txid, vout: UNCOLORED_PAYLOAD_VOUT },
             script_sig: ScriptBuf::new(),
             sequence: csv_blocks(csv_d),
             witness: Witness::default(),
         }],
         output,
     };
-    Ok(encode(&tx))
+    encode(&tx, UNCOLORED_PAYLOAD_VOUT)
 }
 
 /// COOPERATIVE DE-TRIGGER: a FRESH spend of `T.out[0]` with the relative-timelock DISABLED (paying
@@ -419,7 +458,10 @@ pub fn build_detrigger(
     let txid = Txid::from_str(t_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
     let out_value = tier_out_value(t_out_value, fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let spk = spk_from_address(to_address, network)?;
-    Ok(encode(&build_tier_tx(txid, 0, TRIGGER_SEQUENCE, spk, out_value)))
+    encode(
+        &build_tier_tx(txid, UNCOLORED_PAYLOAD_VOUT, TRIGGER_SEQUENCE, spk, out_value),
+        UNCOLORED_PAYLOAD_VOUT,
+    )
 }
 
 /// Blind-co-sign one TES-R tier tx (client half). Mirrors the colored-tx co-sign path exactly, but
@@ -546,6 +588,73 @@ mod tests {
             assert_eq!(stx.input[0].previous_output.vout, 0);
             assert_eq!(stx.input[0].sequence, csv_blocks(24));
         }
+    }
+
+    #[test]
+    fn encode_reads_the_payload_output_and_fails_closed_out_of_range() {
+        // `encode` must read the PAYLOAD output, not `output[0]`. With the uncoloured shape the two
+        // coincide; the point of the accessor is that they need not.
+        let txid = Txid::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let tx = build_tier_tx(txid, UNCOLORED_PAYLOAD_VOUT, csv_blocks(24), p2a_script(), 50_000);
+        let at0 = encode(&tx, 0).expect("payload 0 exists");
+        assert_eq!(at0.out_value, 50_000);
+        assert_eq!(at0.payload_vout, 0);
+        // Index 1 is the P2A anchor — reading it as "the payload" yields the anchor value, which is
+        // exactly the class of silent mis-read the accessor exists to make explicit.
+        assert_eq!(encode(&tx, 1).unwrap().out_value, P2A_VALUE);
+        // Out of range → fail CLOSED, never a panic and never a wrong output.
+        assert!(matches!(encode(&tx, 2), Err(MercuryError::TransactionReconstructionError)));
+        assert!(matches!(encode(&tx, 99), Err(MercuryError::TransactionReconstructionError)));
+    }
+
+    #[test]
+    fn tier_builders_chain_through_the_payload_vout_accessor() {
+        // Every builder must root its input at the PARENT's payload vout and report its OWN payload
+        // vout, so a later colouring change is one constant rather than a dozen literals.
+        let a = test_addr();
+        let (f_value, rate) = (200_000u64, 2.0);
+        let f = "0000000000000000000000000000000000000000000000000000000000000001";
+        let t = build_trigger(f, 0, f_value, &a, "regtest", rate).unwrap();
+        assert_eq!(t.payload_vout, UNCOLORED_PAYLOAD_VOUT);
+        let x = build_extension(&t.txid, t.out_value, &a, "regtest", 12, rate).unwrap();
+        assert_eq!(x.payload_vout, UNCOLORED_PAYLOAD_VOUT);
+        let xtx: Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&x.tx_hex).unwrap()).unwrap();
+        assert_eq!(
+            xtx.input[0].previous_output.vout, t.payload_vout,
+            "the extension spends the TRIGGER's payload output"
+        );
+        let s = build_state(&x.txid, x.out_value, &a, "regtest", 24, rate).unwrap();
+        let stx: Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&s.tx_hex).unwrap()).unwrap();
+        assert_eq!(
+            stx.input[0].previous_output.vout, x.payload_vout,
+            "the state spends the EXTENSION's payload output"
+        );
+        let de = build_detrigger(&t.txid, t.out_value, &a, "regtest", rate).unwrap();
+        let dtx: Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&de.tx_hex).unwrap()).unwrap();
+        assert_eq!(dtx.input[0].previous_output.vout, t.payload_vout, "de-trigger too");
+        // The split state roots at the extension's payload vout and hosts child j at payload_vout+j.
+        let avail = tier_out_total(x.out_value, 2, rate).unwrap();
+        let sp = build_split_state(
+            &x.txid,
+            x.out_value,
+            &[(a.clone(), 1_000), (a.clone(), avail - 1_000)],
+            "regtest",
+            18,
+            rate,
+        )
+        .unwrap();
+        let sptx: Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&sp.tx_hex).unwrap()).unwrap();
+        assert_eq!(sptx.input[0].previous_output.vout, x.payload_vout, "SP spends X's payload output");
+        assert_eq!(sp.payload_vout, UNCOLORED_PAYLOAD_VOUT);
+        assert_eq!(sptx.output[sp.payload_vout as usize].value, 1_000, "child 0 at payload_vout");
+        assert_eq!(sptx.output[sp.payload_vout as usize + 1].value, avail - 1_000, "child 1 at +1");
     }
 
     #[test]

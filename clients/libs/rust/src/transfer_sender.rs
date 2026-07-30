@@ -250,21 +250,22 @@ pub async fn execute(
 
     let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
 
-    // LIGHTNING-LATCHED V2 (TES-R) TRANSFER — enabled via the HODL-latch pivot (LIGHTNING.md),
+    // LIGHTNING-LATCHED TES-R TRANSFER — enabled via the HODL-latch pivot (LIGHTNING.md),
     // superseding the old blanket refusal. The Model A co-sign of the receiver-paying state S' is still
     // NOT preimage-gated (presign_receiver_state co-signs S' on a clone, unconditionally). What makes it
-    // SAFE at the V1/operator-trust bar:
+    // SAFE at the pre-existing operator-trust bar:
     //   * rob-SSP (a hidden lower-CSV S* the sender co-signed but omitted from the conveyed ladder) is
     //     blocked by the SSP's PRE-PAY CENSUS — peek_pending_transfers now runs verify_bundle
-    //     (num_sigs == v1_backups + tiers, read from the enclave-authoritative sig_count) BEFORE
+    //     (num_sigs == flat_backups + tiers, read from the enclave-authoritative sig_count) BEFORE
     //     send_payment (ssp.rs execute_pay), so an inflated count is refused before the LN leg.
     //   * rob-USER (the SSP broadcasting the conveyed, broadcastable S' without paying) rests on
-    //     operator trust — identical to the shipped V1 LN lane (get_msg_addr already serves S' pre-pay).
+    //     operator trust — identical to the already-shipping un-laddered LN lane (get_msg_addr already
+    //     serves S' pre-pay).
     // RESIDUAL (recoverable, not theft): on ROLLBACK the orphan S' co-sign inflates the reclaimed coin's
     // sig_count, so a later verify_bundle bricks re-transfer — the coin stays fully exitable, and a
     // refresh() re-anchor restores re-transferability. Optional enclave latch-scoped terminalization
     // (LIGHTNING.md Phase 3) removes this residual but is not required to lift the guard. See sdk53
-    // (guard test, now V1-pinned) and the new sdk63 (V2 PAY happy path).
+    // (guard test: a latched transfer of a laddered coin must now OPEN) and sdk63 (the LN PAY happy path).
 
     // NOTE: `get_new_x1` (which OPENS the transfer at the coordinator) is intentionally deferred to
     // AFTER all of the sender's own pre-signs below (transfer_signature, backup_transactions, and the
@@ -298,15 +299,15 @@ pub async fn execute(
         .map(|txs| txs.iter().map(|b| b.tx.clone()).collect())
         .unwrap_or_default();
 
-    // TES-R (Utexo V2): if this coin has a persisted exit ladder, convey it so the receiver can run
-    // the R′ verification (crate::tesr::verify_bundle) instead of the flat V1 backup-count check.
-    // Absent (an ordinary V1 coin) → protocol_version 0, and the receiver takes the V1 path.
+    // TES-R: if this coin has a persisted exit ladder, convey it so the receiver can run
+    // the R′ verification (crate::tesr::verify_bundle) instead of the flat backup-count check.
+    // Absent (an un-laddered coin) → protocol_version 0, and the receiver takes the un-laddered path.
     let (protocol_version, tesr_ladder) = match crate::tesr::load(client_config, wallet_name, &statechain_id).await {
         Ok(Some(bundle)) => {
             // Model A: while we still own the coin, pre-sign the RECEIVER-paying state S' (pays the
             // recipient, one δ lower CSV) and convey the augmented bundle, so the receiver adopts a
-            // complete exit chain paying them. Falls back to V1 on any error (the coin still exits
-            // via its tx1 backup).
+            // complete exit chain paying them. Falls back to the un-laddered path on any error (the
+            // coin still exits via its tx1 backup).
             match crate::tesr::presign_receiver_state(client_config, &coin, &bundle, recipient_address).await {
                 Ok(augmented) => match serde_json::to_string(&augmented) {
                     Ok(json) => (2u32, Some(json)),

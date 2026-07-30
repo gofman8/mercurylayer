@@ -153,12 +153,12 @@ pub fn classify(err: &anyhow::Error) -> Class {
         ("does not fit", "split-fit"),
         ("dust", "dust"),
         ("feetoolow", "dust"),
-        // V2 protocol LIMITS — finite by design, hit legitimately in a long chaos run:
+        // Protocol LIMITS — finite by design, hit legitimately in a long chaos run:
         //  * replace-by-lower-timelock has finite depth. Each onward hop of a child costs one CSV rung
         //    (d0 24 -> 18 -> 12 -> 6 = d_floor on regtest); at the floor the coin must be exited or
-        //    re-anchored rather than re-sent. This is the same finite-budget property V1's
-        //    decrementing ladder had, and refusing at the floor is what stops a hop from creating a
-        //    state that cannot out-race the one it replaces.
+        //    re-anchored rather than re-sent. This is the same finite-budget property the un-laddered
+        //    shape's decrementing absolute-locktime backup chain has, and refusing at the floor is what
+        //    stops a hop from creating a state that cannot out-race the one it replaces.
         ("at the floor", "csv-floor"),
         //  * a child too small to split into a viable piece + change (each grandchild must fund its own
         //    two tiers and clear dust). The refusal happens BEFORE anything is co-signed.
@@ -255,11 +255,11 @@ async fn refill_tokens(user: &UserHandle, n: usize, bitcoin: &Mutex<()>) {
 // ------------------------------------------------------------------------------------------------
 
 pub async fn execute() -> Result<()> {
-    // Runs on the V2 (TES-R) default. The DAG-deepening actions go through the in-ladder split
+    // Runs on the TES-R default. The DAG-deepening actions go through the in-ladder split
     // (`in_ladder_pay` for a laddered root, `child_in_ladder_pay` for a received child), and the
-    // clawback cheat broadcasts a SUPERSEDED ladder state instead of a V1 absolute-locktime backup —
-    // the V2 vector. The oracle's invariants (value conservation, single custody, outpoint
-    // single-spender, no stuck coins) are protocol-agnostic and unchanged.
+    // clawback cheat broadcasts a SUPERSEDED ladder state instead of a stale absolute-locktime backup
+    // — the laddered-coin vector. The oracle's invariants (value conservation, single custody,
+    // outpoint single-spender, no stuck coins) are coin-shape-agnostic and unchanged.
     let cfg = Cfg::from_env();
     let _ = std::fs::remove_dir_all(&cfg.run_dir);
     std::fs::create_dir_all(&cfg.run_dir)?;
@@ -605,7 +605,7 @@ async fn run_user(
                     continue;
                 }
                 let piece = rng.gen_range(5_000..(c.amount_sats / 2).max(5_001));
-                // V2: a laddered coin cannot be self-split [B1]; the split IS a payment. `in_ladder_pay`
+                // A laddered coin cannot be self-split [B1]; the split IS a payment. `in_ladder_pay`
                 // conveys the piece (Model A) to a peer and keeps the change, deepening the DAG at the
                 // receiver — the same structure the old `split_coin` produced locally.
                 let to = loop {
@@ -682,7 +682,7 @@ async fn run_user(
                         if j != me.idx { break j; }
                     };
                     let to_addr = registry.users[to].address.clone();
-                    // V2 DEEPEN: `transfer` auto-routes — a laddered ROOT goes through `in_ladder_pay`,
+                    // DEEPEN: `transfer` auto-routes — a laddered ROOT goes through `in_ladder_pay`,
                     // a received CHILD through `child_in_ladder_pay` (a child-level split, which is
                     // exactly the depth-2 chain sdk17 exercises). Either way the DAG gains a hop.
                     trace.emit(me.idx, "split", "attempt", "start",

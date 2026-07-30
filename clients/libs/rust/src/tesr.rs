@@ -1,8 +1,8 @@
-//! Client-side driver for TES-R (Utexo V2) tier co-signing against the live blind SE.
+//! Client-side driver for TES-R tier co-signing against the live blind SE.
 //!
 //! The SE is unchanged: it blind-co-signs whatever sighash the client presents (`/sign/first` +
 //! `/sign/second`), so a tier tx (v3, relative-timelock, P2A anchor) round-trips through exactly the
-//! same MuSig2 flow as a V1 backup. This module wires [`mercurylib::tesr::cosign_tier_request`] into
+//! same MuSig2 flow as an un-laddered coin's backup tx. This module wires [`mercurylib::tesr::cosign_tier_request`] into
 //! that round-trip and returns the fully-signed, broadcast-ready tier tx.
 
 use std::str::FromStr;
@@ -28,10 +28,41 @@ const TESR_BUNDLE_VERSION: u32 = 1;
 pub struct TesrTier {
     pub txid: String,
     pub signed_tx: String,
-    /// The value this tier pays forward (its `out[0]`) — the prevout the child tier spends.
+    /// The value this tier pays forward (its payload output) — the prevout the child tier spends.
     pub out_value: u64,
     /// The relative-timelock (BIP-68 blocks) on this tier's input; `None` for the trigger.
     pub csv: Option<u16>,
+    /// **Payload-vout accessor** — the output index at which this tier's PAYLOAD (value-carrying)
+    /// outputs begin. `mercurylib::tesr::UNCOLORED_PAYLOAD_VOUT` (= 0) today; a coloured CTES-R tier
+    /// carries the opret at 0 and shifts every payload by one.
+    ///
+    /// ⚠️ In a CONVEYED bundle this field is ATTACKER-SUPPLIED, exactly like every other field. It is
+    /// never trusted on its own: every site that reads it cross-checks the index against transaction
+    /// CONTENT (`spk == agg_spk`, `taproot_key_hex` on the spk, or the prevout amount feeding
+    /// `verify_tier_cosigned`'s sighash), so a wrong value fails CLOSED with a named verification
+    /// error rather than mis-chaining. `serde(default)` keeps every already-persisted `tesr-*` /
+    /// `ctesr-*` row and every in-flight mailbox message deserializing byte-identically.
+    #[serde(default)]
+    pub payload_vout: u32,
+}
+
+impl TesrTier {
+    /// This tier's payload output within `tx`. Fails CLOSED if `payload_vout` is out of range — a
+    /// conveyed bundle can claim any index, and an out-of-range one must be a rejection, never a
+    /// panic and never a silent fallback to `output[0]`.
+    fn payload_out<'a>(
+        &self,
+        tx: &'a electrum_client::bitcoin::Transaction,
+        what: &str,
+    ) -> Result<&'a electrum_client::bitcoin::TxOut> {
+        tx.output.get(self.payload_vout as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what}: declared payload_vout {} is out of range ({} outputs)",
+                self.payload_vout,
+                tx.output.len()
+            )
+        })
+    }
 }
 
 /// One depth LEVEL of the ladder: an extension and the state hanging off it. For a non-final level
@@ -64,7 +95,7 @@ pub struct TesrBundle {
     /// Renewal counter at the current (deepest) level.
     pub m: u32,
     /// SUPERSEDED states — every owner-paying state the SE co-signed that a later renewal/rollover/
-    /// transfer replaced. Kept for FULL-DISCLOSURE counting (V2-MIGRATION): the SE counts their
+    /// transfer replaced. Kept for FULL-DISCLOSURE counting (history/MIGRATION.md): the SE counts their
     /// co-signs, so verify_bundle must see them or num_sigs won't balance; and the current state must
     /// be at a strictly LOWER CSV than every one of these (it matures first, so a retained stale state
     /// loses the race). Not part of the exit chain.
@@ -206,10 +237,10 @@ pub async fn establish(
         f_txid,
         f_vout,
         f_value,
-        trigger: TesrTier { txid: t.txid, signed_tx: t_signed, out_value: t.out_value, csv: None },
+        trigger: TesrTier { txid: t.txid, signed_tx: t_signed, out_value: t.out_value, csv: None, payload_vout: t.payload_vout },
         levels: vec![TesrLevel {
-            extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e) },
-            state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+            extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e), payload_vout: x.payload_vout },
+            state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d), payload_vout: s.payload_vout },
         }],
         m: 0,
         superseded_states: Vec::new(),
@@ -263,13 +294,15 @@ pub async fn establish_child(
     let x = mercurylib::tesr::build_extension_from(sp_txid, sp_vout, sp_out_value, &agg, network, csv_e, fee_rate)?;
     let x_signed = cosign_tier(cc, child_coin, x.tx_hex.clone(), sp_out_value, network).await?;
 
-    // Owner state spends the extension's out[0], pays the owner-exit key.
-    let s = mercurylib::tesr::build_state_from(&x.txid, 0, x.out_value, owner_exit_address, network, csv_d, fee_rate)?;
+    // Owner state spends the extension's PAYLOAD output, pays the owner-exit key.
+    let s = mercurylib::tesr::build_state_from(
+        &x.txid, x.payload_vout, x.out_value, owner_exit_address, network, csv_d, fee_rate,
+    )?;
     let s_signed = cosign_tier(cc, child_coin, s.tx_hex.clone(), x.out_value, network).await?;
 
     Ok(ChildLadder {
-        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e) },
-        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e), payload_vout: x.payload_vout },
+        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d), payload_vout: s.payload_vout },
     })
 }
 
@@ -347,13 +380,17 @@ pub async fn in_ladder_split(
         signed_tx: sp_signed,
         out_value: total,
         csv: Some(sp_csv),
+        payload_vout: sp.payload_vout,
     };
 
     // Each child: headless ladder off SP.out[j], paying its recipient (Model A).
     let mut bundles = Vec::with_capacity(n);
     for (j, (child_coin, recipient, value)) in children.iter_mut().enumerate() {
+        // Child `j` lives at SP's j-th PAYLOAD output, not positional `j` (a coloured SP carries the
+        // opret at index 0 and shifts every child by one).
+        let child_vout = sp.payload_vout + j as u32;
         let ladder = establish_child(
-            cc, child_coin, &sp.txid, j as u32, *value, recipient,
+            cc, child_coin, &sp.txid, child_vout, *value, recipient,
             p.ext_csv(0), p.state_csv(0), bundle.fee_rate, &bundle.network,
         )
         .await?;
@@ -376,7 +413,7 @@ pub async fn in_ladder_split(
         bundles.push(ChildTesrBundle {
             parent: parent_seg.clone(),
             parent_statechain_id: parent_sid.clone(),
-            sp_vout: j as u32,
+            sp_vout: child_vout,
             child_statechain_id: child_sid,
             child_owner_exit_address: recipient.clone(),
             child_extension: ladder.extension,
@@ -428,15 +465,15 @@ pub async fn load(cc: &ClientConfig, wallet_name: &str, statechain_id: &str) -> 
     Ok(None)
 }
 
-/// V1-backup baseline of a V2-NATIVE **on-chain PARENT** coin. `sig_count` starts at 0
-/// (`generated_public_key DEFAULT 0`); the coin's on-chain deposit confirmation co-signs exactly ONE V1
-/// backup tx (`coin_status::check_deposit` → `create_tx1` for a non-single-use coin) before the ladder
-/// is established. So a V2-native parent has `num_sigs == 1 + <established tiers>`. A split-child
+/// Flat-backup baseline of a natively-laddered **on-chain PARENT** coin. `sig_count` starts at 0
+/// (`generated_public_key DEFAULT 0`); the coin's on-chain deposit confirmation co-signs exactly ONE
+/// signed-once backup tx (`coin_status::check_deposit` → `create_tx1` for a non-single-use coin) before
+/// the ladder is established. So such a parent has `num_sigs == 1 + <established tiers>`. A split-child
 /// receiver — who cannot observe the parent's pre-establish history — relies on this constant to run
 /// `verify_child_bundle`'s exact-equality census independently of the sender.
 pub const PARENT_V2_BASELINE: u32 = 1;
 
-/// V1-backup baseline of a split **CHILD** slot: it is an SE-registered key that is NEVER funded
+/// Flat-backup baseline of a split **CHILD** slot: it is an SE-registered key that is NEVER funded
 /// on-chain (its funding is the un-broadcast `SP.out[j]`), so `check_deposit`/`create_tx1` never runs
 /// for it and `num_sigs` counts ONLY the two child tiers co-signed at split time. Baseline `0`.
 pub const CHILD_V2_BASELINE: u32 = 0;
@@ -724,6 +761,7 @@ pub async fn child_in_ladder_split(
             signed_tx: csp_signed,
             out_value: total,
             csv: Some(csp_csv),
+            payload_vout: csp.payload_vout,
         },
         superseded_states: seg_superseded,
         superseded_extensions: cb.child_superseded_extensions.clone(),
@@ -731,8 +769,9 @@ pub async fn child_in_ladder_split(
 
     let mut bundles = Vec::with_capacity(n);
     for (j, (gc_coin, recipient, value)) in children.iter_mut().enumerate() {
+        let gc_vout = csp.payload_vout + j as u32;
         let ladder = establish_child(
-            cc, gc_coin, &csp.txid, j as u32, *value, recipient,
+            cc, gc_coin, &csp.txid, gc_vout, *value, recipient,
             p.ext_csv(0), p.state_csv(0), cb.parent.fee_rate, &cb.parent.network,
         )
         .await?;
@@ -747,7 +786,7 @@ pub async fn child_in_ladder_split(
         bundles.push(ChildTesrBundle {
             parent: cb.parent.clone(),
             parent_statechain_id: cb.parent_statechain_id.clone(),
-            sp_vout: j as u32,
+            sp_vout: gc_vout,
             child_statechain_id: gc_sid,
             child_owner_exit_address: recipient.clone(),
             child_extension: ladder.extension,
@@ -763,8 +802,8 @@ pub async fn child_in_ladder_split(
 /// ONWARD HOP — re-transfer a whole received CHILD off-chain to a new owner (Spark parity).
 ///
 /// A received child cannot go through `transfer_sender::execute`: it has no `tesr-` bundle (only
-/// `ctesr-`), so that path would fall through to the B1-unsafe plain split, and it has no V1 backup
-/// chain to hand over. This is the child's own Model-A transfer instead:
+/// `ctesr-`), so that path would fall through to the B1-unsafe plain split, and it has no un-laddered
+/// backup chain to hand over. This is the child's own Model-A transfer instead:
 ///
 ///   * build a NEW child state over `ext_child.out[0]` one δ lower (replace-by-lower-timelock), paying
 ///     the NEW recipient's exit key — so the fresh state matures BEFORE the one it replaces and wins
@@ -803,7 +842,7 @@ pub async fn child_retransfer(
     let payee = mercurylib::tesr::payee_address(recipient_address, &cb.parent.network)?;
     let st = mercurylib::tesr::build_state_from(
         &cb.child_extension.txid,
-        0,
+        cb.child_extension.payload_vout,
         cb.child_extension.out_value,
         &payee,
         &cb.parent.network,
@@ -828,6 +867,7 @@ pub async fn child_retransfer(
         signed_tx: signed,
         out_value: st.out_value,
         csv: Some(new_csv),
+        payload_vout: st.payload_vout,
     };
     next.child_owner_exit_address = payee;
 
@@ -961,8 +1001,8 @@ pub async fn renew(
     bundle.superseded_extensions.push(bundle.levels[last].extension.clone());
     bundle.superseded_states.push(bundle.levels[last].state.clone());
     bundle.levels[last] = TesrLevel {
-        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e_new) },
-        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d) },
+        extension: TesrTier { txid: x.txid, signed_tx: x_signed, out_value: x.out_value, csv: Some(csv_e_new), payload_vout: x.payload_vout },
+        state: TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(csv_d), payload_vout: s.payload_vout },
     };
     bundle.m += 1;
     Ok(())
@@ -1018,16 +1058,16 @@ pub async fn rollover(
     let last = bundle.levels.len() - 1;
     // Full-disclosure: the old owner-paying state is replaced by the self-split; keep it for counting.
     bundle.superseded_states.push(bundle.levels[last].state.clone());
-    bundle.levels[last].state = TesrTier { txid: s_roll.txid, signed_tx: s_roll_signed, out_value: s_roll.out_value, csv: Some(roll_csv) };
+    bundle.levels[last].state = TesrTier { txid: s_roll.txid, signed_tx: s_roll_signed, out_value: s_roll.out_value, csv: Some(roll_csv), payload_vout: s_roll.payload_vout };
     bundle.levels.push(TesrLevel {
-        extension: TesrTier { txid: x2.txid, signed_tx: x2_signed, out_value: x2.out_value, csv: Some(csv_e) },
-        state: TesrTier { txid: s2.txid, signed_tx: s2_signed, out_value: s2.out_value, csv: Some(csv_d) },
+        extension: TesrTier { txid: x2.txid, signed_tx: x2_signed, out_value: x2.out_value, csv: Some(csv_e), payload_vout: x2.payload_vout },
+        state: TesrTier { txid: s2.txid, signed_tx: s2_signed, out_value: s2.out_value, csv: Some(csv_d), payload_vout: s2.payload_vout },
     });
     bundle.m = 0; // fresh renewal budget at the new level
     Ok(())
 }
 
-/// Model A (V2-MIGRATION §"receiver ladder adoption"): while still owning the coin, pre-sign the
+/// Model A (history/MIGRATION.md §"receiver ladder adoption"): while still owning the coin, pre-sign the
 /// RECEIVER-paying state `S'` so the receiver gets a complete, verifiable exit chain paying THEM.
 /// `S'` spends the deepest extension's output, pays the recipient's derived P2TR (from a Mercury
 /// transfer address), and carries CSV `= current_state_csv − δ` (one lower, so it matures before the
@@ -1060,7 +1100,7 @@ pub async fn presign_receiver_state(
     // Full-disclosure: the sender's own (now stale) state was co-signed; keep it so verify_bundle
     // counts it — and it sits at a HIGHER CSV than S', so it loses the maturity race to the receiver.
     b.superseded_states.push(b.levels[last].state.clone());
-    b.levels[last].state = TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(new_csv) };
+    b.levels[last].state = TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(new_csv), payload_vout: s.payload_vout };
     Ok(b)
 }
 
@@ -1104,7 +1144,7 @@ fn outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
     !listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout)
 }
 
-/// **WatchBundle v2 (keyless watchtower).** One reactive pass: if the coin's funding UTXO `F` has
+/// **TES-R WatchBundle (keyless watchtower).** One reactive pass: if the coin's funding UTXO `F` has
 /// been spent — i.e. someone broadcast the trigger — drive the OWNER's unilateral exit by
 /// broadcasting each pre-signed tier in order as its relative-timelock matures. Keyless: it holds
 /// only the pre-signed [`TesrBundle`] (every tier pays the owner) and NEVER co-signs, so a delegated
@@ -1134,7 +1174,7 @@ pub fn watch_pass(cc: &ClientConfig, bundle: &TesrBundle) -> Vec<String> {
     acted
 }
 
-/// **Owner-initiated unilateral exit of a V2 coin.** Like [`watch_pass`], but this KICKS OFF the exit
+/// **Owner-initiated unilateral exit of a laddered coin.** Like [`watch_pass`], but this KICKS OFF the exit
 /// by spending `F` with the trigger — a tower defends an already-triggered coin and never initiates,
 /// whereas an owner walking away must start the clock. Broadcasts the trigger (if `F` is still unspent)
 /// and then every subsequent tier whose relative-CSV is now met, in exit order, stopping at the first
@@ -1161,7 +1201,7 @@ pub fn exit_pass(cc: &ClientConfig, bundle: &TesrBundle) -> (Vec<String>, bool) 
 }
 
 /// The first tier not yet on-chain in exit order, and its relative-CSV (a wait-time hint). `None` once
-/// the exit is complete. Used to report `ExitStatus.wait_blocks` for a V2 unilateral exit.
+/// the exit is complete. Used to report `ExitStatus.wait_blocks` for a laddered coin's unilateral exit.
 pub fn next_exit_tier(cc: &ClientConfig, bundle: &TesrBundle) -> Option<u16> {
     for tier in bundle.exit_tiers() {
         if !tx_known(cc, &tier.txid) {
@@ -1183,17 +1223,259 @@ fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
 
 /// **Receiver R′ verification (PROTOCOL.md §5.11).** Soundly verify a conveyed TES-R ladder before
 /// accepting a coin: it must be a valid unilateral-exit chain over the on-chain funding UTXO `F`, and
-/// the SE's PUBLIC finalized-signature count must EXACTLY account for its tiers (plus any pre-TES-R
-/// V1 backups). Exact equality is the linchpin — it makes a hidden extra co-signed state (a
+/// the SE's PUBLIC finalized-signature count must EXACTLY account for its tiers (plus the signed-once
+/// backup txs conveyed with the coin — `flat_backups`, which is 1 for an ordinary on-chain root coin,
+/// whose deposit co-signs one backup before the ladder is established, and 0 for an un-broadcast split
+/// slot). Exact equality is the linchpin — it makes a hidden extra co-signed state (a
 /// double-spend the receiver can't see) impossible, and prevents padding the ladder with junk. Checks:
 ///   1. the trigger spends `F` (no relative-timelock) and pays the aggregate key `A`;
 ///   2. every later tier spends its parent's `out[0]`, carries a BIP-68 block CSV within the coin's
 ///      schedule bounds, and pays `A` — except the final state, which pays the owner;
-///   3. `se_num_sigs == v1_backups + <number of tiers>`.
+///   3. `se_num_sigs == flat_backups + <number of tiers>`.
 /// This is a PURE function (no network) so it is unit-testable and reusable by the transfer receiver.
-pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32) -> Result<()> {
+///
+/// ⚠️ **SELF-VERIFICATION ONLY — this entry point is UNBOUND (audit C-1).** Every authority it checks
+/// against (`f_txid`/`f_vout`/`f_value`, `agg_address`, `statechain_id`) is a field OF THE BUNDLE, so
+/// it proves INTERNAL CONSISTENCY, not that the bundle describes the coin you are about to accept. A
+/// sender can convey a self-consistent DECOY ladder over an attacker-controlled outpoint, with
+/// `owner_exit_address` set correctly and the tiers padded so the census balances, and keep the REAL
+/// trigger — then take the coin back after the receiver accepts. Use it to re-check a ladder you built
+/// yourself; to ACCEPT a conveyed one, use [`verify_bundle_bound`].
+pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32) -> Result<()> {
     // Ordinary bundle: the final state pays the owner. (A split parent uses verify_bundle_ex(true).)
-    verify_bundle_ex(bundle, se_num_sigs, v1_backups, false)
+    verify_bundle_ex(bundle, se_num_sigs, flat_backups, false)
+}
+
+/// The AUTHORITATIVE description of the coin an incoming ladder must describe. Every field is read
+/// from a source the SENDER does not control — the funding transaction on chain and the coordinator's
+/// `/info/statechain` record — never from the conveyed bundle.
+#[derive(Clone, Debug)]
+pub struct CoinAuthority {
+    /// The statechain id the receiver/payer is acting on (the id whose `num_sigs` feeds the census).
+    pub statechain_id: String,
+    /// The coin's funding outpoint (`tx0_outpoint`), which the ladder's trigger must spend.
+    pub f_txid: String,
+    pub f_vout: u32,
+    /// `tx0.output[f_vout].value`, read from the funding transaction.
+    pub f_value: u64,
+    /// `tx0.output[f_vout].script_pubkey` as hex — the on-chain P2TR of the coin's aggregate key `A`.
+    pub f_spk_hex: String,
+    /// The coordinator's recorded aggregate x-only key for `statechain_id` (`aggregate_pubkey`,
+    /// UNIQUE per sid). `None` ⟹ REJECT: without it a rogue-key decomposition lets a sender point at
+    /// a decoy sid whose counter happens to balance ([FATAL-B], migration 0009).
+    pub se_aggregate_pubkey: Option<String>,
+}
+
+/// Build a [`CoinAuthority`] from the coin's FUNDING TRANSACTION plus the coordinator's record.
+///
+/// `tx0_hex` must be the funding transaction as read from the chain (never a sender-supplied
+/// un-broadcast branch tx), and `(tx0_txid, tx0_vout)` the outpoint the coin rests on. The value and
+/// the aggregate scriptPubKey are taken FROM that output, so neither can be restated by a sender.
+pub fn coin_authority_from_tx0(
+    statechain_id: &str,
+    tx0_txid: &str,
+    tx0_vout: u32,
+    tx0_hex: &str,
+    se_aggregate_pubkey: Option<String>,
+) -> Result<CoinAuthority> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let raw = hex::decode(tx0_hex).map_err(|_| anyhow::anyhow!("funding tx is not hex"))?;
+    let tx0: Transaction =
+        deserialize(&raw).map_err(|_| anyhow::anyhow!("funding tx does not parse"))?;
+    if tx0.txid().to_string() != tx0_txid {
+        return Err(anyhow::anyhow!(
+            "funding tx hex is {} but the coin's funding outpoint names {tx0_txid}",
+            tx0.txid()
+        ));
+    }
+    let out = tx0
+        .output
+        .get(tx0_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("funding tx has no output {tx0_vout}"))?;
+    Ok(CoinAuthority {
+        statechain_id: statechain_id.to_string(),
+        f_txid: tx0_txid.to_string(),
+        f_vout: tx0_vout,
+        f_value: out.value,
+        f_spk_hex: hex::encode(out.script_pubkey.as_bytes()),
+        se_aggregate_pubkey,
+    })
+}
+
+/// The BIP-341-tweaked P2TR output key (x-only hex) of an UNTWEAKED aggregate x-only key. The server
+/// records the untweaked aggregate; an on-chain scriptPubKey commits to the tweaked output key, so a
+/// comparison between the two must go through this.
+fn tweaked_p2tr_key_hex(
+    agg_xonly_hex: &str,
+    net: electrum_client::bitcoin::Network,
+) -> Result<String> {
+    use electrum_client::bitcoin::{
+        secp256k1::{Secp256k1, XOnlyPublicKey},
+        Address,
+    };
+    let xonly = XOnlyPublicKey::from_str(agg_xonly_hex)
+        .map_err(|_| anyhow::anyhow!("bad aggregate x-only hex"))?;
+    let spk =
+        Address::p2tr(&Secp256k1::verification_only(), xonly, None, net).script_pubkey();
+    taproot_key_hex(spk.as_bytes())
+}
+
+/// **[R5] ESTABLISH-TIME bindability gate — do not create a ladder no receiver can bind.**
+///
+/// `verify_bundle_bound` fails CLOSED when the coordinator has no `aggregate_pubkey` on record for the
+/// sid. On the ACCEPTANCE path that is the only correct answer (see the rejected alternatives below).
+/// But the coordinator's aggregate column was added by migration 0009 and backfilled FORWARD only, so
+/// pre-0009 rows are NULL (empirically a closed, contiguous legacy set: every NULL id below a clean
+/// cut, none above). A pre-0009 coin is otherwise an ordinary confirmed on-chain root coin, so the
+/// default IN-PLACE ladder pass happily ladders it — and the resulting ladder is unclaimable.
+///
+/// ⚠️ **This gate does NOT make such a coin transferable again, and must not be advertised as if it
+/// did.** A legacy no-aggregate coin cannot carry a BOUND ladder — there is no coordinator aggregate
+/// to bind against — so this gate keeps it un-laddered rather than minting an unclaimable ladder.
+/// It still transfers on the flat lane at `protocol_version 0`: the claim path's unconditional
+/// version floor was implemented, shown to break sdk41, and narrowed to a version/payload
+/// consistency check, so that door is NOT shut. The only
+/// complete fix is coordinator-side: backfill `aggregate_xonly` for the legacy rows from the
+/// coordinator's OWN columns (`x_only(user_public_key + server_public_key)`), which is the same value
+/// deposit-init records today and involves no client input. Until that runs, a legacy coin's value is
+/// still recoverable — on-chain withdrawal and its signed-once backup exit are untouched — but it
+/// cannot move off-chain.
+///
+/// What this gate DOES buy, and why it is still worth having:
+///   * establishing a ladder co-signs three tiers through the SE. That is IRREVERSIBLE: it spends
+///     signature budget and permanently raises the sid's `num_sigs`, on a coin that gains nothing;
+///   * it stops an unclaimable bundle from being persisted and later conveyed as authentic;
+///   * it is self-healing — the moment the coordinator backfills, the next `claim()` pass ladders the
+///     coin normally, with no client change.
+///
+/// The predicate is exactly the authority half of `verify_bundle_bound`, hoisted ahead of
+/// establishment: the coordinator must have an aggregate on record for the sid, and it must be the key
+/// that actually controls the funding output. `f_spk_hex` is `tx0.output[vout].script_pubkey` read FROM
+/// THE CHAIN and `se_aggregate_pubkey` the coordinator's `/info/statechain` record — the same two
+/// authorities the receiver will use, so this predicate and the acceptance check cannot drift.
+///
+/// **Rejected alternatives** (both would have re-opened C-1/[FATAL-B]):
+///   * *"When the coordinator has no aggregate, derive it from `tx0.output[vout]` instead."* That key
+///     is already `a_onchain`, and the ladder is already checked against it — so this is not a second
+///     authority, it is the absence of one. `tx0`, its outpoint and the ladder all arrive from the
+///     SENDER; the only other thing tying them to the sid is `validate_tx0_output_pubkey`, which tests
+///     `enclave_pubkey(sid) + transfer_msg.user_public_key == tx0.out[vout]` — and the sender chooses
+///     `user_public_key`, so the rogue-key decomposition `U := D − E_sid` makes ANY attacker-controlled
+///     output `D` pass. The coordinator's per-sid, UNIQUE aggregate is the one value in the whole
+///     acceptance path that is not restatable by the sender. Making its absence a fallback would also
+///     hand the attacker the trigger: he picks which sid to convey, hence whether the record is NULL.
+///   * *"Accept a ladder whose tiers carry genuine SE co-signatures under `A`, sid-record or not."* A
+///     schnorr co-sign proves the SE signed under `A` for SOME sid, never for THIS one; an attacker
+///     who owns a second coin can pad a decoy ladder over it to any tier count, and the census is run
+///     against the conveyed sid's `num_sigs`, which he also controls. Not a substitute.
+pub fn ladder_binding_precheck(
+    statechain_id: &str,
+    f_spk_hex: &str,
+    se_aggregate_pubkey: Option<&str>,
+    network: &str,
+) -> Result<()> {
+    let net = net_from_str(network);
+    let f_spk = hex::decode(f_spk_hex)
+        .map_err(|_| anyhow::anyhow!("funding scriptPubKey is not hex — cannot bind a ladder"))?;
+    let a_onchain = taproot_key_hex(&f_spk).map_err(|e| {
+        anyhow::anyhow!("coin funding output is not a v1 taproot output: {e}")
+    })?;
+    let se_agg = se_aggregate_pubkey.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the coordinator recorded no aggregate for statechain id {statechain_id} — a ladder over \
+             this coin could not be bound by any receiver (pre-0009 legacy coin: leave it un-laddered)"
+        )
+    })?;
+    if tweaked_p2tr_key_hex(se_agg, net)? != a_onchain {
+        return Err(anyhow::anyhow!(
+            "the coordinator's aggregate for statechain id {statechain_id} does not match the funding \
+             output key — a ladder over this coin would be refused as a decoy"
+        ));
+    }
+    Ok(())
+}
+
+/// **[C-1] ACCEPTANCE-PATH verifier — [`verify_bundle`] BOUND TO THE COIN.**
+///
+/// `verify_bundle` proves a ladder is internally consistent. That is not the question a receiver (or a
+/// pre-paying SSP) is asking: it needs to know that THIS ladder describes THE COIN it is accepting.
+/// The attack this closes is the default coin shape, not an exotic one — a self-signed decoy ladder
+/// over an attacker-controlled outpoint, `owner_exit_address` correctly set to the receiver's key (so
+/// the Model-A gate passes) and tiers padded so the census balances, while the sender retains the REAL
+/// trigger and spends the coin back afterwards.
+///
+/// So the authority is derived from the COIN and the ladder is checked against it:
+///   * `bundle.statechain_id` == the sid whose `num_sigs` the census is run against — otherwise the
+///     count being balanced belongs to a different coin;
+///   * `(f_txid, f_vout)` == the coin's funding outpoint, and `f_value` == that output's value read
+///     from the funding transaction (the value every tier's co-sign sighash commits to);
+///   * `bundle.agg_address` == P2TR of the key in `tx0.output[f_vout].script_pubkey`, so the key the
+///     tiers are verified against is the ON-CHAIN one;
+///   * that same key == the coordinator's recorded `aggregate_pubkey` for the sid, which is UNIQUE per
+///     sid — so a second outpoint paying the same aggregate cannot be substituted under a decoy sid,
+///     and (with the exact-equality census) a second ladder over a second UTXO of the SAME sid would
+///     need extra SE co-signs and blows the count.
+///
+/// Fails CLOSED on every absent/unparseable field, including a missing server aggregate.
+pub fn verify_bundle_bound(
+    bundle: &TesrBundle,
+    se_num_sigs: u32,
+    flat_backups: u32,
+    coin: &CoinAuthority,
+) -> Result<()> {
+    if bundle.statechain_id != coin.statechain_id {
+        return Err(anyhow::anyhow!(
+            "conveyed ladder is for statechain id {} but the coin being accepted is {} — the census would balance a different coin",
+            bundle.statechain_id,
+            coin.statechain_id
+        ));
+    }
+    if bundle.f_txid != coin.f_txid || bundle.f_vout != coin.f_vout {
+        return Err(anyhow::anyhow!(
+            "conveyed ladder is rooted at {}:{} but the coin's funding outpoint is {}:{} — decoy ladder",
+            bundle.f_txid,
+            bundle.f_vout,
+            coin.f_txid,
+            coin.f_vout
+        ));
+    }
+    if bundle.f_value != coin.f_value {
+        return Err(anyhow::anyhow!(
+            "conveyed ladder declares F value {} but the funding output carries {} — the tier sighashes commit to the real value",
+            bundle.f_value,
+            coin.f_value
+        ));
+    }
+
+    let net = net_from_str(&bundle.network);
+    let f_spk = hex::decode(&coin.f_spk_hex).map_err(|_| anyhow::anyhow!("bad funding spk hex"))?;
+    let a_onchain = taproot_key_hex(&f_spk)
+        .map_err(|e| anyhow::anyhow!("coin funding output is not a v1 taproot output: {e}"))?;
+    let declared_agg_spk = electrum_client::bitcoin::Address::from_str(&bundle.agg_address)
+        .map_err(|_| anyhow::anyhow!("bad ladder agg_address"))?
+        .require_network(net)
+        .map_err(|_| anyhow::anyhow!("ladder agg_address is on the wrong network"))?
+        .script_pubkey();
+    if taproot_key_hex(declared_agg_spk.as_bytes())? != a_onchain {
+        return Err(anyhow::anyhow!(
+            "conveyed ladder's aggregate address does not match the coin's on-chain funding key — decoy ladder"
+        ));
+    }
+
+    let se_agg = coin.se_aggregate_pubkey.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the coordinator recorded no aggregate for statechain id {} (fail-closed)",
+            coin.statechain_id
+        )
+    })?;
+    if tweaked_p2tr_key_hex(se_agg, net)? != a_onchain {
+        return Err(anyhow::anyhow!(
+            "the coordinator's aggregate for statechain id {} does not match the funding output key — decoy coin",
+            coin.statechain_id
+        ));
+    }
+
+    verify_bundle_ex(bundle, se_num_sigs, flat_backups, false)
 }
 
 /// As [`verify_bundle`], but when `final_is_split` the FINAL tier is an in-ladder split state `SP` that
@@ -1220,8 +1502,16 @@ fn verify_superseded_segment(
     p: &mercurylib::tesr::TesrParams,
     prevout_value_of: &mut std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64>,
     live_csv_by_outpoint: &std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u32>,
+    live_txids: &std::collections::HashSet<electrum_client::bitcoin::Txid>,
 ) -> Result<u32> {
     use electrum_client::bitcoin::{consensus::deserialize, Transaction, Txid};
+    // [C-2] ONE co-sign, ONE census slot. The return value of this function is added to the SE's
+    // exact-equality count, so a DUPLICATE disclosure inflates `expected` by one for free and absorbs
+    // one hidden co-signed state — the same padding class as `[S1]`, except every padded entry is a
+    // GENUINE tier and so passes parse, txid-binding, linkage, signature and race checks unchanged.
+    // One set spanning BOTH superseded lists AND the live exit tiers closes it: a tier may appear in
+    // the bundle exactly once, whether it is disclosed twice or disclosed once while also being live.
+    let mut seen_txids: std::collections::HashSet<Txid> = live_txids.clone();
     // Parsed up-front so their outputs can also serve as parents (e.g. a superseded extension's state
     // after a renewal) and so no unparseable entry reaches the checks below.
     let mut superseded_parsed: Vec<(&'static str, usize, &TesrTier, Transaction)> = Vec::new();
@@ -1238,6 +1528,12 @@ fn verify_superseded_segment(
                 return Err(anyhow::anyhow!("superseded {kind} {j}: txid does not match its tx"));
             }
             let id = tx.txid();
+            if !seen_txids.insert(id) {
+                return Err(anyhow::anyhow!(
+                    "superseded {kind} {j}: tier {id} is disclosed more than once (or is also a live tier) \
+                     — one co-sign may be counted only once, and a repeat masks a hidden state"
+                ));
+            }
             for (vout, o) in tx.output.iter().enumerate() {
                 prevout_value_of.insert((id, vout as u32), o.value);
             }
@@ -1353,7 +1649,7 @@ fn verify_superseded_segment(
     Ok(sups.len() as u32)
 }
 
-fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, final_is_split: bool) -> Result<()> {
+fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, final_is_split: bool) -> Result<()> {
     use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction, Txid};
 
     let net = net_from_str(&bundle.network);
@@ -1388,19 +1684,23 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
     {
         return Err(anyhow::anyhow!("trigger does not spend the funding UTXO F"));
     }
-    if t.output.is_empty() || t.output[0].script_pubkey != agg_spk {
+    // The trigger must pay `A` on its declared PAYLOAD output (`payload_vout`, 0 today). Reading the
+    // payload through the accessor rather than `output[0]` is what keeps this check meaningful once a
+    // coloured tier carries an opret at index 0 — and a bogus declared index fails closed right here.
+    if tiers[0].payload_out(t, "trigger")?.script_pubkey != agg_spk {
         return Err(anyhow::anyhow!("trigger does not pay the aggregate key A"));
     }
 
-    // 2. Each later tier spends its parent's out[0], within schedule bounds, paying A (or owner if final).
+    // 2. Each later tier spends its parent's PAYLOAD output, within schedule bounds, paying A (or the
+    //    owner if final).
     let p = &bundle.params;
     for i in 1..txs.len() {
         let tx = &txs[i];
         if tx.input.len() != 1
             || tx.input[0].previous_output.txid != txs[i - 1].txid()
-            || tx.input[0].previous_output.vout != 0
+            || tx.input[0].previous_output.vout != tiers[i - 1].payload_vout
         {
-            return Err(anyhow::anyhow!("tier {i} does not spend its parent's output"));
+            return Err(anyhow::anyhow!("tier {i} does not spend its parent's payload output"));
         }
         let seq = tx.input[0].sequence.0;
         if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
@@ -1418,7 +1718,7 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
             // verify_child_bundle (A_child == SP.out[j]). Skip the single-owner payee check here.
         } else {
             let want = if is_final { &owner_spk } else { &agg_spk };
-            if tx.output.is_empty() || &tx.output[0].script_pubkey != want {
+            if &tiers[i].payload_out(tx, &format!("tier {i}"))?.script_pubkey != want {
                 return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
             }
         }
@@ -1482,6 +1782,14 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
         let op = txs[i].input[0].previous_output;
         live_csv_by_outpoint.insert((op.txid, op.vout), txs[i].input[0].sequence.0 & 0xFFFF);
     }
+    // [C-2] Every LIVE exit tier's txid, so a superseded list cannot re-declare one of them (or repeat
+    // itself) to buy an extra census slot.
+    let live_txids: std::collections::HashSet<Txid> = txs.iter().map(|t| t.txid()).collect();
+    if live_txids.len() != txs.len() {
+        return Err(anyhow::anyhow!(
+            "the exit chain repeats a tier txid — one co-sign counted twice"
+        ));
+    }
     let superseded_ok = verify_superseded_segment(
         &bundle.superseded_states,
         &bundle.superseded_extensions,
@@ -1489,13 +1797,14 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, v1_backups: u32, fina
         &p,
         &mut prevout_value_of,
         &live_csv_by_outpoint,
+        &live_txids,
     )?;
 
     // 3. The linchpin: the SE's finalized-signature count must EXACTLY account for EVERY co-signed
     //    tier — the exit chain PLUS the superseded states/extensions (full-disclosure counting). Every
     //    term below is now a VERIFIED co-sign of this ladder (above), so the count cannot be padded.
     //    A hidden co-signed state bumps num_sigs without appearing here ⟹ reject.
-    let expected = v1_backups + tiers.len() as u32 + superseded_ok;
+    let expected = flat_backups + tiers.len() as u32 + superseded_ok;
     if se_num_sigs != expected {
         return Err(anyhow::anyhow!(
             "num_sigs mismatch: SE issued {se_num_sigs}, disclosed tiers+backups account for {expected} — possible hidden state"
@@ -1531,11 +1840,11 @@ pub fn verify_child_bundle(
     cb: &ChildTesrBundle,
     parent_f_onchain_spk_hex: &str,
     parent_num_sigs: u32,
-    parent_v1_backups: u32,
+    parent_flat_backups: u32,
     parent_aggregate_pubkey: Option<&str>,
     parent_terminal: bool,
     child_num_sigs: u32,
-    child_v1_backups: u32,
+    child_flat_backups: u32,
     child_aggregate_pubkey: Option<&str>,
     ancestor_facts: &[AncestorFacts],
     receiver_backup_address: &str,
@@ -1560,22 +1869,15 @@ pub fn verify_child_bundle(
             "parent sid is NOT terminal — a rival state over F/X_m.out[0] could still be co-signed (fail-closed)"
         ));
     }
-    use electrum_client::bitcoin::{
-        consensus::deserialize,
-        secp256k1::{Secp256k1, XOnlyPublicKey},
-        Address, Transaction,
-    };
-    let secp = Secp256k1::verification_only();
+    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
     let net = net_from_str(&cb.parent.network);
 
     // The server records the UNTWEAKED aggregate x-only; an on-chain scriptPubKey commits to the
     // BIP-341-TWEAKED output key. So to compare a recorded aggregate to a key read from a spk, tweak the
     // recorded aggregate first (P2TR with no script tree) and take the resulting output key.
     let tweaked_key_hex = |agg_xonly_hex: &str| -> Result<String> {
-        let xonly = XOnlyPublicKey::from_str(agg_xonly_hex)
-            .map_err(|_| anyhow::anyhow!("bad aggregate x-only hex"))?;
-        let spk = Address::p2tr(&secp, xonly, None, net).script_pubkey();
-        taproot_key_hex(spk.as_bytes())
+        // Shared with `verify_bundle_bound` so the two acceptance paths can never drift.
+        tweaked_p2tr_key_hex(agg_xonly_hex, net)
     };
 
     // [1] ON-CHAIN ROOT: A_parent := taproot key of the fetched on-chain F.spk. Bind the parent
@@ -1605,7 +1907,7 @@ pub fn verify_child_bundle(
     //     co-signed under A_parent(=agg_address, now bound to on-chain F), SP is the current state,
     //     S_0 is disclosed as superseded and OUT-RACED by SP over X_m.out[0], and the exact-equality
     //     census holds (num_sigs(parent_sid) accounts for exactly the disclosed tiers).
-    verify_bundle_ex(&cb.parent, parent_num_sigs, parent_v1_backups, true)
+    verify_bundle_ex(&cb.parent, parent_num_sigs, parent_flat_backups, true)
         .map_err(|e| anyhow::anyhow!("parent segment/census invalid: {e}"))?;
 
     // Parse SP (the parent's current, terminal state) — it hosts the children on its outputs.
@@ -1666,14 +1968,19 @@ pub fn verify_child_bundle(
         }
         verify_tier_cosigned(&ext_tx, fund_out.value, &seg_spk)
             .map_err(|e| anyhow::anyhow!("ancestor {i}: extension not co-signed by its aggregate: {e}"))?;
-        let ext0 = ext_tx.output.first().ok_or_else(|| anyhow::anyhow!("ancestor {i}: ext has no out0"))?.clone();
+        let ext0 = seg.extension.payload_out(&ext_tx, &format!("ancestor {i} extension"))?.clone();
         let st_tx: Transaction = deserialize(
             &hex::decode(&seg.state.signed_tx).map_err(|_| anyhow::anyhow!("ancestor {i}: bad state hex"))?,
         )
         .map_err(|_| anyhow::anyhow!("ancestor {i}: state is not a transaction"))?;
         let sin = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("ancestor {i}: state has no input"))?;
-        if st_tx.input.len() != 1 || sin.previous_output.txid != ext_tx.txid() || sin.previous_output.vout != 0 {
-            return Err(anyhow::anyhow!("ancestor {i}: state does not spend its extension's out[0]"));
+        if st_tx.input.len() != 1
+            || sin.previous_output.txid != ext_tx.txid()
+            || sin.previous_output.vout != seg.extension.payload_vout
+        {
+            return Err(anyhow::anyhow!(
+                "ancestor {i}: state does not spend its extension's payload output"
+            ));
         }
         verify_tier_cosigned(&st_tx, ext0.value, &seg_spk)
             .map_err(|e| anyhow::anyhow!("ancestor {i}: state not co-signed by its aggregate: {e}"))?;
@@ -1701,8 +2008,18 @@ pub fn verify_child_bundle(
                 }
             }
             let mut live: std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u32> = std::collections::HashMap::new();
+            // The census key MUST move with the payload vout it describes (CTESR-GATE §3.2): this map
+            // is KEYED rather than content-checked, so a key that disagreed with its tier would make
+            // the superseded battery compare a rival against the WRONG live CSV — the one migration
+            // site that warrants explicit care. `st_tx` is asserted above to spend exactly this
+            // outpoint, so key and tier can never drift.
             live.insert((fund_txid, seg.funding_vout), ext_tx.input[0].sequence.0 & 0xFFFF);
-            live.insert((ext_tx.txid(), 0), st_tx.input[0].sequence.0 & 0xFFFF);
+            live.insert(
+                (ext_tx.txid(), seg.extension.payload_vout),
+                st_tx.input[0].sequence.0 & 0xFFFF,
+            );
+            let live_ids: std::collections::HashSet<electrum_client::bitcoin::Txid> =
+                [ext_tx.txid(), st_tx.txid()].into_iter().collect();
             verify_superseded_segment(
                 &seg.superseded_states,
                 &seg.superseded_extensions,
@@ -1710,6 +2027,7 @@ pub fn verify_child_bundle(
                 &cb.parent.params,
                 &mut prevouts,
                 &live,
+                &live_ids,
             )
             .map_err(|e| anyhow::anyhow!("ancestor {i}: {e}"))?
         };
@@ -1724,6 +2042,19 @@ pub fn verify_child_bundle(
     }
 
     let sp_txid = cur_tx.txid();
+    // The funding tier's own payload vout — `SP.out[j]` means the j-th PAYLOAD output, so a child slot
+    // can never sit before it (index 0 becomes the opret once a tier is coloured).
+    let funding_payload_vout = cb
+        .ancestors
+        .last()
+        .map(|a| a.state.payload_vout)
+        .unwrap_or(cb.parent.current().state.payload_vout);
+    if cb.sp_vout < funding_payload_vout {
+        return Err(anyhow::anyhow!(
+            "child funding vout {} precedes the funding tier's payload vout {funding_payload_vout}",
+            cb.sp_vout
+        ));
+    }
     let sp_out = cur_tx
         .output
         .get(cb.sp_vout as usize)
@@ -1767,15 +2098,18 @@ pub fn verify_child_bundle(
         }
     }
 
-    // state_child spends ext_child.out[0], co-signed by A_child.
-    let ext_out0 = ext_tx.output.first().ok_or_else(|| anyhow::anyhow!("child ext has no out0"))?;
+    // state_child spends ext_child's PAYLOAD output, co-signed by A_child.
+    let ext_out0 = cb.child_extension.payload_out(&ext_tx, "child extension")?;
     let st_tx: Transaction = deserialize(
         &hex::decode(&cb.child_state.signed_tx).map_err(|_| anyhow::anyhow!("bad child state hex"))?,
     )
     .map_err(|_| anyhow::anyhow!("child state is not a transaction"))?;
     let st_in = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("child state has no input"))?;
-    if st_tx.input.len() != 1 || st_in.previous_output.txid != ext_tx.txid() || st_in.previous_output.vout != 0 {
-        return Err(anyhow::anyhow!("child state does not spend ext_child.out[0]"));
+    if st_tx.input.len() != 1
+        || st_in.previous_output.txid != ext_tx.txid()
+        || st_in.previous_output.vout != cb.child_extension.payload_vout
+    {
+        return Err(anyhow::anyhow!("child state does not spend ext_child's payload output"));
     }
     verify_tier_cosigned(&st_tx, ext_out0.value, &child_agg_spk)
         .map_err(|e| anyhow::anyhow!("child state not co-signed by A_child: {e}"))?;
@@ -1798,7 +2132,7 @@ pub fn verify_child_bundle(
         .map_err(|_| anyhow::anyhow!("receiver backup address wrong network"))?
         .script_pubkey();
     let recv_key = taproot_key_hex(recv_spk.as_bytes())?;
-    let st_out0 = st_tx.output.first().ok_or_else(|| anyhow::anyhow!("child state has no out0"))?;
+    let st_out0 = cb.child_state.payload_out(&st_tx, "child state")?;
     if taproot_key_hex(st_out0.script_pubkey.as_bytes())? != recv_key {
         return Err(anyhow::anyhow!("child state does not pay the receiver's key (Model A violated)"));
     }
@@ -1840,8 +2174,15 @@ pub fn verify_child_bundle(
         }
         let mut child_live: std::collections::HashMap<(_Txid, u32), u32> =
             std::collections::HashMap::new();
+        // Same rule as the ancestor segment: the KEYED census map must track the payload vout of the
+        // tier it describes, or a rival would be raced against the wrong live CSV (CTESR-GATE §3.2).
         child_live.insert((sp_txid, cb.sp_vout), ext_tx.input[0].sequence.0 & 0xFFFF);
-        child_live.insert((ext_tx.txid(), 0), st_tx.input[0].sequence.0 & 0xFFFF);
+        child_live.insert(
+            (ext_tx.txid(), cb.child_extension.payload_vout),
+            st_tx.input[0].sequence.0 & 0xFFFF,
+        );
+        let child_live_ids: std::collections::HashSet<_Txid> =
+            [ext_tx.txid(), st_tx.txid()].into_iter().collect();
         verify_superseded_segment(
             &cb.child_superseded_states,
             &cb.child_superseded_extensions,
@@ -1849,15 +2190,16 @@ pub fn verify_child_bundle(
             &cb.parent.params,
             &mut child_prevouts,
             &child_live,
+            &child_live_ids,
         )?
     };
 
     // [6 cont.] CHILD CENSUS exact-equality: the child discloses exactly ext_child + state_child (2
-    //     co-signs) plus one superseded state per onward hop, on top of any V1 backups (a derived slot
+    //     co-signs) plus one superseded state per onward hop, on top of any flat backups (a derived slot
     //     has none — CHILD_V2_BASELINE = 0). A hidden child co-sign would push child_num_sigs above
     //     this ⟹ reject. Key handovers are census-NEUTRAL (the enclave bumps sig_count only when it
     //     signs), so an adopted child counts the same as a conveyed one.
-    let child_expected = child_v1_backups + 2 + child_superseded_ok;
+    let child_expected = child_flat_backups + 2 + child_superseded_ok;
     if child_num_sigs != child_expected {
         return Err(anyhow::anyhow!(
             "child num_sigs mismatch: SE issued {child_num_sigs}, disclosed accounts for {child_expected} — possible hidden child state"
@@ -1937,20 +2279,373 @@ mod verify_tests {
             version: 1, statechain_id: "sid".into(), network: "regtest".into(),
             fee_rate: p.committed_fee_rate, agg_address: AGG.into(), owner_exit_address: OWNER.into(),
             f_txid: F_TXID.into(), f_vout: 0, f_value,
-            trigger: TesrTier { txid: t.txid, signed_tx: t.tx_hex, out_value: t.out_value, csv: None },
+            trigger: TesrTier { txid: t.txid, signed_tx: t.tx_hex, out_value: t.out_value, csv: None, payload_vout: t.payload_vout },
             levels: vec![TesrLevel {
-                extension: TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)) },
-                state: TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)) },
+                extension: TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)), payload_vout: x.payload_vout },
+                state: TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)), payload_vout: s.payload_vout },
             }],
             m: 0, superseded_states: vec![], superseded_extensions: vec![], params: p,
         }
     }
 
+    /// PRE-EXISTING, corrected (not weakened): this used to assert `verify_bundle(&b, 3, 0).is_ok()`
+    /// and had been RED since the `[S1]` fix, because `sample_bundle` builds UNSIGNED tiers and every
+    /// counted tier must now verify as a genuine co-sign by `A`. A structurally perfect but
+    /// never-co-signed ladder must be REFUSED — that is the property, and it is what is asserted here.
+    /// The positive control (an honest, live-SE-co-signed ladder is ACCEPTED) cannot be built without
+    /// the SE and lives in the E2Es: sdk46, sdk48, sdk54 and sdk70.
     #[test]
-    fn accepts_a_sound_ladder() {
+    fn rejects_a_structurally_perfect_but_uncosigned_ladder() {
         let b = sample_bundle();
-        // trigger + extension + state = 3 tiers, 0 V1 backups.
-        assert!(verify_bundle(&b, 3, 0).is_ok());
+        // trigger + extension + state = 3 tiers, 0 flat backups — the COUNT balances exactly, so the
+        // only thing left to refuse on is the absent signature.
+        let e = verify_bundle(&b, 3, 0).expect_err("an un-co-signed ladder must never be accepted");
+        assert!(
+            e.to_string().contains("not co-signed by A"),
+            "must reject on the missing co-sign, got: {e}"
+        );
+    }
+
+    /// The scriptPubKey of the sample bundle's aggregate address, hex — what a coin's on-chain
+    /// funding output would carry.
+    fn agg_spk_hex() -> String {
+        use electrum_client::bitcoin::{Address, Network};
+        let spk = Address::from_str(AGG)
+            .unwrap()
+            .require_network(Network::Regtest)
+            .unwrap()
+            .script_pubkey();
+        hex::encode(spk.as_bytes())
+    }
+
+    /// The authority a receiver derives from the coin the sample bundle claims to describe.
+    fn sample_authority() -> CoinAuthority {
+        CoinAuthority {
+            statechain_id: "sid".into(),
+            f_txid: F_TXID.into(),
+            f_vout: 0,
+            f_value: 100_000,
+            f_spk_hex: agg_spk_hex(),
+            // A real one is the coordinator's untweaked aggregate; the tests below all fire on checks
+            // that precede it, or on its absence.
+            se_aggregate_pubkey: None,
+        }
+    }
+
+    fn reject_msg(r: Result<()>) -> String {
+        r.expect_err("must be rejected").to_string()
+    }
+
+    // ---- payload_vout: every migrated site fails CLOSED with a named error (CTES-R commit 1). ----
+    //
+    // These run BEFORE the signature battery, so they are exercisable without the SE — which is the
+    // point: a wrong payload vout is caught structurally, early, and loudly.
+
+    #[test]
+    fn wrong_trigger_payload_vout_is_rejected() {
+        let mut b = sample_bundle();
+        b.trigger.payload_vout = 1; // the P2A anchor, not the payload
+        assert!(reject_msg(verify_bundle(&b, 3, 0)).contains("does not pay the aggregate key A"));
+    }
+
+    #[test]
+    fn out_of_range_payload_vout_is_rejected_not_defaulted() {
+        let mut b = sample_bundle();
+        b.trigger.payload_vout = 9;
+        let e = reject_msg(verify_bundle(&b, 3, 0));
+        assert!(e.contains("out of range"), "must fail closed on the accessor, got: {e}");
+    }
+
+    #[test]
+    fn wrong_extension_payload_vout_is_rejected() {
+        let mut b = sample_bundle();
+        b.levels[0].extension.payload_vout = 1;
+        assert!(reject_msg(verify_bundle(&b, 3, 0)).contains("tier 1 pays the wrong output"));
+    }
+
+    #[test]
+    fn wrong_final_state_payload_vout_is_rejected() {
+        let mut b = sample_bundle();
+        b.levels[0].state.payload_vout = 1;
+        assert!(reject_msg(verify_bundle(&b, 3, 0)).contains("tier 2 pays the wrong output"));
+    }
+
+    #[test]
+    fn child_spending_a_non_payload_output_of_its_parent_is_rejected() {
+        // Isolate the LINKAGE check: give the trigger a payload that really does sit at index 1 (swap
+        // its two outputs) so the payee check passes, then hang the extension off `out[0]`. The chain
+        // is broken and the linkage check — not the payee check — must say so.
+        use electrum_client::bitcoin::{
+            consensus::{deserialize, serialize},
+            Transaction,
+        };
+        let mut b = sample_bundle();
+        let mut t: Transaction = deserialize(&hex::decode(&b.trigger.signed_tx).unwrap()).unwrap();
+        t.output.swap(0, 1);
+        let t_txid = t.txid().to_string();
+        let payload_value = t.output[1].value;
+        let p = b.params;
+        let x = mercurylib::tesr::build_extension(
+            &t_txid, payload_value, AGG, "regtest", p.ext_csv(0), p.committed_fee_rate,
+        )
+        .unwrap();
+        b.trigger = TesrTier {
+            txid: t_txid,
+            signed_tx: hex::encode(serialize(&t)),
+            out_value: payload_value,
+            csv: None,
+            payload_vout: 1,
+        };
+        b.levels[0].extension = TesrTier {
+            txid: x.txid,
+            signed_tx: x.tx_hex,
+            out_value: x.out_value,
+            csv: Some(p.ext_csv(0)),
+            payload_vout: x.payload_vout,
+        };
+        let e = reject_msg(verify_bundle(&b, 3, 0));
+        assert!(e.contains("does not spend its parent's payload output"), "got: {e}");
+    }
+
+    // ---- [C-1] the acceptance-path verifier is bound to the COIN, not to the bundle. ----
+
+    #[test]
+    fn bound_verifier_rejects_a_ladder_for_another_statechain_id() {
+        let b = sample_bundle();
+        let mut coin = sample_authority();
+        coin.statechain_id = "a-different-sid".into();
+        assert!(reject_msg(verify_bundle_bound(&b, 3, 0, &coin)).contains("statechain id"));
+    }
+
+    #[test]
+    fn bound_verifier_rejects_a_ladder_over_another_outpoint() {
+        let b = sample_bundle();
+        let mut coin = sample_authority();
+        coin.f_txid = "2".repeat(64);
+        assert!(reject_msg(verify_bundle_bound(&b, 3, 0, &coin)).contains("decoy ladder"));
+        let mut coin = sample_authority();
+        coin.f_vout = 7;
+        assert!(reject_msg(verify_bundle_bound(&b, 3, 0, &coin)).contains("decoy ladder"));
+    }
+
+    #[test]
+    fn bound_verifier_rejects_a_restated_funding_value() {
+        let b = sample_bundle();
+        let mut coin = sample_authority();
+        coin.f_value += 1;
+        assert!(reject_msg(verify_bundle_bound(&b, 3, 0, &coin)).contains("F value"));
+    }
+
+    #[test]
+    fn bound_verifier_rejects_an_aggregate_that_is_not_the_coins() {
+        use electrum_client::bitcoin::{
+            secp256k1::{Secp256k1, XOnlyPublicKey},
+            Address, Network,
+        };
+        let b = sample_bundle();
+        let mut coin = sample_authority();
+        // A different, perfectly valid P2TR funding output — the ladder's tiers are co-signed under a
+        // key that does not control it.
+        let x = XOnlyPublicKey::from_slice(
+            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap(),
+        )
+        .unwrap();
+        coin.f_spk_hex = hex::encode(
+            Address::p2tr(&Secp256k1::verification_only(), x, None, Network::Regtest)
+                .script_pubkey()
+                .as_bytes(),
+        );
+        let e = reject_msg(verify_bundle_bound(&b, 3, 0, &coin));
+        assert!(e.contains("on-chain funding key"), "got: {e}");
+    }
+
+    #[test]
+    fn bound_verifier_rejects_a_non_taproot_funding_output() {
+        // `taproot_key_hex` on a non-P2TR spk — here the P2A anchor script, a witness program that is
+        // NOT P2TR (the exact shape that broke `create_colored_split_tx`'s filter, CTESR-GATE §2.1d).
+        let b = sample_bundle();
+        let mut coin = sample_authority();
+        coin.f_spk_hex = "51024e73".into();
+        let e = reject_msg(verify_bundle_bound(&b, 3, 0, &coin));
+        assert!(e.contains("not a v1 taproot output"), "got: {e}");
+    }
+
+    #[test]
+    fn bound_verifier_fails_closed_without_a_coordinator_aggregate() {
+        // Everything else matches; the coordinator simply has no aggregate on record for the sid.
+        // That is a REJECTION, never a fallback to the sender-supplied key.
+        let b = sample_bundle();
+        let coin = sample_authority();
+        assert!(coin.se_aggregate_pubkey.is_none());
+        let e = reject_msg(verify_bundle_bound(&b, 3, 0, &coin));
+        assert!(e.contains("recorded no aggregate"), "got: {e}");
+    }
+
+    // ---- [R5] The establish-time counterpart: a legacy coin is left UN-LADDERED, not bricked. ----
+    //
+    // `verify_bundle_bound`'s fail-closed-on-missing-aggregate is correct and stays exactly as it is.
+    // Its cost is that a pre-0009 coin (`aggregate_xonly IS NULL`) which gets laddered in place carries
+    // a bundle no receiver can bind. `ladder_binding_precheck` is the same authority test hoisted ahead
+    // of establishment, so such a coin never acquires that ladder — and never burns the three
+    // irreversible SE co-signs it would cost. It does NOT restore off-chain transferability (the [R4]
+    // version floor refuses the un-laddered shape too); only a coordinator-side backfill of
+    // `aggregate_xonly` does that.
+
+    /// The generator's x-coordinate — a valid x-only key standing in for "some other aggregate".
+    const OTHER_XONLY: &str =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// P2TR spk (hex) of an UNTWEAKED x-only key — what the coordinator's recorded aggregate looks
+    /// like once it is on chain.
+    fn p2tr_spk_hex_of(untweaked_xonly: &str) -> String {
+        use electrum_client::bitcoin::{
+            secp256k1::{Secp256k1, XOnlyPublicKey},
+            Address, Network,
+        };
+        let x = XOnlyPublicKey::from_str(untweaked_xonly).unwrap();
+        hex::encode(
+            Address::p2tr(&Secp256k1::verification_only(), x, None, Network::Regtest)
+                .script_pubkey()
+                .as_bytes(),
+        )
+    }
+
+    #[test]
+    fn precheck_refuses_to_ladder_a_legacy_coin_with_no_coordinator_aggregate() {
+        // A perfectly legitimate, live, on-chain root coin — the coordinator simply predates the
+        // aggregate column. Laddering it would spend three SE co-signs to produce an unclaimable
+        // bundle, so the pass must leave it alone.
+        let e = ladder_binding_precheck("sid-legacy", &agg_spk_hex(), None, "regtest")
+            .expect_err("a coin with no coordinator aggregate must never be laddered");
+        assert!(e.to_string().contains("recorded no aggregate"), "got: {e}");
+
+        // Why it must never be laddered: this is precisely the coin whose conveyed ladder the
+        // acceptance path refuses. The refusal is NOT relaxed — the fix is upstream of it.
+        let b = sample_bundle();
+        let legacy = sample_authority(); // se_aggregate_pubkey: None
+        assert!(legacy.se_aggregate_pubkey.is_none());
+        assert!(
+            reject_msg(verify_bundle_bound(&b, 3, 0, &legacy)).contains("recorded no aggregate"),
+            "the acceptance-path fail-closed must stand unchanged"
+        );
+    }
+
+    #[test]
+    fn precheck_refuses_an_aggregate_that_does_not_control_the_funding_output() {
+        // Not the legacy case: the coordinator HAS a record, it just is not the key on chain. A ladder
+        // here would be refused as a decoy at acceptance, so it must not be built either.
+        let e = ladder_binding_precheck("sid", &agg_spk_hex(), Some(OTHER_XONLY), "regtest")
+            .expect_err("a mismatched coordinator aggregate must not be laddered");
+        assert!(e.to_string().contains("does not match the funding output key"), "got: {e}");
+    }
+
+    #[test]
+    fn precheck_fails_closed_on_a_non_taproot_funding_output() {
+        let e = ladder_binding_precheck("sid", "51024e73", Some(OTHER_XONLY), "regtest")
+            .expect_err("a non-P2TR funding output has no aggregate key to bind to");
+        assert!(e.to_string().contains("not a v1 taproot output"), "got: {e}");
+        assert!(
+            ladder_binding_precheck("sid", "zz", Some(OTHER_XONLY), "regtest").is_err(),
+            "unparseable spk must fail closed"
+        );
+    }
+
+    #[test]
+    fn precheck_passes_exactly_when_the_receiver_could_bind_the_ladder() {
+        // The coordinator's untweaked aggregate, and the funding output that key actually controls.
+        let f_spk_hex = p2tr_spk_hex_of(OTHER_XONLY);
+        ladder_binding_precheck("sid", &f_spk_hex, Some(OTHER_XONLY), "regtest")
+            .expect("a coin whose coordinator aggregate controls F is ladderable");
+
+        // And the acceptance-path verifier agrees on the same coin: a ladder built over that aggregate
+        // clears EVERY binding check and stops only at the SE co-signature, which no unit test can
+        // forge. So `precheck ⟹ bindable`: the establish gate never creates an unclaimable ladder.
+        use electrum_client::bitcoin::{
+            secp256k1::{Secp256k1, XOnlyPublicKey},
+            Address, Network,
+        };
+        let agg_addr = Address::p2tr(
+            &Secp256k1::verification_only(),
+            XOnlyPublicKey::from_str(OTHER_XONLY).unwrap(),
+            None,
+            Network::Regtest,
+        )
+        .to_string();
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let f_value = 100_000u64;
+        let t = mercurylib::tesr::build_trigger(F_TXID, 0, f_value, &agg_addr, "regtest", p.committed_fee_rate).unwrap();
+        let x = mercurylib::tesr::build_extension(&t.txid, t.out_value, &agg_addr, "regtest", p.ext_csv(0), p.committed_fee_rate).unwrap();
+        let s = mercurylib::tesr::build_state(&x.txid, x.out_value, OWNER, "regtest", p.state_csv(0), p.committed_fee_rate).unwrap();
+        let mut b = sample_bundle();
+        b.agg_address = agg_addr;
+        b.trigger = TesrTier { txid: t.txid, signed_tx: t.tx_hex, out_value: t.out_value, csv: None, payload_vout: t.payload_vout };
+        b.levels[0].extension = TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)), payload_vout: x.payload_vout };
+        b.levels[0].state = TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)), payload_vout: s.payload_vout };
+
+        let coin = CoinAuthority {
+            statechain_id: "sid".into(),
+            f_txid: F_TXID.into(),
+            f_vout: 0,
+            f_value,
+            f_spk_hex,
+            se_aggregate_pubkey: Some(OTHER_XONLY.into()),
+        };
+        let e = reject_msg(verify_bundle_bound(&b, 3, 0, &coin));
+        assert!(
+            e.contains("not co-signed by A"),
+            "binding must not be what fails for a precheck-passing coin, got: {e}"
+        );
+    }
+
+    // ---- [C-2] one co-sign, one census slot. ----
+
+    /// The dedup guard sits in `verify_superseded_segment`'s PRE-PASS, ahead of the co-sign battery,
+    /// so it is exercisable without the SE — which matters, because the padding it stops is padding
+    /// with GENUINE, fully co-signed tiers that every other check waves through. (The end-to-end
+    /// version, against a real renewed ladder, is sdk70 PART C.)
+    fn superseded_dedup(sup: &[TesrTier], live: &[TesrTier]) -> String {
+        use electrum_client::bitcoin::{Address, Network, Txid};
+        let b = sample_bundle();
+        let agg_spk = Address::from_str(AGG)
+            .unwrap()
+            .require_network(Network::Regtest)
+            .unwrap()
+            .script_pubkey();
+        let mut prevouts: std::collections::HashMap<(Txid, u32), u64> =
+            std::collections::HashMap::new();
+        let live_csv: std::collections::HashMap<(Txid, u32), u32> = std::collections::HashMap::new();
+        let live_txids: std::collections::HashSet<Txid> = live
+            .iter()
+            .map(|t| Txid::from_str(&t.txid).unwrap())
+            .collect();
+        verify_superseded_segment(
+            sup,
+            &[],
+            &agg_spk,
+            &b.params,
+            &mut prevouts,
+            &live_csv,
+            &live_txids,
+        )
+        .expect_err("a repeated tier must be rejected")
+        .to_string()
+    }
+
+    #[test]
+    fn a_disclosed_tier_cannot_be_counted_twice() {
+        // Repeat a superseded entry: `expected` grows by one for free and absorbs a hidden co-sign.
+        let s = sample_bundle().levels[0].state.clone();
+        let e = superseded_dedup(&[s.clone(), s], &[]);
+        assert!(e.contains("disclosed more than once"), "got: {e}");
+    }
+
+    #[test]
+    fn a_live_tier_cannot_also_be_disclosed_as_superseded() {
+        // Already counted once by `tiers.len()`; re-declaring it buys the same free slot.
+        let b = sample_bundle();
+        let x = b.levels[0].extension.clone();
+        let e = superseded_dedup(&[x.clone()], &[x]);
+        assert!(e.contains("disclosed more than once"), "got: {e}");
     }
 
     #[test]
@@ -1976,7 +2671,7 @@ mod verify_tests {
             "2222222222222222222222222222222222222222222222222222222222222222",
             b.trigger.out_value, AGG, "regtest", p.ext_csv(0), p.committed_fee_rate,
         ).unwrap();
-        b.levels[0].extension = TesrTier { txid: bogus.txid, signed_tx: bogus.tx_hex, out_value: bogus.out_value, csv: Some(p.ext_csv(0)) };
+        b.levels[0].extension = TesrTier { txid: bogus.txid, signed_tx: bogus.tx_hex, out_value: bogus.out_value, csv: Some(p.ext_csv(0)), payload_vout: bogus.payload_vout };
         assert!(verify_bundle(&b, 3, 0).is_err(), "extension not linked to the trigger must be rejected");
     }
 
@@ -1987,7 +2682,7 @@ mod verify_tests {
         // Rebuild the final state paying A instead of the owner.
         let x = &b.levels[0].extension;
         let s = mercurylib::tesr::build_state(&x.txid, x.out_value, AGG, "regtest", p.state_csv(0), p.committed_fee_rate).unwrap();
-        b.levels[0].state = TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)) };
+        b.levels[0].state = TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)), payload_vout: s.payload_vout };
         assert!(verify_bundle(&b, 3, 0).is_err(), "final state must pay the owner");
     }
 }
@@ -2021,7 +2716,7 @@ pub async fn cosign_tier(
     // [KEYSTONE / client half] Retry the SAME sign/second — NEVER restart sign/first here.
     //
     // Restarting sign/first would mint a fresh secnonce and a fresh SE co-sign, so sig_count would run
-    // ahead of the one tier we actually keep, and the receiver census (num_sigs == v1_backups + tiers +
+    // ahead of the one tier we actually keep, and the receiver census (num_sigs == flat_backups + tiers +
     // superseded) could never rebalance ⟹ the coin bricks. Resending the IDENTICAL payload is idempotent
     // at the lockbox (same session ⟹ cached partial sig, no re-sign, no re-increment — see the lockbox
     // signed_session_cache), so a lost sign/second response is recovered with the exact same signature.

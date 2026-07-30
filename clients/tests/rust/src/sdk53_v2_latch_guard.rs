@@ -1,12 +1,12 @@
 //! E2E (SDK_E2E=53) — **the LN-latch guard is now LIFTED (HODL-latch pivot, LIGHTNING.md)**.
 //!
-//! History: this test used to prove `transfer_sender` REFUSED a Lightning-latched transfer of a V2
-//! (TES-R) coin, because the Model A co-sign of S' is not preimage-gated. The HODL-latch pivot lifts
-//! that refusal: rob-SSP is now blocked by the SSP's pre-pay `verify_bundle` census
+//! History: this test used to prove `transfer_sender` REFUSED a Lightning-latched transfer of a
+//! laddered (TES-R) coin, because the Model A co-sign of S' is not preimage-gated. The HODL-latch pivot
+//! lifts that refusal: rob-SSP is now blocked by the SSP's pre-pay `verify_bundle` census
 //! (peek_pending_transfers → ssp.rs execute_pay), and rob-USER rests on operator trust exactly as the
-//! V1 lane does. So a latched V2 transfer must now OPEN successfully (no refusal). The full happy path
-//! (SSP censuses + pays a real BOLT11 with a V2 coin) is proved by sdk63. This test just pins that the
-//! guard is gone and the latch opens.
+//! pre-TES-R design did. So a latched transfer of a laddered coin must now OPEN successfully (no
+//! refusal). The full happy path (SSP censuses + pays a real BOLT11 with a laddered coin) is proved by
+//! sdk63. This test just pins that the guard is gone and the latch opens.
 //!
 //! Run with SDK_E2E=53 (needs the regtest + Mercury lockbox stack, Core 28+).
 
@@ -34,7 +34,7 @@ pub async fn execute() -> Result<()> {
     mercuryrustlib::sqlite_manager::insert_wallet(&cc.pool, &bob_wallet).await?;
     let bob_addr = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk53_bob").await?;
 
-    // --- A LATCHED transfer (batch_id set) of a V2 coin must now OPEN (guard lifted). ---------------
+    // --- A LATCHED transfer (batch_id set) of a laddered coin must now OPEN (guard lifted). --------
     // Safety is provided by the SSP's pre-pay census + operator trust (LIGHTNING.md), not a refusal.
     let batch_id = format!("sdk53-batch-{}", uuid::Uuid::new_v4());
     let latched = mercuryrustlib::transfer_sender::execute(
@@ -44,11 +44,11 @@ pub async fn execute() -> Result<()> {
     if let Err(e) = &latched {
         let msg = e.to_string();
         assert!(
-            !msg.contains("Lightning-latched transfer of a V2"),
+            !msg.contains("Lightning-latched transfer"),
             "the old atomicity-guard refusal must be GONE, but it fired: {msg}"
         );
-        return Err(anyhow!("latched V2 transfer should open, but failed: {msg}"));
+        return Err(anyhow!("latched transfer of a laddered coin should open, but failed: {msg}"));
     }
-    println!("SDK53 - ✓ PASS: the V2 LN-latch guard is LIFTED — a latched (batch_id) transfer of a V2 coin now opens instead of being refused. rob-SSP is guarded by the SSP's pre-pay verify_bundle census (peek_pending_transfers → execute_pay), not a blanket refusal. The full happy path (SSP censuses + pays a real BOLT11 with a V2 coin) is proved end-to-end by sdk63.");
+    println!("SDK53 - ✓ PASS: the LN-latch guard is LIFTED — a latched (batch_id) transfer of a laddered coin now opens instead of being refused. rob-SSP is guarded by the SSP's pre-pay verify_bundle census (peek_pending_transfers → execute_pay), not a blanket refusal. The full happy path (SSP censuses + pays a real BOLT11 with a laddered coin) is proved end-to-end by sdk63.");
     Ok(())
 }

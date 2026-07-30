@@ -285,7 +285,7 @@ shape, the census (REQ-38) on the laddered one.
 reject otherwise (ERR-7).
 **REQ-38 (census)** A receiver of a laddered coin, or of a split child (§6.3), MUST reject unless
 the SE's public co-signature count equals EXACTLY the tiers it was shown:
-`se_num_sigs == v1_backups + Σ conveyed tiers + Σ disclosed superseded tiers`, summed over every hop
+`se_num_sigs == flat_backups + Σ conveyed tiers + Σ disclosed superseded tiers`, summed over every hop
 of the conveyed ancestor chain (N-hop for a re-transferred child). Each disclosed superseded tier
 MUST be parsed, linked to the ladder, signature-checked, and carry a strictly HIGHER CSV than the
 tier that replaces it — a `.len()`-only count is paddable, and an unparsed `csv: None` skipped the
@@ -713,15 +713,20 @@ message.
 split (N pieces + change), with the same branch + terminal-parent guarantees as a single transfer
 (REQ-17/REQ-18).
 
-> ⚠ **Known divergence (code, not spec).** `transfer_many` still builds the PLAIN N+1 branch split
-> (§6.2) directly: it neither routes a laddered parent through the in-ladder split nor carries the
-> `split_coin` refusal that REQ-39 requires. On a laddered parent it therefore produces exactly the
-> shape REQ-39 forbids — the split tx and the coin's trigger both spend `F`. Harmless when the
-> parent was self-deposited (only the owner holds `T`), but a RECEIVED laddered coin leaves its
-> previous owner holding a broadcastable no-timelock `T` that can void the split after the pieces
-> are handed over: live [B1]. Single-recipient `transfer()` routes correctly; `transfer_many` needs
-> the same routing. `sdk11` exercises it green on a self-deposited coin, which pins the *behaviour*,
-> not the safety property.
+`transfer_many` MUST dispatch on the parent's shape exactly as single-recipient `transfer()` does: a
+laddered ROOT coin through a MULTI-CHILD in-ladder split (one `SP` over `X_m.out[0]` carving N
+recipient children plus change), a received CHILD through the child-level equivalent, and only an
+un-laddered coin through the plain N+1 branch split (§6.2). A plain split of a laddered parent is the
+shape REQ-39 forbids — the split tx and the coin's trigger both spend `F` — so it MUST NOT be built.
+
+> **Was a known divergence, now FIXED.** `transfer_many` used to build the plain split directly on
+> any parent, carrying neither the routing nor the `split_coin` refusal. Harmless when the parent was
+> self-deposited (only the owner holds `T`), but a RECEIVED laddered coin left its previous owner
+> holding a broadcastable no-timelock `T` that could void the split after the pieces were handed
+> over: live [B1]. `sdk69` now proves the fixed shape by executing that attack — the retained trigger
+> is broadcast and spends `F`, and both recipients still exit unilaterally for their exact amounts,
+> because `SP` descends from the trigger instead of racing it. `sdk11` asserts the route as well as
+> the amounts.
 
 **REQ-28** `create_sats_invoice`/`create_tokens_invoice` MUST encode {address, amount, asset?,
 memo?, expiry?} into a `utexoinv1…` string that round-trips through `decode_utexo_invoice`;
@@ -801,8 +806,7 @@ Findings from the adversarial review that are **documented assumptions**, not co
 - **Batch atomicity.** `transfer_many` / `batch_transfer_tokens` hand off pieces independently; there
   is no all-or-nothing guarantee across recipients. A dropped hand-off leaves that piece reclaimable
   by the sender (the split parent is terminal, so no double-spend), but the batch is not atomic.
-  `transfer_many` additionally still takes the plain-split route on a laddered parent — see the
-  divergence note under REQ-27 (§13).
+  This is the only remaining `transfer_many` caveat: its laddered-parent routing is fixed (REQ-27).
 - **Perpetual watching.** A laddered coin's unconditional no-watch window is gone: nothing ages while
   un-broadcast (INV-27), but once a hostile trigger IS broadcast the defence is a race the owner (or
   a tower) must enter within the CSV edge. No theft tx can become valid until ≥144 blocks after a

@@ -107,7 +107,7 @@ Defaults are set in server/src/server_config.rs:69-70. Clients obtain the live v
 sub-coins — whose ownership hops are backup-chain handovers. A **laddered** coin still carries the
 deposit backup `tx1` that was co-signed when its funding was first seen, and the conveyed-backup
 COUNT still feeds the receiver's `verify_bundle` equation (`se_num_sigs = <conveyed backups> +
-<tier count>`, the `v1_backups` term in code — which is why the decrement rule of IVL-REQ-4 is
+<tier count>`, the `flat_backups` term in code — which is why the decrement rule of IVL-REQ-4 is
 enforced on that lane too, sdk55), but its
 *exit* runs the relative-CSV tier chain and never this ladder
 (`UtexoWallet::unilateral_exit` takes the TES-R branch first, clients/libs/rust-sdk/src/wallet.rs).
@@ -164,7 +164,7 @@ constructs them (`calculate_block_height`) and receiver-side validation rejects 
   of any check MUST abort the claim; the coin is never booked.
   *Both shapes (§0).* The count equation above is the **un-laddered** handover's form. A laddered
   handover conveys a TES-R bundle instead, and the receiver runs the same linchpin in its R′ form —
-  `verify_bundle` enforces `se_num_sigs == v1_backups + tier_count`, which still consumes
+  `verify_bundle` enforces `se_num_sigs == flat_backups + tier_count`, which still consumes
   `backup_transactions.len()` as a term, so the decrement rule (`ladder_decrements_by_interval`) is
   enforced on that lane too. sdk55 is the adversarial proof: without it a sender could PAD the
   conveyed backups to absorb a hidden co-signed state, or INVERT the ladder so their own backup
@@ -278,7 +278,7 @@ invalidate. Each failure aborts the claim before the coin is booked.
   scheme against the SE's statechain info, and run the full ladder validation of IVL-REQ-4
   including the `num_sigs` cross-check in whichever form the conveyance takes (IVL-REQ-4:
   `num_sigs == backup_transactions.len()` on the un-laddered lane, `verify_bundle`'s
-  `se_num_sigs == v1_backups + tier_count` on the laddered one) — lib/src/transfer/receiver.rs;
+  `se_num_sigs == flat_backups + tier_count` on the laddered one) — lib/src/transfer/receiver.rs;
   clients/libs/rust/src/transfer_receiver.rs. Error: `SignatureSchemeValidationError` /
   `num_sigs is not correct`. Evidence: sdk17 (multi-hop claim), sdk55 (padding/inversion),
   sdk46 (R′ count vs the live SE).

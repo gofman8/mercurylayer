@@ -25,6 +25,7 @@ pub mod rgb11_issue_schemas_uda_cfa;
 pub mod rgb12_validate_offchain_negative;
 pub mod rgb13_consignment_integrity;
 pub mod rgb14_metadata_and_ifa_supply;
+pub mod rgb15_colored_tier_builder;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
@@ -80,6 +81,8 @@ pub mod sdk65_inladder_lightning_pay;
 pub mod sdk66_inladder_pay_failure;
 pub mod sdk67_inladder_lightning_receive;
 pub mod sdk68_v2_pay_failure_reclaim;
+pub mod sdk69_transfer_many_inladder;
+pub mod sdk70_verifier_binding_adversarial;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -347,6 +350,20 @@ async fn main() -> Result<()> {
         sdk68_v2_pay_failure_reclaim::execute().await?;
         return Ok(());
     }
+    // transfer_many on a LADDERED parent (SDK_E2E=69): the multi-child in-ladder split, with the
+    // [B1] retained-trigger attack executed for real — both recipients still exit for their amounts.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("69") {
+        sdk69_transfer_many_inladder::execute().await?;
+        return Ok(());
+    }
+    // Verifier binding + payload_vout fail-closed (SDK_E2E=70): a fully co-signed DECOY ladder over an
+    // attacker-owned outpoint is accepted by the unbound verifier and REJECTED once the authority is
+    // derived from the coin [C-1]; a genuine tier cannot be counted twice [C-2]; every migrated
+    // `payload_vout` site fails closed with a named error.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("70") {
+        sdk70_verifier_binding_adversarial::execute().await?;
+        return Ok(());
+    }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
     if std::env::var("LN_SMOKE").as_deref() == std::result::Result::Ok("1") {
         let (a, b) = rln::setup_ln_pair("/tmp/rln-smoke").await?;
@@ -433,6 +450,15 @@ async fn main() -> Result<()> {
     }
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("14") {
         rgb14_metadata_and_ifa_supply::execute().await?;
+        return Ok(());
+    }
+    // CTES-R coloured tier builder + per-tier seal blinding (RGB_E2E=15): promotes the E1/E2 gate
+    // harnesses — coloured 1-payload and N-payload tiers at exactly 2.000 sat/vB, off-chain
+    // validation against an un-broadcast txid, and the decisive >=3-rival / non-minimum-internal-txid
+    // test with the retired global blinding as the negative control. Needs bitcoind + electrs +
+    // the RGB proxy only (no Mercury server, no lockbox).
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("15") {
+        rgb15_colored_tier_builder::execute().await?;
         return Ok(());
     }
 

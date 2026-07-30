@@ -33,7 +33,7 @@ async fn claim_one(w: &UtexoWallet) -> Result<()> {
 }
 
 pub async fn execute() -> Result<()> {
-    // Runs on the V2 (TES-R) default. Hop 1 is a root in-ladder split; hop 2 re-spends a NON-EXACT
+    // Runs on laddered (TES-R) coins. Hop 1 is a root in-ladder split; hop 2 re-spends a NON-EXACT
     // part of Bob's RECEIVED child, which is a CHILD-LEVEL in-ladder split (the child's state is
     // replaced by a split state paying two grandchildren, and the child becomes an intermediate
     // `ancestors` segment in each grandchild's bundle). Carol's exit therefore walks a depth-2 chain.
@@ -96,7 +96,7 @@ pub async fn execute() -> Result<()> {
     // --- Only the final unilateral exit touches the chain -----------------------------------------
     let carol_coin = r2.coins[0].statechain_id.clone();
     // Carol's exit key — the PAYOFF assertion below checks the value actually lands there, which the
-    // V1 version of this test never verified (it only checked that O got spent).
+    // pre-TES-R version of this test never verified (it only checked that O got spent).
     let carol_exit_key = {
         let c = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk17_carol")
             .await?
@@ -107,7 +107,7 @@ pub async fn execute() -> Result<()> {
             .ok_or_else(|| anyhow!("carol's coin missing"))?;
         mercurylib::transaction::get_user_backup_address(&c, "regtest".to_string())?
     };
-    // The V2 exit walks a DEPTH-2 chain: F -> T -> X_m -> SP -> ext_child -> CSP -> ext_gc -> state_gc,
+    // The TES-R exit walks a DEPTH-2 chain: F -> T -> X_m -> SP -> ext_child -> CSP -> ext_gc -> state_gc,
     // one relative timelock at a time.
     let mut passes = 0;
     loop {

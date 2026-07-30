@@ -4,7 +4,7 @@
 //! laddered, and the old sdk53 guard refused a Lightning-latched transfer of a V2 coin — so a V2
 //! wallet could not pay over LN at all. This proves it now works: alice pays a real BOLT11 from a
 //! **V2** statechain coin, and the SSP's **pre-pay census** (verify_bundle over the conveyed ladder,
-//! num_sigs == v1_backups + tiers read from the enclave sig-count) runs before send_payment.
+//! num_sigs == flat_backups + tiers read from the enclave sig-count) runs before send_payment.
 //!
 //! To isolate the census + guard-lift from the in-ladder-split machinery, alice deposits the EXACT
 //! invoice amount so `ensure_exact_coin` uses the whole V2 coin (no split). NOTE: no

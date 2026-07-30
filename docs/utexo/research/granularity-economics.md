@@ -248,9 +248,11 @@ planner off-by-one are identical — they are properties of `plan_with_floor`, w
 budget-burn *ordering* below is what remains untested — GRANULARITY-SPEC §11 item 7. The E2E that
 exercised the sats boundary, sdk28, is retired: it described the plain-split lane as the default
 payment path, which it no longer is):**
-The window is narrower than it was: `transfer_many` now filters its parent on
-`amount > total + reserve + min_output` and rejects any recipient below `min_output` before it
-touches a coin (`transfer.rs:344-368`), and `transfer_tokens`/`batch_transfer_tokens` re-check the
+The window is narrower than it was, and now applies only to `transfer_many`'s **plain (un-laddered)**
+route: it rejects any recipient below `min_output` before it touches a coin and admits a parent only
+if its route's real capacity covers the batch plus a viable change (`transfer.rs:392-476`) — while its
+in-ladder routes check every output against the larger `min_child_value` floor up-front, like
+`in_ladder_pay`. `transfer_tokens`/`batch_transfer_tokens` re-check the
 backup-fee floor on every piece and the change after the fit guard (`tokens.rs:558-578`,
 `tokens.rs:1091-1108`). What remains is the *ordering*: a parent that clears those guards but is
 still rejected by the lib's own dust check has already had its spend budget clamped to 1

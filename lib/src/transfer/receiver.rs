@@ -282,22 +282,24 @@ pub fn ladder_decrements_by_interval(prev_lock_time: u32, current_lock_time: u32
     prev_lock_time.checked_sub(current_lock_time) == Some(interval)
 }
 
-/// **[S2] V2 backup-chain validation.** A TES-R (V2) coin still conveys the V1 backups AND still feeds
-/// their COUNT into `verify_bundle`'s anti-theft equation (`v1_backups`), so they must be validated —
-/// otherwise a sender can (a) pad the vector with duplicate `tx1`s to inflate the count and absorb a
-/// hidden co-signed state, or (b) invert the ladder (receiver-paying backup at `L+interval`, own at `L`)
-/// so their stale backup matures FIRST.
+/// **[S2] Backup-chain validation for a LADDERED coin.** A laddered (TES-R) coin still conveys the
+/// signed-once backup chain AND still feeds its COUNT into `verify_bundle`'s anti-theft equation
+/// (`flat_backups`), so those backups must be validated — otherwise a sender can (a) pad the vector
+/// with duplicate `tx1`s to inflate the count and absorb a hidden co-signed state, or (b) invert the
+/// chain (receiver-paying backup at `L+interval`, own at `L`) so their stale backup matures FIRST.
 ///
 /// This is [`validate_signature_scheme`] **minus the `tx_n`-keyed `statechain_info` lookup and its
-/// `verify_blinded_musig_scheme`**, which cannot run on the V2 lane: the SE indexes `statechain_info`
-/// per CO-SIGN, and a V2 coin's ladder tiers consume co-sign slots, so a backup's `tx_n` no longer
-/// aligns with the SE's index and the lookup returns a *tier's* blinding info. Everything that defends
-/// the two attacks above is retained — critically `ladder_decrements_by_interval` (INV-5), which rejects
-/// duplicates (decrement 0 ≠ interval) and inversions (increasing ladder) alike.
+/// `verify_blinded_musig_scheme`**, which cannot run for a laddered coin: the SE indexes
+/// `statechain_info` per CO-SIGN, and a laddered coin's tiers consume co-sign slots, so a backup's
+/// `tx_n` no longer aligns with the SE's index and the lookup returns a *tier's* blinding info.
+/// Everything that defends the two attacks above is retained — critically
+/// `ladder_decrements_by_interval` (INV-5), which rejects duplicates (decrement 0 ≠ interval) and
+/// inversions (increasing locktimes) alike.
 ///
-/// RESIDUAL: the V1 backups' blinded-MuSig commitments are not verified on the V2 lane (the tiers are,
-/// via `verify_bundle`'s signature check). Closing it needs the SE's `tx_n` ↔ co-sign indexing to
-/// distinguish tier co-signs from backup co-signs — tracked in `docs/utexo/history/SPLIT-FINDINGS.md`.
+/// RESIDUAL: the backup chain's blinded-MuSig commitments are not verified for a laddered coin (the
+/// tiers are, via `verify_bundle`'s signature check). Closing it needs the SE's `tx_n` ↔ co-sign
+/// indexing to distinguish tier co-signs from backup co-signs — tracked in
+/// `docs/utexo/history/SPLIT-FINDINGS.md`.
 pub fn validate_backup_chain_v2(
     backup_transactions: &Vec<BackupTx>,
     tx0_hex: &str,

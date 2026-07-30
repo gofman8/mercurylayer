@@ -1,6 +1,6 @@
 //! E2E (SDK_E2E=46) — **R′ verifier validated against the REAL SE sig count** on the live stack.
 //!
-//! The R′ soundness linchpin is `se_num_sigs == v1_backups + <tier count>`. This test proves the
+//! The R′ soundness linchpin is `se_num_sigs == flat_backups + <tier count>`. This test proves the
 //! count formula matches what the actual SE reports (not just a unit-test mock): it measures the
 //! SE's `num_sigs` before and after establishing the ladder, asserts the SE increments by exactly
 //! the number of tier co-signs, then confirms `verify_bundle` ACCEPTS the true count and REJECTS a
@@ -35,9 +35,10 @@ pub async fn execute() -> Result<()> {
     let sid = coin.statechain_id.clone().ok_or(anyhow!("no statechain_id"))?;
     let owner_exit = bitcoin_core::getnewaddress()?;
 
-    // Measure the SE's finalized-signature count BEFORE establishing any tiers (V1 baseline).
+    // Measure the SE's finalized-signature count BEFORE establishing any tiers — this is the
+    // `flat_backups` term: the signed-once backup transactions the deposit already co-signed.
     let baseline = num_sigs(&cc, &sid).await?;
-    println!("SDK46 - SE num_sigs after deposit (V1 baseline): {baseline}");
+    println!("SDK46 - SE num_sigs after deposit (flat_backups baseline): {baseline}");
 
     // Establish the ladder at the schedule (T + extension + state = 3 SE co-signs).
     let bundle = mercuryrustlib::tesr::establish_auto(&cc, &mut coin, &owner_exit, NETWORK).await?;
@@ -48,7 +49,7 @@ pub async fn execute() -> Result<()> {
     println!("SDK46 - SE num_sigs after establishing {tier_count} tiers: {after}");
     assert_eq!(after, baseline + tier_count, "SE incremented by EXACTLY the tier count — the R′ count formula holds against the real SE");
 
-    // R′ verifier ACCEPTS the real ladder with the real count (v1_backups = the pre-tier baseline).
+    // R′ verifier ACCEPTS the real ladder with the real count (flat_backups = the pre-tier baseline).
     mercuryrustlib::tesr::verify_bundle(&bundle, after, baseline)
         .map_err(|e| anyhow!("verify_bundle rejected a valid ladder: {e}"))?;
     println!("SDK46 - ✓ verify_bundle ACCEPTS the real ladder at the true SE count {after}");

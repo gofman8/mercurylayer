@@ -109,9 +109,17 @@ pub struct TransferMsg {
     /// ancestor and invalidate the branch. Empty for ordinary on-chain coins.
     #[serde(default)]
     pub terminal_parents: Vec<String>,
-    /// TES-R (Utexo V2) protocol version of this transfer. `0`/absent = V1 (the flat backup-count
-    /// check). When `>= 2` the receiver verifies the conveyed exit ladder and its exact sig-count
-    /// instead. serde-default keeps the message wire-compatible with V1 wallets.
+    /// Conveyance format of this transfer, which tells the receiver WHICH validation to run:
+    /// - `0`/absent — an un-laddered coin: only the flat backup chain is conveyed, and the receiver
+    ///   runs the plain backup-count check (`num_sigs == backup_transactions.len()`).
+    /// - `>= 2` — a laddered coin: `tesr_ladder` is conveyed and the receiver verifies that exit
+    ///   ladder and its exact sig-count instead.
+    /// - `3` — an in-ladder split child (`child_tesr_bundle`) with NO key handover; adopted
+    ///   exit-only.
+    /// - `4` — an in-ladder split child WITH the key handover, which the receiver completes to make
+    ///   the child a first-class coin.
+    ///
+    /// serde-default keeps the message wire-compatible with wallets that predate the field.
     #[serde(default)]
     pub protocol_version: u32,
     /// JSON-serialized TES-R exit ladder (`mercuryrustlib::tesr::TesrBundle`) conveyed for R′
@@ -122,7 +130,7 @@ pub struct TransferMsg {
     /// when this transfer is a NON-EXACT payment funded by splitting a laddered coin (protocol_version
     /// `>= 3`). The receiver verifies it with `verify_child_bundle` (parent `F` on-chain, child `F` =
     /// the un-broadcast `SP.out[j]`, both sids terminal) instead of the plain ladder. serde-default keeps
-    /// the message wire-compatible with V1/V2 wallets.
+    /// the message wire-compatible with wallets that predate the field.
     #[serde(default)]
     pub child_tesr_bundle: Option<String>,
 }

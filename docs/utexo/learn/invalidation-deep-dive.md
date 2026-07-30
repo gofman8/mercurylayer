@@ -273,9 +273,10 @@ each tier output pays `A` plus the public tagged tweak; the conveyed extension's
 exactly `E0 − m·δE` and the new state's exactly `D0 − (k+1)·δ` against the SE's **publicly served
 counters**; and — the linchpin — **the SE's signature count equals the exact expected tree size**.
 Any hidden extra co-signed state or extension shows up as a count mismatch. For a multi-hop child
-the census generalizes to `se_num_sigs == v1_backups + Σ conveyed_tiers` — where `v1_backups` is the
-coin's signed-once backup count, the one signature every coin of either shape carries — summed across
-the ancestor chain rooted at the on-chain funding output. Each hop discloses exactly one superseded
+the census generalizes to `se_num_sigs == flat_backups + Σ conveyed_tiers` — where `flat_backups` is
+the count of signed-once backup transactions conveyed with the coin (the un-laddered shape's chain;
+a laddered root coin still carries exactly one, co-signed by its deposit at claim, so the term is
+never assumed zero) — summed across the ancestor chain rooted at the on-chain funding output. Each hop discloses exactly one superseded
 state, so an undisclosed rival cannot hide. Evidence: `sdk46` (the census against the
 *real* SE counter — it accepts the true count and rejects a hidden extra signature), `sdk47` (R′
 across a transfer), `sdk54` (adversarial `verify_bundle`), `sdk58` (11 adversarial in-ladder-split

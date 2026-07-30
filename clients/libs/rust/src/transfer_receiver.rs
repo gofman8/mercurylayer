@@ -263,13 +263,301 @@ pub struct PendingTransferInfo {
     pub funding_vout: u32,
     /// The un-broadcast exit branch (raw tx hex, root-first) the consignment resolves against.
     pub branch_txs: Vec<String>,
-    /// Pre-pay ladder census (LIGHTNING.md): `true` iff this coin is safe to accept-before-paying —
-    /// a V1 coin (no ladder) is trivially `true`; a V2 (TES-R) coin is `true` only if its conveyed
-    /// ladder passes `verify_bundle`'s `num_sigs == v1_backups + tiers` against the LIVE enclave
-    /// sig-count (so no hidden lower-CSV state is present). The SSP's pre-pay gate MUST refuse to pay
-    /// for any latched coin whose `ladder_census_ok` is `false`. Fails CLOSED (`false`) if the ladder
-    /// is missing/malformed or the enclave sig-count cannot be read.
+    /// Pre-pay ladder census (LIGHTNING.md): `true` iff this coin is safe to accept-before-paying.
+    ///
+    /// It is `true` ONLY when a binding actually ran and passed — there is no "trivially ok" shape any
+    /// more ([D1]). Two lanes:
+    ///   * a flat TES-R ladder (`protocol_version >= 2`) → `verify_bundle_bound`: the exact-equality
+    ///     census (`num_sigs == flat_backups + tiers`) against the LIVE enclave sig-count, so no hidden
+    ///     lower-CSV state is present, AND the [C-1] coin binding, so the ladder provably describes THIS
+    ///     coin (funding outpoint, on-chain value, on-chain aggregate key, coordinator-recorded
+    ///     aggregate for the sid) rather than merely being self-consistent, AND the Model-A owner-exit
+    ///     binding ([D2]) — the ladder must exit to the PROSPECTIVE OWNER's own seed-derived key, not a
+    ///     third party's;
+    ///   * an in-ladder-split CHILD bundle (`protocol_version >= 3`) → `verify_conveyed_child`, bound to
+    ///     the LATCHED statechain id, not yet adopted, over a live on-chain parent root ([D3]).
+    ///
+    /// The SSP's pre-pay gate MUST refuse to pay for any latched coin whose `ladder_census_ok` is
+    /// `false`. Fails CLOSED (`false`) on an unrecognised/absent `protocol_version`, a missing or
+    /// malformed ladder/child bundle, a funding UTXO that is off-chain/spent/unconfirmed, an
+    /// exit address that is not ours, or an unreadable enclave sig-count / coordinator aggregate.
     pub ladder_census_ok: bool,
+}
+
+/// [D1/R4] The MINIMUM `protocol_version` accepted on the flat lane — by the PRE-PAY census AND, since
+/// [R4], by the CLAIM path (`validate_encrypted_message`), which previously had no floor at all and so
+/// let a sub-floor declaration select the legacy count check instead of the bound verifier.
+/// `protocol_version`
+/// is a SENDER-DECLARED field of the transfer message: the wallet can decrypt the message, which proves
+/// it is addressed here, but proves NOTHING about the fields inside. Anything below this is a rejection
+/// — never a pass — because the [C-1] coin binding only exists on the `>= 2` shape, so a lower declared
+/// version is indistinguishable from "skip the binding". (The audit's C-14 recommends the same floor on
+/// the receive path.)
+pub(crate) const MIN_PREPAY_PROTOCOL_VERSION: u32 = 2;
+
+/// [D1/R4] The minimum `protocol_version` for a CHILD conveyance, enforced on BOTH the pre-pay census
+/// and (since [R4]) the claim path: 3 is the legacy exit-only in-ladder
+/// child, 4 adds the key handover. A `child_tesr_bundle` attached to a message declaring anything lower
+/// is a version/payload mismatch and is refused rather than censused.
+pub(crate) const MIN_PREPAY_CHILD_PROTOCOL_VERSION: u32 = 3;
+
+/// [D1/D2] PRE-PAY census of a FLAT (TES-R) laddered conveyance, for a party that is about to make an
+/// IRREVERSIBLE payment against it (the SSP) and has NOT claimed the coin.
+///
+/// Fail-closed BY CONSTRUCTION: every step returns `Err`, and the only caller maps `Err` to
+/// `ladder_census_ok = false`. There is deliberately no success path that skips a check.
+///
+/// `my_backup` is the PROSPECTIVE OWNER's seed-derived backup address (the payer's own), derived
+/// exactly as the claim path derives the receiver's.
+async fn prepay_flat_census(
+    client_config: &ClientConfig,
+    network: &str,
+    my_backup: &str,
+    transfer_msg: &mercurylib::transfer::TransferMsg,
+    funding_txid: &str,
+    funding_vout: u32,
+    onchain_tx0: Option<&String>,
+    groups: &[Vec<BackupTx>],
+    info_config: &InfoConfig,
+    blockheight: u32,
+) -> Result<()> {
+    // [D1] VERSION FLOOR. The previous shape ran the [C-1] binding only inside an
+    // `else if protocol_version >= 2` arm and let the final `else` report `ladder_census_ok = true`,
+    // so an attacker declaring `protocol_version = 0` skipped the binding entirely and still cleared
+    // the gate that authorises an irreversible Lightning leg.
+    if transfer_msg.protocol_version < MIN_PREPAY_PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "pre-pay census: conveyance declares protocol_version {} but this path accepts only >= {} — refusing (an unrecognised version must never bypass the [C-1] coin binding)",
+            transfer_msg.protocol_version,
+            MIN_PREPAY_PROTOCOL_VERSION
+        ));
+    }
+    if groups.len() != 1 {
+        return Err(anyhow!(
+            "pre-pay census: laddered conveyance carries {} funding group(s) — a ladder is rooted at exactly one funding UTXO",
+            groups.len()
+        ));
+    }
+    // [R1] An empty backup vector is a rejection, not a vacuous pass — see the sibling guard on the
+    // claim path. (`groups.len() == 1` already implies non-empty, but state it so the invariant does
+    // not depend on the grouping function's internals.)
+    let backup_group = &groups[0];
+    if backup_group.is_empty() {
+        return Err(anyhow!(
+            "pre-pay census: laddered conveyance carries no backup transactions — nothing to count, nothing to bind"
+        ));
+    }
+    // The funding tx must have been read FROM THE CHAIN. A branch-supplied (un-broadcast) funding tx is
+    // sender-controlled, so there would be no authority to bind the ladder to.
+    let tx0_hex = onchain_tx0.ok_or_else(|| {
+        anyhow!("pre-pay census: the coin's funding UTXO is not on-chain — nothing authoritative to bind the ladder to")
+    })?;
+    let ladder_json = transfer_msg
+        .tesr_ladder
+        .as_ref()
+        .ok_or_else(|| anyhow!("pre-pay census: laddered conveyance is missing its TES-R ladder"))?;
+    let bundle: crate::tesr::TesrBundle = serde_json::from_str(ladder_json)
+        .map_err(|e| anyhow!("pre-pay census: malformed TES-R ladder: {e}"))?;
+
+    // [D2] MODEL-A OWNER-EXIT BINDING. `verify_bundle_bound` binds the ladder to the COIN but is
+    // structurally incapable of checking WHO the ladder exits to — `owner_exit_address` is not derivable
+    // from the funding output or the coordinator record. So a sender can convey a ladder that is
+    // perfectly bound to a real, live, correctly-counted coin and still pays a THIRD PARTY on exit; the
+    // payer would hand over Lightning money for a coin whose only exit route enriches someone else.
+    // The claim path already refuses this (`bundle.owner_exit_address == my_backup`); the pre-pay path
+    // must refuse it too, with the PAYER as the prospective owner.
+    if bundle.owner_exit_address != my_backup {
+        return Err(anyhow!(
+            "pre-pay census: the conveyed ladder exits to {} but the prospective owner's key is {} — a coin-bound ladder that pays a third party",
+            bundle.owner_exit_address,
+            my_backup
+        ));
+    }
+
+    // The coordinator's record supplies the LIVE sig-count AND the authoritative per-sid aggregate.
+    let info = crate::utils::get_statechain_info(&transfer_msg.statechain_id, client_config)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "pre-pay census: the coordinator has no record for statechain id {} (fail-closed)",
+                transfer_msg.statechain_id
+            )
+        })?;
+
+    // A spent or unconfirmed `F` means the ladder is already dead (or not yet real) and must never gate
+    // an irreversible Lightning leg.
+    let tx0_outpoint = mercurylib::transfer::TxOutpoint {
+        txid: funding_txid.to_string(),
+        vout: funding_vout,
+    };
+    let (unspent, status) = verify_tx0_output_is_unspent_and_confirmed(
+        &client_config.electrum_client,
+        &tx0_outpoint,
+        tx0_hex,
+        network,
+        client_config.confirmation_target,
+    )
+    .await?;
+    if !unspent {
+        return Err(anyhow!(
+            "pre-pay census: funding output {funding_txid}:{funding_vout} is already spent — the conveyed ladder is dead"
+        ));
+    }
+    if status != CoinStatus::CONFIRMED {
+        return Err(anyhow!(
+            "pre-pay census: funding output {funding_txid}:{funding_vout} is not confirmed to the client's target"
+        ));
+    }
+
+    // [R1] EARN THE `flat_backups` NUMBER BEFORE SPENDING IT.
+    //
+    // The census `se_num_sigs == flat_backups + tiers + superseded` is the anti-theft linchpin: it is
+    // EXACT equality precisely so that a co-signed state the sender kept hidden has no slot to hide
+    // in. That only holds while every term is independently earned. The CLAIM path earns
+    // `flat_backups` by running `validate_backup_chain_v2` over the conveyed chain ([S2]); the
+    // pre-pay path used to hand the RAW `transfer_msg.backup_transactions.len()` straight into
+    // `verify_bundle_bound`.
+    //
+    // Because that length was unvalidated, an attacker could simply PAD the vector — duplicate `tx1`s
+    // (same prevout ⟹ still one group, so the funding-group and `.last()` checks are unchanged) or
+    // any other filler — inflating `expected` by one per padded entry, and park a live, co-signed
+    // rival state in the slack. Every remaining check passes and the SSP pays an IRREVERSIBLE
+    // Lightning invoice for a coin the sender can still take back with the lower-CSV state it kept.
+    // [D1]'s version floor closed the "declare protocol_version 0 and skip the binding" door; this is
+    // the door the census itself exists for.
+    //
+    // The fix reuses the CLAIM path's validator — deliberately the same function, not a second,
+    // weaker re-implementation — and then derives the count from the VALIDATED structure rather than
+    // from the message. `validate_backup_chain_v2` rejects an empty chain, verifies each backup's
+    // signature/sequence/locktime-sanity/reconstruction against the on-chain `tx0`, and enforces
+    // INV-5 (`ladder_decrements_by_interval`): consecutive locktimes must fall by EXACTLY `interval`.
+    // INV-5 is what makes padding structurally impossible — a duplicate decrements by 0, an inserted
+    // filler by something other than `interval` — and it also rejects an inverted ladder whose stale
+    // sender-paying backup would mature first.
+    let current_fee_rate_sats_per_byte = if info_config.fee_rate_sats_per_byte > client_config.max_fee_rate {
+        client_config.max_fee_rate
+    } else {
+        info_config.fee_rate_sats_per_byte
+    };
+    mercurylib::transfer::receiver::validate_backup_chain_v2(
+        backup_group,
+        tx0_hex,
+        blockheight,
+        client_config.fee_rate_tolerance,
+        current_fee_rate_sats_per_byte,
+        info_config.initlock,
+        info_config.interval,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "pre-pay census: the conveyed backup chain is not structurally valid, so its length cannot be counted into the census: {e}"
+        )
+    })?;
+
+    let authority = crate::tesr::coin_authority_from_tx0(
+        &transfer_msg.statechain_id,
+        funding_txid,
+        funding_vout,
+        tx0_hex,
+        info.aggregate_pubkey.clone(),
+    )?;
+    // `flat_backups` is now the length of the chain that JUST passed structural validation — the same
+    // number the claim path uses — not the sender-declared vector length.
+    crate::tesr::verify_bundle_bound(
+        &bundle,
+        info.num_sigs,
+        backup_group.len() as u32,
+        &authority,
+    )
+}
+
+/// [D1/D3] PRE-PAY census of an in-ladder-split CHILD conveyance. Same fail-closed-by-construction
+/// shape as [`prepay_flat_census`]; returns the child's census-bound exit value on success, which the
+/// caller may then use as the reported amount (a bundle-derived value may ONLY override a trusted one
+/// once the bundle has been bound to the coin the payer latched).
+async fn prepay_child_census(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    network: &str,
+    my_backup: &str,
+    transfer_msg: &mercurylib::transfer::TransferMsg,
+    cb_json: &str,
+) -> Result<u64> {
+    if transfer_msg.protocol_version < MIN_PREPAY_CHILD_PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "pre-pay census: a child bundle was conveyed under protocol_version {} but child conveyances are >= {} — refusing",
+            transfer_msg.protocol_version,
+            MIN_PREPAY_CHILD_PROTOCOL_VERSION
+        ));
+    }
+    let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
+        .map_err(|e| anyhow!("pre-pay census: malformed child TES-R bundle: {e}"))?;
+
+    // [D3] BIND THE CHILD LANE TO THE LATCHED COIN. `verify_conveyed_child` anchors the bundle to the
+    // parent's on-chain `F` and to the coordinator's aggregate for `cb.child_statechain_id` — but
+    // NOTHING tied that id to the id the payer latched the swap to. So an attacker could latch sid `X`
+    // and convey a fully-valid bundle for an unrelated sid `Y` it genuinely owns: every check inside
+    // `verify_conveyed_child` passes, the census reports `true`, and the reported amount is overridden
+    // by `Y`'s value — while the Lightning latch, and therefore the coin the payer actually acquires,
+    // is `X`. The sender-declared statechain id in the message IS the latched id (the coordinator keys
+    // the mailbox by it), so equality with the bundle's child id is the missing binding.
+    if cb.child_statechain_id != transfer_msg.statechain_id {
+        return Err(anyhow!(
+            "pre-pay census: the conveyed child bundle is for statechain id {} but the latched transfer is {} — the census (and the value it returns) would describe a different coin",
+            cb.child_statechain_id,
+            transfer_msg.statechain_id
+        ));
+    }
+
+    // [D3] ALREADY-ADOPTED. The claim path FAILS validation for a child this wallet has already adopted
+    // (`get_msg_addr` is non-destructive, so a claimed child's message keeps being re-served). Without
+    // the same check here a stale, already-owned child keeps re-appearing as a payable pending transfer,
+    // so a replayed latch could make the payer pay a second time for a coin it already holds.
+    if crate::tesr::load_child(client_config, wallet_name, &cb.child_statechain_id)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!(
+            "pre-pay census: split child {} is already adopted by this wallet — not a payable pending transfer",
+            cb.child_statechain_id
+        ));
+    }
+
+    // [D3] LIVENESS. `verify_conveyed_child` reads the parent's `F` only to recover its scriptPubKey and
+    // deliberately leaves unspent/confirmed to the caller. The flat lane checks exactly this; the child
+    // lane must too, or a payer can be handed a child whose entire exit chain hangs off a funding output
+    // that has already been spent out from under it.
+    let f_hex = get_tx0(&client_config.electrum_client, &cb.parent.f_txid).await?;
+    let f_outpoint = mercurylib::transfer::TxOutpoint {
+        txid: cb.parent.f_txid.clone(),
+        vout: cb.parent.f_vout,
+    };
+    let (unspent, status) = verify_tx0_output_is_unspent_and_confirmed(
+        &client_config.electrum_client,
+        &f_outpoint,
+        &f_hex,
+        network,
+        client_config.confirmation_target,
+    )
+    .await?;
+    if !unspent {
+        return Err(anyhow!(
+            "pre-pay census: the child's parent funding output {}:{} is already spent — the child's exit chain is dead",
+            cb.parent.f_txid,
+            cb.parent.f_vout
+        ));
+    }
+    if status != CoinStatus::CONFIRMED {
+        return Err(anyhow!(
+            "pre-pay census: the child's parent funding output {}:{} is not confirmed to the client's target",
+            cb.parent.f_txid,
+            cb.parent.f_vout
+        ));
+    }
+
+    // Model A for the child lane: `verify_conveyed_child` requires the final child state to pay
+    // `my_backup` — the prospective owner's own key ([D2] for this lane).
+    crate::tesr::verify_conveyed_child(client_config, my_backup, &cb).await
 }
 
 pub async fn peek_pending_transfers(
@@ -277,6 +565,17 @@ pub async fn peek_pending_transfers(
     wallet_name: &str,
 ) -> Result<Vec<PendingTransferInfo>> {
     let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+
+    // [R1] The pre-pay census now runs the CLAIM path's structural backup-chain validation before it
+    // trusts the chain's length, so it needs the same two inputs the claim path uses: the SE's
+    // lock/interval/fee-rate config and the current tip. Both are fetched ONCE here, and a failure to
+    // read either is fatal to the whole peek — a pre-pay gate that cannot validate must not report
+    // anything as payable (fail closed).
+    let info_config = utils::info_config(client_config).await?;
+    let blockheight = client_config
+        .electrum_client
+        .block_headers_subscribe_raw()?
+        .height as u32;
 
     // Map each auth pubkey to a private key that can decrypt messages addressed to it.
     let mut privkey_by_pubkey: HashMap<String, String> = HashMap::new();
@@ -306,9 +605,20 @@ pub async fn peek_pending_transfers(
                 continue;
             }
             // Amount from the funding tx0 (index-0 backup group), read on-chain or from the branch.
-            let groups = split_backup_transactions(&transfer_msg.backup_transactions);
+            // [R3] The grouping is fallible on attacker-controlled input; a malformed backup vector
+            // used to PANIC the process here. A message we cannot even parse is not a payable
+            // pending transfer, so drop it entirely rather than surfacing it with a false amount.
+            let groups = match split_backup_transactions(&transfer_msg.backup_transactions) {
+                std::result::Result::Ok(g) => g,
+                Err(_) => continue,
+            };
             let mut funding_txid = String::new();
             let mut funding_vout = 0u32;
+            // [C-1] The coin's funding transaction AS READ FROM THE CHAIN, kept only when the funding
+            // is genuinely on-chain (never a sender-supplied un-broadcast branch tx). This is the
+            // authority the conveyed ladder is bound to below — without it the pre-pay census would
+            // check a bundle against its own fields.
+            let mut onchain_tx0: Option<String> = None;
             let amount = if let Some(first_group) = groups.first() {
                 match mercurylib::transfer::receiver::get_tx0_outpoint(first_group) {
                     std::result::Result::Ok(tx0_outpoint) => {
@@ -322,6 +632,9 @@ pub async fn peek_pending_transfers(
                         .await
                         {
                             std::result::Result::Ok((tx0_hex, funding_from_branch)) => {
+                                if !funding_from_branch {
+                                    onchain_tx0 = Some(tx0_hex.clone());
+                                }
                                 // SECURITY (audit [3]): a branch-derived amount is
                                 // attacker-controlled — the blind SE co-signs ANY leaf output value,
                                 // so an un-broadcast sub-coin's funding tx can claim any amount. A
@@ -380,54 +693,76 @@ pub async fn peek_pending_transfers(
                 .find_map(|b| b.rgb_consignment.clone());
             // PRE-PAY CENSUS (LIGHTNING.md §2/§2b). A paying party (the SSP) must validate a conveyed
             // coin BEFORE the irreversible Lightning leg. Two shapes:
-            //   * a flat V2/TES-R ladder → `verify_bundle` (`num_sigs == v1_backups + tiers` vs the LIVE
-            //     enclave sig-count), catching a hidden lower-CSV state that would out-race the conveyed
-            //     S' after payment;
-            //   * an in-ladder-split CHILD bundle (non-exact PAY, protocol_version 3) →
-            //     `verify_conveyed_child` (child pays THIS wallet's key + parent/child census +
-            //     terminality). Its returned value is the trustworthy piece amount (value-binding fix),
-            //     so it OVERRIDES the branch-derived sats `amount` (a child has no on-chain funding to
-            //     read). The receiver runs the same census at claim time; this hoists it ahead of pay.
-            // V1 coins have no ladder → trivially ok. Fail CLOSED on any parse/read failure.
-            let (ladder_census_ok, child_amount) = if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
-                let backup = wallet
-                    .coins
-                    .iter()
-                    .find(|c| &c.auth_pubkey == auth_pubkey)
-                    .and_then(|c| {
-                        mercurylib::transaction::get_user_backup_address(c, wallet.network.clone()).ok()
-                    });
-                match (serde_json::from_str::<crate::tesr::ChildTesrBundle>(cb_json), backup) {
-                    (std::result::Result::Ok(cb), Some(bk)) => {
-                        match crate::tesr::verify_conveyed_child(client_config, &bk, &cb).await {
+            //   * a flat TES-R ladder (`protocol_version >= 2`) → `prepay_flat_census`:
+            //     `verify_bundle_bound` (`num_sigs == flat_backups + tiers` vs the LIVE enclave
+            //     sig-count, catching a hidden lower-CSV state that would out-race the conveyed S'
+            //     after payment, PLUS the [C-1] coin binding) and the [D2] Model-A owner-exit binding;
+            //   * an in-ladder-split CHILD bundle (non-exact PAY, `protocol_version >= 3`) →
+            //     `prepay_child_census`: bound to the latched sid, not already adopted, live parent
+            //     root, then `verify_conveyed_child` (child pays THIS wallet's key + parent/child
+            //     census + terminality). Only THEN is its returned value the trustworthy piece amount
+            //     (value-binding fix) that OVERRIDES the branch-derived sats `amount` (a child has no
+            //     on-chain funding to read). The receiver runs the same census at claim time; this
+            //     hoists it ahead of pay.
+            //
+            // [D1] FAIL CLOSED ON THE VERSION ITSELF. `protocol_version` is a SENDER-DECLARED field, so
+            // dispatching on it and letting the fall-through arm report `true` meant an attacker just
+            // declared `protocol_version = 0`: no binding ran, yet `ladder_census_ok` was reported TRUE
+            // on the exact path that authorises an irreversible Lightning payment. Every arm below now
+            // ends in a census that must SUCCEED; there is no "trivially ok" coin shape here.
+            //
+            // The prospective owner's own seed-derived backup address — this wallet is the payer, and
+            // the coin is addressed to `auth_pubkey`, so the coin slot holding that auth key carries the
+            // key the ladder must exit to ([D2]/[D3], the Model-A gate the claim path enforces). All
+            // coins sharing an auth pubkey are the same wallet slot and so share `user_pubkey`, which is
+            // the only input to this address — the claim path derives it identically. `None` (no such
+            // slot) is a rejection, not a bypass.
+            let my_backup = wallet
+                .coins
+                .iter()
+                .find(|c| &c.auth_pubkey == auth_pubkey)
+                .and_then(|c| {
+                    mercurylib::transaction::get_user_backup_address(c, wallet.network.clone()).ok()
+                });
+            let (ladder_census_ok, child_amount) =
+                match (&transfer_msg.child_tesr_bundle, my_backup.as_deref()) {
+                    // No derivable owner key ⟹ nothing to bind the exit to ⟹ refuse.
+                    (_, None) => (false, None),
+                    (Some(cb_json), Some(bk)) => {
+                        match prepay_child_census(
+                            client_config,
+                            wallet_name,
+                            &wallet.network,
+                            bk,
+                            &transfer_msg,
+                            cb_json,
+                        )
+                        .await
+                        {
+                            // The child value may override the branch-derived `amount` ONLY here, i.e.
+                            // only once the bundle has been bound to the latched sid and censused.
                             std::result::Result::Ok(v) => (true, Some(v)),
                             Err(_) => (false, None),
                         }
                     }
-                    _ => (false, None),
-                }
-            } else if transfer_msg.protocol_version >= 2 {
-                let ok = match transfer_msg.tesr_ladder.as_ref() {
-                    Some(ladder_json) => match serde_json::from_str::<crate::tesr::TesrBundle>(ladder_json) {
-                        std::result::Result::Ok(bundle) => {
-                            match crate::utils::get_statechain_info(&transfer_msg.statechain_id, client_config).await {
-                                std::result::Result::Ok(Some(info)) => crate::tesr::verify_bundle(
-                                    &bundle,
-                                    info.num_sigs,
-                                    transfer_msg.backup_transactions.len() as u32,
-                                )
-                                .is_ok(),
-                                _ => false,
-                            }
-                        }
-                        Err(_) => false,
-                    },
-                    None => false,
+                    (None, Some(bk)) => (
+                        prepay_flat_census(
+                            client_config,
+                            &wallet.network,
+                            bk,
+                            &transfer_msg,
+                            &funding_txid,
+                            funding_vout,
+                            onchain_tx0.as_ref(),
+                            &groups,
+                            &info_config,
+                            blockheight,
+                        )
+                        .await
+                        .is_ok(),
+                        None,
+                    ),
                 };
-                (ok, None)
-            } else {
-                (true, None)
-            };
             let amount = child_amount.unwrap_or(amount);
             out.push(PendingTransferInfo {
                 statechain_id: transfer_msg.statechain_id,
@@ -443,20 +778,32 @@ pub async fn peek_pending_transfers(
     Ok(out)
 }
 
-pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Vec<Vec<BackupTx>> {
+/// Group a conveyed backup vector by the outpoint each backup spends, preserving first-appearance
+/// order and sorting each group by `tx_n`.
+///
+/// [R3] FALLIBLE BY DESIGN. This used to `.expect("Valid outpoint")` on `get_previous_outpoint`,
+/// which returns `Err` for any tx that fails to deserialise, has more than one input, or has more
+/// than one non-OP_RETURN output (`lib/src/wallet/mod.rs`). Every input here is ATTACKER-CONTROLLED —
+/// it is the decrypted transfer message — and this function is reached from BOTH acceptance paths
+/// (`validate_encrypted_message` at claim time and `peek_pending_transfers` at pre-pay time), so a
+/// single crafted backup tx aborted the whole wallet process: a remote, unauthenticated DoS. The
+/// error is propagated instead, and both callers treat it as a rejection (fail closed).
+pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Result<Vec<Vec<BackupTx>>> {
     // HashMap to store grouped transactions
     let mut grouped_txs: HashMap<(String, u32), Vec<BackupTx>> = HashMap::new();
-    
+
     // Vector to keep track of order of appearance of outpoints
     let mut order_of_appearance: Vec<(String, u32)> = Vec::new();
     // HashSet to track which outpoints we've seen
     let mut seen_outpoints: HashSet<(String, u32)> = HashSet::new();
-    
+
     // Process each transaction
     for tx in backup_transactions {
         // Get the outpoint for this transaction
-        let outpoint = get_previous_outpoint(&tx).expect("Valid outpoint");
-        
+        let outpoint = get_previous_outpoint(&tx).map_err(|e| {
+            anyhow!("malformed backup transaction in the conveyed vector (cannot read its previous outpoint): {e}")
+        })?;
+
         // Create a key tuple from txid and vout
         let key = (outpoint.txid, outpoint.vout);
         
@@ -480,8 +827,8 @@ pub fn split_backup_transactions(backup_transactions: &Vec<BackupTx>) -> Vec<Vec
             result.push(transactions);
         }
     }
-    
-    result
+
+    std::result::Result::Ok(result)
 }
 
 /// Verify every structural ancestor node is TERMINAL at the SE (its spend budget is exhausted), so
@@ -587,11 +934,40 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
     // [in-ladder split] A split-child payment carries the child's exit bundle (and, from
     // `protocol_version >= 4`, the key-handover material) but NO backup ladder. Verify the bundle
     // against authoritative on-chain + SE values (verify_child_bundle: parent F on-chain, parent+child
-    // terminal, child pays THIS coin's key) and skip the V1/V2 backup-chain checks below (there are
+    // terminal, child pays THIS coin's key) and skip the backup-chain checks below (there are
     // none to validate).
     if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
+        // [R4] VERSION FLOOR ON THE CLAIM PATH'S CHILD LANE, mirroring `prepay_child_census`. A
+        // `child_tesr_bundle` attached to a message declaring a version below the child floor is a
+        // version/payload mismatch: the sender is asking to be processed by rules that predate the
+        // child lane while shipping child material. Refuse rather than guess.
+        if transfer_msg.protocol_version < MIN_PREPAY_CHILD_PROTOCOL_VERSION {
+            return Err(anyhow::anyhow!(
+                "a child bundle was conveyed under protocol_version {} but child conveyances are >= {} — refusing",
+                transfer_msg.protocol_version,
+                MIN_PREPAY_CHILD_PROTOCOL_VERSION
+            ));
+        }
         let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
             .map_err(|e| anyhow::anyhow!("malformed child TES-R bundle: {e}"))?;
+        // [R4] BIND THE BUNDLE TO THE CONVEYED SLOT, mirroring [D3] on the pre-pay path. The
+        // coordinator keys the mailbox by `transfer_msg.statechain_id`, so THAT is the slot this
+        // message conveys; `cb.child_statechain_id` is the slot the bundle describes and the slot
+        // `process_encrypted_message` then adopts, unlocks and completes the key handover on. Nothing
+        // forced them to be the same id. `verify_conveyed_child` is no help — it validates the bundle
+        // against `cb.child_statechain_id` throughout, so a bundle for an unrelated child the sender
+        // genuinely owns passes every check while the transfer, the unlock and the handover run
+        // against a different coin. (The `protocol_version >= 4` handover signature binds the
+        // recipient over the child's funding outpoint, which mitigates the v4 shape — but v3 carries
+        // no such signature at all, and a mitigation is not the binding.) The sender already enforces
+        // this equality in `convey_child_bundle`; the receiver must not take it on trust.
+        if cb.child_statechain_id != transfer_msg.statechain_id {
+            return Err(anyhow::anyhow!(
+                "the conveyed child bundle is for statechain id {} but the transfer message conveys {} — refusing (adoption would describe a different coin)",
+                cb.child_statechain_id,
+                transfer_msg.statechain_id
+            ));
+        }
         // Idempotency (mirrors the flat-transfer pattern where a re-received coin fails validation and
         // is skipped): if this child is already adopted, FAIL validation so the receive loop skips it
         // rather than booking a duplicate. get_msg_addr is non-destructive, so the message is re-served.
@@ -631,7 +1007,64 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
         return Ok(());
     }
 
-    let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions);
+    // ---------------------------------------------------------------------------------------------
+    // FLAT (laddered) LANE. Everything below this point lives inside the per-group loop, so it all
+    // depends on there being at least one group — and on the message declaring a version whose rules
+    // this function actually implements. Both are checked HERE, before the loop, because a check
+    // inside a loop that never runs is not a check.
+    // ---------------------------------------------------------------------------------------------
+
+    // [R2] AN EMPTY BACKUP VECTOR IS A REJECTION, NOT A VACUOUS PASS.
+    //
+    // With `backup_transactions` empty, `split_backup_transactions` yields ZERO groups, so the loop
+    // below never executes: the transfer-signature check, the tx0-output-pubkey check, the
+    // latest-backup-pays-to-me check, the ladder binding, the unspent/confirmed check and the
+    // backup-chain validation are ALL skipped, and this function returns `Ok(())` having verified
+    // literally nothing about the message. `process_encrypted_message` then runs its own loop, which
+    // is likewise empty — so a coin whose validation "passed" is booked with no evidence at all. Fail
+    // closed on the shape itself.
+    if transfer_msg.backup_transactions.is_empty() {
+        return Err(anyhow::anyhow!(
+            "transfer message carries no backup transactions — every structural check on this path is per-group, so an empty vector would be accepted without verifying anything; rejecting"
+        ));
+    }
+
+    // [R4] VERSION/PAYLOAD CONSISTENCY ON THE CLAIM PATH.
+    //
+    // `protocol_version` is SENDER-DECLARED, and it SELECTS THE RULES: at `>= 2` this path runs
+    // `verify_bundle_bound` (the [C-1] coin binding + the exact tier census + the Model-A owner-exit
+    // gate); below that it runs the legacy un-laddered rule. A sender must not be able to ship ladder
+    // material and simultaneously ask to be judged by the rules that predate it — that is a payload
+    // the declared version does not describe, and "which check runs" is exactly what an attacker
+    // wants to choose. Refuse the mismatch outright.
+    //
+    // WHY NOT AN UNCONDITIONAL FLOOR OF 2 HERE (unlike [D1] on the pre-pay path). A pre-pay refusal
+    // means "do not pay"; a claim-path refusal means "this coin can never be received". The
+    // un-laddered shape is still produced by this codebase (a raw `deposit` with no `claim()`
+    // ladder-establish pass, and — deliberately — any coin whose aggregate the coordinator does not
+    // record, which `wallet.rs` leaves un-laddered precisely so it stays transferable), so an
+    // unconditional floor BRICKS those coins rather than hardening anything. It is also not needed:
+    // the `< 2` arm is not a weaker census, it is the un-laddered census, and it is EXACT equality
+    // (`num_sigs == backup_transactions.len()`) over the enclave's live co-sign count. A laddered
+    // coin's tiers each consume a co-sign slot, so for any coin carrying even one tier
+    // `num_sigs > backup_transactions.len()` — permanently. Declaring version 0 to dodge the bound
+    // verifier therefore cannot succeed on a laddered coin: it fails the count check instead. Padding
+    // the backup vector to rebalance that count is defeated inside `validate_signature_scheme`, which
+    // this arm runs in full (INV-5's exact-`interval` decrement rejects duplicates, and
+    // `verify_blinded_musig_scheme` demands per-`tx_n` SE blinding data for every entry). The floor
+    // that WOULD be load-bearing — the one guarding the ladder binding — is enforced below by the
+    // `>= 2` arm itself, which requires the ladder to be present and bound.
+    if transfer_msg.protocol_version < MIN_PREPAY_PROTOCOL_VERSION
+        && transfer_msg.tesr_ladder.is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "transfer message declares protocol_version {} (below {}) yet carries a TES-R ladder — a payload the declared version does not describe; refusing rather than letting the sender choose which census runs",
+            transfer_msg.protocol_version,
+            MIN_PREPAY_PROTOCOL_VERSION
+        ));
+    }
+
+    let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions)?;
 
     for (index, backup_transactions) in grouped_backup_transactions.iter().enumerate() {
   
@@ -693,20 +1126,50 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
         }
 
         if transfer_msg.protocol_version >= 2 {
-            // TES-R (Utexo V2) coin: verify the conveyed exit ladder and its EXACT sig-count via the
-            // R′ verifier (crate::tesr::verify_bundle), which enforces
-            // `se_num_sigs == v1_backups + tier_count` (no hidden co-signed state) plus a valid exit
-            // chain — the V2 analogue of the flat V1 backup-count linchpin below.
+            // Laddered (TES-R) coin: verify the conveyed exit ladder and its EXACT sig-count via the
+            // R′ verifier, which enforces `se_num_sigs == flat_backups + tier_count` (no hidden
+            // co-signed state) plus a valid exit chain — the laddered analogue of the un-laddered
+            // backup-count linchpin below.
+            //
+            // [C-1] It is the BOUND verifier. `verify_bundle` alone checks the trigger against
+            // `bundle.f_txid`/`f_vout` and the tier payees against `bundle.agg_address` — all fields
+            // of the very bundle under test — so it proves internal consistency, not that the ladder
+            // describes THIS coin. A sender could convey a self-consistent decoy ladder over an
+            // attacker-controlled outpoint (owner_exit_address correctly set, tiers padded so the
+            // census balances), have it accepted, and then spend the coin with the REAL trigger it
+            // kept. The authority therefore comes from the coin: the funding outpoint validated on
+            // this path, its on-chain value and aggregate scriptPubKey, and the coordinator's
+            // recorded aggregate for the sid.
+            if index != 0 {
+                return Err(anyhow::anyhow!(
+                    "laddered transfer carries more than one funding group — a ladder is rooted at exactly one funding UTXO"
+                ));
+            }
+            if funding_from_branch {
+                // A laddered coin rests on a CONFIRMED on-chain funding UTXO; if the funding came from
+                // an un-broadcast branch tx there is no on-chain authority to bind the ladder to.
+                return Err(anyhow::anyhow!(
+                    "laddered transfer's funding UTXO is not on-chain — cannot bind the ladder to the coin"
+                ));
+            }
             let ladder = transfer_msg
                 .tesr_ladder
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("v2 transfer is missing its TES-R ladder"))?;
+                .ok_or_else(|| anyhow::anyhow!("laddered transfer is missing its TES-R ladder"))?;
             let bundle: crate::tesr::TesrBundle = serde_json::from_str(ladder)
                 .map_err(|e| anyhow::anyhow!("malformed TES-R ladder: {e}"))?;
-            crate::tesr::verify_bundle(
+            let coin_authority = crate::tesr::coin_authority_from_tx0(
+                &transfer_msg.statechain_id,
+                &tx0_outpoint.txid,
+                tx0_outpoint.vout,
+                &tx0_hex,
+                statechain_info.aggregate_pubkey.clone(),
+            )?;
+            crate::tesr::verify_bundle_bound(
                 &bundle,
                 statechain_info.num_sigs,
                 transfer_msg.backup_transactions.len() as u32,
+                &coin_authority,
             )?;
             // Model A fund-safety gate: the ladder's final state MUST exit to the RECEIVER's own
             // seed-derived key (P2TR of this coin's user_pubkey). Without this, a sender could set
@@ -715,10 +1178,14 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
                 .map_err(|_| anyhow::anyhow!("cannot derive the receiver's backup address"))?;
             if bundle.owner_exit_address != my_backup {
                 return Err(anyhow::anyhow!(
-                    "v2 transfer rejected: the conveyed ladder does not exit to the receiver's own key"
+                    "laddered transfer rejected: the conveyed ladder does not exit to the receiver's own key"
                 ));
             }
         } else if statechain_info.num_sigs != transfer_msg.backup_transactions.len() as u32 {
+            // [R4] The un-laddered census. EXACT equality against the enclave's live co-sign count is
+            // what makes this arm safe to reach at all: every tier a laddered coin carries consumes a
+            // co-sign slot, so a laddered coin can never satisfy it, and a sender cannot select this
+            // arm to dodge `verify_bundle_bound` above. See the version/payload note before the loop.
             return Err(anyhow::anyhow!("num_sigs is not correct".to_string()));
         }
 
@@ -736,18 +1203,20 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
             info_config.fee_rate_sats_per_byte
         };
 
-        // [S2] The conveyed V1 backups MUST be validated on BOTH lanes. This was previously gated to
-        // `protocol_version < 2` on the reasoning that "a V2 coin does not use that ladder" — which was
-        // WRONG: a V2 coin still conveys V1 backups AND still feeds their COUNT into verify_bundle's
-        // anti-theft equation above (`v1_backups = backup_transactions.len()`). Skipping this left that
-        // term attacker-supplied and structurally unvalidated, so a sender could (a) pad the vector with
+        // [S2] The conveyed flat backup chain (the signed-once backups every coin carries) MUST be
+        // validated for BOTH coin shapes. This was previously gated to `protocol_version < 2` on the
+        // reasoning that "a laddered coin does not use that chain" — which was WRONG: a laddered coin
+        // still conveys those backups AND still feeds their COUNT into verify_bundle's anti-theft
+        // equation above (`flat_backups = backup_transactions.len()`). Skipping this left that term
+        // attacker-supplied and structurally unvalidated, so a sender could (a) pad the vector with
         // duplicate tx1s — same prevout ⟹ one group, first-by-tx_n and .last() unchanged — to inflate
         // `expected` and absorb a hidden co-signed state, or (b) invert the ladder, building the
         // receiver-paying backup at L+interval while retaining their own at L, so their stale backup
         // matures FIRST. `ladder_decrements_by_interval` (INV-5) is the only defence against (b) and it
-        // lived solely in here. A strict V1→V2 regression; both lanes now run it.
+        // lived solely in here. The gate was a regression introduced when the laddered shape was added
+        // alongside the un-laddered one, which had always run this check; both shapes now run it.
         let previous_lock_time = if transfer_msg.protocol_version >= 2 {
-            // V2: the tiers consume SE co-sign slots, so a backup's `tx_n` no longer aligns with the
+            // Laddered: the tiers consume SE co-sign slots, so a backup's `tx_n` no longer aligns with the
             // SE's per-co-sign `statechain_info` index and the blinded-musig lookup would read a
             // TIER's blinding info. Run the structural chain validation, which keeps INV-5 — the
             // defence against both S2 attacks (duplicate padding and ladder inversion).
@@ -940,7 +1409,10 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
         return Ok(transfer_receive_result);
     }
 
-    let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions);
+    // [R3] Fallible: a malformed conveyed backup vector is an error, not a panic. It cannot normally
+    // reach here (`validate_encrypted_message` runs first and would have rejected it), so propagating
+    // simply aborts processing this message.
+    let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions)?;
 
     for (index, backup_transactions) in grouped_backup_transactions.iter().enumerate() {
 

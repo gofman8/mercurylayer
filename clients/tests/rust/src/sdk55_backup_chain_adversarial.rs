@@ -1,8 +1,8 @@
-//! E2E (SDK_E2E=55) — **ADVERSARIAL: the V2 lane's conveyed V1 backups cannot be padded or inverted [S2]**.
+//! E2E (SDK_E2E=55) — **ADVERSARIAL: a laddered coin's conveyed flat backups cannot be padded or inverted [S2]**.
 //!
-//! A V2 coin still conveys V1 backups AND still feeds their COUNT into `verify_bundle`'s anti-theft
-//! equation (`v1_backups = backup_transactions.len()`). V2DEF-1 had gated the structural check off for
-//! `protocol_version >= 2`, leaving that term attacker-supplied:
+//! A laddered coin still conveys the signed-once backup chain AND still feeds its COUNT into
+//! `verify_bundle`'s anti-theft equation (`flat_backups = backup_transactions.len()`). V2DEF-1 had
+//! gated the structural check off for `protocol_version >= 2`, leaving that term attacker-supplied:
 //!   (a) **padding** — duplicate `tx1` inflates `expected` to absorb a hidden co-signed state (same
 //!       prevout ⟹ one group; first-by-`tx_n` and `.last()` unchanged, so nothing else noticed);
 //!   (b) **inversion** — the sender builds the receiver-paying backup at `L+interval` and keeps their
@@ -30,7 +30,7 @@ pub async fn execute() -> Result<()> {
     env::set_var("ML_NETWORK", "regtest");
     let cc = mercuryrustlib::client_config::load().await;
 
-    // --- A real V2 coin, transferred once so the backup chain has TWO real hops (tx1 → tx2). --------
+    // --- A real laddered coin, transferred once so the backup chain has TWO real hops (tx1 → tx2). --
     let mut alice = deposit_coin(&cc, "sdk55_alice").await?;
     let sid = alice.statechain_id.clone().ok_or(anyhow!("no statechain_id"))?;
     let f_txid = alice.utxo_txid.clone().ok_or(anyhow!("no F txid"))?;
@@ -49,9 +49,9 @@ pub async fn execute() -> Result<()> {
     if backups.len() < 2 {
         return Err(anyhow!("expected a >=2-hop backup chain, got {}", backups.len()));
     }
-    println!("SDK55 - bob holds a real {}-hop V2-conveyed backup chain", backups.len());
+    println!("SDK55 - bob holds a real {}-hop conveyed backup chain", backups.len());
 
-    // --- The exact parameters the V2 receiver validates with. --------------------------------------
+    // --- The exact parameters the receiver validates a laddered conveyance with. --------------------
     let info = mercuryrustlib::utils::info_config(&cc).await?;
     let tip = cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
     let tx0 = cc.electrum_client.transaction_get(&f_txid.parse()?)?;
@@ -65,13 +65,13 @@ pub async fn execute() -> Result<()> {
     check(&backups).map_err(|e| anyhow!("the honest backup chain must validate, got: {e}"))?;
     println!("SDK55 - control: the honest backup chain validates");
 
-    // --- ATTACK A (padding): duplicate a REAL backup to inflate v1_backups by one. ------------------
+    // --- ATTACK A (padding): duplicate a REAL backup to inflate flat_backups by one. ------------------
     // Absorbs one hidden co-signed state in verify_bundle's count. Every tx is validly signed, so only
     // INV-5 can catch it: the duplicate decrements by 0, not `interval`.
     let mut padded = backups.clone();
     padded.insert(1, backups[0].clone());
     match check(&padded) {
-        Ok(_) => return Err(anyhow!("SECURITY: duplicate-padded backup vector was ACCEPTED — v1_backups is still inflatable")),
+        Ok(_) => return Err(anyhow!("SECURITY: duplicate-padded backup vector was ACCEPTED — flat_backups is still inflatable")),
         Err(e) => println!("SDK55 - ATTACK A (duplicate padding, all sigs valid) correctly REJECTED: {e}"),
     }
 
@@ -87,6 +87,6 @@ pub async fn execute() -> Result<()> {
     // --- The honest chain still validates after all that. -------------------------------------------
     check(&backups).map_err(|e| anyhow!("the honest chain must still validate, got: {e}"))?;
 
-    println!("SDK55 - ✓ PASS: the V2 lane's v1_backups term is unforgeable — duplicate padding and ladder inversion are REJECTED by INV-5; honest chains validate");
+    println!("SDK55 - ✓ PASS: a laddered coin's flat_backups term is unforgeable — duplicate padding and ladder inversion are REJECTED by INV-5; honest chains validate");
     Ok(())
 }

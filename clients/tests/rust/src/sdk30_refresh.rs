@@ -1,4 +1,4 @@
-//! E2E (refresh / re-anchor): move a V2 (TES-R) coin to a FRESH on-chain aggregate with ONE tx.
+//! E2E (refresh / re-anchor): move a laddered (TES-R) coin to a FRESH on-chain aggregate with ONE tx.
 //!
 //! Under TES-R a coin's exit is a chain of RELATIVE-timelock (CSV) tiers hanging off an
 //! **un-broadcast** trigger, so an idle coin never ages: nothing is on-chain, nothing decays with
@@ -15,16 +15,17 @@
 //!     the balance is untouched. Then `refresh` re-anchors it: the old outpoint is spent (old coin
 //!     WITHDRAWN, all prior exit rights dead), a NEW statechain id is minted with its OWN fresh
 //!     ladder, and the new amount is 50k − fee (fee = 112 sats at 1 sat/vB).
-//! (b) STILL SPENDABLE: alice transfers the whole re-anchored coin to bob (exact amount ⇒ the V2
+//! (b) STILL SPENDABLE: alice transfers the whole re-anchored coin to bob (exact amount ⇒ the
 //!     whole-coin `S'` handover, no split) and bob claims it (balances 0 / new_amount).
 //! (c) OPERATOR PAYS (off-chain rebate): a fresh laddered coin is re-anchored via
 //!     `refresh_sponsored`, where a funded operator wallet reimburses the fee OFF-CHAIN. The user's
 //!     TOTAL balance is preserved (re-anchored `amount − fee` + a `fee` rebate = the original); the
 //!     operator bore the on-chain cost. The blind SE holds no funds, so "operator pays" is realized
-//!     as this rebate. On V2 the operator's rebate is a non-exact spend of a laddered coin, so it is
+//!     as this rebate. The operator's rebate is a non-exact spend of a laddered coin, so it is
 //!     routed through the IN-LADDER split (`in_ladder_pay`): the piece is conveyed to the user and
 //!     the operator keeps the tier-fee-reduced change. Its size is the SMALLEST off-chain-payable
-//!     in-ladder child (`min_child_value` = 1306 sat at 2 sat/vB), not the old V1 `fee + dust` 442.
+//!     in-ladder child (`min_child_value` = 1306 sat at 2 sat/vB), not the backup-chain `fee + dust`
+//!     442 that bounds an un-laddered piece.
 //!
 //! Run: SDK_E2E=30 ML_NETWORK=regtest cargo run
 
@@ -85,7 +86,7 @@ async fn coin_by_id(
         .ok_or_else(|| anyhow!("{wallet_name} has no coin with statechain id {id}"))
 }
 
-/// Poll `claim()` until the coin's TES-R ladder is persisted — a V2 deposit auto-establishes it
+/// Poll `claim()` until the coin's TES-R ladder is persisted — a deposit auto-establishes it
 /// during the same claim pass that confirms the coin, so this normally returns on the first look.
 async fn wait_ladder(
     cc: &ClientConfig,
@@ -113,7 +114,7 @@ fn tip(cc: &ClientConfig) -> Result<u32> {
 }
 
 pub async fn execute() -> Result<()> {
-    // Runs on the V2 (TES-R) default: every deposit auto-establishes a relative-timelock exit ladder
+    // Runs on TES-R: every deposit auto-establishes a relative-timelock exit ladder
     // at claim(), so `refresh` here re-anchors a LADDERED root coin — the coin's whole exit chain is
     // discarded with its old funding outpoint and rebuilt over the fresh one.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
@@ -148,11 +149,12 @@ pub async fn execute() -> Result<()> {
     );
     assert!(
         !is_outpoint_spent(&cc, &f_txid, f_vout),
-        "a resting V2 coin publishes NOTHING — its funding outpoint F must be unspent"
+        "a resting laddered coin publishes NOTHING — its funding outpoint F must be unspent"
     );
 
-    // Time passes: mine 300 blocks. Under V1 this ate 300 blocks of the coin's absolute-locktime
-    // headroom; under TES-R the tiers are RELATIVE (CSV) and un-broadcast, so the coin does not age.
+    // Time passes: mine 300 blocks. Under the pre-TES-R design this ate 300 blocks of the coin's
+    // absolute-locktime headroom; under TES-R the tiers are RELATIVE (CSV) and un-broadcast, so the
+    // coin does not age.
     bitcoin_core::generatetoaddress(300, &core)?;
     // The electrum index can lag bitcoind by a moment; wait for it to see the new tip.
     let mut tip_aged = tip(&cc)?;
@@ -214,8 +216,8 @@ pub async fn execute() -> Result<()> {
     }
     let new_coin = new_coin.ok_or_else(|| anyhow!("refreshed coin did not confirm"))?;
 
-    // The re-anchored coin is a full-fledged V2 coin: claim() established its OWN fresh ladder over
-    // the NEW funding outpoint. (There is no "headroom" to restore under TES-R — the old chain is
+    // The re-anchored coin is a full-fledged laddered coin: claim() established its OWN fresh
+    // ladder over the NEW funding outpoint. (There is no "headroom" to restore under TES-R — the old chain is
     // simply gone with the old outpoint, and this one starts from scratch.)
     let bundle_new = wait_ladder(&cc, &alice, "sdk30_alice", &res.new_statechain_id).await?;
     assert_ne!(
@@ -234,8 +236,8 @@ pub async fn execute() -> Result<()> {
     );
 
     // The old coin is spent on-chain (WITHDRAWN); the refresh tx is confirmed and spends coin0's
-    // funding outpoint — every exit right rooted at the old F (its trigger/tiers AND its V1 backup)
-    // is now a double-spend of a spent input (dead).
+    // funding outpoint — every exit right rooted at the old F (its trigger/tiers AND its
+    // absolute-locktime backup tx) is now a double-spend of a spent input (dead).
     let old = coin_by_id(&cc, "sdk30_alice", &id0).await?;
     assert_eq!(old.status, CoinStatus::WITHDRAWN, "the old coin is spent on-chain");
     let rtxid = res.refresh_txid.parse::<electrum_client::bitcoin::Txid>()?;
@@ -264,7 +266,7 @@ pub async fn execute() -> Result<()> {
     let new_amount = res.new_amount_sats;
     let r = alice.transfer(&bob_addr, new_amount).await?;
     assert_eq!(r.total_sats, new_amount, "the whole refreshed coin transfers");
-    assert!(!r.used_split, "an exact whole-coin amount uses the V2 S' handover, not a split");
+    assert!(!r.used_split, "an exact whole-coin amount uses the S' handover, not a split");
     let mut claimed = 0u32;
     for _ in 0..60 {
         claimed += bob.claim().await?.claimed_transfers;
@@ -283,7 +285,8 @@ pub async fn execute() -> Result<()> {
     let (operator, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk30_operator"), None).await?;
     let c0 = deposit_confirmed_coin(&cc, &carol, "sdk30_carol", 40_000).await?;
     let cid = c0.statechain_id.clone().ok_or_else(|| anyhow!("carol deposit has no id"))?;
-    // carol's coin must be LADDERED — this is the case that matters: re-anchoring a live V2 root.
+    // carol's coin must be LADDERED — this is the case that matters: re-anchoring a live laddered
+    // root coin.
     let _ = wait_ladder(&cc, &carol, "sdk30_carol", &cid).await?;
     // Fund the operator so it can rebate off-chain.
     let op_coin = deposit_confirmed_coin(&cc, &operator, "sdk30_operator", 10_000).await?;
@@ -294,16 +297,17 @@ pub async fn execute() -> Result<()> {
     assert_eq!(sp.fee_sats, 112);
     assert_eq!(sp.new_amount_sats, 40_000 - 112);
     // The sub-dust 112-sat fee can't be rebated exactly off-chain. TWO floors bound the smallest
-    // payable rebate and the LARGER binds: the V1-era backup floor (dust 330 + backup fee 112 = 442)
-    // and, because the operator's coin is LADDERED, `min_child_value` — the rebate is paid by an
-    // in-ladder split whose child funds its own extension + state tier (each committed_fee + P2A)
-    // before clearing dust: 2*(248+240)+330 = 1306 at the default 2 sat/vB. Sizing the rebate at the
-    // old 442 made `refresh_sponsored` fail outright with FeeTooHigh on V2.
+    // payable rebate and the LARGER binds: the backup-chain floor of an un-laddered piece
+    // (dust 330 + backup fee 112 = 442) and, because the operator's coin is LADDERED,
+    // `min_child_value` — the rebate is paid by an in-ladder split whose child funds its own
+    // extension + state tier (each committed_fee + P2A) before clearing dust: 2*(248+240)+330 = 1306
+    // at the default 2 sat/vB. Sizing the rebate at 442 made `refresh_sponsored` fail outright with
+    // FeeTooHigh once the operator's coin is laddered.
     let min_payable = mercurylib::tesr::min_child_value(
         mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate,
         330,
     );
-    assert_eq!(min_payable, 1_306, "the V2 minimum payable child at 2 sat/vB");
+    assert_eq!(min_payable, 1_306, "the minimum payable in-ladder child at 2 sat/vB");
     assert_eq!(
         sp.rebate_sats, min_payable,
         "operator rebates the smallest OFF-CHAIN-PAYABLE amount ≥ fee (the in-ladder child floor)"
@@ -327,7 +331,7 @@ pub async fn execute() -> Result<()> {
     let carol_total = carol.get_balance().await?.available_sats;
     assert_eq!(carol_total, expected_total, "refreshed + rebate");
     assert!(carol_total >= 40_000, "operator-paid refresh leaves the user at least whole");
-    // The operator bore the on-chain cost. On V2 the rebate is a NON-EXACT spend of the
+    // The operator bore the on-chain cost. The rebate is a NON-EXACT spend of the
     // operator's laddered 10_000 coin, so it goes through the in-ladder split: `SP` spends
     // `X_m.out[0]` and pays the rebate piece to carol plus the change back to the operator, so the
     // operator keeps exactly `tier_out_total(X_m.out[0], 2) − rebate` — the rebate AND the split tier's
@@ -363,7 +367,7 @@ pub async fn execute() -> Result<()> {
     );
 
     println!(
-        "SDK30 - SUCCESS: on TES-R (V2) an IDLE coin never ages — 300 blocks left its un-broadcast exit chain byte-identical, its funding outpoint unspent (0 vB rent) and its 50000 sat spendable. `refresh` is the RE-ANCHOR primitive: ONE on-chain tx spends the old outpoint (WITHDRAWN → every exit right rooted at the old F is permanently dead) and mints a new statechain id carrying a brand-new ladder over the re-anchor tx, which stays an ordinary spendable coin (50000 → {}, handed whole to bob). TWO fee models proven: (1) USER PAYS — the fee comes from the coin; (2) OPERATOR PAYS — a funded sponsor rebates the fee off-chain through an in-ladder split piece sized to the smallest payable in-ladder child so the user ends ≥ whole (40000 → {carol_total}); the operator bore the cost. The blind SE never touches funds in either.",
+        "SDK30 - SUCCESS: on TES-R an IDLE coin never ages — 300 blocks left its un-broadcast exit chain byte-identical, its funding outpoint unspent (0 vB rent) and its 50000 sat spendable. `refresh` is the RE-ANCHOR primitive: ONE on-chain tx spends the old outpoint (WITHDRAWN → every exit right rooted at the old F is permanently dead) and mints a new statechain id carrying a brand-new ladder over the re-anchor tx, which stays an ordinary spendable coin (50000 → {}, handed whole to bob). TWO fee models proven: (1) USER PAYS — the fee comes from the coin; (2) OPERATOR PAYS — a funded sponsor rebates the fee off-chain through an in-ladder split piece sized to the smallest payable in-ladder child so the user ends ≥ whole (40000 → {carol_total}); the operator bore the cost. The blind SE never touches funds in either.",
         res.new_amount_sats
     );
     Ok(())

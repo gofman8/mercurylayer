@@ -1,6 +1,6 @@
 //! E2E (SDK_E2E=58) — **in-ladder split: verify_child_bundle ACCEPTS a real split child**.
 //!
-//! Proves the B1 fix end-to-end with NO SGX (Stage-3-necessity ruling wqvoxvusg). A parent V2 coin is
+//! Proves the B1 fix end-to-end with NO SGX (Stage-3-necessity ruling wqvoxvusg). A laddered parent coin is
 //! split IN-LADDER: SP is a STATE tier spending X_m.out[0] (a DESCENDANT of the trigger, not a rival for
 //! F), paying one child statechain coin; the parent is terminalized and its old owner state S_0 disclosed
 //! as superseded (out-raced by SP). The child's two-aggregate exit bundle (ancestors under A_parent, child
@@ -37,7 +37,7 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let wallet = "sdk58_alice";
 
-    // --- Parent: deposit + establish (canonical schedule). Capture the V1 baseline count. -----------
+    // --- Parent: deposit + establish (canonical schedule). Capture the pre-ladder baseline count. ---
     let mut parent = deposit_coin(&cc, wallet).await?;
     let parent_sid = parent.statechain_id.clone().ok_or(anyhow!("no parent sid"))?;
     let parent_baseline = num_sigs(&cc, &parent_sid).await?;
@@ -92,10 +92,23 @@ pub async fn execute() -> Result<()> {
     println!("SDK58 - control: valid split child ACCEPTED (parent terminal; child non-terminal by design).");
 
     // ---- ADVERSARIAL: every tampering of the authoritative inputs must REJECT. ---------------------
-    let ok = |r: Result<()>, attack: &str| -> Result<()> {
+    // EVERY attack below pins the NAMED error it targets. A bare "rejected for some reason" helper was
+    // removed on purpose (the D6 strictness discipline): a security test that passes on an unrelated
+    // parse, address or network error reports a safety it never observed, so a rejection carrying any
+    // other message is a FAILURE here, not a pass.
+    let ok_named = |r: Result<()>, attack: &str, expect: &str| -> Result<()> {
         match r {
             Ok(()) => Err(anyhow!("SECURITY: {attack} was ACCEPTED")),
-            Err(e) => { println!("SDK58 - {attack} correctly REJECTED: {e}"); Ok(()) }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains(expect) {
+                    return Err(anyhow!(
+                        "{attack} was rejected for the WRONG reason — expected an error containing {expect:?}, got: {msg}"
+                    ));
+                }
+                println!("SDK58 - {attack} correctly REJECTED: {msg}");
+                Ok(())
+            }
         }
     };
     // A VALID but wrong x-only (a decoy aggregate — exercises the != check, not a parse failure) + a
@@ -112,47 +125,133 @@ pub async fn execute() -> Result<()> {
     };
     let (pa, ca) = (parent_agg.as_deref(), child_agg.as_deref());
 
-    ok(vcb(None, parent_terminal, parent_num_sigs, ca, child_num_sigs, &receiver), "A (parent aggregate NULL — fail-closed)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, None, child_num_sigs, &receiver), "B (child aggregate NULL — fail-closed)")?;
-    ok(vcb(Some(decoy_xonly), parent_terminal, parent_num_sigs, ca, child_num_sigs, &receiver), "C (decoy parent aggregate != A_parent)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, Some(decoy_xonly), child_num_sigs, &receiver), "D (decoy child aggregate != SP.out[j])")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs + 1, ca, child_num_sigs, &receiver), "E (hidden parent state: parent num_sigs one higher)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_num_sigs + 1, &receiver), "F (hidden child state: child num_sigs one higher)")?;
-    ok(vcb(pa, parent_terminal, parent_num_sigs, ca, child_num_sigs, &other_recv), "G (Model A violated: child state pays not-the-receiver)")?;
-    ok(vcb(pa, false, parent_num_sigs, ca, child_num_sigs, &receiver), "H (parent NOT terminal — a rival trigger over F could still be co-signed)")?;
+    // Each expectation names the guard under test:
+    //   A/B  → the fail-closed `ok_or` on a NULL server aggregate ([2] / [5]),
+    //   C/D  → the decoy-sid aggregate comparison ([2] / [5]),
+    //   E/F  → the two EXACT-equality censuses (parent segment vs child leaf) — note E must surface the
+    //          PARENT census through the `parent segment/census invalid:` wrapper, so that a child-side
+    //          mismatch can never be mistaken for parent-side coverage,
+    //   G    → the Model-A receiver-key binding,
+    //   H    → the parent-terminality fail-closed gate.
+    ok_named(vcb(None, parent_terminal, parent_num_sigs, ca, child_num_sigs, &receiver),
+        "A (parent aggregate NULL — fail-closed)", "server recorded no aggregate for parent sid")?;
+    ok_named(vcb(pa, parent_terminal, parent_num_sigs, None, child_num_sigs, &receiver),
+        "B (child aggregate NULL — fail-closed)", "server recorded no aggregate for child sid")?;
+    ok_named(vcb(Some(decoy_xonly), parent_terminal, parent_num_sigs, ca, child_num_sigs, &receiver),
+        "C (decoy parent aggregate != A_parent)", "parent sid's server aggregate != A_parent")?;
+    ok_named(vcb(pa, parent_terminal, parent_num_sigs, Some(decoy_xonly), child_num_sigs, &receiver),
+        "D (decoy child aggregate != SP.out[j])", "child sid's server aggregate != SP.out[j] key")?;
+    ok_named(vcb(pa, parent_terminal, parent_num_sigs + 1, ca, child_num_sigs, &receiver),
+        "E (hidden parent state: parent num_sigs one higher)", "parent segment/census invalid: num_sigs mismatch")?;
+    ok_named(vcb(pa, parent_terminal, parent_num_sigs, ca, child_num_sigs + 1, &receiver),
+        "F (hidden child state: child num_sigs one higher)", "child num_sigs mismatch")?;
+    ok_named(vcb(pa, parent_terminal, parent_num_sigs, ca, child_num_sigs, &other_recv),
+        "G (Model A violated: child state pays not-the-receiver)", "Model A violated")?;
+    ok_named(vcb(pa, false, parent_num_sigs, ca, child_num_sigs, &receiver),
+        "H (parent NOT terminal — a rival trigger over F could still be co-signed)", "parent sid is NOT terminal")?;
     // I is REPLACED, not dropped. The old I asserted a synthetic `child_terminal = false` flag, which no
     // longer exists: a child is deliberately non-terminal so it can be re-transferred, and its safety
     // now rests on the CHILD SUPERSEDED CENSUS. These two attacks exercise that census directly and are
     // strictly stronger than the flag was — they forge the actual objects the census counts.
     //
-    // I' (RIVAL RACE): disclose a child superseded state whose CSV is <= the LIVE child state's over the
-    // same outpoint. A superseded tier is only safe to count because it LOSES the maturity race; one
-    // that ties or wins could confirm first and pay the attacker.
+    // I' (RIVAL RACE): a child superseded state whose CSV ties the LIVE child state's over the same
+    // outpoint. A superseded tier is only safe to count because it LOSES the maturity race; one that
+    // ties or wins could confirm first and pay the attacker.
+    //
+    // It must be a GENUINE rival, not a re-labelled copy of the live state. Cloning `child_state` and
+    // editing only its declared `csv` field produces a tier whose txid is already a live txid, so the
+    // [C-2] one-co-sign-one-slot dedup refuses it before the race check runs — and the declared-vs-tx
+    // CSV check would refuse it even without that. Either way the maturity race, the property this
+    // attack is named for, would never execute. So build what a real attacker builds: the SE is BLIND
+    // and the child slot is deliberately non-terminal, so it will co-sign a SECOND child state over
+    // `ext_child`'s payload output, paying the attacker, at the live state's own CSV. Distinct txid
+    // (dedup blind), genuinely co-signed (the [S1] battery blind), CSV declared == tx CSV and inside
+    // the schedule bounds, and the count passed MAKES the census balance. Only the per-outpoint
+    // maturity race can reject it.
     {
+        let live_csv = cb.child_state.csv.ok_or(anyhow!("live child state has no CSV"))?;
+        let t = mercurylib::tesr::build_state_from(
+            &cb.child_extension.txid,
+            cb.child_extension.payload_vout,
+            cb.child_extension.out_value,
+            &other_recv, // the attacker's own key
+            NETWORK,
+            live_csv, // TIES the live state ⟹ does NOT lose the race
+            bundle.fee_rate,
+        )?;
+        let signed = mercuryrustlib::tesr::cosign_tier(
+            &cc,
+            &mut children[0].0,
+            t.tx_hex.clone(),
+            cb.child_extension.out_value,
+            NETWORK,
+        )
+        .await?;
+        let child_num_sigs_after = num_sigs(&cc, &child_sid).await?;
+        assert_eq!(
+            child_num_sigs_after,
+            child_num_sigs + 1,
+            "the SE really co-signed the rival child state — this is a genuine co-sign, not a forgery"
+        );
         let mut rival = cb.clone();
-        let live = rival.child_state.clone();
-        let mut sup = live.clone();
-        sup.csv = live.csv.map(|c| c.saturating_sub(1)); // strictly LOWER CSV ⟹ matures FIRST
-        rival.child_superseded_states.push(sup);
+        rival.child_superseded_states.push(mercuryrustlib::tesr::TesrTier {
+            txid: t.txid,
+            signed_tx: signed,
+            out_value: t.out_value,
+            csv: Some(live_csv),
+            payload_vout: t.payload_vout,
+        });
         let r = mercuryrustlib::tesr::verify_child_bundle(
             &rival, &f_spk_hex,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
-            child_num_sigs + 1, child_baseline, child_agg.as_deref(),
+            child_num_sigs_after, child_baseline, child_agg.as_deref(),
             &[],
             &receiver,
         );
-        ok(r, "I' (child superseded state at a CSV <= the live state's — could out-race the owner)")?;
+        ok_named(
+            r,
+            "I' (a GENUINELY co-signed rival child state tying the live state's CSV)",
+            "could out-race the owner",
+        )?;
+
+        // I''' (the same rival, UNDISCLOSED): the co-sign really happened, so the child's exact-equality
+        // census must now refuse the untouched bundle at the SE's true count. This is the census doing
+        // the job the race check cannot.
+        let r = mercuryrustlib::tesr::verify_child_bundle(
+            &cb, &f_spk_hex,
+            parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
+            child_num_sigs_after, child_baseline, child_agg.as_deref(),
+            &[],
+            &receiver,
+        );
+        ok_named(
+            r,
+            "I''' (the rival hidden rather than disclosed — exact-equality census)",
+            "possible hidden child state",
+        )?;
     }
     // I'' (COUNT PADDING, the [S1] class — reachable on the child segment for the first time): pad the
     // child's superseded list with a structurally plausible entry that was never co-signed by A_child,
     // to make the census balance an inflated num_sigs. Only a valid signature proves a tier consumed a
     // co-sign, so this MUST reject.
+    //
+    // Built by re-deriving a real tier: take the live child state, move one satoshi inside its payload
+    // output and recompute its txid. It is still a well-formed, ladder-linked tier with a DISTINCT txid
+    // (so the [C-2] dedup does not fire and the txid-binding check passes) — but the co-signature no
+    // longer covers it, which is the only thing that proves a tier consumed a co-sign.
     {
+        use electrum_client::bitcoin::{consensus::{deserialize, serialize}, Transaction};
         let mut padded = cb.clone();
-        let mut junk = padded.child_state.clone();
-        junk.csv = junk.csv.map(|c| c.saturating_add(1)); // would lose the race — but is not co-signed
-        junk.txid = "0".repeat(64);
-        padded.child_superseded_states.push(junk);
+        let src = cb.child_state.clone();
+        let mut tx: Transaction = deserialize(&hex::decode(&src.signed_tx)?)?;
+        tx.output[src.payload_vout as usize].value -= 1; // invalidates the signature; tier stays well-formed
+        padded.child_superseded_states.push(mercuryrustlib::tesr::TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: hex::encode(serialize(&tx)),
+            out_value: src.out_value,
+            csv: src.csv,
+            payload_vout: src.payload_vout,
+        });
         let r = mercuryrustlib::tesr::verify_child_bundle(
             &padded, &f_spk_hex,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
@@ -160,7 +259,11 @@ pub async fn execute() -> Result<()> {
             &[],
             &receiver,
         );
-        ok(r, "I'' (padded child superseded entry, not co-signed by A_child — count padding)")?;
+        ok_named(
+            r,
+            "I'' (padded child superseded entry, not co-signed by A_child — count padding)",
+            "is not co-signed by A",
+        )?;
     }
     // J (VALUE-GATE SPOOF): declare a larger `out_value` than `state_child.out[0]` actually pays. A
     // payer crafting a near-worthless piece while claiming invoice value would pass a value gate that
@@ -176,7 +279,11 @@ pub async fn execute() -> Result<()> {
             &[],
             &receiver,
         );
-        ok(r, "J (value-gate spoof: declared out_value > state_child.out[0].value)")?;
+        ok_named(
+            r,
+            "J (value-gate spoof: declared out_value > state_child.out[0].value)",
+            "value-gate spoof",
+        )?;
     }
 
     // ---- THE PAYOFF: exit the child through the FULL pre-co-signed chain; the receiver is paid. -------
@@ -200,7 +307,7 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK58 - child EXITED: {} sat landed at the receiver via the pre-signed chain.", cb.child_state.out_value);
 
-    println!("SDK58 - ✓ PASS: split child ACCEPTED (non-terminal by design — it is handed over, not frozen); 11 attacks REJECTED (aggregates/hidden-state/Model-A/parent-terminality/child-superseded race + count-padding/value-spoof); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
+    println!("SDK58 - ✓ PASS: split child ACCEPTED (non-terminal by design — it is handed over, not frozen); 12 attacks REJECTED, each for the NAMED reason it targets (aggregates/hidden-state/Model-A/parent-terminality + a GENUINELY co-signed rival child state refused by the per-outpoint maturity race, the same rival refused by the census when hidden, count-padding, value-spoof); and the child EXITS to pay the receiver. B1 closed, split is a real payment, no SGX.");
     Ok(())
 }
 

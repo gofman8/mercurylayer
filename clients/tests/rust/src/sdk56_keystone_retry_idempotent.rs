@@ -4,7 +4,7 @@
 //! increments the SE's `sig_count`. If the sign/second RESPONSE is lost in flight, the count has
 //! advanced but the client holds no tier — and the naive recovery (a fresh sign/first) mints a NEW
 //! secnonce and a NEW co-sign, so `sig_count` runs ahead of the client's disclosed tier set forever.
-//! The receiver census `num_sigs == v1_backups + tiers + superseded` can then never rebalance ⟹ the
+//! The receiver census `num_sigs == flat_backups + tiers + superseded` can then never rebalance ⟹ the
 //! coin BRICKS. No attacker needed. This is the last thing gating V2-as-default.
 //!
 //! The lockbox now caches the produced partial sig keyed on the session and increments the count

@@ -190,7 +190,8 @@ The receiver trusts nothing and re-derives everything from public data — any d
   outputs pay the correct publicly-tweaked keys, the current extension's CSV matches the SE's
   published counters, and the new state's CSV is exactly one δ below the current one, with headroom;
 - the **census**: the SE's public signature count equals exactly the expected number of co-signed
-  transactions (`se_num_sigs == v1_backups + Σ conveyed_tiers`, generalized to N hops for children).
+  transactions (`se_num_sigs == flat_backups + Σ conveyed_tiers`, where `flat_backups` counts the
+  signed-once backup transactions conveyed with the coin; generalized to N hops for children).
   A hidden, undisclosed rival state shows up as a count mismatch — this is the linchpin (`sdk46`,
   `sdk47`, `sdk54`, `sdk55`, `sdk58`);
 - for sub-coins, per-level branch validation plus Σ-inputs terminal ancestors;

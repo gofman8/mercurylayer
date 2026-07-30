@@ -1,21 +1,21 @@
 //! E2E (security, honest about the trust floor): the **fresh double-sign** case — a *malicious SE*
 //! that co-signs a second, conflicting spend of a coin's funding UTXO `F`.
 //!
-//! On V2 (TES-R) a coin's ladder hangs off a **trigger** `T` that spends `F` and is itself
+//! Under TES-R a coin's ladder hangs off a **trigger** `T` that spends `F` and is itself
 //! *locktime-free*: it carries no absolute locktime and no CSV, because the relative timelocks live
 //! on the extension/state tiers hanging BELOW it, and an idle coin never ages (nothing is broadcast,
 //! so no clock runs). A freshly SE-co-signed RIVAL trigger over the same `F` is therefore exactly as
 //! final as the owner's own — the CSV tier chain breaks no tie and gives NO advantage. The contest
 //! degrades to a plain on-chain race (first-seen / highest-fee wins). The ladder shape changed from
-//! V1; this floor did not.
+//! the pre-TES-R design; this floor did not.
 //!
 //! We model the malicious SE with a NORMAL (non-single-use, no-budget) coin, for which the honest SE
 //! already permits re-signing — `server/src/endpoints/sign.rs`'s single-use / spend-budget /
 //! epoch-deadline gates simply do not fire — so obtaining two conflicting co-signatures of one coin
 //! exercises exactly the code path a gate-ignoring SE would take. The point: two valid conflicting
 //! spends of `F` exist, and only the one that confirms first wins. This is the irreducible single-SE
-//! trust floor that neither the ladder (V1 locktime OR V2 CSV), single_use, nor the terminal/budget
-//! query can close (only threshold signing can).
+//! trust floor that neither the ladder (an absolute-locktime backup chain OR the TES-R CSV tiers),
+//! single_use, nor the terminal/budget query can close (only threshold signing can).
 //!
 //! Not to be confused with sdk12, which proves the INVERSE property: the SE cannot double-sign behind
 //! the receiver's back (nonce atomicity). Here the SE is *willing*, and nothing client-side stops it.
@@ -43,7 +43,7 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 }
 
 pub async fn execute() -> Result<()> {
-    // No protocol pin: this runs on the real V2 (TES-R) default. The coin below is laddered by
+    // No protocol pin: this runs on the real TES-R default. The coin below is laddered by
     // claim() (`tesr::establish_auto`), which is exactly the point — the CSV ladder IS in place, the
     // coin never ages while idle, and none of that buys the honest owner anything against a freshly
     // co-signed rival trigger over the same funding UTXO.
@@ -69,7 +69,7 @@ pub async fn execute() -> Result<()> {
         if waited > 60 { return Err(anyhow!("deposit did not confirm")); }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    // Take the confirmed coin once claim() has also established its TES-R ladder (V2 default).
+    // Take the confirmed coin once claim() has also established its TES-R ladder (the default).
     let mut found = None;
     for _ in 0..15 {
         let candidate = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk15_alice")
@@ -90,10 +90,10 @@ pub async fn execute() -> Result<()> {
     }
     let coin = found.ok_or_else(|| anyhow!("no confirmed coin carrying a TES-R ladder"))?;
     let sid = coin.statechain_id.clone().ok_or_else(|| anyhow!("coin has no statechain_id"))?;
-    // The V2 property is really in force before the attack: the coin IS laddered.
+    // The TES-R property is really in force before the attack: the coin IS laddered.
     assert!(
         mercuryrustlib::tesr::load(&cc, "sdk15_alice", &sid).await?.is_some(),
-        "the coin must carry a TES-R ladder (V2) — the ladder is present and still powerless below"
+        "the coin must carry a TES-R ladder — the ladder is present and still powerless below"
     );
     println!("SDK15 - funded a normal coin {sid} (SE permits re-signing); its TES-R ladder is established");
 
@@ -137,6 +137,6 @@ pub async fn execute() -> Result<()> {
     assert!(by.is_err(), "the conflicting spend loses the race (already-spent input): {by:?}");
     println!("SDK15 - tx_X won the race (confirmed); tx_Y REJECTED (its input is already spent). Only ONE of the two co-signed conflicts can settle — and it won only by being first with the higher fee, not by anything the ladder did.");
 
-    println!("SDK15 - SUCCESS (documents the trust floor): a malicious SE CAN produce two conflicting fresh co-signatures of one funding UTXO. On V2 the rival is a TRIGGER, which is locktime-free — the TES-R CSV tier chain constrains only the tiers BELOW a trigger, so two fresh triggers over F start their clocks on equal terms and the ladder gives NO advantage. It is a first-seen/highest-fee RACE. The honest party's only defence is speed + fee (be first / bump via the P2A anchor). This is the irreducible single-SE trust — closed only by threshold-signing the SE, not by any client-side layer (not the V2 CSV ladder, not single_use, not the terminal/spend-budget query).");
+    println!("SDK15 - SUCCESS (documents the trust floor): a malicious SE CAN produce two conflicting fresh co-signatures of one funding UTXO. On a laddered coin the rival is a TRIGGER, which is locktime-free — the TES-R CSV tier chain constrains only the tiers BELOW a trigger, so two fresh triggers over F start their clocks on equal terms and the ladder gives NO advantage. It is a first-seen/highest-fee RACE. The honest party's only defence is speed + fee (be first / bump via the P2A anchor). This is the irreducible single-SE trust — closed only by threshold-signing the SE, not by any client-side layer (not the TES-R CSV ladder, not single_use, not the terminal/spend-budget query).");
     Ok(())
 }

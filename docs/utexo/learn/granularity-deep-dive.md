@@ -217,10 +217,13 @@ split"* — SDK token rails are one-hop today (§6, §7 FAQ,
 ### 2c. Paying three people at once: width beats depth
 
 `transfer_many([(a,x),(b,y),(c,z)])` and `batch_transfer_tokens` carve **all pieces in one
-split**: one SE-co-signed tx with N piece outputs plus one change output (`change = parent −
-Σ amounts − reserve`, every output ≥ 330). Each recipient gets their piece by an ordinary
-handover; for tokens, one consignment is shared and each piece carries its own envelope with its
-own amount hint.
+split**: one SE-co-signed tx with N piece outputs plus one change output (every output ≥ the route's
+floor). `transfer_many` picks the split by the parent's shape, exactly as `transfer` does — a
+laddered coin gets one **split state `SP` over `X_m.out[0]`** (N children + change + the P2A anchor,
+`Σ = tier_out_total(X_m.out[0], N+1)`, each child conveyed to its recipient's mailbox with the
+standard key handover), and only an un-laddered coin gets the plain branch split (`change = parent −
+Σ amounts − reserve`, each piece handed over afterwards). For tokens, one consignment is shared and
+each piece carries its own envelope with its own amount hint.
 
 On the **un-laddered** lane the measured constants are: a 3-recipient fan-out split is **241 vB**
 total — about **60 vB of future exit weight per piece**, versus **155 vB per piece** if you paid
@@ -236,12 +239,19 @@ chain-measured.
 (Caveat: hand-offs within a batch are independent — the batch is not atomic across recipients,
 [SPEC.md §14](../SPEC.md#14-known-limitations-adversarial-review).)
 
-**Known gap — `transfer_many` has no in-ladder route.** Unlike `transfer()`, its parent filter
-excludes carriers but *not* laddered coins, so it will plain-split a laddered parent: exactly the
-[B1] shape `split_coin` hard-refuses. `in_ladder_pay` carves one piece plus change, not N, so there
-is nothing yet to route it to. Until `transfer_many` either refuses laddered parents or gains a
-multi-child split state, prefer N sequential `transfer()` calls, which route per parent shape
-(the width saving above is then forfeited).
+**Was a gap, now closed — `transfer_many` routes in-ladder.** It used to plain-split whatever parent
+it picked, which on a laddered coin is exactly the [B1] shape `split_coin` hard-refuses: the split tx
+and the coin's own trigger both spend `F`, so whoever retains that un-timelocked trigger could consume
+`F` and void the split, killing every recipient's piece at once. It now dispatches per parent shape
+like `transfer` — `in_ladder_pay_many` for a laddered root, `child_in_ladder_pay_many` for a received
+child, the plain split only for un-laddered sub-coins — so the width saving above is available on the
+laddered lane too, with no B1 exposure. `sdk69` proves it by running the attack: the retained trigger
+is broadcast and spends `F`, and both recipients still exit for their exact amounts.
+
+One thing the in-ladder lane changes: the per-output floor is the larger
+`min_child_value` (1,306 sats at 2 sat/vB) rather than the 442-sat backup-fee floor, because every
+child funds its own extension + state tier before it must clear dust — so very small pieces that a
+plain split would accept are refused up-front, with the parent untouched.
 
 ## 3. What a partial send does to invalidation
 
@@ -477,8 +487,9 @@ receives PT2 three times: 10 → 11 → 9,996).
 
 ### 5.3 Tiny amounts: the floors, and why
 
-Rows 1–3 are the **un-laddered** lane (`split_coin`, `transfer_many`, every colored split); rows 4–5
-are the **laddered** one; the rest are token-specific and therefore un-laddered too.
+Rows 1–3 are the **un-laddered** lane (`split_coin`, every colored split); rows 4–5 are the
+**laddered** one; the rest are token-specific and therefore un-laddered too. `transfer_many` spans
+both — it takes whichever lane its parent's shape selects (§2c), and therefore whichever floor.
 
 | Floor | Value | Why |
 |---|---|---|
@@ -500,8 +511,9 @@ micro-amounts are refused loudly and early — before the parent is touched. One
 knowing: the *planner* carries only the 442-sat backup floor, so a laddered payment leaving a
 change in `[442, 1306)` gets past planning and is refused by `in_ladder_pay`'s own guard — cleanly,
 with the parent still fully spendable (this is exactly the D1 window, now closed).
-Two paths still check late, honestly: a boundary-sized `transfer_many`
-parent, or a token carrier of 1,801–2,129 sats (the row above), passes the SDK guard and is only
+Two paths still check late, honestly: a boundary-sized parent on `transfer_many`'s **plain
+(un-laddered) route** — its in-ladder routes check every output up-front, like `in_ladder_pay` —
+or a token carrier of 1,801–2,129 sats (the row above), passes the SDK guard and is only
 refused by the PSBT builder's dust floor *after* the terminal-guard has pinned the parent to a
 single remaining co-signature — recoverable (that one co-sign funds a corrected retry) but
 irreversible ([GRANULARITY-SPEC](../GRANULARITY-SPEC.md) GRN-REQ-8 note / GRN-INV-6 / §11.7;
@@ -676,8 +688,8 @@ packaging is below the token-carrier floor, so tokens
 you receive can be held or exited but not re-sent off-chain until combine/top-up ships (§2b;
 quantified in [granularity-economics §3/§8](../research/granularity-economics.md)) — note this is a
 *token-packaging* limit, not a protocol one: received **sats** pieces are first-class and re-spendable
-(§5.1); fragmentation with no plain-BTC combine (§5.5); `transfer_many` has no in-ladder route and
-will plain-split a laddered parent, so prefer sequential `transfer()` calls (§2c); the split-output
+(§5.1); fragmentation with no plain-BTC combine (§5.5); a batch is still not atomic across recipients,
+though `transfer_many`'s laddered-parent routing is now fixed (§2c); the split-output
 floors — 330-sat dust, ~442-sat *mintable* un-laddered piece (backup-fee floor, enforced up-front so
 it refuses rather than strands), 1,306-sat in-ladder child (`min_child_value`, likewise enforced
 up-front since D1), ~2,242-sat token-viable carrier (§5.3); every token piece carries exactly 1,500
@@ -762,7 +774,7 @@ value as it is built — so the split state costs `committed_fee_for_outputs(2) 
 **What happens to dust-level change?** It never exists on any path: the split guards error and
 the planner won't select a coin that would produce one (audit [29]), both before the parent is
 touched — `split_amounts_floored` un-laddered, `max(min_split_output, min_child_value)` in-ladder
-(§5.3, D1). On the late-checked paths (`transfer_many`, token splits at the carrier boundary) the
+(§5.3, D1). On the late-checked paths (`transfer_many`'s plain route, token splits at the carrier boundary) the
 PSBT builder's dust floor refuses instead — no dust output is ever co-signed there either, but
 the refusal lands *after* the parent was pinned to one remaining co-signature (§5.3).
 

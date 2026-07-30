@@ -133,11 +133,14 @@ exact amounts are a first-class off-chain operation with no third party and no l
 recipient pieces plus change in a single split — width is far cheaper than paying N people
 sequentially. For tokens there is also a **fan-in** form: `colored_combine_transfer` spends N
 carriers of one asset into an exact piece plus change (N inputs → 2 outputs), and the receiver then
-requires **all N** input carriers to be terminal. Both of these are *plain* splits, i.e. the
-un-laddered lane. ⚠️ `transfer_many` has no in-ladder route yet — its parent filter excludes carriers
-but not laddered coins — so until it either refuses laddered parents or gains a multi-child split
-state, prefer N sequential `transfer()` calls, which route per parent shape automatically (see
+requires **all N** input carriers to be terminal. The token forms are *plain* splits, i.e. the
+un-laddered lane. `transfer_many` routes per parent shape, exactly like `transfer`: a laddered coin
+gets a multi-child **in-ladder** split (one `SP` over `X_m.out[0]` paying N children plus change,
+each conveyed with the standard key handover), a received child gets the child-level equivalent, and
+only an un-laddered coin gets the plain split — so a batch never plain-splits a laddered parent, which
+would be the [B1] shape (see
 [granularity deep dive §2c](granularity-deep-dive.md#2c-paying-three-people-at-once-width-beats-depth)).
+A batch is still not atomic across recipients.
 
 ## Receiving
 

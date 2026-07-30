@@ -1,4 +1,4 @@
-# V2 split-transfer design — FLAWED verdict + FATAL holes found in the LIVE V2 lane
+# Split-transfer design — FLAWED verdict + FATAL holes found in the LIVE laddered lane
 ### [HISTORICAL — the verdict was acted on; the split SHIPPED. Read the STATUS block first.]
 
 > ## STATUS (2026-07-29) — HISTORICAL RECORD. Every finding below is CLOSED or superseded.
@@ -9,11 +9,13 @@
 >
 > - **There is ONE protocol.** `deposit_protocol_version` and the `UTEXO_PROTOCOL_DEFAULT` env are
 >   DELETED; `claim()` establishes a TES-R ladder for every fresh confirmed ROOT coin, unconditionally.
->   The "flip the default / delete V1" gate chain at the bottom of this file is DONE. Nothing is opt-in;
->   zero tests pin the old lane.
-> - **Read "V1"/"V2" below as HISTORY, not as two live lanes.** What this file calls V2 is simply *the*
->   protocol. What it calls V1 survives only as a coin SHAPE — the UN-LADDERED shape — and that shape is
->   LOAD-BEARING, not legacy: an **RGB carrier** is deliberately never laddered (a plain tier spend would
+>   The "flip the default / delete the pre-TES-R lane" gate chain at the bottom of this file is DONE.
+>   Nothing is opt-in; zero tests pin the deleted lane.
+> - **Read the two "lanes" below as HISTORY, not as two live things.** What this file calls the laddered
+>   lane is simply *the* protocol (TES-R). The pre-TES-R design — every coin anchored to a decrementing
+>   absolute-locktime backup chain from its deposit height — survives only as a coin SHAPE, the UN-LADDERED
+>   shape, and that shape is LOAD-BEARING, not legacy: an **RGB carrier** is deliberately never laddered
+>   (a plain tier spend would
 >   destroy the allocation — terminal-freeze, PROTOCOL.md §5.10; sdk52), and a **split sub-coin whose
 >   funding is un-broadcast cannot root a trigger** [B0, below]. Those coins keep the signed-once backup
 >   and transfer by backup-chain handover.
@@ -38,7 +40,7 @@
 > **SGX lane** — every test here runs against the dev lockbox, so the production `enclave/App` signing lane
 > is still unexercised (`sgx-lane-untested-gap`).
 
-## 🔴 B1 — LIVE THEFT VECTOR (was shipped in the V2 default at 434d334; default REVERTED)
+## 🔴 B1 — LIVE THEFT VECTOR (was shipped in the laddered default at 434d334; default REVERTED)
 
 **Not a future design constraint — an exploitable theft in the shipped default. No collusion, one SDK call.**
 
@@ -47,11 +49,11 @@
 | `T` has NO timelock, spends `F`, fully co-signed at `establish` | `lib/src/tesr.rs:145` (`TRIGGER_SEQUENCE=0xFFFF_FFFD`), `:159` `lock_time:0`, asserted `:352-353`; co-signed `clients/libs/rust/src/tesr.rs:130` |
 | The split tx spends the SAME `F` | `lib/src/transaction.rs:402-412` builds its input from `coin.utxo_txid/vout`; `clients/libs/rust/src/tesr.rs:125-126` sets `f_txid/f_vout` from the same fields |
 | `split_coin` had NO ladder check | `clients/libs/rust-sdk/src/transfer.rs:387-406` — guards were CONFIRMED / !dup / !carrier only |
-| Every V2 transfer leaves the SENDER a retained `T` | `presign_receiver_state` clones and never deletes (`tesr.rs:299,302`); there is NO deletion path for `tesr-*` |
+| Every transfer of a laddered coin leaves the SENDER a retained `T` | `presign_receiver_state` clones and never deletes (`tesr.rs:299,302`); there is NO deletion path for `tesr-*` |
 | The SDK performs the attack | `unilateral_exit(Some(ids))` filters the explicit-id branch on carrier status only (`wallet.rs:1016-1028`), then `exit_pass` broadcasts `T` with no `outpoint_spent` gate (`tesr.rs:389-406`) |
 
-**Attack:** Alice receives a V2 coin → pays Bob a non-exact amount (⟹ `split_coin`; Bob gets a **V1**
-sub-coin, `transfer_sender.rs:312`, funded by the un-broadcast split tx) → Alice `unilateral_exit`s the
+**Attack:** Alice receives a laddered coin → pays Bob a non-exact amount (⟹ `split_coin`; Bob gets an
+**un-laddered** sub-coin, `transfer_sender.rs:312`, funded by the un-broadcast split tx) → Alice `unilateral_exit`s the
 PARENT. `T` confirms, `F` is consumed, **Bob's split tx is permanently dead**, Alice's ladder pays her the
 full parent value.
 
@@ -60,18 +62,18 @@ frozen fee and no RBF headroom (the parent's SE budget is set to exactly 1 and t
 `transfer.rs:458-464`). Alice wins deterministically.
 
 **Bob's due diligence is meaningless:** his `terminal_parents` check (`transfer_sender.rs:290-294`) returns
-true. He cannot see `T` — the ladder is never conveyed on the V1 lane and the SE has never seen it
+true. He cannot see `T` — a ladder is never conveyed with an un-laddered coin and the SE has never seen it
 (`tesr.rs:47`).
 
-**The code's load-bearing claim is FALSE for V2** (`transfer.rs:455-457`: *"No later withdraw/transfer/
+**The code's load-bearing claim is FALSE for a laddered coin** (`transfer.rs:455-457`: *"No later withdraw/transfer/
 backup of the parent can be signed — the branch cannot be double-spent even by a malicious sender"*). It
-rests on the V1 premise that every spend of `F` needs a FRESH SE co-sign. V2 breaks it at the root: `T` was
-co-signed at `establish`, long before `set_spend_budget`. **A budget bounds future co-signs; it cannot
-retract an issued signature.** Strictly WORSE than V1, where the parent's backup is locktimed above the
-branch and the branch always matures first (INV-4).
+rests on the un-laddered premise that every spend of `F` needs a FRESH SE co-sign. A ladder breaks it at the
+root: `T` was co-signed at `establish`, long before `set_spend_budget`. **A budget bounds future co-signs; it
+cannot retract an issued signature.** Strictly WORSE than the un-laddered shape, where the parent's backup is
+locktimed above the branch and the branch always matures first (INV-4).
 
 ### Status
-- ~~**Default STILL V1** (V2 opt-in via `UTEXO_PROTOCOL_DEFAULT=2`) — exposure closed.~~
+- ~~**Deposits STILL un-laddered by default** (laddering opt-in via `UTEXO_PROTOCOL_DEFAULT=2`) — exposure closed.~~
   **SUPERSEDED (2026-07-29): there is one protocol.** Every fresh confirmed root coin is laddered by
   `claim()`; the `UTEXO_PROTOCOL_DEFAULT` / `deposit_protocol_version` escape hatch is deleted. The
   exposure is closed by the in-ladder split *itself*, not by a default — `transfer()` never routes a
@@ -130,7 +132,7 @@ branch and the branch always matures first (INV-4).
         row), and a child's headless funding IS census-verifiable downstream because the conveyance
         carries the whole `ancestors` chain back to the on-chain `F` (each segment terminal + its own
         exact-equality census). sdk60/sdk17.
-    - ~~⟹ Flipping V2 default makes received non-exact payments exit-only claims (re-spend = materialize) —
+    - ~~⟹ Laddering by default makes received non-exact payments exit-only claims (re-spend = materialize) —
       a **product decision** (sdk01's instant co-op-withdraw assumption becomes a multi-block chain op),
       not just an engineering gate.~~ **MOOT: received non-exact payments are first-class, so re-spend is
       an off-chain hop, not a materialization.** Only an on-chain *withdraw* of a child is still the
@@ -147,11 +149,11 @@ branch and the branch always matures first (INV-4).
     guard states the B1 reasoning instead).
 
 ### THE FIX — in-ladder split (PROTOCOL.md §5.4), not a gate
-The gate is a feature amputation: `presign_receiver_state` runs on EVERY V2 transfer, so essentially every
-circulating V2 coin is conveyed-ladder ⟹ V2 coins could not pay non-exact amounts (violating REQ-2). Its
-escape hatch (`reanchor`, 112 vB + a confirmation per non-exact payment) negates V2's "0 vB rent / ~320×
-footprint win" — and may not even work (does `withdraw` on a conveyed V2 coin have SE sign-budget headroom?
-external review F2 / migration 0008 — MUST be checked).
+The gate is a feature amputation: `presign_receiver_state` runs on EVERY transfer of a laddered coin, so
+essentially every circulating laddered coin is conveyed-ladder ⟹ laddered coins could not pay non-exact
+amounts (violating REQ-2). Its escape hatch (`reanchor`, 112 vB + a confirmation per non-exact payment)
+negates TES-R's "0 vB rent / ~320× footprint win" — and may not even work (does `withdraw` on a conveyed
+laddered coin have SE sign-budget headroom? external review F2 / migration 0008 — MUST be checked).
 
 > **Outcome:** the amputation never shipped and the open question is MOOT as an escape hatch — a non-exact
 > payment routes in-ladder (sdk59), never through a re-anchor. Re-anchoring survives as the separate
@@ -201,7 +203,7 @@ sdk58 rejects a non-terminal parent among its 11 cases.
 
 `clients/libs/rust/src/tesr.rs:508-529`.
 ```
-expected = v1_backups + tiers.len() + superseded_states.len() + superseded_extensions.len()
+expected = flat_backups + tiers.len() + superseded_states.len() + superseded_extensions.len()
 ```
 - Exit tiers are parsed + structurally checked (`:458-503`). **Superseded entries are only `.len()`-counted**
   — never deserialized, never linked to the ladder, never signature-checked.
@@ -229,7 +231,7 @@ impossible.
 5. Unit tests: `csv:None`, empty `signed_tx`, off-ladder outpoint, unsigned tier → each must REJECT, and be
    shown ACCEPTED before the patch.
 
-## S2 — FATAL (fund-loss): `v1_backups` is attacker-supplied and unvalidated on the V2 path — **FIXED**
+## S2 — FATAL (fund-loss): `flat_backups` is attacker-supplied and unvalidated on the laddered path — **FIXED**
 > **FIXED — the backup vector is now structurally validated on BOTH coin shapes.** A laddered coin runs
 > `validate_backup_chain_v2` (structural chain validation that keeps INV-5, `ladder_decrements_by_interval`,
 > against both the duplicate-padding and the locktime-inversion attack) instead of skipping the check; the
@@ -239,22 +241,23 @@ impossible.
 
 `clients/libs/rust/src/transfer_receiver.rs:600-604` passes `transfer_msg.backup_transactions.len()`
 straight into `expected`; `:635` gates `validate_signature_scheme` on `protocol_version < 2`, so **nothing
-inspects the vector's interior on V2** (only `get_tx0_outpoint` first-by-`tx_n` and
+inspects the vector's interior once the coin is laddered** (only `get_tx0_outpoint` first-by-`tx_n` and
 `verify_latest_backup_tx_pays_to_user_pubkey` `.last()`).
 - **Count padding**: duplicate `tx1` → `[tx1, tx1, tx2]`. Same prevout ⟹ one group; first/last unchanged.
   `expected` inflates to match a hidden-state `num_sigs`. Middle entries need not be valid txs. Unbounded.
 - **Locktime inversion**: build the receiver-paying backup at `L+interval` (not `L−interval`) and retain
   one's own at `L`. INV-5 (`ladder_decrements_by_interval`) is the only enforcement — and it is skipped.
 
-**Strict V1→V2 regression**: V1 rejects both (`:615` + `validate_signature_scheme`). Root cause (mine):
-V2DEF-1 gated the V1 structural check off for V2 without replacing it.
+**Strict regression against the pre-TES-R design**: the un-laddered path rejects both (`:615` +
+`validate_signature_scheme`). Root cause (mine): V2DEF-1 gated that structural check off for laddered coins
+without replacing it.
 
-**Required fix.** Validate the backup vector structurally on the V2 path too (count, per-group uniqueness,
-decrementing-locktime), or derive `v1_backups` from an authoritative source rather than the sender's vector.
+**Required fix.** Validate the backup vector structurally on the laddered path too (count, per-group uniqueness,
+decrementing-locktime), or derive `flat_backups` from an authoritative source rather than the sender's vector.
 
 ## B0 — FIXED (commit 5c42667): root-only laddering
 `claim()`'s establish loop filtered only `CONFIRMED/!dup/!single_use/!carrier` — no root check — so a split
-**sub-coin** got laddered under the V2 default; its `F` is an un-broadcast split output ⟹ `exit_pass`
+**sub-coin** got laddered once deposits were laddered by default; its `F` is an un-broadcast split output ⟹ `exit_pass`
 broadcasts a trigger with no prevout ⟹ silent stall, `wait_blocks:0` forever ⟹ unexitable via the SDK.
 Fixed by requiring F on-chain (electrum `transaction_get`), fail-closed. (An earlier `branch-<id>` proxy
 broke root laddering because `get_backup_txs` does `fetch_one(..)?` — a missing row returns `Err`, conflating
@@ -267,16 +270,16 @@ broke root laddering because `get_backup_txs` does `fetch_one(..)?` — a missin
 > sdk52 proves a carrier is never laddered). Those coins keep the signed-once backup and transfer by
 > backup-chain handover. Do not "finish the migration" by laddering them.
 
-## B1 — structural constraint on V2 split-transfer (~~not yet addressed~~ **ADDRESSED**)
+## B1 — structural constraint on laddered split-transfer (~~not yet addressed~~ **ADDRESSED**)
 > **ADDRESSED by the in-ladder split, and the constraint's second half is now a standing design rule.**
 > A laddered coin is never split by a tx that rivals `F`: `SP` is a STATE tier spending `X_m.out[0]`, a
 > DESCENDANT of the trigger. The "give the trigger a CSV" alternative was not needed. The relay/confirmation
 > point below survives verbatim as [B0]: a sub-coin whose funding is un-broadcast cannot root a trigger, so
 > it stays un-laddered.
 The conveyed trigger has **no timelock** (`TRIGGER_SEQUENCE = 0xFFFF_FFFD`, `lib/src/tesr.rs:145`), so every
-prior owner of a V2-adopted coin holds a free, immediate spend of `F`. A branch-conveyed sub-coin's root hop
+prior owner of an adopted laddered coin holds a free, immediate spend of `F`. A branch-conveyed sub-coin's root hop
 is the split tx, which **also** spends `F` ⟹ unwinnable fee race whose loser is the sub-coin's receiver, who
-cannot detect the exposure at accept time. ⟹ V2 split-transfer must refuse to ladder a sub-coin whose parent
+cannot detect the exposure at accept time. ⟹ laddered split-transfer must refuse to ladder a sub-coin whose parent
 ladder was ever conveyed, or give the trigger a CSV. Also: tiers are v3/TRUC and the split tx is v2, so a v3
 trigger cannot relay while the split tx is unconfirmed — **F must confirm, not merely be broadcast**.
 
@@ -294,7 +297,7 @@ that **do not currently hold**. Verdict: **FLAWED — not implementable until th
 1. **S1 (FIXED 9d63f15) — `sign/second` was ungated.** Every fork gate (`single_use`, `sig_budget`,
    `epoch_deadline`) lived only in `sign/first`; `sign/second` re-checked none. A durable null-challenge
    session opened before terminalization could be completed after ⟹ a 2nd co-sign of a terminal node
-   (INV-19 fork). **Live on the V1 single_use lane, not just V2.** Fixed by replicating the gate block in
+   (INV-19 fork). **Live on the un-laddered `single_use` lane, not just the laddered one.** Fixed by replicating the gate block in
    `sign/second`, fail-closed. Needs a **server rebuild + redeploy**. — **REDEPLOYED and now load-bearing:**
    `sign_first`/`sign_second` also carry the pending-transfer lock (19e6668), which is what lets a conveyed
    child be handed over without being frozen.
@@ -349,13 +352,13 @@ that **do not currently hold**. Verdict: **FLAWED — not implementable until th
    **Fixed by making every segment carry its own census, verified against its own SE-fetched facts:** the
    parent segment via `verify_bundle_ex(..., PARENT_V2_BASELINE)`, each `ancestors[i]` against its own
    `AncestorFacts { num_sigs, aggregate_pubkey, terminal }`, and the leaf against
-   `child_num_sigs == child_v1_backups + 2 + child_superseded_ok`. An artifact moved between segments no
+   `child_num_sigs == child_flat_backups + 2 + child_superseded_ok`. An artifact moved between segments no
    longer balances any of them.
 
 ## Verdict / order of work
-1. **DONE** — default reverted to V1 (exposure closed); B0, S1(verify_bundle), S2, S-1, S-2 fixed +
+1. **DONE** — default reverted to un-laddered deposits (exposure closed); B0, S1(verify_bundle), S2, S-1, S-2 fixed +
    attack-proven (sdk54/sdk55); B1 gated (HF-1/3/4/5); `sign/second` gates fixed (9d63f15, needs redeploy).
-2. **BLOCKING for V2-as-default (server/enclave workstream, NOT a client patch):** — **ALL LANDED.**
+2. **BLOCKING for laddering-by-default (server/enclave workstream, NOT a client patch):** — **ALL LANDED.**
    - a census that counts TIERS, not partial-sig issuances (fix the `update_sig_count` vs
      `set_partial_sig_issued` ordering, or make the client census tolerant of issuance-count drift);
      — **done: keystone session cache, sdk56.**
@@ -366,8 +369,8 @@ that **do not currently hold**. Verdict: **FLAWED — not implementable until th
      backups; segment-scoped census). — **done, all four: on-chain-`F`-derived aggregate binding; the child
      bootstraps from its conveyed segment + handover instead of a backup vector; per-segment censuses.**
 3. ~~**THE HONEST STATE:** the in-ladder split cannot be made sound purely client-side. B1 (relocated to the
-   parent-state rival) is only closed by a census that rests on #2. Until #2 lands, V2 stays opt-in and
-   splits of laddered coins stay refused (HF-1). Do NOT flip the default.~~
+   parent-state rival) is only closed by a census that rests on #2. Until #2 lands, laddering stays opt-in
+   and splits of laddered coins stay refused (HF-1). Do NOT flip the default.~~
    **THE HONEST STATE (2026-07-29):** that judgement was right and was honoured — #2 was done as backend
    work, and only then did the split ship. There is now one protocol; laddered coins split in-ladder
    (sdk58/sdk59) and received children are first-class (sdk60/sdk17). `split_coin`'s HF-1 refusal survives
@@ -381,7 +384,7 @@ that **do not currently hold**. Verdict: **FLAWED — not implementable until th
 
 ---
 
-## O-1 RESOLUTION (2026-07-21) — V2 CAN be made sound; the count census is the right mechanism
+## O-1 RESOLUTION (2026-07-21) — TES-R CAN be made sound; the count census is the right mechanism
 
 The O-1 counter-machine review (the missing TESR-3 foundation) settled the central question:
 
@@ -391,7 +394,7 @@ The O-1 counter-machine review (the missing TESR-3 foundation) settled the centr
 - A **label** census (`{level,m,k}`, as PROTOCOL.md:208 specified) is genuinely impossible — a blind SE
   cannot verify a declared coordinate matches the signed message (Theorem 1). That machine is dead; do NOT
   build it.
-- The shipped `verify_bundle` uses a **COUNT** census (`num_sigs == v1_backups + tiers + superseded`),
+- The shipped `verify_bundle` uses a **COUNT** census (`num_sigs == flat_backups + tiers + superseded`),
   which is sound: the SE observes each signing round regardless of blindness. The retry-brick is **a
   missing cache, not an information barrier**. The CTL/semi-blind redesign was REJECTED (it would trade
   away blindness for a guarantee obtainable free).
@@ -412,10 +415,10 @@ The O-1 counter-machine review (the missing TESR-3 foundation) settled the centr
 - **sign/second fork gates** (9d63f15), **get_statechain_info NULL-challenge panic** (42a39fe),
   **sign/first fail-open lock → fail-closed** (549d9d2) — all server-side; activate on redeploy.
   — **REDEPLOYED (server + lockbox rebuilt from source); the full suite runs against them.**
-- **S7 nodejs/web fail-closed on V2 coins** (ca76dfc).
+- **S7 nodejs/web fail-closed on laddered coins** (ca76dfc).
 
 ### ~~BLOCKED~~ RESOLVED / RESIDUAL (not a client patch; needed infra or protocol design)
-- **Keystone — retry-safety response cache** (the last thing gating V2-as-default): lockbox caches the
+- **Keystone — retry-safety response cache** (the last thing gating laddering-by-default): lockbox caches the
   partial sig keyed on the challenge (return cached on retry, no re-sign / no increment; nonce-reuse guard
   preserved); coordinator caches likewise; client persists the session and retries `sign/second` — never
   restarts `sign/first`. This makes the count census retry-safe (a lost response no longer bricks a coin).
@@ -450,34 +453,35 @@ The O-1 counter-machine review (the missing TESR-3 foundation) settled the centr
   assumes the coordinator is the only caller of the lockbox — that assumption is a DEPLOYMENT obligation,
   not a code guarantee.
 
-~~**Do NOT flip the default to V2 until the keystone lands and is verified.**~~ **The keystone landed and
+~~**Do NOT ladder deposits by default until the keystone lands and is verified.**~~ **The keystone landed and
 was verified (sdk56); the default no longer exists — every fresh confirmed root coin is laddered.** The
 count census is sound and retry-safe, and the in-ladder split (B1) rides on top of a trustworthy parent
 census, exactly as this section required.
 
 ---
 
-## KEYSTONE DONE (2026-07-22) + the V2-completion gate chain
+## KEYSTONE DONE (2026-07-22) + the TES-R-completion gate chain
 
 The keystone LANDED and is VERIFIED (see the memory + commits 11edbae/5b5b698/ea09c01): the lockbox caches
 the partial sig keyed on the session and increments sig_count atomically; the client retries the same
 sign/second. sdk56 proves the signing round is idempotent under retry (num_sigs counted once across 3
-replays). Server + lockbox redeployed from latest source; full V2 suite green.
+replays). Server + lockbox redeployed from latest source; the full TES-R suite green.
 
-**To reach "V2 default + V1 deleted" the remaining gates are, in order:**
+**To reach "laddered by default + the pre-TES-R lane deleted" the remaining gates are, in order:**
 **— ALL FOUR ARE NOW PAST. Outcome recorded per gate; gate 3 was solved a different way than planned.**
 
 1. **S5 (presign-abandonment brick) — NEEDS A SERVER-SIDE PROTOCOL CHANGE (design ruling, workflow
    wab9jyo5b).** A purely client-side fix is IMPOSSIBLE — three independent FATALs, S-1 dispositive:
-   the V2 transfer path co-signs a RECEIVER-PAYING V1 BACKUP on every attempt (transfer_sender.rs:278 ->
-   create_backup_tx_to_receiver), whose locktime is IDENTICAL across abandons; splicing journaled backups
-   into the conveyed list hits INV-5 (ladder_decrements_by_interval, receiver.rs:274) — which cannot loosen
-   without reopening the S2 hidden-state defense — and NOT splicing leaves v1_backups short => verify_bundle
-   num_sigs mismatch. Both horns BRICK. FIX = **receiver-liveness gate**: add a receiver-signed commitment
-   to the transfer protocol; the SE co-signs BOTH the V1 backup AND S' ONLY against that commitment, so a
-   no-show strands nothing (this is the work already flagged at transfer_sender.rs:257). Latent note
-   (limitation, independent of S5): the receiver-paying V1 backup a V2 coin co-signs descends from tx0's
-   output, which T also spends — a latent on-chain rival of T on EVERY successful V2 transfer; deserves its
+   the laddered transfer path co-signs a RECEIVER-PAYING SIGNED-ONCE BACKUP on every attempt
+   (transfer_sender.rs:278 -> create_backup_tx_to_receiver), whose locktime is IDENTICAL across abandons;
+   splicing journaled backups into the conveyed list hits INV-5 (ladder_decrements_by_interval,
+   receiver.rs:274) — which cannot loosen without reopening the S2 hidden-state defense — and NOT splicing
+   leaves flat_backups short => verify_bundle num_sigs mismatch. Both horns BRICK. FIX =
+   **receiver-liveness gate**: add a receiver-signed commitment to the transfer protocol; the SE co-signs
+   BOTH the signed-once backup AND S' ONLY against that commitment, so a no-show strands nothing (this is
+   the work already flagged at transfer_sender.rs:257). Latent note (limitation, independent of S5): the
+   receiver-paying signed-once backup a laddered coin co-signs descends from tx0's output, which T also
+   spends — a latent on-chain rival of T on EVERY successful transfer of a laddered coin; deserves its
    own verification pass.
    > **OUTCOME — gate PASSED without the receiver-liveness gate; a bounded residual remains.** What shipped
    > instead: the pre-sign/`get_new_x1` re-order + the coordinator pending-transfer lock, which removes the
@@ -492,28 +496,31 @@ replays). Server + lockbox redeployed from latest source; full V2 suite green.
    > timelock), INV-5 forces each hop's backup strictly LOWER, and the stale-ancestor clawback it would
    > enable is what the watchtower + `auto_exit_due` defeat (sdk45 keyless bundle, sdk51 hostile trigger,
    > sdk40 PART 2 stale state dying at consensus). A dedicated verification pass is still owed.
-2. **In-ladder split (B1)** — enables V2 non-exact payments (split_coin refuses laddered coins today,
+2. **In-ladder split (B1)** — enables non-exact payments from laddered coins (split_coin refuses laddered coins today,
    transfer.rs:426). Redesign in progress (workflow w7s7jxly2) now that the parent census is trustworthy.
    > **DONE.** `transfer()` splits a laddered coin in-ladder (sdk58 control + 11 adversarial REJECTs; sdk59
    > end-to-end payment), and the received child is first-class (sdk60 two off-chain hops; sdk17 partial
    > second hop). `split_coin`'s refusal survives only on the direct API. [D1] fixed the admission floor.
-3. **Adaptor-sig LN = "finish lightning swaps"** — LN rides the V1 batch_id latch (lightning.rs); deleting
-   V1 breaks it. Needs adaptor signatures (server/protocol).
+3. **Adaptor-sig LN = "finish lightning swaps"** — LN rides the pre-TES-R batch_id latch (lightning.rs);
+   deleting that lane breaks it. Needs adaptor signatures (server/protocol).
    > **SOLVED DIFFERENTLY — adaptor signatures were NOT built.** The lane pivoted to a HODL-invoice latch at
    > the same trust bar (`LIGHTNING.md` — the adaptor/latch-fix designs were never built and are deleted): sdk63 pay, sdk64/
    > sdk67 receive, sdk65 non-exact in-ladder pay, sdk66/sdk68 failure+reclaim. [D3] the one-call PAY API
    > minted via `ensure_exact_coin` and so refused every laddered coin — fixed. The LN-latched piece is the
    > one case that deliberately stays terminalized.
-4. Then: flip deposit_protocol_default -> 2; delete V1 (verifier lane, validate_signature_scheme,
-   v1_backups, batch_id latch, migrate tests); rewrite all docs/utexo/*.
+4. Then: flip deposit_protocol_default -> 2; delete the pre-TES-R lane (verifier lane,
+   validate_signature_scheme, the signed-once backup count term, batch_id latch, migrate tests); rewrite
+   all docs/utexo/*.
    > **DONE — with one correction to the plan.** `deposit_protocol_version` / `UTEXO_PROTOCOL_DEFAULT` are
-   > deleted and the tests are migrated. But "delete V1" did NOT mean deleting the un-laddered coin SHAPE:
-   > `validate_signature_scheme` and the backup-chain handover are RETAINED and load-bearing, because an RGB
-   > carrier must never be laddered and an un-broadcast-funded sub-coin cannot root a trigger [B0]. The
-   > `v1_backups` term likewise survives as the census's baseline count. What was deleted is the *choice*.
+   > deleted and the tests are migrated. But deleting that lane did NOT mean deleting the un-laddered coin
+   > SHAPE: `validate_signature_scheme` and the backup-chain handover are RETAINED and load-bearing, because
+   > an RGB carrier must never be laddered and an un-broadcast-funded sub-coin cannot root a trigger [B0].
+   > The `flat_backups` term likewise survives as the census's baseline count — it is the number of
+   > signed-once backup transactions conveyed with the coin, and a laddered root coin's deposit still
+   > co-signs exactly one of them at claim, so the term is not always zero. What was deleted is the *choice*.
 
 ~~**Every remaining gate is server/SE/protocol work, not a client patch**~~ — that read was correct, and the
 backend program was executed gate by gate with adversarial review + live-stack verification, exactly as
-scoped. V2's safety rests on the blind SE (counting + gating). The build/deploy cycle is proven (incremental
-Docker rebuild + docker cp + restart). ~~Do NOT flip default or delete V1 until gates 1-3 land + are
-verified.~~ **All gates are past; there is one protocol.**
+scoped. TES-R's safety rests on the blind SE (counting + gating). The build/deploy cycle is proven (incremental
+Docker rebuild + docker cp + restart). ~~Do NOT flip the default or delete the pre-TES-R lane until gates 1-3
+land + are verified.~~ **All gates are past; there is one protocol.**

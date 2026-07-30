@@ -10,17 +10,83 @@
 use anyhow::{anyhow, Result};
 use mercury_rgb::RgbWallet;
 use mercurylib::wallet::CoinStatus;
+use mercuryrustlib::rgb::{TierRole, TierSeal};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{SdkError, TokenBalance, TransferResult, TransferredCoin};
 use crate::wallet::UtexoWallet;
 
-/// Seal blinding used for SDK token flows (both sides derive validation from the consignment, so
-/// a fixed value is fine; randomize per-transfer once bindings expose it end-to-end).
-pub(crate) const TOKEN_BLINDING: u64 = 777;
+// The global `TOKEN_BLINDING: u64 = 777` that used to live here is GONE. Its doc comment claimed
+// "a fixed value is fine"; `docs/utexo/CTESR-GATE.md` §2.2/§4.2 measured that claim and it is
+// conditionally FALSE. Two RGB transitions over the SAME parent outpoint with equal amounts and
+// equal blinding collapse to one `OpId` and one `BundleId`, and rgb-lib then resolves that BundleId
+// to whichever rival witness has the numerically smallest INTERNAL (little-endian) txid — an
+// arbitrary hash lottery. The losing transition's consignment embeds the rival's witness, so no
+// branch the receiver can try will validate; the allocation is simply unclaimable off-chain.
+//
+// Every colouring in this module now derives its blinding from a `TierSeal`
+// (`H(statechain_id ‖ role ‖ tier_index ‖ rung)`), which is unique over the whole
+// `(parent outpoint, role, index)` space and deterministically re-derivable by the receiver.
 /// Sats carried by a token-piece sub-coin (just above dust; the token is the payload).
 /// `pub(crate)` so the granularity model (`granularity_model.rs`) can pin the carrier floor.
 pub(crate) const TOKEN_PIECE_SATS: u64 = 1_500;
+
+/// Rung-space flag that separates the BATCH split lane from the single-recipient split lane.
+///
+/// Both lanes spend the same carrier under `TierRole::Split` at the same `tier_index` (the carrier's
+/// spend generation), so only the `rung` can tell them apart, and both key it on the transition's
+/// arity. The single lane's arity is always 2 (piece + change). A batch's arity is `n + 1`, and
+/// `batch_transfer_tokens` rejects only an EMPTY recipient list — so a batch of ONE recipient also
+/// has arity 2 and would derive the byte-identical seal. Setting the high bit puts every batch rung
+/// in a range the single lane can never reach (a split's arity is bounded by its output count, far
+/// below `2^31`), which restores uniqueness at every arity including 1.
+const BATCH_SPLIT_RUNG_FLAG: u32 = 0x8000_0000;
+
+/// THE single-recipient split lane's seal (`transfer_tokens`). `arity` is the transition's output
+/// count (piece + change = 2); `generation` is the carrier's spend generation (`parent_backups`).
+///
+/// This is the ONLY place the single lane's rung is expressed. Both split lanes go through these two
+/// functions so the disjointness they promise is a property of the code that actually runs, and so
+/// the unit tests below can exercise the real derivation instead of restating it.
+fn single_split_seal(carrier_id: &str, generation: u32, arity: u32) -> TierSeal {
+    TierSeal::new(carrier_id, TierRole::Split, generation, arity)
+}
+
+/// THE batch split lane's seal (`batch_transfer_tokens`): the same derivation moved into a disjoint
+/// rung space by [`BATCH_SPLIT_RUNG_FLAG`]. `arity` is `recipients + 1` (the change output).
+fn batch_split_seal(carrier_id: &str, generation: u32, arity: u32) -> TierSeal {
+    debug_assert_eq!(
+        arity & BATCH_SPLIT_RUNG_FLAG,
+        0,
+        "a split arity must never reach the lane-separating flag bit"
+    );
+    TierSeal::new(carrier_id, TierRole::Split, generation, BATCH_SPLIT_RUNG_FLAG | arity)
+}
+
+/// The CTES-R build-time collision assert (`docs/utexo/CTESR-GATE.md` §3.1), for the lanes that
+/// colour through `RgbWallet::color` (`create_colored_split_tx` / `create_colored_combine_tx`)
+/// rather than through `mercuryrustlib::rgb::build_colored_tier`, which carries the guard itself.
+///
+/// Two RGB transitions over the same parent outpoint(s) with equal amounts and an equal seal
+/// blinding collapse to one `OpId` and one `BundleId`; rgb-lib resolves that BundleId to whichever
+/// rival witness has the smallest INTERNAL (little-endian) txid. The loser's consignment therefore
+/// comes back carrying the RIVAL's witness, and no branch the receiver can try will validate. So the
+/// absence of our own witness from the consignment we just produced is proof that the seal blinding
+/// collided — a sender-side defect that must never be handed to a receiver as an unvalidatable
+/// consignment. Fail closed here instead.
+fn assert_own_witness(lane: &str, txid: &str, consignment: &str, blinding: u64) -> Result<()> {
+    let witnesses = mercury_rgb::consignment_witness_txids(consignment)?;
+    if !witnesses.iter().any(|w| w == txid) {
+        return Err(anyhow!(
+            "{lane} {txid}: its OWN witness is absent from the consignment it just produced \
+             (bundled witnesses: {witnesses:?}). The seal blinding {blinding} collided with a rival \
+             transition over the same parent output(s) — rgb-lib merged them into one BundleId and \
+             kept the rival with the smaller internal txid, so this consignment is unvalidatable by \
+             ANY receiver."
+        ));
+    }
+    Ok(())
+}
 
 /// How a colored transfer's piece is handed over.
 pub(crate) enum ColoredLatch {
@@ -141,11 +207,16 @@ impl UtexoWallet {
             u32::try_from(deposit_sats)?,
         )
         .await?;
+        // The coin has no statechain_id yet (the deposit has not confirmed), so the funding seal is
+        // keyed on the deposit address — freshly derived per slot, therefore unique per funding
+        // transition. Nothing on the receiving side ever re-derives a funding blinding.
+        let funding_blinding =
+            TierSeal::new(sc_address.clone(), TierRole::Funding, 0, 0).blinding();
         let (txid, vout) = {
             let mut rgb = self.rgb().await?;
             let w = rgb.as_mut().unwrap();
             let (txid, vout, _consignment, signed_tx) = tokio::task::block_in_place(|| {
-                w.fund_statechain(&sc_address, deposit_sats, &asset_id, supply, 2, TOKEN_BLINDING)
+                w.fund_statechain(&sc_address, deposit_sats, &asset_id, supply, 2, funding_blinding)
             })?;
             use electrum_client::ElectrumApi;
             let raw = hex::decode(&signed_tx)?;
@@ -295,11 +366,14 @@ impl UtexoWallet {
             u32::try_from(deposit_sats)?,
         )
         .await?;
+        // Same as `issue_token`: no statechain_id yet, so the fresh deposit address is the seal id.
+        let funding_blinding =
+            TierSeal::new(sc_address.clone(), TierRole::Funding, 0, 0).blinding();
         let (txid, vout) = {
             let mut rgb = self.rgb().await?;
             let w = rgb.as_mut().unwrap();
             let (txid, vout, _c, signed_tx) = tokio::task::block_in_place(|| {
-                w.fund_statechain(&sc_address, deposit_sats, asset_id, amount, 2, TOKEN_BLINDING)
+                w.fund_statechain(&sc_address, deposit_sats, asset_id, amount, 2, funding_blinding)
             })?;
             use electrum_client::ElectrumApi;
             let raw = hex::decode(&signed_tx)?;
@@ -622,6 +696,13 @@ impl UtexoWallet {
             (piece_addr.clone(), TOKEN_PIECE_SATS, token_amount),
             (change_addr.clone(), change_sats, token_change),
         ];
+        // Per-transfer seal: the carrier being spent, the split role, the carrier's spend
+        // generation, and the transition's arity — always 2 here. What separates this lane from the
+        // batch lane below (whose split over the same carrier would otherwise share
+        // `(role, tier_index)`, and at `n == 1` the same arity too) is `BATCH_SPLIT_RUNG_FLAG`,
+        // which that lane ORs into its rung; this one never sets it.
+        let split_blinding =
+            single_split_seal(&carrier_id, parent_backups, splits.len() as u32).blinding();
         let split = {
             let rgb = self.rgb().await?;
             let w = rgb.as_ref().unwrap();
@@ -637,7 +718,7 @@ impl UtexoWallet {
                 &self.inner.config.network.to_string(),
                 server_info.initlock,
                 server_info.interval,
-                TOKEN_BLINDING,
+                split_blinding,
             )
             .await?
         };
@@ -696,7 +777,7 @@ impl UtexoWallet {
         .await?;
         if let Some(first) = piece_backups.first_mut() {
             first.rgb_consignment = Some(envelope);
-            first.rgb_blinding = Some(TOKEN_BLINDING);
+            first.rgb_blinding = Some(split.blinding);
         }
         mercuryrustlib::sqlite_manager::update_backup_txs(
             &self.inner.cc.pool,
@@ -904,6 +985,18 @@ impl UtexoWallet {
             (piece_addr.clone(), TOKEN_PIECE_SATS, token_amount),
             (change_addr.clone(), change_sats, token_change),
         ];
+        // A combine has N parent outpoints, so its seal is keyed on the whole input set. Two
+        // combines over the identical set cannot both be co-signed — step 4 above set every input's
+        // spend budget to 1 — so `(input set, Combine, arity)` is unique in practice. That is an
+        // argument, not a check: `create_colored_combine_tx` colours through `RgbWallet::color`,
+        // which has no guard of its own, so `assert_own_witness` is applied to the result below.
+        let combine_blinding = TierSeal::new(
+            carrier_ids.join("+"),
+            TierRole::Combine,
+            0,
+            splits.len() as u32,
+        )
+        .blinding();
         let combine = {
             let rgb = self.rgb().await?;
             let w = rgb.as_ref().unwrap();
@@ -919,10 +1012,18 @@ impl UtexoWallet {
                 &self.inner.config.network.to_string(),
                 server_info.initlock,
                 server_info.interval,
-                TOKEN_BLINDING,
+                combine_blinding,
             )
             .await?
         };
+        // The collision assert the seal derivation above relies on — fail closed BEFORE the
+        // sub-coins are registered and the piece is handed over.
+        assert_own_witness(
+            "coloured combine",
+            &combine.txid,
+            &combine.consignment,
+            combine.blinding,
+        )?;
         let piece_vout = combine.output_vouts[0];
         let change_vout = combine.output_vouts[1];
 
@@ -976,7 +1077,7 @@ impl UtexoWallet {
         .await?;
         if let Some(first) = piece_backups.first_mut() {
             first.rgb_consignment = Some(envelope);
-            first.rgb_blinding = Some(TOKEN_BLINDING);
+            first.rgb_blinding = Some(combine.blinding);
         }
         mercuryrustlib::sqlite_manager::update_backup_txs(
             &self.inner.cc.pool,
@@ -1150,6 +1251,14 @@ impl UtexoWallet {
             1,
         )
         .await?;
+        // Same seal derivation as the single-recipient split, but in a DISJOINT rung space. The
+        // arity alone does not keep the two lanes apart: this function rejects only an EMPTY
+        // recipient list, so `n == 1` is reachable and gives `splits.len() == 2` — exactly the
+        // single lane's arity, over the same carrier at the same spend generation, i.e. the byte
+        // identical seal. `BATCH_SPLIT_RUNG_FLAG` moves every batch rung out of the single lane's
+        // reach at every arity, including 1.
+        let split_blinding =
+            batch_split_seal(&carrier_id, parent_backups, splits.len() as u32).blinding();
         let split = {
             let rgb = self.rgb().await?;
             let w = rgb.as_ref().unwrap();
@@ -1165,7 +1274,7 @@ impl UtexoWallet {
                 &self.inner.config.network.to_string(),
                 server_info.initlock,
                 server_info.interval,
-                TOKEN_BLINDING,
+                split_blinding,
             )
             .await?
         };
@@ -1224,7 +1333,7 @@ impl UtexoWallet {
             .await?;
             if let Some(first) = backups.first_mut() {
                 first.rgb_consignment = Some(envelope);
-                first.rgb_blinding = Some(TOKEN_BLINDING);
+                first.rgb_blinding = Some(split.blinding);
             }
             mercuryrustlib::sqlite_manager::update_backup_txs(
                 &self.inner.cc.pool,
@@ -1419,5 +1528,89 @@ mod envelope_tests {
         let lying = ConsignmentEnvelope { c: "c".into(), a: 999, s: 1500 };
         assert_eq!(honest.a, booked); // accepted
         assert_ne!(lying.a, booked); // rejected (ERR-8)
+    }
+}
+
+/// The two split lanes derive DISJOINT seals over the same carrier at the same spend generation —
+/// including at the arity a batch of one recipient produces, which `batch_transfer_tokens` does not
+/// reject (it rejects only an EMPTY recipient list).
+#[cfg(test)]
+mod split_seal_tests {
+    // The PRODUCTION derivations, called directly — `transfer_tokens` and `batch_transfer_tokens`
+    // now have no rung expression of their own, so changing either lane's seal changes these tests.
+    use super::{BATCH_SPLIT_RUNG_FLAG, TierRole, batch_split_seal, single_split_seal};
+
+    /// `transfer_tokens` always builds `splits = [piece, change]`, so its arity is fixed at 2. Pinned
+    /// here so the lane-collision tests below cannot drift away from what production actually passes.
+    const SINGLE_LANE_ARITY: u32 = 2;
+
+    /// `batch_transfer_tokens` builds `splits = [piece; n] + change`, i.e. arity `n + 1`, and rejects
+    /// only an EMPTY recipient list — so `n == 1` (arity 2) is reachable.
+    fn batch_arity(recipients: u32) -> u32 {
+        recipients + 1
+    }
+
+    /// The regression: a ONE-recipient batch has arity 2, exactly like the single lane. Keying the
+    /// rung on the arity alone made the two seals identical over the same carrier and generation.
+    #[test]
+    fn a_one_recipient_batch_does_not_collide_with_the_single_lane() {
+        for generation in 0..8u32 {
+            assert_eq!(batch_arity(1), SINGLE_LANE_ARITY, "the collision precondition still holds");
+            assert_ne!(
+                batch_split_seal("sid-carrier", generation, batch_arity(1)).blinding(),
+                single_split_seal("sid-carrier", generation, SINGLE_LANE_ARITY).blinding(),
+                "a batch of one recipient must not share the single lane's seal at generation \
+                 {generation}"
+            );
+        }
+    }
+
+    /// And nothing else in either lane's rung space collides either.
+    #[test]
+    fn the_two_split_lanes_never_share_a_rung() {
+        use std::collections::HashSet;
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut n = 0usize;
+        for generation in 0..16u32 {
+            assert!(
+                seen.insert(
+                    single_split_seal("sid-carrier", generation, SINGLE_LANE_ARITY).blinding()
+                )
+            );
+            n += 1;
+            for recipients in 1..64u32 {
+                assert!(
+                    seen.insert(
+                        batch_split_seal("sid-carrier", generation, batch_arity(recipients))
+                            .blinding()
+                    ),
+                    "batch({recipients}) at generation {generation} reused a blinding"
+                );
+                n += 1;
+            }
+        }
+        assert_eq!(seen.len(), n, "every split-lane seal must be distinct");
+    }
+
+    /// The lanes are disjoint BY CONSTRUCTION, not merely by hash luck: both derive under
+    /// `TierRole::Split` over the same carrier and generation, and the only difference production
+    /// creates is the flag bit in the rung. Asserting on the pre-image (rather than only on the
+    /// 64-bit digest) means a future edit that drops the flag fails here even if the two digests
+    /// happened not to collide in the sampled range above.
+    #[test]
+    fn the_batch_lane_is_separated_by_the_flag_bit_in_the_rung_itself() {
+        let single = single_split_seal("sid-carrier", 7, SINGLE_LANE_ARITY);
+        let batch = batch_split_seal("sid-carrier", 7, batch_arity(1));
+        assert_eq!(single.role, TierRole::Split);
+        assert_eq!(batch.role, TierRole::Split);
+        assert_eq!(single.statechain_id, batch.statechain_id);
+        assert_eq!(single.tier_index, batch.tier_index);
+        assert_eq!(single.rung & BATCH_SPLIT_RUNG_FLAG, 0, "the single lane must never set the flag");
+        assert_eq!(
+            batch.rung & BATCH_SPLIT_RUNG_FLAG,
+            BATCH_SPLIT_RUNG_FLAG,
+            "the batch lane must always set the flag"
+        );
+        assert_eq!(batch.rung & !BATCH_SPLIT_RUNG_FLAG, batch_arity(1));
     }
 }

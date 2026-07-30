@@ -64,6 +64,21 @@ pub async fn execute() -> Result<()> {
         let t = prepaid_token(&cc).await?;
         alice.add_prepaid_token(&t).await;
     }
+    // claim() ladders every fresh confirmed root coin, so alice's only coin carries a TES-R ladder —
+    // which makes this the DEFAULT `transfer_many` shape, and the one a plain split of `F` must never
+    // be used for ([B1]; the dedicated proof is sdk69). Assert the route rather than just the amounts:
+    // a plain split would hand each recipient an ordinary un-laddered sub-coin with no child bundle.
+    let alice_sid = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk11_alice")
+        .await?
+        .coins
+        .iter()
+        .find(|c| c.status == mercurylib::wallet::CoinStatus::CONFIRMED && c.duplicate_index == 0)
+        .and_then(|c| c.statechain_id.clone())
+        .ok_or(anyhow!("alice has no confirmed coin"))?;
+    assert!(
+        mercuryrustlib::tesr::load(&cc, "sdk11_alice", &alice_sid).await?.is_some(),
+        "alice's deposit must be laddered — this test's transfer_many parent is a V2 coin"
+    );
     let results = alice
         .transfer_many(&[(bob_addr.clone(), 10_000), (carol_addr.clone(), 15_000)])
         .await?;
@@ -72,7 +87,19 @@ pub async fn execute() -> Result<()> {
     assert_eq!(carol.claim().await?.claimed_transfers, 1, "carol claims her piece");
     assert_eq!(bob.get_balance().await?.available_sats, 10_000, "bob got 10k");
     assert_eq!(carol.get_balance().await?.available_sats, 15_000, "carol got 15k");
-    println!("SDK11 - P-D: one split -> bob 10k + carol 15k (multi-recipient)");
+    let bob_cb = mercuryrustlib::tesr::load_child(&cc, "sdk11_bob", &results[0].coins[0].statechain_id)
+        .await?
+        .ok_or(anyhow!("bob's piece is not an in-ladder child — transfer_many took the plain split [B1]"))?;
+    let carol_cb =
+        mercuryrustlib::tesr::load_child(&cc, "sdk11_carol", &results[1].coins[0].statechain_id)
+            .await?
+            .ok_or(anyhow!("carol's piece is not an in-ladder child [B1]"))?;
+    assert_eq!(
+        bob_cb.parent.current().state.signed_tx, carol_cb.parent.current().state.signed_tx,
+        "both pieces are carved by ONE split state (a single multi-recipient split)"
+    );
+    assert_eq!((bob_cb.sp_vout, carol_cb.sp_vout), (0, 1), "SP.out[j] == recipients[j]");
+    println!("SDK11 - P-D: one IN-LADDER split -> bob 10k + carol 15k (multi-recipient, laddered parent)");
 
     // --- P-E: Utexo invoice create + fulfill ---------------------------------------------------
     for _ in 0..2 {

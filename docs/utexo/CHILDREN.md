@@ -40,7 +40,7 @@ standard Mercury key-handover (the mechanism proven by sdk41/sdk49) and every pr
 3. **Onward re-transfer** (receiver → next): a normal Model-A transfer of the child — co-sign a new state
    over `ext_child.out[0]` one δ lower, disclose the old state as superseded, convey the **multi-hop**
    bundle (ancestor chain rooted at on-chain `F`). Verified by the **N-hop census**
-   (`se_num_sigs == v1_backups + Σ conveyed_tiers`, history/MIGRATION.md:393-394) — a generalization of
+   (`se_num_sigs == flat_backups + Σ conveyed_tiers`, history/MIGRATION.md:393-394) — a generalization of
    `verify_child_bundle`.
 
 **Why no terminalize/reopen:** after the handover the sender's share is rotated out, so it can never
@@ -63,8 +63,9 @@ transfer). Coordinator-side, lockbox-testable. It also hardens every transfer.
   transfer to a different recipient. Safe after the `get_new_x1` re-order (7e23891). Verified sdk49/41/01
   (transfers) + sdk58/59 (in-ladder split) green on the live server. This is the enabling primitive.
 - **Refined child security model (replaces terminalize+reopen):** with the pending-lock live, the child
-  is NO LONGER terminalized. Its anti-hidden-state safety is: the **census** (`child_num_sigs == v1_backups
-  + conveyed_tiers`, checked at receive) closes any PRE-conveyance rival, and the **pending-lock** (an open
+  is NO LONGER terminalized. Its anti-hidden-state safety is: the **census** (`child_num_sigs ==
+  child_flat_backups + conveyed_tiers`, checked at receive) closes any PRE-conveyance rival, and the
+  **pending-lock** (an open
   transfer on the child) closes any POST-conveyance rival. So `in_ladder_split` drops
   `set_spend_budget(child_sid, 0)` and `verify_child_bundle` drops the `child_terminal` requirement (KEEP
   `parent_terminal` + the census). **INTERDEPENDENT — verified while implementing:** dropping
@@ -103,5 +104,6 @@ transfer). Coordinator-side, lockbox-testable. It also hardens every transfer.
   re-transfers the child OFF-CHAIN to Charlie; Charlie adopts + exits; funds land at Charlie. Adversarial:
   sender-rival-during-pending REJECT (pending lock), hidden-state REJECT (census), re-address REJECT.
 
-Supersedes `history/SPLIT-FINDINGS.md`'s "received children are exit-only" and the reopen in
-`v2-child-retransfer-unsound`.
+Supersedes `history/SPLIT-FINDINGS.md`'s "received children are exit-only" and the budget-reopen
+design of the earlier child-re-transfer analysis (rejected above — see "Why the earlier answers were
+wrong").

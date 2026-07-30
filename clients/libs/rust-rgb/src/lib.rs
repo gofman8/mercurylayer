@@ -34,8 +34,38 @@ use rgb_lib::{
     generate_keys, restore_keys,
     keys::WitnessVersion,
     wallet::{DatabaseType, Online, OnlineOptions, WalletData},
-    Assignment, AssetSchema, BitcoinNetwork, ContractId, FileContent, RgbTransport,
+    Assignment, AssetSchema, BitcoinNetwork, ConsignmentExt, ContractId, FileContent, RgbTransport,
 };
+
+/// The witness txid of every bundle carried by `consignment_base64`, in the consignment's own
+/// bundle order.
+///
+/// This is the read side of the CTES-R **build-time collision assert** (`docs/utexo/CTESR-GATE.md`
+/// §3.1). Two RGB transitions over the SAME parent outpoint with the same amounts and the same seal
+/// blinding collapse to one `OpId` and one `BundleId` (`TransitionBundle::commit_encode` commits
+/// only the `input_map`); rgb-lib then resolves that one BundleId to whichever rival witness has the
+/// numerically smallest *internal* (little-endian) txid. The loser's own consignment therefore comes
+/// back embedding the RIVAL's witness, and no branch the receiver can try will validate.
+///
+/// So: after colouring a tier, the caller MUST check that this list contains the tier's own txid.
+/// Absence is proof that the seal blinding collided — never a receiver-side problem to discover.
+pub fn consignment_witness_txids(consignment_base64: &str) -> Result<Vec<String>> {
+    let bytes = STANDARD
+        .decode(consignment_base64)
+        .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+    let dir = unique_tmp("mercury-rgb-witnesses");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("consignment");
+    fs::write(&path, &bytes)?;
+    let consignment = rgb_lib::wallet::rust_only::load_transfer(
+        path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+    )?;
+    let _ = fs::remove_dir_all(&dir);
+    Ok(consignment
+        .bundled_witnesses()
+        .map(|wb| wb.pub_witness.txid().to_string())
+        .collect())
+}
 
 /// An rgb-lib wallet wired for use alongside a Mercury Layer wallet.
 pub struct RgbWallet {
@@ -374,6 +404,25 @@ impl RgbWallet {
         output_map: HashMap<u32, u64>,
         blinding: u64,
     ) -> Result<(String, String)> {
+        self.color_with_nonce(psbt_base64, contract_id, output_map, blinding, None)
+    }
+
+    /// [`Self::color`] plus an explicit `ColoringInfo.nonce`.
+    ///
+    /// The nonce lands in the RGB transition (`transition_builder.set_nonce`) and therefore
+    /// independently separates the `OpId` **and** the `BundleId` of two transitions over the same
+    /// parent outpoint — the belt-and-braces half of `docs/utexo/CTESR-GATE.md` §3.1. It is a
+    /// *second* separation, never a substitute: rival tiers must already carry distinct seal
+    /// blindings (see `mercuryrustlib::rgb::TierSeal`), because the blinding is what the receiver
+    /// re-derives. Pass `None` for the historical behaviour (`u64::MAX`, rgb-lib's default).
+    pub fn color_with_nonce(
+        &self,
+        psbt_base64: &str,
+        contract_id: &str,
+        output_map: HashMap<u32, u64>,
+        blinding: u64,
+        nonce: Option<u64>,
+    ) -> Result<(String, String)> {
         let contract = ContractId::from_str(contract_id)
             .map_err(|e| anyhow!("invalid contract id: {e}"))?;
         let mut psbt = RgbPsbt::from_str(psbt_base64).map_err(|e| anyhow!("invalid psbt: {e}"))?;
@@ -388,7 +437,7 @@ impl RgbWallet {
                 },
             )]),
             static_blinding: Some(blinding),
-            nonce: None,
+            nonce,
         };
 
         let transfers = self.wallet.color_psbt_and_consume(&mut psbt, coloring_info)?;
