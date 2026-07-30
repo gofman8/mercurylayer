@@ -83,6 +83,7 @@ pub mod sdk67_inladder_lightning_receive;
 pub mod sdk68_v2_pay_failure_reclaim;
 pub mod sdk69_transfer_many_inladder;
 pub mod sdk70_verifier_binding_adversarial;
+pub mod sdk71_unconditional_ladder;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -362,6 +363,14 @@ async fn main() -> Result<()> {
     // `payload_vout` site fails closed with a named error.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("70") {
         sdk70_verifier_binding_adversarial::execute().await?;
+        return Ok(());
+    }
+    // Unconditional laddering (SDK_E2E=71): claim() ladders a plain deposit with no opt-in; an RGB
+    // carrier is left flat and the skip is surfaced (LadderSkipped); the carrier still transfers;
+    // and a laddered coin can never be conveyed at protocol_version 0 (unreadable ladder / missing
+    // ladder are both refused before any SE co-sign).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("71") {
+        sdk71_unconditional_ladder::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

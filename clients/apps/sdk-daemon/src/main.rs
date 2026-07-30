@@ -188,6 +188,12 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "LadderDefended",
                                 json!({"statechain_id": statechain_id, "tiers_broadcast": tiers_broadcast}),
                             ),
+                            // The coin is FLAT-ONLY (no exit ladder). `reason` uses the stable
+                            // wire spellings ("rgb-carrier", "funding-not-onchain", ...).
+                            WalletEvent::LadderSkipped { statechain_id, reason } => (
+                                "LadderSkipped",
+                                json!({"statechain_id": statechain_id, "reason": reason.as_str()}),
+                            ),
                         };
                         let line = json!({"event": name, "data": data}).to_string();
                         let mut out = tokio::io::stdout();

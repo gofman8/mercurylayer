@@ -7,7 +7,7 @@ use mercuryrustlib::sqlite_manager::{get_wallet, insert_wallet, update_wallet};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::SdkConfig;
-use crate::events::WalletEvent;
+use crate::events::{LadderSkipReason, WalletEvent};
 use crate::types::{Balance, ClaimResult, DepositAddressInfo, SdkError, TokenClaimState, TokenClaimStatus};
 
 /// A complete off-line recovery bundle for a wallet (review H3). Contains everything that lives
@@ -448,15 +448,36 @@ impl UtexoWallet {
             });
         }
 
-        // Auto-establish the TES-R exit ladder for every fresh deposit — unconditional, there is one
-        // protocol. Only CONFIRMED, non-duplicate, non-single-use ROOT coins with no existing ladder
-        // qualify (idempotent). The exit payee is the coin's seed-derived `backup_address`
-        // (recoverable from the mnemonic), NEVER an out-of-wallet address. An establish failure
-        // leaves the coin un-laddered — still exitable via its signed-once backup — and the next
-        // claim() retries.
+        // Auto-establish the TES-R exit ladder — UNCONDITIONAL: every CONFIRMED coin is laddered
+        // unless it falls in one of the three narrow classes that structurally cannot be
+        // (RGB carrier / [B0] un-broadcast funding / legacy no-aggregate). There is one protocol.
+        // The exit payee is the coin's seed-derived `backup_address` (recoverable from the
+        // mnemonic), NEVER an out-of-wallet address. Idempotent: a coin that already has a ladder
+        // is left alone.
+        //
+        // Every skip is now RECORDED (`ladderskip-<sid>` in the wallet DB) and SURFACED
+        // (`WalletEvent::LadderSkipped`) — a review flagged the previous silence as a UX defect,
+        // since the owner only discovered a flat-only coin at transfer time. The record is also
+        // load-bearing for the conveyance path: `transfer_sender::assert_flat_conveyance_is_legitimate`
+        // reads it back to tell a legitimately-flat coin from an unexplained one, because that crate
+        // cannot see RGB state.
         {
             let mut rec = self.record().await?;
             let network = rec.network.clone();
+            // Mark the wallet as ladder-managed: from here on, an unexplained un-laddered coin in
+            // this wallet is a bug and the flat conveyance path refuses it.
+            //
+            // NOT best-effort. This write used to be `let _ = ...`, which made a failed insert a
+            // silent, permanent global off-switch for the conveyance-path classifier. The classifier
+            // no longer depends on this row alone (it arms itself from any ladder artefact — see
+            // `transfer_sender::wallet_is_provably_pre_sdk`), but a wallet DB that cannot take this
+            // write is a fault the caller must see, not one to paper over.
+            mercuryrustlib::transfer_sender::mark_ladder_managed(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+            )
+            .await
+            .map_err(|e| anyhow!("could not mark the wallet ladder-managed: {e}"))?;
             // Terminal-freeze invariant (PROTOCOL.md §5.10, rule 1): RGB rides the signed-once colored
             // carrier model and is NEVER anchored on the renewable T/X/S ladder — a plain tier spend
             // would destroy the allocation. So an RGB carrier must not get a ladder. `single_use`
@@ -472,15 +493,76 @@ impl UtexoWallet {
                 Some(std::collections::HashSet::new())
             };
             // `None` = a token wallet whose RGB state is momentarily unavailable → skip establishing
-            // this pass rather than risk laddering a carrier; the next claim() retries.
+            // this pass rather than risk laddering a carrier; the next claim() retries. Unlike the
+            // old blanket `break`, the affected coins are now recorded + surfaced so the app knows
+            // the whole wallet is flat-only this pass.
+            let rgb_state_unavailable = carriers.is_none();
+            let carriers = carriers.unwrap_or_default();
             for coin in rec.coins.iter_mut() {
-                let Some(carriers) = carriers.as_ref() else { break };
                 let sid = match &coin.statechain_id { Some(s) => s.clone(), None => continue };
-                if coin.status != CoinStatus::CONFIRMED
-                    || coin.duplicate_index != 0
-                    || coin.single_use
-                    || is_token_carrier(coin, carriers)
-                {
+                // A coin that is not CONFIRMED is not "flat-only", it is simply not ready: the
+                // deposit may still be confirming, or the coin is mid-transfer/withdrawing (where a
+                // fresh SE co-sign would inflate `num_sigs` against an open transfer). Not recorded,
+                // not surfaced — nothing has been decided about it.
+                if coin.status != CoinStatus::CONFIRMED {
+                    continue;
+                }
+                let dup = coin.duplicate_index;
+                if dup != 0 {
+                    // Keyed apart (`ladderskip-<sid>#<n>`), so this never touches the index-0 coin's
+                    // record — and the sid's ladder belongs to the index-0 coin, so an existing
+                    // ladder says nothing about the duplicate.
+                    self.note_flat(&sid, dup, LadderSkipReason::DuplicateDeposit).await?;
+                    continue;
+                }
+                // [M2/M3] Read the coin's ladder row FIRST — before the carrier tests and before the
+                // electrum round-trip below.
+                //
+                // [M3] ORDER IS LOAD-BEARING FOR ACCURACY. The carrier / `single_use` /
+                // `rgb-state-unavailable` arms used to run BEFORE this probe, so an ALREADY-LADDERED
+                // coin that happens to be (or to look like) a carrier got a `ladderskip-` record
+                // written for it — and `ladder_skip_reason` / `flat_only_coins` then reported a
+                // laddered coin as flat-only, which is simply false. A coin that HAS a ladder is not
+                // on the flat lane by any reading, so nothing is recorded for it at all.
+                //
+                // [M2] It also means the recorded reason describes the coin's ACTUAL blocker:
+                // deciding `funding-not-onchain` ahead of this would let a coin with an unreadable
+                // `tesr-` row be recorded under a reason that LICENSES flat conveyance. And it is
+                // the cheaper test: an already-laddered coin costs one DB read, not a chain query.
+                match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
+                    // Already established — idempotent. Drop any stale "left flat" record so it can
+                    // never later excuse a flat conveyance of a coin that now HAS a ladder.
+                    Ok(Some(_)) => {
+                        self.clear_flat_note(&sid).await?;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    // [M2] A bundle row we cannot READ. Do not overwrite it by establishing a second
+                    // ladder — but DO record and surface it, because this is the single most
+                    // important flat-only case to tell the owner about: the conveyance path refuses
+                    // such a coin outright (`transfer_sender::execute`'s `tesr::load` Err arm), so
+                    // the coin is untransferable until the row is restored, and it used to reach
+                    // that refusal with no record and no event whatsoever. The coin stays
+                    // withdrawable and unilaterally exitable throughout.
+                    Err(_) => {
+                        self.note_flat(&sid, 0, LadderSkipReason::LadderUnreadable).await?;
+                        continue;
+                    }
+                }
+                if rgb_state_unavailable {
+                    self.note_flat(&sid, 0, LadderSkipReason::RgbStateUnavailable).await?;
+                    continue;
+                }
+                // `single_use` marks a terminalized/combine carrier. It has no production setter
+                // today, but it is NOT redundant: in a wallet with no RGB config the carrier set is
+                // empty by construction, so dropping this flag would newly ladder such a coin —
+                // a fail-OPEN on the terminal-freeze rule. Kept as part of the carrier exclusion.
+                if coin.single_use {
+                    self.note_flat(&sid, 0, LadderSkipReason::TerminalizedCarrier).await?;
+                    continue;
+                }
+                if is_token_carrier(coin, &carriers) {
+                    self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
                     continue;
                 }
                 // ROOT-ONLY [B0]: only a coin whose funding `F` is ON-CHAIN may be laddered. A split
@@ -511,12 +593,24 @@ impl UtexoWallet {
                         _ => None,
                     }
                 };
-                let Some(f_spk_hex) = f_spk_hex else { continue };
-                match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
-                    Ok(Some(_)) => continue, // already established — idempotent
-                    Ok(None) => {}
-                    Err(_) => continue,
-                }
+                let Some(f_spk_hex) = f_spk_hex else {
+                    // [B1, recording side] `funding-not-onchain` is a PERMANENT reason and therefore
+                    // LICENSES a flat conveyance — so it may only be recorded when the coin is
+                    // POSITIVELY known to be an off-chain sub-coin. The `None` above does not prove
+                    // that: an electrum fault produces exactly the same value as a genuinely
+                    // un-broadcast `F`. Writing the permanent reason on a transient fault would
+                    // re-create the very hole [B1] closes, one level up — a blip during claim()
+                    // would license that coin to convey flat forever after. So prove it from the
+                    // coin's own exit material (a `branch-<id>` chain or a `ctesr-<id>` child
+                    // bundle), and otherwise record a TRANSIENT reason that licenses nothing.
+                    let reason = if self.has_offchain_funding_row(&sid).await {
+                        LadderSkipReason::FundingNotOnChain
+                    } else {
+                        LadderSkipReason::FundingUnresolvable
+                    };
+                    self.note_flat(&sid, 0, reason).await?;
+                    continue;
+                };
                 // [R5] BINDABILITY GATE. A receiver accepts a conveyed ladder only through
                 // `verify_bundle_bound`, which fails CLOSED unless the COORDINATOR has an aggregate on
                 // record for the sid and that aggregate is the key controlling `F`. The aggregate column
@@ -548,26 +642,53 @@ impl UtexoWallet {
                 // backfills, the next claim() pass ladders the coin with no client change.
                 let se_agg = match mercuryrustlib::utils::get_statechain_info(&sid, &self.inner.cc).await {
                     Ok(Some(info)) => info.aggregate_pubkey.clone(),
-                    _ => continue, // coordinator unreachable / no record → not known bindable → skip
+                    // Coordinator unreachable / no record → not known bindable → skip. Recorded as
+                    // its own reason, distinct from `NotBindable`: "we could not decide" must never
+                    // be read back as "flat is fine for this coin", so the conveyance path treats
+                    // this record as a REFUSAL, not a licence.
+                    _ => {
+                        self.note_flat(&sid, 0, LadderSkipReason::CoordinatorUnavailable).await?;
+                        continue;
+                    }
                 };
-                if mercuryrustlib::tesr::ladder_binding_precheck(
+                // TYPED CAUSE, not `.is_err()`. Only `NoCoordinatorAggregate` is the permanent,
+                // harmless pre-0009 explanation that the conveyance path may later license; a
+                // non-taproot funding output, an spk that will not decode, or an aggregate that does
+                // not control `F` (a decoy-shaped coin) are DIFFERENT facts and must not be recorded
+                // under the licensing spelling. The blanket `is_err()` here — mirroring the one in
+                // the classifier — was one of the fail-opens this pass removes.
+                if let Err(e) = mercuryrustlib::tesr::ladder_binding_precheck_cause(
                     &sid,
                     &f_spk_hex,
                     se_agg.as_deref(),
                     &network,
-                )
-                .is_err()
-                {
+                ) {
+                    let reason = if e.cause
+                        == mercuryrustlib::tesr::BindingRefusal::NoCoordinatorAggregate
+                    {
+                        LadderSkipReason::NotBindable
+                    } else {
+                        LadderSkipReason::BindingUnresolved
+                    };
+                    self.note_flat(&sid, 0, reason).await?;
                     continue;
                 }
                 let payee = coin.backup_address.clone();
                 match mercuryrustlib::tesr::establish_auto(&self.inner.cc, coin, &payee, &network).await {
                     Ok(bundle) => {
                         if mercuryrustlib::tesr::persist(&self.inner.cc, &self.inner.config.wallet_name, &bundle).await.is_ok() {
+                            self.clear_flat_note(&sid).await?;
                             let _ = self.inner.events_tx.send(WalletEvent::LadderEstablished { statechain_id: sid });
+                        } else {
+                            // Co-signed but not persisted — the coin is flat-only until a retry.
+                            self.note_flat(&sid, 0, LadderSkipReason::EstablishFailed).await?;
                         }
                     }
-                    Err(_) => { /* leave un-laddered: its tx1 backup still exits; resumable retry is a later stage */ }
+                    // Leave un-laddered: its tx1 backup still exits, and the next pass retries. The
+                    // owner is told, because a coin that keeps failing here is flat-only in practice.
+                    Err(_) => {
+                        self.note_flat(&sid, 0, LadderSkipReason::EstablishFailed).await?;
+                    }
                 }
             }
         }
@@ -617,6 +738,166 @@ impl UtexoWallet {
             claimed_transfers: receive.received_statechain_ids.len() as u32,
             confirmed_deposits,
             token_results: token_status.into_values().collect(),
+        })
+    }
+
+    /// Record that a coin was left on the FLAT (un-laddered) lane, and tell the application — but
+    /// only the FIRST time this reason applies. Both halves matter:
+    ///   * the DB record is what `transfer_sender::assert_flat_conveyance_is_legitimate` reads back
+    ///     to tell a legitimately-flat coin (carrier / [B0] / legacy) from an unexplained one, since
+    ///     that crate cannot see RGB state;
+    ///   * the event is the owner's advance notice that the coin is flat-only, instead of finding
+    ///     out at transfer time.
+    /// De-duplicated on the recorded reason so the polling background watcher does not spam it.
+    ///
+    /// **The write failure is NOT swallowed.** It used to end in `.unwrap_or(false)`, which meant a
+    /// DB fault left a legitimately-flat carrier with no record and no event — and a carrier with no
+    /// record cannot be conveyed at all, because the conveyance-path classifier has no way to see
+    /// RGB state and depends on this row to explain the coin. Silently producing an untransferable
+    /// coin is strictly worse than failing the `claim()` pass, which the caller can retry.
+    async fn note_flat(
+        &self,
+        statechain_id: &str,
+        duplicate_index: u32,
+        reason: LadderSkipReason,
+    ) -> Result<()> {
+        let changed = mercuryrustlib::transfer_sender::record_ladder_skip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            duplicate_index,
+            reason.as_str(),
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "could not record why statechain id {statechain_id} was left on the flat lane \
+                 (reason '{}'): {e}. Refusing to continue the ladder pass silently — without that \
+                 record the coin cannot be conveyed at all.",
+                reason.as_str()
+            )
+        })?;
+        if changed {
+            let _ = self.inner.events_tx.send(WalletEvent::LadderSkipped {
+                statechain_id: statechain_id.to_string(),
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    /// [M3] Why this coin is **flat-only**, read back from the persisted record — `None` when the
+    /// coin has no recorded reason (it is laddered, or no `claim()` pass has decided its lane yet).
+    ///
+    /// [`WalletEvent::LadderSkipped`] fires only on a TRANSITION, so an app that starts after the
+    /// transition — a fresh process, a restored wallet, a UI opened later — would otherwise have NO
+    /// way to learn a coin is flat-only until a transfer failed. This is that way, and it is
+    /// SDK-level: the underlying record lives in mercuryrustlib and was not reachable from an SDK
+    /// consumer at all.
+    ///
+    /// ⚠️ This returns `None` both when no record exists AND when the record carries a spelling this
+    /// build does not know (a forward value written by a newer client). Use
+    /// [`Self::ladder_skip_reason_raw`] where that difference matters — it never loses information.
+    pub async fn ladder_skip_reason(&self, statechain_id: &str) -> Option<LadderSkipReason> {
+        LadderSkipReason::from_str(&self.ladder_skip_reason_raw(statechain_id).await?)
+    }
+
+    /// The exact persisted spelling of this coin's flat-only reason (e.g. `"rgb-carrier"`), or
+    /// `None` if none is recorded. Preferred over [`Self::ladder_skip_reason`] when the caller must
+    /// not silently drop a reason spelling this build predates.
+    pub async fn ladder_skip_reason_raw(&self, statechain_id: &str) -> Option<String> {
+        mercuryrustlib::transfer_sender::read_ladder_skip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            0,
+        )
+        .await
+    }
+
+    /// [M3] Every coin in this wallet currently recorded as flat-only, as
+    /// `(statechain_id, raw_reason, may_still_be_transferred)`.
+    ///
+    /// The third element is the one an app actually needs: `true` means the reason is a PERMANENT,
+    /// structural one that legitimises conveying the coin on the flat lane (an RGB carrier, an
+    /// off-chain funding, a legacy no-aggregate coin), so the coin still transfers; `false` means
+    /// the coin is currently NOT transferable and `send` will refuse it — run `claim()` again, and
+    /// if the reason persists the coin needs operator attention. Either way the coin's value is
+    /// unaffected: it remains withdrawable and unilaterally exitable.
+    pub async fn flat_only_coins(&self) -> Result<Vec<(String, String, bool)>> {
+        let rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        .map_err(|e| anyhow!("could not read the wallet's backup rows: {e}"))?;
+        let mut out = Vec::new();
+        for (key, json) in rows {
+            // `ladderskip-<sid>` for the index-0 coin; `ladderskip-<sid>#<n>` for a duplicate.
+            let Some(rest) = key.strip_prefix("ladderskip-") else { continue };
+            if rest.contains('#') {
+                continue;
+            }
+            let Some(reason) = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string()))
+            else {
+                // An unreadable record is itself a flat-only condition the conveyance path refuses;
+                // report it rather than dropping the coin from the listing.
+                out.push((rest.to_string(), String::new(), false));
+                continue;
+            };
+            let transferable =
+                mercuryrustlib::transfer_sender::is_legitimate_flat_reason(&reason);
+            out.push((rest.to_string(), reason, transferable));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Does this coin carry POSITIVE evidence that its funding `F` is off chain — a `branch-<id>`
+    /// exit chain (flat sub-coin) or a `ctesr-<id>` child bundle (in-ladder split child)? These are
+    /// the same two witnesses `transfer_sender::assert_flat_conveyance_is_legitimate` accepts, so
+    /// the recording side and the conveyance side agree on what "[B0] off-chain" means. A DB error
+    /// reads as "no evidence", which is the conservative answer here: it downgrades a permanent,
+    /// licensing reason to a transient one.
+    async fn has_offchain_funding_row(&self, statechain_id: &str) -> bool {
+        let Ok(rows) = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        else {
+            return false;
+        };
+        let branch_key = format!("branch-{statechain_id}");
+        let child_key = format!("ctesr-{statechain_id}");
+        rows.iter().any(|(k, json)| {
+            if *k == child_key {
+                return true;
+            }
+            *k == branch_key
+                && serde_json::from_str::<serde_json::Value>(json)
+                    .ok()
+                    .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Drop a coin's "left flat" record — it now has a ladder, and a stale record must never later
+    /// excuse conveying a laddered coin flat. The delete's failure is surfaced for the same reason
+    /// [`Self::note_flat`]'s is: this record is load-bearing for the conveyance path, so a DB fault
+    /// that leaves it wrong must be visible rather than inferred later from a puzzling refusal.
+    async fn clear_flat_note(&self, statechain_id: &str) -> Result<()> {
+        mercuryrustlib::transfer_sender::clear_ladder_skip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            0,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!("could not clear the flat-lane record of statechain id {statechain_id}: {e}")
         })
     }
 

@@ -43,4 +43,131 @@ pub enum WalletEvent {
     /// malicious sender can no longer claw back the shared root. Emitted by `auto_exit_due`; the
     /// plain (RGB-unaware) exit path still refuses carriers, so this is their dedicated protection.
     TokenCarrierMaterialized { statechain_id: String, deadline_block: u32, tip: u32 },
+    /// A CONFIRMED coin was **left on the flat (un-laddered) lane** by the `claim()` ladder pass, so
+    /// it has no TES-R exit ladder and cannot be conveyed on the R′ path.
+    ///
+    /// Laddering is otherwise unconditional, so this is the app's only advance notice that a
+    /// particular coin is flat-only — a review flagged the previous silence as a UX defect, because
+    /// the owner discovered it at transfer time (or, worse, never). Some reasons are permanent for
+    /// the coin ([`LadderSkipReason::RgbCarrier`], [`LadderSkipReason::FundingNotOnChain`]) and some
+    /// clear themselves on a later pass ([`LadderSkipReason::CoordinatorUnavailable`]); the event is
+    /// emitted only when the recorded reason CHANGES, so a polling watcher does not spam it.
+    ///
+    /// ⚠️ Because it is transition-only, an app that STARTS after the transition never sees it.
+    /// [`crate::UtexoWallet::ladder_skip_reason`] / [`crate::UtexoWallet::flat_only_coins`] read the
+    /// same persisted record back on demand and are the authority for "is this coin flat-only?".
+    LadderSkipped { statechain_id: String, reason: LadderSkipReason },
+}
+
+/// Why the `claim()` ladder pass left a coin un-laddered. See [`WalletEvent::LadderSkipped`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LadderSkipReason {
+    /// The coin carries an RGB allocation. PERMANENT until CTES-R colouring lands: a plain tier
+    /// spend carries no state transition and would DESTROY the allocation (terminal freeze).
+    RgbCarrier,
+    /// The coin is flagged `single_use` — a terminalized/combine carrier. Same terminal-freeze
+    /// reason as [`Self::RgbCarrier`], reached through the flag rather than the allocation set.
+    TerminalizedCarrier,
+    /// This wallet holds RGB state that could not be read this pass, so the carrier set is unknown.
+    /// Fail-closed: nothing in the wallet is laddered rather than risk laddering a carrier.
+    RgbStateUnavailable,
+    /// [B0] The coin's funding output `F` is not on chain (a split sub-coin's `F` is an un-broadcast
+    /// split output), so a ladder trigger would have no prevout to spend. PERMANENT for the coin —
+    /// laddering a sub-coin is the in-ladder split's job (`establish_child`), not this pass's.
+    ///
+    /// Recorded only on POSITIVE evidence (a `branch-<id>` exit chain or a `ctesr-<id>` child
+    /// bundle). A funding output that merely could not be looked up is
+    /// [`Self::FundingUnresolvable`] instead — this reason licenses flat conveyance, so it must
+    /// never be written on a transient chain-backend fault.
+    FundingNotOnChain,
+    /// The coin's funding output could not be resolved this pass (chain backend unreachable, or a
+    /// funding outpoint the wallet cannot parse), so the pass cannot tell whether the coin is an
+    /// off-chain sub-coin ([`Self::FundingNotOnChain`], permanent) or an ordinary on-chain root that
+    /// simply has not been laddered yet. TRANSIENT: the next pass retries, and it licenses nothing.
+    FundingUnresolvable,
+    /// The coordinator has no aggregate on record for this statechain id (a pre-migration-0009
+    /// legacy coin), so no receiver could bind a ladder built over it. Laddering it would burn three
+    /// irreversible SE co-signs for nothing. The coin stays flat, claimable and withdrawable.
+    NotBindable,
+    /// The coordinator could not be reached (or returned no record) this pass, so bindability is
+    /// unknown. TRANSIENT: the next pass retries.
+    CoordinatorUnavailable,
+    /// The ladder could not be bound for a reason that is NOT the pre-0009 legacy case: the funding
+    /// output is not v1 taproot, its scriptPubKey would not decode, or the coordinator's aggregate
+    /// does not control `F` (a decoy-shaped coin). Distinct from [`Self::NotBindable`] on purpose —
+    /// only "the coordinator recorded no aggregate" is the permanent, harmless explanation that
+    /// licenses a flat conveyance, and a blanket `is_err()` on the binding precheck used to fold all
+    /// of these into it. Licenses NOTHING; the coin needs operator attention.
+    BindingUnresolved,
+    /// Establishing the ladder failed (SE co-sign refused, signature budget, network). TRANSIENT in
+    /// principle — the next pass retries — but a coin stuck on this reason is flat-only in practice,
+    /// which is exactly why it is surfaced.
+    EstablishFailed,
+    /// A duplicate deposit (`duplicate_index != 0`). PERMANENT: a duplicate never becomes index 0,
+    /// and the statechain id's ladder belongs to the index-0 coin.
+    DuplicateDeposit,
+    /// [M2] The coin's `tesr-<sid>` row exists but could not be READ (corrupt / unparseable JSON), so
+    /// the pass cannot tell whether the coin already has a ladder. It refuses to establish a second
+    /// one over the unreadable row. TRANSIENT-looking but in practice terminal until the row is
+    /// restored from a recovery bundle — and it is the single most important case to surface,
+    /// because the conveyance path ALSO refuses such a coin (a ladder we cannot read is not a ladder
+    /// we may assume away). The coin stays withdrawable and unilaterally exitable throughout.
+    LadderUnreadable,
+}
+
+impl LadderSkipReason {
+    /// Stable wire/DB spelling, persisted in the wallet DB so the conveyance path can tell a
+    /// legitimately-flat coin from an unexplained one. Never change these strings casually.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RgbCarrier => mercuryrustlib::transfer_sender::FLAT_RGB_CARRIER,
+            Self::TerminalizedCarrier => mercuryrustlib::transfer_sender::FLAT_TERMINALIZED_CARRIER,
+            Self::RgbStateUnavailable => mercuryrustlib::transfer_sender::FLAT_RGB_STATE_UNAVAILABLE,
+            Self::FundingNotOnChain => mercuryrustlib::transfer_sender::FLAT_FUNDING_NOT_ONCHAIN,
+            Self::FundingUnresolvable => mercuryrustlib::transfer_sender::FLAT_FUNDING_UNRESOLVABLE,
+            Self::NotBindable => mercuryrustlib::transfer_sender::FLAT_NOT_BINDABLE,
+            Self::CoordinatorUnavailable => mercuryrustlib::transfer_sender::FLAT_COORDINATOR_UNAVAILABLE,
+            Self::BindingUnresolved => mercuryrustlib::transfer_sender::FLAT_BINDING_UNRESOLVED,
+            Self::EstablishFailed => mercuryrustlib::transfer_sender::FLAT_ESTABLISH_FAILED,
+            Self::DuplicateDeposit => mercuryrustlib::transfer_sender::FLAT_DUPLICATE_DEPOSIT,
+            Self::LadderUnreadable => mercuryrustlib::transfer_sender::FLAT_LADDER_UNREADABLE,
+        }
+    }
+
+    /// Parse a persisted spelling back. `None` for a spelling this build does not know — a forward
+    /// value written by a newer client, which callers must treat as "flat-only for an unknown
+    /// reason", never as "no reason recorded".
+    pub fn from_str(s: &str) -> Option<Self> {
+        const ALL: &[LadderSkipReason] = &[
+            LadderSkipReason::RgbCarrier,
+            LadderSkipReason::TerminalizedCarrier,
+            LadderSkipReason::RgbStateUnavailable,
+            LadderSkipReason::FundingNotOnChain,
+            LadderSkipReason::FundingUnresolvable,
+            LadderSkipReason::NotBindable,
+            LadderSkipReason::CoordinatorUnavailable,
+            LadderSkipReason::BindingUnresolved,
+            LadderSkipReason::EstablishFailed,
+            LadderSkipReason::DuplicateDeposit,
+            LadderSkipReason::LadderUnreadable,
+        ];
+        ALL.iter().copied().find(|r| r.as_str() == s)
+    }
+
+    /// Would this reason LICENSE conveying the coin on the flat lane?
+    ///
+    /// Only the structurally-permanent reasons would. A transient reason ("we could not decide this
+    /// pass") must never harden into "flat is fine forever".
+    ///
+    /// ⚠️ **A PREDICTION, not the decision.** The authority is
+    /// [`mercuryrustlib::transfer_sender::assert_flat_conveyance_is_legitimate`], which re-proves
+    /// every licence from live evidence at conveyance time (the `branch-`/`ctesr-` exit material for
+    /// [`Self::FundingNotOnChain`], the coin's own `single_use` flag for
+    /// [`Self::TerminalizedCarrier`], the coordinator's live answer for [`Self::NotBindable`]).
+    /// `false` here is reliable — the classifier is strictly stricter than this predicate — while
+    /// `true` means "the classifier will say yes provided the evidence is still there". This exists
+    /// so an app can warn ahead of a `send`, never so it can skip the classifier.
+    pub fn permits_flat_conveyance(&self) -> bool {
+        mercuryrustlib::transfer_sender::is_legitimate_flat_reason(self.as_str())
+    }
 }

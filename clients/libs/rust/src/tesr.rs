@@ -1374,22 +1374,103 @@ pub fn ladder_binding_precheck(
     se_aggregate_pubkey: Option<&str>,
     network: &str,
 ) -> Result<()> {
+    ladder_binding_precheck_cause(statechain_id, f_spk_hex, se_aggregate_pubkey, network)
+        .map_err(anyhow::Error::new)
+}
+
+/// **WHY the ladder could not be bound — the typed counterpart of [`ladder_binding_precheck`].**
+///
+/// The causes are NOT interchangeable, and a caller that collapses them fails OPEN. Only
+/// [`BindingRefusal::NoCoordinatorAggregate`] is a structurally PERMANENT property of the coin (a
+/// pre-0009 legacy row: nothing about the coin will ever make it bindable until the coordinator
+/// backfills), and it is the only cause that may be read as "this coin legitimately has no ladder".
+/// Every other cause means the coin's shape is WRONG or unreadable — a non-taproot funding output, a
+/// scriptPubKey we could not parse, an aggregate that does not control `F` — and a caller must
+/// refuse rather than treat it as a licence.
+///
+/// The flat-conveyance classifier in `transfer_sender` used to test `ladder_binding_precheck(..)
+/// .is_err()` and license the flat lane on ANY error, which silently folded "decoy-shaped coin" and
+/// "spk we could not decode" into "harmless legacy coin". This enum exists so it cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingRefusal {
+    /// The coordinator has NO `aggregate_pubkey` on record for the sid (pre-migration-0009 legacy
+    /// row). PERMANENT for the coin until a coordinator-side backfill.
+    NoCoordinatorAggregate,
+    /// The funding scriptPubKey is not hex — the caller handed us something unreadable.
+    FundingSpkUnparseable,
+    /// The funding output is not a v1 taproot output, so it has no aggregate key to bind to.
+    FundingNotTaproot,
+    /// The coordinator's recorded aggregate could not be tweaked into a P2TR key (unusable key).
+    AggregateUnusable,
+    /// The coordinator HAS an aggregate for the sid, but it is not the key controlling `F`. A ladder
+    /// here would be refused as a decoy at acceptance.
+    AggregateMismatch,
+}
+
+/// [`BindingRefusal`] plus the human-readable message the untyped
+/// [`ladder_binding_precheck`] has always produced (unchanged, so callers that string-match keep
+/// working).
+#[derive(Clone, Debug)]
+pub struct LadderBindingError {
+    pub cause: BindingRefusal,
+    pub message: String,
+}
+
+impl std::fmt::Display for LadderBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LadderBindingError {}
+
+/// [`ladder_binding_precheck`] with the refusal CAUSE preserved. See [`BindingRefusal`].
+pub fn ladder_binding_precheck_cause(
+    statechain_id: &str,
+    f_spk_hex: &str,
+    se_aggregate_pubkey: Option<&str>,
+    network: &str,
+) -> std::result::Result<(), LadderBindingError> {
+    let refuse = |cause: BindingRefusal, message: String| LadderBindingError { cause, message };
     let net = net_from_str(network);
-    let f_spk = hex::decode(f_spk_hex)
-        .map_err(|_| anyhow::anyhow!("funding scriptPubKey is not hex — cannot bind a ladder"))?;
-    let a_onchain = taproot_key_hex(&f_spk).map_err(|e| {
-        anyhow::anyhow!("coin funding output is not a v1 taproot output: {e}")
-    })?;
-    let se_agg = se_aggregate_pubkey.ok_or_else(|| {
-        anyhow::anyhow!(
-            "the coordinator recorded no aggregate for statechain id {statechain_id} — a ladder over \
-             this coin could not be bound by any receiver (pre-0009 legacy coin: leave it un-laddered)"
+    let f_spk = hex::decode(f_spk_hex).map_err(|_| {
+        refuse(
+            BindingRefusal::FundingSpkUnparseable,
+            "funding scriptPubKey is not hex — cannot bind a ladder".to_string(),
         )
     })?;
-    if tweaked_p2tr_key_hex(se_agg, net)? != a_onchain {
-        return Err(anyhow::anyhow!(
-            "the coordinator's aggregate for statechain id {statechain_id} does not match the funding \
-             output key — a ladder over this coin would be refused as a decoy"
+    let a_onchain = taproot_key_hex(&f_spk).map_err(|e| {
+        refuse(
+            BindingRefusal::FundingNotTaproot,
+            format!("coin funding output is not a v1 taproot output: {e}"),
+        )
+    })?;
+    let se_agg = se_aggregate_pubkey.ok_or_else(|| {
+        refuse(
+            BindingRefusal::NoCoordinatorAggregate,
+            format!(
+                "the coordinator recorded no aggregate for statechain id {statechain_id} — a ladder \
+                 over this coin could not be bound by any receiver (pre-0009 legacy coin: leave it \
+                 un-laddered)"
+            ),
+        )
+    })?;
+    let se_agg_spk = tweaked_p2tr_key_hex(se_agg, net).map_err(|e| {
+        refuse(
+            BindingRefusal::AggregateUnusable,
+            format!(
+                "the coordinator's aggregate for statechain id {statechain_id} is not a usable \
+                 x-only key ({e}) — a ladder over this coin could not be bound"
+            ),
+        )
+    })?;
+    if se_agg_spk != a_onchain {
+        return Err(refuse(
+            BindingRefusal::AggregateMismatch,
+            format!(
+                "the coordinator's aggregate for statechain id {statechain_id} does not match the \
+                 funding output key — a ladder over this coin would be refused as a decoy"
+            ),
         ));
     }
     Ok(())
@@ -2548,6 +2629,34 @@ mod verify_tests {
             ladder_binding_precheck("sid", "zz", Some(OTHER_XONLY), "regtest").is_err(),
             "unparseable spk must fail closed"
         );
+    }
+
+    /// The four refusal causes are DISTINGUISHABLE. A caller that collapses them into `is_err()`
+    /// licenses "decoy-shaped coin" and "unreadable spk" as if they were the harmless legacy case —
+    /// which is exactly the fail-open the flat-conveyance classifier used to have.
+    #[test]
+    fn precheck_reports_a_distinguishable_cause_for_every_refusal() {
+        use BindingRefusal::*;
+        let cases: &[(BindingRefusal, &str, Option<&str>)] = &[
+            (NoCoordinatorAggregate, &"", None),
+            (AggregateMismatch, &"", Some(OTHER_XONLY)),
+            (FundingNotTaproot, "51024e73", Some(OTHER_XONLY)),
+            (FundingSpkUnparseable, "zz", Some(OTHER_XONLY)),
+        ];
+        let agg = agg_spk_hex();
+        for (expected, spk, se_agg) in cases {
+            let spk = if spk.is_empty() { agg.as_str() } else { *spk };
+            let e = ladder_binding_precheck_cause("sid", spk, *se_agg, "regtest")
+                .expect_err("this shape must not be ladderable");
+            assert_eq!(e.cause, *expected, "wrong cause for spk={spk} agg={se_agg:?}: {e}");
+            // The untyped wrapper keeps producing the exact same prose.
+            assert_eq!(
+                ladder_binding_precheck("sid", spk, *se_agg, "regtest").unwrap_err().to_string(),
+                e.message
+            );
+        }
+        // ...and ONLY the legacy case is the permanent one a caller may license.
+        assert_ne!(AggregateMismatch, NoCoordinatorAggregate);
     }
 
     #[test]
