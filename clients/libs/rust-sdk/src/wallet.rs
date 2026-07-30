@@ -7,7 +7,7 @@ use mercuryrustlib::sqlite_manager::{get_wallet, insert_wallet, update_wallet};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::SdkConfig;
-use crate::events::{LadderSkipReason, WalletEvent};
+use crate::events::{LadderSkipReason, WalletEvent, WatchtowerPass};
 use crate::types::{Balance, ClaimResult, DepositAddressInfo, SdkError, TokenClaimState, TokenClaimStatus};
 
 /// A complete off-line recovery bundle for a wallet (review H3). Contains everything that lives
@@ -29,10 +29,39 @@ pub struct RecoveryBundle {
     pub notes: String,
 }
 
+/// A deadline-critical background pass that could not SEE what it needed to see, retained on the
+/// wallet until a later pass of the same kind succeeds (external review F3).
+///
+/// A background watcher must not die on a transient fault — but it must not look healthy while
+/// protecting nothing either. So each failing pass emits [`WalletEvent::WatchtowerBlind`] AND leaves
+/// this record behind; [`UtexoWallet::watchtower_faults`] reads it back on demand, so an app that
+/// subscribed late (or does not subscribe at all) can still answer "is my protection running?".
+#[derive(Clone, Debug)]
+pub struct WatchtowerFault {
+    /// Which pass is blind.
+    pub pass: WatchtowerPass,
+    /// The most recent underlying error.
+    pub detail: String,
+    /// How many consecutive passes of this kind have failed. `1` is a blip; a growing number on a
+    /// wallet holding received off-chain coins is an incident.
+    pub consecutive_failures: u32,
+    /// Unix seconds of the FIRST failure in this run (i.e. how long the wallet has been blind).
+    pub since_unix: u64,
+    /// Unix seconds of the most recent failure.
+    pub last_unix: u64,
+}
+
 pub(crate) struct Inner {
     pub cc: ClientConfig,
     pub config: SdkConfig,
     pub events_tx: broadcast::Sender<WalletEvent>,
+    /// Retained "this pass is blind" state, keyed by pass. Empty = every pass that has run, ran with
+    /// full visibility. See [`WatchtowerFault`].
+    pub watchtower_faults: Mutex<std::collections::BTreeMap<WatchtowerPass, WatchtowerFault>>,
+    /// Chain height at which [`UtexoWallet::defend_ladders`] last ran from the background loop. The
+    /// TES-R defence is a PER-BLOCK reaction (tier CSVs only mature on a new block), so the loop
+    /// gates on this instead of hammering the chain backend every `poll_interval_secs`.
+    pub last_defended_height: Mutex<Option<u32>>,
     /// Pre-paid ONBOARDING deposit-token ids, consumed one per fresh on-chain slot (deposit
     /// address, issuance carrier). Derived slots (split/combine/refresh outputs) never draw on
     /// this pool — they use free SE-minted derived tokens (`take_derived_tokens`).
@@ -104,6 +133,8 @@ impl UtexoWallet {
                 token_pool: Mutex::new(Vec::new()),
                 wallet_lock: Mutex::new(()),
                 rgb: Mutex::new(None),
+                watchtower_faults: Mutex::new(std::collections::BTreeMap::new()),
+                last_defended_height: Mutex::new(None),
             }),
         };
         Ok((wallet, mnemonic_out))
@@ -204,6 +235,8 @@ impl UtexoWallet {
                 token_pool: Mutex::new(Vec::new()),
                 wallet_lock: Mutex::new(()),
                 rgb: Mutex::new(None),
+                watchtower_faults: Mutex::new(std::collections::BTreeMap::new()),
+                last_defended_height: Mutex::new(None),
             }),
         };
         Ok((wallet, mnemonic_out))
@@ -212,6 +245,59 @@ impl UtexoWallet {
     /// Subscribe to wallet events (deposits confirmed, transfers claimed, balance updates).
     pub fn subscribe(&self) -> broadcast::Receiver<WalletEvent> {
         self.inner.events_tx.subscribe()
+    }
+
+    /// Every deadline-critical pass that is currently BLIND, newest state per pass (external review
+    /// F3). Empty = every pass that has run, ran with full visibility.
+    ///
+    /// This is the retained half of the fail-loud contract: a background watcher must survive a
+    /// transient fault, so it keeps looping — but it emits [`WalletEvent::WatchtowerBlind`] on every
+    /// failing pass AND leaves a [`WatchtowerFault`] here, so an app that never subscribed (or
+    /// subscribed after the fact) can still tell "nothing to do" from "I could not see". Poll this
+    /// next to `get_balance` and alert on a non-empty result: while it is non-empty, nothing is
+    /// racing a clawback or a hostile trigger on this wallet's behalf.
+    pub async fn watchtower_faults(&self) -> Vec<WatchtowerFault> {
+        self.inner.watchtower_faults.lock().await.values().cloned().collect()
+    }
+
+    /// `true` iff any deadline-critical pass is currently blind. Convenience over
+    /// [`Self::watchtower_faults`].
+    pub async fn is_watchtower_blind(&self) -> bool {
+        !self.inner.watchtower_faults.lock().await.is_empty()
+    }
+
+    /// Record (or extend) a blind pass: emit [`WalletEvent::WatchtowerBlind`] and retain the state.
+    /// Called by the pass itself, so a DIRECT caller of `auto_exit_due` / `defend_ladders` gets the
+    /// same signal as the background loop.
+    pub(crate) async fn note_watchtower_blind(&self, pass: WatchtowerPass, detail: String) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        {
+            let mut faults = self.inner.watchtower_faults.lock().await;
+            let entry = faults.entry(pass).or_insert_with(|| WatchtowerFault {
+                pass,
+                detail: detail.clone(),
+                consecutive_failures: 0,
+                since_unix: now,
+                last_unix: now,
+            });
+            entry.detail = detail.clone();
+            entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            entry.last_unix = now;
+        }
+        // Emitted on EVERY failing pass, not only on the transition: a subscriber that starts while
+        // the wallet is already blind must not have to wait for a recovery to learn about it.
+        let _ = self
+            .inner
+            .events_tx
+            .send(WalletEvent::WatchtowerBlind { pass, detail });
+    }
+
+    /// Clear the retained blind state for a pass that has now run with full visibility.
+    pub(crate) async fn note_watchtower_ok(&self, pass: WatchtowerPass) {
+        self.inner.watchtower_faults.lock().await.remove(&pass);
     }
 
     /// Fixed derivation path for the wallet's stable identity key (distinct from coin keys at
@@ -288,15 +374,17 @@ impl UtexoWallet {
         let record = self.record().await?;
         // Fail CLOSED for token wallets (audit [23]): if RGB state is unavailable we cannot know
         // which coins are carriers, and silently counting a carrier's sats as spendable BTC would
-        // invite an RGB-destroying spend. For a non-token wallet there are no carriers, so an empty
-        // set is correct.
-        let carriers = if self.inner.config.rgb_data_dir.is_some()
-            && self.inner.config.rgb_proxy_url.is_some()
-        {
-            self.unspendable_as_btc_outpoints().await?
-        } else {
-            self.unspendable_as_btc_outpoints().await.unwrap_or_default()
-        };
+        // invite an RGB-destroying spend.
+        //
+        // [F3] The non-token arm used to swallow the error with `unwrap_or_default()`. It is
+        // infallible TODAY (both `token_carrier_outpoints` and `consignment_bearing_outpoints`
+        // return early with an empty set when the RGB config is absent) — which is exactly why
+        // swallowing it bought nothing and hid everything: the day either helper grows a fallible
+        // step before that early return, an empty carrier set silently becomes "no carriers" and a
+        // carrier's sats are reported as spendable BTC. Propagate from both arms.
+        let carriers = self.unspendable_as_btc_outpoints().await.map_err(|e| {
+            anyhow!("cannot compute balance: RGB token-carrier state is unavailable ({e}) — a carrier's sats must never be reported as spendable BTC")
+        })?;
         let mut balance = compute_balance_excluding(&record, &carriers);
         balance.tokens = self.get_token_balances().await.unwrap_or_default();
         Ok(balance)
@@ -973,9 +1061,17 @@ impl UtexoWallet {
         }
     }
 
-    /// Start the background watcher (deposit confirmation + incoming-transfer auto-claim).
+    /// Start the background watcher (deposit confirmation + incoming-transfer auto-claim +
+    /// **both** deadline-critical defences).
     /// Returns a handle; abort it to stop. Mirrors the Spark SDK's background stream + claim
     /// automation (poll-based — Mercury has no server push).
+    ///
+    /// Each pass runs, in order: [`Self::claim`], optional [`Self::auto_refresh_due`],
+    /// [`Self::defend_ladders`] (once per new block — external review F2; it was previously spawned
+    /// by NOTHING, so a hostile trigger on a laddered coin was never raced) and
+    /// [`Self::auto_exit_due`]. A failing pass never kills the loop, but it is never silent either:
+    /// it emits [`WalletEvent::WatchtowerBlind`] and retains a [`WatchtowerFault`] visible through
+    /// [`Self::watchtower_faults`].
     pub fn start_background(&self) -> tokio::task::JoinHandle<()> {
         let wallet = self.clone();
         let interval = self.inner.config.poll_interval_secs.max(1);
@@ -991,10 +1087,47 @@ impl UtexoWallet {
                         .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
                         .await;
                 }
+                // [F2] TES-R ladder defence. UNCONDITIONAL — there is no opt-in and no config flag,
+                // because there is no wallet that wants an un-defended ladder: if someone broadcasts
+                // a hostile trigger on a laddered coin, this is the only thing that races it, and the
+                // owner's adopted state carries the strictly-lowest CSV so it wins if (and only if)
+                // it is actually broadcast. It used to be spawned by nothing at all — every shipped
+                // wrapper started only claim() + auto_exit_due, so the defence existed as an API and
+                // never as a running process.
+                //
+                // Gated to ONE pass per new block: a tier's relative-CSV can only mature on a block,
+                // so a per-poll pass (5 s on regtest) would add two chain queries per laddered coin
+                // for nothing. An un-triggered coin is a no-op either way (`watch_pass` returns
+                // early while F is unspent). If the tip cannot be read, run anyway — being unsure is
+                // a reason to defend, not to skip.
+                let tip_now = {
+                    use electrum_client::ElectrumApi;
+                    wallet
+                        .inner
+                        .cc
+                        .electrum_client
+                        .block_headers_subscribe_raw()
+                        .ok()
+                        .map(|h| h.height as u32)
+                };
+                let due = match tip_now {
+                    Some(h) => *wallet.inner.last_defended_height.lock().await != Some(h),
+                    None => true,
+                };
+                if due {
+                    // Errors are already surfaced by `defend_ladders` itself (WatchtowerBlind + a
+                    // retained WatchtowerFault); the loop must keep going either way.
+                    let _ = wallet.defend_ladders().await;
+                    if let Some(h) = tip_now {
+                        *wallet.inner.last_defended_height.lock().await = Some(h);
+                    }
+                }
                 // Watchtower pass: protect off-chain coins nearing their exit-race deadline —
                 // force-exit plain sub-coins, MATERIALIZE token carriers (REQ-33). Default-on so an
                 // idle receiver is protected without scheduling anything.
                 if wallet.inner.config.auto_exit {
+                    // Same contract: a failure here is loud (WatchtowerBlind + retained fault), not
+                    // fatal to the loop.
                     let _ = wallet
                         .auto_exit_due(wallet.inner.config.auto_exit_margin_blocks)
                         .await;
@@ -1024,11 +1157,41 @@ impl UtexoWallet {
     /// (audit [10]). Returns the statechain_ids acted on. Call on an interval from your own loop (or
     /// alongside `claim()`), especially for wallets holding received off-chain coins/tokens — an
     /// offline owner is otherwise exposed to clawback.
+    ///
+    /// **Fails CLOSED and LOUD (external review F3).** A pass that cannot see is not a pass that
+    /// found nothing: any failure here — chain tip, wallet record, or the RGB carrier enumeration —
+    /// emits [`WalletEvent::WatchtowerBlind`], retains a [`WatchtowerFault`] readable through
+    /// [`Self::watchtower_faults`], and returns `Err`. It never proceeds on a defaulted-empty
+    /// carrier set: that made every carrier fail `is_token_carrier`, so the materialisation loop
+    /// below found nothing to protect and the pass reported success while doing nothing at all.
     pub async fn auto_exit_due(&self, margin_blocks: u32) -> Result<Vec<String>> {
+        match self.auto_exit_due_inner(margin_blocks).await {
+            Ok(v) => {
+                self.note_watchtower_ok(WatchtowerPass::AutoExit).await;
+                Ok(v)
+            }
+            Err(e) => {
+                self.note_watchtower_blind(WatchtowerPass::AutoExit, e.to_string()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn auto_exit_due_inner(&self, margin_blocks: u32) -> Result<Vec<String>> {
         use electrum_client::ElectrumApi;
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let record = self.record().await?;
-        let carriers = self.unspendable_as_btc_outpoints().await.unwrap_or_default();
+        // [F3] NOT `unwrap_or_default()`. An empty carrier set is a legitimate answer only when the
+        // enumeration SUCCEEDED; manufacturing one from a failure silently disarms the only clawback
+        // protection a received RGB token has (the materialisation loop at the bottom of this
+        // function iterates exactly the set this call returns).
+        let carriers = self.unspendable_as_btc_outpoints().await.map_err(|e| {
+            anyhow!(
+                "watchtower pass aborted: could not enumerate RGB token carriers ({e}) — refusing to \
+                 run the near-deadline pass against an assumed-empty carrier set, which would skip \
+                 every carrier's clawback protection while reporting success"
+            )
+        })?;
         let ids: Vec<String> = record
             .coins
             .iter()
@@ -1104,31 +1267,85 @@ impl UtexoWallet {
     /// tiers are skipped and a not-yet-mature tier retries next pass. A delegated tower runs the same
     /// pass against the owner's pre-signed bundle with NO key material. Returns the statechain_ids
     /// that had at least one tier broadcast this pass.
+    /// **Runs in the default background pass (external review F2).** [`Self::start_background`]
+    /// calls it once per NEW BLOCK — the defence is a per-block reaction (tier CSVs only mature on a
+    /// block), so gating on the tip keeps it cheap while still racing a hostile trigger from the
+    /// first block it lands in. Before this it was spawned by nothing at all: every shipped wrapper
+    /// started only `claim()` + `auto_exit_due`, so a broadcast hostile trigger ran unopposed unless
+    /// the app happened to schedule this itself.
+    ///
+    /// **Fails CLOSED and LOUD.** One coin whose ladder row cannot be READ no longer aborts the
+    /// whole pass (that would let a single corrupt row blind the defence of every other coin): the
+    /// readable coins are all defended first, and the unreadable ones are then reported as an `Err`
+    /// naming them — with [`WalletEvent::WatchtowerBlind`] emitted and a [`WatchtowerFault`] retained
+    /// for [`Self::watchtower_faults`]. Coins actually defended have already emitted
+    /// [`WalletEvent::LadderDefended`], so nothing is lost by the `Err`.
     pub async fn defend_ladders(&self) -> Result<Vec<String>> {
+        match self.defend_ladders_inner().await {
+            Ok(v) => {
+                self.note_watchtower_ok(WatchtowerPass::DefendLadders).await;
+                Ok(v)
+            }
+            Err(e) => {
+                self.note_watchtower_blind(WatchtowerPass::DefendLadders, e.to_string()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn defend_ladders_inner(&self) -> Result<Vec<String>> {
         let record = self.record().await?;
         let mut acted = Vec::new();
+        // Coins this pass could NOT decide about (their `tesr-` row is unreadable). Collected rather
+        // than propagated immediately: the defence of the OTHER coins is time-critical and must not
+        // be cancelled by one corrupt row.
+        let mut blind: Vec<String> = Vec::new();
         for c in &record.coins {
             if c.duplicate_index != 0 {
                 continue;
             }
             let Some(id) = c.statechain_id.clone() else { continue };
-            let Some(bundle) = mercuryrustlib::tesr::load(
+            let bundle = match mercuryrustlib::tesr::load(
                 &self.inner.cc,
                 &self.inner.config.wallet_name,
                 &id,
             )
-            .await?
-            else {
-                continue;
+            .await
+            {
+                Ok(Some(b)) => b,
+                Ok(None) => continue, // no ladder on this coin — nothing to defend
+                Err(e) => {
+                    blind.push(format!("{id} (ladder row unreadable: {e})"));
+                    continue;
+                }
             };
-            let broadcast = mercuryrustlib::tesr::watch_pass(&self.inner.cc, &bundle);
-            if !broadcast.is_empty() {
-                let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
-                    statechain_id: id.clone(),
-                    tiers_broadcast: broadcast.len() as u32,
-                });
-                acted.push(id);
+            // F4: `watch_pass` now reports whether it could SEE. An unreadable chain backend is
+            // `Blind`, NOT an empty "nothing to do" — treating the two alike is what let a dead
+            // electrum connection masquerade as a quiet, well-defended coin.
+            match mercuryrustlib::tesr::watch_pass(&self.inner.cc.electrum_client, &bundle) {
+                mercuryrustlib::tesr::WatchState::Idle => {} // F unspent: verifiably nothing to do
+                mercuryrustlib::tesr::WatchState::Acted { ids, .. } => {
+                    if !ids.is_empty() {
+                        let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
+                            statechain_id: id.clone(),
+                            tiers_broadcast: ids.len() as u32,
+                        });
+                        acted.push(id);
+                    }
+                }
+                mercuryrustlib::tesr::WatchState::Blind { reason } => {
+                    blind.push(format!("{id} ({reason})"));
+                }
             }
+        }
+        if !blind.is_empty() {
+            return Err(anyhow!(
+                "ladder defence is BLIND on {} coin(s) — their TES-R bundle could not be read, or \
+                 the chain backend could not be read for them, so a hostile trigger on them would \
+                 run unopposed: {}",
+                blind.len(),
+                blind.join(", ")
+            ));
         }
         Ok(acted)
     }
@@ -1418,11 +1635,17 @@ impl UtexoWallet {
             if let Some(bundle) =
                 mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &id).await?
             {
-                let (_broadcast, done) = mercuryrustlib::tesr::exit_pass(&self.inner.cc, &bundle);
+                // F4: `?` on both calls — an unreadable chain backend must surface as an error, not
+                // as `complete: false, wait_blocks: 0`, which reads exactly like a healthy exit
+                // still waiting for its next CSV.
+                let progress =
+                    mercuryrustlib::tesr::exit_pass(&self.inner.cc.electrum_client, &bundle)?;
+                let done = progress.complete;
                 let wait_blocks = if done {
                     0
                 } else {
-                    mercuryrustlib::tesr::next_exit_tier(&self.inner.cc, &bundle).unwrap_or(0) as u32
+                    mercuryrustlib::tesr::next_exit_tier(&self.inner.cc.electrum_client, &bundle)?
+                        .unwrap_or(0) as u32
                 };
                 statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
                 continue;
@@ -1434,11 +1657,14 @@ impl UtexoWallet {
             if let Some(cb) =
                 mercuryrustlib::tesr::load_child(&self.inner.cc, &self.inner.config.wallet_name, &id).await?
             {
-                let (_broadcast, done) = mercuryrustlib::tesr::exit_child_pass(&self.inner.cc, &cb);
+                let progress =
+                    mercuryrustlib::tesr::exit_child_pass(&self.inner.cc.electrum_client, &cb)?;
+                let done = progress.complete;
                 let wait_blocks = if done {
                     0
                 } else {
-                    mercuryrustlib::tesr::next_child_exit_tier(&self.inner.cc, &cb).unwrap_or(0) as u32
+                    mercuryrustlib::tesr::next_child_exit_tier(&self.inner.cc.electrum_client, &cb)?
+                        .unwrap_or(0) as u32
                 };
                 statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
                 continue;

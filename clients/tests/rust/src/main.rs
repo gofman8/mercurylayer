@@ -84,6 +84,8 @@ pub mod sdk68_v2_pay_failure_reclaim;
 pub mod sdk69_transfer_many_inladder;
 pub mod sdk70_verifier_binding_adversarial;
 pub mod sdk71_unconditional_ladder;
+pub mod sdk72_watchtower_failloud;
+pub mod sdk73_structural_recovery;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -371,6 +373,21 @@ async fn main() -> Result<()> {
     // ladder are both refused before any SE co-sign).
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("71") {
         sdk71_unconditional_ladder::execute().await?;
+        return Ok(());
+    }
+    // Fail-loud watchtower (SDK_E2E=72): [F3] a pass that cannot enumerate RGB carriers returns Err
+    // + WatchtowerBlind + a retained fault instead of a manufactured empty carrier set, and clears it
+    // on repair; [F2] `start_background()` alone defends a hostile trigger (defend_ladders is now in
+    // the default background pass — it used to be spawned by nothing at all).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("72") {
+        sdk72_watchtower_failloud::execute().await?;
+        return Ok(());
+    }
+    // Structural-spend crash recovery (SDK_E2E=73): [F7] a colored split KILLED by SIGABRT between
+    // terminalizing the carrier and persisting the co-signed child is rebuilt from the write-ahead
+    // journal after a restart, and the original payment still completes.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("73") {
+        sdk73_structural_recovery::execute().await?;
         return Ok(());
     }
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.

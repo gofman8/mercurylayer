@@ -84,7 +84,8 @@ pub async fn execute() -> Result<()> {
         if !acted.is_empty() {
             println!("SDK51 - defend_ladders broadcast a tier for {acted:?}");
         }
-        match mercuryrustlib::tesr::next_exit_tier(&cc, &bundle) {
+        // F4: `?` — a blind chain read is an error here, never a fabricated wait time.
+        match mercuryrustlib::tesr::next_exit_tier(&cc.electrum_client, &bundle)? {
             None => break, // every tier is on-chain / in the mempool
             Some(csv) => {
                 bitcoin_core::generatetoaddress(csv.max(1) as u32, &core)?;

@@ -395,6 +395,10 @@ let bundle_json = wallet.export_watch_bundle().await?;  // NO mnemonic, NO key s
 // tower broadcasts the SAME transactions, so a second tower can never conflict with the first.
 // Carriers are exported WITHOUT their backup tx, so a tower structurally cannot do the
 // token-destroying sweep (sdk45, sdk51, sdk34).
+//
+// It returns a `WatchState`: `Idle` (the tip WAS read and nothing is due), `Acted { ids, failures }`
+// or `Blind { reason }`. Alert on `Blind` — a tower that cannot see the chain is watching nothing,
+// and before this it was indistinguishable from a quiet one.
 ```
 
 Re-export the watch bundle after any transfer/claim/split, like the recovery bundle.

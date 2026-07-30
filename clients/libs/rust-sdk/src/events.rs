@@ -57,6 +57,47 @@ pub enum WalletEvent {
     /// [`crate::UtexoWallet::ladder_skip_reason`] / [`crate::UtexoWallet::flat_only_coins`] read the
     /// same persisted record back on demand and are the authority for "is this coin flat-only?".
     LadderSkipped { statechain_id: String, reason: LadderSkipReason },
+    /// 🔴 **A deadline-critical background pass could not SEE, so it did not act.** The wallet is
+    /// *blind*, not idle — and the two are indistinguishable from the outside unless this is
+    /// surfaced, which is exactly the failure an external review flagged (F3): the near-deadline
+    /// watcher enumerated its RGB token carriers with `unwrap_or_default()`, so a storage / indexer /
+    /// RGB-engine fault produced an EMPTY carrier set, the materialisation loop found "no carriers"
+    /// and the pass reported success while protecting nothing. Every such pass now fails CLOSED and
+    /// emits this.
+    ///
+    /// `detail` is the underlying error, for logs. It is emitted on EVERY failing pass (so a
+    /// subscriber that starts late still learns the wallet is blind on the next poll), and the same
+    /// state is retained on the wallet — read it back with
+    /// [`crate::UtexoWallet::watchtower_faults`] / [`crate::UtexoWallet::is_watchtower_blind`],
+    /// which are the authority for "is my protection running right now?".
+    ///
+    /// ⚠️ An app that holds received off-chain coins or RGB tokens MUST treat this as an alert:
+    /// while it persists, nothing is racing a clawback or a hostile trigger on this wallet's behalf.
+    WatchtowerBlind { pass: WatchtowerPass, detail: String },
+}
+
+/// Which deadline-critical pass reported a [`WalletEvent::WatchtowerBlind`] / a retained
+/// [`crate::WatchtowerFault`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WatchtowerPass {
+    /// [`crate::UtexoWallet::auto_exit_due`] — force-exit plain sub-coins and MATERIALIZE received
+    /// token carriers before their clawback deadline. Blind ⟹ a received RGB token can be clawed
+    /// back by its sender.
+    AutoExit,
+    /// [`crate::UtexoWallet::defend_ladders`] — the per-block TES-R defence that races a hostile
+    /// trigger with the owner's own (strictly-lowest-CSV) tiers. Blind ⟹ a contested exit runs
+    /// unopposed.
+    DefendLadders,
+}
+
+impl WatchtowerPass {
+    /// Stable wire spelling (used by the sdk-daemon JSON event stream and every non-Rust wrapper).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AutoExit => "auto-exit",
+            Self::DefendLadders => "defend-ladders",
+        }
+    }
 }
 
 /// Why the `claim()` ladder pass left a coin un-laddered. See [`WalletEvent::LadderSkipped`].

@@ -50,6 +50,11 @@ function pushEvent(event, data) {
 const FORWARDED_EVENTS = [
   'DepositConfirmed', 'TransferClaimed', 'BalanceUpdate', 'TokenTransferClaimed',
   'CoinRefreshed', 'ExitDeadlineApproaching', 'ExitBranchConflict', 'TokenCarrierMaterialized',
+  // [F2] the TES-R defence now runs in the default background pass — surface when it fires.
+  'LadderDefended',
+  // [F3] a deadline-critical pass is BLIND (it did not run; it did not "find nothing").
+  // Never drop this one: it is the wallet telling the UI it is currently unprotected.
+  'WatchtowerBlind',
 ];
 
 // RGB asset rules (rgb-lib NIA): ticker 1-8 uppercase ASCII, name 1-40 chars, precision 0-18.

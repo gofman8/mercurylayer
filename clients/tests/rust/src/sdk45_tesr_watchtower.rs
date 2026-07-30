@@ -64,13 +64,20 @@ pub async fn execute() -> Result<()> {
     }
     println!("SDK45 - the persisted bundle carries zero key material (custody-free delegation) ✓");
 
-    // Before any trigger, the tower is idle.
-    assert!(mercuryrustlib::tesr::watch_pass(&cc, &tower_bundle).is_empty(), "idle: no trigger, no action");
+    // Before any trigger, the tower is idle — and STRICTLY idle (F4): the pass must report that it
+    // READ the chain and found F unspent, not merely that it happened to broadcast nothing. An
+    // empty result used to be the only signal, so a dead backend was indistinguishable from this.
+    assert_eq!(
+        mercuryrustlib::tesr::watch_pass(&cc.electrum_client, &tower_bundle),
+        mercuryrustlib::tesr::WatchState::Idle,
+        "idle: no trigger, no action — and the tower could SEE that"
+    );
     // A SECOND, INDEPENDENT tower over the SAME bundle is harmlessly idempotent — towers need no
     // coordination, so a user may delegate to several. (Also back-filled from sdk35.)
     let tower_bundle_b = mercuryrustlib::tesr::load(&cc, wallet, &sid).await?.ok_or(anyhow!("no bundle"))?;
-    assert!(
-        mercuryrustlib::tesr::watch_pass(&cc, &tower_bundle_b).is_empty(),
+    assert_eq!(
+        mercuryrustlib::tesr::watch_pass(&cc.electrum_client, &tower_bundle_b),
+        mercuryrustlib::tesr::WatchState::Idle,
         "a second independent tower must also be idle (no trigger) — watch_pass is idempotent, so redundant towers never conflict"
     );
     println!("SDK45 - keyless tower loaded the bundle; idle while the coin sits un-broadcast (a 2nd independent tower is idempotent) ✓");
@@ -83,8 +90,10 @@ pub async fn execute() -> Result<()> {
 
     let mut total_acted = 0usize;
     for _ in 0..40 {
-        let acted = mercuryrustlib::tesr::watch_pass(&cc, &tower_bundle);
-        total_acted += acted.len();
+        let state = mercuryrustlib::tesr::watch_pass(&cc.electrum_client, &tower_bundle);
+        assert!(!state.is_blind(), "the tower must be able to SEE throughout the defence: {state:?}");
+        assert!(!state.is_idle(), "F is spent — a pass that reports Idle here is reading the chain wrong");
+        total_acted += state.ids().len();
         if tx_exists(&cc, &final_txid) {
             break;
         }

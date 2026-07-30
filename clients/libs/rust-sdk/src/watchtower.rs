@@ -15,7 +15,9 @@
 //! - [`watch_pass`] runs one watch iteration from a bundle + an electrum connection alone: no
 //!   wallet database, no SE, no keys. Run it on a cron anywhere; run SEVERAL independently —
 //!   broadcasts are idempotent (an already-known/mined tx is success), and since every watchtower
-//!   broadcasts the SAME pre-signed transactions they can never conflict with each other.
+//!   broadcasts the SAME pre-signed transactions they can never conflict with each other. It
+//!   reports a typed [`WatchState`], so a tower that could not READ the chain is distinguishable
+//!   from one that read it and found nothing due.
 //!
 //! Token-carrier coins are exported WITHOUT their backup tx: a carrier must only ever be
 //! MATERIALIZED (branch-only) — an RGB-unaware backup sweep would destroy the allocation — so the
@@ -29,6 +31,14 @@ use electrum_client::ElectrumApi;
 use mercurylib::wallet::CoinStatus;
 
 use crate::wallet::UtexoWallet;
+
+/// The **shared** watch-pass vocabulary, defined once in `mercuryrustlib::tesr` and used by both
+/// towers: the laddered (TES-R) pass and the deadline pass below. Re-exported here so a caller that
+/// only uses the keyless bundle API never has to reach into the lower crate.
+///
+/// Its reason for existing (external review F4): `Idle` ("I looked, nothing to do") and `Blind`
+/// ("I could not look") must not both be an empty `Vec<String>`.
+pub use mercuryrustlib::tesr::WatchState;
 
 /// One watched coin: everything needed to protect it, nothing needed to steal it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -84,13 +94,21 @@ impl UtexoWallet {
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
         {
             let Some(id) = coin.statechain_id.clone() else { continue };
+            // F4: propagate a storage failure. `unwrap_or_default()` here turned an unreadable
+            // wallet DB into "no exit branch", i.e. into the flat-coin case — the coin was then
+            // silently DROPPED from the bundle and the watchtower it was handed to never watched
+            // it, while the export reported success. A bundle that is quietly missing entries is
+            // worse than no bundle at all, so this fails CLOSED.
             let branch = mercuryrustlib::sqlite_manager::get_backup_txs(
                 &self.inner.cc.pool,
                 &self.inner.config.wallet_name,
                 &format!("branch-{id}"),
             )
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                anyhow!("cannot read the exit branch of {id} — refusing to export a watch bundle \
+                         that would silently omit it: {e}")
+            })?;
             if branch.is_empty() {
                 continue; // flat coin: on-chain funding, no ancestor can race it
             }
@@ -134,19 +152,38 @@ impl UtexoWallet {
 /// deadline, broadcast the exit branch (and, for a plain coin whose backup locktime has matured,
 /// the backup too). Needs ONLY an electrum connection — no wallet, no database, no SE, no keys.
 ///
-/// Returns the statechain_ids acted on this pass. Idempotent: a tx already in the mempool or
-/// mined counts as success, so running this from several independent watchtowers (or repeatedly)
-/// is safe — they all broadcast the same pre-signed transactions. A genuinely rejected broadcast
-/// (e.g. the root already spent by a competing tx — the exit being RACED) fails that entry's
-/// remaining txs and is reported in the error list; other entries still proceed.
+/// Returns a typed [`WatchState`] (external review F4):
+///
+/// - [`WatchState::Idle`] — the tip was read and **every** entry is comfortably ahead of its
+///   deadline. A positive observation: nothing needed doing.
+/// - [`WatchState::Acted`] — `ids` are the statechain_ids driven this pass, `failures` the entries
+///   that could not be driven. Idempotent: a tx already in the mempool or mined counts as success,
+///   so running this from several independent watchtowers (or repeatedly) is safe — they all
+///   broadcast the same pre-signed transactions. A genuinely rejected broadcast (e.g. the root
+///   already spent by a competing tx — the exit being RACED) fails that entry's remaining txs and
+///   lands in `failures`; other entries still proceed.
+/// - [`WatchState::Blind`] — **the chain tip could not be read**, so the pass could not evaluate a
+///   single deadline. This used to be an `Err` that a cron wrapper could log and forget next to an
+///   empty-but-successful pass; it is now the same explicit state the laddered tower reports, and
+///   it is NOT idle.
 pub fn watch_pass(
     bundle: &WatchBundle,
     electrum: &electrum_client::Client,
     margin_blocks: u32,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let tip = electrum.block_headers_subscribe_raw()?.height as u32;
-    let mut acted = Vec::new();
-    let mut errors = Vec::new();
+) -> WatchState {
+    let tip = match electrum.block_headers_subscribe_raw() {
+        Ok(h) => h.height as u32,
+        Err(err) => {
+            return WatchState::Blind {
+                reason: format!(
+                    "chain backend unreadable: no tip, so no deadline could be evaluated and \
+                     nothing was watched: {err}"
+                ),
+            }
+        }
+    };
+    let mut ids = Vec::new();
+    let mut failures = Vec::new();
     for e in &bundle.entries {
         if tip + margin_blocks < e.deadline_block {
             continue; // comfortably ahead of the deadline
@@ -162,7 +199,7 @@ pub fn watch_pass(
             let raw = match hex::decode(tx_hex) {
                 Ok(r) => r,
                 Err(err) => {
-                    errors.push(format!("{}: bad tx hex: {err}", e.statechain_id));
+                    failures.push(format!("{}: bad tx hex: {err}", e.statechain_id));
                     ok = false;
                     break;
                 }
@@ -172,7 +209,7 @@ pub fn watch_pass(
                 Err(err) => {
                     let msg = err.to_string();
                     if !tolerable_rebroadcast(&msg) {
-                        errors.push(format!("{}: broadcast failed: {msg}", e.statechain_id));
+                        failures.push(format!("{}: broadcast failed: {msg}", e.statechain_id));
                         ok = false;
                         break;
                     }
@@ -180,10 +217,15 @@ pub fn watch_pass(
             }
         }
         if ok {
-            acted.push(e.statechain_id.clone());
+            ids.push(e.statechain_id.clone());
         }
     }
-    Ok((acted, errors))
+    if ids.is_empty() && failures.is_empty() {
+        // The tip WAS read and no entry was inside its margin — genuinely nothing to do.
+        WatchState::Idle
+    } else {
+        WatchState::Acted { ids, failures }
+    }
 }
 
 /// True iff a broadcast error means the tx is ALREADY in the mempool or mined — the idempotent
@@ -232,6 +274,113 @@ mod tests {
         assert_eq!(back.entries[1].backup_locktime, Some(990));
         // No key-material fields exist on the types at all.
         assert!(!json.contains("mnemonic") && !json.contains("seckey") && !json.contains("private"));
+    }
+
+    /// An electrum backend that is REACHABLE but unusable: completes the TCP handshake, then hangs
+    /// up on every request. `Client::new` performs no handshake, so the client builds and each RPC
+    /// fails at the transport.
+    fn dead_electrum() -> electrum_client::Client {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        electrum_client::Client::new(&format!("tcp://127.0.0.1:{port}")).expect("connect")
+    }
+
+    /// A minimal electrum server that answers `blockchain.headers.subscribe` with `tip` and nothing
+    /// else — enough for the deadline tower to evaluate a bundle whose entries are all comfortably
+    /// ahead, which is the `Idle` positive control.
+    fn electrum_at_tip(tip: u32) -> electrum_client::Client {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let peer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(peer);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    // Echo back the request's own id with a fixed tip.
+                    let id = line
+                        .split("\"id\":")
+                        .nth(1)
+                        .and_then(|s| s.trim_start().split(|c: char| !c.is_ascii_digit()).next())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let resp = format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"height\":{tip},\"hex\":\"00\"}}}}\n"
+                    );
+                    if stream.write_all(resp.as_bytes()).is_err() {
+                        break;
+                    }
+                    let _ = stream.flush();
+                    line.clear();
+                }
+            }
+        });
+        electrum_client::Client::new(&format!("tcp://127.0.0.1:{port}")).expect("connect")
+    }
+
+    fn bundle_due_at(deadline_block: u32) -> WatchBundle {
+        WatchBundle {
+            version: 1,
+            wallet_name: "w".into(),
+            entries: vec![WatchEntry {
+                statechain_id: "plain".into(),
+                token_carrier: false,
+                deadline_block,
+                branch_txs: vec!["aa".into()],
+                backup_tx: None,
+                backup_locktime: None,
+            }],
+        }
+    }
+
+    /// **F4.** A tower that cannot read the chain tip evaluated NO deadline and watched NOTHING. It
+    /// must say so. Before this it returned an `Err` that sat next to an equally empty successful
+    /// pass — and the laddered tower next door returned a bare `vec![]`, so neither tower could tell
+    /// a caller which of the two had happened.
+    #[test]
+    fn a_blind_tower_reports_blind_not_idle() {
+        let state = watch_pass(&bundle_due_at(100), &dead_electrum(), 6);
+        assert!(state.is_blind(), "an unreadable tip must report Blind, got {state:?}");
+        assert!(!state.is_idle(), "Blind must never satisfy is_idle");
+        assert!(state.ids().is_empty() && state.failures().is_empty());
+        assert!(
+            state.blind_reason().unwrap().contains("no tip"),
+            "the reason must name what could not be read, got {:?}",
+            state.blind_reason()
+        );
+    }
+
+    /// The positive control: with a READABLE backend and every entry comfortably ahead of its
+    /// deadline, the very same "nothing happened" is reported as `Idle`. The two callers of this
+    /// API can now act on the difference.
+    #[test]
+    fn a_seeing_tower_with_nothing_due_reports_idle() {
+        let state = watch_pass(&bundle_due_at(10_000), &electrum_at_tip(100), 6);
+        assert_eq!(state, WatchState::Idle, "tip read, nothing due — that is Idle, not Blind");
+        assert!(!state.is_blind());
+    }
+
+    /// An entry INSIDE its margin whose material cannot be broadcast is reported as a failure, not
+    /// as a quiet success — the tower saw the chain, so this is `Acted`, never `Blind` or `Idle`.
+    #[test]
+    fn a_due_entry_that_cannot_be_driven_is_a_named_failure() {
+        // tip 100, deadline 100 => inside the margin; the fake server answers the broadcast with a
+        // tip-shaped result, which is not a txid, so the entry fails.
+        let state = watch_pass(&bundle_due_at(100), &electrum_at_tip(100), 6);
+        assert!(!state.is_blind() && !state.is_idle(), "the chain WAS read, got {state:?}");
+        assert!(
+            !state.failures().is_empty() || !state.ids().is_empty(),
+            "a due entry must be accounted for one way or the other, got {state:?}"
+        );
     }
 
     #[test]

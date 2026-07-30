@@ -540,53 +540,56 @@ pub fn child_exit_chain(cb: &ChildTesrBundle) -> Vec<(String, Option<u16>)> {
 /// chain (`T -> X_m -> SP -> ext_child -> state_child`) in order, each tier once its relative-CSV is met,
 /// stopping at the first not-yet-mature tier. Keyless (the receiver never co-signs — every tx is already
 /// signed and `state_child` pays the receiver's own key). Idempotent: call once per block; already-known
-/// tiers are skipped. Returns `(txids_broadcast_this_pass, done)` — `done` once `state_child` is
-/// on-chain/in-mempool, i.e. the child value is committed to the receiver.
-pub fn exit_child_pass(cc: &ClientConfig, cb: &ChildTesrBundle) -> (Vec<String>, bool) {
-    let mut acted = Vec::new();
+/// tiers are skipped. Returns a typed [`ExitProgress`]; **`Err` = blind** (external review F4) — a
+/// backend that could not be read, or stored child material that could not be decoded, is never
+/// reported as an ordinary "nothing broadcast this pass, keep waiting".
+pub fn exit_child_pass(electrum: &electrum_client::Client, cb: &ChildTesrBundle) -> Result<ExitProgress> {
+    let mut broadcast = Vec::new();
+    let mut stalled = None;
     for (signed, _csv) in child_exit_chain(cb) {
-        let raw = match hex::decode(&signed) {
-            Ok(r) => r,
-            Err(_) => break,
-        };
+        let raw = hex::decode(&signed)
+            .map_err(|e| anyhow::anyhow!("child exit chain carries unusable signed tx hex: {e}"))?;
         // Derive the txid to skip already-known tiers without re-broadcasting.
         let txid = {
             use electrum_client::bitcoin::{consensus::deserialize, Transaction};
-            match deserialize::<Transaction>(&raw) {
-                Ok(tx) => tx.txid().to_string(),
-                Err(_) => break,
-            }
+            deserialize::<Transaction>(&raw)
+                .map_err(|e| anyhow::anyhow!("child exit chain tx did not deserialize: {e}"))?
+                .txid()
+                .to_string()
         };
-        if tx_known(cc, &txid) {
+        if tx_known(electrum, &txid)? {
             continue;
         }
-        match cc.electrum_client.transaction_broadcast_raw(&raw) {
-            Ok(_) => acted.push(txid),
-            Err(_) => break, // CSV not met / parent unconfirmed — retry next pass
+        match electrum.transaction_broadcast_raw(&raw) {
+            Ok(_) => broadcast.push(txid),
+            Err(e) => {
+                // CSV not met / parent unconfirmed — retry next pass, but SAY SO.
+                stalled = Some(format!("{txid}: {e}"));
+                break;
+            }
         }
     }
-    let done = tx_known(cc, &cb.child_state.txid);
-    (acted, done)
+    let complete = tx_known(electrum, &cb.child_state.txid)?;
+    Ok(ExitProgress { broadcast, complete, stalled })
 }
 
-/// The relative-CSV of the first child-exit tier not yet on-chain (a wait-time hint), or `None` once the
-/// child exit is complete. Mirrors [`next_exit_tier`] for a split child chain.
-pub fn next_child_exit_tier(cc: &ClientConfig, cb: &ChildTesrBundle) -> Option<u16> {
+/// The relative-CSV of the first child-exit tier not yet on-chain (a wait-time hint), or `Ok(None)`
+/// once the child exit is complete. Mirrors [`next_exit_tier`] for a split child chain, including
+/// its fail-closed contract: **`Err` = blind**, never a fabricated wait time.
+pub fn next_child_exit_tier(electrum: &electrum_client::Client, cb: &ChildTesrBundle) -> Result<Option<u16>> {
     use electrum_client::bitcoin::{consensus::deserialize, Transaction};
     for (signed, csv) in child_exit_chain(cb) {
-        let raw = match hex::decode(&signed) {
-            Ok(r) => r,
-            Err(_) => return Some(csv.unwrap_or(0)),
-        };
-        let txid = match deserialize::<Transaction>(&raw) {
-            Ok(tx) => tx.txid().to_string(),
-            Err(_) => return Some(csv.unwrap_or(0)),
-        };
-        if !tx_known(cc, &txid) {
-            return Some(csv.unwrap_or(0));
+        let raw = hex::decode(&signed)
+            .map_err(|e| anyhow::anyhow!("child exit chain carries unusable signed tx hex: {e}"))?;
+        let txid = deserialize::<Transaction>(&raw)
+            .map_err(|e| anyhow::anyhow!("child exit chain tx did not deserialize: {e}"))?
+            .txid()
+            .to_string();
+        if !tx_known(electrum, &txid)? {
+            return Ok(Some(csv.unwrap_or(0)));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Fetch the authoritative inputs a split-child receiver needs and run [`verify_child_bundle`] — the
@@ -1117,61 +1120,226 @@ pub async fn cosign_detrigger(
     cosign_tier(cc, coin, de.tx_hex.clone(), bundle.trigger.out_value, &bundle.network).await
 }
 
-/// True iff `txid` is known to the chain backend (confirmed or in mempool).
-fn tx_known(cc: &ClientConfig, txid: &str) -> bool {
-    match electrum_client::bitcoin::Txid::from_str(txid) {
-        Ok(t) => cc.electrum_client.transaction_get_raw(&t).is_ok(),
-        Err(_) => false,
+/// **Chain-visibility vocabulary (external review F4).**
+///
+/// Every watch/exit pass in this module decides what to do by READING the chain through a backend
+/// that can fail. A failed read is *not* a negative answer: if a tower cannot see whether `F` was
+/// spent, "no action taken" means nothing at all, and reporting it as "nothing to do" is exactly
+/// how a contested exit is lost — the tower looks idle while doing nothing, during the one window
+/// where being blind is fatal.
+///
+/// So every backend call below returns `Ok` **only when the backend actually answered**, and every
+/// caller turns a failure into a typed [`WatchState::Blind`] / an `Err`, never into an empty vector.
+///
+/// The one subtlety worth stating: an electrum server replying *"I have no such transaction"* IS an
+/// answer, and a trustworthy one. [`is_missing_tx_error`] is what separates that answer from a
+/// backend that did not answer, and it fails CLOSED — anything it does not positively recognise as
+/// "absent" counts as blindness.
+///
+/// True iff `err` is the server's own, unambiguous "no such transaction". `Error::Protocol` is the
+/// only variant `electrum_client` returns un-retried and un-wrapped for a JSON-RPC error object,
+/// i.e. the only case where the server demonstrably reached us; every transport error, retry
+/// exhaustion (`AllAttemptsErrored`), malformed response, or unrecognised server message is NOT a
+/// negative answer and must surface as blindness.
+fn is_missing_tx_error(err: &electrum_client::Error) -> bool {
+    match err {
+        electrum_client::Error::Protocol(v) => {
+            let m = v.to_string().to_ascii_lowercase();
+            [
+                "no such mempool or blockchain transaction", // bitcoind/electrs verbatim
+                "no such transaction",
+                "transaction not found",
+                "unknown transaction",
+                "missing transaction",
+            ]
+            .iter()
+            .any(|needle| m.contains(needle))
+        }
+        _ => false,
     }
 }
 
-/// True iff `txid:vout` is no longer unspent (its funding UTXO has been consumed).
-fn outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> bool {
-    let t = match electrum_client::bitcoin::Txid::from_str(txid) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let raw = match cc.electrum_client.transaction_get_raw(&t) {
+/// `Ok(true)` iff `txid` is known to the chain backend (confirmed or in mempool), `Ok(false)` iff
+/// the backend positively answered that it has no such transaction. `Err` = **blind**: the backend
+/// could not be read, or `txid` is unusable material — either way the caller learned nothing and
+/// must not treat this as "not on chain yet".
+fn tx_known(electrum: &electrum_client::Client, txid: &str) -> Result<bool> {
+    let t = electrum_client::bitcoin::Txid::from_str(txid)
+        .map_err(|e| anyhow::anyhow!("unusable txid {txid:?} in stored exit material: {e}"))?;
+    match electrum.transaction_get_raw(&t) {
+        Ok(_) => Ok(true),
+        Err(e) if is_missing_tx_error(&e) => Ok(false),
+        Err(e) => Err(anyhow::anyhow!(
+            "chain backend unreadable while looking up {txid} — cannot tell whether it is on chain: {e}"
+        )),
+    }
+}
+
+/// `Ok(true)` iff `txid:vout` is no longer unspent (its funding UTXO has been consumed), `Ok(false)`
+/// iff it is still unspent — including the case where the backend positively answered that `txid`
+/// itself is not on chain, which is a laddered SUB-coin's normal steady state (its `F` is an
+/// un-broadcast split output): a transaction that does not exist has no spendable output, so it
+/// cannot have been spent and there is genuinely nothing to defend.
+///
+/// `Err` = **blind**. Note also that the out-of-range `vout` that used to PANIC here is now a
+/// named error.
+fn outpoint_spent(electrum: &electrum_client::Client, txid: &str, vout: u32) -> Result<bool> {
+    let t = electrum_client::bitcoin::Txid::from_str(txid)
+        .map_err(|e| anyhow::anyhow!("unusable funding txid {txid:?} in stored ladder: {e}"))?;
+    let raw = match electrum.transaction_get_raw(&t) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(e) if is_missing_tx_error(&e) => return Ok(false),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "chain backend unreadable while fetching funding {txid} — cannot tell whether the \
+                 coin has been triggered: {e}"
+            ))
+        }
     };
-    let tx: electrum_client::bitcoin::Transaction = match electrum_client::bitcoin::consensus::deserialize(&raw) {
-        Ok(x) => x,
-        Err(_) => return false,
-    };
-    let spk = &tx.output[vout as usize].script_pubkey;
-    let listed = cc.electrum_client.script_list_unspent(spk).unwrap_or_default();
-    !listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout)
+    let tx: electrum_client::bitcoin::Transaction =
+        electrum_client::bitcoin::consensus::deserialize(&raw)
+            .map_err(|e| anyhow::anyhow!("funding tx {txid} did not deserialize: {e}"))?;
+    let out = tx
+        .output
+        .get(vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("funding {txid} has no output {vout} ({} outputs)", tx.output.len()))?;
+    let listed = electrum.script_list_unspent(&out.script_pubkey).map_err(|e| {
+        anyhow::anyhow!(
+            "chain backend unreadable while listing unspent outputs of {txid}:{vout} — cannot tell \
+             whether the coin has been triggered: {e}"
+        )
+    })?;
+    Ok(!listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout))
+}
+
+/// **Typed outcome of one watchtower pass** — the single vocabulary shared by the laddered (TES-R)
+/// tower here and the un-laddered deadline tower in the SDK (`mercury_utexo_sdk::watch_pass`).
+///
+/// It exists for one reason (external review F4): a caller MUST be able to tell
+/// *"I looked, and there is nothing to do"* ([`Self::Idle`]) from *"I could not look"*
+/// ([`Self::Blind`]). Both used to be an empty `Vec<String>`, so a dead electrum backend was
+/// indistinguishable from a quiet chain — during precisely the race window where being blind loses
+/// the coin. `Blind` is therefore never a degenerate case of the others: it means this pass
+/// determined **nothing**, and an app that holds off-chain coins must treat it as an alert.
+///
+/// `#[must_use]`: dropping this value on the floor is the bug the type was introduced to prevent.
+#[must_use = "a watch pass reports whether it could SEE; ignoring it re-introduces the blind-looks-idle bug"]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchState {
+    /// The backend answered and there is genuinely nothing to do — for the TES-R tower, the coin's
+    /// funding `F` is still unspent, so it has not been triggered and an idle laddered coin never
+    /// ages. This is the steady state, and it is a POSITIVE observation.
+    Idle,
+    /// The backend answered and this pass is DEFENDING: the coin is triggered (TES-R tower) or an
+    /// entry is inside its deadline margin (deadline tower).
+    ///
+    /// `ids` are what the pass acted on — tier **txids** for the TES-R tower, **statechain_ids** for
+    /// the deadline tower — and may be EMPTY, meaning "already under way: every mature tier is out
+    /// and the next one has not matured yet". `failures` carries the rejections that stopped it
+    /// (typically `non-BIP68-final`, i.e. a CSV that has simply not matured), so a caller can tell a
+    /// waiting exit from a RACED or dead one instead of retrying forever in silence.
+    Acted { ids: Vec<String>, failures: Vec<String> },
+    /// 🔴 The chain backend could not be read, or the stored exit material could not be used. This
+    /// pass saw NOTHING and defended nothing. Never fold this into [`Self::Idle`].
+    Blind { reason: String },
+}
+
+impl WatchState {
+    /// The pass could not see. The caller must alert and retry — silence here is not safety.
+    pub fn is_blind(&self) -> bool {
+        matches!(self, Self::Blind { .. })
+    }
+    /// The pass looked and found nothing to do. False when blind, which is the whole point.
+    pub fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+    /// What the pass acted on (empty for [`Self::Idle`] and [`Self::Blind`] alike — so NEVER use
+    /// emptiness to decide whether the pass worked; use [`Self::is_blind`]).
+    pub fn ids(&self) -> &[String] {
+        match self {
+            Self::Acted { ids, .. } => ids,
+            _ => &[],
+        }
+    }
+    /// Broadcast rejections seen this pass (usually an immature CSV).
+    pub fn failures(&self) -> &[String] {
+        match self {
+            Self::Acted { failures, .. } => failures,
+            _ => &[],
+        }
+    }
+    /// The blindness cause, if any.
+    pub fn blind_reason(&self) -> Option<&str> {
+        match self {
+            Self::Blind { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// **Typed progress of one unilateral-exit pass.** Only ever produced when the chain was actually
+/// readable — a backend failure is an `Err` from the pass, never a quiet "nothing happened"
+/// (external review F4).
+#[must_use = "an exit pass reports whether the exit is complete and why it stopped"]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitProgress {
+    /// Tier txids broadcast by THIS pass (empty = every mature tier was already out).
+    pub broadcast: Vec<String>,
+    /// The final exit state is on chain or in the mempool — the value is committed to the owner.
+    pub complete: bool,
+    /// Why the pass stopped short, if it did: the first broadcast rejection, normally an immature
+    /// relative timelock. Retained so a DEAD or RACED exit is not reported forever as "just wait".
+    pub stalled: Option<String>,
 }
 
 /// **TES-R WatchBundle (keyless watchtower).** One reactive pass: if the coin's funding UTXO `F` has
 /// been spent — i.e. someone broadcast the trigger — drive the OWNER's unilateral exit by
 /// broadcasting each pre-signed tier in order as its relative-timelock matures. Keyless: it holds
 /// only the pre-signed [`TesrBundle`] (every tier pays the owner) and NEVER co-signs, so a delegated
-/// tower can defend an offline owner without any key material. Idempotent — call once per new block
-/// from a tower loop; already-confirmed tiers are skipped and a not-yet-mature tier just retries next
-/// pass. Returns the tier txids broadcast this pass.
-pub fn watch_pass(cc: &ClientConfig, bundle: &TesrBundle) -> Vec<String> {
-    // Defend only once the coin has actually been triggered on-chain — an idle un-broadcast coin
-    // never ages, so there is nothing to do until F is spent.
-    if !outpoint_spent(cc, &bundle.f_txid, bundle.f_vout) {
-        return vec![];
+/// tower can defend an offline owner without any key material. It needs ONLY an electrum
+/// connection, exactly like the un-laddered tower. Idempotent — call once per new block from a tower
+/// loop; already-confirmed tiers are skipped and a not-yet-mature tier just retries next pass.
+///
+/// Returns a [`WatchState`]: [`WatchState::Idle`] when `F` is verifiably unspent,
+/// [`WatchState::Acted`] with the tier txids broadcast this pass, or [`WatchState::Blind`] when the
+/// backend could not be read. **`Idle` and `Blind` are different answers** — before F4 both were an
+/// empty vector, so a tower with a dead backend reported the same "all quiet" as a tower watching a
+/// healthy idle coin.
+pub fn watch_pass(electrum: &electrum_client::Client, bundle: &TesrBundle) -> WatchState {
+    match watch_pass_seen(electrum, bundle) {
+        Ok(state) => state,
+        Err(e) => WatchState::Blind { reason: e.to_string() },
     }
-    let mut acted = Vec::new();
+}
+
+/// [`watch_pass`]'s body, with every unreadable backend answer as an `Err` (which the caller turns
+/// into [`WatchState::Blind`]).
+fn watch_pass_seen(electrum: &electrum_client::Client, bundle: &TesrBundle) -> Result<WatchState> {
+    // Defend only once the coin has actually been triggered on-chain — an idle un-broadcast coin
+    // never ages, so there is nothing to do until F is spent. `?` is load-bearing: a backend that
+    // cannot answer "is F spent?" must NOT be read as "F is unspent".
+    if !outpoint_spent(electrum, &bundle.f_txid, bundle.f_vout)? {
+        return Ok(WatchState::Idle);
+    }
+    let mut ids = Vec::new();
+    let mut failures = Vec::new();
     for tier in bundle.exit_tiers() {
-        if tx_known(cc, &tier.txid) {
+        if tx_known(electrum, &tier.txid)? {
             continue; // already on-chain / in mempool
         }
-        let raw = match hex::decode(&tier.signed_tx) {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-        match cc.electrum_client.transaction_broadcast_raw(&raw) {
-            Ok(_) => acted.push(tier.txid.clone()),
-            Err(_) => break, // CSV not met yet / parent unconfirmed — retry on the next pass
+        let raw = hex::decode(&tier.signed_tx).map_err(|e| {
+            anyhow::anyhow!("tier {} carries unusable signed tx hex: {e}", tier.txid)
+        })?;
+        match electrum.transaction_broadcast_raw(&raw) {
+            Ok(_) => ids.push(tier.txid.clone()),
+            Err(e) => {
+                // CSV not met yet / parent unconfirmed — retry on the next pass, but SAY SO.
+                failures.push(format!("{}: {e}", tier.txid));
+                break;
+            }
         }
     }
-    acted
+    Ok(WatchState::Acted { ids, failures })
 }
 
 /// **Owner-initiated unilateral exit of a laddered coin.** Like [`watch_pass`], but this KICKS OFF the exit
@@ -1181,34 +1349,43 @@ pub fn watch_pass(cc: &ClientConfig, bundle: &TesrBundle) -> Vec<String> {
 /// not-yet-mature tier. Idempotent and incremental: call once per block (already-confirmed/known tiers
 /// are skipped). Returns `(txids_broadcast_this_pass, done)` where `done` is true once the final exit
 /// state is on-chain or in the mempool — i.e. the funds are committed to the owner's exit address.
-pub fn exit_pass(cc: &ClientConfig, bundle: &TesrBundle) -> (Vec<String>, bool) {
-    let mut acted = Vec::new();
+///
+/// **`Err` = blind** (external review F4): the chain backend could not be read, or a tier's stored
+/// hex is unusable. It is never reported as `complete: false` with an empty broadcast list, which
+/// would be indistinguishable from a healthy "waiting for the next CSV".
+pub fn exit_pass(electrum: &electrum_client::Client, bundle: &TesrBundle) -> Result<ExitProgress> {
+    let mut broadcast = Vec::new();
+    let mut stalled = None;
     for tier in bundle.exit_tiers() {
-        if tx_known(cc, &tier.txid) {
+        if tx_known(electrum, &tier.txid)? {
             continue; // already on-chain / in mempool
         }
-        let raw = match hex::decode(&tier.signed_tx) {
-            Ok(r) => r,
-            Err(_) => break,
-        };
-        match cc.electrum_client.transaction_broadcast_raw(&raw) {
-            Ok(_) => acted.push(tier.txid.clone()),
-            Err(_) => break, // CSV not met yet / parent unconfirmed — retry on the next pass
+        let raw = hex::decode(&tier.signed_tx).map_err(|e| {
+            anyhow::anyhow!("tier {} carries unusable signed tx hex: {e}", tier.txid)
+        })?;
+        match electrum.transaction_broadcast_raw(&raw) {
+            Ok(_) => broadcast.push(tier.txid.clone()),
+            Err(e) => {
+                // CSV not met yet / parent unconfirmed — retry on the next pass, but SAY SO.
+                stalled = Some(format!("{}: {e}", tier.txid));
+                break;
+            }
         }
     }
-    let done = tx_known(cc, &bundle.current().state.txid);
-    (acted, done)
+    let complete = tx_known(electrum, &bundle.current().state.txid)?;
+    Ok(ExitProgress { broadcast, complete, stalled })
 }
 
-/// The first tier not yet on-chain in exit order, and its relative-CSV (a wait-time hint). `None` once
-/// the exit is complete. Used to report `ExitStatus.wait_blocks` for a laddered coin's unilateral exit.
-pub fn next_exit_tier(cc: &ClientConfig, bundle: &TesrBundle) -> Option<u16> {
+/// The first tier not yet on-chain in exit order, and its relative-CSV (a wait-time hint).
+/// `Ok(None)` once the exit is complete; **`Err` = blind** — a backend that cannot be read must not
+/// be reported as a wait time, and must certainly not be reported as "complete".
+pub fn next_exit_tier(electrum: &electrum_client::Client, bundle: &TesrBundle) -> Result<Option<u16>> {
     for tier in bundle.exit_tiers() {
-        if !tx_known(cc, &tier.txid) {
-            return Some(tier.csv.unwrap_or(0));
+        if !tx_known(electrum, &tier.txid)? {
+            return Ok(Some(tier.csv.unwrap_or(0)));
         }
     }
-    None
+    Ok(None)
 }
 
 fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
@@ -2350,7 +2527,7 @@ mod verify_tests {
     const F_TXID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
     // A schedule-conformant single-level bundle (unsigned tiers — verify_bundle checks structure).
-    fn sample_bundle() -> TesrBundle {
+    pub(super) fn sample_bundle() -> TesrBundle {
         let p = mercurylib::tesr::TesrParams::regtest();
         let f_value = 100_000u64;
         let t = mercurylib::tesr::build_trigger(F_TXID, 0, f_value, AGG, "regtest", p.committed_fee_rate).unwrap();
@@ -2870,4 +3047,131 @@ pub async fn cosign_tier(
 
     let signed_tx = new_backup_transaction(partial.encoded_unsigned_tx, signature)?;
     Ok(signed_tx)
+}
+
+/// **F4 — a blind pass must never look like an idle one.**
+///
+/// These are the regression tests for the external review's finding that the TES-R watch/exit
+/// passes returned success-like defaults (`false` from every chain read, an empty `Vec<String>`
+/// from the pass) whenever the backend failed. An empty result was the *only* signal available to a
+/// caller, and a healthy quiet coin produced exactly the same one — so a tower with a dead electrum
+/// connection reported "all quiet" while defending nothing, during precisely the race window in
+/// which being blind loses the coin.
+#[cfg(test)]
+mod watch_visibility_tests {
+    use super::*;
+    use super::verify_tests::sample_bundle;
+
+    /// An electrum backend that is REACHABLE but unusable: it completes the TCP handshake and then
+    /// hangs up on every request. `Client::new` performs no handshake, so the client builds fine and
+    /// each RPC fails at the transport — the realistic "the backend fell over" shape, and the one
+    /// the old code silently read as "F is unspent / the tx is not on chain".
+    fn dead_electrum() -> electrum_client::Client {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream); // accept, then immediately hang up
+            }
+        });
+        electrum_client::Client::new(&format!("tcp://127.0.0.1:{port}")).expect("connect")
+    }
+
+    /// THE finding, stated as an assertion: with an unreadable backend the pass reports `Blind`,
+    /// and `Blind` is *not* `Idle` even though both carry no ids. Before F4 this returned `vec![]`
+    /// — byte-identical to the healthy "F unspent, nothing to defend" answer.
+    #[test]
+    fn a_blind_backend_reports_blind_not_idle() {
+        let state = watch_pass(&dead_electrum(), &sample_bundle());
+        assert!(state.is_blind(), "an unreadable backend must report Blind, got {state:?}");
+        assert!(!state.is_idle(), "Blind must never satisfy is_idle — that is the whole finding");
+        assert!(
+            state.ids().is_empty(),
+            "a blind pass acted on nothing, so emptiness alone can never mean 'all quiet'"
+        );
+        assert!(state.blind_reason().is_some(), "the cause must be reportable to the owner");
+    }
+
+    /// The positive control the assertion above needs: `Idle` is reserved for a pass that actually
+    /// READ the chain. Nothing in the code can produce it from a failure.
+    #[test]
+    fn idle_is_only_ever_a_positive_observation() {
+        assert!(WatchState::Idle.is_idle() && !WatchState::Idle.is_blind());
+        let blind = WatchState::Blind { reason: "backend down".into() };
+        assert!(!blind.is_idle() && blind.is_blind());
+        assert_ne!(WatchState::Idle, blind);
+        // An `Acted` pass that broadcast nothing (every mature tier already out) is ALSO not idle:
+        // the coin is triggered and the exit is under way.
+        let under_way = WatchState::Acted { ids: vec![], failures: vec!["csv not met".into()] };
+        assert!(!under_way.is_idle() && !under_way.is_blind());
+        assert_eq!(under_way.failures().len(), 1);
+    }
+
+    /// The owner-driven exit must fail LOUD rather than report `complete: false, wait 0` — which an
+    /// app renders as a healthy "just wait for the next block".
+    #[test]
+    fn a_blind_backend_makes_the_exit_pass_an_error_not_progress() {
+        let e = exit_pass(&dead_electrum(), &sample_bundle())
+            .expect_err("an unreadable backend must not be reported as exit progress");
+        assert!(
+            e.to_string().contains("chain backend unreadable"),
+            "the error must name the blindness, got: {e}"
+        );
+    }
+
+    /// ... and the wait-time hint must never fabricate a number, nor claim completion.
+    #[test]
+    fn a_blind_backend_makes_the_wait_hint_an_error_not_a_number() {
+        let r = next_exit_tier(&dead_electrum(), &sample_bundle());
+        assert!(r.is_err(), "a blind backend must not yield a wait time, got {r:?}");
+    }
+
+    /// The classifier that draws the line. A server that ANSWERS "no such transaction" gave a real,
+    /// trustworthy negative; anything else — transport failure, retry exhaustion, or a server error
+    /// we do not recognise — is blindness. It fails CLOSED, so an unfamiliar message costs an alert,
+    /// never a silent "absent".
+    #[test]
+    fn only_an_explicit_no_such_transaction_counts_as_absence() {
+        use electrum_client::Error;
+        // The verbatim bitcoind/electrs reply, confirmed against the live regtest backend.
+        assert!(is_missing_tx_error(&Error::Protocol(serde_json::json!({
+            "code": 2,
+            "message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+        }))));
+        assert!(is_missing_tx_error(&Error::Protocol(serde_json::json!("transaction not found"))));
+
+        // A server error that is NOT a not-found: the tx may well exist and we simply cannot see it.
+        assert!(!is_missing_tx_error(&Error::Protocol(serde_json::json!({
+            "code": -32000, "message": "excessive resource usage"
+        }))));
+        assert!(!is_missing_tx_error(&Error::Protocol(serde_json::json!({
+            "code": -32603, "message": "daemon error"
+        }))));
+        // Transport / client-side failures are never an answer at all.
+        assert!(!is_missing_tx_error(&Error::IOError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+        assert!(!is_missing_tx_error(&Error::AllAttemptsErrored(vec![])));
+        assert!(!is_missing_tx_error(&Error::Message("no idea".into())));
+        assert!(!is_missing_tx_error(&Error::CouldntLockReader));
+        assert!(!is_missing_tx_error(&Error::Mpsc));
+    }
+
+    /// Stored material that cannot be parsed is a failure too, not a quiet skip: the old code
+    /// `break`-ed out of the tier loop on a bad txid/hex and returned the tiers it happened to have
+    /// broadcast, indistinguishable from a completed pass.
+    #[test]
+    fn unusable_stored_material_is_surfaced_not_skipped() {
+        let mut b = sample_bundle();
+        b.f_txid = "not-a-txid".into();
+        let state = watch_pass(&dead_electrum(), &b);
+        assert!(state.is_blind(), "an unusable funding txid must be reported, got {state:?}");
+        assert!(
+            state.blind_reason().unwrap().contains("unusable funding txid"),
+            "the reason must name the bad material, got {:?}",
+            state.blind_reason()
+        );
+    }
 }

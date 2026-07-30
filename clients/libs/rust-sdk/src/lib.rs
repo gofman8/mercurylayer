@@ -37,9 +37,9 @@ pub mod wallet;
 pub mod watchtower;
 
 pub use config::SdkConfig;
-pub use events::{LadderSkipReason, WalletEvent};
+pub use events::{LadderSkipReason, WalletEvent, WatchtowerPass};
 pub use types::{Balance, ClaimResult, CoinInfo, DepositAddressInfo, ExitCostEstimate, ExitStatus, SdkError, TokenBalance, TokenTx, TransferResult, WithdrawalFeeQuote};
 pub use invoice::{UtexoInvoice, decode_utexo_invoice, encode_utexo_invoice};
 pub use refresh::RefreshResult;
-pub use wallet::UtexoWallet;
-pub use watchtower::{watch_pass, WatchBundle, WatchEntry};
+pub use wallet::{UtexoWallet, WatchtowerFault};
+pub use watchtower::{watch_pass, WatchBundle, WatchEntry, WatchState};

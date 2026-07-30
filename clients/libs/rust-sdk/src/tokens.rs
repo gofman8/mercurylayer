@@ -119,6 +119,348 @@ pub(crate) struct ConsignmentEnvelope {
     pub s: u64,
 }
 
+/// Derive the branch witness txids a consignment chain resolves against, from the raw (hex) branch
+/// transactions. Shared so the pre-payment gate and the claim path resolve the SAME witness set.
+pub(crate) fn branch_witness_txids(branch_txs: &[String]) -> Result<Vec<String>> {
+    let mut txids = Vec::with_capacity(branch_txs.len());
+    for raw in branch_txs {
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(raw)?)?;
+        txids.push(tx.txid().to_string());
+    }
+    Ok(txids)
+}
+
+/// THE token-acceptance predicate — the SINGLE definition of "this consignment genuinely assigns
+/// `env.a` of some contract to `witness_txid:witness_vout`". Returns `(contract_id, amount)` where
+/// `amount` is the CONSIGNMENT-derived assignment (never the envelope hint).
+///
+/// Both the irreversible-payment gate (`validate_pending_token`, called by the SSP BEFORE it pays a
+/// Lightning invoice) and the claim path (`accept_incoming_tokens`) call exactly this. Keeping them
+/// as one function is a security requirement, not tidiness: while the SSP's pre-check was the weaker
+/// of the two (it omitted the `booked == env.a` equality below), a payer could latch a coin whose
+/// consignment validated but whose envelope amount was mutated — it passed the gate, the SSP paid an
+/// irreversible invoice, and the SAME coin then failed PERMANENT-INVALID at claim. Two predicates
+/// that must be kept in sync by hand is the bug; one predicate cannot disagree with itself.
+///
+/// Fails CLOSED and always with the `PERMANENT-INVALID:` prefix that `claim()` matches to
+/// un-quarantine a coin whose consignment can never book (as distinct from an un-prefixed TRANSIENT
+/// RGB-proxy/indexer error, which keeps the coin quarantined and retried).
+pub(crate) fn verify_consignment_assignment(
+    w: &mut RgbWallet,
+    env: &ConsignmentEnvelope,
+    branch_txids: &[String],
+    witness_txid: &str,
+    witness_vout: u32,
+) -> Result<(String, u64)> {
+    let (valid, detail, contract_id) =
+        tokio::task::block_in_place(|| w.validate_offchain_chain_info(&env.c, branch_txids))?;
+    if !valid {
+        return Err(anyhow!(
+            "PERMANENT-INVALID: token consignment INVALID: {}",
+            detail.unwrap_or_default()
+        ));
+    }
+    let contract_id =
+        contract_id.ok_or_else(|| anyhow!("validated consignment without contract id"))?;
+    // The amount the CONSIGNMENT assigns to our own witness outpoint — the cryptographic source of
+    // truth. The envelope amount (env.a) is only a hint we cross-check; a lying sender cannot
+    // inflate the derived amount because the consignment governs it.
+    let booked = tokio::task::block_in_place(|| {
+        w.accept_offchain_amount(&env.c, branch_txids, witness_txid, witness_vout)
+    })?;
+    if booked != env.a {
+        return Err(anyhow!(
+            "PERMANENT-INVALID: token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
+            env.a
+        ));
+    }
+    Ok((contract_id, booked))
+}
+
+// ============================================================================================
+// F7 — durable prepare/commit journal for STRUCTURAL colored spends (split + combine).
+// ============================================================================================
+//
+// A colored split/combine makes the parent carrier(s) TERMINAL at the SE and then produces exactly
+// one co-signature over the un-broadcast child transaction. Before this journal, everything between
+// those two facts lived only in process memory: the signed tx, the consignment, the blinding, the
+// child vouts. A crash anywhere after the co-signature and before `register_split_subcoins`
+// persisted the children destroyed the cooperative off-chain path for good — the SE would never
+// co-sign the carrier again, and the one transaction that spent it was gone. (The BTC stayed
+// recoverable by unilateral exit of the carrier's own backup; the token/piece hand-over did not.)
+//
+// WHY THE TERMINALIZATION IS *NOT* MOVED AFTER THE SIGNATURE
+// ---------------------------------------------------------
+// The obvious "persist the signed child material BEFORE terminalizing" ordering is unsafe here and
+// is deliberately NOT what this journal does. `set_spend_budget(carrier, 1)` is an ABSOLUTE budget
+// (`finalized_count + remaining`, monotonically tightening — see `database::deposit::set_sig_budget`)
+// and it is the *only* thing that stops the SE from issuing a SECOND co-signature over the same
+// carrier. Signing first and calling `set_spend_budget(carrier, 0)` afterwards would still leave the
+// carrier reading `terminal == true` to a receiver, but a malicious sender could co-sign branch A
+// and branch B in the gap and hand them to two different receivers — both would see a terminal
+// ancestor and both would accept. That is exactly the INV-19 fork the terminal check exists to
+// prevent, and no client-side guard can bind a sender who simply skips it. So the budget is still
+// pinned BEFORE the signature, and durability is bought with a write-ahead journal instead.
+//
+// WHAT THE JOURNAL BUYS
+// ---------------------
+//  * `Prepared` is committed to sqlite BEFORE `set_spend_budget`, so a crash in the pre-signature
+//    window is *classifiable* rather than silent: the recovery reader asks the SE whether each
+//    carrier is terminal and reports `Retryable` (budget pinned but never consumed — the whole
+//    operation can simply be run again) or `CooperativePathLost` (the co-signature WAS finalized and
+//    its transaction is gone — the holder must unilaterally exit that carrier). Fail-closed: a
+//    carrier with a lost journal entry is never selected for a new colored spend.
+//  * `Signed` is committed to sqlite IMMEDIATELY after the co-signature returns and BEFORE any other
+//    work, so every later step (sub-coin registration, RGB re-registration, envelope attachment,
+//    hand-over) is replayable after a restart. That is the bulk of the old window — several DB
+//    writes, an RGB stash mutation and two network calls — and it is now fully recoverable.
+//  * The one window that remains is the single HTTP round-trip between the SE finalizing the
+//    signature and this process persisting it. It is irreducible on the client: closing it needs an
+//    SE-side idempotent re-serve of a finalized partial signature.
+//
+/// Stage of a journalled structural spend. Ordered: every stage implies all earlier ones are done,
+/// so recovery resumes at the first step AFTER the recorded stage.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StructuralStage {
+    /// Plan is durable; the parent carrier(s) have NOT been terminalized yet.
+    Prepared,
+    /// The co-signed child transaction + consignment are durable.
+    Signed,
+    /// The child sub-coins are registered as wallet coins (branch + backups persisted).
+    Registered,
+    /// The RGB change allocation is re-registered (or the carriers marked spent).
+    Colored,
+    /// The consignment envelope is attached to the piece's backup row.
+    Enveloped,
+    /// Done: the piece was handed over (or, after a replay, restored to this wallet). Terminal.
+    Committed,
+    /// Terminal: the operation never consumed its co-signature and was safely rolled forward to
+    /// "never happened". The carrier keeps its pinned budget and can be re-spent once.
+    Abandoned,
+    /// Terminal: the co-signature was consumed but its transaction was lost. The carrier's
+    /// cooperative path is GONE — unilateral exit only.
+    Stranded,
+}
+
+impl StructuralStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            StructuralStage::Prepared => "prepared",
+            StructuralStage::Signed => "signed",
+            StructuralStage::Registered => "registered",
+            StructuralStage::Colored => "colored",
+            StructuralStage::Enveloped => "enveloped",
+            StructuralStage::Committed => "committed",
+            StructuralStage::Abandoned => "abandoned",
+            StructuralStage::Stranded => "stranded",
+        }
+    }
+    /// A stage that still needs the recovery reader's attention.
+    fn is_open(self) -> bool {
+        !matches!(
+            self,
+            StructuralStage::Committed | StructuralStage::Abandoned | StructuralStage::Stranded
+        )
+    }
+}
+
+/// The durable plan + signed material of one structural colored spend.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StructuralSpendRecord {
+    pub op_id: String,
+    /// `"colored_split"` (one carrier) or `"colored_combine"` (N carriers).
+    pub lane: String,
+    pub stage: StructuralStage,
+    pub asset_id: String,
+    pub receiver_address: String,
+    pub token_amount: u64,
+    pub token_change: u64,
+    /// Statechain ids of every carrier this spend consumes (1 for a split, N for a combine).
+    pub carrier_ids: Vec<String>,
+    /// `txid:vout` of every consumed carrier — the RGB sources of the change allocation.
+    pub carrier_ops: Vec<String>,
+    /// Derived-slot deposit tokens minted for the piece and change (diagnostics).
+    pub slot_tokens: Vec<String>,
+    pub piece_addr: String,
+    pub change_addr: String,
+    pub piece_sats: u64,
+    pub change_sats: u64,
+    /// True when the piece was to be handed over under a Lightning latch. A latched hand-over is
+    /// NEVER replayed by recovery: the caller never learned the batch id / SE hash, so completing it
+    /// would strand the piece in a lock nobody can open.
+    pub latched: bool,
+    // ---- present from `Signed` onward ----
+    pub signed_tx: Option<String>,
+    pub txid: Option<String>,
+    pub piece_vout: Option<u32>,
+    pub change_vout: Option<u32>,
+    pub consignment: Option<String>,
+    pub blinding: Option<u64>,
+    // ---- present from `Registered` onward ----
+    pub piece_id: Option<String>,
+    pub change_id: Option<String>,
+}
+
+/// What the recovery reader did with one journalled spend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StructuralSpendOutcome {
+    /// The signed child material survived the crash and the local state was rebuilt from it. The
+    /// piece exists in this wallet again; `handed_over` says whether the transfer to
+    /// `receiver_address` was completed (never true for a replay — re-send it explicitly).
+    Replayed { piece_id: String, handed_over: bool },
+    /// The crash landed BEFORE the co-signature was issued. Nothing was lost: the carriers keep
+    /// their pinned budget and the operation can simply be run again.
+    Retryable,
+    /// The crash landed in the irreducible window: the SE finalized the co-signature but this
+    /// process never persisted the transaction. The listed carriers can never be co-signed again —
+    /// their value is recoverable ONLY by unilateral exit of their own backup.
+    CooperativePathLost,
+}
+
+/// One entry of the recovery reader's report.
+#[derive(Clone, Debug)]
+pub struct StructuralSpendRecovery {
+    pub op_id: String,
+    pub lane: String,
+    pub carrier_ids: Vec<String>,
+    pub receiver_address: String,
+    pub outcome: StructuralSpendOutcome,
+}
+
+/// Classify a crash that landed at `Prepared` from the carriers' SE terminal states.
+///
+/// PURE so the decision is unit-testable without an SE. Terminal means the pinned budget was
+/// consumed — i.e. the co-signature this operation asked for WAS issued and its transaction is the
+/// thing we lost. Non-terminal on every carrier means the signature never happened.
+fn classify_prepared(carriers_terminal: &[bool]) -> StructuralSpendOutcome {
+    if carriers_terminal.iter().any(|t| *t) {
+        StructuralSpendOutcome::CooperativePathLost
+    } else {
+        StructuralSpendOutcome::Retryable
+    }
+}
+
+/// Create the journal table if it does not exist.
+///
+/// Deliberately created here rather than in `clients/libs/rust/migrations`: the journal is owned by
+/// this module, and a lazily-created table keeps the SDK's storage contract in one file.
+pub(crate) async fn journal_ensure_table(pool: &sqlx::Pool<sqlx::Sqlite>) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS structural_spend_journal (
+             op_id        TEXT PRIMARY KEY,
+             wallet_name  TEXT NOT NULL,
+             stage        TEXT NOT NULL,
+             payload      TEXT NOT NULL,
+             updated_at   INTEGER NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Commit a record at its current stage. Durable on return: sqlite's default `synchronous = FULL`
+/// rollback journal fsyncs the commit, which is the whole point of the write-ahead ordering.
+pub(crate) async fn journal_upsert(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+    rec: &StructuralSpendRecord,
+) -> Result<()> {
+    journal_ensure_table(pool).await?;
+    let payload = serde_json::to_string(rec)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        "INSERT INTO structural_spend_journal (op_id, wallet_name, stage, payload, updated_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT(op_id) DO UPDATE SET stage = $3, payload = $4, updated_at = $5",
+    )
+    .bind(&rec.op_id)
+    .bind(wallet_name)
+    .bind(rec.stage.as_str())
+    .bind(&payload)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every journal entry of this wallet that is not in a terminal stage, oldest first. THE recovery
+/// reader's input.
+pub(crate) async fn journal_open_entries(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+) -> Result<Vec<StructuralSpendRecord>> {
+    journal_ensure_table(pool).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM structural_spend_journal
+         WHERE wallet_name = $1 AND stage NOT IN ('committed', 'abandoned', 'stranded')
+         ORDER BY updated_at ASC",
+    )
+    .bind(wallet_name)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (payload,) in rows {
+        // A journal row we cannot parse is NOT skipped silently — that would be the same
+        // "an unreadable state looks like an empty one" failure this audit is about.
+        let rec: StructuralSpendRecord = serde_json::from_str(&payload)
+            .map_err(|e| anyhow!("unreadable structural-spend journal row: {e}"))?;
+        if !rec.stage.is_open() {
+            return Err(anyhow!(
+                "structural-spend journal row {} is at terminal stage {:?} but was indexed as open",
+                rec.op_id,
+                rec.stage
+            ));
+        }
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+/// FAULT INJECTION for the crash-recovery tests, debug builds ONLY.
+///
+/// A durability claim can only be proved by really killing the process at the instant in question —
+/// an early `return` proves nothing about what reached the disk. This gives the E2E a way to abort
+/// (SIGABRT: no unwinding, no `Drop`, no flush) at a named point inside the structural spend.
+/// `#[cfg(debug_assertions)]` compiles it out of release builds entirely, and even in a debug build
+/// it fires only when the operator sets `UTEXO_CRASH_POINT` to the exact point name.
+#[cfg(debug_assertions)]
+fn crash_point(name: &str) {
+    if std::env::var("UTEXO_CRASH_POINT").as_deref() == std::result::Result::Ok(name) {
+        eprintln!("UTEXO_CRASH_POINT={name}: aborting to exercise structural-spend recovery");
+        std::process::abort();
+    }
+}
+#[cfg(not(debug_assertions))]
+fn crash_point(_name: &str) {}
+
+/// Carriers whose cooperative path is known to be gone (`Stranded`). They must never be selected
+/// for a new colored spend: the SE will refuse to co-sign them and the attempt would only burn
+/// derived slots and produce a confusing SE-side error instead of a clear local one.
+pub(crate) async fn journal_stranded_carriers(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    wallet_name: &str,
+) -> Result<Vec<String>> {
+    journal_ensure_table(pool).await?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM structural_spend_journal WHERE wallet_name = $1 AND stage = 'stranded'",
+    )
+    .bind(wallet_name)
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<String> = Vec::new();
+    for (payload,) in rows {
+        let rec: StructuralSpendRecord = serde_json::from_str(&payload)
+            .map_err(|e| anyhow!("unreadable structural-spend journal row: {e}"))?;
+        out.extend(rec.carrier_ids);
+    }
+    Ok(out)
+}
+
 impl UtexoWallet {
     /// Open (lazily) this wallet's RGB engine. Token support requires `rgb_proxy_url` and
     /// `rgb_data_dir` in the config.
@@ -519,6 +861,254 @@ impl UtexoWallet {
         Ok(set)
     }
 
+    // ---------------------------------------------------------------------------------------
+    // F7 — journal plumbing + the recovery reader.
+    // ---------------------------------------------------------------------------------------
+
+    /// Commit a structural-spend record at its current stage. Durable on return.
+    async fn journal_write(&self, rec: &StructuralSpendRecord) -> Result<()> {
+        journal_upsert(&self.inner.cc.pool, &self.inner.config.wallet_name, rec).await
+    }
+
+    /// Commit a record at a new stage.
+    async fn journal_stage(
+        &self,
+        rec: &mut StructuralSpendRecord,
+        stage: StructuralStage,
+    ) -> Result<()> {
+        rec.stage = stage;
+        self.journal_write(rec).await
+    }
+
+    /// Replay every interrupted structural colored spend (split/combine) found in the journal.
+    ///
+    /// Call after a restart — `transfer_tokens` and friends call it themselves before selecting a
+    /// carrier, so an interrupted spend is always healed before a new one can touch the same coin.
+    /// Errors are propagated, never swallowed: an entry this pass could not resolve stays open and
+    /// its carriers stay excluded from selection (fail closed).
+    pub async fn recover_structural_spends(&self) -> Result<Vec<StructuralSpendRecovery>> {
+        let _guard = self.inner.wallet_lock.lock().await;
+        self.recover_structural_spends_locked().await
+    }
+
+    /// [`Self::recover_structural_spends`] without taking `wallet_lock` (the caller holds it).
+    pub(crate) async fn recover_structural_spends_locked(
+        &self,
+    ) -> Result<Vec<StructuralSpendRecovery>> {
+        let open = journal_open_entries(&self.inner.cc.pool, &self.inner.config.wallet_name).await?;
+        let mut report = Vec::with_capacity(open.len());
+        for mut rec in open {
+            let outcome = match rec.stage {
+                StructuralStage::Prepared => {
+                    // Ask the SE, per carrier, whether the pinned budget was consumed. A query
+                    // failure aborts the pass with the entry still OPEN — guessing here would be
+                    // exactly the "success-like default" defect this audit is about.
+                    let mut terminal = Vec::with_capacity(rec.carrier_ids.len());
+                    for id in &rec.carrier_ids {
+                        let (_, _, t) = mercuryrustlib::lightning_latch::get_spend_budget(
+                            &self.inner.cc,
+                            id,
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "structural-spend recovery: could not read carrier {id}'s terminal \
+                                 state at the SE ({e}) — leaving journal entry {} open (fail-closed)",
+                                rec.op_id
+                            )
+                        })?;
+                        terminal.push(t);
+                    }
+                    let outcome = classify_prepared(&terminal);
+                    let stage = match outcome {
+                        StructuralSpendOutcome::Retryable => StructuralStage::Abandoned,
+                        _ => StructuralStage::Stranded,
+                    };
+                    self.journal_stage(&mut rec, stage).await?;
+                    outcome
+                }
+                // The signed child material survived: rebuild everything downstream of it.
+                _ => {
+                    self.finish_structural_spend(&mut rec, None).await?;
+                    StructuralSpendOutcome::Replayed {
+                        piece_id: rec.piece_id.clone().unwrap_or_default(),
+                        handed_over: false,
+                    }
+                }
+            };
+            report.push(StructuralSpendRecovery {
+                op_id: rec.op_id.clone(),
+                lane: rec.lane.clone(),
+                carrier_ids: rec.carrier_ids.clone(),
+                receiver_address: rec.receiver_address.clone(),
+                outcome,
+            });
+        }
+        Ok(report)
+    }
+
+    /// THE tail of every structural colored spend, shared by the live path and the recovery reader
+    /// so the two can never drift: register the sub-coins, re-register the RGB change (or mark the
+    /// carriers spent), attach the consignment envelope, and — only when `latch` is `Some` (the live
+    /// path) — latch and hand the piece over. Each completed step is journalled before the next one
+    /// starts, so a second crash resumes exactly where this one stopped.
+    ///
+    /// `latch == None` means "replay": the local state is rebuilt and the piece is left in THIS
+    /// wallet. A hand-over is a payment the caller must re-authorise, and for a latched piece the
+    /// batch id / SE hash were lost with the crash, so completing it would lock the piece forever.
+    async fn finish_structural_spend(
+        &self,
+        rec: &mut StructuralSpendRecord,
+        latch: Option<&ColoredLatch>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let signed_tx = rec
+            .signed_tx
+            .clone()
+            .ok_or_else(|| anyhow!("journal entry {} has no signed tx", rec.op_id))?;
+        let txid = rec
+            .txid
+            .clone()
+            .ok_or_else(|| anyhow!("journal entry {} has no txid", rec.op_id))?;
+        let piece_vout = rec
+            .piece_vout
+            .ok_or_else(|| anyhow!("journal entry {} has no piece vout", rec.op_id))?;
+        let change_vout = rec
+            .change_vout
+            .ok_or_else(|| anyhow!("journal entry {} has no change vout", rec.op_id))?;
+        let outputs = [
+            (rec.piece_addr.clone(), piece_vout, rec.piece_sats),
+            (rec.change_addr.clone(), change_vout, rec.change_sats),
+        ];
+
+        if rec.stage == StructuralStage::Signed {
+            let ids = if rec.lane == "colored_combine" {
+                self.register_combine_subcoins(&rec.carrier_ids, &signed_tx, &txid, &outputs)
+                    .await?
+            } else {
+                let (p, c) = self
+                    .register_split_subcoins(&rec.carrier_ids[0], &signed_tx, &txid, &outputs)
+                    .await?;
+                vec![p, c]
+            };
+            rec.piece_id = Some(ids[0].clone());
+            rec.change_id = Some(ids[1].clone());
+            self.journal_stage(rec, StructuralStage::Registered).await?;
+        }
+
+        if rec.stage == StructuralStage::Registered {
+            // NOT idempotent (a second `register_statechain` would double-book the change), which is
+            // exactly why the stage is journalled around it.
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().unwrap();
+            let asset_id = rec.asset_id.clone();
+            let token_change = rec.token_change;
+            let change_sats = rec.change_sats;
+            let carrier_ops = rec.carrier_ops.clone();
+            tokio::task::block_in_place(|| -> Result<()> {
+                if token_change > 0 {
+                    w.register_statechain(
+                        &txid,
+                        change_vout,
+                        change_sats,
+                        &asset_id,
+                        token_change,
+                        &carrier_ops,
+                    )?;
+                } else {
+                    w.mark_spent(&carrier_ops)?;
+                }
+                Ok(())
+            })?;
+            drop(rgb);
+            self.journal_stage(rec, StructuralStage::Colored).await?;
+        }
+
+        if rec.stage == StructuralStage::Colored {
+            let piece_id = rec
+                .piece_id
+                .clone()
+                .ok_or_else(|| anyhow!("journal entry {} has no piece id", rec.op_id))?;
+            let envelope = serde_json::to_string(&ConsignmentEnvelope {
+                c: rec
+                    .consignment
+                    .clone()
+                    .ok_or_else(|| anyhow!("journal entry {} has no consignment", rec.op_id))?,
+                a: rec.token_amount,
+                s: rec.piece_sats,
+            })?;
+            let mut piece_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &piece_id,
+            )
+            .await?;
+            if let Some(first) = piece_backups.first_mut() {
+                first.rgb_consignment = Some(envelope);
+                first.rgb_blinding = rec.blinding;
+            }
+            mercuryrustlib::sqlite_manager::update_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+                &piece_id,
+                &piece_backups,
+            )
+            .await?;
+            self.journal_stage(rec, StructuralStage::Enveloped).await?;
+        }
+
+        let latch = match latch {
+            Some(l) => l,
+            // Replay: the local state is whole again; the piece stays here. The entry is CLOSED so
+            // the carriers are released from the selection ban — they are spent, and the piece is a
+            // normal coin of this wallet that the caller can re-send.
+            None => {
+                self.journal_stage(rec, StructuralStage::Committed).await?;
+                return Ok((None, None));
+            }
+        };
+
+        let piece_id = rec
+            .piece_id
+            .clone()
+            .ok_or_else(|| anyhow!("journal entry {} has no piece id", rec.op_id))?;
+        let (batch_id, se_hash) = match latch {
+            ColoredLatch::None => (None, None),
+            ColoredLatch::ExternalHash(hash) => (
+                Some(
+                    mercuryrustlib::lightning_latch::create_external_hash_latch(
+                        &self.inner.cc,
+                        &self.inner.config.wallet_name,
+                        &piece_id,
+                        hash,
+                    )
+                    .await?,
+                ),
+                None,
+            ),
+            ColoredLatch::SePreimage => {
+                let pre = mercuryrustlib::lightning_latch::create_pre_image(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &piece_id,
+                )
+                .await?;
+                (Some(pre.batch_id), Some(pre.hash))
+            }
+        };
+        mercuryrustlib::transfer_sender::execute(
+            &self.inner.cc,
+            &rec.receiver_address,
+            &self.inner.config.wallet_name,
+            &piece_id,
+            None,
+            false,
+            batch_id.clone(),
+        )
+        .await?;
+        self.journal_stage(rec, StructuralStage::Committed).await?;
+        Ok((batch_id, se_hash))
+    }
+
     /// Send `token_amount` of `asset_id` to a statechain address, entirely off-chain: colored
     /// split (exact token piece + change back to this wallet) then branch-carrying key handover
     /// of the piece coin. The receiver's SDK auto-claims, validates the consignment off-chain and
@@ -580,6 +1170,11 @@ impl UtexoWallet {
         latch: ColoredLatch,
     ) -> Result<ColoredTransferOut> {
         let _guard = self.inner.wallet_lock.lock().await;
+        // F7: heal any structural spend an earlier run left half-done BEFORE picking a carrier, so a
+        // new spend can never race the replay of an old one over the same coin.
+        self.recover_structural_spends_locked().await?;
+        let banned = journal_stranded_carriers(&self.inner.cc.pool, &self.inner.config.wallet_name)
+            .await?;
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
         let record = self.record().await?;
@@ -593,6 +1188,15 @@ impl UtexoWallet {
         let mut carrier: Option<(mercurylib::wallet::Coin, u64)> = None;
         for coin in record.coins.iter() {
             if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 {
+                continue;
+            }
+            // A carrier whose co-signature was consumed by a lost structural spend can never be
+            // co-signed again — exit-only. Never select it (fail closed).
+            if coin
+                .statechain_id
+                .as_deref()
+                .map_or(false, |sid| banned.iter().any(|b| b == sid))
+            {
                 continue;
             }
             let op = format!(
@@ -621,6 +1225,7 @@ impl UtexoWallet {
                         latch,
                         record,
                         allocations,
+                        &banned,
                     )
                     .await;
             }
@@ -683,8 +1288,46 @@ impl UtexoWallet {
         .map(|v| v.len() as u32)
         .unwrap_or(0);
         let server_info = mercuryrustlib::utils::info_config(&self.inner.cc).await?;
+
+        // F7 WRITE-AHEAD: the plan becomes durable BEFORE the carrier is terminalized, so a crash in
+        // the pre-signature window is classifiable by the recovery reader instead of silent.
+        let carrier_op = format!(
+            "{}:{}",
+            carrier.utxo_txid.clone().unwrap_or_default(),
+            carrier.utxo_vout.unwrap_or_default()
+        );
+        let mut journal = StructuralSpendRecord {
+            op_id: uuid::Uuid::new_v4().to_string(),
+            lane: "colored_split".to_string(),
+            stage: StructuralStage::Prepared,
+            asset_id: asset_id.to_string(),
+            receiver_address: receiver_address.to_string(),
+            token_amount,
+            token_change,
+            carrier_ids: vec![carrier_id.clone()],
+            carrier_ops: vec![carrier_op],
+            slot_tokens: vec![token_a.clone(), token_b.clone()],
+            piece_addr: piece_addr.clone(),
+            change_addr: change_addr.clone(),
+            piece_sats: TOKEN_PIECE_SATS,
+            change_sats,
+            latched: !matches!(latch, ColoredLatch::None),
+            signed_tx: None,
+            txid: None,
+            piece_vout: None,
+            change_vout: None,
+            consignment: None,
+            blinding: None,
+            piece_id: None,
+            change_id: None,
+        };
+        self.journal_write(&journal).await?;
+
         // Terminal-spend guard on the carrier: one more co-signature (the colored split), then
-        // the SE refuses everything — the token branch cannot be double-spent.
+        // the SE refuses everything — the token branch cannot be double-spent. This MUST stay ahead
+        // of the co-signature (see the journal's module note): pinning the budget afterwards would
+        // let a malicious sender co-sign two rival branches and show both receivers a terminal
+        // ancestor.
         mercuryrustlib::lightning_latch::set_spend_budget(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -692,6 +1335,8 @@ impl UtexoWallet {
             1,
         )
         .await?;
+        // The pre-signature window: the budget is pinned but no co-signature exists yet.
+        crash_point("after_structural_terminalize");
         let splits = vec![
             (piece_addr.clone(), TOKEN_PIECE_SATS, token_amount),
             (change_addr.clone(), change_sats, token_change),
@@ -722,111 +1367,31 @@ impl UtexoWallet {
             )
             .await?
         };
-        let piece_vout = split.output_vouts[0];
-        let change_vout = split.output_vouts[1];
-
-        // Register the sub-coins as wallet coins (with backups + branch) — shared with the plain
-        // split — then RGB-register the change and mark the carrier spent.
-        let (piece_id, change_id) = self
-            .register_split_subcoins(
-                &carrier_id,
-                &split.signed_tx,
-                &split.txid,
-                &[
-                    (piece_addr.clone(), piece_vout, TOKEN_PIECE_SATS),
-                    (change_addr.clone(), change_vout, change_sats),
-                ],
-            )
+        // F7 COMMIT POINT: the co-signature is spent and irreplaceable, so the signed child material
+        // is made durable HERE — before the sub-coin registration, the RGB stash mutation, the
+        // envelope write and the hand-over. Everything after this line is replayable from the
+        // journal by `recover_structural_spends`.
+        journal.signed_tx = Some(split.signed_tx.clone());
+        journal.txid = Some(split.txid.clone());
+        journal.piece_vout = Some(split.output_vouts[0]);
+        journal.change_vout = Some(split.output_vouts[1]);
+        journal.consignment = Some(split.consignment.clone());
+        journal.blinding = Some(split.blinding);
+        self.journal_stage(&mut journal, StructuralStage::Signed)
             .await?;
-        {
-            let rgb = self.rgb().await?;
-            let w = rgb.as_ref().unwrap();
-            let carrier_op = format!(
-                "{}:{}",
-                carrier.utxo_txid.clone().unwrap_or_default(),
-                carrier.utxo_vout.unwrap_or_default()
-            );
-            tokio::task::block_in_place(|| -> Result<()> {
-                if token_change > 0 {
-                    w.register_statechain(
-                        &split.txid,
-                        change_vout,
-                        change_sats,
-                        asset_id,
-                        token_change,
-                        &[carrier_op.clone()],
-                    )?;
-                } else {
-                    w.mark_spent(&[carrier_op.clone()])?;
-                }
-                Ok(())
-            })?;
-        }
+        // The exact instant F7 is about: the carrier is terminal, the co-signature is spent, and
+        // NOTHING downstream has run yet. sdk73 kills the process here and proves the split is
+        // rebuilt from the journal alone.
+        crash_point("after_structural_sign");
 
-        // Attach the consignment envelope to the piece's backup row so it rides the transfer msg.
-        let envelope = serde_json::to_string(&ConsignmentEnvelope {
-            c: split.consignment.clone(),
-            a: token_amount,
-            s: TOKEN_PIECE_SATS,
-        })?;
-        let mut piece_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &piece_id,
-        )
-        .await?;
-        if let Some(first) = piece_backups.first_mut() {
-            first.rgb_consignment = Some(envelope);
-            first.rgb_blinding = Some(split.blinding);
-        }
-        mercuryrustlib::sqlite_manager::update_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &piece_id,
-            &piece_backups,
-        )
-        .await?;
+        // Registration → RGB change → envelope → latch → hand-over, each stage journalled. THE SAME
+        // code the recovery reader runs, so a replay cannot drift from the live path.
+        let (batch_id, se_hash) = self.finish_structural_spend(&mut journal, Some(&latch)).await?;
+        let piece_id = journal
+            .piece_id
+            .clone()
+            .ok_or_else(|| anyhow!("colored split produced no piece id"))?;
 
-        // If latching (Lightning swap), bind the piece BEFORE handing it over so the receiver's
-        // claim stays locked until the preimage is revealed.
-        let (batch_id, se_hash) = match &latch {
-            ColoredLatch::None => (None, None),
-            ColoredLatch::ExternalHash(hash) => (
-                Some(
-                    mercuryrustlib::lightning_latch::create_external_hash_latch(
-                        &self.inner.cc,
-                        &self.inner.config.wallet_name,
-                        &piece_id,
-                        hash,
-                    )
-                    .await?,
-                ),
-                None,
-            ),
-            ColoredLatch::SePreimage => {
-                let pre = mercuryrustlib::lightning_latch::create_pre_image(
-                    &self.inner.cc,
-                    &self.inner.config.wallet_name,
-                    &piece_id,
-                )
-                .await?;
-                (Some(pre.batch_id), Some(pre.hash))
-            }
-        };
-
-        // Hand the piece over (plain, or batch-locked when latching).
-        mercuryrustlib::transfer_sender::execute(
-            &self.inner.cc,
-            receiver_address,
-            &self.inner.config.wallet_name,
-            &piece_id,
-            None,
-            false,
-            batch_id.clone(),
-        )
-        .await?;
-
-        let _ = change_id;
         Ok(ColoredTransferOut {
             result: TransferResult {
                 receiver_address: receiver_address.to_string(),
@@ -857,6 +1422,7 @@ impl UtexoWallet {
         latch: ColoredLatch,
         record: mercurylib::wallet::Wallet,
         allocations: Vec<(String, u64, bool)>,
+        banned: &[String],
     ) -> Result<ColoredTransferOut> {
         // 1. Select a minimal set of confirmed, settled carriers of this asset, largest allocation
         //    first, until their allocations sum to >= token_amount; then top up with more carriers
@@ -866,6 +1432,15 @@ impl UtexoWallet {
         let mut candidates: Vec<(mercurylib::wallet::Coin, u64)> = Vec::new();
         for coin in record.coins.iter() {
             if coin.status != CoinStatus::CONFIRMED || coin.duplicate_index != 0 {
+                continue;
+            }
+            // F7 fail-closed: a carrier whose structural co-signature was consumed by a lost spend
+            // is exit-only; combining it would produce a branch the SE can never complete.
+            if coin
+                .statechain_id
+                .as_deref()
+                .map_or(false, |sid| banned.iter().any(|b| b == sid))
+            {
                 continue;
             }
             let op = format!(
@@ -967,6 +1542,37 @@ impl UtexoWallet {
                 )
             })
             .collect();
+
+        // F7 WRITE-AHEAD: the plan is durable BEFORE the first carrier is terminalized. A crash
+        // anywhere in the loop below leaves an entry the recovery reader classifies per carrier —
+        // and it takes only ONE terminal carrier to make the whole combine unrepeatable.
+        let mut journal = StructuralSpendRecord {
+            op_id: uuid::Uuid::new_v4().to_string(),
+            lane: "colored_combine".to_string(),
+            stage: StructuralStage::Prepared,
+            asset_id: asset_id.to_string(),
+            receiver_address: receiver_address.to_string(),
+            token_amount,
+            token_change,
+            carrier_ids: carrier_ids.clone(),
+            carrier_ops: carrier_ops.clone(),
+            slot_tokens: vec![token_a.clone(), token_b.clone()],
+            piece_addr: piece_addr.clone(),
+            change_addr: change_addr.clone(),
+            piece_sats: TOKEN_PIECE_SATS,
+            change_sats,
+            latched: !matches!(latch, ColoredLatch::None),
+            signed_tx: None,
+            txid: None,
+            piece_vout: None,
+            change_vout: None,
+            consignment: None,
+            blinding: None,
+            piece_id: None,
+            change_id: None,
+        };
+        self.journal_write(&journal).await?;
+
         for id in &carrier_ids {
             mercuryrustlib::lightning_latch::set_spend_budget(
                 &self.inner.cc,
@@ -1016,114 +1622,42 @@ impl UtexoWallet {
             )
             .await?
         };
-        // The collision assert the seal derivation above relies on — fail closed BEFORE the
-        // sub-coins are registered and the piece is handed over.
-        assert_own_witness(
+        // The collision assert the seal derivation above relies on — fail closed BEFORE the signed
+        // material is journalled, so the recovery reader can never replay a consignment that carries
+        // a rival's witness. The co-signatures ARE spent at this point, so the entry is closed as
+        // `Stranded`: those carriers are exit-only and must never be picked again.
+        if let Err(e) = assert_own_witness(
             "coloured combine",
             &combine.txid,
             &combine.consignment,
             combine.blinding,
-        )?;
-        let piece_vout = combine.output_vouts[0];
-        let change_vout = combine.output_vouts[1];
-
-        // 6. Register both sub-coins (merged DAG branch = all inputs' sub-branches + combine tx;
-        //    ancestors = every carrier + its inherited ancestors). Then RGB-register the change with
-        //    ALL input carrier outpoints as its sources, or mark them all spent on a full-allocation send.
-        let ids = self
-            .register_combine_subcoins(
-                &carrier_ids,
-                &combine.signed_tx,
-                &combine.txid,
-                &[
-                    (piece_addr.clone(), piece_vout, TOKEN_PIECE_SATS),
-                    (change_addr.clone(), change_vout, change_sats),
-                ],
-            )
-            .await?;
-        let piece_id = ids[0].clone();
-        let change_id = ids[1].clone();
-        {
-            let rgb = self.rgb().await?;
-            let w = rgb.as_ref().unwrap();
-            tokio::task::block_in_place(|| -> Result<()> {
-                if token_change > 0 {
-                    w.register_statechain(
-                        &combine.txid,
-                        change_vout,
-                        change_sats,
-                        asset_id,
-                        token_change,
-                        &carrier_ops,
-                    )?;
-                } else {
-                    w.mark_spent(&carrier_ops)?;
-                }
-                Ok(())
-            })?;
-        }
-
-        // 7. Attach the consignment envelope to the piece's backup so it rides the transfer message.
-        let envelope = serde_json::to_string(&ConsignmentEnvelope {
-            c: combine.consignment.clone(),
-            a: token_amount,
-            s: TOKEN_PIECE_SATS,
-        })?;
-        let mut piece_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &piece_id,
-        )
-        .await?;
-        if let Some(first) = piece_backups.first_mut() {
-            first.rgb_consignment = Some(envelope);
-            first.rgb_blinding = Some(combine.blinding);
-        }
-        mercuryrustlib::sqlite_manager::update_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &piece_id,
-            &piece_backups,
-        )
-        .await?;
-
-        // 8. Optional latch, then hand the piece over — identical to the single-carrier path.
-        let (batch_id, se_hash) = match &latch {
-            ColoredLatch::None => (None, None),
-            ColoredLatch::ExternalHash(hash) => (
-                Some(
-                    mercuryrustlib::lightning_latch::create_external_hash_latch(
-                        &self.inner.cc,
-                        &self.inner.config.wallet_name,
-                        &piece_id,
-                        hash,
-                    )
-                    .await?,
-                ),
-                None,
-            ),
-            ColoredLatch::SePreimage => {
-                let pre = mercuryrustlib::lightning_latch::create_pre_image(
-                    &self.inner.cc,
-                    &self.inner.config.wallet_name,
-                    &piece_id,
-                )
+        ) {
+            self.journal_stage(&mut journal, StructuralStage::Stranded)
                 .await?;
-                (Some(pre.batch_id), Some(pre.hash))
-            }
-        };
-        mercuryrustlib::transfer_sender::execute(
-            &self.inner.cc,
-            receiver_address,
-            &self.inner.config.wallet_name,
-            &piece_id,
-            None,
-            false,
-            batch_id.clone(),
-        )
-        .await?;
+            return Err(e);
+        }
 
-        let _ = change_id;
+        // F7 COMMIT POINT: see the single-carrier lane — the signed child material is durable before
+        // any of the work that used to be able to lose it.
+        journal.signed_tx = Some(combine.signed_tx.clone());
+        journal.txid = Some(combine.txid.clone());
+        journal.piece_vout = Some(combine.output_vouts[0]);
+        journal.change_vout = Some(combine.output_vouts[1]);
+        journal.consignment = Some(combine.consignment.clone());
+        journal.blinding = Some(combine.blinding);
+        self.journal_stage(&mut journal, StructuralStage::Signed)
+            .await?;
+        crash_point("after_structural_sign");
+
+        // 6/7/8. Sub-coin registration (merged DAG branch), RGB change re-registration, envelope,
+        //        optional latch, hand-over — the SAME journalled tail the split lane and the recovery
+        //        reader run.
+        let (batch_id, se_hash) = self.finish_structural_spend(&mut journal, Some(&latch)).await?;
+        let piece_id = journal
+            .piece_id
+            .clone()
+            .ok_or_else(|| anyhow!("colored combine produced no piece id"))?;
+
         Ok(ColoredTransferOut {
             result: TransferResult {
                 receiver_address: receiver_address.to_string(),
@@ -1397,12 +1931,8 @@ impl UtexoWallet {
         )
         .await
         .unwrap_or_default();
-        let mut txids = Vec::new();
-        for b in &branch {
-            let tx: bitcoin::Transaction =
-                bitcoin::consensus::encode::deserialize(&hex::decode(&b.tx)?)?;
-            txids.push(tx.txid().to_string());
-        }
+        let raw_branch: Vec<String> = branch.iter().map(|b| b.tx.clone()).collect();
+        let txids = branch_witness_txids(&raw_branch)?;
 
         let record = self.record().await?;
         let coin = record
@@ -1418,36 +1948,13 @@ impl UtexoWallet {
 
         let mut rgb = self.rgb().await?;
         let w = rgb.as_mut().unwrap();
-        let (valid, detail, contract_id) = tokio::task::block_in_place(|| {
-            w.validate_offchain_chain_info(&env.c, &txids)
-        })?;
-        if !valid {
-            // PERMANENT-INVALID prefix (external review finding 5): a consignment that fails
-            // cryptographic validation is never going to book. claim() matches this exact prefix to
-            // un-quarantine the coin (so a griefer cannot lock a victim's sats forever by attaching a
-            // garbage consignment) — as distinct from a TRANSIENT RGB-proxy/indexer error (no prefix),
-            // which keeps the coin quarantined and retried.
-            return Err(anyhow!(
-                "PERMANENT-INVALID: incoming token consignment INVALID: {}",
-                detail.unwrap_or_default()
-            ));
-        }
-        let contract_id =
-            contract_id.ok_or_else(|| anyhow!("validated consignment without contract id"))?;
-        // Book the amount the CONSIGNMENT assigns to our own witness outpoint — the cryptographic
-        // source of truth. The envelope amount (env.a) is only a hint we cross-check; a lying
-        // sender cannot inflate the booked balance because the consignment governs it.
-        let booked = tokio::task::block_in_place(|| {
-            w.accept_offchain_amount(&env.c, &txids, &txid, vout)
-        })?;
-        if booked != env.a {
-            // PERMANENT-INVALID (see above): the consignment cryptographically assigns a different
-            // amount than the envelope claimed — a lying sender; this will never book.
-            return Err(anyhow!(
-                "PERMANENT-INVALID: token consignment assigns {booked} to this coin but the envelope claimed {} — rejecting",
-                env.a
-            ));
-        }
+        // THE shared predicate (F1) — byte-for-byte the same check the SSP's pre-payment gate runs,
+        // including the `booked == env.a` equality. Errors carry the `PERMANENT-INVALID:` prefix that
+        // claim() matches to un-quarantine a coin that can never book (so a griefer cannot lock a
+        // victim's sats forever by attaching a garbage consignment), as distinct from a TRANSIENT
+        // RGB-proxy/indexer error (no prefix), which keeps the coin quarantined and retried.
+        let (contract_id, booked) =
+            verify_consignment_assignment(w, &env, &txids, &txid, vout)?;
         tokio::task::block_in_place(|| -> Result<()> {
             // First sight of this contract: import it (genesis + history) into the stash so the
             // allocation rows have their asset to reference — validated against the same branch.
@@ -1468,6 +1975,11 @@ impl UtexoWallet {
     /// amount is trustworthy. Read-only: `validate_offchain_chain_info` and `accept_offchain_amount`
     /// load the consignment into a temp dir and query it, mutating neither the stash nor the wallet,
     /// so it does not disturb the later `accept_incoming_tokens` booking.
+    ///
+    /// F1: this runs the IDENTICAL predicate the claim path runs
+    /// (`verify_consignment_assignment`), envelope-equality check included. Previously it omitted the
+    /// `booked == env.a` equality, so a payer could mutate the envelope amount, pass this gate, take
+    /// the irreversible Lightning payment, and leave the SSP holding a coin that fails at claim.
     pub async fn validate_pending_token(
         &self,
         consignment_env: &str,
@@ -1477,29 +1989,10 @@ impl UtexoWallet {
     ) -> Result<(String, u64)> {
         let env: ConsignmentEnvelope = serde_json::from_str(consignment_env)
             .map_err(|e| anyhow!("malformed consignment envelope: {e}"))?;
-        let mut txids = Vec::new();
-        for b in branch_txs {
-            let tx: bitcoin::Transaction =
-                bitcoin::consensus::encode::deserialize(&hex::decode(b)?)?;
-            txids.push(tx.txid().to_string());
-        }
+        let txids = branch_witness_txids(branch_txs)?;
         let mut rgb = self.rgb().await?;
         let w = rgb.as_mut().ok_or_else(|| anyhow!("RGB engine not configured"))?;
-        let (valid, detail, contract_id) = tokio::task::block_in_place(|| {
-            w.validate_offchain_chain_info(&env.c, &txids)
-        })?;
-        if !valid {
-            return Err(anyhow!(
-                "pending token consignment INVALID: {}",
-                detail.unwrap_or_default()
-            ));
-        }
-        let contract_id =
-            contract_id.ok_or_else(|| anyhow!("validated consignment without contract id"))?;
-        let booked = tokio::task::block_in_place(|| {
-            w.accept_offchain_amount(&env.c, &txids, funding_txid, funding_vout)
-        })?;
-        Ok((contract_id, booked))
+        verify_consignment_assignment(w, &env, &txids, funding_txid, funding_vout)
     }
 }
 
@@ -1518,16 +2011,47 @@ mod envelope_tests {
         assert_eq!(back.c, "base64data");
     }
 
-    // REQ-21: the envelope amount is only a hint; the receiver compares it to the consignment-
-    // derived amount and rejects on mismatch. This models that decision (the crypto derivation
-    // itself is covered E2E by sdk02/sdk09).
+    // REQ-21 / F1: the envelope amount is only a hint; the consignment-derived amount governs, and a
+    // mismatch is rejected. This models the decision (the crypto derivation itself is covered E2E by
+    // sdk02/sdk09, and the SSP pre-pay refusal by sdk37).
+    //
+    // The equality below now lives in exactly ONE place — `verify_consignment_assignment` — which is
+    // what both `validate_pending_token` (the SSP's pre-payment gate, before an IRREVERSIBLE Lightning
+    // payment) and `accept_incoming_tokens` (claim) call. The F1 defect was that the gate had its own,
+    // weaker copy that omitted it. If a future edit re-splits them, sdk37's mutated-envelope assertion
+    // is the tripwire.
     #[test]
     fn envelope_amount_is_a_checked_hint() {
         let booked = 250u64; // from the consignment
         let honest = ConsignmentEnvelope { c: "c".into(), a: 250, s: 1500 };
         let lying = ConsignmentEnvelope { c: "c".into(), a: 999, s: 1500 };
         assert_eq!(honest.a, booked); // accepted
-        assert_ne!(lying.a, booked); // rejected (ERR-8)
+        assert_ne!(lying.a, booked); // rejected (ERR-8) — on BOTH paths, pre-pay and claim
+    }
+
+    // F1 tripwire: the pre-payment gate and the claim path must resolve to the SAME predicate symbol.
+    // A source-level check is the only way to state "these two are one function" — the predicate needs
+    // a live RGB engine, so it cannot be exercised in a unit test.
+    #[test]
+    fn prepay_and_claim_share_one_predicate() {
+        let src = include_str!("tokens.rs");
+        // Needles are assembled at runtime so this test's own source does not match them.
+        let predicate = concat!("verify_consignment_", "assignment(");
+        // 1 definition + 2 call sites (validate_pending_token, accept_incoming_tokens).
+        assert_eq!(
+            src.matches(predicate).count(),
+            3,
+            "the shared consignment predicate must have exactly its definition and the two call \
+             sites (pre-pay gate + claim); a pre-pay check that stops calling it is the F1 hole"
+        );
+        // And the equality itself must live inside the shared predicate, nowhere else.
+        let equality = concat!("if booked != ", "env.a {");
+        assert_eq!(
+            src.matches(equality).count(),
+            1,
+            "the `booked == env.a` equality must exist exactly once — a second copy is a predicate \
+             that can drift out of sync"
+        );
     }
 }
 
@@ -1612,5 +2136,216 @@ mod split_seal_tests {
             "the batch lane must always set the flag"
         );
         assert_eq!(batch.rung & !BATCH_SPLIT_RUNG_FLAG, batch_arity(1));
+    }
+}
+
+/// F7 — the durable prepare/commit journal that keeps a structural colored spend recoverable across
+/// a crash between "the parent's spend budget is terminalized" and "the signed child material is
+/// persisted".
+///
+/// The centrepiece is a REAL process kill (`std::process::abort()`, i.e. SIGABRT — no unwinding, no
+/// destructors, no buffered writes flushed) executed by a child process between the two steps. The
+/// parent then reopens the same sqlite file and asserts the recovery reader can see exactly what
+/// survived. A simulated "crash" that just returns early would prove nothing about durability; only
+/// killing the process does.
+#[cfg(test)]
+mod structural_journal_tests {
+    use super::{
+        classify_prepared, journal_open_entries, journal_stranded_carriers, journal_upsert,
+        StructuralSpendOutcome, StructuralSpendRecord, StructuralStage,
+    };
+
+    /// Set on the child process; its value is the stage the child dies AFTER committing.
+    const CRASH_AT: &str = "SDK_F7_CRASH_AT";
+    /// Sqlite file shared between parent and child.
+    const CRASH_DB: &str = "SDK_F7_CRASH_DB";
+
+    fn record(stage: StructuralStage) -> StructuralSpendRecord {
+        StructuralSpendRecord {
+            op_id: "op-under-test".to_string(),
+            lane: "colored_split".to_string(),
+            stage,
+            asset_id: "rgb:contract-1".to_string(),
+            receiver_address: "tml1receiver".to_string(),
+            token_amount: 250,
+            token_change: 750,
+            carrier_ids: vec!["carrier-sid".to_string()],
+            carrier_ops: vec!["aa11:0".to_string()],
+            slot_tokens: vec!["tok-a".to_string(), "tok-b".to_string()],
+            piece_addr: "bcrt1piece".to_string(),
+            change_addr: "bcrt1change".to_string(),
+            piece_sats: 1_500,
+            change_sats: 8_500,
+            latched: false,
+            signed_tx: None,
+            txid: None,
+            piece_vout: None,
+            change_vout: None,
+            consignment: None,
+            blinding: None,
+            piece_id: None,
+            change_id: None,
+        }
+    }
+
+    /// The signed child material the old code kept ONLY in process memory — the thing the crash used
+    /// to destroy.
+    fn sign(rec: &mut StructuralSpendRecord) {
+        rec.signed_tx = Some("0200000000010111feedface".to_string());
+        rec.txid = Some("f00dbabe".repeat(8));
+        rec.piece_vout = Some(0);
+        rec.change_vout = Some(1);
+        rec.consignment = Some("Y29uc2lnbm1lbnQ=".to_string());
+        rec.blinding = Some(0xdead_beef_u64);
+        rec.stage = StructuralStage::Signed;
+    }
+
+    async fn open_pool(db: &str) -> sqlx::Pool<sqlx::Sqlite> {
+        sqlx::SqlitePool::connect(&format!("sqlite:{db}?mode=rwc"))
+            .await
+            .expect("open sqlite")
+    }
+
+    /// The child: journal the operation the way the production path does, then DIE at the requested
+    /// point. `prepared` models a kill in the pre-signature window (budget pinned, no co-signature);
+    /// `signed` models a kill in the window that used to lose everything — right after the SE
+    /// returned the co-signature, before any sub-coin was registered.
+    async fn child_role(db: &str, crash_at: &str) -> ! {
+        let pool = open_pool(db).await;
+        let mut rec = record(StructuralStage::Prepared);
+        // Write-ahead: this lands BEFORE `set_spend_budget` in production.
+        journal_upsert(&pool, "w", &rec).await.expect("prepare");
+        if crash_at == "signed" {
+            // ... `set_spend_budget` + the co-signature happen here in production ...
+            sign(&mut rec);
+            journal_upsert(&pool, "w", &rec).await.expect("signed");
+        }
+        // Hard kill: no unwinding, no Drop, no flush. Anything readable afterwards is on disk
+        // because sqlite fsynced the commit, which is the property under test.
+        std::process::abort();
+    }
+
+    fn spawn_crashing_child(db: &str, crash_at: &str) -> std::process::Output {
+        let exe = std::env::current_exe().expect("test binary path");
+        std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("tokens::structural_journal_tests::a_hard_kill_between_the_two_steps_is_recovered")
+            .arg("--nocapture")
+            .env(CRASH_DB, db)
+            .env(CRASH_AT, crash_at)
+            .output()
+            .expect("spawn crashing child")
+    }
+
+    fn scratch_db(tag: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("sdk-f7-journal-{tag}-{}.sqlite", uuid::Uuid::new_v4()));
+        p.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_hard_kill_between_the_two_steps_is_recovered() {
+        // ---- child role -------------------------------------------------------------------
+        if let (Ok(db), Ok(at)) = (std::env::var(CRASH_DB), std::env::var(CRASH_AT)) {
+            child_role(&db, &at).await;
+        }
+
+        // ---- parent role: kill AFTER the signed material was committed ---------------------
+        let db = scratch_db("signed");
+        let out = spawn_crashing_child(&db, "signed");
+        assert!(
+            !out.status.success(),
+            "the child was supposed to die by abort(), not exit cleanly: {out:?}"
+        );
+        let pool = open_pool(&db).await;
+        let open = journal_open_entries(&pool, "w").await.expect("read journal");
+        assert_eq!(open.len(), 1, "the interrupted spend must still be visible after the kill");
+        let rec = &open[0];
+        assert_eq!(rec.stage, StructuralStage::Signed);
+        // THE regression this test exists for: the co-signed child transaction, its consignment and
+        // its blinding survived a process kill, so the cooperative path is replayable. Before the
+        // journal these lived only in memory and the parent was already terminal at the SE.
+        assert_eq!(rec.signed_tx.as_deref(), Some("0200000000010111feedface"));
+        assert_eq!(rec.consignment.as_deref(), Some("Y29uc2lnbm1lbnQ="));
+        assert_eq!(rec.blinding, Some(0xdead_beef_u64));
+        assert_eq!(rec.piece_vout, Some(0));
+        assert_eq!(rec.change_vout, Some(1));
+        assert_eq!(rec.carrier_ids, vec!["carrier-sid".to_string()]);
+        assert_eq!(rec.receiver_address, "tml1receiver");
+        // A `Signed` entry is never classified as lost — it is replayed.
+        assert!(
+            journal_stranded_carriers(&pool, "w").await.unwrap().is_empty(),
+            "a replayable entry must not ban its carrier"
+        );
+        drop(pool);
+        let _ = std::fs::remove_file(&db);
+
+        // ---- parent role: kill in the PRE-signature window --------------------------------
+        let db = scratch_db("prepared");
+        let out = spawn_crashing_child(&db, "prepared");
+        assert!(!out.status.success(), "child must abort");
+        let pool = open_pool(&db).await;
+        let open = journal_open_entries(&pool, "w").await.expect("read journal");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].stage, StructuralStage::Prepared);
+        assert!(open[0].signed_tx.is_none());
+        // The recovery reader asks the SE whether the pinned budget was consumed and decides from
+        // that alone; both answers are exercised as the pure decision below.
+        assert_eq!(classify_prepared(&[false]), StructuralSpendOutcome::Retryable);
+        assert_eq!(
+            classify_prepared(&[true]),
+            StructuralSpendOutcome::CooperativePathLost
+        );
+        drop(pool);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Resolved entries leave the reader's view, and a `Stranded` one bans its carriers from any
+    /// further colored spend (fail closed — the SE can never co-sign them again).
+    #[tokio::test]
+    async fn resolved_entries_leave_the_open_set_and_stranded_carriers_are_banned() {
+        let db = scratch_db("resolve");
+        let pool = open_pool(&db).await;
+        let mut rec = record(StructuralStage::Prepared);
+        journal_upsert(&pool, "w", &rec).await.unwrap();
+        assert_eq!(journal_open_entries(&pool, "w").await.unwrap().len(), 1);
+
+        rec.stage = StructuralStage::Abandoned;
+        journal_upsert(&pool, "w", &rec).await.unwrap();
+        assert!(journal_open_entries(&pool, "w").await.unwrap().is_empty());
+        assert!(journal_stranded_carriers(&pool, "w").await.unwrap().is_empty());
+
+        rec.stage = StructuralStage::Stranded;
+        journal_upsert(&pool, "w", &rec).await.unwrap();
+        assert!(journal_open_entries(&pool, "w").await.unwrap().is_empty());
+        assert_eq!(
+            journal_stranded_carriers(&pool, "w").await.unwrap(),
+            vec!["carrier-sid".to_string()],
+            "a carrier whose co-signature was consumed by a lost spend must never be re-selected"
+        );
+
+        // Journals of OTHER wallets are invisible (the reader is per-wallet).
+        assert!(journal_open_entries(&pool, "other").await.unwrap().is_empty());
+        assert!(journal_stranded_carriers(&pool, "other").await.unwrap().is_empty());
+        drop(pool);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A combine's entry is lost the moment ANY of its carriers went terminal: the combine consumes
+    /// all N co-signatures together and cannot be rebuilt from a subset.
+    #[test]
+    fn one_terminal_carrier_condemns_the_whole_combine() {
+        assert_eq!(
+            classify_prepared(&[false, false, false]),
+            StructuralSpendOutcome::Retryable
+        );
+        assert_eq!(
+            classify_prepared(&[false, true, false]),
+            StructuralSpendOutcome::CooperativePathLost
+        );
+        // No carriers at all is not "safe by default" in the dangerous direction: an empty set can
+        // only arise from a malformed record, and it resolves to the retry-safe branch, which never
+        // hands anything to a receiver.
+        assert_eq!(classify_prepared(&[]), StructuralSpendOutcome::Retryable);
     }
 }

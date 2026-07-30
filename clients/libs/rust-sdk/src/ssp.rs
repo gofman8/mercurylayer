@@ -469,6 +469,14 @@ impl SspService {
             // latch a 1-USDT (or wrong-asset) coin against a 10k-USDT invoice and the post-payment
             // balance-delta check (below) would fire only after the Lightning money is gone. Validate
             // each latched coin's consignment NOW (audit [4]).
+            //
+            // F1: `validate_pending_token` runs the IDENTICAL predicate the claim path runs — one
+            // shared implementation (`tokens::verify_consignment_assignment`), not two that have to be
+            // kept in sync by hand. It previously omitted the claim path's `booked == env.a` envelope
+            // equality, so a payer could mutate the envelope amount, pass this gate, collect an
+            // IRREVERSIBLE Lightning payment, and leave us holding a coin that fails PERMANENT-INVALID
+            // at claim. A pre-payment predicate weaker than the claim predicate is a pay-out hole; the
+            // two must be the same function, and now are.
             let asset_amount = d.asset_amount.ok_or_else(|| {
                 anyhow!("RGB invoice for {asset_id} carries no asset amount — refusing to pay")
             })?;

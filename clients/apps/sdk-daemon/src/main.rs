@@ -194,6 +194,15 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "LadderSkipped",
                                 json!({"statechain_id": statechain_id, "reason": reason.as_str()}),
                             ),
+                            // 🔴 [F3] A deadline-critical pass is BLIND — it did not run, it did not
+                            // "find nothing". `pass` uses the stable wire spellings ("auto-exit",
+                            // "defend-ladders"). A host MUST alert on this: while it repeats, no
+                            // clawback and no hostile trigger is being raced for this wallet. The
+                            // same state is readable on demand via `watchtower_faults`.
+                            WalletEvent::WatchtowerBlind { pass, detail } => (
+                                "WatchtowerBlind",
+                                json!({"pass": pass.as_str(), "detail": detail}),
+                            ),
                         };
                         let line = json!({"event": name, "data": data}).to_string();
                         let mut out = tokio::io::stdout();
@@ -278,6 +287,28 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
             serde_json::to_value(wallet.unilateral_exit(coins, None).await?)?
         }
         "get_activities" => serde_json::to_value(wallet.get_activities().await?)?,
+        // [F3] Poll-side twin of the `WatchtowerBlind` event: which deadline-critical passes are
+        // currently blind. `[]` means every pass that has run, ran with full visibility — a host
+        // that shows "protected" must read this, not merely observe an absence of errors.
+        "watchtower_faults" => Value::Array(
+            wallet
+                .watchtower_faults()
+                .await
+                .into_iter()
+                .map(|f| {
+                    json!({
+                        "pass": f.pass.as_str(),
+                        "detail": f.detail,
+                        "consecutive_failures": f.consecutive_failures,
+                        "since_unix": f.since_unix,
+                        "last_unix": f.last_unix,
+                    })
+                })
+                .collect(),
+        ),
+        // [F2] The TES-R defence also runs unconditionally in `start_background` (once per block);
+        // this exposes an explicit extra pass for a host that wants to force one.
+        "defend_ladders" => json!(wallet.defend_ladders().await?),
         other => return Err(anyhow!("unknown method {other}")),
     })
 }
