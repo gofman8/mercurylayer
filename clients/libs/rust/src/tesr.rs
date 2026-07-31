@@ -173,6 +173,163 @@ pub struct ChildTesrBundle {
     /// when this is empty, otherwise `ancestors.last().state`.
     #[serde(default)]
     pub ancestors: Vec<ChildSegment>,
+    /// **CTES-R.** Present iff this child carries an RGB allocation — i.e. it was carved by
+    /// [`colored_in_ladder_split`] out of a COLOURED parent. `None` on every plain child, and
+    /// `#[serde(default)]` keeps every already-persisted `ctesr-*` row and every in-flight mailbox
+    /// message deserializing byte-identically.
+    #[serde(default)]
+    pub rgb: Option<ColoredChild>,
+}
+
+/// The RGB half of a COLOURED split child: this child's own share of the parent's allocation, and
+/// the consignments proving its two own tiers.
+///
+/// The ancestor segment's proofs (`T`, `X_m`, `SP`) ride in `ChildTesrBundle::parent.rgb` in
+/// [`TesrBundle::exit_tiers`] order, so the full leaf-ward chain a receiver must validate is
+/// `parent.rgb.consignments ++ self.consignments`, and its witness list is
+/// `parent.ladder_txids() ++ [child_extension.txid, child_state.txid]`.
+///
+/// As with [`ColoredLadder`], seal blindings are **not** stored — they are DERIVED on both sides
+/// from [`colored_tier_seal`], because a stored blinding is an attacker-supplied field the receiver
+/// could be talked into trusting.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ColoredChild {
+    /// RGB contract id whose allocation this child carries. MUST equal the parent segment's.
+    pub contract_id: String,
+    /// THIS child's share of the allocation — strictly less than the parent's whole when the split
+    /// has more than one child, and `Σ children == parent.rgb.amount` by construction.
+    pub amount: u64,
+    /// Consignments for the child's OWN two tiers, in exit order:
+    /// `[child_extension, child_state]`.
+    pub consignments: Vec<String>,
+}
+
+impl ChildTesrBundle {
+    /// True iff this child carries an RGB allocation (CTES-R).
+    pub fn is_colored(&self) -> bool {
+        self.rgb.is_some()
+    }
+
+    /// The FULL off-chain witness list a coloured child's consignments must be resolved against, in
+    /// leaf-ward order: the ancestor segment `T, X_m, SP` followed by the child's own two tiers.
+    ///
+    /// Refuses a multi-level child (`ancestors` non-empty): a coloured GRANDCHILD cannot be built
+    /// today (`child_in_ladder_split` refuses a coloured child), so a bundle claiming to be both
+    /// coloured and multi-level did not come from this code and has no derivable seal schedule.
+    /// Fail CLOSED rather than resolve a chain we cannot account for.
+    pub fn colored_child_txids(&self) -> Result<Vec<String>> {
+        if !self.is_colored() {
+            return Err(anyhow::anyhow!("this child is PLAIN — it has no coloured witness chain"));
+        }
+        if !self.ancestors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "a coloured child must be depth-1 (found {} intermediate segments) — coloured \
+                 child-level split does not exist, so a multi-level coloured child has no \
+                 derivable seal schedule",
+                self.ancestors.len()
+            ));
+        }
+        let mut v = self.parent.ladder_txids();
+        v.push(self.child_extension.txid.clone());
+        v.push(self.child_state.txid.clone());
+        Ok(v)
+    }
+
+    /// **The seal schedule of a coloured child — derived by BOTH parties, stored by neither.**
+    ///
+    /// Five seals in leaf-ward order, matching [`Self::colored_child_txids`]:
+    ///
+    /// | tier | derived from |
+    /// |---|---|
+    /// | `T` | parent sid, [`TierRole::Trigger`] |
+    /// | `X_m` | parent sid, [`TierRole::Extension`], rung `m ‖ csv` |
+    /// | `SP` | parent sid, [`TierRole::SplitState`], rung `m ‖ csv` — **at THIS child's `sp_vout`** |
+    /// | `ext_child` | CHILD sid, [`TierRole::ChildExtension`] |
+    /// | `state_child` | CHILD sid, [`TierRole::ChildState`] |
+    ///
+    /// Two things here are load-bearing and easy to get wrong:
+    ///
+    /// 1. `SP`'s role is `SplitState`, **not** `State`. `SP` and the parent's retained `S_0` are
+    ///    RIVAL transitions over the same `X_m` payload output; deriving `SP` with `TierRole::State`
+    ///    would hand it `S_0`'s blinding, the two would collapse to one `OpId`, and rgb-lib would
+    ///    keep whichever witness has the smaller internal txid — an arbitrary hash lottery
+    ///    (`docs/utexo/CTESR-GATE.md` §2.2). This is why [`TesrBundle::colored_tier_seals`] cannot
+    ///    be reused for a split parent: it hard-codes `State` for the current state.
+    /// 2. Every child of one split shares `SP`'s *blinding* (one transition, one seal identity) and
+    ///    is separated only by `sp_vout`. That is sound — an RGB seal is `(vout, blinding)` — and it
+    ///    is also what keeps a child's siblings CONCEALED from it: revealing `(sp_vout_j, blinding)`
+    ///    opens child `j`'s assignment and no other.
+    pub fn colored_child_seals(&self) -> Result<Vec<(String, u32, u64)>> {
+        use crate::rgb::TierRole;
+        let _ = self.colored_child_txids()?;
+        let p = &self.parent;
+        if p.levels.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "a coloured child's parent segment must have exactly one level (found {})",
+                p.levels.len()
+            ));
+        }
+        let psid = &p.statechain_id;
+        let ext = &p.current().extension;
+        let sp = &p.current().state;
+        let csid = &self.child_statechain_id;
+        Ok(vec![
+            (
+                p.trigger.txid.clone(),
+                p.trigger.payload_vout,
+                colored_tier_seal(psid, TierRole::Trigger, 0, 0, None).blinding(),
+            ),
+            (
+                ext.txid.clone(),
+                ext.payload_vout,
+                colored_tier_seal(psid, TierRole::Extension, 0, p.m, ext.csv).blinding(),
+            ),
+            (
+                sp.txid.clone(),
+                // THIS child's payload output of the shared split transition.
+                self.sp_vout,
+                colored_tier_seal(psid, TierRole::SplitState, 0, p.m, sp.csv).blinding(),
+            ),
+            (
+                self.child_extension.txid.clone(),
+                self.child_extension.payload_vout,
+                colored_tier_seal(csid, TierRole::ChildExtension, 0, 0, self.child_extension.csv)
+                    .blinding(),
+            ),
+            (
+                self.child_state.txid.clone(),
+                self.child_state.payload_vout,
+                colored_tier_seal(csid, TierRole::ChildState, 0, 0, self.child_state.csv)
+                    .blinding(),
+            ),
+        ])
+    }
+
+    /// The LEAF consignment — the proof for the child's own final state, the one a receiver
+    /// validates and books against.
+    pub fn leaf_consignment(&self) -> Option<&String> {
+        self.rgb.as_ref().and_then(|r| r.consignments.last())
+    }
+}
+
+/// **The CTES-R interlock, child side.** Refuse an operation that would build an UNCOLOURED tier
+/// over a COLOURED child's sealed output.
+///
+/// The mirror of [`refuse_uncolored_over_colored`], and it exists for a hazard that is strictly
+/// worse than the parent one because it is *silent by omission*: `child_in_ladder_split` and
+/// `child_retransfer` build plain tiers over `ext_child.out[0]` / the child's state output. Before
+/// coloured children existed those two were vacuously safe — no child ever carried an allocation.
+/// The moment [`colored_in_ladder_split`] can produce one, the next hop would spend a sealed output
+/// with an RGB-unaware transaction and BURN the allocation, with every existing check passing.
+pub fn refuse_uncolored_over_colored_child(cb: &ChildTesrBundle, what: &str) -> Result<()> {
+    if cb.is_colored() {
+        return Err(anyhow::anyhow!(
+            "{what}: this CHILD carries an RGB allocation (CTES-R) and {what} would build an \
+             UNCOLOURED tier over a sealed output, destroying it. Refusing — the coloured \
+             child-level replacement path is not implemented."
+        ));
+    }
+    Ok(())
 }
 
 /// One INTERMEDIATE child segment of a multi-level child chain: the split state that funds the next
@@ -1260,6 +1417,543 @@ pub async fn establish_child(
     })
 }
 
+// =================================================================================================
+// CTES-R — the COLOURED IN-LADDER SPLIT. The replacement for the legacy coloured-split lane.
+//
+// The legacy lane (`create_colored_split_tx`) spent the carrier's FUNDING outpoint `F` directly, so
+// it was a RIVAL of the coloured trigger `T` over the same `F` carrying a rival RGB transition:
+// whoever retained `T` could broadcast it, consume `F`, and void the split. That is why the two
+// lanes were mutually exclusive per carrier, and why `colored_ladder` had to default OFF.
+//
+// The replacement carves the same value out of a DESCENDANT of `T` instead: an `SP` split-state tier
+// over `X_m`'s payload output, carrying an RGB transition that assigns each child its share. `SP` is
+// not a rival for `F` — it is a rival for the parent's own retained state `S_0`, one rung lower, and
+// that is the ordinary CTES-R case the per-tier seal blinding already separates.
+// =================================================================================================
+
+/// The smallest `SP` output that can carry a COLOURED child ladder (extension + state, no trigger).
+///
+/// The coloured sibling of `mercurylib::tesr::min_child_value`: two coloured rungs plus a final
+/// output that still clears dust. A coloured rung is dearer than a plain one by exactly
+/// `P2TR_OUT_VBYTES * rate`, because the RGB `opret` is a real output the committed fee must cover.
+pub fn colored_child_floor(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
+    2 * (crate::rgb::colored_committed_fee(1, fee_rate_sats_per_vb) + mercurylib::tesr::P2A_VALUE)
+        + dust_limit
+}
+
+/// What the caller asks for, per child of a coloured split. The child coin must ALREADY be
+/// SE-registered — `SP` pays its aggregate, so the aggregate must exist before `SP` is built.
+#[derive(Clone, Debug)]
+pub struct ColoredSplitChildSpec {
+    pub statechain_id: String,
+    /// The child's aggregate address — this is what `SP.out[j]` pays.
+    pub agg_address: String,
+    /// Where the child's final state pays (Model A: the RECIPIENT's own exit key).
+    pub owner_exit_address: String,
+    /// The child's share of the sats.
+    pub sats: u64,
+    /// The child's share of the ALLOCATION. May be 0 for a sats-only child, but `Σ rgb_amount`
+    /// across all children must equal the parent's whole allocation — no mint, no burn.
+    pub rgb_amount: u64,
+}
+
+/// One child of a built-but-unsigned coloured split.
+#[derive(Clone, Debug)]
+pub struct ColoredSplitChildDraft {
+    pub statechain_id: String,
+    pub owner_exit_address: String,
+    pub sp_vout: u32,
+    pub sp_out_value: u64,
+    pub rgb_amount: u64,
+    pub csv_e: u16,
+    pub csv_d: u16,
+    pub extension: ColoredTierDraft,
+    pub state: ColoredTierDraft,
+}
+
+/// A complete coloured in-ladder split, built and coloured, awaiting its `1 + 2N` SE co-signs.
+#[derive(Clone, Debug)]
+pub struct ColoredSplitDraft {
+    pub parent_statechain_id: String,
+    pub contract_id: String,
+    pub network: String,
+    pub fee_rate: f64,
+    pub sp_csv: u16,
+    pub sp_txid: String,
+    pub sp_tx_hex: String,
+    pub sp_consignment: String,
+    /// `Σ child sats` — what `X_m`'s payload output affords across `N` payloads.
+    pub sp_total: u64,
+    /// `X_m`'s payload output, which `SP` spends (the co-signer's fail-closed recheck).
+    pub parent_prev_txid: String,
+    pub parent_prev_vout: u32,
+    pub parent_prev_value: u64,
+    pub children: Vec<ColoredSplitChildDraft>,
+}
+
+/// **Build a COLOURED in-ladder split.** Engine-only, synchronous, co-signs NOTHING — the
+/// `!Sync`-resolver rule that governs every other coloured builder in this module.
+///
+/// Produces `1 + 2N` coloured tiers: the split state `SP` over `X_m`'s payload output assigning each
+/// child its share, and per child a headless coloured ladder (`ext_child`, `state_child`) rooted at
+/// `SP.out[j]` and paying the recipient's own exit key.
+///
+/// Three conservation laws are enforced BEFORE any tier is built, because every one of them is
+/// unrecoverable once an SE co-sign has been spent:
+///
+/// 1. **Sats.** `Σ child sats == colored_tier_out_total(X_m.payload, N, rate)` — the coloured fee is
+///    dearer than the plain one, so the plain `tier_out_total` would over-pay and the tier would be
+///    rejected as a value-conservation failure at build time.
+/// 2. **Allocation.** `Σ child rgb_amount == parent allocation`. An allocation must never be
+///    destroyed; a split that burns part of one is refused here rather than discovered by a receiver
+///    whose consignment assigns less than it was promised.
+/// 3. **Child viability.** every child clears [`colored_child_floor`], so it can actually fund its
+///    own two coloured rungs. A child below the floor would co-sign an `SP` that no child ladder can
+///    hang off — the parent terminalized, the value stranded.
+pub fn build_colored_in_ladder_split(
+    rgb: &mercury_rgb::RgbWallet,
+    bundle: &TesrBundle,
+    children: &[ColoredSplitChildSpec],
+) -> Result<ColoredSplitDraft> {
+    use crate::rgb::{
+        build_colored_tier, colored_tier_out_total, colored_tier_out_value, ColoredTierSpec,
+        TierRole,
+    };
+
+    if !bundle.is_colored() {
+        return Err(anyhow::anyhow!(
+            "build_colored_in_ladder_split: this coin's ladder is PLAIN — use in_ladder_split"
+        ));
+    }
+    // Reuses the coloured seal schedule's single-level invariant (and its reasoning).
+    let _ = bundle.colored_tier_seals()?;
+    let rgb_half = bundle.rgb.as_ref().expect("is_colored");
+    let n = children.len();
+    if n == 0 {
+        return Err(anyhow::anyhow!("a coloured in-ladder split needs at least one child"));
+    }
+    let p = bundle.params;
+    let s0_csv = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+    // SP must OUT-RACE S_0 over X_m's payload output: one rung lower, floored. This is also what
+    // separates their seals — the rung folds in the CSV.
+    let sp_csv = s0_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| {
+            anyhow::anyhow!("state CSV at the floor — renew/rollover before splitting this carrier")
+        })?;
+
+    let x_m = bundle.current().extension.clone();
+    let (parent_prev_value, parent_prev_spk) =
+        tier_payload_prevout(&x_m, "coloured split parent")?;
+
+    // ---- Conservation law 1: SATS. -------------------------------------------------------------
+    let total = colored_tier_out_total(parent_prev_value, n, bundle.fee_rate).ok_or_else(|| {
+        anyhow::anyhow!(
+            "X_m's payload output ({parent_prev_value} sat) cannot carry a coloured {n}-child \
+             split at {} sat/vB",
+            bundle.fee_rate
+        )
+    })?;
+    let sum: u64 = children.iter().map(|c| c.sats).sum();
+    if sum != total {
+        return Err(anyhow::anyhow!(
+            "coloured split value conservation: children sum to {sum} sat but X_m's payload output \
+             affords exactly {total} sat across {n} coloured payloads"
+        ));
+    }
+
+    // ---- Conservation law 2: THE ALLOCATION. ---------------------------------------------------
+    let rgb_sum: u64 = children.iter().map(|c| c.rgb_amount).sum();
+    if rgb_sum != rgb_half.amount {
+        return Err(anyhow::anyhow!(
+            "coloured split ALLOCATION conservation: children sum to {rgb_sum} but the carrier holds \
+             {} — refusing to mint or burn an allocation",
+            rgb_half.amount
+        ));
+    }
+    if rgb_sum == 0 {
+        return Err(anyhow::anyhow!(
+            "coloured split would assign nothing to any child — a coloured tier must assign a \
+             non-zero amount"
+        ));
+    }
+
+    // ---- Conservation law 3: CHILD VIABILITY. --------------------------------------------------
+    let child_floor = colored_child_floor(bundle.fee_rate, COLORED_LADDER_DUST);
+    for c in children {
+        if c.sats < child_floor {
+            return Err(anyhow::anyhow!(
+                "coloured split child {} would hold {} sat but a COLOURED child ladder needs at \
+                 least {child_floor} sat at {} sat/vB — refusing before any SE co-sign, because an \
+                 SP whose output cannot fund its own ladder strands the value under a terminalized \
+                 parent",
+                c.statechain_id,
+                c.sats,
+                bundle.fee_rate
+            ));
+        }
+    }
+
+    // ---- SP: the split state over X_m's payload output. ----------------------------------------
+    let sp_seal = colored_tier_seal(
+        &bundle.statechain_id,
+        TierRole::SplitState,
+        0,
+        bundle.m,
+        Some(sp_csv),
+    );
+    let payloads: Vec<(String, u64, u64)> = children
+        .iter()
+        .map(|c| (c.agg_address.clone(), c.sats, c.rgb_amount))
+        .collect();
+    let sp = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &x_m.txid,
+            prev_vout: x_m.payload_vout,
+            prev_value: parent_prev_value,
+            prev_spk_hex: &parent_prev_spk,
+            sequence: mercurylib::tesr::csv_blocks(sp_csv).0,
+            payloads: &payloads,
+            network: &bundle.network,
+            fee_rate: bundle.fee_rate,
+            nonce: Some(sp_seal.rung as u64),
+        },
+        &sp_seal,
+    )?;
+    if sp.payloads.len() != n {
+        return Err(anyhow::anyhow!(
+            "the coloured split state carries {} payload outputs, expected {n}",
+            sp.payloads.len()
+        ));
+    }
+
+    // ---- Per child: a headless COLOURED ladder off SP.out[j]. ----------------------------------
+    let csv_e = p.ext_csv(0);
+    let csv_d = p.state_csv(0);
+    let mut child_drafts = Vec::with_capacity(n);
+    for (j, c) in children.iter().enumerate() {
+        // The child's vout is READ from the builder's returned payload list, never assumed: a
+        // coloured tier carries the opret at index 0 and shifts every payload by one.
+        let out = &sp.payloads[j];
+        if out.value != c.sats {
+            return Err(anyhow::anyhow!(
+                "coloured split child {} was built at {} sat but asked for {}",
+                c.statechain_id,
+                out.value,
+                c.sats
+            ));
+        }
+
+        // Child extension: spends SP.out[j], stays under the CHILD's aggregate.
+        let x_value = colored_tier_out_value(out.value, bundle.fee_rate).ok_or_else(|| {
+            anyhow::anyhow!(
+                "coloured split child {} ({} sat) cannot carry an extension",
+                c.statechain_id,
+                out.value
+            )
+        })?;
+        let x_seal =
+            colored_tier_seal(&c.statechain_id, TierRole::ChildExtension, 0, 0, Some(csv_e));
+        let xc = build_colored_tier(
+            rgb,
+            &ColoredTierSpec {
+                contract_id: &rgb_half.contract_id,
+                prev_txid: &sp.txid,
+                prev_vout: out.vout,
+                prev_value: out.value,
+                prev_spk_hex: &out.script_pubkey_hex,
+                sequence: mercurylib::tesr::csv_blocks(csv_e).0,
+                payloads: &[(c.agg_address.clone(), x_value, c.rgb_amount)],
+                network: &bundle.network,
+                fee_rate: bundle.fee_rate,
+                nonce: Some(x_seal.rung as u64),
+            },
+            &x_seal,
+        )?;
+
+        // Child state: spends the child extension's payload output, pays the RECIPIENT.
+        let s_value = colored_tier_out_value(xc.payloads[0].value, bundle.fee_rate)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "coloured split child {}'s extension cannot carry a state",
+                    c.statechain_id
+                )
+            })?;
+        let s_seal = colored_tier_seal(&c.statechain_id, TierRole::ChildState, 0, 0, Some(csv_d));
+        let sc = build_colored_tier(
+            rgb,
+            &ColoredTierSpec {
+                contract_id: &rgb_half.contract_id,
+                prev_txid: &xc.txid,
+                prev_vout: xc.payloads[0].vout,
+                prev_value: xc.payloads[0].value,
+                prev_spk_hex: &xc.payloads[0].script_pubkey_hex,
+                sequence: mercurylib::tesr::csv_blocks(csv_d).0,
+                payloads: &[(c.owner_exit_address.clone(), s_value, c.rgb_amount)],
+                network: &bundle.network,
+                fee_rate: bundle.fee_rate,
+                nonce: Some(s_seal.rung as u64),
+            },
+            &s_seal,
+        )?;
+
+        let draft_of = |t: crate::rgb::ColoredTier| ColoredTierDraft {
+            tx_hex: t.tx_hex,
+            txid: t.txid,
+            payload_vout: t.payloads[0].vout,
+            payload_value: t.payloads[0].value,
+            payload_spk_hex: t.payloads[0].script_pubkey_hex.clone(),
+            consignment: t.consignment,
+        };
+        child_drafts.push(ColoredSplitChildDraft {
+            statechain_id: c.statechain_id.clone(),
+            owner_exit_address: c.owner_exit_address.clone(),
+            sp_vout: out.vout,
+            sp_out_value: out.value,
+            rgb_amount: c.rgb_amount,
+            csv_e,
+            csv_d,
+            extension: draft_of(xc),
+            state: draft_of(sc),
+        });
+    }
+
+    Ok(ColoredSplitDraft {
+        parent_statechain_id: bundle.statechain_id.clone(),
+        contract_id: rgb_half.contract_id.clone(),
+        network: bundle.network.clone(),
+        fee_rate: bundle.fee_rate,
+        sp_csv,
+        sp_txid: sp.txid,
+        sp_tx_hex: sp.tx_hex,
+        sp_consignment: sp.consignment,
+        sp_total: total,
+        parent_prev_txid: x_m.txid,
+        parent_prev_vout: x_m.payload_vout,
+        parent_prev_value: parent_prev_value,
+        children: child_drafts,
+    })
+}
+
+/// **Co-sign a [`ColoredSplitDraft`]** and return one [`ChildTesrBundle`] per child, ready to convey.
+/// Network-only and async — the co-sign half of [`build_colored_in_ladder_split`].
+///
+/// `1 + 2N` `cosign_tier` round-trips: `SP` under the PARENT's aggregate, then each child's two
+/// tiers under that CHILD's aggregate. Colouring adds no co-sign — one input, one sighash, one
+/// `cosign_tier` — so the census arithmetic is byte for byte the plain in-ladder split's.
+///
+/// The parent is terminalized (budget 1, consumed by `SP`) BEFORE `SP` is co-signed, exactly as
+/// [`in_ladder_split`] does, so no further parent state can be minted behind the children's backs.
+///
+/// Everything the draft asserts is RE-CHECKED against the live bundle here, because the draft is
+/// built where the RGB engine lives and consumed where the network lives.
+pub async fn cosign_colored_in_ladder_split(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    parent_coin: &mut Coin,
+    bundle: &TesrBundle,
+    draft: ColoredSplitDraft,
+    child_coins: &mut [Coin],
+) -> Result<Vec<ChildTesrBundle>> {
+    let rgb_half = bundle
+        .rgb
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cosign_colored_in_ladder_split on a PLAIN ladder"))?;
+    if draft.parent_statechain_id != bundle.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured split draft is for {} but the bundle is {}",
+            draft.parent_statechain_id,
+            bundle.statechain_id
+        ));
+    }
+    if draft.contract_id != rgb_half.contract_id {
+        return Err(anyhow::anyhow!(
+            "coloured split draft names contract {} but the ladder carries {}",
+            draft.contract_id,
+            rgb_half.contract_id
+        ));
+    }
+    if draft.children.len() != child_coins.len() {
+        return Err(anyhow::anyhow!(
+            "coloured split draft has {} children but {} child coins were supplied",
+            draft.children.len(),
+            child_coins.len()
+        ));
+    }
+    let x_m = bundle.current().extension.clone();
+    if draft.parent_prev_txid != x_m.txid || draft.parent_prev_vout != x_m.payload_vout {
+        return Err(anyhow::anyhow!(
+            "coloured split draft spends {}:{} but the ladder's current extension output is {}:{}",
+            draft.parent_prev_txid,
+            draft.parent_prev_vout,
+            x_m.txid,
+            x_m.payload_vout
+        ));
+    }
+    let s0_csv = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+    if draft.sp_csv >= s0_csv {
+        return Err(anyhow::anyhow!(
+            "coloured split state's CSV {} does not out-race the state it replaces ({s0_csv})",
+            draft.sp_csv
+        ));
+    }
+    // Re-check the ALLOCATION conservation law against the LIVE bundle, not the draft's own copy.
+    let rgb_sum: u64 = draft.children.iter().map(|c| c.rgb_amount).sum();
+    if rgb_sum != rgb_half.amount {
+        return Err(anyhow::anyhow!(
+            "coloured split draft assigns {rgb_sum} across its children but the carrier holds {} — \
+             refusing to mint or burn an allocation",
+            rgb_half.amount
+        ));
+    }
+
+    let parent_sid = parent_coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("parent coin has no statechain_id"))?;
+    if parent_sid != bundle.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured split parent coin is {parent_sid} but the bundle is {}",
+            bundle.statechain_id
+        ));
+    }
+    // [D1] CENSUS, FAIL-CLOSED. The child's receiver runs `verify_child_bundle` with
+    // `PARENT_V2_BASELINE` flat backups for the ancestor segment, because it cannot observe the
+    // parent's pre-establish history. That constant (1) is correct only for a parent THIS wallet
+    // deposited: every whole-coin hop co-signs one more flat backup
+    // (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries
+    // `1 + k` and the receiver's exact-equality census comes up `k` short — yielding a child that
+    // NO receiver can adopt, after the parent has already been terminalized and the piece booked
+    // away. Fail-closed, not theft, but unrecoverable through any supported path.
+    //
+    // The gap cannot be closed from this side by declaring the real count: a sender-supplied
+    // `flat_backups` is precisely the term an attacker inflates to mask a hidden co-signed tier,
+    // which is the one thing the census exists to catch. Closing it properly means conveying the
+    // parent's backup transactions and having the receiver verify each as co-signed under
+    // `A_parent` — a separate change. Until then, refuse rather than mint an unclaimable child.
+    let parent_backups =
+        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid).await?;
+    if parent_backups.len() as u32 != PARENT_V2_BASELINE {
+        return Err(anyhow::anyhow!(
+            "coloured in-ladder split refused: this carrier holds {} flat backup transaction(s) but \
+             a split child's receiver censuses the ancestor segment at PARENT_V2_BASELINE = {} — \
+             the child would be unclaimable. This carrier was RECEIVED rather than deposited by \
+             this wallet; splitting it needs the conveyed-parent-backup census, which is not \
+             implemented. Transfer the whole carrier instead.",
+            parent_backups.len(),
+            PARENT_V2_BASELINE
+        ));
+    }
+
+    // Terminalize the parent — SP consumes the last budget slot.
+    crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
+    let sp_signed = cosign_tier(
+        cc,
+        parent_coin,
+        draft.sp_tx_hex.clone(),
+        draft.parent_prev_value,
+        &draft.network,
+    )
+    .await?;
+
+    // The parent segment shared by every child bundle: SP is the current (terminal) state, and the
+    // parent's own retained S_0 is disclosed as superseded — it rivals SP over X_m's payload output
+    // and loses the maturity race by sitting one delta HIGHER.
+    let mut parent_seg = bundle.clone();
+    let last = parent_seg.levels.len() - 1;
+    parent_seg.superseded_states.push(parent_seg.levels[last].state.clone());
+    parent_seg.levels[last].state = TesrTier {
+        txid: draft.sp_txid.clone(),
+        signed_tx: sp_signed,
+        out_value: draft.sp_total,
+        csv: Some(draft.sp_csv),
+        payload_vout: draft.children[0].sp_vout,
+    };
+    // The parent segment's leaf consignment is SP's — `consignments` is indexed by `exit_tiers()`.
+    let mut parent_consignments = rgb_half.consignments.clone();
+    let pc = parent_consignments.len();
+    if pc == 0 {
+        return Err(anyhow::anyhow!("coloured ladder carries no consignments"));
+    }
+    parent_consignments[pc - 1] = draft.sp_consignment.clone();
+    parent_seg.rgb = Some(ColoredLadder { consignments: parent_consignments, ..rgb_half.clone() });
+
+    let mut bundles = Vec::with_capacity(draft.children.len());
+    for (cd, child_coin) in draft.children.iter().zip(child_coins.iter_mut()) {
+        let child_sid = child_coin
+            .statechain_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
+        if child_sid != cd.statechain_id {
+            return Err(anyhow::anyhow!(
+                "coloured split child coin is {child_sid} but the draft's child is {}",
+                cd.statechain_id
+            ));
+        }
+        let x_signed = cosign_tier(
+            cc,
+            child_coin,
+            cd.extension.tx_hex.clone(),
+            cd.sp_out_value,
+            &draft.network,
+        )
+        .await?;
+        let s_signed = cosign_tier(
+            cc,
+            child_coin,
+            cd.state.tx_hex.clone(),
+            cd.extension.payload_value,
+            &draft.network,
+        )
+        .await?;
+
+        bundles.push(ChildTesrBundle {
+            parent: parent_seg.clone(),
+            parent_statechain_id: parent_sid.clone(),
+            sp_vout: cd.sp_vout,
+            child_statechain_id: child_sid,
+            child_owner_exit_address: cd.owner_exit_address.clone(),
+            child_extension: TesrTier {
+                txid: cd.extension.txid.clone(),
+                signed_tx: x_signed,
+                out_value: cd.extension.payload_value,
+                csv: Some(cd.csv_e),
+                payload_vout: cd.extension.payload_vout,
+            },
+            child_state: TesrTier {
+                txid: cd.state.txid.clone(),
+                signed_tx: s_signed,
+                out_value: cd.state.payload_value,
+                csv: Some(cd.csv_d),
+                payload_vout: cd.state.payload_vout,
+            },
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+            ancestors: vec![],
+            rgb: Some(ColoredChild {
+                contract_id: draft.contract_id.clone(),
+                amount: cd.rgb_amount,
+                consignments: vec![
+                    cd.extension.consignment.clone(),
+                    cd.state.consignment.clone(),
+                ],
+            }),
+        });
+    }
+    Ok(bundles)
+}
+
 /// [in-ladder split] The production sender for an in-ladder split (B1 fix, PROTOCOL.md §5.4). Builds
 /// `SP` — a STATE tier spending `X_m.out[0]` (a DESCENDANT of the trigger, NOT a rival for `F`), paying
 /// each child statechain coin's aggregate — terminalizes the parent (budget 1, consumed by `SP`),
@@ -1323,6 +2017,35 @@ pub async fn in_ladder_split(
         .statechain_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("parent coin has no statechain_id"))?;
+
+    // [D1] CENSUS, FAIL-CLOSED — see the identical guard in `cosign_colored_in_ladder_split`.
+    //
+    // A split child's receiver censuses the ancestor segment at `PARENT_V2_BASELINE` (1), because it
+    // cannot observe the parent's pre-establish history. That is right only for a parent THIS wallet
+    // DEPOSITED. Every whole-coin hop co-signs one more flat backup
+    // (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries
+    // `1 + k` flat backups and the receiver's exact-equality census comes up `k` short:
+    // `verify_conveyed_child` rejects with "num_sigs mismatch … possible hidden state" and the child
+    // is unadoptable — AFTER the parent has been terminalized and the piece booked away. Fail-closed,
+    // not theft, but unrecoverable through any supported path.
+    //
+    // Refuse BEFORE `set_spend_budget`, which is the point of no return. Declaring the real count
+    // instead is not an option from this side: a sender-supplied `flat_backups` is exactly the term
+    // an attacker inflates to mask a hidden co-signed tier, which is what the census exists to catch.
+    let parent_backups =
+        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid).await?;
+    if parent_backups.len() as u32 != PARENT_V2_BASELINE {
+        return Err(anyhow::anyhow!(
+            "in-ladder split refused: this coin holds {} flat backup transaction(s) but a split \
+             child's receiver censuses the ancestor segment at PARENT_V2_BASELINE = {} — the child \
+             would be unclaimable by anyone. This coin was RECEIVED rather than deposited by this \
+             wallet; splitting it needs the conveyed-parent-backup census, which is not implemented. \
+             Transfer the whole coin instead.",
+            parent_backups.len(),
+            PARENT_V2_BASELINE
+        ));
+    }
+
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
     let sp_signed = cosign_tier(cc, parent_coin, sp.tx_hex.clone(), x_m.out_value, &bundle.network).await?;
 
@@ -1376,6 +2099,9 @@ pub async fn in_ladder_split(
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
             ancestors: vec![],
+            // PLAIN split: a coloured parent never reaches here (`refuse_uncolored_over_colored`
+            // is this function's first statement), so a child carved here carries no allocation.
+            rgb: None,
         });
     }
     Ok(bundles)
@@ -1644,6 +2370,7 @@ pub async fn child_in_ladder_split(
     cb: &ChildTesrBundle,
     children: &mut [(Coin, String, u64)],
 ) -> Result<Vec<ChildTesrBundle>> {
+    refuse_uncolored_over_colored_child(cb, "child_in_ladder_split")?;
     let p = cb.parent.params;
     let n = children.len();
     if n == 0 {
@@ -1752,6 +2479,9 @@ pub async fn child_in_ladder_split(
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
             ancestors,
+            // Child-level PLAIN split. `child_in_ladder_split` refuses a COLOURED child outright
+            // (see its `refuse_uncolored_over_colored_child` guard), so this is never an allocation.
+            rgb: None,
         });
     }
     Ok(bundles)
@@ -1781,6 +2511,7 @@ pub async fn child_retransfer(
     cb: &ChildTesrBundle,
     recipient_address: &str,
 ) -> Result<ChildTesrBundle> {
+    refuse_uncolored_over_colored_child(cb, "child_retransfer")?;
     let p = cb.parent.params;
     // Replace-by-lower-timelock: the new state must mature strictly before the one it supersedes, and
     // must not sink below the schedule floor (at the floor the coin must be re-anchored, not re-sent).
@@ -3526,6 +4257,134 @@ pub fn verify_child_bundle(
         ));
     }
 
+    // [7] COLOUR, structurally. Colour-blind, no RGB engine — the child-side sibling of
+    //     `verify_colored_shape`, which `verify_bundle_ex` already ran over the parent segment.
+    verify_colored_child_shape(cb)?;
+
+    Ok(())
+}
+
+/// **[CTES-R] The structural half of colour for a split CHILD.** No RGB engine, no network.
+///
+/// The load-bearing check is the BICONDITIONAL: a coloured parent segment and a plain child is the
+/// allocation-destroying shape. `SP.out[j]` is a SEALED output; a child whose two tiers are
+/// uncoloured spends it with an RGB-unaware transaction, and every other check in
+/// `verify_child_bundle` passes — the transactions are perfectly valid Bitcoin, the census balances,
+/// the aggregates are right. Only this rejects it.
+///
+/// The converse (plain parent, coloured child) is equally refused: the child would claim an
+/// allocation its ancestor segment carries no transition for, so nothing could ever validate it.
+fn verify_colored_child_shape(cb: &ChildTesrBundle) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+
+    let parent_colored = cb.parent.is_colored();
+    if parent_colored != cb.is_colored() {
+        return Err(anyhow::anyhow!(
+            "colour mismatch: the parent segment is {} but the child is {} — a plain child over a \
+             COLOURED SP output spends a sealed UTXO with no transition and destroys the \
+             allocation; a coloured child under a plain parent has no transition chain to validate \
+             against",
+            if parent_colored { "COLOURED" } else { "PLAIN" },
+            if cb.is_colored() { "COLOURED" } else { "PLAIN" }
+        ));
+    }
+
+    // Both child tiers, checked for the opret shape either way round.
+    let tiers = [("child_extension", &cb.child_extension), ("child_state", &cb.child_state)];
+    for (name, tier) in tiers {
+        let raw = hex::decode(&tier.signed_tx)
+            .map_err(|_| anyhow::anyhow!("{name}: hex does not decode"))?;
+        let tx: Transaction =
+            deserialize(&raw).map_err(|_| anyhow::anyhow!("{name}: tx does not parse"))?;
+        let oprets: Vec<usize> = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.script_pubkey.is_op_return())
+            .map(|(v, _)| v)
+            .collect();
+        match (cb.is_colored(), oprets.len()) {
+            (true, 1) => {
+                if oprets[0] as u32 == tier.payload_vout {
+                    return Err(anyhow::anyhow!(
+                        "coloured {name} declares its payload at vout {} — that output is the RGB \
+                         opret commitment, which carries no value and cannot be spent",
+                        tier.payload_vout
+                    ));
+                }
+            }
+            (true, n) => {
+                return Err(anyhow::anyhow!(
+                    "coloured {name} carries {n} OP_RETURN outputs, expected exactly 1"
+                ))
+            }
+            (false, 0) => {}
+            (false, n) => {
+                return Err(anyhow::anyhow!(
+                    "{name} carries {n} OP_RETURN output(s) but this child is conveyed as PLAIN — \
+                     a coloured child passed off as plain would have its asset half validated by \
+                     nobody"
+                ))
+            }
+        }
+    }
+
+    let Some(rgb) = cb.rgb.as_ref() else {
+        return Ok(());
+    };
+    // A coloured child must be depth-1: coloured child-level split does not exist, so a coloured
+    // bundle with intermediate segments did not come from this code and has no seal schedule.
+    let _ = cb.colored_child_seals()?;
+    let parent_rgb = cb
+        .parent
+        .rgb
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("coloured child with no parent allocation"))?;
+    if rgb.contract_id != parent_rgb.contract_id {
+        return Err(anyhow::anyhow!(
+            "coloured child claims contract {} but its ancestor segment carries {}",
+            rgb.contract_id,
+            parent_rgb.contract_id
+        ));
+    }
+    if rgb.amount == 0 {
+        return Err(anyhow::anyhow!("coloured child carries a zero allocation"));
+    }
+    // A child is one share of the parent's whole, so it can never exceed it. (The exact split is
+    // proved by the CONSIGNMENT at accept time — this is the cheap structural bound.)
+    if rgb.amount > parent_rgb.amount {
+        return Err(anyhow::anyhow!(
+            "coloured child claims {} but its ancestor segment only carries {}",
+            rgb.amount,
+            parent_rgb.amount
+        ));
+    }
+    if rgb.consignments.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "coloured child carries {} consignments for its 2 own tiers — they are indexed by exit \
+             order, so a mismatch means the receiver cannot tell which proof belongs to which tier",
+            rgb.consignments.len()
+        ));
+    }
+    if rgb.consignments.iter().any(|c| c.trim().is_empty()) {
+        return Err(anyhow::anyhow!("coloured child carries an empty consignment"));
+    }
+    // The child's `sp_vout` must be a real, spendable, NON-opret output of SP.
+    let sp_raw = hex::decode(&cb.parent.current().state.signed_tx)
+        .map_err(|_| anyhow::anyhow!("bad SP hex"))?;
+    let sp: Transaction =
+        deserialize(&sp_raw).map_err(|_| anyhow::anyhow!("SP is not a transaction"))?;
+    let out = sp
+        .output
+        .get(cb.sp_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("child's sp_vout {} is past SP's outputs", cb.sp_vout))?;
+    if out.script_pubkey.is_op_return() {
+        return Err(anyhow::anyhow!(
+            "child's sp_vout {} is SP's RGB opret commitment, which carries no value and cannot be \
+             spent",
+            cb.sp_vout
+        ));
+    }
     Ok(())
 }
 
@@ -3606,6 +4465,175 @@ mod verify_tests {
             }],
             m: 0, superseded_states: vec![], superseded_extensions: vec![], params: p, rgb: None,
         }
+    }
+
+    /// A minimal split child over `sample_bundle`, with colour dialled independently on each half so
+    /// the BICONDITIONAL can be exercised in both broken directions. The tiers are the sample
+    /// bundle's plain ones — that is deliberate: the colour-mismatch check must fire on the
+    /// declaration alone, before anything is parsed.
+    fn sample_child(colored_parent: bool, colored_child: bool) -> ChildTesrBundle {
+        let mut parent = sample_bundle();
+        if colored_parent {
+            parent.rgb = Some(ColoredLadder {
+                contract_id: "rgb:contract".into(),
+                amount: 1_000,
+                consignments: vec!["a".into(), "b".into(), "c".into()],
+            });
+        }
+        let lvl = parent.levels[0].clone();
+        ChildTesrBundle {
+            parent,
+            parent_statechain_id: "sid".into(),
+            sp_vout: 0,
+            child_statechain_id: "child-sid".into(),
+            child_owner_exit_address: OWNER.into(),
+            child_extension: lvl.extension,
+            child_state: lvl.state,
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+            ancestors: vec![],
+            rgb: colored_child.then(|| ColoredChild {
+                contract_id: "rgb:contract".into(),
+                amount: 400,
+                consignments: vec!["x".into(), "y".into()],
+            }),
+        }
+    }
+
+    /// **The allocation-destroying shape, refused.** A COLOURED parent segment whose child is plain
+    /// means the child's two tiers spend `SP.out[j]` — a SEALED output — with RGB-unaware
+    /// transactions. Every other check in `verify_child_bundle` passes on that bundle: the
+    /// transactions are valid Bitcoin, the census balances, the aggregates are right. This is the
+    /// only thing standing between it and a burnt allocation.
+    #[test]
+    fn a_plain_child_over_a_coloured_parent_is_refused() {
+        let e = verify_colored_child_shape(&sample_child(true, false))
+            .expect_err("a plain child over a COLOURED SP output destroys the allocation");
+        assert!(
+            e.to_string().contains("colour mismatch"),
+            "must reject on the colour biconditional, got: {e}"
+        );
+        // And the converse: a coloured child under a plain ancestor segment has no transition chain
+        // anything could validate against.
+        let e = verify_colored_child_shape(&sample_child(false, true))
+            .expect_err("a coloured child under a PLAIN parent has no chain to validate");
+        assert!(e.to_string().contains("colour mismatch"), "got: {e}");
+        // Both halves agreeing is accepted (plain/plain is the pre-CTES-R world, unchanged).
+        verify_colored_child_shape(&sample_child(false, false))
+            .expect("a plain child under a plain parent must keep verifying");
+    }
+
+    /// The child-side interlock: once a child can carry an allocation, the child-level split and the
+    /// onward re-transfer would each build an UNCOLOURED tier over a sealed output. They were
+    /// vacuously safe only while no child was ever coloured.
+    #[test]
+    fn colored_children_refuse_every_uncolored_child_replacement() {
+        let plain = sample_child(false, false);
+        for what in ["child_in_ladder_split", "child_retransfer"] {
+            assert!(
+                refuse_uncolored_over_colored_child(&plain, what).is_ok(),
+                "a plain child must keep taking {what}"
+            );
+        }
+        let colored = sample_child(true, true);
+        for what in ["child_in_ladder_split", "child_retransfer"] {
+            let e = refuse_uncolored_over_colored_child(&colored, what)
+                .expect_err("{what} over a coloured child destroys the allocation");
+            assert!(e.to_string().contains("destroying it"), "got: {e}");
+        }
+    }
+
+    /// **`SP` must not inherit `S_0`'s blinding.** They are RIVAL transitions over the same `X_m`
+    /// payload output. Sharing a blinding collapses them to one `OpId`, after which rgb-lib keeps
+    /// whichever witness has the smaller INTERNAL txid — an arbitrary hash lottery, and the loser's
+    /// consignment validates for nobody (CTESR-GATE §2.2).
+    ///
+    /// This also pins why `TesrBundle::colored_tier_seals` cannot be reused for a split parent: it
+    /// hard-codes `TierRole::State` for the current state, which for a split parent IS `SP`.
+    #[test]
+    fn the_split_state_seal_is_distinct_from_every_rival_over_x_m() {
+        use crate::rgb::TierRole;
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let s0_csv = p.state_csv(0);
+        let sp_csv = s0_csv - p.delta;
+
+        let s0 = colored_tier_seal("sid", TierRole::State, 0, 0, Some(s0_csv)).blinding();
+        let sp = colored_tier_seal("sid", TierRole::SplitState, 0, 0, Some(sp_csv)).blinding();
+        // A renewal-era state is a THIRD rival over the same outpoint — >=3, per the rival rule.
+        let s_renew = colored_tier_seal("sid", TierRole::State, 0, 1, Some(s0_csv)).blinding();
+        let all = [s0, sp, s_renew];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "rivals {i} and {j} over X_m share a blinding — they collapse");
+                }
+            }
+        }
+        // The role alone separates them even at an IDENTICAL rung, which is the case a
+        // CSV-derivation bug would produce.
+        assert_ne!(
+            colored_tier_seal("sid", TierRole::State, 0, 0, Some(sp_csv)).blinding(),
+            colored_tier_seal("sid", TierRole::SplitState, 0, 0, Some(sp_csv)).blinding(),
+            "role must separate SP from S_0 independently of the rung"
+        );
+    }
+
+    /// A child's own tiers must not collide with its PARENT's, nor with a sibling's. The child rungs
+    /// are derived under the CHILD's statechain id and under roles no parent tier uses, so the two
+    /// separators are independent.
+    #[test]
+    fn child_tier_seals_collide_with_nothing() {
+        use crate::rgb::TierRole;
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let (ce, cd) = (p.ext_csv(0), p.state_csv(0));
+        let mut seen = std::collections::HashSet::new();
+        for sid in ["sid", "child-a", "child-b"] {
+            for (role, csv) in [
+                (TierRole::Trigger, None),
+                (TierRole::Extension, Some(ce)),
+                (TierRole::State, Some(cd)),
+                (TierRole::SplitState, Some(cd - p.delta)),
+                (TierRole::ChildExtension, Some(ce)),
+                (TierRole::ChildState, Some(cd)),
+            ] {
+                let b = colored_tier_seal(sid, role, 0, 0, csv).blinding();
+                assert!(seen.insert(b), "blinding collision at {sid}/{role:?}");
+            }
+        }
+        // The stable wire tags of the two new roles, pinned. A renumber silently re-blinds every
+        // coloured child in flight.
+        assert_eq!(TierRole::ChildExtension.tag(), 0x0A);
+        assert_eq!(TierRole::ChildState.tag(), 0x0B);
+    }
+
+    /// The coloured CHILD floor, as arithmetic. A child ladder is headless — two rungs, not three —
+    /// so it is cheaper than a root coloured ladder but dearer than the plain child floor by exactly
+    /// the two oprets it must pay for.
+    #[test]
+    fn colored_child_floor_price() {
+        let rate = 2.0;
+        assert_eq!(
+            colored_child_floor(rate, COLORED_LADDER_DUST),
+            2 * 574 + 330,
+            "two coloured rungs plus a spendable final output"
+        );
+        assert!(
+            colored_child_floor(rate, COLORED_LADDER_DUST)
+                < colored_ladder_floor(rate, COLORED_LADDER_DUST),
+            "a headless child must be cheaper than a full root ladder"
+        );
+        let plain = mercurylib::tesr::min_child_value(rate, COLORED_LADDER_DUST);
+        assert_eq!(
+            colored_child_floor(rate, COLORED_LADDER_DUST) - plain,
+            2 * 86,
+            "the coloured child surcharge is two oprets"
+        );
+        // THE MIXED-WALLET TRAP, pinned as arithmetic. The legacy 1,500-sat token piece clears the
+        // coloured CHILD floor, so a coloured split can carve one — but NOT the coloured ROOT floor,
+        // so the moment its receiver claims it as a root coin the colouring is refused. Retiring the
+        // flat lane while `TOKEN_PIECE_SATS` is 1,500 therefore strands received pieces.
+        assert!(1_500 > colored_child_floor(rate, COLORED_LADDER_DUST));
+        assert!(1_500 < colored_ladder_floor(rate, COLORED_LADDER_DUST));
     }
 
     /// PRE-EXISTING, corrected (not weakened): this used to assert `verify_bundle(&b, 3, 0).is_ok()`

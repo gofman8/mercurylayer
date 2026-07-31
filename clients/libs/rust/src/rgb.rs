@@ -752,6 +752,13 @@ pub enum TierRole {
     Split,
     /// Un-laddered colored combine (N carriers -> M pieces).
     Combine,
+    /// CHILD EXTENSION — a split child's own extension, spending `SP.out[j]` under the CHILD's
+    /// aggregate. Distinct from [`TierRole::Extension`] because a child's ladder is headless (no
+    /// trigger) and lives under a different aggregate, so its seals must never collide with the
+    /// parent's even when `tier_index` and `rung` coincide.
+    ChildExtension,
+    /// CHILD STATE — a split child's owner state, spending its child extension's payload output.
+    ChildState,
 }
 
 impl TierRole {
@@ -768,6 +775,8 @@ impl TierRole {
             TierRole::Backup => 0x07,
             TierRole::Split => 0x08,
             TierRole::Combine => 0x09,
+            TierRole::ChildExtension => 0x0A,
+            TierRole::ChildState => 0x0B,
         }
     }
 }

@@ -31,6 +31,35 @@ pub enum InLadderLatch<'a> {
     /// invoice and `settle_receive` retrieves the preimage from the SE to release + claim.
     ClassicMinted,
 }
+
+/// Which split route a `transfer_many` parent takes. Chosen by the parent's SHAPE, exactly as
+/// `transfer` chooses between `in_ladder_pay` / `child_in_ladder_pay` / `split_coin`: a parent that
+/// carries a TES-R ladder must never take the plain split ([B1] — a retained, un-timelocked trigger
+/// over the parent's funding `F` would void it and destroy every recipient's piece).
+enum ManyRoute {
+    /// Laddered ROOT coin: one split state `SP` over `X_m.out[0]`.
+    InLadderRoot,
+    /// Received in-ladder CHILD: one split state `CSP` at the child's own level.
+    InLadderChild,
+    /// Un-laddered coin (a plain split sub-coin): the N+1-output plain split.
+    PlainSplit,
+}
+
+/// One `TransferResult` per recipient for an in-ladder `transfer_many`: each piece was conveyed
+/// directly to its recipient's mailbox inside the split (never through the key-handover loop), so
+/// the piece's statechain id IS the coin the recipient adopts at claim.
+fn inladder_many_results(recipients: &[(String, u64)], piece_sids: &[String]) -> Vec<TransferResult> {
+    recipients
+        .iter()
+        .zip(piece_sids)
+        .map(|((recipient, amount), sid)| TransferResult {
+            receiver_address: recipient.clone(),
+            total_sats: *amount,
+            coins: vec![TransferredCoin { statechain_id: sid.clone(), amount_sats: *amount }],
+            used_split: true,
+        })
+        .collect()
+}
 use crate::types::{SdkError, TransferResult, TransferredCoin};
 use crate::wallet::{coin_outpoint, UtexoWallet};
 
@@ -96,7 +125,7 @@ impl UtexoWallet {
         // their own backup (not merely clear dust) — the split executor enforces the same floor.
         let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
         let plan = select::plan_with_floor(&candidates, amount_sats, min_output);
-        // An in-ladder split payment (V2 laddered coin) is conveyed directly to the recipient inside
+        // An in-ladder split payment (laddered coin) is conveyed directly to the recipient inside
         // the split, not handed over in the loop below; track its piece for the returned result.
         let mut inladder_piece: Option<(String, u64)> = None;
         let (mut to_send, used_split): (Vec<String>, bool) = match plan {
@@ -129,7 +158,7 @@ impl UtexoWallet {
                     .ok_or_else(|| anyhow!("coin without statechain id"))?;
                 drop(spendable);
                 drop(record);
-                // A V2 (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock trigger
+                // A laddered (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock trigger
                 // could void the split [B1]. Do an IN-LADDER split payment instead: `SP` descends from
                 // the trigger, the piece child pays the recipient (Model A), and the piece bundle is
                 // conveyed directly to their mailbox WITH the standard key handover (the receiver
@@ -183,8 +212,8 @@ impl UtexoWallet {
                 .filter_map(|c| c.amount)
                 .next_back()
                 .unwrap_or_default() as u64;
-            // A received in-ladder CHILD takes its own onward route. It has no `tesr-` ladder and no V1
-            // backup chain, so `transfer_sender::execute` would mis-handle it; `child_retransfer`
+            // A received in-ladder CHILD takes its own onward route. It has no `tesr-` ladder and no
+            // flat signed-once backup chain, so `transfer_sender::execute` would mis-handle it; `child_retransfer`
             // co-signs a fresh lower-CSV state over `ext_child.out[0]` paying the new recipient and
             // discloses the replaced state for the receiver's census.
             if let Some(cb) = mercuryrustlib::tesr::load_child(
@@ -328,6 +357,16 @@ impl UtexoWallet {
     /// Send sats to MANY recipients in one off-chain split (Spark's multi-receiver transfer): one
     /// SE-co-signed tx carves one piece per recipient (its exact amount) plus this wallet's
     /// change; each piece is handed over. Returns one `TransferResult` per recipient.
+    ///
+    /// Like `transfer`, this DISPATCHES ON THE PARENT'S SHAPE — a plain split of a laddered parent
+    /// is unsafe ([B1], see `split_coin`), so a laddered parent takes the multi-child IN-LADDER
+    /// route instead (`SP` descends from the trigger rather than racing it for `F`):
+    ///   * a laddered ROOT coin  → [`Self::in_ladder_pay_many`] (one `SP` over `X_m.out[0]`);
+    ///   * a received CHILD      → [`Self::child_in_ladder_pay_many`] (one `CSP` at the child's level);
+    ///   * an un-laddered coin   → the plain N+1-output split (the un-laddered route; no trigger exists
+    ///     over its funding outpoint, so nothing can race the split).
+    /// Because `claim()` ladders every fresh confirmed root coin unconditionally, the in-ladder route
+    /// is the DEFAULT — the plain split now serves only un-laddered sub-coins.
     pub async fn transfer_many(
         &self,
         recipients: &[(String, u64)],
@@ -347,29 +386,133 @@ impl UtexoWallet {
 
         // Every piece and the change must clear the backup-fee floor (dust + each sub-coin's own
         // backup fee) so no output is a stranded coin. Reject up-front — before any parent is made
-        // terminal — so a doomed batch never pins a carrier's spend budget.
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        // terminal — so a doomed batch never pins a carrier's spend budget. This is the floor that
+        // holds on EVERY route; the in-ladder routes raise it per-parent below (`min_child_value`).
+        let backup_rate = backup_fee_rate(&self.inner.cc).await?;
+        let min_output = min_split_output(backup_rate);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the minimum viable piece {min_output} (dust floor + backup fee) — it could not fund its own backup"
             ));
         }
 
-        // Parent: a confirmed, non-token-carrier coin large enough for all pieces + fee reserve AND
-        // a change output that itself clears the backup-fee floor.
-        let carrier = record
+        // Parent selection is SHAPE-AWARE: a coin's real capacity depends on its route (an in-ladder
+        // split spends `X_m.out[0]`, which is the coin's value net of its already-committed tier fees,
+        // and each child then funds its own two tiers), so a candidate cannot be judged on
+        // `coin.amount` alone. Ladder state lives in the wallet db, so this must be async: collect +
+        // sort first (smallest workable parent wins, as before), then probe each candidate's shape.
+        let mut candidates: Vec<(u64, String)> = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
             .filter(|c| !is_token_carrier(c, &carriers))
-            .filter(|c| {
-                let a = c.amount.unwrap_or_default() as u64;
-                a > total + split_fee_reserve(a) + min_output
+            .filter_map(|c| {
+                c.statechain_id
+                    .clone()
+                    .map(|id| (c.amount.unwrap_or_default() as u64, id))
             })
-            .min_by_key(|c| c.amount.unwrap_or_default())
+            .collect();
+        candidates.sort_by_key(|(amount, _)| *amount);
+        drop(record);
+
+        // N recipient pieces + one change output share the split.
+        let n_out = recipients.len() + 1;
+        let mut chosen: Option<(String, ManyRoute)> = None;
+        let mut rejected: Vec<String> = Vec::new();
+        for (parent_sats, id) in candidates {
+            // An in-ladder child gets its OWN extension + state tier from `establish_child`, each
+            // burning `committed_fee + P2A_VALUE`, and its final state output must still clear dust —
+            // so the in-ladder floor is strictly above the backup-fee floor and BOTH bind.
+            let fits_inladder = |floor: u64, capacity: Option<u64>| {
+                let capacity = capacity.unwrap_or(0);
+                recipients.iter().all(|(_, a)| *a >= floor) && capacity >= total + floor
+            };
+            if let Some(cb) = mercuryrustlib::tesr::load_child(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?
+            {
+                let rate = cb.parent.fee_rate;
+                let floor = min_output.max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT));
+                let cap = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, n_out, rate);
+                if fits_inladder(floor, cap) {
+                    chosen = Some((id, ManyRoute::InLadderChild));
+                    break;
+                }
+                rejected.push(format!(
+                    "child {id} ({parent_sats} sat): in-ladder capacity {}, per-output floor {floor}",
+                    cap.unwrap_or(0)
+                ));
+            } else if let Some(bundle) = mercuryrustlib::tesr::load(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?
+            {
+                let rate = bundle.fee_rate;
+                let floor = min_output.max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT));
+                let cap = mercurylib::tesr::tier_out_total(
+                    bundle.current().extension.out_value,
+                    n_out,
+                    rate,
+                );
+                if fits_inladder(floor, cap) {
+                    chosen = Some((id, ManyRoute::InLadderRoot));
+                    break;
+                }
+                rejected.push(format!(
+                    "laddered {id} ({parent_sats} sat): in-ladder capacity {}, per-output floor {floor}",
+                    cap.unwrap_or(0)
+                ));
+            } else if parent_sats > total + split_fee_reserve(parent_sats) + min_output {
+                chosen = Some((id, ManyRoute::PlainSplit));
+                break;
+            } else {
+                rejected.push(format!("un-laddered {id} ({parent_sats} sat): too small"));
+            }
+        }
+        let (carrier_id, route) = chosen.ok_or_else(|| {
+            anyhow!(
+                "no confirmed coin can fund {total} sats to {} recipients + fee + non-dust change ({})",
+                recipients.len(),
+                if rejected.is_empty() {
+                    "no candidate coins".to_string()
+                } else {
+                    rejected.join("; ")
+                }
+            )
+        })?;
+
+        // A laddered parent MUST NOT take the plain split [B1]; route it in-ladder instead.
+        match route {
+            ManyRoute::InLadderRoot => {
+                let (piece_sids, _change) =
+                    self.in_ladder_pay_many(&carrier_id, recipients).await?;
+                return Ok(inladder_many_results(recipients, &piece_sids));
+            }
+            ManyRoute::InLadderChild => {
+                let (piece_sids, _change) =
+                    self.child_in_ladder_pay_many(&carrier_id, recipients).await?;
+                return Ok(inladder_many_results(recipients, &piece_sids));
+            }
+            ManyRoute::PlainSplit => {}
+        }
+
+        let record = self.record().await?;
+        let carrier = record
+            .coins
+            .iter()
+            .find(|c| {
+                c.statechain_id.as_deref() == Some(carrier_id.as_str())
+                    && c.status == CoinStatus::CONFIRMED
+                    && c.duplicate_index == 0
+            })
             .cloned()
-            .ok_or_else(|| anyhow!("no confirmed coin large enough for {total} sats + fee + non-dust change"))?;
-        let carrier_id = carrier.statechain_id.clone().unwrap();
+            .ok_or_else(|| anyhow!("selected parent {carrier_id} not found"))?;
+        drop(record);
         let parent_sats = carrier.amount.unwrap_or_default() as u64;
         let fee_reserve = split_fee_reserve(parent_sats);
         let change_sats = parent_sats - total - fee_reserve;
@@ -544,11 +687,11 @@ impl UtexoWallet {
         // consume `F`, and permanently kill this split, voiding the sub-coin its receiver paid for,
         // while their ladder pays them the full parent value. The race is rigged: `T` is v3/TRUC with a
         // P2A anchor (fee-bumpable by anyone, forever) vs a v2 split tx with a frozen fee and no RBF
-        // headroom. The receiver cannot detect the exposure: the ladder is not conveyed on the V1 lane
-        // and the SE has never seen it, so their `terminal_parents` check returns true and means
-        // nothing. NOTE the spend-budget does NOT protect here — it bounds FUTURE co-signs, and `T` was
-        // co-signed long before `set_spend_budget` (this is why `transfer.rs`'s "the branch cannot be
-        // double-spent even by a malicious sender" claim does not hold for V2 parents).
+        // headroom. The receiver cannot detect the exposure: the ladder is not conveyed on the
+        // un-laddered backup-chain route and the SE has never seen it, so their `terminal_parents` check
+        // returns true and means nothing. NOTE the spend-budget does NOT protect here — it bounds FUTURE
+        // co-signs, and `T` was co-signed long before `set_spend_budget` (this is why `transfer.rs`'s "the
+        // branch cannot be double-spent even by a malicious sender" claim does not hold for laddered parents).
         // The real fix is the IN-LADDER split (PROTOCOL.md §5.4): a split as a STATE tier spending
         // `X_m.out[0]` is a DESCENDANT of `T`, not a rival for `F`, so a retained trigger has nothing to
         // race. Until that ships, refuse — a hard error beats silently voiding the receiver's coin.
@@ -613,9 +756,9 @@ impl UtexoWallet {
         // parent can be signed.
         //
         // [HF-5 / B1] SCOPE — this does NOT mean "the branch cannot be double-spent even by a malicious
-        // sender" (the claim that stood here). That holds only under the V1 premise that EVERY spend of
-        // the parent's funding `F` needs a FRESH SE co-signature. A budget bounds FUTURE co-signs; it
-        // cannot RETRACT one already issued. A V2 parent's trigger `T` was co-signed back at `establish`
+        // sender" (the claim that stood here). That holds only under the pre-TES-R premise that EVERY spend
+        // of the parent's funding `F` needs a FRESH SE co-signature. A budget bounds FUTURE co-signs; it
+        // cannot RETRACT one already issued. A laddered parent's trigger `T` was co-signed back at `establish`
         // — long before this call — carries no timelock, and spends `F` directly, so a retained `T`
         // double-spends the branch regardless of any budget set here. That is B1. Splitting a laddered
         // coin is therefore refused up-front in `split_coin`; the real fix is the in-ladder split
@@ -655,7 +798,7 @@ impl UtexoWallet {
         Ok((piece_id, change_id))
     }
 
-    /// **In-ladder split payment of a V2 (TES-R) coin** (the B1-safe replacement for the refused
+    /// **In-ladder split payment of a laddered (TES-R) coin** (the B1-safe replacement for the refused
     /// `split_coin` path). The split IS the payment: `SP` is a STATE tier spending `X_m.out[0]` (a
     /// DESCENDANT of the trigger, never a rival for `F`), with two children — the PIECE, whose headless
     /// ladder pays the recipient (Model A), and the CHANGE, paying this wallet back. The piece child
@@ -775,6 +918,148 @@ impl UtexoWallet {
         Ok((piece_sid, change_sid))
     }
 
+    /// MULTI-RECIPIENT payment out of a RECEIVED CHILD — the `transfer_many` route for a child parent.
+    /// One split state `CSP` over `ext_child.out[0]` carves N recipient grandchildren (exact amounts)
+    /// plus this wallet's change; each recipient's bundle is conveyed to its mailbox with the standard
+    /// key handover. Returns `(piece_sids in recipient order, change_sid)`.
+    ///
+    /// This is the N-way generalisation of [`Self::child_in_ladder_pay`] and exists for the same
+    /// reason: a plain split of a laddered parent is [B1]-unsafe, so `transfer_many` must never take
+    /// it. `child_in_ladder_split` already accepts N children and enforces value conservation
+    /// (`Σ children == tier_out_total(ext_child.out[0], N+1)`), so the change is DERIVED, not free.
+    pub async fn child_in_ladder_pay_many(
+        &self,
+        child_statechain_id: &str,
+        recipients: &[(String, u64)],
+    ) -> Result<(Vec<String>, String)> {
+        let network = self.inner.config.network.to_string();
+        let n = recipients.len();
+        if n == 0 {
+            return Err(anyhow!("no recipients"));
+        }
+        let cb = mercuryrustlib::tesr::load_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            child_statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("coin {child_statechain_id} is not a received split child"))?;
+
+        // Σpieces + change == the child's split total (ext_child.out[0] − committed fee for N+1).
+        let total = mercurylib::tesr::tier_out_total(
+            cb.child_extension.out_value,
+            n + 1,
+            cb.parent.fee_rate,
+        )
+        .ok_or_else(|| anyhow!("committed fee too high to split this child into {} outputs", n + 1))?;
+        let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
+        if pieces_total >= total {
+            return Err(anyhow!(
+                "payments totalling {pieces_total} sat leave no change: splitting this child {n} ways can pay at most {} sat",
+                total.saturating_sub(1)
+            ));
+        }
+        let change_sats = total - pieces_total;
+        // Same two floors as the single-recipient child split, on EVERY output (see the guard in
+        // `child_in_ladder_pay`): refuse up-front, before the child is terminalized.
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
+            .max(mercurylib::tesr::min_child_value(cb.parent.fee_rate, DUST_LIMIT));
+        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
+            return Err(anyhow!(
+                "recipient amount {amt} is below the in-ladder minimum {min_output} sat (each grandchild funds its own extension + state tier, then must clear the {DUST_LIMIT}-sat dust floor)"
+            ));
+        }
+        if change_sats < min_output {
+            return Err(anyhow!(
+                "change {change_sats} is below the in-ladder minimum {min_output} sat — lower the payment total or use a larger coin"
+            ));
+        }
+
+        let mut slot_tokens = self.take_derived_tokens(child_statechain_id, n + 1).await?;
+        let mut grandchildren: Vec<(Coin, String, u64)> = Vec::with_capacity(n + 1);
+        for (address, amount) in recipients {
+            let slot = self.create_child_slot(&slot_tokens.remove(0), *amount).await?;
+            grandchildren.push((slot, mercurylib::tesr::payee_address(address, &network)?, *amount));
+        }
+        let change_gc = self.create_child_slot(&slot_tokens.remove(0), change_sats).await?;
+        let self_change_backup =
+            mercurylib::transaction::get_user_backup_address(&change_gc, network.clone())?;
+        grandchildren.push((change_gc.clone(), self_change_backup, change_sats));
+
+        let mut child_coin = self
+            .record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(child_statechain_id) && c.duplicate_index == 0)
+            .cloned()
+            .ok_or_else(|| anyhow!("child coin {child_statechain_id} not found"))?;
+
+        let bundles = mercuryrustlib::tesr::child_in_ladder_split(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mut child_coin,
+            &cb,
+            &mut grandchildren,
+        )
+        .await?;
+
+        // Persist the change claim FIRST, then convey. Ordering matters more here than in the
+        // single-recipient case: `CSP` and every tier are already co-signed and the child is terminal,
+        // so those signatures can never be regenerated — and a conveyance that fails on recipient k
+        // would abort the call with the change bundle unwritten, destroying the only record of our own
+        // remaining value. Persisting first makes the change recoverable from any mid-batch failure.
+        mercuryrustlib::tesr::persist_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &bundles[n],
+        )
+        .await?;
+        // Convey each recipient's grandchild (standard handover).
+        for (j, (address, _)) in recipients.iter().enumerate() {
+            mercuryrustlib::tesr::convey_child_bundle(
+                &self.inner.cc,
+                address,
+                &grandchildren[j].0,
+                &bundles[j],
+                None,
+            )
+            .await?;
+        }
+
+        let piece_sids: Vec<String> = grandchildren[..n]
+            .iter()
+            .map(|(c, _, _)| c.statechain_id.clone().unwrap_or_default())
+            .collect();
+        let change_sid = change_gc.statechain_id.clone().unwrap_or_default();
+        // Book: the spent child is gone, every piece left, the change is a fresh confirmed claim.
+        {
+            let mut record = self.record().await?;
+            for coin in record.coins.iter_mut() {
+                match coin.statechain_id.as_deref() {
+                    Some(sid) if sid == child_statechain_id => coin.status = CoinStatus::WITHDRAWN,
+                    Some(sid) if piece_sids.iter().any(|p| p == sid) => {
+                        coin.status = CoinStatus::WITHDRAWN
+                    }
+                    Some(sid) if sid == change_sid => {
+                        coin.status = CoinStatus::CONFIRMED;
+                        coin.amount = Some(u32::try_from(change_sats)?);
+                    }
+                    _ => {}
+                }
+            }
+            self.save_record(&record).await?;
+        }
+        // History: the grandchildren are funded by `CSP.out[j]`, and `CSP` is the state of the segment
+        // `child_in_ladder_split` just appended (the spent child as an ancestor). Best-effort by
+        // construction — the payment itself is already committed and conveyed at this point.
+        if let Some(seg) = bundles[n].ancestors.last() {
+            let csp_txid = signed_tier_txid(&seg.state.signed_tx)?;
+            self.record_conveyed_pieces(&csp_txid, recipients).await?;
+        }
+        Ok((piece_sids, change_sid))
+    }
+
     /// change is self-owned and trustless; no double-recovery, both share `X_m.out[0]`). The 3rd tuple
     /// element is the latch `(batch_id, payment_hash)` (`None` for a plain in-ladder payment):
     ///   * [`InLadderLatch::External`] — PAY: latch to a known merchant-invoice hash.
@@ -808,7 +1093,8 @@ impl UtexoWallet {
         }
         let change_sats = total - piece_sats;
         // Admission guard. BOTH floors apply and the LARGER binds:
-        //  * the backup-fee floor (dust + the sub-coin's own backup fee), as for a V1 sub-coin; and
+        //  * the backup-fee floor (dust + the sub-coin's own backup fee), as for a plain un-laddered
+        //    sub-coin; and
         //  * `min_child_value` — an in-ladder child gets its OWN two-tier ladder (extension + state)
         //    from `establish_child`, each tier burning `committed_fee + P2A_VALUE`, and its final
         //    state output must still clear dust.
@@ -942,12 +1228,7 @@ impl UtexoWallet {
             change_bundle,
         )
         .await?;
-        let sp_txid = {
-            use bitcoin::consensus::encode::deserialize;
-            let sp: bitcoin::Transaction =
-                deserialize(&hex::decode(&change_bundle.parent.current().state.signed_tx)?)?;
-            sp.txid().to_string()
-        };
+        let sp_txid = signed_tier_txid(&change_bundle.parent.current().state.signed_tx)?;
         // A latched piece stays IN_TRANSFER (conveyed but pending payment; the SSP adopts on pay); a
         // plain conveyed piece is WITHDRAWN (given away outright).
         let piece_status = if latch_batch.is_some() {
@@ -966,6 +1247,146 @@ impl UtexoWallet {
         .await?;
 
         Ok((piece_sid, change_child.statechain_id.clone().unwrap_or_default(), latch))
+    }
+
+    /// MULTI-RECIPIENT in-ladder split payment — the `transfer_many` route for a laddered ROOT coin,
+    /// and the [B1] fix for it. ONE split state `SP` over `X_m.out[0]` carves N recipient children
+    /// (exact amounts) plus this wallet's change; each recipient's child bundle is conveyed to its
+    /// mailbox with the standard key handover, so every piece is a first-class coin the recipient
+    /// adopts at claim. Returns `(piece_sids in recipient order, change_sid)`.
+    ///
+    /// Why this and not the plain N+1 split: `SP` spends `X_m.out[0]`, i.e. it DESCENDS from the
+    /// trigger `T` instead of racing it for the funding outpoint `F`. A prior owner's retained,
+    /// un-timelocked `T` therefore cannot consume `F` and void the split, which is exactly what would
+    /// destroy every recipient's piece on the plain lane (see the [B1] refusal in [`Self::split_coin`]).
+    ///
+    /// Value is conserved by the split builder: `Σ pieces + change == tier_out_total(X_m.out[0], N+1)`,
+    /// so the change is derived — the caller states the payments, not the change.
+    pub async fn in_ladder_pay_many(
+        &self,
+        parent_statechain_id: &str,
+        recipients: &[(String, u64)],
+    ) -> Result<(Vec<String>, String)> {
+        let network = self.inner.config.network.to_string();
+        let n = recipients.len();
+        if n == 0 {
+            return Err(anyhow!("no recipients"));
+        }
+        let bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            parent_statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("coin {parent_statechain_id} has no TES-R ladder to split in-ladder"))?;
+
+        // Σpieces + change == the split total (X_m.out[0] − the committed fee for N+1 outputs; each
+        // extra payload output costs P2TR_OUT_VBYTES, so the fee scales with the recipient count).
+        let x_m = bundle.current().extension.clone();
+        let total = mercurylib::tesr::tier_out_total(x_m.out_value, n + 1, bundle.fee_rate)
+            .ok_or_else(|| anyhow!("committed fee too high to split this coin into {} outputs", n + 1))?;
+        let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
+        if pieces_total >= total {
+            return Err(anyhow!(
+                "payments totalling {pieces_total} sat leave no change: an in-ladder split of this coin into {} outputs can pay at most {} sat",
+                n + 1,
+                total.saturating_sub(1)
+            ));
+        }
+        let change_sats = total - pieces_total;
+        // Both floors apply to EVERY output and the larger binds — see the single-recipient guard in
+        // `in_ladder_pay`. Refusing up-front is load-bearing: `establish_child` runs AFTER the parent's
+        // spend budget is consumed and `SP` is co-signed, so an output admitted below the floor
+        // terminalizes the parent and THEN fails, stranding it to unilateral-exit-only.
+        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
+            .max(mercurylib::tesr::min_child_value(bundle.fee_rate, DUST_LIMIT));
+        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
+            return Err(anyhow!(
+                "recipient amount {amt} is below the in-ladder minimum {min_output} sat (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
+                bundle.fee_rate
+            ));
+        }
+        if change_sats < min_output {
+            return Err(anyhow!(
+                "change {change_sats} is below the in-ladder minimum {min_output} sat — lower the payment total or use a larger coin"
+            ));
+        }
+
+        // N+1 fresh SE-registered child slots (DERIVED — one free voucher batch against the parent).
+        let mut slot_tokens = self.take_derived_tokens(parent_statechain_id, n + 1).await?;
+        let mut children: Vec<(Coin, String, u64)> = Vec::with_capacity(n + 1);
+        for (address, amount) in recipients {
+            let slot = self.create_child_slot(&slot_tokens.remove(0), *amount).await?;
+            // Model A payee: the recipient's exit key (from their statechain address).
+            children.push((slot, mercurylib::tesr::payee_address(address, &network)?, *amount));
+        }
+        let change_child = self.create_child_slot(&slot_tokens.remove(0), change_sats).await?;
+        let self_change_backup =
+            mercurylib::transaction::get_user_backup_address(&change_child, network.clone())?;
+        children.push((change_child.clone(), self_change_backup, change_sats));
+
+        let mut parent = self
+            .record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(parent_statechain_id) && c.duplicate_index == 0)
+            .cloned()
+            .ok_or_else(|| anyhow!("parent coin {parent_statechain_id} not found"))?;
+
+        let bundles = mercuryrustlib::tesr::in_ladder_split(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mut parent,
+            &bundle,
+            &mut children,
+        )
+        .await?;
+
+        // Persist the change claim FIRST, then convey. Ordering matters more here than in the
+        // single-recipient case: `SP` and every tier are already co-signed and the parent is terminal,
+        // so those signatures can never be regenerated — and a conveyance that fails on recipient k
+        // would abort the call with the change bundle unwritten, destroying the only record of our own
+        // remaining value. Persisting first makes the change recoverable from any mid-batch failure.
+        mercuryrustlib::tesr::persist_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &bundles[n],
+        )
+        .await?;
+        // Convey each recipient's child (auth = the slot we still own).
+        // No LN latch on this lane: a batch payment is never a Lightning swap leg, so every piece
+        // relies on the pending-transfer lock + the receiver's prompt handover, exactly like the
+        // single-recipient plain `in_ladder_pay` (see its [F1] note).
+        for (j, (address, _)) in recipients.iter().enumerate() {
+            mercuryrustlib::tesr::convey_child_bundle(
+                &self.inner.cc,
+                address,
+                &children[j].0,
+                &bundles[j],
+                None,
+            )
+            .await?;
+        }
+
+        let piece_sids: Vec<String> = children[..n]
+            .iter()
+            .map(|(c, _, _)| c.statechain_id.clone().unwrap_or_default())
+            .collect();
+        let change_sid = change_child.statechain_id.clone().unwrap_or_default();
+        let sp_txid = signed_tier_txid(&bundles[n].parent.current().state.signed_tx)?;
+        self.book_inladder_split_coins_n(
+            parent_statechain_id,
+            &sp_txid,
+            &piece_sids,
+            CoinStatus::WITHDRAWN,
+            &change_sid,
+            change_sats,
+            n as u32,
+        )
+        .await?;
+        self.record_conveyed_pieces(&sp_txid, recipients).await?;
+        Ok((piece_sids, change_sid))
     }
 
     /// Set a single coin's status by statechain_id in the local wallet db.
@@ -1011,25 +1432,74 @@ impl UtexoWallet {
         change_sats: u64,
         piece_status: CoinStatus,
     ) -> Result<()> {
+        let pieces = [piece_child_sid.to_string()];
+        self.book_inladder_split_coins_n(
+            parent_statechain_id,
+            sp_txid,
+            &pieces,
+            piece_status,
+            change_child_sid,
+            change_sats,
+            1,
+        )
+        .await
+    }
+
+    /// N-piece variant of [`Self::book_inladder_split_coins`] (multi-recipient in-ladder split): the
+    /// change slot is funded by `SP.out[change_vout]`, which is the LAST payload output — `SP.out[j]`
+    /// is `children[j]` and the change is appended after the N pieces, so `change_vout == N`.
+    async fn book_inladder_split_coins_n(
+        &self,
+        parent_statechain_id: &str,
+        sp_txid: &str,
+        piece_child_sids: &[String],
+        piece_status: CoinStatus,
+        change_child_sid: &str,
+        change_sats: u64,
+        change_vout: u32,
+    ) -> Result<()> {
         let mut record = self.record().await?;
         for coin in record.coins.iter_mut() {
             match coin.statechain_id.as_deref() {
                 Some(sid) if sid == parent_statechain_id && coin.duplicate_index == 0 => {
                     coin.status = CoinStatus::WITHDRAWN;
                 }
-                Some(sid) if sid == piece_child_sid => {
+                Some(sid) if piece_child_sids.iter().any(|p| p == sid) => {
                     // Plain conveyance: value given to the recipient (WITHDRAWN). Latched LN piece:
                     // IN_TRANSFER (conveyed but pending payment; the SSP adopts it once it pays).
                     coin.status = piece_status.clone();
                 }
                 Some(sid) if sid == change_child_sid => {
                     coin.utxo_txid = Some(sp_txid.to_string());
-                    coin.utxo_vout = Some(1);
+                    coin.utxo_vout = Some(change_vout);
                     coin.amount = Some(u32::try_from(change_sats)?);
                     coin.status = CoinStatus::CONFIRMED;
                 }
                 _ => {}
             }
+        }
+        self.save_record(&record).await?;
+        Ok(())
+    }
+
+    /// Record one `"Transfer"` history row per conveyed in-ladder piece, keyed on the piece's funding
+    /// outpoint `SP.out[j]`. An in-ladder split conveys its pieces directly through the mailbox and
+    /// never calls `transfer_sender::execute` — which is what writes the history row for a whole-coin
+    /// handover — so without this an off-chain in-ladder payment would leave no trace in
+    /// `get_transfers()`. Never called for a LATCHED piece: that value has not left the wallet until
+    /// the Lightning preimage lands.
+    async fn record_conveyed_pieces(
+        &self,
+        split_txid: &str,
+        pieces: &[(String, u64)],
+    ) -> Result<()> {
+        let mut record = self.record().await?;
+        for (vout, (_, amount)) in pieces.iter().enumerate() {
+            record.activities.push(mercuryrustlib::utils::create_activity(
+                &format!("{split_txid}:{vout}"),
+                u32::try_from(*amount)?,
+                "Transfer",
+            ));
         }
         self.save_record(&record).await?;
         Ok(())
@@ -1410,6 +1880,15 @@ impl UtexoWallet {
         )?;
         Ok(new_backup_transaction(tx_hex, signature)?)
     }
+}
+
+/// txid of a signed (un-broadcast) tier tx, from its hex. The in-ladder split's children are funded
+/// by `SP.out[j]`, an outpoint that exists only inside the bundle — so the booking code derives the
+/// txid from the signed tx rather than from any on-chain lookup.
+fn signed_tier_txid(signed_tx_hex: &str) -> Result<String> {
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&hex::decode(signed_tx_hex)?)?;
+    Ok(tx.txid().to_string())
 }
 
 /// Miner-fee margin left in a split tx for its (exit-only) broadcast.
