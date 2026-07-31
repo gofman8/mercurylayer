@@ -1,5 +1,25 @@
 # Utexo TES-R — renewal & invalidation design (the shipped protocol)
 
+> ## ⚠️ Direction of travel: ONE COIN TYPE
+>
+> The status block below is about the *protocol*; this is about the *coin shapes*. Today there are
+> two — *laddered* (TES-R) and *un-laddered* (RGB carriers and un-broadcast split sub-coins). **That
+> is a transitional state, not the target architecture.** The decided direction is a single coin
+> type; the un-laddered shape is being removed, not kept.
+>
+> The mechanism is **CTES-R** — colour every tier so an RGB carrier can be laddered, retiring
+> terminal-freeze. Its gate passed against the live stack ([CTESR-GATE.md](CTESR-GATE.md)) and its
+> foundation has landed (the `payload_vout` migration, the coloured tier builder, per-tier seal
+> blinding). **The colouring itself is not yet wired.** Until it is, everything below about the
+> un-laddered shape remains accurate as-built.
+>
+> In particular, the pre-TES-R **baseline** column used in the comparison tables is a historical
+> measuring stick and stays. The un-laddered **shape** is a different thing, and it is going away.
+>
+> Reaching one coin type also requires porting `verify_bundle` to wasm/JS and Kotlin: the nodejs and
+> web clients currently *refuse* any laddered coin. Background:
+> [COLORED-FORWARDING.md](COLORED-FORWARDING.md).
+
 **Status: SHIPPED — this is the protocol.** TES-R is not a proposal or a lane any more: `claim()`
 establishes a trigger/extension/state ladder for **every fresh confirmed ROOT coin, unconditionally**.
 The `deposit_protocol_version` field and the `UTEXO_PROTOCOL_DEFAULT` escape hatch that could opt a

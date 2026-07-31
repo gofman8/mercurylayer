@@ -1,5 +1,23 @@
 # Coin Granularity (Partial Amounts) — Normative Specification
 
+> ## ⚠️ Direction of travel: ONE COIN TYPE
+>
+> This spec covers both coin shapes as built today — *laddered* (TES-R) and *un-laddered* (RGB
+> carriers and un-broadcast split sub-coins). **That is a transitional state, not the target
+> architecture.** The decided direction is a single coin type; the un-laddered shape is being removed.
+>
+> Much of the arithmetic below is scoped to the un-laddered shape: the plain-split fee reserve, the
+> backup-fee floor, carrier depletion, the `TOKEN_PIECE_SATS` packaging and the leaf problem it
+> creates (a received 1,500-sat piece cannot be forwarded, because forwarding needs strictly more than
+> the piece size — unsatisfiable for any constant). Those `GRN-*` items are expected to be **deleted,
+> not migrated**; the laddered in-ladder split has its own model (`tier_out_total`,
+> `committed_fee_for_outputs`, `min_child_value`) which stays.
+>
+> The mechanism is **CTES-R** (colour every tier so a carrier can be laddered). Note it **raises** the
+> minimum splittable carrier roughly 2.6× and **removes** off-chain colored combine — see
+> [CTESR-GATE.md](CTESR-GATE.md) and [COLORED-FORWARDING.md](COLORED-FORWARDING.md). Its foundation
+> has landed; **the colouring is not yet wired**, so everything below remains accurate as-built.
+
 This document is the authoritative reference for **coin granularity**: how the Utexo SDK
 (Spark-compatible API) pays, splits, and books *partial amounts* — sats below a coin's size and token amounts below a
 carrier's allocation. Requirements are numbered **GRN-REQ-n**, invariants **GRN-INV-n**, error

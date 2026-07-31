@@ -1,5 +1,25 @@
 # Trust model — who trusts whom, what is verified instead, and what cannot be solved
 
+> ## ⚠️ Direction of travel: ONE COIN TYPE
+>
+> The trust boundaries below are stated for both coin shapes as built today — *laddered* (TES-R) and
+> *un-laddered* (RGB carriers and un-broadcast split sub-coins). **That is a transitional state, not
+> the target architecture.** The decided direction is a single coin type; the un-laddered shape is
+> being removed.
+>
+> Several residuals recorded here belong to that shape and go away with it — notably **B2**, the
+> terminal-parent proofs that are checked by COUNT rather than cryptographically bound to the branch
+> inputs. An independent review rates that CRITICAL; it is not being patched, because the code that
+> contains it is scheduled for deletion rather than hardening.
+>
+> Two boundaries that do NOT go away, and should not be read as transitional: the single-SE trust
+> unit itself, and the ~6.9-day **root** epoch (an unspent on-chain root plus the original
+> depositor's maturing absolute-locktime backup — on-chain state, escapable only by an on-chain
+> colored re-anchor that does not exist today).
+>
+> Mechanism and status: [CTESR-GATE.md](CTESR-GATE.md). Foundation landed; **colouring not yet
+> wired**, so everything below remains accurate as-built.
+
 Every party a user interacts with — sender, receiver, the statechain entity (SE), the watchtower,
 the Bitcoin indexer, the RGB proxy, operators — and, for each: what flows between them, what the
 code **verifies** (with the file and the test that proves it), what is **trusted** and why, and

@@ -1,5 +1,21 @@
 # Old-State Invalidation — Normative Specification
 
+> ## ⚠️ Direction of travel: ONE COIN TYPE
+>
+> This spec covers both coin shapes as built today — *laddered* (TES-R, relative CSV, never ages) and
+> *un-laddered* (RGB carriers and un-broadcast split sub-coins, absolute nLockTimes with a root
+> deadline). **That is a transitional state, not the target architecture.** The decided direction is
+> a single coin type; the un-laddered shape is being removed.
+>
+> This document is affected more than most: a large share of its `IVL-*` items exist **only** because
+> the un-laddered shape has an absolute deadline — the deadline arithmetic, the audit-[17]
+> `k·interval` gap, the stale-backup race, the monitor-or-delegate duty. When that shape goes, those
+> items are **deleted, not migrated**, because a laddered coin has no deadline to invalidate against.
+>
+> The mechanism is **CTES-R** (colour every tier so a carrier can be laddered). Its gate passed
+> ([CTESR-GATE.md](CTESR-GATE.md)) and its foundation has landed; **the colouring is not yet wired**,
+> so everything below remains accurate as-built until it is.
+
 This document is the single authoritative reference for the old-state invalidation mechanism of
 the Mercury-Layer statechain fork (Utexo, Spark-compatible API; `feat/spark`). It specifies *how a
 previously valid off-chain state is made unspendable-in-practice* when ownership moves, and what

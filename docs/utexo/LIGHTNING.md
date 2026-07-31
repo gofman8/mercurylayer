@@ -1,5 +1,15 @@
 # Lightning — the HODL-invoice latch
 
+> ## ⚠️ Direction of travel: ONE COIN TYPE
+>
+> The sats lanes below run on the **laddered** shape and are unaffected. The **colored** lane (§9
+> residual 6) rides an *un-laddered* carrier, and that shape is being removed — the decided direction
+> is a single coin type. When CTES-R colours the tiers, the colored LN lane moves onto the ladder too
+> and the "rides an un-laddered coin by design" note below stops being true.
+>
+> Status: gate passed ([CTESR-GATE.md](CTESR-GATE.md)), foundation landed, **colouring not yet
+> wired** — so the description below is accurate as-built.
+
 **Normative.** This is how Lightning works: both directions, exact and non-exact amounts, running on
 the TES-R ladder over the pinned `rgb-lightning-node` `pr-90` (LDK 0.2.2) stack. No new cryptographic
 primitive, no enclave change for the core.

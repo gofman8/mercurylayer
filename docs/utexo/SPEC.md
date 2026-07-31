@@ -1,5 +1,26 @@
 # Mercury + RGB Utexo — System Specification
 
+> ## ⚠️ Direction of travel: ONE COIN TYPE
+>
+> This document specifies the system **as built today**, which has two coin shapes — *laddered*
+> (TES-R) and *un-laddered* (RGB carriers and un-broadcast split sub-coins). **That is a transitional
+> state, not the target architecture.** The decided direction is a single coin type; the un-laddered
+> shape is being removed, not kept.
+>
+> The mechanism is **CTES-R** — colour every TES-R tier so an RGB carrier can be laddered, retiring
+> terminal-freeze. Its gate passed against the live stack ([CTESR-GATE.md](CTESR-GATE.md)) and its
+> foundation has landed (the `payload_vout` migration, the coloured tier builder, per-tier seal
+> blinding). **The colouring itself is not yet wired.** Until it is, everything below about the
+> un-laddered shape remains accurate as-built.
+>
+> So: read two-shape material here as a description of the present, never as the target. Items scoped
+> to the un-laddered shape — its absolute deadlines, backup-chain handover, terminal-parent proofs,
+> and the exit-cost and carrier-depletion arithmetic — are expected to be **deleted**, not migrated.
+>
+> Reaching one coin type also requires porting `verify_bundle` to wasm/JS and Kotlin: the nodejs and
+> web clients currently *refuse* any laddered coin, so every coin laddered is one they cannot
+> receive. Background: [COLORED-FORWARDING.md](COLORED-FORWARDING.md).
+
 Normative specification of the Utexo system built on Mercury Layer statechains with RGB
 assets and a single statechain entity (SE). Requirements are labelled **REQ-n**, invariants
 **INV-n**, and error semantics **ERR-n**. Each is mapped to a verifying test in
