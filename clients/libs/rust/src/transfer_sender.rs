@@ -864,7 +864,47 @@ pub async fn execute(
     statechain_id: &str,
     duplicated_indexes: Option<Vec<u32>>,
     force_send: bool,
-    batch_id: Option<String>) -> Result<()> 
+    batch_id: Option<String>) -> Result<()>
+{
+    execute_ex(client_config, recipient_address, wallet_name, statechain_id, duplicated_indexes, force_send, batch_id, None).await
+}
+
+/// [CTES-R] [`execute`] for a COLOURED (CTES-R) ladder: the caller supplies a pre-built, pre-coloured
+/// receiver-paying state `S'` and everything else is byte-identical to the plain path.
+///
+/// The draft is built by the caller — not here — for one hard reason: colouring needs the RGB engine,
+/// whose resolver is `!Sync`, so a handle to it must never be alive across an `await`. This function
+/// is `await`s from end to end. Splitting the build out is free, because a tier's txid is stable
+/// across signing (`mercuryrustlib::tesr::build_colored_receiver_state` →
+/// `cosign_colored_receiver_state`).
+///
+/// A coloured ladder conveyed WITHOUT a draft is still refused, and that refusal is the safety
+/// property: `verify_bundle_bound` is colour-blind, so an uncoloured `S'` over a sealed output would
+/// bind the receiver's sats while destroying the asset on first exit.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_colored(
+    client_config: &ClientConfig,
+    recipient_address: &str,
+    wallet_name: &str,
+    statechain_id: &str,
+    duplicated_indexes: Option<Vec<u32>>,
+    force_send: bool,
+    batch_id: Option<String>,
+    colored_state: crate::tesr::ColoredStateDraft) -> Result<()>
+{
+    execute_ex(client_config, recipient_address, wallet_name, statechain_id, duplicated_indexes, force_send, batch_id, Some(colored_state)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_ex(
+    client_config: &ClientConfig,
+    recipient_address: &str,
+    wallet_name: &str,
+    statechain_id: &str,
+    duplicated_indexes: Option<Vec<u32>>,
+    force_send: bool,
+    batch_id: Option<String>,
+    colored_state: Option<crate::tesr::ColoredStateDraft>) -> Result<()>
 {
     let mut wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
@@ -937,6 +977,30 @@ pub async fn execute(
             ))
         }
     };
+    // [CTES-R] A COLOURED ladder may only be conveyed with a pre-built, pre-COLOURED receiver state.
+    // `verify_bundle_bound` is entirely colour-blind, so an uncoloured `S'` over a sealed output
+    // would bind the receiver's sats while destroying the allocation on first exit — and it would be
+    // silent: the transaction is perfectly valid Bitcoin and every existing check passes. The
+    // symmetric mistake is refused too: a coloured draft handed to a PLAIN ladder would attach a
+    // transition to a coin whose other tiers carry none.
+    match (tesr_bundle.as_ref().map(|b| b.is_colored()).unwrap_or(false), colored_state.is_some()) {
+        (true, false) => {
+            return Err(anyhow!(
+                "statechain id {statechain_id} carries a COLOURED (CTES-R) ladder and must be \
+                 conveyed through transfer_sender::execute_colored with a pre-coloured receiver \
+                 state. A plain conveyance would co-sign an UNCOLOURED S' over a sealed output, \
+                 destroying the RGB allocation. Refusing before any SE co-sign — the coin is \
+                 unaffected."
+            ))
+        }
+        (false, true) => {
+            return Err(anyhow!(
+                "statechain id {statechain_id} was handed a COLOURED receiver state but its ladder \
+                 is not coloured — refusing before any SE co-sign."
+            ))
+        }
+        _ => {}
+    }
     if tesr_bundle.is_none() {
         assert_flat_conveyance_is_legitimate(
             client_config,
@@ -1012,8 +1076,21 @@ pub async fn execute(
             // would produce exactly the hard-failed transfer this change removes, so surface a
             // DISTINCT, NAMED error instead: the caller can branch on
             // `ERR_LADDER_COSIGN_INCOMPLETE` and drive the remedy.
-            let augmented = crate::tesr::presign_receiver_state(client_config, &coin, &bundle, recipient_address)
-                .await
+            let presigned = match colored_state {
+                // [CTES-R] The coloured sibling: one `cosign_tier` round-trip, the same as the plain
+                // path, over a tier that already carries its RGB state transition.
+                Some(draft) => crate::tesr::cosign_colored_receiver_state(
+                    client_config,
+                    &coin,
+                    &bundle,
+                    draft,
+                    recipient_address,
+                )
+                .await,
+                None => crate::tesr::presign_receiver_state(client_config, &coin, &bundle, recipient_address)
+                    .await,
+            };
+            let augmented = presigned
                 .map_err(|e| {
                     anyhow!(
                         "[{ERR_LADDER_COSIGN_INCOMPLETE}] statechain id {statechain_id} is laddered \

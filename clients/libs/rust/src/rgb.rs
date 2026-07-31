@@ -989,6 +989,73 @@ fn tier_out_spk(address: &str, network: &str) -> Result<ScriptBuf> {
         .script_pubkey())
 }
 
+/// **[CTES-R] The §3.3 stock probe: is `amount` of `contract_id` still spendable out of
+/// `(txid, vout)`?**
+///
+/// The health check `docs/utexo/CTESR-GATE.md` §3.3 mandates and the only one that works. It builds
+/// a throwaway one-input, one-output spend of the outpoint and hands it to
+/// [`mercury_rgb::RgbWallet::probe_spendable`], which runs rgb-lib's **read-only** `color_psbt`:
+/// nothing is consumed, no transfer row is written, no witness is resolved, and the coin is
+/// untouched — safe against a live coin, including one mid-exit.
+///
+/// `Ok(())` means the stash still binds the allocation to that outpoint. `Err` is the answer that
+/// matters: a stash whose ladder has been invalidated answers
+/// `InvalidColoringInfo { "total amount in output_map (N) greater than available (0)" }` while
+/// `get_asset_balance` and `list_unspents` both keep reporting a full, settled, spendable balance
+/// (measured — E7). Never assert carrier liveness on the balance.
+///
+/// `value`/`spk_hex` describe the outpoint being spent (the witness utxo rgb-lib needs to place the
+/// opret); `payee` is any valid address on `network` and is pure scaffolding — the probe transaction
+/// is never signed, never broadcast and never leaves this function.
+pub fn probe_allocation(
+    rgb: &RgbWallet,
+    contract_id: &str,
+    txid: &str,
+    vout: u32,
+    value: u64,
+    spk_hex: &str,
+    payee: &str,
+    network: &str,
+    amount: u64,
+) -> Result<()> {
+    let prev_txid =
+        Txid::from_str(txid).map_err(|e| anyhow!("bad probe outpoint txid {txid}: {e}"))?;
+    let probe = Transaction {
+        version: 2,
+        lock_time: absolute::LockTime::from_consensus(0),
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: prev_txid, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(0xFFFF_FFFD),
+            witness: Witness::default(),
+        }],
+        // One P2TR output: enough for rgb-lib to have somewhere to assign, and P2TR is what makes
+        // the fork place the opret FIRST — i.e. the probe has the same shape as a real tier.
+        output: vec![TxOut { value, script_pubkey: tier_out_spk(payee, network)? }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(probe)
+        .map_err(|e| anyhow!("could not build the probe psbt: {e}"))?;
+    psbt.inputs = vec![PsbtInput {
+        witness_utxo: Some(TxOut {
+            value,
+            script_pubkey: ScriptBuf::from(
+                hex::decode(spk_hex).map_err(|e| anyhow!("bad probe scriptPubKey hex: {e}"))?,
+            ),
+        }),
+        ..Default::default()
+    }];
+    let mut output_map = std::collections::HashMap::new();
+    output_map.insert(0u32, amount);
+    // The blinding is irrelevant to the probe (nothing is published), but it must be SOME value, and
+    // a per-probe one keeps this call from ever looking like a real transition to a future reader.
+    rgb.probe_spendable(&psbt.to_string(), contract_id, output_map, PROBE_BLINDING)
+}
+
+/// Seal blinding used by [`probe_allocation`]. Deliberately not a [`TierSeal`]-derived value: the
+/// probe's transition is built in memory and discarded, so it must be impossible to mistake for a
+/// real tier's seal.
+const PROBE_BLINDING: u64 = 0;
+
 /// **Build and colour ONE TES-R tier**, returning EXPLICIT payload vouts.
 ///
 /// This is the CTES-R tier builder mandated by `docs/utexo/CTESR-GATE.md` §3.5. It deliberately does

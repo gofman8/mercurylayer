@@ -602,6 +602,24 @@ impl UtexoWallet {
             // AUDITED-SWALLOW: the `None` case is already captured in `rgb_state_unavailable` above
             // and drives the `note_flat` below; this default only supplies an unused empty set.
             let carriers = carriers.unwrap_or_default();
+            // [CTES-R] The BOOKED allocations, `outpoint -> Some((contract_id, amount))`, or
+            // `Some(None)` for an outpoint holding more than one. Only fetched when the coloured
+            // lane is enabled, so the plain path does not gain a single RGB read.
+            //
+            // `carriers` above is the UNION of booked and *pending* (consignment-bearing, not yet
+            // booked) carriers. That union must be SPLIT here: `build_colored_tier` on a pending
+            // carrier fails with `InvalidColoringInfo { available (0) }`, so a pending carrier stays
+            // on the flat lane and is retried on the next pass, once its allocation is booked.
+            //
+            // AUDITED-SWALLOW: an unreadable allocation map degrades to "colour nothing this pass",
+            // which is the pre-CTES-R behaviour — strictly less work, strictly more safety, and the
+            // affected carriers are still recorded + surfaced as `RgbCarrier` below.
+            let booked: std::collections::HashMap<String, Option<(String, u64)>> =
+                if self.inner.config.colored_ladder && !rgb_state_unavailable {
+                    self.token_carrier_allocations().await.unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
             for coin in rec.coins.iter_mut() {
                 let sid = match &coin.statechain_id { Some(s) => s.clone(), None => continue };
                 // A coin that is not CONFIRMED is not "flat-only", it is simply not ready: the
@@ -669,9 +687,25 @@ impl UtexoWallet {
                     self.note_flat(&sid, 0, LadderSkipReason::TerminalizedCarrier).await?;
                     continue;
                 }
+                // [CTES-R] THE DECISION SITE. A carrier either gets a COLOURED ladder — every tier
+                // carrying a valid RGB state transition, so laddering MOVES the allocation instead
+                // of destroying it — or it stays on the flat lane exactly as before.
+                //
+                // Fail CLOSED in every ambiguous case: the coloured lane is taken ONLY when the
+                // outpoint resolves to exactly ONE booked allocation. Zero (a pending carrier whose
+                // consignment is not booked yet) or more than one (no single-transition tier shape
+                // exists) both fall through to `note_flat(RgbCarrier)` + `continue`, i.e. today's
+                // behaviour, retried next pass.
+                let mut colored_target: Option<(String, u64)> = None;
                 if is_token_carrier(coin, &carriers) {
-                    self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
-                    continue;
+                    let one = coin_outpoint(coin).and_then(|o| booked.get(&o).cloned()).flatten();
+                    match (self.inner.config.colored_ladder, one) {
+                        (true, Some(alloc)) => colored_target = Some(alloc),
+                        _ => {
+                            self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
+                            continue;
+                        }
+                    }
                 }
                 // ROOT-ONLY [B0]: only a coin whose funding `F` is ON-CHAIN may be laddered. A split
                 // SUB-COIN's F is an un-broadcast split output, so its ladder's trigger has no prevout
@@ -782,7 +816,55 @@ impl UtexoWallet {
                     continue;
                 }
                 let payee = coin.backup_address.clone();
-                match mercuryrustlib::tesr::establish_auto(&self.inner.cc, coin, &payee, &network).await {
+                // ONE call site, TWO builders. A plain coin takes `establish_auto` unchanged — the
+                // plain path is byte-identical, down to the RGB engine never being opened. A carrier
+                // with exactly one booked allocation takes the COLOURED sibling, whose only
+                // differences are the opret, the payload at vout 1 and the `n_payload + 1` fee.
+                let was_colored = colored_target.is_some();
+                let established = match colored_target {
+                    Some((ref contract_id, amount)) => {
+                        // TWO PHASES. Colour first (engine only, no network), then co-sign (network
+                        // only, no engine). The RGB engine's resolver is `!Sync`, so its guard must
+                        // NOT be alive across an `await` or the whole `claim()` future stops being
+                        // `Send` and cannot run in the background watcher's task — hence the block.
+                        // It is free: a tier's txid is stable across signing.
+                        let draft = {
+                            let mut rgb = self.rgb().await?;
+                            let w = rgb.as_mut().ok_or_else(|| {
+                                anyhow!("colored ladder requested but no RGB engine is configured")
+                            })?;
+                            tokio::task::block_in_place(|| {
+                                mercuryrustlib::tesr::build_colored_ladder_auto(
+                                    w,
+                                    coin,
+                                    &payee,
+                                    &network,
+                                    contract_id,
+                                    amount,
+                                    &f_spk_hex,
+                                )
+                            })
+                        };
+                        match draft {
+                            // `cosign_tier` is the same blind SE round-trip either way — the SE
+                            // never learns that anything is coloured.
+                            Ok(draft) => {
+                                mercuryrustlib::tesr::cosign_colored_ladder(
+                                    &self.inner.cc,
+                                    coin,
+                                    draft,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => {
+                        mercuryrustlib::tesr::establish_auto(&self.inner.cc, coin, &payee, &network)
+                            .await
+                    }
+                };
+                match established {
                     Ok(bundle) => {
                         if mercuryrustlib::tesr::persist(&self.inner.cc, &self.inner.config.wallet_name, &bundle).await.is_ok() {
                             self.clear_flat_note(&sid).await?;
@@ -794,8 +876,24 @@ impl UtexoWallet {
                     }
                     // Leave un-laddered: its tx1 backup still exits, and the next pass retries. The
                     // owner is told, because a coin that keeps failing here is flat-only in practice.
-                    Err(_) => {
-                        self.note_flat(&sid, 0, LadderSkipReason::EstablishFailed).await?;
+                    //
+                    // [CTES-R] A CARRIER that could not be coloured — most often because it cannot
+                    // afford three coloured rungs (`colored_ladder_floor`; every existing 1,500-sat
+                    // token piece is in that class) — is recorded as `RgbCarrier`, NOT
+                    // `EstablishFailed`. The distinction is load-bearing: `RgbCarrier` licenses flat
+                    // conveyance, so the carrier keeps working exactly as it does today, whereas
+                    // `EstablishFailed` licenses nothing and would leave it untransferable. The
+                    // coloured attempt refuses BEFORE its first SE co-sign, so nothing was spent.
+                    Err(e) => {
+                        if was_colored {
+                            eprintln!(
+                                "coin {sid}: colouring the ladder failed ({e}); leaving the carrier \
+                                 on the flat lane"
+                            );
+                            self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
+                        } else {
+                            self.note_flat(&sid, 0, LadderSkipReason::EstablishFailed).await?;
+                        }
                     }
                 }
             }
@@ -1865,13 +1963,29 @@ impl UtexoWallet {
         // spend, so a carrier coin must be excluded from the exit-everything default and rejected if
         // named explicitly.
         let carriers = self.unspendable_as_btc_outpoints().await?;
+        // [CTES-R] THE ONE CARRIER THAT MAY EXIT. Until CTES-R a carrier had no unilateral exit at
+        // all: its only pre-signed spends of `F` were RGB-unaware, so broadcasting one destroyed the
+        // allocation. A COLOURED ladder is the exception and the only one — every tier carries a
+        // valid RGB state transition, so the walk MOVES the allocation to the owner's own key.
+        //
+        // Read once, fail CLOSED: an unreadable ladder table is an `Err` (not an empty set), and a
+        // `tesr-` row that will not deserialize counts as NOT coloured, so the carrier is refused.
+        // "I could not tell whether this ladder is coloured" must never license the walk.
+        //
+        // Deliberately NOT opened here: `withdraw` and `refresh` (`refresh.rs`) still refuse
+        // carriers outright. Neither is fixed by CTES-R — there is still no coloured on-chain
+        // re-anchor (CTESR-GATE §7) — so their refusals stand and only this one opens.
+        let colored_sids = self.colored_ladder_sids().await?;
+        let exitable_carrier = |c: &Coin| -> bool {
+            c.statechain_id.as_deref().is_some_and(|id| colored_sids.contains(id))
+        };
         let ids: Vec<String> = match statechain_ids {
             Some(ids) => {
                 for id in &ids {
                     if let Some(c) = record.coins.iter().find(|c| c.statechain_id.as_deref() == Some(id)) {
-                        if is_token_carrier(c, &carriers) {
+                        if is_token_carrier(c, &carriers) && !exitable_carrier(c) {
                             return Err(anyhow!(
-                                "coin {id} carries an RGB allocation; a plain unilateral exit would destroy the tokens — move the asset off this coin first"
+                                "coin {id} carries an RGB allocation and its ladder is not COLOURED (CTES-R); a plain unilateral exit would destroy the tokens — move the asset off this coin first"
                             ));
                         }
                         // [HF-4 / B1] Never exit a coin that is no longer ours to exit. The explicit-id
@@ -1898,7 +2012,9 @@ impl UtexoWallet {
                 .coins
                 .iter()
                 .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
-                .filter(|c| !is_token_carrier(c, &carriers))
+                // [CTES-R] A carrier is included ONLY if its ladder is coloured; every other
+                // carrier stays excluded from the exit-everything default exactly as before.
+                .filter(|c| !is_token_carrier(c, &carriers) || exitable_carrier(c))
                 .filter_map(|c| c.statechain_id.clone())
                 .collect(),
         };
@@ -1951,6 +2067,29 @@ impl UtexoWallet {
                 };
                 statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
                 continue;
+            }
+
+            // [CTES-R] FAIL CLOSED AT THE FLAT FALLBACK. Everything below broadcasts an RGB-UNAWARE
+            // spend of `F` — the branch tx and the latest absolute-locktime backup. Those are
+            // retained on a coloured coin too (they must be: `tx1` was co-signed at deposit-init and
+            // the census counts it forever), and broadcasting one BURNS the allocation.
+            //
+            // The filters above should make this unreachable for a carrier — but "should" is how
+            // recovery paths lose money. A coin whose `tesr-` row is missing or unreadable after a
+            // restore-from-mnemonic reaches exactly here, and it is precisely the case where the
+            // wallet cannot see that it is holding an asset. So the carrier test is repeated at the
+            // point of no return, as a refusal rather than a filter.
+            if record
+                .coins
+                .iter()
+                .any(|c| c.statechain_id.as_deref() == Some(&id) && is_token_carrier(c, &carriers))
+            {
+                return Err(anyhow!(
+                    "coin {id} carries an RGB allocation but has no coloured (CTES-R) ladder to \
+                     walk; the only remaining exit is an RGB-unaware spend of its funding output, \
+                     which would DESTROY the allocation. Refusing. If this coin was restored from a \
+                     mnemonic, restore its `tesr-{id}` ladder row as well."
+                ));
             }
 
             // Materialize the coin's funding first (no locktime on branch txs).

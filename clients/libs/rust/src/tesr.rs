@@ -109,6 +109,36 @@ pub struct TesrBundle {
     /// persisted before this field existed.
     #[serde(default)]
     pub params: mercurylib::tesr::TesrParams,
+    /// **CTES-R.** Present iff this is a COLOURED ladder: every tier carries a valid RGB state
+    /// transition, so laddering the carrier MOVES the allocation instead of destroying it.
+    ///
+    /// `None` on every plain coin — and `#[serde(default)]` keeps every already-persisted `tesr-*`
+    /// row and every in-flight mailbox message deserializing byte-identically, so the plain path is
+    /// unchanged on the wire as well as in behaviour.
+    #[serde(default)]
+    pub rgb: Option<ColoredLadder>,
+}
+
+/// The RGB half of a CTES-R ladder: which contract rides it, how much, and the per-tier
+/// consignments proving each tier's transition.
+///
+/// The consignments are held in **exit-tier order** — exactly [`TesrBundle::exit_tiers`] —
+/// `[trigger, ext_0, state_0, ext_1, state_1, …]`, so `consignments[i]` is the proof for
+/// `exit_tiers()[i]`. A receiver validates the LEAF one (`consignments.last()`) against the ordered
+/// ladder txid list; the earlier ones are what let it resolve the un-broadcast chain above it.
+///
+/// Seal blindings are **not** stored: they are DERIVED on both sides from
+/// `mercuryrustlib::rgb::TierSeal(statechain_id, role, tier_index, rung)`, and a stored blinding
+/// would be an attacker-supplied field the receiver could be talked into trusting.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ColoredLadder {
+    /// RGB contract id whose allocation this ladder carries.
+    pub contract_id: String,
+    /// The full fungible amount riding the ladder (the whole allocation — CTES-R moves the
+    /// allocation as a unit; partial amounts are the in-ladder coloured split, a later commit).
+    pub amount: u64,
+    /// Per-tier consignments, base64, in [`TesrBundle::exit_tiers`] order.
+    pub consignments: Vec<String>,
 }
 
 /// [in-ladder split] A split child's exit bundle. It spans TWO aggregates: the ancestor segment
@@ -192,6 +222,17 @@ impl TesrBundle {
             (self.levels[n - 2].state.txid.clone(), self.levels[n - 2].state.out_value)
         }
     }
+    /// **Is this a CTES-R (coloured) ladder?** Every tier of a coloured ladder carries a valid RGB
+    /// state transition; every tier of a plain one carries none.
+    ///
+    /// This is the discriminator every lane that could produce a RIVAL, allocation-destroying spend
+    /// must consult. It is deliberately a property of the BUNDLE, not of the coin: a coin can look
+    /// like a carrier to one subsystem and not to another, but a ladder either colours its tiers or
+    /// it does not.
+    pub fn is_colored(&self) -> bool {
+        self.rgb.is_some()
+    }
+
     /// All tier txs in unilateral-exit order: trigger, then (extension, state) for each level.
     pub fn exit_tiers(&self) -> Vec<&TesrTier> {
         let mut v = vec![&self.trigger];
@@ -201,6 +242,105 @@ impl TesrBundle {
         }
         v
     }
+
+    /// The ladder's tier txids in [`Self::exit_tiers`] order — the off-chain witness list every
+    /// consignment of this ladder must be resolved against. NEVER resolve a coloured ladder with the
+    /// plain blockchain resolver: each tier is deliberately un-broadcast, the indexer reports it
+    /// `Unresolved`, and rgb-lib maps that to `Archived`, silently and irreversibly invalidating the
+    /// whole chain (`docs/utexo/CTESR-GATE.md` §2.3/§3.3).
+    pub fn ladder_txids(&self) -> Vec<String> {
+        self.exit_tiers().iter().map(|t| t.txid.clone()).collect()
+    }
+
+    /// The LEAF consignment — the proof for the final state, the one a receiver validates.
+    pub fn leaf_consignment(&self) -> Option<&String> {
+        self.rgb.as_ref().and_then(|r| r.consignments.last())
+    }
+
+    /// **`(txid, payload_vout, blinding)` for every tier of a COLOURED ladder, DERIVED.**
+    ///
+    /// This is the receiver's half of [`colored_tier_seal`]: everything it needs for
+    /// `RgbWallet::accept_ladder` comes out of the conveyed bundle itself — the statechain id, the
+    /// tier's role and its relative timelock — so no blinding is ever transmitted, and a sender
+    /// cannot talk a receiver into opening a seal of the sender's choosing.
+    ///
+    /// Refuses a multi-level (rolled-over) coloured ladder: [`rollover`] cannot produce one (it
+    /// refuses a coloured bundle outright), so a bundle that claims to be both coloured and
+    /// multi-level did not come from this code, and its per-level renewal counters cannot be
+    /// reconstructed. Fail CLOSED rather than derive a blinding that opens nothing.
+    pub fn colored_tier_seals(&self) -> Result<Vec<(String, u32, u64)>> {
+        use crate::rgb::TierRole;
+        if !self.is_colored() {
+            return Err(anyhow::anyhow!("this ladder is PLAIN — it has no tier seals"));
+        }
+        if self.levels.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "a coloured ladder must have exactly one level (found {}) — coloured rollover does \
+                 not exist yet, so a multi-level coloured bundle has no derivable seal schedule",
+                self.levels.len()
+            ));
+        }
+        let sid = &self.statechain_id;
+        let ext = &self.current().extension;
+        let state = &self.current().state;
+        Ok(vec![
+            (
+                self.trigger.txid.clone(),
+                self.trigger.payload_vout,
+                colored_tier_seal(sid, TierRole::Trigger, 0, 0, None).blinding(),
+            ),
+            (
+                ext.txid.clone(),
+                ext.payload_vout,
+                colored_tier_seal(sid, TierRole::Extension, 0, self.m, ext.csv).blinding(),
+            ),
+            (
+                state.txid.clone(),
+                state.payload_vout,
+                colored_tier_seal(sid, TierRole::State, 0, self.m, state.csv).blinding(),
+            ),
+        ])
+    }
+}
+
+/// **The seal identity of ONE tier of a coloured ladder. Derived by BOTH parties, stored by neither.**
+///
+/// Rival tiers over the SAME parent output are the NORMAL case in CTES-R — a renewal replaces `X_m`
+/// over `T`'s payload output, a transfer replaces `S_k` over `X_m`'s — and two rivals sharing a
+/// blinding collapse to one `OpId`/`BundleId`, after which rgb-lib keeps whichever witness has the
+/// numerically smallest INTERNAL txid (an arbitrary hash lottery) and the loser's consignment is
+/// unvalidatable by anyone (`docs/utexo/CTESR-GATE.md` §2.2). So the derivation must separate rivals,
+/// and the receiver must reproduce it exactly from what the transfer message already carries.
+///
+/// The inputs, and why each one is available to both sides:
+///
+/// * `statechain_id` — separates coins; the receiver is acting on it.
+/// * `role` — separates an extension from a state over the same parent.
+/// * `level` — the rollover depth. Always `0` today: [`rollover`] refuses a coloured bundle, so a
+///   coloured ladder is single-level by construction and [`TesrBundle::colored_tier_seals`] enforces it.
+/// * `m` ‖ `csv`, packed into the `rung` — **this is the pair that actually separates rivals**, and
+///   it is not a convention but an invariant the PLAIN protocol already enforces: `verify_bundle`'s
+///   per-prevout race check requires the live tier over an outpoint to sit at a strictly LOWER CSV
+///   than every superseded rival over that same outpoint (otherwise the stale tier could win the
+///   maturity race). Two rivals over one parent output therefore can NEVER share a CSV in a bundle
+///   that verifies. The renewal counter `m` is folded in as a second, independent separator.
+///
+/// Both are cross-checked against transaction CONTENT downstream — `csv` against the tier's nSequence
+/// in `verify_bundle_ex`, the whole ladder against the coin in `verify_bundle_bound` — so a bundle
+/// that lies about either is rejected before any seal is derived from it.
+///
+/// `build_colored_tier` additionally asserts at BUILD time that the consignment it just produced
+/// carries the tier's OWN witness, so a derivation collision fails loudly at the sender rather than
+/// opaquely at the receiver.
+pub fn colored_tier_seal(
+    statechain_id: &str,
+    role: crate::rgb::TierRole,
+    level: u32,
+    m: u32,
+    csv: Option<u16>,
+) -> crate::rgb::TierSeal {
+    let rung = ((m & 0xFFFF) << 16) | csv.unwrap_or(0) as u32;
+    crate::rgb::TierSeal::new(statechain_id, role, level, rung)
 }
 
 /// Establish a confirmed coin's TES-R ladder: build + blind-co-sign T → X_0 → S_0 over the funding
@@ -246,7 +386,821 @@ pub async fn establish(
         superseded_states: Vec::new(),
         superseded_extensions: Vec::new(),
         params: mercurylib::tesr::TesrParams::for_network(network),
+        rgb: None,
     })
+}
+
+// =================================================================================================
+// CTES-R — colour the ladder.
+// =================================================================================================
+
+/// The smallest funding value `F` that can carry a full COLOURED three-tier ladder.
+///
+/// **This must be checked BEFORE the first `cosign_tier`, and it is the first thing that bites.** A
+/// coloured rung costs `colored_committed_fee(1, rate) + P2A_VALUE` — 574 sat at 2 sat/vB versus 488
+/// uncoloured, because the RGB `opret` output serialises to exactly `P2TR_OUT_VBYTES` (43 B) and the
+/// fee is `committed_fee_for_outputs(n_payload + 1, rate)` (`docs/utexo/CTESR-GATE.md` §3.4). Three
+/// rungs plus a final state output that still clears dust is the floor.
+///
+/// Discovering this at rung 3 instead would be unrecoverable: `T` and `X_0` would already have burned
+/// two IRREVERSIBLE SE co-signs, leaving the coin's `num_sigs` permanently ahead of any bundle that
+/// can be persisted — i.e. a coin whose census no receiver can ever balance. Hence a pre-flight gate,
+/// not an error at the third `build_colored_tier`.
+pub fn colored_ladder_floor(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
+    3 * (crate::rgb::colored_committed_fee(1, fee_rate_sats_per_vb) + mercurylib::tesr::P2A_VALUE)
+        + dust_limit
+}
+
+/// Dust floor used by [`colored_ladder_floor`] — the final state output must be spendable.
+pub const COLORED_LADDER_DUST: u64 = 330;
+
+/// One coloured tier, built and coloured but NOT yet co-signed.
+#[derive(Clone, Debug)]
+pub struct ColoredTierDraft {
+    pub tx_hex: String,
+    pub txid: String,
+    /// Post-colouring payload index — 1 for the standard one-payload tier, but READ from the
+    /// builder's return value, never assumed.
+    pub payload_vout: u32,
+    pub payload_value: u64,
+    pub payload_spk_hex: String,
+    pub consignment: String,
+}
+
+/// A complete COLOURED ladder, built and coloured, awaiting its three SE co-signs.
+///
+/// **Why the build and the co-sign are separate phases.** Colouring needs the RGB engine; co-signing
+/// needs the network. Interleaving them would mean holding the engine handle across an `await`, and
+/// the engine's resolver is `!Sync`, so the resulting future is not `Send` and cannot live in the
+/// SDK's background task. Splitting is also free: a tier's txid is stable across signing (a taproot
+/// key-spend adds only witness data), so the whole chain can be built before any of it is signed.
+#[derive(Clone, Debug)]
+pub struct ColoredLadderDraft {
+    pub statechain_id: String,
+    pub network: String,
+    pub fee_rate: f64,
+    pub agg_address: String,
+    pub owner_exit_address: String,
+    pub f_txid: String,
+    pub f_vout: u32,
+    pub f_value: u64,
+    pub csv_e: u16,
+    pub csv_d: u16,
+    pub contract_id: String,
+    pub amount: u64,
+    pub trigger: ColoredTierDraft,
+    pub extension: ColoredTierDraft,
+    pub state: ColoredTierDraft,
+}
+
+/// **Build a COLOURED (CTES-R) ladder over an RGB carrier** — `T`, `X_0` and `S_0` each carrying a
+/// valid RGB state transition, so laddering the carrier MOVES the allocation instead of destroying
+/// it. Synchronous, engine-only, and it co-signs NOTHING.
+///
+/// The shape differs from [`establish`] in exactly three ways, and in nothing else:
+///
+/// 1. every tier is built by [`crate::rgb::build_colored_tier`] rather than
+///    `mercurylib::tesr::build_{trigger,extension,state}`, so it carries an `opret` commitment and a
+///    per-tier seal blinding derived from [`crate::rgb::TierSeal`];
+/// 2. the payload therefore sits at **vout 1**, not 0 — and that value is taken from the builder's
+///    RETURNED vout, never assumed (`opreturn_first` is triggered by the P2TR payload output, not by
+///    the P2A anchor, so "the opret is index 0" is a consequence, not a rule);
+/// 3. the committed fee is `committed_fee_for_outputs(n_payload + 1, rate)`.
+///
+/// Everything else — the co-sign flow, the tier CSVs, the census, `verify_bundle_bound` — is byte
+/// for byte the plain path. The SE stays BLIND: a coloured tier is still one input, one sighash, one
+/// [`cosign_tier`], so colouring adds **zero** SE co-signs and the census arithmetic is unchanged.
+///
+/// Rival tiers over one parent output are separated by the per-tier [`crate::rgb::TierSeal`]
+/// blinding, and `build_colored_tier` asserts at build time that each consignment carries its own
+/// tier's witness — so a derivation collision fails HERE, loudly, rather than at a receiver that can
+/// only report "not known to the resolver" (`docs/utexo/CTESR-GATE.md` §3.1).
+///
+/// `f_spk_hex` is `tx0.output[f_vout].script_pubkey` read from the chain — the prevout rgb-lib needs
+/// to know which allocation is being spent, and the value the trigger's sighash commits to.
+#[allow(clippy::too_many_arguments)]
+pub fn build_colored_ladder(
+    rgb: &mercury_rgb::RgbWallet,
+    coin: &Coin,
+    owner_exit_address: &str,
+    csv_e: u16,
+    csv_d: u16,
+    fee_rate: f64,
+    network: &str,
+    contract_id: &str,
+    rgb_amount: u64,
+    f_spk_hex: &str,
+) -> Result<ColoredLadderDraft> {
+    use crate::rgb::{
+        build_colored_tier, colored_tier_out_value, ColoredTier, ColoredTierSpec, TierRole,
+    };
+
+    let statechain_id =
+        coin.statechain_id.clone().ok_or_else(|| anyhow::anyhow!("no statechain_id"))?;
+    let f_txid = coin.utxo_txid.clone().ok_or_else(|| anyhow::anyhow!("no utxo_txid"))?;
+    let f_vout = coin.utxo_vout.ok_or_else(|| anyhow::anyhow!("no utxo_vout"))?;
+    let f_value = coin.amount.ok_or_else(|| anyhow::anyhow!("no amount"))? as u64;
+    let agg =
+        coin.aggregated_address.clone().ok_or_else(|| anyhow::anyhow!("no aggregated_address"))?;
+    if rgb_amount == 0 {
+        return Err(anyhow::anyhow!(
+            "refusing to colour a ladder for a zero allocation — a coloured tier must assign a \
+             non-zero amount"
+        ));
+    }
+
+    // PRE-FLIGHT AFFORDABILITY. Ahead of everything; see `colored_ladder_floor`.
+    let floor = colored_ladder_floor(fee_rate, COLORED_LADDER_DUST);
+    if f_value < floor {
+        return Err(anyhow::anyhow!(
+            "carrier {statechain_id} holds {f_value} sat but a COLOURED three-tier ladder needs at \
+             least {floor} sat at {fee_rate} sat/vB (each coloured rung costs {} sat: fee {} + \
+             anchor {}) — refusing before any SE co-sign, because a ladder abandoned at rung 3 \
+             leaves num_sigs permanently ahead of any persistable bundle",
+            crate::rgb::colored_committed_fee(1, fee_rate) + mercurylib::tesr::P2A_VALUE,
+            crate::rgb::colored_committed_fee(1, fee_rate),
+            mercurylib::tesr::P2A_VALUE
+        ));
+    }
+
+    let draft_of = |t: ColoredTier| ColoredTierDraft {
+        tx_hex: t.tx_hex,
+        txid: t.txid,
+        payload_vout: t.payloads[0].vout,
+        payload_value: t.payloads[0].value,
+        payload_spk_hex: t.payloads[0].script_pubkey_hex.clone(),
+        consignment: t.consignment,
+    };
+
+    // ---- TRIGGER: spends F, no relative timelock, pays A, carries the whole allocation. ----------
+    let t_value = colored_tier_out_value(f_value, fee_rate)
+        .ok_or_else(|| anyhow::anyhow!("F ({f_value} sat) cannot carry a coloured trigger"))?;
+    let trigger = draft_of(build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id,
+            prev_txid: &f_txid,
+            prev_vout: f_vout,
+            prev_value: f_value,
+            prev_spk_hex: f_spk_hex,
+            sequence: mercurylib::tesr::TRIGGER_SEQUENCE.0,
+            payloads: &[(agg.clone(), t_value, rgb_amount)],
+            network,
+            fee_rate,
+            // Belt-and-braces second separator (CTESR-GATE §3.1). The TierSeal is what the receiver
+            // re-derives; the nonce only makes a collision even less reachable.
+            nonce: Some(0),
+        },
+        &colored_tier_seal(&statechain_id, TierRole::Trigger, 0, 0, None),
+    )?);
+
+    // ---- EXTENSION X_0: spends T's PAYLOAD output (vout 1, as returned), pays A. -----------------
+    let x_value = colored_tier_out_value(trigger.payload_value, fee_rate)
+        .ok_or_else(|| anyhow::anyhow!("the coloured trigger cannot carry an extension"))?;
+    let extension = draft_of(build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id,
+            prev_txid: &trigger.txid,
+            prev_vout: trigger.payload_vout,
+            prev_value: trigger.payload_value,
+            prev_spk_hex: &trigger.payload_spk_hex,
+            sequence: mercurylib::tesr::csv_blocks(csv_e).0,
+            payloads: &[(agg.clone(), x_value, rgb_amount)],
+            network,
+            fee_rate,
+            nonce: Some(csv_e as u64),
+        },
+        &colored_tier_seal(&statechain_id, TierRole::Extension, 0, 0, Some(csv_e)),
+    )?);
+
+    // ---- STATE S_0: spends X_0's PAYLOAD output, pays the OWNER's exit key. ----------------------
+    let s_value = colored_tier_out_value(extension.payload_value, fee_rate)
+        .ok_or_else(|| anyhow::anyhow!("the coloured extension cannot carry a state"))?;
+    let state = draft_of(build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id,
+            prev_txid: &extension.txid,
+            prev_vout: extension.payload_vout,
+            prev_value: extension.payload_value,
+            prev_spk_hex: &extension.payload_spk_hex,
+            sequence: mercurylib::tesr::csv_blocks(csv_d).0,
+            payloads: &[(owner_exit_address.to_string(), s_value, rgb_amount)],
+            network,
+            fee_rate,
+            nonce: Some(csv_d as u64),
+        },
+        &colored_tier_seal(&statechain_id, TierRole::State, 0, 0, Some(csv_d)),
+    )?);
+
+    Ok(ColoredLadderDraft {
+        statechain_id,
+        network: network.to_string(),
+        fee_rate,
+        agg_address: agg,
+        owner_exit_address: owner_exit_address.to_string(),
+        f_txid,
+        f_vout,
+        f_value,
+        csv_e,
+        csv_d,
+        contract_id: contract_id.to_string(),
+        amount: rgb_amount,
+        trigger,
+        extension,
+        state,
+    })
+}
+
+/// [`build_colored_ladder`] on the network's canonical schedule — the coloured sibling of
+/// [`establish_auto`]'s parameter choice.
+pub fn build_colored_ladder_auto(
+    rgb: &mercury_rgb::RgbWallet,
+    coin: &Coin,
+    owner_exit_address: &str,
+    network: &str,
+    contract_id: &str,
+    rgb_amount: u64,
+    f_spk_hex: &str,
+) -> Result<ColoredLadderDraft> {
+    let p = mercurylib::tesr::TesrParams::for_network(network);
+    build_colored_ladder(
+        rgb,
+        coin,
+        owner_exit_address,
+        p.ext_csv(0),
+        p.state_csv(0),
+        p.committed_fee_rate,
+        network,
+        contract_id,
+        rgb_amount,
+        f_spk_hex,
+    )
+}
+
+/// Blind-co-sign the three tiers of a [`ColoredLadderDraft`] and assemble the persistable
+/// [`TesrBundle`]. Exactly three `cosign_tier` round-trips — the same number, in the same order, as
+/// the plain [`establish`]. The SE never learns that anything is coloured.
+///
+/// ## The census, spelled out (it is the thing most likely to be got wrong)
+///
+/// `verify_bundle_bound` enforces `se_num_sigs == flat_backups + tiers + superseded`. For a coloured
+/// coin every term is IDENTICAL to a plain one:
+///
+/// * `flat_backups` STAYS the deposit-anchored chain length. It is tempting to reason "a coloured
+///   coin's flat backup is an RGB-unaware spend of `F`, so a coloured ladder must not carry one" and
+///   pass 0 — but `tx1` was co-signed at deposit-init, before the coin had any RGB on it, and that
+///   co-sign is permanent and un-retractable. Passing 0 makes `expected = 3` against a live
+///   `num_sigs` of 4, and EVERY coloured coin then dies at claim with "num_sigs mismatch". There is
+///   no way to un-count `tx1`.
+/// * `tiers` is 3, because colouring adds no co-sign: one input, one sighash, one `cosign_tier`.
+/// * `superseded` is 0 at establish.
+///
+/// So: deposit `1 = 1 + 0 + 0`; after this call `4 = 1 + 3 + 0`. Balanced, and identical to plain.
+///
+/// The retained flat backups are still a live, allocation-destroying spend of `F` that the owner
+/// holds — they must never be the recommended exit for a coloured coin, and `unilateral_exit`'s
+/// non-laddered fallback must never reach one. That is a SAFETY property of the exit path, not an
+/// arithmetic one, and it is why the coloured coin's other spend lanes are refused (see
+/// [`refuse_uncolored_over_colored`] and the SDK's colored-split interlock).
+pub async fn cosign_colored_ladder(
+    cc: &ClientConfig,
+    coin: &mut Coin,
+    draft: ColoredLadderDraft,
+) -> Result<TesrBundle> {
+    let t_signed =
+        cosign_tier(cc, coin, draft.trigger.tx_hex.clone(), draft.f_value, &draft.network).await?;
+    let x_signed = cosign_tier(
+        cc,
+        coin,
+        draft.extension.tx_hex.clone(),
+        draft.trigger.payload_value,
+        &draft.network,
+    )
+    .await?;
+    let s_signed = cosign_tier(
+        cc,
+        coin,
+        draft.state.tx_hex.clone(),
+        draft.extension.payload_value,
+        &draft.network,
+    )
+    .await?;
+
+    let bundle = TesrBundle {
+        version: TESR_BUNDLE_VERSION,
+        statechain_id: draft.statechain_id,
+        network: draft.network.clone(),
+        fee_rate: draft.fee_rate,
+        agg_address: draft.agg_address,
+        owner_exit_address: draft.owner_exit_address,
+        f_txid: draft.f_txid,
+        f_vout: draft.f_vout,
+        f_value: draft.f_value,
+        trigger: TesrTier {
+            txid: draft.trigger.txid,
+            signed_tx: t_signed,
+            out_value: draft.trigger.payload_value,
+            csv: None,
+            payload_vout: draft.trigger.payload_vout,
+        },
+        levels: vec![TesrLevel {
+            extension: TesrTier {
+                txid: draft.extension.txid,
+                signed_tx: x_signed,
+                out_value: draft.extension.payload_value,
+                csv: Some(draft.csv_e),
+                payload_vout: draft.extension.payload_vout,
+            },
+            state: TesrTier {
+                txid: draft.state.txid,
+                signed_tx: s_signed,
+                out_value: draft.state.payload_value,
+                csv: Some(draft.csv_d),
+                payload_vout: draft.state.payload_vout,
+            },
+        }],
+        m: 0,
+        superseded_states: Vec::new(),
+        superseded_extensions: Vec::new(),
+        params: mercurylib::tesr::TesrParams::for_network(&draft.network),
+        rgb: Some(ColoredLadder {
+            contract_id: draft.contract_id,
+            amount: draft.amount,
+            // exit-tier order: [trigger, ext_0, state_0]
+            consignments: vec![
+                draft.trigger.consignment,
+                draft.extension.consignment,
+                draft.state.consignment,
+            ],
+        }),
+    };
+    // Self-check with the SAME predicate a receiver runs. Colouring shifts every payload vout, so a
+    // mis-threaded index would only surface at the far end; catch it here, while the co-signs are
+    // still ours to explain. `flat_backups = 1` (the deposit-anchored tx1) + 3 tiers + 0 superseded.
+    verify_bundle(&bundle, 4, 1).map_err(|e| {
+        anyhow::anyhow!("the coloured ladder just built does not verify as an exit chain: {e}")
+    })?;
+    Ok(bundle)
+}
+
+/// **The CTES-R interlock.** Refuse an operation that would build an UNCOLOURED tier over a coloured
+/// ladder — the shape that destroys the allocation on first exit.
+///
+/// Every renewal/rollover/transfer/split path replaces a tier over an existing parent output. On a
+/// plain ladder that is routine. On a COLOURED ladder an uncoloured replacement is an
+/// allocation-destroying spend of a sealed UTXO, and it would be **silent**: the transaction is
+/// perfectly valid Bitcoin and every existing check passes. There is no coloured builder for those
+/// paths yet, so they refuse.
+pub fn refuse_uncolored_over_colored(bundle: &TesrBundle, what: &str) -> Result<()> {
+    if bundle.is_colored() {
+        return Err(anyhow::anyhow!(
+            "{what}: this coin's ladder is COLOURED (CTES-R) and {what} would build an UNCOLOURED \
+             tier over a sealed output, destroying the RGB allocation. Refusing — the coloured \
+             replacement path is not implemented yet."
+        ));
+    }
+    Ok(())
+}
+
+// =================================================================================================
+// CTES-R — colour the RIVAL-TIER paths: renewal and transfer.
+//
+// Renewal replaces `X_m` over `T`'s payload output; a transfer co-signs a fresh `S_k` one delta
+// LOWER over `X_m`'s payload output and discloses the replaced state as superseded. Both produce
+// RIVAL transitions over ONE parent outpoint — the case CTESR-GATE §2.2 proved collapses without
+// per-tier blinding. `colored_tier_seal` is what separates them, and the rung it derives from
+// (`m ‖ csv`) is exactly the pair the plain protocol already forces to differ between rivals.
+//
+// Every builder here is SYNCHRONOUS and engine-only; every co-signer is async and network-only. The
+// split is not cosmetic: the RGB engine's resolver is `!Sync`, so holding its guard across an
+// `await` makes the whole future non-`Send` and it cannot live in the SDK's background task. It is
+// free, because a tier's txid is stable across signing.
+// =================================================================================================
+
+/// The PAYLOAD output of an already-built tier, as `(value, scriptPubKey hex)` — read from the
+/// transaction, never from the declared `out_value`. A coloured child needs both: the value feeds the
+/// fee arithmetic and the taproot sighash, the script is the prevout rgb-lib must see.
+fn tier_payload_prevout(tier: &TesrTier, what: &str) -> Result<(u64, String)> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let raw = hex::decode(&tier.signed_tx)
+        .map_err(|_| anyhow::anyhow!("{what}: tier hex does not decode"))?;
+    let tx: Transaction =
+        deserialize(&raw).map_err(|_| anyhow::anyhow!("{what}: tier tx does not parse"))?;
+    if tx.txid().to_string() != tier.txid {
+        return Err(anyhow::anyhow!(
+            "{what}: stored tier tx hashes to {} but the bundle names {}",
+            tx.txid(),
+            tier.txid
+        ));
+    }
+    let out = tier.payload_out(&tx, what)?;
+    if out.value != tier.out_value {
+        return Err(anyhow::anyhow!(
+            "{what}: declared out_value {} disagrees with the transaction's {} at vout {}",
+            tier.out_value,
+            out.value,
+            tier.payload_vout
+        ));
+    }
+    Ok((out.value, hex::encode(out.script_pubkey.as_bytes())))
+}
+
+/// A COLOURED replacement STATE, built but NOT co-signed — the receiver-paying `S'` of a coloured
+/// transfer, or any other state that rivals the current one over the extension's payload output.
+#[derive(Clone, Debug)]
+pub struct ColoredStateDraft {
+    pub statechain_id: String,
+    /// The plain address this state pays, already resolved from the recipient's transfer address.
+    pub payee: String,
+    /// The new state's relative timelock — strictly LOWER than the state it replaces, which is both
+    /// the protocol's race rule and (via the seal rung) what keeps the two transitions apart.
+    pub csv: u16,
+    /// The extension whose payload output this state spends, for the co-signer's fail-closed recheck.
+    pub parent_txid: String,
+    pub parent_vout: u32,
+    pub parent_value: u64,
+    pub tier: ColoredTierDraft,
+}
+
+/// **Colour the receiver-paying state `S'` of a transfer.** The coloured sibling of
+/// [`presign_receiver_state`]'s build half: engine-only, synchronous, co-signs nothing.
+///
+/// `S'` is a RIVAL of the sender's own current state over `X_m`'s payload output. It is separated
+/// from it by the seal rung, which folds in the new CSV — and the new CSV is strictly lower by
+/// construction (`cur − δ`), because the protocol already requires the receiver's state to mature
+/// FIRST or the sender's retained state could win the race.
+pub fn build_colored_receiver_state(
+    rgb: &mercury_rgb::RgbWallet,
+    bundle: &TesrBundle,
+    recipient_address: &str,
+) -> Result<ColoredStateDraft> {
+    use crate::rgb::{build_colored_tier, colored_tier_out_value, ColoredTierSpec, TierRole};
+
+    if !bundle.is_colored() {
+        return Err(anyhow::anyhow!(
+            "build_colored_receiver_state: this coin's ladder is PLAIN — use presign_receiver_state"
+        ));
+    }
+    // Reuses the coloured seal schedule's single-level invariant (and its reasoning).
+    let _ = bundle.colored_tier_seals()?;
+    let rgb_half = bundle.rgb.as_ref().expect("is_colored");
+    let p = bundle.params;
+    let cur_csv = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+    let new_csv = cur_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| {
+            anyhow::anyhow!("state CSV at the floor — renew before transferring this carrier")
+        })?;
+    let payee = mercurylib::tesr::payee_address(recipient_address, &bundle.network)?;
+
+    let ext = bundle.current().extension.clone();
+    let (parent_value, parent_spk) = tier_payload_prevout(&ext, "coloured transfer parent")?;
+    let s_value = colored_tier_out_value(parent_value, bundle.fee_rate).ok_or_else(|| {
+        anyhow::anyhow!("the coloured extension ({parent_value} sat) cannot carry another state")
+    })?;
+    let seal = colored_tier_seal(
+        &bundle.statechain_id,
+        TierRole::State,
+        0,
+        bundle.m,
+        Some(new_csv),
+    );
+    let tier = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &ext.txid,
+            prev_vout: ext.payload_vout,
+            prev_value: parent_value,
+            prev_spk_hex: &parent_spk,
+            sequence: mercurylib::tesr::csv_blocks(new_csv).0,
+            payloads: &[(payee.clone(), s_value, rgb_half.amount)],
+            network: &bundle.network,
+            fee_rate: bundle.fee_rate,
+            nonce: Some(seal.rung as u64),
+        },
+        &seal,
+    )?;
+    Ok(ColoredStateDraft {
+        statechain_id: bundle.statechain_id.clone(),
+        payee,
+        csv: new_csv,
+        parent_txid: ext.txid,
+        parent_vout: ext.payload_vout,
+        parent_value,
+        tier: ColoredTierDraft {
+            tx_hex: tier.tx_hex,
+            txid: tier.txid,
+            payload_vout: tier.payloads[0].vout,
+            payload_value: tier.payloads[0].value,
+            payload_spk_hex: tier.payloads[0].script_pubkey_hex.clone(),
+            consignment: tier.consignment,
+        },
+    })
+}
+
+/// Blind-co-sign a [`ColoredStateDraft`] and return the AUGMENTED bundle to convey — the coloured
+/// sibling of [`presign_receiver_state`]'s co-sign half. Exactly one `cosign_tier` round-trip, the
+/// same as the plain path; the SE never learns that anything is coloured.
+///
+/// Everything the draft asserts is RE-CHECKED here against the bundle and the recipient address the
+/// caller actually asked for, because a draft is built in one place (the SDK, holding the engine) and
+/// consumed in another. A mismatch is a refusal, never a rebuild.
+pub async fn cosign_colored_receiver_state(
+    cc: &ClientConfig,
+    coin: &Coin,
+    bundle: &TesrBundle,
+    draft: ColoredStateDraft,
+    recipient_address: &str,
+) -> Result<TesrBundle> {
+    let rgb_half = bundle
+        .rgb
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cosign_colored_receiver_state on a PLAIN ladder"))?;
+    if draft.statechain_id != bundle.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured state draft is for {} but the bundle is {}",
+            draft.statechain_id,
+            bundle.statechain_id
+        ));
+    }
+    let want_payee = mercurylib::tesr::payee_address(recipient_address, &bundle.network)?;
+    if draft.payee != want_payee {
+        return Err(anyhow::anyhow!(
+            "coloured state draft pays {} but this transfer is to {want_payee} — refusing",
+            draft.payee
+        ));
+    }
+    let ext = bundle.current().extension.clone();
+    if draft.parent_txid != ext.txid || draft.parent_vout != ext.payload_vout {
+        return Err(anyhow::anyhow!(
+            "coloured state draft spends {}:{} but the ladder's current extension output is {}:{}",
+            draft.parent_txid,
+            draft.parent_vout,
+            ext.txid,
+            ext.payload_vout
+        ));
+    }
+    let cur_csv = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+    if draft.csv >= cur_csv {
+        return Err(anyhow::anyhow!(
+            "coloured state draft's CSV {} does not out-race the state it replaces ({cur_csv})",
+            draft.csv
+        ));
+    }
+
+    let mut c = coin.clone();
+    let s_signed =
+        cosign_tier(cc, &mut c, draft.tier.tx_hex.clone(), draft.parent_value, &bundle.network)
+            .await?;
+
+    let mut b = bundle.clone();
+    b.owner_exit_address = draft.payee;
+    let last = b.levels.len() - 1;
+    // Full disclosure, exactly as the plain path: the sender's own (now stale) state was co-signed,
+    // so it must stay counted — and it sits at a HIGHER CSV than S', so it loses the maturity race.
+    b.superseded_states.push(b.levels[last].state.clone());
+    b.levels[last].state = TesrTier {
+        txid: draft.tier.txid,
+        signed_tx: s_signed,
+        out_value: draft.tier.payload_value,
+        csv: Some(draft.csv),
+        payload_vout: draft.tier.payload_vout,
+    };
+    // The leaf consignment is replaced, not appended: `consignments` is indexed by `exit_tiers()`.
+    let mut consignments = rgb_half.consignments.clone();
+    let n = consignments.len();
+    if n == 0 {
+        return Err(anyhow::anyhow!("coloured ladder carries no consignments"));
+    }
+    consignments[n - 1] = draft.tier.consignment;
+    b.rgb = Some(ColoredLadder { consignments, ..rgb_half });
+    Ok(b)
+}
+
+/// A COLOURED renewal — a fresh extension `X_{m+1}` over `T`'s payload output plus the state that
+/// hangs off it, built but NOT co-signed.
+#[derive(Clone, Debug)]
+pub struct ColoredRenewalDraft {
+    pub statechain_id: String,
+    pub csv_e: u16,
+    pub csv_d: u16,
+    /// The renewal counter the seals were derived at (`bundle.m + 1`).
+    pub m: u32,
+    pub parent_txid: String,
+    pub parent_vout: u32,
+    pub parent_value: u64,
+    pub extension: ColoredTierDraft,
+    pub state: ColoredTierDraft,
+}
+
+/// **Colour an off-chain RENEWAL.** The new extension `X_{m+1}` is a RIVAL of `X_m` over `T`'s
+/// payload output — the textbook case CTESR-GATE §2.2 measured collapsing under a shared blinding.
+/// Two independent things separate them here: the renewal counter and the (strictly lower) CSV, both
+/// folded into the seal rung, and both re-derivable by a receiver from the bundle it is handed.
+pub fn build_colored_renewal(
+    rgb: &mercury_rgb::RgbWallet,
+    bundle: &TesrBundle,
+    csv_e_new: u16,
+    csv_d: u16,
+) -> Result<ColoredRenewalDraft> {
+    use crate::rgb::{build_colored_tier, colored_tier_out_value, ColoredTierSpec, TierRole};
+
+    if !bundle.is_colored() {
+        return Err(anyhow::anyhow!("build_colored_renewal: this coin's ladder is PLAIN"));
+    }
+    let _ = bundle.colored_tier_seals()?;
+    let rgb_half = bundle.rgb.as_ref().expect("is_colored");
+    let cur_csv_e = bundle
+        .current()
+        .extension
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current extension has no CSV"))?;
+    if csv_e_new >= cur_csv_e {
+        return Err(anyhow::anyhow!(
+            "a renewal's extension CSV ({csv_e_new}) must be strictly lower than the one it \
+             replaces ({cur_csv_e}) — otherwise the superseded extension can still win the race \
+             for T's payload output, and the two transitions would not be separated either"
+        ));
+    }
+    // The renewal's extension rivals X_m over the TRIGGER's payload output (single-level ladder).
+    let (parent_value, parent_spk) =
+        tier_payload_prevout(&bundle.trigger, "coloured renewal parent")?;
+    let m_new = bundle.m + 1;
+
+    let x_value = colored_tier_out_value(parent_value, bundle.fee_rate).ok_or_else(|| {
+        anyhow::anyhow!("the coloured trigger ({parent_value} sat) cannot carry another extension")
+    })?;
+    let x_seal =
+        colored_tier_seal(&bundle.statechain_id, TierRole::Extension, 0, m_new, Some(csv_e_new));
+    let x = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &bundle.trigger.txid,
+            prev_vout: bundle.trigger.payload_vout,
+            prev_value: parent_value,
+            prev_spk_hex: &parent_spk,
+            sequence: mercurylib::tesr::csv_blocks(csv_e_new).0,
+            payloads: &[(bundle.agg_address.clone(), x_value, rgb_half.amount)],
+            network: &bundle.network,
+            fee_rate: bundle.fee_rate,
+            nonce: Some(x_seal.rung as u64),
+        },
+        &x_seal,
+    )?;
+
+    let s_value = colored_tier_out_value(x.payloads[0].value, bundle.fee_rate)
+        .ok_or_else(|| anyhow::anyhow!("the renewed coloured extension cannot carry a state"))?;
+    let s_seal = colored_tier_seal(&bundle.statechain_id, TierRole::State, 0, m_new, Some(csv_d));
+    let s = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &x.txid,
+            prev_vout: x.payloads[0].vout,
+            prev_value: x.payloads[0].value,
+            prev_spk_hex: &x.payloads[0].script_pubkey_hex,
+            sequence: mercurylib::tesr::csv_blocks(csv_d).0,
+            payloads: &[(bundle.owner_exit_address.clone(), s_value, rgb_half.amount)],
+            network: &bundle.network,
+            fee_rate: bundle.fee_rate,
+            nonce: Some(s_seal.rung as u64),
+        },
+        &s_seal,
+    )?;
+
+    let draft_of = |t: crate::rgb::ColoredTier| ColoredTierDraft {
+        tx_hex: t.tx_hex,
+        txid: t.txid,
+        payload_vout: t.payloads[0].vout,
+        payload_value: t.payloads[0].value,
+        payload_spk_hex: t.payloads[0].script_pubkey_hex.clone(),
+        consignment: t.consignment,
+    };
+    Ok(ColoredRenewalDraft {
+        statechain_id: bundle.statechain_id.clone(),
+        csv_e: csv_e_new,
+        csv_d,
+        m: m_new,
+        parent_txid: bundle.trigger.txid.clone(),
+        parent_vout: bundle.trigger.payload_vout,
+        parent_value,
+        extension: draft_of(x),
+        state: draft_of(s),
+    })
+}
+
+/// [`build_colored_renewal`] on the network's canonical schedule — the coloured sibling of
+/// [`renew_auto`]'s parameter choice.
+pub fn build_colored_renewal_auto(
+    rgb: &mercury_rgb::RgbWallet,
+    bundle: &TesrBundle,
+) -> Result<ColoredRenewalDraft> {
+    let p = bundle.params;
+    let next_m = (bundle.m + 1) as u16;
+    build_colored_renewal(rgb, bundle, p.ext_csv(next_m), p.state_csv(0))
+}
+
+/// Blind-co-sign a [`ColoredRenewalDraft`] into `bundle` — two `cosign_tier` round-trips, exactly as
+/// the plain [`renew`]. Persist the bundle afterwards.
+pub async fn cosign_colored_renewal(
+    cc: &ClientConfig,
+    coin: &mut Coin,
+    bundle: &mut TesrBundle,
+    draft: ColoredRenewalDraft,
+) -> Result<()> {
+    let rgb_half = bundle
+        .rgb
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cosign_colored_renewal on a PLAIN ladder"))?;
+    if draft.statechain_id != bundle.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured renewal draft is for {} but the bundle is {}",
+            draft.statechain_id,
+            bundle.statechain_id
+        ));
+    }
+    if draft.parent_txid != bundle.trigger.txid || draft.parent_vout != bundle.trigger.payload_vout {
+        return Err(anyhow::anyhow!(
+            "coloured renewal draft spends {}:{} but the ladder's trigger output is {}:{}",
+            draft.parent_txid,
+            draft.parent_vout,
+            bundle.trigger.txid,
+            bundle.trigger.payload_vout
+        ));
+    }
+    if draft.m != bundle.m + 1 {
+        return Err(anyhow::anyhow!(
+            "coloured renewal draft derived its seals at m={} but this bundle is at m={} — the \
+             receiver would derive a different blinding and could not open the ladder",
+            draft.m,
+            bundle.m
+        ));
+    }
+
+    let x_signed = cosign_tier(
+        cc,
+        coin,
+        draft.extension.tx_hex.clone(),
+        draft.parent_value,
+        &bundle.network,
+    )
+    .await?;
+    let s_signed = cosign_tier(
+        cc,
+        coin,
+        draft.state.tx_hex.clone(),
+        draft.extension.payload_value,
+        &bundle.network,
+    )
+    .await?;
+
+    let last = bundle.levels.len() - 1;
+    bundle.superseded_extensions.push(bundle.levels[last].extension.clone());
+    bundle.superseded_states.push(bundle.levels[last].state.clone());
+    bundle.levels[last] = TesrLevel {
+        extension: TesrTier {
+            txid: draft.extension.txid,
+            signed_tx: x_signed,
+            out_value: draft.extension.payload_value,
+            csv: Some(draft.csv_e),
+            payload_vout: draft.extension.payload_vout,
+        },
+        state: TesrTier {
+            txid: draft.state.txid,
+            signed_tx: s_signed,
+            out_value: draft.state.payload_value,
+            csv: Some(draft.csv_d),
+            payload_vout: draft.state.payload_vout,
+        },
+    };
+    bundle.m = draft.m;
+    // exit-tier order: [trigger, ext, state] — the trigger's consignment is untouched.
+    bundle.rgb = Some(ColoredLadder {
+        consignments: vec![
+            rgb_half
+                .consignments
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("coloured ladder carries no trigger consignment"))?,
+            draft.extension.consignment,
+            draft.state.consignment,
+        ],
+        ..rgb_half
+    });
+    Ok(())
 }
 
 /// Establish a coin's ladder using its network's canonical [`TesrParams`] schedule (initial extension
@@ -322,6 +1276,7 @@ pub async fn in_ladder_split(
     bundle: &TesrBundle,
     children: &mut [(Coin, String, u64)],
 ) -> Result<Vec<ChildTesrBundle>> {
+    refuse_uncolored_over_colored(bundle, "in_ladder_split")?;
     let p = bundle.params;
     let x_m = bundle.current().extension.clone();
     let s0_csv = bundle
@@ -993,6 +1948,7 @@ pub async fn renew(
     csv_e_new: u16,
     csv_d: u16,
 ) -> Result<()> {
+    refuse_uncolored_over_colored(bundle, "renew")?;
     let (parent_txid, parent_val) = bundle.current_parent();
     let x = mercurylib::tesr::build_extension(&parent_txid, parent_val, &bundle.agg_address, &bundle.network, csv_e_new, bundle.fee_rate)?;
     let x_signed = cosign_tier(cc, coin, x.tx_hex.clone(), parent_val, &bundle.network).await?;
@@ -1022,6 +1978,7 @@ pub async fn rollover(
     csv_e: u16,
     csv_d: u16,
 ) -> Result<()> {
+    refuse_uncolored_over_colored(bundle, "rollover")?;
     let p = bundle.params;
     let cur_ext = bundle.current().extension.clone();
     let cur_state_csv = bundle
@@ -1083,6 +2040,7 @@ pub async fn presign_receiver_state(
     bundle: &TesrBundle,
     recipient_address: &str,
 ) -> Result<TesrBundle> {
+    refuse_uncolored_over_colored(bundle, "presign_receiver_state")?;
     let p = bundle.params;
     let cur_csv = bundle.current().state.csv.ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
     let new_csv = cur_csv
@@ -1116,6 +2074,10 @@ pub async fn cosign_detrigger(
     bundle: &TesrBundle,
     to_address: &str,
 ) -> Result<String> {
+    // A coloured trigger carries the opret at index 0, so `build_detrigger`'s uncoloured
+    // `UNCOLORED_PAYLOAD_VOUT` prevout would name an OP_RETURN — an unspendable, dead transaction
+    // that nonetheless BURNS an irreversible SE co-sign and unbalances the census. Refuse.
+    refuse_uncolored_over_colored(bundle, "cosign_detrigger")?;
     let de = mercurylib::tesr::build_detrigger(&bundle.trigger.txid, bundle.trigger.out_value, to_address, &bundle.network, bundle.fee_rate)?;
     cosign_tier(cc, coin, de.tx_hex.clone(), bundle.trigger.out_value, &bundle.network).await
 }
@@ -1925,6 +2887,9 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
     if tiers.len() < 3 || (tiers.len() - 1) % 2 != 0 {
         return Err(anyhow::anyhow!("malformed ladder: expected trigger + N*(extension,state)"));
     }
+    // [CTES-R] Colour is STRUCTURAL, and it is checked on every acceptance path (claim + SSP
+    // pre-pay), colour-blind and with no RGB engine. See `verify_colored_shape`.
+    verify_colored_shape(bundle)?;
 
     let txs: Vec<Transaction> = tiers
         .iter()
@@ -2068,6 +3033,103 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
             "num_sigs mismatch: SE issued {se_num_sigs}, disclosed tiers+backups account for {expected} — possible hidden state"
         ));
     }
+    Ok(())
+}
+
+/// **[CTES-R] The structural half of colour, enforced with no RGB engine and no network.**
+///
+/// `verify_bundle_bound` binds a ladder's SATS to the coin. It is entirely colour-blind, and it must
+/// stay that way — so this is what stops the two ways a conveyed bundle can lie about colour, both of
+/// which are silent at every other check:
+///
+/// * **claiming colour it does not carry** — a bundle with an `rgb` half whose tiers carry no opret,
+///   or whose consignment list does not line up one-for-one with `exit_tiers()`. The receiver would
+///   derive seals for tiers that commit to nothing and book an allocation that no transition moves.
+/// * **carrying colour it does not claim** — a bundle with `rgb: None` whose tiers DO carry oprets.
+///   That is a coloured ladder conveyed as plain: the receiver binds the sats, runs no consignment
+///   validation at all, and the asset half is simply unaccounted for.
+///
+/// It also pins the single-level invariant that [`TesrBundle::colored_tier_seals`] depends on, so a
+/// bundle whose seals cannot be derived is rejected by the census rather than at accept time.
+///
+/// Deliberately NOT checked here: that the consignments are valid RGB, or that they assign anything
+/// to anyone. That needs the engine and belongs to the SDK's token hook — this is the gate that runs
+/// everywhere, including in the SSP's pre-payment census where there is no wallet at all.
+fn verify_colored_shape(bundle: &TesrBundle) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let tiers = bundle.exit_tiers();
+    let mut opret_count = 0usize;
+    for (i, tier) in tiers.iter().enumerate() {
+        let raw = hex::decode(&tier.signed_tx)
+            .map_err(|_| anyhow::anyhow!("tier {i}: hex does not decode"))?;
+        let tx: Transaction =
+            deserialize(&raw).map_err(|_| anyhow::anyhow!("tier {i}: tx does not parse"))?;
+        let oprets: Vec<usize> = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.script_pubkey.is_op_return())
+            .map(|(v, _)| v)
+            .collect();
+        match (bundle.is_colored(), oprets.len()) {
+            (true, 1) => {
+                if oprets[0] as u32 == tier.payload_vout {
+                    return Err(anyhow::anyhow!(
+                        "coloured tier {i} declares its payload at vout {} — that output is the RGB \
+                         opret commitment, which carries no value and cannot be spent",
+                        tier.payload_vout
+                    ));
+                }
+                opret_count += 1;
+            }
+            (true, n) => {
+                return Err(anyhow::anyhow!(
+                    "coloured tier {i} carries {n} OP_RETURN outputs, expected exactly 1 (the RGB \
+                     opret commitment)"
+                ))
+            }
+            (false, 0) => {}
+            (false, n) => {
+                return Err(anyhow::anyhow!(
+                    "tier {i} carries {n} OP_RETURN output(s) but this ladder is conveyed as PLAIN \
+                     — a coloured ladder passed off as plain would have its asset half validated by \
+                     nobody"
+                ))
+            }
+        }
+    }
+    let Some(rgb) = bundle.rgb.as_ref() else {
+        return Ok(());
+    };
+    if opret_count != tiers.len() {
+        return Err(anyhow::anyhow!("coloured ladder: not every tier carries an opret"));
+    }
+    if bundle.levels.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "coloured ladder has {} levels — coloured rollover does not exist, and a multi-level \
+             coloured bundle has no derivable seal schedule",
+            bundle.levels.len()
+        ));
+    }
+    if rgb.contract_id.trim().is_empty() {
+        return Err(anyhow::anyhow!("coloured ladder names no contract"));
+    }
+    if rgb.amount == 0 {
+        return Err(anyhow::anyhow!("coloured ladder carries a zero allocation"));
+    }
+    if rgb.consignments.len() != tiers.len() {
+        return Err(anyhow::anyhow!(
+            "coloured ladder carries {} consignments for {} tiers — they are indexed by exit order, \
+             so a mismatch means the receiver cannot tell which proof belongs to which tier",
+            rgb.consignments.len(),
+            tiers.len()
+        ));
+    }
+    if rgb.consignments.iter().any(|c| c.trim().is_empty()) {
+        return Err(anyhow::anyhow!("coloured ladder carries an empty consignment"));
+    }
+    // The seals must be derivable, since that is what the receiver will do.
+    bundle.colored_tier_seals()?;
     Ok(())
 }
 
@@ -2542,7 +3604,7 @@ mod verify_tests {
                 extension: TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)), payload_vout: x.payload_vout },
                 state: TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)), payload_vout: s.payload_vout },
             }],
-            m: 0, superseded_states: vec![], superseded_extensions: vec![], params: p,
+            m: 0, superseded_states: vec![], superseded_extensions: vec![], params: p, rgb: None,
         }
     }
 
@@ -2592,6 +3654,193 @@ mod verify_tests {
 
     fn reject_msg(r: Result<()>) -> String {
         r.expect_err("must be rejected").to_string()
+    }
+
+    // ---- CTES-R: colour the ladder (this commit). ----------------------------------------------
+
+    /// The coloured-rung price and the three-rung floor, pinned as arithmetic rather than prose.
+    /// `docs/utexo/CTESR-GATE.md` §3.4: the opret serialises to exactly `P2TR_OUT_VBYTES`, so a
+    /// coloured rung is `committed_fee_for_outputs(2, rate) + P2A_VALUE`.
+    #[test]
+    fn colored_rung_price_and_floor() {
+        let rate = 2.0;
+        let rung = crate::rgb::colored_committed_fee(1, rate) + mercurylib::tesr::P2A_VALUE;
+        assert_eq!(rung, 574, "a coloured rung at 2 sat/vB is (124+43)*2 + 240");
+        // Strictly dearer than an uncoloured rung, by exactly 43 * rate.
+        let plain = mercurylib::tesr::committed_fee(rate) + mercurylib::tesr::P2A_VALUE;
+        assert_eq!(rung - plain, 86, "the coloured surcharge is 43 vB * 2 sat/vB, independent of n");
+        assert_eq!(
+            colored_ladder_floor(rate, COLORED_LADDER_DUST),
+            3 * 574 + 330,
+            "three coloured rungs plus a spendable final output"
+        );
+        // The standard 1,500-sat token piece cannot afford a coloured ladder — the case that must
+        // be caught BEFORE the first co-sign, not at rung 3.
+        assert!(1_500 < colored_ladder_floor(rate, COLORED_LADDER_DUST));
+    }
+
+    /// A plain bundle is not coloured and every tier-replacing path stays open on it; a coloured one
+    /// refuses them all. This is the interlock that keeps an UNCOLOURED tier from ever being built
+    /// over a sealed output.
+    #[test]
+    fn colored_ladders_refuse_every_uncolored_replacement() {
+        let plain = sample_bundle();
+        assert!(!plain.is_colored());
+        for what in ["renew", "rollover", "presign_receiver_state", "in_ladder_split"] {
+            assert!(
+                refuse_uncolored_over_colored(&plain, what).is_ok(),
+                "a plain ladder must keep taking {what}"
+            );
+        }
+        let mut colored = sample_bundle();
+        colored.rgb = Some(ColoredLadder {
+            contract_id: "rgb:contract".into(),
+            amount: 1000,
+            consignments: vec!["a".into(), "b".into(), "c".into()],
+        });
+        assert!(colored.is_colored());
+        for what in ["renew", "rollover", "presign_receiver_state", "in_ladder_split"] {
+            let e = refuse_uncolored_over_colored(&colored, what)
+                .expect_err("a coloured ladder must refuse an uncoloured replacement")
+                .to_string();
+            assert!(e.contains("COLOURED") && e.contains(what), "unexpected refusal: {e}");
+        }
+    }
+
+    /// **RIVAL TIERS OVER ONE PARENT OUTPUT NEVER SHARE A BLINDING** — the whole point of
+    /// `colored_tier_seal`, pinned over the full renewal-and-transfer schedule rather than a pair.
+    ///
+    /// Over the trigger's payload output the rivals are the extensions of every renewal epoch; over
+    /// each extension's payload output they are the renewal's own state plus every transfer's `S'`.
+    /// The derivation must separate all of them, and it must also keep the two ROLES apart, since
+    /// `role` is the only thing distinguishing an extension from a state at the same `(m, csv)`.
+    #[test]
+    fn rival_tiers_over_one_parent_never_share_a_blinding() {
+        use crate::rgb::TierRole;
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let mut all: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut note = |b: u64, what: String| {
+            if let Some(prev) = all.insert(b, what.clone()) {
+                panic!("seal blinding collision: {what} and {prev} both derive {b}");
+            }
+        };
+        note(colored_tier_seal("sid", TierRole::Trigger, 0, 0, None).blinding(), "T".into());
+        // 10 renewal epochs, stepping the extension CSV by 1 (the shape sdk74 drives).
+        for m in 0..10u32 {
+            let csv_e = p.e0 - m as u16;
+            note(
+                colored_tier_seal("sid", TierRole::Extension, 0, m, Some(csv_e)).blinding(),
+                format!("X(m={m},csv={csv_e})"),
+            );
+            // At each epoch: the renewal's own state, then one `S'` per onward hop, each a delta lower.
+            for k in 0..3u16 {
+                let csv_d = p.state_csv(0) - k * p.delta;
+                note(
+                    colored_tier_seal("sid", TierRole::State, 0, m, Some(csv_d)).blinding(),
+                    format!("S(m={m},csv={csv_d})"),
+                );
+            }
+        }
+        // A DIFFERENT coin at the identical schedule must not collide with any of the above.
+        for m in 0..10u32 {
+            let csv_e = p.e0 - m as u16;
+            note(
+                colored_tier_seal("other", TierRole::Extension, 0, m, Some(csv_e)).blinding(),
+                format!("other X(m={m})"),
+            );
+        }
+    }
+
+    /// The seal schedule a RECEIVER derives is exactly the one the sender used, and it is refused
+    /// outright for a shape whose renewal counters cannot be reconstructed.
+    #[test]
+    fn a_receiver_derives_the_same_seals_and_refuses_what_it_cannot() {
+        use crate::rgb::TierRole;
+        let mut b = sample_bundle();
+        b.m = 4;
+        b.rgb = Some(ColoredLadder {
+            contract_id: "rgb:c".into(),
+            amount: 7,
+            consignments: vec!["a".into(), "b".into(), "c".into()],
+        });
+        let seals = b.colored_tier_seals().expect("single-level coloured ladder");
+        assert_eq!(seals.len(), 3);
+        assert_eq!(
+            seals[1].2,
+            colored_tier_seal("sid", TierRole::Extension, 0, 4, b.current().extension.csv)
+                .blinding(),
+            "the receiver's extension blinding must be the sender's"
+        );
+        assert_eq!(
+            seals[2].2,
+            colored_tier_seal("sid", TierRole::State, 0, 4, b.current().state.csv).blinding()
+        );
+        assert_ne!(seals[1].2, seals[2].2, "role must separate an extension from a state");
+        // A PLAIN ladder has no seals at all, and a multi-level coloured one is refused rather than
+        // guessed at (its per-level counters are unreconstructable — coloured rollover does not exist).
+        assert!(sample_bundle().colored_tier_seals().is_err());
+        let extra = b.levels[0].clone();
+        b.levels.push(extra);
+        assert!(b.colored_tier_seals().unwrap_err().to_string().contains("exactly one level"));
+    }
+
+    /// Colour is STRUCTURAL and is checked on every acceptance path, with no RGB engine: a bundle
+    /// cannot claim colour it does not carry, nor carry colour it does not claim.
+    #[test]
+    fn the_census_refuses_a_bundle_that_lies_about_colour() {
+        // A plain ladder passes unchanged — the gate costs the plain path nothing.
+        assert!(verify_colored_shape(&sample_bundle()).is_ok());
+
+        // CLAIMS colour, carries none: the sample tiers are `[payload, P2A]`, no opret. A receiver
+        // would derive seals for tiers that commit to nothing.
+        let mut lying = sample_bundle();
+        lying.rgb = Some(ColoredLadder {
+            contract_id: "rgb:c".into(),
+            amount: 1,
+            consignments: vec!["a".into(), "b".into(), "c".into()],
+        });
+        assert!(
+            reject_msg(verify_bundle(&lying, 3, 0)).contains("OP_RETURN"),
+            "a bundle claiming colour whose tiers carry no opret must be refused"
+        );
+
+        // CARRIES colour, claims none: `rgb: None` with opret-bearing tiers. That is a coloured
+        // ladder conveyed as plain — the receiver binds the sats and validates no asset at all.
+        let mut smuggled = sample_bundle();
+        {
+            use electrum_client::bitcoin::{consensus::deserialize, ScriptBuf, Transaction, TxOut};
+            let raw = hex::decode(&smuggled.trigger.signed_tx).unwrap();
+            let mut tx: Transaction = deserialize(&raw).unwrap();
+            tx.output.insert(
+                0,
+                TxOut { value: 0, script_pubkey: ScriptBuf::new_op_return(&[0u8; 32]) },
+            );
+            smuggled.trigger.payload_vout = 1;
+            smuggled.trigger.txid = tx.txid().to_string();
+            smuggled.trigger.signed_tx =
+                hex::encode(electrum_client::bitcoin::consensus::serialize(&tx));
+        }
+        assert!(
+            reject_msg(verify_bundle(&smuggled, 3, 0)).contains("conveyed as PLAIN"),
+            "a coloured tier smuggled into a bundle declared PLAIN must be refused"
+        );
+    }
+
+    /// The colour field is additive on the wire: a `tesr-` row persisted BEFORE CTES-R must keep
+    /// deserializing byte-identically, as a PLAIN ladder. `#[serde(default)]` is what guarantees it,
+    /// and this pins it so a future edit cannot quietly drop the attribute.
+    #[test]
+    fn pre_ctesr_bundles_still_deserialize_as_plain() {
+        let plain = sample_bundle();
+        let mut v: serde_json::Value = serde_json::to_value(&plain).unwrap();
+        // Exactly the shape a pre-CTES-R client wrote: no `rgb` key at all.
+        v.as_object_mut().unwrap().remove("rgb");
+        let back: TesrBundle = serde_json::from_value(v).unwrap();
+        assert!(!back.is_colored(), "an absent `rgb` field must mean PLAIN, never a parse failure");
+        assert_eq!(back.trigger.txid, plain.trigger.txid);
+        // And a plain bundle round-trips unchanged.
+        let round: TesrBundle = serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
+        assert_eq!(round.rgb, None);
     }
 
     // ---- payload_vout: every migrated site fails CLOSED with a named error (CTES-R commit 1). ----

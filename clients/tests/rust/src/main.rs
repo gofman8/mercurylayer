@@ -86,6 +86,8 @@ pub mod sdk70_verifier_binding_adversarial;
 pub mod sdk71_unconditional_ladder;
 pub mod sdk72_watchtower_failloud;
 pub mod sdk73_structural_recovery;
+pub mod sdk74_colored_ladder;
+pub mod sdk75_colored_exit;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -390,6 +392,23 @@ async fn main() -> Result<()> {
         sdk73_structural_recovery::execute().await?;
         return Ok(());
     }
+    // CTES-R colour the ladder (SDK_E2E=74): claim() establishes a COLOURED ladder over an RGB
+    // carrier — every tier carries a valid RGB state transition, opret at vout 0, payload at vout 1,
+    // fee committed_fee_for_outputs(n+1) — the plain path stays byte-identical, and the coloured
+    // lane is mutually exclusive with the legacy colored split.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("74") {
+        sdk74_colored_ladder::execute().await?;
+        return Ok(());
+    }
+    // CTES-R unilateral coloured exit (SDK_E2E=75): a coloured laddered carrier walks T -> X_0 -> S_0
+    // ON CHAIN with no SE cooperation, and the RGB allocation survives — proved by the leaf
+    // consignment validating with an EMPTY off-chain witness set plus a read-only color_psbt stock
+    // probe at the exit tip. An UNCOLOURED carrier stays refused.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("75") {
+        sdk75_colored_exit::execute().await?;
+        return Ok(());
+    }
+
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
     if std::env::var("LN_SMOKE").as_deref() == std::result::Result::Ok("1") {
         let (a, b) = rln::setup_ln_pair("/tmp/rln-smoke").await?;

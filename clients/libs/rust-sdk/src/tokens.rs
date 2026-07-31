@@ -954,6 +954,62 @@ impl UtexoWallet {
         })
     }
 
+    /// Where an asset's allocations actually sit: `(outpoint, amount)` per carrier UTXO.
+    ///
+    /// Distinct from [`Self::get_token_balances`] on purpose. A balance is an aggregate computed
+    /// from rgb-lib's sqlite tables and stays confidently wrong when the RGB stock has been
+    /// invalidated underneath it (E7); this lists the actual per-outpoint bindings, which is what a
+    /// caller needs to answer "is the allocation still on the coin I think it is?".
+    pub async fn list_token_allocations(&self, asset_id: &str) -> Result<Vec<(String, u64)>> {
+        if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
+            return Ok(vec![]);
+        }
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().unwrap();
+        tokio::task::block_in_place(|| -> Result<Vec<(String, u64)>> {
+            Ok(w.list_allocations(asset_id)?
+                .into_iter()
+                .map(|(op, amt, _settled)| (op, amt))
+                .collect())
+        })
+    }
+
+    /// [CTES-R] Every **booked** RGB allocation this wallet holds, keyed by carrier outpoint:
+    /// `"txid:vout" -> (contract_id, amount)`.
+    ///
+    /// This is [`Self::token_carrier_outpoints`] with the two facts it throws away kept — the same
+    /// `list_assets() × list_allocations()` walk, nothing more expensive. Those two facts are the
+    /// entire "how do I know what to colour" problem for a coloured ladder: a CTES-R tier needs a
+    /// contract id and an amount, and both are already in hand.
+    ///
+    /// **Multi-allocation carriers are reported, not hidden.** An outpoint holding allocations of
+    /// two different contracts (or two fungible entries of one) maps to `None`, so the caller can
+    /// tell "one allocation, colourable" from "several, no single-transition tier shape yet" and
+    /// fail CLOSED on the latter rather than silently colouring one asset and destroying the other.
+    pub(crate) async fn token_carrier_allocations(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Option<(String, u64)>>> {
+        let mut out: std::collections::HashMap<String, Option<(String, u64)>> =
+            std::collections::HashMap::new();
+        if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
+            return Ok(out);
+        }
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().unwrap();
+        tokio::task::block_in_place(|| -> Result<()> {
+            for (asset_id, _ticker, _name, _precision) in w.list_assets()? {
+                for (outpoint, amt, _settled) in w.list_allocations(&asset_id)? {
+                    // Second allocation on the same outpoint ⟹ ambiguous ⟹ `None` (fail closed).
+                    out.entry(outpoint)
+                        .and_modify(|e| *e = None)
+                        .or_insert(Some((asset_id.clone(), amt)));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Outpoints of CONFIRMED coins that carry an incoming RGB **consignment** in their backup rows
     /// but whose allocation is NOT yet booked in the engine — a *pending* token carrier (external
     /// review finding 5). A transient RGB-proxy/indexer error during `accept_incoming_tokens` leaves
@@ -961,6 +1017,43 @@ impl UtexoWallet {
     /// booked allocations), so until the retry loop books it, plain-BTC selection would happily
     /// spend it and DESTROY the allocation — including `auto_refresh_due`, which would re-anchor it.
     /// These outpoints must be quarantined from every plain-BTC path exactly like booked carriers.
+    /// **[CTES-R] Every statechain id in this wallet whose exit ladder is COLOURED.**
+    ///
+    /// One read of the `tesr-` rows, shared by the two callers that must agree about it: the
+    /// carrier quarantine below (a coloured carrier must never reach plain-BTC selection) and
+    /// `unilateral_exit` (a coloured carrier is the ONLY carrier that may be exited, because it is
+    /// the only one whose tiers carry RGB transitions).
+    ///
+    /// **Fails CLOSED, and the direction is the whole point.** An unreadable ladder table yields an
+    /// `Err`, never an empty set. For the quarantine an empty set means "no carriers" and would let
+    /// a carrier be spent as sats; for the exit an empty set means "no coloured ladder" and merely
+    /// refuses an exit. Both are the safe direction only if neither is silently defaulted, so the
+    /// error is propagated and each caller decides.
+    ///
+    /// A `tesr-` row that will not DESERIALIZE is deliberately treated as not-coloured (it is
+    /// dropped by `filter_map`): `unilateral_exit` then refuses to exit that carrier at all, which
+    /// is the fail-closed answer — an unreadable bundle is not evidence that a coloured walk exists.
+    pub(crate) async fn colored_ladder_sids(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "cannot enumerate token carriers: the exit-ladder rows could not be read ({e}) \
+                 — refusing to report a carrier set built from an unreadable database"
+            )
+        })?
+        .into_iter()
+        .filter_map(|(key, json)| {
+            let sid = key.strip_prefix("tesr-")?.to_string();
+            let bundle: mercuryrustlib::tesr::TesrBundle = serde_json::from_str(&json).ok()?;
+            bundle.is_colored().then_some(sid)
+        })
+        .collect())
+    }
+
     pub(crate) async fn consignment_bearing_outpoints(
         &self,
     ) -> Result<std::collections::HashSet<String>> {
@@ -968,12 +1061,28 @@ impl UtexoWallet {
         if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
             return Ok(out);
         }
+        // [CTES-R] A conveyed COLOURED ladder carries its RGB half in the `tesr-` bundle, NOT in a
+        // backup-row consignment envelope — so between the claim and the booking it would be invisible
+        // to the loop below, and plain-BTC selection would happily spend the carrier and destroy the
+        // allocation. Read the ladder rows ONCE (not per coin) and quarantine every coloured one.
+        //
+        // NOT best-effort: an unreadable ladder table must stop the caller exactly as an unreadable
+        // backup row does, for the same reason — a carrier set assembled from failures is a confident
+        // answer about which coins are safe to spend, built out of not knowing.
+        let colored_sids = self.colored_ladder_sids().await?;
         let record = self.record().await?;
         for coin in record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
         {
+            if let (Some(id), Some(outpoint)) =
+                (coin.statechain_id.as_deref(), crate::wallet::coin_outpoint(coin))
+            {
+                if colored_sids.contains(id) {
+                    out.insert(outpoint);
+                }
+            }
             // A coin with no statechain id or no outpoint cannot be referenced by BTC coin
             // selection at all (selection keys on the outpoint), so skipping it removes no
             // protection — unlike the DB reads below, whose absence is a real answer about a real
@@ -1058,6 +1167,512 @@ impl UtexoWallet {
     /// after which the loser's consignment embeds the rival's witness and the allocation is simply
     /// unclaimable off-chain (the collision this module's `TierSeal` exists to prevent). Zero is a
     /// real generation, never a stand-in for "could not read".
+    /// **[CTES-R] Is a coin's coloured ladder still alive?** The health check `CTESR-GATE.md` §3.3
+    /// mandates, and the ONLY kind that works.
+    ///
+    /// Never assert carrier liveness on `get_asset_balance` or `list_unspents`: E7 measured both
+    /// reporting `settled/future/spendable = 1000` with the RGB **stock** at zero, because rgb-lib's
+    /// balance is computed from its sqlite tables and a stock invalidation touches neither. A
+    /// monitoring alarm built on the balance would never fire.
+    ///
+    /// So this probes the stock, through the fork's `OffchainResolver` with the ladder's OWN txid
+    /// list — never the plain blockchain resolver, which would report every deliberately-un-broadcast
+    /// tier as `Unresolved`, archive it, and recursively invalidate the ladder with no error and no
+    /// repair path (E7).
+    ///
+    /// Returns `(contract_id, amount_assigned_to_the_final_state, tier_txids, detail)`. `Err` for a
+    /// coin with no ladder or a plain one; `Err` too when the consignment does not validate — a
+    /// coloured ladder that cannot be validated off-chain is not "probably fine".
+    pub async fn colored_ladder_health(
+        &self,
+        statechain_id: &str,
+    ) -> Result<(String, u64, Vec<String>, Option<String>)> {
+        let bundle =
+            mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, statechain_id)
+                .await?
+                .ok_or_else(|| anyhow!("statechain id {statechain_id} has no ladder"))?;
+        let rgb_half = bundle
+            .rgb
+            .clone()
+            .ok_or_else(|| anyhow!("statechain id {statechain_id} has a PLAIN ladder"))?;
+        let tiers = bundle.exit_tiers();
+        if rgb_half.consignments.len() != tiers.len() {
+            return Err(anyhow!(
+                "coloured ladder of {statechain_id} carries {} consignments for {} tiers",
+                rgb_half.consignments.len(),
+                tiers.len()
+            ));
+        }
+        let txids: Vec<String> = tiers.iter().map(|t| t.txid.clone()).collect();
+        let leaf = rgb_half.consignments.last().cloned().unwrap();
+        let final_state = bundle.current().state.clone();
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        tokio::task::block_in_place(|| -> Result<(String, u64, Vec<String>, Option<String>)> {
+            let (verdict, detail, contract) = w.validate_offchain_chain_info(&leaf, &txids)?;
+            if verdict != ValidationVerdict::Valid {
+                return Err(anyhow!(
+                    "the coloured ladder of {statechain_id} does not validate off-chain \
+                     ({verdict:?}): {}",
+                    detail.unwrap_or_default()
+                ));
+            }
+            let assigned = w.accept_offchain_amount(
+                &leaf,
+                &txids,
+                &final_state.txid,
+                final_state.payload_vout,
+            )?;
+            Ok((
+                contract.unwrap_or_else(|| rgb_half.contract_id.clone()),
+                assigned,
+                txids,
+                detail,
+            ))
+        })
+    }
+
+    /// **[CTES-R] The on-chain survival proof of a unilateral coloured exit.**
+    ///
+    /// Validates the ladder's LEAF consignment with an **EMPTY** off-chain witness set. That empty
+    /// set is the whole assertion, and it is the one thing stash state cannot fake: with no ids in
+    /// `offchain_witness_ids` the fork's `OffchainResolver` falls through to the plain indexer for
+    /// EVERY witness, so `valid = true` is achievable only if every tier that ever carried the
+    /// allocation is genuinely MINED. Before the exit walk this same call fails; after it succeeds.
+    ///
+    /// Contrast [`Self::colored_ladder_health`], which passes the ladder's own txids and therefore
+    /// answers the *off-chain* question ("is the un-broadcast chain still coherent?"). Neither is a
+    /// substitute for the other, and neither is `get_asset_balance`, which is blind to both (E7).
+    ///
+    /// Returns `(contract_id, amount_assigned_to_the_final_state, detail)`.
+    pub async fn colored_exit_proof(&self, statechain_id: &str) -> Result<(String, u64, Option<String>)> {
+        let bundle =
+            mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, statechain_id)
+                .await?
+                .ok_or_else(|| anyhow!("statechain id {statechain_id} has no ladder"))?;
+        let rgb_half = bundle
+            .rgb
+            .clone()
+            .ok_or_else(|| anyhow!("statechain id {statechain_id} has a PLAIN ladder"))?;
+        let leaf = rgb_half
+            .consignments
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("the coloured ladder of {statechain_id} carries no consignment"))?;
+        let final_state = bundle.current().state.clone();
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        tokio::task::block_in_place(|| -> Result<(String, u64, Option<String>)> {
+            // THE EMPTY SET. Not a stylistic choice — see the doc comment.
+            let (verdict, detail, contract) = w.validate_offchain_chain_info(&leaf, &[])?;
+            if verdict != ValidationVerdict::Valid {
+                return Err(anyhow!(
+                    "the coloured ladder of {statechain_id} does NOT validate against the chain \
+                     alone ({verdict:?}): {} — at least one tier is still un-mined, so the exit \
+                     walk did not land",
+                    detail.unwrap_or_default()
+                ));
+            }
+            let assigned =
+                w.accept_offchain_amount(&leaf, &[], &final_state.txid, final_state.payload_vout)?;
+            Ok((contract.unwrap_or_else(|| rgb_half.contract_id.clone()), assigned, detail))
+        })
+    }
+
+    /// **[CTES-R] The §3.3 read-only STOCK probe at a coloured ladder's exit tip.**
+    ///
+    /// Asks the stash — not the balance — whether `amount` of the ladder's contract can still be
+    /// spent out of the final state's payload output, the outpoint that pays the owner's own exit
+    /// key. `Ok(())` means the allocation is alive there; `Err` carries rgb-lib's reason, which for
+    /// a dead stash is `InvalidColoringInfo { … greater than available (0) }`.
+    ///
+    /// Nothing is consumed and no witness is resolved: it runs rgb-lib's `color_psbt`, not
+    /// `color_psbt_and_consume`. `get_asset_balance` and `list_unspents` are BLIND to the failure
+    /// this detects — E7 measured both reporting a full settled spendable balance over a stock at
+    /// zero — so this is the probe every CTES-R invariant test and ops alarm must use.
+    pub async fn probe_colored_tip(&self, statechain_id: &str, amount: u64) -> Result<()> {
+        let bundle =
+            mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, statechain_id)
+                .await?
+                .ok_or_else(|| anyhow!("statechain id {statechain_id} has no ladder"))?;
+        let rgb_half = bundle
+            .rgb
+            .clone()
+            .ok_or_else(|| anyhow!("statechain id {statechain_id} has a PLAIN ladder"))?;
+        let state = bundle.current().state.clone();
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&state.signed_tx)?)?;
+        let out = tx
+            .output
+            .get(state.payload_vout as usize)
+            .ok_or_else(|| anyhow!("the final state has no output at its declared payload vout"))?;
+        let spk_hex = hex::encode(out.script_pubkey.as_bytes());
+        let payee = bundle.owner_exit_address.clone();
+        let network = bundle.network.clone();
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        tokio::task::block_in_place(|| {
+            mercuryrustlib::rgb::probe_allocation(
+                w,
+                &rgb_half.contract_id,
+                &state.txid,
+                state.payload_vout,
+                out.value,
+                &spk_hex,
+                &payee,
+                &network,
+                amount,
+            )
+        })
+    }
+
+    /// **[CTES-R] Renew a coloured ladder off-chain.** The coloured sibling of `tesr::renew_auto`.
+    ///
+    /// The new extension `X_{m+1}` is a RIVAL of `X_m` over the trigger's payload output — the exact
+    /// case a shared blinding collapses (CTESR-GATE §2.2). What separates them is the seal rung,
+    /// which folds in the renewal counter AND the (strictly lower) CSV; the receiver re-derives both
+    /// from the bundle it is handed. Returns the new renewal counter `m`.
+    ///
+    /// Two phases, and the split is load-bearing: colouring holds the RGB engine (whose resolver is
+    /// `!Sync`) and co-signing `await`s the SE, so the two may never overlap.
+    pub async fn renew_colored_ladder(&self, statechain_id: &str) -> Result<u32> {
+        self.renew_colored_ladder_ex(statechain_id, None).await
+    }
+
+    /// [`Self::renew_colored_ladder`] with hand-picked CSVs instead of the network's canonical
+    /// cadence. The new extension CSV must still be strictly lower than the one it replaces — that
+    /// is the maturity race, and it is also what separates the two rival transitions over the
+    /// trigger's payload output.
+    pub async fn renew_colored_ladder_with(
+        &self,
+        statechain_id: &str,
+        csv_e: u16,
+        csv_d: u16,
+    ) -> Result<u32> {
+        self.renew_colored_ladder_ex(statechain_id, Some((csv_e, csv_d))).await
+    }
+
+    async fn renew_colored_ladder_ex(
+        &self,
+        statechain_id: &str,
+        csvs: Option<(u16, u16)>,
+    ) -> Result<u32> {
+        let mut bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("statechain id {statechain_id} has no ladder"))?;
+        if !bundle.is_colored() {
+            return Err(anyhow!(
+                "statechain id {statechain_id} has a PLAIN ladder — use the plain renewal path"
+            ));
+        }
+        let mut coin = self.confirmed_coin(statechain_id).await?;
+
+        let draft = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+            tokio::task::block_in_place(|| match csvs {
+                Some((csv_e, csv_d)) => {
+                    mercuryrustlib::tesr::build_colored_renewal(w, &bundle, csv_e, csv_d)
+                }
+                None => mercuryrustlib::tesr::build_colored_renewal_auto(w, &bundle),
+            })?
+        };
+        mercuryrustlib::tesr::cosign_colored_renewal(&self.inner.cc, &mut coin, &mut bundle, draft)
+            .await?;
+        mercuryrustlib::tesr::persist(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &bundle,
+        )
+        .await?;
+        Ok(bundle.m)
+    }
+
+    /// **[CTES-R] Convey a whole COLOURED carrier — sats and allocation together.**
+    ///
+    /// The coloured transfer is the same Model-A handover as a plain coin, with one difference: the
+    /// receiver-paying state `S'` carries a valid RGB state transition, so it MOVES the allocation
+    /// instead of destroying it. `S'` rivals the sender's own state over the extension's payload
+    /// output; the seal rung's CSV term is what keeps the two transitions apart.
+    ///
+    /// The consignment is validated against the ladder BEFORE any SE co-sign, so a seal collision or
+    /// a stash that cannot produce a resolvable chain is a refusal here rather than an unvalidatable
+    /// consignment at the receiver. After the handover the carrier is marked spent in the engine, so
+    /// the sender's balance drops to what it actually still controls.
+    pub async fn transfer_colored_carrier(
+        &self,
+        statechain_id: &str,
+        receiver_address: &str,
+    ) -> Result<()> {
+        let bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("statechain id {statechain_id} has no ladder"))?;
+        if !bundle.is_colored() {
+            return Err(anyhow!(
+                "statechain id {statechain_id} has a PLAIN ladder — use the plain transfer path"
+            ));
+        }
+        let rgb_half = bundle.rgb.clone().expect("is_colored");
+        let carrier_op = format!("{}:{}", bundle.f_txid, bundle.f_vout);
+
+        // PHASE 1 — engine only: colour S', then PROVE the resulting ladder resolves off-chain.
+        let draft = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+            tokio::task::block_in_place(|| -> Result<_> {
+                let draft = mercuryrustlib::tesr::build_colored_receiver_state(
+                    w,
+                    &bundle,
+                    receiver_address,
+                )?;
+                // The ladder the RECEIVER will be handed: trigger, current extension, new S'.
+                let txids = vec![
+                    bundle.trigger.txid.clone(),
+                    bundle.current().extension.txid.clone(),
+                    draft.tier.txid.clone(),
+                ];
+                let (verdict, detail, contract) =
+                    w.validate_offchain_chain_info(&draft.tier.consignment, &txids)?;
+                if verdict != ValidationVerdict::Valid {
+                    return Err(anyhow!(
+                        "refusing to convey {statechain_id}: the coloured S' consignment does not \
+                         validate against the ladder ({verdict:?}): {}",
+                        detail.unwrap_or_default()
+                    ));
+                }
+                if contract.as_deref() != Some(rgb_half.contract_id.as_str()) {
+                    return Err(anyhow!(
+                        "refusing to convey {statechain_id}: the coloured S' consignment is for \
+                         contract {contract:?}, not the ladder's {}",
+                        rgb_half.contract_id
+                    ));
+                }
+                let assigned = w.accept_offchain_amount(
+                    &draft.tier.consignment,
+                    &txids,
+                    &draft.tier.txid,
+                    draft.tier.payload_vout,
+                )?;
+                if assigned != rgb_half.amount {
+                    return Err(anyhow!(
+                        "refusing to convey {statechain_id}: the coloured S' assigns {assigned} to \
+                         the receiver's exit output but the ladder carries {}",
+                        rgb_half.amount
+                    ));
+                }
+                Ok(draft)
+            })?
+        };
+
+        // PHASE 2 — network only: one blind SE co-sign of S', then the ordinary handover.
+        mercuryrustlib::transfer_sender::execute_colored(
+            &self.inner.cc,
+            receiver_address,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            None,
+            false,
+            None,
+            draft,
+        )
+        .await?;
+
+        // The carrier is gone. Marking it spent is DB accounting only (the allocation itself moved
+        // with the ladder), but without it `get_token_balances` keeps advertising an asset this
+        // wallet no longer controls, and the coin keeps being quarantined from plain-BTC selection.
+        {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+            tokio::task::block_in_place(|| w.mark_spent(&[carrier_op]))?;
+        }
+        Ok(())
+    }
+
+    /// The CONFIRMED, non-duplicate coin of `statechain_id`.
+    async fn confirmed_coin(&self, statechain_id: &str) -> Result<mercurylib::wallet::Coin> {
+        let rec = self.record().await?;
+        rec.coins
+            .into_iter()
+            .find(|c| {
+                c.statechain_id.as_deref() == Some(statechain_id)
+                    && c.duplicate_index == 0
+                    && c.status == CoinStatus::CONFIRMED
+            })
+            .ok_or_else(|| anyhow!("no CONFIRMED coin for statechain id {statechain_id}"))
+    }
+
+    /// **[CTES-R] Receive-side booking of a conveyed COLOURED ladder.**
+    ///
+    /// `Ok(None)` means "not a coloured ladder, try the legacy lane"; `Ok(Some(..))` books the
+    /// allocation. Every refusal that is a property of the material rather than of the network
+    /// carries the `PERMANENT-INVALID:` prefix `claim()` matches, so a griefer cannot lock a
+    /// victim's sats forever behind a consignment that can never book.
+    ///
+    /// Three things happen, in this order, and the order matters:
+    ///  1. the LEAF consignment is validated against the ladder's OWN un-broadcast txids through the
+    ///     fork's `OffchainResolver` — never the plain blockchain resolver, which would report every
+    ///     deliberately-un-broadcast tier `Unresolved`, archive it, and recursively invalidate the
+    ///     chain with no error and no repair (CTESR-GATE §2.3);
+    ///  2. the amount is taken from the CONSIGNMENT (`accept_offchain_amount` at the final state's
+    ///     payload output), never from the sender's `ColoredLadder::amount` field, and the two must
+    ///     agree;
+    ///  3. every tier seal is opened — not just the leaf. The receiver must be able to spend the
+    ///     EXTENSION's payload output, because that is the outpoint its own next-hop state tier
+    ///     spends; without that seal the coin books fine and is then exit-only.
+    async fn accept_colored_ladder(&self, statechain_id: &str) -> Result<Option<(String, u64)>> {
+        let Some(bundle) = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if !bundle.is_colored() {
+            return Ok(None);
+        }
+        let rgb_half = bundle.rgb.clone().expect("is_colored");
+        let carrier_op = format!("{}:{}", bundle.f_txid, bundle.f_vout);
+        // Idempotency: claim() may run this again for the same coin. An allocation already booked on
+        // `F` means this ladder was accepted; re-running `register_statechain` would double-book it.
+        if self.token_carrier_outpoints().await?.contains(&carrier_op) {
+            return Ok(None);
+        }
+        let txids = bundle.ladder_txids();
+        let leaf = bundle
+            .leaf_consignment()
+            .cloned()
+            .ok_or_else(|| anyhow!("PERMANENT-INVALID: coloured ladder carries no consignment"))?;
+        let seals = bundle
+            .colored_tier_seals()
+            .map_err(|e| anyhow!("PERMANENT-INVALID: coloured ladder seals are not derivable: {e}"))?;
+        let final_state = bundle.current().state.clone();
+        let f_value = bundle.f_value;
+
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("RGB engine not configured"))?;
+        let booked = tokio::task::block_in_place(|| -> Result<u64> {
+            let (verdict, detail, contract) = w.validate_offchain_chain_info(&leaf, &txids)?;
+            match verdict {
+                ValidationVerdict::Valid => {}
+                ValidationVerdict::PermanentlyInvalid => {
+                    return Err(anyhow!(
+                        "PERMANENT-INVALID: the conveyed coloured ladder does not validate against \
+                         its own tiers: {}",
+                        detail.unwrap_or_default()
+                    ))
+                }
+                other => {
+                    return Err(anyhow!(
+                        "coloured ladder validation is inconclusive ({other:?}): {}",
+                        detail.unwrap_or_default()
+                    ))
+                }
+            }
+            let contract = contract.ok_or_else(|| {
+                anyhow!("PERMANENT-INVALID: valid coloured consignment with no contract id")
+            })?;
+            if contract != rgb_half.contract_id {
+                return Err(anyhow!(
+                    "PERMANENT-INVALID: the conveyed ladder claims contract {} but its consignment \
+                     verifies under {contract}",
+                    rgb_half.contract_id
+                ));
+            }
+            // The CONSIGNMENT-derived amount at the receiver's own exit output. The sender's
+            // declared `amount` is attacker-supplied and is only ever checked against this.
+            let assigned = w.accept_offchain_amount(
+                &leaf,
+                &txids,
+                &final_state.txid,
+                final_state.payload_vout,
+            )?;
+            if assigned != rgb_half.amount {
+                return Err(anyhow!(
+                    "PERMANENT-INVALID: the conveyed ladder declares {} but its consignment assigns \
+                     {assigned} to the receiver's exit output",
+                    rgb_half.amount
+                ));
+            }
+            if assigned == 0 {
+                return Err(anyhow!(
+                    "PERMANENT-INVALID: the conveyed coloured ladder assigns nothing to the receiver"
+                ));
+            }
+            // First sight of this contract: import its genesis + history, validated against the same
+            // un-broadcast ladder.
+            w.import_asset_offchain(&leaf, &txids)?;
+            // Open EVERY tier seal (see the doc comment, point 3).
+            let received = w.accept_ladder(&leaf, &txids, &seals)?;
+            if received != assigned {
+                return Err(anyhow!(
+                    "PERMANENT-INVALID: accepting the coloured ladder booked {received}, but its \
+                     consignment assigns {assigned} to the receiver's exit output"
+                ));
+            }
+            w.register_statechain(
+                &bundle.f_txid,
+                bundle.f_vout,
+                f_value,
+                &contract,
+                assigned,
+                &[],
+            )?;
+            Ok(assigned)
+        })?;
+        Ok(Some((rgb_half.contract_id, booked)))
+    }
+
+    /// **[CTES-R] The lane interlock — one carrier, one spend of `F`.**
+    ///
+    /// A coloured ladder's trigger `T` spends the carrier's funding output `F` with NO timelock. The
+    /// legacy coloured split spends the SAME `F` as an absolute-locktime backup maturing ~`initlock`
+    /// blocks out. A carrier holding both would let its previous owner broadcast `T` the instant
+    /// after conveying a split, taking back the sats AND the asset against a receiver who cannot
+    /// race it. The census does not catch this — the piece is a fresh statechain node with its own
+    /// `num_sigs` — and neither does the terminal-parent check, because `T` is already co-signed.
+    ///
+    /// So the two lanes are mutually exclusive per coin and this is where that is enforced, BEFORE
+    /// `set_spend_budget` and before any co-sign. It is a refusal, not a preference: there is no
+    /// safe ordering, only one lane per carrier.
+    ///
+    /// Unreachable while `SdkConfig::colored_ladder` is off — no carrier has a coloured ladder then,
+    /// which is exactly why that flag defaults to false.
+    async fn refuse_if_colored_ladder(&self, carrier_id: &str) -> Result<()> {
+        // Fail CLOSED on an unreadable row: "I could not tell whether this carrier has a coloured
+        // ladder" must not be read as "it does not".
+        let bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            carrier_id,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "cannot tell whether carrier {carrier_id} holds a coloured ladder ({e}) — refusing \
+                 the colored split rather than risking two rival spends of its funding output"
+            )
+        })?;
+        if bundle.is_some_and(|b| b.is_colored()) {
+            return Err(anyhow!(
+                "carrier {carrier_id} holds a COLOURED (CTES-R) ladder, whose trigger already spends \
+                 its funding output with no timelock. A colored split would be a RIVAL spend of the \
+                 same output that the previous owner could out-race instantly, so it is refused. \
+                 Move this coin along its ladder instead."
+            ));
+        }
+        Ok(())
+    }
+
     async fn carrier_spend_generation(&self, carrier_id: &str) -> Result<u32> {
         let rows = read_backup_rows(
             &self.inner.cc.pool,
@@ -1622,6 +2237,8 @@ impl UtexoWallet {
             .statechain_id
             .clone()
             .ok_or_else(|| anyhow!("carrier coin without statechain id"))?;
+        // [CTES-R] One carrier, one spend of F. Ahead of every co-sign and every budget pin.
+        self.refuse_if_colored_ladder(&carrier_id).await?;
         let carrier_sats = carrier.amount.unwrap_or_default() as u64;
         let fee_reserve = (carrier_sats / 100).clamp(300, 2_000);
         if TOKEN_PIECE_SATS + fee_reserve >= carrier_sats {
@@ -1914,6 +2531,11 @@ impl UtexoWallet {
             .iter()
             .map(|(c, _)| c.statechain_id.clone().unwrap_or_default())
             .collect();
+        // [CTES-R] Same interlock as the single-carrier lane, per INPUT: one coloured-laddered
+        // carrier anywhere in the combine is one rival spend of a funding output, which is enough.
+        for id in &carrier_ids {
+            self.refuse_if_colored_ladder(id).await?;
+        }
         let carrier_ops: Vec<String> = selected
             .iter()
             .map(|(c, _)| {
@@ -2117,6 +2739,8 @@ impl UtexoWallet {
             anyhow!("no confirmed coin carries >= {total} of {asset_id} for the batch")
         })?;
         let carrier_id = carrier.statechain_id.clone().unwrap();
+        // [CTES-R] One carrier, one spend of F — the batch lane splits the same funding output.
+        self.refuse_if_colored_ladder(&carrier_id).await?;
         let carrier_sats = carrier.amount.unwrap_or_default() as u64;
         let fee_reserve = (carrier_sats / 100).clamp(300, 2_000);
         let pieces_sats = TOKEN_PIECE_SATS * n as u64;
@@ -2284,6 +2908,12 @@ impl UtexoWallet {
     pub(crate) async fn accept_incoming_tokens(&self, statechain_id: &str) -> Result<Option<(String, u64)>> {
         if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
             return Ok(None);
+        }
+        // [CTES-R] A conveyed COLOURED ladder carries its RGB half in the `tesr-` bundle, not in a
+        // backup-row consignment envelope, so it is decided FIRST. `Ok(None)` means "not coloured",
+        // and the legacy envelope lane below runs unchanged.
+        if let Some(booked) = self.accept_colored_ladder(statechain_id).await? {
+            return Ok(Some(booked));
         }
         // `Ok(None)` is read by `book_incoming_token` as "this coin is plain sats, nothing to
         // record" — a CLEAN ABSENCE that records no status and leaves nothing to retry. The old

@@ -371,9 +371,51 @@ signature check, identically to v2. Delete this line item from the plan.
 
 Fix status is independent of whether CTES-R ever ships.
 
-### 4.1 LIVE — RGB carriers have no unilateral exit at all
+### 4.1 ~~LIVE~~ **CLOSED for coloured carriers** — RGB carriers have no unilateral exit at all
 
-**Confirmed present as described**, `clients/libs/rust-sdk/src/wallet.rs:1039-1050`:
+> **RESOLVED 2026-07-31, measured, `SDK_E2E=75` (`clients/tests/rust/src/sdk75_colored_exit.rs`),
+> two consecutive green runs.** A coloured laddered carrier now walks `T → X_0 → S_0` on chain and
+> the RGB allocation survives. `unilateral_exit` opens for exactly one class — a carrier whose
+> ladder is COLOURED — and refuses every other carrier, including one whose `tesr-` row is missing
+> or unreadable (`wallet.rs`, `colored_ladder_sids` + the fail-closed refusal at the flat fallback).
+> `withdraw` and `refresh` still refuse carriers outright; only the exit opened (§7 stands).
+>
+> The walk itself is driven by `tesr::exit_pass(&electrum_client, &bundle)`, whose signature is the
+> proof of "no SE cooperation": a chain backend and stored material, no `ClientConfig`, no
+> coordinator URL, no key.
+>
+> Proof of survival, three parts, and (c) is the one stash state cannot fake:
+> (a) all three tiers MINED (height > 0), each spending its parent's DECLARED `payload_vout`, each
+> with one 32-byte opret at vout 0, `F` consumed;
+> (b) the §3.3 read-only `color_psbt` stock probe over `(S_0.txid, S_0.payload_vout)` spends the
+> full allocation and REFUSES `amount + 1` (`RgbWallet::probe_spendable` /
+> `mercuryrustlib::rgb::probe_allocation`, never `color_psbt_and_consume`);
+> (c) `validate_consignment_offchain_chain(leaf, offchain_txids = &[])` — the EMPTY set, so every
+> witness falls through to the plain indexer — FAILS before the walk and SUCCEEDS after.
+>
+> **Two gaps the run exposed, both open:**
+> 1. After the exit, rgb-lib's UTXO-driven views are **stale, not merely blind**: measured twice,
+>    `list_token_allocations` / `get_asset_balance` / `token_carrier_allocations` still report the
+>    full allocation at the **SPENT** funding outpoint `F` and nothing at the exit tip. The tip pays
+>    a Mercury seed-derived key that is not in the engine's descriptor. `token_carrier_allocations`
+>    is the input to the CTES-R decision site in `claim()`, so it would offer a spent outpoint as a
+>    colourable carrier. The E7 rule stands and hardens: never read liveness OR location off the
+>    balance.
+> 2. The exited allocation is therefore not spendable **through the SDK**: the stash binds it and
+>    the owner holds the Bitcoin key, but nothing registers the tip outpoint
+>    (`register_statechain_utxo`) after an exit, so the engine cannot build an onward RGB spend.
+> 3. `auto_exit_due`'s deadline loop still filters out **every** carrier (`wallet.rs`), coloured
+>    included — the coloured exit is manual-only, with no automatic near-deadline protection.
+>
+> Robustness note recorded while running it: rgb-lib's electrum witness resolver derives a mined
+> witness's height as `block_headers_subscribe().height − confirmations` and looks up the merkle
+> proof at that height ± 2 (`rgb-ops-0.11.1-rc.10/src/indexers/electrum_blocking.rs:168-178`). The
+> tip is electrs's and the confirmation count is bitcoind's, so while electrs trails by ≥ 2 blocks a
+> well-mined tier is reported "transaction can't be located in the blockchain". Observed on a
+> 3-block burst; `sdk75` mines block-by-block waiting for the indexer and retries the proof only on
+> that exact string.
+
+**Original finding — confirmed present as described**, `clients/libs/rust-sdk/src/wallet.rs:1039-1050`:
 `unilateral_exit` refuses a carrier outright, because the only pre-signed spend of a carrier is
 RGB-unaware and broadcasting it burns the asset. This is not a hypothetical CTES-R property — it is
 the **current** state of the product: a carrier holder has no exit-in-the-absence-of-the-coordinator
@@ -517,6 +559,98 @@ acceptable evidence; it passes half the time by luck.
 
 Only after these three does the first commit that colours a live `T` over a real `F` become
 reviewable.
+
+### Commit 4 — colour the ladder at establish (LANDED)
+
+`claim()` establishes a COLOURED ladder over an RGB carrier: `mercuryrustlib::tesr::`
+`build_colored_ladder` (engine only, synchronous) + `cosign_colored_ladder` (three ordinary
+`cosign_tier` round-trips). The split is not cosmetic — the RGB engine's resolver is `!Sync`, so
+holding its guard across an `await` makes `claim()` non-`Send` and it cannot run in the background
+watcher. Payload lands at vout 1 (read from the builder, never assumed), fee is
+`committed_fee_for_outputs(2, rate)` = 334 sat at 2 sat/vB, and `TesrBundle.rgb`
+(`#[serde(default)]`) carries the contract id, the amount and the three per-tier consignments.
+
+**The census is unchanged, and this is the trap worth restating.** `flat_backups` STAYS the
+deposit-anchored chain length for a coloured coin. `tx1` was co-signed at deposit-init, before the
+coin had any RGB on it, and that co-sign is permanent — passing 0 makes `expected = 3` against a
+live `num_sigs` of 4 and bricks every coloured coin at claim. Colouring adds zero SE co-signs (one
+input, one sighash, one `cosign_tier`), so the equation is `4 = 1 + 3 + 0`, exactly as plain.
+
+**Gated OFF by default (`SdkConfig::colored_ladder`), for one specific reason.** A coloured `T`
+spends `F` with NO timelock; the legacy coloured split spends the same `F` as an absolute-locktime
+backup maturing ~`initlock` blocks out. A carrier holding both would let its previous owner
+broadcast `T` the instant after conveying a split — an immediate, cost-free clawback of sats *and*
+asset, against a receiver who cannot race it. Neither the census (the piece is a fresh statechain
+node) nor the terminal-parent check (`T` is already co-signed) catches it. So the lanes are made
+mutually exclusive per coin, fail-closed, and the flag stays off until §7's coloured forwarding
+retires the split lane. This is the same discipline that twice reverted the V2 default over B1.
+
+What is refused on a coloured ladder, all before any co-sign: `renew`, `rollover`,
+`presign_receiver_state`, `in_ladder_split`, `cosign_detrigger`
+(`tesr::refuse_uncolored_over_colored`); conveyance (`transfer_sender::execute`, no receiver-side
+consignment validation yet); and the colored split / combine / batch lanes
+(`tokens::refuse_if_colored_ladder`). `unilateral_exit`, `withdraw` and `refresh` still refuse
+carriers outright — §4.1 and §7 are unchanged by this commit.
+
+*Test:* `SDK_E2E=74` (`sdk74_colored_ladder`). Note `73` was already taken by
+`sdk73_structural_recovery`.
+
+### Commit 5 — colour RENEWAL and TRANSFER: the rival-tier case (LANDED)
+
+The case §2.2 is about. A renewal replaces `X_m` over `T`'s payload output; a transfer co-signs a
+fresh `S_k` one δ lower over `X_m`'s. **Rivals over one parent outpoint are the normal case**, so
+this is where a coloured ladder is actually hard — and where a shared blinding is fatal rather than
+merely untidy.
+
+**The seal derivation is now ONE function, `tesr::colored_tier_seal(sid, role, level, m, csv)`,**
+and its rung is `m ‖ csv`. That pair is not a convention: `verify_bundle`'s per-prevout race check
+ALREADY requires the live tier over an outpoint to sit at a strictly lower CSV than every superseded
+rival over that same outpoint, so two rivals over one parent output can never share a CSV in a bundle
+that verifies. The renewal counter is folded in as a second, independent separator. `level` is always
+0, because `rollover` refuses a coloured bundle — and `TesrBundle::colored_tier_seals` refuses a
+multi-level coloured bundle rather than guessing at per-level counters it cannot reconstruct.
+
+**The receiver derives, never trusts.** Everything the derivation needs — the statechain id, each
+tier's role, `bundle.m`, each tier's `csv` — is already in the conveyed `TesrBundle`, and both `m`
+and `csv` are cross-checked against transaction CONTENT (`csv` against the tier's nSequence in
+`verify_bundle_ex`, the whole ladder against the coin in `verify_bundle_bound`). No blinding is ever
+transmitted.
+
+**New API, all two-phase for the `!Sync`-resolver reason:** `build_colored_renewal{,_auto}` +
+`cosign_colored_renewal`; `build_colored_receiver_state` + `cosign_colored_receiver_state`;
+`transfer_sender::execute_colored` (a coloured ladder conveyed WITHOUT a pre-coloured `S'` is still
+refused, and so is a coloured draft handed to a plain ladder). SDK entry points:
+`renew_colored_ladder{,_with}`, `transfer_colored_carrier`, and the receive-side
+`accept_colored_ladder`.
+
+**Two structural gates were added, not relaxed.** `verify_colored_shape` runs inside
+`verify_bundle_ex` — i.e. on the claim path AND the SSP's pre-payment census, colour-blind and with
+no RGB engine — and refuses both ways a bundle can lie about colour: claiming colour its tiers do not
+carry (opret-free tiers, a consignment list that does not line up with `exit_tiers()`), and carrying
+colour it does not claim (opret-bearing tiers conveyed as `rgb: None`, whose asset half would be
+validated by nobody). Separately, `consignment_bearing_outpoints` now quarantines a coloured-laddered
+coin from plain-BTC selection between the claim and the booking; a conveyed coloured ladder carries
+its RGB half in the `tesr-` row, not in a backup-row envelope, so it was invisible to that gate.
+
+**One fork change, and it is load-bearing:** `Wallet::accept_offchain_ladder`
+(`utexo-rgb-lib/src/wallet/rust_only.rs`), surfaced as `RgbWallet::accept_ladder`.
+`accept_transfer` cannot accept a ladder for two independent reasons — it resolves a SINGLE off-chain
+witness, so the leaf's un-broadcast ancestors fall through to the indexer and are archived; and it
+reveals a SINGLE seal, whereas a ladder receiver must also be able to open the EXTENSION's payload
+output, since that is the outpoint its own next-hop state spends. Without that second seal the coin
+books fine and is then exit-only. The hop-2 assertion in `sdk74` is precisely the test of it.
+
+*Test:* `SDK_E2E=74`, extended. It renews until there are **≥3 rivals** over the trigger's payload
+output AND the live extension is deliberately **not** the internal-txid minimum — §3.1's rule, and
+the loop is what makes it deterministic rather than a coin flip — then asserts the leaf consignment
+embeds the live extension and none of the superseded ones. Then the coin moves alice → bob → carol
+entirely off-chain (chain height unchanged, every tier still absent from the backend), with the
+census re-verified at the far end by the receiver's own `verify_bundle_bound`.
+
+**Still refused, and still true:** `unilateral_exit`, `withdraw` and `refresh` refuse carriers
+outright (§4.1 and §7 are unchanged); coloured `rollover`, `in_ladder_split` and `cosign_detrigger`
+refuse; the legacy colored split/combine lanes remain mutually exclusive with a coloured ladder; and
+`SdkConfig::colored_ladder` still defaults OFF for the Commit-4 reason.
 
 ---
 

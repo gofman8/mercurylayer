@@ -437,6 +437,55 @@ impl RgbWallet {
         Ok(())
     }
 
+    /// **[CTES-R] The read-only STOCK probe of `docs/utexo/CTESR-GATE.md` §3.3.** Can `output_map`
+    /// still be spent, right now, out of the outpoints `psbt_base64` spends?
+    ///
+    /// This is the ONLY health check the gate sanctions, and the reason is measured, not stylistic:
+    /// E7 killed a coloured ladder's stock outright and `get_asset_balance` went on reporting
+    /// `settled = future = spendable = 1000`, because rgb-lib's balance is computed from its sqlite
+    /// tables and a stock invalidation touches neither. `list_unspents` was equally blind. A
+    /// monitoring alarm built on either would never have fired.
+    ///
+    /// It probes the stock because `color_psbt` builds the transition from
+    /// `contract_assignments_for(contract_id, prev_outputs)` — i.e. from the STASH — and refuses
+    /// with `InvalidColoringInfo { "total amount in output_map (N) greater than available (0)" }`
+    /// when the allocation is gone. A dead stash therefore answers `Err` where a live one answers
+    /// `Ok`, which is exactly the discrimination the balance cannot make.
+    ///
+    /// **Read-only by construction, not by convention:** `color_psbt` (NOT
+    /// `color_psbt_and_consume`) builds the fascia in memory and returns it; nothing is consumed,
+    /// no transfer row is written, no witness is touched, and the caller's `psbt_base64` is
+    /// untouched because the parsed copy is local. Safe to run against a live coin, including
+    /// mid-exit.
+    ///
+    /// `Ok(())` means spendable. `Err` carries rgb-lib's own reason.
+    pub fn probe_spendable(
+        &self,
+        psbt_base64: &str,
+        contract_id: &str,
+        output_map: HashMap<u32, u64>,
+        blinding: u64,
+    ) -> Result<()> {
+        let contract = ContractId::from_str(contract_id)
+            .map_err(|e| anyhow!("invalid contract id: {e}"))?;
+        let mut psbt = RgbPsbt::from_str(psbt_base64).map_err(|e| anyhow!("invalid psbt: {e}"))?;
+        let coloring_info = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                contract,
+                AssetColoringInfo {
+                    output_map,
+                    blinded_map: HashMap::new(),
+                    static_blinding: Some(blinding),
+                },
+            )]),
+            static_blinding: Some(blinding),
+            nonce: None,
+        };
+        // `color_psbt` — never `color_psbt_and_consume`. The fascia is dropped on return.
+        let _ = self.wallet.color_psbt(&mut psbt, coloring_info)?;
+        Ok(())
+    }
+
     /// Color a Mercury-built unsigned transaction (provided as a base64 PSBT) so that the RGB asset
     /// is re-assigned to the given pre-coloring output vouts, returning the modified PSBT (base64,
     /// with the OP_RETURN opret commitment added) and the consignment (base64) to relay to the
@@ -758,6 +807,51 @@ impl RgbWallet {
             .sum();
 
         Ok(received)
+    }
+
+    /// **CTES-R.** Accept a colored TES-R ladder: validate the LEAF consignment against the whole
+    /// UN-BROADCAST tier chain and reveal EVERY tier seal, so the receiver both holds the allocation
+    /// and can spend the extension's payload output on its next hop.
+    ///
+    /// `txids` is the ladder in exit order (`T, X_m, S_k`); `seals` is `(txid, vout, blinding)` per
+    /// tier, in the same order. The blindings are DERIVED by the caller from the conveyed bundle
+    /// (`mercuryrustlib::tesr::colored_tier_seals`) — never taken from a sender-supplied field.
+    ///
+    /// Returns the fungible amount the LEAF seal (the receiver's own exit output) receives.
+    ///
+    /// Distinct from [`Self::accept`] in the two ways that matter: `accept` resolves exactly one
+    /// off-chain witness and reveals exactly one seal, so it can neither validate a multi-tier
+    /// un-broadcast chain nor leave the receiver able to continue it.
+    pub fn accept_ladder(
+        &mut self,
+        consignment_base64: &str,
+        txids: &[String],
+        seals: &[(String, u32, u64)],
+    ) -> Result<u64> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-accept-ladder");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let consignment = rgb_lib::wallet::rust_only::load_transfer(
+            path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+
+        let assignments = self
+            .wallet
+            .accept_offchain_ladder(consignment, txids, seals)?;
+        // INV-26, as in `accept`: only SPENDABLE fungible state counts as received. An
+        // InflationRight is the right to mint, not balance.
+        Ok(assignments
+            .into_iter()
+            .map(|a| match a {
+                Assignment::Fungible(amt) => amt,
+                Assignment::InflationRight(_) | Assignment::NonFungible | Assignment::Any => 0,
+            })
+            .sum())
     }
 
     /// Create a statechain UTXO of `size_sat` sats and deposit the wallet's **free allocation** of

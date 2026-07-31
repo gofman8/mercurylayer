@@ -54,6 +54,26 @@ pub struct SdkConfig {
     /// times pre-split) plus confirmation latency and congestion: choose `≥ k_max·interval + 144`.
     /// Default 288 (~2 days; covers k ≤ 14 pre-split hops on the deployed 1000/10 profile).
     pub auto_exit_margin_blocks: u32,
+    /// **[CTES-R] Colour the ladder of an RGB carrier.** When on, `claim()` establishes a COLOURED
+    /// TES-R ladder over a carrier — `T`, `X_0` and `S_0` each carrying a valid RGB state transition
+    /// — instead of leaving it on the flat lane. Default **false**.
+    ///
+    /// ## Why this is not on by default, stated exactly
+    ///
+    /// A coloured ladder and the legacy coloured-split lane are RIVAL spends of the same funding
+    /// output `F`, and the ladder's `T` carries **no timelock** while the legacy split is an
+    /// absolute-locktime backup that matures ~`initlock` blocks out. So a carrier that had both
+    /// would let its previous owner broadcast `T` the instant after conveying a split — an
+    /// immediate, cost-free clawback of both the sats and the asset, against a receiver who cannot
+    /// even race it. Today, with no ladder, the owner's only rival spend of `F` is that same
+    /// absolute-locktime backup, which the receiver's `auto_exit_due` pass beats by design.
+    ///
+    /// Turning this on therefore makes the two lanes **mutually exclusive per coin**, fail-closed:
+    /// a coloured-laddered carrier is refused by `transfer_tokens` (the split lane) and by
+    /// `transfer` (no coloured conveyance schema yet). That is the honest state of CTES-R at this
+    /// commit — the ladder is built, co-signed and verifiable; moving a coin along it is the next
+    /// commit. Enable it in tests and in wallets exploring the coloured lane, not in production.
+    pub colored_ladder: bool,
 }
 
 /// THERE IS ONE PROTOCOL. Every fresh confirmed root coin is laddered (TES-R) by `claim()` — the
@@ -74,8 +94,13 @@ pub struct SdkConfig {
 /// (`docs/utexo/CHILDREN.md`; sdk60 two hops, sdk17 a partial second hop).
 ///
 /// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
-///   * an **RGB carrier** must never be laddered (a plain tier spend would destroy the allocation), so
-///     it keeps the flat signed-once backup shape and transfers by backup-chain handover;
+///   * an **RGB carrier** must never be laddered *with a PLAIN ladder* (an uncoloured tier spend
+///     would destroy the allocation), so by default it keeps the flat signed-once backup shape and
+///     transfers by backup-chain handover. [CTES-R] `SdkConfig::colored_ladder` lifts exactly this
+///     restriction: with it on, `claim()` builds a COLOURED ladder whose every tier carries a valid
+///     RGB state transition, so laddering MOVES the allocation. It is off by default because a
+///     coloured ladder and the legacy colored split are rival spends of one funding output — see
+///     that field's own note;
 ///   * a **split sub-coin** whose funding is un-broadcast cannot root a trigger [B0].
 /// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead code left over
 /// from the pre-TES-R design.
@@ -100,6 +125,7 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
+            colored_ladder: false,
         }
     }
 
@@ -122,6 +148,7 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             auto_exit_margin_blocks: 288,
+            colored_ladder: false,
         }
     }
 }
