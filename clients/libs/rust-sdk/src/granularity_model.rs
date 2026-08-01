@@ -12,7 +12,8 @@
 //! - [`crate::transfer::split_fee_reserve`] — the split miner-fee reserve clamp,
 //! - [`crate::select::plan`] / [`crate::select::exact_subset`] — payment planning: exact
 //!   subsets, whole-coins-then-split, typed insufficiency,
-//! - [`crate::tokens::TOKEN_PIECE_SATS`] — the fixed 1500-sat packaging of a token piece,
+//! - [`crate::tokens::TOKEN_PIECE_SATS`] — the packaging of a token piece (3_054 sats: the
+//!   COLOURED root-ladder floor at twice the committed tier fee rate; derived, not chosen),
 //! - [`crate::types::ExitCostEstimate::fee_sats_at`] — ceil fee arithmetic (INV-17).
 //!
 //! Only quantities with no callable pure implementation are modelled, each with a citation to
@@ -268,35 +269,48 @@ fn plan_paths_matrix() {
 
 // GRN token-carrier floor, modelled with the REAL `split_amounts` at piece = TOKEN_PIECE_SATS.
 //
-// A colored split carves (piece = 1500 sats + exact token amount, change = rest − reserve).
-// tokens.rs:484-490 computes reserve/change with the SAME expressions as
-// split_fee_reserve/split_amounts, but its own early guard (:485) only checks the FIT
+// A colored split carves (piece = TOKEN_PIECE_SATS sats + exact token amount, change = rest −
+// reserve). tokens.rs computes reserve/change with the SAME expressions as
+// split_fee_reserve/split_amounts, but its own early guard only checks the FIT
 // (piece + reserve < carrier); the change dust floor is enforced downstream when the split
 // PSBT is built (lib/src/transaction.rs:357-360, `get_unsigned_split_psbt`, audit [9]). The
 // EFFECTIVE minimum carrier is therefore governed by the full split_amounts rule:
-//   min carrier = TOKEN_PIECE_SATS + reserve(min 300) + change(min 330) = 2130 sats,
-// with 2129 failing the sats math (change 329) and 2130 passing with change exactly 330.
+//   min carrier = TOKEN_PIECE_SATS + reserve(min 300) + change(min 330).
+//
+// RE-DERIVED, not weakened: `TOKEN_PIECE_SATS` moved 1_500 → 3_066 (it is now the COLOURED root
+// ladder floor at twice the committed fee rate — see `tokens::token_piece_sats_is_the_coloured_root_floor`;
+// [D4] corrected it 3_054 → 3_066 when the coloured tier's measured signed vsize went 167 → 168 vB),
+// so the identity that used to read 2_130 now reads 3_696, and the two boundary probes move with
+// it. The SHAPE of every assertion below is unchanged, and each bound is written as an expression
+// in `TOKEN_PIECE_SATS` so the next move of the constant cannot leave a stale literal behind.
 #[test]
 fn token_split_bounds_model() {
-    assert_eq!(TOKEN_PIECE_SATS, 1_500, "fixed packaging of a token piece (tokens.rs:23)");
+    assert_eq!(TOKEN_PIECE_SATS, 3_066, "coloured-root-floor packaging of a token piece");
 
-    // Both floors pinned: reserve at its 300 floor for carriers this small.
-    assert_eq!(split_fee_reserve(2_130), 300);
-    assert_eq!(TOKEN_PIECE_SATS + 300 + DUST_LIMIT, 2_130, "the 2130 identity");
+    // The min-carrier identity, as an expression rather than a copied literal.
+    let min_carrier = TOKEN_PIECE_SATS + 300 + DUST_LIMIT;
+    assert_eq!(min_carrier, 3_696, "the min-carrier identity: 3066 + 300 + 330");
+
+    // Both floors pinned: reserve at its 300 floor for carriers this small (3_696/100 = 36 < 300).
+    assert_eq!(split_fee_reserve(min_carrier), 300);
 
     assert!(
-        split_amounts(2_129, TOKEN_PIECE_SATS).is_err(),
-        "2129: change = 2129 - 1500 - 300 = 329 — sub-dust, the colored split PSBT is refused"
+        split_amounts(min_carrier - 1, TOKEN_PIECE_SATS).is_err(),
+        "3695: change = 3695 - 3066 - 300 = 329 — sub-dust, the colored split PSBT is refused"
     );
     assert_eq!(
-        split_amounts(2_130, TOKEN_PIECE_SATS).ok(),
+        split_amounts(min_carrier, TOKEN_PIECE_SATS).ok(),
         Some((DUST_LIMIT, 300)),
-        "2130 is the EXACT minimum carrier: change lands on the 330 dust floor"
+        "3696 is the EXACT minimum carrier: change lands on the 330 dust floor"
     );
 
-    // The tokens.rs:485 early guard alone ("carrier coin too small") fires at the FIT bound:
-    // carrier ≤ 1800 = 1500 + 300. split_amounts subsumes it.
-    assert!(split_amounts(1_800, TOKEN_PIECE_SATS).is_err(), "1500 + 300 == 1800: no fit");
+    // The tokens.rs early guard alone ("carrier coin too small") fires at the FIT bound:
+    // carrier ≤ TOKEN_PIECE_SATS + 300 = 3_366. split_amounts subsumes it.
+    assert_eq!(TOKEN_PIECE_SATS + 300, 3_366);
+    assert!(
+        split_amounts(TOKEN_PIECE_SATS + 300, TOKEN_PIECE_SATS).is_err(),
+        "3066 + 300 == 3366: no fit"
+    );
 }
 
 // GRN raw-units model (pure — no callable SDK function scales token amounts, BY DESIGN).
@@ -346,15 +360,19 @@ fn raw_units_precision_model() {
     }
 }
 
-// GRN packaging-dust threshold (exit economics of the 1500-sat piece), via the REAL
+// GRN packaging-dust threshold (exit economics of the token piece), via the REAL
 // `ExitCostEstimate::fee_sats_at` (types.rs:138-140, INV-17 ceil arithmetic).
 //
-// A token piece's backup tx (112 vB measured) sweeps its 1500-sat packaging minus the fee. The
-// sats zero out exactly when ceil(112·rate) ≥ 1500, i.e. at integer feerates the threshold is
-// 14 sat/vB: 112·13 = 1456 < 1500 < 1568 = 112·14. Above it the sweep is economically dust —
-// but ONLY the packaging: the token allocation is untouched (the colored split txs are the RGB
-// witnesses; the allocation settles on-chain when they confirm, INV-16). Branch txs carry
-// pre-committed fees from the parent's reserve and do not draw on the 1500.
+// A token piece's backup tx (112 vB measured) sweeps its packaging minus the fee. The sats zero
+// out exactly when ceil(112·rate) ≥ TOKEN_PIECE_SATS. RE-DERIVED for the new packaging (3_066,
+// the coloured root-ladder floor at twice the committed rate): at integer feerates the threshold
+// is 28 sat/vB, because 112·27 = 3_024 < 3_066 < 3_136 = 112·28. It was 14 sat/vB at the legacy
+// 1_500 — the bigger piece is exactly twice as resistant to packaging dust, which is a direct
+// consequence of the size change and is asserted below rather than assumed. Above the threshold
+// the sweep is economically dust — but ONLY the packaging: the token allocation is untouched (the
+// colored split txs are the RGB witnesses; the allocation settles on-chain when they confirm,
+// INV-16). Branch txs carry pre-committed fees from the parent's reserve and do not draw on the
+// packaging.
 #[test]
 fn token_packaging_exit_economics() {
     let piece_backup = ExitCostEstimate {
@@ -369,13 +387,27 @@ fn token_packaging_exit_economics() {
     };
 
     // Exact ceil arithmetic on both sides of the threshold.
-    assert_eq!(piece_backup.fee_sats_at(13.0), 1_456);
-    assert_eq!(piece_backup.fee_sats_at(14.0), 1_568);
+    assert_eq!(piece_backup.fee_sats_at(27.0), 3_024);
+    assert_eq!(piece_backup.fee_sats_at(28.0), 3_136);
 
-    // The packaging-dust threshold: net sats at 13 sat/vB = 44; negative (zeroed out) at 14.
-    assert!(TOKEN_PIECE_SATS > piece_backup.fee_sats_at(13.0), "13 sat/vB: 44 sats net remain");
-    assert!(TOKEN_PIECE_SATS < piece_backup.fee_sats_at(14.0), "14 sat/vB: sweep zeroes out");
-    assert_eq!(TOKEN_PIECE_SATS - piece_backup.fee_sats_at(13.0), 44);
+    // The packaging-dust threshold: net sats at 27 sat/vB = 42; negative (zeroed out) at 28.
+    assert!(TOKEN_PIECE_SATS > piece_backup.fee_sats_at(27.0), "27 sat/vB: 42 sats net remain");
+    assert!(TOKEN_PIECE_SATS < piece_backup.fee_sats_at(28.0), "28 sat/vB: sweep zeroes out");
+    assert_eq!(TOKEN_PIECE_SATS - piece_backup.fee_sats_at(27.0), 42);
+
+    // The threshold is the ceil-inverse of the packaging size, so it must be RE-DERIVED whenever
+    // TOKEN_PIECE_SATS moves. Pinned as the search itself, so a future move of the constant fails
+    // here loudly instead of silently invalidating the two literals above.
+    let threshold = (1..=100u64)
+        .find(|r| piece_backup.fee_sats_at(*r as f64) >= TOKEN_PIECE_SATS)
+        .expect("a packaging-dust threshold must exist below 100 sat/vB");
+    assert_eq!(threshold, 28, "packaging-dust threshold for a {TOKEN_PIECE_SATS}-sat piece");
+    // The legacy 1_500-sat piece dusted at 14 sat/vB; the derived piece doubles that headroom.
+    assert_eq!(
+        (1..=100u64).find(|r| piece_backup.fee_sats_at(*r as f64) >= 1_500),
+        Some(14),
+        "the legacy piece's threshold, for comparison"
+    );
 }
 
 // GRN width-vs-depth: paying k parties by ONE transfer_many width split beats k chained

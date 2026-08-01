@@ -179,6 +179,30 @@ pub struct ChildTesrBundle {
     /// message deserializing byte-identically.
     #[serde(default)]
     pub rgb: Option<ColoredChild>,
+    /// **The parent segment's FLAT (signed-once) backup chain, conveyed.**
+    ///
+    /// The census `verify_child_bundle` runs over the ancestor segment is
+    /// `num_sigs(parent) == flat_backups + tiers + superseded`, and `flat_backups` is a fact about
+    /// the parent's history that the receiver cannot observe: it never owned the parent. It used to
+    /// be supplied as the constant [`PARENT_V2_BASELINE`] (= 1), which is right only for a parent
+    /// this wallet DEPOSITED — every whole-coin hop co-signs one more flat backup
+    /// (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries
+    /// `1 + k` and the constant under-counts by exactly `k`.
+    ///
+    /// So the chain is CONVEYED and the receiver counts it itself, exactly as the whole-coin receive
+    /// path does (`transfer_receiver.rs`, `transfer_msg.backup_transactions.len()`). A conveyed count
+    /// is only safe because it is STRUCTURALLY VALIDATED before it is counted
+    /// ([`verify_conveyed_child`] runs `validate_backup_chain_v2` against the parent's on-chain `F`):
+    /// every entry must be a real taproot key-spend of `F` under `A_parent` — i.e. must have consumed
+    /// a real SE co-sign — and INV-5 (`ladder_decrements_by_interval`) forbids duplicate padding and
+    /// ladder inversion. An attacker can therefore not inflate this term to absorb a hidden co-signed
+    /// state; that is the same argument [S2] makes for the whole-coin lane.
+    ///
+    /// `#[serde(default)]` for the usual reason — already-persisted `ctesr-*` rows and in-flight
+    /// mailbox messages keep deserializing. An EMPTY vector is refused by the verifier (a parent
+    /// always carries at least its deposit `tx1`), so the default is fail-closed, not fail-open.
+    #[serde(default)]
+    pub parent_flat_backups: Vec<mercurylib::wallet::BackupTx>,
 }
 
 /// The RGB half of a COLOURED split child: this child's own share of the parent's allocation, and
@@ -325,8 +349,10 @@ pub fn refuse_uncolored_over_colored_child(cb: &ChildTesrBundle, what: &str) -> 
     if cb.is_colored() {
         return Err(anyhow::anyhow!(
             "{what}: this CHILD carries an RGB allocation (CTES-R) and {what} would build an \
-             UNCOLOURED tier over a sealed output, destroying it. Refusing — the coloured \
-             child-level replacement path is not implemented."
+             UNCOLOURED tier over a sealed output, destroying it. Refusing — use the coloured \
+             replacement path instead: `build_colored_child_retransfer` + \
+             `cosign_colored_child_retransfer` (SDK: `transfer_colored_child`) to move a coloured \
+             child whole. A coloured child-level SPLIT does not exist; split at the root instead."
         ));
     }
     Ok(())
@@ -554,8 +580,10 @@ pub async fn establish(
 /// The smallest funding value `F` that can carry a full COLOURED three-tier ladder.
 ///
 /// **This must be checked BEFORE the first `cosign_tier`, and it is the first thing that bites.** A
-/// coloured rung costs `colored_committed_fee(1, rate) + P2A_VALUE` — 574 sat at 2 sat/vB versus 488
-/// uncoloured, because the RGB `opret` output serialises to exactly `P2TR_OUT_VBYTES` (43 B) and the
+/// coloured rung costs `colored_committed_fee(1, rate) + P2A_VALUE` — 576 sat at 2 sat/vB versus 490
+/// uncoloured ([D4]-corrected on both halves; was 574 vs 488 when both vsize models understated the
+/// explicit `SIGHASH_ALL` byte), because the RGB `opret` output serialises to exactly
+/// `P2TR_OUT_VBYTES` (43 B) and the
 /// fee is `committed_fee_for_outputs(n_payload + 1, rate)` (`docs/utexo/CTESR-GATE.md` §3.4). Three
 /// rungs plus a final state output that still clears dust is the floor.
 ///
@@ -914,8 +942,11 @@ pub fn refuse_uncolored_over_colored(bundle: &TesrBundle, what: &str) -> Result<
     if bundle.is_colored() {
         return Err(anyhow::anyhow!(
             "{what}: this coin's ladder is COLOURED (CTES-R) and {what} would build an UNCOLOURED \
-             tier over a sealed output, destroying the RGB allocation. Refusing — the coloured \
-             replacement path is not implemented yet."
+             tier over a sealed output, destroying the RGB allocation. Refusing — use the coloured \
+             replacement path instead: `build_colored_in_ladder_split` + \
+             `cosign_colored_in_ladder_split` to pay part of the allocation (SDK: \
+             `transfer_tokens`), `build_colored_receiver_state` to convey the whole carrier, or \
+             `build_colored_renewal` to renew."
         ));
     }
     Ok(())
@@ -1828,31 +1859,38 @@ pub async fn cosign_colored_in_ladder_split(
             bundle.statechain_id
         ));
     }
-    // [D1] CENSUS, FAIL-CLOSED. The child's receiver runs `verify_child_bundle` with
-    // `PARENT_V2_BASELINE` flat backups for the ancestor segment, because it cannot observe the
-    // parent's pre-establish history. That constant (1) is correct only for a parent THIS wallet
-    // deposited: every whole-coin hop co-signs one more flat backup
-    // (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries
-    // `1 + k` and the receiver's exact-equality census comes up `k` short — yielding a child that
-    // NO receiver can adopt, after the parent has already been terminalized and the piece booked
-    // away. Fail-closed, not theft, but unrecoverable through any supported path.
+    // [D1] CENSUS. The child's receiver runs `verify_child_bundle` over the ancestor segment with
+    // `flat_backups = <the parent's REAL flat backup count>`, which it cannot observe on its own —
+    // it never owned the parent. So the chain is read here and CONVEYED in the bundle; the receiver
+    // re-derives the count from it after validating every entry against the on-chain `F`
+    // (`verify_conveyed_child`). See `ChildTesrBundle::parent_flat_backups` for why a conveyed count
+    // is not an attacker-controlled term.
     //
-    // The gap cannot be closed from this side by declaring the real count: a sender-supplied
-    // `flat_backups` is precisely the term an attacker inflates to mask a hidden co-signed tier,
-    // which is the one thing the census exists to catch. Closing it properly means conveying the
-    // parent's backup transactions and having the receiver verify each as co-signed under
-    // `A_parent` — a separate change. Until then, refuse rather than mint an unclaimable child.
+    // This replaces the old `len() == PARENT_V2_BASELINE` refusal, which rejected any carrier this
+    // wallet had RECEIVED rather than deposited — the constant is `1 + k` short after `k` whole-coin
+    // hops, so a split of a received carrier minted a child no receiver could adopt (fail-closed,
+    // but only after the parent was terminalized and the piece booked away).
+    // Context added HERE, not inside `get_backup_txs`: that function's bare `sqlx::Error` is
+    // load-bearing (`tokens::read_backup_rows` downcasts to `RowNotFound` to tell a genuine absence
+    // from a failed read), so decorating it at the source breaks absence detection wallet-wide.
+    // Decorating it at a call site that treats every failure alike is safe, and is the difference
+    // between a diagnosable refusal and a naked "no rows returned by a query".
     let parent_backups =
-        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid).await?;
-    if parent_backups.len() as u32 != PARENT_V2_BASELINE {
+        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "in-ladder split refused: the flat backup rows of parent {parent_sid} in \
+                     wallet {wallet_name} could not be read ({e}) — the child's census cannot be \
+                     balanced without them"
+                )
+            })?;
+    if (parent_backups.len() as u32) < PARENT_V2_BASELINE {
         return Err(anyhow::anyhow!(
-            "coloured in-ladder split refused: this carrier holds {} flat backup transaction(s) but \
-             a split child's receiver censuses the ancestor segment at PARENT_V2_BASELINE = {} — \
-             the child would be unclaimable. This carrier was RECEIVED rather than deposited by \
-             this wallet; splitting it needs the conveyed-parent-backup census, which is not \
-             implemented. Transfer the whole carrier instead.",
+            "coloured in-ladder split refused: this carrier holds {} flat backup transaction(s), \
+             fewer than the {PARENT_V2_BASELINE} every deposited coin carries — the local backup \
+             record is incomplete and the child's census could not be balanced by any receiver",
             parent_backups.len(),
-            PARENT_V2_BASELINE
         ));
     }
 
@@ -1949,6 +1987,7 @@ pub async fn cosign_colored_in_ladder_split(
                     cd.state.consignment.clone(),
                 ],
             }),
+            parent_flat_backups: parent_backups.clone(),
         });
     }
     Ok(bundles)
@@ -2018,31 +2057,37 @@ pub async fn in_ladder_split(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("parent coin has no statechain_id"))?;
 
-    // [D1] CENSUS, FAIL-CLOSED — see the identical guard in `cosign_colored_in_ladder_split`.
+    // [D1] CENSUS — see the identical read in `cosign_colored_in_ladder_split`.
     //
-    // A split child's receiver censuses the ancestor segment at `PARENT_V2_BASELINE` (1), because it
-    // cannot observe the parent's pre-establish history. That is right only for a parent THIS wallet
-    // DEPOSITED. Every whole-coin hop co-signs one more flat backup
-    // (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries
-    // `1 + k` flat backups and the receiver's exact-equality census comes up `k` short:
-    // `verify_conveyed_child` rejects with "num_sigs mismatch … possible hidden state" and the child
-    // is unadoptable — AFTER the parent has been terminalized and the piece booked away. Fail-closed,
-    // not theft, but unrecoverable through any supported path.
+    // The parent's flat backup chain is a fact about its history the child's receiver cannot observe,
+    // so it is CONVEYED (`ChildTesrBundle::parent_flat_backups`) and the receiver counts it after
+    // structurally validating it against the on-chain `F`. This used to be a hard refusal of any
+    // coin `len() != PARENT_V2_BASELINE`, i.e. of every RECEIVED coin: the constant is `k` short
+    // after `k` whole-coin hops, and splitting anyway minted a child no receiver could adopt — after
+    // the parent had been terminalized and the piece booked away.
     //
-    // Refuse BEFORE `set_spend_budget`, which is the point of no return. Declaring the real count
-    // instead is not an option from this side: a sender-supplied `flat_backups` is exactly the term
-    // an attacker inflates to mask a hidden co-signed tier, which is what the census exists to catch.
+    // Read BEFORE `set_spend_budget`, which is the point of no return.
+    // Context added HERE, not inside `get_backup_txs`: that function's bare `sqlx::Error` is
+    // load-bearing (`tokens::read_backup_rows` downcasts to `RowNotFound` to tell a genuine absence
+    // from a failed read), so decorating it at the source breaks absence detection wallet-wide.
+    // Decorating it at a call site that treats every failure alike is safe, and is the difference
+    // between a diagnosable refusal and a naked "no rows returned by a query".
     let parent_backups =
-        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid).await?;
-    if parent_backups.len() as u32 != PARENT_V2_BASELINE {
+        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "in-ladder split refused: the flat backup rows of parent {parent_sid} in \
+                     wallet {wallet_name} could not be read ({e}) — the child's census cannot be \
+                     balanced without them"
+                )
+            })?;
+    if (parent_backups.len() as u32) < PARENT_V2_BASELINE {
         return Err(anyhow::anyhow!(
-            "in-ladder split refused: this coin holds {} flat backup transaction(s) but a split \
-             child's receiver censuses the ancestor segment at PARENT_V2_BASELINE = {} — the child \
-             would be unclaimable by anyone. This coin was RECEIVED rather than deposited by this \
-             wallet; splitting it needs the conveyed-parent-backup census, which is not implemented. \
-             Transfer the whole coin instead.",
+            "in-ladder split refused: this coin holds {} flat backup transaction(s), fewer than the \
+             {PARENT_V2_BASELINE} every deposited coin carries — the local backup record is \
+             incomplete and the child's census could not be balanced by any receiver",
             parent_backups.len(),
-            PARENT_V2_BASELINE
         ));
     }
 
@@ -2102,6 +2147,7 @@ pub async fn in_ladder_split(
             // PLAIN split: a coloured parent never reaches here (`refuse_uncolored_over_colored`
             // is this function's first statement), so a child carved here carries no allocation.
             rgb: None,
+            parent_flat_backups: parent_backups.clone(),
         });
     }
     Ok(bundles)
@@ -2146,12 +2192,23 @@ pub async fn load(cc: &ClientConfig, wallet_name: &str, statechain_id: &str) -> 
     Ok(None)
 }
 
-/// Flat-backup baseline of a natively-laddered **on-chain PARENT** coin. `sig_count` starts at 0
+/// Flat-backup **MINIMUM** of a natively-laddered on-chain PARENT coin. `sig_count` starts at 0
 /// (`generated_public_key DEFAULT 0`); the coin's on-chain deposit confirmation co-signs exactly ONE
 /// signed-once backup tx (`coin_status::check_deposit` → `create_tx1` for a non-single-use coin) before
-/// the ladder is established. So such a parent has `num_sigs == 1 + <established tiers>`. A split-child
-/// receiver — who cannot observe the parent's pre-establish history — relies on this constant to run
-/// `verify_child_bundle`'s exact-equality census independently of the sender.
+/// the ladder is established.
+///
+/// ⚠️ It is a MINIMUM, not the count. This constant used to be fed to `verify_child_bundle` as the
+/// parent's `flat_backups`, on the reasoning that a split-child receiver cannot observe the parent's
+/// history. That was only true for a parent the SENDER had deposited: every whole-coin hop co-signs
+/// one further flat backup (`transfer_sender::create_backup_tx_to_receiver`), so a parent received
+/// `k` times carries `1 + k` and the exact-equality census came up `k` short — an in-ladder split of
+/// a RECEIVED laddered coin produced a child NO receiver could adopt, after the sender had already
+/// terminalized the parent and booked the piece away.
+///
+/// The real count now travels in `ChildTesrBundle::parent_flat_backups` and is re-derived by the
+/// receiver from the validated chain (`verify_conveyed_child`). What remains of this constant is the
+/// floor both sides still check: a conveyed chain SHORTER than this did not come from a deposited
+/// coin and is refused.
 pub const PARENT_V2_BASELINE: u32 = 1;
 
 /// Flat-backup baseline of a split **CHILD** slot: it is an SE-registered key that is NEVER funded
@@ -2298,6 +2355,90 @@ pub async fn verify_conveyed_child(
         .ok_or_else(|| anyhow::anyhow!("parent F has no output {}", cb.parent.f_vout))?;
     let f_spk_hex = hex::encode(f_out.script_pubkey.as_bytes());
 
+    // [D1] THE PARENT'S FLAT-BACKUP COUNT, VALIDATED THEN COUNTED — the child-lane analogue of the
+    // whole-coin path's `transfer_msg.backup_transactions.len()` (transfer_receiver.rs [S2]).
+    //
+    // The census term must be the parent's REAL flat-backup count (`1 + k` after `k` whole-coin
+    // hops), which no constant can express; it is conveyed. Conveyed is sender-supplied, so it is
+    // validated to exactly the standard the whole-coin lane holds its own chain to, plus one
+    // strictly stronger binding this lane can afford:
+    //
+    //   * every entry is a taproot key-spend of the ON-CHAIN `F` we just fetched, signature-verified
+    //     under `F.spk`'s key (= `A_parent`, itself bound to the server's recorded parent aggregate
+    //     below) — so each entry cost the attacker a real SE co-sign and cannot pad the count for
+    //     free;
+    //   * INV-5 (`ladder_decrements_by_interval`): consecutive locktimes fall by EXACTLY `interval`,
+    //     which rejects duplicate padding (decrement 0) and chain inversion alike;
+    //   * [stronger than the whole-coin lane] each entry's prevout is pinned to `(F.txid, F.vout)`.
+    //     `verify_transaction_signature` only indexes `tx0.output[prevout.vout]`, so without this a
+    //     backup naming a foreign txid would still verify; here the funding outpoint is a field of
+    //     the bundle already bound to the chain, so there is no reason to leave it loose.
+    //
+    // NOTE ON AGEING, since this is the obvious worry: `validate_backup_chain_v2` refuses a chain
+    // whose locktimes have run out or whose committed fee has fallen below the live rate, and a
+    // laddered coin's flat backups DO age while the ladder itself does not. That does not make this
+    // lane stricter than the alternative: the whole-coin receive path validates the very same
+    // entries at claim time and additionally appends one at `lowest − interval`, so it hits
+    // `LocktimeTooLow` STRICTLY EARLIER than this does. A parent whose flat chain has aged out is
+    // already untransferable as a whole coin; it is not newly unsplittable.
+    let parent_backups = &cb.parent_flat_backups;
+    if (parent_backups.len() as u32) < PARENT_V2_BASELINE {
+        return Err(anyhow::anyhow!(
+            "conveyed child discloses {} parent flat backup transaction(s), fewer than the \
+             {PARENT_V2_BASELINE} every deposited coin carries — the ancestor census cannot be \
+             balanced (fail-closed)",
+            parent_backups.len()
+        ));
+    }
+    {
+        use electrum_client::bitcoin::consensus::{deserialize, serialize};
+        for (i, b) in parent_backups.iter().enumerate() {
+            let tx: electrum_client::bitcoin::Transaction =
+                deserialize(&hex::decode(&b.tx).map_err(|_| {
+                    anyhow::anyhow!("parent flat backup {i}: not hex")
+                })?)
+                .map_err(|_| anyhow::anyhow!("parent flat backup {i}: not a transaction"))?;
+            let inp = tx
+                .input
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("parent flat backup {i}: no input"))?;
+            if tx.input.len() != 1
+                || inp.previous_output.txid != f_txid
+                || inp.previous_output.vout != cb.parent.f_vout
+            {
+                return Err(anyhow::anyhow!(
+                    "parent flat backup {i} does not spend the parent's funding outpoint \
+                     {}:{} — refusing to count it toward the ancestor census",
+                    cb.parent.f_txid,
+                    cb.parent.f_vout
+                ));
+            }
+        }
+        let info_config = crate::utils::info_config(cc).await?;
+        let blockheight = cc
+            .electrum_client
+            .block_headers_subscribe_raw()
+            .map_err(|e| anyhow::anyhow!("cannot read the chain tip: {e}"))?
+            .height as u32;
+        let current_fee_rate = if info_config.fee_rate_sats_per_byte > cc.max_fee_rate {
+            cc.max_fee_rate
+        } else {
+            info_config.fee_rate_sats_per_byte
+        };
+        mercurylib::transfer::receiver::validate_backup_chain_v2(
+            parent_backups,
+            &hex::encode(serialize(&f_tx)),
+            blockheight,
+            cc.fee_rate_tolerance,
+            current_fee_rate,
+            info_config.initlock,
+            info_config.interval,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("conveyed parent flat backup chain is invalid ({e}) — the ancestor census term is unusable")
+        })?;
+    }
+
     let p_info = crate::utils::get_statechain_info(&cb.parent_statechain_id, cc)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no statechain info for parent sid"))?;
@@ -2329,7 +2470,8 @@ pub async fn verify_conveyed_child(
         cb,
         &f_spk_hex,
         p_info.num_sigs,
-        PARENT_V2_BASELINE,
+        // The REAL count, re-derived from the chain validated above — never the baseline constant.
+        parent_backups.len() as u32,
         p_info.aggregate_pubkey.as_deref(),
         parent_terminal,
         c_info.num_sigs,
@@ -2482,6 +2624,10 @@ pub async fn child_in_ladder_split(
             // Child-level PLAIN split. `child_in_ladder_split` refuses a COLOURED child outright
             // (see its `refuse_uncolored_over_colored_child` guard), so this is never an allocation.
             rgb: None,
+            // The ancestor PARENT segment is unchanged by a child-level split, so its conveyed flat
+            // backup chain travels forward verbatim — the grandchild's receiver censuses the very
+            // same parent this child's receiver already censused.
+            parent_flat_backups: cb.parent_flat_backups.clone(),
         });
     }
     Ok(bundles)
@@ -2538,6 +2684,27 @@ pub async fn child_retransfer(
         new_csv,
         cb.parent.fee_rate,
     )?;
+    // [D1 / A2] ARM DOWN DURABLY BEFORE THE SUPERSEDING STATE EXISTS — see the note on
+    // `cosign_colored_child_retransfer`, which carries the full argument. Same window, same filter,
+    // same remedy; only the stakes differ (sats rather than an allocation).
+    let child_sid = cb.child_statechain_id.clone();
+    let status_before_conveyance = crate::transfer_sender::persist_coin_status(
+        cc,
+        wallet_name,
+        &child_sid,
+        mercurylib::wallet::CoinStatus::IN_TRANSFER,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to re-transfer child {child_sid}: its coin could not be durably marked \
+             IN_TRANSFER before the co-sign ({e}). Proceeding would leave this wallet's watchtower \
+             driving the state about to be superseded, which rivals the recipient's S'_child over \
+             ext_child's payload output. Nothing has been co-signed and the child is unchanged."
+        )
+    })?;
+
+    let staged = async {
     let signed = cosign_tier(
         cc,
         child_coin,
@@ -2560,9 +2727,402 @@ pub async fn child_retransfer(
     };
     next.child_owner_exit_address = payee;
 
-    convey_child_bundle(cc, recipient_address, child_coin, &next, None).await?;
-    // Book the hop locally: the child has left this wallet.
-    persist_child(cc, wallet_name, &next).await?;
+    // [D1] STORE BEFORE CONVEYING — see the note on `cosign_colored_child_retransfer`, which carries
+    // the full argument. The shape is identical here and the ordering rule is the same; only the
+    // stakes differ (a plain child's superseded state races the recipient's sats rather than an RGB
+    // allocation, so the loss is a double-spend of the piece rather than a burn).
+    persist_child(cc, wallet_name, &next).await.map_err(|e| {
+        anyhow::anyhow!(
+            "child {} is re-transferred and its replacement state S'_child is co-signed, but the \
+             superseding bundle could not be stored ({e}). Refusing to convey it: this wallet's \
+             `ctesr-` row would go on naming the SUPERSEDED state live, and `defend_ladders` drives \
+             that row — it would race the recipient over ext_child's payload output instead of \
+             defending them. Nothing has been conveyed, so retry the store and re-send.",
+            cb.child_statechain_id
+        )
+    })?;
+    Ok::<_, anyhow::Error>(next)
+    }
+    .await;
+
+    // Nothing conveyed yet — restore, exactly as the coloured lane does.
+    let next = match staged {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(
+                match crate::transfer_sender::persist_coin_status(
+                    cc,
+                    wallet_name,
+                    &child_sid,
+                    status_before_conveyance,
+                )
+                .await
+                {
+                    Ok(_) => e,
+                    Err(restore_err) => anyhow::anyhow!(
+                        "{e}\n\nAND the child's status could not be restored afterwards \
+                         ({restore_err}): child {child_sid} is left marked IN_TRANSFER even though \
+                         nothing was conveyed, so `defend_ladders` will not drive its chain — \
+                         repair the status or exit the child."
+                    ),
+                },
+            );
+        }
+    };
+
+    // A conveyance failure now leaves the superseding bundle ON DISK with nothing sent. That is the
+    // safe side of the trade — the alternative ordering hands out rival material against a tower
+    // that is still armed — and it is RECOVERABLE, not a loss: the child is still ours (IN_TRANSFER,
+    // so the tower stands down rather than driving a state nobody was given), and re-running the
+    // re-transfer supersedes `S'_child` in turn with a state one further δ down, paying whoever is
+    // named then. Say so, because a bare transport error here reads like "nothing happened".
+    convey_child_bundle(cc, recipient_address, child_coin, &next, None)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "child {child_sid}'s replacement state S'_child is co-signed and stored but could \
+                 not be conveyed ({e}). The child has NOT been given away and is not lost: it is \
+                 marked IN_TRANSFER, so this wallet's watchtower stands down instead of driving a \
+                 state no one holds. Re-run the re-transfer to supersede S'_child with a state one \
+                 further delta down, paying whoever you name then; the CSV floor is the only budget \
+                 this consumes."
+            )
+        })?;
+    Ok(next)
+}
+
+/// A COLOURED replacement child STATE, built but NOT co-signed — the new-recipient-paying
+/// `S'_child` of a coloured child re-transfer.
+#[derive(Clone, Debug)]
+pub struct ColoredChildStateDraft {
+    pub child_statechain_id: String,
+    /// The plain address this state pays, already resolved from the recipient's transfer address.
+    pub payee: String,
+    /// Strictly LOWER than the state it replaces — the race rule, and (via the seal rung) what keeps
+    /// the two rival transitions over `ext_child`'s payload output apart.
+    pub csv: u16,
+    /// `ext_child`'s payload output, for the co-signer's fail-closed recheck.
+    pub parent_txid: String,
+    pub parent_vout: u32,
+    pub parent_value: u64,
+    /// The child's whole allocation — a re-transfer MOVES it, it never splits it.
+    pub rgb_amount: u64,
+    pub tier: ColoredTierDraft,
+}
+
+/// **[CTES-R] Colour the new owner-paying state of a COLOURED child re-transfer.** Engine-only,
+/// synchronous, co-signs nothing — the `!Sync`-resolver rule every coloured builder here follows.
+///
+/// This is what [`child_retransfer`] cannot do and [`refuse_uncolored_over_colored_child`] therefore
+/// refuses: `ext_child`'s payload output is a SEALED output, so replacing the child's state with a
+/// plain tier would spend it with an RGB-unaware transaction and burn the allocation. The
+/// replacement carries a real transition assigning the child's whole allocation to the new owner.
+///
+/// `S'_child` is a RIVAL of the child's current state over the SAME outpoint. They are separated by
+/// the seal rung, which folds in the CSV — and the new CSV is strictly lower by construction
+/// (`cur − δ`), so the seals cannot collide (equal rung ⟹ equal blinding ⟹ one `OpId` and a hash
+/// lottery, `docs/utexo/CTESR-GATE.md` §2.2).
+pub fn build_colored_child_retransfer(
+    rgb: &mercury_rgb::RgbWallet,
+    cb: &ChildTesrBundle,
+    recipient_address: &str,
+) -> Result<ColoredChildStateDraft> {
+    use crate::rgb::{build_colored_tier, colored_tier_out_value, ColoredTierSpec, TierRole};
+
+    if !cb.is_colored() {
+        return Err(anyhow::anyhow!(
+            "build_colored_child_retransfer: this child is PLAIN — use child_retransfer"
+        ));
+    }
+    // Depth-1 + single-level parent + a derivable seal schedule, all in one.
+    let _ = cb.colored_child_seals()?;
+    let rgb_half = cb.rgb.as_ref().expect("is_colored");
+    let p = cb.parent.params;
+    let old_csv = cb
+        .child_state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("child state has no CSV — cannot re-transfer"))?;
+    let new_csv = old_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "child state CSV {old_csv} is at the floor ({}) — exit or re-anchor it instead of \
+                 re-sending",
+                p.d_floor
+            )
+        })?;
+
+    let (parent_value, parent_spk) =
+        tier_payload_prevout(&cb.child_extension, "coloured child re-transfer parent")?;
+    let s_value = colored_tier_out_value(parent_value, cb.parent.fee_rate).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the child extension's payload output ({parent_value} sat) cannot carry another \
+             coloured state at {} sat/vB",
+            cb.parent.fee_rate
+        )
+    })?;
+    let payee = mercurylib::tesr::payee_address(recipient_address, &cb.parent.network)?;
+    let seal = colored_tier_seal(
+        &cb.child_statechain_id,
+        TierRole::ChildState,
+        0,
+        0,
+        Some(new_csv),
+    );
+    let tier = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &cb.child_extension.txid,
+            prev_vout: cb.child_extension.payload_vout,
+            prev_value: parent_value,
+            prev_spk_hex: &parent_spk,
+            sequence: mercurylib::tesr::csv_blocks(new_csv).0,
+            payloads: &[(payee.clone(), s_value, rgb_half.amount)],
+            network: &cb.parent.network,
+            fee_rate: cb.parent.fee_rate,
+            nonce: Some(seal.rung as u64),
+        },
+        &seal,
+    )?;
+
+    Ok(ColoredChildStateDraft {
+        child_statechain_id: cb.child_statechain_id.clone(),
+        payee,
+        csv: new_csv,
+        parent_txid: cb.child_extension.txid.clone(),
+        parent_vout: cb.child_extension.payload_vout,
+        parent_value,
+        rgb_amount: rgb_half.amount,
+        tier: ColoredTierDraft {
+            tx_hex: tier.tx_hex,
+            txid: tier.txid,
+            payload_vout: tier.payloads[0].vout,
+            payload_value: tier.payloads[0].value,
+            payload_spk_hex: tier.payloads[0].script_pubkey_hex.clone(),
+            consignment: tier.consignment,
+        },
+    })
+}
+
+/// **[CTES-R] Co-sign, convey and book a COLOURED child re-transfer.** The coloured sibling of
+/// [`child_retransfer`], and byte for byte the same census arithmetic: exactly one `cosign_tier`
+/// round-trip and exactly one new `child_superseded_states` entry, which is what
+/// `verify_child_bundle`'s child census (`baseline + 2 + superseded`) expects. Colouring adds no
+/// co-sign, so the SE never learns anything changed.
+///
+/// Everything the draft asserts is RE-CHECKED against the live bundle and the recipient the caller
+/// actually named, because the draft is built where the RGB engine lives and consumed where the
+/// network lives.
+pub async fn cosign_colored_child_retransfer(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &mut Coin,
+    cb: &ChildTesrBundle,
+    draft: ColoredChildStateDraft,
+    recipient_address: &str,
+) -> Result<ChildTesrBundle> {
+    let rgb_half = cb
+        .rgb
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cosign_colored_child_retransfer on a PLAIN child"))?;
+    if draft.child_statechain_id != cb.child_statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured child state draft is for {} but the bundle is {}",
+            draft.child_statechain_id,
+            cb.child_statechain_id
+        ));
+    }
+    if draft.rgb_amount != rgb_half.amount {
+        return Err(anyhow::anyhow!(
+            "coloured child re-transfer would move {} but the child carries {} — a re-transfer \
+             moves the whole allocation, it never mints or burns part of one",
+            draft.rgb_amount,
+            rgb_half.amount
+        ));
+    }
+    let want_payee = mercurylib::tesr::payee_address(recipient_address, &cb.parent.network)?;
+    if draft.payee != want_payee {
+        return Err(anyhow::anyhow!(
+            "coloured child state draft pays {} but this transfer is to {want_payee} — refusing",
+            draft.payee
+        ));
+    }
+    if draft.parent_txid != cb.child_extension.txid
+        || draft.parent_vout != cb.child_extension.payload_vout
+    {
+        return Err(anyhow::anyhow!(
+            "coloured child state draft spends {}:{} but the child extension's payload output is \
+             {}:{}",
+            draft.parent_txid,
+            draft.parent_vout,
+            cb.child_extension.txid,
+            cb.child_extension.payload_vout
+        ));
+    }
+    let old_csv = cb
+        .child_state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("child state has no CSV"))?;
+    if draft.csv >= old_csv {
+        return Err(anyhow::anyhow!(
+            "coloured child state draft's CSV {} does not out-race the state it replaces ({old_csv})",
+            draft.csv
+        ));
+    }
+    if rgb_half.consignments.len() != 2 {
+        return Err(anyhow::anyhow!(
+            "coloured child carries {} consignments for its 2 own tiers — refusing to re-transfer a \
+             bundle whose proofs are not indexed by exit order",
+            rgb_half.consignments.len()
+        ));
+    }
+
+    // ---- [D1 / A2] ARM THE WATCHTOWER DOWN, DURABLY, BEFORE THE SUPERSEDING STATE EXISTS. ------
+    //
+    // `defend_ladders`' child loop drives `ctesr-<child>` for any child whose coin this wallet still
+    // holds CONFIRMED, and `transfer_colored_child` does not mark the coin WITHDRAWN until AFTER
+    // this function returns. So for the whole duration of the co-sign and the conveyance the
+    // liveness allowlist admits this child, and the only thing deciding what gets broadcast is the
+    // row's content — which still names the state we are about to supersede. A pass landing in that
+    // window broadcasts `state_child(us)`, which rivals `S'_child(them)` over `ext_child`'s payload
+    // output and, on the coloured lane, burns the allocation being paid.
+    //
+    // Same remedy as the whole-coin lane in `transfer_sender::execute_ex`, for the same reason
+    // (durable local evidence beats asking the coordinator: no network on a per-block broadcast
+    // path, no outage-induced blindness, no trust in the counterparty's answer). Restored below if
+    // we abort before conveying — nothing has escaped at that point, so a still-ours child must not
+    // be left without a tower.
+    let child_sid = cb.child_statechain_id.clone();
+    let status_before_conveyance = crate::transfer_sender::persist_coin_status(
+        cc,
+        wallet_name,
+        &child_sid,
+        mercurylib::wallet::CoinStatus::IN_TRANSFER,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to re-transfer coloured child {child_sid}: its coin could not be durably \
+             marked IN_TRANSFER before the co-sign ({e}). Proceeding would leave this wallet's \
+             watchtower driving the state that is about to be superseded, which rivals the \
+             recipient's S'_child over ext_child's payload output and destroys their allocation. \
+             Nothing has been co-signed and the child is unchanged."
+        )
+    })?;
+
+    let staged = async {
+    let signed = cosign_tier(
+        cc,
+        child_coin,
+        draft.tier.tx_hex.clone(),
+        draft.parent_value,
+        &cb.parent.network,
+    )
+    .await?;
+
+    let mut next = cb.clone();
+    // Full disclosure, exactly as the plain path: the state we just replaced was co-signed, so it
+    // stays counted — and it sits one δ HIGHER, so it loses the race for ext_child's payload output.
+    next.child_superseded_states.push(next.child_state.clone());
+    next.child_state = TesrTier {
+        txid: draft.tier.txid.clone(),
+        signed_tx: signed,
+        out_value: draft.tier.payload_value,
+        csv: Some(draft.csv),
+        payload_vout: draft.tier.payload_vout,
+    };
+    next.child_owner_exit_address = draft.payee;
+    // The leaf consignment is REPLACED, not appended: `ColoredChild::consignments` is indexed by the
+    // child's own exit order `[ext_child, state_child]`.
+    let mut consignments = rgb_half.consignments.clone();
+    consignments[1] = draft.tier.consignment;
+    next.rgb = Some(ColoredChild { consignments, ..rgb_half });
+
+    // ---- [D1] STORE THE SUPERSEDING BUNDLE **BEFORE** CONVEYING IT. --------------------------
+    //
+    // This call used to convey first and store second. Between the two, the recipient held a
+    // co-signed `S'_child` while this wallet's `ctesr-<child>` row still named the state it
+    // REPLACES as live — and `defend_ladders`' child loop drives exactly that row. The two states
+    // spend the same outpoint (`ext_child`'s payload output), and on the coloured lane the
+    // recipient's whole allocation lives on `S'_child`, so a watchtower pass landing in that window
+    // would not defend anything: it would race the recipient we just paid and BURN their asset.
+    //
+    // The sender's coin is not what closes this. `transfer_colored_child` leaves the child coin
+    // CONFIRMED until it returns, so the liveness allowlist (L1) ADMITS the row for the whole
+    // duration of the conveyance — by design, because a child re-transfer has no on-chain step and
+    // the coin is genuinely still ours until the handover completes. What decides the outcome is
+    // therefore the row's CONTENT, and storing first makes the sender's tower an ALLY of the
+    // recipient rather than a rival: it now drives `T -> X_m -> SP -> ext_child -> S'_child`, which
+    // is precisely the chain the recipient needs underneath them.
+    //
+    // A failure here is FATAL and conveys nothing. That is the safe direction: continuing would
+    // hand out an allocation this wallet is armed to destroy — a third party's loss rather than our
+    // own — whereas aborting leaves the child exactly where it was, still ours, still exitable from
+    // the bundle already on disk. `S'_child` is co-signed and unrecoverable, but it is also
+    // unreachable by anyone else, so the only cost of the abort is one wasted SE signature.
+    persist_child(cc, wallet_name, &next).await.map_err(|e| {
+        anyhow::anyhow!(
+            "coloured child {} is re-transferred and S'_child is co-signed, but the superseding \
+             bundle could not be stored ({e}). Refusing to convey it: this wallet's `ctesr-` row \
+             would go on naming the SUPERSEDED state live, and `defend_ladders` drives that row — \
+             broadcasting it would race the recipient over ext_child's payload output and DESTROY \
+             the allocation being paid. Nothing has been conveyed and the child is unchanged; \
+             retry the store, then re-send.",
+            cb.child_statechain_id
+        )
+    })?;
+    Ok::<_, anyhow::Error>(next)
+    }
+    .await;
+
+    // Nothing has been conveyed yet, so an abort leaves the child wholly ours: put its status back
+    // rather than stranding a live child without a watchtower. A failed restore is surfaced, never
+    // swallowed — it is the only way the owner learns the child is undefended.
+    let next = match staged {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(
+                match crate::transfer_sender::persist_coin_status(
+                    cc,
+                    wallet_name,
+                    &child_sid,
+                    status_before_conveyance,
+                )
+                .await
+                {
+                    Ok(_) => e,
+                    Err(restore_err) => anyhow::anyhow!(
+                        "{e}\n\nAND the child's status could not be restored afterwards \
+                         ({restore_err}): child {child_sid} is left marked IN_TRANSFER even though \
+                         nothing was conveyed, so `defend_ladders` will not drive its chain. \
+                         Nothing was given away, but the child is UNDEFENDED until the status is \
+                         repaired — restore it, or exit the child."
+                    ),
+                },
+            );
+        }
+    };
+
+    // A conveyance failure now leaves the superseding bundle ON DISK with nothing sent. That is the
+    // safe side of the trade — the alternative ordering hands out rival material against a tower
+    // that is still armed — and it is RECOVERABLE, not a loss: the child is still ours (IN_TRANSFER,
+    // so the tower stands down rather than driving a state nobody was given), and re-running the
+    // re-transfer supersedes `S'_child` in turn with a state one further δ down, paying whoever is
+    // named then. Say so, because a bare transport error here reads like "nothing happened".
+    convey_child_bundle(cc, recipient_address, child_coin, &next, None)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "child {child_sid}'s replacement state S'_child is co-signed and stored but could \
+                 not be conveyed ({e}). The child has NOT been given away and is not lost: it is \
+                 marked IN_TRANSFER, so this wallet's watchtower stands down instead of driving a \
+                 state no one holds. Re-run the re-transfer to supersede S'_child with a state one \
+                 further delta down, paying whoever you name then; the CSV floor is the only budget \
+                 this consumes."
+            )
+        })?;
     Ok(next)
 }
 
@@ -3028,6 +3588,67 @@ fn watch_pass_seen(electrum: &electrum_client::Client, bundle: &TesrBundle) -> R
             Err(e) => {
                 // CSV not met yet / parent unconfirmed — retry on the next pass, but SAY SO.
                 failures.push(format!("{}: {e}", tier.txid));
+                break;
+            }
+        }
+    }
+    Ok(WatchState::Acted { ids, failures })
+}
+
+/// **Tower pass for a split CHILD — the child-lane sibling of [`watch_pass`].**
+///
+/// A child's ladder is not rooted at its own funding output: `SP.out[sp_vout]` is un-broadcast, and
+/// the whole chain hangs off the PARENT's on-chain `F`. So "has someone started a contested exit?"
+/// is the same question for a child as for its parent — *is `F` spent?* — and the answer decides
+/// whether this pass does anything at all.
+///
+/// It matters because the child's threat model is not the parent's. What a child has to survive is
+/// the parent's retained `S_0`, which rivals the child's `SP` over `X_m.out[0]`. The child wins that
+/// race by construction (`SP` carries a strictly lower CSV, enforced at adoption by
+/// `verify_child_bundle`) — but only if somebody actually BROADCASTS the child's chain while the
+/// race is on. Before this existed nothing did: [`watch_pass`] is driven from the `tesr-` rows and a
+/// child has none, so an adopted child — including every COLOURED child, whose `SP.out[j]` carries
+/// the RGB allocation — sat undefended through exactly the event it was designed to win.
+///
+/// Keyless and idempotent, on the same contract as [`watch_pass`]: every tx is already co-signed,
+/// nothing here can co-sign, `Idle` and `Blind` are different answers, and a not-yet-mature tier
+/// reports itself as a `failures` entry rather than as silence.
+pub fn watch_child_pass(
+    electrum: &electrum_client::Client,
+    cb: &ChildTesrBundle,
+) -> WatchState {
+    match watch_child_pass_seen(electrum, cb) {
+        Ok(state) => state,
+        Err(e) => WatchState::Blind { reason: e.to_string() },
+    }
+}
+
+fn watch_child_pass_seen(
+    electrum: &electrum_client::Client,
+    cb: &ChildTesrBundle,
+) -> Result<WatchState> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    // `?` is load-bearing, exactly as in `watch_pass_seen`: a backend that cannot answer "is F
+    // spent?" must never be read as "F is unspent".
+    if !outpoint_spent(electrum, &cb.parent.f_txid, cb.parent.f_vout)? {
+        return Ok(WatchState::Idle);
+    }
+    let mut ids = Vec::new();
+    let mut failures = Vec::new();
+    for (signed, _csv) in child_exit_chain(cb) {
+        let raw = hex::decode(&signed)
+            .map_err(|e| anyhow::anyhow!("child exit chain carries unusable signed tx hex: {e}"))?;
+        let txid = deserialize::<Transaction>(&raw)
+            .map_err(|e| anyhow::anyhow!("child exit chain tx did not deserialize: {e}"))?
+            .txid()
+            .to_string();
+        if tx_known(electrum, &txid)? {
+            continue; // already on-chain / in mempool (often the racer's own T or X_m)
+        }
+        match electrum.transaction_broadcast_raw(&raw) {
+            Ok(_) => ids.push(txid),
+            Err(e) => {
+                failures.push(format!("{txid}: {e}"));
                 break;
             }
         }
@@ -4439,6 +5060,155 @@ fn verify_tier_cosigned(
         .map_err(|_| anyhow::anyhow!("signature does not verify against the aggregate key A"))
 }
 
+/// **THE RETIREMENT ASSERTION, source-level half: no UNCOLOURED tier builder is reachable with a
+/// coloured coin.**
+///
+/// Every function in this module that constructs a PLAIN tier —
+/// `mercurylib::tesr::build_{trigger,extension,state,split_state,detrigger,extension_from,state_from}`
+/// — spends an output that, on a coloured coin, carries an RGB seal. Doing so with an RGB-unaware
+/// transaction destroys the allocation, which is the one thing this protocol may never do. Each such
+/// function must therefore either call [`refuse_uncolored_over_colored`] /
+/// [`refuse_uncolored_over_colored_child`], or appear in [`GUARD_EXEMPT`] with the reason it does not
+/// need to.
+///
+/// This is a GREP over this module's own source, and it is deliberately that rather than a behavioural
+/// test: the hazard is a builder somebody adds LATER without a guard, which no behavioural test can
+/// anticipate. A per-builder behavioural test proves the guards that exist work (see
+/// `colored_interlock_tests` below); this proves the set of guarded builders is COMPLETE.
+#[cfg(test)]
+mod uncoloured_builder_census {
+    /// Builders that construct a PLAIN (RGB-unaware) tier. Any call to one of these puts the
+    /// enclosing function on the hook for a carrier guard.
+    const PLAIN_TIER_BUILDERS: &[&str] = &[
+        "mercurylib::tesr::build_trigger(",
+        "mercurylib::tesr::build_extension(",
+        "mercurylib::tesr::build_extension_from(",
+        "mercurylib::tesr::build_state(",
+        "mercurylib::tesr::build_state_from(",
+        "mercurylib::tesr::build_split_state(",
+        "mercurylib::tesr::build_detrigger(",
+    ];
+
+    /// The guard tokens that discharge the obligation.
+    const GUARDS: &[&str] =
+        &["refuse_uncolored_over_colored(", "refuse_uncolored_over_colored_child("];
+
+    /// `(function, why it needs no guard)`. Every entry is a claim that a COLOURED coin cannot
+    /// reach that function, and each one is checked below against a real property, not just listed.
+    const GUARD_EXEMPT: &[(&str, &str)] = &[
+        (
+            "establish",
+            "Builds a coin's FIRST ladder, so there is no bundle to inspect and no seal to break \
+             yet — the coin has no coloured ladder by definition. A carrier is kept out at the \
+             single decision site in the SDK's claim pass, which routes a carrier with exactly one \
+             booked allocation to `build_colored_ladder_auto` and leaves every other carrier on the \
+             flat lane (`LadderSkipReason::RgbCarrier`). Guarding here is impossible, not merely \
+             omitted.",
+        ),
+        (
+            "establish_child",
+            "Only reachable from `in_ladder_split`, which IS guarded — a coloured parent is refused \
+             before any child is established. It takes no bundle of its own to test.",
+        ),
+    ];
+
+    /// Top-level `fn` / `pub fn` / `pub async fn` boundaries of the NON-test source.
+    fn production_functions() -> Vec<(String, String)> {
+        let src = include_str!("tesr.rs");
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut name = String::from("<file scope>");
+        let mut body = String::new();
+        for line in src.lines() {
+            // Everything from the first top-level `#[cfg(test)]` on is test code, including this
+            // module. Stop there so the census never grades its own fixtures.
+            if line.starts_with("#[cfg(test)]") {
+                break;
+            }
+            let decl = line
+                .strip_prefix("pub async fn ")
+                .or_else(|| line.strip_prefix("pub fn "))
+                .or_else(|| line.strip_prefix("async fn "))
+                .or_else(|| line.strip_prefix("fn "));
+            if let Some(rest) = decl {
+                out.push((std::mem::take(&mut name), std::mem::take(&mut body)));
+                name = rest
+                    .split(|c: char| c == '(' || c == '<' || c == ' ')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string();
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        out.push((name, body));
+        out
+    }
+
+    #[test]
+    fn every_plain_tier_builder_call_is_behind_a_carrier_guard() {
+        let mut unguarded: Vec<String> = Vec::new();
+        let mut exempt_used: Vec<String> = Vec::new();
+        let mut seen_any = false;
+        for (name, body) in production_functions() {
+            let builders: Vec<&str> = PLAIN_TIER_BUILDERS
+                .iter()
+                .copied()
+                .filter(|b| body.contains(b))
+                .collect();
+            if builders.is_empty() {
+                continue;
+            }
+            seen_any = true;
+            if GUARDS.iter().any(|g| body.contains(g)) {
+                continue;
+            }
+            match GUARD_EXEMPT.iter().find(|(f, _)| *f == name) {
+                Some((f, _)) => exempt_used.push((*f).to_string()),
+                None => unguarded.push(format!("{name} (calls {builders:?})")),
+            }
+        }
+        assert!(
+            seen_any,
+            "the census found NO plain tier builder call at all — the source parser has drifted \
+             from the code and this test is now vacuous, which is worse than failing"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these functions build an UNCOLOURED tier with no carrier guard and no stated \
+             exemption — on a coloured coin each one spends a sealed output with an RGB-unaware \
+             transaction and DESTROYS the allocation: {unguarded:?}"
+        );
+        // A stale exemption is a hole that looks like a decision. Every entry must still be earning
+        // its place.
+        let stale: Vec<&str> = GUARD_EXEMPT
+            .iter()
+            .map(|(f, _)| *f)
+            .filter(|f| !exempt_used.iter().any(|u| u == f))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these guard exemptions no longer correspond to an unguarded builder — delete them \
+             rather than leaving a standing licence: {stale:?}"
+        );
+    }
+
+    /// The exemption for `establish` claims the SDK's claim pass is the decision site. That claim is
+    /// about a different crate, so it is asserted where it can be: `establish` must not itself be
+    /// able to produce a coloured ladder (it has no RGB engine argument at all), which is what makes
+    /// "a carrier must not reach it" the SDK's job rather than a missing branch here.
+    #[test]
+    fn establish_cannot_colour_anything_so_the_decision_must_be_upstream() {
+        let src = include_str!("tesr.rs");
+        let start = src.find("\npub async fn establish(").expect("establish exists");
+        let body = &src[start..start + 2_000];
+        assert!(
+            !body.contains("RgbWallet") && !body.contains("contract_id"),
+            "`establish` has gained RGB awareness — the exemption in GUARD_EXEMPT is now wrong and \
+             the carrier decision may no longer be entirely upstream"
+        );
+    }
+}
+
 #[cfg(test)]
 mod verify_tests {
     use super::*;
@@ -4497,6 +5267,8 @@ mod verify_tests {
                 amount: 400,
                 consignments: vec!["x".into(), "y".into()],
             }),
+            // These shape tests fire before any chain access, so the conveyed chain is not read.
+            parent_flat_backups: vec![],
         }
     }
 
@@ -4612,9 +5384,13 @@ mod verify_tests {
     #[test]
     fn colored_child_floor_price() {
         let rate = 2.0;
+        // RE-DERIVED, not weakened ([D4]): a coloured rung is 576 sat, not 574. The tier's signed
+        // vsize is 168 vB — `crate::rgb::COLORED_TIER_VBYTES`, measured on a production-finalised
+        // transaction — because a TES-R taproot signature carries an explicit SIGHASH_ALL byte and
+        // so is 65 witness bytes, not 64. 168 * 2 + 240 = 576.
         assert_eq!(
             colored_child_floor(rate, COLORED_LADDER_DUST),
-            2 * 574 + 330,
+            2 * 576 + 330,
             "two coloured rungs plus a spendable final output"
         );
         assert!(
@@ -4623,17 +5399,37 @@ mod verify_tests {
             "a headless child must be cheaper than a full root ladder"
         );
         let plain = mercurylib::tesr::min_child_value(rate, COLORED_LADDER_DUST);
+        // RE-DERIVED ([D4], BOTH halves): two rungs x 43 vB of opret x 2 sat/vB.
+        //
+        // This read `2 * 88` while [D4] was fixed on the coloured half only: the extra vB per rung
+        // was the explicit SIGHASH_ALL byte, which is on EVERY tier, and it showed up as a coloured
+        // "surcharge" purely because `mercurylib::tesr::TIER_VBYTES` still modelled a 64-byte
+        // SIGHASH_DEFAULT witness (124 vB for a transaction that measures 125). With that constant
+        // corrected the surcharge is what it always physically was: the opret and nothing else.
         assert_eq!(
             colored_child_floor(rate, COLORED_LADDER_DUST) - plain,
-            2 * 86,
-            "the coloured child surcharge is two oprets"
+            2 * (mercurylib::tesr::P2TR_OUT_VBYTES * 2),
+            "the coloured child surcharge is exactly two oprets"
         );
-        // THE MIXED-WALLET TRAP, pinned as arithmetic. The legacy 1,500-sat token piece clears the
-        // coloured CHILD floor, so a coloured split can carve one — but NOT the coloured ROOT floor,
-        // so the moment its receiver claims it as a root coin the colouring is refused. Retiring the
-        // flat lane while `TOKEN_PIECE_SATS` is 1,500 therefore strands received pieces.
+        assert_eq!(colored_child_floor(rate, COLORED_LADDER_DUST) - plain, 2 * 86);
+        // THE MIXED-WALLET TRAP, pinned as arithmetic and now ESCAPED. The legacy 1,500-sat token
+        // piece cleared the coloured CHILD floor, so a coloured split would carve one — but not the
+        // coloured ROOT floor, so the moment its receiver claimed it as a root coin the colouring
+        // was refused. Retiring the flat lane at that value strands every received piece.
+        //
+        // The interval `(child_floor, root_floor)` is the trap, and it is a property of THESE two
+        // functions, so it is pinned here; `TOKEN_PIECE_SATS` was moved OUT of it (1_500 → 3_066 =
+        // the root floor at twice the committed rate, [D4]-corrected from 3_054) and that move is
+        // pinned, with the constant itself in scope, by
+        // `mercury_utexo_sdk::tokens::token_piece_sats_is_the_coloured_root_floor`.
+        // This crate cannot see the SDK's constant, so the two halves of the statement live in the
+        // two crates that own them.
         assert!(1_500 > colored_child_floor(rate, COLORED_LADDER_DUST));
         assert!(1_500 < colored_ladder_floor(rate, COLORED_LADDER_DUST));
+        assert!(
+            3_066 >= colored_ladder_floor(rate, COLORED_LADDER_DUST),
+            "the replacement piece size must clear the coloured ROOT floor"
+        );
     }
 
     /// PRE-EXISTING, corrected (not weakened): this used to assert `verify_bundle(&b, 3, 0).is_ok()`
@@ -4687,23 +5483,40 @@ mod verify_tests {
     // ---- CTES-R: colour the ladder (this commit). ----------------------------------------------
 
     /// The coloured-rung price and the three-rung floor, pinned as arithmetic rather than prose.
-    /// `docs/utexo/CTESR-GATE.md` §3.4: the opret serialises to exactly `P2TR_OUT_VBYTES`, so a
-    /// coloured rung is `committed_fee_for_outputs(2, rate) + P2A_VALUE`.
+    /// `docs/utexo/CTESR-GATE.md` §3.4 as corrected by [D4]: a coloured tier is one whole extra
+    /// P2TR output wide (the opret serialises to exactly `P2TR_OUT_VBYTES`) and nothing else, so a
+    /// coloured rung is `ceil(crate::rgb::colored_tier_vbytes(1) * rate) + P2A_VALUE` and an
+    /// uncoloured one is `ceil(mercurylib::tesr::TIER_VBYTES * rate) + P2A_VALUE`, with
+    /// `TIER_VBYTES + P2TR_OUT_VBYTES == COLORED_TIER_VBYTES`. The explicit `SIGHASH_ALL` byte
+    /// [D4] found is a cost of EVERY tier, and is now carried by both constants rather than by the
+    /// coloured one alone.
     #[test]
     fn colored_rung_price_and_floor() {
         let rate = 2.0;
         let rung = crate::rgb::colored_committed_fee(1, rate) + mercurylib::tesr::P2A_VALUE;
-        assert_eq!(rung, 574, "a coloured rung at 2 sat/vB is (124+43)*2 + 240");
-        // Strictly dearer than an uncoloured rung, by exactly 43 * rate.
+        // RE-DERIVED, not weakened: 576, not 574. `crate::rgb::COLORED_TIER_VBYTES` = 168 vB is
+        // MEASURED on a production-finalised tier, and 168 * 2 + 240 = 576. The old 574 came from
+        // (124 + 43) * 2 + 240, i.e. a 167-vB model of a 168-vB transaction.
+        assert_eq!(crate::rgb::colored_tier_vbytes(1), 168);
+        assert_eq!(rung, 576, "a coloured rung at 2 sat/vB is 168 * 2 + 240");
+        // Strictly dearer than an uncoloured rung, by exactly 43 vB of opret — and by NOTHING else.
+        // [D4] is now fixed on both halves: `mercurylib::tesr::TIER_VBYTES` was 124 (a 64-byte
+        // SIGHASH_DEFAULT witness) for a transaction that measures 125, so the sighash byte — a cost
+        // every TES-R tier pays — masqueraded as a coloured surcharge and this assertion read 88.
+        // With TIER_VBYTES = 125 the identity 125 + 43 == 168 holds and the surcharge is 43 * rate.
         let plain = mercurylib::tesr::committed_fee(rate) + mercurylib::tesr::P2A_VALUE;
-        assert_eq!(rung - plain, 86, "the coloured surcharge is 43 vB * 2 sat/vB, independent of n");
+        assert_eq!(plain, 490, "an uncoloured rung at 2 sat/vB is 125 * 2 + 240");
+        assert_eq!(rung - plain, mercurylib::tesr::P2TR_OUT_VBYTES * 2);
+        assert_eq!(rung - plain, 86, "the coloured surcharge is exactly the opret's 43 vB * 2 sat/vB");
         assert_eq!(
             colored_ladder_floor(rate, COLORED_LADDER_DUST),
-            3 * 574 + 330,
+            3 * 576 + 330,
             "three coloured rungs plus a spendable final output"
         );
-        // The standard 1,500-sat token piece cannot afford a coloured ladder — the case that must
-        // be caught BEFORE the first co-sign, not at rung 3.
+        // The LEGACY 1,500-sat token piece cannot afford a coloured ladder — the case that must
+        // be caught BEFORE the first co-sign, not at rung 3. (`TOKEN_PIECE_SATS` has since been
+        // re-derived to 3_054 so that new pieces clear this floor; old 1,500-sat pieces still exist
+        // in wallets, so the pre-flight gate this pins is still load-bearing.)
         assert!(1_500 < colored_ladder_floor(rate, COLORED_LADDER_DUST));
     }
 

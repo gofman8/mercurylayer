@@ -435,14 +435,22 @@ pub async fn execute() -> Result<()> {
         over_err.lines().next().unwrap_or("").trim()
     );
 
-    // ---- 6b. WHAT THE BALANCE-LEVEL VIEW SAYS — recorded, never used as evidence. ----------------
+    // ---- 6b. THE ENGINE'S UTXO VIEW MOVED TO THE EXIT TIP. --------------------------------------
     //
-    // The exited allocation now sits at `owner_exit_address`, a MERCURY seed-derived key. That key
-    // is not in the RGB engine's BDK descriptor, so rgb-lib's UTXO-driven views cannot see the
-    // outpoint at all. Printed so the gap is on the record and nobody mistakes a balance reading for
-    // the survival proof in either direction: E7 showed the balance staying full over a DEAD stock,
-    // and this is the mirror case — a LIVE stock the balance cannot see. Only the stock probe and
-    // the empty-set validation above are evidence.
+    // This block used to be a printed KNOWN GAP. The exited allocation sits at `owner_exit_address`,
+    // a MERCURY seed-derived key that is not in the RGB engine's BDK descriptor, so no wallet sync
+    // can ever discover it — which meant that after a coloured exit `list_allocations` /
+    // `get_asset_balance` were not merely incomplete but STALE: they reported the asset at the
+    // funding outpoint that the exit had just SPENT.
+    //
+    // `unilateral_exit` now registers the tip with `register_statechain_utxo` the moment the walk
+    // completes, passing the pre-exit outpoint as the spend, so both ends move together. Asserted in
+    // BOTH directions, because a view that gains the tip while keeping the stale entry double-counts
+    // the asset — which is a worse answer than the gap was.
+    //
+    // NOTE ON E7: this is a statement about rgb-lib's UTXO BOOKKEEPING, not about whether the asset
+    // survived. The survival evidence is still, and only, the stock probe and the empty-witness-set
+    // validation above. A balance reading is never used as evidence here in either direction.
     let allocs = alice.list_token_allocations(&asset_id).await.unwrap_or_default();
     let bal = alice
         .get_token_balances()
@@ -455,14 +463,28 @@ pub async fn execute() -> Result<()> {
         format!("{}:{}", bundle.current().state.txid, bundle.current().state.payload_vout);
     let stale = allocs.iter().any(|(op, _)| *op == f_outpoint);
     let at_tip = allocs.iter().any(|(op, _)| *op == tip_outpoint);
+    assert!(
+        at_tip,
+        "after a completed coloured exit the allocation must be registered at the exit tip \
+         {tip_outpoint}; rgb-lib reports {allocs:?}"
+    );
+    assert!(
+        !stale,
+        "the SPENT funding outpoint {f_outpoint} must not still hold the allocation — the exit tip \
+         was registered but the pre-exit outpoint was not marked spent, so the asset is now \
+         double-counted: {allocs:?}"
+    );
+    assert_eq!(
+        bal,
+        Some(SUPPLY),
+        "the engine's balance must be the whole supply once, at the tip"
+    );
     println!(
-        "SDK75 - (informational, and it is a KNOWN GAP) after the exit rgb-lib's UTXO views report \
-         allocations {allocs:?} and balance {bal:?}. The allocation is at the SPENT funding \
-         outpoint {f_outpoint}: {stale}. It is at the exit tip {tip_outpoint}: {at_tip}. Both views \
-         are driven by rgb-lib's own UTXO table, and the exit tip pays a MERCURY seed-derived key \
-         that is not in the engine's descriptor — so after a coloured exit these views are STALE, \
-         not merely incomplete. Recorded, never asserted: the stock probe and the empty-set \
-         validation above are the only evidence in either direction (E7)."
+        "SDK75 - (d) the exit TIP is registered with the engine: rgb-lib now reports {allocs:?} \
+         (balance {bal:?}) — the allocation is at the exit tip {tip_outpoint} and NOT at the spent \
+         funding outpoint {f_outpoint}. The tip pays a Mercury seed-derived key absent from the \
+         engine's descriptor, so no sync could have found it; `register_statechain_utxo` at exit \
+         completion is what moved the view."
     );
 
     // ---- 7. NEGATIVE CONTROL: a PLAIN carrier is still refused. ----------------------------------
@@ -470,9 +492,19 @@ pub async fn execute() -> Result<()> {
     // The guard that opened is "a carrier whose ladder is COLOURED", not "a carrier". A wallet with
     // the coloured lane OFF produces exactly the old shape, and exiting it would burn the asset.
     let _ = std::fs::remove_dir_all("./rgb-data-sdk75_bob");
+    // RE-DERIVED, not weakened. This used to obtain bob's plain carrier from the DEFAULT and assert
+    // the default was off. The default is now ON, so bob opts out explicitly — the negative control
+    // is about a carrier with NO coloured ladder, and how that wallet came to be configured that way
+    // was never the point. The default is pinned in the opposite direction instead, so the flip
+    // itself is now under test rather than merely assumed.
+    assert!(
+        SdkConfig::regtest("default-probe").colored_ladder,
+        "colored_ladder must now default to ON — CTES-R is the token lane and the legacy \
+         coloured-split lane is retired"
+    );
     let mut bob_cfg = SdkConfig::regtest("sdk75_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk75_bob".to_string());
-    assert!(!bob_cfg.colored_ladder, "colored_ladder must default to OFF");
+    bob_cfg.colored_ladder = false;
     let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
     let t = prepaid_token(&cc).await?;
     bob.add_prepaid_token(&t).await;

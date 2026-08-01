@@ -857,6 +857,38 @@ fn assert_receiver_state_is_presignable(
     Ok(())
 }
 
+/// Durably record `status` for the `duplicate_index == 0` coin of `statechain_id`, returning the
+/// status it had before the write so an abort can put it back.
+///
+/// [D1 / A2] This exists because `defend_ladders`' liveness allowlist reads the coin's status from
+/// the wallet DB, and the conveyance path used to set that status only in memory (see the arm-down
+/// note in `execute_ex`). The row is RE-READ here rather than reusing the caller's copy: the write
+/// replaces the whole `wallet_json` blob, so writing back a copy that was loaded before an SE
+/// round-trip would clobber whatever else happened in the meantime. Re-reading narrows the write to
+/// the single field this function owns.
+pub(crate) async fn persist_coin_status(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    status: CoinStatus,
+) -> Result<CoinStatus> {
+    let mut wallet = get_wallet(&client_config.pool, wallet_name).await?;
+    let coin = wallet
+        .coins
+        .iter_mut()
+        .find(|c| c.statechain_id.as_deref() == Some(statechain_id) && c.duplicate_index == 0)
+        .ok_or_else(|| {
+            anyhow!("no duplicate_index 0 coin for statechain id {statechain_id} in wallet {wallet_name}")
+        })?;
+    let previous = coin.status.clone();
+    if previous == status {
+        return Ok(previous);
+    }
+    coin.status = status;
+    update_wallet(&client_config.pool, &wallet).await?;
+    Ok(previous)
+}
+
 pub async fn execute(
     client_config: &ClientConfig,
     recipient_address: &str,
@@ -1044,6 +1076,65 @@ async fn execute_ex(
 
     let transfer_signature = create_transfer_signature(recipient_address, &input_txid, input_vout, &client_seckey)?;
 
+    // ---- [D1 / A2] ARM THE WATCHTOWER DOWN **DURABLY**, BEFORE ANY RIVAL MATERIAL EXISTS. -------
+    //
+    // `defend_ladders`' liveness allowlist (L1) broadcasts a coin's retained exit chain only while
+    // the coin reads CONFIRMED — and it reads that status from the wallet DB, re-loading the row on
+    // every pass. Until now the only thing that moved a conveyed coin out of CONFIRMED was
+    // `create_backup_transactions`, which sets `coin.status = IN_TRANSFER` **in memory**, on a copy
+    // of the wallet that is not written back until `update_wallet` at the very end of this function
+    // — after the coordinator transfer is open and after `transfer/update_msg` has handed the
+    // recipient a co-signed, receiver-paying `S'`. So on EVERY whole-coin conveyance there was a
+    // window in which the recipient held `S'` while this wallet's DISK still said CONFIRMED, and a
+    // concurrent watchtower pass was admitted by L1 and would broadcast the sender's retained `S`.
+    // The two spend the same `X_m.out[0]`; on the coloured lane the recipient's entire allocation
+    // lives on `S'`. That is the D1 theft, one level up from the split lane, and the filter was
+    // keyed on precisely the field that had not yet been written.
+    //
+    // WHY DURABILITY RATHER THAN A DIFFERENT KEY. The alternative was to key L1 on evidence the
+    // tower can verify for itself. The only such evidence for a whole-coin hop is the COORDINATOR's
+    // pending-transfer lock, and it fails on three counts: it puts a network round-trip on a
+    // per-block broadcast path; an unreachable coordinator would have to be read as blindness,
+    // disarming the tower during exactly the outage in which a griefer would trigger the carrier;
+    // and the coordinator is not trusted for safety, so a lying "no transfer is open" would induce
+    // the sender to destroy the recipient's allocation. Local durable state is checkable offline,
+    // synchronously, and by the only party whose keys can produce the rival transaction. So the
+    // write is made durable instead — hoisted here, ahead of every step that can produce material
+    // capable of paying anybody else.
+    //
+    // The arm-down covers the whole irreversible region and is UNDONE if we abort before the
+    // transfer is opened at the coordinator: up to `get_new_x1` nothing has escaped, so leaving the
+    // coin IN_TRANSFER would strip a still-ours coin of its automatic defence for no reason. After
+    // `get_new_x1` the recipient can complete the handover, so IN_TRANSFER stands — which is the
+    // status the call already ended in on the success path.
+    let status_before_conveyance = persist_coin_status(
+        client_config,
+        &wallet.name,
+        &statechain_id,
+        CoinStatus::IN_TRANSFER,
+    )
+    .await
+    .map_err(|e| {
+        anyhow!(
+            "refusing to transfer statechain id {statechain_id}: its coin could not be durably \
+             marked IN_TRANSFER before the conveyance ({e}). Proceeding would leave this wallet's \
+             watchtower armed with a retained state that rivals the one the recipient is about to \
+             hold over the same output — on a coloured coin that destroys their allocation. \
+             Nothing has been co-signed and the coin is unchanged."
+        )
+    })?;
+    // Keep the in-memory copy in step with the row we just wrote, so the `update_wallet` at the end
+    // of this function cannot silently put CONFIRMED back.
+    for c in wallet
+        .coins
+        .iter_mut()
+        .filter(|c| c.statechain_id.as_deref() == Some(statechain_id.as_str()) && c.duplicate_index == 0)
+    {
+        c.status = CoinStatus::IN_TRANSFER;
+    }
+
+    let staged = async {
+
     // TES-R: if this coin has a persisted exit ladder, convey it so the receiver can run
     // the R′ verification (crate::tesr::verify_bundle) instead of the flat backup-count check.
     // Absent (a legitimately flat coin — carrier / [B0] / legacy-no-aggregate, proven above) →
@@ -1132,6 +1223,40 @@ async fn execute_ex(
         .await
         .map(|txs| txs.iter().map(|b| b.tx.clone()).collect())
         .unwrap_or_default();
+
+    Ok::<_, anyhow::Error>((protocol_version, tesr_ladder, backup_transactions, branch_txs, terminal_parents))
+    }
+    .await;
+
+    // Everything above happened BEFORE the transfer was opened at the coordinator, so an abort here
+    // has conveyed nothing and the coin is still wholly ours — put its status back rather than
+    // leaving a live coin without a watchtower. A failed restore is NOT swallowed: it is appended to
+    // the error, because it is the only remaining way the caller learns their coin is defenceless.
+    let (protocol_version, tesr_ladder, backup_transactions, branch_txs, terminal_parents) =
+        match staged {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(
+                    match persist_coin_status(
+                        client_config,
+                        wallet_name,
+                        &statechain_id,
+                        status_before_conveyance,
+                    )
+                    .await
+                    {
+                        Ok(_) => e,
+                        Err(restore_err) => anyhow!(
+                            "{e}\n\nAND the coin's status could not be restored afterwards \
+                             ({restore_err}): statechain id {statechain_id} is left marked \
+                             IN_TRANSFER even though nothing was conveyed, so `defend_ladders` will \
+                             not drive its ladder. Nothing was given away, but the coin is \
+                             UNDEFENDED until the status is repaired — restore it, or exit the coin."
+                        ),
+                    },
+                );
+            }
+        };
 
     // Open the transfer at the coordinator now, AFTER every sender pre-sign above (see the note by
     // `input_txid`). Returns x1 for the t1 blinding tweak.

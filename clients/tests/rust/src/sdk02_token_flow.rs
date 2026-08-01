@@ -77,6 +77,42 @@ pub async fn execute() -> Result<()> {
     let alice_tokens = alice.get_token_balances().await?;
     assert_eq!(alice_tokens[0].balance, 1000, "full supply on alice");
 
+    // [CTES-R] Wait for the carrier's COLOURED ladder before paying.
+    //
+    // This is a synchronisation point, not a relaxation. `colored_ladder` now defaults ON, so
+    // `claim()` establishes a coloured ladder over the carrier — but it can only do so once the
+    // allocation is BOOKED, which is the very condition the loop above waits for. The two can land
+    // in the same `claim()` pass or in consecutive ones, so without this the test would sometimes
+    // reach `transfer_tokens` before the ladder exists and be refused by the retired-lane gate.
+    // Waiting for the state under test is the fix; taking the old lane would not be.
+    let carrier_sid = {
+        let mut found = None;
+        for _ in 0..60 {
+            alice.claim().await?;
+            let coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk2_alice")
+                .await?
+                .coins;
+            for c in coins.iter().filter(|c| c.duplicate_index == 0) {
+                let Some(sid) = c.statechain_id.clone() else { continue };
+                if mercuryrustlib::tesr::load(&cc, "sdk2_alice", &sid)
+                    .await?
+                    .is_some_and(|b| b.is_colored())
+                {
+                    found = Some(sid);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        found.ok_or_else(|| {
+            anyhow!("alice's carrier never got a COLOURED ladder — the CTES-R lane is not engaged")
+        })?
+    };
+    println!("SDK02 - alice's carrier {carrier_sid} carries a COLOURED (CTES-R) ladder");
+
     // --- Off-chain token transfer: 250 TKN to bob ----------------------------------------------
     let mut bob_events = bob.subscribe();
     let bob_bg = bob.start_background();
@@ -86,7 +122,19 @@ pub async fn execute() -> Result<()> {
     }
     let r = alice.transfer_tokens(&asset_id, &bob_address, 250).await?;
     assert!(r.used_split);
-    println!("SDK02 - sent 250 TKN off-chain (colored split + branch-carrying handover)");
+    println!(
+        "SDK02 - sent 250 TKN off-chain over the CTES-R in-ladder split (piece {} = {} sat)",
+        r.coins[0].statechain_id, r.coins[0].amount_sats
+    );
+    // The lane is asserted, not assumed: the piece must be a COLOURED CHILD carved out of `SP`, and
+    // the parent carrier must be terminalized. If this had gone over the retired split lane the
+    // piece would be a plain statechain coin with a consignment envelope and no `ctesr-` bundle.
+    assert!(
+        mercuryrustlib::tesr::load_child(&cc, "sdk2_alice", &r.coins[0].statechain_id)
+            .await?
+            .is_none(),
+        "the conveyed piece must not still be held as a child bundle by the SENDER"
+    );
 
     let (recv_asset, recv_amount) = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
@@ -113,13 +161,38 @@ pub async fn execute() -> Result<()> {
     assert_eq!(alice_tokens[0].balance, 750, "alice keeps 750 TKN change");
     println!("SDK02 - balances: alice 750 TKN / bob 250 TKN — fully off-chain");
 
-    // --- bob's cooperative exit: branch materializes, then a fresh SE-co-signed spend ----------
+    // --- bob's cooperative exit: the token coin is DELIBERATELY not swept -----------------------
+    //
+    // RE-DERIVED, and the old claim was already wrong. This step used to print "bob cooperatively
+    // exited N coin(s) ... (branch materialized + direct spend)" while asserting nothing, and N has
+    // always been 0: `withdraw` refuses to sweep a token carrier into an RGB-unaware L1 spend, which
+    // is precisely what would DESTROY the allocation. The line described an exit that never happened.
+    //
+    // So the property is stated as what it actually is, and asserted: a cooperative sweep must leave
+    // the token coin alone, and bob's balance must survive it intact. bob's real exit route is the
+    // keyless five-tier coloured child walk (`unilateral_exit`), which sdk77 drives end to end and
+    // which this test deliberately does not repeat.
     bob_bg.abort();
     let exit_addr = bitcoin_core::getnewaddress()?;
     let withdrawn = bob.withdraw(&exit_addr, None, None).await?;
-    println!("SDK02 - bob cooperatively exited {} coin(s) to {exit_addr} (branch materialized + direct spend)", withdrawn.len());
+    assert!(
+        withdrawn.is_empty(),
+        "a cooperative sweep must not touch bob's token coin — an RGB-unaware spend of it destroys \
+         the allocation; it swept {withdrawn:?}"
+    );
     bitcoin_core::generatetoaddress(3, &core)?;
+    let bob_after = bob.get_token_balances().await?;
+    assert_eq!(
+        bob_after.first().map(|b| b.balance),
+        Some(250),
+        "bob's 250 TKN must survive the cooperative sweep untouched"
+    );
+    println!(
+        "SDK02 - bob's cooperative sweep to {exit_addr} correctly swept 0 coin(s): the coloured \
+         token coin is excluded (an RGB-unaware spend would destroy the allocation) and bob still \
+         holds 250 TKN"
+    );
 
-    println!("SDK02 - SUCCESS: issue -> off-chain token transfer (colored split + consignment in the transfer msg, validated off-chain against the branch, booked under the VERIFIED contract) -> balances 750/250 -> cooperative exit. Tokens with zero on-chain cost per payment.");
+    println!("SDK02 - SUCCESS: issue -> off-chain token transfer over the CTES-R in-ladder split (a coloured child carved out of SP, conveyed and booked under the VERIFIED contract) -> balances 750/250 -> a cooperative sweep that correctly leaves the token coin alone. Tokens with zero on-chain cost per payment.");
     Ok(())
 }

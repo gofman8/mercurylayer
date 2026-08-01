@@ -203,6 +203,18 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "WatchtowerBlind",
                                 json!({"pass": pass.as_str(), "detail": detail}),
                             ),
+                            // [CTES-R] A coloured exit finished and the engine now sees the asset at
+                            // the exit tip. Hosts that cache balances should re-read them here.
+                            WalletEvent::ColoredExitTipRegistered { statechain_id, outpoint } => (
+                                "ColoredExitTipRegistered",
+                                json!({"statechain_id": statechain_id, "outpoint": outpoint}),
+                            ),
+                            // 🔴 The exit landed but the engine was NOT updated: every UTXO-driven
+                            // rgb-lib view for this wallet is stale until the tip is registered.
+                            WalletEvent::ColoredExitTipUnregistered { statechain_id, detail } => (
+                                "ColoredExitTipUnregistered",
+                                json!({"statechain_id": statechain_id, "detail": detail}),
+                            ),
                         };
                         let line = json!({"event": name, "data": data}).to_string();
                         let mut out = tokio::io::stdout();

@@ -84,7 +84,7 @@ async fn wait_carrier(cc: &ClientConfig, w: &UtexoWallet, name: &str, core: &str
         w.claim().await?;
         if token_balance(w, asset).await? >= units {
             let rec = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, name).await?;
-            if rec.coins.iter().any(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0 && c.amount == Some(10_000)) {
+            if rec.coins.iter().any(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0 && c.amount == Some(mercury_utexo_sdk::tokens::TOKEN_CARRIER_SATS as u32)) {
                 return Ok(());
             }
         }

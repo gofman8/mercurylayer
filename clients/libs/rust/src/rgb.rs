@@ -22,6 +22,7 @@ use bitcoin::{
 use electrum_client::ElectrumApi;
 use mercurylib::tesr::{
     committed_fee_for_outputs, p2a_script, payee_address, P2A_SCRIPT_BYTES, P2A_VALUE,
+    P2TR_OUT_VBYTES,
 };
 use mercurylib::transaction::{
     create_signature, get_partial_sig_request_for_colored_tx,
@@ -875,17 +876,75 @@ pub fn colored_payload_vouts(tx: &Transaction) -> Vec<u32> {
         .collect()
 }
 
-/// The committed fee a **coloured** tier must bake in: `committed_fee_for_outputs(n_payload + 1)`.
+/// **The signed virtual size of a one-payload coloured tier — MEASURED, not modelled.**
 ///
-/// `docs/utexo/CTESR-GATE.md` §3.4. The `opret` output serialises to exactly 43 bytes (8 value + 1
-/// length + 34 scriptPubKey = `6a20` + a 32-byte MPC commitment), which is exactly
-/// `P2TR_OUT_VBYTES`, so "one more payload output" is not an approximation — it is the identity.
-/// Measured exact (2.000 sat/vB) on the coloured transaction at n=1 and n=3. Using the uncoloured
-/// `committed_fee_for_outputs(n_payload, …)` underpays every coloured tier by a constant
-/// `43 × rate` sats regardless of `n`, which breaks the self-funding property that lets a pre-signed
-/// tier relay and confirm standalone without its P2A anchor.
+/// Byte for byte, over the shape [`build_colored_tier`] emits and
+/// [`mercurylib::transaction::new_backup_transaction`] finalises:
+///
+/// | part                                          | bytes |
+/// |-----------------------------------------------|-------|
+/// | nVersion (3) + nLockTime                      | 8     |
+/// | input count + output count                    | 2     |
+/// | input (32 txid + 4 vout + 1 scriptSig len + 4 nSequence) | 41 |
+/// | RGB `opret` out (8 value + 1 len + 34 `6a20`‖32-byte MPC commitment) | 43 |
+/// | P2TR payload out (8 + 1 + 34)                 | 43    |
+/// | P2A anchor out (8 + 1 + 4 = `OP_1 <0x4e73>`)  | 13    |
+///
+/// base = **150 B** ⟹ weight = `4·150 + 2` (segwit marker+flag) `+ 67` (witness: 1 item-count varint
+/// + 1 length varint + a **65-byte** signature) = **669 WU** ⟹ vsize = `⌈669/4⌉` = **168 vB**.
+///
+/// **The 65th signature byte is the whole of [D4].** A taproot key-spend signature is 64 bytes
+/// *only* under `SIGHASH_DEFAULT`. TES-R does not sign that way: `mercurylib::tesr::cosign_tier_request`
+/// hashes with `TapSighashType::All`, and `new_backup_transaction{,_multi}` serialise
+/// `taproot::Signature { hash_ty: All }`, which appends the explicit `0x01` sighash byte. Modelling a
+/// 64-byte witness therefore understates EVERY tier by exactly 1 vB (verified: at 2 sat/vB the
+/// previous model committed 334 sat to a transaction that relays at 168 vB — 1.988 sat/vB, short of
+/// the rate the pre-signed tier is supposed to be able to confirm at with no P2A child attached).
+///
+/// **Both halves are now corrected.** The uncoloured `mercurylib::tesr::TIER_VBYTES` carried the same
+/// 1-vB understatement (124 on the `SIGHASH_DEFAULT` model; its true signed size is **125**) and has
+/// been moved to 125, so the two lanes differ by exactly one [`P2TR_OUT_VBYTES`] — the RGB `opret`
+/// output and nothing else:
+///
+/// ```text
+/// TIER_VBYTES (125) + P2TR_OUT_VBYTES (43) == COLORED_TIER_VBYTES (168)
+/// ```
+///
+/// That identity is what `SDK_E2E=74` asserts on a live coloured ladder
+/// (`colored_committed_fee(1, r) − committed_fee(r) == 43·r`); fixing one half only is what made it
+/// red. It is pinned here by [`ctesr_tests::the_coloured_surcharge_is_exactly_one_opret_output`] —
+/// MEASURED on both shapes through the production finaliser, not restated.
+pub const COLORED_TIER_VBYTES: u64 = 168;
+
+/// Signed vsize of a coloured tier carrying `n_payload` value outputs (plus the `opret` and the P2A
+/// anchor). Each payload past the first adds exactly one P2TR output, i.e. `P2TR_OUT_VBYTES`.
+///
+/// Measured: 168 / 211 / 254 vB at n = 1 / 2 / 3. Pinned against real, production-finalised
+/// transactions by [`ctesr_tests::the_coloured_fee_matches_a_measured_signed_tier`], and re-checked
+/// against the *actual* rgb-lib output of every single build by [`build_colored_tier`] step 6b.
+pub fn colored_tier_vbytes(n_payload: usize) -> u64 {
+    COLORED_TIER_VBYTES + (n_payload.saturating_sub(1)) as u64 * P2TR_OUT_VBYTES
+}
+
+/// The committed fee a **coloured** tier must bake in: `⌈colored_tier_vbytes(n_payload) · rate⌉`.
+///
+/// `docs/utexo/CTESR-GATE.md` §3.4, corrected by [D4]. Two separate costs over the uncoloured tier:
+///
+/// 1. the RGB `opret` output serialises to exactly 43 bytes, which is exactly `P2TR_OUT_VBYTES`, so
+///    the coloured tier is one whole extra P2TR output wide — that part was already right;
+/// 2. the explicit `SIGHASH_ALL` byte on the taproot signature, worth 1 more vB — that part was
+///    **not**, and is what this function now includes. See [`COLORED_TIER_VBYTES`].
+///
+/// The fee exists so a pre-signed tier **relays and confirms standalone, without its P2A anchor**.
+/// A fee sized to 167 vB on a 168-vB transaction is not that guarantee, so the model moved to the
+/// transaction rather than the transaction to the model: at 2 sat/vB `n=1` is now 336 sat (was 334)
+/// and `n=3` is 508 (was 506).
+///
+/// Cost (2) is not a coloured-lane cost at all — it applies to every TES-R tier — so with
+/// `mercurylib::tesr::TIER_VBYTES` corrected to 125 the relation to the uncoloured fee is now EXACT
+/// and carries no residue: `colored_committed_fee(n, r) == committed_fee_for_outputs(n + 1, r)`.
 pub fn colored_committed_fee(n_payload: usize, fee_rate_sats_per_vb: f64) -> u64 {
-    committed_fee_for_outputs(n_payload + 1, fee_rate_sats_per_vb)
+    (colored_tier_vbytes(n_payload) as f64 * fee_rate_sats_per_vb).ceil() as u64
 }
 
 /// Total value available to the payload outputs of a coloured tier = parent value − the coloured
@@ -960,9 +1019,13 @@ pub struct ColoredTier {
     pub blinding: u64,
     /// Fee baked into the transaction (`prev_value − Σ outputs`).
     pub committed_fee: u64,
-    /// vsize of this transaction once a taproot key-spend witness (one 64-byte Schnorr signature) is
-    /// attached — the size it will actually relay at. `committed_fee / signed_vsize` is the
+    /// vsize of this transaction once its taproot key-spend witness is attached — the size it will
+    /// actually relay at. The witness is one [`TAPROOT_SIGHASH_ALL_WITNESS_BYTES`]-byte signature,
+    /// which is what the production finaliser serialises; modelling the 64-byte `SIGHASH_DEFAULT`
+    /// form here is what made this field read 1 vB low ([D4]). `committed_fee / signed_vsize` is the
     /// effective rate, and the two together are what §3.4 pins to exactly 2.000 sat/vB.
+    ///
+    /// Always equals [`colored_tier_vbytes`]`(payloads.len())` — enforced at build time (step 6b).
     pub signed_vsize: u64,
 }
 
@@ -973,12 +1036,26 @@ impl ColoredTier {
     }
 }
 
-/// vsize of a tier tx once a taproot key-spend witness (one 64-byte Schnorr sig per input) is on it.
+/// Number of witness bytes one TES-R taproot key-spend signature occupies: a 64-byte Schnorr
+/// signature **plus the explicit `SIGHASH_ALL` byte**.
+///
+/// Not 64. `mercurylib::tesr::cosign_tier_request` hashes under `TapSighashType::All`, and
+/// `mercurylib::transaction::new_backup_transaction{,_multi}` push
+/// `taproot::Signature { hash_ty: TapSighashType::All }.to_vec()`, which is 65 bytes — the 64-byte
+/// form is `SIGHASH_DEFAULT` only. Modelling 64 here is what made the coloured committed fee 1 vB
+/// short of the transaction it funds ([D4]).
+const TAPROOT_SIGHASH_ALL_WITNESS_BYTES: usize = 65;
+
+/// vsize of a tier tx once its taproot key-spend witness (one signature per input) is on it.
+///
+/// The signature width is [`TAPROOT_SIGHASH_ALL_WITNESS_BYTES`], i.e. what the production finaliser
+/// actually serialises — this function must never be cheaper than reality, because the committed fee
+/// is derived from it.
 fn signed_vsize(tx: &Transaction) -> u64 {
     let mut probe = tx.clone();
     for input in probe.input.iter_mut() {
         let mut witness = Witness::new();
-        witness.push(vec![0u8; 64]);
+        witness.push(vec![0u8; TAPROOT_SIGHASH_ALL_WITNESS_BYTES]);
         input.witness = witness;
     }
     probe.vsize() as u64
@@ -1259,8 +1336,41 @@ pub fn build_colored_tier(
     if committed_fee != expected_fee {
         return Err(anyhow!(
             "coloured tier {txid} committed {committed_fee} sat of fee, expected {expected_fee} \
-             (= committed_fee_for_outputs({}, {}))",
-            n_payload + 1,
+             (= ceil(colored_tier_vbytes({n_payload}) {} vB * {} sat/vB))",
+            colored_tier_vbytes(n_payload),
+            spec.fee_rate
+        ));
+    }
+
+    // 6b. [D4] THE SELF-FUNDING ASSERT — measured on THIS transaction, not on the formula.
+    //
+    // The committed fee exists for exactly one property: a pre-signed tier must relay and confirm
+    // STANDALONE, with no P2A child attached. That property is a statement about the fee rate over
+    // the vsize the tier will actually have on the wire — so it is checked against the vsize rgb-lib
+    // just produced, with the witness the production finaliser will actually put on it
+    // (TAPROOT_SIGHASH_ALL_WITNESS_BYTES), and not against the arithmetic that produced the fee.
+    //
+    // This runs on EVERY coloured tier the product ever builds, which is the point: a future change
+    // to the tier shape (an extra output, a different sighash, a second input) cannot silently
+    // desynchronise the model from the transaction the way the missing SIGHASH_ALL byte did.
+    let measured_vsize = signed_vsize(&colored);
+    let modelled_vsize = colored_tier_vbytes(n_payload);
+    if measured_vsize != modelled_vsize {
+        return Err(anyhow!(
+            "coloured tier {txid} measures {measured_vsize} vB signed but colored_tier_vbytes\
+             ({n_payload}) models {modelled_vsize} vB — the committed fee {committed_fee} sat is \
+             sized to the model, so the tier would relay at {:.3} sat/vB instead of {} and could \
+             stall without its P2A anchor. Fix COLORED_TIER_VBYTES, not this check.",
+            committed_fee as f64 / measured_vsize as f64,
+            spec.fee_rate
+        ));
+    }
+    let min_fee = (measured_vsize as f64 * spec.fee_rate).ceil() as u64;
+    if committed_fee < min_fee {
+        return Err(anyhow!(
+            "coloured tier {txid} committed {committed_fee} sat over a measured {measured_vsize} vB \
+             = {:.3} sat/vB, short of the {} sat/vB it must relay standalone at (needs {min_fee})",
+            committed_fee as f64 / measured_vsize as f64,
             spec.fee_rate
         ));
     }
@@ -1289,7 +1399,7 @@ pub fn build_colored_tier(
         consignment,
         blinding,
         committed_fee,
-        signed_vsize: signed_vsize(&colored),
+        signed_vsize: measured_vsize,
     })
 }
 
@@ -1298,7 +1408,12 @@ mod ctesr_tests {
     use super::*;
     use std::collections::HashSet;
 
-    const ROLES: [TierRole; 9] = [
+    // Every role, and the list must STAY complete: it drives the wire-tag disjointness and the
+    // per-role blinding-uniqueness assertions below, so a role missing here is a role whose seals
+    // were never proved distinct from anyone else's. `ChildExtension`/`ChildState` arrived with the
+    // coloured in-ladder split and were absent from this list, which is exactly the shape of hole
+    // that ships a seal collision (`docs/utexo/CTESR-GATE.md` §2.2).
+    const ROLES: [TierRole; 11] = [
         TierRole::Funding,
         TierRole::Trigger,
         TierRole::Extension,
@@ -1308,6 +1423,8 @@ mod ctesr_tests {
         TierRole::Backup,
         TierRole::Split,
         TierRole::Combine,
+        TierRole::ChildExtension,
+        TierRole::ChildState,
     ];
 
     #[test]
@@ -1370,21 +1487,205 @@ mod ctesr_tests {
         );
     }
 
-    /// §3.4 — the coloured fee is the uncoloured fee for one MORE output, because the opret is
-    /// exactly `P2TR_OUT_VBYTES`. Pinned at the two arities E1 measured.
+    /// A coloured tier of the exact shape [`build_colored_tier`] emits: nVersion 3, no locktime, one
+    /// P2TR key-spend input, the RGB `opret` FIRST (the fork's `opreturn_first`, triggered by the
+    /// P2TR payloads), `n` P2TR payload outputs, the 240-sat P2A anchor last.
+    fn tier_shape(n_payload: usize) -> Transaction {
+        let payload_spk =
+            ScriptBuf::from(hex::decode(format!("5120{}", "22".repeat(32))).unwrap());
+        // `6a20` ‖ 32 bytes — exactly what rgb-psbt-utils' `ScriptBuf::new_op_return(commitment)`
+        // produces for a 32-byte MPC commitment.
+        let opret_spk = ScriptBuf::from(hex::decode(format!("6a20{}", "11".repeat(32))).unwrap());
+        let mut output = vec![TxOut { value: 0, script_pubkey: opret_spk }];
+        for _ in 0..n_payload {
+            output.push(TxOut { value: 10_000, script_pubkey: payload_spk.clone() });
+        }
+        output.push(TxOut { value: P2A_VALUE, script_pubkey: p2a_script() });
+        Transaction {
+            version: 3,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_str(&"11".repeat(32)).unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0xFFFF_FFFD),
+                witness: Witness::default(),
+            }],
+            output,
+        }
+    }
+
+    /// The UNCOLOURED counterpart of [`tier_shape`], byte-identical to what
+    /// `mercurylib::tesr::build_tier_tx` / `build_split_state` emit: no `opret`, `n` P2TR payload
+    /// outputs, the 240-sat P2A anchor last. The two shapes differ by exactly one output, which is
+    /// the whole claim the surcharge identity makes.
+    fn plain_tier_shape(n_payload: usize) -> Transaction {
+        let mut tx = tier_shape(n_payload);
+        assert!(tx.output[0].script_pubkey.is_op_return(), "tier_shape puts the opret first");
+        tx.output.remove(0);
+        if n_payload == 1 {
+            // Not a derivative: the base case must be byte-identical to what the REAL uncoloured
+            // builder emits, or "strip the opret" would be a claim about this helper rather than
+            // about the protocol.
+            let real = mercurylib::tesr::build_tier_tx(
+                Txid::from_str(&"11".repeat(32)).unwrap(),
+                0,
+                Sequence(0xFFFF_FFFD),
+                ScriptBuf::from(hex::decode(format!("5120{}", "22".repeat(32))).unwrap()),
+                10_000,
+            );
+            assert_eq!(tx, real, "the plain shape must be exactly mercurylib's build_tier_tx output");
+        }
+        tx
+    }
+
+    /// vsize of `tx` after the **production** finaliser has put a real TES-R witness on it.
+    ///
+    /// This deliberately routes through `mercurylib::transaction::new_backup_transaction_multi` —
+    /// the same function that finalises every co-signed tier — rather than constructing a witness
+    /// here. That is what makes this a measurement instead of a restatement: if the sighash type or
+    /// the witness layout ever changes, this number moves on its own.
+    fn finalised_vsize(tx: &Transaction) -> u64 {
+        let unsigned_hex = hex::encode(bitcoin::consensus::encode::serialize(tx));
+        // Schnorr signatures are fixed-width, so any 64 bytes parse; only the SERIALISED width
+        // matters to vsize, and that is decided by the finaliser's `hash_ty`, not by these bytes.
+        let signed_hex = mercurylib::transaction::new_backup_transaction_multi(
+            unsigned_hex,
+            vec!["01".repeat(64)],
+        )
+        .expect("the production finaliser must accept a tier-shaped transaction");
+        let signed: Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(signed_hex).unwrap()).unwrap();
+        assert_eq!(
+            signed.input[0].witness.iter().next().unwrap().len(),
+            TAPROOT_SIGHASH_ALL_WITNESS_BYTES,
+            "TES-R signs SIGHASH_ALL, so the witness item is 64 sig bytes + 1 sighash byte"
+        );
+        signed.vsize() as u64
+    }
+
+    /// **[D4] The model and the transaction must agree — proved by MEASURING, at every arity.**
+    ///
+    /// The committed fee exists so a pre-signed tier relays and confirms standalone, WITHOUT its P2A
+    /// anchor. That property is `committed_fee / real_vsize >= rate`, so it is only worth anything if
+    /// `real_vsize` is the size the transaction actually has once signed. This test therefore builds
+    /// the tier shape, hands it to the production finaliser, measures `Transaction::vsize()`, and
+    /// requires the model to match it exactly.
+    ///
+    /// Counterfactual: restore the pre-[D4] model (`COLORED_TIER_VBYTES = 167`, or a 64-byte witness
+    /// in `signed_vsize`) and this fails at n=1 with 334 != 336 — the previous constants sized a
+    /// 167-vB transaction that measures 168 vB and would have relayed at 1.988 sat/vB.
     #[test]
-    fn the_coloured_fee_is_the_uncoloured_fee_plus_one_output() {
+    fn the_coloured_fee_matches_a_measured_signed_tier() {
         let rate = 2.0;
-        assert_eq!(colored_committed_fee(1, rate), committed_fee_for_outputs(2, rate));
-        assert_eq!(colored_committed_fee(3, rate), committed_fee_for_outputs(4, rate));
-        // (TIER_VBYTES 124 + 43) * 2 = 334 over the measured 167 vB coloured 1-payload tier.
-        assert_eq!(colored_committed_fee(1, rate), 334);
-        // (124 + 3*43) * 2 = 506 over the measured 253 vB coloured 3-payload split state.
-        assert_eq!(colored_committed_fee(3, rate), 506);
+        for n_payload in 1..=4usize {
+            let tx = tier_shape(n_payload);
+            let measured = finalised_vsize(&tx);
+
+            assert_eq!(
+                colored_tier_vbytes(n_payload),
+                measured,
+                "n={n_payload}: the vsize model must equal the finalised transaction"
+            );
+            // `signed_vsize` is what `build_colored_tier` records on every real tier; it must be the
+            // same measurement, not a second opinion.
+            assert_eq!(
+                signed_vsize(&tx),
+                measured,
+                "n={n_payload}: signed_vsize must model the production witness exactly"
+            );
+            // The property the fee is FOR: standalone relay at the target rate, no anchor.
+            let fee = colored_committed_fee(n_payload, rate);
+            assert!(
+                fee >= (measured as f64 * rate).ceil() as u64,
+                "n={n_payload}: {fee} sat over {measured} vB = {:.3} sat/vB < {rate}",
+                fee as f64 / measured as f64
+            );
+            // At an integral rate the fee is exact — no silent over-payment either.
+            assert_eq!(fee, measured * 2, "n={n_payload}: a coloured tier must pay EXACTLY {rate}");
+        }
+    }
+
+    /// §3.4, as corrected by [D4] **on both halves**: a coloured tier is an uncoloured tier plus ONE
+    /// `opret` output and nothing else, so the coloured fee is exactly the uncoloured fee for one
+    /// MORE output — no residue.
+    ///
+    /// The `+ 1 vB` term this assertion used to carry was never a coloured-lane cost: it was the
+    /// explicit `SIGHASH_ALL` byte, which is on EVERY TES-R tier, and it appeared here only because
+    /// `mercurylib::tesr::TIER_VBYTES` still modelled a 64-byte `SIGHASH_DEFAULT` witness. With that
+    /// constant corrected 124 → 125 the term is gone and the relation is exact — a TIGHTENING: any
+    /// future 1-vB drift between the two lanes now fails here instead of cancelling out.
+    #[test]
+    fn the_coloured_fee_is_exactly_the_uncoloured_fee_for_one_more_output() {
+        let rate = 2.0;
+        for n_payload in 1..=4usize {
+            assert_eq!(
+                colored_committed_fee(n_payload, rate),
+                committed_fee_for_outputs(n_payload + 1, rate),
+                "n={n_payload}: the opret is exactly one P2TR output and costs exactly that"
+            );
+        }
+        // 168 vB * 2 = 336 over the MEASURED 168 vB coloured 1-payload tier (was 334 / 167 vB).
+        assert_eq!(colored_committed_fee(1, rate), 336);
+        // (168 + 2*43) = 254 vB * 2 = 508 over the MEASURED 254 vB coloured 3-payload split state.
+        assert_eq!(colored_committed_fee(3, rate), 508);
         assert!(
             colored_committed_fee(1, rate) > mercurylib::tesr::committed_fee(rate),
             "a coloured tier must pay MORE than an uncoloured one, or it cannot relay standalone"
         );
+    }
+
+    /// **THE SURCHARGE IDENTITY, MEASURED ON BOTH LANES** — the constant-level statement of what
+    /// `SDK_E2E=74` asserts on a live coloured ladder:
+    /// `colored_committed_fee(1, r) − committed_fee(r) == 43·r`.
+    ///
+    /// Both sides are finalised through the **production** finaliser and measured with
+    /// `Transaction::vsize()`; nothing here restates a constant. That is what makes this evidence:
+    /// [D4] was found by measurement and was fixed on the coloured half only, which broke this
+    /// identity in the direction that LOOKS harmless (the coloured lane over-paid relative to the
+    /// plain one) while leaving every uncoloured tier under-paying its own standalone relay. Fixing
+    /// one half alone now fails here.
+    #[test]
+    fn the_coloured_surcharge_is_exactly_one_opret_output() {
+        // MEASURED, both lanes, same finaliser.
+        let colored_measured = finalised_vsize(&tier_shape(1));
+        let plain_measured = finalised_vsize(&plain_tier_shape(1));
+        assert_eq!(colored_measured, 168, "coloured 1-payload tier measures 168 vB");
+        assert_eq!(plain_measured, 125, "uncoloured 1-payload tier measures 125 vB");
+        assert_eq!(
+            colored_measured - plain_measured,
+            P2TR_OUT_VBYTES,
+            "the only difference between the lanes is the opret output"
+        );
+
+        // Both models must equal their own measurement...
+        assert_eq!(colored_tier_vbytes(1), colored_measured);
+        assert_eq!(mercurylib::tesr::TIER_VBYTES, plain_measured);
+        // ...at every arity a split state can reach.
+        for n in 1..=4usize {
+            assert_eq!(colored_tier_vbytes(n), finalised_vsize(&tier_shape(n)), "coloured n={n}");
+            assert_eq!(
+                mercurylib::tesr::TIER_VBYTES + (n as u64 - 1) * P2TR_OUT_VBYTES,
+                finalised_vsize(&plain_tier_shape(n)),
+                "uncoloured n={n}"
+            );
+        }
+
+        // ...and therefore the FEE surcharge is the opret's 43 vB at the committed rate — the
+        // `SDK_E2E=74` assertion verbatim, at several rates.
+        for rate in [1.0f64, 2.0, 5.0, 10.0] {
+            assert_eq!(
+                colored_committed_fee(1, rate) - mercurylib::tesr::committed_fee(rate),
+                (P2TR_OUT_VBYTES as f64 * rate).ceil() as u64,
+                "rate {rate}: coloured surcharge must be exactly the opret's 43 vB"
+            );
+        }
+        assert_eq!(colored_committed_fee(1, 2.0) - mercurylib::tesr::committed_fee(2.0), 43 * 2);
+        // And the plain fee is what the plain transaction actually needs: 250 sat over 125 vB.
+        assert_eq!(mercurylib::tesr::committed_fee(2.0), 250);
+        assert_eq!(mercurylib::tesr::committed_fee(2.0), plain_measured * 2);
     }
 
     #[test]
@@ -1429,3 +1730,4 @@ mod ctesr_tests {
         assert!(!p2a_script().is_op_return());
     }
 }
+

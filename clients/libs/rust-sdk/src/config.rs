@@ -56,23 +56,47 @@ pub struct SdkConfig {
     pub auto_exit_margin_blocks: u32,
     /// **[CTES-R] Colour the ladder of an RGB carrier.** When on, `claim()` establishes a COLOURED
     /// TES-R ladder over a carrier — `T`, `X_0` and `S_0` each carrying a valid RGB state transition
-    /// — instead of leaving it on the flat lane. Default **false**.
+    /// — instead of leaving it on the flat lane. Default **true**.
     ///
-    /// ## Why this is not on by default, stated exactly
+    /// ## Why it was off, and what changed
     ///
-    /// A coloured ladder and the legacy coloured-split lane are RIVAL spends of the same funding
+    /// A coloured ladder and the legacy coloured-SPLIT lane are RIVAL spends of the same funding
     /// output `F`, and the ladder's `T` carries **no timelock** while the legacy split is an
-    /// absolute-locktime backup that matures ~`initlock` blocks out. So a carrier that had both
-    /// would let its previous owner broadcast `T` the instant after conveying a split — an
-    /// immediate, cost-free clawback of both the sats and the asset, against a receiver who cannot
-    /// even race it. Today, with no ladder, the owner's only rival spend of `F` is that same
-    /// absolute-locktime backup, which the receiver's `auto_exit_due` pass beats by design.
+    /// absolute-locktime backup that matures ~`initlock` blocks out. A carrier holding both would
+    /// let its previous owner broadcast `T` the instant after conveying a split — an immediate,
+    /// cost-free clawback of the sats AND the asset, against a receiver who cannot even race it.
+    /// While both lanes existed, the only safe configuration was one lane per wallet, so this
+    /// defaulted to off.
     ///
-    /// Turning this on therefore makes the two lanes **mutually exclusive per coin**, fail-closed:
-    /// a coloured-laddered carrier is refused by `transfer_tokens` (the split lane) and by
-    /// `transfer` (no coloured conveyance schema yet). That is the honest state of CTES-R at this
-    /// commit — the ladder is built, co-signed and verifiable; moving a coin along it is the next
-    /// commit. Enable it in tests and in wallets exploring the coloured lane, not in production.
+    /// The legacy lane is now RETIRED rather than merely interlocked: with this flag on,
+    /// `UtexoWallet::refuse_legacy_colored_split_lane` refuses every route into
+    /// `create_colored_split_tx` / `create_colored_combine_tx` — the single-carrier transfer, the
+    /// multi-carrier combine and the N-recipient batch all reach the coloured in-ladder split
+    /// instead, and `tokens::retired_split_lane_census` asserts over the source that no route
+    /// escapes the gate. There is no longer a second spend of `F` for `T` to rival, which is what
+    /// makes ON the safe default rather than a brave one.
+    ///
+    /// ## The one exception: the MIGRATION HATCH [B1]
+    ///
+    /// Retiring the lane outright would STRAND every carrier CTES-R cannot serve. A carrier that
+    /// cannot be laddered has no coloured exit to walk, cannot be withdrawn as plain BTC (that burns
+    /// the asset) and — with the legacy lane closed — cannot be paid from either: a working coin
+    /// becomes an unspendable one, which is worse than the hazard the retirement avoids. The largest
+    /// such class is every pre-flip 1_500-sat token piece, sitting above the coloured CHILD floor
+    /// (so a split carved it) and below the coloured ROOT floor (so its receiver can never ladder
+    /// it) — the trap `tokens::TOKEN_PIECE_SATS` was re-derived to close for NEW pieces.
+    ///
+    /// So `tokens::migration_hatch_verdict` opens the legacy RGB-aware lane for, and only for,
+    /// carriers that hold no ladder AND for which no coloured ladder can be built — proved
+    /// read-only, per coin, at the moment of the spend, under the same `wallet_lock` that `claim()`
+    /// takes to build one. The retirement gate's premise is a rival trigger `T`; for that class no
+    /// `T` exists or can be built while the lock is held, so the premise is absent and the refusal
+    /// protects nothing. `UtexoWallet::unilateral_exit` opens for the same class in the same way:
+    /// it MATERIALISES the RGB-aware exit branch and never the plain backup. Every carrier keeps at
+    /// least one safe way out at all times (sdk78; unit `tokens::migration_hatch_is_narrow`).
+    ///
+    /// Setting it back to `false` re-enables the legacy lane for that wallet; the per-coin interlock
+    /// (`refuse_if_colored_ladder`) still stops any single coin from carrying both.
     pub colored_ladder: bool,
 }
 
@@ -95,12 +119,14 @@ pub struct SdkConfig {
 ///
 /// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
 ///   * an **RGB carrier** must never be laddered *with a PLAIN ladder* (an uncoloured tier spend
-///     would destroy the allocation), so by default it keeps the flat signed-once backup shape and
-///     transfers by backup-chain handover. [CTES-R] `SdkConfig::colored_ladder` lifts exactly this
-///     restriction: with it on, `claim()` builds a COLOURED ladder whose every tier carries a valid
-///     RGB state transition, so laddering MOVES the allocation. It is off by default because a
-///     coloured ladder and the legacy colored split are rival spends of one funding output — see
-///     that field's own note;
+///     would destroy the allocation). [CTES-R] `SdkConfig::colored_ladder`, now ON by default,
+///     builds it a COLOURED ladder instead — every tier carrying a valid RGB state transition, so
+///     laddering MOVES the allocation rather than destroying it. A carrier still falls back to the
+///     flat signed-once backup shape when the coloured lane cannot be taken *for that coin*: its
+///     allocation is not booked yet, its outpoint holds more than one allocation, or the RGB state
+///     could not be read this pass (`LadderSkipReason::RgbCarrier`). Those are retried on the next
+///     `claim()`, and while they last that carrier cannot be paid from at all — the legacy split
+///     lane it used to fall back to is retired;
 ///   * a **split sub-coin** whose funding is un-broadcast cannot root a trigger [B0].
 /// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead code left over
 /// from the pre-TES-R design.

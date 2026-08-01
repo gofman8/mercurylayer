@@ -89,6 +89,11 @@ pub async fn get_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_i
 
     let query = "SELECT txs FROM backup_txs WHERE statechain_id = $1 AND wallet_name = $2";
 
+    // `fetch_one`, so an ABSENT row is an `Err` — and callers DISTINGUISH a genuine absence from a
+    // failed read by DOWNCASTING to `sqlx::Error::RowNotFound` (`tokens::read_backup_rows`). Wrapping
+    // this error in an `anyhow!` to add context therefore breaks absence detection wallet-wide: every
+    // missing row starts reading as "the database could not be read", which fails closed so hard that
+    // `claim()` stops laddering anything. The bare sqlx error is load-bearing. Do not decorate it.
     let row = sqlx::query(query)
         .bind(statechain_id)
         .bind(wallet_name)

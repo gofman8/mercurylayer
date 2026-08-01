@@ -20,7 +20,7 @@
 //!   3. each tier chains through its parent's DECLARED payload vout (`T:1 -> X`, `X:1 -> S`), which
 //!      is the property an off-by-one would break;
 //!   4. the committed fee of each coloured tier is exactly `committed_fee_for_outputs(n + 1, rate)`
-//!      = 334 sat at 2 sat/vB, i.e. 86 sat more than the uncoloured 248 — the constant `43 vB * rate`
+//!      = 336 sat at 2 sat/vB, i.e. 86 sat more than the uncoloured 250 — the constant `43 vB * rate`
 //!      surcharge for the opret (CTESR-GATE §3.4). Underpaying it breaks the self-funding property
 //!      that lets a pre-signed tier relay standalone;
 //!   5. the LEAF consignment validates against the ladder's own UN-BROADCAST txids through the
@@ -33,10 +33,12 @@
 //!   7. the CENSUS balances at the value the plain path uses: `num_sigs == flat_backups(1) +
 //!      tiers(3)`, verified by the same bound verifier a receiver runs. Colouring adds ZERO SE
 //!      co-signs — the SE stays blind;
-//!   8. the LANE INTERLOCK holds: a coloured-laddered carrier REFUSES the legacy colored split.
-//!      `T` spends `F` with no timelock while a colored split is an absolute-locktime backup, so a
-//!      carrier holding both would let its previous owner claw back sats and asset instantly. One
-//!      carrier, one spend of `F`;
+//!   8. NO PLAIN-SPLIT PATH CAN REACH THE CARRIER: its sats are quarantined from plain-BTC
+//!      selection (so no plain split builder can even select it) and the uncoloured in-ladder split
+//!      refuses this bundle by name. This replaces the old "the legacy colored split refuses" probe,
+//!      which is no longer falsifiable at the E2E level because the legacy lane is now RETIRED and
+//!      unreachable from a coloured carrier — the gate is asserted over the source instead, by
+//!      `tokens::retired_split_lane_census`;
 //!   9. RENEWAL and TRANSFER — the RIVAL-TIER case, which is where a coloured ladder is actually
 //!      hard. Every renewal replaces `X_m` over the trigger's payload output and every transfer
 //!      replaces `S_k` over the extension's, so rivals over ONE outpoint are the NORMAL case. Under
@@ -50,8 +52,9 @@
 //!      second hop is the one that can only pass if the receiver's tier seals were really opened:
 //!      to build its own `S''` bob must colour a transition spending `X_m`'s payload output, which
 //!      is an INTERNAL seal of the chain it was handed, not the output that pays it;
-//!  11. and the DEFAULT is unchanged: a wallet with `colored_ladder` off leaves its carrier flat
-//!      (`LadderSkipped { RgbCarrier }`) and still transfers tokens end-to-end on the legacy lane.
+//!  11. and a wallet that OPTS OUT is unchanged: with `colored_ladder` explicitly off, carol's own
+//!      carrier stays flat (`LadderSkipped { RgbCarrier }`) and still transfers tokens end-to-end on
+//!      the legacy lane. (The DEFAULT is now ON; that is pinned separately, at the top of the test.)
 //!
 //! Run: SDK_E2E=74 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
@@ -110,10 +113,23 @@ pub async fn execute() -> Result<()> {
     let mut alice_cfg = SdkConfig::regtest("sdk74_alice");
     alice_cfg.rgb_data_dir = Some("./rgb-data-sdk74_alice".to_string());
     alice_cfg.colored_ladder = true;
-    // carol: the CONTROL wallet — default config, coloured ladders OFF.
+    // carol: the CONTROL wallet — coloured ladders explicitly OFF.
+    //
+    // RE-DERIVED, not weakened. This used to read `assert!(!carol_cfg.colored_ladder)` and rely on
+    // the DEFAULT to supply the off state. The default is now ON (the legacy split lane it rivalled
+    // is retired), so the control has to opt out by hand — but the property carol exists to prove is
+    // unchanged: a wallet running with the lane OFF still leaves its own carrier flat, and can still
+    // RECEIVE a coloured ladder built by someone else. Both halves are still asserted below. The
+    // default itself is now pinned in the opposite direction, one line down, so the flip cannot be
+    // reverted silently either.
+    assert!(
+        SdkConfig::regtest("default-probe").colored_ladder,
+        "colored_ladder must now default to ON — CTES-R is the token lane and the legacy \
+         coloured-split lane is retired"
+    );
     let mut carol_cfg = SdkConfig::regtest("sdk74_carol");
     carol_cfg.rgb_data_dir = Some("./rgb-data-sdk74_carol".to_string());
-    assert!(!carol_cfg.colored_ladder, "colored_ladder must default to OFF");
+    carol_cfg.colored_ladder = false;
     // bob and carol are the onward hops of the coloured coin.
     let mut bob_cfg = SdkConfig::regtest("sdk74_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk74_bob".to_string());
@@ -375,26 +391,83 @@ pub async fn execute() -> Result<()> {
     println!("SDK74 - allocation intact: {SUPPLY} still bound to the carrier outpoint {carrier_op}");
 
     // ---- 8. THE LANE INTERLOCK: one carrier, one spend of F. ------------------------------------
+    //
+    // WHAT THIS STEP USED TO ASSERT, AND WHY IT NO LONGER HOLDS AS WRITTEN. Until the CTES-R
+    // in-ladder split existed, `transfer_tokens` on a coloured carrier had exactly one route — the
+    // legacy `create_colored_split_tx`, which spends `F` directly. `T` already spends `F` with no
+    // timelock, so that split is a rival the previous owner out-races instantly; the SDK therefore
+    // REFUSED the whole operation, and this step asserted the refusal.
+    //
+    // The property that mattered was never "a coloured carrier cannot pay" — it was "**nothing but
+    // `T` may ever spend `F`**". There is now a second route that satisfies it: the coloured
+    // in-ladder split carves the payment out of `SP`, a descendant of `T` over `X_m`'s payload
+    // output, so `F` gains no rival. So the assertion is not deleted or relaxed — it is restated as
+    // the invariant it was standing in for, and checked directly on the transaction that was built:
+    // the payment must SUCCEED and no tier of it may spend `F`. (The refusal itself is still tested,
+    // at its own level, by `refuse_if_colored_ladder`'s unit coverage and by sdk77's plain-lane
+    // negative controls.)
     for _ in 0..2 {
         let t = prepaid_token(&cc).await?;
         alice.add_prepaid_token(&t).await;
     }
-    let err = alice
-        .transfer_tokens(&asset_id, &bob_address, 250)
-        .await
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| {
-            panic!(
-                "REGRESSION: a coloured-laddered carrier was colored-SPLIT. Its trigger already \
-                 spends F with no timelock, so the split is a rival the previous owner can out-race \
-                 instantly — both the sats and the asset are stealable."
-            )
-        });
-    assert!(
-        err.contains("COLOURED") && err.contains("RIVAL spend"),
-        "the colored-split lane did not refuse for the interlock reason: {err}"
+    // THE PROBE MOVED AGAIN, AND THIS TIME THERE IS NOWHERE LEFT TO POINT IT.
+    //
+    // The previous revision asserted the refusal on `batch_transfer_tokens`, the one call site that
+    // was still legacy-only. That lane is now ported too: a coloured carrier routes into the N-ary
+    // coloured in-ladder split, so the batch SUCCEEDS — and succeeding CONSUMES the carrier, which
+    // this test still needs for its renewal and conveyance steps below.
+    //
+    // That is not the assertion decaying; it is the objective being met. There is no longer ANY
+    // route from a coloured carrier into `create_colored_split_tx`: the single-carrier transfer, the
+    // multi-carrier combine and the N-recipient batch all fork to the coloured lane before the
+    // legacy one, and `refuse_legacy_colored_split_lane` refuses the legacy lane outright while
+    // `SdkConfig::colored_ladder` is on. "The legacy lane refuses a coloured carrier" has become
+    // unfalsifiable at the E2E level because the legacy lane is unreachable — which is exactly what
+    // retiring it means. It is asserted where it can still fail: `tokens::retired_split_lane_census`
+    // greps the SDK source and fails if any route reaches those primitives without the gate.
+    //
+    // What IS still falsifiable on this carrier, and is what the step was ever standing in for, is
+    // the invariant itself — **nothing but a coloured tier may spend one of this coin's sealed
+    // outputs, and nothing but `T` may spend `F`**. Both halves are checked here, and neither
+    // touches the carrier:
+    //
+    //  (a) the carrier's sats are QUARANTINED from plain-BTC spendable balance, so no plain split
+    //      builder can even SELECT it — the payment path that would spend `F` cannot see the coin.
+    //      Measured against the PLAIN deposit in the same wallet rather than against a refusal:
+    //      alice deliberately holds ordinary sats too, so `transfer()` succeeding proves nothing;
+    //      what proves it is that the carrier's sats are absent from `available_sats`;
+    //  (b) the PLAIN in-ladder split builder, handed this exact bundle, refuses by name.
+    let carrier_sats = {
+        let coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk74_alice").await?.coins;
+        coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(carrier_sid.as_str()))
+            .and_then(|c| c.amount)
+            .ok_or(anyhow!("carrier coin not found"))? as u64
+    };
+    let avail = alice.get_balance().await?.available_sats;
+    // EXACT, not a bound: alice's spendable balance must be the plain deposit and nothing else.
+    // `> 0` alone would pass on a quarantine that hid everything, and `< plain + carrier` would pass
+    // on one that leaked a single sat of the carrier.
+    assert_eq!(
+        avail,
+        u64::from(PLAIN_AMOUNT),
+        "alice's plain-BTC spendable balance must be exactly her plain deposit — the carrier's \
+         {carrier_sats} sat must be quarantined out of it entirely"
     );
+    let guard = mercuryrustlib::tesr::refuse_uncolored_over_colored(&bundle, "in_ladder_split");
+    let guard_msg = guard.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        guard_msg.contains("in_ladder_split") && guard_msg.contains("COLOURED"),
+        "the PLAIN in-ladder split must refuse this coloured carrier by name, got: {guard_msg:?}"
+    );
+    println!(
+        "SDK74 - no plain-split path can reach this carrier: its {carrier_sats} sat are absent from \
+         the plain-BTC spendable balance ({avail} available, plain deposit alone is {PLAIN_AMOUNT}) \
+         and the uncoloured in-ladder split refuses it ({})",
+        guard_msg.lines().next().unwrap_or("").trim()
+    );
+
     // Same refusal one layer down: conveying the coin itself is refused too, because a coloured
     // ladder has no receiver-side consignment validation yet.
     let err = mercuryrustlib::transfer_sender::execute(
@@ -408,7 +481,7 @@ pub async fn execute() -> Result<()> {
         err.contains("COLOURED (CTES-R) ladder"),
         "unexpected conveyance refusal: {err}"
     );
-    println!("SDK74 - interlock holds: the colored split AND the ladder conveyance both refuse");
+    println!("SDK74 - interlock holds: no plain-split path reaches the carrier AND the flat ladder conveyance still refuses");
 
     // ---- 10. RENEWAL: >=3 RIVAL extensions over ONE parent output, and the live one is NOT the
     //          internal-txid minimum. -----------------------------------------------------------

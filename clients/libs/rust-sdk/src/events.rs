@@ -74,6 +74,19 @@ pub enum WalletEvent {
     /// ⚠️ An app that holds received off-chain coins or RGB tokens MUST treat this as an alert:
     /// while it persists, nothing is racing a clawback or a hostile trigger on this wallet's behalf.
     WatchtowerBlind { pass: WatchtowerPass, detail: String },
+    /// **[CTES-R]** A coloured unilateral exit COMPLETED and its final payload output was registered
+    /// with the RGB engine, so `get_asset_balance` / `list_allocations` / `blind_receive` now see the
+    /// allocation at the exit tip instead of at the spent funding outpoint.
+    ///
+    /// The tip pays a Mercury seed-derived key that is not in the engine's BDK descriptor, so no
+    /// wallet sync can discover it — this registration is the only thing that moves the engine's view.
+    ColoredExitTipRegistered { statechain_id: String, outpoint: String },
+    /// 🔴 **[CTES-R]** A coloured unilateral exit completed on chain but the engine could NOT be told
+    /// where the allocation went. The coin is safe — the asset is on chain at the owner's own key and
+    /// the pre-signed walk is finished — but every UTXO-driven rgb-lib view is now STALE: it still
+    /// reports the asset at the SPENT pre-exit outpoint. Re-run the exit pass (it is idempotent) or
+    /// re-register the tip by hand before spending the asset.
+    ColoredExitTipUnregistered { statechain_id: String, detail: String },
 }
 
 /// Which deadline-critical pass reported a [`WalletEvent::WatchtowerBlind`] / a retained

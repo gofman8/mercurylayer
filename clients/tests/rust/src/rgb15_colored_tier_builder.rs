@@ -220,10 +220,34 @@ fn assert_tier_invariants(label: &str, tier: &ColoredTier, prev_value: u64, n_pa
         tier.committed_fee > tesr::committed_fee_for_outputs(n_payload, FEE_RATE),
         "{label}: the coloured fee must exceed the uncoloured one, or the tier cannot relay standalone"
     );
+    // [D4], now fixed on BOTH halves. The gap is exactly 43 vB * rate — the opret output and nothing
+    // else. It read `(43 + 1)` while `mercurylib::tesr::TIER_VBYTES` was still 124, i.e. a 64-byte
+    // SIGHASH_DEFAULT witness modelling a transaction that measures 125 vB; the extra vB was the
+    // explicit SIGHASH_ALL byte, a cost EVERY TES-R tier pays, not a coloured surcharge. With
+    // TIER_VBYTES = 125 the identity 125 + 43 == 168 holds and the gap is the opret alone. Still
+    // independent of n.
     assert_eq!(
         tier.committed_fee,
         tesr::committed_fee_for_outputs(n_payload, FEE_RATE) + tesr::P2TR_OUT_VBYTES * 2,
         "{label}: the coloured/uncoloured gap must be the constant 43 vB * rate, independent of n"
+    );
+    assert_eq!(
+        tier.committed_fee,
+        tesr::committed_fee_for_outputs(n_payload + 1, FEE_RATE),
+        "{label}: the coloured fee is EXACTLY the uncoloured fee for one more output"
+    );
+    // [D4] THE MEASUREMENT, on the tier rgb-lib actually built: the recorded signed vsize is the
+    // model, and the fee covers it at the target rate with the P2A anchor unspent.
+    assert_eq!(
+        tier.signed_vsize,
+        mercuryrustlib::rgb::colored_tier_vbytes(n_payload),
+        "{label}: the real coloured tier must measure exactly what colored_tier_vbytes models"
+    );
+    assert!(
+        tier.committed_fee >= (tier.signed_vsize as f64 * FEE_RATE).ceil() as u64,
+        "{label}: {} sat over a measured {} vB cannot relay standalone at {FEE_RATE} sat/vB",
+        tier.committed_fee,
+        tier.signed_vsize
     );
 
     // Explicit payload vouts: as many as asked for, all distinct, and never the opret or the anchor.
@@ -305,8 +329,11 @@ fn part_a(rgb: &RgbWallet, contract: &str, prev: (&str, u32, u64, &str)) -> Resu
 
     // The measured numbers from CTESR-GATE §2.1(c), pinned so a rgb-lib change that alters the
     // opret's size (and therefore the fee arithmetic) fails HERE and not in production.
-    assert_eq!(tier.signed_vsize, 167, "A: coloured 1-payload tier vsize");
-    assert_eq!(tier.committed_fee, 334, "A: (TIER_VBYTES 124 + 43) * 2");
+    // [D4] RE-DERIVED: 336, not 334. `rgb::COLORED_TIER_VBYTES` = 168 vB is the MEASURED signed
+    // size of this very transaction (the taproot signature carries an explicit SIGHASH_ALL byte, so
+    // the witness item is 65 bytes, not 64). The old 334 sized a 167-vB model of a 168-vB tier.
+    assert_eq!(tier.committed_fee, 336, "A: colored_tier_vbytes(1) 168 * 2");
+    assert_eq!(tier.signed_vsize, 168, "A: measured signed vsize of the real coloured tier");
 
     // The opret lands FIRST (the fork sets `opreturn_first` whenever any output is P2TR), so the
     // payload shifts from 0 to 1 and the anchor from 1 to 2. Asserted as an observation, never
@@ -374,8 +401,9 @@ fn part_b(rgb: &RgbWallet, contract: &str, prev: (&str, u32, u64, &str)) -> Resu
         tier.committed_fee as f64 / tier.signed_vsize as f64
     );
     assert_tier_invariants("B", &tier, prev_value, N);
-    assert_eq!(tier.signed_vsize, 253, "B: coloured 3-payload split-state vsize");
-    assert_eq!(tier.committed_fee, 506, "B: (124 + 3*43) * 2");
+    // [D4] RE-DERIVED: 508, not 506 — 168 + 2*43 = 254 vB, measured.
+    assert_eq!(tier.committed_fee, 508, "B: colored_tier_vbytes(3) 254 * 2");
+    assert_eq!(tier.signed_vsize, 254, "B: measured signed vsize of the real 3-payload tier");
     assert_eq!(tier.opret_vout, 0, "B: opret first");
     assert_eq!(tier.payload_vouts(), vec![1, 2, 3], "B: payloads shifted j -> j+1");
     assert_eq!(tier.p2a_vout, 4, "B: anchor shifted 3 -> 4");

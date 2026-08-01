@@ -486,6 +486,57 @@ impl RgbWallet {
         Ok(())
     }
 
+    /// **[D3] Why did rgb-lib refuse to colour this outpoint?** Read-only.
+    ///
+    /// [`Self::probe_spendable`] answers *whether*; this answers *why*. rgb-lib's own refusal is
+    /// `Invalid coloring info { "total amount in output_map (N) greater than available (0)" }`,
+    /// which names neither of the two filters that can produce that `0`:
+    ///
+    /// * `check_witness` — the allocation's witness must be in the stock's witness-ord map and must
+    ///   not be `Archived`. A deliberately un-broadcast branch resolved with the PLAIN blockchain
+    ///   resolver comes back `Unresolved`, and `WitnessStatus::Unresolved.witness_ord()` is
+    ///   `Archived`. That is the E7 class, and it is persisted.
+    /// * `check_bundle` — the allocation's bundle must not be in the persisted `invalid_bundles`
+    ///   set, which archival populates recursively.
+    ///
+    /// Meanwhile `get_asset_balance` is computed from sqlite and does not move, so the coin looks
+    /// healthy from every angle except the one that matters. Never diagnose this from a balance.
+    ///
+    /// Returns `(verdict, visible_amount, witness_ord, stash_holds_witness_tx,
+    /// invalid_bundle_count)`. The verdict is the `Debug` rendering of rgb-lib's
+    /// `AllocationVerdict` — `Spendable`, `WitnessUnknownToStock`, `WitnessArchived`,
+    /// `BundleInvalidated` or `SealNotRevealed`.
+    ///
+    /// Nothing is consumed, no witness is resolved and no indexer is consulted (E7-safe).
+    pub fn diagnose_allocation(
+        &self,
+        contract_id: &str,
+        txid: &str,
+        vout: u32,
+    ) -> Result<(String, u64, Option<String>, bool, usize)> {
+        use rgb_lib::wallet::Outpoint;
+        let d = self.wallet.diagnose_allocation(
+            contract_id.to_string(),
+            Outpoint { txid: txid.to_string(), vout },
+        )?;
+        Ok((
+            format!("{:?}", d.verdict()),
+            d.visible_amount,
+            d.witness_ord.clone(),
+            d.stash_holds_witness_tx,
+            d.invalid_bundle_count,
+        ))
+    }
+
+    /// Every witness the RGB stock holds an ord for, as `(txid, ord)`. Read-only.
+    ///
+    /// The chain-level companion to [`Self::diagnose_allocation`]: on a CTES-R ladder every rung
+    /// must read `Tentative` (it is un-broadcast by design). Any `Archived` rung is the E7 defect,
+    /// and the position of the first one says which step archived it.
+    pub fn witness_ords(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.wallet.witness_ords()?)
+    }
+
     /// Color a Mercury-built unsigned transaction (provided as a base64 PSBT) so that the RGB asset
     /// is re-assigned to the given pre-coloring output vouts, returning the modified PSBT (base64,
     /// with the OP_RETURN opret commitment added) and the consignment (base64) to relay to the
@@ -822,6 +873,25 @@ impl RgbWallet {
     /// Distinct from [`Self::accept`] in the two ways that matter: `accept` resolves exactly one
     /// off-chain witness and reveals exactly one seal, so it can neither validate a multi-tier
     /// un-broadcast chain nor leave the receiver able to continue it.
+    ///
+    /// # [D3] This is also the missing call on the LEGACY lane
+    ///
+    /// The legacy token receive path books a piece with [`Self::import_asset_offchain`] +
+    /// [`Self::register_statechain`] only. `import_asset_offchain` is rgb-lib's `save_new_asset`,
+    /// which imports the **contract** and never `accept_transfer`s the transfer; `register_statechain`
+    /// writes a **sqlite** row. So the receiver's stock ends up holding no witness ord for the
+    /// split/combine txid and no revealed seal at the piece's outpoint, and every later
+    /// `color_psbt` over that outpoint answers
+    /// `Invalid coloring info: total amount in output_map (N) greater than available (0)` — while
+    /// `get_asset_balance` reports the full amount, because that comes from sqlite.
+    ///
+    /// Measured, with the control, by `RGB_E2E=16`: the SAME consignment and the SAME outpoint go
+    /// from `WitnessUnknownToStock` to `Spendable` when this call is added, and nothing else
+    /// changes. A legacy piece can therefore be repaired by accepting it here with
+    /// `txids = the branch witnesses` and `seals = [(funding_txid, vout, the sender's blinding)]` —
+    /// it is a one-seal ladder. Doing so is an SDK receive-path change and is deliberately NOT
+    /// done inside this bridge; see `RGB_E2E=16`'s module docs for the migration consequence of
+    /// leaving it undone.
     pub fn accept_ladder(
         &mut self,
         consignment_base64: &str,

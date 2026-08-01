@@ -24,7 +24,7 @@
 //!     as this rebate. The operator's rebate is a non-exact spend of a laddered coin, so it is
 //!     routed through the IN-LADDER split (`in_ladder_pay`): the piece is conveyed to the user and
 //!     the operator keeps the tier-fee-reduced change. Its size is the SMALLEST off-chain-payable
-//!     in-ladder child (`min_child_value` = 1306 sat at 2 sat/vB), not the backup-chain `fee + dust`
+//!     in-ladder child (`min_child_value` = 1310 sat at 2 sat/vB), not the backup-chain `fee + dust`
 //!     442 that bounds an un-laddered piece.
 //!
 //! Run: SDK_E2E=30 ML_NETWORK=regtest cargo run
@@ -300,14 +300,24 @@ pub async fn execute() -> Result<()> {
     // payable rebate and the LARGER binds: the backup-chain floor of an un-laddered piece
     // (dust 330 + backup fee 112 = 442) and, because the operator's coin is LADDERED,
     // `min_child_value` — the rebate is paid by an in-ladder split whose child funds its own
-    // extension + state tier (each committed_fee + P2A) before clearing dust: 2*(248+240)+330 = 1306
+    // extension + state tier (each committed_fee + P2A) before clearing dust: 2*(250+240)+330 = 1310
     // at the default 2 sat/vB. Sizing the rebate at 442 made `refresh_sponsored` fail outright with
     // FeeTooHigh once the operator's coin is laddered.
+    //
+    // RE-DERIVED, not weakened ([D4]): 1_310, not 1_306. `mercurylib::tesr::TIER_VBYTES` moved
+    // 124 → 125 — the MEASURED signed vsize of a tier, whose taproot signature carries an explicit
+    // SIGHASH_ALL byte and so is 65 witness bytes, not 64 — so a committed rung is 250 sat, not 248.
+    // The floor is DERIVED here, never a literal; the literal is only the second opinion.
     let min_payable = mercurylib::tesr::min_child_value(
         mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate,
         330,
     );
-    assert_eq!(min_payable, 1_306, "the minimum payable in-ladder child at 2 sat/vB");
+    assert_eq!(min_payable, 1_310, "the minimum payable in-ladder child at 2 sat/vB");
+    assert_eq!(
+        min_payable,
+        2 * (mercurylib::tesr::committed_fee(2.0) + mercurylib::tesr::P2A_VALUE) + 330,
+        "two committed rungs plus a spendable final output"
+    );
     assert_eq!(
         sp.rebate_sats, min_payable,
         "operator rebates the smallest OFF-CHAIN-PAYABLE amount ≥ fee (the in-ladder child floor)"

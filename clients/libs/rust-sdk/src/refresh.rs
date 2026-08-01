@@ -77,7 +77,7 @@ impl UtexoWallet {
     /// The refresh fee (~112 sats at 1 sat/vB) is BELOW the dust floor, and an off-chain transfer
     /// can't mint a piece below `min_split_output` (dust + the piece's own backup fee), and on a
     /// TES-R sponsor coin the rebate is paid by an IN-LADDER split whose child funds its own
-    /// extension + state tier before clearing dust (`min_child_value`, 1306 sat at the default
+    /// extension + state tier before clearing dust (`min_child_value`, 1310 sat at the default
     /// 2 sat/vB). The sponsor therefore rebates `max(fee_sats + DUST_LIMIT, min_child_value)`,
     /// over-compensating the user by the difference. `rebate_sats` reports the actual amount
     /// rebated (≥ `fee_sats`), so the user's total balance ends ≥ the original. The rebate arrives
@@ -96,7 +96,7 @@ impl UtexoWallet {
         //  * `fee + DUST_LIMIT` — the un-laddered floor (min_split_output for this 112-vB tx), and
         //  * `min_child_value` — on a TES-R sponsor coin the rebate is paid by an IN-LADDER split,
         //    and the child carries its own extension + state tier before it can clear dust. At the
-        //    default 2 sat/vB that is 2*(248+240)+330 = 1306 sat, well above the old 442, so the
+        //    default 2 sat/vB that is 2*(250+240)+330 = 1310 sat, well above the old 442, so the
         //    old sizing made a sponsored refresh fail outright (`FeeTooHigh`).
         // The operator absorbs the difference; the user is still made (at least) whole.
         let ladder_floor = mercurylib::tesr::min_child_value(

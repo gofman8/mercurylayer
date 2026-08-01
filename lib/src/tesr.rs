@@ -39,9 +39,38 @@ use crate::{
 pub const P2A_SCRIPT_BYTES: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
 /// Value parked in each tier tx's P2A anchor output (sats). Above the P2A dust floor.
 pub const P2A_VALUE: u64 = 240;
-/// Approximate virtual size of a tier tx (1 P2TR key-spend in + 1 P2TR out + 1 P2A out + v3
-/// overhead), used to size the committed fee baked into each pre-signed tx.
-pub const TIER_VBYTES: u64 = 124;
+/// **The signed virtual size of a one-payload UNCOLOURED tier — MEASURED, not approximated.**
+///
+/// Byte for byte, over the shape [`build_tier_tx`] emits and
+/// [`crate::transaction::new_backup_transaction`] finalises:
+///
+/// | part                                                     | bytes |
+/// |----------------------------------------------------------|-------|
+/// | nVersion (3) + nLockTime                                 | 8     |
+/// | input count + output count                               | 2     |
+/// | input (32 txid + 4 vout + 1 scriptSig len + 4 nSequence)  | 41    |
+/// | P2TR payload out (8 value + 1 len + 34 scriptPubKey)      | 43    |
+/// | P2A anchor out (8 + 1 + 4 = `OP_1 <0x4e73>`)              | 13    |
+///
+/// base = **107 B** ⟹ weight = `4·107 + 2` (segwit marker+flag) `+ 67` (witness: 1 item-count varint
+/// + 1 length varint + a **65-byte** signature) = **497 WU** ⟹ vsize = `⌈497/4⌉` = **125 vB**.
+///
+/// **The 65th signature byte is the whole of [D4].** A taproot key-spend signature is 64 bytes *only*
+/// under `SIGHASH_DEFAULT`. TES-R does not sign that way: [`cosign_tier_request`] hashes with
+/// [`TapSighashType::All`], and `new_backup_transaction{,_multi}` serialise
+/// `taproot::Signature { hash_ty: All }`, which appends the explicit `0x01` sighash byte. The former
+/// value **124** modelled the 64-byte `SIGHASH_DEFAULT` witness (`4·107 + 2 + 66 = 496` ⟹ 124 vB) and
+/// therefore understated EVERY uncoloured tier by exactly 1 vB: at the default 2 sat/vB it committed
+/// 248 sat to a transaction that relays at 125 vB — 1.984 sat/vB, short of the rate the pre-signed
+/// tier is supposed to be able to confirm at with **no P2A child attached**, which is the entire
+/// reason the committed fee exists.
+///
+/// Pinned against a real, production-finalised transaction by the unit test
+/// `tests::the_uncoloured_fee_matches_a_measured_signed_tier`. The coloured sibling is
+/// `mercuryrustlib::rgb::COLORED_TIER_VBYTES` = **168**, and the two now differ by exactly one
+/// [`P2TR_OUT_VBYTES`] (the RGB `opret` output) — `125 + 43 = 168`, the surcharge identity
+/// `SDK_E2E=74` asserts.
+pub const TIER_VBYTES: u64 = 125;
 
 /// The Pay-to-Anchor output script.
 pub fn p2a_script() -> ScriptBuf {
@@ -679,10 +708,143 @@ mod tests {
 
     #[test]
     fn tier_value_decrements_by_fee_and_anchor() {
-        // 100_000 sats, 2 sat/vB → fee 248, anchor 240 → 99_512 forward.
-        assert_eq!(tier_out_value(100_000, 2.0), Some(100_000 - 248 - 240));
+        // 100_000 sats, 2 sat/vB → fee 250 (125 vB, [D4]-corrected — was 248 on the 124-vB
+        // SIGHASH_DEFAULT model), anchor 240 → 99_510 forward.
+        assert_eq!(committed_fee(2.0), 250);
+        assert_eq!(tier_out_value(100_000, 2.0), Some(100_000 - 250 - 240));
         // Too small → terminal dust case.
         assert_eq!(tier_out_value(300, 2.0), None);
+    }
+
+    /// **[D4] The model and the transaction must agree — proved by MEASURING.**
+    ///
+    /// The committed fee exists for exactly one property: a pre-signed tier relays and confirms
+    /// STANDALONE, with no P2A child attached. That property is `committed_fee / real_vsize >= rate`,
+    /// so it is worth nothing unless `real_vsize` is the size the transaction actually has once
+    /// signed. This test therefore builds the real tier shape, hands it to the **production**
+    /// finaliser ([`crate::transaction::new_backup_transaction`] — the same function that finalises
+    /// every co-signed tier), measures `Transaction::vsize()`, and requires the model to match it
+    /// exactly, at every arity a split state can reach.
+    ///
+    /// Counterfactual: restore `TIER_VBYTES = 124` and this fails at n=1 with `124 != 125` — the old
+    /// constant sized a 124-vB transaction that measures 125 vB and would have relayed at
+    /// 1.984 sat/vB.
+    #[test]
+    fn the_uncoloured_fee_matches_a_measured_signed_tier() {
+        /// One TES-R taproot key-spend signature: 64 Schnorr bytes + the explicit `SIGHASH_ALL` byte.
+        /// Not 64 — that width is `SIGHASH_DEFAULT` only, and assuming it is [D4].
+        const TAPROOT_SIGHASH_ALL_WITNESS_BYTES: usize = 65;
+        let rate = 2.0;
+        let a = test_addr();
+        let f = "0000000000000000000000000000000000000000000000000000000000000001";
+
+        for n_payload in 1..=4usize {
+            // The real shape, from the real builders: n=1 is a plain tier; n>1 is a split state.
+            let unsigned_hex = if n_payload == 1 {
+                build_trigger(f, 0, 1_000_000, &a, "regtest", rate).unwrap().tx_hex
+            } else {
+                let avail = tier_out_total(1_000_000, n_payload, rate).unwrap();
+                let mut kids: Vec<(String, u64)> =
+                    (1..n_payload).map(|i| (a.clone(), 10_000 * i as u64)).collect();
+                let rest: u64 = kids.iter().map(|(_, v)| *v).sum();
+                kids.push((a.clone(), avail - rest));
+                build_split_state(f, 1_000_000, &kids, "regtest", 18, rate).unwrap().tx_hex
+            };
+
+            // MEASURE: through the production finaliser, not a hand-rolled witness. Schnorr
+            // signatures are fixed-width, so any 64 bytes parse; only the SERIALISED width matters to
+            // vsize, and that is decided by the finaliser's `hash_ty`, not by these bytes.
+            let signed_hex =
+                crate::transaction::new_backup_transaction(unsigned_hex, "01".repeat(64))
+                    .expect("the production finaliser must accept a tier-shaped transaction");
+            let signed: Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&signed_hex).unwrap()).unwrap();
+            assert_eq!(
+                signed.input[0].witness.iter().next().unwrap().len(),
+                TAPROOT_SIGHASH_ALL_WITNESS_BYTES,
+                "TES-R signs SIGHASH_ALL, so the witness item is 64 sig bytes + 1 sighash byte"
+            );
+            let measured = signed.vsize() as u64;
+
+            // The model must EQUAL the transaction — not bound it.
+            let modelled = TIER_VBYTES + (n_payload as u64 - 1) * P2TR_OUT_VBYTES;
+            assert_eq!(
+                modelled, measured,
+                "n={n_payload}: the vsize model must equal the finalised transaction"
+            );
+            // The property the fee is FOR: standalone relay at the target rate, no anchor.
+            let fee = committed_fee_for_outputs(n_payload, rate);
+            assert!(
+                fee >= (measured as f64 * rate).ceil() as u64,
+                "n={n_payload}: {fee} sat over {measured} vB = {:.3} sat/vB < {rate}",
+                fee as f64 / measured as f64
+            );
+            // At an integral rate the fee is exact — no silent over-payment either.
+            assert_eq!(fee, measured * 2, "n={n_payload}: an uncoloured tier must pay EXACTLY {rate}");
+        }
+    }
+
+    /// **The CTES-R surcharge identity, pinned at its uncoloured end.**
+    ///
+    /// A coloured tier is an uncoloured tier plus ONE `opret` output — nothing else. So
+    /// `COLORED_TIER_VBYTES − TIER_VBYTES` must be exactly [`P2TR_OUT_VBYTES`] (43), and the fee
+    /// surcharge exactly `43 · rate`. `SDK_E2E=74` asserts this end to end on a live coloured ladder;
+    /// this is the constant-level half, so a future move of either constant alone fails here first.
+    ///
+    /// `mercuryrustlib` cannot be depended on from `mercurylib` (it depends on us), so the coloured
+    /// number is restated as a literal — with the guard that it is the ONLY literal, and the identity
+    /// is what is checked.
+    #[test]
+    fn the_coloured_surcharge_is_exactly_one_opret_output() {
+        // `mercuryrustlib::rgb::COLORED_TIER_VBYTES`, MEASURED on a production-finalised coloured
+        // tier by `rgb::ctesr_tests::the_coloured_fee_matches_a_measured_signed_tier`.
+        const COLORED_TIER_VBYTES: u64 = 168;
+        assert_eq!(
+            COLORED_TIER_VBYTES - TIER_VBYTES,
+            P2TR_OUT_VBYTES,
+            "the coloured tier is the uncoloured tier plus exactly one opret output — if this fails, \
+             one of the two vsize models moved without the other (that is [D4], and it is what made \
+             SDK_E2E=74 red)"
+        );
+        for rate in [1.0f64, 2.0, 5.0, 10.0] {
+            let colored = (COLORED_TIER_VBYTES as f64 * rate).ceil() as u64;
+            assert_eq!(
+                colored - committed_fee(rate),
+                (P2TR_OUT_VBYTES as f64 * rate).ceil() as u64,
+                "rate {rate}: the coloured surcharge must be exactly the opret's 43 vB"
+            );
+        }
+        // The `SDK_E2E=74` assertion verbatim, at the committed default rate.
+        assert_eq!(committed_fee(2.0), 250);
+        assert_eq!((COLORED_TIER_VBYTES as f64 * 2.0).ceil() as u64 - committed_fee(2.0), 43 * 2);
+        // And the coloured fee is the uncoloured fee for one MORE output — exactly, no +1 vB slack.
+        for n in 1..=4usize {
+            let colored_n =
+                ((COLORED_TIER_VBYTES + (n as u64 - 1) * P2TR_OUT_VBYTES) as f64 * 2.0).ceil() as u64;
+            assert_eq!(
+                colored_n,
+                committed_fee_for_outputs(n + 1, 2.0),
+                "n={n}: colored_committed_fee(n) == committed_fee_for_outputs(n + 1)"
+            );
+        }
+    }
+
+    /// Every floor that is DERIVED from the tier vsize moves with it — no floor may keep a literal.
+    #[test]
+    fn derived_floors_track_the_corrected_tier_vbytes() {
+        let (rate, dust) = (2.0f64, 330u64);
+        // A child of an in-ladder split funds TWO rungs (extension + state) and must still clear dust.
+        assert_eq!(min_child_value(rate, dust), 2 * (250 + P2A_VALUE) + dust);
+        assert_eq!(min_child_value(rate, dust), 1_310, "was 1_306 on the 124-vB model");
+        // Derived, never a literal: re-deriving from the constant must reproduce it.
+        assert_eq!(
+            min_child_value(rate, dust),
+            2 * ((TIER_VBYTES as f64 * rate).ceil() as u64 + P2A_VALUE) + dust
+        );
+        // A tier's forward value drops by the same 2 sat per rung; three rungs cost 6 more sat.
+        let plain_rung = committed_fee(rate) + P2A_VALUE;
+        assert_eq!(tier_out_value(1_000_000, rate), Some(1_000_000 - plain_rung));
+        assert_eq!(tier_out_total(1_000_000, 1, rate), tier_out_value(1_000_000, rate));
     }
 
     #[test]

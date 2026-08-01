@@ -1390,7 +1390,7 @@ impl UtexoWallet {
     }
 
     /// Set a single coin's status by statechain_id in the local wallet db.
-    async fn set_coin_status(&self, statechain_id: &str, status: CoinStatus) -> Result<()> {
+    pub(crate) async fn set_coin_status(&self, statechain_id: &str, status: CoinStatus) -> Result<()> {
         let mut record = self.record().await?;
         for coin in record.coins.iter_mut() {
             if coin.statechain_id.as_deref() == Some(statechain_id) {
@@ -1403,7 +1403,7 @@ impl UtexoWallet {
 
     /// Create one SE-registered child slot funded by a derived token, returning its `Coin` (with
     /// statechain_id + auth). The slot's aggregate is what `SP.out[j]` pays in the in-ladder split.
-    async fn create_child_slot(&self, token_id: &str, amount_sats: u64) -> Result<Coin> {
+    pub(crate) async fn create_child_slot(&self, token_id: &str, amount_sats: u64) -> Result<Coin> {
         let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1423,7 +1423,7 @@ impl UtexoWallet {
     /// Book the coin records after an in-ladder split payment: the parent is spent (WITHDRAWN), the
     /// piece slot is sent to the recipient (WITHDRAWN — its value left this wallet), and the change slot
     /// becomes a CONFIRMED exitable claim funded by the un-broadcast `SP.out[1]`.
-    async fn book_inladder_split_coins(
+    pub(crate) async fn book_inladder_split_coins(
         &self,
         parent_statechain_id: &str,
         sp_txid: &str,
@@ -1458,6 +1458,34 @@ impl UtexoWallet {
         change_sats: u64,
         change_vout: u32,
     ) -> Result<()> {
+        self.book_inladder_split_coins_opt(
+            parent_statechain_id,
+            sp_txid,
+            piece_child_sids,
+            piece_status,
+            Some((change_child_sid.to_string(), change_sats, change_vout)),
+        )
+        .await
+    }
+
+    /// [CTES-R] The general form: N pieces and **optionally** a change child.
+    ///
+    /// A coloured split that hands over a carrier's WHOLE allocation (the ordinary case in the
+    /// middle of a multi-carrier payment, and the only shape a fully-spent carrier can take) carves
+    /// no change child at all — every sat of `X_m`'s payload goes to the pieces. Passing a change
+    /// slot there would mean carving a child that holds an EMPTY RGB assignment purely to satisfy
+    /// this booking call, which is both wasteful (it must still clear `colored_child_floor`) and a
+    /// shape nothing else in CTES-R produces. So the change is an `Option` rather than a required
+    /// argument, and the parent is still marked WITHDRAWN either way — that part is about the
+    /// parent being terminalized, not about where the change went.
+    pub(crate) async fn book_inladder_split_coins_opt(
+        &self,
+        parent_statechain_id: &str,
+        sp_txid: &str,
+        piece_child_sids: &[String],
+        piece_status: CoinStatus,
+        change: Option<(String, u64, u32)>,
+    ) -> Result<()> {
         let mut record = self.record().await?;
         for coin in record.coins.iter_mut() {
             match coin.statechain_id.as_deref() {
@@ -1469,7 +1497,10 @@ impl UtexoWallet {
                     // IN_TRANSFER (conveyed but pending payment; the SSP adopts it once it pays).
                     coin.status = piece_status.clone();
                 }
-                Some(sid) if sid == change_child_sid => {
+                Some(sid)
+                    if change.as_ref().is_some_and(|(c, _, _)| c == sid) =>
+                {
+                    let (_, change_sats, change_vout) = change.clone().expect("matched above");
                     coin.utxo_txid = Some(sp_txid.to_string());
                     coin.utxo_vout = Some(change_vout);
                     coin.amount = Some(u32::try_from(change_sats)?);
@@ -1885,7 +1916,7 @@ impl UtexoWallet {
 /// txid of a signed (un-broadcast) tier tx, from its hex. The in-ladder split's children are funded
 /// by `SP.out[j]`, an outpoint that exists only inside the bundle — so the booking code derives the
 /// txid from the signed tx rather than from any on-chain lookup.
-fn signed_tier_txid(signed_tx_hex: &str) -> Result<String> {
+pub(crate) fn signed_tier_txid(signed_tx_hex: &str) -> Result<String> {
     let tx: bitcoin::Transaction =
         bitcoin::consensus::encode::deserialize(&hex::decode(signed_tx_hex)?)?;
     Ok(tx.txid().to_string())

@@ -36,10 +36,17 @@
 # ================================================================================================
 # clients/libs/rust-sdk — wallet SDK
 # ================================================================================================
-# Unit-test probe of the split-amount model's REFUSAL boundary. `.is_err()` here is the property
-# being asserted, not a classifier taking a lenient branch. (Only reached the guard because the
-# assert! macro spans several lines, so the `assert` filter did not see it on this line.)
-1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts(2_129, TOKEN_PIECE_SATS).is_err(),
+# Unit-test probe of the split-amount model's REFUSAL boundary — the MIN-CARRIER bound, one sat
+# below the smallest carrier a coloured split can carve (change would be sub-dust). `.is_err()` is
+# the property being asserted, not a classifier taking a lenient branch. (Only reached the guard
+# because the assert! macro spans several lines, so the `assert` filter did not see it on this line.)
+# Replaces the old `split_amounts(2_129, …)` entry: same assertion, same test, but the literal was
+# re-derived from TOKEN_PIECE_SATS when the piece moved to 3_066, so the normalised line changed.
+1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts(min_carrier - 1, TOKEN_PIECE_SATS).is_err(),
+#
+# Same test, the other bound: the FIT bound (carrier == piece + reserve leaves no room for change).
+# A unit-test refusal probe; the `.is_err()` IS the assertion. Multi-line assert!, same as above.
+1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts(TOKEN_PIECE_SATS + 300, TOKEN_PIECE_SATS).is_err(),
 #
 # Same: unit-test refusal-boundary probe.
 1	clients/libs/rust-sdk/src/granularity_model.rs	is_err-classifier	split_amounts(959, DUST_LIMIT).is_err(),
@@ -78,6 +85,28 @@
 # Unit test in `absence_vs_unreadable_tests` asserting that read_backup_rows returns Err (not an
 # empty vector) for an unreadable database — i.e. a test OF this very class. The assertion itself.
 1	clients/libs/rust-sdk/src/tokens.rs	is_err-classifier	out.is_err(),
+#
+# Unit test in `migration_hatch_is_narrow` asserting the hatch REFUSES a carrier that can still be
+# coloured (it must wait for its ladder, not take the retired lane). The `.is_err()` is the
+# assertion; the direction under test is strictness. Multi-line assert!, so the `assert` filter
+# did not see it on this line.
+1	clients/libs/rust-sdk/src/tokens.rs	is_err-classifier	migration_hatch_verdict(f, &[carrier("normal", TOKEN_PIECE_SATS, false, true)]).is_err(),
+#
+# Unit test in `piece_floor_tests` asserting the carrier is sized for exactly CARRIER_SEND_DEPTH
+# sends and that the (depth+1)-th split is REFUSED. Again the assertion itself, and again only
+# visible to the guard because the assert! spans several lines.
+1	clients/libs/rust-sdk/src/tokens.rs	is_err-classifier	split_amounts_floored(carrier, TOKEN_PIECE_SATS, min_output).is_err(),
+#
+# colored_child_sids(): a `ctesr-` row that will not deserialize is dropped, so that child counts as
+# NOT coloured. Its ONLY consumer is `unilateral_exit` (grep: wallet.rs is the single call site), and
+# there "I cannot read this child's bundle" -> refuse the exit is the fail-closed answer: a coloured
+# walk that cannot be proved must never be broadcast over a carrier. Fails toward refusing.
+#   NOTE, and it is why this is NOT the same verdict as its `tesr-` sibling: the sibling
+#   (colored_ladder_sids) also feeds the plain-BTC QUARANTINE, where dropping means "not a carrier"
+#   and the coin can be spent as sats — so that one was FIXED this round (tesr_colour_census splits
+#   PROVEN from UNREADABLE and the quarantine takes the union). If a quarantine consumer is ever
+#   added for `ctesr-` rows, this entry is wrong and must become a census too.
+1	clients/libs/rust-sdk/src/tokens.rs	ok-question	let cb: mercuryrustlib::tesr::ChildTesrBundle = serde_json::from_str(&json).ok()?;
 #
 # backup_bundle(): reading the optional `rgb.mnemonic` file into the recovery bundle. Absent or
 # unreadable -> the bundle carries no RGB mnemonic, which is the correct value for a non-token

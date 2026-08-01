@@ -1474,6 +1474,114 @@ impl UtexoWallet {
                 )),
             }
         }
+
+        // ---- [CTES-R] RECEIVED COLOURED CHILDREN — the coloured lane's form of the loop above ---
+        //
+        // The loop above gates every carrier on a `branch-<id>` row, and a coloured child HAS none:
+        // its exit material is the five-tier chain `T -> X_m -> SP -> ext_child -> state_child`
+        // carried in its `ctesr-` bundle. `read_exit_branch` therefore answers VERIFIED-EMPTY for
+        // it, which that loop reads as "issued/flat carrier, no clawback risk" — and for a RECEIVED
+        // piece that is exactly wrong. The sender keeps one pre-signed, RGB-UNAWARE deposit backup
+        // over the very funding output `F` the child's chain roots at; the moment it matures she can
+        // spend `F` and the whole chain underneath it dies. On the flat lane that was a CLAWBACK
+        // (she recovered the tokens); on this lane it only DESTROYS them — but the receiver loses
+        // the allocation either way, and the answer is the same one `sdk34` has always tested:
+        // spend `F` first.
+        //
+        // Two things differ from the flat lane, both forced by the shape of the walk:
+        //
+        //  * THE ACTION is `unilateral_exit`, not a branch broadcast. The child's chain IS its
+        //    branch and every rung of it is RGB-aware; broadcasting any other spend of `F` destroys
+        //    the allocation, which is precisely why the loop above must never be pointed at this
+        //    coin. The walk is resumed by later passes as each relative timelock matures.
+        //  * THE DEADLINE GETS A HEAD START. A flat branch is locktime-0 and lands in one block, so
+        //    `L0` itself was a usable deadline. This walk is a chain of RELATIVE timelocks, so it
+        //    must be STARTED at least `Σ csv` blocks before `L0` or it cannot finish in time. The
+        //    head start is read off the bundle's own chain, never guessed.
+        //
+        // L1 — the same liveness allowlist `defend_ladders` applies: act only for a child this
+        // wallet still holds CONFIRMED. A child conveyed onward belongs to its recipient, and
+        // driving its chain would rival the state they now hold (the D1 class sdk79 pins).
+        //
+        // DELIBERATELY NARROW: only COLOURED children. A plain in-ladder child has the same shape
+        // and is left to its own change with its own tests, rather than being swept in here on the
+        // strength of an argument this round did not measure.
+        let child_rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "near-deadline protection is BLIND on every adopted split child: the child-bundle \
+                 rows could not be read ({e}) — refusing to report a protected wallet from a \
+                 failed read"
+            )
+        })?;
+        for (key, json) in child_rows.iter() {
+            let Some(cid) = key.strip_prefix("ctesr-") else { continue };
+            // L1. Absence from the record, or any status other than CONFIRMED, is a DECIDED answer
+            // ("not ours to drive"), not blindness.
+            let Some(coin) = record.coins.iter().find(|c| {
+                c.duplicate_index == 0 && c.statechain_id.as_deref() == Some(cid)
+            }) else {
+                continue;
+            };
+            if coin.status != CoinStatus::CONFIRMED {
+                continue;
+            }
+            let cb: mercuryrustlib::tesr::ChildTesrBundle = match serde_json::from_str(json) {
+                Ok(c) => c,
+                // NOT a skip. An unparseable child bundle is the one shape where "I could not tell"
+                // and "nothing is due" look identical, and this coin's only protection is here.
+                Err(e) => {
+                    blind.push(format!(
+                        "{cid} (adopted split child; its `ctesr-` bundle will not parse ({e}), so \
+                         its exit-race deadline cannot be computed)"
+                    ));
+                    continue;
+                }
+            };
+            if !cb.is_colored() {
+                continue;
+            }
+            let chain = mercuryrustlib::tesr::child_exit_chain(&cb);
+            let Some((root_hex, _)) = chain.first() else {
+                blind.push(format!(
+                    "{cid} (coloured child with an EMPTY exit chain — it has no walk to protect it \
+                     and no deadline can be derived)"
+                ));
+                continue;
+            };
+            // The head start: every relative timelock the walk must sit through, summed.
+            let head_start: u32 = chain.iter().filter_map(|(_, csv)| *csv).map(u32::from).sum();
+            let deadline = match self.deposit_anchored_deadline_of_root_tx(root_hex).await {
+                Ok(d) => d.saturating_sub(head_start),
+                Err(e) => {
+                    blind.push(format!(
+                        "{cid} (coloured child; its exit-race deadline could NOT be computed ({e}) \
+                         — it has a five-tier chain rooted at a funding output an ancestor can \
+                         still spend, so absence of a deadline here means blindness, not safety)"
+                    ));
+                    continue;
+                }
+            };
+            if tip + margin_blocks < deadline {
+                continue; // still comfortably ahead of the head-started deadline
+            }
+            let _ = self.inner.events_tx.send(WalletEvent::TokenCarrierMaterialized {
+                statechain_id: cid.to_string(),
+                deadline_block: deadline,
+                tip,
+            });
+            match self.unilateral_exit(Some(vec![cid.to_string()]), None).await {
+                Ok(_) => exited.push(cid.to_string()),
+                Err(e) => blind.push(format!(
+                    "{cid} (coloured child is DUE at block {deadline}, tip {tip}, but driving its \
+                     exit walk failed: {e})"
+                )),
+            }
+        }
         if !blind.is_empty() {
             // Deliberately an `Err`, not a quiet `Ok(exited)`: `auto_exit_due` maps `Ok` to
             // `note_watchtower_ok`, i.e. to "this wallet's clawback protection ran with full
@@ -1539,11 +1647,123 @@ impl UtexoWallet {
         // than propagated immediately: the defence of the OTHER coins is time-critical and must not
         // be cancelled by one corrupt row.
         let mut blind: Vec<String> = Vec::new();
+        // ---- [B2] WHAT THIS PASS MUST NOT BROADCAST -------------------------------------------
+        //
+        // `defend_ladders` is a BROADCAST path. It drove every coin that had a `tesr-` row,
+        // including coins this wallet had already spent or given away — and a RETAINED ladder is a
+        // rival spend of the very same payload output as the state its recipient now holds. An
+        // in-ladder split terminalizes the parent with `SP` and supersedes `S_0`; both spend
+        // `X_m.out[0]`, so a tower still driving `S_0` does not defend anything, it RACES the child
+        // it just paid, and on the coloured lane the child's allocation lives on `SP`. A WHOLE-coin
+        // conveyance is the same shape one level up: `transfer_colored_carrier` hands the recipient
+        // a receiver-paying state `S'` over the same `X_m.out[0]`, and the sender keeps a co-signed
+        // `S_sender` that rivals it.
+        //
+        // The first round closed only the SPLIT lane, with two filters: a DENYLIST on
+        // WITHDRAWN/WITHDRAWING, and a supersession check driven by this wallet's `ctesr-` rows.
+        // Neither closes the WHOLE-CARRIER CONVEYANCE lane. A whole-coin handover writes no
+        // `ctesr-` row at all (there is no child), and `transfer_sender::execute*` leaves the
+        // sender's coin IN_TRANSFER — which the denylist admits — and `coin_status::update_coins`
+        // later promotes that to TRANSFERRED, which the denylist admits too. Same theft, different
+        // route, and enumerating routes is exactly what failed.
+        //
+        // So the filter no longer enumerates lanes. It keys on evidence this tower can check for
+        // itself, for every coin, on every lane that exists or will exist:
+        //
+        //  L1 — LIVENESS, AS AN ALLOWLIST (not a denylist). Broadcast only for a coin whose status
+        //       is CONFIRMED. CONFIRMED is this wallet's own record of "mine, unspent, no
+        //       counterparty holds anything over it", and every route that hands value away must
+        //       move a coin OUT of it before the counterparty can hold rival material:
+        //       `transfer_sender::execute`/`execute_colored` → IN_TRANSFER → TRANSFERRED,
+        //       `withdraw` → WITHDRAWING → WITHDRAWN, the in-ladder split and `child_retransfer` →
+        //       WITHDRAWN, an LN-latched piece → IN_TRANSFER. The allowlist form is the whole
+        //       point: a lane added tomorrow parks its coin in SOME non-CONFIRMED status and is
+        //       refused BY DEFAULT. It cannot re-arm this tower against its own recipient by
+        //       forgetting to extend a list. (`unilateral_exit` already holds the same rule for the
+        //       same coins — "exiting a withdrawn parent would invalidate the sub-coins funded by
+        //       its split [B1]" — and this pass broadcasts the same transactions, so it must hold
+        //       the same rule.) Nothing is left undefended by the refusal: a conveyed coin's
+        //       segment is driven by the party that now owns it — `watch_child_pass` replays
+        //       `T -> X_m -> SP` underneath a child chain, and a whole-carrier recipient's own
+        //       `tesr-` row drives `T -> X_m -> S'`.
+        //
+        //       [A2 — THE KEY MUST BE DURABLE.] L1 is only as good as the field it reads, and it
+        //       reads that field FROM THE WALLET DB on every pass. `create_backup_transactions`
+        //       used to set `coin.status = IN_TRANSFER` in MEMORY only, on a copy the conveyance
+        //       did not write back until `update_wallet` — the last statement of
+        //       `transfer_sender::execute_ex`, long after `transfer/update_msg` had handed the
+        //       recipient a co-signed `S'`. So the filter was keyed on precisely the field that was
+        //       not yet on disk, and a pass landing in that window read a stale CONFIRMED and was
+        //       admitted. Both conveyance lanes now make the transition DURABLE **before** the
+        //       first step that can produce material for anybody else — `execute_ex` before the
+        //       `S'` co-sign, `tesr::{child_retransfer, cosign_colored_child_retransfer}` before
+        //       the `S'_child` co-sign — and restore it if they abort before anything is conveyed.
+        //       Durable local evidence was chosen over asking the coordinator whether a transfer is
+        //       open: a network round-trip on a per-block broadcast path would read a coordinator
+        //       outage as blindness (disarming the tower during exactly the outage a griefer would
+        //       exploit), and a coordinator that answered "no transfer is open" would induce this
+        //       wallet to destroy its own recipient's allocation. sdk79 PART C races a real,
+        //       lethal watchtower against a whole-coin conveyance; PART D does the same for the
+        //       child re-transfer.
+        //  L2 — SUPERSESSION. A coin can stay CONFIRMED and still have had its state replaced in
+        //       place. If any child bundle in this wallet names this coin as its parent and carries
+        //       a DIFFERENT current parent state than the `tesr-` row does, the row is provably
+        //       stale — the child's copy is the one that was conveyed and co-signed last.
+        //       `colored_in_ladder_pay` writes the terminalized segment back so the row names `SP`
+        //       and this tower becomes the child's ALLY, but a watchtower must not depend on a
+        //       write having succeeded. Reported as blindness rather than acted on: a tower that
+        //       cannot tell which of two rival states is live must broadcast neither.
+        let child_rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "ladder defence is BLIND on every adopted split child: the child-bundle rows could \
+                 not be read ({e}) — refusing to report a defended wallet from a failed read"
+            )
+        })?;
+        // L1's evidence in lookup form, for the second broadcast loop below (which iterates DB rows
+        // rather than coins and so has no `Coin` in hand): the statechain ids this wallet can still
+        // prove are its own live, unspent coins. Everything else — conveyed, in flight, withdrawn,
+        // invalidated, or absent from the record entirely — is refused by default. Same predicate
+        // the root loop applies directly to `c.status`.
+        let live_sids: std::collections::HashSet<String> = record
+            .coins
+            .iter()
+            .filter(|c| c.duplicate_index == 0 && c.status == CoinStatus::CONFIRMED)
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        let mut conveyed_parent_states: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for (key, json) in child_rows.iter() {
+            if !key.starts_with("ctesr-") {
+                continue;
+            }
+            // A row that will not parse is handled (loudly) by the child loop below; here it simply
+            // contributes no supersession evidence, which leaves L1 in charge.
+            if let Ok(cb) =
+                serde_json::from_str::<mercuryrustlib::tesr::ChildTesrBundle>(json)
+            {
+                conveyed_parent_states
+                    .entry(cb.parent_statechain_id.clone())
+                    .or_default()
+                    .insert(cb.parent.current().state.txid.clone());
+            }
+        }
         for c in &record.coins {
             if c.duplicate_index != 0 {
                 continue;
             }
             let Some(id) = c.statechain_id.clone() else { continue };
+            // L1 — LIVENESS ALLOWLIST. Anything that is not CONFIRMED is not provably ours, and
+            // therefore not ours to broadcast. This is a DECIDED answer, not blindness: a wallet
+            // with one pending transfer must not report a permanently blind watchtower, and the
+            // coin is not left undefended — whoever now holds the live state defends it.
+            if c.status != CoinStatus::CONFIRMED {
+                continue;
+            }
             let bundle = match mercuryrustlib::tesr::load(
                 &self.inner.cc,
                 &self.inner.config.wallet_name,
@@ -1558,6 +1778,20 @@ impl UtexoWallet {
                     continue;
                 }
             };
+            // L2 — a child of ours disagrees with this row about which parent state is live.
+            if let Some(conveyed) = conveyed_parent_states.get(&id) {
+                let local = bundle.current().state.txid.clone();
+                if !conveyed.contains(&local) {
+                    blind.push(format!(
+                        "{id} (this wallet's `tesr-` row still names state {local} as live, but the \
+                         split child(ren) it funded were conveyed with {conveyed:?} as the parent's \
+                         current state — the local row is SUPERSEDED, and broadcasting it would \
+                         race those children rather than defend them, destroying a coloured child's \
+                         allocation. Refusing to act on it; re-store the terminalized parent segment)"
+                    ));
+                    continue;
+                }
+            }
             // F4: `watch_pass` now reports whether it could SEE. An unreadable chain backend is
             // `Blind`, NOT an empty "nothing to do" — treating the two alike is what let a dead
             // electrum connection masquerade as a quiet, well-defended coin.
@@ -1596,6 +1830,89 @@ impl UtexoWallet {
                 }
             }
         }
+
+        // ---- ADOPTED SPLIT CHILDREN (`ctesr-` rows) -------------------------------------------
+        //
+        // [CTES-R] **This is the pass that protects a coloured carrier, and `auto_exit_due` is not.**
+        //
+        // The instruction was "open `auto_exit_due` to coloured carriers". The evidence says the
+        // other pass is the right one, so this is where the coverage went:
+        //
+        //  * `auto_exit_due` acts on `ExitCostEstimate::exit_deadline_block`, which is defined only
+        //    for a coin with an off-chain ANCESTOR that could broadcast a stale ABSOLUTE-locktime
+        //    backup — "`None` for a flat on-chain coin (no off-chain ancestor can race you)". A
+        //    coloured ladder is root-only by construction (the claim pass refuses to ladder a coin
+        //    whose `F` is not on chain, [B0]), so its `read_exit_branch` is verifiably empty and its
+        //    deadline is genuinely `None`. There is no height at which anything expires: an idle
+        //    laddered coin never ages. Opening `auto_exit_due` to it would not compute a deadline —
+        //    it would have to invent one, and then act on it by broadcasting a three-tier exit that
+        //    converts a live off-chain coin into on-chain sats for no reason. That is the opposite
+        //    of protection.
+        //  * What can actually hurt a coloured coin is someone SPENDING `F` — a prior owner or
+        //    griefer broadcasting `T` — and, for a child, the parent's retained `S_0` racing the
+        //    child's `SP` over `X_m.out[0]`. Both are reactive, per-block races that the owner wins
+        //    because the adopted state carries the strictly-lowest CSV. Racing them is exactly what
+        //    this pass does, and only this pass does it.
+        //
+        // Coloured ROOT carriers were already covered: their ladder lives in a `tesr-` row and the
+        // loop above does not care whether a bundle is coloured. Children were not covered at all —
+        // by anything — which is the real gap the instruction was pointing at, since the coloured
+        // in-ladder split pays its recipient in exactly this shape. Plain children get the same
+        // defence for free; they had the same hole.
+        //
+        // [D1] …and this loop had NO liveness filter of any kind — not even the denylist the root
+        // loop carried. A `ctesr-` row is not deleted when the child leaves: `child_retransfer` /
+        // `cosign_colored_child_retransfer` overwrite it with the bundle they conveyed, and the
+        // sender's piece slot is left WITHDRAWN. That is safe only for exactly one hop. The moment
+        // the RECIPIENT re-transfers the child onward, this wallet is holding a co-signed child
+        // state that rivals the one the new owner now holds over `ext_child.out[0]` — and driving
+        // it destroys a stranger's allocation, two hops away from anything this wallet did. Same
+        // L1, same evidence, same allowlist: broadcast only for a child whose coin this wallet
+        // still holds CONFIRMED. A `ctesr-` row with no live coin behind it is a receipt of a coin
+        // that has moved on; it is not a coin to defend.
+        for (key, json) in child_rows.iter() {
+            let Some(cid) = key.strip_prefix("ctesr-") else { continue };
+            // L1 — LIVENESS ALLOWLIST (see the root loop). A decided answer, not blindness.
+            if !live_sids.contains(cid) {
+                continue;
+            }
+            let cb: mercuryrustlib::tesr::ChildTesrBundle = match serde_json::from_str(json) {
+                Ok(b) => b,
+                // Fail CLOSED and LOUD, same contract as the `tesr-` arm: a child bundle we cannot
+                // parse is a child we cannot defend, not a child with nothing to defend.
+                Err(e) => {
+                    blind.push(format!("{cid} (child bundle unreadable: {e})"));
+                    continue;
+                }
+            };
+            match mercuryrustlib::tesr::watch_child_pass(&self.inner.cc.electrum_client, &cb) {
+                mercuryrustlib::tesr::WatchState::Idle => {}
+                mercuryrustlib::tesr::WatchState::Acted { ids, failures } => {
+                    if !ids.is_empty() {
+                        let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
+                            statechain_id: cid.to_string(),
+                            tiers_broadcast: ids.len() as u32,
+                        });
+                        acted.push(cid.to_string());
+                    }
+                    let hard: Vec<&String> = failures
+                        .iter()
+                        .filter(|f| !ladder_failure_is_waiting(f))
+                        .collect();
+                    if !hard.is_empty() {
+                        blind.push(format!(
+                            "{cid} (child tier broadcast REJECTED for a reason that is not an \
+                             immature CSV — the child's exit may be raced or unusable: {})",
+                            hard.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")
+                        ));
+                    }
+                }
+                mercuryrustlib::tesr::WatchState::Blind { reason } => {
+                    blind.push(format!("{cid} ({reason})"));
+                }
+            }
+        }
+
         if !blind.is_empty() {
             return Err(anyhow!(
                 "ladder defence is BLIND on {} coin(s) — their TES-R bundle could not be read, or \
@@ -1884,18 +2201,28 @@ impl UtexoWallet {
         &self,
         branch: &[mercurylib::wallet::BackupTx],
     ) -> Result<u32> {
-        use electrum_client::ElectrumApi;
-        let initlock = mercuryrustlib::utils::info_config(&self.inner.cc)
-            .await
-            .map_err(|e| anyhow!("SE config unreachable, so `initlock` is unknown: {e}"))?
-            .initlock;
         // Branch is stored root-first; the root's single input spends the on-chain deposit outpoint.
         let root = branch
             .iter()
             .min_by_key(|b| b.tx_n)
             .ok_or_else(|| anyhow!("exit branch is empty — no root tx to anchor the deadline to"))?;
+        self.deposit_anchored_deadline_of_root_tx(&root.tx).await
+    }
+
+    /// The same computation keyed on the ROOT TRANSACTION alone, so the coloured lane can use it.
+    /// A coloured child stores no `branch-` rows — its exit material is the five-tier chain in its
+    /// `ctesr-` bundle — but the anchor is identical: the chain's root (`T`) spends the carrier's
+    /// on-chain funding output, and every ancestor backup that could race it is anchored at that
+    /// output's DEPOSIT height. Splitting this out keeps one definition of the deadline rather than
+    /// two that can drift.
+    async fn deposit_anchored_deadline_of_root_tx(&self, root_tx_hex: &str) -> Result<u32> {
+        use electrum_client::ElectrumApi;
+        let initlock = mercuryrustlib::utils::info_config(&self.inner.cc)
+            .await
+            .map_err(|e| anyhow!("SE config unreachable, so `initlock` is unknown: {e}"))?
+            .initlock;
         let root_tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&hex::decode(&root.tx).map_err(|e| {
+            bitcoin::consensus::encode::deserialize(&hex::decode(root_tx_hex).map_err(|e| {
                 anyhow!("exit-branch root tx is not valid hex: {e}")
             })?)
             .map_err(|e| anyhow!("exit-branch root tx does not deserialize: {e}"))?;
@@ -1948,10 +2275,124 @@ impl UtexoWallet {
         Ok(deposit_anchored_deadline(h_deposit, initlock))
     }
 
+    /// **[CTES-R MIGRATION / D2] Settle an un-colourable carrier's ALLOCATION on chain. NOT an exit.**
+    ///
+    /// This is the action [`Self::unilateral_exit`] used to perform for this class under the wrong
+    /// name, reporting `ExitStatus{complete:true}` for it. The action was always sound; the label
+    /// was not. It is separated out here so that neither half has to lie about the other:
+    ///
+    ///  * WHAT IT DOES. Broadcasts the carrier's stored exit BRANCH — the `branch-<id>` rows, which
+    ///    for a carrier are the un-broadcast COLOURED split/combine transactions, i.e. the RGB
+    ///    witnesses that carved this allocation. Landing them settles the allocation on a confirmed
+    ///    outpoint and spends the shared root, which is what defeats an ancestor's stale-backup
+    ///    clawback. A carrier whose funding was confirmed to begin with has no branch, and then this
+    ///    is a verified no-op — the allocation was already settled.
+    ///  * WHAT IT DOES NOT DO, AND CANNOT. It does not exit the coin. The sats stay on the live
+    ///    2-of-2 outpoint and still need the SE to move; the only SE-free spend of that outpoint
+    ///    this wallet holds is the plain pre-signed backup, which is RGB-UNAWARE and would destroy
+    ///    the allocation, so it is never broadcast here. A carrier in this class has no unilateral
+    ///    exit at all, and no method in this SDK will claim one for it.
+    ///  * WHAT IT REFUSES. Any carrier that is not in the migration class: a carrier that already
+    ///    HAS a coloured ladder walks that ladder through `unilateral_exit`, and a carrier that
+    ///    could still be coloured must WAIT for its ladder rather than be settled early. Both are
+    ///    decided by the one shared definition, [`Self::carrier_is_permanently_flat`], so this
+    ///    method and the exit's refusal can never disagree about which coins they are talking about.
+    ///
+    /// Returns `true` if a branch was broadcast, `false` if the carrier verifiably had none. Either
+    /// way the allocation's settlement is VERIFIED against the chain before returning: an
+    /// unreachable backend is an `Err`, never a quiet success.
+    pub async fn materialise_carrier(&self, statechain_id: &str) -> Result<bool> {
+        use electrum_client::ElectrumApi;
+        let record = self.record().await?;
+        let coin = record
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(statechain_id) && c.duplicate_index == 0)
+            .ok_or_else(|| anyhow!("no coin found for statechain id {statechain_id}"))?
+            .clone();
+        let carriers = self.unspendable_as_btc_outpoints().await?;
+        if !is_token_carrier(&coin, &carriers) {
+            return Err(anyhow!(
+                "coin {statechain_id} carries no RGB allocation — there is nothing to materialise. \
+                 A plain coin exits through `unilateral_exit`."
+            ));
+        }
+        // Fail CLOSED through the shared definition: an unreadable ladder row is an `Err` there, so
+        // "I could not tell whether this coin could be coloured" never licenses an early settlement.
+        if !self.carrier_is_permanently_flat(&coin).await? {
+            return Err(anyhow!(
+                "carrier {statechain_id} is NOT in the migration class — a COLOURED ladder either \
+                 already exists for it or can still be built (coloured root floor {} sat). It must \
+                 not be settled early: once it is laddered, `unilateral_exit` walks that ladder and \
+                 the walk moves the allocation to your own key, which this method cannot do.",
+                self.colored_root_floor()
+            ));
+        }
+        let branch_broadcast = self.broadcast_branch_if_any(statechain_id).await?;
+        // VERIFIED, not assumed. The allocation is settled only if the outpoint it is sealed on is
+        // really known to the chain; an unreachable backend reads as NOT settled and is an error, so
+        // a caller can never be told the tokens are safe on the strength of a failed lookup.
+        let funding_txid = coin
+            .utxo_txid
+            .clone()
+            .ok_or_else(|| anyhow!("carrier {statechain_id} has no funding txid recorded"))?;
+        let parsed: bitcoin::Txid = funding_txid.parse().map_err(|e| {
+            anyhow!("carrier {statechain_id} has an unparseable funding txid {funding_txid}: {e}")
+        })?;
+        self.inner.cc.electrum_client.transaction_get(&parsed).map_err(|e| {
+            anyhow!(
+                "carrier {statechain_id}: its exit branch was broadcast ({branch_broadcast}) but the \
+                 funding transaction {funding_txid} its allocation is sealed on is not visible to \
+                 the chain backend ({e}) — refusing to report the allocation as settled. Retry; the \
+                 branch broadcast is idempotent."
+            )
+        })?;
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let _ = self.inner.events_tx.send(WalletEvent::TokenCarrierMaterialized {
+            statechain_id: statechain_id.to_string(),
+            deadline_block: tip,
+            tip,
+        });
+        eprintln!(
+            "[CTES-R migration] carrier {statechain_id} has no coloured ladder and none can be built \
+             for it (coloured root floor {} sat), so it has NO unilateral exit. MATERIALISED \
+             instead: exit branch broadcast = {branch_broadcast}, allocation sealed on \
+             {funding_txid} and visible to the chain. Its plain backup was deliberately NOT \
+             broadcast — that would destroy the tokens — and its sats remain on the 2-of-2 outpoint, \
+             movable only with the SE or over the migration hatch (`transfer_tokens`).",
+            self.colored_root_floor()
+        );
+        Ok(branch_broadcast)
+    }
+
     /// Unilateral exit: broadcast the exit branch (immediately valid) and the latest pre-signed
     /// backup tx for each coin. Needs no SE cooperation. A backup whose locktime has not been
     /// reached is reported as `complete=false` with the remaining `wait_blocks` — call again
     /// once the chain advances (the branch stays out either way).
+    /// [CTES-R] Tell the RGB engine where a COMPLETED coloured exit put the allocation.
+    ///
+    /// Deliberately non-fatal: by the time this runs the exit is already on chain and irreversible,
+    /// so turning a bookkeeping failure into an `Err` would report a SUCCESSFUL exit as a failed one
+    /// and send callers into a retry loop over a finished walk. It is not silent either — both
+    /// outcomes are evented, and the failure event says plainly that the engine's views are stale.
+    async fn register_exit_tip_best_effort(&self, id: &str) {
+        match self.register_colored_exit_tip(id).await {
+            Ok(Some(outpoint)) => {
+                let _ = self.inner.events_tx.send(WalletEvent::ColoredExitTipRegistered {
+                    statechain_id: id.to_string(),
+                    outpoint,
+                });
+            }
+            Ok(None) => {} // plain coin, non-token wallet, or already registered
+            Err(e) => {
+                let _ = self.inner.events_tx.send(WalletEvent::ColoredExitTipUnregistered {
+                    statechain_id: id.to_string(),
+                    detail: e.to_string(),
+                });
+            }
+        }
+    }
+
     pub async fn unilateral_exit(
         &self,
         statechain_ids: Option<Vec<String>>,
@@ -1975,7 +2416,14 @@ impl UtexoWallet {
         // Deliberately NOT opened here: `withdraw` and `refresh` (`refresh.rs`) still refuse
         // carriers outright. Neither is fixed by CTES-R — there is still no coloured on-chain
         // re-anchor (CTESR-GATE §7) — so their refusals stand and only this one opens.
-        let colored_sids = self.colored_ladder_sids().await?;
+        let mut colored_sids = self.colored_ladder_sids().await?;
+        // [CTES-R] …and the coloured SPLIT CHILDREN, which have no `tesr-` row at all. A coloured
+        // child IS a carrier (its allocation sits on `SP.out[j]`), and its five-tier pre-signed walk
+        // `T -> X_m -> SP -> ext_child -> state_child` moves the allocation to the owner's own key
+        // exactly as a root ladder's three-tier walk does. Without this the piece a coloured
+        // in-ladder split pays out would be the one carrier class that can never exit — refused by
+        // the very guard CTES-R opened. Same fail-closed read (an unreadable table is an `Err`).
+        colored_sids.extend(self.colored_child_sids().await?);
         let exitable_carrier = |c: &Coin| -> bool {
             c.statechain_id.as_deref().is_some_and(|id| colored_sids.contains(id))
         };
@@ -1984,9 +2432,71 @@ impl UtexoWallet {
                 for id in &ids {
                     if let Some(c) = record.coins.iter().find(|c| c.statechain_id.as_deref() == Some(id)) {
                         if is_token_carrier(c, &carriers) && !exitable_carrier(c) {
-                            return Err(anyhow!(
-                                "coin {id} carries an RGB allocation and its ladder is not COLOURED (CTES-R); a plain unilateral exit would destroy the tokens — move the asset off this coin first"
-                            ));
+                            // [CTES-R MIGRATION / D2] …and the un-colourable class gets a DIFFERENT
+                            // refusal, not a different outcome.
+                            //
+                            // The blanket refusal below is right for a carrier that is merely
+                            // WAITING for its ladder: it will be coloured by a later `claim()` and
+                            // then walks. It says the wrong thing to a carrier that can NEVER be
+                            // coloured — "move the asset off this coin first" is not advice to such
+                            // an owner, it is a description of something they cannot do — so that
+                            // class is answered separately, below.
+                            //
+                            // What it is NOT answered with any more is `ExitStatus{complete:true}`.
+                            // The previous round routed this class into the exit loop, where a
+                            // "materialise" arm broadcast the stored `branch-` rows and then
+                            // reported the exit COMPLETE. The ACTION was right — those rows are the
+                            // un-broadcast coloured split/combine transactions, i.e. the RGB
+                            // witnesses themselves, so broadcasting them really does settle the
+                            // allocation on chain and really does defeat an ancestor's clawback.
+                            // The REPORT was a lie, twice over:
+                            //
+                            //  * `ExitStatus::complete` is documented as "branch (if any) and
+                            //    backup both broadcast". The backup is deliberately never broadcast
+                            //    here — it is an RGB-unaware spend of `F` and would destroy the
+                            //    allocation — so `complete` could not be true by the field's own
+                            //    definition, and the flag was in fact computed from "is the funding
+                            //    txid known to the chain", which says nothing about an exit;
+                            //  * and it is not an exit in any sense the caller means. A unilateral
+                            //    exit ends with the value under the owner's sole key. This ends
+                            //    with the ASSET sealed on a confirmed outpoint and the SATS still
+                            //    parked on the live 2-of-2, movable only with the SE. There is no
+                            //    pre-signed SE-free spend that could do better: colouring is what
+                            //    makes a tier an RGB witness, and this is the class that cannot be
+                            //    coloured. So no unilateral exit exists for it today.
+                            //
+                            // A false green on an escape hatch is worse than no hatch — it will be
+                            // believed. Refuse, and name the two things that DO exist, both of them
+                            // callable: `materialise_carrier` (settle the allocation on chain, the
+                            // action this arm used to perform under the wrong name) and
+                            // `transfer_tokens` (the migration hatch, which still moves the value).
+                            if self.carrier_is_permanently_flat(c).await? {
+                                let op = coin_outpoint(c).unwrap_or_else(|| "<unknown>".to_string());
+                                return Err(anyhow!(
+                                    "coin {id} carries an RGB allocation, no COLOURED ladder can be \
+                                     built for it (coloured root floor {} sat), and therefore it has \
+                                     NO unilateral, SE-free exit at all — this call will not report \
+                                     one. Every pre-signed spend of its funding output {op} that \
+                                     this wallet holds is RGB-UNAWARE, so broadcasting one would \
+                                     destroy the allocation; that is refused, not deferred. The coin \
+                                     is NOT stranded, and two named routes remain: (1) \
+                                     `materialise_carrier(\"{id}\")` settles the ALLOCATION on chain \
+                                     by broadcasting its stored RGB-aware exit branch — that is what \
+                                     protects the tokens from an ancestor's stale-backup clawback, \
+                                     and it is what this call used to do while mislabelling itself \
+                                     an exit; (2) `transfer_tokens` still pays the asset onward over \
+                                     the migration hatch, which opens the RGB-aware legacy \
+                                     split/combine lane for exactly this class. The sats stay on the \
+                                     2-of-2 outpoint either way and need the SE to move; if you need \
+                                     them on chain, move the asset to a colourable carrier via (2) \
+                                     first and withdraw cooperatively.",
+                                    self.colored_root_floor()
+                                ));
+                            } else {
+                                return Err(anyhow!(
+                                    "coin {id} carries an RGB allocation and its ladder is not COLOURED (CTES-R); a plain unilateral exit would destroy the tokens — move the asset off this coin first"
+                                ));
+                            }
                         }
                         // [HF-4 / B1] Never exit a coin that is no longer ours to exit. The explicit-id
                         // branch previously filtered on carrier status ALONE — so a WITHDRAWN parent (a
@@ -2021,6 +2531,10 @@ impl UtexoWallet {
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let mut statuses = Vec::new();
         for id in ids {
+            // [CTES-R MIGRATION / D2] The un-colourable carrier never reaches this loop: it is
+            // REFUSED, by name and with its routes spelled out, in the id-selection arm above. The
+            // "materialise here and report complete" arm that used to sit at this point was removed
+            // — see that refusal for why it was a no-op wearing a success flag.
             // Laddered (TES-R) coin: if a ladder was adopted (deposit-established or received via Model A),
             // the unilateral exit runs the tier chain — trigger spends F, then each extension/state as
             // its relative-CSV matures — NOT the un-laddered absolute-locktime backup. exit_pass is idempotent
@@ -2035,6 +2549,9 @@ impl UtexoWallet {
                 let progress =
                     mercuryrustlib::tesr::exit_pass(&self.inner.cc.electrum_client, &bundle)?;
                 let done = progress.complete;
+                if done {
+                    self.register_exit_tip_best_effort(&id).await;
+                }
                 let wait_blocks = if done {
                     0
                 } else {
@@ -2057,6 +2574,9 @@ impl UtexoWallet {
                 let progress =
                     mercuryrustlib::tesr::exit_child_pass(&self.inner.cc.electrum_client, &cb)?;
                 let done = progress.complete;
+                if done {
+                    self.register_exit_tip_best_effort(&id).await;
+                }
                 let wait_blocks = if done {
                     0
                 } else {

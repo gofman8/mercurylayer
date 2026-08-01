@@ -26,6 +26,7 @@ pub mod rgb12_validate_offchain_negative;
 pub mod rgb13_consignment_integrity;
 pub mod rgb14_metadata_and_ifa_supply;
 pub mod rgb15_colored_tier_builder;
+pub mod rgb16_legacy_lane_uncolourable;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
@@ -88,6 +89,11 @@ pub mod sdk72_watchtower_failloud;
 pub mod sdk73_structural_recovery;
 pub mod sdk74_colored_ladder;
 pub mod sdk75_colored_exit;
+pub mod sdk76_received_parent_split;
+pub mod sdk77_colored_inladder_split;
+pub mod sdk78_uncolourable_carrier;
+pub mod sdk79_split_watchtower;
+pub mod sdk80_plain_child_split_watchtower;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -408,6 +414,48 @@ async fn main() -> Result<()> {
         sdk75_colored_exit::execute().await?;
         return Ok(());
     }
+    // Split a RECEIVED laddered coin (SDK_E2E=76): the PARENT_V2_BASELINE regression. sdk58/59/69
+    // all DEPOSIT the parent, so the baseline constant is accidentally correct there; this puts one
+    // whole-coin hop in front of the split, so the parent carries 1 + k flat backups, and asserts
+    // the receiver can still ADOPT and EXIT the child — with a negative control proving the old
+    // constant would reject the very same bundle.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("76") {
+        sdk76_received_parent_split::execute().await?;
+        return Ok(());
+    }
+    // CTES-R partial token payment (SDK_E2E=77): a COLOURED carrier pays PART of its allocation
+    // through the in-ladder split (SP over X_m's payload output, per-child coloured ladders), the
+    // recipient adopts the coloured child, RE-TRANSFERS it off-chain, and the next holder exits it
+    // unilaterally with the allocation intact (empty-off-chain-set proof + read-only stock probe).
+    // The plain lanes over both the carrier and the child stay refused.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("77") {
+        sdk77_colored_inladder_split::execute().await?;
+        return Ok(());
+    }
+    // [B1] Un-colourable carrier migration (SDK_E2E=78): three PRE-FLIP 1_500-sat carriers on a
+    // wallet with `colored_ladder` ON are proved permanently un-colourable, then SPENT through the
+    // migration hatch, upgraded into a colourable piece at the receiver, and the residue EXITED by
+    // materialisation with the allocation intact and the plain sweep never broadcast.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("78") {
+        sdk78_uncolourable_carrier::execute().await?;
+        return Ok(());
+    }
+    // [B2] Split watchtower supersession (SDK_E2E=79): after a coloured in-ladder pay the SENDER's
+    // own `tesr-` row names SP (not the superseded S_0), and its watchtower refuses to act on a
+    // ladder it has already spent — so it can never broadcast a state that conflicts with the
+    // recipient's child and destroys the allocation it just paid out.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("79") {
+        sdk79_split_watchtower::execute().await?;
+        return Ok(());
+    }
+    // [D1 adversarial] The window A1/A2 did not close (SDK_E2E=80): `child_in_ladder_pay_many`
+    // conveys every grandchild BEFORE writing the child's durable status, and `ctesr-<child>` is
+    // never rewritten, so `defend_ladders`' child loop is admitted to drive a superseded state
+    // while strangers hold the bundles that supersede it.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("80") {
+        sdk80_plain_child_split_watchtower::execute().await?;
+        return Ok(());
+    }
 
     // RLN harness smoke (LN_SMOKE=1): two rgb-lightning-node daemons, funded channel, real BOLT11.
     if std::env::var("LN_SMOKE").as_deref() == std::result::Result::Ok("1") {
@@ -504,6 +552,15 @@ async fn main() -> Result<()> {
     // the RGB proxy only (no Mercury server, no lockbox).
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("15") {
         rgb15_colored_tier_builder::execute().await?;
+        return Ok(());
+    }
+    // [D3] Why a LEGACY-lane carrier cannot be coloured (RGB_E2E=16): reproduces sdk78's
+    // `Invalid coloring info` over an above-the-floor piece and names the cause — the legacy
+    // receive path never accepts the transfer into the RGB stock, so it is NOT the E7 class. The
+    // control accepts the SAME consignment through `accept_ladder` and the same piece colours.
+    // Needs bitcoind + electrs + the RGB proxy only (no Mercury server, no lockbox).
+    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("16") {
+        rgb16_legacy_lane_uncolourable::execute()?;
         return Ok(());
     }
 

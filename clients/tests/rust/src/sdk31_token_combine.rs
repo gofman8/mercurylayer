@@ -80,7 +80,7 @@ async fn wait_carriers_confirmed(
         let carriers = rec
             .coins
             .iter()
-            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0 && c.amount == Some(10_000))
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0 && c.amount == Some(mercury_utexo_sdk::tokens::TOKEN_CARRIER_SATS as u32))
             .count();
         if units_ok && carriers >= want_carriers {
             return Ok(());
@@ -149,128 +149,175 @@ pub async fn execute() -> Result<()> {
     wait_carriers_confirmed(&cc, &alice, "sdk31_alice", &core, &asset, 110, 2).await?;
     println!("SDK31 - alice holds 110 {asset} across TWO carriers (60 + 50); no single carrier has 100");
 
-    // ===== (a) COMBINE PAYMENT (the payment that used to be refused) =============================
-    add_tokens(&cc, &alice, 3).await?; // piece + change slots + headroom
-    let r = alice.transfer_tokens(&asset, &bob_addr, 100).await?;
-    assert_eq!(r.coins.len(), 1, "one piece handed over");
-    let piece_id = r.coins[0].statechain_id.clone();
-    wait_token_balance(&bob, &asset, 100).await?;
-    assert_eq!(token_balance(&bob, &asset).await?, 100, "bob booked EXACTLY 100 across the combine");
-    assert_eq!(token_balance(&alice, &asset).await?, 10, "alice keeps the 10-unit change");
-    println!("SDK31 - COMBINE PAYMENT: paid bob 100 spanning two carriers; bob=100 alice=10");
-
-    // ===== (b) VERIFY branch + terminal-ancestor invariants (check logs vs spec) =================
-    let branch = mercuryrustlib::sqlite_manager::get_backup_txs(
-        &cc.pool,
-        "sdk31_bob",
-        &format!("branch-{piece_id}"),
-    )
-    .await?;
-    assert_eq!(branch.len(), 1, "the piece's exit branch is the single combine tx");
-    let combine_tx = parse_tx(&branch[0].tx)?;
-    let n_inputs = combine_tx.input.len();
-    let op_returns = combine_tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count();
-    assert_eq!(n_inputs, 2, "the combine consumes BOTH carriers (2 inputs)");
-    assert_eq!(op_returns, 1, "exactly one opret commitment (INV-11)");
-    let est = bob.estimate_exit_cost(&piece_id).await?;
-    assert_eq!(est.branch_txs, 1, "depth-1: the combine is the whole branch");
-    // Receiver rule: required terminal ancestors = Σ inputs across branch txs = 2 (not 1 per hop).
-    let required_ancestors: usize = branch
-        .iter()
-        .map(|b| parse_tx(&b.tx).map(|t| t.input.len()))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .sum();
-    assert_eq!(required_ancestors, 2, "a 2-input combine requires 2 terminal ancestors");
-    // The named ancestors (what the receiver validated) — both must be terminal at the SE.
-    let ancestors = mercuryrustlib::sqlite_manager::get_backup_txs(
-        &cc.pool,
-        "sdk31_bob",
-        &format!("parents-{piece_id}"),
-    )
-    .await?;
-    assert_eq!(ancestors.len(), 2, "exactly the two carriers are named as ancestors");
-    let mut all_terminal = true;
-    for a in &ancestors {
-        let (_budget, _fin, terminal) =
-            mercuryrustlib::lightning_latch::get_spend_budget(&cc, &a.tx).await?;
-        all_terminal &= terminal;
+    // [CTES-R] Wait for BOTH carriers' COLOURED ladders before paying.
+    //
+    // Synchronisation, not relaxation: `colored_ladder` is now on by default, so `claim()` builds a
+    // coloured ladder over each carrier — but only once that carrier's allocation is BOOKED, which
+    // can land in the same pass as the balance or in the next one. Without this the payment would
+    // sometimes be attempted before the ladders exist and be refused by the retired-lane gate.
+    let mut colored_sids: Vec<String> = Vec::new();
+    for _ in 0..60 {
+        alice.claim().await?;
+        let coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk31_alice").await?.coins;
+        colored_sids.clear();
+        for c in coins.iter().filter(|c| c.duplicate_index == 0) {
+            let Some(sid) = c.statechain_id.clone() else { continue };
+            if mercuryrustlib::tesr::load(&cc, "sdk31_alice", &sid)
+                .await?
+                .is_some_and(|b| b.is_colored())
+            {
+                colored_sids.push(sid);
+            }
+        }
+        if colored_sids.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    assert!(all_terminal, "BOTH combined carriers must be terminal (bob enforced this on claim)");
-    println!(
-        "VERIFY combine: branch_txs=1 combine_inputs={n_inputs} op_returns=1 required_terminal_ancestors={required_ancestors} named_ancestors={} all_terminal={all_terminal}",
-        ancestors.len()
+    assert_eq!(
+        colored_sids.len(),
+        2,
+        "both of alice's carriers must carry a COLOURED ladder before the multi-carrier payment"
     );
-    println!("ECON token_combine inputs=2 combine_vb={} outputs={}", combine_tx.vsize(), combine_tx.output.len());
+    println!("SDK31 - both carriers carry a COLOURED (CTES-R) ladder: {colored_sids:?}");
 
-    // ===== (c) EXIT the combined coin (invalidation holds for a combine) =========================
-    // A token piece is a CARRIER, so unilateral_exit refuses it (a plain sweep would destroy the
-    // allocation). The token-preserving exit is to broadcast the branch DIRECTLY: the colored
-    // combine tx IS the RGB witness — confirming it anchors the transition on-chain and settles the
-    // allocation. (The uncolored leaf backup is deliberately NOT broadcast; it would destroy it.)
-    use electrum_client::ElectrumApi;
-    // Capture the two carrier outpoints, to prove they get spent on-chain (old carriers dead).
-    let carrier_ops: Vec<(String, u32)> = combine_tx
-        .input
-        .iter()
-        .map(|i| (i.previous_output.txid.to_string(), i.previous_output.vout))
-        .collect();
-    for row in &branch {
-        cc.electrum_client.transaction_broadcast_raw(&hex::decode(&row.tx)?)?;
-    }
-    bitcoin_core::generatetoaddress(3, &core)?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    // Both carrier outpoints are now spent by the combine — every old backup on them is dead.
-    for (txid, vout) in &carrier_ops {
-        assert!(is_outpoint_spent(&cc, txid, *vout)?, "carrier {txid}:{vout} must be spent by the combine");
-    }
-    // bob's piece outpoint is a LIVE on-chain UTXO holding the 1_500 packaging sats.
-    let piece_coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk31_bob")
-        .await?
-        .coins
-        .into_iter()
-        .find(|c| c.statechain_id.as_deref() == Some(&piece_id))
-        .ok_or_else(|| anyhow!("bob's piece coin vanished"))?;
-    let leaf_txid = piece_coin.utxo_txid.clone().unwrap_or_default();
-    let leaf_vout = piece_coin.utxo_vout.unwrap_or_default();
-    let mut leaf_live = false;
-    for _ in 0..30 {
-        let spk = &combine_tx.output[leaf_vout as usize].script_pubkey;
-        if cc
-            .electrum_client
-            .script_list_unspent(spk)?
-            .iter()
-            .any(|u| u.tx_hash.to_string() == leaf_txid && u.tx_pos as u32 == leaf_vout)
-        {
-            leaf_live = true;
-            break;
-        }
-        bitcoin_core::generatetoaddress(1, &core)?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert!(leaf_live, "bob's exited piece outpoint {leaf_txid}:{leaf_vout} must be a live on-chain UTXO");
-    // RGB settles the 100 units on-chain on the exited outpoint (balance stays 100, now settled).
-    for _ in 0..20 {
-        let _ = bob.claim().await?;
-        if token_balance(&bob, &asset).await? == 100 {
-            break;
-        }
-        bitcoin_core::generatetoaddress(1, &core)?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert_eq!(token_balance(&bob, &asset).await?, 100, "100 units remain (now settled on-chain)");
-    println!("SDK31 - EXIT: broadcast the 2-input combine branch; both carrier outpoints spent; bob's 100 units settled on-chain on {leaf_txid}:{leaf_vout}");
+    // ===== (a) MULTI-CARRIER PAYMENT (the payment that used to be refused) =======================
+    //
+    // THE SHAPE CHANGED, AND THE CHANGE IS THE POINT. The legacy combine built ONE transaction
+    // spending BOTH carriers' funding outputs `F`. That shape cannot exist on the coloured lane and
+    // must not: each `F` is already spent by that carrier's own trigger `T`, so a combine over them
+    // is a rival spend of two outpoints at once — the exact hazard CTES-R removes. There is also no
+    // multi-parent coloured tier: `SP` spends exactly one `X_m`.
+    //
+    // So "pay across carriers" is now a multi-PIECE payment: one in-ladder split per carrier, each
+    // conveying a coloured child to the same recipient. RGB value conservation holds per split and
+    // the recipient's balance is the sum — which is the property the legacy combine delivered too.
+    // The assertions below are re-derived to that shape, not dropped: the amount bob receives, the
+    // change alice keeps, and the terminality of every source carrier are all still checked.
+    add_tokens(&cc, &alice, 4).await?; // 2 legs: piece(+change) slots per leg + headroom
+    let r = alice.transfer_tokens(&asset, &bob_addr, 100).await?;
+    assert_eq!(
+        r.coins.len(),
+        2,
+        "a payment spanning two carriers hands over ONE coloured child per carrier, got {:?}",
+        r.coins
+    );
+    let piece_ids: Vec<String> = r.coins.iter().map(|c| c.statechain_id.clone()).collect();
+    wait_token_balance(&bob, &asset, 100).await?;
+    assert_eq!(
+        token_balance(&bob, &asset).await?,
+        100,
+        "bob booked EXACTLY 100 summed across the two coloured children"
+    );
+    assert_eq!(token_balance(&alice, &asset).await?, 10, "alice keeps the 10-unit change");
+    println!("SDK31 - MULTI-CARRIER PAYMENT: paid bob 100 across two coloured carriers as {} children ({piece_ids:?}); bob=100 alice=10", piece_ids.len());
 
-    // ===== (d) NEGATIVE: over-balance is a TYPED insufficient error (not 'no single coin') =======
-    // alice now holds only 10; asking for 200 must fail on total balance, via the combine selector.
+    // ===== (b) VERIFY the structural invariants, re-derived for the coloured lane ================
+    //
+    // What the legacy version checked — "the branch is one 2-input tx, so the receiver demands 2
+    // terminal ancestors" — was a statement about a transaction that no longer exists. The
+    // invariant underneath it does still exist and is checked here, in three parts:
+    //
+    //   (i)   each conveyed piece really is a COLOURED CHILD at the receiver, carrying its declared
+    //         share of the allocation, and its five-tier chain validates off-chain;
+    //   (ii)  each child's ancestor segment spends its parent's `X_m` payload output — NOT `F`. This
+    //         is the whole reason the combine had to go: on the coloured lane nothing but `T` ever
+    //         spends a carrier's funding output;
+    //   (iii) EVERY source carrier is TERMINAL at the SE. That is the invalidation property the
+    //         2-terminal-ancestor rule was enforcing: no source coin can mint a further state behind
+    //         the recipient's back. It is now one terminal parent per leg rather than N per tx, and
+    //         it is asserted per leg, so a leg that silently skipped terminalisation still fails.
+    let mut total_booked = 0u64;
+    for pid in &piece_ids {
+        let cb = mercuryrustlib::tesr::load_child(&cc, "sdk31_bob", pid)
+            .await?
+            .ok_or_else(|| anyhow!("bob did not adopt {pid} as a child bundle"))?;
+        assert!(cb.is_colored(), "piece {pid} must be a COLOURED child, not a plain one");
+        let (contract, assigned, txids, _) = bob.colored_child_health(pid).await.map_err(|e| {
+            anyhow!("bob's coloured child {pid} does not validate against its own chain: {e}")
+        })?;
+        assert_eq!(contract, asset, "child {pid} carries the wrong contract");
+        total_booked += assigned;
+        assert_eq!(txids.len(), 5, "a coloured child's witness chain is T, X_m, SP, ext, state");
+        // (ii) SP spends X_m's payload output, and `F` is untouched by the child's chain.
+        let sp = parse_tx(&cb.parent.current().state.signed_tx)?;
+        let x_m = &cb.parent.current().extension;
+        assert_eq!(
+            sp.input.len(),
+            1,
+            "a coloured SP spends exactly ONE parent output — there is no multi-parent tier"
+        );
+        assert_eq!(
+            sp.input[0].previous_output.txid.to_string(),
+            x_m.txid,
+            "SP must spend X_m, not F"
+        );
+        assert_eq!(sp.input[0].previous_output.vout, x_m.payload_vout, "SP must spend X_m's payload");
+        assert_ne!(
+            sp.input[0].previous_output.txid.to_string(),
+            cb.parent.f_txid,
+            "SP must never spend the carrier's funding output F"
+        );
+        // (iii) that leg's source carrier is terminal at the SE.
+        let (_budget, _fin, terminal) =
+            mercuryrustlib::lightning_latch::get_spend_budget(&cc, &cb.parent_statechain_id).await?;
+        assert!(
+            terminal,
+            "the source carrier {} of child {pid} must be TERMINAL at the SE — otherwise it can \
+             mint a rival state behind bob's back",
+            cb.parent_statechain_id
+        );
+        println!(
+            "VERIFY leg: child {pid} holds {assigned} of {contract}; its SP spends X_m {}:{} (F {} \
+             untouched); source carrier {} is terminal",
+            x_m.txid, x_m.payload_vout, cb.parent.f_txid, cb.parent_statechain_id
+        );
+    }
+    assert_eq!(total_booked, 100, "the children's declared shares must sum to the amount paid");
+    // Every source carrier named across the legs must be DISTINCT — two children carved out of the
+    // same carrier would mean the payment never spanned carriers at all.
+    let sources: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        for pid in &piece_ids {
+            let cb = mercuryrustlib::tesr::load_child(&cc, "sdk31_bob", pid).await?.unwrap();
+            set.insert(cb.parent_statechain_id.clone());
+        }
+        set
+    };
+    assert_eq!(sources.len(), 2, "the two children must come from two DIFFERENT carriers: {sources:?}");
+
+    // ===== (c) SURVIVAL, at the stock level (E7) ================================================
+    //
+    // The legacy version "exited" by broadcasting the combine tx and reading a balance. Neither half
+    // transfers: there is no combine tx, and `get_asset_balance` is blind to a dead stash (E7). The
+    // survival evidence for a coloured child is the read-only `color_psbt` stock probe over its own
+    // exit output, which accepts exactly the declared amount and refuses one more. The full
+    // on-chain five-tier walk is owned by sdk77, which drives it end to end; repeating it per leg
+    // here would add ~2 CSV waits per child and prove nothing sdk77 does not.
+    for pid in &piece_ids {
+        let (_, assigned, _, _) = bob.colored_child_health(pid).await?;
+        bob.probe_colored_child_tip(pid, assigned).await.map_err(|e| {
+            anyhow!("bob's stock does not bind {assigned} to child {pid}'s exit output: {e}")
+        })?;
+        assert!(
+            bob.probe_colored_child_tip(pid, assigned + 1).await.is_err(),
+            "the stock probe must REFUSE {} on child {pid} — accepting more than the declared \
+             amount means the probe is not reading the stash at all",
+            assigned + 1
+        );
+        println!("SDK31 - stock probe: child {pid} spends exactly {assigned} out of its own exit output, and refuses {}", assigned + 1);
+    }
+
+    // ===== (d) NEGATIVE: over-balance is a TYPED insufficient error ==============================
+    // alice now holds only 10; asking for 200 must fail on total balance, via the coloured selector.
     let err = alice.transfer_tokens(&asset, &bob_addr, 200).await.expect_err("over-balance must fail");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("insufficient") && !msg.contains("multi-coin token combine not yet wired"),
-        "expected a typed insufficient error, got: {msg}"
+        msg.contains("cannot send 200") || msg.contains("short by"),
+        "expected a typed insufficient error naming the shortfall, got: {msg}"
     );
     println!("SDK31 - NEGATIVE: paying 200 > balance is refused with a typed insufficient error: {msg}");
 
-    println!("SDK31 - SUCCESS: multi-carrier token combine works — a payment spanning several carriers is minted by ONE SE-co-signed colored combine (2 inputs → piece + change); the receiver validates the multi-input branch and requires ALL combined carriers terminal (2 inputs => 2 terminal ancestors, closing the per-hop hole); the combined coin exits on-chain (both carrier outpoints spent, 100 units settled); and over-balance fails with a typed insufficient error. Invalidation/branch invariants preserved.");
+    println!("SDK31 - SUCCESS: a payment spanning several carriers works on the CTES-R lane — one in-ladder split per carrier, each conveying a COLOURED child to the recipient, whose declared shares sum to the amount paid (bob 100 / alice 10). Every child's SP spends its parent's X_m payload output and never the carrier's funding output F, every source carrier is TERMINAL at the SE (the invalidation property the old 2-terminal-ancestor rule enforced), the two children come from two DIFFERENT carriers, and the stock binds each child's exact share to its own exit output.");
     Ok(())
 }
