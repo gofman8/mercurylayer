@@ -3216,6 +3216,64 @@ pub async fn verify_conveyed_child(
         .ok_or_else(|| anyhow::anyhow!("parent F has no output {}", cb.parent.f_vout))?;
     let f_spk_hex = hex::encode(f_out.script_pubkey.as_bytes());
 
+    // ═══ [VALUE-CONSERVATION] ANCHOR THE CHAIN TO THE CHAIN ═══
+    //
+    // The laws in `verify_bundle_ex` and `verify_child_bundle` bind each tier to the one above it, so
+    // the whole structure conserves value RELATIVE to the trigger's payload output. That output was
+    // never itself bound to anything: `f_out` is fetched here and only its scriptPubKey is used, so
+    // `cb.parent.f_value` and the trigger's own outputs float free. A relative chain anchored to a
+    // free value is a free chain — a sender declaring a trigger that pays far less than `F` holds
+    // makes every tier below it conserve perfectly against a fiction, and the receiver books the
+    // funding value all the same.
+    //
+    // `f_out.value` is the one number in this whole structure that Bitcoin already agreed to. Binding
+    // the trigger to it turns every law above from relative into absolute.
+    {
+        use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+        let t_tx: Transaction =
+            deserialize(&hex::decode(&cb.parent.trigger.signed_tx).map_err(|_| {
+                anyhow::anyhow!("parent trigger hex does not decode")
+            })?)
+            .map_err(|_| anyhow::anyhow!("parent trigger is not a transaction"))?;
+        // Branch on colour, as every other law in this file does: a coloured tier's rung is 576 sat
+        // at 2 sat/vB (336 fee + 240 anchor) against the plain 490, because the opret is one whole
+        // extra P2TR-sized output. sdk77 caught this exact omission — 17 384 − 16 808 = 576.
+        let expect = if cb.is_colored() {
+            crate::rgb::colored_tier_out_total(f_out.value, 1, cb.parent.fee_rate)
+        } else {
+            mercurylib::tesr::tier_out_value(f_out.value, cb.parent.fee_rate)
+        }
+        .ok_or_else(|| anyhow::anyhow!(
+            "parent F holds {} sat, too little to carry a trigger at {} sat/vB",
+            f_out.value, cb.parent.fee_rate
+        ))?;
+        let got: u64 = t_tx
+            .output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum();
+        if got != expect {
+            return Err(anyhow::anyhow!(
+                "the parent's trigger is funded by an on-chain output of {} sat but its payload \
+                 outputs carry {got} (expected exactly {expect}) — every tier below it conserves \
+                 value against a number the sender chose rather than one the chain agreed to",
+                f_out.value
+            ));
+        }
+        // …and the bundle's own declared `f_value`, which builders feed to `cosign_tier` as a prevout
+        // amount, must be that same on-chain number.
+        if cb.parent.f_value != f_out.value {
+            return Err(anyhow::anyhow!(
+                "the bundle declares f_value {} but the on-chain funding output holds {}",
+                cb.parent.f_value, f_out.value
+            ));
+        }
+    }
+
     // [D1] THE PARENT'S FLAT-BACKUP COUNT, VALIDATED THEN COUNTED — the child-lane analogue of the
     // whole-coin path's `transfer_msg.backup_transactions.len()` (transfer_receiver.rs [S2]).
     //
