@@ -87,8 +87,12 @@ partial payment, ever" is dead** — the refusals that enforced it are gone. Per
 leaving them at `state_csv(1)` would not have been "conservative", it would have been a silent
 economic cap — refusing payments the chain carries fine — enforced by a stale constant.
 
-Verified by running: unit suites green (mercuryrustlib 72 now), and **sdk 58, 59, 69, 11, 76, 77, 81,
-82, 2, 31, 74, 75, 79 all PASS** against a freshly built binary.
+Verified by running: unit suites green (mercuryrustlib 72 now), and a **full-suite baseline at
+`5eddc0c`** — 22 distinct E2Es, all PASS against a freshly built binary:
+
+```
+sdk 1  2  11 29 30 31 32 34 36 45 58 59 69 72 74 75 76 77 78 79 81 82   +  RGB_E2E=1
+```
 
 sdk82 failed first, and the failure was worth having: it hard-coded `required_wait = 71` from
 `state_csv(1)`, so after the spine landed it mined to a tip chosen for the old arithmetic, left 56
