@@ -525,3 +525,48 @@ Do not re-raise these. Each names the check that stops it.
   point of no return; replay behaviour was not analysed.
 * **Non-value invariants generally.** Dust floors on the final exit leg, relay/TRUC package limits,
   and fee-bumping economics were out of scope even where they bound the same attacks.
+
+---
+
+## 8. Status after the fixes (2026-08-03, added by the orchestrator)
+
+Eight commits landed against this document: `4e165e6`, `a063e3f`, `9c00140`, `deed25c`, `d692c07`,
+`2ad2b2d`, `37d8bba` (plus `1160525`, journal). All four properties of §1's checklist are now pinned
+on the child, ancestor and root lanes.
+
+### Findings 4, 6 and 7 are closed TRANSITIVELY — the reasoning, so it is not re-derived
+
+All three read a value out of a tier chain. That chain is now anchored end to end:
+
+1. `37d8bba` binds the trigger's payload outputs to **`f_out.value`**, the on-chain funding output —
+   the one number in the structure Bitcoin has already agreed to.
+2. `deed25c` binds every root tier to the one above it (Σ payloads, so an extra output cannot hide).
+3. `d692c07` binds the ancestor and leaf extension hops, and *where* each pays.
+4. `4e165e6` / `a063e3f` bind the leaf's two hops and both `out_value` fields.
+5. `2ad2b2d` pins `fee_rate`, the yardstick all of the above measure against, to the receiver's own
+   network preset — without which every one of them is satisfiable by an inflated rate.
+
+**Findings 4 and 6 (SSP pre-pay).** The gated `amount` is `child_amount` from `prepay_child_census`
+(`transfer_receiver.rs:766`), which is `verify_conveyed_child`'s return, which is
+`cb.child_state.out_value` (`tesr.rs:3383`). That field is bound to its signed output, that output to
+the conservation law, its funding up the chain to the trigger, and the trigger to `f_out.value`. The
+SSP now pays against a number provably reachable by the exit chain. **Closed.**
+
+**Finding 7 (claim books `SP.out[j].value`).** Still true as written, and no longer a defect. The
+booked value is the piece's funding; what the payee can reach is that minus the leaf's own two rungs,
+and both hops are now bound — so the gap is exactly `2 × rung` (980 sat plain, 1 152 coloured at
+2 sat/vB) rather than arbitrary. That is the intended accounting: you are credited the piece and its
+exit costs come out of it. **Downgraded from theft to a bounded convention** — worth documenting for
+wallet UI, not worth a verifier change.
+
+### What is genuinely NOT covered
+
+* **No test proves the attacks are now refused.** The fixes were validated by showing honest traffic
+  still passes (sdk 1, 2, 11, 17, 58, 59, 74, 75, 76, 77 across the series). The adversarial
+  direction — construct the skim, assert the refusal — has **no permanent test**. The probe that
+  proved the original defect was temporary and is gone. This is the single most valuable thing to
+  build next, and it is what `4e165e6`'s standard was.
+* **`verify_bundle_ex`'s trigger-to-`F` anchor exists only on the CHILD lane** (`37d8bba` is in
+  `verify_conveyed_child`). The whole-coin receive path binds `f_value` through
+  `verify_bundle_bound`; that was not re-audited under this document's lens.
+* **The combine lane** (multi-input tiers) was not swept at all.
