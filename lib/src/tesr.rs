@@ -87,7 +87,16 @@ pub fn committed_fee(fee_rate_sats_per_vb: f64) -> u64 {
 /// Value flowing to a tier's main output = parent value − committed fee − the P2A anchor value.
 /// Returns `None` if the coin is too small to carry one more tier (the terminal "dust" case).
 pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64> {
-    prev_value.checked_sub(committed_fee(fee_rate_sats_per_vb) + P2A_VALUE)
+    // `checked_add` on the ANCHOR too, not just the subtraction. `committed_fee` ends in
+    // `(.. as f64 * rate).ceil() as u64`, which SATURATES at `u64::MAX` for an absurd rate rather
+    // than erroring — so `committed_fee(..) + P2A_VALUE` overflowed and PANICKED in debug builds.
+    //
+    // That is reachable from attacker-controlled input: `fee_rate` arrives on a conveyed bundle, and
+    // a panic in a verifier is worse than a wrong answer — it takes down the whole claim pass, not
+    // one coin. Found by `forged_yardstick_attack_tests`, which pinned it as a live gap.
+    committed_fee(fee_rate_sats_per_vb)
+        .checked_add(P2A_VALUE)
+        .and_then(|cost| prev_value.checked_sub(cost))
 }
 
 /// The smallest value an in-ladder split CHILD can carry and still be exitable.
@@ -103,7 +112,12 @@ pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64>
 /// dies with [`MercuryError::FeeTooHigh`] once the parent is already terminal — stranding the
 /// parent to unilateral-exit-only.
 pub fn min_child_value(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
-    2 * (committed_fee(fee_rate_sats_per_vb) + P2A_VALUE) + dust_limit
+    // Saturating rather than checked: this is a FLOOR used to refuse small coins, so an absurd rate
+    // yielding `u64::MAX` correctly refuses everything instead of panicking.
+    committed_fee(fee_rate_sats_per_vb)
+        .saturating_add(P2A_VALUE)
+        .saturating_mul(2)
+        .saturating_add(dust_limit)
 }
 
 /// nSequence for a BIP-68 relative-block-height lock of `blocks` (the tx must be v≥2; TES-R tiers are
@@ -410,7 +424,11 @@ pub fn committed_fee_for_outputs(n_payload: usize, fee_rate_sats_per_vb: f64) ->
 /// Total value available to the `n_payload` children of a tier = parent value − committed fee − P2A.
 /// `None` if the parent cannot carry the tier at all.
 pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f64) -> Option<u64> {
-    prev_value.checked_sub(committed_fee_for_outputs(n_payload, fee_rate_sats_per_vb) + P2A_VALUE)
+    // Checked on the anchor too — same saturating-`as u64` overflow as `tier_out_value`, same
+    // attacker-controlled `fee_rate`, same panic.
+    committed_fee_for_outputs(n_payload, fee_rate_sats_per_vb)
+        .checked_add(P2A_VALUE)
+        .and_then(|cost| prev_value.checked_sub(cost))
 }
 
 /// **SPLIT STATE `SP`** — the in-ladder split (PROTOCOL.md §5.4). Spends `X_m.out[0]` under

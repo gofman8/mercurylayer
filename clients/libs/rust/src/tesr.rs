@@ -6269,6 +6269,32 @@ pub fn verify_child_bundle(
         ));
     }
 
+    // THAT NOTHING ELSE LEAVES, on the state hop too — the mirror of the extension's Σ check above,
+    // and of GAP 1 on the root lane in the opposite direction. The per-output check just above pins
+    // what the RECEIVER is paid; this pins that nothing ELSE is paid. `skim_root_attack_tests` proved
+    // the two are independent: Σ alone permits a sum-preserving redistribution, and a single-output
+    // check alone permits an extra output. The state hop had only the second, so a state tier
+    // carrying a surplus output while paying the receiver exactly right passed — consensus-invalid
+    // rather than a skim, i.e. it strands the child, which is the shape sweep finding V4 describes
+    // and §8 does NOT claim closed for this hop.
+    let st_payload_total: u64 = st_tx
+        .output
+        .iter()
+        .filter(|o| {
+            o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                && !o.script_pubkey.is_op_return()
+        })
+        .map(|o| o.value)
+        .sum();
+    if st_payload_total != expect_state {
+        return Err(anyhow::anyhow!(
+            "child state is funded with {} sat but its payload outputs carry {st_payload_total} \
+             (expected exactly {expect_state}) — a surplus output makes the tier unbroadcastable and \
+             strands the child, while the receiver is credited the funding value",
+            ext_out0.value
+        ));
+    }
+
     // [6 cont.] CHILD SUPERSEDED SEGMENT. A child that has been RE-TRANSFERRED discloses the states it
     // replaced (one per hop), each of which consumed a real co-sign and so must be counted — but only
     // after being proven non-confirmable, exactly like the root ladder's. Same shared battery, so the
@@ -9858,24 +9884,19 @@ mod forged_yardstick_attack_tests {
     /// The test asserts the panic rather than an error, because a panic is what happens. When the
     /// arithmetic is fixed this test fails, and the fix is to assert the typed refusal instead.
     #[test]
-    fn gap_an_absurd_declared_rate_panics_the_verifier_instead_of_refusing_it() {
+    fn an_absurd_declared_rate_is_refused_not_panicked() {
         let rig = rig();
         // Structurally perfect, honestly built, absurdly declared.
         let b = rig.ladder(HONEST_RATE, 1e18);
 
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // keep the expected panic out of the test log
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify_root(&b)));
-        std::panic::set_hook(hook);
+        // GAP C IS NOW CLOSED. This ran under `catch_unwind` because an absurd rate PANICKED the
+        // verifier: `committed_fee` saturates its `f64 -> u64` cast at `u64::MAX`, and the caller
+        // then added `P2A_VALUE` to it, overflowing in debug. Both additions are checked now, so the
+        // verifier REFUSES instead of unwinding — which matters because `fee_rate` is attacker-
+        // supplied and a panic takes down the whole claim pass, not one coin.
+        let r = verify_root(&b);
+        assert!(r.is_err(), "an absurd declared rate must be refused, got {r:?}");
 
-        match outcome {
-            Err(_) => { /* GAP C, as described: attacker-controlled input panics the verifier. */ }
-            Ok(r) => panic!(
-                "GAP C HAS BEEN CLOSED — this tripwire has done its job. An absurd declared rate no \
-                 longer panics `verify_bundle_ex` ({r:?}); replace this test with an assertion that \
-                 the refusal names the rate, and strike GAP C from the module doc comment."
-            ),
-        }
         // The underlying arithmetic, isolated — this is the public API the sweep asks to harden.
         assert_eq!(
             mercurylib::tesr::committed_fee(1e18),
