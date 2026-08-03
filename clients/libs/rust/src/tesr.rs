@@ -1569,14 +1569,21 @@ pub fn build_colored_in_ladder_split(
         .state
         .csv
         .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
-    // SP must OUT-RACE S_0 over X_m's payload output: one rung lower, floored. This is also what
-    // separates their seals — the rung folds in the CSV.
-    let sp_csv = s0_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| {
-            anyhow::anyhow!("state CSV at the floor — renew/rollover before splitting this carrier")
-        })?;
+    // [CATS] SP out-races `S_0` over `X_m`'s payload output at CSV 0 — see `SPINE_CSV`. This is also
+    // what separates their SEALS (the CSV folds into `colored_tier_seal`), so the guard below is
+    // doing two jobs at once: without a strict inequality the two tiers would share a blinding and
+    // their `BundleId`s would collapse into an arbitrary hash lottery.
+    //
+    // This lane is the one the rung budget hurt most: a coloured carrier never renews, so
+    // `s0_csv − δ` gave it exactly ONE partial payment in its whole life
+    // (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.3).
+    if s0_csv <= SPINE_CSV {
+        return Err(anyhow::anyhow!(
+            "this carrier's live state has CSV {s0_csv}, which does not exceed the spine CSV \
+             {SPINE_CSV} — SP could neither out-race it nor be sealed apart from it"
+        ));
+    }
+    let sp_csv = SPINE_CSV;
 
     let x_m = bundle.current().extension.clone();
     let (parent_prev_value, parent_prev_spk) =
@@ -2615,16 +2622,24 @@ pub async fn in_ladder_split(
     refuse_uncolored_over_colored(bundle, "in_ladder_split")?;
     let p = bundle.params;
     let x_m = bundle.current().extension.clone();
+    // [CATS] SP must OUT-RACE `S_0` over `X_m.out[0]`, and it does so at CSV 0 — see `SPINE_CSV`.
+    // This used to be `s0_csv − δ`, floored, which consumed a state rung per split and refused the
+    // split outright once the rung budget ran out ("state CSV at the floor — renew/rollover before
+    // splitting"). That refusal is gone: a split no longer spends anything the coin cannot replace.
+    // `S_0`'s own CSV is still read, because the superseded battery needs it to be strictly greater
+    // than the live one and a state without a CSV is a malformed bundle either way.
     let s0_csv = bundle
         .current()
         .state
         .csv
         .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
-    // SP must OUT-RACE S_0 over X_m.out[0]: one rung lower, floored (consumes a state rung).
-    let sp_csv = s0_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| anyhow::anyhow!("state CSV at the floor — renew/rollover before splitting"))?;
+    if s0_csv <= SPINE_CSV {
+        return Err(anyhow::anyhow!(
+            "the state SP would supersede already has CSV {s0_csv}, which does not exceed the spine \
+             CSV {SPINE_CSV} — replace-by-lower-timelock cannot be satisfied, refusing to split"
+        ));
+    }
+    let sp_csv = SPINE_CSV;
 
     let n = children.len();
     if n == 0 {
@@ -2877,16 +2892,22 @@ async fn enforce_split_depth_cap(
     })?;
     let epoch_blocks = info.initlock;
     // A depth-1 exit chain and the cost of one further level, both from the live schedule:
-    //   T (no timelock) | X_m E0 | SP D0−δ | ext_child E0 | state_child D0
+    //   T (no timelock) | X_m E0 | SP 0 | ext_child E0 | state_child D0
     // and each extra level adds its own extension + split state.
+    //
+    // [CATS] The split states are `SPINE_CSV`, not `D0 − δ`. Keeping the old `state_csv(1)` here
+    // would not have been "conservative" in any useful sense: this function is what decides how deep
+    // a payment chain may go, so a model that charges ~2 124 blocks for a tier that actually waits
+    // zero refuses payments the chain would carry perfectly well — a silent economic cap enforced by
+    // a stale constant. The value must track the builders, which is why both read `SPINE_CSV`.
     let base = vec![
         None,
         Some(p.ext_csv(0)),
-        Some(p.state_csv(1)),
+        Some(SPINE_CSV),
         Some(p.ext_csv(0)),
         Some(p.state_csv(0)),
     ];
-    let per_level = vec![Some(p.ext_csv(0)), Some(p.state_csv(1))];
+    let per_level = vec![Some(p.ext_csv(0)), Some(SPINE_CSV)];
     let max_depth = mercurylib::transfer::receiver::max_split_depth(&base, &per_level, epoch_blocks);
     if new_depth > max_depth {
         let mut chain = base.clone();
@@ -2929,6 +2950,31 @@ pub const PARENT_V2_BASELINE: u32 = 1;
 /// on-chain (its funding is the un-broadcast `SP.out[j]`), so `check_deposit`/`create_tx1` never runs
 /// for it and `num_sigs` counts ONLY the two child tiers co-signed at split time. Baseline `0`.
 pub const CHILD_V2_BASELINE: u32 = 0;
+
+/// **[CATS] The relative timelock of a SPLIT STATE (`SP` / `CSP`) — zero, always.**
+///
+/// A split state is a *spine* tier, and a spine tier is a different KIND from the `state` tiers
+/// whose CSV walks down the `[d_floor, d0]` schedule. Two facts make zero right rather than merely
+/// cheap:
+///
+/// * **It wins by the largest possible margin.** Over the outpoint it spends, the only competing
+///   transaction is the state it replaces (`S_0`, or the child's previous state), whose CSV is
+///   necessarily ≥ `d_floor`. Replace-by-lower-timelock is the invariant; `0` is its extreme, and
+///   the superseded battery's `sup.csv <= live_csv → reject` passes with the whole schedule to spare.
+/// * **The [B1] asymmetry does not arise.** An un-timelocked tier is dangerous when a party can
+///   retain it and void someone else's material — `T` over `F`. `SP` is signed by the sole current
+///   owner of the outpoint it spends, on the outpoint it is simultaneously giving up: the voiding
+///   party and the victim are the same entity.
+///
+/// What this REPLACES is `s0_csv − δ`, which consumed one state rung per split and produced the
+/// defect that made the whole design uneconomic: a coin could be partially paid from only as many
+/// times as it had rungs left, and a coloured carrier — which never renews — exactly **once, ever**
+/// (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.3). At zero a split consumes no rung at all, and
+/// the SP contributes one block (its parent's confirmation) to the exit walk instead of ~2 124.
+///
+/// The liveness trade this buys into is real and is stated in §4.8, not hidden: zero-CSV tiers
+/// accelerate the honest exit and a theft identically.
+pub const SPINE_CSV: u16 = 0;
 
 /// Persist a split child bundle under `ctesr-<child_statechain_id>` (replaces any prior).
 pub async fn persist_child(cc: &ClientConfig, wallet_name: &str, cb: &ChildTesrBundle) -> Result<()> {
@@ -3381,14 +3427,17 @@ pub async fn child_in_ladder_split(
         .child_state
         .csv
         .ok_or_else(|| anyhow::anyhow!("child state has no CSV — cannot split"))?;
-    // CSP must OUT-RACE the state it replaces over ext_child.out[0]: one rung lower, floored.
-    let csp_csv = old_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| anyhow::anyhow!(
-            "child state CSV {old_csv} is at the floor ({}) — exit or re-anchor instead of splitting",
-            p.d_floor
-        ))?;
+    // [CATS] CSP out-races the state it replaces over `ext_child.out[0]` at CSV 0 — see `SPINE_CSV`.
+    // A received child cannot renew (`renew`/`rollover` take `&mut TesrBundle` and there is no
+    // `ChildTesrBundle` analogue), so `old_csv − δ` gave a child a hard, unreplenishable budget of
+    // onward partial payments. At zero there is no budget to run out of.
+    if old_csv <= SPINE_CSV {
+        return Err(anyhow::anyhow!(
+            "this child's state has CSV {old_csv}, which does not exceed the spine CSV {SPINE_CSV} \
+             — CSP could not out-race it, so the split is refused"
+        ));
+    }
+    let csp_csv = SPINE_CSV;
 
     // Value conservation: the grandchildren share the split total exactly (no mint, no burn).
     let total = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, n, cb.parent.fee_rate)
@@ -5232,9 +5281,29 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
         }
         let csv = seq as u16;
         let is_extension = i % 2 == 1;
-        let (lo, hi) = if is_extension { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+        let is_final = i == txs.len() - 1;
+        // [CATS] THREE tier kinds, and the kind is STRUCTURAL — never sender-declared. `is_extension`
+        // comes from position parity; `final_is_split` is a code-path constant chosen by the RECEIVER
+        // (`false` on every whole-coin path, `true` only from `verify_child_bundle`), not a field on
+        // the bundle. That matters: the spine's `[0,0]` is the loosest-looking bound in the file, and
+        // it would be a real hole if a sender could elect into it. They cannot.
+        //
+        // It is a NEW KIND rather than a widened state range on purpose. Widening `[d_floor, d0]` to
+        // include 0 would let any state tier be un-timelocked, which is exactly the [B1] shape;
+        // pinning the spine to EXACTLY 0 means an `SP` that tried to carry a real timelock — quietly
+        // making every payee's exit thousands of blocks slower with no refusal anywhere — is rejected.
+        let (lo, hi) = if is_final && final_is_split {
+            (SPINE_CSV, SPINE_CSV)
+        } else if is_extension {
+            (p.e_floor, p.e0)
+        } else {
+            (p.d_floor, p.d0)
+        };
         if csv < lo || csv > hi {
-            return Err(anyhow::anyhow!("tier {i} CSV {csv} outside schedule bounds [{lo},{hi}]"));
+            return Err(anyhow::anyhow!(
+                "tier {i} CSV {csv} outside {} bounds [{lo},{hi}]",
+                if is_final && final_is_split { "SPINE" } else if is_extension { "extension" } else { "state" }
+            ));
         }
         // [B1] …and the tier's DECLARED `csv` field must be that same number. This function already
         // held the signed `nSequence` in its hand for the schedule-bounds check above and never
@@ -5246,7 +5315,6 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
             tiers[i].csv,
             Some(csv),
         )?;
-        let is_final = i == txs.len() - 1;
         if is_final && final_is_split {
             // SP (split state) pays the children, not the owner; its outputs are verified per-child by
             // verify_child_bundle (A_child == SP.out[j]). Skip the single-owner payee check here.
@@ -5627,9 +5695,20 @@ pub fn verify_child_bundle(
             }
             let csv = seq as u16;
             let p = cb.parent.params;
-            let (lo, hi) = if kind == "extension" { (p.e_floor, p.e0) } else { (p.d_floor, p.d0) };
+            // [CATS] An intermediate segment's `state` IS that level's split state — the tier whose
+            // outputs fund the level below — so it is a SPINE tier and carries `SPINE_CSV`, not a
+            // schedule state. `kind` here is a literal from the array two lines up, i.e. structural
+            // and not something the bundle can influence.
+            let (lo, hi) = if kind == "extension" {
+                (p.e_floor, p.e0)
+            } else {
+                (SPINE_CSV, SPINE_CSV)
+            };
             if csv < lo || csv > hi {
-                return Err(anyhow::anyhow!("ancestor {i} {kind}: CSV {csv} outside [{lo},{hi}]"));
+                let what = if kind == "extension" { "extension" } else { "SPINE state" };
+                return Err(anyhow::anyhow!(
+                    "ancestor {i} {what}: CSV {csv} outside [{lo},{hi}]"
+                ));
             }
             mercurylib::transfer::receiver::bind_declared_csv(
                 i,
@@ -6473,6 +6552,48 @@ mod verify_tests {
     }
 
     // ---- CTES-R: colour the ladder (this commit). ----------------------------------------------
+
+    /// **[CATS] The spine CSV must be OUTSIDE every schedule's state range, on every profile.**
+    ///
+    /// §4.5 of `PARTIAL-PAYMENT-ECONOMICS.md` insists the spine be a NEW tier kind rather than a
+    /// widened state range, and this is the property that makes that distinction real rather than
+    /// nominal. If `SPINE_CSV` were ever a legal `state` CSV, then "spine" and "state" would be two
+    /// names for one admissible interval: a state tier could be un-timelocked (the [B1] shape) and a
+    /// spine tier could quietly carry a real timelock, making every payee's exit thousands of blocks
+    /// slower with nothing to refuse it. `d_floor > SPINE_CSV` is what keeps the two disjoint, and it
+    /// is a property of the SCHEDULES, so it is asserted against each shipped one.
+    ///
+    /// It also underwrites the builders' `s0_csv <= SPINE_CSV` guards: replace-by-lower-timelock
+    /// needs the spine strictly below whatever it supersedes, and every state a spine can supersede
+    /// is ≥ `d_floor`.
+    #[test]
+    fn the_spine_csv_is_not_a_legal_state_csv_on_any_profile() {
+        for (name, p) in [
+            ("mainnet", mercurylib::tesr::TesrParams::mainnet()),
+            ("regtest", mercurylib::tesr::TesrParams::regtest()),
+        ] {
+            assert!(
+                p.d_floor > SPINE_CSV,
+                "{name}: d_floor {} must exceed the spine CSV {SPINE_CSV}, or the spine is just a \
+                 widened state range",
+                p.d_floor
+            );
+            assert!(
+                p.e_floor > SPINE_CSV,
+                "{name}: e_floor {} must exceed the spine CSV {SPINE_CSV} too — an extension is \
+                 never un-timelocked",
+                p.e_floor
+            );
+            // …and the deepest a state can ever walk is still above it, so no amount of rung
+            // consumption lands a state ON the spine value.
+            let deepest = p.state_csv(u16::MAX);
+            assert!(
+                deepest > SPINE_CSV,
+                "{name}: a state walked to its floor is {deepest}, which must still exceed \
+                 {SPINE_CSV}"
+            );
+        }
+    }
 
     /// The coloured-rung price and the three-rung floor, pinned as arithmetic rather than prose.
     /// `docs/utexo/CTESR-GATE.md` §3.4 as corrected by [D4]: a coloured tier is one whole extra

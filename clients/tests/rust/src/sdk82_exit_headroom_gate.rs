@@ -37,8 +37,9 @@ const BOB: &str = "sdk82_bob";
 const DEPOSIT: u64 = 100_000;
 const PAY: u64 = 30_000;
 /// Blocks of epoch left when the doomed payment is made. Must be BELOW the regtest depth-1 exit wait
-/// (`T 0 | X_m 12 | SP 18 | ext 12 | state 24` = 66 blocks of timelock + 5 confirmations = 71) and
-/// above zero, so the OLD `lock_time > tip` check still passes and only the new gate can refuse.
+/// (`T 0 | X_m 12 | SP 0 | ext 12 | state 24` = 48 blocks of timelock + 5 confirmations = 53 — `SP`
+/// is a [CATS] spine tier, so it contributes only its confirmation) and above zero, so the OLD
+/// `lock_time > tip` check still passes and only the new gate can refuse.
 const HEADROOM_LEFT: u32 = 40;
 
 async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<String> {
@@ -160,19 +161,26 @@ pub async fn execute() -> Result<()> {
     println!("SDK82 - control: a full-epoch child was ADOPTED normally ({PAY} sat)");
 
     // The exit a depth-1 child needs, derived from the live regtest schedule the coins are built
-    // with: `T (no lock) | X_m E0 | SP D0−δ | ext_child E0 | state_child D0`, one confirmation per
+    // with: `T (no lock) | X_m E0 | SP 0 | ext_child E0 | state_child D0`, one confirmation per
     // tier. Both halves of this flow are measured against it.
+    //
+    // [CATS] `SP` is a SPINE tier at `SPINE_CSV`, not the state at `D0 − δ`. The window this test
+    // steers into is only `required_wait` blocks wide, so this number is not decoration: when the
+    // spine landed and this still said `state_csv(1)`, the flow mined to a tip chosen for a 71-block
+    // requirement, left 56 blocks, and the gate — correctly — ADMITTED a child that now needs 53.
+    // The test read that as "THE DEFECT IS OPEN". Deriving the constant from the same source the
+    // builders sign is what keeps the failure honest.
     let required_wait: u32 = {
         let p = mercurylib::tesr::TesrParams::regtest();
         mercurylib::transfer::receiver::exit_wait_blocks(&[
             None,
             Some(p.ext_csv(0)),
-            Some(p.state_csv(1)),
+            Some(mercuryrustlib::tesr::SPINE_CSV),
             Some(p.ext_csv(0)),
             Some(p.state_csv(0)),
         ])
     };
-    assert_eq!(required_wait, 71, "regtest depth-1 exit: 66 blocks of CSV + 5 confirmations");
+    assert_eq!(required_wait, 53, "regtest depth-1 exit: 48 blocks of CSV + 5 confirmations");
 
     // The SAME predicate the exploit half will be refused by, run over the control child's REAL
     // conveyed material — so the refusal below is known to be discriminating on headroom rather than
@@ -349,7 +357,7 @@ pub async fn execute() -> Result<()> {
     // the conveyed bundle, and inside the signed transaction's `nSequence`, which is the only copy
     // Bitcoin enforces. The gate read the FIELD. So the sender of the very coin just refused had
     // only to declare `csv: 1` on each tier — touching no signature, no txid and no nSequence — for
-    // the requirement to collapse from 71 blocks to 9 and the coin to be admitted.
+    // the requirement to collapse from the real 53 blocks to 9 and the coin to be admitted.
     // ============================================================================================
     let mut forged = bundles[piece_idx].clone();
     for lvl in forged.parent.levels.iter_mut() {

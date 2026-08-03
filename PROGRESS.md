@@ -65,18 +65,47 @@ Delegating to a third-party tower protected only un-laddered coins, silently. No
 per-entry blindness (`WatchState::Acted.blind` + `any_blindness()`) so an unevaluable entry can never
 report `Idle`, and 4 new tests including a non-vacuity control and old-bundle compatibility.
 
-## Next
+## Queue item 5 — CATS-B, in progress
 
-Queue item 5, CATS-B **Phase 1** (`PARTIAL-PAYMENT-ECONOMICS.md` §8): V1–V5 of §4.5 plus the builder
-change, plain lane, K = 1. The shape of the work, from reading the code:
+**The SPINE TIER is landed and verified** (commit after `09ec773`). `SPINE_CSV = 0` is signed by all
+three split builders and admitted by the verifier as a distinct KIND with bounds `[0,0]`.
 
-* `in_ladder_split` (`clients/libs/rust/src/tesr.rs:2608`) currently builds EVERY child the same way
-  (extension + state) and computes `sp_csv = s0_csv − δ` floored. CATS needs `sp_csv = 0` and a
-  **per-child role**, because the change leg gets one cap and no extension while payee legs keep
-  both. That is an API change to `children: &mut [(Coin, String, u64)]`.
-* V1 makes `ChildSegment::extension` an `Option`, which makes segment SHAPE sender-declared for the
-  first time. §4.5 is explicit that this — not the CSV-0 race — is where the adversarial E2E budget
-  goes. The census still closes it (a dropped tier leaves `expected` one short of `num_sigs`).
+Why it is a kind and not a widened range: if `SPINE_CSV` were a legal `state` CSV, a state tier could
+be un-timelocked (the [B1] shape) and a spine tier could quietly carry a real timelock — making every
+payee's exit thousands of blocks slower with nothing to refuse it. `d_floor > SPINE_CSV` on every
+shipped profile is asserted by `the_spine_csv_is_not_a_legal_state_csv_on_any_profile`.
+
+The kind is chosen from `final_is_split`, which is a **code-path constant the receiver picks**
+(`false` on every whole-coin path, `true` only from `verify_child_bundle`) — not a bundle field. That
+matters: `[0,0]` is the loosest-looking bound in the file and would be a real hole if a sender could
+elect into it.
+
+What it bought: the split no longer consumes a state rung, so **§1.3's "a coloured carrier gets ONE
+partial payment, ever" is dead** — the refusals that enforced it are gone. Per-level exit latency
+2 124 → 720 blocks; mainnet depth 1 4 284 → 2 880, depth 100 4.08 → 1.41 years. The model in
+`tesr_exit_wait_blocks` and the depth cap in `enforce_split_depth_cap` both read `SPINE_CSV` now:
+leaving them at `state_csv(1)` would not have been "conservative", it would have been a silent
+economic cap — refusing payments the chain carries fine — enforced by a stale constant.
+
+Verified by running: unit suites green (mercuryrustlib 72 now), and **sdk 58, 59, 69, 11, 76, 77, 81,
+82, 2, 31, 74, 75, 79 all PASS** against a freshly built binary.
+
+sdk82 failed first, and the failure was worth having: it hard-coded `required_wait = 71` from
+`state_csv(1)`, so after the spine landed it mined to a tip chosen for the old arithmetic, left 56
+blocks against a real requirement of 53, and reported "THE DEFECT IS OPEN" when the gate had
+correctly ADMITTED the coin. Re-derived from `SPINE_CSV`, not relaxed.
+
+### Still to build in Phase 1
+
+* **Change 2 (§4.1): the change leg gets one cap and no extension.** `in_ladder_split` builds every
+  child identically, so this needs a per-child ROLE — an API change to
+  `children: &mut [(Coin, String, u64)]`. Until it lands a payment still adds `[extension, state]`
+  for the change as well as the piece, so the Freeze-Lemma bound of §4.0 is approached, not attained.
+* **V1**: `ChildSegment::extension` becomes `Option`, which makes segment SHAPE sender-declared for
+  the first time. §4.5 is explicit that this — not the CSV-0 race — is where the adversarial E2E
+  budget goes. The census still closes it (a dropped tier leaves `expected` one short of `num_sigs`).
+* **V2** (derive the ancestor `2` from the disclosed tier count), **V4** (spine-tip bundle key),
+  **V5** (`min_spine_tip_value` on the change leg only), then change 3 (K > 1).
 
 ### Landed in P0 round 1 (uncommitted, verified by running)
 

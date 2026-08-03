@@ -363,18 +363,24 @@ fn exit_cost_scaling_model() {
 
     // ---- LATENCY. The dimension the old model reported as ZERO for every depth. The waits are
     // SEQUENTIAL relative locks, so they add; the coefficients come from the schedule, not a table.
-    let per_level_wait = u32::from(main.ext_csv(0)) + u32::from(main.state_csv(1));
+    // [CATS] `SP` is a SPINE tier at `SPINE_CSV` = 0, so a split level costs only its extension.
+    // Re-derived, not relaxed: the assertion still pins an exact number, and it still comes from the
+    // schedule — the SP term is simply the constant the builders now sign into the transaction.
+    let per_level_wait = u32::from(main.ext_csv(0)) + u32::from(mercuryrustlib::tesr::SPINE_CSV);
     let tail_wait = u32::from(main.ext_csv(0)) + u32::from(main.state_csv(0));
-    assert_eq!(per_level_wait, 2_124, "X_m 720 + SP 1404, per split level");
-    assert_eq!(tail_wait, 2_160, "the child's own ext 720 + state 1440");
+    assert_eq!(per_level_wait, 720, "X_m 720 + SP 0, per split level (was 2124 at SP = D0 − δ)");
+    assert_eq!(tail_wait, 2_160, "the child's own ext 720 + state 1440 — NOT a spine, unchanged");
     for depth in 0..=8u32 {
         let e = tesr_exit_estimate(&main, depth);
         assert_eq!(e.wait_blocks, depth * per_level_wait + tail_wait, "depth {depth}");
         assert!(e.wait_blocks > 0, "no depth exits instantly — the old model said every one did");
     }
-    // The headline numbers of PARTIAL-PAYMENT-ECONOMICS §2, re-derived rather than copied.
-    assert_eq!(tesr_exit_estimate(&main, 1).wait_blocks, 4_284); // 29.75 days
-    assert_eq!(tesr_exit_estimate(&main, 100).wait_blocks, 214_560); // 4.08 years
+    // The headline numbers of PARTIAL-PAYMENT-ECONOMICS §4.4, re-derived rather than copied.
+    assert_eq!(tesr_exit_estimate(&main, 1).wait_blocks, 2_880); // 20 days (was 4_284 / 29.75 days)
+    assert_eq!(tesr_exit_estimate(&main, 100).wait_blocks, 74_160); // 1.41 years (was 4.08)
+    // The whole point, stated as a ratio: depth is 66% cheaper in LATENCY than it was, and the
+    // saving is entirely in the term that compounds.
+    assert_eq!(2_124 - per_level_wait, 1_404, "the saving per level is exactly the old SP timelock");
     assert_eq!(tesr_exit_estimate(&main, 100).total_vbytes, 29_675);
     assert_eq!(tesr_exit_txs(100), 203);
 
@@ -383,9 +389,11 @@ fn exit_cost_scaling_model() {
     let reg = TesrParams::regtest();
     assert_eq!(
         tesr_exit_estimate(&reg, 1).wait_blocks,
-        u32::from(reg.ext_csv(0)) * 2 + u32::from(reg.state_csv(1)) + u32::from(reg.state_csv(0))
+        u32::from(reg.ext_csv(0)) * 2
+            + u32::from(mercuryrustlib::tesr::SPINE_CSV)
+            + u32::from(reg.state_csv(0))
     );
-    assert_eq!(tesr_exit_estimate(&reg, 1).wait_blocks, 66);
+    assert_eq!(tesr_exit_estimate(&reg, 1).wait_blocks, 48); // was 66, before SP became a spine
     // Size does NOT depend on the schedule — the tiers are the same transactions either way.
     assert_eq!(tesr_exit_estimate(&reg, 4).total_vbytes, tesr_exit_estimate(&main, 4).total_vbytes);
 
@@ -489,21 +497,28 @@ fn auto_exit_margin_is_derived_from_the_walk() {
     //
     // The two shipped pairings both hold, with very different slack:
     //   * mainnet SE (`lockheight_init` 10_000, `lh_decrement` 100) + `TesrParams::mainnet`
-    //     (walk 4_284) — 3_596 blocks (~25 days) of off-chain life left;
-    //   * deployed/testnet SE (1_000 / 10) + `TesrParams::regtest` (walk 66) — 74 blocks left, and
+    //     (walk 2_880) — 5_000 blocks (~34.7 days) of off-chain life left;
+    //   * deployed/testnet SE (1_000 / 10) + `TesrParams::regtest` (walk 48) — 92 blocks left, and
     //     that is with the SAME derived margin, which is what makes the deployed profile tight.
     //
+    // [CATS] Both slacks WIDENED (3_596 → 5_000 and 74 → 92) because the spine tier removed 1_404
+    // blocks per level from the walk. The margin term did not move: it counts sequential
+    // CONFIRMATIONS, and the number of transactions is unchanged — only their timelocks are.
+    //
     // The pairing that does NOT hold is the mainnet SCHEDULE under the deployed `lockheight_init`:
-    // the walk alone (4_284) then exceeds the entire 1_000-block horizon and no margin — this one
+    // the walk alone (2_880) still exceeds the entire 1_000-block horizon and no margin — this one
     // or any other — lets a depth-1 coloured child finish its exit in time. That is a PARAMETER
-    // defect, not a watchtower one, and this assertion is where it would be caught.
+    // defect, not a watchtower one, and this assertion is where it would be caught. Note that CATS
+    // narrowed the violation from 4.3× the horizon to 2.9× without removing it: the tail
+    // (`E0 + D0` = 2_160) is not a spine and does not shrink, so no amount of spine work makes the
+    // mainnet schedule fit a 1_000-block epoch. Only re-parameterising does.
     let main_walk = tesr_exit_estimate(&TesrParams::mainnet(), AUTO_EXIT_MODELLED_DEPTH).wait_blocks;
     let reg_walk = tesr_exit_estimate(&TesrParams::regtest(), AUTO_EXIT_MODELLED_DEPTH).wait_blocks;
-    assert_eq!((main_walk, reg_walk), (4_284, 66));
+    assert_eq!((main_walk, reg_walk), (2_880, 48));
     // mainnet SE `lockheight_init` = 10_000 (server/src/server_config.rs:82) + mainnet schedule.
-    assert_eq!(10_000 - main_walk - mainnet, 3_596, "blocks of off-chain life left on mainnet");
+    assert_eq!(10_000 - main_walk - mainnet, 5_000, "blocks of off-chain life left on mainnet");
     // deployed SE `lockheight_init` = 1_000 (server/Settings.toml:2) + regtest schedule.
-    assert_eq!(1_000 - reg_walk - deployed, 74, "…and on the deployed profile");
+    assert_eq!(1_000 - reg_walk - deployed, 92, "…and on the deployed profile");
     assert!(
         main_walk > 1_000,
         "the mainnet SCHEDULE cannot be run under the deployed 1_000-block lockheight_init: the \

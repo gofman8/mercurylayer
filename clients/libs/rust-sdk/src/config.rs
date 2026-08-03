@@ -187,16 +187,21 @@ pub const fn tesr_exit_vbytes(child_depth: u64) -> u64 {
     spine + child_depth * per_level
 }
 
-/// **Exit LATENCY in blocks** — the sum of the walk's relative timelocks: `2124·d + 2160` on the
-/// mainnet schedule, `30·d + 36` on the regtest one. Derived from the schedule, never a literal.
+/// **Exit LATENCY in blocks** — the sum of the walk's relative timelocks: `720·d + 2160` on the
+/// mainnet schedule, `12·d + 36` on the regtest one. Derived from the schedule, never a literal.
 ///
-/// The model this replaced reported **zero** wait for every depth. A depth-1 mainnet coin needs
-/// 4_284 blocks (29.8 days); a depth-100 one needs 4.08 years.
+/// The model this replaced reported **zero** wait for every depth. Then it reported `2124·d + 2160`,
+/// which was right for split states at `D0 − δ`.
+///
+/// [CATS] A split state is now a SPINE tier at `SPINE_CSV` = 0, so a level costs only its extension:
+/// **720 blocks instead of 2 124**, a 66% cut in the term that compounds with depth. The tail is
+/// unchanged — the payee's own `[extension, state]` pair is not a spine and still waits the full
+/// `E0 + D0`. Concretely, mainnet: depth 1 falls 4 284 → 2 880 blocks (29.8 → 20 days) and depth 100
+/// falls 214 560 → 74 160 blocks (4.08 years → 1.41 years).
 pub fn tesr_exit_wait_blocks(p: &mercurylib::tesr::TesrParams, child_depth: u32) -> u32 {
-    // `T` has no timelock. `X_m` is a fresh extension (m = 0); the split state `SP` is the state at
-    // k = 1 (the parent's own retained `S_0` is the rung it replaces); the child's own ladder is a
-    // fresh extension and a fresh state.
-    let per_level = u32::from(p.ext_csv(0)) + u32::from(p.state_csv(1));
+    // `T` has no timelock. `X_m` is a fresh extension (m = 0); the split state `SP` is a spine tier
+    // and waits nothing; the child's own ladder is a fresh extension and a fresh state.
+    let per_level = u32::from(p.ext_csv(0)) + u32::from(mercuryrustlib::tesr::SPINE_CSV);
     let tail = u32::from(p.ext_csv(0)) + u32::from(p.state_csv(0));
     child_depth * per_level + tail
 }

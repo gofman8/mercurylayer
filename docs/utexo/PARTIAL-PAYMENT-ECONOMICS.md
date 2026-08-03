@@ -217,6 +217,21 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 
 ## 4. The chosen design — CATS-B in implementable detail
 
+> **Build status (2026-08-03).** The **spine tier is BUILT**: `SPINE_CSV = 0`
+> (`clients/libs/rust/src/tesr.rs`) is what all three split builders sign — `in_ladder_split`,
+> `cosign_colored_in_ladder_split` and `child_in_ladder_split` — and the verifier admits it as a
+> distinct KIND with bounds `[0,0]`, both for the parent's `SP` (`verify_bundle_ex` under the
+> receiver-chosen `final_is_split`) and for every intermediate segment's split state. That is change
+> **1** of the three in §4.1, plus **V3** of §4.5, and it is the one that removes the rung
+> consumption: `§1.3`'s "coloured carriers get exactly ONE partial payment, ever" **no longer holds**
+> — the refusals that enforced it are deleted, and the per-level exit latency falls from 2 124 blocks
+> to 720 (mainnet depth 1: 4 284 → 2 880 blocks; depth 100: 4.08 → 1.41 years).
+>
+> Still to build: change **2** (the change leg keeps its extension, so it is not yet a one-cap spine
+> tip), change **3** (K > 1 payloads), and V1/V2/V4/V5. Until change 2 lands, a payment still adds
+> `[extension, state]` for the change as well as for the piece, so the Freeze-Lemma bound of §4.0 is
+> approached but not yet attained.
+
 ### 4.0 What cannot be delivered, and why
 
 The brief asked for change that stays at **root level** (a sibling of `T` over `F`). It is
