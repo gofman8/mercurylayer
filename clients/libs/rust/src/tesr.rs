@@ -5758,6 +5758,52 @@ pub fn verify_child_bundle(
         verify_tier_cosigned(&ext_tx, fund_out.value, &seg_spk)
             .map_err(|e| anyhow::anyhow!("ancestor {i}: extension not co-signed by its aggregate: {e}"))?;
         let ext0 = seg.extension.payload_out(&ext_tx, &format!("ancestor {i} extension"))?.clone();
+        // WHERE IT PAYS. A co-sign proves what a tier SPENDS, never what it PAYS — and this segment's
+        // state is about to have its own co-sign verified against a prevout SYNTHESISED as
+        // `TxOut { value: ext0.value, script_pubkey: seg_spk }`. If the real `ext0` pays someone
+        // else's key, that signature is valid for a prevout that does not exist: the state is
+        // unbroadcastable forever, and whoever owns the real key sweeps the segment the moment the
+        // extension confirms. The receiver, meanwhile, has been credited the full funding value and —
+        // this ancestor being terminal — can never obtain a replacement.
+        // `seg_spk` is a `ScriptBuf`, so compare it as one. An earlier version of this line wrote
+        // `hex::decode(&seg_spk).unwrap_or_default()` — which compiles, because `hex::decode` takes
+        // `AsRef<[u8]>` and a script derefs to its bytes, but those bytes are not ASCII hex, so the
+        // decode always failed and `unwrap_or_default()` turned the failure into an EMPTY vector that
+        // matches nothing. The check then refused every honest ancestor bundle (sdk11 and sdk17
+        // caught it). Precisely the swallow shape the repo's own guard exists for, written into a
+        // security check by the person who keeps citing that guard.
+        if ext0.script_pubkey != seg_spk {
+            return Err(anyhow::anyhow!(
+                "ancestor {i}: the extension's payload output does not pay the segment's aggregate \
+                 key — every tier below it would be signed against a prevout that does not exist"
+            ));
+        }
+        // HOW MUCH IT FORWARDS, and THAT NOTHING ELSE LEAVES. Summed over every non-anchor,
+        // non-opret output rather than read from `payload_vout`, for the reason spelled out on the
+        // root ladder's law: checking one output leaves a window exactly one committed fee wide.
+        {
+            let expect = mercurylib::tesr::tier_out_value(fund_out.value, cb.parent.fee_rate)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "ancestor {i} extension: funding of {} sat cannot carry a tier at {} sat/vB",
+                    fund_out.value, cb.parent.fee_rate
+                ))?;
+            let got: u64 = ext_tx
+                .output
+                .iter()
+                .filter(|o| {
+                    o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                        && !o.script_pubkey.is_op_return()
+                })
+                .map(|o| o.value)
+                .sum();
+            if got != expect {
+                return Err(anyhow::anyhow!(
+                    "ancestor {i} extension is funded with {} sat but its payload outputs carry {got} \
+                     (expected exactly {expect}) — the difference would leave the exit chain",
+                    fund_out.value
+                ));
+            }
+        }
         let st_tx: Transaction = deserialize(
             &hex::decode(&seg.state.signed_tx).map_err(|_| anyhow::anyhow!("ancestor {i}: bad state hex"))?,
         )
@@ -5991,7 +6037,37 @@ pub fn verify_child_bundle(
             cb.child_extension.out_value
         ));
     }
+    // WHERE IT PAYS — the leaf's copy of the ancestor check above, and load-bearing for the same
+    // reason: `child_state`'s co-sign is verified against a prevout SYNTHESISED as
+    // `TxOut { value: ext_out0.value, script_pubkey: child_agg_spk }`. If the real payload output
+    // pays another key, the state is signed against a prevout that does not exist — unbroadcastable
+    // forever, while whoever holds the real key sweeps the child once the extension confirms.
+    if ext_out0.script_pubkey != child_agg_spk {
+        return Err(anyhow::anyhow!(
+            "child extension's payload output does not pay A_child — the child state below it would \
+             be signed against a prevout that does not exist"
+        ));
+    }
+    // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, not just
+    // `out[payload_vout]`: pinning one output leaves a window exactly one committed fee wide for a
+    // second output to carry value out of the chain.
+    let ext_payload_total: u64 = ext_tx
+        .output
+        .iter()
+        .filter(|o| {
+            o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                && !o.script_pubkey.is_op_return()
+        })
+        .map(|o| o.value)
+        .sum();
     let expect_ext = rung_forward(sp_out.value, "child extension")?;
+    if ext_payload_total != expect_ext {
+        return Err(anyhow::anyhow!(
+            "child extension is funded with {} sat but its payload outputs carry {ext_payload_total} \
+             (expected exactly {expect_ext}) — the difference would leave the exit chain",
+            sp_out.value
+        ));
+    }
     if ext_out0.value != expect_ext {
         return Err(anyhow::anyhow!(
             "child extension is funded with {} sat but forwards only {} to its payload output \
