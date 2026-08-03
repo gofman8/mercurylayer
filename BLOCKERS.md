@@ -32,6 +32,19 @@ it is an entry in this file.**
   SE to distinguish coloured from plain, that is the expensive path with a proven history of landing
   on the tested lockbox lane and missing the shipped SGX one — stop and report rather than proceed.
 
+## Found by adversarial review, fixed, but the class is not exhausted
+
+* **The split child's tier chain had no value-conservation check** (fixed 2026-08-03). A sender could
+  fund a payee's slot with 198 530 sat and have the child's extension forward only 1 000, skimming
+  the rest to a second output; `verify_child_bundle` returned `Ok(())` and the receiver booked the
+  FUNDING value. Proven by running it against the real verifier, not argued.
+  **The general lesson, which is not yet swept:** `verify_tier_cosigned` binds a co-sign to the
+  tier's INPUT amount and says nothing about how that amount is split across outputs — and the SE is
+  blind, so it signs any distribution by design. Every place that reasons about a tier's value needs
+  to ask whether it is reading a parsed output or assuming conservation. Two hops are now bound; the
+  ancestor-segment hops and the split state's Σ-payload conservation have **not** been audited with
+  this question in mind.
+
 ## Open, unexplained, needs its own investigation
 
 * **rgb-lib refuses to colour a legacy-lane carrier.** Four independent reproductions: a piece above

@@ -5827,6 +5827,70 @@ pub fn verify_child_bundle(
 
     // state_child spends ext_child's PAYLOAD output, co-signed by A_child.
     let ext_out0 = cb.child_extension.payload_out(&ext_tx, "child extension")?;
+
+    // ═══ [VALUE-CONSERVATION] EVERY TIER MUST FORWARD ITS FUNDING MINUS EXACTLY ONE RUNG ═══
+    //
+    // THE DEFECT this closes, demonstrated against this very function rather than argued: a sender
+    // built an honest parent, an honest `SP` paying the payee's slot 198 530 sat, and then a
+    // `child_extension` that spends that output but pays only 1 000 sat forward — the remaining
+    // 196 690 going to a SECOND output back to the sender. `child_state` then paid the payee 510 sat
+    // and declared `out_value: 510` truthfully. `verify_child_bundle` returned `Ok(())`.
+    //
+    // Every existing check passed, and each for a good reason:
+    //   * `verify_tier_cosigned` binds a co-sign to the tier's INPUT amount, never to how the tier
+    //     splits it across outputs — and the SE is BLIND, so it co-signs any distribution by design.
+    //   * The `[value-gate spoof]` check below binds `child_state.out_value` to the signed tx, but
+    //     the attacker declares it HONESTLY; 510 really is all the payee can reach.
+    //   * A tier legitimately has more than one output (payload + the P2A anchor), so "extra output"
+    //     is not itself suspicious.
+    //
+    // What made it theft is that the receiver books the FUNDING value: `coin.amount =
+    // sp_out.value` (`transfer_receiver.rs:1321`), and `verify_conveyed_child`'s returned exit value
+    // is discarded at the claim site (`:979`). So the payee is credited 198 530 for a coin worth 510.
+    //
+    // WHY THIS IS A CHILD-LANE DEFECT AND NOT A WHOLE-COIN ONE — the reason is worth keeping,
+    // because it is also the reason this check must never be "generalised" onto the root ladder as
+    // if the two lanes were the same shape. `verify_bundle_ex` likewise does not bind its final
+    // tier's value, and a skimming root ladder is genuinely NOT theft: a whole coin always retains
+    // its flat backup chain, which `verify_if_locktime_is_reasonable_tx_version_and_output_size`
+    // (lib/src/transfer/receiver.rs) constrains to EXACTLY ONE spendable output paying the owner,
+    // and INV-5 makes the current owner's the first to mature. A skim there degrades the fast path
+    // and leaves the slow path whole. A split child has **no backup at all** — it is an SE-registered
+    // key that is never funded on-chain, so `check_deposit`/`create_tx1` never runs for it, which is
+    // exactly why `CHILD_V2_BASELINE = 0`. Its tier chain is its ONLY exit, so value that leaves the
+    // chain is gone. That asymmetry is the whole defect.
+    //
+    // The law is not a new invariant — it is what the builders have always done
+    // (`build_extension_from` -> `tier_out_value`, lib/src/tesr.rs:376), so an honest bundle passes
+    // with equality. It was simply never checked on the receive side. Note the direction: an
+    // UNDER-paying tier is the attack, but this is an exact-equality check rather than a `>=`,
+    // because an OVER-paying tier does not conserve either and would mean the fee is not committed —
+    // which is the property the whole un-broadcast design rests on.
+    let rung_forward = |prev: u64, what: &str| -> Result<u64> {
+        let v = if cb.is_colored() {
+            crate::rgb::colored_tier_out_total(prev, 1, cb.parent.fee_rate)
+        } else {
+            mercurylib::tesr::tier_out_value(prev, cb.parent.fee_rate)
+        };
+        v.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what}: funding of {prev} sat cannot carry a tier at {} sat/vB",
+                cb.parent.fee_rate
+            )
+        })
+    };
+    let expect_ext = rung_forward(sp_out.value, "child extension")?;
+    if ext_out0.value != expect_ext {
+        return Err(anyhow::anyhow!(
+            "child extension is funded with {} sat but forwards only {} to its payload output \
+             (expected exactly {expect_ext} = funding − one rung at {} sat/vB) — {} sat would be \
+             skimmed to another output while the receiver is credited the funding value",
+            sp_out.value,
+            ext_out0.value,
+            cb.parent.fee_rate,
+            sp_out.value.saturating_sub(ext_out0.value + (sp_out.value - expect_ext)),
+        ));
+    }
     let st_tx: Transaction = deserialize(
         &hex::decode(&cb.child_state.signed_tx).map_err(|_| anyhow::anyhow!("bad child state hex"))?,
     )
@@ -5883,6 +5947,22 @@ pub fn verify_child_bundle(
         return Err(anyhow::anyhow!(
             "child state out[0] pays {} sat but the bundle declares out_value {} — value-gate spoof",
             st_out0.value, cb.child_state.out_value
+        ));
+    }
+    // [VALUE-CONSERVATION, second hop] The declared/signed agreement above is NOT the same property:
+    // it makes the number honest, not the number CORRECT. The skim needs both hops bound, because
+    // moving it one tier down works identically — an extension that forwards the full amount and a
+    // state that pays the payee 510 while sending the rest to a second output is the same theft with
+    // the same receiver-side booking.
+    let expect_state = rung_forward(ext_out0.value, "child state")?;
+    if st_out0.value != expect_state {
+        return Err(anyhow::anyhow!(
+            "child state is funded with {} sat but pays the receiver only {} \
+             (expected exactly {expect_state} = funding − one rung at {} sat/vB) — the remainder \
+             would leave the receiver's exit chain entirely",
+            ext_out0.value,
+            st_out0.value,
+            cb.parent.fee_rate,
         ));
     }
 
