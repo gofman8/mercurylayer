@@ -3286,6 +3286,37 @@ pub async fn verify_conveyed_child(
         } else {
             info_config.fee_rate_sats_per_byte
         };
+        // ═══ [VALUE-CONSERVATION] IS THE YARDSTICK OURS? ═══
+        //
+        // The conservation laws in `verify_child_bundle` and `verify_bundle_ex` all compute
+        // `expect = prev − committed_fee(rate) − P2A`, and `rate` is `cb.parent.fee_rate` — a plain
+        // `f64` on the CONVEYED bundle. `expect` DECREASES as `rate` rises, so a sender who declares
+        // a large enough rate makes a tier that forwards almost nothing satisfy the equality exactly.
+        // Unbounded, that is not a rounding concern: it is a complete bypass of every law landed in
+        // 4e165e6, deed25c and d692c07, restoring the original skim through the measuring stick
+        // instead of through the outputs.
+        //
+        // The yardstick is a CONSTANT, not a market rate: every establish path builds at
+        // `TesrParams::committed_fee_rate` (`establish_auto` -> `p.committed_fee_rate`), which is 2.0
+        // on every shipped preset. So this is exact equality against the RECEIVER's own preset,
+        // derived from its network — never `cb.parent.params`, which is conveyed alongside the rate
+        // and would let the sender move both ends of the comparison together.
+        //
+        // Note what the ceiling must NOT be: `cc.max_fee_rate` caps the flat BACKUP fee and is `1` on
+        // the regtest profile, below the 2.0 every honest ladder carries — using it here would refuse
+        // all legitimate traffic. Two different quantities with similar names; the first draft of this
+        // check used the wrong one.
+        let expected_rate = mercurylib::tesr::TesrParams::for_network(&cc.network.to_string())
+            .committed_fee_rate;
+        if cb.parent.fee_rate != expected_rate {
+            return Err(anyhow::anyhow!(
+                "conveyed bundle declares a committed fee rate of {} sat/vB but this network builds \
+                 ladders at {expected_rate} — that number is the yardstick every value-conservation \
+                 check measures against, and an inflated one lets a tier forwarding almost nothing \
+                 satisfy them all",
+                cb.parent.fee_rate
+            ));
+        }
         // The RETURN VALUE is load-bearing, not a formality: it is the LOWEST locktime of the
         // validated chain, i.e. the first height at which the parent's current owner (the sender of
         // this child) can broadcast a flat backup that spends `F` and voids the entire tree. That is
