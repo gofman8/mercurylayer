@@ -5326,6 +5326,96 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
         }
     }
 
+    // ═══ [VALUE-CONSERVATION] THE ROOT LADDER, TIER BY TIER ═══
+    //
+    // ORDERING IS DELIBERATE: this runs AFTER the structural loop above, not before it. Placed first,
+    // it shadowed the specific "tier N pays the wrong output" refusal with a generic arithmetic one —
+    // a wrong `payload_vout` makes this law read the P2A anchor as the funding value and fail on the
+    // NEXT tier, so the message named the wrong tier and the wrong cause. The structural checks are
+    // the better diagnostics; this is the check that catches what they cannot see.
+    //
+    //
+    // **A CORRECTION.** Commit 4e165e6 bound the split CHILD's chain and argued this lane did not
+    // need it, on the grounds that "a whole coin always retains its flat backup chain … so a skim
+    // here degrades the fast path and leaves the slow path whole". **That reasoning is wrong, and
+    // [B1] is why.** `T` is un-timelocked and spends `F`; every prior owner retains a co-signed copy
+    // of it. The moment any of them broadcasts `T`, `F` is spent and EVERY flat backup — which all
+    // spend `F` — is void. The fallback is not merely slower, it is destroyed at the attacker's
+    // choosing, by the same party who built the skimming ladder.
+    //
+    // So the skim is theft here too, and it is worse than on the child lane: the receiver books the
+    // ON-CHAIN funding value (`amount: tx0_output.value`, lib/src/transfer/receiver.rs:1003, assigned
+    // at transfer_receiver.rs:1486), which is the largest number in the whole structure.
+    //
+    // The law is the same one the builders use — each tier forwards its parent's payload output minus
+    // exactly one rung — and it is checked here against values PARSED from the transactions, never
+    // declared. `fee_rate` is the bundle's own field and so sender-influenced; that is acceptable in
+    // this direction and only in this direction, because a *higher* declared rate makes the expected
+    // forward value SMALLER, and a tier forwarding less than its own declared schedule demands is
+    // exactly what the equality refuses. It is pinned properly by `bind_declared_csv`'s sibling
+    // problem — see `docs/utexo/VALUE-CONSERVATION-SWEEP.md` for the remaining `fee_rate` item.
+    {
+        let rung_forward = |prev: u64, n_payload: usize, what: &str| -> Result<u64> {
+            let v = if bundle.is_colored() {
+                crate::rgb::colored_tier_out_total(prev, n_payload, bundle.fee_rate)
+            } else {
+                mercurylib::tesr::tier_out_total(prev, n_payload, bundle.fee_rate)
+            };
+            v.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{what}: funding of {prev} sat cannot carry a {n_payload}-payload tier at {} sat/vB",
+                    bundle.fee_rate
+                )
+            })
+        };
+        for i in 1..txs.len() {
+            let prev_payload = tiers[i - 1]
+                .payload_out(&txs[i - 1], &format!("tier {}", i - 1))?
+                .value;
+            let is_final = i == txs.len() - 1;
+            // The final tier of a SPLIT parent is an `SP` with N payload outputs funding N children,
+            // so its law is Σ(payloads) rather than a single forward. Every other tier has exactly one
+            // payload output. `n` is derived from the transaction: total outputs less the P2A anchor,
+            // less the opret when coloured — never from a declared count.
+            let n_payload = if is_final && final_is_split {
+                let anchors = txs[i]
+                    .output
+                    .iter()
+                    .filter(|o| o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES)
+                    .count();
+                let oprets = txs[i].output.iter().filter(|o| o.script_pubkey.is_op_return()).count();
+                txs[i].output.len().saturating_sub(anchors + oprets)
+            } else {
+                1
+            };
+            if n_payload == 0 {
+                return Err(anyhow::anyhow!("tier {i} has no payload output at all"));
+            }
+            let expect = rung_forward(prev_payload, n_payload, &format!("tier {i}"))?;
+            // Σ over the payload outputs — which for the single-payload case is just `out[payload_vout]`,
+            // and for `SP` is every child's slot. Summing rather than checking one output is what makes
+            // an EXTRA output impossible to hide: any sats routed elsewhere make the sum come up short.
+            let got: u64 = txs[i]
+                .output
+                .iter()
+                .filter(|o| {
+                    o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                        && !o.script_pubkey.is_op_return()
+                })
+                .map(|o| o.value)
+                .sum();
+            if got != expect {
+                return Err(anyhow::anyhow!(
+                    "tier {i} is funded with {prev_payload} sat but its payload outputs carry {got} \
+                     (expected exactly {expect} = funding − one rung at {} sat/vB across {n_payload} \
+                     payload output(s)) — the difference would leave the owner's exit chain, while the \
+                     receiver is credited the on-chain funding value",
+                    bundle.fee_rate
+                ));
+            }
+        }
+    }
+
     // ---- Superseded tiers: PARSE + LADDER-LINK + SIGNATURE-VERIFY before they may be counted [S1].
     //
     // The count in check 3 is the anti-theft linchpin, so EVERY term of it must correspond to a real,
@@ -5848,17 +5938,23 @@ pub fn verify_child_bundle(
     // sp_out.value` (`transfer_receiver.rs:1321`), and `verify_conveyed_child`'s returned exit value
     // is discarded at the claim site (`:979`). So the payee is credited 198 530 for a coin worth 510.
     //
-    // WHY THIS IS A CHILD-LANE DEFECT AND NOT A WHOLE-COIN ONE — the reason is worth keeping,
-    // because it is also the reason this check must never be "generalised" onto the root ladder as
-    // if the two lanes were the same shape. `verify_bundle_ex` likewise does not bind its final
-    // tier's value, and a skimming root ladder is genuinely NOT theft: a whole coin always retains
-    // its flat backup chain, which `verify_if_locktime_is_reasonable_tx_version_and_output_size`
-    // (lib/src/transfer/receiver.rs) constrains to EXACTLY ONE spendable output paying the owner,
-    // and INV-5 makes the current owner's the first to mature. A skim there degrades the fast path
-    // and leaves the slow path whole. A split child has **no backup at all** — it is an SE-registered
-    // key that is never funded on-chain, so `check_deposit`/`create_tx1` never runs for it, which is
-    // exactly why `CHILD_V2_BASELINE = 0`. Its tier chain is its ONLY exit, so value that leaves the
-    // chain is gone. That asymmetry is the whole defect.
+    // ⚠️ THIS CHECK WAS ORIGINALLY SCOPED TO THE CHILD LANE ON REASONING THAT WAS WRONG. The
+    // argument was: a whole coin retains its flat backup chain, which
+    // `verify_if_locktime_is_reasonable_tx_version_and_output_size` constrains to exactly one
+    // spendable output paying the owner, so a skimming ROOT ladder only degrades the fast path.
+    //
+    // **[B1] destroys that fallback.** `T` is un-timelocked and spends `F`, and every prior owner
+    // retains a co-signed copy. The moment one of them broadcasts `T`, `F` is spent and every flat
+    // backup — all of which spend `F` — is void. The slow path is not slower, it is gone, at the
+    // choosing of the same party who built the skimming ladder. The root ladder therefore carries
+    // the identical theft, against a LARGER number (the receiver books the on-chain funding value),
+    // and it is now bound by the matching law in `verify_bundle_ex`.
+    //
+    // What remains true, and is the reason the two laws are written separately rather than shared:
+    // the child's chain funds from an UN-BROADCAST output, so its yardstick is a value parsed from
+    // another tier; the root's funds from `F`, an on-chain output. Different provenance, same law.
+    // A split child additionally has no backup at all — an SE-registered key never funded on-chain,
+    // so `check_deposit`/`create_tx1` never runs, which is why `CHILD_V2_BASELINE = 0`.
     //
     // The law is not a new invariant — it is what the builders have always done
     // (`build_extension_from` -> `tier_out_value`, lib/src/tesr.rs:376), so an honest bundle passes
