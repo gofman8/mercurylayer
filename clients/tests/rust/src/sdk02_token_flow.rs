@@ -33,6 +33,16 @@ pub async fn execute() -> Result<()> {
     alice_cfg.rgb_data_dir = Some("./rgb-data-sdk2_alice".to_string());
     let mut bob_cfg = SdkConfig::regtest("sdk2_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk2_bob".to_string());
+    // [CTES-R] The COLOURED lane is asked for BY NAME, on both wallets.
+    //
+    // `SdkConfig::colored_ladder` defaults to **false** (2c351c6), and that default is a shipping
+    // decision, not a doubt about the lane: what keeps it off is the measured economics of the lane
+    // it switches on (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` — one coloured partial payment per
+    // carrier, ever). A test of the lane must therefore ENABLE the lane; inheriting it from the
+    // default would make this test a test of the default instead. The default is pinned, in the
+    // direction it actually has, by sdk74 and sdk75.
+    alice_cfg.colored_ladder = true;
+    bob_cfg.colored_ladder = true;
 
     let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
@@ -79,8 +89,8 @@ pub async fn execute() -> Result<()> {
 
     // [CTES-R] Wait for the carrier's COLOURED ladder before paying.
     //
-    // This is a synchronisation point, not a relaxation. `colored_ladder` now defaults ON, so
-    // `claim()` establishes a coloured ladder over the carrier — but it can only do so once the
+    // This is a synchronisation point, not a relaxation. alice runs with `colored_ladder` ON (set
+    // above), so `claim()` establishes a coloured ladder over the carrier — but it can only do so once the
     // allocation is BOOKED, which is the very condition the loop above waits for. The two can land
     // in the same `claim()` pass or in consecutive ones, so without this the test would sometimes
     // reach `transfer_tokens` before the ladder exists and be refused by the retired-lane gate.

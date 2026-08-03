@@ -11,12 +11,15 @@
 //! - [`crate::select::plan`] — payment planning / split-floor refusal,
 //! - [`crate::wallet::deposit_anchored_deadline`] — the pure formula inside the async/electrum
 //!   `UtexoWallet::deposit_anchored_exit_deadline`,
-//! - [`crate::types::ExitCostEstimate::fee_sats_at`] and [`crate::types::is_terminal`].
+//! - [`crate::types::ExitCostEstimate::fee_sats_at`] and [`crate::types::is_terminal`],
+//! - [`crate::config::tesr_exit_vbytes`] / [`crate::config::tesr_exit_txs`] /
+//!   [`crate::config::tesr_exit_wait_blocks`] — the TES-R exit model, which is production code
+//!   precisely because `SdkConfig::auto_exit_margin_blocks` is derived from it [P0-5].
 //!
 //! Only quantities with no callable pure implementation are modelled here, each with a citation
-//! to the production code it mirrors: wall-clock arithmetic (blocks-per-day) and the measured
-//! branch/backup vsizes behind the synthetic exit-cost estimates. Where a modelled value and the
-//! real ladder can be cross-checked, the test computes the ladder side with the real function.
+//! to the production code it mirrors: wall-clock arithmetic (blocks-per-day). Where a modelled
+//! value and the real ladder can be cross-checked, the test computes the ladder side with the real
+//! function.
 //!
 //! Ladder caller convention (mirrored from production by [`ladder_locktime`]):
 //! `calculate_block_height` zeroes `initlock` for `qt > 0`, so callers pass
@@ -27,8 +30,10 @@
 //!   (clients/libs/rust/src/transfer_sender.rs:314-339, `get_blockheight(bkp_tx1)`),
 //!   yielding `L_k = L_0 − k·interval`.
 
+use mercurylib::tesr::TesrParams;
 use mercurylib::transaction::calculate_block_height;
 
+use crate::config::{tesr_exit_txs, tesr_exit_vbytes, tesr_exit_wait_blocks};
 use crate::select::{plan, Candidate, Plan};
 use crate::transfer::{split_amounts, split_fee_reserve, DUST_LIMIT};
 use crate::types::{is_terminal, ExitCostEstimate};
@@ -42,8 +47,10 @@ const PROFILES: [(u32, u32); 2] = [DEPLOYED, DEFAULTS];
 
 /// Representative co-sign tip (deposit confirmation height) for the ladder tests.
 const H: u32 = 850_000;
-/// Expected block cadence used by all wall-clock reasoning in the docs.
-const BLOCKS_PER_DAY: u32 = 144;
+/// Expected block cadence used by all wall-clock reasoning in the docs. Now a PRODUCTION constant
+/// (the `auto_exit_margin_blocks` derivation spends one of these per exit transaction), re-exported
+/// here so the ladder tests below keep reading the same number the margin does.
+use crate::config::BLOCKS_PER_DAY;
 
 /// Backup locktime after `qt` hops, computed with the REAL production function under the
 /// production caller convention (see module docs). `qt = 0` is the deposit backup tx1.
@@ -280,40 +287,64 @@ fn split_size_floor() {
     assert_eq!(plan(&cs, 2_200), Plan::Insufficient { available: 7_000 });
 }
 
-/// Synthetic depth-N exit-cost estimate: N split-branch txs at the measured 155 vB each
-/// (1-in-2-out P2TR, sdk07/types.rs measurements; combine hops are larger — ~57.5 vB per extra
-/// input — and are NOT modelled here) plus the measured 112 vB backup (1-in-1-out P2TR
-/// keyspend). Uses the REAL `ExitCostEstimate::fee_sats_at` for all fee arithmetic.
-fn synthetic_exit_estimate(depth: u32) -> ExitCostEstimate {
-    let branch_vbytes = 155u64 * depth as u64;
-    let backup_vbytes = 112u64;
+/// Depth-`d` TES-R exit estimate, in the shape `estimate_exit_cost` returns. **[P0-5] Every field
+/// is DERIVED** — from the production `crate::config` model, which is in turn derived from the
+/// measured tier vsizes (`mercurylib::tesr::TIER_VBYTES` / `P2TR_OUT_VBYTES`) and the schedule
+/// (`TesrParams`). Fee arithmetic still goes through the REAL `ExitCostEstimate::fee_sats_at`.
+///
+/// `branch_txs` / `branch_vbytes` hold the walk up to but excluding the final state tier, and
+/// `backup_vbytes` holds that last tier, so `total_vbytes = branch + backup` matches the production
+/// invariant (`estimate_exit_cost` sums the stored branch and the latest backup separately).
+fn tesr_exit_estimate(p: &TesrParams, depth: u32) -> ExitCostEstimate {
+    let total_vbytes = tesr_exit_vbytes(depth as u64);
+    // The last rung of the walk is the child's own state tier: one payload output.
+    let backup_vbytes = mercurylib::tesr::TIER_VBYTES;
     ExitCostEstimate {
         statechain_id: format!("model-depth-{depth}"),
-        branch_txs: depth,
-        branch_vbytes,
+        branch_txs: tesr_exit_txs(depth) - 1,
+        branch_vbytes: total_vbytes - backup_vbytes,
         backup_vbytes,
-        total_vbytes: branch_vbytes + backup_vbytes,
-        wait_blocks: 0,
+        total_vbytes,
+        wait_blocks: tesr_exit_wait_blocks(p, depth),
         exit_deadline_block: None,
         exit_deadline_blind: None,
     }
 }
 
-// INV-17 exit-cost scaling: fee_sats_at is ceil(total·rate); cost is LINEAR in tree depth (each
-// extra split level adds exactly one 155-vB branch tx). Note the production invariant
-// `total_vbytes = branch_vbytes + backup_vbytes` is a property of `estimate_exit_cost`
-// (wallet.rs:628) pinned by the sdk07 E2E against real pre-signed txs; the synthetic helper
-// above mirrors it by construction, so asserting it here would only re-check the helper — the
-// expected-totals table pins the numbers instead.
+// [P0-5] THE EXIT MODEL, in both dimensions, derived from the schedule constants.
+//
+// What this replaced: a synthetic `155·d + 112` vB estimate with `wait_blocks: 0`, modelling the
+// pre-TES-R flat split-branch shape (d locktime-free 1-in-2-out branch txs plus one 1-in-1-out
+// backup). Under TES-R an exit is not a branch plus a backup — it is a WALK of pre-signed tiers,
+// each behind a BIP-68 relative lock:
+//
+//   F → T(csv 0) → X_m(720) → [ SP(1404) → ext(720) ] × d → state(1440)      (mainnet schedule)
+//
+// so the old model understated a depth-1 exit by 1.9× in vbytes (267 → 508) and by 100% in latency
+// (0 → 4_284 blocks). Both numbers are now computed by the PRODUCTION functions in `crate::config`
+// (the margin default is derived from the same code), and every literal below is re-derived from
+// `TesrParams` / `TIER_VBYTES` in the same test, so a schedule change fails HERE rather than
+// silently invalidating the model and the margin together.
 #[test]
 fn exit_cost_scaling_model() {
-    // (depth, expected total vbytes = 155·depth + 112)
-    let expected = [(0u32, 112u64), (1, 267), (2, 422), (4, 732), (8, 1352)];
-    let rates = [1u64, 2, 10, 30, 100];
+    let main = TesrParams::mainnet();
 
-    for &(depth, total) in &expected {
-        let e = synthetic_exit_estimate(depth);
+    // ---- SIZE. 293·d + 375 vB, and both coefficients come from the measured tier vsizes.
+    let per_level = 2 * mercurylib::tesr::TIER_VBYTES + mercurylib::tesr::P2TR_OUT_VBYTES;
+    let spine = 3 * mercurylib::tesr::TIER_VBYTES;
+    assert_eq!(per_level, 293, "SP (2 payload outputs) + one extension");
+    assert_eq!(spine, 375, "T + X_m + the final state, one payload output each");
+    // (depth, expected total vbytes, expected txs)
+    let expected = [(0u32, 375u64, 3u32), (1, 668, 5), (2, 961, 7), (4, 1_547, 11), (8, 2_719, 19)];
+    let rates = [1u64, 2, 10, 30, 100];
+    for &(depth, total, txs) in &expected {
+        let e = tesr_exit_estimate(&main, depth);
+        assert_eq!(total, spine + depth as u64 * per_level, "depth {depth}: derived from the tiers");
         assert_eq!(e.total_vbytes, total, "depth {depth}");
+        assert_eq!(e.branch_txs + 1, txs, "depth {depth}: 3 + 2d transactions, in sequence");
+        assert_eq!(tesr_exit_txs(depth), txs);
+        // The production invariant `total = branch + backup`, as `estimate_exit_cost` builds it.
+        assert_eq!(e.total_vbytes, e.branch_vbytes + e.backup_vbytes, "depth {depth}");
         for &r in &rates {
             // Integer rates: ceil(total·r) = total·r exactly.
             assert_eq!(e.fee_sats_at(r as f64), total * r, "depth {depth} @ {r} sat/vB");
@@ -321,14 +352,163 @@ fn exit_cost_scaling_model() {
     }
 
     // Fractional rates round UP (ceil), never down.
-    assert_eq!(synthetic_exit_estimate(2).fee_sats_at(1.1), 465); // ceil(422·1.1 = 464.2)
+    assert_eq!(tesr_exit_estimate(&main, 2).fee_sats_at(1.1), 1_058); // ceil(961·1.1 = 1057.1)
 
-    // Linearity in depth: fee(d8) − fee(d4) == fee(d4) − fee(d0) == 4·155·rate.
+    // Linearity in depth: each level adds exactly one SP + one extension.
     for &r in &rates {
-        let fee = |d: u32| synthetic_exit_estimate(d).fee_sats_at(r as f64);
+        let fee = |d: u32| tesr_exit_estimate(&main, d).fee_sats_at(r as f64);
         assert_eq!(fee(8) - fee(4), fee(4) - fee(0), "equal per-4-level increments @ {r}");
-        assert_eq!(fee(8) - fee(4), 620 * r);
+        assert_eq!(fee(8) - fee(4), 4 * per_level * r);
     }
+
+    // ---- LATENCY. The dimension the old model reported as ZERO for every depth. The waits are
+    // SEQUENTIAL relative locks, so they add; the coefficients come from the schedule, not a table.
+    let per_level_wait = u32::from(main.ext_csv(0)) + u32::from(main.state_csv(1));
+    let tail_wait = u32::from(main.ext_csv(0)) + u32::from(main.state_csv(0));
+    assert_eq!(per_level_wait, 2_124, "X_m 720 + SP 1404, per split level");
+    assert_eq!(tail_wait, 2_160, "the child's own ext 720 + state 1440");
+    for depth in 0..=8u32 {
+        let e = tesr_exit_estimate(&main, depth);
+        assert_eq!(e.wait_blocks, depth * per_level_wait + tail_wait, "depth {depth}");
+        assert!(e.wait_blocks > 0, "no depth exits instantly — the old model said every one did");
+    }
+    // The headline numbers of PARTIAL-PAYMENT-ECONOMICS §2, re-derived rather than copied.
+    assert_eq!(tesr_exit_estimate(&main, 1).wait_blocks, 4_284); // 29.75 days
+    assert_eq!(tesr_exit_estimate(&main, 100).wait_blocks, 214_560); // 4.08 years
+    assert_eq!(tesr_exit_estimate(&main, 100).total_vbytes, 29_675);
+    assert_eq!(tesr_exit_txs(100), 203);
+
+    // Latency is a property of the SCHEDULE, not of TES-R: the regtest schedule gives the same
+    // shape with its own constants, so this model tracks whichever profile a wallet runs.
+    let reg = TesrParams::regtest();
+    assert_eq!(
+        tesr_exit_estimate(&reg, 1).wait_blocks,
+        u32::from(reg.ext_csv(0)) * 2 + u32::from(reg.state_csv(1)) + u32::from(reg.state_csv(0))
+    );
+    assert_eq!(tesr_exit_estimate(&reg, 1).wait_blocks, 66);
+    // Size does NOT depend on the schedule — the tiers are the same transactions either way.
+    assert_eq!(tesr_exit_estimate(&reg, 4).total_vbytes, tesr_exit_estimate(&main, 4).total_vbytes);
+
+    // ---- The COLOURED walk: same shape, same TRANSACTION COUNT (which is what the margin
+    // consumes), dearer tiers. Kept here so the uncoloured model above is never mistaken for the
+    // cost of a CTES-R exit — sdk29 measures `chain_txs=5 tier_vbs=[168, 168, 297, 168, 168]` for a
+    // 4-child split; the 2-child case is the row below.
+    use mercuryrustlib::rgb::colored_tier_vbytes;
+    // Four one-payload tiers (T, X_m, ext_child, state_child) and one two-payload `SP`.
+    let coloured_depth1 = 4 * colored_tier_vbytes(1) + colored_tier_vbytes(2);
+    assert_eq!(colored_tier_vbytes(1), 168, "T / X_m / ext / state, one payload output each");
+    assert_eq!(colored_tier_vbytes(2), 211, "SP: piece + change");
+    assert_eq!(coloured_depth1, 883, "the coloured depth-1 walk, 5 txs");
+    assert_eq!(tesr_exit_estimate(&main, 1).total_vbytes, 668, "the uncoloured one, also 5 txs");
+    assert_eq!(tesr_exit_txs(1), 5, "the tx COUNT is lane-independent — hence usable in the margin");
+    // sdk29's measured 4-child split tier, re-derived: the number the E2E prints is this function's.
+    assert_eq!(colored_tier_vbytes(4), 297);
+}
+
+// [P0-5] The `auto_exit_margin_blocks` DEFAULT is derived from the walk above, not chosen. This
+// test is the derivation, and it exists so that a change to the schedule, to the tier count or to
+// the SE profile fails LOUDLY here instead of silently invalidating a literal.
+//
+//   margin = k_max·interval  +  tesr_exit_txs(d)·144
+//            \___audit-[17]__/   \__one confirmation window per SEQUENTIAL tx of the walk__/
+//
+// WHAT IS DELIBERATELY ABSENT: the walk's own `Σ csv` (`tesr_exit_wait_blocks`). `auto_exit_due`
+// already head-starts the deadline of a coloured child by exactly that sum, read off the coin's own
+// chain (`wallet.rs`, `let head_start: u32 = chain.iter()…sum()`), which is where a per-coin
+// quantity belongs. Adding it to the global margin as well would double-count it and force-exit
+// every coin 2_124·d + 2_160 blocks early. The margin covers what the head start does NOT: the
+// audit-[17] gap, and the fact that each of the walk's transactions must actually CONFIRM before
+// the next tier's relative lock starts counting — a cost the old single `+ 144` priced at one
+// transaction for a walk of five.
+#[test]
+fn auto_exit_margin_is_derived_from_the_walk() {
+    use crate::config::{
+        auto_exit_margin_blocks_for, SdkConfig, AUDIT_17_K_MAX, AUTO_EXIT_MODELLED_DEPTH,
+        SE_INTERVAL_DEFAULT, SE_INTERVAL_DEPLOYED,
+    };
+
+    // The modelled depth is the CTES-R cap, not a guess: `auto_exit_due`'s only CSV-walking lane is
+    // the coloured split child, and a coloured child can never be split again. If a coloured
+    // child-level split is ever built, `tokens::CTESR_CARRIER_SEND_DEPTH` moves and this fails.
+    assert_eq!(
+        AUTO_EXIT_MODELLED_DEPTH as u64,
+        crate::tokens::CTESR_CARRIER_SEND_DEPTH,
+        "the margin is sized for the deepest coin `auto_exit_due` actually drives"
+    );
+    assert_eq!(tesr_exit_txs(AUTO_EXIT_MODELLED_DEPTH), 5, "T, X_m, SP, ext_child, state_child");
+
+    // The shipped defaults ARE the formula, evaluated on each network's SE profile.
+    let deployed = auto_exit_margin_blocks_for(
+        AUDIT_17_K_MAX,
+        SE_INTERVAL_DEPLOYED,
+        AUTO_EXIT_MODELLED_DEPTH,
+    );
+    let mainnet =
+        auto_exit_margin_blocks_for(AUDIT_17_K_MAX, SE_INTERVAL_DEFAULT, AUTO_EXIT_MODELLED_DEPTH);
+    assert_eq!(deployed, 14 * 10 + 5 * 144);
+    assert_eq!(deployed, 860);
+    assert_eq!(mainnet, 14 * 100 + 5 * 144);
+    assert_eq!(mainnet, 2_120);
+    assert_eq!(SdkConfig::regtest("m").auto_exit_margin_blocks, deployed);
+    assert_eq!(
+        SdkConfig::mainnet("m", "http://se", "tcp://e:50001").auto_exit_margin_blocks,
+        mainnet
+    );
+
+    // Both terms are live: change either input and the margin moves.
+    assert_eq!(
+        auto_exit_margin_blocks_for(AUDIT_17_K_MAX, SE_INTERVAL_DEFAULT, 2) - mainnet,
+        2 * BLOCKS_PER_DAY,
+        "one more split level = two more sequential txs = two more confirmation windows"
+    );
+    assert_eq!(
+        mainnet - auto_exit_margin_blocks_for(AUDIT_17_K_MAX, SE_INTERVAL_DEPLOYED, 1),
+        AUDIT_17_K_MAX * (SE_INTERVAL_DEFAULT - SE_INTERVAL_DEPLOYED)
+    );
+
+    // STRICTLY SAFER THAN THE LITERAL IT REPLACES, on both profiles. Never the other way round:
+    // this pass is a coin's only defence against an ancestor's stale backup, so a smaller margin
+    // would be a regression dressed as a derivation.
+    assert!(deployed > 288 && mainnet > 288, "the derived margin must not be under the old 288");
+
+    // The old literal's actual coverage on each profile, which is the defect: `288 = k·interval +
+    // 144` solves to k = 14 on the deployed profile and to k = 1 on the mainnet one.
+    assert_eq!((288 - BLOCKS_PER_DAY) / SE_INTERVAL_DEPLOYED, 14);
+    assert_eq!((288 - BLOCKS_PER_DAY) / SE_INTERVAL_DEFAULT, 1);
+
+    // ---- THE HABITABILITY CONDITION, and the profile pairing it constrains.
+    //
+    // A coin's whole deadline horizon is `initlock` blocks from its deposit. `auto_exit_due` spends
+    // the walk's `Σ csv` of it as a head start and this margin on top, so an off-chain coin is only
+    // viable while
+    //
+    //     initlock  >  tesr_exit_wait_blocks(schedule, d)  +  margin
+    //
+    // and the two sides come from DIFFERENT sources: `initlock` from the SE's `Settings.toml`, the
+    // schedule from `TesrParams::for_network`. Nothing checks that they were chosen together.
+    //
+    // The two shipped pairings both hold, with very different slack:
+    //   * mainnet SE (`lockheight_init` 10_000, `lh_decrement` 100) + `TesrParams::mainnet`
+    //     (walk 4_284) — 3_596 blocks (~25 days) of off-chain life left;
+    //   * deployed/testnet SE (1_000 / 10) + `TesrParams::regtest` (walk 66) — 74 blocks left, and
+    //     that is with the SAME derived margin, which is what makes the deployed profile tight.
+    //
+    // The pairing that does NOT hold is the mainnet SCHEDULE under the deployed `lockheight_init`:
+    // the walk alone (4_284) then exceeds the entire 1_000-block horizon and no margin — this one
+    // or any other — lets a depth-1 coloured child finish its exit in time. That is a PARAMETER
+    // defect, not a watchtower one, and this assertion is where it would be caught.
+    let main_walk = tesr_exit_estimate(&TesrParams::mainnet(), AUTO_EXIT_MODELLED_DEPTH).wait_blocks;
+    let reg_walk = tesr_exit_estimate(&TesrParams::regtest(), AUTO_EXIT_MODELLED_DEPTH).wait_blocks;
+    assert_eq!((main_walk, reg_walk), (4_284, 66));
+    // mainnet SE `lockheight_init` = 10_000 (server/src/server_config.rs:82) + mainnet schedule.
+    assert_eq!(10_000 - main_walk - mainnet, 3_596, "blocks of off-chain life left on mainnet");
+    // deployed SE `lockheight_init` = 1_000 (server/Settings.toml:2) + regtest schedule.
+    assert_eq!(1_000 - reg_walk - deployed, 74, "…and on the deployed profile");
+    assert!(
+        main_walk > 1_000,
+        "the mainnet SCHEDULE cannot be run under the deployed 1_000-block lockheight_init: the \
+         exit walk alone is longer than the whole horizon it must fit inside"
+    );
 }
 
 // Wall-clock model (no callable production function — the chain tip is external): the co-sign

@@ -1805,7 +1805,7 @@ impl UtexoWallet {
                 // `ids` empty, no event, no fault, pass returns `Ok`. Classify, and treat anything
                 // that is not a recognised "not yet" as blindness — an owner whose exit is being
                 // out-raced learns about it on the NEXT pass instead of never.
-                mercuryrustlib::tesr::WatchState::Acted { ids, failures } => {
+                mercuryrustlib::tesr::WatchState::Acted { ids, failures, blind: unseen } => {
                     if !ids.is_empty() {
                         let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
                             statechain_id: id.clone(),
@@ -1813,6 +1813,11 @@ impl UtexoWallet {
                         });
                         acted.push(id.clone());
                     }
+                    // Per-entry blindness. This tower passes ONE bundle, so today the list is always
+                    // empty — bound and merged rather than `..`-ignored so that if a future pass can
+                    // report it, it lands in the fault machinery instead of being dropped by a
+                    // wildcard nobody revisits.
+                    blind.extend(unseen);
                     let hard: Vec<&String> = failures
                         .iter()
                         .filter(|f| !ladder_failure_is_waiting(f))
@@ -1887,7 +1892,7 @@ impl UtexoWallet {
             };
             match mercuryrustlib::tesr::watch_child_pass(&self.inner.cc.electrum_client, &cb) {
                 mercuryrustlib::tesr::WatchState::Idle => {}
-                mercuryrustlib::tesr::WatchState::Acted { ids, failures } => {
+                mercuryrustlib::tesr::WatchState::Acted { ids, failures, blind: unseen } => {
                     if !ids.is_empty() {
                         let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
                             statechain_id: cid.to_string(),
@@ -1895,6 +1900,7 @@ impl UtexoWallet {
                         });
                         acted.push(cid.to_string());
                     }
+                    blind.extend(unseen); // same reasoning as the parent pass above
                     let hard: Vec<&String> = failures
                         .iter()
                         .filter(|f| !ladder_failure_is_waiting(f))

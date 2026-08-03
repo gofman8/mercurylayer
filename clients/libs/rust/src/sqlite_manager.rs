@@ -122,19 +122,39 @@ pub async fn get_all_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str) -> Resul
 }
 
 /// Insert a raw backup row (statechain_id key + txs JSON string) verbatim, replacing any existing
-/// row for that key. Used by recovery-bundle import to restore branch-*/parents-*/backup rows.
+/// row for that key. Used by recovery-bundle import to restore branch-*/parents-*/backup rows, and
+/// by the in-ladder split's write-ahead journal (`tesr::journal_write`).
+///
+/// **[B4] ATOMIC — DELETE + INSERT in ONE transaction, and it must stay that way.** This used to
+/// execute the two statements against the pool directly, i.e. as two independent auto-committed
+/// transactions with a real window between them in which the row does NOT EXIST. Every caller of
+/// this function treats the write as a replace, but the crash-durability argument the split journal
+/// rests on is stronger than that: `journal_write` advances one record through its stages, so a
+/// crash inside that window destroys the PREVIOUS stage's record as well as failing to write the new
+/// one — the write-ahead log evaporates at exactly the moment it is being relied on, and the split
+/// it was protecting (a terminalized parent, unregenerable co-signatures) becomes invisible to the
+/// recovery reader. Narrower than having no journal at all, and the same failure.
+///
+/// Wrapping both statements in one transaction makes the row transition old→new with no observable
+/// intermediate state: a crash before `commit` leaves the PREVIOUS record intact (recovery replays
+/// from the older stage, which is always safe — every stage is idempotent by construction), and a
+/// crash after it leaves the new one. There is no ordering in which the record is absent.
 pub async fn insert_raw_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_id: &str, txs_json: &str) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+
     let _ = sqlx::query("DELETE FROM backup_txs WHERE statechain_id = $1 AND wallet_name = $2")
         .bind(statechain_id)
         .bind(wallet_name)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
     sqlx::query("INSERT INTO backup_txs (statechain_id, wallet_name, txs) VALUES ($1, $2, $3)")
         .bind(statechain_id)
         .bind(wallet_name)
         .bind(txs_json)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+
+    transaction.commit().await?;
     Ok(())
 }
 

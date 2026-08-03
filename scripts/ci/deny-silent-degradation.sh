@@ -137,6 +137,9 @@ trap 'rm -rf "$tmp"' EXIT
 
 MARKER='AUDITED-SWALLOW'
 MARKER_LOOKBACK=6
+# How far back to look for a wrapped `assert!(` opener. 3 covers rustfmt's wrapping of a macro with
+# a condition and a message; deliberately short, so an `.is_err()` far below an assert is still a hit.
+ASSERT_LOOKBACK=3
 
 # `record FILE LINENO TEXT ID` — normalise, drop the non-swallows, append to $tmp/hits.
 record() {
@@ -151,6 +154,17 @@ record() {
         *'\n'*) return 0 ;;
         '"'*'"'|'"'*'",') return 0 ;;
     esac
+    # The `*assert*` exemption above is LINE-scoped, and rustfmt wraps a long assertion so that its
+    # first argument lands on its own line: `assert!(\n    x.is_err(),\n    "...");`. That argument is
+    # still the assertion's condition — a CHECK that panics, never a fallback — so honour the same
+    # exemption when the line is the continuation of an assert opener. Requiring the opener line to
+    # END in `(` keeps this tight: it matches only a macro whose arguments continue below.
+    _from=$((_no - ASSERT_LOOKBACK)); [ "$_from" -lt 1 ] && _from=1
+    if [ "$_no" -gt 1 ] && sed -n "${_from},$((_no - 1))p" "$_file" 2>/dev/null \
+        | grep -qE '(^|[^A-Za-z0-9_])(debug_)?assert(_eq|_ne)?!\($'; then
+        return 0
+    fi
+
     # inline escape hatch, same marker as the in-file guard in rust-sdk/src/wallet.rs
     _from=$((_no - MARKER_LOOKBACK)); [ "$_from" -lt 1 ] && _from=1
     if sed -n "${_from},${_no}p" "$_file" 2>/dev/null | grep -q "$MARKER"; then

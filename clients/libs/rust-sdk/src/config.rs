@@ -49,14 +49,24 @@ pub struct SdkConfig {
     /// owner); disable for wallets that schedule `auto_exit_due` themselves or delegate to
     /// external watch bundles.
     pub auto_exit: bool,
-    /// Deadline margin (blocks) for the background `auto_exit_due` pass. Must absorb the audit-[17]
-    /// gap (the deposit-anchored deadline is late by `k·interval` for a parent transferred `k`
-    /// times pre-split) plus confirmation latency and congestion: choose `≥ k_max·interval + 144`.
-    /// Default 288 (~2 days; covers k ≤ 14 pre-split hops on the deployed 1000/10 profile).
+    /// Deadline margin (blocks) for the background `auto_exit_due` pass. **DERIVED — see
+    /// [`auto_exit_margin_blocks_for`], which is what both constructors call. [P0-5]**
+    ///
+    /// The old literal `288` was `k_max·interval + 144` evaluated on the DEPLOYED 1000/10 profile
+    /// with `k_max = 14`, and it was wrong in two ways at once: `interval` is 100 on the mainnet
+    /// profile (so 288 covers `k ≤ 1` there, not 14), and the trailing `+ 144` is a budget for ONE
+    /// transaction to confirm while a coin whose exit is a TES-R walk must land `3 + 2·depth`
+    /// transactions in sequence. Both are now derived per network.
     pub auto_exit_margin_blocks: u32,
     /// **[CTES-R] Colour the ladder of an RGB carrier.** When on, `claim()` establishes a COLOURED
     /// TES-R ladder over a carrier — `T`, `X_0` and `S_0` each carrying a valid RGB state transition
-    /// — instead of leaving it on the flat lane. Default **true**.
+    /// — instead of leaving it on the flat lane.
+    ///
+    /// **Default `false`** (commit 2c351c6). The retirement argument below is what makes ON *safe*;
+    /// what stopped it from being the default is the measured economics of the lane it switches on
+    /// — `docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
+    /// and a 4_284-block unilateral exit for the child it produces. Both constructors below ship
+    /// `false`; the doc used to say "true" and the code has said `false` since 2c351c6.
     ///
     /// ## Why it was off, and what changed
     ///
@@ -119,7 +129,7 @@ pub struct SdkConfig {
 ///
 /// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
 ///   * an **RGB carrier** must never be laddered *with a PLAIN ladder* (an uncoloured tier spend
-///     would destroy the allocation). [CTES-R] `SdkConfig::colored_ladder`, now ON by default,
+///     would destroy the allocation). [CTES-R] `SdkConfig::colored_ladder` (default OFF — 2c351c6)
 ///     builds it a COLOURED ladder instead — every tier carrying a valid RGB state transition, so
 ///     laddering MOVES the allocation rather than destroying it. A carrier still falls back to the
 ///     flat signed-once backup shape when the coloured lane cannot be taken *for that coin*: its
@@ -130,6 +140,115 @@ pub struct SdkConfig {
 ///   * a **split sub-coin** whose funding is un-broadcast cannot root a trigger [B0].
 /// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead code left over
 /// from the pre-TES-R design.
+
+// =================================================================================================
+// [P0-5] THE EXIT MODEL — size, transaction count and LATENCY of a unilateral TES-R exit.
+//
+// These live here, in a non-test module, because `auto_exit_margin_blocks` is DERIVED from them and
+// a default cannot be derived from a `#[cfg(test)]` model. `invalidation_model.rs` pins them against
+// the schedule constants; `docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §2 is the measured source.
+//
+// The walk a depth-`d` coin must complete, leaf-ward, and what each rung costs:
+//
+//   F → T(csv 0) → X_m(ext_csv 0) → [ SP(state_csv 1) → ext(ext_csv 0) ] × d → state(state_csv 0)
+//
+// `T` carries no timelock; every other rung carries a BIP-68 RELATIVE lock, so the waits are
+// SEQUENTIAL and add. `SP` is the only rung with two payload outputs (piece + change), hence the
+// only one that costs `TIER_VBYTES + P2TR_OUT_VBYTES`.
+// =================================================================================================
+
+/// Expected block cadence — the unit every wall-clock statement in the docs uses, and the
+/// confirmation budget the previous `auto_exit_margin_blocks` literal already spent one of.
+pub const BLOCKS_PER_DAY: u32 = 144;
+
+/// Transactions a unilateral exit must confirm, **in sequence**, for a coin at in-ladder split
+/// depth `d`: `T`, `X_m` and the final state, plus one `SP` and one extension per split level.
+pub const fn tesr_exit_txs(child_depth: u32) -> u32 {
+    3 + 2 * child_depth
+}
+
+/// Signed vsize of that whole walk, derived from the MEASURED tier vsizes
+/// (`mercurylib::tesr::TIER_VBYTES` = 125, `P2TR_OUT_VBYTES` = 43): `293·d + 375` vB.
+///
+/// The model this replaced said `155·d + 112` — a pre-TES-R split-branch shape that understates a
+/// depth-1 exit by 1.9× and gets further out with every level.
+///
+/// **This is the UNCOLOURED walk.** A CTES-R coloured walk has the same shape and the same
+/// transaction count — which is all [`auto_exit_margin_blocks_for`] consumes — but every tier
+/// carries an `opret`, so it is dearer: `mercuryrustlib::rgb::colored_tier_vbytes` gives 168 / 211
+/// per one- / two-payload tier, i.e. 883 vB at depth 1 against 668 here.
+/// `invalidation_model::exit_cost_scaling_model` pins both.
+pub const fn tesr_exit_vbytes(child_depth: u64) -> u64 {
+    use mercurylib::tesr::{P2TR_OUT_VBYTES, TIER_VBYTES};
+    // `T` + `X_m` + the final state, all one-payload tiers.
+    let spine = 3 * TIER_VBYTES;
+    // Per split level: `SP` (two payload outputs) + one extension (one payload output).
+    let per_level = (TIER_VBYTES + P2TR_OUT_VBYTES) + TIER_VBYTES;
+    spine + child_depth * per_level
+}
+
+/// **Exit LATENCY in blocks** — the sum of the walk's relative timelocks: `2124·d + 2160` on the
+/// mainnet schedule, `30·d + 36` on the regtest one. Derived from the schedule, never a literal.
+///
+/// The model this replaced reported **zero** wait for every depth. A depth-1 mainnet coin needs
+/// 4_284 blocks (29.8 days); a depth-100 one needs 4.08 years.
+pub fn tesr_exit_wait_blocks(p: &mercurylib::tesr::TesrParams, child_depth: u32) -> u32 {
+    // `T` has no timelock. `X_m` is a fresh extension (m = 0); the split state `SP` is the state at
+    // k = 1 (the parent's own retained `S_0` is the rung it replaces); the child's own ladder is a
+    // fresh extension and a fresh state.
+    let per_level = u32::from(p.ext_csv(0)) + u32::from(p.state_csv(1));
+    let tail = u32::from(p.ext_csv(0)) + u32::from(p.state_csv(0));
+    child_depth * per_level + tail
+}
+
+/// Pre-split hops the audit-[17] gap is assumed to span.
+///
+/// **This is an ASSUMPTION, and it is the weakest term in [`auto_exit_margin_blocks_for`].** The
+/// deposit-anchored deadline (`H_deposit + initlock`) is LATE by `k·interval` for a parent
+/// transferred `k` times before it was split, and nothing conveys `k` to a receiver — that is
+/// audit item [17], still open. The true fail-closed bound is the ladder capacity itself
+/// (`initlock / interval` = 100 hops ⟹ a gap of `initlock`), which would exceed the entire deadline
+/// horizon and make every off-chain coin due the moment it is claimed. A margin cannot absorb an
+/// unbounded `k`; only conveying ancestor locktimes can. 14 is carried over unchanged from the
+/// literal this derivation replaced, so that this change moves exactly one dimension.
+pub const AUDIT_17_K_MAX: u32 = 14;
+
+/// SE `interval` (`lh_decrement`) of the deployed/regtest profile — `server/Settings.toml:3`.
+pub const SE_INTERVAL_DEPLOYED: u32 = 10;
+/// SE `interval` of the mainnet default profile — `server/src/server_config.rs:69-70`.
+pub const SE_INTERVAL_DEFAULT: u32 = 100;
+
+/// In-ladder split depth [`auto_exit_margin_blocks_for`] sizes the confirmation budget for.
+///
+/// The only lane in `auto_exit_due` that walks relative timelocks at all is the COLOURED split
+/// child (`wallet.rs`, the `ctesr-` loop), and a coloured child is capped at depth 1 —
+/// `tokens::CTESR_CARRIER_SEND_DEPTH`, enforced by `colored_child_txids`. The other two lanes
+/// broadcast a locktime-free branch, i.e. one transaction, which this formula covers as `d = 0`
+/// would not: `tesr_exit_txs(0) = 3` is still a safe over-estimate for them.
+/// `invalidation_model::auto_exit_margin_is_derived_from_the_walk` asserts the two constants agree,
+/// so a coloured child-level split appearing later fails loudly here.
+pub const AUTO_EXIT_MODELLED_DEPTH: u32 = 1;
+
+/// **The derived `auto_exit_margin_blocks` default. [P0-5]**
+///
+/// ```text
+/// margin = k_max · interval          the audit-[17] gap the deposit-anchored deadline misses
+///        + tesr_exit_txs(d) · 144    one confirmation window per SEQUENTIAL tx of the exit walk
+/// ```
+///
+/// The second term is the correction. The literal it replaces spent a single `+ 144` — a budget for
+/// ONE transaction — on a walk that lands `3 + 2d` of them one after another, each of which must
+/// confirm before the next tier's relative lock even starts counting.
+///
+/// It deliberately does NOT include the walk's `Σ csv` (`tesr_exit_wait_blocks`). That head start is
+/// already taken per-coin, from the coin's own chain, where it belongs: `auto_exit_due` computes
+/// `head_start = Σ csv` off the `ctesr-` bundle and subtracts it from the deadline before comparing
+/// against this margin. Folding it in here as well would double-count it and force-exit every coin
+/// `2124·d + 2160` blocks early — thousands of blocks of off-chain life and an on-chain fee, spent
+/// on arithmetic already done.
+pub const fn auto_exit_margin_blocks_for(k_max: u32, interval: u32, child_depth: u32) -> u32 {
+    k_max * interval + tesr_exit_txs(child_depth) * BLOCKS_PER_DAY
+}
 
 impl SdkConfig {
     /// Local regtest stack defaults (matches `regtest.Settings.toml` of the repo's test harness).
@@ -150,7 +269,12 @@ impl SdkConfig {
             auto_refresh_margin_blocks: 144,
             background_auto_refresh: false,
             auto_exit: true,
-            auto_exit_margin_blocks: 288,
+            // 14·10 + 5·144 = 860 blocks. DERIVED, not chosen — see auto_exit_margin_blocks_for.
+            auto_exit_margin_blocks: auto_exit_margin_blocks_for(
+                AUDIT_17_K_MAX,
+                SE_INTERVAL_DEPLOYED,
+                AUTO_EXIT_MODELLED_DEPTH,
+            ),
             colored_ladder: false,
         }
     }
@@ -173,7 +297,13 @@ impl SdkConfig {
             auto_refresh_margin_blocks: 144,
             background_auto_refresh: false,
             auto_exit: true,
-            auto_exit_margin_blocks: 288,
+            // 14·100 + 5·144 = 2_120 blocks. The mainnet SE `interval` is 100, not the 10 the
+            // old shared literal was derived on.
+            auto_exit_margin_blocks: auto_exit_margin_blocks_for(
+                AUDIT_17_K_MAX,
+                SE_INTERVAL_DEFAULT,
+                AUTO_EXIT_MODELLED_DEPTH,
+            ),
             colored_ladder: false,
         }
     }

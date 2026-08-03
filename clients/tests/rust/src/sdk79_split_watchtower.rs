@@ -150,8 +150,20 @@ pub async fn execute() -> Result<()> {
     // The watchtower is driven EXPLICITLY here; a background pass would make "which pass broadcast
     // what" unanswerable.
     alice_cfg.auto_exit = false;
+    // [CTES-R] The COLOURED lane is asked for BY NAME, on every wallet in this test.
+    //
+    // `SdkConfig::colored_ladder` ships **false** (2c351c6) — the lane is sound (sdk74/sdk75) but
+    // its measured economics keep it opt-in (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`). Every
+    // theft this test drives is SPECIFIC to that lane: `S_0` vs `SP`, `S` vs `S'`, and the child
+    // re-transfer are all rival COLOURED states over one `X_m` payload output, and none of them
+    // exists on the flat lane. So the lane is enabled here rather than inherited — with it off,
+    // `find_colored_carrier` would simply never find a carrier and every part would hang, and if it
+    // somehow did not, the counterfactuals below would pass vacuously. Nothing about what this test
+    // proves depends on which way the default points.
+    alice_cfg.colored_ladder = true;
     let mut bob_cfg = SdkConfig::regtest("sdk79_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk79_bob".to_string());
+    bob_cfg.colored_ladder = true;
     let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
     let bob_address = bob.get_utexo_address().await?;
@@ -1116,6 +1128,9 @@ async fn part_d(
     let mut carol_cfg = SdkConfig::regtest("sdk79_carol");
     carol_cfg.rgb_data_dir = Some("./rgb-data-sdk79_carol".to_string());
     carol_cfg.auto_exit = false;
+    // Same reason as alice and bob at the top of `execute`: the lane is opt-in (it ships OFF,
+    // 2c351c6) and carol is the recipient of a coloured CHILD re-transfer, which only exists on it.
+    carol_cfg.colored_ladder = true;
     let (carol, _) = UtexoWallet::initialize(carol_cfg, None).await?;
     let carol_address = carol.get_utexo_address().await?;
     for _ in 0..4 {
@@ -1137,22 +1152,72 @@ async fn part_d(
     println!("SDK79 - (D0) alice's fourth coloured carrier {carrier_d} holds {SUPPLY_D} of {asset_d}");
 
     // ---- D1. Alice pays bob in-ladder, so bob holds a coloured CHILD to re-transfer. -------------
-    let out = alice.transfer_tokens(&asset_d, bob_address, PAY_D).await?;
+    let out = alice
+        .transfer_tokens(&asset_d, bob_address, PAY_D)
+        .await
+        .map_err(|e| anyhow!("(D1) alice's in-ladder pay to bob failed: {e:#}"))?;
     let piece_sid = out.coins[0].statechain_id.clone();
     let mut bob_child = None;
+    // The last reason a POLL pass did not settle, so the timeout below names it instead of just
+    // saying "never adopted". A pass that errors is "not ready yet" — this whole loop is the wait,
+    // and `book_incoming_token` retries a transient accept on the NEXT `claim()` by construction —
+    // but it is never SWALLOWED: if the state never arrives the loop fails and prints this.
+    let mut last_wait: Option<String> = None;
     for _ in 0..60 {
-        bob.claim().await?;
-        alice.claim().await?;
+        if let Err(e) = bob.claim().await {
+            last_wait = Some(format!("bob.claim: {e:#}"));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        if let Err(e) = alice.claim().await {
+            last_wait = Some(format!("alice.claim: {e:#}"));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
         if let Some(cb) = mercuryrustlib::tesr::load_child(cc, "sdk79_bob", &piece_sid).await? {
-            if cb.is_colored() {
+            // SYNCHRONISATION, NOT RELAXATION — and the gate was genuinely under-specified.
+            //
+            // Adopting the `ctesr-` row and ACCEPTING the consignment into bob's RGB STOCK are two
+            // different writes on two different retry clocks. `book_incoming_token` classifies a
+            // resolver miss (the un-broadcast child extension is not in the indexer, and the proxy
+            // is still catching up) as `Pending` and retries it on the NEXT `claim()`, so the bundle
+            // is on disk one or more passes before the allocation is booked. Breaking on the row
+            // alone let D2 start against a stock that did not yet know the contract, and
+            // `transfer_colored_child` then failed on its own PRECONDITION — observed as both
+            // "contract rgb:… is unknown" and "the coloured S'_child consignment does not validate
+            // against its chain (Unresolved)" — neither of which is anything Part D is about.
+            //
+            // So the gate is the precondition the hop actually has: the child is adopted AND its
+            // allocation is booked. That is strictly STRONGER than what was there, and it changes
+            // nothing about what D2/D3 then prove — the race, the witness and the `admitted == 0`
+            // assertion all run exactly as before, on a hop that can now reach them.
+            let booked = match bob.get_token_balances().await {
+                Ok(bals) => bals.into_iter().any(|b| b.asset_id == asset_d && b.balance >= PAY_D),
+                Err(e) => {
+                    last_wait = Some(format!("bob.get_token_balances: {e:#}"));
+                    false
+                }
+            };
+            if cb.is_colored() && booked {
                 bob_child = Some(cb);
                 break;
+            }
+            if !booked && last_wait.is_none() {
+                last_wait = Some(format!(
+                    "bob adopted the `ctesr-` row for {piece_sid} but has not BOOKED {PAY_D} of \
+                     {asset_d} yet"
+                ));
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let bob_child = bob_child
-        .ok_or_else(|| anyhow!("bob never adopted the coloured child {piece_sid}"))?;
+    let bob_child = bob_child.ok_or_else(|| {
+        anyhow!(
+            "bob never reached the state PART D needs for {piece_sid}: the coloured child adopted \
+             AND {PAY_D} of {asset_d} booked into his RGB stock. Last pass reported: {}",
+            last_wait.as_deref().unwrap_or("<no error recorded>")
+        )
+    })?;
     let s_child_bob = bob_child.child_state.txid.clone();
     let parent_t = bob_child.parent.trigger.txid.clone();
     let parent_t_hex = bob_child.parent.trigger.signed_tx.clone();
@@ -1300,18 +1365,47 @@ async fn part_d(
 
     // ---- D5. Carol really got it, and the chain really was actionable. ---------------------------
     let mut carol_child = None;
+    // Same under-specified gate as D1, one level down, and the same fix: the `ctesr-` row and the
+    // ACCEPT into carol's RGB stock are separate writes, and `book_incoming_token` retries a
+    // resolver miss on the next `claim()`. Breaking on the row alone ran the balance assertion
+    // BEFORE the accept had had its retries, so the assertion below reported "an allocation was
+    // destroyed by a hop" when nothing had been destroyed and the accept was simply still pending.
+    // The ASSERTION IS UNCHANGED and still loud — this only makes the wait wait for the thing the
+    // assertion is about, and carol never booking it in 60 passes is still a failure.
+    let mut carol_wait: Option<String> = None;
     for _ in 0..60 {
-        carol.claim().await?;
+        if let Err(e) = carol.claim().await {
+            carol_wait = Some(format!("carol.claim: {e:#}"));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
         if let Some(cb) = mercuryrustlib::tesr::load_child(cc, "sdk79_carol", &piece_sid).await? {
-            if cb.is_colored() {
+            let booked = match carol.get_token_balances().await {
+                Ok(bals) => bals.into_iter().any(|b| b.asset_id == asset_d && b.balance == PAY_D),
+                Err(e) => {
+                    carol_wait = Some(format!("carol.get_token_balances: {e:#}"));
+                    false
+                }
+            };
+            if cb.is_colored() && booked {
                 carol_child = Some(cb);
                 break;
+            }
+            if !booked {
+                carol_wait.get_or_insert_with(|| {
+                    format!("carol adopted the row for {piece_sid} but has not booked {PAY_D} yet")
+                });
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let carol_child =
-        carol_child.ok_or_else(|| anyhow!("carol never adopted the re-transferred child"))?;
+    let carol_child = carol_child.ok_or_else(|| {
+        anyhow!(
+            "carol never adopted the re-transferred child AND booked {PAY_D} of {asset_d}. Last \
+             pass reported: {}",
+            carol_wait.as_deref().unwrap_or("<no error recorded>")
+        )
+    })?;
     assert_eq!(
         carol_child.child_state.txid, s_child_carol,
         "carol must hold exactly the state bob stored before conveying"

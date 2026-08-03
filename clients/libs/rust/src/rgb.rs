@@ -21,8 +21,7 @@ use bitcoin::{
 };
 use electrum_client::ElectrumApi;
 use mercurylib::tesr::{
-    committed_fee_for_outputs, p2a_script, payee_address, P2A_SCRIPT_BYTES, P2A_VALUE,
-    P2TR_OUT_VBYTES,
+    p2a_script, payee_address, P2A_SCRIPT_BYTES, P2A_VALUE, P2TR_OUT_VBYTES,
 };
 use mercurylib::transaction::{
     create_signature, get_partial_sig_request_for_colored_tx,
@@ -1406,6 +1405,9 @@ pub fn build_colored_tier(
 #[cfg(test)]
 mod ctesr_tests {
     use super::*;
+    // Only the fee-parity assertion needs this; importing it at module scope made every non-test
+    // build warn.
+    use mercurylib::tesr::committed_fee_for_outputs;
     use std::collections::HashSet;
 
     // Every role, and the list must STAY complete: it drives the wire-tag disjointness and the

@@ -1894,8 +1894,114 @@ pub async fn cosign_colored_in_ladder_split(
         ));
     }
 
+    // Every child coin is matched to its draft child BEFORE anything irreversible happens. This used
+    // to be checked inside the co-signing loop, i.e. after the parent had been terminalized: a
+    // mismatched coin then refused a split that had already spent the parent's last budget slot.
+    let child_sids = draft
+        .children
+        .iter()
+        .zip(child_coins.iter())
+        .map(|(cd, child_coin)| {
+            let child_sid = child_coin
+                .statechain_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
+            if child_sid != cd.statechain_id {
+                return Err(anyhow::anyhow!(
+                    "coloured split child coin is {child_sid} but the draft's child is {}",
+                    cd.statechain_id
+                ));
+            }
+            Ok(child_sid)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // The parent segment's leaf consignment is SP's — `consignments` is indexed by `exit_tiers()`.
+    // Computed before the terminalization for the same reason: it can fail, and a failure here after
+    // the budget was spent would strand the carrier over a bookkeeping error.
+    let mut parent_consignments = rgb_half.consignments.clone();
+    let pc = parent_consignments.len();
+    if pc == 0 {
+        return Err(anyhow::anyhow!("coloured ladder carries no consignments"));
+    }
+    parent_consignments[pc - 1] = draft.sp_consignment.clone();
+
+    // =============================================================================================
+    // [B4] WRITE AHEAD, THEN TERMINALIZE — the coloured lane's half of [P0-3].
+    //
+    // THE DEFECT. This function did everything the plain `in_ladder_split` does — `set_spend_budget`
+    // to terminalize the parent, then `1 + 2N` co-signatures the SE will never issue again — and
+    // persisted NOTHING. A dropped response, a killed process or a full disk anywhere below returned
+    // `Err` with the carrier permanently terminal server-side and not one byte of the material on
+    // disk. For a COLOURED carrier that is worse than for a plain one: the tiers carry RGB
+    // transitions built by an engine phase that has already been discarded by the time this runs, so
+    // "sign it again" is not merely wasteful, it is impossible — the whole allocation's off-chain
+    // life ends with the process. The plain lane's journal was written for exactly this failure and
+    // this lane simply never got one.
+    //
+    // The record is the same `splitjrnl-<op_id>` shape, keyed with the same deterministic `op_id`
+    // (`split_op_id`), so one recovery reader serves both lanes — plus the two coloured-only fields
+    // (`PendingTier`, `SplitJournalChild::rgb`) without which a replay could not reproduce a tier it
+    // cannot rebuild or hand back the allocation it carries.
+    // =============================================================================================
+    let mut journal = SplitJournalRecord {
+        op_id: format!("in_ladder_split:{parent_sid}:{}", draft.sp_txid),
+        lane: "colored_in_ladder_split".to_string(),
+        stage: SplitStage::Planned,
+        terminalized_statechain_id: parent_sid.clone(),
+        parent: bundle.clone(),
+        parent_statechain_id: parent_sid.clone(),
+        ancestors: vec![],
+        parent_flat_backups: parent_backups.clone(),
+        children: draft
+            .children
+            .iter()
+            .zip(child_sids.iter())
+            .map(|(cd, sid)| SplitJournalChild {
+                statechain_id: sid.clone(),
+                owner_exit_address: cd.owner_exit_address.clone(),
+                // The sats at `SP.out[j]` — what the child's extension spends.
+                value: cd.sp_out_value,
+                sp_vout: cd.sp_vout,
+                extension: None,
+                state: None,
+                rgb: Some(ColoredChild {
+                    contract_id: draft.contract_id.clone(),
+                    amount: cd.rgb_amount,
+                    consignments: vec![
+                        cd.extension.consignment.clone(),
+                        cd.state.consignment.clone(),
+                    ],
+                }),
+                pending_extension: Some(PendingTier {
+                    txid: cd.extension.txid.clone(),
+                    tx_hex: cd.extension.tx_hex.clone(),
+                    prev_value: cd.sp_out_value,
+                    out_value: cd.extension.payload_value,
+                    csv: cd.csv_e,
+                    payload_vout: cd.extension.payload_vout,
+                }),
+                pending_state: Some(PendingTier {
+                    txid: cd.state.txid.clone(),
+                    tx_hex: cd.state.tx_hex.clone(),
+                    prev_value: cd.extension.payload_value,
+                    out_value: cd.state.payload_value,
+                    csv: cd.csv_d,
+                    payload_vout: cd.state.payload_vout,
+                }),
+            })
+            .collect(),
+        child_ext_csv: draft.children[0].csv_e,
+        child_state_csv: draft.children[0].csv_d,
+        fee_rate: draft.fee_rate,
+        network: draft.network.clone(),
+        sp_txid: draft.sp_txid.clone(),
+    };
+    journal_write(cc, wallet_name, &journal).await?;
+
     // Terminalize the parent — SP consumes the last budget slot.
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
+    crash_point("after_colored_inladder_terminalize");
     let sp_signed = cosign_tier(
         cc,
         parent_coin,
@@ -1918,27 +2024,19 @@ pub async fn cosign_colored_in_ladder_split(
         csv: Some(draft.sp_csv),
         payload_vout: draft.children[0].sp_vout,
     };
-    // The parent segment's leaf consignment is SP's — `consignments` is indexed by `exit_tiers()`.
-    let mut parent_consignments = rgb_half.consignments.clone();
-    let pc = parent_consignments.len();
-    if pc == 0 {
-        return Err(anyhow::anyhow!("coloured ladder carries no consignments"));
-    }
-    parent_consignments[pc - 1] = draft.sp_consignment.clone();
     parent_seg.rgb = Some(ColoredLadder { consignments: parent_consignments, ..rgb_half.clone() });
 
+    // The `SP` co-signature is the unregenerable one: record it before touching a child.
+    journal.parent = parent_seg.clone();
+    journal.stage = SplitStage::Signed;
+    journal_write(cc, wallet_name, &journal).await?;
+    crash_point("after_colored_inladder_sp_sign");
+
     let mut bundles = Vec::with_capacity(draft.children.len());
-    for (cd, child_coin) in draft.children.iter().zip(child_coins.iter_mut()) {
-        let child_sid = child_coin
-            .statechain_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
-        if child_sid != cd.statechain_id {
-            return Err(anyhow::anyhow!(
-                "coloured split child coin is {child_sid} but the draft's child is {}",
-                cd.statechain_id
-            ));
-        }
+    for (j, (cd, child_coin)) in draft.children.iter().zip(child_coins.iter_mut()).enumerate() {
+        // Per TIER, not per child, and for the same reason the plain lane journals per tier: a
+        // re-run of a co-sign that already happened pushes the child's `num_sigs` past its census
+        // (`baseline + 2 + superseded`) and no receiver can ever adopt it.
         let x_signed = cosign_tier(
             cc,
             child_coin,
@@ -1947,6 +2045,17 @@ pub async fn cosign_colored_in_ladder_split(
             &draft.network,
         )
         .await?;
+        let child_extension = TesrTier {
+            txid: cd.extension.txid.clone(),
+            signed_tx: x_signed,
+            out_value: cd.extension.payload_value,
+            csv: Some(cd.csv_e),
+            payload_vout: cd.extension.payload_vout,
+        };
+        journal.children[j].extension = Some(child_extension.clone());
+        journal_write(cc, wallet_name, &journal).await?;
+        crash_point("after_colored_inladder_child_extension");
+
         let s_signed = cosign_tier(
             cc,
             child_coin,
@@ -1955,27 +2064,25 @@ pub async fn cosign_colored_in_ladder_split(
             &draft.network,
         )
         .await?;
+        let child_state = TesrTier {
+            txid: cd.state.txid.clone(),
+            signed_tx: s_signed,
+            out_value: cd.state.payload_value,
+            csv: Some(cd.csv_d),
+            payload_vout: cd.state.payload_vout,
+        };
+        journal.children[j].state = Some(child_state.clone());
+        journal_write(cc, wallet_name, &journal).await?;
+        crash_point("after_colored_inladder_child_state");
 
         bundles.push(ChildTesrBundle {
             parent: parent_seg.clone(),
             parent_statechain_id: parent_sid.clone(),
             sp_vout: cd.sp_vout,
-            child_statechain_id: child_sid,
+            child_statechain_id: child_sids[j].clone(),
             child_owner_exit_address: cd.owner_exit_address.clone(),
-            child_extension: TesrTier {
-                txid: cd.extension.txid.clone(),
-                signed_tx: x_signed,
-                out_value: cd.extension.payload_value,
-                csv: Some(cd.csv_e),
-                payload_vout: cd.extension.payload_vout,
-            },
-            child_state: TesrTier {
-                txid: cd.state.txid.clone(),
-                signed_tx: s_signed,
-                out_value: cd.state.payload_value,
-                csv: Some(cd.csv_d),
-                payload_vout: cd.state.payload_vout,
-            },
+            child_extension,
+            child_state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
             ancestors: vec![],
@@ -1990,7 +2097,503 @@ pub async fn cosign_colored_in_ladder_split(
             parent_flat_backups: parent_backups.clone(),
         });
     }
+    journal.stage = SplitStage::Established;
+    journal_write(cc, wallet_name, &journal).await?;
+
+    // [B4] CLOSED HERE, and deliberately — the one place this lane's journal differs from the plain
+    // lane's. `in_ladder_split` leaves its record OPEN on return and its SDK caller commits it after
+    // persisting and conveying, so the reader (`recover_in_ladder_splits`) can replay that window
+    // too. This lane's caller is the coloured token path, which does not commit, and a record left
+    // open after a SUCCESSFUL split is not a harmless loose end: the reader would replay a completed
+    // operation — re-booking the carrier as withdrawn, re-booking the change, and reporting pieces
+    // that were in fact conveyed as unconveyed, i.e. inviting a double send. A false replay is a
+    // worse failure than the window it would cover, so the record is closed the moment the
+    // unregenerable material is complete and handed back.
+    //
+    // What that leaves uncovered is the caller's own persist/convey step. The material is not lost
+    // there — the record is still on disk and `journal_find(op_id)` (which reads EVERY stage, not
+    // just open ones) rebuilds every bundle from it via `SplitJournalRecord::bundles`, with the
+    // `op_id` derivable from any surviving bundle through `split_op_id`. It is recoverable by an
+    // explicit call rather than automatically, which is a narrower and honest claim than the plain
+    // lane's, and it is a strict improvement on nothing on disk at all.
+    journal.stage = SplitStage::Committed;
+    journal_write(cc, wallet_name, &journal).await?;
     Ok(bundles)
+}
+
+// =================================================================================================
+// [P0-3] THE IN-LADDER SPLIT'S WRITE-AHEAD JOURNAL.
+//
+// THE DEFECT. `in_ladder_split` used to persist NOTHING. It terminalized the parent at the SE
+// (`set_spend_budget(..., 1)`), obtained the `SP` co-signature, then co-signed two tiers per child in
+// a loop — all in process memory — and the SDK persisted only on `Ok`. Any failure after the
+// terminalization (a dropped SE response, a killed process, a full disk) returned `Err` with the
+// parent PERMANENTLY terminal server-side and zero bundles on disk. Those signatures can never be
+// regenerated: the parent's budget is spent, so the SE will co-sign nothing further over it, and the
+// only surviving path for the whole coin is a unilateral exit of its own flat backup. The value is
+// not stolen, but every off-chain property of the coin is destroyed by a transient error.
+//
+// THE FIX, and why it is this shape. Same pattern as the coloured lane's `structural_spend_journal`
+// (`clients/libs/rust-sdk/src/tokens.rs`): a record written BEFORE the irreversible step and
+// advanced through named stages as each piece of unregenerable material is produced, plus a
+// `crash_point` fault injector so the durability claim can be proved by a real SIGABRT rather than
+// argued. Two deliberate differences:
+//
+//   * the record lives in the wallet's existing raw-backup KV (the same durable store `persist` and
+//     `persist_child` use, keyed `splitjrnl-<op_id>`) instead of a second table. This crate cannot
+//     see the SDK's table, and adding a table would mean editing `sqlite_manager`; the KV gives the
+//     identical durability (one sqlite transaction, `synchronous = FULL`) with no schema change.
+//   * it journals PER TIER, not per operation. A child's tiers are co-signed one at a time under the
+//     CHILD's key, and re-running a co-sign that already happened would push that child's `num_sigs`
+//     past the census (`baseline + 2 + superseded`) and brick it. Recording each tier as it lands is
+//     what makes replay exact instead of merely hopeful.
+// =================================================================================================
+
+/// Wallet-DB key prefix of an in-ladder split journal record.
+const SPLIT_JOURNAL_PREFIX: &str = "splitjrnl-";
+
+/// How far an in-ladder split got before it stopped.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitStage {
+    /// Plan written, nothing irreversible done yet: the parent is NOT terminal, so the whole
+    /// operation can simply be run again.
+    Planned,
+    /// The parent is terminal and `SP` is co-signed. From here the material is unregenerable and
+    /// recovery must REPLAY, never restart.
+    Signed,
+    /// Every child's ladder is co-signed; the bundles are complete and ready to be persisted/conveyed.
+    Established,
+    /// The caller persisted and conveyed the bundles. Terminal stage — nothing left to recover.
+    Committed,
+    /// Terminal stage for the irreducible window: the SE consumed the budget but this process never
+    /// recorded the co-signature, so `SP` can never be produced again. The coin's cooperative path is
+    /// gone and only a unilateral exit of its own backup recovers the value. Recorded — never
+    /// silently dropped — so the wallet can SAY so instead of looking idle.
+    Stranded,
+}
+
+impl SplitStage {
+    /// A stage that still needs the recovery reader's attention.
+    pub fn is_open(self) -> bool {
+        !matches!(self, SplitStage::Committed | SplitStage::Stranded)
+    }
+}
+
+/// A tier that has been BUILT but not yet co-signed, journalled verbatim so a replay can produce
+/// exactly it.
+///
+/// **[B4] Why the coloured lane needs this and the plain one does not.** A plain tier is a pure
+/// function of `(prev outpoint, value, address, csv, fee rate)`, all of which the record already
+/// holds, so `establish_child_journalled` simply rebuilds it. A COLOURED tier carries an RGB opret
+/// committing to a state transition produced by the engine, and the engine is not available on the
+/// recovery path (its resolver is `!Sync`, which is the entire reason colouring and co-signing are
+/// separate phases). Rebuilding is therefore impossible and the unsigned transaction itself is what
+/// must survive: a co-sign is a signature over THIS transaction, and re-deriving a different one
+/// would spend a census slot on a tier no receiver can chain to.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PendingTier {
+    pub txid: String,
+    /// The UNSIGNED transaction, exactly as the builder produced it.
+    pub tx_hex: String,
+    /// Value of the outpoint this tier spends — the amount its taproot key-spend sighash commits to,
+    /// so it must be journalled with the tier rather than re-derived on the recovery path.
+    pub prev_value: u64,
+    pub out_value: u64,
+    pub csv: u16,
+    pub payload_vout: u32,
+}
+
+/// One child of a journalled split. `extension`/`state` are filled in as each tier is co-signed, so a
+/// crash between the two is resumed by co-signing only the missing one.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SplitJournalChild {
+    pub statechain_id: String,
+    /// Model-A payee of this child's final state (the recipient's exit key, or ours for the change).
+    pub owner_exit_address: String,
+    pub value: u64,
+    /// Which `SP`/`CSP` output funds this child.
+    pub sp_vout: u32,
+    pub extension: Option<TesrTier>,
+    pub state: Option<TesrTier>,
+    /// **[B4/CTES-R]** This child's coloured half — contract, its share of the allocation, and the
+    /// consignments for its own two tiers. `None` on the plain lanes. Known at PLAN time (the draft
+    /// is built and validated before anything is co-signed), so a replay reconstructs a coloured
+    /// child bundle complete with its proofs rather than a sats-only stub that would be conveyed with
+    /// the allocation silently unaccounted for.
+    #[serde(default)]
+    pub rgb: Option<ColoredChild>,
+    /// **[B4]** The child's pre-built, un-co-signed tiers (coloured lane only — see [`PendingTier`]).
+    #[serde(default)]
+    pub pending_extension: Option<PendingTier>,
+    #[serde(default)]
+    pub pending_state: Option<PendingTier>,
+}
+
+/// The durable plan + co-signed material of ONE in-ladder split.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SplitJournalRecord {
+    pub op_id: String,
+    /// `"in_ladder_split"` (root parent) or `"child_in_ladder_split"` (a received child).
+    pub lane: String,
+    pub stage: SplitStage,
+    /// The coin this split terminalizes — the root parent, or the child being re-split.
+    pub terminalized_statechain_id: String,
+    /// The ROOT parent segment as the children will see it (`SP` installed as the current state once
+    /// the stage is `Signed`).
+    pub parent: TesrBundle,
+    pub parent_statechain_id: String,
+    /// Intermediate segments for the children (empty on the root lane; the just-split child's own
+    /// segment on the child lane).
+    pub ancestors: Vec<ChildSegment>,
+    pub parent_flat_backups: Vec<mercurylib::wallet::BackupTx>,
+    pub children: Vec<SplitJournalChild>,
+    /// Tier CSVs the children's ladders are built with (so a replay reproduces them exactly).
+    pub child_ext_csv: u16,
+    pub child_state_csv: u16,
+    pub fee_rate: f64,
+    pub network: String,
+    /// txid of the split state (`SP`/`CSP`) the children are funded by.
+    pub sp_txid: String,
+}
+
+impl SplitJournalRecord {
+    /// Rebuild the split's conveyable bundles. `Err` if any child is still incomplete — a caller must
+    /// finish it (see [`resume_in_ladder_split`]) rather than convey a half-built ladder.
+    pub fn bundles(&self) -> Result<Vec<ChildTesrBundle>> {
+        self.children
+            .iter()
+            .map(|c| {
+                let (ext, st) = match (&c.extension, &c.state) {
+                    (Some(e), Some(s)) => (e.clone(), s.clone()),
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "journalled child {} has no complete ladder yet",
+                            c.statechain_id
+                        ))
+                    }
+                };
+                Ok(ChildTesrBundle {
+                    parent: self.parent.clone(),
+                    parent_statechain_id: self.parent_statechain_id.clone(),
+                    sp_vout: c.sp_vout,
+                    child_statechain_id: c.statechain_id.clone(),
+                    child_owner_exit_address: c.owner_exit_address.clone(),
+                    child_extension: ext,
+                    child_state: st,
+                    child_superseded_states: vec![],
+                    child_superseded_extensions: vec![],
+                    ancestors: self.ancestors.clone(),
+                    // [B4] The coloured lane journals its children's allocations and proofs, so a
+                    // record replayed from disk rebuilds a COLOURED child when that is what was
+                    // carved. `None` on the two plain lanes, where it always was.
+                    rgb: c.rgb.clone(),
+                    parent_flat_backups: self.parent_flat_backups.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// FAULT INJECTION for the crash-recovery test, debug builds ONLY.
+///
+/// A durability claim can only be proved by really killing the process at the instant in question —
+/// an early `return` proves nothing about what reached the disk. Fires only when the operator sets
+/// `UTEXO_CRASH_POINT` to this exact point name, and is compiled out of release builds entirely.
+/// (Deliberately identical to the coloured lane's injector in `tokens.rs` — same contract, same
+/// SIGABRT: no unwinding, no `Drop`, no flush.)
+#[cfg(debug_assertions)]
+fn crash_point(name: &str) {
+    if std::env::var("UTEXO_CRASH_POINT").as_deref() == std::result::Result::Ok(name) {
+        eprintln!("UTEXO_CRASH_POINT={name}: aborting to exercise in-ladder split recovery");
+        std::process::abort();
+    }
+}
+#[cfg(not(debug_assertions))]
+fn crash_point(_name: &str) {}
+
+/// Commit a journal record at its current stage. **Durable on return** — that is the entire point of
+/// the write-ahead ordering, so every caller must `?` it and none may treat a write failure as a
+/// warning.
+pub async fn journal_write(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    rec: &SplitJournalRecord,
+) -> Result<()> {
+    let json = serde_json::to_string(rec)?;
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("{SPLIT_JOURNAL_PREFIX}{}", rec.op_id),
+        &json,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "in-ladder split journal write failed at stage {:?} ({e}) — refusing to continue, \
+             because the next step produces signatures that could never be regenerated",
+            rec.stage
+        )
+    })
+}
+
+/// Every in-ladder split of this wallet that stopped before it was committed, i.e. THE recovery
+/// reader's input. A row that cannot be decoded is an ERROR, never a silently skipped entry — an
+/// unreadable journal is exactly the "failure looks like idle" shape this journal exists to kill.
+pub async fn journal_open_splits(
+    cc: &ClientConfig,
+    wallet_name: &str,
+) -> Result<Vec<SplitJournalRecord>> {
+    let mut out = Vec::new();
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if !k.starts_with(SPLIT_JOURNAL_PREFIX) {
+            continue;
+        }
+        let rec: SplitJournalRecord = serde_json::from_str(&json).map_err(|e| {
+            anyhow::anyhow!("unreadable in-ladder split journal row {k}: {e}")
+        })?;
+        if rec.stage.is_open() {
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
+/// One journal record by `op_id`, at ANY stage (including the terminal ones). Used by a caller that
+/// finished recovery and still needs the rebuilt material — e.g. to convey a piece whose payment the
+/// crash interrupted.
+pub async fn journal_find(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    op_id: &str,
+) -> Result<Option<SplitJournalRecord>> {
+    let key = format!("{SPLIT_JOURNAL_PREFIX}{op_id}");
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if k == key {
+            return Ok(Some(serde_json::from_str(&json).map_err(|e| {
+                anyhow::anyhow!("unreadable in-ladder split journal row {k}: {e}")
+            })?));
+        }
+    }
+    Ok(None)
+}
+
+/// Every journal record of the splits that consumed `terminalized_statechain_id`, at ANY stage.
+/// The audit view: what this wallet did to that coin, and what it produced.
+pub async fn journal_records_for(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    terminalized_statechain_id: &str,
+) -> Result<Vec<SplitJournalRecord>> {
+    let mut out = Vec::new();
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if !k.starts_with(SPLIT_JOURNAL_PREFIX) {
+            continue;
+        }
+        let rec: SplitJournalRecord = serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("unreadable in-ladder split journal row {k}: {e}"))?;
+        if rec.terminalized_statechain_id == terminalized_statechain_id {
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
+/// Move a journalled split to a terminal stage. `journal_commit` is called by the caller that has
+/// PERSISTED and CONVEYED the bundles — never by the split itself: until they are on disk the
+/// operation is still recoverable.
+pub async fn journal_close(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    op_id: &str,
+    stage: SplitStage,
+) -> Result<()> {
+    let mut open = journal_open_splits(cc, wallet_name).await?;
+    if let Some(rec) = open.iter_mut().find(|r| r.op_id == op_id) {
+        rec.stage = stage;
+        journal_write(cc, wallet_name, rec).await?;
+    }
+    Ok(())
+}
+
+/// [`journal_close`] at [`SplitStage::Committed`].
+pub async fn journal_commit(cc: &ClientConfig, wallet_name: &str, op_id: &str) -> Result<()> {
+    journal_close(cc, wallet_name, op_id, SplitStage::Committed).await
+}
+
+/// Co-sign the one child ladder of a journalled split, RESUMING from whatever already landed.
+///
+/// The difference from [`establish_child`] is the journal: each tier is written the instant it comes
+/// back from the SE, and a tier already recorded is reused rather than re-signed. Re-signing would be
+/// silently fatal — the child's `num_sigs` would exceed `CHILD_V2_BASELINE + tiers + superseded` and
+/// no receiver could ever adopt it.
+async fn establish_child_journalled(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &mut Coin,
+    rec: &mut SplitJournalRecord,
+    j: usize,
+) -> Result<ChildLadder> {
+    let (sp_txid, csv_e, csv_d, fee_rate, network) = (
+        rec.sp_txid.clone(),
+        rec.child_ext_csv,
+        rec.child_state_csv,
+        rec.fee_rate,
+        rec.network.clone(),
+    );
+    let (sp_vout, value, owner_exit_address) = {
+        let c = &rec.children[j];
+        (c.sp_vout, c.value, c.owner_exit_address.clone())
+    };
+    let agg = child_coin
+        .aggregated_address
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))?;
+
+    // Extension over SP.out[j], under the child's aggregate.
+    //
+    // [B4] A journalled PENDING tier wins over rebuilding: on the coloured lane the transaction
+    // carries an RGB opret this path cannot reproduce (no engine here), so the record holds the
+    // unsigned tx and the co-sign is taken over exactly it. On the plain lanes there is no pending
+    // tier and the tier is rebuilt as before — deterministically, from the same inputs.
+    let extension = match rec.children[j].extension.clone() {
+        Some(t) => t,
+        None => {
+            let (tx_hex, txid, out_value, csv, payload_vout, prev_value) =
+                match rec.children[j].pending_extension.clone() {
+                    Some(p) => (p.tx_hex, p.txid, p.out_value, p.csv, p.payload_vout, p.prev_value),
+                    None => {
+                        let x = mercurylib::tesr::build_extension_from(
+                            &sp_txid, sp_vout, value, &agg, &network, csv_e, fee_rate,
+                        )?;
+                        (x.tx_hex, x.txid, x.out_value, csv_e, x.payload_vout, value)
+                    }
+                };
+            let x_signed = cosign_tier(cc, child_coin, tx_hex, prev_value, &network).await?;
+            let tier = TesrTier {
+                txid,
+                signed_tx: x_signed,
+                out_value,
+                csv: Some(csv),
+                payload_vout,
+            };
+            rec.children[j].extension = Some(tier.clone());
+            journal_write(cc, wallet_name, rec).await?;
+            crash_point("after_inladder_child_extension");
+            tier
+        }
+    };
+
+    // Owner state over the extension's payload output, paying the Model-A payee.
+    let state = match rec.children[j].state.clone() {
+        Some(t) => t,
+        None => {
+            let (tx_hex, txid, out_value, csv, payload_vout, prev_value) =
+                match rec.children[j].pending_state.clone() {
+                    Some(p) => (p.tx_hex, p.txid, p.out_value, p.csv, p.payload_vout, p.prev_value),
+                    None => {
+                        let s = mercurylib::tesr::build_state_from(
+                            &extension.txid,
+                            extension.payload_vout,
+                            extension.out_value,
+                            &owner_exit_address,
+                            &network,
+                            csv_d,
+                            fee_rate,
+                        )?;
+                        (s.tx_hex, s.txid, s.out_value, csv_d, s.payload_vout, extension.out_value)
+                    }
+                };
+            let s_signed = cosign_tier(cc, child_coin, tx_hex, prev_value, &network).await?;
+            let tier = TesrTier {
+                txid,
+                signed_tx: s_signed,
+                out_value,
+                csv: Some(csv),
+                payload_vout,
+            };
+            rec.children[j].state = Some(tier.clone());
+            journal_write(cc, wallet_name, rec).await?;
+            crash_point("after_inladder_child_state");
+            tier
+        }
+    };
+
+    Ok(ChildLadder { extension, state })
+}
+
+/// **THE RECOVERY READER.** Finish an in-ladder split that a crash interrupted, and return its
+/// conveyable bundles.
+///
+/// `child_coins` supplies the (SE-registered, wallet-owned) coin for every journalled child that
+/// still needs a tier; a child whose ladder is already complete needs none. Fails CLOSED: a child
+/// that is unfinished and whose coin was not supplied is an error, never a bundle quietly omitted.
+///
+/// A `Planned` record is NOT replayed here — nothing irreversible had happened when it was written,
+/// so the caller re-runs the whole split instead (see [`split_is_retryable`]).
+pub async fn resume_in_ladder_split(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    rec: &mut SplitJournalRecord,
+    child_coins: &mut [(String, Coin)],
+) -> Result<Vec<ChildTesrBundle>> {
+    if rec.stage == SplitStage::Planned {
+        return Err(anyhow::anyhow!(
+            "in-ladder split {} stopped before the parent was terminalized — it must be RE-RUN, not \
+             replayed (replaying would produce a second SP)",
+            rec.op_id
+        ));
+    }
+    for j in 0..rec.children.len() {
+        if rec.children[j].extension.is_some() && rec.children[j].state.is_some() {
+            continue;
+        }
+        let sid = rec.children[j].statechain_id.clone();
+        let coin = child_coins
+            .iter_mut()
+            .find(|(id, _)| *id == sid)
+            .map(|(_, c)| c)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot resume in-ladder split {}: child {sid} has an incomplete ladder and its \
+                     coin was not supplied — refusing to return a bundle set that silently omits it",
+                    rec.op_id
+                )
+            })?;
+        establish_child_journalled(cc, wallet_name, coin, rec, j).await?;
+    }
+    rec.stage = SplitStage::Established;
+    journal_write(cc, wallet_name, rec).await?;
+    rec.bundles()
+}
+
+/// The journal `op_id` of the split that produced this bundle — deterministic, so a caller that
+/// holds only the returned bundles can commit (or look up) the journal record without the split
+/// having to hand back an extra value.
+pub fn split_op_id(cb: &ChildTesrBundle) -> String {
+    match cb.ancestors.last() {
+        None => format!(
+            "in_ladder_split:{}:{}",
+            cb.parent_statechain_id,
+            cb.parent.current().state.txid
+        ),
+        Some(seg) => format!(
+            "child_in_ladder_split:{}:{}",
+            seg.statechain_id, seg.state.txid
+        ),
+    }
+}
+
+/// Is a stopped split safe to simply run again? True only for a `Planned` record whose terminalized
+/// coin is confirmed NOT terminal at the SE — i.e. the co-signature provably never happened.
+/// Mirrors the coloured lane's `classify_prepared`, and fails CLOSED: an SE that cannot be read
+/// yields `Err`, never a hopeful `true`.
+pub async fn split_is_retryable(cc: &ClientConfig, rec: &SplitJournalRecord) -> Result<bool> {
+    if rec.stage != SplitStage::Planned {
+        return Ok(false);
+    }
+    let (_, _, terminal) =
+        crate::lightning_latch::get_spend_budget(cc, &rec.terminalized_statechain_id).await?;
+    Ok(!terminal)
 }
 
 /// [in-ladder split] The production sender for an in-ladder split (B1 fix, PROTOCOL.md §5.4). Builds
@@ -2027,6 +2630,9 @@ pub async fn in_ladder_split(
     if n == 0 {
         return Err(anyhow::anyhow!("in-ladder split needs at least one child"));
     }
+    // [P0-2] A root split mints depth-1 children. Normally admissible, but not if the deployed epoch
+    // is too short for even one level — check rather than assume.
+    enforce_split_depth_cap(cc, p, 1).await?;
     // Value conservation — no mint, no burn (build_split_state re-checks, but fail early with context).
     let total = mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
         .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?;
@@ -2091,7 +2697,54 @@ pub async fn in_ladder_split(
         ));
     }
 
+    // [P0-3] WRITE AHEAD, THEN TERMINALIZE. Everything below `set_spend_budget` produces material the
+    // SE will never re-issue; if this record is not on disk first, a crash anywhere in the rest of
+    // this function leaves the parent terminal with nothing to show for it and the coin exit-only
+    // forever. The plan is complete here: `SP` is fully determined (its txid is fixed before the
+    // signature), and each child's tiers are appended as they land.
+    let mut journal = SplitJournalRecord {
+        op_id: format!("in_ladder_split:{parent_sid}:{}", sp.txid),
+        lane: "in_ladder_split".to_string(),
+        stage: SplitStage::Planned,
+        terminalized_statechain_id: parent_sid.clone(),
+        parent: bundle.clone(),
+        parent_statechain_id: parent_sid.clone(),
+        ancestors: vec![],
+        parent_flat_backups: parent_backups.clone(),
+        children: children
+            .iter()
+            .enumerate()
+            .map(|(j, (c, recipient, value))| {
+                Ok(SplitJournalChild {
+                    statechain_id: c
+                        .statechain_id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
+                    owner_exit_address: recipient.clone(),
+                    value: *value,
+                    // Child `j` lives at SP's j-th PAYLOAD output, not positional `j` (a coloured SP
+                    // carries the opret at index 0 and shifts every child by one).
+                    sp_vout: sp.payload_vout + j as u32,
+                    extension: None,
+                    state: None,
+                    // The PLAIN lane: no allocation, and every tier is rebuildable from this record
+                    // without an engine, so nothing pre-built needs to be carried.
+                    rgb: None,
+                    pending_extension: None,
+                    pending_state: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        child_ext_csv: p.ext_csv(0),
+        child_state_csv: p.state_csv(0),
+        fee_rate: bundle.fee_rate,
+        network: bundle.network.clone(),
+        sp_txid: sp.txid.clone(),
+    };
+    journal_write(cc, wallet_name, &journal).await?;
+
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
+    crash_point("after_inladder_terminalize");
     let sp_signed = cosign_tier(cc, parent_coin, sp.tx_hex.clone(), x_m.out_value, &bundle.network).await?;
 
     // Parent segment shared by every child bundle: SP is the current (terminal) state; S_0 superseded.
@@ -2105,18 +2758,18 @@ pub async fn in_ladder_split(
         csv: Some(sp_csv),
         payload_vout: sp.payload_vout,
     };
+    // The `SP` co-signature is the unregenerable one: record it before touching a child.
+    journal.parent = parent_seg.clone();
+    journal.stage = SplitStage::Signed;
+    journal_write(cc, wallet_name, &journal).await?;
+    crash_point("after_inladder_sp_sign");
 
     // Each child: headless ladder off SP.out[j], paying its recipient (Model A).
     let mut bundles = Vec::with_capacity(n);
     for (j, (child_coin, recipient, value)) in children.iter_mut().enumerate() {
-        // Child `j` lives at SP's j-th PAYLOAD output, not positional `j` (a coloured SP carries the
-        // opret at index 0 and shifts every child by one).
-        let child_vout = sp.payload_vout + j as u32;
-        let ladder = establish_child(
-            cc, child_coin, &sp.txid, child_vout, *value, recipient,
-            p.ext_csv(0), p.state_csv(0), bundle.fee_rate, &bundle.network,
-        )
-        .await?;
+        let child_vout = journal.children[j].sp_vout;
+        debug_assert_eq!(*value, journal.children[j].value); // journalled above, and read from the record
+        let ladder = establish_child_journalled(cc, wallet_name, child_coin, &mut journal, j).await?;
         let child_sid = child_coin
             .statechain_id
             .clone()
@@ -2150,6 +2803,11 @@ pub async fn in_ladder_split(
             parent_flat_backups: parent_backups.clone(),
         });
     }
+    // Complete: the bundles exist and are rebuildable from disk. The caller marks the record
+    // COMMITTED (`journal_commit`) only once it has persisted/conveyed them — a crash in the window
+    // between this return and that persistence is still recoverable, which is the whole point.
+    journal.stage = SplitStage::Established;
+    journal_write(cc, wallet_name, &journal).await?;
     Ok(bundles)
 }
 
@@ -2190,6 +2848,62 @@ pub async fn load(cc: &ClientConfig, wallet_name: &str, statechain_id: &str) -> 
         }
     }
     Ok(None)
+}
+
+/// **[P0-2] THE DEPTH CAP.** Refuse a split that would mint a child too deep to survive one funding
+/// epoch, derived from the LIVE schedule and the SE's live `lockheight_init` — never a literal.
+///
+/// Depth grows by exactly +1 per in-ladder payment and never resets (a child cannot be re-anchored:
+/// `refresh()` routes a `ctesr-` coin to `unilateral_exit`, because `SP.out[j]` is un-broadcast and
+/// there is no confirmed outpoint to co-operatively spend). Exit latency compounds with it —
+/// `2124·d + 2160` blocks on the mainnet schedule — so past some depth the exit no longer fits in
+/// the `lockheight_init`-block epoch at all: the coin can never be parked across an epoch boundary,
+/// and every receiver's [`verify_conveyed_child`] would refuse it for the whole of every epoch. That
+/// coin must not be minted in the first place, while the parent is still whole and spendable.
+///
+/// `new_depth` is the depth of the child the split is about to create (a root split child is 1).
+async fn enforce_split_depth_cap(
+    cc: &ClientConfig,
+    p: mercurylib::tesr::TesrParams,
+    new_depth: u32,
+) -> Result<()> {
+    // Fail CLOSED: an unreadable epoch is a refusal, not an assumed-generous default.
+    let info = crate::utils::info_config(cc).await.map_err(|e| {
+        anyhow::anyhow!(
+            "in-ladder split refused: the SE's funding-epoch length (`lockheight_init`) could not be \
+             read ({e}), so the exit-latency cap on split depth cannot be evaluated — refusing rather \
+             than minting a child that may be unmaterialisable"
+        )
+    })?;
+    let epoch_blocks = info.initlock;
+    // A depth-1 exit chain and the cost of one further level, both from the live schedule:
+    //   T (no timelock) | X_m E0 | SP D0−δ | ext_child E0 | state_child D0
+    // and each extra level adds its own extension + split state.
+    let base = vec![
+        None,
+        Some(p.ext_csv(0)),
+        Some(p.state_csv(1)),
+        Some(p.ext_csv(0)),
+        Some(p.state_csv(0)),
+    ];
+    let per_level = vec![Some(p.ext_csv(0)), Some(p.state_csv(1))];
+    let max_depth = mercurylib::transfer::receiver::max_split_depth(&base, &per_level, epoch_blocks);
+    if new_depth > max_depth {
+        let mut chain = base.clone();
+        for _ in 1..new_depth {
+            chain.splice(3..3, per_level.iter().cloned());
+        }
+        return Err(anyhow::anyhow!(
+            "{}",
+            mercurylib::transfer::receiver::SplitDepthCapExceeded {
+                depth: new_depth,
+                max_depth,
+                required: mercurylib::transfer::receiver::exit_wait_blocks(&chain),
+                epoch_blocks,
+            }
+        ));
+    }
+    Ok(())
 }
 
 /// Flat-backup **MINIMUM** of a natively-laddered on-chain PARENT coin. `sig_count` starts at 0
@@ -2255,9 +2969,105 @@ pub async fn child_claim_sids(cc: &ClientConfig, wallet_name: &str) -> Result<st
     Ok(set)
 }
 
+/// **[B1] The relative timelock a SIGNED tier actually carries**, read off its `nSequence` under
+/// BIP-68 — the only copy of that number Bitcoin will ever enforce, and therefore the only one a
+/// verifier may compute with.
+///
+/// `Ok(None)` means the relative lock is DISABLED (bit 31 set — the trigger's
+/// `mercurylib::tesr::TRIGGER_SEQUENCE`). A time-denominated lock (bit 22 set) is a refusal, not a
+/// zero: this schedule is expressed entirely in blocks, so a tier that waits in 512-second units
+/// cannot be placed on the exit timeline at all and must never be silently counted as costing
+/// nothing.
+fn signed_relative_csv(
+    tx: &electrum_client::bitcoin::Transaction,
+    what: &str,
+) -> Result<Option<u16>> {
+    let seq = tx
+        .input
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("{what}: has no input, so it carries no timelock to read"))?
+        .sequence
+        .0;
+    if seq & (1 << 31) != 0 {
+        return Ok(None);
+    }
+    if seq & (1 << 22) != 0 {
+        return Err(anyhow::anyhow!(
+            "{what}: nSequence encodes a 512-second BIP-68 lock, which this block-denominated exit \
+             schedule cannot express — refusing rather than counting it as no wait at all"
+        ));
+    }
+    Ok(Some(seq as u16))
+}
+
+/// Human names for [`child_exit_chain`]'s entries, in the same order, so a refusal can say WHICH tier
+/// lied. Derived from the same three loops the chain itself is built from; a length disagreement is a
+/// programming error and is caught by the caller rather than papered over with an index.
+fn child_exit_labels(cb: &ChildTesrBundle) -> Vec<String> {
+    let mut v = vec!["parent trigger".to_string()];
+    for l in 0..cb.parent.levels.len() {
+        v.push(format!("parent level {l} extension"));
+        v.push(format!("parent level {l} state"));
+    }
+    for i in 0..cb.ancestors.len() {
+        v.push(format!("ancestor {i} extension"));
+        v.push(format!("ancestor {i} state"));
+    }
+    v.push("child extension".to_string());
+    v.push("child state".to_string());
+    v
+}
+
+/// **[B1] The child's exit chain with every timelock BOUND to the signature that enforces it** — the
+/// only form of the chain an admission decision may be computed from.
+///
+/// [`child_exit_chain`] reports each tier's `csv` FIELD, which on a conveyed bundle is plain
+/// attacker-supplied serde. This parses every tier instead, reads the timelock from `nSequence`, and
+/// refuses (`DeclaredCsvMismatch`) if the two disagree — so the exit-headroom gate can no longer be
+/// handed a schedule of the sender's choosing, and a sender who declares `csv: 1` on a tier the SE
+/// co-signed at 2 124 is refused by name instead of admitted at 1.
+///
+/// The returned timelocks are the SIGNED ones.
+pub fn child_exit_chain_bound(cb: &ChildTesrBundle) -> Result<Vec<(String, Option<u16>)>> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let declared = child_exit_chain(cb);
+    let labels = child_exit_labels(cb);
+    if labels.len() != declared.len() {
+        return Err(anyhow::anyhow!(
+            "internal: exit chain has {} tiers but {} labels — refusing to verify a chain this code \
+             cannot describe",
+            declared.len(),
+            labels.len()
+        ));
+    }
+    let mut bound = Vec::with_capacity(declared.len());
+    for (i, (signed_hex, declared_csv)) in declared.into_iter().enumerate() {
+        let what = &labels[i];
+        let raw = hex::decode(&signed_hex)
+            .map_err(|e| anyhow::anyhow!("{what}: signed tx hex does not decode ({e})"))?;
+        let tx: Transaction = deserialize(&raw)
+            .map_err(|e| anyhow::anyhow!("{what}: signed tx does not parse ({e})"))?;
+        let signed_csv = signed_relative_csv(&tx, what)?;
+        let csv = mercurylib::transfer::receiver::bind_declared_csv(
+            i,
+            what,
+            declared_csv,
+            signed_csv,
+        )?;
+        bound.push((signed_hex, csv));
+    }
+    Ok(bound)
+}
+
 /// The full unilateral-exit chain of a split child, in broadcast order:
 /// `T -> X_m -> SP` (parent segment) then `ext_child -> state_child`. Each entry is
 /// `(signed_tx_hex, relative_csv)` — the trigger has no CSV.
+///
+/// ⚠️ **[B1] The `csv` here is the bundle's DECLARED field**, which on conveyed material is
+/// attacker-supplied. It is safe for the two broadcast-side callers below (they either ignore it or
+/// use it as a wait-time hint about the caller's OWN persisted bundle) and it is NOT safe for any
+/// admission decision. Anything that computes a requirement, a deadline or a cap from these
+/// timelocks must use [`child_exit_chain_bound`], which reads them from the signed transactions.
 pub fn child_exit_chain(cb: &ChildTesrBundle) -> Vec<(String, Option<u16>)> {
     let mut chain: Vec<(String, Option<u16>)> =
         cb.parent.exit_tiers().iter().map(|t| (t.signed_tx.clone(), t.csv)).collect();
@@ -2314,9 +3124,14 @@ pub fn exit_child_pass(electrum: &electrum_client::Client, cb: &ChildTesrBundle)
 /// The relative-CSV of the first child-exit tier not yet on-chain (a wait-time hint), or `Ok(None)`
 /// once the child exit is complete. Mirrors [`next_exit_tier`] for a split child chain, including
 /// its fail-closed contract: **`Err` = blind**, never a fabricated wait time.
+///
+/// [B1] The hint is the SIGNED timelock ([`child_exit_chain_bound`]), not the declared one: a wait
+/// time a watchtower schedules against is exactly the kind of number that must not be quotable by
+/// whoever sent the bundle, and a stored row whose two copies disagree is corruption to report, not
+/// to average over.
 pub fn next_child_exit_tier(electrum: &electrum_client::Client, cb: &ChildTesrBundle) -> Result<Option<u16>> {
     use electrum_client::bitcoin::{consensus::deserialize, Transaction};
-    for (signed, csv) in child_exit_chain(cb) {
+    for (signed, csv) in child_exit_chain_bound(cb)? {
         let raw = hex::decode(&signed)
             .map_err(|e| anyhow::anyhow!("child exit chain carries unusable signed tx hex: {e}"))?;
         let txid = deserialize::<Transaction>(&raw)
@@ -2390,7 +3205,7 @@ pub async fn verify_conveyed_child(
             parent_backups.len()
         ));
     }
-    {
+    let (epoch_expiry_height, tip) = {
         use electrum_client::bitcoin::consensus::{deserialize, serialize};
         for (i, b) in parent_backups.iter().enumerate() {
             let tx: electrum_client::bitcoin::Transaction =
@@ -2425,7 +3240,11 @@ pub async fn verify_conveyed_child(
         } else {
             info_config.fee_rate_sats_per_byte
         };
-        mercurylib::transfer::receiver::validate_backup_chain_v2(
+        // The RETURN VALUE is load-bearing, not a formality: it is the LOWEST locktime of the
+        // validated chain, i.e. the first height at which the parent's current owner (the sender of
+        // this child) can broadcast a flat backup that spends `F` and voids the entire tree. That is
+        // this coin's epoch expiry, and it is the only absolute clock anywhere in the structure.
+        let lowest_locktime = mercurylib::transfer::receiver::validate_backup_chain_v2(
             parent_backups,
             &hex::encode(serialize(&f_tx)),
             blockheight,
@@ -2437,7 +3256,42 @@ pub async fn verify_conveyed_child(
         .map_err(|e| {
             anyhow::anyhow!("conveyed parent flat backup chain is invalid ({e}) — the ancestor census term is unusable")
         })?;
-    }
+        (lowest_locktime, blockheight)
+    };
+
+    // [P0-1] EXIT-HEADROOM ADMISSION GATE. Until this existed, the only bound on a conveyed child
+    // was `lock_time > tip` inside `validate_backup_chain_v2` above — so a sender could hand over a
+    // coin whose exit provably could not complete inside the epoch it was minted in, and for the
+    // last `WAIT(d)` blocks of every epoch (43% of it at mainnet depth 1) that was every coin they
+    // sent. The census balanced, Model A held, and the coin was worthless.
+    //
+    // The requirement is read off THIS bundle's own exit chain — its real depth (`ancestors`) and the
+    // CSVs actually co-signed into its tiers — so it tracks the live schedule with no constant to go
+    // stale. See `mercurylib::transfer::receiver`'s module note for why the whole chain must fit and
+    // not merely the trigger.
+    //
+    // [B1] EVERY TERM IS RECEIVER-DERIVED. The gate was bypassable for as long as it read the CSVs
+    // from `TesrTier::csv`, a plain serde field on the conveyed bundle: declare `csv: 1` everywhere
+    // and the requirement collapses to a handful of blocks while the chain still enforces thousands.
+    // `child_exit_chain_bound` reads each timelock from the SIGNED transaction's `nSequence` and
+    // refuses any bundle whose declared schedule contradicts its own signatures. The other two terms
+    // were already ours: `tip` comes from this wallet's chain backend, and `epoch_expiry_height` is
+    // the lowest locktime of a flat backup chain just validated against the on-chain `F` — every
+    // entry signature-verified under `F`'s key, prevout-pinned, INV-5 strictly decrementing, capped
+    // at `tip + lockheight_init` by `verify_if_locktime_is_reasonable_tx_version_and_output_size`
+    // (so it cannot be inflated past one epoch) and its COUNT pinned by the exact-equality census
+    // below (so low entries cannot be dropped to raise the minimum). The chain's LENGTH is likewise
+    // not free: `verify_child_bundle` links every tier to its parent's outpoint, so a segment cannot
+    // be omitted to shorten the walk without breaking the funding chain outright.
+    let exit_csvs: Vec<Option<u16>> =
+        child_exit_chain_bound(cb)?.into_iter().map(|(_, csv)| csv).collect();
+    mercurylib::transfer::receiver::check_exit_headroom(&exit_csvs, tip, epoch_expiry_height)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "conveyed child refused at depth {}: {e}",
+                cb.ancestors.len() + 1
+            )
+        })?;
 
     let p_info = crate::utils::get_statechain_info(&cb.parent_statechain_id, cc)
         .await?
@@ -2518,6 +3372,11 @@ pub async fn child_in_ladder_split(
     if n == 0 {
         return Err(anyhow::anyhow!("a child split needs at least one grandchild"));
     }
+    // [P0-2] THE DEPTH CAP. `cb` sits at depth `ancestors.len() + 1`; splitting it pushes `cb`'s own
+    // segment into `ancestors`, so every grandchild lands one level deeper. Checked BEFORE anything
+    // irreversible (the child's terminalization is two statements below): a refusal here leaves the
+    // child whole, spendable and re-transferable.
+    enforce_split_depth_cap(cc, p, cb.ancestors.len() as u32 + 2).await?;
     let old_csv = cb
         .child_state
         .csv
@@ -2565,7 +3424,51 @@ pub async fn child_in_ladder_split(
         .statechain_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?;
+
+    // [P0-3] WRITE AHEAD, THEN TERMINALIZE — identical contract to `in_ladder_split`; this lane has
+    // the same defect and now shares the same journal. The record is complete before the child's
+    // budget is consumed, so a crash anywhere below is replayed rather than lost.
+    let mut journal = SplitJournalRecord {
+        op_id: format!("child_in_ladder_split:{child_sid}:{}", csp.txid),
+        lane: "child_in_ladder_split".to_string(),
+        stage: SplitStage::Planned,
+        terminalized_statechain_id: child_sid.clone(),
+        parent: cb.parent.clone(),
+        parent_statechain_id: cb.parent_statechain_id.clone(),
+        // Filled in once CSP is co-signed (the child's own segment carries CSP as its state).
+        ancestors: cb.ancestors.clone(),
+        parent_flat_backups: cb.parent_flat_backups.clone(),
+        children: children
+            .iter()
+            .enumerate()
+            .map(|(j, (c, recipient, value))| {
+                Ok(SplitJournalChild {
+                    statechain_id: c
+                        .statechain_id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("grandchild coin has no statechain_id"))?,
+                    owner_exit_address: recipient.clone(),
+                    value: *value,
+                    sp_vout: csp.payload_vout + j as u32,
+                    extension: None,
+                    state: None,
+                    // The PLAIN child lane — see the root lane's note.
+                    rgb: None,
+                    pending_extension: None,
+                    pending_state: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        child_ext_csv: p.ext_csv(0),
+        child_state_csv: p.state_csv(0),
+        fee_rate: cb.parent.fee_rate,
+        network: cb.parent.network.clone(),
+        sp_txid: csp.txid.clone(),
+    };
+    journal_write(cc, wallet_name, &journal).await?;
+
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &child_sid, 1).await?;
+    crash_point("after_inladder_terminalize");
     let csp_signed = cosign_tier(
         cc,
         child_coin,
@@ -2593,15 +3496,18 @@ pub async fn child_in_ladder_split(
         superseded_states: seg_superseded,
         superseded_extensions: cb.child_superseded_extensions.clone(),
     };
+    // CSP is the unregenerable co-signature on this lane: record the completed ancestor segment
+    // (which carries it) before touching a grandchild.
+    journal.ancestors.push(child_segment.clone());
+    journal.stage = SplitStage::Signed;
+    journal_write(cc, wallet_name, &journal).await?;
+    crash_point("after_inladder_sp_sign");
 
     let mut bundles = Vec::with_capacity(n);
     for (j, (gc_coin, recipient, value)) in children.iter_mut().enumerate() {
-        let gc_vout = csp.payload_vout + j as u32;
-        let ladder = establish_child(
-            cc, gc_coin, &csp.txid, gc_vout, *value, recipient,
-            p.ext_csv(0), p.state_csv(0), cb.parent.fee_rate, &cb.parent.network,
-        )
-        .await?;
+        let gc_vout = journal.children[j].sp_vout;
+        debug_assert_eq!(*value, journal.children[j].value); // journalled above, and read from the record
+        let ladder = establish_child_journalled(cc, wallet_name, gc_coin, &mut journal, j).await?;
         let gc_sid = gc_coin
             .statechain_id
             .clone()
@@ -2630,6 +3536,8 @@ pub async fn child_in_ladder_split(
             parent_flat_backups: cb.parent_flat_backups.clone(),
         });
     }
+    journal.stage = SplitStage::Established;
+    journal_write(cc, wallet_name, &journal).await?;
     Ok(bundles)
 }
 
@@ -3436,7 +4344,12 @@ fn tx_known(electrum: &electrum_client::Client, txid: &str) -> Result<bool> {
 ///
 /// `Err` = **blind**. Note also that the out-of-range `vout` that used to PANIC here is now a
 /// named error.
-fn outpoint_spent(electrum: &electrum_client::Client, txid: &str, vout: u32) -> Result<bool> {
+/// Public because the keyless bundle tower in the SDK needs the SAME question answered the SAME
+/// way. Note the two failure directions it deliberately distinguishes: a funding tx that is simply
+/// **absent** is `Ok(false)` (an outpoint that does not exist cannot have been spent), while a
+/// backend that could not answer is `Err` — which the caller must surface as blindness and never as
+/// "unspent, nothing to do".
+pub fn outpoint_spent(electrum: &electrum_client::Client, txid: &str, vout: u32) -> Result<bool> {
     let t = electrum_client::bitcoin::Txid::from_str(txid)
         .map_err(|e| anyhow::anyhow!("unusable funding txid {txid:?} in stored ladder: {e}"))?;
     let raw = match electrum.transaction_get_raw(&t) {
@@ -3491,7 +4404,19 @@ pub enum WatchState {
     /// and the next one has not matured yet". `failures` carries the rejections that stopped it
     /// (typically `non-BIP68-final`, i.e. a CSV that has simply not matured), so a caller can tell a
     /// waiting exit from a RACED or dead one instead of retrying forever in silence.
-    Acted { ids: Vec<String>, failures: Vec<String> },
+    ///
+    /// `blind` names the entries the pass could **not evaluate at all** — a per-entry sibling of
+    /// [`Self::Blind`], which is whole-pass. A bundle-based tower watches many coins over one
+    /// backend, so "I could not answer the question for coin X" must not be averaged away by the
+    /// coins it could answer for: without this field an entry whose trigger was unreadable
+    /// contributed nothing and the pass reported [`Self::Idle`] — the exact blind-looks-idle bug
+    /// this enum exists to prevent, reintroduced one level down.
+    ///
+    /// Note the widened meaning of the variant itself: `Acted` is **"the pass was engaged"** —
+    /// it broadcast something, tried and was rejected, or could not see an entry. It is everything
+    /// that is not the positive all-quiet observation. `Idle` still means, exactly, *every* entry was
+    /// evaluated and none was due.
+    Acted { ids: Vec<String>, failures: Vec<String>, blind: Vec<String> },
     /// 🔴 The chain backend could not be read, or the stored exit material could not be used. This
     /// pass saw NOTHING and defended nothing. Never fold this into [`Self::Idle`].
     Blind { reason: String },
@@ -3527,6 +4452,20 @@ impl WatchState {
             Self::Blind { reason } => Some(reason),
             _ => None,
         }
+    }
+    /// Entries this pass could not evaluate (empty unless the tower watches a bundle of coins).
+    pub fn blind_entries(&self) -> &[String] {
+        match self {
+            Self::Acted { blind, .. } => blind,
+            _ => &[],
+        }
+    }
+    /// **The alert predicate a bundle tower must use.** True when the pass saw nothing at all
+    /// ([`Self::Blind`]) *or* when it could not evaluate at least one entry. `is_blind` alone is not
+    /// enough for a multi-coin tower: it answers only for the pass, not for the coin that went
+    /// unwatched inside a pass that otherwise succeeded.
+    pub fn any_blindness(&self) -> bool {
+        self.is_blind() || !self.blind_entries().is_empty()
     }
 }
 
@@ -3592,7 +4531,7 @@ fn watch_pass_seen(electrum: &electrum_client::Client, bundle: &TesrBundle) -> R
             }
         }
     }
-    Ok(WatchState::Acted { ids, failures })
+    Ok(WatchState::Acted { ids, failures, blind: vec![] })
 }
 
 /// **Tower pass for a split CHILD — the child-lane sibling of [`watch_pass`].**
@@ -3653,7 +4592,7 @@ fn watch_child_pass_seen(
             }
         }
     }
-    Ok(WatchState::Acted { ids, failures })
+    Ok(WatchState::Acted { ids, failures, blind: vec![] })
 }
 
 /// **Owner-initiated unilateral exit of a laddered coin.** Like [`watch_pass`], but this KICKS OFF the exit
@@ -4265,6 +5204,16 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
     if tiers[0].payload_out(t, "trigger")?.script_pubkey != agg_spk {
         return Err(anyhow::anyhow!("trigger does not pay the aggregate key A"));
     }
+    // [B1] The trigger's DECLARED timelock must be the one it was signed with — `None`, since
+    // `TRIGGER_SEQUENCE` disables the relative lock. A trigger declaring a CSV it does not carry
+    // would inflate the exit-headroom requirement rather than shrink it, but the binding is not a
+    // one-directional guard: the declared field is either the signed number or the bundle is refused.
+    mercurylib::transfer::receiver::bind_declared_csv(
+        0,
+        "trigger",
+        tiers[0].csv,
+        signed_relative_csv(t, "trigger")?,
+    )?;
 
     // 2. Each later tier spends its parent's PAYLOAD output, within schedule bounds, paying A (or the
     //    owner if final).
@@ -4287,6 +5236,16 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
         if csv < lo || csv > hi {
             return Err(anyhow::anyhow!("tier {i} CSV {csv} outside schedule bounds [{lo},{hi}]"));
         }
+        // [B1] …and the tier's DECLARED `csv` field must be that same number. This function already
+        // held the signed `nSequence` in its hand for the schedule-bounds check above and never
+        // compared it to the field the bundle travels with, which is how a declared schedule could
+        // contradict the signatures and still be accepted by every census check.
+        mercurylib::transfer::receiver::bind_declared_csv(
+            i,
+            &format!("tier {i}"),
+            tiers[i].csv,
+            Some(csv),
+        )?;
         let is_final = i == txs.len() - 1;
         if is_final && final_is_split {
             // SP (split state) pays the children, not the owner; its outputs are verified per-child by
@@ -4656,8 +5615,12 @@ pub fn verify_child_bundle(
         }
         verify_tier_cosigned(&st_tx, ext0.value, &seg_spk)
             .map_err(|e| anyhow::anyhow!("ancestor {i}: state not co-signed by its aggregate: {e}"))?;
-        // CSV bounds for both tiers.
-        for (kind, tx) in [("extension", &ext_tx), ("state", &st_tx)] {
+        // CSV bounds for both tiers — and [B1] the declared field bound to the signed one, so an
+        // intermediate segment cannot understate the depth cost of the chain it sits in.
+        for (kind, tx, declared) in [
+            ("extension", &ext_tx, seg.extension.csv),
+            ("state", &st_tx, seg.state.csv),
+        ] {
             let seq = tx.input[0].sequence.0;
             if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
                 return Err(anyhow::anyhow!("ancestor {i} {kind}: not a BIP-68 block relative-timelock"));
@@ -4668,6 +5631,12 @@ pub fn verify_child_bundle(
             if csv < lo || csv > hi {
                 return Err(anyhow::anyhow!("ancestor {i} {kind}: CSV {csv} outside [{lo},{hi}]"));
             }
+            mercurylib::transfer::receiver::bind_declared_csv(
+                i,
+                &format!("ancestor {i} {kind}"),
+                declared,
+                Some(csv),
+            )?;
         }
         // Superseded battery + exact-equality census for this segment (same shared logic as everywhere).
         let seg_superseded_ok = {
@@ -4768,6 +5737,13 @@ pub fn verify_child_bundle(
         if csv < p.e_floor || csv > p.e0 {
             return Err(anyhow::anyhow!("child extension CSV {csv} outside [{},{}]", p.e_floor, p.e0));
         }
+        // [B1] the declared field is the signed one, or the bundle is refused.
+        mercurylib::transfer::receiver::bind_declared_csv(
+            0,
+            "child extension",
+            cb.child_extension.csv,
+            Some(csv),
+        )?;
     }
 
     // state_child spends ext_child's PAYLOAD output, co-signed by A_child.
@@ -4795,6 +5771,13 @@ pub fn verify_child_bundle(
         if csv < p.d_floor || csv > p.d0 {
             return Err(anyhow::anyhow!("child state CSV {csv} outside [{},{}]", p.d_floor, p.d0));
         }
+        // [B1] the declared field is the signed one, or the bundle is refused.
+        mercurylib::transfer::receiver::bind_declared_csv(
+            1,
+            "child state",
+            cb.child_state.csv,
+            Some(csv),
+        )?;
     }
 
     // MODEL A: the final child state must pay the RECEIVER's own key.
@@ -5109,6 +6092,15 @@ mod uncoloured_builder_census {
             "establish_child",
             "Only reachable from `in_ladder_split`, which IS guarded — a coloured parent is refused \
              before any child is established. It takes no bundle of its own to test.",
+        ),
+        (
+            "establish_child_journalled",
+            "The journalling twin of `establish_child`, and exempt for the same reason plus a \
+             stronger one. Its two live callers (`in_ladder_split`, `child_in_ladder_split`) refuse \
+             a coloured parent in their FIRST statement, before the journal record is written; so a \
+             `splitjrnl-` record only ever describes a PLAIN split, and the third caller — \
+             `resume_in_ladder_split` — can therefore only ever replay one. It takes no bundle of \
+             its own to test: it reads its tier parameters from that record.",
         ),
     ];
 
@@ -6193,7 +7185,7 @@ mod watch_visibility_tests {
         assert_ne!(WatchState::Idle, blind);
         // An `Acted` pass that broadcast nothing (every mature tier already out) is ALSO not idle:
         // the coin is triggered and the exit is under way.
-        let under_way = WatchState::Acted { ids: vec![], failures: vec!["csv not met".into()] };
+        let under_way = WatchState::Acted { ids: vec![], failures: vec!["csv not met".into()], blind: vec![] };
         assert!(!under_way.is_idle() && !under_way.is_blind());
         assert_eq!(under_way.failures().len(), 1);
     }
@@ -6263,5 +7255,155 @@ mod watch_visibility_tests {
             "the reason must name the bad material, got {:?}",
             state.blind_reason()
         );
+    }
+}
+
+#[cfg(test)]
+mod split_journal_tests {
+    //! [P0-3] The journal's PURE contract: what a record says, what it rebuilds, and what it refuses
+    //! to rebuild. The live half (a real SIGABRT mid-split, then a restart that replays it) is
+    //! `SDK_E2E=81`; these are the parts that must hold with no SE and no database.
+    use super::*;
+    use super::verify_tests::sample_bundle;
+
+    fn tier(txid: &str, csv: u16) -> TesrTier {
+        TesrTier {
+            txid: txid.into(),
+            signed_tx: "00".into(),
+            out_value: 10_000,
+            csv: Some(csv),
+            payload_vout: 0,
+        }
+    }
+
+    fn record(stage: SplitStage) -> SplitJournalRecord {
+        let p = mercurylib::tesr::TesrParams::regtest();
+        SplitJournalRecord {
+            op_id: "in_ladder_split:parent:sp".into(),
+            lane: "in_ladder_split".into(),
+            stage,
+            terminalized_statechain_id: "parent".into(),
+            parent: sample_bundle(),
+            parent_statechain_id: "parent".into(),
+            ancestors: vec![],
+            parent_flat_backups: vec![],
+            children: vec![
+                SplitJournalChild {
+                    statechain_id: "piece".into(),
+                    owner_exit_address: "bcrt1qpayee".into(),
+                    value: 30_000,
+                    sp_vout: 0,
+                    extension: None,
+                    state: None,
+                    rgb: None,
+                    pending_extension: None,
+                    pending_state: None,
+                },
+                SplitJournalChild {
+                    statechain_id: "change".into(),
+                    owner_exit_address: "bcrt1qchange".into(),
+                    value: 60_000,
+                    sp_vout: 1,
+                    extension: None,
+                    state: None,
+                    rgb: None,
+                    pending_extension: None,
+                    pending_state: None,
+                },
+            ],
+            child_ext_csv: p.ext_csv(0),
+            child_state_csv: p.state_csv(0),
+            fee_rate: p.committed_fee_rate,
+            network: "regtest".into(),
+            sp_txid: "sp".into(),
+        }
+    }
+
+    #[test]
+    fn only_a_committed_or_stranded_record_leaves_the_open_set() {
+        // Everything before the caller has persisted+conveyed still needs the recovery reader —
+        // including `Established`, because the bundles exist only in the returning call's memory.
+        assert!(SplitStage::Planned.is_open());
+        assert!(SplitStage::Signed.is_open());
+        assert!(SplitStage::Established.is_open());
+        assert!(!SplitStage::Committed.is_open());
+        assert!(!SplitStage::Stranded.is_open());
+    }
+
+    #[test]
+    fn a_half_built_ladder_is_never_rebuilt_into_a_bundle() {
+        // The failure this guards: returning a bundle whose child tiers are missing would convey a
+        // ladder the receiver cannot exit — worse than reporting the interruption.
+        let mut rec = record(SplitStage::Signed);
+        assert!(rec.bundles().is_err(), "no tiers at all → refuse");
+
+        rec.children[0].extension = Some(tier("x0", 12));
+        assert!(rec.bundles().is_err(), "extension without state → still refuse");
+
+        rec.children[0].state = Some(tier("s0", 24));
+        assert!(
+            rec.bundles().is_err(),
+            "one COMPLETE child is not enough — the other child's value would silently vanish"
+        );
+
+        rec.children[1].extension = Some(tier("x1", 12));
+        rec.children[1].state = Some(tier("s1", 24));
+        let bundles = rec.bundles().expect("both ladders complete → rebuildable");
+        assert_eq!(bundles.len(), 2);
+        assert_eq!(bundles[0].child_statechain_id, "piece");
+        assert_eq!(bundles[0].sp_vout, 0);
+        assert_eq!(bundles[0].child_owner_exit_address, "bcrt1qpayee");
+        assert_eq!(bundles[1].sp_vout, 1);
+        // A journalled split is always a PLAIN one — the coloured lanes refuse before the record is
+        // written — so a rebuilt bundle must never claim an allocation.
+        assert!(bundles.iter().all(|b| b.rgb.is_none()));
+    }
+
+    #[test]
+    fn the_op_id_is_recoverable_from_the_bundles_alone() {
+        // The split cannot hand its op_id back without changing a signature every caller uses, so
+        // the id must be derivable from what it DOES return — otherwise the caller could never close
+        // the record it opened.
+        let mut rec = record(SplitStage::Signed);
+        for c in rec.children.iter_mut() {
+            c.extension = Some(tier("x", 12));
+            c.state = Some(tier("s", 24));
+        }
+        let bundles = rec.bundles().unwrap();
+        let expected = format!(
+            "in_ladder_split:parent:{}",
+            rec.parent.current().state.txid
+        );
+        assert_eq!(split_op_id(&bundles[0]), expected);
+        assert_eq!(split_op_id(&bundles[1]), expected, "one split, one record");
+
+        // The child lane keys off the segment it terminalized, not the root parent.
+        let mut deep = bundles[0].clone();
+        deep.ancestors.push(ChildSegment {
+            statechain_id: "childcoin".into(),
+            funding_vout: 0,
+            extension: tier("xc", 12),
+            state: tier("csp", 18),
+            superseded_states: vec![],
+            superseded_extensions: vec![],
+        });
+        assert_eq!(split_op_id(&deep), "child_in_ladder_split:childcoin:csp");
+    }
+
+    #[test]
+    fn a_journalled_record_round_trips_through_json() {
+        // The record IS the recovery: if it cannot be read back byte-for-byte after a restart, the
+        // journal is decoration.
+        let mut rec = record(SplitStage::Signed);
+        rec.children[0].extension = Some(tier("x0", 12));
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: SplitJournalRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.op_id, rec.op_id);
+        assert_eq!(back.stage, SplitStage::Signed);
+        assert_eq!(back.children.len(), 2);
+        assert_eq!(back.children[0].extension.as_ref().unwrap().txid, "x0");
+        assert!(back.children[1].extension.is_none());
+        assert_eq!(back.sp_txid, "sp");
+        assert_eq!(back.child_state_csv, mercurylib::tesr::TesrParams::regtest().state_csv(0));
     }
 }

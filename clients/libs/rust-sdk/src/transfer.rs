@@ -32,6 +32,37 @@ pub enum InLadderLatch<'a> {
     ClassicMinted,
 }
 
+/// What [`UtexoWallet::recover_in_ladder_splits`] did with one interrupted split.
+#[derive(Clone, Debug)]
+pub enum InLadderSplitOutcome {
+    /// The co-signed material survived the crash and the split was rebuilt from it: our own change
+    /// child is on disk and exitable again. `unconveyed_pieces` are the recipients' children — real,
+    /// complete coins of this wallet that were never handed over. Recovery NEVER conveys them by
+    /// itself; call [`UtexoWallet::convey_recovered_piece`] to complete the payment.
+    Replayed {
+        change_statechain_id: Option<String>,
+        unconveyed_pieces: Vec<String>,
+    },
+    /// The crash landed before the parent was terminalized: nothing was lost and nothing was
+    /// consumed — the payment can simply be made again.
+    Retryable,
+    /// The irreducible window: the SE consumed the parent's budget but this process never recorded
+    /// the `SP` co-signature, so it can never be produced again. The parent's value is recoverable
+    /// ONLY by a unilateral exit of its own backup.
+    CooperativePathLost,
+}
+
+/// One entry of the in-ladder split recovery report.
+#[derive(Clone, Debug)]
+pub struct InLadderSplitRecovery {
+    pub op_id: String,
+    /// `"in_ladder_split"` or `"child_in_ladder_split"`.
+    pub lane: String,
+    /// The coin the split terminalized (the root parent, or the child that was re-split).
+    pub terminalized_statechain_id: String,
+    pub outcome: InLadderSplitOutcome,
+}
+
 /// Which split route a `transfer_many` parent takes. Chosen by the parent's SHAPE, exactly as
 /// `transfer` chooses between `in_ladder_pay` / `child_in_ladder_pay` / `split_coin`: a parent that
 /// carries a TES-R ladder must never take the plain split ([B1] — a retained, un-timelocked trigger
@@ -69,7 +100,146 @@ fn is_token_carrier(c: &Coin, carriers: &std::collections::HashSet<String>) -> b
     coin_outpoint(c).map_or(false, |o| carriers.contains(&o))
 }
 
+/// [B2] The coins a payment may spend — ONE definition, used by `quote_transfer` AND by `transfer`.
+/// A shared floor is not enough if the two sides look at different wallets: `fundable` is computed
+/// over this set and the plan is executed over this set, so they must be the same set.
+///
+/// Confirmed, non-duplicate, not an RGB carrier (spending one as plain BTC destroys the allocation),
+/// and not STUCK. A coin whose value is at or below the fee of its own re-anchor cannot pay for its
+/// own renewal; it is reported for rescue-by-combine rather than silently planned into a payment.
+/// Returns `(spendable coins, stuck statechain ids)`.
+fn payment_coins(
+    coins: &[Coin],
+    carriers: &std::collections::HashSet<String>,
+    refresh_fee: u64,
+) -> (Vec<Coin>, Vec<String>) {
+    let live: Vec<&Coin> = coins
+        .iter()
+        .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+        .filter(|c| !is_token_carrier(c, carriers))
+        .collect();
+    let amt = |c: &&Coin| c.amount.unwrap_or_default() as u64;
+    let stuck = live
+        .iter()
+        .filter(|c| amt(c) <= refresh_fee)
+        .filter_map(|c| c.statechain_id.clone())
+        .collect();
+    let usable = live.iter().filter(|c| amt(c) > refresh_fee).map(|c| (*c).clone()).collect();
+    (usable, stuck)
+}
+
 impl UtexoWallet {
+    /// [B2] Resolve how a coin is laddered — the ONE resolution that fixes both the split route and
+    /// the split floor. `transfer` dispatches on it and `quote_transfer` quotes on it, so neither can
+    /// pick a route the other did not.
+    ///
+    /// [B3] FAIL CLOSED. A bundle read that FAILS propagates. It must never be read as "no ladder":
+    /// `Unladdered` is both the cheaper cost model (the ~300-sat split reserve instead of the ~2 536-sat
+    /// in-ladder cost) and the LOWER floor (554 instead of 1 310 at 2 sat/vB), so a swallowed DB error
+    /// would quote an unfundable payment as fundable and route a laddered coin at un-laddered prices —
+    /// exactly the silent-degradation shape.
+    pub(crate) async fn parent_shape(&self, statechain_id: &str) -> Result<ParentShape> {
+        if let Some(cb) = mercuryrustlib::tesr::load_child(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        {
+            return Ok(ParentShape::Child {
+                fee_rate: cb.parent.fee_rate,
+                split_source_value: cb.child_extension.out_value,
+            });
+        }
+        if let Some(bundle) = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        {
+            let out_value = bundle.current().extension.out_value;
+            return Ok(ParentShape::Root { fee_rate: bundle.fee_rate, split_source_value: out_value });
+        }
+        Ok(ParentShape::Unladdered)
+    }
+
+    /// [B2] **THE payment planner.** `quote_transfer` and `transfer` both call this and nothing else,
+    /// so `fundable` and the executor's verdict are one computation over one coin set, not two that
+    /// happen to agree today.
+    ///
+    /// `select::plan_with_floor` is shape-blind — it sees only amounts — so it is ADVISORY here. It
+    /// is run at the smallest floor any candidate imposes (so it never refuses a split some coin
+    /// could actually make), and the coin it names is then judged by [`split_preflight_pure`] at THAT
+    /// coin's own floor, which BINDS. A coin the executor would refuse is marked un-splittable — it
+    /// can still be handed over whole — and the plan is re-run; refusing the whole payment because
+    /// the first candidate did not fit would be a different disagreement, not a fix. Each pass
+    /// removes one candidate, so the loop terminates.
+    pub(crate) async fn plan_payment(
+        &self,
+        coins: &[Coin],
+        amount_sats: u64,
+    ) -> Result<PaymentPlan> {
+        let backup_rate = backup_fee_rate(&self.inner.cc).await?;
+        let network = self.inner.config.network.to_string();
+
+        // One shape — and therefore one floor — per candidate, resolved ONCE. A failed read
+        // propagates [B3]: it must not become "un-laddered", the cheapest and lowest-floored answer.
+        let mut shapes: Vec<ParentShape> = Vec::with_capacity(coins.len());
+        for c in coins {
+            let sid = c
+                .statechain_id
+                .clone()
+                .ok_or_else(|| anyhow!("coin without statechain id"))?;
+            shapes.push(self.parent_shape(&sid).await?);
+        }
+        let planning_floor = shapes
+            .iter()
+            .map(|s| split_output_floor(backup_rate, *s))
+            .min()
+            // No candidates: the laddered floor stands in, since `claim()` ladders every fresh root
+            // coin unconditionally and the laddered case is therefore the default, not the exception.
+            .unwrap_or_else(|| planning_split_floor(backup_rate, &network));
+
+        let mut candidates: Vec<Candidate> = coins
+            .iter()
+            .enumerate()
+            .map(|(index, c)| Candidate {
+                index,
+                amount_sats: c.amount.unwrap_or_default() as u64,
+                splittable: true,
+            })
+            .collect();
+
+        let mut last_refusal: Option<SplitChoice> = None;
+        loop {
+            let plan = select::plan_with_floor(&candidates, amount_sats, planning_floor);
+            let (split, piece_sats) = match &plan {
+                Plan::WithSplit { split, split_amount, .. } => (*split, *split_amount),
+                // Exact / Insufficient: no split is proposed. If candidates were refused on the way
+                // here, THAT refusal is the reason, not a bare "insufficient".
+                _ => return Ok(PaymentPlan { plan, split: last_refusal }),
+            };
+            let statechain_id = coins[split]
+                .statechain_id
+                .clone()
+                .ok_or_else(|| anyhow!("coin without statechain id"))?;
+            let preflight = split_preflight_pure(
+                backup_rate,
+                shapes[split],
+                coins[split].amount.unwrap_or_default() as u64,
+                piece_sats,
+            );
+            let choice = SplitChoice { statechain_id, piece_sats, preflight };
+            if choice.preflight.admission.is_ok() {
+                return Ok(PaymentPlan { plan, split: Some(choice) });
+            }
+            // `Candidate.index` is its position, so this is the coin the planner named.
+            candidates[split].splittable = false;
+            last_refusal = Some(choice);
+        }
+    }
+
     /// Send `amount_sats` to a statechain address. Exact amounts always work: the SDK either finds
     /// an exact subset of coins or mints one via an off-chain split. The receiver claims
     /// asynchronously (their SDK background watcher, or any Mercury wallet's receive flow for the
@@ -86,53 +256,49 @@ impl UtexoWallet {
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
-        // Received in-ladder split CHILDREN are now FIRST-CLASS: the receiver co-owns `A_child` (the
+        // Received in-ladder split CHILDREN are FIRST-CLASS: the receiver co-owns `A_child` (the
         // handover completed at claim) and the child is left non-terminal, so it can be re-transferred
         // off-chain via `child_retransfer` — Spark-parity multi-hop with zero on-chain footprint.
         //
-        // They are spendable only WHOLE, though. A child cannot itself be split in-ladder yet (that is
-        // the child-level split, Commit C), so they are excluded from the SPLIT candidate set and
-        // selected only when an exact/whole-coin plan uses them. Keeping them out of the split pool
-        // also stops a selected child from silently falling through to the B1-unsafe `split_coin`.
-        let child_bundles = mercuryrustlib::tesr::child_claim_sids(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-        )
-        .await?;
+        // A `child_claim_sids` read used to sit here to EXCLUDE children from the split candidate
+        // set, back when a child could not itself be split. Commit C made child-level in-ladder
+        // splits real and [B2] moved candidate selection into the shared `payment_coins` /
+        // `plan_payment` pair, so the exclusion is gone and the read was dead — one DB round-trip
+        // per transfer whose result nothing consulted, under a comment asserting the opposite of
+        // what the code fifteen lines down now does.
 
-        let spendable: Vec<&Coin> = record
-            .coins
-            .iter()
-            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
-            .filter(|c| !is_token_carrier(c, &carriers))
-            .collect();
-        // Children participate as WHOLE coins only: `splittable = false` keeps them out of the split
-        // slot, so the planner may satisfy an exact/whole plan with them but will never choose one to
-        // split (a child-level split is Commit C).
-        let candidates: Vec<Candidate> = spendable
-            .iter()
-            .enumerate()
-            .map(|(index, c)| Candidate {
-                index,
-                amount_sats: c.amount.unwrap_or_default() as u64,
-                // Children ARE splittable now (child-level in-ladder split, Commit C): a non-exact
-                // payment selecting a child routes to `child_in_ladder_pay` below.
-                splittable: true,
-            })
-            .collect();
+        // [B2] The SAME coin set and the SAME planner the quote uses (`payment_coins` +
+        // `plan_payment`), so `fundable: true` followed by a refusal is no longer expressible: the
+        // quote's verdict and this executor's verdict are the same call on the same inputs.
+        //
+        // Children participate as splittable candidates too (child-level in-ladder split, Commit C):
+        // a non-exact payment that selects a child routes to `child_in_ladder_pay` below.
+        let backup_rate = backup_fee_rate(&self.inner.cc).await?;
+        let refresh_fee = (BACKUP_TX_VBYTES as f64 * backup_rate).ceil() as u64;
+        let (spendable, _stuck) = payment_coins(&record.coins, &carriers, refresh_fee);
+        let planned = self.plan_payment(&spendable, amount_sats).await?;
 
-        // Plan with the backup-fee floor so any proposed split's piece and change can each fund
-        // their own backup (not merely clear dust) — the split executor enforces the same floor.
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
-        let plan = select::plan_with_floor(&candidates, amount_sats, min_output);
         // An in-ladder split payment (laddered coin) is conveyed directly to the recipient inside
         // the split, not handed over in the loop below; track its piece for the returned result.
         let mut inladder_piece: Option<(String, u64)> = None;
-        let (mut to_send, used_split): (Vec<String>, bool) = match plan {
+        let (mut to_send, used_split): (Vec<String>, bool) = match &planned.plan {
             Plan::Insufficient { available } => {
+                // A candidate the planner named but the executor refuses is a MORE precise answer
+                // than "insufficient" — report the actual refusal when there was one.
+                if let Some(choice) = &planned.split {
+                    if let Err(why) = &choice.preflight.admission {
+                        return Err(anyhow!(
+                            "cannot send {amount_sats} sat: no coin can mint the piece. Closest was \
+                             {} on its {} route (per-output floor {}): {why}",
+                            choice.statechain_id,
+                            choice.preflight.shape.route(),
+                            choice.preflight.floor
+                        ));
+                    }
+                }
                 return Err(SdkError::InsufficientBalance {
                     requested_sats: amount_sats,
-                    available_sats: available,
+                    available_sats: *available,
                 }
                 .into());
             }
@@ -143,60 +309,63 @@ impl UtexoWallet {
                     .collect(),
                 false,
             ),
-            Plan::WithSplit {
-                whole,
-                split,
-                split_amount,
-            } => {
+            Plan::WithSplit { whole, .. } => {
                 let mut ids: Vec<String> = whole
                     .iter()
                     .filter_map(|&i| spendable[i].statechain_id.clone())
                     .collect();
-                let split_coin_id = spendable[split]
-                    .statechain_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("coin without statechain id"))?;
+                let choice = planned
+                    .split
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("planner proposed a split without naming a coin"))?;
+                // `plan_payment` only returns `WithSplit` with an ADMISSIBLE preflight — the same
+                // verdict `quote_transfer` reported as `fundable`.
+                if let Err(why) = &choice.preflight.admission {
+                    return Err(anyhow!(
+                        "coin {} cannot mint a {}-sat piece on its {} route (per-output floor {}): {why}",
+                        choice.statechain_id,
+                        choice.piece_sats,
+                        choice.preflight.shape.route(),
+                        choice.preflight.floor
+                    ));
+                }
+                let split_coin_id = choice.statechain_id.clone();
+                let split_amount = choice.piece_sats;
+                let shape = choice.preflight.shape;
                 drop(spendable);
                 drop(record);
-                // A laddered (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock trigger
-                // could void the split [B1]. Do an IN-LADDER split payment instead: `SP` descends from
-                // the trigger, the piece child pays the recipient (Model A), and the piece bundle is
-                // conveyed directly to their mailbox WITH the standard key handover (the receiver
-                // completes it at claim, so the child is first-class). The change stays with us.
-                // A received CHILD splits at its own level (its state is replaced by a split state
-                // paying two grandchildren); a root coin splits in-ladder off its trigger.
-                if mercuryrustlib::tesr::load_child(
-                    &self.inner.cc,
-                    &self.inner.config.wallet_name,
-                    &split_coin_id,
-                )
-                .await?
-                .is_some()
-                {
-                    let (piece_id, _change_id) = self
-                        .child_in_ladder_pay(&split_coin_id, receiver_address, split_amount)
-                        .await?;
-                    inladder_piece = Some((piece_id, split_amount));
-                    (ids, true)
-                } else if mercuryrustlib::tesr::load(
-                    &self.inner.cc,
-                    &self.inner.config.wallet_name,
-                    &split_coin_id,
-                )
-                .await?
-                .is_some()
-                {
-                    let (piece_id, _change_id, _batch) = self
-                        .in_ladder_pay(&split_coin_id, receiver_address, split_amount, InLadderLatch::None)
-                        .await?;
-                    inladder_piece = Some((piece_id, split_amount));
-                    // `ids` = the whole coins (still handed over below); the piece is already conveyed.
-                    (ids, true)
-                } else {
-                    let (piece_id, _change_id) =
-                        self.split_coin(&split_coin_id, split_amount).await?;
-                    ids.push(piece_id);
-                    (ids, true)
+
+                // A laddered (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock
+                // trigger could void the split [B1]. `ParentShape` therefore selects the executor as
+                // well as the floor: a received CHILD splits at its own level, a root coin splits
+                // in-ladder off its trigger, and only an un-laddered coin takes the plain split.
+                match shape {
+                    ParentShape::Child { .. } => {
+                        let (piece_id, _change_id) = self
+                            .child_in_ladder_pay(&split_coin_id, receiver_address, split_amount)
+                            .await?;
+                        inladder_piece = Some((piece_id, split_amount));
+                        (ids, true)
+                    }
+                    ParentShape::Root { .. } => {
+                        let (piece_id, _change_id, _batch) = self
+                            .in_ladder_pay(
+                                &split_coin_id,
+                                receiver_address,
+                                split_amount,
+                                InLadderLatch::None,
+                            )
+                            .await?;
+                        inladder_piece = Some((piece_id, split_amount));
+                        // `ids` = the whole coins (still handed over below); the piece is already conveyed.
+                        (ids, true)
+                    }
+                    ParentShape::Unladdered => {
+                        let (piece_id, _change_id) =
+                            self.split_coin(&split_coin_id, split_amount).await?;
+                        ids.push(piece_id);
+                        (ids, true)
+                    }
                 }
             }
         };
@@ -287,28 +456,21 @@ impl UtexoWallet {
     pub async fn quote_transfer(&self, amount_sats: u64) -> Result<crate::types::TransferQuote> {
         use electrum_client::ElectrumApi;
         let record = self.record().await?;
-        let carriers = self.unspendable_as_btc_outpoints().await.unwrap_or_default();
+        // [B2] Both reads PROPAGATE. An empty carrier set would quote an RGB carrier as spendable
+        // plain BTC (a coin `transfer` then refuses), and a defaulted 1.0 sat/vB rate would compute a
+        // LOWER floor than the executor's — both are the quote disagreeing with the executor because
+        // it could not read something, which is the bug this round exists to close.
+        let carriers = self.unspendable_as_btc_outpoints().await?;
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let margin = self.inner.config.auto_refresh_margin_blocks;
-        let rate = backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
+        let rate = backup_fee_rate(&self.inner.cc).await?;
         let refresh_fee = (BACKUP_TX_VBYTES as f64 * rate).ceil() as u64;
 
-        let spendable: Vec<&Coin> = record
-            .coins
-            .iter()
-            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
-            .filter(|c| !is_token_carrier(c, &carriers))
-            .collect();
-        let amt = |c: &&Coin| c.amount.unwrap_or_default() as u64;
-
-        // A coin whose value is at/below its renewal fee cannot self-refresh (rescue by combining).
-        let stuck_coins: Vec<String> = spendable
-            .iter()
-            .filter(|c| amt(c) <= refresh_fee)
-            .filter_map(|c| c.statechain_id.clone())
-            .collect();
-        let usable: Vec<&&Coin> = spendable.iter().filter(|c| amt(c) > refresh_fee).collect();
-        let usable_total: u64 = usable.iter().map(|c| amt(c)).sum();
+        // [B2] The SAME coin set `transfer` will plan over. A coin at/below its own renewal fee
+        // cannot self-refresh and is reported for rescue-by-combine instead.
+        let (usable, stuck_coins) = payment_coins(&record.coins, &carriers, refresh_fee);
+        let amt = |c: &Coin| c.amount.unwrap_or_default() as u64;
+        let usable_total: u64 = usable.iter().map(amt).sum();
 
         // Renewal is due if any usable coin is within the auto-refresh margin of its ladder floor.
         let renewal_due = usable
@@ -316,31 +478,78 @@ impl UtexoWallet {
             .any(|c| c.locktime.map_or(false, |l| l.saturating_sub(tip) <= margin));
         let renewal_fee_sats = if renewal_due { refresh_fee } else { 0 };
 
-        // Split-reserve fee applies only when no exact subset exists (a split is needed).
-        let candidates: Vec<Candidate> = usable
-            .iter()
-            .enumerate()
-            // Quoting only: treat every usable coin as splittable so the quote is not skewed by
-            // whether the wallet happens to hold children (the executor applies the real rule).
-            .map(|(index, c)| Candidate { index, amount_sats: amt(c), splittable: true })
-            .collect();
-        let network_fee_sats = match select::plan(&candidates, amount_sats) {
-            Plan::WithSplit { split, .. } => split_fee_reserve(candidates[split].amount_sats),
-            _ => 0,
+        // [B2] The SAME planner `transfer` runs, over the SAME coins. `fundable` is therefore not an
+        // estimate of what the executor would do — it IS what the executor will do. Round 1 raised
+        // the floor here only, which left the executor planning lower; one planner from one source is
+        // the fix, not a higher number on one side.
+        let planned = self.plan_payment(&usable, amount_sats).await?;
+        let (network_fee_sats, split_admissible, split_note) = match (&planned.plan, &planned.split) {
+            (Plan::Exact(_), _) => (0, true, "paid from exact coins — no split needed".to_string()),
+            (Plan::WithSplit { .. }, Some(choice)) => match &choice.preflight.admission {
+                Ok(change) => (
+                    choice.preflight.fee_sats,
+                    true,
+                    format!(
+                        "includes the real {} cost {} sat (piece {} + change {change}, per-output floor {})",
+                        choice.preflight.shape.route(),
+                        choice.preflight.fee_sats,
+                        choice.piece_sats,
+                    choice.preflight.floor
+                    ),
+                ),
+                Err(why) => (
+                    choice.preflight.fee_sats,
+                    false,
+                    format!(
+                        "coin {} cannot mint a {}-sat piece on its {} route (per-output floor {}): {why}",
+                        choice.statechain_id,
+                        choice.piece_sats,
+                        choice.preflight.shape.route(),
+                        choice.preflight.floor
+                    ),
+                ),
+            },
+            (Plan::WithSplit { .. }, None) => {
+                (0, false, "planner proposed a split without naming a coin".to_string())
+            }
+            // No plan. If a candidate WAS named and refused, that refusal is the honest reason.
+            (Plan::Insufficient { available }, Some(choice)) => (
+                0,
+                false,
+                match &choice.preflight.admission {
+                    Err(why) => format!(
+                        "no coin can mint this amount as a viable split piece (available {available}); \
+                         closest was {} on its {} route (per-output floor {}): {why}",
+                        choice.statechain_id,
+                        choice.preflight.shape.route(),
+                        choice.preflight.floor
+                    ),
+                    Ok(_) => format!(
+                        "no coin can mint this amount as a viable split piece (available {available})"
+                    ),
+                },
+            ),
+            (Plan::Insufficient { available }, None) => (
+                0,
+                false,
+                format!("no coin can mint this amount as a viable split piece (available {available})"),
+            ),
         };
 
         let total_fee_sats = network_fee_sats + renewal_fee_sats;
-        let fundable = usable_total >= amount_sats.saturating_add(total_fee_sats);
+        // `fundable` now means what the caller reads it as: the executor will accept this payment.
+        let fundable =
+            usable_total >= amount_sats.saturating_add(total_fee_sats) && split_admissible;
         let note = if !fundable {
             format!(
-                "not fundable from non-stuck coins: usable {usable_total} < need {}{}",
+                "not fundable from non-stuck coins: usable {usable_total} vs need {} — {split_note}{}",
                 amount_sats.saturating_add(total_fee_sats),
                 if stuck_coins.is_empty() { String::new() } else { format!(" ({} stuck coin(s) — combine to rescue)", stuck_coins.len()) }
             )
         } else if renewal_due {
-            "includes a renewal (re-anchor) fee — a coin this send uses is due for refresh".to_string()
+            format!("{split_note}; includes a renewal (re-anchor) fee — a coin this send uses is due for refresh")
         } else {
-            "no renewal due for this send".to_string()
+            format!("{split_note}; no renewal due for this send")
         };
 
         Ok(crate::types::TransferQuote {
@@ -389,7 +598,7 @@ impl UtexoWallet {
         // terminal — so a doomed batch never pins a carrier's spend budget. This is the floor that
         // holds on EVERY route; the in-ladder routes raise it per-parent below (`min_child_value`).
         let backup_rate = backup_fee_rate(&self.inner.cc).await?;
-        let min_output = min_split_output(backup_rate);
+        let min_output = split_output_floor(backup_rate, ParentShape::Unladdered);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the minimum viable piece {min_output} (dust floor + backup fee) — it could not fund its own backup"
@@ -420,58 +629,45 @@ impl UtexoWallet {
         let mut chosen: Option<(String, ManyRoute)> = None;
         let mut rejected: Vec<String> = Vec::new();
         for (parent_sats, id) in candidates {
-            // An in-ladder child gets its OWN extension + state tier from `establish_child`, each
-            // burning `committed_fee + P2A_VALUE`, and its final state output must still clear dust —
-            // so the in-ladder floor is strictly above the backup-fee floor and BOTH bind.
-            let fits_inladder = |floor: u64, capacity: Option<u64>| {
-                let capacity = capacity.unwrap_or(0);
-                recipients.iter().all(|(_, a)| *a >= floor) && capacity >= total + floor
-            };
-            if let Some(cb) = mercuryrustlib::tesr::load_child(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &id,
-            )
-            .await?
-            {
-                let rate = cb.parent.fee_rate;
-                let floor = min_output.max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT));
-                let cap = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, n_out, rate);
-                if fits_inladder(floor, cap) {
-                    chosen = Some((id, ManyRoute::InLadderChild));
-                    break;
+            // [B2] ONE shape resolution decides the route AND the floor here too — the same
+            // `parent_shape` / `split_output_floor` pair `transfer` and `quote_transfer` use, so the
+            // batch lane cannot drift from the single-recipient lane. An in-ladder child gets its OWN
+            // extension + state tier from `establish_child`, each burning `committed_fee +
+            // P2A_VALUE`, and its final state output must still clear dust — so the in-ladder floor is
+            // strictly above the backup-fee floor and BOTH bind.
+            let shape = self.parent_shape(&id).await?;
+            let floor = split_output_floor(backup_rate, shape);
+            match shape {
+                ParentShape::Unladdered => {
+                    let need = total + split_fee_reserve(parent_sats) + floor;
+                    if parent_sats > need {
+                        chosen = Some((id, ManyRoute::PlainSplit));
+                        break;
+                    }
+                    rejected.push(format!(
+                        "un-laddered {id} ({parent_sats} sat): too small — needs more than {need} sat \
+                         (total {total} + fee reserve + a {floor}-sat change)"
+                    ));
                 }
-                rejected.push(format!(
-                    "child {id} ({parent_sats} sat): in-ladder capacity {}, per-output floor {floor}",
-                    cap.unwrap_or(0)
-                ));
-            } else if let Some(bundle) = mercuryrustlib::tesr::load(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &id,
-            )
-            .await?
-            {
-                let rate = bundle.fee_rate;
-                let floor = min_output.max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT));
-                let cap = mercurylib::tesr::tier_out_total(
-                    bundle.current().extension.out_value,
-                    n_out,
-                    rate,
-                );
-                if fits_inladder(floor, cap) {
-                    chosen = Some((id, ManyRoute::InLadderRoot));
-                    break;
+                ParentShape::Child { .. } | ParentShape::Root { .. } => {
+                    let cap = shape.split_total(n_out);
+                    let fits = recipients.iter().all(|(_, a)| *a >= floor)
+                        && cap.is_some_and(|c| c >= total + floor);
+                    if fits {
+                        let route = match shape {
+                            ParentShape::Child { .. } => ManyRoute::InLadderChild,
+                            _ => ManyRoute::InLadderRoot,
+                        };
+                        chosen = Some((id, route));
+                        break;
+                    }
+                    rejected.push(format!(
+                        "{} {id} ({parent_sats} sat): in-ladder capacity {}, per-output floor {floor}",
+                        shape.route(),
+                        cap.map(|c| c.to_string())
+                            .unwrap_or_else(|| "unavailable (committed fee no longer fits)".to_string())
+                    ));
                 }
-                rejected.push(format!(
-                    "laddered {id} ({parent_sats} sat): in-ladder capacity {}, per-output floor {floor}",
-                    cap.unwrap_or(0)
-                ));
-            } else if parent_sats > total + split_fee_reserve(parent_sats) + min_output {
-                chosen = Some((id, ManyRoute::PlainSplit));
-                break;
-            } else {
-                rejected.push(format!("un-laddered {id} ({parent_sats} sat): too small"));
             }
         }
         let (carrier_id, route) = chosen.ok_or_else(|| {
@@ -710,7 +906,10 @@ impl UtexoWallet {
         // output whose backup is FeeTooLow, and admitting it here (then making the parent terminal)
         // would strand the parent to unilateral-exit-only. Guarding up-front keeps the parent
         // spendable on refusal.
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?);
+        // [B2] ONE floor, from `split_output_floor` — the same call the quote's `split_preflight_pure`
+        // makes for an `Unladdered` parent (the `tesr::load` above proved this coin is un-laddered).
+        let min_output =
+            split_output_floor(backup_fee_rate(&self.inner.cc).await?, ParentShape::Unladdered);
         let (change_sats, _fee_reserve) =
             split_amounts_floored(parent_sats, piece_sats, min_output)?;
 
@@ -832,25 +1031,19 @@ impl UtexoWallet {
         .await?
         .ok_or_else(|| anyhow!("coin {child_statechain_id} is not a received split child"))?;
 
+        // [B2] ONE floor and ONE admission rule, both shared with the quote's `split_preflight_pure`: a
+        // grandchild also funds its own extension + state tier before it can clear dust, and the
+        // child is terminalized BEFORE those are built.
+        let shape = ParentShape::Child {
+            fee_rate: cb.parent.fee_rate,
+            split_source_value: cb.child_extension.out_value,
+        };
         // piece + change == the child's split total (ext_child.out[0] − committed fee for 2).
-        let total = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, 2, cb.parent.fee_rate)
+        let total = shape
+            .split_total(2)
             .ok_or_else(|| anyhow!("committed fee too high to split this child into two"))?;
-        if piece_sats >= total {
-            return Err(anyhow!(
-                "payment {piece_sats} sat leaves no change: splitting this child can pay at most {} sat",
-                total.saturating_sub(1)
-            ));
-        }
-        let change_sats = total - piece_sats;
-        // Same two floors as the root split: a grandchild also funds its own extension + state tier
-        // before it can clear dust, and the child is terminalized BEFORE those are built.
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
-            .max(mercurylib::tesr::min_child_value(cb.parent.fee_rate, DUST_LIMIT));
-        if piece_sats < min_output || change_sats < min_output {
-            return Err(anyhow!(
-                "a child split needs both piece ({piece_sats}) and change ({change_sats}) >= {min_output} sat"
-            ));
-        }
+        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
+        let change_sats = inladder_amounts_floored(total, piece_sats, min_output)?;
 
         let mut slot_tokens = self.take_derived_tokens(child_statechain_id, 2).await?;
         let piece_gc = self.create_child_slot(&slot_tokens.remove(0), piece_sats).await?;
@@ -915,6 +1108,15 @@ impl UtexoWallet {
             }
             self.save_record(&record).await?;
         }
+
+        // [P0-3] The split's write-ahead journal record stays OPEN until this point: the co-signed
+        // material only becomes recoverable-by-restart once the bundles are on disk and conveyed.
+        mercuryrustlib::tesr::journal_commit(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
+        )
+        .await?;
         Ok((piece_sid, change_sid))
     }
 
@@ -946,12 +1148,13 @@ impl UtexoWallet {
         .ok_or_else(|| anyhow!("coin {child_statechain_id} is not a received split child"))?;
 
         // Σpieces + change == the child's split total (ext_child.out[0] − committed fee for N+1).
-        let total = mercurylib::tesr::tier_out_total(
-            cb.child_extension.out_value,
-            n + 1,
-            cb.parent.fee_rate,
-        )
-        .ok_or_else(|| anyhow!("committed fee too high to split this child into {} outputs", n + 1))?;
+        let shape = ParentShape::Child {
+            fee_rate: cb.parent.fee_rate,
+            split_source_value: cb.child_extension.out_value,
+        };
+        let total = shape
+            .split_total(n + 1)
+            .ok_or_else(|| anyhow!("committed fee too high to split this child into {} outputs", n + 1))?;
         let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
         if pieces_total >= total {
             return Err(anyhow!(
@@ -960,10 +1163,10 @@ impl UtexoWallet {
             ));
         }
         let change_sats = total - pieces_total;
-        // Same two floors as the single-recipient child split, on EVERY output (see the guard in
-        // `child_in_ladder_pay`): refuse up-front, before the child is terminalized.
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
-            .max(mercurylib::tesr::min_child_value(cb.parent.fee_rate, DUST_LIMIT));
+        // [B2] The same floor, from the same source, as the single-recipient child split (see the
+        // guard in `child_in_ladder_pay`), applied to EVERY output: refuse up-front, before the child
+        // is terminalized.
+        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the in-ladder minimum {min_output} sat (each grandchild funds its own extension + state tier, then must clear the {DUST_LIMIT}-sat dust floor)"
@@ -1057,6 +1260,14 @@ impl UtexoWallet {
             let csp_txid = signed_tier_txid(&seg.state.signed_tx)?;
             self.record_conveyed_pieces(&csp_txid, recipients).await?;
         }
+        // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
+        // restart has nothing left to replay.
+        mercuryrustlib::tesr::journal_commit(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
+        )
+        .await?;
         Ok((piece_sids, change_sid))
     }
 
@@ -1083,16 +1294,14 @@ impl UtexoWallet {
 
         // piece + change == the split total (X_m.out[0] − committed fee for 2 children).
         let x_m = bundle.current().extension.clone();
-        let total = mercurylib::tesr::tier_out_total(x_m.out_value, 2, bundle.fee_rate)
+        let shape =
+            ParentShape::Root { fee_rate: bundle.fee_rate, split_source_value: x_m.out_value };
+        let total = shape
+            .split_total(2)
             .ok_or_else(|| anyhow!("committed fee too high to split this coin into two"))?;
-        if piece_sats >= total {
-            return Err(anyhow!(
-                "payment {piece_sats} sat leaves no change: an in-ladder split of this coin can pay at most {} sat (total {total} minus a viable change output)",
-                total.saturating_sub(1)
-            ));
-        }
-        let change_sats = total - piece_sats;
-        // Admission guard. BOTH floors apply and the LARGER binds:
+        // [B2] Admission guard — ONE floor (`split_output_floor`) and ONE rule
+        // (`inladder_amounts_floored`), both shared with the quote's `split_preflight_pure`. Two floors
+        // apply and the LARGER binds:
         //  * the backup-fee floor (dust + the sub-coin's own backup fee), as for a plain un-laddered
         //    sub-coin; and
         //  * `min_child_value` — an in-ladder child gets its OWN two-tier ladder (extension + state)
@@ -1102,15 +1311,8 @@ impl UtexoWallet {
         // spend budget is consumed and `SP` is co-signed, so admitting a child below it terminalizes
         // the parent and THEN fails with FeeTooHigh, stranding the parent to unilateral-exit-only.
         // Refusing up-front keeps the parent fully spendable (same discipline as `split_coin`).
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
-            .max(mercurylib::tesr::min_child_value(bundle.fee_rate, DUST_LIMIT));
-        if piece_sats < min_output || change_sats < min_output {
-            return Err(anyhow!(
-                "in-ladder split needs both piece ({piece_sats}) and change ({change_sats}) >= {min_output} sat \
-                 (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
-                bundle.fee_rate
-            ));
-        }
+        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
+        let change_sats = inladder_amounts_floored(total, piece_sats, min_output)?;
 
         // Two fresh SE-registered child slots (DERIVED — free vouchers against the parent's value).
         let mut slot_tokens = self.take_derived_tokens(parent_statechain_id, 2).await?;
@@ -1245,6 +1447,14 @@ impl UtexoWallet {
             piece_status,
         )
         .await?;
+        // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
+        // restart has nothing left to replay.
+        mercuryrustlib::tesr::journal_commit(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
+        )
+        .await?;
 
         Ok((piece_sid, change_child.statechain_id.clone().unwrap_or_default(), latch))
     }
@@ -1283,7 +1493,10 @@ impl UtexoWallet {
         // Σpieces + change == the split total (X_m.out[0] − the committed fee for N+1 outputs; each
         // extra payload output costs P2TR_OUT_VBYTES, so the fee scales with the recipient count).
         let x_m = bundle.current().extension.clone();
-        let total = mercurylib::tesr::tier_out_total(x_m.out_value, n + 1, bundle.fee_rate)
+        let shape =
+            ParentShape::Root { fee_rate: bundle.fee_rate, split_source_value: x_m.out_value };
+        let total = shape
+            .split_total(n + 1)
             .ok_or_else(|| anyhow!("committed fee too high to split this coin into {} outputs", n + 1))?;
         let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
         if pieces_total >= total {
@@ -1294,12 +1507,12 @@ impl UtexoWallet {
             ));
         }
         let change_sats = total - pieces_total;
-        // Both floors apply to EVERY output and the larger binds — see the single-recipient guard in
-        // `in_ladder_pay`. Refusing up-front is load-bearing: `establish_child` runs AFTER the parent's
-        // spend budget is consumed and `SP` is co-signed, so an output admitted below the floor
-        // terminalizes the parent and THEN fails, stranding it to unilateral-exit-only.
-        let min_output = min_split_output(backup_fee_rate(&self.inner.cc).await?)
-            .max(mercurylib::tesr::min_child_value(bundle.fee_rate, DUST_LIMIT));
+        // [B2] The same floor, from the same source, as the single-recipient guard in
+        // `in_ladder_pay`, applied to EVERY output. Refusing up-front is load-bearing:
+        // `establish_child` runs AFTER the parent's spend budget is consumed and `SP` is co-signed,
+        // so an output admitted below the floor terminalizes the parent and THEN fails, stranding it
+        // to unilateral-exit-only.
+        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the in-ladder minimum {min_output} sat (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
@@ -1386,7 +1599,170 @@ impl UtexoWallet {
         )
         .await?;
         self.record_conveyed_pieces(&sp_txid, recipients).await?;
+        // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
+        // restart has nothing left to replay.
+        mercuryrustlib::tesr::journal_commit(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
+        )
+        .await?;
         Ok((piece_sids, change_sid))
+    }
+
+    /// **[P0-3] THE RECOVERY READER for interrupted in-ladder splits.**
+    ///
+    /// Run it at startup (and after any crash): every in-ladder split that stopped after the parent
+    /// was terminalized at the SE is replayed from its write-ahead journal, so the co-signed material
+    /// — which the SE will never re-issue — comes back instead of being lost with the process.
+    ///
+    /// What it does NOT do: re-send a payment. A replayed piece is reported in
+    /// [`InLadderSplitOutcome::Replayed::unconveyed_pieces`] and conveyed only by an explicit
+    /// [`Self::convey_recovered_piece`], for the same reason the coloured lane's reader never sets
+    /// `handed_over` — a crashed process is not evidence that the user still wants the payment made.
+    ///
+    /// Idempotent: a record it closes is not offered again.
+    pub async fn recover_in_ladder_splits(&self) -> Result<Vec<InLadderSplitRecovery>> {
+        use mercuryrustlib::tesr::SplitStage;
+        let cc = &self.inner.cc;
+        let wallet = self.inner.config.wallet_name.clone();
+        let network = self.inner.config.network.to_string();
+        let mut report = Vec::new();
+
+        for mut rec in mercuryrustlib::tesr::journal_open_splits(cc, &wallet).await? {
+            // Nothing irreversible had happened when a `Planned` record was written — unless the SE
+            // consumed the budget in the window before we could record the co-signature.
+            if rec.stage == SplitStage::Planned {
+                let retryable = mercuryrustlib::tesr::split_is_retryable(cc, &rec).await?;
+                let stage = if retryable { SplitStage::Committed } else { SplitStage::Stranded };
+                mercuryrustlib::tesr::journal_close(cc, &wallet, &rec.op_id, stage).await?;
+                report.push(InLadderSplitRecovery {
+                    op_id: rec.op_id.clone(),
+                    lane: rec.lane.clone(),
+                    terminalized_statechain_id: rec.terminalized_statechain_id.clone(),
+                    outcome: if retryable {
+                        InLadderSplitOutcome::Retryable
+                    } else {
+                        InLadderSplitOutcome::CooperativePathLost
+                    },
+                });
+                continue;
+            }
+
+            // `Signed` / `Established`: the material exists and must be REPLAYED, never restarted.
+            // Supply every journalled child's coin so an unfinished ladder can be completed; a child
+            // whose coin is missing makes `resume_in_ladder_split` fail closed rather than return a
+            // bundle set that silently omits it.
+            let coins = self.record().await?.coins;
+            let mut child_coins: Vec<(String, Coin)> = rec
+                .children
+                .iter()
+                .filter_map(|c| {
+                    coins
+                        .iter()
+                        .find(|k| {
+                            k.statechain_id.as_deref() == Some(c.statechain_id.as_str())
+                                && k.duplicate_index == 0
+                        })
+                        .cloned()
+                        .map(|k| (c.statechain_id.clone(), k))
+                })
+                .collect();
+            let bundles =
+                mercuryrustlib::tesr::resume_in_ladder_split(cc, &wallet, &mut rec, &mut child_coins)
+                    .await?;
+
+            // Which child is OURS? The one whose journalled Model-A payee is the exit address this
+            // wallet derives from that child's own key — i.e. the change. Derived, not positional:
+            // a convention ("the change is last") is exactly the kind of assumption a recovery path
+            // must not depend on.
+            let mut change: Option<(String, u64, u32)> = None;
+            let mut unconveyed_pieces: Vec<String> = Vec::new();
+            for (j, jc) in rec.children.iter().enumerate() {
+                let ours = child_coins
+                    .iter()
+                    .find(|(id, _)| *id == jc.statechain_id)
+                    .map(|(_, coin)| {
+                        mercurylib::transaction::get_user_backup_address(coin, network.clone())
+                            .map(|a| a == jc.owner_exit_address)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if ours {
+                    mercuryrustlib::tesr::persist_child(cc, &wallet, &bundles[j]).await?;
+                    change = Some((jc.statechain_id.clone(), jc.value, jc.sp_vout));
+                } else {
+                    unconveyed_pieces.push(jc.statechain_id.clone());
+                }
+            }
+
+            // Book what the split actually did: the parent is terminal (gone), the change is a fresh
+            // confirmed claim funded by `SP.out[j]`. The pieces are deliberately left untouched —
+            // they were never conveyed.
+            self.book_inladder_split_coins_opt(
+                &rec.terminalized_statechain_id,
+                &rec.sp_txid,
+                &[],
+                CoinStatus::WITHDRAWN,
+                change.clone(),
+            )
+            .await?;
+            mercuryrustlib::tesr::journal_commit(cc, &wallet, &rec.op_id).await?;
+            report.push(InLadderSplitRecovery {
+                op_id: rec.op_id.clone(),
+                lane: rec.lane.clone(),
+                terminalized_statechain_id: rec.terminalized_statechain_id.clone(),
+                outcome: InLadderSplitOutcome::Replayed {
+                    change_statechain_id: change.map(|(id, _, _)| id),
+                    unconveyed_pieces,
+                },
+            });
+        }
+        Ok(report)
+    }
+
+    /// Convey a piece whose in-ladder split was interrupted and then recovered by
+    /// [`Self::recover_in_ladder_splits`] — the explicit "yes, still send it" step.
+    ///
+    /// Rebuilds the piece's bundle from the journal (the material is already co-signed; nothing new
+    /// is signed here) and hands it over exactly as the original call would have.
+    pub async fn convey_recovered_piece(
+        &self,
+        op_id: &str,
+        piece_statechain_id: &str,
+        recipient_address: &str,
+    ) -> Result<()> {
+        let cc = &self.inner.cc;
+        let wallet = self.inner.config.wallet_name.clone();
+        let rec = mercuryrustlib::tesr::journal_find(cc, &wallet, op_id)
+            .await?
+            .ok_or_else(|| anyhow!("no in-ladder split journal record {op_id}"))?;
+        let bundles = rec.bundles()?;
+        let idx = rec
+            .children
+            .iter()
+            .position(|c| c.statechain_id == piece_statechain_id)
+            .ok_or_else(|| anyhow!("split {op_id} carved no child {piece_statechain_id}"))?;
+        let piece_coin = self
+            .record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| {
+                c.statechain_id.as_deref() == Some(piece_statechain_id) && c.duplicate_index == 0
+            })
+            .cloned()
+            .ok_or_else(|| anyhow!("piece coin {piece_statechain_id} not found"))?;
+        mercuryrustlib::tesr::convey_child_bundle(
+            cc,
+            recipient_address,
+            &piece_coin,
+            &bundles[idx],
+            None,
+        )
+        .await?;
+        self.set_coin_status(piece_statechain_id, CoinStatus::WITHDRAWN).await?;
+        Ok(())
     }
 
     /// Set a single coin's status by statechain_id in the local wallet db.
@@ -1922,6 +2298,33 @@ pub(crate) fn signed_tier_txid(signed_tx_hex: &str) -> Result<String> {
     Ok(tx.txid().to_string())
 }
 
+/// **[P0-4] The real sat cost of paying a non-exact amount out of a LADDERED coin.**
+///
+/// The commonly-quoted figure counted only the `SP` tier and omitted the two children the split
+/// creates — each of which gets its OWN extension and state rung, every rung burning
+/// `committed_fee + P2A_VALUE`. Measured as loss of exitable value across the tree
+/// (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.1):
+///
+/// ```text
+///   SP split tier (2 payload outputs)   576   committed_fee_for_outputs(2, r) + P2A
+///   piece child   — extension + state   980   2 × (committed_fee(r) + P2A)
+///   change child  — extension + state   980   2 × (committed_fee(r) + P2A)
+///                                     -----
+///                                      2 536  at r = 2.0 sat/vB
+/// ```
+///
+/// This is the GROSS figure: it deliberately does not take the −490 credit the economics ledger
+/// applies for the parent's superseded state rung. That rung's sats were burned when the parent's
+/// ladder was built, not by this payment, and crediting them would let the quote come in UNDER what
+/// the payer's tree actually gives up. The old quote — `clamp(parent/100, 300, 2000)` — returned 300
+/// sat here, a 6.8× under-quote on a 10 000-sat parent.
+pub(crate) fn in_ladder_split_cost(fee_rate_sats_per_vb: f64) -> u64 {
+    let rung = mercurylib::tesr::committed_fee(fee_rate_sats_per_vb) + mercurylib::tesr::P2A_VALUE;
+    let sp_tier = mercurylib::tesr::committed_fee_for_outputs(2, fee_rate_sats_per_vb)
+        + mercurylib::tesr::P2A_VALUE;
+    sp_tier + 4 * rung
+}
+
 /// Miner-fee margin left in a split tx for its (exit-only) broadcast.
 pub(crate) fn split_fee_reserve(parent_sats: u64) -> u64 {
     // ~200 vB at a couple sat/vB, floored so tiny test coins still split.
@@ -1952,6 +2355,200 @@ pub(crate) fn min_split_output(fee_rate_sats_per_byte: f64) -> u64 {
 pub(crate) async fn backup_fee_rate(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<f64> {
     let info = mercuryrustlib::utils::info_config(cc).await?;
     Ok(info.fee_rate_sats_per_byte.min(cc.max_fee_rate))
+}
+
+// ================================================================================================
+// [B2] ONE FLOOR, ONE SOURCE.
+//
+// `quote_transfer` reports `fundable`; `transfer` executes. Round 1 (P0-4) raised the floor in the
+// quote and left the executor planning at the bare `min_split_output`, which did not close the bug —
+// it only changed which side was wrong. A quote that can disagree with the executor IS the bug.
+//
+// Everything the two sides must agree on now has exactly one derivation, below:
+//   * the ROUTE            -> `UtexoWallet::parent_shape`   (load_child, then load; errors PROPAGATE)
+//   * the per-output FLOOR -> `split_output_floor`
+//   * the split TOTAL      -> `ParentShape::split_total`
+//   * ADMISSIBILITY        -> `split_amounts_floored` / `inladder_amounts_floored`
+//   * all four at once     -> `split_preflight_pure`
+//   * plan + verdict       -> `UtexoWallet::plan_payment`
+// `quote_transfer` and `transfer` both call `plan_payment` and nothing else, so
+// `fundable: true` followed by a refusal is no longer expressible.
+// ================================================================================================
+
+/// How a parent is laddered. This ONE resolution decides both the split ROUTE and the split FLOOR,
+/// so the quote and the executor cannot answer the same question differently.
+///
+/// Resolved only by [`UtexoWallet::parent_shape`], which PROPAGATES a failed bundle read. A failed
+/// read must never fall through to `Unladdered`: that is simultaneously the cheaper cost model and
+/// the LOWER floor, i.e. the silent-degradation shape that quotes an unfundable payment as fundable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ParentShape {
+    /// No TES-R ladder: the plain off-chain split (`split_coin`), whose sub-coins carry only their
+    /// own backup tx.
+    Unladdered,
+    /// A received in-ladder split CHILD: it re-splits at its OWN level (`child_in_ladder_pay`),
+    /// carving `CSP` out of `ext_child.out[0]`.
+    Child { fee_rate: f64, split_source_value: u64 },
+    /// A root TES-R coin: `in_ladder_pay` carves `SP` out of `X_m.out[0]`.
+    Root { fee_rate: f64, split_source_value: u64 },
+}
+
+impl ParentShape {
+    /// The committed fee rate of the ladder this parent's children inherit, or `None` when there is
+    /// no ladder and therefore no `min_child_value` floor.
+    pub(crate) fn ladder_fee_rate(self) -> Option<f64> {
+        match self {
+            ParentShape::Unladdered => None,
+            ParentShape::Child { fee_rate, .. } | ParentShape::Root { fee_rate, .. } => Some(fee_rate),
+        }
+    }
+
+    /// The value an in-ladder split of this parent can carve into `n_payload` outputs — the tier
+    /// source value net of the split tier's own committed fee and P2A anchor. `None` for an
+    /// un-laddered parent (whose capacity is `parent_sats` minus the split fee reserve instead) or
+    /// when the committed fee no longer fits.
+    pub(crate) fn split_total(self, n_payload: usize) -> Option<u64> {
+        match self {
+            ParentShape::Unladdered => None,
+            ParentShape::Child { fee_rate, split_source_value }
+            | ParentShape::Root { fee_rate, split_source_value } => {
+                mercurylib::tesr::tier_out_total(split_source_value, n_payload, fee_rate)
+            }
+        }
+    }
+
+    /// The executor this shape dispatches to — named in quotes and refusals so a disagreement is
+    /// legible instead of mysterious.
+    pub(crate) fn route(self) -> &'static str {
+        match self {
+            ParentShape::Unladdered => "plain off-chain split",
+            ParentShape::Child { .. } => "child in-ladder split",
+            ParentShape::Root { .. } => "in-ladder split",
+        }
+    }
+}
+
+/// **THE** per-output floor for one split output. Every admission guard in this file and the quote
+/// derive their floor here and nowhere else.
+///
+/// Two floors apply and the LARGER binds:
+///  * `min_split_output(backup_fee_rate)` — the dust limit plus the fee the sub-coin's OWN backup tx
+///    must pay; below it the sub-coin exists but can never be exited.
+///  * `min_child_value(ladder rate)` — a LADDERED parent's child additionally gets its own extension
+///    + state rungs from `establish_child`, each burning `committed_fee + P2A_VALUE`, and its final
+///    state output must still clear dust. Only applies when the parent actually carries a ladder.
+pub(crate) fn split_output_floor(backup_fee_rate: f64, shape: ParentShape) -> u64 {
+    let backup_floor = min_split_output(backup_fee_rate);
+    match shape.ladder_fee_rate() {
+        Some(rate) => backup_floor.max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT)),
+        None => backup_floor,
+    }
+}
+
+/// The floor used to PLAN, before the planner has named a coin — necessarily shape-blind, so it
+/// assumes the laddered case at the NETWORK's committed rate, which is the rate every ladder this
+/// wallet builds is anchored at (`claim()` ladders every fresh root coin unconditionally, so the
+/// laddered case is the default, not the exception).
+///
+/// This is a planning heuristic, never an admission decision: once the planner names a coin, the
+/// exact floor is re-derived from THAT coin via [`split_output_floor`] inside
+/// [`split_preflight_pure`], and the plan stands or falls on that. Both `quote_transfer` and
+/// `transfer` call this function, so they plan over the same feasible set.
+pub(crate) fn planning_split_floor(backup_fee_rate: f64, network: &str) -> u64 {
+    let committed_rate = mercurylib::tesr::TesrParams::for_network(network).committed_fee_rate;
+    split_output_floor(
+        backup_fee_rate,
+        ParentShape::Root { fee_rate: committed_rate, split_source_value: 0 },
+    )
+}
+
+/// The IN-LADDER admission rule, in one place: `piece` and `change` are both carved out of `total`
+/// (the tier's payload budget) and each must clear `floor`. Returns the change on success.
+///
+/// Shared by `in_ladder_pay`, `child_in_ladder_pay` and the quote's preflight, so a piece the quote
+/// calls fundable is a piece the executor accepts, and vice versa.
+pub(crate) fn inladder_amounts_floored(total: u64, piece_sats: u64, floor: u64) -> Result<u64> {
+    if piece_sats >= total {
+        return Err(anyhow!(
+            "payment {piece_sats} sat leaves no change: an in-ladder split of this coin can pay at most {} sat (total {total} minus a viable change output)",
+            total.saturating_sub(1)
+        ));
+    }
+    let change_sats = total - piece_sats;
+    if piece_sats < floor || change_sats < floor {
+        return Err(anyhow!(
+            "in-ladder split needs both piece ({piece_sats}) and change ({change_sats}) >= {floor} sat \
+             (each child funds its own extension + state rungs, then must clear the {DUST_LIMIT}-sat dust floor); \
+             the split total is {total}"
+        ));
+    }
+    Ok(change_sats)
+}
+
+/// The whole quote/executor agreement in one pure function, with the
+/// two I/O reads (the backup fee rate and the coin's shape) lifted out so it is directly testable.
+/// Nothing else in this file re-derives a floor, a split total or an admission verdict.
+pub(crate) fn split_preflight_pure(
+    backup_rate: f64,
+    shape: ParentShape,
+    parent_sats: u64,
+    piece_sats: u64,
+) -> SplitPreflight {
+    let floor = split_output_floor(backup_rate, shape);
+    let (fee_sats, admission) = match shape {
+        ParentShape::Unladdered => (
+            split_fee_reserve(parent_sats),
+            split_amounts_floored(parent_sats, piece_sats, floor)
+                .map(|(change, _)| change)
+                .map_err(|e| e.to_string()),
+        ),
+        ParentShape::Child { fee_rate, .. } | ParentShape::Root { fee_rate, .. } => {
+            // The split carves TWO payload outputs (piece + change) out of the tier.
+            let admission = match shape.split_total(2) {
+                Some(total) => {
+                    inladder_amounts_floored(total, piece_sats, floor).map_err(|e| e.to_string())
+                }
+                None => Err(format!(
+                    "committed fee at {fee_rate} sat/vB no longer fits: this coin cannot be split in-ladder at all"
+                )),
+            };
+            (in_ladder_split_cost(fee_rate), admission)
+        }
+    };
+    SplitPreflight { shape, floor, fee_sats, admission }
+}
+
+/// The coin a payment plan wants to split, together with the BINDING verdict on splitting it.
+#[derive(Clone, Debug)]
+pub(crate) struct SplitChoice {
+    pub statechain_id: String,
+    pub piece_sats: u64,
+    pub preflight: SplitPreflight,
+}
+
+/// A resolved payment plan: which coins go whole, and — when a split is needed — which coin is split
+/// and whether that split is actually admissible.
+#[derive(Clone, Debug)]
+pub(crate) struct PaymentPlan {
+    pub plan: Plan,
+    /// The split coin and its verdict. `Some` with an `Err` admission when NO candidate could mint
+    /// the piece: that refusal is the honest reason the payment cannot be made, and both the quote
+    /// and the executor report it.
+    pub split: Option<SplitChoice>,
+}
+
+/// Everything the quote and the executor must agree on about splitting ONE named coin.
+#[derive(Clone, Debug)]
+pub(crate) struct SplitPreflight {
+    pub shape: ParentShape,
+    /// The per-output floor [`split_output_floor`] gives for THIS coin.
+    pub floor: u64,
+    /// The real cost of this route (the in-ladder split's burnt tier fees, or the plain split's
+    /// reserve) — what the quote must report.
+    pub fee_sats: u64,
+    /// `Ok(change_sats)` when the executor will accept this split; `Err(reason)` — the executor's
+    /// own refusal text — when it will not.
+    pub admission: std::result::Result<u64, String>,
 }
 
 /// The split executor's pure admission guard with an explicit per-output floor: fee reserve + fit
@@ -2004,5 +2601,259 @@ mod split_math_tests {
         let reserve = split_fee_reserve(parent);
         assert!(piece + reserve < parent);
         assert_eq!(parent - piece - reserve, 40_000 - 15_000 - 400);
+    }
+
+    // [P0-4] The in-ladder split's real cost, re-derived from the tier arithmetic rather than
+    // asserted as a magic number — and measured against the reserve the quote used to return.
+    #[test]
+    fn in_ladder_cost_is_the_whole_split_not_just_the_sp_tier() {
+        let r = 2.0;
+        let rung = mercurylib::tesr::committed_fee(r) + mercurylib::tesr::P2A_VALUE;
+        let sp = mercurylib::tesr::committed_fee_for_outputs(2, r) + mercurylib::tesr::P2A_VALUE;
+        assert_eq!(rung, 490, "committed fee 250 + P2A 240");
+        assert_eq!(sp, 576, "a 2-payload tier costs one extra P2TR output of fee");
+        // SP + piece child (ext+state) + change child (ext+state).
+        assert_eq!(in_ladder_split_cost(r), sp + 2 * (2 * rung));
+        assert_eq!(in_ladder_split_cost(r), 2_536);
+
+        // THE DEFECT: on a 10 000-sat parent the old quote returned the 300-sat floor.
+        assert_eq!(split_fee_reserve(10_000), 300);
+        assert!(
+            in_ladder_split_cost(r) > 6 * split_fee_reserve(10_000),
+            "the old quote under-stated the cost by more than 6x"
+        );
+        // It scales with the committed fee rate, so it cannot go stale against the schedule.
+        assert!(in_ladder_split_cost(4.0) > in_ladder_split_cost(2.0));
+    }
+
+    /// The tier source value whose 2-output in-ladder split total is exactly `total`.
+    fn source_value_for_total(total: u64, rate: f64) -> u64 {
+        total + mercurylib::tesr::committed_fee_for_outputs(2, rate) + mercurylib::tesr::P2A_VALUE
+    }
+
+    // [B2] ONE FLOOR, ONE SOURCE — asserted as an identity, not as two numbers that happen to match.
+    // Every floor in this file now comes from `split_output_floor`; nothing re-derives one.
+    #[test]
+    fn every_floor_comes_from_split_output_floor() {
+        let backup_rate = 2.0;
+        let ladder_rate = 2.0;
+
+        // The un-laddered floor IS `min_split_output` — no ladder, no `min_child_value` term.
+        assert_eq!(
+            split_output_floor(backup_rate, ParentShape::Unladdered),
+            min_split_output(backup_rate)
+        );
+        assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
+
+        // A laddered parent (root or child, same rule) raises it to `min_child_value`.
+        let root = ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 };
+        let child = ParentShape::Child { fee_rate: ladder_rate, split_source_value: 0 };
+        assert_eq!(mercurylib::tesr::min_child_value(ladder_rate, DUST_LIMIT), 1_310);
+        assert_eq!(split_output_floor(backup_rate, root), 1_310, "the larger floor binds");
+        assert_eq!(
+            split_output_floor(backup_rate, child),
+            split_output_floor(backup_rate, root),
+            "a child re-split and a root split are floored identically"
+        );
+
+        // The B2 defect itself: `transfer` planned at 554 while the executor enforced 1 310. Both
+        // sides now call `planning_split_floor`, which is `split_output_floor` at the network's
+        // committed rate — strictly above the bare backup-fee floor.
+        for network in ["regtest", "mainnet"] {
+            let planning = planning_split_floor(backup_rate, network);
+            let committed = mercurylib::tesr::TesrParams::for_network(network).committed_fee_rate;
+            assert_eq!(
+                planning,
+                split_output_floor(
+                    backup_rate,
+                    ParentShape::Root { fee_rate: committed, split_source_value: 0 }
+                ),
+                "[{network}] the planning floor is not a second derivation"
+            );
+            assert!(
+                planning > min_split_output(backup_rate),
+                "[{network}] planning at the bare backup-fee floor is the bug (planning {planning})"
+            );
+        }
+    }
+
+    // [B2] THE BOUNDARY, BOTH WAYS. A parent sized so its in-ladder split total is exactly two
+    // floors: the piece can be the floor and no more, and the change must also be the floor.
+    //
+    // `quote_transfer` fills `fundable` from `plan_payment`, and `transfer` executes the SAME
+    // call before touching the parent, so "quote agrees with executor" is checked here on the shared
+    // core (`split_preflight_pure`) against the exact expressions the executors run inline.
+    #[test]
+    fn quote_and_executor_agree_at_the_floor_both_ways() {
+        let backup_rate = 2.0;
+        let ladder_rate = 2.0;
+        let floor = split_output_floor(
+            backup_rate,
+            ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 },
+        );
+        assert_eq!(floor, 1_310);
+
+        // A parent whose split total is exactly 2 × floor: the boundary in both directions at once.
+        let total = 2 * floor;
+        let shape = ParentShape::Root {
+            fee_rate: ladder_rate,
+            split_source_value: source_value_for_total(total, ladder_rate),
+        };
+        assert_eq!(shape.split_total(2), Some(total), "the parent sits exactly on the boundary");
+
+        // What `in_ladder_pay` does inline, re-run: shape -> split_total(2) -> split_output_floor ->
+        // inladder_amounts_floored. What the quote does, via `plan_payment`: `split_preflight_pure`. They must return
+        // the same verdict for every piece across the boundary, in BOTH directions.
+        for piece in [floor - 2, floor - 1, floor, floor + 1, floor + 2] {
+            let executor = {
+                let t = shape.split_total(2).expect("splittable");
+                let f = split_output_floor(backup_rate, shape);
+                inladder_amounts_floored(t, piece, f).map_err(|e| e.to_string())
+            };
+            let quote = split_preflight_pure(backup_rate, shape, 0, piece).admission;
+            assert_eq!(
+                executor.is_ok(),
+                quote.is_ok(),
+                "piece {piece}: quote says fundable={}, executor says admissible={}",
+                quote.is_ok(),
+                executor.is_ok()
+            );
+            assert_eq!(executor.ok(), quote.ok(), "piece {piece}: change differs");
+        }
+
+        // ...and the verdicts are the RIGHT ones, or the agreement above is agreement on garbage.
+        assert!(
+            split_preflight_pure(backup_rate, shape, 0, floor).admission.is_ok(),
+            "a piece exactly at the floor, with change exactly at the floor, is admissible"
+        );
+        assert_eq!(
+            split_preflight_pure(backup_rate, shape, 0, floor).admission.unwrap(),
+            floor,
+            "the change is the other half of the boundary"
+        );
+        let one_under = split_preflight_pure(backup_rate, shape, 0, floor - 1).admission;
+        assert!(one_under.is_err(), "one sat under the floor the PIECE is unviable");
+        let one_over = split_preflight_pure(backup_rate, shape, 0, floor + 1).admission;
+        assert!(one_over.is_err(), "one sat over, the CHANGE falls under the floor — the other way");
+
+        // The pre-B2 executor floor (the bare backup-fee floor, 554) admitted both of those. That is
+        // the exact gap `fundable: true` used to be reported through.
+        let old_floor = min_split_output(backup_rate);
+        assert!(old_floor < floor, "554 < 1310");
+        assert!(
+            inladder_amounts_floored(total, floor - 1, old_floor).is_ok(),
+            "the old, lower floor admitted the piece the real executor refuses"
+        );
+
+        // A CHILD parent at its own boundary behaves identically — one rule, not two.
+        let child = ParentShape::Child {
+            fee_rate: ladder_rate,
+            split_source_value: source_value_for_total(total, ladder_rate),
+        };
+        assert!(split_preflight_pure(backup_rate, child, 0, floor).admission.is_ok());
+        assert!(split_preflight_pure(backup_rate, child, 0, floor - 1).admission.is_err());
+        assert!(split_preflight_pure(backup_rate, child, 0, floor + 1).admission.is_err());
+
+        // And an UN-LADDERED parent is floored by `min_split_output` alone, from the same function.
+        let parent = 10_000u64;
+        let unladdered_floor = split_output_floor(backup_rate, ParentShape::Unladdered);
+        let pf = split_preflight_pure(backup_rate, ParentShape::Unladdered, parent, unladdered_floor);
+        assert_eq!(pf.floor, unladdered_floor);
+        assert!(pf.admission.is_ok(), "at its own floor an un-laddered piece is admissible");
+        let plain_under =
+            split_preflight_pure(backup_rate, ParentShape::Unladdered, parent, unladdered_floor - 1)
+                .admission;
+        assert!(plain_under.is_err(), "one sat under the un-laddered floor, refused");
+        assert_eq!(pf.fee_sats, split_fee_reserve(parent), "the plain lane quotes its reserve");
+        assert_eq!(
+            split_preflight_pure(backup_rate, shape, 0, floor).fee_sats,
+            in_ladder_split_cost(ladder_rate),
+            "the in-ladder lane quotes the real in-ladder cost"
+        );
+    }
+
+    // [B2] The planner is ADVISORY; the per-coin floor BINDS. `plan_payment` runs
+    // `select::plan_with_floor` at the smallest floor any candidate imposes and then judges the coin
+    // it named at THAT coin's floor, retrying with the coin marked un-splittable. Planning at a
+    // single conservative floor instead would agree with the executor by refusing payments the
+    // wallet can actually make — agreement bought with a capability regression, which is not a fix.
+    #[test]
+    fn the_planner_is_advisory_and_the_per_coin_floor_binds() {
+        let backup_rate = 2.0;
+        let laddered = ParentShape::Root {
+            fee_rate: 2.0,
+            split_source_value: source_value_for_total(50_000, 2.0),
+        };
+        let plain = ParentShape::Unladdered;
+        let laddered_floor = split_output_floor(backup_rate, laddered);
+        let plain_floor = split_output_floor(backup_rate, plain);
+        assert_eq!((plain_floor, laddered_floor), (554, 1_310));
+
+        // The floor `plan_payment` plans at, over a wallet holding one of each.
+        let planning = [laddered_floor, plain_floor].into_iter().min().unwrap();
+        assert_eq!(planning, plain_floor, "the smallest floor any candidate imposes");
+
+        // A 600-sat piece: the un-laddered coin can mint it; the laddered coin cannot.
+        let plain_600 = split_preflight_pure(backup_rate, plain, 10_000, 600).admission;
+        assert!(plain_600.is_ok(), "an un-laddered coin mints a 600-sat piece: {plain_600:?}");
+        let laddered_600 = split_preflight_pure(backup_rate, laddered, 0, 600).admission;
+        assert!(laddered_600.is_err(), "600 is under the in-ladder floor of {laddered_floor}");
+
+        // Planning at the laddered floor would refuse the payment outright; planning at the smallest
+        // candidate floor proposes it, and the binding per-coin preflight then decides.
+        let coins = vec![crate::select::Candidate { index: 0, amount_sats: 10_000, splittable: true }];
+        assert!(matches!(
+            crate::select::plan_with_floor(&coins, 600, planning),
+            crate::select::Plan::WithSplit { .. }
+        ));
+        assert!(matches!(
+            crate::select::plan_with_floor(&coins, 600, laddered_floor),
+            crate::select::Plan::Insufficient { .. }
+        ));
+
+        // And the retry itself: once the coin the planner named is marked un-splittable, the planner
+        // must stop proposing it — this is what makes `plan_payment`'s loop terminate.
+        let exhausted =
+            vec![crate::select::Candidate { index: 0, amount_sats: 10_000, splittable: false }];
+        assert!(matches!(
+            crate::select::plan_with_floor(&exhausted, 600, planning),
+            crate::select::Plan::Insufficient { .. }
+        ));
+    }
+
+    // [P0-4] The quote must plan with the floor the executor enforces. The planner used to be run
+    // at the bare dust floor (330) via `select::plan`, while `in_ladder_pay` refuses below
+    // `min_child_value` (1 310) — so a piece in between was quoted `fundable` and then refused.
+    #[test]
+    fn quote_floor_matches_the_executor_floor() {
+        let backup_rate = 2.0;
+        let committed_rate = 2.0;
+        // [B2] re-derived through the ONE source rather than re-spelled here.
+        let executor_floor = split_output_floor(
+            backup_rate,
+            ParentShape::Root { fee_rate: committed_rate, split_source_value: 0 },
+        );
+        assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
+        assert_eq!(mercurylib::tesr::min_child_value(committed_rate, DUST_LIMIT), 1_310);
+        assert_eq!(executor_floor, 1_310, "the larger floor binds");
+
+        // A 1 000-sat piece: admitted by the old dust-floor plan, refused by the executor.
+        let coins = vec![crate::select::Candidate { index: 0, amount_sats: 10_000, splittable: true }];
+        assert!(
+            matches!(crate::select::plan(&coins, 1_000), crate::select::Plan::WithSplit { .. }),
+            "the dust-floor planner proposes a piece the executor rejects"
+        );
+        assert!(
+            matches!(
+                crate::select::plan_with_floor(&coins, 1_000, executor_floor),
+                crate::select::Plan::Insufficient { .. }
+            ),
+            "planning at the executor's floor must not propose a doomed split"
+        );
+        // Above the floor both agree.
+        assert!(matches!(
+            crate::select::plan_with_floor(&coins, 2_000, executor_floor),
+            crate::select::Plan::WithSplit { .. }
+        ));
     }
 }

@@ -492,15 +492,22 @@ pub async fn execute() -> Result<()> {
     // The guard that opened is "a carrier whose ladder is COLOURED", not "a carrier". A wallet with
     // the coloured lane OFF produces exactly the old shape, and exiting it would burn the asset.
     let _ = std::fs::remove_dir_all("./rgb-data-sdk75_bob");
-    // RE-DERIVED, not weakened. This used to obtain bob's plain carrier from the DEFAULT and assert
-    // the default was off. The default is now ON, so bob opts out explicitly — the negative control
-    // is about a carrier with NO coloured ladder, and how that wallet came to be configured that way
-    // was never the point. The default is pinned in the opposite direction instead, so the flip
-    // itself is now under test rather than merely assumed.
+    // RE-DERIVED, and pinned in the direction the code actually has. bob opts out EXPLICITLY rather
+    // than inheriting: the negative control is about a carrier with NO coloured ladder, and how that
+    // wallet came to be configured that way was never the point — stating it means the control keeps
+    // working whichever way the default later moves.
+    //
+    // The pin below is the same pin, aimed at the truth: `colored_ladder` ships **false** (2c351c6).
+    // Note what that does NOT say about this test. Everything above this line is alice, running with
+    // the lane explicitly ON, carrying an RGB allocation through a full unilateral exit — the lane
+    // is SOUND, and that is proved, not defaulted. What keeps it opt-in is the measured economics of
+    // what it switches on (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`), which is a product decision
+    // and is exactly what this pin stops from moving silently.
     assert!(
-        SdkConfig::regtest("default-probe").colored_ladder,
-        "colored_ladder must now default to ON — CTES-R is the token lane and the legacy \
-         coloured-split lane is retired"
+        !SdkConfig::regtest("default-probe").colored_ladder,
+        "colored_ladder must ship OFF by default (2c351c6) — this test proves the lane WORKS \
+         (alice exits an RGB allocation unilaterally on it), but its economics keep it opt-in. \
+         Flipping the default is a product decision and must not happen silently."
     );
     let mut bob_cfg = SdkConfig::regtest("sdk75_bob");
     bob_cfg.rgb_data_dir = Some("./rgb-data-sdk75_bob".to_string());
@@ -538,7 +545,7 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::load(&cc, "sdk75_bob", &bob_carrier)
             .await?
             .map_or(true, |b| !b.is_colored()),
-        "bob's carrier must NOT be coloured (the lane is off by default)"
+        "bob's carrier must NOT be coloured (his wallet has the lane explicitly OFF)"
     );
     let refused = bob.unilateral_exit(Some(vec![bob_carrier.clone()]), None).await;
     let msg = refused.err().map(|e| e.to_string()).unwrap_or_default();

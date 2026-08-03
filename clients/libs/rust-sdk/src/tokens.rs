@@ -104,26 +104,99 @@ pub(crate) const PIECE_FEE_RATE_HEADROOM: f64 = 2.0;
 /// floors from the real `tesr` functions and fails if this constant ever drops below them.
 pub const TOKEN_PIECE_SATS: u64 = 3_066;
 
-/// Chained token sends one freshly-issued carrier is sized to support before it must be re-funded.
+/// **Chained token sends one carrier supports — PER LANE. [P0-6]**
 ///
-/// This is not a new parameter — it is the capacity the 10_000-sat carrier already had at the legacy
-/// 1_500-sat piece (`5 · (1_500 + 300) + 554 = 9_554 ≤ 10_000`), written down so that raising
-/// [`TOKEN_PIECE_SATS`] cannot silently shrink it. Leaving the carrier at 10_000 while the piece
-/// doubles would cut a token wallet from five sends per carrier to two.
-pub(crate) const CARRIER_SEND_DEPTH: u64 = 5;
+/// There is no single such number, and the former global `CARRIER_SEND_DEPTH = 5` was a claim about
+/// whichever of the two coloured spend lanes the reader happened to have in mind:
+///
+/// | lane | selected by | second send off the same carrier |
+/// |---|---|---|
+/// | LEGACY flat coloured split (`create_colored_split_tx`) | `SdkConfig::colored_ladder == false` | allowed — the change is a plain sub-coin and splits again |
+/// | CTES-R coloured in-ladder split (`colored_in_ladder_pay`) | `SdkConfig::colored_ladder == true` | **STRUCTURALLY REFUSED** |
+///
+/// On the CTES-R lane the change of a coloured split is a depth-1 COLOURED CHILD, and three guards
+/// in `mercuryrustlib::tesr` each independently refuse to carve a second piece out of it:
+/// `refuse_uncolored_over_colored_child` (an uncoloured tier over a sealed output burns the
+/// allocation), `ChildTesrBundle::colored_child_txids` (a coloured child must be depth-1 — a
+/// coloured grandchild has no derivable seal schedule), and `colored_in_ladder_pay` itself, which
+/// loads a ROOT `tesr-` bundle and a child has none. So the CTES-R depth is **1**, not 5, and no
+/// amount of extra sats buys a sixth — or a second — send on that lane.
+///
+/// [`the_two_coloured_lanes_have_different_send_depths`] pins both numbers against the real guards
+/// and the real sizing functions.
+pub(crate) const LEGACY_CARRIER_SEND_DEPTH: u64 = 5;
+/// The CTES-R lane's hard cap. Not a sizing choice — a structural property of the coloured child
+/// bundle (see [`LEGACY_CARRIER_SEND_DEPTH`] for the three guards that enforce it).
+#[allow(dead_code)] // read by the derivation tests and by config's margin derivation
+pub(crate) const CTESR_CARRIER_SEND_DEPTH: u64 = 1;
 
-/// Sats a freshly-issued token carrier is funded with. **DERIVED from [`TOKEN_PIECE_SATS`].**
+/// The split fee reserve on the LEGACY lane for carriers this size: `split_fee_reserve` floors at
+/// 300 sat below a 30_000-sat parent.
+const LEGACY_SPLIT_RESERVE_FLOOR: u64 = 300;
+/// The tail the LEGACY lane's last change must land on: `min_split_output(TIER_COMMITTED_FEE_RATE)`
+/// = `DUST_LIMIT + 112 vB of backup at 2 sat/vB` = `330 + 224`. Not expressible as a `const fn` (the
+/// rate is an `f64`), so [`carrier_supports_the_full_send_depth`] recomputes it from the REAL
+/// `min_split_output` and fails if it ever moves.
+const LEGACY_CARRIER_TAIL: u64 = 554;
+
+/// Sats a LEGACY-lane carrier needs to afford `send_depth` chained flat splits: each send consumes a
+/// piece plus the floored fee reserve, and the last change must still clear the sub-coin floor.
+pub(crate) const fn legacy_carrier_sats(send_depth: u64) -> u64 {
+    send_depth * (TOKEN_PIECE_SATS + LEGACY_SPLIT_RESERVE_FLOOR) + LEGACY_CARRIER_TAIL
+}
+
+/// Sats a CTES-R-lane carrier needs to afford `send_depth` (i.e. one) coloured in-ladder split into
+/// a piece plus a change child. **DERIVED from the REAL coloured sizing functions**, walking exactly
+/// the chain `colored_in_ladder_pay` walks:
 ///
-/// Each colored send off a carrier consumes `TOKEN_PIECE_SATS` (the piece) plus the split fee
-/// reserve, which floors at 300 for carriers this size (`split_fee_reserve`), and the final change
-/// must still clear `min_split_output` — `DUST_LIMIT + 112 · rate` — so it can fund its own backup.
-/// At the protocol rate of [`TIER_COMMITTED_FEE_RATE`] that tail is `330 + 224 = 554`. Hence
-/// `CARRIER_SEND_DEPTH · (TOKEN_PIECE_SATS + 300) + 554` = `5 · 3_366 + 554` = **17_384**, which
-/// splits exactly five times and lands the last change on the 554 floor.
+/// `F` → `T` → `X_0` → `SP`(2 children) → { piece, change }, where every rung is a coloured tier.
+///
+/// Not a `const fn` for the same reason as [`LEGACY_CARRIER_TAIL`] (the rate is an `f64`), which is
+/// why [`TOKEN_CARRIER_SATS`] takes the max of the two lanes in a TEST rather than in the `const`.
+#[allow(dead_code)] // read by the derivation tests; the function IS the documentation
+pub(crate) fn ctesr_carrier_sats(send_depth: u64, fee_rate: f64) -> u64 {
+    use mercurylib::tesr::P2A_VALUE;
+    use mercuryrustlib::rgb::colored_committed_fee;
+    use mercuryrustlib::tesr::{colored_child_floor, COLORED_LADDER_DUST};
+    // `SP`'s children: `send_depth` pieces plus the change child that keeps the rest of the
+    // allocation. Each must clear `colored_child_floor` (its own two coloured rungs + dust); the
+    // pieces are carved at `TOKEN_PIECE_SATS`, which already exceeds that floor.
+    let n_children = (send_depth + 1) as usize;
+    let at_sp = send_depth * TOKEN_PIECE_SATS + colored_child_floor(fee_rate, COLORED_LADDER_DUST);
+    // Add back the rungs between `F` and `SP`, each the exact inverse of the REAL
+    // `colored_tier_out_total` (`prev − colored_committed_fee(n) − P2A`): `SP` carries `n_children`
+    // payload outputs, `X_0` and `T` one each.
+    at_sp
+        + (colored_committed_fee(n_children, fee_rate) + P2A_VALUE)
+        + 2 * (colored_committed_fee(1, fee_rate) + P2A_VALUE)
+}
+
+/// Sats a freshly-issued token carrier is funded with.
+///
+/// **DERIVED, and derived from the LARGER of the two lanes' requirements. [P0-6]**
+///
+/// A carrier is FUNDED at issuance, before the lane its future sends will take is known: the lane is
+/// chosen per spend by `SdkConfig::colored_ladder`, which a wallet may flip at any time between
+/// issuing a carrier and spending it. Sizing for one lane therefore has to mean sizing for both, and
+/// the failure directions are not symmetric — an over-sized carrier parks sats in a change child,
+/// an under-sized one is refused at spend time with the carrier already terminalized. Fail closed:
+///
+/// | lane | derived requirement |
+/// |---|---|
+/// | LEGACY, `LEGACY_CARRIER_SEND_DEPTH` = 5 | `5 · (3_066 + 300) + 554` = **17_384** |
+/// | CTES-R, `CTESR_CARRIER_SEND_DEPTH` = 1 | `T`+`X_0`+`SP(2)` over piece + child floor = **6_362** |
+///
+/// so the carrier is **17_384**, the max. The SATS did not move; what moved is that they are now
+/// derived from BOTH lanes and that the "splits exactly five times" claim is scoped to the lane
+/// where it is true. On the CTES-R lane 17_384 buys ONE send and the remaining ~11_000 sat land in
+/// the depth-1 change child, which can only be moved whole or exited — that is a real cost of the
+/// coloured lane, recorded here rather than hidden behind a number that reads like five sends.
 ///
 /// `pub` so the E2Es filter carriers by THIS constant instead of a copied literal.
-/// [`carrier_supports_the_full_send_depth`] walks the five sends through the REAL split guard.
-pub const TOKEN_CARRIER_SATS: u64 = CARRIER_SEND_DEPTH * (TOKEN_PIECE_SATS + 300) + 554;
+/// [`carrier_supports_the_full_send_depth`] walks the five LEGACY sends through the REAL split
+/// guard; [`the_two_coloured_lanes_have_different_send_depths`] recomputes both rows of the table
+/// above from the REAL coloured sizing functions and fails if either lane outgrows this constant.
+pub const TOKEN_CARRIER_SATS: u64 = legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH);
 
 /// Rung-space flag that separates the BATCH split lane from the single-recipient split lane.
 ///
@@ -5358,26 +5431,41 @@ mod piece_floor_tests {
     /// would still be admissible, just exhausted after two sends instead of five. So the five sends
     /// are actually executed against the REAL admission guard (`split_amounts_floored` with the real
     /// `min_split_output`), and the SIXTH is required to fail.
+    ///
+    /// This is the **LEGACY flat coloured-split lane only** — the lane that runs while
+    /// `SdkConfig::colored_ladder` is off. The CTES-R lane's very different capacity is
+    /// [`the_two_coloured_lanes_have_different_send_depths`].
     #[test]
     fn carrier_supports_the_full_send_depth() {
-        use super::{CARRIER_SEND_DEPTH, TOKEN_CARRIER_SATS};
+        use super::{legacy_carrier_sats, LEGACY_CARRIER_SEND_DEPTH, TOKEN_CARRIER_SATS};
         use crate::transfer::{min_split_output, split_amounts_floored};
 
         let min_output = min_split_output(TIER_COMMITTED_FEE_RATE);
+        // The two literals `legacy_carrier_sats` cannot express as a `const fn`, re-derived from the
+        // REAL functions so a change to either fails HERE rather than silently under-funding.
         assert_eq!(min_output, 554, "330 dust + 112 vB of backup at 2 sat/vB");
+        assert_eq!(super::LEGACY_CARRIER_TAIL, min_output, "the carrier tail IS min_split_output");
+        assert_eq!(
+            super::LEGACY_SPLIT_RESERVE_FLOOR,
+            crate::transfer::split_fee_reserve(TOKEN_CARRIER_SATS),
+            "the reserve floors at 300 for carriers this size"
+        );
         assert_eq!(TOKEN_CARRIER_SATS, 17_384, "5 * (3066 + 300) + 554");
+        assert_eq!(TOKEN_CARRIER_SATS, legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH));
 
         let mut carrier = TOKEN_CARRIER_SATS;
-        for send in 1..=CARRIER_SEND_DEPTH {
-            let (change, reserve) = split_amounts_floored(carrier, TOKEN_PIECE_SATS, min_output)
-                .unwrap_or_else(|e| panic!("send {send} of {CARRIER_SEND_DEPTH} was refused: {e}"));
+        for send in 1..=LEGACY_CARRIER_SEND_DEPTH {
+            let (change, reserve) =
+                split_amounts_floored(carrier, TOKEN_PIECE_SATS, min_output).unwrap_or_else(|e| {
+                    panic!("send {send} of {LEGACY_CARRIER_SEND_DEPTH} was refused: {e}")
+                });
             assert_eq!(reserve, 300, "the fee reserve floors at 300 for carriers this size");
             carrier = change;
         }
         assert_eq!(carrier, min_output, "the last change lands exactly on the output floor");
         assert!(
             split_amounts_floored(carrier, TOKEN_PIECE_SATS, min_output).is_err(),
-            "the carrier is sized for exactly {CARRIER_SEND_DEPTH} sends, not more"
+            "the carrier is sized for exactly {LEGACY_CARRIER_SEND_DEPTH} legacy sends, not more"
         );
 
         // The capacity is PRESERVED, not invented: the legacy 10_000-sat carrier gave the same five
@@ -5389,7 +5477,7 @@ mod piece_floor_tests {
             legacy = change;
             legacy_depth += 1;
         }
-        assert_eq!(legacy_depth, CARRIER_SEND_DEPTH, "the legacy carrier's capacity");
+        assert_eq!(legacy_depth, LEGACY_CARRIER_SEND_DEPTH, "the legacy carrier's capacity");
         let mut unraised = 10_000u64;
         let mut unraised_depth = 0;
         while let Ok((change, _)) = split_amounts_floored(unraised, TOKEN_PIECE_SATS, min_output) {
@@ -5397,6 +5485,90 @@ mod piece_floor_tests {
             unraised_depth += 1;
         }
         assert_eq!(unraised_depth, 2, "a 10_000-sat carrier at the new piece size: only 2 sends");
+    }
+
+    /// **[P0-6] THE two lanes do not have the same send depth, and the carrier is sized for both.**
+    ///
+    /// `CARRIER_SEND_DEPTH = 5` used to be a single global constant, and on the CTES-R coloured
+    /// in-ladder lane it is simply false: the change of a coloured split is a depth-1 coloured
+    /// child, and a coloured child can never be split again. Three things are pinned here:
+    ///
+    /// 1. the CTES-R requirement, recomputed from the REAL coloured sizing functions along exactly
+    ///    the chain `colored_in_ladder_pay` walks (`F → T → X_0 → SP(2) → {piece, change}`);
+    /// 2. that [`TOKEN_CARRIER_SATS`] covers BOTH lanes — the carrier is funded at issuance, before
+    ///    `SdkConfig::colored_ladder` has decided which lane the spend will take;
+    /// 3. that the CTES-R depth cap is STRUCTURAL, by a source census over the three guards in
+    ///    `mercuryrustlib::tesr` that enforce it. A census and not a behavioural test for the same
+    ///    reason `retired_split_lane_census` is one: the hazard is a future route, and the number it
+    ///    would invalidate is a `const` nothing else re-derives.
+    #[test]
+    fn the_two_coloured_lanes_have_different_send_depths() {
+        use super::{
+            ctesr_carrier_sats, legacy_carrier_sats, CTESR_CARRIER_SEND_DEPTH,
+            LEGACY_CARRIER_SEND_DEPTH, TOKEN_CARRIER_SATS,
+        };
+        use mercuryrustlib::rgb::{colored_tier_out_total, colored_tier_out_value};
+        use mercuryrustlib::tesr::{colored_child_floor, COLORED_LADDER_DUST};
+
+        let rate = TIER_COMMITTED_FEE_RATE;
+        assert_eq!(CTESR_CARRIER_SEND_DEPTH, 1, "a coloured child can never be split again");
+
+        // 1. The CTES-R requirement, and it is the exact inverse of the real forward walk: fund a
+        //    carrier with it and `T`, `X_0`, `SP` leave precisely piece + floored change.
+        let need = ctesr_carrier_sats(CTESR_CARRIER_SEND_DEPTH, rate);
+        assert_eq!(need, 6_362, "T 576 + X_0 576 + SP(2) 662 + piece 3_066 + child floor 1_482");
+        let after_t = colored_tier_out_value(need, rate).expect("T fits");
+        let after_x = colored_tier_out_value(after_t, rate).expect("X_0 fits");
+        let at_sp = colored_tier_out_total(after_x, 2, rate).expect("SP with 2 children fits");
+        let floor = colored_child_floor(rate, COLORED_LADDER_DUST);
+        assert_eq!(
+            at_sp,
+            TOKEN_PIECE_SATS + floor,
+            "the derived carrier leaves exactly one piece plus a change child on the floor"
+        );
+        // One sat less and the change child falls below its floor — i.e. `need` is TIGHT, so the
+        // `>=` below is a real check and not a vacuous one.
+        let at_sp_short = colored_tier_out_total(
+            colored_tier_out_value(colored_tier_out_value(need - 1, rate).unwrap(), rate).unwrap(),
+            2,
+            rate,
+        )
+        .unwrap();
+        assert!(at_sp_short - TOKEN_PIECE_SATS < floor, "one sat less strands the change child");
+
+        // 2. The shipped constant is the MAX of the two lanes, because issuance does not know the
+        //    lane. Under-sizing is a refusal after the carrier is terminalized; over-sizing only
+        //    parks sats in the change child.
+        let legacy = legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH);
+        assert_eq!(TOKEN_CARRIER_SATS, legacy.max(need), "sized for whichever lane is dearer");
+        assert!(TOKEN_CARRIER_SATS >= need, "a CTES-R carrier must be able to make its ONE send");
+        assert!(
+            TOKEN_CARRIER_SATS >= legacy,
+            "a LEGACY carrier must be able to make its {LEGACY_CARRIER_SEND_DEPTH} sends"
+        );
+
+        // 3. The depth-1 cap is structural. `colored_in_ladder_pay` only ever loads a ROOT `tesr-`
+        //    bundle, and these two guards refuse a coloured child that tries to be a parent.
+        let tesr_src = include_str!("../../rust/src/tesr.rs");
+        for guard in [
+            "pub fn refuse_uncolored_over_colored_child(",
+            "pub fn colored_child_txids(",
+            "a coloured child must be depth-1",
+        ] {
+            assert!(
+                tesr_src.contains(guard),
+                "the CTES-R send depth of {CTESR_CARRIER_SEND_DEPTH} rests on `{guard}` in \
+                 clients/libs/rust/src/tesr.rs, which is no longer there — either a coloured \
+                 child-level split now exists (raise CTESR_CARRIER_SEND_DEPTH and re-derive the \
+                 carrier) or the guard was renamed and this census must follow it"
+            );
+        }
+        let ladder_src = include_str!("tokens.rs");
+        assert!(
+            ladder_src.contains("carrier {carrier_id} has no TES-R ladder to split in-ladder"),
+            "colored_in_ladder_pay must keep refusing a carrier without a ROOT `tesr-` bundle — \
+             that refusal is the third leg of the depth-1 cap"
+        );
     }
 }
 

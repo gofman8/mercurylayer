@@ -388,18 +388,19 @@
 #
 
 # ================================================================================================
-# clients/libs/rust-sdk/src/transfer.rs — DEFERRED (file owned by another session this round; reported, not edited)
+# clients/libs/rust-sdk/src/transfer.rs
 # ================================================================================================
-# Same fee-floor fallback as refresh.rs: 1.0 sat/vB is the lower bound, so a failed estimate
-# UNDER-states the renewal fee in the quote. Under-stating makes more coins look fundable, which
-# is a wrong quote, not a lost coin. Deferred with the file.
-1	clients/libs/rust-sdk/src/transfer.rs	await-unwrap_or	let rate = backup_fee_rate(&self.inner.cc).await.unwrap_or(1.0);
-#
-# ⚠️ SUSPECT — quote_transfer(): an empty carrier set makes is_token_carrier() false for every
-# coin, so an RGB CARRIER is quoted as spendable plain BTC. Quote-only (transfer itself
-# re-derives the set), but it is the exact F3 shape and it is one refactor away from being the
-# selection path. Deferred: transfer.rs is another session's file this round.
-1	clients/libs/rust-sdk/src/transfer.rs	await-unwrap_or_default	let carriers = self.unspendable_as_btc_outpoints().await.unwrap_or_default();
+# [B2/B3, round 2] THREE sites that were deferred here last round are now FIXED, not allowlisted,
+# and their entries are deleted rather than left to rot:
+#   * `backup_fee_rate(..).await.unwrap_or(1.0)`  — the quote's fee rate. It feeds the split FLOOR,
+#     so a defaulted 1.0 sat/vB computed a LOWER floor than the executor's and reported unfundable
+#     payments as fundable. Now propagates.
+#   * `unspendable_as_btc_outpoints().await.unwrap_or_default()` — the quote's RGB carrier set. An
+#     empty set quoted a carrier as spendable plain BTC, which `transfer` then refuses; the two
+#     sides must see the same wallet. Now propagates.
+#   * `tesr::load(..).await.unwrap_or(None)` — a failed ladder read became "this parent has no
+#     ladder", i.e. the cheaper cost model AND the lower floor. Now propagates, via
+#     `UtexoWallet::parent_shape`.
 #
 # Two sites: `parent_backups` = the count of existing backup rows, used only to pick the NEXT
 # tx_n for the split's backup row. A 0 from a failed read would COLLIDE with an existing tx_n

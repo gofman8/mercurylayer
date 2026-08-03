@@ -112,6 +112,10 @@ off-chain, whole or split); **Lightning both directions** on the ladder via a HO
   un-laddered shape's absolute-locktime machinery and duties. *Normative.*
 - [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) — normative `GRN-*` for partial amounts: split bounds,
   floors, raw token units, error semantics. *Normative.*
+- [ADMISSION-INPUTS.md](ADMISSION-INPUTS.md) — every input to the exit-headroom gate and who supplies
+  it: backend, config, operator, signature, or declared. Written because the "gate computes its
+  requirement from a sender-chosen number" defect appeared three times. *Normative; read before
+  adding any admission check.*
 - [PARITY.md](PARITY.md) — Spark ↔ Mercury+RGB feature matrix, every row citing the live test.
   *Evaluators.*
 - [ARK-SPARK-PARITY.md](ARK-SPARK-PARITY.md) — our off-chain transfer mapped against Ark out-of-round

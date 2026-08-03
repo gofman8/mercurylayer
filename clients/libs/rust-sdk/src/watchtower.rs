@@ -40,6 +40,30 @@ use crate::wallet::UtexoWallet;
 /// ("I could not look") must not both be an empty `Vec<String>`.
 pub use mercuryrustlib::tesr::WatchState;
 
+/// **An EVENT trigger for a watched coin**, for the races that do not start at a fixed height.
+///
+/// `deadline_block` can only express *"act before height H"*. A laddered coin's race does not have
+/// one: it starts when somebody **spends an outpoint** — the sender broadcasting the trigger `T`
+/// over `F`, or, on a CATS spine, the sender confirming `SP_i` and thereby starting the `Δ_cap`
+/// countdown on their own retained cap over `O_i`. There is no height to compare against, so a
+/// height-only tower evaluates its one predicate, finds nothing due, and reports `Idle` for the
+/// entire race window. That is the repo's silent-degradation shape (`PARTIAL-PAYMENT-ECONOMICS.md`
+/// §4.7) and it is why this type exists.
+///
+/// Keyless like the rest of the bundle: `push_txs` are already fully signed and pay only the owner.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatchTrigger {
+    /// The outpoint whose SPEND starts the race.
+    pub watch_txid: String,
+    pub watch_vout: u32,
+    /// Blocks between that spend confirming and the rival transaction maturing — the budget the
+    /// tower has to get `push_txs` confirmed. Informational for the pass itself (which acts
+    /// immediately), and the number an operator needs to size their polling interval.
+    pub csv_blocks: u32,
+    /// What to broadcast when the trigger fires, root-first. Normally the entry's own exit chain.
+    pub push_txs: Vec<String>,
+}
+
 /// One watched coin: everything needed to protect it, nothing needed to steal it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WatchEntry {
@@ -57,6 +81,11 @@ pub struct WatchEntry {
     pub backup_tx: Option<String>,
     /// `backup_tx`'s nLockTime (broadcastable from this height).
     pub backup_locktime: Option<u32>,
+    /// The event trigger, when this coin's race is not height-based. `#[serde(default)]` so a
+    /// bundle exported before triggers existed still parses — but note that such a bundle is
+    /// height-only by construction, which is a REASON TO RE-EXPORT rather than a compatibility win.
+    #[serde(default)]
+    pub trigger: Option<WatchTrigger>,
 }
 
 /// A keyless watchtower bundle: watch entries for every off-chain coin of a wallet.
@@ -106,19 +135,66 @@ impl UtexoWallet {
             // `read_exit_branch` is the read that separates the two: `Ok(vec![])` is a verified
             // absence, `Err` is a real fault.
             let branch = self.read_exit_branch(&id).await?;
-            if branch.is_empty() {
+            // A LADDERED coin's race is an EVENT, not a height, so it never had an entry here: its
+            // `exit_deadline_block` is legitimately `None` (an idle ladder never ages) and the
+            // `else { continue }` below dropped it. The consequence was that delegating to a
+            // third-party tower protected only the un-laddered coins, silently — the owner's
+            // laddered coins were covered by the in-process `defend_ladders` pass alone, i.e. only
+            // while they were online, which is the one condition a watchtower exists to remove.
+            //
+            // `?` and not `unwrap_or(None)`: a failed ladder read must not read as "flat coin".
+            let ladder = mercuryrustlib::tesr::load(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?;
+            if branch.is_empty() && ladder.is_none() {
                 continue; // flat coin: on-chain funding, no ancestor can race it
             }
             let est = self.estimate_exit_cost(&id).await?;
-            // [C1] `branch` is non-empty here (checked above), so this coin HAS a deadline. A
-            // missing `exit_deadline_block` at this point is therefore never "flat coin, nothing
-            // can race it" — it is "I could not compute it", and silently `continue`ing on it would
-            // drop the entry from the exported bundle exactly like the `unwrap_or_default()` the
-            // comment above describes. Same fail-closed rule.
+            // [C1] This coin has an exit branch or a ladder (checked above), so it is watchable. A
+            // missing `exit_deadline_block` here is therefore never "flat coin, nothing can race
+            // it" — it is either "this coin's race is an event, not a height" (the ladder case,
+            // handled below) or "I could not compute it", and silently `continue`ing on the second
+            // would drop the entry from the exported bundle exactly like the `unwrap_or_default()`
+            // the comment above describes. Same fail-closed rule.
+            //
+            // **This check runs BEFORE the ladder case on purpose.** Handling laddered coins first
+            // let a coin with an UNCOMPUTABLE deadline take the ladder branch and skip this refusal
+            // — the very silent omission the rule exists to prevent, reintroduced by the fix for a
+            // different silent omission. sdk72 part C6 is the test that says so.
             if let Some(reason) = est.exit_deadline_blind.as_deref() {
                 return Err(anyhow!(
                     "refusing to export a watch bundle that silently omits {id}: {reason}"
                 ));
+            }
+            // The LADDERED lane: an event trigger instead of a height. Watch `F`, and when somebody
+            // spends it (a prior owner or griefer broadcasting `T`), push the owner's own pre-signed
+            // tiers. `deadline_block: u32::MAX` keeps the height predicate permanently false so the
+            // two predicates stay independent.
+            if let Some(tb) = ladder {
+                entries.push(WatchEntry {
+                    statechain_id: id.clone(),
+                    token_carrier: crate::wallet::is_token_carrier(coin, &carriers),
+                    deadline_block: u32::MAX,
+                    branch_txs: Vec::new(),
+                    // A laddered coin is never swept by an absolute-locktime backup: its exit is the
+                    // tier chain. Withholding the backup here is the same structural denial the
+                    // carrier case relies on.
+                    backup_tx: None,
+                    backup_locktime: None,
+                    trigger: Some(WatchTrigger {
+                        watch_txid: tb.f_txid.clone(),
+                        watch_vout: tb.f_vout,
+                        // The budget is the next tier's own relative timelock: once `T` confirms,
+                        // `X_m` cannot be mined for that many blocks, and the owner's exit must be
+                        // under way by then.
+                        csv_blocks: tb.current().extension.csv.unwrap_or(0) as u32,
+                        push_txs: tb.exit_tiers().iter().map(|t| t.signed_tx.clone()).collect(),
+                    }),
+                });
+                continue;
             }
             let Some(deadline) = est.exit_deadline_block else { continue };
             let carrier = crate::wallet::is_token_carrier(coin, &carriers);
@@ -144,6 +220,7 @@ impl UtexoWallet {
                 branch_txs: branch.iter().map(|b| b.tx.clone()).collect(),
                 backup_tx,
                 backup_locktime,
+                trigger: None, // this lane's race genuinely IS a height
             });
         }
 
@@ -161,10 +238,16 @@ impl UtexoWallet {
 ///
 /// Returns a typed [`WatchState`] (external review F4):
 ///
-/// - [`WatchState::Idle`] — the tip was read and **every** entry is comfortably ahead of its
-///   deadline. A positive observation: nothing needed doing.
+/// An entry is due when EITHER of its two predicates fires: the height one (`tip + margin >=
+/// deadline_block`) or, if it carries a [`WatchTrigger`], the event one (the watched outpoint has
+/// been spent). A coin whose race has no fixed height needs the second — see [`WatchTrigger`].
+///
+/// - [`WatchState::Idle`] — the tip was read, **every** entry was evaluated on both predicates, and
+///   none was due. A positive observation: nothing needed doing.
 /// - [`WatchState::Acted`] — `ids` are the statechain_ids driven this pass, `failures` the entries
-///   that could not be driven. Idempotent: a tx already in the mempool or mined counts as success,
+///   that could not be driven, and `blind` the entries that could not be EVALUATED (their trigger
+///   outpoint was unreadable) — those were not watched at all this pass and must be alerted on, not
+///   counted as quiet. Idempotent: a tx already in the mempool or mined counts as success,
 ///   so running this from several independent watchtowers (or repeatedly) is safe — they all
 ///   broadcast the same pre-signed transactions. A genuinely rejected broadcast (e.g. the root
 ///   already spent by a competing tx — the exit being RACED) fails that entry's remaining txs and
@@ -191,11 +274,45 @@ pub fn watch_pass(
     };
     let mut ids = Vec::new();
     let mut failures = Vec::new();
+    let mut blind = Vec::new();
     for e in &bundle.entries {
-        if tip + margin_blocks < e.deadline_block {
-            continue; // comfortably ahead of the deadline
+        // Two independent reasons to act, and the entry is due if EITHER fires.
+        let deadline_due = tip + margin_blocks >= e.deadline_block;
+        // The event trigger. `outpoint_spent` separates "the outpoint is verifiably still unspent"
+        // from "I could not find out": the second is recorded as blindness for THIS entry and the
+        // pass moves on to the others, because one unreadable coin must neither stop the tower nor
+        // be averaged into a green `Idle`.
+        let (event_due, unreadable) = match &e.trigger {
+            None => (false, None),
+            Some(t) => match mercuryrustlib::tesr::outpoint_spent(
+                electrum,
+                &t.watch_txid,
+                t.watch_vout,
+            ) {
+                Ok(spent) => (spent, None),
+                Err(err) => (
+                    false,
+                    Some(format!(
+                        "{}: trigger outpoint {}:{} unreadable, so this coin was NOT watched this \
+                         pass ({} blocks of race budget if it has already fired): {err}",
+                        e.statechain_id, t.watch_txid, t.watch_vout, t.csv_blocks
+                    )),
+                ),
+            },
+        };
+        if let Some(reason) = unreadable {
+            blind.push(reason);
+            continue;
         }
-        let mut txs: Vec<&String> = e.branch_txs.iter().collect();
+        if !deadline_due && !event_due {
+            continue; // evaluated both predicates; genuinely nothing to do for this coin
+        }
+        // A fired trigger pushes its own chain; a deadline pushes the branch. When both fire the
+        // trigger's list wins — it is the one written for the race that is actually running.
+        let mut txs: Vec<&String> = match (&e.trigger, event_due) {
+            (Some(t), true) => t.push_txs.iter().collect(),
+            _ => e.branch_txs.iter().collect(),
+        };
         if let (Some(bk), Some(lock)) = (&e.backup_tx, e.backup_locktime) {
             if tip >= lock {
                 txs.push(bk);
@@ -227,11 +344,14 @@ pub fn watch_pass(
             ids.push(e.statechain_id.clone());
         }
     }
-    if ids.is_empty() && failures.is_empty() {
-        // The tip WAS read and no entry was inside its margin — genuinely nothing to do.
+    if ids.is_empty() && failures.is_empty() && blind.is_empty() {
+        // The tip WAS read and EVERY entry was evaluated — both its deadline and, where it has one,
+        // its trigger — and none was due. `blind` is in this condition deliberately: an entry the
+        // pass could not evaluate makes the answer "I don't know", and `Idle` is reserved for the
+        // positive observation.
         WatchState::Idle
     } else {
-        WatchState::Acted { ids, failures }
+        WatchState::Acted { ids, failures, blind }
     }
 }
 
@@ -264,6 +384,7 @@ mod tests {
                     branch_txs: vec!["aa".into()],
                     backup_tx: None,
                     backup_locktime: None,
+                    trigger: None,
                 },
                 WatchEntry {
                     statechain_id: "plain".into(),
@@ -272,6 +393,7 @@ mod tests {
                     branch_txs: vec!["bb".into()],
                     backup_tx: Some("cc".into()),
                     backup_locktime: Some(990),
+                    trigger: None,
                 },
             ],
         };
@@ -345,8 +467,77 @@ mod tests {
                 branch_txs: vec!["aa".into()],
                 backup_tx: None,
                 backup_locktime: None,
+                trigger: None,
             }],
         }
+    }
+
+    /// A laddered coin's entry: no usable deadline, an EVENT trigger instead.
+    fn bundle_with_trigger() -> WatchBundle {
+        WatchBundle {
+            version: 1,
+            wallet_name: "w".into(),
+            entries: vec![WatchEntry {
+                statechain_id: "laddered".into(),
+                token_carrier: false,
+                deadline_block: u32::MAX,
+                branch_txs: vec![],
+                backup_tx: None,
+                backup_locktime: None,
+                trigger: Some(WatchTrigger {
+                    watch_txid: "1".repeat(64),
+                    watch_vout: 0,
+                    csv_blocks: 720,
+                    push_txs: vec!["aa".into()],
+                }),
+            }],
+        }
+    }
+
+    /// **§4.7.** The defect this trigger exists for, asserted as a behaviour rather than a comment:
+    /// a coin whose race is an EVENT must not be reported as quiet just because its height predicate
+    /// is false. Before the trigger the entry below evaluated `tip + margin < u32::MAX`, found
+    /// nothing due, and returned `Idle` — for the whole race window, every pass, forever.
+    #[test]
+    fn an_unevaluable_trigger_is_blind_not_idle() {
+        // The tip IS readable (so this is not the whole-pass Blind case), but the trigger outpoint
+        // cannot be resolved by this stub backend.
+        let state = watch_pass(&bundle_with_trigger(), &electrum_at_tip(100), 6);
+        assert!(
+            !state.is_idle(),
+            "an entry that could not be evaluated must never report Idle, got {state:?}"
+        );
+        assert!(
+            !state.blind_entries().is_empty(),
+            "the unwatched coin must be named, got {state:?}"
+        );
+        assert!(state.any_blindness(), "any_blindness is the alert predicate a tower must use");
+        assert!(
+            state.blind_entries()[0].contains("laddered")
+                && state.blind_entries()[0].contains("NOT watched"),
+            "the reason must name the coin and say it went unwatched, got {:?}",
+            state.blind_entries()
+        );
+    }
+
+    /// Non-vacuity for the test above: the SAME entry, with its trigger removed, is `Idle` on the
+    /// same backend. So the assertion is detecting the trigger evaluation, not a broken stub.
+    #[test]
+    fn the_same_entry_without_a_trigger_is_idle() {
+        let mut b = bundle_with_trigger();
+        b.entries[0].trigger = None;
+        let state = watch_pass(&b, &electrum_at_tip(100), 6);
+        assert_eq!(state, WatchState::Idle, "no trigger, deadline far away — genuinely idle");
+    }
+
+    /// An old bundle (exported before triggers existed) still deserialises, and is height-only.
+    #[test]
+    fn a_pre_trigger_bundle_still_parses() {
+        let json = r#"{"version":1,"wallet_name":"w","entries":[{"statechain_id":"old",
+            "token_carrier":false,"deadline_block":1000,"branch_txs":["aa"],
+            "backup_tx":null,"backup_locktime":null}]}"#;
+        let b: WatchBundle = serde_json::from_str(json).expect("old bundle parses");
+        assert!(b.entries[0].trigger.is_none());
     }
 
     /// **F4.** A tower that cannot read the chain tip evaluated NO deadline and watched NOTHING. It

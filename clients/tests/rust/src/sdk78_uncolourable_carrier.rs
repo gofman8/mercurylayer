@@ -1,6 +1,7 @@
 //! E2E (SDK_E2E=78) — **[B1] the CTES-R flip must not strand a carrier it cannot colour.**
 //!
-//! `colored_ladder` now defaults ON, and with it on a carrier that has no COLOURED ladder is refused
+//! On a wallet running the CTES-R lane (`colored_ladder` ON — set explicitly by all three wallets
+//! here; it ships OFF, see the note at the config block), a carrier that has no COLOURED ladder is refused
 //! by every route: the legacy RGB-aware split/combine lane is retired, `unilateral_exit` refuses it
 //! ("its ladder is not COLOURED"), and `withdraw` refuses it as a carrier. For a carrier that is
 //! merely WAITING for its ladder that is right — a later `claim()` colours it and it moves. For a
@@ -199,10 +200,28 @@ pub async fn execute() -> Result<()> {
     // and land, booked, somewhere else.
     let mut carol_cfg = SdkConfig::regtest("sdk78_carol");
     carol_cfg.rgb_data_dir = Some("./rgb-data-sdk78_carol".to_string());
-    // The flip itself is under test: every wallet takes the DEFAULT, and the default is asserted.
+    // THE FLIP IS THE PREMISE, SO IT IS SET, NOT INHERITED.
+    //
+    // This test is about what a wallet running the CTES-R lane does to a carrier it can never
+    // colour, and the stranding it probes is CAUSED by the lane being on: `refuse_legacy_colored_
+    // split_lane` only fires when `config.colored_ladder` is true, and the migration hatch only
+    // exists to reopen what that refusal closes. With the lane off there is no retirement gate,
+    // nothing is stranded, and (a)/(b)/(c) below would all pass vacuously.
+    //
+    // It used to read the flag off the DEFAULT and assert the default was ON. The default ships
+    // **false** (2c351c6) — the lane is sound (sdk74/sdk75) but its economics keep it opt-in
+    // (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`). So the three wallets opt in by name and the
+    // assertion below checks the thing that is actually load-bearing here: that every wallet in
+    // this test IS running the lane, which is what makes the trap reachable at all. Nothing about
+    // the stranding class, the floors or the hatch changes — 1_500 sits between the same two
+    // floors whatever the default is.
+    alice_cfg.colored_ladder = true;
+    bob_cfg.colored_ladder = true;
+    carol_cfg.colored_ladder = true;
     assert!(
         alice_cfg.colored_ladder && bob_cfg.colored_ladder && carol_cfg.colored_ladder,
-        "colored_ladder must default ON — this test is about what that flip does to legacy carriers"
+        "every wallet here must run the CTES-R lane — this test is about what that lane does to \
+         legacy carriers, and with it off there is nothing to strand"
     );
     let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;

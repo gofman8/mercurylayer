@@ -116,8 +116,19 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk31_alice"), None).await?;
-    let (bob, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk31_bob"), None).await?;
+    // [CTES-R] The COLOURED lane is asked for BY NAME, on both wallets.
+    //
+    // `SdkConfig::colored_ladder` defaults to **false** (2c351c6): what keeps the lane off by
+    // default is its measured economics (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`), not any doubt
+    // about its soundness. This test is about the multi-carrier PAYMENT shape on that lane, so it
+    // enables the lane rather than inheriting it — a test that asserted the default would be
+    // testing the shipping decision instead. The default itself is pinned by sdk74/sdk75.
+    let mut alice_cfg = SdkConfig::regtest("sdk31_alice");
+    alice_cfg.colored_ladder = true;
+    let mut bob_cfg = SdkConfig::regtest("sdk31_bob");
+    bob_cfg.colored_ladder = true;
+    let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
+    let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
     let bob_addr = bob.get_utexo_address().await?;
 
     // Fund alice's RGB engine (issuance + mint witnesses).
@@ -151,8 +162,8 @@ pub async fn execute() -> Result<()> {
 
     // [CTES-R] Wait for BOTH carriers' COLOURED ladders before paying.
     //
-    // Synchronisation, not relaxation: `colored_ladder` is now on by default, so `claim()` builds a
-    // coloured ladder over each carrier — but only once that carrier's allocation is BOOKED, which
+    // Synchronisation, not relaxation: alice runs with `colored_ladder` ON (set above), so `claim()`
+    // builds a coloured ladder over each carrier — but only once that carrier's allocation is BOOKED, which
     // can land in the same pass as the balance or in the next one. Without this the payment would
     // sometimes be attempted before the ladders exist and be refused by the retired-lane gate.
     let mut colored_sids: Vec<String> = Vec::new();

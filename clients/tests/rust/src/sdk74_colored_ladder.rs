@@ -54,7 +54,8 @@
 //!      is an INTERNAL seal of the chain it was handed, not the output that pays it;
 //!  11. and a wallet that OPTS OUT is unchanged: with `colored_ladder` explicitly off, carol's own
 //!      carrier stays flat (`LadderSkipped { RgbCarrier }`) and still transfers tokens end-to-end on
-//!      the legacy lane. (The DEFAULT is now ON; that is pinned separately, at the top of the test.)
+//!      the legacy lane. (`colored_ladder` also SHIPS off — alice and bob opt in by name; that
+//!      default is pinned separately, at the top of the test, so it cannot move silently either.)
 //!
 //! Run: SDK_E2E=74 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
@@ -115,17 +116,24 @@ pub async fn execute() -> Result<()> {
     alice_cfg.colored_ladder = true;
     // carol: the CONTROL wallet — coloured ladders explicitly OFF.
     //
-    // RE-DERIVED, not weakened. This used to read `assert!(!carol_cfg.colored_ladder)` and rely on
-    // the DEFAULT to supply the off state. The default is now ON (the legacy split lane it rivalled
-    // is retired), so the control has to opt out by hand — but the property carol exists to prove is
-    // unchanged: a wallet running with the lane OFF still leaves its own carrier flat, and can still
-    // RECEIVE a coloured ladder built by someone else. Both halves are still asserted below. The
-    // default itself is now pinned in the opposite direction, one line down, so the flip cannot be
-    // reverted silently either.
+    // RE-DERIVED, and pinned in the direction the code actually has. carol has always had to prove
+    // the same two things — a wallet running with the lane OFF leaves its own carrier flat, and can
+    // still RECEIVE a coloured ladder built by someone else — and both halves are still asserted
+    // below. She sets the flag by hand regardless of what the default is, so the control states the
+    // lane it is controlling for rather than inheriting it.
+    //
+    // The pin below is the same pin, aimed at the truth: `colored_ladder` ships **false** (2c351c6).
+    // The lane is SOUND — that is what alice proves in this very test — but it is not the default,
+    // because of the measured economics of what it switches on
+    // (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
+    // and a 4_284-block unilateral exit for the child it produces). Keeping the pin means the
+    // shipping default still cannot move without a test saying so; alice and bob opt IN explicitly,
+    // ten lines up and down, so what this test proves about the lane is untouched by it.
     assert!(
-        SdkConfig::regtest("default-probe").colored_ladder,
-        "colored_ladder must now default to ON — CTES-R is the token lane and the legacy \
-         coloured-split lane is retired"
+        !SdkConfig::regtest("default-probe").colored_ladder,
+        "colored_ladder must ship OFF by default (2c351c6) — the lane is sound (this test proves \
+         it) but its economics are not, so it is opt-in. Flipping the default is a product \
+         decision and must not happen silently."
     );
     let mut carol_cfg = SdkConfig::regtest("sdk74_carol");
     carol_cfg.rgb_data_dir = Some("./rgb-data-sdk74_carol".to_string());

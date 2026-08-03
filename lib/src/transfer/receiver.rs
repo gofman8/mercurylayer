@@ -545,6 +545,230 @@ pub fn verify_if_locktime_is_reasonable_tx_version_and_output_size(tx_n_hex: &st
     Ok(())
 }
 
+// =================================================================================================
+// [P0-1 / P0-2] EXIT-HEADROOM ADMISSION — the epoch a conveyed off-chain coin must fit inside.
+//
+// THE CLOCK. Every tier of a TES-R tree is timelocked RELATIVELY (BIP-68 CSV, measured from its
+// parent's confirmation), so nothing in the tree has a calendar deadline of its own. Exactly ONE
+// absolute clock exists anywhere in the structure: the FLAT backup chain over the funding outpoint
+// `F`. Those transactions are `nLockTime`d, they are held by the coin's previous owners, and they
+// spend the very outpoint the trigger `T` spends. The lowest locktime in that chain belongs to the
+// CURRENT owner (INV-5, `ladder_decrements_by_interval`), so `min(locktime)` is the first height at
+// which anybody can broadcast a transaction that spends `F` out from under the whole tree. Call it
+// the coin's EPOCH EXPIRY. A split child never has flat backups of its own (`CHILD_V2_BASELINE == 0`
+// — its funding `SP.out[j]` is un-broadcast and was never deposited), so its epoch is inherited
+// wholesale from the root parent's chain, which is why that chain is conveyed with the bundle.
+//
+// THE REQUIREMENT. The exit is a strictly sequential chain — `T -> X_m -> SP -> (ext, state)* ->
+// ext_child -> state_child` — and each tier's relative timelock only starts counting once its parent
+// is CONFIRMED. So the wall-clock cost of materialising the coin is
+//
+//     required = Σ_i (csv_i + conf_i)  with conf_i >= 1 block per tier
+//
+// which for the mainnet schedule and a depth-`d` child is `2124·d + 2160` blocks of timelock plus
+// `3 + 2d` confirmations. `lockheight_init` is 10 000, so a depth-1 child (4 284 + 5) does not fit in
+// the last 43% of any epoch, and a depth-4 child (10 656 + 11) does not fit in a WHOLE epoch.
+//
+// WHY THE FULL CHAIN AND NOT JUST `T`. It is true that once `T` confirms, `F` is spent and every flat
+// backup is dead forever — so a holder who force-exits the instant the deadline nears is safe with a
+// single block of headroom. That is the WATCHTOWER's rule (`auto_exit_due`), not an ADMISSION rule,
+// and the two answer different questions. A coin admitted with less headroom than its own exit takes
+// is a coin that can never be idle: it obliges its new owner to be online and to start an irreversible
+// unilateral exit inside the remaining window or lose everything, and it cannot be parked across the
+// epoch boundary, re-transferred, or split further. That is not the instrument the census and Model A
+// promise the payee, and the payee is the party who cannot inspect it after the fact. So the gate is
+// the honest one: REFUSE unless the whole exit fits in the epoch the coin was minted in.
+// =================================================================================================
+
+/// A conveyed off-chain coin whose unilateral exit does NOT fit in the funding epoch it belongs to.
+///
+/// Named (not a bare string) because both users of the rule test it: the RECEIVER refuses such a
+/// bundle at claim time ([`check_exit_headroom`]) and the SENDER refuses to mint one at split time
+/// ([`max_split_depth`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "exit-headroom shortfall: materialising this coin takes {required} blocks ({tiers} exit \
+     transactions, {csv_total} blocks of relative timelock plus one confirmation each), but only \
+     {available} blocks remain before the funding epoch expires at height {epoch_expiry_height} \
+     (chain tip {tip}) — short by {shortfall} blocks. The sender's flat backup can spend the \
+     funding outpoint at {epoch_expiry_height} and void the whole tree, so this coin could not be \
+     materialised in time and is refused."
+)]
+pub struct ExitHeadroomShortfall {
+    /// Chain tip the check was made against.
+    pub tip: u32,
+    /// First height at which a flat backup over `F` can be broadcast (lowest conveyed locktime).
+    pub epoch_expiry_height: u32,
+    /// `epoch_expiry_height − tip`, saturating.
+    pub available: u32,
+    /// Blocks the exit needs (see [`exit_wait_blocks`]).
+    pub required: u32,
+    /// `required − available`.
+    pub shortfall: u32,
+    /// Number of transactions in the exit chain.
+    pub tiers: u32,
+    /// Sum of the chain's relative timelocks (the `2124·d + 2160` term).
+    pub csv_total: u32,
+}
+
+/// A split refused because the child it would mint is too deep to survive one funding epoch.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "split depth cap: this split would mint a depth-{depth} child whose unilateral exit takes \
+     {required} blocks, more than the {epoch_blocks}-block funding epoch — such a coin can never be \
+     parked across an epoch boundary and its holder could never materialise it after a re-anchor. \
+     The deepest child this schedule and epoch admit is depth {max_depth}."
+)]
+pub struct SplitDepthCapExceeded {
+    /// Depth of the child the split would have created (a root split child is depth 1).
+    pub depth: u32,
+    /// Deepest admissible depth under the live schedule and epoch.
+    pub max_depth: u32,
+    /// Blocks the refused child's exit would need.
+    pub required: u32,
+    /// The funding epoch length (`lockheight_init`).
+    pub epoch_blocks: u32,
+}
+
+/// A conveyed bundle whose DECLARED relative timelock disagrees with the one its own SIGNED
+/// transaction carries.
+///
+/// **[B1] WHY THIS EXISTS.** The exit-headroom requirement is a function of the exit chain's
+/// timelocks, and a `TesrTier` carries its timelock TWICE: once as a plain serde field (`csv`) that
+/// travels with the conveyed bundle, and once — the only copy Bitcoin will ever enforce — inside the
+/// signed transaction's `nSequence` (BIP-68). Until this check existed the admission gate read the
+/// serde field. A sender therefore declared `csv: 1` on every tier, the gate computed a requirement
+/// of a handful of blocks, and the coin it exists to refuse walked straight through it while the
+/// chain still made its new owner wait the real thousands of blocks.
+///
+/// That is the audit's C-1 shape exactly: authority derived from the artifact being checked. The fix
+/// is not to prefer one copy silently — a bundle whose two copies disagree did not come from this
+/// code, and guessing which half is honest is a decision no verifier should make. Both are read, the
+/// signed one is the authority, and disagreement is THIS refusal, by name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "declared-CSV mismatch at exit tier {index} ({tier}): the bundle DECLARES {declared}, but the \
+     SIGNED transaction's nSequence encodes {signed} — and nSequence is what Bitcoin enforces. The \
+     exit-headroom requirement is computed from the timelocks the chain will actually impose, so a \
+     bundle whose declared schedule contradicts its own signatures is refused rather than admitted \
+     on either value."
+)]
+pub struct DeclaredCsvMismatch {
+    /// Position in the exit chain, broadcast order.
+    pub index: u32,
+    /// Which tier that is, in words (`"child extension"`, `"ancestor 0 state"`, …).
+    pub tier: String,
+    /// What the bundle's serde field claims.
+    pub declared: String,
+    /// What the signed transaction's `nSequence` encodes.
+    pub signed: String,
+}
+
+/// How a relative timelock reads in a refusal — `None` is "no relative timelock", never "0", because
+/// a tier declaring `csv: Some(0)` and a tier declaring `csv: None` are DIFFERENT claims that happen
+/// to cost the same number of blocks, and a refusal that rendered them identically would be unusable
+/// for telling which one the sender made.
+fn render_csv(csv: Option<u16>) -> String {
+    match csv {
+        Some(c) => format!("a relative timelock of {c} block(s)"),
+        None => "no relative timelock".to_string(),
+    }
+}
+
+/// **[B1] BIND a declared timelock to the signed one.** Returns the SIGNED value (the authority) when
+/// the two agree, and [`DeclaredCsvMismatch`] when they do not.
+///
+/// Callers pass `signed` straight from the parsed transaction's `nSequence`; this crate deliberately
+/// does not parse it here, because the two client crates carry different `bitcoin` re-exports and a
+/// second parse is a second chance to disagree with the verifier that already parsed it.
+pub fn bind_declared_csv(
+    index: usize,
+    tier: &str,
+    declared: Option<u16>,
+    signed: Option<u16>,
+) -> Result<Option<u16>, DeclaredCsvMismatch> {
+    if declared != signed {
+        return Err(DeclaredCsvMismatch {
+            index: index as u32,
+            tier: tier.to_string(),
+            declared: render_csv(declared),
+            signed: render_csv(signed),
+        });
+    }
+    Ok(signed)
+}
+
+/// Blocks a pre-signed exit chain needs to complete, from broadcasting its first transaction.
+///
+/// `csvs` is the chain in broadcast order, one entry per transaction, `None` for a transaction with
+/// no relative timelock (the trigger). Each tier contributes its own timelock PLUS the one block its
+/// parent needs to confirm before that timelock starts counting — the minimum, and the term the
+/// `2124·d + 2160` figure in `PARTIAL-PAYMENT-ECONOMICS.md` §1.2 omits.
+///
+/// ⚠️ Every `csvs` entry MUST come from the SIGNED transaction's `nSequence` (see
+/// [`bind_declared_csv`]). Fed the conveyed serde field instead, this function computes whatever
+/// requirement the sender wants it to.
+pub fn exit_wait_blocks(csvs: &[Option<u16>]) -> u32 {
+    csvs.iter().map(|c| c.unwrap_or(0) as u32 + 1).sum()
+}
+
+/// Sum of a chain's relative timelocks alone (no confirmations) — the reported `csv_total`.
+pub fn exit_csv_total(csvs: &[Option<u16>]) -> u32 {
+    csvs.iter().map(|c| c.unwrap_or(0) as u32).sum()
+}
+
+/// **[P0-1] THE ADMISSION GATE.** Refuse a conveyed bundle whose exit cannot complete before the
+/// funding epoch expires.
+///
+/// `csvs` is the bundle's ACTUAL exit chain (so the requirement is derived from the bundle's real
+/// depth and the live schedule, never a hard-coded constant); `epoch_expiry_height` is the lowest
+/// locktime of the parent's validated flat backup chain. Returns the surviving slack in blocks.
+///
+/// **[B1] Every input must be RECEIVER-DERIVED.** `csvs` must be read off the signed transactions'
+/// `nSequence` (never the conveyed `TesrTier::csv` field — see [`bind_declared_csv`]), `tip` from the
+/// receiver's own chain backend, and `epoch_expiry_height` from a flat backup chain already validated
+/// against the on-chain funding output. Fed a sender-declared term, this function computes exactly
+/// the requirement the sender chose for it.
+pub fn check_exit_headroom(
+    csvs: &[Option<u16>],
+    tip: u32,
+    epoch_expiry_height: u32,
+) -> Result<u32, ExitHeadroomShortfall> {
+    let required = exit_wait_blocks(csvs);
+    let available = epoch_expiry_height.saturating_sub(tip);
+    if available < required {
+        return Err(ExitHeadroomShortfall {
+            tip,
+            epoch_expiry_height,
+            available,
+            required,
+            shortfall: required - available,
+            tiers: csvs.len() as u32,
+            csv_total: exit_csv_total(csvs),
+        });
+    }
+    Ok(available - required)
+}
+
+/// **[P0-2] THE DEPTH CAP**, derived rather than written down.
+///
+/// `base` is the exit chain of a depth-1 child (`T`, `X_m`, `SP`, `ext_child`, `state_child`) and
+/// `per_level` is what ONE further split level adds (that level's extension and split state). Returns
+/// the deepest child whose exit still fits in an `epoch_blocks`-long funding epoch — `0` when even a
+/// depth-1 child does not fit, in which case no in-ladder split is admissible at all.
+pub fn max_split_depth(base: &[Option<u16>], per_level: &[Option<u16>], epoch_blocks: u32) -> u32 {
+    let base_wait = exit_wait_blocks(base);
+    if base_wait > epoch_blocks {
+        return 0;
+    }
+    let level_wait = exit_wait_blocks(per_level);
+    if level_wait == 0 {
+        // No level cost means no bound from this rule; the caller's other guards still apply.
+        return u32::MAX;
+    }
+    1 + (epoch_blocks - base_wait) / level_wait
+}
+
 pub fn reconstruct_transaction(tx_n_hex: &str) -> Result<(), MercuryError> {
 
     let tx_n: Transaction = bitcoin::consensus::encode::deserialize(&hex::decode(&tx_n_hex)?)?;
@@ -830,6 +1054,157 @@ mod transfer_signature_tests {
         assert!(!ok(1000, 1000, 10));
         // Increasing ladder (a forged backup maturing LATER than its parent) → rejected, no panic.
         assert!(!ok(990, 1000, 10), "an increasing ladder must be rejected cleanly (no u32 underflow panic)");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // [P0-1 / P0-2] Exit-headroom admission. The numbers below are re-derived from the mainnet
+    // schedule in `docs/utexo/PROTOCOL.md` §5.2 (D0 1440, δ 36, d_floor 144, E0 720, δE 36,
+    // e_floor 144) and `lockheight_init = 10 000` (`server/src/server_config.rs:82`) — they are
+    // asserted here so a schedule change that silently breaks the invariant is caught.
+    // ---------------------------------------------------------------------------------------
+
+    /// The exit chain of a depth-`d` in-ladder split child on the mainnet schedule:
+    /// `T (none) | X_m 720 | SP 1404 | (d−1)×(720, 1404) | ext_child 720 | state_child 1440`.
+    fn mainnet_chain(d: u32) -> Vec<Option<u16>> {
+        let mut v = vec![None, Some(720), Some(1404)];
+        for _ in 1..d {
+            v.push(Some(720));
+            v.push(Some(1404));
+        }
+        v.push(Some(720));
+        v.push(Some(1440));
+        v
+    }
+
+    #[test]
+    fn exit_wait_matches_the_measured_schedule() {
+        // §1.2: WAIT(d) = 2124·d + 2160 blocks of timelock, over 3 + 2d transactions.
+        for d in 1..=5u32 {
+            let chain = mainnet_chain(d);
+            assert_eq!(chain.len() as u32, 3 + 2 * d, "d={d}: 3 + 2d exit transactions");
+            assert_eq!(
+                super::exit_csv_total(&chain),
+                2124 * d + 2160,
+                "d={d}: the documented WAIT(d) timelock total"
+            );
+            // Plus one confirmation per transaction — a CSV cannot start before its parent confirms.
+            assert_eq!(super::exit_wait_blocks(&chain), 2124 * d + 2160 + (3 + 2 * d));
+        }
+    }
+
+    /// **[B1]** the declared timelock is bound to the signed one, and the requirement is computed
+    /// from the SIGNED chain — the whole bypass in one assertion.
+    #[test]
+    fn declared_csv_must_match_the_signed_nsequence() {
+        // Agreement passes through and yields the signed value.
+        assert_eq!(super::bind_declared_csv(3, "child extension", Some(2124), Some(2124)), Ok(Some(2124)));
+        assert_eq!(super::bind_declared_csv(0, "trigger", None, None), Ok(None));
+
+        // The attack: every tier declares a 1-block lock while the signatures say otherwise.
+        let err = super::bind_declared_csv(4, "child state", Some(1), Some(2160)).unwrap_err();
+        assert_eq!(err.index, 4);
+        assert_eq!(err.tier, "child state");
+        let msg = err.to_string();
+        assert!(msg.contains("declared-CSV mismatch"), "{msg}");
+        assert!(msg.contains("1 block(s)") && msg.contains("2160 block(s)"), "both values named: {msg}");
+
+        // `None` and `Some(0)` cost the same number of blocks but are different claims, so they must
+        // not be quietly treated as equal — a tier whose relative lock is DISABLED is not a tier with
+        // a zero-block lock.
+        assert!(super::bind_declared_csv(1, "parent level 0 extension", Some(0), None).is_err());
+        assert!(super::bind_declared_csv(1, "parent level 0 extension", None, Some(0)).is_err());
+
+        // And the point of it all: had the declared chain been used, the doomed coin would have been
+        // admitted with 4 289 blocks of exit needing only 10 of headroom.
+        let declared: Vec<Option<u16>> = vec![None, Some(1), Some(1), Some(1), Some(1)];
+        assert_eq!(super::exit_wait_blocks(&declared), 9);
+        assert!(super::check_exit_headroom(&declared, 100_000, 100_010).is_ok());
+        assert!(super::check_exit_headroom(&mainnet_chain(1), 100_000, 100_010).is_err());
+    }
+
+    #[test]
+    fn headroom_gate_refuses_a_child_that_cannot_be_materialised_in_time() {
+        let chain = mainnet_chain(1);
+        let required = super::exit_wait_blocks(&chain); // 4 289
+        assert_eq!(required, 4_289);
+
+        // Fresh epoch: a depth-1 child fits with room to spare.
+        let slack = super::check_exit_headroom(&chain, 100_000, 100_000 + 10_000)
+            .expect("a full epoch admits a depth-1 child");
+        assert_eq!(slack, 10_000 - required);
+
+        // Exactly enough: admitted at the boundary (never weaken, never over-refuse).
+        assert_eq!(
+            super::check_exit_headroom(&chain, 100_000, 100_000 + required),
+            Ok(0),
+            "a bundle whose exit lands exactly on the expiry height is admissible"
+        );
+
+        // One block short: refused, and the refusal states the shortfall.
+        let err = super::check_exit_headroom(&chain, 100_000, 100_000 + required - 1)
+            .expect_err("one block short of the exit wait must be refused");
+        assert_eq!(err.shortfall, 1);
+        assert_eq!(err.required, required);
+        assert_eq!(err.available, required - 1);
+        assert_eq!(err.tiers, 5);
+        assert_eq!(err.csv_total, 4_284);
+        assert!(err.to_string().contains("short by 1 blocks"), "{err}");
+
+        // THE EXPLOIT (P0-1): the old gate was `lock_time > tip`, which admits everything below.
+        // The last 4 289 blocks of a 10 000-block epoch are 42.9% of it.
+        let epoch = 10_000u32;
+        let bad_window = required;
+        assert!(
+            (bad_window as f64) / (epoch as f64) > 0.42,
+            "the window the missing gate left open is ~43% of every epoch"
+        );
+        for age in (epoch - bad_window + 1)..epoch {
+            let tip = 100_000 + age;
+            assert!(
+                super::check_exit_headroom(&chain, tip, 100_000 + epoch).is_err(),
+                "a coin conveyed {age} blocks into the epoch must be refused"
+            );
+        }
+
+        // An already-expired epoch is refused, not underflowed.
+        assert!(super::check_exit_headroom(&chain, 100_001, 100_000).is_err());
+    }
+
+    #[test]
+    fn deeper_children_need_proportionally_more_headroom() {
+        // The contagion: each further split level costs 2 126 more blocks of headroom.
+        let d1 = super::exit_wait_blocks(&mainnet_chain(1));
+        let d2 = super::exit_wait_blocks(&mainnet_chain(2));
+        assert_eq!(d2 - d1, 2_126);
+        // A window that admits a depth-1 child refuses a depth-2 one.
+        assert!(super::check_exit_headroom(&mainnet_chain(1), 0, d1).is_ok());
+        assert!(super::check_exit_headroom(&mainnet_chain(2), 0, d1).is_err());
+    }
+
+    #[test]
+    fn depth_cap_is_derived_from_the_schedule_and_the_epoch() {
+        let base = mainnet_chain(1);
+        let per_level = vec![Some(720u16), Some(1404)];
+        // Mainnet, lockheight_init = 10 000: depth 3 fits (10 541), depth 4 does not (12 667).
+        let cap = super::max_split_depth(&base, &per_level, 10_000);
+        assert_eq!(cap, 3, "mainnet admits at most a depth-3 child");
+        assert!(super::exit_wait_blocks(&mainnet_chain(cap)) <= 10_000);
+        assert!(
+            super::exit_wait_blocks(&mainnet_chain(cap + 1)) > 10_000,
+            "the cap must be the LAST depth that fits"
+        );
+        // The task's figure: WAIT(4) = 10 656 > 10 000 even before confirmations.
+        assert_eq!(super::exit_csv_total(&mainnet_chain(4)), 10_656);
+
+        // Regtest schedule (d0 24, δ 6, e0 12) with the deployed 1 000-block epoch.
+        let rt_base = vec![None, Some(12u16), Some(18), Some(12), Some(24)];
+        let rt_level = vec![Some(12u16), Some(18)];
+        assert_eq!(super::exit_wait_blocks(&rt_base), 66 + 5);
+        assert_eq!(super::max_split_depth(&rt_base, &rt_level, 1_000), 30);
+
+        // An epoch too short for even a depth-1 child admits NOTHING (fail closed).
+        assert_eq!(super::max_split_depth(&base, &per_level, 4_288), 0);
+        assert_eq!(super::max_split_depth(&base, &per_level, 4_289), 1);
     }
 
     #[test]

@@ -94,6 +94,8 @@ pub mod sdk77_colored_inladder_split;
 pub mod sdk78_uncolourable_carrier;
 pub mod sdk79_split_watchtower;
 pub mod sdk80_plain_child_split_watchtower;
+pub mod sdk81_inladder_split_recovery;
+pub mod sdk82_exit_headroom_gate;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -454,6 +456,20 @@ async fn main() -> Result<()> {
     // while strangers hold the bundles that supersede it.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("80") {
         sdk80_plain_child_split_watchtower::execute().await?;
+        return Ok(());
+    }
+    // [P0-3] In-ladder split crash recovery (SDK_E2E=81): a SIGABRT taken between terminalizing
+    // the parent and persisting the co-signed children — the window that used to leave the coin
+    // exit-only forever — is replayed from the write-ahead journal and the payment still completes.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("81") {
+        sdk81_inladder_split_recovery::execute().await?;
+        return Ok(());
+    }
+    // [P0-1] Exit-headroom admission gate (SDK_E2E=82): a child conveyed near the end of its
+    // funding epoch — whose exit provably cannot finish before the sender's flat backup can spend F
+    // — is REFUSED by the receiver, while the same payment in a fresh epoch is adopted.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("82") {
+        sdk82_exit_headroom_gate::execute().await?;
         return Ok(());
     }
 
