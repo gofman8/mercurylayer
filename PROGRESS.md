@@ -204,3 +204,42 @@ Full set: `SDK_E2E=` 1, 2, 29, 30, 31, 32, 34, 58, 59, 69, 74, 75, 76, 77, 78, 7
   ladder, and `get_asset_balance` is blind to it. Assert with a read-only `color_psbt` stock probe.
 * `sdk58`/`sdk59`/`sdk69` are blind to `PARENT_V2_BASELINE` bugs — they DEPOSIT the parent, making
   baseline 1 accidentally correct. `sdk76` splits a RECEIVED parent, which is the real test.
+
+## HANDOFF — 2026-08-03, end of session
+
+Twelve commits, `2c351c6` → `7a03799`, all on `feat/spark`, all pushed. Unit suites: mercurylib 27,
+mercuryrustlib 100, mercury-utexo-sdk 91+1, ci-guards 5+11+5. E2E green across the series.
+
+### Start here, in this order
+
+1. **THE ORDERING REFACTOR — do this before adding any further verifier check.**
+   `TesrTier::payload_out(tx, ..)` reads the tx at the tier's DECLARED `payload_vout`. Called before
+   the structural linkage check, it reads the P2A anchor on a tampered bundle and refuses on VALUE,
+   hiding the accurate structural cause. I made this mistake FOUR TIMES today (`deed25c`, the GAP-1
+   count check, the declared-`out_value` check, and again when I moved one check and left its two
+   neighbours). Every instance is now correctly ordered and commented — but the fix is discipline,
+   and discipline demonstrably did not hold. The real fix: make `payload_out` **uncallable** until
+   linkage is proven (a typed `LinkedTier` the linkage check produces, or fold the value laws into
+   the same pass that establishes linkage). Until that exists, this recurs.
+2. **CATS-B change 2** — the original objective, untouched. Research complete, plan sound; see the
+   §4.5 CORRECTION in `PARTIAL-PAYMENT-ECONOMICS.md` (the census does NOT close segment shape —
+   derive it from the signed prevout) and `docs/utexo/CATS-B-PHASE1-PLAN.md` if the synthesis wrote
+   one. **V1 must not be applied to the conveyed leaf**, and **V1 and V2 must land in one commit**.
+3. **`ci-guards` gap.** Bare `.unwrap_or_default()` on a `Result` is excluded from the guard's
+   patterns by design ("overwhelmingly Option, not Result"). I walked straight into it inside a
+   verifier — it compiled, always failed, and refused every honest ancestor bundle. Widening the
+   pattern changes the guard's own precision: decide it on merits, do not allowlist around it.
+
+### What is proven vs believed
+
+`docs/utexo/VALUE-CONSERVATION-SWEEP.md` §8 is the honest ledger. In short: the class is
+**demonstrated** closed on the pure synchronous verifier — 28 adversarial tests that build real
+co-signed ladders holding both key halves, with mutation testing proving each test is pinned to its
+fix. **Not covered, and needing the live stack:** the async lane end-to-end, the SSP pre-pay gate,
+the receiver-side booking that turns a skim into a credit, the coloured 576-sat rung under attack,
+and the ancestor loop at depth ≥ 2. Those remain argued, not run.
+
+### Above all of it
+
+`BLOCKERS.md`: the SE seed and Vault root token are committed to a PUBLIC repo. That outranks every
+code item in this file and cannot be fixed from here.
