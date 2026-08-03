@@ -561,12 +561,65 @@ wallet UI, not worth a verifier change.
 
 ### What is genuinely NOT covered
 
-* **No test proves the attacks are now refused.** The fixes were validated by showing honest traffic
-  still passes (sdk 1, 2, 11, 17, 58, 59, 74, 75, 76, 77 across the series). The adversarial
-  direction — construct the skim, assert the refusal — has **no permanent test**. The probe that
-  proved the original defect was temporary and is gone. This is the single most valuable thing to
-  build next, and it is what `4e165e6`'s standard was.
-* **`verify_bundle_ex`'s trigger-to-`F` anchor exists only on the CHILD lane** (`37d8bba` is in
-  `verify_conveyed_child`). The whole-coin receive path binds `f_value` through
-  `verify_bundle_bound`; that was not re-audited under this document's lens.
+* ~~**No test proves the attacks are now refused.**~~ **Closed by `6777528` and `3bb6845`.** Four
+  adversarial modules in `clients/libs/rust/src/tesr.rs` now build the skims and assert the refusal:
+  `skim_leaf_attack_tests`, `skim_root_attack_tests`, `forged_yardstick_attack_tests`,
+  `wrong_payee_attack_tests`. Each ships a non-vacuity control and an
+  `assert_not_an_unrelated_refusal` guard, and each holds both halves of the aggregate key so no
+  result turns on a forged signature. They found live holes on day one.
+* ~~**`verify_bundle_ex`'s trigger-to-`F` anchor exists only on the CHILD lane.**~~ **Closed — see
+  §8.1 below.**
 * **The combine lane** (multi-input tiers) was not swept at all.
+
+---
+
+## 8.1 The trigger-to-`F` anchor, on both lanes (2026-08-03)
+
+The tripwire `skim_root_attack_tests::gap_a_skimming_trigger_on_the_root_lane_is_still_accepted`
+pinned the last gap this document names: `verify_bundle_ex` bound every tier to the one above it, so
+the root ladder conserved value RELATIVE to the trigger's payload output, and nothing bound that
+output to `F`. A sender whose trigger paid far less than `F` held got a ladder that conserved
+perfectly against a fiction while the receiver booked the real on-chain value
+(`amount: tx0_output.value`). `37d8bba` had closed this on the child lane only, inside the async
+`verify_conveyed_child`, because `verify_bundle_ex` is synchronous and has no chain access.
+
+**The shape of the fix, and why the shape mattered more than the arithmetic.** `TesrBundle` carries a
+declared `f_value`, and using it inside `verify_bundle_ex` would have measured the chain against
+another sender-declared number — a check that never fails, for honest and skimming ladders alike,
+while reading in review like an anchor. Per `ADMISSION-INPUTS.md` a term with no provenance must be
+left out of the calculation rather than dressed up. So the value is **passed in**, and each caller's
+provenance is visible at its call site:
+
+| entry point | what it supplies | provenance |
+|---|---|---|
+| `verify_bundle_bound` | `Some(coin.f_value)` | **chain** — `coin_authority_from_tx0` reads `tx0.output[vout].value` from the funding transaction, and the function has already refused any bundle whose `f_value` disagrees. Both production callers (claim, `transfer_receiver.rs`; SSP pre-pay, `prepay_flat_census`) fetch `tx0` over Electrum and refuse branch funding outright. |
+| `verify_child_bundle` | `Some(parent_f_onchain_value)`, a new REQUIRED parameter | **chain** — beside the `parent_f_onchain_spk_hex` it already took. `verify_conveyed_child` passes `f_out.value`; `37d8bba`'s duplicate law moved down here, so every caller of the synchronous verifier inherits the anchor instead of one caller of one wrapper. |
+| `verify_bundle` | `None` | **none, stated as such.** No chain access, so the trigger's hop is skipped. This entry point is documented as self-verification-only; it is not an acceptance path. |
+
+`verify_bundle_ex`'s parameter is therefore `Option<u64>`, and `None` means *no anchor*, never *fall
+back to the bundle*. The residue is asserted rather than left implicit: the last assertion of
+`skim_root_attack_tests::a_skimming_trigger_is_refused_against_the_on_chain_funding_value` pins that
+`verify_bundle` still accepts the skimming trigger, with the reason written down.
+
+The law itself is the loop's existing one, run from `i = 0` with `F` as the trigger's funding, and it
+branches on colour (`colored_tier_out_total` vs `tier_out_total`) — a coloured rung is 576 sat at
+2 sat/vB against the plain 490, and omitting that branch bricks every coloured coin (`sdk77` caught
+exactly that in `37d8bba`).
+
+**Refusal ordering moved, and one adversarial control was updated to match.** A ladder built at a
+forged fee rate now breaks at the trigger rather than at tier 1, because the trigger is the first hop
+with an absolute yardstick. `forged_yardstick_attack_tests::a_forged_yardstick_ladder_is_refused_when_the_rate_is_declared_honestly`
+now asserts the refusal **twice**: through `verify_root` (anchored — names `F` and the trigger) and
+through `verify_bundle` (unanchored — falls to tier 1's relative law, with the numbers the control
+was written with). Neither check is load-bearing alone, and the test now says so.
+
+### Still open after this pass
+
+* **GAP A / GAP B — the `fee_rate` yardstick is unbound on both synchronous verifiers.** `2ad2b2d`
+  pinned it in `verify_conveyed_child` only. Both tripwires
+  (`forged_yardstick_attack_tests::gap_*`) are still passing, i.e. still holes. The anchor added here
+  does **not** close them: a ladder built *and* declared at 2 662 sat/vB satisfies the trigger law
+  against the real `F` and still delivers 1 030 sat of a 1 000 000-sat coin.
+* **`gap_an_ancestor_split_state_may_mint_value_out_of_nothing`** (`wrong_payee_attack_tests`) — an
+  ancestor segment's split state is not held to a Σ law.
+* **The combine lane**, as above.

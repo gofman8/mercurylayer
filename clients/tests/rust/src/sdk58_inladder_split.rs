@@ -65,6 +65,10 @@ pub async fn execute() -> Result<()> {
     let f_txid = electrum_client::bitcoin::Txid::from_str(&bundle.f_txid).map_err(|_| anyhow!("bad f_txid"))?;
     let f_tx = cc.electrum_client.transaction_get(&f_txid).map_err(|_| anyhow!("F not on chain"))?;
     let f_spk_hex = hex::encode(f_tx.output[bundle.f_vout as usize].script_pubkey.as_bytes());
+    // The funding output's VALUE, read from the same fetched transaction as its scriptPubKey. It is
+    // what anchors the parent's trigger, so the tier chain conserves against the chain rather than
+    // against a number the sender declared.
+    let f_value_onchain = f_tx.output[bundle.f_vout as usize].value;
 
     let parent_num_sigs = num_sigs(&cc, &parent_sid).await?;
     let parent_agg = aggregate(&cc, &parent_sid).await?;
@@ -83,7 +87,7 @@ pub async fn execute() -> Result<()> {
     assert!(!child_terminal, "a plain (unlatched) split child must stay NON-terminal so it can be re-transferred");
 
     mercuryrustlib::tesr::verify_child_bundle(
-        &cb, &f_spk_hex,
+        &cb, &f_spk_hex, f_value_onchain,
         parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
         child_num_sigs, child_baseline, child_agg.as_deref(),
         &[],
@@ -121,7 +125,7 @@ pub async fn execute() -> Result<()> {
     };
     // Convenience: verify_child_bundle with all-valid args (override individual fields per attack).
     let vcb = |p_agg: Option<&str>, p_term: bool, p_ns: u32, c_agg: Option<&str>, c_ns: u32, recv: &str| {
-        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, &[], recv)
+        mercuryrustlib::tesr::verify_child_bundle(&cb, &f_spk_hex, f_value_onchain, p_ns, parent_baseline, p_agg, p_term, c_ns, child_baseline, c_agg, &[], recv)
     };
     let (pa, ca) = (parent_agg.as_deref(), child_agg.as_deref());
 
@@ -202,7 +206,7 @@ pub async fn execute() -> Result<()> {
             payload_vout: t.payload_vout,
         });
         let r = mercuryrustlib::tesr::verify_child_bundle(
-            &rival, &f_spk_hex,
+            &rival, &f_spk_hex, f_value_onchain,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs_after, child_baseline, child_agg.as_deref(),
             &[],
@@ -218,7 +222,7 @@ pub async fn execute() -> Result<()> {
         // census must now refuse the untouched bundle at the SE's true count. This is the census doing
         // the job the race check cannot.
         let r = mercuryrustlib::tesr::verify_child_bundle(
-            &cb, &f_spk_hex,
+            &cb, &f_spk_hex, f_value_onchain,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs_after, child_baseline, child_agg.as_deref(),
             &[],
@@ -253,7 +257,7 @@ pub async fn execute() -> Result<()> {
             payload_vout: src.payload_vout,
         });
         let r = mercuryrustlib::tesr::verify_child_bundle(
-            &padded, &f_spk_hex,
+            &padded, &f_spk_hex, f_value_onchain,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs + 1, child_baseline, child_agg.as_deref(),
             &[],
@@ -273,7 +277,7 @@ pub async fn execute() -> Result<()> {
         let mut spoof = cb.clone();
         spoof.child_state.out_value += 10_000;
         let r = mercuryrustlib::tesr::verify_child_bundle(
-            &spoof, &f_spk_hex,
+            &spoof, &f_spk_hex, f_value_onchain,
             parent_num_sigs, parent_baseline, parent_agg.as_deref(), parent_terminal,
             child_num_sigs, child_baseline, child_agg.as_deref(),
             &[],

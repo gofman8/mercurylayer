@@ -232,6 +232,8 @@ pub async fn execute() -> Result<()> {
     let f_tx = cc.electrum_client.transaction_get(&f_txid).map_err(|_| anyhow!("F not on chain"))?;
     let f_spk_hex =
         hex::encode(f_tx.output[cb.parent.f_vout as usize].script_pubkey.as_bytes());
+    // …and its VALUE, from the same fetched transaction — the anchor the parent's trigger is bound to.
+    let f_value_onchain = f_tx.output[cb.parent.f_vout as usize].value;
     let p_ns = num_sigs(&cc, &cb.parent_statechain_id).await?;
     let p_agg = aggregate(&cc, &cb.parent_statechain_id).await?;
     let c_ns = num_sigs(&cc, &cb.child_statechain_id).await?;
@@ -253,6 +255,7 @@ pub async fn execute() -> Result<()> {
     mercuryrustlib::tesr::verify_child_bundle(
         &cb,
         &f_spk_hex,
+        f_value_onchain,
         p_ns,
         cb.parent_flat_backups.len() as u32,
         p_agg.as_deref(),
@@ -269,6 +272,7 @@ pub async fn execute() -> Result<()> {
     let err = mercuryrustlib::tesr::verify_child_bundle(
         &cb,
         &f_spk_hex,
+        f_value_onchain,
         p_ns,
         mercuryrustlib::tesr::PARENT_V2_BASELINE,
         p_agg.as_deref(),

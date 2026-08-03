@@ -563,6 +563,8 @@ pub async fn execute() -> Result<()> {
     let f_txid = electrum_client::bitcoin::Txid::from_str(&pbundle.f_txid).map_err(|_| anyhow!("bad f_txid"))?;
     let f_tx = cc.electrum_client.transaction_get(&f_txid).map_err(|_| anyhow!("F not on chain"))?;
     let f_spk_hex = hex::encode(f_tx.output[pbundle.f_vout as usize].script_pubkey.as_bytes());
+    // …and its VALUE, from the same fetched transaction — the anchor the parent's trigger is bound to.
+    let f_value_onchain = f_tx.output[pbundle.f_vout as usize].value;
     let p_ns = num_sigs(&cc, &parent_sid).await?;
     let p_agg = aggregate(&cc, &parent_sid).await?;
     let c_ns = num_sigs(&cc, &child_sid).await?;
@@ -573,6 +575,7 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::verify_child_bundle(
             b,
             &f_spk_hex,
+            f_value_onchain,
             p_ns,
             parent_baseline,
             p_agg.as_deref(),
@@ -703,6 +706,7 @@ pub async fn execute() -> Result<()> {
             mercuryrustlib::tesr::verify_child_bundle(
                 &d,
                 &f_spk_hex,
+                f_value_onchain,
                 p_ns,
                 parent_baseline,
                 p_agg.as_deref(),
@@ -733,6 +737,7 @@ pub async fn execute() -> Result<()> {
             mercuryrustlib::tesr::verify_child_bundle(
                 &d,
                 &f_spk_hex,
+                f_value_onchain,
                 p_ns,
                 parent_baseline,
                 p_agg.as_deref(),
@@ -756,6 +761,7 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::verify_child_bundle(
             &cb,
             &f_spk_hex,
+            f_value_onchain,
             p_ns,
             parent_baseline,
             p_agg.as_deref(),

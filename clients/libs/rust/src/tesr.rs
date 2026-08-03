@@ -3215,64 +3215,20 @@ pub async fn verify_conveyed_child(
         .get(cb.parent.f_vout as usize)
         .ok_or_else(|| anyhow::anyhow!("parent F has no output {}", cb.parent.f_vout))?;
     let f_spk_hex = hex::encode(f_out.script_pubkey.as_bytes());
-
-    // ═══ [VALUE-CONSERVATION] ANCHOR THE CHAIN TO THE CHAIN ═══
+    // ═══ [VALUE-CONSERVATION] THE ONE NUMBER BITCOIN ALREADY AGREED TO ═══
     //
-    // The laws in `verify_bundle_ex` and `verify_child_bundle` bind each tier to the one above it, so
-    // the whole structure conserves value RELATIVE to the trigger's payload output. That output was
-    // never itself bound to anything: `f_out` is fetched here and only its scriptPubKey is used, so
-    // `cb.parent.f_value` and the trigger's own outputs float free. A relative chain anchored to a
-    // free value is a free chain — a sender declaring a trigger that pays far less than `F` holds
-    // makes every tier below it conserve perfectly against a fiction, and the receiver books the
-    // funding value all the same.
+    // The value laws bind each tier to the one above it, so the structure conserves value RELATIVE to
+    // the parent trigger's payload output — and that output floats free unless something ties it to
+    // `F`. A relative chain anchored to a free value is a free chain: a sender whose trigger pays far
+    // less than `F` holds gets a ladder that conserves perfectly against a fiction, while the receiver
+    // books the real on-chain value.
     //
-    // `f_out.value` is the one number in this whole structure that Bitcoin already agreed to. Binding
-    // the trigger to it turns every law above from relative into absolute.
-    {
-        use electrum_client::bitcoin::{consensus::deserialize, Transaction};
-        let t_tx: Transaction =
-            deserialize(&hex::decode(&cb.parent.trigger.signed_tx).map_err(|_| {
-                anyhow::anyhow!("parent trigger hex does not decode")
-            })?)
-            .map_err(|_| anyhow::anyhow!("parent trigger is not a transaction"))?;
-        // Branch on colour, as every other law in this file does: a coloured tier's rung is 576 sat
-        // at 2 sat/vB (336 fee + 240 anchor) against the plain 490, because the opret is one whole
-        // extra P2TR-sized output. sdk77 caught this exact omission — 17 384 − 16 808 = 576.
-        let expect = if cb.is_colored() {
-            crate::rgb::colored_tier_out_total(f_out.value, 1, cb.parent.fee_rate)
-        } else {
-            mercurylib::tesr::tier_out_value(f_out.value, cb.parent.fee_rate)
-        }
-        .ok_or_else(|| anyhow::anyhow!(
-            "parent F holds {} sat, too little to carry a trigger at {} sat/vB",
-            f_out.value, cb.parent.fee_rate
-        ))?;
-        let got: u64 = t_tx
-            .output
-            .iter()
-            .filter(|o| {
-                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
-                    && !o.script_pubkey.is_op_return()
-            })
-            .map(|o| o.value)
-            .sum();
-        if got != expect {
-            return Err(anyhow::anyhow!(
-                "the parent's trigger is funded by an on-chain output of {} sat but its payload \
-                 outputs carry {got} (expected exactly {expect}) — every tier below it conserves \
-                 value against a number the sender chose rather than one the chain agreed to",
-                f_out.value
-            ));
-        }
-        // …and the bundle's own declared `f_value`, which builders feed to `cosign_tier` as a prevout
-        // amount, must be that same on-chain number.
-        if cb.parent.f_value != f_out.value {
-            return Err(anyhow::anyhow!(
-                "the bundle declares f_value {} but the on-chain funding output holds {}",
-                cb.parent.f_value, f_out.value
-            ));
-        }
-    }
+    // `37d8bba` tied it here, in this async wrapper, because `verify_bundle_ex` had no chain access.
+    // It is now a REQUIRED PARAMETER of `verify_child_bundle` (below) and an explicit `Some(..)` on
+    // `verify_bundle_ex`, so the anchor lives where the laws live and every caller of the synchronous
+    // verifier inherits it. This is the only place that fetches it; the checks it feeds are two levels
+    // down. Do not re-add a second copy here — one law, one site.
+    let f_onchain_value = f_out.value;
 
     // [D1] THE PARENT'S FLAT-BACKUP COUNT, VALIDATED THEN COUNTED — the child-lane analogue of the
     // whole-coin path's `transfer_msg.backup_transactions.len()` (transfer_receiver.rs [S2]).
@@ -3458,6 +3414,7 @@ pub async fn verify_conveyed_child(
     verify_child_bundle(
         cb,
         &f_spk_hex,
+        f_onchain_value,
         p_info.num_sigs,
         // The REAL count, re-derived from the chain validated above — never the baseline constant.
         parent_backups.len() as u32,
@@ -4809,9 +4766,18 @@ fn net_from_str(network: &str) -> electrum_client::bitcoin::Network {
 /// `owner_exit_address` set correctly and the tiers padded so the census balances, and keep the REAL
 /// trigger — then take the coin back after the receiver accepts. Use it to re-check a ladder you built
 /// yourself; to ACCEPT a conveyed one, use [`verify_bundle_bound`].
+///
+/// ⚠️ **It also has NO TRIGGER-TO-`F` ANCHOR, and cannot be given one.** The value laws bind each
+/// tier to the one above it, so a ladder conserves value RELATIVE to what the trigger pays itself.
+/// Making that absolute takes the value of the on-chain funding output, and this entry point has no
+/// chain access — so it passes `None` and the trigger's hop is skipped. Passing `bundle.f_value`
+/// instead would be worse than skipping it: the sender chose that number *and* co-signed the trigger
+/// against it, so the check would pass for a skimming ladder exactly as it passes for an honest one,
+/// while reading in review like an anchor. A caller that needs the coin's real value checked must
+/// fetch `F` and use [`verify_bundle_bound`].
 pub fn verify_bundle(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32) -> Result<()> {
     // Ordinary bundle: the final state pays the owner. (A split parent uses verify_bundle_ex(true).)
-    verify_bundle_ex(bundle, se_num_sigs, flat_backups, false)
+    verify_bundle_ex(bundle, se_num_sigs, flat_backups, false, None)
 }
 
 /// The AUTHORITATIVE description of the coin an incoming ladder must describe. Every field is read
@@ -5124,7 +5090,11 @@ pub fn verify_bundle_bound(
         ));
     }
 
-    verify_bundle_ex(bundle, se_num_sigs, flat_backups, false)
+    // `coin.f_value` is `tx0.output[f_vout].value` read from the funding transaction by
+    // `coin_authority_from_tx0`, and the equality above has just refused any bundle that disagrees
+    // with it. So this is the chain's number, and the trigger is bound to it — which is what turns
+    // every relative law below into an absolute one.
+    verify_bundle_ex(bundle, se_num_sigs, flat_backups, false, Some(coin.f_value))
 }
 
 /// As [`verify_bundle`], but when `final_is_split` the FINAL tier is an in-ladder split state `SP` that
@@ -5298,7 +5268,29 @@ fn verify_superseded_segment(
     Ok(sups.len() as u32)
 }
 
-fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, final_is_split: bool) -> Result<()> {
+/// `f_onchain` — **the value of the on-chain funding output `F`, as the CALLER read it from the
+/// chain**, and the one term in this function that cannot be derived from the bundle. It is an
+/// `Option` on purpose, and the purpose is honesty rather than convenience:
+///
+///   * `Some(v)` — the caller holds a chain-derived `F` value and the trigger is bound to it (the
+///     law below runs at `i == 0`). Every check downstream then measures against a number Bitcoin
+///     has already agreed to, instead of one the sender picked.
+///   * `None` — the caller has **no chain access at all**, so there is no `F` to anchor to. The
+///     trigger's law is skipped and the ladder is checked for internal consistency only.
+///
+/// The obvious-looking third option — "`None` means fall back to `bundle.f_value`" — is the thing
+/// this parameter exists to prevent. `bundle.f_value` is a serde field; measuring the trigger
+/// against it proves the sender was self-consistent and nothing more, while producing a check that
+/// *reads* like an anchor. Per `docs/utexo/ADMISSION-INPUTS.md`, being present in a struct the
+/// sender sent is not provenance, and a term with no provenance must be left out of the calculation
+/// rather than dressed up. So the type makes each caller state which of the two it has.
+fn verify_bundle_ex(
+    bundle: &TesrBundle,
+    se_num_sigs: u32,
+    flat_backups: u32,
+    final_is_split: bool,
+    f_onchain: Option<u64>,
+) -> Result<()> {
     use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction, Txid};
 
     let net = net_from_str(&bundle.network);
@@ -5443,6 +5435,24 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
     // forward value SMALLER, and a tier forwarding less than its own declared schedule demands is
     // exactly what the equality refuses. It is pinned properly by `bind_declared_csv`'s sibling
     // problem — see `docs/utexo/VALUE-CONSERVATION-SWEEP.md` for the remaining `fee_rate` item.
+    //
+    //
+    // **AND THE CHAIN IS THE FIRST RUNG.** The loop below used to start at `i = 1`, which left the
+    // TRIGGER bound to nothing: its payload output seeded the extension's law and was never itself
+    // compared to anything. A chain of relative equalities anchored to a free value is a free chain —
+    // a trigger spending a 200 000-sat `F` and paying the aggregate 1 000 makes every tier beneath it
+    // conserve perfectly against a fiction, while the receiver books the on-chain 200 000. The theft
+    // needs no extra co-sign, so the census balances, and it needs no counterparty: the coin's first
+    // laddering owner plants it at `establish`.
+    //
+    // It is the WORST place in the structure to leave loose. `T` is un-timelocked, spends `F`, and
+    // every prior owner keeps a co-signed copy ([B1]) — so broadcasting it both takes the money and
+    // voids every flat backup, which all spend `F` too. The theft and the destruction of the slow
+    // path are one transaction.
+    //
+    // `f_onchain` closes it, and only when the caller actually has a chain fact to close it with —
+    // see the parameter's own note. This is `37d8bba`'s child-lane anchor moved down to where both
+    // lanes pass through, so a caller inherits it rather than having to remember it.
     {
         let rung_forward = |prev: u64, n_payload: usize, what: &str| -> Result<u64> {
             let v = if bundle.is_colored() {
@@ -5457,11 +5467,31 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
                 )
             })
         };
-        for i in 1..txs.len() {
-            let prev_payload = tiers[i - 1]
-                .payload_out(&txs[i - 1], &format!("tier {}", i - 1))?
-                .value;
+        for i in 0..txs.len() {
+            // Tier 0 is the trigger, and its funding is not another tier — it is the on-chain output
+            // `F`. With no chain fact in hand there is nothing sound to compare it to, so the hop is
+            // skipped rather than measured against `bundle.f_value`; the tiers below it are still
+            // bound to each other.
+            let prev_payload = if i == 0 {
+                match f_onchain {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                tiers[i - 1]
+                    .payload_out(&txs[i - 1], &format!("tier {}", i - 1))?
+                    .value
+            };
             let is_final = i == txs.len() - 1;
+            // How this hop names itself in a refusal. Tier 0's funding is the chain's, not another
+            // tier's, and saying so is the difference between "some arithmetic did not add up" and
+            // "the coin is not worth what it says it is".
+            let what = if i == 0 { "the trigger".to_string() } else { format!("tier {i}") };
+            let funded_by = if i == 0 {
+                format!("{prev_payload} sat, read from the ON-CHAIN funding output F,")
+            } else {
+                format!("{prev_payload} sat")
+            };
             // The final tier of a SPLIT parent is an `SP` with N payload outputs funding N children,
             // so its law is Σ(payloads) rather than a single forward. Every other tier has exactly one
             // payload output. `n` is derived from the transaction: total outputs less the P2A anchor,
@@ -5478,9 +5508,9 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
                 1
             };
             if n_payload == 0 {
-                return Err(anyhow::anyhow!("tier {i} has no payload output at all"));
+                return Err(anyhow::anyhow!("{what} has no payload output at all"));
             }
-            let expect = rung_forward(prev_payload, n_payload, &format!("tier {i}"))?;
+            let expect = rung_forward(prev_payload, n_payload, &what)?;
             // Σ over the payload outputs — which for the single-payload case is just `out[payload_vout]`,
             // and for `SP` is every child's slot. Summing rather than checking one output is what makes
             // an EXTRA output impossible to hide: any sats routed elsewhere make the sum come up short.
@@ -5495,11 +5525,17 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
                 .sum();
             if got != expect {
                 return Err(anyhow::anyhow!(
-                    "tier {i} is funded with {prev_payload} sat but its payload outputs carry {got} \
+                    "{what} is funded with {funded_by} but its payload outputs carry {got} \
                      (expected exactly {expect} = funding − one rung at {} sat/vB across {n_payload} \
                      payload output(s)) — the difference would leave the owner's exit chain, while the \
-                     receiver is credited the on-chain funding value",
-                    bundle.fee_rate
+                     receiver is credited the on-chain funding value{}",
+                    bundle.fee_rate,
+                    if i == 0 {
+                        " — and every tier below it conserves against a number the sender chose \
+                         rather than one the chain agreed to"
+                    } else {
+                        ""
+                    }
                 ));
             }
             // [GAP 1] A non-split tier must have EXACTLY ONE payload output, and the Σ check alone
@@ -5523,7 +5559,7 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
                 .count();
             if actual_payloads != n_payload {
                 return Err(anyhow::anyhow!(
-                    "tier {i} carries {actual_payloads} payload output(s) but this tier kind has \
+                    "{what} carries {actual_payloads} payload output(s) but this tier kind has \
                      exactly {n_payload} — the surplus could hold value that conserves in the SUM \
                      while never reaching the owner's exit chain"
                 ));
@@ -5732,9 +5768,17 @@ fn taproot_key_hex(spk: &[u8]) -> Result<String> {
 /// records (Stage 1, UNIQUE), the exact-equality censuses, and coordinator-enforced terminality.
 ///
 /// PURE + unit-testable: all authoritative values are passed in (the caller fetches them from chain +
-/// `/info/statechain`). `parent_f_onchain_spk_hex` is `F.output[f_vout].script_pubkey` read from the
-/// chain (the caller having confirmed `F` unspent+confirmed at `cb.parent.f_txid/f_vout`); the
-/// `*_aggregate_pubkey` are the server's recorded aggregates (None ⟹ fail-closed).
+/// `/info/statechain`). `parent_f_onchain_spk_hex` and `parent_f_onchain_value` are
+/// `F.output[f_vout].{script_pubkey, value}` read from the chain (the caller having confirmed `F`
+/// unspent+confirmed at `cb.parent.f_txid/f_vout`); the `*_aggregate_pubkey` are the server's
+/// recorded aggregates (None ⟹ fail-closed).
+///
+/// `parent_f_onchain_value` is REQUIRED rather than read off `cb.parent.f_value`, and the difference
+/// is the whole point. `37d8bba` anchored the parent's trigger to the chain inside
+/// `verify_conveyed_child` — the async wrapper — which left every caller that reaches this verifier
+/// directly measuring a value chain against a value the sender declared. This function's own contract
+/// is that authoritative numbers arrive as parameters; `F`'s value is one of those numbers, so it
+/// arrives as one, and the type system now refuses to let a caller forget it.
 ///
 /// ⚠️ DORMANT + UNREVIEWED: nothing calls this for a live split yet (HF-1 still refuses to split a
 /// laddered coin). It must pass the split E2E + an adversarial test suite + an independent review before
@@ -5743,6 +5787,7 @@ fn taproot_key_hex(spk: &[u8]) -> Result<String> {
 pub fn verify_child_bundle(
     cb: &ChildTesrBundle,
     parent_f_onchain_spk_hex: &str,
+    parent_f_onchain_value: u64,
     parent_num_sigs: u32,
     parent_flat_backups: u32,
     parent_aggregate_pubkey: Option<&str>,
@@ -5798,6 +5843,20 @@ pub fn verify_child_bundle(
         return Err(anyhow::anyhow!("parent agg_address does not match the on-chain F aggregate"));
     }
 
+    // [1b] ON-CHAIN VALUE: the parent segment's declared `f_value` must be the value the funding
+    //      output actually holds. Builders hand that number to `cosign_tier` as the trigger's prevout
+    //      amount, and `verify_bundle_ex` seeds its sighash map with it, so a restated `f_value` and a
+    //      trigger co-signed against the restatement agree with each other perfectly. Only the chain
+    //      breaks the tie. (This was `verify_conveyed_child`'s, and is now here, so that a caller of
+    //      the synchronous verifier inherits it rather than having to remember it.)
+    if cb.parent.f_value != parent_f_onchain_value {
+        return Err(anyhow::anyhow!(
+            "the bundle declares f_value {} but the on-chain funding output holds {}",
+            cb.parent.f_value,
+            parent_f_onchain_value
+        ));
+    }
+
     // [2] PARENT AGGREGATE AUTHORITY: the server's recorded aggregate for parent_sid must be non-NULL
     //     (fail-closed) and == A_parent. UNIQUE(aggregate_xonly) ⟹ only the REAL parent sid can hold
     //     A_parent, so a decoy parent_sid (whose counter a sender could pump) can never match here.
@@ -5811,7 +5870,10 @@ pub fn verify_child_bundle(
     //     co-signed under A_parent(=agg_address, now bound to on-chain F), SP is the current state,
     //     S_0 is disclosed as superseded and OUT-RACED by SP over X_m.out[0], and the exact-equality
     //     census holds (num_sigs(parent_sid) accounts for exactly the disclosed tiers).
-    verify_bundle_ex(&cb.parent, parent_num_sigs, parent_flat_backups, true)
+    //     …and the parent's TRIGGER is bound to the chain's `F` value, so the whole tier chain below
+    //     it — parent, ancestors, leaf — conserves against a number Bitcoin agreed to rather than one
+    //     the sender picked.
+    verify_bundle_ex(&cb.parent, parent_num_sigs, parent_flat_backups, true, Some(parent_f_onchain_value))
         .map_err(|e| anyhow::anyhow!("parent segment/census invalid: {e}"))?;
 
     // Parse SP (the parent's current, terminal state) — it hosts the children on its outputs.
@@ -6136,6 +6198,59 @@ pub fn verify_child_bundle(
             )
         })
     };
+    let st_tx: Transaction = deserialize(
+        &hex::decode(&cb.child_state.signed_tx).map_err(|_| anyhow::anyhow!("bad child state hex"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("child state is not a transaction"))?;
+    let st_in = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("child state has no input"))?;
+    if st_tx.input.len() != 1
+        || st_in.previous_output.txid != ext_tx.txid()
+        || st_in.previous_output.vout != cb.child_extension.payload_vout
+    {
+        return Err(anyhow::anyhow!("child state does not spend ext_child's payload output"));
+    }
+
+    // Every check below reads `payload_out` at the DECLARED `payload_vout`, so all of them must
+    // sit BELOW the structural linkage check above — a tampered vout otherwise makes them compute
+    // on the P2A anchor and refuse on VALUE, hiding the accurate structural cause. sdk70 D1 pins
+    // that message. Moving one of them and leaving its neighbours is how this recurred twice.
+    let expect_ext = rung_forward(sp_out.value, "child extension")?;
+    // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, not just
+    // `out[payload_vout]`: pinning one output leaves a window exactly one committed fee wide for a
+    // second output to carry value out of the chain.
+    let ext_payload_total: u64 = ext_tx
+        .output
+        .iter()
+        .filter(|o| {
+            o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                && !o.script_pubkey.is_op_return()
+        })
+        .map(|o| o.value)
+        .sum();
+    if ext_payload_total != expect_ext {
+        return Err(anyhow::anyhow!(
+            "child extension is funded with {} sat but its payload outputs carry {ext_payload_total} \
+             (expected exactly {expect_ext}) — the difference would leave the exit chain",
+            sp_out.value
+        ));
+    }
+    if ext_out0.value != expect_ext {
+        return Err(anyhow::anyhow!(
+            "child extension is funded with {} sat but forwards only {} to its payload output \
+             (expected exactly {expect_ext} = funding − one rung at {} sat/vB) — {} sat would be \
+             skimmed to another output while the receiver is credited the funding value",
+            sp_out.value,
+            ext_out0.value,
+            cb.parent.fee_rate,
+            sp_out.value.saturating_sub(ext_out0.value + (sp_out.value - expect_ext)),
+        ));
+    }
+
+    // ORDERING, and this is the THIRD time in this file: the declared-vs-signed `out_value` check
+    // below reads `payload_out` at the DECLARED vout, so on a bundle whose `payload_vout` is
+    // tampered it reads the P2A anchor (240 sat) and refuses on VALUE — shadowing the structural
+    // "child state does not spend ext_child's payload output" refusal just above, which is the
+    // accurate diagnosis. sdk70 D1 pins that message. Structural checks first, always.
     // The DECLARED field too, symmetrically with the state's `[value-gate spoof]` check below. The
     // conservation law above pins the SIGNED value; this pins the field that travels beside it, and
     // they are different properties. `child_in_ladder_split` later feeds `cb.child_extension
@@ -6162,48 +6277,6 @@ pub fn verify_child_bundle(
             "child extension's payload output does not pay A_child — the child state below it would \
              be signed against a prevout that does not exist"
         ));
-    }
-    // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, not just
-    // `out[payload_vout]`: pinning one output leaves a window exactly one committed fee wide for a
-    // second output to carry value out of the chain.
-    let ext_payload_total: u64 = ext_tx
-        .output
-        .iter()
-        .filter(|o| {
-            o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
-                && !o.script_pubkey.is_op_return()
-        })
-        .map(|o| o.value)
-        .sum();
-    let expect_ext = rung_forward(sp_out.value, "child extension")?;
-    if ext_payload_total != expect_ext {
-        return Err(anyhow::anyhow!(
-            "child extension is funded with {} sat but its payload outputs carry {ext_payload_total} \
-             (expected exactly {expect_ext}) — the difference would leave the exit chain",
-            sp_out.value
-        ));
-    }
-    if ext_out0.value != expect_ext {
-        return Err(anyhow::anyhow!(
-            "child extension is funded with {} sat but forwards only {} to its payload output \
-             (expected exactly {expect_ext} = funding − one rung at {} sat/vB) — {} sat would be \
-             skimmed to another output while the receiver is credited the funding value",
-            sp_out.value,
-            ext_out0.value,
-            cb.parent.fee_rate,
-            sp_out.value.saturating_sub(ext_out0.value + (sp_out.value - expect_ext)),
-        ));
-    }
-    let st_tx: Transaction = deserialize(
-        &hex::decode(&cb.child_state.signed_tx).map_err(|_| anyhow::anyhow!("bad child state hex"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("child state is not a transaction"))?;
-    let st_in = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("child state has no input"))?;
-    if st_tx.input.len() != 1
-        || st_in.previous_output.txid != ext_tx.txid()
-        || st_in.previous_output.vout != cb.child_extension.payload_vout
-    {
-        return Err(anyhow::anyhow!("child state does not spend ext_child's payload output"));
     }
     verify_tier_cosigned(&st_tx, ext_out0.value, &child_agg_spk)
         .map_err(|e| anyhow::anyhow!("child state not co-signed by A_child: {e}"))?;
@@ -8255,6 +8328,9 @@ mod skim_leaf_attack_tests {
         verify_child_bundle(
             cb,
             &f.f_spk_hex,
+            // The chain fact: what `F` actually holds. The parent segment here is honest, so the
+            // trigger anchor never fires — every refusal below still comes from the leaf laws.
+            F_VALUE,
             f.parent_num_sigs,
             f.parent_flat_backups,
             Some(&f.parent_xonly),
@@ -8473,7 +8549,14 @@ mod skim_leaf_attack_tests {
 /// `assert_not_an_unrelated_refusal` fails the test if the bundle was thrown out for a structural
 /// reason instead.
 ///
-/// **Two of these tests pin a hole rather than a fix — read `gap_*` before trusting this lane.**
+/// **Both holes this module opened with are now closed, and the tests that pinned them were flipped
+/// rather than deleted.** GAP 1 (a sum-preserving redistribution across two payload outputs) is
+/// refused by the payload-COUNT check; GAP 2 (a skimming trigger) by the trigger-to-`F` anchor,
+/// `verify_bundle_ex`'s `f_onchain` parameter. One residue is deliberate and is asserted rather than
+/// left implicit: `verify_bundle`, the UNBOUND entry point, has no chain access and therefore no
+/// anchor — see the last assertion of
+/// `a_skimming_trigger_is_refused_against_the_on_chain_funding_value` for why supplying
+/// `bundle.f_value` there would be worse than supplying nothing.
 #[cfg(test)]
 mod skim_root_attack_tests {
     use super::*;
@@ -8737,9 +8820,10 @@ mod skim_root_attack_tests {
     }
 
     /// The entry point under test: the root ladder, un-split (`final_is_split: false`, the constant
-    /// every whole-coin path passes).
+    /// every whole-coin path passes), with the funding value supplied as the CHAIN fact a receiver
+    /// would have fetched — `Some(F_VALUE)`, exactly what `verify_bundle_bound` derives from `tx0`.
     fn verify_root(b: &TesrBundle) -> Result<()> {
-        verify_bundle_ex(b, NUM_SIGS, FLAT_BACKUPS, false)
+        verify_bundle_ex(b, NUM_SIGS, FLAT_BACKUPS, false, Some(F_VALUE))
     }
 
     /// The co-sign that blesses the skim, isolated. `verify_tier_cosigned` must ACCEPT every tampered
@@ -8999,46 +9083,88 @@ mod skim_root_attack_tests {
         );
     }
 
-    /// **GAP 2 — a skimming TRIGGER is ACCEPTED.**
+    /// **THE SKIMMING TRIGGER — was GAP 2, now the lane's anchor. (Formerly a tripwire.)**
     ///
-    /// `deed25c`'s loop runs `for i in 1..txs.len()`, so tier 0 — the trigger — is bound to nothing.
-    /// Its payload output is used as the funding value for the extension's law and is never itself
-    /// compared to `f_value`, which `verify_bundle_bound` has already pinned to the on-chain output.
-    /// So `T` can spend a 200 000-sat `F`, pay the aggregate 1 000, and route 197 924 to the attacker;
-    /// every tier below it conserves perfectly from the lie.
+    /// `deed25c`'s loop ran `for i in 1..txs.len()`, so tier 0 — the trigger — was bound to nothing.
+    /// Its payload output seeded the extension's law and was never itself compared to `F`. So `T`
+    /// could spend a 200 000-sat funding output, pay the aggregate 1 000, and route 198 424 to the
+    /// attacker, while every tier below it conserved perfectly from the lie and the receiver booked
+    /// the on-chain 200 000 (`amount: tx0_output.value`, transfer_receiver.rs:1486).
     ///
-    /// This is the construction §2 of the sweep document gives for V1, and §8 flags the anchor as
-    /// existing "only on the CHILD lane" — `verify_conveyed_child` gained it in `37d8bba`
-    /// (`tesr.rs`: `tier_out_value(f_out.value, …)`), the whole-coin path never did. The fix is the
-    /// same three lines, against `bundle.f_value`, which is already chain-bound at that point.
+    /// It was the most severe of that pair: the trigger is un-timelocked and spends `F`, so
+    /// broadcasting it kills every flat backup at the same instant ([B1]) — the theft and the
+    /// destruction of the fallback are one transaction.
     ///
-    /// It is the most severe of the two: the trigger is un-timelocked and spends `F`, so broadcasting
-    /// it kills every flat backup at the same instant ([B1]) — the theft and the destruction of the
-    /// fallback are one transaction.
+    /// **This test was written as a tripwire asserting the hole was open, and is flipped here exactly
+    /// as its author instructed.** The loop now starts at `i = 0` and the trigger's funding is
+    /// `f_onchain`, an explicit parameter carrying the value the CALLER read off the chain —
+    /// `Some(coin.f_value)` from `verify_bundle_bound`, `Some(parent_f_onchain_value)` from
+    /// `verify_child_bundle`.
+    ///
+    /// **And the last assertion is the honest residue, not an oversight.** `verify_bundle` has no
+    /// chain access, passes `None`, and still accepts this bundle. That is deliberate: the alternative
+    /// is to measure the trigger against `bundle.f_value`, which the sender chose and co-signed
+    /// against, producing a check that never fails and reads like an anchor. The unbound entry point
+    /// is documented as unbound; this pins that it really is.
     #[test]
-    fn gap_a_skimming_trigger_on_the_root_lane_is_still_accepted() {
+    fn a_skimming_trigger_is_refused_against_the_on_chain_funding_value() {
         let rig = rig();
         let b = rig.ladder(Skim::TriggerShort);
 
+        // The theft, stated as arithmetic.
         let t: Transaction = parse(&b.trigger.signed_tx);
         assert_eq!(t.output.len(), 3);
         assert_eq!(t.output[2].script_pubkey, rig.attacker.spk);
         assert_eq!(b.trigger.out_value, TOKEN_FORWARD, "the trigger forwards 1 000 of a 200 000 coin");
+        assert_eq!(t.output[2].value, 198_424, "…and 198 424 goes to the attacker");
         assert_eq!(
             b.levels[0].state.out_value,
             TOKEN_FORWARD - 2 * RUNG,
             "the owner's exit chain can deliver 20 sat"
         );
+        // Everything BELOW the trigger conserves exactly, which is why nothing else can be what
+        // refuses this bundle: each tier was built from the value its parent really forwards.
+        assert_eq!(
+            b.levels[0].extension.out_value,
+            TOKEN_FORWARD - RUNG,
+            "the extension conserves perfectly — against the trigger's lie"
+        );
         assert_still_genuinely_cosigned(&b, &rig);
 
-        // And the bound path — which knows the real funding value — accepts it anyway.
-        let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
+        // The bound path — the one `transfer_receiver.rs` calls on every laddered claim and every SSP
+        // pre-pay — knows the real funding value, and now uses it.
+        let msg = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority())
+            .expect_err("a trigger that skims the funding output must be REFUSED")
+            .to_string();
         assert!(
-            r.is_ok(),
-            "GAP 2 HAS BEEN CLOSED — this tripwire has done its job. The root lane now anchors the \
-             trigger to F ({:?}); flip this test to `expect_err`, assert the refusal names the \
-             funding value, and strike GAP 2 from the module doc comment.",
-            r.as_ref().err()
+            msg.contains("the trigger is funded with 200000 sat, read from the ON-CHAIN funding output F"),
+            "the refusal must name the CHAIN's funding value, got: {msg}"
+        );
+        assert!(
+            msg.contains("payload outputs carry 199424"),
+            "…and what the trigger's outputs actually carry, got: {msg}"
+        );
+        assert!(
+            msg.contains("expected exactly 199510"),
+            "…and what one rung off the real F would have been, got: {msg}"
+        );
+        assert!(
+            msg.contains("a number the sender chose rather than one the chain agreed to"),
+            "…and why every law below it was worthless without this one, got: {msg}"
+        );
+        assert_not_an_unrelated_refusal(&msg);
+
+        // Same refusal through the private entry point when the chain fact is supplied.
+        let direct = verify_root(&b).expect_err("…and directly").to_string();
+        assert!(direct.contains("payload outputs carry 199424"));
+
+        // THE RESIDUE, pinned deliberately: with NO chain fact there is no anchor, and this bundle is
+        // internally perfect. `verify_bundle` is for re-checking a ladder you built yourself; it is
+        // not an acceptance path, and its doc comment says so.
+        verify_bundle(&b, NUM_SIGS, FLAT_BACKUPS).expect(
+            "the UNBOUND entry point has no F to measure against and must stay honest about that — \
+             if this starts failing, someone has passed `bundle.f_value` as the anchor, which proves \
+             only that the sender was self-consistent",
         );
     }
 }
@@ -9375,14 +9501,19 @@ mod forged_yardstick_attack_tests {
         }
     }
 
+    /// The funding value is the CHAIN fact a receiver would have fetched. It is deliberately supplied
+    /// even here: the ladders in this module are built at a forged RATE, not a forged funding value,
+    /// so the trigger anchor is satisfied by construction and cannot be what refuses (or accepts)
+    /// anything below. That is the point — this module isolates the yardstick.
     fn verify_root(b: &TesrBundle) -> Result<()> {
-        verify_bundle_ex(b, NUM_SIGS, FLAT_BACKUPS, false)
+        verify_bundle_ex(b, NUM_SIGS, FLAT_BACKUPS, false, Some(F_VALUE))
     }
 
     fn verify_child(rig: &Rig, cb: &ChildTesrBundle) -> Result<()> {
         verify_child_bundle(
             cb,
             &hex::encode(rig.agg.spk.as_bytes()),
+            F_VALUE,
             // The parent's census: one deposit backup + T + X + SP.
             1 + 3,
             1,
@@ -9647,6 +9778,14 @@ mod forged_yardstick_attack_tests {
     /// value law now refuses every tier, naming the value it was funded with and what its payload
     /// outputs carry. Which is to say: the tiers ARE skimming; the verifier can see it perfectly
     /// well; it is measuring with the attacker's ruler.
+    ///
+    /// **The refusal is asserted twice, at two hops, on purpose.** The trigger-to-`F` anchor now
+    /// makes tier 0 the FIRST hop to break — a ladder built at 2 662 sat/vB forwards 667 010 out of a
+    /// funding output the chain says holds 1 000 000, and one honest rung off 1 000 000 is 999 510.
+    /// Through `verify_bundle`, which has no chain fact and therefore no anchor, the same bytes fall
+    /// instead to tier 1's RELATIVE law, with the numbers this test has always named. Both matter:
+    /// the first shows the anchor catches a forged schedule at the root, the second shows the
+    /// relative chain still catches it without one — so neither check is load-bearing alone.
     #[test]
     fn a_forged_yardstick_ladder_is_refused_when_the_rate_is_declared_honestly() {
         let rig = rig();
@@ -9662,8 +9801,28 @@ mod forged_yardstick_attack_tests {
         assert_eq!(attack.levels[0].state.signed_tx, same_bytes_honest_rate.levels[0].state.signed_tx);
         assert_ne!(attack.fee_rate, same_bytes_honest_rate.fee_rate);
 
+        // (a) ANCHORED — the chain fact in hand, so the very first hop is the one that breaks.
         let msg = verify_root(&same_bytes_honest_rate)
             .expect_err("measured against the RECEIVER's rate, this ladder is a skim and is refused")
+            .to_string();
+        assert!(
+            msg.contains(&format!("the trigger is funded with {F_VALUE} sat, read from the ON-CHAIN funding output F")),
+            "the refusal must name the on-chain funding value, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("payload outputs carry {}", F_VALUE - FORGED_RUNG)),
+            "…and what the trigger actually forwards, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("expected exactly {}", F_VALUE - HONEST_RUNG)),
+            "…and what one HONEST rung off the real F would have been, got: {msg}"
+        );
+        assert_not_an_unrelated_refusal(&msg);
+
+        // (b) UNANCHORED — no chain fact, so the trigger's hop is skipped and tier 1's relative law
+        //     is what refuses. These are the assertions this control was written with.
+        let msg = verify_bundle(&same_bytes_honest_rate, NUM_SIGS, FLAT_BACKUPS)
+            .expect_err("the relative laws refuse it too, with no anchor at all")
             .to_string();
         assert!(
             msg.contains(&format!("tier 1 is funded with {} sat", F_VALUE - FORGED_RUNG)),
@@ -10310,6 +10469,10 @@ mod wrong_payee_attack_tests {
         verify_child_bundle(
             cb,
             &f.f_spk_hex,
+            // The chain fact. Every segment here conserves value exactly — the tamper is a PAYEE key,
+            // never an amount — so the trigger anchor is satisfied and the payee binding stays the
+            // only thing that can refuse.
+            F_VALUE,
             f.parent_num_sigs,
             f.parent_flat_backups,
             Some(&f.parent_xonly),
