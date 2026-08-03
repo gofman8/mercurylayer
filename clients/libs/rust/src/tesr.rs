@@ -5879,6 +5879,22 @@ pub fn verify_child_bundle(
             )
         })
     };
+    // The DECLARED field too, symmetrically with the state's `[value-gate spoof]` check below. The
+    // conservation law above pins the SIGNED value; this pins the field that travels beside it, and
+    // they are different properties. `child_in_ladder_split` later feeds `cb.child_extension
+    // .out_value` to `tier_out_total` and to `cosign_tier` as a prevout amount, so a field that
+    // disagrees with its own transaction makes the receiver's OWN next split sign against a sighash
+    // committing to an amount the transaction does not carry — a signature that verifies against
+    // nothing, discovered only after `set_spend_budget` has terminalized the coin.
+    if ext_out0.value != cb.child_extension.out_value {
+        return Err(anyhow::anyhow!(
+            "child extension out[{}] carries {} sat but the bundle declares out_value {} — the \
+             declared value is what later splits of this child would compute and sign against",
+            cb.child_extension.payload_vout,
+            ext_out0.value,
+            cb.child_extension.out_value
+        ));
+    }
     let expect_ext = rung_forward(sp_out.value, "child extension")?;
     if ext_out0.value != expect_ext {
         return Err(anyhow::anyhow!(
