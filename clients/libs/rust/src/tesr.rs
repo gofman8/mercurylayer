@@ -5502,6 +5502,32 @@ fn verify_bundle_ex(bundle: &TesrBundle, se_num_sigs: u32, flat_backups: u32, fi
                     bundle.fee_rate
                 ));
             }
+            // [GAP 1] A non-split tier must have EXACTLY ONE payload output, and the Σ check alone
+            // does not say so. `n_payload` is hard-coded to 1 above for these tiers while `got` sums
+            // over every payload output, so an attacker who splits the forward value across TWO
+            // outputs — 1 000 onward and the rest to themselves — keeps Σ exactly on the expected
+            // total, commits the honest fee, and sails through. The leaf lane refuses this only
+            // because it ALSO checks the single `out[payload_vout]`, a line that reads as redundant
+            // beside its Σ check and is not; the root lane had no such second line.
+            //
+            // Found by `skim_root_attack_tests`, by running it. The sweep's §1 argues for the Σ form
+            // because pinning one output leaves a fee-wide window; the converse — that Σ alone leaves
+            // a redistribution window — was true the whole time and written down nowhere.
+            let actual_payloads = txs[i]
+                .output
+                .iter()
+                .filter(|o| {
+                    o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                        && !o.script_pubkey.is_op_return()
+                })
+                .count();
+            if actual_payloads != n_payload {
+                return Err(anyhow::anyhow!(
+                    "tier {i} carries {actual_payloads} payload output(s) but this tier kind has \
+                     exactly {n_payload} — the surplus could hold value that conserves in the SUM \
+                     while never reaching the owner's exit chain"
+                ));
+            }
         }
     }
 
@@ -7883,5 +7909,2779 @@ mod split_journal_tests {
         assert!(back.children[1].extension.is_none());
         assert_eq!(back.sp_txid, "sp");
         assert_eq!(back.child_state_csv, mercurylib::tesr::TesrParams::regtest().state_csv(0));
+    }
+}
+
+/// # THE SKIM-LEAF ATTACK, BUILT AND RUN
+///
+/// Every fix in `docs/utexo/VALUE-CONSERVATION-SWEEP.md` was landed against HONEST traffic: sdk 1, 2,
+/// 11, 17, 58, 59, 74, 75, 76 and 77 all show that a well-formed bundle still passes. Not one of them
+/// constructs the theft and asserts the refusal, and the probe that originally proved the defect
+/// (`4e165e6`) was temporary and is gone. §8 of that document names this as the single most valuable
+/// thing left to build. This module is it, for the LEAF hop.
+///
+/// **What the attacker holds, and why that is realistic.** These tests build a real, fully co-signed
+/// ladder while holding BOTH halves of every aggregate key. That is not a cheat — it is precisely
+/// what a blind SE hands out. `cosign_tier_request` (lib/src/tesr.rs:503) presents a sighash and the
+/// enclave signs it; it never deserialises the transaction, never sees the outputs, and takes the
+/// prevout amount as a CALLER parameter. So "this tier is genuinely co-signed" carries no information
+/// whatsoever about how the tier splits its input across outputs. Each test below asserts that
+/// directly — `verify_tier_cosigned` is checked to still ACCEPT the tampered tier — so the refusal
+/// can only be coming from the value law and from nothing else.
+///
+/// **The attack.** `child_extension` spends `SP.out[j]` (198 530 sat here, the same number the
+/// original probe used) and forwards a fraction, sending the remainder to a second output that pays
+/// the sender. `child_state` then pays the receiver that fraction minus one rung and declares
+/// `out_value` **honestly** — 510 really is all the payee can ever reach. Every declared-vs-signed
+/// check therefore passes. What makes it theft is that the receiver books the FUNDING value
+/// (`coin.amount = sp_out.value`, transfer_receiver.rs:1321), so the payee is credited 198 530 for a
+/// coin worth 510.
+///
+/// **Non-vacuity.** `honest_child_bundle_is_accepted` runs the identical construction with no
+/// tampering and asserts `Ok(())`. Every attack test additionally asserts that the refusal names the
+/// right cause, so a bundle that happened to be malformed for an unrelated reason would not pass as a
+/// success here.
+#[cfg(test)]
+mod skim_leaf_attack_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        consensus::{deserialize, serialize},
+        key::TapTweak,
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, ScriptBuf, Transaction, TxOut, Witness,
+    };
+
+    const NET: &str = "regtest";
+    /// The parent coin's on-chain funding outpoint. Nothing fetches it — `verify_child_bundle` is
+    /// pure and takes `F`'s scriptPubKey as a parameter.
+    const F_TXID: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const F_VOUT: u32 = 0;
+    const F_VALUE: u64 = 200_000;
+
+    /// A party holding BOTH halves of an aggregate key — what a blind co-sign is equivalent to.
+    struct Holder {
+        kp: KeyPair,
+        /// The P2TR address for the UNTWEAKED internal key (BIP-341, no script tree).
+        address: String,
+        spk: ScriptBuf,
+        /// The x-only the coordinator would have on record: UNTWEAKED, as `/info/statechain` serves it.
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    /// Produce exactly the witness `verify_tier_cosigned` checks: a BIP-341 key-spend Schnorr
+    /// signature by the aggregate over `TxOut { value: prevout_value, script_pubkey: agg_spk }` with
+    /// `TapSighashType::All`. This IS the blind co-sign, performed locally.
+    fn cosign(tx: &Transaction, prevout_value: u64, agg_spk: &ScriptBuf, kp: &KeyPair) -> Transaction {
+        let secp = Secp256k1::new();
+        let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };
+        let sighash = SighashCache::new(tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+            .expect("taproot key-spend sighash");
+        let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+        let mut signed = tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+        signed
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    fn as_hex(tx: &Transaction) -> String {
+        hex::encode(serialize(tx))
+    }
+
+    /// A bundle tier describing `tx`, with `out_value` read from the transaction — i.e. declared
+    /// HONESTLY. Every attack below keeps it that way; the lie is in the OUTPUT VECTOR, never in the
+    /// field beside it.
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: as_hex(tx),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    /// Where the skim is planted.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Skim {
+        /// No tampering at all — the non-vacuity control.
+        None,
+        /// **The original probe.** The extension forwards a fraction and routes the rest to a second
+        /// output paying the sender, taking a plausible fee on the way. `Σ payload outputs` comes up
+        /// short of the law's expected total.
+        ExtensionGreedy,
+        /// The same theft, sized so that `Σ payload outputs` STILL equals the expected total — the
+        /// attacker pays the committed fee and simply moves the value between two payload outputs.
+        /// This is the variant a Σ-only law would wave through, and it exists to prove the
+        /// per-output check beside the Σ check is load-bearing rather than redundant.
+        ExtensionFeeNeutral,
+        /// The skim moved one hop DOWN: an honest extension, and a state that pays the receiver a
+        /// fraction while returning the rest. `child_state.out_value` is still declared honestly.
+        StateHop,
+    }
+
+    struct Rig {
+        parent: Holder,
+        child: Holder,
+        receiver: Holder,
+        sender: Holder,
+        params: mercurylib::tesr::TesrParams,
+        rate: f64,
+    }
+
+    /// Everything `verify_child_bundle` needs alongside the bundle: the facts a receiver reads off
+    /// the chain and the coordinator, none of which the attack touches.
+    struct Facts {
+        f_spk_hex: String,
+        parent_num_sigs: u32,
+        parent_flat_backups: u32,
+        parent_xonly: String,
+        child_num_sigs: u32,
+        child_flat_backups: u32,
+        child_xonly: String,
+        receiver_address: String,
+    }
+
+    fn rig() -> Rig {
+        let params = mercurylib::tesr::TesrParams::regtest();
+        Rig {
+            parent: holder(0x11),
+            child: holder(0x22),
+            receiver: holder(0x33),
+            sender: holder(0x44),
+            rate: params.committed_fee_rate,
+            params,
+        }
+    }
+
+    impl Rig {
+        /// The PARENT segment, honest throughout and genuinely co-signed by `A_parent`:
+        /// `T -> X -> SP`, with `SP` a spine split state (CSV = `SPINE_CSV`) funding ONE child slot.
+        /// Returns the bundle and the value of that slot.
+        fn parent_segment(&self) -> (TesrBundle, u64) {
+            let p = self.params;
+            let a = &self.parent;
+
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, self.rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), F_VALUE, &a.spk, &a.kp);
+
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+
+            // The child's slot on `SP`: the whole of `X`'s payload minus exactly one rung.
+            let slot = mercurylib::tesr::tier_out_total(x.out_value, 1, self.rate).expect("slot");
+            let sp = mercurylib::tesr::build_split_state(
+                &x.txid,
+                x.out_value,
+                &[(self.child.address.clone(), slot)],
+                NET,
+                SPINE_CSV,
+                self.rate,
+            )
+            .expect("split state");
+            let sp_tx = cosign(&parse(&sp.tx_hex), x.out_value, &a.spk, &a.kp);
+
+            let bundle = TesrBundle {
+                version: 1,
+                statechain_id: "parent-sid".into(),
+                network: NET.into(),
+                fee_rate: self.rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.sender.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&sp_tx, Some(SPINE_CSV), sp.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                params: p,
+                rgb: None,
+            };
+            (bundle, slot)
+        }
+
+        /// The LEAF: `child_extension` over `SP.out[0]`, then `child_state` paying the receiver.
+        /// Both tiers really co-signed by `A_child`, with `skim` deciding where (if anywhere) value
+        /// is diverted.
+        fn child_bundle(&self, skim: Skim) -> ChildTesrBundle {
+            let p = self.params;
+            let (parent, slot) = self.parent_segment();
+            let sp_txid = parent.current().state.txid.clone();
+            let c = &self.child;
+
+            // ---- hop 1: the child extension ------------------------------------------------------
+            let xc = mercurylib::tesr::build_extension(
+                &sp_txid, slot, &c.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("child extension");
+            let honest_forward = xc.out_value; // slot − one rung, what an honest tier pays on
+            let mut xc_tx = parse(&xc.tx_hex);
+            let forwarded = match skim {
+                Skim::ExtensionGreedy | Skim::ExtensionFeeNeutral => {
+                    // Forward a token amount; the rest goes to a SECOND output paying the sender.
+                    let forwarded = 1_000u64;
+                    let diverted = match skim {
+                        // Take everything the transaction can carry after a plausible 3-output fee:
+                        // Σ(payload) then falls SHORT of the law's expected total.
+                        Skim::ExtensionGreedy => {
+                            slot - forwarded
+                                - mercurylib::tesr::P2A_VALUE
+                                - mercurylib::tesr::committed_fee_for_outputs(2, self.rate)
+                        }
+                        // Keep Σ(payload) EXACTLY on the law's expected total — the fee is committed
+                        // honestly and only the distribution across payload outputs is a lie.
+                        _ => honest_forward - forwarded,
+                    };
+                    xc_tx.output[xc.payload_vout as usize].value = forwarded;
+                    xc_tx.output.push(TxOut {
+                        value: diverted,
+                        script_pubkey: self.sender.spk.clone(),
+                    });
+                    forwarded
+                }
+                Skim::None | Skim::StateHop => honest_forward,
+            };
+            // The blind SE co-signs the tampered distribution exactly as it co-signs an honest one.
+            let xc_tx = cosign(&xc_tx, slot, &c.spk, &c.kp);
+
+            // ---- hop 2: the child state ----------------------------------------------------------
+            let sc = mercurylib::tesr::build_state(
+                &xc_tx.txid().to_string(),
+                forwarded,
+                &self.receiver.address,
+                NET,
+                p.state_csv(0),
+                self.rate,
+            )
+            .expect("child state");
+            let mut sc_tx = parse(&sc.tx_hex);
+            if skim == Skim::StateHop {
+                // Pay the receiver a fraction and return the rest to the sender. `out_value` below is
+                // still read off THIS transaction, so the declaration stays honest.
+                let to_receiver = 510u64;
+                let diverted = sc.out_value - to_receiver;
+                sc_tx.output[sc.payload_vout as usize].value = to_receiver;
+                sc_tx.output.push(TxOut { value: diverted, script_pubkey: self.sender.spk.clone() });
+            }
+            let sc_tx = cosign(&sc_tx, forwarded, &c.spk, &c.kp);
+
+            ChildTesrBundle {
+                parent,
+                parent_statechain_id: "parent-sid".into(),
+                sp_vout: 0,
+                child_statechain_id: "child-sid".into(),
+                child_owner_exit_address: self.receiver.address.clone(),
+                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
+                child_superseded_states: vec![],
+                child_superseded_extensions: vec![],
+                ancestors: vec![],
+                rgb: None,
+                parent_flat_backups: vec![],
+            }
+        }
+
+        fn facts(&self) -> Facts {
+            Facts {
+                f_spk_hex: hex::encode(self.parent.spk.as_bytes()),
+                // The parent's census: one deposit backup + T + X + SP, nothing superseded.
+                parent_num_sigs: 1 + 3,
+                parent_flat_backups: 1,
+                parent_xonly: self.parent.recorded_xonly.clone(),
+                // A derived child slot has no flat backup (CHILD_V2_BASELINE = 0) — just its two tiers.
+                child_num_sigs: 2,
+                child_flat_backups: 0,
+                child_xonly: self.child.recorded_xonly.clone(),
+                receiver_address: self.receiver.address.clone(),
+            }
+        }
+    }
+
+    fn verify(cb: &ChildTesrBundle, f: &Facts) -> Result<()> {
+        verify_child_bundle(
+            cb,
+            &f.f_spk_hex,
+            f.parent_num_sigs,
+            f.parent_flat_backups,
+            Some(&f.parent_xonly),
+            true, // the parent segment is terminal, as the protocol requires
+            f.child_num_sigs,
+            f.child_flat_backups,
+            Some(&f.child_xonly),
+            &[],
+            &f.receiver_address,
+        )
+    }
+
+    /// The co-sign that blesses the skim, isolated. `verify_tier_cosigned` must ACCEPT the tampered
+    /// extension: that is what makes the value law the only thing standing between the receiver and
+    /// the theft, and it is what every attack test below leans on for non-vacuity.
+    fn assert_still_genuinely_cosigned(cb: &ChildTesrBundle, rig: &Rig) {
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let funding = sp.output[cb.sp_vout as usize].value;
+        let ext: Transaction = parse(&cb.child_extension.signed_tx);
+        verify_tier_cosigned(&ext, funding, &rig.child.spk)
+            .expect("the blind SE really does co-sign this tier — the skim is not a forgery");
+        let st: Transaction = parse(&cb.child_state.signed_tx);
+        verify_tier_cosigned(&st, ext.output[cb.child_extension.payload_vout as usize].value, &rig.child.spk)
+            .expect("and so is the state below it");
+    }
+
+    /// A refusal must name the value law, not some unrelated malformation. These are the causes that
+    /// would make an attack test pass for the WRONG reason.
+    fn assert_not_an_unrelated_refusal(msg: &str) {
+        for unrelated in [
+            "not co-signed",
+            "num_sigs",
+            "CSV",
+            "does not spend",
+            "colour",
+            "Model A",
+            "decoy",
+            "terminal",
+            "out of range",
+        ] {
+            assert!(
+                !msg.contains(unrelated),
+                "the bundle was refused for an UNRELATED reason ({unrelated:?}) — this test would \
+                 be worthless: {msg}"
+            );
+        }
+    }
+
+    // ── THE NON-VACUITY CONTROL ────────────────────────────────────────────────────────────────
+
+    /// **The control every attack below depends on.** The identical construction, untampered, must be
+    /// ACCEPTED. Without this, a refusal proves nothing: the scaffolding could be malformed in a
+    /// dozen ways that have nothing to do with value conservation.
+    #[test]
+    fn honest_child_bundle_is_accepted() {
+        let rig = rig();
+        let cb = rig.child_bundle(Skim::None);
+        // The arithmetic the tests below break, stated first so a schedule change shows up here and
+        // not as a mystery failure three tests down. A plain rung at 2 sat/vB is 490 sat.
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let slot = sp.output[0].value;
+        assert_eq!(slot, 198_530, "the child's slot on SP");
+        assert_eq!(cb.child_extension.out_value, slot - 490, "the extension forwards one rung less");
+        assert_eq!(
+            cb.child_state.out_value,
+            slot - 2 * 490,
+            "and the state pays the receiver one rung less again"
+        );
+        verify(&cb, &rig.facts()).expect("an honest, fully co-signed child bundle must be ACCEPTED");
+    }
+
+    // ── THE ATTACKS ────────────────────────────────────────────────────────────────────────────
+
+    /// **The original probe, reconstructed.** `child_extension` spends the 198 530-sat slot and pays
+    /// 1 000 sat forward, with the remainder going to a second output back to the sender.
+    /// `child_state` then pays the receiver 510 sat and declares `out_value: 510` truthfully. Before
+    /// `4e165e6` this returned `Ok(())` and the receiver was credited 198 530 for a coin worth 510.
+    #[test]
+    fn a_skimming_child_extension_is_refused() {
+        let rig = rig();
+        let cb = rig.child_bundle(Skim::ExtensionGreedy);
+
+        // The theft is real and everything else about the bundle is honest.
+        assert_eq!(cb.child_extension.out_value, 1_000, "only 1 000 sat is forwarded");
+        assert_eq!(cb.child_state.out_value, 510, "…so 510 sat is all the payee can ever reach");
+        let ext: Transaction = parse(&cb.child_extension.signed_tx);
+        assert_eq!(ext.output.len(), 3, "payload + P2A anchor + the sender's second output");
+        assert_eq!(
+            ext.output[2].script_pubkey, rig.sender.spk,
+            "the skimmed value goes back to the SENDER"
+        );
+        assert_eq!(
+            ext.output[cb.child_extension.payload_vout as usize].value,
+            cb.child_extension.out_value,
+            "the declared value is HONEST — the lie is in the output vector"
+        );
+        assert_still_genuinely_cosigned(&cb, &rig);
+
+        let e = verify(&cb, &rig.facts()).expect_err("a skimming child extension must be REFUSED");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("payload outputs carry") && msg.contains("would leave the exit chain"),
+            "the refusal must name the payload outputs and the exit chain, got: {msg}"
+        );
+        assert!(msg.contains("child extension"), "…and it must name the hop, got: {msg}");
+        assert_not_an_unrelated_refusal(&msg);
+    }
+
+    /// **The Σ-neutral variant, which is why the per-output check beside the Σ check is not
+    /// redundant.** Same theft, but the attacker keeps `Σ payload outputs` exactly on the number the
+    /// conservation law expects — the committed fee is paid honestly and only the DISTRIBUTION
+    /// between the two payload outputs is a lie. A law that summed and stopped there would accept
+    /// this bundle.
+    #[test]
+    fn a_sum_neutral_skim_across_two_payload_outputs_is_refused() {
+        let rig = rig();
+        let cb = rig.child_bundle(Skim::ExtensionFeeNeutral);
+
+        let ext: Transaction = parse(&cb.child_extension.signed_tx);
+        let payload_total: u64 = ext
+            .output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum();
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let slot = sp.output[0].value;
+        assert_eq!(
+            payload_total,
+            mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+            "Σ over the payload outputs is EXACTLY what the conservation law expects — the sum \
+             check alone cannot see this attack"
+        );
+        assert_eq!(cb.child_extension.out_value, 1_000, "yet only 1 000 sat continues down the chain");
+        assert_still_genuinely_cosigned(&cb, &rig);
+
+        let e = verify(&cb, &rig.facts()).expect_err("a sum-neutral skim must be REFUSED");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("forwards only") && msg.contains("skimmed"),
+            "the refusal must name the under-forwarding payload output, got: {msg}"
+        );
+        assert!(msg.contains("child extension"), "…and it must name the hop, got: {msg}");
+        assert_not_an_unrelated_refusal(&msg);
+    }
+
+    /// **The same theft one hop down.** The extension is entirely honest; the STATE pays the receiver
+    /// 510 sat and returns the rest to the sender, declaring `out_value: 510` truthfully. The
+    /// declared-vs-signed check (`value-gate spoof`) is satisfied — it makes the number honest, not
+    /// correct — so only the second conservation hop refuses it.
+    #[test]
+    fn a_skimming_child_state_is_refused() {
+        let rig = rig();
+        let cb = rig.child_bundle(Skim::StateHop);
+
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let slot = sp.output[0].value;
+        assert_eq!(
+            cb.child_extension.out_value,
+            mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+            "the extension hop is HONEST — the skim is entirely in the state"
+        );
+        let st: Transaction = parse(&cb.child_state.signed_tx);
+        assert_eq!(st.output.len(), 3, "receiver payment + P2A anchor + the sender's second output");
+        assert_eq!(st.output[2].script_pubkey, rig.sender.spk);
+        assert_eq!(cb.child_state.out_value, 510, "declared honestly: 510 is what the payee reaches");
+        assert_eq!(
+            st.output[cb.child_state.payload_vout as usize].value,
+            cb.child_state.out_value,
+            "so the `value-gate spoof` check is satisfied and cannot be what refuses this"
+        );
+        assert_still_genuinely_cosigned(&cb, &rig);
+
+        let e = verify(&cb, &rig.facts()).expect_err("a skimming child state must be REFUSED");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("pays the receiver only")
+                && msg.contains("would leave the receiver's exit chain entirely"),
+            "the refusal must name the receiver's exit chain, got: {msg}"
+        );
+        assert!(msg.contains("child state"), "…and it must name the hop, got: {msg}");
+        assert_not_an_unrelated_refusal(&msg);
+    }
+}
+
+/// # THE SKIM-ROOT ATTACK, BUILT AND RUN
+///
+/// The sibling of `skim_leaf_attack_tests` on the WHOLE-COIN lane. `deed25c` added a per-tier
+/// conservation law to `verify_bundle_ex` — the root ladder's `T → X_m → S_k` — and, like every other
+/// commit in the `docs/utexo/VALUE-CONSERVATION-SWEEP.md` series, it was validated only by showing
+/// that honest traffic still passes. §8 of that document names the missing half: *"No test proves the
+/// attacks are now refused."* This module builds them.
+///
+/// **Why the root lane is the worse one.** On the child lane the number the receiver books comes out
+/// of the bundle, so a skim lowers the credited amount too. On the root lane the receiver books the
+/// **on-chain funding value** (`amount: tx0_output.value`, lib/src/transfer/receiver.rs → assigned at
+/// transfer_receiver.rs:1486), which is the largest number in the whole structure and which no skim
+/// can touch. And the fallback is not a fallback: `T` is un-timelocked, spends `F`, and every prior
+/// owner keeps a co-signed copy of it, so the moment one of them broadcasts it every flat backup —
+/// all of which also spend `F` — is void ([B1]). The theft and the destruction of the slow path are
+/// the same transaction.
+///
+/// **What the attacker holds, and why that is realistic.** These tests build a real, fully co-signed
+/// ladder while holding both halves of the aggregate key `A`. That is not a cheat — it is exactly
+/// what a blind SE hands out: `cosign_tier_request` (lib/src/tesr.rs:503) is handed a sighash and a
+/// prevout AMOUNT, never a transaction, so it cannot see how a tier splits its input across outputs.
+/// Every attack below additionally asserts that `verify_tier_cosigned` still ACCEPTS the tampered
+/// tier, so the refusal can only be coming from the value law.
+///
+/// **Non-vacuity.** `honest_root_ladder_is_accepted` runs the identical construction untampered and
+/// asserts `Ok(())` through all three entry points (`verify_bundle_ex`, `verify_bundle`,
+/// `verify_bundle_bound`). Every attack test asserts the refusal names the value law, and
+/// `assert_not_an_unrelated_refusal` fails the test if the bundle was thrown out for a structural
+/// reason instead.
+///
+/// **Two of these tests pin a hole rather than a fix — read `gap_*` before trusting this lane.**
+#[cfg(test)]
+mod skim_root_attack_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        consensus::{deserialize, serialize},
+        key::TapTweak,
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, ScriptBuf, Transaction, TxOut, Witness,
+    };
+
+    const NET: &str = "regtest";
+    const SID: &str = "root-sid";
+    /// The coin's on-chain funding outpoint. Nothing fetches it — every entry point used here is pure
+    /// and takes the chain facts as parameters.
+    const F_TXID: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const F_VOUT: u32 = 0;
+    const F_VALUE: u64 = 200_000;
+
+    /// An ordinary on-chain root coin: the deposit co-signs one flat backup before the ladder is
+    /// established, then `T`, `X_0` and `S_0` consume one co-sign each. The census is EXACT equality,
+    /// so these two constants are not decoration — get either wrong and every test below fails on
+    /// `num_sigs mismatch` instead of on the value law.
+    const FLAT_BACKUPS: u32 = 1;
+    const NUM_SIGS: u32 = FLAT_BACKUPS + 3;
+
+    /// One plain rung at the committed 2 sat/vB: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
+    const RUNG: u64 = 490;
+
+    /// A party holding BOTH halves of an aggregate key — what a blind co-sign is equivalent to.
+    struct Holder {
+        kp: KeyPair,
+        /// The P2TR address for the UNTWEAKED internal key (BIP-341, no script tree).
+        address: String,
+        spk: ScriptBuf,
+        /// The x-only the coordinator would have on record: UNTWEAKED, as `/info/statechain` serves it.
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    /// Produce exactly the witness `verify_tier_cosigned` checks: a BIP-341 key-spend Schnorr
+    /// signature by the aggregate over `TxOut { value: prevout_value, script_pubkey: agg_spk }` with
+    /// `TapSighashType::All`. This IS the blind co-sign, performed locally — note that it commits to
+    /// the prevout AMOUNT and to the transaction, but the SE that produces it in production sees only
+    /// the resulting 32 bytes.
+    fn cosign(tx: &Transaction, prevout_value: u64, agg_spk: &ScriptBuf, kp: &KeyPair) -> Transaction {
+        let secp = Secp256k1::new();
+        let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };
+        let sighash = SighashCache::new(tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+            .expect("taproot key-spend sighash");
+        let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+        let mut signed = tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+        signed
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    /// A bundle tier describing `tx`, with `out_value` and `txid` read FROM the transaction — i.e.
+    /// declared honestly. Every attack here keeps it that way: the lie is in the output vector, never
+    /// in the field beside it, so no declared-vs-signed check can be what refuses these bundles.
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: hex::encode(serialize(tx)),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    /// What a skimming tier deigns to forward down the exit chain.
+    const TOKEN_FORWARD: u64 = 1_000;
+    /// What the EXTRA-OUTPUT variant takes. It comes out of the committed fee rather than out of the
+    /// payload, so the tier stays consensus-valid (outputs still below the input) and would really
+    /// relay — which is what makes that variant worth refusing rather than shrugging at.
+    const FEE_THEFT: u64 = 100;
+
+    /// How a single tier is tampered with. Each is applied to the BUILDER's honest output vector, so
+    /// everything not named here — version, locktime, sequence, the P2A anchor, the payee's
+    /// scriptPubKey — is exactly what an honest tier carries.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Tamper {
+        None,
+        /// **The skim.** Forward a token amount and route the rest to a second output paying the
+        /// attacker, paying a plausible 3-output fee on the way. `Σ payload outputs` comes up SHORT
+        /// of the law's expected total by exactly the extra output's own fee.
+        Short,
+        /// **The extra-output variant.** The payload output is left exactly right; a THIRD output is
+        /// appended, funded out of the committed fee. Reading `out[payload_vout]` and stopping there
+        /// would wave this through — summing is what sees it.
+        Extra,
+        /// **The sum-preserving redistribution.** Forward a token amount and put the remainder in a
+        /// second output, sized so `Σ payload outputs` still equals the law's expected total exactly.
+        /// See `gap_*` below: this one is NOT refused.
+        SumNeutral,
+    }
+
+    fn apply(t: Tamper, tx: &mut Transaction, prev: u64, rate: f64, attacker: &ScriptBuf) {
+        match t {
+            Tamper::None => {}
+            Tamper::Short => {
+                // Everything the transaction can carry after an honest 3-output fee.
+                let diverted = prev
+                    - TOKEN_FORWARD
+                    - mercurylib::tesr::P2A_VALUE
+                    - mercurylib::tesr::committed_fee_for_outputs(2, rate);
+                tx.output[0].value = TOKEN_FORWARD;
+                tx.output.push(TxOut { value: diverted, script_pubkey: attacker.clone() });
+            }
+            Tamper::Extra => {
+                tx.output.push(TxOut { value: FEE_THEFT, script_pubkey: attacker.clone() });
+            }
+            Tamper::SumNeutral => {
+                let honest = tx.output[0].value;
+                tx.output[0].value = TOKEN_FORWARD;
+                tx.output
+                    .push(TxOut { value: honest - TOKEN_FORWARD, script_pubkey: attacker.clone() });
+            }
+        }
+    }
+
+    /// Which tier of the root ladder is attacked, and how. Tier 0 is the trigger, 1 the extension,
+    /// 2 the owner state.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Skim {
+        /// No tampering at all — the non-vacuity control.
+        None,
+        TriggerShort,
+        ExtensionShort,
+        ExtensionExtra,
+        ExtensionSumNeutral,
+        StateShort,
+        StateExtra,
+    }
+
+    impl Skim {
+        fn at(self, i: usize) -> Tamper {
+            match (self, i) {
+                (Skim::TriggerShort, 0) => Tamper::Short,
+                (Skim::ExtensionShort, 1) => Tamper::Short,
+                (Skim::ExtensionExtra, 1) => Tamper::Extra,
+                (Skim::ExtensionSumNeutral, 1) => Tamper::SumNeutral,
+                (Skim::StateShort, 2) => Tamper::Short,
+                (Skim::StateExtra, 2) => Tamper::Extra,
+                _ => Tamper::None,
+            }
+        }
+    }
+
+    struct Rig {
+        agg: Holder,
+        owner: Holder,
+        attacker: Holder,
+        params: mercurylib::tesr::TesrParams,
+        rate: f64,
+    }
+
+    fn rig() -> Rig {
+        let params = mercurylib::tesr::TesrParams::regtest();
+        Rig {
+            agg: holder(0x51),
+            owner: holder(0x52),
+            attacker: holder(0x53),
+            rate: params.committed_fee_rate,
+            params,
+        }
+    }
+
+    impl Rig {
+        /// The whole-coin root ladder `T → X_0 → S_0`, every tier genuinely co-signed by `A`, with
+        /// `skim` deciding where (if anywhere) value is diverted.
+        ///
+        /// Each tier is built FROM the value its parent actually forwards, so a skim high up does not
+        /// leave the tiers below it inconsistent: the ladder stays internally perfect and only its
+        /// relationship to the funding value is a lie. That is the whole point — an inconsistent
+        /// ladder would be refused by the co-sign check and would prove nothing about the value law.
+        fn ladder(&self, skim: Skim) -> TesrBundle {
+            let p = self.params;
+            let a = &self.agg;
+
+            // ---- tier 0: the trigger, spending the on-chain funding output F --------------------
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, self.rate)
+                .expect("trigger");
+            let mut t_tx = parse(&t.tx_hex);
+            apply(skim.at(0), &mut t_tx, F_VALUE, self.rate, &self.attacker.spk);
+            let t_tx = cosign(&t_tx, F_VALUE, &a.spk, &a.kp);
+            let t_forward = t_tx.output[t.payload_vout as usize].value;
+
+            // ---- tier 1: the extension ----------------------------------------------------------
+            let x = mercurylib::tesr::build_extension(
+                &t_tx.txid().to_string(), t_forward, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let mut x_tx = parse(&x.tx_hex);
+            apply(skim.at(1), &mut x_tx, t_forward, self.rate, &self.attacker.spk);
+            let x_tx = cosign(&x_tx, t_forward, &a.spk, &a.kp);
+            let x_forward = x_tx.output[x.payload_vout as usize].value;
+
+            // ---- tier 2: the owner state ---------------------------------------------------------
+            let s = mercurylib::tesr::build_state(
+                &x_tx.txid().to_string(), x_forward, &self.owner.address, NET, p.state_csv(0), self.rate,
+            )
+            .expect("state");
+            let mut s_tx = parse(&s.tx_hex);
+            apply(skim.at(2), &mut s_tx, x_forward, self.rate, &self.attacker.spk);
+            let s_tx = cosign(&s_tx, x_forward, &a.spk, &a.kp);
+
+            TesrBundle {
+                version: 1,
+                statechain_id: SID.into(),
+                network: NET.into(),
+                fee_rate: self.rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.owner.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&s_tx, Some(p.state_csv(0)), s.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                params: p,
+                rgb: None,
+            }
+        }
+
+        /// The authority a receiver derives from the CHAIN and the coordinator — none of which any
+        /// attack here touches, which is exactly why `verify_bundle_bound` cannot be what refuses them.
+        fn authority(&self) -> CoinAuthority {
+            CoinAuthority {
+                statechain_id: SID.into(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                f_spk_hex: hex::encode(self.agg.spk.as_bytes()),
+                se_aggregate_pubkey: Some(self.agg.recorded_xonly.clone()),
+            }
+        }
+    }
+
+    /// The entry point under test: the root ladder, un-split (`final_is_split: false`, the constant
+    /// every whole-coin path passes).
+    fn verify_root(b: &TesrBundle) -> Result<()> {
+        verify_bundle_ex(b, NUM_SIGS, FLAT_BACKUPS, false)
+    }
+
+    /// The co-sign that blesses the skim, isolated. `verify_tier_cosigned` must ACCEPT every tampered
+    /// tier: that is what makes the value law the only thing standing between the receiver and the
+    /// theft, and it is what every attack test leans on for non-vacuity.
+    fn assert_still_genuinely_cosigned(b: &TesrBundle, rig: &Rig) {
+        let tiers = b.exit_tiers();
+        let txs: Vec<Transaction> = tiers.iter().map(|t| parse(&t.signed_tx)).collect();
+        let mut prev = b.f_value;
+        for (i, tx) in txs.iter().enumerate() {
+            verify_tier_cosigned(tx, prev, &rig.agg.spk).unwrap_or_else(|e| {
+                panic!("tier {i} is not a genuine co-sign, so this test would prove nothing: {e}")
+            });
+            prev = tx.output[tiers[i].payload_vout as usize].value;
+        }
+    }
+
+    /// A refusal must name the value law, not some unrelated malformation. These are the causes that
+    /// would make an attack test pass for the WRONG reason.
+    fn assert_not_an_unrelated_refusal(msg: &str) {
+        for unrelated in [
+            "not co-signed",
+            "num_sigs",
+            "CSV",
+            "does not spend",
+            "pays the wrong output",
+            "does not pay the aggregate",
+            "colour",
+            "PLAIN",
+            "decoy",
+            "malformed ladder",
+            "repeats a tier txid",
+            "outside this ladder",
+        ] {
+            assert!(
+                !msg.contains(unrelated),
+                "the bundle was refused for an UNRELATED reason ({unrelated:?}) — this test would \
+                 be worthless: {msg}"
+            );
+        }
+    }
+
+    /// Every refusal in this module has the same shape; this asserts it names the value law, the
+    /// right tier, and the two numbers that make the theft legible.
+    fn assert_conservation_refusal(msg: &str, tier_index: usize, funded_with: u64, carried: u64) {
+        assert!(
+            msg.contains(&format!("tier {tier_index} is funded with {funded_with} sat")),
+            "the refusal must name the offending tier and the value it was funded with, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("payload outputs carry {carried}")),
+            "…and what its payload outputs actually carry, got: {msg}"
+        );
+        assert!(
+            msg.contains("would leave the owner's exit chain"),
+            "…and where the difference goes, got: {msg}"
+        );
+        assert_not_an_unrelated_refusal(msg);
+    }
+
+    // ── THE NON-VACUITY CONTROL ────────────────────────────────────────────────────────────────
+
+    /// **The control every attack below depends on.** The identical construction, untampered, must be
+    /// ACCEPTED — through the unbound entry point, the public wrapper, AND the bound acceptance path.
+    /// Without this a refusal proves nothing: the scaffolding could be malformed in a dozen ways that
+    /// have nothing to do with value conservation.
+    #[test]
+    fn honest_root_ladder_is_accepted() {
+        let rig = rig();
+        let b = rig.ladder(Skim::None);
+
+        // The arithmetic the attacks break, stated once here so a schedule change shows up as a
+        // failure in the CONTROL rather than as a mystery three tests down.
+        assert_eq!(RUNG, mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE);
+        assert_eq!(b.trigger.out_value, F_VALUE - RUNG, "the trigger forwards F minus one rung");
+        assert_eq!(b.levels[0].extension.out_value, F_VALUE - 2 * RUNG);
+        assert_eq!(b.levels[0].state.out_value, F_VALUE - 3 * RUNG, "198 530 reaches the owner");
+
+        verify_root(&b).expect("an honest, fully co-signed root ladder must be ACCEPTED");
+        verify_bundle(&b, NUM_SIGS, FLAT_BACKUPS).expect("…through the public wrapper too");
+        verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority())
+            .expect("…and through the bound acceptance path the claim/SSP lanes actually call");
+    }
+
+    // ── THE ATTACKS ────────────────────────────────────────────────────────────────────────────
+
+    /// **The skim, on the extension.** `X_0` spends the trigger's 199 510-sat payload output and pays
+    /// 1 000 sat forward, with the remainder going to a second output that pays the attacker. `S_0`
+    /// then pays the owner 510 sat, and every declared field in the bundle is honest about it. What
+    /// makes it theft is that the receiver books the ON-CHAIN funding value — 200 000 — for a coin
+    /// whose exit chain can deliver 510.
+    #[test]
+    fn a_skimming_extension_is_refused() {
+        let rig = rig();
+        let b = rig.ladder(Skim::ExtensionShort);
+
+        // The theft is real, and everything else about the bundle is honest.
+        let x: Transaction = parse(&b.levels[0].extension.signed_tx);
+        assert_eq!(x.output.len(), 3, "payload + P2A anchor + the attacker's second output");
+        assert_eq!(x.output[2].script_pubkey, rig.attacker.spk, "the skim pays the ATTACKER");
+        assert_eq!(b.levels[0].extension.out_value, TOKEN_FORWARD, "only 1 000 sat is forwarded");
+        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "…so the owner reaches 510");
+        assert_eq!(
+            x.output[b.levels[0].extension.payload_vout as usize].value,
+            b.levels[0].extension.out_value,
+            "the declared value is HONEST — the lie is in the output vector"
+        );
+        assert_still_genuinely_cosigned(&b, &rig);
+
+        let msg = verify_root(&b).expect_err("a skimming extension must be REFUSED").to_string();
+        // Σ = 1 000 forwarded + 197 934 diverted = 198 934, against an expected 199 020: short by
+        // exactly the extra output's own fee.
+        assert_conservation_refusal(&msg, 1, F_VALUE - RUNG, 198_934);
+
+        // The same refusal on the path a receiver and a pre-paying SSP actually call — the bound
+        // entry point binds `f_value` to the chain and then delegates to the same law.
+        let bound = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority())
+            .expect_err("the bound acceptance path must refuse it too")
+            .to_string();
+        assert_conservation_refusal(&bound, 1, F_VALUE - RUNG, 198_934);
+    }
+
+    /// **The same skim on the final tier.** `X_0` is entirely honest; `S_0` pays the owner 1 000 sat
+    /// and returns the rest to the attacker. The declared `out_value` is again truthful, so nothing
+    /// about the bundle's *fields* is wrong — only the transaction is.
+    #[test]
+    fn a_skimming_owner_state_is_refused() {
+        let rig = rig();
+        let b = rig.ladder(Skim::StateShort);
+
+        let s: Transaction = parse(&b.levels[0].state.signed_tx);
+        assert_eq!(s.output.len(), 3);
+        assert_eq!(s.output[2].script_pubkey, rig.attacker.spk);
+        assert_eq!(
+            b.levels[0].extension.out_value,
+            F_VALUE - 2 * RUNG,
+            "the extension hop is HONEST — the skim is entirely in the state"
+        );
+        assert_eq!(
+            s.output[0].script_pubkey,
+            rig.owner.spk,
+            "and the state still PAYS THE OWNER on its payload output, so the payee check passes"
+        );
+        assert_still_genuinely_cosigned(&b, &rig);
+
+        let msg = verify_root(&b).expect_err("a skimming owner state must be REFUSED").to_string();
+        // Funded with 199 020; Σ = 1 000 + 197 444 = 198 444 against an expected 198 530.
+        assert_conservation_refusal(&msg, 2, F_VALUE - 2 * RUNG, 198_444);
+    }
+
+    /// **The extra-output variant, which is what summing is FOR.** The extension's payload output is
+    /// left exactly right — `out[payload_vout]` is the honest 199 020 — and a THIRD output is
+    /// appended, funded out of the committed fee. A law that read `out[payload_vout]` and stopped
+    /// there would accept this; the tier would still relay (its outputs remain below its input) and
+    /// the attacker would pocket the difference.
+    #[test]
+    fn an_extra_output_on_the_extension_is_refused() {
+        let rig = rig();
+        let b = rig.ladder(Skim::ExtensionExtra);
+
+        let x: Transaction = parse(&b.levels[0].extension.signed_tx);
+        assert_eq!(x.output.len(), 3, "payload + P2A anchor + one appended output");
+        assert_eq!(x.output[2].value, FEE_THEFT);
+        assert_eq!(x.output[2].script_pubkey, rig.attacker.spk);
+        assert_eq!(
+            b.levels[0].extension.out_value,
+            F_VALUE - 2 * RUNG,
+            "the PAYLOAD output is exactly what the conservation law expects — reading that one \
+             output cannot see this attack"
+        );
+        let outs: u64 = x.output.iter().map(|o| o.value).sum();
+        assert!(
+            outs < b.trigger.out_value,
+            "and the tier is still consensus-valid ({outs} out of {}), so it really would relay",
+            b.trigger.out_value
+        );
+        assert_still_genuinely_cosigned(&b, &rig);
+
+        let msg = verify_root(&b)
+            .expect_err("a tier carrying a third output must be REFUSED")
+            .to_string();
+        assert_conservation_refusal(&msg, 1, F_VALUE - RUNG, F_VALUE - 2 * RUNG + FEE_THEFT);
+    }
+
+    /// The same extra output on the FINAL tier, where the payee check is against the owner rather than
+    /// the aggregate — a different branch of the structural loop, and the last hop before the money is
+    /// the owner's.
+    #[test]
+    fn an_extra_output_on_the_owner_state_is_refused() {
+        let rig = rig();
+        let b = rig.ladder(Skim::StateExtra);
+
+        let s: Transaction = parse(&b.levels[0].state.signed_tx);
+        assert_eq!(s.output.len(), 3);
+        assert_eq!(s.output[0].script_pubkey, rig.owner.spk, "the owner is still paid in full…");
+        assert_eq!(b.levels[0].state.out_value, F_VALUE - 3 * RUNG);
+        assert_eq!(s.output[2].script_pubkey, rig.attacker.spk, "…and the fee is stolen anyway");
+        assert_still_genuinely_cosigned(&b, &rig);
+
+        let msg = verify_root(&b).expect_err("a third output on S_0 must be REFUSED").to_string();
+        assert_conservation_refusal(&msg, 2, F_VALUE - 2 * RUNG, F_VALUE - 3 * RUNG + FEE_THEFT);
+    }
+
+    // ── TWO HOLES THIS LANE STILL HAS ──────────────────────────────────────────────────────────
+    //
+    // The two tests below assert what `verify_bundle_ex` does TODAY, and what it does today is accept
+    // a theft. They are tripwires, not endorsements: each one fails the moment the hole is closed, and
+    // says so. Do not "fix" them by deleting them — fix the verifier and flip the assertion.
+
+    /// **GAP 1 — a sum-preserving redistribution is ACCEPTED.**
+    ///
+    /// `deed25c`'s law is `Σ(payload outputs) == tier_out_total(prev, n_payload, rate)`, and for every
+    /// tier that is not the split state of a split parent it hard-codes `n_payload = 1` while summing
+    /// over ALL non-anchor, non-opret outputs. So a tier with TWO payload outputs whose values add up
+    /// to the expected total satisfies it exactly. The attacker forwards 1 000 sat down the exit chain
+    /// and takes 198 020 in a second output; the ladder below re-bases on the 1 000 and stays
+    /// internally perfect; the receiver books the on-chain 200 000.
+    ///
+    /// The child lane does NOT have this hole: `verify_child_bundle` checks the payload output
+    /// itself, not just the sum (`skim_leaf_attack_tests::a_sum_neutral_skim_across_two_payload_outputs_is_refused`).
+    /// The root lane needs the same — for a non-split tier, `n_payload` must be REQUIRED to be 1, or
+    /// `out[payload_vout]` must be checked alongside the sum.
+    #[test]
+    fn a_sum_preserving_redistribution_on_the_root_lane_is_refused() {
+        let rig = rig();
+        let b = rig.ladder(Skim::ExtensionSumNeutral);
+
+        // The theft, stated as arithmetic.
+        let x: Transaction = parse(&b.levels[0].extension.signed_tx);
+        let payload_sum: u64 = x
+            .output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum();
+        assert_eq!(
+            payload_sum,
+            mercurylib::tesr::tier_out_value(b.trigger.out_value, rig.rate).unwrap(),
+            "Σ over the payload outputs is EXACTLY what the law expects"
+        );
+        assert_eq!(x.output[2].script_pubkey, rig.attacker.spk);
+        assert_eq!(x.output[2].value, F_VALUE - 2 * RUNG - TOKEN_FORWARD, "198 020 to the attacker");
+        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "510 reaches the owner");
+        assert_still_genuinely_cosigned(&b, &rig);
+
+        let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
+        // GAP 1 IS NOW CLOSED. This test was written as a tripwire asserting the hole was still
+        // open; the root lane refuses a sum-preserving redistribution as of the payload-count check,
+        // so it is flipped to assert the refusal, exactly as its author instructed.
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(
+            msg.contains("payload output"),
+            "the refusal must name the payload outputs, got: {msg}"
+        );
+    }
+
+    /// **GAP 2 — a skimming TRIGGER is ACCEPTED.**
+    ///
+    /// `deed25c`'s loop runs `for i in 1..txs.len()`, so tier 0 — the trigger — is bound to nothing.
+    /// Its payload output is used as the funding value for the extension's law and is never itself
+    /// compared to `f_value`, which `verify_bundle_bound` has already pinned to the on-chain output.
+    /// So `T` can spend a 200 000-sat `F`, pay the aggregate 1 000, and route 197 924 to the attacker;
+    /// every tier below it conserves perfectly from the lie.
+    ///
+    /// This is the construction §2 of the sweep document gives for V1, and §8 flags the anchor as
+    /// existing "only on the CHILD lane" — `verify_conveyed_child` gained it in `37d8bba`
+    /// (`tesr.rs`: `tier_out_value(f_out.value, …)`), the whole-coin path never did. The fix is the
+    /// same three lines, against `bundle.f_value`, which is already chain-bound at that point.
+    ///
+    /// It is the most severe of the two: the trigger is un-timelocked and spends `F`, so broadcasting
+    /// it kills every flat backup at the same instant ([B1]) — the theft and the destruction of the
+    /// fallback are one transaction.
+    #[test]
+    fn gap_a_skimming_trigger_on_the_root_lane_is_still_accepted() {
+        let rig = rig();
+        let b = rig.ladder(Skim::TriggerShort);
+
+        let t: Transaction = parse(&b.trigger.signed_tx);
+        assert_eq!(t.output.len(), 3);
+        assert_eq!(t.output[2].script_pubkey, rig.attacker.spk);
+        assert_eq!(b.trigger.out_value, TOKEN_FORWARD, "the trigger forwards 1 000 of a 200 000 coin");
+        assert_eq!(
+            b.levels[0].state.out_value,
+            TOKEN_FORWARD - 2 * RUNG,
+            "the owner's exit chain can deliver 20 sat"
+        );
+        assert_still_genuinely_cosigned(&b, &rig);
+
+        // And the bound path — which knows the real funding value — accepts it anyway.
+        let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
+        assert!(
+            r.is_ok(),
+            "GAP 2 HAS BEEN CLOSED — this tripwire has done its job. The root lane now anchors the \
+             trigger to F ({:?}); flip this test to `expect_err`, assert the refusal names the \
+             funding value, and strike GAP 2 from the module doc comment.",
+            r.as_ref().err()
+        );
+    }
+}
+
+/// # THE FORGED-YARDSTICK ATTACK, BUILT AND RUN
+///
+/// The third sibling of `skim_leaf_attack_tests` and `skim_root_attack_tests`, and the one that
+/// bypasses both. Those two attack the OUTPUTS of a tier and are refused by the conservation laws
+/// landed in `4e165e6`, `deed25c` and `d692c07`. This one leaves every output exactly where the law
+/// says it should be and moves the LAW instead.
+///
+/// **The lever.** Every conservation check in this file computes
+/// `expect = prev − committed_fee(rate) − P2A_VALUE`, and `rate` is `bundle.fee_rate` /
+/// `cb.parent.fee_rate` — a plain serde `f64` carried on the conveyed bundle
+/// (`TesrBundle::fee_rate`, `tesr.rs:84`). `expect` DECREASES as `rate` rises, without bound. So an
+/// attacker does not have to break the equality: they solve it. Pick the value a tier should
+/// forward, and there is a rate that makes that value the equality's exact right-hand side.
+/// `the_forged_yardstick_solves_the_conservation_equality_for_any_forward` does that solve
+/// constructively — 1 000 000 sat in, 1 010 sat out, `tier_out_value` agreeing to the satoshi.
+///
+/// **Where it is refused, and where it is not.** `2ad2b2d` pinned the rate to
+/// `TesrParams::for_network(&cc.network).committed_fee_rate` — but it pinned it in
+/// `verify_conveyed_child`, which is `async`, fetches `F` over Electrum and `/info/config` over HTTP
+/// before it ever reaches the comparison, and therefore cannot be reached from a unit test. The two
+/// SYNCHRONOUS verifiers underneath it — `verify_bundle_ex`/`verify_bundle`/`verify_bundle_bound` on
+/// the root lane and `verify_child_bundle` on the child lane — never mention `fee_rate` except to
+/// measure against it. This module runs the attack through all four of them and records what they do
+/// today. Two of them accept a 99.9 % theft.
+///
+/// **This module is a mix of proofs and tripwires; read the names.**
+///   * `honest_*` — the non-vacuity controls. Same rig, honest rate, must be ACCEPTED.
+///   * `a_forged_yardstick_ladder_is_refused_when_the_rate_is_declared_honestly` and its child-lane
+///     twin — the same signed transactions, byte for byte, with the single `fee_rate` field put back
+///     to 2.0, must be REFUSED by the value law. This is what proves the yardstick is load-bearing
+///     rather than decorative: one `f64` flips a refusal into an acceptance.
+///   * `gap_*` — what the verifier does TODAY, and what it does today is accept a theft. Each fails
+///     the moment the hole is closed and says so. Do not delete them; fix the verifier and flip them.
+///
+/// **What the attacker holds.** As in the two sibling modules, these tests build fully co-signed
+/// ladders while holding both halves of the aggregate key. That is not a cheat: `cosign_tier_request`
+/// (lib/src/tesr.rs:503) is handed a sighash and a prevout AMOUNT, never a transaction and never a
+/// fee rate, so the SE cannot see — let alone object to — the schedule a tier was sized at. Every
+/// `gap_` test additionally asserts `verify_tier_cosigned` still accepts every tier, so nothing here
+/// turns on a forged signature.
+#[cfg(test)]
+mod forged_yardstick_attack_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        consensus::{deserialize, serialize},
+        key::TapTweak,
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, ScriptBuf, Transaction, TxOut, Witness,
+    };
+
+    const NET: &str = "regtest";
+    const SID: &str = "yardstick-sid";
+    const CHILD_SID: &str = "yardstick-child-sid";
+    /// The coin's on-chain funding outpoint. Nothing fetches it — every entry point exercised here is
+    /// pure and takes the chain facts as parameters.
+    const F_TXID: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+    const F_VOUT: u32 = 0;
+    /// A whole bitcoin, so a forged schedule has room to consume nearly all of it and still leave
+    /// three (root) or five (child) tiers that the builders will actually construct.
+    const F_VALUE: u64 = 1_000_000;
+
+    /// The census terms. Exact equality, so getting either wrong fails every test on `num_sigs`
+    /// instead of on the property under test.
+    const FLAT_BACKUPS: u32 = 1;
+    const NUM_SIGS: u32 = FLAT_BACKUPS + 3;
+
+    /// The rate every shipped preset builds at, on every network — `TesrParams::mainnet()` and
+    /// `::regtest()` both carry `committed_fee_rate: 2.0`. This is the yardstick the attack replaces.
+    const HONEST_RATE: f64 = 2.0;
+    /// One plain rung at the honest rate: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
+    const HONEST_RUNG: u64 = 490;
+
+    /// **The forged yardstick, root lane.** Chosen so three rungs consume 99.897 % of the coin and
+    /// the builders still succeed: `committed_fee(2662) = 332 750`, rung = `332 990`, and
+    /// `3 × 332 990 = 998 970` of a 1 000 000-sat coin. An integer rate keeps `125.0 * rate` exactly
+    /// representable, so the `ceil` in `committed_fee` is not doing anything subtle.
+    const FORGED_RATE: f64 = 2662.0;
+    const FORGED_RUNG: u64 = 332_990;
+
+    /// **The forged yardstick, child lane.** The sweep document's own number
+    /// (`VALUE-CONSERVATION-SWEEP.md` V5: *"Declare `fee_rate: 700.0` … each rung consumes
+    /// `committed_fee(700) + 240` = 87 740"*). The child chain is five tiers deep — `T`, `X_0`, `SP`,
+    /// then the child's own extension and state — so the rung has to be small enough that five of
+    /// them fit.
+    const FORGED_CHILD_RATE: f64 = 700.0;
+    const FORGED_CHILD_RUNG: u64 = 87_740;
+
+    // ── SCAFFOLDING (the `skim_*_attack_tests` pattern, unchanged) ──────────────────────────────
+
+    /// A party holding BOTH halves of an aggregate key — what a blind co-sign is equivalent to.
+    struct Holder {
+        kp: KeyPair,
+        /// The P2TR address for the UNTWEAKED internal key (BIP-341, no script tree).
+        address: String,
+        spk: ScriptBuf,
+        /// The x-only the coordinator would have on record: UNTWEAKED, as `/info/statechain` serves it.
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    /// Produce exactly the witness `verify_tier_cosigned` checks: a BIP-341 key-spend Schnorr
+    /// signature by the aggregate over `TxOut { value: prevout_value, script_pubkey: agg_spk }` with
+    /// `TapSighashType::All`. Note what it commits to — the transaction and the prevout AMOUNT. The
+    /// fee RATE is not an input to a signature anywhere in this protocol, which is precisely why it
+    /// has to be bound by the receiver instead.
+    fn cosign(tx: &Transaction, prevout_value: u64, agg_spk: &ScriptBuf, kp: &KeyPair) -> Transaction {
+        let secp = Secp256k1::new();
+        let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };
+        let sighash = SighashCache::new(tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+            .expect("taproot key-spend sighash");
+        let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+        let mut signed = tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+        signed
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    /// A bundle tier describing `tx`, with `txid` and `out_value` read FROM the transaction. Every
+    /// declared field in this module is honest — the whole point of the attack is that it needs no
+    /// lie about any transaction. The only false statement anywhere is the fee rate.
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: hex::encode(serialize(tx)),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    struct Rig {
+        agg: Holder,
+        child: Holder,
+        owner: Holder,
+        receiver: Holder,
+        params: mercurylib::tesr::TesrParams,
+    }
+
+    fn rig() -> Rig {
+        Rig {
+            agg: holder(0x61),
+            child: holder(0x62),
+            owner: holder(0x63),
+            receiver: holder(0x64),
+            // The SCHEDULE is honest — the same regtest preset a receiver derives for itself. Only
+            // `fee_rate` is forged, so no CSV bound, no `bind_declared_csv`, and no census term can
+            // be what refuses (or accepts) anything below.
+            params: mercurylib::tesr::TesrParams::regtest(),
+        }
+    }
+
+    impl Rig {
+        /// The whole-coin root ladder `T → X_0 → S_0`, built entirely at `build_rate` and genuinely
+        /// co-signed by `A`, then DECLARED at `declared_rate`.
+        ///
+        /// Passing the same value twice is the honest case (and the attack: the attacker's ladder is
+        /// perfectly self-consistent, which is the whole trick). Passing different values is the
+        /// control — identical bytes, one field changed — and it is what proves the declared rate is
+        /// the thing the laws measure against.
+        ///
+        /// No output is ever touched. Each tier is `[payload, P2A]`, exactly as `build_tier_tx`
+        /// emits it.
+        fn ladder(&self, build_rate: f64, declared_rate: f64) -> TesrBundle {
+            let p = self.params;
+            let a = &self.agg;
+
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, build_rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), F_VALUE, &a.spk, &a.kp);
+
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), build_rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+
+            let s = mercurylib::tesr::build_state(
+                &x.txid, x.out_value, &self.owner.address, NET, p.state_csv(0), build_rate,
+            )
+            .expect("state");
+            let s_tx = cosign(&parse(&s.tx_hex), x.out_value, &a.spk, &a.kp);
+
+            TesrBundle {
+                version: 1,
+                statechain_id: SID.into(),
+                network: NET.into(),
+                fee_rate: declared_rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.owner.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&s_tx, Some(p.state_csv(0)), s.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                // HONEST — the receiver's own preset. A forged schedule is a different attack
+                // (VALUE-CONSERVATION-SWEEP.md §4, "the `params` schedule as an attack surface");
+                // keeping it honest here is what makes the fee rate the only variable.
+                params: p,
+                rgb: None,
+            }
+        }
+
+        /// The parent segment of a split: `T → X_0 → SP`, with `SP` a spine split state funding one
+        /// child slot. Returns the bundle and the slot's value.
+        fn parent_segment(&self, build_rate: f64, declared_rate: f64) -> (TesrBundle, u64) {
+            let p = self.params;
+            let a = &self.agg;
+
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, build_rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), F_VALUE, &a.spk, &a.kp);
+
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), build_rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+
+            let slot = mercurylib::tesr::tier_out_total(x.out_value, 1, build_rate).expect("slot");
+            let sp = mercurylib::tesr::build_split_state(
+                &x.txid,
+                x.out_value,
+                &[(self.child.address.clone(), slot)],
+                NET,
+                SPINE_CSV,
+                build_rate,
+            )
+            .expect("split state");
+            let sp_tx = cosign(&parse(&sp.tx_hex), x.out_value, &a.spk, &a.kp);
+
+            let bundle = TesrBundle {
+                version: 1,
+                statechain_id: SID.into(),
+                network: NET.into(),
+                fee_rate: declared_rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.owner.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&sp_tx, Some(SPINE_CSV), sp.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                params: p,
+                rgb: None,
+            };
+            (bundle, slot)
+        }
+
+        /// The full conveyed child: an honest-shaped parent segment plus the child's own two tiers,
+        /// all built at `build_rate` and all declared at `declared_rate`.
+        fn child_bundle(&self, build_rate: f64, declared_rate: f64) -> ChildTesrBundle {
+            let p = self.params;
+            let (parent, slot) = self.parent_segment(build_rate, declared_rate);
+            let sp_txid = parent.current().state.txid.clone();
+            let c = &self.child;
+
+            let xc = mercurylib::tesr::build_extension(
+                &sp_txid, slot, &c.address, NET, p.ext_csv(0), build_rate,
+            )
+            .expect("child extension");
+            let xc_tx = cosign(&parse(&xc.tx_hex), slot, &c.spk, &c.kp);
+
+            let sc = mercurylib::tesr::build_state(
+                &xc.txid, xc.out_value, &self.receiver.address, NET, p.state_csv(0), build_rate,
+            )
+            .expect("child state");
+            let sc_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &c.spk, &c.kp);
+
+            ChildTesrBundle {
+                parent,
+                parent_statechain_id: SID.into(),
+                sp_vout: 0,
+                child_statechain_id: CHILD_SID.into(),
+                child_owner_exit_address: self.receiver.address.clone(),
+                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
+                child_superseded_states: vec![],
+                child_superseded_extensions: vec![],
+                ancestors: vec![],
+                rgb: None,
+                // `verify_child_bundle` takes the parent's flat-backup COUNT as a parameter; the
+                // transactions themselves are only validated by `verify_conveyed_child`, one level up.
+                parent_flat_backups: vec![],
+            }
+        }
+
+        /// The authority a receiver derives from the CHAIN and the coordinator. The forged rate does
+        /// not touch any of it, which is exactly why `verify_bundle_bound` cannot be what refuses the
+        /// attack.
+        fn authority(&self) -> CoinAuthority {
+            CoinAuthority {
+                statechain_id: SID.into(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                f_spk_hex: hex::encode(self.agg.spk.as_bytes()),
+                se_aggregate_pubkey: Some(self.agg.recorded_xonly.clone()),
+            }
+        }
+    }
+
+    fn verify_root(b: &TesrBundle) -> Result<()> {
+        verify_bundle_ex(b, NUM_SIGS, FLAT_BACKUPS, false)
+    }
+
+    fn verify_child(rig: &Rig, cb: &ChildTesrBundle) -> Result<()> {
+        verify_child_bundle(
+            cb,
+            &hex::encode(rig.agg.spk.as_bytes()),
+            // The parent's census: one deposit backup + T + X + SP.
+            1 + 3,
+            1,
+            Some(&rig.agg.recorded_xonly),
+            true, // the parent segment is terminal, as the protocol requires
+            // A derived child slot has no flat backup (CHILD_V2_BASELINE = 0) — just its two tiers.
+            2,
+            0,
+            Some(&rig.child.recorded_xonly),
+            &[],
+            &rig.receiver.address,
+        )
+    }
+
+    /// Every tier of a root ladder really is co-signed by `A`, so no `gap_` result below can be
+    /// blamed on a forged signature.
+    fn assert_root_genuinely_cosigned(b: &TesrBundle, rig: &Rig) {
+        let tiers = b.exit_tiers();
+        let txs: Vec<Transaction> = tiers.iter().map(|t| parse(&t.signed_tx)).collect();
+        let mut prev = b.f_value;
+        for (i, tx) in txs.iter().enumerate() {
+            verify_tier_cosigned(tx, prev, &rig.agg.spk).unwrap_or_else(|e| {
+                panic!("tier {i} is not a genuine co-sign, so this test would prove nothing: {e}")
+            });
+            prev = tx.output[tiers[i].payload_vout as usize].value;
+        }
+    }
+
+    fn assert_child_genuinely_cosigned(cb: &ChildTesrBundle, rig: &Rig) {
+        let sp = parse(&cb.parent.current().state.signed_tx);
+        let funding = sp.output[cb.sp_vout as usize].value;
+        let ext = parse(&cb.child_extension.signed_tx);
+        verify_tier_cosigned(&ext, funding, &rig.child.spk)
+            .expect("the child extension really is co-signed by A_child");
+        let st = parse(&cb.child_state.signed_tx);
+        verify_tier_cosigned(
+            &st,
+            ext.output[cb.child_extension.payload_vout as usize].value,
+            &rig.child.spk,
+        )
+        .expect("and so is the child state below it");
+    }
+
+    /// A refusal must name the value law. These are the causes that would make a control test pass
+    /// for the WRONG reason.
+    fn assert_not_an_unrelated_refusal(msg: &str) {
+        for unrelated in [
+            "not co-signed",
+            "num_sigs",
+            "CSV",
+            "does not spend",
+            "pays the wrong output",
+            "does not pay the aggregate",
+            "colour",
+            "decoy",
+            "malformed ladder",
+            "terminal",
+            "Model A",
+        ] {
+            assert!(
+                !msg.contains(unrelated),
+                "refused for an UNRELATED reason ({unrelated:?}) — this test would be worthless: {msg}"
+            );
+        }
+    }
+
+    /// Every tier in this module is `[payload, P2A]`, so the value the forged schedule frees up is
+    /// not paid to anybody — it is left to the miner as fee. That is what makes the tier RELAY, and
+    /// it is the sense in which this attack destroys the receiver's money rather than transferring
+    /// it. (Pocketing it as well needs a second payload output, which is
+    /// `skim_root_attack_tests::gap_a_sum_preserving_redistribution_on_the_root_lane_is_still_accepted`
+    /// — an orthogonal hole. Either way the receiver's loss is identical, and the receiver's loss is
+    /// what the value laws exist to prevent.)
+    fn miner_fee(tx: &Transaction, prev: u64) -> u64 {
+        prev - tx.output.iter().map(|o| o.value).sum::<u64>()
+    }
+
+    // ── 1. THE ARITHMETIC: THE EQUALITY IS SOLVABLE FOR ANY FORWARD VALUE ───────────────────────
+
+    /// **The claim that makes the binding load-bearing, as pure arithmetic against the real
+    /// functions.**
+    ///
+    /// The conservation law is an EQUALITY, `Σ payload outputs == prev − committed_fee(rate) − P2A`.
+    /// An attacker who cannot break an equality can still choose which equality they are asked to
+    /// satisfy, because `rate` is theirs. `committed_fee` is linear in `rate`
+    /// (`ceil(TIER_VBYTES · rate)`), so for any target forward `f < prev − P2A` the rate
+    /// `(prev − f − P2A) / TIER_VBYTES` makes `f` the exact right-hand side. There is no rounding
+    /// slack to hide behind and no bound to run into: this is a solve, not an approximation.
+    ///
+    /// Run forwards: 1 000 000 sat in, 1 010 sat out, at 7 990 sat/vB — and `tier_out_value` agrees
+    /// to the satoshi, which is the number `verify_bundle_ex` and `verify_child_bundle` compare
+    /// against.
+    #[test]
+    fn the_forged_yardstick_solves_the_conservation_equality_for_any_forward() {
+        let prev = F_VALUE;
+
+        // The honest law, for scale: one rung, 490 sat, 0.049 % of the coin.
+        assert_eq!(mercurylib::tesr::committed_fee(HONEST_RATE), 250);
+        assert_eq!(
+            mercurylib::tesr::tier_out_value(prev, HONEST_RATE),
+            Some(prev - HONEST_RUNG)
+        );
+
+        // THE SOLVE. Pick what the tier should forward; derive the rate that makes the equality true.
+        // 1 010 is chosen so `prev − f − P2A` is a whole multiple of `TIER_VBYTES` and the rate comes
+        // out an exact integer — the arithmetic below is then doing nothing that floating point could
+        // be blamed for.
+        let target = 1_010u64;
+        let rate = (prev - target - mercurylib::tesr::P2A_VALUE) as f64
+            / mercurylib::tesr::TIER_VBYTES as f64;
+        assert_eq!(rate, 7_990.0, "the rate that makes 1 010 sat the law's expected forward");
+        assert_eq!(
+            mercurylib::tesr::tier_out_value(prev, rate),
+            Some(target),
+            "the verifier's own function agrees: at 7 990 sat/vB a tier forwarding 1 010 sat out of \
+             1 000 000 satisfies the conservation equality EXACTLY"
+        );
+        // …and the multi-payload form the split state is measured by solves identically.
+        assert_eq!(mercurylib::tesr::tier_out_total(prev, 1, rate), Some(target));
+
+        // The same solve for a hundred different targets, so this is a property and not one lucky
+        // pair. Every one of them is a value a tier may forward while the law reports success.
+        for k in 1..=100u64 {
+            let target = k * 125; // keeps `prev − target − P2A` ≡ 0 (mod TIER_VBYTES)
+            let rate = (prev - target - mercurylib::tesr::P2A_VALUE) as f64
+                / mercurylib::tesr::TIER_VBYTES as f64;
+            assert_eq!(
+                mercurylib::tesr::tier_out_value(prev, rate),
+                Some(target),
+                "the equality is satisfiable at a forward of {target} sat (rate {rate})"
+            );
+        }
+
+        // MONOTONICITY, which is why the direction matters: a *higher* declared rate always demands
+        // *less*. The comment at `verify_bundle_ex`'s value block argues the sender-declared rate is
+        // "acceptable in this direction … because a higher declared rate makes the expected forward
+        // value SMALLER, and a tier forwarding less than its own declared schedule demands is exactly
+        // what the equality refuses". Both halves are true and the conclusion does not follow: the
+        // attacker does not forward less than their schedule demands, they declare a schedule that
+        // demands almost nothing and then meet it exactly.
+        let mut last = u64::MAX;
+        for rate in [2.0, 10.0, 100.0, 700.0, 2662.0, 7990.0] {
+            let v = mercurylib::tesr::tier_out_value(prev, rate).expect("still fits");
+            assert!(v < last, "expected forward must fall as the declared rate rises");
+            last = v;
+        }
+    }
+
+    /// The two per-rung prices this module trades on, pinned so a schedule change surfaces here
+    /// rather than as a mystery three tests down. A rung is 490 sat plain at the committed
+    /// 2 sat/vB; the coloured tier carries one whole extra P2TR-sized output (the opret) and costs
+    /// 576.
+    #[test]
+    fn the_rung_prices_this_attack_inflates() {
+        assert_eq!(
+            mercurylib::tesr::committed_fee(HONEST_RATE) + mercurylib::tesr::P2A_VALUE,
+            HONEST_RUNG,
+            "a plain rung at 2 sat/vB is 125 vB * 2 + 240"
+        );
+        assert_eq!(
+            crate::rgb::colored_committed_fee(1, HONEST_RATE) + mercurylib::tesr::P2A_VALUE,
+            576,
+            "a coloured rung at 2 sat/vB is 168 vB * 2 + 240 — one extra P2TR-sized output"
+        );
+        // And the forged ones, which is what the ladders below are built at.
+        assert_eq!(
+            mercurylib::tesr::committed_fee(FORGED_RATE) + mercurylib::tesr::P2A_VALUE,
+            FORGED_RUNG,
+            "the root-lane forged rung: 679x the honest one"
+        );
+        assert_eq!(
+            mercurylib::tesr::committed_fee(FORGED_CHILD_RATE) + mercurylib::tesr::P2A_VALUE,
+            FORGED_CHILD_RUNG,
+            "the child-lane forged rung — the sweep document's own 87 740"
+        );
+    }
+
+    /// **The receiver's preset is the only honest yardstick, and it is a CONSTANT.** `2ad2b2d`'s
+    /// binding is exact equality against `TesrParams::for_network(network).committed_fee_rate`, which
+    /// works only because every establish path builds at that same constant
+    /// (`establish_auto` → `p.committed_fee_rate`, `build_colored_ladder_auto` likewise). If any
+    /// shipped preset ever moved off 2.0, or the two presets diverged from each other in a way the
+    /// network string could not resolve, that binding would start refusing honest traffic — so the
+    /// property is pinned here rather than assumed.
+    #[test]
+    fn the_receivers_yardstick_is_a_per_network_constant() {
+        for net in ["bitcoin", "mainnet", "regtest", "signet", "testnet"] {
+            assert_eq!(
+                mercurylib::tesr::TesrParams::for_network(net).committed_fee_rate,
+                HONEST_RATE,
+                "{net}: every shipped preset builds ladders at the same committed rate"
+            );
+        }
+        // The comparison `verify_conveyed_child` makes, on the values this module forges.
+        let want = mercurylib::tesr::TesrParams::for_network(NET).committed_fee_rate;
+        assert_ne!(FORGED_RATE, want);
+        assert_ne!(FORGED_CHILD_RATE, want);
+        // …and the trap that check has to avoid: `max_fee_rate` is 1.0 on the regtest profile, BELOW
+        // the 2.0 every honest ladder carries, so using it as the ceiling would refuse all legitimate
+        // traffic. The two numbers are not interchangeable and the first draft of the check used the
+        // wrong one.
+        assert!(want > 1.0, "the committed rate is above the flat-backup fee ceiling, not below it");
+    }
+
+    // ── 2. NON-VACUITY: THE HONEST RIG IS ACCEPTED ─────────────────────────────────────────────
+
+    /// **The control every `gap_` test below depends on.** The identical construction at the honest
+    /// rate must be ACCEPTED — through the private entry point, the public wrapper, and the bound
+    /// acceptance path the whole-coin claim lane actually calls
+    /// (`transfer_receiver.rs` → `verify_bundle_bound`).
+    #[test]
+    fn honest_root_ladder_is_accepted() {
+        let rig = rig();
+        let b = rig.ladder(HONEST_RATE, HONEST_RATE);
+
+        assert_eq!(b.trigger.out_value, F_VALUE - HONEST_RUNG);
+        assert_eq!(b.levels[0].extension.out_value, F_VALUE - 2 * HONEST_RUNG);
+        assert_eq!(
+            b.levels[0].state.out_value,
+            F_VALUE - 3 * HONEST_RUNG,
+            "998 530 of a 1 000 000-sat coin reaches the owner — 99.85 %"
+        );
+        assert_root_genuinely_cosigned(&b, &rig);
+
+        verify_root(&b).expect("an honest, fully co-signed root ladder must be ACCEPTED");
+        verify_bundle(&b, NUM_SIGS, FLAT_BACKUPS).expect("…through the public wrapper too");
+        verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority())
+            .expect("…and through the bound acceptance path the claim/SSP lanes call");
+    }
+
+    /// The child-lane control: an honest conveyed child is accepted, and the gap between what the
+    /// claim path BOOKS (`SP.out[j]`, the slot) and what the child's exit chain can DELIVER is
+    /// exactly two rungs — 980 sat. `VALUE-CONSERVATION-SWEEP.md` §8 downgrades that gap from theft
+    /// to "a bounded convention"; this test is where the word *bounded* is checked, and
+    /// `gap_a_forged_yardstick_child_is_still_accepted_by_the_sync_verifier` is where it stops being
+    /// true.
+    #[test]
+    fn honest_child_bundle_is_accepted_and_its_booking_gap_is_two_rungs() {
+        let rig = rig();
+        let cb = rig.child_bundle(HONEST_RATE, HONEST_RATE);
+
+        let sp = parse(&cb.parent.current().state.signed_tx);
+        let slot = sp.output[0].value;
+        assert_eq!(slot, F_VALUE - 3 * HONEST_RUNG, "the child's slot on SP");
+        assert_eq!(cb.child_state.out_value, slot - 2 * HONEST_RUNG);
+        assert_eq!(
+            slot - cb.child_state.out_value,
+            2 * HONEST_RUNG,
+            "booked minus reachable is exactly two rungs — 980 sat, the §8 convention"
+        );
+        assert_child_genuinely_cosigned(&cb, &rig);
+
+        verify_child(&rig, &cb).expect("an honest, fully co-signed child bundle must be ACCEPTED");
+    }
+
+    // ── 3. THE CONTROL THAT PROVES THE YARDSTICK IS LOAD-BEARING ───────────────────────────────
+
+    /// **One `f64`, and the same bytes go from refused to accepted.**
+    ///
+    /// Identical signed transactions to `gap_a_forged_yardstick_root_ladder_is_still_accepted` —
+    /// same txids, same witnesses, same outputs — with `fee_rate` put back to the honest 2.0. The
+    /// value law now refuses every tier, naming the value it was funded with and what its payload
+    /// outputs carry. Which is to say: the tiers ARE skimming; the verifier can see it perfectly
+    /// well; it is measuring with the attacker's ruler.
+    #[test]
+    fn a_forged_yardstick_ladder_is_refused_when_the_rate_is_declared_honestly() {
+        let rig = rig();
+        let attack = rig.ladder(FORGED_RATE, FORGED_RATE);
+        let same_bytes_honest_rate = rig.ladder(FORGED_RATE, HONEST_RATE);
+
+        // The two bundles differ in exactly one field.
+        assert_eq!(attack.trigger.signed_tx, same_bytes_honest_rate.trigger.signed_tx);
+        assert_eq!(
+            attack.levels[0].extension.signed_tx,
+            same_bytes_honest_rate.levels[0].extension.signed_tx
+        );
+        assert_eq!(attack.levels[0].state.signed_tx, same_bytes_honest_rate.levels[0].state.signed_tx);
+        assert_ne!(attack.fee_rate, same_bytes_honest_rate.fee_rate);
+
+        let msg = verify_root(&same_bytes_honest_rate)
+            .expect_err("measured against the RECEIVER's rate, this ladder is a skim and is refused")
+            .to_string();
+        assert!(
+            msg.contains(&format!("tier 1 is funded with {} sat", F_VALUE - FORGED_RUNG)),
+            "the refusal must name the offending tier and its funding, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("payload outputs carry {}", F_VALUE - 2 * FORGED_RUNG)),
+            "…and what it actually forwards, got: {msg}"
+        );
+        assert!(
+            msg.contains("would leave the owner's exit chain"),
+            "…and where the difference goes, got: {msg}"
+        );
+        assert_not_an_unrelated_refusal(&msg);
+
+        // The converse control, so this cannot be dismissed as "the value law just dislikes low
+        // forwards": an HONESTLY BUILT ladder declared at the FORGED rate is refused too, because the
+        // law is an equality and honest outputs are now too LARGE for the inflated schedule.
+        //
+        // The accepted causes are deliberately two, and which one fires tells you whether GAP A is
+        // still open. TODAY it is the value law, because nothing looks at the declared rate. Once
+        // GAP A is closed the rate binding fires first and this assertion keeps holding — that is
+        // intentional, so closing the hole does not break the control that motivated it.
+        let honest_bytes_forged_rate = rig.ladder(HONEST_RATE, FORGED_RATE);
+        let msg = verify_root(&honest_bytes_forged_rate)
+            .expect_err("the equality is two-sided")
+            .to_string();
+        assert!(
+            msg.contains(&format!("payload outputs carry {}", F_VALUE - 2 * HONEST_RUNG))
+                || msg.contains(&format!("{FORGED_RATE}")),
+            "must be refused either by the value law or by a rate binding, got: {msg}"
+        );
+        assert_not_an_unrelated_refusal(&msg);
+    }
+
+    /// The child-lane twin of the control above: identical child bytes, `fee_rate` honest, refused by
+    /// the conveyed child's own conservation hop.
+    #[test]
+    fn a_forged_yardstick_child_is_refused_when_the_rate_is_declared_honestly() {
+        let rig = rig();
+        let cb = rig.child_bundle(FORGED_CHILD_RATE, HONEST_RATE);
+        assert_child_genuinely_cosigned(&cb, &rig);
+
+        let msg = verify_child(&rig, &cb)
+            .expect_err("measured against the RECEIVER's rate this child is a skim")
+            .to_string();
+        assert!(
+            msg.contains("payload outputs carry") || msg.contains("forwards only"),
+            "the refusal must name the value law, got: {msg}"
+        );
+        assert_not_an_unrelated_refusal(&msg);
+    }
+
+    // ── 4. THE HOLES, AS THEY STAND TODAY ──────────────────────────────────────────────────────
+    //
+    // The three tests below assert what the SYNCHRONOUS verifiers do today, and what they do today is
+    // accept a theft. They are tripwires, not endorsements: each fails the moment the hole is closed
+    // and tells you how to flip it.
+
+    /// **GAP A — the root lane has no yardstick binding at all, and the claim path calls it
+    /// directly.**
+    ///
+    /// `verify_bundle_ex` mentions `fee_rate` in exactly two places: the two branches of
+    /// `rung_forward`, i.e. only to measure against it. `verify_bundle_bound` — which
+    /// `transfer_receiver.rs` calls on every laddered whole-coin claim, and `prepay_flat_census` on
+    /// every SSP pre-pay — binds the statechain id, the funding outpoint, `f_value`, the aggregate
+    /// address and the coordinator's recorded aggregate, and not the rate. `2ad2b2d` put the binding
+    /// in `verify_conveyed_child`, which is on the CHILD lane only.
+    ///
+    /// So: a ladder declaring 2 662 sat/vB over a 1 000 000-sat coin is internally perfect, fully
+    /// co-signed, structurally identical to an honest one, and delivers **1 030 sat** to the owner.
+    /// The receiver books the on-chain funding value — `amount: tx0_output.value`, assigned at
+    /// `transfer_receiver.rs:1486` — so a wallet displays 1 000 000 for a coin worth a thousandth of
+    /// that.
+    ///
+    /// **And the flat backups are not the fallback they look like.** `T` is un-timelocked
+    /// (`TRIGGER_SEQUENCE` disables the relative lock) and spends `F`; every prior owner retains a
+    /// co-signed copy ([B1]). The moment one is broadcast, every flat backup — all of which also
+    /// spend `F` — is void. The theft and the destruction of the slow path are one transaction.
+    ///
+    /// **The fix** is `2ad2b2d`'s, moved down a level: compare `bundle.fee_rate` to
+    /// `TesrParams::for_network(&bundle.network).committed_fee_rate` at the top of `verify_bundle_ex`,
+    /// before any value law. Honest bundles pass with equality — `the_receivers_yardstick_is_a_per_
+    /// network_constant` above is the proof that they do.
+    #[test]
+    fn gap_a_forged_yardstick_root_ladder_is_still_accepted() {
+        let rig = rig();
+        let b = rig.ladder(FORGED_RATE, FORGED_RATE);
+
+        // The theft, as arithmetic.
+        assert_eq!(b.fee_rate, FORGED_RATE, "1 331x the rate any establish path builds at");
+        assert_eq!(b.trigger.out_value, F_VALUE - FORGED_RUNG);
+        assert_eq!(b.levels[0].extension.out_value, F_VALUE - 2 * FORGED_RUNG);
+        assert_eq!(
+            b.levels[0].state.out_value,
+            1_030,
+            "the owner's exit chain can deliver 1 030 sat of a 1 000 000-sat coin"
+        );
+        assert_eq!(
+            F_VALUE - b.levels[0].state.out_value,
+            998_970,
+            "99.897 % of the coin never reaches the owner"
+        );
+
+        // Nothing structural distinguishes it from an honest ladder. Two outputs per tier, the payee
+        // is right, the declared values are right, and every tier is a genuine co-sign.
+        for (i, t) in b.exit_tiers().iter().enumerate() {
+            let tx = parse(&t.signed_tx);
+            assert_eq!(tx.output.len(), 2, "tier {i} is [payload, P2A] — no extra output to notice");
+            assert_eq!(
+                tx.output[t.payload_vout as usize].value, t.out_value,
+                "tier {i}'s declared out_value is HONEST"
+            );
+            assert_eq!(
+                tx.output[1].value,
+                mercurylib::tesr::P2A_VALUE,
+                "tier {i}'s anchor is untouched"
+            );
+        }
+        let s = parse(&b.levels[0].state.signed_tx);
+        assert_eq!(s.output[0].script_pubkey, rig.owner.spk, "and the OWNER is the payee throughout");
+        assert_root_genuinely_cosigned(&b, &rig);
+
+        // Where the money goes: each tier pays 332 750 sat to the miner and still relays.
+        let t = parse(&b.trigger.signed_tx);
+        assert_eq!(miner_fee(&t, F_VALUE), mercurylib::tesr::committed_fee(FORGED_RATE));
+        assert!(
+            t.output.iter().map(|o| o.value).sum::<u64>() < F_VALUE,
+            "outputs stay below the input, so the tier is consensus-valid and would really confirm"
+        );
+
+        let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
+        assert!(
+            r.is_ok(),
+            "GAP A HAS BEEN CLOSED — this tripwire has done its job. The root lane now binds \
+             `fee_rate` to the receiver's own preset ({:?}); flip this test to `expect_err`, assert \
+             the refusal names the declared rate, and strike GAP A from the module doc comment.",
+            r.as_ref().err()
+        );
+        // …and through the other two root entry points, so no caller is accidentally safe.
+        assert!(verify_root(&b).is_ok(), "GAP A: `verify_bundle_ex` accepts it");
+        assert!(
+            verify_bundle(&b, NUM_SIGS, FLAT_BACKUPS).is_ok(),
+            "GAP A: the public `verify_bundle` wrapper accepts it"
+        );
+    }
+
+    /// **GAP B — on the child lane the binding exists, but only above the synchronous verifier.**
+    ///
+    /// `verify_child_bundle` is `pub`, synchronous, and carries every conservation law the child lane
+    /// has. The yardstick binding is not in it: it is in `verify_conveyed_child`, ~150 lines further
+    /// up, behind an Electrum `transaction_get` and an `/info/config` HTTP round-trip. Any caller
+    /// that reaches the verifier without going through the async wrapper — a watchtower pass, a
+    /// re-verification of stored state, a future pre-pay path, the E2Es at
+    /// `clients/tests/rust/src/sdk58_inladder_split.rs:85` and
+    /// `sdk70_verifier_binding_adversarial.rs:573` — inherits none of it.
+    ///
+    /// The bundle below declares 700 sat/vB, is accepted by `verify_child_bundle`, and turns §8's
+    /// "bounded convention" into an attacker-sized hole: the claim path books `SP.out[j]` = 736 780
+    /// and the child's exit chain delivers 561 300. The gap is `2 × rung` in both cases — that is
+    /// exactly the point, because `rung` is a function of the rate the attacker declared. 980 sat
+    /// honest, 175 480 sat forged.
+    ///
+    /// **The fix** is the same one line as GAP A, in `verify_child_bundle` against
+    /// `cb.parent.fee_rate` — belt and braces with the async check rather than instead of it, so the
+    /// property holds for every caller of the verifier rather than for one caller of one wrapper.
+    #[test]
+    fn gap_a_forged_yardstick_child_is_still_accepted_by_the_sync_verifier() {
+        let rig = rig();
+        let cb = rig.child_bundle(FORGED_CHILD_RATE, FORGED_CHILD_RATE);
+
+        let sp = parse(&cb.parent.current().state.signed_tx);
+        let slot = sp.output[0].value;
+        assert_eq!(slot, F_VALUE - 3 * FORGED_CHILD_RUNG, "736 780 — what the claim path BOOKS");
+        assert_eq!(
+            cb.child_state.out_value,
+            slot - 2 * FORGED_CHILD_RUNG,
+            "561 300 — what the child's exit chain can DELIVER"
+        );
+        assert_eq!(
+            slot - cb.child_state.out_value,
+            2 * FORGED_CHILD_RUNG,
+            "the §8 'bounded convention' is 175 480 sat here, against 980 on an honest bundle — the \
+             bound is the attacker's to choose"
+        );
+        assert_eq!(2 * FORGED_CHILD_RUNG, 175_480);
+        assert_child_genuinely_cosigned(&cb, &rig);
+        // Every tier is the honest two-output shape; there is nothing structural to catch.
+        for t in [&cb.child_extension, &cb.child_state] {
+            let tx = parse(&t.signed_tx);
+            assert_eq!(tx.output.len(), 2);
+            assert_eq!(tx.output[t.payload_vout as usize].value, t.out_value);
+        }
+
+        let r = verify_child(&rig, &cb);
+        assert!(
+            r.is_ok(),
+            "GAP B HAS BEEN CLOSED — this tripwire has done its job. `verify_child_bundle` now binds \
+             `cb.parent.fee_rate` itself rather than relying on `verify_conveyed_child` ({:?}); flip \
+             this test to `expect_err` and strike GAP B from the module doc comment.",
+            r.as_ref().err()
+        );
+    }
+
+    /// **GAP C — the yardstick is an unvalidated `f64`, and a large one is a remote panic.**
+    ///
+    /// `committed_fee` is `(TIER_VBYTES as f64 * rate).ceil() as u64`. The cast SATURATES, so a huge
+    /// declared rate yields `u64::MAX`, and `tier_out_value`'s `committed_fee(rate) + P2A_VALUE` is
+    /// an unchecked add — a panic in any build with overflow checks on, which is every debug and test
+    /// build in this workspace (no `[profile]` overrides in the root `Cargo.toml`). It is reached
+    /// straight from `rung_forward` inside `verify_bundle_ex`, on a field a sender fills in, so it is
+    /// a remote denial of service on the claim path and on the SSP pre-pay path.
+    ///
+    /// This is `VALUE-CONSERVATION-SWEEP.md` V5's "secondary, same site" item, which is still open:
+    /// the document asks for `checked_add` and a rejection of non-finite / `<= 0` rates *in addition
+    /// to* the binding, "because the arithmetic is public API".
+    ///
+    /// The test asserts the panic rather than an error, because a panic is what happens. When the
+    /// arithmetic is fixed this test fails, and the fix is to assert the typed refusal instead.
+    #[test]
+    fn gap_an_absurd_declared_rate_panics_the_verifier_instead_of_refusing_it() {
+        let rig = rig();
+        // Structurally perfect, honestly built, absurdly declared.
+        let b = rig.ladder(HONEST_RATE, 1e18);
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the expected panic out of the test log
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify_root(&b)));
+        std::panic::set_hook(hook);
+
+        match outcome {
+            Err(_) => { /* GAP C, as described: attacker-controlled input panics the verifier. */ }
+            Ok(r) => panic!(
+                "GAP C HAS BEEN CLOSED — this tripwire has done its job. An absurd declared rate no \
+                 longer panics `verify_bundle_ex` ({r:?}); replace this test with an assertion that \
+                 the refusal names the rate, and strike GAP C from the module doc comment."
+            ),
+        }
+        // The underlying arithmetic, isolated — this is the public API the sweep asks to harden.
+        assert_eq!(
+            mercurylib::tesr::committed_fee(1e18),
+            u64::MAX,
+            "the f64 -> u64 cast saturates rather than erroring, and the caller then adds 240 to it"
+        );
+    }
+}
+
+/// # THE WRONG-PAYEE ATTACK, BUILT AND RUN
+///
+/// The third sibling of `skim_leaf_attack_tests` and `skim_root_attack_tests`, over the property those
+/// two do NOT touch: **where a tier pays**, as opposed to how much it forwards.
+///
+/// `docs/utexo/VALUE-CONSERVATION-SWEEP.md` §1 states the class in one line — *"A signature over a tier
+/// binds that tier's INPUT amount and nothing else"* — and then names four independent properties, of
+/// which the FIRST is `payload_out(tx).script_pubkey == the aggregate it is supposed to pay`. V2(b)
+/// records that the ancestor loop had no such check at all: `ext0 = seg.extension.payload_out(&ext_tx,…)`
+/// was a bare index and `ext0.script_pubkey` was compared to nothing, while the very next line fed
+/// `ext0.value` to the state's co-sign check as a prevout amount — i.e. it ASSUMED the spent output pays
+/// `A_seg`. `d692c07` added the two refusals (`tesr.rs:5864` on the ancestor hop, `:6134` on the leaf).
+/// Like every other commit in that series it was landed against HONEST traffic only. §8: *"No test proves
+/// the attacks are now refused."* This module is that proof for the payee half.
+///
+/// **Why this variant is different from the skims, and why it is worse in one specific way.** A skim
+/// STEALS: value leaves the exit chain into an output the attacker controls, and the value laws see the
+/// arithmetic come up short. A wrong payee STRANDS: every number in the bundle is correct to the satoshi,
+/// so **not one value law fires**. What breaks is downstream and invisible — `verify_tier_cosigned`
+/// SYNTHESISES the prevout it checks against:
+///
+/// ```text
+/// let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };   // tesr.rs:6455
+/// ```
+///
+/// so the tier below is verified against a `TxOut` that is *asserted*, never observed. If the real
+/// payload output pays a different key, that signature commits to a prevout **that does not exist on any
+/// chain**. The state below it is unbroadcastable forever, the ancestor is required to be terminal
+/// (`:5830`) so the SE will never co-sign a repair, a split child has no flat backup at all
+/// (`CHILD_V2_BASELINE = 0`), and the receiver has meanwhile been credited the full funding value. The
+/// attacker, holding the key the extension really pays, sweeps the whole segment the moment that
+/// extension confirms.
+///
+/// **What the attacker holds, and why that is realistic.** These tests build a real, fully co-signed
+/// three-segment chain (root → ancestor → leaf) while holding both halves of every aggregate key. That is
+/// not a cheat — `cosign_tier_request` (lib/src/tesr.rs:503) is handed a sighash and a prevout AMOUNT,
+/// never a transaction, so the blind SE cannot see which key a tier pays any more than it can see how the
+/// tier splits its value. Every attack below asserts that `verify_tier_cosigned` STILL ACCEPTS the
+/// tampered tier, and that the value laws are still satisfied to the satoshi, so the refusal can only be
+/// coming from the payee binding.
+///
+/// **Non-vacuity, three ways.** `an_honest_{one,two}_deep_chain_is_accepted` run the constructions
+/// untampered and assert `Ok(())`. Each attack test then repeats that control ON ITSELF via
+/// `assert_untampered_twin_is_accepted` — the same rig with the payee restored is verified to PASS, and
+/// its tier is verified to carry output values identical to the refused one, so the single difference
+/// between `Ok` and `Err` is a scriptPubKey. Finally `assert_refusal_names_the_payee_not_the_value`
+/// fails the test both if some unrelated structural check threw the bundle out AND if a value law fired
+/// instead, either of which would make the refusal worthless as evidence.
+///
+/// **One test here pins a HOLE rather than a fix** — `gap_an_ancestor_split_state_may_mint_value_out_of_nothing`,
+/// found while building the rig. Read it before trusting the ancestor lane's value story.
+#[cfg(test)]
+mod wrong_payee_attack_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        consensus::{deserialize, serialize},
+        key::{TapTweak, TweakedPublicKey},
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, ScriptBuf, Transaction, Witness,
+    };
+
+    const NET: &str = "regtest";
+    /// The parent coin's on-chain funding outpoint. Nothing fetches it — `verify_child_bundle` is pure
+    /// and takes `F`'s scriptPubKey as a parameter.
+    const F_TXID: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+    const F_VOUT: u32 = 0;
+    const F_VALUE: u64 = 200_000;
+
+    /// A party holding BOTH halves of an aggregate key — what a blind co-sign is equivalent to.
+    struct Holder {
+        kp: KeyPair,
+        /// The P2TR address for the UNTWEAKED internal key (BIP-341, no script tree).
+        address: String,
+        spk: ScriptBuf,
+        /// The x-only the coordinator would have on record: UNTWEAKED, as `/info/statechain` serves it.
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    impl Holder {
+        /// The scriptPubKey this holder's key would produce if the BIP-341 tweak were SKIPPED — the
+        /// output key set to the raw internal x-only. A near-miss payee: same 32 bytes on the wire in
+        /// the coordinator's records, a different output, and nobody can spend it with the aggregate.
+        fn untweaked_spk(&self) -> ScriptBuf {
+            let (xonly, _) = self.kp.x_only_public_key();
+            ScriptBuf::new_v1_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly))
+        }
+    }
+
+    /// Produce exactly the witness `verify_tier_cosigned` checks: a BIP-341 key-spend Schnorr signature
+    /// by the aggregate over `TxOut { value: prevout_value, script_pubkey: agg_spk }` with
+    /// `TapSighashType::All`. This IS the blind co-sign, performed locally — note that `agg_spk` is a
+    /// PARAMETER here exactly as it is in the verifier, which is the whole point of this module.
+    fn cosign(tx: &Transaction, prevout_value: u64, agg_spk: &ScriptBuf, kp: &KeyPair) -> Transaction {
+        let secp = Secp256k1::new();
+        let prevout = electrum_client::bitcoin::TxOut {
+            value: prevout_value,
+            script_pubkey: agg_spk.clone(),
+        };
+        let sighash = SighashCache::new(tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+            .expect("taproot key-spend sighash");
+        let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+        let mut signed = tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+        signed
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    fn as_hex(tx: &Transaction) -> String {
+        hex::encode(serialize(tx))
+    }
+
+    /// A bundle tier describing `tx`, with `out_value` read from the transaction — i.e. declared
+    /// HONESTLY. Every attack below keeps every declared field honest; the lie is a scriptPubKey.
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: as_hex(tx),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    /// Which extension's payload output is redirected, and to whom.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Payee {
+        /// No tampering at all — the non-vacuity control.
+        Honest,
+        /// **The assigned attack.** The ANCESTOR segment's extension pays a key the attacker holds
+        /// instead of the segment's own aggregate. Values are untouched, so every conservation law is
+        /// satisfied exactly; the segment's split state below it is then co-signed against a prevout
+        /// that will never exist.
+        AncestorExtensionToAttacker,
+        /// The same attack with a payee that is not a stranger but the LEAF CHILD's own aggregate — a
+        /// key that genuinely appears in this very structure and is genuinely SE-registered. A verifier
+        /// that only asked "is this some aggregate we know?" would wave it through.
+        AncestorExtensionToTheChildsKey,
+        /// The leaf hop's copy of the same attack: `child_extension` pays the attacker rather than
+        /// `A_child`. This one is reachable at depth 1, on the shipped shallow shape.
+        LeafExtensionToAttacker,
+        /// The near-miss: `child_extension` pays a P2TR output built from `A_child`'s x-only with the
+        /// BIP-341 tweak SKIPPED. The 32 bytes match the coordinator's record; the output does not.
+        LeafExtensionToUntweakedAggregate,
+    }
+
+    struct Rig {
+        /// The root coin's aggregate — owner of `T`, `X`, `SP`.
+        parent: Holder,
+        /// The intermediate child segment's aggregate — owner of `X_a`, `CSP`.
+        ancestor: Holder,
+        /// The leaf child's aggregate — owner of `X_c`, `S_c`.
+        child: Holder,
+        /// Where the leaf state pays (Model A).
+        receiver: Holder,
+        /// The key a redirected payload output really pays. The attacker holds it and nobody else does.
+        attacker: Holder,
+        /// The root coin's exit address.
+        sender: Holder,
+        params: mercurylib::tesr::TesrParams,
+        rate: f64,
+    }
+
+    /// Everything `verify_child_bundle` needs alongside the bundle: the facts a receiver reads off the
+    /// chain and the coordinator, none of which any attack here touches.
+    struct Facts {
+        f_spk_hex: String,
+        parent_num_sigs: u32,
+        parent_flat_backups: u32,
+        parent_xonly: String,
+        child_num_sigs: u32,
+        child_flat_backups: u32,
+        child_xonly: String,
+        ancestors: Vec<AncestorFacts>,
+        receiver_address: String,
+    }
+
+    fn rig() -> Rig {
+        let params = mercurylib::tesr::TesrParams::regtest();
+        Rig {
+            parent: holder(0x51),
+            ancestor: holder(0x52),
+            child: holder(0x53),
+            receiver: holder(0x54),
+            attacker: holder(0x55),
+            sender: holder(0x56),
+            rate: params.committed_fee_rate,
+            params,
+        }
+    }
+
+    /// What the whole rig looks like when nothing is tampered with, at depth 2:
+    ///
+    /// ```text
+    ///   F (on-chain, 200 000)
+    ///     └─ T  ─ pays A_parent   199 510
+    ///         └─ X  ─ pays A_parent   199 020
+    ///             └─ SP (spine) ─ out[0] pays A_ancestor   198 530      <- the ancestor's slot
+    ///                 └─ X_a ─ pays A_ancestor   198 040                <- ATTACK SITE 1
+    ///                     └─ CSP (spine) ─ out[0] pays A_child  197 550 <- the leaf's slot
+    ///                         └─ X_c ─ pays A_child   197 060           <- ATTACK SITE 2
+    ///                             └─ S_c ─ pays the receiver   196 570
+    /// ```
+    ///
+    /// Each arrow is one 490-sat rung (`committed_fee(2.0) + P2A_VALUE` = 250 + 240) at the regtest
+    /// committed rate. Depth 1 omits the ancestor segment: `SP.out[0]` funds `X_c` directly.
+    impl Rig {
+        fn build(&self, with_ancestor: bool, tamper: Payee) -> (ChildTesrBundle, Facts) {
+            let p = self.params;
+            let a = &self.parent;
+
+            // ── the ROOT segment: T → X → SP, honest throughout and genuinely co-signed by A_parent ──
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, self.rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), F_VALUE, &a.spk, &a.kp);
+
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+
+            // `SP` funds ONE slot. At depth 2 that slot belongs to the intermediate segment; at depth 1
+            // it is the leaf child's directly.
+            let slot_owner = if with_ancestor { &self.ancestor } else { &self.child };
+            let slot = mercurylib::tesr::tier_out_total(x.out_value, 1, self.rate).expect("slot");
+            let sp = mercurylib::tesr::build_split_state(
+                &x.txid,
+                x.out_value,
+                &[(slot_owner.address.clone(), slot)],
+                NET,
+                SPINE_CSV,
+                self.rate,
+            )
+            .expect("split state");
+            let sp_tx = cosign(&parse(&sp.tx_hex), x.out_value, &a.spk, &a.kp);
+
+            let parent = TesrBundle {
+                version: 1,
+                statechain_id: "parent-sid".into(),
+                network: NET.into(),
+                fee_rate: self.rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.sender.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&sp_tx, Some(SPINE_CSV), sp.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                params: p,
+                rgb: None,
+            };
+
+            // ── the optional ANCESTOR segment: X_a over SP.out[0], then its own spine split state ────
+            let mut ancestors: Vec<ChildSegment> = vec![];
+            let mut ancestor_facts: Vec<AncestorFacts> = vec![];
+            let (leaf_funding_txid, leaf_slot) = if with_ancestor {
+                let g = &self.ancestor;
+                let xa = mercurylib::tesr::build_extension(
+                    &sp.txid, slot, &g.address, NET, p.ext_csv(0), self.rate,
+                )
+                .expect("ancestor extension");
+                let mut xa_tx = parse(&xa.tx_hex);
+                // ── ATTACK SITE 1 ────────────────────────────────────────────────────────────────
+                // One field. The value stays exactly `slot − one rung`, the P2A anchor is untouched,
+                // the output count is unchanged, `out_value` below is still read off this very
+                // transaction. Only the 32 bytes of the key change.
+                match tamper {
+                    Payee::AncestorExtensionToAttacker => {
+                        xa_tx.output[xa.payload_vout as usize].script_pubkey = self.attacker.spk.clone();
+                    }
+                    Payee::AncestorExtensionToTheChildsKey => {
+                        xa_tx.output[xa.payload_vout as usize].script_pubkey = self.child.spk.clone();
+                    }
+                    _ => {}
+                }
+                // The blind SE co-signs the redirected output exactly as it co-signs an honest one: it
+                // is handed `(sighash, prevout amount)` and never sees an output at all.
+                let xa_tx = cosign(&xa_tx, slot, &g.spk, &g.kp);
+
+                let slot2 = mercurylib::tesr::tier_out_total(xa.out_value, 1, self.rate)
+                    .expect("leaf slot");
+                let csp = mercurylib::tesr::build_split_state(
+                    &xa_tx.txid().to_string(),
+                    xa.out_value,
+                    &[(self.child.address.clone(), slot2)],
+                    NET,
+                    SPINE_CSV,
+                    self.rate,
+                )
+                .expect("ancestor split state");
+                // THE STRAND, made concrete: this co-sign is taken against `A_ancestor`'s spk, because
+                // that is what the SE is told the prevout is. When `X_a` really pays someone else, this
+                // signature is valid for a `TxOut` that exists nowhere.
+                let csp_tx = cosign(&parse(&csp.tx_hex), xa.out_value, &g.spk, &g.kp);
+
+                ancestors.push(ChildSegment {
+                    statechain_id: "ancestor-sid".into(),
+                    funding_vout: 0,
+                    extension: tier(&xa_tx, Some(p.ext_csv(0)), xa.payload_vout),
+                    state: tier(&csp_tx, Some(SPINE_CSV), csp.payload_vout),
+                    superseded_states: vec![],
+                    superseded_extensions: vec![],
+                });
+                ancestor_facts.push(AncestorFacts {
+                    // A derived segment has no flat backup: just its two tiers, nothing superseded.
+                    num_sigs: CHILD_V2_BASELINE + 2,
+                    aggregate_pubkey: Some(g.recorded_xonly.clone()),
+                    terminal: true,
+                });
+                (csp_tx.txid().to_string(), slot2)
+            } else {
+                (sp_tx.txid().to_string(), slot)
+            };
+
+            // ── the LEAF: X_c over the funding slot, then S_c paying the receiver ────────────────────
+            let c = &self.child;
+            let xc = mercurylib::tesr::build_extension(
+                &leaf_funding_txid, leaf_slot, &c.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("child extension");
+            let mut xc_tx = parse(&xc.tx_hex);
+            // ── ATTACK SITE 2 ───────────────────────────────────────────────────────────────────
+            match tamper {
+                Payee::LeafExtensionToAttacker => {
+                    xc_tx.output[xc.payload_vout as usize].script_pubkey = self.attacker.spk.clone();
+                }
+                Payee::LeafExtensionToUntweakedAggregate => {
+                    xc_tx.output[xc.payload_vout as usize].script_pubkey = c.untweaked_spk();
+                }
+                _ => {}
+            }
+            let xc_tx = cosign(&xc_tx, leaf_slot, &c.spk, &c.kp);
+
+            let sc = mercurylib::tesr::build_state(
+                &xc_tx.txid().to_string(),
+                xc.out_value,
+                &self.receiver.address,
+                NET,
+                p.state_csv(0),
+                self.rate,
+            )
+            .expect("child state");
+            let sc_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &c.spk, &c.kp);
+
+            let cb = ChildTesrBundle {
+                parent,
+                parent_statechain_id: "parent-sid".into(),
+                sp_vout: 0,
+                child_statechain_id: "child-sid".into(),
+                child_owner_exit_address: self.receiver.address.clone(),
+                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
+                child_superseded_states: vec![],
+                child_superseded_extensions: vec![],
+                ancestors,
+                rgb: None,
+                parent_flat_backups: vec![],
+            };
+            let facts = Facts {
+                f_spk_hex: hex::encode(self.parent.spk.as_bytes()),
+                // The root's census: one deposit backup + T + X + SP, nothing superseded.
+                parent_num_sigs: 1 + 3,
+                parent_flat_backups: 1,
+                parent_xonly: self.parent.recorded_xonly.clone(),
+                child_num_sigs: 2,
+                child_flat_backups: 0,
+                child_xonly: self.child.recorded_xonly.clone(),
+                ancestors: ancestor_facts,
+                receiver_address: self.receiver.address.clone(),
+            };
+            (cb, facts)
+        }
+    }
+
+    fn verify(cb: &ChildTesrBundle, f: &Facts) -> Result<()> {
+        verify_child_bundle(
+            cb,
+            &f.f_spk_hex,
+            f.parent_num_sigs,
+            f.parent_flat_backups,
+            Some(&f.parent_xonly),
+            true, // the root segment is terminal, as the protocol requires
+            f.child_num_sigs,
+            f.child_flat_backups,
+            Some(&f.child_xonly),
+            &f.ancestors,
+            &f.receiver_address,
+        )
+    }
+
+    /// The refusal must name WHERE THE TIER PAYS. Two ways this test could be worthless, both checked:
+    /// the bundle was thrown out by some unrelated structural check, or a VALUE law fired — which would
+    /// mean the construction accidentally failed to conserve and the payee binding was never reached.
+    fn assert_refusal_names_the_payee_not_the_value(msg: &str) {
+        assert!(
+            msg.contains("does not pay"),
+            "the refusal must name the payee, got: {msg}"
+        );
+        for value_law in [
+            "payload outputs carry",
+            "forwards only",
+            "expected exactly",
+            "skimmed",
+            "cannot carry a tier",
+            "out_value",
+        ] {
+            assert!(
+                !msg.contains(value_law),
+                "a VALUE law fired ({value_law:?}) — the construction did not conserve and this test \
+                 proves nothing about the payee binding: {msg}"
+            );
+        }
+        for unrelated in [
+            "not co-signed",
+            "num_sigs",
+            "CSV",
+            "does not spend",
+            "colour",
+            "decoy",
+            "terminal",
+            "fail-closed",
+            "hex",
+            "not a transaction",
+        ] {
+            assert!(
+                !msg.contains(unrelated),
+                "the bundle was refused for an UNRELATED reason ({unrelated:?}) — this test would be \
+                 worthless: {msg}"
+            );
+        }
+    }
+
+    /// The value laws, re-computed here from the tier's own funding, so an attack test can state
+    /// positively that they are SATISFIED rather than merely hoping they are. Returns
+    /// `(Σ payload outputs, what the law expects)`.
+    fn payload_sum_and_expectation(tx: &Transaction, funding: u64, rate: f64) -> (u64, u64) {
+        let got: u64 = tx
+            .output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum();
+        (got, mercurylib::tesr::tier_out_value(funding, rate).expect("rung"))
+    }
+
+    /// **The paired non-vacuity control.** Rebuild the SAME rig with no tampering, assert the verifier
+    /// ACCEPTS it, and assert that the tier which was just refused carries output values identical to
+    /// its accepted twin — so the only thing that changed between `Ok` and `Err` is a scriptPubKey.
+    /// This is what makes each attack test self-contained: a refusal is only evidence if the identical
+    /// bundle minus the tampering passes.
+    fn assert_untampered_twin_is_accepted(
+        rig: &Rig,
+        with_ancestor: bool,
+        pick: impl Fn(&ChildTesrBundle) -> Transaction,
+        tampered: &Transaction,
+    ) {
+        let (honest, facts) = rig.build(with_ancestor, Payee::Honest);
+        verify(&honest, &facts).expect(
+            "the SAME construction without the tampering must PASS — otherwise the refusal proves \
+             nothing about the payee binding",
+        );
+        let twin = pick(&honest);
+        assert_eq!(
+            twin.output.iter().map(|o| o.value).collect::<Vec<_>>(),
+            tampered.output.iter().map(|o| o.value).collect::<Vec<_>>(),
+            "the accepted twin and the refused tier carry IDENTICAL output values"
+        );
+        assert_ne!(
+            twin.output[0].script_pubkey, tampered.output[0].script_pubkey,
+            "…and the one difference between them is the payee"
+        );
+    }
+
+    // ── THE NON-VACUITY CONTROLS ───────────────────────────────────────────────────────────────────
+
+    /// **The control the depth-2 attacks depend on.** The identical three-segment construction,
+    /// untampered, must be ACCEPTED. Without this a refusal proves nothing: an ancestor segment is the
+    /// most intricate shape this verifier takes and could be malformed in a dozen unrelated ways.
+    #[test]
+    fn an_honest_two_deep_chain_is_accepted() {
+        let rig = rig();
+        let (cb, facts) = rig.build(true, Payee::Honest);
+
+        // The arithmetic every attack below leaves UNTOUCHED, stated once so a schedule change surfaces
+        // here rather than as a mystery three tests down. A plain rung at 2 sat/vB is 490 sat.
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        assert_eq!(sp.output[0].value, 198_530, "the ancestor segment's slot on SP");
+        assert_eq!(sp.output[0].script_pubkey, rig.ancestor.spk, "…and it pays A_ancestor");
+        let xa: Transaction = parse(&cb.ancestors[0].extension.signed_tx);
+        assert_eq!(xa.output[0].value, 198_530 - 490, "the ancestor extension forwards one rung less");
+        assert_eq!(xa.output[0].script_pubkey, rig.ancestor.spk, "…to its OWN aggregate");
+        let csp: Transaction = parse(&cb.ancestors[0].state.signed_tx);
+        assert_eq!(csp.output[0].value, 198_530 - 2 * 490, "the leaf's slot on CSP");
+        assert_eq!(csp.output[0].script_pubkey, rig.child.spk, "…paying A_child");
+        assert_eq!(cb.child_extension.out_value, 198_530 - 3 * 490);
+        assert_eq!(cb.child_state.out_value, 198_530 - 4 * 490);
+
+        verify(&cb, &facts).expect("an honest, fully co-signed two-deep child bundle must be ACCEPTED");
+    }
+
+    /// The depth-1 control, for the leaf attacks — the shipped shallow shape, with no ancestor segment
+    /// at all, so a leaf refusal cannot be blamed on the ancestor scaffolding.
+    #[test]
+    fn an_honest_one_deep_chain_is_accepted() {
+        let rig = rig();
+        let (cb, facts) = rig.build(false, Payee::Honest);
+        assert!(cb.ancestors.is_empty(), "depth 1: SP funds the leaf directly");
+        assert_eq!(cb.child_extension.out_value, 198_530 - 490);
+        assert_eq!(cb.child_state.out_value, 198_530 - 2 * 490);
+        verify(&cb, &facts).expect("an honest depth-1 child bundle must be ACCEPTED");
+    }
+
+    // ── THE ATTACKS ────────────────────────────────────────────────────────────────────────────────
+
+    /// **THE ASSIGNED ATTACK.** The ancestor segment's extension spends its 198 530-sat funding output,
+    /// forwards exactly 198 040 — the correct amount, to the satoshi — and pays it to a key only the
+    /// attacker holds. Nothing is skimmed. Nothing is minted. Every declared field agrees with its
+    /// transaction.
+    ///
+    /// What it destroys is the segment below: `CSP` was co-signed against
+    /// `TxOut { value: 198_040, script_pubkey: A_ancestor }`, an output that this chain never creates.
+    /// The test asserts that directly — the co-sign verifies against the SYNTHESISED prevout and fails
+    /// against the REAL one — which is the stranding, in two lines, rather than as an argument.
+    #[test]
+    fn an_ancestor_extension_paying_a_foreign_key_is_refused() {
+        let rig = rig();
+        let (cb, facts) = rig.build(true, Payee::AncestorExtensionToAttacker);
+
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let funding = sp.output[0].value;
+        let xa: Transaction = parse(&cb.ancestors[0].extension.signed_tx);
+
+        // 1. THE VALUE LAWS ARE SATISFIED — this is not a skim wearing a different hat.
+        let (got, expect) = payload_sum_and_expectation(&xa, funding, rig.rate);
+        assert_eq!(got, expect, "Σ payload outputs is EXACTLY the law's expected total");
+        assert_eq!(xa.output.len(), 2, "payload + P2A anchor — no extra output to hide value in");
+        assert_eq!(
+            cb.ancestors[0].extension.out_value, xa.output[0].value,
+            "the declared value is read off the transaction — every declared field is honest"
+        );
+
+        // 2. THE LIE, isolated: 32 bytes.
+        assert_eq!(xa.output[0].script_pubkey, rig.attacker.spk, "the payload output pays the ATTACKER");
+        assert_ne!(xa.output[0].script_pubkey, rig.ancestor.spk, "…not the segment's own aggregate");
+
+        // 3. THE SE REALLY CO-SIGNED IT. A blind co-sign carries no information about the payee.
+        verify_tier_cosigned(&xa, funding, &rig.ancestor.spk)
+            .expect("the blind SE co-signs the redirected tier — this is not a forgery");
+
+        // 4. THE STRAND, demonstrated. `CSP`'s signature verifies against the prevout the verifier
+        //    SYNTHESISES, and against nothing that will ever be on a chain.
+        let csp: Transaction = parse(&cb.ancestors[0].state.signed_tx);
+        verify_tier_cosigned(&csp, xa.output[0].value, &rig.ancestor.spk)
+            .expect("valid against the ASSUMED prevout — which is why the co-sign check cannot see this");
+        verify_tier_cosigned(&csp, xa.output[0].value, &rig.attacker.spk).expect_err(
+            "…and INVALID against the output the chain would really carry: CSP is unbroadcastable \
+             forever, while the attacker sweeps the segment the moment X_a confirms",
+        );
+
+        let e = verify(&cb, &facts).expect_err("an ancestor extension paying a foreign key must be REFUSED");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("ancestor 0") && msg.contains("segment's aggregate"),
+            "the refusal must name the hop and the key it should have paid, got: {msg}"
+        );
+        assert!(
+            msg.contains("prevout that does not exist"),
+            "…and the consequence, got: {msg}"
+        );
+        assert_refusal_names_the_payee_not_the_value(&msg);
+
+        // 5. NON-VACUITY, paired inside this test rather than only next door: the identical
+        //    construction with the payee restored is ACCEPTED, and the two extensions carry
+        //    byte-identical VALUES. The refusal cannot be about anything but the key.
+        assert_untampered_twin_is_accepted(&rig, true, |b| {
+            parse(&b.ancestors[0].extension.signed_tx)
+        }, &xa);
+    }
+
+    /// The same attack with a payee chosen to defeat a lazier check: the ancestor extension pays the
+    /// **leaf child's** aggregate — a key that is genuinely SE-registered, genuinely appears in this
+    /// bundle, and which `verify_child_bundle` will itself bind to `CSP.out[0]` a few lines later. Only
+    /// a check that compares against THIS SEGMENT's own aggregate refuses it.
+    ///
+    /// Note what this shape would do if it were accepted: `CSP` spends `X_a.out[0]` under `A_ancestor`'s
+    /// key, which no longer owns it, so the leaf's entire funding chain is dead — while the child's own
+    /// two tiers verify perfectly and the receiver is credited 197 550 sat.
+    #[test]
+    fn an_ancestor_extension_paying_a_different_real_aggregate_is_refused() {
+        let rig = rig();
+        let (cb, facts) = rig.build(true, Payee::AncestorExtensionToTheChildsKey);
+
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let xa: Transaction = parse(&cb.ancestors[0].extension.signed_tx);
+        let (got, expect) = payload_sum_and_expectation(&xa, sp.output[0].value, rig.rate);
+        assert_eq!(got, expect, "value conservation is exact — only the payee is wrong");
+        assert_eq!(
+            xa.output[0].script_pubkey, rig.child.spk,
+            "the payee is the LEAF's aggregate: a real, server-registered key from this same bundle"
+        );
+        // And it is the key the verifier is about to accept as `A_child` for the leaf, one hop down —
+        // so "is this a key we recognise?" is not a check that could have caught this.
+        let csp: Transaction = parse(&cb.ancestors[0].state.signed_tx);
+        assert_eq!(csp.output[0].script_pubkey, rig.child.spk);
+        verify_tier_cosigned(&xa, sp.output[0].value, &rig.ancestor.spk)
+            .expect("genuinely co-signed by the segment's aggregate");
+
+        let e = verify(&cb, &facts).expect_err("paying the WRONG real aggregate must still be REFUSED");
+        let msg = e.to_string();
+        assert!(msg.contains("ancestor 0"), "got: {msg}");
+        assert_refusal_names_the_payee_not_the_value(&msg);
+        assert_untampered_twin_is_accepted(&rig, true, |b| {
+            parse(&b.ancestors[0].extension.signed_tx)
+        }, &xa);
+    }
+
+    /// The leaf hop's copy, at depth 1 — the shipped shallow shape. `child_extension` forwards exactly
+    /// one rung less than its funding, to the attacker's key. `child_state` then pays the receiver the
+    /// right amount and declares it honestly, so Model A and the value-gate binding both pass; the coin
+    /// is simply unreachable, and a split child has no flat backup to fall back on.
+    #[test]
+    fn a_leaf_child_extension_paying_a_foreign_key_is_refused() {
+        let rig = rig();
+        let (cb, facts) = rig.build(false, Payee::LeafExtensionToAttacker);
+
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let funding = sp.output[0].value;
+        let xc: Transaction = parse(&cb.child_extension.signed_tx);
+        let (got, expect) = payload_sum_and_expectation(&xc, funding, rig.rate);
+        assert_eq!(got, expect, "the leaf extension conserves exactly");
+        assert_eq!(
+            cb.child_extension.out_value, xc.output[0].value,
+            "and its declared out_value is the signed one"
+        );
+        assert_eq!(xc.output[0].script_pubkey, rig.attacker.spk, "but it pays the ATTACKER");
+
+        // Model A still holds one tier further down — the state really does pay the receiver.
+        let sc: Transaction = parse(&cb.child_state.signed_tx);
+        assert_eq!(sc.output[0].script_pubkey, rig.receiver.spk);
+        assert_eq!(sc.output[0].value, cb.child_state.out_value);
+        verify_tier_cosigned(&xc, funding, &rig.child.spk).expect("genuinely co-signed by A_child");
+        verify_tier_cosigned(&sc, xc.output[0].value, &rig.child.spk)
+            .expect("and so is the state, against the prevout the verifier assumes");
+        verify_tier_cosigned(&sc, xc.output[0].value, &rig.attacker.spk)
+            .expect_err("but not against the one the chain would carry — the child is stranded");
+
+        let e = verify(&cb, &facts).expect_err("a leaf extension paying a foreign key must be REFUSED");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("child extension") && msg.contains("A_child"),
+            "the refusal must name the leaf hop and A_child, got: {msg}"
+        );
+        assert!(msg.contains("prevout that does not exist"), "…and the consequence, got: {msg}");
+        assert_refusal_names_the_payee_not_the_value(&msg);
+        assert_untampered_twin_is_accepted(&rig, false, |b| parse(&b.child_extension.signed_tx), &xc);
+    }
+
+    /// The near-miss, and the reason the check compares whole scriptPubKeys rather than key material.
+    /// `child_extension` pays a P2TR output whose OUTPUT KEY is `A_child`'s x-only with the BIP-341
+    /// tweak skipped. The 32 bytes match the coordinator's `/info/statechain` record exactly, so a
+    /// verifier that compared the recorded aggregate to `taproot_key_hex(out.script_pubkey)` would see
+    /// what it expected — but the aggregate cannot produce a key-spend signature for that output, so the
+    /// tier below is signed against a prevout that does not exist, exactly as in the foreign-key case.
+    #[test]
+    fn a_leaf_child_extension_paying_the_untweaked_aggregate_is_refused() {
+        let rig = rig();
+        let (cb, facts) = rig.build(false, Payee::LeafExtensionToUntweakedAggregate);
+
+        let xc: Transaction = parse(&cb.child_extension.signed_tx);
+        let paid = &xc.output[0].script_pubkey;
+        assert_ne!(*paid, rig.child.spk, "the output key is NOT the tweaked aggregate");
+        assert_eq!(
+            hex::encode(&paid.as_bytes()[2..34]),
+            rig.child.recorded_xonly,
+            "…yet the 32 bytes on the wire are exactly the aggregate the coordinator has on record"
+        );
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let (got, expect) = payload_sum_and_expectation(&xc, sp.output[0].value, rig.rate);
+        assert_eq!(got, expect, "value conservation is exact");
+        verify_tier_cosigned(&xc, sp.output[0].value, &rig.child.spk)
+            .expect("genuinely co-signed — the tweak is missing from the PAYEE, not from the signature");
+
+        let e = verify(&cb, &facts).expect_err("an untweaked payee must be REFUSED");
+        let msg = e.to_string();
+        assert!(msg.contains("child extension") && msg.contains("A_child"), "got: {msg}");
+        assert_refusal_names_the_payee_not_the_value(&msg);
+        assert_untampered_twin_is_accepted(&rig, false, |b| parse(&b.child_extension.signed_tx), &xc);
+    }
+
+    /// **A HOLE THIS MODULE FOUND WHILE BUILDING THE ABOVE, PINNED AS A TRIPWIRE.**
+    ///
+    /// The ancestor loop binds the extension hop's value (`tesr.rs:5870-5895`, `d692c07`) and the leaf
+    /// binds both of its own (`4e165e6`). **The ancestor segment's STATE — the spine `CSP` whose outputs
+    /// fund the level below — is bound by no value law at all.** Between the extension's Σ check and
+    /// `cur_tx = st_tx` (`:5986`) the state is parsed, checked to spend the extension's payload output,
+    /// co-signed against `ext0.value`, and CSV-bounded; its OUTPUT VALUES are never compared to anything.
+    ///
+    /// That matters because the very next thing the function does is read the leaf's funding out of it —
+    /// `sp_out = cur_tx.output[cb.sp_vout]` — and the receiver books that number. So an intermediate
+    /// segment can MINT: `CSP` declares `out[0]` far larger than `X_a` holds, the leaf's two hops then
+    /// conserve perfectly from the inflated figure, every census balances, and `verify_child_bundle`
+    /// returns `Ok(())` over a chain that is consensus-invalid at `CSP` (outputs exceed input) and can
+    /// therefore never confirm. This is finding V2(a) of the sweep, closed on the extension hop and left
+    /// open on the state hop.
+    ///
+    /// It is NOT the attack this module was written for, so it is recorded as an executable tripwire
+    /// rather than argued in prose: the test asserts the bundle is currently ACCEPTED, and FAILS LOUDLY
+    /// the day someone closes the hole — at which point the fix is to turn this into a refusal assertion
+    /// alongside the others.
+    #[test]
+    fn gap_an_ancestor_split_state_may_mint_value_out_of_nothing() {
+        let rig = rig();
+        let (mut cb, mut facts) = rig.build(true, Payee::Honest);
+        let g = &rig.ancestor;
+
+        let xa: Transaction = parse(&cb.ancestors[0].extension.signed_tx);
+        let honest_slot = parse(&cb.ancestors[0].state.signed_tx).output[0].value;
+        // Mint: hand the leaf a slot ten times what the segment above it actually holds. `X_a` carries
+        // 198 040 sat; `CSP` will now claim to pay out 1 975 500.
+        let minted = honest_slot * 10;
+        let csp = mercurylib::tesr::build_split_state(
+            &xa.txid().to_string(),
+            // `build_split_state` enforces conservation itself, so it is told a funding figure that
+            // matches the mint — the transaction it returns is what a hostile builder would emit
+            // directly, and nothing on the receive side ever compares it to `X_a`.
+            minted + (xa.output[0].value - honest_slot),
+            &[(rig.child.address.clone(), minted)],
+            NET,
+            SPINE_CSV,
+            rig.rate,
+        )
+        .expect("a minting split state");
+        let csp_tx = cosign(&parse(&csp.tx_hex), xa.output[0].value, &g.spk, &g.kp);
+        cb.ancestors[0].state = tier(&csp_tx, Some(SPINE_CSV), csp.payload_vout);
+
+        // Rebuild the leaf honestly over the inflated slot — every law it is subject to is satisfied.
+        let c = &rig.child;
+        let xc = mercurylib::tesr::build_extension(
+            &csp_tx.txid().to_string(), minted, &c.address, NET, rig.params.ext_csv(0), rig.rate,
+        )
+        .expect("child extension");
+        let xc_tx = cosign(&parse(&xc.tx_hex), minted, &c.spk, &c.kp);
+        let sc = mercurylib::tesr::build_state(
+            &xc_tx.txid().to_string(), xc.out_value, &rig.receiver.address, NET,
+            rig.params.state_csv(0), rig.rate,
+        )
+        .expect("child state");
+        let sc_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &c.spk, &c.kp);
+        cb.child_extension = tier(&xc_tx, Some(rig.params.ext_csv(0)), xc.payload_vout);
+        cb.child_state = tier(&sc_tx, Some(rig.params.state_csv(0)), sc.payload_vout);
+        facts.ancestors[0].num_sigs = CHILD_V2_BASELINE + 2;
+
+        // The mint is real: CSP's outputs exceed what it spends, so it can never confirm.
+        let spends = xa.output[0].value;
+        let pays: u64 = csp_tx.output.iter().map(|o| o.value).sum();
+        assert!(
+            pays > spends,
+            "the tripwire's premise: CSP pays {pays} while spending {spends} — consensus-invalid"
+        );
+
+        match verify(&cb, &facts) {
+            Ok(()) => { /* GAP as described: V2(a) survives on the ancestor STATE hop. */ }
+            Err(e) => panic!(
+                "THE ANCESTOR-STATE VALUE GAP HAS BEEN CLOSED — this tripwire has done its job. \
+                 `verify_child_bundle` now refuses a minting ancestor split state ({e}); replace this \
+                 test with an assertion that the refusal names the value law, and strike the gap from \
+                 the module doc comment."
+            ),
+        }
     }
 }
