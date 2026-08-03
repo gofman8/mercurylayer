@@ -46,22 +46,191 @@ pub struct TesrTier {
     pub payload_vout: u32,
 }
 
-impl TesrTier {
-    /// This tier's payload output within `tx`. Fails CLOSED if `payload_vout` is out of range — a
-    /// conveyed bundle can claim any index, and an out-of-range one must be a rejection, never a
-    /// panic and never a silent fallback to `output[0]`.
-    fn payload_out<'a>(
-        &self,
-        tx: &'a electrum_client::bitcoin::Transaction,
-        what: &str,
-    ) -> Result<&'a electrum_client::bitcoin::TxOut> {
-        tx.output.get(self.payload_vout as usize).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{what}: declared payload_vout {} is out of range ({} outputs)",
-                self.payload_vout,
-                tx.output.len()
-            )
-        })
+use linked::{tier_payload_prevout, LinkedPayload};
+
+// =================================================================================================
+// `payload_vout` → an OUTPUT: the ONE place in this file where that step may be taken.
+// =================================================================================================
+//
+// `TesrTier::payload_vout` is ATTACKER-SUPPLIED in every conveyed bundle. Turning it into a `TxOut`
+// — `tx.output[payload_vout]` — is a step that can only be justified by a STRUCTURAL fact already
+// proven about that index: that the next tier really spends it, or that the output sitting there
+// really pays the key it is supposed to pay. Taken without one, a tampered index silently yields
+// the P2A ANCHOR (240 sat), so every VALUE law downstream computes on the anchor and refuses with an
+// arithmetic message — hiding the accurate structural cause, and in one case shadowing a refusal an
+// E2E pins.
+//
+// That mistake was made FOUR times in a single day, by one author, in four different places:
+// `deed25c`'s root value law, the GAP-1 payload-count check, the declared-`out_value` check, and
+// again while FIXING the third — one check was moved below the linkage test and its two neighbours
+// were left above it. Each instance was fixed by re-ordering statements and writing a comment
+// explaining the order. Ordering that only a comment defends is not defended.
+//
+// So the accessor is PRIVATE TO THIS MODULE, and the module exports no way to reach it except the
+// three `link_*` constructors, each of which performs a structural pin and only then hands back a
+// [`LinkedPayload`]. The value laws take that type. A `LinkedPayload` cannot exist before its pin
+// ran, so "value check before linkage check" stops being a review comment and becomes a thing that
+// does not compile.
+//
+// **Trusted construction is a different case and is NOT put through this ceremony.** A builder that
+// reads a tier IT JUST BUILT, from a bundle this process owns both key halves for, has no attacker
+// to defend against and no next tier to link to yet — there is nothing for a pin to prove. Those
+// four call sites go through [`tier_payload_prevout`], which lives in here too (so the raw accessor
+// still has zero users outside this module) and does the binding that IS available to a builder:
+// re-derive the transaction from its own hex, check it hashes to the declared txid, and check the
+// output matches the declared `out_value`. The test-side census `payload_vout_access_census` pins
+// the encapsulation itself, since a future edit could always widen a visibility again.
+mod linked {
+    use anyhow::Result;
+    use electrum_client::bitcoin::{ScriptBuf, Transaction, TxOut};
+
+    use super::TesrTier;
+
+    /// A tier's payload output, **plus the proof that it is the payload**.
+    ///
+    /// Constructible only by one of the `link_*` methods below, each of which pins the declared
+    /// `payload_vout` to a structural fact before yielding one. Holding a `LinkedPayload` is
+    /// therefore evidence — carried in the type system rather than in a comment — that the
+    /// structural check ran FIRST. Give the value laws this instead of a `&TesrTier` + `&Transaction`
+    /// pair and the ordering defect becomes unrepresentable.
+    pub(super) struct LinkedPayload<'a> {
+        out: &'a TxOut,
+    }
+
+    impl<'a> LinkedPayload<'a> {
+        /// The value the pinned output carries — the term every conservation law measures against.
+        pub(super) fn value(&self) -> u64 {
+            self.out.value
+        }
+
+        /// The pinned output's scriptPubKey. Safe to hand out: reaching here already cost a pin.
+        pub(super) fn script_pubkey(&self) -> &'a ScriptBuf {
+            &self.out.script_pubkey
+        }
+    }
+
+    impl TesrTier {
+        /// This tier's payload output within `tx`. Fails CLOSED if `payload_vout` is out of range — a
+        /// conveyed bundle can claim any index, and an out-of-range one must be a rejection, never a
+        /// panic and never a silent fallback to `output[0]`.
+        ///
+        /// **Private to this module on purpose** — see the module comment. Everything a verifier is
+        /// allowed to do with it is one of the `link_*` methods below.
+        fn payload_out<'a>(&self, tx: &'a Transaction, what: &str) -> Result<&'a TxOut> {
+            tx.output.get(self.payload_vout as usize).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{what}: declared payload_vout {} is out of range ({} outputs)",
+                    self.payload_vout,
+                    tx.output.len()
+                )
+            })
+        }
+
+        /// **PIN 1 — the next tier really spends it.** The strongest of the three: the declared index
+        /// is not merely plausible, it is the outpoint the chain below actually hangs off, so a value
+        /// read here is the value that chain is funded with.
+        ///
+        /// `what` names this tier in the out-of-range refusal; `mismatch` is the CALLER's own refusal
+        /// text for a child that spends something else, because those messages are pinned by E2Es
+        /// (sdk70 D1) and by the unit tests in this file, and a generic replacement would lose the
+        /// caller's tier numbering.
+        ///
+        /// The range check runs BEFORE the linkage comparison, which is the order every one of these
+        /// sites had before this type existed (each tier's index was already range-checked by its own
+        /// payee check, one loop iteration earlier).
+        pub(super) fn link_child<'a>(
+            &self,
+            tx: &'a Transaction,
+            child: &Transaction,
+            what: &str,
+            mismatch: &str,
+        ) -> Result<LinkedPayload<'a>> {
+            let out = self.payload_out(tx, what)?;
+            if child.input.len() != 1
+                || child.input[0].previous_output.txid != tx.txid()
+                || child.input[0].previous_output.vout != self.payload_vout
+            {
+                return Err(anyhow::anyhow!("{mismatch}"));
+            }
+            Ok(LinkedPayload { out })
+        }
+
+        /// **PIN 2 — the output at the declared index pays the key it is supposed to pay.** The
+        /// TERMINAL tier of a chain has no child to link it, so the payee is the pin — and it is a
+        /// real one: the P2A anchor, an opret and a skim-to-self change output all carry a different
+        /// script, so none of them can be passed off as the payload.
+        pub(super) fn link_pays<'a>(
+            &self,
+            tx: &'a Transaction,
+            want: &ScriptBuf,
+            what: &str,
+            mismatch: &str,
+        ) -> Result<LinkedPayload<'a>> {
+            let out = self.payload_out(tx, what)?;
+            if &out.script_pubkey != want {
+                return Err(anyhow::anyhow!("{mismatch}"));
+            }
+            Ok(LinkedPayload { out })
+        }
+
+        /// **PIN 2′ — the same pin, by taproot OUTPUT KEY rather than by whole scriptPubKey.** Model A
+        /// compares the receiver's key, not their script, and a non-taproot output must keep failing
+        /// with `taproot_key_hex`'s own "not a v1 taproot scriptPubKey" rather than with the payee
+        /// message — so the comparison is reproduced here exactly rather than approximated by
+        /// [`Self::link_pays`].
+        pub(super) fn link_pays_taproot_key<'a>(
+            &self,
+            tx: &'a Transaction,
+            want_key_hex: &str,
+            what: &str,
+            mismatch: &str,
+        ) -> Result<LinkedPayload<'a>> {
+            let out = self.payload_out(tx, what)?;
+            if super::taproot_key_hex(out.script_pubkey.as_bytes())? != want_key_hex {
+                return Err(anyhow::anyhow!("{mismatch}"));
+            }
+            Ok(LinkedPayload { out })
+        }
+    }
+
+    /// The PAYLOAD output of an already-built tier, as `(value, scriptPubKey hex)` — read from the
+    /// transaction, never from the declared `out_value`. A coloured child needs both: the value feeds
+    /// the fee arithmetic and the taproot sighash, the script is the prevout rgb-lib must see.
+    ///
+    /// **TRUSTED CONSTRUCTION ONLY — this is the builders' door, and it is not a verifier's.** Its
+    /// four callers (`build_colored_receiver_state`, `build_colored_renewal`, the coloured split, and
+    /// the coloured child re-transfer) each read a tier out of a bundle THIS process owns: either one
+    /// it just built, or one a claim already put through `verify_bundle_ex` / `verify_child_bundle`
+    /// end to end. There is no attacker in the loop and, for a tier being extended, no child tier in
+    /// existence yet — so there is no structural fact for a `link_*` pin to prove. What a builder CAN
+    /// bind, it binds: the hex must hash to the declared txid, and the parsed output must equal the
+    /// declared `out_value`.
+    ///
+    /// Do not reach for this from an acceptance path. If a value is about to be measured, compared or
+    /// booked on behalf of a receiver, it needs a `LinkedPayload`.
+    pub(super) fn tier_payload_prevout(tier: &TesrTier, what: &str) -> Result<(u64, String)> {
+        use electrum_client::bitcoin::consensus::deserialize;
+        let raw = hex::decode(&tier.signed_tx)
+            .map_err(|_| anyhow::anyhow!("{what}: tier hex does not decode"))?;
+        let tx: Transaction =
+            deserialize(&raw).map_err(|_| anyhow::anyhow!("{what}: tier tx does not parse"))?;
+        if tx.txid().to_string() != tier.txid {
+            return Err(anyhow::anyhow!(
+                "{what}: stored tier tx hashes to {} but the bundle names {}",
+                tx.txid(),
+                tier.txid
+            ));
+        }
+        let out = tier.payload_out(&tx, what)?;
+        if out.value != tier.out_value {
+            return Err(anyhow::anyhow!(
+                "{what}: declared out_value {} disagrees with the transaction's {} at vout {}",
+                tier.out_value,
+                out.value,
+                tier.payload_vout
+            ));
+        }
+        Ok((out.value, hex::encode(out.script_pubkey.as_bytes())))
     }
 }
 
@@ -967,33 +1136,11 @@ pub fn refuse_uncolored_over_colored(bundle: &TesrBundle, what: &str) -> Result<
 // free, because a tier's txid is stable across signing.
 // =================================================================================================
 
-/// The PAYLOAD output of an already-built tier, as `(value, scriptPubKey hex)` — read from the
-/// transaction, never from the declared `out_value`. A coloured child needs both: the value feeds the
-/// fee arithmetic and the taproot sighash, the script is the prevout rgb-lib must see.
-fn tier_payload_prevout(tier: &TesrTier, what: &str) -> Result<(u64, String)> {
-    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
-    let raw = hex::decode(&tier.signed_tx)
-        .map_err(|_| anyhow::anyhow!("{what}: tier hex does not decode"))?;
-    let tx: Transaction =
-        deserialize(&raw).map_err(|_| anyhow::anyhow!("{what}: tier tx does not parse"))?;
-    if tx.txid().to_string() != tier.txid {
-        return Err(anyhow::anyhow!(
-            "{what}: stored tier tx hashes to {} but the bundle names {}",
-            tx.txid(),
-            tier.txid
-        ));
-    }
-    let out = tier.payload_out(&tx, what)?;
-    if out.value != tier.out_value {
-        return Err(anyhow::anyhow!(
-            "{what}: declared out_value {} disagrees with the transaction's {} at vout {}",
-            tier.out_value,
-            out.value,
-            tier.payload_vout
-        ));
-    }
-    Ok((out.value, hex::encode(out.script_pubkey.as_bytes())))
-}
+// `tier_payload_prevout` — the builders' payload accessor — used to live here. It moved into `mod
+// linked` beside `TesrTier::payload_out`, so that the raw accessor has ZERO users outside that
+// module and the encapsulation is a fact about the code rather than a convention. Its contract and
+// the trusted-vs-untrusted argument are documented on the function itself; the four call sites in
+// this section are unchanged.
 
 /// A COLOURED replacement STATE, built but NOT co-signed — the receiver-paying `S'` of a coloured
 /// transfer, or any other state that rivals the current one over the extension's payload output.
@@ -5331,9 +5478,9 @@ fn verify_bundle_ex(
     // The trigger must pay `A` on its declared PAYLOAD output (`payload_vout`, 0 today). Reading the
     // payload through the accessor rather than `output[0]` is what keeps this check meaningful once a
     // coloured tier carries an opret at index 0 — and a bogus declared index fails closed right here.
-    if tiers[0].payload_out(t, "trigger")?.script_pubkey != agg_spk {
-        return Err(anyhow::anyhow!("trigger does not pay the aggregate key A"));
-    }
+    // This is PIN 2; the trigger's value is not read from it (the value loop below uses the stronger
+    // PIN 1 the structural loop produces), so the `LinkedPayload` is discharged rather than kept.
+    tiers[0].link_pays(t, &agg_spk, "trigger", "trigger does not pay the aggregate key A")?;
     // [B1] The trigger's DECLARED timelock must be the one it was signed with — `None`, since
     // `TRIGGER_SEQUENCE` disables the relative lock. A trigger declaring a CSV it does not carry
     // would inflate the exit-headroom requirement rather than shrink it, but the binding is not a
@@ -5348,14 +5495,21 @@ fn verify_bundle_ex(
     // 2. Each later tier spends its parent's PAYLOAD output, within schedule bounds, paying A (or the
     //    owner if final).
     let p = &bundle.params;
+    // The parent-side product of this loop: `parent_links[j]` is tier `j`'s payload output TOGETHER
+    // WITH the proof that tier `j+1` spends exactly it. The value loop below indexes this instead of
+    // re-deriving the output from `payload_vout`, which is what makes the check-ordering defect
+    // unwritable rather than merely commented-against — see `mod linked`. Coverage is exact: the
+    // value law needs the payload of every tier that funds another, i.e. `0..txs.len()-1`, and that
+    // is precisely the set this loop links.
+    let mut parent_links: Vec<LinkedPayload> = Vec::with_capacity(txs.len().saturating_sub(1));
     for i in 1..txs.len() {
         let tx = &txs[i];
-        if tx.input.len() != 1
-            || tx.input[0].previous_output.txid != txs[i - 1].txid()
-            || tx.input[0].previous_output.vout != tiers[i - 1].payload_vout
-        {
-            return Err(anyhow::anyhow!("tier {i} does not spend its parent's payload output"));
-        }
+        parent_links.push(tiers[i - 1].link_child(
+            &txs[i - 1],
+            tx,
+            &format!("tier {}", i - 1),
+            &format!("tier {i} does not spend its parent's payload output"),
+        )?);
         let seq = tx.input[0].sequence.0;
         if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
             return Err(anyhow::anyhow!("tier {i} is not a BIP-68 block relative-timelock"));
@@ -5401,19 +5555,28 @@ fn verify_bundle_ex(
             // verify_child_bundle (A_child == SP.out[j]). Skip the single-owner payee check here.
         } else {
             let want = if is_final { &owner_spk } else { &agg_spk };
-            if &tiers[i].payload_out(tx, &format!("tier {i}"))?.script_pubkey != want {
-                return Err(anyhow::anyhow!("tier {i} pays the wrong output"));
-            }
+            // PIN 2 again. For a non-final tier this duplicates what PIN 1 already established one
+            // iteration later; for the FINAL tier it is the only pin there can be, since nothing
+            // spends it. Discharged either way — the value loop reads parents, never this.
+            tiers[i].link_pays(
+                tx,
+                want,
+                &format!("tier {i}"),
+                &format!("tier {i} pays the wrong output"),
+            )?;
         }
     }
 
     // ═══ [VALUE-CONSERVATION] THE ROOT LADDER, TIER BY TIER ═══
     //
-    // ORDERING IS DELIBERATE: this runs AFTER the structural loop above, not before it. Placed first,
-    // it shadowed the specific "tier N pays the wrong output" refusal with a generic arithmetic one —
-    // a wrong `payload_vout` makes this law read the P2A anchor as the funding value and fail on the
-    // NEXT tier, so the message named the wrong tier and the wrong cause. The structural checks are
-    // the better diagnostics; this is the check that catches what they cannot see.
+    // ORDERING IS DELIBERATE, AND IS NOW ENFORCED BY THE TYPE. This runs AFTER the structural loop
+    // above, not before it. Placed first, it shadowed the specific "tier N pays the wrong output"
+    // refusal with a generic arithmetic one — a wrong `payload_vout` makes this law read the P2A
+    // anchor as the funding value and fail on the NEXT tier, so the message named the wrong tier and
+    // the wrong cause. The structural checks are the better diagnostics; this is the check that
+    // catches what they cannot see. The funding term below is `parent_links[i-1].value()`, and a
+    // `LinkedPayload` can only be produced BY the structural loop — so moving this block above it no
+    // longer reads the anchor, it fails to compile. See `mod linked`.
     //
     //
     // **A CORRECTION.** Commit 4e165e6 bound the split CHILD's chain and argued this lane did not
@@ -5478,9 +5641,10 @@ fn verify_bundle_ex(
                     None => continue,
                 }
             } else {
-                tiers[i - 1]
-                    .payload_out(&txs[i - 1], &format!("tier {}", i - 1))?
-                    .value
+                // The ONLY way this function can obtain a tier's payload value: a `LinkedPayload`
+                // minted by the structural loop above, which proves tier `i` really spends it. There
+                // is no expression here that could be written before that loop ran.
+                parent_links[i - 1].value()
             };
             let is_final = i == txs.len() - 1;
             // How this hop names itself in a refusal. Tier 0's funding is the chain's, not another
@@ -5934,7 +6098,6 @@ pub fn verify_child_bundle(
         }
         verify_tier_cosigned(&ext_tx, fund_out.value, &seg_spk)
             .map_err(|e| anyhow::anyhow!("ancestor {i}: extension not co-signed by its aggregate: {e}"))?;
-        let ext0 = seg.extension.payload_out(&ext_tx, &format!("ancestor {i} extension"))?.clone();
         // WHERE IT PAYS. A co-sign proves what a tier SPENDS, never what it PAYS — and this segment's
         // state is about to have its own co-sign verified against a prevout SYNTHESISED as
         // `TxOut { value: ext0.value, script_pubkey: seg_spk }`. If the real `ext0` pays someone
@@ -5949,12 +6112,20 @@ pub fn verify_child_bundle(
         // matches nothing. The check then refused every honest ancestor bundle (sdk11 and sdk17
         // caught it). Precisely the swallow shape the repo's own guard exists for, written into a
         // security check by the person who keeps citing that guard.
-        if ext0.script_pubkey != seg_spk {
-            return Err(anyhow::anyhow!(
+        //
+        // This is PIN 2, and it is what licenses reading `ext0.value()` below — the ancestor
+        // extension's payload output is not linked to its state until further down, so the payee is
+        // the structural fact this segment's value chain rests on. Expressed as a `link_pays` so the
+        // value cannot be reached without it.
+        let ext0 = seg.extension.link_pays(
+            &ext_tx,
+            &seg_spk,
+            &format!("ancestor {i} extension"),
+            &format!(
                 "ancestor {i}: the extension's payload output does not pay the segment's aggregate \
                  key — every tier below it would be signed against a prevout that does not exist"
-            ));
-        }
+            ),
+        )?;
         // HOW MUCH IT FORWARDS, and THAT NOTHING ELSE LEAVES. Summed over every non-anchor,
         // non-opret output rather than read from `payload_vout`, for the reason spelled out on the
         // root ladder's law: checking one output leaves a window exactly one committed fee wide.
@@ -5994,7 +6165,7 @@ pub fn verify_child_bundle(
                 "ancestor {i}: state does not spend its extension's payload output"
             ));
         }
-        verify_tier_cosigned(&st_tx, ext0.value, &seg_spk)
+        verify_tier_cosigned(&st_tx, ext0.value(), &seg_spk)
             .map_err(|e| anyhow::anyhow!("ancestor {i}: state not co-signed by its aggregate: {e}"))?;
         // CSV bounds for both tiers — and [B1] the declared field bound to the signed one, so an
         // intermediate segment cannot understate the depth cost of the chain it sits in.
@@ -6138,9 +6309,6 @@ pub fn verify_child_bundle(
         )?;
     }
 
-    // state_child spends ext_child's PAYLOAD output, co-signed by A_child.
-    let ext_out0 = cb.child_extension.payload_out(&ext_tx, "child extension")?;
-
     // ═══ [VALUE-CONSERVATION] EVERY TIER MUST FORWARD ITS FUNDING MINUS EXACTLY ONE RUNG ═══
     //
     // THE DEFECT this closes, demonstrated against this very function rather than argued: a sender
@@ -6202,18 +6370,25 @@ pub fn verify_child_bundle(
         &hex::decode(&cb.child_state.signed_tx).map_err(|_| anyhow::anyhow!("bad child state hex"))?,
     )
     .map_err(|_| anyhow::anyhow!("child state is not a transaction"))?;
-    let st_in = st_tx.input.first().ok_or_else(|| anyhow::anyhow!("child state has no input"))?;
-    if st_tx.input.len() != 1
-        || st_in.previous_output.txid != ext_tx.txid()
-        || st_in.previous_output.vout != cb.child_extension.payload_vout
-    {
-        return Err(anyhow::anyhow!("child state does not spend ext_child's payload output"));
+    if st_tx.input.is_empty() {
+        return Err(anyhow::anyhow!("child state has no input"));
     }
+    // state_child spends ext_child's PAYLOAD output — PIN 1, and the ONLY door to `ext_out0`.
+    //
+    // This binding used to sit ~70 lines above, before `st_tx` was even parsed, and every value check
+    // below it read the payload at the DECLARED `payload_vout`. On a bundle whose vout is tampered
+    // they computed on the P2A anchor and refused on VALUE, shadowing the accurate structural cause
+    // that this very check states (sdk70 D1 pins that message). The fix was a comment saying "all of
+    // them must sit BELOW the structural check" — and then one check was moved and its two
+    // neighbours were left behind. Now the structural check MAKES the value: there is no `ext_out0`
+    // until `link_child` has returned one, so the ordering cannot be got wrong again.
+    let ext_out0 = cb.child_extension.link_child(
+        &ext_tx,
+        &st_tx,
+        "child extension",
+        "child state does not spend ext_child's payload output",
+    )?;
 
-    // Every check below reads `payload_out` at the DECLARED `payload_vout`, so all of them must
-    // sit BELOW the structural linkage check above — a tampered vout otherwise makes them compute
-    // on the P2A anchor and refuse on VALUE, hiding the accurate structural cause. sdk70 D1 pins
-    // that message. Moving one of them and leaving its neighbours is how this recurred twice.
     let expect_ext = rung_forward(sp_out.value, "child extension")?;
     // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, not just
     // `out[payload_vout]`: pinning one output leaves a window exactly one committed fee wide for a
@@ -6234,23 +6409,18 @@ pub fn verify_child_bundle(
             sp_out.value
         ));
     }
-    if ext_out0.value != expect_ext {
+    if ext_out0.value() != expect_ext {
         return Err(anyhow::anyhow!(
             "child extension is funded with {} sat but forwards only {} to its payload output \
              (expected exactly {expect_ext} = funding − one rung at {} sat/vB) — {} sat would be \
              skimmed to another output while the receiver is credited the funding value",
             sp_out.value,
-            ext_out0.value,
+            ext_out0.value(),
             cb.parent.fee_rate,
-            sp_out.value.saturating_sub(ext_out0.value + (sp_out.value - expect_ext)),
+            sp_out.value.saturating_sub(ext_out0.value() + (sp_out.value - expect_ext)),
         ));
     }
 
-    // ORDERING, and this is the THIRD time in this file: the declared-vs-signed `out_value` check
-    // below reads `payload_out` at the DECLARED vout, so on a bundle whose `payload_vout` is
-    // tampered it reads the P2A anchor (240 sat) and refuses on VALUE — shadowing the structural
-    // "child state does not spend ext_child's payload output" refusal just above, which is the
-    // accurate diagnosis. sdk70 D1 pins that message. Structural checks first, always.
     // The DECLARED field too, symmetrically with the state's `[value-gate spoof]` check below. The
     // conservation law above pins the SIGNED value; this pins the field that travels beside it, and
     // they are different properties. `child_in_ladder_split` later feeds `cb.child_extension
@@ -6258,12 +6428,12 @@ pub fn verify_child_bundle(
     // disagrees with its own transaction makes the receiver's OWN next split sign against a sighash
     // committing to an amount the transaction does not carry — a signature that verifies against
     // nothing, discovered only after `set_spend_budget` has terminalized the coin.
-    if ext_out0.value != cb.child_extension.out_value {
+    if ext_out0.value() != cb.child_extension.out_value {
         return Err(anyhow::anyhow!(
             "child extension out[{}] carries {} sat but the bundle declares out_value {} — the \
              declared value is what later splits of this child would compute and sign against",
             cb.child_extension.payload_vout,
-            ext_out0.value,
+            ext_out0.value(),
             cb.child_extension.out_value
         ));
     }
@@ -6272,13 +6442,13 @@ pub fn verify_child_bundle(
     // `TxOut { value: ext_out0.value, script_pubkey: child_agg_spk }`. If the real payload output
     // pays another key, the state is signed against a prevout that does not exist — unbroadcastable
     // forever, while whoever holds the real key sweeps the child once the extension confirms.
-    if ext_out0.script_pubkey != child_agg_spk {
+    if ext_out0.script_pubkey() != &child_agg_spk {
         return Err(anyhow::anyhow!(
             "child extension's payload output does not pay A_child — the child state below it would \
              be signed against a prevout that does not exist"
         ));
     }
-    verify_tier_cosigned(&st_tx, ext_out0.value, &child_agg_spk)
+    verify_tier_cosigned(&st_tx, ext_out0.value(), &child_agg_spk)
         .map_err(|e| anyhow::anyhow!("child state not co-signed by A_child: {e}"))?;
     // [F4] child state CSV: a valid BIP-68 block relative-timelock within the state schedule.
     {
@@ -6306,10 +6476,17 @@ pub fn verify_child_bundle(
         .map_err(|_| anyhow::anyhow!("receiver backup address wrong network"))?
         .script_pubkey();
     let recv_key = taproot_key_hex(recv_spk.as_bytes())?;
-    let st_out0 = cb.child_state.payload_out(&st_tx, "child state")?;
-    if taproot_key_hex(st_out0.script_pubkey.as_bytes())? != recv_key {
-        return Err(anyhow::anyhow!("child state does not pay the receiver's key (Model A violated)"));
-    }
+    // PIN 2′, and the only pin available on this tier: the child state is TERMINAL, so nothing spends
+    // its payload output and there is no `link_child` to be had. Model A — "the last state pays the
+    // receiver's own key" — is therefore what licenses reading its value below, and the two checks
+    // that do (`out_value` agreement and the second conservation hop) can no longer be written above
+    // it, because `st_out0` does not exist until it has passed.
+    let st_out0 = cb.child_state.link_pays_taproot_key(
+        &st_tx,
+        &recv_key,
+        "child state",
+        "child state does not pay the receiver's key (Model A violated)",
+    )?;
     // [value-binding — child value-gate spoof] Bind the receiver-paying output's VALUE to the bundle's
     // declared `out_value`. `verify_tier_cosigned` binds the co-sign to the INPUT amount, not the
     // output split, and the blind SE co-signs ANY output distribution — so without this a payer crafts
@@ -6319,10 +6496,10 @@ pub fn verify_child_bundle(
     // be the receiver payment by the key check above (a P2A anchor or change can only be a LATER
     // output), so binding `out[0].value == out_value` makes `verify_conveyed_child`'s returned value
     // trustworthy. Live on the shipped child census (sdk59), not just non-exact LN.
-    if st_out0.value != cb.child_state.out_value {
+    if st_out0.value() != cb.child_state.out_value {
         return Err(anyhow::anyhow!(
             "child state out[0] pays {} sat but the bundle declares out_value {} — value-gate spoof",
-            st_out0.value, cb.child_state.out_value
+            st_out0.value(), cb.child_state.out_value
         ));
     }
     // [VALUE-CONSERVATION, second hop] The declared/signed agreement above is NOT the same property:
@@ -6330,14 +6507,14 @@ pub fn verify_child_bundle(
     // moving it one tier down works identically — an extension that forwards the full amount and a
     // state that pays the payee 510 while sending the rest to a second output is the same theft with
     // the same receiver-side booking.
-    let expect_state = rung_forward(ext_out0.value, "child state")?;
-    if st_out0.value != expect_state {
+    let expect_state = rung_forward(ext_out0.value(), "child state")?;
+    if st_out0.value() != expect_state {
         return Err(anyhow::anyhow!(
             "child state is funded with {} sat but pays the receiver only {} \
              (expected exactly {expect_state} = funding − one rung at {} sat/vB) — the remainder \
              would leave the receiver's exit chain entirely",
-            ext_out0.value,
-            st_out0.value,
+            ext_out0.value(),
+            st_out0.value(),
             cb.parent.fee_rate,
         ));
     }
@@ -6364,7 +6541,7 @@ pub fn verify_child_bundle(
             "child state is funded with {} sat but its payload outputs carry {st_payload_total} \
              (expected exactly {expect_state}) — a surplus output makes the tier unbroadcastable and \
              strands the child, while the receiver is credited the funding value",
-            ext_out0.value
+            ext_out0.value()
         ));
     }
 
@@ -6759,6 +6936,192 @@ mod uncoloured_builder_census {
             "`establish` has gained RGB awareness — the exemption in GUARD_EXEMPT is now wrong and \
              the carrier decision may no longer be entirely upstream"
         );
+    }
+}
+
+/// **THE ORDERING INVARIANT, source-level half: a declared `payload_vout` becomes an output in
+/// exactly one module.**
+///
+/// [`LinkedPayload`] makes "value law before linkage check" a compile error for anything that goes
+/// through `TesrTier`. It cannot make `tx.output[tier.payload_vout as usize]` a compile error —
+/// `payload_vout` is a `pub` field, that expression is ordinary Rust, and it is how every test in
+/// this file reads a payload. So the type closes the door and this closes the window: without it the
+/// class simply reappears in a shape the type cannot see.
+///
+/// A grep over this module's own source, deliberately, and for the same reason as
+/// [`uncoloured_builder_census`]: the hazard is a value check somebody adds LATER, which no
+/// behavioural test can anticipate. `mod linked`'s own unit behaviour is exercised by the adversarial
+/// suites; this proves the set of places that may take the step is still exactly one.
+///
+/// **What it does NOT catch, stated so nobody mistakes its reach:** an alias (`let outs =
+/// &tx.output;` then `outs[…]`), a helper in another file, or a value laundered through a `u64`
+/// before the law reads it. It catches the direct shape — which is the one all four incidents took,
+/// and the one a hurried author writes.
+#[cfg(test)]
+mod payload_vout_access_census {
+    /// Everything before the first top-level `#[cfg(test)]` — the production half of this file. The
+    /// non-vacuity assertions below must run against this and not the whole file, or the string
+    /// literals in this very module would satisfy them.
+    fn production_half(src: &str) -> &str {
+        match src.find("\n#[cfg(test)]") {
+            Some(at) => &src[..at + 1],
+            None => src,
+        }
+    }
+
+    /// `(line number, line)` for every production line that turns a declared `payload_vout` into an
+    /// output OUTSIDE `mod linked`. Pure and total over an arbitrary source string, so the planted
+    /// cases below can drive the detector itself rather than trusting it.
+    fn unlinked_payload_reads(src: &str) -> Vec<(usize, String)> {
+        let mut hits: Vec<(usize, String)> = Vec::new();
+        let mut in_linked = false;
+        for (n, line) in src.lines().enumerate() {
+            // Test code is exempt: a test builds the bundle it is attacking and holds both key
+            // halves, so there is no attacker-supplied index to defend against.
+            if line.starts_with("#[cfg(test)]") {
+                break;
+            }
+            if line.starts_with("mod linked {") {
+                in_linked = true;
+                continue;
+            }
+            if in_linked {
+                // The module is top-level, so its closing brace is the next column-0 `}`.
+                if line == "}" {
+                    in_linked = false;
+                }
+                continue;
+            }
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let hand_rolled = line.contains("payload_vout")
+                && (line.contains(".output")
+                    || line.contains("output[")
+                    || line.contains("output.get("));
+            if line.contains("payload_out(") || hand_rolled {
+                hits.push((n + 1, line.to_string()));
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn a_declared_payload_vout_becomes_an_output_only_inside_mod_linked() {
+        let src = include_str!("tesr.rs");
+        let prod = production_half(src);
+
+        // Non-vacuity, part 1: the module, the private accessor and the builders' door are all still
+        // where this census thinks they are. If any of these drifts, the scan below would pass by
+        // scanning nothing meaningful — which is worse than failing.
+        assert!(prod.contains("\nmod linked {"), "`mod linked` is gone — this census is now vacuous");
+        assert!(
+            prod.contains("fn payload_out<'a>(&self, tx: &'a Transaction, what: &str)"),
+            "the private accessor has been renamed or moved out of `mod linked`"
+        );
+        assert!(
+            prod.contains("pub(super) fn tier_payload_prevout("),
+            "the builders' trusted door has left `mod linked` — the raw accessor now has a second \
+             user and the encapsulation argument no longer holds"
+        );
+
+        // Non-vacuity, part 2: each constructor is DEFINED and actually CALLED. A guarded abstraction
+        // nobody uses would let every verifier quietly go back to hand-rolling the index. The call
+        // pattern carries a leading `.`, which the definition does not, so one occurrence of it is
+        // one real call site.
+        for ctor in ["link_child", "link_pays", "link_pays_taproot_key"] {
+            assert!(
+                prod.contains(&format!("pub(super) fn {ctor}<'a>(")),
+                "`{ctor}` is no longer defined in `mod linked`"
+            );
+            assert!(
+                prod.matches(&format!(".{ctor}(")).count() >= 1,
+                "`{ctor}` is defined but has no production call site — a verifier has stopped \
+                 pinning its payload, which is exactly the regression this census exists to see"
+            );
+        }
+
+        let hits = unlinked_payload_reads(src);
+        assert!(
+            hits.is_empty(),
+            "these production lines turn a declared `payload_vout` into an output outside \
+             `mod linked`, which is how the four check-ordering defects were written: {hits:#?}"
+        );
+    }
+
+    /// A guard that cannot fail is decoration. These are the shapes the four incidents took —
+    /// replanted — plus the hand-rolled index that is the type's blind spot and this census's whole
+    /// reason to exist.
+    #[test]
+    fn the_census_catches_each_shape_it_was_written_for() {
+        let cases = [
+            (
+                "root value law re-derives the parent's payload",
+                r#"
+fn verify_bundle_ex() {
+    let prev_payload = tiers[i - 1].payload_out(&txs[i - 1], "tier")?.value;
+}
+"#,
+            ),
+            (
+                "leaf declared-out_value check reads the declared vout",
+                r#"
+fn verify_child_bundle() {
+    let ext_out0 = cb.child_extension.payload_out(&ext_tx, "child extension")?;
+}
+"#,
+            ),
+            (
+                "hand-rolled index — the escape the type cannot see",
+                r#"
+fn verify_child_bundle() {
+    let out = ext_tx.output[cb.child_extension.payload_vout as usize].clone();
+}
+"#,
+            ),
+            (
+                "...and its `get` spelling",
+                r#"
+fn verify_child_bundle() {
+    let out = st_tx.output.get(cb.child_state.payload_vout as usize).unwrap();
+}
+"#,
+            ),
+        ];
+        for (tag, body) in cases {
+            assert!(
+                !unlinked_payload_reads(body).is_empty(),
+                "planted shape `{tag}` was NOT caught — the census would not have caught the \
+                 defects it was written for"
+            );
+        }
+    }
+
+    /// ...and it must not cry wolf, or it just pushes people back to the hand-rolled index.
+    #[test]
+    fn the_census_accepts_the_corrected_shapes() {
+        let body = r#"
+mod linked {
+    impl TesrTier {
+        fn payload_out<'a>(&self, tx: &'a Transaction, what: &str) -> Result<&'a TxOut> {
+            tx.output.get(self.payload_vout as usize).ok_or_else(|| anyhow::anyhow!("{what}"))
+        }
+    }
+}
+
+fn verify_bundle_ex() {
+    // A hand-rolled tx.output[tier.payload_vout as usize] named in a COMMENT is documentation.
+    let link = tiers[i - 1].link_child(&txs[i - 1], tx, "tier 0", "tier 1 does not spend it")?;
+    let prev_payload = link.value();
+    // Comparing the declared vout to a prevout, or keying a census map by it, reads no output.
+    if tx.input[0].previous_output.vout != tiers[i - 1].payload_vout {
+        return Err(anyhow::anyhow!("no"));
+    }
+    live.insert((ext_tx.txid(), cb.child_extension.payload_vout), seq);
+}
+"#;
+        let hits = unlinked_payload_reads(body);
+        assert!(hits.is_empty(), "the corrected shapes were flagged: {hits:#?}");
     }
 }
 
