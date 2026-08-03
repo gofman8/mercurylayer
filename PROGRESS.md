@@ -65,6 +65,38 @@ Delegating to a third-party tower protected only un-laddered coins, silently. No
 per-entry blindness (`WatchState::Acted.blind` + `any_blindness()`) so an unevaluable entry can never
 report `Idle`, and 4 new tests including a non-vacuity control and old-bundle compatibility.
 
+## 2026-08-03 — the value-conservation class (took priority over CATS-B)
+
+A workflow launched to plan CATS-B change 2 instead found a **live theft-class defect at HEAD**,
+proven by running it against the shipped verifier. Six commits:
+
+| commit | what |
+|---|---|
+| `4e165e6` | child lane, both hops bound to `prev − one rung` — the proven skim |
+| `a063e3f` | the extension's declared `out_value` bound to its signed output |
+| `9c00140` | §4.5 correction: the census does **not** close sender-declared segment shape |
+| `deed25c` | root ladder bound too — correcting my own scoping in `4e165e6` |
+| `d692c07` | WHERE-it-pays + Σ-outputs, on the ancestor and leaf hops |
+| `2ad2b2d` | the fee-rate **yardstick** — without it all of the above are bypassable |
+
+**The generative rule.** `verify_tier_cosigned` binds a tier's INPUT amount and says nothing about
+how that amount is split across outputs — and the SE is blind, so it signs any distribution by
+design. "Genuinely co-signed" never implies "pays the right key" or "forwards the right amount".
+`docs/utexo/VALUE-CONSERVATION-SWEEP.md` §1 has the four-property checklist; pinning three is worth
+nothing, which finding 5 proved.
+
+### Still open
+
+* Sweep findings **4, 6, 7** — SSP pre-pay gates and the claim-path booking. All downstream of the
+  bindings above, so re-test them against these rather than patching independently.
+* **`ci-guards` has a hole this session walked into.** I wrote `hex::decode(..).unwrap_or_default()`
+  inside a new security check; it compiled, always failed, and refused every honest ancestor bundle
+  (sdk11/sdk17 caught it). The guard's patterns cover `.await.unwrap_or(` and deliberately EXCLUDE
+  bare `.unwrap_or_default()` as "overwhelmingly Option, not Result". Here it was a Result, in a
+  verifier. Widening the pattern is a change to the guard's own precision — decide it on its merits,
+  do not allowlist around it.
+* **CATS-B change 2** — untouched. See below; the research is done and the plan is sound.
+
 ## Queue item 5 — CATS-B, in progress
 
 **The SPINE TIER is landed and verified** (commit after `09ec773`). `SPINE_CSV = 0` is signed by all
