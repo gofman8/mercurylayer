@@ -367,6 +367,49 @@ segment **shape sender-declared**. It still fails closed via the exact-equality 
 tier leaves `expected` one short of `num_sigs`), but that is where the adversarial E2E budget must
 go, not at the race check.
 
+> ### ⚠️ CORRECTION (2026-08-03) — the sentence above is WRONG, and the reason matters
+>
+> **"A dropped tier leaves `expected` one short of `num_sigs`" is false.** A dropped tier is not
+> lost. The sender re-declares it in `superseded_extensions`, where `verify_superseded_segment`
+> counts it (it returns `sups.len()`), and `expected` moves by exactly the same 1 in the opposite
+> direction. `CHILD_V2_BASELINE + 1 + 1` and `CHILD_V2_BASELINE + 2 + 0` are the same number for
+> the same segment. **The census re-balances exactly, every co-sign is real, and every other check
+> passes.** Three independent adversarial lenses reached this conclusion separately.
+>
+> Today the attack is blocked by something else entirely: `live_ids` contains BOTH tier txids, so
+> the [C-2] dedup refuses any attempt to also disclose the extension as superseded. **V1's `None`
+> branch takes the extension out of `live_ids` and un-blocks it.** The defence that is about to be
+> removed is not the one this section credits.
+>
+> What actually closes sender-declared shape, and what must therefore be implemented deliberately
+> rather than inherited:
+>
+> 1. **The prevout re-anchor.** In the `None` branch, require the surviving tier to spend the
+>    segment's own **funding outpoint** — `st_in.previous_output == (fund_txid, seg.funding_vout)`.
+>    A genuine two-tier segment's state spends `ext.out[0]`, so it cannot be re-labelled. This is
+>    the single load-bearing check, and it is *derived from a signature*: the outpoint is committed
+>    by the taproot `SIGHASH_ALL` sighash, so it cannot be repointed without invalidating the SE's
+>    own signature. Per `ADMISSION-INPUTS.md`, that makes shape **derived**, not **declared** — the
+>    `Option` becomes a cross-checked declaration that must agree, never the source of truth.
+> 2. **The `[0,0]` CSV pin** stays exactly disjoint from `[e_floor, e0]`. Note `[144,720]` is a
+>    strict *subset* of `[144,1440]`, so extension-vs-state was **never** CSV-separable; only the
+>    spine's `[0,0]` is disjoint from both, which is why widening it for the `None` case destroys
+>    the last structural layer.
+> 3. **The dead knob.** Child-side `superseded_extensions` has no honest writer. Refuse a non-empty
+>    list whenever `extension.is_none()`. Free, independent of (1), and it closes the re-declaration
+>    route directly.
+>
+> Without (1) the concrete consequence is **P0-1 re-opened through a new door**: a real
+> `[ext 720, state 1440]` segment declared as a spine loses 721 blocks from its declared exit chain,
+> and `check_exit_headroom` admits a child near the epoch boundary whose real exit cannot finish.
+>
+> Also corrected: **V1 must not be applied to the conveyed leaf.** At the leaf the two ranges
+> overlap completely, so nothing CSV-based separates a cap from an extension there — only the
+> Model-A payee check does, which is far more weight than that check was designed to carry. A
+> conveyed piece stays strictly two-tier; the spine tip is never conveyed and gets its own record
+> (V4). And **V1 must land in the same commit as V2**: the literal `2` against a one-tier bundle is
+> a free census slot, and that mismatch fails *open*.
+
 **Census, K-invariant, exact equality holds:**
 
 - *root slot* — `SP_1` is the terminal state; `S_0` and prior states are superseded, all with
