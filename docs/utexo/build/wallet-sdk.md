@@ -153,15 +153,23 @@ let r = wallet.transfer(&bob_address, 15_000).await?;
 
 ### The in-ladder admission floor
 
-Both the piece and the change must be at least `min_child_value` — **1306 sat at the default
-2 sat/vB** — because each child funds its **own** extension + state tier before its final output can
-clear the 330-sat dust limit. (The un-laddered `min_split_output` floor — dust + the sub-coin's own
-backup fee — also applies; the larger binds.) The SDK refuses up front rather than terminalizing the
-parent and failing afterwards:
+**Two legs, two floors** (`split_output_floors` → `SplitFloors { piece, change }`). A payee's
+**piece** must clear `min_child_value` — **1310 sat at the default 2 sat/vB** — because a piece funds
+its **own** extension + state tier before its final output can clear the 330-sat dust limit. The
+sender's **change** clears whatever floor matches the shape the builders actually give it, reported
+by `mercuryrustlib::tesr::change_leg_role()`: today that is the same two-tier child, so the two
+floors are equal; under CATS change 2 the change becomes a one-cap **spine tip** and its floor drops
+to `min_spine_tip_value` = **820 sat** (906 coloured). One shared number could only reach 820 by
+lowering the *piece's* floor with it, which admits a piece that cannot fund its second rung — and
+that is discovered inside `establish_child`, after the parent has been terminalized. (The un-laddered
+`min_split_output` floor — dust + the sub-coin's own backup fee — also applies to each leg; the
+larger binds.) The SDK refuses up front rather than terminalizing the parent and failing afterwards:
 
 ```
-in-ladder split needs both piece (900) and change (…) >= 1306 sat
-(each child funds its own extension + state tier at 2 sat/vB, then must clear the 330-sat dust floor)
+in-ladder split refused — the piece falls short. The payee's piece (900) must be >= 1310 sat
+(it funds its own extension + state rungs) and the change (…) must be >= 1310 sat (the change is
+built as a two-tier child today, so it funds an extension + a state rung too); both must then clear
+the 330-sat dust floor. The split total is …
 ```
 
 ### Quoting

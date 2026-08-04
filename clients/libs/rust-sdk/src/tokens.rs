@@ -1448,6 +1448,14 @@ impl UtexoWallet {
     ///
     /// Same fail-closed reading as its sibling: an unreadable table is an `Err`, and a `ctesr-` row
     /// that will not deserialize counts as NOT coloured, so that child stays refused.
+    ///
+    /// **[CATS/V4] It also covers COLOURED SPINE TIPS (`spinetip-` rows).** A tip is a carrier by
+    /// exactly the same argument — its allocation sits on the un-broadcast `SP.out[K]`, which
+    /// `token_carrier_outpoints` reports — and it has a pre-signed walk that MOVES that allocation
+    /// to the owner's own key, one tier shorter than a child's. This set is what `unilateral_exit`
+    /// consults to decide which carriers may walk at all, so a missed prefix here is not a missed
+    /// optimisation: the sender's own coloured change becomes the one carrier class that can never
+    /// exit, refused by the very guard CTES-R opened.
     pub(crate) async fn colored_child_sids(&self) -> Result<std::collections::HashSet<String>> {
         Ok(mercuryrustlib::sqlite_manager::get_all_backup_txs(
             &self.inner.cc.pool,
@@ -1462,9 +1470,13 @@ impl UtexoWallet {
         })?
         .into_iter()
         .filter_map(|(key, json)| {
-            let sid = key.strip_prefix("ctesr-")?.to_string();
-            let cb: mercuryrustlib::tesr::ChildTesrBundle = serde_json::from_str(&json).ok()?;
-            cb.is_colored().then_some(sid)
+            if let Some(sid) = key.strip_prefix("ctesr-") {
+                let cb: mercuryrustlib::tesr::ChildTesrBundle = serde_json::from_str(&json).ok()?;
+                return cb.is_colored().then_some(sid.to_string());
+            }
+            let sid = key.strip_prefix(mercuryrustlib::tesr::SPINE_TIP_KEY_PREFIX)?.to_string();
+            let tip: mercuryrustlib::tesr::SpineTipBundle = serde_json::from_str(&json).ok()?;
+            tip.is_colored().then_some(sid)
         })
         .collect())
     }
@@ -3526,7 +3538,7 @@ impl UtexoWallet {
         carrier_amount: u64,
         payouts: &[(String, u64)],
     ) -> Result<Vec<(String, u64)>> {
-        use mercuryrustlib::tesr::{colored_child_floor, ColoredSplitChildSpec, COLORED_LADDER_DUST};
+        use mercuryrustlib::tesr::{ColoredSplitChildSpec, COLORED_LADDER_DUST};
 
         if payouts.is_empty() {
             return Err(anyhow!("a coloured in-ladder split needs at least one payout"));
@@ -3629,26 +3641,40 @@ impl UtexoWallet {
             0
         };
         // BOTH floors apply and the larger binds, exactly as `transfer::in_ladder_pay` does it:
-        //  * `colored_child_floor` — a coloured child funds its OWN two coloured rungs and its final
-        //    state output must still clear dust. This is the load-bearing one: the child ladders are
-        //    built AFTER the parent's spend budget is consumed, so admitting a child below it would
-        //    terminalize the carrier and THEN fail, stranding it exit-only;
+        //  * the coloured LADDER floor for that leg's SHAPE — a coloured PIECE funds its OWN two
+        //    coloured rungs (`colored_child_floor`), the sender's CHANGE funds whatever
+        //    `change_leg_role()` says the builder gives it. This is the load-bearing one: the child
+        //    ladders are built AFTER the carrier's spend budget is consumed, so admitting a leg below
+        //    its floor would terminalize the carrier and THEN fail, stranding it exit-only — and on
+        //    this lane "exit-only" also means the allocation's only pre-signed RGB-aware walk;
         //  * `min_split_output` — the generic sub-coin viability floor at the live backup fee rate.
-        let min_output = crate::transfer::min_split_output(
+        //
+        // [V5] PER-LEG, as on the plain lane and for the identical reason: the coloured tip floor is
+        // 576 sat below the coloured piece floor, so one shared number could only carry the tip's
+        // cheaper shape by applying it to every PAYEE too.
+        let backup_floor = crate::transfer::min_split_output(
             crate::transfer::backup_fee_rate(&self.inner.cc).await?,
-        )
-        .max(colored_child_floor(bundle.fee_rate, COLORED_LADDER_DUST));
-        let too_small: Vec<u64> = piece_sats
-            .iter()
-            .copied()
-            .chain((token_change > 0).then_some(change_sats))
-            .filter(|s| *s < min_output)
-            .collect();
+        );
+        let piece_floor =
+            backup_floor.max(mercuryrustlib::tesr::SplitLegRole::Piece
+                .colored_min_value(bundle.fee_rate, COLORED_LADDER_DUST));
+        let change_floor =
+            backup_floor.max(mercuryrustlib::tesr::change_leg_role()
+                .colored_min_value(bundle.fee_rate, COLORED_LADDER_DUST));
+        let too_small: Vec<u64> =
+            piece_sats.iter().copied().filter(|s| *s < piece_floor).collect();
         if !too_small.is_empty() {
             return Err(anyhow!(
-                "coloured in-ladder token split needs every child >= {min_output} sat (each child \
+                "coloured in-ladder token split needs every PIECE >= {piece_floor} sat (each piece \
                  funds its own coloured extension + state tier at {} sat/vB, then must clear the \
                  dust floor); these do not: {too_small:?}",
+                bundle.fee_rate
+            ));
+        }
+        if token_change > 0 && change_sats < change_floor {
+            return Err(anyhow!(
+                "coloured in-ladder token split needs the CHANGE >= {change_floor} sat at {} sat/vB \
+                 (it is {change_sats}); lower the payout or use a larger carrier",
                 bundle.fee_rate
             ));
         }

@@ -365,7 +365,12 @@ pub async fn execute() -> Result<()> {
         lvl.state.csv = Some(1);
     }
     for seg in forged.ancestors.iter_mut() {
-        seg.extension.csv = Some(1);
+        // [CATS] `ChildSegment::extension` is an `Option` — `None` is a SPINE segment, which has one
+        // tier and no extension rung to forge. Forge whatever is there; the point of the fixture is
+        // that ONLY declared fields move, and a segment with no extension has one fewer to move.
+        if let Some(ext) = seg.extension.as_mut() {
+            ext.csv = Some(1);
+        }
         seg.state.csv = Some(1);
     }
     forged.child_extension.csv = Some(1);

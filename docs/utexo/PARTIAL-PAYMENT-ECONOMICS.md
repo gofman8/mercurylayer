@@ -227,10 +227,23 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > — the refusals that enforced it are deleted, and the per-level exit latency falls from 2 124 blocks
 > to 720 (mainnet depth 1: 4 284 → 2 880 blocks; depth 100: 4.08 → 1.41 years).
 >
+> **V1, V2, V4 and V5 are also BUILT.** V1/V2 landed together with the shape DERIVATION the
+> CORRECTION block below demands (the `None` branch requires the surviving tier to spend the
+> segment's own funding outpoint) and the dead-knob refusal. V4 is `SpineTipBundle` under
+> `spinetip-<sid>`, with every fail-open enumerator co-edited — `parent_shape` (a tip is no longer
+> read as un-laddered), `wallet_is_provably_pre_sdk`, `defend_ladders` (its own tower loop, plus the
+> L2 supersession evidence), `colored_child_sids`, `auto_exit_due`, `withdraw` and
+> `unilateral_exit`. V5 is `split_output_floors` → `SplitFloors { piece, change }` with
+> `min_spine_tip_value` = 820 plain / 906 coloured and per-leg refusal text.
+>
 > Still to build: change **2** (the change leg keeps its extension, so it is not yet a one-cap spine
-> tip), change **3** (K > 1 payloads), and V1/V2/V4/V5. Until change 2 lands, a payment still adds
+> tip), and change **3** (K > 1 payloads). Until change 2 lands, a payment still adds
 > `[extension, state]` for the change as well as for the piece, so the Freeze-Lemma bound of §4.0 is
-> approached but not yet attained.
+> approached but not yet attained — and V5's change floor stays at `min_child_value`, because
+> `mercuryrustlib::tesr::change_leg_role()` reports what the BUILDERS emit, not what the design
+> wants. **That function is change 2's single flip point, and flipping it early fails OPEN**: the
+> wallet would admit a change leg at 820 and then fail to build its second rung inside
+> `establish_child`, after `set_spend_budget` has terminalized the parent.
 
 ### 4.0 What cannot be delivered, and why
 
@@ -354,8 +367,8 @@ only depth reset remains the root re-anchor, which a split tree does not have (�
 | V1 | `ChildSegment` becomes `{ extension: Option<TesrTier>, state: TesrTier }` | `clients/libs/rust/src/tesr.rs:365-378` | a spine segment has one tier |
 | V2 | the ancestor expectation `CHILD_V2_BASELINE + 2 + seg_superseded_ok` must derive the `2` from the **disclosed tier count** | `clients/libs/rust/src/tesr.rs:4706` | without it every CATS bundle is rejected outright |
 | V3 | add a **SPINE tier kind** with CSV bounds `[0, 0]` alongside state/extension | `clients/libs/rust/src/tesr.rs:4287` (live), `:4162` (superseded) | **must be a new kind, never a widened state range** — see below |
-| V4 | new persisted bundle key for the sender's spine tip | `clients/libs/rust-sdk/src/wallet.rs:1856-1878` | `withdraw` routes anything keyed `ctesr-` to unilateral exit; the tip must not be mistaken for a leaf |
-| V5 | new floor `min_spine_tip_value = rung + dust = 820`, applied to the **change leg only** | `clients/libs/rust-sdk/src/transfer.rs:1104-1112, 963-976` | the executor currently applies `min_child_value` (1 310) to both legs and refuses payments its own arithmetic permits; the refusal text ("each child funds its own extension + state tier") is also false for a spine child |
+| V4 | new persisted bundle key for the sender's spine tip | `clients/libs/rust/src/tesr.rs` (`SpineTipBundle`, `SPINE_TIP_KEY_PREFIX`) | `withdraw` routes anything keyed `ctesr-` to unilateral exit; the tip must not be mistaken for a leaf. **BUILT** — and the record was the easy half: every site that ENUMERATES ladder artefacts had to be co-edited, because a missed prefix does not produce an absence there, it produces a confident wrong answer (un-laddered, un-managed wallet, not a carrier, nothing to defend) |
+| V5 | new floor `min_spine_tip_value = rung + dust = 820`, applied to the **change leg only** | `clients/libs/rust-sdk/src/transfer.rs` (`split_output_floors`, `inladder_amounts_floored`) | the executor applied `min_child_value` (1 310) to both legs and refused payments its own arithmetic permits; the refusal text ("each child funds its own extension + state tier") is also false for a spine child. **BUILT** as two floors, `SplitFloors { piece, change }` — the split is the point: one number can only reach 820 by lowering the PIECE's floor too, which mints a child that cannot fund its second rung and dies after the parent is terminal |
 
 On V3: the design's own risk ranking previously called the CSV-0 admission a theft primitive. It is
 not — `if sup.csv <= live_csv { reject }` (`clients/libs/rust/src/tesr.rs:4181-4187`) means a

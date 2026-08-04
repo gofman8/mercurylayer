@@ -139,6 +139,34 @@ impl UtexoWallet {
     /// would quote an unfundable payment as fundable and route a laddered coin at un-laddered prices —
     /// exactly the silent-degradation shape.
     pub(crate) async fn parent_shape(&self, statechain_id: &str) -> Result<ParentShape> {
+        // [CATS/V4] THE SPINE TIP, FIRST — and this arm is why the tip needed a record of its own.
+        //
+        // A tip has no `tesr-` row and no `ctesr-` row, so before this arm existed it fell through
+        // every probe below to `Ok(ParentShape::Unladdered)` — a POSITIVE answer, arrived at by
+        // three consecutive absences, and wrong in three ways at once: the cheaper cost model, the
+        // LOWER floor, and a route to `split_coin`, which is the [B1]-unsafe plain split of a coin
+        // that IS laddered. Exactly the silent-degradation shape [B3] made this function
+        // fail-closed for, arriving through a door [B3] did not cover: not a swallowed error, an
+        // unasked question.
+        //
+        // Probed FIRST because it is the narrowest and most specific key. The tip's sid is a fresh
+        // child slot the sender owns; it never carries a `tesr-` row, and it carries a `ctesr-` row
+        // only after it has been handed over — at which point it is no longer this wallet's tip.
+        if let Some(tip) = mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        {
+            return Ok(ParentShape::SpineTip {
+                fee_rate: tip.parent.fee_rate,
+                // The next batch's `SP_{i+1}` spends the tip's own funding outpoint `SP_i.out[K]`,
+                // NOT the cap's output — the cap is the tier being replaced, not the one being
+                // extended.
+                split_source_value: tip.sp_out_value,
+            });
+        }
         if let Some(cb) = mercuryrustlib::tesr::load_child(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -195,7 +223,9 @@ impl UtexoWallet {
         }
         let planning_floor = shapes
             .iter()
-            .map(|s| split_output_floor(backup_rate, *s))
+            // The SMALLEST floor either leg of any candidate imposes — this is advisory, and the
+            // named coin is re-judged per-leg by `split_preflight_pure`, which BINDS.
+            .map(|s| split_output_floors(backup_rate, *s).planning())
             .min()
             // No candidates: the laddered floor stands in, since `claim()` ladders every fresh root
             // coin unconditionally and the laddered case is therefore the default, not the exception.
@@ -289,10 +319,10 @@ impl UtexoWallet {
                     if let Err(why) = &choice.preflight.admission {
                         return Err(anyhow!(
                             "cannot send {amount_sats} sat: no coin can mint the piece. Closest was \
-                             {} on its {} route (per-output floor {}): {why}",
+                             {} on its {} route (per-leg floor {}): {why}",
                             choice.statechain_id,
                             choice.preflight.shape.route(),
-                            choice.preflight.floor
+                            choice.preflight.floors.describe()
                         ));
                     }
                 }
@@ -322,11 +352,11 @@ impl UtexoWallet {
                 // verdict `quote_transfer` reported as `fundable`.
                 if let Err(why) = &choice.preflight.admission {
                     return Err(anyhow!(
-                        "coin {} cannot mint a {}-sat piece on its {} route (per-output floor {}): {why}",
+                        "coin {} cannot mint a {}-sat piece on its {} route (per-leg floor {}): {why}",
                         choice.statechain_id,
                         choice.piece_sats,
                         choice.preflight.shape.route(),
-                        choice.preflight.floor
+                        choice.preflight.floors.describe()
                     ));
                 }
                 let split_coin_id = choice.statechain_id.clone();
@@ -365,6 +395,19 @@ impl UtexoWallet {
                             self.split_coin(&split_coin_id, split_amount).await?;
                         ids.push(piece_id);
                         (ids, true)
+                    }
+                    // [CATS/V4] Unreachable via `plan_payment` — `split_preflight_pure` refuses a
+                    // tip, so the planner never returns one as an ADMISSIBLE split, and the
+                    // admission check twenty lines above would have returned first. Kept as an
+                    // explicit refusal rather than a fallthrough into any other arm: the two arms it
+                    // could plausibly be folded into are the two that would lose the money
+                    // (`split_coin` is the [B1]-unsafe plain split; `in_ladder_pay` would build over
+                    // the wrong outpoint).
+                    ParentShape::SpineTip { .. } => {
+                        return Err(anyhow!(
+                            "coin {split_coin_id} is a SPINE TIP: splitting it is the next spine \
+                             batch, whose builder is not landed. It can still be spent whole."
+                        ));
                     }
                 }
             }
@@ -490,22 +533,22 @@ impl UtexoWallet {
                     choice.preflight.fee_sats,
                     true,
                     format!(
-                        "includes the real {} cost {} sat (piece {} + change {change}, per-output floor {})",
+                        "includes the real {} cost {} sat (piece {} + change {change}, per-leg floor {})",
                         choice.preflight.shape.route(),
                         choice.preflight.fee_sats,
                         choice.piece_sats,
-                    choice.preflight.floor
+                    choice.preflight.floors.describe()
                     ),
                 ),
                 Err(why) => (
                     choice.preflight.fee_sats,
                     false,
                     format!(
-                        "coin {} cannot mint a {}-sat piece on its {} route (per-output floor {}): {why}",
+                        "coin {} cannot mint a {}-sat piece on its {} route (per-leg floor {}): {why}",
                         choice.statechain_id,
                         choice.piece_sats,
                         choice.preflight.shape.route(),
-                        choice.preflight.floor
+                        choice.preflight.floors.describe()
                     ),
                 ),
             },
@@ -519,10 +562,10 @@ impl UtexoWallet {
                 match &choice.preflight.admission {
                     Err(why) => format!(
                         "no coin can mint this amount as a viable split piece (available {available}); \
-                         closest was {} on its {} route (per-output floor {}): {why}",
+                         closest was {} on its {} route (per-leg floor {}): {why}",
                         choice.statechain_id,
                         choice.preflight.shape.route(),
-                        choice.preflight.floor
+                        choice.preflight.floors.describe()
                     ),
                     Ok(_) => format!(
                         "no coin can mint this amount as a viable split piece (available {available})"
@@ -598,7 +641,7 @@ impl UtexoWallet {
         // terminal — so a doomed batch never pins a carrier's spend budget. This is the floor that
         // holds on EVERY route; the in-ladder routes raise it per-parent below (`min_child_value`).
         let backup_rate = backup_fee_rate(&self.inner.cc).await?;
-        let min_output = split_output_floor(backup_rate, ParentShape::Unladdered);
+        let min_output = split_output_floors(backup_rate, ParentShape::Unladdered).piece;
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the minimum viable piece {min_output} (dust floor + backup fee) — it could not fund its own backup"
@@ -629,30 +672,35 @@ impl UtexoWallet {
         let mut chosen: Option<(String, ManyRoute)> = None;
         let mut rejected: Vec<String> = Vec::new();
         for (parent_sats, id) in candidates {
-            // [B2] ONE shape resolution decides the route AND the floor here too — the same
-            // `parent_shape` / `split_output_floor` pair `transfer` and `quote_transfer` use, so the
+            // [B2] ONE shape resolution decides the route AND the floors here too — the same
+            // `parent_shape` / `split_output_floors` pair `transfer` and `quote_transfer` use, so the
             // batch lane cannot drift from the single-recipient lane. An in-ladder child gets its OWN
             // extension + state tier from `establish_child`, each burning `committed_fee +
             // P2A_VALUE`, and its final state output must still clear dust — so the in-ladder floor is
             // strictly above the backup-fee floor and BOTH bind.
+            //
+            // [V5] And the recipients are PIECES while the leftover is the CHANGE, so the two terms
+            // below take the two floors. They are equal today; writing one name for both is how the
+            // change leg's cheaper shape would silently become the payees' floor.
             let shape = self.parent_shape(&id).await?;
-            let floor = split_output_floor(backup_rate, shape);
+            let floors = split_output_floors(backup_rate, shape);
             match shape {
                 ParentShape::Unladdered => {
-                    let need = total + split_fee_reserve(parent_sats) + floor;
+                    let need = total + split_fee_reserve(parent_sats) + floors.change;
                     if parent_sats > need {
                         chosen = Some((id, ManyRoute::PlainSplit));
                         break;
                     }
                     rejected.push(format!(
                         "un-laddered {id} ({parent_sats} sat): too small — needs more than {need} sat \
-                         (total {total} + fee reserve + a {floor}-sat change)"
+                         (total {total} + fee reserve + a {}-sat change)",
+                        floors.change
                     ));
                 }
                 ParentShape::Child { .. } | ParentShape::Root { .. } => {
                     let cap = shape.split_total(n_out);
-                    let fits = recipients.iter().all(|(_, a)| *a >= floor)
-                        && cap.is_some_and(|c| c >= total + floor);
+                    let fits = recipients.iter().all(|(_, a)| *a >= floors.piece)
+                        && cap.is_some_and(|c| c >= total + floors.change);
                     if fits {
                         let route = match shape {
                             ParentShape::Child { .. } => ManyRoute::InLadderChild,
@@ -662,10 +710,20 @@ impl UtexoWallet {
                         break;
                     }
                     rejected.push(format!(
-                        "{} {id} ({parent_sats} sat): in-ladder capacity {}, per-output floor {floor}",
+                        "{} {id} ({parent_sats} sat): in-ladder capacity {}, per-leg floor {}",
                         shape.route(),
                         cap.map(|c| c.to_string())
-                            .unwrap_or_else(|| "unavailable (committed fee no longer fits)".to_string())
+                            .unwrap_or_else(|| "unavailable (committed fee no longer fits)".to_string()),
+                        floors.describe()
+                    ));
+                }
+                // [CATS/V4] Same refusal as the single-recipient lane, for the same reason: the
+                // spine-batch builder is not landed, so a tip is never CHOSEN as the parent of a
+                // batch. It is not stranded — it is spendable whole.
+                ParentShape::SpineTip { .. } => {
+                    rejected.push(format!(
+                        "spine tip {id} ({parent_sats} sat): splitting a tip is the next spine \
+                         batch, whose builder is not landed — it can only be spent whole"
                     ));
                 }
             }
@@ -906,10 +964,13 @@ impl UtexoWallet {
         // output whose backup is FeeTooLow, and admitting it here (then making the parent terminal)
         // would strand the parent to unilateral-exit-only. Guarding up-front keeps the parent
         // spendable on refusal.
-        // [B2] ONE floor, from `split_output_floor` — the same call the quote's `split_preflight_pure`
-        // makes for an `Unladdered` parent (the `tesr::load` above proved this coin is un-laddered).
+        // [B2] ONE floor, from `split_output_floors` — the same call the quote's
+        // `split_preflight_pure` makes for an `Unladdered` parent (the `tesr::load` above proved this
+        // coin is un-laddered). Un-laddered sub-coins have identical shape, so `binding()` is the
+        // honest reading of two equal legs, not a shortcut past a distinction.
         let min_output =
-            split_output_floor(backup_fee_rate(&self.inner.cc).await?, ParentShape::Unladdered);
+            split_output_floors(backup_fee_rate(&self.inner.cc).await?, ParentShape::Unladdered)
+                .binding();
         let (change_sats, _fee_reserve) =
             split_amounts_floored(parent_sats, piece_sats, min_output)?;
 
@@ -1042,8 +1103,8 @@ impl UtexoWallet {
         let total = shape
             .split_total(2)
             .ok_or_else(|| anyhow!("committed fee too high to split this child into two"))?;
-        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
-        let change_sats = inladder_amounts_floored(total, piece_sats, min_output)?;
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        let change_sats = inladder_amounts_floored(total, piece_sats, floors)?;
 
         let mut slot_tokens = self.take_derived_tokens(child_statechain_id, 2).await?;
         let piece_gc = self.create_child_slot(&slot_tokens.remove(0), piece_sats).await?;
@@ -1166,15 +1227,19 @@ impl UtexoWallet {
         // [B2] The same floor, from the same source, as the single-recipient child split (see the
         // guard in `child_in_ladder_pay`), applied to EVERY output: refuse up-front, before the child
         // is terminalized.
-        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
-        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
+        // [V5] Per-leg: the recipients are PIECES, the leftover is the CHANGE.
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < floors.piece) {
             return Err(anyhow!(
-                "recipient amount {amt} is below the in-ladder minimum {min_output} sat (each grandchild funds its own extension + state tier, then must clear the {DUST_LIMIT}-sat dust floor)"
+                "recipient amount {amt} is below the in-ladder piece minimum {} sat (each grandchild funds its own extension + state tier, then must clear the {DUST_LIMIT}-sat dust floor)",
+                floors.piece
             ));
         }
-        if change_sats < min_output {
+        if change_sats < floors.change {
             return Err(anyhow!(
-                "change {change_sats} is below the in-ladder minimum {min_output} sat — lower the payment total or use a larger coin"
+                "change {change_sats} is below the in-ladder change minimum {} sat ({}) — lower the payment total or use a larger coin",
+                floors.change,
+                change_leg_shape_note()
             ));
         }
 
@@ -1311,8 +1376,8 @@ impl UtexoWallet {
         // spend budget is consumed and `SP` is co-signed, so admitting a child below it terminalizes
         // the parent and THEN fails with FeeTooHigh, stranding the parent to unilateral-exit-only.
         // Refusing up-front keeps the parent fully spendable (same discipline as `split_coin`).
-        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
-        let change_sats = inladder_amounts_floored(total, piece_sats, min_output)?;
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        let change_sats = inladder_amounts_floored(total, piece_sats, floors)?;
 
         // Two fresh SE-registered child slots (DERIVED — free vouchers against the parent's value).
         let mut slot_tokens = self.take_derived_tokens(parent_statechain_id, 2).await?;
@@ -1512,16 +1577,20 @@ impl UtexoWallet {
         // `establish_child` runs AFTER the parent's spend budget is consumed and `SP` is co-signed,
         // so an output admitted below the floor terminalizes the parent and THEN fails, stranding it
         // to unilateral-exit-only.
-        let min_output = split_output_floor(backup_fee_rate(&self.inner.cc).await?, shape);
-        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
+        // [V5] Per-leg: the recipients are PIECES, the leftover is the CHANGE.
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < floors.piece) {
             return Err(anyhow!(
-                "recipient amount {amt} is below the in-ladder minimum {min_output} sat (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
+                "recipient amount {amt} is below the in-ladder piece minimum {} sat (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
+                floors.piece,
                 bundle.fee_rate
             ));
         }
-        if change_sats < min_output {
+        if change_sats < floors.change {
             return Err(anyhow!(
-                "change {change_sats} is below the in-ladder minimum {min_output} sat — lower the payment total or use a larger coin"
+                "change {change_sats} is below the in-ladder change minimum {} sat ({}) — lower the payment total or use a larger coin",
+                floors.change,
+                change_leg_shape_note()
             ));
         }
 
@@ -2391,6 +2460,18 @@ pub(crate) enum ParentShape {
     Child { fee_rate: f64, split_source_value: u64 },
     /// A root TES-R coin: `in_ladder_pay` carves `SP` out of `X_m.out[0]`.
     Root { fee_rate: f64, split_source_value: u64 },
+    /// **[CATS/V4] A SPINE TIP** — the sender's own change leg from a CATS batch, funded by the
+    /// un-broadcast `SP_i.out[K]` and capped by ONE tier.
+    ///
+    /// It exists as a variant for one reason: without it a tip falls through `parent_shape` to
+    /// `Unladdered`, which is simultaneously the cheaper cost model, the LOWER floor, and the route
+    /// to `split_coin` — a plain split of a laddered coin, which [B1] makes unsafe. That is three
+    /// wrong answers from one missing arm, and every one of them fails open.
+    ///
+    /// Splitting a tip is the NEXT spine batch (`SP_{i+1}` over `SP_i.out[K]`), and that builder is
+    /// change 2, which is not landed. So this shape prices correctly and REFUSES to split, by name —
+    /// the coin stays fully spendable whole.
+    SpineTip { fee_rate: f64, split_source_value: u64 },
 }
 
 impl ParentShape {
@@ -2399,7 +2480,9 @@ impl ParentShape {
     pub(crate) fn ladder_fee_rate(self) -> Option<f64> {
         match self {
             ParentShape::Unladdered => None,
-            ParentShape::Child { fee_rate, .. } | ParentShape::Root { fee_rate, .. } => Some(fee_rate),
+            ParentShape::Child { fee_rate, .. }
+            | ParentShape::Root { fee_rate, .. }
+            | ParentShape::SpineTip { fee_rate, .. } => Some(fee_rate),
         }
     }
 
@@ -2411,7 +2494,8 @@ impl ParentShape {
         match self {
             ParentShape::Unladdered => None,
             ParentShape::Child { fee_rate, split_source_value }
-            | ParentShape::Root { fee_rate, split_source_value } => {
+            | ParentShape::Root { fee_rate, split_source_value }
+            | ParentShape::SpineTip { fee_rate, split_source_value } => {
                 mercurylib::tesr::tier_out_total(split_source_value, n_payload, fee_rate)
             }
         }
@@ -2424,24 +2508,75 @@ impl ParentShape {
             ParentShape::Unladdered => "plain off-chain split",
             ParentShape::Child { .. } => "child in-ladder split",
             ParentShape::Root { .. } => "in-ladder split",
+            ParentShape::SpineTip { .. } => "spine batch",
         }
     }
 }
 
-/// **THE** per-output floor for one split output. Every admission guard in this file and the quote
-/// derive their floor here and nowhere else.
+/// **[V5] The per-LEG floors of one in-ladder split.** A split has two kinds of output and — once
+/// CATS change 2 lands — two different SHAPES of output, so it has two floors. Returning one number
+/// for both is the [V5] hazard in a sentence: the two legs then move together, and lowering the
+/// change leg to its true one-rung cost lowers the payee's piece with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SplitFloors {
+    /// Every PAYEE piece must clear this. A piece is always a two-tier child (V1's correction is
+    /// explicit that the conveyed leaf stays two-tier), so this floor never falls.
+    pub piece: u64,
+    /// The sender's CHANGE leg must clear this. Equal to `piece` today, and 490 sat lower the moment
+    /// `mercuryrustlib::tesr::change_leg_role` reports `SpineTip`.
+    pub change: u64,
+}
+
+impl SplitFloors {
+    /// The floor that binds BOTH legs — the larger. Used where one number is genuinely right: the
+    /// plain un-laddered split (whose two sub-coins have identical shape) and any single-number
+    /// report.
+    pub(crate) fn binding(self) -> u64 {
+        self.piece.max(self.change)
+    }
+
+    /// The smallest floor either leg imposes. Used by the shape-BLIND planner, which must never
+    /// refuse a split some coin could actually make; the named coin is then judged per-leg.
+    pub(crate) fn planning(self) -> u64 {
+        self.piece.min(self.change)
+    }
+
+    /// One legible string for a quote or refusal: a single number while the legs agree, and both
+    /// numbers, named, as soon as they do not.
+    pub(crate) fn describe(self) -> String {
+        if self.piece == self.change {
+            self.piece.to_string()
+        } else {
+            format!("piece {}, change {}", self.piece, self.change)
+        }
+    }
+}
+
+/// **THE** per-leg floors for a split of this parent. Every admission guard in this file and the
+/// quote derive their floors here and nowhere else.
 ///
-/// Two floors apply and the LARGER binds:
+/// Two floors apply to each leg and the LARGER binds:
 ///  * `min_split_output(backup_fee_rate)` — the dust limit plus the fee the sub-coin's OWN backup tx
 ///    must pay; below it the sub-coin exists but can never be exited.
-///  * `min_child_value(ladder rate)` — a LADDERED parent's child additionally gets its own extension
-///    + state rungs from `establish_child`, each burning `committed_fee + P2A_VALUE`, and its final
-///    state output must still clear dust. Only applies when the parent actually carries a ladder.
-pub(crate) fn split_output_floor(backup_fee_rate: f64, shape: ParentShape) -> u64 {
+///  * the LADDER floor for that leg's SHAPE — a payee's piece gets its own extension + state rungs
+///    from `establish_child` (`min_child_value`), while the sender's change gets whatever
+///    [`mercuryrustlib::tesr::change_leg_role`] says the builders actually give it: two rungs today,
+///    ONE (`min_spine_tip_value`) once change 2 lands. Only applies when the parent carries a ladder.
+///
+/// The leg's shape is deliberately NOT a parameter. It is read from the one function that describes
+/// what the builders emit, so the floor a payment is admitted at and the ladder that is then built
+/// cannot be two different shapes — which is the failure this split exists to prevent, and it lands
+/// *after* `set_spend_budget` has terminalized the parent.
+pub(crate) fn split_output_floors(backup_fee_rate: f64, shape: ParentShape) -> SplitFloors {
     let backup_floor = min_split_output(backup_fee_rate);
     match shape.ladder_fee_rate() {
-        Some(rate) => backup_floor.max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT)),
-        None => backup_floor,
+        Some(rate) => SplitFloors {
+            piece: backup_floor
+                .max(mercuryrustlib::tesr::SplitLegRole::Piece.min_value(rate, DUST_LIMIT)),
+            change: backup_floor
+                .max(mercuryrustlib::tesr::change_leg_role().min_value(rate, DUST_LIMIT)),
+        },
+        None => SplitFloors { piece: backup_floor, change: backup_floor },
     }
 }
 
@@ -2456,18 +2591,45 @@ pub(crate) fn split_output_floor(backup_fee_rate: f64, shape: ParentShape) -> u6
 /// `transfer` call this function, so they plan over the same feasible set.
 pub(crate) fn planning_split_floor(backup_fee_rate: f64, network: &str) -> u64 {
     let committed_rate = mercurylib::tesr::TesrParams::for_network(network).committed_fee_rate;
-    split_output_floor(
+    split_output_floors(
         backup_fee_rate,
         ParentShape::Root { fee_rate: committed_rate, split_source_value: 0 },
     )
+    .planning()
+}
+
+/// How the CHANGE leg's floor is justified, for a refusal message. The two legs no longer
+/// necessarily have the same shape, so a message that describes one shape and applies it to both is
+/// exactly the false text V5 exists to remove.
+fn change_leg_shape_note() -> &'static str {
+    match mercuryrustlib::tesr::change_leg_role() {
+        mercuryrustlib::tesr::SplitLegRole::Piece => {
+            "the change is built as a two-tier child today, so it funds an extension + a state rung too"
+        }
+        mercuryrustlib::tesr::SplitLegRole::SpineTip => {
+            "the change is a one-cap spine tip, so it funds ONE rung, not two"
+        }
+    }
 }
 
 /// The IN-LADDER admission rule, in one place: `piece` and `change` are both carved out of `total`
-/// (the tier's payload budget) and each must clear `floor`. Returns the change on success.
+/// (the tier's payload budget) and **each must clear its OWN leg's floor**. Returns the change on
+/// success.
 ///
 /// Shared by `in_ladder_pay`, `child_in_ladder_pay` and the quote's preflight, so a piece the quote
 /// calls fundable is a piece the executor accepts, and vice versa.
-pub(crate) fn inladder_amounts_floored(total: u64, piece_sats: u64, floor: u64) -> Result<u64> {
+///
+/// [V5] Two floors, not one. The old signature took a single number and the message explained it as
+/// "each child funds its own extension + state rungs" — which is true of a payee's piece and false
+/// of a spine tip, and the arithmetic was false in the more dangerous direction: one floor means the
+/// change leg's true one-rung cost can only be applied by lowering the PIECE's floor too, admitting
+/// a piece that cannot fund its second rung. `establish_child` discovers that after the parent is
+/// already terminal.
+pub(crate) fn inladder_amounts_floored(
+    total: u64,
+    piece_sats: u64,
+    floors: SplitFloors,
+) -> Result<u64> {
     if piece_sats >= total {
         return Err(anyhow!(
             "payment {piece_sats} sat leaves no change: an in-ladder split of this coin can pay at most {} sat (total {total} minus a viable change output)",
@@ -2475,11 +2637,23 @@ pub(crate) fn inladder_amounts_floored(total: u64, piece_sats: u64, floor: u64) 
         ));
     }
     let change_sats = total - piece_sats;
-    if piece_sats < floor || change_sats < floor {
+    let piece_short = piece_sats < floors.piece;
+    let change_short = change_sats < floors.change;
+    if piece_short || change_short {
+        let which = match (piece_short, change_short) {
+            (true, true) => "both legs fall short",
+            (true, false) => "the piece falls short",
+            (false, true) => "the change falls short",
+            (false, false) => unreachable!(),
+        };
         return Err(anyhow!(
-            "in-ladder split needs both piece ({piece_sats}) and change ({change_sats}) >= {floor} sat \
-             (each child funds its own extension + state rungs, then must clear the {DUST_LIMIT}-sat dust floor); \
-             the split total is {total}"
+            "in-ladder split refused — {which}. The payee's piece ({piece_sats}) must be >= {} sat \
+             (it funds its own extension + state rungs) and the change ({change_sats}) must be >= \
+             {} sat ({}); both must then clear the {DUST_LIMIT}-sat dust floor. The split total is \
+             {total}",
+            floors.piece,
+            floors.change,
+            change_leg_shape_note()
         ));
     }
     Ok(change_sats)
@@ -2494,11 +2668,14 @@ pub(crate) fn split_preflight_pure(
     parent_sats: u64,
     piece_sats: u64,
 ) -> SplitPreflight {
-    let floor = split_output_floor(backup_rate, shape);
+    let floors = split_output_floors(backup_rate, shape);
     let (fee_sats, admission) = match shape {
         ParentShape::Unladdered => (
             split_fee_reserve(parent_sats),
-            split_amounts_floored(parent_sats, piece_sats, floor)
+            // The plain lane's two sub-coins have IDENTICAL shape (each carries only its own backup
+            // tx), so one number is genuinely right here — and it is the binding one, never the
+            // planning one.
+            split_amounts_floored(parent_sats, piece_sats, floors.binding())
                 .map(|(change, _)| change)
                 .map_err(|e| e.to_string()),
         ),
@@ -2506,7 +2683,7 @@ pub(crate) fn split_preflight_pure(
             // The split carves TWO payload outputs (piece + change) out of the tier.
             let admission = match shape.split_total(2) {
                 Some(total) => {
-                    inladder_amounts_floored(total, piece_sats, floor).map_err(|e| e.to_string())
+                    inladder_amounts_floored(total, piece_sats, floors).map_err(|e| e.to_string())
                 }
                 None => Err(format!(
                     "committed fee at {fee_rate} sat/vB no longer fits: this coin cannot be split in-ladder at all"
@@ -2514,8 +2691,22 @@ pub(crate) fn split_preflight_pure(
             };
             (in_ladder_split_cost(fee_rate), admission)
         }
+        // [CATS/V4] A tip is priced correctly and REFUSED, with the reason named. The builder for a
+        // spine batch (`SP_{i+1}` over `SP_i.out[K]`) is change 2 and is not landed, so admitting
+        // one would route the sender's own change into an executor that does not exist — or, worse,
+        // into `split_coin`, which is the [B1]-unsafe plain split of a laddered coin. A refusal here
+        // costs the caller nothing they had: `plan_payment` marks the coin un-splittable and it is
+        // still spendable WHOLE, which is every use a tip has today.
+        ParentShape::SpineTip { fee_rate, .. } => (
+            in_ladder_split_cost(fee_rate),
+            Err(
+                "this coin is a SPINE TIP (the change leg of an earlier batch): splitting it is the \
+                 next spine batch, whose builder is not landed. It can still be spent whole."
+                    .to_string(),
+            ),
+        ),
     };
-    SplitPreflight { shape, floor, fee_sats, admission }
+    SplitPreflight { shape, floors, fee_sats, admission }
 }
 
 /// The coin a payment plan wants to split, together with the BINDING verdict on splitting it.
@@ -2541,8 +2732,8 @@ pub(crate) struct PaymentPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct SplitPreflight {
     pub shape: ParentShape,
-    /// The per-output floor [`split_output_floor`] gives for THIS coin.
-    pub floor: u64,
+    /// The per-LEG floors [`split_output_floors`] gives for THIS coin.
+    pub floors: SplitFloors,
     /// The real cost of this route (the in-ladder split's burnt tier fees, or the plain split's
     /// reserve) — what the quote must report.
     pub fee_sats: u64,
@@ -2551,7 +2742,7 @@ pub(crate) struct SplitPreflight {
     pub admission: std::result::Result<u64, String>,
 }
 
-/// The split executor's pure admission guard with an explicit per-output floor: fee reserve + fit
+/// The split executor's pure admission guard with an explicit per-leg floor: fee reserve + fit
 /// + `min_output` on both sub-coins. Returns `(change_sats, fee_reserve)` when admissible.
 pub(crate) fn split_amounts_floored(
     parent_sats: u64,
@@ -2634,14 +2825,15 @@ mod split_math_tests {
     // [B2] ONE FLOOR, ONE SOURCE — asserted as an identity, not as two numbers that happen to match.
     // Every floor in this file now comes from `split_output_floor`; nothing re-derives one.
     #[test]
-    fn every_floor_comes_from_split_output_floor() {
+    fn every_floor_comes_from_split_output_floors() {
         let backup_rate = 2.0;
         let ladder_rate = 2.0;
 
-        // The un-laddered floor IS `min_split_output` — no ladder, no `min_child_value` term.
+        // The un-laddered floor IS `min_split_output` — no ladder, no `min_child_value` term. Both
+        // legs, because an un-laddered split's two sub-coins genuinely have the same shape.
         assert_eq!(
-            split_output_floor(backup_rate, ParentShape::Unladdered),
-            min_split_output(backup_rate)
+            split_output_floors(backup_rate, ParentShape::Unladdered),
+            SplitFloors { piece: min_split_output(backup_rate), change: min_split_output(backup_rate) }
         );
         assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
 
@@ -2649,10 +2841,14 @@ mod split_math_tests {
         let root = ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 };
         let child = ParentShape::Child { fee_rate: ladder_rate, split_source_value: 0 };
         assert_eq!(mercurylib::tesr::min_child_value(ladder_rate, DUST_LIMIT), 1_310);
-        assert_eq!(split_output_floor(backup_rate, root), 1_310, "the larger floor binds");
         assert_eq!(
-            split_output_floor(backup_rate, child),
-            split_output_floor(backup_rate, root),
+            split_output_floors(backup_rate, root).piece,
+            1_310,
+            "the larger floor binds"
+        );
+        assert_eq!(
+            split_output_floors(backup_rate, child),
+            split_output_floors(backup_rate, root),
             "a child re-split and a root split are floored identically"
         );
 
@@ -2664,10 +2860,11 @@ mod split_math_tests {
             let committed = mercurylib::tesr::TesrParams::for_network(network).committed_fee_rate;
             assert_eq!(
                 planning,
-                split_output_floor(
+                split_output_floors(
                     backup_rate,
                     ParentShape::Root { fee_rate: committed, split_source_value: 0 }
-                ),
+                )
+                .planning(),
                 "[{network}] the planning floor is not a second derivation"
             );
             assert!(
@@ -2687,14 +2884,22 @@ mod split_math_tests {
     fn quote_and_executor_agree_at_the_floor_both_ways() {
         let backup_rate = 2.0;
         let ladder_rate = 2.0;
-        let floor = split_output_floor(
+        let floors = split_output_floors(
             backup_rate,
             ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 },
         );
+        let floor = floors.piece;
         assert_eq!(floor, 1_310);
 
-        // A parent whose split total is exactly 2 × floor: the boundary in both directions at once.
-        let total = 2 * floor;
+        // A parent whose split total is exactly `piece_floor + change_floor`: the boundary in both
+        // directions at once.
+        //
+        // [V5] Derived from the TWO floors, not from `2 × floor`. Those are the same number today
+        // and stop being the same number the instant `change_leg_role()` reports `SpineTip` — at
+        // which point `2 × piece_floor` is no longer a boundary for the change leg at all, and this
+        // test would have failed on an assertion that had merely gone stale rather than on a defect.
+        // Measured, not assumed: flipping the role and re-running is how this line was written.
+        let total = floors.piece + floors.change;
         let shape = ParentShape::Root {
             fee_rate: ladder_rate,
             split_source_value: source_value_for_total(total, ladder_rate),
@@ -2707,7 +2912,7 @@ mod split_math_tests {
         for piece in [floor - 2, floor - 1, floor, floor + 1, floor + 2] {
             let executor = {
                 let t = shape.split_total(2).expect("splittable");
-                let f = split_output_floor(backup_rate, shape);
+                let f = split_output_floors(backup_rate, shape);
                 inladder_amounts_floored(t, piece, f).map_err(|e| e.to_string())
             };
             let quote = split_preflight_pure(backup_rate, shape, 0, piece).admission;
@@ -2728,8 +2933,9 @@ mod split_math_tests {
         );
         assert_eq!(
             split_preflight_pure(backup_rate, shape, 0, floor).admission.unwrap(),
-            floor,
-            "the change is the other half of the boundary"
+            floors.change,
+            "the change is the other half of the boundary — at ITS floor, which is not necessarily \
+             the piece's"
         );
         let one_under = split_preflight_pure(backup_rate, shape, 0, floor - 1).admission;
         assert!(one_under.is_err(), "one sat under the floor the PIECE is unviable");
@@ -2741,7 +2947,12 @@ mod split_math_tests {
         let old_floor = min_split_output(backup_rate);
         assert!(old_floor < floor, "554 < 1310");
         assert!(
-            inladder_amounts_floored(total, floor - 1, old_floor).is_ok(),
+            inladder_amounts_floored(
+                total,
+                floor - 1,
+                SplitFloors { piece: old_floor, change: old_floor }
+            )
+            .is_ok(),
             "the old, lower floor admitted the piece the real executor refuses"
         );
 
@@ -2756,9 +2967,9 @@ mod split_math_tests {
 
         // And an UN-LADDERED parent is floored by `min_split_output` alone, from the same function.
         let parent = 10_000u64;
-        let unladdered_floor = split_output_floor(backup_rate, ParentShape::Unladdered);
+        let unladdered_floor = split_output_floors(backup_rate, ParentShape::Unladdered).binding();
         let pf = split_preflight_pure(backup_rate, ParentShape::Unladdered, parent, unladdered_floor);
-        assert_eq!(pf.floor, unladdered_floor);
+        assert_eq!(pf.floors.binding(), unladdered_floor);
         assert!(pf.admission.is_ok(), "at its own floor an un-laddered piece is admissible");
         let plain_under =
             split_preflight_pure(backup_rate, ParentShape::Unladdered, parent, unladdered_floor - 1)
@@ -2785,8 +2996,8 @@ mod split_math_tests {
             split_source_value: source_value_for_total(50_000, 2.0),
         };
         let plain = ParentShape::Unladdered;
-        let laddered_floor = split_output_floor(backup_rate, laddered);
-        let plain_floor = split_output_floor(backup_rate, plain);
+        let laddered_floor = split_output_floors(backup_rate, laddered).binding();
+        let plain_floor = split_output_floors(backup_rate, plain).binding();
         assert_eq!((plain_floor, laddered_floor), (554, 1_310));
 
         // The floor `plan_payment` plans at, over a wallet holding one of each.
@@ -2829,10 +3040,11 @@ mod split_math_tests {
         let backup_rate = 2.0;
         let committed_rate = 2.0;
         // [B2] re-derived through the ONE source rather than re-spelled here.
-        let executor_floor = split_output_floor(
+        let executor_floor = split_output_floors(
             backup_rate,
             ParentShape::Root { fee_rate: committed_rate, split_source_value: 0 },
-        );
+        )
+        .binding();
         assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
         assert_eq!(mercurylib::tesr::min_child_value(committed_rate, DUST_LIMIT), 1_310);
         assert_eq!(executor_floor, 1_310, "the larger floor binds");
@@ -2855,5 +3067,114 @@ mod split_math_tests {
             crate::select::plan_with_floor(&coins, 2_000, executor_floor),
             crate::select::Plan::WithSplit { .. }
         ));
+    }
+
+    // ============================================================================================
+    // [CATS / V5] TWO LEGS, TWO FLOORS — and the piece's floor is the one that must never fall.
+    // ============================================================================================
+
+    /// **The split is real, not plumbing.** Asserted by exercising `inladder_amounts_floored` with
+    /// the two floors DIFFERENT — which is what the wallet computes the moment `change_leg_role()`
+    /// reports `SpineTip` — and showing that a value legal for the change is illegal for the piece.
+    ///
+    /// A single-floor implementation cannot express this at all: it either refuses both legs at
+    /// 1 310 (today, correct but 490 sat expensive) or admits both at 820, and admitting a PIECE at
+    /// 820 mints a child that cannot fund its second rung. `establish_child` discovers that after
+    /// `set_spend_budget` has already terminalized the parent, which is why the guard has to be here
+    /// and why it has to be per-leg.
+    #[test]
+    fn the_two_legs_are_floored_independently() {
+        let piece_floor = mercurylib::tesr::min_child_value(2.0, DUST_LIMIT); // 1 310
+        let tip_floor = mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT); // 820
+        assert_eq!((piece_floor, tip_floor), (1_310, 820));
+        let floors = SplitFloors { piece: piece_floor, change: tip_floor };
+
+        // A split whose change lands between the two floors: legal as a TIP, illegal as a piece.
+        let total = piece_floor + tip_floor;
+        assert_eq!(inladder_amounts_floored(total, piece_floor, floors).unwrap(), tip_floor);
+        // …and the same number on the PIECE side is refused, by name.
+        let e = inladder_amounts_floored(total, tip_floor, floors)
+            .expect_err("a piece at the tip's floor cannot fund its second rung");
+        let msg = e.to_string();
+        assert!(msg.contains("the piece falls short"), "must name the leg, got: {msg}");
+        assert!(msg.contains("1310"), "must state the piece's own floor, got: {msg}");
+
+        // The change leg falling short is named as the change, not as "both legs >= N".
+        let e = inladder_amounts_floored(total, total - (tip_floor - 1), floors)
+            .expect_err("a change under the tip floor is refused");
+        assert!(e.to_string().contains("the change falls short"), "got: {e}");
+
+        // And the old text — one floor, one shape, "each child funds its own extension + state" —
+        // is gone. It was false for a tip in both halves: wrong count of rungs, wrong owner.
+        assert!(!msg.contains("needs both piece"), "the single-floor phrasing must not survive");
+    }
+
+    /// **The change floor tracks what the BUILDERS emit, and nothing else.** `split_output_floors`
+    /// reads `change_leg_role()`, which is the one function describing the shape
+    /// `in_ladder_split`/`child_in_ladder_split`/`cosign_colored_in_ladder_split` actually build.
+    ///
+    /// So while change 2 is unlanded the two floors are EQUAL — the wallet keeps refusing a change
+    /// below 1 310, which is a capability cost and not a safety one — and the day the builders flip,
+    /// this assertion flips with them in the same commit. That direction matters: a floor lowered
+    /// ahead of the builder fails OPEN and strands the parent.
+    #[test]
+    fn the_change_floor_is_derived_from_the_builders_not_declared() {
+        let backup_rate = 2.0;
+        let shape = ParentShape::Root { fee_rate: 2.0, split_source_value: 0 };
+        let floors = split_output_floors(backup_rate, shape);
+        assert_eq!(
+            floors.piece,
+            mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
+            "a payee's piece is always a two-tier child — V1's correction is explicit that the \
+             conveyed leaf never becomes a spine"
+        );
+        match mercuryrustlib::tesr::change_leg_role() {
+            mercuryrustlib::tesr::SplitLegRole::Piece => {
+                assert_eq!(floors.change, floors.piece, "unlanded change 2: the legs agree");
+                assert_eq!(floors.describe(), "1310", "one number while the legs agree");
+            }
+            mercuryrustlib::tesr::SplitLegRole::SpineTip => {
+                assert_eq!(floors.change, mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT));
+                assert!(floors.change < floors.piece);
+                assert_eq!(floors.describe(), "piece 1310, change 820");
+            }
+        }
+        // `binding()` and `planning()` are the two honest single-number reductions, and they are
+        // used in opposite places: `binding` where one number must cover both legs (the un-laddered
+        // lane), `planning` where refusing too much is the bug (the shape-blind planner).
+        assert_eq!(floors.binding(), floors.piece.max(floors.change));
+        assert_eq!(floors.planning(), floors.piece.min(floors.change));
+    }
+
+    /// **[V4] A SPINE TIP is priced as laddered and refused as un-splittable — never `Unladdered`.**
+    ///
+    /// The variant exists because falling through to `Unladdered` is three wrong answers from one
+    /// missing arm: the cheaper cost model, the LOWER floor, and the route to `split_coin`, which is
+    /// the [B1]-unsafe plain split of a coin that IS laddered. The refusal is the safe half of the
+    /// pair — the spine-batch builder is change 2 and is not landed — and it costs the holder
+    /// nothing: the coin is still spendable whole.
+    #[test]
+    fn a_spine_tip_prices_as_laddered_and_refuses_to_split() {
+        let backup_rate = 2.0;
+        let tip = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 100_000 };
+        assert_eq!(tip.ladder_fee_rate(), Some(2.0), "a tip carries a ladder");
+        assert_eq!(
+            split_output_floors(backup_rate, tip),
+            split_output_floors(backup_rate, ParentShape::Root { fee_rate: 2.0, split_source_value: 0 }),
+            "a tip is floored as a laddered parent, NOT at the un-laddered 554"
+        );
+        assert_ne!(
+            split_output_floors(backup_rate, tip),
+            split_output_floors(backup_rate, ParentShape::Unladdered),
+            "the fall-through answer is the dangerous one and must be distinguishable"
+        );
+        assert_eq!(tip.route(), "spine batch");
+        // Its capacity is arithmetic over its FUNDING outpoint (`SP_i.out[K]`), not over the cap.
+        assert_eq!(tip.split_total(2), mercurylib::tesr::tier_out_total(100_000, 2, 2.0));
+        // …and it is refused, by name, before any of that can be acted on.
+        let pf = split_preflight_pure(backup_rate, tip, 0, 5_000);
+        let why = pf.admission.expect_err("a tip cannot be split until change 2 lands");
+        assert!(why.contains("SPINE TIP"), "the refusal must name the shape, got: {why}");
+        assert!(why.contains("spent whole"), "and must say what still works, got: {why}");
     }
 }

@@ -137,11 +137,23 @@ correctly ADMITTED the coin. Re-derived from `SPINE_CSV`, not relaxed.
   child identically, so this needs a per-child ROLE — an API change to
   `children: &mut [(Coin, String, u64)]`. Until it lands a payment still adds `[extension, state]`
   for the change as well as the piece, so the Freeze-Lemma bound of §4.0 is approached, not attained.
-* **V1**: `ChildSegment::extension` becomes `Option`, which makes segment SHAPE sender-declared for
-  the first time. §4.5 is explicit that this — not the CSV-0 race — is where the adversarial E2E
-  budget goes. The census still closes it (a dropped tier leaves `expected` one short of `num_sigs`).
-* **V2** (derive the ancestor `2` from the disclosed tier count), **V4** (spine-tip bundle key),
-  **V5** (`min_spine_tip_value` on the change leg only), then change 3 (K > 1).
+  **Its single flip point is `mercuryrustlib::tesr::change_leg_role()`**, which reports the shape the
+  builders actually emit and is what V5's change floor is derived from. Flip it in the SAME commit as
+  the builders: early = the wallet admits a change at 820 and then cannot fund its second rung, after
+  `set_spend_budget` has terminalized the parent (fails OPEN); late = it merely refuses payments the
+  chain would carry (fails CLOSED). One test asserts the current value and is meant to be edited with
+  it: `mercuryrustlib::tesr::spine_tip_tests::the_leg_role_selects_the_floor_and_the_piece_floor_never_falls`.
+  Everything else in the floor path is already role-agnostic — flipping the role and re-running leaves
+  the whole SDK suite green.
+* ~~**V1/V2/V4/V5**~~ — **BUILT.** V1+V2 landed atomically (a one-tier bundle against the literal `2`
+  is a free census slot that fails OPEN), together with the check that actually closes sender-declared
+  shape: the `None` branch requires the surviving tier to spend the segment's own FUNDING outpoint,
+  which the taproot SIGHASH_ALL sighash commits to. **§4.5's "the census still closes it" was FALSE**
+  — a dropped tier is re-declared in `superseded_extensions`, `verify_superseded_segment` counts it,
+  and `expected` re-balances exactly; see the ⚠️ CORRECTION block. V4 = `SpineTipBundle` under
+  `spinetip-<sid>` plus every fail-open enumerator co-edited. V5 = `SplitFloors { piece, change }`,
+  820 plain / 906 coloured, with per-leg refusal text.
+* Then change 3 (K > 1).
 
 ### Landed in P0 round 1 (uncommitted, verified by running)
 

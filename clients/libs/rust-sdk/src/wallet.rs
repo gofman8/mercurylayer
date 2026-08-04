@@ -1518,8 +1518,24 @@ impl UtexoWallet {
                  failed read"
             )
         })?;
+        // [CATS/V4] Two row shapes, ONE protection. A coloured SPINE TIP is the sender's own change
+        // leg and its allocation sits on the un-broadcast `SP.out[K]` — the identical exposure a
+        // coloured child has to an ancestor's stale-backup clawback, differing only in whose money
+        // it is and in the chain being one tier shorter. Keying this loop on `ctesr-` alone would
+        // leave the sender's own coloured change as the single carrier class in the wallet with no
+        // near-deadline protection at all.
+        enum Row {
+            Child(Box<mercuryrustlib::tesr::ChildTesrBundle>),
+            Tip(Box<mercuryrustlib::tesr::SpineTipBundle>),
+        }
         for (key, json) in child_rows.iter() {
-            let Some(cid) = key.strip_prefix("ctesr-") else { continue };
+            let (cid, what) = if let Some(cid) = key.strip_prefix("ctesr-") {
+                (cid, "adopted split child")
+            } else if let Some(tid) = key.strip_prefix(mercuryrustlib::tesr::SPINE_TIP_KEY_PREFIX) {
+                (tid, "spine tip")
+            } else {
+                continue;
+            };
             // L1. Absence from the record, or any status other than CONFIRMED, is a DECIDED answer
             // ("not ours to drive"), not blindness.
             let Some(coin) = record.coins.iter().find(|c| {
@@ -1530,26 +1546,37 @@ impl UtexoWallet {
             if coin.status != CoinStatus::CONFIRMED {
                 continue;
             }
-            let cb: mercuryrustlib::tesr::ChildTesrBundle = match serde_json::from_str(json) {
-                Ok(c) => c,
-                // NOT a skip. An unparseable child bundle is the one shape where "I could not tell"
-                // and "nothing is due" look identical, and this coin's only protection is here.
+            let parsed = if key.starts_with("ctesr-") {
+                serde_json::from_str(json).map(|c| Row::Child(Box::new(c)))
+            } else {
+                serde_json::from_str(json).map(|t| Row::Tip(Box::new(t)))
+            };
+            let parsed = match parsed {
+                Ok(r) => r,
+                // NOT a skip. An unparseable bundle is the one shape where "I could not tell" and
+                // "nothing is due" look identical, and this coin's only protection is here.
                 Err(e) => {
                     blind.push(format!(
-                        "{cid} (adopted split child; its `ctesr-` bundle will not parse ({e}), so \
-                         its exit-race deadline cannot be computed)"
+                        "{cid} ({what}: its stored bundle will not parse ({e}), so its exit-race \
+                         deadline cannot be computed)"
                     ));
                     continue;
                 }
             };
-            if !cb.is_colored() {
-                continue;
-            }
-            let chain = mercuryrustlib::tesr::child_exit_chain(&cb);
+            let chain = match &parsed {
+                Row::Child(cb) if cb.is_colored() => mercuryrustlib::tesr::child_exit_chain(cb),
+                Row::Tip(tip) if tip.is_colored() => {
+                    mercuryrustlib::tesr::spine_tip_exit_chain(tip)
+                }
+                // DELIBERATELY NARROW, unchanged: plain children (and plain tips) have the same
+                // shape and are left to their own change with their own tests, rather than swept in
+                // on the strength of an argument this round did not measure.
+                _ => continue,
+            };
             let Some((root_hex, _)) = chain.first() else {
                 blind.push(format!(
-                    "{cid} (coloured child with an EMPTY exit chain — it has no walk to protect it \
-                     and no deadline can be derived)"
+                    "{cid} (coloured {what} has an EMPTY exit chain — it has no walk to protect \
+                     it and no deadline can be derived)"
                 ));
                 continue;
             };
@@ -1559,9 +1586,9 @@ impl UtexoWallet {
                 Ok(d) => d.saturating_sub(head_start),
                 Err(e) => {
                     blind.push(format!(
-                        "{cid} (coloured child; its exit-race deadline could NOT be computed ({e}) \
-                         — it has a five-tier chain rooted at a funding output an ancestor can \
-                         still spend, so absence of a deadline here means blindness, not safety)"
+                        "{cid} (coloured {what}: its exit-race deadline could NOT be computed \
+                         ({e}) — it has a pre-signed chain rooted at a funding output an ancestor \
+                         can still spend, so absence of a deadline here means blindness, not safety)"
                     ));
                     continue;
                 }
@@ -1577,8 +1604,8 @@ impl UtexoWallet {
             match self.unilateral_exit(Some(vec![cid.to_string()]), None).await {
                 Ok(_) => exited.push(cid.to_string()),
                 Err(e) => blind.push(format!(
-                    "{cid} (coloured child is DUE at block {deadline}, tip {tip}, but driving its \
-                     exit walk failed: {e})"
+                    "{cid} (coloured {what} is DUE at block {deadline}, tip {tip}, but driving \
+                     its exit walk failed: {e})"
                 )),
             }
         }
@@ -1738,18 +1765,32 @@ impl UtexoWallet {
         let mut conveyed_parent_states: std::collections::HashMap<String, std::collections::HashSet<String>> =
             std::collections::HashMap::new();
         for (key, json) in child_rows.iter() {
-            if !key.starts_with("ctesr-") {
+            // A row that will not parse is handled (loudly) by the loops below; here it simply
+            // contributes no supersession evidence, which leaves L1 in charge.
+            if key.starts_with("ctesr-") {
+                if let Ok(cb) = serde_json::from_str::<mercuryrustlib::tesr::ChildTesrBundle>(json) {
+                    conveyed_parent_states
+                        .entry(cb.parent_statechain_id.clone())
+                        .or_default()
+                        .insert(cb.parent.current().state.txid.clone());
+                }
                 continue;
             }
-            // A row that will not parse is handled (loudly) by the child loop below; here it simply
-            // contributes no supersession evidence, which leaves L1 in charge.
-            if let Ok(cb) =
-                serde_json::from_str::<mercuryrustlib::tesr::ChildTesrBundle>(json)
-            {
-                conveyed_parent_states
-                    .entry(cb.parent_statechain_id.clone())
-                    .or_default()
-                    .insert(cb.parent.current().state.txid.clone());
+            // [CATS/V4] **A SPINE TIP is the same evidence about the same fact**, and this is the
+            // one place where omitting it would REMOVE an existing defence rather than fail to add
+            // one. L2 fires only when this map has an entry for the parent. Today the sender's own
+            // change child leaves a `ctesr-` row, so a root split always populates it. Under change
+            // 2 that row becomes a `spinetip-` row — and if only the `ctesr-` prefix were read, a
+            // sender who conveyed every piece would end with an EMPTY map for that parent, L2 would
+            // stop firing, and the root loop would drive the wallet's stale `tesr-` row, racing the
+            // very children it had just conveyed. That is the exact accident L2 was written to stop.
+            if key.starts_with(mercuryrustlib::tesr::SPINE_TIP_KEY_PREFIX) {
+                if let Ok(tip) = serde_json::from_str::<mercuryrustlib::tesr::SpineTipBundle>(json) {
+                    conveyed_parent_states
+                        .entry(tip.parent_statechain_id.clone())
+                        .or_default()
+                        .insert(tip.parent.current().state.txid.clone());
+                }
             }
         }
         for c in &record.coins {
@@ -1919,6 +1960,59 @@ impl UtexoWallet {
             }
         }
 
+        // ---- SPINE TIPS (`spinetip-` rows) ----------------------------------------------------
+        //
+        // [CATS/V4] The sender's own CHANGE leg. It is defended by NOTHING without this loop: it has
+        // no `tesr-` row (so the root loop above never sees it) and no `ctesr-` row (so the child
+        // loop never sees it), and what it has to survive is precisely what a child survives — the
+        // parent's retained state racing `SP` over `X_m.out[0]`. The difference is only whose money
+        // it is. A wallet that has made one CATS payment holds most of its balance here.
+        //
+        // Same three properties as the loop above, deliberately identical: the L1 liveness allowlist
+        // (drive only a coin this wallet still holds CONFIRMED — a tip handed onward belongs to its
+        // recipient and racing it would destroy their state), fail-CLOSED on an unparseable row, and
+        // `Idle`/`Blind` as different answers.
+        for (key, json) in child_rows.iter() {
+            let Some(tid) = key.strip_prefix(mercuryrustlib::tesr::SPINE_TIP_KEY_PREFIX) else {
+                continue;
+            };
+            if !live_sids.contains(tid) {
+                continue;
+            }
+            let tip: mercuryrustlib::tesr::SpineTipBundle = match serde_json::from_str(json) {
+                Ok(t) => t,
+                Err(e) => {
+                    blind.push(format!("{tid} (spine-tip bundle unreadable: {e})"));
+                    continue;
+                }
+            };
+            match mercuryrustlib::tesr::watch_spine_tip_pass(&self.inner.cc.electrum_client, &tip) {
+                mercuryrustlib::tesr::WatchState::Idle => {}
+                mercuryrustlib::tesr::WatchState::Acted { ids, failures, blind: unseen } => {
+                    if !ids.is_empty() {
+                        let _ = self.inner.events_tx.send(WalletEvent::LadderDefended {
+                            statechain_id: tid.to_string(),
+                            tiers_broadcast: ids.len() as u32,
+                        });
+                        acted.push(tid.to_string());
+                    }
+                    blind.extend(unseen);
+                    let hard: Vec<&String> =
+                        failures.iter().filter(|f| !ladder_failure_is_waiting(f)).collect();
+                    if !hard.is_empty() {
+                        blind.push(format!(
+                            "{tid} (spine-tip tier broadcast REJECTED for a reason that is not an \
+                             immature CSV — the tip's exit may be raced or unusable: {})",
+                            hard.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")
+                        ));
+                    }
+                }
+                mercuryrustlib::tesr::WatchState::Blind { reason } => {
+                    blind.push(format!("{tid} ({reason})"));
+                }
+            }
+        }
+
         if !blind.is_empty() {
             return Err(anyhow!(
                 "ladder defence is BLIND on {} coin(s) — their TES-R bundle could not be read, or \
@@ -1973,7 +2067,20 @@ impl UtexoWallet {
             // confirmed outpoint for withdraw::execute to spend (it would find no backup/statechain
             // rows). Route it to the unilateral exit instead — materializing the pre-signed chain,
             // whose final state already pays this wallet's own key.
+            //
+            // [CATS/V4] A SPINE TIP is the same case for the same reason — its funding `SP.out[K]`
+            // is un-broadcast — so it takes the same route. Without this arm a tip falls through to
+            // `withdraw::execute`, which looks for the coin's confirmed funding outpoint, does not
+            // find it, and fails with a storage-shaped error about missing rows rather than doing
+            // the one thing that works.
             if mercuryrustlib::tesr::load_child(&self.inner.cc, &self.inner.config.wallet_name, &id)
+                .await?
+                .is_some()
+                || mercuryrustlib::tesr::load_spine_tip(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &id,
+                )
                 .await?
                 .is_some()
             {
@@ -2590,6 +2697,39 @@ impl UtexoWallet {
                     // backend, `None` genuinely means no tier is pending.
                     mercuryrustlib::tesr::next_child_exit_tier(&self.inner.cc.electrum_client, &cb)?
                         .unwrap_or(0) as u32
+                };
+                statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
+                continue;
+            }
+
+            // [CATS/V4] …and a SPINE TIP: the sender's own change leg, funded by the un-broadcast
+            // `SP.out[K]` and capped by ONE tier. Same keyless walk, one tier shorter.
+            //
+            // This arm is the literal reason the tip has a record of its own. Without it a tip falls
+            // through to the flat fallback below, which broadcasts the coin's `branch-` rows and its
+            // latest absolute-locktime backup — an RGB-unaware spend of a funding output that does
+            // not exist on chain. For a plain tip that is an opaque "missing inputs"; for a coloured
+            // one it is the allocation.
+            if let Some(tip) =
+                mercuryrustlib::tesr::load_spine_tip(&self.inner.cc, &self.inner.config.wallet_name, &id)
+                    .await?
+            {
+                let progress =
+                    mercuryrustlib::tesr::exit_spine_tip_pass(&self.inner.cc.electrum_client, &tip)?;
+                let done = progress.complete;
+                if done {
+                    self.register_exit_tip_best_effort(&id).await;
+                }
+                let wait_blocks = if done {
+                    0
+                } else {
+                    // AUDITED-SWALLOW: same as the two arms above — `?` covers the blind backend,
+                    // `None` genuinely means no tier is pending.
+                    mercuryrustlib::tesr::next_spine_tip_exit_tier(
+                        &self.inner.cc.electrum_client,
+                        &tip,
+                    )?
+                    .unwrap_or(0) as u32
                 };
                 statuses.push(crate::types::ExitStatus { statechain_id: id, complete: done, wait_blocks });
                 continue;

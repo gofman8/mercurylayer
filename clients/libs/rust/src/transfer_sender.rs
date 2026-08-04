@@ -493,6 +493,13 @@ fn wallet_is_provably_pre_sdk(rows: &WalletRows) -> bool {
     rows.get(LADDER_MANAGED_KEY).is_none()
         && !rows.has_prefix("tesr-")
         && !rows.has_prefix("ctesr-")
+        // [CATS/V4] …and a SPINE TIP is a ladder artefact too. This licence is a wallet-wide
+        // off-switch for the entire flat-conveyance classifier, so a missing prefix here does not
+        // merely overlook one row — it hands every coin in the wallet a permanent licence to be
+        // conveyed flat. A wallet whose only artefact was a spine tip (a sender who has made exactly
+        // one CATS payment and holds only its change) would have qualified as "provably never
+        // laddered" while holding a laddered coin.
+        && !rows.has_prefix(crate::tesr::SPINE_TIP_KEY_PREFIX)
         && !rows.has_prefix("ladderskip-")
 }
 
@@ -593,6 +600,28 @@ fn licence_funding_not_onchain(
                  coin ({}). Refusing to convey it on the flat lane — that row is not evidence about \
                  this coin.",
                 cb.child_statechain_id
+            ));
+        }
+        return Ok(Some(PermanentLicence::FundingNotOnChain));
+    }
+    // [CATS/V4] A SPINE TIP is funded by `SP.out[K]`, which is un-broadcast — the same [B0] fact the
+    // `ctesr-` arm above proves, for the sender's own change leg instead of a received piece. Same
+    // standard of evidence, deliberately: the row must PARSE and must NAME this coin. Existence is
+    // not evidence, and a row about a different coin is not evidence about this one.
+    if let Some(json) = rows.get(&format!("{}{statechain_id}", crate::tesr::SPINE_TIP_KEY_PREFIX)) {
+        let tip: crate::tesr::SpineTipBundle = serde_json::from_str(json).map_err(|e| {
+            anyhow!(
+                "statechain id {statechain_id} has a spine-tip row that could not be parsed ({e}). \
+                 Refusing to convey it on the flat lane — a row we cannot read is not evidence that \
+                 the coin's funding is off chain."
+            )
+        })?;
+        if tip.statechain_id != statechain_id {
+            return Err(anyhow!(
+                "statechain id {statechain_id} has a spine-tip row that names a different coin \
+                 ({}). Refusing to convey it on the flat lane — that row is not evidence about this \
+                 coin.",
+                tip.statechain_id
             ));
         }
         return Ok(Some(PermanentLicence::FundingNotOnChain));
@@ -1473,6 +1502,10 @@ mod flat_lane_tests {
             (LADDER_MANAGED_KEY, "1"),
             ("tesr-abc", "{}"),
             ("ctesr-abc", "{}"),
+            // [CATS/V4] A spine tip is a ladder artefact. Without this the one wallet shape that
+            // holds ONLY a tip — a sender whose single CATS payment left it holding the change —
+            // would read as "provably never laddered" and every coin in it would be licensed flat.
+            ("spinetip-abc", "{}"),
             ("ladderskip-abc", "{}"),
             ("ladderskip-abc#1", "{}"),
         ] {
@@ -1509,6 +1542,10 @@ mod flat_lane_tests {
         assert_eq!(licence_funding_not_onchain(&row("branch-abc", "[]"), "abc").unwrap(), None);
         // No rows at all: nothing learned here.
         assert_eq!(licence_funding_not_onchain(&WalletRows(vec![]), "abc").unwrap(), None);
+        // [CATS/V4] The SPINE TIP arm holds itself to the identical standard. `{}` parses as JSON
+        // but not as a `SpineTipBundle`, so it is an error, not a licence.
+        assert!(licence_funding_not_onchain(&row("spinetip-abc", "not json"), "abc").is_err());
+        assert!(licence_funding_not_onchain(&row("spinetip-abc", "{}"), "abc").is_err());
     }
 
     /// A terminalized carrier must be POSITIVELY proven from the coin, never assumed from a record —

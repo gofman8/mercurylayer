@@ -120,6 +120,31 @@ pub fn min_child_value(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
         .saturating_add(dust_limit)
 }
 
+/// **[CATS change 2 / V5] The smallest value a SPINE TIP can carry and still be exitable.**
+///
+/// The tip is the sender's CHANGE leg, and its shape is not the piece's: it gets ONE cap tier
+/// directly over `SP.out[K]` and **no extension** (the extension exists to reset the state budget by
+/// renewal, and on the spine every payment already lands the change on a virgin outpoint at a virgin
+/// `D0`, so the rung is dead weight). So it funds ONE rung, not two:
+///
+/// ```text
+/// min_spine_tip_value = committed_fee + P2A + dust = 250 + 240 + 330 = 820   @ 2 sat/vB
+/// min_child_value     = 2·(committed_fee + P2A) + dust                = 1 310
+/// ```
+///
+/// ⚠️ **This floor is for the CHANGE leg only.** Applying it to a payee's piece admits a piece that
+/// cannot fund its own two tiers — and it dies inside `establish_child`, i.e. *after* the parent's
+/// spend budget is consumed and `SP` is co-signed, stranding the parent to unilateral-exit-only. That
+/// is why the SDK's floor accessor returns a floor **per leg** rather than one number for both, and
+/// why the leg's shape is not a caller's choice: see `mercuryrustlib::tesr::change_leg_role`.
+pub fn min_spine_tip_value(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
+    // Saturating for the same reason as `min_child_value`: an absurd rate must refuse everything, not
+    // panic in a floor computation that exists to refuse.
+    committed_fee(fee_rate_sats_per_vb)
+        .saturating_add(P2A_VALUE)
+        .saturating_add(dust_limit)
+}
+
 /// nSequence for a BIP-68 relative-block-height lock of `blocks` (the tx must be v≥2; TES-R tiers are
 /// v3). For a block-height lock the raw value equals `blocks` — the type flag (bit 22) and the
 /// disable bit (bit 31) are both clear.
@@ -460,11 +485,48 @@ pub fn build_split_state(
     csv_d: u16,
     fee_rate: f64,
 ) -> Result<TierTx, MercuryError> {
+    build_split_state_from(
+        x_txid,
+        UNCOLORED_PAYLOAD_VOUT,
+        x_out_value,
+        children,
+        network,
+        csv_d,
+        fee_rate,
+    )
+}
+
+/// [CATS] [`build_split_state`] rooted at an ARBITRARY outpoint `(prev_txid, prev_vout)`.
+///
+/// **Why the vout cannot stay hard-coded.** `build_split_state` fixed its input vout at
+/// [`UNCOLORED_PAYLOAD_VOUT`], which is right for the two shapes that existed when it was written —
+/// `SP` over `X_m.out[0]` and `CSP` over `ext_child.out[0]`. It is WRONG for every spine batch after
+/// the first: the sender's tip lives at `SP_i.out[K]` with `K >= 1` (it is the LAST payload output of
+/// the previous batch), so batch *i+1* spends `(SP_i.txid, K)`.
+///
+/// Reusing the vout-0 builder there would not fail loudly. It would produce a transaction whose input
+/// names `SP_i.out[0]` — a PAYEE's slot — while the co-sign it is about to be given commits, through
+/// the taproot `SIGHASH_ALL` sighash, to that same wrong outpoint. The signature would be valid, the
+/// transaction would be un-broadcastable forever, and the discovery would come AFTER
+/// `set_spend_budget` had already terminalized the tip: the sender's own change, stranded by a
+/// positional literal.
+///
+/// Same conservation law, same encoding, one extra parameter.
+pub fn build_split_state_from(
+    prev_txid: &str,
+    prev_vout: u32,
+    prev_out_value: u64,
+    children: &[(String, u64)],
+    network: &str,
+    csv_d: u16,
+    fee_rate: f64,
+) -> Result<TierTx, MercuryError> {
     if children.is_empty() {
         return Err(MercuryError::FeeTooHigh);
     }
-    let txid = Txid::from_str(x_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
-    let available = tier_out_total(x_out_value, children.len(), fee_rate).ok_or(MercuryError::FeeTooHigh)?;
+    let txid = Txid::from_str(prev_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
+    let available =
+        tier_out_total(prev_out_value, children.len(), fee_rate).ok_or(MercuryError::FeeTooHigh)?;
     let total: u64 = children.iter().map(|(_, v)| *v).sum();
     if total != available {
         // Σout must equal Σin − fee_committed exactly (PROTOCOL.md §5.4).
@@ -479,9 +541,9 @@ pub fn build_split_state(
         version: 3,
         lock_time: absolute::LockTime::from_consensus(0),
         input: vec![TxIn {
-            // SP spends the extension's PAYLOAD output — not a positional `0`. Child `j` then lands at
-            // `payload_vout + j` (see the returned [`TierTx::payload_vout`]).
-            previous_output: OutPoint { txid, vout: UNCOLORED_PAYLOAD_VOUT },
+            // The split state spends the funding tier's PAYLOAD output — not a positional `0`. Child
+            // `j` then lands at `payload_vout + j` (see the returned [`TierTx::payload_vout`]).
+            previous_output: OutPoint { txid, vout: prev_vout },
             script_sig: ScriptBuf::new(),
             sequence: csv_blocks(csv_d),
             witness: Witness::default(),
@@ -591,6 +653,41 @@ mod tests {
         let paid: u64 = tx.output[..3].iter().map(|o| o.value).sum();
         assert_eq!(paid, avail, "Σout == Σin − fee_committed (no mint, no burn)");
         assert_eq!(paid + P2A_VALUE + committed_fee_for_outputs(3, rate), x_val);
+    }
+
+    /// **[CATS] The spine's split state roots at `SP_i.out[K]`, not `out[0]`.**
+    ///
+    /// The sender's tip is the LAST payload output of the previous batch, so every batch after the
+    /// first spends a vout `>= 1`. Reusing the vout-0 builder there would not fail loudly: it would
+    /// produce a transaction naming a PAYEE's slot as its input, and the taproot SIGHASH_ALL co-sign
+    /// taken over it would commit to that same wrong outpoint — a valid signature over a transaction
+    /// that can never be broadcast, discovered only after `set_spend_budget` had terminalized the tip.
+    #[test]
+    fn split_state_from_roots_at_the_named_outpoint() {
+        let x = "0000000000000000000000000000000000000000000000000000000000000001";
+        let a = test_addr();
+        let (x_val, rate) = (200_000u64, 2.0);
+        let avail = tier_out_total(x_val, 2, rate).unwrap();
+        let kids = vec![(a.clone(), 1_000u64), (a.clone(), avail - 1_000)];
+
+        for vout in [0u32, 1, 7] {
+            let sp = build_split_state_from(x, vout, x_val, &kids, "regtest", 0, rate).unwrap();
+            let tx: Transaction =
+                bitcoin::consensus::encode::deserialize(&hex::decode(&sp.tx_hex).unwrap()).unwrap();
+            assert_eq!(tx.input[0].previous_output.vout, vout, "the input must be the one asked for");
+            assert_eq!(tx.input[0].sequence, csv_blocks(0), "spine tiers carry SPINE_CSV");
+            let paid: u64 = tx.output[..2].iter().map(|o| o.value).sum();
+            assert_eq!(paid, avail, "the conservation law is unchanged by the outpoint");
+        }
+
+        // The old entry point is exactly the vout-0 case, byte for byte — so nothing that already
+        // spends `X_m.out[0]` or `ext_child.out[0]` changes shape, txid, or signature.
+        assert_eq!(
+            build_split_state(x, x_val, &kids, "regtest", 0, rate).unwrap().tx_hex,
+            build_split_state_from(x, UNCOLORED_PAYLOAD_VOUT, x_val, &kids, "regtest", 0, rate)
+                .unwrap()
+                .tx_hex
+        );
     }
 
     #[test]
@@ -863,6 +960,36 @@ mod tests {
         let plain_rung = committed_fee(rate) + P2A_VALUE;
         assert_eq!(tier_out_value(1_000_000, rate), Some(1_000_000 - plain_rung));
         assert_eq!(tier_out_total(1_000_000, 1, rate), tier_out_value(1_000_000, rate));
+        // [CATS/V5] …and the SPINE TIP funds exactly ONE rung, so it is one rung cheaper. Both
+        // numbers are derived from `TIER_VBYTES`, not written down.
+        assert_eq!(min_spine_tip_value(rate, dust), plain_rung + dust);
+        assert_eq!(min_spine_tip_value(rate, dust), 820);
+        assert_eq!(
+            min_child_value(rate, dust) - min_spine_tip_value(rate, dust),
+            plain_rung,
+            "the tip's saving is exactly the extension rung it does not build"
+        );
+    }
+
+    /// **[V5] The two floors are NOT interchangeable, and the cheap one is the dangerous one.**
+    ///
+    /// `min_spine_tip_value` is 490 sat below `min_child_value` at the default rate. Applied to a
+    /// PAYEE's piece it admits a value that cannot fund the piece's second rung — and the failure
+    /// lands inside `establish_child`, after `set_spend_budget` has already terminalized the parent.
+    /// So the ordering is asserted here rather than left as a comment: any future edit that lets the
+    /// tip floor rise to or above the child floor (or the child floor fall to the tip's) breaks a
+    /// test instead of a coin.
+    #[test]
+    fn the_spine_tip_floor_is_strictly_below_the_child_floor_at_every_shipped_rate() {
+        for rate in [1.0f64, 2.0, 5.0, 10.0, 50.0] {
+            let dust = 330u64;
+            assert!(
+                min_spine_tip_value(rate, dust) < min_child_value(rate, dust),
+                "rate {rate}: a one-rung floor must be cheaper than a two-rung floor"
+            );
+            // …and it is still above bare dust: a tip that cannot pay for its own cap is not a coin.
+            assert!(min_spine_tip_value(rate, dust) > dust);
+        }
     }
 
     #[test]

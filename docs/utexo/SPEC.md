@@ -718,7 +718,11 @@ spendable balance would let a right-holder inflate a receiver's balance out of n
   unsigned superseded tier, a superseded CSV that ties or wins, or a ladder not exiting to the
   receiver's own key).
 - **ERR-16** in-ladder split below the admission floor (§5.1) → refused BEFORE the parent's budget is
-  consumed: `in-ladder split needs both piece (…) and change (…) >= N sat`.
+  consumed: `in-ladder split refused — the piece falls short` / `… the change falls short` / `… both
+  legs fall short`, naming each leg's own floor. The two legs are floored independently
+  (`SplitFloors { piece, change }`): a piece always funds two rungs, the change funds whatever
+  `change_leg_role()` says the builders give it — two today, ONE (`min_spine_tip_value`, 820 sat
+  plain / 906 coloured) once CATS change 2 lands.
 
 ---
 
