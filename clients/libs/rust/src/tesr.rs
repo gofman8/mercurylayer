@@ -397,10 +397,29 @@ pub struct ColoredChild {
     pub consignments: Vec<String>,
 }
 
+/// **The `SP` tier a segment's `sp_vout` indexes into — ONE definition for both leaf shapes.**
+///
+/// A split child and a spine tip carry the same convention, spelled out in
+/// [`ChildTesrBundle::ancestors`]: `sp_vout` is relative to the IMMEDIATELY PRECEDING segment, which
+/// is `parent.current().state` only while `ancestors` is empty and `ancestors.last().state` after
+/// that. Written out twice it drifts, and the drift is silent — a depth-2 record would name a
+/// perfectly real outpoint belonging to the wrong `SP`, so every read of it (funding value, RGB
+/// spend-marking, the cap's re-anchor) would be confidently wrong rather than absent.
+fn segment_funding_tier<'a>(parent: &'a TesrBundle, ancestors: &'a [ChildSegment]) -> &'a TesrTier {
+    ancestors.last().map_or(&parent.current().state, |seg| &seg.state)
+}
+
 impl ChildTesrBundle {
     /// True iff this child carries an RGB allocation (CTES-R).
     pub fn is_colored(&self) -> bool {
         self.rgb.is_some()
+    }
+
+    /// `SP.out[sp_vout]` — the un-broadcast outpoint this child's ladder hangs off, and the outpoint
+    /// an RGB engine has registered for it while it is off-chain. See [`segment_funding_tier`] for
+    /// why the `SP` is not unconditionally the root parent's.
+    pub fn funding_outpoint(&self) -> (String, u32) {
+        (segment_funding_tier(&self.parent, &self.ancestors).txid.clone(), self.sp_vout)
     }
 
     /// The FULL off-chain witness list a coloured child's consignments must be resolved against, in
@@ -616,6 +635,280 @@ impl SpineTipBundle {
     pub fn is_colored(&self) -> bool {
         self.rgb.is_some()
     }
+
+    /// The `SP` tier whose `out[sp_vout]` funds this tip — the root parent's split state for a
+    /// depth-1 tip, the LAST intermediate segment's for a tip that descends through earlier spine
+    /// levels. See [`segment_funding_tier`].
+    pub fn funding_tier(&self) -> &TesrTier {
+        segment_funding_tier(&self.parent, &self.ancestors)
+    }
+
+    /// `SP.out[K]` — the un-broadcast outpoint the cap spends, the outpoint the NEXT batch's
+    /// `SP_{i+1}` spends instead, and the outpoint an RGB engine has registered while the tip is
+    /// off-chain.
+    pub fn funding_outpoint(&self) -> (String, u32) {
+        (self.funding_tier().txid.clone(), self.sp_vout)
+    }
+
+    /// **Is this record self-consistent?** A `SpineTipBundle` is the sender's own write, and every
+    /// field of it is later read as fact by something that spends money:
+    ///
+    /// * `sp_out_value` feeds [`ParentShape::SpineTip::split_source_value`] straight into the NEXT
+    ///   batch's payload arithmetic (`rust-sdk/src/transfer.rs`), so a wrong number mis-prices a
+    ///   whole batch of payees — silently, because the split builder's own conservation law is
+    ///   satisfied by any self-consistent set of amounts;
+    /// * `cap.payload_vout` is where a coloured tip's allocation is booked once the exit lands
+    ///   ([`colored_exit_move`]), and the P2A anchor sits one output away;
+    /// * `funding_outpoint()` is what the RGB engine is told the walk has SPENT.
+    ///
+    /// None of that has a counterparty to catch it. So the record is checked against ITSELF, and the
+    /// arbiter is the signed transaction rather than the neighbouring serde field — the cap's
+    /// taproot `SIGHASH_ALL` sighash commits to `previous_output` and `nSequence`, so those two are
+    /// facts the writer cannot restate.
+    ///
+    /// **Structural checks strictly before value checks.** The prevout re-anchor and the payee pin
+    /// run first; only then is any output turned into a number. That ordering is the one this file
+    /// has lost four times (see `mod linked`), and here it is what makes "the value at
+    /// `SP.out[sp_vout]`" a statement about the outpoint the cap provably spends rather than about
+    /// an index the writer chose.
+    ///
+    /// The cap's CSV band is `[d_floor, d0]` and deliberately **not** `[0, 0]`: the cap is the
+    /// sender's slow exit leg, and it is precisely what the next batch's `SP` at [`SPINE_CSV`] has
+    /// to out-race.
+    pub fn validate(&self) -> Result<()> {
+        use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
+
+        let sid = &self.statechain_id;
+        let funding = self.funding_tier();
+
+        // ---- STRUCTURE ------------------------------------------------------------------------
+        let cap_raw = hex::decode(&self.cap.signed_tx).map_err(|e| {
+            anyhow::anyhow!("spine tip {sid}: the cap's signed tx hex does not decode ({e})")
+        })?;
+        let cap_tx: Transaction = deserialize(&cap_raw).map_err(|e| {
+            anyhow::anyhow!("spine tip {sid}: the cap's signed tx does not parse ({e})")
+        })?;
+        if cap_tx.txid().to_string() != self.cap.txid {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: the cap's stored tx hashes to {} but the record names {} — every \
+                 reader that decides 'has the exit landed?' keys on the NAME, so it would report a \
+                 completed exit for a transaction that was never broadcast",
+                cap_tx.txid(),
+                self.cap.txid
+            ));
+        }
+        if cap_tx.input.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: the cap has {} inputs — a cap spends exactly its funding \
+                 `SP.out[K]` and nothing else",
+                cap_tx.input.len()
+            ));
+        }
+        // THE RE-ANCHOR. Derived, not declared: this outpoint is committed by the cap's own
+        // SIGHASH_ALL sighash, so it cannot be repointed without invalidating the SE's signature.
+        let spends = cap_tx.input[0].previous_output;
+        if spends.txid.to_string() != funding.txid || spends.vout != self.sp_vout {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: its cap spends {}:{} but the record declares it funded by \
+                 {}:{} — the tip's whole shape (one cap directly over `SP.out[K]`, no extension) \
+                 rests on those being the same outpoint",
+                spends.txid,
+                spends.vout,
+                funding.txid,
+                self.sp_vout
+            ));
+        }
+        // PIN 2 — the cap pays THIS wallet's exit key at its declared payload index. Pins
+        // `payload_vout` before anything reads a value through it; without this the P2A anchor
+        // (240 sat) sits one index away and every value law below would compute on it.
+        let net = net_from_str(&self.parent.network);
+        let owner_spk = Address::from_str(&self.owner_exit_address)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "spine tip {sid}: owner_exit_address {} is not a valid address",
+                    self.owner_exit_address
+                )
+            })?
+            .require_network(net)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "spine tip {sid}: owner_exit_address {} is for the wrong network",
+                    self.owner_exit_address
+                )
+            })?
+            .script_pubkey();
+        let cap_payload = self.cap.link_pays(
+            &cap_tx,
+            &owner_spk,
+            "spine tip cap",
+            &format!(
+                "spine tip {sid}: the cap's payload output does not pay the recorded exit address \
+                 {} — the change would land somewhere this wallet cannot spend it",
+                self.owner_exit_address
+            ),
+        )?;
+
+        // ---- VALUE (only now) -----------------------------------------------------------------
+        if cap_payload.value() != self.cap.out_value {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: the cap declares out_value {} but its payload output carries {}",
+                self.cap.out_value,
+                cap_payload.value()
+            ));
+        }
+        let sp_raw = hex::decode(&funding.signed_tx).map_err(|e| {
+            anyhow::anyhow!("spine tip {sid}: the funding SP's signed tx hex does not decode ({e})")
+        })?;
+        let sp_tx: Transaction = deserialize(&sp_raw).map_err(|e| {
+            anyhow::anyhow!("spine tip {sid}: the funding SP's signed tx does not parse ({e})")
+        })?;
+        if sp_tx.txid().to_string() != funding.txid {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: the funding SP's stored tx hashes to {} but the segment names {}",
+                sp_tx.txid(),
+                funding.txid
+            ));
+        }
+        // Safe by the re-anchor above: `sp_vout` is the index the cap's SIGNATURE names, not one
+        // this record chose.
+        let sp_out = sp_tx.output.get(self.sp_vout as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "spine tip {sid}: the funding SP has no output {} ({} outputs)",
+                self.sp_vout,
+                sp_tx.output.len()
+            )
+        })?;
+        if sp_out.value != self.sp_out_value {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: sp_out_value is recorded as {} but `SP.out[{}]` carries {} — the \
+                 next batch would carve its payees out of an amount that does not exist",
+                self.sp_out_value,
+                self.sp_vout,
+                sp_out.value
+            ));
+        }
+
+        // ---- THE CSV BAND, read off the SIGNATURE ---------------------------------------------
+        let signed_csv = signed_relative_csv(&cap_tx, "spine tip cap")?;
+        let csv = mercurylib::transfer::receiver::bind_declared_csv(
+            0,
+            "spine tip cap",
+            self.cap.csv,
+            signed_csv,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "spine tip {sid}: the cap's relative timelock is DISABLED — the cap is the sender's \
+                 SLOW leg and must sit in [{}, {}], or the next batch's SP has nothing to out-race",
+                self.parent.params.d_floor,
+                self.parent.params.d0
+            )
+        })?;
+        let p = &self.parent.params;
+        if csv < p.d_floor || csv > p.d0 {
+            return Err(anyhow::anyhow!(
+                "spine tip {sid}: the cap's signed CSV is {csv}, outside the state band [{}, {}]. \
+                 It is NOT pinned to {SPINE_CSV} like a spine tier: a cap at {SPINE_CSV} would \
+                 leave the next batch's SP no margin at all, and the builders' `s0_csv <= \
+                 {SPINE_CSV}` guard would then refuse to build that batch, stranding the tip",
+                p.d_floor,
+                p.d0
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// **Where a COLOURED record's allocation moves when its unilateral exit lands.** Consumed by
+/// [`colored_exit_move`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColoredExitMove {
+    /// The outpoint the walk's LAST tier pays — where the allocation physically ends up.
+    pub tip_txid: String,
+    pub tip_vout: u32,
+    pub tip_value: u64,
+    pub contract_id: String,
+    pub amount: u64,
+    /// `txid:vout` of the outpoint an RGB engine still has registered and the walk has now SPENT.
+    /// Marking the wrong one leaves the allocation counted twice.
+    pub spent_outpoint: String,
+}
+
+/// The three shapes a coin's off-chain exit material can take — a root ladder (`tesr-`), an adopted
+/// split child (`ctesr-`), or a spine tip (`spinetip-`).
+///
+/// **The point of the enum is the `match`.** Every one of these shapes moves an RGB allocation from
+/// one outpoint to another when it exits, and the sites that resolve that move were written as an
+/// `if let … else if let … else { None }` chain. A new record shape then does not produce an
+/// absence there — it produces `Ok(None)`, which the caller reads as "plain coin, nothing to do",
+/// with no event and no error. That is exactly how the coloured spine tip fell through
+/// [`colored_exit_move`]'s caller. Routed through an exhaustive `match`, the next shape added is a
+/// compile error instead.
+pub enum LadderRecord<'a> {
+    Root(&'a TesrBundle),
+    Child(&'a ChildTesrBundle),
+    Tip(&'a SpineTipBundle),
+}
+
+/// **What the RGB engine must be told once a COLOURED record's unilateral exit has landed.**
+/// `None` for a PLAIN record — a plain walk moves no allocation, so there is nothing to book.
+///
+/// Until this runs for a record, every UTXO-driven rgb-lib view (`get_asset_balance`,
+/// `list_unspents`, `list_allocations`, `blind_receive`) is not merely incomplete but **STALE**: it
+/// reports the asset at an outpoint that has been spent on chain and no longer exists. The engine
+/// cannot discover the new one by itself — every tier pays a Mercury seed-derived key that is not in
+/// its BDK descriptor, so no wallet sync will ever surface it.
+///
+/// The `spent_outpoint` is the interesting term in all three arms, and it is NOT the coin's `F`
+/// except for a root ladder. A child's and a tip's allocation was booked at their own funding
+/// `SP.out[j]` when the split was made (the parent's `F` was marked spent then); naming `F` again
+/// here would leave the leaf's own allocation counted twice.
+pub fn colored_exit_move(rec: LadderRecord<'_>) -> Option<ColoredExitMove> {
+    match rec {
+        LadderRecord::Root(b) => {
+            let rgb = b.rgb.as_ref()?;
+            let tip = &b.current().state;
+            Some(ColoredExitMove {
+                tip_txid: tip.txid.clone(),
+                tip_vout: tip.payload_vout,
+                tip_value: tip.out_value,
+                contract_id: rgb.contract_id.clone(),
+                amount: rgb.amount,
+                spent_outpoint: format!("{}:{}", b.f_txid, b.f_vout),
+            })
+        }
+        LadderRecord::Child(cb) => {
+            let rgb = cb.rgb.as_ref()?;
+            let tip = &cb.child_state;
+            let (sp_txid, sp_vout) = cb.funding_outpoint();
+            Some(ColoredExitMove {
+                tip_txid: tip.txid.clone(),
+                tip_vout: tip.payload_vout,
+                tip_value: tip.out_value,
+                contract_id: rgb.contract_id.clone(),
+                amount: rgb.amount,
+                spent_outpoint: format!("{sp_txid}:{sp_vout}"),
+            })
+        }
+        // [CATS/V4] **The arm the enumerator sweep missed.** A coloured tip is the sender's own
+        // change: its allocation sits on the un-broadcast `SP.out[K]` (booked there by the coloured
+        // split's own `register_statechain`), and its ONE cap moves it to the sender's exit key.
+        // With no arm here the caller returned `Ok(None)` — indistinguishable from "plain coin" —
+        // so the walk landed on chain and the engine went on advertising the balance at an outpoint
+        // the cap had just spent. No event, no error, a confident wrong answer.
+        LadderRecord::Tip(tip) => {
+            let rgb = tip.rgb.as_ref()?;
+            let (sp_txid, sp_vout) = tip.funding_outpoint();
+            Some(ColoredExitMove {
+                tip_txid: tip.cap.txid.clone(),
+                tip_vout: tip.cap.payload_vout,
+                tip_value: tip.cap.out_value,
+                contract_id: rgb.contract_id.clone(),
+                amount: rgb.amount,
+                spent_outpoint: format!("{sp_txid}:{sp_vout}"),
+            })
+        }
+    }
 }
 
 /// The wallet-DB key prefix for a [`SpineTipBundle`]. **One spelling, one constant** — every reader
@@ -624,11 +917,19 @@ impl SpineTipBundle {
 pub const SPINE_TIP_KEY_PREFIX: &str = "spinetip-";
 
 /// Persist a spine tip under `spinetip-<statechain_id>` (replaces any prior tip for that slot).
+///
+/// **[`SpineTipBundle::validate`] is a PRECONDITION, not an afterthought.** This is the producer's
+/// only door, and it is the last moment at which a mis-shaped tip is still just a value in memory.
+/// One write later it is the wallet's own source of truth: `parent_shape` prices the next batch off
+/// its `sp_out_value`, `unilateral_exit` broadcasts its cap, and `colored_exit_move` books its
+/// allocation — none of which has a counterparty to notice. Refusing here costs the caller an error
+/// on a record it can still rebuild; refusing later costs it a batch of payees.
 pub async fn persist_spine_tip(
     cc: &ClientConfig,
     wallet_name: &str,
     tip: &SpineTipBundle,
 ) -> Result<()> {
+    tip.validate()?;
     let json = serde_json::to_string(tip)?;
     crate::sqlite_manager::insert_raw_backup_txs(
         &cc.pool,
@@ -654,21 +955,13 @@ pub async fn load_spine_tip(
     Ok(None)
 }
 
-/// Statechain ids of every coin backed by a spine-tip record. The tip's funding `SP.out[K]` is
-/// un-broadcast, so — exactly like [`child_claim_sids`] — these coins are withdrawn by unilateral
-/// exit rather than by a cooperative on-chain spend. One wallet-DB read.
-pub async fn spine_tip_sids(
-    cc: &ClientConfig,
-    wallet_name: &str,
-) -> Result<std::collections::HashSet<String>> {
-    let mut set = std::collections::HashSet::new();
-    for (k, _json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
-        if let Some(sid) = k.strip_prefix(SPINE_TIP_KEY_PREFIX) {
-            set.insert(sid.to_string());
-        }
-    }
-    Ok(set)
-}
+// **DELETED: `spine_tip_sids`.** It was written as the tip-lane sibling of `child_claim_sids` — a
+// set of "coins that must be withdrawn by unilateral exit rather than cooperatively" — and it had
+// zero callers, in this commit and in principle: `child_claim_sids` itself was RETIRED when the
+// candidate-selection exclusion it fed moved into `payment_coins`/`plan_payment`, and the two
+// remaining sites that need the same fact (`withdraw`, `parent_shape`) ask about ONE coin and use
+// `load_spine_tip`. A `pub` helper with no caller reads as coverage of a case nobody covers; the
+// V4 sweep is only worth what its WIRED sites are worth, so an unwired one is worse than absent.
 
 /// Human names for [`spine_tip_exit_chain`]'s entries, in the same order — same lock-step contract as
 /// [`child_exit_labels`]: the two loops are reconciled only by a length check, so they are edited
@@ -8924,6 +9217,10 @@ mod spine_tip_tests {
 
     /// A depth-1 tip over `sample_bundle`: the parent's own state tier stands in for the cap, which
     /// is exactly the right shape — a cap IS a state tier, hung one level lower.
+    ///
+    /// ⚠️ SHAPE ONLY. Its cap spends the parent's `X_m`, not `SP.out[1]`, so it does NOT satisfy
+    /// [`SpineTipBundle::validate`] and must not be reused for anything that reads the signed
+    /// transactions. Use `sample_valid_tip` for those.
     pub(super) fn sample_tip() -> SpineTipBundle {
         let parent = sample_bundle();
         let cap = parent.levels[0].state.clone();
@@ -9033,6 +9330,215 @@ mod spine_tip_tests {
             SplitLegRole::Piece,
             "the split builders still give the change leg two tiers; the floor must say so"
         );
+    }
+
+    /// A tip whose material is REAL: `SP` is a genuine 2-payload split state over `X_m.out[0]`, and
+    /// the cap is a genuine state tier built over `SP.out[1]`. [`SpineTipBundle::validate`] reads
+    /// the signed transactions, so a fixture of hand-written stubs would prove nothing about it.
+    fn sample_valid_tip() -> SpineTipBundle {
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let mut parent = sample_bundle();
+        let x = parent.levels[0].extension.clone();
+        // SP pays a payee's piece at out[0] and the sender's own tip at out[1].
+        let avail =
+            mercurylib::tesr::tier_out_total(x.out_value, 2, p.committed_fee_rate).unwrap();
+        let piece = avail / 2;
+        let tip_value = avail - piece;
+        let sp = mercurylib::tesr::build_split_state(
+            &x.txid,
+            x.out_value,
+            &[(OWNER.to_string(), piece), (OWNER.to_string(), tip_value)],
+            "regtest",
+            SPINE_CSV,
+            p.committed_fee_rate,
+        )
+        .unwrap();
+        parent.levels[0].state = TesrTier {
+            txid: sp.txid.clone(),
+            signed_tx: sp.tx_hex,
+            out_value: sp.out_value,
+            csv: Some(SPINE_CSV),
+            payload_vout: sp.payload_vout,
+        };
+        // The cap: ONE tier, directly over `SP.out[1]`, at `D0` — no extension between them.
+        let cap = mercurylib::tesr::build_state_from(
+            &sp.txid,
+            1,
+            tip_value,
+            OWNER,
+            "regtest",
+            p.state_csv(0),
+            p.committed_fee_rate,
+        )
+        .unwrap();
+        SpineTipBundle {
+            parent_statechain_id: parent.statechain_id.clone(),
+            sp_out_value: tip_value,
+            parent,
+            ancestors: vec![],
+            sp_vout: 1,
+            statechain_id: "tip-sid".into(),
+            owner_exit_address: OWNER.into(),
+            cap: TesrTier {
+                txid: cap.txid,
+                signed_tx: cap.tx_hex,
+                out_value: cap.out_value,
+                csv: Some(p.state_csv(0)),
+                payload_vout: cap.payload_vout,
+            },
+            superseded_caps: vec![],
+            parent_flat_backups: vec![],
+            rgb: None,
+        }
+    }
+
+    /// **[F2] The record is checked against ITSELF, and the arbiter is the signature.**
+    ///
+    /// A tip has no counterparty: nobody else ever verifies it, so every field it gets wrong is
+    /// believed until it costs something. `sp_out_value` is the sharpest of them — `parent_shape`
+    /// feeds it straight into the next batch's payload arithmetic, and the split builder's own
+    /// conservation law is satisfied by ANY self-consistent set of amounts, so an inflated one
+    /// mis-prices a whole batch of payees with every downstream check passing.
+    ///
+    /// Non-vacuity is built in: the honest fixture is asserted to PASS first, so each refusal below
+    /// is attributable to the one field it tampers with and not to a fixture that never validated.
+    #[test]
+    fn a_spine_tip_record_that_lies_about_its_own_funding_is_refused() {
+        let good = sample_valid_tip();
+        good.validate().expect("the honest fixture must validate, or every refusal below is vacuous");
+
+        // (1) THE RE-ANCHOR. The cap's signed prevout is the one fact the writer cannot restate:
+        // re-pointing `sp_vout` at the payee's slot leaves the signature naming `out[1]`.
+        let mut wrong_vout = sample_valid_tip();
+        wrong_vout.sp_vout = 0;
+        let e = wrong_vout.validate().expect_err("a tip funded by a different SP output is a lie");
+        assert!(e.to_string().contains("but the record declares it funded by"), "got: {e}");
+
+        // …and the same check catches a re-parented tip: a record whose ancestors say the cap hangs
+        // off a segment the cap's signature has never heard of.
+        let mut reparented = sample_valid_tip();
+        reparented.ancestors.push(ChildSegment {
+            statechain_id: "seg".into(),
+            funding_vout: 1,
+            extension: None,
+            state: reparented.parent.trigger.clone(),
+            superseded_states: vec![],
+            superseded_extensions: vec![],
+        });
+        let e = reparented.validate().expect_err("the cap does not spend that segment's state");
+        assert!(e.to_string().contains("but the record declares it funded by"), "got: {e}");
+
+        // (2) THE SOURCE VALUE — the number that prices the next batch.
+        let mut fat = sample_valid_tip();
+        fat.sp_out_value += 50_000;
+        let e = fat.validate().expect_err("an inflated sp_out_value mis-prices the next batch");
+        assert!(
+            e.to_string().contains("the next batch would carve its payees out of an amount that \
+                                    does not exist"),
+            "got: {e}"
+        );
+
+        // (3) THE CSV BAND — `[d_floor, d0]`, and emphatically NOT `[0,0]`. A cap pinned to the
+        // spine CSV would leave the next batch's SP nothing to out-race, and the builders' own
+        // `s0_csv <= SPINE_CSV` guard would then refuse to build that batch at all.
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let mut zero_csv = sample_valid_tip();
+        let sp_txid = zero_csv.funding_tier().txid.clone();
+        let recap = |csv: u16| {
+            let t = mercurylib::tesr::build_state_from(
+                &sp_txid,
+                1,
+                zero_csv.sp_out_value,
+                OWNER,
+                "regtest",
+                csv,
+                p.committed_fee_rate,
+            )
+            .unwrap();
+            TesrTier {
+                txid: t.txid,
+                signed_tx: t.tx_hex,
+                out_value: t.out_value,
+                csv: Some(csv),
+                payload_vout: t.payload_vout,
+            }
+        };
+        zero_csv.cap = recap(SPINE_CSV);
+        let e = zero_csv.validate().expect_err("a cap at the spine CSV strands the tip");
+        assert!(e.to_string().contains("outside the state band"), "got: {e}");
+        // Below the floor is refused for the same reason; the floor itself is admitted.
+        let mut under = sample_valid_tip();
+        under.cap = recap(p.d_floor - 1);
+        assert!(under.validate().is_err(), "d_floor - 1 is outside the band");
+        let mut at_floor = sample_valid_tip();
+        at_floor.cap = recap(p.d_floor);
+        at_floor.validate().expect("the floor itself is inside the band");
+
+        // (4) THE DECLARED FIELD MAY NEVER WIN. `cap.csv` is serde; the nSequence is signed. A
+        // record that declares an in-band CSV over an out-of-band signature is refused on the
+        // disagreement, not admitted on the declaration.
+        let mut liar = sample_valid_tip();
+        liar.cap = recap(SPINE_CSV);
+        liar.cap.csv = Some(p.state_csv(0));
+        assert!(liar.validate().is_err(), "the declared CSV must never override the signed one");
+    }
+
+    /// **[F1] A coloured tip's exit MOVES its allocation, and the move is resolved against the
+    /// tip's OWN funding outpoint.**
+    ///
+    /// This is the sweep hole that made the producer flip unsafe. `register_colored_exit_tip`
+    /// resolved two record shapes and returned `Ok(None)` for everything else — the same answer it
+    /// gives a plain coin, and one its caller maps to no event, no fault and no error. A coloured
+    /// tip therefore completed its walk on chain while the RGB engine went on advertising the
+    /// allocation at `SP.out[K]`, an outpoint the cap had just spent.
+    ///
+    /// The DEPTH case is the second half and is not decoration: naming the root parent's `SP` for a
+    /// tip that descends through earlier spine levels would be a real, existing outpoint belonging
+    /// to the wrong transaction — the failure mode that survives adding an arm carelessly.
+    #[test]
+    fn a_coloured_spine_tip_moves_its_allocation_off_its_own_funding_sp() {
+        let mut tip = sample_valid_tip();
+        tip.rgb = Some(ColoredTip {
+            contract_id: "rgb:contract".into(),
+            amount: 400,
+            consignment: "cap-consignment".into(),
+        });
+        let mv = colored_exit_move(LadderRecord::Tip(&tip))
+            .expect("a COLOURED tip's exit must be bookable — this is the fallthrough F1 names");
+        // Where the allocation LANDS: the cap's payload output, not the P2A anchor beside it.
+        assert_eq!(mv.tip_txid, tip.cap.txid);
+        assert_eq!(mv.tip_vout, tip.cap.payload_vout);
+        assert_eq!(mv.tip_value, tip.cap.out_value);
+        assert_eq!((mv.contract_id.as_str(), mv.amount), ("rgb:contract", 400));
+        // Where it LEAVES: `SP.out[K]`, the outpoint the engine has registered and the cap spends —
+        // never the parent's `F`, which was marked spent when the split was made and would leave
+        // this allocation counted twice.
+        assert_eq!(
+            mv.spent_outpoint,
+            format!("{}:{}", tip.parent.current().state.txid, tip.sp_vout)
+        );
+        assert_ne!(mv.spent_outpoint, format!("{}:{}", tip.parent.f_txid, tip.parent.f_vout));
+
+        // DEPTH: `sp_vout` is relative to the LAST ancestor segment, not to the root parent.
+        let mut deep = tip.clone();
+        deep.ancestors.push(ChildSegment {
+            statechain_id: "spine-level-2".into(),
+            funding_vout: 1,
+            extension: None,
+            state: deep.parent.levels[0].extension.clone(),
+            superseded_states: vec![],
+            superseded_extensions: vec![],
+        });
+        let mv = colored_exit_move(LadderRecord::Tip(&deep)).expect("still coloured, still bookable");
+        assert_eq!(
+            mv.spent_outpoint,
+            format!("{}:{}", deep.ancestors[0].state.txid, deep.sp_vout),
+            "a deeper tip is funded by the LAST spine level's SP, not the root parent's"
+        );
+
+        // A PLAIN tip moves no allocation — `None` here is the one honest negative, and it must
+        // stay distinguishable from the fallthrough above.
+        assert!(colored_exit_move(LadderRecord::Tip(&sample_valid_tip())).is_none());
     }
 }
 

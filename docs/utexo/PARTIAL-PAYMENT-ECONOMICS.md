@@ -237,9 +237,26 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > segment's own funding outpoint) and the dead-knob refusal. V4 is `SpineTipBundle` under
 > `spinetip-<sid>`, with every fail-open enumerator co-edited — `parent_shape` (a tip is no longer
 > read as un-laddered), `wallet_is_provably_pre_sdk`, `defend_ladders` (its own tower loop, plus the
-> L2 supersession evidence), `colored_child_sids`, `auto_exit_due`, `withdraw` and
-> `unilateral_exit`. V5 is `split_output_floors` → `SplitFloors { piece, change }` with
+> L2 supersession evidence), `colored_child_sids`, `auto_exit_due`, `withdraw`,
+> `unilateral_exit` and — **added 2026-08-04, the one the first sweep missed** —
+> `register_colored_exit_tip`. That last one is worth stating in full, because it is the shape the
+> sweep is fighting: it resolved two record shapes in an `if let … else if let … else { None }`
+> chain, so a coloured tip took the trailing `else` and came back `Ok(None)` — the answer a PLAIN
+> coin gives, which its caller maps to no event, no fault and no error. The tip's cap would land on
+> chain and the RGB engine would go on advertising the allocation at the `SP.out[K]` that cap had
+> just spent: *not merely incomplete but STALE*, the exact wording that function's own doc comment
+> uses about the gap it was written to close. The fix routes all three shapes through one
+> `colored_exit_move` whose `match` is EXHAUSTIVE (a fourth shape is a compile error, not a fourth
+> silent `None`), plus a census asserting the CALLER still constructs all three variants — the half
+> an exhaustive match cannot see. V5 is `split_output_floors` → `SplitFloors { piece, change }` with
 > `min_spine_tip_value` = 820 plain / 906 coloured and per-leg refusal text.
+>
+> `SpineTipBundle::validate()` is now a PRECONDITION of `persist_spine_tip` (the producer's only
+> door): the cap must spend `(SP.txid, sp_vout)` **derived from its own signed prevout**, must pay
+> the recorded exit address at its declared payload index, `sp_out_value` must equal that output's
+> real value, and the cap's SIGNED `nSequence` must sit in `[d_floor, d0]` — not `[0,0]`, which
+> would leave the next batch's `SP` nothing to out-race and strand the tip behind the builders'
+> own `s0_csv <= SPINE_CSV` guard. Structural checks run strictly before value checks.
 >
 > Still to build: change **2** (the change leg keeps its extension, so it is not yet a one-cap spine
 > tip), and change **3** (K > 1 payloads). Until change 2 lands, a payment still adds

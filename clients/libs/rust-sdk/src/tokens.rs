@@ -2419,8 +2419,9 @@ impl UtexoWallet {
     /// **[CTES-R] Register the EXIT TIP with the RGB engine once a coloured walk has completed.**
     ///
     /// After a unilateral exit the allocation physically lives on the last tier's payload output —
-    /// `S_0.out[payload]` for a root ladder, `state_child.out[payload]` for a coloured child — and
-    /// the outpoint the engine still has registered (`F`, or `SP.out[sp_vout]`) has been SPENT on
+    /// `S_0.out[payload]` for a root ladder, `state_child.out[payload]` for a coloured child,
+    /// `cap.out[payload]` for a coloured SPINE TIP — and the outpoint the engine still has
+    /// registered (`F`, or `SP.out[j]`, or `SP.out[K]`) has been SPENT on
     /// chain. Until this runs, every UTXO-driven rgb-lib view (`get_asset_balance`,
     /// `list_unspents`, `list_allocations`, `blind_receive`) is not merely incomplete but STALE: it
     /// reports the asset at an outpoint that no longer exists. That was measured and recorded as a
@@ -2449,62 +2450,66 @@ impl UtexoWallet {
         if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
             return Ok(None);
         }
-        // (tip_txid, tip_vout, tip_value, contract, amount, spent_outpoint)
-        let plan: Option<(String, u32, u64, String, u64, String)> = {
-            if let Some(b) = mercuryrustlib::tesr::load(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                statechain_id,
-            )
-            .await?
-            {
-                match b.rgb.as_ref() {
-                    None => None, // a PLAIN ladder moves no allocation — nothing to register
-                    Some(rgb) => {
-                        let tip = b.current().state.clone();
-                        Some((
-                            tip.txid.clone(),
-                            tip.payload_vout,
-                            tip.out_value,
-                            rgb.contract_id.clone(),
-                            rgb.amount,
-                            format!("{}:{}", b.f_txid, b.f_vout),
-                        ))
-                    }
-                }
-            } else if let Some(cb) = mercuryrustlib::tesr::load_child(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                statechain_id,
-            )
-            .await?
-            {
-                match cb.rgb.as_ref() {
-                    None => None,
-                    Some(rgb) => {
-                        let tip = cb.child_state.clone();
-                        // What the engine has registered for a coloured CHILD is `SP.out[sp_vout]`
-                        // (booked by `accept_colored_child_bundle` / the sender's change
-                        // registration), NOT the parent's `F` — `F` was already marked spent when
-                        // the split was made. Marking the wrong one leaves the child's own
-                        // allocation counted twice.
-                        Some((
-                            tip.txid.clone(),
-                            tip.payload_vout,
-                            tip.out_value,
-                            rgb.contract_id.clone(),
-                            rgb.amount,
-                            format!("{}:{}", cb.parent.current().state.txid, cb.sp_vout),
-                        ))
-                    }
-                }
-            } else {
-                None
+        // WHICH RECORD backs this coin — and then ONE resolver over all of them.
+        //
+        // [CATS/V4] This used to be an `if let … else if let … else { None }` chain over the two
+        // record shapes that existed when it was written, and that shape is the defect: a coloured
+        // SPINE TIP has neither a `tesr-` nor a `ctesr-` row, so it reached the trailing `else` and
+        // came back `Ok(None)` — the same answer a plain coin gives. `register_exit_tip_best_effort`
+        // maps `Ok(None)` to nothing at all: no event, no fault, no error. The tip's cap would land
+        // on chain, spend `SP.out[K]`, and the engine would go on reporting the allocation at that
+        // spent outpoint forever — the exact staleness this function's own doc comment describes,
+        // reintroduced through a door it did not know about.
+        //
+        // So the shapes go through `mercuryrustlib::tesr::colored_exit_move`, whose `match` is
+        // EXHAUSTIVE: the next record shape added is a compile error here rather than a fourth
+        // silent `None`. What remains below is the one honest negative — this coin has no off-chain
+        // exit material of any kind.
+        let root = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?;
+        let child = match &root {
+            Some(_) => None,
+            None => {
+                mercuryrustlib::tesr::load_child(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    statechain_id,
+                )
+                .await?
             }
         };
-        let Some((txid, vout, value, contract, amount, spent)) = plan else {
+        let tip = match (&root, &child) {
+            (None, None) => {
+                mercuryrustlib::tesr::load_spine_tip(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    statechain_id,
+                )
+                .await?
+            }
+            _ => None,
+        };
+        let record = match (&root, &child, &tip) {
+            (Some(b), _, _) => Some(mercuryrustlib::tesr::LadderRecord::Root(b)),
+            (_, Some(cb), _) => Some(mercuryrustlib::tesr::LadderRecord::Child(cb)),
+            (_, _, Some(t)) => Some(mercuryrustlib::tesr::LadderRecord::Tip(t)),
+            _ => None,
+        };
+        let Some(mv) = record.and_then(mercuryrustlib::tesr::colored_exit_move) else {
             return Ok(None);
         };
+        let (txid, vout, value, contract, amount, spent) = (
+            mv.tip_txid,
+            mv.tip_vout,
+            mv.tip_value,
+            mv.contract_id,
+            mv.amount,
+            mv.spent_outpoint,
+        );
         let tip_outpoint = format!("{txid}:{vout}");
         let mut rgb = self.rgb().await?;
         let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
@@ -5906,6 +5911,76 @@ mod unreadable_ladder_row_tests {
         assert!(
             unreadable.is_empty(),
             "a non-`tesr-` row must be ignored entirely: {unreadable:?}"
+        );
+    }
+}
+
+/// **[CATS/V4 — F1] The exit-tip registration must see EVERY record shape that can hold an
+/// allocation.**
+///
+/// `mercuryrustlib::tesr::colored_exit_move`'s `match` is exhaustive, so a new record shape cannot
+/// silently vanish inside the resolver. It cannot see the other half of the defect: a caller that
+/// never CONSTRUCTS one of the variants. That is precisely how the coloured spine tip was lost —
+/// the resolution here was an `if let root … else if let child … else { None }` chain, and a tip has
+/// neither row, so it took the trailing `else` and came back `Ok(None)`, which
+/// `register_exit_tip_best_effort` maps to no event, no fault, no error.
+///
+/// A source census, for the same reason its two siblings in this file are: the hazard is a route
+/// added LATER, which no behavioural test written today anticipates.
+#[cfg(test)]
+mod exit_tip_registration_census {
+    /// The body of `register_colored_exit_tip`, up to the next method at the same indent.
+    fn registration_body() -> String {
+        let src = include_str!("tokens.rs");
+        let start = src
+            .find("    pub(crate) async fn register_colored_exit_tip(")
+            .expect("`register_colored_exit_tip` exists — this census is about that function");
+        let rest = &src[start..];
+        // The next sibling item at 4-space indent ends the body.
+        let end = rest[1..]
+            .find("\n    /// ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// Every record shape is LOADED and every variant is CONSTRUCTED at the one site that books a
+    /// completed coloured exit. Dropping any of the three is silent in production: the coin's
+    /// allocation is left advertised at an outpoint its own exit has already spent.
+    #[test]
+    fn all_three_ladder_record_shapes_are_loaded_and_routed_through_one_resolver() {
+        let body = registration_body();
+        // Non-vacuity, both ends: the extracted span is a real body, and it stops AT that body —
+        // a runaway span would satisfy every assertion below out of the rest of the file.
+        assert!(
+            body.len() > 500,
+            "the body extractor drifted — this census would now be scanning nothing"
+        );
+        assert!(
+            !body.contains("fn refuse_if_colored_ladder("),
+            "the extracted span ran past `register_colored_exit_tip` into the next method — the \
+             assertions below would then be satisfied by unrelated code"
+        );
+        for loader in ["tesr::load(", "tesr::load_child(", "tesr::load_spine_tip("] {
+            assert!(
+                body.contains(loader),
+                "`register_colored_exit_tip` no longer reads `{loader}` — a coin backed by that \
+                 record shape would complete its coloured exit and keep advertising its allocation \
+                 on the outpoint the walk just spent"
+            );
+        }
+        for variant in ["LadderRecord::Root(", "LadderRecord::Child(", "LadderRecord::Tip("] {
+            assert!(
+                body.contains(variant),
+                "`{variant}` is never constructed here — the resolver's exhaustive `match` cannot \
+                 catch a shape the CALLER never hands it, which is exactly how the coloured spine \
+                 tip fell through"
+            );
+        }
+        assert!(
+            body.contains("colored_exit_move"),
+            "the registration no longer routes through the single exhaustive resolver — an ad-hoc \
+             chain here is what the F1 fallthrough was"
         );
     }
 }

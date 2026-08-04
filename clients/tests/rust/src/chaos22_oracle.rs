@@ -223,12 +223,30 @@ pub async fn run(
             let backups = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, name, &id)
                 .await
                 .unwrap_or_default();
+            // [CATS/V4] THREE record shapes, and the depth of each is READ OFF ITS OWN EXIT CHAIN.
+            //
+            // Two bugs lived in the two-arm version. First, a wallet holding only a SPINE TIP (the
+            // sender's own change leg after a CATS payment — where a paying wallet keeps most of
+            // its balance) matched neither arm, scored `tesr_depth = 0`, and with `backups` legally
+            // empty (`CHILD_V2_BASELINE = 0`) fell into the stuck branch and was reported as
+            // MONEY LOSS. A healthy coin with a complete pre-signed exit, flagged as unrecoverable
+            // — a false breach in the oracle whose whole job is to be believed.
+            //
+            // Second, `ancestors.len() * 2` counts every ancestor as `[extension, state]`. A SPINE
+            // segment has ONE tier, so that over-counts a spine chain and would keep over-counting
+            // it silently (depth is a reported metric, not an assertion). `child_exit_chain` /
+            // `spine_tip_exit_chain` are the same loops the exit itself broadcasts, so the number
+            // here cannot drift from the number of transactions that actually have to confirm.
             let tesr_depth = match mercuryrustlib::tesr::load(cc, name, &id).await {
                 Ok(Some(b)) => b.exit_tiers().len() as u64,
                 _ => match mercuryrustlib::tesr::load_child(cc, name, &id).await {
-                    // ancestors × (ext+state) + the leaf's own two tiers + the parent's exit chain.
-                    Ok(Some(cb)) => (cb.ancestors.len() as u64) * 2 + 2 + cb.parent.exit_tiers().len() as u64,
-                    _ => 0,
+                    Ok(Some(cb)) => mercuryrustlib::tesr::child_exit_chain(&cb).len() as u64,
+                    _ => match mercuryrustlib::tesr::load_spine_tip(cc, name, &id).await {
+                        Ok(Some(tip)) => {
+                            mercuryrustlib::tesr::spine_tip_exit_chain(&tip).len() as u64
+                        }
+                        _ => 0,
+                    },
                 },
             };
             report.max_branch_depth = report.max_branch_depth.max(backups.len() as u64).max(tesr_depth);
