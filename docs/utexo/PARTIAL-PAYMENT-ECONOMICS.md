@@ -1,8 +1,13 @@
 # Partial-payment economics — what a real payment costs, and what to build
 
-> **Status: design decision, not shipped.** Every number here is derived from constants read at
-> `feat/spark` HEAD `a541a07` and is cited `file:line`. Nothing in §4 exists in code yet; §3.0 is a
-> list of defects that exist **today**, independent of which design ships.
+> **Status: PARTLY SHIPPED.** Numbers are derived from constants read at `feat/spark` and cited
+> `file:line`; §3.0 lists defects that existed independent of which design shipped, and most are now
+> closed. **The "nothing in §4 exists in code yet" this line used to carry is false** — see the
+> build-status block at the head of §4, which is authoritative: change 1 (the spine tier) is landed
+> and change 2's VERIFIER half is landed with its producer deliberately gated off.
+>
+> **Read the ⚠️ CORRECTION inside §4.5 before implementing anything from §4.5** — it voids that
+> section's stated safety argument, and the code now carries an executable disproof of it.
 
 ---
 
@@ -376,9 +381,10 @@ superseded tier at CSV 0 is **always** rejected; it fails closed. The invariant 
 weakens is different and unnamed: today the tier kind (and therefore its CSV bound) is **structural
 and unforgeable**, derived from position parity (`let is_extension = i % 2 == 1;`, `:4285-4288`) and
 from a hard-coded pair in the ancestor loop (`:4659-4668`). `extension: Option<TesrTier>` makes
-segment **shape sender-declared**. It still fails closed via the exact-equality census (a dropped
-tier leaves `expected` one short of `num_sigs`), but that is where the adversarial E2E budget must
-go, not at the race check.
+segment **shape sender-declared**. ~~It still fails closed via the exact-equality census (a dropped
+tier leaves `expected` one short of `num_sigs`)~~ — **struck: that claim is false, see the CORRECTION
+immediately below.** The adversarial budget does belong here rather than at the race check, which was
+the one part of this paragraph that held up.
 
 > ### ⚠️ CORRECTION (2026-08-03) — the sentence above is WRONG, and the reason matters
 >
