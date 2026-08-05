@@ -37,7 +37,7 @@ confirmed **root** coin unconditionally. But not every coin is laddered, **by de
   legacy.
 
 Also shipped: **any amount** via the in-ladder split (a state tier spending `X_m.out[0]`, a
-descendant of the trigger — admission floor `min_child_value` = 1306 sat at 2 sat/vB); **first-class
+descendant of the trigger — admission floor `min_child_value` = 1310 sat at 2 sat/vB); **first-class
 received children** (the claim completes the SE key handover, so a received piece pays onward
 off-chain, whole or split); **Lightning both directions** on the ladder via a HODL-invoice latch.
 
@@ -116,6 +116,10 @@ off-chain, whole or split); **Lightning both directions** on the ladder via a HO
   it: backend, config, operator, signature, or declared. Written because the "gate computes its
   requirement from a sender-chosen number" defect appeared three times. *Normative; read before
   adding any admission check.*
+- [SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md) — the break-even band `V_min(d, r)` below which a
+  split piece costs more to defend than it is worth, against a sender whose flat backup voids it for
+  one 112-vB transaction; what the blind SE can and cannot enforce, and where the receiver-side
+  viability gate belongs. *Normative finding; not yet built.*
 - [PARITY.md](PARITY.md) — Spark ↔ Mercury+RGB feature matrix, every row citing the live test.
   *Evaluators.*
 - [ARK-SPARK-PARITY.md](ARK-SPARK-PARITY.md) — our off-chain transfer mapped against Ark out-of-round

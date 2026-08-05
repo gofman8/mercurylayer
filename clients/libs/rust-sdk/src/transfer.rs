@@ -72,6 +72,8 @@ enum ManyRoute {
     InLadderRoot,
     /// Received in-ladder CHILD: one split state `CSP` at the child's own level.
     InLadderChild,
+    /// [CATS spine batch] A SPINE TIP: the next batch, `SP_{i+1}` over the tip's own `SP_i.out[K]`.
+    SpineBatch,
     /// Un-laddered coin (a plain split sub-coin): the N+1-output plain split.
     PlainSplit,
 }
@@ -396,18 +398,22 @@ impl UtexoWallet {
                         ids.push(piece_id);
                         (ids, true)
                     }
-                    // [CATS/V4] Unreachable via `plan_payment` — `split_preflight_pure` refuses a
-                    // tip, so the planner never returns one as an ADMISSIBLE split, and the
-                    // admission check twenty lines above would have returned first. Kept as an
-                    // explicit refusal rather than a fallthrough into any other arm: the two arms it
-                    // could plausibly be folded into are the two that would lose the money
-                    // (`split_coin` is the [B1]-unsafe plain split; `in_ladder_pay` would build over
-                    // the wrong outpoint).
+                    // [CATS spine batch] A SPINE TIP takes the SPINE BATCH: `SP_{i+1}` over the tip's
+                    // own funding outpoint `SP_i.out[K]`. It is deliberately its own arm and not
+                    // folded into either neighbour — the two it could plausibly be folded into are
+                    // the two that would lose the money (`split_coin` is the [B1]-unsafe plain
+                    // split; `in_ladder_pay` would build over `X_m.out[0]`, an outpoint this coin's
+                    // ladder gave up a batch ago).
+                    //
+                    // This is the arm that keeps a wallet spendable: after change 2 every partial
+                    // payment leaves the sender holding a tip, so without it the SECOND payment out
+                    // of a coin had no route at all.
                     ParentShape::SpineTip { .. } => {
-                        return Err(anyhow!(
-                            "coin {split_coin_id} is a SPINE TIP: splitting it is the next spine \
-                             batch, whose builder is not landed. It can still be spent whole."
-                        ));
+                        let (piece_id, _change_id) = self
+                            .spine_batch_pay(&split_coin_id, receiver_address, split_amount)
+                            .await?;
+                        inladder_piece = Some((piece_id, split_amount));
+                        (ids, true)
                     }
                 }
             }
@@ -455,6 +461,38 @@ impl UtexoWallet {
                     amount_sats: amount,
                 });
                 continue;
+            }
+            // [CATS change 2] …and a SPINE TIP is REFUSED here, by name, rather than falling through
+            // to the flat lane below.
+            //
+            // This arm exists because the producer made it reachable. A tip's funding `SP.out[K]` is
+            // un-broadcast, exactly like a `ctesr-` child's — and `transfer_sender`'s classifier
+            // knows that, so it LICENSES the flat conveyance (`PermanentLicence::FundingNotOnChain`)
+            // instead of refusing it. That licence is right for what it was written for (it stops a
+            // laddered coin being conveyed flat by accident) and wrong as a route: a flat conveyance
+            // hands the receiver a signed-once backup chain over an outpoint that does not exist on
+            // chain and never will, i.e. a coin with no working exit, with no error on either side.
+            // The `ctesr-` arm above avoids that by having its own conveyance (`child_retransfer`).
+            // The tip has none yet — handing one over is a key handover plus a `spinetip-`
+            // conveyance, which is not built — so the honest answer is a refusal, not a route.
+            //
+            // The coin is untouched by this: it is still unilaterally exitable, and its cap already
+            // pays this wallet's own key.
+            if mercuryrustlib::tesr::load_spine_tip(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &id,
+            )
+            .await?
+            .is_some()
+            {
+                return Err(anyhow!(
+                    "coin {id} is a SPINE TIP (the change leg of an earlier in-ladder payment): \
+                     handing it over whole is a spine-tip conveyance, whose builder is not landed. \
+                     Refusing rather than conveying it on the flat lane, which would give the \
+                     recipient a backup chain over an un-broadcast funding output — a coin with no \
+                     exit. It can still be exited unilaterally by this wallet."
+                ));
             }
             mercuryrustlib::transfer_sender::execute(
                 &self.inner.cc,
@@ -697,13 +735,19 @@ impl UtexoWallet {
                         floors.change
                     ));
                 }
-                ParentShape::Child { .. } | ParentShape::Root { .. } => {
+                // [CATS spine batch] A SPINE TIP is a candidate on the same terms as the two older
+                // in-ladder shapes — `spine_batch_split` is N-ary, so one batch pays N recipients
+                // and keeps the change as the next tip, exactly like `in_ladder_pay_many`. Sharing
+                // the arm is what keeps the three capacities computed the same way; only the ROUTE
+                // differs, and it is selected from the same `shape`.
+                ParentShape::Child { .. } | ParentShape::Root { .. } | ParentShape::SpineTip { .. } => {
                     let cap = shape.split_total(n_out);
                     let fits = recipients.iter().all(|(_, a)| *a >= floors.piece)
                         && cap.is_some_and(|c| c >= total + floors.change);
                     if fits {
                         let route = match shape {
                             ParentShape::Child { .. } => ManyRoute::InLadderChild,
+                            ParentShape::SpineTip { .. } => ManyRoute::SpineBatch,
                             _ => ManyRoute::InLadderRoot,
                         };
                         chosen = Some((id, route));
@@ -715,15 +759,6 @@ impl UtexoWallet {
                         cap.map(|c| c.to_string())
                             .unwrap_or_else(|| "unavailable (committed fee no longer fits)".to_string()),
                         floors.describe()
-                    ));
-                }
-                // [CATS/V4] Same refusal as the single-recipient lane, for the same reason: the
-                // spine-batch builder is not landed, so a tip is never CHOSEN as the parent of a
-                // batch. It is not stranded — it is spendable whole.
-                ParentShape::SpineTip { .. } => {
-                    rejected.push(format!(
-                        "spine tip {id} ({parent_sats} sat): splitting a tip is the next spine \
-                         batch, whose builder is not landed — it can only be spent whole"
                     ));
                 }
             }
@@ -750,6 +785,11 @@ impl UtexoWallet {
             ManyRoute::InLadderChild => {
                 let (piece_sids, _change) =
                     self.child_in_ladder_pay_many(&carrier_id, recipients).await?;
+                return Ok(inladder_many_results(recipients, &piece_sids));
+            }
+            ManyRoute::SpineBatch => {
+                let (piece_sids, _change) =
+                    self.spine_batch_pay_many(&carrier_id, recipients).await?;
                 return Ok(inladder_many_results(recipients, &piece_sids));
             }
             ManyRoute::PlainSplit => {}
@@ -1239,7 +1279,7 @@ impl UtexoWallet {
             return Err(anyhow!(
                 "change {change_sats} is below the in-ladder change minimum {} sat ({}) — lower the payment total or use a larger coin",
                 floors.change,
-                change_leg_shape_note()
+                floors.change_note()
             ));
         }
 
@@ -1402,16 +1442,23 @@ impl UtexoWallet {
             (piece_child.clone(), payee, piece_sats),
             (change_child.clone(), self_change_backup, change_sats),
         ];
-        let bundles = mercuryrustlib::tesr::in_ladder_split(
+        // [CATS change 2] The change leg is LAST and is built as a one-cap SPINE TIP — one rung, not
+        // two, which is exactly the shape `split_output_floors` just admitted it at.
+        let split = mercuryrustlib::tesr::in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &mut parent,
             &bundle,
             &mut children,
+            mercuryrustlib::tesr::ChangeLeg::LastIsTip,
         )
         .await?;
+        let bundles = &split.pieces;
         let piece_bundle = &bundles[0];
-        let change_bundle = &bundles[1];
+        let change_tip = split
+            .tip
+            .as_ref()
+            .ok_or_else(|| anyhow!("the in-ladder split produced no change leg"))?;
 
         // [non-exact LN latch, LIGHTNING.md §2b] If a payment hash is given, register the external-hash
         // latch on the PIECE child (so the SSP finds it via the batch and censuses it pre-pay) BEFORE
@@ -1488,14 +1535,19 @@ impl UtexoWallet {
         )
         .await?;
 
-        // Persist the change child as an exitable self-claim; book both slots + the spent parent.
-        mercuryrustlib::tesr::persist_child(
+        // Persist the change as an exitable self-claim; book both slots + the spent parent.
+        //
+        // [CATS change 2] `persist_spine_tip`, not `persist_child`: the change is a one-cap tip and a
+        // `ctesr-` row would route it to leaf handling. That call runs `SpineTipBundle::validate()`
+        // as its precondition, so the record is checked against its own signed cap before it becomes
+        // this wallet's source of truth for the change.
+        mercuryrustlib::tesr::persist_spine_tip(
             &self.inner.cc,
             &self.inner.config.wallet_name,
-            change_bundle,
+            change_tip,
         )
         .await?;
-        let sp_txid = signed_tier_txid(&change_bundle.parent.current().state.signed_tx)?;
+        let sp_txid = signed_tier_txid(&change_tip.parent.current().state.signed_tx)?;
         // A latched piece stays IN_TRANSFER (conveyed but pending payment; the SSP adopts on pay); a
         // plain conveyed piece is WITHDRAWN (given away outright).
         let piece_status = if latch_batch.is_some() {
@@ -1590,7 +1642,7 @@ impl UtexoWallet {
             return Err(anyhow!(
                 "change {change_sats} is below the in-ladder change minimum {} sat ({}) — lower the payment total or use a larger coin",
                 floors.change,
-                change_leg_shape_note()
+                floors.change_note()
             ));
         }
 
@@ -1616,24 +1668,32 @@ impl UtexoWallet {
             .cloned()
             .ok_or_else(|| anyhow!("parent coin {parent_statechain_id} not found"))?;
 
-        let bundles = mercuryrustlib::tesr::in_ladder_split(
+        // [CATS change 2] The change leg is LAST (pushed after every recipient above) and becomes the
+        // one-cap spine tip; the N recipients' pieces are unchanged two-tier children.
+        let split = mercuryrustlib::tesr::in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &mut parent,
             &bundle,
             &mut children,
+            mercuryrustlib::tesr::ChangeLeg::LastIsTip,
         )
         .await?;
+        let bundles = &split.pieces;
+        let change_tip = split
+            .tip
+            .as_ref()
+            .ok_or_else(|| anyhow!("the in-ladder split produced no change leg"))?;
 
         // Persist the change claim FIRST, then convey. Ordering matters more here than in the
         // single-recipient case: `SP` and every tier are already co-signed and the parent is terminal,
         // so those signatures can never be regenerated — and a conveyance that fails on recipient k
-        // would abort the call with the change bundle unwritten, destroying the only record of our own
+        // would abort the call with the change record unwritten, destroying the only record of our own
         // remaining value. Persisting first makes the change recoverable from any mid-batch failure.
-        mercuryrustlib::tesr::persist_child(
+        mercuryrustlib::tesr::persist_spine_tip(
             &self.inner.cc,
             &self.inner.config.wallet_name,
-            &bundles[n],
+            change_tip,
         )
         .await?;
         // Convey each recipient's child (auth = the slot we still own).
@@ -1656,7 +1716,7 @@ impl UtexoWallet {
             .map(|(c, _, _)| c.statechain_id.clone().unwrap_or_default())
             .collect();
         let change_sid = change_child.statechain_id.clone().unwrap_or_default();
-        let sp_txid = signed_tier_txid(&bundles[n].parent.current().state.signed_tx)?;
+        let sp_txid = signed_tier_txid(&change_tip.parent.current().state.signed_tx)?;
         self.book_inladder_split_coins_n(
             parent_statechain_id,
             &sp_txid,
@@ -1670,6 +1730,217 @@ impl UtexoWallet {
         self.record_conveyed_pieces(&sp_txid, recipients).await?;
         // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
         // restart has nothing left to replay.
+        mercuryrustlib::tesr::journal_commit(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
+        )
+        .await?;
+        Ok((piece_sids, change_sid))
+    }
+
+    /// **[CATS spine batch] THE SPINE BATCH — a further partial payment out of a coin whose change is
+    /// already a one-cap tip.** Returns `(piece_sid, next_tip_sid)`.
+    ///
+    /// This is what makes payment 2 out of a coin possible at all. After change 2 the change leg of
+    /// every in-ladder payment is a [`mercuryrustlib::tesr::SpineTipBundle`], which has no `tesr-`
+    /// row (so `in_ladder_pay` cannot load it) and no `ctesr-` row (so `child_in_ladder_pay` cannot
+    /// either). The batch spends the tip's own funding outpoint `SP_i.out[K]` — see
+    /// [`mercuryrustlib::tesr::spine_batch_split`] for why `SP_{i+1}` sits at `SPINE_CSV` while the
+    /// new cap sits at `state_csv(0)`.
+    ///
+    /// Deliberately WITHOUT an `InLadderLatch` parameter, unlike [`Self::in_ladder_pay`]. A Lightning
+    /// latch over a spine batch is a design question this change does not answer (the SSP censuses a
+    /// piece pre-pay, and a spine ancestor changes what that census reads), and a parameter that
+    /// silently accepted `External(hash)` would look like support for it. The LN lanes select their
+    /// own carrier and still route to `in_ladder_pay`.
+    pub async fn spine_batch_pay(
+        &self,
+        tip_statechain_id: &str,
+        recipient_address: &str,
+        piece_sats: u64,
+    ) -> Result<(String, String)> {
+        let (piece_sids, change_sid) = self
+            .spine_batch_pay_inner(
+                tip_statechain_id,
+                &[(recipient_address.to_string(), piece_sats)],
+                None,
+            )
+            .await?;
+        Ok((piece_sids.into_iter().next().unwrap_or_default(), change_sid))
+    }
+
+    /// MULTI-RECIPIENT spine batch — the `transfer_many` route for a coin that is already a tip, and
+    /// the sibling of [`Self::in_ladder_pay_many`]. ONE `SP_{i+1}` carves N recipient pieces (exact
+    /// amounts) plus this wallet's change, which becomes the NEXT tip.
+    pub async fn spine_batch_pay_many(
+        &self,
+        tip_statechain_id: &str,
+        recipients: &[(String, u64)],
+    ) -> Result<(Vec<String>, String)> {
+        self.spine_batch_pay_inner(tip_statechain_id, recipients, Some(recipients)).await
+    }
+
+    /// The one body both spine-batch entry points share, so the single- and multi-recipient lanes
+    /// cannot drift the way `in_ladder_pay` and `in_ladder_pay_many` have (two copies of the floor
+    /// check, two copies of the booking, one of them with a history row and one without).
+    ///
+    /// `history` is `Some(recipients)` when the caller wants a `get_transfers()` row per conveyed
+    /// piece and `None` when it does not — the only real difference between the two lanes.
+    async fn spine_batch_pay_inner(
+        &self,
+        tip_statechain_id: &str,
+        recipients: &[(String, u64)],
+        history: Option<&[(String, u64)]>,
+    ) -> Result<(Vec<String>, String)> {
+        let network = self.inner.config.network.to_string();
+        let n = recipients.len();
+        if n == 0 {
+            return Err(anyhow!("no recipients"));
+        }
+        let tip = mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            tip_statechain_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!("coin {tip_statechain_id} has no spine-tip record to build the next batch over")
+        })?;
+
+        // [B2] ONE shape, ONE pair of floors, ONE admission rule — the same three the quote's
+        // `split_preflight_pure` uses, so `fundable: true` followed by a refusal stays inexpressible
+        // on this lane too. `split_source_value` is the tip's `sp_out_value`: the batch spends
+        // `SP_i.out[K]`, not the cap's output.
+        let shape = ParentShape::SpineTip {
+            fee_rate: tip.parent.fee_rate,
+            split_source_value: tip.sp_out_value,
+        };
+        let total = shape.split_total(n + 1).ok_or_else(|| {
+            anyhow!("committed fee too high to carve a spine batch of {} outputs", n + 1)
+        })?;
+        let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        // Refusing up-front is load-bearing here for the same reason as on the two older lanes, and
+        // the stakes are the same: `establish_child_journalled` runs AFTER the tip's spend budget is
+        // consumed and `SP_{i+1}` is co-signed, so a leg admitted below its floor terminalizes the
+        // tip and THEN fails — leaving the batch's own change unbuildable.
+        let change_sats = if n == 1 {
+            inladder_amounts_floored(total, pieces_total, floors)?
+        } else {
+            if pieces_total >= total {
+                return Err(anyhow!(
+                    "payments totalling {pieces_total} sat leave no change: a spine batch of this \
+                     tip into {} outputs can pay at most {} sat",
+                    n + 1,
+                    total.saturating_sub(1)
+                ));
+            }
+            let change = total - pieces_total;
+            if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < floors.piece) {
+                return Err(anyhow!(
+                    "recipient amount {amt} is below the spine-batch piece minimum {} sat (each \
+                     piece funds its own extension + state tier at {} sat/vB, then must clear the \
+                     {DUST_LIMIT}-sat dust floor)",
+                    floors.piece,
+                    tip.parent.fee_rate
+                ));
+            }
+            if change < floors.change {
+                return Err(anyhow!(
+                    "change {change} is below the spine-batch change minimum {} sat ({}) — lower \
+                     the payment total or use a larger coin",
+                    floors.change,
+                    floors.change_note()
+                ));
+            }
+            change
+        };
+
+        // N+1 fresh SE-registered slots, DERIVED against the TIP (it is the coin being spent, and
+        // the coin whose lifetime allowance the vouchers are drawn from).
+        let mut slot_tokens = self.take_derived_tokens(tip_statechain_id, n + 1).await?;
+        let mut children: Vec<(Coin, String, u64)> = Vec::with_capacity(n + 1);
+        for (address, amount) in recipients {
+            let slot = self.create_child_slot(&slot_tokens.remove(0), *amount).await?;
+            children.push((slot, mercurylib::tesr::payee_address(address, &network)?, *amount));
+        }
+        let change_child = self.create_child_slot(&slot_tokens.remove(0), change_sats).await?;
+        let self_change_backup =
+            mercurylib::transaction::get_user_backup_address(&change_child, network.clone())?;
+        children.push((change_child.clone(), self_change_backup, change_sats));
+
+        let mut tip_coin = self
+            .record()
+            .await?
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(tip_statechain_id) && c.duplicate_index == 0)
+            .cloned()
+            .ok_or_else(|| anyhow!("spine tip coin {tip_statechain_id} not found"))?;
+
+        // The change leg is LAST (pushed after every recipient) and becomes the NEXT one-cap tip.
+        let batch = mercuryrustlib::tesr::spine_batch_split(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mut tip_coin,
+            &tip,
+            &mut children,
+            mercuryrustlib::tesr::ChangeLeg::LastIsTip,
+        )
+        .await?;
+        let bundles = &batch.pieces;
+        let next_tip = batch
+            .tip
+            .as_ref()
+            .ok_or_else(|| anyhow!("the spine batch produced no change leg"))?;
+
+        // Persist the change FIRST, then convey — the ordering `in_ladder_pay_many` argues for, and
+        // for the same reason: `SP_{i+1}` and every tier are already co-signed and the tip is
+        // terminal, so a conveyance that fails on recipient k would otherwise abort with the change
+        // record unwritten, destroying the only record of this wallet's remaining value.
+        mercuryrustlib::tesr::persist_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            next_tip,
+        )
+        .await?;
+        for (j, (address, _)) in recipients.iter().enumerate() {
+            mercuryrustlib::tesr::convey_child_bundle(
+                &self.inner.cc,
+                address,
+                &children[j].0,
+                &bundles[j],
+                None,
+            )
+            .await?;
+        }
+
+        let piece_sids: Vec<String> = children[..n]
+            .iter()
+            .map(|(c, _, _)| c.statechain_id.clone().unwrap_or_default())
+            .collect();
+        let change_sid = change_child.statechain_id.clone().unwrap_or_default();
+        // `SP_{i+1}` is the state of the segment the batch just appended — the spine level whose
+        // outputs fund every leg, and `funding_tier()` is the ONE accessor that resolves it (the
+        // last ancestor, not the root parent's `SP`). Hashed from the SIGNED transaction rather than
+        // read off the declared field, so the outpoint this wallet books its change at is the one
+        // the payees' bundles actually name.
+        let sp_txid = signed_tier_txid(&next_tip.funding_tier().signed_tx)?;
+        self.book_inladder_split_coins_n(
+            tip_statechain_id,
+            &sp_txid,
+            &piece_sids,
+            CoinStatus::WITHDRAWN,
+            &change_sid,
+            change_sats,
+            next_tip.sp_vout,
+        )
+        .await?;
+        if let Some(rows) = history {
+            self.record_conveyed_pieces(&sp_txid, rows).await?;
+        }
+        // [P0-3] Close the batch's write-ahead journal: the bundles are on disk and conveyed.
         mercuryrustlib::tesr::journal_commit(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1737,31 +2008,49 @@ impl UtexoWallet {
                         .map(|k| (c.statechain_id.clone(), k))
                 })
                 .collect();
-            let bundles =
+            let legs =
                 mercuryrustlib::tesr::resume_in_ladder_split(cc, &wallet, &mut rec, &mut child_coins)
                     .await?;
 
-            // Which child is OURS? The one whose journalled Model-A payee is the exit address this
-            // wallet derives from that child's own key — i.e. the change. Derived, not positional:
-            // a convention ("the change is last") is exactly the kind of assumption a recovery path
-            // must not depend on.
+            // Which leg is OURS?
+            //
+            // [CATS change 2] A SPINE TIP is ours by CONSTRUCTION — the journalled role says so, and
+            // it is the one fact about the leg that was written before the parent was terminalized.
+            // A PIECE is judged as before: ours iff its journalled Model-A payee is the exit address
+            // this wallet derives from that child's own key. That derivation stays, because the two
+            // lanes that still carve a two-tier change (and any older record) run through it.
+            //
+            // `legs` is index-stable against `rec.children`, which is what makes reading them
+            // together safe: a leg list that quietly dropped the tip would shift every index after it
+            // and persist a payee's bundle under the change's statechain id.
             let mut change: Option<(String, u64, u32)> = None;
             let mut unconveyed_pieces: Vec<String> = Vec::new();
             for (j, jc) in rec.children.iter().enumerate() {
-                let ours = child_coins
-                    .iter()
-                    .find(|(id, _)| *id == jc.statechain_id)
-                    .map(|(_, coin)| {
-                        mercurylib::transaction::get_user_backup_address(coin, network.clone())
-                            .map(|a| a == jc.owner_exit_address)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if ours {
-                    mercuryrustlib::tesr::persist_child(cc, &wallet, &bundles[j]).await?;
-                    change = Some((jc.statechain_id.clone(), jc.value, jc.sp_vout));
-                } else {
-                    unconveyed_pieces.push(jc.statechain_id.clone());
+                match &legs[j] {
+                    mercuryrustlib::tesr::SplitLeg::Tip(tip) => {
+                        mercuryrustlib::tesr::persist_spine_tip(cc, &wallet, tip).await?;
+                        change = Some((jc.statechain_id.clone(), jc.value, jc.sp_vout));
+                    }
+                    mercuryrustlib::tesr::SplitLeg::Piece(cb) => {
+                        let ours = child_coins
+                            .iter()
+                            .find(|(id, _)| *id == jc.statechain_id)
+                            .map(|(_, coin)| {
+                                mercurylib::transaction::get_user_backup_address(
+                                    coin,
+                                    network.clone(),
+                                )
+                                .map(|a| a == jc.owner_exit_address)
+                                .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if ours {
+                            mercuryrustlib::tesr::persist_child(cc, &wallet, cb).await?;
+                            change = Some((jc.statechain_id.clone(), jc.value, jc.sp_vout));
+                        } else {
+                            unconveyed_pieces.push(jc.statechain_id.clone());
+                        }
+                    }
                 }
             }
 
@@ -1806,12 +2095,15 @@ impl UtexoWallet {
         let rec = mercuryrustlib::tesr::journal_find(cc, &wallet, op_id)
             .await?
             .ok_or_else(|| anyhow!("no in-ladder split journal record {op_id}"))?;
-        let bundles = rec.bundles()?;
         let idx = rec
             .children
             .iter()
             .position(|c| c.statechain_id == piece_statechain_id)
             .ok_or_else(|| anyhow!("split {op_id} carved no child {piece_statechain_id}"))?;
+        // [CATS change 2] Rebuild THAT leg, as a piece. A root-lane record now normally holds a spine
+        // tip too, so `bundles()` (all-pieces) would refuse the whole record; and naming the tip's
+        // index here must be an error, not a conveyance of the sender's own change to a third party.
+        let piece_bundle = rec.piece_bundle(idx)?;
         let piece_coin = self
             .record()
             .await?
@@ -1826,7 +2118,7 @@ impl UtexoWallet {
             cc,
             recipient_address,
             &piece_coin,
-            &bundles[idx],
+            &piece_bundle,
             None,
         )
         .await?;
@@ -2468,9 +2760,11 @@ pub(crate) enum ParentShape {
     /// to `split_coin` — a plain split of a laddered coin, which [B1] makes unsafe. That is three
     /// wrong answers from one missing arm, and every one of them fails open.
     ///
-    /// Splitting a tip is the NEXT spine batch (`SP_{i+1}` over `SP_i.out[K]`), and that builder is
-    /// change 2, which is not landed. So this shape prices correctly and REFUSES to split, by name —
-    /// the coin stays fully spendable whole.
+    /// [CATS spine batch] Splitting a tip is the NEXT spine batch (`SP_{i+1}` over `SP_i.out[K]`,
+    /// `mercuryrustlib::tesr::spine_batch_split`), and it routes to `spine_batch_pay`. Note
+    /// `split_source_value` is the tip's `sp_out_value` — the value of `SP_i.out[K]`, the outpoint
+    /// the next batch SPENDS — and not the cap's output value: the cap is the tier being replaced,
+    /// not the one being extended, so pricing off it would under-fund every leg by a committed fee.
     SpineTip { fee_rate: f64, split_source_value: u64 },
 }
 
@@ -2522,9 +2816,20 @@ pub(crate) struct SplitFloors {
     /// Every PAYEE piece must clear this. A piece is always a two-tier child (V1's correction is
     /// explicit that the conveyed leaf stays two-tier), so this floor never falls.
     pub piece: u64,
-    /// The sender's CHANGE leg must clear this. Equal to `piece` today, and 490 sat lower the moment
-    /// `mercuryrustlib::tesr::change_leg_role` reports `SpineTip`.
+    /// The sender's CHANGE leg must clear this — 490 sat below `piece` on the PLAIN ROOT lane, where
+    /// the change is a one-cap spine tip, and equal to it on the two lanes whose builders still
+    /// carve a two-tier change. Which is which is [`mercuryrustlib::tesr::change_leg_role`]'s answer
+    /// for that lane, never a number chosen here.
     pub change: u64,
+    /// **The lane these two numbers were derived for**, carried WITH them rather than passed
+    /// alongside. `None` for the un-laddered split, which has no in-ladder builder at all.
+    ///
+    /// It is here so the refusal text explaining `change` cannot describe a different lane's shape
+    /// than the number it is explaining. Deriving that text from the numbers instead (`change <
+    /// piece` ⟹ "one-cap tip") reads correctly today and lies during a fee spike: once
+    /// `min_split_output` exceeds `min_child_value` both legs clamp to it, the two floors become
+    /// equal, and the shape has not changed at all.
+    pub lane: Option<mercuryrustlib::tesr::SplitLane>,
 }
 
 impl SplitFloors {
@@ -2550,6 +2855,16 @@ impl SplitFloors {
             format!("piece {}, change {}", self.piece, self.change)
         }
     }
+
+    /// Why the CHANGE leg's floor is what it is, in the words of the lane it came from.
+    pub(crate) fn change_note(self) -> &'static str {
+        match self.lane {
+            Some(lane) => change_leg_shape_note(lane),
+            // Un-laddered: both sub-coins carry only their own backup tx, so there is no ladder
+            // shape to describe and the floor is the backup-fee floor for both.
+            None => "an un-laddered sub-coin funds only its own backup transaction",
+        }
+    }
 }
 
 /// **THE** per-leg floors for a split of this parent. Every admission guard in this file and the
@@ -2560,23 +2875,44 @@ impl SplitFloors {
 ///    must pay; below it the sub-coin exists but can never be exited.
 ///  * the LADDER floor for that leg's SHAPE — a payee's piece gets its own extension + state rungs
 ///    from `establish_child` (`min_child_value`), while the sender's change gets whatever
-///    [`mercuryrustlib::tesr::change_leg_role`] says the builders actually give it: two rungs today,
-///    ONE (`min_spine_tip_value`) once change 2 lands. Only applies when the parent carries a ladder.
+///    [`mercuryrustlib::tesr::change_leg_role`] says THAT LANE's builder actually gives it: one rung
+///    (`min_spine_tip_value`) on the plain root lane, two on the other two. Only applies when the
+///    parent carries a ladder.
 ///
 /// The leg's shape is deliberately NOT a parameter. It is read from the one function that describes
 /// what the builders emit, so the floor a payment is admitted at and the ladder that is then built
 /// cannot be two different shapes — which is the failure this split exists to prevent, and it lands
-/// *after* `set_spend_budget` has terminalized the parent.
+/// *after* `set_spend_budget` has terminalized the parent. The LANE is a parameter, because the
+/// three builders no longer agree and the question is meaningless without naming one.
 pub(crate) fn split_output_floors(backup_fee_rate: f64, shape: ParentShape) -> SplitFloors {
     let backup_floor = min_split_output(backup_fee_rate);
-    match shape.ladder_fee_rate() {
-        Some(rate) => SplitFloors {
-            piece: backup_floor
-                .max(mercuryrustlib::tesr::SplitLegRole::Piece.min_value(rate, DUST_LIMIT)),
-            change: backup_floor
-                .max(mercuryrustlib::tesr::change_leg_role().min_value(rate, DUST_LIMIT)),
-        },
-        None => SplitFloors { piece: backup_floor, change: backup_floor },
+    let laddered = |rate: f64, lane: mercuryrustlib::tesr::SplitLane| SplitFloors {
+        piece: backup_floor
+            .max(mercuryrustlib::tesr::SplitLegRole::Piece.min_value(rate, DUST_LIMIT)),
+        change: backup_floor
+            .max(mercuryrustlib::tesr::change_leg_role(lane).min_value(rate, DUST_LIMIT)),
+        lane: Some(lane),
+    };
+    // Exhaustive on the SHAPE, so a fourth parent shape is a compile error rather than a fourth
+    // silent fall-through to the un-laddered (lower) floor.
+    match shape {
+        ParentShape::Unladdered => {
+            SplitFloors { piece: backup_floor, change: backup_floor, lane: None }
+        }
+        ParentShape::Root { fee_rate, .. } => {
+            laddered(fee_rate, mercuryrustlib::tesr::SplitLane::PlainRoot)
+        }
+        ParentShape::Child { fee_rate, .. } => {
+            laddered(fee_rate, mercuryrustlib::tesr::SplitLane::PlainChild)
+        }
+        // [CATS spine batch] Splitting a tip is the NEXT spine batch, and that builder is landed — so
+        // this number IS an admission decision now. It is priced on the spine-batch lane, whose
+        // change leg `spine_batch_split` carves as a one-cap tip exactly as the root lane does; the
+        // pieces are ordinary two-tier children on both. Never the un-laddered pair, which is the
+        // cheaper and LOWER answer that [V4] exists to keep unreachable.
+        ParentShape::SpineTip { fee_rate, .. } => {
+            laddered(fee_rate, mercuryrustlib::tesr::SplitLane::SpineBatch)
+        }
     }
 }
 
@@ -2600,11 +2936,11 @@ pub(crate) fn planning_split_floor(backup_fee_rate: f64, network: &str) -> u64 {
 
 /// How the CHANGE leg's floor is justified, for a refusal message. The two legs no longer
 /// necessarily have the same shape, so a message that describes one shape and applies it to both is
-/// exactly the false text V5 exists to remove.
-fn change_leg_shape_note() -> &'static str {
-    match mercuryrustlib::tesr::change_leg_role() {
+/// exactly the false text V5 exists to remove — and neither does one LANE's shape describe another's.
+fn change_leg_shape_note(lane: mercuryrustlib::tesr::SplitLane) -> &'static str {
+    match mercuryrustlib::tesr::change_leg_role(lane) {
         mercuryrustlib::tesr::SplitLegRole::Piece => {
-            "the change is built as a two-tier child today, so it funds an extension + a state rung too"
+            "the change is built as a two-tier child on this lane, so it funds an extension + a state rung too"
         }
         mercuryrustlib::tesr::SplitLegRole::SpineTip => {
             "the change is a one-cap spine tip, so it funds ONE rung, not two"
@@ -2653,7 +2989,7 @@ pub(crate) fn inladder_amounts_floored(
              {total}",
             floors.piece,
             floors.change,
-            change_leg_shape_note()
+            floors.change_note()
         ));
     }
     Ok(change_sats)
@@ -2679,7 +3015,15 @@ pub(crate) fn split_preflight_pure(
                 .map(|(change, _)| change)
                 .map_err(|e| e.to_string()),
         ),
-        ParentShape::Child { fee_rate, .. } | ParentShape::Root { fee_rate, .. } => {
+        // [CATS spine batch] A SPINE TIP joins the two in-ladder shapes rather than being refused: its
+        // split IS the next spine batch (`SP_{i+1}` over `SP_i.out[K]`, `spine_batch_split`), which
+        // carves the same two payload outputs out of the same kind of tier and admits them against
+        // the same two floors. The arm is shared rather than duplicated on purpose — the three
+        // differ in which builder runs and in `split_source_value` (the tip's is `SP_i.out[K]`, not
+        // a `X_m.out[0]`), both of which `ParentShape` already carries.
+        ParentShape::Child { fee_rate, .. }
+        | ParentShape::Root { fee_rate, .. }
+        | ParentShape::SpineTip { fee_rate, .. } => {
             // The split carves TWO payload outputs (piece + change) out of the tier.
             let admission = match shape.split_total(2) {
                 Some(total) => {
@@ -2691,20 +3035,6 @@ pub(crate) fn split_preflight_pure(
             };
             (in_ladder_split_cost(fee_rate), admission)
         }
-        // [CATS/V4] A tip is priced correctly and REFUSED, with the reason named. The builder for a
-        // spine batch (`SP_{i+1}` over `SP_i.out[K]`) is change 2 and is not landed, so admitting
-        // one would route the sender's own change into an executor that does not exist — or, worse,
-        // into `split_coin`, which is the [B1]-unsafe plain split of a laddered coin. A refusal here
-        // costs the caller nothing they had: `plan_payment` marks the coin un-splittable and it is
-        // still spendable WHOLE, which is every use a tip has today.
-        ParentShape::SpineTip { fee_rate, .. } => (
-            in_ladder_split_cost(fee_rate),
-            Err(
-                "this coin is a SPINE TIP (the change leg of an earlier batch): splitting it is the \
-                 next spine batch, whose builder is not landed. It can still be spent whole."
-                    .to_string(),
-            ),
-        ),
     };
     SplitPreflight { shape, floors, fee_sats, admission }
 }
@@ -2833,11 +3163,16 @@ mod split_math_tests {
         // legs, because an un-laddered split's two sub-coins genuinely have the same shape.
         assert_eq!(
             split_output_floors(backup_rate, ParentShape::Unladdered),
-            SplitFloors { piece: min_split_output(backup_rate), change: min_split_output(backup_rate) }
+            SplitFloors {
+                piece: min_split_output(backup_rate),
+                change: min_split_output(backup_rate),
+                lane: None,
+            }
         );
         assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
 
-        // A laddered parent (root or child, same rule) raises it to `min_child_value`.
+        // A laddered parent raises the PIECE to `min_child_value`, on either lane — the payee's leaf
+        // is two-tier everywhere and that is the floor that must never fall.
         let root = ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 };
         let child = ParentShape::Child { fee_rate: ladder_rate, split_source_value: 0 };
         assert_eq!(mercurylib::tesr::min_child_value(ladder_rate, DUST_LIMIT), 1_310);
@@ -2847,9 +3182,28 @@ mod split_math_tests {
             "the larger floor binds"
         );
         assert_eq!(
-            split_output_floors(backup_rate, child),
-            split_output_floors(backup_rate, root),
-            "a child re-split and a root split are floored identically"
+            split_output_floors(backup_rate, child).piece,
+            split_output_floors(backup_rate, root).piece,
+            "a child re-split and a root split floor the PAYEE identically"
+        );
+        // [CATS change 2] …and their CHANGE legs no longer agree, because their builders no longer
+        // agree. This used to assert the two whole `SplitFloors` equal; that stopped being true the
+        // moment `in_ladder_split` started carving a one-cap tip and `child_in_ladder_split` did not.
+        // Asserting the difference (rather than deleting the comparison) is what keeps a future
+        // change to the CHILD lane's builder from landing without its floor.
+        assert_eq!(
+            split_output_floors(backup_rate, root).change,
+            mercurylib::tesr::min_spine_tip_value(ladder_rate, DUST_LIMIT),
+            "the root lane's change is a one-cap spine tip"
+        );
+        assert_eq!(
+            split_output_floors(backup_rate, child).change,
+            mercurylib::tesr::min_child_value(ladder_rate, DUST_LIMIT),
+            "the child lane's change is still a two-tier piece"
+        );
+        assert!(
+            split_output_floors(backup_rate, root).change
+                < split_output_floors(backup_rate, child).change
         );
 
         // The B2 defect itself: `transfer` planned at 554 while the executor enforced 1 310. Both
@@ -2950,20 +3304,38 @@ mod split_math_tests {
             inladder_amounts_floored(
                 total,
                 floor - 1,
-                SplitFloors { piece: old_floor, change: old_floor }
+                SplitFloors {
+                    piece: old_floor,
+                    change: old_floor,
+                    lane: Some(mercuryrustlib::tesr::SplitLane::PlainRoot),
+                }
             )
             .is_ok(),
             "the old, lower floor admitted the piece the real executor refuses"
         );
 
-        // A CHILD parent at its own boundary behaves identically — one rule, not two.
+        // A CHILD parent obeys the same RULE — piece and change each against their own floor — but
+        // [CATS change 2] it no longer sits on the same NUMBER: its change leg is still a two-tier
+        // piece, so its boundary total is `piece + piece`, not `piece + tip`. Deriving the child's
+        // boundary from the child's own floors is the point; re-using the root's would have tested
+        // the root lane twice and called it coverage of two.
+        let child_floors = split_output_floors(
+            backup_rate,
+            ParentShape::Child { fee_rate: ladder_rate, split_source_value: 0 },
+        );
+        let child_total = child_floors.piece + child_floors.change;
         let child = ParentShape::Child {
             fee_rate: ladder_rate,
-            split_source_value: source_value_for_total(total, ladder_rate),
+            split_source_value: source_value_for_total(child_total, ladder_rate),
         };
-        assert!(split_preflight_pure(backup_rate, child, 0, floor).admission.is_ok());
-        assert!(split_preflight_pure(backup_rate, child, 0, floor - 1).admission.is_err());
-        assert!(split_preflight_pure(backup_rate, child, 0, floor + 1).admission.is_err());
+        assert_eq!(child.split_total(2), Some(child_total), "the child sits on ITS own boundary");
+        assert!(split_preflight_pure(backup_rate, child, 0, child_floors.piece).admission.is_ok());
+        assert!(split_preflight_pure(backup_rate, child, 0, child_floors.piece - 1)
+            .admission
+            .is_err());
+        assert!(split_preflight_pure(backup_rate, child, 0, child_floors.piece + 1)
+            .admission
+            .is_err());
 
         // And an UN-LADDERED parent is floored by `min_split_output` alone, from the same function.
         let parent = 10_000u64;
@@ -3074,11 +3446,12 @@ mod split_math_tests {
     // ============================================================================================
 
     /// **The split is real, not plumbing.** Asserted by exercising `inladder_amounts_floored` with
-    /// the two floors DIFFERENT — which is what the wallet computes the moment `change_leg_role()`
-    /// reports `SpineTip` — and showing that a value legal for the change is illegal for the piece.
+    /// the two floors DIFFERENT — which is what the wallet computes on the plain root lane now that
+    /// `change_leg_role(PlainRoot)` reports `SpineTip` — and showing that a value legal for the
+    /// change is illegal for the piece.
     ///
     /// A single-floor implementation cannot express this at all: it either refuses both legs at
-    /// 1 310 (today, correct but 490 sat expensive) or admits both at 820, and admitting a PIECE at
+    /// 1 310 (correct but 490 sat expensive) or admits both at 820, and admitting a PIECE at
     /// 820 mints a child that cannot fund its second rung. `establish_child` discovers that after
     /// `set_spend_budget` has already terminalized the parent, which is why the guard has to be here
     /// and why it has to be per-leg.
@@ -3087,7 +3460,11 @@ mod split_math_tests {
         let piece_floor = mercurylib::tesr::min_child_value(2.0, DUST_LIMIT); // 1 310
         let tip_floor = mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT); // 820
         assert_eq!((piece_floor, tip_floor), (1_310, 820));
-        let floors = SplitFloors { piece: piece_floor, change: tip_floor };
+        let floors = SplitFloors {
+            piece: piece_floor,
+            change: tip_floor,
+            lane: Some(mercuryrustlib::tesr::SplitLane::PlainRoot),
+        };
 
         // A split whose change lands between the two floors: legal as a TIP, illegal as a piece.
         let total = piece_floor + tip_floor;
@@ -3109,72 +3486,191 @@ mod split_math_tests {
         assert!(!msg.contains("needs both piece"), "the single-floor phrasing must not survive");
     }
 
-    /// **The change floor tracks what the BUILDERS emit, and nothing else.** `split_output_floors`
-    /// reads `change_leg_role()`, which is the one function describing the shape
-    /// `in_ladder_split`/`child_in_ladder_split`/`cosign_colored_in_ladder_split` actually build.
+    /// **The change floor tracks what THAT LANE's BUILDER emits, and nothing else.**
+    /// `split_output_floors` reads `change_leg_role(lane)`, the one function describing the shape
+    /// `in_ladder_split` / `child_in_ladder_split` / `cosign_colored_in_ladder_split` actually build.
     ///
-    /// So while change 2 is unlanded the two floors are EQUAL — the wallet keeps refusing a change
-    /// below 1 310, which is a capability cost and not a safety one — and the day the builders flip,
-    /// this assertion flips with them in the same commit. That direction matters: a floor lowered
-    /// ahead of the builder fails OPEN and strands the parent.
+    /// Every lane is walked here, and the assertion for each is written against ITS OWN builder — a
+    /// lane whose floor moved without its builder is the fail-open direction, and it strands the
+    /// parent after `set_spend_budget` rather than merely refusing a payment.
     #[test]
     fn the_change_floor_is_derived_from_the_builders_not_declared() {
         let backup_rate = 2.0;
-        let shape = ParentShape::Root { fee_rate: 2.0, split_source_value: 0 };
-        let floors = split_output_floors(backup_rate, shape);
-        assert_eq!(
-            floors.piece,
-            mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
-            "a payee's piece is always a two-tier child — V1's correction is explicit that the \
-             conveyed leaf never becomes a spine"
-        );
-        match mercuryrustlib::tesr::change_leg_role() {
-            mercuryrustlib::tesr::SplitLegRole::Piece => {
-                assert_eq!(floors.change, floors.piece, "unlanded change 2: the legs agree");
-                assert_eq!(floors.describe(), "1310", "one number while the legs agree");
+        for shape in [
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 0 },
+            ParentShape::Child { fee_rate: 2.0, split_source_value: 0 },
+        ] {
+            let floors = split_output_floors(backup_rate, shape);
+            assert_eq!(
+                floors.piece,
+                mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
+                "a payee's piece is always a two-tier child — V1's correction is explicit that the \
+                 conveyed leaf never becomes a spine"
+            );
+            let lane = floors.lane.expect("a laddered parent names its lane");
+            match mercuryrustlib::tesr::change_leg_role(lane) {
+                mercuryrustlib::tesr::SplitLegRole::Piece => {
+                    assert_eq!(floors.change, floors.piece, "{lane:?}: a two-tier change");
+                    assert_eq!(floors.describe(), "1310", "one number while the legs agree");
+                    assert!(floors.change_note().contains("two-tier"));
+                }
+                mercuryrustlib::tesr::SplitLegRole::SpineTip => {
+                    assert_eq!(
+                        floors.change,
+                        mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT)
+                    );
+                    assert!(floors.change < floors.piece);
+                    assert_eq!(floors.describe(), "piece 1310, change 820");
+                    assert!(floors.change_note().contains("ONE rung"));
+                }
             }
-            mercuryrustlib::tesr::SplitLegRole::SpineTip => {
-                assert_eq!(floors.change, mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT));
-                assert!(floors.change < floors.piece);
-                assert_eq!(floors.describe(), "piece 1310, change 820");
-            }
+            // `binding()` and `planning()` are the two honest single-number reductions, and they are
+            // used in opposite places: `binding` where one number must cover both legs (the
+            // un-laddered lane), `planning` where refusing too much is the bug (the shape-blind
+            // planner).
+            assert_eq!(floors.binding(), floors.piece.max(floors.change));
+            assert_eq!(floors.planning(), floors.piece.min(floors.change));
         }
-        // `binding()` and `planning()` are the two honest single-number reductions, and they are
-        // used in opposite places: `binding` where one number must cover both legs (the un-laddered
-        // lane), `planning` where refusing too much is the bug (the shape-blind planner).
-        assert_eq!(floors.binding(), floors.piece.max(floors.change));
-        assert_eq!(floors.planning(), floors.piece.min(floors.change));
+        // And the two lanes really do give different answers — otherwise the loop above would pass
+        // with one arm never taken, which is what the old single-shape version of this test did.
+        assert_ne!(
+            split_output_floors(backup_rate, ParentShape::Root { fee_rate: 2.0, split_source_value: 0 })
+                .change,
+            split_output_floors(backup_rate, ParentShape::Child { fee_rate: 2.0, split_source_value: 0 })
+                .change
+        );
     }
 
-    /// **[V4] A SPINE TIP is priced as laddered and refused as un-splittable — never `Unladdered`.**
+    /// **[CATS change 2 / V5] THE PRODUCER FLIP LOWERED THE CHANGE LEG AND NOTHING ELSE.**
+    ///
+    /// The [V5] hazard is not "the change floor is wrong" — it is that lowering the change floor is
+    /// only expressible, in a single-floor world, by lowering the PIECE's with it. A piece admitted
+    /// at 820 cannot fund its second rung, and `establish_child` finds that out *after*
+    /// `set_spend_budget` has terminalized the parent: the coin is stranded to unilateral-exit-only,
+    /// the payee gets nothing, and the sender cannot retry. So this is asserted as a **non-movement**
+    /// of the piece floor, across the whole fee-rate range and on every lane, rather than as one
+    /// number at one rate — the shape of the regression is a floor that tracks the wrong leg, and
+    /// that is invisible at a single point.
+    #[test]
+    fn the_producer_flip_lowered_only_the_change_leg() {
+        let backup_rate = 2.0;
+        for rate in [1.0f64, 2.0, 5.0, 25.0, 100.0] {
+            let root = split_output_floors(
+                backup_rate,
+                ParentShape::Root { fee_rate: rate, split_source_value: 0 },
+            );
+            let child = split_output_floors(
+                backup_rate,
+                ParentShape::Child { fee_rate: rate, split_source_value: 0 },
+            );
+            // THE FLOOR THAT MUST NEVER FALL. A payee's piece is a two-tier child on every lane, so
+            // its floor is `min_child_value` (or the backup-fee floor when that binds) — the exact
+            // expression it had before change 2, on both lanes.
+            let piece = min_split_output(backup_rate)
+                .max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT));
+            assert_eq!(root.piece, piece, "[{rate} sat/vB] the ROOT lane's piece floor moved");
+            assert_eq!(child.piece, piece, "[{rate} sat/vB] the CHILD lane's piece floor moved");
+            // …and the change leg is the ONLY thing that moved, and only on the lane whose builder
+            // moved with it.
+            assert_eq!(
+                root.change,
+                min_split_output(backup_rate)
+                    .max(mercurylib::tesr::min_spine_tip_value(rate, DUST_LIMIT)),
+                "[{rate} sat/vB] the root lane's change is a one-cap tip"
+            );
+            assert_eq!(child.change, piece, "[{rate} sat/vB] the child lane's change is unmoved");
+            assert!(root.change <= root.piece, "[{rate} sat/vB] the tip is never the DEARER leg");
+            // The planner reduction must not hand the tip's cheaper number to a piece: it is used
+            // where refusing too much is the bug, and the per-coin preflight then judges each leg.
+            assert!(root.planning() <= root.piece && root.binding() == root.piece);
+        }
+
+        // The admission rule itself, at the rate that matters: a piece AT the change leg's floor is
+        // still refused, by name. This is the single assertion that would have caught a flip landed
+        // without its builder — and it is checked through the executor's own guard, not through the
+        // numbers alone.
+        let root = split_output_floors(
+            backup_rate,
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 0 },
+        );
+        assert_eq!((root.piece, root.change), (1_310, 820));
+        let e = inladder_amounts_floored(root.piece + root.change, root.change, root)
+            .expect_err("a PIECE at the tip's floor cannot fund its second rung");
+        assert!(e.to_string().contains("the piece falls short"), "got: {e}");
+        // …while the CHANGE at that same number is admitted — which is the 490 sat change 2 buys.
+        assert_eq!(
+            inladder_amounts_floored(root.piece + root.change, root.piece, root).unwrap(),
+            root.change
+        );
+        // The pre-flip wallet refused exactly that split. Stated as the capability gained, so a
+        // future revert is visible as a loss rather than as a silent tightening.
+        assert!(
+            inladder_amounts_floored(
+                root.piece + root.change,
+                root.piece,
+                SplitFloors { piece: root.piece, change: root.piece, lane: root.lane },
+            )
+            .is_err(),
+            "before change 2 this split was refused for want of 490 sat of change"
+        );
+    }
+
+    /// **[V4 + spine batch] A SPINE TIP is priced as laddered — never `Unladdered` — and it SPLITS.**
     ///
     /// The variant exists because falling through to `Unladdered` is three wrong answers from one
     /// missing arm: the cheaper cost model, the LOWER floor, and the route to `split_coin`, which is
-    /// the [B1]-unsafe plain split of a coin that IS laddered. The refusal is the safe half of the
-    /// pair — the spine-batch builder is change 2 and is not landed — and it costs the holder
-    /// nothing: the coin is still spendable whole.
+    /// the [B1]-unsafe plain split of a coin that IS laddered. This test pins the pricing half in
+    /// both directions, and — since the spine batch landed the spine-batch builder — pins that a tip is now
+    /// ADMITTED rather than refused, which is the capability the whole change exists for.
     #[test]
-    fn a_spine_tip_prices_as_laddered_and_refuses_to_split() {
+    fn a_spine_tip_prices_as_laddered_and_now_splits_as_a_batch() {
         let backup_rate = 2.0;
         let tip = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 100_000 };
+        let root = ParentShape::Root { fee_rate: 2.0, split_source_value: 0 };
         assert_eq!(tip.ladder_fee_rate(), Some(2.0), "a tip carries a ladder");
-        assert_eq!(
-            split_output_floors(backup_rate, tip),
-            split_output_floors(backup_rate, ParentShape::Root { fee_rate: 2.0, split_source_value: 0 }),
-            "a tip is floored as a laddered parent, NOT at the un-laddered 554"
-        );
+        let (tf, rf) = (split_output_floors(backup_rate, tip), split_output_floors(backup_rate, root));
+        // The NUMBERS match the root lane — both build a two-tier piece and a one-cap change…
+        assert_eq!((tf.piece, tf.change), (rf.piece, rf.change));
+        assert_eq!((tf.piece, tf.change), (1_310, 820));
+        // …but the LANE is its own, and that is deliberate: the two floors agreeing is a fact about
+        // two builders, and a lane that read another lane's answer is exactly how the floor and the
+        // ladder actually built come apart (hazard 12).
+        assert_eq!(tf.lane, Some(mercuryrustlib::tesr::SplitLane::SpineBatch));
+        assert_eq!(rf.lane, Some(mercuryrustlib::tesr::SplitLane::PlainRoot));
         assert_ne!(
-            split_output_floors(backup_rate, tip),
+            tf,
             split_output_floors(backup_rate, ParentShape::Unladdered),
             "the fall-through answer is the dangerous one and must be distinguishable"
         );
         assert_eq!(tip.route(), "spine batch");
         // Its capacity is arithmetic over its FUNDING outpoint (`SP_i.out[K]`), not over the cap.
         assert_eq!(tip.split_total(2), mercurylib::tesr::tier_out_total(100_000, 2, 2.0));
-        // …and it is refused, by name, before any of that can be acted on.
-        let pf = split_preflight_pure(backup_rate, tip, 0, 5_000);
-        let why = pf.admission.expect_err("a tip cannot be split until change 2 lands");
-        assert!(why.contains("SPINE TIP"), "the refusal must name the shape, got: {why}");
-        assert!(why.contains("spent whole"), "and must say what still works, got: {why}");
+
+        // THE CAPABILITY. A tip is admitted on exactly the terms a root coin is: the same two
+        // floors, the same rule, the same change. Before the spine batch this returned the "builder is not
+        // landed" refusal, and every wallet that had made one partial payment was exit-only for the
+        // rest of its balance.
+        let total = tip.split_total(2).unwrap();
+        let admitted = split_preflight_pure(backup_rate, tip, 0, 5_000)
+            .admission
+            .expect("a spine tip splits as the next batch");
+        assert_eq!(admitted, total - 5_000, "the change is the rest of `SP_i.out[K]`");
+        assert_eq!(
+            split_preflight_pure(backup_rate, tip, 0, 5_000).admission,
+            split_preflight_pure(
+                backup_rate,
+                ParentShape::Root { fee_rate: 2.0, split_source_value: 100_000 },
+                0,
+                5_000
+            )
+            .admission,
+            "quote and executor must judge a tip exactly as they judge the coin it came from"
+        );
+        // And the floors still BIND on this lane — a piece at the change leg's floor is refused,
+        // which is the [V5] hazard the two numbers exist to keep apart.
+        let e = split_preflight_pure(backup_rate, tip, 0, tf.change)
+            .admission
+            .expect_err("a PIECE at the tip floor cannot fund its second rung");
+        assert!(e.contains("the piece falls short"), "got: {e}");
     }
 }

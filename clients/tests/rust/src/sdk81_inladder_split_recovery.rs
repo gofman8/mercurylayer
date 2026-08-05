@@ -191,16 +191,34 @@ pub async fn execute() -> Result<()> {
          piece {piece_sid} awaiting an explicit hand-over)"
     );
 
-    // The change is a real, persisted, exitable claim again — the crash landed BEFORE either child
-    // ladder existed, so both were co-signed by the replay.
-    let change_bundle = mercuryrustlib::tesr::load_child(&cc, ALICE, &change_sid)
+    // The change is a real, persisted, exitable claim again — the crash landed BEFORE any leg's
+    // material existed, so the replay co-signed all of it.
+    //
+    // [CATS change 2] The change is a SPINE TIP now, under `spinetip-`, not a `ctesr-` child. The
+    // row it is looked up through is part of the claim: a replay that wrote it under the child key
+    // would file the sender's own change as a conveyable leaf, and `load_spine_tip` — which is what
+    // `parent_shape`, `unilateral_exit` and the tower all read — would find nothing.
+    let change_tip = mercuryrustlib::tesr::load_spine_tip(&cc, ALICE, &change_sid)
         .await?
-        .ok_or_else(|| anyhow!("alice's change child bundle must be on disk after recovery"))?;
-    assert_eq!(change_bundle.child_statechain_id, change_sid);
+        .ok_or_else(|| anyhow!("alice's change spine tip must be on disk after recovery"))?;
+    assert_eq!(change_tip.statechain_id, change_sid);
     assert!(
-        !change_bundle.child_extension.signed_tx.is_empty()
-            && !change_bundle.child_state.signed_tx.is_empty(),
-        "the replayed change child must carry BOTH co-signed tiers"
+        !change_tip.cap.signed_tx.is_empty(),
+        "the replayed spine tip must carry its co-signed cap"
+    );
+    // ONE cap and no extension, and the record must satisfy its own persist-door precondition after
+    // a REPLAY just as it does after a first run.
+    change_tip
+        .validate()
+        .map_err(|e| anyhow!("the replayed spine tip must still validate: {e}"))?;
+    assert_eq!(
+        mercuryrustlib::tesr::spine_tip_exit_chain(&change_tip).len(),
+        change_tip.parent.exit_tiers().len() + 1,
+        "T, X_m, SP, then ONE cap"
+    );
+    assert!(
+        mercuryrustlib::tesr::load_child(&cc, ALICE, &change_sid).await?.is_none(),
+        "the change must NOT also be filed as a conveyable `ctesr-` child"
     );
     let alice_change = alice.get_balance().await?.available_sats;
     assert!(
@@ -216,7 +234,7 @@ pub async fn execute() -> Result<()> {
     );
 
     // --- THE PROOF: the ORIGINAL payment still completes off-chain. -----------------------------
-    let op_id = format!("in_ladder_split:{parent_sid}:{}", change_bundle.parent.current().state.txid);
+    let op_id = format!("in_ladder_split:{parent_sid}:{}", change_tip.parent.current().state.txid);
     alice
         .convey_recovered_piece(&op_id, &piece_sid, &bob_address)
         .await?;

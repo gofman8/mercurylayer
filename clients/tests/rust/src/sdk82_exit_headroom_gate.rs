@@ -197,7 +197,6 @@ pub async fn execute() -> Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("the control split left no journal record"))?;
-    let control_bundles = control_rec.bundles()?;
     let alice_coins_at_control = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, ALICE).await?.coins;
     let control_piece = control_rec
         .children
@@ -219,10 +218,14 @@ pub async fn execute() -> Result<()> {
     );
     // (Already adopted by bob, so the census terms have moved on; only the headroom term is under
     // test here — it must not be the reason if this one fails.)
+    // [CATS change 2] Rebuild THAT leg as a piece. A root-lane record now also holds the sender's
+    // spine tip, which `bundles()` refuses wholesale — and `piece_bundle` refuses the tip's own index
+    // by name, so this can only ever be the recipient's leaf.
+    let control_piece_bundle = control_rec.piece_bundle(control_piece)?;
     if let Err(e) = mercuryrustlib::tesr::verify_conveyed_child(
         &cc,
         &control_rec.children[control_piece].owner_exit_address,
-        &control_bundles[control_piece],
+        &control_piece_bundle,
     )
     .await
     {
@@ -317,7 +320,6 @@ pub async fn execute() -> Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("the doomed split left no journal record"))?;
-    let bundles = rec.bundles()?;
     // The piece is the child that does NOT pay a key of alice's own wallet.
     let alice_coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, ALICE).await?.coins;
     let piece_idx = rec
@@ -333,7 +335,8 @@ pub async fn execute() -> Result<()> {
         })
         .ok_or_else(|| anyhow!("the split carved no recipient piece"))?;
     let payee = rec.children[piece_idx].owner_exit_address.clone();
-    let err = mercuryrustlib::tesr::verify_conveyed_child(&cc, &payee, &bundles[piece_idx])
+    let piece_bundle = rec.piece_bundle(piece_idx)?;
+    let err = mercuryrustlib::tesr::verify_conveyed_child(&cc, &payee, &piece_bundle)
         .await
         .err()
         .ok_or_else(|| {
@@ -359,7 +362,7 @@ pub async fn execute() -> Result<()> {
     // only to declare `csv: 1` on each tier — touching no signature, no txid and no nSequence — for
     // the requirement to collapse from the real 53 blocks to 9 and the coin to be admitted.
     // ============================================================================================
-    let mut forged = bundles[piece_idx].clone();
+    let mut forged = piece_bundle.clone();
     for lvl in forged.parent.levels.iter_mut() {
         lvl.extension.csv = Some(1);
         lvl.state.csv = Some(1);
@@ -378,7 +381,7 @@ pub async fn execute() -> Result<()> {
     // Nothing that is signed has changed: same tier transactions, byte for byte.
     for (a, b) in mercuryrustlib::tesr::child_exit_chain(&forged)
         .iter()
-        .zip(mercuryrustlib::tesr::child_exit_chain(&bundles[piece_idx]).iter())
+        .zip(mercuryrustlib::tesr::child_exit_chain(&piece_bundle).iter())
     {
         assert_eq!(a.0, b.0, "the forgery must touch ONLY the declared field");
     }
@@ -449,7 +452,7 @@ pub async fn execute() -> Result<()> {
 
     // [B1] And the binding is not simply refusing everything: the HONEST control child's two copies
     // agree, and the requirement read off its signatures is the live schedule's.
-    let bound = mercuryrustlib::tesr::child_exit_chain_bound(&control_bundles[control_piece])
+    let bound = mercuryrustlib::tesr::child_exit_chain_bound(&control_piece_bundle)
         .expect("an honest bundle's declared timelocks match its signatures");
     let bound_csvs: Vec<Option<u16>> = bound.iter().map(|(_, csv)| *csv).collect();
     assert_eq!(bound.len(), 5, "T | X_m | SP | ext_child | state_child");
@@ -460,7 +463,7 @@ pub async fn execute() -> Result<()> {
     );
     // The same forgery on the honest child is refused too — the binding is a property of the
     // bundle, not of the coin's headroom.
-    let mut forged_control = control_bundles[control_piece].clone();
+    let mut forged_control = control_piece_bundle.clone();
     forged_control.child_state.csv = Some(1);
     let ctrl_err = mercuryrustlib::tesr::child_exit_chain_bound(&forged_control)
         .err()

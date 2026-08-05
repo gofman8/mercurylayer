@@ -554,11 +554,21 @@ pub async fn execute() -> Result<()> {
 
     let receiver = crate::sdk58_inladder_split::taproot_addr();
     let mut children = vec![(child.clone(), receiver.clone(), child_value)];
-    let cb = mercuryrustlib::tesr::in_ladder_split(&cc, wallet, &mut parent, &pbundle, &mut children)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(anyhow!("in_ladder_split returned no child bundle"))?;
+    // [CATS change 2] One recipient, NO change leg — see sdk58. The child under attack here is a
+    // PIECE, whose two-tier shape change 2 deliberately leaves alone.
+    let cb = mercuryrustlib::tesr::in_ladder_split(
+        &cc,
+        wallet,
+        &mut parent,
+        &pbundle,
+        &mut children,
+        mercuryrustlib::tesr::ChangeLeg::None,
+    )
+    .await?
+    .pieces
+    .into_iter()
+    .next()
+    .ok_or(anyhow!("in_ladder_split returned no child bundle"))?;
 
     let f_txid = electrum_client::bitcoin::Txid::from_str(&pbundle.f_txid).map_err(|_| anyhow!("bad f_txid"))?;
     let f_tx = cc.electrum_client.transaction_get(&f_txid).map_err(|_| anyhow!("F not on chain"))?;

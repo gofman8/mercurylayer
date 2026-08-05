@@ -58,8 +58,19 @@ pub async fn execute() -> Result<()> {
     // --- Split IN-LADDER via the PRODUCTION sender (promoted from this test's earlier inline logic). -
     let receiver = crate::sdk58_inladder_split::taproot_addr();
     let mut children = vec![(child.clone(), receiver.clone(), child_value)];
-    let bundles = mercuryrustlib::tesr::in_ladder_split(&cc, wallet, &mut parent, &bundle, &mut children).await?;
-    let cb = bundles.into_iter().next().ok_or(anyhow!("in_ladder_split returned no child bundle"))?;
+    // [CATS change 2] `ChangeLeg::None`: this split is one recipient and NO change — the single
+    // child takes the whole payload budget, so there is no sender's leg to shape as a spine tip.
+    let split = mercuryrustlib::tesr::in_ladder_split(
+        &cc,
+        wallet,
+        &mut parent,
+        &bundle,
+        &mut children,
+        mercuryrustlib::tesr::ChangeLeg::None,
+    )
+    .await?;
+    assert!(split.tip.is_none(), "a ChangeLeg::None split must not mint a spine tip");
+    let cb = split.pieces.into_iter().next().ok_or(anyhow!("in_ladder_split returned no child bundle"))?;
 
     // --- Fetch authoritative values a real child receiver would fetch. ------------------------------
     let f_txid = electrum_client::bitcoin::Txid::from_str(&bundle.f_txid).map_err(|_| anyhow!("bad f_txid"))?;

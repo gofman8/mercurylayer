@@ -258,14 +258,41 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > would leave the next batch's `SP` nothing to out-race and strand the tip behind the builders'
 > own `s0_csv <= SPINE_CSV` guard. Structural checks run strictly before value checks.
 >
-> Still to build: change **2** (the change leg keeps its extension, so it is not yet a one-cap spine
-> tip), and change **3** (K > 1 payloads). Until change 2 lands, a payment still adds
-> `[extension, state]` for the change as well as for the piece, so the Freeze-Lemma bound of §4.0 is
-> approached but not yet attained — and V5's change floor stays at `min_child_value`, because
-> `mercuryrustlib::tesr::change_leg_role()` reports what the BUILDERS emit, not what the design
-> wants. **That function is change 2's single flip point, and flipping it early fails OPEN**: the
-> wallet would admit a change leg at 820 and then fail to build its second rung inside
-> `establish_child`, after `set_spend_budget` has terminalized the parent.
+> **Change 2 is now BUILT, in two halves that had to land together.** The PRODUCER:
+> `in_ladder_split` takes a `ChangeLeg` and, on the plain ROOT lane, sends the change leg to
+> `establish_spine_tip_journalled` — ONE state tier at `p.state_csv(0)` directly over `SP.out[K]`,
+> no extension — returning it as a `SpineTipBundle` for `persist_spine_tip` rather than as a
+> `ctesr-` child. `change_leg_role()` (change 2's single flip point, which fails OPEN if flipped
+> early) is now per-LANE and reports `SpineTip` for `SplitLane::PlainRoot`, so V5's 820-sat change
+> floor is live on that lane and the Freeze-Lemma bound of §4.0 is **attained**: a payment adds one
+> transaction to the sender's exit chain, not two.
+>
+> The SECOND half is the **SPINE BATCH** (`spine_batch_split`), and without it the first half is a
+> capability REGRESSION rather than a saving: a tip can be neither split (it has no `tesr-` row, so
+> `in_ladder_pay` cannot load it, and no `ctesr-` row, so `child_in_ladder_pay` cannot either) nor
+> handed over whole (a flat conveyance would give the recipient a backup chain over an un-broadcast
+> funding output — a coin with no exit), so a wallet that had made ONE partial payment was
+> exit-only for the rest of its balance. The batch builds `SP_{i+1}` over the tip's own funding
+> outpoint `SP_i.out[K]` at `SPINE_CSV` (via `build_split_state_from`, never the vout-0 builder),
+> retires the cap `C_i` into the segment's `superseded_states`, terminalizes **the TIP's** slot
+> (not the root parent's, which went terminal at batch 1), and leaves another one-cap tip. The
+> sender's coin is therefore the same object and the same builder at batch 1 and at batch 1000.
+> `ParentShape::SpineTip` routes to it in both `transfer` and `transfer_many`, and
+> `split_preflight_pure` now admits a tip on exactly the terms it admits the coin it came from.
+>
+> Two consequences worth stating because they are easy to get backwards. The batch's `SP_{i+1}` is
+> at `SPINE_CSV` while the new cap is at `state_csv(0)` — **two different tiers, two different
+> bounds**; pin the cap to `SPINE_CSV` and it ties with every future `SP`, and the builder's own
+> `cap_csv <= SPINE_CSV` guard then refuses the next batch, stranding the tip when it is already
+> terminal. And a spine level costs the exit walk **ONE tier**, so `enforce_split_depth_cap` had to
+> stop charging every intermediate level as two (`SplitLevelShape`, derived from the segment's own
+> shape): charging a spine level as two is a silent economic cap, and charging a two-tier level as
+> one mints a leaf whose exit does not fit the epoch.
+>
+> Still to build: the **whole-coin handover of a tip** (D3 of the phase-1 plan — promote it to an
+> ordinary two-tier child, census `0 + 2 + 1`), which is refused by name today; and the **coloured**
+> spine (§4.5 RGB items 1–3), where `cosign_colored_in_ladder_split` still carves a two-tier change
+> and `refuse_uncolored_over_colored_tip` keeps a coloured tip out of the batch builder.
 
 ### 4.0 What cannot be delivered, and why
 
@@ -539,6 +566,21 @@ is a normal L2 assumption (LN `to_self_delay` runs 144–2016 blocks). But "chec
 days, forever" becomes a per-payee obligation, for a $2 payee as much as a $2 000 one, and
 sub-economic payees will rationally abandon. The `Δ_cap` parameter is the dial: raising it above
 1440 lengthens only the sender's own final leg.
+
+> ⚠️ **This section understates it, and the correction matters.** "Sub-economic payees will
+> rationally abandon" frames the cost as **liveness**, borne by the payee. It is a **finality**
+> limit, and it is the **sender's free option**. A split child has no flat backup
+> (`CHILD_V2_BASELINE = 0`); the sender keeps one that spends `F` for **112 vB**
+> (`lib/src/transaction.rs:116`) and pays them the whole coin — **6× to 265× cheaper** than the
+> payee's `293d + 375` vB walk, cheaper than the sender's *own* ladder at every fee rate, and with
+> **zero marginal cost** per additional piece voided. So an ordinary sender exiting for their own
+> reasons voids every sub-economic piece they ever paid, and the admission floor does not protect
+> anyone: `min_child_value` = 1 310 sat **is** the break-even function evaluated at the hardcoded
+> `committed_fee_rate = 2.0` (`lib/src/tesr.rs:190`) and at no other rate. At 20 sat/vB a depth-10
+> piece admitted at 1 310 costs **124 870** to defend. CATS shrinks the `d` term (§6) but leaves the
+> option free and, per the table above, shortens the window in which the payee could notice.
+> The band, the three enforcement buckets, and the ranked fixes are in
+> [SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md).
 
 ---
 

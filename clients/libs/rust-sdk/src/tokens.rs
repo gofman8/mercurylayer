@@ -3663,9 +3663,16 @@ impl UtexoWallet {
         let piece_floor =
             backup_floor.max(mercuryrustlib::tesr::SplitLegRole::Piece
                 .colored_min_value(bundle.fee_rate, COLORED_LADDER_DUST));
+        // [CATS change 2] `SplitLane::Colored` — this lane's OWN answer, not the plain root lane's.
+        // `cosign_colored_in_ladder_split` still sends every leg through the two-rung coloured child
+        // builder, so its change floor is still `colored_child_floor`. Reading the root lane's
+        // answer here would floor the change at 906 while the builder built 1 482 worth of rungs,
+        // and `establish_child` would discover that after the carrier was already terminal.
         let change_floor =
-            backup_floor.max(mercuryrustlib::tesr::change_leg_role()
-                .colored_min_value(bundle.fee_rate, COLORED_LADDER_DUST));
+            backup_floor.max(mercuryrustlib::tesr::change_leg_role(
+                mercuryrustlib::tesr::SplitLane::Colored,
+            )
+            .colored_min_value(bundle.fee_rate, COLORED_LADDER_DUST));
         let too_small: Vec<u64> =
             piece_sats.iter().copied().filter(|s| *s < piece_floor).collect();
         if !too_small.is_empty() {
