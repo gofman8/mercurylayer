@@ -52,7 +52,7 @@ const WIDTH_PER_PIECE_SHARE_VB: u64 = WIDTH_SPLIT_VB / 4;
 fn coins(v: &[u64]) -> Vec<Candidate> {
     v.iter()
         .enumerate()
-        .map(|(index, &amount_sats)| Candidate { index, amount_sats, splittable: true })
+        .map(|(index, &amount_sats)| Candidate { index, amount_sats, splittable: true, is_inventory: true })
         .collect()
 }
 

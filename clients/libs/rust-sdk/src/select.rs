@@ -14,6 +14,26 @@ pub struct Candidate {
     /// whole (a child-level split is not implemented), so it is offered for exact/whole plans but
     /// never selected to be split.
     pub splittable: bool,
+    /// **[K>1 prerequisite 3] Is this coin the wallet's own INVENTORY, rather than a payee-facing
+    /// piece it happens to still hold?**
+    ///
+    /// The planner is otherwise shape-blind: it sees amounts, sorts split candidates ascending and
+    /// takes the smallest that fits. That rule picks the wrong coin as soon as a wallet holds both a
+    /// spine tip and a received piece, and it picks it in a way that gets worse over time:
+    ///
+    /// * splitting a received PIECE pushes that payee's leaf one level deeper and mints a crumb;
+    /// * the crumb is smaller than the tip, so it sorts EARLIER next time;
+    /// * so the next forecast miss splits the crumb, and the one after that its crumb.
+    ///
+    /// Self-reinforcing, and each turn of it deepens someone else's exit chain to save the sender an
+    /// arithmetic surprise. So the preference is **hard** — every inventory candidate is preferred to
+    /// every non-inventory one, at any amount — not a tiebreak that a 1-sat difference can invert.
+    ///
+    /// **Keyed on the record kind, resolved LOCALLY, never on `amount_sats`.** The wallet reads its
+    /// own `spinetip-`/`ctesr-`/`tesr-` rows to answer this. Deriving it from the amount instead
+    /// would hand a counterparty the choice of which of the recipient's coins gets split next, by
+    /// choosing what they send them.
+    pub is_inventory: bool,
 }
 
 /// Outcome of planning a payment of `target` sats.
@@ -125,7 +145,11 @@ pub fn plan_with_floor(coins: &[Candidate], target: u64, min_output: u64) -> Pla
                     > remaining + crate::transfer::split_fee_reserve(c.amount_sats) + min_output
         })
         .collect();
-    candidates.sort_by_key(|c| c.amount_sats);
+    // [K>1 prerequisite 3] INVENTORY FIRST, and only then smallest-that-fits. `false < true`, so
+    // `!is_inventory` puts every inventory candidate ahead of every non-inventory one regardless of
+    // amount — a HARD preference, which is the point: as a tiebreak it would be inverted by a
+    // one-sat difference, and the coin it would then pick is a payee's piece. See `Candidate`.
+    candidates.sort_by_key(|c| (!c.is_inventory, c.amount_sats));
     match candidates.first() {
         Some(c) => Plan::WithSplit {
             whole,
@@ -144,7 +168,14 @@ mod tests {
     fn coins(v: &[u64]) -> Vec<Candidate> {
         v.iter()
             .enumerate()
-            .map(|(index, &amount_sats)| Candidate { index, amount_sats, splittable: true })
+            .map(|(index, &amount_sats)| Candidate {
+                index,
+                amount_sats,
+                splittable: true,
+                // The pre-existing tests describe a wallet of ordinary own coins; the inventory
+                // preference is exercised by the tests that mix the two kinds, below.
+                is_inventory: true,
+            })
             .collect()
     }
 
@@ -208,6 +239,93 @@ mod tests {
             }
             p => panic!("expected split, got {p:?}"),
         }
+    }
+
+    // ---- [K>1 prerequisite 3] THE INVENTORY PREFERENCE ------------------------------------------
+
+    /// `(amount, is_inventory)` — the only two facts this preference is allowed to read.
+    fn mixed(v: &[(u64, bool)]) -> Vec<Candidate> {
+        v.iter()
+            .enumerate()
+            .map(|(index, &(amount_sats, is_inventory))| Candidate {
+                index,
+                amount_sats,
+                splittable: true,
+                is_inventory,
+            })
+            .collect()
+    }
+
+    /// THE DEFECT, executed. A wallet holding a small received PIECE and a large spine TIP must
+    /// split the tip: splitting the piece deepens a payee's exit chain and mints a crumb that sorts
+    /// even earlier next time.
+    ///
+    /// Both coins are viable here — this is not a fallback, it is a preference, and it has to hold
+    /// when the *wrong* coin is the one the amount rule would pick.
+    #[test]
+    fn a_forecast_miss_splits_inventory_not_a_payees_piece() {
+        //            index 0: a received piece (small)   index 1: the spine tip (large)
+        let cs = mixed(&[(20_000, false), (900_000, true)]);
+        match plan(&cs, 5_000) {
+            Plan::WithSplit { split, split_amount, whole } => {
+                assert!(whole.is_empty(), "nothing sums below the target here");
+                assert_eq!(split_amount, 5_000);
+                assert_eq!(
+                    split, 1,
+                    "the SPINE TIP (index 1) must be split even though the received piece at \
+                     index 0 is smaller and also viable"
+                );
+            }
+            p => panic!("expected a split, got {p:?}"),
+        }
+    }
+
+    /// The preference is HARD, not a tiebreak: no amount gap reverses it. 40x here, and the
+    /// direction must be unchanged.
+    #[test]
+    fn the_inventory_preference_is_not_a_tiebreak() {
+        let cs = mixed(&[(25_000, false), (1_000_000, true)]);
+        let picked = match plan(&cs, 5_000) {
+            Plan::WithSplit { split, .. } => split,
+            p => panic!("expected a split, got {p:?}"),
+        };
+        assert_eq!(picked, 1, "a 40x larger inventory coin still wins");
+    }
+
+    /// …and within a class the old rule is untouched: smallest that fits.
+    #[test]
+    fn among_inventory_the_smallest_that_fits_still_wins() {
+        let cs = mixed(&[(900_000, true), (40_000, true), (20_000, false)]);
+        match plan(&cs, 5_000) {
+            Plan::WithSplit { split, .. } => assert_eq!(split, 1, "the 40 000-sat inventory coin"),
+            p => panic!("expected a split, got {p:?}"),
+        }
+    }
+
+    /// A wallet with NO inventory still pays. The preference orders candidates; it never removes
+    /// them, because a payment refused for want of a tip is a payment the chain would have carried.
+    #[test]
+    fn with_no_inventory_a_piece_is_still_split() {
+        let cs = mixed(&[(20_000, false), (900_000, false)]);
+        match plan(&cs, 5_000) {
+            Plan::WithSplit { split, .. } => assert_eq!(split, 0, "smallest that fits, as before"),
+            p => panic!("expected a split, got {p:?}"),
+        }
+    }
+
+    /// The flag is read, the amount is not. Same amounts, flags swapped, and the choice follows the
+    /// FLAG — which is what stops a counterparty from steering the recipient's next split by
+    /// choosing what they send.
+    #[test]
+    fn the_choice_follows_the_flag_and_not_the_amount() {
+        let a = mixed(&[(20_000, false), (900_000, true)]);
+        let b = mixed(&[(20_000, true), (900_000, false)]);
+        let pick = |cs: &[Candidate]| match plan(cs, 5_000) {
+            Plan::WithSplit { split, .. } => split,
+            p => panic!("expected a split, got {p:?}"),
+        };
+        assert_eq!(pick(&a), 1);
+        assert_eq!(pick(&b), 0);
     }
 
     // INV-9: exact subset sums to target exactly.

@@ -30,6 +30,15 @@ pub struct TransferReceiverRequestPayload {
 pub enum TransferReceiverError {
     StatecoinBatchLockedError,
     ExpiredBatchTimeError,
+    /// The transfer this recipient is trying to claim was CANCELLED (see
+    /// `crate::transfer::cancel`). Returned with HTTP 410 and only to a caller that proved it holds
+    /// the recorded recipient key, so it is never an existence oracle for third parties.
+    ///
+    /// This variant exists so the wallet can say "this payment was cancelled" instead of the
+    /// silent "nothing arrived" the client's `println!` + `continue` loop produces for every other
+    /// mailbox miss — a cancelled payment that looks like an idle mailbox is the exact
+    /// silent-degradation shape a recipient must never be shown.
+    TransferCancelledError,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -767,6 +776,137 @@ pub fn max_split_depth(base: &[Option<u16>], per_level: &[Option<u16>], epoch_bl
         return u32::MAX;
     }
     1 + (epoch_blocks - base_wait) / level_wait
+}
+
+/// **[P0-3] THE EXIT-CHAIN LENGTH CAP** — the most transactions one unilateral exit may require.
+///
+/// # Why the latency rule is not enough
+///
+/// [`exit_wait_blocks`] charges a tier ONE block for its parent's confirmation. That is the
+/// theoretical minimum, not a budget. A SPINE tier is signed at `SPINE_CSV = 0`, so it costs exactly
+/// **one block** of latency while adding a whole transaction (~168 vB) to the walk. On the mainnet
+/// schedule a depth-1 child's chain waits 2 885 blocks, which leaves 7 115 blocks of a
+/// 10 000-block funding epoch — i.e. [`check_exit_headroom`] admits **7 115 further spine levels**,
+/// a legal 7 120-transaction, ~1.2 MB exit chain that it reports as comfortably inside the epoch.
+/// Every receiver of such a piece is credited a coin it cannot realistically materialise, and the
+/// sender can mint them in one batch each. Ark's `bark` closed the same hole with a flat
+/// `max_vtxo_exit_depth = 100`.
+///
+/// # The bound is derived, not chosen
+///
+/// The latency rule already blesses a longest chain: the deepest TWO-TIER child it admits, because a
+/// two-tier level is the shape that pays full price in latency. Expressing that same rule in
+/// transactions instead of blocks gives the cap:
+///
+/// ```text
+/// max_exit_txs(base, per_level, epoch) = 3 + 2 · max_split_depth(base, per_level, epoch)
+/// ```
+///
+/// where `3` is the parent segment (`T`, `X_m`, `SP`) and each further level costs its two tiers,
+/// plus the leaf's own two — i.e. `tesr_exit_txs(d) = 3 + 2d`, the count the SDK's invalidation model
+/// already uses.
+///
+/// * **Mainnet** (`lockheight_init = 10 000`, `E0 = 720`, `D0 = 1440`): `max_split_depth = 10`,
+///   so the cap is **23 transactions**.
+/// * **Regtest** (`lockheight_init = 1 000`, `E0 = 12`, `D0 = 24`): `max_split_depth = 68`,
+///   so the cap is **139 transactions**.
+///
+/// By construction this refuses NOTHING the latency rule admits on a two-tier chain — the two bounds
+/// meet exactly at depth 10 / 23 transactions on mainnet — and it is what turns a spine level from
+/// free into priced.
+///
+/// # The worst-case weight it implies
+///
+/// At the mainnet cap of 23 tiers: all one-payload uncoloured tiers = 23 · 125 = **2 875 vB**; every
+/// ancestor `SP` two-payload uncoloured = 23 · 168 = **3 864 vB**; all coloured two-payload tiers
+/// (211 vB) = 23 · 211 = **4 853 vB**. Against the 1 196 160 vB a 7 120-tier chain costs today.
+///
+/// ⚠️ This is a bound on the CHAIN, not on any single transaction. An `SP`'s width is a free
+/// parameter (`build_split_state_from` enforces no output-count limit), so the absolute ceiling is
+/// `23 · TRUC_MAX_VBYTES = 230 000 vB` until a companion per-tier bound exists. See the module note
+/// in `docs` and the residual-risk list: a v3/TRUC tier above 10 000 vB (≈ 230 payload outputs) is
+/// non-standard, never relays, and its pre-signed exit is dead — that is a SEPARATE, still-open
+/// finding, not one this cap closes.
+///
+/// # Floor
+///
+/// `max_split_depth` returns `0` when even a depth-1 child does not fit, so the cap floors at `3`,
+/// which is exactly a minimal root ladder (`T`, `X_0`, `S_0`). No honest coin is ever refused for
+/// being shorter than the shortest chain this protocol can build.
+pub fn max_exit_txs(base: &[Option<u16>], per_level: &[Option<u16>], epoch_blocks: u32) -> u32 {
+    let depth = max_split_depth(base, per_level, epoch_blocks);
+    3u32.saturating_add(depth.saturating_mul(2))
+}
+
+/// A coin whose unilateral exit needs more TRANSACTIONS than [`max_exit_txs`] admits.
+///
+/// Distinct from [`ExitHeadroomShortfall`] on purpose: that one fires when the exit does not fit in
+/// TIME, this one when it does not fit in WORK. The whole point of the cap is the gap between them —
+/// a chain of spine tiers satisfies the latency rule and violates this one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "exit-chain length cap ({lane}): this coin's unilateral exit is {txs} transactions long, more \
+     than the {max_txs} this schedule and its {epoch_blocks}-block funding epoch admit (the deepest \
+     two-tier child that fits is depth {max_depth}, and a chain is 3 + 2·depth transactions). A \
+     SPINE tier costs one block of exit latency but a whole transaction, so the exit-headroom rule \
+     alone would pass a chain of thousands of them: it fits in the epoch and is still unusable. \
+     Refused rather than admitted as a coin whose owner could never realistically broadcast it."
+)]
+pub struct ExitChainTooLong {
+    /// Which lane refused (`"conveyed child"`, `"in-ladder split"`, `"conveyed root ladder"`, …).
+    pub lane: String,
+    /// Transactions in the exit chain that was measured.
+    pub txs: u32,
+    /// The cap ([`max_exit_txs`]).
+    pub max_txs: u32,
+    /// The deepest two-tier child the epoch admits — the depth the cap is derived from.
+    pub max_depth: u32,
+    /// The funding epoch length (`lockheight_init`).
+    pub epoch_blocks: u32,
+}
+
+/// **[P0-3] THE LENGTH GATE.** Refuse an exit chain longer than [`max_exit_txs`]; returns the
+/// surviving slack in transactions.
+///
+/// **Strictly greater, never `>=`.** The mainnet-max latency-bound two-tier child is EXACTLY 23
+/// transactions and is honest — `max_split_depth` admits it and [`check_exit_headroom`] admits it
+/// (9 383 ≤ 10 000). `>=` would refuse the single deepest shape the builders legitimately produce.
+/// Same boundary discipline [`check_exit_headroom`] already keeps: a bundle landing exactly on the
+/// limit is admissible.
+///
+/// **[B1] Every input must be RECEIVER-DERIVED.** `epoch_blocks` is the SE's `lockheight_init` read
+/// from `/info/config`; `base`/`per_level` come from the RECEIVER's own network preset
+/// (`TesrParams::for_network`), NEVER from the conveyed `bundle.params` — a schedule the sender
+/// declares would let it inflate its own cap, which is the C-1 shape (authority derived from the
+/// artifact being checked) this file has already been burned by.
+///
+/// ⚠️ **This is a COUNT, not a value.** It reads no transaction output and no `LinkedPayload`, so it
+/// is outside the check-ordering defect class and belongs BEFORE the structural pass, not after: a
+/// chain cannot be shortened by omitting a segment (every tier is linked to its parent's outpoint),
+/// so the count is trustworthy pre-binding, and refusing early is what keeps the DoS margin.
+///
+/// ⚠️ **NEVER call this from the exit path.** It is an ADMISSION and BUILD rule only. A coin that is
+/// already owned must always be exitable; a length refusal reachable from `exit_pass`,
+/// `exit_child_pass`, `child_exit_chain*`, `spine_tip_exit_chain*`, `defend_ladders` or
+/// `unilateral_exit` would strand a real coin permanently — strictly worse than the hole it closes.
+pub fn check_exit_chain_length(
+    lane: &str,
+    txs: u32,
+    base: &[Option<u16>],
+    per_level: &[Option<u16>],
+    epoch_blocks: u32,
+) -> Result<u32, ExitChainTooLong> {
+    let max_txs = max_exit_txs(base, per_level, epoch_blocks);
+    if txs > max_txs {
+        return Err(ExitChainTooLong {
+            lane: lane.to_string(),
+            txs,
+            max_txs,
+            max_depth: max_split_depth(base, per_level, epoch_blocks),
+            epoch_blocks,
+        });
+    }
+    Ok(max_txs.saturating_sub(txs))
 }
 
 pub fn reconstruct_transaction(tx_n_hex: &str) -> Result<(), MercuryError> {

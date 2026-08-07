@@ -63,6 +63,68 @@ pub struct InLadderSplitRecovery {
     pub outcome: InLadderSplitOutcome,
 }
 
+/// **[K>1 prerequisite 2] A split that carved pieces it never handed over.**
+///
+/// The material is co-signed and on disk; what is missing is the hand-over. The sender cannot spend
+/// these pieces — their final state tier pays the recipient — and the recipient cannot claim them —
+/// they have no bundle — so an outstanding leg is value that is stuck until
+/// [`UtexoWallet::resume_split_conveyance`] runs.
+#[derive(Clone, Debug)]
+pub struct PendingConveyance {
+    /// Feed this to [`UtexoWallet::resume_split_conveyance`].
+    pub op_id: String,
+    pub lane: String,
+    pub terminalized_statechain_id: String,
+    /// Pieces still resumable: the journal holds their recipient address, so a resume can finish them.
+    pub outstanding: Vec<String>,
+    /// Pieces that can NOT be resumed to the same address — see
+    /// [`mercuryrustlib::tesr::ConveyanceStage::Stranded`].
+    pub stranded: Vec<String>,
+}
+
+/// **[K>1 prerequisite 2] Close the journal, or say precisely what is left — never both, never
+/// neither.**
+///
+/// A split lane may close its write-ahead record only when every piece it undertook to convey has
+/// actually landed. Closing it early hides the survivors from
+/// [`UtexoWallet::pending_conveyances`]; leaving it open on success replays a finished operation
+/// forever. So the two are decided by the same value, in one place.
+///
+/// When legs remain the call FAILS — the caller asked for a payment and did not fully get one — but
+/// it fails with the `op_id` and the resume call in the message, because everything needed to finish
+/// is durable and the correct response is to retry, not to re-pay.
+async fn finish_or_report_conveyance(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet_name: &str,
+    op_id: &str,
+    outcome: &mercuryrustlib::tesr::ConveyanceOutcome,
+) -> Result<()> {
+    if outcome.is_complete() {
+        return mercuryrustlib::tesr::journal_commit(cc, wallet_name, op_id).await;
+    }
+    Err(anyhow!(
+        "in-ladder batch {op_id}: {} of {} piece(s) were handed over; {} failed, {} stranded, {} \
+         unactionable. The split itself is COMPLETE and durable — every tier is co-signed and on \
+         disk, and every remaining recipient's address is in the journal — so this is a resumable \
+         hand-over, not a lost payment and not one to re-send: call \
+         `resume_split_conveyance(\"{op_id}\")`. Failures: {:?}. Stranded (cannot be resumed to the \
+         same address): {:?}. Unactionable: {:?}.",
+        // `not_undertaken` is EXCLUDED from both counts. Those legs are conveyed by the caller, so
+        // they are neither "handed over by this driver" nor outstanding work — counting them in the
+        // denominator produced the nonsense "1 of 2 piece(s) were handed over" for a healthy split.
+        outcome.conveyed.len() + outcome.already.len(),
+        outcome.conveyed.len() + outcome.already.len() + outcome.failed.len()
+            + outcome.stranded.len()
+            + outcome.unactionable.len(),
+        outcome.failed.len(),
+        outcome.stranded.len(),
+        outcome.unactionable.len(),
+        outcome.failed,
+        outcome.stranded,
+        outcome.unactionable,
+    ))
+}
+
 /// Which split route a `transfer_many` parent takes. Chosen by the parent's SHAPE, exactly as
 /// `transfer` chooses between `in_ladder_pay` / `child_in_ladder_pay` / `split_coin`: a parent that
 /// carries a TES-R ladder must never take the plain split ([B1] — a retained, un-timelocked trigger
@@ -240,6 +302,11 @@ impl UtexoWallet {
                 index,
                 amount_sats: c.amount.unwrap_or_default() as u64,
                 splittable: true,
+                // [K>1 prerequisite 3] From the shape resolved LOCALLY just above — the wallet's own
+                // `spinetip-`/`ctesr-`/`tesr-` rows — and never from `amount_sats`. `shapes` is
+                // built by the same `enumerate` over the same slice, so `shapes[index]` is this
+                // coin.
+                is_inventory: shapes[index].is_inventory(),
             })
             .collect();
 
@@ -664,6 +731,11 @@ impl UtexoWallet {
         if recipients.is_empty() {
             return Err(anyhow!("no recipients"));
         }
+        // [K>1 prerequisite 4] The outermost statement of the bound, so a caller that builds a
+        // recipient list programmatically is told the maximum batch size before anything else can
+        // fail for a less informative reason. Every in-ladder route re-states it against the coin it
+        // actually splits (each spine level is a FRESH statechain, so the cap is per level).
+        crate::wallet::refuse_oversized_slot_batch(recipients.len() + 1)?;
         let total: u64 = recipients.iter().map(|(_, a)| *a).sum();
 
         // Auto-refresh near-final coins before the parent is selected (see `transfer`).
@@ -1144,6 +1216,8 @@ impl UtexoWallet {
             .split_total(2)
             .ok_or_else(|| anyhow!("committed fee too high to split this child into two"))?;
         let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        // [K>1] The aggregate floor first — see `in_ladder_pay`. K = 1 here.
+        refuse_undersized_batch_parent(child_statechain_id, 1, shape, floors)?;
         let change_sats = inladder_amounts_floored(total, piece_sats, floors)?;
 
         let mut slot_tokens = self.take_derived_tokens(child_statechain_id, 2).await?;
@@ -1166,40 +1240,42 @@ impl UtexoWallet {
             (piece_gc.clone(), payee, piece_sats),
             (change_gc.clone(), self_change_backup, change_sats),
         ];
+        let piece_sid = piece_gc.statechain_id.clone().unwrap_or_default();
+        let change_sid = change_gc.statechain_id.clone().unwrap_or_default();
+        // [K>1 prerequisite 2] One recipient is still a conveyance plan: the address must be durable
+        // before the child is terminalized, or a failed hand-over here is as unrecoverable as one at
+        // K = 20.
+        let conveyance = vec![(piece_sid.clone(), recipient_address.to_string())];
         let bundles = mercuryrustlib::tesr::child_in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &mut child_coin,
             &cb,
             &mut grandchildren,
+            &conveyance,
         )
         .await?;
 
-        let piece_sid = piece_gc.statechain_id.clone().unwrap_or_default();
-        let change_sid = change_gc.statechain_id.clone().unwrap_or_default();
-        // Convey the piece grandchild (with the standard handover) and keep the change locally.
-        mercuryrustlib::tesr::convey_child_bundle(
-            &self.inner.cc,
-            recipient_address,
-            &grandchildren[0].0,
-            &bundles[0],
-            None,
-        )
-        .await?;
         mercuryrustlib::tesr::persist_child(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &bundles[1],
         )
         .await?;
+        // Convey the piece grandchild (with the standard handover) and keep the change locally.
+        let op_id = mercuryrustlib::tesr::split_op_id(&bundles[0]);
+        let outcome = self.drive_split_conveyance(&op_id).await?;
 
-        // Book: the spent child is gone, the piece left, the change is a fresh confirmed claim.
+        // Book: the spent child is gone, the piece left (if it landed), the change is a fresh
+        // confirmed claim.
         {
             let mut record = self.record().await?;
             for coin in record.coins.iter_mut() {
                 match coin.statechain_id.as_deref() {
                     Some(sid) if sid == child_statechain_id => coin.status = CoinStatus::WITHDRAWN,
-                    Some(sid) if sid == piece_sid => coin.status = CoinStatus::WITHDRAWN,
+                    Some(sid) if outcome.conveyed.iter().any(|p| p == sid) => {
+                        coin.status = CoinStatus::WITHDRAWN
+                    }
                     Some(sid) if sid == change_sid => {
                         coin.status = CoinStatus::CONFIRMED;
                         coin.amount = Some(change_sats as u32);
@@ -1212,12 +1288,8 @@ impl UtexoWallet {
 
         // [P0-3] The split's write-ahead journal record stays OPEN until this point: the co-signed
         // material only becomes recoverable-by-restart once the bundles are on disk and conveyed.
-        mercuryrustlib::tesr::journal_commit(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
-        )
-        .await?;
+        finish_or_report_conveyance(&self.inner.cc, &self.inner.config.wallet_name, &op_id, &outcome)
+            .await?;
         Ok((piece_sid, change_sid))
     }
 
@@ -1240,6 +1312,8 @@ impl UtexoWallet {
         if n == 0 {
             return Err(anyhow!("no recipients"));
         }
+        // [K>1 prerequisite 4] `n` payee slots + one change slot, vouched by the child being split.
+        crate::wallet::refuse_oversized_slot_batch(n + 1)?;
         let cb = mercuryrustlib::tesr::load_child(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1257,6 +1331,16 @@ impl UtexoWallet {
             .split_total(n + 1)
             .ok_or_else(|| anyhow!("committed fee too high to split this child into {} outputs", n + 1))?;
         let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
+        // [B2] The same floor, from the same source, as the single-recipient child split (see the
+        // guard in `child_in_ladder_pay`), applied to EVERY output: refuse up-front, before the child
+        // is terminalized.
+        // [V5] Per-leg: the recipients are PIECES, the leftover is the CHANGE.
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        // [K>1] The aggregate floor first — see `in_ladder_pay_many`. Note this lane's change leg is
+        // a two-tier grandchild, so `floors.change` is `min_child_value`, not the tip's cheaper
+        // number: the minimum is `1 396K + 1 800`, not `1 396K + 1 310`, and it comes from the
+        // floors rather than from either literal.
+        refuse_undersized_batch_parent(child_statechain_id, n, shape, floors)?;
         if pieces_total >= total {
             return Err(anyhow!(
                 "payments totalling {pieces_total} sat leave no change: splitting this child {n} ways can pay at most {} sat",
@@ -1264,11 +1348,6 @@ impl UtexoWallet {
             ));
         }
         let change_sats = total - pieces_total;
-        // [B2] The same floor, from the same source, as the single-recipient child split (see the
-        // guard in `child_in_ladder_pay`), applied to EVERY output: refuse up-front, before the child
-        // is terminalized.
-        // [V5] Per-leg: the recipients are PIECES, the leftover is the CHANGE.
-        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < floors.piece) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the in-ladder piece minimum {} sat (each grandchild funds its own extension + state tier, then must clear the {DUST_LIMIT}-sat dust floor)",
@@ -1303,12 +1382,21 @@ impl UtexoWallet {
             .cloned()
             .ok_or_else(|| anyhow!("child coin {child_statechain_id} not found"))?;
 
+        // [K>1 prerequisite 2] The conveyance plan, journalled before the child is terminalized.
+        let conveyance: Vec<(String, String)> = grandchildren[..n]
+            .iter()
+            .zip(recipients.iter())
+            .map(|((c, _, _), (address, _))| {
+                (c.statechain_id.clone().unwrap_or_default(), address.clone())
+            })
+            .collect();
         let bundles = mercuryrustlib::tesr::child_in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &mut child_coin,
             &cb,
             &mut grandchildren,
+            &conveyance,
         )
         .await?;
 
@@ -1323,30 +1411,23 @@ impl UtexoWallet {
             &bundles[n],
         )
         .await?;
-        // Convey each recipient's grandchild (standard handover).
-        for (j, (address, _)) in recipients.iter().enumerate() {
-            mercuryrustlib::tesr::convey_child_bundle(
-                &self.inner.cc,
-                address,
-                &grandchildren[j].0,
-                &bundles[j],
-                None,
-            )
-            .await?;
-        }
 
         let piece_sids: Vec<String> = grandchildren[..n]
             .iter()
             .map(|(c, _, _)| c.statechain_id.clone().unwrap_or_default())
             .collect();
         let change_sid = change_gc.statechain_id.clone().unwrap_or_default();
-        // Book: the spent child is gone, every piece left, the change is a fresh confirmed claim.
+        // [K>1 prerequisite 2] Journalled, resumable, leg-independent — see `in_ladder_pay_many`.
+        let op_id = mercuryrustlib::tesr::split_op_id(&bundles[0]);
+        let outcome = self.drive_split_conveyance(&op_id).await?;
+        // Book: the spent child is gone, every CONVEYED piece left, the change is a fresh confirmed
+        // claim. A piece that did not land keeps its status — its value has not gone anywhere.
         {
             let mut record = self.record().await?;
             for coin in record.coins.iter_mut() {
                 match coin.statechain_id.as_deref() {
                     Some(sid) if sid == child_statechain_id => coin.status = CoinStatus::WITHDRAWN,
-                    Some(sid) if piece_sids.iter().any(|p| p == sid) => {
+                    Some(sid) if outcome.conveyed.iter().any(|p| p == sid) => {
                         coin.status = CoinStatus::WITHDRAWN
                     }
                     Some(sid) if sid == change_sid => {
@@ -1363,16 +1444,18 @@ impl UtexoWallet {
         // construction — the payment itself is already committed and conveyed at this point.
         if let Some(seg) = bundles[n].ancestors.last() {
             let csp_txid = signed_tier_txid(&seg.state.signed_tx)?;
-            self.record_conveyed_pieces(&csp_txid, recipients).await?;
+            let landed: Vec<(u32, u64)> = recipients
+                .iter()
+                .zip(piece_sids.iter())
+                .enumerate()
+                .filter(|(_, (_, sid))| outcome.conveyed.contains(sid))
+                .map(|(j, ((_, amt), _))| (j as u32, *amt))
+                .collect();
+            self.record_conveyed_pieces(&csp_txid, &landed).await?;
         }
-        // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
-        // restart has nothing left to replay.
-        mercuryrustlib::tesr::journal_commit(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
-        )
-        .await?;
+        // [P0-3] Close the split's write-ahead journal only if nothing is left to hand over.
+        finish_or_report_conveyance(&self.inner.cc, &self.inner.config.wallet_name, &op_id, &outcome)
+            .await?;
         Ok((piece_sids, change_sid))
     }
 
@@ -1417,6 +1500,9 @@ impl UtexoWallet {
         // the parent and THEN fails with FeeTooHigh, stranding the parent to unilateral-exit-only.
         // Refusing up-front keeps the parent fully spendable (same discipline as `split_coin`).
         let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        // [K>1] The aggregate floor first, so a coin that cannot carry ONE payee plus a change leg
+        // says so instead of blaming the amount the caller chose. K = 1 here.
+        refuse_undersized_batch_parent(parent_statechain_id, 1, shape, floors)?;
         let change_sats = inladder_amounts_floored(total, piece_sats, floors)?;
 
         // Two fresh SE-registered child slots (DERIVED — free vouchers against the parent's value).
@@ -1442,6 +1528,21 @@ impl UtexoWallet {
             (piece_child.clone(), payee, piece_sats),
             (change_child.clone(), self_change_backup, change_sats),
         ];
+        // [K>1 prerequisite 2] The conveyance plan — but ONLY for the unlatched lane.
+        //
+        // A LATCHED piece's mailbox row must be born batch-locked, and the batch id does not exist
+        // yet: it is created below, after the split. Journalling an address without it would let the
+        // resume driver re-open the hand-over UNLATCHED — the receiver could then adopt the piece
+        // before the Lightning preimage lands, which is the one thing the latch exists to prevent.
+        // So the latched lane journals no address and conveys inline; the resume driver reports its
+        // leg `unactionable` rather than finishing it wrongly. Fail-closed, and deliberate.
+        let conveyance: Vec<(String, String)> = match latch {
+            InLadderLatch::None => vec![(
+                piece_child.statechain_id.clone().unwrap_or_default(),
+                recipient_address.to_string(),
+            )],
+            _ => vec![],
+        };
         // [CATS change 2] The change leg is LAST and is built as a one-cap SPINE TIP — one rung, not
         // two, which is exactly the shape `split_output_floors` just admitted it at.
         let split = mercuryrustlib::tesr::in_ladder_split(
@@ -1451,6 +1552,7 @@ impl UtexoWallet {
             &bundle,
             &mut children,
             mercuryrustlib::tesr::ChangeLeg::LastIsTip,
+            &conveyance,
         )
         .await?;
         let bundles = &split.pieces;
@@ -1526,14 +1628,25 @@ impl UtexoWallet {
         }
 
         // Convey the piece child to the recipient's mailbox (auth = the piece slot we own).
-        mercuryrustlib::tesr::convey_child_bundle(
-            &self.inner.cc,
-            recipient_address,
-            &children[0].0,
-            piece_bundle,
-            latch_batch.clone(),
-        )
-        .await?;
+        //
+        // [K>1 prerequisite 2] The unlatched lane goes through the journalled driver (resumable);
+        // the latched lane conveys inline, because its batch id was only learned above — see the
+        // `conveyance` note where the plan is built.
+        let op_id = mercuryrustlib::tesr::split_op_id(&bundles[0]);
+        let conveyance_outcome = match &latch_batch {
+            None => Some(self.drive_split_conveyance(&op_id).await?),
+            Some(batch) => {
+                mercuryrustlib::tesr::convey_child_bundle(
+                    &self.inner.cc,
+                    recipient_address,
+                    &children[0].0,
+                    piece_bundle,
+                    Some(batch.clone()),
+                )
+                .await?;
+                None
+            }
+        };
 
         // Persist the change as an exitable self-claim; book both slots + the spent parent.
         //
@@ -1555,23 +1668,44 @@ impl UtexoWallet {
         } else {
             CoinStatus::WITHDRAWN
         };
-        self.book_inladder_split_coins(
+        // [K>1 prerequisite 2] The piece's status follows what actually landed. On the unlatched lane
+        // a hand-over that did not complete leaves the piece where it is — its value has not left
+        // this wallet, and `WITHDRAWN` would hide a piece that still needs conveying.
+        let conveyed_pieces: Vec<String> = match &conveyance_outcome {
+            Some(o) => o.conveyed.clone(),
+            None => vec![piece_sid.clone()],
+        };
+        self.book_inladder_split_coins_n(
             parent_statechain_id,
             &sp_txid,
-            &piece_sid,
+            &conveyed_pieces,
+            piece_status,
             change_child.statechain_id.as_deref().unwrap_or_default(),
             change_sats,
-            piece_status,
+            1,
         )
         .await?;
         // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
         // restart has nothing left to replay.
-        mercuryrustlib::tesr::journal_commit(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
-        )
-        .await?;
+        match &conveyance_outcome {
+            Some(outcome) => {
+                finish_or_report_conveyance(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &op_id,
+                    outcome,
+                )
+                .await?
+            }
+            None => {
+                mercuryrustlib::tesr::journal_commit(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &op_id,
+                )
+                .await?
+            }
+        }
 
         Ok((piece_sid, change_child.statechain_id.clone().unwrap_or_default(), latch))
     }
@@ -1599,6 +1733,10 @@ impl UtexoWallet {
         if n == 0 {
             return Err(anyhow!("no recipients"));
         }
+        // [K>1 prerequisite 4] `n` payee slots + one change slot, all vouched by this parent. Refused
+        // here, before the ladder is even read, so the bound is stated in terms of the recipient list
+        // the caller just handed us rather than as a token-count failure three calls deeper.
+        crate::wallet::refuse_oversized_slot_batch(n + 1)?;
         let bundle = mercuryrustlib::tesr::load(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1616,6 +1754,18 @@ impl UtexoWallet {
             .split_total(n + 1)
             .ok_or_else(|| anyhow!("committed fee too high to split this coin into {} outputs", n + 1))?;
         let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
+        // [B2] The same floor, from the same source, as the single-recipient guard in
+        // `in_ladder_pay`, applied to EVERY output. Refusing up-front is load-bearing:
+        // `establish_child` runs AFTER the parent's spend budget is consumed and `SP` is co-signed,
+        // so an output admitted below the floor terminalizes the parent and THEN fails, stranding it
+        // to unilateral-exit-only.
+        // [V5] Per-leg: the recipients are PIECES, the leftover is the CHANGE.
+        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        // [K>1] THE AGGREGATE FLOOR, BEFORE the per-amount ones. A coin too small to carry K legs at
+        // any distribution must say THAT — "change 3 200 is below the minimum 820" invites the caller
+        // to pay less, which cannot help, while "a 20-recipient batch needs 29 230 and this holds
+        // 17 000" names the batch size, which is the thing they can actually change.
+        refuse_undersized_batch_parent(parent_statechain_id, n, shape, floors)?;
         if pieces_total >= total {
             return Err(anyhow!(
                 "payments totalling {pieces_total} sat leave no change: an in-ladder split of this coin into {} outputs can pay at most {} sat",
@@ -1624,13 +1774,6 @@ impl UtexoWallet {
             ));
         }
         let change_sats = total - pieces_total;
-        // [B2] The same floor, from the same source, as the single-recipient guard in
-        // `in_ladder_pay`, applied to EVERY output. Refusing up-front is load-bearing:
-        // `establish_child` runs AFTER the parent's spend budget is consumed and `SP` is co-signed,
-        // so an output admitted below the floor terminalizes the parent and THEN fails, stranding it
-        // to unilateral-exit-only.
-        // [V5] Per-leg: the recipients are PIECES, the leftover is the CHANGE.
-        let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < floors.piece) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the in-ladder piece minimum {} sat (each child funds its own extension + state tier at {} sat/vB, then must clear the {DUST_LIMIT}-sat dust floor)",
@@ -1668,6 +1811,18 @@ impl UtexoWallet {
             .cloned()
             .ok_or_else(|| anyhow!("parent coin {parent_statechain_id} not found"))?;
 
+        // [K>1 prerequisite 2] THE CONVEYANCE PLAN, declared to the builder so it lands in the
+        // `Planned` record BEFORE the parent is terminalized. `payee_address` (which is what
+        // `children[j].1` holds) discards the recipient's auth key, so an address learned only from
+        // this call's arguments is an address no later process can reconstruct — and a piece with no
+        // address is a piece the sender owns the key to and can never hand over.
+        let conveyance: Vec<(String, String)> = children[..n]
+            .iter()
+            .zip(recipients.iter())
+            .map(|((c, _, _), (address, _))| {
+                (c.statechain_id.clone().unwrap_or_default(), address.clone())
+            })
+            .collect();
         // [CATS change 2] The change leg is LAST (pushed after every recipient above) and becomes the
         // one-cap spine tip; the N recipients' pieces are unchanged two-tier children.
         let split = mercuryrustlib::tesr::in_ladder_split(
@@ -1677,6 +1832,7 @@ impl UtexoWallet {
             &bundle,
             &mut children,
             mercuryrustlib::tesr::ChangeLeg::LastIsTip,
+            &conveyance,
         )
         .await?;
         let bundles = &split.pieces;
@@ -1696,20 +1852,6 @@ impl UtexoWallet {
             change_tip,
         )
         .await?;
-        // Convey each recipient's child (auth = the slot we still own).
-        // No LN latch on this lane: a batch payment is never a Lightning swap leg, so every piece
-        // relies on the pending-transfer lock + the receiver's prompt handover, exactly like the
-        // single-recipient plain `in_ladder_pay` (see its [F1] note).
-        for (j, (address, _)) in recipients.iter().enumerate() {
-            mercuryrustlib::tesr::convey_child_bundle(
-                &self.inner.cc,
-                address,
-                &children[j].0,
-                &bundles[j],
-                None,
-            )
-            .await?;
-        }
 
         let piece_sids: Vec<String> = children[..n]
             .iter()
@@ -1717,25 +1859,45 @@ impl UtexoWallet {
             .collect();
         let change_sid = change_child.statechain_id.clone().unwrap_or_default();
         let sp_txid = signed_tier_txid(&change_tip.parent.current().state.signed_tx)?;
+        // [K>1 prerequisite 2] Convey through the JOURNALLED driver, not a bare loop. The loop this
+        // replaces aborted the whole call at the first failure, so recipients j+1..K-1 were never
+        // even attempted and — with no journalled address — never could be. The driver marks each
+        // leg in the journal as it lands, carries on past a failure, and reports what is left.
+        //
+        // No LN latch on this lane: a batch payment is never a Lightning swap leg, so every piece
+        // relies on the pending-transfer lock + the receiver's prompt handover, exactly like the
+        // single-recipient plain `in_ladder_pay` (see its [F1] note).
+        let op_id = mercuryrustlib::tesr::split_op_id(&bundles[0]);
+        let outcome = self.drive_split_conveyance(&op_id).await?;
+        // Book what actually happened, leg by leg. A leg that was NOT conveyed keeps its slot coin —
+        // the value has not left this wallet, and marking it WITHDRAWN would hide a piece that still
+        // needs a hand-over.
         self.book_inladder_split_coins_n(
             parent_statechain_id,
             &sp_txid,
-            &piece_sids,
+            &outcome.conveyed,
             CoinStatus::WITHDRAWN,
             &change_sid,
             change_sats,
             n as u32,
         )
         .await?;
-        self.record_conveyed_pieces(&sp_txid, recipients).await?;
-        // [P0-3] Close the split's write-ahead journal: the bundles are on disk and conveyed, so a
-        // restart has nothing left to replay.
-        mercuryrustlib::tesr::journal_commit(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
-        )
-        .await?;
+        // Each row keeps its OWN payload index — `SP.out[j]` is `children[j]`, and the list is a
+        // subset once a hand-over is outstanding.
+        let landed: Vec<(u32, u64)> = recipients
+            .iter()
+            .zip(piece_sids.iter())
+            .enumerate()
+            .filter(|(_, (_, sid))| outcome.conveyed.contains(sid))
+            .map(|(j, ((_, amt), _))| (j as u32, *amt))
+            .collect();
+        self.record_conveyed_pieces(&sp_txid, &landed).await?;
+        // [P0-3] Close the split's write-ahead journal only when there is genuinely nothing left:
+        // the bundles are on disk AND every piece is conveyed. Closing it with legs outstanding would
+        // hide them from the resume driver — the co-signed material would still be on disk and still
+        // be unreachable, which is the silent-degradation shape this journal exists to prevent.
+        finish_or_report_conveyance(&self.inner.cc, &self.inner.config.wallet_name, &op_id, &outcome)
+            .await?;
         Ok((piece_sids, change_sid))
     }
 
@@ -1798,6 +1960,9 @@ impl UtexoWallet {
         if n == 0 {
             return Err(anyhow!("no recipients"));
         }
+        // [K>1 prerequisite 4] `n` payee slots + one for the NEXT tip, vouched by this tip. Because
+        // every spine level is a fresh statechain the bound applies per level, not to the spine.
+        crate::wallet::refuse_oversized_slot_batch(n + 1)?;
         let tip = mercuryrustlib::tesr::load_spine_tip(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1821,6 +1986,9 @@ impl UtexoWallet {
         })?;
         let pieces_total: u64 = recipients.iter().map(|(_, a)| *a).sum();
         let floors = split_output_floors(backup_fee_rate(&self.inner.cc).await?, shape);
+        // [K>1] The aggregate floor first — see `in_ladder_pay_many`. On this lane `have` is the
+        // tip's `sp_out_value`, i.e. `SP_i.out[K]`, which is exactly the outpoint `SP_{i+1}` spends.
+        refuse_undersized_batch_parent(tip_statechain_id, n, shape, floors)?;
         // Refusing up-front is load-bearing here for the same reason as on the two older lanes, and
         // the stakes are the same: `establish_child_journalled` runs AFTER the tip's spend budget is
         // consumed and `SP_{i+1}` is co-signed, so a leg admitted below its floor terminalizes the
@@ -1879,6 +2047,14 @@ impl UtexoWallet {
             .cloned()
             .ok_or_else(|| anyhow!("spine tip coin {tip_statechain_id} not found"))?;
 
+        // [K>1 prerequisite 2] The conveyance plan, journalled before the tip is terminalized.
+        let conveyance: Vec<(String, String)> = children[..n]
+            .iter()
+            .zip(recipients.iter())
+            .map(|((c, _, _), (address, _))| {
+                (c.statechain_id.clone().unwrap_or_default(), address.clone())
+            })
+            .collect();
         // The change leg is LAST (pushed after every recipient) and becomes the NEXT one-cap tip.
         let batch = mercuryrustlib::tesr::spine_batch_split(
             &self.inner.cc,
@@ -1887,6 +2063,7 @@ impl UtexoWallet {
             &tip,
             &mut children,
             mercuryrustlib::tesr::ChangeLeg::LastIsTip,
+            &conveyance,
         )
         .await?;
         let bundles = &batch.pieces;
@@ -1905,16 +2082,9 @@ impl UtexoWallet {
             next_tip,
         )
         .await?;
-        for (j, (address, _)) in recipients.iter().enumerate() {
-            mercuryrustlib::tesr::convey_child_bundle(
-                &self.inner.cc,
-                address,
-                &children[j].0,
-                &bundles[j],
-                None,
-            )
-            .await?;
-        }
+        // [K>1 prerequisite 2] Journalled, resumable, leg-independent — see `in_ladder_pay_many`.
+        let op_id = mercuryrustlib::tesr::split_op_id(&bundles[0]);
+        let outcome = self.drive_split_conveyance(&op_id).await?;
 
         let piece_sids: Vec<String> = children[..n]
             .iter()
@@ -1930,7 +2100,7 @@ impl UtexoWallet {
         self.book_inladder_split_coins_n(
             tip_statechain_id,
             &sp_txid,
-            &piece_sids,
+            &outcome.conveyed,
             CoinStatus::WITHDRAWN,
             &change_sid,
             change_sats,
@@ -1938,13 +2108,21 @@ impl UtexoWallet {
         )
         .await?;
         if let Some(rows) = history {
-            self.record_conveyed_pieces(&sp_txid, rows).await?;
+            let landed: Vec<(u32, u64)> = rows
+                .iter()
+                .zip(piece_sids.iter())
+                .enumerate()
+                .filter(|(_, (_, sid))| outcome.conveyed.contains(sid))
+                .map(|(j, ((_, amt), _))| (j as u32, *amt))
+                .collect();
+            self.record_conveyed_pieces(&sp_txid, &landed).await?;
         }
-        // [P0-3] Close the batch's write-ahead journal: the bundles are on disk and conveyed.
-        mercuryrustlib::tesr::journal_commit(
+        // [P0-3] Close the batch's write-ahead journal only when every piece has been handed over.
+        finish_or_report_conveyance(
             &self.inner.cc,
             &self.inner.config.wallet_name,
-            &mercuryrustlib::tesr::split_op_id(&bundles[0]),
+            &op_id,
+            &outcome,
         )
         .await?;
         Ok((piece_sids, change_sid))
@@ -2047,7 +2225,14 @@ impl UtexoWallet {
                         if ours {
                             mercuryrustlib::tesr::persist_child(cc, &wallet, cb).await?;
                             change = Some((jc.statechain_id.clone(), jc.value, jc.sp_vout));
-                        } else {
+                        } else if jc.conveyance
+                            != mercuryrustlib::tesr::ConveyanceStage::Conveyed
+                        {
+                            // [K>1 prerequisite 2] The JOURNAL says whether this leg was handed
+                            // over — a fact, written when it happened. This used to report every
+                            // payee leg of the record as unconveyed, so a batch interrupted at
+                            // recipient 15 of 20 offered all 20 back: five of them re-sends the SE
+                            // would refuse, and the operator with no way to tell which five.
                             unconveyed_pieces.push(jc.statechain_id.clone());
                         }
                     }
@@ -2065,6 +2250,12 @@ impl UtexoWallet {
                 change.clone(),
             )
             .await?;
+            // [K>1 prerequisite 2] The REPLAY is finished either way — every tier is co-signed and
+            // on disk — so the record leaves the replay reader's open set. The pieces that were
+            // never handed over do not disappear with it: they are addressed in the journal and
+            // surface through `pending_conveyances()` / `resume_split_conveyance()`, which read
+            // every record rather than only the open ones. Closing here without that reader would
+            // be the silent-degradation shape: complete material, no payee, and nothing that says so.
             mercuryrustlib::tesr::journal_commit(cc, &wallet, &rec.op_id).await?;
             report.push(InLadderSplitRecovery {
                 op_id: rec.op_id.clone(),
@@ -2077,6 +2268,108 @@ impl UtexoWallet {
             });
         }
         Ok(report)
+    }
+
+    /// **[K>1 prerequisite 2] Run the journalled conveyance driver over one split record.**
+    ///
+    /// Gathers this wallet's slot coin for every leg and hands the record to
+    /// [`mercuryrustlib::tesr::convey_journalled_pieces`], which resumes from whatever the journal
+    /// says already landed. Safe to call any number of times: a leg already `Conveyed` is reported,
+    /// not re-sent.
+    pub(crate) async fn drive_split_conveyance(
+        &self,
+        op_id: &str,
+    ) -> Result<mercuryrustlib::tesr::ConveyanceOutcome> {
+        let cc = &self.inner.cc;
+        let wallet = self.inner.config.wallet_name.clone();
+        let mut rec = mercuryrustlib::tesr::journal_find(cc, &wallet, op_id)
+            .await?
+            .ok_or_else(|| anyhow!("no in-ladder split journal record {op_id}"))?;
+        let coins = self.record().await?.coins;
+        // A leg whose coin is missing is NOT filtered into silence here — the driver reports it as
+        // `unactionable`, which is the difference between "we could not send it" and "there was
+        // nothing to send".
+        let slot_coins: Vec<(String, Coin)> = rec
+            .children
+            .iter()
+            .filter_map(|c| {
+                coins
+                    .iter()
+                    .find(|k| {
+                        k.statechain_id.as_deref() == Some(c.statechain_id.as_str())
+                            && k.duplicate_index == 0
+                    })
+                    .cloned()
+                    .map(|k| (c.statechain_id.clone(), k))
+            })
+            .collect();
+        mercuryrustlib::tesr::convey_journalled_pieces(cc, &wallet, &mut rec, &slot_coins).await
+    }
+
+    /// **[K>1 prerequisite 2] THE RESUME ENTRY POINT — finish a batch whose hand-overs were
+    /// interrupted, from the journal alone.**
+    ///
+    /// Takes nothing but the `op_id`: every recipient address was journalled into the `Planned`
+    /// record before the parent was terminalized, precisely so this call needs no arguments the
+    /// crashed process took with it. Conveys every leg still outstanding, books the ones that land,
+    /// and closes the record when nothing is left.
+    ///
+    /// Returns the outcome rather than an error when legs remain, because a partially-complete batch
+    /// is a state to be inspected and retried, not an exception: the material is on disk and the next
+    /// call picks up exactly where this one stopped.
+    pub async fn resume_split_conveyance(
+        &self,
+        op_id: &str,
+    ) -> Result<mercuryrustlib::tesr::ConveyanceOutcome> {
+        let _guard = self.inner.wallet_lock.lock().await;
+        let outcome = self.drive_split_conveyance(op_id).await?;
+        // The pieces that landed have left this wallet.
+        for sid in &outcome.conveyed {
+            self.set_coin_status(sid, CoinStatus::WITHDRAWN).await?;
+        }
+        if outcome.is_complete() {
+            mercuryrustlib::tesr::journal_commit(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                op_id,
+            )
+            .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// **[K>1 prerequisite 2] Every piece this wallet carved and never handed over.**
+    ///
+    /// Read across ALL journal records, at every stage — including closed ones, because a record can
+    /// legitimately be closed for replay purposes (all tiers co-signed and on disk) while a payee
+    /// still holds nothing. Without this the only symptom of a lost hand-over is a payee saying they
+    /// were not paid.
+    ///
+    /// `stranded` legs are reported separately: those cannot be resumed to the same address (see
+    /// [`mercuryrustlib::tesr::ConveyanceStage::Stranded`]), and reporting them as merely pending
+    /// would send a caller into a retry loop that can never succeed.
+    pub async fn pending_conveyances(&self) -> Result<Vec<PendingConveyance>> {
+        let mut out = Vec::new();
+        for rec in mercuryrustlib::tesr::journal_all(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+        )
+        .await?
+        {
+            let outstanding = rec.outstanding_conveyances();
+            let stranded = rec.stranded_conveyances();
+            if outstanding.is_empty() && stranded.is_empty() {
+                continue;
+            }
+            out.push(PendingConveyance {
+                op_id: rec.op_id.clone(),
+                lane: rec.lane.clone(),
+                terminalized_statechain_id: rec.terminalized_statechain_id.clone(),
+                outstanding: outstanding.into_iter().map(|(_, sid)| sid).collect(),
+                stranded: stranded.into_iter().map(|(_, sid)| sid).collect(),
+            });
+        }
+        Ok(out)
     }
 
     /// Convey a piece whose in-ladder split was interrupted and then recovered by
@@ -2141,13 +2434,26 @@ impl UtexoWallet {
     /// Create one SE-registered child slot funded by a derived token, returning its `Coin` (with
     /// statechain_id + auth). The slot's aggregate is what `SP.out[j]` pays in the in-ladder split.
     pub(crate) async fn create_child_slot(&self, token_id: &str, amount_sats: u64) -> Result<Coin> {
-        let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
+        let addr = match mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             token_id,
             u32::try_from(amount_sats)?,
         )
-        .await?;
+        .await
+        {
+            Ok(addr) => addr,
+            Err(e) => {
+                // [K>1 prerequisite 4] The voucher was NOT spent (or we cannot tell): leave it in
+                // the pool so the retry costs the parent's lifetime allowance nothing, but count the
+                // attempt so a token the SE has already consumed cannot wedge every later batch.
+                self.fail_slot_voucher(token_id).await?;
+                return Err(e);
+            }
+        };
+        // Spent: `deposit/init` consumed the token, so it must leave the pool or a later batch would
+        // hand out a dead id.
+        self.consume_slot_voucher(token_id).await?;
         self.record()
             .await?
             .coins
@@ -2157,34 +2463,18 @@ impl UtexoWallet {
             .ok_or_else(|| anyhow!("child slot coin not found for {addr}"))
     }
 
-    /// Book the coin records after an in-ladder split payment: the parent is spent (WITHDRAWN), the
-    /// piece slot is sent to the recipient (WITHDRAWN — its value left this wallet), and the change slot
-    /// becomes a CONFIRMED exitable claim funded by the un-broadcast `SP.out[1]`.
-    pub(crate) async fn book_inladder_split_coins(
-        &self,
-        parent_statechain_id: &str,
-        sp_txid: &str,
-        piece_child_sid: &str,
-        change_child_sid: &str,
-        change_sats: u64,
-        piece_status: CoinStatus,
-    ) -> Result<()> {
-        let pieces = [piece_child_sid.to_string()];
-        self.book_inladder_split_coins_n(
-            parent_statechain_id,
-            sp_txid,
-            &pieces,
-            piece_status,
-            change_child_sid,
-            change_sats,
-            1,
-        )
-        .await
-    }
-
-    /// N-piece variant of [`Self::book_inladder_split_coins`] (multi-recipient in-ladder split): the
-    /// change slot is funded by `SP.out[change_vout]`, which is the LAST payload output — `SP.out[j]`
-    /// is `children[j]` and the change is appended after the N pieces, so `change_vout == N`.
+    /// Book the coin records after an in-ladder split payment: the parent is spent (WITHDRAWN), each
+    /// CONVEYED piece slot is sent to its recipient (WITHDRAWN — its value left this wallet), and the
+    /// change slot becomes a CONFIRMED exitable claim funded by the un-broadcast
+    /// `SP.out[change_vout]`, which is the LAST payload output (`SP.out[j]` is `children[j]` and the
+    /// change is appended after the N pieces, so `change_vout == N`).
+    ///
+    /// [K>1 prerequisite 2] `piece_child_sids` is the list that actually LANDED, not the list that
+    /// was carved: a piece whose hand-over is still outstanding has not left this wallet, and marking
+    /// it `WITHDRAWN` would hide it from the operator and from `pending_conveyances`.
+    ///
+    /// (The single-piece wrapper this used to carry is gone: every lane now books what the
+    /// conveyance driver reports, which is a list.)
     async fn book_inladder_split_coins_n(
         &self,
         parent_statechain_id: &str,
@@ -2256,13 +2546,18 @@ impl UtexoWallet {
     /// handover — so without this an off-chain in-ladder payment would leave no trace in
     /// `get_transfers()`. Never called for a LATCHED piece: that value has not left the wallet until
     /// the Lightning preimage lands.
+    ///
+    /// [K>1 prerequisite 2] `pieces` carries each row's OWN `vout` rather than relying on its
+    /// position, because the list is now the set that actually landed and may be a subset. Deriving
+    /// the outpoint from `enumerate()` over a filtered list renumbers every row after the first gap,
+    /// so a partially-conveyed batch would file its history against other pieces' outpoints.
     async fn record_conveyed_pieces(
         &self,
         split_txid: &str,
-        pieces: &[(String, u64)],
+        pieces: &[(u32, u64)],
     ) -> Result<()> {
         let mut record = self.record().await?;
-        for (vout, (_, amount)) in pieces.iter().enumerate() {
+        for (vout, amount) in pieces {
             record.activities.push(mercuryrustlib::utils::create_activity(
                 &format!("{split_txid}:{vout}"),
                 u32::try_from(*amount)?,
@@ -2780,6 +3075,22 @@ impl ParentShape {
         }
     }
 
+    /// **The outpoint value an in-ladder split is carved OUT OF** — `X_m.out[0]` for a root,
+    /// `ext_child.out[0]` for a child, `SP_i.out[K]` for a spine tip. `None` for an un-laddered
+    /// parent, which has no tier to carve from.
+    ///
+    /// This is the number [`min_batch_source_value`] is compared against, and it is deliberately
+    /// NOT the coin's `amount`: the coin's sats already paid for every tier above this outpoint, so
+    /// judging a batch on `amount` over-states capacity by a whole ladder.
+    pub(crate) fn split_source_value(self) -> Option<u64> {
+        match self {
+            ParentShape::Unladdered => None,
+            ParentShape::Child { split_source_value, .. }
+            | ParentShape::Root { split_source_value, .. }
+            | ParentShape::SpineTip { split_source_value, .. } => Some(split_source_value),
+        }
+    }
+
     /// The value an in-ladder split of this parent can carve into `n_payload` outputs — the tier
     /// source value net of the split tier's own committed fee and P2A anchor. `None` for an
     /// un-laddered parent (whose capacity is `parent_sats` minus the split fee reserve instead) or
@@ -2793,6 +3104,26 @@ impl ParentShape {
                 mercurylib::tesr::tier_out_total(split_source_value, n_payload, fee_rate)
             }
         }
+    }
+
+    /// **[K>1 prerequisite 3] Is a coin of this shape the wallet's own INVENTORY?**
+    ///
+    /// The one question [`crate::select::Candidate::is_inventory`] is answered from, and it is
+    /// answered from the RECORD KIND — the `spinetip-`/`ctesr-`/`tesr-` row this wallet resolved
+    /// locally in [`UtexoWallet::parent_shape`] — never from the amount. That distinction is the
+    /// whole point: an amount-derived answer lets a counterparty pick which of the recipient's coins
+    /// gets split next simply by choosing what to send them.
+    ///
+    /// * `SpineTip` — the sender's own change reservoir. Splitting it is the spine batch, the
+    ///   designed path, and it deepens nobody.
+    /// * `Root` — a coin claimed from a deposit, still whole. Splitting it mints depth-1 pieces,
+    ///   the SHALLOWEST any payee can get.
+    /// * `Unladdered` — likewise this wallet's own coin.
+    /// * `Child` — a received in-ladder piece. **Not inventory.** It is the leaf of somebody's
+    ///   payment to us; splitting it pushes its own exit chain a level deeper and mints a crumb that
+    ///   sorts ahead of the tip next time.
+    pub(crate) fn is_inventory(self) -> bool {
+        !matches!(self, ParentShape::Child { .. })
     }
 
     /// The executor this shape dispatches to — named in quotes and refusals so a disagreement is
@@ -2914,6 +3245,84 @@ pub(crate) fn split_output_floors(backup_fee_rate: f64, shape: ParentShape) -> S
             laddered(fee_rate, mercuryrustlib::tesr::SplitLane::SpineBatch)
         }
     }
+}
+
+/// **[K>1] THE MINIMUM SPLIT SOURCE VALUE a K-payee batch can be carved from** —
+/// `1 396·K + 1 310` sat on a spine-tip-change lane at the 2 sat/vB committed rate
+/// (K=1 → 2 706; K=20 → 29 230), the figure `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 names.
+///
+/// Derived, never a literal, because the three terms all move independently:
+///
+/// ```text
+/// need = K · floors.piece            the payees' legs, each a two-tier child
+///      + floors.change               the sender's leg, whose shape is its lane's
+///      + committed_fee_for_outputs(K + 1, rate)   43 vB per extra payload output
+///      + P2A_VALUE                   the anchor every tier carries
+/// ```
+///
+/// **Why this exists when the per-leg floors already bind.** They are equivalent as a *predicate* —
+/// `Σ legs == total` and every leg over its floor is false exactly when this is — but they are not
+/// equivalent as an *answer*. A K = 20 batch out of a coin 12 000 sat short reports "change 3 200 is
+/// below the in-ladder change minimum 820", which names neither K nor the shortfall and reads as a
+/// distribution problem the caller can fix by paying less. It cannot: the coin is too small to carry
+/// twenty legs at any distribution. Refusing on the aggregate, first, is what makes the batch size
+/// the subject of the sentence.
+///
+/// Being *implied by* the per-leg rule is also what makes it safe to add to lanes that have a quote:
+/// [`split_preflight_pure`] accepts only what [`inladder_amounts_floored`] accepts, and everything
+/// that passes clears this — so `fundable: true` followed by a refusal stays inexpressible ([B2]).
+/// `a_batch_the_per_leg_rule_admits_always_clears_the_aggregate_floor` pins that rather than trusting
+/// the argument.
+///
+/// `None` for an un-laddered parent (no in-ladder batch exists) or if the arithmetic overflows.
+pub(crate) fn min_batch_source_value(k: usize, shape: ParentShape, floors: SplitFloors) -> Option<u64> {
+    let rate = shape.ladder_fee_rate()?;
+    // K payee legs + the sender's own — the payload count `SP` is actually built with, so the fee
+    // term is the one `split_total` will subtract and not an approximation of it.
+    let legs = k.checked_add(1)?;
+    // `k as u64` and not `try_from(..).ok()?`: a widening `usize -> u64` cannot lose a bit on any
+    // supported target, and a `.ok()?` here would be a swallow-shaped line in a function whose `None`
+    // means "no floor to enforce" — i.e. it would fail toward LESS protection.
+    let payees = floors.piece.checked_mul(k as u64)?;
+    payees
+        .checked_add(floors.change)?
+        .checked_add(mercurylib::tesr::committed_fee_for_outputs(legs, rate))?
+        .checked_add(mercurylib::tesr::P2A_VALUE)
+}
+
+/// **[K>1] Refuse a K-payee batch whose parent cannot carry K legs at all** — by name, naming K and
+/// the shortfall, and BEFORE any SE round trip (no derived-slot voucher, no `create_child_slot`, no
+/// co-sign, no `set_spend_budget`). A refusal here leaves the parent whole and spendable.
+pub(crate) fn refuse_undersized_batch_parent(
+    parent_statechain_id: &str,
+    k: usize,
+    shape: ParentShape,
+    floors: SplitFloors,
+) -> Result<()> {
+    let (Some(need), Some(have)) = (min_batch_source_value(k, shape, floors), shape.split_source_value())
+    else {
+        // Un-laddered parents never reach an in-ladder builder, and an overflowing fee term is
+        // already refused by `split_total`'s `None`. Nothing to say here that would not be a guess.
+        return Ok(());
+    };
+    if have >= need {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{} refused: a {k}-recipient batch out of {parent_statechain_id} needs a split source of at \
+         least {need} sat ({k} × {}-sat piece + {}-sat change + {} sat of committed fee and anchor \
+         for {} payload outputs), but this coin's split source holds {have} — {} sat short. Nothing \
+         has been co-signed and the coin is untouched; pay fewer recipients in this batch or use a \
+         larger coin.",
+        shape.route(),
+        floors.piece,
+        floors.change,
+        // Exact by construction (`need` is the sum of these four terms) — saturating only so a
+        // refusal can never become a panic in the one code path whose job is to report cleanly.
+        need.saturating_sub(floors.piece.saturating_mul(k as u64)).saturating_sub(floors.change),
+        k + 1,
+        need - have
+    ))
 }
 
 /// The floor used to PLAN, before the planner has named a coin — necessarily shape-blind, so it
@@ -3384,7 +3793,12 @@ mod split_math_tests {
 
         // Planning at the laddered floor would refuse the payment outright; planning at the smallest
         // candidate floor proposes it, and the binding per-coin preflight then decides.
-        let coins = vec![crate::select::Candidate { index: 0, amount_sats: 10_000, splittable: true }];
+        let coins = vec![crate::select::Candidate {
+            index: 0,
+            amount_sats: 10_000,
+            splittable: true,
+            is_inventory: true,
+        }];
         assert!(matches!(
             crate::select::plan_with_floor(&coins, 600, planning),
             crate::select::Plan::WithSplit { .. }
@@ -3397,7 +3811,12 @@ mod split_math_tests {
         // And the retry itself: once the coin the planner named is marked un-splittable, the planner
         // must stop proposing it — this is what makes `plan_payment`'s loop terminate.
         let exhausted =
-            vec![crate::select::Candidate { index: 0, amount_sats: 10_000, splittable: false }];
+            vec![crate::select::Candidate {
+            index: 0,
+            amount_sats: 10_000,
+            splittable: false,
+            is_inventory: true,
+        }];
         assert!(matches!(
             crate::select::plan_with_floor(&exhausted, 600, planning),
             crate::select::Plan::Insufficient { .. }
@@ -3422,7 +3841,12 @@ mod split_math_tests {
         assert_eq!(executor_floor, 1_310, "the larger floor binds");
 
         // A 1 000-sat piece: admitted by the old dust-floor plan, refused by the executor.
-        let coins = vec![crate::select::Candidate { index: 0, amount_sats: 10_000, splittable: true }];
+        let coins = vec![crate::select::Candidate {
+            index: 0,
+            amount_sats: 10_000,
+            splittable: true,
+            is_inventory: true,
+        }];
         assert!(
             matches!(crate::select::plan(&coins, 1_000), crate::select::Plan::WithSplit { .. }),
             "the dust-floor planner proposes a piece the executor rejects"
@@ -3672,5 +4096,212 @@ mod split_math_tests {
             .admission
             .expect_err("a PIECE at the tip floor cannot fund its second rung");
         assert!(e.contains("the piece falls short"), "got: {e}");
+    }
+
+    /// **[K > 1] THE MINIMUM PARENT VALUE FOR A K-BATCH IS `1 396K + 1 310`, AND IT IS DERIVED.**
+    ///
+    /// The number `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 publishes is pinned here against
+    /// [`min_batch_source_value`], which computes it from the real floors and the real
+    /// `committed_fee_for_outputs` — so the doc and the code cannot drift, and a change to any of the
+    /// four terms shows up as a failure with the arithmetic in front of it.
+    ///
+    /// The linear shape is the substance, not decoration: `1 396` per recipient is
+    /// `1 310` (the piece's two rungs + dust) + `86` (43 vB of extra payload at 2 sat/vB), and the
+    /// constant `1 310` is the tip's `820` + `250` of base tier fee + the `240` anchor. Anything that
+    /// made the per-recipient term super-linear would mean an extra payee costs a whole new `SP`,
+    /// which is precisely the economics K > 1 exists to avoid.
+    #[test]
+    fn the_k_batch_minimum_parent_value_is_1396k_plus_1310() {
+        let backup_rate = 2.0;
+        // Any laddered shape whose CHANGE leg is a one-cap tip: the plain root lane and the spine
+        // batch. Both are the lanes a K-batch actually runs on.
+        for shape in [
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 0 },
+            ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 0 },
+        ] {
+            let floors = split_output_floors(backup_rate, shape);
+            assert_eq!((floors.piece, floors.change), (1_310, 820), "the two terms of the formula");
+            for k in 1..=crate::wallet::MAX_BATCH_RECIPIENTS {
+                assert_eq!(
+                    min_batch_source_value(k, shape, floors),
+                    Some(1_396 * k as u64 + 1_310),
+                    "K = {k} on the {} lane",
+                    shape.route()
+                );
+            }
+            // The three published rows, spelled out.
+            assert_eq!(min_batch_source_value(1, shape, floors), Some(2_706));
+            assert_eq!(min_batch_source_value(10, shape, floors), Some(15_270));
+            assert_eq!(min_batch_source_value(20, shape, floors), Some(29_230));
+        }
+        // The CHILD lane's change is still a two-tier grandchild, so its constant term is the
+        // piece's floor, not the tip's — and the function reports THAT rather than the headline.
+        let child = ParentShape::Child { fee_rate: 2.0, split_source_value: 0 };
+        let cf = split_output_floors(backup_rate, child);
+        assert_eq!((cf.piece, cf.change), (1_310, 1_310));
+        assert_eq!(min_batch_source_value(3, child, cf), Some(1_396 * 3 + 1_800));
+        // An un-laddered parent has no in-ladder batch at all.
+        assert_eq!(
+            min_batch_source_value(
+                3,
+                ParentShape::Unladdered,
+                split_output_floors(backup_rate, ParentShape::Unladdered)
+            ),
+            None
+        );
+    }
+
+    /// **[K > 1] THE VALUE-FLOOR REFUSAL FIRES AT THE BOUNDARY, AND NAMES K AND THE SHORTFALL.**
+    ///
+    /// A refusal that does not name the batch size sends the caller to fix the wrong thing: told
+    /// "change 3 200 is below the minimum 820" they lower the payment, which cannot help, because the
+    /// coin is too small to carry K legs at ANY distribution.
+    #[test]
+    fn the_batch_value_floor_refuses_by_name_at_the_boundary() {
+        let backup_rate = 2.0;
+        let k = 20usize;
+        let shape0 = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 0 };
+        let floors = split_output_floors(backup_rate, shape0);
+        let need = min_batch_source_value(k, shape0, floors).unwrap();
+        assert_eq!(need, 29_230);
+
+        // Exactly at the floor: admitted. One sat under: refused. Nothing in between.
+        let at = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: need };
+        refuse_undersized_batch_parent("sid-at", k, at, floors)
+            .expect("a parent worth exactly the minimum carries the batch");
+        let under = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: need - 1 };
+        let e = refuse_undersized_batch_parent("sid-under", k, under, floors)
+            .expect_err("one sat under the minimum must refuse")
+            .to_string();
+        assert!(e.contains("20-recipient batch"), "the refusal must name K: {e}");
+        assert!(e.contains("29230"), "the refusal must name the requirement: {e}");
+        assert!(e.contains("1 sat short"), "the refusal must name the SHORTFALL: {e}");
+        assert!(e.contains("sid-under"), "the refusal must name the coin: {e}");
+        assert!(
+            e.contains("Nothing has been co-signed"),
+            "a refusal before the SE round trip must SAY the coin is untouched: {e}"
+        );
+        // A big shortfall reports the real distance, not a clamped one.
+        let tiny = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 3_000 };
+        let e = refuse_undersized_batch_parent("sid-tiny", k, tiny, floors).unwrap_err().to_string();
+        assert!(e.contains("26230 sat short"), "got: {e}");
+        // …and it stays classifiable by the chaos suite's refusal taxonomy ("piece" -> split-fit),
+        // so a legitimate protocol limit hit under load is not reported as an unexplained breach.
+        assert!(e.contains("piece"), "got: {e}");
+
+        // K = 1 is the same rule, not a special case: 2 706 is the smallest coin that pays anyone.
+        let one = split_output_floors(backup_rate, ParentShape::Root { fee_rate: 2.0, split_source_value: 0 });
+        refuse_undersized_batch_parent(
+            "sid",
+            1,
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 2_706 },
+            one,
+        )
+        .expect("2 706 sat is exactly one payee plus a tip");
+        let e = refuse_undersized_batch_parent(
+            "sid",
+            1,
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 2_705 },
+            one,
+        )
+        .expect_err("2 705 sat cannot pay one recipient and keep an exitable tip")
+        .to_string();
+        assert!(e.contains("1-recipient batch") && e.contains("1 sat short"), "{e}");
+    }
+
+    /// **[B2] THE AGGREGATE FLOOR IS IMPLIED BY THE PER-LEG RULE, SO THE QUOTE CANNOT COME APART.**
+    ///
+    /// The value floor was added to lanes that have a quote (`in_ladder_pay`, `child_in_ladder_pay`),
+    /// and a new executor refusal the quote does not know about would re-open the exact defect [B2]
+    /// closed: `fundable: true` followed by a refusal. It cannot, because the aggregate floor is
+    /// strictly WEAKER than the per-leg rule both sides already share — but "cannot" is an argument,
+    /// and this is the check. Every amount the shared rule admits, at every shape, clears it.
+    #[test]
+    fn a_batch_the_per_leg_rule_admits_always_clears_the_aggregate_floor() {
+        let backup_rate = 2.0;
+        for rate in [2.0f64, 3.0, 5.0] {
+            for source in [0u64, 1_000, 2_700, 2_706, 5_000, 20_000, 100_000] {
+                for shape in [
+                    ParentShape::Root { fee_rate: rate, split_source_value: source },
+                    ParentShape::Child { fee_rate: rate, split_source_value: source },
+                    ParentShape::SpineTip { fee_rate: rate, split_source_value: source },
+                ] {
+                    let floors = split_output_floors(backup_rate, shape);
+                    let Some(total) = shape.split_total(2) else { continue };
+                    for piece in [0u64, 330, 819, 820, 1_309, 1_310, 2_000, total, total + 1] {
+                        if inladder_amounts_floored(total, piece, floors).is_ok() {
+                            refuse_undersized_batch_parent("sid", 1, shape, floors).unwrap_or_else(
+                                |e| {
+                                    panic!(
+                                        "the per-leg rule admitted piece={piece} out of \
+                                         source={source} at rate={rate} on the {} lane, but the \
+                                         aggregate floor refused it — that is a quote/executor \
+                                         disagreement: {e}",
+                                        shape.route()
+                                    )
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **[K > 1] EVERY BATCH ENTRY POINT STATES THE K <= 63 BOUND BEFORE IT DOES ANYTHING ELSE.**
+    ///
+    /// The cap itself is unit-tested in `crate::wallet`; what this pins is that no lane can reach
+    /// `take_derived_tokens` without having stated it, and that the value floor is checked before the
+    /// slot vouchers are drawn. Both are ORDERING facts about the shipping functions, so both are
+    /// read out of the source — the only way to assert "before" without an SE.
+    #[test]
+    fn every_batch_lane_refuses_over_63_and_prices_the_parent_before_it_spends_a_slot() {
+        let src = include_str!("transfer.rs");
+        let cut = |marker: &str| -> &str {
+            let at = src.find(marker).unwrap_or_else(|| panic!("{marker} not found"));
+            &src[at..at + src[at..].find("\n    }\n").expect("function ends")]
+        };
+        for (marker, k) in [
+            ("\n    pub async fn in_ladder_pay_many(", "n"),
+            ("\n    pub async fn child_in_ladder_pay_many(", "n"),
+            ("\n    async fn spine_batch_pay_inner(", "n"),
+            ("\n    pub async fn in_ladder_pay(", "1"),
+            ("\n    pub async fn child_in_ladder_pay(", "1"),
+        ] {
+            let body = cut(marker);
+            let floor = body
+                .find("refuse_undersized_batch_parent(")
+                .unwrap_or_else(|| panic!("{marker} does not price its parent for a K-batch"));
+            assert!(
+                body[floor..floor + 200].contains(&format!(", {k},")),
+                "{marker} must pass its OWN recipient count to the value floor"
+            );
+            // Nothing may be drawn from the SE before the batch has been priced. `take_derived_tokens`
+            // burns lifetime slot allowance and `create_child_slot` is a network round trip; both are
+            // irreversible in a way a refusal is not.
+            for spend in ["take_derived_tokens(", "create_child_slot(", "set_spend_budget("] {
+                if let Some(at) = body.find(spend) {
+                    assert!(
+                        floor < at,
+                        "{marker} reaches `{spend}` at {at} before pricing the parent at {floor}"
+                    );
+                }
+            }
+            // The multi-recipient lanes must ALSO have stated the slot cap, and stated it first —
+            // a 200-recipient list should be told the maximum, not fail three calls deeper.
+            if k == "n" {
+                let cap = body
+                    .find("refuse_oversized_slot_batch(")
+                    .unwrap_or_else(|| panic!("{marker} does not state the K <= 63 bound"));
+                assert!(cap < floor, "{marker} must state the batch cap before pricing");
+            }
+        }
+        // And `transfer_many`, the outermost door, states it before selecting a parent at all.
+        let many = cut("\n    pub async fn transfer_many(");
+        let cap = many.find("refuse_oversized_slot_batch(").expect("transfer_many states the bound");
+        assert!(
+            cap < many.find("self.record()").unwrap_or(usize::MAX),
+            "the bound is stated before the wallet is even read"
+        );
     }
 }

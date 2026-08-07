@@ -267,7 +267,8 @@ fn split_size_floor() {
 
     // Planner boundary (REAL plan()): accepts 961 (change 331), refuses 960 (change 330 — the
     // strict `>` in select.rs:110 makes plan() 1 sat more conservative than the executor).
-    let one_coin = |sats: u64| vec![Candidate { index: 0, amount_sats: sats, splittable: true }];
+    let one_coin =
+        |sats: u64| vec![Candidate { index: 0, amount_sats: sats, splittable: true, is_inventory: true }];
     assert_eq!(
         plan(&one_coin(961), 330),
         Plan::WithSplit { whole: vec![], split: 0, split_amount: 330 }
@@ -281,8 +282,8 @@ fn split_size_floor() {
     // Sub-dust remainder after whole-coin selection is refused (audit [29]) even though the
     // balance covers the target: 2000 taken whole, remainder 200 < 330 cannot be minted.
     let cs = vec![
-        Candidate { index: 0, amount_sats: 2_000, splittable: true },
-        Candidate { index: 1, amount_sats: 5_000, splittable: true },
+        Candidate { index: 0, amount_sats: 2_000, splittable: true, is_inventory: true },
+        Candidate { index: 1, amount_sats: 5_000, splittable: true, is_inventory: true },
     ];
     assert_eq!(plan(&cs, 2_200), Plan::Insufficient { available: 7_000 });
 }

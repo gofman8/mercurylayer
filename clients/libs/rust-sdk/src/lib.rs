@@ -42,4 +42,10 @@ pub use types::{Balance, ClaimResult, CoinInfo, DepositAddressInfo, ExitCostEsti
 pub use invoice::{UtexoInvoice, decode_utexo_invoice, encode_utexo_invoice};
 pub use refresh::RefreshResult;
 pub use wallet::{UtexoWallet, WatchtowerFault};
+/// Transfer-cancellation vocabulary, re-exported so an app can BRANCH on a refusal instead of
+/// string-matching it. `CancelNeedsRecipientConsent` in particular carries the recipient auth key,
+/// which is the only thing that makes a cross-wallet cooperative cancellation actionable.
+pub use mercuryrustlib::transfer_sender::{
+    CancelNeedsRecipientConsent, CancelOutcome, CancelRefused,
+};
 pub use watchtower::{watch_pass, WatchBundle, WatchEntry, WatchState};

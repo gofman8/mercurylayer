@@ -53,6 +53,11 @@ pub struct ClaimResult {
     /// Mercury coin can be CONFIRMED while RGB acceptance is still pending or has failed. These let
     /// an app show token status instead of trusting `claimed_transfers` to mean "tokens received".
     pub token_results: Vec<TokenClaimStatus>,
+    /// Incoming transfers this pass found had been CANCELLED by their sender — the payment will
+    /// never complete. Reported here rather than raised, so one withdrawn payment cannot discard the
+    /// deposits and receipts of the same pass; also emitted as `WalletEvent::TransferCancelled`.
+    /// Never counted in `claimed_transfers`.
+    pub cancelled_transfers: Vec<String>,
 }
 
 /// Outcome of booking an incoming token consignment for one claimed coin.
@@ -114,6 +119,26 @@ pub enum SdkError {
         statechain_id: String,
         amount_sats: u64,
         fee_sats: u64,
+    },
+    /// **[K > 1 prerequisite 4] The derived-slot allowance bounds a batch.**
+    ///
+    /// A K-recipient in-ladder batch needs `K + 1` fresh statechain slots (K payee pieces plus the
+    /// sender's change), and every slot costs one DERIVED token vouched by the coin being split.
+    /// The SE issues at most `max_derived_tokens_per_statechain` of those per parent, counted over
+    /// its LIFETIME with spent rows included, so `K + 1` can never exceed the cap: K ≤ 63 at the
+    /// default 64. Because each spine level is a fresh statechain, that is a bound PER LEVEL, not a
+    /// budget the wallet spends down.
+    ///
+    /// Refused locally, by name, before any SE call — the server's own refusal is a bare 400 that
+    /// arrives after the caller has already committed to a recipient list.
+    #[error("a batch of {recipients} recipients needs {slots} statechain slots (one per payee plus the sender's change), but a coin may only ever vouch {cap} derived slots — split the payment into batches of at most {max_recipients} recipients")]
+    BatchTooManyRecipients {
+        recipients: usize,
+        /// `recipients + 1`.
+        slots: usize,
+        cap: u32,
+        /// `cap - 1`.
+        max_recipients: usize,
     },
 }
 

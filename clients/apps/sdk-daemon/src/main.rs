@@ -154,6 +154,14 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "TransferClaimed",
                                 json!({"statechain_ids": statechain_ids}),
                             ),
+                            // A payment this wallet was expecting was WITHDRAWN by its sender. It
+                            // has to reach the app: the receiving slot stays empty either way, so
+                            // without this event a cancelled payment is indistinguishable from an
+                            // idle mailbox.
+                            WalletEvent::TransferCancelled { statechain_ids } => (
+                                "TransferCancelled",
+                                json!({"statechain_ids": statechain_ids}),
+                            ),
                             WalletEvent::TokenTransferClaimed { asset_id, amount, statechain_id } => (
                                 "TokenTransferClaimed",
                                 // amount = u64 raw units — as a STRING (same reason as

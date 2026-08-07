@@ -415,6 +415,19 @@ impl ChildTesrBundle {
         self.rgb.is_some()
     }
 
+    /// **The schedule that TRAVELLED on this artifact** — the counterparty's serde field, not a fact
+    /// about anything.
+    ///
+    /// ⚠️ There is exactly ONE legitimate use for it: handing it to [`cap_schedule`] to be BOUND
+    /// against the receiver's own `TesrParams::for_network` preset, so a contradiction is refused by
+    /// name. It is never the yardstick a cap is measured with — a sender that could set the yardstick
+    /// would set the victim's cap, which is the C-1 shape this file has been burned by twice (the
+    /// forged `fee_rate`, then this). The accessor exists so that single use reads as the deliberate
+    /// act it is instead of an anonymous field read.
+    pub fn conveyed_schedule(&self) -> mercurylib::tesr::TesrParams {
+        self.parent.params
+    }
+
     /// `SP.out[sp_vout]` — the un-broadcast outpoint this child's ladder hangs off, and the outpoint
     /// an RGB engine has registered for it while it is off-chain. See [`segment_funding_tier`] for
     /// why the `SP` is not unconditionally the root parent's.
@@ -787,6 +800,21 @@ impl SpineTipBundle {
                 sp_out.value
             ));
         }
+        // [DUST] …and every leg of the cap must be spendable. This record has no Σ law at all — it
+        // pins the cap's payload output against the declared `out_value` and stops — so a 1-sat
+        // appended output passes everything above, and a tip funded below `min_spine_tip_value` (820)
+        // produces an honest cap paying under the floor. Either way the SENDER'S OWN CHANGE becomes
+        // unbroadcastable, and this is the producer's only door: refusing here costs a rebuildable
+        // record, refusing later costs the change leg. After the structural pass, per
+        // `refuse_dust_payloads`.
+        refuse_dust_payloads(&cap_tx, &format!("spine tip {sid} cap"))?;
+        // [ANCHOR] + [OPRET] …and both exempt kinds bound, since this record has no Σ law to lean on
+        // and NO colour-shape check runs over a cap at all — `verify_colored_shape` walks a
+        // `TesrBundle`'s `exit_tiers()` and `validate` never calls it. The opret count is the tip's
+        // OWN colour: a plain tip's cap carries none, a coloured tip's carries the one commitment
+        // whose outpoint `colored_exit_move` books the allocation at.
+        bind_single_p2a_anchor(&cap_tx, &format!("spine tip {sid} cap"))?;
+        bind_opret_count(&cap_tx, &format!("spine tip {sid} cap"), self.is_colored() as usize)?;
 
         // ---- THE CSV BAND, read off the SIGNATURE ---------------------------------------------
         let signed_csv = signed_relative_csv(&cap_tx, "spine tip cap")?;
@@ -2718,6 +2746,17 @@ pub async fn cosign_colored_in_ladder_split(
         ));
     }
 
+    // [P0-2]/[P0-3] THE DEPTH AND LENGTH CAPS. This lane had NEITHER: `cosign_colored_in_ladder_split`
+    // was the one builder with no `enforce_split_depth_cap` call, uncovered by construction rather
+    // than by argument. A coloured root split mints depth-1 children (`CTESR_CARRIER_SEND_DEPTH = 1`),
+    // so both caps are trivially met on a one-level carrier — but a carrier that has ROLLED OVER is
+    // `1 + 2·levels.len()` transactions, which is exactly the term the caps must see and the term the
+    // plain lanes now pass explicitly.
+    //
+    // Checked BEFORE anything irreversible: the parent is terminalized further down, and a refusal
+    // here leaves the carrier whole, spendable and re-transferable.
+    enforce_split_depth_cap(cc, bundle.params, 1, bundle.exit_tiers().len()).await?;
+
     // Every child coin is matched to its draft child BEFORE anything irreversible happens. This used
     // to be checked inside the co-signing loop, i.e. after the parent had been terminalized: a
     // mismatched coin then refused a split that had already spent the parent's last budget slot.
@@ -2815,6 +2854,15 @@ pub async fn cosign_colored_in_ladder_split(
                 }),
                 // The coloured lane carves N two-tier children and no spine tip.
                 role: SplitLegRole::Piece,
+                // [K>1 prerequisite 2] The coloured lane conveys its pieces itself and is explicitly
+                // OUT OF SCOPE for K > 1 (one `seal.blinding()` covers every payload, so payee *j*
+                // de-conceals every sibling seal in K tries). It journals no recipient, and the
+                // resume driver therefore reports its legs `unactionable` rather than conveying
+                // them — the fail-closed direction for a lane whose K > 1 shape is not admitted.
+                recipient_address: None,
+                conveyance: ConveyanceStage::Pending,
+                conveyance_x1: None,
+                latch_batch_id: None,
             })
             .collect(),
         child_ext_csv: draft.children[0].csv_e,
@@ -3134,6 +3182,51 @@ pub fn change_leg_role(lane: SplitLane) -> SplitLegRole {
     }
 }
 
+/// **[K>1 prerequisite 2] HOW FAR THE HAND-OVER OF ONE PIECE GOT.**
+///
+/// A split's pieces are conveyed SERIALLY after the parent is already terminal, so the interesting
+/// question at recovery time is not "does the material exist" (the tier journal answers that) but
+/// "did recipient *j* get it". Before this existed there was no answer: a failure at recipient *j*
+/// aborted the whole call, and the caller could neither tell the conveyed pieces from the unconveyed
+/// ones nor re-drive the rest — the sender held the slots' keys, but the payee had no tier hex and
+/// never would.
+///
+/// The stage is advanced ONLY forward, and each transition is journalled BEFORE the network call it
+/// describes, never after — that ordering is what makes the ambiguous case *nameable* instead of
+/// invisible.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConveyanceStage {
+    /// Not handed over, and provably not attempted: no `transfer/sender` call has been made for this
+    /// leg by this wallet. The DEFAULT, and correct for every row written before this field existed —
+    /// those rows also carry no `recipient_address`, so they are never offered for resumption.
+    #[default]
+    Pending,
+    /// A hand-over was STARTED. Written to disk *before* `transfer/sender` runs, so it covers both
+    /// "the call never happened" and "the call happened and the answer was lost". Which of the two
+    /// it is, is decided by `conveyance_x1`: with an `x1` the transfer is open and only the mailbox
+    /// post is missing (a pure retry), without one the resume re-runs `transfer/sender` and reads
+    /// the SE's answer.
+    Attempted,
+    /// Handed over: `transfer/update_msg` returned success, so the recipient's mailbox holds the
+    /// bundle. Terminal.
+    Conveyed,
+    /// **The irreducible window, recorded rather than hidden.** The SE reports a transfer already
+    /// open on this slot for this recipient's auth key, but this wallet holds no `x1` for it — the
+    /// process died in the single round trip between journalling `Attempted` and journalling the
+    /// `x1` that came back. `t1 = o1 + x1` cannot be rebuilt without that `x1` and the SE will not
+    /// re-issue it (a second `transfer/sender` for the same auth key is refused), so the piece
+    /// cannot be conveyed to THIS address. Terminal for the resume driver, and reported by name so
+    /// the wallet can say so instead of looking idle.
+    Stranded,
+}
+
+impl ConveyanceStage {
+    /// Does the resume driver still have work to do on this leg?
+    pub fn is_outstanding(self) -> bool {
+        matches!(self, ConveyanceStage::Pending | ConveyanceStage::Attempted)
+    }
+}
+
 /// One child of a journalled split. `extension`/`state` are filled in as each tier is co-signed, so a
 /// crash between the two is resumed by co-signing only the missing one.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3166,6 +3259,56 @@ pub struct SplitJournalChild {
     /// struct has no such guarantee, which is why it carries no default.
     #[serde(default)]
     pub role: SplitLegRole,
+    /// **[K>1 prerequisite 2] THE RECIPIENT'S TRANSFER ADDRESS, journalled at PLAN time.**
+    ///
+    /// `owner_exit_address` is NOT a substitute and cannot be made into one:
+    /// [`mercurylib::tesr::payee_address`] reduces a statechain transfer address to the P2TR of the
+    /// recipient's *user* key, discarding the auth key the hand-over is addressed to and the
+    /// encryption key the mailbox message is sealed with. That reduction is one-way. So without this
+    /// field a piece whose conveyance failed can never be conveyed by any later process — the sender
+    /// owns the slot's key, the tier hex is on disk, and there is nobody to send it to.
+    ///
+    /// Written into the `Planned` record, i.e. **before `set_spend_budget`**, for the same reason
+    /// `role` is: after the parent is terminal the piece is already carved, and a fact learned too
+    /// late to be durable is a fact the recovery path does not have.
+    ///
+    /// `None` means "this leg is not conveyed by the split driver" — the sender's own change, a
+    /// caller that hands over itself, or any row written before this field existed. Fail-closed: the
+    /// resume driver reports such a leg rather than guessing an address for it.
+    #[serde(default)]
+    pub recipient_address: Option<String>,
+    /// **[K>1 prerequisite 2]** How far this leg's hand-over got. See [`ConveyanceStage`].
+    #[serde(default)]
+    pub conveyance: ConveyanceStage,
+    /// **[K>1 prerequisite 2]** The SE's blinding factor for this leg's key hand-over, journalled the
+    /// instant `transfer/sender` returns it.
+    ///
+    /// It is the one piece of hand-over material the SE issues exactly once: `transfer/sender`
+    /// refuses a second call for the same `(statechain_id, new_user_auth_key)`, and the sender needs
+    /// it to build `t1 = o1 + x1`. Kept here so a retry that already opened the transfer re-posts the
+    /// mailbox message — an idempotent `UPDATE` — instead of re-opening it and being refused.
+    #[serde(default)]
+    pub conveyance_x1: Option<String>,
+    /// **[K>1 prerequisite 2]** The Lightning latch batch this leg's mailbox row must be born into
+    /// (`insert_new_transfer` marks the row batch-locked only when a latch row already exists).
+    ///
+    /// Journalled because it changes the SAFETY of the hand-over, not just its bookkeeping: a latched
+    /// piece conveyed without its batch is a piece the receiver may adopt before the preimage lands.
+    /// A leg that needs a latch is therefore never resumed with `None` — the latched lane journals no
+    /// `recipient_address` at all unless its latch is `None`, so the resume driver cannot reach it.
+    #[serde(default)]
+    pub latch_batch_id: Option<String>,
+}
+
+impl SplitJournalChild {
+    /// Is this leg one the resume driver can still act on? Both halves are required: a stage that is
+    /// not terminal AND an address to send to. A `None` address is not a failure to be retried — it
+    /// is a leg this wallet never undertook to convey.
+    pub fn is_outstanding(&self) -> bool {
+        self.role == SplitLegRole::Piece
+            && self.conveyance.is_outstanding()
+            && self.recipient_address.is_some()
+    }
 }
 
 /// The durable plan + co-signed material of ONE in-ladder split.
@@ -3332,6 +3475,130 @@ impl SplitJournalRecord {
     pub fn bundles(&self) -> Result<Vec<ChildTesrBundle>> {
         (0..self.children.len()).map(|j| self.piece_bundle(j)).collect()
     }
+
+    /// **[K>1 prerequisite 1] THE PLAN IS COMPLETE — checked, not asserted in a comment.**
+    ///
+    /// Every split builder writes its `Planned` record and then calls `set_spend_budget`, and from
+    /// that call onward the record is the ONLY description of a coin that has already been consumed.
+    /// At K = 1 a mis-shaped plan was a two-leg record and hard to get wrong; at K = 20 the plan is
+    /// 21 legs assembled inside a `map` over the caller's slice, and a plan that is short, or whose
+    /// `sp_vout`s do not match the outputs `SP` actually carries, or whose values do not add up to
+    /// what `SP` actually pays out, produces a *replay* that rebuilds the wrong coin — silently,
+    /// after the parent is gone.
+    ///
+    /// So the invariants the builder relies on are enforced at the one moment they are still free to
+    /// enforce: before the terminalization.
+    ///
+    /// * `legs` — one journal entry per leg the builder is about to carve, in the same order;
+    /// * `payload_vout0` — `SP.payload_vout`, from which leg *j* must be at `payload_vout0 + j`
+    ///   (a coloured `SP` carries its opret at index 0 and shifts every leg by one, which is exactly
+    ///   the kind of off-by-one that only shows up in someone else's verifier);
+    /// * `total` — `tier_out_total(source, legs)`, the sum `SP` actually pays out;
+    /// * `change_leg` — exactly one [`SplitLegRole::SpineTip`], and it is the LAST leg, iff the
+    ///   caller declared [`ChangeLeg::LastIsTip`]. `ChangeLeg::None` admits no tip at all.
+    pub fn validate_plan(
+        &self,
+        legs: usize,
+        payload_vout0: u32,
+        total: u64,
+        change_leg: ChangeLeg,
+    ) -> Result<()> {
+        if self.children.len() != legs {
+            return Err(anyhow::anyhow!(
+                "in-ladder split {}: the write-ahead plan describes {} leg(s) but the split carves \
+                 {legs} — a record short of the carve cannot rebuild the coin it is protecting",
+                self.op_id,
+                self.children.len()
+            ));
+        }
+        for (j, c) in self.children.iter().enumerate() {
+            let want = payload_vout0 + j as u32;
+            if c.sp_vout != want {
+                return Err(anyhow::anyhow!(
+                    "in-ladder split {}: journalled leg {j} ({}) names funding output {} but `SP` \
+                     funds it at {want} — a replay would rebuild this leg over another leg's outpoint",
+                    self.op_id,
+                    c.statechain_id,
+                    c.sp_vout
+                ));
+            }
+            if c.extension.is_some() || c.state.is_some() {
+                return Err(anyhow::anyhow!(
+                    "in-ladder split {}: journalled leg {j} ({}) already carries a co-signed tier \
+                     before the parent has been terminalized — the plan is not a plan",
+                    self.op_id,
+                    c.statechain_id
+                ));
+            }
+        }
+        // Distinct slots. Two legs sharing a statechain id would make `resume_in_ladder_split`'s
+        // coin lookup (by id) hand the same coin to two different tier schedules.
+        for j in 0..self.children.len() {
+            if self.children[..j]
+                .iter()
+                .any(|c| c.statechain_id == self.children[j].statechain_id)
+            {
+                return Err(anyhow::anyhow!(
+                    "in-ladder split {}: statechain id {} appears on two legs — a replay could not \
+                     tell which schedule the coin belongs to",
+                    self.op_id,
+                    self.children[j].statechain_id
+                ));
+            }
+        }
+        let sum: u64 = self.children.iter().map(|c| c.value).sum();
+        if sum != total {
+            return Err(anyhow::anyhow!(
+                "in-ladder split {}: journalled leg values sum to {sum} but `SP` pays out {total}",
+                self.op_id
+            ));
+        }
+        let tips: Vec<usize> = self
+            .children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.role == SplitLegRole::SpineTip)
+            .map(|(j, _)| j)
+            .collect();
+        let want_tip = match change_leg {
+            ChangeLeg::LastIsTip => vec![legs - 1],
+            ChangeLeg::None => vec![],
+        };
+        if tips != want_tip {
+            return Err(anyhow::anyhow!(
+                "in-ladder split {}: the caller declared change_leg={change_leg:?}, so the spine tip \
+                 must be at leg(s) {want_tip:?}, but the plan marks {tips:?} — a role decided \
+                 anywhere but the last leg sends a payee's piece to the tip builder",
+                self.op_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// **[K>1 prerequisite 2]** Every leg the conveyance driver still owes a hand-over, as
+    /// `(journal index, statechain id)`. Index-stable against `children`, so a caller may read the
+    /// two together.
+    pub fn outstanding_conveyances(&self) -> Vec<(usize, String)> {
+        self.children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_outstanding())
+            .map(|(j, c)| (j, c.statechain_id.clone()))
+            .collect()
+    }
+
+    /// **[K>1 prerequisite 2]** Legs whose hand-over is over for good but never landed — see
+    /// [`ConveyanceStage::Stranded`]. Reported separately from [`Self::outstanding_conveyances`]
+    /// because retrying them is pointless and reporting them as idle is the defect this whole
+    /// mechanism exists to kill.
+    pub fn stranded_conveyances(&self) -> Vec<(usize, String)> {
+        self.children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.conveyance == ConveyanceStage::Stranded)
+            .map(|(j, c)| (j, c.statechain_id.clone()))
+            .collect()
+    }
 }
 
 /// FAULT INJECTION for the crash-recovery test, debug builds ONLY.
@@ -3394,6 +3661,29 @@ pub async fn journal_open_splits(
         if rec.stage.is_open() {
             out.push(rec);
         }
+    }
+    Ok(out)
+}
+
+/// **EVERY** in-ladder split journal record of this wallet, at any stage. The reader for questions
+/// that are not about replay — chiefly "which pieces did this wallet carve and never hand over"
+/// ([`SplitJournalRecord::outstanding_conveyances`]), which outlives the replay stages: the tiers can
+/// be complete and the record closed while a payee still holds nothing.
+///
+/// A row that cannot be decoded is an ERROR here too. Same reason as everywhere else in this file: a
+/// skipped row is an absence, and an absence reads as "nothing to do".
+pub async fn journal_all(
+    cc: &ClientConfig,
+    wallet_name: &str,
+) -> Result<Vec<SplitJournalRecord>> {
+    let mut out = Vec::new();
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if !k.starts_with(SPLIT_JOURNAL_PREFIX) {
+            continue;
+        }
+        out.push(serde_json::from_str(&json).map_err(|e| {
+            anyhow::anyhow!("unreadable in-ladder split journal row {k}: {e}")
+        })?);
     }
     Ok(out)
 }
@@ -3811,6 +4101,77 @@ pub enum ChangeLeg {
     LastIsTip,
 }
 
+/// **[K>1 prerequisite 2] BIND THE CALLER'S CONVEYANCE PLAN TO THE LEGS THE SPLIT IS ABOUT TO CARVE.**
+///
+/// `conveyance` is `(child statechain id, recipient transfer address)`, keyed by id rather than by
+/// position on purpose: an index-aligned parallel array is exactly the shape that shifts by one when
+/// a change leg is appended, and the cost of that shift here would be a payee's piece conveyed to a
+/// different payee's mailbox.
+///
+/// Three refusals, all structural and all BEFORE the parent is terminalized:
+///
+/// * an entry naming a leg that does not exist — a typo that would otherwise vanish, leaving the
+///   named piece un-conveyable forever because no address ever reached the journal;
+/// * an entry on the sender's own SPINE TIP — the change is not conveyed to anyone, and journalling
+///   an address for it would let the resume driver hand this wallet's change to a third party;
+/// * an entry whose address does not reduce to the leg's **Model-A payee**. The piece's final state
+///   tier is co-signed to pay `owner_exit_address` and nothing can change that afterwards, so an
+///   address that disagrees would convey the bundle to someone who cannot spend what it pays. This
+///   is the one check that makes the journalled address trustworthy on the recovery path, where
+///   nobody is watching.
+///
+/// Returns the address for each leg in leg order, `None` for legs the caller did not undertake to
+/// convey (the tip, or a lane that hands over itself).
+fn resolve_conveyance_plan(
+    legs: &[(String, String, SplitLegRole)],
+    conveyance: &[(String, String)],
+    network: &str,
+) -> Result<Vec<Option<String>>> {
+    for (sid, address) in conveyance {
+        let Some((_, payee, role)) = legs.iter().find(|(id, _, _)| id == sid) else {
+            return Err(anyhow::anyhow!(
+                "conveyance plan names slot {sid}, which is not a leg of this split — refusing to \
+                 carve a batch whose recipient list does not describe it"
+            ));
+        };
+        if *role != SplitLegRole::Piece {
+            return Err(anyhow::anyhow!(
+                "conveyance plan names slot {sid}, which is this wallet's own SPINE TIP — the \
+                 change leg is not conveyed, and journalling a recipient for it would let a resume \
+                 hand this wallet's change to a third party"
+            ));
+        }
+        // A hand-over needs the recipient's AUTH and encryption keys, which only a statechain
+        // transfer address carries. `payee_address` accepts a bare bitcoin address too (it returns
+        // it unchanged), so without this the payee check below would pass on an address
+        // `convey_child_bundle` cannot use — and the discovery would come from the conveyance
+        // driver, after the parent was terminal. Checked here, where a refusal costs nothing.
+        mercurylib::decode_transfer_address(address).map_err(|e| {
+            anyhow::anyhow!(
+                "conveyance plan for slot {sid} is not a statechain transfer address ({e}) — a \
+                 hand-over needs the recipient's auth key, which a plain bitcoin address does not \
+                 carry"
+            )
+        })?;
+        let declared = mercurylib::tesr::payee_address(address, network).map_err(|e| {
+            anyhow::anyhow!("conveyance plan for slot {sid} has an unusable address ({e})")
+        })?;
+        if declared != *payee {
+            return Err(anyhow::anyhow!(
+                "conveyance plan for slot {sid} names a recipient whose exit key is {declared}, but \
+                 this leg's state tier is co-signed to pay {payee} — the bundle would be conveyed to \
+                 a party that cannot spend what it pays"
+            ));
+        }
+    }
+    Ok(legs
+        .iter()
+        .map(|(sid, _, _)| {
+            conveyance.iter().find(|(id, _)| id == sid).map(|(_, a)| a.clone())
+        })
+        .collect())
+}
+
 /// What one in-ladder split produced: the payees' conveyable pieces, and the sender's own change.
 ///
 /// Two fields rather than one vector because they are two RECORD TYPES with two persisters
@@ -3850,6 +4211,7 @@ pub async fn in_ladder_split(
     bundle: &TesrBundle,
     children: &mut [(Coin, String, u64)],
     change_leg: ChangeLeg,
+    conveyance: &[(String, String)],
 ) -> Result<InLadderSplitOutput> {
     refuse_uncolored_over_colored(bundle, "in_ladder_split")?;
     let p = bundle.params;
@@ -3878,8 +4240,10 @@ pub async fn in_ladder_split(
         return Err(anyhow::anyhow!("in-ladder split needs at least one child"));
     }
     // [P0-2] A root split mints depth-1 children. Normally admissible, but not if the deployed epoch
-    // is too short for even one level — check rather than assume.
-    enforce_split_depth_cap(cc, p, 1).await?;
+    // is too short for even one level — check rather than assume. [P0-3] The parent's REAL tier count
+    // goes with it: a rolled-over ladder is `1 + 2·levels.len()` transactions, and the children's
+    // exit walks inherit every one of them.
+    enforce_split_depth_cap(cc, p, 1, bundle.exit_tiers().len()).await?;
     // Value conservation — no mint, no burn (build_split_state re-checks, but fail early with context).
     let total = mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
         .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?;
@@ -3949,6 +4313,33 @@ pub async fn in_ladder_split(
     // this function leaves the parent terminal with nothing to show for it and the coin exit-only
     // forever. The plan is complete here: `SP` is fully determined (its txid is fixed before the
     // signature), and each child's tiers are appended as they land.
+    //
+    // [CATS change 2] THE SHAPE, ON DISK BEFORE ANYTHING IS SIGNED. This is what a replay reads to
+    // decide which builder finishes the leg; inferring it from `extension: None` would make a tip
+    // indistinguishable from an unfinished piece exactly where nobody is watching (see
+    // `SplitLegRole`). Computed here, into the `Planned` record, so it is durable before
+    // `set_spend_budget`.
+    let legs: Vec<(String, String, SplitLegRole)> = children
+        .iter()
+        .enumerate()
+        .map(|(j, (c, recipient, _))| {
+            Ok((
+                c.statechain_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
+                recipient.clone(),
+                if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
+                    SplitLegRole::SpineTip
+                } else {
+                    SplitLegRole::Piece
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // [K>1 prerequisite 2] …and so is the RECIPIENT of each piece. See `resolve_conveyance_plan`:
+    // an address learned after the parent is terminal is an address the recovery path does not have,
+    // and `owner_exit_address` cannot be turned back into one.
+    let recipients = resolve_conveyance_plan(&legs, conveyance, &bundle.network)?;
     let mut journal = SplitJournalRecord {
         op_id: format!("in_ladder_split:{parent_sid}:{}", sp.txid),
         lane: "in_ladder_split".to_string(),
@@ -3958,46 +4349,41 @@ pub async fn in_ladder_split(
         parent_statechain_id: parent_sid.clone(),
         ancestors: vec![],
         parent_flat_backups: parent_backups.clone(),
-        children: children
+        children: legs
             .iter()
             .enumerate()
-            .map(|(j, (c, recipient, value))| {
-                Ok(SplitJournalChild {
-                    statechain_id: c
-                        .statechain_id
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
-                    owner_exit_address: recipient.clone(),
-                    value: *value,
-                    // Child `j` lives at SP's j-th PAYLOAD output, not positional `j` (a coloured SP
-                    // carries the opret at index 0 and shifts every child by one).
-                    sp_vout: sp.payload_vout + j as u32,
-                    extension: None,
-                    state: None,
-                    // The PLAIN lane: no allocation, and every tier is rebuildable from this record
-                    // without an engine, so nothing pre-built needs to be carried.
-                    rgb: None,
-                    pending_extension: None,
-                    pending_state: None,
-                    // [CATS change 2] THE SHAPE, ON DISK BEFORE ANYTHING IS SIGNED. This is what a
-                    // replay reads to decide which builder finishes the leg; inferring it from
-                    // `extension: None` would make a tip indistinguishable from an unfinished piece
-                    // exactly where nobody is watching (see `SplitLegRole`). Written here, in the
-                    // `Planned` record, so it is durable before `set_spend_budget`.
-                    role: if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
-                        SplitLegRole::SpineTip
-                    } else {
-                        SplitLegRole::Piece
-                    },
-                })
+            .map(|(j, (sid, recipient, role))| SplitJournalChild {
+                statechain_id: sid.clone(),
+                owner_exit_address: recipient.clone(),
+                value: children[j].2,
+                // Child `j` lives at SP's j-th PAYLOAD output, not positional `j` (a coloured SP
+                // carries the opret at index 0 and shifts every child by one).
+                sp_vout: sp.payload_vout + j as u32,
+                extension: None,
+                state: None,
+                // The PLAIN lane: no allocation, and every tier is rebuildable from this record
+                // without an engine, so nothing pre-built needs to be carried.
+                rgb: None,
+                pending_extension: None,
+                pending_state: None,
+                role: *role,
+                recipient_address: recipients[j].clone(),
+                conveyance: ConveyanceStage::Pending,
+                conveyance_x1: None,
+                latch_batch_id: None,
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect(),
         child_ext_csv: p.ext_csv(0),
         child_state_csv: p.state_csv(0),
         fee_rate: bundle.fee_rate,
         network: bundle.network.clone(),
         sp_txid: sp.txid.clone(),
     };
+    // [K>1 prerequisite 1] The plan is complete, and now it is CHECKED to be — while a refusal still
+    // costs nothing. One leg per carve, contiguous funding outputs, values that add up, and exactly
+    // the tip the caller declared. Past `set_spend_budget` this record is the only description of a
+    // coin that no longer exists.
+    journal.validate_plan(n, sp.payload_vout, total, change_leg)?;
     journal_write(cc, wallet_name, &journal).await?;
 
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
@@ -4194,6 +4580,7 @@ pub async fn spine_batch_split(
     tip: &SpineTipBundle,
     children: &mut [(Coin, String, u64)],
     change_leg: ChangeLeg,
+    conveyance: &[(String, String)],
 ) -> Result<InLadderSplitOutput> {
     // ---- STRUCTURE, STRICTLY BEFORE VALUE, AND ALL OF IT BEFORE ANYTHING IS SIGNED --------------
     //
@@ -4304,7 +4691,7 @@ pub async fn spine_batch_split(
     let mut levels: Vec<SplitLevelShape> =
         tip.ancestors.iter().map(SplitLevelShape::of).collect();
     levels.push(SplitLevelShape::Spine);
-    enforce_split_depth_cap_shaped(cc, p, &levels).await?;
+    enforce_split_depth_cap_shaped(cc, p, &levels, tip.parent.exit_tiers().len()).await?;
 
     // [D1] The parent's flat backup chain travels with the tip (it was conveyed into the record when
     // the tip was carved) and is what every piece's receiver counts. A record short of the deposit
@@ -4365,6 +4752,26 @@ pub async fn spine_batch_split(
     // co-signature is unregenerable, so the plan that describes it is on disk before the SE can be
     // asked for it. Note `terminalized_statechain_id` is the TIP's: the root parent went terminal at
     // batch 1 and this batch never touches its budget.
+    // [CATS] THE SHAPE, ON DISK BEFORE ANYTHING IS SIGNED — see `in_ladder_split`. So is the
+    // recipient of each piece [K>1 prerequisite 2].
+    let legs: Vec<(String, String, SplitLegRole)> = children
+        .iter()
+        .enumerate()
+        .map(|(j, (c, recipient, _))| {
+            Ok((
+                c.statechain_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("spine batch leg coin has no statechain_id"))?,
+                recipient.clone(),
+                if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
+                    SplitLegRole::SpineTip
+                } else {
+                    SplitLegRole::Piece
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let recipients = resolve_conveyance_plan(&legs, conveyance, &network)?;
     let mut journal = SplitJournalRecord {
         op_id: format!("spine_batch:{tip_sid}:{}", sp.txid),
         lane: "spine_batch".to_string(),
@@ -4376,39 +4783,35 @@ pub async fn spine_batch_split(
         // exactly as the child lane appends its own.
         ancestors: tip.ancestors.clone(),
         parent_flat_backups: tip.parent_flat_backups.clone(),
-        children: children
+        children: legs
             .iter()
             .enumerate()
-            .map(|(j, (c, recipient, value))| {
-                Ok(SplitJournalChild {
-                    statechain_id: c
-                        .statechain_id
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("spine batch leg coin has no statechain_id"))?,
-                    owner_exit_address: recipient.clone(),
-                    value: *value,
-                    sp_vout: sp.payload_vout + j as u32,
-                    extension: None,
-                    state: None,
-                    // PLAIN lane — `refuse_uncolored_over_colored_tip` above is what makes that true.
-                    rgb: None,
-                    pending_extension: None,
-                    pending_state: None,
-                    // [CATS] THE SHAPE, ON DISK BEFORE ANYTHING IS SIGNED — see `in_ladder_split`.
-                    role: if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
-                        SplitLegRole::SpineTip
-                    } else {
-                        SplitLegRole::Piece
-                    },
-                })
+            .map(|(j, (sid, recipient, role))| SplitJournalChild {
+                statechain_id: sid.clone(),
+                owner_exit_address: recipient.clone(),
+                value: children[j].2,
+                sp_vout: sp.payload_vout + j as u32,
+                extension: None,
+                state: None,
+                // PLAIN lane — `refuse_uncolored_over_colored_tip` above is what makes that true.
+                rgb: None,
+                pending_extension: None,
+                pending_state: None,
+                role: *role,
+                recipient_address: recipients[j].clone(),
+                conveyance: ConveyanceStage::Pending,
+                conveyance_x1: None,
+                latch_batch_id: None,
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect(),
         child_ext_csv: p.ext_csv(0),
         child_state_csv: p.state_csv(0),
         fee_rate,
         network: network.clone(),
         sp_txid: sp.txid.clone(),
     };
+    // [K>1 prerequisite 1] Same check, same reason, one level further up the spine.
+    journal.validate_plan(n, sp.payload_vout, total, change_leg)?;
     journal_write(cc, wallet_name, &journal).await?;
 
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &tip_sid, 1).await?;
@@ -4558,12 +4961,13 @@ async fn enforce_split_depth_cap(
     cc: &ClientConfig,
     p: mercurylib::tesr::TesrParams,
     new_depth: u32,
+    parent_exit_tiers: usize,
 ) -> Result<()> {
     // Every intermediate level on the two legacy lanes is a TWO-TIER segment, which is exactly what
     // this signature has always assumed. Stated as data now rather than baked into the body, because
     // the spine lane's levels are NOT that shape and the difference is a real block count.
     let levels = vec![SplitLevelShape::TwoTier; new_depth.saturating_sub(1) as usize];
-    enforce_split_depth_cap_shaped(cc, p, &levels).await
+    enforce_split_depth_cap_shaped(cc, p, &levels, parent_exit_tiers).await
 }
 
 /// **[CATS spine batch] The tiers ONE intermediate segment adds to a leaf's unilateral-exit walk.**
@@ -4608,13 +5012,151 @@ impl SplitLevelShape {
     }
 }
 
+/// **[P0-3] The two exit-chain shapes the LENGTH cap is derived from**, for the live schedule `p`.
+///
+/// `base` is a depth-1 child's chain (`T`, `X_m`, `SP`, `ext_child`, `state_child`) and `per_level`
+/// is what ONE further TWO-TIER level adds. Deliberately the two-tier shape and not the spine one:
+/// the cap is "the longest chain the latency rule already blesses", and the two-tier level is the
+/// shape that pays full price in latency. See [`mercurylib::transfer::receiver::max_exit_txs`].
+///
+/// ⚠️ `p` must be the RECEIVER's / BUILDER's own preset (`TesrParams::for_network`), never a conveyed
+/// `bundle.params` — the schedule is one end of the comparison and a sender that could move it would
+/// set its own cap.
+fn exit_cap_shapes(p: mercurylib::tesr::TesrParams) -> (Vec<Option<u16>>, Vec<Option<u16>>) {
+    let base = vec![
+        None,
+        Some(p.ext_csv(0)),
+        Some(SPINE_CSV),
+        Some(p.ext_csv(0)),
+        Some(p.state_csv(0)),
+    ];
+    (base, SplitLevelShape::TwoTier.csvs(p))
+}
+
+/// **[P0-3] THE EXIT-CHAIN LENGTH CAP** for a schedule and epoch — 23 on mainnet, 139 on regtest.
+/// Thin, named wrapper over [`mercurylib::transfer::receiver::max_exit_txs`] so every lane in this
+/// file derives the number the same way, from the same two shapes.
+pub fn max_exit_txs(p: mercurylib::tesr::TesrParams, epoch_blocks: u32) -> u32 {
+    let (base, per_level) = exit_cap_shapes(p);
+    mercurylib::transfer::receiver::max_exit_txs(&base, &per_level, epoch_blocks)
+}
+
+/// **[C-1] THE PROVENANCE OF THE CAP SCHEDULE** — the ONE place both sides of the exit-chain cap
+/// pick the [`mercurylib::tesr::TesrParams`] they measure with.
+///
+/// `network` is the deciding wallet's OWN network (`cc.network`); `conveyed` is the schedule that
+/// travelled on the artifact (`bundle.params` / `cb.parent.params` / `tip.parent.params`).
+///
+/// **The authority is the wallet's OWN preset, always.** The conveyed schedule is never returned and
+/// never measured with: it is a plain serde field on an artifact the counterparty wrote, and the cap
+/// is a comparison whose other end it must not be allowed to move. A sender that could pick this
+/// schedule would pick the VICTIM's build cap — see `cap_params_provenance_tests` for the attack, and
+/// `forged_yardstick_attack_tests` for the identical shape already closed on `fee_rate`.
+///
+/// **A mismatch is an ERROR, not a silent substitution.** Returning the preset and ignoring the
+/// disagreement would close the stranding and leave the wallet holding an artifact whose declared
+/// schedule contradicts the network it is on — while every OTHER reader of that field (the CSV bands
+/// in [`verify_bundle_ex`] and [`verify_child_bundle`], [`SpineTipBundle::validate`]) goes on
+/// trusting it. So the contradiction is reported, and the message names the field that disagreed,
+/// both values, and the network whose preset won.
+pub fn cap_schedule(
+    network: &str,
+    conveyed: mercurylib::tesr::TesrParams,
+) -> Result<mercurylib::tesr::TesrParams> {
+    let authority = mercurylib::tesr::TesrParams::for_network(network);
+    if let Some((field, got, want)) = schedule_disagreement(&conveyed, &authority) {
+        return Err(anyhow::anyhow!(
+            "conveyed TES-R schedule refused: it declares `{field}` = {got}, but this wallet's own \
+             `{network}` preset — the authority both the BUILD side and the ADMISSION side measure \
+             every exit-chain cap with — says {want}. A schedule that travels on an artifact is \
+             data, never a yardstick: honouring it would move this wallet's build cap away from the \
+             cap its own receivers enforce, so the split it authorised would mint a chain nobody \
+             will adopt, after the parent has already been terminalized. Refused by name rather \
+             than silently substituted, because every other reader of this field (the CSV bands in \
+             `verify_bundle_ex` / `verify_child_bundle`) is still trusting it."
+        ));
+    }
+    Ok(authority)
+}
+
+/// The FIRST field on which a conveyed [`mercurylib::tesr::TesrParams`] disagrees with the preset
+/// that is the authority, as `(field name, conveyed, authority)` rendered for a refusal message.
+/// `None` when the two agree exactly.
+///
+/// Field-by-field rather than `!=` on the whole struct so the refusal can say WHICH knob was moved:
+/// "the schedule is wrong" is unactionable, "`d0` = 24 where `bitcoin` says 1440" is the regtest
+/// schedule declared on a mainnet wallet, which is the attack, spelled out.
+fn schedule_disagreement(
+    conveyed: &mercurylib::tesr::TesrParams,
+    authority: &mercurylib::tesr::TesrParams,
+) -> Option<(&'static str, String, String)> {
+    let integral: [(&'static str, u16, u16); 7] = [
+        ("d0", conveyed.d0, authority.d0),
+        ("delta", conveyed.delta, authority.delta),
+        ("d_floor", conveyed.d_floor, authority.d_floor),
+        ("e0", conveyed.e0, authority.e0),
+        ("delta_e", conveyed.delta_e, authority.delta_e),
+        ("e_floor", conveyed.e_floor, authority.e_floor),
+        ("m_max", conveyed.m_max, authority.m_max),
+    ];
+    for (name, got, want) in integral {
+        if got != want {
+            return Some((name, got.to_string(), want.to_string()));
+        }
+    }
+    // The committed fee rate is part of the schedule too, and it is the term the ALREADY-CLOSED
+    // forged-yardstick attack rode in on. Compared exactly: both presets ship the same literal, so
+    // any difference at all is a schedule this wallet did not write.
+    if conveyed.committed_fee_rate != authority.committed_fee_rate {
+        return Some((
+            "committed_fee_rate",
+            conveyed.committed_fee_rate.to_string(),
+            authority.committed_fee_rate.to_string(),
+        ));
+    }
+    None
+}
+
+/// **[P0-3] THE LENGTH GATE**, in the form every call site in this file uses: `txs` is the number of
+/// transactions the coin's unilateral exit walk contains, `lane` names the refusing lane.
+///
+/// ⚠️ **ADMISSION and BUILD only.** Never reachable from `exit_pass`, `exit_child_pass`,
+/// `child_exit_chain*`, `spine_tip_exit_chain*`, `defend_ladders` or `unilateral_exit`: refusing to
+/// ACCEPT or to CREATE is safe, refusing to EXIT strands a coin that is already someone's. The
+/// wiring census `the_length_cap_is_not_reachable_from_the_exit_path` pins that.
+pub fn enforce_exit_chain_length(
+    lane: &str,
+    txs: usize,
+    p: mercurylib::tesr::TesrParams,
+    epoch_blocks: u32,
+) -> Result<()> {
+    let (base, per_level) = exit_cap_shapes(p);
+    mercurylib::transfer::receiver::check_exit_chain_length(
+        lane,
+        txs as u32,
+        &base,
+        &per_level,
+        epoch_blocks,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
 /// [P0-2] The depth cap over a chain whose intermediate levels are named individually — see
 /// [`SplitLevelShape`]. `levels` is one entry per INTERMEDIATE segment the new leaf will sit under,
 /// root→leaf; empty for a depth-1 child carved straight off a root coin.
+///
+/// `parent_exit_tiers` is the ROOT parent segment's REAL transaction count
+/// (`TesrBundle::exit_tiers().len()` = `1 + 2·levels.len()`), which the [P0-3] length cap below
+/// needs and which `base` — hardcoded to a ONE-level parent — does not model. Passing it explicitly
+/// is what keeps the builder and `verify_conveyed_child` measuring the same chain: a split off a
+/// ROLLED-OVER parent is `2·(R−1)` transactions longer than `base` says, and a build side that
+/// under-counted it would mint children no receiver would adopt, after the parent is terminal.
 async fn enforce_split_depth_cap_shaped(
     cc: &ClientConfig,
     p: mercurylib::tesr::TesrParams,
     levels: &[SplitLevelShape],
+    parent_exit_tiers: usize,
 ) -> Result<()> {
     // Fail CLOSED: an unreadable epoch is a refusal, not an assumed-generous default.
     let info = crate::utils::info_config(cc).await.map_err(|e| {
@@ -4625,6 +5167,22 @@ async fn enforce_split_depth_cap_shaped(
         )
     })?;
     let epoch_blocks = info.initlock;
+    // [C-1] WHOSE SCHEDULE. `p` arrived from the CONVEYED artifact at every one of this function's
+    // four call sites; the admission sites cap with `TesrParams::for_network`. Which one wins is
+    // decided in exactly one place, so the two sides cannot drift apart call site by call site.
+    let p = cap_schedule(&cc.network.to_string(), p)?;
+    split_cap_decision(p, levels, parent_exit_tiers, epoch_blocks)
+}
+
+/// The PURE decision `enforce_split_depth_cap_shaped` makes once it has the epoch and has settled
+/// whose schedule to measure with. Separated so the cap arithmetic — and the ordering the comments
+/// below insist on — is reachable from a unit test without an SE.
+fn split_cap_decision(
+    p: mercurylib::tesr::TesrParams,
+    levels: &[SplitLevelShape],
+    parent_exit_tiers: usize,
+    epoch_blocks: u32,
+) -> Result<()> {
     // A depth-1 exit chain, from the live schedule:
     //   T (no timelock) | X_m E0 | SP 0 | ext_child E0 | state_child D0
     //
@@ -4647,6 +5205,20 @@ async fn enforce_split_depth_cap_shaped(
         chain.splice(at..at, tiers);
         at += n;
     }
+    // ═══ [P0-3] THE LENGTH CAP — ABOVE THE LATENCY RULE'S EARLY RETURN ═══
+    //
+    // This MUST sit above `if required <= epoch_blocks { return Ok(()) }` below. A SPINE level costs
+    // ONE block of latency and a WHOLE transaction, so an all-spine chain of thousands of tiers
+    // satisfies the latency test and returns `Ok` there before its length is ever looked at. Placing
+    // the length check under that return reproduces the defect verbatim.
+    //
+    // The chain measured is the leaf's REAL walk, not `base`'s five-entry model of it:
+    //   parent segment (`1 + 2·parent.levels.len()`) + every intermediate level's own tiers
+    //   + the leaf's own extension and state.
+    let level_tiers: usize = levels.iter().map(|l| l.csvs(p).len()).sum();
+    let exit_txs = parent_exit_tiers + level_tiers + 2;
+    enforce_exit_chain_length("in-ladder split", exit_txs, p, epoch_blocks)?;
+
     let required = mercurylib::transfer::receiver::exit_wait_blocks(&chain);
     if required <= epoch_blocks {
         return Ok(());
@@ -5021,6 +5593,10 @@ pub async fn verify_conveyed_child(
             parent_backups.len()
         ));
     }
+    // Hoisted out of the block below because BOTH admission rules need it: the flat chain's epoch
+    // terms (`initlock`/`interval`) and the [P0-3] length cap's epoch length. One fetch, one
+    // fail-closed `?` — an SE that cannot be read refuses the adoption rather than defaulting.
+    let info_config = crate::utils::info_config(cc).await?;
     let (epoch_expiry_height, tip) = {
         use electrum_client::bitcoin::consensus::{deserialize, serialize};
         for (i, b) in parent_backups.iter().enumerate() {
@@ -5045,7 +5621,6 @@ pub async fn verify_conveyed_child(
                 ));
             }
         }
-        let info_config = crate::utils::info_config(cc).await?;
         let blockheight = cc
             .electrum_client
             .block_headers_subscribe_raw()
@@ -5130,6 +5705,42 @@ pub async fn verify_conveyed_child(
     // below (so low entries cannot be dropped to raise the minimum). The chain's LENGTH is likewise
     // not free: `verify_child_bundle` links every tier to its parent's outpoint, so a segment cannot
     // be omitted to shorten the walk without breaking the funding chain outright.
+    // ═══ [P0-3] THE EXIT-CHAIN LENGTH CAP — BEFORE THE STRUCTURAL BIND ═══
+    //
+    // The headroom gate below is a LATENCY rule, and a SPINE tier costs one block of latency while
+    // adding a whole transaction. A sender who batches the same spine tip over and over hands out
+    // pieces whose walks grow by one transaction per batch at one block of latency each: on the
+    // mainnet schedule the headroom gate passes a 7 120-transaction, ~1.2 MB exit chain and calls it
+    // comfortably inside the epoch. This refuses on WORK what the gate below refuses on TIME.
+    //
+    // [B1] Both terms are receiver-derived: `initlock` from `/info/config` (already fetched above,
+    // fail-closed) and the schedule from THIS wallet's network preset — never `cb.parent.params`,
+    // which travels on the bundle and would let the sender set its own cap. Same discipline as the
+    // fee-rate yardstick binding above.
+    //
+    // ⚠️ ORDERING. This is a COUNT of conveyed vectors, not a value read out of a transaction output,
+    // so it is outside the check-ordering defect class `mod linked` exists to police and belongs
+    // HERE, above the structural bind — refusing a 7 120-tier bundle before `child_exit_chain_bound`
+    // hex-decodes and deserialises 7 120 attacker-supplied transactions is the whole DoS margin. The
+    // count cannot be faked downward either: `verify_child_bundle` links every tier to its parent's
+    // outpoint, so a chain shortened by omitting a segment is a broken funding chain.
+    // [C-1] AND THE CONVEYED SCHEDULE IS BOUND, NOT MERELY UNUSED. `cap_schedule` returns this
+    // wallet's own preset and refuses — by name — a bundle whose declared schedule contradicts it.
+    // Ignoring the field instead would close this cap and leave `verify_child_bundle` below reading
+    // that same contradicted field for every CSV band it enforces.
+    let authority = cap_schedule(&cc.network.to_string(), cb.conveyed_schedule())?;
+    debug_assert_eq!(
+        authority,
+        mercurylib::tesr::TesrParams::for_network(&cc.network.to_string()),
+        "cap_schedule must hand back the RECEIVER's preset, never the conveyed schedule"
+    );
+    enforce_exit_chain_length(
+        "conveyed child",
+        child_exit_chain(cb).len(),
+        authority,
+        info_config.initlock,
+    )?;
+
     let exit_csvs: Vec<Option<u16>> =
         child_exit_chain_bound(cb)?.into_iter().map(|(_, csv)| csv).collect();
     mercurylib::transfer::receiver::check_exit_headroom(&exit_csvs, tip, epoch_expiry_height)
@@ -5213,6 +5824,7 @@ pub async fn child_in_ladder_split(
     child_coin: &mut Coin,
     cb: &ChildTesrBundle,
     children: &mut [(Coin, String, u64)],
+    conveyance: &[(String, String)],
 ) -> Result<Vec<ChildTesrBundle>> {
     refuse_uncolored_over_colored_child(cb, "child_in_ladder_split")?;
     let p = cb.parent.params;
@@ -5224,7 +5836,8 @@ pub async fn child_in_ladder_split(
     // segment into `ancestors`, so every grandchild lands one level deeper. Checked BEFORE anything
     // irreversible (the child's terminalization is two statements below): a refusal here leaves the
     // child whole, spendable and re-transferable.
-    enforce_split_depth_cap(cc, p, cb.ancestors.len() as u32 + 2).await?;
+    enforce_split_depth_cap(cc, p, cb.ancestors.len() as u32 + 2, cb.parent.exit_tiers().len())
+        .await?;
     let old_csv = cb
         .child_state
         .csv
@@ -5279,6 +5892,22 @@ pub async fn child_in_ladder_split(
     // [P0-3] WRITE AHEAD, THEN TERMINALIZE — identical contract to `in_ladder_split`; this lane has
     // the same defect and now shares the same journal. The record is complete before the child's
     // budget is consumed, so a crash anywhere below is replayed rather than lost.
+    // Every leg of a child split is a payee's PIECE: this lane's change is still two-tier, so there
+    // is no spine tip to mark. The recipients are resolved and bound to their legs' Model-A payees
+    // before the child is terminalized [K>1 prerequisite 2].
+    let legs: Vec<(String, String, SplitLegRole)> = children
+        .iter()
+        .map(|(c, recipient, _)| {
+            Ok((
+                c.statechain_id
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("grandchild coin has no statechain_id"))?,
+                recipient.clone(),
+                SplitLegRole::Piece,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let recipients = resolve_conveyance_plan(&legs, conveyance, &cb.parent.network)?;
     let mut journal = SplitJournalRecord {
         op_id: format!("child_in_ladder_split:{child_sid}:{}", csp.txid),
         lane: "child_in_ladder_split".to_string(),
@@ -5289,34 +5918,38 @@ pub async fn child_in_ladder_split(
         // Filled in once CSP is co-signed (the child's own segment carries CSP as its state).
         ancestors: cb.ancestors.clone(),
         parent_flat_backups: cb.parent_flat_backups.clone(),
-        children: children
+        children: legs
             .iter()
             .enumerate()
-            .map(|(j, (c, recipient, value))| {
-                Ok(SplitJournalChild {
-                    statechain_id: c
-                        .statechain_id
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("grandchild coin has no statechain_id"))?,
-                    owner_exit_address: recipient.clone(),
-                    value: *value,
-                    sp_vout: csp.payload_vout + j as u32,
-                    extension: None,
-                    state: None,
-                    // The PLAIN child lane — see the root lane's note.
-                    rgb: None,
-                    pending_extension: None,
-                    pending_state: None,
-                    role: SplitLegRole::Piece,
-                })
+            .map(|(j, (sid, recipient, role))| SplitJournalChild {
+                statechain_id: sid.clone(),
+                owner_exit_address: recipient.clone(),
+                value: children[j].2,
+                sp_vout: csp.payload_vout + j as u32,
+                extension: None,
+                state: None,
+                // The PLAIN child lane — see the root lane's note.
+                rgb: None,
+                pending_extension: None,
+                pending_state: None,
+                role: *role,
+                recipient_address: recipients[j].clone(),
+                conveyance: ConveyanceStage::Pending,
+                conveyance_x1: None,
+                latch_batch_id: None,
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect(),
         child_ext_csv: p.ext_csv(0),
         child_state_csv: p.state_csv(0),
         fee_rate: cb.parent.fee_rate,
         network: cb.parent.network.clone(),
         sp_txid: csp.txid.clone(),
     };
+    // [K>1 prerequisite 1] The child lane's change leg is still a two-tier PIECE, so every leg here
+    // is a `Piece` and the declaration is `ChangeLeg::None` — which `validate_plan` enforces rather
+    // than assumes, since a stray tip on this lane would reach `establish_spine_tip_journalled` and
+    // build one cap where the receiver's verifier expects two tiers.
+    journal.validate_plan(n, csp.payload_vout, total, ChangeLeg::None)?;
     journal_write(cc, wallet_name, &journal).await?;
 
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &child_sid, 1).await?;
@@ -5423,7 +6056,16 @@ pub async fn child_retransfer(
     refuse_uncolored_over_colored_child(cb, "child_retransfer")?;
     let p = cb.parent.params;
     // Replace-by-lower-timelock: the new state must mature strictly before the one it supersedes, and
-    // must not sink below the schedule floor (at the floor the coin must be re-anchored, not re-sent).
+    // must not sink below the schedule floor.
+    //
+    // ⚠️ THE MESSAGE BELOW USED TO NAME `re-anchor`, WHICH IS A REMEDY A LEAF DOES NOT HAVE.
+    // `refresh()` routes a `ctesr-` coin to `unilateral_exit` (`wallet.rs`) because `SP.out[j]` is
+    // un-broadcast and there is no confirmed outpoint to co-operatively spend. So on the mainnet
+    // schedule a leaf ran out of onward hops at `(1440 − 144) / 36 = 36` and was told to do
+    // something impossible. The real remedy is `renew_child`: it rebuilds BOTH tiers in place over
+    // the same `SP.out[j]`, resetting this very rung to `state_csv(0)` for zero on-chain bytes and
+    // no depth. When the extension schedule itself is spent (`child_needs_rollover`), the leaf's
+    // analogue of `rollover` is `child_in_ladder_split`.
     let old_csv = cb
         .child_state
         .csv
@@ -5432,8 +6074,14 @@ pub async fn child_retransfer(
         .checked_sub(p.delta)
         .filter(|c| *c >= p.d_floor)
         .ok_or_else(|| anyhow::anyhow!(
-            "child state CSV {old_csv} is at the floor ({}) — exit or re-anchor it instead of re-sending",
-            p.d_floor
+            "child state CSV {old_csv} is at the floor ({}) — this leaf has spent the onward hops \
+             of its current epoch. RENEW IT: `renew_child` rebuilds this leaf's extension and state \
+             in place over the same `SP.out[j]`, resetting the state rung to {} without consuming a \
+             depth level, for zero on-chain bytes and two SE co-signatures. If its extension \
+             schedule is also spent (`child_needs_rollover`), split it with `child_in_ladder_split` \
+             — the leaf's analogue of `rollover` — or exit it.",
+            p.d_floor,
+            p.state_csv(0)
         ))?;
 
     // The new state spends the SAME outpoint as the one it replaces: ext_child.out[0].
@@ -5902,6 +6550,109 @@ pub async fn convey_child_bundle(
     cb: &ChildTesrBundle,
     batch_id: Option<String>,
 ) -> Result<()> {
+    let x1 = open_child_conveyance(cc, recipient_address, child_coin, cb, batch_id).await?;
+    post_child_conveyance(cc, recipient_address, child_coin, cb, &x1).await
+}
+
+/// **[K>1 prerequisite 2] THE FIRST HALF of a child hand-over: open the transfer, return `x1`.**
+///
+/// Split out of [`convey_child_bundle`] so a journal can sit between the two halves, because the two
+/// halves are not equally repeatable and pretending otherwise is what loses the piece:
+///
+/// * `transfer/sender` is **once per `(statechain_id, new_user_auth_key)`** — a second call is
+///   refused ("Transfer message already exists…"), and `x1` is never re-issued;
+/// * `transfer/update_msg` is an `UPDATE` keyed on that same pair, so it is idempotent and may be
+///   re-posted freely.
+///
+/// A driver that treats the whole thing as one atom therefore has no safe retry: retrying re-runs
+/// the un-repeatable half. A driver that journals the `x1` this function returns has one — it
+/// re-enters at [`post_child_conveyance`] instead.
+pub async fn open_child_conveyance(
+    cc: &ClientConfig,
+    recipient_address: &str,
+    child_coin: &Coin,
+    cb: &ChildTesrBundle,
+    batch_id: Option<String>,
+) -> Result<String> {
+    let (statechain_id, signed_statechain_id, _sp_txid) =
+        conveyance_preconditions(recipient_address, child_coin, cb)?;
+    let (_, _, recipient_auth_pubkey) = mercurylib::decode_transfer_address(recipient_address)?;
+
+    // `transfer/update_msg` is an UPDATE keyed on (statechain_id, new_user_auth_key); the row is
+    // created by this `transfer/sender` init call — without it the update_msg silently no-ops (0 rows)
+    // and the receiver never sees the message. It also returns `x1`, the SE's blinding factor for the
+    // key handover, and ARMS the coordinator's pending-transfer lock on this slot (which is what closes
+    // the post-conveyance rival window for the child).
+    //
+    // [non-exact LN latch, LIGHTNING.md Step 1] `batch_id = Some` makes the child mailbox row born
+    // batch-locked: `insert_new_transfer` sets locked=true and locked2=is_lightning_latch, so the
+    // receiver (SSP) must not adopt the piece until the LN preimage flips locked2 via
+    // `unlock_by_preimage`. The piece sid must already carry an external-hash latch (registered by the
+    // latched `in_ladder_pay`) for the server to mark the row a lightning latch.
+    crate::transfer_sender::get_new_x1(
+        cc,
+        &statechain_id,
+        &signed_statechain_id,
+        &recipient_auth_pubkey.to_string(),
+        batch_id,
+    )
+    .await
+}
+
+/// **[K>1 prerequisite 2] THE SECOND HALF: seal the bundle to the recipient and post it.**
+///
+/// Idempotent by construction — `transfer/update_msg` is an `UPDATE` on the row
+/// [`open_child_conveyance`] created — so a driver holding a journalled `x1` may re-enter here after
+/// any failure, including one that lost the response.
+///
+/// The transfer signature is rebuilt here rather than carried from the first half. It is a purely
+/// LOCAL signature under the child slot's own `user_privkey`, so it does not touch the SE and is
+/// unaffected by the pending-transfer lock the first half armed.
+pub async fn post_child_conveyance(
+    cc: &ClientConfig,
+    recipient_address: &str,
+    child_coin: &Coin,
+    cb: &ChildTesrBundle,
+    x1: &str,
+) -> Result<()> {
+    let (_statechain_id, _signed, sp_txid) =
+        conveyance_preconditions(recipient_address, child_coin, cb)?;
+    let transfer_signature = mercurylib::transfer::sender::create_transfer_signature(
+        recipient_address,
+        &sp_txid,
+        cb.sp_vout,
+        &child_coin.user_privkey,
+    )?;
+    let json = serde_json::to_string(cb)?;
+    let payload = mercurylib::transfer::sender::create_child_conveyance_update_msg(
+        x1,
+        recipient_address,
+        child_coin,
+        &transfer_signature,
+        &json,
+    )?;
+    let endpoint = cc.statechain_entity.clone();
+    let client = cc.get_reqwest_client()?;
+    let status = client
+        .post(&format!("{}/transfer/update_msg", endpoint))
+        .json(&payload)
+        .send()
+        .await?
+        .status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("failed to convey child bundle (update_msg {status})"));
+    }
+    Ok(())
+}
+
+/// The checks and derivations both halves of a hand-over need, in one place so the two halves cannot
+/// disagree about which slot and which outpoint they are talking about. Returns
+/// `(statechain_id, signed_statechain_id, funding txid)`.
+fn conveyance_preconditions(
+    recipient_address: &str,
+    child_coin: &Coin,
+    cb: &ChildTesrBundle,
+) -> Result<(String, String, String)> {
     let statechain_id = child_coin
         .statechain_id
         .as_ref()
@@ -5910,8 +6661,9 @@ pub async fn convey_child_bundle(
         .signed_statechain_id
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("piece child coin has no signed_statechain_id"))?;
-    let (_, _, recipient_auth_pubkey) =
-        mercurylib::decode_transfer_address(recipient_address)?;
+    // Parsed for its side effect: a malformed recipient address must be a refusal on BOTH halves,
+    // and in particular before the un-repeatable one runs.
+    let (_, _, _) = mercurylib::decode_transfer_address(recipient_address)?;
     // The bundle must describe the very slot we are conveying, or the receiver would census one coin
     // and complete the handover on another.
     if cb.child_statechain_id != *statechain_id {
@@ -5938,57 +6690,182 @@ pub async fn convey_child_bundle(
         let sp: bitcoin::Transaction = deserialize(&hex::decode(&funding_hex)?)?;
         sp.txid().to_string()
     };
+    Ok((statechain_id.clone(), signed_statechain_id.clone(), sp_txid))
+}
 
-    // Sender-side binding, built BEFORE the transfer is opened: once `get_new_x1` runs, the coordinator's
-    // pending-transfer lock refuses further co-signs on this slot, so every sender-side signature must
-    // already exist (the same discipline `transfer_sender::execute` follows).
-    let transfer_signature = mercurylib::transfer::sender::create_transfer_signature(
-        recipient_address,
-        &sp_txid,
-        cb.sp_vout,
-        &child_coin.user_privkey,
-    )?;
+/// The SE's refusal of a SECOND `transfer/sender` for a `(statechain_id, new_user_auth_key)` pair
+/// that already has an open transfer (`server/src/endpoints/transfer_sender.rs`).
+///
+/// Matched on text because the transport gives no other signal — `get_new_x1` flattens every
+/// non-2xx into one `anyhow` string. That is tolerable **only** because the match is not
+/// load-bearing: it decides whether a leg is reported [`ConveyanceStage::Stranded`] (over, say so)
+/// or left [`ConveyanceStage::Attempted`] (retried, reported failing). A miss therefore costs a
+/// retry loop the operator can see, never a silent loss — which is the direction this repo requires
+/// a heuristic to fail in.
+fn is_transfer_already_open(err: &str) -> bool {
+    err.contains("Transfer message already exists")
+}
 
-    // `transfer/update_msg` is an UPDATE keyed on (statechain_id, new_user_auth_key); the row is
-    // created by this `transfer/sender` init call — without it the update_msg silently no-ops (0 rows)
-    // and the receiver never sees the message. It also returns `x1`, the SE's blinding factor for the
-    // key handover, and ARMS the coordinator's pending-transfer lock on this slot (which is what closes
-    // the post-conveyance rival window for the child).
-    //
-    // [non-exact LN latch, LIGHTNING.md Step 1] `batch_id = Some` makes the child mailbox row born
-    // batch-locked: `insert_new_transfer` sets locked=true and locked2=is_lightning_latch, so the
-    // receiver (SSP) must not adopt the piece until the LN preimage flips locked2 via
-    // `unlock_by_preimage`. The piece sid must already carry an external-hash latch (registered by the
-    // latched `in_ladder_pay`) for the server to mark the row a lightning latch.
-    let x1 = crate::transfer_sender::get_new_x1(
-        cc,
-        statechain_id,
-        signed_statechain_id,
-        &recipient_auth_pubkey.to_string(),
-        batch_id,
-    )
-    .await?;
+/// What one pass of [`convey_journalled_pieces`] did, leg by leg. Every leg of the record appears in
+/// exactly one bucket — there is no "the rest", because "the rest" is how a lost piece hides.
+#[derive(Clone, Debug, Default)]
+pub struct ConveyanceOutcome {
+    /// Handed over by THIS pass.
+    pub conveyed: Vec<String>,
+    /// Already [`ConveyanceStage::Conveyed`] when the pass started — reported, not silently skipped,
+    /// so a caller can prove the batch is complete rather than infer it from an empty failure list.
+    pub already: Vec<String>,
+    /// Attempted and failed, with the reason. Still resumable: the journal holds the leg at
+    /// `Attempted`, with its `x1` if the transfer is open, so the next pass re-enters at the
+    /// idempotent half.
+    pub failed: Vec<(String, String)>,
+    /// [`ConveyanceStage::Stranded`] — the transfer is open at the SE but this wallet lost the `x1`.
+    /// Not retryable.
+    pub stranded: Vec<String>,
+    /// Legs the driver COULD not convey though it was meant to: the slot's coin was not supplied, or
+    /// the piece's ladder could not be rebuilt from the journal. These are genuine gaps — a leg this
+    /// record undertook to hand over and could not. Reported rather than skipped.
+    pub unactionable: Vec<(String, String)>,
+    /// Legs the driver never undertook at all: no journalled `recipient_address`, because the CALLER
+    /// conveys them itself (or the row predates the field).
+    ///
+    /// **This is a separate bucket, and that is the whole point.** It used to share `unactionable`,
+    /// so `is_complete` reported a perfectly healthy batch as incomplete the moment ONE leg was
+    /// caller-conveyed — which is the ordinary shape of `child_in_ladder_split`, where the caller
+    /// hands over its own piece and journals only the payee's. sdk17 failed on exactly that: "1 of 2
+    /// piece(s) were handed over … 1 unactionable", with nothing wrong. A leg nobody promised to
+    /// convey is not a leg that failed to convey, and `is_complete`'s own doc already said so.
+    pub not_undertaken: Vec<String>,
+}
 
-    let json = serde_json::to_string(cb)?;
-    let payload = mercurylib::transfer::sender::create_child_conveyance_update_msg(
-        &x1,
-        recipient_address,
-        child_coin,
-        &transfer_signature,
-        &json,
-    )?;
-    let endpoint = cc.statechain_entity.clone();
-    let client = cc.get_reqwest_client()?;
-    let status = client
-        .post(&format!("{}/transfer/update_msg", endpoint))
-        .json(&payload)
-        .send()
-        .await?
-        .status();
-    if !status.is_success() {
-        return Err(anyhow::anyhow!("failed to convey child bundle (update_msg {status})"));
+impl ConveyanceOutcome {
+    /// Did every leg this record undertook to convey actually land? The condition a caller must
+    /// satisfy before it may close the journal record.
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty() && self.stranded.is_empty() && self.unactionable.is_empty()
     }
-    Ok(())
+}
+
+/// **[K>1 prerequisite 2] THE RESUMABLE CONVEYANCE DRIVER.**
+///
+/// Hands over every payee piece of a journalled split that has not been handed over yet, resuming
+/// from whatever the journal says already landed, and journalling each step **before** the network
+/// call it describes. Replaces the ad-hoc `for recipient in …` loop the split lanes used to run.
+///
+/// Three properties, and each of them is a defect that existed before:
+///
+/// 1. **Resumable.** The recipient's transfer address is in the journal (written into the `Planned`
+///    record, before the parent was terminalized), so a later process — a restart, a retry, another
+///    day — can finish the batch with nothing but the `op_id`. Previously the address lived only in
+///    the arguments of the call that crashed, and `owner_exit_address` cannot be turned back into
+///    one: [`mercurylib::tesr::payee_address`] discards the auth key.
+/// 2. **Idempotent.** The un-repeatable half of a hand-over (`transfer/sender`, which issues `x1`
+///    once) is journalled apart from the repeatable half (`transfer/update_msg`, an `UPDATE`), so a
+///    retry re-enters at the repeatable one. Re-running a completed leg is a skip, not a second
+///    transfer.
+/// 3. **Leg-independent.** A failure at recipient *j* no longer abandons *j+1..K-1*. Those legs
+///    share nothing with *j* — different slots, different recipients, different mailbox rows — and
+///    abandoning them was the whole of the K>1 money-loss risk: one network blip, K−1−*j* payees
+///    holding nothing, and a sender holding slots whose final state pays someone else.
+///
+/// `coins` supplies the sender-owned slot coin for each leg by statechain id. A leg whose coin is
+/// missing is reported in `unactionable`, never skipped.
+pub async fn convey_journalled_pieces(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    rec: &mut SplitJournalRecord,
+    coins: &[(String, Coin)],
+) -> Result<ConveyanceOutcome> {
+    let mut out = ConveyanceOutcome::default();
+    for j in 0..rec.children.len() {
+        // STRUCTURE BEFORE VALUE, and role before everything: the sender's own change leg is not a
+        // hand-over that failed, it is a hand-over that was never owed.
+        if rec.children[j].role != SplitLegRole::Piece {
+            continue;
+        }
+        let sid = rec.children[j].statechain_id.clone();
+        match rec.children[j].conveyance {
+            ConveyanceStage::Conveyed => {
+                out.already.push(sid);
+                continue;
+            }
+            ConveyanceStage::Stranded => {
+                out.stranded.push(sid);
+                continue;
+            }
+            ConveyanceStage::Pending | ConveyanceStage::Attempted => {}
+        }
+        let Some(address) = rec.children[j].recipient_address.clone() else {
+            // NOT a failure: no address was journalled because this driver was never asked to convey
+            // this leg. `child_in_ladder_split` journals the payee's address and hands over its OWN
+            // piece directly, so one such leg per split is the NORMAL shape, not an anomaly.
+            out.not_undertaken.push(sid);
+            continue;
+        };
+        let Some(coin) = coins.iter().find(|(id, _)| *id == sid).map(|(_, c)| c.clone()) else {
+            out.unactionable.push((
+                sid,
+                "this wallet holds no slot coin for the leg, so the hand-over cannot be \
+                 authorised — refusing to report it conveyed"
+                    .to_string(),
+            ));
+            continue;
+        };
+        // Rebuilt from the journal, never from the caller: the co-signed material is what it is, and
+        // a leg whose ladder is incomplete must be finished by `resume_in_ladder_split` first.
+        let bundle = match rec.piece_bundle(j) {
+            Ok(b) => b,
+            Err(e) => {
+                out.unactionable.push((sid, e.to_string()));
+                continue;
+            }
+        };
+
+        // ---- the un-repeatable half, and the durable marker that it MIGHT have run ---------------
+        let x1 = match rec.children[j].conveyance_x1.clone() {
+            // The transfer is already open and `x1` survived: only the idempotent post is missing.
+            Some(x1) => x1,
+            None => {
+                // On disk BEFORE the call. Without this write a crash inside `transfer/sender` is
+                // indistinguishable from never having called it, and the next pass would call it
+                // again — which is the one call that cannot be repeated.
+                rec.children[j].conveyance = ConveyanceStage::Attempted;
+                journal_write(cc, wallet_name, rec).await?;
+                let latch = rec.children[j].latch_batch_id.clone();
+                match open_child_conveyance(cc, &address, &coin, &bundle, latch).await {
+                    Ok(x1) => {
+                        rec.children[j].conveyance_x1 = Some(x1.clone());
+                        journal_write(cc, wallet_name, rec).await?;
+                        x1
+                    }
+                    Err(e) if is_transfer_already_open(&e.to_string()) => {
+                        rec.children[j].conveyance = ConveyanceStage::Stranded;
+                        journal_write(cc, wallet_name, rec).await?;
+                        out.stranded.push(sid);
+                        continue;
+                    }
+                    Err(e) => {
+                        // Stays `Attempted` with no `x1`: the next pass re-runs this half and reads
+                        // the SE's answer, which is the only thing that can tell the two cases apart.
+                        out.failed.push((sid, e.to_string()));
+                        continue;
+                    }
+                }
+            }
+        };
+
+        // ---- the repeatable half ----------------------------------------------------------------
+        match post_child_conveyance(cc, &address, &coin, &bundle, &x1).await {
+            Ok(()) => {
+                rec.children[j].conveyance = ConveyanceStage::Conveyed;
+                journal_write(cc, wallet_name, rec).await?;
+                out.conveyed.push(sid);
+            }
+            // The leg keeps its `x1`, so the next pass skips straight back to this call.
+            Err(e) => out.failed.push((sid, e.to_string())),
+        }
+    }
+    Ok(out)
 }
 
 /// Off-chain RENEWAL: co-sign a new extension `X_{m+1}` with a strictly LOWER CSV
@@ -7028,6 +7905,183 @@ fn verify_superseded_segment(
     Ok(sups.len() as u32)
 }
 
+/// **[DUST] EVERY SPENDABLE OUTPUT OF EVERY TIER MUST CLEAR THE RELAY FLOOR.**
+///
+/// The one law in this file that is not about a total. Every value check around it — the Σ over the
+/// payload outputs, the payload COUNT, the per-output forward on the leaf — constrains what the tiers
+/// add up to and says nothing whatever about the SMALLEST output. So all of them are satisfied
+/// exactly by a tier carrying a 1-sat (or zero-sat) leg beside an otherwise perfect payload:
+///
+/// * a split `SP` carving `(expected − 1, 1)` across two child slots — Σ exact, count exact;
+/// * an ancestor extension doing the same (that lane has a Σ check and no count check);
+/// * an intermediate spine `SP` doing the same (that lane has NEITHER);
+/// * a zero-value output appended to a leaf tier, which is Σ-neutral by construction and therefore
+///   invisible to both the sum check and the per-output check;
+/// * a 1-sat output appended to a spine tip's cap, which nothing in `validate` looks at.
+///
+/// **Why that is theft rather than untidiness.** A transaction with an output below the dust relay
+/// threshold is NON-STANDARD: no node relays it, it never reaches a mempool, it never confirms. Every
+/// TES-R tier is pre-signed and un-broadcast, so a poisoned tier cannot be repaired — the SE co-signed
+/// *that* transaction, and once the coin is terminal it will never co-sign a replacement. Everything
+/// hanging beneath the poisoned tier is unreachable forever, while the receiver is credited the
+/// FUNDING value (`coin.amount = sp_out.value` on the child lane, the on-chain `F` on the root lane)
+/// and the SSP's pre-payment census — which runs these same verifiers — pays the invoice.
+///
+/// **The blind SE cannot be the one to catch it.** `cosign_tier_request` is handed a sighash and a
+/// prevout amount; it never deserialises an output, so it cannot see a value, let alone a small one.
+///
+/// **`>=`, NOT `>`.** Every floor in this codebase is written as `k · (rung) + dust`, so the honest
+/// MINIMUM of every shape lands on EXACTLY [`mercurylib::tesr::DUST_LIMIT`] — a plain child at
+/// `min_child_value` (1 310 → 820 → **330**), a spine tip at `min_spine_tip_value` (820 → **330**), a
+/// plain root ladder at `3·rung + dust` (1 800 → 1 310 → 820 → **330**), a coloured ladder at
+/// [`colored_ladder_floor`] (2 058 → 1 482 → 906 → **330**). A `>` here refuses every minimum-sized
+/// leg in the system — the same wrong-constant-as-ceiling class this file has already paid for. Each
+/// of those four boundaries is pinned as an ACCEPTANCE in `dust_poisoned_tier_attack_tests`.
+///
+/// **THE FILTER IS THE EXISTING ONE, and that is load-bearing in both directions.** Exactly two
+/// outputs are exempt, by exact script content rather than by heuristic:
+///
+/// * the P2A anchor — a 4-byte `OP_1 <0x4e73>` output whose own standardness threshold is 240, which
+///   is why [`mercurylib::tesr::P2A_VALUE`] is 240 and not 330;
+/// * the RGB `opret` commitment — provably unspendable, hence exempt from dust rules entirely, and it
+///   carries value **0**. A check that did not exempt it would refuse the ENTIRE coloured lane.
+///
+/// **THE EXEMPTION IS A HOLE UNLESS THE EXEMPT KINDS ARE THEMSELVES BOUND, AND THIS FUNCTION DOES NOT
+/// BIND THEM.** An earlier version of this paragraph argued the waiver could not be abused, on the
+/// grounds that a second P2A "leaves the Σ set, so the conservation check refuses the shortfall" and a
+/// second opret "is refused by `verify_colored_shape`". Both halves were wrong, and both were wrong in
+/// the same way — they described a FUNDED, WATCHED output:
+///
+/// * the Σ argument holds only for a second anchor that carries value. A **zero-value** one takes
+///   nothing out of Σ, and the payload COUNT never counted it either (the filter removes it by
+///   script), so it passed every law in the file. Nothing bound the lone anchor's value to
+///   `P2A_VALUE` either, so a 1-sat anchor — non-standard on its own account — passed too.
+/// * the `verify_colored_shape` argument holds only where a colour-shape check runs: the root
+///   ladder's `exit_tiers()` and the two child tiers. It does NOT run over `cb.ancestors[i]
+///   .extension` / `.state` or over a spine tip's cap, and those lanes counted no oprets at all.
+///
+/// Both are now BOUND rather than argued, by [`bind_single_p2a_anchor`] (all six lanes) and
+/// [`bind_opret_count`] (the three lanes no colour check reaches). Every attack shape above is pinned
+/// in `exemption_binding_attack_tests`, each of which was ACCEPTED before those two were added. What
+/// this function guarantees on its own is therefore exactly: *no output outside the two exempt kinds
+/// carries less than `DUST_LIMIT`* — and nothing about the exempt kinds themselves.
+///
+/// **ORDERING.** This is a relay-standardness law, not a conservation law: it ranges over the whole
+/// filtered output set, derived from scriptPubKey content, and never reads the sender-declared
+/// `payload_vout` — so there is no index to pin and `mod linked`'s ceremony does not apply to it. It
+/// must still run AFTER the structural pass and after the Σ / count laws of the same tier, or it
+/// shadows their far more specific diagnostics with a generic value message. See the call sites.
+fn refuse_dust_payloads(tx: &electrum_client::bitcoin::Transaction, what: &str) -> Result<()> {
+    for (vout, o) in tx.output.iter().enumerate() {
+        if o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES
+            || o.script_pubkey.is_op_return()
+        {
+            continue;
+        }
+        if o.value < mercurylib::tesr::DUST_LIMIT {
+            return Err(anyhow::anyhow!(
+                "{what}: payload output {vout} carries {} sat, under the {}-sat spendable floor — \
+                 the tier is non-standard, so it never relays and never confirms, and every leg \
+                 hanging off it is unreachable while its receiver is credited the funding value",
+                o.value,
+                mercurylib::tesr::DUST_LIMIT
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// **[ANCHOR] EXACTLY ONE P2A OUTPUT, CARRYING EXACTLY [`mercurylib::tesr::P2A_VALUE`].**
+///
+/// The P2A anchor is the first of `refuse_dust_payloads`' two exemptions, and an exemption is a
+/// sender-controlled dimension unless the exempt kind is pinned. Before this, NOTHING in the file
+/// looked at an anchor except to filter it out:
+///
+/// * every Σ law is written `filter(script != P2A && !is_op_return).map(value).sum()`, so an anchor
+///   contributes nothing to a sum — a SECOND anchor worth **0** is therefore Σ-neutral, not
+///   Σ-reducing, and the conservation check that was supposed to catch it never sees it;
+/// * every payload-COUNT law uses the same filter, so a second anchor is not counted either;
+/// * `refuse_dust_payloads` waives it by name, which is precisely the waiver being abused.
+///
+/// So a sender could append any number of zero-value anchors, or starve the one real anchor down to
+/// 1 sat. `P2A_VALUE` is 240 because that is the anchor's OWN standardness threshold, so a starved
+/// anchor is the dust defect wearing the exemption: the tier does not relay, and being pre-signed and
+/// un-broadcast it can never be repaired. And every rung in this file is priced
+/// `committed_fee(rate) + P2A_VALUE`, so an anchor that is not `P2A_VALUE` also means the tier's real
+/// fee is not the committed one — the number every downstream `tier_out_value` was computed from.
+///
+/// **This is a shape law, not a value law, and it does not settle relay policy.** Whether a given
+/// shape is non-standard under some particular Bitcoin Core release is not the question and is not
+/// asked here: the verifier must not leave a dimension the sender controls and no law weighs. The
+/// binding is one comparison per tier.
+///
+/// **ORDERING.** Same rule as `refuse_dust_payloads`, and for the same reason: derived from
+/// scriptPubKey content, never from the declared `payload_vout`, so there is no index to pin — but it
+/// must still run AFTER the structural pass and after the Σ / count laws of the same tier, or it
+/// shadows their far more specific diagnostics. Every call site places it immediately after the dust
+/// floor, so a tier that is both poisoned and mis-anchored refuses on the poison first.
+fn bind_single_p2a_anchor(tx: &electrum_client::bitcoin::Transaction, what: &str) -> Result<()> {
+    let anchors: Vec<&electrum_client::bitcoin::TxOut> = tx
+        .output
+        .iter()
+        .filter(|o| o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES)
+        .collect();
+    if anchors.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "{what}: carries {} P2A anchor output(s), expected exactly 1 — every Σ and payload-count \
+             law in this file removes P2A outputs BY SCRIPT, so a surplus anchor is weighed by \
+             nothing at all; a zero-value one is invisible to the conservation sum and to the dust \
+             floor alike",
+            anchors.len()
+        ));
+    }
+    if anchors[0].value != mercurylib::tesr::P2A_VALUE {
+        return Err(anyhow::anyhow!(
+            "{what}: its P2A anchor carries {} sat, not the committed {} — {} is the anchor's own \
+             standardness threshold, so a starved anchor makes the tier non-standard exactly as a \
+             sub-dust payload does, and every rung of this ladder was priced as committed_fee + {}",
+            anchors[0].value,
+            mercurylib::tesr::P2A_VALUE,
+            mercurylib::tesr::P2A_VALUE,
+            mercurylib::tesr::P2A_VALUE
+        ));
+    }
+    Ok(())
+}
+
+/// **[OPRET] THE OPRET COUNT, ON THE LANES NO COLOUR-SHAPE CHECK REACHES.**
+///
+/// The second of `refuse_dust_payloads`' exemptions. `verify_colored_shape` binds the count to
+/// `is_colored() as usize` over `bundle.exit_tiers()`, and `verify_colored_child_shape` does the same
+/// for `child_extension` and `child_state` — but between them sits `cb.ancestors[i].extension` /
+/// `.state`, walked entirely inline in `verify_child_bundle`, and the spine tip's `cap`, walked in
+/// `SpineTipBundle::validate`. Neither walk counted an `OP_RETURN`, so on those tiers the exemption
+/// was unconditional: an appended opret is value-0 (Σ-neutral), removed by every payload filter, and
+/// waived by the dust floor.
+///
+/// `expected` is derived from the record's own colour, never declared per-tier: a PLAIN record's tier
+/// carries **0**, a COLOURED one carries exactly **1** (the RGB commitment). That is the same law the
+/// two colour-shape functions apply, written once so the lanes cannot drift apart — an ancestor tier
+/// carrying a second commitment would make the receiver's seal derivation ambiguous in exactly the
+/// way `verify_colored_shape`'s `(true, n)` arm exists to prevent.
+fn bind_opret_count(
+    tx: &electrum_client::bitcoin::Transaction,
+    what: &str,
+    expected: usize,
+) -> Result<()> {
+    let found = tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count();
+    if found != expected {
+        return Err(anyhow::anyhow!(
+            "{what}: carries {found} OP_RETURN output(s), expected exactly {expected} for a {} tier \
+             — an opret is exempt from the dust floor and removed from every payload sum and count \
+             by script, so a surplus one is a sender-controlled output no law weighs, and on a \
+             coloured record it makes the seal schedule ambiguous",
+            if expected == 0 { "PLAIN" } else { "COLOURED" }
+        ));
+    }
+    Ok(())
+}
+
 /// `f_onchain` — **the value of the on-chain funding output `F`, as the CALLER read it from the
 /// chain**, and the one term in this function that cannot be derived from the bundle. It is an
 /// `Option` on purpose, and the purpose is honesty rather than convenience:
@@ -7342,6 +8396,38 @@ fn verify_bundle_ex(
                 ));
             }
         }
+    }
+
+    // ═══ [DUST] NO TIER MAY CARRY AN UNSPENDABLE LEG ═══
+    //
+    // See `refuse_dust_payloads` for the law and why the two exemptions are exactly right. Two things
+    // about its PLACEMENT here are deliberate and neither is cosmetic:
+    //
+    // (1) IT RUNS AFTER THE Σ AND COUNT LAWS ABOVE, and existing tests depend on that.
+    //     `skim_root_attack_tests::Tamper::Extra` appends a 100-sat output; it is refused today by the
+    //     Σ check with `assert_conservation_refusal`, and both `an_extra_output_on_the_extension_is_
+    //     refused` and `an_extra_output_on_the_owner_state_is_refused` assert that exact message. A
+    //     dust check placed ABOVE Σ would refuse them on dust instead and break both — the specific
+    //     diagnostic must come first, which is the same rule `mod linked` enforces for the structural
+    //     pass.
+    //
+    // (2) IT IS ITS OWN LOOP, NOT A LINE IN THE ONE ABOVE. That loop does `match f_onchain { Some(v)
+    //     => v, None => continue }` at `i == 0`, and `verify_bundle` — the UNBOUND entry point —
+    //     passes `None`. A dust check folded into it would therefore be SILENTLY SKIPPED FOR THE
+    //     TRIGGER on exactly the path that has no other tier-0 check at all (no Σ, no count). The dust
+    //     law has no funding-provenance dependency, so it must not inherit that `continue`. Pinned by
+    //     `a_zero_value_output_on_the_trigger_is_refused_on_the_unbound_entry_point_too`.
+    //
+    // [ANCHOR] rides in the same loop and for the same reasons — no funding-provenance dependency, so
+    // it must not inherit the `continue` either, and the trigger is the tier the unbound entry point
+    // leaves entirely unchecked. It runs AFTER the dust floor so a tier that is both poisoned and
+    // mis-anchored keeps the poison diagnostic. The OPRET count is NOT bound here: `verify_colored_
+    // shape` already binds it over exactly these tiers, at the top of this function, and a second
+    // check would only ever shadow its far more specific colour message.
+    for i in 0..txs.len() {
+        let what = if i == 0 { "the trigger".to_string() } else { format!("tier {i}") };
+        refuse_dust_payloads(&txs[i], &what)?;
+        bind_single_p2a_anchor(&txs[i], &what)?;
     }
 
     // ---- Superseded tiers: PARSE + LADDER-LINK + SIGNATURE-VERIFY before they may be counted [S1].
@@ -7821,6 +8907,22 @@ pub fn verify_child_bundle(
                     ));
                 }
             }
+            // [DUST] …and no leg of it may be unspendable. AFTER the Σ law above, per
+            // `refuse_dust_payloads`. This lane has a Σ check and NO payload-count check, so the
+            // `(expected − 1, 1)` shape satisfies everything above it exactly.
+            refuse_dust_payloads(&ext_tx, &format!("ancestor {i} extension"))?;
+            // [ANCHOR] + [OPRET] The exempt kinds, bound. This is one of the two lanes the ancestor
+            // OPRET GAP lived on: `verify_colored_shape` walks `cb.parent.exit_tiers()` and
+            // `verify_colored_child_shape` walks the two CHILD tiers — nothing between them ever
+            // counted an `OP_RETURN` on an intermediate segment, so the dust floor's opret waiver was
+            // unconditional here. Colour is the PARENT segment's (the whole record is one colour;
+            // `verify_colored_child_shape` enforces that biconditional).
+            bind_single_p2a_anchor(&ext_tx, &format!("ancestor {i} extension"))?;
+            bind_opret_count(
+                &ext_tx,
+                &format!("ancestor {i} extension"),
+                cb.parent.is_colored() as usize,
+            )?;
             ext_parsed = Some((ext_tx, ext.payload_vout, ext0_value));
         }
         // THE OUTPOINT THE LONE/FINAL TIER MUST RE-ANCHOR ON, and the prevout amount its co-sign is
@@ -7905,6 +9007,18 @@ pub fn verify_child_bundle(
                 Some(csv),
             )?;
         }
+        // [DUST] The intermediate spine `SP` — the tier that hosts the level below. It is the ONE
+        // tier in the whole structure with neither a Σ-payload law nor a payload-count law (its
+        // sibling one block up has both), so `out[j]` is read straight into the leaf's arithmetic
+        // while nothing at all constrains what its OTHER outputs carry. One 1-sat slot here strands
+        // every child of this level. Placed after the structural pass and the CSV band, per
+        // `refuse_dust_payloads`.
+        refuse_dust_payloads(&st_tx, &format!("ancestor {i} state"))?;
+        // [ANCHOR] + [OPRET] The other half of the ancestor gap, on the tier that has no Σ law and no
+        // payload-count law either — so before these two lines an intermediate `SP` could carry any
+        // number of zero-value anchors and oprets, all of them removed by every filter in the file.
+        bind_single_p2a_anchor(&st_tx, &format!("ancestor {i} state"))?;
+        bind_opret_count(&st_tx, &format!("ancestor {i} state"), cb.parent.is_colored() as usize)?;
         // Superseded battery + exact-equality census for this segment (same shared logic as everywhere).
         let seg_superseded_ok = {
             let mut prevouts: std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64> = std::collections::HashMap::new();
@@ -8143,6 +9257,16 @@ pub fn verify_child_bundle(
             sp_out.value
         ));
     }
+    // [DUST] AFTER the Σ law, BEFORE the per-output one is immaterial to correctness but this order
+    // keeps the more specific skim diagnostic first on a tier that is both skimmed and poisoned. The
+    // shape that survives every law on this lane is a ZERO-VALUE appended output: Σ-neutral by
+    // construction, and `out[payload_vout]` is left exactly right.
+    refuse_dust_payloads(&ext_tx, "child extension")?;
+    // [ANCHOR] The anchor bound on this lane too. The OPRET count is NOT bound here: check [7] at the
+    // end of this function runs `verify_colored_child_shape`, which counts oprets on exactly this tier
+    // against the child's own colour, and duplicating it above would shadow its colour-mismatch
+    // diagnostic — the more specific of the two — on every mis-declared bundle.
+    bind_single_p2a_anchor(&ext_tx, "child extension")?;
     if ext_out0.value() != expect_ext {
         return Err(anyhow::anyhow!(
             "child extension is funded with {} sat but forwards only {} to its payload output \
@@ -8278,6 +9402,13 @@ pub fn verify_child_bundle(
             ext_out0.value()
         ));
     }
+    // [DUST] The last tier before the money is the receiver's. Two shapes reach here past everything
+    // above: a zero-value appended output (Σ-neutral), and — with no attacker at all — a child whose
+    // slot was below `min_child_value`, whose honest final leg is then simply too small to relay.
+    refuse_dust_payloads(&st_tx, "child state")?;
+    // [ANCHOR] Same on the last tier before the money is the receiver's. Opret count again left to
+    // check [7]'s `verify_colored_child_shape`, which already binds it for this tier.
+    bind_single_p2a_anchor(&st_tx, "child state")?;
 
     // [6 cont.] CHILD SUPERSEDED SEGMENT. A child that has been RE-TRANSFERRED discloses the states it
     // replaced (one per hop), each of which consumed a real co-sign and so must be counted — but only
@@ -10300,6 +11431,10 @@ mod spine_tip_tests {
             pending_extension: None,
             pending_state: None,
             role,
+            recipient_address: None,
+            conveyance: ConveyanceStage::Pending,
+            conveyance_x1: None,
+            latch_batch_id: None,
         };
         let mut rec = SplitJournalRecord {
             op_id: "in_ladder_split:sid:sp".into(),
@@ -10571,6 +11706,10 @@ mod spine_tip_tests {
             pending_extension: None,
             pending_state: None,
             role,
+            recipient_address: None,
+            conveyance: ConveyanceStage::Pending,
+            conveyance_x1: None,
+            latch_batch_id: None,
         };
         let mut rec = SplitJournalRecord {
             op_id: format!("spine_batch:{}:{}", tip.statechain_id, sp2.txid),
@@ -10764,6 +11903,362 @@ mod spine_tip_tests {
             journalled < terminalized,
             "the co-signature is unregenerable, so the record that describes it is on disk first"
         );
+    }
+
+    /// **[K > 1] ONE `SP` CARRIES K PAYEE PIECES AND ONE TIP, AND THE K PIECES ARE INDEPENDENT.**
+    ///
+    /// The widening itself is arithmetic — `build_split_state_from` and `committed_fee_for_outputs`
+    /// were already N-ary. What is NOT arithmetic, and what this pins, is that the K pieces are
+    /// **independent coins** rather than K names for one. At K = 1 every "is leg *j* wired to leg
+    /// *j*'s outpoint" question has a single trivially-correct answer; at K = 3 a builder that
+    /// hard-codes `payload_vout`, or reuses a value, or hangs two pieces off one output, produces a
+    /// record that still validates, still persists, and still conveys — and the discovery comes from
+    /// a payee's verifier, after the tip is terminal and no signature can be re-issued.
+    ///
+    /// So the assertions below are all of the form "leg *j* names leg *j*'s outpoint and nothing
+    /// else", and every one of them is read off a TRANSACTION rather than a serde field.
+    ///
+    /// Reach, stated up front: co-signing needs an SE, so this reproduces the tier arithmetic of
+    /// `spine_batch_split` over a REAL `SP` and hands the result to the real
+    /// [`SplitJournalRecord::validate_plan`], the real [`SplitJournalRecord::legs`], the real
+    /// [`SpineTipBundle::validate`] and the real [`child_exit_chain_bound`]. The sibling test above
+    /// pins the producer to those same functions by source scan; this one pins what they must produce
+    /// once K stops being 1.
+    #[test]
+    fn a_three_payee_batch_carves_three_independent_pieces_and_one_tip() {
+        use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+        const K: usize = 3;
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let rate = p.committed_fee_rate;
+        let parse = |hex_str: &str| -> Transaction {
+            deserialize(&hex::decode(hex_str).unwrap()).unwrap()
+        };
+
+        // ── THE BATCH: `SP` over the tip's own funding outpoint, K + 1 payload outputs ────────────
+        let tip = sample_valid_tip();
+        tip.validate().expect("the tip must validate, or nothing below is evidence");
+        let (fund_txid, fund_vout) = tip.funding_outpoint();
+
+        let total = mercurylib::tesr::tier_out_total(tip.sp_out_value, K + 1, rate)
+            .expect("the sample tip affords a 4-payload batch");
+        // DISTINCT values, deliberately: identical legs would let a swap pass every assertion below.
+        let piece_vals = [total / 6, total / 6 + 1, total / 6 + 2];
+        let change = total - piece_vals.iter().sum::<u64>();
+        let payees: Vec<(String, u64)> = piece_vals
+            .iter()
+            .map(|v| (AGG.to_string(), *v))
+            .chain(std::iter::once((AGG.to_string(), change)))
+            .collect();
+        let sp = mercurylib::tesr::build_split_state_from(
+            &fund_txid,
+            fund_vout,
+            tip.sp_out_value,
+            &payees,
+            "regtest",
+            SPINE_CSV,
+            rate,
+        )
+        .expect("a K = 3 batch is one split state with four payload outputs");
+        let v0 = sp.payload_vout;
+        let k_vout = v0 + K as u32;
+
+        // ── (a) `SP` REALLY CARRIES K + 1 PAYLOADS, CONTIGUOUS, EACH AT ITS DECLARED VALUE ───────
+        let sp_tx = parse(&sp.tx_hex);
+        assert_eq!(sp_tx.input.len(), 1, "a split state spends exactly its funding outpoint");
+        assert_eq!(sp_tx.input[0].previous_output.txid.to_string(), fund_txid);
+        assert_eq!(sp_tx.input[0].previous_output.vout, fund_vout);
+        assert_eq!(
+            sp_tx.input[0].sequence.0 as u16, SPINE_CSV,
+            "`SP_{{i+1}}` sits at the spine CSV — read off the nSequence the sighash commits to"
+        );
+        assert_eq!(
+            sp_tx.output.len(),
+            K + 2,
+            "K payee pieces + the tip + the P2A anchor, and nothing else"
+        );
+        for (j, (_, want)) in payees.iter().enumerate() {
+            assert_eq!(
+                sp_tx.output[(v0 + j as u32) as usize].value,
+                *want,
+                "leg {j} must be funded at its own declared value"
+            );
+        }
+        assert_eq!(
+            sp_tx.output[..=k_vout as usize].iter().map(|o| o.value).sum::<u64>(),
+            total,
+            "value is conserved across the widened carve: Σ payloads == tier_out_total(source, K+1)"
+        );
+        // The extra payload really is 43 vB on the shared tier and not a whole new SP: the K = 3 fee
+        // exceeds the K = 1 fee by exactly two P2TR outputs' worth, priced by the shipping function.
+        assert_eq!(
+            mercurylib::tesr::committed_fee_for_outputs(K + 1, rate)
+                - mercurylib::tesr::committed_fee_for_outputs(2, rate),
+            (((K as u64 - 1) * mercurylib::tesr::P2TR_OUT_VBYTES) as f64 * rate).ceil() as u64,
+            "going from K = 1 to K = 3 costs two extra P2TR outputs on the SHARED tier — not two \
+             more 125-vB split states, which is the whole economic point of widening K"
+        );
+
+        // ── THE JOURNAL: K + 1 legs, exactly one tip, and it is LAST ─────────────────────────────
+        let spine_seg = spine_segment(
+            &tip,
+            TesrTier {
+                txid: sp.txid.clone(),
+                signed_tx: sp.tx_hex.clone(),
+                out_value: total,
+                csv: Some(SPINE_CSV),
+                payload_vout: v0,
+            },
+        );
+        let leg = |sid: &str, value: u64, sp_vout: u32, role: SplitLegRole| SplitJournalChild {
+            statechain_id: sid.into(),
+            owner_exit_address: OWNER.into(),
+            value,
+            sp_vout,
+            extension: None,
+            state: None,
+            rgb: None,
+            pending_extension: None,
+            pending_state: None,
+            role,
+            recipient_address: None,
+            conveyance: ConveyanceStage::Pending,
+            conveyance_x1: None,
+            latch_batch_id: None,
+        };
+        let mut rec = SplitJournalRecord {
+            op_id: format!("spine_batch:{}:{}", tip.statechain_id, sp.txid),
+            lane: "spine_batch".into(),
+            stage: SplitStage::Signed,
+            terminalized_statechain_id: tip.statechain_id.clone(),
+            parent_statechain_id: tip.parent_statechain_id.clone(),
+            parent: tip.parent.clone(),
+            ancestors: vec![spine_seg.clone()],
+            parent_flat_backups: vec![],
+            children: (0..K)
+                .map(|j| leg(&format!("piece{j}"), piece_vals[j], v0 + j as u32, SplitLegRole::Piece))
+                .chain(std::iter::once(leg("tip2", change, k_vout, SplitLegRole::SpineTip)))
+                .collect(),
+            child_ext_csv: p.ext_csv(0),
+            child_state_csv: p.state_csv(0),
+            fee_rate: rate,
+            network: "regtest".into(),
+            sp_txid: sp.txid.clone(),
+        };
+        // [K>1 prerequisite 1] The plan the builder would write, checked by the shipping validator.
+        rec.validate_plan(K + 1, v0, total, ChangeLeg::LastIsTip)
+            .expect("a K = 3 plan with the tip last is exactly what the builder carves");
+        // Kept for section (f): `validate_plan` runs BEFORE any tier exists (it refuses a "plan"
+        // that already carries a co-signed tier), so the mis-shapes must be mutated from the
+        // plan-stage record, not from the finished one.
+        let plan = rec.clone();
+
+        // ── EACH LEG'S OWN TIERS, off ITS OWN payload output ─────────────────────────────────────
+        for j in 0..K {
+            let px = mercurylib::tesr::build_extension_from(
+                &rec.sp_txid,
+                rec.children[j].sp_vout,
+                rec.children[j].value,
+                AGG,
+                "regtest",
+                rec.child_ext_csv,
+                rec.fee_rate,
+            )
+            .unwrap();
+            let ps = mercurylib::tesr::build_state_from(
+                &px.txid,
+                px.payload_vout,
+                px.out_value,
+                OWNER,
+                "regtest",
+                rec.child_state_csv,
+                rec.fee_rate,
+            )
+            .unwrap();
+            rec.children[j].extension = Some(TesrTier {
+                txid: px.txid,
+                signed_tx: px.tx_hex,
+                out_value: px.out_value,
+                csv: Some(rec.child_ext_csv),
+                payload_vout: px.payload_vout,
+            });
+            rec.children[j].state = Some(TesrTier {
+                txid: ps.txid,
+                signed_tx: ps.tx_hex,
+                out_value: ps.out_value,
+                csv: Some(rec.child_state_csv),
+                payload_vout: ps.payload_vout,
+            });
+        }
+        let cap = mercurylib::tesr::build_state_from(
+            &rec.sp_txid, k_vout, change, OWNER, "regtest", rec.child_state_csv, rec.fee_rate,
+        )
+        .unwrap();
+        rec.children[K].state = Some(TesrTier {
+            txid: cap.txid.clone(),
+            signed_tx: cap.tx_hex,
+            out_value: cap.out_value,
+            csv: Some(rec.child_state_csv),
+            payload_vout: cap.payload_vout,
+        });
+
+        let legs = rec.legs().expect("all four legs of a K = 3 batch are complete");
+        assert_eq!(legs.len(), K + 1);
+        let pieces: Vec<ChildTesrBundle> = legs[..K]
+            .iter()
+            .map(|l| match l {
+                SplitLeg::Piece(cb) => cb.clone(),
+                SplitLeg::Tip(_) => panic!("legs 0..K are the payees' pieces"),
+            })
+            .collect();
+        let next_tip = match &legs[K] {
+            SplitLeg::Tip(t) => t.clone(),
+            SplitLeg::Piece(_) => panic!("the CHANGE leg of a batch must come back as a spine tip"),
+        };
+
+        // ── (b) THE TIP KEEPS ITS ONE CAP, AT `state_csv(0)`, OVER `SP.out[K]` ───────────────────
+        next_tip.validate().expect("the batch's own change must satisfy `persist_spine_tip`");
+        let cap_tx = parse(&next_tip.cap.signed_tx);
+        assert_eq!(
+            cap_tx.input[0].sequence.0 as u16,
+            p.state_csv(0),
+            "off the SIGNATURE: the cap is at `state_csv(0)`, never at the spine CSV"
+        );
+        assert_ne!(
+            cap_tx.input[0].sequence.0 as u16,
+            SPINE_CSV,
+            "a cap at the spine CSV ties with every future `SP` and `cap_csv <= SPINE_CSV` would \
+             then refuse the next batch — stranding the tip"
+        );
+        assert_eq!(cap_tx.input[0].previous_output.txid.to_string(), sp.txid);
+        assert_eq!(
+            cap_tx.input[0].previous_output.vout, k_vout,
+            "the tip is the LAST payload output — out[K], never out[0], which is a PAYEE's slot"
+        );
+        assert_eq!((next_tip.sp_vout, next_tip.sp_out_value), (k_vout, change));
+
+        // ── (c) THE K PIECES ARE INDEPENDENT — each wired to ITS OWN payload output ──────────────
+        let mut seen_outpoints = std::collections::HashSet::new();
+        for (j, piece) in pieces.iter().enumerate() {
+            assert_eq!(
+                piece.funding_outpoint(),
+                (sp.txid.clone(), v0 + j as u32),
+                "piece {j} must hang off `SP.out[{}]`",
+                v0 + j as u32
+            );
+            assert!(
+                seen_outpoints.insert(piece.funding_outpoint()),
+                "two pieces share a funding outpoint — one of them can never be spent"
+            );
+            // Its extension spends THAT output, and its state spends its own extension. Both read
+            // off the transactions, which is what the SE's sighash actually commits to.
+            let ext_tx = parse(&piece.child_extension.signed_tx);
+            assert_eq!(ext_tx.input[0].previous_output.txid.to_string(), sp.txid);
+            assert_eq!(
+                ext_tx.input[0].previous_output.vout,
+                v0 + j as u32,
+                "piece {j}'s extension must spend piece {j}'s output, not a sibling's"
+            );
+            assert_eq!(ext_tx.input[0].sequence.0 as u16, p.ext_csv(0));
+            let st_tx = parse(&piece.child_state.signed_tx);
+            assert_eq!(
+                st_tx.input[0].previous_output.txid,
+                ext_tx.txid(),
+                "piece {j}'s state must spend piece {j}'s OWN extension"
+            );
+            assert_eq!(st_tx.input[0].sequence.0 as u16, p.state_csv(0));
+            // …and the piece is worth what the plan said, off the transaction.
+            assert_eq!(sp_tx.output[(v0 + j as u32) as usize].value, piece_vals[j]);
+        }
+        assert!(
+            !seen_outpoints.contains(&(sp.txid.clone(), k_vout)),
+            "no payee's piece may be wired to the sender's own change output"
+        );
+
+        // ── (d) EACH PIECE'S EXIT CHAIN IS INTACT, AND SHARED ONLY DOWN TO THE SPINE ─────────────
+        // Every timelock read from the SIGNED transaction and cross-checked against the declared
+        // field — `child_exit_chain_bound` is the admission-grade accessor.
+        let chains: Vec<Vec<(String, Option<u16>)>> = pieces
+            .iter()
+            .map(|piece| {
+                child_exit_chain_bound(piece)
+                    .unwrap_or_else(|e| panic!("a piece's exit chain must bind: {e}"))
+            })
+            .collect();
+        let want_len = pieces[0].parent.exit_tiers().len() + 1 + 2;
+        for (j, chain) in chains.iter().enumerate() {
+            assert_eq!(
+                chain.len(),
+                want_len,
+                "piece {j}: T, X_m, SP_1 | SP_2 (ONE spine tier) | ext_child, state_child"
+            );
+            assert_eq!(chain.last().unwrap().1, Some(p.state_csv(0)));
+        }
+        // The shared prefix is exactly the ancestors: the parent's tiers plus the ONE spine tier.
+        // Everything below it must be disjoint, or two payees are spending the same coin.
+        let shared = want_len - 2;
+        for j in 0..K {
+            for i in 0..j {
+                assert_eq!(
+                    chains[i][..shared],
+                    chains[j][..shared],
+                    "pieces {i} and {j} descend from the same parent and the same spine level"
+                );
+                assert_ne!(
+                    chains[i][shared..],
+                    chains[j][shared..],
+                    "pieces {i} and {j} must own SEPARATE tiers below the spine"
+                );
+            }
+        }
+        // The pieces' own tier txids are all distinct — K names, K coins.
+        let leaf_txids: std::collections::HashSet<String> = pieces
+            .iter()
+            .flat_map(|c| [c.child_extension.txid.clone(), c.child_state.txid.clone()])
+            .collect();
+        assert_eq!(leaf_txids.len(), 2 * K, "K pieces own 2K distinct tiers");
+
+        // ── (e) THE CENSUS IS K-INVARIANT ───────────────────────────────────────────────────────
+        // Widening K adds payload OUTPUTS to one `SP`, not tiers to the spine — so every piece of a
+        // K = 3 batch balances the same census as the single piece of a K = 1 batch. If this ever
+        // moved with K, no receiver could adopt a batched piece at all.
+        for piece in pieces.iter() {
+            assert_eq!(piece.ancestors.len(), 1);
+            let seg = &piece.ancestors[0];
+            assert!(seg.extension.is_none(), "a spine level is ONE tier");
+            assert!(seg.superseded_extensions.is_empty(), "the dead knob stays empty");
+            assert_eq!(
+                CHILD_V2_BASELINE
+                    + 1
+                    + u32::from(seg.extension.is_some())
+                    + seg.superseded_states.len() as u32,
+                2,
+                "1 live (SP_2) + 1 superseded (C_1), regardless of K"
+            );
+        }
+
+        // ── (f) THE PLAN VALIDATOR REFUSES THE K > 1 MIS-SHAPES ─────────────────────────────────
+        // None of these is expressible at K = 1, which is why they are checked here.
+        let mut middle_tip = plan.clone();
+        middle_tip.children[1].role = SplitLegRole::SpineTip;
+        middle_tip.children[K].role = SplitLegRole::Piece;
+        let e = middle_tip
+            .validate_plan(K + 1, v0, total, ChangeLeg::LastIsTip)
+            .expect_err("a tip anywhere but last sends a payee's piece to the tip builder");
+        assert!(e.to_string().contains("spine tip must be at leg(s)"), "{e}");
+
+        let mut collided = plan.clone();
+        collided.children[2].sp_vout = collided.children[1].sp_vout;
+        let e = collided
+            .validate_plan(K + 1, v0, total, ChangeLeg::LastIsTip)
+            .expect_err("two legs over one output is a replay that rebuilds the wrong coin");
+        assert!(e.to_string().contains("funds it at"), "{e}");
+
+        let mut short = plan.clone();
+        short.children.truncate(K);
+        let e = short
+            .validate_plan(K + 1, v0, total, ChangeLeg::LastIsTip)
+            .expect_err("a plan one leg short of the carve cannot rebuild what it protects");
+        assert!(e.to_string().contains("leg(s) but the split carves"), "{e}");
     }
 
     /// **[CATS spine batch / P0-2] A SPINE LEVEL COSTS ONE TIER, AND THE CAP CHARGES IT.**
@@ -11003,6 +12498,10 @@ mod split_journal_tests {
                     pending_extension: None,
                     pending_state: None,
                     role: SplitLegRole::Piece,
+                    recipient_address: None,
+                    conveyance: ConveyanceStage::Pending,
+                    conveyance_x1: None,
+                    latch_batch_id: None,
                 },
                 SplitJournalChild {
                     statechain_id: "change".into(),
@@ -11015,6 +12514,10 @@ mod split_journal_tests {
                     pending_extension: None,
                     pending_state: None,
                     role: SplitLegRole::Piece,
+                    recipient_address: None,
+                    conveyance: ConveyanceStage::Pending,
+                    conveyance_x1: None,
+                    latch_batch_id: None,
                 },
             ],
             child_ext_csv: p.ext_csv(0),
@@ -11178,6 +12681,340 @@ mod split_journal_tests {
         let back: ChildSegment =
             serde_json::from_str(&serde_json::to_string(&two_tier).unwrap()).unwrap();
         assert_eq!(back.extension.as_ref().unwrap().txid, "x");
+    }
+
+    // =============================================================================================
+    // [K > 1 PREREQUISITE 1] THE CARVE IS JOURNALLED PER *TIER*, AND THE PLAN IS K-WIDE.
+    //
+    // The K = 1 case is proved live by `SDK_E2E=81` (a real SIGABRT, then a replay). What that test
+    // cannot show is that the same machinery is width-independent: the unrecoverable window of a
+    // K-leg carve is `2K + 2` SE round trips, so at K = 20 there are 8.6x more places for a crash to
+    // land and every one of them must leave a record that rebuilds exactly the coin that was
+    // consumed. These are the parts of that claim which hold with no SE and no database.
+    // =============================================================================================
+
+    const K: usize = 20;
+
+    /// A `Planned` record exactly as `in_ladder_split` writes one for a K-payee batch: K pieces at
+    /// `SP.out[0..K-1]`, the sender's tip at `SP.out[K]`, no tiers yet.
+    fn wide_plan(payload_vout0: u32) -> SplitJournalRecord {
+        let mut rec = record(SplitStage::Planned);
+        rec.children = (0..=K)
+            .map(|j| SplitJournalChild {
+                statechain_id: format!("leg{j}"),
+                owner_exit_address: format!("payee{j}"),
+                value: 10_000 + j as u64,
+                sp_vout: payload_vout0 + j as u32,
+                extension: None,
+                state: None,
+                rgb: None,
+                pending_extension: None,
+                pending_state: None,
+                role: if j == K { SplitLegRole::SpineTip } else { SplitLegRole::Piece },
+                recipient_address: if j == K { None } else { Some(format!("payee{j}")) },
+                conveyance: ConveyanceStage::Pending,
+                conveyance_x1: None,
+                latch_batch_id: None,
+            })
+            .collect();
+        rec
+    }
+
+    fn wide_total() -> u64 {
+        (0..=K).map(|j| 10_000 + j as u64).sum()
+    }
+
+    #[test]
+    fn a_k_wide_plan_is_accepted_at_both_payload_offsets() {
+        // Plain `SP` starts its payloads at 0; a coloured `SP` carries the opret at index 0 and
+        // shifts every leg by one. Both are legal shapes and the check must not hard-code either.
+        for v0 in [0u32, 1] {
+            wide_plan(v0)
+                .validate_plan(K + 1, v0, wide_total(), ChangeLeg::LastIsTip)
+                .unwrap_or_else(|e| panic!("payload_vout0={v0}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_plan_short_of_the_carve_is_refused() {
+        // The failure: `set_spend_budget` consumes the parent, then the loop carves 21 legs while
+        // the only durable description of them names 20. Leg 21 has no journal row, so a replay
+        // rebuilds 20 coins out of a parent that paid out 21 — and the 21st is simply gone.
+        let mut rec = wide_plan(0);
+        rec.children.pop();
+        let e = rec
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::LastIsTip)
+            .expect_err("a short plan must not reach set_spend_budget");
+        assert!(e.to_string().contains("describes 20 leg(s) but the split carves 21"), "got: {e}");
+    }
+
+    #[test]
+    fn a_leg_at_the_wrong_funding_output_is_refused() {
+        let mut rec = wide_plan(0);
+        rec.children[7].sp_vout = 9;
+        let e = rec
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::LastIsTip)
+            .expect_err("a leg pointed at another leg's outpoint must be refused");
+        assert!(e.to_string().contains("names funding output 9"), "got: {e}");
+        assert!(e.to_string().contains("another leg's outpoint"), "got: {e}");
+    }
+
+    #[test]
+    fn two_legs_sharing_a_slot_are_refused() {
+        // `resume_in_ladder_split` looks its coins up BY statechain id, so a duplicate makes one
+        // coin the answer to two different tier schedules — and the second schedule's co-signature
+        // pushes that slot's `num_sigs` past the receiver's exact-equality census.
+        let mut rec = wide_plan(0);
+        rec.children[11].statechain_id = rec.children[3].statechain_id.clone();
+        let e = rec
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::LastIsTip)
+            .expect_err("duplicate slots must be refused");
+        assert!(e.to_string().contains("appears on two legs"), "got: {e}");
+    }
+
+    #[test]
+    fn a_plan_whose_values_do_not_add_up_is_refused() {
+        let mut rec = wide_plan(0);
+        rec.children[2].value += 1;
+        let e = rec
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::LastIsTip)
+            .expect_err("value conservation is checked against what SP pays out");
+        assert!(e.to_string().contains("but `SP` pays out"), "got: {e}");
+    }
+
+    #[test]
+    fn the_tip_must_be_the_last_leg_and_only_when_declared() {
+        // Both directions matter, and they fail differently:
+        //   * a tip anywhere but last sends a PAYEE's leg to `establish_spine_tip_journalled`,
+        //     which builds ONE cap where the receiver's verifier requires two tiers;
+        //   * a tip on a `ChangeLeg::None` split is a leg with no payee at all.
+        let mut mid = wide_plan(0);
+        mid.children[K].role = SplitLegRole::Piece;
+        mid.children[4].role = SplitLegRole::SpineTip;
+        let e = mid
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::LastIsTip)
+            .expect_err("a tip that is not the last leg must be refused");
+        assert!(e.to_string().contains("[20]"), "expected the required index, got: {e}");
+        assert!(e.to_string().contains("[4]"), "expected the offending index, got: {e}");
+
+        let e = wide_plan(0)
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::None)
+            .expect_err("a ChangeLeg::None split has no tip");
+        assert!(e.to_string().contains("change_leg=None"), "got: {e}");
+    }
+
+    #[test]
+    fn a_plan_that_already_carries_a_tier_is_not_a_plan() {
+        // The `Planned` record is written BEFORE `set_spend_budget`. A tier in it means the record
+        // was assembled after signing had begun, i.e. the write-ahead ordering has been inverted and
+        // the guarantee it buys is gone.
+        let mut rec = wide_plan(0);
+        rec.children[0].state = Some(tier("s", 24));
+        let e = rec
+            .validate_plan(K + 1, 0, wide_total(), ChangeLeg::LastIsTip)
+            .expect_err("a pre-signed leg in a plan must be refused");
+        assert!(e.to_string().contains("the plan is not a plan"), "got: {e}");
+    }
+
+    #[test]
+    fn every_tier_of_a_k_wide_carve_is_journalled_separately() {
+        // PER TIER, NOT PER CHILD — the property `establish_child_journalled` relies on. Fill the
+        // record one tier at a time, exactly as the builder does, and assert the record refuses to
+        // rebuild until the LAST tier lands. `2K + 1` tiers here: two per piece, one for the tip.
+        let mut rec = wide_plan(0);
+        rec.stage = SplitStage::Signed;
+        let mut landed = 0usize;
+        for j in 0..K {
+            rec.children[j].extension = Some(tier(&format!("x{j}"), 12));
+            landed += 1;
+            assert!(rec.legs().is_err(), "half a ladder at leg {j} must not rebuild");
+            rec.children[j].state = Some(tier(&format!("s{j}"), 24));
+            landed += 1;
+        }
+        assert!(rec.legs().is_err(), "every piece is complete but the TIP's cap is still missing");
+        rec.children[K].state = Some(tier("cap", 24));
+        landed += 1;
+        assert_eq!(landed, 2 * K + 1, "the carve is 2K+1 co-signatures wide");
+
+        // …and now it rebuilds, index-stable: leg j is children[j], the tip is last and is a Tip.
+        let legs = rec.legs().expect("all tiers present");
+        assert_eq!(legs.len(), K + 1);
+        for (j, leg) in legs.iter().enumerate() {
+            match leg {
+                SplitLeg::Piece(cb) => {
+                    assert!(j < K, "only legs 0..K-1 are pieces");
+                    assert_eq!(cb.child_statechain_id, format!("leg{j}"));
+                    assert_eq!(cb.sp_vout, j as u32, "index-stable against the journal");
+                }
+                SplitLeg::Tip(t) => {
+                    assert_eq!(j, K, "the tip is the last leg");
+                    assert_eq!(t.statechain_id, format!("leg{K}"));
+                }
+            }
+        }
+    }
+
+    // =============================================================================================
+    // [K > 1 PREREQUISITE 2] RE-CONVEYANCE IS RESUMABLE FROM THE JOURNAL.
+    // =============================================================================================
+
+    /// A REAL statechain transfer address for the key numbered `n`, plus the Model-A payee it
+    /// reduces to. Built with the same two library functions the production path uses, so the test
+    /// cannot pass by agreeing with itself.
+    fn transfer_address(n: u8) -> (String, String) {
+        use electrum_client::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let mut user = [1u8; 32];
+        user[31] = n;
+        let mut auth = [2u8; 32];
+        auth[31] = n;
+        let pk = |b: [u8; 32]| {
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&b).unwrap())
+        };
+        let address = mercurylib::encode_sc_address(
+            &pk(user),
+            &pk(auth),
+            electrum_client::bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let payee = mercurylib::tesr::payee_address(&address, "regtest").unwrap();
+        (address, payee)
+    }
+
+    #[test]
+    fn the_recipient_of_every_piece_is_bound_to_the_leg_it_pays() {
+        // `resolve_conveyance_plan` is what makes a journalled address trustworthy on the recovery
+        // path. The state tier is co-signed to pay `owner_exit_address` and can never be changed, so
+        // an address that reduces to anything else would convey the bundle to a party who cannot
+        // spend what it pays.
+        let (addr_a, payee_a) = transfer_address(1);
+        let (addr_b, payee_b) = transfer_address(2);
+        let legs = vec![
+            ("a".to_string(), payee_a.clone(), SplitLegRole::Piece),
+            ("b".to_string(), payee_b.clone(), SplitLegRole::Piece),
+            ("tip".to_string(), "ours".to_string(), SplitLegRole::SpineTip),
+        ];
+        let ok = resolve_conveyance_plan(
+            &legs,
+            &[("b".into(), addr_b.clone()), ("a".into(), addr_a.clone())],
+            "regtest",
+        )
+        .expect("addresses that match their legs' payees");
+        // Returned in LEG order, not in the caller's order — the tip gets `None`.
+        assert_eq!(ok, vec![Some(addr_a.clone()), Some(addr_b.clone()), None]);
+
+        let e = resolve_conveyance_plan(&legs, &[("a".into(), addr_b.clone())], "regtest")
+            .expect_err("an address for the WRONG leg must be refused");
+        assert!(e.to_string().contains("cannot spend what it pays"), "got: {e}");
+
+        let e = resolve_conveyance_plan(&legs, &[("tip".into(), addr_a.clone())], "regtest")
+            .expect_err("the sender's own change is not conveyed to anyone");
+        assert!(e.to_string().contains("SPINE TIP"), "got: {e}");
+
+        let e = resolve_conveyance_plan(&legs, &[("typo".into(), addr_a.clone())], "regtest")
+            .expect_err("an address for a leg that does not exist must be refused, not dropped");
+        assert!(e.to_string().contains("not a leg of this split"), "got: {e}");
+
+        // A BARE bitcoin address passes the payee check by construction (`payee_address` returns a
+        // non-HRP address unchanged) and is useless to `convey_child_bundle`, which needs the auth
+        // key. It has to die HERE, not in the driver after the parent is terminal.
+        let bare = vec![("a".to_string(), payee_a.clone(), SplitLegRole::Piece)];
+        let e = resolve_conveyance_plan(&bare, &[("a".into(), payee_a.clone())], "regtest")
+            .expect_err("a plain bitcoin address cannot receive a hand-over");
+        assert!(e.to_string().contains("not a statechain transfer address"), "got: {e}");
+    }
+
+    #[test]
+    fn a_k_wide_batch_reports_exactly_the_legs_still_owed() {
+        // The defect: an interruption at recipient j used to leave j+1..K-1 with no address and no
+        // record, so the sender held slots whose final state pays someone else and had nothing to
+        // send. Now the journal answers "who is still owed" precisely.
+        let mut rec = wide_plan(0);
+        for j in 0..15 {
+            rec.children[j].conveyance = ConveyanceStage::Conveyed;
+        }
+        rec.children[15].conveyance = ConveyanceStage::Attempted;
+        rec.children[16].conveyance = ConveyanceStage::Stranded;
+
+        let owed: Vec<String> =
+            rec.outstanding_conveyances().into_iter().map(|(_, s)| s).collect();
+        assert_eq!(
+            owed,
+            (15..K).filter(|j| *j != 16).map(|j| format!("leg{j}")).collect::<Vec<_>>(),
+            "an `Attempted` leg is still owed; a `Stranded` one is not; the tip never was"
+        );
+        assert_eq!(
+            rec.stranded_conveyances().into_iter().map(|(_, s)| s).collect::<Vec<_>>(),
+            vec!["leg16".to_string()],
+            "stranded legs are reported apart — retrying them can never succeed"
+        );
+    }
+
+    #[test]
+    fn a_leg_with_no_journalled_address_is_never_offered_for_resumption() {
+        // Two shapes reach here: the sender's own tip, and any row written before the field existed
+        // (`#[serde(default)]` gives them `None` + `Pending`). Neither is a hand-over this wallet
+        // undertook, and offering them would make the resume driver invent a recipient.
+        let mut rec = wide_plan(0);
+        for c in rec.children.iter_mut() {
+            c.recipient_address = None;
+        }
+        assert!(rec.outstanding_conveyances().is_empty());
+        assert!(!rec.children[K].is_outstanding(), "the tip is not a hand-over");
+    }
+
+    #[test]
+    fn an_old_journal_row_deserialises_as_an_unconveyed_unaddressed_piece() {
+        // Forward compatibility, stated as a test: rows written before [K>1 prerequisite 2] carry
+        // none of the four new fields. They must come back as `Piece` + `Pending` + no address —
+        // which is exactly "a leg this driver knows nothing about", the fail-closed reading.
+        let old = r#"{
+            "statechain_id": "legacy",
+            "owner_exit_address": "bcrt1qpayee",
+            "value": 30000,
+            "sp_vout": 0,
+            "extension": null,
+            "state": null
+        }"#;
+        let c: SplitJournalChild = serde_json::from_str(old).expect("old rows must still parse");
+        assert_eq!(c.role, SplitLegRole::Piece);
+        assert_eq!(c.conveyance, ConveyanceStage::Pending);
+        assert!(c.recipient_address.is_none());
+        assert!(c.conveyance_x1.is_none());
+        assert!(!c.is_outstanding(), "no address ⟹ not resumable, and not silently retried");
+    }
+
+    #[test]
+    fn a_conveyance_outcome_is_complete_only_when_nothing_is_left() {
+        // `is_complete` gates `journal_commit`. Anything that lets it return true with a leg
+        // outstanding closes the record on a payee who was never paid.
+        let mut o = ConveyanceOutcome {
+            conveyed: vec!["a".into()],
+            already: vec!["b".into()],
+            ..Default::default()
+        };
+        assert!(o.is_complete());
+        o.failed.push(("c".into(), "timeout".into()));
+        assert!(!o.is_complete(), "a failed leg is resumable, not finished");
+        o.failed.clear();
+        o.stranded.push("d".into());
+        assert!(!o.is_complete(), "a stranded leg is the loudest possible incomplete");
+        o.stranded.clear();
+        o.unactionable.push(("e".into(), "no coin".into()));
+        assert!(!o.is_complete(), "a leg we could not act on is not a leg that landed");
+    }
+
+    #[test]
+    fn the_two_halves_of_a_handover_are_ordered_by_repeatability() {
+        // The whole design rests on this asymmetry, so it is asserted where it is stated rather
+        // than only in a comment: `transfer/sender` is once-per-(slot, auth key) and hands back the
+        // `x1` that `t1 = o1 + x1` needs; `transfer/update_msg` is an UPDATE on the row it created.
+        // A driver that journals the x1 between them therefore always has a repeatable re-entry.
+        assert!(is_transfer_already_open(
+            "status: 400 Bad Request, error: {\"message\":\"Transfer message already exists for \
+             this statechain_id and new_user_auth_key.\"}"
+        ));
+        assert!(!is_transfer_already_open("status: 503, error: upstream unavailable"));
     }
 }
 
@@ -11816,7 +13653,20 @@ mod skim_root_attack_tests {
     }
 
     /// What a skimming tier deigns to forward down the exit chain.
-    const TOKEN_FORWARD: u64 = 1_000;
+    ///
+    /// **Why this is `min_child_value(2.0, 330)` and not a round number.** It was 1 000, chosen only
+    /// to be visibly tiny beside `F_VALUE`. That made the WORST case — `Skim::TriggerShort`, where
+    /// two rungs still hang below the tampered tier — forward `1 000 − 2·490 = 20` sat to the owner's
+    /// final state, i.e. a ladder whose last output is under the dust relay floor. The receive-side
+    /// dust law now refuses such a bundle on every entry point INCLUDING the unbound one, which
+    /// collided with this module's closing assertion that `verify_bundle` stays honest about having
+    /// no anchor.
+    ///
+    /// Both laws are right; the FIXTURE was unbuildable. Sizing the forward at the smallest value
+    /// that can carry a ladder puts the owner's final state on exactly `DUST_LIMIT`, so the bundle is
+    /// relayable and the only thing wrong with it is the theft these tests are about. 1 310 out of
+    /// 200 000 is no less a skim than 1 000 was.
+    const TOKEN_FORWARD: u64 = 1_310;
     /// What the EXTRA-OUTPUT variant takes. It comes out of the committed fee rather than out of the
     /// payload, so the tier stays consensus-valid (outputs still below the input) and would really
     /// relay — which is what makes that variant worth refusing rather than shrugging at.
@@ -12094,8 +13944,8 @@ mod skim_root_attack_tests {
         let x: Transaction = parse(&b.levels[0].extension.signed_tx);
         assert_eq!(x.output.len(), 3, "payload + P2A anchor + the attacker's second output");
         assert_eq!(x.output[2].script_pubkey, rig.attacker.spk, "the skim pays the ATTACKER");
-        assert_eq!(b.levels[0].extension.out_value, TOKEN_FORWARD, "only 1 000 sat is forwarded");
-        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "…so the owner reaches 510");
+        assert_eq!(b.levels[0].extension.out_value, TOKEN_FORWARD, "only 1 310 sat is forwarded");
+        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "…so the owner reaches 820");
         assert_eq!(
             x.output[b.levels[0].extension.payload_vout as usize].value,
             b.levels[0].extension.out_value,
@@ -12238,8 +14088,8 @@ mod skim_root_attack_tests {
             "Σ over the payload outputs is EXACTLY what the law expects"
         );
         assert_eq!(x.output[2].script_pubkey, rig.attacker.spk);
-        assert_eq!(x.output[2].value, F_VALUE - 2 * RUNG - TOKEN_FORWARD, "198 020 to the attacker");
-        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "510 reaches the owner");
+        assert_eq!(x.output[2].value, F_VALUE - 2 * RUNG - TOKEN_FORWARD, "197 710 to the attacker");
+        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "820 reaches the owner");
         assert_still_genuinely_cosigned(&b, &rig);
 
         let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
@@ -12285,12 +14135,13 @@ mod skim_root_attack_tests {
         let t: Transaction = parse(&b.trigger.signed_tx);
         assert_eq!(t.output.len(), 3);
         assert_eq!(t.output[2].script_pubkey, rig.attacker.spk);
-        assert_eq!(b.trigger.out_value, TOKEN_FORWARD, "the trigger forwards 1 000 of a 200 000 coin");
-        assert_eq!(t.output[2].value, 198_424, "…and 198 424 goes to the attacker");
+        assert_eq!(b.trigger.out_value, TOKEN_FORWARD, "the trigger forwards 1 310 of a 200 000 coin");
+        assert_eq!(t.output[2].value, 198_114, "…and 198 114 goes to the attacker");
         assert_eq!(
             b.levels[0].state.out_value,
             TOKEN_FORWARD - 2 * RUNG,
-            "the owner's exit chain can deliver 20 sat"
+            "the owner's exit chain can deliver 330 sat — exactly the dust floor, so the bundle is \
+             genuinely relayable and the ONLY thing wrong with it is the theft"
         );
         // Everything BELOW the trigger conserves exactly, which is why nothing else can be what
         // refuses this bundle: each tier was built from the value its parent really forwards.
@@ -14422,5 +16273,4021 @@ mod wrong_payee_attack_tests {
         // T, X, SP, SP2, X_c, S_c — and the ancestor entry is the SPINE tier, read off its signature.
         assert_eq!(bound.len(), 6);
         assert_eq!(bound[3].1, Some(SPINE_CSV), "the ancestor's lone tier, bound to its nSequence");
+    }
+}
+
+/// # THE DUST-POISONED TIER, BUILT AND RUN
+///
+/// **The theft.** Every value law in this file is a law about *totals*: `Σ(payload outputs)` must
+/// equal `funding − one rung`, a non-split tier must carry exactly one payload output, the leaf's
+/// payload output must carry the whole forward. Not one of them says anything about the SMALLEST
+/// output. So a sender can satisfy every conservation check exactly and still hand over an exit
+/// chain that Bitcoin will never carry, by putting a single sub-dust output on one tier:
+///
+/// * a `SP` whose N child slots sum to the expected total but whose last slot is 1 sat;
+/// * an ancestor extension, or an intermediate spine `SP`, with the same shape — and those two lanes
+///   are checked entirely inline in `verify_child_bundle`, where the intermediate `SP` has no Σ check
+///   and no payload-count check at all;
+/// * a child extension or child state carrying an appended **zero-value** output, which is Σ-neutral
+///   by construction and therefore invisible to both the sum check and the per-output check;
+/// * a spine tip cap with an appended 1-sat output, which `SpineTipBundle::validate` never looks at.
+///
+/// A transaction carrying an output below the relay dust floor is NON-STANDARD. It does not relay, it
+/// does not enter a mempool, it never confirms — and because every TES-R tier is un-broadcast and
+/// pre-signed, a poisoned tier cannot be repaired: the SE co-signed *that* transaction, and after
+/// `set_spend_budget` it will never co-sign a replacement. Everything hanging off the poisoned tier is
+/// dead. Meanwhile the receiver books the FUNDING value (`coin.amount = sp_out.value` on the child
+/// lane, the on-chain `F` on the root lane), and the SSP's pre-payment census — which runs this very
+/// verifier (`rust-sdk/src/ssp.rs`) — pays the invoice.
+///
+/// **Why the blind SE cannot be the one to catch it.** `cosign_tier_request` is handed a sighash and a
+/// prevout amount. It never deserialises an output, so it cannot see a value, let alone a small one.
+/// Every attack below asserts `verify_tier_cosigned` still ACCEPTS the poisoned tier, exactly as
+/// `skim_root_attack_tests` does, so the refusal can only be coming from the new floor.
+///
+/// **And the boundary is the other half of the test.** Every floor in this codebase is written as
+/// `k · (rung) + dust`, so the honest MINIMUM of every shape lands on exactly `DUST_LIMIT` — 1 310 for
+/// a plain child, 820 for a spine tip, 1 800 for a plain root ladder, 2 058 for a coloured one. A `>`
+/// predicate instead of `>=` would refuse every one of them. Each is pinned here as an ACCEPTANCE,
+/// one sat below it as a refusal, and the acceptance half passes both before and after the fix.
+#[cfg(test)]
+mod dust_poisoned_tier_attack_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        absolute,
+        consensus::{deserialize, serialize},
+        key::TapTweak,
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness,
+    };
+
+    const NET: &str = "regtest";
+    /// The parent coin's on-chain funding outpoint. Nothing fetches it — every entry point exercised
+    /// here is pure and takes the chain facts as parameters.
+    const F_TXID: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+    const F_VOUT: u32 = 0;
+
+    /// The floor under test, named once. Read from `mercurylib` rather than written as `330` so a
+    /// change to the constant moves the tests with it.
+    const DUST: u64 = mercurylib::tesr::DUST_LIMIT;
+
+    // ── the same local scaffolding the neighbouring attack suites use ──────────────────────────
+
+    struct Holder {
+        kp: KeyPair,
+        address: String,
+        spk: ScriptBuf,
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _parity) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    /// The blind co-sign, performed locally: a BIP-341 key-spend Schnorr signature over
+    /// `TxOut { value: prevout_value, script_pubkey: agg_spk }` with `TapSighashType::All`.
+    fn cosign(tx: &Transaction, prevout_value: u64, agg_spk: &ScriptBuf, kp: &KeyPair) -> Transaction {
+        let secp = Secp256k1::new();
+        let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };
+        let sighash = SighashCache::new(tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+            .expect("taproot key-spend sighash");
+        let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+        let mut signed = tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+        signed
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    /// A bundle tier describing `tx`, with `txid` and `out_value` read FROM the transaction — i.e.
+    /// declared honestly. Every attack here keeps it that way: the lie is a single extra output, never
+    /// the field beside it, so no declared-vs-signed check can be what refuses these bundles.
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: hex::encode(serialize(tx)),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    /// **The poison.** One appended output, below the relay dust floor. Everything else about the
+    /// transaction — version, locktime, sequence, the P2A anchor, the payload output, the declared
+    /// fields — is exactly what an honest tier carries.
+    fn poison(tx: &mut Transaction, value: u64, spk: &ScriptBuf) {
+        assert!(value < DUST, "the point of the fixture is an output UNDER the floor");
+        tx.output.push(TxOut { value, script_pubkey: spk.clone() });
+    }
+
+    /// Σ over the outputs the payload filter admits — neither the P2A anchor nor an opret.
+    fn payload_total(tx: &Transaction) -> u64 {
+        tx.output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum()
+    }
+
+    fn payload_count(tx: &Transaction) -> usize {
+        tx.output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .count()
+    }
+
+    struct Rig {
+        agg: Holder,
+        ancestor: Holder,
+        child: Holder,
+        receiver: Holder,
+        attacker: Holder,
+        params: mercurylib::tesr::TesrParams,
+        rate: f64,
+    }
+
+    fn rig() -> Rig {
+        let params = mercurylib::tesr::TesrParams::regtest();
+        Rig {
+            agg: holder(0x71),
+            ancestor: holder(0x72),
+            child: holder(0x73),
+            receiver: holder(0x74),
+            attacker: holder(0x75),
+            rate: params.committed_fee_rate,
+            params,
+        }
+    }
+
+    /// What a built root segment leaves behind for the tiers below it.
+    struct Root {
+        bundle: TesrBundle,
+        /// The final tier of the root segment, parsed — `S_0` for a whole coin, `SP` for a split.
+        final_tx: Transaction,
+    }
+
+    impl Rig {
+        /// A whole-coin root ladder `T → X_0 → S_0` paying the receiver, genuinely co-signed by `A`.
+        /// `tamper` runs on each tier's honest output vector before it is co-signed, indexed by tier.
+        fn root_ladder(&self, f_value: u64, tamper: impl Fn(usize, &mut Transaction)) -> Root {
+            let p = self.params;
+            let a = &self.agg;
+
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, f_value, &a.address, NET, self.rate)
+                .expect("trigger");
+            let mut t_tx = parse(&t.tx_hex);
+            tamper(0, &mut t_tx);
+            let t_tx = cosign(&t_tx, f_value, &a.spk, &a.kp);
+            let t_forward = t_tx.output[t.payload_vout as usize].value;
+
+            let x = mercurylib::tesr::build_extension(
+                &t_tx.txid().to_string(), t_forward, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let mut x_tx = parse(&x.tx_hex);
+            tamper(1, &mut x_tx);
+            let x_tx = cosign(&x_tx, t_forward, &a.spk, &a.kp);
+            let x_forward = x_tx.output[x.payload_vout as usize].value;
+
+            let s = mercurylib::tesr::build_state(
+                &x_tx.txid().to_string(), x_forward, &self.receiver.address, NET, p.state_csv(0),
+                self.rate,
+            )
+            .expect("state");
+            let mut s_tx = parse(&s.tx_hex);
+            tamper(2, &mut s_tx);
+            let s_tx = cosign(&s_tx, x_forward, &a.spk, &a.kp);
+
+            Root {
+                bundle: TesrBundle {
+                    version: 1,
+                    statechain_id: "root-sid".into(),
+                    network: NET.into(),
+                    fee_rate: self.rate,
+                    agg_address: a.address.clone(),
+                    owner_exit_address: self.receiver.address.clone(),
+                    f_txid: F_TXID.into(),
+                    f_vout: F_VOUT,
+                    f_value,
+                    trigger: tier(&t_tx, None, t.payload_vout),
+                    levels: vec![TesrLevel {
+                        extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                        state: tier(&s_tx, Some(p.state_csv(0)), s.payload_vout),
+                    }],
+                    m: 0,
+                    superseded_states: vec![],
+                    superseded_extensions: vec![],
+                    params: p,
+                    rgb: None,
+                },
+                final_tx: s_tx,
+            }
+        }
+
+        /// A SPLIT root segment `T → X_0 → SP`, `SP` carving `slots` out of `X_0`'s payload. The
+        /// builder enforces `Σ slots == tier_out_total(...)` itself, so any split passed here already
+        /// satisfies the receiver's Σ law by construction.
+        fn split_root(&self, f_value: u64, slots: &[(String, u64)]) -> Root {
+            let p = self.params;
+            let a = &self.agg;
+
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, f_value, &a.address, NET, self.rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), f_value, &a.spk, &a.kp);
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+            let sp = mercurylib::tesr::build_split_state(
+                &x.txid, x.out_value, slots, NET, SPINE_CSV, self.rate,
+            )
+            .expect("split state");
+            let sp_tx = cosign(&parse(&sp.tx_hex), x.out_value, &a.spk, &a.kp);
+
+            Root {
+                bundle: TesrBundle {
+                    version: 1,
+                    statechain_id: "parent-sid".into(),
+                    network: NET.into(),
+                    fee_rate: self.rate,
+                    agg_address: a.address.clone(),
+                    owner_exit_address: self.receiver.address.clone(),
+                    f_txid: F_TXID.into(),
+                    f_vout: F_VOUT,
+                    f_value,
+                    trigger: tier(&t_tx, None, t.payload_vout),
+                    levels: vec![TesrLevel {
+                        extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                        state: tier(&sp_tx, Some(SPINE_CSV), sp.payload_vout),
+                    }],
+                    m: 0,
+                    superseded_states: vec![],
+                    superseded_extensions: vec![],
+                    params: p,
+                    rgb: None,
+                },
+                final_tx: sp_tx,
+            }
+        }
+
+        /// The LEAF: `X_c` over `(funding_txid, funding_vout)` worth `slot`, then `S_c` paying the
+        /// receiver. `tamper` is applied to each tier before its co-sign (0 = extension, 1 = state).
+        fn leaf(
+            &self,
+            funding_txid: &str,
+            funding_vout: u32,
+            slot: u64,
+            tamper: impl Fn(usize, &mut Transaction),
+        ) -> (TesrTier, TesrTier) {
+            let p = self.params;
+            let c = &self.child;
+            let xc = mercurylib::tesr::build_extension_from(
+                funding_txid, funding_vout, slot, &c.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("child extension");
+            let mut xc_tx = parse(&xc.tx_hex);
+            tamper(0, &mut xc_tx);
+            let xc_tx = cosign(&xc_tx, slot, &c.spk, &c.kp);
+            let forward = xc_tx.output[xc.payload_vout as usize].value;
+
+            let sc = mercurylib::tesr::build_state_from(
+                &xc_tx.txid().to_string(),
+                xc.payload_vout,
+                forward,
+                &self.receiver.address,
+                NET,
+                p.state_csv(0),
+                self.rate,
+            )
+            .expect("child state");
+            let mut sc_tx = parse(&sc.tx_hex);
+            tamper(1, &mut sc_tx);
+            let sc_tx = cosign(&sc_tx, forward, &c.spk, &c.kp);
+
+            (
+                tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
+            )
+        }
+
+        fn child_bundle(
+            &self,
+            root: &Root,
+            sp_vout: u32,
+            ancestors: Vec<ChildSegment>,
+            leaf_funding: (&str, u32, u64),
+            tamper: impl Fn(usize, &mut Transaction),
+        ) -> ChildTesrBundle {
+            let (ext, state) = self.leaf(leaf_funding.0, leaf_funding.1, leaf_funding.2, tamper);
+            ChildTesrBundle {
+                parent: root.bundle.clone(),
+                parent_statechain_id: "parent-sid".into(),
+                sp_vout,
+                child_statechain_id: "child-sid".into(),
+                child_owner_exit_address: self.receiver.address.clone(),
+                child_extension: ext,
+                child_state: state,
+                child_superseded_states: vec![],
+                child_superseded_extensions: vec![],
+                ancestors,
+                rgb: None,
+                parent_flat_backups: vec![],
+            }
+        }
+
+        /// The chain facts a receiver reads off the chain and the coordinator, none of which any
+        /// attack here touches — so no authority check can be what refuses these bundles.
+        fn verify_child(
+            &self,
+            cb: &ChildTesrBundle,
+            f_value: u64,
+            ancestor_facts: &[AncestorFacts],
+        ) -> Result<()> {
+            verify_child_bundle(
+                cb,
+                &hex::encode(self.agg.spk.as_bytes()),
+                f_value,
+                1 + 3, // one deposit backup + T + X + SP, nothing superseded
+                1,
+                Some(&self.agg.recorded_xonly),
+                true, // terminal, as the protocol requires
+                2,    // a derived child slot has no flat backup: just its two tiers
+                0,
+                Some(&self.child.recorded_xonly),
+                ancestor_facts,
+                &self.receiver.address,
+            )
+        }
+    }
+
+    /// A refusal must name the dust floor, not some unrelated malformation. Mirrors
+    /// `skim_root_attack_tests::assert_not_an_unrelated_refusal` and its leaf-lane twin, unioned.
+    fn assert_refused_on_dust(msg: &str, offending_value: u64) {
+        for unrelated in [
+            "not co-signed",
+            "num_sigs",
+            "CSV",
+            "does not spend",
+            "pays the wrong output",
+            "does not pay the aggregate",
+            "colour",
+            "decoy",
+            "malformed ladder",
+            "Model A",
+            "terminal",
+            "outside this ladder",
+        ] {
+            assert!(
+                !msg.contains(unrelated),
+                "the bundle was refused for an UNRELATED reason ({unrelated:?}) — this test would \
+                 be worthless: {msg}"
+            );
+        }
+        assert!(
+            msg.contains(&format!("carries {offending_value} sat")),
+            "the refusal must name the offending output's value, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{DUST}-sat")),
+            "…and the floor it fell under, got: {msg}"
+        );
+        assert!(
+            msg.contains("never confirms"),
+            "…and WHY that is fatal rather than untidy, got: {msg}"
+        );
+    }
+
+    // ══ 0. THE CONSTANT ════════════════════════════════════════════════════════════════════════
+
+    /// The number the verifier refuses on must be the number every BUILDER floors on. It was four
+    /// separate literals before this fix; this pins the two that are reachable from here as one.
+    #[test]
+    fn the_receive_side_floor_is_the_same_number_every_builder_floors_on() {
+        assert_eq!(DUST, 330);
+        assert_eq!(COLORED_LADDER_DUST, DUST, "the coloured builder floor is the same number");
+        // …and each honest floor really is `k · rung + dust`, which is the identity that makes the
+        // minimum of every shape land on EXACTLY the floor rather than above it.
+        let rate = 2.0f64;
+        let rung = mercurylib::tesr::committed_fee(rate) + mercurylib::tesr::P2A_VALUE;
+        assert_eq!(mercurylib::tesr::min_child_value(rate, DUST), 2 * rung + DUST);
+        assert_eq!(mercurylib::tesr::min_spine_tip_value(rate, DUST), rung + DUST);
+        let crung = crate::rgb::colored_committed_fee(1, rate) + mercurylib::tesr::P2A_VALUE;
+        assert_eq!(colored_ladder_floor(rate, DUST), 3 * crung + DUST);
+    }
+
+    // ══ 1. THE DUST-POISONED SPLIT STATE — the SSP's lane ══════════════════════════════════════
+
+    /// **THE ATTACK.** `SP` carves its funding into TWO child slots: the payee's, one sat short of the
+    /// whole, and a 1-sat slot to the attacker. `Σ(payload outputs)` is EXACTLY the expected total, the
+    /// payload COUNT is exactly the derived `n_payload`, every tier is genuinely co-signed, and the
+    /// payee's own two tiers conserve perfectly from a 198 443-sat slot.
+    ///
+    /// And `SP` will never confirm. One 1-sat output makes the whole transaction non-standard, so
+    /// nothing beneath it — `X_c`, `S_c`, the payee's entire exit — can ever be broadcast. The payee is
+    /// credited 198 443 for a coin that does not exist, and the SSP, whose pre-payment census is this
+    /// same verifier, pays the invoice.
+    #[test]
+    fn a_dust_poisoned_split_state_is_refused() {
+        let rig = rig();
+        let f_value = 200_000u64;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        let total = mercurylib::tesr::tier_out_total(x_out, 2, rig.rate).unwrap();
+        let root = rig.split_root(
+            f_value,
+            &[(rig.child.address.clone(), total - 1), (rig.attacker.address.clone(), 1)],
+        );
+
+        // ── the bundle satisfies every law that exists today ──────────────────────────────────
+        assert_eq!(
+            payload_total(&root.final_tx),
+            total,
+            "Σ over SP's payload outputs is EXACTLY what the conservation law expects"
+        );
+        assert_eq!(
+            payload_count(&root.final_tx),
+            2,
+            "…and the payload COUNT is exactly the number the law derives, so [GAP 1] cannot fire"
+        );
+        assert_eq!(root.final_tx.output[1].value, 1, "the poison: one sat");
+        assert!(root.final_tx.output[1].value < DUST);
+        assert_eq!(root.final_tx.output[1].script_pubkey, rig.attacker.spk);
+        // The blind SE really does co-sign this, which is what leaves the value law alone in the way.
+        verify_tier_cosigned(&root.final_tx, x_out, &rig.agg.spk)
+            .expect("SP is a genuine co-sign — the poison is not a forgery");
+
+        let sp_txid = root.final_tx.txid().to_string();
+        let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, total - 1), |_, _| {});
+        // The payee's OWN legs are all comfortably spendable — the poison is entirely on the tier
+        // that funds them, which is what makes this invisible to every leaf-lane law.
+        assert!(cb.child_extension.out_value >= DUST && cb.child_state.out_value >= DUST);
+
+        // ── the two entry points that must refuse it ──────────────────────────────────────────
+        let direct = verify_bundle_ex(&cb.parent, 1 + 3, 1, true, Some(f_value))
+            .expect_err("a dust-poisoned SP must be REFUSED by the split-lane verifier")
+            .to_string();
+        assert_refused_on_dust(&direct, 1);
+
+        let conveyed = rig
+            .verify_child(&cb, f_value, &[])
+            .expect_err("…and by the conveyed-child path the receiver and the SSP actually call")
+            .to_string();
+        assert_refused_on_dust(&conveyed, 1);
+    }
+
+    // ══ 2. THE ANCESTOR LANES — checked inline, reached by no shared verifier ══════════════════
+
+    /// **The same poison on an ANCESTOR EXTENSION.** That tier has a Σ check and — unlike the root
+    /// lane — no payload-COUNT check at all, so the `(expect − 1, 1)` shape passes it exactly. The
+    /// segment's state then funds from the 198 039-sat payload output and the whole chain below stays
+    /// internally perfect.
+    #[test]
+    fn a_dust_poisoned_ancestor_extension_is_refused() {
+        let rig = rig();
+        let f_value = 200_000u64;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+        let root = rig.split_root(f_value, &[(rig.ancestor.address.clone(), slot)]);
+        let sp_txid = root.final_tx.txid().to_string();
+
+        let g = &rig.ancestor;
+        let p = rig.params;
+        let xa = mercurylib::tesr::build_extension_from(
+            &sp_txid, 0, slot, &g.address, NET, p.ext_csv(0), rig.rate,
+        )
+        .expect("ancestor extension");
+        let honest_forward = xa.out_value;
+        let mut xa_tx = parse(&xa.tx_hex);
+        // Σ-NEUTRAL by construction: one sat is moved out of the payload output and into a 1-sat
+        // output paying the attacker.
+        xa_tx.output[xa.payload_vout as usize].value = honest_forward - 1;
+        poison(&mut xa_tx, 1, &rig.attacker.spk);
+        let xa_tx = cosign(&xa_tx, slot, &g.spk, &g.kp);
+        assert_eq!(
+            payload_total(&xa_tx),
+            mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+            "Σ over the ancestor extension's payload outputs is EXACTLY what its law expects"
+        );
+        verify_tier_cosigned(&xa_tx, slot, &g.spk).expect("a genuine co-sign, poison and all");
+
+        let forward = honest_forward - 1;
+        let leaf_slot = mercurylib::tesr::tier_out_total(forward, 1, rig.rate).unwrap();
+        let csp = mercurylib::tesr::build_split_state_from(
+            &xa_tx.txid().to_string(),
+            xa.payload_vout,
+            forward,
+            &[(rig.child.address.clone(), leaf_slot)],
+            NET,
+            SPINE_CSV,
+            rig.rate,
+        )
+        .expect("ancestor split state");
+        let csp_tx = cosign(&parse(&csp.tx_hex), forward, &g.spk, &g.kp);
+
+        let segment = ChildSegment {
+            statechain_id: "ancestor-sid".into(),
+            funding_vout: 0,
+            extension: Some(tier(&xa_tx, Some(p.ext_csv(0)), xa.payload_vout)),
+            state: tier(&csp_tx, Some(SPINE_CSV), csp.payload_vout),
+            superseded_states: vec![],
+            superseded_extensions: vec![],
+        };
+        let facts = [AncestorFacts {
+            num_sigs: CHILD_V2_BASELINE + 2,
+            aggregate_pubkey: Some(g.recorded_xonly.clone()),
+            terminal: true,
+        }];
+        let cb = rig.child_bundle(
+            &root,
+            0,
+            vec![segment],
+            (&csp_tx.txid().to_string(), 0, leaf_slot),
+            |_, _| {},
+        );
+
+        let msg = rig
+            .verify_child(&cb, f_value, &facts)
+            .expect_err("a dust-poisoned ancestor extension must be REFUSED")
+            .to_string();
+        assert_refused_on_dust(&msg, 1);
+        assert!(msg.contains("ancestor 0"), "…and it must name the segment, got: {msg}");
+    }
+
+    /// **The poison on the INTERMEDIATE SPINE `SP`** — the ancestor's own split state, and the one
+    /// tier in the whole structure that has NEITHER a Σ-payload check NOR a payload-count check. Its
+    /// `out[j]` is read straight into the leaf's laws; nothing constrains what its other outputs carry.
+    #[test]
+    fn a_dust_poisoned_ancestor_spine_state_is_refused() {
+        let rig = rig();
+        let f_value = 200_000u64;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+        let root = rig.split_root(f_value, &[(rig.ancestor.address.clone(), slot)]);
+        let sp_txid = root.final_tx.txid().to_string();
+
+        let g = &rig.ancestor;
+        let p = rig.params;
+        let xa = mercurylib::tesr::build_extension_from(
+            &sp_txid, 0, slot, &g.address, NET, p.ext_csv(0), rig.rate,
+        )
+        .expect("ancestor extension");
+        let xa_tx = cosign(&parse(&xa.tx_hex), slot, &g.spk, &g.kp);
+
+        let total2 = mercurylib::tesr::tier_out_total(xa.out_value, 2, rig.rate).unwrap();
+        let csp = mercurylib::tesr::build_split_state_from(
+            &xa_tx.txid().to_string(),
+            xa.payload_vout,
+            xa.out_value,
+            &[(rig.child.address.clone(), total2 - 1), (rig.attacker.address.clone(), 1)],
+            NET,
+            SPINE_CSV,
+            rig.rate,
+        )
+        .expect("ancestor split state");
+        let csp_tx = cosign(&parse(&csp.tx_hex), xa.out_value, &g.spk, &g.kp);
+        assert_eq!(payload_total(&csp_tx), total2, "conserves exactly, for whatever that is worth here");
+        assert_eq!(csp_tx.output[1].value, 1, "the poison, on the tier with no value law at all");
+
+        let segment = ChildSegment {
+            statechain_id: "ancestor-sid".into(),
+            funding_vout: 0,
+            extension: Some(tier(&xa_tx, Some(p.ext_csv(0)), xa.payload_vout)),
+            state: tier(&csp_tx, Some(SPINE_CSV), csp.payload_vout),
+            superseded_states: vec![],
+            superseded_extensions: vec![],
+        };
+        let facts = [AncestorFacts {
+            num_sigs: CHILD_V2_BASELINE + 2,
+            aggregate_pubkey: Some(g.recorded_xonly.clone()),
+            terminal: true,
+        }];
+        let cb = rig.child_bundle(
+            &root,
+            0,
+            vec![segment],
+            (&csp_tx.txid().to_string(), 0, total2 - 1),
+            |_, _| {},
+        );
+
+        let msg = rig
+            .verify_child(&cb, f_value, &facts)
+            .expect_err("a dust-poisoned intermediate SP must be REFUSED")
+            .to_string();
+        assert_refused_on_dust(&msg, 1);
+        assert!(msg.contains("ancestor 0"), "…and it must name the segment, got: {msg}");
+    }
+
+    // ══ 3. THE LEAF LANES — where the poison must be Σ-NEUTRAL to survive ══════════════════════
+
+    /// **A ZERO-VALUE output on the child extension.** The leaf lane has BOTH a Σ check and a
+    /// per-output check, so `(expect − 1, 1)` dies on the per-output one. A zero-value output evades
+    /// both by construction: `Σ = expect + 0` and `out[payload_vout] = expect`. It is still an output
+    /// below the dust floor, and it still makes the tier non-standard.
+    #[test]
+    fn a_zero_value_output_on_the_child_extension_is_refused() {
+        let rig = rig();
+        let f_value = 200_000u64;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+        let root = rig.split_root(f_value, &[(rig.child.address.clone(), slot)]);
+        let sp_txid = root.final_tx.txid().to_string();
+        let attacker = rig.attacker.spk.clone();
+        let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot), |i, tx| {
+            if i == 0 {
+                poison(tx, 0, &attacker);
+            }
+        });
+
+        let ext = parse(&cb.child_extension.signed_tx);
+        assert_eq!(
+            payload_total(&ext),
+            mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+            "Σ is untouched — a zero-value output is invisible to a sum"
+        );
+        assert_eq!(
+            cb.child_extension.out_value,
+            mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+            "…and so is the per-output check: the payload output is exactly right"
+        );
+        assert_eq!(ext.output.last().unwrap().value, 0);
+
+        let msg = rig
+            .verify_child(&cb, f_value, &[])
+            .expect_err("a zero-value output on the child extension must be REFUSED")
+            .to_string();
+        assert_refused_on_dust(&msg, 0);
+        assert!(msg.contains("child extension"), "…and it must name the hop, got: {msg}");
+    }
+
+    /// The same zero-value output one hop down, on the child STATE — the last tier before the money is
+    /// the receiver's, and the one whose `out_value` the SSP's value gate reads.
+    #[test]
+    fn a_zero_value_output_on_the_child_state_is_refused() {
+        let rig = rig();
+        let f_value = 200_000u64;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+        let root = rig.split_root(f_value, &[(rig.child.address.clone(), slot)]);
+        let sp_txid = root.final_tx.txid().to_string();
+        let attacker = rig.attacker.spk.clone();
+        let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot), |i, tx| {
+            if i == 1 {
+                poison(tx, 0, &attacker);
+            }
+        });
+
+        let st = parse(&cb.child_state.signed_tx);
+        assert_eq!(st.output.last().unwrap().value, 0);
+        assert!(cb.child_state.out_value >= DUST, "the receiver's own output is fine…");
+
+        let msg = rig
+            .verify_child(&cb, f_value, &[])
+            .expect_err("a zero-value output on the child state must be REFUSED")
+            .to_string();
+        assert_refused_on_dust(&msg, 0);
+        assert!(msg.contains("child state"), "…and it must name the hop, got: {msg}");
+    }
+
+    // ══ 4. THE UNBOUND ROOT ENTRY POINT — why the loop must be its OWN ═════════════════════════
+
+    /// **The trigger, on `verify_bundle`.** `verify_bundle_ex`'s value loop `continue`s on tier 0 when
+    /// `f_onchain` is `None` — which is exactly what `verify_bundle` passes — so on that entry point
+    /// the trigger has no Σ check AND no payload-count check. A dust check folded into that loop would
+    /// be skipped for it. This is the test that fails if the new loop is written inside the old one.
+    ///
+    /// The output is zero-valued so that the BOUND path refuses it on the payload-count law instead,
+    /// leaving this entry point the only one where the dust floor is the sole thing standing.
+    #[test]
+    fn a_zero_value_output_on_the_trigger_is_refused_on_the_unbound_entry_point_too() {
+        let rig = rig();
+        let attacker = rig.attacker.spk.clone();
+        let root = rig.root_ladder(200_000, |i, tx| {
+            if i == 0 {
+                poison(tx, 0, &attacker);
+            }
+        });
+        let t = parse(&root.bundle.trigger.signed_tx);
+        assert_eq!(t.output.last().unwrap().value, 0);
+        assert_eq!(payload_count(&t), 2, "two payload outputs — but tier 0 is never counted here");
+        verify_tier_cosigned(&t, 200_000, &rig.agg.spk).expect("a genuine co-sign");
+
+        let msg = verify_bundle(&root.bundle, 1 + 3, 1)
+            .expect_err("the UNBOUND entry point must refuse a dust-poisoned trigger")
+            .to_string();
+        assert_refused_on_dust(&msg, 0);
+        assert!(msg.contains("trigger"), "…and it must name the tier, got: {msg}");
+    }
+
+    // ══ 5. THE SPINE TIP ═══════════════════════════════════════════════════════════════════════
+
+    /// A tip whose `SP` really is a two-payload split state and whose cap really is a state tier over
+    /// `SP.out[1]`. `SpineTipBundle::validate` reads the signed transactions, so stub tiers would prove
+    /// nothing about it.
+    fn tip(rig: &Rig, tip_value: u64, tamper: impl Fn(&mut Transaction)) -> SpineTipBundle {
+        let p = rig.params;
+        let f_value = 200_000u64;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        let total = mercurylib::tesr::tier_out_total(x_out, 2, rig.rate).unwrap();
+        let root = rig.split_root(
+            f_value,
+            &[(rig.child.address.clone(), total - tip_value), (rig.receiver.address.clone(), tip_value)],
+        );
+        let cap = mercurylib::tesr::build_state_from(
+            &root.final_tx.txid().to_string(),
+            1,
+            tip_value,
+            &rig.receiver.address,
+            NET,
+            p.state_csv(0),
+            rig.rate,
+        )
+        .expect("cap");
+        let mut cap_tx = parse(&cap.tx_hex);
+        tamper(&mut cap_tx);
+        SpineTipBundle {
+            parent_statechain_id: root.bundle.statechain_id.clone(),
+            sp_out_value: tip_value,
+            parent: root.bundle,
+            ancestors: vec![],
+            sp_vout: 1,
+            statechain_id: "tip-sid".into(),
+            owner_exit_address: rig.receiver.address.clone(),
+            cap: tier(&cap_tx, Some(p.state_csv(0)), cap.payload_vout),
+            superseded_caps: vec![],
+            parent_flat_backups: vec![],
+            rgb: None,
+        }
+    }
+
+    /// **The tip's cap, poisoned.** `validate` has no Σ law at all — it pins the cap's payload output
+    /// against the declared `out_value` and stops — so a 1-sat appended output sails through, and the
+    /// sender's own change leg becomes unbroadcastable at the moment it is written to the wallet.
+    #[test]
+    fn a_dust_poisoned_spine_tip_cap_is_refused() {
+        let rig = rig();
+        let attacker = rig.attacker.spk.clone();
+        let t = tip(&rig, 100_000, |tx| poison(tx, 1, &attacker));
+        let cap_tx = parse(&t.cap.signed_tx);
+        assert_eq!(cap_tx.output.last().unwrap().value, 1);
+        assert!(t.cap.out_value >= DUST, "the sender's own change output is fine…");
+
+        let msg = t
+            .validate()
+            .expect_err("a dust-poisoned cap must be REFUSED before the record is persisted")
+            .to_string();
+        assert_refused_on_dust(&msg, 1);
+        assert!(msg.contains("spine tip"), "…and it must name the record, got: {msg}");
+    }
+
+    // ══ 6. THE HONEST BOUNDARY — every minimum shape lands on EXACTLY the floor ════════════════
+
+    /// **The plain child at `min_child_value`.** 1 310 → 820 → 330: the state's payload output is
+    /// EXACTLY the dust floor. A `>` predicate would refuse every minimum-sized piece in the system.
+    /// One sat less and the final leg really is unspendable, which is the same defect arriving by
+    /// accident rather than by attack — and it must be refused too.
+    #[test]
+    fn an_honest_minimum_child_lands_on_exactly_the_floor_and_is_accepted() {
+        let rig = rig();
+        let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
+        let slot = mercurylib::tesr::min_child_value(rig.rate, DUST);
+        assert_eq!(slot, 1_310);
+
+        // A root ladder sized so that `SP`'s single slot is EXACTLY the child floor.
+        let f_value = slot + 3 * rung;
+        let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+        let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+        assert_eq!(mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap(), slot);
+        let root = rig.split_root(f_value, &[(rig.child.address.clone(), slot)]);
+        let sp_txid = root.final_tx.txid().to_string();
+        let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot), |_, _| {});
+
+        assert_eq!(cb.child_extension.out_value, slot - rung);
+        assert_eq!(cb.child_state.out_value, DUST, "the minimum child's last leg IS the floor");
+        rig.verify_child(&cb, f_value, &[])
+            .expect("an honest minimum-value child must be ACCEPTED at exactly the floor");
+
+        // …and one sat below it, where the last leg is 329, it must not be.
+        let f_short = f_value - 1;
+        let root = rig.split_root(f_short, &[(rig.child.address.clone(), slot - 1)]);
+        let sp_txid = root.final_tx.txid().to_string();
+        let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot - 1), |_, _| {});
+        assert_eq!(cb.child_state.out_value, DUST - 1);
+        let msg = rig
+            .verify_child(&cb, f_short, &[])
+            .expect_err("one sat under the floor the child's exit is unbroadcastable")
+            .to_string();
+        assert_refused_on_dust(&msg, DUST - 1);
+    }
+
+    /// **The spine tip at `min_spine_tip_value`.** 820 → 330 over its one cap.
+    #[test]
+    fn an_honest_minimum_spine_tip_lands_on_exactly_the_floor_and_is_accepted() {
+        let rig = rig();
+        let floor = mercurylib::tesr::min_spine_tip_value(rig.rate, DUST);
+        assert_eq!(floor, 820);
+
+        let t = tip(&rig, floor, |_| {});
+        assert_eq!(t.cap.out_value, DUST, "the minimum tip's cap IS the floor");
+        t.validate().expect("an honest minimum-value tip must be ACCEPTED at exactly the floor");
+
+        let t = tip(&rig, floor - 1, |_| {});
+        assert_eq!(t.cap.out_value, DUST - 1);
+        let msg = t
+            .validate()
+            .expect_err("one sat under the floor the cap is unbroadcastable")
+            .to_string();
+        assert_refused_on_dust(&msg, DUST - 1);
+    }
+
+    /// **The plain root ladder at its implied floor.** There is no `plain_ladder_floor` constant and
+    /// `establish` applies no pre-flight, but the arithmetic is the same shape as every other floor:
+    /// `3 · rung + dust` = 1 800 gives `T = 1 310`, `X_0 = 820`, `S_0 = 330` — exactly the floor. Below
+    /// it the coin's own exit chain ends in an output Bitcoin will not relay.
+    #[test]
+    fn an_honest_minimum_root_ladder_lands_on_exactly_the_floor_and_is_accepted() {
+        let rig = rig();
+        let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
+        let floor = 3 * rung + DUST;
+        assert_eq!(floor, 1_800);
+
+        let root = rig.root_ladder(floor, |_, _| {});
+        assert_eq!(root.bundle.current().state.out_value, DUST);
+        verify_bundle_ex(&root.bundle, 1 + 3, 1, false, Some(floor))
+            .expect("an honest minimum-value root ladder must be ACCEPTED at exactly the floor");
+        verify_bundle(&root.bundle, 1 + 3, 1).expect("…through the unbound wrapper too");
+
+        let root = rig.root_ladder(floor - 1, |_, _| {});
+        assert_eq!(root.bundle.current().state.out_value, DUST - 1);
+        let msg = verify_bundle_ex(&root.bundle, 1 + 3, 1, false, Some(floor - 1))
+            .expect_err("one sat under the floor the owner's own exit is unbroadcastable")
+            .to_string();
+        assert_refused_on_dust(&msg, DUST - 1);
+    }
+
+    // ══ 7. THE COLOURED LANE — and the proof the opret exemption is not optional ═══════════════
+
+    /// A synthetic COLOURED tier of the exact shape `build_colored_tier` emits: nVersion 3, the RGB
+    /// `opret` FIRST (value 0), the P2TR payload, the 240-sat P2A anchor last.
+    fn colored_tier_tx(
+        prev_txid: Txid,
+        prev_vout: u32,
+        sequence: electrum_client::bitcoin::Sequence,
+        pay_to: &ScriptBuf,
+        value: u64,
+    ) -> Transaction {
+        let opret = ScriptBuf::from(hex::decode(format!("6a20{}", "11".repeat(32))).unwrap());
+        Transaction {
+            version: 3,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: prev_txid, vout: prev_vout },
+                script_sig: ScriptBuf::new(),
+                sequence,
+                witness: Witness::default(),
+            }],
+            output: vec![
+                TxOut { value: 0, script_pubkey: opret },
+                TxOut { value, script_pubkey: pay_to.clone() },
+                TxOut {
+                    value: mercurylib::tesr::P2A_VALUE,
+                    script_pubkey: mercurylib::tesr::p2a_script(),
+                },
+            ],
+        }
+    }
+
+    /// A whole COLOURED root ladder at `f_value`, genuinely co-signed by `A`. The payload sits at vout
+    /// 1 on every tier because the opret takes index 0.
+    fn colored_ladder(rig: &Rig, f_value: u64) -> TesrBundle {
+        let p = rig.params;
+        let a = &rig.agg;
+        let rung = |v: u64| crate::rgb::colored_tier_out_total(v, 1, rig.rate).expect("coloured rung");
+
+        let t_val = rung(f_value);
+        let t_tx = colored_tier_tx(
+            Txid::from_str(F_TXID).unwrap(),
+            F_VOUT,
+            mercurylib::tesr::TRIGGER_SEQUENCE,
+            &a.spk,
+            t_val,
+        );
+        let t_tx = cosign(&t_tx, f_value, &a.spk, &a.kp);
+
+        let x_val = rung(t_val);
+        let x_tx = colored_tier_tx(
+            t_tx.txid(),
+            1,
+            mercurylib::tesr::csv_blocks(p.ext_csv(0)),
+            &a.spk,
+            x_val,
+        );
+        let x_tx = cosign(&x_tx, t_val, &a.spk, &a.kp);
+
+        let s_val = rung(x_val);
+        let s_tx = colored_tier_tx(
+            x_tx.txid(),
+            1,
+            mercurylib::tesr::csv_blocks(p.state_csv(0)),
+            &rig.receiver.spk,
+            s_val,
+        );
+        let s_tx = cosign(&s_tx, x_val, &a.spk, &a.kp);
+
+        TesrBundle {
+            version: 1,
+            statechain_id: "coloured-sid".into(),
+            network: NET.into(),
+            fee_rate: rig.rate,
+            agg_address: a.address.clone(),
+            owner_exit_address: rig.receiver.address.clone(),
+            f_txid: F_TXID.into(),
+            f_vout: F_VOUT,
+            f_value,
+            trigger: tier(&t_tx, None, 1),
+            levels: vec![TesrLevel {
+                extension: tier(&x_tx, Some(p.ext_csv(0)), 1),
+                state: tier(&s_tx, Some(p.state_csv(0)), 1),
+            }],
+            m: 0,
+            superseded_states: vec![],
+            superseded_extensions: vec![],
+            params: p,
+            rgb: Some(ColoredLadder {
+                contract_id: "rgb:contract".into(),
+                amount: 1_000,
+                consignments: vec!["a".into(), "b".into(), "c".into()],
+            }),
+        }
+    }
+
+    /// **The coloured ladder at `colored_ladder_floor`, and the opret exemption.** 2 058 → 1 482 → 906
+    /// → 330: exactly the floor again. This is also the test that fails loudly if the payload filter is
+    /// ever written as "every output that is not the P2A anchor" — every coloured tier carries a
+    /// zero-value opret, so a check that did not exempt it would refuse the ENTIRE coloured lane.
+    #[test]
+    fn a_coloured_ladder_at_its_floor_is_accepted_and_the_zero_value_opret_is_exempt() {
+        let rig = rig();
+        let floor = colored_ladder_floor(rig.rate, COLORED_LADDER_DUST);
+        assert_eq!(floor, 2_058);
+
+        let b = colored_ladder(&rig, floor);
+        let s = parse(&b.current().state.signed_tx);
+        assert_eq!(s.output[0].value, 0, "the opret carries nothing — and must be exempt");
+        assert!(s.output[0].script_pubkey.is_op_return());
+        assert_eq!(b.current().state.out_value, DUST, "the minimum coloured ladder IS the floor");
+        verify_bundle_ex(&b, 1 + 3, 1, false, Some(floor))
+            .expect("an honest minimum-value COLOURED ladder must be ACCEPTED at exactly the floor");
+
+        let b = colored_ladder(&rig, floor - 1);
+        assert_eq!(b.current().state.out_value, DUST - 1);
+        let msg = verify_bundle_ex(&b, 1 + 3, 1, false, Some(floor - 1))
+            .expect_err("one sat under the coloured floor the exit is unbroadcastable")
+            .to_string();
+        assert_refused_on_dust(&msg, DUST - 1);
+    }
+
+    // ══ 8. THE EXEMPTIONS THEMSELVES ═══════════════════════════════════════════════════════════
+
+    /// # THE TWO EXEMPT KINDS, PROBED RATHER THAN ARGUED
+    ///
+    /// `refuse_dust_payloads` waives its floor for exactly two output kinds, by exact script content:
+    /// the P2A anchor and an `OP_RETURN`. Its docstring used to argue the waiver could not be abused,
+    /// on the grounds that a second anchor "leaves the Σ set, so the conservation check refuses the
+    /// shortfall" and a second opret "is refused by `verify_colored_shape`".
+    ///
+    /// The first half of that argument is only true of a FUNDED second anchor. A **zero-value** one
+    /// takes nothing out of Σ: the sum still balances, the payload COUNT is unchanged (the filter
+    /// removes it by script, so it was never counted), the dust floor waives it by name, and the tier
+    /// is co-signed for real. Nothing bound the single anchor's VALUE to `P2A_VALUE` either, so a
+    /// 1-sat anchor — non-standard on its own account, since the anchor's relay threshold is exactly
+    /// 240 — passed everything as well.
+    ///
+    /// The second half is true only where a colour-shape check actually runs. It does on the root
+    /// ladder's `exit_tiers()` and on the two child tiers; it does NOT on `cb.ancestors[i].extension`
+    /// / `.state`, nor on a spine tip's cap. Those lanes counted no oprets at all.
+    ///
+    /// Every test below asserts the shape survives Σ, the payload count, the dust floor and
+    /// `verify_tier_cosigned` first, so the refusal can only be coming from the new binding — and the
+    /// two that were ALREADY refused say so, and by what, rather than being written as new wins.
+    mod exemption_binding_attack_tests {
+        use super::*;
+
+        /// A second `OP_RETURN`, distinguishable from the RGB one so a refusal cannot be an accident
+        /// of the two being equal.
+        fn second_opret() -> ScriptBuf {
+            ScriptBuf::from(hex::decode(format!("6a20{}", "22".repeat(32))).unwrap())
+        }
+
+        fn anchors(tx: &Transaction) -> Vec<(usize, u64)> {
+            tx.output
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES
+                })
+                .map(|(v, o)| (v, o.value))
+                .collect()
+        }
+
+        fn oprets(tx: &Transaction) -> usize {
+            tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count()
+        }
+
+        /// The refusal must be the anchor law and not some unrelated malformation — same discipline
+        /// as `assert_refused_on_dust`, whose list this extends with the dust message itself (a tier
+        /// refused on dust would prove nothing about the anchor).
+        fn assert_refused_on_anchor(msg: &str, needle: &str) {
+            for unrelated in [
+                "not co-signed",
+                "num_sigs",
+                "CSV",
+                "does not spend",
+                "does not pay the aggregate",
+                "Model A",
+                "terminal",
+                "spendable floor",
+            ] {
+                assert!(
+                    !msg.contains(unrelated),
+                    "refused for an UNRELATED reason ({unrelated:?}) — the test would be \
+                     worthless: {msg}"
+                );
+            }
+            assert!(
+                msg.contains("P2A anchor"),
+                "the refusal must name the anchor law, got: {msg}"
+            );
+            assert!(msg.contains(needle), "…and say what was wrong ({needle:?}), got: {msg}");
+        }
+
+        fn assert_refused_on_opret_count(msg: &str, found: usize, expected: usize) {
+            for unrelated in ["not co-signed", "num_sigs", "CSV", "does not spend", "spendable floor"]
+            {
+                assert!(
+                    !msg.contains(unrelated),
+                    "refused for an UNRELATED reason ({unrelated:?}): {msg}"
+                );
+            }
+            assert!(
+                msg.contains(&format!("carries {found} OP_RETURN")),
+                "the refusal must name the count it found, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("expected exactly {expected}")),
+                "…and the count it expected, got: {msg}"
+            );
+        }
+
+        // ── (i) A SECOND, ZERO-VALUE P2A ANCHOR ───────────────────────────────────────────────
+
+        /// **The root ladder's owner state, with a second zero-value anchor appended.** Σ is
+        /// untouched (the filter drops both anchors by script), the payload count is untouched for
+        /// the same reason, the dust floor waives it by name, and `A` really co-signed it.
+        #[test]
+        fn a_second_zero_value_p2a_anchor_on_a_root_tier_is_refused() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let root = rig.root_ladder(f_value, |i, tx| {
+                if i == 2 {
+                    tx.output.push(TxOut {
+                        value: 0,
+                        script_pubkey: mercurylib::tesr::p2a_script(),
+                    });
+                }
+            });
+            let s = &root.final_tx;
+
+            // ── it satisfies every law that existed before this binding ──────────────────────
+            assert_eq!(anchors(s).len(), 2, "two anchors, the second worth nothing");
+            assert_eq!(anchors(s)[1].1, 0);
+            let x_out = mercurylib::tesr::tier_out_value(
+                mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap(),
+                rig.rate,
+            )
+            .unwrap();
+            assert_eq!(
+                payload_total(s),
+                mercurylib::tesr::tier_out_value(x_out, rig.rate).unwrap(),
+                "Σ over the payload outputs is EXACTLY what the conservation law expects — a \
+                 zero-value anchor takes nothing out of the sum"
+            );
+            assert_eq!(payload_count(s), 1, "…and [GAP 1]'s payload count is untouched too");
+            assert!(
+                s.output.iter().all(|o| o.value >= DUST
+                    || o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES
+                    || o.script_pubkey.is_op_return()),
+                "…and the dust floor waives it by name, so that is not what refuses this"
+            );
+            verify_tier_cosigned(s, x_out, &rig.agg.spk).expect("a genuine co-sign");
+
+            let bound = verify_bundle_ex(&root.bundle, 1 + 3, 1, false, Some(f_value))
+                .expect_err("a tier carrying two P2A anchors must be REFUSED")
+                .to_string();
+            assert_refused_on_anchor(&bound, "2 P2A anchor");
+            let unbound = verify_bundle(&root.bundle, 1 + 3, 1)
+                .expect_err("…on the unbound entry point too")
+                .to_string();
+            assert_refused_on_anchor(&unbound, "2 P2A anchor");
+        }
+
+        /// The same second anchor on the CHILD EXTENSION — the leaf lane, which has both a Σ check
+        /// and a per-output check, and neither of them can see an output the filter removes.
+        #[test]
+        fn a_second_zero_value_p2a_anchor_on_the_child_extension_is_refused() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+            let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+            let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+            let root = rig.split_root(f_value, &[(rig.child.address.clone(), slot)]);
+            let sp_txid = root.final_tx.txid().to_string();
+            let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot), |i, tx| {
+                if i == 0 {
+                    tx.output.push(TxOut {
+                        value: 0,
+                        script_pubkey: mercurylib::tesr::p2a_script(),
+                    });
+                }
+            });
+
+            let ext = parse(&cb.child_extension.signed_tx);
+            assert_eq!(anchors(&ext).len(), 2);
+            assert_eq!(
+                payload_total(&ext),
+                mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+                "Σ untouched"
+            );
+            assert_eq!(
+                cb.child_extension.out_value,
+                mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
+                "…and the per-output check is untouched: the payload output is exactly right"
+            );
+
+            let msg = rig
+                .verify_child(&cb, f_value, &[])
+                .expect_err("a child extension carrying two P2A anchors must be REFUSED")
+                .to_string();
+            assert_refused_on_anchor(&msg, "2 P2A anchor");
+            assert!(msg.contains("child extension"), "…and it must name the hop, got: {msg}");
+        }
+
+        /// And on the SPINE TIP's cap, whose `validate` has no Σ law at all.
+        #[test]
+        fn a_second_zero_value_p2a_anchor_on_the_spine_tip_cap_is_refused() {
+            let rig = rig();
+            let t = tip(&rig, 100_000, |tx| {
+                tx.output
+                    .push(TxOut { value: 0, script_pubkey: mercurylib::tesr::p2a_script() });
+            });
+            let cap_tx = parse(&t.cap.signed_tx);
+            assert_eq!(anchors(&cap_tx).len(), 2);
+            assert!(t.cap.out_value >= DUST, "the sender's own change output is fine…");
+
+            let msg = t
+                .validate()
+                .expect_err("a cap carrying two P2A anchors must be REFUSED")
+                .to_string();
+            assert_refused_on_anchor(&msg, "2 P2A anchor");
+            assert!(msg.contains("spine tip"), "…and it must name the record, got: {msg}");
+        }
+
+        // ── (ii) THE ANCHOR'S OWN VALUE ───────────────────────────────────────────────────────
+
+        /// **A tier whose ONE anchor carries 1 sat instead of `P2A_VALUE`.** Nothing bound it: the
+        /// Σ and count laws both filter the anchor out by script, and the dust floor waives it by
+        /// name — which is precisely why the waiver has to be paid for with a value binding. Its own
+        /// relay threshold is 240, so a starved anchor is the dust defect wearing the exemption.
+        #[test]
+        fn a_p2a_anchor_carrying_less_than_the_p2a_value_is_refused() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let root = rig.root_ladder(f_value, |i, tx| {
+                if i == 1 {
+                    for o in tx.output.iter_mut() {
+                        if o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES {
+                            o.value = 1;
+                        }
+                    }
+                }
+            });
+            let x = parse(&root.bundle.current().extension.signed_tx);
+            assert_eq!(anchors(&x).len(), 1, "still exactly one anchor…");
+            assert_eq!(anchors(&x)[0].1, 1, "…worth one sat instead of 240");
+            let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+            assert_eq!(
+                payload_total(&x),
+                mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap(),
+                "Σ is computed over the payload outputs only, so a starved anchor is invisible to it"
+            );
+            assert_eq!(payload_count(&x), 1, "…and to the payload-count law");
+            verify_tier_cosigned(&x, t_out, &rig.agg.spk).expect("a genuine co-sign");
+
+            let msg = verify_bundle_ex(&root.bundle, 1 + 3, 1, false, Some(f_value))
+                .expect_err("a starved P2A anchor must be REFUSED")
+                .to_string();
+            assert_refused_on_anchor(&msg, "carries 1 sat");
+            assert!(
+                msg.contains(&mercurylib::tesr::P2A_VALUE.to_string()),
+                "…naming the committed anchor value, got: {msg}"
+            );
+        }
+
+        // ── (iii) THE OPRET COUNT ─────────────────────────────────────────────────────────────
+
+        /// **Already refused, and by what.** On the root ladder an extra `OP_RETURN` never reaches
+        /// the value laws: `verify_colored_shape` runs first and refuses a PLAIN ladder that carries
+        /// one at all. Pinned here so the ancestor-lane fix below is not mistaken for a fix of this
+        /// lane too — and so a later edit that moves the colour check cannot silently open it.
+        #[test]
+        fn an_extra_opret_on_a_root_tier_is_already_refused_by_the_colour_shape_check() {
+            let rig = rig();
+            let root = rig.root_ladder(200_000, |i, tx| {
+                if i == 2 {
+                    tx.output.push(TxOut { value: 0, script_pubkey: second_opret() });
+                }
+            });
+            assert_eq!(oprets(&root.final_tx), 1);
+            let msg = verify_bundle_ex(&root.bundle, 1 + 3, 1, false, Some(200_000))
+                .expect_err("a plain ladder carrying an opret is refused today")
+                .to_string();
+            assert!(
+                msg.contains("conveyed as PLAIN"),
+                "…by `verify_colored_shape`, on the plain arm, got: {msg}"
+            );
+        }
+
+        /// The child tiers' twin: `verify_colored_child_shape` counts oprets on `child_extension`
+        /// and `child_state`, so that lane was bound already too.
+        #[test]
+        fn an_extra_opret_on_the_child_state_is_already_refused_by_the_child_colour_shape_check() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+            let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+            let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+            let root = rig.split_root(f_value, &[(rig.child.address.clone(), slot)]);
+            let sp_txid = root.final_tx.txid().to_string();
+            let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot), |i, tx| {
+                if i == 1 {
+                    tx.output.push(TxOut { value: 0, script_pubkey: second_opret() });
+                }
+            });
+            assert_eq!(oprets(&parse(&cb.child_state.signed_tx)), 1);
+            let msg = rig
+                .verify_child(&cb, f_value, &[])
+                .expect_err("a plain child carrying an opret is refused today")
+                .to_string();
+            assert!(
+                msg.contains("conveyed as PLAIN"),
+                "…by `verify_colored_child_shape`, got: {msg}"
+            );
+        }
+
+        /// A `ChildTesrBundle` with one intermediate segment `X_a -> SP_a` between `SP` and the
+        /// leaf, `tamper` applied to the ancestor's extension (0) and its spine state (1) before
+        /// each is co-signed. Only zero-value outputs are appended, so every value in the chain is
+        /// the honest one.
+        fn ancestor_case(
+            rig: &Rig,
+            f_value: u64,
+            tamper: impl Fn(usize, &mut Transaction),
+        ) -> (ChildTesrBundle, Vec<AncestorFacts>, Transaction, Transaction) {
+            let p = rig.params;
+            let t_out = mercurylib::tesr::tier_out_value(f_value, rig.rate).unwrap();
+            let x_out = mercurylib::tesr::tier_out_value(t_out, rig.rate).unwrap();
+            let slot = mercurylib::tesr::tier_out_total(x_out, 1, rig.rate).unwrap();
+            let root = rig.split_root(f_value, &[(rig.ancestor.address.clone(), slot)]);
+            let sp_txid = root.final_tx.txid().to_string();
+
+            let g = &rig.ancestor;
+            let xa = mercurylib::tesr::build_extension_from(
+                &sp_txid, 0, slot, &g.address, NET, p.ext_csv(0), rig.rate,
+            )
+            .expect("ancestor extension");
+            let mut xa_tx = parse(&xa.tx_hex);
+            tamper(0, &mut xa_tx);
+            let xa_tx = cosign(&xa_tx, slot, &g.spk, &g.kp);
+
+            let leaf_slot =
+                mercurylib::tesr::tier_out_total(xa.out_value, 1, rig.rate).unwrap();
+            let csp = mercurylib::tesr::build_split_state_from(
+                &xa_tx.txid().to_string(),
+                xa.payload_vout,
+                xa.out_value,
+                &[(rig.child.address.clone(), leaf_slot)],
+                NET,
+                SPINE_CSV,
+                rig.rate,
+            )
+            .expect("ancestor split state");
+            let mut csp_tx = parse(&csp.tx_hex);
+            tamper(1, &mut csp_tx);
+            let csp_tx = cosign(&csp_tx, xa.out_value, &g.spk, &g.kp);
+
+            let segment = ChildSegment {
+                statechain_id: "ancestor-sid".into(),
+                funding_vout: 0,
+                extension: Some(tier(&xa_tx, Some(p.ext_csv(0)), xa.payload_vout)),
+                state: tier(&csp_tx, Some(SPINE_CSV), csp.payload_vout),
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+            };
+            let facts = vec![AncestorFacts {
+                num_sigs: CHILD_V2_BASELINE + 2,
+                aggregate_pubkey: Some(g.recorded_xonly.clone()),
+                terminal: true,
+            }];
+            let cb = rig.child_bundle(
+                &root,
+                0,
+                vec![segment],
+                (&csp_tx.txid().to_string(), 0, leaf_slot),
+                |_, _| {},
+            );
+            (cb, facts, xa_tx, csp_tx)
+        }
+
+        /// **THE ANCESTOR OPRET GAP.** `verify_colored_shape` walks `cb.parent.exit_tiers()`;
+        /// `verify_colored_child_shape` walks `child_extension` and `child_state`. Nothing walked
+        /// `cb.ancestors[i]`, so a plain conveyed bundle could carry an ancestor extension with an
+        /// `OP_RETURN` on it — waived by the dust floor, invisible to Σ (the filter drops oprets by
+        /// script), and counted by no colour law anywhere.
+        #[test]
+        fn an_extra_opret_on_an_ancestor_extension_is_refused() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let (cb, facts, xa_tx, _) = ancestor_case(&rig, f_value, |i, tx| {
+                if i == 0 {
+                    tx.output.push(TxOut { value: 0, script_pubkey: second_opret() });
+                }
+            });
+            assert!(cb.parent.rgb.is_none() && cb.rgb.is_none(), "a wholly PLAIN bundle");
+            assert_eq!(oprets(&xa_tx), 1, "the ancestor extension carries an opret…");
+            assert_eq!(oprets(&parse(&cb.child_extension.signed_tx)), 0, "…and nothing else does");
+            assert_eq!(anchors(&xa_tx).len(), 1, "one honest anchor, so that is not what refuses it");
+
+            let msg = rig
+                .verify_child(&cb, f_value, &facts)
+                .expect_err("an ancestor extension carrying an opret must be REFUSED")
+                .to_string();
+            assert_refused_on_opret_count(&msg, 1, 0);
+            assert!(msg.contains("ancestor 0"), "…and it must name the segment, got: {msg}");
+        }
+
+        /// The same gap one tier down, on the intermediate spine `SP_a` — the tier with neither a
+        /// Σ-payload law nor a payload-count law.
+        #[test]
+        fn an_extra_opret_on_an_ancestor_spine_state_is_refused() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let (cb, facts, _, csp_tx) = ancestor_case(&rig, f_value, |i, tx| {
+                if i == 1 {
+                    tx.output.push(TxOut { value: 0, script_pubkey: second_opret() });
+                }
+            });
+            assert_eq!(oprets(&csp_tx), 1);
+
+            let msg = rig
+                .verify_child(&cb, f_value, &facts)
+                .expect_err("an ancestor spine state carrying an opret must be REFUSED")
+                .to_string();
+            assert_refused_on_opret_count(&msg, 1, 0);
+            assert!(msg.contains("ancestor 0"), "…and it must name the segment, got: {msg}");
+        }
+
+        /// A second anchor on an ancestor tier, for completeness — the same lane, the other law.
+        #[test]
+        fn a_second_zero_value_p2a_anchor_on_an_ancestor_state_is_refused() {
+            let rig = rig();
+            let f_value = 200_000u64;
+            let (cb, facts, _, csp_tx) = ancestor_case(&rig, f_value, |i, tx| {
+                if i == 1 {
+                    tx.output.push(TxOut {
+                        value: 0,
+                        script_pubkey: mercurylib::tesr::p2a_script(),
+                    });
+                }
+            });
+            assert_eq!(anchors(&csp_tx).len(), 2);
+
+            let msg = rig
+                .verify_child(&cb, f_value, &facts)
+                .expect_err("an ancestor state carrying two P2A anchors must be REFUSED")
+                .to_string();
+            assert_refused_on_anchor(&msg, "2 P2A anchor");
+            assert!(msg.contains("ancestor 0"), "…and it must name the segment, got: {msg}");
+        }
+
+        // ── THE HONEST BOUNDARY: exactly one anchor at 240, and the coloured lane's ONE opret ──
+
+        /// The acceptance half, and the one that would fail if the anchor law were written as
+        /// "no P2A at all" or the opret law as "none, ever": an honest PLAIN ladder carries exactly
+        /// one 240-sat anchor and no opret per tier, and an honest COLOURED one carries exactly one
+        /// of each. Both must still verify.
+        #[test]
+        fn the_honest_shapes_carry_exactly_one_anchor_at_the_committed_value() {
+            let rig = rig();
+            let plain = rig.root_ladder(200_000, |_, _| {});
+            for t in plain.bundle.exit_tiers() {
+                let tx = parse(&t.signed_tx);
+                assert_eq!(anchors(&tx).len(), 1);
+                assert_eq!(anchors(&tx)[0].1, mercurylib::tesr::P2A_VALUE);
+                assert_eq!(oprets(&tx), 0);
+            }
+            verify_bundle_ex(&plain.bundle, 1 + 3, 1, false, Some(200_000))
+                .expect("an honest plain ladder must keep verifying");
+
+            let floor = colored_ladder_floor(rig.rate, COLORED_LADDER_DUST);
+            let coloured = colored_ladder(&rig, floor);
+            for t in coloured.exit_tiers() {
+                let tx = parse(&t.signed_tx);
+                assert_eq!(anchors(&tx).len(), 1);
+                assert_eq!(anchors(&tx)[0].1, mercurylib::tesr::P2A_VALUE);
+                assert_eq!(oprets(&tx), 1, "one opret — the RGB commitment, and only it");
+            }
+            verify_bundle_ex(&coloured, 1 + 3, 1, false, Some(floor))
+                .expect("an honest COLOURED ladder must keep verifying");
+
+            // …and the honest ancestor + spine-tip lanes, which the new bindings also gate.
+            let (cb, facts, _, _) = ancestor_case(&rig, 200_000, |_, _| {});
+            rig.verify_child(&cb, 200_000, &facts)
+                .expect("an honest CATS bundle with an intermediate segment must keep verifying");
+            tip(&rig, 100_000, |_| {}).validate().expect("an honest spine tip must keep validating");
+        }
+    }
+}
+
+/// **[P0-3] THE EXIT-CHAIN LENGTH CAP.**
+///
+/// The defect these tests pin is a GAP BETWEEN TWO RULES, not a missing rule. `check_exit_headroom`
+/// bounds an exit in BLOCKS and charges a tier `csv + 1`. A SPINE tier is signed at `SPINE_CSV = 0`,
+/// so it costs exactly ONE block while adding a whole transaction. Nothing anywhere bounded the
+/// transaction count, so a sender who re-batched the same spine tip could hand out pieces whose exit
+/// walks were thousands of transactions long and which the headroom gate reported as comfortably
+/// inside the funding epoch.
+///
+/// Every test here works in the two units the gap lives between — BLOCKS and TRANSACTIONS — and the
+/// first one asserts BOTH on the same chain, so the gap itself is a regression test rather than a
+/// claim in a comment.
+#[cfg(test)]
+mod exit_chain_length_cap_tests {
+    use super::*;
+    use mercurylib::tesr::TesrParams;
+    use mercurylib::transfer::receiver::{check_exit_headroom, exit_wait_blocks, max_split_depth};
+
+    /// Deployed epoch lengths. Mainnet is `server_config.rs`'s default; regtest is `Settings.toml`.
+    const MAINNET_EPOCH: u32 = 10_000;
+    const REGTEST_EPOCH: u32 = 1_000;
+
+    /// The exit chain of a depth-1 child, in broadcast order — the same five entries
+    /// `enforce_split_depth_cap_shaped` models.
+    fn base(p: TesrParams) -> Vec<Option<u16>> {
+        vec![None, Some(p.ext_csv(0)), Some(SPINE_CSV), Some(p.ext_csv(0)), Some(p.state_csv(0))]
+    }
+
+    /// A depth-`d` TWO-TIER child's chain: the base with `d − 1` two-tier levels spliced in.
+    fn two_tier_chain(p: TesrParams, d: u32) -> Vec<Option<u16>> {
+        let mut chain = base(p);
+        for _ in 1..d {
+            chain.splice(3..3, [Some(p.ext_csv(0)), Some(SPINE_CSV)]);
+        }
+        chain
+    }
+
+    fn cap(p: TesrParams, epoch: u32) -> u32 {
+        max_exit_txs(p, epoch)
+    }
+
+    // =============================================================================================
+    // STEP 1 — THE ADVERSARIAL SHAPE: long in TRANSACTIONS, short in BLOCKS.
+    // =============================================================================================
+
+    /// **THE GAP, in one chain.** An all-spine walk that the latency rule admits and the length cap
+    /// refuses. The first half of this test is a statement about the EXISTING rule and passes with or
+    /// without the cap — that is the point: it is the proof that the second half is closing a real
+    /// hole and not restating a check that already existed.
+    #[test]
+    fn a_spine_inflated_chain_passes_the_latency_rule_and_must_be_refused_on_length() {
+        let p = TesrParams::mainnet();
+
+        // 7 115 spine levels, each one transaction and one block, spliced under the root `SP`.
+        let mut chain = base(p);
+        chain.splice(3..3, std::iter::repeat(Some(SPINE_CSV)).take(7_115));
+        assert_eq!(chain.len(), 7_120, "5 base tiers + 7 115 spine tiers");
+
+        // ---- THE EXISTING RULE SAYS YES ----------------------------------------------------------
+        let required = exit_wait_blocks(&chain);
+        assert_eq!(required, 10_000, "2 885 for the base + one block per spine tier");
+        let slack = check_exit_headroom(&chain, 0, MAINNET_EPOCH).expect(
+            "THIS IS THE DEFECT: the latency gate admits a 7 120-transaction, ~1.2 MB exit walk \
+             because a spine tier costs it exactly one block",
+        );
+        assert_eq!(slack, 0, "it lands exactly on the epoch boundary — admitted, by the letter");
+
+        // ---- THE NEW RULE SAYS NO ----------------------------------------------------------------
+        let e = enforce_exit_chain_length("conveyed child", chain.len(), p, MAINNET_EPOCH)
+            .expect_err(
+                "a 7 120-transaction exit walk must be REFUSED on length, whatever its latency",
+            )
+            .to_string();
+        assert!(e.contains("exit-chain length cap"), "must refuse by name, got: {e}");
+        assert!(e.contains("7120"), "the refusal must state the measured length, got: {e}");
+        assert!(e.contains("23"), "…and the cap it broke, got: {e}");
+    }
+
+    /// The same attack expressed as a real `ChildTesrBundle` walking the ADMISSION lane's own
+    /// measurement (`child_exit_chain`), on the regtest schedule the E2Es run.
+    ///
+    /// 900 spine ancestors: the walk is 905 transactions and 977 blocks, so it clears a 1 000-block
+    /// epoch with 23 blocks to spare. This is what a sender who re-batched one spine tip 900 times
+    /// hands its payees.
+    #[test]
+    fn a_spine_inflated_child_bundle_is_refused_by_the_admission_measurement() {
+        let cb = spine_inflated_child(900);
+        let chain = child_exit_chain(&cb);
+        assert_eq!(chain.len(), 905, "parent T,X,S (3) + 900 spine ancestors + child ext,state (2)");
+
+        // The latency rule, on the very chain the admission lane measures, still says yes.
+        let csvs: Vec<Option<u16>> = chain.iter().map(|(_, csv)| *csv).collect();
+        let required = exit_wait_blocks(&csvs);
+        assert_eq!(required, 977);
+        check_exit_headroom(&csvs, 0, REGTEST_EPOCH)
+            .expect("THE DEFECT: 905 transactions still fit inside a 1 000-block regtest epoch");
+
+        // The length cap does not.
+        let p = TesrParams::regtest();
+        assert_eq!(cap(p, REGTEST_EPOCH), 139);
+        let e = enforce_exit_chain_length("conveyed child", chain.len(), p, REGTEST_EPOCH)
+            .expect_err("a 905-transaction child exit walk must be refused at admission")
+            .to_string();
+        assert!(e.contains("905") && e.contains("139"), "got: {e}");
+    }
+
+    /// The BUILD side refuses the same shape before it is minted — measured the way
+    /// `enforce_split_depth_cap_shaped` measures it (`parent tiers + level tiers + leaf's two`),
+    /// which is the arithmetic the length check there runs.
+    #[test]
+    fn the_builder_refuses_a_spine_batch_that_would_push_a_leaf_over_the_cap() {
+        let p = TesrParams::mainnet();
+        let build_txs = |spine_levels: usize| 3 + spine_levels + 2;
+
+        // Batch 19 mints a leaf under 18 spine ancestors plus this batch's own: 23 transactions.
+        assert_eq!(build_txs(19), 24);
+        enforce_exit_chain_length("in-ladder split", build_txs(18), p, MAINNET_EPOCH)
+            .expect("batch 19's leaf is exactly 23 transactions and must still be buildable");
+        let e = enforce_exit_chain_length("in-ladder split", build_txs(19), p, MAINNET_EPOCH)
+            .expect_err("batch 20's leaf is 24 transactions and must be refused BEFORE minting")
+            .to_string();
+        assert!(e.contains("in-ladder split"), "the refusing lane must be named, got: {e}");
+
+        // And the latency rule would have waved batch 20 — and batch 7 000 — straight through.
+        let mut chain = base(p);
+        chain.splice(3..3, std::iter::repeat(Some(SPINE_CSV)).take(19));
+        check_exit_headroom(&chain, 0, MAINNET_EPOCH)
+            .expect("19 spine levels cost 19 blocks — the latency rule cannot see this attack");
+    }
+
+    // =============================================================================================
+    // STEP 2 — EVERY SHAPE THE BUILDERS HONESTLY PRODUCE MUST STILL BE ADMITTED.
+    // =============================================================================================
+
+    /// **The boundary the cap is DERIVED from.** The deepest two-tier child the latency rule admits
+    /// on mainnet is depth 10; its walk is `3 + 2·10 = 23` transactions; the cap is 23; and it is
+    /// ADMITTED. The two bounds meet exactly, which is why the predicate must be `>` and not `>=`.
+    #[test]
+    fn the_deepest_two_tier_child_the_latency_rule_admits_lands_exactly_on_the_cap() {
+        let p = TesrParams::mainnet();
+        let per_level = SplitLevelShape::TwoTier.csvs(p);
+        assert_eq!(exit_wait_blocks(&base(p)), 2_885, "T 1 + X 721 + SP 1 + ext 721 + state 1441");
+        assert_eq!(exit_wait_blocks(&per_level), 722, "a two-tier level pays full price");
+        assert_eq!(max_split_depth(&base(p), &per_level, MAINNET_EPOCH), 10);
+        assert_eq!(cap(p, MAINNET_EPOCH), 23, "3 + 2·10 — the same rule, counted in transactions");
+
+        // Depth 10 fits in BOTH units, and is accepted by both.
+        let d10 = two_tier_chain(p, 10);
+        assert_eq!(d10.len(), 23);
+        assert_eq!(exit_wait_blocks(&d10), 9_383);
+        check_exit_headroom(&d10, 0, MAINNET_EPOCH).expect("depth 10 fits the epoch in blocks");
+        enforce_exit_chain_length("conveyed child", d10.len(), p, MAINNET_EPOCH)
+            .expect("the deepest honest two-tier child must be ADMITTED, exactly at the cap");
+
+        // One transaction more is refused — `>` and not `>=` is what makes the line fall here.
+        enforce_exit_chain_length("conveyed child", 24, p, MAINNET_EPOCH)
+            .expect_err("24 transactions is over the cap");
+
+        // Depth 11 is over BOTH bounds, so nothing honest lives past the line.
+        let d11 = two_tier_chain(p, 11);
+        assert_eq!(d11.len(), 25);
+        assert_eq!(exit_wait_blocks(&d11), 10_105);
+        check_exit_headroom(&d11, 0, MAINNET_EPOCH)
+            .expect_err("depth 11 already fails the latency rule — the cap refuses nothing new");
+    }
+
+    /// Every honest spine-batch shape, in both units. A piece from batch `i` is `i + 4` transactions
+    /// and the tip minted beside it is `i + 3` — always exactly one shorter, which is why the tip
+    /// needs no call site of its own and can never be the binding constraint.
+    #[test]
+    fn honest_spine_batch_pieces_and_tips_are_admitted_up_to_batch_nineteen() {
+        let p = TesrParams::mainnet();
+        let piece_txs = |i: usize| i + 4;
+        let tip_txs = |i: usize| i + 3;
+
+        assert_eq!(piece_txs(1), 5, "batch 1 is a plain root split: T, X, SP, ext, state");
+        assert_eq!(tip_txs(1), 4, "T, X, SP, cap");
+
+        for i in 1..=19 {
+            enforce_exit_chain_length("conveyed child", piece_txs(i), p, MAINNET_EPOCH)
+                .unwrap_or_else(|e| panic!("batch {i}'s piece is honest and must be admitted: {e}"));
+            enforce_exit_chain_length("spine tip", tip_txs(i), p, MAINNET_EPOCH)
+                .unwrap_or_else(|e| panic!("batch {i}'s tip must be admitted: {e}"));
+            assert_eq!(
+                tip_txs(i) + 1,
+                piece_txs(i),
+                "the tip is ALWAYS exactly one transaction shorter than the leaf minted with it"
+            );
+        }
+        assert_eq!(piece_txs(19), 23, "batch 19 is the last one that fits");
+        enforce_exit_chain_length("conveyed child", piece_txs(20), p, MAINNET_EPOCH)
+            .expect_err("batch 20's piece is 24 transactions — refused");
+        // The tip minted by batch 20 is still 23, so the sender's own change leg stays exitable
+        // even in the batch that can no longer mint pieces. That asymmetry is deliberate.
+        enforce_exit_chain_length("spine tip", tip_txs(20), p, MAINNET_EPOCH)
+            .expect("the tip at the cap keeps its exit — refusing it would strand the sender");
+    }
+
+    /// The coloured lane. `CTESR_CARRIER_SEND_DEPTH = 1`, so a coloured child is a five-transaction
+    /// walk on every preset — nowhere near any cap, which is what makes adding the previously-absent
+    /// builder guard to `cosign_colored_in_ladder_split` a no-op for honest traffic.
+    #[test]
+    fn an_honest_coloured_carrier_child_is_admitted_on_every_preset() {
+        for (p, epoch) in
+            [(TesrParams::mainnet(), MAINNET_EPOCH), (TesrParams::regtest(), REGTEST_EPOCH)]
+        {
+            enforce_exit_chain_length("conveyed child", 5, p, epoch)
+                .expect("a depth-1 coloured child is 5 transactions and must be admitted");
+        }
+    }
+
+    /// The FLAT root lane. A ladder that has rolled over `L` times is `1 + 2L` transactions, and the
+    /// latency rule bounds `L` to 4 on mainnet — so every root ladder the code can build is at most
+    /// 9 transactions against a cap of 23. The cap is LOOSE here and deliberately so: it is a bound
+    /// where there was none, not a re-derivation of the flat lane's own (still missing) headroom rule.
+    #[test]
+    fn every_root_ladder_the_latency_rule_allows_is_admitted_by_the_length_cap() {
+        let p = TesrParams::mainnet();
+        let level = exit_wait_blocks(&[Some(p.ext_csv(0)), Some(p.state_csv(0))]);
+        assert_eq!(level, 2_162, "each rollover level costs its extension and its state");
+
+        let mut deepest_admitted = 0;
+        for l in 1..=8u32 {
+            let txs = (1 + 2 * l) as usize;
+            let chain: Vec<Option<u16>> = std::iter::once(None)
+                .chain(
+                    std::iter::repeat([Some(p.ext_csv(0)), Some(p.state_csv(0))])
+                        .take(l as usize)
+                        .flatten(),
+                )
+                .collect();
+            assert_eq!(chain.len(), txs);
+            if check_exit_headroom(&chain, 0, MAINNET_EPOCH).is_ok() {
+                deepest_admitted = l;
+                enforce_exit_chain_length("conveyed root ladder", txs, p, MAINNET_EPOCH)
+                    .unwrap_or_else(|e| {
+                        panic!("a {l}-level root ladder fits the epoch in blocks and must be admitted: {e}")
+                    });
+            }
+        }
+        assert_eq!(deepest_admitted, 4, "1 + 4·2163 = 8 653 fits; a 5th level does not");
+        assert_eq!((1 + 2 * deepest_admitted) as u32, 9, "…so 9 transactions, against a cap of 23");
+    }
+
+    /// The regtest cap against the deepest shape any E2E in this repo builds (sdk17's depth-2
+    /// grandchild, 7 transactions). 20× headroom — the cap cannot pre-empt an existing test's own
+    /// refusal and turn a named assertion into a length refusal.
+    #[test]
+    fn the_regtest_cap_leaves_every_shape_the_e2es_build_untouched() {
+        let p = TesrParams::regtest();
+        assert_eq!(exit_wait_blocks(&base(p)), 53);
+        assert_eq!(max_split_depth(&base(p), &SplitLevelShape::TwoTier.csvs(p), REGTEST_EPOCH), 68);
+        assert_eq!(cap(p, REGTEST_EPOCH), 139);
+        for txs in [3usize, 4, 5, 6, 7, 9] {
+            enforce_exit_chain_length("conveyed child", txs, p, REGTEST_EPOCH)
+                .unwrap_or_else(|e| panic!("{txs} transactions is ordinary regtest traffic: {e}"));
+        }
+    }
+
+    /// **The floor.** `max_split_depth` returns 0 when even a depth-1 child does not fit, so the cap
+    /// collapses to `3 + 0` — which is EXACTLY a minimal root ladder (`T`, `X_0`, `S_0`). A test
+    /// harness with an absurdly short epoch therefore still admits the shortest chain the protocol
+    /// can build; it can never refuse a coin for being shorter than the shortest possible coin.
+    #[test]
+    fn the_cap_never_falls_below_a_minimal_root_ladder() {
+        for epoch in [0u32, 1, 100, 2_884] {
+            let p = TesrParams::mainnet();
+            assert_eq!(max_split_depth(&base(p), &SplitLevelShape::TwoTier.csvs(p), epoch), 0);
+            assert_eq!(cap(p, epoch), 3, "the floor is a minimal root ladder, never less");
+            enforce_exit_chain_length("conveyed root ladder", 3, p, epoch)
+                .expect("T, X_0, S_0 must be admissible under any epoch whatsoever");
+        }
+    }
+
+    // =============================================================================================
+    // BUILD ⇄ ADMISSION AGREEMENT, AND THE ROLLED-OVER PARENT THAT USED TO BREAK IT.
+    // =============================================================================================
+
+    /// **The build side and the admission side must measure the SAME chain.** The build side models
+    /// the parent as `base`'s five entries, i.e. a ONE-level ladder; the admission side walks
+    /// `parent.exit_tiers()`, which is `1 + 2·levels.len()`. On a ROLLED-OVER parent those disagree
+    /// by `2·(R−1)` transactions — and a build side that under-counted would mint children no
+    /// receiver would adopt, AFTER the parent had been terminalized. That is why the builder's length
+    /// arithmetic takes the parent's real tier count as an argument.
+    #[test]
+    fn the_builder_and_the_receiver_count_the_same_transactions_on_a_rolled_over_parent() {
+        for rollovers in 1..=3usize {
+            for spine_ancestors in 0..=3usize {
+                let cb = spine_inflated_child_over(rollovers, spine_ancestors);
+
+                // What the RECEIVER measures.
+                let admitted = child_exit_chain(&cb).len();
+
+                // What the BUILDER measures, verbatim from `enforce_split_depth_cap_shaped`'s body:
+                //   parent_exit_tiers + Σ level tiers + the leaf's own two.
+                let parent_exit_tiers = cb.parent.exit_tiers().len();
+                assert_eq!(parent_exit_tiers, 1 + 2 * rollovers);
+                let levels: Vec<SplitLevelShape> =
+                    cb.ancestors.iter().map(SplitLevelShape::of).collect();
+                let level_tiers: usize =
+                    levels.iter().map(|l| l.csvs(cb.parent.params).len()).sum();
+                let built = parent_exit_tiers + level_tiers + 2;
+
+                assert_eq!(
+                    built, admitted,
+                    "rollovers={rollovers} spine_ancestors={spine_ancestors}: the builder and the \
+                     receiver must count the same walk, or the builder mints children nobody adopts"
+                );
+            }
+        }
+    }
+
+    // =============================================================================================
+    // WIRING — WHERE THE CAP IS, AND (LOAD-BEARING) WHERE IT IS NOT.
+    // =============================================================================================
+
+    /// **THE MOST IMPORTANT PROPERTY IN THIS FILE.** Refusing to ACCEPT or to CREATE is safe.
+    /// Refusing to EXIT strands a coin that is already someone's — strictly worse than the hole the
+    /// cap closes. Every function on the broadcast path is asserted CLEAN of the cap, by source text,
+    /// so a later edit that "adds it for symmetry" turns this red instead of bricking a real coin.
+    #[test]
+    fn the_length_cap_is_not_reachable_from_the_exit_path() {
+        let src = include_str!("tesr.rs");
+        // COMMENTS ARE STRIPPED. Every assertion below is about what the function DOES, and the
+        // comments here talk about the checks at length — an ordering assertion that matched a
+        // comment describing the check would be satisfied by prose alone.
+        let cut = |marker: &str| -> String {
+            let at = src.find(marker).unwrap_or_else(|| panic!("{marker} not found"));
+            src[at..at + src[at..].find("\n}\n").expect("function ends")]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // ---- THE EXIT PATH — must contain NEITHER the gate nor anything that derives the cap ------
+        for f in [
+            "\npub fn exit_pass(",
+            "\npub fn next_exit_tier(",
+            "\npub fn exit_child_pass(",
+            "\npub fn next_child_exit_tier(",
+            "\npub fn child_exit_chain(",
+            "\npub fn child_exit_chain_bound(",
+            "\npub fn spine_tip_exit_chain(",
+            "\npub fn spine_tip_exit_chain_bound(",
+            "\npub fn exit_spine_tip_pass(",
+            "\nfn watch_spine_tip_pass_seen(",
+            "\npub fn next_spine_tip_exit_tier(",
+        ] {
+            let body = cut(f);
+            assert!(
+                !body.contains("enforce_exit_chain_length")
+                    && !body.contains("max_exit_txs")
+                    && !body.contains("check_exit_chain_length")
+                    && !body.contains("ExitChainTooLong"),
+                "{f} IS ON THE BROADCAST PATH. A length refusal here makes an over-long coin \
+                 UNEXITABLE — the catastrophic direction. Put the cap at admission or at build, \
+                 never here."
+            );
+        }
+
+        // ---- ADMISSION — the conveyed-child lane, ABOVE the structural bind ----------------------
+        let admit = cut("\npub async fn verify_conveyed_child(");
+        assert!(
+            admit.contains("enforce_exit_chain_length("),
+            "the hostile lane — a whole ChildTesrBundle off the mailbox with an attacker-length \
+             `ancestors` — must carry the cap"
+        );
+        assert!(
+            admit.find("enforce_exit_chain_length(").unwrap()
+                < admit.find("child_exit_chain_bound(cb)?").unwrap(),
+            "the count must be refused BEFORE `child_exit_chain_bound` hex-decodes and deserialises \
+             every attacker-supplied transaction — that ordering IS the DoS margin"
+        );
+        assert!(
+            admit.contains("TesrParams::for_network(&cc.network.to_string())"),
+            "[B1] the schedule must be the RECEIVER's preset; `cb.parent.params` is conveyed and \
+             would let the sender set its own cap (the C-1 shape)"
+        );
+        // …and the conveyed schedule appears ONLY in prose warning against it, never in code.
+        assert!(
+            !admit.contains("cb.parent.params"),
+            "the conveyed schedule must not be read by any executable line of this function"
+        );
+
+        // ---- BUILD — above the latency rule's early return ---------------------------------------
+        //
+        // The cap arithmetic lives in the PURE `split_cap_decision`; the async wrapper only fetches
+        // the epoch and settles the schedule's provenance. Both halves are asserted, so the split
+        // cannot be used to lose either the check or its ordering.
+        let wrapper = cut("\nasync fn enforce_split_depth_cap_shaped(");
+        assert!(
+            wrapper.contains("split_cap_decision("),
+            "the async builder gate must delegate to the pure decision, or the cap is unreachable"
+        );
+        let build = cut("\nfn split_cap_decision(");
+        assert!(build.contains("enforce_exit_chain_length("), "the builder must carry the cap");
+        assert!(
+            build.find("enforce_exit_chain_length(").unwrap()
+                < build.find("if required <= epoch_blocks {").unwrap(),
+            "THE DEFECT VERBATIM: an all-spine chain satisfies `required <= epoch_blocks` and \
+             returns Ok there. A length check placed BELOW that early return is never reached."
+        );
+        assert!(
+            build.contains("parent_exit_tiers + level_tiers + 2"),
+            "the builder must measure the parent's REAL tier count, not `base`'s one-level model"
+        );
+
+        // ---- BUILD — the coloured lane, which had NO cap at all before this change ---------------
+        let coloured = cut("\npub async fn cosign_colored_in_ladder_split(");
+        assert!(
+            coloured.contains("enforce_split_depth_cap("),
+            "this was the one builder with no depth/length cap — uncovered by construction"
+        );
+        assert!(
+            coloured.find("enforce_split_depth_cap(").unwrap()
+                < coloured.find("set_spend_budget(").expect("the carrier IS terminalized here"),
+            "the cap must be checked BEFORE the carrier is terminalized, or a refusal costs the \
+             parent its last budget slot and leaves the carrier permanently terminal server-side"
+        );
+
+        // ---- BUILD — the other three call sites all pass the parent's real tier count ------------
+        for (f, expected) in [
+            ("\npub async fn in_ladder_split(", "bundle.exit_tiers().len()"),
+            ("\npub async fn spine_batch_split(", "tip.parent.exit_tiers().len()"),
+            ("\npub async fn child_in_ladder_split(", "cb.parent.exit_tiers().len()"),
+        ] {
+            assert!(cut(f).contains(expected), "{f} must pass {expected} to the depth/length cap");
+        }
+    }
+
+    /// The FLAT lane's two admission doors live in another file; pin them there.
+    #[test]
+    fn the_flat_lane_carries_the_cap_at_both_admission_doors() {
+        let src = include_str!("transfer_receiver.rs");
+        assert_eq!(
+            src.matches("enforce_exit_chain_length(").count(),
+            2,
+            "both the PRE-PAY census and the CLAIM path must refuse an over-long root ladder — \
+             `rollover` pushes a level per exhausted epoch with no bound but the state-rung floor"
+        );
+        assert_eq!(
+            src.matches("TesrParams::for_network(network)").count(),
+            2,
+            "[B1] both must derive the schedule from the receiver's own network, not `bundle.params`"
+        );
+    }
+
+    // =============================================================================================
+    // FIXTURES
+    // =============================================================================================
+
+    /// A `ChildTesrBundle` over a one-level regtest parent with `n` SPINE ancestor segments — the
+    /// shape a sender produces by re-batching one spine tip `n` times.
+    fn spine_inflated_child(n: usize) -> ChildTesrBundle {
+        spine_inflated_child_over(1, n)
+    }
+
+    /// As above, over a parent that has ROLLED OVER `rollovers` times (so its own exit chain is
+    /// `1 + 2·rollovers` transactions).
+    fn spine_inflated_child_over(rollovers: usize, n: usize) -> ChildTesrBundle {
+        let mut parent = super::verify_tests::sample_bundle();
+        let lvl = parent.levels[0].clone();
+        while parent.levels.len() < rollovers {
+            parent.levels.push(lvl.clone());
+        }
+        let spine_state = TesrTier { csv: Some(SPINE_CSV), ..lvl.state.clone() };
+        let ancestors: Vec<ChildSegment> = (0..n)
+            .map(|i| ChildSegment {
+                statechain_id: format!("ancestor-{i}"),
+                funding_vout: 0,
+                // `extension: None` IS the spine shape — one tier, re-anchored on its own funding
+                // outpoint. That is what makes each level cost a transaction and a single block.
+                extension: None,
+                state: spine_state.clone(),
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+            })
+            .collect();
+        ChildTesrBundle {
+            parent,
+            parent_statechain_id: "sid".into(),
+            sp_vout: 0,
+            child_statechain_id: "child-sid".into(),
+            child_owner_exit_address: super::verify_tests::OWNER.into(),
+            child_extension: lvl.extension,
+            child_state: lvl.state,
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+            ancestors,
+            rgb: None,
+            parent_flat_backups: vec![],
+        }
+    }
+}
+
+/// # [C-1] THE CAP-SCHEDULE PROVENANCE ATTACK
+///
+/// The exit-chain length cap ([P0-3]) is a comparison, and like every comparison in this file it has
+/// TWO ends. The chain being measured is the artifact's; the yardstick is `TesrParams`. Until this
+/// module the two SIDES of the protocol read that yardstick from different places:
+///
+/// * **ADMISSION** — `verify_conveyed_child` and both flat-lane doors in `transfer_receiver.rs` cap
+///   with `TesrParams::for_network(<the receiver's own network>)`.
+/// * **BUILD** — `in_ladder_split`, `cosign_colored_in_ladder_split`, `spine_batch_split` and
+///   `child_in_ladder_split` capped with `bundle.params` / `cb.parent.params` / `tip.parent.params`
+///   — a plain serde field on the CONVEYED artifact, never validated against anything.
+///
+/// **The attack is not against the sender's own coin — it is against the VICTIM'S NEXT PAYMENT.** A
+/// hostile sender hands the victim a bundle declaring the REGTEST schedule while the wallet is on
+/// mainnet. Nothing refuses it: the schedule is not a value, no signature commits to it, and the SE
+/// is blind. The victim later splits that coin. Its builder derives a cap of 139 transactions from
+/// the conveyed schedule and happily mints a 24-transaction chain. Every receiver the victim then
+/// pays derives 23 from its OWN preset and refuses the piece — and by then the builders have already
+/// terminalized the parent (`set_spend_budget`), so the parent is unilateral-exit-only and the piece
+/// is unspendable. One `u16` the attacker chose, and the victim's coin is stranded.
+///
+/// This is the same shape as `forged_yardstick_attack_tests`: a sender-chosen `fee_rate` used as the
+/// conservation yardstick, closed by pinning it to `TesrParams::for_network(&cc.network)`. Same
+/// disease (**C-1: authority derived from the artifact being checked**), same cure.
+///
+/// **Read the names.** `the_conveyed_schedule_is_*` are the non-vacuity controls — they establish
+/// that the conveyed field really is a lever and really does strand the victim, and they pass with
+/// or without the fix. The rest are the fix.
+#[cfg(test)]
+mod cap_params_provenance_tests {
+    use super::*;
+    use mercurylib::tesr::TesrParams;
+
+    /// `server_config.rs`'s deployed mainnet `lockheight_init`.
+    const MAINNET_EPOCH: u32 = 10_000;
+    /// A mainnet wallet's own network string, exactly as `cc.network.to_string()` renders it.
+    const MAINNET: &str = "bitcoin";
+
+    /// The victim's ladder is a plain one-level root (`T`, `X_0`) → 1 exit tier in `exit_tiers()`.
+    const ONE_LEVEL_PARENT: usize = 1;
+
+    /// A split shape whose leaf walks exactly `txs` transactions, built the way the builders build:
+    /// `parent_exit_tiers + Σ level tiers + the leaf's own two`. Spine levels, because those are the
+    /// cheap-in-blocks / expensive-in-transactions ones the length cap exists for — a chain made of
+    /// them sails through the latency rule, so anything that refuses it refused it on LENGTH.
+    fn spine_levels(txs: usize) -> Vec<SplitLevelShape> {
+        vec![SplitLevelShape::Spine; txs - ONE_LEVEL_PARENT - 2]
+    }
+
+    // =============================================================================================
+    // THE CONTROLS — the lever is real, and pulling it really does strand the victim.
+    // =============================================================================================
+
+    /// **THE LEVER.** The cap is a function of the schedule, and the two shipped presets put it six
+    /// times apart on the same epoch. A sender who picks the schedule picks the victim's cap.
+    ///
+    /// ⚠️ The literal below was written as `139` and that number is the regtest cap on the REGTEST
+    /// epoch (`lockheight_init = 1 000`, `max_exit_txs` docs). On the MAINNET epoch this test
+    /// measures, the regtest schedule's cap is **1 425** — the lever is 62-fold, not 6-fold. The
+    /// constant is corrected, not the assertion: nothing here is loosened, `forged > honest * 6` is
+    /// untouched, and the attack this documents is strictly larger than it was written to be.
+    #[test]
+    fn the_conveyed_schedule_is_a_six_fold_lever_on_the_cap() {
+        let honest = max_exit_txs(TesrParams::mainnet(), MAINNET_EPOCH);
+        let forged = max_exit_txs(TesrParams::regtest(), MAINNET_EPOCH);
+        assert_eq!(honest, 23, "the mainnet schedule caps a mainnet epoch at 23 transactions");
+        assert_eq!(forged, 1425, "…the regtest schedule, on the SAME epoch, at 1425");
+        assert!(forged > honest * 6, "a conveyed schedule moves the cap by more than 6x");
+    }
+
+    /// **THE STRANDING.** 24 transactions: one over what the victim's own receivers admit. This is
+    /// the number the attack aims the victim at, and it is refused at admission — so if the builder
+    /// ever mints it, the piece is dead on arrival and the parent has already been terminalized.
+    #[test]
+    fn the_conveyed_schedule_buys_a_chain_the_victims_own_receivers_refuse() {
+        let e = enforce_exit_chain_length(
+            "conveyed child",
+            24,
+            TesrParams::for_network(MAINNET),
+            MAINNET_EPOCH,
+        )
+        .expect_err("a 24-transaction walk is over the mainnet cap and must be refused at admission")
+        .to_string();
+        assert!(e.contains("exit-chain length cap"), "refused by name, got: {e}");
+        assert!(e.contains("24") && e.contains("23"), "naming both numbers, got: {e}");
+
+        // …and the honest boundary is untouched: 23 is the deepest shape the builders legitimately
+        // produce and it must still be ADMITTED, or this cap refuses real traffic.
+        enforce_exit_chain_length("conveyed child", 23, TesrParams::for_network(MAINNET), MAINNET_EPOCH)
+            .expect("23 is exactly the cap and must be admitted");
+    }
+
+    // =============================================================================================
+    // THE ATTACK — a conveyed schedule must not move the BUILDER's cap.
+    // =============================================================================================
+
+    /// **THE ATTACK, RUN.** A mainnet wallet, a bundle conveying the regtest schedule, and a split
+    /// that would mint a 24-transaction leaf. The builder must refuse it — it is the number the test
+    /// above just proved every receiver rejects.
+    ///
+    /// Note which side is asserted: NOT "the sender's bundle is rejected" (a sender is free to send
+    /// whatever it likes) but "the victim does not BUILD over the cap its own payees enforce".
+    #[test]
+    fn a_conveyed_schedule_cannot_inflate_the_builders_own_cap() {
+        let forged = TesrParams::regtest();
+        let levels = spine_levels(24);
+
+        let p = cap_schedule(MAINNET, forged)
+            .unwrap_or_else(|_| TesrParams::for_network(MAINNET));
+        let e = split_cap_decision(p, &levels, ONE_LEVEL_PARENT, MAINNET_EPOCH)
+            .expect_err(
+                "THE DEFECT: the conveyed regtest schedule raises the BUILD cap to 139 while every \
+                 receiver caps at 23, so the builder mints a 24-transaction leaf nobody will adopt \
+                 — after the parent has already been terminalized",
+            )
+            .to_string();
+        assert!(e.contains("exit-chain length cap"), "refused on LENGTH, got: {e}");
+        assert!(e.contains("24") && e.contains("23"), "naming the measured walk and the cap: {e}");
+    }
+
+    /// **THE GENERAL PROPERTY.** For every network the wallet can be on and every schedule a sender
+    /// can declare, the number the BUILD side caps at is the number the ADMISSION side caps at.
+    /// Anything less is a build that strands a coin at someone else's door.
+    #[test]
+    fn the_build_side_and_the_admission_side_cap_at_the_same_number() {
+        for network in ["bitcoin", "mainnet", "regtest", "signet", "testnet"] {
+            let admission = TesrParams::for_network(network);
+            for (name, conveyed) in [
+                ("mainnet", TesrParams::mainnet()),
+                ("regtest", TesrParams::regtest()),
+                ("hand-rolled", TesrParams { d0: 3, delta: 1, d_floor: 1, e0: 2, delta_e: 1, e_floor: 1, m_max: 1, committed_fee_rate: 2.0 }),
+            ] {
+                for epoch in [1_000u32, 10_000, 4_289] {
+                    // Either the conveyed schedule is REFUSED outright, or it is IGNORED in favour of
+                    // the wallet's own preset. What must never happen is that it is USED.
+                    if let Ok(p) = cap_schedule(network, conveyed) {
+                        assert_eq!(
+                            max_exit_txs(p, epoch),
+                            max_exit_txs(admission, epoch),
+                            "network={network} conveyed={name} epoch={epoch}: the builder caps at a \
+                             different number from the receivers it is building for"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **REFUSED LOUDLY, NOT SILENTLY IGNORED.** Quietly substituting the right schedule would close
+    /// the stranding, but it would also let a wallet go on holding an artifact whose declared
+    /// schedule contradicts the network it is on — and every OTHER reader of `params` in this file
+    /// (the CSV band in `verify_bundle_ex`, `verify_child_bundle`, `SpineTipBundle::validate`) is
+    /// still trusting that field. The mismatch is a fact about the artifact, so it is an error, and
+    /// the error names the field that disagreed.
+    #[test]
+    fn a_conveyed_schedule_that_contradicts_the_network_is_refused_by_name() {
+        let e = cap_schedule(MAINNET, TesrParams::regtest())
+            .expect_err("the regtest schedule on a mainnet wallet must be REFUSED, not ignored")
+            .to_string();
+        assert!(e.contains("d0"), "the refusal must name the field that disagreed, got: {e}");
+        assert!(e.contains("24") && e.contains("1440"), "…and both values, got: {e}");
+        assert!(e.contains("bitcoin"), "…and the network whose preset is the authority, got: {e}");
+    }
+
+    /// **NON-VACUITY.** The honest schedule — which is what every shipped builder writes onto every
+    /// bundle (`TesrParams::for_network(network)`, `tesr.rs:1414`/`:1755`) — must pass, on every
+    /// network, and must leave the deepest legitimate shape buildable.
+    #[test]
+    fn the_honest_schedule_is_accepted_on_every_network_and_still_builds_the_deepest_shape() {
+        for network in ["bitcoin", "mainnet", "regtest", "signet", "testnet"] {
+            let honest = TesrParams::for_network(network);
+            let p = cap_schedule(network, honest)
+                .unwrap_or_else(|e| panic!("{network}: the wallet's own preset must be accepted: {e}"));
+            assert_eq!(p, honest, "{network}: and it must be the schedule that is used");
+        }
+        // The mainnet-max shape: 23 transactions, the boundary `check_exit_chain_length` admits.
+        let p = cap_schedule(MAINNET, TesrParams::mainnet()).expect("honest");
+        split_cap_decision(p, &spine_levels(23), ONE_LEVEL_PARENT, MAINNET_EPOCH)
+            .expect("23 transactions is exactly the cap and must still BUILD");
+    }
+
+    /// **EVERY KNOB, NOT JUST THE LOUD ONE.** The two shipped presets differ in all eight fields, so
+    /// a test that only ever compares `regtest` against `mainnet` is satisfied by a binder that
+    /// checks `d0` alone — and a schedule forged in ONE field is the interesting attack, because
+    /// `ext_csv`/`state_csv` read `e0`/`delta_e`/`e_floor`/`d0`/`delta`/`d_floor` independently and
+    /// each of them moves `exit_cap_shapes`. Walk the fields one at a time, off the wallet's own
+    /// preset, and require the refusal to NAME the one that was moved.
+    #[test]
+    fn a_schedule_forged_in_any_single_field_is_refused_and_that_field_is_named() {
+        let honest = TesrParams::for_network(MAINNET);
+        let mutate: [(&str, fn(&mut TesrParams)); 8] = [
+            ("d0", |p| p.d0 += 1),
+            ("delta", |p| p.delta += 1),
+            ("d_floor", |p| p.d_floor += 1),
+            ("e0", |p| p.e0 += 1),
+            ("delta_e", |p| p.delta_e += 1),
+            ("e_floor", |p| p.e_floor += 1),
+            ("m_max", |p| p.m_max += 1),
+            ("committed_fee_rate", |p| p.committed_fee_rate += 1.0),
+        ];
+        for (field, forge) in mutate {
+            let mut forged = honest;
+            forge(&mut forged);
+            let e = cap_schedule(MAINNET, forged)
+                .map(|p| format!("ACCEPTED, returning {p:?}"))
+                .expect_err(&format!(
+                    "a schedule differing from the `{MAINNET}` preset only in `{field}` must still \
+                     be refused — one field is all it takes to move `exit_cap_shapes`"
+                ))
+                .to_string();
+            assert!(
+                e.contains(&format!("`{field}`")),
+                "the refusal must name `{field}`, the field that was actually moved, got: {e}"
+            );
+        }
+        // …and the untouched preset is still accepted, so the walk above is not passing on a binder
+        // that simply refuses everything.
+        assert_eq!(cap_schedule(MAINNET, honest).expect("the honest preset"), honest);
+    }
+
+    // =============================================================================================
+    // WIRING — every lane that caps must take its schedule from the same authority.
+    // =============================================================================================
+
+    /// The four BUILD call sites hand `enforce_split_depth_cap*` a CONVEYED schedule, and that is
+    /// fine — provided the gate itself settles the provenance. What must never happen is a lane that
+    /// derives the cap from conveyed params without passing through `cap_schedule`.
+    #[test]
+    fn every_cap_lane_derives_its_schedule_from_cap_schedule() {
+        let src = include_str!("tesr.rs");
+        let cut = |marker: &str| -> String {
+            let at = src.find(marker).unwrap_or_else(|| panic!("{marker} not found"));
+            src[at..at + src[at..].find("\n}\n").expect("function ends")]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // The BUILD gate: the conveyed schedule must be laundered through `cap_schedule` BEFORE the
+        // decision that uses it, and the network must come from the wallet's own config.
+        let gate = cut("\nasync fn enforce_split_depth_cap_shaped(");
+        assert!(
+            gate.contains("cap_schedule(&cc.network.to_string()"),
+            "[C-1] the build gate must settle the schedule against THIS wallet's network"
+        );
+        assert!(
+            gate.find("cap_schedule(").unwrap() < gate.find("split_cap_decision(").unwrap(),
+            "the provenance must be settled BEFORE the cap is computed, not after"
+        );
+
+        // …and the pure decision must not reach around it for a conveyed one.
+        let decision = cut("\nfn split_cap_decision(");
+        for conveyed in ["bundle.params", "cb.parent.params", "tip.parent.params"] {
+            assert!(
+                !decision.contains(conveyed),
+                "the cap decision must read no conveyed schedule; found `{conveyed}`"
+            );
+        }
+
+        // The ADMISSION lane binds the conveyed schedule too, so every OTHER reader of `params`
+        // downstream of it (the CSV bands) is reading a schedule proven equal to this wallet's own.
+        let admit = cut("\npub async fn verify_conveyed_child(");
+        assert!(
+            admit.contains("cap_schedule("),
+            "[C-1] the conveyed child schedule must be BOUND at claim time, not silently ignored — \
+             `verify_child_bundle` reads `cb.parent.params` for every CSV band it enforces"
+        );
+    }
+
+    /// The FLAT lane's two admission doors live in another file; pin the binding there.
+    #[test]
+    fn the_flat_lane_binds_the_conveyed_schedule_at_both_admission_doors() {
+        let src = include_str!("transfer_receiver.rs");
+        assert_eq!(
+            src.matches("cap_schedule(").count(),
+            2,
+            "[C-1] both the PRE-PAY census and the CLAIM path must bind the conveyed root-ladder \
+             schedule against the receiver's own network preset"
+        );
+    }
+}
+
+// =================================================================================================
+// LEAF RENEWAL — rebuild `child_extension` + `child_state` in place over the SAME `SP.out[j]`
+// =================================================================================================
+
+/// **[LEAF RENEWAL] The plan for one in-place rebuild of a leaf's two tiers.** Built by
+/// [`plan_child_renewal`], which is PURE: it takes the bundle by immutable borrow, reaches nothing,
+/// signs nothing, and either produces this or refuses. Every refusal a renewal can make lives there,
+/// so a refusal provably costs the leaf nothing — no mutation, no co-signature, no census slot.
+pub struct ChildRenewalPlan {
+    pub child_statechain_id: String,
+    /// `SP.out[j]` — the SAME outpoint the extension being replaced spends. Derived from the signed
+    /// funding tier, never from a declared field.
+    pub funding_txid: String,
+    pub funding_vout: u32,
+    pub funding_value: u64,
+    /// `A_child`, read off `SP.out[j]`'s scriptPubKey.
+    pub child_agg_address: String,
+    pub csv_e_new: u16,
+    pub csv_d: u16,
+    /// The epoch the leaf is at now, and the one this plan moves it to. Both DERIVED from signed
+    /// nSequences; a leaf carries no `m` field and must never grow one.
+    pub epoch_before: u16,
+    pub epoch_after: u16,
+    /// The two un-signed tiers, in co-sign order.
+    pub extension: mercurylib::tesr::TierTx,
+    pub state: mercurylib::tesr::TierTx,
+}
+
+/// Hand-written because [`mercurylib::tesr::TierTx`] derives neither `Debug` nor `Clone`, and a
+/// `Result<ChildRenewalPlan>` must be printable for `expect_err` to be usable at all. The tier HEX
+/// is deliberately not printed — only the identity a reader needs to follow the plan.
+impl std::fmt::Debug for ChildRenewalPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildRenewalPlan")
+            .field("child_statechain_id", &self.child_statechain_id)
+            .field("funding", &format!("{}:{}", self.funding_txid, self.funding_vout))
+            .field("funding_value", &self.funding_value)
+            .field("csv_e_new", &self.csv_e_new)
+            .field("csv_d", &self.csv_d)
+            .field("epoch", &format!("{} -> {}", self.epoch_before, self.epoch_after))
+            .field("extension_txid", &self.extension.txid)
+            .field("state_txid", &self.state.txid)
+            .finish()
+    }
+}
+
+/// The CSV of a leaf's LIVE extension, read off the **signed** nSequence.
+///
+/// Not `cb.child_extension.csv`. That field travels beside the transaction and is a sender-supplied
+/// number; the nSequence is committed by the taproot SIGHASH_ALL sighash that
+/// [`verify_tier_cosigned`] checks, so it cannot be moved without invalidating a signature the
+/// sender cannot forge. The receiver's `[B1]` `bind_declared_csv` makes the two agree on any bundle
+/// that was ever accepted — this reads the one that is provenanced anyway.
+pub fn child_extension_csv(cb: &ChildTesrBundle) -> Result<u16> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let tx: Transaction = deserialize(
+        &hex::decode(&cb.child_extension.signed_tx)
+            .map_err(|_| anyhow::anyhow!("child extension: bad hex"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
+    let seq = tx
+        .input
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("child extension has no input"))?
+        .sequence
+        .0;
+    if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+        return Err(anyhow::anyhow!(
+            "child extension: nSequence {seq:#x} is not a BIP-68 block relative-timelock"
+        ));
+    }
+    Ok(seq as u16)
+}
+
+/// **[LEAF RENEWAL] The leaf's renewal epoch `m`, DERIVED rather than declared.**
+///
+/// `TesrBundle.m` is a `u32` field on the ROOT that travels to the receiver as a sender-supplied
+/// number. It is harmless there only because `verify_bundle_ex` never reads it — every safety
+/// comparison is made against the SIGNED nSequence. A leaf needs no such field and must not grow
+/// one: it is minted at exactly `ext_csv(0)` ([`in_ladder_split`], [`spine_batch_split`],
+/// [`child_in_ladder_split`] all write `child_ext_csv: p.ext_csv(0)`), and the ONLY thing that ever
+/// moves its extension rung is a renewal. So
+///
+/// ```text
+///     m = (e0 − csv_e) / δE
+/// ```
+///
+/// is exact, and it is derived from the same signed byte the race rule is enforced on.
+///
+/// **THE CLAMP, AND WHY REFUSING IT IS THE RIGHT ANSWER.** `TesrParams::ext_csv` saturates at
+/// `e_floor`, so `m ↦ ext_csv(m)` stops being injective at the first `m` that reaches the floor
+/// (mainnet 16, regtest 3) and the inverse would be ambiguous. That region is UNREACHABLE by any
+/// scheduled renewal — renewal stops at `m_max` (15 / 2), and `ext_csv(m_max)` is 180 / 6, strictly
+/// above the floor of 144 / 3, which is exactly what `lib/src/tesr.rs:194`'s "never operates AT the
+/// extension floor" means. So an extension found at or below the floor did not come from this code,
+/// and the honest answer is to refuse it by name rather than to guess an epoch. Same for a rung that
+/// is not on the `δE` grid at all.
+pub fn child_renewal_epoch(cb: &ChildTesrBundle) -> Result<u16> {
+    let p = cb.parent.params;
+    let csv = child_extension_csv(cb)?;
+    let exhausted = || {
+        anyhow::anyhow!(
+            "this leaf's extension sits at CSV {csv}, at or below the extension floor ({}) — its \
+             renewal schedule is spent. A leaf cannot re-anchor (`refresh()` routes a `ctesr-` coin \
+             to `unilateral_exit`, because `SP.out[j]` is un-broadcast and there is no confirmed \
+             outpoint to co-operatively spend) and it has no `rollover`. The leaf's analogue is \
+             `child_in_ladder_split`, which starts a fresh level with a fresh schedule — or exit it.",
+            p.e_floor
+        )
+    };
+    if csv <= p.e_floor {
+        return Err(exhausted());
+    }
+    if csv > p.e0 {
+        return Err(anyhow::anyhow!(
+            "this leaf's extension sits at CSV {csv}, ABOVE the schedule's initial rung ({}) — it \
+             was not minted by this protocol and its epoch cannot be derived",
+            p.e0
+        ));
+    }
+    if p.delta_e == 0 {
+        return Err(anyhow::anyhow!("schedule has a zero extension decrement — no epoch to derive"));
+    }
+    let drop = p.e0 - csv;
+    if drop % p.delta_e != 0 {
+        return Err(anyhow::anyhow!(
+            "this leaf's extension sits at CSV {csv}, which is {drop} below the initial rung ({}) \
+             and not a multiple of the decrement ({}) — it is off the schedule grid, so no epoch \
+             maps to it. Refusing rather than rounding: the rung this returns decides the CSV of \
+             the tier that must out-race every extension it supersedes.",
+            p.e0,
+            p.delta_e
+        ));
+    }
+    let m = drop / p.delta_e;
+    if m > p.m_max {
+        return Err(exhausted());
+    }
+    Ok(m)
+}
+
+/// **[LEAF RENEWAL] The leaf's `needs_rollover`.** Mirrors [`mercurylib::tesr::TesrParams::needs_rollover`]
+/// over the DERIVED epoch. `true` means the extension schedule is spent and the next structural move
+/// must be a [`child_in_ladder_split`], not a renewal.
+pub fn child_needs_rollover(cb: &ChildTesrBundle) -> Result<bool> {
+    Ok(cb.parent.params.needs_rollover(child_renewal_epoch(cb)?))
+}
+
+/// **[LEAF RENEWAL] `true` once the leaf's NEXT re-transfer would fall below the state floor** —
+/// i.e. renew before sending again. The leaf's [`mercurylib::tesr::TesrParams::needs_renewal`].
+pub fn child_needs_renewal(cb: &ChildTesrBundle) -> Result<bool> {
+    let p = cb.parent.params;
+    let csv = cb
+        .child_state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("child state has no CSV"))?;
+    Ok(csv.checked_sub(p.delta).filter(|c| *c >= p.d_floor).is_none())
+}
+
+/// **[LEAF RENEWAL] Plan an in-place rebuild of a leaf's two tiers over the SAME `SP.out[j]`.**
+///
+/// PURE — `cb` is an immutable borrow, nothing here reaches the SE, and every refusal a renewal can
+/// make lives in this function. That is not tidiness: the leaf's census is EXACT-EQUALITY
+/// (`child_num_sigs == flat + 2 + superseded`), so a refusal taken AFTER one of the two co-signatures
+/// leaves the SE's `sig_count` one ahead of every bundle the wallet can persist or convey, and there
+/// is no bundle that rebalances it. A refusal must therefore be provably free, and the only way to
+/// prove that is for the deciding code to be unable to sign or to mutate.
+///
+/// ## THE SAFETY PROPERTY: REPLACE-BY-LOWER-TIMELOCK, ACROSS THE LEAF'S WHOLE OWNERSHIP HISTORY
+///
+/// Every extension a leaf has ever had — the original and every renewal — spends the SAME outpoint
+/// `SP.out[j]`, so exactly one of them can ever confirm. `child_retransfer` replaces only the STATE,
+/// which means the extension is SHARED with every previous owner of this leaf. Write out who holds
+/// what after `k` renewals and `h` hops:
+///
+/// * the extensions in existence are `X_0 … X_k`, with strictly decreasing CSV;
+/// * the CURRENT owner holds `X_k` (the lowest) and a state over `X_k.out[0]`;
+/// * a PREVIOUS owner holds whichever `X_i` was live while they held the leaf, plus their retained
+///   state over `X_i.out[0]`.
+///
+/// The current owner's `X_k` matures strictly first, so it wins the race for `SP.out[j]` against
+/// every `X_i`, `i < k`. A previous owner's retained state can only confirm if their `X_i` confirms,
+/// and it cannot. So a renewal makes a stale owner's threat strictly WEAKER than before it: they
+/// must now win TWO races instead of one. That is exactly the transitive-death shape
+/// [`verify_superseded_segment`] already models for the root `renew` — the old state is dead because
+/// its parent extension is dead — which is why a renewed leaf needs no change to the conveyed format.
+///
+/// **The guard below is what all of that rests on**, and the plain root `renew` does not have it:
+/// it will happily co-sign an extension at an equal or HIGHER CSV, and the coin is discovered
+/// bricked only at the receiver's `verify_superseded_segment` (`sup.csv <= live_csv` ⟹ reject) —
+/// after two irreversible co-signatures are gone. The COLOURED sibling `build_colored_renewal` has
+/// the guard; this is that one, copied, and it runs before anything at all can be signed.
+///
+/// The race window only opens once `SP` CONFIRMS — CSVs are relative and `SP` is un-broadcast — so
+/// an idle renewed leaf has no race at all. That is a reason the guard is cheap to hold, never a
+/// reason to skip it.
+pub fn plan_child_renewal(
+    cb: &ChildTesrBundle,
+    csv_e_new: u16,
+    csv_d: u16,
+) -> Result<ChildRenewalPlan> {
+    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
+
+    // A COLOURED leaf's tiers each carry an RGB state transition and its allocation is SEALED to
+    // `SP.out[j]`; a plain extension over that output spends a sealed UTXO with no transition and
+    // destroys the allocation. Refused BY NAME, first, exactly as every other plain builder on this
+    // lane does.
+    refuse_uncolored_over_colored_child(cb, "renew_child")?;
+
+    let p = cb.parent.params;
+
+    // ── THE EPOCH, AND THE EXHAUSTION PATH ────────────────────────────────────────────────────────
+    // Derived from the signed nSequence. At `m_max` the extension schedule is spent: the root's
+    // remedy is `rollover` (+1 depth off its own self-split), and the leaf's analogue is
+    // `child_in_ladder_split`, which hangs a fresh level with a fresh schedule off `ext_child.out[0]`.
+    // NEVER a re-anchor — naming one is the defect this whole path exists to remove.
+    let epoch_before = child_renewal_epoch(cb)?;
+    if p.needs_rollover(epoch_before) {
+        return Err(anyhow::anyhow!(
+            "this leaf is at renewal epoch {epoch_before} of {} — its extension schedule is spent, \
+             so there is no lower rung left to renew onto. A leaf cannot re-anchor and has no \
+             `rollover`; its analogue is `child_in_ladder_split`, which starts a fresh level (and a \
+             fresh renewal budget) off this leaf's own extension. Split it, or exit it.",
+            p.m_max
+        ));
+    }
+
+    // ── THE STRICT-DECREASE GUARD ─────────────────────────────────────────────────────────────────
+    // The COLOURED guard verbatim (`build_colored_renewal`), not the plain root's absent one.
+    let cur_csv_e = child_extension_csv(cb)?;
+    if csv_e_new >= cur_csv_e {
+        return Err(anyhow::anyhow!(
+            "a renewal must lower the extension rung STRICTLY: asked for CSV {csv_e_new} against a \
+             live extension at {cur_csv_e}. Every extension this leaf has ever had spends the SAME \
+             `SP.out[j]`, so exactly one can confirm and the current owner's must mature FIRST. At \
+             an equal or higher CSV the superseded extension out-races the replacement, every \
+             previous owner's retained state comes alive under it, and the receiver's \
+             `verify_superseded_segment` refuses the bundle outright — after both co-signatures are \
+             already spent and the leaf's exact-equality census can never rebalance."
+        ));
+    }
+    if csv_e_new < p.e_floor {
+        return Err(anyhow::anyhow!(
+            "renewal extension CSV {csv_e_new} is below the extension floor ({}) — the design never \
+             operates AT the floor, let alone under it; use `child_in_ladder_split` instead",
+            p.e_floor
+        ));
+    }
+    if csv_e_new > p.e0 {
+        return Err(anyhow::anyhow!(
+            "renewal extension CSV {csv_e_new} is above the schedule's initial rung ({})",
+            p.e0
+        ));
+    }
+    // The state rung is bounded by the SAME schedule the receiver's verifier enforces
+    // (`verify_child_bundle`'s `[F4]` band), so a plan that would be refused on arrival is refused
+    // here instead — while refusing is still free.
+    if csv_d < p.d_floor || csv_d > p.d0 {
+        return Err(anyhow::anyhow!(
+            "renewal state CSV {csv_d} is outside the schedule band [{},{}] — the receiver's \
+             verifier enforces exactly this band",
+            p.d_floor,
+            p.d0
+        ));
+    }
+    // ON THE GRID. The epoch is DERIVED from this rung for the rest of the leaf's life, so a rung
+    // that is not a whole number of decrements below `e0` would leave a leaf that renews once and
+    // can then never derive its epoch again — refused by `child_renewal_epoch` forever, i.e. one
+    // renewal short of the budget this whole change exists to give it. The strictly-lower guard
+    // above would not catch it: `e0 − 1` is perfectly "lower".
+    if p.delta_e == 0 || (p.e0 - csv_e_new) % p.delta_e != 0 {
+        return Err(anyhow::anyhow!(
+            "renewal extension CSV {csv_e_new} is {} below the initial rung ({}), which is not a \
+             multiple of the decrement ({}) — a leaf's epoch is DERIVED from this rung, so an \
+             off-grid one is underivable and the leaf would never renew again. Use \
+             `TesrParams::ext_csv(m)`, or `renew_child_auto`.",
+            p.e0 - csv_e_new,
+            p.e0,
+            p.delta_e
+        ));
+    }
+    let epoch_after = (p.e0 - csv_e_new) / p.delta_e;
+    // …AND IT MUST LAND ON A RUNG THE SCHEDULE ACTUALLY HAS. The `needs_rollover` check above asks
+    // only where the leaf IS; nothing so far asks where the plan PUTS it, and `ext_csv` SATURATES —
+    // so `ext_csv(m_max + 1)` is exactly `e_floor`, which is on the grid, inside `[e_floor, e0]`,
+    // and strictly lower than any live rung. It satisfies every guard above it.
+    //
+    // Landing there is not a rounding nicety. `lib/src/tesr.rs:194` — "never operate at the
+    // extension floor" — is the reason `m_max` is 15 rather than 16, and a leaf whose extension
+    // sits AT the floor is refused by this file's own `child_renewal_epoch` FOREVER. So the one
+    // call that was meant to give a leaf 16 epochs of budget could instead spend 15 of them at
+    // once (mainnet: 540 of 576 onward hops), and leave `child_needs_rollover` returning `Err`
+    // where the correct answer is a plain `true` — i.e. the exhaustion path this whole change
+    // exists to make sayable stops being sayable for exactly the leaves that reached it.
+    //
+    // A planner must not be able to manufacture a record its own reader refuses. Checked here,
+    // where refusing is still free.
+    if epoch_after > p.m_max {
+        return Err(anyhow::anyhow!(
+            "renewal extension CSV {csv_e_new} is epoch {epoch_after} of a schedule whose last is \
+             {} — `ext_csv` saturates, so this rung is the extension FLOOR and the design never \
+             operates there. A leaf renewed onto it forfeits every remaining epoch at once and can \
+             never derive its own epoch again, so it could not renew, roll over, or even say which \
+             it needed. Renew onto `TesrParams::ext_csv(m)` for some `m <= {}` (or use \
+             `renew_child_auto`); if the schedule really is spent, the leaf's analogue of \
+             `rollover` is `child_in_ladder_split`, which starts a fresh level with a fresh \
+             schedule — or exit it.",
+            p.m_max,
+            p.m_max
+        ));
+    }
+
+    // ── THE OUTPOINT, DERIVED FROM SIGNED BYTES ───────────────────────────────────────────────────
+    // `SP.out[j]`: its value and its scriptPubKey (which IS `A_child`) are read off the funding
+    // tier's own transaction, never off a declared field. `segment_funding_tier` is the one
+    // definition of which `SP` a leaf's `sp_vout` indexes into, at any depth.
+    let funding = segment_funding_tier(&cb.parent, &cb.ancestors);
+    let sp_tx: Transaction = deserialize(
+        &hex::decode(&funding.signed_tx).map_err(|_| anyhow::anyhow!("funding tier: bad hex"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("funding tier is not a transaction"))?;
+    let sp_out = sp_tx
+        .output
+        .get(cb.sp_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("funding tx has no output {}", cb.sp_vout))?
+        .clone();
+    let net = net_from_str(&cb.parent.network);
+    let child_agg_address = Address::from_script(&sp_out.script_pubkey, net)
+        .map_err(|_| anyhow::anyhow!("SP.out[{}] is not an address-shaped output", cb.sp_vout))?
+        .to_string();
+
+    // FAIL-CLOSED CROSS-CHECK. The live extension must already spend exactly this outpoint and pay
+    // exactly this key — that is what `verify_child_bundle` accepted on arrival. If the bundle on
+    // disk disagrees with its own funding tier, the renewal would build over an outpoint the leaf
+    // does not actually hang off, and both co-signatures would be spent on a chain that leads
+    // nowhere. Refuse instead of building.
+    {
+        let live: Transaction = deserialize(
+            &hex::decode(&cb.child_extension.signed_tx)
+                .map_err(|_| anyhow::anyhow!("child extension: bad hex"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
+        let op = live
+            .input
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("child extension has no input"))?
+            .previous_output;
+        if op.txid.to_string() != funding.txid || op.vout != cb.sp_vout {
+            return Err(anyhow::anyhow!(
+                "this leaf's live extension spends {}:{} but the bundle's funding tier is {}:{} — \
+                 refusing to renew over an outpoint the leaf does not hang off",
+                op.txid,
+                op.vout,
+                funding.txid,
+                cb.sp_vout
+            ));
+        }
+    }
+
+    // ── THE TWO TIERS, over the SAME `SP.out[j]` and at the SAME value arithmetic as the mint ─────
+    let extension = mercurylib::tesr::build_extension_from(
+        &funding.txid,
+        cb.sp_vout,
+        sp_out.value,
+        &child_agg_address,
+        &cb.parent.network,
+        csv_e_new,
+        cb.parent.fee_rate,
+    )?;
+    let state = mercurylib::tesr::build_state_from(
+        &extension.txid,
+        extension.payload_vout,
+        extension.out_value,
+        &cb.child_owner_exit_address,
+        &cb.parent.network,
+        csv_d,
+        cb.parent.fee_rate,
+    )?;
+
+    Ok(ChildRenewalPlan {
+        child_statechain_id: cb.child_statechain_id.clone(),
+        funding_txid: funding.txid.clone(),
+        funding_vout: cb.sp_vout,
+        funding_value: sp_out.value,
+        child_agg_address,
+        csv_e_new,
+        csv_d,
+        epoch_before,
+        epoch_after,
+        extension,
+        state,
+    })
+}
+
+/// [`plan_child_renewal`] at the schedule cadence: the next extension rung down, and a FULL state
+/// reset. The leaf's [`renew_auto`].
+pub fn plan_child_renewal_auto(cb: &ChildTesrBundle) -> Result<ChildRenewalPlan> {
+    let p = cb.parent.params;
+    let next = child_renewal_epoch(cb)?.saturating_add(1);
+    plan_child_renewal(cb, p.ext_csv(next), p.state_csv(0))
+}
+
+/// How far a leaf renewal got before it stopped. Mirrors [`SplitStage`] and
+/// [`crate::combine::CombineStage`].
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildRenewalStage {
+    /// Plan written; NOTHING irreversible has happened. Recovery = simply run again.
+    Planned,
+    /// The replacement EXTENSION is co-signed. From here the material is unregenerable and the
+    /// leaf's census does not balance until the state below it exists too.
+    ExtensionSigned,
+    /// Both tiers co-signed and the superseding bundle stored. Terminal.
+    Complete,
+}
+
+/// Journal key prefix, alongside `tesr-` / `ctesr-` / `spinetip-` / `combine-` / the split journal's.
+pub const CHILD_RENEWAL_JOURNAL_PREFIX: &str = "crenew-";
+
+/// **The durable record of ONE leaf renewal, and why it is warranted.**
+///
+/// A renewal takes exactly TWO co-signatures. Between them the SE's `sig_count` is one ahead of
+/// every bundle the wallet holds, and the leaf's census is EXACT-EQUALITY
+/// (`child_num_sigs == flat + 2 + superseded`, `verify_child_bundle`), so in that window there is no
+/// persistable bundle at all: not the old one (one short), not a half-built one (no state). A crash
+/// there without a record leaves a leaf whose SE count nothing can ever account for — i.e. bricked,
+/// silently, in exactly the "failure looks like idle" shape this repo's journals exist for.
+///
+/// With the record, the extension's signature is captured the instant it exists and the operation is
+/// REPLAYED rather than restarted: the state is rebuilt deterministically over the stored extension
+/// and only the second signature is taken. Restarting would mint a second extension and burn a third
+/// co-signature, which is precisely what `cosign_tier`'s `[KEYSTONE]` note forbids.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct ChildRenewalJournalRecord {
+    pub op_id: String,
+    pub lane: String,
+    pub stage: ChildRenewalStage,
+    pub child_statechain_id: String,
+    pub funding_txid: String,
+    pub funding_vout: u32,
+    pub funding_value: u64,
+    pub csv_e_new: u16,
+    pub csv_d: u16,
+    pub epoch_before: u16,
+    pub epoch_after: u16,
+    /// The unregenerable material, recorded the moment it exists.
+    pub extension_signed_tx: Option<String>,
+    pub extension_txid: Option<String>,
+    pub state_signed_tx: Option<String>,
+    pub state_txid: Option<String>,
+}
+
+/// Write the renewal journal. A failed write is FATAL by design, exactly as in [`journal_write`] and
+/// [`crate::combine::combine_journal_write`]: the next step produces a signature that can never be
+/// regenerated, and a record that did not land cannot describe it.
+pub async fn child_renewal_journal_write(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    rec: &ChildRenewalJournalRecord,
+) -> Result<()> {
+    let json = serde_json::to_string(rec)?;
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("{CHILD_RENEWAL_JOURNAL_PREFIX}{}", rec.op_id),
+        &json,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "leaf renewal journal write failed at stage {:?} ({e}) — refusing to continue, because \
+             the next step produces a signature that could never be regenerated and the leaf's \
+             census does not balance until its partner exists",
+            rec.stage
+        )
+    })
+}
+
+/// Every leaf renewal of this wallet that stopped before it completed. A row that cannot be decoded
+/// is an ERROR, never a silently skipped entry — an unreadable journal is the "failure looks like
+/// idle" shape the journal exists to kill.
+pub async fn child_renewal_open(
+    cc: &ClientConfig,
+    wallet_name: &str,
+) -> Result<Vec<ChildRenewalJournalRecord>> {
+    let mut out = Vec::new();
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if !k.starts_with(CHILD_RENEWAL_JOURNAL_PREFIX) {
+            continue;
+        }
+        let rec: ChildRenewalJournalRecord = serde_json::from_str(&json).map_err(|e| {
+            anyhow::anyhow!(
+                "leaf renewal journal row `{k}` could not be decoded ({e}) — refusing to report it \
+                 as absent: it may name a co-signature this wallet must account for"
+            )
+        })?;
+        if rec.stage != ChildRenewalStage::Complete {
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
+/// **[STEP 5] THE COMBINE INTERLOCK.** `true` if an UN-FINISHED leaf combine names this leaf.
+///
+/// A combine spends `SP.out[j]` with a FRESH, un-timelocked co-signature; a renewed extension spends
+/// the same `SP.out[j]`. Both are the owner's own material, so the hazard is not theft — it is that
+/// they are two concurrent co-signing flows over ONE statechain id. Two things go wrong at once:
+///
+/// * `combine_leaves` parks each leaf at [`crate::combine::COMBINE_PARK_STATUS`] and then co-signs
+///   N inputs; a renewal interleaved with that spends the leaf's SE budget on tiers the combine's
+///   plan knows nothing about, and if the leaf is at a `sig_budget` boundary the combine's own
+///   `sign_first` is refused mid-batch — after other leaves' nonces are already spent;
+/// * a renewal that lands between the combine's `Planned` and `Signed` stages changes nothing the
+///   combine reads (it sweeps the OUTPOINT, not the tiers), so the money is safe either way — but
+///   the renewal's own two signatures are wasted the moment the sweep confirms, and if the crash
+///   window is hit the leaf is left with a half-renewal against an outpoint that no longer exists.
+///
+/// The interlock is one-directional and that is deliberate: a combine is the LONGER, parked, N-leaf
+/// operation, so the short single-leaf one yields to it. A leaf mid-renewal is not blocked from
+/// being combined — a renewal completes or is journalled, and either way the sweep of `SP.out[j]`
+/// supersedes both tiers exactly as it supersedes the originals. `an_abandoned_combine_leaves_the_leaf_exitable`
+/// already pins the converse direction on the combine's own record.
+///
+/// Fail-CLOSED: an undecodable combine row is an error, not "no combine".
+pub async fn open_combine_names_leaf(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_statechain_id: &str,
+) -> Result<bool> {
+    use crate::combine::{CombineJournalRecord, CombineStage, COMBINE_JOURNAL_PREFIX};
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if !k.starts_with(COMBINE_JOURNAL_PREFIX) {
+            continue;
+        }
+        let rec: CombineJournalRecord = serde_json::from_str(&json).map_err(|e| {
+            anyhow::anyhow!(
+                "leaf combine journal row `{k}` could not be decoded ({e}) — refusing to read that \
+                 as 'no combine is running': it may name this very leaf"
+            )
+        })?;
+        let unfinished =
+            matches!(rec.stage, CombineStage::Planned | CombineStage::Signed);
+        if unfinished && rec.statechain_ids.iter().any(|s| s == child_statechain_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// **[L1] THE LIVENESS ALLOWLIST, ON THE RENEWAL LANE.**
+///
+/// The watchtower's rule (`clients/libs/rust-sdk/src/wallet.rs`, "L1 — LIVENESS, AS AN ALLOWLIST")
+/// and the leaf combine's (`combine.rs`, step 2 of its plan builder), verbatim in form and for the
+/// same reason: act only on a coin whose status is `CONFIRMED` — this wallet's own record of "mine,
+/// unspent, no counterparty holds anything over it".
+///
+/// **A RENEWAL IS EXACTLY THE LANE THAT RULE WAS WRITTEN AGAINST.** `child_retransfer` conveys a
+/// leaf by co-signing `S'_child` over `ext_child.out[0]`, and marks the coin `IN_TRANSFER` durably
+/// FIRST precisely so that no other lane acts on it while a counterparty holds material. A renewal
+/// run in that window supersedes `ext_child` ITSELF: the recipient's conveyed state hangs off an
+/// extension that can now never confirm, and their claim fails the exact-equality census (the SE's
+/// count is two ahead of everything their bundle discloses). Fail-closed for them — but the hop is
+/// destroyed after the sender may already have been paid, and the leaf's own budget went on it.
+///
+/// **ALLOWLIST, NOT DENYLIST**, and that is the point rather than a style preference. The combine
+/// interlock next to this one is a denylist keyed on a single journal prefix; it can only ever see
+/// the lanes it enumerates. Naming the ONE admissible status means a lane added tomorrow parks its
+/// coin in SOME non-CONFIRMED status and is refused by default. The `match` is written with an
+/// explicit catch-all so the property is structural rather than a list to maintain.
+pub fn refuse_unless_leaf_is_live(
+    status: &mercurylib::wallet::CoinStatus,
+    child_statechain_id: &str,
+) -> Result<()> {
+    match status {
+        mercurylib::wallet::CoinStatus::CONFIRMED => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "leaf {child_statechain_id} is {other}, not CONFIRMED — this wallet's own record says a \
+             counterparty may already hold material over it, so it may not be renewed. A renewal \
+             supersedes the leaf's EXTENSION, which is the very tier a conveyed state hangs off: \
+             doing it now would leave the recipient's claim failing the exact-equality census, with \
+             the hop destroyed and this leaf's budget spent on it. Only CONFIRMED is admissible \
+             here, so a lane that parks a coin in any other status is refused by default. Nothing \
+             has been co-signed and the leaf is unchanged."
+        )),
+    }
+}
+
+/// The `duplicate_index == 0` coin's status for `statechain_id`, **read from the wallet DB**.
+///
+/// [A2] The in-memory `Coin` a caller is holding is not this. `child_retransfer` makes its
+/// `IN_TRANSFER` transition durable through `persist_coin_status`, which re-reads and rewrites the
+/// row and writes back into no copy anybody else is holding — so a check keyed on a caller-supplied
+/// `Coin` reads a stale `CONFIRMED` in exactly the window it exists for. That is the defect
+/// `wallet.rs`'s `[A2 — THE KEY MUST BE DURABLE]` note records the conveyance lane having already
+/// paid for once; this lane inherits the fix rather than the defect.
+///
+/// A missing row is an ERROR, never "no status": an absent coin is the one case where guessing
+/// would be fail-open.
+pub async fn durable_coin_status(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<mercurylib::wallet::CoinStatus> {
+    let wallet = crate::sqlite_manager::get_wallet(&cc.pool, wallet_name).await?;
+    wallet
+        .coins
+        .iter()
+        .find(|c| c.statechain_id.as_deref() == Some(statechain_id) && c.duplicate_index == 0)
+        .map(|c| c.status.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "wallet {wallet_name} holds no duplicate_index 0 coin for statechain id \
+                 {statechain_id} — refusing to read that as 'the leaf is live'"
+            )
+        })
+}
+
+/// **[LEAF RENEWAL] Rebuild a leaf's `child_extension` + `child_state` in place over the SAME
+/// `SP.out[j]`, resetting the state schedule WITHOUT consuming a depth level.**
+///
+/// This is the leaf's [`renew`]. Zero on-chain bytes, two SE co-signatures, client-only: the SE is
+/// blind — it is handed a sighash and a caller-supplied prevout amount and never deserialises an
+/// output, so it neither knows nor cares that this is a renewal rather than a first mint.
+///
+/// ## WHY IT HAD TO EXIST
+///
+/// A leaf's transfer budget was hard and unreplenishable. `child_retransfer` takes one `δ` off the
+/// state rung per whole-coin hop and refuses at the floor; leaves are minted at `state_csv(0)`, so
+/// on the mainnet schedule that is `(1440 − 144) / 36 = 36` hops and then the leaf could never move
+/// again. The message it refused with named remedies a leaf does not have — it cannot re-anchor
+/// (`refresh()` routes a `ctesr-` coin to `unilateral_exit`) and there was no `ChildTesrBundle`
+/// analogue of `renew`/`rollover`, both of which take `&mut TesrBundle`. With renewal the budget is
+/// 36 hops × 16 epochs (`m = 0` is itself an epoch, so `m_max + 1`) per depth level.
+///
+/// ## SHAPE
+///
+/// Everything that can refuse lives in the PURE [`plan_child_renewal`] and runs first, so a refusal
+/// costs the leaf nothing. Then: journal `Planned`; co-sign the extension; journal `ExtensionSigned`
+/// with the signature the instant it exists; co-sign the state; store the superseding bundle; journal
+/// `Complete`. The bundle is returned rather than mutated in place, following [`child_retransfer`]
+/// rather than [`renew`] — an immutable input is how "a refusal cannot mutate" is made structural.
+///
+/// The census moves by exactly +2 co-signatures and +2 superseded entries, and the live tier count
+/// is unchanged, so `child_num_sigs == flat_backups + 2 + superseded` still balances. The conveyed
+/// format does not change: `ChildTesrBundle` already carries `child_superseded_extensions`, and
+/// `verify_superseded_segment` already models this exact shape (the superseded extension loses the
+/// race for `SP.out[j]` directly; the superseded state below it is TRANSITIVELY dead).
+pub async fn renew_child(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &mut Coin,
+    cb: &ChildTesrBundle,
+    csv_e_new: u16,
+    csv_d: u16,
+) -> Result<ChildTesrBundle> {
+    // [STEP 1] EVERY REFUSAL, BEFORE ANYTHING CAN BE SIGNED OR MUTATED. `cb` is an immutable borrow
+    // and `plan_child_renewal` is not async, so this ordering is enforced by the type system rather
+    // than asserted by a comment.
+    let plan = plan_child_renewal(cb, csv_e_new, csv_d)?;
+    let child_sid = plan.child_statechain_id.clone();
+
+    // [L1] LIVENESS, AS AN ALLOWLIST — before the first co-signature, for the same reason, and read
+    // from the DURABLE row rather than `child_coin` ([A2]). This is the general rule; the combine
+    // interlock immediately below is the one specific case the allowlist cannot express, because a
+    // combine parks its leaves at `WITHDRAWING` only at its `Planned` stage and an ABANDONED one
+    // unparks them — so the journal, not the status, is what says a combine is still running.
+    refuse_unless_leaf_is_live(&durable_coin_status(cc, wallet_name, &child_sid).await?, &child_sid)?;
+
+    // [STEP 5] THE COMBINE INTERLOCK — before the first co-signature, for the same reason.
+    if open_combine_names_leaf(cc, wallet_name, &child_sid).await? {
+        return Err(anyhow::anyhow!(
+            "leaf {child_sid} is named by an un-finished combine journal \
+             (`{}…`). A combine spends the very outpoint a renewal rebuilds \
+             over — `SP.out[j]` — and it holds the leaf parked with N sibling nonces already \
+             committed to one transaction. Finish or abandon that combine first; nothing has been \
+             co-signed and this leaf is unchanged.",
+            crate::combine::COMBINE_JOURNAL_PREFIX
+        ));
+    }
+
+    // THE SE BUDGET, PRE-FLIGHT. A renewal needs TWO co-signatures. `child_in_ladder_split`
+    // terminalizes the leaf it splits (`set_spend_budget(child_sid, 1)`, consumed by CSP), so a leaf
+    // that has made a partial payment can never renew — and a leaf whose split CRASHED before CSP
+    // has exactly ONE slot left, enough for the extension and not for the state. That is the one
+    // shape that would burn a signature and then fail, so it is refused here by name instead. A
+    // false negative costs only a wasted round-trip: the SE refuses the FIRST co-sign, so nothing is
+    // burned either way.
+    match crate::lightning_latch::get_spend_budget(cc, &child_sid).await {
+        Ok((budget, _finalized, terminal)) => {
+            if terminal {
+                return Err(anyhow::anyhow!(
+                    "leaf {child_sid} is TERMINAL at the SE — it has already made a partial payment \
+                     (`child_in_ladder_split` terminalizes the leaf it splits), so no further \
+                     co-signature will ever be issued for it and it cannot be renewed. Its value \
+                     now lives in the grandchildren that split produced; this record is an ancestor \
+                     segment. Exit it, or spend the grandchildren."
+                ));
+            }
+            if let Some(b) = budget {
+                if b < 2 {
+                    return Err(anyhow::anyhow!(
+                        "leaf {child_sid} has {b} co-signature(s) of budget left at the SE and a \
+                         renewal needs 2 (extension, then state). Taking the first would leave the \
+                         SE's count one ahead of every bundle this wallet can persist, and the \
+                         leaf's exact-equality census could never rebalance. Refusing while it is \
+                         still free."
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "could not read leaf {child_sid}'s spend budget from the SE ({e}) — refusing to \
+                 read that as 'the budget is fine'. A renewal needs two co-signatures and a leaf \
+                 with one left would be bricked by taking the first. Nothing has been co-signed."
+            ));
+        }
+    }
+
+    let mut journal = ChildRenewalJournalRecord {
+        op_id: format!("renew_child:{child_sid}:{}", plan.extension.txid),
+        lane: "renew_child".to_string(),
+        stage: ChildRenewalStage::Planned,
+        child_statechain_id: child_sid.clone(),
+        funding_txid: plan.funding_txid.clone(),
+        funding_vout: plan.funding_vout,
+        funding_value: plan.funding_value,
+        csv_e_new: plan.csv_e_new,
+        csv_d: plan.csv_d,
+        epoch_before: plan.epoch_before,
+        epoch_after: plan.epoch_after,
+        extension_signed_tx: None,
+        extension_txid: None,
+        state_signed_tx: None,
+        state_txid: None,
+    };
+    // WRITE AHEAD, THEN SIGN — the discipline `in_ladder_split` established. The record is complete
+    // before the leaf's budget is touched, so a crash below is replayed rather than lost.
+    child_renewal_journal_write(cc, wallet_name, &journal).await?;
+
+    let x_signed = cosign_tier(
+        cc,
+        child_coin,
+        plan.extension.tx_hex.clone(),
+        plan.funding_value,
+        &cb.parent.network,
+    )
+    .await?;
+    // THE INSTANT IT EXISTS. Past this point the material is unregenerable: recovery must rebuild
+    // the state over THIS extension and take only the second signature, never re-sign the first.
+    journal.stage = ChildRenewalStage::ExtensionSigned;
+    journal.extension_signed_tx = Some(x_signed.clone());
+    journal.extension_txid = Some(plan.extension.txid.clone());
+    child_renewal_journal_write(cc, wallet_name, &journal).await?;
+    crash_point("after_child_renewal_extension_sign");
+
+    let s_signed = cosign_tier(
+        cc,
+        child_coin,
+        plan.state.tx_hex.clone(),
+        plan.extension.out_value,
+        &cb.parent.network,
+    )
+    .await?;
+
+    // FULL DISCLOSURE. Both replaced tiers were co-signed, so both must be disclosed or the
+    // receiver's census comes up two short. The superseded EXTENSION loses the race for `SP.out[j]`
+    // to the one above (strictly lower CSV, guarded in the planner); the superseded STATE is
+    // transitively dead beneath it, which is the shape `verify_superseded_segment` already models
+    // for the root `renew`.
+    let mut next = cb.clone();
+    next.child_superseded_extensions.push(next.child_extension.clone());
+    next.child_superseded_states.push(next.child_state.clone());
+    next.child_extension = TesrTier {
+        txid: plan.extension.txid.clone(),
+        signed_tx: x_signed,
+        out_value: plan.extension.out_value,
+        csv: Some(plan.csv_e_new),
+        payload_vout: plan.extension.payload_vout,
+    };
+    next.child_state = TesrTier {
+        txid: plan.state.txid.clone(),
+        signed_tx: s_signed.clone(),
+        out_value: plan.state.out_value,
+        csv: Some(plan.csv_d),
+        payload_vout: plan.state.payload_vout,
+    };
+
+    journal.state_signed_tx = Some(s_signed);
+    journal.state_txid = Some(plan.state.txid.clone());
+    child_renewal_journal_write(cc, wallet_name, &journal).await?;
+
+    // STORE BEFORE DECLARING DONE. `defend_ladders` drives the `ctesr-` row: while it still names
+    // the SUPERSEDED extension, the watchtower would broadcast a tier that has just been out-raced
+    // by one this wallet holds. The stored bundle is what makes the renewal real to the rest of the
+    // wallet, so the journal is only closed after it lands.
+    persist_child(cc, wallet_name, &next).await.map_err(|e| {
+        anyhow::anyhow!(
+            "leaf {child_sid} is renewed and BOTH replacement tiers are co-signed, but the \
+             superseding bundle could not be stored ({e}). The signatures are recorded in the \
+             `{CHILD_RENEWAL_JOURNAL_PREFIX}` journal at stage ExtensionSigned — replay from there, \
+             never re-sign. Until the store lands this wallet's `ctesr-` row still names the \
+             superseded extension, and `defend_ladders` would drive that instead of the live one."
+        )
+    })?;
+
+    journal.stage = ChildRenewalStage::Complete;
+    child_renewal_journal_write(cc, wallet_name, &journal).await?;
+    Ok(next)
+}
+
+/// [`renew_child`] at the schedule cadence: the next extension rung down and a FULL state reset.
+/// Returns the superseding bundle and whether the extension budget is now spent (`true` ⟹ the next
+/// structural move must be a [`child_in_ladder_split`], the leaf's analogue of `rollover`).
+pub async fn renew_child_auto(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &mut Coin,
+    cb: &ChildTesrBundle,
+) -> Result<(ChildTesrBundle, bool)> {
+    let p = cb.parent.params;
+    let next = child_renewal_epoch(cb)?.saturating_add(1);
+    let out = renew_child(cc, wallet_name, child_coin, cb, p.ext_csv(next), p.state_csv(0)).await?;
+    let due = child_needs_rollover(&out)?;
+    Ok((out, due))
+}
+
+// =================================================================================================
+// LEAF RENEWAL — rebuild `child_extension` + `child_state` in place over the SAME `SP.out[j]`
+// =================================================================================================
+
+#[cfg(test)]
+mod leaf_renewal_source_tests {
+    /// This module's own source, comments stripped, from `head` to the end of that item.
+    fn cut(head: &str) -> String {
+        let src = include_str!("tesr.rs");
+        let at = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{head} is ABSENT from tesr.rs — leaf renewal does not exist"));
+        src[at..at + src[at..].find("\n}\n").expect("item ends")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **[STEP 1] THE STRICT-DECREASE GUARD, AND THAT IT RUNS BEFORE ANY CO-SIGNATURE.**
+    ///
+    /// The plain root `renew` has no such guard: it will co-sign an extension whose CSV is equal to
+    /// or higher than the one it supersedes, and the coin is discovered BRICKED only at the
+    /// receiver's `verify_superseded_segment` — after two irreversible SE co-signs have been burned
+    /// and `num_sigs` is permanently ahead of any persistable bundle. The COLOURED sibling
+    /// `build_colored_renewal` does have it. The leaf lane must copy the COLOURED one.
+    ///
+    /// Two separate properties, both structural:
+    ///   * the decision lives in a PURE planner that takes `&ChildTesrBundle` — an immutable
+    ///     borrow, so the compiler itself guarantees no bundle mutation on refusal;
+    ///   * the driver calls that planner BEFORE its first `cosign_tier`.
+    #[test]
+    fn the_strict_decrease_guard_runs_before_the_first_cosign() {
+        let plan = cut("\npub fn plan_child_renewal(");
+        assert!(
+            plan.contains("csv_e_new >= cur_csv_e"),
+            "the leaf planner must carry the COLOURED guard verbatim — a renewal whose extension \
+             CSV does not STRICTLY decrease loses the replace-by-lower-timelock race over \
+             SP.out[j] to the extension it supersedes, and every prior owner's retained state \
+             hangs off that superseded extension"
+        );
+
+        let driver = cut("\npub async fn renew_child(");
+        let planned = driver
+            .find("plan_child_renewal(")
+            .expect("the driver must delegate every refusal to the pure planner");
+        let signed = driver
+            .find("cosign_tier(")
+            .expect("the driver must take two co-signatures");
+        assert!(
+            planned < signed,
+            "the guard must be checked BEFORE the first co-signature round-trip. A refusal AFTER \
+             one co-sign leaves the SE's sig_count one ahead of any bundle the wallet can persist, \
+             and the leaf's exact-equality census (child_num_sigs == flat + 2 + superseded) can \
+             never rebalance — i.e. the refusal itself bricks the leaf."
+        );
+    }
+
+    /// **[STEP 3] THE PLANNER IS PURE AND TAKES AN IMMUTABLE BUNDLE.** A refusal cannot mutate.
+    #[test]
+    fn the_planner_cannot_mutate_the_bundle_it_refuses() {
+        let plan = cut("\npub fn plan_child_renewal(");
+        assert!(
+            plan.contains("cb: &ChildTesrBundle"),
+            "the planner must borrow the bundle IMMUTABLY — that is how 'no mutation before the \
+             co-sign' is expressed in a way the compiler enforces rather than a comment asserts"
+        );
+        assert!(
+            !plan.contains("cosign_tier") && !plan.contains("async"),
+            "the planner must not be able to reach the SE at all"
+        );
+    }
+
+    /// **[STEP 3] THE JOURNAL.** A crash between the two co-signatures must not brick the leaf:
+    /// the SE has issued one signature the persisted bundle does not account for, and the leaf's
+    /// census is exact-equality, so there is no bundle that balances until the second signature
+    /// exists. The record must therefore be complete before the first signature, and must capture
+    /// the first signature the instant it exists.
+    #[test]
+    fn the_renewal_journal_is_written_before_the_first_cosign_and_the_moment_it_exists() {
+        let driver = cut("\npub async fn renew_child(");
+        let planned = driver
+            .find("ChildRenewalStage::Planned")
+            .expect("a Planned journal write");
+        let first = driver.find("cosign_tier(").expect("the first co-signature");
+        let signed = driver
+            .find("ChildRenewalStage::ExtensionSigned")
+            .expect("an ExtensionSigned journal write");
+        assert!(
+            planned < first,
+            "the plan must be journalled BEFORE the first co-signature round-trip"
+        );
+        assert!(
+            first < signed,
+            "the extension's co-signature must be journalled the moment it exists, and before the \
+             second round-trip — it is unregenerable, and a lost one leaves the SE's count one \
+             ahead of every persistable bundle"
+        );
+    }
+
+    /// **[STEP 4] THE EXHAUSTION PATH NAMES A REMEDY A LEAF ACTUALLY HAS.**
+    ///
+    /// The whole reason this work exists is a message that pointed at `re-anchor`, which a leaf
+    /// cannot do (`refresh()` routes a `ctesr-` coin to `unilateral_exit`). The root's analogue at
+    /// epoch exhaustion is `rollover`; the leaf's is `child_in_ladder_split`.
+    #[test]
+    fn every_leaf_refusal_names_a_remedy_a_leaf_actually_has() {
+        let plan = cut("\npub fn plan_child_renewal(");
+        assert!(
+            plan.contains("child_in_ladder_split"),
+            "the epoch-exhaustion refusal must name `child_in_ladder_split` — the leaf's analogue \
+             of `rollover`"
+        );
+        for offered in ["or re-anchor", "re-anchor it"] {
+            assert!(
+                !plan.contains(offered),
+                "no leaf-lane refusal may OFFER `{offered}`: a child has no confirmed outpoint to \
+                 co-operatively spend, so `refresh()` routes it to `unilateral_exit` instead"
+            );
+        }
+
+        let retransfer = cut("\npub async fn child_retransfer(");
+        assert!(
+            retransfer.contains("renew_child"),
+            "the state-floor refusal in `child_retransfer` must name RENEWAL — that message is \
+             the defect this whole change exists to fix"
+        );
+        assert!(
+            !retransfer.contains("exit or re-anchor it"),
+            "…and THE DEFECT VERBATIM — `exit or re-anchor it instead of re-sending` — must be gone"
+        );
+        for offered in ["or re-anchor", "re-anchor it"] {
+            assert!(
+                !retransfer.contains(offered),
+                "…and it must stop OFFERING `{offered}`, which a leaf can never perform"
+            );
+        }
+        assert!(
+            retransfer.contains("child_in_ladder_split"),
+            "…and the epoch-exhaustion case must point at the leaf's analogue of `rollover`"
+        );
+    }
+
+    /// **[STEP 5] THE COMBINE INTERLOCK.** A leaf combine spends `SP.out[j]` with a FRESH
+    /// co-signature; a renewed extension also spends `SP.out[j]`. Both are the owner's own, so the
+    /// risk is not theft — it is spending the leaf's SE budget, and secnonce discipline, on two
+    /// concurrent flows over one statechain id.
+    #[test]
+    fn a_leaf_parked_for_a_combine_cannot_be_renewed() {
+        let driver = cut("\npub async fn renew_child(");
+        assert!(
+            driver.contains("COMBINE_JOURNAL_PREFIX") || driver.contains("open_combine_names_leaf"),
+            "the renewal driver must refuse a leaf named by an un-finished combine journal"
+        );
+        let interlock = driver
+            .find("open_combine_names_leaf")
+            .expect("the interlock must be a named, testable check");
+        let first = driver.find("cosign_tier(").expect("the first co-signature");
+        assert!(
+            interlock < first,
+            "the interlock must run BEFORE any co-signature — after one, the refusal costs the \
+             leaf a census slot it can never reclaim"
+        );
+    }
+
+    /// **L1 LIVENESS, AND THAT IT READS THE DURABLE ROW.** The behavioural half is
+    /// `only_a_confirmed_leaf_may_be_renewed`; this pins that the DRIVER actually applies it, before
+    /// anything can be signed, and against the wallet DB rather than the caller's `Coin`.
+    ///
+    /// [A2] is the whole reason for the second half. `child_retransfer` makes `IN_TRANSFER` durable
+    /// with `persist_coin_status` — which re-reads and rewrites the row — and does NOT write back
+    /// into the caller's in-memory copy. A renewal that trusted `child_coin.status` would read a
+    /// stale `CONFIRMED` in exactly the window the check exists for, which is the defect
+    /// `wallet.rs:1877-1886` records having already been paid for once.
+    #[test]
+    fn a_leaf_this_wallet_has_already_handed_away_cannot_be_renewed() {
+        let driver = cut("\npub async fn renew_child(");
+        let live = driver
+            .find("refuse_unless_leaf_is_live")
+            .expect("the driver must apply the L1 liveness allowlist");
+        let first = driver.find("cosign_tier(").expect("the first co-signature");
+        assert!(
+            live < first,
+            "L1 must run BEFORE any co-signature — a refusal afterwards has already spent a census \
+             slot the leaf can never reclaim"
+        );
+        assert!(
+            driver.contains("durable_coin_status"),
+            "…and it must read the DURABLE row, not the caller's in-memory `Coin`: \
+             `child_retransfer` makes IN_TRANSFER durable via `persist_coin_status` without \
+             writing back into any copy the renewal was handed, so an in-memory read is stale in \
+             precisely the window this check exists for ([A2], wallet.rs:1877-1886)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod leaf_renewal_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        consensus::{deserialize, serialize},
+        key::TapTweak,
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, ScriptBuf, Transaction, TxOut, Witness,
+    };
+
+    const NET: &str = "regtest";
+    const F_TXID: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const F_VOUT: u32 = 0;
+    const F_VALUE: u64 = 200_000;
+
+    struct Holder {
+        kp: KeyPair,
+        address: String,
+        spk: ScriptBuf,
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    /// The blind co-sign, performed locally: a BIP-341 key-spend signature by the aggregate over the
+    /// tier's single synthesised prevout. Exactly what `verify_tier_cosigned` checks.
+    fn cosign(tx: &Transaction, prevout_value: u64, agg_spk: &ScriptBuf, kp: &KeyPair) -> Transaction {
+        let secp = Secp256k1::new();
+        let prevout = TxOut { value: prevout_value, script_pubkey: agg_spk.clone() };
+        let sighash = SighashCache::new(tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+            .expect("taproot key-spend sighash");
+        let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+        let mut signed = tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+        signed
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: hex::encode(serialize(tx)),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    struct Rig {
+        parent: Holder,
+        child: Holder,
+        receiver: Holder,
+        sender: Holder,
+        params: mercurylib::tesr::TesrParams,
+        rate: f64,
+    }
+
+    fn rig() -> Rig {
+        let params = mercurylib::tesr::TesrParams::regtest();
+        Rig {
+            parent: holder(0x11),
+            child: holder(0x22),
+            receiver: holder(0x33),
+            sender: holder(0x44),
+            rate: params.committed_fee_rate,
+            params,
+        }
+    }
+
+    struct Facts {
+        f_spk_hex: String,
+        parent_num_sigs: u32,
+        parent_flat_backups: u32,
+        parent_xonly: String,
+        child_num_sigs: u32,
+        child_flat_backups: u32,
+        child_xonly: String,
+        receiver_address: String,
+    }
+
+    impl Rig {
+        /// `T -> X -> SP`, honest, genuinely co-signed by `A_parent`; `SP` is a spine split state
+        /// funding ONE child slot. Returns the bundle and the slot value.
+        fn parent_segment(&self) -> (TesrBundle, u64) {
+            let p = self.params;
+            let a = &self.parent;
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, self.rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), F_VALUE, &a.spk, &a.kp);
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+            let slot = mercurylib::tesr::tier_out_total(x.out_value, 1, self.rate).expect("slot");
+            let sp = mercurylib::tesr::build_split_state(
+                &x.txid,
+                x.out_value,
+                &[(self.child.address.clone(), slot)],
+                NET,
+                SPINE_CSV,
+                self.rate,
+            )
+            .expect("split state");
+            let sp_tx = cosign(&parse(&sp.tx_hex), x.out_value, &a.spk, &a.kp);
+            let bundle = TesrBundle {
+                version: 1,
+                statechain_id: "parent-sid".into(),
+                network: NET.into(),
+                fee_rate: self.rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.sender.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&sp_tx, Some(SPINE_CSV), sp.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                params: p,
+                rgb: None,
+            };
+            (bundle, slot)
+        }
+
+        /// A freshly minted leaf, exactly as `in_ladder_split` mints one: `ext_csv(0)` /
+        /// `state_csv(0)` over `SP.out[0]`.
+        fn leaf(&self) -> ChildTesrBundle {
+            let p = self.params;
+            let (parent, slot) = self.parent_segment();
+            let sp_txid = parent.current().state.txid.clone();
+            let c = &self.child;
+            let xc = mercurylib::tesr::build_extension_from(
+                &sp_txid, 0, slot, &c.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("child extension");
+            let xc_tx = cosign(&parse(&xc.tx_hex), slot, &c.spk, &c.kp);
+            let sc = mercurylib::tesr::build_state_from(
+                &xc.txid, xc.payload_vout, xc.out_value, &self.receiver.address, NET,
+                p.state_csv(0), self.rate,
+            )
+            .expect("child state");
+            let sc_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &c.spk, &c.kp);
+            ChildTesrBundle {
+                parent,
+                parent_statechain_id: "parent-sid".into(),
+                sp_vout: 0,
+                child_statechain_id: "child-sid".into(),
+                child_owner_exit_address: self.receiver.address.clone(),
+                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
+                child_superseded_states: vec![],
+                child_superseded_extensions: vec![],
+                ancestors: vec![],
+                rgb: None,
+                parent_flat_backups: vec![],
+            }
+        }
+
+        /// Execute the renewal `plan_child_renewal` produced, with the local aggregate standing in
+        /// for the blind SE. This is the exact tier arithmetic `renew_child` performs; running it
+        /// here keeps the shape under test without a network.
+        fn apply(&self, cb: &ChildTesrBundle, plan: &ChildRenewalPlan) -> ChildTesrBundle {
+            let c = &self.child;
+            let x_tx = cosign(&parse(&plan.extension.tx_hex), plan.funding_value, &c.spk, &c.kp);
+            let s_tx = cosign(&parse(&plan.state.tx_hex), plan.extension.out_value, &c.spk, &c.kp);
+            let mut next = cb.clone();
+            next.child_superseded_extensions.push(next.child_extension.clone());
+            next.child_superseded_states.push(next.child_state.clone());
+            next.child_extension = tier(&x_tx, Some(plan.csv_e_new), plan.extension.payload_vout);
+            next.child_state = tier(&s_tx, Some(plan.csv_d), plan.state.payload_vout);
+            next
+        }
+
+        fn facts(&self) -> Facts {
+            Facts {
+                f_spk_hex: hex::encode(self.parent.spk.as_bytes()),
+                parent_num_sigs: 1 + 3,
+                parent_flat_backups: 1,
+                parent_xonly: self.parent.recorded_xonly.clone(),
+                child_num_sigs: 2,
+                child_flat_backups: 0,
+                child_xonly: self.child.recorded_xonly.clone(),
+                receiver_address: self.receiver.address.clone(),
+            }
+        }
+    }
+
+    fn verify(cb: &ChildTesrBundle, f: &Facts) -> Result<()> {
+        verify_child_bundle(
+            cb,
+            &f.f_spk_hex,
+            F_VALUE,
+            f.parent_num_sigs,
+            f.parent_flat_backups,
+            Some(&f.parent_xonly),
+            true,
+            f.child_num_sigs,
+            f.child_flat_backups,
+            Some(&f.child_xonly),
+            &[],
+            &f.receiver_address,
+        )
+    }
+
+    // =============================================================================================
+    // STEP 2 — THE DERIVED `m`
+    // =============================================================================================
+
+    /// A freshly minted leaf is at epoch 0: `in_ladder_split` mints it at exactly `ext_csv(0)`.
+    #[test]
+    fn a_freshly_minted_leaf_derives_epoch_zero() {
+        let r = rig();
+        assert_eq!(child_renewal_epoch(&r.leaf()).expect("derivable"), 0);
+    }
+
+    /// After ONE renewal it is at epoch 1 — and the derivation moved because the SIGNED nSequence
+    /// moved, not because any field was incremented.
+    #[test]
+    fn one_renewal_moves_the_derived_epoch_to_one() {
+        let r = rig();
+        let leaf = r.leaf();
+        let p = r.params;
+        let plan = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("renewable");
+        let renewed = r.apply(&leaf, &plan);
+        assert_eq!(child_renewal_epoch(&renewed).expect("derivable"), 1);
+        assert_eq!(
+            renewed.child_extension.csv,
+            Some(p.ext_csv(1)),
+            "and the extension really did move down one rung"
+        );
+    }
+
+    /// **THE POINT OF DERIVING IT.** `TesrBundle.m` is a sender-supplied number that travels with
+    /// the artifact; a leaf has no such field, and must not grow one. The epoch is read off the
+    /// SIGNED nSequence — committed by the taproot SIGHASH_ALL sighash `verify_tier_cosigned`
+    /// checks, so it cannot be moved without invalidating a signature the sender cannot forge.
+    #[test]
+    fn the_derived_epoch_reads_the_signed_nsequence_not_the_declared_field() {
+        let r = rig();
+        let p = r.params;
+        let mut leaf = r.leaf();
+        // A sender lies about the rung its extension sits on. The signed transaction is untouched.
+        leaf.child_extension.csv = Some(p.ext_csv(2));
+        assert_eq!(
+            child_renewal_epoch(&leaf).expect("derivable"),
+            0,
+            "the declared field must have no influence whatever on the derived epoch"
+        );
+    }
+
+    /// The clamped case. `ext_csv` saturates at `e_floor`, so the map `m -> ext_csv(m)` stops being
+    /// injective there and the derivation would be ambiguous. It is never REACHED (renewal stops at
+    /// `m_max`, whose CSV is strictly above the floor on both presets), so the right answer is to
+    /// refuse rather than to guess — and to refuse naming the remedy a leaf actually has.
+    #[test]
+    fn an_extension_at_the_clamped_floor_is_refused_rather_than_guessed() {
+        let r = rig();
+        let p = r.params;
+        assert!(
+            p.ext_csv(p.m_max) > p.e_floor,
+            "non-vacuity: the clamp is unreachable by any scheduled renewal, which is WHY refusing \
+             it is safe"
+        );
+        let mut leaf = r.leaf();
+        leaf.child_extension.csv = Some(p.e_floor);
+        // …and make the signed transaction agree, so this is the clamp and not a declaration lie.
+        let mut tx = parse(&leaf.child_extension.signed_tx);
+        tx.input[0].sequence = mercurylib::tesr::csv_blocks(p.e_floor);
+        leaf.child_extension.signed_tx = hex::encode(serialize(&tx));
+        let e = child_renewal_epoch(&leaf).expect_err("must refuse");
+        assert!(
+            e.to_string().contains("child_in_ladder_split"),
+            "the refusal must name the leaf's own remedy, got: {e}"
+        );
+    }
+
+    /// A CSV that is not on the schedule grid at all is refused rather than rounded.
+    #[test]
+    fn an_extension_csv_off_the_schedule_grid_is_refused() {
+        let r = rig();
+        let p = r.params;
+        let mut leaf = r.leaf();
+        let off = p.e0 - 1; // not a multiple of delta_e below e0
+        let mut tx = parse(&leaf.child_extension.signed_tx);
+        tx.input[0].sequence = mercurylib::tesr::csv_blocks(off);
+        leaf.child_extension.signed_tx = hex::encode(serialize(&tx));
+        leaf.child_extension.csv = Some(off);
+        assert!(child_renewal_epoch(&leaf).is_err(), "an off-grid rung must not be interpreted");
+    }
+
+    // =============================================================================================
+    // STEP 1 — THE STRICT-DECREASE GUARD, BEHAVIOURALLY
+    // =============================================================================================
+
+    /// The guard itself: equal is refused, higher is refused, strictly lower is allowed.
+    #[test]
+    fn a_renewal_that_does_not_strictly_lower_the_extension_csv_is_refused() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        for bad in [p.ext_csv(0), p.ext_csv(0) + 1] {
+            let e = plan_child_renewal(&leaf, bad, p.state_csv(0))
+                .expect_err("a non-decreasing extension CSV must be refused");
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("strictly") && msg.contains("mature first"),
+                "the refusal must say WHY (replace-by-lower-timelock), got: {e}"
+            );
+        }
+        plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("non-vacuity: one rung down");
+    }
+
+    /// **WHY THE GUARD IS NOT COSMETIC.** Build the renewal the missing guard permits — an
+    /// extension at the SAME CSV as the one it supersedes — and hand it to the receiver's verifier.
+    /// It is REFUSED, i.e. the leaf is bricked: two irreversible co-signatures burned, `num_sigs`
+    /// permanently ahead of any bundle that can be persisted or conveyed.
+    #[test]
+    fn an_equal_csv_renewal_bricks_the_leaf_at_the_receiver() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let mut f = r.facts();
+        // The plan the guard refuses, built by hand exactly as the un-guarded root `renew` would.
+        let sp_txid = leaf.parent.current().state.txid.clone();
+        let slot = leaf
+            .parent
+            .current()
+            .state
+            .out_value;
+        let xc = mercurylib::tesr::build_extension_from(
+            &sp_txid, 0, slot, &r.child.address, NET, p.ext_csv(0), r.rate,
+        )
+        .expect("extension");
+        let mut raw = parse(&xc.tx_hex);
+        // A DIFFERENT transaction at the SAME rung (nLockTime is the only free field), so it is a
+        // genuine rival of the extension it supersedes rather than the very same tx.
+        raw.lock_time = electrum_client::bitcoin::absolute::LockTime::from_consensus(0);
+        raw.output.push(TxOut { value: 0, script_pubkey: ScriptBuf::new_op_return(&[1u8]) });
+        let x_tx = cosign(&raw, slot, &r.child.spk, &r.child.kp);
+        let sc = mercurylib::tesr::build_state_from(
+            &x_tx.txid().to_string(), xc.payload_vout, xc.out_value, &r.receiver.address, NET,
+            p.state_csv(0), r.rate,
+        )
+        .expect("state");
+        let s_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &r.child.spk, &r.child.kp);
+        let mut bad = leaf.clone();
+        bad.child_superseded_extensions.push(bad.child_extension.clone());
+        bad.child_superseded_states.push(bad.child_state.clone());
+        bad.child_extension = tier(&x_tx, Some(p.ext_csv(0)), xc.payload_vout);
+        bad.child_state = tier(&s_tx, Some(p.state_csv(0)), sc.payload_vout);
+        f.child_num_sigs = 4; // the SE really did issue two more
+        let e = verify(&bad, &f).expect_err("an equal-CSV renewal must be refused by the receiver");
+        assert!(
+            e.to_string().contains("out-race"),
+            "…and refused for the race reason, which is what makes it unrecoverable: {e}"
+        );
+    }
+
+    // =============================================================================================
+    // STEP 0(a) / STEP 3 — A RENEWED LEAF IS ACCEPTED, AND ITS CENSUS BALANCES
+    // =============================================================================================
+
+    /// **THE COMPATIBILITY ANSWER.** `ChildTesrBundle` already carries `child_superseded_extensions`
+    /// and `verify_superseded_segment` already handles the renewal shape (the old state is
+    /// TRANSITIVELY dead through the old extension). So a renewed leaf verifies with NO change to
+    /// the conveyed format — and the exact-equality census moves by exactly +2/+2.
+    #[test]
+    fn a_renewed_leaf_verifies_and_its_census_balances() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let mut f = r.facts();
+        verify(&leaf, &f).expect("non-vacuity: the un-renewed leaf verifies");
+
+        let plan = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("renewable");
+        let renewed = r.apply(&leaf, &plan);
+        f.child_num_sigs = 4;
+        verify(&renewed, &f).expect("a renewed leaf must verify unchanged");
+        assert_eq!(renewed.child_superseded_extensions.len(), 1);
+        assert_eq!(renewed.child_superseded_states.len(), 1);
+
+        // …and the census is EXACT, not merely satisfiable: one too few or one too many is refused.
+        for wrong in [3u32, 5] {
+            let mut g = r.facts();
+            g.child_num_sigs = wrong;
+            assert!(verify(&renewed, &g).is_err(), "census must be exact at {wrong}");
+        }
+    }
+
+    /// Renewal costs NO depth: the same `SP.out[j]`, the same ancestor chain.
+    #[test]
+    fn renewal_spends_the_same_sp_output_and_costs_no_depth() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let before = leaf.funding_outpoint();
+        let plan = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("renewable");
+        let renewed = r.apply(&leaf, &plan);
+        assert_eq!(renewed.funding_outpoint(), before, "the SAME SP.out[j]");
+        assert_eq!(renewed.ancestors.len(), leaf.ancestors.len(), "depth untouched");
+        let x = parse(&renewed.child_extension.signed_tx);
+        assert_eq!(x.input[0].previous_output.txid.to_string(), before.0);
+        assert_eq!(x.input[0].previous_output.vout, before.1);
+    }
+
+    /// **THE WHOLE POINT.** A leaf at the state floor cannot re-transfer; after a renewal it can,
+    /// with the full `state_csv(0)` budget back.
+    #[test]
+    fn a_renewed_leaf_recovers_its_full_retransfer_budget() {
+        let r = rig();
+        let p = r.params;
+        let mut leaf = r.leaf();
+        // Drive the state rung down to the floor, as 36 mainnet hops would.
+        let floor = p.d_floor;
+        leaf.child_state.csv = Some(floor);
+        assert!(
+            floor.checked_sub(p.delta).filter(|c| *c >= p.d_floor).is_none(),
+            "non-vacuity: at the floor `child_retransfer` has no rung left"
+        );
+        let plan = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("renewable");
+        assert_eq!(plan.csv_d, p.state_csv(0), "the renewal resets the state schedule");
+        let renewed = r.apply(&leaf, &plan);
+        assert_eq!(renewed.child_state.csv, Some(p.state_csv(0)));
+    }
+
+    // =============================================================================================
+    // STEP 3 / STEP 4 — REFUSALS
+    // =============================================================================================
+
+    /// A COLOURED leaf is refused BY NAME: a plain renewal builds an uncoloured tier over a sealed
+    /// output and destroys the allocation.
+    #[test]
+    fn a_coloured_leaf_is_refused_by_name() {
+        let r = rig();
+        let p = r.params;
+        let mut leaf = r.leaf();
+        leaf.rgb = Some(ColoredChild {
+            contract_id: "rgb:contract".into(),
+            amount: 42,
+            consignments: vec!["a".into(), "b".into()],
+        });
+        let e = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect_err("must refuse");
+        assert!(e.to_string().contains("RGB"), "must refuse by name, got: {e}");
+    }
+
+    /// Epoch exhaustion. At `m_max` the extension schedule is spent and the remedy is the leaf's
+    /// analogue of `rollover` — `child_in_ladder_split`, which starts a fresh level. Never a
+    /// re-anchor: a leaf has no confirmed outpoint, so `refresh()` routes it to `unilateral_exit`.
+    #[test]
+    fn epoch_exhaustion_names_the_split_not_a_reanchor() {
+        let r = rig();
+        let p = r.params;
+        let mut leaf = r.leaf();
+        // Walk the leaf to the last epoch the schedule allows.
+        for m in 1..=p.m_max {
+            let plan = plan_child_renewal(&leaf, p.ext_csv(m), p.state_csv(0)).expect("renewable");
+            leaf = r.apply(&leaf, &plan);
+        }
+        assert_eq!(child_renewal_epoch(&leaf).expect("derivable"), p.m_max);
+        assert!(child_needs_rollover(&leaf).expect("derivable"), "the budget is spent");
+        let e = plan_child_renewal(&leaf, p.ext_csv(p.m_max + 1), p.state_csv(0))
+            .expect_err("no epoch left");
+        let msg = e.to_string();
+        assert!(msg.contains("child_in_ladder_split"), "must name the leaf's remedy: {msg}");
+        // The DEFECT verbatim was `"exit or re-anchor it instead of re-sending"`. A refusal may
+        // still say that a leaf CANNOT be re-anchored — that is the fact — but it may never OFFER
+        // one as the action to take.
+        for offered in ["or re-anchor", "re-anchor it"] {
+            assert!(
+                !msg.contains(offered),
+                "must not offer `{offered}` — a leaf has no confirmed outpoint to co-operatively \
+                 spend, so `refresh()` routes it to `unilateral_exit`: {msg}"
+            );
+        }
+    }
+
+    /// The predicate mirrors `TesrParams::needs_rollover`, read off the derived epoch.
+    #[test]
+    fn the_rollover_predicate_tracks_the_derived_epoch() {
+        let r = rig();
+        let p = r.params;
+        let mut leaf = r.leaf();
+        assert!(!child_needs_rollover(&leaf).expect("derivable"));
+        for m in 1..=p.m_max {
+            let plan = plan_child_renewal(&leaf, p.ext_csv(m), p.state_csv(0)).expect("renewable");
+            leaf = r.apply(&leaf, &plan);
+            assert_eq!(
+                child_needs_rollover(&leaf).expect("derivable"),
+                p.needs_rollover(m),
+                "at epoch {m}"
+            );
+        }
+    }
+
+    // =============================================================================================
+    // STEP 5 — THE COMBINE INTERACTION
+    // =============================================================================================
+
+    /// **WHY A CONFIRMED COMBINE CANNOT LOSE A RENEWING LEAF'S MONEY.**
+    ///
+    /// A leaf combine sweeps the leaf's coin outpoint, and for a leaf that outpoint IS `SP.out[j]`
+    /// (`combine.rs`: "`utxo_txid` = SP.txid, `utxo_vout` = cb.sp_vout"). A renewal rebuilds over
+    /// exactly the same outpoint. They are rival spends of ONE output, both the owner's own — so a
+    /// sweep that confirms supersedes the RENEWED extension precisely as it supersedes the original
+    /// one, and the only cost of the collision is two wasted co-signatures. There is no ordering in
+    /// which value is lost, and none in which a transaction sticks: an un-broadcast tier cannot
+    /// conflict in a mempool.
+    ///
+    /// Asserted on the bytes rather than argued: the renewed extension's input is the very outpoint
+    /// the combine's planner would read off the coin.
+    #[test]
+    fn a_renewal_and_a_combine_are_rival_spends_of_the_one_outpoint_the_owner_already_owns() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let (sp_txid, sp_vout) = leaf.funding_outpoint();
+
+        // The coin a combine plans over: `plan_leaf_combine` identifies each leaf by
+        // `coin_outpoint(c)` = `utxo_txid:utxo_vout`, and for a leaf that pair IS `SP.out[j]` —
+        // stated by the combine module itself, so the two lanes cannot drift apart silently.
+        let combine_src = include_str!("combine.rs");
+        assert!(
+            combine_src.contains("`utxo_txid` = SP.txid, `utxo_vout` = cb.sp_vout"),
+            "non-vacuity: the combine must still identify a leaf by SP.out[j]"
+        );
+        assert!(
+            combine_src.contains("format!(\"{t}:{v}\")"),
+            "…and still key it by that outpoint"
+        );
+
+        let plan = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("renewable");
+        let renewed = r.apply(&leaf, &plan);
+        for (what, hex) in [
+            ("the ORIGINAL extension", &leaf.child_extension.signed_tx),
+            ("the RENEWED extension", &renewed.child_extension.signed_tx),
+        ] {
+            let tx = parse(hex);
+            assert_eq!(
+                (tx.input[0].previous_output.txid.to_string(), tx.input[0].previous_output.vout),
+                (sp_txid.clone(), sp_vout),
+                "{what} must spend the same SP.out[j] the combine sweeps — that is what makes the \
+                 sweep supersede it rather than conflict with it"
+            );
+        }
+    }
+
+    /// …and the renewal itself broadcasts NOTHING, so it can never strand a combine that is already
+    /// signed. The interlock therefore only has to run one way (renewal yields to combine), which is
+    /// what `a_leaf_parked_for_a_combine_cannot_be_renewed` pins on the driver's own source.
+    #[test]
+    fn a_renewal_broadcasts_nothing() {
+        let src = include_str!("tesr.rs");
+        let at = src.find("\npub async fn renew_child(").expect("the driver");
+        let body: String = src[at..at + src[at..].find("\n}\n").expect("ends")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in ["broadcast", "transaction_broadcast", "electrum"] {
+            assert!(
+                !body.contains(forbidden),
+                "a renewal is entirely off-chain — `{forbidden}` on this path would put a rival of \
+                 the owner's own combine into a mempool"
+            );
+        }
+    }
+
+    /// **THE FOOTGUN THE STRICTLY-LOWER GUARD DOES NOT CATCH.** `e0 − 1` is lower than `e0`, but it
+    /// is not on the `δE` grid — and the epoch is DERIVED from the rung, so a leaf renewed onto it
+    /// could never derive its epoch again and would be refused every further renewal. Refused at the
+    /// plan, where refusing is still free.
+    #[test]
+    fn an_off_grid_renewal_rung_is_refused_even_though_it_is_lower() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let off = p.e0 - 1;
+        assert!(off < p.ext_csv(0), "non-vacuity: it really is strictly lower");
+        assert!(off > p.e_floor, "…and inside the band");
+        let e = plan_child_renewal(&leaf, off, p.state_csv(0)).expect_err("off-grid must be refused");
+        assert!(
+            e.to_string().contains("multiple of the decrement"),
+            "the refusal must say why the rung is unusable, got: {e}"
+        );
+        plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("non-vacuity: on-grid works");
+    }
+
+    /// The state rung a renewal writes is bounded by the SAME schedule the verifier enforces.
+    #[test]
+    fn a_renewal_state_csv_outside_the_schedule_is_refused() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        for bad in [p.d_floor - 1, p.d0 + 1] {
+            assert!(
+                plan_child_renewal(&leaf, p.ext_csv(1), bad).is_err(),
+                "state CSV {bad} is outside [{},{}]",
+                p.d_floor,
+                p.d0
+            );
+        }
+    }
+
+    // =============================================================================================
+    // THE LAST RUNG — a renewal must not land the leaf PAST its last epoch
+    // =============================================================================================
+
+    /// **THE ONE ON-GRID RUNG THAT SKIPS THE WHOLE REMAINING SCHEDULE: THE EXTENSION FLOOR ITSELF.**
+    ///
+    /// `needs_rollover(epoch_before)` only asks where the leaf IS. It never asks where the plan puts
+    /// it, and `ext_csv` SATURATES — so `ext_csv(m_max + 1)` is exactly `e_floor`, which is on the
+    /// `δE` grid, inside `[e_floor, e0]`, and strictly lower than any live rung. Every guard in the
+    /// planner is satisfied by it.
+    ///
+    /// Landing there is not cosmetic. `lib/src/tesr.rs:194` — "never operate at the extension
+    /// floor" — is why `m_max` is 15 and not 16, and a leaf whose extension sits AT the floor is
+    /// refused by this file's own [`child_renewal_epoch`] forever: it has silently forfeited every
+    /// remaining epoch (mainnet: up to 15 of its 16, i.e. 540 of 576 onward hops) and its
+    /// [`child_needs_rollover`] now ERRORS where the answer is a plain `true`. The planner must not
+    /// be able to manufacture a leaf its own reader refuses.
+    #[test]
+    fn a_renewal_onto_the_extension_floor_is_refused() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let floor_rung = p.e_floor;
+        // Non-vacuity: it really does pass every OTHER guard the planner has.
+        assert_eq!(
+            floor_rung,
+            p.ext_csv(p.m_max + 1),
+            "the saturating schedule puts epoch m_max+1 exactly on the floor"
+        );
+        assert!(floor_rung < p.ext_csv(0), "strictly lower than the live rung");
+        assert!(floor_rung >= p.e_floor, "not below the floor");
+        assert_eq!((p.e0 - floor_rung) % p.delta_e, 0, "on the δE grid");
+        assert!(p.m_max + 1 > p.m_max, "and past the last epoch the schedule allows");
+
+        let e = plan_child_renewal(&leaf, floor_rung, p.state_csv(0))
+            .expect_err("a rung past the last epoch must be refused");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("child_in_ladder_split"),
+            "…and refused naming the leaf's own remedy, never a re-anchor: {msg}"
+        );
+        // Non-vacuity in the other direction: the LAST legal rung is still accepted.
+        plan_child_renewal(&leaf, p.ext_csv(p.m_max), p.state_csv(0))
+            .expect("the last epoch the schedule allows is renewable");
+    }
+
+    /// **THE PROPERTY BEHIND IT, over the whole band rather than the one rung.** A leaf carries no
+    /// `m` field — the epoch is DERIVED from the signed nSequence — so a rung the planner accepts
+    /// but the reader cannot interpret is a leaf that can no longer answer for itself: neither
+    /// `child_renewal_epoch`, nor `child_needs_rollover`, nor `renew_child_auto`, which all go
+    /// through the same derivation. Every accepted rung must therefore round-trip.
+    #[test]
+    fn every_rung_the_planner_accepts_leaves_a_leaf_that_can_still_answer_for_itself() {
+        let r = rig();
+        let p = r.params;
+        let leaf = r.leaf();
+        let mut accepted = 0;
+        for csv in 0..=p.e0 + 2 {
+            let Ok(plan) = plan_child_renewal(&leaf, csv, p.state_csv(0)) else { continue };
+            accepted += 1;
+            let renewed = r.apply(&leaf, &plan);
+            let m = child_renewal_epoch(&renewed).unwrap_or_else(|e| {
+                panic!(
+                    "the planner accepted extension rung {csv}, but the leaf it produces can no \
+                     longer derive its own epoch ({e}) — it has silently forfeited every remaining \
+                     renewal, and `child_needs_rollover` now ERRORS where it should answer `true`"
+                )
+            });
+            assert_eq!(m, plan.epoch_after, "the plan's declared epoch is the derived one");
+            assert!(
+                m <= p.m_max,
+                "rung {csv} puts the leaf at epoch {m}, past the schedule's last ({})",
+                p.m_max
+            );
+            child_needs_rollover(&renewed)
+                .unwrap_or_else(|e| panic!("rung {csv} leaves the rollover predicate unanswerable: {e}"));
+        }
+        assert!(accepted >= 2, "non-vacuity: the planner must accept SOMETHING (got {accepted})");
+    }
+
+    // =============================================================================================
+    // L1 LIVENESS — a leaf this wallet has already handed away may not be renewed
+    // =============================================================================================
+
+    /// **THE WATCHTOWER'S L1 RULE, ON THE RENEWAL LANE.** `wallet.rs:1856-1872` and
+    /// `combine.rs`'s plan builder both hold it: broadcast/spend only for a coin whose status is
+    /// `CONFIRMED`, as an ALLOWLIST, because "a lane added tomorrow parks its coin in SOME
+    /// non-CONFIRMED status and is refused BY DEFAULT". A renewal IS that lane added tomorrow.
+    ///
+    /// Why it is not merely tidy. `child_retransfer` conveys a leaf by co-signing `S'_child` over
+    /// `ext_child.out[0]` and marking the coin `IN_TRANSFER` durably first. A renewal run in that
+    /// window supersedes `ext_child` itself — so the recipient's conveyed state hangs off an
+    /// extension that can never confirm, and their claim fails the exact-equality census (the SE's
+    /// count is now two ahead of what their bundle discloses). Fail-closed for them, but the hop is
+    /// destroyed after the sender may already have been paid, and the leaf's own budget is spent on
+    /// it. The same holds for `TRANSFERRED`, `WITHDRAWN`, `WITHDRAWING` and every status a future
+    /// lane invents.
+    ///
+    /// The un-finished-combine journal check is a DENYLIST keyed on one prefix; this is the
+    /// allowlist that does not have to enumerate anything.
+    #[test]
+    fn only_a_confirmed_leaf_may_be_renewed() {
+        use mercurylib::wallet::CoinStatus::*;
+        refuse_unless_leaf_is_live(&CONFIRMED, "child-sid")
+            .expect("non-vacuity: a live leaf is renewable");
+        for parked in [
+            INITIALISED, IN_MEMPOOL, UNCONFIRMED, IN_TRANSFER, WITHDRAWING, TRANSFERRED, WITHDRAWN,
+            DUPLICATED, INVALIDATED,
+        ] {
+            let e = refuse_unless_leaf_is_live(&parked, "child-sid")
+                .expect_err(&format!("a {parked} leaf must not be renewable"));
+            let msg = e.to_string();
+            assert!(
+                msg.contains("child-sid") && msg.contains(&parked.to_string()),
+                "the refusal must name the leaf and the status that refused it, got: {msg}"
+            );
+        }
     }
 }

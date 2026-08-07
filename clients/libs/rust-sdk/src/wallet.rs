@@ -4,11 +4,76 @@ use anyhow::{anyhow, Result};
 use mercurylib::wallet::{Coin, CoinStatus, Wallet as WalletRecord};
 use mercuryrustlib::client_config::ClientConfig;
 use mercuryrustlib::sqlite_manager::{get_wallet, insert_wallet, update_wallet};
+use mercuryrustlib::transfer_sender::CancelOutcome;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::SdkConfig;
 use crate::events::{LadderSkipReason, WalletEvent, WatchtowerPass};
 use crate::types::{Balance, ClaimResult, DepositAddressInfo, SdkError, TokenClaimState, TokenClaimStatus};
+
+/// **[K>1 prerequisite 4] The SE's per-parent LIFETIME derived-slot allowance**, mirroring
+/// `max_derived_tokens_per_statechain` (`server/src/server_config.rs`, default 64).
+///
+/// Mirrored rather than fetched because the number is needed BEFORE the first SE call — the point of
+/// the guard is to refuse an oversized batch while nothing has been minted, co-signed or
+/// terminalized. An operator who lowers the cap makes this bound optimistic, and the server's own
+/// 400 then stops the batch at the mint; an operator who raises it makes it conservative, which
+/// costs a large batch a split into two. Both directions are safe; the direction that would not be
+/// is admitting a batch the SE cannot slot, and this constant cannot cause that.
+pub const DERIVED_SLOTS_PER_STATECHAIN: u32 = 64;
+
+/// The largest K a single in-ladder batch may carry: `K + 1` slots must fit
+/// [`DERIVED_SLOTS_PER_STATECHAIN`], so K ≤ 63.
+pub const MAX_BATCH_RECIPIENTS: usize = DERIVED_SLOTS_PER_STATECHAIN as usize - 1;
+
+/// How many times a pooled derived-slot voucher may fail to become a slot before it is discarded.
+/// See [`UtexoWallet::fail_slot_voucher`].
+pub const SLOT_VOUCHER_FAILURE_LIMIT: u32 = 3;
+
+/// Wallet-DB key of the durable derived-slot voucher pool.
+const SLOT_VOUCHER_KEY: &str = "slotvouchers";
+
+/// One minted-but-unused derived-slot voucher — see [`UtexoWallet::take_derived_tokens`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SlotVoucher {
+    pub token_id: String,
+    /// Consecutive failed attempts to turn this voucher into a slot.
+    #[serde(default)]
+    pub failures: u32,
+}
+
+/// **[K>1 prerequisite 4] Refuse a slot batch the derived-slot allowance cannot carry, by name.**
+///
+/// `slots` is `K + 1` for a K-recipient batch. The refusal is a typed
+/// [`SdkError::BatchTooManyRecipients`] naming K, the slot count, the cap and the largest admissible
+/// K — a caller that batches automatically can read the bound out of the error instead of guessing
+/// at a bare "count must be between 1 and 64" from the server, which arrives only after the caller
+/// has already assembled the recipient list.
+pub(crate) fn refuse_oversized_slot_batch(slots: usize) -> Result<()> {
+    if slots > DERIVED_SLOTS_PER_STATECHAIN as usize {
+        return Err(SdkError::BatchTooManyRecipients {
+            recipients: slots.saturating_sub(1),
+            slots,
+            cap: DERIVED_SLOTS_PER_STATECHAIN,
+            max_recipients: MAX_BATCH_RECIPIENTS,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The pure half of [`UtexoWallet::fail_slot_voucher`]: bump the failure count of `token_id` and
+/// drop it once it hits [`SLOT_VOUCHER_FAILURE_LIMIT`]. Returns whether the pool changed.
+fn record_voucher_failure(pool: &mut Vec<SlotVoucher>, token_id: &str) -> bool {
+    let Some(v) = pool.iter_mut().find(|v| v.token_id == token_id) else {
+        return false;
+    };
+    v.failures += 1;
+    if v.failures >= SLOT_VOUCHER_FAILURE_LIMIT {
+        pool.retain(|v| v.token_id != token_id);
+    }
+    true
+}
 
 /// A complete off-line recovery bundle for a wallet (review H3). Contains everything that lives
 /// ONLY on the owner's disk and that the SE cannot re-serve after a claim: the full wallet record
@@ -438,6 +503,19 @@ impl UtexoWallet {
     /// for zero new on-chain surface). One SE round-trip authorizes the whole batch (a single
     /// consumed auth nonce).
     ///
+    /// **[K>1 prerequisite 4] RECOVERABLE.** Issuance is counted over the parent's LIFETIME,
+    /// spent rows included (`server/src/endpoints/deposit.rs`, `max_derived_tokens_per_statechain`),
+    /// so a batch that is minted and then abandoned is *permanently* deducted from that parent's
+    /// allowance. At K = 1 (2 slots per attempt) 31 failed attempts survive; at K = 20 (21 slots)
+    /// only 2 do — the retry budget collapses exactly as the batch gets big enough to need one.
+    ///
+    /// So minted-but-unused vouchers are kept: they go into a durable pool the moment they are
+    /// issued and leave it only when a slot is actually created from one
+    /// ([`Self::create_child_slot`]). A retry therefore re-uses them and costs the allowance
+    /// **nothing**. An unused voucher is still `unspent` at the SE, so it is a valid input to
+    /// `deposit/init` however long it has sat there; a voucher that keeps failing is dropped after
+    /// [`SLOT_VOUCHER_FAILURE_LIMIT`] attempts so a single poisoned id cannot wedge the pool.
+    ///
     /// Falls back to onboarding tokens ([`Self::take_token`]) ONLY when the SE genuinely does not
     /// offer derived issuance — the endpoint is absent (old server) or the operator disabled it
     /// (`get_derived_tokens` → `Ok(None)`). A TRANSIENT or refused failure (proxy/DB down, auth
@@ -446,6 +524,31 @@ impl UtexoWallet {
     /// onboarding tokens (real money in a paid deployment) on a momentary derived-endpoint blip. A
     /// caller that truly wants to pay can catch the error and call [`Self::take_token`] itself.
     pub(crate) async fn take_derived_tokens(
+        &self,
+        parent_statechain_id: &str,
+        n: usize,
+    ) -> Result<Vec<String>> {
+        // [K>1 prerequisite 4] The SE refuses `count > cap` outright, so a batch that would exceed
+        // the allowance must be refused HERE, by name, before anything irreversible — see
+        // `refuse_oversized_slot_batch`.
+        refuse_oversized_slot_batch(n)?;
+        // [K>1 prerequisite 4] Vouchers left over from an earlier attempt first. They cost the
+        // parent's lifetime allowance nothing, which is the whole point.
+        let mut pool = self.slot_vouchers().await?;
+        if pool.len() < n {
+            let need = n - pool.len();
+            let minted = self.mint_derived_tokens(parent_statechain_id, need).await?;
+            pool.extend(minted.into_iter().map(|token_id| SlotVoucher { token_id, failures: 0 }));
+            // Durable BEFORE they are handed out: a voucher that exists at the SE and nowhere on
+            // disk is exactly the lifetime-allowance leak this pool exists to stop.
+            self.save_slot_vouchers(&pool).await?;
+        }
+        Ok(pool.into_iter().take(n).map(|v| v.token_id).collect())
+    }
+
+    /// The SE round-trip half of [`Self::take_derived_tokens`] — mint `n` fresh derived vouchers, or
+    /// fall back to onboarding when the SE genuinely does not offer derived issuance.
+    async fn mint_derived_tokens(
         &self,
         parent_statechain_id: &str,
         n: usize,
@@ -489,6 +592,61 @@ impl UtexoWallet {
         }
     }
 
+    /// The durable pool of minted-but-unused derived-slot vouchers — see [`Self::take_derived_tokens`].
+    pub(crate) async fn slot_vouchers(&self) -> Result<Vec<SlotVoucher>> {
+        let rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await?;
+        match rows.iter().find(|(k, _)| k == SLOT_VOUCHER_KEY) {
+            // An unreadable pool row is an ERROR, never an empty pool: reading it as empty would
+            // silently re-mint the batch and charge the parent's lifetime allowance twice.
+            Some((_, json)) => serde_json::from_str(json)
+                .map_err(|e| anyhow!("unreadable derived-slot voucher pool: {e}")),
+            None => Ok(vec![]),
+        }
+    }
+
+    async fn save_slot_vouchers(&self, pool: &[SlotVoucher]) -> Result<()> {
+        mercuryrustlib::sqlite_manager::insert_raw_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            SLOT_VOUCHER_KEY,
+            &serde_json::to_string(pool)?,
+        )
+        .await
+    }
+
+    /// Drop a voucher that has been SPENT (a slot was created from it). Called only on success —
+    /// a voucher removed on failure would be a voucher paid for and thrown away, which is what this
+    /// pool exists to prevent.
+    pub(crate) async fn consume_slot_voucher(&self, token_id: &str) -> Result<()> {
+        let mut pool = self.slot_vouchers().await?;
+        let before = pool.len();
+        pool.retain(|v| v.token_id != token_id);
+        if pool.len() != before {
+            self.save_slot_vouchers(&pool).await?;
+        }
+        Ok(())
+    }
+
+    /// Record that a voucher failed to become a slot, and drop it once it has failed
+    /// [`SLOT_VOUCHER_FAILURE_LIMIT`] times.
+    ///
+    /// The count is what makes the pool self-healing. A voucher can fail for two reasons that look
+    /// identical from here — a transient error (retry it, that is the whole point) or a token the SE
+    /// has already consumed and this wallet failed to record (retrying it forever wedges every
+    /// later batch behind a dead id). Counting attempts costs a transient failure two extra tries
+    /// and bounds the poisoned case, without parsing an error string to tell them apart.
+    pub(crate) async fn fail_slot_voucher(&self, token_id: &str) -> Result<()> {
+        let mut pool = self.slot_vouchers().await?;
+        if !record_voucher_failure(&mut pool, token_id) {
+            return Ok(());
+        }
+        self.save_slot_vouchers(&pool).await
+    }
+
     /// Fresh single-use Bitcoin deposit address for `amount_sats`. Full Mercury security: the
     /// deposit gets a decrementing-locktime backup transaction (unilateral exit) automatically.
     pub async fn get_deposit_address(&self, amount_sats: u64) -> Result<String> {
@@ -512,11 +670,19 @@ impl UtexoWallet {
 
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
             .await?;
-        let receive = mercuryrustlib::transfer_receiver::execute(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-        )
-        .await?;
+        // `execute_reporting_cancellations` + `fold_receive_outcome`, NOT the raising `execute`.
+        // A cancelled incoming transfer used to `?` out right here, before `ClaimResult` was built
+        // and before a single event was emitted — so one withdrawn payment discarded the whole
+        // pass's DepositConfirmed / TransferClaimed / TokenTransferClaimed / BalanceUpdate for the
+        // money that DID arrive. The cancellation is now reported (`cancelled_transfers` +
+        // `WalletEvent::TransferCancelled`) rather than thrown; every OTHER error still propagates.
+        let receive = fold_receive_outcome(
+            mercuryrustlib::transfer_receiver::execute_reporting_cancellations(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+            )
+            .await,
+        )?;
         // transfer_receiver::execute updates statuses of freshly claimed coins internally; refresh
         // once more so claimed coins show as confirmed.
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
@@ -952,6 +1118,16 @@ impl UtexoWallet {
                 self.book_incoming_token(id, &mut token_status).await;
             }
         }
+        // A withdrawn payment is money the user was expecting and will not get. It is reported on
+        // its own channel because it is otherwise indistinguishable from silence: the receiving slot
+        // stays empty either way. Emitted unconditionally, before the balance event, so an app that
+        // only watches events still learns about it.
+        if !receive.cancelled_statechain_ids.is_empty() {
+            let _ = self.inner.events_tx.send(WalletEvent::TransferCancelled {
+                statechain_ids: receive.cancelled_statechain_ids.clone(),
+            });
+        }
+
         if !confirmed_deposits.is_empty() || !receive.received_statechain_ids.is_empty() {
             let _ = self.inner.events_tx.send(WalletEvent::BalanceUpdate {
                 balance: compute_balance(&after),
@@ -962,7 +1138,93 @@ impl UtexoWallet {
             claimed_transfers: receive.received_statechain_ids.len() as u32,
             confirmed_deposits,
             token_results: token_status.into_values().collect(),
+            cancelled_transfers: receive.cancelled_statechain_ids.clone(),
         })
+    }
+
+    /// Withdraw an opened, unclaimed transfer so the coin is spendable again.
+    ///
+    /// The coordinator's pending-transfer lock is what stops a sender from co-signing a rival state
+    /// while a recipient holds claimable material, so this is not a power the sender simply has. The
+    /// rule is: if the mailbox message was never posted, the sender alone may withdraw it; once it
+    /// was posted, the RECORDED recipient must co-sign. This method supplies that co-signature
+    /// automatically only when this wallet holds the recipient key (a self-addressed transfer, or
+    /// one to another address in the same wallet).
+    ///
+    /// When the recipient is someone else the call returns
+    /// [`mercuryrustlib::transfer_sender::CancelNeedsRecipientConsent`], which carries the recipient
+    /// auth key: hand it to the recipient, have them call [`Self::cancel_consent`], and finish with
+    /// [`Self::cancel_transfer_with_consent`]. There is no force flag — one would reopen the
+    /// two-victim break (convey to Bob, cancel, convey to Carol) the rule exists to close.
+    ///
+    /// On success the coin is restored to CONFIRMED and is selectable for a new spend.
+    pub async fn cancel_transfer(&self, statechain_id: &str) -> Result<CancelOutcome> {
+        let _guard = self.inner.wallet_lock.lock().await;
+        let outcome = mercuryrustlib::transfer_sender::cancel(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?;
+        self.after_cancel().await?;
+        Ok(outcome)
+    }
+
+    /// Recipient half of a cooperative cancellation: the single-use consent token to hand back to
+    /// the sender out of band.
+    ///
+    /// Read-only — it signs a fresh challenge and changes nothing locally. The token authorizes
+    /// EXACTLY ONE cancellation (the nonce is single-use), so a sender cannot bank it and replay it
+    /// against a later transfer to the same key.
+    pub async fn cancel_consent(
+        &self,
+        statechain_id: &str,
+        recipient_auth_pub_key: &str,
+    ) -> Result<String> {
+        mercuryrustlib::transfer_sender::cancel_consent(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            recipient_auth_pub_key,
+        )
+        .await
+    }
+
+    /// Sender half of a cooperative cancellation, carrying a consent token obtained out of band from
+    /// the recipient's [`Self::cancel_consent`]. This is what makes a cross-wallet cancellation of a
+    /// CONVEYED transfer possible at all.
+    pub async fn cancel_transfer_with_consent(
+        &self,
+        statechain_id: &str,
+        recipient_auth_pub_key: &str,
+        recipient_auth_sig: &str,
+    ) -> Result<CancelOutcome> {
+        let _guard = self.inner.wallet_lock.lock().await;
+        let outcome = mercuryrustlib::transfer_sender::cancel_with_consent(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+            recipient_auth_pub_key,
+            recipient_auth_sig,
+        )
+        .await?;
+        self.after_cancel().await?;
+        Ok(outcome)
+    }
+
+    /// Re-sync statuses and tell the app the balance moved, after a successful cancellation.
+    ///
+    /// `update_coins` is what makes the released coin actually SPENDABLE from this wallet: the
+    /// client layer restores IN_TRANSFER -> CONFIRMED locally, and this reconciles it against the
+    /// coordinator so selection, `defend_ladders` and `get_balance` all see a live coin again.
+    async fn after_cancel(&self) -> Result<()> {
+        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+            .await?;
+        let after = self.record().await?;
+        let _ = self.inner.events_tx.send(WalletEvent::BalanceUpdate {
+            balance: compute_balance(&after),
+        });
+        Ok(())
     }
 
     /// Record that a coin was left on the FLAT (un-laddered) lane, and tell the application — but
@@ -2950,6 +3212,41 @@ pub(crate) fn deposit_anchored_deadline(h_deposit: u32, initlock: u32) -> u32 {
     h_deposit + initlock
 }
 
+/// Fold one receive poll's outcome into a result `claim()` can keep working with.
+///
+/// EXACTLY ONE error is recoverable here — [`mercuryrustlib::transfer_receiver::TransfersCancelledInPoll`]
+/// — and it is recoverable only because everything that poll DID receive is already persisted before
+/// it is raised, and because `claim()` reports it on `ClaimResult::cancelled_transfers` and
+/// `WalletEvent::TransferCancelled`. This is NOT a swallow: the cancellation comes out louder than
+/// it went in (an event, plus a field, instead of an opaque `Err` that also destroyed the pass).
+///
+/// Every other error propagates unchanged. That half is what keeps this safe — turning a
+/// coordinator outage or a DB fault into "an empty, successful pass" would be exactly the
+/// silent-degradation shape this repo has a CI guard for.
+///
+/// The call site deliberately uses the NON-raising entry point, so in the ordinary case this fold
+/// is a pass-through: recovering from the raised form would lose `received_statechain_ids`, and a
+/// poll that both received one payment and found another cancelled must report both. The downcast
+/// arm is therefore the boundary contract rather than the hot path — it is what makes "no route into
+/// `claim()` can lose a pass to a cancellation" true of a future edit that switches back to
+/// `transfer_receiver::execute`, which is precisely the edit that caused this defect the first time.
+fn fold_receive_outcome(
+    outcome: Result<mercuryrustlib::transfer_receiver::TransferReceiveResult>,
+) -> Result<mercuryrustlib::transfer_receiver::TransferReceiveResult> {
+    let err = match outcome {
+        Ok(result) => return Ok(result),
+        Err(err) => err,
+    };
+    match err.downcast_ref::<mercuryrustlib::transfer_receiver::TransfersCancelledInPoll>() {
+        Some(cancelled) => Ok(mercuryrustlib::transfer_receiver::TransferReceiveResult {
+            is_there_batch_locked: false,
+            received_statechain_ids: Vec::new(),
+            cancelled_statechain_ids: cancelled.statechain_ids.clone(),
+        }),
+        None => Err(err),
+    }
+}
+
 /// Coins in a given status, as stable keys.
 fn coins_in(record: &WalletRecord, status: CoinStatus) -> Vec<String> {
     record
@@ -3262,5 +3559,202 @@ mod silent_degradation_guard {
                 && !window.contains(MARKER)
         });
         assert!(!hit, "an explicitly audited swallow must be accepted, or nobody will use the marker");
+    }
+}
+
+// =================================================================================================
+// [K > 1 PREREQUISITE 4] THE DERIVED-SLOT BUDGET.
+//
+// A K-recipient batch needs K + 1 statechain slots, and every slot costs one derived token vouched
+// by the coin being split. The SE caps those at `max_derived_tokens_per_statechain` (64) counted
+// over the parent's LIFETIME, spent rows included — so the batch size is bounded, and a batch that
+// is minted and then abandoned charges the allowance permanently. At K = 1 that is 2 slots an
+// attempt and 31 attempts survive; at K = 20 it is 21 slots and 2 do.
+// =================================================================================================
+#[cfg(test)]
+mod derived_slot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_bound_is_k_plus_one_slots_and_the_refusal_names_k() {
+        // K + 1 == cap is the largest admissible batch: 63 payees plus the sender's change.
+        refuse_oversized_slot_batch(MAX_BATCH_RECIPIENTS + 1).expect("K = 63 fits exactly");
+        assert_eq!(MAX_BATCH_RECIPIENTS + 1, DERIVED_SLOTS_PER_STATECHAIN as usize);
+
+        let e = refuse_oversized_slot_batch(MAX_BATCH_RECIPIENTS + 2)
+            .expect_err("K = 64 needs 65 slots and must be refused");
+        let msg = e.to_string();
+        // A caller that batches automatically has to be able to act on this, so every number it
+        // needs is IN the message: how many it asked for, how many slots that is, the cap, and the
+        // largest K it may retry with.
+        assert!(msg.contains("64 recipients"), "got: {msg}");
+        assert!(msg.contains("65 statechain slots"), "got: {msg}");
+        assert!(msg.contains("64 derived slots"), "got: {msg}");
+        assert!(msg.contains("at most 63 recipients"), "got: {msg}");
+
+        // …and it is the TYPED error, so a caller can match on it rather than parse prose.
+        let typed = e.downcast_ref::<SdkError>().expect("a named refusal, not a bare anyhow");
+        assert!(matches!(
+            typed,
+            SdkError::BatchTooManyRecipients { recipients: 64, slots: 65, cap: 64, max_recipients: 63 }
+        ));
+    }
+
+    #[test]
+    fn the_single_recipient_and_empty_cases_are_untouched() {
+        // The guard bounds a batch; it must not become a new way for an ordinary payment to fail.
+        refuse_oversized_slot_batch(2).expect("K = 1: piece + change");
+        refuse_oversized_slot_batch(1).expect("a split with no change leg");
+    }
+
+    #[test]
+    fn a_pooled_voucher_survives_a_transient_failure_and_dies_after_three() {
+        // The two failure modes look identical from the client: a transient error (retry — that is
+        // the whole point of the pool) and a token the SE has already consumed (retrying it forever
+        // wedges every later batch behind a dead id). Counting attempts bounds the second without
+        // parsing an error string to tell them apart.
+        let mut pool = vec![
+            SlotVoucher { token_id: "a".into(), failures: 0 },
+            SlotVoucher { token_id: "b".into(), failures: 0 },
+        ];
+        for attempt in 1..SLOT_VOUCHER_FAILURE_LIMIT {
+            assert!(record_voucher_failure(&mut pool, "a"));
+            assert_eq!(pool.len(), 2, "still retryable after {attempt} failure(s)");
+        }
+        assert!(record_voucher_failure(&mut pool, "a"));
+        assert_eq!(
+            pool.iter().map(|v| v.token_id.as_str()).collect::<Vec<_>>(),
+            vec!["b"],
+            "a voucher that has failed {SLOT_VOUCHER_FAILURE_LIMIT} times is discarded, and only it"
+        );
+
+        // A token that is not in the pool is not an error and does not rewrite the pool — the
+        // fallback/onboarding path hands out ids that were never pooled.
+        assert!(!record_voucher_failure(&mut pool, "never-pooled"));
+    }
+
+    #[test]
+    fn the_local_bound_mirrors_the_servers_default() {
+        // Mirrored, not fetched: the guard must fire before the first SE call. Stated as a test so
+        // a change to `max_derived_tokens_per_statechain` in server_config.rs is a change somebody
+        // has to make here too, rather than a silently optimistic client.
+        assert_eq!(
+            DERIVED_SLOTS_PER_STATECHAIN, 64,
+            "server/src/server_config.rs: max_derived_tokens_per_statechain"
+        );
+    }
+}
+
+#[cfg(test)]
+mod claim_cancellation_tests {
+    use super::*;
+
+    fn cancelled(ids: &[&str]) -> anyhow::Error {
+        anyhow::Error::new(mercuryrustlib::transfer_receiver::TransfersCancelledInPoll {
+            statechain_ids: ids.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    fn poll(received: &[&str], batch_locked: bool) -> mercuryrustlib::transfer_receiver::TransferReceiveResult {
+        mercuryrustlib::transfer_receiver::TransferReceiveResult {
+            is_there_batch_locked: batch_locked,
+            received_statechain_ids: received.iter().map(|s| s.to_string()).collect(),
+            cancelled_statechain_ids: Vec::new(),
+        }
+    }
+
+    /// THE DEFECT, stated as a test. A cancelled incoming transfer used to `?` out of `claim()`
+    /// before `ClaimResult` was built, so the deposits and transfers that DID arrive in the same
+    /// poll lost their events and their report entirely — one withdrawn payment silently discarded
+    /// the whole pass. The cancellation must be REPORTED, not thrown.
+    #[test]
+    fn a_cancellation_does_not_discard_the_rest_of_the_pass() {
+        let folded = fold_receive_outcome(Err(cancelled(&["sid-cancelled"])))
+            .expect("a cancellation must not abort the claim pass");
+        assert_eq!(folded.cancelled_statechain_ids, vec!["sid-cancelled".to_string()]);
+        assert!(folded.received_statechain_ids.is_empty());
+    }
+
+    /// ...and it is still not silent: the ids come back on the result so `claim()` can put them on
+    /// `ClaimResult` and emit `TransferCancelled`. An empty list here would be the exact
+    /// silent-degradation shape — a withdrawn payment reading as an idle mailbox.
+    #[test]
+    fn the_cancelled_ids_survive_the_fold() {
+        let folded = fold_receive_outcome(Err(cancelled(&["a", "b"]))).unwrap();
+        assert_eq!(folded.cancelled_statechain_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Any OTHER error still aborts. This is the half that makes the fix safe: only the one typed,
+    /// fully-persisted cancellation signal is recoverable; a DB fault or a coordinator outage must
+    /// not be turned into "an empty successful pass".
+    #[test]
+    fn any_other_error_still_aborts_the_pass() {
+        let err = match fold_receive_outcome(Err(anyhow!("the coordinator is unreachable"))) {
+            Err(err) => err,
+            Ok(_) => panic!("a genuine failure must still propagate, not fold to a clean pass"),
+        };
+        assert!(err.to_string().contains("coordinator is unreachable"));
+    }
+
+    /// The ordinary path is untouched.
+    #[test]
+    fn a_clean_poll_folds_to_itself() {
+        let folded = fold_receive_outcome(Ok(poll(&["got-paid"], true))).unwrap();
+        assert_eq!(folded.received_statechain_ids, vec!["got-paid".to_string()]);
+        assert!(folded.cancelled_statechain_ids.is_empty());
+        assert!(folded.is_there_batch_locked);
+    }
+
+    /// A cancellation is counted apart from a receipt in the pass's report, so no consumer can read
+    /// one as the other. `claimed_transfers` must never absorb a cancelled id.
+    #[test]
+    fn claim_result_counts_cancellations_apart_from_receipts() {
+        let r = ClaimResult {
+            claimed_transfers: 1,
+            confirmed_deposits: Vec::new(),
+            token_results: Vec::new(),
+            cancelled_transfers: vec!["sid-cancelled".to_string()],
+        };
+        assert_eq!(r.claimed_transfers, 1);
+        assert_eq!(r.cancelled_transfers, vec!["sid-cancelled".to_string()]);
+    }
+
+    /// The SDK's re-exported refusal types are the SAME types the client layer raises, so an app
+    /// can `downcast_ref` across the crate boundary. If these ever became SDK-local newtypes the
+    /// downcast would silently start returning `None` and every caller would fall back to string
+    /// matching — which is exactly what the typed refusal exists to eliminate.
+    ///
+    /// Characterization test: it pins a property that is already true, so it has no red phase.
+    #[test]
+    fn the_sdk_reexports_the_same_refusal_types_the_client_raises() {
+        let raised: anyhow::Error =
+            anyhow::Error::new(mercuryrustlib::transfer_sender::CancelRefused {
+                statechain_id: "sid-1".to_string(),
+                code: "already_claimed".to_string(),
+                message: "transfer already claimed by the recipient; it cannot be cancelled"
+                    .to_string(),
+                decision: Some(mercurylib::transfer::cancel::CancelDecision::AlreadyClaimed),
+            });
+        // Downcast through the SDK's OWN path name, not the client's.
+        let via_sdk = raised.downcast_ref::<crate::CancelRefused>();
+        assert!(via_sdk.is_some(), "the SDK re-export must be the same type the client raises");
+        assert_eq!(via_sdk.unwrap().code, "already_claimed");
+        // ...and the two successes are re-exported as one enum, not duplicated.
+        assert_eq!(crate::CancelOutcome::Cancelled, CancelOutcome::Cancelled);
+    }
+
+    /// The event exists and names the transfers, so an app driven by events alone (the background
+    /// watcher's only channel) learns about a withdrawn payment.
+    #[test]
+    fn there_is_an_event_for_a_cancelled_incoming_transfer() {
+        let ev = WalletEvent::TransferCancelled {
+            statechain_ids: vec!["sid-cancelled".to_string()],
+        };
+        match ev {
+            WalletEvent::TransferCancelled { statechain_ids } => {
+                assert_eq!(statechain_ids, vec!["sid-cancelled".to_string()]);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
     }
 }

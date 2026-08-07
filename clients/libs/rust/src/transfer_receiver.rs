@@ -26,7 +26,33 @@ pub async fn new_transfer_address(client_config: &ClientConfig, wallet_name: &st
 pub struct TransferReceiveResult {
     pub is_there_batch_locked: bool,
     pub received_statechain_ids: Vec<String>,
+    /// Transfers this poll found had been CANCELLED. Non-empty means a payment this wallet was
+    /// expecting was withdrawn — [`execute`] also returns `Err` in that case, so a caller that only
+    /// inspects the `Result` still cannot read a cancellation as "nothing arrived".
+    pub cancelled_statechain_ids: Vec<String>,
 }
+
+/// A transfer this wallet was claiming had been cancelled (coordinator answered 410 with
+/// `TransferCancelledError`).
+///
+/// A distinct error type, not a formatted string, because the receive loop's `println!` + `continue`
+/// treats every claim failure as a transient miss. This one is terminal and is the user's money: it
+/// has to be distinguishable by `downcast_ref` so the loop can record it and surface it instead of
+/// swallowing it. Both claim paths therefore propagate the error UNCHANGED rather than re-wrapping
+/// it in a fresh `anyhow!("Error: {}")`, which would erase the type.
+#[derive(Debug, Clone)]
+pub struct TransferWasCancelled {
+    pub statechain_id: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for TransferWasCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "transfer of statechain id {} was cancelled: {}", self.statechain_id, self.message)
+    }
+}
+
+impl std::error::Error for TransferWasCancelled {}
 
 pub struct DuplicatedCoinData {
     pub txid: String,
@@ -71,7 +97,69 @@ pub fn sort_coins_by_statechain(coins: &mut Vec<Coin>) {
     });
 }
 
+/// One or more transfers this wallet was expecting had been CANCELLED, named by statechain id.
+///
+/// The TYPED form of [`execute`]'s refusal. `execute` still returns `Err` — that is the loud signal,
+/// and a caller which only inspects the `Result` must never read a withdrawn payment as an idle
+/// mailbox. But a caller that reports cancellations PROPERLY needs the ids, and its only other
+/// options are to lose the whole poll or to scrape them out of prose. The SDK's `claim()` downcasts
+/// this to put the ids on `ClaimResult::cancelled_transfers` and emit
+/// `WalletEvent::TransferCancelled`, instead of `?`-ing away the deposits and receipts that landed
+/// in the very same pass.
+///
+/// Everything this poll DID receive is already persisted before this is constructed
+/// ([`execute_reporting_cancellations`] returns after `update_wallet`), so recovering from it loses
+/// nothing.
+#[derive(Debug, Clone)]
+pub struct TransfersCancelledInPoll {
+    pub statechain_ids: Vec<String>,
+}
+
+impl std::fmt::Display for TransfersCancelledInPoll {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a transfer to this wallet was CANCELLED and will never complete: statechain id(s) {}. \
+             The payment did not arrive. Any other transfers in this poll were received normally \
+             and have been saved.",
+            self.statechain_ids.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for TransfersCancelledInPoll {}
+
+/// One receive poll. Cancellations are REPORTED on the result rather than raised.
+///
+/// This is the whole body; [`execute`] is this plus the `Err` for callers that want a cancellation
+/// to be impossible to overlook. Prefer this one only when you actually surface
+/// `cancelled_statechain_ids` — reading it and dropping it is the silent-degradation shape this
+/// module's `TransferWasCancelled` exists to prevent.
+pub async fn execute_reporting_cancellations(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+) -> Result<TransferReceiveResult> {
+    execute_inner(client_config, wallet_name).await
+}
+
+/// One receive poll, with a cancellation raised as [`TransfersCancelledInPoll`].
 pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<TransferReceiveResult>{
+    let result = execute_inner(client_config, wallet_name).await?;
+
+    // Persist FIRST, then fail — `execute_inner` has already saved everything that did arrive this
+    // poll (including the TransferCancel activities). A cancellation must not be returnable as an
+    // ordinary success, because "no coin appeared" is exactly what an idle mailbox looks like and
+    // the user would read it as nothing having happened.
+    if !result.cancelled_statechain_ids.is_empty() {
+        return Err(anyhow::Error::new(TransfersCancelledInPoll {
+            statechain_ids: result.cancelled_statechain_ids,
+        }));
+    }
+
+    Ok(result)
+}
+
+async fn execute_inner(client_config: &ClientConfig, wallet_name: &str) -> Result<TransferReceiveResult>{
 
     let mut wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
@@ -98,6 +186,8 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<
     let mut is_there_batch_locked = false;
 
     let mut received_statechain_ids =  Vec::<String>::new();
+
+    let mut cancelled_statechain_ids = Vec::<String>::new();
 
     let mut temp_coins = wallet.coins.clone();
     let mut temp_activities = wallet.activities.clone();
@@ -129,7 +219,17 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<
                 let message_result = process_encrypted_message(client_config, &mut coin, enc_message, &wallet.network, &wallet.name, &mut temp_activities).await;
 
                 if message_result.is_err() {
-                    println!("Processing error: {}", message_result.err().unwrap().to_string());
+                    let err = message_result.err().unwrap();
+                    if let Some(cancelled) = err.downcast_ref::<TransferWasCancelled>() {
+                        record_cancelled_transfer(
+                            cancelled,
+                            &coin,
+                            &mut temp_activities,
+                            &mut cancelled_statechain_ids,
+                        );
+                        continue;
+                    }
+                    println!("Processing error: {}", err.to_string());
                     continue;
                 }
 
@@ -179,7 +279,17 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<
                 let message_result = process_encrypted_message(client_config, &mut new_coin, enc_message, &wallet.network, &wallet.name, &mut temp_activities).await;
 
                 if message_result.is_err() {
-                    println!("Processing error: {}", message_result.err().unwrap().to_string());
+                    let err = message_result.err().unwrap();
+                    if let Some(cancelled) = err.downcast_ref::<TransferWasCancelled>() {
+                        record_cancelled_transfer(
+                            cancelled,
+                            &new_coin,
+                            &mut temp_activities,
+                            &mut cancelled_statechain_ids,
+                        );
+                        continue;
+                    }
+                    println!("Processing error: {}", err.to_string());
                     continue;
                 }
 
@@ -221,10 +331,46 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str) -> Result<
 
     update_wallet(&client_config.pool, &wallet).await?;
 
+    // Persist FIRST, then report. Everything that did arrive this poll is saved by the
+    // `update_wallet` above (including the TransferCancel activities), which is what makes it safe
+    // for `execute` to raise the cancellation immediately afterwards and for
+    // `execute_reporting_cancellations` to hand it back on the result instead.
     Ok(TransferReceiveResult{
         is_there_batch_locked,
-        received_statechain_ids
+        received_statechain_ids,
+        cancelled_statechain_ids,
     })
+}
+
+/// Book a cancelled incoming transfer into the wallet's activity log.
+///
+/// The receiving slot's `CoinStatus` is deliberately left alone. There is no "cancelled" status, and
+/// the nearest existing one (`INVALIDATED`) means something specific — a duplicate superseded by a
+/// transfer — that other code branches on; overloading it would make a cancelled payment
+/// indistinguishable from a stale duplicate in every consumer of the enum. The durable, unambiguous
+/// record is the activity entry, and the loud signal is [`execute`]'s `Err`.
+fn record_cancelled_transfer(
+    cancelled: &TransferWasCancelled,
+    coin: &Coin,
+    activities: &mut Vec<Activity>,
+    cancelled_statechain_ids: &mut Vec<String>,
+) {
+    println!(
+        "Transfer CANCELLED: statechain id {} — {}",
+        cancelled.statechain_id, cancelled.message
+    );
+    activities.push(Activity {
+        utxo: match (coin.utxo_txid.as_ref(), coin.utxo_vout) {
+            (Some(txid), Some(vout)) => format!("{}:{}", txid, vout),
+            // A never-materialised receiving slot has no outpoint yet; name the transfer instead so
+            // the entry is still attributable.
+            _ => cancelled.statechain_id.clone(),
+        },
+        amount: coin.amount.unwrap_or(0),
+        action: "TransferCancelled".to_string(),
+        date: Utc::now().to_rfc3339(),
+    });
+    cancelled_statechain_ids.push(cancelled.statechain_id.clone());
 }
 
 async fn get_msg_addr(auth_pubkey: &str, client_config: &ClientConfig) -> Result<Vec<String>> {
@@ -460,6 +606,30 @@ async fn prepay_flat_census(
         funding_vout,
         tx0_hex,
         info.aggregate_pubkey.clone(),
+    )?;
+    // [P0-3] EXIT-CHAIN LENGTH CAP on the FLAT lane. `rollover` pushes a level per exhausted epoch
+    // with no bound but the state-rung floor, so a conveyed root ladder is `1 + 2·levels.len()`
+    // transactions and nothing here has ever bounded that number. Both terms are receiver-derived:
+    // `initlock` from this wallet's own `/info/config` fetch and the schedule from its own network
+    // preset — never `bundle.params`, which is conveyed.
+    //
+    // Refusing to ACCEPT is safe; this is not reachable from any exit path.
+    //
+    // [C-1] And the conveyed schedule is BOUND rather than merely unused: `crate::tesr::cap_schedule`
+    // returns this wallet's own preset and refuses — naming the field that disagreed — a ladder whose
+    // declared schedule contradicts it. Silently ignoring the field would close this cap and leave
+    // `verify_bundle_bound` below reading that same contradicted field for every CSV band.
+    let cap_authority = crate::tesr::cap_schedule(network, bundle.params)?;
+    debug_assert_eq!(
+        cap_authority,
+        mercurylib::tesr::TesrParams::for_network(network),
+        "the cap authority must be the RECEIVER's preset, never the conveyed schedule"
+    );
+    crate::tesr::enforce_exit_chain_length(
+        "conveyed root ladder",
+        bundle.exit_tiers().len(),
+        cap_authority,
+        info_config.initlock,
     )?;
     // `flat_backups` is now the length of the chain that JUST passed structural validation — the same
     // number the claim path uses — not the sender-declared vector length.
@@ -1165,6 +1335,22 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
                 &tx0_hex,
                 statechain_info.aggregate_pubkey.clone(),
             )?;
+            // [P0-3] EXIT-CHAIN LENGTH CAP on the FLAT lane — the claim-time twin of the pre-pay
+            // census's. See the note there; both terms are receiver-derived and this is admission
+            // only, never reachable from an exit path. [C-1] The conveyed schedule is bound here too
+            // — same reasoning, and this is the door a claim comes through when no pre-pay census ran.
+            let cap_authority = crate::tesr::cap_schedule(network, bundle.params)?;
+            debug_assert_eq!(
+                cap_authority,
+                mercurylib::tesr::TesrParams::for_network(network),
+                "the cap authority must be the RECEIVER's preset, never the conveyed schedule"
+            );
+            crate::tesr::enforce_exit_chain_length(
+                "conveyed root ladder",
+                bundle.exit_tiers().len(),
+                cap_authority,
+                info_config.initlock,
+            )?;
             crate::tesr::verify_bundle_bound(
                 &bundle,
                 statechain_info.num_sigs,
@@ -1366,7 +1552,10 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
                 res.server_pubkey
                     .ok_or_else(|| anyhow::anyhow!("transfer/receiver returned no server pubkey"))?
             }
-            Err(err) => return Err(anyhow::anyhow!("Error: {}", err.to_string())),
+            // Propagate UNCHANGED: re-wrapping in `anyhow!("Error: {}")` would erase the
+            // `TransferWasCancelled` type the receive loop downcasts on, turning a cancelled
+            // payment back into an indistinguishable "processing error".
+            Err(err) => return Err(err),
         };
 
         // Passing the UN-BROADCAST SP as `tx0_hex` makes this REQUIRE that the rotated aggregate equals
@@ -1471,8 +1660,10 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
         
                     server_public_key_hex.server_pubkey.unwrap()
                 },
+                // Propagate UNCHANGED — see the note on the child-bundle path above: the
+                // `TransferWasCancelled` type must survive to the receive loop.
                 Err(err) => {
-                    return Err(anyhow::anyhow!("Error: {}", err.to_string()));
+                    return Err(err);
                 }
             };
 
@@ -1841,6 +2032,24 @@ async fn send_transfer_receiver_request_payload(client_config: &ClientConfig, tr
 
         let value = response.text().await?;
 
+        // A cancelled transfer answers 410 Gone with a TYPED body. It must never be flattened into
+        // the generic "Failed to update transfer message" below: to a recipient, a payment that was
+        // withdrawn and a mailbox that was always empty look identical, and only the typed answer
+        // distinguishes them.
+        if status == StatusCode::GONE {
+            if let std::result::Result::Ok(error) =
+                serde_json::from_str::<mercurylib::transfer::receiver::TransferReceiverErrorResponsePayload>(value.as_str())
+            {
+                if matches!(error.code, mercurylib::transfer::receiver::TransferReceiverError::TransferCancelledError) {
+                    return Err(anyhow::Error::new(TransferWasCancelled {
+                        statechain_id: transfer_receiver_request_payload.statechain_id.clone(),
+                        message: error.message,
+                    }));
+                }
+            }
+            return Err(anyhow::anyhow!("transfer/receiver refused (410): {}", value));
+        }
+
         if status == StatusCode::BAD_REQUEST{
 
             let error: mercurylib::transfer::receiver::TransferReceiverErrorResponsePayload = serde_json::from_str(value.as_str())?;
@@ -1854,6 +2063,14 @@ async fn send_transfer_receiver_request_payload(client_config: &ClientConfig, tr
                         is_batch_locked: true,
                         server_pubkey: None,
                     });
+                },
+                // A 400 never carries this code (the coordinator answers 410), but the match must
+                // stay exhaustive rather than swallow it under a wildcard.
+                mercurylib::transfer::receiver::TransferReceiverError::TransferCancelledError => {
+                    return Err(anyhow::Error::new(TransferWasCancelled {
+                        statechain_id: transfer_receiver_request_payload.statechain_id.clone(),
+                        message: error.message,
+                    }));
                 },
             }
         }
@@ -1869,6 +2086,130 @@ async fn send_transfer_receiver_request_payload(client_config: &ClientConfig, tr
         }
     
 }
+#[cfg(test)]
+mod transfer_cancelled_signal_tests {
+    use super::*;
+
+    fn cancelled() -> anyhow::Error {
+        anyhow::Error::new(TransferWasCancelled {
+            statechain_id: "sid-abc".to_string(),
+            message: "this transfer was cancelled by the sender with the recipient's consent; the payment did not complete".to_string(),
+        })
+    }
+
+    /// The receive loop distinguishes a cancelled payment from an ordinary claim miss ONLY by
+    /// downcasting. Pin that the type survives being returned through the claim paths unchanged.
+    #[test]
+    fn typed_cancellation_survives_propagation() {
+        fn claim_path() -> Result<()> {
+            // exactly what both claim paths now do: `Err(err) => return Err(err)`
+            Err(cancelled())
+        }
+        let err = claim_path().unwrap_err();
+        let found = err.downcast_ref::<TransferWasCancelled>();
+        assert!(found.is_some(), "the cancellation signal was lost in propagation");
+        assert_eq!(found.unwrap().statechain_id, "sid-abc");
+    }
+
+    /// The defect this guards against, stated as a test: re-wrapping the error in a fresh `anyhow!`
+    /// (which is what both claim paths used to do — `anyhow!("Error: {}", err.to_string())`) erases
+    /// the type, and the loop then treats a cancelled payment as a transient miss and prints-and-
+    /// continues. Failure would look like an idle mailbox, which is the whole thing this must not do.
+    #[test]
+    fn restringifying_the_error_would_lose_the_signal() {
+        let rewrapped = anyhow::anyhow!("Error: {}", cancelled().to_string());
+        assert!(
+            rewrapped.downcast_ref::<TransferWasCancelled>().is_none(),
+            "if this ever passes, the claim paths may re-wrap freely; today they must not"
+        );
+        // and the loud text is at least still present in the string form
+        assert!(rewrapped.to_string().contains("was cancelled"));
+    }
+
+    #[test]
+    fn cancellation_display_names_the_transfer_and_the_reason() {
+        let text = cancelled().to_string();
+        assert!(text.contains("sid-abc"), "must name the transfer: {text}");
+        assert!(text.contains("cancelled"), "must say cancelled: {text}");
+    }
+
+    /// The receive result carries cancellations separately from receipts, so a caller can never read
+    /// one as the other.
+    #[test]
+    fn receive_result_separates_cancellations_from_receipts() {
+        let r = TransferReceiveResult {
+            is_there_batch_locked: false,
+            received_statechain_ids: vec!["got-paid".to_string()],
+            cancelled_statechain_ids: vec!["sid-abc".to_string()],
+        };
+        assert!(!r.received_statechain_ids.contains(&"sid-abc".to_string()));
+        assert_eq!(r.cancelled_statechain_ids, vec!["sid-abc".to_string()]);
+    }
+
+    /// A receiving slot as it exists BEFORE the transfer completes: keys derived, but no outpoint
+    /// and no amount, because nothing was ever received into it. That is precisely the shape a
+    /// cancellation arrives on, so the fixture is built here rather than borrowed from a
+    /// general-purpose constructor that would default the outpoint to something.
+    fn unmaterialised_receiving_slot() -> Coin {
+        Coin {
+            index: 0,
+            user_privkey: String::new(),
+            user_pubkey: String::new(),
+            auth_privkey: String::new(),
+            auth_pubkey: String::new(),
+            derivation_path: String::new(),
+            fingerprint: String::new(),
+            address: String::new(),
+            backup_address: String::new(),
+            server_pubkey: None,
+            aggregated_pubkey: None,
+            aggregated_address: None,
+            utxo_txid: None,
+            utxo_vout: None,
+            amount: None,
+            statechain_id: Some("sid-abc".to_string()),
+            signed_statechain_id: None,
+            locktime: None,
+            secret_nonce: None,
+            public_nonce: None,
+            blinding_factor: None,
+            server_public_nonce: None,
+            tx_cpfp: None,
+            tx_withdraw: None,
+            withdrawal_address: None,
+            status: mercurylib::wallet::CoinStatus::INITIALISED,
+            duplicate_index: 0,
+            single_use: false,
+            epoch_deadline: None,
+        }
+    }
+
+    /// The activity booked for a cancelled payment is distinguishable from a received one, and works
+    /// for a receiving slot that never materialised an outpoint.
+    #[test]
+    fn cancelled_transfer_is_booked_as_an_activity() {
+        let mut activities: Vec<Activity> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        let coin = unmaterialised_receiving_slot();
+
+        record_cancelled_transfer(
+            &TransferWasCancelled {
+                statechain_id: "sid-abc".to_string(),
+                message: "cancelled".to_string(),
+            },
+            &coin,
+            &mut activities,
+            &mut ids,
+        );
+
+        assert_eq!(ids, vec!["sid-abc".to_string()]);
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].action, "TransferCancelled");
+        // no outpoint on an unmaterialised slot: the entry falls back to naming the transfer
+        assert_eq!(activities[0].utxo, "sid-abc");
+    }
+}
+
 #[cfg(test)]
 mod terminal_parents_tests {
     use super::{required_terminal_ancestors, terminal_parents_sufficient};
@@ -1991,5 +2332,35 @@ mod terminal_parents_tests {
         // defensive: max(1) means "no ancestors named" is never sufficient.
         assert!(!terminal_parents_sufficient(0, 0));
         assert!(terminal_parents_sufficient(1, 0));
+    }
+}
+
+#[cfg(test)]
+mod poll_cancellation_reporting_tests {
+    use super::*;
+
+    /// The poll-level error must carry the IDS, not only a sentence. `execute` has to stay `Err` —
+    /// that is the loud signal — but a caller which knows how to report cancellations properly
+    /// (the SDK's `claim`) must be able to recover them WITHOUT re-parsing prose, otherwise its only
+    /// options are to lose the whole pass or to lose the cancellation.
+    #[test]
+    fn the_poll_error_carries_the_ids_not_just_a_sentence() {
+        let err = anyhow::Error::new(TransfersCancelledInPoll {
+            statechain_ids: vec!["sid-a".to_string(), "sid-b".to_string()],
+        });
+        let found = err
+            .downcast_ref::<TransfersCancelledInPoll>()
+            .expect("the poll error must be downcastable to its ids");
+        assert_eq!(found.statechain_ids, vec!["sid-a".to_string(), "sid-b".to_string()]);
+    }
+
+    /// ...and it still SAYS the same thing. The text is what a plain `?`-ing caller shows the user,
+    /// so adding the type must not quietly soften the wording.
+    #[test]
+    fn the_poll_error_still_says_the_payment_did_not_arrive() {
+        let text = TransfersCancelledInPoll { statechain_ids: vec!["sid-a".to_string()] }.to_string();
+        assert!(text.contains("CANCELLED"), "{text}");
+        assert!(text.contains("will never complete"), "{text}");
+        assert!(text.contains("sid-a"), "must name the transfer: {text}");
     }
 }

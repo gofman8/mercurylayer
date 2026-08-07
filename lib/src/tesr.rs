@@ -39,6 +39,26 @@ use crate::{
 pub const P2A_SCRIPT_BYTES: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
 /// Value parked in each tier tx's P2A anchor output (sats). Above the P2A dust floor.
 pub const P2A_VALUE: u64 = 240;
+/// **The relay dust floor a SPENDABLE output must clear, in sats.**
+///
+/// Bitcoin Core refuses to relay a transaction carrying an output below `dustRelayFee`-derived
+/// threshold for its script type; 330 is the P2TR figure, and it is the number every builder floor in
+/// this codebase is written against ([`min_child_value`], [`min_spine_tip_value`],
+/// `mercuryrustlib::tesr::colored_ladder_floor`, `SplitLegRole::min_value`). It lived as four
+/// independent literal `330`s — two function-local `const`s in `crate::transaction`, one
+/// crate-private one in the SDK, and `COLORED_LADDER_DUST` — none of them reachable from the
+/// RECEIVE-side verifiers, which is a large part of why no verifier ever checked it.
+///
+/// ⚠️ **Deliberately one number for every script type.** A P2WPKH output actually relays at 294, so
+/// this is over-strict by 36 sat for a v0-witness exit address. That is the right trade: every
+/// sender-side floor in the tree already uses 330 uniformly, so no honest path produces a leg in the
+/// 294..329 band, and a per-script-type table would introduce exactly the sender/receiver floor drift
+/// this constant exists to remove.
+///
+/// **Exempt, and only these two:** the P2A anchor (a 4-byte `OP_1 <0x4e73>` output whose own
+/// standardness threshold is 240, which is why [`P2A_VALUE`] is 240) and the RGB `opret` commitment
+/// (provably unspendable, so exempt from dust rules entirely, and it carries value 0).
+pub const DUST_LIMIT: u64 = 330;
 /// **The signed virtual size of a one-payload UNCOLOURED tier — MEASURED, not approximated.**
 ///
 /// Byte for byte, over the shape [`build_tier_tx`] emits and

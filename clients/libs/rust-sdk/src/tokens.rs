@@ -198,6 +198,50 @@ pub(crate) fn ctesr_carrier_sats(send_depth: u64, fee_rate: f64) -> u64 {
 /// above from the REAL coloured sizing functions and fails if either lane outgrows this constant.
 pub const TOKEN_CARRIER_SATS: u64 = legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH);
 
+/// **[K>1] COLOURED K > 1 IS REFUSED BY NAME. The plain lane only.**
+///
+/// One `SP` may carry K payee payloads on the PLAIN lane. On the COLOURED lane it may not, and the
+/// reason is not that the builder cannot do it — [`mercuryrustlib::tesr::build_colored_in_ladder_split`]
+/// is already N-ary. It is that a coloured `SP`'s K payloads share ONE seal blinding.
+///
+/// `mercuryrustlib::rgb::build_colored_tier` derives a single `let blinding = seal.blinding()`
+/// (`clients/libs/rust/src/rgb.rs:1245`) and passes it once for an `output_map` covering every
+/// payload; `mercuryrustlib::tesr::colored_tier_seal` takes the parent statechain id, the role, `m`
+/// and the CSV — nothing child-specific. A concealed seal commits to `(method, txid, vout, blinding)`,
+/// so a payee who holds their own piece knows `B`, knows the witness txid, and can enumerate the
+/// vouts: **K tries de-conceal every sibling seal in the batch**.
+///
+/// At K = 1 that leaks the sender's own change seal to the one payee already transacting with them —
+/// a cost this lane has always paid and §4.5 accepts. At K > 1 it makes mutually unrelated payees and
+/// their exact allocations linkable to each other, which is not a cost anybody agreed to and cannot
+/// be undone once the consignment is out. It is not theft — a seal is not spendable without the key —
+/// but concealment across a coloured batch is worth **zero bits**, and a privacy property that is
+/// silently zero is worse than one that is absent.
+///
+/// The fix is per-output blinding (§4.5 item 3), which is a change to the coloured tier builder, its
+/// seal derivation and the receiver's resolution — a separate commit with its own anti-collision
+/// argument (rival tiers over one outpoint must not share a blinding or their `BundleId`s collapse).
+/// Until it lands the capability is refused rather than shipped un-private.
+///
+/// ⚠️ **This removes a capability, and there is no fallback within one carrier.** A coloured carrier
+/// is split exactly once (`SP` terminalizes it, and the change is a depth-1 coloured child no guard
+/// will split again — see [`LEGACY_CARRIER_SEND_DEPTH`]), so "pay them one at a time" means one
+/// CARRIER per recipient, via [`UtexoWallet::transfer_tokens`] or the multi-carrier lane.
+pub(crate) fn refuse_colored_multi_payee(payees: usize) -> Result<()> {
+    if payees <= 1 {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "coloured K > 1 refused: this batch pays {payees} recipients out of ONE coloured carrier, \
+         and a coloured split state gives all {payees} payload outputs the SAME seal blinding \
+         (`build_colored_tier` derives one `seal.blinding()` for the whole output map). A concealed \
+         seal commits to (method, txid, vout, blinding), so each payee could de-conceal every other \
+         payee's seal and allocation in {payees} tries — concealment across the batch would be worth \
+         zero bits. Per-output blinding is a separate change; until it lands, pay coloured recipients \
+         one per carrier (`transfer_tokens`). Nothing has been co-signed and the carrier is untouched."
+    ))
+}
+
 /// Rung-space flag that separates the BATCH split lane from the single-recipient split lane.
 ///
 /// Both lanes spend the same carrier under `TierRole::Split` at the same `tier_index` (the carrier's
@@ -3548,6 +3592,12 @@ impl UtexoWallet {
         if payouts.is_empty() {
             return Err(anyhow!("a coloured in-ladder split needs at least one payout"));
         }
+        // [K>1] THE ENGINE is where this is refused, not the entry point. Every coloured send in the
+        // SDK funnels through here — `transfer_tokens`, `batch_transfer_tokens`, and each leg of a
+        // multi-carrier payment — so a future route cannot reach a shared-blinding batch by taking a
+        // different door. First statement after the empty check, i.e. before the ladder is read and
+        // long before anything is co-signed.
+        refuse_colored_multi_payee(payouts.len())?;
         let network = self.inner.config.network.to_string();
         let carrier_id = carrier
             .statechain_id
@@ -5606,6 +5656,82 @@ mod piece_floor_tests {
             ladder_src.contains("carrier {carrier_id} has no TES-R ladder to split in-ladder"),
             "colored_in_ladder_pay must keep refusing a carrier without a ROOT `tesr-` bundle — \
              that refusal is the third leg of the depth-1 cap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod colored_k_gt_1_tests {
+    use super::refuse_colored_multi_payee;
+
+    /// **[K > 1] COLOURED K > 1 IS REFUSED BY NAME, AND K = 1 IS NOT.**
+    ///
+    /// The line is drawn at exactly one PAYEE, not at one output: a coloured split of a partly-spent
+    /// carrier carries a change child too, and that seal is the sender's own. Leaking your own change
+    /// seal to the one payee you are already transacting with is the cost §4.5 accepts; leaking payee
+    /// *i*'s allocation to payee *j*, who has no relationship with them, is not.
+    #[test]
+    fn a_coloured_batch_of_one_is_allowed_and_two_is_refused_by_name() {
+        refuse_colored_multi_payee(1).expect("coloured K = 1 is the lane that ships");
+        refuse_colored_multi_payee(0).expect("an empty list is somebody else's refusal, not this one");
+
+        let e = refuse_colored_multi_payee(2).unwrap_err().to_string();
+        assert!(e.contains("coloured K > 1 refused"), "refused BY NAME: {e}");
+        assert!(e.contains("SAME seal blinding"), "the refusal must state the reason: {e}");
+        assert!(e.contains("build_colored_tier"), "…and name the code it is a property of: {e}");
+        assert!(
+            e.contains("transfer_tokens"),
+            "a refusal that removes a capability must name the route that still works: {e}"
+        );
+        assert!(
+            e.contains("Nothing has been co-signed"),
+            "the carrier must be stated untouched — this fires before the split: {e}"
+        );
+
+        // The count in the message is the caller's K, not a constant.
+        let e19 = refuse_colored_multi_payee(19).unwrap_err().to_string();
+        assert!(e19.contains("19 recipients") && e19.contains("in 19 tries"), "{e19}");
+    }
+
+    /// **THE ENGINE IS WHERE IT IS REFUSED**, so no route reaches a shared-blinding batch by another
+    /// door — and it is refused before the ladder is read, let alone co-signed.
+    ///
+    /// `batch_transfer_tokens` is not the only caller of `colored_in_ladder_pay`
+    /// (`colored_multi_carrier_transfer` is another, and it calls it once per carrier), which is
+    /// exactly why the guard cannot live at an entry point.
+    #[test]
+    fn the_refusal_sits_in_the_engine_ahead_of_every_read_and_every_co_sign() {
+        let src = include_str!("tokens.rs");
+        let at = src.find("\n    async fn colored_in_ladder_pay(").expect("the engine");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("function ends")];
+        let guard = body
+            .find("refuse_colored_multi_payee(payouts.len())")
+            .expect("the coloured payment engine must refuse K > 1");
+        for later in [
+            "mercuryrustlib::tesr::load(",           // the carrier's ladder
+            "list_allocations",                      // the engine's booked allocation
+            "build_colored_in_ladder_split(",        // the draft
+            "cosign_colored_in_ladder_split(",       // the terminalizing co-sign
+            "take_derived_tokens(",                  // lifetime slot allowance
+        ] {
+            if let Some(pos) = body.find(later) {
+                assert!(
+                    guard < pos,
+                    "`{later}` runs at {pos}, before the K > 1 refusal at {guard} — a refusal after \
+                     the carrier is read is still correct, but one after the co-sign is a carrier \
+                     terminalized for a payment that was never allowed"
+                );
+            }
+        }
+        // And the only call site that can hand it more than one payout is the batch lane; the other
+        // two pass a one-element list. All three go through the engine, so none can dodge the guard.
+        // (The needle is assembled at runtime so this assertion does not count ITSELF.)
+        let call = format!(".colored_in_ladder_pay{}", "(asset_id");
+        assert_eq!(
+            src.matches(call.as_str()).count(),
+            3,
+            "three call sites (transfer_tokens, multi-carrier, batch_transfer_tokens) — a fourth \
+             needs re-checking against this guard"
         );
     }
 }

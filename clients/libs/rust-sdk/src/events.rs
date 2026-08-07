@@ -8,6 +8,16 @@ pub enum WalletEvent {
     DepositConfirmed { address: String, amount_sats: u64 },
     /// An incoming transfer was claimed (key handover completed).
     TransferClaimed { statechain_ids: Vec<String> },
+    /// An incoming transfer this wallet was expecting was CANCELLED by its sender (with the
+    /// recipient's consent, or before the mailbox message was ever posted). The payment will never
+    /// complete and no coin will appear.
+    ///
+    /// This has its own event because the alternative is indistinguishable from silence: the
+    /// receiving slot stays empty either way, so an app driven by `TransferClaimed` alone would show
+    /// a user an idle mailbox for money that was withdrawn. The claim pass that reports this is
+    /// otherwise NORMAL — deposits and other transfers in the same pass are claimed and evented as
+    /// usual — so this must not be read as "the pass failed".
+    TransferCancelled { statechain_ids: Vec<String> },
     /// Balance changed for any reason (deposit, claim, send).
     BalanceUpdate { balance: Balance },
     /// An incoming token transfer was validated (off-chain consignment) and booked.

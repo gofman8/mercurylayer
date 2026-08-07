@@ -1393,6 +1393,445 @@ pub async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, sign
 
 
 
+/// Outcome of a successful [`cancel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The transfer was withdrawn by this call; the coin is spendable again.
+    Cancelled,
+    /// The transfer had already been cancelled. Reported separately so a retry after a dropped
+    /// response is not mistaken for a fresh cancellation, but it is a success either way.
+    AlreadyCancelled,
+}
+
+/// The coordinator refused the cancellation, and this is the rule that refused it.
+///
+/// A TYPE, not a formatted string, for the same reason [`crate::transfer_receiver::TransferWasCancelled`]
+/// is: every one of these refusals means the pending-transfer lock is STILL HELD, and a caller that
+/// can only string-match cannot reliably tell that from a success. `decision` is `None` only for a
+/// code this client does not know — which is still a refusal, never a success.
+#[derive(Debug, Clone)]
+pub struct CancelRefused {
+    pub statechain_id: String,
+    /// The wire code, verbatim, even when this client cannot name it.
+    pub code: String,
+    /// The coordinator's message, verbatim. Never reworded locally: rewording hides which rule fired.
+    pub message: String,
+    /// Which row of the authorization table refused, when this client recognises the code.
+    pub decision: Option<mercurylib::transfer::cancel::CancelDecision>,
+}
+
+impl std::fmt::Display for CancelRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancellation of statechain id {} refused ({}): {}",
+            self.statechain_id, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for CancelRefused {}
+
+/// The ONE refusal a caller can actually do something about: the mailbox message was conveyed, so
+/// the recorded recipient must co-sign.
+///
+/// Distinct from [`CancelRefused`] because it is the only refusal with a REMEDY, and the remedy
+/// needs the key programmatically: the recipient — who is usually in a different wallet, on a
+/// different device — mints a consent token with [`cancel_consent`] and hands it back for
+/// [`cancel_with_consent`]. Scraping the key out of prose is not a remedy.
+#[derive(Debug, Clone)]
+pub struct CancelNeedsRecipientConsent {
+    pub statechain_id: String,
+    /// The auth key the coordinator RECORDED as this transfer's recipient. `None` only if the
+    /// coordinator declined to name it, in which case there is nothing to route the request to.
+    pub recipient_auth_pub_key: Option<String>,
+    /// The coordinator's verbatim message.
+    pub message: String,
+}
+
+impl std::fmt::Display for CancelNeedsRecipientConsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The coordinator's text comes FIRST and unaltered — the live-stack test pins
+        // "the recipient must co-sign the cancellation" and the whole point of a named refusal is
+        // that it reads the same everywhere.
+        write!(f, "{}", self.message)?;
+        if let Some(key) = &self.recipient_auth_pub_key {
+            write!(
+                f,
+                " (statechain id {}, recipient auth key {}). This wallet does not hold that key, so \
+                 it cannot produce the consent. Ask the recipient to co-sign with `cancel_consent` \
+                 and pass the token to `cancel_with_consent`, or wait for the coordinator's \
+                 transfer window to expire.",
+                self.statechain_id, key
+            )
+        } else {
+            write!(
+                f,
+                " (statechain id {}; the coordinator did not name the recipient key)",
+                self.statechain_id
+            )
+        }
+    }
+}
+
+impl std::error::Error for CancelNeedsRecipientConsent {}
+
+/// This client's reading of a `POST /transfer/cancel` response body.
+///
+/// Deliberately a THREE-way split rather than `Result<CancelOutcome>`: the consent case is neither
+/// a success nor a dead end, it is the point at which the cooperative flow starts. Keeping it
+/// separate is what lets [`cancel`] retry in-wallet and a cross-wallet caller route it onward,
+/// without either of them re-parsing a string.
+#[derive(Debug)]
+pub enum CancelReply {
+    /// The lock is released (or was already).
+    Done(CancelOutcome),
+    /// Conveyed and unclaimed: the recorded recipient must co-sign.
+    NeedsRecipientConsent(CancelNeedsRecipientConsent),
+    /// Every other answer. The lock is still held.
+    Refused(CancelRefused),
+}
+
+impl CancelReply {
+    /// Collapse to the caller-facing result. Both refusals become TYPED errors carried by
+    /// `anyhow::Error::new`, so `downcast_ref` still works after propagation.
+    pub fn into_result(self) -> Result<CancelOutcome> {
+        match self {
+            CancelReply::Done(outcome) => Ok(outcome),
+            CancelReply::NeedsRecipientConsent(c) => Err(anyhow::Error::new(c)),
+            CancelReply::Refused(r) => Err(anyhow::Error::new(r)),
+        }
+    }
+}
+
+/// Read a cancel response body into a [`CancelReply`]. Pure — no I/O, so the mapping is exhaustively
+/// testable without a coordinator.
+///
+/// EXHAUSTIVE BY CONSTRUCTION: the match walks the `CancelDecision` list and anything that is not on
+/// it falls to `Refused`, never to a success. There is deliberately no `_ => Ok(Cancelled)` arm; an
+/// old client meeting a newer coordinator's ninth decision must report a refusal, because telling
+/// the sender its coin is free while the coordinator still holds the lock is exactly the
+/// silent-degradation shape this repo has a CI guard for.
+pub fn read_cancel_reply(
+    statechain_id: &str,
+    body: &mercurylib::transfer::cancel::TransferCancelResponsePayload,
+) -> CancelReply {
+    use mercurylib::transfer::cancel::CancelDecision::*;
+
+    // Compare against the policy enum's own codes rather than string literals, so the client and the
+    // coordinator cannot drift apart on the wire vocabulary.
+    let decision = [
+        Allow,
+        AlreadyCancelled,
+        NoSuchTransfer,
+        AlreadyClaimed,
+        Batched,
+        ClaimInFlight,
+        RecipientConsentRequired,
+        RecipientSignatureInvalid,
+    ]
+    .into_iter()
+    .find(|d| d.code() == body.code);
+
+    match decision {
+        Some(Allow) => CancelReply::Done(CancelOutcome::Cancelled),
+        Some(AlreadyCancelled) => CancelReply::Done(CancelOutcome::AlreadyCancelled),
+        Some(RecipientConsentRequired) => {
+            CancelReply::NeedsRecipientConsent(CancelNeedsRecipientConsent {
+                statechain_id: statechain_id.to_string(),
+                recipient_auth_pub_key: body.recipient_auth_pub_key.clone(),
+                message: body.message.clone(),
+            })
+        }
+        other => CancelReply::Refused(CancelRefused {
+            statechain_id: statechain_id.to_string(),
+            code: body.code.clone(),
+            message: body.message.clone(),
+            decision: other,
+        }),
+    }
+}
+
+/// The local status a coin should be moved to after a SUCCESSFUL cancellation, or `None` to leave
+/// it exactly as it is.
+///
+/// Only `IN_TRANSFER` is restored, and only to `CONFIRMED`. Both halves matter. Leaving a cancelled
+/// coin `IN_TRANSFER` hides it from selection and from `defend_ladders` forever — the coin is on
+/// chain and safe, but the wallet will not spend it, which is the likeliest way to make a cancelled
+/// coin unusable. Stamping `CONFIRMED` over anything ELSE is worse: a `WITHDRAWING` /`WITHDRAWN` /
+/// `INVALIDATED` coin is not the sender's to spend, and resurrecting it would put a coin the wallet
+/// cannot co-sign back into the selection set.
+pub fn status_after_cancel(current: &CoinStatus) -> Option<CoinStatus> {
+    match current {
+        CoinStatus::IN_TRANSFER => Some(CoinStatus::CONFIRMED),
+        _ => None,
+    }
+}
+
+/// Fetch a single-use auth challenge and sign it with `coin`'s auth key, producing the
+/// `"<nonce>:<sig>"` token the nonce-protected endpoints expect.
+async fn nonce_auth_token(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+    endpoint: &str,
+    coin: &Coin,
+) -> Result<String> {
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .get(&format!("{}/auth/challenge/{}", client_config.statechain_entity, statechain_id))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(anyhow!("auth challenge failed: {}", response.text().await?));
+    }
+    let v: serde_json::Value = response.json().await?;
+    let nonce = v
+        .get("nonce")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow!("no nonce in auth challenge response"))?;
+    let sig = mercurylib::transfer::receiver::sign_message(&format!("{nonce}|{endpoint}"), coin)?;
+    Ok(format!("{nonce}:{sig}"))
+}
+
+/// Withdraw an opened transfer that nobody has claimed, so the coin can be spent again.
+///
+/// # When this works, and when it does not
+///
+/// The coordinator's pending-transfer lock is what stops a sender from co-signing a rival state
+/// while a recipient holds claimable material, so cancellation is not a power the sender simply has.
+/// The rule (`mercurylib::transfer::cancel`) is:
+///
+/// * the mailbox message was never posted — the sender's own authorization is enough;
+/// * the message WAS posted — the recorded recipient must co-sign the cancellation.
+///
+/// This function supplies the recipient's co-signature automatically **only when this wallet holds
+/// the recipient key** — a transfer addressed to one of our own addresses, or to another address in
+/// the same wallet. That is not a loophole: it is the same rule, satisfied by a wallet that happens
+/// to be both parties. When the recipient is someone else, the call returns the server's named
+/// refusal, and the honest paths from there are to get the recipient to co-sign or to wait out the
+/// coordinator's expiry window. There is no force flag, and adding one would reopen the two-victim
+/// break the rule exists to close.
+///
+/// # Effects on local state
+///
+/// On success the coin's status is restored from `IN_TRANSFER` to `CONFIRMED` and a `TransferCancel`
+/// activity is recorded. The backup transactions built for the abandoned transfer are deliberately
+/// left in place: they are already co-signed, they are the coin's unilateral exit for the state it
+/// is in, and the next transfer appends to the chain rather than replacing it.
+pub async fn cancel(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<CancelOutcome> {
+    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+    let sender_coin = sender_coin_for_cancel(&wallet, wallet_name, statechain_id)?;
+
+    // Attempt 1: sender authorization only. This succeeds outright when nothing was conveyed, and
+    // otherwise comes back naming the recipient key whose consent is required.
+    let reply = post_cancel(client_config, statechain_id, &sender_coin, None).await?;
+
+    let needs = match reply {
+        CancelReply::NeedsRecipientConsent(needs) => needs,
+        // Success or a refusal with no remedy — settle it here.
+        other => return finish_cancel(client_config, wallet_name, &sender_coin, other).await,
+    };
+
+    let Some(recipient_key) = needs.recipient_auth_pub_key.clone() else {
+        return Err(anyhow::Error::new(needs));
+    };
+
+    // Do we hold the recipient key? Only then can this one wallet be both parties. If not, hand the
+    // caller the TYPED refusal carrying the key, so it can route the consent request to whoever does
+    // hold it (`cancel_consent` there, `cancel_with_consent` back here) instead of scraping prose.
+    if !wallet.coins.iter().any(|c| c.auth_pubkey == recipient_key) {
+        return Err(anyhow::Error::new(needs));
+    }
+
+    cancel_with_consent_inner(client_config, wallet_name, statechain_id, &recipient_key, None).await
+}
+
+/// Recipient half of a COOPERATIVE cancellation: mint the single-use consent token.
+///
+/// The recipient — normally a different wallet on a different device — signs
+/// `sha256(nonce|"transfer/cancel/recipient")` with the auth key of its receiving slot and hands the
+/// `"<nonce>:<sig>"` token back to the sender out of band. That token authorizes EXACTLY ONE
+/// cancellation: the nonce is single-use, so a sender cannot bank a consent and replay it against a
+/// later transfer to the same key (the reopen-and-replay break `mercurylib::transfer::cancel`'s
+/// module doc describes).
+///
+/// Errors if this wallet does not hold `recipient_auth_pub_key` — there is nothing to sign with, and
+/// signing with any other key produces [`CancelDecision::RecipientSignatureInvalid`], not consent.
+pub async fn cancel_consent(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    recipient_auth_pub_key: &str,
+) -> Result<String> {
+    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+
+    let recipient_coin = wallet
+        .coins
+        .iter()
+        .find(|c| c.auth_pubkey == recipient_auth_pub_key)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "wallet {wallet_name} does not hold the recipient auth key \
+                 {recipient_auth_pub_key}, so it cannot consent to cancelling statechain id \
+                 {statechain_id}"
+            )
+        })?;
+
+    nonce_auth_token(
+        client_config,
+        statechain_id,
+        mercurylib::transfer::cancel::CANCEL_RECIPIENT_ENDPOINT,
+        &recipient_coin,
+    )
+    .await
+}
+
+/// Sender half of a COOPERATIVE cancellation, carrying a consent token obtained out of band from
+/// [`cancel_consent`].
+///
+/// This is what makes row 2 of the authorization table reachable ACROSS wallets. It fetches its own
+/// fresh sender nonce — the two legs are bound to different endpoint strings, so neither can stand in
+/// for the other, and the sender leg burned by a previous attempt is never reused.
+pub async fn cancel_with_consent(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    recipient_auth_pub_key: &str,
+    recipient_auth_sig: &str,
+) -> Result<CancelOutcome> {
+    cancel_with_consent_inner(
+        client_config,
+        wallet_name,
+        statechain_id,
+        recipient_auth_pub_key,
+        Some(recipient_auth_sig.to_string()),
+    )
+    .await
+}
+
+/// The coin this wallet is cancelling AS THE SENDER. Index 0 only: duplicates are deposits into the
+/// same address, not transfer legs, and their auth keys do not authorize the transfer row.
+fn sender_coin_for_cancel(wallet: &Wallet, wallet_name: &str, statechain_id: &str) -> Result<Coin> {
+    wallet
+        .coins
+        .iter()
+        .find(|c| c.statechain_id.as_deref() == Some(statechain_id) && c.duplicate_index == 0)
+        .cloned()
+        .ok_or_else(|| anyhow!("no coin with statechain id {statechain_id} in wallet {wallet_name}"))
+}
+
+/// One `POST /transfer/cancel` round trip, read into a [`CancelReply`].
+///
+/// `recipient` is `Some((key, sig))` for the cooperative leg. A transport or parse failure is
+/// PROPAGATED, never folded into "nothing to cancel": a coordinator this client could not reach has
+/// not released the lock, and reporting success would leave the sender believing a still-locked coin
+/// is spendable.
+async fn post_cancel(
+    client_config: &ClientConfig,
+    statechain_id: &str,
+    sender_coin: &Coin,
+    recipient: Option<(String, String)>,
+) -> Result<CancelReply> {
+    let client = client_config.get_reqwest_client()?;
+    let url = format!("{}/transfer/cancel", client_config.statechain_entity);
+
+    let auth_sig = nonce_auth_token(
+        client_config,
+        statechain_id,
+        mercurylib::transfer::cancel::CANCEL_SENDER_ENDPOINT,
+        sender_coin,
+    )
+    .await?;
+
+    let (recipient_auth_pub_key, recipient_auth_sig) = match recipient {
+        Some((key, sig)) => (Some(key), Some(sig)),
+        None => (None, None),
+    };
+
+    let payload = mercurylib::transfer::cancel::TransferCancelRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        auth_sig,
+        recipient_auth_sig,
+        recipient_auth_pub_key,
+    };
+
+    let response = client.post(&url).json(&payload).send().await?;
+    let text = response.text().await?;
+    let body: mercurylib::transfer::cancel::TransferCancelResponsePayload =
+        serde_json::from_str(&text)
+            .map_err(|e| anyhow!("could not read the cancel response ({e}): {text}"))?;
+
+    Ok(read_cancel_reply(statechain_id, &body))
+}
+
+/// Turn a settled reply into the caller's result, applying the local bookkeeping on success.
+async fn finish_cancel(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    sender_coin: &Coin,
+    reply: CancelReply,
+) -> Result<CancelOutcome> {
+    let outcome = reply.into_result()?;
+    let statechain_id = sender_coin
+        .statechain_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("cancelled a coin with no statechain id"))?;
+
+    // The coin is ours again. Put its status back so it is selectable for a new spend and so
+    // `defend_ladders` treats it as a live coin rather than one mid-conveyance.
+    if let Some(restored) = status_after_cancel(&sender_coin.status) {
+        persist_coin_status(client_config, wallet_name, statechain_id, restored).await?;
+    }
+
+    if let (Some(txid), Some(vout)) = (sender_coin.utxo_txid.clone(), sender_coin.utxo_vout) {
+        let mut wallet = get_wallet(&client_config.pool, wallet_name).await?;
+        wallet.activities.push(Activity {
+            utxo: format!("{}:{}", txid, vout),
+            amount: sender_coin.amount.unwrap_or(0),
+            action: "TransferCancel".to_string(),
+            date: Utc::now().to_rfc3339(),
+        });
+        update_wallet(&client_config.pool, &wallet).await?;
+    }
+
+    Ok(outcome)
+}
+
+/// The cooperative leg. `supplied` is the consent token when it came from another wallet; `None`
+/// means mint it here, which only works when this wallet holds the recipient key.
+async fn cancel_with_consent_inner(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+    recipient_auth_pub_key: &str,
+    supplied: Option<String>,
+) -> Result<CancelOutcome> {
+    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+    let sender_coin = sender_coin_for_cancel(&wallet, wallet_name, statechain_id)?;
+
+    let recipient_auth_sig = match supplied {
+        Some(sig) => sig,
+        None => {
+            cancel_consent(client_config, wallet_name, statechain_id, recipient_auth_pub_key).await?
+        }
+    };
+
+    let reply = post_cancel(
+        client_config,
+        statechain_id,
+        &sender_coin,
+        Some((recipient_auth_pub_key.to_string(), recipient_auth_sig)),
+    )
+    .await?;
+
+    finish_cancel(client_config, wallet_name, &sender_coin, reply).await
+}
+
 #[cfg(test)]
 mod flat_lane_tests {
     use super::*;
@@ -1563,5 +2002,192 @@ mod flat_lane_tests {
         );
         // ...and the licence comes from the coin's own flag, which no test row can fake.
         assert_eq!(recorded_flat_reason(&rows, "abc").unwrap().as_deref(), Some(FLAT_TERMINALIZED_CARRIER));
+    }
+}
+
+#[cfg(test)]
+mod transfer_cancel_client_tests {
+    use super::*;
+    use mercurylib::transfer::cancel::{CancelDecision, TransferCancelResponsePayload};
+
+    fn body(decision: CancelDecision, key: Option<&str>) -> TransferCancelResponsePayload {
+        TransferCancelResponsePayload {
+            code: decision.code().to_string(),
+            message: decision.message().to_string(),
+            recipient_auth_pub_key: key.map(|k| k.to_string()),
+        }
+    }
+
+    /// EXHAUSTIVE. Every `CancelDecision` the coordinator can answer with maps to exactly one
+    /// client reading, and the two successes are the ONLY readings that are not an error. A
+    /// catch-all that fell through to `Cancelled` would tell a sender its coin is free while the
+    /// coordinator still holds the lock — and the sender would then try to spend a coin the SE
+    /// refuses, or worse, believe a conveyed payment was withdrawn when it was not.
+    #[test]
+    fn every_cancel_decision_maps_to_exactly_one_client_reading() {
+        for decision in [
+            CancelDecision::Allow,
+            CancelDecision::AlreadyCancelled,
+            CancelDecision::NoSuchTransfer,
+            CancelDecision::AlreadyClaimed,
+            CancelDecision::Batched,
+            CancelDecision::ClaimInFlight,
+            CancelDecision::RecipientConsentRequired,
+            CancelDecision::RecipientSignatureInvalid,
+        ] {
+            let key = matches!(decision, CancelDecision::RecipientConsentRequired)
+                .then_some("02deadbeef");
+            let reply = read_cancel_reply("sid-1", &body(decision, key));
+            match (decision, &reply) {
+                (CancelDecision::Allow, CancelReply::Done(CancelOutcome::Cancelled)) => {}
+                (
+                    CancelDecision::AlreadyCancelled,
+                    CancelReply::Done(CancelOutcome::AlreadyCancelled),
+                ) => {}
+                (CancelDecision::RecipientConsentRequired, CancelReply::NeedsRecipientConsent(c)) => {
+                    assert_eq!(c.recipient_auth_pub_key.as_deref(), Some("02deadbeef"));
+                }
+                (d, CancelReply::Refused(r)) => {
+                    assert_eq!(r.decision, Some(d), "the refusal must name the rule that fired");
+                    assert_eq!(r.code, d.code());
+                }
+                (d, other) => panic!("{d:?} was read as {other:?}"),
+            }
+        }
+    }
+
+    /// A code this client does not know is a REFUSAL, never a success. This is the
+    /// silent-degradation shape for this endpoint: a future coordinator that grows a ninth decision
+    /// must not have it read as "cancelled" by an old client, because the sender would then treat a
+    /// still-locked coin as free.
+    #[test]
+    fn an_unknown_code_is_refused_not_treated_as_success() {
+        let reply = read_cancel_reply(
+            "sid-1",
+            &TransferCancelResponsePayload {
+                code: "some_future_decision".to_string(),
+                message: "a rule this client has never heard of".to_string(),
+                recipient_auth_pub_key: None,
+            },
+        );
+        match reply {
+            CancelReply::Refused(ref r) => {
+                assert_eq!(r.decision, None, "an unknown code cannot name a known rule");
+                assert_eq!(r.code, "some_future_decision");
+            }
+            ref other => panic!("an unknown code must be refused, got {other:?}"),
+        }
+        assert!(reply.into_result().is_err());
+    }
+
+    /// A CLAIMED transfer is never cancellable, and the refusal says so by name rather than as an
+    /// opaque string the caller has to parse.
+    #[test]
+    fn a_claimed_transfer_is_refused_by_name() {
+        let err = read_cancel_reply("sid-1", &body(CancelDecision::AlreadyClaimed, None))
+            .into_result()
+            .unwrap_err();
+        let refusal = err
+            .downcast_ref::<CancelRefused>()
+            .expect("a refusal must survive as a typed error, not a formatted string");
+        assert_eq!(refusal.decision, Some(CancelDecision::AlreadyClaimed));
+        assert!(refusal.to_string().contains("already claimed"), "{refusal}");
+    }
+
+    /// An LN-BATCHED transfer is never cancellable: the latch's preimage decides whether the
+    /// payment happened, and recipient consent is not the right authorization for it.
+    #[test]
+    fn an_ln_batched_transfer_is_refused_by_name() {
+        let err = read_cancel_reply("sid-1", &body(CancelDecision::Batched, None))
+            .into_result()
+            .unwrap_err();
+        let refusal = err.downcast_ref::<CancelRefused>().expect("typed refusal");
+        assert_eq!(refusal.decision, Some(CancelDecision::Batched));
+        assert!(refusal.to_string().contains("lightning-latch"), "{refusal}");
+    }
+
+    /// The recipient-consent refusal carries the key PROGRAMMATICALLY, so a cross-wallet caller can
+    /// route it to the recipient instead of scraping prose — and it still contains the server's
+    /// verbatim text, which the live-stack test pins.
+    #[test]
+    fn the_consent_refusal_is_actionable_and_keeps_the_servers_words() {
+        let err = read_cancel_reply(
+            "sid-1",
+            &body(CancelDecision::RecipientConsentRequired, Some("02abc")),
+        )
+        .into_result()
+        .unwrap_err();
+        let needs = err
+            .downcast_ref::<CancelNeedsRecipientConsent>()
+            .expect("the consent refusal must be its own type");
+        assert_eq!(needs.statechain_id, "sid-1");
+        assert_eq!(needs.recipient_auth_pub_key.as_deref(), Some("02abc"));
+        assert!(
+            needs.to_string().contains("the recipient must co-sign the cancellation"),
+            "the server's verbatim refusal must survive: {needs}"
+        );
+    }
+
+    /// A consent-required answer with no key is still a consent refusal, not a success and not a
+    /// generic one: the sender cannot act on it, but it must not be mistaken for anything else.
+    #[test]
+    fn consent_required_without_a_key_is_still_a_consent_refusal() {
+        let reply =
+            read_cancel_reply("sid-1", &body(CancelDecision::RecipientConsentRequired, None));
+        match reply {
+            CancelReply::NeedsRecipientConsent(ref c) => {
+                assert!(c.recipient_auth_pub_key.is_none());
+            }
+            other => panic!("expected a consent refusal, got {other:?}"),
+        }
+        assert!(reply.into_result().is_err());
+    }
+
+    /// A recipient signature that did not verify is reported as INVALID, never as MISSING. Reading
+    /// a wrong-key or replayed consent as "you forgot to attach one" would send an honest client
+    /// into a retry loop and would hide a forgery attempt.
+    #[test]
+    fn an_invalid_consent_is_not_reported_as_a_missing_one() {
+        let err = read_cancel_reply("sid-1", &body(CancelDecision::RecipientSignatureInvalid, None))
+            .into_result()
+            .unwrap_err();
+        assert!(err.downcast_ref::<CancelNeedsRecipientConsent>().is_none());
+        let refusal = err.downcast_ref::<CancelRefused>().expect("typed refusal");
+        assert_eq!(refusal.decision, Some(CancelDecision::RecipientSignatureInvalid));
+    }
+
+    /// Only the two success readings restore the coin, and only from IN_TRANSFER. Getting this
+    /// wrong is the likeliest way to make a cancelled coin unusable: leaving it IN_TRANSFER hides
+    /// it from selection forever, and stamping CONFIRMED over a WITHDRAWING/INVALIDATED coin would
+    /// resurrect a coin that is not the sender's to spend.
+    #[test]
+    fn a_successful_cancel_restores_only_an_in_transfer_coin_to_spendable() {
+        assert_eq!(status_after_cancel(&CoinStatus::IN_TRANSFER), Some(CoinStatus::CONFIRMED));
+        for untouched in [
+            CoinStatus::CONFIRMED,
+            CoinStatus::WITHDRAWING,
+            CoinStatus::WITHDRAWN,
+            CoinStatus::INVALIDATED,
+            CoinStatus::INITIALISED,
+            CoinStatus::IN_MEMPOOL,
+            CoinStatus::TRANSFERRED,
+            CoinStatus::DUPLICATED,
+        ] {
+            assert_eq!(
+                status_after_cancel(&untouched),
+                None,
+                "{untouched:?} must be left exactly as it is"
+            );
+        }
+    }
+
+    /// The two consent legs are bound to DIFFERENT endpoint strings, so neither can stand in for
+    /// the other and neither can be redirected at another nonce-protected endpoint.
+    #[test]
+    fn the_two_consent_legs_cannot_be_substituted_for_one_another() {
+        assert_ne!(
+            mercurylib::transfer::cancel::CANCEL_SENDER_ENDPOINT,
+            mercurylib::transfer::cancel::CANCEL_RECIPIENT_ENDPOINT
+        );
     }
 }

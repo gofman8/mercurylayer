@@ -67,6 +67,10 @@ pub async fn execute() -> Result<()> {
         &bundle,
         &mut children,
         mercuryrustlib::tesr::ChangeLeg::None,
+        // [K>1 prerequisite 2] No conveyance plan: this test drives the hand-over itself (or does
+        // not hand over at all), so the journal records no recipient for the leg and the resume
+        // driver correctly reports it `unactionable` rather than conveying it behind the test.
+        &[],
     )
     .await?;
     assert!(split.tip.is_none(), "a ChangeLeg::None split must not mint a spine tip");

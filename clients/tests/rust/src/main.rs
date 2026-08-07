@@ -96,6 +96,9 @@ pub mod sdk79_split_watchtower;
 pub mod sdk80_plain_child_split_watchtower;
 pub mod sdk81_inladder_split_recovery;
 pub mod sdk82_exit_headroom_gate;
+pub mod sdk83_leaf_combine;
+pub mod sdk84_leaf_renewal;
+pub mod sdk85_transfer_cancel;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -470,6 +473,42 @@ async fn main() -> Result<()> {
     // — is REFUSED by the receiver, while the same payment in a fresh epoch is adopted.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("82") {
         sdk82_exit_headroom_gate::execute().await?;
+        return Ok(());
+    }
+    // THE LEAF COMBINE (SDK_E2E=83): one spine batch carves 5 leaves; the shared prefix
+    // T -> X_m -> SP is walked on chain until SP CONFIRMS; three of the leaves are then swept into
+    // ONE consolidated UTXO by a single N-input transaction carrying no timelock — and the leaf that
+    // was NOT combined still exits unilaterally on its own pre-signed tiers. The refusals are
+    // exercised for real: a combine over an un-broadcast SP (blind), over a MEMPOOL SP (replaceable),
+    // and over a coloured leaf (allocation-destroying) are each refused side-effect free.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("83") {
+        sdk83_leaf_combine::execute().await?;
+        return Ok(());
+    }
+    // LEAF RENEWAL (SDK_E2E=84): a leaf's transfer budget was HARD and unreplenishable — one δ off
+    // the state rung per whole-coin hop, refused at the floor, and the refusal named remedies a leaf
+    // does not have (it cannot re-anchor and has no `rollover`). `renew_child` rebuilds both leaf
+    // tiers IN PLACE over the SAME `SP.out[j]` for zero on-chain bytes and no depth. This walks a
+    // leaf through every hop of every epoch on the regtest schedule, renewing between them, and
+    // settles the safety property on chain: when the leaf finally exits, the transaction that takes
+    // `SP.out[j]` is the RENEWED extension — every superseded one loses the maturity race. The
+    // refusals are exercised for real: the floor refusal must name RENEWAL, the exhaustion refusal
+    // must name `child_in_ladder_split`, and a renewal that does not strictly LOWER the extension
+    // rung is refused with no co-signature burned.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("84") {
+        sdk84_leaf_renewal::execute().await?;
+        return Ok(());
+    }
+    // TRANSFER CANCELLATION (SDK_E2E=85): withdrawing an opened transfer so the coin is spendable
+    // again — and the one case that must never be withdrawable. All four rows of
+    // `mercurylib::transfer::cancel`'s authorization table are pinned against a live coordinator:
+    // opened-but-never-conveyed (sender alone), conveyed-and-unclaimed (sender-only REFUSED by name,
+    // then released CROSS-WALLET with bob's single-use consent), claimed (terminal), and batched
+    // (governed by the latch, never by the sender). The safety step closes the double-pay hole the
+    // whole design exists for: after a consented cancellation bob can never claim, and the coin
+    // lands with carol — exactly one of them is paid.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("85") {
+        sdk85_transfer_cancel::execute().await?;
         return Ok(());
     }
 
