@@ -754,6 +754,138 @@ pub fn new_backup_transaction(
 // irrelevant.
 // ---------------------------------------------------------------------------------------------------
 
+/// The P2TR dust threshold, in satoshis: an output at or below this makes its transaction
+/// non-standard, so no node will relay it. Already asserted, as a function-local constant, by
+/// `create_tx_out` and `get_unsigned_split_psbt`; hoisted here so the multi-input builders and the
+/// combine fee model share ONE number with them instead of each carrying a copy that can drift.
+pub const DUST_LIMIT: u64 = 330;
+
+// ---------------------------------------------------------------------------------------------
+// FEE ARITHMETIC FOR A MULTI-INPUT P2TR KEY-PATH SWEEP.
+//
+// `get_unsigned_combine_psbt` does NO fee arithmetic: it enforces `sum(outputs) < sum(inputs)` and
+// calls whatever is left over "the fee". That is fine for an off-chain branch nobody broadcasts and
+// useless for an on-chain sweep, where the remainder has to actually clear the relay minimum. The
+// only fee model that existed in this tree is `create_tx_out`'s `BACKUP_TX_SIZE = 112`, a single
+// hardcoded 1-in-1-out figure with no way to extend it to N inputs (extrapolating it per input
+// over-estimates a 60-leaf sweep by roughly 2x — 134 400 sats instead of 70 380 at 20 sat/vB,
+// which is not a safe rounding, it is money burnt).
+//
+// WHICH FIGURES ARE WHAT:
+//   * 112 vB (1-in 1-out) — a REPO CONSTANT, `lib/src/transaction.rs:116`. Pinned against this
+//     model by `the_one_input_sweep_agrees_with_the_repos_existing_backup_tx_size`, which it now
+//     matches EXACTLY (it used to carry one vByte of margin over a model that was one byte short).
+//   * 330 sat P2TR dust — a REPO CONSTANT, already asserted by `create_tx_out` and
+//     `get_unsigned_split_psbt`; now [`DUST_LIMIT`].
+//   * every byte figure below (41-byte input, 43-byte P2TR output, 67-byte key-path witness,
+//     4-weight-unit-per-byte, the marker+flag) — STANDARD BITCOIN SERIALISATION, NOT previously
+//     present anywhere in this repo. Derived here from consensus encoding, re-derived by hand in
+//     `the_sweep_vsize_matches_the_hand_derived_serialisation_at_1_2_and_60_inputs`, and — because
+//     a hand-derivation cannot catch a wrong PREMISE — measured against a real signed transaction
+//     in `witness_size_ground_truth_tests`.
+// ---------------------------------------------------------------------------------------------
+
+/// Non-witness bytes of one transaction input: 32-byte txid + 4-byte vout + 1-byte empty
+/// scriptSig length + 4-byte sequence. (Standard serialisation.)
+const INPUT_BASE_BYTES: u64 = 41;
+/// Witness bytes of a P2TR **key-path** spend as THIS repo signs it: 1-byte stack-item count +
+/// 1-byte item length + 65-byte signature.
+///
+/// **65, not 64.** `new_backup_transaction_multi` (below) builds
+/// `taproot::Signature { hash_ty: TapSighashType::All }`, and rust-bitcoin 0.30.1's
+/// `taproot::Signature::to_vec` omits the trailing sighash byte for `TapSighashType::Default` ONLY
+/// — for every other type, `All` (0x01) included, it appends it. So the witness item is 65 bytes
+/// and the per-input witness is 67.
+///
+/// This constant was 66 (the `Default`-sighash figure) and therefore under-estimated EVERY sweep by
+/// one byte per input. That is the dangerous direction: an under-paying transaction over N leaves
+/// that have already been co-signed cannot be re-signed, only re-broadcast, so it sticks in the
+/// mempool. `witness_size_ground_truth_tests` measures the real signed transaction rather than
+/// re-deriving this number, so the premise itself is now pinned.
+const INPUT_WITNESS_BYTES: u64 = 67;
+/// Non-witness bytes of one P2TR output: 8-byte value + 1-byte script length + 34-byte
+/// `OP_1 <32-byte x-only key>`. (Standard serialisation.)
+const P2TR_OUTPUT_BYTES: u64 = 43;
+
+/// Bytes a Bitcoin `CompactSize` needs for `n`.
+const fn compact_size_bytes(n: u64) -> u64 {
+    if n < 253 {
+        1
+    } else if n <= u16::MAX as u64 {
+        3
+    } else if n <= u32::MAX as u64 {
+        5
+    } else {
+        9
+    }
+}
+
+/// Virtual size, in vBytes, of an `n_inputs`-in / `n_outputs`-out transaction where every input is
+/// a P2TR key-path spend and every output is P2TR.
+///
+/// `vsize = ceil(weight / 4)`, `weight = 4 * base_bytes + witness_bytes` — the segwit rule, so the
+/// witness is discounted 4x. Rounding is UP: a truncated vsize under-pays, and an under-paying
+/// sweep of N already-co-signed leaves is exactly the "looks fine, never confirms" failure the dust
+/// floor above exists to prevent.
+///
+/// The marginal cost of one more input is `(4 * 41 + 67) / 4 = 57.75` vBytes and does not depend on
+/// N — that number is the whole economic case for batching.
+pub fn sweep_tx_vsize(n_inputs: usize, n_outputs: usize) -> core::result::Result<u64, MercuryError> {
+    // Not `saturating` and not a default: a caller asking the size of a transaction with no inputs
+    // or no outputs has a bug, and answering with a number lets it proceed.
+    if n_inputs == 0 || n_outputs == 0 {
+        return Err(MercuryError::EmptyInput);
+    }
+    let n_in = n_inputs as u64;
+    let n_out = n_outputs as u64;
+
+    let base_bytes = 4                            // nVersion
+        + compact_size_bytes(n_in)                // input count
+        + INPUT_BASE_BYTES * n_in
+        + compact_size_bytes(n_out)               // output count
+        + P2TR_OUTPUT_BYTES * n_out
+        + 4; // nLockTime
+    let witness_bytes = 2                         // segwit marker + flag
+        + INPUT_WITNESS_BYTES * n_in;
+
+    let weight = 4 * base_bytes + witness_bytes;
+    Ok(weight.div_ceil(4))
+}
+
+/// The miner fee, in satoshis, for [`sweep_tx_vsize`] at `fee_rate_sats_per_vb`, rounded UP.
+///
+/// The rate is validated rather than cast: `(f64::NAN).ceil() as u64` is 0 in Rust, so an
+/// un-checked rate turns a garbage input into a zero fee on the one path that decides whether a
+/// co-signed sweep can be relayed. A zero or negative rate is refused for the same reason.
+pub fn sweep_fee_sats(
+    n_inputs: usize,
+    n_outputs: usize,
+    fee_rate_sats_per_vb: f64,
+) -> core::result::Result<u64, MercuryError> {
+    if !fee_rate_sats_per_vb.is_finite() || fee_rate_sats_per_vb <= 0.0 {
+        return Err(MercuryError::FeeTooLow);
+    }
+    let vsize = sweep_tx_vsize(n_inputs, n_outputs)?;
+    let fee = (vsize as f64 * fee_rate_sats_per_vb).ceil();
+    if !fee.is_finite() || fee < 0.0 || fee > u64::MAX as f64 {
+        return Err(MercuryError::FeeTooLow);
+    }
+    Ok(fee as u64)
+}
+
+/// Is a combine of `n_inputs` leaves totalling `total_in_sats` worth doing at this rate? True iff
+/// the total covers the sweep fee AND still leaves a relayable (>= [`DUST_LIMIT`]) output.
+///
+/// Stated once, here, so the build path and any caller-facing quote cannot disagree about it.
+pub fn combine_is_economic(
+    total_in_sats: u64,
+    n_inputs: usize,
+    fee_rate_sats_per_vb: f64,
+) -> core::result::Result<bool, MercuryError> {
+    let fee = sweep_fee_sats(n_inputs, 1, fee_rate_sats_per_vb)?;
+    Ok(total_in_sats >= fee.saturating_add(DUST_LIMIT))
+}
+
 /// Resolve a recipient address string (a Mercury transfer address or a plain bitcoin address) to a
 /// `ScriptBuf`, mirroring `create_tx_out`.
 fn resolve_output_scriptpubkey(addr: &str, network: Network) -> core::result::Result<ScriptBuf, MercuryError> {
@@ -791,6 +923,15 @@ pub fn get_unsigned_combine_psbt(
     let total_in: u64 = coins.iter().map(|c| c.amount.unwrap() as u64).sum();
     let total_out: u64 = outputs.iter().map(|(_, v)| *v).sum();
     if outputs.is_empty() || total_out >= total_in {
+        return Err(MercuryError::FeeTooLow);
+    }
+    // Dust floor — the SAME rule `get_unsigned_split_psbt` carries (see its DUST_LIMIT above), and
+    // it was missing here. A below-dust output makes the whole co-signed transaction non-standard,
+    // so it is unrelayable — and on a combine that is worse than on a split, because N inputs have
+    // already been co-signed by the time anyone finds out. Reject BEFORE the SE is asked for a
+    // single signature. P2TR dust is 330 sats. Per-output, not on the sum: two 200-sat outputs
+    // total 400 yet each one is individually unrelayable.
+    if outputs.iter().any(|(_, v)| *v < DUST_LIMIT) {
         return Err(MercuryError::FeeTooLow);
     }
 
@@ -943,5 +1084,369 @@ mod split_locktime_tests {
         let lt = LockTime::from_height(0).expect("height-0 locktime must be valid");
         assert_eq!(lt.to_consensus_u32(), 0);
         assert!(lt.is_block_height());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod combine_test_support {
+    use crate::wallet::{Coin, CoinStatus};
+
+    /// A fixed, valid secp256k1 point used as every test leaf's aggregate key. The PSBT builder
+    /// only needs it to parse and to key-path-tweak into a P2TR address, so one deterministic
+    /// literal keeps these tests free of key derivation.
+    pub const AGG_PUBKEY: &str =
+        "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+
+    /// The regtest P2TR address of [`AGG_PUBKEY`], derived rather than hard-coded so the literal
+    /// can never drift out of agreement with the key.
+    pub fn agg_address_regtest() -> String {
+        use bitcoin::{Address, Network};
+        use secp256k1_zkp::{PublicKey, Secp256k1};
+        use std::str::FromStr;
+        let pk = PublicKey::from_str(AGG_PUBKEY).expect("test agg pubkey parses");
+        Address::p2tr(&Secp256k1::new(), pk.x_only_public_key().0, None, Network::Regtest).to_string()
+    }
+
+    /// A leaf `Coin` as `transfer_receiver.rs:1500-1513` leaves it after adoption: `utxo_txid` =
+    /// SP.txid, `utxo_vout` = cb.sp_vout, `amount` = SP.out[j].value, plus its own aggregate key.
+    /// Those are exactly the four fields the combine PSBT builder reads per input.
+    pub fn leaf_coin(txid: &str, vout: u32, amount: u32) -> Coin {
+        Coin {
+            index: 0,
+            user_privkey: String::new(),
+            user_pubkey: String::new(),
+            auth_privkey: String::new(),
+            auth_pubkey: String::new(),
+            derivation_path: String::new(),
+            fingerprint: String::new(),
+            address: String::new(),
+            backup_address: String::new(),
+            server_pubkey: None,
+            aggregated_pubkey: Some(AGG_PUBKEY.to_string()),
+            aggregated_address: Some(agg_address_regtest()),
+            utxo_txid: Some(txid.to_string()),
+            utxo_vout: Some(vout),
+            amount: Some(amount),
+            statechain_id: Some(format!("sid-{txid}-{vout}")),
+            signed_statechain_id: None,
+            locktime: None,
+            secret_nonce: None,
+            public_nonce: None,
+            blinding_factor: None,
+            server_public_nonce: None,
+            tx_cpfp: None,
+            tx_withdraw: None,
+            withdrawal_address: None,
+            status: CoinStatus::CONFIRMED,
+            duplicate_index: 0,
+            single_use: false,
+            epoch_deadline: None,
+        }
+    }
+}
+
+/// **GROUND TRUTH FOR THE WITNESS TERM.** Every other test in `sweep_fee_model_tests` re-derives
+/// the model's arithmetic by hand — which catches a typo, but cannot catch a wrong PREMISE. The
+/// premise here is how many bytes `new_backup_transaction_multi` really puts in a witness, and that
+/// is decided by rust-bitcoin, not by this repo:
+///
+/// ```text
+/// // bitcoin-0.30.1/src/crypto/taproot.rs:55-64
+/// pub fn to_vec(self) -> Vec<u8> {
+///     let mut ser_sig = self.sig.as_ref().to_vec();
+///     if self.hash_ty == TapSighashType::Default {
+///         // default sighash type, don't add extra sighash byte
+///     } else {
+///         ser_sig.push(self.hash_ty as u8);
+///     }
+///     ser_sig
+/// }
+/// ```
+///
+/// `new_backup_transaction_multi` builds `taproot::Signature { hash_ty: TapSighashType::All }`
+/// (`All` is 0x01, NOT `Default`), so the sighash byte IS appended: the signature is 65 bytes and
+/// the per-input witness is 1 (item count) + 1 (item length) + 65 = **67**, not 66. So instead of
+/// re-deriving, these two tests BUILD the transaction the fee model prices and MEASURE it.
+#[cfg(test)]
+mod witness_size_ground_truth_tests {
+    use super::combine_test_support::{agg_address_regtest, leaf_coin};
+    use super::{get_unsigned_combine_psbt, new_backup_transaction_multi, sweep_tx_vsize};
+    use std::str::FromStr;
+
+    const TXID_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// The FULLY SIGNED n-in / 1-out sweep, exactly as the combine driver produces it: the same
+    /// `get_unsigned_combine_psbt` and the same `new_backup_transaction_multi`.
+    ///
+    /// The 64 signature bytes are fabricated, which changes nothing this test measures:
+    /// `secp256k1::schnorr::Signature::from_slice` (secp256k1-0.27.0/src/schnorr.rs:78-87) checks
+    /// LENGTH ONLY, so a fabricated BIP-340 signature serialises byte-for-byte like a real one. The
+    /// question under test is a serialisation size, not a validity.
+    fn signed_sweep(n: usize) -> bitcoin::Transaction {
+        let coins: Vec<crate::wallet::Coin> =
+            (0..n as u32).map(|i| leaf_coin(TXID_A, i, 5_000)).collect();
+        let total: u64 = 5_000 * n as u64;
+        let psbt_b64 = get_unsigned_combine_psbt(
+            &coins,
+            0,
+            0,
+            0,
+            0,
+            vec![(agg_address_regtest(), total - 2_000)],
+            "regtest".to_string(),
+            false,
+        )
+        .expect("the unsigned combine psbt must build");
+        let psbt = bitcoin::psbt::Psbt::from_str(&psbt_b64).expect("psbt parses");
+        let tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&psbt.unsigned_tx));
+        let sig_hex = "ab".repeat(64);
+        let signed = new_backup_transaction_multi(tx_hex, vec![sig_hex; n])
+            .expect("the signed sweep must assemble");
+        bitcoin::consensus::encode::deserialize(&hex::decode(signed).expect("hex"))
+            .expect("the signed sweep must deserialize")
+    }
+
+    /// **THE PREMISE, MEASURED.** 65-byte signature (64 + the `SIGHASH_ALL` byte), 67-byte witness.
+    #[test]
+    fn the_real_signed_sweep_carries_a_65_byte_signature_and_a_67_byte_witness_per_input() {
+        for n in [1usize, 2, 60] {
+            let tx = signed_sweep(n);
+            assert_eq!(tx.input.len(), n);
+            for (i, txin) in tx.input.iter().enumerate() {
+                let items: Vec<&[u8]> = txin.witness.iter().collect();
+                assert_eq!(items.len(), 1, "a key-path spend is a one-item witness (n={n}, i={i})");
+                assert_eq!(
+                    items[0].len(),
+                    65,
+                    "`taproot::Signature{{ hash_ty: TapSighashType::All }}.to_vec()` appends the \
+                     0x01 sighash byte — only `TapSighashType::Default` is omitted — so the \
+                     signature is 65 bytes, not 64 (n={n}, i={i})"
+                );
+                assert_eq!(
+                    txin.witness.serialized_len(),
+                    67,
+                    "per-input witness = 1 (item count) + 1 (item length) + 65 (n={n}, i={i})"
+                );
+            }
+        }
+    }
+
+    /// **THE MODEL AGAINST THE TRANSACTION IT PRICES.** `INPUT_WITNESS_BYTES` was 66, i.e. one byte
+    /// per input too small, so the model UNDER-estimated every sweep — and an under-paying sweep of
+    /// N already-co-signed leaves is the "looks fine, never confirms" failure that cannot be
+    /// re-signed away. Measured against `Transaction::vsize()` of the real signed transaction at the
+    /// three sizes the feature is specified at.
+    #[test]
+    fn the_fee_models_vsize_is_the_real_signed_transactions_vsize() {
+        for n in [1usize, 2, 60] {
+            let tx = signed_sweep(n);
+            assert_eq!(
+                sweep_tx_vsize(n, 1).unwrap(),
+                tx.vsize() as u64,
+                "the fee model must size the transaction it actually prices, at n={n}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_fee_model_tests {
+    use super::{sweep_fee_sats, sweep_tx_vsize, DUST_LIMIT};
+    use crate::error::MercuryError;
+
+    /// The three sizes the leaf combine is actually specified against. Each is derived here by
+    /// hand from the consensus serialisation so a change to the model has to disagree with an
+    /// independent arithmetic, not just with itself:
+    ///
+    ///   base  = 4 (version) + varint(n_in) + 41*n_in + varint(n_out) + 43*n_out + 4 (locktime)
+    ///   wit   = 2 (marker+flag) + 67*n_in
+    ///   vsize = ceil((4*base + wit) / 4)
+    ///
+    /// N=1  : base 4+1+41+1+43+4      = 94   ; wit 69   ; weight 445   ; vsize 112
+    /// N=2  : base 4+1+82+1+43+4      = 135  ; wit 136  ; weight 676   ; vsize 169
+    /// N=60 : base 4+1+2460+1+43+4    = 2513 ; wit 4022 ; weight 14074 ; vsize 3519
+    ///
+    /// The witness term is 67 per input, not 66: `new_backup_transaction_multi` signs with
+    /// `TapSighashType::All`, so rust-bitcoin appends the 0x01 sighash byte and the signature is 65
+    /// bytes. `witness_size_ground_truth_tests` measures that on the real signed transaction.
+    #[test]
+    fn the_sweep_vsize_matches_the_hand_derived_serialisation_at_1_2_and_60_inputs() {
+        assert_eq!(sweep_tx_vsize(1, 1).unwrap(), 112, "1-in 1-out P2TR key-path");
+        assert_eq!(sweep_tx_vsize(2, 1).unwrap(), 169, "2-in 1-out P2TR key-path");
+        assert_eq!(sweep_tx_vsize(60, 1).unwrap(), 3519, "60-in 1-out P2TR key-path");
+    }
+
+    /// THE ONE NUMBER THE REPO ALREADY AGREED TO. `create_tx_out` hardcodes `BACKUP_TX_SIZE = 112`
+    /// for a 1-in 1-out P2TR backup (`lib/src/transaction.rs:116`). The exact serialisation is 112
+    /// as well — the repo's long-standing figure and this model now agree to the byte.
+    ///
+    /// That agreement is itself evidence about the fix: with the old 66-byte witness term this test
+    /// read 111 and the repo constant was explained away as "exactly one vByte of margin". The
+    /// margin was never margin, it was the missing sighash byte, and the repo's own hand-rolled
+    /// backup figure had it right all along.
+    #[test]
+    fn the_one_input_sweep_agrees_with_the_repos_existing_backup_tx_size() {
+        const REPO_BACKUP_TX_SIZE: u64 = 112;
+        let exact = sweep_tx_vsize(1, 1).unwrap();
+        assert_eq!(exact, 112);
+        assert!(
+            REPO_BACKUP_TX_SIZE >= exact && REPO_BACKUP_TX_SIZE - exact <= 1,
+            "the repo's 112 must stay a >=, within one vByte, of the exact {exact}"
+        );
+        assert_eq!(REPO_BACKUP_TX_SIZE, exact, "and they now agree exactly");
+    }
+
+    /// The varint on the input count widens at 253. A model that assumed one byte forever would
+    /// under-estimate every batch of 253+ by two bytes — small, but in the direction that produces
+    /// an under-paying, un-mineable transaction.
+    #[test]
+    fn the_input_count_varint_widens_at_253() {
+        // 252 inputs: 1-byte varint. base = 4+1+41*252+1+43+4 = 10385; wit = 2+67*252 = 16886;
+        // weight = 41540+16886 = 58426; vsize = ceil(58426/4) = 14607 (58426/4 = 14606.5).
+        assert_eq!(sweep_tx_vsize(252, 1).unwrap(), 14607);
+        // 253 inputs: 3-byte varint (+2 base bytes = +8 weight).
+        // base = 4+3+41*253+1+43+4 = 10428; wit = 2+67*253 = 16953;
+        // weight = 41712+16953 = 58665; vsize = ceil(58665/4) = 14667 (58665/4 = 14666.25).
+        assert_eq!(sweep_tx_vsize(253, 1).unwrap(), 14667);
+    }
+
+    /// The fee rounds UP. A truncating fee is a fee that can fall below the relay minimum, which is
+    /// the same "looks fine, never confirms" failure the dust floor closes.
+    #[test]
+    fn the_sweep_fee_rounds_up_at_the_caller_supplied_rate() {
+        // 112 vB * 1.5 = 168 exactly
+        assert_eq!(sweep_fee_sats(1, 1, 1.5).unwrap(), 168);
+        // 3519 vB * 1.5 = 5278.5 -> 5279
+        assert_eq!(sweep_fee_sats(60, 1, 1.5).unwrap(), 5_279);
+        // 3519 vB * 20 = 70_380 exactly
+        assert_eq!(sweep_fee_sats(60, 1, 20.0).unwrap(), 70_380);
+    }
+
+    /// **THE MARGINAL-VALUE ARITHMETIC — what this feature is FOR.** Adding one more leaf to a
+    /// batch costs only that leaf's own bytes: 41 base bytes (weight 164) + 67 witness bytes =
+    /// 231 weight = 57.75 vB. So the smallest leaf worth including at N=60 is one worth more than
+    /// `57.75 * rate` sats — a number that does NOT depend on N (the prefix and the single output
+    /// are paid once for the whole batch).
+    ///
+    /// Pinned at the three rates the design was argued at. Compare with the tail-walk it replaces:
+    /// a leaf that exits on its own pays a whole ~250-vB tail plus 2160 blocks of CSV.
+    #[test]
+    fn the_marginal_cost_of_one_more_leaf_is_57_and_three_quarter_vbytes() {
+        let marginal = |n: usize| sweep_tx_vsize(n + 1, 1).unwrap() - sweep_tx_vsize(n, 1).unwrap();
+        // **THE EXACT FIGURE, WITH THE ROUNDING CANCELLED.** 57.75 vB is not an integer, so no
+        // single step can show it: `vsize` is a `ceil` of the whole transaction, and `vsize(60)`
+        // itself rounds up by half a vByte. FOUR steps are 4 * 57.75 = 231 vB exactly, and at a
+        // multiple of four the ceil contributes nothing either side.
+        assert_eq!(
+            sweep_tx_vsize(64, 1).unwrap() - sweep_tx_vsize(60, 1).unwrap(),
+            231,
+            "four more leaves must cost exactly 4 x 57.75 vB"
+        );
+        // The two-step and one-step figures, which the ceil DOES shift, kept as regression pins.
+        assert_eq!(sweep_tx_vsize(62, 1).unwrap() - sweep_tx_vsize(60, 1).unwrap(), 115);
+        assert!(marginal(60) == 57 || marginal(60) == 58);
+
+        // What two more leaves cost at 2 / 20 / 50 sat/vB. (115 vB, not 115.5, for the ceil reason
+        // above — the exact per-leaf floor is `57.75 * rate` sats.)
+        for (rate, floor) in [(2.0_f64, 115_u64), (20.0, 1_150), (50.0, 2_875)] {
+            let with = sweep_fee_sats(61, 1, rate).unwrap();
+            let without = sweep_fee_sats(60, 1, rate).unwrap();
+            let two_more = sweep_fee_sats(62, 1, rate).unwrap();
+            assert_eq!(
+                two_more - without,
+                2 * floor,
+                "two more leaves at {rate} sat/vB must cost exactly 2 x {floor} sats"
+            );
+            assert!(
+                with > without,
+                "one more leaf must never be free at {rate} sat/vB"
+            );
+        }
+    }
+
+    /// A batch is worth doing only if the swept total clears the fee AND leaves a relayable output.
+    /// This is the arithmetic the economic refusal is built on; `combine_is_economic` states it in
+    /// one place so the driver and any quote agree.
+    #[test]
+    fn a_batch_that_cannot_clear_its_fee_plus_dust_is_not_economic() {
+        let fee_60 = sweep_fee_sats(60, 1, 20.0).unwrap();
+        assert_eq!(fee_60, 70_380);
+        assert!(!super::combine_is_economic(fee_60 + DUST_LIMIT - 1, 60, 20.0).unwrap());
+        assert!(super::combine_is_economic(fee_60 + DUST_LIMIT, 60, 20.0).unwrap());
+    }
+
+    #[test]
+    fn a_zero_input_or_zero_output_sweep_has_no_size_to_report() {
+        assert!(matches!(sweep_tx_vsize(0, 1), Err(MercuryError::EmptyInput)));
+        assert!(matches!(sweep_tx_vsize(1, 0), Err(MercuryError::EmptyInput)));
+    }
+
+    /// A NaN / negative / absurd fee rate must be refused, not silently turned into a zero fee by
+    /// `as u64`. `(f64::NAN).ceil() as u64` is 0 in Rust — a fee of zero, on the path that decides
+    /// whether a co-signed sweep can be relayed at all.
+    #[test]
+    fn a_nonsensical_fee_rate_is_refused_rather_than_saturating_to_zero() {
+        for bad in [f64::NAN, -1.0, f64::INFINITY, 0.0] {
+            assert!(
+                matches!(sweep_fee_sats(2, 1, bad), Err(MercuryError::FeeTooLow)),
+                "fee rate {bad} must be refused"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod combine_dust_tests {
+    use super::combine_test_support::{agg_address_regtest, leaf_coin};
+    use super::get_unsigned_combine_psbt;
+    use crate::error::MercuryError;
+
+    const TXID_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const TXID_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn build(outputs: Vec<(String, u64)>, coins: &[crate::wallet::Coin]) -> Result<String, MercuryError> {
+        get_unsigned_combine_psbt(coins, 100, 100, 10, 0, outputs, "regtest".to_string(), false)
+    }
+
+    /// **THE DEFECT.** `get_unsigned_split_psbt` refuses any output below the 330-sat P2TR dust
+    /// floor (`lib/src/transaction.rs:358-366`) because a sub-dust output is non-standard, so the
+    /// co-signed tx can never be relayed and whatever funded it is stranded. Its multi-input
+    /// sibling `get_unsigned_combine_psbt` had NO such floor: it checked only
+    /// `sum(outputs) < sum(inputs)`. A 300-sat output passes that check and produces a transaction
+    /// the network will not carry — after the SE has co-signed every input.
+    #[test]
+    fn a_combine_output_below_the_dust_floor_is_refused() {
+        let coins = [leaf_coin(TXID_A, 0, 5_000), leaf_coin(TXID_B, 1, 5_000)];
+        let r = build(vec![(agg_address_regtest(), 300)], &coins);
+        assert!(
+            matches!(r, Err(MercuryError::FeeTooLow)),
+            "a 300-sat combine output is below the 330-sat P2TR dust floor and must be refused \
+             BEFORE the SE co-signs N inputs, got {r:?}"
+        );
+    }
+
+    /// The floor is per-output, not on the sum: two 200-sat outputs total 400 (above 330) yet each
+    /// one is individually unrelayable. `get_unsigned_split_psbt` checks `.any(|v| v < DUST_LIMIT)`
+    /// for exactly this reason.
+    #[test]
+    fn one_sub_dust_output_among_several_is_refused() {
+        let coins = [leaf_coin(TXID_A, 0, 5_000), leaf_coin(TXID_B, 1, 5_000)];
+        let r = build(
+            vec![(agg_address_regtest(), 200), (agg_address_regtest(), 200)],
+            &coins,
+        );
+        assert!(
+            matches!(r, Err(MercuryError::FeeTooLow)),
+            "each combine output must clear the dust floor on its own, got {r:?}"
+        );
+    }
+
+    /// Exactly at the floor is ACCEPTED — the refusal must not be off by one and quietly reject
+    /// legitimate 330-sat outputs.
+    #[test]
+    fn a_combine_output_exactly_at_the_dust_floor_is_accepted() {
+        let coins = [leaf_coin(TXID_A, 0, 5_000), leaf_coin(TXID_B, 1, 5_000)];
+        let r = build(vec![(agg_address_regtest(), 330)], &coins);
+        assert!(r.is_ok(), "330 sats is the floor itself and must build, got {r:?}");
     }
 }
