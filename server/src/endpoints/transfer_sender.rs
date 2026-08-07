@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use mercurylib::transfer::cancel::{decide_transfer_cancel, CancelDecision, RecipientConsent, TransferCancelRequestPayload, TransferCancelResponsePayload, TransferCancelState, CANCEL_RECIPIENT_ENDPOINT, CANCEL_SENDER_ENDPOINT};
 use mercurylib::transfer::sender::{TransferSenderRequestPayload, TransferSenderResponsePayload, TransferUpdateMsgRequestPayload};
 use rocket::{State, serde::json::Json, response::status, http::Status};
 use secp256k1_zkp::{PublicKey, Scalar, SecretKey};
@@ -162,6 +163,30 @@ pub async fn transfer_sender(statechain_entity: &State<StateChainEntity>, transf
         }
     }
 
+    // [CANCELLED-KEY REUSE GUARD — migration 0010] Refuse to re-address this coin to a recipient key
+    // that already had a transfer of it CANCELLED. Transfer addresses are single-use by construction
+    // (the client mints a fresh coin, hence a fresh auth key, per `new_transfer_address`), so this
+    // costs an honest sender nothing. What it removes: conveyed material is blinded against the x1
+    // of the transfer it was built for, and a reopened transfer to the same key carries a FRESH x1.
+    // A recipient still holding the old message that claimed against the new row would drive the
+    // enclave to rotate its share by the wrong tweak — irreversible, and the coin is bricked for
+    // everyone. Fail CLOSED on a DB error.
+    match crate::database::transfer_cancel::recipient_key_was_cancelled(&statechain_entity.pool, &statechain_id, &new_user_auth_key).await {
+        Ok(true) => {
+            return status::Custom(
+                Status::Conflict,
+                Json(json!({ "message": "a transfer of this coin to that recipient key was cancelled; ask the recipient for a fresh transfer address" })),
+            );
+        }
+        Ok(false) => {}
+        Err(_) => {
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "transfer-state check unavailable; refusing to open a transfer (fail-closed)" })),
+            );
+        }
+    }
+
     let secret_x1 = SecretKey::new(&mut rand::thread_rng());
 
     let s_x1 = Scalar::from(secret_x1);
@@ -205,4 +230,201 @@ pub async fn transfer_update_msg(statechain_entity: &State<StateChainEntity>, tr
     });
 
     return status::Custom(Status::Ok, Json(response_body));
+}
+
+/// Map a cancellation decision to its HTTP status.
+///
+/// `AlreadyCancelled` is a 200, not an error: cancellation is irreversible, so a client that retries
+/// after a dropped response must not be told something different the second time.
+fn cancel_status(decision: CancelDecision) -> Status {
+    match decision {
+        CancelDecision::Allow | CancelDecision::AlreadyCancelled => Status::Ok,
+        CancelDecision::NoSuchTransfer => Status::NotFound,
+        CancelDecision::AlreadyClaimed => Status::Gone,
+        CancelDecision::Batched | CancelDecision::ClaimInFlight | CancelDecision::RecipientConsentRequired => Status::Conflict,
+        CancelDecision::RecipientSignatureInvalid => Status::Forbidden,
+    }
+}
+
+fn cancel_response(decision: CancelDecision, recipient_auth_pub_key: Option<String>) -> status::Custom<Json<Value>> {
+    let body = TransferCancelResponsePayload {
+        code: decision.code().to_string(),
+        message: decision.message().to_string(),
+        recipient_auth_pub_key,
+    };
+    status::Custom(cancel_status(decision), Json(json!(body)))
+}
+
+/// `POST /transfer/cancel` — withdraw an opened transfer that nobody has claimed, so the coin
+/// becomes spendable again.
+///
+/// # What this is releasing
+///
+/// The pending-transfer lock (`has_open_transfer`) is the only thing that stops a still-owner sender
+/// from co-signing a rival state while a conveyed recipient holds claimable material. Mechanically
+/// this endpoint is "expire now" — but expiry today carries NO authorization at all (it is pure
+/// time), and that is exactly why it is safe: an hour of not-being-claimed is evidence nobody was
+/// paid. Cancellation replaces that hour with an authorization, and the authorization has to be at
+/// least as strong.
+///
+/// It is: the rule in `mercurylib::transfer::cancel` requires the RECORDED recipient's co-signature
+/// the moment the mailbox message has been posted. The sender alone can only withdraw a transfer
+/// whose message never left the coordinator. `RecipientConsentRequired` is the named refusal for
+/// everything else, and this endpoint has no override for it — not a force flag, not an operator
+/// path. A sender whose recipient is conveyed and offline still waits out the hour, and must.
+///
+/// # Authorization
+///
+/// Both legs are single-use `"<nonce>:<sig>"` tokens over `sha256(nonce|endpoint)` with distinct
+/// endpoint strings, never the static replayable `sha256(statechain_id)` signature. Cancellation is
+/// irreversible, so it joins `withdraw/complete` on the nonce-protected list. See
+/// `validate_signature_nonce_given_public_key` for why the recipient leg in particular must not be
+/// static.
+///
+/// # The enclave
+///
+/// Is not involved. A cancellation is coordinator bookkeeping: no amount, no colour, no leg identity
+/// is revealed to the SE, and no SE state changes. The one place the enclave DOES matter is the
+/// claim latch — once `/transfer/receiver` has latched, its keyupdate may already have rotated the
+/// enclave's share, and no coordinator flag can undo that. So a latched claim beats a cancellation
+/// (`ClaimInFlight`), never the other way round.
+#[post("/transfer/cancel", format = "json", data = "<transfer_cancel_request_payload>")]
+pub async fn transfer_cancel(statechain_entity: &State<StateChainEntity>, transfer_cancel_request_payload: Json<TransferCancelRequestPayload>) -> status::Custom<Json<Value>> {
+
+    let statechain_id = transfer_cancel_request_payload.0.statechain_id.clone();
+
+    // Sender auth FIRST, before any row lookup, so an unauthenticated caller cannot use this
+    // endpoint as an oracle for whether a coin has a pending transfer (or exists at all): every
+    // unauthenticated request gets the same answer regardless of state.
+    if !crate::endpoints::utils::validate_signature_nonce(
+        &statechain_entity.pool,
+        &transfer_cancel_request_payload.0.auth_sig,
+        &statechain_id,
+        CANCEL_SENDER_ENDPOINT,
+    ).await {
+        return status::Custom(
+            Status::Forbidden,
+            Json(json!({ "message": "Signature does not match authentication key." })),
+        );
+    }
+
+    let row = match crate::database::transfer_cancel::get_transfer_for_cancel(&statechain_entity.pool, &statechain_id).await {
+        Ok(r) => r,
+        // Fail CLOSED. Reporting a DB fault as "no such transfer" would tell a sender its coin is
+        // free while the lock is in fact still held.
+        Err(_) => {
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "transfer-state lookup unavailable; refusing to cancel (fail-closed)" })),
+            );
+        }
+    };
+
+    let row = match row {
+        Some(r) => r,
+        None => return cancel_response(CancelDecision::NoSuchTransfer, None),
+    };
+
+    // The recipient leg. It counts as consent ONLY if it verifies under the key the coordinator
+    // recorded for this transfer — a signature under any other key, including one the sender picked,
+    // is `Invalid`. `recipient_auth_pub_key` must therefore MATCH the record; it is an assertion the
+    // caller makes and the server checks, never a substitute for the record.
+    let recipient_consent = match (
+        &transfer_cancel_request_payload.0.recipient_auth_sig,
+        &transfer_cancel_request_payload.0.recipient_auth_pub_key,
+    ) {
+        (None, _) => RecipientConsent::Absent,
+        (Some(sig), claimed_key) => {
+            let key_matches = match claimed_key {
+                Some(k) => PublicKey::from_str(k).map(|pk| pk == row.recipient_auth_pub_key).unwrap_or(false),
+                // A signature with no key named is still checked against the record — naming the key
+                // is a convenience, not the authorization.
+                None => true,
+            };
+            if !key_matches {
+                RecipientConsent::Invalid
+            } else if crate::endpoints::utils::validate_signature_nonce_given_public_key(
+                &statechain_entity.pool,
+                sig,
+                &statechain_id,
+                CANCEL_RECIPIENT_ENDPOINT,
+                &row.recipient_auth_pub_key,
+            ).await {
+                RecipientConsent::Valid
+            } else {
+                RecipientConsent::Invalid
+            }
+        }
+    };
+
+    let state = TransferCancelState {
+        row_exists: true,
+        key_updated: row.key_updated,
+        already_cancelled: row.cancelled,
+        is_batched: row.batched,
+        message_posted: row.message_posted,
+        claim_in_flight: row.claim_in_flight,
+        recipient_consent,
+    };
+
+    let decision = decide_transfer_cancel(&state);
+
+    if !decision.releases_lock() {
+        // Tell an AUTHENTICATED sender which key must co-sign — it cannot act on the refusal
+        // otherwise. Only on this decision, and only after the sender's own signature verified: the
+        // coin -> recipient-key link is not published anywhere unauthenticated, because it would let
+        // an observer correlate a coin with its next owner's mailbox.
+        let key = if decision == CancelDecision::RecipientConsentRequired {
+            Some(row.recipient_auth_pub_key.to_string())
+        } else {
+            None
+        };
+        return cancel_response(decision, key);
+    }
+
+    match crate::database::transfer_cancel::apply_cancel(
+        &statechain_entity.pool,
+        &statechain_id,
+        &row.recipient_auth_pub_key,
+        row.message_posted,
+        recipient_consent == RecipientConsent::Valid,
+    ).await {
+        Ok(true) => cancel_response(CancelDecision::Allow, None),
+        // The guarded UPDATE affected no row: a claim or another cancel landed between our read and
+        // our write. Re-read and report what actually happened rather than claiming a success that
+        // did not occur.
+        Ok(false) => {
+            match crate::database::transfer_cancel::get_transfer_for_cancel(&statechain_entity.pool, &statechain_id).await {
+                Ok(Some(fresh)) => {
+                    let fresh_state = TransferCancelState {
+                        row_exists: true,
+                        key_updated: fresh.key_updated,
+                        already_cancelled: fresh.cancelled,
+                        is_batched: fresh.batched,
+                        message_posted: fresh.message_posted,
+                        claim_in_flight: fresh.claim_in_flight,
+                        // The consent nonce is spent; do not re-credit it on the retry path.
+                        recipient_consent: RecipientConsent::Absent,
+                    };
+                    let fresh_decision = decide_transfer_cancel(&fresh_state);
+                    // If the fresh state would still allow, the race resolved into a state we can no
+                    // longer distinguish safely — report the conservative refusal.
+                    if fresh_decision.releases_lock() {
+                        cancel_response(CancelDecision::ClaimInFlight, None)
+                    } else {
+                        cancel_response(fresh_decision, None)
+                    }
+                }
+                Ok(None) => cancel_response(CancelDecision::NoSuchTransfer, None),
+                Err(_) => status::Custom(
+                    Status::ServiceUnavailable,
+                    Json(json!({ "message": "transfer-state lookup unavailable; refusing to cancel (fail-closed)" })),
+                ),
+            }
+        }
+        Err(_) => status::Custom(
+            Status::ServiceUnavailable,
+            Json(json!({ "message": "could not record the cancellation; the transfer is unchanged" })),
+        ),
+    }
 }

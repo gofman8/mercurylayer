@@ -5,11 +5,16 @@ use sqlx::Row;
 
 pub async fn exists_msg_for_same_statechain_id_and_new_user_auth_key(pool: &sqlx::PgPool, new_user_auth_key: &PublicKey, statechain_id: &str, batch_id: &Option<String>) -> bool {
 
+    // `cancelled_at IS NULL`: a CANCELLED transfer must not keep reporting "message already exists"
+    // and block the sender from opening a fresh one. Reusing the same recipient key after a
+    // cancellation is refused separately and by name (transfer_cancel::recipient_key_was_cancelled),
+    // so relaxing this check does not admit a stale-x1 reopen.
     let query = "\
         SELECT COUNT(*) \
         FROM statechain_transfer \
         WHERE new_user_auth_public_key = $1 \
-        AND statechain_id = $2 AND batch_id = $3".to_string();
+        AND statechain_id = $2 AND batch_id = $3 \
+        AND cancelled_at IS NULL".to_string();
 
     let serialized_new_user_auth_key = new_user_auth_key.serialize();
 
@@ -57,6 +62,13 @@ pub async fn get_batch_time_by_batch_id(pool: &sqlx::PgPool, batch_id: &str) -> 
 /// cannot co-sign a lower-CSV rival that would out-race the receiver's conveyed state. Expiry only affects
 /// the never-claimed case (no victim: an unclaimed payment was never accepted). Returns Result so the
 /// sign gate can FAIL CLOSED on a DB error, exactly like the single-use/budget/epoch gates.
+///
+/// A CANCELLED transfer (`cancelled_at IS NOT NULL`, migration 0010) is not open: cancellation is
+/// exactly "release this lock now instead of at the expiry". What makes that safe is the
+/// AUTHORIZATION the cancel endpoint demands before stamping `cancelled_at` — sender alone only
+/// while nothing has been conveyed, otherwise the recorded recipient must co-sign
+/// (`mercurylib::transfer::cancel`). By the time the flag is set, the only party who could be
+/// defrauded has signed the release.
 pub async fn has_open_transfer(pool: &sqlx::PgPool, statechain_id: &str, batch_timeout_secs: i64) -> Result<bool, sqlx::Error> {
     // A BATCH (Lightning-latch) transfer is only "open" until its batch expires: once `batch_time +
     // batch_timeout` passes, the receiver can NEVER complete it (no preimage arrived), so the sender's
@@ -67,6 +79,7 @@ pub async fn has_open_transfer(pool: &sqlx::PgPool, statechain_id: &str, batch_t
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM statechain_transfer \
          WHERE statechain_id = $1 AND key_updated = false \
+         AND cancelled_at IS NULL \
          AND updated_at > NOW() - INTERVAL '1 hour' \
          AND (batch_id IS NULL OR batch_time > NOW() - make_interval(secs => $2::int)))",
     )
@@ -93,6 +106,7 @@ pub async fn has_open_transfer_to_other_auth(
     let row = sqlx::query(
         "SELECT EXISTS(SELECT 1 FROM statechain_transfer \
          WHERE statechain_id = $1 AND key_updated = false \
+         AND cancelled_at IS NULL \
          AND updated_at > NOW() - INTERVAL '1 hour' \
          AND (batch_id IS NULL OR batch_time > NOW() - make_interval(secs => $3::int)) \
          AND new_user_auth_public_key <> $2)",

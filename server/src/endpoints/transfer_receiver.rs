@@ -222,6 +222,70 @@ pub async fn validate_batch(statechain_entity: &State<StateChainEntity>, statech
     BatchTransferReceiveValidationResult::Success
 }
 
+/// If a transfer of `statechain_id` to the key that signed `t2` was CANCELLED, build the typed 410.
+///
+/// Returns `None` when no cancellation record matches the caller — in which case the caller falls
+/// through to whatever generic answer it was already going to give.
+///
+/// The caller PROVES possession first: we verify their `auth_sig` over `t2` against each tombstoned
+/// recipient key and only answer for a key that verifies. So this discloses nothing to a third
+/// party who merely knows a statechain id — it tells a recipient, and only the recipient, that the
+/// payment they were expecting was withdrawn rather than that their mailbox is quiet. Without this,
+/// a cancelled payment is indistinguishable from nothing having arrived, and the client's
+/// `println!` + `continue` loop would swallow it.
+async fn cancelled_transfer_response(
+    statechain_entity: &State<StateChainEntity>,
+    statechain_id: &str,
+    t2: &str,
+    auth_sig: &str,
+) -> Option<status::Custom<Json<Value>>> {
+
+    // AUDITED-SWALLOW: a malformed `auth_sig` is not a fault, it is a caller that has not PROVEN
+    // possession of the recipient key — so it gets exactly the generic not-found any stranger gets.
+    // Direction: strictly LESS disclosure, never less protection. Spelled as a match, not `.ok()?`,
+    // so the direction is visible at the site.
+    let signed_message = match Signature::from_str(auth_sig) {
+        Ok(sig) => sig,
+        Err(_) => return None,
+    };
+    let msg = Message::from_hashed_data::<sha256::Hash>(t2.as_bytes());
+    let secp = Secp256k1::new();
+
+    // A DB FAULT IS NOT "NO CANCELLATION RECORD". This used to be `.ok()?`, which handed the
+    // recipient a bare 404 whenever the tombstone table could not be read — i.e. the cancelled
+    // payment looked exactly like an idle mailbox, the one thing this function exists to prevent.
+    // Answer 503: "I could not tell" is distinguishable from "there is nothing here", and the
+    // client retries instead of concluding the payment simply never arrived.
+    let keys = match crate::database::transfer_cancel::cancelled_recipient_keys(
+        &statechain_entity.pool,
+        statechain_id,
+    )
+    .await
+    {
+        Ok(keys) => keys,
+        Err(_) => {
+            return Some(status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({
+                    "message": "could not determine whether this transfer was cancelled; retry"
+                })),
+            ));
+        }
+    };
+
+    for key in keys {
+        if secp.verify_schnorr(&signed_message, &msg, &key.x_only_public_key().0).is_ok() {
+            let response_body = json!(TransferReceiverErrorResponsePayload {
+                code: TransferReceiverError::TransferCancelledError,
+                message: "this transfer was cancelled by the sender with the recipient's consent; the payment did not complete".to_string(),
+            });
+            return Some(status::Custom(Status::Gone, Json(response_body)));
+        }
+    }
+
+    None
+}
+
 #[post("/transfer/receiver", format = "json", data = "<transfer_receiver_request_payload>")]
 pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, transfer_receiver_request_payload: Json<TransferReceiverRequestPayload>) -> status::Custom<Json<Value>> {
 
@@ -255,10 +319,23 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
     let auth_pubkey_x1 = crate::database::transfer_receiver::get_auth_pubkey_and_x1(&statechain_entity.pool, &transfer_receiver_request_payload.statechain_id).await;
 
     if auth_pubkey_x1.is_none() {
+        // Before the generic not-found: was a transfer of this coin to THIS caller CANCELLED?
+        // A cancelled payment that looks like an idle mailbox is the silent-degradation shape a
+        // recipient must never be shown, so answer it by name — but only to a caller that PROVES it
+        // holds the recorded recipient key, so this is never an existence oracle for a third party.
+        if let Some(response) = cancelled_transfer_response(
+            &statechain_entity,
+            &transfer_receiver_request_payload.statechain_id,
+            &transfer_receiver_request_payload.t2,
+            &transfer_receiver_request_payload.auth_sig,
+        ).await {
+            return response;
+        }
+
         let response_body = json!({
             "message": "No transfer messages found for this statechain_id"
         });
-    
+
         return status::Custom(Status::NotFound, Json(response_body));
     }
 
@@ -283,10 +360,23 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
     
     if !secp.verify_schnorr(&signed_message, &msg, &auth_pubkey).is_ok() {
 
+        // The signature does not match the CURRENT transfer's recipient. That is also what a
+        // recipient sees after their transfer was cancelled and the coin re-addressed to someone
+        // else — `insert_new_transfer` DELETEs the old row, so the tombstone is the only remaining
+        // record. Check it, and answer by name to whoever can prove they held the cancelled key.
+        if let Some(response) = cancelled_transfer_response(
+            &statechain_entity,
+            &statechain_id,
+            &t2,
+            &auth_sign,
+        ).await {
+            return response;
+        }
+
         let response_body = json!({
             "message": "Signature does not match authentication key."
         });
-    
+
         return status::Custom(Status::InternalServerError, Json(response_body));
 
     }
@@ -312,9 +402,38 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
         return status::Custom(Status::Ok, Json(response_body));
     }
 
+    // [CLAIM LATCH — migration 0010] From here on the enclave may rotate its key share, and an
+    // enclave keyupdate is IRREVERSIBLE: no coordinator flag can undo it, and refusing the claim
+    // afterwards would leave the coin's aggregate unreachable by anyone. So take the latch BEFORE
+    // the enclave call. It is one atomic UPDATE whose WHERE clause is exactly complementary to the
+    // cancellation's, so under READ COMMITTED exactly one of {this claim, a concurrent cancel} can
+    // win — closing the race where a recipient co-signs a cancellation and then pipelines a claim,
+    // which would otherwise let a LATER recipient's row be marked claimed while the coin went to the
+    // earlier one.
+    match crate::database::transfer_cancel::latch_claim(&statechain_entity.pool, &statechain_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // Either the transfer was cancelled under us, or another claim is already in flight.
+            // Both mean: do not touch the enclave.
+            if let Some(response) = cancelled_transfer_response(&statechain_entity, &statechain_id, &t2, &auth_sign).await {
+                return response;
+            }
+            return status::Custom(
+                Status::Conflict,
+                Json(json!({ "message": "a claim for this transfer is already in progress; retry shortly" })),
+            );
+        }
+        Err(_) => {
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({ "message": "transfer-state check unavailable; refusing to complete the transfer (fail-closed)" })),
+            );
+        }
+    }
+
     let x1_hex = hex::encode(x1);
 
-    let key_update_response_payload = mercurylib::transfer::receiver::KeyUpdateResponsePayload { 
+    let key_update_response_payload = mercurylib::transfer::receiver::KeyUpdateResponsePayload {
         statechain_id: statechain_id.clone(),
         t2,
         x1: x1_hex,
@@ -327,10 +446,13 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
     let enclave_index = match enclave_index {
         Some(index) => index,
         None => {
+            // Never reached the enclave: release the latch so a retry is not made to wait out
+            // CLAIM_LATCH_SECS. Releasing is always safe — the latch only ever DENIES transitions.
+            crate::database::transfer_cancel::release_claim_latch(&statechain_entity.pool, &statechain_id).await;
             let response_body = json!({
                 "message": format!("Enclave index for statechain {} ID not found.", statechain_id)
             });
-        
+
             return status::Custom(Status::InternalServerError, Json(response_body));
         }
     };
@@ -349,11 +471,17 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
             text
         },
         Err(err) => {
+            // Deliberately do NOT release the claim latch here. A transport error means we do not
+            // know whether the enclave applied the keyupdate — and if it did, its share has already
+            // rotated. Holding the latch for CLAIM_LATCH_SECS keeps a cancellation from releasing
+            // the coin under a rotation that may have happened, and equally keeps an immediate claim
+            // retry from asking the enclave to rotate a second time. The ambiguous case must wait;
+            // it must not be resolved optimistically in either direction.
             let response_body = json!({
                 "error": "Internal Server Error",
                 "message": err.to_string()
             });
-        
+
             return status::Custom(Status::InternalServerError, Json(response_body));
         },
     };

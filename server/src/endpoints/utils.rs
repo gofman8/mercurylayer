@@ -108,6 +108,44 @@ pub async fn validate_signature_nonce(
     crate::database::auth_nonce::consume_auth_nonce(pool, nonce, statechain_id).await
 }
 
+/// Single-use, endpoint-bound validation against a GIVEN public key rather than the coin's
+/// registered owner key.
+///
+/// Needed by transfer cancellation, where the co-signer is the transfer's RECIPIENT — a key that is
+/// deliberately not yet registered on the coin (registering it is what claiming does). The caller
+/// must pass the key the coordinator RECORDED as `new_user_auth_public_key`; passing a
+/// caller-supplied key would make the check vacuous.
+///
+/// Why not the static `sha256(statechain_id)` signature that `transfer/unlock` accepts: that value
+/// never changes, so one recipient signature would be a REUSABLE cancel token for that coin and key.
+/// A sender could bank a cooperative cancellation's signature, later open a second transfer to the
+/// same recipient key, post the message so the recipient believes they were paid, replay the
+/// signature to cancel, and convey to a third party — two victims, one coin. A single-use nonce
+/// makes each consent authorize exactly one cancellation.
+pub async fn validate_signature_nonce_given_public_key(
+    pool: &sqlx::PgPool,
+    auth_field: &str,
+    statechain_id: &str,
+    endpoint: &str,
+    auth_key: &PublicKey,
+) -> bool {
+    let (nonce, signed_message_hex) = match auth_field.split_once(':') {
+        Some((n, s)) if !n.is_empty() && !s.is_empty() => (n, s),
+        _ => return false,
+    };
+    let signed_message = match Signature::from_str(signed_message_hex) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let msg = Message::from_hashed_data::<sha256::Hash>(format!("{nonce}|{endpoint}").as_bytes());
+    let secp = Secp256k1::new();
+    if !secp.verify_schnorr(&signed_message, &msg, &auth_key.x_only_public_key().0).is_ok() {
+        return false;
+    }
+    // Consume only after the signature verifies, so a bogus signature cannot burn a real nonce.
+    crate::database::auth_nonce::consume_auth_nonce(pool, nonce, statechain_id).await
+}
+
 /// Issue a fresh single-use owner-auth challenge for a coin (audit [15]).
 #[get("/auth/challenge/<statechain_id>")]
 pub async fn auth_challenge(statechain_entity: &State<StateChainEntity>, statechain_id: &str) -> status::Custom<Json<Value>> {

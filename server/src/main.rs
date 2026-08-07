@@ -158,6 +158,7 @@ async fn main() {
             endpoints::lightning_latch::get_spend_budget,
             endpoints::transfer_sender::transfer_sender,
             endpoints::transfer_sender::transfer_update_msg,
+            endpoints::transfer_sender::transfer_cancel,
             endpoints::transfer_receiver::get_msg_addr,
             endpoints::transfer_receiver::statechain_info,
             endpoints::transfer_receiver::transfer_unlock,

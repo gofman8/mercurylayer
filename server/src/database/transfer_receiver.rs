@@ -92,37 +92,51 @@ pub async fn get_aggregate_pubkey(pool: &sqlx::PgPool, statechain_id: &str) -> O
     bytes.map(hex::encode)
 }
 
+/// The x1 public point for an OPEN transfer of this coin, or None.
+///
+/// `cancelled_at IS NULL`: a cancelled transfer has no x1 to advertise — `apply_cancel` NULLs the
+/// column outright, so a stale `x1_pub` in `/info/statechain` would be both wrong and a hint that a
+/// dead transfer is still live. The read is also NULL- and error-tolerant now that a NULL `x1` is
+/// reachable: the old `row.get::<Vec<u8>>` and both `.unwrap()`s would have panicked the request
+/// worker, which is a DoS on an endpoint every receiver calls to verify a coin.
 pub async fn get_x1pub(pool: &sqlx::PgPool, statechain_id: &str) -> Option<PublicKey> {
 
     let query = "SELECT x1 \
         FROM statechain_transfer \
-        WHERE statechain_id = $1";
+        WHERE statechain_id = $1 \
+        AND cancelled_at IS NULL";
 
-    let row = sqlx::query(query)
+    let row = match sqlx::query(query)
         .bind(statechain_id)
         .fetch_optional(pool)
         .await
-        .unwrap();
+    {
+        Ok(Some(r)) => r,
+        _ => return None,
+    };
 
-    if row.is_none() {
-        return None;
-    }
-
-    let row = row.unwrap();
-
-    let x1_secret_bytes = row.get::<Vec<u8>, _>("x1");
-    let secret_x1 = SecretKey::from_slice(&x1_secret_bytes).unwrap();
+    // AUDITED-SWALLOW: an `x1` column that is NULL or does not parse is one this endpoint cannot
+    // advertise — publishing a garbage `x1_pub` in `/info/statechain` would make the receiver derive
+    // a t2 nobody can verify, which is strictly worse than not advertising it. Direction: withhold
+    // an unusable value, never grant one. The transfer row itself is untouched and the coin is not
+    // at risk; `apply_cancel` NULLing `x1` is exactly why the NULL case became reachable at all.
+    let x1_secret_bytes: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>("x1").ok().flatten()?;
+    let secret_x1 = SecretKey::from_slice(&x1_secret_bytes).ok()?;
 
     Some(secret_x1.public_key(&Secp256k1::new()))
 }
 
 pub async fn get_statechain_transfer_messages(pool: &sqlx::PgPool, new_user_auth_key: &PublicKey) -> Vec::<String> {
 
+    // `cancelled_at IS NULL` as well as the NOT NULL message check: `apply_cancel` clears the
+    // message, so this filter is belt-and-braces — a cancelled transfer must never keep serving
+    // claimable material from the mailbox, whichever of the two writes a future change forgets.
     let query = "\
         SELECT encrypted_transfer_msg \
         FROM statechain_transfer \
         WHERE new_user_auth_public_key = $1
         AND encrypted_transfer_msg IS NOT NULL \
+        AND cancelled_at IS NULL \
         ORDER BY updated_at ASC";
 
     let rows = sqlx::query(query)
@@ -143,10 +157,15 @@ pub async fn get_statechain_transfer_messages(pool: &sqlx::PgPool, new_user_auth
 
 pub async fn get_auth_pubkey_and_x1(pool: &sqlx::PgPool, statechain_id: &str) -> Option<(PublicKey, Vec<u8>)> {
 
+    // `cancelled_at IS NULL`: a cancelled transfer is not claimable. The endpoint's existing
+    // `is_none()` branch turns that into a 404 — and then consults the cancellation tombstone so a
+    // caller that PROVES it holds the recorded recipient key gets a typed "cancelled" answer
+    // instead of a bare not-found it cannot tell from an idle mailbox.
     let query = "\
         SELECT new_user_auth_public_key, x1 \
         FROM statechain_transfer \
-        WHERE statechain_id = $1";
+        WHERE statechain_id = $1 \
+        AND cancelled_at IS NULL";
 
     // fetch_optional, NOT fetch_one().unwrap(): fetch_one returns Err(RowNotFound) for an unknown
     // statechain_id, and this function runs BEFORE auth in POST /transfer/receiver, so the old
@@ -163,10 +182,18 @@ pub async fn get_auth_pubkey_and_x1(pool: &sqlx::PgPool, statechain_id: &str) ->
         _ => return None,
     };
 
-    let new_user_auth_public_key_bytes = row.get::<Vec<u8>, _>(0);
-    let new_user_auth_public_key = PublicKey::from_slice(&new_user_auth_public_key_bytes).unwrap();
+    // Both columns are nullable and both `.unwrap()`s were reachable panics (a NULL `x1` became
+    // reachable with migration 0010, which clears it on cancellation). A row we cannot read is a row
+    // we cannot authorize a claim against: report absent, do not kill the worker.
+    let new_user_auth_public_key_bytes: Vec<u8> =
+        row.try_get::<Option<Vec<u8>>, _>(0).ok().flatten()?;
+    // AUDITED-SWALLOW: the recorded recipient key is the ONLY thing a claim's signature is checked
+    // against; if it does not parse there is nothing to check under, so the choice is "refuse" or
+    // "accept unverified" — this refuses. Direction: strictly LESS privilege granted. The caller
+    // turns `None` into the generic 404; the transfer row, its message and the coin are untouched.
+    let new_user_auth_public_key = PublicKey::from_slice(&new_user_auth_public_key_bytes).ok()?;
 
-    let x1_bytes = row.get::<Vec<u8>, _>(1);
+    let x1_bytes: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(1).ok().flatten()?;
 
     Some((new_user_auth_public_key, x1_bytes))
 }
