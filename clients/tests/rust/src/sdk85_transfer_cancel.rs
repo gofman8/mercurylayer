@@ -579,14 +579,24 @@ pub async fn execute() -> Result<()> {
                 .ok_or_else(|| {
                     anyhow!("[4] refusing to preview a CLAIMED transfer must be TYPED; got: {e}")
                 })?;
-            if !matches!(
-                unavailable.reason,
-                mercury_utexo_sdk::ConsentBlocked::AlreadyClaimed
-                    | mercury_utexo_sdk::ConsentBlocked::NoPendingTransfer
-            ) {
+            // `AlreadyClaimed` ONLY. `NoPendingTransfer` used to be accepted alongside it on the
+            // reasoning that a claimed transfer might simply vanish from the mailbox — but it does
+            // not: `update_statechain` rotates the auth key and sets `key_updated = true` WITHOUT
+            // clearing `encrypted_transfer_msg`, and `get_statechain_transfer_messages` filters only
+            // on `encrypted_transfer_msg IS NOT NULL AND cancelled_at IS NULL`, with no
+            // `key_updated` term. So a claimed message stays in the recipient's mailbox and the
+            // preview MUST be able to classify it.
+            //
+            // Accepting the generic answer made this half of the step assert nothing about
+            // claimed-is-terminal: `NoPendingTransfer` is indistinguishable from the row having been
+            // swept for any other reason. If this now fails, that is a real finding — it means the
+            // preview cannot tell a claimed transfer from an absent one, and a recipient could be
+            // asked to consent to cancelling a payment it has already taken.
+            if unavailable.reason != mercury_utexo_sdk::ConsentBlocked::AlreadyClaimed {
                 return Err(anyhow!(
-                    "[4] a claimed transfer must refuse as AlreadyClaimed (or vanish from the \
-                     mailbox entirely); got {:?}",
+                    "[4] a CLAIMED transfer's message stays in the mailbox, so the preview must \
+                     classify it as AlreadyClaimed rather than falling back to a generic answer; \
+                     got {:?}",
                     unavailable.reason
                 ));
             }
@@ -614,18 +624,35 @@ pub async fn execute() -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("coin D carries no signed statechain id"))?;
     let batch_id = format!("sdk85-batch-{}", &coin_d[..8.min(coin_d.len())]);
+    let _ = &signed_statechain_id; // kept: proves alice can sign for D before the batched convey
 
-    mercuryrustlib::transfer_sender::get_new_x1(
+    // A FULL BATCHED CONVEYANCE, not a bare `get_new_x1`. This used to open the row and stop, so the
+    // mailbox message was NEVER posted — which meant bob had downloaded nothing, so
+    // `preview_cancel_consent` could only ever answer `NoPendingTransfer`, and the branch this step
+    // exists to assert ("even WITH a minted consent, a batched transfer refuses") was UNREACHABLE.
+    // The step passed while testing a strictly weaker claim than its own doc advertises.
+    //
+    // `execute` takes the batch_id, so the whole conveyance — open, pre-sign, POST the ciphertext —
+    // runs batched, and it still needs no lightning daemon: what `decide_transfer_cancel` reads is
+    // `batch_id IS NOT NULL`, and a batch with no `lightning_latch` row simply falls back to
+    // `batch_time + batch_timeout` on the receiver's side, which nothing here depends on.
+    //
+    // It also STRENGTHENS the first assertion below. Coin D used to be "opened, never posted", which
+    // is row 1 — the one case a sender MAY cancel alone — so the refusal only proved that row 4 beats
+    // row 1. Now D is "posted, unclaimed", which is row 2, and the refusal proves row 4 beats the
+    // consent rule as well. That is the ordering `decide_transfer_cancel` actually promises.
+    mercuryrustlib::transfer_sender::execute(
         &cc,
+        &bob_slot_d,
+        "sdk85_alice",
         &coin_d,
-        &signed_statechain_id,
-        &bob_auth_d.to_string(),
-        Some(batch_id),
+        None,
+        false,
+        Some(batch_id.clone()),
     )
     .await?;
     println!(
-        "SDK85 - [5] alice opened a BATCHED transfer of coin D={} ({DEPOSIT} sats) to bob under batch_id sdk85-batch-{}",
-        &coin_d[..8.min(coin_d.len())],
+        "SDK85 - [5] alice CONVEYED coin D={} ({DEPOSIT} sats) to bob under batch_id {batch_id} — message posted, unclaimed",
         &coin_d[..8.min(coin_d.len())]
     );
 
@@ -656,23 +683,16 @@ pub async fn execute() -> Result<()> {
             )?;
             println!("SDK85 - [5] DONE: even WITH a minted consent, the batched coin D refused cancellation");
         }
+        // NOW A HARD FAILURE. Coin D is conveyed and unclaimed, so bob HAS the material and a
+        // consent must be mintable — that is the precondition for the assertion above, and the only
+        // one that makes this step test what its doc claims. Accepting a refusal here is how the
+        // step silently degraded to a weaker property before.
         Err(e) => {
-            let unavailable = e
-                .downcast_ref::<mercury_utexo_sdk::ConsentUnavailable>()
-                .ok_or_else(|| {
-                    anyhow!("[5] refusing to mint an unconveyed consent must be TYPED; got: {e}")
-                })?;
-            if unavailable.reason != mercury_utexo_sdk::ConsentBlocked::NoPendingTransfer {
-                return Err(anyhow!(
-                    "[5] coin D was never conveyed, so the refusal must be NoPendingTransfer; got \
-                     {:?}",
-                    unavailable.reason
-                ));
-            }
-            println!(
-                "SDK85 - [5] DONE: bob cannot even MINT a consent for the never-conveyed coin D, typed {:?}",
-                unavailable.reason
-            );
+            return Err(anyhow!(
+                "[5] coin D is CONVEYED and unclaimed, so bob must be able to mint a consent for \
+                 it — a refusal here means the batched-with-consent path is unreachable again and \
+                 this step is no longer testing row 4 against the consent rule. Got: {e}"
+            ));
         }
     }
 
