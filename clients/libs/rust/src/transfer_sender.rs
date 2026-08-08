@@ -1332,7 +1332,55 @@ async fn execute_ex(
 
     // Open the transfer at the coordinator now, AFTER every sender pre-sign above (see the note by
     // `input_txid`). Returns x1 for the t1 blinding tweak.
-    let x1 = get_new_x1(&client_config, &statechain_id, &signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await?;
+    //
+    // A FAILURE HERE IS NOT A NO-OP, AND THAT IS WHY IT IS NOT A BARE `?`. Every sender pre-sign is
+    // already done: `S'` has been co-signed, the enclave's MONOTONIC `sig_count` has been raised,
+    // and the record of it is persisted in `conveyed_states` (see the note by that write). The
+    // coordinator refusing NOW — a cancelled recipient key, an open transfer, a batch clash, a dead
+    // socket — leaves that co-sign orphaned with NO transfer to cancel, so the cancellation path
+    // that would normally reconcile it can never be reached. The coin would be permanently
+    // unconveyable: every later `transfer` refuses on the outstanding conveyed state, and the only
+    // remedy left is an on-chain re-anchor.
+    //
+    // So reconcile it here, with the SAME primitive the cancellation uses — co-sign one replacement
+    // state strictly below the orphan and demote the orphan into `superseded_states`, where the next
+    // receiver's census counts it and the verifier proves it non-confirmable. Then report the
+    // ORIGINAL refusal, because that is what the caller asked about; the reconciliation is
+    // bookkeeping, and its own outcome is appended rather than substituted.
+    //
+    // Best-effort BY CONSTRUCTION, not by carelessness: the reclaim needs a fresh SE co-signature,
+    // and the very condition that refused the open (an open transfer of this coin) is one the SE
+    // also refuses to co-sign under. When that happens the coin stays wedged and the message says
+    // so, naming the retry — which is strictly better than today's silent wedge.
+    let x1 = match get_new_x1(&client_config, &statechain_id, &signed_statechain_id, &recipient_auth_pubkey.to_string(), batch_id).await {
+        Ok(x1) => x1,
+        Err(open_err) => {
+            let reconciled =
+                crate::tesr::reclaim_cancelled_conveyance(client_config, wallet_name, &coin).await;
+            return Err(match reconciled {
+                Ok(true) => anyhow!(
+                    "the coordinator refused to open the transfer of statechain id \
+                     {statechain_id} ({open_err}). The receiver-paying state co-signed for this \
+                     attempt has been folded into the coin's disclosed superseded states, so the \
+                     coin is transferable again — retry the transfer."
+                ),
+                Ok(false) => anyhow!(
+                    "the coordinator refused to open the transfer of statechain id \
+                     {statechain_id} ({open_err}). Nothing needed reconciling."
+                ),
+                Err(reclaim_err) => anyhow!(
+                    "the coordinator refused to open the transfer of statechain id \
+                     {statechain_id} ({open_err}), AND the receiver-paying state already co-signed \
+                     for this attempt could not be reconciled afterwards ({reclaim_err}). That \
+                     co-sign is orphaned: until it is folded into the bundle's superseded states \
+                     this coin cannot be transferred onward, because the next receiver would refuse \
+                     it on the signature census. It remains fully withdrawable and unilaterally \
+                     exitable. Settle whatever the coordinator is refusing on and retry the \
+                     transfer, or re-anchor the coin on-chain with refresh."
+                ),
+            });
+        }
+    };
 
     let transfer_update_msg_request_payload = create_transfer_update_msg_with_branch(&x1, recipient_address, &coin, &transfer_signature, &backup_transactions, &branch_txs, &terminal_parents, protocol_version, tesr_ladder)?;
 

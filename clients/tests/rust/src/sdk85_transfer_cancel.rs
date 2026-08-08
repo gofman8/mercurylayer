@@ -206,6 +206,11 @@ async fn convey(
     recipient_address: &str,
     statechain_id: &str,
 ) -> Result<()> {
+    // Progress logging, because this test had none and its failures arrive as bare `Error:` lines
+    // with no indication of WHICH of the eleven conveyances raised them. Every step below either
+    // conveys or refuses a conveyance, so labelling this one call is enough to localise any of them.
+    println!("SDK85 - convey: {wallet_name} -> {} (coin {statechain_id})",
+             &recipient_address[..recipient_address.len().min(24)]);
     mercuryrustlib::transfer_sender::execute(
         cc,
         recipient_address,
@@ -785,9 +790,26 @@ pub async fn execute() -> Result<()> {
 
     // [8e] AND AFTERWARDS the same key cannot be reused: a recipient key whose transfer was
     // cancelled is retired, so alice cannot rebuild the situation and ask for a fresh consent.
+    //
+    // PROBED WITH THE RAW `get_new_x1`, exactly as [8b] probes the re-address guard, and NOT with a
+    // full `convey`. The guard under test is the coordinator's `recipient_key_was_cancelled` — it
+    // lives in `POST /transfer/sender`, so the raw call reaches it directly. A full `convey` would
+    // reach it too, but only AFTER the client co-signs `S'`, which SPENDS A STATE RUNG: the regtest
+    // schedule gives a coin three (d0 24, delta 6, floor 6 => 24 -> 18 -> 12 -> 6) and coin E has
+    // already spent two here — the conveyance to bob, and the cancellation's reclaim in [8d]. The
+    // third would leave nothing for [8f]'s conveyance to carol, which is the step that proves
+    // exactly one payee. Burning a rung to reach a server-side refusal tests the same property and
+    // costs the budget the SCENARIO needs; this asserts the same guard at the layer it lives on.
     refused_with(
-        convey(&cc, "sdk85_alice", &bob_slot_e, &coin_e).await,
-        "[8e] re-conveying to a recipient key whose transfer was cancelled",
+        mercuryrustlib::transfer_sender::get_new_x1(
+            &cc,
+            &coin_e,
+            &signed_e,
+            &bob_auth_e.to_string(),
+            None,
+        )
+        .await,
+        "[8e] re-opening a transfer to a recipient key whose transfer was cancelled",
         "was cancelled",
     )?;
 
