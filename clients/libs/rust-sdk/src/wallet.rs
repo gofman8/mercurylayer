@@ -1902,7 +1902,30 @@ impl UtexoWallet {
             };
             // The head start: every relative timelock the walk must sit through, summed.
             let head_start: u32 = chain.iter().filter_map(|(_, csv)| *csv).map(u32::from).sum();
-            let deadline = match self.deposit_anchored_deadline_of_root_tx(root_hex).await {
+            // [audit-17] READ `L_k` OFF THE SIGNED BACKUPS, do not recompute `L_0` from the chain.
+            //
+            // This used to call `deposit_anchored_deadline_of_root_tx`, which finds the deposit's
+            // confirmation height and returns `h_deposit + initlock` — that is `L_0`, the k = 0 case
+            // and the LATEST the ladder can be. The real deadline is `L_k = L_0 − k·interval` for a
+            // parent transferred `k` times before the split, and nothing conveys `k`. So the number
+            // was too LATE by `k·interval`, i.e. fail-open: this coin believed it had more time than
+            // it had, and `AUDIT_17_K_MAX = 14` was a guess at `k` whose own comment called it the
+            // weakest term in the margin.
+            //
+            // `k` never needed conveying. Each backup's nLockTime IS its rung, and the whole chain
+            // is already conveyed, already signature-verified and already count-pinned by the
+            // exact-equality census (see `epoch_deadline_from_flat_backups`). The minimum over it is
+            // `L_k` exactly.
+            //
+            // It is also CHEAPER than what it replaces: two electrum round-trips and an
+            // `/info/config` per coin per pass are gone, and with them a whole class of watchtower
+            // blindness — a pass that could not reach the chain used to report every coin as
+            // undecidable, and now reads a field it already holds.
+            let backups = match &parsed {
+                Row::Child(cb) => &cb.parent_flat_backups,
+                Row::Tip(tip) => &tip.parent_flat_backups,
+            };
+            let deadline = match mercuryrustlib::tesr::epoch_deadline_from_flat_backups(backups) {
                 Ok(d) => d.saturating_sub(head_start),
                 Err(e) => {
                     blind.push(format!(

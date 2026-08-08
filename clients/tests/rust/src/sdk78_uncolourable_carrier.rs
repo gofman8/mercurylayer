@@ -233,6 +233,11 @@ pub async fn execute() -> Result<()> {
     bitcoin_core::sendtoaddress(400_000, &rgb_fund)?;
     mine_synced(&cc, &core, 3)?;
     tokio::time::sleep(Duration::from_secs(3)).await;
+    println!(
+        "SDK78 - (1) setup done: alice/bob/carol up with colored_ladder=ON, 400000 sat funded to \
+         alice's RGB address, floors measured child {child_floor} < legacy {LEGACY_PIECE} < root \
+         {root_floor} (today's piece {PIECE})"
+    );
 
     // ---- 1. THREE PRE-FLIP CARRIERS: 1_500 sats each, one asset. --------------------------------
     //
@@ -281,6 +286,10 @@ pub async fn execute() -> Result<()> {
     let _ = miner.join();
     mint_res?;
     mine_synced(&cc, &core, 2)?;
+    println!(
+        "SDK78 - (1) two on-chain mints of {MINT} each settled onto {LEGACY_PIECE}-sat carriers \
+         (background miner stopped); polling up to 90 claim passes for three confirmed carriers"
+    );
 
     let mut legacy_sids: Vec<String> = Vec::new();
     for _ in 0..90 {
@@ -301,6 +310,11 @@ pub async fn execute() -> Result<()> {
         token_balance(&alice, &asset_id).await?,
         SUPPLY + 2 * MINT,
         "all {} units must be settled across the three legacy carriers",
+        SUPPLY + 2 * MINT
+    );
+    println!(
+        "SDK78 - (1) three {LEGACY_PIECE}-sat carriers CONFIRMED {legacy_sids:?} holding all {} \
+         units of {asset_id}",
         SUPPLY + 2 * MINT
     );
 
@@ -349,6 +363,12 @@ pub async fn execute() -> Result<()> {
         out.coins[0].amount_sats, PIECE,
         "the piece the hatch pays out must carry the CURRENT piece size"
     );
+    println!(
+        "SDK78 - (b) migration hatch COMBINE returned: {PAY} of {asset_id} sent to bob over three \
+         {LEGACY_PIECE}-sat inputs, used_split={}, piece {piece_sid} at {} sat; polling up to 90 \
+         claim passes for bob to book it",
+        out.used_split, out.coins[0].amount_sats
+    );
 
     for _ in 0..90 {
         alice.claim().await?;
@@ -388,6 +408,10 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::load(&cc, "sdk78_alice", &change_sid).await?.is_none(),
         "the change carrier must have no ladder either"
     );
+    println!(
+        "SDK78 - (4) alice's combine CHANGE carrier {change_sid} holds {change_sats} sat — below \
+         the root floor {root_floor}, so it is in the same class, and it has no ladder row"
+    );
 
     // ---- 5. (d) EXITABLE: materialise, never sweep. ---------------------------------------------
     //
@@ -419,6 +443,12 @@ pub async fn execute() -> Result<()> {
         !sweep_all.iter().any(|s| s.statechain_id == change_sid),
         "an un-colourable carrier must stay OUT of the exit-everything default: materialising is an \
          on-chain broadcast and has to be asked for"
+    );
+    println!(
+        "SDK78 - (d) exit-everything default returned {} exits and EXCLUDED the change carrier \
+         {change_sid}; its plain backup {}... is un-broadcast going in",
+        sweep_all.len(),
+        &plain_backup_txid[..8]
     );
 
     // [D2] The re-derived assertion. The old one — `exits[0].complete` — asserted a field whose own
@@ -471,6 +501,11 @@ pub async fn execute() -> Result<()> {
         "THE PLAIN BACKUP WAS BROADCAST ({plain_backup_txid}) — that is an RGB-unaware spend of the \
          carrier's funding output and it DESTROYS the allocation. Materialisation must broadcast the \
          branch and nothing else."
+    );
+    println!(
+        "SDK78 - (d) materialise_carrier({change_sid}) BROADCAST the carrier's un-broadcast combine \
+         branch (branch_broadcast={branch_broadcast}); plain backup {}... still off chain",
+        &plain_backup_txid[..8]
     );
     mine_synced(&cc, &core, 3)?;
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -543,6 +578,11 @@ pub async fn execute() -> Result<()> {
     // `color_psbt` over the piece's own funding output answered `available (0)` on every pass. The
     // failure below therefore names the exact call whose absence caused it, so a regression is
     // diagnosable from the message alone.
+    println!(
+        "SDK78 - (c.1) bob's piece {piece_sid} plain backup {}... captured; polling up to 40 claim \
+         passes for a COLOURED ladder on it",
+        &piece_backup_txid[..8]
+    );
     let mut piece_ladder = None;
     let mut colour_error = String::new();
     for _ in 0..40 {
@@ -610,6 +650,10 @@ pub async fn execute() -> Result<()> {
                  whatever the balance says."
             )
         })?;
+    println!(
+        "SDK78 - (c.2) bob CONVEYED piece {piece_sid} to carol at tip {before}; polling up to 40 \
+         carol claim passes for her to book {PAY} of {asset_id}"
+    );
     let mut carol_balance = 0;
     for _ in 0..40 {
         carol.claim().await?;

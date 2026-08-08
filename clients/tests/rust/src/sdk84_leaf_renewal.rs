@@ -384,6 +384,11 @@ pub async fn execute() -> Result<()> {
         .await?
         .ok_or_else(|| anyhow!("claim() must ladder a fresh confirmed root coin unconditionally"))?;
     let (f_txid, f_vout) = (parent_bundle.f_txid.clone(), parent_bundle.f_vout);
+    println!(
+        "SDK84 - [1] alice's {DEPOSIT}-sat deposit confirmed after {waited} claim pass(es) and was \
+         LADDERED: sid {} over F = {f_txid}:{f_vout}",
+        alice_sid.chars().take(8).collect::<String>()
+    );
 
     let h0_addr =
         mercuryrustlib::transfer_receiver::new_transfer_address(&cc, &holders[0].0).await?;
@@ -392,6 +397,11 @@ pub async fn execute() -> Result<()> {
         r.used_split,
         "a {PAY}-sat payment out of one {DEPOSIT}-sat LADDERED coin must split in-ladder — without a \
          split there is no leaf and this test has nothing to renew"
+    );
+    println!(
+        "SDK84 - [1] the non-exact {PAY}-sat payment out of {DEPOSIT} sat took the IN-LADDER SPLIT \
+         lane (used_split={}, total_sats={}) and conveyed a leaf to sdk84_h0",
+        r.used_split, r.total_sats
     );
     let leaf_sid = {
         // The child's statechain id is whichever CONFIRMED `ctesr-` row h0 just adopted.
@@ -551,6 +561,16 @@ pub async fn execute() -> Result<()> {
                     "with hops left in the epoch the leaf must not claim it needs renewing"
                 );
             }
+            println!(
+                "SDK84 - [{}] hop {hops_done}/{total_hops} (epoch {epoch}, hop {}/{hops_per_epoch}): \
+                 leaf {} moved {PAY} sat {from_name} -> {to_name}; state CSV {csv_before} -> \
+                 {csv_after}, extension CSV {ext_before} unmoved over {leaf_outpoint}; num_sigs \
+                 {expected_sigs}, {} superseded state(s) disclosed",
+                if epoch == 0 { "2" } else { "5" },
+                k + 1,
+                leaf_sid.chars().take(8).collect::<String>(),
+                after.child_superseded_states.len()
+            );
         }
         println!(
             "SDK84 - [{}] epoch {epoch}: {hops_per_epoch} whole-leaf hop(s) took the state rung {} -> \
@@ -969,6 +989,21 @@ pub async fn execute() -> Result<()> {
          assertion below proves nothing"
     );
 
+    println!(
+        "SDK84 - [8] starting the unilateral exit of leaf {} from {final_name}: live extension {} \
+         (CSV {}) vs {} superseded extension(s) [{}] all rivalling {leaf_outpoint}; exit address \
+         starts empty",
+        leaf_sid.chars().take(8).collect::<String>(),
+        live_ext_txid.chars().take(8).collect::<String>(),
+        signed_csv(&final_cb.child_extension)?,
+        dead_ext_txids.len(),
+        dead_ext_txids
+            .iter()
+            .map(|t| t.chars().take(8).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let mut passes = 0;
     loop {
         let st = final_w.unilateral_exit(Some(vec![leaf_sid.clone()]), None).await?;
@@ -1028,6 +1063,15 @@ pub async fn execute() -> Result<()> {
     assert_eq!(
         landed[0].value, final_cb.child_state.out_value,
         "[8] the value that lands is the renewed state's committed value"
+    );
+    println!(
+        "SDK84 - [8] the chain settled the race: SP.out[{}] ({sp_txid}:{}) was spent by the RENEWED \
+         extension {live_ext_txid}, none of the {} superseded extension(s) reached the chain, F \
+         {f_txid}:{f_vout} is spent, and {} sat landed at the final holder's own exit address",
+        final_cb.sp_vout,
+        final_cb.sp_vout,
+        dead_ext_txids.len(),
+        landed[0].value
     );
 
     println!(

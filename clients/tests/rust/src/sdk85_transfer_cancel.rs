@@ -317,6 +317,16 @@ pub async fn execute() -> Result<()> {
     // [7]/[8]: the two coins of different value the misdirection attack needs.
     let coin_e = fund_one_of(&cc, &alice, "sdk85_alice", &core, SMALL).await?;
     let coin_f = fund_one_of(&cc, &alice, "sdk85_alice", &core, LARGE).await?;
+    println!(
+        "SDK85 - [setup] alice funded 6 coins: A={} B={} C={} D={} (each {DEPOSIT} sats), \
+         E={} ({SMALL} sats), F={} ({LARGE} sats)",
+        &coin_a[..8.min(coin_a.len())],
+        &coin_b[..8.min(coin_b.len())],
+        &coin_c[..8.min(coin_c.len())],
+        &coin_d[..8.min(coin_d.len())],
+        &coin_e[..8.min(coin_e.len())],
+        &coin_f[..8.min(coin_f.len())],
+    );
 
     // =============================================================================================
     // [1] ROW 1 — OPENED, NEVER CONVEYED: THE SENDER ALONE MAY WITHDRAW IT.
@@ -348,6 +358,10 @@ pub async fn execute() -> Result<()> {
         None,
     )
     .await?;
+    println!(
+        "SDK85 - [1] alice OPENED a transfer of coin A={} to bob (get_new_x1, message never posted)",
+        &coin_a[..8.min(coin_a.len())]
+    );
 
     // Assert the lock is REALLY THERE before asserting it can be released. Without this, a cancel
     // that did nothing at all would still make the next transfer succeed and the step would pass.
@@ -357,6 +371,7 @@ pub async fn execute() -> Result<()> {
         "[1] transferring a coin that already has an OPEN transfer",
         "coin has an open transfer",
     )?;
+    println!("SDK85 - [1] the pending-transfer lock is REALLY THERE: conveying coin A to carol was refused");
 
     // Row 1: sender alone. No recipient co-signature is presented and none is required.
     let outcome = alice.cancel_transfer(&coin_a).await?;
@@ -370,10 +385,18 @@ pub async fn execute() -> Result<()> {
     if again != CancelOutcome::AlreadyCancelled {
         return Err(anyhow!("[1] a repeated cancel must be idempotent, got {again:?}"));
     }
+    println!(
+        "SDK85 - [1] sender-alone cancel of coin A={} => Cancelled, and a repeat => AlreadyCancelled (idempotent)",
+        &coin_a[..8.min(coin_a.len())]
+    );
 
     // The lock is released: the coin is spendable again, to a DIFFERENT recipient.
     convey(&cc, "sdk85_alice", &carol_slot_a, &coin_a).await?;
     claim_until(&cc, &carol, "sdk85_carol", &coin_a).await?;
+    println!(
+        "SDK85 - [1] DONE: lock released — coin A={} re-conveyed to carol and CLAIMED ({DEPOSIT} sats)",
+        &coin_a[..8.min(coin_a.len())]
+    );
 
     // =============================================================================================
     // [2] ROW 2, THE REFUSAL — CONVEYED AND UNCLAIMED: THE SENDER ALONE MUST NOT BE ABLE TO WITHDRAW.
@@ -386,6 +409,10 @@ pub async fn execute() -> Result<()> {
     let bob_slot_b = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk85_bob").await?;
     let (_, _, bob_auth_b) = mercurylib::decode_transfer_address(&bob_slot_b)?;
     convey(&cc, "sdk85_alice", &bob_slot_b, &coin_b).await?;
+    println!(
+        "SDK85 - [2] coin B={} ({DEPOSIT} sats) CONVEYED to bob (message posted, unclaimed)",
+        &coin_b[..8.min(coin_b.len())]
+    );
 
     let refusal = alice.cancel_transfer(&coin_b).await;
     let err = match refusal {
@@ -413,6 +440,10 @@ pub async fn execute() -> Result<()> {
     if !needs.to_string().contains("the recipient must co-sign the cancellation") {
         return Err(anyhow!("[2] the refusal lost the coordinator's named reason: {needs}"));
     }
+    println!(
+        "SDK85 - [2] sender-only cancel of coin B was REFUSED as a typed CancelNeedsRecipientConsent naming bob's key {}",
+        &bob_auth_b.to_string()[..8]
+    );
 
     // ...and the refusal left the lock in place: alice still cannot convey coin B to anyone else.
     let carol_slot_b = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk85_carol").await?;
@@ -427,6 +458,7 @@ pub async fn execute() -> Result<()> {
         // superseded-disclosure work doing its job; the assertion is re-derived, not relaxed.
         "outstanding conveyed state",
     )?;
+    println!("SDK85 - [2] DONE: the lock survived the refusal — conveying coin B to carol was refused (outstanding conveyed state)");
 
     // =============================================================================================
     // [3] ROW 2, THE COOPERATIVE CANCEL — THE ONLY PARTY WHO CAN BE DEFRAUDED SIGNS THE RELEASE.
@@ -468,6 +500,12 @@ pub async fn execute() -> Result<()> {
     if preview.is_coloured() {
         return Err(anyhow!("[3] coin B carries no RGB allocation; the preview says it does"));
     }
+    println!(
+        "SDK85 - [3] bob PREVIEWED the consent for coin B={}: {} sats, material posted, uncoloured, key {}",
+        &coin_b[..8.min(coin_b.len())],
+        preview.amount(),
+        &preview.recipient_auth_pub_key()[..8]
+    );
 
     // bob consents to THE OBJECT HE WAS SHOWN — there is no coin id and no key in this call, so
     // nothing alice said can steer it.
@@ -490,6 +528,11 @@ pub async fn execute() -> Result<()> {
     if outcome != CancelOutcome::Cancelled {
         return Err(anyhow!("[3] a consented cancel must release the lock, got {outcome:?}"));
     }
+    println!(
+        "SDK85 - [3] DONE: bob minted a cross-wallet consent bound to digest {} and alice's cancel of coin B={} => Cancelled",
+        &preview.transfer_digest()[..8],
+        &coin_b[..8.min(coin_b.len())]
+    );
 
     // =============================================================================================
     // [4] ROW 3 — CLAIMED IS TERMINAL. A completed payment is never withdrawable, whatever consent
@@ -499,12 +542,17 @@ pub async fn execute() -> Result<()> {
     let (_, _, bob_auth_c) = mercurylib::decode_transfer_address(&bob_slot_c)?;
     convey(&cc, "sdk85_alice", &bob_slot_c, &coin_c).await?;
     claim_until(&cc, &bob, "sdk85_bob", &coin_c).await?;
+    println!(
+        "SDK85 - [4] coin C={} ({DEPOSIT} sats) conveyed to bob and CLAIMED (key_updated = true)",
+        &coin_c[..8.min(coin_c.len())]
+    );
 
     refused_with(
         alice.cancel_transfer(&coin_c).await,
         "[4] cancelling a transfer bob has already CLAIMED",
         "already claimed",
     )?;
+    println!("SDK85 - [4] alice's sender-only cancel of the CLAIMED coin C was refused (already claimed)");
 
     // ...and not even bob's own consent can un-complete it. `key_updated` is tested before every
     // other guard in `decide_transfer_cancel` precisely so no later state can reopen a finished
@@ -519,6 +567,7 @@ pub async fn execute() -> Result<()> {
                 "[4] cancelling a CLAIMED transfer WITH the recipient's consent",
                 "already claimed",
             )?;
+            println!("SDK85 - [4] DONE: even WITH bob's consent, cancelling the claimed coin C was refused (already claimed)");
         }
         // bob's receiving slot became the coin itself on claim, so previewing the old slot may
         // legitimately refuse here — and when it does it must refuse BY NAME as AlreadyClaimed,
@@ -541,6 +590,10 @@ pub async fn execute() -> Result<()> {
                     unavailable.reason
                 ));
             }
+            println!(
+                "SDK85 - [4] DONE: bob's wallet refused to even PREVIEW a consent for the claimed coin C, typed {:?}",
+                unavailable.reason
+            );
         }
     }
 
@@ -570,12 +623,18 @@ pub async fn execute() -> Result<()> {
         Some(batch_id),
     )
     .await?;
+    println!(
+        "SDK85 - [5] alice opened a BATCHED transfer of coin D={} ({DEPOSIT} sats) to bob under batch_id sdk85-batch-{}",
+        &coin_d[..8.min(coin_d.len())],
+        &coin_d[..8.min(coin_d.len())]
+    );
 
     refused_with(
         alice.cancel_transfer(&coin_d).await,
         "[5] cancelling a BATCHED (lightning-latch) transfer",
         "batched (lightning-latch) transfer cannot be cancelled",
     )?;
+    println!("SDK85 - [5] the sender-only cancel of the batched coin D was refused (latch governs it)");
 
     // Consent is not the right authorization for a latch, and row 4 is tested BEFORE the consent
     // rule in `decide_transfer_cancel` for exactly that reason. There are now TWO layers refusing
@@ -595,6 +654,7 @@ pub async fn execute() -> Result<()> {
                 "[5] cancelling a BATCHED transfer WITH the recipient's consent",
                 "batched (lightning-latch) transfer cannot be cancelled",
             )?;
+            println!("SDK85 - [5] DONE: even WITH a minted consent, the batched coin D refused cancellation");
         }
         Err(e) => {
             let unavailable = e
@@ -609,6 +669,10 @@ pub async fn execute() -> Result<()> {
                     unavailable.reason
                 ));
             }
+            println!(
+                "SDK85 - [5] DONE: bob cannot even MINT a consent for the never-conveyed coin D, typed {:?}",
+                unavailable.reason
+            );
         }
     }
 
@@ -632,6 +696,10 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
+    println!(
+        "SDK85 - [6] bob never booked the CANCELLED coin B={} after 15 claim passes",
+        &coin_b[..8.min(coin_b.len())]
+    );
 
     // The other half of "exactly one": the coin really did go somewhere.
     convey(&cc, "sdk85_alice", &carol_slot_b, &coin_b).await?;
@@ -642,6 +710,10 @@ pub async fn execute() -> Result<()> {
             "SAFETY: [6] bob still holds material for coin B after carol was paid with it"
         ));
     }
+    println!(
+        "SDK85 - [6] DONE: EXACTLY ONE payee for coin B={} — carol CLAIMED {DEPOSIT} sats, bob holds no material for it",
+        &coin_b[..8.min(coin_b.len())]
+    );
 
     // =============================================================================================
     // [7] ATTACK — MISDIRECTION. "CONSENT TO CANCELLING THE SMALL ONE", WHILE NAMING THE LARGE ONE.
@@ -663,6 +735,11 @@ pub async fn execute() -> Result<()> {
     let (_, _, bob_auth_f) = mercurylib::decode_transfer_address(&bob_slot_f)?;
     convey(&cc, "sdk85_alice", &bob_slot_e, &coin_e).await?;
     convey(&cc, "sdk85_alice", &bob_slot_f, &coin_f).await?;
+    println!(
+        "SDK85 - [7] bob now holds TWO open transfers on different slots: E={} ({SMALL} sats) and F={} ({LARGE} sats)",
+        &coin_e[..8.min(coin_e.len())],
+        &coin_f[..8.min(coin_f.len())]
+    );
 
     // THE STRONGEST FORM: alice names NOTHING. bob enumerates his own mailbox and sees both
     // transfers with their real, branch-validated amounts. A request that describes a small payment
@@ -678,6 +755,10 @@ pub async fn execute() -> Result<()> {
     if !seen.iter().any(|(sid, amt)| sid == &coin_f && *amt == LARGE) {
         return Err(anyhow!("[7] bob's own enumeration lost coin F at {LARGE} sats; saw {seen:?}"));
     }
+    println!(
+        "SDK85 - [7] bob ENUMERATED his own mailbox: {} cancellable consent(s), E at {SMALL} and F at {LARGE} sats both present",
+        cancellable.len()
+    );
 
     // THE MISDIRECTION ITSELF. alice says "the small one" and passes coin F. Whatever she says, the
     // preview describes F truthfully — the LARGE amount — so the lie is visible before anything is
@@ -698,6 +779,11 @@ pub async fn execute() -> Result<()> {
             misdirected.recipient_auth_pub_key()
         ));
     }
+    println!(
+        "SDK85 - [7] MISDIRECTION VISIBLE: alice described the small payment but named coin F={} — bob was shown the TRUE {} sats",
+        &coin_f[..8.min(coin_f.len())],
+        misdirected.amount()
+    );
 
     // …and bob consents to the SMALL one, which is what he actually agreed to. The token is minted
     // from the previewed object, so it can only ever be about coin E.
@@ -716,6 +802,12 @@ pub async fn execute() -> Result<()> {
         ));
     }
     let consent_e = bob.cancel_consent(&preview_e).await?;
+    println!(
+        "SDK85 - [7] DONE: bob consented to the SMALL coin E={} ({SMALL} sats), digest {} — distinct from F's digest {}",
+        &coin_e[..8.min(coin_e.len())],
+        &preview_e.transfer_digest()[..8],
+        &misdirected.transfer_digest()[..8]
+    );
 
     // =============================================================================================
     // [8] ATTACK — REPLAY. A CONSENT RELEASES ONE TRANSFER INSTANCE, NOT A COIN.
@@ -734,6 +826,10 @@ pub async fn execute() -> Result<()> {
         "[8a] spending a consent minted for coin E against coin F",
         "bound to different transfer material",
     )?;
+    println!(
+        "SDK85 - [8a] cross-instance replay REFUSED: E's consent presented against coin F={} was named stale, not a bad signature",
+        &coin_f[..8.min(coin_f.len())]
+    );
 
     // [8b] RE-OPENING THE ROW to manufacture a second instance to spend the token on. `get_new_x1`
     // is the raw POST /transfer/sender — the re-address guard is what must refuse it, and until that
@@ -763,6 +859,11 @@ pub async fn execute() -> Result<()> {
         "[8b] re-opening a conveyed transfer to the SAME recipient key",
         "Transfer message already exists",
     )?;
+    println!(
+        "SDK85 - [8b] re-opening coin E={} to bob's same key {} was REFUSED by the re-address guard",
+        &coin_e[..8.min(coin_e.len())],
+        &bob_auth_e.to_string()[..8]
+    );
 
     // [8c] RE-CONVEYING outright. This used to die on the coordinator's pending-transfer lock; it
     // now dies one layer EARLIER still, in the wallet, on the rival-state guard — alice has already
@@ -773,6 +874,10 @@ pub async fn execute() -> Result<()> {
         "[8c] re-conveying a coin whose transfer is still open",
         "outstanding conveyed state",
     )?;
+    println!(
+        "SDK85 - [8c] re-conveying coin E={} was REFUSED locally by the rival-state guard (outstanding conveyed state)",
+        &coin_e[..8.min(coin_e.len())]
+    );
 
     // [8d] THE TOKEN IS STILL GOOD FOR THE TRANSFER IT WAS GIVEN FOR. This is the other half of
     // [8a]: the staleness test runs BEFORE the nonce is consumed, so a sender who tried to misuse a
@@ -787,6 +892,10 @@ pub async fn execute() -> Result<()> {
              of coin E got {outcome:?}"
         ));
     }
+    println!(
+        "SDK85 - [8d] the SAME token still worked where it belonged: coin E={} cancelled => Cancelled (nonce not burned by [8a])",
+        &coin_e[..8.min(coin_e.len())]
+    );
 
     // [8e] AND AFTERWARDS the same key cannot be reused: a recipient key whose transfer was
     // cancelled is retired, so alice cannot rebuild the situation and ask for a fresh consent.
@@ -812,6 +921,10 @@ pub async fn execute() -> Result<()> {
         "[8e] re-opening a transfer to a recipient key whose transfer was cancelled",
         "was cancelled",
     )?;
+    println!(
+        "SDK85 - [8e] the retired recipient key {} was REFUSED for a fresh transfer of coin E",
+        &bob_auth_e.to_string()[..8]
+    );
 
     // [8f] EXACTLY ONE PAYEE, for the attacked coin: bob never books E, carol does.
     for _ in 0..15 {
@@ -827,15 +940,27 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
+    println!(
+        "SDK85 - [8f] bob never booked the CANCELLED coin E={} after 15 claim passes",
+        &coin_e[..8.min(coin_e.len())]
+    );
     let carol_slot_e = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk85_carol").await?;
     convey(&cc, "sdk85_alice", &carol_slot_e, &coin_e).await?;
     claim_until(&cc, &carol, "sdk85_carol", &coin_e).await?;
+    println!(
+        "SDK85 - [8f] carol CLAIMED coin E={} ({SMALL} sats) — exactly one payee for the attacked coin",
+        &coin_e[..8.min(coin_e.len())]
+    );
 
     // [8g] THE UN-ATTACKED TRANSFER IS UNHARMED. Coin F was the target of the misdirection and of
     // the cross-instance replay, and both were refused — so F must still complete normally. A fix
     // that defended by breaking honest cancellations, or honest CLAIMS, would pass every negative
     // assertion above and fail here.
     claim_until(&cc, &bob, "sdk85_bob", &coin_f).await?;
+    println!(
+        "SDK85 - [8g] the un-attacked coin F={} completed normally: bob CLAIMED {LARGE} sats",
+        &coin_f[..8.min(coin_f.len())]
+    );
 
     // End state, as declared in the module doc: bob holds C and F; carol holds A, B and E.
     confirmed_coin(&cc, "sdk85_bob", &coin_c).await?;
@@ -848,6 +973,7 @@ pub async fn execute() -> Result<()> {
             "SAFETY: [8f] bob still holds material for coin E after carol was paid with it"
         ));
     }
+    println!("SDK85 - [8g] END STATE verified: bob holds C and F; carol holds A, B and E; coin D still locked by its batched transfer");
 
     println!("sdk85_transfer_cancel: OK");
     Ok(())

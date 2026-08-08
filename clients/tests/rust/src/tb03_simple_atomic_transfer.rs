@@ -18,6 +18,8 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     let _ = bitcoin_core::sendtoaddress(amount, &wallet1_address)?;
 
+    println!("TB03 - [1] funded wallet1 deposit address {} with {} sats (token {})", &wallet1_address[..8.min(wallet1_address.len())], amount, &token_id[..8.min(token_id.len())]);
+
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
     let token_id = crate::utils::handle_token_response(client_config, &token_response).await?;
@@ -26,9 +28,13 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     let _ = bitcoin_core::sendtoaddress(amount, &wallet2_address)?;
 
+    println!("TB03 - [2] funded wallet2 deposit address {} with {} sats (token {})", &wallet2_address[..8.min(wallet2_address.len())], amount, &token_id[..8.min(token_id.len())]);
+
     let core_wallet_address = bitcoin_core::getnewaddress()?;
     let remaining_blocks = client_config.confirmation_target;
     let _ = bitcoin_core::generatetoaddress(remaining_blocks, &core_wallet_address)?;
+
+    println!("TB03 - [3] mined {} blocks; waiting for electrs to index both {}-sat deposits", remaining_blocks, amount);
 
     // It appears that Electrs takes a few seconds to index the transaction
     let mut is_tx_indexed = false;
@@ -40,10 +46,14 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
         thread::sleep(Duration::from_secs(1));
     }
 
+    println!("TB03 - [3] electrs indexed both deposits");
+
     let batch_id = Some(uuid::Uuid::new_v4().to_string());
 
     let wallet3_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet3.name).await?;
     let wallet4_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet4.name).await?;
+
+    println!("TB03 - [4] opened atomic batch {} with 2 legs (wallet1->wallet3, wallet2->wallet4)", &batch_id.as_ref().unwrap()[..8]);
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
     let wallet1: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
@@ -56,6 +66,8 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     assert!(result.is_ok());
 
+    println!("TB03 - [5] leg A sent: wallet1 coin SC={} ({} sats) -> wallet3, batch {}", &statechain_id_1[..8], amount, &batch_id.as_ref().unwrap()[..8]);
+
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet2.name).await?;
     let wallet2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
     let new_coin = wallet2.coins.iter().find(|&coin| coin.aggregated_address == Some(wallet2_address.clone()) && coin.status == CoinStatus::CONFIRMED).unwrap();
@@ -65,10 +77,14 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     assert!(result.is_ok());
 
+    println!("TB03 - [6] leg B sent: wallet2 coin SC={} ({} sats) -> wallet4, same batch", &statechain_id_2[..8], amount);
+
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet3.name).await?;
 
     assert!(transfer_receive_result.is_there_batch_locked);
     assert!(transfer_receive_result.received_statechain_ids.len() == 0);
+
+    println!("TB03 - [7] wallet3 first receive attempt: batch LOCKED as expected, 0 statechain ids received");
 
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet4.name).await?;
 
@@ -80,6 +96,8 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
     let new_coin = wallet4.coins.iter().find(|&coin| coin.statechain_id == Some(statechain_id_2.clone())).unwrap();
     assert!(new_coin.status == CoinStatus::CONFIRMED);
 
+    println!("TB03 - [8] wallet4 receive unlocked the batch: booked SC={} as CONFIRMED", &statechain_id_2[..8]);
+
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet3.name).await?;
 
     assert!(!transfer_receive_result.is_there_batch_locked);
@@ -90,6 +108,8 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
     let new_coin = wallet3.coins.iter().find(|&coin| coin.statechain_id == Some(statechain_id_1.clone())).unwrap();
     assert!(new_coin.status == CoinStatus::CONFIRMED);
 
+    println!("TB03 - [9] wallet3 second receive succeeded: batch unlocked, booked SC={} as CONFIRMED", &statechain_id_1[..8]);
+
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
     let wallet1: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
     let new_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(wallet1_address.clone())).unwrap();
@@ -99,6 +119,8 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
     let wallet2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
     let new_coin = wallet2.coins.iter().find(|&coin| coin.aggregated_address == Some(wallet2_address.clone())).unwrap();
     assert!(new_coin.status == CoinStatus::TRANSFERRED);
+
+    println!("TB03 - [10] both sender coins settled TRANSFERRED (wallet1 SC={}, wallet2 SC={})", &statechain_id_1[..8], &statechain_id_2[..8]);
 
     Ok(())
 }

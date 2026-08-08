@@ -24,6 +24,8 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
     let remaining_blocks = client_config.confirmation_target;
     let _ = bitcoin_core::generatetoaddress(remaining_blocks, &core_wallet_address)?;
 
+    println!("TB05 - [1] deposit funded: {} sats sent to {} and {} blocks mined; waiting for electrs to index", amount, &deposit_address, remaining_blocks);
+
     // It appears that Electrs takes a few seconds to index the transaction
     let mut is_tx_indexed = false;
 
@@ -32,6 +34,8 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
         thread::sleep(Duration::from_secs(1));
     }
 
+    println!("TB05 - [1] electrs indexed the deposit of {} sats at {}", amount, &deposit_address);
+
     let wallet1_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet1.name).await?;
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
@@ -39,11 +43,15 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
     let new_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(deposit_address.clone()) && coin.status == CoinStatus::CONFIRMED).unwrap();
     let statechain_id_1 = new_coin.statechain_id.as_ref().unwrap();
 
+    println!("TB05 - [2] wallet1 booked CONFIRMED coin SC={} ({} sats) from the deposit", &statechain_id_1[..8], amount);
+
     let force_send = false;
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet1_transfer_adress, &wallet1.name, &statechain_id_1.clone(), None, force_send, None).await;
 
     assert!(result.is_ok(), "transfer_sender::execute failed: {:?}", result.as_ref().err());
+
+    println!("TB05 - [3] CONVEY #1: wallet1 conveyed SC={} to its OWN transfer address (never claimed) -> open transfer", &statechain_id_1[..8]);
 
     let wallet2_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet2.name).await?;
 
@@ -64,6 +72,8 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
         "expected the pending-transfer lock to refuse; got: {blocked_msg}"
     );
 
+    println!("TB05 - [4] pending-transfer lock HELD: second convey of SC={} to wallet2 refused with \"{}\"", &statechain_id_1[..8], blocked_msg);
+
     // Cancel the abandoned transfer. It WAS conveyed (transfer_sender posts the mailbox message), so
     // the recorded recipient must co-sign the release — and here wallet1 is that recipient, because
     // it addressed the transfer to itself. This is not a sender-only cancel; it is the same consent
@@ -76,6 +86,8 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
         mercuryrustlib::transfer_sender::CancelOutcome::Cancelled
     );
 
+    println!("TB05 - [5] CANCEL #1 (self-addressed transfer, wallet1 is both sender and recipient): SC={} -> Cancelled", &statechain_id_1[..8]);
+
     // Cancelling twice is idempotent, not an error: cancellation is irreversible, so a client that
     // retries after a dropped response must not be told something different the second time.
     let again = mercuryrustlib::transfer_sender::cancel(&client_config, &wallet1.name, &statechain_id_1.clone()).await;
@@ -85,6 +97,8 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
         mercuryrustlib::transfer_sender::CancelOutcome::AlreadyCancelled
     );
 
+    println!("TB05 - [6] CANCEL #2 (idempotent retry of the same cancel): SC={} -> AlreadyCancelled", &statechain_id_1[..8]);
+
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
     let wallet1: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
@@ -92,6 +106,8 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id_1.clone(), None, force_send, None).await;
 
     assert!(result.is_ok(), "transfer_sender::execute failed: {:?}", result.as_ref().err());
+
+    println!("TB05 - [7] lock RELEASED by the cancel: CONVEY #2 sent SC={} to WALLET2 (unclaimed)", &statechain_id_1[..8]);
 
     // ADVERSARIAL, on the live stack: the coin is now conveyed to WALLET2, which has not claimed it.
     // wallet1 must not be able to take it back — it does not hold wallet2's recipient key, and
@@ -107,11 +123,15 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
         "expected the recipient-consent refusal; got: {refused_msg}"
     );
 
+    println!("TB05 - [8] CANCEL #3 (sender-only, transfer conveyed to wallet2) REFUSED for SC={} with \"{}\"", &statechain_id_1[..8], refused_msg);
+
     // ... and the refusal left the transfer intact: the coin is still locked, so wallet1 cannot
     // co-sign a rival state while wallet2 holds claimable material.
     let wallet1_second_address = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet1.name).await?;
     let still_locked = mercuryrustlib::transfer_sender::execute(&client_config, &wallet1_second_address, &wallet1.name, &statechain_id_1.clone(), None, force_send, None).await;
     assert!(still_locked.is_err(), "a refused cancel must leave the pending-transfer lock in place");
+
+    println!("TB05 - [9] refused cancel left the lock INTACT: wallet1 still cannot re-convey SC={} to itself", &statechain_id_1[..8]);
 
     let backup_transactions = mercuryrustlib::sqlite_manager::get_backup_txs(&client_config.pool, &wallet1.name, &statechain_id_1).await?;
 
@@ -121,10 +141,14 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
 
     assert!(bkp_tx.tx_n == 2);
 
+    println!("TB05 - [10] wallet1 holds {} backup txs for SC={}; picked the OLD state tx_n={}", backup_transactions.len(), &statechain_id_1[..8], bkp_tx.tx_n);
+
     let tx_bytes = hex::decode(&bkp_tx.tx)?;
     let txid = client_config.electrum_client.transaction_broadcast_raw(&tx_bytes);
 
     assert!(txid.is_err());
+
+    println!("TB05 - [11] old-state broadcast REJECTED while timelocked, as expected: {:?}", txid.as_ref().err());
 
     let tx_lock_time = mercuryrustlib::get_blockheight(&bkp_tx)?;
 
@@ -134,9 +158,13 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
 
     let _ = bitcoin_core::generatetoaddress(height_diff, &core_wallet_address)?;
 
+    println!("TB05 - [12] mined {} blocks to reach the tx_n={} locktime {} (from height {})", height_diff, bkp_tx.tx_n, tx_lock_time, current_blockheight);
+
     let txid = client_config.electrum_client.transaction_broadcast_raw(&tx_bytes);
 
     assert!(txid.is_ok());
+
+    println!("TB05 - [12] old-state tx_n={} for SC={} BROADCAST accepted after the timelock expired: txid {}", bkp_tx.tx_n, &statechain_id_1[..8], txid.as_ref().unwrap());
 
     Ok(())
 

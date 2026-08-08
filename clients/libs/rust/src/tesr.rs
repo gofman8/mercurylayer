@@ -5550,6 +5550,65 @@ pub fn next_child_exit_tier(electrum: &electrum_client::Client, cb: &ChildTesrBu
     }
     Ok(None)
 }
+/// **[audit-17] THE COIN'S TRUE EPOCH DEADLINE, read from signed material instead of recomputed.**
+///
+/// Returns `L_k` — the LOWEST absolute nLockTime across the parent's conveyed flat backups, i.e. the
+/// first height at which the parent's current owner can broadcast a backup that spends `F` and voids
+/// the entire tree. That is the only absolute clock anywhere in the structure; everything below `T`
+/// is relative.
+///
+/// **WHY THIS EXISTS.** The deadline used to be recomputed as `deposit_anchored_deadline` =
+/// `h_deposit + initlock`, which is `L_0` — the k = 0 case, i.e. the LATEST value the ladder can
+/// take. The real one is `L_k = L_0 − k·interval` for a parent transferred `k` times before it was
+/// split, and nothing conveys `k`. The error direction is FAIL-OPEN: the holder believes it has more
+/// time than it has, by `k·interval`. `AUDIT_17_K_MAX = 14` was a guess at `k` and its own comment
+/// called it the weakest term in the margin.
+///
+/// It was never necessary. `k` does not need conveying because the ANSWER is already conveyed: each
+/// backup's own nLockTime IS its rung (`calculate_block_height`, lib/src/transaction.rs), so the
+/// minimum over the chain is `L_k` exactly. This reads a field that is already in hand.
+///
+/// **WHY THE NUMBER CAN BE TRUSTED.** Every entry this reads has already been through
+/// [`verify_conveyed_child`]'s ancestor census before the bundle was persisted: signature-verified
+/// under `F`'s key, prevout-pinned to `(F.txid, F.vout)`, INV-5 exact-decrement-checked, and capped
+/// at `tip + initlock`. Crucially the COUNT is pinned by the exact-equality signature census, so a
+/// sender can neither DROP the low entry to flatter this minimum (the census breaks) nor pad the
+/// chain (a padded entry is a real SE co-signature, which raises `num_sigs` and lowers the minimum
+/// anyway). The locktime is inside the signed transaction, so moving it invalidates the signature.
+///
+/// **FAIL-CLOSED, deliberately.** An empty chain is an error, not "no deadline": a coin with no
+/// disclosed backup is one whose clock cannot be established, and the caller must record blindness
+/// rather than conclude safety. A zero locktime is refused for the same reason — every TES-R tier is
+/// built at locktime 0 (INV-4), so a zero here means tiers were passed where backups belong, and
+/// silently returning 0 would read as "overdue since genesis".
+pub fn epoch_deadline_from_flat_backups(
+    backups: &[mercurylib::wallet::BackupTx],
+) -> Result<u32> {
+    use electrum_client::bitcoin::consensus::deserialize;
+
+    if backups.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no flat backups disclosed, so this coin's epoch deadline cannot be established —              refusing to report a deadline rather than defaulting to one"
+        ));
+    }
+    let mut lowest: Option<u32> = None;
+    for (i, b) in backups.iter().enumerate() {
+        let tx: electrum_client::bitcoin::Transaction = deserialize(
+            &hex::decode(&b.tx)
+                .map_err(|_| anyhow::anyhow!("flat backup {i}: not hex"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("flat backup {i}: not a transaction"))?;
+        let lt = tx.lock_time.to_consensus_u32();
+        if lt == 0 {
+            return Err(anyhow::anyhow!(
+                "flat backup {i} has an absolute locktime of 0. Every TES-R tier is built at                  locktime 0 (INV-4) and every flat backup carries its rung there, so this is a tier                  in the backup list — reporting 0 would read as a deadline already passed"
+            ));
+        }
+        lowest = Some(lowest.map_or(lt, |l: u32| l.min(lt)));
+    }
+    lowest.ok_or_else(|| anyhow::anyhow!("unreachable: non-empty chain yielded no locktime"))
+}
+
 
 /// Fetch the authoritative inputs a split-child receiver needs and run [`verify_child_bundle`] — the
 /// verify-ONLY core (no persistence). Reads `F.spk` from chain, the parent+child
@@ -21240,5 +21299,111 @@ mod cancelled_conveyance_tests {
         pre_fix.superseded_states.remove(1);
         let e = verify_bundle(&pre_fix, n, f).expect_err("fail CLOSED, not open");
         assert!(e.to_string().contains("num_sigs mismatch"), "got: {e}");
+    }
+}
+
+/// **[audit-17] THE DEADLINE MUST COME FROM THE SIGNED LADDER, NOT FROM `L_0`.**
+///
+/// The defect this pins was FAIL-OPEN — the old derivation returned `h_deposit + initlock`, which is
+/// `L_0`, so a coin whose parent had moved `k` times believed it had `k·interval` more blocks than
+/// it did. These tests assert the new derivation returns `L_k`, that `L_k` is strictly EARLIER than
+/// the old answer for every `k > 0`, and that the failure modes refuse rather than default.
+#[cfg(test)]
+mod audit17_epoch_deadline_tests {
+    use super::epoch_deadline_from_flat_backups;
+    use electrum_client::bitcoin::{absolute::LockTime, consensus::serialize};
+    use electrum_client::bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use mercurylib::wallet::BackupTx;
+
+    /// A backup carrying nothing but the locktime under test — that is the only field read.
+    fn backup(locktime: u32, tx_n: u32) -> BackupTx {
+        let tx = Transaction {
+            version: 2,
+            lock_time: LockTime::from_consensus(locktime),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: 1_000, script_pubkey: ScriptBuf::new() }],
+        };
+        BackupTx { tx_n, tx: hex::encode(serialize(&tx)), client_public_nonce: String::new(),
+                   server_public_nonce: String::new(), client_public_key: String::new(),
+                   server_public_key: String::new(), blinding_factor: String::new(),
+                   rgb_blinding: None, rgb_consignment: None }
+    }
+
+    /// The deployed profile: `initlock` 1 000, `interval` 10 (server/Settings.toml).
+    const INITLOCK: u32 = 1_000;
+    const INTERVAL: u32 = 10;
+    /// A representative co-sign tip, so `L_0 = H + initlock`.
+    const H: u32 = 850_000;
+
+    /// The real ladder: `L_k = L_0 − k·interval`, one entry per hop, lowest LAST.
+    fn ladder(k: u32) -> Vec<BackupTx> {
+        (0..=k).map(|i| backup(H + INITLOCK - i * INTERVAL, i)).collect()
+    }
+
+    #[test]
+    fn the_deadline_is_the_lowest_rung_not_the_first() {
+        for k in 0..=10u32 {
+            let expected = H + INITLOCK - k * INTERVAL;
+            assert_eq!(
+                epoch_deadline_from_flat_backups(&ladder(k)).unwrap(),
+                expected,
+                "a coin transferred {k} time(s) expires at L_{k}, not at L_0"
+            );
+        }
+    }
+
+    #[test]
+    fn it_is_strictly_earlier_than_the_old_l0_answer_for_every_k_above_zero() {
+        // This is the defect, stated as arithmetic. `deposit_anchored_deadline(h, initlock)` was
+        // `h + initlock` for EVERY coin regardless of k — always L_0, always too late.
+        let old_answer = H + INITLOCK;
+        assert_eq!(epoch_deadline_from_flat_backups(&ladder(0)).unwrap(), old_answer,
+                   "at k = 0 the old answer was right, which is why this went unnoticed");
+        for k in 1..=10u32 {
+            let now = epoch_deadline_from_flat_backups(&ladder(k)).unwrap();
+            assert!(now < old_answer, "k = {k} must move the deadline EARLIER, never later");
+            assert_eq!(old_answer - now, k * INTERVAL,
+                       "and by exactly k·interval — the term AUDIT_17_K_MAX was guessing at");
+        }
+        // The margin's guess was 14 hops. A coin at the ladder's capacity (initlock/interval = 100)
+        // was believed 1 000 blocks safer than it was — most of a whole epoch.
+        let at_capacity = epoch_deadline_from_flat_backups(&ladder(100)).unwrap();
+        assert_eq!(old_answer - at_capacity, INITLOCK);
+    }
+
+    #[test]
+    fn order_does_not_matter_because_it_is_a_minimum() {
+        let mut shuffled = ladder(7);
+        shuffled.reverse();
+        assert_eq!(epoch_deadline_from_flat_backups(&shuffled).unwrap(), H + INITLOCK - 7 * INTERVAL);
+    }
+
+    #[test]
+    fn an_empty_chain_refuses_rather_than_reporting_no_deadline() {
+        // "I cannot establish a clock" must never be spelled the same way as "there is no clock".
+        assert!(epoch_deadline_from_flat_backups(&[]).is_err());
+    }
+
+    #[test]
+    fn a_locktime_of_zero_is_refused_because_that_is_a_tier_not_a_backup() {
+        // Every TES-R tier is built at locktime 0 (INV-4). Taking a minimum over a list that
+        // contained one would return 0 — "overdue since genesis" — which is fail-closed by accident
+        // and unreadable by design. Refuse by name instead.
+        let mut with_tier = ladder(3);
+        with_tier.push(backup(0, 99));
+        let msg = epoch_deadline_from_flat_backups(&with_tier).unwrap_err().to_string();
+        assert!(msg.contains("locktime of 0"), "got: {msg}");
+    }
+
+    #[test]
+    fn unparseable_material_refuses_rather_than_being_skipped() {
+        let mut bad = ladder(2);
+        bad[1].tx = "not hex".to_string();
+        assert!(epoch_deadline_from_flat_backups(&bad).is_err());
     }
 }
