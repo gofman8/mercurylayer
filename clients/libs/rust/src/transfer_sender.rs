@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, str::FromStr};
 
-use crate::{client_config::ClientConfig, deposit::create_tx1, sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet}, transaction::new_transaction, utils::info_config};
+use crate::{client_config::ClientConfig, deposit::create_tx1, sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet}, transaction::new_transaction, transfer_receiver::PendingTransferInfo, utils::info_config};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use mercurylib::{decode_transfer_address, transfer::sender::{create_transfer_signature, create_transfer_update_msg_with_branch, TransferSenderRequestPayload, TransferSenderResponsePayload}, utils::get_blockheight, wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus, Wallet}};
@@ -854,21 +854,28 @@ fn assert_receiver_state_is_presignable(
              coin is untouched, still withdrawable and still unilaterally exitable."
         )
     })?;
-    cur_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| {
-            anyhow!(
-                "statechain id {statechain_id} is laddered but its state CSV ({cur_csv}) is at the \
-                 floor (δ {}, floor {}), so the receiver-paying state S' cannot be built one δ \
-                 lower. Refusing to fall back to the flat lane — the receiver would reject it on \
-                 the signature census. Renew or roll the ladder over (or re-anchor the coin \
-                 on-chain with refresh) and retry. Nothing has been co-signed: the coin is \
-                 untouched.",
-                p.delta,
-                p.d_floor
-            )
-        })?;
+    // [CANCEL] An outstanding conveyed co-sign makes the coin un-conveyable until it is settled —
+    // decided here, with no SE call and no network, so the coin stays completely untouched.
+    crate::tesr::refuse_outstanding_conveyance(bundle, "transfer").map_err(|e| {
+        anyhow!(
+            "{e} Refusing to fall back to the flat lane — the receiver would reject that on the \
+             signature census. Nothing has been co-signed: the coin is untouched, still \
+             withdrawable and still unilaterally exitable."
+        )
+    })?;
+    // The SAME derivation `presign_receiver_state` will use, so this gate cannot pass a coin the
+    // co-sign step would then refuse — nor refuse one it would have accepted.
+    crate::tesr::next_rival_state_csv(bundle).map_err(|e| {
+        anyhow!(
+            "statechain id {statechain_id} is laddered but its receiver-paying state S' cannot be \
+             built ({e}); its current state CSV is {cur_csv} (δ {}, floor {}). Refusing to fall \
+             back to the flat lane — the receiver would reject it on the signature census. Renew \
+             or roll the ladder over (or re-anchor the coin on-chain with refresh) and retry. \
+             Nothing has been co-signed: the coin is untouched.",
+            p.delta,
+            p.d_floor
+        )
+    })?;
     mercurylib::tesr::payee_address(recipient_address, &bundle.network).map_err(|e| {
         anyhow!(
             "statechain id {statechain_id} is laddered but the recipient address cannot be used as \
@@ -1223,6 +1230,42 @@ async fn execute_ex(
                          retry."
                     )
                 })?;
+            // ---- [CANCEL] DURABLY RECORD THE CO-SIGN WE JUST HANDED OUT, BEFORE IT LEAVES. -----
+            //
+            // `presign_receiver_state` co-signs `S'` on a CLONE and persists nothing, so until now
+            // the sender's own bundle never learned that an irreversible co-sign had been spent on
+            // a state paying somebody else. On the happy path that is harmless — the coin is gone.
+            // On a CANCELLATION it was two defects at once: the enclave's MONOTONIC `sig_count` had
+            // been raised by a tier nobody could disclose, so the receiver's exact-equality census
+            // came up short by one FOREVER (the coin stayed exitable but was dead for onward
+            // payment); and the rung `S'` consumed was not consumed, so a re-address rebuilt the
+            // replacement recipient's state at the SAME CSV over the SAME outpoint as the cancelled
+            // one — a first-seen race, i.e. a payment-theft vector.
+            //
+            // This write is what `reclaim_cancelled_conveyance` reads. It happens BEFORE the
+            // material can reach anyone: `get_new_x1` (which opens the transfer) and
+            // `transfer/update_msg` (which posts the ciphertext) are both still below.
+            //
+            // A FAILURE HERE IS FATAL TO THE TRANSFER, deliberately. The co-sign has already
+            // happened; continuing would convey the coin with the orphan unrecorded, which is
+            // exactly the state this change exists to remove.
+            let mut retained = bundle.clone();
+            retained.conveyed_states.push(augmented.current().state.clone());
+            crate::tesr::persist(client_config, &wallet.name, &retained)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "[{ERR_LADDER_COSIGN_INCOMPLETE}] statechain id {statechain_id}'s \
+                         receiver-paying state S' was co-signed, but the record of it could not be \
+                         written to this wallet ({e}). Refusing to convey: an unrecorded co-sign \
+                         cannot be disclosed if the transfer is later cancelled, which would leave \
+                         the coin unable to be claimed by anyone and would let a cancelled \
+                         recipient tie with a replacement one. The coin is still withdrawable and \
+                         still unilaterally exitable; renew or roll the ladder over, or re-anchor \
+                         it on-chain with refresh, before retrying."
+                    )
+                })?;
+
             let json = serde_json::to_string(&augmented).map_err(|e| {
                 anyhow!(
                     "[{ERR_LADDER_COSIGN_INCOMPLETE}] statechain id {statechain_id} is laddered but \
@@ -1386,7 +1429,12 @@ pub async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, sign
         },
     };
 
-    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
+    // A response body is NETWORK INPUT. The status has already been checked above, so this is a 2xx
+    // whose shape we did not expect — a coordinator we do not understand, or something in front of
+    // it. That is an error the caller can handle; it is never a reason to abort its task, which is
+    // what the `.expect()` that used to be here did.
+    let response: TransferSenderResponsePayload = serde_json::from_str(value.as_str())
+        .map_err(|e| anyhow!("transfer/sender returned a body this client cannot read ({e}): {}", crate::utils::server_message_from_body(&value)))?;
 
     Ok(response.x1)
 }
@@ -1529,6 +1577,7 @@ pub fn read_cancel_reply(
         ClaimInFlight,
         RecipientConsentRequired,
         RecipientSignatureInvalid,
+        RecipientConsentStale,
     ]
     .into_iter()
     .find(|d| d.code() == body.code);
@@ -1552,6 +1601,60 @@ pub fn read_cancel_reply(
     }
 }
 
+/// The refusal code stamped on a response body this client could not read as a decision.
+///
+/// Prefixed so it can never be confused with a coordinator decision code: every `CancelDecision`
+/// code is a bare lower-snake word (`already_claimed`, `batched_transfer`, …) and none of them
+/// begins with `http_`. A caller that branches on `code` therefore sees "this is the HTTP status,
+/// not a rule" without having to know the decision vocabulary.
+fn http_fallback_code(http_status: u16) -> String {
+    format!("http_{http_status}")
+}
+
+/// Read a `POST /transfer/cancel` HTTP response — STATUS and RAW BODY — into a [`CancelReply`],
+/// whatever shape the body arrived in. Pure, so every shape is testable without a coordinator.
+///
+/// # Why this exists rather than a bare `serde_json::from_str`
+///
+/// The endpoint has TWO body shapes. A DECISION is `{code, message, recipient_auth_pub_key}`.
+/// Everything that happens before the decision is reached — the sender signature that did not
+/// verify, a fail-closed DB fault — is the coordinator's generic `{"message": "…"}`, which carries
+/// no `code`. Deserialising every response as a decision therefore turned a well-formed, meaningful
+/// refusal into `could not read the cancel response (missing field 'code')`: the server's actual
+/// sentence was dropped, and the failure read as a client parsing bug rather than as the refusal it
+/// was. Whoever met it went looking in the wrong half of the system.
+///
+/// So an unreadable body degrades to what the server DID say — its `message` and its HTTP status —
+/// and never to a parse error.
+///
+/// # It degrades to a REFUSAL, never to a success
+///
+/// Including on a 2xx. The lock this endpoint releases is the only thing standing between a
+/// conveyed-but-unclaimed recipient and a sender who co-signs a rival state, so "I could not read
+/// the answer" must resolve the same way every other unknown does in this file: the lock is still
+/// held. There is deliberately no status-based success arm — a 200 whose body this client cannot
+/// read is a coordinator this client does not understand, which is exactly the case
+/// `an_unknown_code_is_refused_not_treated_as_success` already covers one layer up.
+pub fn read_cancel_response(statechain_id: &str, http_status: u16, text: &str) -> CancelReply {
+    if let Ok(body) =
+        serde_json::from_str::<mercurylib::transfer::cancel::TransferCancelResponsePayload>(text)
+    {
+        return read_cancel_reply(statechain_id, &body);
+    }
+
+    CancelReply::Refused(CancelRefused {
+        statechain_id: statechain_id.to_string(),
+        code: http_fallback_code(http_status),
+        // Verbatim, for the same reason `read_cancel_reply` keeps the coordinator's words: rewording
+        // hides which rule fired, and here it is the ONLY thing left that says what happened. The
+        // extraction is `crate::utils`' — ONE definition, shared with every other client read of a
+        // coordinator refusal, so the sites cannot drift apart.
+        message: crate::utils::server_message_from_body(text),
+        // No decision was named, so this client must not name one.
+        decision: None,
+    })
+}
+
 /// The local status a coin should be moved to after a SUCCESSFUL cancellation, or `None` to leave
 /// it exactly as it is.
 ///
@@ -1566,6 +1669,174 @@ pub fn status_after_cancel(current: &CoinStatus) -> Option<CoinStatus> {
         CoinStatus::IN_TRANSFER => Some(CoinStatus::CONFIRMED),
         _ => None,
     }
+}
+
+// ==============================================================================================
+// THE CONSENT TOKEN
+// ==============================================================================================
+
+/// A recipient's consent, as it travels out of band between two wallets.
+///
+/// ONE opaque string, deliberately. The signature and the statement of what it is a signature FOR
+/// must not be separable by whatever carries them — a chat message, a QR code, a support ticket —
+/// because a consent whose subject has been detached is exactly the unbound token the coordinator
+/// now refuses as [`CancelDecision::RecipientConsentStale`]. Wire form:
+///
+/// ```text
+/// <nonce>:<sig>:<digest>
+/// ```
+///
+/// `<nonce>:<sig>` is the ordinary single-use auth token the endpoint already understands; `<digest>`
+/// is [`mercurylib::transfer::cancel::transfer_consent_digest`] over the mailbox ciphertext the
+/// recipient downloaded. The two travel together and are submitted in separate payload fields, so
+/// the server's `split_once(':')` parse is untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentToken {
+    /// The `"<nonce>:<sig>"` half, verbatim, for `TransferCancelRequestPayload::recipient_auth_sig`.
+    pub nonce_sig: String,
+    /// The transfer-instance digest this consent is bound to.
+    pub transfer_digest: String,
+}
+
+impl ConsentToken {
+    /// The single string to hand to the sender.
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.nonce_sig, self.transfer_digest)
+    }
+
+    /// Read a token back, REFUSING anything that does not carry a binding.
+    ///
+    /// A legacy `"<nonce>:<sig>"` token parses to an error rather than to an unbound consent. It
+    /// would be refused by the coordinator anyway (that is the whole fix), but refusing it here
+    /// gives the sender a comprehensible local error instead of a confusing `recipient_consent_stale`
+    /// from a server it will suspect of being broken.
+    pub fn parse(token: &str) -> Result<Self> {
+        let fields: Vec<&str> = token.split(':').collect();
+        let [nonce, sig, digest] = fields.as_slice() else {
+            return Err(anyhow!(
+                "malformed consent token: expected exactly three colon-separated fields \
+                 (<nonce>:<signature>:<transfer digest>), found {}. A two-field token is the legacy \
+                 unbound shape and is no longer accepted — ask the recipient to mint a fresh one.",
+                fields.len()
+            ));
+        };
+        if nonce.is_empty() || sig.is_empty() {
+            return Err(anyhow!("malformed consent token: empty nonce or signature"));
+        }
+        // A well-formed digest is the only thing that makes this a BOUND consent, and the
+        // coordinator applies the same shape test — see `cancel::consent_binding_is_stale`. Reject
+        // here so an obviously unusable token never burns the sender's own nonce on a round trip.
+        if mercurylib::transfer::cancel::consent_binding_is_stale(Some(digest), Some(digest)) {
+            return Err(anyhow!(
+                "malformed consent token: '{digest}' is not a transfer digest (expected 64 hex characters)"
+            ));
+        }
+        Ok(ConsentToken {
+            nonce_sig: format!("{nonce}:{sig}"),
+            transfer_digest: digest.to_string(),
+        })
+    }
+}
+
+// ==============================================================================================
+// WHO MAY MINT A CONSENT
+// ==============================================================================================
+
+/// Why this wallet will not sign a consent for a named coin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentBlocked {
+    /// No transfer of this coin is addressed to any key this wallet holds. This wallet is not the
+    /// recorded recipient and has no standing to consent to anything about it.
+    NoPendingTransfer,
+    /// This wallet already completed the handover for this coin on that receiving slot. Consenting
+    /// to cancel a payment you have already taken is a footgun; the coordinator refuses it too, but
+    /// only after the signature has been given.
+    AlreadyClaimed,
+    /// This wallet previewed a transfer but no longer holds the receiving slot it was addressed to —
+    /// a restore from an older backup, or a coin pruned between the preview and the consent. There
+    /// is no key to sign with, and there must be no falling back to another one.
+    ReceivingSlotGone,
+}
+
+/// This wallet declines to mint a consent, and why — a TYPE, so a caller (or a UI) can distinguish
+/// "you were never the recipient" from "you already took this" without parsing prose.
+#[derive(Debug, Clone)]
+pub struct ConsentUnavailable {
+    pub statechain_id: String,
+    pub reason: ConsentBlocked,
+}
+
+impl std::fmt::Display for ConsentUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reason {
+            ConsentBlocked::NoPendingTransfer => write!(
+                f,
+                "this wallet holds no pending transfer of statechain id {}, so it cannot consent to \
+                 cancelling one. Only the recorded recipient's consent releases a conveyed transfer, \
+                 and being asked for one by a sender is not evidence of being that recipient.",
+                self.statechain_id
+            ),
+            ConsentBlocked::AlreadyClaimed => write!(
+                f,
+                "this wallet has already claimed statechain id {}; the payment is complete and \
+                 cannot be cancelled. Do not consent to withdrawing a coin you already hold.",
+                self.statechain_id
+            ),
+            ConsentBlocked::ReceivingSlotGone => write!(
+                f,
+                "this wallet decrypted a transfer of statechain id {} but no longer holds the \
+                 receiving slot it was addressed to, so it cannot sign a consent for it. Signing \
+                 with any other key is not consent — it is an invalid signature the coordinator \
+                 would reject.",
+                self.statechain_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConsentUnavailable {}
+
+/// The transfer-instance digest for a pending transfer THIS WALLET DECRYPTED — computed over the
+/// ciphertext actually downloaded from `get_msg_addr`, so the recipient signs over material it has
+/// seen rather than over a coordinator assertion.
+pub fn consent_digest_for(pending: &PendingTransferInfo) -> String {
+    mercurylib::transfer::cancel::transfer_consent_digest(
+        &pending.statechain_id,
+        &pending.recipient_auth_pub_key,
+        &pending.encrypted_transfer_msg,
+    )
+}
+
+/// Pick the pending transfer a consent would be for, or refuse BY NAME.
+///
+/// Pure, so the two refusals that make this primitive safe are testable without a coordinator.
+///
+/// `claimed` is `(statechain_id, auth_pubkey)` for every coin this wallet holds. The already-claimed
+/// test is keyed on the RECEIVING SLOT, not on the coin: in a self-addressed transfer one wallet
+/// holds both legs and the SENDER's coin carries the same statechain id, so matching on the coin
+/// alone would report every self-addressed cancellation as already claimed.
+pub fn select_consent_target<'a>(
+    statechain_id: &str,
+    pending: &'a [PendingTransferInfo],
+    claimed: &[(String, String)],
+) -> std::result::Result<&'a PendingTransferInfo, ConsentUnavailable> {
+    let blocked = |reason| ConsentUnavailable { statechain_id: statechain_id.to_string(), reason };
+
+    // Being addressed to us is established by DECRYPTION, upstream in `peek_pending_transfers` —
+    // the message is in this list only because a private key this wallet holds opened it.
+    let target = pending
+        .iter()
+        .find(|p| p.statechain_id == statechain_id)
+        .ok_or_else(|| blocked(ConsentBlocked::NoPendingTransfer))?;
+
+    if claimed
+        .iter()
+        .any(|(sid, key)| sid == statechain_id && *key == target.recipient_auth_pub_key)
+    {
+        return Err(blocked(ConsentBlocked::AlreadyClaimed));
+    }
+
+    Ok(target)
 }
 
 /// Fetch a single-use auth challenge and sign it with `coin`'s auth key, producing the
@@ -1650,66 +1921,303 @@ pub async fn cancel(
     cancel_with_consent_inner(client_config, wallet_name, statechain_id, &recipient_key, None).await
 }
 
-/// Recipient half of a COOPERATIVE cancellation: mint the single-use consent token.
+// ==============================================================================================
+// WHAT THE RECIPIENT IS SHOWN, AND THEREFORE WHAT IT SIGNS
+//
+// The type below used to be a `pub struct` with every field `pub`, under a docstring claiming
+// "every field here is derived from a message this wallet decrypted". Anyone could write
+// `CancelConsentRequest { amount: 10_000, transfer_digest: <the million-sat coin's>, .. }`, which
+// is the misdirection attack with the loose identifiers merely reshuffled into one object: a
+// number shown to a human, paired with a binding that abandons something else.
+//
+// `mod linked` (tesr.rs:83) and `mod gated` (combine.rs:230) are this repo's precedent, and their
+// reasoning applies unchanged — an encapsulation claim a comment defends is not defended. Every
+// field is private, the type lives in a private module, and the module's only constructor derives
+// ALL of them, INCLUDING the digest, from ONE decrypted message. The fields therefore cannot be
+// made to disagree with one another, which is the entire property a preview needs: the amount on
+// screen and the bytes signed describe the same transfer, or there is no object at all.
+// ==============================================================================================
+mod previewed {
+    use super::PendingTransferInfo;
+
+    /// What a recipient is being asked to abandon — everything a person needs to decide, established
+    /// LOCALLY.
+    ///
+    /// Every field is derived, by [`CancelConsentRequest::from_decrypted`], from a message this
+    /// wallet DECRYPTED with its own key. Nothing in it is asserted by the sender. That is the
+    /// difference between informed consent and a phishing primitive: an API that takes a coin id and
+    /// a key from a counterparty and signs a nonce lets that counterparty describe the transaction
+    /// however it likes ("consent to cancelling the small one") while naming a different one.
+    ///
+    /// # What this deliberately does NOT say
+    ///
+    /// **Whose transfer it is.** `TransferMsg` carries no sender identity — no name, no label, no
+    /// memo — so there is nothing honest to put here. A UI built on this must not invent one. The
+    /// previous owner's `user_public_key` is the only related value on the wire and it is not a
+    /// meaningful answer to "who is asking me to do this".
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CancelConsentRequest {
+        statechain_id: String,
+        recipient_auth_pub_key: String,
+        amount: u64,
+        rgb_consignment: Option<String>,
+        funding_txid: String,
+        funding_vout: u32,
+        transfer_digest: String,
+    }
+
+    impl CancelConsentRequest {
+        /// The ONLY constructor. Takes the decrypted mailbox message and derives every field from
+        /// it — the digest included, so a caller cannot pair one transfer's amount with another
+        /// transfer's binding.
+        pub fn from_decrypted(pending: &PendingTransferInfo) -> Self {
+            Self {
+                statechain_id: pending.statechain_id.clone(),
+                recipient_auth_pub_key: pending.recipient_auth_pub_key.clone(),
+                amount: pending.amount,
+                rgb_consignment: pending.rgb_consignment.clone(),
+                funding_txid: pending.funding_txid.clone(),
+                funding_vout: pending.funding_vout,
+                transfer_digest: super::consent_digest_for(pending),
+            }
+        }
+
+        /// The coin.
+        pub fn statechain_id(&self) -> &str {
+            &self.statechain_id
+        }
+
+        /// The receiving slot the message was addressed to — DERIVED, by decryption, not supplied.
+        pub fn recipient_auth_pub_key(&self) -> &str {
+            &self.recipient_auth_pub_key
+        }
+
+        /// Sats, branch-validated (`PendingTransferInfo::amount`): 0 if the branch fails validation,
+        /// so a hostile sender cannot inflate what the recipient is shown.
+        pub fn amount(&self) -> u64 {
+            self.amount
+        }
+
+        /// The coin's RGB consignment envelope, if it carries a token.
+        pub fn rgb_consignment(&self) -> Option<&str> {
+            self.rgb_consignment.as_deref()
+        }
+
+        /// True if abandoning this transfer abandons an RGB allocation as well as sats. A recipient
+        /// deciding on sats alone would be deciding on the smaller half.
+        pub fn is_coloured(&self) -> bool {
+            self.rgb_consignment.is_some()
+        }
+
+        pub fn funding_txid(&self) -> &str {
+            &self.funding_txid
+        }
+
+        pub fn funding_vout(&self) -> u32 {
+            self.funding_vout
+        }
+
+        /// Claimable material IS posted — necessarily true, since this wallet downloaded and
+        /// decrypted it. Carried explicitly because it is the fact that makes consent NECESSARY (an
+        /// unconveyed transfer the sender can withdraw alone), and a UI should be able to say so.
+        pub fn claimable_material_posted(&self) -> bool {
+            true
+        }
+
+        /// The transfer-instance digest this consent is bound to.
+        pub fn transfer_digest(&self) -> &str {
+            &self.transfer_digest
+        }
+    }
+}
+
+pub use previewed::CancelConsentRequest;
+
+/// Show a recipient what a consent would abandon, WITHOUT signing anything.
 ///
-/// The recipient — normally a different wallet on a different device — signs
-/// `sha256(nonce|"transfer/cancel/recipient")` with the auth key of its receiving slot and hands the
-/// `"<nonce>:<sig>"` token back to the sender out of band. That token authorizes EXACTLY ONE
-/// cancellation: the nonce is single-use, so a sender cannot bank a consent and replay it against a
-/// later transfer to the same key (the reopen-and-replay break `mercurylib::transfer::cancel`'s
-/// module doc describes).
+/// Read-only and side-effect free; safe to call before showing a confirmation prompt. It refuses,
+/// by name, on [`ConsentBlocked::NoPendingTransfer`] and [`ConsentBlocked::AlreadyClaimed`] — the
+/// two reasons a wallet has no standing to consent. [`cancel_consent`] adds exactly one more,
+/// [`ConsentBlocked::ReceivingSlotGone`], for a wallet that stopped holding the slot in between.
 ///
-/// Errors if this wallet does not hold `recipient_auth_pub_key` — there is nothing to sign with, and
-/// signing with any other key produces [`CancelDecision::RecipientSignatureInvalid`], not consent.
-pub async fn cancel_consent(
+/// Note the parameters: a coin id, and nothing else. The recipient key is DERIVED from the message
+/// this wallet could decrypt, never accepted from the sender. Better still, call
+/// [`preview_all_cancellable_consents`] and let the recipient choose from ITS OWN list, so the party
+/// asking for the consent does not get to name the subject at all.
+pub async fn preview_cancel_consent(
     client_config: &ClientConfig,
     wallet_name: &str,
     statechain_id: &str,
-    recipient_auth_pub_key: &str,
-) -> Result<String> {
-    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
-
-    let recipient_coin = wallet
-        .coins
-        .iter()
-        .find(|c| c.auth_pubkey == recipient_auth_pub_key)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "wallet {wallet_name} does not hold the recipient auth key \
-                 {recipient_auth_pub_key}, so it cannot consent to cancelling statechain id \
-                 {statechain_id}"
-            )
-        })?;
-
-    nonce_auth_token(
-        client_config,
-        statechain_id,
-        mercurylib::transfer::cancel::CANCEL_RECIPIENT_ENDPOINT,
-        &recipient_coin,
-    )
-    .await
+) -> Result<CancelConsentRequest> {
+    let target = consent_target_for(client_config, wallet_name, statechain_id).await?;
+    Ok(CancelConsentRequest::from_decrypted(&target))
 }
 
-/// Sender half of a COOPERATIVE cancellation, carrying a consent token obtained out of band from
-/// [`cancel_consent`].
+/// EVERY transfer this wallet could consent to cancelling, described in full.
+///
+/// The strongest answer to the misdirection attack, because the sender names nothing: the recipient
+/// enumerates its own mailbox and picks. A request that describes a small payment has to match an
+/// entry here, and the entry carries the real branch-validated amount.
+///
+/// Transfers this wallet has already claimed are omitted — they are not cancellable, and asking for
+/// one by id yields the typed [`ConsentBlocked::AlreadyClaimed`] refusal.
+pub async fn preview_all_cancellable_consents(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+) -> Result<Vec<CancelConsentRequest>> {
+    let (pending, claimed) = mailbox_and_claimed(client_config, wallet_name).await?;
+    Ok(pending
+        .iter()
+        .filter(|p| {
+            select_consent_target(&p.statechain_id, &pending, &claimed)
+                .is_ok_and(|t| t.recipient_auth_pub_key == p.recipient_auth_pub_key)
+        })
+        .map(CancelConsentRequest::from_decrypted)
+        .collect())
+}
+
+/// This wallet's decrypted mailbox, and the `(statechain_id, auth_pubkey)` of every coin it holds.
+///
+/// A transport failure reaching the mailbox is PROPAGATED, never folded into "no pending transfer":
+/// a coordinator we could not reach has told us nothing, and reporting that as "you are not the
+/// recipient" would talk an honest recipient out of a cancellation they should agree to.
+async fn mailbox_and_claimed(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+) -> Result<(Vec<PendingTransferInfo>, Vec<(String, String)>)> {
+    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+    let pending =
+        crate::transfer_receiver::peek_pending_transfers(client_config, wallet_name).await?;
+    let claimed: Vec<(String, String)> = wallet
+        .coins
+        .iter()
+        .filter_map(|c| c.statechain_id.clone().map(|sid| (sid, c.auth_pubkey.clone())))
+        .collect();
+    Ok((pending, claimed))
+}
+
+/// Locate the transfer a consent would be for.
+async fn consent_target_for(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<PendingTransferInfo> {
+    let (pending, claimed) = mailbox_and_claimed(client_config, wallet_name).await?;
+    Ok(select_consent_target(statechain_id, &pending, &claimed)
+        .map_err(anyhow::Error::new)?
+        .clone())
+}
+
+/// The coin whose auth key signs an APPROVED consent, or a typed refusal.
+///
+/// Pure, so the refusal is testable without a coordinator. The key came from decrypting the message,
+/// so the wallet normally holds its private half — resolve it explicitly rather than assume, and
+/// refuse by name rather than fall back to any other key: signing with the wrong key is not consent,
+/// it is a signature the coordinator rejects after the recipient has already given it.
+fn signing_slot_for<'a>(
+    approved: &CancelConsentRequest,
+    coins: &'a [Coin],
+) -> std::result::Result<&'a Coin, ConsentUnavailable> {
+    coins
+        .iter()
+        .find(|c| c.auth_pubkey == approved.recipient_auth_pub_key())
+        .ok_or_else(|| ConsentUnavailable {
+            statechain_id: approved.statechain_id().to_string(),
+            reason: ConsentBlocked::ReceivingSlotGone,
+        })
+}
+
+/// Recipient half of a COOPERATIVE cancellation: mint the single-use, transfer-bound consent token.
+///
+/// The recipient — normally a different wallet on a different device — signs
+/// `sha256(nonce|"transfer/cancel/recipient|<digest>")` with the auth key of its receiving slot and
+/// hands the resulting [`ConsentToken`] back to the sender out of band.
+///
+/// # It signs an OBJECT, not two identifiers
+///
+/// The only parameter that says WHAT is being abandoned is a [`CancelConsentRequest`], and the only
+/// way to obtain one is [`preview_cancel_consent`] or [`preview_all_cancellable_consents`]. Neither
+/// the coin id nor the recipient key can be supplied here, so a counterparty has nothing to aim.
+/// That is deliberate and it is the shape `mod gated` uses in `combine.rs`: the argument is evidence
+/// that a check ran, and its fields are private so it cannot be assembled to say something the check
+/// never established.
+///
+/// It also means **what was previewed is what is signed**. The digest comes out of the approved
+/// object; this function never looks at the mailbox again. Two independent peeks would let the row
+/// move between the human's decision and the signature — the sender re-addresses, the second peek
+/// sees the replacement, and the recipient signs material it was never shown. If the row HAS moved,
+/// the coordinator refuses the now-superseded consent as
+/// [`CancelDecision::RecipientConsentStale`](mercurylib::transfer::cancel::CancelDecision::RecipientConsentStale),
+/// which is the correct outcome: a refusal, not a signature over the unexpected.
+///
+/// # What it refuses to sign
+///
+/// The preview refuses, by name, when no transfer of that coin is addressed to any key this wallet
+/// holds ([`ConsentBlocked::NoPendingTransfer`]) or this wallet already claimed it
+/// ([`ConsentBlocked::AlreadyClaimed`]); this call adds [`ConsentBlocked::ReceivingSlotGone`] for a
+/// wallet that no longer holds the previewed slot. A consent primitive that signs an opaque nonce is
+/// a phishing tool — show the human the previewed amount first.
+///
+/// # What the token authorizes
+///
+/// EXACTLY ONE cancellation of EXACTLY THIS transfer. The nonce is single-use, and the digest binds
+/// the signature to the mailbox ciphertext currently in the recipient's hands. Both halves are load
+/// bearing: without the digest a sender could take the consent, re-address the coin to the SAME
+/// recipient key (which the coordinator permits, minting a fresh `x1` and destroying the old row),
+/// let the recipient see the replacement in its mailbox and believe it is live, then spend the
+/// consent against the replacement.
+pub async fn cancel_consent(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+    approved: &CancelConsentRequest,
+) -> Result<String> {
+    let wallet = get_wallet(&client_config.pool, wallet_name).await?;
+    let recipient_coin = signing_slot_for(approved, &wallet.coins).map_err(anyhow::Error::new)?;
+
+    let nonce_sig = nonce_auth_token(
+        client_config,
+        approved.statechain_id(),
+        &mercurylib::transfer::cancel::recipient_consent_endpoint(approved.transfer_digest()),
+        recipient_coin,
+    )
+    .await?;
+
+    Ok(ConsentToken {
+        nonce_sig,
+        transfer_digest: approved.transfer_digest().to_string(),
+    }
+    .encode())
+}
+
+/// Sender half of a COOPERATIVE cancellation, carrying a [`ConsentToken`] obtained out of band from
+/// the recipient's [`cancel_consent`].
 ///
 /// This is what makes row 2 of the authorization table reachable ACROSS wallets. It fetches its own
 /// fresh sender nonce — the two legs are bound to different endpoint strings, so neither can stand in
 /// for the other, and the sender leg burned by a previous attempt is never reused.
+///
+/// # Why this is not a `consent: Option<..>` parameter on [`cancel`]
+///
+/// Different clocks and different meanings. [`cancel`] is a DISCOVERY call: it attempts sender-alone
+/// and, on refusal, returns [`CancelNeedsRecipientConsent`] carrying the key to route the request
+/// to — an errand with no deadline. This one is a one-shot against a token whose nonce dies in
+/// minutes. And `Err(CancelNeedsRecipientConsent)` from [`cancel`] is the START of the cooperative
+/// flow, whereas from here it would mean the token you were handed did not work; one function
+/// returning one error type for those two situations would be unreadable.
 pub async fn cancel_with_consent(
     client_config: &ClientConfig,
     wallet_name: &str,
     statechain_id: &str,
     recipient_auth_pub_key: &str,
-    recipient_auth_sig: &str,
+    consent_token: &str,
 ) -> Result<CancelOutcome> {
+    let token = ConsentToken::parse(consent_token)?;
     cancel_with_consent_inner(
         client_config,
         wallet_name,
         statechain_id,
         recipient_auth_pub_key,
-        Some(recipient_auth_sig.to_string()),
+        Some(token),
     )
     .await
 }
@@ -1735,7 +2243,7 @@ async fn post_cancel(
     client_config: &ClientConfig,
     statechain_id: &str,
     sender_coin: &Coin,
-    recipient: Option<(String, String)>,
+    recipient: Option<(String, ConsentToken)>,
 ) -> Result<CancelReply> {
     let client = client_config.get_reqwest_client()?;
     let url = format!("{}/transfer/cancel", client_config.statechain_entity);
@@ -1748,9 +2256,13 @@ async fn post_cancel(
     )
     .await?;
 
-    let (recipient_auth_pub_key, recipient_auth_sig) = match recipient {
-        Some((key, sig)) => (Some(key), Some(sig)),
-        None => (None, None),
+    // The digest travels as its own field: the coordinator RECOMPUTES it from the row and refuses a
+    // mismatch, so this only states which transfer instance the signature claims to be for.
+    let (recipient_auth_pub_key, recipient_auth_sig, recipient_transfer_digest) = match recipient {
+        Some((key, token)) => {
+            (Some(key), Some(token.nonce_sig), Some(token.transfer_digest))
+        }
+        None => (None, None, None),
     };
 
     let payload = mercurylib::transfer::cancel::TransferCancelRequestPayload {
@@ -1758,15 +2270,17 @@ async fn post_cancel(
         auth_sig,
         recipient_auth_sig,
         recipient_auth_pub_key,
+        recipient_transfer_digest,
     };
 
     let response = client.post(&url).json(&payload).send().await?;
+    // The status is read BEFORE the body is consumed: when the body turns out not to be a decision,
+    // the status is half of what the caller has left. See `read_cancel_response` for why an
+    // unreadable body must degrade to the server's own words rather than to a parse error.
+    let http_status = response.status().as_u16();
     let text = response.text().await?;
-    let body: mercurylib::transfer::cancel::TransferCancelResponsePayload =
-        serde_json::from_str(&text)
-            .map_err(|e| anyhow!("could not read the cancel response ({e}): {text}"))?;
 
-    Ok(read_cancel_reply(statechain_id, &body))
+    Ok(read_cancel_response(statechain_id, http_status, &text))
 }
 
 /// Turn a settled reply into the caller's result, applying the local bookkeeping on success.
@@ -1787,6 +2301,38 @@ async fn finish_cancel(
     if let Some(restored) = status_after_cancel(&sender_coin.status) {
         persist_coin_status(client_config, wallet_name, statechain_id, restored).await?;
     }
+
+    // ---- [CANCEL] RECONCILE THE LADDER. -------------------------------------------------------
+    //
+    // The coordinator has released the pending-transfer lock, but the receiver-paying state `S'`
+    // this wallet co-signed is still out there — the recipient may well hold it, which is the entire
+    // reason a POSTED transfer needs their consent to cancel. Cancelling does not un-sign it, and
+    // the enclave's `sig_count` cannot be decremented (every write to it, in the lockbox and in the
+    // SGX twin, is `+ 1`). So the orphan is DISCLOSED instead: `reclaim_cancelled_conveyance`
+    // co-signs one replacement state strictly below it and demotes it into the bundle's
+    // `superseded_states`, where the next receiver's census counts it and the verifier proves it
+    // non-confirmable. Without this the coin could never be claimed by anyone again, and a
+    // replacement recipient would TIE with the cancelled one over the same outpoint.
+    //
+    // ORDER: after the status restore, and after the coordinator applied the cancellation — while a
+    // transfer is open the SE refuses every co-signature of the coin.
+    //
+    // A FAILURE HERE IS REPORTED, NOT SWALLOWED, and it says the cancellation itself succeeded: the
+    // lock is released either way, and the difference is whether the coin can be transferred onward.
+    crate::tesr::reclaim_cancelled_conveyance(client_config, wallet_name, sender_coin)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "the transfer of statechain id {statechain_id} WAS cancelled and the coin is yours \
+                 again, but its exit ladder could not be reconciled afterwards ({e}). The \
+                 receiver-paying state co-signed for the cancelled recipient is still un-disclosed, \
+                 so this coin cannot be transferred onward until the ladder is repaired — the \
+                 receiver would refuse it on the signature census. It remains fully withdrawable \
+                 and unilaterally exitable. Retry the cancellation (the coordinator reports it as \
+                 already cancelled and this step runs again), or re-anchor the coin on-chain with \
+                 refresh."
+            )
+        })?;
 
     if let (Some(txid), Some(vout)) = (sender_coin.utxo_txid.clone(), sender_coin.utxo_vout) {
         let mut wallet = get_wallet(&client_config.pool, wallet_name).await?;
@@ -1809,15 +2355,30 @@ async fn cancel_with_consent_inner(
     wallet_name: &str,
     statechain_id: &str,
     recipient_auth_pub_key: &str,
-    supplied: Option<String>,
+    supplied: Option<ConsentToken>,
 ) -> Result<CancelOutcome> {
     let wallet = get_wallet(&client_config.pool, wallet_name).await?;
     let sender_coin = sender_coin_for_cancel(&wallet, wallet_name, statechain_id)?;
 
-    let recipient_auth_sig = match supplied {
-        Some(sig) => sig,
+    let token = match supplied {
+        Some(token) => token,
+        // Self-addressed: this wallet is both parties, so it mints its own consent through exactly
+        // the same recipient-side path — including the preview's refusals. `recipient_auth_pub_key`
+        // here came from the COORDINATOR's authenticated response, not from a counterparty, which is
+        // why it is safe to cross-check against rather than to sign with.
         None => {
-            cancel_consent(client_config, wallet_name, statechain_id, recipient_auth_pub_key).await?
+            let approved =
+                preview_cancel_consent(client_config, wallet_name, statechain_id).await?;
+            if approved.recipient_auth_pub_key() != recipient_auth_pub_key {
+                return Err(anyhow!(
+                    "the coordinator records {recipient_auth_pub_key} as the recipient of \
+                     statechain id {statechain_id}, but the message this wallet decrypted is \
+                     addressed to {}; refusing to submit a consent for a transfer this wallet \
+                     cannot identify",
+                    approved.recipient_auth_pub_key()
+                ));
+            }
+            ConsentToken::parse(&cancel_consent(client_config, wallet_name, &approved).await?)?
         }
     };
 
@@ -1825,7 +2386,7 @@ async fn cancel_with_consent_inner(
         client_config,
         statechain_id,
         &sender_coin,
-        Some((recipient_auth_pub_key.to_string(), recipient_auth_sig)),
+        Some((recipient_auth_pub_key.to_string(), token)),
     )
     .await?;
 
@@ -2018,6 +2579,216 @@ mod transfer_cancel_client_tests {
         }
     }
 
+    /// The production half of this file — everything before the first `#[cfg(test)]`.
+    fn production_source() -> &'static str {
+        let src = include_str!("transfer_sender.rs");
+        match src.find("\n#[cfg(test)]") {
+            Some(at) => &src[..at + 1],
+            None => src,
+        }
+    }
+
+    // ==========================================================================================
+    // AN ERROR RESPONSE THIS CLIENT CANNOT PARSE MUST STILL CARRY THE SERVER'S WORDS.
+    //
+    // `POST /transfer/cancel` answers a DECISION with `{code, message, recipient_auth_pub_key}`.
+    // Everything that happens BEFORE the decision — a signature that did not verify, a DB fault —
+    // is answered with the coordinator's generic `{"message": "..."}`, which has NO `code` field.
+    // Deserialising every body as a decision therefore converts a well-formed, meaningful refusal
+    // into "could not read the cancel response (missing field `code`)", and the server's actual
+    // sentence never reaches the caller at all.
+    //
+    // That is the silent-degradation shape this repo has a CI guard for, wearing a disguise: the
+    // failure reads as a CLIENT parsing bug, so whoever sees it goes looking in the wrong half of
+    // the system and the coordinator's real reason — which is the only thing that says what to do
+    // next — is discarded on the way past. The rule is therefore absolute and independent of any
+    // server-side change: a body this client cannot read degrades to the server's `message` and
+    // the HTTP status, NEVER to a parse error, and never to a success.
+    // ==========================================================================================
+
+    /// `post_cancel` must route the response through the degrading reader.
+    ///
+    /// Asserted on the source because `post_cancel` is I/O — it needs a live coordinator, which this
+    /// crate's test suite does not have. The BEHAVIOUR of the reader is pinned properly, by calling
+    /// it, in the tests below; this one pins only that the network path actually uses it rather than
+    /// keeping a second, stricter parse of its own.
+    #[test]
+    fn post_cancel_reads_the_response_through_the_degrading_reader() {
+        let src = production_source();
+        let at = src.find("async fn post_cancel(").expect("`post_cancel` must exist");
+        let rest = &src[at..];
+        let body = &rest[..rest.find("\n}\n").expect("`post_cancel` must be terminated")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("read_cancel_response("),
+            "`post_cancel` must hand the HTTP STATUS and the RAW BODY to `read_cancel_response`, \
+             which degrades an unreadable body to the server's own message. Parsing the body as a \
+             decision and propagating the serde error discards the coordinator's refusal.\n---\n{code}\n---"
+        );
+        assert!(
+            !code.contains("could not read the cancel response"),
+            "a body this client cannot parse must not become a parse error: the server's `message` \
+             and status are the answer, and this string is what hid them.\n---\n{code}\n---"
+        );
+        assert!(
+            code.contains("response.status()"),
+            "the HTTP STATUS must be captured before the body is consumed — it is half of what a \
+             caller has left when the body does not parse.\n---\n{code}\n---"
+        );
+    }
+
+    /// THE DEFECT, stated as behaviour. This is the exact body the coordinator's generic auth
+    /// refusal produces, and the exact status it produces it with.
+    #[test]
+    fn a_body_with_only_a_message_surfaces_the_servers_message_and_status() {
+        let reply = read_cancel_response(
+            "sid-1",
+            403,
+            r#"{"message":"Signature does not match authentication key."}"#,
+        );
+
+        let refusal = match reply {
+            CancelReply::Refused(r) => r,
+            other => panic!("a server refusal must be a refusal, got {other:?}"),
+        };
+        assert_eq!(
+            refusal.message, "Signature does not match authentication key.",
+            "the server's own sentence is the answer — it must arrive verbatim, not be replaced by \
+             a serde error about a missing field"
+        );
+        assert_eq!(refusal.code, "http_403", "the HTTP status must survive");
+        assert_eq!(refusal.decision, None, "no rule was named, so none may be claimed");
+        assert!(
+            refusal.to_string().contains("Signature does not match authentication key."),
+            "and it must still be there after the error is formatted: {refusal}"
+        );
+    }
+
+    /// Every OTHER pre-decision answer this endpoint can give has the same shape, so pin them all —
+    /// each one is a sentence that tells the caller what to do next, and each one used to be lost.
+    #[test]
+    fn every_pre_decision_refusal_keeps_its_words() {
+        for (status, body, expected) in [
+            (
+                503u16,
+                r#"{"message":"transfer-state lookup unavailable; refusing to cancel (fail-closed)"}"#,
+                "transfer-state lookup unavailable; refusing to cancel (fail-closed)",
+            ),
+            (
+                503,
+                r#"{"message":"could not record the cancellation; the transfer is unchanged"}"#,
+                "could not record the cancellation; the transfer is unchanged",
+            ),
+            // The two-field shape a few older endpoints use.
+            (
+                500,
+                r#"{"error":"Internal Server Error","message":"Signature does not match authentication key."}"#,
+                "Signature does not match authentication key.",
+            ),
+            // `error` alone still beats falling back to the raw body.
+            (500, r#"{"error":"Internal Server Error"}"#, "Internal Server Error"),
+        ] {
+            match read_cancel_response("sid-1", status, body) {
+                CancelReply::Refused(r) => {
+                    assert_eq!(r.message, expected, "body {body} lost its message");
+                    assert_eq!(r.code, format!("http_{status}"));
+                }
+                other => panic!("{body} must be a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A body that is not JSON at all — a proxy's error page, a truncated response — still has to
+    /// produce something a human can act on, and must still be a REFUSAL.
+    #[test]
+    fn a_body_that_is_not_the_coordinators_json_still_refuses_legibly() {
+        for (status, body) in [
+            (502u16, "<html><body>502 Bad Gateway</body></html>"),
+            (504, ""),
+            (200, "{}"),
+            (200, r#"{"code":42}"#), // right field name, wrong type
+        ] {
+            match read_cancel_response("sid-1", status, body) {
+                CancelReply::Refused(r) => {
+                    assert_eq!(r.code, format!("http_{status}"));
+                    assert!(!r.message.is_empty(), "a refusal must say something");
+                    assert!(
+                        !r.message.contains("missing field"),
+                        "a serde complaint is not an answer: {}",
+                        r.message
+                    );
+                }
+                other => panic!("({status}, {body:?}) must be a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// **A 200 IS NOT A SUCCESS IF THE BODY DOES NOT SAY SO.** This is the direction the fallback
+    /// must never fail in: the pending-transfer lock is the only thing standing between a conveyed
+    /// recipient and a sender who co-signs a rival state, so an answer this client cannot read
+    /// resolves as "still held", exactly like an unknown decision code does.
+    #[test]
+    fn an_unreadable_success_status_is_still_not_a_cancellation() {
+        for status in [200u16, 201, 204] {
+            let reply = read_cancel_response("sid-1", status, "not json at all");
+            assert!(
+                matches!(reply, CancelReply::Refused(_)),
+                "HTTP {status} with an unreadable body must NOT be read as a cancellation: {reply:?}"
+            );
+            assert!(reply.into_result().is_err());
+        }
+    }
+
+    /// A well-formed decision is untouched by the fallback — it still goes through
+    /// `read_cancel_reply`, whatever the HTTP status says. The status is a HINT; the decision code
+    /// is the authority, and the two must not be able to disagree into a success.
+    #[test]
+    fn a_real_decision_is_read_as_a_decision_whatever_the_status_says() {
+        let text = serde_json::to_string(&body(CancelDecision::AlreadyClaimed, None)).unwrap();
+        for status in [410u16, 200, 500] {
+            match read_cancel_response("sid-1", status, &text) {
+                CancelReply::Refused(r) => {
+                    assert_eq!(r.decision, Some(CancelDecision::AlreadyClaimed));
+                    assert_eq!(r.code, CancelDecision::AlreadyClaimed.code());
+                }
+                other => panic!("a decision body must be read as its decision, got {other:?}"),
+            }
+        }
+        // And a genuine `cancelled` decision is still a success.
+        let ok = serde_json::to_string(&body(CancelDecision::Allow, None)).unwrap();
+        assert!(matches!(
+            read_cancel_response("sid-1", 200, &ok),
+            CancelReply::Done(CancelOutcome::Cancelled)
+        ));
+    }
+
+    /// The fallback code can never be mistaken for a rule that fired.
+    #[test]
+    fn the_http_fallback_code_cannot_collide_with_a_decision_code() {
+        for d in [
+            CancelDecision::Allow,
+            CancelDecision::AlreadyCancelled,
+            CancelDecision::NoSuchTransfer,
+            CancelDecision::AlreadyClaimed,
+            CancelDecision::Batched,
+            CancelDecision::ClaimInFlight,
+            CancelDecision::RecipientConsentRequired,
+            CancelDecision::RecipientSignatureInvalid,
+            CancelDecision::RecipientConsentStale,
+        ] {
+            assert!(
+                !d.code().starts_with("http_"),
+                "{} would be indistinguishable from the HTTP fallback",
+                d.code()
+            );
+        }
+    }
+
     /// EXHAUSTIVE. Every `CancelDecision` the coordinator can answer with maps to exactly one
     /// client reading, and the two successes are the ONLY readings that are not an error. A
     /// catch-all that fell through to `Cancelled` would tell a sender its coin is free while the
@@ -2189,5 +2960,591 @@ mod transfer_cancel_client_tests {
             mercurylib::transfer::cancel::CANCEL_SENDER_ENDPOINT,
             mercurylib::transfer::cancel::CANCEL_RECIPIENT_ENDPOINT
         );
+    }
+
+    /// A STALE consent — one the recipient minted for a transfer the sender then re-addressed out
+    /// from under it — must reach the caller as its own named rule.
+    ///
+    /// The distinction is not cosmetic. `RecipientConsentRequired` means "go and get a token";
+    /// `RecipientSignatureInvalid` means "your recipient signed badly". A sender holding a perfectly
+    /// good token for a superseded transfer would act on either of those by re-sending the same
+    /// token, or by accusing an honest recipient. The truthful answer is that the transfer moved.
+    #[test]
+    fn a_stale_consent_is_named_apart_from_missing_and_invalid() {
+        let reply =
+            read_cancel_reply("sid-1", &body(CancelDecision::RecipientConsentStale, None));
+
+        // Not the "go and get a token" reading — the sender already has one.
+        assert!(
+            !matches!(reply, CancelReply::NeedsRecipientConsent(_)),
+            "a stale consent is not a MISSING one: {reply:?}"
+        );
+
+        let err = reply.into_result().unwrap_err();
+        assert!(err.downcast_ref::<CancelNeedsRecipientConsent>().is_none());
+        let refusal = err.downcast_ref::<CancelRefused>().expect("typed refusal");
+        assert_eq!(
+            refusal.decision,
+            Some(CancelDecision::RecipientConsentStale),
+            "this client must RECOGNISE the rule, not fall through to the unknown-code arm — \
+             otherwise a sender cannot tell a re-addressed transfer from a coordinator it has never \
+             met"
+        );
+        assert_ne!(refusal.decision, Some(CancelDecision::RecipientSignatureInvalid));
+        assert!(
+            refusal.to_string().contains("different transfer material"),
+            "the server's verbatim words must survive: {refusal}"
+        );
+    }
+
+    // ==========================================================================================
+    // THE CONSENT TOKEN: one opaque string that carries what it is consent FOR.
+    // ==========================================================================================
+
+    const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn a_consent_token_round_trips_and_carries_its_binding() {
+        let token = ConsentToken { nonce_sig: "nonce-1:abcd".to_string(), transfer_digest: D1.to_string() };
+        let wire = token.encode();
+        let back = ConsentToken::parse(&wire).expect("a token this crate minted must parse");
+        assert_eq!(back.nonce_sig, "nonce-1:abcd");
+        assert_eq!(back.transfer_digest, D1);
+    }
+
+    /// The token is ONE string precisely so a human relaying it out of band cannot separate the
+    /// signature from what it is a signature FOR. A token stripped back to the legacy
+    /// `"<nonce>:<sig>"` shape must be REFUSED, not silently sent as an unbound consent — an unbound
+    /// consent is exactly what the coordinator now treats as stale, and failing here gives the
+    /// caller a comprehensible error instead of a confusing server refusal.
+    #[test]
+    fn a_token_that_carries_no_binding_is_refused_locally() {
+        for stripped in [
+            "nonce-1:abcd",                       // the legacy two-field shape
+            "nonce-1",                            // nonce alone
+            "",                                   // empty
+            "nonce-1:abcd:",                      // present but empty digest
+            "nonce-1::abcd",                      // empty signature
+            ":abcd:1111",                         // empty nonce
+            "nonce-1:abcd:not-a-digest",          // not 64 hex
+            "nonce-1:abcd:1111111111111111111111111111111111111111111111111111111111111zz",
+            "nonce-1:abcd:1111:2222",             // an extra field is not a token this client wrote
+        ] {
+            assert!(
+                ConsentToken::parse(stripped).is_err(),
+                "'{stripped}' must not parse as a bound consent token"
+            );
+        }
+    }
+
+    // ==========================================================================================
+    // WHO MAY MINT A CONSENT — the phishing surface.
+    // ==========================================================================================
+
+    fn pending(sid: &str, key: &str, amount: u64) -> PendingTransferInfo {
+        PendingTransferInfo {
+            statechain_id: sid.to_string(),
+            recipient_auth_pub_key: key.to_string(),
+            encrypted_transfer_msg: format!("ciphertext-for-{sid}-{key}"),
+            amount,
+            rgb_consignment: None,
+            funding_txid: "f".repeat(64),
+            funding_vout: 0,
+            branch_txs: vec![],
+            ladder_census_ok: true,
+        }
+    }
+
+    /// A wallet that is not the recorded recipient CANNOT MINT. The refusal is local and by name:
+    /// this wallet decrypted nothing addressed to it for that coin, so it has no business signing
+    /// anything about it.
+    ///
+    /// This is the property that makes the primitive safe to expose. A sender that names some other
+    /// party's coin gets a refusal here, before any key is touched — rather than a signature this
+    /// wallet had no standing to give.
+    #[test]
+    fn a_wallet_that_is_not_the_recorded_recipient_cannot_mint() {
+        let mine = [pending("sid-mine", "02aaa", 10_000)];
+        let err = select_consent_target("sid-someone-elses", &mine, &[])
+            .expect_err("a coin we hold no pending transfer for must not be consentable");
+        assert_eq!(err.reason, ConsentBlocked::NoPendingTransfer);
+        assert_eq!(err.statechain_id, "sid-someone-elses");
+        assert!(err.to_string().contains("no pending transfer"), "{err}");
+
+        // ... and an EMPTY mailbox is the same refusal, never a silent success.
+        assert_eq!(
+            select_consent_target("sid-mine", &[], &[]).unwrap_err().reason,
+            ConsentBlocked::NoPendingTransfer
+        );
+    }
+
+    /// Consenting to cancel something you have ALREADY TAKEN is a footgun: the coordinator will
+    /// refuse it (`AlreadyClaimed`), but by then the recipient has already signed. Refuse locally,
+    /// by name, before signing.
+    #[test]
+    fn an_already_claimed_transfer_refuses_locally_before_signing() {
+        let mine = [pending("sid-1", "02aaa", 10_000)];
+        // This wallet already booked sid-1 on that very receiving slot: the handover completed.
+        let claimed = [("sid-1".to_string(), "02aaa".to_string())];
+
+        let err = select_consent_target("sid-1", &mine, &claimed)
+            .expect_err("a claimed transfer must not be consentable");
+        assert_eq!(err.reason, ConsentBlocked::AlreadyClaimed);
+        assert!(err.to_string().contains("already claimed"), "{err}");
+    }
+
+    /// The already-claimed check is keyed on the RECEIVING SLOT, not merely on the coin. In a
+    /// self-addressed transfer one wallet holds both legs, and the SENDER's coin carries the same
+    /// statechain id — matching on the coin alone would make every self-addressed cancellation
+    /// report "already claimed" and break the path tb05 exercises.
+    #[test]
+    fn the_claimed_check_is_keyed_on_the_receiving_slot_not_the_coin() {
+        let mine = [pending("sid-1", "02recipient", 10_000)];
+        // The sender leg: same coin, DIFFERENT auth key, held by the same wallet.
+        let claimed = [("sid-1".to_string(), "02sender".to_string())];
+
+        let target = select_consent_target("sid-1", &mine, &claimed)
+            .expect("the sender leg of a self-addressed transfer must not block the consent");
+        assert_eq!(target.recipient_auth_pub_key, "02recipient");
+    }
+
+    /// The right coin is selected out of several, so a preview cannot show one coin's amount while
+    /// consenting to another's.
+    #[test]
+    fn the_named_coin_is_the_one_selected() {
+        let mine = [
+            pending("sid-small", "02aaa", 10_000),
+            pending("sid-big", "02bbb", 1_000_000),
+        ];
+        assert_eq!(select_consent_target("sid-big", &mine, &[]).unwrap().amount, 1_000_000);
+        assert_eq!(select_consent_target("sid-small", &mine, &[]).unwrap().amount, 10_000);
+    }
+
+    /// The digest a recipient signs is derived from the ciphertext it DOWNLOADED, so two transfers
+    /// of the same coin to the same key produce different consents. This is the client half of the
+    /// instance binding; the coordinator half is `mercurylib::transfer::cancel`.
+    #[test]
+    fn the_consent_digest_follows_the_downloaded_ciphertext() {
+        let mut t1 = pending("sid-1", "02aaa", 10_000);
+        let d1 = consent_digest_for(&t1);
+        // The sender re-addresses to the SAME key: fresh x1, so different ciphertext.
+        t1.encrypted_transfer_msg = "a-freshly-blinded-replacement".to_string();
+        let d2 = consent_digest_for(&t1);
+        assert_ne!(d1, d2, "a re-addressed transfer must not inherit the old consent's digest");
+        assert_eq!(d1.len(), 64);
+    }
+
+    /// A success ALWAYS restores the coin, and a refusal NEVER does.
+    ///
+    /// Both halves are failure modes. Not restoring after a success strands the coin: it stays
+    /// IN_TRANSFER, which hides it from selection and from `defend_ladders` forever — the coin is on
+    /// chain and safe, but the wallet will not spend it, and nothing surfaces the problem. Restoring
+    /// after a refusal is worse: the coordinator still holds the pending-transfer lock, so the
+    /// wallet would offer a coin it cannot co-sign.
+    #[test]
+    fn a_success_always_restores_the_coin_and_a_refusal_never_does() {
+        use CancelDecision::*;
+        for d in [
+            Allow,
+            AlreadyCancelled,
+            NoSuchTransfer,
+            AlreadyClaimed,
+            Batched,
+            ClaimInFlight,
+            RecipientConsentRequired,
+            RecipientSignatureInvalid,
+            RecipientConsentStale,
+        ] {
+            let is_success = read_cancel_reply("sid-1", &body(d, None)).into_result().is_ok();
+            assert_eq!(
+                is_success,
+                matches!(d, Allow | AlreadyCancelled),
+                "{d:?} is on the wrong side of the success boundary"
+            );
+            if is_success {
+                assert_eq!(
+                    status_after_cancel(&CoinStatus::IN_TRANSFER),
+                    Some(CoinStatus::CONFIRMED),
+                    "{d:?} released the lock, so the coin must become spendable again"
+                );
+            }
+        }
+    }
+
+    /// **THE ORDERING, asserted on the source itself.**
+    ///
+    /// `finish_cancel` must consume the reply through `into_result()?` BEFORE it touches the coin's
+    /// status. That single `?` is the entire reason a refusal cannot resurrect a still-locked coin,
+    /// and it is one line-reorder away from being wrong in a way no unit test on either piece would
+    /// notice — both `read_cancel_reply` and `status_after_cancel` stay green while the composition
+    /// silently unlocks coins the coordinator never released.
+    #[test]
+    fn the_status_restore_is_gated_behind_the_reply_check() {
+        const SIGNATURE: &str = "async fn finish_cancel(";
+        let src = include_str!("transfer_sender.rs");
+        let start = src.find(SIGNATURE).expect("finish_cancel must exist");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").expect("finish_cancel must be terminated")];
+
+        let gate = body.find("into_result()?").expect(
+            "finish_cancel must consume the reply with `into_result()?` — a refusal has to become an \
+             error BEFORE any local bookkeeping runs",
+        );
+        let restore = body
+            .find("persist_coin_status")
+            .expect("finish_cancel must restore the coin status on success");
+        assert!(
+            gate < restore,
+            "`into_result()?` must come BEFORE `persist_coin_status`, otherwise a REFUSED \
+             cancellation would mark a still-locked coin spendable.\n---\n{body}\n---"
+        );
+        assert_eq!(
+            body.matches("persist_coin_status").count(),
+            1,
+            "exactly one restore path, so the gate above covers all of them"
+        );
+    }
+
+    /// Every `CancelDecision` maps to exactly one reading, and only the two successes are successes.
+    /// A future decision landing in the success bucket is the silent-degradation shape this repo
+    /// guards against, so the mapping is asserted exhaustively rather than case by case.
+    #[test]
+    fn every_decision_maps_to_a_distinct_reading_and_only_two_are_successes() {
+        use CancelDecision::*;
+        let all = [
+            Allow,
+            AlreadyCancelled,
+            NoSuchTransfer,
+            AlreadyClaimed,
+            Batched,
+            ClaimInFlight,
+            RecipientConsentRequired,
+            RecipientSignatureInvalid,
+            RecipientConsentStale,
+        ];
+        let mut successes = 0usize;
+        for d in all {
+            let reply = read_cancel_reply("sid-1", &body(d, None));
+            match (&reply, d) {
+                (CancelReply::Done(CancelOutcome::Cancelled), Allow) => successes += 1,
+                (CancelReply::Done(CancelOutcome::AlreadyCancelled), AlreadyCancelled) => {
+                    successes += 1
+                }
+                (CancelReply::NeedsRecipientConsent(_), RecipientConsentRequired) => {}
+                (CancelReply::Refused(r), other) => {
+                    assert_eq!(
+                        r.decision,
+                        Some(other),
+                        "{other:?} must be recognised by name, not fall through as unknown"
+                    );
+                }
+                (reply, other) => panic!("{other:?} read as {reply:?}"),
+            }
+        }
+        assert_eq!(successes, 2, "exactly Allow and AlreadyCancelled release the lock");
+    }
+
+    // ==========================================================================================
+    // THE RECIPIENT SIGNS WHAT IT WAS SHOWN — the last of the blind-signing surface.
+    //
+    // Taking the recipient key out of `cancel_consent`'s parameters removed the sender's ability
+    // to AIM a consent. It did not make the preview and the signature the same act. Those two
+    // assertions below are what closes the remaining gap, and both of them are about SOURCE SHAPE
+    // rather than about a value returned at runtime — stated plainly, because both concern
+    // properties no value can exhibit:
+    //
+    //   * "this type cannot be constructed elsewhere" is a compile-time fact, and Rust has no
+    //     built-in compile-fail test (`combine.rs`'s
+    //     `a_combine_plan_cannot_be_built_outside_its_validating_constructor` says the same thing
+    //     at length, and this is the same device applied to the same shape); and
+    //   * "the bytes signed are the bytes previewed" is a property of a function whose every other
+    //     step is a network call. This file already pins one composition this way
+    //     (`the_status_restore_is_gated_behind_the_reply_check`), for the same reason: the pieces
+    //     stay green while the composition goes wrong.
+    // ==========================================================================================
+
+    /// Everything before the first top-level `#[cfg(test)]` — the production half of this file, so
+    /// the string literals in this very module cannot satisfy the assertions below.
+    fn production_half() -> &'static str {
+        let src = include_str!("transfer_sender.rs");
+        match src.find("\n#[cfg(test)]") {
+            Some(at) => &src[..at + 1],
+            None => src,
+        }
+    }
+
+    /// The `mod previewed { … }` span, by brace counting from its opening line.
+    fn previewed_span(src: &str) -> (usize, usize) {
+        let at = src.find("\nmod previewed {").expect(
+            "the previewed-transfer type must live in a PRIVATE module — `mod linked` (tesr.rs:83) \
+             and `mod gated` (combine.rs:230) are this repo's precedent for making an encapsulation \
+             claim a compile error instead of a docstring",
+        );
+        let open = at + src[at..].find('{').expect("the module opens");
+        let mut depth = 0usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (at, open + i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`mod previewed` never closes");
+    }
+
+    /// **THE DOCSTRING'S CLAIM, MADE TRUE.** `CancelConsentRequest` says "Every field here is
+    /// derived from a message this wallet DECRYPTED with its own key. Nothing in it is asserted by
+    /// the sender" — while being a `pub struct` with every field `pub`. Anyone can write
+    /// `CancelConsentRequest { amount: 10_000, transfer_digest: <the 1M coin's>, .. }`, which is
+    /// the misdirection attack restated: an amount shown to a human paired with a digest that
+    /// abandons something else. A claim that holds only while nobody writes the obvious literal is
+    /// not a claim.
+    ///
+    /// The fix is `combine.rs`'s, verbatim: private fields inside a private module whose only
+    /// export is the constructor that derives EVERY field — the amount, the coin, the colour and
+    /// the digest — from ONE decrypted message. The fields then cannot be made to disagree with
+    /// each other, which is the whole property a preview needs to have.
+    #[test]
+    fn a_previewed_consent_cannot_be_assembled_field_by_field() {
+        let src = production_half();
+        let (start, end) = previewed_span(src);
+        let previewed = &src[start..end];
+
+        // 1. The type is DECLARED inside the module…
+        assert!(
+            previewed.contains("struct CancelConsentRequest {"),
+            "`CancelConsentRequest` must be declared inside `mod previewed`"
+        );
+
+        // 2. …with no `pub` field. One `pub` field would not on its own permit a literal, but it is
+        //    the first step back to one, and the accessors give reads without giving construction.
+        let at = previewed.find("pub struct CancelConsentRequest {").expect("declared");
+        let decl =
+            &previewed[at..at + previewed[at..].find("\n    }\n").expect("the struct closes")];
+        for line in decl.lines().skip(1) {
+            assert!(
+                !line.trim_start().starts_with("pub "),
+                "`CancelConsentRequest` must keep every field PRIVATE — `{}` re-opens the struct \
+                 literal, and with it the ability to pair one transfer's amount with another \
+                 transfer's digest",
+                line.trim()
+            );
+        }
+
+        // 3. …and no struct literal exists anywhere OUTSIDE the module. This is the assertion that
+        //    fires if somebody moves the type back to file scope or exports a raw constructor.
+        let outside: String = format!("{}{}", &src[..start], &src[end..])
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !outside.contains("CancelConsentRequest {"),
+            "a `CancelConsentRequest {{ … }}` literal outside `mod previewed` is a preview nobody \
+             previewed"
+        );
+
+        // 4. The deriving constructor lives inside the module too, so it cannot be called with a
+        //    hand-built set of fields from anywhere else in this file.
+        assert!(
+            previewed.contains("fn from_decrypted("),
+            "the ONLY constructor must live INSIDE `mod previewed` and take the decrypted message, \
+             so every field is derived from the same material"
+        );
+    }
+
+    /// **WHAT WAS PREVIEWED IS WHAT IS SIGNED.**
+    ///
+    /// `preview_cancel_consent` and `cancel_consent` used to be two independent peeks at the
+    /// coordinator's mailbox: the preview showed a human one transfer's amount, and the signing
+    /// call then went back to the network, re-derived a digest from whatever the mailbox held by
+    /// then, and signed THAT. Nothing linked the two. A sender that can move the row between the
+    /// two calls — the batched-then-non-batched ordering the re-address guard does not cover is one
+    /// way — gets a signature over material the recipient was never shown, which is the
+    /// blind-signing defect with the coordinator's row in place of the sender's out-of-band key.
+    ///
+    /// So `cancel_consent` must take the APPROVED OBJECT and sign the digest carried in it. Asserted
+    /// on the source because the only thing left in the function is a network call: the assertion is
+    /// that the function has no second source of truth to drift towards.
+    #[test]
+    fn the_consent_signs_the_previewed_object_and_never_re_derives_it() {
+        let src = production_half();
+        let at = src
+            .find("pub async fn cancel_consent(")
+            .expect("`cancel_consent` must exist");
+        let rest = &src[at..];
+        let body = &rest[..rest.find("\n}\n").expect("`cancel_consent` must be terminated")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("approved: &CancelConsentRequest"),
+            "`cancel_consent` must take the PREVIEWED OBJECT, not a bare coin id it re-resolves \
+             itself — a recipient consents to a transfer it was shown, and an id is not a \
+             transfer.\n---\n{code}\n---"
+        );
+        for re_derivation in ["peek_pending_transfers", "consent_target_for", "consent_digest_for"]
+        {
+            assert!(
+                !code.contains(re_derivation),
+                "`cancel_consent` must not reach for `{re_derivation}`: a second look at the \
+                 mailbox is a second transfer, and the one it would sign is not the one the human \
+                 approved.\n---\n{code}\n---"
+            );
+        }
+        assert!(
+            code.contains("approved.transfer_digest()"),
+            "the digest signed must come OUT OF the approved object.\n---\n{code}\n---"
+        );
+    }
+
+    /// The third local refusal, TYPED like the other two.
+    ///
+    /// A wallet can hold a preview whose receiving slot it no longer has — a restore from an older
+    /// backup, a coin pruned between the two calls. Signing is then impossible, and the answer must
+    /// be a name a caller can match on rather than prose, exactly as `NoPendingTransfer` and
+    /// `AlreadyClaimed` are. An untyped `anyhow!` here is the one refusal in this family a UI would
+    /// have to string-match.
+    #[test]
+    fn the_missing_receiving_slot_refusal_is_typed_like_the_others() {
+        let src = production_half();
+        assert!(
+            src.contains("ReceivingSlotGone"),
+            "the 'this wallet no longer holds that receiving slot' case must be a named \
+             `ConsentBlocked` variant, not a bare `anyhow!`"
+        );
+        let at = src.find("fn signing_slot_for").expect(
+            "the slot lookup must be a PURE function taking the approved object and the wallet's \
+             coins, so its refusal is testable without a coordinator",
+        );
+        let sig = &src[at..at + src[at..].find(" {").expect("the signature ends")];
+        assert!(
+            sig.contains("ConsentUnavailable"),
+            "`signing_slot_for` must refuse with the same typed error as the other two \
+             refusals: {sig}"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // BEHAVIOUR on the surface the three assertions above forced into existence. Written after the
+    // fix and green on their first run — stated plainly, because they did not drive it. What they
+    // do is stop it silently rotting: the census pins the SHAPE, these pin what the shape is for.
+    // ------------------------------------------------------------------------------------------
+
+    fn coin_with_auth(auth_pubkey: &str) -> Coin {
+        Coin {
+            index: 0,
+            user_privkey: String::new(),
+            user_pubkey: String::new(),
+            auth_privkey: String::new(),
+            auth_pubkey: auth_pubkey.to_string(),
+            derivation_path: String::new(),
+            fingerprint: String::new(),
+            address: String::new(),
+            backup_address: String::new(),
+            server_pubkey: None,
+            aggregated_pubkey: None,
+            aggregated_address: None,
+            utxo_txid: None,
+            utxo_vout: None,
+            amount: None,
+            statechain_id: None,
+            signed_statechain_id: None,
+            locktime: None,
+            secret_nonce: None,
+            public_nonce: None,
+            blinding_factor: None,
+            server_public_nonce: None,
+            tx_cpfp: None,
+            tx_withdraw: None,
+            withdrawal_address: None,
+            status: CoinStatus::CONFIRMED,
+            duplicate_index: 0,
+            single_use: false,
+            epoch_deadline: None,
+        }
+    }
+
+    /// **THE MISDIRECTION ATTACK, ON THE OBJECT.** Bob is receiving a 10k coin on one slot and a 1M
+    /// coin on another. Alice describes the small one. Whatever coin id reaches the preview, the
+    /// object that comes back describes THAT coin truthfully — its own branch-validated amount, its
+    /// own receiving key, its own digest — and every one of those fields comes from the same
+    /// decrypted message. There is no arrangement of the API in which the amount shown belongs to
+    /// one transfer and the binding to another.
+    #[test]
+    fn a_preview_cannot_show_one_transfers_amount_while_binding_anothers() {
+        let small = CancelConsentRequest::from_decrypted(&pending("sid-small", "02aaa", 10_000));
+        let big = CancelConsentRequest::from_decrypted(&pending("sid-big", "02bbb", 1_000_000));
+
+        assert_eq!(small.amount(), 10_000);
+        assert_eq!(big.amount(), 1_000_000);
+        assert_eq!(small.recipient_auth_pub_key(), "02aaa");
+        assert_ne!(
+            small.transfer_digest(),
+            big.transfer_digest(),
+            "two transfers must not share a binding, or one consent would release either"
+        );
+        // The digest is a function of the SAME message the amount came from — recomputing it from
+        // the small transfer's material must reproduce the small object's binding and nothing else.
+        assert_eq!(
+            small.transfer_digest(),
+            consent_digest_for(&pending("sid-small", "02aaa", 10_000)),
+            "the binding must be derivable from the material the recipient decrypted"
+        );
+    }
+
+    /// A recipient that no longer holds the previewed receiving slot must be told so BY NAME, and
+    /// must not fall back to any other key it happens to have. Signing with the wrong key is not a
+    /// weaker consent — it is a signature the coordinator rejects, given away for nothing.
+    #[test]
+    fn a_missing_receiving_slot_refuses_by_name_rather_than_signing_with_another_key() {
+        let approved = CancelConsentRequest::from_decrypted(&pending("sid-1", "02aaa", 10_000));
+        // The wallet holds a DIFFERENT slot — the tempting fallback.
+        let coins = [coin_with_auth("02bbb")];
+
+        let err = signing_slot_for(&approved, &coins)
+            .expect_err("a slot this wallet does not hold must not resolve to another one");
+        assert_eq!(err.reason, ConsentBlocked::ReceivingSlotGone);
+        assert_eq!(err.statechain_id, "sid-1");
+        assert!(err.to_string().contains("no longer holds"), "{err}");
+
+        // …and the right slot resolves to exactly that coin.
+        let coins = [coin_with_auth("02bbb"), coin_with_auth("02aaa")];
+        assert_eq!(signing_slot_for(&approved, &coins).unwrap().auth_pubkey, "02aaa");
+    }
+
+    /// The colour is part of what is being abandoned. A recipient shown sats alone, for a coin
+    /// carrying an RGB allocation, has been shown the smaller half of the decision.
+    #[test]
+    fn the_preview_says_whether_an_rgb_allocation_is_being_abandoned_too() {
+        let plain = CancelConsentRequest::from_decrypted(&pending("sid-1", "02aaa", 10_000));
+        assert!(!plain.is_coloured());
+        assert_eq!(plain.rgb_consignment(), None);
+
+        let mut with_token = pending("sid-2", "02bbb", 10_000);
+        with_token.rgb_consignment = Some("consignment-bytes".to_string());
+        let coloured = CancelConsentRequest::from_decrypted(&with_token);
+        assert!(coloured.is_coloured(), "a token carrier must not preview as a plain sat payment");
+        assert_eq!(coloured.rgb_consignment(), Some("consignment-bytes"));
+    }
+
+    /// Claimable material is ALWAYS posted for anything previewable: the object exists only because
+    /// this wallet downloaded and decrypted the message. That is the fact which makes the
+    /// recipient's consent necessary rather than optional, so it is stated rather than inferred.
+    #[test]
+    fn everything_previewable_has_claimable_material_posted() {
+        let p = CancelConsentRequest::from_decrypted(&pending("sid-1", "02aaa", 10_000));
+        assert!(p.claimable_material_posted());
+        assert_eq!(p.statechain_id(), "sid-1");
+        assert_eq!(p.funding_txid(), "f".repeat(64));
+        assert_eq!(p.funding_vout(), 0);
     }
 }

@@ -22,11 +22,24 @@ pub const CLAIM_LATCH_SECS: i64 = 120;
 /// `mercurylib::transfer::cancel::decide_transfer_cancel` consumes.
 pub struct TransferRowForCancel {
     pub recipient_auth_pub_key: PublicKey,
+    /// The auth key that OPENED this transfer (migration 0011), i.e. the coin's auth key at the
+    /// moment `insert_new_transfer` wrote the row. This — not the coin's LIVE key — is what
+    /// `transfer_cancel` verifies the sender leg against, because claiming rotates the live key to
+    /// the recipient's and would otherwise lock the sender out of an answer about its own transfer.
+    ///
+    /// `None` for a row written before 0011. The endpoint then falls back to the live-key check,
+    /// which is exactly the pre-0011 behaviour — never anything weaker.
+    pub sender_auth_pub_key: Option<secp256k1_zkp::XOnlyPublicKey>,
     pub key_updated: bool,
     pub cancelled: bool,
     pub batched: bool,
     pub message_posted: bool,
     pub claim_in_flight: bool,
+    /// The conveyed mailbox ciphertext, HEX-ENCODED exactly as `get_msg_addr` serves it
+    /// (`server/src/database/transfer_receiver.rs` does `hex::encode` on the same `bytea`), so the
+    /// digest the coordinator recomputes is over the identical bytes the recipient downloaded and
+    /// signed. `None` when nothing has been conveyed.
+    pub encrypted_transfer_msg: Option<String>,
 }
 
 /// Read the transfer row for `statechain_id`, or `None` if there is none.
@@ -40,7 +53,9 @@ pub async fn get_transfer_for_cancel(
     let row = sqlx::query(
         "SELECT new_user_auth_public_key, key_updated, cancelled_at, batch_id, \
                 encrypted_transfer_msg IS NOT NULL AS message_posted, \
-                (claim_started_at IS NOT NULL AND claim_started_at > NOW() - make_interval(secs => $2::int)) AS claim_in_flight \
+                (claim_started_at IS NOT NULL AND claim_started_at > NOW() - make_interval(secs => $2::int)) AS claim_in_flight, \
+                encrypted_transfer_msg, \
+                sender_auth_xonly_public_key \
          FROM statechain_transfer WHERE statechain_id = $1",
     )
     .bind(statechain_id)
@@ -67,14 +82,33 @@ pub async fn get_transfer_for_cancel(
     let batch_id: Option<String> = row.try_get(3).unwrap_or(None);
     let message_posted: Option<bool> = row.try_get(4).unwrap_or(Some(false));
     let claim_in_flight: Option<bool> = row.try_get(5).unwrap_or(Some(false));
+    // An unreadable ciphertext column stays `None`, which the consent binding treats as STALE — a
+    // row whose conveyed material we cannot hash is a row we cannot bind a consent to, and failing
+    // closed there is the same rule the rest of this module follows.
+    let encrypted_transfer_msg: Option<String> = row
+        .try_get::<Option<Vec<u8>>, _>(6)
+        .ok()
+        .flatten()
+        .map(hex::encode);
+
+    // The opener key (migration 0011). An unreadable or absent value stays `None`, which the
+    // endpoint treats as "fall back to the coin's live key" — the pre-0011 check, never a skipped
+    // one. Never panics the worker on a malformed column.
+    let sender_auth_pub_key: Option<secp256k1_zkp::XOnlyPublicKey> = row
+        .try_get::<Option<Vec<u8>>, _>(7)
+        .ok()
+        .flatten()
+        .and_then(|b| secp256k1_zkp::XOnlyPublicKey::from_slice(&b).ok());
 
     Ok(Some(TransferRowForCancel {
         recipient_auth_pub_key,
+        sender_auth_pub_key,
         key_updated: key_updated.unwrap_or(false),
         cancelled: cancelled_at.is_some(),
         batched: batch_id.is_some(),
         message_posted: message_posted.unwrap_or(false),
         claim_in_flight: claim_in_flight.unwrap_or(false),
+        encrypted_transfer_msg,
     }))
 }
 

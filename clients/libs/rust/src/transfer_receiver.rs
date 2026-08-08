@@ -380,7 +380,18 @@ async fn get_msg_addr(auth_pubkey: &str, client_config: &ClientConfig) -> Result
     let client = client_config.get_reqwest_client()?;
     let request = client.get(&format!("{}/{}", client_config.statechain_entity, path));
 
-    let value = request.send().await?.text().await?;
+    let http = request.send().await?;
+    // Status BEFORE body. `get_msg_addr` answers an unreadable key with a 500 and
+    // `{"error": …, "message": "Invalid authentication public key"}`; parsing that as a
+    // `GetMsgAddrResponsePayload` reported "missing field `list_enc_transfer_msg`", which reads as a
+    // client bug and hides the coordinator's actual complaint. This call is on the RECEIVE polling
+    // path, so a refusal it cannot name is a wallet that looks idle while it is in fact being
+    // refused — the silent-degradation shape this repo has a CI guard for. See `server_refusal`.
+    let status = http.status().as_u16();
+    let value = http.text().await?;
+    if !(200..300).contains(&status) {
+        return Err(crate::utils::server_refusal("transfer/get_msg_addr", status, &value));
+    }
 
     let response: mercurylib::transfer::receiver::GetMsgAddrResponsePayload = serde_json::from_str(value.as_str())?;
 
@@ -398,6 +409,20 @@ async fn get_msg_addr(auth_pubkey: &str, client_config: &ClientConfig) -> Result
 #[derive(Clone, Debug)]
 pub struct PendingTransferInfo {
     pub statechain_id: String,
+    /// The auth public key of OUR receiving slot that this message was addressed to — derived from
+    /// the fact that its private key decrypted the message, never asserted by the sender.
+    ///
+    /// A consent primitive must not accept this key from a counterparty (that is the phishing
+    /// surface: a sender that names a coin and a key it chose can steer a recipient into signing
+    /// away something other than what it described). Carrying it here is what lets the recipient
+    /// establish it locally instead.
+    pub recipient_auth_pub_key: String,
+    /// The mailbox ciphertext EXACTLY as downloaded from `GET /transfer/get_msg_addr` (hex).
+    ///
+    /// This is the only transfer-INSTANCE identity a recipient can bind a signature to: its `t1` is
+    /// blinded against the row's server-random `x1`, so re-addressing the same coin to the same key
+    /// necessarily changes these bytes. See `mercurylib::transfer::cancel::transfer_consent_digest`.
+    pub encrypted_transfer_msg: String,
     /// Sats funding this coin, **branch-validated** (audit [3]): 0 if the branch fails validation,
     /// so a value gate cannot be tricked by an attacker-inflated un-broadcast leaf.
     pub amount: u64,
@@ -936,6 +961,8 @@ pub async fn peek_pending_transfers(
             let amount = child_amount.unwrap_or(amount);
             out.push(PendingTransferInfo {
                 statechain_id: transfer_msg.statechain_id,
+                recipient_auth_pub_key: auth_pubkey.clone(),
+                encrypted_transfer_msg: enc_message.clone(),
                 amount,
                 rgb_consignment,
                 funding_txid,

@@ -1,0 +1,37 @@
+-- Record WHO OPENED a transfer, so a sender stays authenticated to its own transfer after that
+-- transfer has been claimed.
+--
+-- THE DEFECT. `POST /transfer/cancel` verified the sender's signature against the COIN's live auth
+-- key. Claiming ROTATES that key: `update_statechain` sets `statechain_data.auth_xonly_public_key`
+-- to the RECIPIENT's key in the same transaction that sets `key_updated = true`. So the moment a
+-- recipient claimed, the sender's signature stopped matching, and a sender asking about its own
+-- transfer received the generic "Signature does not match authentication key." instead of an answer.
+-- `CancelDecision::AlreadyClaimed` (410) — row 3 of the four-row authorization table in
+-- lib/src/transfer/cancel.rs, and the row the whole "a completed payment is never withdrawable"
+-- rule is written around — could therefore never fire for the ordinary case it exists to describe.
+--
+-- THE FIX, and why it is not a loosening. The sender leg is now verified against the key that opened
+-- the transfer, recorded here at `insert_new_transfer` time. Cancellation RELEASES the
+-- pending-transfer lock, which is the only thing standing between a conveyed-but-unclaimed recipient
+-- and a sender who co-signs a rival state, so nothing about it may become more permissive. It does
+-- not:
+--
+--   * a cancellation releases the lock only on `CancelDecision::Allow`;
+--   * `decide_transfer_cancel` returns `Allow` only when `key_updated = false`;
+--   * the coin's auth key rotates in exactly one place, `update_statechain`, which sets
+--     `auth_xonly_public_key` and `key_updated = true` in ONE transaction;
+--   * so `key_updated = false` implies the coin's live key has not moved since the row was opened,
+--     i.e. the key recorded here IS the live key whenever a lock-releasing decision is possible.
+--
+-- A superseded key can therefore only ever reach a decision that REFUSES — `AlreadyClaimed`, which
+-- is precisely the answer this migration exists to make reachable.
+--
+-- NULLABLE, and it stays nullable. Rows written before this migration have no recorded opener, and
+-- the endpoint falls back to the coin's live key for them — exactly the pre-0011 behaviour, never
+-- weaker. A NULL here is "we do not know who opened this", which is a reason to fall back to the old
+-- check, never a reason to skip one.
+--
+-- No enclave change: this is coordinator bookkeeping. The SE is never told a transfer exists.
+
+ALTER TABLE public.statechain_transfer
+    ADD COLUMN IF NOT EXISTS sender_auth_xonly_public_key bytea NULL;

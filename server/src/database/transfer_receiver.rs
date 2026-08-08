@@ -341,3 +341,129 @@ pub async fn update_unlock_transfer(pool: &sqlx::PgPool, is_current_owner: bool,
 
     Ok(())
 }
+
+// ==================================================================================================
+// THE PREMISE THE CANCEL ENDPOINT'S SENDER-AUTH ORDERING RESTS ON.
+//
+// `POST /transfer/cancel` authenticates the sender leg against the key that OPENED the transfer
+// (`statechain_transfer.sender_auth_xonly_public_key`, migration 0011) rather than against the
+// coin's LIVE auth key, because `update_statechain` below ROTATES that live key to the recipient's
+// when a claim completes — which used to leave a sender unable to authenticate about its own
+// transfer and made `CancelDecision::AlreadyClaimed` unreachable.
+//
+// That is only as strict as the live-key check because of THIS function's shape:
+//
+//     the key rotation and `key_updated = true` happen in ONE transaction.
+//
+// Given that, `key_updated = false` implies the live key has not moved since the row was opened, so
+// the recorded opener IS the live key wherever a lock-releasing decision is possible
+// (`mercurylib::transfer::cancel::every_lock_releasing_decision_requires_an_unclaimed_row` pins the
+// other half). Split the two statements apart — commit the key rotation before the flag, say — and
+// there is a window in which the coin's key has moved while `key_updated` still reads false, i.e. a
+// window in which a SUPERSEDED key could reach a lock-RELEASING decision. That is the one way this
+// ordering becomes more permissive, so it is pinned here, at the site that would cause it.
+//
+// Asserted on the source: `update_statechain` takes a live `sqlx::PgPool` and this repository has no
+// test database, which is the same reason `endpoints::transfer_sender`'s consent-binding pin is
+// written this way. Stated plainly rather than dressed up as a behavioural test.
+// ==================================================================================================
+#[cfg(test)]
+mod claim_rotation_atomicity_tests {
+    fn update_statechain_body() -> &'static str {
+        const SIGNATURE: &str = "pub async fn update_statechain(";
+        let src = include_str!("transfer_receiver.rs");
+        let start = src.find(SIGNATURE).expect("`update_statechain` must exist");
+        let rest = &src[start..];
+        &rest[..rest.find("\n}\n").expect("`update_statechain` must be terminated")]
+    }
+
+    fn code_only(body: &str) -> String {
+        body.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn check_rotation_is_atomic(body: &str) -> Result<(), String> {
+        let code = code_only(body);
+
+        let begin = code.find("pool.begin()").ok_or(
+            "the claim's two writes must run inside ONE transaction — `pool.begin()` is missing",
+        )?;
+        let rotate = code
+            .find("SET auth_xonly_public_key")
+            .ok_or("the key rotation must happen here")?;
+        let flag = code
+            .find("SET key_updated = true")
+            .ok_or("the claim flag must be set here")?;
+        let commit = code
+            .find("commit()")
+            .ok_or("the transaction must be committed")?;
+
+        if !(begin < rotate && begin < flag) {
+            return Err("both writes must be issued AFTER `pool.begin()`".to_string());
+        }
+        if !(rotate < commit && flag < commit) {
+            return Err("both writes must be issued BEFORE `commit()`: a rotation that lands \
+                        without the claim flag opens a window in which a SUPERSEDED auth key could \
+                        reach a lock-RELEASING cancel decision"
+                .to_string());
+        }
+        // Two separate commits would defeat the point even with both writes present.
+        let commits = code.matches("commit()").count();
+        if commits != 1 {
+            return Err(format!(
+                "the claim must commit exactly ONCE, found {commits}: two commits is two windows"
+            ));
+        }
+        Ok(())
+    }
+
+    /// **THE PIN.**
+    #[test]
+    fn the_key_rotation_and_the_claim_flag_are_one_transaction() {
+        if let Err(why) = check_rotation_is_atomic(update_statechain_body()) {
+            panic!(
+                "a claim's key rotation and its `key_updated` flag are no longer atomic, which is \
+                 the premise `transfer_cancel`'s sender-auth ordering depends on: {why}"
+            );
+        }
+    }
+
+    /// **THE PIN'S OWN TEST.** A pin that has stopped discriminating reports green.
+    #[test]
+    fn the_atomicity_pin_rejects_a_split_claim() {
+        let real = update_statechain_body();
+        assert!(check_rotation_is_atomic(real).is_ok(), "precondition: the real body passes");
+
+        // The rotation committed on its own, ahead of the flag.
+        let split = real.replacen(
+            "let query = \"UPDATE statechain_transfer \\\n        SET key_updated = true",
+            "transaction.commit().await.unwrap();\n    let query = \"UPDATE statechain_transfer \\\n        SET key_updated = true",
+            1,
+        );
+        assert_ne!(split, real, "the fixture must actually differ from the real body");
+        assert!(
+            check_rotation_is_atomic(&split).is_err(),
+            "an early commit between the two writes must be rejected"
+        );
+
+        // No transaction at all.
+        let no_tx = real.replace("pool.begin()", "no_transaction_at_all()");
+        assert!(check_rotation_is_atomic(&no_tx).is_err());
+
+        // The flag dropped entirely — a claim that never marks the row claimed.
+        let no_flag = real.replace("SET key_updated = true", "SET updated_at = NOW()");
+        assert!(check_rotation_is_atomic(&no_flag).is_err());
+
+        // A comment-only edit must NOT be reported as a defect.
+        let recommented = format!("{real}\n    // commit() SET key_updated = true pool.begin()");
+        assert!(check_rotation_is_atomic(&recommented).is_ok(), "the pin must measure code, not comments");
+    }
+}

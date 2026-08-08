@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use mercurylib::wallet::{Coin, CoinStatus, Wallet as WalletRecord};
 use mercuryrustlib::client_config::ClientConfig;
 use mercuryrustlib::sqlite_manager::{get_wallet, insert_wallet, update_wallet};
-use mercuryrustlib::transfer_sender::CancelOutcome;
+use mercuryrustlib::transfer_sender::{CancelConsentRequest, CancelOutcome};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::SdkConfig;
@@ -1170,22 +1170,73 @@ impl UtexoWallet {
         Ok(outcome)
     }
 
-    /// Recipient half of a cooperative cancellation: the single-use consent token to hand back to
-    /// the sender out of band.
+    /// Inspect a cancellation this wallet is being asked to CONSENT to, without signing anything.
     ///
-    /// Read-only — it signs a fresh challenge and changes nothing locally. The token authorizes
-    /// EXACTLY ONE cancellation (the nonce is single-use), so a sender cannot bank it and replay it
-    /// against a later transfer to the same key.
-    pub async fn cancel_consent(
+    /// Call this before [`Self::cancel_consent`] and show the human the result. Consent to
+    /// cancelling a conveyed transfer is consent to giving a payment back, and the amount, the coin
+    /// and the colour are exactly the facts a person needs in order to give it meaningfully.
+    ///
+    /// Every field is established locally, by decrypting the mailbox message with this wallet's own
+    /// key — nothing in it is asserted by the party asking. It errors, by name
+    /// (`mercuryrustlib::transfer_sender::ConsentUnavailable`), when this wallet is not the recorded
+    /// recipient or has already claimed the transfer, so a caller that previews successfully knows
+    /// the signing call will not refuse for those reasons either.
+    ///
+    /// Read-only: takes no wallet lock and changes nothing.
+    pub async fn preview_cancel_consent(
         &self,
         statechain_id: &str,
-        recipient_auth_pub_key: &str,
-    ) -> Result<String> {
-        mercuryrustlib::transfer_sender::cancel_consent(
+    ) -> Result<CancelConsentRequest> {
+        mercuryrustlib::transfer_sender::preview_cancel_consent(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             statechain_id,
-            recipient_auth_pub_key,
+        )
+        .await
+    }
+
+    /// EVERY transfer this wallet could consent to cancelling.
+    ///
+    /// The strongest answer to a misdirected consent request, because the party asking names
+    /// nothing: the recipient enumerates its own mailbox and picks. A request that describes a small
+    /// coin has to match an entry here, and the entry carries the real branch-validated amount.
+    ///
+    /// Read-only. Transfers this wallet already claimed are omitted — they are not cancellable.
+    pub async fn preview_all_cancellable_consents(&self) -> Result<Vec<CancelConsentRequest>> {
+        mercuryrustlib::transfer_sender::preview_all_cancellable_consents(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+        )
+        .await
+    }
+
+    /// Recipient half of a cooperative cancellation: the single-use consent token to hand back to
+    /// the sender out of band.
+    ///
+    /// Read-only — it signs a fresh challenge and changes nothing locally.
+    ///
+    /// Note what it takes: the OBJECT returned by [`Self::preview_cancel_consent`], and nothing a
+    /// counterparty can supply. There is no coin id and no recipient key in this signature, because
+    /// a caller that supplies both can describe one transfer while naming another and the wallet
+    /// would sign without ever showing an amount. `CancelConsentRequest`'s fields are private and
+    /// its only constructor derives all of them — the amount and the binding together — from one
+    /// message this wallet decrypted, so it cannot be assembled to say something that was never
+    /// previewed.
+    ///
+    /// What was previewed is therefore what is signed: this call does not look at the mailbox again.
+    /// If the transfer moved in between, the coordinator refuses the superseded consent rather than
+    /// this wallet signing something it never showed.
+    ///
+    /// The token authorizes EXACTLY ONE cancellation of EXACTLY THIS transfer — single-use nonce,
+    /// plus a digest binding it to the conveyed material currently in this wallet's hands. Without
+    /// the second half a sender could take the consent, re-address the coin to this same receiving
+    /// key (which the coordinator permits), let the replacement appear in this wallet's mailbox, and
+    /// spend the consent against the transfer the recipient now believes is live.
+    pub async fn cancel_consent(&self, approved: &CancelConsentRequest) -> Result<String> {
+        mercuryrustlib::transfer_sender::cancel_consent(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            approved,
         )
         .await
     }
@@ -1193,11 +1244,18 @@ impl UtexoWallet {
     /// Sender half of a cooperative cancellation, carrying a consent token obtained out of band from
     /// the recipient's [`Self::cancel_consent`]. This is what makes a cross-wallet cancellation of a
     /// CONVEYED transfer possible at all.
+    ///
+    /// `consent_token` is the whole opaque string the recipient produced. Do not split it: the
+    /// signature and the statement of which transfer it covers travel together on purpose, and a
+    /// token stripped back to the older two-field shape is refused (locally, and by the
+    /// coordinator).
+    ///
+    /// On success the coin is restored to CONFIRMED and is selectable for a new spend.
     pub async fn cancel_transfer_with_consent(
         &self,
         statechain_id: &str,
         recipient_auth_pub_key: &str,
-        recipient_auth_sig: &str,
+        consent_token: &str,
     ) -> Result<CancelOutcome> {
         let _guard = self.inner.wallet_lock.lock().await;
         let outcome = mercuryrustlib::transfer_sender::cancel_with_consent(
@@ -1205,7 +1263,7 @@ impl UtexoWallet {
             &self.inner.config.wallet_name,
             statechain_id,
             recipient_auth_pub_key,
-            recipient_auth_sig,
+            consent_token,
         )
         .await?;
         self.after_cancel().await?;

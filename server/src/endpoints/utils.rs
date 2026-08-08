@@ -129,6 +129,34 @@ pub async fn validate_signature_nonce_given_public_key(
     endpoint: &str,
     auth_key: &PublicKey,
 ) -> bool {
+    validate_signature_nonce_given_xonly_key(
+        pool,
+        auth_field,
+        statechain_id,
+        endpoint,
+        &auth_key.x_only_public_key().0,
+    )
+    .await
+}
+
+/// The x-only form of [`validate_signature_nonce_given_public_key`], and its implementation.
+///
+/// Needed by transfer cancellation's SENDER leg, where the key to check against is read from
+/// `statechain_transfer.sender_auth_xonly_public_key` (migration 0011) and is therefore already
+/// x-only — the same 32-byte form `statechain_data.auth_xonly_public_key` is stored in.
+///
+/// This is the SAME check `validate_signature_nonce` performs; the only difference is where the key
+/// comes from. `validate_signature_nonce` looks it up on the coin, which is wrong for a cancellation
+/// once a claim has ROTATED that key to the recipient's — see the ordering block on
+/// `endpoints::transfer_sender::transfer_cancel` for why authenticating against the RECORDED opener
+/// cannot admit anyone the live-key check would have refused.
+pub async fn validate_signature_nonce_given_xonly_key(
+    pool: &sqlx::PgPool,
+    auth_field: &str,
+    statechain_id: &str,
+    endpoint: &str,
+    auth_key: &XOnlyPublicKey,
+) -> bool {
     let (nonce, signed_message_hex) = match auth_field.split_once(':') {
         Some((n, s)) if !n.is_empty() && !s.is_empty() => (n, s),
         _ => return false,
@@ -139,7 +167,7 @@ pub async fn validate_signature_nonce_given_public_key(
     };
     let msg = Message::from_hashed_data::<sha256::Hash>(format!("{nonce}|{endpoint}").as_bytes());
     let secp = Secp256k1::new();
-    if !secp.verify_schnorr(&signed_message, &msg, &auth_key.x_only_public_key().0).is_ok() {
+    if !secp.verify_schnorr(&signed_message, &msg, auth_key).is_ok() {
         return false;
     }
     // Consume only after the signature verifies, so a bogus signature cannot burn a real nonce.

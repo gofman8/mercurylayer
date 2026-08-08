@@ -273,6 +273,28 @@ pub struct TesrBundle {
     /// SUPERSEDED extensions (from renewals) — kept only so their co-signs are counted.
     #[serde(default)]
     pub superseded_extensions: Vec<TesrTier>,
+    /// **OUTSTANDING CONVEYED STATES — the sender's own note of a co-sign they have handed out.**
+    ///
+    /// Opening a whole-coin transfer of a laddered coin co-signs a receiver-paying state `S'`
+    /// ([`presign_receiver_state`]) and gives it away. That co-sign is irreversible and it raises
+    /// the enclave's MONOTONIC `sig_count`; the sender's own bundle used to learn nothing about it,
+    /// so a CANCELLED transfer orphaned it permanently — the receiver's exact-equality census came
+    /// up short by one on the next conveyance and the coin was dead for onward payment, and the
+    /// replacement recipient's state was rebuilt at the SAME CSV over the SAME outpoint as the
+    /// cancelled one, which is a first-seen race rather than a protocol outcome.
+    ///
+    /// An entry here is written BEFORE the material leaves this wallet and is retired by exactly one
+    /// operation — [`apply_reclaim`], the local half of a cancellation — which demotes it into
+    /// [`Self::superseded_states`] where the census counts it and the verifier proves it
+    /// non-confirmable.
+    ///
+    /// **It is LOCAL and it never travels.** [`presign_receiver_state`] clears it on the conveyed
+    /// clone, and `verify_bundle_ex` REFUSES any bundle that arrives carrying one: such an entry is
+    /// a co-signed rival at a strictly LOWER CSV than the live tier, i.e. precisely the hidden state
+    /// the census exists to catch. `#[serde(default)]` keeps every already-persisted `tesr-*` row
+    /// and every in-flight mailbox message deserializing byte-identically.
+    #[serde(default)]
+    pub conveyed_states: Vec<TesrTier>,
     /// The relative-timelock schedule this coin runs on (mainnet/regtest preset). Drives the
     /// param-based cadence in [`renew_auto`] / [`rollover_auto`]; defaults to mainnet for bundles
     /// persisted before this field existed.
@@ -1424,6 +1446,7 @@ pub async fn establish(
         m: 0,
         superseded_states: Vec::new(),
         superseded_extensions: Vec::new(),
+        conveyed_states: Vec::new(),
         params: mercurylib::tesr::TesrParams::for_network(network),
         rgb: None,
     })
@@ -1765,6 +1788,7 @@ pub async fn cosign_colored_ladder(
         m: 0,
         superseded_states: Vec::new(),
         superseded_extensions: Vec::new(),
+        conveyed_states: Vec::new(),
         params: mercurylib::tesr::TesrParams::for_network(&draft.network),
         rgb: Some(ColoredLadder {
             contract_id: draft.contract_id,
@@ -1868,18 +1892,10 @@ pub fn build_colored_receiver_state(
     // Reuses the coloured seal schedule's single-level invariant (and its reasoning).
     let _ = bundle.colored_tier_seals()?;
     let rgb_half = bundle.rgb.as_ref().expect("is_colored");
-    let p = bundle.params;
-    let cur_csv = bundle
-        .current()
-        .state
-        .csv
-        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
-    let new_csv = cur_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| {
-            anyhow::anyhow!("state CSV at the floor — renew before transferring this carrier")
-        })?;
+    refuse_outstanding_conveyance(bundle, "build_colored_receiver_state")?;
+    // Same derivation as the plain path, and for the same reason: one rung below every rival over
+    // the outpoint this state will spend, not merely below the live one.
+    let new_csv = next_rival_state_csv(bundle)?;
     let payee = mercurylib::tesr::payee_address(recipient_address, &bundle.network)?;
 
     let ext = bundle.current().extension.clone();
@@ -1970,15 +1986,25 @@ pub async fn cosign_colored_receiver_state(
             ext.payload_vout
         ));
     }
-    let cur_csv = bundle
-        .current()
-        .state
-        .csv
-        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
-    if draft.csv >= cur_csv {
+    refuse_outstanding_conveyance(bundle, "cosign_colored_receiver_state")?;
+    // Re-derived here rather than trusted: the draft is built in the SDK (which holds the RGB
+    // engine) and consumed here, and the number that matters is not "below the live state" but
+    // "below every rival over the outpoint it spends" — the distinction a cancellation creates.
+    // A draft LOWER than required is safe (it matures even earlier for the receiver); at or above
+    // it, the rival it must beat could win a first-seen race.
+    let required = next_rival_state_csv(bundle)?;
+    if draft.csv > required {
         return Err(anyhow::anyhow!(
-            "coloured state draft's CSV {} does not out-race the state it replaces ({cur_csv})",
+            "coloured state draft's CSV {} does not out-race every rival over the extension output \
+             it spends — it must be at most {required}",
             draft.csv
+        ));
+    }
+    if draft.csv < bundle.params.d_floor {
+        return Err(anyhow::anyhow!(
+            "coloured state draft's CSV {} is below the schedule floor {}",
+            draft.csv,
+            bundle.params.d_floor
         ));
     }
 
@@ -2008,6 +2034,8 @@ pub async fn cosign_colored_receiver_state(
     }
     consignments[n - 1] = draft.tier.consignment;
     b.rgb = Some(ColoredLadder { consignments, ..rgb_half });
+    // The conveyance record is the SENDER'S and never travels — same reason as the plain path.
+    b.conveyed_states.clear();
     Ok(b)
 }
 
@@ -4214,6 +4242,10 @@ pub async fn in_ladder_split(
     conveyance: &[(String, String)],
 ) -> Result<InLadderSplitOutput> {
     refuse_uncolored_over_colored(bundle, "in_ladder_split")?;
+    // [CANCEL] The split turns the parent's final state into a SPLIT state over the current
+    // extension's output — a direct rival of the outstanding conveyed one, which nothing here
+    // consults and nothing downstream would count. Settle the open transfer first.
+    refuse_outstanding_conveyance(bundle, "in_ladder_split")?;
     let p = bundle.params;
     let x_m = bundle.current().extension.clone();
     // [CATS] SP must OUT-RACE `S_0` over `X_m.out[0]`, and it does so at CSV 0 — see `SPINE_CSV`.
@@ -6880,6 +6912,13 @@ pub async fn renew(
     csv_d: u16,
 ) -> Result<()> {
     refuse_uncolored_over_colored(bundle, "renew")?;
+    // [CANCEL] A renewal re-parents the level: the outstanding conveyed state would come to spend
+    // a SUPERSEDED extension, so `next_rival_state_csv`'s per-outpoint filter would stop seeing it
+    // and no disclosure would ever count it — the census would stay one short forever. It would
+    // also be transitively DEAD and therefore harmless, which is exactly why silently proceeding
+    // is the dangerous option: the safety half would look fine while the count quietly bricked the
+    // coin. Settle the open transfer first.
+    refuse_outstanding_conveyance(bundle, "renew")?;
     let (parent_txid, parent_val) = bundle.current_parent();
     let x = mercurylib::tesr::build_extension(&parent_txid, parent_val, &bundle.agg_address, &bundle.network, csv_e_new, bundle.fee_rate)?;
     let x_signed = cosign_tier(cc, coin, x.tx_hex.clone(), parent_val, &bundle.network).await?;
@@ -6910,6 +6949,10 @@ pub async fn rollover(
     csv_d: u16,
 ) -> Result<()> {
     refuse_uncolored_over_colored(bundle, "rollover")?;
+    // [CANCEL] Same reasoning as `renew`, plus a safety half of its own: the self-split state
+    // rivals the outstanding conveyed one over the CURRENT extension's output, and
+    // `next_rival_state_csv` is not consulted here.
+    refuse_outstanding_conveyance(bundle, "rollover")?;
     let p = bundle.params;
     let cur_ext = bundle.current().extension.clone();
     let cur_state_csv = bundle
@@ -6958,6 +7001,150 @@ pub async fn rollover(
     Ok(())
 }
 
+/// The outpoint a tier's single input spends, read from the SIGNED TRANSACTION rather than from any
+/// declared field — rivalry is a property of what the transaction actually spends.
+fn tier_input_outpoint(
+    t: &TesrTier,
+    what: &str,
+) -> Result<electrum_client::bitcoin::OutPoint> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let raw = hex::decode(&t.signed_tx).map_err(|_| anyhow::anyhow!("{what}: bad tier hex"))?;
+    let tx: Transaction =
+        deserialize(&raw).map_err(|_| anyhow::anyhow!("{what}: not a transaction"))?;
+    let input = tx.input.first().ok_or_else(|| anyhow::anyhow!("{what}: tier has no input"))?;
+    Ok(input.previous_output)
+}
+
+/// **THE CSV A NEWLY CO-SIGNED STATE OVER THE CURRENT EXTENSION'S PAYLOAD OUTPUT MUST TAKE.**
+///
+/// Every state of a level spends the SAME outpoint — `X_m`'s payload output — so they are all
+/// RIVALS, and the protocol settles rivalry by maturity: **LOWER CSV CONFIRMS FIRST AND WINS**
+/// (Decker–Wattenhofer replace-by-lower-timelock). `verify_superseded_segment` enforces exactly that
+/// and nothing weaker: a disclosed rival over the same outpoint whose CSV is `<=` the live tier's is
+/// REFUSED, because at equality the winner is decided by a first-seen/fee race — by the adversary's
+/// mempool policy, not by the protocol.
+///
+/// So the number is NOT `live − δ`. It is **`(the lowest CSV any rival over this outpoint already
+/// holds) − δ`**. The two agreed until cancellation existed, and that is the whole of Defect 2: a
+/// conveyance handed out `S'` at `live − δ` and never updated the sender's bundle, so after a
+/// cancellation the re-address recomputed `live − δ` again and the replacement recipient TIED with
+/// the cancelled one over the same outpoint. Consulting the rivals — the live state, every disclosed
+/// superseded state, and every outstanding [`TesrBundle::conveyed_states`] entry — makes the
+/// derivation TOTAL instead of true-by-luck, and it is the same remedy [`rollover`]'s `[S3]` note
+/// records for the identical equal-CSV-twin defect: the operation must CONSUME a rung.
+///
+/// Rivals over OTHER outpoints (an earlier level's state, a superseded extension's child) are
+/// skipped: they never contend with this one, which is exactly why the verifier's race map is keyed
+/// per-outpoint rather than on a global final CSV.
+pub fn next_rival_state_csv(bundle: &TesrBundle) -> Result<u16> {
+    let p = bundle.params;
+    let ext = &bundle.current().extension;
+    let parent = (ext.txid.clone(), ext.payload_vout);
+
+    // The live state is a rival by definition — it spends the outpoint the new state will spend.
+    let mut lowest = bundle
+        .current()
+        .state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
+
+    for (what, list) in [
+        ("superseded state", &bundle.superseded_states),
+        ("outstanding conveyed state", &bundle.conveyed_states),
+    ] {
+        for (j, t) in list.iter().enumerate() {
+            let op = tier_input_outpoint(t, &format!("{what} {j}"))?;
+            if op.txid.to_string() != parent.0 || op.vout != parent.1 {
+                continue;
+            }
+            let csv = t
+                .csv
+                .ok_or_else(|| anyhow::anyhow!("{what} {j}: no CSV declared"))?;
+            // `min`, not "assume the live one is lowest": a bundle in which a disclosed rival sits
+            // BELOW the live tier is already unsound and the receiver's verifier refuses it, but
+            // deriving from it would compound the fault instead of stopping one rung short of it.
+            lowest = lowest.min(csv);
+        }
+    }
+
+    lowest
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "state CSV at the floor (lowest rival over the current extension is {lowest}, δ {}, \
+                 floor {}) — renew or roll the ladder over, or re-anchor the coin on-chain with \
+                 refresh, before pre-signing another state for it",
+                p.delta,
+                p.d_floor
+            )
+        })
+}
+
+/// **THE LOCAL HALF OF A CANCELLATION: fold the reclaimed rung and the orphaned co-sign back in.**
+///
+/// A cancellation releases the coordinator's pending-transfer lock and hands the coin back, but it
+/// CANNOT un-sign the `S'` the sender already gave away, and it cannot decrement the enclave's
+/// count (`sig_count` is written only as `+ 1`, in the lockbox and in the SGX twin alike). So the
+/// cancelled state is treated as what it actually is — a REPLACED tier — and joins the same
+/// disclosed bucket a renewal's or a rollover's replaced tier joins:
+///
+/// * `replacement` (freshly co-signed, paying the SENDER again) becomes the live state;
+/// * the state it replaces AND every outstanding conveyed state are demoted into
+///   [`TesrBundle::superseded_states`], where `verify_superseded_segment` parses them, links them to
+///   the ladder, verifies each is a genuine co-sign by `A`, checks its declared CSV against the
+///   transaction's, and proves it non-confirmable — and only then does the census count it.
+///
+/// **THE INEQUALITY IS CHECKED HERE, NOT ASSUMED.** `replacement` must sit STRICTLY BELOW every tier
+/// it demotes that spends the same outpoint. Strictly, in that direction, because lower matures
+/// first: the party who legitimately holds the coin must be the one who can spend first, so the
+/// cancelled recipient's retained state has to sit ABOVE. This is the producer-side half of the
+/// consumer-side check at `verify_superseded_segment`'s race map; catching it here means a mistake
+/// surfaces while the co-signs are still ours to explain, rather than as an opaque refusal at the
+/// far end of a conveyance.
+pub fn apply_reclaim(bundle: &mut TesrBundle, replacement: TesrTier) -> Result<()> {
+    if bundle.conveyed_states.is_empty() {
+        return Err(anyhow::anyhow!(
+            "nothing to reclaim: this bundle records no outstanding conveyed state, so folding in a \
+             replacement would demote the live tier for no reason and burn a rung"
+        ));
+    }
+    let new_csv = replacement
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("the reclaim replacement state declares no CSV"))?;
+    let new_op = tier_input_outpoint(&replacement, "reclaim replacement state")?;
+
+    let mut demoted = vec![bundle.current().state.clone()];
+    demoted.extend(bundle.conveyed_states.iter().cloned());
+    for (j, t) in demoted.iter().enumerate() {
+        let op = tier_input_outpoint(t, &format!("demoted state {j}"))?;
+        if op != new_op {
+            // A rival of a different outpoint cannot contend with the replacement, so no relation
+            // between their CSVs is required — or meaningful.
+            continue;
+        }
+        let csv = t
+            .csv
+            .ok_or_else(|| anyhow::anyhow!("demoted state {j} declares no CSV"))?;
+        if new_csv >= csv {
+            return Err(anyhow::anyhow!(
+                "the reclaim replacement state (CSV {new_csv}) does not mature STRICTLY BEFORE the \
+                 state it demotes (CSV {csv}) over the same outpoint {}:{} — at or above it the \
+                 cancelled recipient could out-race the owner, which is the theft this reclaim \
+                 exists to close",
+                new_op.txid,
+                new_op.vout
+            ));
+        }
+    }
+
+    let last = bundle.levels.len() - 1;
+    bundle.superseded_states.push(bundle.levels[last].state.clone());
+    bundle.superseded_states.append(&mut bundle.conveyed_states);
+    bundle.levels[last].state = replacement;
+    Ok(())
+}
+
 /// Model A (history/MIGRATION.md §"receiver ladder adoption"): while still owning the coin, pre-sign the
 /// RECEIVER-paying state `S'` so the receiver gets a complete, verifiable exit chain paying THEM.
 /// `S'` spends the deepest extension's output, pays the recipient's derived P2TR (from a Mercury
@@ -6972,12 +7159,11 @@ pub async fn presign_receiver_state(
     recipient_address: &str,
 ) -> Result<TesrBundle> {
     refuse_uncolored_over_colored(bundle, "presign_receiver_state")?;
-    let p = bundle.params;
-    let cur_csv = bundle.current().state.csv.ok_or_else(|| anyhow::anyhow!("current state has no CSV"))?;
-    let new_csv = cur_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| anyhow::anyhow!("state CSV at the floor — renew/rollover before transferring"))?;
+    refuse_outstanding_conveyance(bundle, "presign_receiver_state")?;
+    // One rung BELOW every rival over the outpoint `S'` will spend — see `next_rival_state_csv`. It
+    // reduces to the old `cur − δ` on a bundle with no cancellation in its history, and it is what
+    // stops a re-addressed recipient from tying with a cancelled one.
+    let new_csv = next_rival_state_csv(bundle)?;
 
     let payee = mercurylib::tesr::payee_address(recipient_address, &bundle.network)?;
     let ext = bundle.current().extension.clone();
@@ -6993,7 +7179,104 @@ pub async fn presign_receiver_state(
     // counts it — and it sits at a HIGHER CSV than S', so it loses the maturity race to the receiver.
     b.superseded_states.push(b.levels[last].state.clone());
     b.levels[last].state = TesrTier { txid: s.txid, signed_tx: s_signed, out_value: s.out_value, csv: Some(new_csv), payload_vout: s.payload_vout };
+    // The conveyance record is the SENDER'S. Cleared here rather than left to the guard above, so
+    // "it never travels" is a property of this function and not of a check 6 000 lines away.
+    b.conveyed_states.clear();
     Ok(b)
+}
+
+/// A wallet holding an outstanding conveyed co-sign must not co-sign another state for the coin.
+///
+/// The outstanding `S'` sits one δ BELOW the live state, so a second state built off the same bundle
+/// would tie with it or lose to it, and neither is disclosed to anyone. The remedy is not to guess:
+/// it is to settle the open transfer — let the recipient claim it, or cancel it, which is what
+/// converts the record into a counted disclosure ([`apply_reclaim`]).
+pub fn refuse_outstanding_conveyance(bundle: &TesrBundle, what: &str) -> Result<()> {
+    if bundle.conveyed_states.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "{what}: statechain id {} has {} outstanding conveyed state(s) — a receiver-paying state \
+         this wallet already co-signed and handed out, at a LOWER CSV than its current one. \
+         Building another state now would produce a rival that ties with it or loses to it over the \
+         same outpoint, and neither would be disclosed to the next receiver. Settle the open \
+         transfer first: let the recipient claim it, or cancel it (which folds the orphaned co-sign \
+         into the bundle's disclosed superseded states and consumes the rung it needs).",
+        bundle.statechain_id,
+        bundle.conveyed_states.len()
+    ))
+}
+
+/// **THE CANCELLATION'S EFFECT ON THE SENDER'S PERSISTED LADDER — the half `finish_cancel` was
+/// missing entirely.**
+///
+/// Returns `false` when there is nothing to do (an un-laddered coin, or a cancellation of a transfer
+/// that never got as far as co-signing `S'`); `true` when the ladder was reclaimed and re-persisted.
+///
+/// It co-signs ONE new owner-paying state, strictly below every rival over the current extension's
+/// payload output, and [`apply_reclaim`] demotes the replaced state and the orphaned `S'` into the
+/// disclosed superseded bucket. That costs a rung and one co-sign, and both are the correct price:
+/// the rung is what makes the replacement recipient strictly out-race the cancelled one, and the
+/// co-sign is counted by the census like every other.
+///
+/// **ORDERING.** It must run AFTER the coordinator has applied the cancellation: while a transfer is
+/// open the SE refuses every co-signature of that coin (the pending-transfer lock), which is the only
+/// thing standing between a conveyed-but-unclaimed recipient and a sender who co-signs a rival state.
+///
+/// **CRASH WINDOW,** stated rather than papered over: the co-sign is irreversible and the persist is
+/// not, so a crash between them leaves the count one ahead of the disclosure — the same window
+/// [`renew`], [`rollover`] and [`establish`] have always carried, narrowed here from "every
+/// cancellation, permanently" to "a crash inside one function". A retry is safe in the sense that
+/// nothing is corrupted, and the coordinator reports the cancellation as already applied so
+/// `finish_cancel` runs this again; it costs another rung.
+///
+/// **COLOURED LADDERS ARE REFUSED,** loudly, by the guard: there is no coloured builder for this
+/// path, and an uncoloured replacement over a sealed output would destroy the allocation silently.
+/// A cancelled coloured coin therefore stays un-reclaimed and un-conveyable — but it now fails at
+/// the SENDER, by name, instead of at the far end of the next transfer on an unexplained census.
+pub async fn reclaim_cancelled_conveyance(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    coin: &Coin,
+) -> Result<bool> {
+    let statechain_id = coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cannot reclaim a ladder for a coin with no statechain id"))?;
+    let mut bundle = match load(cc, wallet_name, &statechain_id).await? {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+    if bundle.conveyed_states.is_empty() {
+        return Ok(false);
+    }
+    refuse_uncolored_over_colored(&bundle, "reclaim_cancelled_conveyance")?;
+
+    let csv = next_rival_state_csv(&bundle)?;
+    let ext = bundle.current().extension.clone();
+    let s = mercurylib::tesr::build_state(
+        &ext.txid,
+        ext.out_value,
+        &bundle.owner_exit_address,
+        &bundle.network,
+        csv,
+        bundle.fee_rate,
+    )?;
+    let mut c = coin.clone();
+    let s_signed = cosign_tier(cc, &mut c, s.tx_hex.clone(), ext.out_value, &bundle.network).await?;
+
+    apply_reclaim(
+        &mut bundle,
+        TesrTier {
+            txid: s.txid,
+            signed_tx: s_signed,
+            out_value: s.out_value,
+            csv: Some(csv),
+            payload_vout: s.payload_vout,
+        },
+    )?;
+    persist(cc, wallet_name, &bundle).await?;
+    Ok(true)
 }
 
 /// Cooperative DE-TRIGGER: blind-co-sign a fresh no-timelock spend of `T.out[0]` paying `to_address`,
@@ -8125,6 +8408,31 @@ fn verify_bundle_ex(
     // [CTES-R] Colour is STRUCTURAL, and it is checked on every acceptance path (claim + SSP
     // pre-pay), colour-blind and with no RGB engine. See `verify_colored_shape`.
     verify_colored_shape(bundle)?;
+
+    // [CANCEL] A BUNDLE THAT REACHES A VERIFIER MUST CARRY NO OUTSTANDING CONVEYANCE RECORD.
+    //
+    // `conveyed_states` is the SENDER'S OWN local note of a receiver-paying state they co-signed and
+    // handed out (see `presign_receiver_state`). It is deliberately NOT counted by the census, and
+    // by construction it sits at a strictly LOWER CSV than the live state over the SAME outpoint —
+    // so a bundle that arrives carrying one is announcing a co-signed rival that would out-race the
+    // very tier it is asking to be accepted. Exactly one operation retires such an entry, and it
+    // retires it INTO `superseded_states` where it is verified and counted: `apply_reclaim`, the
+    // local half of a cancellation.
+    //
+    // Refused rather than ignored, and refused rather than counted. Ignoring it is the hidden-state
+    // class this whole census exists to catch; counting it would be worse still, because the entry
+    // is a LOWER-CSV rival and `verify_superseded_segment`'s race check is the only thing that makes
+    // a disclosed rival safe to count.
+    if !bundle.conveyed_states.is_empty() {
+        return Err(anyhow::anyhow!(
+            "this bundle carries {} outstanding conveyed state(s) — co-signed receiver-paying \
+             states the sender has already handed out, at a LOWER CSV than the live tier over the \
+             same outpoint. That record is the sender's own and must never be conveyed: it is not \
+             counted, and the tier it names could out-race the one being offered. A cancellation \
+             converts it into a disclosed superseded state; nothing else may carry it",
+            bundle.conveyed_states.len()
+        ));
+    }
 
     let txs: Vec<Transaction> = tiers
         .iter()
@@ -10035,7 +10343,8 @@ mod verify_tests {
                 extension: TesrTier { txid: x.txid, signed_tx: x.tx_hex, out_value: x.out_value, csv: Some(p.ext_csv(0)), payload_vout: x.payload_vout },
                 state: TesrTier { txid: s.txid, signed_tx: s.tx_hex, out_value: s.out_value, csv: Some(p.state_csv(0)), payload_vout: s.payload_vout },
             }],
-            m: 0, superseded_states: vec![], superseded_extensions: vec![], params: p, rgb: None,
+            m: 0, superseded_states: vec![], superseded_extensions: vec![], conveyed_states: vec![],
+            params: p, rgb: None,
         }
     }
 
@@ -13228,6 +13537,7 @@ mod skim_leaf_attack_tests {
                 m: 0,
                 superseded_states: vec![],
                 superseded_extensions: vec![],
+                conveyed_states: vec![],
                 params: p,
                 rgb: None,
             };
@@ -13820,6 +14130,7 @@ mod skim_root_attack_tests {
                 m: 0,
                 superseded_states: vec![],
                 superseded_extensions: vec![],
+                conveyed_states: vec![],
                 params: p,
                 rgb: None,
             }
@@ -14409,6 +14720,7 @@ mod forged_yardstick_attack_tests {
                 m: 0,
                 superseded_states: vec![],
                 superseded_extensions: vec![],
+                conveyed_states: vec![],
                 // HONEST — the receiver's own preset. A forged schedule is a different attack
                 // (VALUE-CONSERVATION-SWEEP.md §4, "the `params` schedule as an attack surface");
                 // keeping it honest here is what makes the fee rate the only variable.
@@ -14463,6 +14775,7 @@ mod forged_yardstick_attack_tests {
                 m: 0,
                 superseded_states: vec![],
                 superseded_extensions: vec![],
+                conveyed_states: vec![],
                 params: p,
                 rgb: None,
             };
@@ -15385,6 +15698,7 @@ mod wrong_payee_attack_tests {
                 m: 0,
                 superseded_states: vec![],
                 superseded_extensions: vec![],
+                conveyed_states: vec![],
                 params: p,
                 rgb: None,
             };
@@ -16498,6 +16812,7 @@ mod dust_poisoned_tier_attack_tests {
                     m: 0,
                     superseded_states: vec![],
                     superseded_extensions: vec![],
+                    conveyed_states: vec![],
                     params: p,
                     rgb: None,
                 },
@@ -16545,6 +16860,7 @@ mod dust_poisoned_tier_attack_tests {
                     m: 0,
                     superseded_states: vec![],
                     superseded_extensions: vec![],
+                    conveyed_states: vec![],
                     params: p,
                     rgb: None,
                 },
@@ -17238,6 +17554,7 @@ mod dust_poisoned_tier_attack_tests {
             m: 0,
             superseded_states: vec![],
             superseded_extensions: vec![],
+            conveyed_states: vec![],
             params: p,
             rgb: Some(ColoredLadder {
                 contract_id: "rgb:contract".into(),
@@ -19687,6 +20004,7 @@ mod leaf_renewal_tests {
                 m: 0,
                 superseded_states: vec![],
                 superseded_extensions: vec![],
+                conveyed_states: vec![],
                 params: p,
                 rgb: None,
             };
@@ -20289,5 +20607,638 @@ mod leaf_renewal_tests {
                 "the refusal must name the leaf and the status that refused it, got: {msg}"
             );
         }
+    }
+}
+
+/// **A CANCELLED CONVEYANCE IS A REPLACEMENT, AND IT WAS NEVER MODELLED AS ONE.**
+///
+/// Opening a whole-coin transfer of a laddered coin co-signs a receiver-paying state `S'` (Model A,
+/// [`presign_receiver_state`]) — an irreversible SE co-sign that raises the coin's MONOTONIC
+/// `sig_count`. Cancelling the transfer releases the coordinator's pending-transfer lock and hands
+/// the coin back to the sender, but it cannot un-sign `S'` and it cannot decrement the counter (the
+/// counter lives in the signing enclave; every write is `+ 1`).
+///
+/// Two things therefore have to happen at cancellation, and neither did:
+///
+/// * **[SAFETY — the one that outranks the census.]** `S'_cancelled` spends the live extension's
+///   payload output at `cur_csv − δ`, so it matures BEFORE the sender's retained state and before
+///   any state the sender later pre-signs for a REPLACEMENT recipient off the same (unchanged)
+///   bundle. The replacement recipient TIES with the cancelled one — same outpoint, same CSV — and
+///   the coin goes to whoever's transaction the network sees first. The sender loses outright. This
+///   is the same equal-CSV-twin defect [`rollover`] carries an `[S3]` note about, and it has the
+///   same remedy: the operation must CONSUME a rung.
+/// * **[CENSUS.]** `S'_cancelled`'s only copies were the mailbox ciphertext (which the coordinator
+///   NULLs) and the recipient's disk. The sender's bundle never learned it existed, so the
+///   receiver's exact-equality census — `se_num_sigs == flat_backups + tiers + superseded` — came
+///   up SHORT BY EXACTLY ONE on the next conveyance, permanently. Funds stayed exitable; the coin
+///   was dead for onward payment, which is worse than the stuck lock cancellation exists to release.
+///
+/// These tests drive the whole history — deposit, establish, convey to BOB, cancel, re-address to
+/// CAROL — through the production builders and a locally-performed blind co-sign, with a MONOTONIC
+/// counter standing in for the enclave's. Nothing here is a mock of the thing under test: the
+/// bundles are real, the signatures are real, and the verifier is the production one.
+#[cfg(test)]
+mod cancelled_conveyance_tests {
+    use super::*;
+    use electrum_client::bitcoin::{
+        consensus::{deserialize, serialize},
+        key::TapTweak,
+        secp256k1::{KeyPair, Message, Secp256k1, SecretKey},
+        sighash::{Prevouts, SighashCache, TapSighashType},
+        Address, Network, ScriptBuf, Transaction, TxOut, Witness,
+    };
+    use std::cell::Cell;
+
+    const NET: &str = "regtest";
+    const SID: &str = "cancel-sid";
+    const F_TXID: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+    const F_VOUT: u32 = 0;
+    const F_VALUE: u64 = 200_000;
+
+    struct Holder {
+        kp: KeyPair,
+        address: String,
+        spk: ScriptBuf,
+        recorded_xonly: String,
+    }
+
+    fn holder(seed: u8) -> Holder {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[seed; 32]).expect("valid secret key");
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let address = Address::p2tr(&secp, xonly, None, Network::Regtest);
+        Holder {
+            kp,
+            spk: address.script_pubkey(),
+            address: address.to_string(),
+            recorded_xonly: hex::encode(xonly.serialize()),
+        }
+    }
+
+    fn parse(tx_hex: &str) -> Transaction {
+        deserialize(&hex::decode(tx_hex).expect("hex")).expect("transaction")
+    }
+
+    fn tier(tx: &Transaction, csv: Option<u16>, payload_vout: u32) -> TesrTier {
+        TesrTier {
+            txid: tx.txid().to_string(),
+            signed_tx: hex::encode(serialize(tx)),
+            out_value: tx.output[payload_vout as usize].value,
+            csv,
+            payload_vout,
+        }
+    }
+
+    /// The signing enclave, modelled as the only thing about it the census depends on: it co-signs
+    /// blind, and it keeps a MONOTONIC count of every finalized signature it has ever issued for the
+    /// coin. There is no decrement — not in `lockbox/src/db_manager.cpp`, not in the SGX twin, and
+    /// no coordinator path to either. That is precisely why disclosure is the only available remedy.
+    struct Se {
+        agg: Holder,
+        count: Cell<u32>,
+    }
+
+    impl Se {
+        /// One blind co-sign: a BIP-341 key-spend Schnorr signature by the aggregate over the tier's
+        /// single synthesised prevout — exactly what `verify_tier_cosigned` checks — and `+1` on the
+        /// counter, exactly what the enclave does.
+        fn cosign(&self, tx: &Transaction, prevout_value: u64) -> Transaction {
+            let secp = Secp256k1::new();
+            let prevout = TxOut { value: prevout_value, script_pubkey: self.agg.spk.clone() };
+            let sighash = SighashCache::new(tx)
+                .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::All)
+                .expect("taproot key-spend sighash");
+            let msg = Message::from_slice(sighash.as_ref()).expect("32-byte sighash");
+            let sig = secp.sign_schnorr_no_aux_rand(&msg, &self.agg.kp.tap_tweak(&secp, None).to_inner());
+            let mut signed = tx.clone();
+            signed.input[0].witness = Witness::from_slice(&[&sig[..]]);
+            self.count.set(self.count.get() + 1);
+            signed
+        }
+
+        /// A FLAT backup tx co-sign. The census takes flat backups as a COUNT, not as transactions
+        /// (`transfer_msg.backup_transactions.len()`), so the count is all this history needs — but
+        /// it is a real co-sign and it moves the enclave's counter exactly like a tier does.
+        fn flat_backup(&self) {
+            self.count.set(self.count.get() + 1);
+        }
+
+        fn num_sigs(&self) -> u32 {
+            self.count.get()
+        }
+    }
+
+    struct Rig {
+        se: Se,
+        alice: Holder,
+        bob: Holder,
+        carol: Holder,
+        params: mercurylib::tesr::TesrParams,
+        rate: f64,
+        /// Flat backups conveyed so far: `tx1` at deposit, then one per conveyance.
+        flat: Cell<u32>,
+    }
+
+    fn rig() -> Rig {
+        let params = mercurylib::tesr::TesrParams::regtest();
+        Rig {
+            se: Se { agg: holder(0x71), count: Cell::new(0) },
+            alice: holder(0x72),
+            bob: holder(0x73),
+            carol: holder(0x74),
+            rate: params.committed_fee_rate,
+            params,
+            flat: Cell::new(0),
+        }
+    }
+
+    impl Rig {
+        /// Deposit (one flat backup `tx1`) then `establish`: `T → X_0 → S_0`, three co-signs.
+        fn establish(&self) -> TesrBundle {
+            let p = self.params;
+            let a = &self.se.agg;
+            self.se.flat_backup();
+            self.flat.set(self.flat.get() + 1);
+
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, self.rate)
+                .expect("trigger");
+            let t_tx = self.se.cosign(&parse(&t.tx_hex), F_VALUE);
+            let t_fwd = t_tx.output[t.payload_vout as usize].value;
+
+            let x = mercurylib::tesr::build_extension(
+                &t_tx.txid().to_string(), t_fwd, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let x_tx = self.se.cosign(&parse(&x.tx_hex), t_fwd);
+            let x_fwd = x_tx.output[x.payload_vout as usize].value;
+
+            let s = mercurylib::tesr::build_state(
+                &x_tx.txid().to_string(), x_fwd, &self.alice.address, NET, p.state_csv(0), self.rate,
+            )
+            .expect("state");
+            let s_tx = self.se.cosign(&parse(&s.tx_hex), x_fwd);
+
+            TesrBundle {
+                version: 1,
+                statechain_id: SID.into(),
+                network: NET.into(),
+                fee_rate: self.rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.alice.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&s_tx, Some(p.state_csv(0)), s.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                conveyed_states: vec![],
+                params: p,
+                rgb: None,
+            }
+        }
+
+        /// Co-sign a state over the current extension's payload output paying `payee`, at `csv`.
+        /// The one primitive every rival in this history is built from.
+        fn cosign_state_over_current_extension(
+            &self,
+            b: &TesrBundle,
+            payee: &str,
+            csv: u16,
+        ) -> TesrTier {
+            let ext = b.current().extension.clone();
+            let s = mercurylib::tesr::build_state(
+                &ext.txid, ext.out_value, payee, &b.network, csv, b.fee_rate,
+            )
+            .expect("state");
+            let tx = self.se.cosign(&parse(&s.tx_hex), ext.out_value);
+            tier(&tx, Some(csv), s.payload_vout)
+        }
+
+        /// **The sender half of a whole-coin conveyance, mirroring [`presign_receiver_state`].**
+        ///
+        /// Returns `(bundle_conveyed_to_the_recipient, bundle_the_sender_keeps)`. Production keeps
+        /// the augmented bundle on a CLONE and persists NOTHING, which is the whole defect: the
+        /// sender's copy is returned here unchanged so the test can be explicit about that.
+        fn convey(&self, b: &TesrBundle, payee: &Holder) -> (TesrBundle, TesrBundle) {
+            // The production derivation, called directly: one rung below every rival over the
+            // outpoint `S'` will spend, not merely below the live state.
+            let csv = next_rival_state_csv(b).expect("a rung is available");
+            let s = self.cosign_state_over_current_extension(b, &payee.address, csv);
+
+            // The rest of `presign_receiver_state`'s bundle surgery, mirrored.
+            let mut conveyed = b.clone();
+            conveyed.owner_exit_address = payee.address.clone();
+            let last = conveyed.levels.len() - 1;
+            conveyed.superseded_states.push(conveyed.levels[last].state.clone());
+            conveyed.levels[last].state = s.clone();
+            conveyed.conveyed_states.clear();
+
+            // The recipient's flat backup tx, co-signed by `create_backup_transactions`.
+            self.se.flat_backup();
+            self.flat.set(self.flat.get() + 1);
+
+            // What the sender keeps: their own ladder, plus the DURABLE record of the co-sign they
+            // just handed out — `transfer_sender::execute_ex` persists exactly this, before the
+            // material leaves. Without it the cancellation below has nothing to disclose.
+            let mut retained = b.clone();
+            retained.conveyed_states.push(s);
+            (conveyed, retained)
+        }
+
+        /// The CANCELLATION's effect on the sender's persisted bundle: co-sign one replacement state
+        /// strictly below every rival, and fold the orphaned `S'` into the disclosed superseded
+        /// bucket. Both halves are the production functions
+        /// (`reclaim_cancelled_conveyance` is these two with the SE round-trip in between).
+        fn cancel(&self, b: &mut TesrBundle) {
+            let csv = next_rival_state_csv(b).expect("a rung is available for the reclaim");
+            let replacement =
+                self.cosign_state_over_current_extension(b, &self.alice.address, csv);
+            apply_reclaim(b, replacement).expect("the reclaim folds in");
+        }
+
+        fn authority(&self) -> CoinAuthority {
+            CoinAuthority {
+                statechain_id: SID.into(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                f_spk_hex: hex::encode(self.se.agg.spk.as_bytes()),
+                se_aggregate_pubkey: Some(self.se.agg.recorded_xonly.clone()),
+            }
+        }
+    }
+
+    fn csv_of(t: &TesrTier) -> u16 {
+        t.csv.expect("every state declares its CSV")
+    }
+
+    /// **NON-VACUITY.** The same history WITHOUT a cancellation must be accepted, or every assertion
+    /// below could be passing for an unrelated reason.
+    #[test]
+    fn a_plain_conveyance_with_no_cancellation_balances() {
+        let rig = rig();
+        let b = rig.establish();
+        let (to_bob, _kept) = rig.convey(&b, &rig.bob);
+        verify_bundle(&to_bob, rig.se.num_sigs(), rig.flat.get())
+            .expect("an uncancelled conveyance must verify");
+        verify_bundle_bound(&to_bob, rig.se.num_sigs(), rig.flat.get(), &rig.authority())
+            .expect("…through the bound path the claim lane actually calls, too");
+    }
+
+    /// **DEFECT 2 — THE THEFT VECTOR, AND IT OUTRANKS THE CENSUS.**
+    ///
+    /// Alice opens a transfer to BOB, cancels it, and re-addresses the coin to CAROL. Bob may still
+    /// hold `S'_bob` — the coordinator cannot tell, which is the entire reason a posted transfer
+    /// needs his consent to cancel — and cancelling does not un-sign it. Carol's state must
+    /// therefore mature STRICTLY BEFORE Bob's, over the outpoint they both spend. Equality is not
+    /// "a tie the honest party probably wins": it is a first-seen/fee race decided by the
+    /// adversary's mempool policy, which is why the verifier's own race check is `<=` and not `<`.
+    #[test]
+    fn a_replacement_recipient_strictly_out_races_the_cancelled_one() {
+        let rig = rig();
+        let b = rig.establish();
+
+        let (to_bob, mut kept) = rig.convey(&b, &rig.bob);
+        let bob_state = to_bob.current().state.clone();
+
+        rig.cancel(&mut kept);
+
+        let (to_carol, _) = rig.convey(&kept, &rig.carol);
+        let carol_state = to_carol.current().state.clone();
+
+        assert_eq!(
+            parse(&carol_state.signed_tx).input[0].previous_output,
+            parse(&bob_state.signed_tx).input[0].previous_output,
+            "non-vacuity: the two states must contend over the SAME outpoint, or the comparison \
+             below is meaningless"
+        );
+        assert!(
+            csv_of(&carol_state) < csv_of(&bob_state),
+            "the replacement recipient's state (CSV {}) must mature STRICTLY BEFORE the cancelled \
+             recipient's retained one (CSV {}) — an equal CSV over the same outpoint is a \
+             first-seen race, i.e. a payment-theft vector",
+            csv_of(&carol_state),
+            csv_of(&bob_state),
+        );
+
+        // …and the SENDER is protected by the same rung. Before the reclaim, Alice's retained state
+        // sat one δ ABOVE the state she had co-signed for Bob, so a cancelled-but-retained `S'`
+        // beat its own sender: Bob could have taken the coin back off a transfer Alice cancelled
+        // with his consent. Consuming a rung at cancellation is what puts her below him.
+        assert!(
+            csv_of(&kept.current().state) < csv_of(&bob_state),
+            "after the cancellation the SENDER's own live state (CSV {}) must also mature strictly \
+             before the cancelled recipient's retained one (CSV {})",
+            csv_of(&kept.current().state),
+            csv_of(&bob_state),
+        );
+    }
+
+    /// **THE FLAT LANE MUST NOT BE "FIXED".**
+    ///
+    /// The flat backup chain runs the OTHER ladder — `L_k = L_0 − k·interval` on nLockTime — and the
+    /// hop index is not a stored counter but `filtered_transactions.len()`, the length of the
+    /// sender's own local chain (`transfer_sender.rs`, `qt_backup_tx`). The cancelled recipient's
+    /// backup STAYS in that chain, and that retention is the only reason a re-addressed recipient
+    /// gets a strictly lower locktime instead of tying: the rung really was consumed. It is also
+    /// already disclosed (`backup_transactions`) and already counted (`flat_backups`), so the flat
+    /// lane's census self-balances across a cancellation with no change at all.
+    ///
+    /// Pruning it — the obvious-looking tidy-up, and the thing the census deficit made tempting —
+    /// would recreate on the flat lane exactly the tie this module removed from the ladder lane. So
+    /// the cancel path must keep its hands off the backup chain, and this says so at the one place
+    /// that could change it.
+    #[test]
+    fn the_cancel_path_never_prunes_the_flat_backup_chain() {
+        let src = include_str!("transfer_sender.rs");
+        let at = src.find("async fn finish_cancel(").expect("`finish_cancel` must exist");
+        let rest = &src[at..];
+        let body = &rest[..rest.find("\n}\n").expect("`finish_cancel` must be terminated")];
+        for forbidden in ["update_backup_txs", "backup_transactions", "truncate", "remove("] {
+            assert!(
+                !body.contains(forbidden),
+                "`finish_cancel` now touches the flat backup chain (`{forbidden}`). The cancelled \
+                 recipient's backup must STAY in it: its retention is what consumes the hop and \
+                 gives the replacement recipient a strictly LOWER locktime. Removing it makes the \
+                 two tie, which is a first-seen race for the coin."
+            );
+        }
+        // Non-vacuity: the slice really is the function, and the function really is the one that
+        // does the cancel's local bookkeeping.
+        assert!(
+            body.contains("status_after_cancel") && body.contains("reclaim_cancelled_conveyance"),
+            "the `finish_cancel` slice no longer contains its own bookkeeping — this scan has \
+             drifted off the function and is now vacuous"
+        );
+    }
+
+    /// **DEFECT 1 — THE CENSUS DEFICIT.** The exact-equality count must balance across a
+    /// cancellation. Every co-sign in this history is either a flat backup, a live exit tier, or a
+    /// disclosed superseded tier; nothing is unexplained.
+    #[test]
+    fn a_history_containing_a_cancellation_balances_the_census() {
+        let rig = rig();
+        let b = rig.establish();
+        let (_to_bob, mut kept) = rig.convey(&b, &rig.bob);
+        rig.cancel(&mut kept);
+        let (to_carol, _) = rig.convey(&kept, &rig.carol);
+
+        verify_bundle(&to_carol, rig.se.num_sigs(), rig.flat.get()).unwrap_or_else(|e| {
+            panic!(
+                "a bundle whose history includes a cancellation must still balance the census \
+                 (SE issued {}, {} flat backups): {e}",
+                rig.se.num_sigs(),
+                rig.flat.get()
+            )
+        });
+        verify_bundle_bound(&to_carol, rig.se.num_sigs(), rig.flat.get(), &rig.authority())
+            .expect("…and through the bound acceptance path the claim lane actually calls");
+
+        // …and it balances because the cancelled tier is DISCLOSED, not because a term was padded.
+        // Every one of these has been parsed, ladder-linked, signature-verified under `A` and
+        // proven non-confirmable by `verify_superseded_segment` before it was allowed to count.
+        assert_eq!(
+            to_carol.superseded_states.len(), 3,
+            "Alice's original state, BOB's cancelled state and Alice's reclaim state must all be \
+             disclosed to Carol"
+        );
+    }
+
+    /// **THE CENSUS STAYS EXACT.** It is equality by design: an unexplained signature is treated as
+    /// hidden state, and an over-disclosure is a padding attempt. One too few and one too many must
+    /// BOTH be refused, on the very bundle the fix makes acceptable.
+    #[test]
+    fn the_balanced_bundle_is_rejected_one_either_side() {
+        let rig = rig();
+        let b = rig.establish();
+        let (_to_bob, mut kept) = rig.convey(&b, &rig.bob);
+        rig.cancel(&mut kept);
+        let (to_carol, _) = rig.convey(&kept, &rig.carol);
+        let n = rig.se.num_sigs();
+        let f = rig.flat.get();
+
+        verify_bundle(&to_carol, n, f).expect("non-vacuity: the exact count is accepted");
+        for wrong in [n - 1, n + 1] {
+            let e = verify_bundle(&to_carol, wrong, f)
+                .expect_err(&format!("num_sigs {wrong} must be refused — the census is EXACT"));
+            assert!(
+                e.to_string().contains("num_sigs mismatch"),
+                "the refusal must be the census, got: {e}"
+            );
+        }
+    }
+
+    /// **PADDING.** The cancelled tier balances the count because it is VERIFIED, not because a term
+    /// grew. Dropping it must make the census refuse by exactly one, and re-declaring an existing
+    /// tier in its place must be caught by the `[C-2]` one-co-sign-one-slot rule rather than
+    /// silently restoring the balance.
+    #[test]
+    fn the_cancelled_tier_earns_its_census_slot() {
+        let rig = rig();
+        let b = rig.establish();
+        let (_to_bob, mut kept) = rig.convey(&b, &rig.bob);
+        rig.cancel(&mut kept);
+        let (to_carol, _) = rig.convey(&kept, &rig.carol);
+        let n = rig.se.num_sigs();
+        let f = rig.flat.get();
+
+        let mut dropped = to_carol.clone();
+        dropped.superseded_states.remove(1); // BOB's cancelled state
+        let e = verify_bundle(&dropped, n, f).expect_err("an undisclosed co-sign must be refused");
+        assert!(
+            e.to_string().contains(&format!("account for {}", n - 1)),
+            "dropping the cancelled tier must leave the census SHORT BY EXACTLY ONE, got: {e}"
+        );
+
+        let mut padded = dropped.clone();
+        padded.superseded_states.push(padded.superseded_states[0].clone());
+        let e = verify_bundle(&padded, n, f)
+            .expect_err("a repeated disclosure must not buy a census slot");
+        assert!(
+            e.to_string().contains("disclosed more than once"),
+            "the refusal must be the [C-2] one-co-sign-one-slot rule, got: {e}"
+        );
+    }
+
+    /// **THE RELATION IS CHECKED, NOT ASSUMED.** `apply_reclaim` is the producer of the disclosure,
+    /// and it must refuse a replacement that does not strictly out-race the tier it demotes — the
+    /// producer-side half of `verify_superseded_segment`'s race check. A disclosed transaction whose
+    /// relation is unverified is a declared field wearing a disguise.
+    #[test]
+    fn the_reclaim_refuses_a_replacement_that_does_not_out_race_what_it_demotes() {
+        let rig = rig();
+        let b = rig.establish();
+        let (to_bob, kept) = rig.convey(&b, &rig.bob);
+        let bob_csv = csv_of(&to_bob.current().state);
+
+        // Non-vacuity: one rung lower IS accepted, and it is what the derivation picks.
+        let good = next_rival_state_csv(&kept).expect("a rung is available");
+        assert!(good < bob_csv, "the derivation must already be below the cancelled state");
+        let mut ok = kept.clone();
+        let r = rig.cosign_state_over_current_extension(&ok, &rig.alice.address, good);
+        apply_reclaim(&mut ok, r).expect("a strictly lower replacement is accepted");
+
+        for bad in [bob_csv, bob_csv + rig.params.delta] {
+            let mut b2 = kept.clone();
+            let r = rig.cosign_state_over_current_extension(&b2, &rig.alice.address, bad);
+            let e = apply_reclaim(&mut b2, r)
+                .expect_err("a replacement at or above the demoted rival must be refused");
+            assert!(
+                e.to_string().contains("STRICTLY BEFORE"),
+                "the refusal must name the maturity relation, got: {e}"
+            );
+        }
+    }
+
+    /// **THE RECORD IS THE SENDER'S AND IT NEVER TRAVELS.** A bundle that arrives carrying one is
+    /// announcing a co-signed rival at a LOWER CSV than the tier it is asking to be accepted, and it
+    /// is not counted by the census — precisely the hidden state the census exists to catch. Every
+    /// verifier must refuse it, including the child lane's re-verification of its embedded parent.
+    #[test]
+    fn a_conveyed_bundle_carrying_an_outstanding_record_is_refused() {
+        let rig = rig();
+        let b = rig.establish();
+        let (to_bob, kept) = rig.convey(&b, &rig.bob);
+
+        assert!(
+            to_bob.conveyed_states.is_empty(),
+            "the conveyed clone must never carry the sender's own record"
+        );
+        assert_eq!(kept.conveyed_states.len(), 1, "…and the sender's copy must keep it");
+
+        let mut smuggled = to_bob.clone();
+        smuggled.conveyed_states = kept.conveyed_states.clone();
+        for n in [rig.se.num_sigs(), rig.se.num_sigs() + 1] {
+            let e = verify_bundle(&smuggled, n, rig.flat.get())
+                .expect_err("an outstanding conveyance record must never be accepted");
+            assert!(
+                e.to_string().contains("outstanding conveyed state"),
+                "the refusal must name the record, got: {e}"
+            );
+        }
+    }
+
+    /// **THE SENDER-SIDE GATE.** While a co-sign is outstanding the coin is not the sender's to
+    /// build another state for: a second one would tie with it or lose to it over the same outpoint,
+    /// and neither would be disclosed to anyone. Every operation that co-signs a tier off the
+    /// current level must refuse — decided locally, before any SE round-trip.
+    #[test]
+    fn an_outstanding_conveyance_blocks_every_operation_that_would_co_sign_another_tier() {
+        let rig = rig();
+        let b = rig.establish();
+        let (_to_bob, kept) = rig.convey(&b, &rig.bob);
+
+        refuse_outstanding_conveyance(&b, "control")
+            .expect("non-vacuity: a settled bundle is not blocked");
+        let e = refuse_outstanding_conveyance(&kept, "transfer")
+            .expect_err("an outstanding conveyance must block a second one");
+        let msg = e.to_string();
+        assert!(msg.contains(SID), "the refusal must name the coin, got: {msg}");
+        assert!(msg.contains("cancel it"), "…and the remedy, got: {msg}");
+
+        // The production call sites, asserted where a behavioural test cannot reach them: each one
+        // needs an SE round-trip, so what is checkable here is that the guard is IN them.
+        let src = include_str!("tesr.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]").expect("the file has test modules")];
+        for f in [
+            "pub async fn presign_receiver_state(",
+            "pub async fn renew(",
+            "pub async fn rollover(",
+            "pub async fn in_ladder_split(",
+            "pub fn build_colored_receiver_state(",
+            "pub async fn cosign_colored_receiver_state(",
+        ] {
+            let at = prod.find(f).unwrap_or_else(|| panic!("`{f}` has been renamed or removed"));
+            let body = &prod[at..prod[at..].find("\n}\n").map(|e| at + e).unwrap_or(prod.len())];
+            assert!(
+                body.contains("refuse_outstanding_conveyance("),
+                "`{f}` co-signs a tier off the current level but does not refuse an outstanding \
+                 conveyance — it would strand the record and leave the census one short forever"
+            );
+        }
+    }
+
+    /// **THE CHILD LANE RE-VERIFIES ITS EMBEDDED PARENT THROUGH THE SAME FUNCTION.** That is what
+    /// makes "counted consistently wherever it is carried" true rather than hoped: the parent census,
+    /// the superseded battery and the outstanding-record refusal are one body of code, so a split
+    /// child of a coin with a cancellation in its history is graded by exactly the arithmetic
+    /// verified above. A second copy of any of it is how the `[S1]` class comes back.
+    #[test]
+    fn the_child_lane_grades_its_parent_with_the_same_verifier() {
+        let src = include_str!("tesr.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]").expect("the file has test modules")];
+        let at = prod.find("pub fn verify_child_bundle(").expect("verify_child_bundle exists");
+        let body = &prod[at..];
+        let end = body.find("\n}\n").map(|e| e + 2).unwrap_or(body.len());
+        assert!(
+            body[..end].contains("verify_bundle_ex(&cb.parent"),
+            "the child verifier no longer re-verifies its embedded parent through `verify_bundle_ex` \
+             — the parent census and the outstanding-record refusal have forked"
+        );
+        assert_eq!(
+            prod.matches("fn verify_superseded_segment(").count(),
+            1,
+            "the superseded battery has been copied — the root and child lanes must share one"
+        );
+    }
+
+    /// **SERDE, BOTH DIRECTIONS, AND WHAT EACH ONE DOES.**
+    ///
+    /// * **NEW sender → OLD receiver.** The cancelled tier travels inside the EXISTING
+    ///   `superseded_states` field, so an unmodified receiver parses it, runs the unmodified
+    ///   `verify_superseded_segment` over it (which enforces the strict CSV relation for free) and
+    ///   COUNTS it: the census BALANCES. Wire-compatible, no version bump, no new refusal. The only
+    ///   new field is `conveyed_states`, and it is always `[]` on the wire; `TesrBundle` carries no
+    ///   `deny_unknown_fields`, so an old receiver ignores it and is unaffected either way.
+    /// * **OLD sender → NEW receiver.** A pre-fix sender with a cancellation in its history discloses
+    ///   nothing for it, so `expected` is short by one and the UNCHANGED census message refuses.
+    ///   Fail-closed, and correctly so: that sender genuinely holds an unaccounted co-sign.
+    /// * **OLD persisted bundle → NEW client.** `#[serde(default)]` loads it with an empty record,
+    ///   which is the truth about a bundle written before the field existed.
+    #[test]
+    fn the_disclosure_is_wire_compatible_in_the_fail_closed_direction() {
+        let rig = rig();
+        let b = rig.establish();
+        let (_to_bob, mut kept) = rig.convey(&b, &rig.bob);
+        rig.cancel(&mut kept);
+        let (to_carol, _) = rig.convey(&kept, &rig.carol);
+        let n = rig.se.num_sigs();
+        let f = rig.flat.get();
+
+        let json = serde_json::to_value(&to_carol).expect("serializes");
+        assert_eq!(
+            json["conveyed_states"].as_array().expect("present").len(),
+            0,
+            "the sender's own record must be empty on every conveyed bundle"
+        );
+        assert_eq!(
+            json["superseded_states"].as_array().expect("present").len(),
+            3,
+            "the cancelled tier must travel in the EXISTING superseded field, which is what makes \
+             an unmodified receiver count it"
+        );
+
+        // NEW → OLD: strip the field an old client does not know about. What is left must verify
+        // and balance IDENTICALLY, which is the whole claim.
+        let mut stripped = json.clone();
+        stripped.as_object_mut().expect("object").remove("conveyed_states");
+        let as_old: TesrBundle =
+            serde_json::from_value(stripped).expect("an old-shaped bundle still parses");
+        assert!(as_old.conveyed_states.is_empty(), "#[serde(default)] fills it in");
+        verify_bundle(&as_old, n, f)
+            .expect("an old receiver's view of the bundle balances the census unchanged");
+
+        // OLD → NEW: a pre-fix sender disclosed nothing for the cancelled co-sign. The census
+        // refuses, with the message it always had.
+        let mut pre_fix = to_carol.clone();
+        pre_fix.superseded_states.remove(1);
+        let e = verify_bundle(&pre_fix, n, f).expect_err("fail CLOSED, not open");
+        assert!(e.to_string().contains("num_sigs mismatch"), "got: {e}");
     }
 }

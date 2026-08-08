@@ -46,6 +46,7 @@ pub use wallet::{UtexoWallet, WatchtowerFault};
 /// string-matching it. `CancelNeedsRecipientConsent` in particular carries the recipient auth key,
 /// which is the only thing that makes a cross-wallet cooperative cancellation actionable.
 pub use mercuryrustlib::transfer_sender::{
-    CancelNeedsRecipientConsent, CancelOutcome, CancelRefused,
+    CancelConsentRequest, CancelNeedsRecipientConsent, CancelOutcome, CancelRefused, ConsentBlocked,
+    ConsentToken, ConsentUnavailable,
 };
 pub use watchtower::{watch_pass, WatchBundle, WatchEntry, WatchState};
