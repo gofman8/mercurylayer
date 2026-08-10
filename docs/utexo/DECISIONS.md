@@ -155,18 +155,72 @@ the CSV-separated rungs (`T→X`, `X→S`, `SP→ext`) and **never** to `SP_i �
 
 ---
 
-## Still open — seventeen decisions
+## D3–D20 — the remaining sixteen, taken 2026-08-10
 
-D3, D5, D6, D8, D9, D10, D11 (round 1) and D12–D20 (round 2). See `SPEC-ROADMAP.md` §2.
+All follow the roadmap's recommendation. Full context for each is in `SPEC-ROADMAP.md` §2; recorded
+here is the answer, and the consequence where it is not obvious.
 
-Sequencing notes that are already fixed by the four above:
+| # | Decided | Note |
+|---|---|---|
+| **D3** | Renewal and rollover are **caller-driven primitives**. Normative end-of-life rule: at `d_floor` the coin is terminal — exit unilaterally, or re-anchor cooperatively. Compaction REQUIRED at the depth cap, threshold left to implementations. Publish `V_min(d, r)` as a table over fee rate; name sub-economic finality as a limitation. | This makes `PROTOCOL.md:295` and `:348` **wrong**, not merely undocumented — they claim renewal and rollover run automatically inside `transfer()`, and there are zero call sites. WP7 deletes those claims rather than building to them. |
+| **D5** | Tier rate is a **per-network constant, receiver-enforced by equality**; the tolerance band is retained for flat backups with a normative width; publish both. | **Gated on the P2A spike (WP1).** If a tier cannot be reliably fee-bumped through its anchor above 2 sat/vB, equality is unsound as stated and this decision reopens. Do not draft §12's fee clauses before the spike reports. |
+| **D6** | **Re-derive the exit-cost model from measured vsizes** at depths 0..3 through the production finaliser; change the receiver admission rule; re-pin every test; regenerate all doc figures from the constant. | Sequenced **after D7**. This is not documentation regeneration — `max_exit_txs` is an admission rule, so re-deriving changes *which conveyed bundles a receiver admits*. Budget the test churn. |
+| **D8** | **Enumerated trust assumption**, published alongside R1–R9: `num_sigs`, the `statechain_id ↔ aggregate` binding, mailbox availability and ordering, tip service if proxied. SE-signed counts named as the closure path. | **Verify first** (1 day, week 1): does anything authenticate `sig_count` end to end? Currently UNVERIFIED. Also schedules the `aggregate_xonly` backfill for pre-0009 rows, which nothing owned. |
+| **D9** | **Freeze the current serde shape** as the normative wire format. Specify field by field; make absent-vs-null explicit and REQUIRED-to-reject wherever absence is currently free; write the ancestry disclosure-completeness rule. | The disclosure rule is not optional detail: a receiver cannot check that an ancestor split state's outputs do not exceed its funding without knowing what it is entitled to be shown. Pairs with WP3b. |
+| **D10** | **Commission the analysis** in week 1 alongside the P2A spike. | Still not answered — deliberately. If the retained checks (INV-5 rejecting duplicates and inversions) already cover what blinding-commitment verification would, accepting it is honest and cheap. If not, it is an excluded-scope collision and must surface in week 1, not week 6. |
+| **D11** | **Fix the encodings before freezing.** Add bech32/checksum and a version tag to the invoice; decide explicitly whether coin type 0 on testnet/signet is deliberate or a defect. | Freezing an unchecksummed, unversioned payment request in a v1 spec cannot be walked back, and field-typo losses in the wild are the predictable result. Also in WP6b: `decode_transfer_address` **panics** on a short-but-valid Bech32m payload. |
+| **D12** | **Retire the absolute deadline once `T` confirms** — and mandate the handoff to `defend_ladders` **in the same clause**, or the walk strands mid-chain. Publish the δ budget. | Mandating a deferral *policy* is implementation; mandating the *bound* is not. Without the published budget an implementer reads `δ = 36` as slack and batches broadcasts into it. |
+| **D13** | **Port the near-deadline defence to plain leaves** and specify it as REQUIRED of a conformant wallet. | **Re-priced by evidence, see below.** No longer the "port of existing, tested code" the roadmap assumed. |
+| **D14** | **Relational margin law**: `sup.csv ≥ live_csv + δ`, receiver-enforced. Schedule-grid membership named as v2, with the `SPINE_CSV` exception recorded as the reason it is not free. | Additive-safe: a later strengthening to the grid form retracts nothing. Implementation is WP3c. |
+| **D15** | **Claim-time finality** with the current windows, plus the outstanding sender obligation. `key_updated`-tied lock lifetime named as v2. | Deciding it is what stops the spec either omitting payment finality entirely or accidentally committing to "payments are reversible for one hour". |
+| **D16** | **MUST-reject unknown-higher `protocol_version`** (fails closed; needs a coordinated flag day) and **4 is the floor** — delete the legacy v3 branch. | (d) is the surviving theft half of audit C-14, and it changes what a child **is** — which is why §Children cannot be written without it. Also in scope: the uniffi FFI silently strips `protocol_version`, `tesr_ladder` and `child_tesr_bundle` in both directions, so "which client profiles are conformant" is part of this decision. |
+| **D17** | **Wall-clock windows published as configuration** with the failure mode named (adequate for a non-normative appendix); enforce `latch_expiry < CLTV deadline` before LN is ever normative. Terminalization carve-out decided separately as WP11 (1–2 days). | See D21 below — D1's answer changed this one's surroundings. |
+| **D18** | **Stable `code` field alongside `message`.** Renumber the ERR-n taxonomy against it; re-point the tests. | Size it *with* the test churn, not as a schema edit — E2E tests match on error substrings today, which makes the prose a de-facto interface. An independent implementation cannot conform to prose. |
+| **D19** | **Full normative watchtower obligation**: a margin formula, a maximum polling interval expressed as a fraction of the smallest CSV in the bundle, a REQUIRED re-export trigger set plus a freshness field, and a third reporting state (tolerable-and-pending) distinct from failure. Write down what a keyless tower **cannot** do as normative properties. | Answers §4's warning that an implementation built from a ladder-only spec could be structurally correct and still lose funds. The named mechanism is the missing margin and cadence. |
+| **D20** | **Both**: a capability/feature-discovery mechanism (a distinct `protocol_version` plus a feature list on `/info/config`) **and** a normative statement that coins minted under an older coordinator retain their original semantics for life, per-column. | Also: state that the published `version` is informational and MUST NOT be used for compatibility decisions until it is split. |
 
-- **D6 and D3 sit behind D7** — epoch → cap → cost table → `V_min`.
-- **D10** is unchanged and still not decidable in a sitting; it is commissioned, not answered.
-- **D13** (the plain leaf's runtime deadline defence) is unaffected by D1's answer and remains a
-  live shipping defect. Fix in progress.
-- **D17** (the LN latch clock) is *enlarged* by D1: RGB-over-Lightning was going to disappear with
-  the scope-out and now has to be built or explicitly excluded in the appendix.
+### D13 has been re-priced by evidence, and the roadmap's estimate no longer holds
+
+The roadmap called option (a) "a port of existing, tested code". A safety probe run before implementing
+found it is not. Removing the `is_colored()` gate at `clients/libs/rust-sdk/src/wallet.rs:1886-1894`
+would have created a **theft path**, not a fee waste:
+
+- `child_in_ladder_split` is a **plain-only** lane (`clients/libs/rust/src/tesr.rs:5935`;
+  `refuse_uncolored_over_colored_child` at `:571-581` refuses coloured children outright), so the
+  coloured loop shipping today has **never been exposed to it**.
+- Unlike `child_retransfer` and `combine`, that lane does **not** park the coin's status before its
+  irreversible co-signature. A terminalized leaf therefore reads CONFIRMED with a stale `ctesr-` row
+  from the CSP co-signature until conveyance completes — and **permanently** after any error or
+  crash in that span (`resume_split_conveyance` repairs only the conveyed pieces, never the
+  terminalized parent).
+- The ported loop would force-exit it and broadcast `state_child`, rivalling CSP and **destroying
+  grandchild pieces already conveyed to payees**.
+
+Required with the port, therefore: a split-journal guard (zero extra I/O — the loop already holds
+every row, and the journal is written at `Planned` *before* the co-signature, so it is durable
+evidence available before anything can be handed out).
+
+Two further defects the same probe found, **live in shipped code today**, independent of the port:
+
+1. **`head_start` is short by one block per tier.** `wallet.rs:1904` sums `Σ csv`; the claim-time
+   admission gate this defence exists to honour uses `exit_wait_blocks` = `Σ (csv + 1)`
+   (`lib/src/transfer/receiver.rs:720-722`) — each tier's timelock *plus* the block its parent needs
+   to confirm. The current expression also `filter_map`s away any tier whose csv is `None` entirely.
+   The two sites decide the same quantity two ways and the watchtower errs **fail-open**.
+2. **The loop computes a deadline from DECLARED timelocks**, which `child_exit_chain`'s own doc
+   forbids: *"Anything that computes a requirement, a deadline or a cap from these timelocks must use
+   `child_exit_chain_bound`"* (`clients/libs/rust/src/tesr.rs:5489-5493`).
+
+## Newly open — created by D1
+
+**D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB
+scope-out this disappeared at zero cost: coloured LN is already refused by name on the surviving lane
+(`clients/libs/rust-sdk/src/tokens.rs:3292-3295`), non-exact RGB PAY is refused (`ssp.rs:1093`), and
+RGB receive has no remote-SSP path (`ssp.rs:1174-1183`). D1 chose CTES-R as normative instead, so
+RGB-over-LN must now either be built or stated as an explicit exclusion in the Lightning appendix.
+Not decidable until WP11 closes D17's terminalization carve-out.
+
+## Re-costing
 
 ## Re-costing
 
