@@ -57,26 +57,83 @@ async fn tm01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet, 
 
     let batch_id = None;
 
-    // this first "double spend" is legitimate, as it will overwrite the previous transaction
+    // ---- REDIRECTING AN UN-RECEIVED TRANSFER -------------------------------------------------
+    //
+    // This test used to assert that wallet1 could simply send the coin AGAIN, to a different
+    // recipient, and that the second conveyance would silently overwrite the first. That is no
+    // longer the protocol. The coordinator now holds an OPEN-TRANSFER LOCK: while a conveyed
+    // transfer is outstanding, the SE refuses further co-signatures on that coin.
+    //
+    // The lock is the point, not an obstacle to route around. Silent overwrite meant a recipient
+    // who had been handed a transfer could have it revoked underneath them with no record and no
+    // say. Redirection is still possible — it is now EXPLICIT: cancel, with the current
+    // recipient's consent, and only then send elsewhere.
+    //
+    // So the sequence below tests three things the old single assertion could not:
+    //   [2a] the lock actually refuses the silent overwrite,
+    //   [2b] the recipient can consent to releasing it,
+    //   [2c] once cancelled, the coin is spendable again and the redirect goes through.
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet3_transfer_adress, &wallet1.name, &statechain_id, None, force_send, batch_id).await;
 
-    // THE PREMISE OF THIS WHOLE TEST. It asserts the OLD semantics: a sender may silently re-convey
-    // a coin whose previous transfer was never received, and the second convey overwrites the first.
-    // If the coordinator has since grown an open-transfer lock, this refusal is not a regression —
-    // it is the lock working, and it is THIS TEST that is out of date. Say so in the message, because
-    // a bare `is_ok()` here reports a deliberate protocol change as an unexplained panic.
+    assert!(
+        result.is_err(),
+        "TM01 - [2a] re-conveying SC={statechain_id} to wallet3 while the transfer to wallet2 is \
+         still open must be REFUSED. It was accepted, which means a conveyed transfer can be \
+         revoked out from under its recipient with no record — the exact thing the open-transfer \
+         lock exists to prevent."
+    );
+    let err = result.err().unwrap().to_string();
+    assert!(
+        err.contains("open transfer"),
+        "TM01 - [2a] refused, but NOT by the open-transfer lock. Any other error (unreachable \
+         server, timeout, locked db) satisfies is_err() too and would leave the lock untested. \
+         Got: {err}"
+    );
+    println!("TM01 - [2a] silent overwrite REFUSED by the open-transfer lock: {err}");
+
+    // The recipient's half. wallet2 is a separate wallet with its own auth key, so wallet1 cannot
+    // produce this consent — it must come from the side that would lose the coin. (Both wallets
+    // happen to live in one local db here; the keys are still distinct, and the sender-only path is
+    // refused for exactly that reason.)
+    let preview = mercuryrustlib::transfer_sender::preview_cancel_consent(&client_config, &wallet2.name, &statechain_id).await?;
+    assert_eq!(
+        preview.statechain_id(), statechain_id.as_str(),
+        "TM01 - [2b] wallet2's consent preview must describe the coin under cancellation, not some \
+         other pending transfer — the token is bound to the transfer it previews."
+    );
+    let recipient_auth_pub_key = preview.recipient_auth_pub_key().to_string();
+    let consent = mercuryrustlib::transfer_sender::cancel_consent(&client_config, &wallet2.name, &preview).await?;
+
+    println!("TM01 - [2b] wallet2 (the current recipient) consented to cancelling SC={}", &statechain_id[..8]);
+
+    let outcome = mercuryrustlib::transfer_sender::cancel_with_consent(
+        &client_config, &wallet1.name, &statechain_id, &recipient_auth_pub_key, &consent,
+    ).await?;
+    assert_eq!(
+        outcome, mercuryrustlib::transfer_sender::CancelOutcome::Cancelled,
+        "TM01 - [2b] the consented cancellation of SC={statechain_id} must report a FRESH \
+         cancellation. `AlreadyCancelled` here would mean this transfer was withdrawn by something \
+         other than this call."
+    );
+    println!("TM01 - [2b] wallet1 cancelled the transfer to wallet2 with that consent");
+
+    // The cancellation releases the coordinator's lock; the local coin still reads IN_TRANSFER
+    // until it is resynced. tb05 does the same between its cancel and its re-convey.
+    mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
+
+    let batch_id = None;
+
+    let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet3_transfer_adress, &wallet1.name, &statechain_id, None, force_send, batch_id).await;
+
     assert!(
         result.is_ok(),
-        "TM01 - [2] the LEGITIMATE double spend must be accepted: re-conveying SC={statechain_id} \
-         to wallet3 is supposed to OVERWRITE the un-received transfer to wallet2. Failed with: \
-         {:?}\n\
-         If that error is an open-transfer lock (\"coin has an open transfer\" / 409 Conflict), then \
-         the silent-overwrite semantics this test encodes have been deliberately replaced by \
-         cancel-then-resend, and the test must be rewritten to cancel first — not \"fixed\" by \
-         weakening the assertion.",
+        "TM01 - [2c] after the cancellation, re-conveying SC={statechain_id} to wallet3 must \
+         succeed: the coin is wallet1's again and no transfer is open on it. If this still fails, \
+         the cancel released the coordinator's record but NOT the coin — the redirect path is \
+         broken and a cancelled transfer strands the coin. Failed with: {:?}",
         result.as_ref().err()
     );
-    println!("TM01 - [2] wallet1 re-conveyed SC={} to wallet3, overwriting the unreceived transfer to wallet2", &statechain_id[..8]);
+    println!("TM01 - [2c] lock released; wallet1 redirected SC={} to wallet3", &statechain_id[..8]);
 
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet3.name).await?;
     let received_statechain_ids = transfer_receive_result.received_statechain_ids;
