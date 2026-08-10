@@ -1130,9 +1130,32 @@ fn watch_spine_tip_pass_seen(
     use electrum_client::bitcoin::{consensus::deserialize, Transaction};
     // `?` is load-bearing, exactly as in `watch_pass_seen`: a backend that cannot answer "is F
     // spent?" must never be read as "F is unspent".
-    if !outpoint_spent(electrum, &tip.parent.f_txid, tip.parent.f_vout)? {
-        return Ok(WatchState::Idle);
+    // [RE-ANCHOR] ASK WHAT SPENT `F`, NOT MERELY WHETHER IT IS SPENT.
+    //
+    // A bare "is F spent?" conflates two OPPOSITE situations and this loop used to do the same thing
+    // for both: broadcast the entire chain, retrying every block forever.
+    //   * spent by OUR OWN `T` -> the tree is triggered, the CSVs are counting, each tier becomes
+    //     valid in turn. Correct to proceed.
+    //   * spent by ANYTHING ELSE -> `T` is double-spent, so every tier below it is PERMANENTLY
+    //     invalid. Broadcasting is futile, and doing it forever while reporting only
+    //     backend-flavoured noise is how a dead coin looked like a flaky connection.
+    // `?` stays load-bearing: a backend that cannot answer must NOT be read as "F is unspent".
+    match f_spender(electrum, &tip.parent.f_txid, tip.parent.f_vout)? {
+        None => return Ok(WatchState::Idle),
+        Some(sp) if sp == tip.parent.trigger.txid => {}
+        Some(sp) => {
+            return Ok(WatchState::Void {
+                detail: format!(
+                    "funding {}:{} was spent by {sp}, which is not this coin's trigger {} — every \
+                     tier below the trigger is permanently unconfirmable and no later pass can \
+                     change that",
+                    &tip.parent.f_txid, tip.parent.f_vout, tip.parent.trigger.txid
+                ),
+                spender: sp,
+            });
+        }
     }
+
     let mut ids = Vec::new();
     let mut failures = Vec::new();
     for (signed, _csv) in spine_tip_exit_chain(tip) {
@@ -7452,6 +7475,115 @@ pub fn outpoint_spent(electrum: &electrum_client::Client, txid: &str, vout: u32)
     Ok(!listed.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout))
 }
 
+/// **WHO spent `F`?** `Ok(None)` = still unspent. `Err` = the backend could not tell — NEVER
+/// "unspent".
+///
+/// The watch passes used to ask only [`outpoint_spent`], a single bit, and that bit conflates two
+/// OPPOSITE situations:
+///
+///   * `F` was spent by THIS bundle's own `T`. The tree is triggered; the CSVs have merely started
+///     counting and each tier becomes valid in turn. Nothing is wrong.
+///   * `F` was spent by ANYTHING ELSE — a prior owner's flat backup being the expected case. Then
+///     `T` is double-spent, and every tier below it is **permanently** invalid. The coin is lost to
+///     this bundle and no future pass can change that.
+///
+/// Broadcasting the whole chain is the right response to the first and a futile one to the second,
+/// and the old predicate did it for both — retrying every block, forever, against a chain that can
+/// never confirm.
+///
+/// **THE PREDICATE IS "IS THE SPENDER `T`?", NOT "IS THE SPENDER A BACKUP".** `TesrBundle` carries
+/// no flat backups (only the child and spine-tip bundles do), so a delegated keyless tower cannot
+/// enumerate the things that might legitimately have spent `F`. It can always name the ONE
+/// transaction it wants to see there, because `T`'s txid is a field of the bundle. Framing it as
+/// "not `T`" is also strictly safer: it catches a flat backup, an SE-collusion spend, and anything
+/// else nobody has thought of, all of which kill the chain identically.
+///
+/// Cost: one `script_get_history` on the branch where `F` is already known spent. While `F` is
+/// unspent — the state every healthy coin is in — this costs exactly what it did before.
+pub fn f_spender(
+    electrum: &electrum_client::Client,
+    f_txid: &str,
+    f_vout: u32,
+) -> Result<Option<String>> {
+    if !outpoint_spent(electrum, f_txid, f_vout)? {
+        return Ok(None);
+    }
+    let t = electrum_client::bitcoin::Txid::from_str(f_txid)
+        .map_err(|e| anyhow::anyhow!("unusable funding txid {f_txid:?} in stored ladder: {e}"))?;
+    let raw = electrum.transaction_get_raw(&t).map_err(|e| {
+        anyhow::anyhow!("chain backend unreadable while re-fetching funding {f_txid}: {e}")
+    })?;
+    let tx: electrum_client::bitcoin::Transaction =
+        electrum_client::bitcoin::consensus::deserialize(&raw)
+            .map_err(|e| anyhow::anyhow!("funding tx {f_txid} did not deserialize: {e}"))?;
+    let out = tx.output.get(f_vout as usize).ok_or_else(|| {
+        anyhow::anyhow!("funding {f_txid} has no output {f_vout} ({} outputs)", tx.output.len())
+    })?;
+    // Every tier pays back to `P2TR(A)` — the SAME scriptPubKey `F` sits on (`build_trigger` passes
+    // the aggregate as its payee). So one history call over that script returns `F`, its spender,
+    // and the tiers themselves.
+    let hist = electrum.script_get_history(&out.script_pubkey).map_err(|e| {
+        anyhow::anyhow!(
+            "chain backend unreadable while reading the history of {f_txid}:{f_vout} — cannot tell \
+             WHAT spent the funding output, and treating that as 'our own trigger' would broadcast \
+             a chain that may already be dead: {e}"
+        )
+    })?;
+    let mut unreadable: Vec<String> = Vec::new();
+    for h in hist.iter() {
+        let cand = h.tx_hash.to_string();
+        if cand == f_txid {
+            continue;
+        }
+        // A history entry we cannot read is not evidence of anything, so keep looking — but COUNT
+        // it. Skipping silently is how "I could not read the candidate that spent F" would come
+        // back indistinguishable from "no candidate spent F", and the second of those is the answer
+        // that gets a coin declared dead. The tally is reported in the error below.
+        let craw = match electrum.transaction_get_raw(&h.tx_hash) {
+            Ok(r) => r,
+            Err(e) => {
+                unreadable.push(format!("{cand}: {e}"));
+                continue;
+            }
+        };
+        let ctx: electrum_client::bitcoin::Transaction =
+            match electrum_client::bitcoin::consensus::deserialize(&craw) {
+                Ok(t) => t,
+                Err(e) => {
+                    unreadable.push(format!("{cand}: did not deserialize: {e}"));
+                    continue;
+                }
+            };
+        if ctx
+            .input
+            .iter()
+            .any(|i| i.previous_output.txid == t && i.previous_output.vout == f_vout)
+        {
+            return Ok(Some(cand));
+        }
+    }
+    // `outpoint_spent` said spent and no readable history entry claims it. The one answer that must
+    // never be returned here is `None`. Distinguish the two ways of getting here, because they mean
+    // different things to an operator: a backend that contradicts itself is a bug to chase, whereas
+    // candidates we simply could not read is a transient condition to retry.
+    if unreadable.is_empty() {
+        Err(anyhow::anyhow!(
+            "funding {f_txid}:{f_vout} is spent but no transaction in its script history claims it \
+             — the chain backend is inconsistent, and reporting 'unspent' or assuming our own \
+             trigger would both be guesses about whether this coin is still alive"
+        ))
+    } else {
+        Err(anyhow::anyhow!(
+            "funding {f_txid}:{f_vout} is spent and the spender could not be identified because {} \
+             candidate transaction(s) in its script history could not be read ({}). This is NOT \
+             'nothing spent it' and NOT 'our own trigger spent it' — both would be guesses, and one \
+             of them broadcasts a chain that may already be dead. Retry when the backend is healthy.",
+            unreadable.len(),
+            unreadable.join("; ")
+        ))
+    }
+}
+
 /// **Typed outcome of one watchtower pass** — the single vocabulary shared by the laddered (TES-R)
 /// tower here and the un-laddered deadline tower in the SDK (`mercury_utexo_sdk::watch_pass`).
 ///
@@ -7494,6 +7626,21 @@ pub enum WatchState {
     /// 🔴 The chain backend could not be read, or the stored exit material could not be used. This
     /// pass saw NOTHING and defended nothing. Never fold this into [`Self::Idle`].
     Blind { reason: String },
+    /// **`F` was spent by a transaction that is NOT this bundle's trigger.** Every tier below `T`
+    /// is permanently invalid: `T` spends `F`, so once something else has, `T` can never confirm and
+    /// nothing hanging off it can either.
+    ///
+    /// This is NOT a degenerate [`Self::Blind`], and the distinction is the point. `Blind` means
+    /// *"I could not see — retry"*. `Void` means *"I saw, and this coin is gone — stop"*. Before this
+    /// existed, the tower kept broadcasting a dead chain every block forever; the rejections did
+    /// surface, but as `Blind`-flavoured noise indistinguishable from a flaky backend, and
+    /// `note_watchtower_ok` cleared them the moment some other coin's pass succeeded. The coin's
+    /// death was reported in a form that got erased.
+    ///
+    /// Nothing the owner does from here recovers the coin through THIS bundle. The value, if any,
+    /// went wherever `spender` sent it — for the expected case, a prior owner's flat backup, that is
+    /// the prior owner.
+    Void { spender: String, detail: String },
 }
 
 impl WatchState {
@@ -7541,6 +7688,26 @@ impl WatchState {
     pub fn any_blindness(&self) -> bool {
         self.is_blind() || !self.blind_entries().is_empty()
     }
+    /// The coin is dead to this bundle: something other than our `T` spent `F`.
+    ///
+    /// Deliberately NOT folded into [`Self::is_blind`]. Blindness is transient and clearable; this
+    /// is permanent and must never be cleared by a later successful pass. A caller that treats the
+    /// two the same re-creates the bug this variant exists to fix.
+    pub fn is_void(&self) -> bool {
+        matches!(self, Self::Void { .. })
+    }
+    /// **Does this pass require the owner's attention?** — blindness OR a permanent loss.
+    ///
+    /// [`Self::any_blindness`] deliberately stays FALSE for [`Self::Void`]: a void coin is not a
+    /// blind spot, and folding it in would re-conflate the two states this variant exists to
+    /// separate. But that leaves a trap for any caller using `any_blindness()` as its "is something
+    /// wrong?" check — it would silently miss the graver of the two. This is that check.
+    ///
+    /// Found by its own test: the first draft asserted `any_blindness()` was true for `Void`, which
+    /// would have been the wrong fix to the right observation.
+    pub fn needs_attention(&self) -> bool {
+        self.any_blindness() || self.is_void()
+    }
 }
 
 /// **Typed progress of one unilateral-exit pass.** Only ever produced when the chain was actually
@@ -7584,9 +7751,32 @@ fn watch_pass_seen(electrum: &electrum_client::Client, bundle: &TesrBundle) -> R
     // Defend only once the coin has actually been triggered on-chain — an idle un-broadcast coin
     // never ages, so there is nothing to do until F is spent. `?` is load-bearing: a backend that
     // cannot answer "is F spent?" must NOT be read as "F is unspent".
-    if !outpoint_spent(electrum, &bundle.f_txid, bundle.f_vout)? {
-        return Ok(WatchState::Idle);
+    // [RE-ANCHOR] ASK WHAT SPENT `F`, NOT MERELY WHETHER IT IS SPENT.
+    //
+    // A bare "is F spent?" conflates two OPPOSITE situations and this loop used to do the same thing
+    // for both: broadcast the entire chain, retrying every block forever.
+    //   * spent by OUR OWN `T` -> the tree is triggered, the CSVs are counting, each tier becomes
+    //     valid in turn. Correct to proceed.
+    //   * spent by ANYTHING ELSE -> `T` is double-spent, so every tier below it is PERMANENTLY
+    //     invalid. Broadcasting is futile, and doing it forever while reporting only
+    //     backend-flavoured noise is how a dead coin looked like a flaky connection.
+    // `?` stays load-bearing: a backend that cannot answer must NOT be read as "F is unspent".
+    match f_spender(electrum, &bundle.f_txid, bundle.f_vout)? {
+        None => return Ok(WatchState::Idle),
+        Some(sp) if sp == bundle.trigger.txid => {}
+        Some(sp) => {
+            return Ok(WatchState::Void {
+                detail: format!(
+                    "funding {}:{} was spent by {sp}, which is not this coin's trigger {} — every \
+                     tier below the trigger is permanently unconfirmable and no later pass can \
+                     change that",
+                    &bundle.f_txid, bundle.f_vout, bundle.trigger.txid
+                ),
+                spender: sp,
+            });
+        }
     }
+
     let mut ids = Vec::new();
     let mut failures = Vec::new();
     for tier in bundle.exit_tiers() {
@@ -7643,9 +7833,32 @@ fn watch_child_pass_seen(
     use electrum_client::bitcoin::{consensus::deserialize, Transaction};
     // `?` is load-bearing, exactly as in `watch_pass_seen`: a backend that cannot answer "is F
     // spent?" must never be read as "F is unspent".
-    if !outpoint_spent(electrum, &cb.parent.f_txid, cb.parent.f_vout)? {
-        return Ok(WatchState::Idle);
+    // [RE-ANCHOR] ASK WHAT SPENT `F`, NOT MERELY WHETHER IT IS SPENT.
+    //
+    // A bare "is F spent?" conflates two OPPOSITE situations and this loop used to do the same thing
+    // for both: broadcast the entire chain, retrying every block forever.
+    //   * spent by OUR OWN `T` -> the tree is triggered, the CSVs are counting, each tier becomes
+    //     valid in turn. Correct to proceed.
+    //   * spent by ANYTHING ELSE -> `T` is double-spent, so every tier below it is PERMANENTLY
+    //     invalid. Broadcasting is futile, and doing it forever while reporting only
+    //     backend-flavoured noise is how a dead coin looked like a flaky connection.
+    // `?` stays load-bearing: a backend that cannot answer must NOT be read as "F is unspent".
+    match f_spender(electrum, &cb.parent.f_txid, cb.parent.f_vout)? {
+        None => return Ok(WatchState::Idle),
+        Some(sp) if sp == cb.parent.trigger.txid => {}
+        Some(sp) => {
+            return Ok(WatchState::Void {
+                detail: format!(
+                    "funding {}:{} was spent by {sp}, which is not this coin's trigger {} — every \
+                     tier below the trigger is permanently unconfirmable and no later pass can \
+                     change that",
+                    &cb.parent.f_txid, cb.parent.f_vout, cb.parent.trigger.txid
+                ),
+                spender: sp,
+            });
+        }
     }
+
     let mut ids = Vec::new();
     let mut failures = Vec::new();
     for (signed, _csv) in child_exit_chain(cb) {
@@ -21405,5 +21618,78 @@ mod audit17_epoch_deadline_tests {
         let mut bad = ladder(2);
         bad[1].tx = "not hex".to_string();
         assert!(epoch_deadline_from_flat_backups(&bad).is_err());
+    }
+}
+
+/// **[RE-ANCHOR] `Void` IS NOT `Blind`, AND THAT IS THE WHOLE FIX.**
+///
+/// The watch passes used to gate on one bit — "is `F` spent?" — which conflates our own trigger
+/// having spent it (fine, the CSVs are counting) with anything else having spent it (fatal, `T` is
+/// double-spent and every tier below it is permanently unconfirmable). Both produced the same
+/// behaviour: broadcast the entire chain, every block, forever.
+///
+/// These pin the state machine's shape. The chain-reading half is exercised by the E2E; what is
+/// asserted here is the property that made the bug survive review — that a permanent loss can never
+/// be mistaken for, or cleared as, a transient blind spot.
+#[cfg(test)]
+mod reanchor_void_state_tests {
+    use super::WatchState;
+
+    fn void() -> WatchState {
+        WatchState::Void {
+            spender: "beef".repeat(16),
+            detail: "spent by the parent's retained flat backup".to_string(),
+        }
+    }
+
+    #[test]
+    fn void_is_not_blind_and_blind_is_not_void() {
+        // The two must be disjoint. If `is_blind()` ever returns true for `Void`, every caller that
+        // branches on blindness will treat a dead coin as retryable — which is the pre-fix
+        // behaviour, reintroduced through the type instead of through the predicate.
+        assert!(!void().is_blind(), "a void coin is not blind: the pass SAW, and the answer was bad");
+        assert!(void().is_void());
+
+        let blind = WatchState::Blind { reason: "backend unreadable".into() };
+        assert!(blind.is_blind());
+        assert!(!blind.is_void(), "an unreadable backend says NOTHING about whether the coin is alive");
+    }
+
+    #[test]
+    fn void_is_not_idle_and_carries_no_acted_ids() {
+        // `Idle` is the positive all-quiet observation. A void coin is the opposite of quiet, and
+        // reporting it as idle is how it would silently disappear from a defence pass.
+        assert!(!void().is_idle());
+        assert!(void().ids().is_empty(), "nothing was broadcast, and nothing could have been");
+    }
+
+    #[test]
+    fn void_counts_as_something_the_owner_must_be_told_about() {
+        // The FIRST draft of this test asserted `any_blindness()`, and it failed — correctly. That
+        // would have been the wrong fix to the right observation: overloading the blindness
+        // predicate re-conflates the two states this variant exists to separate. The right shape is
+        // a third predicate, and the gap the failure exposed was real — a caller using
+        // `any_blindness()` as its "is something wrong?" check would silently miss the graver case.
+        assert!(!void().any_blindness(), "a void coin is NOT blind, and must not be counted as such");
+        assert!(
+            void().needs_attention(),
+            "but it must still escalate — a permanently lost coin cannot sit in a variant nobody polls"
+        );
+        // And the predicate must not become a synonym for the other two.
+        assert!(WatchState::Blind { reason: "x".into() }.needs_attention());
+        assert!(!WatchState::Idle.needs_attention(), "a quiet chain needs nobody's attention");
+    }
+
+    #[test]
+    fn the_spender_is_carried_so_the_owner_can_see_who_took_it() {
+        // The txid is the only forensic handle the owner gets. Dropping it would leave "your coin is
+        // gone" with no way to find out where.
+        match void() {
+            WatchState::Void { spender, detail } => {
+                assert!(!spender.is_empty());
+                assert!(detail.contains("flat backup"));
+            }
+            other => panic!("expected Void, got {other:?}"),
+        }
     }
 }

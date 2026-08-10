@@ -2017,6 +2017,12 @@ impl UtexoWallet {
         // than propagated immediately: the defence of the OTHER coins is time-critical and must not
         // be cancelled by one corrupt row.
         let mut blind: Vec<String> = Vec::new();
+        // [RE-ANCHOR] Coins whose `F` was spent by something OTHER than their own trigger. Kept in
+        // its own vector, never merged into `blind`, because the two mean opposite things to a
+        // caller: `blind` is "retry, I could not see" and clears on the next good pass; this is
+        // "I saw, and every tier below the trigger is permanently unconfirmable". Merging them let
+        // `note_watchtower_ok` erase a permanent loss the moment any other coin's pass succeeded.
+        let mut lost: Vec<String> = Vec::new();
         // ---- [B2] WHAT THIS PASS MUST NOT BROADCAST -------------------------------------------
         //
         // `defend_ladders` is a BROADCAST path. It drove every coin that had a `tesr-` row,
@@ -2217,6 +2223,15 @@ impl UtexoWallet {
                 mercuryrustlib::tesr::WatchState::Blind { reason } => {
                     blind.push(format!("{id} ({reason})"));
                 }
+                // [RE-ANCHOR] `Void` is NOT blindness, and must never be merged into it.
+                // `blind` means "retry, I could not see"; this means "I saw, and the coin is gone".
+                // Something other than this coin's own trigger spent `F`, so every tier below it is
+                // permanently unconfirmable. Merging the two would let `note_watchtower_ok` clear a
+                // permanent loss the moment some other coin's pass happened to succeed — which is
+                // exactly how this used to disappear.
+                mercuryrustlib::tesr::WatchState::Void { spender, detail } => {
+                    lost.push(format!("{id} (spent by {spender} — {detail})"));
+                }
             }
         }
 
@@ -2300,6 +2315,11 @@ impl UtexoWallet {
                 mercuryrustlib::tesr::WatchState::Blind { reason } => {
                     blind.push(format!("{cid} ({reason})"));
                 }
+                mercuryrustlib::tesr::WatchState::Void { spender, detail } => {
+                    // [RE-ANCHOR] NOT blindness: "I saw, and the coin is gone", not "retry".
+                    // Kept out of `blind` so `note_watchtower_ok` can never clear a permanent loss.
+                    lost.push(format!("{cid} (spent by {spender} — {detail})"));
+                }
             }
         }
 
@@ -2353,9 +2373,29 @@ impl UtexoWallet {
                 mercuryrustlib::tesr::WatchState::Blind { reason } => {
                     blind.push(format!("{tid} ({reason})"));
                 }
+                mercuryrustlib::tesr::WatchState::Void { spender, detail } => {
+                    // [RE-ANCHOR] NOT blindness: "I saw, and the coin is gone", not "retry".
+                    // Kept out of `blind` so `note_watchtower_ok` can never clear a permanent loss.
+                    lost.push(format!("{tid} (spent by {spender} — {detail})"));
+                }
             }
         }
 
+        // [RE-ANCHOR] REPORTED BEFORE BLINDNESS, because it is the graver and the more actionable
+        // of the two. A blind pass says "look again"; this says "this coin is gone, and no later
+        // pass will say otherwise". Surfacing it second, or folded into the blindness message,
+        // would bury a permanent loss underneath a transient one.
+        if !lost.is_empty() {
+            return Err(anyhow!(
+                "ladder defence found {} coin(s) whose funding output was spent by a transaction \
+                 that is NOT their own trigger. Every tier below the trigger is permanently \
+                 unconfirmable, so there is nothing left for this tower to broadcast and no later \
+                 pass can recover them — for the expected case, a prior owner's flat backup, the \
+                 value went to that prior owner. This is a LOSS, not a blind spot: {}",
+                lost.len(),
+                lost.join(", ")
+            ));
+        }
         if !blind.is_empty() {
             return Err(anyhow!(
                 "ladder defence is BLIND on {} coin(s) — their TES-R bundle could not be read, or \
