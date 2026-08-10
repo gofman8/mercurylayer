@@ -146,9 +146,22 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
     let tx_bytes = hex::decode(&bkp_tx.tx)?;
     let txid = client_config.electrum_client.transaction_broadcast_raw(&tx_bytes);
 
-    assert!(txid.is_err());
+    assert!(
+        txid.is_err(),
+        "TB05 - [11] the OLD state tx_n={} for SC={} must be rejected while its timelock is \
+         unexpired — that rejection is the entire stale-state defence. It was accepted.",
+        bkp_tx.tx_n, &statechain_id_1[..8]
+    );
+    // `is_err()` alone would also be satisfied by an unreachable electrs, which would make this
+    // defence look proven on a run where nothing was ever submitted to a node.
+    let reject_reason = format!("{:?}", txid.as_ref().err());
+    assert!(
+        reject_reason.contains("non-final"),
+        "TB05 - [11] the old state was rejected, but NOT as `non-final`. Only a timelock rejection \
+         proves the defence; a dead backend rejects everything and proves nothing. Got: {reject_reason}"
+    );
 
-    println!("TB05 - [11] old-state broadcast REJECTED while timelocked, as expected: {:?}", txid.as_ref().err());
+    println!("TB05 - [11] old-state broadcast REJECTED while timelocked, as expected: {reject_reason}");
 
     let tx_lock_time = mercuryrustlib::get_blockheight(&bkp_tx)?;
 
@@ -162,7 +175,13 @@ pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Walle
 
     let txid = client_config.electrum_client.transaction_broadcast_raw(&tx_bytes);
 
-    assert!(txid.is_ok());
+    assert!(
+        txid.is_ok(),
+        "TB05 - [12] the SAME tx_n={} that was refused at [11] must now be accepted, {} blocks \
+         later: the timelock has expired. If it is still refused, the rejection at [11] was never \
+         about the timelock and the defence is untested. Failed with: {:?}",
+        bkp_tx.tx_n, height_diff, txid.as_ref().err()
+    );
 
     println!("TB05 - [12] old-state tx_n={} for SC={} BROADCAST accepted after the timelock expired: txid {}", bkp_tx.tx_n, &statechain_id_1[..8], txid.as_ref().unwrap());
 

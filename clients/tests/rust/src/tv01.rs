@@ -42,7 +42,13 @@ async fn w1_transfer_to_w2(client_config: &ClientConfig, wallet1: &Wallet, walle
     let force_send = false;
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, None, force_send, batch_id).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TV01 - the setup send must succeed: wallet1 -> wallet2 for SC={statechain_id}. Everything \
+         this test proves about stale-state broadcast depends on the transfer having happened. \
+         Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
     let received_statechain_ids = transfer_receive_result.received_statechain_ids;
@@ -63,7 +69,15 @@ async fn w1_transfer_to_w2(client_config: &ClientConfig, wallet1: &Wallet, walle
 
     let result = mercuryrustlib::broadcast_backup_tx::execute(&client_config, &wallet1.name, &statechain_id, core_wallet_address.clone(), fee_rate).await;
 
-    assert!(result.is_err());
+    // THE SECURITY PROPERTY OF THIS FILE: wallet1 SENT the coin, so its retained backup is stale.
+    // Broadcasting it must fail, and specifically it must fail because the node enforces the
+    // TIMELOCK — that is what makes the previous owner harmless. Any other error means the
+    // broadcast was blocked by something incidental, and the timelock was never tested at all.
+    assert!(
+        result.is_err(),
+        "TV01 - the PREVIOUS owner's stale backup for SC={statechain_id} must NOT broadcast: \
+         wallet1 already sent this coin to wallet2. It was accepted, which is a theft path."
+    );
 
     let err = result.err().unwrap();
 
@@ -73,13 +87,27 @@ async fn w1_transfer_to_w2(client_config: &ClientConfig, wallet1: &Wallet, walle
 
     let err_msg = err.to_string();
 
-    assert!(err_msg == electrs_msg_err || err_msg == esplora_msg_err);
+    assert!(
+        err_msg == electrs_msg_err || err_msg == esplora_msg_err,
+        "TV01 - the stale backup was rejected, but NOT as `non-final`. Only a timelock rejection \
+         proves the stale-state defence; an unreachable backend or a malformed tx would reject it \
+         too and tell us nothing.\n  expected one of:\n    {electrs_msg_err}\n    {esplora_msg_err}\n\
+           actual: {err_msg}"
+    );
 
     let _ = bitcoin_core::generatetoaddress(990, &core_wallet_address.clone().unwrap())?;
 
     let result = mercuryrustlib::broadcast_backup_tx::execute(&client_config, &wallet2.name, &statechain_id, core_wallet_address, fee_rate).await;
 
-    assert!(result.is_ok());
+    // The other half of the property: the CURRENT owner's backup must work once its timelock
+    // matures. Without this the test would be satisfied by a system that simply rejects everything.
+    assert!(
+        result.is_ok(),
+        "TV01 - the CURRENT owner's backup for SC={statechain_id} must broadcast after 990 blocks: \
+         wallet2 holds the coin and its timelock has matured. If this fails, unilateral exit is \
+         broken for the legitimate owner. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     Ok(())
 }

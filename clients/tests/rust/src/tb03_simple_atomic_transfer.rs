@@ -64,7 +64,14 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet3_transfer_adress, &wallet1.name, &statechain_id_1, None, force_send, batch_id.clone()).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB03 - [5] leg A of the atomic batch must be accepted: wallet1 SC={statechain_id_1} -> \
+         wallet3 in batch {:?}. Both legs must enter the batch before either can be received, so a \
+         refusal here means the batch never forms. Failed with: {:?}",
+        batch_id,
+        result.as_ref().err()
+    );
 
     println!("TB03 - [5] leg A sent: wallet1 coin SC={} ({} sats) -> wallet3, batch {}", &statechain_id_1[..8], amount, &batch_id.as_ref().unwrap()[..8]);
 
@@ -75,7 +82,15 @@ pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wall
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet4_transfer_adress, &wallet2.name, &statechain_id_2, None, force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB03 - [6] leg B of the atomic batch must be accepted: wallet2 SC={statechain_id_2} -> \
+         wallet4, joining the SAME batch leg A already entered. Leg A succeeded, so the coin and \
+         the wallet are not the problem — a refusal here is about the BATCH: either the batch was \
+         closed/expired by leg A's entry, or the coordinator is rejecting a second leg. Failed \
+         with: {:?}",
+        result.as_ref().err()
+    );
 
     println!("TB03 - [6] leg B sent: wallet2 coin SC={} ({} sats) -> wallet4, same batch", &statechain_id_2[..8], amount);
 

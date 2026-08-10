@@ -162,7 +162,13 @@ async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, None, force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA01 - the RECOVERY send must succeed: an earlier attempt reached sign/first but never \
+         called sign/second, and the coin must not be left wedged by that. If this fails, an \
+         abandoned half-signed transfer permanently bricks the coin. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
     let received_statechain_ids = transfer_receive_result.received_statechain_ids;

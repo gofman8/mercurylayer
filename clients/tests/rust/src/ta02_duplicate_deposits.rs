@@ -73,35 +73,55 @@ async fn withdraw_flow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: 
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, statechain_id, None, force_send, batch_id.clone()).await;
 
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "TA02 - withdraw_flow: transferring statechain_id {statechain_id} out of wallet1 without --force must be REFUSED, because wallet1 also holds a DUPLICATED sibling coin (duplicate_index=1) for this same statechain_id and sending the non-duplicated coin away would strand that duplicate, causing PERMANENT LOSS of its funds. It was accepted instead."
+    );
 
     let error_msg = result.err().unwrap().to_string();
 
-    assert!(error_msg == "Coin is duplicated. If you want to proceed, use the command '--force, -f' option. \
-        You will no longer be able to move other duplicate coins with the same statechain_id and this will cause PERMANENT LOSS of these duplicate coin funds.");
+    assert!(
+        error_msg == "Coin is duplicated. If you want to proceed, use the command '--force, -f' option. \
+        You will no longer be able to move other duplicate coins with the same statechain_id and this will cause PERMANENT LOSS of these duplicate coin funds.",
+        "TA02 - withdraw_flow: transfer of statechain_id {statechain_id} was refused, but for the WRONG reason — expected the duplicate-coin force-flag guard in transfer_sender::execute (clients/libs/rust/src/transfer_sender.rs:991) to fire; any other error means this test proved nothing about duplicate-deposit protection. Got: {error_msg}"
+    );
 
     let fee_rate = None;
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet1.name, statechain_id, &core_wallet_address, fee_rate, Some(1)).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA02 - withdraw_flow: withdrawing the DUPLICATED coin (statechain_id {statechain_id}, duplicate_index=1) directly from wallet1 to {core_wallet_address} must succeed — withdrawing a duplicate outright (rather than transferring it) is exactly the recovery path the duplicate-coin guard points to. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, statechain_id, None, force_send, batch_id).await;
 
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "TA02 - withdraw_flow: after the duplicate coin (duplicate_index=1) for statechain_id {statechain_id} was withdrawn, transferring the remaining coin must still be REFUSED, because the recipient would compute a different signature count than the sender's coin now reflects — accepting this transfer would hand the recipient a coin they can never fully validate. It was accepted instead."
+    );
 
     let error_msg = result.err().unwrap().to_string();
 
-    assert!(error_msg == "There have been withdrawals of other coins with this same statechain_id (possibly duplicates).\
+    assert!(
+        error_msg == "There have been withdrawals of other coins with this same statechain_id (possibly duplicates).\
         This transfer cannot be performed because the recipient would reject it due to the difference in signature count.\
-        This coin can be withdrawn, however.");
+        This coin can be withdrawn, however.",
+        "TA02 - withdraw_flow: transfer of statechain_id {statechain_id} was refused, but for the WRONG reason — expected the withdrawn-duplicate signature-count guard in transfer_sender::execute (clients/libs/rust/src/transfer_sender.rs:1002) to fire; any other error means this test proved nothing about duplicate-withdrawal protection. Got: {error_msg}"
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet1.name, statechain_id, &core_wallet_address, fee_rate, None).await;
 
-    assert!(result.is_ok());
-    
+    assert!(
+        result.is_ok(),
+        "TA02 - withdraw_flow: withdrawing the remaining (non-duplicated) coin for statechain_id {statechain_id} from wallet1 to {core_wallet_address} must succeed, since the guard above only blocks TRANSFERRING it, not withdrawing it. Failed with: {:?}",
+        result.as_ref().err()
+    );
+
     Ok(())
 }
 
@@ -173,8 +193,12 @@ async fn transfer_flow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: 
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, statechain_id, None, force_send, batch_id.clone()).await;
 
-    assert!(result.is_ok());
-    
+    assert!(
+        result.is_ok(),
+        "TA02 - transfer_flow: transferring statechain_id {statechain_id} out of wallet1 WITH --force must succeed even though a DUPLICATED sibling coin (duplicate_index=1) shares this statechain_id, because force_send=true explicitly opts into overriding the duplicate-coin guard. Failed with: {:?}",
+        result.as_ref().err()
+    );
+
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet2.name).await?;
     let received_statechain_ids = transfer_receive_result.received_statechain_ids;
 
@@ -200,14 +224,20 @@ async fn transfer_flow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: 
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet1.name, statechain_id, &core_wallet_address, fee_rate, Some(1)).await;
 
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "TA02 - transfer_flow: after wallet1 force-transferred statechain_id {statechain_id} away, withdrawing 'duplicate_index=1' for it must be REFUSED — the force-send left that sibling coin INVALIDATED (not DUPLICATED), so there is no longer a duplicate row at index 1 to withdraw and accepting this would mean the duplicate-index bookkeeping is broken. It was accepted instead."
+    );
 
     let error_msg = result.err().unwrap().to_string();
 
     // assert!(error_msg == "Signature does not match authentication key.");
 
-    assert!(error_msg == "No duplicated coins associated with this statechain ID and index 1 were found");
-    
+    assert!(
+        error_msg == "No duplicated coins associated with this statechain ID and index 1 were found",
+        "TA02 - transfer_flow: withdraw of statechain_id {statechain_id} duplicate_index=1 was refused, but for the WRONG reason — expected the duplicated-index-not-found guard in withdraw::execute (clients/libs/rust/src/withdraw.rs:48) to fire; any other error means this test proved nothing about post-force-transfer duplicate-index bookkeeping. Got: {error_msg}"
+    );
+
     Ok(())
 }
 

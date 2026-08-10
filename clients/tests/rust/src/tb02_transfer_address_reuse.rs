@@ -74,7 +74,12 @@ async fn tb02(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
         let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, None, force_send, batch_id).await;
 
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "TB02 - [4]: sending coin SC={statechain_id} ({} sats) from wallet1 to the reused transfer address {wallet2_transfer_adress} must succeed — reusing one recipient address across two different statechain_id transfers is exactly the address-reuse behavior this test verifies. Failed with: {:?}",
+            coin.amount.unwrap_or(0),
+            result.as_ref().err()
+        );
 
         println!("TB02 - [4] wallet1 -> wallet2 sent SC={}... ({} sats) to the reused address", &statechain_id[..8], coin.amount.unwrap_or(0));
     }
@@ -113,7 +118,11 @@ async fn tb02(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, &statechain_id, &core_wallet_address, fee_rate, None).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB02 - [6]: wallet2 withdrawing SC={statechain_id} (coin[0] of the reused-address pair) to {core_wallet_address} must succeed. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
 
@@ -140,7 +149,11 @@ async fn tb02(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet1_transfer_adress, &wallet2.name, &statechain_id, None, force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB02 - [7]: wallet2 sending the surviving coin SC={statechain_id} (coin[1] of the reused-address pair, wallet2.coins[0] having already been withdrawn) to wallet1 at {wallet1_transfer_adress} must succeed. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     println!("TB02 - [7] wallet2 -> wallet1 sent the surviving coin SC={}... to {}...", &statechain_id[..8], &wallet1_transfer_adress[..12]);
 
@@ -154,7 +167,11 @@ async fn tb02(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) 
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet1.name, &statechain_id, &core_wallet_address, fee_rate, None).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB02 - [8]: wallet1 withdrawing the received coin SC={statechain_id} to {core_wallet_address} must succeed. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
     let wallet1: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;

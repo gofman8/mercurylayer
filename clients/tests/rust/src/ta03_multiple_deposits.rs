@@ -99,7 +99,11 @@ async fn basic_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2:
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet2 with duplicated indexes [1, 3] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
@@ -201,13 +205,25 @@ async fn basic_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2:
     let fee_rate = None;
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(1)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 1 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 1 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(2)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 2 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 2 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, None).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing the PRIMARY coin (duplicate index 0) of SC={statechain_id} from wallet2 must succeed after its duplicates are gone. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     Ok(())
 }
@@ -261,7 +277,11 @@ async fn resend_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet2 with duplicated indexes [1, 3] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
@@ -281,7 +301,11 @@ async fn resend_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet2 with duplicated indexes [2] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
@@ -319,16 +343,32 @@ async fn resend_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2
     let fee_rate = None;
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(1)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 1 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 1 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(2)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 2 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 2 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(3)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 3 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 3 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, None).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing the PRIMARY coin (duplicate index 0) of SC={statechain_id} from wallet2 must succeed after its duplicates are gone. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     Ok(())
 }
@@ -382,7 +422,11 @@ async fn multiple_sends_workflow(client_config: &ClientConfig, wallet1: &Wallet,
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet2 with duplicated indexes [1, 2, 3] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet1 = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
@@ -425,7 +469,11 @@ async fn multiple_sends_workflow(client_config: &ClientConfig, wallet1: &Wallet,
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet3_transfer_adress, &wallet2.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet2 to wallet3 with duplicated indexes [1, 2, 3] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet3.name).await?;
 
@@ -451,7 +499,11 @@ async fn multiple_sends_workflow(client_config: &ClientConfig, wallet1: &Wallet,
     let fee_rate = None;
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet3.name, statechain_id, &core_wallet_address, fee_rate, Some(3)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 3 of SC={statechain_id} from wallet3 must succeed — each duplicate is an independently withdrawable coin, and if index 3 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet1_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet1.name).await?;
 
@@ -463,9 +515,19 @@ async fn multiple_sends_workflow(client_config: &ClientConfig, wallet1: &Wallet,
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet1_transfer_adress, &wallet3.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "TA03 - this send of SC={statechain_id} from wallet3 to wallet1 must be REFUSED: sibling \
+         duplicates of this coin have ALREADY been withdrawn, so the signature count no longer \
+         matches what a recipient will verify. It was accepted — which means the sender can hand \
+         over a coin the receiver will reject, stranding it."
+    );
 
-    assert!(result.err().unwrap().to_string().contains("There have been withdrawals of other coins with this same statechain_id (possibly duplicates).This transfer cannot be performed because the recipient would reject it due to the difference in signature count.This coin can be withdrawn, however."));
+    let err = result.err().unwrap().to_string();
+    assert!(
+        err.contains("There have been withdrawals of other coins with this same statechain_id (possibly duplicates).This transfer cannot be performed because the recipient would reject it due to the difference in signature count.This coin can be withdrawn, however."),
+        "TA03 - refused, but for the WRONG reason. The refusal must name the prior withdrawals of sibling duplicates — that is the signature-count mismatch this step exists to prove. Any other error would satisfy is_err() too and prove nothing. Got: {err}"
+    );
 
     Ok(())
 }
@@ -519,7 +581,11 @@ async fn send_to_itself_workflow(client_config: &ClientConfig, wallet1: &Wallet,
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet1_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet1 (a send to ITSELF) with duplicated indexes [1, 3] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let transfer_receive_result = mercuryrustlib::transfer_receiver::execute(&client_config, &wallet1.name).await?;
 
@@ -561,7 +627,11 @@ async fn send_to_itself_workflow(client_config: &ClientConfig, wallet1: &Wallet,
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet2 with duplicated indexes [1, 2] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let wallet1: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
@@ -615,13 +685,25 @@ async fn send_to_itself_workflow(client_config: &ClientConfig, wallet1: &Wallet,
     let fee_rate = None;
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(1)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 1 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 1 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, Some(2)).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing DUPLICATE index 2 of SC={statechain_id} from wallet2 must succeed — each duplicate is an independently withdrawable coin, and if index 2 cannot be withdrawn its deposit is stranded. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, statechain_id, &core_wallet_address, fee_rate, None).await;
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - withdrawing the PRIMARY coin (duplicate index 0) of SC={statechain_id} from wallet2 must succeed after its duplicates are gone. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     Ok(())
 
@@ -682,13 +764,21 @@ async fn send_unconfirmed_duplicated_workflow(client_config: &ClientConfig, wall
     // try to send the unconfirmed duplicated coin
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "TA03 - this send of SC={statechain_id} from wallet1 to wallet2 must be REFUSED: one of the \
+         named duplicated indexes is NOT YET CONFIRMED, and sending an unconfirmed duplicate hands \
+         the recipient a coin whose deposit can still be reorged away. It was accepted."
+    );
 
     let error_message = result.err().unwrap().to_string();
 
     let expected_error_message = format!("The coin with duplicated index {} has not yet been confirmed. This transfer cannot be performed.", unconfirmed_duplicated_coin.duplicate_index);
 
-    assert!(error_message.contains(expected_error_message.as_str()));
+    assert!(
+        error_message.contains(expected_error_message.as_str()),
+        "TA03 - refused, but for the WRONG reason. Expected: {expected_error_message}\n  Actual:   {error_message}\n  Any other error (unreachable server, timeout, locked db) would satisfy is_err() too and prove nothing."
+    );
 
     let core_wallet_address = bitcoin_core::getnewaddress()?;
     let remaining_blocks = client_config.confirmation_target;
@@ -700,7 +790,11 @@ async fn send_unconfirmed_duplicated_workflow(client_config: &ClientConfig, wall
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet1.name, &statechain_id, Some(duplicated_indexes), force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TA03 - force-sending SC={statechain_id} from wallet1 to wallet2 with duplicated indexes [1, 2] must succeed — force_send is exactly the flag that permits a duplicated coin to move, so a refusal here means duplicates are unspendable. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     Ok(())
 }

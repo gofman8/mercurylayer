@@ -14,13 +14,24 @@ async fn try_to_send_unconfirmed_coin(client_config: &ClientConfig, to_address: 
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, to_address, &wallet.name, &statechain_id, None, force_send, batch_id).await;
 
-    assert!(result.is_err());
+    assert!(
+        result.is_err(),
+        "TB01 - [3/4] sending SC={statechain_id} before it is CONFIRMED must be REFUSED — an \
+         unconfirmed deposit is not yet a spendable coin. It was accepted."
+    );
 
     let error = result.err().unwrap();
 
     let error_message = format!("No coins with status CONFIRMED or IN_TRANSFER associated with this statechain ID were found");
 
-    assert!(error.to_string() == error_message);
+    // The equality is the only thing separating a real refusal from a broken stack: an unreachable
+    // server, a locked database or a timeout all satisfy `is_err()` too, and would let this
+    // negative test pass without ever exercising the coin-status guard.
+    assert!(
+        error.to_string() == error_message,
+        "TB01 - [3/4] refused, but for the WRONG reason.\n  expected: {error_message}\n  \
+         actual:   {error}"
+    );
 
     println!("TB01 - [3/4] send of not-yet-CONFIRMED coin SC={} correctly rejected: {}", &statechain_id[..8.min(statechain_id.len())], error_message);
 
@@ -146,7 +157,13 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
 
     let result = mercuryrustlib::transfer_sender::execute(&client_config, &wallet2_transfer_adress, &wallet.name, &statechain_id, None, force_send, batch_id).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB01 - [6] the happy-path send must succeed: SC={statechain_id} is CONFIRMED and wallet1 \
+         holds it. This is the baseline the whole file depends on — if it fails, nothing after it \
+         means anything. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet1.name).await?;
 
@@ -184,7 +201,13 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
 
     let result = mercuryrustlib::withdraw::execute(&client_config, &wallet2.name, &statechain_id, &core_wallet_address, fee_rate, None).await;
 
-    assert!(result.is_ok());
+    assert!(
+        result.is_ok(),
+        "TB01 - [8] cooperative withdrawal must succeed: wallet2 received SC={statechain_id} and is \
+         its current owner, so the SE should co-sign the exit. A failure here is the cooperative \
+         exit path breaking, which is the path essentially every user takes. Failed with: {:?}",
+        result.as_ref().err()
+    );
 
     mercuryrustlib::coin_status::update_coins(&client_config, &wallet2.name).await?;
     let local_wallet_2: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet2.name).await?;
