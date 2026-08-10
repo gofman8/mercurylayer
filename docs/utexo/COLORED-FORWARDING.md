@@ -6,6 +6,54 @@ tree are being rewritten by a concurrent process — **trust the code, not the c
 
 ---
 
+> ## ⛔ RETIRED, 2026-08-10 — WCH WILL NOT BE BUILT. §1 STILL STANDS.
+>
+> **Owner decision.** Read this before anything below it, because the recommendation and the
+> analysis have different fates and it matters which one you are quoting.
+>
+> **Dead: §2.1 and §3 — the recommendation to build WCH.** It was never built. The identifiers this
+> document names have zero occurrences anywhere in `clients/`, `server/` or `lib/`:
+> `colored_whole_transfer`, `WCH_SAFETY_MARGIN`, `min_backup_output`. Do not resurrect them.
+>
+> **Why the recommendation expired rather than being rejected.** §2.1 offered WCH as the cheap
+> alternative to the coloured ladder, and §2.2 gated that ladder on "*if and only if* partial
+> forwarding and real unilateral exit are worth a quarter of engineering". **CTES-R was subsequently
+> built** — the gate passed against the live stack ([CTESR-GATE.md](CTESR-GATE.md)) and `sdk75` is
+> the first genuine unilateral exit of an RGB allocation. So the either/or this recommendation rests
+> on no longer exists, and the expensive branch is the one that happened.
+>
+> Two things follow, and the second is the decisive one:
+>
+> * **Whole-carrier conveyance already exists on the coloured lane** — `build_colored_receiver_state`
+>   (`clients/libs/rust/src/tesr.rs:1903`), named in the code's own refusal text as the way "to convey
+>   the whole carrier". Onward forwarding is `transfer_colored_child`
+>   (`clients/libs/rust-sdk/src/tokens.rs:4332`). WCH's *mechanism* is not missing; only its
+>   legacy-lane spelling is.
+> * **WCH would never have delivered unilateral exit.** §3.8 preserves terminal-freeze *by design* —
+>   "WCH never ladders a carrier". Building it would have committed the protocol to "RGB carriers
+>   have no SE-free exit" as a permanent property. CTES-R is the only thing that retires that.
+>
+> **Alive and unaffected: §1.** The proof that the legacy coloured lane makes every RGB recipient a
+> structural leaf — a piece minted at exactly `TOKEN_PIECE_SATS` can never exceed
+> `TOKEN_PIECE_SATS + fee_reserve`, unsatisfiable *for every value of the constant* — is correct,
+> load-bearing, and still cited as background by `PROTOCOL.md:21`, `SPEC.md:22`,
+> `GRANULARITY-SPEC.md:18` and `CTESR-GATE.md:11`. Those citations remain valid.
+>
+> **What this decision does NOT do.** It does not fix that defect. The refusal at
+> `clients/libs/rust-sdk/src/tokens.rs:3325` is still a bare refusal with no whole-carrier fallback,
+> so for as long as `SdkConfig::colored_ladder` ships `false` the structural-leaf defect is LIVE in
+> the shipped lane. Skipping WCH is a bet that CTES-R becomes the normative RGB lane. If that bet is
+> ever reversed — see `SPEC-ROADMAP.md` **D1** — this document is where the cheap fix is written up,
+> and it should be un-retired rather than rewritten.
+>
+> §§2.2, 4 (staged plan), 5 (rejected alternatives), 6 and 7 are historical: read them as the
+> reasoning that produced CTES-R, not as work items. §4.1's `claim()` laddering hole is a real,
+> separate defect and is **not** retired by this decision.
+
+---
+
+---
+
 ## 1. The problem
 
 `colored_transfer` (`clients/libs/rust-sdk/src/tokens.rs:501-763`) ALWAYS performs a colored split.
