@@ -9,10 +9,24 @@ description = "Bridge between Mercury Layer (statechains) and rgb-lib for issuin
 # this bridge only ever exchanges *strings* (base64 PSBTs, hex txids, base64 consignments) with the
 # Mercury side - no Bitcoin types cross the boundary.
 [dependencies]
-# rgb-lib is our statechain fork at gofman8/rgb-lib (branch feat/spark). The active dep is a path to
-# the local checkout of that fork (its git `origin` is https://github.com/gofman8/rgb-lib) so rgb-lib
-# edits take effect on rebuild; the equivalent git form for a checkout-free build is:
-#   rgb-lib = { git = "https://github.com/gofman8/rgb-lib", branch = "feat/spark", default-features = false, features = ["electrum"] }
-rgb-lib = { path = "../../../../utexo-rgb-lib", default-features = false, features = ["electrum"] }
+# rgb-lib is our statechain fork at gofman8/rgb-lib (branch feat/spark), PINNED BY REVISION.
+#
+# This used to be `path = "../../../../utexo-rgb-lib"`. A path dependency makes rgb-lib edits take
+# effect on rebuild, which is convenient while developing the fork and indefensible for anything
+# else: it resolves to whatever happens to be in a sibling directory on one machine. It reached the
+# state where mercury CALLED FOUR SYMBOLS THAT EXISTED IN NO COMMIT — `accept_offchain_ladder`,
+# `diagnose_allocation`, `witness_ords` and `AllocationVerdict` lived only in an uncommitted working
+# tree — so HEAD did not build from a clean clone, and no third party could reproduce a build, let
+# alone audit one. A specification that cites RGB consensus behaviour cannot rest on that.
+#
+# `rev`, not `branch`: a branch moves, and the point of the pin is that this revision is the one the
+# tests ran against. Bump it deliberately, with the reason in the commit message.
+#
+# To develop the fork again, override LOCALLY without touching this manifest — add to
+# `.cargo/config.toml` (git-ignored) rather than editing here, so a working-tree pin can never be
+# committed by accident:
+#   [patch."https://github.com/gofman8/rgb-lib"]
+#   rgb-lib = { path = "../../../../utexo-rgb-lib" }
+rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "38e344e06628703f9c92017c5cb732b716c8ffc0", default-features = false, features = ["electrum"] }
 anyhow = "1.0"
 base64 = "0.22"
