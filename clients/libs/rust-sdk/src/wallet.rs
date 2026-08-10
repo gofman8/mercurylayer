@@ -1883,25 +1883,73 @@ impl UtexoWallet {
                     continue;
                 }
             };
+            // [B1] THE **BOUND** CHAIN, NEVER THE DECLARED ONE.
+            //
+            // `child_exit_chain`'s own doc forbids what this loop used to do: "Anything that
+            // computes a requirement, a deadline or a cap from these timelocks must use
+            // `child_exit_chain_bound`" (`clients/libs/rust/src/tesr.rs:5489-5493`). The `csv` field
+            // is plain serde and, on conveyed material, attacker-supplied. This loop computes a
+            // DEADLINE from it, which is exactly the prohibited use. Binding parses each SIGNED
+            // transaction and reads the timelock out of its `nSequence`, refusing by name if the two
+            // disagree — so a sender cannot hand this tower a schedule of their choosing and move
+            // the moment their victim's coin defends itself.
             let chain = match &parsed {
-                Row::Child(cb) if cb.is_colored() => mercuryrustlib::tesr::child_exit_chain(cb),
+                Row::Child(cb) if cb.is_colored() => {
+                    mercuryrustlib::tesr::child_exit_chain_bound(cb)
+                }
                 Row::Tip(tip) if tip.is_colored() => {
-                    mercuryrustlib::tesr::spine_tip_exit_chain(tip)
+                    mercuryrustlib::tesr::spine_tip_exit_chain_bound(tip)
                 }
                 // DELIBERATELY NARROW, unchanged: plain children (and plain tips) have the same
                 // shape and are left to their own change with their own tests, rather than swept in
                 // on the strength of an argument this round did not measure.
+                //
+                // [D13] This narrowness is a KNOWN DEFECT, not a design: a plain leaf has no other
+                // runtime deadline defence anywhere in the SDK. The decided fix (DECISIONS.md D13)
+                // is to cover plain rows too, and it needs a split-journal guard — a terminalized
+                // leaf reads CONFIRMED with a stale row after a crashed split, and driving it would
+                // destroy grandchild pieces already conveyed. That is a separate change; the two
+                // corrections below are independent of it and are live defects today.
                 _ => continue,
             };
-            let Some((root_hex, _)) = chain.first() else {
+            let chain = match chain {
+                Ok(c) => c,
+                // NOT a skip. A chain whose timelocks cannot be bound to the signatures that
+                // enforce them is a chain whose deadline cannot be computed, and this coin's only
+                // protection is here.
+                Err(e) => {
+                    blind.push(format!(
+                        "{cid} (coloured {what}: its exit chain's timelocks could not be bound to \
+                         the signatures enforcing them ({e}), so no deadline can be derived)"
+                    ));
+                    continue;
+                }
+            };
+            if chain.is_empty() {
                 blind.push(format!(
                     "{cid} (coloured {what} has an EMPTY exit chain — it has no walk to protect \
                      it and no deadline can be derived)"
                 ));
                 continue;
-            };
-            // The head start: every relative timelock the walk must sit through, summed.
-            let head_start: u32 = chain.iter().filter_map(|(_, csv)| *csv).map(u32::from).sum();
+            }
+            // THE HEAD START — every block the walk must sit through before its last tier can
+            // confirm. `exit_wait_blocks`, NOT a hand-rolled sum of the timelocks.
+            //
+            // The previous expression here was `chain.iter().filter_map(|(_, csv)| *csv).sum()`,
+            // and it under-counted twice over: it charged each tier only its own CSV, omitting THE
+            // ONE BLOCK ITS PARENT NEEDS TO CONFIRM, and `filter_map` silently dropped any tier
+            // whose csv is `None` rather than charging it that block. So the head start was short
+            // by at least the tier count, and this loop fired LATE by that many blocks.
+            //
+            // Late is the FAIL-OPEN direction on the one number the whole defence rests on. Worse,
+            // it silently disagreed with `check_exit_headroom` — the claim-time gate that admitted
+            // the coin in the first place, which uses `exit_wait_blocks`
+            // (`lib/src/transfer/receiver.rs:720-722`). Two sites deciding the same quantity two
+            // different ways, with the watchtower on the losing side. Calling the same function is
+            // what makes them provably agree, rather than agreeing by inspection until someone
+            // edits one of them.
+            let csvs: Vec<Option<u16>> = chain.iter().map(|(_, csv)| *csv).collect();
+            let head_start = mercurylib::transfer::receiver::exit_wait_blocks(&csvs);
             // [audit-17] READ `L_k` OFF THE SIGNED BACKUPS, do not recompute `L_0` from the chain.
             //
             // This used to call `deposit_anchored_deadline_of_root_tx`, which finds the deposit's
