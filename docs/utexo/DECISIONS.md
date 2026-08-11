@@ -250,6 +250,101 @@ reversal of those.
 
 ---
 
+## D23 — BACKWARD COMPATIBILITY IS NOT A CONSTRAINT (2026-08-11)
+
+**Decided.** The owner, asked about legacy coins, the attestation rollout and the testnet schedule,
+answered each the same way: *"I don't care about backward compatibility at this stage… optimise
+everything for efficiency of testing and bringing us closer to the spec."*
+
+This is a standing rule, not three separate answers. **Do not design phased rollouts, compatibility
+shims, or migration paths for existing data.** Where a choice is between "correct" and "does not
+break what is already deployed", take correct. The deployed stack is a testnet development
+environment; its coins are expendable and can be wiped.
+
+**What it changes, concretely:**
+
+| Was going to be | Now |
+|---|---|
+| D8-CLOSE staged rollout: accept-then-require | **Require the attestation outright.** No flag, no phase 2, no "record when missing" |
+| Legacy pre-0009 coins: re-binding endpoint vs accept | **Neither — ignore them.** No code (D24) |
+| testnet keeps the toy schedule to avoid breaking deployed ladders | **testnet gets the mainnet schedule** (D25) |
+| `for_network`'s silent regtest fallback preserved "so no caller changes" | Fallback can go; an unrecognised network should fail |
+
+**What it does NOT change:** the *protocol's* own compatibility rules — `protocol_version` floors
+and ceilings (D16), and what a conformant implementation must accept — are a spec question about
+independent implementations, not about this deployment's history. D23 is about not carrying our own
+past; it is not licence to make the specification version-blind.
+
+---
+
+## D24 — Legacy pre-0009 coins: ignore them, no code
+
+**Decided** under D23. The `aggregate_xonly` backfill that `tesr.rs:8063-8066`, `SPEC-ROADMAP` WP4
+and D8 all call "the only complete fix" **cannot run** — measured: 0 of 8,155 NULL rows are
+backfillable, because migration 0009 added `user_public_key` and `aggregate_xonly` in one statement
+so the rows that lack one lack both, and the coordinator stores no chain data to recover the
+aggregate from (`notes/AGGREGATE-XONLY-BACKFILL.md`).
+
+**The fact that decided it: new coins are never affected.** Every post-0009 deposit records both
+values, which is why the populated counts are identical (3,793 / 3,793). This is a legacy-data
+artefact of a test deployment, not a protocol defect.
+
+**Actions:** none on the coins. Two documentation consequences:
+* `SPEC-ROADMAP` WP4's gate "Zero NULL `aggregate_xonly` rows" is **unachievable as written** and is
+  restated as "zero NULL among post-0009 rows" — otherwise WP4 can never close.
+* The gate at `clients/libs/rust/src/tesr.rs:8049-8100` that keeps such a coin un-laddered stays. It
+  is correct: it refuses to mint an unclaimable ladder. It should NOT be advertised as making the
+  coin transferable.
+
+---
+
+## D25 — testnet runs the MAINNET schedule; regtest stays fast
+
+**Decided** under D23, resolving the tension in D7 between test speed and spec fidelity by giving
+each network the schedule that suits its purpose:
+
+| network | schedule | why |
+|---|---|---|
+| `bitcoin` / `mainnet` | mainnet (`d0 = 1440`) | — |
+| `testnet` / `testnet3` / `testnet4` / `signet` | **mainnet** | Real ~10-minute blocks, so the toy `d0 = 24` was ~4 hours of real time. Public test networks should exercise **the schedule that ships**. |
+| `regtest` | test-scale (`d0 = 24`) | Blocks mine on demand; this is where E2E speed comes from, and it is preserved exactly |
+| anything else | **refused** | A typo used to fall through to the toy schedule — `"mainet"` would have produced a 4-hour ladder on real money |
+
+**This is a deliberate compatibility break**, permitted by D23: a receiver derives its accepted CSV
+band from its own compiled-in preset, so ladders built by the old build against the deployed testnet
+coordinator will be refused. Those coins are expendable.
+
+**It also fixes what D7 called the sharper problem.** The deployed profile is `network = "testnet"`
+(`server/Settings.toml`), which silently ran the regtest schedule and therefore admitted a
+**139-transaction exit chain** — ~135 consecutive zero-CSV spine tiers, whose TRUC relay stall
+(~68 blocks at two in flight) exceeds the entire toy state schedule
+(`notes/WP1-TRUC-P2A-SPIKE.md`). On the mainnet schedule that combination does not arise.
+
+---
+
+## D26 — The SP fee law AND relay-awareness (both halves)
+
+**Decided:** fix `#134` at both ends, not just the cheap one.
+
+The attack needs two gaps together: `SP` carries **no fee law** (`clients/libs/rust/src/tesr.rs:9590-9601`
+— the code's own comment: "the ONE tier in the whole structure with neither a Σ-payload law nor a
+payload-count law"), and supersession is decided by a **maturity race that presumes relayability**
+(`verify_superseded_segment`, `:8418-8433`, kills a rival only on `sup.csv > live_csv`). Co-sign an
+`SP` at ~1 sat over 211 vB and the victims' lower-CSV tiers are unrelayable by construction, losing a
+race the verifier believes they win.
+
+**Why both.** Binding the fee alone closes *this* instance. It leaves the deeper defect intact: the
+supersession argument would still assume something it never checks, so any future path to an
+unrelayable tier reopens it. That is the same shape as D13 — a defence resting on an unstated
+assumption — and it is worth closing at the level of the assumption.
+
+**Risk to respect while implementing:** `SP` is the tier that hosts the level below, so its outputs
+fund every child. A naive Σ constraint could refuse honest spines that legitimately spread value
+across many payload outputs. The sibling tier one block up already carries both laws, so the shape is
+precedented — mirror it rather than inventing one, and keep every honest-spine test green.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB

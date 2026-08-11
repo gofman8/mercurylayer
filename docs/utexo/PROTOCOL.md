@@ -484,8 +484,16 @@ any hidden extra co-signed state/extension shows as a count mismatch, same linch
 pre-TES-R receiver set. (R6′/R7′) per-level branch validation + Σ-inputs terminal ancestors, now
 including the terminal-freeze check for colored ancestry. (R8) RGB consignment client-validated,
 un-broadcast witnesses allowed.
-All txs v3, committed-fee + single P2A, Σout = Σin − fee. **[Amendment, TES-fixable #6]**: hard depth
-cap (reject depth > 8 regardless of policy) + claim-time validation DoS pricing.
+All txs v3, committed-fee + single P2A, Σout = Σin − fee. **[Amendment, TES-fixable #6]**:
+claim-time validation DoS pricing.
+
+> **[D7/D25] The "hard depth cap of 8" that used to be specified here NEVER EXISTED IN CODE, and has
+> been deleted rather than implemented.** The real cap is *derived*, not a literal:
+> `max_split_depth(base, per_level, epoch_blocks) = 1 + (epoch − base_wait)/level_wait`
+> (`lib/src/transfer/receiver.rs:768-779`), enforced by `enforce_split_depth_cap_shaped`
+> (`clients/libs/rust/src/tesr.rs:5210`). It therefore MOVES WITH THE NETWORK PROFILE, which is the
+> whole point — and is why the profile itself is now explicit per network rather than falling through
+> to a toy schedule. Publishing a fixed 8 would have contradicted the code on every profile at once.
 
 **[Shipped]** the R′ set is enforced at claim: **sdk46** (R5′ against the *real* SE counter — the SE
 increments by exactly the tier count, `verify_bundle` accepts the true count and rejects a hidden extra

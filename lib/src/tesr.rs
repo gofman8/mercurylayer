@@ -215,13 +215,67 @@ impl TesrParams {
         Self { d0: 24, delta: 6, d_floor: 6, e0: 12, delta_e: 3, e_floor: 3, m_max: 2, committed_fee_rate: 2.0 }
     }
 
-    /// The mainnet or regtest preset for a network string (`"bitcoin"` → mainnet, else regtest).
-    pub fn for_network(network: &str) -> Self {
-        if network.eq_ignore_ascii_case("bitcoin") || network.eq_ignore_ascii_case("mainnet") {
-            Self::mainnet()
-        } else {
-            Self::regtest()
+    /// **[D25] The schedule for the public test networks — testnet and signet: the MAINNET one.**
+    ///
+    /// These networks have real ~10-minute blocks, so the old behaviour — silently falling through
+    /// to [`Self::regtest`]'s `d0 = 24` — meant a ladder whose head start was about **four hours**,
+    /// on the profile the deployed coordinator actually runs (`server/Settings.toml`:
+    /// `network = "testnet"`). It was stated in no document.
+    ///
+    /// A public test network should exercise **the schedule that ships**. Only regtest, where blocks
+    /// are mined on demand, keeps the test-scale numbers — that is where E2E speed comes from, and it
+    /// is preserved exactly.
+    ///
+    /// This also removes the combination D7 flagged as the sharper problem: on the toy schedule the
+    /// deployed profile admitted a **139-transaction** exit chain, ~135 of them consecutive zero-CSV
+    /// spine tiers, whose TRUC relay stall (~68 blocks at two in flight) exceeded the entire state
+    /// schedule (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`). On the mainnet schedule it does not arise.
+    ///
+    /// **This is a deliberate compatibility break** (D23): a receiver derives its accepted CSV band
+    /// from its own preset, so ladders built against the deployed testnet coordinator by an older
+    /// build are refused. Those coins are expendable.
+    pub fn testnet() -> Self {
+        Self::mainnet()
+    }
+
+    /// **[D7] The preset for a network string — EXPLICIT, with no silent fallback.**
+    ///
+    /// This used to be "`bitcoin`/`mainnet` → mainnet, **everything else** → regtest", which meant
+    /// testnet and signet silently received the toy schedule (`d0 = 24`, ≈4 hours of real time on a
+    /// 10-minute-block network) — a fact stated in no document, and the deployed coordinator runs
+    /// `network = "testnet"`. It also meant a TYPO fell through to the toy schedule rather than
+    /// being caught: `"mainet"` would have quietly produced a 4-hour ladder on real money.
+    ///
+    /// Every supported network is now named, and an unrecognised one is [`None`] rather than a
+    /// guess. Callers that cannot fail take [`Self::for_network_or_default`], which is explicit
+    /// about what it assumes.
+    pub fn for_network_checked(network: &str) -> Option<Self> {
+        let n = network.to_ascii_lowercase();
+        match n.as_str() {
+            "bitcoin" | "mainnet" => Some(Self::mainnet()),
+            "testnet" | "testnet3" | "testnet4" | "signet" => Some(Self::testnet()),
+            "regtest" => Some(Self::regtest()),
+            _ => None,
         }
+    }
+
+    /// [D25] The preset for a network string. **An unrecognised network PANICS rather than guessing.**
+    ///
+    /// It used to fall through to the toy regtest schedule, so `"mainet"` would have produced a
+    /// four-hour ladder on real money and nothing would have said so. Under D23 there is no reason
+    /// to keep that: a network name this binary does not know is a configuration error, and the
+    /// loudest possible failure is the correct one — a mis-set network silently changes every
+    /// timelock in the system.
+    ///
+    /// Callers that can return an error should use [`Self::for_network_checked`] and refuse by name.
+    pub fn for_network(network: &str) -> Self {
+        Self::for_network_checked(network).unwrap_or_else(|| {
+            panic!(
+                "unknown network {network:?}: refusing to guess a TES-R schedule. Every timelock in \
+                 the system derives from this value, so a typo would silently change the whole \
+                 ladder. Supported: bitcoin/mainnet, testnet/testnet3/testnet4/signet, regtest."
+            )
+        })
     }
 
     /// State CSV at state-count `k`: `D0 − k·δ`, clamped to the floor.
@@ -1069,7 +1123,12 @@ mod tests {
     fn params_network_presets() {
         assert_eq!(TesrParams::for_network("bitcoin"), TesrParams::mainnet());
         assert_eq!(TesrParams::for_network("regtest"), TesrParams::regtest());
-        assert_eq!(TesrParams::for_network("signet"), TesrParams::regtest());
+        // [D25] This line used to assert `signet == regtest`, PINNING the defect as intended
+        // behaviour: signet and testnet have real ~10-minute blocks, so the toy schedule meant a
+        // ~4-hour head start on the profile the deployed coordinator runs. A public test network
+        // must exercise the schedule that ships; only regtest, which mines on demand, stays fast.
+        assert_eq!(TesrParams::for_network("signet"), TesrParams::mainnet());
+        assert_eq!(TesrParams::for_network("testnet"), TesrParams::mainnet());
     }
 
     #[test]
