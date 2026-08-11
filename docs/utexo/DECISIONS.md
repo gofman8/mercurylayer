@@ -343,6 +343,34 @@ fund every child. A naive Σ constraint could refuse honest spines that legitima
 across many payload outputs. The sibling tier one block up already carries both laws, so the shape is
 precedented — mirror it rather than inventing one, and keep every honest-spine test green.
 
+### Both halves are now IMPLEMENTED (2026-08-11)
+
+**Half 1 — the Σ-payload law on the intermediate `SP`** landed first, closing the live instance.
+
+**Half 2 — relay-awareness** landed as `#135`, and it is the one that mattered for the future. The
+supersession race now reads a `LiveRival { csv, relayable, implied_fee, vsize }` instead of a bare
+CSV, and refuses by name when the live tier cannot be broadcast:
+
+> *superseded state 0 is disclosed as beaten by the live tier over the same outpoint, but that live
+> tier pays N sats over M vB — under the 1 sat/vB relay floor, so it cannot be broadcast and cannot
+> win any race.*
+
+Three details worth keeping:
+
+* **One constructor, three segment kinds.** Root ladder, ancestor segment and child segment all build
+  their live map through `LiveRival::read`. Three hand-rolled fee computations would be three chances
+  to disagree, and the one that got it wrong would report an unrelayable tier as relayable — exactly
+  the hole being closed. The fee comes from the parsed transaction and the prevout map, never from a
+  declared `out_value`, which is attacker-supplied on a conveyed bundle.
+* **The P2A anchor is deliberately NOT counted.** Package relay via `submitpackage` would rescue an
+  underpaying tier, but this tree has no `submitpackage` caller yet (its own open item), so crediting
+  the anchor would credit a rescue nobody can perform. The check is conservative in exactly one
+  direction: it may refuse a bundle a future build could broadcast, which costs a retry, not a coin.
+* **It is redundant on honest ladders, and that is the point.** The value laws already hold every
+  live tier at the committed rate (2 sat/vB, twice the floor), so the whole suite stayed green when
+  the check landed — 589 tests. The redundancy is what converts "a future tier without a value law
+  silently reopens the race" into "it fails here, by name".
+
 ---
 
 ## D27 — `initlock`/`interval` are compiled in; the coordinator's copy is a cross-check (closes D8(f))

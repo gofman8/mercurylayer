@@ -104,6 +104,30 @@ pub fn committed_fee(fee_rate_sats_per_vb: f64) -> u64 {
     (TIER_VBYTES as f64 * fee_rate_sats_per_vb).ceil() as u64
 }
 
+/// Bitcoin Core's default `minrelaytxfee`, in sat/vB. A transaction paying less than this is not
+/// merely slow — it is REFUSED at submission ("min relay fee not met") and never enters a mempool.
+pub const MIN_RELAY_FEE_RATE_SATS_PER_VB: f64 = 1.0;
+
+/// **Can this tier be broadcast ON ITS OWN?** [D26]
+///
+/// The ladder's whole safety argument is a maturity race: the lower-CSV tier confirms first and wins
+/// the outpoint. That argument is about a race, and *a transaction that cannot enter a mempool never
+/// enters the race*. So "the superseded tier has a higher CSV, therefore it loses" is only true if
+/// the live tier can actually be sent — which is a fee question, not a timelock question.
+///
+/// Measured, not assumed (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`): a v3 tier under the floor is
+/// refused outright at `sendrawtransaction`.
+///
+/// **Deliberately ignores the P2A anchor**, and that is the conservative direction. Every tier
+/// carries one, and package relay via `submitpackage` WOULD rescue an underpaying tier — but this
+/// tree has no `submitpackage` caller yet (tracked as its own item), so today an underpaid tier is
+/// simply unbroadcastable. Counting the anchor here would credit the ladder with a rescue nobody can
+/// perform. When that path exists, this is the function to revisit; until then it may refuse a
+/// bundle that a future build could broadcast, which costs a retry rather than a coin.
+pub fn tier_is_relayable(implied_fee_sats: u64, vsize: u64) -> bool {
+    implied_fee_sats >= (vsize as f64 * MIN_RELAY_FEE_RATE_SATS_PER_VB).ceil() as u64
+}
+
 /// Value flowing to a tier's main output = parent value − committed fee − the P2A anchor value.
 /// Returns `None` if the coin is too small to carry one more tier (the terminal "dust" case).
 pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64> {

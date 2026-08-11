@@ -8580,6 +8580,60 @@ pub fn verify_bundle_bound(
 /// pays the children (not the owner), so its output-payee check is skipped here — each child's outputs
 /// are verified against its own aggregate by [`verify_child_bundle`]. Everything else (co-signs under
 /// `A`, the per-outpoint race, the exact-equality census) is unchanged.
+/// **The LIVE tier a superseded one contends with, and everything needed to judge that contest.**
+///
+/// [D26 half 2 / #135] Not just the CSV. The contest is decided by two facts, and until this struct
+/// existed only one of them travelled: the live tier must mature FIRST (`csv`) *and* it must be
+/// capable of being broadcast at all (`relayable`). The second was an assumption discharged at a
+/// distance by the value laws on live tiers, joined to its use site by a comment. `implied_fee` and
+/// `vsize` are carried so the refusal can state the arithmetic instead of asserting a verdict.
+#[derive(Clone, Copy, Debug)]
+struct LiveRival {
+    csv: u32,
+    relayable: bool,
+    implied_fee: u64,
+    vsize: u64,
+}
+
+impl LiveRival {
+    /// Read a live tier's race facts off the tier itself.
+    ///
+    /// One constructor for all three segment kinds (root ladder, ancestor segment, child segment)
+    /// deliberately: three hand-rolled fee computations would be three chances to disagree, and the
+    /// one that got it wrong would report an unrelayable tier as relayable — which is precisely the
+    /// hole this closes.
+    ///
+    /// Values come from the PARSED transaction and the prevout map, never from a declared
+    /// `out_value` field: on a conveyed bundle those are attacker-supplied, and a tier that claims a
+    /// healthy fee it does not pay is the whole attack.
+    fn read(
+        tx: &electrum_client::bitcoin::Transaction,
+        prevout_value_of: &std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64>,
+        what: &str,
+    ) -> Result<Self> {
+        let op = tx.input[0].previous_output;
+        let value_in = *prevout_value_of
+            .get(&(op.txid, op.vout))
+            .ok_or_else(|| anyhow::anyhow!("{what}: spends an outpoint outside this ladder"))?;
+        let value_out: u64 = tx.output.iter().map(|o| o.value).sum();
+        // `checked_sub`: a tier whose outputs exceed its input is not merely unrelayable, it is
+        // invalid — and saturating would report it as paying a comfortable fee.
+        let implied_fee = value_in.checked_sub(value_out).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what}: spends {value_in} and pays out {value_out} — it creates value, so it could \
+                 never be valid, let alone relayed"
+            )
+        })?;
+        let vsize = tx.vsize() as u64;
+        Ok(LiveRival {
+            csv: tx.input[0].sequence.0 & 0xFFFF,
+            relayable: mercurylib::tesr::tier_is_relayable(implied_fee, vsize),
+            implied_fee,
+            vsize,
+        })
+    }
+}
+
 /// Validate + count a segment's DISCLOSED SUPERSEDED tiers, returning how many were accepted.
 ///
 /// Shared by the root ladder (`verify_bundle_ex`) and a split CHILD's own segment, so the two can
@@ -8599,7 +8653,7 @@ fn verify_superseded_segment(
     agg_spk: &electrum_client::bitcoin::ScriptBuf,
     p: &mercurylib::tesr::TesrParams,
     prevout_value_of: &mut std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64>,
-    live_csv_by_outpoint: &std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u32>,
+    live_by_outpoint: &std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), LiveRival>,
     live_txids: &std::collections::HashSet<electrum_client::bitcoin::Txid>,
 ) -> Result<u32> {
     use electrum_client::bitcoin::{consensus::deserialize, Transaction, Txid};
@@ -8702,36 +8756,47 @@ fn verify_superseded_segment(
     let mut dead = vec![false; sups.len()];
     let mut dead_outputs: std::collections::HashSet<(Txid, u32)> = std::collections::HashSet::new();
     for (idx, sup) in sups.iter().enumerate() {
-        if let Some(&live_csv) = live_csv_by_outpoint.get(&sup.prevout) {
-            // ⚠️ [D26] **THIS TEST RESTS ON AN ASSUMPTION IT DOES NOT ITSELF CHECK: that the live
-            // tier can be BROADCAST.** "Lower CSV matures first, therefore wins" is a statement about
-            // a race — and a transaction that cannot enter a mempool never enters the race at all.
+        if let Some(live) = live_by_outpoint.get(&sup.prevout) {
+            // **[D26 half 2 / #135] THE LIVE TIER MUST BE ABLE TO ENTER THE RACE AT ALL.**
             //
-            // That is not hypothetical. Until the Σ-payload law was added to the intermediate spine,
-            // a sender could co-sign an `SP` paying its children an above-dust but starving slot, so
-            // that every tier hanging off it was unrelayable by construction; the sender then waited
-            // out `d0` and swept the level back with the very cap this loop had retired as
-            // "superseded". Measured context: a v3 tier below the mempool floor is refused outright
-            // (`min relay fee not met`), package-CPFP would rescue it, and this tree has no
-            // `submitpackage` caller (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`).
+            // "Lower CSV matures first, therefore wins" is a statement about a race, and a
+            // transaction that cannot enter a mempool never enters one. So before the CSV comparison
+            // below means anything, the live tier has to be BROADCASTABLE.
             //
-            // **What currently discharges the assumption is the VALUE LAWS on the live tiers** — Σ
-            // and payload-count on extensions and states, and now Σ on `SP` — which bound each
-            // tier's implied fee to the committed rate and so keep it relayable. That is a
-            // dependency between two distant parts of the verifier, held together by nothing but
-            // this comment. Any future tier that escapes a value law reopens the race.
+            // This used to be an assumption with a comment on it. It was not hypothetical: until the
+            // Σ-payload law was added to the intermediate spine, a sender could co-sign an `SP`
+            // paying its children an above-dust but starving slot, so every tier hanging off it was
+            // unrelayable by construction — then wait out `d0` and sweep the level back with the very
+            // cap this loop had just retired as "superseded". The value laws (Σ and payload-count on
+            // extensions and states, Σ on `SP`) closed that by holding each live tier's implied fee
+            // at the committed rate, which keeps it relayable — but that made the safety of THIS
+            // check depend on laws enforced hundreds of lines away, joined by nothing but prose. Any
+            // future tier that escaped a value law would have silently reopened the race.
             //
-            // The structural fix is to pass each live tier's relayability in and assert it here,
-            // rather than inferring it. Until that lands, do NOT add a live tier without a value law,
-            // and do not weaken one on the grounds that "the CSV ordering protects us" — it does not.
-            //
+            // Now it is checked where it is relied on. On honest ladders this is redundant with the
+            // value laws and never fires; that redundancy is the point — it is what converts "a
+            // future change could reopen this" into "a future change fails here, by name".
+            if !live.relayable {
+                return Err(anyhow::anyhow!(
+                    "superseded {} {} is disclosed as beaten by the live tier over the same \
+                     outpoint, but that live tier pays {} sats over {} vB — under the {} sat/vB \
+                     relay floor, so it cannot be broadcast and cannot win any race. Counting the \
+                     superseded tier as retired would be counting a race that never happens: the \
+                     disclosed tier survives, matures, and takes the outpoint. Refusing the bundle.",
+                    sup.kind,
+                    sup.j,
+                    live.implied_fee,
+                    live.vsize,
+                    mercurylib::tesr::MIN_RELAY_FEE_RATE_SATS_PER_VB
+                ));
+            }
             // Directly contends with a live tier over the SAME outpoint — it MUST lose the race, or it
             // could mature first and steal. (This is [S-1/S-2]: extensions and states alike, against the
             // live tier spending the same outpoint, never a global final_csv.)
-            if sup.csv <= live_csv {
+            if sup.csv <= live.csv {
                 return Err(anyhow::anyhow!(
                     "superseded {} {} has CSV {} <= the live tier's {} over the same outpoint — it could out-race the owner",
-                    sup.kind, sup.j, sup.csv, live_csv
+                    sup.kind, sup.j, sup.csv, live.csv
                 ));
             }
             dead[idx] = true;
@@ -9371,11 +9436,22 @@ fn verify_bundle_ex(
     //        its state pays the attacker — outright theft. Extensions are now checked identically.
     // Keyed per-OUTPUT for the same reason as `prevout_value_of`: a split state hosts a child on each
     // `out[j]`, so "the live tier over this outpoint" is only well-defined per (txid, vout).
-    let mut live_csv_by_outpoint: std::collections::HashMap<(Txid, u32), u32> =
+    //
+    // [D26 half 2 / #135] IT CARRIES RELAYABILITY, NOT JUST THE CSV. The comparison downstream is
+    // "the superseded tier loses the maturity race to this live one" — a claim about a race that a
+    // live tier which cannot be broadcast never enters. That premise used to be discharged, at a
+    // distance, by the value laws on live tiers (Σ and payload-count on extensions and states, Σ on
+    // `SP`) holding each implied fee at the committed rate. A comment tied the two together. Now the
+    // fact travels WITH the tier it is a fact about, so a future tier that escapes a value law makes
+    // the race check fail loudly instead of silently becoming unsound.
+    let mut live_by_outpoint: std::collections::HashMap<(Txid, u32), LiveRival> =
         std::collections::HashMap::new();
     for i in 1..txs.len() {
         let op = txs[i].input[0].previous_output;
-        live_csv_by_outpoint.insert((op.txid, op.vout), txs[i].input[0].sequence.0 & 0xFFFF);
+        live_by_outpoint.insert(
+            (op.txid, op.vout),
+            LiveRival::read(&txs[i], &prevout_value_of, &format!("live exit tier {i}"))?,
+        );
     }
     // [C-2] Every LIVE exit tier's txid, so a superseded list cannot re-declare one of them (or repeat
     // itself) to buy an extra census slot.
@@ -9391,7 +9467,7 @@ fn verify_bundle_ex(
         &agg_spk,
         &p,
         &mut prevout_value_of,
-        &live_csv_by_outpoint,
+        &live_by_outpoint,
         &live_txids,
     )?;
 
@@ -9962,7 +10038,7 @@ pub fn verify_child_bundle(
                     prevouts.insert((id, v as u32), o.value);
                 }
             }
-            let mut live: std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u32> = std::collections::HashMap::new();
+            let mut live: std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), LiveRival> = std::collections::HashMap::new();
             // The census key MUST move with the payload vout it describes (CTESR-GATE §3.2): this map
             // is KEYED rather than content-checked, so a key that disagreed with its tier would make
             // the superseded battery compare a rival against the WRONG live CSV — the one migration
@@ -9983,14 +10059,14 @@ pub fn verify_child_bundle(
             let first_over_funding = ext_parsed.as_ref().map(|(t, _, _)| t).unwrap_or(&st_tx);
             live.insert(
                 (fund_txid, seg.funding_vout),
-                first_over_funding.input[0].sequence.0 & 0xFFFF,
+                LiveRival::read(first_over_funding, &prevouts, "the segment tier over its funding outpoint")?,
             );
             let mut live_ids: std::collections::HashSet<electrum_client::bitcoin::Txid> =
                 std::collections::HashSet::from([st_tx.txid()]);
             if let Some((ext_tx, payload_vout, _)) = &ext_parsed {
                 live.insert(
                     (ext_tx.txid(), *payload_vout),
-                    st_tx.input[0].sequence.0 & 0xFFFF,
+                    LiveRival::read(&st_tx, &prevouts, "the segment's live state")?,
                 );
                 live_ids.insert(ext_tx.txid());
             }
@@ -10363,14 +10439,17 @@ pub fn verify_child_bundle(
                 child_prevouts.insert((id, vout as u32), o.value);
             }
         }
-        let mut child_live: std::collections::HashMap<(_Txid, u32), u32> =
+        let mut child_live: std::collections::HashMap<(_Txid, u32), LiveRival> =
             std::collections::HashMap::new();
         // Same rule as the ancestor segment: the KEYED census map must track the payload vout of the
         // tier it describes, or a rival would be raced against the wrong live CSV (CTESR-GATE §3.2).
-        child_live.insert((sp_txid, cb.sp_vout), ext_tx.input[0].sequence.0 & 0xFFFF);
+        child_live.insert(
+            (sp_txid, cb.sp_vout),
+            LiveRival::read(&ext_tx, &child_prevouts, "the child's live extension")?,
+        );
         child_live.insert(
             (ext_tx.txid(), cb.child_extension.payload_vout),
-            st_tx.input[0].sequence.0 & 0xFFFF,
+            LiveRival::read(&st_tx, &child_prevouts, "the child's live state")?,
         );
         let child_live_ids: std::collections::HashSet<_Txid> =
             [ext_tx.txid(), st_tx.txid()].into_iter().collect();
@@ -11806,7 +11885,10 @@ mod verify_tests {
             .script_pubkey();
         let mut prevouts: std::collections::HashMap<(Txid, u32), u64> =
             std::collections::HashMap::new();
-        let live_csv: std::collections::HashMap<(Txid, u32), u32> = std::collections::HashMap::new();
+        // Empty on purpose: this test exercises the dedup PRE-PASS, which runs ahead of the race
+        // battery, so no live rival is needed to reach it.
+        let live_csv: std::collections::HashMap<(Txid, u32), LiveRival> =
+            std::collections::HashMap::new();
         let live_txids: std::collections::HashSet<Txid> = live
             .iter()
             .map(|t| Txid::from_str(&t.txid).unwrap())
@@ -22285,5 +22367,99 @@ mod child_reclaim_tests {
                 assert!(new >= p.d_floor, "CSV {old} produced {new}, under the floor {}", p.d_floor);
             }
         }
+    }
+}
+
+/// [D26 half 2 / #135] Relayability is now a fact the race check reads, not one it assumes.
+#[cfg(test)]
+mod live_rival_relayability_tests {
+    use super::*;
+
+    /// The predicate itself, at the boundary. A tier paying EXACTLY its vsize in sats meets a
+    /// 1 sat/vB floor; one sat less does not. Off-by-one here is the difference between accepting a
+    /// bundle whose live tier cannot be sent and refusing one that can.
+    #[test]
+    fn the_relay_floor_is_inclusive_at_exactly_one_sat_per_vbyte() {
+        assert_eq!(mercurylib::tesr::MIN_RELAY_FEE_RATE_SATS_PER_VB, 1.0);
+        for vsize in [1u64, 111, 125, 168, 1000] {
+            assert!(
+                mercurylib::tesr::tier_is_relayable(vsize, vsize),
+                "paying exactly {vsize} sats over {vsize} vB meets a 1 sat/vB floor"
+            );
+            assert!(
+                !mercurylib::tesr::tier_is_relayable(vsize - 1, vsize),
+                "paying {} over {vsize} vB is under the floor and must be refused",
+                vsize - 1
+            );
+            assert!(mercurylib::tesr::tier_is_relayable(vsize + 1, vsize));
+        }
+        assert!(!mercurylib::tesr::tier_is_relayable(0, 125), "a zero-fee tier never relays");
+    }
+
+    /// The tiers this protocol actually builds are comfortably clear of the floor — which is WHY the
+    /// 585-test suite stayed green when the check landed. If this ever stops holding, honest bundles
+    /// start being refused and the failure should be here, in one obvious test, not spread across
+    /// every E2E at once.
+    #[test]
+    fn an_honestly_built_tier_clears_the_floor_with_room() {
+        let p = mercurylib::tesr::TesrParams::for_network("bitcoin");
+        let fee = mercurylib::tesr::committed_fee(p.committed_fee_rate);
+        // The committed fee is sized off TIER_VBYTES; a real signed tier measures close to it.
+        for vsize in [mercurylib::tesr::TIER_VBYTES, mercurylib::tesr::TIER_VBYTES + 20] {
+            assert!(
+                mercurylib::tesr::tier_is_relayable(fee, vsize),
+                "an honest tier ({fee} sats over {vsize} vB, committed rate {}) must relay",
+                p.committed_fee_rate
+            );
+        }
+        assert!(
+            p.committed_fee_rate > mercurylib::tesr::MIN_RELAY_FEE_RATE_SATS_PER_VB,
+            "the committed rate must sit ABOVE the relay floor, or honest ladders live on the edge"
+        );
+    }
+
+    /// `LiveRival::read` must take its fee from the transaction, never from a declared field — the
+    /// declared ones are attacker-supplied on a conveyed bundle, and a tier claiming a fee it does
+    /// not pay is the whole attack.
+    #[test]
+    fn read_derives_the_fee_from_the_parsed_tx_and_the_prevout_map() {
+        let src = include_str!("tesr.rs");
+        let at = src.find("    fn read(\n").expect("LiveRival::read exists");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("item ends")];
+        assert!(
+            body.contains("tx.output.iter().map(|o| o.value).sum()"),
+            "the fee must be summed from the PARSED outputs"
+        );
+        assert!(
+            body.contains("checked_sub"),
+            "a tier that creates value must error, not saturate into a healthy-looking fee"
+        );
+        // `.out_value`, the FIELD ACCESS — not the bare token, which is a substring of the
+        // legitimate `prevout_value_of` map this function is supposed to read.
+        assert!(
+            !body.contains(".out_value"),
+            "`TesrTier::out_value` is the DECLARED value and is attacker-supplied on a conveyed \
+             bundle; the fee must come from the parsed tx, so it must not be read here"
+        );
+    }
+
+    /// **The ordering that makes the check worth having.** The relayability refusal must run BEFORE
+    /// the CSV comparison: if the live tier cannot be broadcast, the CSV comparison is meaningless,
+    /// and letting it pass first would accept the superseded tier on the strength of a race that
+    /// never happens.
+    #[test]
+    fn relayability_is_checked_before_the_csv_race() {
+        let src = include_str!("tesr.rs");
+        let at = src
+            .find("fn verify_superseded_segment(")
+            .expect("verify_superseded_segment exists");
+        let body = &src[at..];
+        let relay = body.find("if !live.relayable {").expect("the relayability refusal exists");
+        let csv = body.find("if sup.csv <= live.csv {").expect("the CSV race check exists");
+        assert!(
+            relay < csv,
+            "the relayability refusal must precede the CSV race check — otherwise a superseded tier \
+             is retired on the strength of a race its rival can never enter"
+        );
     }
 }
