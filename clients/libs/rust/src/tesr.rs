@@ -9594,8 +9594,52 @@ pub fn verify_child_bundle(
         // every child of this level. Placed after the structural pass and the CSV band, per
         // `refuse_dust_payloads`.
         refuse_dust_payloads(&st_tx, &format!("ancestor {i} state"))?;
-        // [ANCHOR] + [OPRET] The other half of the ancestor gap, on the tier that has no Σ law and no
-        // payload-count law either — so before these two lines an intermediate `SP` could carry any
+        // [D26] **Σ-PAYLOAD LAW ON THE INTERMEDIATE SPINE — the fee bound this tier never had.**
+        //
+        // Dust, anchor and opret were bound above; the FEE was not. `SP` could commit ~1 sat over
+        // ~211 vB and still verify, because nothing related its outputs to what funds it. That is
+        // half of a theft: the pieces it mints verify perfectly (the leaf reads `sp_out.value`
+        // below), but every one of their exit tiers is UNRELAYABLE by construction — and
+        // `verify_superseded_segment` retires a rival purely on `sup.csv > live_csv`, reasoning that
+        // the lower-CSV live tier "MUST lose the race". It cannot win a race it cannot enter. The
+        // sender then sweeps the level back with the disclosed cap after `d0`.
+        //
+        // The law is Σ, NOT the payload-count law its sibling also carries. `SP` is the tier that
+        // hosts the level below, so multiple payload outputs — one per child — are exactly what it
+        // is FOR; a count law would refuse every honest split. Σ bounds the implied fee regardless of
+        // how the value is divided, which is the property that matters here.
+        {
+            let payload_sum: u64 = st_tx
+                .output
+                .iter()
+                .filter(|o| {
+                    o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                        && !o.script_pubkey.is_op_return()
+                })
+                .map(|o| o.value)
+                .sum();
+            let expected = mercurylib::tesr::tier_out_value(st_prev_value, cb.parent.fee_rate)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ancestor {i} state: its funding value {st_prev_value} cannot carry a tier at \
+                         {} sat/vB — the segment is unfundable as declared",
+                        cb.parent.fee_rate
+                    )
+                })?;
+            if payload_sum != expected {
+                return Err(anyhow::anyhow!(
+                    "ancestor {i} state (the intermediate spine SP): Σ over its payload outputs is \
+                     {payload_sum}, but its funding of {st_prev_value} at {} sat/vB requires exactly \
+                     {expected}. A LOWER sum means the tier commits a larger fee than the schedule \
+                     allows — at the extreme it commits nearly everything and the children it funds \
+                     are minted against a tier that can still relay, while THEIR tiers cannot; a \
+                     HIGHER sum means it mints value its funding does not cover.",
+                    cb.parent.fee_rate
+                ));
+            }
+        }
+        // [ANCHOR] + [OPRET] The other half of the ancestor gap, on the tier that has no
+        // payload-count law — so before these two lines an intermediate `SP` could carry any
         // number of zero-value anchors and oprets, all of them removed by every filter in the file.
         bind_single_p2a_anchor(&st_tx, &format!("ancestor {i} state"))?;
         bind_opret_count(&st_tx, &format!("ancestor {i} state"), cb.parent.is_colored() as usize)?;
@@ -16533,15 +16577,96 @@ mod wrong_payee_attack_tests {
             "the tripwire's premise: CSP pays {pays} while spending {spends} — consensus-invalid"
         );
 
-        match verify(&cb, &facts) {
-            Ok(()) => { /* GAP as described: V2(a) survives on the ancestor STATE hop. */ }
-            Err(e) => panic!(
-                "THE ANCESTOR-STATE VALUE GAP HAS BEEN CLOSED — this tripwire has done its job. \
-                 `verify_child_bundle` now refuses a minting ancestor split state ({e}); replace this \
-                 test with an assertion that the refusal names the value law, and strike the gap from \
-                 the module doc comment."
-            ),
-        }
+        // [D26] THE GAP IS CLOSED, and this tripwire has done its job — it is now the assertion it
+        // told its successor to write. The Σ-payload law on the intermediate spine
+        // (`verify_child_bundle`) relates `SP`'s outputs to what actually funds it, so a state that
+        // mints value out of nothing no longer verifies.
+        //
+        // Note what closed it. The law was added for a DIFFERENT attack — a sender committing a
+        // ~1-sat fee on `SP` so that the pieces it mints verify while their exit tiers are
+        // unrelayable, then sweeping the level back with the disclosed cap. Both attacks are the same
+        // hole seen from opposite ends: nothing related `SP`'s outputs to its funding, so the sum
+        // could be too HIGH (mint, this test) or too LOW (unpayable fee). One Σ closes both.
+        let e = verify(&cb, &facts).expect_err(
+            "a minting ancestor split state must be REFUSED — it pays more than it spends and could \
+             never confirm, yet every law the leaf is subject to was satisfied",
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.contains("Σ over its payload outputs") && msg.contains("intermediate spine SP"),
+            "the refusal must name the VALUE law it broke, not merely fail — a receiver that cannot \
+             tell why it refused cannot tell a mint from a malformed bundle. Got: {msg}"
+        );
+        // And it must be refused for the RIGHT arithmetic: the mint is ten times the honest slot, so
+        // the reported Σ must exceed what the funding allows rather than fall short of it.
+        assert!(
+            msg.contains(&pays.to_string()) || msg.contains(&minted.to_string()),
+            "the refusal should report the offending sum so the failure is diagnosable: {msg}"
+        );
+    }
+
+    /// [D26] **THE OTHER END OF THE SAME HOLE: an `SP` that commits a ruinous FEE.**
+    ///
+    /// The mint test above is the sum being too HIGH. This is it being too LOW — and it is the more
+    /// dangerous of the two, because a minting `SP` could never confirm anyway while an underpaying
+    /// one is perfectly valid consensus and merely cannot RELAY.
+    ///
+    /// The attack: co-sign an `SP` that pays its children almost nothing and commits the rest as
+    /// fee. The pieces it mints verify perfectly — the leaf reads `sp_out.value` and every law it is
+    /// subject to is satisfied. But the children's own exit tiers are then funded from a slot so
+    /// small that they cannot pay their own way, so they are unrelayable by construction. And
+    /// `verify_superseded_segment` retires a rival purely on `sup.csv > live_csv`, reasoning that the
+    /// lower-CSV live tier "MUST lose the race" — which it cannot win if it cannot enter. The sender
+    /// waits out `d0` and sweeps the level back with the disclosed cap.
+    ///
+    /// Measured corroboration that the unrelayability is real, not theoretical: a v3 tier below the
+    /// mempool floor is refused with `min relay fee not met`
+    /// (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`), package-CPFP would rescue it, and no
+    /// `submitpackage` caller exists in this tree.
+    #[test]
+    fn an_ancestor_split_state_committing_a_ruinous_fee_is_refused() {
+        let rig = rig();
+        let (mut cb, mut facts) = rig.build(true, Payee::Honest);
+        let g = &rig.ancestor;
+
+        let xa: Transaction = parse(&cb.ancestors[0].extension.as_ref().unwrap().signed_tx);
+        let funding = xa.output[0].value;
+        let honest = mercurylib::tesr::tier_out_value(funding, rig.rate).expect("fundable");
+
+        // Build the HONEST split state, then starve its payload output to a single satoshi and
+        // re-co-sign. The difference vanishes into the fee. A hostile sender does not use our
+        // builder, so the defence must live on the RECEIVE side — which is the whole point.
+        let honest_sp = mercurylib::tesr::build_split_state(
+            &xa.txid().to_string(), funding,
+            &[(rig.child.address.clone(), honest)],
+            NET, SPINE_CSV, rig.rate,
+        ).expect("an honest split state");
+        let mut raw = parse(&honest_sp.tx_hex);
+        // ABOVE the 330-sat dust floor, so `refuse_dust_payloads` does NOT fire — that check catches
+        // only the degenerate 1-sat case. This is the window the Σ law exists for: a payload that is
+        // perfectly standard and spendable, while the fee it implies is ruinous.
+        let starved = 1_000u64;
+        assert!(starved > 330 && starved < honest / 10, "above dust, far below honest");
+        raw.output[honest_sp.payload_vout as usize].value = starved;
+        let tx = cosign(&raw, funding, &g.spk, &g.kp);
+        cb.ancestors[0].state = tier(&tx, Some(SPINE_CSV), honest_sp.payload_vout);
+        facts.ancestors[0].num_sigs = CHILD_V2_BASELINE + 2;
+
+        // Conservation HOLDS — outputs are far below inputs — so this is consensus-valid and every
+        // structural check passes. Only the Σ law catches it.
+        let pays: u64 = tx.output.iter().map(|o| o.value).sum();
+        assert!(pays < funding, "the premise: it underpays, so it is valid but unrelayable");
+        assert!(starved > 330, "and it clears the dust floor, so only the Σ law can catch it");
+
+        let e = verify(&cb, &facts)
+            .expect_err("an SP committing nearly its whole funding as fee must be REFUSED");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("\u{3a3} over its payload outputs") && msg.contains("intermediate spine SP"),
+            "the refusal must name the value law it broke: {msg}"
+        );
+        assert!(!msg.contains("not found") && !msg.contains("could not"),
+            "must be the value law, not an incidental lookup failure: {msg}");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════════════
