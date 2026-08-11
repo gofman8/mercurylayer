@@ -502,6 +502,32 @@ fee-bump workstream) is now the largest**, and its open question is priced in
 
 ---
 
+## D30 — `colored_ladder` stays `false` until CR-D and the client ports land (D1's flip, re-gated)
+
+**Verified 2026-08-11**, against code rather than against the plan.
+
+D1 decided the coloured ladder is the normative RGB lane and that
+`SdkConfig::colored_ladder` flips `false → true`. **The flip is not takeable yet**, and each of D1's
+own three prerequisites was re-checked today and is still absent:
+
+| prerequisite | state today |
+|---|---|
+| a coloured on-chain re-anchor | **not built.** D29 chose the design (CR-D, a coloured de-trigger); no builder exists. Without it a coloured coin has **no renewal primitive at all** — its life is bounded and ends in a forced exit. |
+| JS and web clients receiving a laddered coin | **still fail closed** (`nodejs/transfer_receive.js`, `web/transfer_receive.js`): neither can run `verify_bundle`, and both refuse rather than fall through to the flat census — which is the correct refusal, and which makes every RGB coin unreceivable on those clients the moment the default flips. |
+| Lightning on the coloured child lane | **refused by name** (`refuse_colored_multi_payee`, and the depth-1 cap). |
+
+**So flipping today would ship coins that cannot be renewed, cannot be received by two of the four
+clients, and cannot use Lightning.** The decision is not reversed — it is sequenced behind CR-D and
+the two client ports, which is where the re-cost in `COLOURED-SPINE-REANCHOR-SCOPE.md` §4 already
+puts them.
+
+**What DID land in the meantime**, so the gate is smaller than it was: the plain-spine theft that
+BLOCKER 1 named is closed and exercised (D26 both halves), terminality is SE-attested (D28), the flat
+ladder is no longer coordinator-defined (D27), and the `claim()` laddering hole that would have
+destroyed an RGB allocation on a materialised carrier is closed (RGB Stage 0).
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB
