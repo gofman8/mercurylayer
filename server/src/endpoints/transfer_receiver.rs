@@ -184,6 +184,100 @@ pub async fn get_msg_addr(statechain_entity: &State<StateChainEntity>, new_auth_
     return status::Custom(Status::Ok, Json(response_body));
 }
 
+/// **[C-6] Is the caller-supplied key the one this transfer was actually addressed to?**
+///
+/// Split out of the handler so the rule is testable without a database — the defect it closes was a
+/// *missing comparison*, and a missing comparison is invisible to every test that only exercises the
+/// happy path.
+///
+/// Compares PARSED keys, never strings: one key has several textual spellings (case, a `0x` prefix),
+/// and a string compare would refuse an honest recipient whose client formats hex differently while
+/// still admitting nothing an attacker could not already do. Unparseable input is `false`, not an
+/// error — "this is not the recipient" is the same answer either way.
+fn supplied_key_is_the_recorded_recipient(supplied: &str, recorded: &PublicKey) -> bool {
+    let cleaned = supplied.strip_prefix("0x").unwrap_or(supplied);
+    match PublicKey::from_str(cleaned) {
+        Ok(parsed) => parsed == *recorded,
+        // AUDITED-SWALLOW: fails toward REFUSING. This function's `false` means "not the recorded
+        // recipient", and an unparseable key is not the recorded recipient — the caller cannot
+        // unlock either way. Propagating the parse error would change nothing except the status
+        // code, and would hand an attacker a way to distinguish malformed input from a wrong key.
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod c6_unlock_authorization_tests {
+    use super::supplied_key_is_the_recorded_recipient;
+    use secp256k1_zkp::{rand, PublicKey, Secp256k1, SecretKey};
+
+    fn key(seed: u8) -> PublicKey {
+        let secp = Secp256k1::new();
+        PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[seed; 32]).unwrap())
+    }
+
+    #[test]
+    fn the_recorded_recipients_own_key_is_accepted() {
+        let recorded = key(1);
+        assert!(supplied_key_is_the_recorded_recipient(&recorded.to_string(), &recorded));
+        // …in either spelling the wire uses.
+        assert!(supplied_key_is_the_recorded_recipient(
+            &format!("0x{}", recorded),
+            &recorded
+        ));
+        assert!(supplied_key_is_the_recorded_recipient(
+            &recorded.to_string().to_uppercase(),
+            &recorded
+        ));
+    }
+
+    /// **THE ATTACK.** Before this comparison existed, the handler verified the signature under the
+    /// key the caller supplied — which proves only "the sender of this request owns the key they
+    /// sent". Every attacker owns a key they just generated. This is the test that would have caught
+    /// it: a perfectly valid, perfectly self-consistent throwaway key must still be refused.
+    #[test]
+    fn a_throwaway_key_the_attacker_generated_is_refused() {
+        let recorded = key(1);
+        let throwaway = PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::new(&mut rand::thread_rng()),
+        );
+        assert_ne!(throwaway, recorded, "the fixture must actually differ");
+        assert!(
+            !supplied_key_is_the_recorded_recipient(&throwaway.to_string(), &recorded),
+            "a self-consistent key that is not the RECORDED recipient must not clear the lock — \
+             that is the whole of C-6 (LN-receive theft and batch-atomicity break)"
+        );
+    }
+
+    #[test]
+    fn garbage_is_refused_rather_than_erroring_out() {
+        let recorded = key(1);
+        for junk in ["", "0x", "not-a-key", "02", &"ff".repeat(33)] {
+            assert!(
+                !supplied_key_is_the_recorded_recipient(junk, &recorded),
+                "{junk:?} must be refused"
+            );
+        }
+    }
+
+    /// A near-miss must fail too: the same x-coordinate with the other parity is a DIFFERENT key,
+    /// and accepting it would let anyone who knows the recipient's key flip one byte and pass.
+    #[test]
+    fn the_other_parity_of_the_recorded_key_is_a_different_key() {
+        let recorded = key(1);
+        let hex = recorded.to_string();
+        let flipped = match &hex[..2] {
+            "02" => format!("03{}", &hex[2..]),
+            _ => format!("02{}", &hex[2..]),
+        };
+        assert!(
+            !supplied_key_is_the_recorded_recipient(&flipped, &recorded),
+            "the opposite-parity key must not pass as the recorded recipient"
+        );
+    }
+}
+
 #[post("/transfer/unlock", format = "json", data = "<transfer_unlock_request_payload>")]
 pub async fn transfer_unlock(statechain_entity: &State<StateChainEntity>, transfer_unlock_request_payload: Json<TransferUnlockRequestPayload>) -> status::Custom<Json<Value>> {
 
@@ -200,8 +294,54 @@ pub async fn transfer_unlock(statechain_entity: &State<StateChainEntity>, transf
     // The previous condition only rejected when `auth_pub_key` was *present* and invalid, so a
     // MISSING `auth_pub_key` with a bad `auth_sig` fell straight through to the DB write — letting
     // anyone who knows a statechain_id clear the receiver-side lock with no valid signature at all.
+    // ── [C-6] THE SUPPLIED KEY MUST BE **THE RECORDED RECIPIENT'S**, NOT MERELY SELF-CONSISTENT ───
+    //
+    // `validate_signature_given_public_key` verifies the signature under the key the CALLER sent. On
+    // its own that proves only "whoever sent this owns the key they sent" — which every attacker
+    // does, by generating one. The previous fix closed a different hole (a MISSING `auth_pub_key`
+    // with a bad signature fell through); the key was still never compared to stored state, so
+    // anyone who knew a statechain_id could clear the receiver-side lock with a throwaway keypair.
+    //
+    // What that bought an attacker, from the audit:
+    //   * **LN RECEIVE theft.** A malicious SSP clears `locked2` legitimately as registered owner and
+    //     forges the receiver side to clear `locked`. Both bits clear ⟹ `lightning_latch.locked`
+    //     flips ⟹ `get_preimage` succeeds ⟹ the SSP settles the HTLC. The payer paid, the receiver
+    //     got nothing, and the SSP never even had to post a usable transfer message.
+    //   * **Batch atomicity.** For a plain batch `locked` is the ONLY gate `is_all_coins_unlocked`
+    //     reads, so a participant who posts nothing can still unlock their own row and claim their
+    //     incoming coin. All-or-nothing is defeated.
+    //
+    // The fix is one comparison against a value that was already being read a few lines away:
+    // `statechain_transfer.new_user_auth_public_key`, the key the SENDER named as the recipient. A
+    // caller now has to hold THAT key, which is exactly the property the endpoint always claimed.
     let is_new_owner_signature = match &auth_pub_key {
-        Some(pk) => crate::endpoints::utils::validate_signature_given_public_key(&signed_statechain_id, &statechain_id, pk).await,
+        Some(pk) => {
+            match crate::database::transfer_receiver::get_auth_pubkey_and_x1(
+                &statechain_entity.pool,
+                &statechain_id,
+            )
+            .await
+            {
+                // Compare the PARSED keys, not the strings: two encodings of one key (case, or a
+                // `0x` prefix) are the same key, and a string compare would refuse an honest
+                // recipient while a byte compare of the wrong field would refuse everyone.
+                Some((recorded, _x1)) if supplied_key_is_the_recorded_recipient(pk, &recorded) => {
+                    crate::endpoints::utils::validate_signature_given_public_key(
+                        &signed_statechain_id,
+                        &statechain_id,
+                        pk,
+                    )
+                    .await
+                }
+                // Either unparseable, or a key this transfer was never addressed to. Both are
+                // "not the recipient", and neither may clear the lock.
+                Some(_) => false,
+                // No open, uncancelled transfer for this coin ⟹ there is no recipient side to
+                // unlock. Refusing here also stops the endpoint being an existence oracle that
+                // answers differently for a coin with a pending transfer.
+                None => false,
+            }
+        }
         None => false,
     };
     if !is_current_owner_signature && !is_new_owner_signature {
@@ -445,6 +585,48 @@ pub async fn transfer_receiver(statechain_entity: &State<StateChainEntity>, tran
         return status::Custom(Status::InternalServerError, Json(response_body));
 
     }
+
+    // ── [H-6] SERIALIZE THE CLAIM, THE WAY `/sign/first` ALREADY DOES ─────────────────────────────
+    //
+    // What follows is check-then-act across a network call to the enclave:
+    //   is_key_already_updated (a bare SELECT) → keyupdate (IRREVERSIBLE) → update_statechain
+    // with nothing holding the coin between the check and the write. Two concurrent claims of one
+    // statechain id both read "not yet updated" and both reach `keyupdate`, which unconditionally
+    // computes `s_new = s_old + t2 − x1` — so the share is rotated TWICE and the aggregate no longer
+    // matches the funding output. Neither SE tree guards it (`lockbox/src/server.cpp`,
+    // `enclave/App/statechain/transfer_receiver.cpp` are the same unguarded
+    // load → key_update → update_sealed_keypair), and both DB writes are plain UPDATEs with no
+    // compare-and-swap, so there is no layer below this one that catches it either.
+    //
+    // `/sign/first` takes `pg_advisory_xact_lock` for exactly this class of race
+    // (`database/sign.rs`). This is the same shape with worse consequences — a wasted secnonce there,
+    // a coin nobody can spend here — so it gets the same treatment rather than a new mechanism.
+    //
+    // Transaction-scoped: it auto-releases on commit OR rollback, so a handler that panics or returns
+    // early cannot leak the lock and wedge the coin. `_claim_lock` is held to the end of this
+    // function by binding it; dropping it earlier would reopen the window it exists to close.
+    let _claim_lock = match crate::database::sign::acquire_signfirst_lock(
+        &statechain_entity.pool,
+        &format!("claim:{statechain_id}"),
+    )
+    .await
+    {
+        Ok(tx) => tx,
+        Err(e) => {
+            // Fail CLOSED. Proceeding unserialized is the defect; a claim that could not take the
+            // lock must be retried, not waved through.
+            return status::Custom(
+                Status::ServiceUnavailable,
+                Json(json!({
+                    "message": format!(
+                        "could not serialize the claim of statechain id {statechain_id} ({e}). \
+                         Refusing rather than racing: two concurrent claims would each rotate the \
+                         enclave's key share and leave the coin unspendable. Retry."
+                    )
+                })),
+            );
+        }
+    };
 
     if crate::database::transfer_receiver::is_key_already_updated(&statechain_entity.pool, &statechain_id).await {
 
