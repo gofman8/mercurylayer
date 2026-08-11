@@ -26,16 +26,32 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 # Include the secp256k1_zkp configuration
 include(secp256k1_zkp)
 
-add_library(LockboxLibrary 
-    src/server.cpp 
-    src/utils.cpp 
-    src/google_key_manager.cpp 
+# [BUILD] Google KMS is OPT-IN, and off by default.
+#
+# `google-cloud-cpp` drags in grpc, protobuf, abseil and re2. On arm64-linux that chain FAILS to
+# build under vcpkg ("error: building grpc:arm64-linux failed"), which made the whole lockbox image
+# unbuildable on an ARM host — including for people who never use Google KMS. The deployed
+# compose file selects `KEY_MANAGER=hashicorp_container`, so nothing in the shipping path touches
+# it: the dependency was costing everyone a broken build to serve one unused branch.
+#
+# Enable with `-DWITH_GOOGLE_KMS=ON` (and the matching vcpkg feature) if you actually deploy on KMS.
+option(WITH_GOOGLE_KMS "Build the Google Cloud KMS key manager (pulls grpc/protobuf/abseil)" OFF)
+
+set(LOCKBOX_SOURCES
+    src/server.cpp
+    src/utils.cpp
     src/hashicorp_api_key_manager.cpp
     src/hashicorp_container_key_manager.cpp
     src/filesystem_key_manager.cpp
-    src/enclave.cpp 
+    src/enclave.cpp
     src/monocypher.c
     src/db_manager.cpp)
+
+if(WITH_GOOGLE_KMS)
+    list(APPEND LOCKBOX_SOURCES src/google_key_manager.cpp)
+endif()
+
+add_library(LockboxLibrary ${LOCKBOX_SOURCES})
 
 set_source_files_properties(src/monocypher.c PROPERTIES LANGUAGE C)
 
@@ -46,17 +62,22 @@ target_compile_options(LockboxLibrary PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-std=c11>
     $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
     
-target_link_libraries(LockboxLibrary 
-    Crow::Crow 
-    cpr::cpr 
-    pqxx 
-    tomlplusplus::tomlplusplus 
-    google-cloud-cpp::storage 
-    google-cloud-cpp::kms 
-    google-cloud-cpp::secretmanager 
+target_link_libraries(LockboxLibrary
+    Crow::Crow
+    cpr::cpr
+    pqxx
+    tomlplusplus::tomlplusplus
     secp256k1_zkp
-    OpenSSL::SSL 
+    OpenSSL::SSL
     OpenSSL::Crypto)
+
+if(WITH_GOOGLE_KMS)
+    target_compile_definitions(LockboxLibrary PUBLIC WITH_GOOGLE_KMS)
+    target_link_libraries(LockboxLibrary
+        google-cloud-cpp::storage
+        google-cloud-cpp::kms
+        google-cloud-cpp::secretmanager)
+endif()
 
 include(FetchContent)
 FetchContent_Declare(
@@ -76,25 +97,31 @@ FetchContent_MakeAvailable(libpqxx)
 
 find_package(Crow)
 find_package(cpr REQUIRED)
-find_package(google_cloud_cpp_storage REQUIRED)
-find_package(google_cloud_cpp_kms REQUIRED)
-find_package(google_cloud_cpp_secretmanager REQUIRED)
+if(WITH_GOOGLE_KMS)
+    find_package(google_cloud_cpp_storage REQUIRED)
+    find_package(google_cloud_cpp_kms REQUIRED)
+    find_package(google_cloud_cpp_secretmanager REQUIRED)
+endif()
 find_package(OpenSSL REQUIRED)
 
 target_include_directories(MercuryLockbox PRIVATE include)
 # Link the library to the main executable
-target_link_libraries(MercuryLockbox PRIVATE 
-    LockboxLibrary 
-    Crow::Crow 
-    cpr::cpr 
-    pqxx 
-    tomlplusplus::tomlplusplus 
-    google-cloud-cpp::storage 
-    google-cloud-cpp::kms 
-    google-cloud-cpp::secretmanager 
+target_link_libraries(MercuryLockbox PRIVATE
+    LockboxLibrary
+    Crow::Crow
+    cpr::cpr
+    pqxx
+    tomlplusplus::tomlplusplus
     secp256k1_zkp
-    OpenSSL::SSL 
+    OpenSSL::SSL
     OpenSSL::Crypto)
+
+if(WITH_GOOGLE_KMS)
+    target_link_libraries(MercuryLockbox PRIVATE
+        google-cloud-cpp::storage
+        google-cloud-cpp::kms
+        google-cloud-cpp::secretmanager)
+endif()
 
 # Copy Settings.toml after building MercuryLockbox
 # add_custom_command(TARGET MercuryLockbox POST_BUILD

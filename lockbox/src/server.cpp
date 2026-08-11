@@ -4,7 +4,9 @@
 #include <openssl/sha.h>
 #include "utils.h"
 #include "enclave.h"
+#ifdef WITH_GOOGLE_KMS
 #include "google_key_manager.h"
+#endif
 #include "hashicorp_api_key_manager.h"
 #include "hashicorp_container_key_manager.h"
 #include "filesystem_key_manager.h"
@@ -263,9 +265,19 @@ namespace lockbox {
             seed = filesystem_key_manager::get_seed();
         } else if (key_provider == "google_kms") {
 
+#ifdef WITH_GOOGLE_KMS
             std::cout << "Using Google KMS key manager" << std::endl;
 
             seed = key_manager::get_seed();
+#else
+            // FAIL LOUD. Silently falling through to another key manager would hand the enclave a
+            // DIFFERENT SEED than the operator asked for — every sealed keypair would decrypt to
+            // garbage, or worse, a fresh seed would be minted and the existing coins orphaned.
+            throw std::runtime_error(
+                "KEY_MANAGER=google_kms but this binary was built without Google KMS support. "
+                "Rebuild with -DWITH_GOOGLE_KMS=ON and the 'google-kms' vcpkg feature, or select a "
+                "different KEY_MANAGER.");
+#endif
         } else if (key_provider == "hashicorp_api") {
 
             std::cout << "Using Hashicorp API key manager" << std::endl;

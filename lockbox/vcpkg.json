@@ -5,15 +5,6 @@
       "version>=": "1.2.0"
     },
     {
-      "name": "google-cloud-cpp",
-      "default-features": false,
-      "features": [
-        "kms",
-        "secretmanager",
-        "storage"
-      ]
-    },
-    {
       "name": "openssl",
       "version>=": "3.4.0"
     },
@@ -21,5 +12,21 @@
       "name": "cpr",
       "version>=": "1.11.1"
     }
-  ]
+  ],
+  "features": {
+    "google-kms": {
+      "description": "Google Cloud KMS key manager. OPT-IN: pulls grpc/protobuf/abseil/re2, which fail to build under vcpkg on arm64-linux and made the whole image unbuildable on an ARM host. Enable together with -DWITH_GOOGLE_KMS=ON only if you deploy with KEY_MANAGER=google_kms.",
+      "dependencies": [
+        {
+          "name": "google-cloud-cpp",
+          "default-features": false,
+          "features": [
+            "kms",
+            "secretmanager",
+            "storage"
+          ]
+        }
+      ]
+    }
+  }
 }
