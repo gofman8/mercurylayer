@@ -79,12 +79,26 @@ GATED on the P2A spike; if fee-bumping cannot be made reliable, this option is u
 
 ### What this run did NOT establish — read before relying on it
 
-1. **The literal P2A script was not exercised.** The anchor here was an ordinary wallet-controlled
-   P2WPKH, not `OP_1 <0x4e73>` (`51024e73`, `lib/src/tesr.rs:36-41`). What is proven is the
-   *mechanism* — package relay rescues an underpaying v3 parent. Whether Core treats a real P2A
-   output identically is highly likely (P2A is anyone-can-spend by design and is the standard CPFP
-   anchor) but is **UNVERIFIED here**. An attempt to hand-patch a P2A output into the raw hex
-   produced a malformed transaction and was abandoned rather than reported as a result.
+1. ~~**The literal P2A script was not exercised.**~~ **RESOLVED 2026-08-11 — it relays.** A v3
+   transaction carrying a genuine `OP_1 <0x4e73>` output was built (by patching the serialised
+   output's value and script directly: `0000000000000000` `04` `6a024e73` ->
+   `f000000000000000` `04` `51024e73`) and broadcast on the isolated node:
+
+   ```
+   version=3
+     vout0 = 0.99999000 BTC  spk=0014b95838653ab062de2906e1ac5ca1fad3c1cfb744
+     vout1 = 0.00000240 BTC  spk=51024e73          <- the real anchor, at exactly P2A_VALUE
+   accepted: 4631aa67b674af5c3e2bfb44c09810c32997f2d11a573babd3526d498c0b36c2
+   ```
+
+   **240 sats at `51024e73` is NOT dust to Core** — no dust rejection, no standardness complaint. So
+   `P2A_VALUE = 240` (`lib/src/tesr.rs:41`) is correct and the anchor is relayable as specified. A
+   unit test also pins the script bytes and the value (`lib/tests/p2a_script_shape.rs`), so a change
+   to either is caught without a node.
+
+   (Note: the broadcast needed `sendrawtransaction <hex> 0` — the default `maxfeerate` guard tripped
+   on the deliberately oversized fee of the test transaction, which is a wallet-side safety check,
+   not a relay rule.)
 2. **No `submitpackage` caller exists anywhere in the tree.** Verified: the rescue path is currently
    theoretical *in this codebase* even though it works in Core. Someone must build it, and D5's
    "choose a package-capable backend" sub-item is unresolved — electrum's protocol has no
