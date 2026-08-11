@@ -975,6 +975,61 @@ impl UtexoWallet {
                     self.note_flat(&sid, 0, LadderSkipReason::TerminalizedCarrier).await?;
                     continue;
                 }
+                // ── [RGB STAGE 0] A COIN WHOSE OWN BACKUP ROWS CARRY A CONSIGNMENT IS A CARRIER ───
+                //
+                // `is_token_carrier` below reads the ALLOCATION set, and at claim() time that set is
+                // not yet populated for a freshly received carrier: this loop runs BEFORE
+                // `book_incoming_token` → `accept_incoming_tokens` → `register_statechain`, so the
+                // outpoint is not in `unspendable_as_btc_outpoints()` yet and the carrier reads as an
+                // ordinary coin.
+                //
+                // What has been saving that is the ROOT-ONLY `f_on_chain` test further down — every
+                // carrier a receiver sees today is funded by an UN-BROADCAST split tx, so
+                // `transaction_get` fails and the coin is skipped. That is an accident of shape, not a
+                // rule, and `auto_exit_due` (default ON) removes it: it MATERIALISES received carriers
+                // near their deadline, putting the funding tx on chain. A materialised carrier then has
+                // `f_on_chain == true`, `is_token_carrier == false`, `tesr::load == None` — and this
+                // loop ladders an RGB carrier. That co-signs an un-timelocked trigger over `F` which
+                // every past holder keeps forever ([B1] verbatim), violates terminal-freeze so every
+                // later exit BURNS the asset, and propagates silently because the next hop sees a
+                // ladder and flips to `protocol_version = 2`.
+                //
+                // The coin's own backup rows are authoritative at this instant and need no RGB
+                // round-trip: a consignment on any row means the sender conveyed an allocation on this
+                // coin. Checked BEFORE the allocation-set decision precisely because it does not
+                // depend on booking having happened.
+                //
+                // FAIL CLOSED on an unreadable row, and note that absence and failure are DIFFERENT
+                // here (`get_backup_txs` is `fetch_one`, so a missing row is an `Err`): a coin with no
+                // rows is an ordinary coin and proceeds, while a database that will not answer must
+                // not be read as "no consignment" — that reading is exactly how an RGB carrier gets
+                // laddered.
+                // **SCOPED TO THE CASE IT IS FOR: a carrier the allocation set does not KNOW is one.**
+                // A RECOGNISED carrier must keep falling through to the decision site below, or the
+                // CTES-R coloured lane — the whole point of which is to ladder carriers correctly —
+                // could never be taken: a coloured carrier has consignment rows too, so an
+                // unconditional skip here would permanently deny it the coloured ladder it is
+                // entitled to. This check exists only to catch the coin the set has NOT booked yet.
+                if !is_token_carrier(coin, &carriers) {
+                    match crate::tokens::read_backup_rows(
+                        &self.inner.cc.pool,
+                        &self.inner.config.wallet_name,
+                        &sid,
+                    )
+                    .await
+                    {
+                        Ok(Some(rows)) if rows.iter().any(|b| b.rgb_consignment.is_some()) => {
+                            self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            self.note_flat(&sid, 0, LadderSkipReason::RgbStateUnavailable).await?;
+                            continue;
+                        }
+                    }
+                }
+
                 // [CTES-R] THE DECISION SITE. A carrier either gets a COLOURED ladder — every tier
                 // carrying a valid RGB state transition, so laddering MOVES the allocation instead
                 // of destroying it — or it stays on the flat lane exactly as before.
@@ -4183,6 +4238,72 @@ mod recovery_bundle_version_tests {
 /// property — a mid-split leaf is never driven, an unreadable journal blinds everything — and the
 /// HONESTY property — a plain leaf reports as a leaf exit, not a token settlement.
 #[cfg(test)]
+/// [RGB STAGE 0] The claim-time laddering hole: a carrier the allocation set does not know about yet.
+#[cfg(test)]
+mod rgb_stage0_claim_laddering_tests {
+    /// The source of the ladder loop, comments stripped, so the ORDER and the SCOPE of the guard can
+    /// be asserted. Both matter and neither is visible to a behavioural test without a wallet, an
+    /// RGB engine and a live coordinator.
+    fn ladder_loop() -> String {
+        let src = include_str!("wallet.rs");
+        let at = src.find("[RGB STAGE 0]").expect("the guard exists");
+        let end = src[at..].find("// ROOT-ONLY [B0]").expect("the loop continues to the F check");
+        src[at..at + end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The guard reads the coin's OWN backup rows, which are authoritative at claim time — not the
+    /// allocation set, which is populated by `book_incoming_token` AFTER this loop runs. Reading the
+    /// set here is precisely the bug: a freshly received carrier is not in it.
+    #[test]
+    fn the_guard_reads_backup_rows_not_the_allocation_set() {
+        let body = ladder_loop();
+        assert!(body.contains("read_backup_rows("), "must consult the coin's own backup rows");
+        assert!(
+            body.contains("rgb_consignment.is_some()"),
+            "a consignment on any row is what marks the coin a carrier at this instant"
+        );
+    }
+
+    /// **THE REGRESSION THIS ALMOST INTRODUCED.** An UNCONDITIONAL skip would have been correct for
+    /// the hole and wrong for everything else: a recognised coloured carrier also has consignment
+    /// rows, so it would have been denied the CTES-R coloured ladder — the one lane whose entire
+    /// purpose is to ladder carriers without destroying the allocation — forever, on every pass.
+    /// The guard must therefore be scoped to coins the set does NOT already know are carriers.
+    #[test]
+    fn the_guard_does_not_intercept_a_recognised_carrier() {
+        let body = ladder_loop();
+        assert!(
+            body.contains("if !is_token_carrier(coin, &carriers)"),
+            "the guard must fire ONLY for a coin the allocation set has not booked; an \
+             unconditional skip would permanently deny recognised carriers the coloured ladder"
+        );
+        let guard = body.find("if !is_token_carrier(coin, &carriers)").unwrap();
+        let read = body.find("read_backup_rows(").unwrap();
+        assert!(guard < read, "the scope test must gate the read, not follow it");
+    }
+
+    /// Absence and failure are different facts, and `get_backup_txs` is `fetch_one` — a missing row
+    /// arrives as an `Err`. A coin with no rows is an ordinary coin and must proceed; a database that
+    /// will not answer must NOT be read as "no consignment", because that reading is exactly how an
+    /// RGB carrier gets laddered.
+    #[test]
+    fn an_unreadable_row_fails_closed_and_an_absent_one_does_not() {
+        let body = ladder_loop();
+        assert!(
+            body.contains("Err(_) =>") && body.contains("RgbStateUnavailable"),
+            "an unreadable row must skip the coin, under a reason distinct from a real carrier"
+        );
+        assert!(
+            body.contains("Ok(_) => {}"),
+            "a coin with NO rows is an ordinary coin and must fall through, not be skipped"
+        );
+    }
+}
+
 mod d13_leaf_gate_tests {
     use super::{wallet_holds_address, leaf_split_gate, near_deadline_exit_event, LeafSplitGate, WalletEvent};
     use std::collections::HashSet;

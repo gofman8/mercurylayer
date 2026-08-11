@@ -455,7 +455,7 @@ pub(crate) struct ConsignmentEnvelope {
 ///
 /// `Ok(None)` = the row genuinely does not exist. `Err(_)` = the database could not be read, and the
 /// caller must fail rather than substitute a default.
-async fn read_backup_rows(
+pub(crate) async fn read_backup_rows(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     wallet_name: &str,
     key: &str,

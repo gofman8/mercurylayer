@@ -294,6 +294,27 @@ plain one, stop and re-cost: that is the expensive, historically-broken-on-one-l
 
 ### Stage 0 — close the `claim()` laddering hole (MANDATORY PREREQUISITE) — lockbox-only
 
+> **STAGE 0 IS CLOSED (2026-08-11).** The ladder loop now consults the coin's OWN backup rows —
+> authoritative at claim time, no RGB round-trip — and skips any coin carrying an `rgb_consignment`,
+> ahead of the `f_on_chain` test that was only accidentally saving it.
+>
+> **Scoped to `!is_token_carrier`, and that scope is the load-bearing part.** An unconditional skip
+> would have closed the hole and broken the CTES-R coloured lane in the same line: a recognised
+> coloured carrier also has consignment rows, so it would have been denied the coloured ladder — the
+> one lane whose purpose is to ladder carriers without destroying the allocation — permanently, on
+> every pass. The guard fires only for a coin the allocation set has not booked yet, which is exactly
+> the case this defect is about.
+>
+> Absence and failure are kept distinct (`get_backup_txs` is `fetch_one`, so a missing row is an
+> `Err`): no rows ⟹ ordinary coin, proceeds; unreadable ⟹ skipped as `RgbStateUnavailable`, because
+> reading "cannot answer" as "no consignment" is how an RGB carrier gets laddered. Three tests,
+> including one that pins the near-regression above.
+>
+> **Stage 1 (the rgb-lib fork's seal re-entry / re-registration defects) is NOT closed** and is
+> reachability-bound to WCH, which is retired (`#110`): D1 (the `spent` flag surviving
+> re-registration) needs the A→B→A round trip that only whole-carrier handover produces. It stays
+> recorded here rather than being marked done.
+
 `claim()` runs the TES-R auto-establish loop at `clients/libs/rust-sdk/src/wallet.rs:451-521`, but
 `book_incoming_token` → `accept_incoming_tokens` → `register_statechain` runs only afterwards
 (:532, :555). So during the ladder loop a freshly received carrier is not yet in
