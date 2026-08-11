@@ -57,6 +57,44 @@ namespace db_manager {
         return true;
     }
 
+    // Create/upgrade every table this process needs. Called once at boot (see server.cpp) so a
+    // schema change lands on an EXISTING database instead of waiting for the code path that happens
+    // to contain a `CREATE TABLE IF NOT EXISTS`.
+    //
+    // Idempotent by construction: every statement is `IF NOT EXISTS`, so running it on each start is
+    // free and there is no "have I migrated yet" state to get wrong.
+    bool ensure_schema(std::string& error_message) {
+        try
+        {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) {
+                error_message = "could not open the lockbox database";
+                return false;
+            }
+            pqxx::work txn(conn);
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS generated_public_key ( "
+                "id SERIAL PRIMARY KEY, "
+                "statechain_id varchar(50), "
+                "sealed_keypair BYTEA, "
+                "sealed_secnonce BYTEA, "
+                "public_nonce BYTEA, "
+                "public_key BYTEA UNIQUE, "
+                "sig_count INTEGER DEFAULT 0, "
+                // [D8(i)] NULL = no budget = co-signable indefinitely, the default and the
+                // pre-existing behaviour. A value is a ratchet: see set_sig_budget.
+                "sig_budget INTEGER);");
+            txn.exec("ALTER TABLE generated_public_key ADD COLUMN IF NOT EXISTS sig_budget INTEGER;");
+            txn.commit();
+            return true;
+        }
+        catch (std::exception const &e)
+        {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     bool save_generated_public_key(
         const utils::chacha20_poly1305_encrypted_data& encrypted_keypair, 
         unsigned char* server_public_key, size_t server_public_key_size,
@@ -78,10 +116,18 @@ namespace db_manager {
                     "sealed_secnonce BYTEA, "
                     "public_nonce BYTEA, "
                     "public_key BYTEA UNIQUE, "
-                    "sig_count INTEGER DEFAULT 0);";
+                    "sig_count INTEGER DEFAULT 0, "
+                    // [D8(i)] NULL = no budget = co-signable indefinitely, which is the default and
+                    // the pre-existing behaviour. A value is a ratchet: see set_sig_budget.
+                    "sig_budget INTEGER);";
 
                 pqxx::work txn(conn);
                 txn.exec(create_table_query);
+                // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing database, so the column
+                // above never appears on one. Every deployment that predates this line needs the
+                // ALTER, and running it unconditionally is cheaper than detecting whether it is
+                // needed.
+                txn.exec("ALTER TABLE generated_public_key ADD COLUMN IF NOT EXISTS sig_budget INTEGER;");
                 txn.commit();
 
 
@@ -480,6 +526,107 @@ namespace db_manager {
         catch (std::exception const &e)
         {
             error_message = e.what();
+            return false;
+        }
+    }
+
+    // [D8(i)] See db_manager.h for why this is a RATCHET and not a setter.
+    bool set_sig_budget(const std::string& statechain_id, int budget, std::string& error_message) {
+
+        auto database_connection_string = getDatabaseConnectionString();
+
+        if (budget < 0) {
+            error_message = "a negative spend budget is meaningless";
+            return false;
+        }
+
+        try
+        {
+            pqxx::connection conn(database_connection_string);
+            if (!conn.is_open()) {
+                error_message = "failed to open the lockbox database";
+                return false;
+            }
+
+            // The read and the write share ONE transaction. Split across two, a concurrent request
+            // could read "no budget", another could lower it to 1, and the first could then write 5
+            // — a raise, assembled out of two individually-legal steps. The WHERE clause carries the
+            // monotonicity so the database decides it, not this process.
+            pqxx::work txn(conn);
+            conn.prepare(
+                "set_budget_monotone",
+                "UPDATE generated_public_key SET sig_budget = $1 "
+                "WHERE statechain_id = $2 AND (sig_budget IS NULL OR sig_budget > $1);");
+            pqxx::result r = txn.exec_prepared("set_budget_monotone", budget, statechain_id);
+
+            if (r.affected_rows() == 0) {
+                // Either the coin does not exist, or the write would have RAISED the budget. Tell
+                // them apart: the second is an attempted downgrade of a terminality guarantee a
+                // receiver may already be relying on, and it must not read as a benign no-op.
+                conn.prepare(
+                    "read_budget",
+                    "SELECT sig_budget FROM generated_public_key WHERE statechain_id = $1;");
+                pqxx::result cur = txn.exec_prepared("read_budget", statechain_id);
+                txn.commit();
+                if (cur.empty()) {
+                    error_message = "unknown statechain id";
+                    return false;
+                }
+                auto field = cur[0]["sig_budget"];
+                if (!field.is_null() && field.as<int>() <= budget) {
+                    if (field.as<int>() == budget) {
+                        return true;  // idempotent: the same budget, set again, is not a raise
+                    }
+                    error_message =
+                        "refusing to RAISE the spend budget from " + std::to_string(field.as<int>()) +
+                        " to " + std::to_string(budget) +
+                        ": terminality is a ratchet. A receiver may already hold an attestation "
+                        "saying this coin is spent out; raising the budget would make that "
+                        "attestation false after the fact and license a rival co-signature.";
+                    return false;
+                }
+                error_message = "the spend budget could not be set";
+                return false;
+            }
+
+            txn.commit();
+            return true;
+        }
+        catch (std::exception const &e)
+        {
+            error_message = std::string("set_sig_budget failed: ") + e.what();
+            return false;
+        }
+    }
+
+    bool get_sig_budget(const std::string& statechain_id, int& budget, bool& has_budget) {
+
+        auto database_connection_string = getDatabaseConnectionString();
+        has_budget = false;
+
+        try
+        {
+            pqxx::connection conn(database_connection_string);
+            if (!conn.is_open()) {
+                return false;
+            }
+
+            pqxx::nontransaction ntxn(conn);
+            conn.prepare("get_budget", "SELECT sig_budget FROM generated_public_key WHERE statechain_id = $1;");
+            pqxx::result result = ntxn.exec_prepared("get_budget", statechain_id);
+
+            if (!result.empty()) {
+                auto field = result[0]["sig_budget"];
+                if (!field.is_null()) {
+                    budget = field.as<int>();
+                    has_budget = true;
+                }
+            }
+            conn.close();
+            return true;
+        }
+        catch (std::exception const &e)
+        {
             return false;
         }
     }

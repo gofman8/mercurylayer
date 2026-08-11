@@ -77,7 +77,32 @@ namespace db_manager {
         const std::string& partial_sig,
         std::string& error_message);
 
+    // Create/upgrade every table this process needs. Called ONCE AT BOOT, so a schema change lands
+    // on an existing database rather than waiting for whichever code path happens to carry a
+    // `CREATE TABLE IF NOT EXISTS`. Idempotent; a failure here is fatal at startup by design.
+    bool ensure_schema(std::string& error_message);
+
     bool signature_count(const std::string& statechain_id, int& sig_count);
+
+    // ── [D8(i)] THE SPEND BUDGET, MIRRORED INTO THE SE ────────────────────────────────────────────
+    //
+    // The coordinator has always held a `sig_budget` and refused to co-sign past it, which makes a
+    // node terminal. But terminality is a fact a RECEIVER has to rely on — the census argument for a
+    // split child assumes its parent can never be spent again — and until now the only witness to it
+    // was the coordinator, i.e. the party a receiver is being protected from. The SE could attest the
+    // COUNT (D8) but had no notion of a budget, so it could not attest that the count was final.
+    //
+    // set_sig_budget is MONOTONE, and that is the whole security content: a budget may be created
+    // where none exists, or LOWERED, never raised. Without that rule a coordinator could hand a
+    // receiver an attestation saying "1 of 1 consumed, terminal", then raise the budget and co-sign a
+    // rival — the attestation would have been true when issued and worthless a block later.
+    // Terminality has to be a ratchet or it is not a property at all.
+    //
+    // Returns false on a DB failure OR on a rejected raise; `error_message` distinguishes them.
+    bool set_sig_budget(const std::string& statechain_id, int budget, std::string& error_message);
+
+    // `has_budget` is false when this coin has no budget (co-signable indefinitely, the default).
+    bool get_sig_budget(const std::string& statechain_id, int& budget, bool& has_budget);
 
     bool update_sealed_keypair(
         const utils::chacha20_poly1305_encrypted_data& encrypted_keypair, 

@@ -314,6 +314,63 @@ pub async fn set_spend_budget(statechain_entity: &State<StateChainEntity>, paylo
             );
         }
     };
+    // ── [D8(i)] MIRROR IT INTO THE ENCLAVE, AND FAIL IF THAT DOES NOT LAND ────────────────────────
+    //
+    // The write above makes THIS coordinator refuse further co-signatures. That was never enough for
+    // a receiver: their census argument rests on the node being terminal, and the only witness to it
+    // was the coordinator — the party they are being protected from. The enclave now holds and
+    // enforces its own copy, and signs it into the `utexo/sig_count/v2` attestation, so terminality
+    // becomes a fact a receiver can check rather than a claim it must accept.
+    //
+    // Reported as a FAILURE when the mirror does not land, even though the local write succeeded.
+    // A coin whose coordinator says "terminal" and whose enclave says "no budget" is the exact state
+    // the receiver's verification will refuse, so reporting success here would hand the caller a coin
+    // nobody can claim. The enclave's setter is a monotone ratchet, so retrying is safe: setting the
+    // same budget again is idempotent.
+    let enclave_index =
+        crate::database::utils::get_enclave_index_from_database(&statechain_entity.pool, &statechain_id).await;
+    if let Some(idx) = enclave_index {
+        let config = crate::server_config::ServerConfig::load();
+        if let Some(enclave) = config.enclaves.get(idx as usize) {
+            let client = reqwest::Client::new();
+            // The refusal REASON is carried through, not collapsed to a bool. "the enclave did not
+            // accept it" and "the enclave is unreachable" are different operational problems, and
+            // the operator reading this is the one who has to tell them apart.
+            let why: Option<String> = match client
+                .post(&format!("{}/sig_budget", enclave.url))
+                .json(&json!({ "statechain_id": statechain_id, "sig_budget": payload.0.remaining }))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => None,
+                Ok(r) => {
+                    let status = r.status();
+                    // AUDITED-SWALLOW: the direction is toward MORE protection. `status` already
+                    // decided the outcome — a non-2xx is a refusal whatever the body says — so an
+                    // unreadable body costs detail in an error message that is being returned
+                    // either way. It can never turn this into a success.
+                    let body = r.text().await.unwrap_or_default();
+                    Some(format!("the enclave answered {status}: {body}"))
+                }
+                Err(e) => Some(format!("the enclave could not be reached: {e}")),
+            };
+            if let Some(why) = why {
+                return status::Custom(
+                    Status::ServiceUnavailable,
+                    Json(json!({
+                        "message": format!(
+                            "the spend budget was recorded by the coordinator but the ENCLAVE did \
+                             not accept it ({why}). Terminality that only the coordinator knows \
+                             about is not terminality a receiver can verify, so this is reported as \
+                             a failure rather than a success. Retry — the enclave's setter is a \
+                             ratchet, so setting the same budget again is idempotent."
+                        )
+                    })),
+                );
+            }
+        }
+    }
+
     let response_body = json!({ "message": "Success", "sig_budget": budget });
     status::Custom(Status::Ok, Json(response_body))
 }

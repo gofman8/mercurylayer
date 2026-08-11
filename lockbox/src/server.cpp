@@ -12,6 +12,8 @@
 #include "filesystem_key_manager.h"
 #include "db_manager.h"
 #include <toml++/toml.h>
+#include <cstdlib>
+#include <iostream>
 #include <chrono>
 #include <thread>
 
@@ -110,6 +112,45 @@ namespace lockbox {
             if (db_manager::get_cached_partial_sig(statechain_id, session_key, cached_partial_sig)) {
                 crow::json::wvalue cached_result({{"partial_sig", cached_partial_sig}});
                 return crow::response{cached_result};
+            }
+
+            // ── [D8(i)] THE SPEND BUDGET, ENFORCED **HERE**, NOT ONLY AT THE COORDINATOR ──────────
+            //
+            // The coordinator has always refused to co-sign past a coin's budget, and that is what
+            // makes a split/combine node terminal. But a receiver's whole census argument rests on
+            // that terminality, and the only witness to it was the coordinator — the party the
+            // receiver is being protected FROM. The SE could attest the count (D8) but knew nothing
+            // of a budget, so it could not attest that the count was FINAL.
+            //
+            // Now it can, because it enforces it. The check sits AFTER the idempotency cache on
+            // purpose: a retry of a session already served must keep returning the same signature
+            // even once the budget is exhausted, or the retry-safety keystone breaks and a lost
+            // response bricks the coin. Only a NEW session consumes budget.
+            //
+            // It sits BEFORE the secnonce is consumed, so a refused request costs nothing.
+            {
+                int budget = 0;
+                bool has_budget = false;
+                if (!db_manager::get_sig_budget(statechain_id, budget, has_budget)) {
+                    // Fail CLOSED. "I could not read the budget" must not mean "there isn't one" —
+                    // that reading is exactly how a terminal node becomes re-signable.
+                    return crow::response(500, "could not read the spend budget for this coin; refusing to co-sign");
+                }
+                if (has_budget) {
+                    int sig_count = 0;
+                    if (!db_manager::signature_count(statechain_id, sig_count)) {
+                        return crow::response(500, "could not read the signature count for this coin; refusing to co-sign");
+                    }
+                    if (sig_count >= budget) {
+                        crow::json::wvalue exhausted;
+                        exhausted["message"] =
+                            "spend budget exhausted: this coin is TERMINAL and the enclave refuses "
+                            "further co-signatures";
+                        exhausted["sig_count"] = sig_count;
+                        exhausted["sig_budget"] = budget;
+                        return crow::response(410, exhausted.dump());
+                    }
+                }
             }
 
             // Atomically load AND consume the sealed secnonce (row-locked, nulled in the same txn).
@@ -254,6 +295,26 @@ namespace lockbox {
 
     void start_server() {
 
+        // ── SCHEMA FIRST, AT BOOT ─────────────────────────────────────────────────────────────────
+        //
+        // The table used to be created lazily inside `save_generated_public_key`, i.e. on the first
+        // DEPOSIT. That is fine for a `CREATE TABLE IF NOT EXISTS` on an empty database and wrong for
+        // everything else: a column added to that statement never appears on a database that already
+        // has the table, and the ALTER that would add it does not run until someone deposits.
+        //
+        // Found the hard way. The `sig_budget` column [D8(i)] was added to the CREATE and the
+        // deployed lockbox went on answering `column "sig_budget" does not exist` — the migration was
+        // sitting behind a code path nothing had called yet. Running it here means the process
+        // either comes up with a schema it can serve, or fails loudly at boot.
+        {
+            std::string migrate_error;
+            if (!db_manager::ensure_schema(migrate_error)) {
+                std::cerr << "FATAL: the lockbox database schema could not be prepared: "
+                          << migrate_error << std::endl;
+                std::exit(1);
+            }
+        }
+
         std::vector<uint8_t> seed;
 
         auto key_provider = getKeyManager();
@@ -367,6 +428,41 @@ namespace lockbox {
         
         });
 
+        // [D8(i)] Set a coin's spend budget. MONOTONE — see db_manager::set_sig_budget: a budget may
+        // be created or LOWERED, never raised. The coordinator calls this alongside its own
+        // `set_sig_budget` so the SE can enforce, and therefore attest, terminality itself.
+        CROW_ROUTE(app, "/sig_budget")
+            .methods("POST"_method)([](const crow::request& req) {
+
+                auto req_body = crow::json::load(req.body);
+                if (!req_body)
+                    return crow::response(400);
+
+                if (req_body.count("statechain_id") == 0 || req_body.count("sig_budget") == 0) {
+                    return crow::response(400, "Invalid parameters. They must be 'statechain_id' and 'sig_budget'.");
+                }
+
+                std::string statechain_id = req_body["statechain_id"].s();
+                int64_t budget = req_body["sig_budget"].i();
+
+                if (budget < 0 || budget > INT32_MAX) {
+                    return crow::response(400, "sig_budget out of range");
+                }
+
+                std::string error_message;
+                if (!db_manager::set_sig_budget(statechain_id, static_cast<int>(budget), error_message)) {
+                    // 409, not 500: a refused RAISE is the ratchet working, not a failure of this
+                    // server, and a caller must be able to tell those apart.
+                    bool is_raise = error_message.find("refusing to RAISE") != std::string::npos;
+                    return crow::response(is_raise ? 409 : 500, error_message);
+                }
+
+                crow::json::wvalue result;
+                result["message"] = "Success";
+                result["sig_budget"] = budget;
+                return crow::response{result};
+        });
+
         CROW_ROUTE(app,"/signature_count/<string>")
         ([&seed](const crow::request& req, std::string statechain_id){
 
@@ -386,7 +482,22 @@ namespace lockbox {
             // tx0 output, so verification needs nothing the client does not already hold.
             //
             // PREIMAGE, defined here and mirrored exactly by the verifier:
-            //     sha256("utexo/sig_count/v1" || statechain_id || u32_be(sig_count) || nonce32)
+            //     sha256("utexo/sig_count/v2" || statechain_id || u32_be(sig_count)
+            //            || u8(has_budget) || u32_be(sig_budget) || nonce32)
+            //
+            // **v2 adds the BUDGET [D8(i)], and it belongs in the SAME signature rather than beside
+            // it.** The count alone answers "how many co-signatures exist"; a receiver's real
+            // question is "can another one ever be issued", and that is the count AND the budget
+            // together. Two separate attestations could be mixed across time — a fresh count paired
+            // with a stale budget — which is precisely the confusion an attestation exists to remove.
+            //
+            // `has_budget` is an explicit byte, not an in-band sentinel: "no budget" (co-signable
+            // indefinitely) and "budget 0" (terminal, nothing may be signed) are opposite facts and
+            // must not share an encoding.
+            //
+            // v1 is GONE rather than retained. Backward compatibility is not a constraint here
+            // (D23), and leaving a v1 route open would leave a way to obtain an attestation that
+            // says nothing about terminality — which is the gap being closed.
             //
             // `nonce` is a 32-byte hex challenge the CLIENT chooses and passes as a query parameter.
             // Without it the attestation is a static value: a coordinator could serve a genuine
@@ -396,8 +507,21 @@ namespace lockbox {
             // simply absent, so a verifier can tell "not attested" from "attested".
             auto nonce_hex = req.url_params.get("nonce");
 
+            int sig_budget = 0;
+            bool has_budget = false;
+            if (!db_manager::get_sig_budget(statechain_id, sig_budget, has_budget)) {
+                return crow::response(500, "Failed to retrieve the spend budget");
+            }
+
             crow::json::wvalue result;
             result["sig_count"] = sig_count;
+            result["has_sig_budget"] = has_budget;
+            if (has_budget) {
+                result["sig_budget"] = sig_budget;
+                // Stated rather than left to the caller's arithmetic: this is the fact the receiver
+                // actually wants, and computing it here means one definition instead of several.
+                result["terminal"] = (sig_count >= sig_budget);
+            }
 
             if (nonce_hex != nullptr) {
                 std::string nonce_str(nonce_hex);
@@ -423,7 +547,7 @@ namespace lockbox {
                 // Build the digest. `sig_count` is serialised big-endian and fixed-width so the
                 // preimage is unambiguous — a length-varying decimal string would let two different
                 // (id, count) pairs collide under concatenation.
-                std::string domain = "utexo/sig_count/v1";
+                std::string domain = "utexo/sig_count/v2";
                 std::vector<unsigned char> preimage(domain.begin(), domain.end());
                 preimage.insert(preimage.end(), statechain_id.begin(), statechain_id.end());
                 uint32_t c = static_cast<uint32_t>(sig_count);
@@ -431,6 +555,12 @@ namespace lockbox {
                 preimage.push_back((c >> 16) & 0xff);
                 preimage.push_back((c >> 8) & 0xff);
                 preimage.push_back(c & 0xff);
+                preimage.push_back(has_budget ? 1 : 0);
+                uint32_t b = has_budget ? static_cast<uint32_t>(sig_budget) : 0;
+                preimage.push_back((b >> 24) & 0xff);
+                preimage.push_back((b >> 16) & 0xff);
+                preimage.push_back((b >> 8) & 0xff);
+                preimage.push_back(b & 0xff);
                 preimage.insert(preimage.end(), nonce_bytes.begin(), nonce_bytes.end());
 
                 unsigned char digest[32];

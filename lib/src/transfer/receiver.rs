@@ -92,7 +92,8 @@ pub struct StatechainInfoResponsePayload {
     #[serde(default)]
     pub aggregate_pubkey: Option<String>,
     /// [D8] BIP-340 Schnorr signature by THIS coin's SE key over
-    /// `sha256("utexo/sig_count/v1" || statechain_id || u32_be(num_sigs) || nonce32)`, hex.
+    /// `sha256("utexo/sig_count/v2" || statechain_id || u32_be(num_sigs) || u8(has_budget)
+    ///          || u32_be(budget) || nonce32)`, hex.
     ///
     /// `num_sigs` is the right-hand side of the receiver's anti-theft census, and it used to arrive
     /// as a bare integer: a coordinator that under-reported it by `k` hid `k` co-signed rival states
@@ -111,6 +112,23 @@ pub struct StatechainInfoResponsePayload {
     /// coordinator could sign with a key of its own choosing.
     #[serde(default)]
     pub sig_count_attestation_pubkey: Option<String>,
+    /// [D8(i)] Whether the ENCLAVE holds a spend budget for this coin.
+    ///
+    /// Carried separately from [`Self::sig_budget`] because "no budget" (co-signable indefinitely,
+    /// the default) and "budget 0" (terminal, nothing more may be signed) are opposite facts. A
+    /// single `Option<u32>` on the wire would let a coordinator turn the second into the first by
+    /// omitting a field — so presence is stated, and it is covered by the attestation signature.
+    ///
+    /// `None` means the enclave reported neither, i.e. it predates the field. A verifier must treat
+    /// that as unattested, not as "no budget".
+    #[serde(default)]
+    pub has_sig_budget: Option<bool>,
+    /// The enclave's spend budget for this coin, when it has one. **Not the coordinator's copy** —
+    /// the coordinator holds and enforces its own, but a receiver relying on terminality cannot take
+    /// its word for it. This value is inside the `utexo/sig_count/v2` preimage, so altering it in
+    /// flight breaks verification.
+    #[serde(default)]
+    pub sig_budget: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,10 +250,18 @@ pub fn verify_transfer_signature(new_user_pubkey: &str, tx0_outpoint: &TxOutpoin
 /// coordinator could replay a genuine attestation captured when the count was legitimately lower.
 ///
 /// Returns `Ok(())` only if the signature verifies over the exact preimage the SE signed:
-/// `sha256("utexo/sig_count/v1" || statechain_id || u32_be(num_sigs) || nonce32)`.
+/// `sha256("utexo/sig_count/v2" || statechain_id || u32_be(num_sigs) || u8(has_budget)
+///          || u32_be(budget) || nonce32)`.
+///
+/// `budget` is the coin's SE-enforced spend budget, `None` when it has none. It is part of the SAME
+/// preimage rather than a second attestation because the two are only meaningful together: a count
+/// says how many co-signatures exist, and only the count PLUS the budget says whether another can
+/// ever be issued — which is what a receiver relying on terminality actually needs. Two separate
+/// attestations could be mixed across time, pairing a fresh count with a stale budget.
 pub fn verify_sig_count_attestation(
     statechain_id: &str,
     num_sigs: u32,
+    budget: Option<u32>,
     nonce_hex: &str,
     attestation_hex: &str,
     attestation_pubkey_hex: &str,
@@ -268,9 +294,15 @@ pub fn verify_sig_count_attestation(
         return Err(MercuryError::SigCountAttestationInvalid);
     }
     let mut preimage: Vec<u8> = Vec::new();
-    preimage.extend_from_slice(b"utexo/sig_count/v1");
+    preimage.extend_from_slice(b"utexo/sig_count/v2");
     preimage.extend_from_slice(statechain_id.as_bytes());
     preimage.extend_from_slice(&num_sigs.to_be_bytes());
+    // [D8(i)] The BUDGET travels inside the same signature as the count. A receiver's question is
+    // not "how many co-signatures exist" but "can another ever be issued", and only the pair answers
+    // it. Presence is an explicit byte because "no budget" (co-signable forever) and "budget 0"
+    // (terminal) are opposite facts that must not share an encoding.
+    preimage.push(u8::from(budget.is_some()));
+    preimage.extend_from_slice(&budget.unwrap_or(0).to_be_bytes());
     preimage.extend_from_slice(&nonce);
 
     let msg = Message::from_hashed_data::<sha256::Hash>(&preimage);
@@ -1479,11 +1511,13 @@ mod sig_count_attestation_tests {
     use secp256k1_zkp::{rand, KeyPair, Secp256k1};
 
     /// Build the preimage exactly as `lockbox/src/server.cpp` does, and sign it.
-    fn attest(kp: &KeyPair, sid: &str, count: u32, nonce: &[u8; 32]) -> String {
+    fn attest(kp: &KeyPair, sid: &str, count: u32, budget: Option<u32>, nonce: &[u8; 32]) -> String {
         let mut preimage: Vec<u8> = Vec::new();
-        preimage.extend_from_slice(b"utexo/sig_count/v1");
+        preimage.extend_from_slice(b"utexo/sig_count/v2");
         preimage.extend_from_slice(sid.as_bytes());
         preimage.extend_from_slice(&count.to_be_bytes());
+        preimage.push(u8::from(budget.is_some()));
+        preimage.extend_from_slice(&budget.unwrap_or(0).to_be_bytes());
         preimage.extend_from_slice(nonce);
         let msg = Message::from_hashed_data::<sha256::Hash>(&preimage);
         Secp256k1::new().sign_schnorr(&msg, kp).to_string()
@@ -1500,9 +1534,9 @@ mod sig_count_attestation_tests {
     #[test]
     fn an_honest_attestation_verifies() {
         let (kp, compressed, xonly, nonce) = setup();
-        let sig = attest(&kp, "coin-a", 5, &nonce);
+        let sig = attest(&kp, "coin-a", 5, None, &nonce);
         assert!(verify_sig_count_attestation(
-            "coin-a", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_ok());
+            "coin-a", 5, None, &hex::encode(nonce), &sig, &xonly, &compressed).is_ok());
     }
 
     #[test]
@@ -1511,9 +1545,9 @@ mod sig_count_attestation_tests {
         // state, so the receiver's exact-equality census balances against a short tally. The
         // signature was made over 5, so it cannot cover 4.
         let (kp, compressed, xonly, nonce) = setup();
-        let sig = attest(&kp, "coin-a", 5, &nonce);
+        let sig = attest(&kp, "coin-a", 5, None, &nonce);
         assert!(verify_sig_count_attestation(
-            "coin-a", 4, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+            "coin-a", 4, None, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
             "an under-reported count must NOT verify — this is the theft the census exists to stop");
     }
 
@@ -1526,9 +1560,9 @@ mod sig_count_attestation_tests {
         let secp = Secp256k1::new();
         let rogue = KeyPair::new(&secp, &mut rand::thread_rng());
         let (rogue_xonly, _) = PublicKey::from_keypair(&rogue).x_only_public_key();
-        let sig = attest(&rogue, "coin-a", 4, &nonce);
+        let sig = attest(&rogue, "coin-a", 4, None, &nonce);
         assert!(verify_sig_count_attestation(
-            "coin-a", 4, &hex::encode(nonce), &sig, &rogue_xonly.to_string(), &compressed).is_err(),
+            "coin-a", 4, None, &hex::encode(nonce), &sig, &rogue_xonly.to_string(), &compressed).is_err(),
             "a signature by a key other than the chain-anchored enclave key must be refused");
     }
 
@@ -1537,19 +1571,19 @@ mod sig_count_attestation_tests {
         // Without nonce binding the attestation is static: a coordinator could serve one captured
         // when the count was legitimately lower, forever.
         let (kp, compressed, xonly, nonce) = setup();
-        let sig = attest(&kp, "coin-a", 5, &nonce);
+        let sig = attest(&kp, "coin-a", 5, None, &nonce);
         let fresh = [9u8; 32];
         assert!(verify_sig_count_attestation(
-            "coin-a", 5, &hex::encode(fresh), &sig, &xonly, &compressed).is_err(),
+            "coin-a", 5, None, &hex::encode(fresh), &sig, &xonly, &compressed).is_err(),
             "an attestation answering a different challenge must not satisfy this one");
     }
 
     #[test]
     fn an_attestation_for_another_coin_is_refused() {
         let (kp, compressed, xonly, nonce) = setup();
-        let sig = attest(&kp, "coin-a", 5, &nonce);
+        let sig = attest(&kp, "coin-a", 5, None, &nonce);
         assert!(verify_sig_count_attestation(
-            "coin-b", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+            "coin-b", 5, None, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
             "the statechain id is in the preimage precisely so one coin's count cannot vouch for another");
     }
 
@@ -1560,13 +1594,115 @@ mod sig_count_attestation_tests {
         // `.to_string()`, which does NOT, so they all passed while the real endpoint's output would
         // have failed to parse. Caught by calling the live /signature_count, not by unit testing.
         let (kp, compressed, xonly, nonce) = setup();
-        let sig = attest(&kp, "coin-a", 5, &nonce);
+        let sig = attest(&kp, "coin-a", 5, None, &nonce);
         assert!(verify_sig_count_attestation(
-            "coin-a", 5, &hex::encode(nonce),
+            "coin-a", 5, None, &hex::encode(nonce),
             &format!("0x{sig}"), &format!("0x{xonly}"), &format!("0x{compressed}")).is_ok(),
             "the SE's actual on-the-wire encoding must verify");
         // And the bare form must keep working, so both encodings are accepted.
         assert!(verify_sig_count_attestation(
-            "coin-a", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_ok());
+            "coin-a", 5, None, &hex::encode(nonce), &sig, &xonly, &compressed).is_ok());
+    }
+
+    // ── [D8(i)] THE BUDGET HALF: terminality, attested ───────────────────────────────────────────
+
+    #[test]
+    fn an_attested_budget_verifies_and_a_substituted_one_does_not() {
+        let (kp, compressed, xonly, nonce) = setup();
+        let sig = attest(&kp, "coin-a", 1, Some(1), &nonce);
+        assert!(
+            verify_sig_count_attestation(
+                "coin-a", 1, Some(1), &hex::encode(nonce), &sig, &xonly, &compressed).is_ok(),
+            "the SE attested 1-of-1 — that is a TERMINAL coin and it must verify"
+        );
+        // THE ATTACK. A coordinator forwards a larger budget so the coin looks like it still has
+        // co-signatures left — the reverse of under-reporting the count, and the same theft: the
+        // receiver accepts a parent the sender can still spend.
+        assert!(
+            verify_sig_count_attestation(
+                "coin-a", 1, Some(2), &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+            "an inflated budget must NOT verify — it would make a terminal coin look re-signable"
+        );
+        assert!(
+            verify_sig_count_attestation(
+                "coin-a", 1, Some(0), &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+            "…and a deflated one must not either: the signature covers one exact budget"
+        );
+    }
+
+    /// **"No budget" and "budget 0" are opposite facts and must not share an encoding.**
+    ///
+    /// No budget = co-signable indefinitely. Budget 0 = terminal, nothing may ever be signed. If the
+    /// preimage could not tell them apart, a coordinator could take an attestation over a terminal
+    /// coin and present it as an unrestricted one, or the reverse. The explicit `has_budget` byte is
+    /// what stops that, and this is the test that would fail if someone "simplified" it away.
+    #[test]
+    fn absent_and_zero_budgets_are_not_interchangeable() {
+        let (kp, compressed, xonly, nonce) = setup();
+
+        let none_sig = attest(&kp, "coin-a", 0, None, &nonce);
+        let zero_sig = attest(&kp, "coin-a", 0, Some(0), &nonce);
+        assert_ne!(none_sig, zero_sig, "the two must not produce the SAME signature");
+
+        assert!(verify_sig_count_attestation(
+            "coin-a", 0, None, &hex::encode(nonce), &none_sig, &xonly, &compressed).is_ok());
+        assert!(verify_sig_count_attestation(
+            "coin-a", 0, Some(0), &hex::encode(nonce), &zero_sig, &xonly, &compressed).is_ok());
+
+        // …and neither vouches for the other.
+        assert!(
+            verify_sig_count_attestation(
+                "coin-a", 0, Some(0), &hex::encode(nonce), &none_sig, &xonly, &compressed).is_err(),
+            "an unrestricted coin's attestation must not pass as a terminal one"
+        );
+        assert!(
+            verify_sig_count_attestation(
+                "coin-a", 0, None, &hex::encode(nonce), &zero_sig, &xonly, &compressed).is_err(),
+            "a terminal coin's attestation must not pass as an unrestricted one"
+        );
+    }
+
+    /// The count and the budget are bound TOGETHER by one signature, so they cannot be mixed across
+    /// time — a fresh count paired with a stale (higher) budget is exactly the confusion two
+    /// separate attestations would have allowed.
+    #[test]
+    fn the_count_and_the_budget_cannot_be_recombined() {
+        let (kp, compressed, xonly, nonce) = setup();
+        let spent = attest(&kp, "coin-a", 2, Some(2), &nonce);   // terminal: 2 of 2
+        let fresh = attest(&kp, "coin-a", 0, Some(2), &nonce);   // same coin, earlier: 0 of 2
+
+        assert!(verify_sig_count_attestation(
+            "coin-a", 2, Some(2), &hex::encode(nonce), &spent, &xonly, &compressed).is_ok());
+        assert!(verify_sig_count_attestation(
+            "coin-a", 0, Some(2), &hex::encode(nonce), &fresh, &xonly, &compressed).is_ok());
+        // Neither signature can be made to say the other's pair.
+        assert!(verify_sig_count_attestation(
+            "coin-a", 0, Some(2), &hex::encode(nonce), &spent, &xonly, &compressed).is_err());
+        assert!(verify_sig_count_attestation(
+            "coin-a", 2, Some(2), &hex::encode(nonce), &fresh, &xonly, &compressed).is_err());
+    }
+
+    /// v1 is gone: an attestation built the old way, without the budget bytes, must not verify.
+    /// Leaving it acceptable would leave a route to an attestation that says nothing about
+    /// terminality, which is the whole gap D8(i) closes.
+    #[test]
+    fn a_v1_attestation_no_longer_verifies() {
+        let (kp, compressed, xonly, nonce) = setup();
+        let v1 = {
+            let mut preimage: Vec<u8> = Vec::new();
+            preimage.extend_from_slice(b"utexo/sig_count/v1");
+            preimage.extend_from_slice(b"coin-a");
+            preimage.extend_from_slice(&5u32.to_be_bytes());
+            preimage.extend_from_slice(&nonce);
+            let msg = Message::from_hashed_data::<sha256::Hash>(&preimage);
+            Secp256k1::new().sign_schnorr(&msg, &kp).to_string()
+        };
+        for budget in [None, Some(0), Some(5)] {
+            assert!(
+                verify_sig_count_attestation(
+                    "coin-a", 5, budget, &hex::encode(nonce), &v1, &xonly, &compressed).is_err(),
+                "a v1 attestation must not verify under any budget reading (tried {budget:?})"
+            );
+        }
     }
 }

@@ -422,6 +422,61 @@ the first transfer.
 
 ---
 
+## D28 — Terminality is SE-enforced and SE-attested; the budget is a RATCHET (closes D8(i))
+
+**Decided and IMPLEMENTED 2026-08-11.**
+
+A split/combine node is *terminal* when its spend budget is exhausted, and a receiver's census
+argument for a child rests on that: the parent must never be co-signable again. The budget lived only
+in the coordinator's Postgres, enforced only by the coordinator — so the sole witness to terminality
+was the party the receiver is being protected from. D8 had made the *count* SE-attested; the SE had no
+notion of a budget, so it could not attest that the count was **final**.
+
+**What shipped.**
+
+| | before | now |
+|---|---|---|
+| where the budget lives | coordinator Postgres | coordinator **and** enclave |
+| who refuses the co-sign | coordinator | coordinator **and** enclave (`410`, before the secnonce is consumed) |
+| what a receiver can check | the coordinator's word | a BIP-340 signature by the coin's chain-anchored key |
+
+**The ratchet is the security content.** `set_sig_budget` may create a budget or **lower** it, never
+raise it — enforced in one SQL statement (`WHERE sig_budget IS NULL OR sig_budget > $1`) so the
+database decides it rather than a read-then-write that two concurrent callers could assemble a raise
+out of. Without it an attestation saying "1 of 1, terminal" would be true when issued and worthless a
+block later, and terminality would not be a property at all. A raise is refused with `409` and a
+message naming both values; setting the same budget again is idempotent.
+
+**The attestation is `utexo/sig_count/v2`,** carrying count and budget under ONE signature:
+
+```
+sha256("utexo/sig_count/v2" || statechain_id || u32_be(count)
+       || u8(has_budget) || u32_be(budget) || nonce32)
+```
+
+Two separate attestations were the alternative and are worse: they could be mixed across time, a
+fresh count paired with a stale budget — exactly the confusion an attestation exists to remove.
+`has_budget` is an explicit byte because **"no budget" (co-signable indefinitely) and "budget 0"
+(terminal) are opposite facts** that must not share an encoding. v1 is gone rather than retained
+(D23): leaving it would leave a way to obtain an attestation that says nothing about terminality.
+
+**The coordinator now fails if the mirror does not land.** Its own write succeeding while the enclave
+disagrees produces a coin the receiver's verification will refuse — reporting success there would hand
+the caller a coin nobody can claim.
+
+**Found while deploying, and worth keeping:** the schema lived in a `CREATE TABLE IF NOT EXISTS`
+inside the first-deposit path, so a new column never reached an existing database and the deployed
+lockbox answered `column "sig_budget" does not exist`. Schema setup now runs **once at boot**
+(`db_manager::ensure_schema`) and is fatal on failure. A migration behind a lazy code path is a
+migration that has not run.
+
+**Verified live**, against the rebuilt lockbox: budget absent → `has_sig_budget:false`; set 5 → ok;
+lower to 2 → ok; **raise to 9 → 409 refused**; re-set 2 → idempotent; attestation then reports
+`terminal:true` and verifies in the Rust verifier at exactly `(count=2, budget=Some(2))` and at no
+neighbouring pair; a co-sign attempt on that coin → **410**, while a no-budget coin passes the gate.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB

@@ -143,9 +143,35 @@ pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConf
     // is exactly the attack; `verify_sig_count_attestation` refuses if the two disagree.
     match (&response.sig_count_attestation, &response.sig_count_attestation_pubkey) {
         (Some(sig), Some(pk)) => {
+            // [D8(i)] The budget is verified TOGETHER with the count, in one signature. `has_sig_budget`
+            // is what decides the shape: `Some(false)` is the enclave saying "this coin has no
+            // budget", `None` is an enclave that cannot say — and the latter must not be silently
+            // read as the former, so it is refused below rather than defaulted here.
+            let attested_budget = match response.has_sig_budget {
+                Some(true) => match response.sig_budget {
+                    Some(b) => Some(b),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "the coordinator reported that {statechain_id} HAS a spend budget but \
+                             served no value for it. Terminality is what a receiver's census rests \
+                             on, so a half-stated budget is refused rather than guessed."
+                        ));
+                    }
+                },
+                Some(false) => None,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "the coordinator served no spend-budget field for {statechain_id}. That is \
+                         not the same as 'no budget': it means the enclave cannot say whether this \
+                         coin is terminal, and terminality is what the receiver's census rests on. \
+                         Upgrade the enclave."
+                    ));
+                }
+            };
             mercurylib::transfer::receiver::verify_sig_count_attestation(
                 statechain_id,
                 response.num_sigs,
+                attested_budget,
                 &nonce_hex,
                 sig,
                 pk,

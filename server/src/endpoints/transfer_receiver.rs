@@ -107,6 +107,26 @@ pub async fn statechain_info(
     let sig_count_attestation = response["attestation"].as_str().map(|s| s.to_string());
     let sig_count_attestation_pubkey = response["attestation_pubkey"].as_str().map(|s| s.to_string());
 
+    // [D8(i)] The SPEND BUDGET, likewise passed through verbatim from the enclave.
+    //
+    // The coordinator has its own copy in Postgres and enforces it, but a receiver relying on a
+    // node's TERMINALITY cannot take the coordinator's word for it — the coordinator is the party
+    // that receiver is being protected from. So the value served here is the ENCLAVE'S, and it is
+    // covered by the same signature as the count (`utexo/sig_count/v2`), which means the coordinator
+    // cannot alter it in flight without the client's verification failing.
+    //
+    // Absence is carried explicitly: `has_sig_budget = false` means "no budget, co-signable
+    // indefinitely", which is a different fact from a budget of 0 ("terminal"), and the two must not
+    // collapse into one another. An enclave that predates the field reports neither, and the client
+    // then fails its attestation check rather than assuming the permissive reading.
+    let has_sig_budget = response["has_sig_budget"].as_bool();
+    let sig_budget = response["sig_budget"].as_u64().map(|b| b as u32);
+    let sig_budget = match has_sig_budget {
+        Some(true) => sig_budget,
+        Some(false) => None,
+        None => None,
+    };
+
     let statechain_info = crate::database::transfer_receiver::get_statechain_info(&statechain_entity.pool, &statechain_id).await;
 
     let x1_pubkey = crate::database::transfer_receiver::get_x1pub(&statechain_entity.pool, &statechain_id).await;
@@ -127,6 +147,8 @@ pub async fn statechain_info(
         aggregate_pubkey,
         sig_count_attestation,
         sig_count_attestation_pubkey,
+        has_sig_budget,
+        sig_budget,
     };
     
     let response_body = json!(statechain_info_response_payload);
