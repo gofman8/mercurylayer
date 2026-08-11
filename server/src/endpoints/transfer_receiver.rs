@@ -10,8 +10,16 @@ use crate::server::StateChainEntity;
 
 use super::is_batch_expired;
 
-#[get("/info/statechain/<statechain_id>")]
-pub async fn statechain_info(statechain_entity: &State<StateChainEntity>, statechain_id: &str) -> status::Custom<Json<Value>> {
+// [D8] `attestation_nonce` is an OPTIONAL query parameter, so the existing URL keeps working
+// unchanged for clients that do not ask for an attestation.
+#[get("/info/statechain/<statechain_id>?<attestation_nonce>")]
+pub async fn statechain_info(
+    statechain_entity: &State<StateChainEntity>,
+    statechain_id: &str,
+    // [D8] Optional 32-byte hex challenge. Present => ask the SE to attest the count against it;
+    // absent => the count is returned unattested, exactly as before, so old clients keep working.
+    attestation_nonce: Option<String>,
+) -> status::Custom<Json<Value>> {
 
     let enclave_public_key = crate::database::transfer_receiver::get_enclave_pubkey(&statechain_entity.pool, &statechain_id).await;
 
@@ -46,7 +54,17 @@ pub async fn statechain_info(statechain_entity: &State<StateChainEntity>, statec
     let path = "signature_count";
 
     let client: reqwest::Client = reqwest::Client::new();
-    let request = client.get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id));
+    // [D8] Forward the caller's attestation nonce to the SE. The count is the right-hand side of the
+    // receiver's census, and a coordinator that under-reports it hides co-signed rival states while
+    // the census still balances — so the client asks the SE to SIGN the count, against a nonce the
+    // client chose. Passing the nonce through is all the coordinator does: it cannot forge the
+    // signature, and it cannot replay an older (lower) attestation because that one answered a
+    // different nonce. A request without a nonce gets the count unattested, exactly as before.
+    let request = match attestation_nonce.as_deref() {
+        Some(nonce) => client.get(&format!(
+            "{}/{}/{}?nonce={}", lockbox_endpoint, path, statechain_id, nonce)),
+        None => client.get(&format!("{}/{}/{}", lockbox_endpoint, path, statechain_id)),
+    };
 
     let value = match request.send().await {
         Ok(response) => {
@@ -63,8 +81,31 @@ pub async fn statechain_info(statechain_entity: &State<StateChainEntity>, statec
         },
     };
 
-    let response: Value = serde_json::from_str(value.as_str()).expect(&format!("failed to parse: {}", value.as_str()));
-    let num_sigs = response["sig_count"].as_u64().unwrap();
+    // [D8] A malformed SE reply used to `.expect()`/`.unwrap()` here, panicking the request handler
+    // — a 500 with no body, and a panic per malformed reply. Both are now typed errors.
+    let response: Value = match serde_json::from_str(value.as_str()) {
+        Ok(v) => v,
+        Err(err) => {
+            return status::Custom(Status::InternalServerError, Json(json!({
+                "error": "Internal Server Error",
+                "message": format!("signature count reply from the enclave did not parse: {}", err)
+            })));
+        }
+    };
+    let num_sigs = match response["sig_count"].as_u64() {
+        Some(n) => n,
+        None => {
+            return status::Custom(Status::InternalServerError, Json(json!({
+                "error": "Internal Server Error",
+                "message": "signature count reply from the enclave carried no numeric `sig_count`"
+            })));
+        }
+    };
+    // The attestation is passed through verbatim, or omitted. The coordinator neither creates nor
+    // validates it — it cannot forge one, and a client that asked for one and gets none knows the
+    // count is UNATTESTED rather than being handed something that merely looks verified.
+    let sig_count_attestation = response["attestation"].as_str().map(|s| s.to_string());
+    let sig_count_attestation_pubkey = response["attestation_pubkey"].as_str().map(|s| s.to_string());
 
     let statechain_info = crate::database::transfer_receiver::get_statechain_info(&statechain_entity.pool, &statechain_id).await;
 
@@ -84,6 +125,8 @@ pub async fn statechain_info(statechain_entity: &State<StateChainEntity>, statec
         statechain_info,
         x1_pub,
         aggregate_pubkey,
+        sig_count_attestation,
+        sig_count_attestation_pubkey,
     };
     
     let response_body = json!(statechain_info_response_payload);

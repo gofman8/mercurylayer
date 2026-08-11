@@ -87,6 +87,12 @@ pub enum MercuryError {
     CoinNotFound,
     SignatureSchemeValidationError,
     NoPreviousLockTimeError,
+    /// [D8] The SE's attestation over `(statechain_id, sig_count)` did not verify: the signature is
+    /// bad, the nonce is not the one this caller asked with, or — the case that matters — the key
+    /// that signed it is not the enclave key already bound to the on-chain tx0 output. Treat the
+    /// count as UNTRUSTED: it is the census's right-hand side, and an unverified one lets a
+    /// coordinator hide co-signed rival states while the census still balances.
+    SigCountAttestationInvalid,
     /// The `FFITransferMsg` shape cannot represent a laddered (TES-R) transfer — it carries no
     /// `protocol_version`, `tesr_ladder`, `child_tesr_bundle`, `branch_txs` or `terminal_parents`.
     /// Converting such a message to the FFI type would SILENTLY DROP that material and hand the far

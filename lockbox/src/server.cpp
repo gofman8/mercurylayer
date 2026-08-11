@@ -1,6 +1,7 @@
 #include "server.h"
 #include <crow.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 #include "utils.h"
 #include "enclave.h"
 #include "google_key_manager.h"
@@ -355,7 +356,7 @@ namespace lockbox {
         });
 
         CROW_ROUTE(app,"/signature_count/<string>")
-        ([](std::string statechain_id){
+        ([&seed](const crow::request& req, std::string statechain_id){
 
             int sig_count;
             std::string error_message;
@@ -366,7 +367,73 @@ namespace lockbox {
                 return crow::response(500, error_message);
             }
 
-            crow::json::wvalue result({{"sig_count", sig_count}});
+            // [D8] ATTEST THE COUNT. Returning it bare is what let a coordinator under-report it by
+            // k and hide k co-signed rival states while the receiver's exact-equality census still
+            // balanced — theft, resting on coordinator honesty alone. The attestation is signed by
+            // THIS coin's server key, whose public half the receiver already binds to the on-chain
+            // tx0 output, so verification needs nothing the client does not already hold.
+            //
+            // PREIMAGE, defined here and mirrored exactly by the verifier:
+            //     sha256("utexo/sig_count/v1" || statechain_id || u32_be(sig_count) || nonce32)
+            //
+            // `nonce` is a 32-byte hex challenge the CLIENT chooses and passes as a query parameter.
+            // Without it the attestation is a static value: a coordinator could serve a genuine
+            // signature captured when the count was legitimately lower, and replay it forever. The
+            // nonce makes each attestation answer one specific question asked once. A caller that
+            // omits it gets the count unattested rather than a forgeable-looking one — the field is
+            // simply absent, so a verifier can tell "not attested" from "attested".
+            auto nonce_hex = req.url_params.get("nonce");
+
+            crow::json::wvalue result;
+            result["sig_count"] = sig_count;
+
+            if (nonce_hex != nullptr) {
+                std::string nonce_str(nonce_hex);
+                if (nonce_str.size() != 64) {
+                    return crow::response(400, "nonce must be 32 bytes of hex (64 characters)");
+                }
+                auto nonce_bytes = utils::ParseHex(nonce_str);
+                if (nonce_bytes.size() != 32) {
+                    return crow::response(400, "nonce must decode to exactly 32 bytes");
+                }
+
+                auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
+                auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
+                encrypted_secnonce.reset();
+
+                bool data_loaded = db_manager::load_generated_key_data(
+                    statechain_id, encrypted_keypair, encrypted_secnonce, nullptr, 0, error_message);
+
+                if (!data_loaded) {
+                    return crow::response(500, "Failed to load key data for attestation: " + error_message);
+                }
+
+                // Build the digest. `sig_count` is serialised big-endian and fixed-width so the
+                // preimage is unambiguous — a length-varying decimal string would let two different
+                // (id, count) pairs collide under concatenation.
+                std::string domain = "utexo/sig_count/v1";
+                std::vector<unsigned char> preimage(domain.begin(), domain.end());
+                preimage.insert(preimage.end(), statechain_id.begin(), statechain_id.end());
+                uint32_t c = static_cast<uint32_t>(sig_count);
+                preimage.push_back((c >> 24) & 0xff);
+                preimage.push_back((c >> 16) & 0xff);
+                preimage.push_back((c >> 8) & 0xff);
+                preimage.push_back(c & 0xff);
+                preimage.insert(preimage.end(), nonce_bytes.begin(), nonce_bytes.end());
+
+                unsigned char digest[32];
+                SHA256(preimage.data(), preimage.size(), digest);
+
+                try {
+                    auto att = enclave::attest_sig_count(seed.data(), encrypted_keypair.get(), digest);
+                    result["attestation"] = utils::key_to_string(att.signature, sizeof(att.signature));
+                    result["attestation_pubkey"] = utils::key_to_string(att.xonly_pubkey, sizeof(att.xonly_pubkey));
+                    result["attestation_nonce"] = nonce_str;
+                } catch (std::exception const &e) {
+                    return crow::response(500, std::string("Failed to attest signature count: ") + e.what());
+                }
+            }
+
             return crow::response{result};
         });
 

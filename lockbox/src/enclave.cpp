@@ -277,4 +277,64 @@ namespace enclave {
 
         }
 
+    /**
+     * [D8] Attest a coin's signature count.
+     *
+     * WHY THIS EXISTS. `sig_count` is the right-hand side of the receiver's anti-theft census
+     * (`se_num_sigs == flat_backups + tiers + superseded`, exact equality). Until now it travelled
+     * from this database to the client as a bare integer with no signature, MAC or attestation at
+     * any hop, so a coordinator that UNDER-REPORTED it by k could hide k co-signed rival states:
+     * the census still balanced exactly and the receiver accepted a coin the sender could still
+     * reclaim. Theft, resting entirely on coordinator honesty.
+     *
+     * WHY THIS KEY. The signature is made with THIS COIN'S server keypair — the same key whose
+     * public half the receiver already binds to the on-chain tx0 output
+     * (`validate_tx0_output_pubkey`: tx0 output == sender_pubkey + enclave_pubkey). So the verifier
+     * is a value the client has already checked against the chain. No new key material, no new
+     * trust anchor, and nothing to distribute.
+     *
+     * The 32-byte digest is built by the caller so that signer and verifier read one definition of
+     * the preimage and cannot drift apart.
+     */
+    SigCountAttestationResponse attest_sig_count(
+        unsigned char* seed,
+        utils::chacha20_poly1305_encrypted_data *encrypted_keypair,
+        const unsigned char* message32) {
+
+        SigCountAttestationResponse response;
+        memset(response.signature, 0, sizeof(response.signature));
+        memset(response.xonly_pubkey, 0, sizeof(response.xonly_pubkey));
+
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+        secp256k1_keypair server_keypair;
+        int status = decrypt_data(encrypted_keypair, seed, server_keypair.data, sizeof(secp256k1_keypair::data));
+        if (status != 0) {
+            secp256k1_context_destroy(ctx);
+            throw std::runtime_error("\nSeed ecryption failed");
+        }
+
+        // Auxiliary randomness, per BIP-340. Not optional: a deterministic-nonce failure here would
+        // leak the coin's server key, which is the same key that co-signs its transactions.
+        unsigned char auxiliary_rand[32];
+        if (RAND_bytes(auxiliary_rand, sizeof(auxiliary_rand)) != 1) {
+            secp256k1_context_destroy(ctx);
+            throw std::runtime_error("Failed to generate random bytes");
+        }
+
+        int return_val = secp256k1_schnorrsig_sign32(ctx, response.signature, message32, &server_keypair, auxiliary_rand);
+        assert(return_val);
+
+        secp256k1_xonly_pubkey xonly_pubkey;
+        return_val = secp256k1_keypair_xonly_pub(ctx, &xonly_pubkey, NULL, &server_keypair);
+        assert(return_val);
+
+        return_val = secp256k1_xonly_pubkey_serialize(ctx, response.xonly_pubkey, &xonly_pubkey);
+        assert(return_val);
+
+        secp256k1_context_destroy(ctx);
+
+        return response;
+    }
+
 } // namespace enclave

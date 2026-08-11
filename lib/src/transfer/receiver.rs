@@ -91,6 +91,26 @@ pub struct StatechainInfoResponsePayload {
     /// keeps old clients/servers interoperable.
     #[serde(default)]
     pub aggregate_pubkey: Option<String>,
+    /// [D8] BIP-340 Schnorr signature by THIS coin's SE key over
+    /// `sha256("utexo/sig_count/v1" || statechain_id || u32_be(num_sigs) || nonce32)`, hex.
+    ///
+    /// `num_sigs` is the right-hand side of the receiver's anti-theft census, and it used to arrive
+    /// as a bare integer: a coordinator that under-reported it by `k` hid `k` co-signed rival states
+    /// while the exact-equality census still balanced, and the receiver accepted a coin the sender
+    /// could still reclaim. This closes that by making the count say who vouched for it.
+    ///
+    /// `None` means **UNATTESTED**, never "fine" — either the client asked for no nonce, or the
+    /// deployment predates the attestation. A verifier must decide which of those it accepts;
+    /// silently treating `None` as verified reintroduces the defect.
+    #[serde(default)]
+    pub sig_count_attestation: Option<String>,
+    /// The x-only public key that signs [`Self::sig_count_attestation`], hex. It is THIS coin's SE
+    /// key — the same key the receiver already binds to the on-chain tx0 output
+    /// (`validate_tx0_output_pubkey`), so the attestation introduces no new trust anchor. A verifier
+    /// MUST check it against that chain-anchored value rather than trusting the field, or the
+    /// coordinator could sign with a key of its own choosing.
+    #[serde(default)]
+    pub sig_count_attestation_pubkey: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -193,6 +213,67 @@ pub fn verify_transfer_signature(new_user_pubkey: &str, tx0_outpoint: &TxOutpoin
     let msg = Message::from_hashed_data::<sha256::Hash>(&data_to_verify);
 
     Ok(secp.verify_schnorr(&signature, &msg, &sender_public_key).is_ok())
+}
+
+/// **[D8] Verify the SE's attestation over a coin's signature count.**
+///
+/// `num_sigs` is the right-hand side of the receiver's anti-theft census
+/// (`se_num_sigs == flat_backups + tiers + superseded`, exact equality). It used to arrive as a bare
+/// integer with no signature at any hop, so a coordinator that UNDER-REPORTED it by `k` hid `k`
+/// co-signed rival states: the census still balanced exactly, and the receiver accepted a coin the
+/// sender could still reclaim. Theft, resting on coordinator honesty alone.
+///
+/// **The verifying key must be the chain-anchored one.** `attestation_pubkey` as served is just a
+/// field the coordinator could fill with a key it controls; pass the `enclave_public_key` this
+/// receiver has already bound to the on-chain tx0 output via [`validate_tx0_output_pubkey`], and
+/// this function refuses if the two disagree. That is what makes the attestation mean anything.
+///
+/// `nonce_hex` must be the 32-byte challenge THIS caller generated for THIS request. Without it a
+/// coordinator could replay a genuine attestation captured when the count was legitimately lower.
+///
+/// Returns `Ok(())` only if the signature verifies over the exact preimage the SE signed:
+/// `sha256("utexo/sig_count/v1" || statechain_id || u32_be(num_sigs) || nonce32)`.
+pub fn verify_sig_count_attestation(
+    statechain_id: &str,
+    num_sigs: u32,
+    nonce_hex: &str,
+    attestation_hex: &str,
+    attestation_pubkey_hex: &str,
+    chain_anchored_enclave_pubkey: &str,
+) -> Result<(), MercuryError> {
+    // 1. The signer must be the key already bound to the on-chain tx0 output. `enclave_public_key`
+    //    is a 33-byte compressed key; the attestation carries its 32-byte x-only half.
+    let anchored = PublicKey::from_str(chain_anchored_enclave_pubkey)
+        .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
+    let (anchored_xonly, _) = anchored.x_only_public_key();
+    let claimed_xonly = XOnlyPublicKey::from_str(attestation_pubkey_hex)
+        .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
+    if anchored_xonly != claimed_xonly {
+        // The coordinator signed with a key of its own choosing. That is the attack this check is
+        // for, so it is a refusal, not a warning.
+        return Err(MercuryError::SigCountAttestationInvalid);
+    }
+
+    // 2. Rebuild the preimage EXACTLY as the SE built it (lockbox/src/server.cpp, /signature_count).
+    //    `num_sigs` big-endian and fixed-width: a decimal string would let two different
+    //    (id, count) pairs collide under concatenation.
+    let nonce = hex::decode(nonce_hex).map_err(|_| MercuryError::SigCountAttestationInvalid)?;
+    if nonce.len() != 32 {
+        return Err(MercuryError::SigCountAttestationInvalid);
+    }
+    let mut preimage: Vec<u8> = Vec::new();
+    preimage.extend_from_slice(b"utexo/sig_count/v1");
+    preimage.extend_from_slice(statechain_id.as_bytes());
+    preimage.extend_from_slice(&num_sigs.to_be_bytes());
+    preimage.extend_from_slice(&nonce);
+
+    let msg = Message::from_hashed_data::<sha256::Hash>(&preimage);
+    let signature = Signature::from_str(attestation_hex)
+        .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
+
+    Secp256k1::new()
+        .verify_schnorr(&signature, &msg, &claimed_xonly)
+        .map_err(|_| MercuryError::SigCountAttestationInvalid)
 }
 
 pub fn validate_tx0_output_pubkey(enclave_public_key: &str, transfer_msg: &TransferMsg, tx0_outpoint: &TxOutpoint, tx0_hex: &str, network: &str) -> Result<bool, MercuryError> {
@@ -1380,5 +1461,89 @@ mod transfer_signature_tests {
         let m_forged = msg_from(&sender, &forged); // user_public_key = honest sender, sig by attacker
         assert!(!verify_transfer_signature(&receiver_pk.to_string(), &outpoint, &m_forged).unwrap(),
             "a signature not produced by the claimed sender key must be rejected");
+    }
+}
+
+/// [D8] The attestation that closes the unauthenticated-census hole. These pin the property the
+/// whole change exists for: an under-reported count must not be believable, and the coordinator
+/// must not be able to sign one itself.
+#[cfg(test)]
+mod sig_count_attestation_tests {
+    use super::*;
+    use secp256k1_zkp::{rand, KeyPair, Secp256k1};
+
+    /// Build the preimage exactly as `lockbox/src/server.cpp` does, and sign it.
+    fn attest(kp: &KeyPair, sid: &str, count: u32, nonce: &[u8; 32]) -> String {
+        let mut preimage: Vec<u8> = Vec::new();
+        preimage.extend_from_slice(b"utexo/sig_count/v1");
+        preimage.extend_from_slice(sid.as_bytes());
+        preimage.extend_from_slice(&count.to_be_bytes());
+        preimage.extend_from_slice(nonce);
+        let msg = Message::from_hashed_data::<sha256::Hash>(&preimage);
+        Secp256k1::new().sign_schnorr(&msg, kp).to_string()
+    }
+
+    fn setup() -> (KeyPair, String, String, [u8; 32]) {
+        let secp = Secp256k1::new();
+        let kp = KeyPair::new(&secp, &mut rand::thread_rng());
+        let compressed = PublicKey::from_keypair(&kp).to_string();
+        let (xonly, _) = PublicKey::from_keypair(&kp).x_only_public_key();
+        (kp, compressed, xonly.to_string(), [7u8; 32])
+    }
+
+    #[test]
+    fn an_honest_attestation_verifies() {
+        let (kp, compressed, xonly, nonce) = setup();
+        let sig = attest(&kp, "coin-a", 5, &nonce);
+        assert!(verify_sig_count_attestation(
+            "coin-a", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_ok());
+    }
+
+    #[test]
+    fn an_under_reported_count_does_not_verify() {
+        // THE ATTACK. The SE attested 5; the coordinator forwards 4 to hide one co-signed rival
+        // state, so the receiver's exact-equality census balances against a short tally. The
+        // signature was made over 5, so it cannot cover 4.
+        let (kp, compressed, xonly, nonce) = setup();
+        let sig = attest(&kp, "coin-a", 5, &nonce);
+        assert!(verify_sig_count_attestation(
+            "coin-a", 4, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+            "an under-reported count must NOT verify — this is the theft the census exists to stop");
+    }
+
+    #[test]
+    fn a_coordinator_signing_with_its_own_key_is_refused() {
+        // The coordinator serves a perfectly valid signature — made with a key IT controls — and
+        // names that key in `attestation_pubkey`. Only binding to the chain-anchored enclave key
+        // catches this; verifying against the served key would accept it.
+        let (_kp, compressed, _xonly, nonce) = setup();
+        let secp = Secp256k1::new();
+        let rogue = KeyPair::new(&secp, &mut rand::thread_rng());
+        let (rogue_xonly, _) = PublicKey::from_keypair(&rogue).x_only_public_key();
+        let sig = attest(&rogue, "coin-a", 4, &nonce);
+        assert!(verify_sig_count_attestation(
+            "coin-a", 4, &hex::encode(nonce), &sig, &rogue_xonly.to_string(), &compressed).is_err(),
+            "a signature by a key other than the chain-anchored enclave key must be refused");
+    }
+
+    #[test]
+    fn a_replayed_attestation_for_another_nonce_is_refused() {
+        // Without nonce binding the attestation is static: a coordinator could serve one captured
+        // when the count was legitimately lower, forever.
+        let (kp, compressed, xonly, nonce) = setup();
+        let sig = attest(&kp, "coin-a", 5, &nonce);
+        let fresh = [9u8; 32];
+        assert!(verify_sig_count_attestation(
+            "coin-a", 5, &hex::encode(fresh), &sig, &xonly, &compressed).is_err(),
+            "an attestation answering a different challenge must not satisfy this one");
+    }
+
+    #[test]
+    fn an_attestation_for_another_coin_is_refused() {
+        let (kp, compressed, xonly, nonce) = setup();
+        let sig = attest(&kp, "coin-a", 5, &nonce);
+        assert!(verify_sig_count_attestation(
+            "coin-b", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+            "the statechain id is in the preimage precisely so one coin's count cannot vouch for another");
     }
 }
