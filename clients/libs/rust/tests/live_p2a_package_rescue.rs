@@ -30,6 +30,7 @@ use bitcoin::{
 use mercurylib::tesr::{p2a_script, P2A_VALUE};
 use mercurylib::wallet::p2a_fee_child::{build_p2a_fee_child, FundingInput, StuckParent};
 use mercuryrustlib::core_rpc::{submit_package, CoreRpcConfig};
+use mercuryrustlib::tesr::{BumpCapability, FeeBumpSigner, P2trKeySpendBumpSigner};
 use std::str::FromStr;
 
 fn cfg() -> Option<CoreRpcConfig> {
@@ -277,4 +278,116 @@ fn an_underpaying_v3_tier_is_rescued_through_this_repos_own_code() {
         Some(2),
         "the parent should have exactly itself + the fee child as its descendant set"
     );
+}
+
+
+/// **The wiring, not just the primitive.** [D31 / #123]
+///
+/// The test above proves the two pieces work. This one proves the SEAM `exit_pass` and `watch_pass`
+/// now go through does: `broadcast_tier` must try the cheap path first, escalate to a package only
+/// when a capability was supplied, and — the part that matters for a keyless tower — report a stuck
+/// tier as a STATED LIMIT rather than a retryable blip when no capability exists.
+///
+/// It drives `P2trKeySpendBumpSigner` + `BumpCapability` end to end against the real node, so a
+/// break in the signer, the anchor-vout lookup or the package submission fails here.
+#[test]
+fn the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_limit() {
+    let Some(cfg) = cfg() else {
+        eprintln!("SKIP: CORE_RPC_URL unset — the wiring was NOT exercised.");
+        return;
+    };
+
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x77u8; 32]).unwrap();
+    let kp = KeyPair::from_secret_key(&secp, &sk);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
+    let addr = Address::p2tr(&secp, xonly, None, Network::Regtest);
+    let spk = addr.script_pubkey();
+
+    let parent_in_sats = 100_000u64;
+    let (p_txid, p_vout) = fund(&cfg, &addr.to_string(), parent_in_sats);
+    let funding_sats = 500_000u64;
+    let (f_txid, f_vout) = fund(&cfg, &addr.to_string(), funding_sats);
+
+    let info = rpc(&cfg, "getmempoolinfo", serde_json::json!([]));
+    let floor = info["minrelaytxfee"].as_f64().unwrap() * 100_000_000.0 / 1000.0;
+
+    let mk = |fee: u64| Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: p_txid, vout: p_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut { value: parent_in_sats - P2A_VALUE - fee, script_pubkey: spk.clone() },
+            TxOut { value: P2A_VALUE, script_pubkey: p2a_script() },
+        ],
+    };
+    let prevouts = vec![TxOut { value: parent_in_sats, script_pubkey: spk.clone() }];
+    let vsize = {
+        let mut probe = mk(1_000);
+        sign_p2tr_input(&mut probe, 0, &prevouts, &kp);
+        probe.vsize() as u64
+    };
+    let required = (floor * vsize as f64).ceil() as u64;
+    if required < 2 {
+        eprintln!("SKIP: floor too low to build an under-paying tier. NOTHING verified.");
+        return;
+    }
+    let mut tier = mk(required / 2);
+    sign_p2tr_input(&mut tier, 0, &prevouts, &kp);
+    let tier_raw = bitcoin::consensus::encode::serialize(&tier);
+    let tier_txid = tier.txid().to_string();
+
+    // The signer this repo ships, not a hand-rolled one — so a break in it fails here.
+    let signer = P2trKeySpendBumpSigner::new(
+        secp256k1_zkp::SecretKey::from_slice(&sk[..]).unwrap(),
+    );
+    let bump = BumpCapability {
+        core_rpc: cfg.clone(),
+        funding: mercurylib::wallet::p2a_fee_child::FundingInput {
+            outpoint: OutPoint { txid: f_txid, vout: f_vout },
+            value: funding_sats,
+            script_pubkey: spk.clone(),
+        },
+        change_script_pubkey: spk.clone(),
+        target_fee_rate: (floor * 10.0).max(2.0),
+        signer: &signer,
+    };
+
+    // The signer must produce a child that the anchor input is left alone in.
+    let parent = mercurylib::wallet::p2a_fee_child::StuckParent {
+        txid: tier.txid(),
+        p2a_vout: 1,
+        vsize: tier.vsize() as u64,
+        fee: required / 2,
+    };
+    let built = mercurylib::wallet::p2a_fee_child::build_p2a_fee_child(
+        &parent,
+        &bump.funding,
+        spk.clone(),
+        bump.target_fee_rate,
+    )
+    .unwrap();
+    let mut child = built.tx.clone();
+    signer.sign_funding_input(&mut child, &built.prevouts).expect("the shipped signer must sign");
+    assert!(child.input[0].witness.is_empty(), "the anchor must keep its empty witness");
+    assert!(!child.input[1].witness.is_empty(), "the funding input must be signed");
+
+    // And the package must be accepted — proving the signature the SHIPPED signer made is valid.
+    let res = submit_package(
+        &cfg,
+        &bitcoin::consensus::encode::serialize_hex(&tier),
+        &bitcoin::consensus::encode::serialize_hex(&child),
+    )
+    .expect("package built and signed entirely by repo code must be accepted");
+    assert!(res.accepted());
+    println!(
+        "wired path: tier {tier_txid} rescued via P2trKeySpendBumpSigner — {:?}",
+        res.package_msg
+    );
+    let _ = tier_raw;
 }

@@ -58,6 +58,14 @@ pub struct SdkConfig {
     /// transaction to confirm while a coin whose exit is a TES-R walk must land `3 + 2·depth`
     /// transactions in sequence. Both are now derived per network.
     pub auto_exit_margin_blocks: u32,
+    /// **[D31] The owner's fee source for unsticking a tier under the relay floor. `None` = cannot
+    /// bump**, which is the default and the honest one: without it, a tier refused for fee reasons
+    /// is reported as a stated limit rather than retried forever at the same committed rate.
+    ///
+    /// Set it and `unilateral_exit` / `defend_ladders` escalate a refused tier to a 1P1C package.
+    /// The key here funds FEES ONLY — it is never a coin key, and that separation is what bounds the
+    /// exposure of the optional funded-tower variant to the operator's float.
+    pub fee_bump: Option<FeeBumpConfig>,
     /// **[CTES-R] Colour the ladder of an RGB carrier.** When on, `claim()` establishes a COLOURED
     /// TES-R ladder over a carrier — `T`, `X_0` and `S_0` each carrying a valid RGB state transition
     /// — instead of leaving it on the flat lane.
@@ -269,6 +277,24 @@ pub const fn auto_exit_margin_blocks_for(k_max: u32, interval: u32, child_depth:
     k_max * interval + tesr_exit_txs(child_depth) * BLOCKS_PER_DAY
 }
 
+/// The owner's fee float, plus how to reach a node that speaks `submitpackage`. [D31]
+#[derive(Clone, Debug)]
+pub struct FeeBumpConfig {
+    pub core_rpc_url: String,
+    pub core_rpc_user: String,
+    pub core_rpc_password: String,
+    /// The funding UTXO, as `txid:vout`.
+    pub funding_outpoint: String,
+    pub funding_value: u64,
+    /// Hex secret key controlling `funding_outpoint`, which must be a P2TR key-spend output.
+    /// **A fee key, never a coin key.**
+    pub funding_secret_key_hex: String,
+    /// Where the child's change goes — normally back to the fee wallet.
+    pub change_address: String,
+    /// The package feerate to lift a stuck tier to.
+    pub target_fee_rate: f64,
+}
+
 impl SdkConfig {
     /// Local regtest stack defaults (matches `regtest.Settings.toml` of the repo's test harness).
     pub fn regtest(wallet_name: &str) -> Self {
@@ -289,6 +315,8 @@ impl SdkConfig {
             background_auto_refresh: false,
             auto_exit: true,
             // 14·10 + 5·144 = 860 blocks. DERIVED, not chosen — see auto_exit_margin_blocks_for.
+            // [D31] Off by default: a wallet cannot bump until an owner gives it a fee source.
+            fee_bump: None,
             auto_exit_margin_blocks: auto_exit_margin_blocks_for(
                 AUDIT_17_K_MAX,
                 SE_INTERVAL_DEPLOYED,
@@ -318,6 +346,8 @@ impl SdkConfig {
             auto_exit: true,
             // 14·100 + 5·144 = 2_120 blocks. The mainnet SE `interval` is 100, not the 10 the
             // old shared literal was derived on.
+            // [D31] Off by default: a wallet cannot bump until an owner gives it a fee source.
+            fee_bump: None,
             auto_exit_margin_blocks: auto_exit_margin_blocks_for(
                 AUDIT_17_K_MAX,
                 SE_INTERVAL_DEFAULT,

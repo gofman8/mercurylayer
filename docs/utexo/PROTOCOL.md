@@ -576,8 +576,19 @@ node whose floor is 0.1 sat/vB (`min relay fee not met, 6 < 13`) and then ACCEPT
 (`package_msg = "success"`, parent in the mempool with a descendant count of 2) —
 `clients/libs/rust/tests/live_p2a_package_rescue.rs`. That is the WP1 acceptance criterion, which
 required the rescue to run through this repo's own code rather than a hand-run `bitcoin-cli`.
-What remains unwired is the CALLER: `watch_pass` (and `exit_pass`) still walk the tiers with
-per-tx `transaction_broadcast_raw` and attach no P2A fee child — the committed fee of §5.3 carries each
+**The CALLERS are now wired too (2026-08-11).** `exit_pass_with_bump` and `watch_pass_with_bump`
+escalate a tier refused at its committed fee into a 1P1C package, and `unilateral_exit` /
+`defend_ladders` use them whenever `SdkConfig::fee_bump` supplies an owner fee source. The
+capability is an explicit argument, never ambient config, so the plain `exit_pass` / `watch_pass`
+keep their exact keyless meaning — and a keyless pass now reports a fee-stuck tier as a **stated
+limit** ("no fee-bump capability was supplied … a keyless tower cannot bump (D31) … it will not
+clear by retrying") instead of as one more retryable failure indistinguishable from an immature CSV.
+The anchor is located by matching the P2A script, never by a guessed vout, because a coloured tier
+carries an extra `opret` and a hardcoded index would spend the payload output instead.
+
+What remains genuinely unbuilt is the tower's FUNDING RAIL (the prepaid fee bond of the optional
+funded-tower variant); the keyless default still walks the tiers with per-tx
+`transaction_broadcast_raw` and attaches no P2A fee child — the committed fee of §5.3 carries each
 tier at ordinary rates, but the amendment above is a specification, not shipped code, and no test
 exercises spike-time fee bumping (§9). Note that under **D31** this gap is narrower than it looks for
 the DEFAULT tower: a keyless tower would not bump even if the code existed, so what is missing is the

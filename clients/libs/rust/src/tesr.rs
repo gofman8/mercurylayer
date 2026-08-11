@@ -8090,8 +8090,272 @@ pub struct ExitProgress {
 /// backend could not be read. **`Idle` and `Blind` are different answers** — before F4 both were an
 /// empty vector, so a tower with a dead backend reported the same "all quiet" as a tower watching a
 /// healthy idle coin.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// [D31 / #123] THE PACKAGE PATH, WIRED INTO THE TWO BROADCAST LOOPS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// A TES-R tier commits its fee at signing time. When the mempool floor rises above that rate the
+// tier is refused — `min relay fee not met, 200 < 423` — and the only way it enters a mempool is as
+// a 1P1C package with a child paying for both. Until now `watch_pass` and `exit_pass` had no way to
+// do that: they called `transaction_broadcast_raw` per tier and reported the refusal as one more
+// retryable failure, indistinguishable from "the CSV has not matured yet".
+//
+// **Who may bump is not an implementation detail — it is D31.** A KEYLESS tower cannot: the child
+// needs a funding input it does not hold and a signature it cannot make. So the capability is an
+// explicit, optional argument rather than something read from ambient config, and the two existing
+// entry points keep their signatures and their keyless meaning. `watch_pass(electrum, bundle)` is
+// still exactly the keyless pass it always was.
+
+/// Signs the funding input of a fee child. Kept as a trait so no key material enters this module.
+///
+/// Implementors sign **input 1 only**. Input 0 is the P2A anchor, which is anyone-can-spend and must
+/// keep its empty witness — an implementor that signs it has mistaken this for a different job.
+pub trait FeeBumpSigner {
+    fn sign_funding_input(
+        &self,
+        child: &mut electrum_client::bitcoin::Transaction,
+        prevouts: &[electrum_client::bitcoin::TxOut],
+    ) -> Result<()>;
+}
+
+/// Everything needed to rescue a stuck tier. Its ABSENCE is the keyless case, and that is the point:
+/// there is no default, no fallback endpoint and no implicit funding source, so a tower cannot
+/// acquire this capability by accident.
+pub struct BumpCapability<'a> {
+    /// Where to submit the package. Electrum has no `submitpackage`, so this is necessarily a
+    /// Bitcoin Core RPC endpoint.
+    pub core_rpc: crate::core_rpc::CoreRpcConfig,
+    /// The OWNER's funding UTXO (D31). A fee float, never a coin.
+    pub funding: mercurylib::wallet::p2a_fee_child::FundingInput,
+    /// Where the child's change goes.
+    pub change_script_pubkey: electrum_client::bitcoin::ScriptBuf,
+    /// The package feerate to lift the tier to.
+    pub target_fee_rate: f64,
+    pub signer: &'a dyn FeeBumpSigner,
+}
+
+/// A [`FeeBumpSigner`] for the ordinary case: the funding UTXO is a P2TR key-spend output.
+///
+/// Holds the FEE wallet's key and nothing else. That separation is the whole of D31's bounded
+/// exposure for the funded-tower variant: compromising this costs the float, and cannot touch a
+/// coin, because coin keys never come near it.
+pub struct P2trKeySpendBumpSigner {
+    secret_key: secp256k1_zkp::SecretKey,
+}
+
+impl P2trKeySpendBumpSigner {
+    pub fn new(secret_key: secp256k1_zkp::SecretKey) -> Self {
+        Self { secret_key }
+    }
+}
+
+impl FeeBumpSigner for P2trKeySpendBumpSigner {
+    fn sign_funding_input(
+        &self,
+        child: &mut electrum_client::bitcoin::Transaction,
+        prevouts: &[electrum_client::bitcoin::TxOut],
+    ) -> Result<()> {
+        use electrum_client::bitcoin::hashes::Hash;
+        use electrum_client::bitcoin::key::TapTweak;
+        use electrum_client::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+
+        // Index 1 by construction (`build_p2a_fee_child`): input 0 is the anchor. Checked rather
+        // than assumed, because signing the wrong input would produce a transaction that is invalid
+        // in a way only a node will tell you about.
+        const FUNDING_INPUT: usize = 1;
+        if child.input.len() <= FUNDING_INPUT || prevouts.len() != child.input.len() {
+            return Err(anyhow::anyhow!(
+                "fee child has {} inputs and {} prevouts; expected the 2-input P2A+funding shape",
+                child.input.len(),
+                prevouts.len()
+            ));
+        }
+
+        let secp = electrum_client::bitcoin::secp256k1::Secp256k1::new();
+        let kp = electrum_client::bitcoin::secp256k1::KeyPair::from_seckey_slice(
+            &secp,
+            &self.secret_key[..],
+        )?;
+        let sighash = SighashCache::new(&*child)
+            .taproot_key_spend_signature_hash(
+                FUNDING_INPUT,
+                &Prevouts::All(prevouts),
+                TapSighashType::Default,
+            )
+            .map_err(|e| anyhow::anyhow!("fee-child sighash failed: {e}"))?;
+        let msg = electrum_client::bitcoin::secp256k1::Message::from_slice(sighash.as_byte_array())?;
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp.tap_tweak(&secp, None).to_inner());
+
+        let mut w = electrum_client::bitcoin::Witness::new();
+        w.push(sig.as_ref());
+        child.input[FUNDING_INPUT].witness = w;
+        Ok(())
+    }
+}
+
+/// Locate a tier's P2A anchor by MATCHING THE SCRIPT, never by assuming an index.
+///
+/// Tier builders place the anchor deliberately and the index differs by tier shape (a coloured tier
+/// carries an extra `opret`). Guessing an index here would spend the payload output instead of the
+/// anchor — that is, it would destroy the tier it is trying to rescue.
+fn p2a_vout_of(tx: &electrum_client::bitcoin::Transaction) -> Option<u32> {
+    tx.output
+        .iter()
+        .position(|o| o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES)
+        .map(|i| i as u32)
+}
+
+/// What happened to one tier.
+#[derive(Debug)]
+enum TierBroadcast {
+    /// Relayed on its own; no package needed.
+    Plain,
+    /// Refused alone, then accepted as a 1P1C package.
+    Bumped { child_fee: u64, package_fee_rate: f64 },
+    /// Still stuck. `detail` says whether a bump was tried, and if not, why not.
+    Stuck { detail: String },
+}
+
+/// Broadcast one tier, escalating to a package **only if the caller supplied the means**.
+///
+/// Order matters: the plain broadcast is tried FIRST, always. Most tiers relay at their committed
+/// rate and a package would spend the owner's sats to achieve the same result. The rescue is for the
+/// case where the cheap path has already failed.
+fn broadcast_tier(
+    electrum: &electrum_client::Client,
+    tier_raw: &[u8],
+    tier_txid: &str,
+    prevout_value: u64,
+    bump: Option<&BumpCapability>,
+) -> TierBroadcast {
+    let plain_err = match electrum.transaction_broadcast_raw(tier_raw) {
+        Ok(_) => return TierBroadcast::Plain,
+        Err(e) => e.to_string(),
+    };
+
+    let Some(bump) = bump else {
+        // [D31] The keyless case, reported as a STATED LIMIT rather than a transient failure. This
+        // wording is deliberate: "retry next block" is what a CSV-immature tier deserves, and a
+        // fee-stuck tier retried forever at the same committed rate is the shape that looks like a
+        // flaky backend while a coin dies.
+        return TierBroadcast::Stuck {
+            detail: format!(
+                "{tier_txid}: {plain_err} — and NO fee-bump capability was supplied, so no package \
+                 was attempted. A keyless tower cannot bump (D31): the CPFP child needs a funding \
+                 input it does not hold and a signature it cannot make. If this is a fee-floor \
+                 refusal it will not clear by retrying; the owner must bump it."
+            ),
+        };
+    };
+
+    let tx: electrum_client::bitcoin::Transaction =
+        match hex::decode(hex::encode(tier_raw)).ok().and_then(|b| {
+            electrum_client::bitcoin::consensus::deserialize(&b).ok()
+        }) {
+            Some(tx) => tx,
+            None => {
+                return TierBroadcast::Stuck {
+                    detail: format!("{tier_txid}: {plain_err}; and its raw hex will not parse, so \
+                                     no package could be built from it"),
+                }
+            }
+        };
+
+    let Some(p2a_vout) = p2a_vout_of(&tx) else {
+        return TierBroadcast::Stuck {
+            detail: format!(
+                "{tier_txid}: {plain_err}; and this tier carries NO P2A anchor, so it cannot be \
+                 fee-bumped at all — there is no output for a child to spend. A tier built without \
+                 an anchor is unrescuable by construction."
+            ),
+        };
+    };
+
+    let value_out: u64 = tx.output.iter().map(|o| o.value).sum();
+    let Some(tier_fee) = prevout_value.checked_sub(value_out) else {
+        return TierBroadcast::Stuck {
+            detail: format!(
+                "{tier_txid}: {plain_err}; and it spends {prevout_value} while paying out \
+                 {value_out} — it creates value, so no fee child can make it valid"
+            ),
+        };
+    };
+
+    let parent = mercurylib::wallet::p2a_fee_child::StuckParent {
+        txid: tx.txid(),
+        p2a_vout,
+        vsize: tx.vsize() as u64,
+        fee: tier_fee,
+    };
+    let built = match mercurylib::wallet::p2a_fee_child::build_p2a_fee_child(
+        &parent,
+        &bump.funding,
+        bump.change_script_pubkey.clone(),
+        bump.target_fee_rate,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return TierBroadcast::Stuck {
+                detail: format!("{tier_txid}: {plain_err}; and the fee child could not be built: {e}"),
+            }
+        }
+    };
+
+    let mut child_tx = built.tx.clone();
+    if let Err(e) = bump.signer.sign_funding_input(&mut child_tx, &built.prevouts) {
+        return TierBroadcast::Stuck {
+            detail: format!("{tier_txid}: {plain_err}; and the fee child could not be signed: {e}"),
+        };
+    }
+    if !child_tx.input[0].witness.is_empty() {
+        // Fail rather than submit: a witness on the anchor means the signer did something other than
+        // what this path asked of it, and submitting an unexpected shape is how a rescue becomes a
+        // second problem.
+        return TierBroadcast::Stuck {
+            detail: format!(
+                "{tier_txid}: the fee-bump signer put a witness on the P2A anchor input, which is \
+                 anyone-can-spend and must stay empty; refusing to submit"
+            ),
+        };
+    }
+
+    let parent_hex = hex::encode(tier_raw);
+    let child_hex = electrum_client::bitcoin::consensus::encode::serialize_hex(&child_tx);
+    match crate::core_rpc::submit_package(&bump.core_rpc, &parent_hex, &child_hex) {
+        Ok(_) => TierBroadcast::Bumped {
+            child_fee: built.child_fee,
+            package_fee_rate: built.package_fee_rate,
+        },
+        Err(e) => TierBroadcast::Stuck {
+            detail: format!(
+                "{tier_txid}: refused alone ({plain_err}) AND as a package ({e}). Both failures are \
+                 reported because they have different causes and different fixes."
+            ),
+        },
+    }
+}
+
 pub fn watch_pass(electrum: &electrum_client::Client, bundle: &TesrBundle) -> WatchState {
-    match watch_pass_seen(electrum, bundle) {
+    // No capability = the KEYLESS tower, which is what this entry point has always been and what
+    // D31 says it must remain. A stuck tier is reported as a stated limit, not a retryable blip.
+    match watch_pass_seen(electrum, bundle, None) {
+        Ok(state) => state,
+        Err(e) => WatchState::Blind { reason: e.to_string() },
+    }
+}
+
+/// [`watch_pass`] for the OPTIONAL funded-tower variant (D31): identical in every respect except
+/// that a tier refused at its committed fee is retried as a 1P1C package paid for by `bump`.
+///
+/// The operator running this holds a fee float and **no coin keys** — a compromise costs them their
+/// float and cannot touch a user's coin. They also inherit the duty that comes with it: a tower that
+/// runs dry fails at exactly the moment it is needed.
+pub fn watch_pass_with_bump(
+    electrum: &electrum_client::Client,
+    bundle: &TesrBundle,
+    bump: &BumpCapability,
+) -> WatchState {
+    match watch_pass_seen(electrum, bundle, Some(bump)) {
         Ok(state) => state,
         Err(e) => WatchState::Blind { reason: e.to_string() },
     }
@@ -8099,7 +8363,11 @@ pub fn watch_pass(electrum: &electrum_client::Client, bundle: &TesrBundle) -> Wa
 
 /// [`watch_pass`]'s body, with every unreadable backend answer as an `Err` (which the caller turns
 /// into [`WatchState::Blind`]).
-fn watch_pass_seen(electrum: &electrum_client::Client, bundle: &TesrBundle) -> Result<WatchState> {
+fn watch_pass_seen(
+    electrum: &electrum_client::Client,
+    bundle: &TesrBundle,
+    bump: Option<&BumpCapability>,
+) -> Result<WatchState> {
     // Defend only once the coin has actually been triggered on-chain — an idle un-broadcast coin
     // never ages, so there is nothing to do until F is spent. `?` is load-bearing: a backend that
     // cannot answer "is F spent?" must NOT be read as "F is unspent".
@@ -8131,21 +8399,38 @@ fn watch_pass_seen(electrum: &electrum_client::Client, bundle: &TesrBundle) -> R
 
     let mut ids = Vec::new();
     let mut failures = Vec::new();
+    // The value each tier spends, walked down the chain: the trigger spends `F`, and every later
+    // tier spends its parent's `out[0]`. Needed to compute a stuck tier's own fee, which is what the
+    // package arithmetic credits.
+    let mut prevout_value = bundle.f_value;
     for tier in bundle.exit_tiers() {
-        if tx_known(electrum, &tier.txid)? {
-            continue; // already on-chain / in mempool
-        }
         let raw = hex::decode(&tier.signed_tx).map_err(|e| {
             anyhow::anyhow!("tier {} carries unusable signed tx hex: {e}", tier.txid)
         })?;
-        match electrum.transaction_broadcast_raw(&raw) {
-            Ok(_) => ids.push(tier.txid.clone()),
-            Err(e) => {
-                // CSV not met yet / parent unconfirmed — retry on the next pass, but SAY SO.
-                failures.push(format!("{}: {e}", tier.txid));
+        let next_prevout_value = tier_payload_value(&raw, &tier.txid)?;
+        if tx_known(electrum, &tier.txid)? {
+            prevout_value = next_prevout_value;
+            continue; // already on-chain / in mempool
+        }
+        match broadcast_tier(electrum, &raw, &tier.txid, prevout_value, bump) {
+            TierBroadcast::Plain => ids.push(tier.txid.clone()),
+            TierBroadcast::Bumped { child_fee, package_fee_rate } => {
+                ids.push(tier.txid.clone());
+                // Recorded in `failures` rather than silently: spending the owner's sats is an event
+                // worth surfacing even though it succeeded.
+                failures.push(format!(
+                    "{}: relayed only as a fee-bumped PACKAGE — child paid {child_fee} sats, \
+                     package at {package_fee_rate:.2} sat/vB",
+                    tier.txid
+                ));
+            }
+            TierBroadcast::Stuck { detail } => {
+                // CSV not met yet / parent unconfirmed / under the floor — retry, but SAY SO.
+                failures.push(detail);
                 break;
             }
         }
+        prevout_value = next_prevout_value;
     }
     Ok(WatchState::Acted { ids, failures, blind: vec![] })
 }
@@ -8246,26 +8531,72 @@ fn watch_child_pass_seen(
 /// hex is unusable. It is never reported as `complete: false` with an empty broadcast list, which
 /// would be indistinguishable from a healthy "waiting for the next CSV".
 pub fn exit_pass(electrum: &electrum_client::Client, bundle: &TesrBundle) -> Result<ExitProgress> {
+    exit_pass_ex(electrum, bundle, None)
+}
+
+/// [`exit_pass`] with the owner paying to unstick a tier — the D31 default for an OWNER-driven exit.
+///
+/// The owner is the party that both holds a spendable UTXO and wants this coin out, so this is the
+/// entry point an exiting wallet should use whenever a fee source is configured.
+pub fn exit_pass_with_bump(
+    electrum: &electrum_client::Client,
+    bundle: &TesrBundle,
+    bump: &BumpCapability,
+) -> Result<ExitProgress> {
+    exit_pass_ex(electrum, bundle, Some(bump))
+}
+
+fn exit_pass_ex(
+    electrum: &electrum_client::Client,
+    bundle: &TesrBundle,
+    bump: Option<&BumpCapability>,
+) -> Result<ExitProgress> {
     let mut broadcast = Vec::new();
     let mut stalled = None;
+    let mut prevout_value = bundle.f_value;
     for tier in bundle.exit_tiers() {
-        if tx_known(electrum, &tier.txid)? {
-            continue; // already on-chain / in mempool
-        }
         let raw = hex::decode(&tier.signed_tx).map_err(|e| {
             anyhow::anyhow!("tier {} carries unusable signed tx hex: {e}", tier.txid)
         })?;
-        match electrum.transaction_broadcast_raw(&raw) {
-            Ok(_) => broadcast.push(tier.txid.clone()),
-            Err(e) => {
-                // CSV not met yet / parent unconfirmed — retry on the next pass, but SAY SO.
-                stalled = Some(format!("{}: {e}", tier.txid));
+        let next_prevout_value = tier_payload_value(&raw, &tier.txid)?;
+        if tx_known(electrum, &tier.txid)? {
+            prevout_value = next_prevout_value;
+            continue; // already on-chain / in mempool
+        }
+        match broadcast_tier(electrum, &raw, &tier.txid, prevout_value, bump) {
+            TierBroadcast::Plain | TierBroadcast::Bumped { .. } => {
+                broadcast.push(tier.txid.clone())
+            }
+            TierBroadcast::Stuck { detail } => {
+                // CSV not met yet / parent unconfirmed / under the floor — retry, but SAY SO.
+                stalled = Some(detail);
                 break;
             }
         }
+        prevout_value = next_prevout_value;
     }
     let complete = tx_known(electrum, &bundle.current().state.txid)?;
     Ok(ExitProgress { broadcast, complete, stalled })
+}
+
+/// The value a tier passes down to the NEXT tier — its payload output, `out[0]`.
+///
+/// **`Err`, never a fallback.** The first version returned `Option` and the caller kept the previous
+/// tier's value when a tier would not parse. The silent-degradation guard caught it, and the guard
+/// was right: a tier can be unparseable AND already on-chain (a corrupt stored bundle), in which case
+/// the loop `continue`s and the NEXT tier gets priced against its grandparent's value. That
+/// mis-prices the package — and since the owner funds the child (D31), a mis-priced package spends
+/// the owner's sats on an over-fee that nobody asked for. "I cannot read this tier" is not a value.
+fn tier_payload_value(raw: &[u8], txid: &str) -> Result<u64> {
+    let tx: electrum_client::bitcoin::Transaction =
+        electrum_client::bitcoin::consensus::deserialize(raw).map_err(|e| {
+            anyhow::anyhow!("tier {txid} will not deserialise ({e}), so the value it passes to the \
+                             next tier is unknown; refusing to price a fee child against a guess")
+        })?;
+    tx.output
+        .first()
+        .map(|o| o.value)
+        .ok_or_else(|| anyhow::anyhow!("tier {txid} has no outputs at all"))
 }
 
 /// The first tier not yet on-chain in exit order, and its relative-CSV (a wait-time hint).
@@ -22678,6 +23009,106 @@ mod live_rival_relayability_tests {
             relay < csv,
             "the relayability refusal must precede the CSV race check — otherwise a superseded tier \
              is retired on the strength of a race its rival can never enter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bump_wiring_tests {
+    use super::*;
+
+    /// The source of `broadcast_tier`, comments stripped, so the ORDER of its two attempts and the
+    /// content of its keyless refusal can be asserted without a node.
+    fn broadcast_tier_src() -> String {
+        let src = include_str!("tesr.rs");
+        let at = src.find("fn broadcast_tier(").expect("broadcast_tier exists");
+        let end = src[at..].find("\n/// The value a tier passes down").unwrap_or(src.len() - at);
+        src[at..at + end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Plain broadcast FIRST, always. Most tiers relay at their committed rate, and going straight
+    /// to a package would spend the owner's sats to achieve what a free broadcast already achieves.
+    #[test]
+    fn the_cheap_path_is_tried_before_the_owner_is_charged() {
+        let b = broadcast_tier_src();
+        let plain = b.find("transaction_broadcast_raw").expect("plain broadcast");
+        let pkg = b.find("submit_package").expect("package submission");
+        assert!(plain < pkg, "the free attempt must precede the paid one");
+    }
+
+    /// **[D31] The keyless case must be reported as a LIMIT, not a retry.** A fee-stuck tier retried
+    /// forever at its committed rate is indistinguishable from a CSV-immature one — which is exactly
+    /// how a dying coin looks like a flaky backend.
+    #[test]
+    fn without_a_capability_the_refusal_names_d31_and_says_no_package_was_attempted() {
+        let b = broadcast_tier_src();
+        assert!(
+            b.contains("NO fee-bump capability was supplied"),
+            "the keyless refusal must say that no package was attempted"
+        );
+        assert!(b.contains("D31"), "…and point at the decision that makes it a stated limit");
+        assert!(
+            b.contains("will not clear by retrying"),
+            "…and say plainly that retrying cannot fix it, or the caller will keep retrying"
+        );
+    }
+
+    /// The anchor is found by SCRIPT, never by index. A coloured tier carries an extra `opret`, so a
+    /// hardcoded vout would spend the payload output — destroying the tier it means to rescue.
+    #[test]
+    fn the_anchor_is_located_by_script_not_by_a_guessed_index() {
+        use electrum_client::bitcoin::{absolute, ScriptBuf, Transaction, TxOut};
+        let payload = TxOut { value: 10_000, script_pubkey: ScriptBuf::from(vec![0x51, 0x20]) };
+        let anchor = TxOut {
+            value: mercurylib::tesr::P2A_VALUE,
+            script_pubkey: ScriptBuf::from(mercurylib::tesr::P2A_SCRIPT_BYTES.to_vec()),
+        };
+        let opret = TxOut {
+            value: 0,
+            script_pubkey: ScriptBuf::from(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]),
+        };
+
+        // Plain tier: anchor at 1.
+        let plain = Transaction {
+            version: 3,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![payload.clone(), anchor.clone()],
+        };
+        assert_eq!(p2a_vout_of(&plain), Some(1));
+
+        // Coloured tier: the opret shifts it to 2. A hardcoded `1` would have spent the opret.
+        let coloured = Transaction {
+            version: 3,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![payload.clone(), opret, anchor],
+        };
+        assert_eq!(p2a_vout_of(&coloured), Some(2), "the anchor moved; the lookup must follow it");
+
+        // A tier with no anchor cannot be rescued, and must say so rather than pick something.
+        let anchorless = Transaction {
+            version: 3,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![payload],
+        };
+        assert_eq!(p2a_vout_of(&anchorless), None);
+    }
+
+    /// An unreadable tier must not silently become a stale value that mis-prices the NEXT tier's
+    /// package — the owner pays for that mistake.
+    #[test]
+    fn an_unparseable_tier_is_an_error_not_a_guess() {
+        let err = tier_payload_value(&[0xff, 0x00, 0x13], "deadbeef").unwrap_err().to_string();
+        assert!(err.contains("deadbeef"), "name the tier: {err}");
+        assert!(
+            err.contains("refusing to price a fee child against a guess"),
+            "say why it refuses rather than defaulting: {err}"
         );
     }
 }

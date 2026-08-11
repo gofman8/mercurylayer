@@ -1582,6 +1582,60 @@ impl UtexoWallet {
     /// the recording side and the conveyance side agree on what "[B0] off-chain" means. A DB error
     /// reads as "no evidence", which is the conservative answer here: it downgrades a permanent,
     /// licensing reason to a transient one.
+    /// **[D31] Turn the configured fee source into a usable bump capability.**
+    ///
+    /// Returns the SIGNER and the CAPABILITY-BUILDER separately because `BumpCapability` borrows its
+    /// signer: the caller keeps the signer alive on its own stack and hands a reference in. Clumsy,
+    /// and the alternative — boxing the signer inside the capability — would put key material behind
+    /// a trait object living for the whole pass, which is the opposite of what D31's bounded exposure
+    /// asks for.
+    ///
+    /// `Ok(None)` = no fee source configured = **cannot bump**, which is the default. A malformed
+    /// one is `Err`, not `None`: an operator who configured a fee wallet and got silence would
+    /// reasonably believe their coins are covered.
+    fn fee_bump_parts(
+        &self,
+    ) -> anyhow::Result<Option<(mercuryrustlib::tesr::P2trKeySpendBumpSigner, FeeBumpParts)>> {
+        let Some(cfg) = self.inner.config.fee_bump.as_ref() else {
+            return Ok(None);
+        };
+        let (txid, vout) = cfg
+            .funding_outpoint
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("fee_bump.funding_outpoint must be `txid:vout`"))?;
+        let outpoint = bitcoin::OutPoint {
+            txid: txid.parse().map_err(|e| anyhow::anyhow!("fee_bump funding txid: {e}"))?,
+            vout: vout.parse().map_err(|e| anyhow::anyhow!("fee_bump funding vout: {e}"))?,
+        };
+        let sk_bytes = hex::decode(&cfg.funding_secret_key_hex)
+            .map_err(|e| anyhow::anyhow!("fee_bump.funding_secret_key_hex is not hex: {e}"))?;
+        let sk = secp256k1_zkp::SecretKey::from_slice(&sk_bytes)
+            .map_err(|e| anyhow::anyhow!("fee_bump.funding_secret_key_hex is not a key: {e}"))?;
+        let change: bitcoin::Address = cfg
+            .change_address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .map_err(|e| anyhow::anyhow!("fee_bump.change_address: {e}"))?
+            .require_network(self.inner.config.network)
+            .map_err(|e| anyhow::anyhow!("fee_bump.change_address is for the wrong network: {e}"))?;
+
+        let signer = mercuryrustlib::tesr::P2trKeySpendBumpSigner::new(sk);
+        let parts = FeeBumpParts {
+            core_rpc: mercuryrustlib::core_rpc::CoreRpcConfig::new(
+                cfg.core_rpc_url.clone(),
+                cfg.core_rpc_user.clone(),
+                cfg.core_rpc_password.clone(),
+            ),
+            funding: mercurylib::wallet::p2a_fee_child::FundingInput {
+                outpoint,
+                value: cfg.funding_value,
+                script_pubkey: change.script_pubkey(),
+            },
+            change_script_pubkey: change.script_pubkey(),
+            target_fee_rate: cfg.target_fee_rate,
+        };
+        Ok(Some((signer, parts)))
+    }
+
     async fn has_offchain_funding_row(&self, statechain_id: &str) -> bool {
         let Ok(rows) = mercuryrustlib::sqlite_manager::get_all_backup_txs(
             &self.inner.cc.pool,
@@ -2505,7 +2559,19 @@ impl UtexoWallet {
             // F4: `watch_pass` now reports whether it could SEE. An unreadable chain backend is
             // `Blind`, NOT an empty "nothing to do" — treating the two alike is what let a dead
             // electrum connection masquerade as a quiet, well-defended coin.
-            match mercuryrustlib::tesr::watch_pass(&self.inner.cc.electrum_client, &bundle) {
+            // [D31] Bump only if the owner configured a fee source. Absent = the keyless pass,
+            // which is what this has always been; `watch_pass` then reports a fee-stuck tier as a
+            // stated limit rather than as one more retryable failure.
+            let bump_parts = self.fee_bump_parts()?;
+            let watched = match bump_parts.as_ref() {
+                Some((signer, parts)) => mercuryrustlib::tesr::watch_pass_with_bump(
+                    &self.inner.cc.electrum_client,
+                    &bundle,
+                    &parts.with(signer),
+                ),
+                None => mercuryrustlib::tesr::watch_pass(&self.inner.cc.electrum_client, &bundle),
+            };
+            match watched {
                 mercuryrustlib::tesr::WatchState::Idle => {} // F unspent: verifiably nothing to do
                 // [HIGH / F2+F4 join] `Acted { ids, .. }` DISCARDED `failures`. That field exists
                 // precisely so a caller can tell a ladder that is WAITING (its next tier's
@@ -3362,8 +3428,19 @@ impl UtexoWallet {
                 // F4: `?` on both calls — an unreadable chain backend must surface as an error, not
                 // as `complete: false, wait_blocks: 0`, which reads exactly like a healthy exit
                 // still waiting for its next CSV.
-                let progress =
-                    mercuryrustlib::tesr::exit_pass(&self.inner.cc.electrum_client, &bundle)?;
+                // [D31] The OWNER drives this pass and is the party that funds a bump, so this is
+                // the call site that should use it whenever a fee source exists.
+                let bump_parts = self.fee_bump_parts()?;
+                let progress = match bump_parts.as_ref() {
+                    Some((signer, parts)) => mercuryrustlib::tesr::exit_pass_with_bump(
+                        &self.inner.cc.electrum_client,
+                        &bundle,
+                        &parts.with(signer),
+                    )?,
+                    None => {
+                        mercuryrustlib::tesr::exit_pass(&self.inner.cc.electrum_client, &bundle)?
+                    }
+                };
                 let done = progress.complete;
                 if done {
                     self.register_exit_tip_best_effort(&id).await;
@@ -4304,6 +4381,31 @@ mod rgb_stage0_claim_laddering_tests {
     }
 }
 
+/// The non-borrowing half of a [`mercuryrustlib::tesr::BumpCapability`], so a caller can hold the
+/// signer on its own stack and assemble the capability at the point of use.
+struct FeeBumpParts {
+    core_rpc: mercuryrustlib::core_rpc::CoreRpcConfig,
+    funding: mercurylib::wallet::p2a_fee_child::FundingInput,
+    change_script_pubkey: bitcoin::ScriptBuf,
+    target_fee_rate: f64,
+}
+
+impl FeeBumpParts {
+    fn with<'a>(
+        &'a self,
+        signer: &'a dyn mercuryrustlib::tesr::FeeBumpSigner,
+    ) -> mercuryrustlib::tesr::BumpCapability<'a> {
+        mercuryrustlib::tesr::BumpCapability {
+            core_rpc: self.core_rpc.clone(),
+            funding: self.funding.clone(),
+            change_script_pubkey: self.change_script_pubkey.clone(),
+            target_fee_rate: self.target_fee_rate,
+            signer,
+        }
+    }
+}
+
+#[cfg(test)]
 mod d13_leaf_gate_tests {
     use super::{wallet_holds_address, leaf_split_gate, near_deadline_exit_event, LeafSplitGate, WalletEvent};
     use std::collections::HashSet;
