@@ -5357,6 +5357,123 @@ pub async fn persist_child(cc: &ClientConfig, wallet_name: &str, cb: &ChildTesrB
     .await
 }
 
+/// **The one rung down that makes a replacement child state out-race the one it supersedes.**
+///
+/// Both child-lane supersessions — an onward [`child_retransfer`] and a
+/// [`reclaim_cancelled_child_conveyance`] — replace a state over the SAME outpoint
+/// (`ext_child.out[0]`), so the replacement is only worth anything if it MATURES FIRST. That is
+/// replace-by-lower-timelock: strictly `delta` below, never under the schedule floor.
+///
+/// Shared rather than written twice because the two callers must not be able to drift apart: if a
+/// reclaim ever chose a rung the re-transfer would not, the reclaimed state would tie with — or lose
+/// to — the conveyed one it is supposed to beat, and the leaf would be a live double-spend against
+/// its own owner.
+pub fn child_supersede_csv(old_csv: u16, p: &mercurylib::tesr::TesrParams, what: &str) -> Result<u16> {
+    old_csv
+        .checked_sub(p.delta)
+        .filter(|c| *c >= p.d_floor)
+        .ok_or_else(|| anyhow::anyhow!(
+            "{what}: the state to supersede sits at CSV {old_csv}, and the replacement must go one \
+             delta ({}) BELOW it to out-race it — which is under the floor ({}). This leaf has spent \
+             the onward hops of its current epoch. RENEW IT: `renew_child` rebuilds both tiers in \
+             place over the same `SP.out[j]`, resetting this rung to {} for zero on-chain bytes and \
+             no depth. If its extension schedule is also spent (`child_needs_rollover`), split it \
+             with `child_in_ladder_split` — the leaf's analogue of `rollover` — or exit it.",
+            p.delta,
+            p.d_floor,
+            p.state_csv(0)
+        ))
+}
+
+/// Key prefix for [`ChildReclaimRecord`].
+///
+/// **Deliberately not `ctesr-reclaim-`.** Seven places in this workspace scan the backup-tx table
+/// with `strip_prefix("ctesr-")` / `starts_with("ctesr-")` and read whatever they find as a
+/// `ChildTesrBundle` — the tower's child loop, the carrier enumeration, `child_claim_sids`. A
+/// `ctesr-`-prefixed sibling record would be handed to every one of them as a leaf whose statechain
+/// id is `reclaim-<sid>`. This prefix cannot collide.
+pub const CHILD_RECLAIM_KEY_PREFIX: &str = "childreclaim-";
+
+/// **Where to re-point a child if the conveyance now in flight is CANCELLED.**
+///
+/// The parent lane needs no such record: a whole-coin conveyance appends `S'` to `conveyed_states`
+/// and leaves `owner_exit_address` untouched, so [`reclaim_cancelled_conveyance`] already knows who
+/// to pay. A child re-transfer works the other way round — it OVERWRITES `child_owner_exit_address`
+/// with the payee, because that field *is* what the child's exit chain pays and the stored row must
+/// pay the recipient from the moment the co-signature exists ("store before conveying"). The
+/// consequence is that the owner's own address is gone from the row, and a cancellation has nothing
+/// to restore. That asymmetry is why `reclaim_cancelled_conveyance` returned `Ok(false)` for every
+/// child, and why a cancelled child conveyance left a row that pays the payee forever.
+///
+/// **It is a separate row rather than a field on `ChildTesrBundle` so that it cannot travel.** The
+/// bundle is the thing that gets conveyed; an owner-address field on it would ship this wallet's
+/// change address to every recipient unless every conveyance path remembered to clear it. Keying it
+/// separately makes "it never travels" a property of the storage layout instead of a rule six
+/// functions have to keep.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildReclaimRecord {
+    pub child_statechain_id: String,
+    /// The `child_owner_exit_address` this wallet held BEFORE the in-flight conveyance overwrote it.
+    pub owner_exit_address: String,
+    /// The payee the conveyance named. Recorded so a reclaim can refuse to act on a row that has
+    /// since moved on (a second re-transfer, or a claim that completed), rather than silently
+    /// superseding a state it does not understand.
+    pub conveyed_to: String,
+}
+
+/// Persist the reclaim record for a child conveyance about to go out.
+pub async fn persist_child_reclaim(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    rec: &ChildReclaimRecord,
+) -> Result<()> {
+    let json = serde_json::to_string(rec)?;
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("{CHILD_RECLAIM_KEY_PREFIX}{}", rec.child_statechain_id),
+        &json,
+    )
+    .await
+}
+
+/// Load a child's reclaim record, if one is outstanding.
+pub async fn load_child_reclaim(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_statechain_id: &str,
+) -> Result<Option<ChildReclaimRecord>> {
+    let key = format!("{CHILD_RECLAIM_KEY_PREFIX}{child_statechain_id}");
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if k == key {
+            // `Option<_>`, so the `null` tombstone written by `clear_child_reclaim` parses as
+            // "settled" instead of erroring. A row that is present but unparseable still errors —
+            // that is corruption, and this record decides where money goes.
+            return Ok(serde_json::from_str::<Option<ChildReclaimRecord>>(&json)?);
+        }
+    }
+    Ok(None)
+}
+
+/// Drop a child's reclaim record — the conveyance it described is settled (claimed or reclaimed).
+///
+/// Writes a `null` tombstone rather than deleting: `insert_raw_backup_txs` is the only write
+/// primitive this table exposes, and [`load_child_reclaim`] parses into `Option`, so `null` reads
+/// back as "nothing outstanding".
+pub async fn clear_child_reclaim(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_statechain_id: &str,
+) -> Result<()> {
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("{CHILD_RECLAIM_KEY_PREFIX}{child_statechain_id}"),
+        "null",
+    )
+    .await
+}
+
 /// Load a coin's persisted split child bundle from the wallet DB, if any.
 pub async fn load_child(cc: &ClientConfig, wallet_name: &str, child_statechain_id: &str) -> Result<Option<ChildTesrBundle>> {
     let key = format!("ctesr-{child_statechain_id}");
@@ -6184,19 +6301,7 @@ pub async fn child_retransfer(
         .child_state
         .csv
         .ok_or_else(|| anyhow::anyhow!("child state has no CSV — cannot re-transfer"))?;
-    let new_csv = old_csv
-        .checked_sub(p.delta)
-        .filter(|c| *c >= p.d_floor)
-        .ok_or_else(|| anyhow::anyhow!(
-            "child state CSV {old_csv} is at the floor ({}) — this leaf has spent the onward hops \
-             of its current epoch. RENEW IT: `renew_child` rebuilds this leaf's extension and state \
-             in place over the same `SP.out[j]`, resetting the state rung to {} without consuming a \
-             depth level, for zero on-chain bytes and two SE co-signatures. If its extension \
-             schedule is also spent (`child_needs_rollover`), split it with `child_in_ladder_split` \
-             — the leaf's analogue of `rollover` — or exit it.",
-            p.d_floor,
-            p.state_csv(0)
-        ))?;
+    let new_csv = child_supersede_csv(old_csv, &p, "re-transferring this child")?;
 
     // The new state spends the SAME outpoint as the one it replaces: ext_child.out[0].
     let payee = mercurylib::tesr::payee_address(recipient_address, &cb.parent.network)?;
@@ -6230,6 +6335,36 @@ pub async fn child_retransfer(
     })?;
 
     let staged = async {
+    // [#133] REMEMBER WHERE THIS LEAF LIVED, BEFORE THE OVERWRITE ERASES IT.
+    //
+    // The write below replaces `child_owner_exit_address` with the payee — deliberately, because the
+    // stored row must pay the recipient from the moment `S'_child` exists. But that is the only copy
+    // of the owner's address, and if this conveyance is later CANCELLED there is then nothing to
+    // re-point the row at: `reclaim_cancelled_conveyance` reads `tesr-` rows and returns `Ok(false)`
+    // for every child. The leaf ends up permanently naming a payee who will never claim it.
+    //
+    // Written BEFORE the co-signature, not after: the failure this guards against is a crash, and a
+    // record written afterwards is missing in exactly the window where the co-signed payee-paying
+    // state already exists. A record with no conveyance behind it is harmless — the reclaim compares
+    // it against the row and settles itself.
+    persist_child_reclaim(
+        cc,
+        wallet_name,
+        &ChildReclaimRecord {
+            child_statechain_id: child_sid.clone(),
+            owner_exit_address: cb.child_owner_exit_address.clone(),
+            conveyed_to: payee.clone(),
+        },
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to re-transfer child {child_sid}: the reclaim record could not be stored \
+             ({e}). Without it, a cancellation of this conveyance would leave this wallet's row \
+             paying {payee} with no record of where the leaf belongs. Nothing has been co-signed."
+        )
+    })?;
+
     let signed = cosign_tier(
         cc,
         child_coin,
@@ -7358,6 +7493,158 @@ pub async fn reclaim_cancelled_conveyance(
         },
     )?;
     persist(cc, wallet_name, &bundle).await?;
+    Ok(true)
+}
+
+/// **THE CHILD LANE'S RECLAIM — the half [`reclaim_cancelled_conveyance`] could not do.**
+///
+/// A cancelled CHILD conveyance used to leave the wallet's own `ctesr-` row naming the payee, for
+/// good: `reclaim_cancelled_conveyance` loads a `tesr-` bundle, finds none for a child, and returns
+/// `Ok(false)`. The row then says this leaf's exit pays someone else — so driving it hands them the
+/// coin, and refusing to drive it leaves the leaf undefended against the parent-anchored deadline it
+/// cannot see. `leaf_exit_pays_this_wallet` (`rust-sdk/src/wallet.rs`) turned that into a loud
+/// refusal instead of a silent theft; this turns it back into a coin.
+///
+/// The mechanism is the child's own re-transfer, aimed at the owner: build a state over the SAME
+/// `ext_child.out[0]` one δ BELOW the conveyed one, co-sign it, and disclose the conveyed state in
+/// `child_superseded_states`. The replacement therefore matures first and wins that outpoint, and the
+/// orphaned co-sign is counted rather than hidden — the same full-disclosure bookkeeping
+/// [`apply_reclaim`] does for a whole coin, and the same price: one rung and one co-signature.
+///
+/// **ORDERING — identical to the parent lane, and load-bearing.** This must run AFTER the coordinator
+/// has applied the cancellation. While a transfer is open the SE refuses every co-signature of that
+/// coin, and that lock is the only thing between a conveyed-but-unclaimed recipient and a sender
+/// co-signing a rival. Called too early it fails at the SE; called at the right time it is the
+/// sender's legitimate reclaim of a transfer that will never complete.
+///
+/// **REFUSES when the record and the row disagree.** If the row no longer names the payee the record
+/// remembers, something else has already moved this leaf — a second re-transfer, or a claim that
+/// completed — and superseding a state whose provenance is not understood is how one loses a coin
+/// twice. It says so and stops.
+///
+/// **COLOURED CHILDREN ARE REFUSED**, by the same guard and for the same reason as the parent lane:
+/// an uncoloured replacement over a sealed output destroys the allocation silently. A cancelled
+/// coloured child stays un-reclaimed and is reported by the tower, not quietly driven.
+///
+/// Returns `false` when there is nothing to reclaim (no record, or the row already pays the owner).
+pub async fn reclaim_cancelled_child_conveyance(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_coin: &Coin,
+) -> Result<bool> {
+    let child_sid = child_coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cannot reclaim a child ladder for a coin with no statechain id"))?;
+
+    let Some(rec) = load_child_reclaim(cc, wallet_name, &child_sid).await? else {
+        return Ok(false);
+    };
+    let Some(cb) = load_child(cc, wallet_name, &child_sid).await? else {
+        return Err(anyhow::anyhow!(
+            "child {child_sid} has an outstanding reclaim record (conveyance to {}) but no `ctesr-` \
+             bundle to reclaim. The row this record exists to repair is gone, so there is nothing \
+             safe to rebuild — do not clear the record: it is the only evidence that a co-signed \
+             state paying {} is outstanding.",
+            rec.conveyed_to,
+            rec.conveyed_to
+        ));
+    };
+
+    // **A COMPLETED transfer is not a cancelled one, and this must not touch it.**
+    //
+    // The record is written before the co-sign and is NOT cleared when a conveyance succeeds — it
+    // cannot be, because "conveyed" and "claimed" are different moments and the window between them
+    // is exactly when a cancellation is legal. So after a SUCCESSFUL re-transfer a record survives
+    // whose `conveyed_to` still matches the row, i.e. the agreement check below passes. Running the
+    // reclaim then would supersede a state the recipient legitimately owns and re-point their leaf at
+    // this wallet.
+    //
+    // In practice the SE stops it — the child key handover completes on claim, so this wallet can no
+    // longer co-sign — and the caller ordering stops it too, since a completed transfer cannot be
+    // cancelled. Neither is a reason to leave it to them. A coin marked TRANSFERRED is one this
+    // wallet has given away, and a reclaim of it is a bug in the caller, not a repair.
+    if matches!(
+        child_coin.status,
+        mercurylib::wallet::CoinStatus::TRANSFERRED | mercurylib::wallet::CoinStatus::WITHDRAWN
+    ) {
+        return Err(anyhow::anyhow!(
+            "refusing to reclaim child {child_sid}: this wallet's record marks it {} — it has been \
+             given away, not cancelled. The state conveyed to {} is the new owner's, and \
+             superseding it would be taking their coin back, not repairing ours. If the transfer \
+             really was cancelled, the coin's status is wrong; fix that first.",
+            child_coin.status,
+            rec.conveyed_to
+        ));
+    }
+
+    // Already ours — the conveyance was reclaimed or never overwrote the row. Settle the record.
+    if cb.child_owner_exit_address == rec.owner_exit_address {
+        clear_child_reclaim(cc, wallet_name, &child_sid).await?;
+        return Ok(false);
+    }
+    if cb.child_owner_exit_address != rec.conveyed_to {
+        return Err(anyhow::anyhow!(
+            "child {child_sid}: the reclaim record says the in-flight conveyance paid {}, but the \
+             stored bundle now pays {}. Something has moved this leaf since the record was written \
+             (a second re-transfer, or a completed claim). Refusing to supersede a state whose \
+             provenance this wallet cannot account for — resolve it by hand.",
+            rec.conveyed_to,
+            cb.child_owner_exit_address
+        ));
+    }
+    refuse_uncolored_over_colored_child(&cb, "reclaim_cancelled_child_conveyance")?;
+
+    let p = cb.parent.params;
+    let old_csv = cb
+        .child_state
+        .csv
+        .ok_or_else(|| anyhow::anyhow!("child {child_sid}: conveyed state has no CSV — cannot reclaim"))?;
+    let new_csv =
+        child_supersede_csv(old_csv, &p, &format!("reclaiming cancelled child {child_sid}"))?;
+
+    let owner = mercurylib::tesr::payee_address(&rec.owner_exit_address, &cb.parent.network)?;
+    let st = mercurylib::tesr::build_state_from(
+        &cb.child_extension.txid,
+        cb.child_extension.payload_vout,
+        cb.child_extension.out_value,
+        &owner,
+        &cb.parent.network,
+        new_csv,
+        cb.parent.fee_rate,
+    )?;
+    // Cloned for the same reason `reclaim_cancelled_conveyance` clones: `cosign_tier` mutates the
+    // coin's key material, and a reclaim is bookkeeping the caller did not ask to have its coin
+    // rewritten by.
+    let mut c = child_coin.clone();
+    let signed = cosign_tier(
+        cc,
+        &mut c,
+        st.tx_hex.clone(),
+        cb.child_extension.out_value,
+        &cb.parent.network,
+    )
+    .await?;
+
+    let mut next = cb.clone();
+    // Full disclosure: the state we just out-raced is the one that was conveyed. It must be COUNTED,
+    // not dropped — the recipient holds a copy, and a census that cannot see it is a census that
+    // cannot prove it loses.
+    next.child_superseded_states.push(next.child_state.clone());
+    next.child_state = TesrTier {
+        txid: st.txid.clone(),
+        signed_tx: signed,
+        out_value: st.out_value,
+        csv: Some(new_csv),
+        payload_vout: st.payload_vout,
+    };
+    next.child_owner_exit_address = owner;
+
+    // Persist the repaired row BEFORE clearing the record. The other order loses the only note of an
+    // outstanding co-signed state if the process dies between the two writes; this order at worst
+    // leaves a record whose row already pays the owner, which the early-return above settles.
+    persist_child(cc, wallet_name, &next).await?;
+    clear_child_reclaim(cc, wallet_name, &child_sid).await?;
     Ok(true)
 }
 
@@ -20207,26 +20494,47 @@ mod leaf_renewal_source_tests {
             );
         }
 
-        let retransfer = cut("\npub async fn child_retransfer(");
+        // [#133] The state-floor refusal used to be written out inside `child_retransfer`, and this
+        // used to `cut()` that function and grep it. It now lives in `child_supersede_csv`, which
+        // BOTH child-lane supersessions share — the re-transfer and the cancel reclaim — so the
+        // check moved with it and got stronger: the message is no longer read out of the source, it
+        // is produced by actually driving the function to the floor.
+        let p = mercurylib::tesr::TesrParams::for_network("bitcoin");
+        let at_floor = super::child_supersede_csv(p.d_floor, &p, "re-transferring this child")
+            .expect_err("at the floor there is no rung below to supersede onto")
+            .to_string();
         assert!(
-            retransfer.contains("renew_child"),
-            "the state-floor refusal in `child_retransfer` must name RENEWAL — that message is \
-             the defect this whole change exists to fix"
+            at_floor.contains("renew_child"),
+            "the state-floor refusal must name RENEWAL — that message is the defect this whole \
+             change exists to fix. Got: {at_floor}"
         );
         assert!(
-            !retransfer.contains("exit or re-anchor it"),
+            at_floor.contains("child_in_ladder_split"),
+            "…and the epoch-exhaustion case must point at the leaf's analogue of `rollover`. \
+             Got: {at_floor}"
+        );
+        assert!(
+            !at_floor.contains("exit or re-anchor it"),
             "…and THE DEFECT VERBATIM — `exit or re-anchor it instead of re-sending` — must be gone"
         );
         for offered in ["or re-anchor", "re-anchor it"] {
             assert!(
-                !retransfer.contains(offered),
-                "…and it must stop OFFERING `{offered}`, which a leaf can never perform"
+                !at_floor.contains(offered),
+                "…and it must stop OFFERING `{offered}`, which a leaf can never perform. \
+                 Got: {at_floor}"
             );
         }
-        assert!(
-            retransfer.contains("child_in_ladder_split"),
-            "…and the epoch-exhaustion case must point at the leaf's analogue of `rollover`"
-        );
+
+        // The source pin stays for the surrounding function, because the *absence* of a bad offer
+        // cannot be driven: a `re-anchor` suggestion added anywhere else in `child_retransfer` would
+        // never appear in the error above.
+        let retransfer = cut("\npub async fn child_retransfer(");
+        for offered in ["or re-anchor", "re-anchor it"] {
+            assert!(
+                !retransfer.contains(offered),
+                "no leaf-lane refusal may OFFER `{offered}`, which a leaf can never perform"
+            );
+        }
     }
 
     /// **[STEP 5] THE COMBINE INTERLOCK.** A leaf combine spends `SP.out[j]` with a FRESH
@@ -21837,6 +22145,145 @@ mod reanchor_void_state_tests {
                 assert!(detail.contains("flat backup"));
             }
             other => panic!("expected Void, got {other:?}"),
+        }
+    }
+}
+
+/// [#133] The child-lane cancel reclaim: the record that makes it possible, and the rung that makes
+/// it correct.
+#[cfg(test)]
+mod child_reclaim_tests {
+    use super::*;
+
+    fn params() -> mercurylib::tesr::TesrParams {
+        mercurylib::tesr::TesrParams::for_network("bitcoin")
+    }
+
+    fn rec() -> ChildReclaimRecord {
+        ChildReclaimRecord {
+            child_statechain_id: "childsid".to_string(),
+            owner_exit_address: "bc1qowner".to_string(),
+            conveyed_to: "bc1qpayee".to_string(),
+        }
+    }
+
+    // ---- the record -------------------------------------------------------------------------
+
+    #[test]
+    fn record_round_trips() {
+        let json = serde_json::to_string(&rec()).unwrap();
+        let back: Option<ChildReclaimRecord> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Some(rec()));
+    }
+
+    /// `clear_child_reclaim` writes `null` because the table has no delete. If the loader could not
+    /// parse that back to "nothing outstanding", every settled conveyance would leave a row that
+    /// errors — and the error would surface from the CANCEL path, on a coin that is already fine.
+    #[test]
+    fn the_null_tombstone_reads_back_as_settled() {
+        let back: Option<ChildReclaimRecord> = serde_json::from_str("null").unwrap();
+        assert_eq!(back, None);
+    }
+
+    /// A row that is present but corrupt must NOT be read as "settled". This is the distinction the
+    /// tombstone makes delicate: `null` means resolved, garbage means the wallet cannot account for
+    /// an outstanding co-signed state, and treating the second as the first would silently drop the
+    /// only evidence that someone holds a state paying themselves.
+    #[test]
+    fn a_corrupt_record_is_an_error_not_an_absence() {
+        for junk in ["{}", "\"bc1qowner\"", "{\"child_statechain_id\":\"x\"}", "["] {
+            assert!(
+                serde_json::from_str::<Option<ChildReclaimRecord>>(junk).is_err(),
+                "{junk:?} must not deserialize to a record or to None"
+            );
+        }
+    }
+
+    // ---- the key prefix ---------------------------------------------------------------------
+
+    /// **The landmine this prefix exists to avoid.** Seven sites scan the backup-tx table with
+    /// `strip_prefix("ctesr-")` / `starts_with("ctesr-")` and read the hit as a `ChildTesrBundle`.
+    /// A `ctesr-reclaim-` key would be handed to every one of them as a leaf whose statechain id is
+    /// `reclaim-<sid>` — the tower would try to defend it, the carrier enumeration would try to
+    /// parse it, and `child_claim_sids` would report a coin that does not exist.
+    #[test]
+    fn the_reclaim_prefix_cannot_be_mistaken_for_a_child_bundle() {
+        assert!(
+            !CHILD_RECLAIM_KEY_PREFIX.starts_with("ctesr-"),
+            "the reclaim prefix must not be a `ctesr-` sub-prefix"
+        );
+        let key = format!("{CHILD_RECLAIM_KEY_PREFIX}abc123");
+        assert!(key.strip_prefix("ctesr-").is_none(), "{key} is visible to the ctesr- scanners");
+        assert!(!key.starts_with("ctesr-"));
+        // ...and it must not collide with the other sibling record either.
+        assert!(key.strip_prefix(SPINE_TIP_KEY_PREFIX).is_none());
+        // The converse: a real child key must not look like a reclaim record.
+        assert!("ctesr-abc123".strip_prefix(CHILD_RECLAIM_KEY_PREFIX).is_none());
+    }
+
+    // ---- the rung ---------------------------------------------------------------------------
+
+    /// The whole point of the reclaim: the replacement must mature STRICTLY BEFORE the state it
+    /// supersedes, or the owner's own reclaim ties with the cancelled recipient over the same
+    /// outpoint. Exactly one delta down, never more (that would waste rungs), never less.
+    #[test]
+    fn a_supersession_goes_exactly_one_delta_below() {
+        let p = params();
+        let old = p.state_csv(0);
+        let new = child_supersede_csv(old, &p, "test").unwrap();
+        assert!(new < old, "the replacement must mature first: {new} !< {old}");
+        assert_eq!(new, old - p.delta, "exactly one rung, not more");
+    }
+
+    /// Both callers must land on the same rung. If a reclaim ever chose differently from a
+    /// re-transfer, the reclaimed state would tie with or lose to the conveyed one it exists to beat
+    /// — a live double-spend against the leaf's own owner.
+    #[test]
+    fn the_reclaim_and_the_retransfer_share_one_rule() {
+        let p = params();
+        for old in [p.state_csv(0), p.state_csv(1), p.d_floor + p.delta] {
+            assert_eq!(
+                child_supersede_csv(old, &p, "reclaim").unwrap(),
+                child_supersede_csv(old, &p, "retransfer").unwrap(),
+                "the two lanes disagreed at CSV {old}"
+            );
+        }
+    }
+
+    /// At the floor there is no rung left, and the answer must be a refusal that names the remedy —
+    /// not a clamp. Clamping to the floor would produce a replacement that TIES with the state it is
+    /// meant to beat, which is the exact failure this rung defends against.
+    #[test]
+    fn at_the_floor_it_refuses_and_names_renew_child() {
+        let p = params();
+        for old in [p.d_floor, p.d_floor + p.delta - 1, 0] {
+            let err = match child_supersede_csv(old, &p, "reclaiming cancelled child X") {
+                Ok(got) => panic!(
+                    "CSV {old} leaves no rung above the floor ({}), so it must refuse — it \
+                     returned {got}, which would TIE with or lose to the state it supersedes",
+                    p.d_floor
+                ),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("renew_child"), "the refusal must name the remedy: {err}");
+            assert!(err.contains("reclaiming cancelled child X"), "and its context: {err}");
+        }
+    }
+
+    /// A subtraction that underflows must be a refusal, not a wrap to ~65535 — which would be a
+    /// replacement maturing FAR LATER than the conveyed state while looking like a valid rung.
+    #[test]
+    fn underflow_refuses_rather_than_wrapping() {
+        let p = params();
+        assert!(p.delta > 0);
+        let err = child_supersede_csv(0, &p, "test").unwrap_err().to_string();
+        assert!(!err.is_empty());
+        // and no input can ever produce something at or above its own predecessor
+        for old in 0..=u16::MAX {
+            if let Ok(new) = child_supersede_csv(old, &p, "test") {
+                assert!(new < old, "CSV {old} produced a non-decreasing replacement {new}");
+                assert!(new >= p.d_floor, "CSV {old} produced {new}, under the floor {}", p.d_floor);
+            }
         }
     }
 }

@@ -2076,11 +2076,19 @@ impl UtexoWallet {
             // the moment their victim's coin defends itself.
             // [D13-follow-up] AND IT MUST PAY US. A CONFIRMED status does not imply the stored row
             // pays this wallet: a failed child conveyance leaves the coin IN_TRANSFER with a
-            // PAYEE-paying row, `/transfer/cancel` lifts that back to CONFIRMED, and
-            // `reclaim_cancelled_conveyance` returns `Ok(false)` for a child so the row is never
-            // re-pointed at the owner. Driving it would force-exit the sender's own money into the
-            // payee's address. Reported, never silently skipped — a false positive here means
-            // declining to defend a coin we DO own, and that must be visible rather than quiet.
+            // PAYEE-paying row, and `/transfer/cancel` lifts that back to CONFIRMED. Driving it
+            // would force-exit the sender's own money into the payee's address. Reported, never
+            // silently skipped — a false positive here means declining to defend a coin we DO own,
+            // and that must be visible rather than quiet.
+            //
+            // [#133] THE ROOT CAUSE IS NOW FIXED, AND THIS CHECK STAYS ANYWAY. The cancel path runs
+            // `reclaim_cancelled_child_conveyance` (`rust/src/tesr.rs`), which re-points the row at
+            // the owner and discloses the orphaned co-sign — so a cancellation no longer strands a
+            // payee-paying leaf. This remains because the repair can still FAIL (the SE refuses, the
+            // rung is at the floor, the process dies mid-cancel) and because rows written before it
+            // existed are still on disk. It is the difference between "the fix worked" and "we
+            // assume the fix worked", and it is the one standing between a stranded leaf and paying
+            // a stranger.
             // CHILDREN ONLY: a spine tip is the sender's own change leg and carries no
             // `child_owner_exit_address` — there is no conveyance-to-a-payee to be resurrected, so
             // the window does not exist for it.

@@ -2382,6 +2382,32 @@ async fn finish_cancel(
             )
         })?;
 
+    // ---- [#133] AND THE SAME FOR A CANCELLED **CHILD** CONVEYANCE. ----------------------------
+    //
+    // The call above handles `tesr-` rows and returns `Ok(false)` for a leaf, because a leaf's ladder
+    // lives under `ctesr-`. That is the whole of the gap: a cancelled child conveyance left the
+    // wallet's own row naming the payee, permanently. `leaf_exit_pays_this_wallet` in the tower
+    // (`rust-sdk/src/wallet.rs`) already refuses to DRIVE such a row — which stops the theft but
+    // leaves the leaf undefended, so the refusal was a holding action, not the fix. This is the fix.
+    //
+    // Both are called unconditionally rather than switched on the coin's shape: each is a no-op when
+    // its lane's record is absent, and asking "is this a child?" here would be a third place that has
+    // to know, which is one more than can be kept right.
+    crate::tesr::reclaim_cancelled_child_conveyance(client_config, wallet_name, sender_coin)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "the transfer of statechain id {statechain_id} WAS cancelled and the coin is yours \
+                 again, but it is a SPLIT CHILD whose ladder could not be re-pointed at this wallet \
+                 afterwards ({e}). Its stored exit still pays the cancelled recipient, so this \
+                 wallet's watchtower will refuse to drive it rather than hand them the coin — which \
+                 means the leaf is currently undefended against its parent-anchored deadline. Retry \
+                 the cancellation (the coordinator reports it as already cancelled and this step \
+                 runs again). If the leaf is near that deadline and the reclaim cannot be made to \
+                 succeed, exit it."
+            )
+        })?;
+
     if let (Some(txid), Some(vout)) = (sender_coin.utxo_txid.clone(), sender_coin.utxo_vout) {
         let mut wallet = get_wallet(&client_config.pool, wallet_name).await?;
         wallet.activities.push(Activity {
