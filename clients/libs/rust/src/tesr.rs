@@ -8416,6 +8416,28 @@ fn verify_superseded_segment(
     let mut dead_outputs: std::collections::HashSet<(Txid, u32)> = std::collections::HashSet::new();
     for (idx, sup) in sups.iter().enumerate() {
         if let Some(&live_csv) = live_csv_by_outpoint.get(&sup.prevout) {
+            // ⚠️ [D26] **THIS TEST RESTS ON AN ASSUMPTION IT DOES NOT ITSELF CHECK: that the live
+            // tier can be BROADCAST.** "Lower CSV matures first, therefore wins" is a statement about
+            // a race — and a transaction that cannot enter a mempool never enters the race at all.
+            //
+            // That is not hypothetical. Until the Σ-payload law was added to the intermediate spine,
+            // a sender could co-sign an `SP` paying its children an above-dust but starving slot, so
+            // that every tier hanging off it was unrelayable by construction; the sender then waited
+            // out `d0` and swept the level back with the very cap this loop had retired as
+            // "superseded". Measured context: a v3 tier below the mempool floor is refused outright
+            // (`min relay fee not met`), package-CPFP would rescue it, and this tree has no
+            // `submitpackage` caller (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`).
+            //
+            // **What currently discharges the assumption is the VALUE LAWS on the live tiers** — Σ
+            // and payload-count on extensions and states, and now Σ on `SP` — which bound each
+            // tier's implied fee to the committed rate and so keep it relayable. That is a
+            // dependency between two distant parts of the verifier, held together by nothing but
+            // this comment. Any future tier that escapes a value law reopens the race.
+            //
+            // The structural fix is to pass each live tier's relayability in and assert it here,
+            // rather than inferring it. Until that lands, do NOT add a live tier without a value law,
+            // and do not weaken one on the grounds that "the CSV ordering protects us" — it does not.
+            //
             // Directly contends with a live tier over the SAME outpoint — it MUST lose the race, or it
             // could mature first and steal. (This is [S-1/S-2]: extensions and states alike, against the
             // live tier spending the same outpoint, never a global final_csv.)
