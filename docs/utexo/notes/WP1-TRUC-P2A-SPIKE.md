@@ -121,7 +121,7 @@ GATED on the P2A spike; if fee-bumping cannot be made reliable, this option is u
 | D7 explicit per-profile `TesrParams` | Evidence strengthened: 139-tx chain ⇒ ~68-block stall > the whole schedule |
 | A `submitpackage`-capable backend | **Open** — no caller exists; electrum cannot do it |
 | Who funds a CPFP child for a keyless tower | **Open** — D19/§15 |
-| Literal P2A output relay | **UNVERIFIED** — re-run with a correctly constructed `51024e73` output |
+| Literal P2A output relay | **VERIFIED 2026-08-11** — a real `51024e73` output at 240 sats relays; not dust to Core. Pinned by `lib/tests/p2a_script_shape.rs` |
 
 Reproduce: start an isolated regtest node with `-minrelaytxfee=0.00003`, build v3 transactions by
 patching `createrawtransaction`'s output from `02000000` to `03000000`, and sign a child spending an
