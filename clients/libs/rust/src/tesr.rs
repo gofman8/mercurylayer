@@ -16287,6 +16287,21 @@ mod wrong_payee_attack_tests {
         /// The CATS spine tip: ONE tier — the next batch's `SP2` at `SPINE_CSV`, re-anchored on the
         /// segment's own funding outpoint — with the retained cap `C` disclosed as superseded.
         Spine,
+        /// **[#134] THE STARVING-SLOT THEFT, on the spine.** Identical to [`Ancestry::Spine`] except
+        /// that `SP2` pays the leaf a slot far smaller than its funding permits, keeping the
+        /// difference as an enormous implied fee.
+        ///
+        /// This is the attack the D26 pair exists to stop, and it is worth stating why it was ever
+        /// dangerous. `SP` was, in the code's own words, "the ONE tier in the whole structure with
+        /// neither a Σ-payload law nor a payload-count law" — so an attacker could choose its output
+        /// values freely. Starve the slot and every tier the victim hangs off it is unrelayable by
+        /// construction; the victim's exit chain then loses a race it appears to win, and the
+        /// attacker waits out `d0` and sweeps the level back with the retained cap that
+        /// `verify_superseded_segment` had just retired as "superseded".
+        ///
+        /// The slot stays ABOVE the dust limit on purpose: a dust output is refused by an older,
+        /// unrelated check, and a test that trips that one would prove nothing about this one.
+        SpineStarvedSlot,
     }
 
     struct Rig {
@@ -16413,7 +16428,9 @@ mod wrong_payee_attack_tests {
             // ── the optional ANCESTOR segment: X_a over SP.out[0], then its own spine split state ────
             let mut ancestors: Vec<ChildSegment> = vec![];
             let mut ancestor_facts: Vec<AncestorFacts> = vec![];
-            let (leaf_funding_txid, leaf_slot) = if ancestry == Ancestry::Spine {
+            let (leaf_funding_txid, leaf_slot) = if ancestry == Ancestry::Spine
+                || ancestry == Ancestry::SpineStarvedSlot
+            {
                 // ── [CATS] the ONE-TIER SPINE segment ────────────────────────────────────────────
                 //
                 // The sender's tip at this level. Its retained cap `C` sits over `SP.out[0]` at `D0`;
@@ -16438,7 +16455,21 @@ mod wrong_payee_attack_tests {
                     self.rate,
                 )
                 .expect("the next batch's spine split state");
-                let sp2_tx = cosign(&parse(&sp2.tx_hex), slot, &g.spk, &g.kp);
+                // [#134] STARVE THE SLOT **AFTER** THE BUILDER, AND THAT DETAIL IS THE POINT.
+                //
+                // `build_split_state_from` refuses a starved slot outright, so the honest client
+                // cannot construct this. An attacker does not use the honest client: they hand the SE
+                // a transaction of their own making and it blind-co-signs a sighash. Editing the
+                // parsed tx and THEN co-signing reproduces exactly that capability — the resulting
+                // signature is genuine over the starved transaction, which is why the verifier, not
+                // the builder, has to be the thing that refuses it.
+                let mut sp2_raw = parse(&sp2.tx_hex);
+                if ancestry == Ancestry::SpineStarvedSlot {
+                    // Above dust on purpose: a dust output is refused by an older, unrelated check,
+                    // and a test that trips that one would prove nothing about the fee law.
+                    sp2_raw.output[0].value = mercurylib::tesr::DUST_LIMIT * 3;
+                }
+                let sp2_tx = cosign(&sp2_raw, slot, &g.spk, &g.kp);
 
                 ancestors.push(ChildSegment {
                     statechain_id: "ancestor-sid".into(),
@@ -17106,6 +17137,93 @@ mod wrong_payee_attack_tests {
         assert!(cap.input[0].sequence.0 as u16 > SPINE_CSV, "the cap must LOSE the race");
 
         verify(&cb, &facts).expect("an honest one-tier CATS spine ancestor must be ACCEPTED");
+    }
+
+    /// **[#134 / D26] THE STARVING-SLOT THEFT, refused — and the two independent laws that refuse it.**
+    ///
+    /// This is the attack that made `#134` a live theft path rather than a tidiness item, reproduced
+    /// end to end on the shape it was found on (a plain CATS spine).
+    ///
+    /// The sender co-signs `SP2` paying its leaf a slot far below what its funding permits, keeping
+    /// the difference as fee. Every OTHER property is honest: the payee is the real child aggregate,
+    /// the CSV is `SPINE_CSV`, the signature is genuine, the census balances. The damage is entirely
+    /// in the value — a starved slot cannot fund a relayable exit chain, so the leaf's tiers lose a
+    /// race the verifier believed they won, and the sender sweeps the level back after `d0` with the
+    /// retained cap that had just been retired as "superseded".
+    ///
+    /// Both halves of D26 now stand between that and the coin, and either alone would refuse this
+    /// bundle:
+    ///   * **half 1**, the Σ-payload law on the intermediate spine `SP`, refuses the starved slot
+    ///     directly — Σ over the payload outputs must equal what the funding and the committed rate
+    ///     imply, so the fee cannot be chosen;
+    ///   * **half 2** would refuse the consequence even if a future tier escaped a value law: a live
+    ///     tier under the relay floor can no longer be treated as the winner of a race.
+    ///
+    /// The test asserts the refusal names the VALUE, which is what distinguishes half 1 firing from
+    /// some unrelated structural check happening to reject the bundle first.
+    #[test]
+    fn a_spine_that_starves_its_leafs_slot_is_refused() {
+        let rig = rig();
+        let (cb, facts) = rig.build_shaped(Ancestry::SpineStarvedSlot, Payee::Honest);
+
+        // ── the premise: everything EXCEPT the value is honest ────────────────────────────────────
+        let seg = &cb.ancestors[0];
+        let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
+        let lone: Transaction = parse(&seg.state.signed_tx);
+        assert_eq!(lone.input[0].previous_output.txid, sp.txid(), "still re-anchored");
+        assert_eq!(lone.input[0].sequence.0 as u16, SPINE_CSV, "still at the spine CSV");
+        assert_eq!(seg.superseded_states.len(), 1, "the cap is still disclosed");
+
+        // ── the starvation itself, stated numerically rather than asserted ────────────────────────
+        let funding = sp.output[seg.funding_vout as usize].value;
+        let (got, expected) = payload_sum_and_expectation(&lone, funding, rig.rate);
+        assert!(
+            got < expected,
+            "the rig did not actually starve the slot: Σ payload {got} is not below the {expected} \
+             its funding implies — this test would prove nothing"
+        );
+        assert!(
+            got > mercurylib::tesr::DUST_LIMIT,
+            "the starved slot must stay ABOVE dust ({}), or an older dust check refuses it and this \
+             test proves nothing about the value law",
+            mercurylib::tesr::DUST_LIMIT
+        );
+        // The fee the attacker keeps, and the reason it is an attack: the leaf's whole exit chain has
+        // to come out of `got`, and it cannot.
+        let stolen = expected - got;
+        assert!(
+            stolen > mercurylib::tesr::committed_fee(rig.rate) * 10,
+            "the retained fee ({stolen}) should dwarf an honest rung — otherwise this is a rounding \
+             quibble, not the theft"
+        );
+
+        // ── the refusal ───────────────────────────────────────────────────────────────────────────
+        let err = verify(&cb, &facts)
+            .expect_err("a spine that starves its leaf's slot must be REFUSED")
+            .to_string();
+        assert!(
+            err.contains(&got.to_string()) || err.contains(&expected.to_string()),
+            "the refusal must name the VALUE — otherwise something unrelated rejected the bundle \
+             first and this test is not exercising the fee law: {err}"
+        );
+        for unrelated in ["not co-signed", "dust", "outside this ladder", "num_sigs"] {
+            assert!(
+                !err.contains(unrelated),
+                "refused for an UNRELATED reason ({unrelated:?}), so the fee law is unproven: {err}"
+            );
+        }
+
+        // ── non-vacuity: the SAME rig, unstarved, is ACCEPTED ─────────────────────────────────────
+        let (honest, honest_facts) = rig.build_shaped(Ancestry::Spine, Payee::Honest);
+        verify(&honest, &honest_facts)
+            .expect("the identical spine WITHOUT the starvation must be accepted");
+        let honest_lone: Transaction = parse(&honest.ancestors[0].state.signed_tx);
+        let (honest_got, honest_expected) =
+            payload_sum_and_expectation(&honest_lone, funding, rig.rate);
+        assert_eq!(
+            honest_got, honest_expected,
+            "the control must SATISFY the law it is the control for"
+        );
     }
 
     /// **(1) THE PREVOUT RE-ANCHOR — the single load-bearing check.**
