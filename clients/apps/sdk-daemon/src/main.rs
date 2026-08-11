@@ -188,6 +188,14 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                                 "TokenCarrierMaterialized",
                                 json!({"statechain_id": statechain_id, "deadline_block": deadline_block, "tip": tip}),
                             ),
+                            // [D13] A PLAIN sats leaf force-exited to beat its deadline. Reported
+                            // separately from TokenCarrierMaterialized on purpose: that event means
+                            // "a token allocation was settled", and emitting it for a plain coin
+                            // would have an integrator record a sats exit as a token settlement.
+                            WalletEvent::LeafExitForced { statechain_id, deadline_block, tip } => (
+                                "LeafExitForced",
+                                json!({"statechain_id": statechain_id, "deadline_block": deadline_block, "tip": tip}),
+                            ),
                             WalletEvent::LadderEstablished { statechain_id } => (
                                 "LadderEstablished",
                                 json!({"statechain_id": statechain_id}),
