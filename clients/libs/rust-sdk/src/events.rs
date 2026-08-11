@@ -53,6 +53,15 @@ pub enum WalletEvent {
     /// malicious sender can no longer claw back the shared root. Emitted by `auto_exit_due`; the
     /// plain (RGB-unaware) exit path still refuses carriers, so this is their dedicated protection.
     TokenCarrierMaterialized { statechain_id: String, deadline_block: u32, tip: u32 },
+    /// [D13] A **plain** (non-token) split leaf nearing its clawback deadline was automatically
+    /// force-exited by `auto_exit_due`. A leaf carries no flat backup of its own and its exit walk
+    /// is a chain of relative timelocks, so it must be STARTED `deadline_block` blocks — the
+    /// parent's `min(L_k)` less the walk length — before a prior owner of the parent can void it.
+    /// Distinct from [`Self::TokenCarrierMaterialized`] on purpose: that event says "a token
+    /// allocation was settled"; this one says "a plain sats leaf was driven to L1 to beat its
+    /// deadline", and an integrator that treated the two the same would mis-report a plain coin as a
+    /// token settlement.
+    LeafExitForced { statechain_id: String, deadline_block: u32, tip: u32 },
     /// A CONFIRMED coin was **left on the flat (un-laddered) lane** by the `claim()` ladder pass, so
     /// it has no TES-R exit ladder and cannot be conveyed on the R′ path.
     ///

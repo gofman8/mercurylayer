@@ -82,6 +82,10 @@ fn record_voucher_failure(pool: &mut Vec<SlotVoucher>, token_id: &str) -> bool {
 /// NOTE: the RGB *stash* (contracts/consignments under `rgb_data_dir`) is NOT embedded — copy that
 /// directory too; from re-obtainable consignments the stash can be rebuilt, but not from the seed
 /// alone.
+/// The only recovery-bundle format version this build understands. (D11: the encoding is frozen;
+/// import must refuse an unknown version rather than mis-parse it.)
+const RECOVERY_BUNDLE_VERSION: u32 = 1;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecoveryBundle {
     pub version: u32,
@@ -92,6 +96,26 @@ pub struct RecoveryBundle {
     /// The RGB engine's BIP39 seed (from `rgb_data_dir/rgb.mnemonic`), if the wallet uses tokens.
     pub rgb_mnemonic: Option<String>,
     pub notes: String,
+}
+
+/// Parse and version-check a [`RecoveryBundle`] JSON. Probes the `version` field FIRST — a future
+/// version may carry a layout that would not deserialize into today's struct — and refuses an
+/// unknown version by name before the full parse.
+fn parse_recovery_bundle(bundle_json: &str) -> Result<RecoveryBundle> {
+    #[derive(serde::Deserialize)]
+    struct VersionProbe {
+        version: u32,
+    }
+    let probe: VersionProbe = serde_json::from_str(bundle_json)?;
+    if probe.version != RECOVERY_BUNDLE_VERSION {
+        return Err(SdkError::UnsupportedVersion {
+            kind: "recovery bundle",
+            found: probe.version as u64,
+            supported: RECOVERY_BUNDLE_VERSION as u64,
+        }
+        .into());
+    }
+    Ok(serde_json::from_str(bundle_json)?)
 }
 
 /// A deadline-critical background pass that could not SEE what it needed to see, retained on the
@@ -135,6 +159,62 @@ pub(crate) struct Inner {
     pub wallet_lock: Mutex<()>,
     /// Lazily-opened RGB engine (token support); None until first token operation.
     pub rgb: Mutex<Option<mercury_rgb::RgbWallet>>,
+}
+
+/// [D13] Whether a split child / spine tip may be force-exited by the near-deadline pass.
+#[derive(Debug, PartialEq, Eq)]
+enum LeafSplitGate {
+    /// No open split names this coin — safe to evaluate for a near-deadline exit.
+    Drive,
+    /// The split journal could not be read at all, so no leaf can be vouched for. Blanket blindness
+    /// is recorded once before the loop; each row is dropped without a second message.
+    HoldSilently,
+    /// This coin is mid-split: an open split-journal record names it as terminalized, so its stored
+    /// row is the state that split SUPERSEDES. Driving it would destroy the pieces the split
+    /// already conveyed. Recorded as attention-needed (never idle), never driven.
+    Hold(String),
+}
+
+/// [D13] THE PREDICATE THE PLAIN-LEAF PORT'S SAFETY RESTS ON. A CONFIRMED status is not proof a
+/// leaf is safe to force-exit: a leaf terminalized by its own partial-payment split reads CONFIRMED
+/// with a stale row until the split's conveyance completes, and permanently if it crashed. The
+/// split journal — written at `Planned` strictly before the irreversible co-signature — is the
+/// durable evidence, so a mid-split coin appears here before any piece can be handed out.
+///
+/// `terminalizing`: `None` = the journal was unreadable (blindness over every child); `Some(set)` =
+/// the statechain ids currently mid-split.
+fn leaf_split_gate(
+    terminalizing: &Option<std::collections::HashSet<String>>,
+    cid: &str,
+    what: &str,
+) -> LeafSplitGate {
+    match terminalizing {
+        None => LeafSplitGate::HoldSilently,
+        Some(set) if set.contains(cid) => LeafSplitGate::Hold(format!(
+            "{cid} ({what}) is mid-split — an open split-journal record names it as terminalized, \
+             so its stored row is the state that split SUPERSEDES. Force-exiting it would destroy \
+             the pieces the split already conveyed. Left for the split's own recovery, reported \
+             here so it is not mistaken for idle"
+        )),
+        Some(_) => LeafSplitGate::Drive,
+    }
+}
+
+/// [D13] The event a near-deadline force-exit emits, chosen by the coin's kind. A coloured row
+/// settles a token allocation ([`WalletEvent::TokenCarrierMaterialized`]); a plain sats leaf is
+/// driven to L1 to beat its deadline ([`WalletEvent::LeafExitForced`]). Emitting the token event
+/// for a plain coin would mis-report it to any integrator watching the stream.
+fn near_deadline_exit_event(
+    colored: bool,
+    statechain_id: String,
+    deadline_block: u32,
+    tip: u32,
+) -> WalletEvent {
+    if colored {
+        WalletEvent::TokenCarrierMaterialized { statechain_id, deadline_block, tip }
+    } else {
+        WalletEvent::LeafExitForced { statechain_id, deadline_block, tip }
+    }
 }
 
 /// Utexo wallet (Spark-compatible API) on Mercury+RGB. Cheap to clone; all clones share state.
@@ -228,7 +308,7 @@ impl UtexoWallet {
                 .map(|s| s.trim().to_string())
         });
         let bundle = RecoveryBundle {
-            version: 1,
+            version: RECOVERY_BUNDLE_VERSION,
             wallet_name: self.inner.config.wallet_name.clone(),
             wallet: record,
             backups,
@@ -247,7 +327,7 @@ impl UtexoWallet {
     /// to also restore the rgb_data_dir stash contents for token balances. Fails if a wallet of the
     /// same name already exists in the target database.
     pub async fn import_recovery_bundle(config: SdkConfig, bundle_json: &str) -> Result<(Self, String)> {
-        let bundle: RecoveryBundle = serde_json::from_str(bundle_json)?;
+        let bundle = parse_recovery_bundle(bundle_json)?;
         let cc = ClientConfig::from_params(
             config.statechain_entity_url.clone(),
             config.electrum_url.clone(),
@@ -1795,9 +1875,9 @@ impl UtexoWallet {
             }
         }
 
-        // ---- [CTES-R] RECEIVED COLOURED CHILDREN — the coloured lane's form of the loop above ---
+        // ---- [CTES-R] RECEIVED SPLIT CHILDREN — the ladder-lane form of the loop above -----------
         //
-        // The loop above gates every carrier on a `branch-<id>` row, and a coloured child HAS none:
+        // The loop above gates every carrier on a `branch-<id>` row, and a split child HAS none:
         // its exit material is the five-tier chain `T -> X_m -> SP -> ext_child -> state_child`
         // carried in its `ctesr-` bundle. `read_exit_branch` therefore answers VERIFIED-EMPTY for
         // it, which that loop reads as "issued/flat carrier, no clawback risk" — and for a RECEIVED
@@ -1823,9 +1903,14 @@ impl UtexoWallet {
         // wallet still holds CONFIRMED. A child conveyed onward belongs to its recipient, and
         // driving its chain would rival the state they now hold (the D1 class sdk79 pins).
         //
-        // DELIBERATELY NARROW: only COLOURED children. A plain in-ladder child has the same shape
-        // and is left to its own change with its own tests, rather than being swept in here on the
-        // strength of an argument this round did not measure.
+        // [D13] COVERS BOTH LANES. This loop once handled only COLOURED children, on the argument
+        // that a plain child was "left to its own change". It was not left to anything — a plain
+        // leaf had NO runtime deadline defence anywhere in the SDK, which under the RGB scope-out
+        // is the whole normative protocol. Coloured and plain leaves have the identical exposure (a
+        // pre-signed relative-timelock walk rooted at a funding output the splitter can still spend
+        // via the parent's flat backup), so both are driven here. The one thing that made covering
+        // plain rows unsafe — a leaf mid-split reading CONFIRMED with a stale row — is closed by the
+        // split-journal guard below.
         let child_rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
             &self.inner.cc.pool,
             &self.inner.config.wallet_name,
@@ -1848,6 +1933,48 @@ impl UtexoWallet {
             Child(Box<mercuryrustlib::tesr::ChildTesrBundle>),
             Tip(Box<mercuryrustlib::tesr::SpineTipBundle>),
         }
+
+        // [D13] THE SPLIT-JOURNAL GUARD — the one thing that makes covering PLAIN leaves safe.
+        //
+        // A leaf that has been TERMINALIZED by its own partial-payment split reads CONFIRMED, with a
+        // stale `ctesr-`/`spinetip-` row still naming the state its CSP supersedes, for the whole
+        // span from the CSP co-signature until the conveyance completes — and PERMANENTLY after any
+        // error or crash in that span, because `child_in_ladder_split` does NOT park the coin's
+        // status before its irreversible co-sign (unlike `child_retransfer` and `combine`), and
+        // `resume_split_conveyance` repairs only the conveyed pieces, never the terminalized parent.
+        // Force-exiting it here would broadcast `state_child`, rival the CSP over `ext_child.out[0]`,
+        // and DESTROY the grandchild pieces already handed to payees.
+        //
+        // The journal is the durable evidence that closes this: it is written at `Planned` STRICTLY
+        // BEFORE the co-signature, so any coin mid-split appears here before anything can be handed
+        // out. Skip such a coin (report it as attention-needed, never drive it). An unreadable
+        // journal is treated as blindness over EVERY child, never as permission — `journal_open_splits`
+        // already errors on an unparseable row, and here that error must not become "no coin is
+        // mid-split".
+        // `None` = the journal could not be read, i.e. blindness over every child; `Some(set)` = the
+        // set of statechain ids currently mid-split, which must not be driven.
+        let terminalizing: Option<std::collections::HashSet<String>> =
+            match mercuryrustlib::tesr::journal_open_splits(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+            )
+            .await
+            {
+                Ok(recs) => {
+                    Some(recs.into_iter().map(|r| r.terminalized_statechain_id).collect())
+                }
+                Err(e) => {
+                    // Fail closed: without the journal we cannot prove any leaf is safe to drive.
+                    blind.push(format!(
+                        "near-deadline protection is BLIND on every adopted split child and spine \
+                         tip: the split journal could not be read ({e}), so a leaf that is \
+                         mid-split — which must NOT be force-exited — cannot be told apart from one \
+                         that is safe to drive"
+                    ));
+                    None
+                }
+            };
+
         for (key, json) in child_rows.iter() {
             let (cid, what) = if let Some(cid) = key.strip_prefix("ctesr-") {
                 (cid, "adopted split child")
@@ -1865,6 +1992,18 @@ impl UtexoWallet {
             };
             if coin.status != CoinStatus::CONFIRMED {
                 continue;
+            }
+            // [D13] MID-SPLIT LEAVES ARE NOT OURS TO DRIVE. A CONFIRMED status here does NOT mean
+            // "safe to force-exit": a leaf terminalized by its own split reads CONFIRMED with a
+            // stale row, and driving it destroys the grandchild pieces its CSP already conveyed.
+            match leaf_split_gate(&terminalizing, cid, what) {
+                LeafSplitGate::Drive => {}
+                // Journal unreadable — blanket blindness already recorded before the loop.
+                LeafSplitGate::HoldSilently => continue,
+                LeafSplitGate::Hold(msg) => {
+                    blind.push(msg);
+                    continue;
+                }
             }
             let parsed = if key.starts_with("ctesr-") {
                 serde_json::from_str(json).map(|c| Row::Child(Box::new(c)))
@@ -1893,24 +2032,19 @@ impl UtexoWallet {
             // transaction and reads the timelock out of its `nSequence`, refusing by name if the two
             // disagree — so a sender cannot hand this tower a schedule of their choosing and move
             // the moment their victim's coin defends itself.
+            // [D13] BOTH LANES, NOT ONLY COLOURED. This loop used to gate on `is_colored()` and drop
+            // every plain child and plain tip with `_ => continue`. That left a PLAIN leaf with no
+            // runtime deadline defence anywhere in the SDK — and under the RGB scope-out the plain
+            // lane was to be the whole normative protocol. The exposure is real: a leaf carries no
+            // flat backup of its own, so its clock is the ABSOLUTE height `min(L_k)` of the PARENT's
+            // flat backups (the lowest rung belongs to the splitter — the adversary), and its exit
+            // is a chain of RELATIVE timelocks that must be STARTED `Σ(csv+1)` blocks before that
+            // height. Reacting to F being spent is too late by construction. The only thing that made
+            // covering plain rows unsafe — a mid-split leaf reading CONFIRMED with a stale row — is
+            // handled by the split-journal guard above; everything past it is safe to drive.
             let chain = match &parsed {
-                Row::Child(cb) if cb.is_colored() => {
-                    mercuryrustlib::tesr::child_exit_chain_bound(cb)
-                }
-                Row::Tip(tip) if tip.is_colored() => {
-                    mercuryrustlib::tesr::spine_tip_exit_chain_bound(tip)
-                }
-                // DELIBERATELY NARROW, unchanged: plain children (and plain tips) have the same
-                // shape and are left to their own change with their own tests, rather than swept in
-                // on the strength of an argument this round did not measure.
-                //
-                // [D13] This narrowness is a KNOWN DEFECT, not a design: a plain leaf has no other
-                // runtime deadline defence anywhere in the SDK. The decided fix (DECISIONS.md D13)
-                // is to cover plain rows too, and it needs a split-journal guard — a terminalized
-                // leaf reads CONFIRMED with a stale row after a crashed split, and driving it would
-                // destroy grandchild pieces already conveyed. That is a separate change; the two
-                // corrections below are independent of it and are live defects today.
-                _ => continue,
+                Row::Child(cb) => mercuryrustlib::tesr::child_exit_chain_bound(cb),
+                Row::Tip(tip) => mercuryrustlib::tesr::spine_tip_exit_chain_bound(tip),
             };
             let chain = match chain {
                 Ok(c) => c,
@@ -1919,7 +2053,7 @@ impl UtexoWallet {
                 // protection is here.
                 Err(e) => {
                     blind.push(format!(
-                        "{cid} (coloured {what}: its exit chain's timelocks could not be bound to \
+                        "{cid} ({what}: its exit chain's timelocks could not be bound to \
                          the signatures enforcing them ({e}), so no deadline can be derived)"
                     ));
                     continue;
@@ -1927,7 +2061,7 @@ impl UtexoWallet {
             };
             if chain.is_empty() {
                 blind.push(format!(
-                    "{cid} (coloured {what} has an EMPTY exit chain — it has no walk to protect \
+                    "{cid} ({what} has an EMPTY exit chain — it has no walk to protect \
                      it and no deadline can be derived)"
                 ));
                 continue;
@@ -1977,7 +2111,7 @@ impl UtexoWallet {
                 Ok(d) => d.saturating_sub(head_start),
                 Err(e) => {
                     blind.push(format!(
-                        "{cid} (coloured {what}: its exit-race deadline could NOT be computed \
+                        "{cid} ({what}: its exit-race deadline could NOT be computed \
                          ({e}) — it has a pre-signed chain rooted at a funding output an ancestor \
                          can still spend, so absence of a deadline here means blindness, not safety)"
                     ));
@@ -1987,15 +2121,24 @@ impl UtexoWallet {
             if tip + margin_blocks < deadline {
                 continue; // still comfortably ahead of the head-started deadline
             }
-            let _ = self.inner.events_tx.send(WalletEvent::TokenCarrierMaterialized {
-                statechain_id: cid.to_string(),
-                deadline_block: deadline,
+            // [D13] Report the RIGHT event for the coin's kind. A coloured row settles a token
+            // allocation (TokenCarrierMaterialized); a plain leaf is driven to L1 to beat its
+            // deadline (LeafExitForced). Emitting the token event for a plain coin would mis-report
+            // it to any integrator watching the stream.
+            let colored = match &parsed {
+                Row::Child(cb) => cb.is_colored(),
+                Row::Tip(tip) => tip.is_colored(),
+            };
+            let _ = self.inner.events_tx.send(near_deadline_exit_event(
+                colored,
+                cid.to_string(),
+                deadline,
                 tip,
-            });
+            ));
             match self.unilateral_exit(Some(vec![cid.to_string()]), None).await {
                 Ok(_) => exited.push(cid.to_string()),
                 Err(e) => blind.push(format!(
-                    "{cid} (coloured {what} is DUE at block {deadline}, tip {tip}, but driving \
+                    "{cid} ({what} is DUE at block {deadline}, tip {tip}, but driving \
                      its exit walk failed: {e})"
                 )),
             }
@@ -3924,6 +4067,115 @@ mod claim_cancellation_tests {
                 assert_eq!(statechain_ids, vec!["sid-cancelled".to_string()]);
             }
             other => panic!("unexpected event {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_bundle_version_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_version() {
+        // Well-formed JSON whose only fault is an unknown version; the probe reads `version` alone,
+        // so the other fields need not be valid wallet material.
+        let json = r#"{"version":999,"wallet_name":"w","wallet":{},"backups":[],"rgb_mnemonic":null,"notes":""}"#;
+        // Avoid `.unwrap_err()` here: it would require `RecoveryBundle: Debug`, and the frozen
+        // struct intentionally has no Debug derive.
+        let err = match parse_recovery_bundle(json) {
+            Ok(_) => panic!("expected an error for an unknown recovery-bundle version"),
+            Err(e) => e,
+        };
+        match err.downcast_ref::<SdkError>() {
+            Some(SdkError::UnsupportedVersion { kind, found, supported }) => {
+                assert_eq!(*kind, "recovery bundle");
+                assert_eq!(*found, 999);
+                assert_eq!(*supported, 1);
+            }
+            _ => panic!("expected SdkError::UnsupportedVersion, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_absent_version() {
+        // No version field at all: the mandatory probe field makes this a refusal, not a silent parse.
+        let json = r#"{"wallet_name":"w","wallet":{},"backups":[],"rgb_mnemonic":null,"notes":""}"#;
+        assert!(parse_recovery_bundle(json).is_err());
+    }
+}
+
+/// [D13] The two decisions the plain-leaf near-deadline port rests on, in isolation from the
+/// integration loop (which needs a live coordinator, electrum and DB). These pin the SAFETY
+/// property — a mid-split leaf is never driven, an unreadable journal blinds everything — and the
+/// HONESTY property — a plain leaf reports as a leaf exit, not a token settlement.
+#[cfg(test)]
+mod d13_leaf_gate_tests {
+    use super::{leaf_split_gate, near_deadline_exit_event, LeafSplitGate, WalletEvent};
+    use std::collections::HashSet;
+
+    fn set(ids: &[&str]) -> Option<HashSet<String>> {
+        Some(ids.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_coin_named_by_an_open_split_is_never_driven() {
+        // THE BLOCKER the safety probe found: this coin reads CONFIRMED with a stale row, and
+        // driving it would broadcast the state its own split superseded, destroying pieces already
+        // conveyed to payees. It must be held, with a message (not idle), never driven.
+        let gate = leaf_split_gate(&set(&["dead", "beef"]), "beef", "adopted split child");
+        match gate {
+            LeafSplitGate::Hold(msg) => {
+                assert!(msg.contains("mid-split"), "the reason must name why it is held: {msg}");
+                assert!(msg.contains("beef"));
+            }
+            other => panic!("a mid-split coin must be Hold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_coin_absent_from_every_open_split_is_drivable() {
+        // The whole point of the port: a plain leaf NOT mid-split is now evaluated for exit, where
+        // before it was dropped by the coloured-only gate.
+        assert_eq!(
+            leaf_split_gate(&set(&["dead", "beef"]), "cafe", "adopted split child"),
+            LeafSplitGate::Drive
+        );
+        // And with no open splits at all.
+        assert_eq!(
+            leaf_split_gate(&set(&[]), "cafe", "spine tip"),
+            LeafSplitGate::Drive
+        );
+    }
+
+    #[test]
+    fn an_unreadable_journal_holds_every_coin() {
+        // Fail closed: if we cannot read the journal we cannot prove ANY leaf is safe, so none is
+        // driven. HoldSilently because the blanket blindness is recorded once before the loop.
+        assert_eq!(
+            leaf_split_gate(&None, "cafe", "adopted split child"),
+            LeafSplitGate::HoldSilently
+        );
+        assert_eq!(
+            leaf_split_gate(&None, "beef", "spine tip"),
+            LeafSplitGate::HoldSilently
+        );
+    }
+
+    #[test]
+    fn a_plain_leaf_reports_a_leaf_exit_a_coloured_one_a_token_settlement() {
+        match near_deadline_exit_event(false, "abc".into(), 100, 90) {
+            WalletEvent::LeafExitForced { statechain_id, deadline_block, tip } => {
+                assert_eq!(statechain_id, "abc");
+                assert_eq!(deadline_block, 100);
+                assert_eq!(tip, 90);
+            }
+            other => panic!("a PLAIN leaf must emit LeafExitForced, not {other:?}"),
+        }
+        match near_deadline_exit_event(true, "xyz".into(), 200, 150) {
+            WalletEvent::TokenCarrierMaterialized { statechain_id, .. } => {
+                assert_eq!(statechain_id, "xyz");
+            }
+            other => panic!("a COLOURED leaf must emit TokenCarrierMaterialized, not {other:?}"),
         }
     }
 }
