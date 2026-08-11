@@ -63,10 +63,25 @@ pub fn create_activity(utxo: &str, amount: u32, action: &str) -> Activity {
 
 pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConfig) -> Result<Option<StatechainInfoResponsePayload>> {
 
+    // [D8-CLOSE] ASK THE SE TO SIGN THE COUNT, against a challenge THIS call chooses.
+    //
+    // `num_sigs` is the right-hand side of the receiver's anti-theft census
+    // (`se_num_sigs == flat_backups + tiers + superseded`, exact equality). Unattested, a coordinator
+    // that under-reports it by k hides k co-signed rival states: the census still balances exactly
+    // and the receiver accepts a coin the sender can still reclaim.
+    //
+    // The nonce is per-REQUEST and random. Without it the attestation is a static value a
+    // coordinator could capture when the count was legitimately lower and replay forever.
+    let nonce: [u8; 32] = rand::random();
+    let nonce_hex = hex::encode(nonce);
+
     let path = format!("info/statechain/{}", statechain_id.to_string());
 
     let client = client_config.get_reqwest_client()?;
-    let request = client.get(&format!("{}/{}", client_config.statechain_entity, path));
+    let request = client.get(&format!(
+        "{}/{}?attestation_nonce={}",
+        client_config.statechain_entity, path, nonce_hex
+    ));
 
     let response = request.send().await?;
 
@@ -86,6 +101,46 @@ pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConf
     }
 
     let response: StatechainInfoResponsePayload = serde_json::from_str(value.as_str())?;
+
+    // [D8-CLOSE] VERIFY THE ATTESTATION, AND REQUIRE IT. Under D23 there is no phased rollout: an
+    // unattested count is refused rather than recorded-and-accepted, because "accept for now" is
+    // indistinguishable from the hole it replaces.
+    //
+    // The verifying key is the CHAIN-ANCHORED one — `enclave_public_key`, which the receiver already
+    // binds to the on-chain tx0 output (`validate_tx0_output_pubkey`). Verifying against the SERVED
+    // `attestation_pubkey` instead would accept a coordinator signing with a key of its own, which
+    // is exactly the attack; `verify_sig_count_attestation` refuses if the two disagree.
+    match (&response.sig_count_attestation, &response.sig_count_attestation_pubkey) {
+        (Some(sig), Some(pk)) => {
+            mercurylib::transfer::receiver::verify_sig_count_attestation(
+                statechain_id,
+                response.num_sigs,
+                &nonce_hex,
+                sig,
+                pk,
+                &response.enclave_public_key,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "the enclave's attestation over num_sigs={} for {statechain_id} did NOT verify \
+                     ({e}). This count is the right-hand side of the anti-theft census, so an \
+                     unverified one lets a coordinator hide co-signed rival states while the census \
+                     still balances — refusing rather than proceeding on it.",
+                    response.num_sigs
+                )
+            })?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "the coordinator returned num_sigs={} for {statechain_id} with NO enclave \
+                 attestation. The count is the census's right-hand side; unattested, a coordinator \
+                 that under-reports it by k hides k co-signed rival states and the exact-equality \
+                 census still balances. Either the coordinator or the enclave predates the \
+                 attestation — upgrade both.",
+                response.num_sigs
+            ));
+        }
+    }
 
     Ok(Some(response))
 }
