@@ -160,3 +160,47 @@ blocked on it rather than being the cheap win it looked like.
 The "unproven break" rating stands: padding needs backups the SE actually co-signed, and each
 co-signature also increments `sig_count`, so both sides of the census move together. Fix it anyway —
 it is small once WP4 lands, and it removes the coordinator's ability to define a defence.
+
+---
+
+## 7. Addendum — (i) `terminal` is NOT client-derivable, and the SE cannot vouch for it *yet*
+
+Answering the question §2 row (i) left open.
+
+`terminal` is computed by the coordinator as `finalized >= budget`
+(`server/src/endpoints/lightning_latch.rs:336`), and **both operands are the coordinator's own
+database**:
+
+| operand | source | independently checkable? |
+|---|---|---|
+| `finalized` | `count_finalized_signatures(pool, sid)` (`:332`) | **Nearly** — it tracks the SE's co-signature count, which §6 just made attestable |
+| `budget` | `get_sig_budget(pool, sid)` (`:328`), column added by `server/migrations/0005_spend_budget.sql` | **No** — see below |
+
+**The decisive fact: the lockbox has no notion of a spend budget.** Grepping `lockbox/src` and
+`lockbox/include` for `budget` returns nothing; `sig_budget` exists only as a coordinator column.
+So the SE *cannot* attest terminality today even though it now attests the count — it does not know
+the threshold the count is being compared against.
+
+**What the receiver relies on this for.** `verify_terminal_parents`
+(`clients/libs/rust/src/transfer_receiver.rs:1082-1120`) requires every structural ancestor of a
+branch-funded sub-coin to be terminal, precisely so the sender cannot hide a non-terminal ancestor it
+could still double-spend. A coordinator reporting `terminal=true` for a live ancestor defeats it.
+Note the client already fails closed on transport problems (`:1107`) and on a missing/false flag
+(`:1114`) — the gap is not sloppiness, it is that a *lying* coordinator is indistinguishable from an
+honest one.
+
+**Therefore (i) does not close by client derivation.** The options, now that D22 puts the SE in
+scope:
+
+1. **Move or mirror `sig_budget` into the lockbox** and have the SE attest `terminal` the same way it
+   now attests `sig_count` — same key, same nonce-bound preimage shape. Strongest, and it makes the SE
+   the authority on the property that is actually about the SE's future behaviour ("will it co-sign
+   again?"). Cost: a schema and a write path on the SE side, and the budget must be set through the
+   SE rather than beside it.
+2. **Attest the pair `(finalized, budget)`** and let the client compute the comparison. Weaker in
+   form but equivalent in effect, and it keeps the policy decision on the coordinator.
+3. **Leave it stated** as an enumerated trust assumption alongside the others.
+
+Recommend (1) or (2); (3) is now a choice rather than a necessity, which is the change D22 bought.
+Either way `terminal` is a **second SE-attested field**, not a second bespoke mechanism — the
+preimage-with-client-nonce shape from §6 generalises directly.
