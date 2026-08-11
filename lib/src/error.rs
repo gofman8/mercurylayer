@@ -87,6 +87,12 @@ pub enum MercuryError {
     CoinNotFound,
     SignatureSchemeValidationError,
     NoPreviousLockTimeError,
+    /// The `FFITransferMsg` shape cannot represent a laddered (TES-R) transfer — it carries no
+    /// `protocol_version`, `tesr_ladder`, `child_tesr_bundle`, `branch_txs` or `terminal_parents`.
+    /// Converting such a message to the FFI type would SILENTLY DROP that material and hand the far
+    /// side a legacy (`protocol_version = 0`) interpretation of a laddered coin — a value-loss path.
+    /// The FFI transfer path is legacy-only; a laddered message must be refused here, by name.
+    FfiCannotCarryLadderedTransfer,
 }
 
 impl core::fmt::Display for MercuryError {

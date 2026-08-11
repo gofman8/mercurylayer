@@ -54,6 +54,12 @@ fn ffi_to_transfer_msg(ffi_msg: FFITransferMsg) -> Result<TransferMsg, MercuryEr
         backup_transactions: ffi_msg.backup_transactions,
         t1: t1_array,
         user_public_key: ffi_msg.user_public_key,
+        // The FFI transfer lane is LEGACY-ONLY, and this is honest rather than lossy: `FFITransferMsg`
+        // has no field for any laddered material, so an incoming FFI message never carries it, and
+        // `protocol_version = 0` / `None` is the correct reading of what the FFI type can express. The
+        // OUT direction (`transfer_to_ffi_msg`) REFUSES a laddered message rather than truncating it,
+        // which is the pair to this: nothing laddered can enter the FFI lane, so nothing laddered can
+        // be mis-read leaving it.
         branch_txs: Vec::new(),
         terminal_parents: Vec::new(),
         protocol_version: 0,
@@ -62,20 +68,32 @@ fn ffi_to_transfer_msg(ffi_msg: FFITransferMsg) -> Result<TransferMsg, MercuryEr
     })
 }
 
-fn transfer_to_ffi_msg(transfer_msg: TransferMsg) -> FFITransferMsg {
-    FFITransferMsg {
+fn transfer_to_ffi_msg(transfer_msg: TransferMsg) -> Result<FFITransferMsg, MercuryError> {
+    // REFUSE, never silently drop. `FFITransferMsg` has no field for any of these, so producing one
+    // from a laddered message would hand the far side a `protocol_version = 0` (legacy) reading of a
+    // TES-R coin — the flat interpretation of a laddered coin is a value-loss path. The FFI transfer
+    // lane is legacy-only; say so loudly rather than truncate.
+    if transfer_msg.protocol_version != 0
+        || transfer_msg.tesr_ladder.is_some()
+        || transfer_msg.child_tesr_bundle.is_some()
+        || !transfer_msg.branch_txs.is_empty()
+        || !transfer_msg.terminal_parents.is_empty()
+    {
+        return Err(MercuryError::FfiCannotCarryLadderedTransfer);
+    }
+    Ok(FFITransferMsg {
         statechain_id: transfer_msg.statechain_id,
         transfer_signature: transfer_msg.transfer_signature,
         backup_transactions: transfer_msg.backup_transactions,
         t1: Vec::from(transfer_msg.t1),
         user_public_key: transfer_msg.user_public_key,
-    }
+    })
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
 pub fn fii_decrypt_transfer_msg(encrypted_message: &str, private_key_wif: &str) -> Result<FFITransferMsg, MercuryError> {
     let transfer_msg = crate::transfer::receiver::decrypt_transfer_msg(encrypted_message, private_key_wif)?;
-    Ok(transfer_to_ffi_msg(transfer_msg))
+    transfer_to_ffi_msg(transfer_msg)
 }
 
 #[cfg_attr(feature = "bindings", uniffi::export)]
