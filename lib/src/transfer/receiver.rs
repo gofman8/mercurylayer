@@ -241,12 +241,18 @@ pub fn verify_sig_count_attestation(
     attestation_pubkey_hex: &str,
     chain_anchored_enclave_pubkey: &str,
 ) -> Result<(), MercuryError> {
+    // The lockbox emits every key it serialises through `key_to_string`, which PREFIXES "0x"
+    // (lockbox/src/utils.cpp:56-62). `from_str` does not accept that, so strip it here rather than
+    // changing a wire convention the rest of the SE API already uses. Found by testing against the
+    // live endpoint — the unit tests generated their own hex and so could not have caught it.
+    let strip0x = |s: &str| s.strip_prefix("0x").unwrap_or(s).to_string();
+
     // 1. The signer must be the key already bound to the on-chain tx0 output. `enclave_public_key`
     //    is a 33-byte compressed key; the attestation carries its 32-byte x-only half.
-    let anchored = PublicKey::from_str(chain_anchored_enclave_pubkey)
+    let anchored = PublicKey::from_str(&strip0x(chain_anchored_enclave_pubkey))
         .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
     let (anchored_xonly, _) = anchored.x_only_public_key();
-    let claimed_xonly = XOnlyPublicKey::from_str(attestation_pubkey_hex)
+    let claimed_xonly = XOnlyPublicKey::from_str(&strip0x(attestation_pubkey_hex))
         .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
     if anchored_xonly != claimed_xonly {
         // The coordinator signed with a key of its own choosing. That is the attack this check is
@@ -268,7 +274,7 @@ pub fn verify_sig_count_attestation(
     preimage.extend_from_slice(&nonce);
 
     let msg = Message::from_hashed_data::<sha256::Hash>(&preimage);
-    let signature = Signature::from_str(attestation_hex)
+    let signature = Signature::from_str(&strip0x(attestation_hex))
         .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
 
     Secp256k1::new()
@@ -1545,5 +1551,22 @@ mod sig_count_attestation_tests {
         assert!(verify_sig_count_attestation(
             "coin-b", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
             "the statechain id is in the preimage precisely so one coin's count cannot vouch for another");
+    }
+
+    #[test]
+    fn the_lockbox_wire_format_with_its_0x_prefix_verifies() {
+        // REGRESSION. The lockbox serialises every key through `key_to_string`, which prefixes
+        // "0x" (lockbox/src/utils.cpp:56-62). The other tests here build their hex with
+        // `.to_string()`, which does NOT, so they all passed while the real endpoint's output would
+        // have failed to parse. Caught by calling the live /signature_count, not by unit testing.
+        let (kp, compressed, xonly, nonce) = setup();
+        let sig = attest(&kp, "coin-a", 5, &nonce);
+        assert!(verify_sig_count_attestation(
+            "coin-a", 5, &hex::encode(nonce),
+            &format!("0x{sig}"), &format!("0x{xonly}"), &format!("0x{compressed}")).is_ok(),
+            "the SE's actual on-the-wire encoding must verify");
+        // And the bare form must keep working, so both encodings are accepted.
+        assert!(verify_sig_count_attestation(
+            "coin-a", 5, &hex::encode(nonce), &sig, &xonly, &compressed).is_ok());
     }
 }
