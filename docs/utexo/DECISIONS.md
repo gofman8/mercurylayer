@@ -211,6 +211,45 @@ Two further defects the same probe found, **live in shipped code today**, indepe
    forbids: *"Anything that computes a requirement, a deadline or a cap from these timelocks must use
    `child_exit_chain_bound`"* (`clients/libs/rust/src/tesr.rs:5489-5493`).
 
+## D22 — SE scope rule REVOKED (2026-08-11): `lockbox/` and `enclave/` are in scope
+
+**Decided:** the standing "never modify `enclave/` or `lockbox/`" constraint is lifted, for both.
+The owner's words: *"do whatever to fix all issues, if it requires changes in enclave, why not?"*
+
+**Why it matters immediately: D8(a) stops being unclosable.** Every prior write-up — this document
+included — recorded the theft-class unauthenticated census count as something the spec must *state*
+rather than *close*, on the sole ground that closure needed SE work. That ground is gone.
+
+**What changes across this record:**
+
+| Previously | Now |
+|---|---|
+| D8: spec states `num_sigs` as an enumerated trust assumption; closure is excluded scope | Closure is IN scope — see D8-CLOSE below. The enumeration is still published (it is good practice), but (a) becomes a *closed* row rather than a standing assumption |
+| D10: "may be a third excluded-scope collision", commissioned to surface in week 1 | No longer a collision at all. It is ordinary work, costed on its merits |
+| The census counter machine (`{level, m, k}` not served — PROTOCOL §5.5/§5.11) | SE-side per-level counters were the "build it" option D4 rejected partly on scope. Re-openable if wanted, though D4's proof means it is no longer *needed* |
+| SSP-side expiry gates (C-7 residual) | Buildable |
+
+**D8-CLOSE — the shape, since it is smaller than "change the enclave" sounds.** The lockbox already
+holds a key and the client **already fetches and trusts `enclave_public_key`** for a different
+binding (`validate_tx0_output_pubkey`, `clients/libs/rust/src/transfer_receiver.rs:1313`). So:
+lockbox signs `(statechain_id, sig_count)` at `lockbox/src/db_manager.cpp:487` /
+`lockbox/src/server.cpp:357`; the coordinator forwards the signature alongside the count; the client
+verifies it against a pubkey it already possesses before using the count as the census RHS
+(`clients/libs/rust/src/tesr.rs:9093`). A signature over two fields on one endpoint — not an
+architecture change. Add a replay/freshness binding so a stale `(sid, count)` pair cannot be
+re-served.
+
+**Practical:** `lockbox/` is plain C++ (Crow, monocypher) with **no SGX** in its build files —
+ordinary Docker container, locally buildable and testable. **Production runs lockbox, not the SGX
+`enclave/App` lane**, so lockbox changes ship and enclave changes matter only if SGX is revived;
+prefer lockbox where both would work.
+
+**Unchanged:** the deployment items the owner set aside separately (port 18080 unauthenticated; the
+committed SE seed and Vault token) are NOT reopened by this. Lifting a code-scope rule is not a
+reversal of those.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB
