@@ -397,6 +397,9 @@ percent.** That is the plainest statement of the defect available.
   it).
 * **Watchtower-funded CPFP** — an operator-run tower bumps on the payee's behalf and bills them.
   Turns a protocol guarantee into a **service**, which is honest but must be labelled as such.
+  **[D31, 2026-08-11]** This is now a decided position rather than an option: it is offered as the
+  OPTIONAL funded-tower variant, and it is labelled as such. The default tower is keyless and
+  **cannot** bump; the normative funder is the **owner**.
 * **Accepting that a piece is a claim, not a bearer instrument** — the design choice. Below the band
   a piece is redeemable **cooperatively** and not otherwise. This is defensible; what is not
   defensible is failing to say it.

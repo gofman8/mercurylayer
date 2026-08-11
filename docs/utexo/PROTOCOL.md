@@ -530,11 +530,37 @@ directly.
 all pre-signed, pays only the owner, zero key material (REQ-34 preserved). `watch_pass` becomes a
 small state machine: monitor F (one outpoint subscription) → on hostile trigger, request co-op
 de-trigger via the owner's SDK if reachable, else broadcast X at +E_m, state/SP at +Δ, attaching P2A
-children. **[Amendment, TES-fixable #4]** `watch_pass` must be package-aware (`submitpackage`, not
-per-tx `transaction_broadcast_raw`) and towers hold a small funded fee wallet — keyless w.r.t. the
-coin, funded w.r.t. anchors; the bundle carries fee-child templates. Funding rail: onboarding prepays
-a tower fee bond sized to ~2 spike bumps (~2 × 152 vB × 50 sat/vB ≈ 15,000 sats, operator-carried and
-priced into the onboarding fee per the delegation refinement). Multiple towers compose idempotently.
+children. **[D31] WHAT A KEYLESS TOWER CANNOT DO — normative.** A keyless tower can watch `F`, and can
+broadcast the pre-signed tiers **at their committed fee**. It **cannot fee-bump them.** A CPFP child
+spending the P2A anchor requires an input the tower does not hold and a signature it cannot make, so
+if the mempool's floor rises above a tier's committed rate, a keyless tower has no action available:
+`min relay fee not met, 200 < 423` is a refusal it cannot answer. This is a **stated limit of the
+protocol, not an implementation gap** — an implementer must not read "delegable, keyless watching"
+as implying spike-time rescue.
+
+Nor does the anyone-can-spend anchor supply one. Rescuing a 240-sat anchor was measured to need a
+**180 330-sat child** (WP1) — about **900×** the anchor's value — so while anyone *may* bump it,
+nobody without a stake in the coin has a reason to. "Anyone-can-spend" is a permission, not an
+incentive.
+
+**[D31] WHO BUMPS, THEN: the owner.** The party that funds a CPFP package is the **coin owner**, from
+their own wallet — the only party holding both a spendable UTXO and a motive. The consequence is
+explicit: **the guarantee during a fee spike is "the owner is online"**, which is precisely the
+condition a watchtower otherwise removes. The protocol does not promise otherwise.
+
+**[D31] OPTIONAL: the funded-tower variant.** An operator MAY run a tower with a small hot fee wallet
+and bump on the owner's behalf. Its exposure is bounded and worth stating exactly: such a tower still
+holds **no coin keys**, so compromising it costs the operator's fee float and **cannot touch a user's
+coin** — a materially smaller claim than "keyless", and materially larger than nothing. It carries an
+operational duty in exchange: the float must be refilled, and **a tower that runs dry fails at exactly
+the moment it is needed**. A suggested rail is an onboarding-prepaid fee bond sized to ~2 spike bumps
+(~2 × 152 vB × 50 sat/vB ≈ 15 000 sats, operator-carried and priced into the onboarding fee). This
+variant is offered so the choice is informed; it is **not** assumed by any other part of this
+specification.
+
+**[Amendment, TES-fixable #4]** Independently of who funds it, `watch_pass` must be package-aware
+(`submitpackage`, not per-tx `transaction_broadcast_raw`) and the bundle carries fee-child templates.
+Multiple towers compose idempotently.
 
 **[Shipped]** **sdk45** is the evidence for the two properties this section rests on: the watch bundle
 carries **no key material**, and a **second independent tower is idempotent** (both explicitly
@@ -544,7 +570,10 @@ counterpart — materializing a colored branch before its deadline — is **sdk3
 **not implemented**: the package-aware broadcast. `watch_pass` (and `exit_pass`) walk the tiers with
 per-tx `transaction_broadcast_raw` and attach no P2A fee child — the committed fee of §5.3 carries each
 tier at ordinary rates, but the amendment above is a specification, not shipped code, and no test
-exercises spike-time fee bumping (§9).
+exercises spike-time fee bumping (§9). Note that under **D31** this gap is narrower than it looks for
+the DEFAULT tower: a keyless tower would not bump even if the code existed, so what is missing is the
+**owner's** package path (`#123`), which additionally needs a Bitcoin Core RPC endpoint the SDK does
+not have — electrum exposes no `submitpackage`.
 
 ---
 

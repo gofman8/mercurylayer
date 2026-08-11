@@ -5,6 +5,20 @@ Spun out of `WP1-TRUC-P2A-SPIKE.md` §4 ("Who funds a CPFP child for a keyless t
 
 ---
 
+> ## DECIDED 2026-08-11 — **(A) owner-funded, with (B) the funded tower as a documented option**
+>
+> The owner took the recommendation in §4 as written. **(C) is not taken** (it relocates the funding
+> question and adds a counterparty). **(D) is not taken** — a permanent, per-coin, signed-in cost
+> that interacts with `V_min` and two open decisions, to shrink rather than close the window.
+>
+> Recorded as **D31** in `DECISIONS.md`. The normative consequences are written into the spec, not
+> left here: `PROTOCOL.md` §5.13 now states plainly **what a keyless tower cannot do** (per D19),
+> re-scopes its funded-wallet amendment from "towers hold" to "an operator MAY", and states the
+> funded variant's bounded exposure. `TRUST-MODEL.md` B4's "keyless delegation covers offline
+> periods" is qualified with the fee-spike exception.
+>
+> This document is retained as the reasoning and the measurements behind that decision.
+
 ## 1. The finding, in one line
 
 **The P2A anchor makes a tier's fee bumpable by *anyone*; it does not make it bumpable by *nobody*.**

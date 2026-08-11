@@ -528,6 +528,69 @@ destroyed an RGB allocation on a materialised carrier is closed (RGB Stage 0).
 
 ---
 
+## D31 — Fee-bumping is **owner-funded** (A); the **funded tower** (B) is a documented deployment option
+
+**Decided by the owner 2026-08-11**, on `notes/CPFP-WHO-FUNDS-IT.md`. Options (C) third-party fee
+service and (D) raising `committed_fee_rate` are **not** taken.
+
+### What was actually decided
+
+**(A) is the normative v1 statement.** The protocol does not promise that anyone bumps a stuck tier
+for you. The party who funds a CPFP package is the **coin owner**, out of their own wallet, because
+they are the only party that has both a UTXO and a reason to spend it.
+
+**(B) is offered, not assumed.** A tower operator MAY run a funded variant with a small hot fee
+wallet. The spec describes it so the choice is informed, and states its exposure precisely.
+
+### Why this is the honest answer rather than the comfortable one
+
+It does not close the gap — **it renames it**. The guarantee becomes "the owner is online during a
+fee spike", and being offline during a fee spike is precisely the case a watchtower exists for. That
+is a real limit and it is now written down as one, rather than left to be discovered by an
+implementer who reasonably assumed the tower had it covered.
+
+The alternative that *looks* like it closes the gap, (D), does not either: any fixed
+`committed_fee_rate` is exceeded by some future mempool, so it shrinks the exposure window instead of
+removing it — and it is paid by **every tier of every coin, permanently, signed in, whether or not
+that coin is ever broadcast**, while also raising `V_min` against two still-open decisions. Trading a
+priced cost for an unpriced one to make a gap close neatly is how a spec acquires claims it cannot
+keep.
+
+### The measured facts this rests on (WP1)
+
+| | measured |
+|---|---|
+| a tier alone, under the relay floor | `min relay fee not met, 200 < 423` — **refused** |
+| the same tier as a 1P1C package | `"package_msg": "success"` |
+| child fee required | **180 330 sats** to rescue a 240-sat anchor |
+
+That ratio — roughly **900×** the anchor's value — is why no disinterested third party bumps it. The
+P2A output is anyone-can-spend, but "anyone *can*" is not "someone *will*": there is no fee revenue
+in it for a stranger, so the only parties with an incentive are the owner and a tower the owner pays.
+
+### Normative consequences (this is the part that changes documents, per D19)
+
+1. **`PROTOCOL.md` must state what a keyless tower CANNOT do**, so that an implementer reading only
+   the spec cannot conclude otherwise. A keyless tower can watch, and can broadcast pre-signed tiers
+   at their committed fee. It **cannot** fee-bump, because a CPFP child needs an input it does not
+   have and a signature it cannot make.
+2. **§5.13's amendment is re-scoped.** It currently reads as though towers *do* hold a fee wallet;
+   under (A) that is the OPTIONAL variant, and the default tower is keyless and cannot bump.
+3. **The funded variant's exposure is bounded and must be stated as such:** a funded tower still
+   holds **no coin keys**, so compromising it loses the operator's fee float and cannot touch a
+   user's coin. That is a materially smaller claim than "keyless" and materially larger than nothing.
+   It also carries an operational duty — the float must be refilled, and **a tower that runs dry
+   fails at exactly the moment it is needed**, which is the same failure as (A) with extra steps.
+
+### What this unblocks and what it does not
+
+`#123` (a `submitpackage`-capable broadcast path) now has an answer to *who calls it* — the owner's
+wallet — and the client code is the same either way. It remains blocked on infrastructure: **electrum
+has no `submitpackage`**, so any bumping path needs a Bitcoin Core RPC endpoint the SDK does not have
+(WP1 §4). (A) does not remove that; it settles the design question sitting on top of it.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB

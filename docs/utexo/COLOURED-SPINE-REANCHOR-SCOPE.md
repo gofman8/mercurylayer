@@ -883,12 +883,14 @@ in the original draft and are corrected here.**
 
 ## 6. Open questions for the owner
 
-1. **Who funds a CPFP fee child for a keyless watchtower?** This is W1(d), the one genuinely
-   undesigned question in the plan, and it is the reason the estimate has a 5-week tail. A keyless
-   tower holds no UTXO (`clients/libs/rust-sdk/src/watchtower.rs:3-4`) and `PROTOCOL.md:525`'s
-   prepaid fee bond is unbuilt. Options: an owner-held bump wallet the tower can draw on, a prepaid
-   bond, or "exits above 2 sat/vB are the owner's own responsibility" stated normatively. **This
-   decision gates the product claim that every coin stays unilaterally exitable.**
+1. ~~**Who funds a CPFP fee child for a keyless watchtower?**~~ **ANSWERED 2026-08-11 — D31.**
+   The owner chose **(A) owner-funded**, with **(B) the funded tower as a documented deployment
+   option**; (C) third-party service and (D) raising `committed_fee_rate` were not taken. W1(d) is
+   therefore no longer undesigned, and **the 5-week tail on this estimate closes** — W1's remaining
+   parts (a) package route, (b) P2A spender, (c) v3 fee child are all engineering.
+   The product claim is now stated rather than assumed: the protocol does **not** promise
+   spike-time rescue, a keyless tower **cannot** fee-bump, and during a spike the defence is the
+   owner being online. Written normatively into `PROTOCOL.md` §5.13 and `TRUST-MODEL.md` B4.
 2. **Confirm CR-D as the Phase-2 baseline.** G2 no longer selects the product (§2.2/§2.3): CR-D
    builds without it, in 2 transactions and zero CSV wait. The question is only whether to spend the
    2–3 days on G2 at all, to find out whether CR-A's one-transaction form is additionally available.

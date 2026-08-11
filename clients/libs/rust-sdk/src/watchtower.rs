@@ -12,6 +12,26 @@
 //!   worst a malicious/buggy watchtower can do with it is broadcast EARLY, which settles the
 //!   owner's coin on-chain to the owner (safe; costs only the off-chain-ness), or not act at all
 //!   (the same risk as running no watchtower).
+//!
+//! # [D31] What a keyless tower CANNOT do — read this before relying on one
+//!
+//! Everything above is about TRUST. This paragraph is about CAPABILITY, and it is the one that
+//! surprises people: a keyless tower can broadcast the pre-signed tiers **at their committed fee**,
+//! and that is all it can do about fees. It **cannot fee-bump**. A CPFP child spending the 240-sat
+//! P2A anchor needs an input this tower does not hold and a signature it cannot make, so when the
+//! mempool's floor rises above a tier's committed rate the tower has no move — `min relay fee not
+//! met, 200 < 423` is a refusal it cannot answer.
+//!
+//! The anchor being anyone-can-spend does not rescue it either. Bumping that 240-sat anchor was
+//! measured to need a **180 330-sat child** — roughly **900×** its value — so "anyone *may* spend
+//! it" is a permission, not an incentive, and no disinterested party supplies one.
+//!
+//! **So during a fee spike the defence is the OWNER being online** — precisely the condition a
+//! watchtower otherwise removes. That is a stated limit of the protocol (`PROTOCOL.md` §5.13), not a
+//! TODO in this file. An operator MAY run the optional funded variant (a small hot fee wallet, still
+//! **no coin keys**, so a compromise costs the operator's float and cannot touch a user's coin) —
+//! and must then keep it funded, because a tower that runs dry fails at exactly the moment it is
+//! needed.
 //! - [`watch_pass`] runs one watch iteration from a bundle + an electrum connection alone: no
 //!   wallet database, no SE, no keys. Run it on a cron anywhere; run SEVERAL independently —
 //!   broadcasts are idempotent (an already-known/mined tx is success), and since every watchtower
