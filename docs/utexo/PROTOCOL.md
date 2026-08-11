@@ -567,7 +567,16 @@ carries **no key material**, and a **second independent tower is idempotent** (b
 asserted there). **sdk51** runs the state machine against a real hostile trigger (and is a no-op while
 the coin is idle — an un-broadcast coin never ages, so there is nothing to defend). The carrier-side
 counterpart — materializing a colored branch before its deadline — is **sdk34** (§5.10.4). What is
-**not implemented**: the package-aware broadcast. `watch_pass` (and `exit_pass`) walk the tiers with
+**partly implemented as of 2026-08-11 [D31/#123]**: the package-aware broadcast now EXISTS as a
+path — `mercurylib::wallet::p2a_fee_child::build_p2a_fee_child` builds and prices the v3 owner-funded
+child, and `mercuryrustlib::core_rpc::submit_package` submits the 1P1C package to a Bitcoin Core node
+(electrum has no `submitpackage`, so this is a second, opt-in backend used for this one call).
+**Verified live, end to end, through repo code**: a v3 tier paying 0.048 sat/vB was REFUSED alone by a
+node whose floor is 0.1 sat/vB (`min relay fee not met, 6 < 13`) and then ACCEPTED as a package
+(`package_msg = "success"`, parent in the mempool with a descendant count of 2) —
+`clients/libs/rust/tests/live_p2a_package_rescue.rs`. That is the WP1 acceptance criterion, which
+required the rescue to run through this repo's own code rather than a hand-run `bitcoin-cli`.
+What remains unwired is the CALLER: `watch_pass` (and `exit_pass`) still walk the tiers with
 per-tx `transaction_broadcast_raw` and attach no P2A fee child — the committed fee of §5.3 carries each
 tier at ordinary rates, but the amendment above is a specification, not shipped code, and no test
 exercises spike-time fee bumping (§9). Note that under **D31** this gap is narrower than it looks for

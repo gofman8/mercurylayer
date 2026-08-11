@@ -425,3 +425,14 @@
 #   "not a carrier" — i.e. spendable as sats — and this entry must become a census (PROVEN vs
 #   UNREADABLE) exactly as `tesr_colour_census` did for the `tesr-` lane.
 1	clients/libs/rust-sdk/src/tokens.rs	ok-question	let tip: mercuryrustlib::tesr::SpineTipBundle = serde_json::from_str(&json).ok()?;
+#
+#
+# [D31/#123] The live package-rescue test's opt-in gate. `CORE_RPC_URL` absent -> `None` -> the test
+# SKIPS. That IS less verification, which is why it is here with a reason rather than passed over:
+# the mitigation is that the skip is LOUD. It prints that nothing was verified and names the WP1
+# criterion it did not exercise, so a green run cannot be mistaken for a proven rescue. This is a
+# test harness, not a protection path — no coin depends on it — and the alternative (failing the
+# suite on every machine without a Core node) would make the whole workspace unrunnable by default.
+#   Re-check if this pattern is ever copied into non-test code: there, "no endpoint configured"
+#   silently becoming "nothing to do" is exactly the shape that loses a coin.
+1	clients/libs/rust/tests/live_p2a_package_rescue.rs	ok-question	let url = std::env::var("CORE_RPC_URL").ok()?;

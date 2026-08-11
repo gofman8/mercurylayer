@@ -99,6 +99,12 @@ pub enum MercuryError {
     /// side a legacy (`protocol_version = 0`) interpretation of a laddered coin — a value-loss path.
     /// The FFI transfer path is legacy-only; a laddered message must be refused here, by name.
     FfiCannotCarryLadderedTransfer,
+    /// [D31] A P2A fee child could not be built or priced. Carries the explanation because every
+    /// refusal in that builder is a QUANTITATIVE one — "the anchor is worth 240 sats and its rescue
+    /// costs 180 330", "the change would be 12 sats, under the dust floor", "the child would exceed
+    /// TRUC's 1000 vB". A unit variant here would discard exactly the number the caller needs in
+    /// order to act (supply a bigger funding input, or accept a lower target).
+    FeeChildUnbuildable(String),
 }
 
 impl core::fmt::Display for MercuryError {

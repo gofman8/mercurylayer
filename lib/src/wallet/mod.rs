@@ -1,5 +1,6 @@
 pub mod key_derivation;
 pub mod cpfp_tx;
+pub mod p2a_fee_child;
 
 use std::{fmt, str::FromStr};
 

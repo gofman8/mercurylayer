@@ -1,6 +1,7 @@
 pub mod broadcast_backup_tx;
 pub mod client_config;
 pub mod coin_status;
+pub mod core_rpc;
 pub mod combine;
 pub mod deposit;
 pub mod lightning_latch;

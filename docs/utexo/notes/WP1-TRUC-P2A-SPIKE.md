@@ -119,7 +119,7 @@ GATED on the P2A spike; if fee-bumping cannot be made reliable, this option is u
 | §6 in-flight window of 2, sequential submission | Write as normative; cite this run |
 | `PROTOCOL.md:245-247` "each tier confirms before the next is valid" | **False for the spine** — correct it (WP7) |
 | D7 explicit per-profile `TesrParams` | Evidence strengthened: 139-tx chain ⇒ ~68-block stall > the whole schedule |
-| A `submitpackage`-capable backend | **Open** — no caller exists; electrum cannot do it |
+| A `submitpackage`-capable backend | **CLOSED 2026-08-11** — `mercuryrustlib::core_rpc::submit_package` is the caller; opt-in Core RPC, since electrum still cannot do it. Verified live in `live_p2a_package_rescue.rs`: refused alone (`min relay fee not met, 6 < 13`), accepted as a package. |
 | Who funds a CPFP child for a keyless tower | **Open** — D19/§15 |
 | Literal P2A output relay | **VERIFIED 2026-08-11** — a real `51024e73` output at 240 sats relays; not dust to Core. Pinned by `lib/tests/p2a_script_shape.rs` |
 
