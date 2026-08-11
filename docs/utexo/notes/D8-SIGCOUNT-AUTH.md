@@ -127,3 +127,36 @@ valid JSON with an under-reported count.
 - Non-Rust/JS clients and lib/out-python/mercurylib.py not exhaustively audited for further census
   sites; JS clients refuse laddered coins outright but trust num_sigs on the flat lane
   (nodejs/transfer_receive.js:190-196, web:230-236).
+
+---
+
+## 6. Addendum 2026-08-11 — (a) is CLOSED; (f)'s obvious fix is circular
+
+**(a) `num_sigs` — closed.** The SE now attests the count and the client verifies it against the
+chain-anchored enclave key (`8bc7f1a`; primitive + 5 tests, wiring into the census sites is the
+remaining half). Unblocked by **D22**, which revoked the SE scope rule. This row moves from "stated
+trust assumption" to "closed", once the wiring ships.
+
+**(f) `initlock`/`interval` — the naive fix would make things WORSE. Recorded so nobody builds it.**
+
+The lever: INV-5 requires each flat-backup hop to decrement by *exactly* `interval`
+(`ladder_decrements_by_interval`, `lib/src/transfer/receiver.rs:371-373`), and that is the defence
+against a sender padding the backup vector with duplicates to inflate `flat_backups` and absorb a
+hidden co-signed state (the attack its own doc-comment names at `:375-380`). `interval` is fetched
+from the coordinator (`clients/libs/rust/src/utils.rs:30`), so **the coordinator defines the
+defence.**
+
+The tempting fix is to derive the interval from the conveyed chain itself, since `L_k = L_0 −
+k·interval` looks self-evidencing. **It is circular.** A padded chain with uniform `I/2` decrements
+would derive `I/2` and validate against itself — accepting precisely the padding the
+coordinator-supplied value at least constrains while the coordinator is honest.
+
+The interval must come from a source **neither the sender nor the coordinator chooses**: a
+compiled-in per-network constant, exactly as `TesrParams` already is
+(`lib/src/tesr.rs:219-225`) — that asymmetry between the TES-R schedule and the flat-lane parameters
+is the whole finding. That needs the normative per-network profile, i.e. **WP4/D7**, so (f) is
+blocked on it rather than being the cheap win it looked like.
+
+The "unproven break" rating stands: padding needs backups the SE actually co-signed, and each
+co-signature also increments `sig_count`, so both sides of the census move together. Fix it anyway —
+it is small once WP4 lands, and it removes the coordinator's ability to define a defence.
