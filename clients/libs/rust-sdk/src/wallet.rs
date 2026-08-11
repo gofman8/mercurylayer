@@ -200,6 +200,48 @@ fn leaf_split_gate(
     }
 }
 
+/// [D13-follow-up] Does this leaf's exit actually pay THIS wallet?
+///
+/// **The cancel-resurrection window.** `child_retransfer` marks the child IN_TRANSFER before its
+/// co-sign and stores the superseding, PAYEE-paying bundle before conveying it. If the conveyance
+/// leg then fails, the coin sits IN_TRANSFER with a row whose `child_owner_exit_address` is the
+/// payee's. A child conveyance opens a real coordinator transfer, so `POST /transfer/cancel` is
+/// reachable for it — and `status_after_cancel` lifts IN_TRANSFER back to CONFIRMED
+/// (`clients/libs/rust/src/transfer_sender.rs:1715-1720`). The repair step does not help:
+/// `reclaim_cancelled_conveyance` loads a `tesr-` bundle and returns `Ok(false)` for a child, which
+/// has none, so the row is never re-pointed at the owner.
+///
+/// A CONFIRMED status therefore does not imply the stored row pays us. Driving one that does not
+/// would force-exit the coin straight into the payee's address — handing away the sender's own
+/// money. This is the guard for that.
+///
+/// **Unrecognised is reported, not silently skipped.** Failing closed here means declining to
+/// defend a coin, which is itself a loss if the address is legitimately ours and merely unknown to
+/// this record. So the caller surfaces it as attention-needed rather than dropping it quietly.
+fn leaf_exit_pays_this_wallet(exit_address: &str, record: &WalletRecord) -> bool {
+    wallet_holds_address(exit_address, wallet_addresses(record).iter().map(|s| s.as_str()))
+}
+
+/// Every address this wallet can be paid at, from its own record.
+fn wallet_addresses(record: &WalletRecord) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in record.coins.iter() {
+        out.push(c.backup_address.clone());
+        out.push(c.address.clone());
+        if let Some(a) = c.aggregated_address.as_ref() {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// The comparison itself, split out so it is testable without constructing a whole wallet record
+/// (neither `Coin` nor `Wallet` implements `Default`, and a hand-built one would test the fixture
+/// rather than the rule).
+fn wallet_holds_address<'a>(exit_address: &str, mut known: impl Iterator<Item = &'a str>) -> bool {
+    known.any(|a| a == exit_address)
+}
+
 /// [D13] The event a near-deadline force-exit emits, chosen by the coin's kind. A coloured row
 /// settles a token allocation ([`WalletEvent::TokenCarrierMaterialized`]); a plain sats leaf is
 /// driven to L1 to beat its deadline ([`WalletEvent::LeafExitForced`]). Emitting the token event
@@ -2032,6 +2074,30 @@ impl UtexoWallet {
             // transaction and reads the timelock out of its `nSequence`, refusing by name if the two
             // disagree — so a sender cannot hand this tower a schedule of their choosing and move
             // the moment their victim's coin defends itself.
+            // [D13-follow-up] AND IT MUST PAY US. A CONFIRMED status does not imply the stored row
+            // pays this wallet: a failed child conveyance leaves the coin IN_TRANSFER with a
+            // PAYEE-paying row, `/transfer/cancel` lifts that back to CONFIRMED, and
+            // `reclaim_cancelled_conveyance` returns `Ok(false)` for a child so the row is never
+            // re-pointed at the owner. Driving it would force-exit the sender's own money into the
+            // payee's address. Reported, never silently skipped — a false positive here means
+            // declining to defend a coin we DO own, and that must be visible rather than quiet.
+            // CHILDREN ONLY: a spine tip is the sender's own change leg and carries no
+            // `child_owner_exit_address` — there is no conveyance-to-a-payee to be resurrected, so
+            // the window does not exist for it.
+            if let Row::Child(cb) = &parsed {
+                let exit_addr = &cb.child_owner_exit_address;
+                if !leaf_exit_pays_this_wallet(exit_addr, &record) {
+                    blind.push(format!(
+                        "{cid} ({what}): its stored exit pays {exit_addr}, which is not an address \
+                         this wallet holds — refusing to drive it. Either a conveyance to that payee \
+                         was cancelled without the row being re-pointed at the owner (exiting would \
+                         hand them the coin), or this wallet's record is incomplete. Not driven, \
+                         and not treated as idle"
+                    ));
+                    continue;
+                }
+            }
+
             // [D13] BOTH LANES, NOT ONLY COLOURED. This loop used to gate on `is_colored()` and drop
             // every plain child and plain tip with `_ => continue`. That left a PLAIN leaf with no
             // runtime deadline defence anywhere in the SDK — and under the RGB scope-out the plain
@@ -4110,7 +4176,7 @@ mod recovery_bundle_version_tests {
 /// HONESTY property — a plain leaf reports as a leaf exit, not a token settlement.
 #[cfg(test)]
 mod d13_leaf_gate_tests {
-    use super::{leaf_split_gate, near_deadline_exit_event, LeafSplitGate, WalletEvent};
+    use super::{wallet_holds_address, leaf_split_gate, near_deadline_exit_event, LeafSplitGate, WalletEvent};
     use std::collections::HashSet;
 
     fn set(ids: &[&str]) -> Option<HashSet<String>> {
@@ -4159,6 +4225,30 @@ mod d13_leaf_gate_tests {
             leaf_split_gate(&None, "beef", "spine tip"),
             LeafSplitGate::HoldSilently
         );
+    }
+
+    #[test]
+    fn a_leaf_whose_exit_pays_someone_else_is_not_driven() {
+        // THE CANCEL-RESURRECTION WINDOW. A failed child conveyance leaves a PAYEE-paying row;
+        // /transfer/cancel lifts the coin back to CONFIRMED; reclaim_cancelled_conveyance returns
+        // Ok(false) for a child so the row is never re-pointed. Driving it would force-exit the
+        // sender's own money into the payee's address.
+        let mine = ["bcrt1qmine", "bcrt1qmine_backup"];
+        assert!(!wallet_holds_address("bcrt1qPAYEE", mine.iter().copied()),
+            "a row paying an address we do not hold must NOT be driven");
+        assert!(wallet_holds_address("bcrt1qmine_backup", mine.iter().copied()),
+            "the owner's own backup address is exactly what an honest row pays");
+        assert!(wallet_holds_address("bcrt1qmine", mine.iter().copied()));
+    }
+
+    #[test]
+    fn a_leaf_reports_when_it_declines_rather_than_going_quiet() {
+        // Declining to drive is itself a loss if the address IS ours and merely unknown to this
+        // record, so the caller must surface it. This pins the predicate's shape; the reporting is
+        // asserted by the loop's `blind` push at the call site.
+        let none: [&str; 0] = [];
+        assert!(!wallet_holds_address("anything", none.iter().copied()),
+            "an empty record recognises no address — and must therefore report, not silently skip");
     }
 
     #[test]
