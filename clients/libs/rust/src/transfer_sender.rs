@@ -992,9 +992,16 @@ async fn execute_ex(
         You will no longer be able to move other duplicate coins with the same statechain_id and this will cause PERMANENT LOSS of these duplicate coin funds."));
     }
 
+    // The second arm was `WITHDRAWING` twice — `X || X` — so this guard only ever fired while a
+    // withdrawal was IN FLIGHT and stopped firing the moment it CONFIRMED. Found by clippy
+    // (`equal expressions as operands to ||`), and it is a real hole rather than a style nit: the
+    // variable is named `..._withdrawn`, the error below says "there have been withdrawals", and a
+    // settled `WITHDRAWN` duplicate is precisely the case that makes the receiver reject the
+    // transfer on signature count. As written, the longer you waited after withdrawing a duplicate,
+    // the more likely you were to be allowed to send a coin that cannot be claimed.
     let are_there_duplicate_coins_withdrawn = wallet.coins.iter().any(|c| {
         c.statechain_id == Some(statechain_id.to_string()) &&
-        (c.status == CoinStatus::WITHDRAWING || c.status == CoinStatus::WITHDRAWING) &&
+        (c.status == CoinStatus::WITHDRAWING || c.status == CoinStatus::WITHDRAWN) &&
         c.duplicate_index > 0
     });
 

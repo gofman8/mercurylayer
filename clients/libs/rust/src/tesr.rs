@@ -2437,6 +2437,11 @@ pub struct ColoredSplitDraft {
 /// 3. **Child viability.** every child clears [`colored_child_floor`], so it can actually fund its
 ///    own two coloured rungs. A child below the floor would co-sign an `SP` that no child ladder can
 ///    hang off — the parent terminalized, the value stranded.
+// [lint] `s0_csv <= SPINE_CSV` reads as an absurd comparison to clippy only because `SPINE_CSV`
+// is currently 0 and the type is unsigned. The guard's MEANING is "the live state's CSV must
+// strictly exceed the spine's", and writing it against the named constant is what keeps it correct
+// if `SPINE_CSV` ever moves off 0 — rewriting it as `== 0` would silently become the wrong test.
+#[allow(clippy::absurd_extreme_comparisons)]
 pub fn build_colored_in_ladder_split(
     rgb: &mercury_rgb::RgbWallet,
     bundle: &TesrBundle,
@@ -4255,6 +4260,11 @@ pub struct InLadderSplitOutput {
 /// The child coins must already be SE-registered (their aggregate is what `SP` pays); `children` is
 /// `(child_coin, owner_exit_address, value_sats)` and is mutated as each leg is co-signed. Value is
 /// conserved: `Σ value == tier_out_total(X_m.out[0], N)`.
+// [lint] `s0_csv <= SPINE_CSV` reads as an absurd comparison to clippy only because `SPINE_CSV`
+// is currently 0 and the type is unsigned. The guard's MEANING is "the live state's CSV must
+// strictly exceed the spine's", and writing it against the named constant is what keeps it correct
+// if `SPINE_CSV` ever moves off 0 — rewriting it as `== 0` would silently become the wrong test.
+#[allow(clippy::absurd_extreme_comparisons)]
 pub async fn in_ladder_split(
     cc: &ClientConfig,
     wallet_name: &str,
@@ -4628,6 +4638,11 @@ fn spine_segment(tip: &SpineTipBundle, live: TesrTier) -> ChildSegment {
 /// `children` is `(child_coin, owner_exit_address, value_sats)`; value is conserved exactly against
 /// `tier_out_total(tip.sp_out_value, n, fee_rate)`. Returns the payees' conveyable pieces and — when
 /// the caller declares [`ChangeLeg::LastIsTip`] — the NEW tip, for [`persist_spine_tip`].
+// [lint] `s0_csv <= SPINE_CSV` reads as an absurd comparison to clippy only because `SPINE_CSV`
+// is currently 0 and the type is unsigned. The guard's MEANING is "the live state's CSV must
+// strictly exceed the spine's", and writing it against the named constant is what keeps it correct
+// if `SPINE_CSV` ever moves off 0 — rewriting it as `== 0` would silently become the wrong test.
+#[allow(clippy::absurd_extreme_comparisons)]
 pub async fn spine_batch_split(
     cc: &ClientConfig,
     wallet_name: &str,
@@ -6094,6 +6109,11 @@ pub async fn adopt_child_bundle(
 /// coin being handed over), and the receiver's `verify_child_bundle` walks it via `cb.ancestors`.
 ///
 /// Returns one bundle per grandchild, in `children` order.
+// [lint] `s0_csv <= SPINE_CSV` reads as an absurd comparison to clippy only because `SPINE_CSV`
+// is currently 0 and the type is unsigned. The guard's MEANING is "the live state's CSV must
+// strictly exceed the spine's", and writing it against the named constant is what keeps it correct
+// if `SPINE_CSV` ever moves off 0 — rewriting it as `== 0` would silently become the wrong test.
+#[allow(clippy::absurd_extreme_comparisons)]
 pub async fn child_in_ladder_split(
     cc: &ClientConfig,
     wallet_name: &str,
