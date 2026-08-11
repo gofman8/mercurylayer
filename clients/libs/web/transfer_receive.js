@@ -228,7 +228,8 @@ const validateEncryptedMessage = async (clientConfig, coin, encMessage, network,
         // later broadcast a lower-CSV state to take the coin back. Refuse rather than mis-verify.
         // (Receive laddered coins with the Rust SDK until the ladder verifier is ported.)
         if (transferMsg.protocol_version >= 2 ||
-            (transferMsg.tesr_ladder !== undefined && transferMsg.tesr_ladder !== null)) {
+            (transferMsg.tesr_ladder !== undefined && transferMsg.tesr_ladder !== null) ||
+            (transferMsg.child_tesr_bundle !== undefined && transferMsg.child_tesr_bundle !== null)) {
             throw new Error("Laddered (TES-R) coin: this client cannot verify the exit ladder — refusing (fail-closed); receive it with the Rust SDK");
         }
 

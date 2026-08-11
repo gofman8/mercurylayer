@@ -3,3 +3,4 @@
 /server/.env
 /token-server/.env
 .DS_Store
+.claude/

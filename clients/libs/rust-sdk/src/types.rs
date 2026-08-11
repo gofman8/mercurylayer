@@ -140,6 +140,16 @@ pub enum SdkError {
         /// `cap - 1`.
         max_recipients: usize,
     },
+    /// A self-describing decoder refused input whose declared format version it does not support —
+    /// named so a caller can tell an unknown-version payload from malformed bytes. (D11: the wire
+    /// encodings are frozen; a decoder must reject a version it cannot interpret rather than
+    /// mis-parse it.)
+    #[error("unsupported {kind} version {found} (this build supports version {supported})")]
+    UnsupportedVersion {
+        kind: &'static str,
+        found: u64,
+        supported: u64,
+    },
 }
 
 /// A cost preview for a send (B4 / refresh economics): the renewal (re-anchor) cost is folded into

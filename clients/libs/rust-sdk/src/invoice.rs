@@ -5,11 +5,18 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::TransferResult;
+use crate::types::{SdkError, TransferResult};
 use crate::wallet::UtexoWallet;
 
 /// Scheme prefix for the encoded invoice string.
 const SCHEME: &str = "utexoinv1";
+
+/// The only invoice wire-format version this build understands. (D11: the encoding is frozen; the
+/// decoder must refuse an unknown version rather than mis-parse it.) The invoice is already
+/// versioned — via this field and the `utexoinv1` scheme prefix — but is not yet checksummed: a
+/// checksum would change every already-issued `utexoinv1<hex(json)>` string, so it is deferred to
+/// the D11 freeze decision and can be added additively only, under a NEW prefix.
+const INVOICE_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct UtexoInvoice {
@@ -37,6 +44,21 @@ pub fn decode_utexo_invoice(s: &str) -> Result<UtexoInvoice> {
         .strip_prefix(SCHEME)
         .ok_or_else(|| anyhow!("not a utexo invoice (missing {SCHEME} prefix)"))?;
     let bytes = hex::decode(body).map_err(|e| anyhow!("bad invoice hex: {e}"))?;
+    // Probe the version FIRST: a future version may carry a layout that would not deserialize into
+    // today's `UtexoInvoice`, so the gate must not depend on the full parse succeeding.
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        version: u8,
+    }
+    let probe: VersionProbe = serde_json::from_slice(&bytes)?;
+    if probe.version != INVOICE_VERSION {
+        return Err(SdkError::UnsupportedVersion {
+            kind: "utexo invoice",
+            found: probe.version as u64,
+            supported: INVOICE_VERSION as u64,
+        }
+        .into());
+    }
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -129,6 +151,29 @@ mod tests {
         };
         let enc = encode_utexo_invoice(&inv).unwrap();
         assert_eq!(decode_utexo_invoice(&enc).unwrap(), inv);
+    }
+
+    #[test]
+    fn rejects_unknown_version() {
+        // A well-formed invoice (valid hex, real JSON) whose only fault is an unknown version.
+        let inv = UtexoInvoice {
+            version: 2,
+            address: "tml1qexample".into(),
+            amount: 1,
+            asset_id: None,
+            memo: None,
+            expiry_unix: None,
+        };
+        let enc = encode_utexo_invoice(&inv).unwrap();
+        let err = decode_utexo_invoice(&enc).unwrap_err();
+        match err.downcast_ref::<SdkError>() {
+            Some(SdkError::UnsupportedVersion { kind, found, supported }) => {
+                assert_eq!(*kind, "utexo invoice");
+                assert_eq!(*found, 2);
+                assert_eq!(*supported, 1);
+            }
+            _ => panic!("expected SdkError::UnsupportedVersion, got {err:?}"),
+        }
     }
 
     #[test]

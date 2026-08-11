@@ -55,6 +55,13 @@ pub fn decode_transfer_address(sc_address: &str) -> core::result::Result<(u8, Pu
 
     let decoded_data = Vec::<u8>::from_base32(&data)?;
 
+    // Bounds check before slicing: a short-but-valid Bech32m payload under the ml/tml HRP would
+    // otherwise trigger an index/range panic on [0], [1..34], [34..67]. 67 = 1 version byte +
+    // 33-byte user pubkey + 33-byte auth pubkey.
+    if decoded_data.len() < 67 {
+        return Err(MercuryError::InvalidStatechainAddressError);
+    }
+
     let version = decoded_data[0];
     let user_pubkey = PublicKey::from_slice(&decoded_data[1..34])?;
     let auth_pubkey = PublicKey::from_slice(&decoded_data[34..67])?;
@@ -156,5 +163,18 @@ mod tests {
         let sc_address = get_sc_address(&mnemonic, 0, network).unwrap();
         let expected_sc_address = "ml1qqpgha2armzyvwwglqty24ztegut27neyvlkpu3894adsgascq96tjqr78gy6adlzsre3fqyrxdx8n68henrd6fzcgfwcltu3sesuh05nvxs2dd888";
         assert_eq!(sc_address, expected_sc_address);
+    }
+
+    #[test]
+    fn decode_transfer_address_short_payload_is_typed_err_not_panic() {
+        // A truncated-but-valid Bech32m string under the testnet HRP: a 3-byte payload decodes
+        // cleanly but is too short for the [0]/[1..34]/[34..67] slices. Must be a typed error, not
+        // a panic.
+        let short = bech32::encode(TESTNET_HRP, [1u8, 2, 3].to_base32(), Variant::Bech32m).unwrap();
+        match decode_transfer_address(&short) {
+            Err(MercuryError::InvalidStatechainAddressError) => {}
+            Err(_) => panic!("expected InvalidStatechainAddressError, got a different error variant"),
+            Ok(_) => panic!("expected an error, but decoding a short payload succeeded"),
+        }
     }
 }
