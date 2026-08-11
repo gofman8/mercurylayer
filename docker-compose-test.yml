@@ -60,8 +60,8 @@ services:
       dockerfile: ./server/Dockerfile
     environment:
       BITCOIN_NETWORK: regtest
-      LOCKHEIGHT_INIT: 1100
-      LH_DECREMENT: 1
+      LOCKHEIGHT_INIT: 1000
+      LH_DECREMENT: 10
       DB_USER: postgres
       DB_PASSWORD: pgpassword
       DB_HOST: postgres

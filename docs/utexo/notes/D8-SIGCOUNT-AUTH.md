@@ -142,9 +142,10 @@ trust assumption" to "closed", once the wiring ships.
 The lever: INV-5 requires each flat-backup hop to decrement by *exactly* `interval`
 (`ladder_decrements_by_interval`, `lib/src/transfer/receiver.rs:371-373`), and that is the defence
 against a sender padding the backup vector with duplicates to inflate `flat_backups` and absorb a
-hidden co-signed state (the attack its own doc-comment names at `:375-380`). `interval` is fetched
-from the coordinator (`clients/libs/rust/src/utils.rs:30`), so **the coordinator defines the
-defence.**
+hidden co-signed state (the attack its own doc-comment names at `:375-380`). `interval` was fetched
+from the coordinator (`clients/libs/rust/src/utils.rs`), so **the coordinator defined the defence.**
+*(Fixed 2026-08-11 — see §7. The rest of this section is kept as the reasoning that got there,
+including the fix that looked obvious and was wrong.)*
 
 The tempting fix is to derive the interval from the conveyed chain itself, since `L_k = L_0 −
 k·interval` looks self-evidencing. **It is circular.** A padded chain with uniform `I/2` decrements
@@ -160,6 +161,38 @@ blocked on it rather than being the cheap win it looked like.
 The "unproven break" rating stands: padding needs backups the SE actually co-signed, and each
 co-signature also increments `sig_count`, so both sides of the census move together. Fix it anyway —
 it is small once WP4 lands, and it removes the coordinator's ability to define a defence.
+
+---
+
+## 7. Addendum 2026-08-11 (later) — (f) is CLOSED
+
+D25 landed the per-network-constant pattern, which was the blocker named above, so (f) was built as
+described: `TesrParams::flat_ladder_params(network)` is now the single source of truth, and the
+prediction held — it was small, and it removed the coordinator's ability to define the defence.
+
+What shipped, beyond the one-line constant this note anticipated:
+
+- **The client refuses**, by name, any coordinator whose `/info/config` disagrees
+  (`clients/libs/rust/src/utils.rs`). The published values are a cross-check, never the source.
+- **The coordinator refuses to boot** on the same disagreement (`server/src/server_config.rs`). This
+  is the necessary companion, not belt-and-braces: once clients refuse, a config typo is a
+  fleet-wide outage, and the difference between a five-second fix and debugging a fleet is whether
+  the process says so at boot with both numbers in the message.
+- **The SDK's `auto_exit_margin_blocks` derivation reads the interval through a `const fn`** instead
+  of the two literals (`SE_INTERVAL_DEPLOYED` / `SE_INTERVAL_DEFAULT`) it used to transcribe, so the
+  margin cannot be sized for a ladder nobody runs.
+- **A CI guard parses the real deployment configs**
+  (`ci-guards/tests/deny_flat_ladder_config_drift.rs`).
+
+**Writing it turned up the drift the note did not predict.** Three of the four config sources in the
+repo disagreed with the table and with each other — `docker-compose-main.yml` at 50000/6,
+`docker-compose-test.yml` at 1100/1, `server/Settings.toml` declaring `testnet` at the regtest
+1000/10. Only the running regtest stack matched, which is exactly why no E2E caught it. That is the
+sharper version of the finding: the coordinator did not merely *define* the defence, the value it
+would have defined it with was already inconsistent across the tree.
+
+Verified live in both directions: the running coordinator (1000/10) is accepted as `regtest`, and a
+coordinator configured one block off refuses to start. Recorded as **D27** in `DECISIONS.md`.
 
 ---
 

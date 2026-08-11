@@ -26,8 +26,39 @@ pub async fn info_config(client_config: &ClientConfig) -> Result<InfoConfig>{
 
     let server_config: ServerConfig = serde_json::from_str(value.as_str())?;
 
-    let initlock = server_config.initlock;
-    let interval = server_config.interval;
+    // [D8(f)] THE COORDINATOR'S COPY IS A CROSS-CHECK, NOT THE SOURCE.
+    //
+    // `interval` is what INV-5 measures every flat-backup hop against, and that check is the defence
+    // against a sender padding the backup vector to inflate `flat_backups` and absorb a hidden
+    // co-signed state. Taking it from the coordinator let the coordinator define the defence.
+    //
+    // Deriving it from the conveyed chain instead would be circular — a padded chain with uniform
+    // `I/2` decrements derives `I/2` and validates against itself — so the value is compiled in per
+    // network, and what the coordinator says must MATCH or the call is refused by name. A mismatch is
+    // not something to paper over: it means this client and that coordinator disagree about what a
+    // valid ladder is, and proceeding would validate against the wrong yardstick.
+    let network = client_config.network.to_string();
+    let (initlock, interval) = match mercurylib::tesr::TesrParams::flat_ladder_params(&network) {
+        Some(p) => p,
+        None => {
+            return Err(anyhow!(
+                "unknown network {:?}: refusing to guess the flat-ladder parameters. `interval` is \
+                 what INV-5 measures every backup hop against, so a wrong value silently changes \
+                 which ladders this wallet accepts.",
+                network
+            ));
+        }
+    };
+    if server_config.initlock != initlock || server_config.interval != interval {
+        return Err(anyhow!(
+            "the coordinator reports initlock={} interval={} but this client compiles in \
+             initlock={} interval={} for network {:?}. These govern INV-5 — the rule that each flat \
+             backup decrements by EXACTLY `interval`, which is what stops a sender padding the chain \
+             to hide a co-signed state — so they cannot be taken on the coordinator's word, and a \
+             disagreement means one of us is validating against the wrong ladder. Refusing.",
+            server_config.initlock, server_config.interval, initlock, interval, network
+        ));
+    }
 
     let number_blocks = 3;
     let mut fee_rate_btc_per_kb = client_config.electrum_client.estimate_fee(number_blocks)?;
@@ -257,6 +288,43 @@ pub fn server_refusal(what: &str, status: u16, body: &str) -> anyhow::Error {
 // a behavioural one and is stated as such; the DEGRADATION ITSELF is pinned behaviourally, by
 // calling `server_message_from_body`, in `server_message_tests` below.
 // ==================================================================================================
+/// [D8(f)] `info_config` looks the flat ladder up by `client_config.network.to_string()`, so the
+/// spelling `bitcoin::Network` produces must be a spelling the table knows — for EVERY variant.
+///
+/// This is pinned because the failure is silent in the wrong direction: an unrecognised spelling
+/// makes `info_config` return `Err`, which bricks every wallet call on that network rather than
+/// weakening anything, and it would not show up until someone actually ran that network. A unit test
+/// over the table alone cannot catch it, because the table is keyed on strings and the bug is in
+/// which string arrives.
+#[cfg(test)]
+mod network_spelling_tests {
+    use bitcoin::Network;
+
+    #[test]
+    fn every_network_variant_resolves_in_the_flat_ladder_table() {
+        // Listed explicitly rather than iterated: `Network` is `#[non_exhaustive]`, so a new variant
+        // must be added here deliberately — which is the point.
+        for net in [Network::Bitcoin, Network::Testnet, Network::Signet, Network::Regtest] {
+            let spelling = net.to_string();
+            assert!(
+                mercurylib::tesr::TesrParams::flat_ladder_params(&spelling).is_some(),
+                "bitcoin::Network::{net:?} renders as {spelling:?}, which the flat-ladder table does \
+                 not know — `info_config` would refuse every coordinator on that network"
+            );
+        }
+    }
+
+    /// And the two live profiles must resolve to the numbers the deployed stacks actually serve.
+    /// `docker-compose-lockbox.yml` (the running regtest stack) sets 1000/10; the mainnet stack sets
+    /// 10000/100. `ci-guards/tests/deny_flat_ladder_config_drift.rs` checks the files themselves.
+    #[test]
+    fn the_live_profiles_resolve_to_the_deployed_numbers() {
+        let f = |n: Network| mercurylib::tesr::TesrParams::flat_ladder_params(&n.to_string());
+        assert_eq!(f(Network::Regtest), Some((1_000, 10)));
+        assert_eq!(f(Network::Bitcoin), Some((10_000, 100)));
+    }
+}
+
 #[cfg(test)]
 mod server_response_reading_tests {
     /// A function body, comments stripped, from a source file in this crate.

@@ -1,6 +1,6 @@
 network = "testnet"
-lockheight_init = 1000
-lh_decrement = 10
+lockheight_init = 10000
+lh_decrement = 100
 batch_timeout = 120 # seconds
 db_user = "postgres"
 db_password = "postgres"

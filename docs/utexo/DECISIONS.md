@@ -345,6 +345,55 @@ precedented — mirror it rather than inventing one, and keep every honest-spine
 
 ---
 
+## D27 — `initlock`/`interval` are compiled in; the coordinator's copy is a cross-check (closes D8(f))
+
+**Decided and IMPLEMENTED 2026-08-11**, unblocked by D25's per-network-constant pattern.
+
+`interval` (`lh_decrement`) is the yardstick INV-5 measures every flat-backup hop against — the rule
+that each hop decrements by EXACTLY `interval`, which is what stops a sender padding the backup
+vector with duplicates to inflate `flat_backups` and absorb a hidden co-signed state. It used to
+arrive from the coordinator's `/info/config`. **That let the coordinator define the defence.**
+
+**The tempting fix — derive it from the conveyed chain — is circular, and that is why D8(f) stayed
+open.** A padded chain with uniform `I/2` decrements derives `I/2` and validates against itself,
+accepting exactly the padding INV-5 exists to stop. The value has to come from somewhere neither the
+sender nor the coordinator chooses.
+
+| network | initlock / interval | hops |
+|---|---|---|
+| `bitcoin` / `mainnet` | 10 000 / 100 | 100 |
+| `testnet` / `testnet3` / `testnet4` / `signet` | **10 000 / 100** (mainnet, per D25) | 100 |
+| `regtest` | 1 000 / 10 | 100 |
+| anything else | **refused** | — |
+
+`TesrParams::flat_ladder_params` is the single source of truth, and **all three consumers now derive
+from it** rather than transcribing it: the client refuses any coordinator that disagrees, the
+coordinator **refuses to boot** if its own env disagrees, and the SDK's `auto_exit_margin_blocks`
+derivation reads the interval through a `const fn` instead of the two literals it used to carry.
+
+**The numbers are the code defaults and the documented 100-hop capacity, not a new choice** — the
+mainnet figure is what `server/src/server_config.rs` already defaulted to and what
+`clients/libs/rust-sdk/src/config.rs` already calls the fail-closed bound on audit [17]. Making the
+value authoritative rather than advisory is the change; re-tuning the margin is not, and would be a
+separate decision.
+
+**Writing it exposed that three of the four config sources in the repo disagreed** — with the table
+and with each other: `docker-compose-main.yml` at 50000/6, `docker-compose-test.yml` at 1100/1, and
+`server/Settings.toml` declaring `testnet` at the regtest 1000/10. Only the running regtest stack
+happened to match, which is why no E2E ever caught it. All four are now aligned and pinned by
+`ci-guards/tests/deny_flat_ladder_config_drift.rs`, which parses the real files.
+
+**Verified live, both directions**: the running coordinator (1000/10) is accepted as `regtest`
+(`clients/libs/rust/tests/live_info_config.rs`), and a coordinator configured one block off refuses
+to start with both numbers in the message.
+
+**The cost, stated plainly:** a config typo is no longer a quiet protocol weakening — it is a
+fleet-wide outage, because every client refuses that coordinator. That is the intended trade, and it
+is why the boot check and the CI guard exist: to make the typo fail at build and boot rather than at
+the first transfer.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB

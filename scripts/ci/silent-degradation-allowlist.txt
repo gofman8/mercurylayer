@@ -414,3 +414,14 @@
 # Deferred: transfer.rs is another session's file this round.
 2	clients/libs/rust-sdk/src/transfer.rs	chain-after-await	.unwrap_or_default();
 #
+#
+# [CATS/V4] The SPINE-TIP half of `colored_child_sids`, added when coloured spine tips became a
+# carrier class. Same function, same single consumer, so the same verdict as the `ctesr-` sibling
+# above: `colored_child_sids` is read only by `unilateral_exit` (verified: the one call site is
+# `wallet.rs:3179`), where "I cannot read this tip's bundle" -> refuse the exit is fail-closed. A
+# coloured walk that cannot be proved must never be broadcast over a carrier.
+#   The sibling's caveat is inherited verbatim and is the thing to re-check if this ever changes:
+#   if a plain-BTC QUARANTINE consumer is added for `spinetip-` rows, dropping would start to mean
+#   "not a carrier" — i.e. spendable as sats — and this entry must become a census (PROVEN vs
+#   UNREADABLE) exactly as `tesr_colour_census` did for the `tesr-` lane.
+1	clients/libs/rust-sdk/src/tokens.rs	ok-question	let tip: mercuryrustlib::tesr::SpineTipBundle = serde_json::from_str(&json).ok()?;

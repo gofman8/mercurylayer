@@ -218,10 +218,24 @@ pub fn tesr_exit_wait_blocks(p: &mercurylib::tesr::TesrParams, child_depth: u32)
 /// literal this derivation replaced, so that this change moves exactly one dimension.
 pub const AUDIT_17_K_MAX: u32 = 14;
 
-/// SE `interval` (`lh_decrement`) of the deployed/regtest profile — `server/Settings.toml:3`.
-pub const SE_INTERVAL_DEPLOYED: u32 = 10;
-/// SE `interval` of the mainnet default profile — `server/src/server_config.rs:69-70`.
-pub const SE_INTERVAL_DEFAULT: u32 = 100;
+/// SE `interval` (`lh_decrement`) of the regtest profile.
+///
+/// [D8(f)] No longer a literal copied from a config file. `TesrParams::flat_ladder_params` is the
+/// single source of truth — the client refuses any coordinator that disagrees with it, and the
+/// coordinator refuses to boot if its own env disagrees — so a margin derived from a stale literal
+/// here would have been sized for a ladder nobody runs.
+pub const SE_INTERVAL_DEPLOYED: u32 = flat_interval_or_panic("regtest");
+/// SE `interval` of the mainnet profile (testnet runs the mainnet schedule per D25).
+pub const SE_INTERVAL_DEFAULT: u32 = flat_interval_or_panic("bitcoin");
+
+/// `flat_ladder_params(net).1` in a `const` context, so the margin below is derived at compile time
+/// rather than transcribed. An unknown network is a compile error, not a silent default.
+const fn flat_interval_or_panic(net: &str) -> u32 {
+    match mercurylib::tesr::TesrParams::flat_ladder_params_const(net) {
+        Some((_, interval)) => interval,
+        None => panic!("unknown network: no flat-ladder interval to derive the exit margin from"),
+    }
+}
 
 /// In-ladder split depth [`auto_exit_margin_blocks_for`] sizes the confirmation budget for.
 ///

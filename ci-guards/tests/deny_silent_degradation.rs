@@ -255,6 +255,50 @@ fn guard_catches_a_swallow_several_lines_below_its_await() {
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
+/// The assert-continuation exemption must be scoped to the assertion's OWN argument list.
+///
+/// The exemption exists because rustfmt wraps `assert!(foo(\n    ..).is_err(), "..")` so the
+/// condition lands on a later line, where the line-scoped `*assert*` filter cannot see it. It was
+/// widened from "the opener line ends in `(`" to a paren-balance test, which is strictly more
+/// permissive — so this pins the boundary: once the assertion's parens CLOSE, a swallow on the next
+/// line is a swallow again, however close it sits to an assert.
+#[test]
+fn the_assert_exemption_stops_at_the_assertions_closing_paren() {
+    let tmp = std::env::temp_dir().join("ci-guard-sd-assert-scope");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let dir = tmp.join("lib");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // INSIDE the argument list, wrapped the way rustfmt actually wraps it -> exempt.
+    std::fs::write(
+        dir.join("offender.rs"),
+        "fn t() {\n\
+         \x20   assert!(super::verify_sig_count_attestation(\n\
+         \x20       \"coin-a\", 4, &nonce, &sig, &xonly, &compressed).is_err(),\n\
+         \x20       \"a stale count must not verify\");\n\
+         }\n",
+    )
+    .unwrap();
+    let (code, output) = run_with(&tmp, Some(Path::new("/dev/null")));
+    assert_eq!(code, 0, "a wrapped assert condition was flagged as a swallow:\n{output}");
+
+    // The assertion has CLOSED; the next line is ordinary code -> still a hit.
+    std::fs::write(
+        dir.join("offender.rs"),
+        "async fn t(pool: &Pool) -> HashSet<String> {\n\
+         \x20   assert!(precondition_holds(pool),\n\
+         \x20       \"the caller must have checked this\");\n\
+         \x20   read_carriers(pool).await.unwrap_or_default()\n\
+         }\n",
+    )
+    .unwrap();
+    let (code, output) = run_with(&tmp, Some(Path::new("/dev/null")));
+    assert_eq!(code, 1, "a real swallow below a closed assert was exempted:\n{output}");
+    assert!(output.contains("await-unwrap_or_default"), "expected the swallow's id:\n{output}");
+
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
 /// A *second*, identical swallow added to a file that already has one allowlisted must fail: the
 /// allowlist pins a COUNT, not merely a spelling.
 #[test]

@@ -139,7 +139,7 @@ MARKER='AUDITED-SWALLOW'
 MARKER_LOOKBACK=6
 # How far back to look for a wrapped `assert!(` opener. 3 covers rustfmt's wrapping of a macro with
 # a condition and a message; deliberately short, so an `.is_err()` far below an assert is still a hit.
-ASSERT_LOOKBACK=3
+ASSERT_LOOKBACK=6
 
 # `record FILE LINENO TEXT ID` — normalise, drop the non-swallows, append to $tmp/hits.
 record() {
@@ -155,15 +155,33 @@ record() {
         '"'*'"'|'"'*'",') return 0 ;;
     esac
     # The `*assert*` exemption above is LINE-scoped, and rustfmt wraps a long assertion so that its
-    # first argument lands on its own line: `assert!(\n    x.is_err(),\n    "...");`. That argument is
-    # still the assertion's condition — a CHECK that panics, never a fallback — so honour the same
-    # exemption when the line is the continuation of an assert opener. Requiring the opener line to
-    # END in `(` keeps this tight: it matches only a macro whose arguments continue below.
+    # condition lands on later lines. That condition is still the assertion's own — a CHECK that
+    # panics, never a fallback — so honour the same exemption for continuation lines.
+    #
+    # This used to require the opener line to END in `(`, which only matches `assert!(` alone on its
+    # line. rustfmt produces plenty of shapes that rule missed, and each one showed up as a false
+    # positive that a reviewer would have had to allowlist by hand:
+    #
+    #     assert!(super::verify_sig_count_attestation(
+    #         "coin-a", 4, &hex::encode(nonce), &sig, &xonly, &compressed).is_err(),
+    #         "a stale count must not verify");
+    #
+    # Decide it structurally instead: find an `assert…!(` opener in the lookback window and require
+    # its parentheses to still be UNBALANCED where the hit sits. That is exactly the condition
+    # "this line is inside the assertion's argument list", so it can never suppress a real swallow
+    # that merely happens to sit below an assertion.
     _from=$((_no - ASSERT_LOOKBACK)); [ "$_from" -lt 1 ] && _from=1
-    if [ "$_no" -gt 1 ] && sed -n "${_from},$((_no - 1))p" "$_file" 2>/dev/null \
-        | grep -qE '(^|[^A-Za-z0-9_])(debug_)?assert(_eq|_ne)?!\($'; then
-        return 0
-    fi
+    _o="$_no"
+    while [ "$_o" -gt "$_from" ]; do
+        _o=$((_o - 1))
+        sed -n "${_o}p" "$_file" 2>/dev/null \
+            | grep -qE '(^|[^A-Za-z0-9_])(debug_)?assert(_eq|_ne)?!\(' || continue
+        _seg="$(sed -n "${_o},$((_no - 1))p" "$_file" 2>/dev/null)"
+        _open="$(printf '%s' "$_seg" | tr -cd '(' | wc -c | tr -d ' ')"
+        _close="$(printf '%s' "$_seg" | tr -cd ')' | wc -c | tr -d ' ')"
+        [ "$_open" -gt "$_close" ] && return 0
+        break
+    done
 
     # inline escape hatch, same marker as the in-file guard in rust-sdk/src/wallet.rs
     _from=$((_no - MARKER_LOOKBACK)); [ "$_from" -lt 1 ] && _from=1

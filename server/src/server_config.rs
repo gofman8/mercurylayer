@@ -201,10 +201,50 @@ impl ServerConfig {
             return None;
         };
 
+        let network = get_env_or_config("network", "BITCOIN_NETWORK");
+        let lockheight_init =
+            get_env_or_config("lockheight_init", "LOCKHEIGHT_INIT").parse::<u32>().unwrap();
+        let lh_decrement =
+            get_env_or_config("lh_decrement", "LH_DECREMENT").parse::<u32>().unwrap();
+
+        // [D8(f)] ONE SOURCE OF TRUTH FOR THE FLAT LADDER — and this is the boot-time half of it.
+        //
+        // Clients no longer take `initlock`/`interval` from `/info/config`; they compile in
+        // `TesrParams::flat_ladder_params(network)` and REFUSE any coordinator whose numbers differ.
+        // `interval` is what INV-5 measures every flat-backup hop against, so letting the coordinator
+        // pick it let the coordinator define the defence against backup-vector padding.
+        //
+        // The consequence for this process is that a misconfigured `LH_DECREMENT` no longer
+        // misconfigures the protocol — it makes the coordinator UNUSABLE, because every client
+        // refuses it. Failing here, at boot, with the two numbers side by side, is the difference
+        // between a five-second fix and debugging a fleet of clients that each refuse by name.
+        //
+        // This check found three disagreeing configs when it was written: `docker-compose-main.yml`
+        // (50000/6), `docker-compose-test.yml` (1100/1) and this repo's `Settings.toml` (testnet at
+        // 1000/10, i.e. the regtest profile). All three are now aligned.
+        match mercurylib::tesr::TesrParams::flat_ladder_params(&network) {
+            None => panic!(
+                "network {network:?} is not a network this build knows how to run. \
+                 `initlock`/`interval` govern INV-5, so there is no safe default to fall back to."
+            ),
+            Some((want_init, want_interval)) => {
+                if lockheight_init != want_init || lh_decrement != want_interval {
+                    panic!(
+                        "REFUSING TO START: this coordinator is configured lockheight_init={} \
+                         lh_decrement={}, but network {:?} requires {}/{}. Clients compile these in \
+                         and refuse any coordinator that disagrees (D8(f)), so serving these values \
+                         would make every transfer fail at `info/config`. Fix LOCKHEIGHT_INIT / \
+                         LH_DECREMENT (or Settings.toml) to match, or run a different network.",
+                        lockheight_init, lh_decrement, network, want_init, want_interval
+                    );
+                }
+            }
+        }
+
         ServerConfig {
-            network: get_env_or_config("network", "BITCOIN_NETWORK"),
-            lockheight_init: get_env_or_config("lockheight_init", "LOCKHEIGHT_INIT").parse::<u32>().unwrap(),
-            lh_decrement: get_env_or_config("lh_decrement", "LH_DECREMENT").parse::<u32>().unwrap(),
+            network,
+            lockheight_init,
+            lh_decrement,
             batch_timeout: get_env_or_config("batch_timeout", "BATCH_TIMEOUT").parse::<u32>().unwrap(),
             enclaves: get_env_or_config_enclave("enclaves", "ENCLAVES"),
             db_user: get_env_or_config("db_user", "DB_USER"),

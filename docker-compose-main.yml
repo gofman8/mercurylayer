@@ -73,8 +73,8 @@ services:
       - token-server-v2
     environment:
       BITCOIN_NETWORK: mainnet
-      LOCKHEIGHT_INIT: 50000
-      LH_DECREMENT: 6
+      LOCKHEIGHT_INIT: 10000
+      LH_DECREMENT: 100
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_HOST: db_server

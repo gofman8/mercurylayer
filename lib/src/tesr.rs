@@ -172,11 +172,33 @@ pub fn csv_blocks(blocks: u16) -> Sequence {
     Sequence(blocks as u32)
 }
 
+/// Byte-wise `==` for `&str` usable from `const fn`. `str`'s `PartialEq` is not const, and neither is
+/// `to_ascii_lowercase`, so the const table below matches canonical (already-lowercased) names.
+pub const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Protocol parameters for the TES-R ladder — the relative-timelock schedule the wallet uses to size
 /// each tier and to decide when to renew or roll over. Mainnet defaults are from
-/// `docs/utexo/PROTOCOL.md` §5.2; in production the SE serves them via `/info/config` so a receiver
-/// can detect a per-victim parameter split, but they are pure protocol constants (no fund is at
-/// stake in getting them "wrong" — only exit-wait length and renewal cadence).
+/// `docs/utexo/PROTOCOL.md` §5.2.
+///
+/// **These are compiled in per network ([`Self::for_network`], D7/D25) and NOT taken from the SE.**
+/// The CSV schedule is the mild half: getting it "wrong" costs exit-wait length and renewal cadence,
+/// not funds. The flat-ladder half ([`Self::flat_ladder_params`], D8(f)) is the sharp one — `interval`
+/// is the yardstick INV-5 measures every backup hop against, so a coordinator that could choose it
+/// could choose the defence against backup-vector padding. `/info/config` still publishes both, but
+/// only as a cross-check the client refuses to proceed past on mismatch.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TesrParams {
     /// State-tier initial CSV `D0` (blocks): the head start the current owner has over a stale state.
@@ -276,6 +298,53 @@ impl TesrParams {
                  ladder. Supported: bitcoin/mainnet, testnet/testnet3/testnet4/signet, regtest."
             )
         })
+    }
+
+    /// **[D8(f)] The FLAT-lane ladder parameters for this network — compiled in, not fetched.**
+    ///
+    /// `initlock` is the deposit's absolute head start; `interval` is the decrement each transfer
+    /// takes off it, so the flat backup chain is `L_k = L_0 − k·interval`.
+    ///
+    /// **Why these must not come from the coordinator.** INV-5 requires every hop to decrement by
+    /// EXACTLY `interval` (`ladder_decrements_by_interval`, `transfer/receiver.rs`), and that is the
+    /// defence against a sender padding the backup vector with duplicates to inflate `flat_backups`
+    /// and absorb a hidden co-signed state. If the coordinator supplies `interval`, the coordinator
+    /// defines the defence.
+    ///
+    /// **And deriving it from the conveyed chain does not work** — that was the tempting fix and it
+    /// is circular: a padded chain with uniform `I/2` decrements derives `I/2` and validates against
+    /// itself, accepting exactly the padding INV-5 exists to stop. The value has to come from
+    /// somewhere neither the sender nor the coordinator chooses, which is here.
+    ///
+    /// Regtest keeps the small numbers so E2E lifecycles stay fast, exactly as the CSV schedule does.
+    pub fn flat_ladder_params(network: &str) -> Option<(u32, u32)> {
+        Self::flat_ladder_params_const(&network.to_ascii_lowercase())
+    }
+
+    /// [`Self::flat_ladder_params`] in a `const` context, so downstream constants (the SDK's
+    /// `auto_exit_margin_blocks` derivation) are computed at compile time from this table instead of
+    /// transcribing its numbers. Case-sensitive — `flat_ladder_params` is the lowercasing wrapper.
+    pub const fn flat_ladder_params_const(network: &str) -> Option<(u32, u32)> {
+        // `match` on `&str` is not available in `const fn` (str's PartialEq is not const), hence the
+        // explicit chain over `const_str_eq`.
+        if const_str_eq(network, "bitcoin")
+            || const_str_eq(network, "mainnet")
+            // D25: testnet/signet deliberately run the MAINNET schedule, so the timings that ship
+            // are the timings that were rehearsed.
+            || const_str_eq(network, "testnet")
+            || const_str_eq(network, "testnet3")
+            || const_str_eq(network, "testnet4")
+            || const_str_eq(network, "signet")
+        {
+            // 10 000-block head start, 100 blocks per hop => 100 hops of ladder capacity, the figure
+            // `clients/libs/rust-sdk/src/config.rs` documents as the fail-closed bound on audit [17].
+            return Some((10_000, 100));
+        }
+        if const_str_eq(network, "regtest") {
+            // Same 100-hop capacity, scaled down so an E2E lifecycle mines in seconds.
+            return Some((1_000, 10));
+        }
+        None
     }
 
     /// State CSV at state-count `k`: `D0 − k·δ`, clamped to the floor.
@@ -679,6 +748,83 @@ pub fn cosign_tier_request(
     )?;
 
     calculate_musig_session(coin, hash, encoded_unsigned_tx)
+}
+
+#[cfg(test)]
+mod flat_ladder_params_tests {
+    use super::*;
+
+    /// The client's whole D8(f) defence rests on this being a total, explicit function: an unknown
+    /// network must be `None` so the caller refuses, never a silently-defaulted `interval`.
+    #[test]
+    fn unknown_networks_are_none_not_defaulted() {
+        for net in ["", "mainet", "bitcoin-testnet", "liquid", "BITCOIN_TESTNET", "regtest2"] {
+            assert!(
+                TesrParams::flat_ladder_params(net).is_none(),
+                "network {net:?} must not resolve to a flat ladder — a guessed `interval` silently \
+                 changes which backup chains INV-5 accepts"
+            );
+        }
+    }
+
+    #[test]
+    fn known_networks_resolve_and_are_case_insensitive() {
+        assert_eq!(TesrParams::flat_ladder_params("bitcoin"), Some((10_000, 100)));
+        assert_eq!(TesrParams::flat_ladder_params("MainNet"), Some((10_000, 100)));
+        assert_eq!(TesrParams::flat_ladder_params("regtest"), Some((1_000, 10)));
+        assert_eq!(TesrParams::flat_ladder_params("REGTEST"), Some((1_000, 10)));
+    }
+
+    /// D25 applies to the flat ladder too: testnet/signet rehearse the mainnet numbers, so the
+    /// timings that ship are the timings that were exercised.
+    #[test]
+    fn testnet_and_signet_run_the_mainnet_flat_ladder() {
+        let mainnet = TesrParams::flat_ladder_params("bitcoin").unwrap();
+        for net in ["testnet", "testnet3", "testnet4", "signet"] {
+            assert_eq!(
+                TesrParams::flat_ladder_params(net),
+                Some(mainnet),
+                "{net} must rehearse the mainnet flat ladder (D25)"
+            );
+        }
+    }
+
+    /// `interval` must divide `initlock`, and the quotient is the ladder's hop capacity — the figure
+    /// `clients/libs/rust-sdk/src/config.rs` calls the fail-closed bound on audit [17]. A ragged
+    /// division would leave a final hop shorter than `interval`, which INV-5 rejects by construction.
+    #[test]
+    fn every_profile_divides_evenly_into_100_hops() {
+        for net in ["bitcoin", "testnet", "signet", "regtest"] {
+            let (initlock, interval) = TesrParams::flat_ladder_params(net).unwrap();
+            assert!(interval > 0, "{net}: interval 0 would make every hop a no-op");
+            assert_eq!(
+                initlock % interval,
+                0,
+                "{net}: initlock {initlock} is not a whole number of {interval}-block hops"
+            );
+            assert_eq!(initlock / interval, 100, "{net}: expected 100 hops of capacity");
+        }
+    }
+
+    /// The const path and the runtime path must not drift — the SDK's exit margin is derived from
+    /// the former while the client's refusal uses the latter.
+    #[test]
+    fn const_and_runtime_paths_agree() {
+        for net in ["bitcoin", "testnet", "testnet3", "testnet4", "signet", "regtest"] {
+            assert_eq!(
+                TesrParams::flat_ladder_params_const(net),
+                TesrParams::flat_ladder_params(net),
+                "{net}: const and runtime tables disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn const_str_eq_matches_std() {
+        for (a, b) in [("a", "a"), ("a", "b"), ("", ""), ("ab", "a"), ("a", "ab"), ("regtest", "regtes")] {
+            assert_eq!(const_str_eq(a, b), a == b, "const_str_eq({a:?}, {b:?})");
+        }
+    }
 }
 
 #[cfg(test)]
