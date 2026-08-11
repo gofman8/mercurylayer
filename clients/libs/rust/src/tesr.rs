@@ -5761,14 +5761,59 @@ pub async fn verify_conveyed_child(
     cb: &ChildTesrBundle,
 ) -> Result<u64> {
     use electrum_client::bitcoin::Txid;
-    // F.spk from chain (also proves F is known to the chain; unspent/confirmed is enforced by the
-    // terminality of the parent — a terminal parent's only live spend is the disclosed T).
+    // F.spk from chain (also proves F is known to the chain).
     let f_txid = Txid::from_str(&cb.parent.f_txid)
         .map_err(|_| anyhow::anyhow!("bad parent F txid"))?;
     let f_tx = cc
         .electrum_client
         .transaction_get(&f_txid)
         .map_err(|_| anyhow::anyhow!("parent F {} not found on chain", cb.parent.f_txid))?;
+
+    // ── [C-10(e)] IS THE PARENT'S FUNDING OUTPOINT STILL LIVE? ASK, DO NOT ASSUME. ────────────────
+    //
+    // This used to read "unspent/confirmed is enforced by the terminality of the parent — a terminal
+    // parent's only live spend is the disclosed T". That is an argument about what a HONEST parent
+    // does, offered in place of a check, and the audit named the gap it leaves: a sender can convey a
+    // child whose parent ladder is ALREADY BROADCAST, and the census still balances because nothing
+    // in the count depends on whether anything has confirmed.
+    //
+    // Two distinct failures, and only one of them is recoverable:
+    //   * **F spent by something that is NOT the disclosed trigger** — every tier below T is
+    //     permanently unconfirmable. The child being offered is worthless and no later pass can
+    //     change that. Refuse, and say what spent it.
+    //   * **F spent BY the disclosed trigger** — the ladder is live and the RELATIVE clocks are
+    //     already counting. That is not fraud in itself, but the receiver is being handed a shorter
+    //     exit window than an un-triggered child, and the difference is invisible in the bundle. It
+    //     is surfaced by name so a claim cannot silently inherit someone else's head start.
+    //
+    // `?` is load-bearing: a backend that cannot answer "what spent F?" must NOT be read as "nothing
+    // did". That is the same rule `watch_pass` and the spine-tip walk already hold.
+    match f_spender(&cc.electrum_client, &cb.parent.f_txid, cb.parent.f_vout)? {
+        None => {}
+        Some(sp) if sp == cb.parent.trigger.txid => {
+            return Err(anyhow::anyhow!(
+                "refusing child {}: its parent's funding outpoint {}:{} is ALREADY SPENT by the \
+                 parent's own trigger {}. The ladder is live and every relative timelock below it is \
+                 already counting, so this child's exit window is shorter than its bundle implies — \
+                 by an amount only the sender knows. Accepting it would inherit a head start that \
+                 was not disclosed. If this conveyance is legitimate, the sender must exit or \
+                 re-anchor the parent rather than hand over a running clock.",
+                cb.child_statechain_id, cb.parent.f_txid, cb.parent.f_vout, cb.parent.trigger.txid
+            ));
+        }
+        Some(sp) => {
+            return Err(anyhow::anyhow!(
+                "refusing child {}: its parent's funding outpoint {}:{} was spent by {sp}, which is \
+                 NOT this parent's trigger {}. Every tier below that trigger is permanently \
+                 unconfirmable, so the child being conveyed can never be exited — this is worthless \
+                 material, not a slow one, and no later attempt will change it.",
+                cb.child_statechain_id,
+                cb.parent.f_txid,
+                cb.parent.f_vout,
+                cb.parent.trigger.txid
+            ));
+        }
+    }
     let f_out = f_tx
         .output
         .get(cb.parent.f_vout as usize)
@@ -19330,6 +19375,41 @@ mod exit_chain_length_cap_tests {
 
         // ---- ADMISSION — the conveyed-child lane, ABOVE the structural bind ----------------------
         let admit = cut("\npub async fn verify_conveyed_child(");
+        // [C-10(e)] F'S LIVENESS IS ASKED, NOT ARGUED. This site used to carry the sentence
+        // "unspent/confirmed is enforced by the terminality of the parent" in place of a check —
+        // an argument about what an HONEST parent does, which is not a property of a CONVEYED one.
+        // A sender could hand over a child whose parent ladder was already broadcast (clocks
+        // running, window shorter than the bundle implies) or whose F had been spent by something
+        // else entirely (every tier permanently void), and the census balanced either way because
+        // no term in it depends on what has confirmed.
+        assert!(
+            admit.contains("f_spender(&cc.electrum_client"),
+            "the conveyed-child admission must ASK what spent the parent's funding outpoint; an \
+             argument that a terminal parent only spends it with T is not a check on a bundle the \
+             sender chose"
+        );
+        assert!(
+            !admit.contains("unspent/confirmed is enforced by the terminality of the parent"),
+            "…and the sentence that stood in for that check must not come back"
+        );
+        // Both spent-cases must refuse, and they must refuse DIFFERENTLY: one is a running clock,
+        // the other is dead material, and telling a user those are the same is telling them wrong.
+        // Substrings chosen to sit on ONE source line — rustfmt wraps these messages, so a phrase
+        // that reads contiguously in the rendered error may not exist contiguously in the file.
+        assert!(
+            admit.contains("ALREADY SPENT by the"),
+            "the trigger-spent case (clocks already running) must be refused by name"
+        );
+        assert!(
+            admit.contains("NOT this parent's trigger"),
+            "the foreign-spender case (permanently void) must be refused by name, distinctly from \
+             the trigger-spent one"
+        );
+        assert!(
+            admit.find("f_spender(&cc.electrum_client").unwrap() < admit.find("enforce_exit_chain_length(").unwrap(),
+            "liveness is one RPC and settles whether the material is worth anything at all; it \
+             belongs ahead of the structural battery, not after it"
+        );
         assert!(
             admit.contains("enforce_exit_chain_length("),
             "the hostile lane — a whole ChildTesrBundle off the mailbox with an attacker-length \
