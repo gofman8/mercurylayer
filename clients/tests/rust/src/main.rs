@@ -619,6 +619,25 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // [WP2] AN UNKNOWN TEST NUMBER MUST ERROR, NOT FALL THROUGH.
+    //
+    // Everything below is the legacy default sequence, and it runs when NO test env var is set —
+    // a bare `cargo run`. But the dispatch above is a chain of `if VAR == Ok("N") { …; return }`,
+    // so a caller who sets `SDK_E2E=6` (or any number with no branch) matches nothing, drops
+    // through to HERE, runs tb01..tv01 and prints "completed successfully" — a PASS attributed to a
+    // test that does not exist. The full-suite runner feeds 21 such numbers, so its green tally was
+    // measuring the same ten legacy tests over and over. Reaching this point with a test var SET is
+    // therefore never "run the default"; it is "the number you asked for has no handler".
+    for var in ["SDK_E2E", "RGB_E2E"] {
+        if let std::result::Result::Ok(n) = std::env::var(var) {
+            return Err(anyhow::anyhow!(
+                "{var}={n} matched no test branch. This is an UNKNOWN test id, not the default \
+                 suite — refusing to silently run the legacy tb01..tv01 sequence and report it as \
+                 '{var}={n} completed successfully'. Add a branch for it, or fix the number."
+            ));
+        }
+    }
+
     tb01_simple_transfer::execute().await?;
     tb02_transfer_address_reuse::execute().await?;
     tb03_simple_atomic_transfer::execute().await?;
