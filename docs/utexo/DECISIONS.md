@@ -477,6 +477,31 @@ neighbouring pair; a co-sign attempt on that coin → **410**, while a no-budget
 
 ---
 
+## D29 — The coloured re-anchor is **CR-D, a coloured de-trigger** (closes the CR-A/B/C spike)
+
+**Decided 2026-08-11** on the evidence in `COLOURED-SPINE-REANCHOR-SCOPE.md` §2.
+
+The question as originally posed — "which of CR-A/CR-B/CR-C, or an SE-assisted variant?" — had a
+false premise. D1 assumed the coloured re-anchor means "colour the refresh transaction", and that is
+**not buildable**: `refresh` routes through `withdraw`, an RGB-unaware builder that refuses carriers
+one level up. The three-design menu was also not exhaustive.
+
+**CR-D — a coloured DE-TRIGGER — needs no RGB rival over `F` at all.** Two transactions, zero CSV
+wait, no SE change, and it reuses a role tag that is already allocated (`TierRole::Detrigger = 0x06`).
+It dominates CR-B on every axis and removes most of CR-C's motivation.
+
+**Consequence for the programme: G2 no longer selects the product.** It was scoped as the experiment
+that would choose between designs; with CR-D available it decides only whether CR-A's
+one-transaction form is *also* available. Build CR-D; run G2 as an optimisation question, not a gate.
+
+**What changed under this decision since the spike was written:** its "single largest risk" was
+BLOCKER 1, a live theft path in the plain spine. That is closed — the Σ-payload law on `SP` and the
+relay-aware supersession race (D26, both halves), each with an attack test. **BLOCKER 2 (W1, the
+fee-bump workstream) is now the largest**, and its open question is priced in
+`notes/CPFP-WHO-FUNDS-IT.md`.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB

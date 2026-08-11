@@ -59,6 +59,23 @@ them and produces the number that un-withdraws it.
 
 ### 0.1 Two blockers, both found by the adversarial pass, both ahead of any coloured work
 
+> **BLOCKER 1 IS CLOSED (2026-08-11).** Both premises of the attack were removed, and both are now
+> exercised rather than argued:
+>   * the intermediate `SP` carries a **Σ-payload law** (`verify_conveyed_child`'s ancestor loop),
+>     so the committed fee is no longer sender-chosen. Reproduced end to end as an attack test —
+>     the starved slot is refused with *"Σ over its payload outputs is 990, but its funding of
+>     198530 at 2 sat/vB requires exactly 198040"* — and the rig starves the slot AFTER the builder,
+>     because the honest builder refuses it and an attacker does not use the honest builder;
+>   * the supersession race no longer **presumes** relayability. It reads a
+>     `LiveRival { csv, relayable, implied_fee, vsize }` and refuses when the live tier sits under
+>     the relay floor, so the "it can never confirm" proof stops being a maturity argument about a
+>     transaction that cannot enter a mempool. Recorded as D26 (both halves).
+>
+> The verdict below still names BLOCKER 1 as "the single largest risk"; that sentence is now
+> historical. **BLOCKER 2 (W1, the fee-bump workstream) is unchanged and is now the largest** — its
+> open design question, "who funds the bump", is analysed and priced in
+> `notes/CPFP-WHO-FUNDS-IT.md` and awaits an owner decision.
+
 **BLOCKER 1 — a theft path in the plain spine, live today (§1.8).** The intermediate spine `SP` — the
 tier this whole document is about — is the single transaction in `verify_child_bundle` with **neither
 a Σ-payload law nor a payload-count law** (`clients/libs/rust/src/tesr.rs:9590-9601`; the comment
