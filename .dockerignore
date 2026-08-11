@@ -1,0 +1,42 @@
+# Build context exclusions — the repo root is the context for `server/Dockerfile`, so WITHOUT this
+# file every `docker build` ships the entire working tree to the daemon.
+#
+# That is not a tidiness issue. `target/` alone is ~153 GB on a developer machine, and Docker
+# Desktop's VM disk is ~39 GB, so the build fills the VM and dies with
+# `no space left on device` — and `docker compose build` STILL EXITS 0, so the failure looks like a
+# successful no-op and the old image keeps running. That is exactly how the coordinator went on
+# serving a 7-week-old binary while three "rebuilds" reported success.
+#
+# Nothing here is needed by any Dockerfile: `server/Dockerfile` copies `Cargo.lock`, `server/`,
+# `lib/` and `Rocket.toml`, and builds inside the image.
+
+# Rust build output — the big one.
+target/
+**/target/
+**/*.rs.bk
+
+# Version control and its history.
+.git/
+.gitignore
+
+# Node / web client dependencies and builds.
+node_modules/
+**/node_modules/
+**/dist/
+**/build/
+
+# Local databases, wallets and logs — never wanted in an image, and some contain keys.
+*.db
+*.db-journal
+*.sqlite
+*.log
+rgb-data-*/
+
+# Editor/OS noise.
+.DS_Store
+.vscode/
+.idea/
+
+# Docs and scratch: not used by any build, and the largest non-target directories.
+docs/
+*.md

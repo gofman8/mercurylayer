@@ -1,2 +1,11 @@
+# Pinned to the toolchain this workspace is actually TESTED against.
+#
+# Was 1.83.0, which predates the stabilisation of edition 2024 (1.85). A dependency has since moved
+# to that edition, so the containerised build — whose WORKDIR is `server/`, and which therefore
+# honours this file while a host `cargo build` from the repo root does not — failed with
+# "feature `edition2024` is required" while every host build and the whole test suite were green.
+#
+# That asymmetry is the thing to keep in mind when changing this: the host and the image do NOT
+# resolve the same toolchain unless this pin says so.
 [toolchain]
-channel = "1.83.0"
+channel = "1.96.0"
