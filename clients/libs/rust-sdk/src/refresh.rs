@@ -66,6 +66,116 @@ impl UtexoWallet {
     /// `fee_rate` (sat/vB) is capped at the client's `max_fee_rate`; `None` uses the SE-quoted rate.
     /// Errors if the coin is not `CONFIRMED`, carries an RGB allocation, or is too small to cover
     /// the fee above the dust floor.
+    /// **[CR-D / D29] Re-anchor a COLOURED carrier — the renewal primitive a coloured coin had none of.**
+    ///
+    /// [`Self::refresh`] routes through `withdraw`, which is RGB-unaware, so it refuses carriers: it
+    /// would move the sats and destroy the allocation. That refusal left a coloured coin with **no
+    /// renewal path at all**, so its life was bounded and ended in a forced exit — the gap D30 cites
+    /// when it keeps `colored_ladder` off.
+    ///
+    /// CR-D closes it without needing an RGB rival over `F`:
+    ///
+    /// 1. broadcast the **trigger** — already co-signed, already part of the ladder, no new SE call;
+    /// 2. co-sign and broadcast a **coloured de-trigger** — a fresh spend of `T`'s payload with the
+    ///    relative timelock disabled, carrying a valid RGB state transition to the owner.
+    ///
+    /// Two transactions, **zero CSV wait**, no SE change. The de-trigger has no timelock while every
+    /// pre-signed extension needs `E ≥ E_floor` confirmations, so it confirms first and kills the
+    /// old ladder — which is exactly what makes this a re-anchor rather than an exit.
+    ///
+    /// Returns the de-trigger's txid. The allocation lands on its payload output; the coin's ladder
+    /// is spent and must be re-established from the new outpoint, the same as after any re-anchor.
+    pub async fn colored_reanchor(&self, statechain_id: &str) -> Result<String> {
+        // Serialize against the background watcher, the same lock `reanchor` takes.
+        let _guard = self.inner.wallet_lock.lock().await;
+
+        let bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("coin {statechain_id} has no TES-R ladder to re-anchor"))?;
+        if !bundle.is_colored() {
+            return Err(anyhow!(
+                "coin {statechain_id} has a PLAIN ladder — use `refresh`, whose uncoloured \
+                 re-anchor is correct for it. CR-D needs coloured material to build from."
+            ));
+        }
+
+        let record = self.record().await?;
+        let mut coin = record
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(statechain_id) && c.duplicate_index == 0)
+            .ok_or_else(|| anyhow!("no coin with statechain id {statechain_id}"))?
+            .clone();
+        let to_address = mercurylib::transaction::get_user_backup_address(
+            &coin,
+            self.inner.config.network.to_string(),
+        )
+        .map_err(|_| anyhow!("cannot derive this wallet's backup address"))?;
+
+        // TWO PHASES, and the split is forced rather than stylistic: the RGB engine's resolver is
+        // `!Sync`, so a guard held across an `await` stops this whole future being `Send` and it can
+        // no longer run in the background watcher's task. Colour first (engine only, no network),
+        // then co-sign (network only, no engine). Free — a tier's txid is stable across signing.
+        let draft = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().ok_or_else(|| {
+                anyhow!("a coloured re-anchor needs the RGB engine, but none is configured")
+            })?;
+            tokio::task::block_in_place(|| {
+                mercuryrustlib::tesr::build_colored_detrigger(w, &bundle, &to_address)
+            })?
+        };
+
+        let detrigger_hex = mercuryrustlib::tesr::cosign_colored_detrigger(
+            &self.inner.cc,
+            &mut coin,
+            &bundle,
+            draft,
+            &to_address,
+        )
+        .await?;
+
+        // ORDER IS LOAD-BEARING. The de-trigger spends the trigger's payload output, so the trigger
+        // must be in a mempool first or the de-trigger has a missing input. Broadcast it if it is not
+        // already known — a re-anchor of an ALREADY-triggered coin is legitimate (that is the hostile
+        // -trigger case this de-trigger was designed to collapse), and re-broadcasting a known tx
+        // would be an error rather than a no-op on some backends.
+        let trigger_hex = bundle.trigger.signed_tx.clone();
+        {
+            use electrum_client::ElectrumApi;
+            let txid = bundle.trigger.txid.parse::<bitcoin::Txid>()
+                .map_err(|e| anyhow!("stored trigger txid is unusable: {e}"))?;
+            let already = self.inner.cc.electrum_client.transaction_get(&txid).is_ok();
+            if !already {
+                let raw = hex::decode(&trigger_hex)
+                    .map_err(|e| anyhow!("stored trigger hex does not decode: {e}"))?;
+                self.inner
+                    .cc
+                    .electrum_client
+                    .transaction_broadcast_raw(&raw)
+                    .map_err(|e| anyhow!("could not broadcast the trigger to re-anchor: {e}"))?;
+            }
+        }
+
+        let raw = hex::decode(&detrigger_hex)
+            .map_err(|e| anyhow!("coloured de-trigger hex does not decode: {e}"))?;
+        let txid = {
+            use electrum_client::ElectrumApi;
+            self.inner.cc.electrum_client.transaction_broadcast_raw(&raw).map_err(|e| {
+                anyhow!(
+                    "the coloured de-trigger was co-signed but could not be broadcast ({e}). The SE \
+                     co-sign is already spent, so retry the BROADCAST rather than rebuilding — \
+                     rebuilding would burn a second irreversible slot."
+                )
+            })?
+        };
+        Ok(txid.to_string())
+    }
+
     pub async fn refresh(&self, statechain_id: &str, fee_rate: Option<f64>) -> Result<RefreshResult> {
         self.reanchor(statechain_id, fee_rate).await
     }
@@ -151,9 +261,39 @@ impl UtexoWallet {
             let amount = coin.amount.unwrap_or_default() as u64;
             let carriers = self.unspendable_as_btc_outpoints().await?;
             if crate::wallet::coin_outpoint(coin).map_or(false, |o| carriers.contains(&o)) {
-                return Err(anyhow!(
-                    "coin {statechain_id} carries an RGB allocation; refreshing it as a plain re-anchor would destroy the tokens — move the asset off this coin first"
-                ));
+                // ── [CR-D / D29] A COLOURED CARRIER HAS A RE-ANCHOR NOW; A PLAIN ONE STILL DOES NOT ──
+                //
+                // The refusal below is correct and stays correct for what it describes: this path
+                // re-anchors through `withdraw`, an RGB-UNAWARE builder, so driving a carrier through
+                // it moves the sats and destroys the allocation.
+                //
+                // What changed is that "carrier" is no longer one thing. A carrier whose ladder is
+                // COLOURED can be re-anchored by CR-D — broadcast the trigger (already co-signed,
+                // already part of the ladder), then a coloured de-trigger carrying a valid state
+                // transition. Two transactions, zero CSV wait, no SE change. So the carrier check
+                // now DISPATCHES instead of refusing everything it recognises.
+                //
+                // The distinction is load-bearing in both directions. Sending a coloured carrier to
+                // `withdraw` burns the asset; sending a PLAIN carrier to CR-D finds no coloured
+                // material to build from. Each is refused by the arm that can name why.
+                let bundle = mercuryrustlib::tesr::load(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    statechain_id,
+                )
+                .await?;
+                match bundle {
+                    Some(b) if b.is_colored() => {
+                        return Err(anyhow!(
+                            "coin {statechain_id} is a COLOURED carrier: its re-anchor is CR-D                              (`build_colored_detrigger` + `cosign_colored_detrigger`), not this                              plain path, which routes through the RGB-unaware `withdraw` and would                              destroy the allocation. Call `colored_reanchor` instead."
+                        ));
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "coin {statechain_id} carries an RGB allocation on a PLAIN ladder;                              refreshing it as a plain re-anchor would destroy the tokens, and CR-D                              cannot help — a coloured de-trigger needs a coloured ladder to build                              from. Move the asset off this coin first."
+                        ));
+                    }
+                }
             }
 
             // 2. Deterministic fee: the re-anchor tx is 1-in-1-out P2TR (BACKUP_TX_VBYTES = 112 vB).
@@ -402,5 +542,87 @@ mod tests {
         let rebate = fee(1.0) + crate::transfer::DUST_LIMIT; // 112 + 330 = 442
         assert_eq!(rebate, 442);
         assert_eq!((amount - fee(1.0)) + rebate, amount + crate::transfer::DUST_LIMIT);
+    }
+}
+
+/// [CR-D] The coloured re-anchor's wiring rules, pinned in source.
+#[cfg(test)]
+mod crd_wiring_tests {
+    fn src() -> String {
+        include_str!("refresh.rs").to_string()
+    }
+    fn fn_src(name: &str) -> String {
+        let s = src();
+        let at = s.find(name).expect("function exists");
+        let end = s[at..].find("\n    /// ").map(|e| at + e).unwrap_or(s.len());
+        s[at..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// **Order is the property.** The de-trigger spends the trigger's payload output, so a
+    /// de-trigger broadcast before its trigger has a missing input. The trigger must go first.
+    #[test]
+    fn the_trigger_is_broadcast_before_the_detrigger() {
+        let f = fn_src("pub async fn colored_reanchor(");
+        let trig = f.find("could not broadcast the trigger").expect("trigger broadcast");
+        let detrig = f.find("coloured de-trigger hex does not decode").expect("de-trigger decode");
+        assert!(trig < detrig, "the trigger must be broadcast first or the de-trigger has no input");
+    }
+
+    /// An ALREADY-triggered coin is the case this de-trigger was designed for — collapsing a hostile
+    /// trigger. Re-broadcasting a known transaction is an error on some backends rather than a
+    /// no-op, so the trigger broadcast must be conditional on it not already being known.
+    #[test]
+    fn an_already_triggered_coin_does_not_re_broadcast() {
+        let f = fn_src("pub async fn colored_reanchor(");
+        assert!(f.contains("transaction_get(&txid).is_ok()"), "must check first");
+        assert!(f.contains("if !already"), "and only broadcast when it is NOT already known");
+    }
+
+    /// A failed broadcast AFTER the co-sign must tell the caller to retry the BROADCAST, not rebuild
+    /// — the SE slot is already spent and rebuilding burns a second irreversible one.
+    #[test]
+    fn a_failed_broadcast_after_cosign_says_retry_not_rebuild() {
+        let f = fn_src("pub async fn colored_reanchor(");
+        assert!(
+            f.contains("retry the BROADCAST rather than rebuilding"),
+            "the post-co-sign failure must not invite a rebuild"
+        );
+    }
+
+    /// The engine guard must not be held across an await: the RGB resolver is `!Sync`, and holding it
+    /// stops the whole future being `Send`, which takes this out of the background watcher's task.
+    #[test]
+    fn the_engine_guard_is_scoped_and_does_not_straddle_an_await() {
+        let f = fn_src("pub async fn colored_reanchor(");
+        let block_start = f.find("let draft = {").expect("two-phase block");
+        let block_end = f[block_start..].find("};").expect("block closes") + block_start;
+        let block = &f[block_start..block_end];
+        // The ACQUISITION await is fine and unavoidable — `self.rgb()` is async. What must not
+        // happen is an await AFTER the guard exists. (My first version of this test forbade every
+        // await in the block and failed on the acquisition itself; the codebase's own pattern at
+        // `wallet.rs` acquires the same way.)
+        let after_acquire = block
+            .find("self.rgb().await")
+            .map(|i| &block[i + "self.rgb().await".len()..])
+            .expect("the guard is acquired here");
+        assert!(
+            !after_acquire.contains(".await"),
+            "no await may follow the guard's acquisition — the RGB resolver is !Sync, and holding \
+             it across an await stops this future being Send: {after_acquire}"
+        );
+        assert!(f.contains("block_in_place"), "the engine call is blocking, and says so");
+    }
+
+    /// Both lanes must refuse each other's coins by name: a coloured coin sent to the plain
+    /// re-anchor burns its allocation, and a plain coin sent here finds nothing to colour.
+    #[test]
+    fn each_lane_refuses_the_others_coin() {
+        let f = fn_src("pub async fn colored_reanchor(");
+        assert!(f.contains("has a PLAIN ladder"), "this lane must refuse a plain coin");
+        let s = src();
+        assert!(
+            s.contains("is a COLOURED carrier: its re-anchor is CR-D"),
+            "and the plain lane must point a coloured carrier here instead of refusing flatly"
+        );
     }
 }
