@@ -24192,3 +24192,91 @@ mod s5_ndeep_seal_walk_tests {
         );
     }
 }
+
+/// [S6] Crash-recovery replay of a COLOURED spine tip.
+///
+/// The scope doc calls this "the least grounded number in this document", and the reason is the
+/// failure it guards: a wrong replay co-signs a PHANTOM RIVAL over `SP.out[K]` — a second transition
+/// over the outpoint the tip's own cap spends. Both would be validly co-signed, they would collide
+/// on one `BundleId`, and rgb-lib would resolve the pair by a hash lottery. "Only ever after a crash"
+/// is exactly where this repo's silent-degradation defects have lived.
+#[cfg(test)]
+mod s6_coloured_tip_replay_tests {
+    fn fn_src(marker: &str) -> String {
+        let s = include_str!("tesr.rs");
+        let at = s.find(marker).expect("exists");
+        let end = s[at..].find("\n/// ").or_else(|| s[at..].find("\n    /// ")).map(|e| at + e).unwrap_or(s.len());
+        s[at..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// **THE PHANTOM-RIVAL PROPERTY.** A coloured cap is co-signed from the material the caller
+    /// pre-built and journalled — never rebuilt here. A rebuild would derive a SECOND transition
+    /// over `SP.out[K]`, and the two would collapse to one `BundleId`.
+    #[test]
+    fn a_coloured_cap_is_co_signed_from_journalled_material_never_rebuilt() {
+        let f = fn_src("async fn establish_spine_tip_journalled(");
+        assert!(
+            f.contains("if let Some(pending) = rec.children[j].pending_state.clone()"),
+            "the coloured cap must come from the journal"
+        );
+        assert!(
+            f.contains("pending.tx_hex.clone()"),
+            "and be co-signed VERBATIM — the bytes the caller built, not a re-derivation"
+        );
+        let cosign = f.find("cosign_tier(").expect("co-sign");
+        let build = f.find("mercurylib::tesr::build_state_from(").unwrap_or(usize::MAX);
+        assert!(
+            cosign < build,
+            "the journalled path must return before the PLAIN builder is ever reached — otherwise a \
+             coloured tip could fall through and be capped by an RGB-unaware tier"
+        );
+    }
+
+    /// Replay must be IDEMPOTENT: a cap already co-signed by an earlier attempt is reused, not
+    /// re-signed. Re-signing spends a second irreversible SE slot on the same outpoint and pushes
+    /// the leg past its census, after which no receiver can adopt it.
+    #[test]
+    fn an_already_co_signed_cap_is_reused_on_replay() {
+        let f = fn_src("async fn establish_spine_tip_journalled(");
+        assert!(
+            f.contains("if let Some(cap) = rec.children[j].state.clone()"),
+            "an existing cap short-circuits"
+        );
+        let resume = fn_src("pub async fn resume_in_ladder_split(");
+        assert!(
+            resume.contains("SplitLegRole::SpineTip =>"),
+            "and the resume driver dispatches on the journalled ROLE, not on shape guesswork"
+        );
+    }
+
+    /// A tip carrying an EXTENSION is a record contradicting itself, and it is refused on BOTH the
+    /// build and the replay paths — an extension over the tip's funding outpoint is a rival at the
+    /// piece schedule's CSV, which out-races the tip's own cap.
+    #[test]
+    fn a_tip_carrying_an_extension_is_refused_on_both_paths() {
+        for marker in [
+            "async fn establish_spine_tip_journalled(",
+            "pub async fn resume_in_ladder_split(",
+        ] {
+            let f = fn_src(marker);
+            assert!(
+                f.contains("carries an extension tier") || f.contains("but carries an"),
+                "{marker} must refuse a tip that carries an extension"
+            );
+        }
+    }
+
+    /// The crash point exists and sits AFTER the journal write, so a crash there resumes with the
+    /// cap recorded rather than re-signing it.
+    #[test]
+    fn the_crash_point_is_after_the_journal_write() {
+        let f = fn_src("async fn establish_spine_tip_journalled(");
+        let write = f.find("journal_write(cc, wallet_name, rec)").expect("journalled");
+        let crash = f.find("crash_point(\"after_inladder_spine_tip_cap\")").expect("crash point");
+        assert!(
+            write < crash,
+            "the cap must be on disk BEFORE the crash window, or a crash there loses a co-signature \
+             that can never be regenerated"
+        );
+    }
+}
