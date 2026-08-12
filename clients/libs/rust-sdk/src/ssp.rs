@@ -506,7 +506,9 @@ impl SspService {
                 // chain and validating against that — the coloured pre-pay gate proper, which does
                 // not exist yet. Until then a coloured child cannot be LN-latched, and the honest
                 // failure is a named refusal rather than an RGB error nobody can act on.
-                if p.branch_txs.is_empty() {
+                // [P3] A COLOURED CHILD carries its own witness chain, so it IS verifiable now —
+                // the refusal below applies only to an envelope with neither.
+                if p.branch_txs.is_empty() && p.child_witness_txids.is_empty() {
                     return Err(anyhow!(
                         "latched coin {sid} carries an RGB consignment but no exit branch to resolve \
                          it against — this is the shape of a coloured SPLIT CHILD, whose witness \
@@ -518,7 +520,13 @@ impl SspService {
                 }
                 let (contract_id, booked) = self
                     .wallet
-                    .validate_pending_token(env, &p.branch_txs, &p.funding_txid, p.funding_vout)
+                    .validate_pending_token_ex(
+                        env,
+                        &p.branch_txs,
+                        &p.child_witness_txids,
+                        &p.funding_txid,
+                        p.funding_vout,
+                    )
                     .await
                     .map_err(|e| {
                         anyhow!("pre-payment RGB validation failed for {sid}: {e} — refusing to pay")
@@ -1356,7 +1364,7 @@ mod p3_prepay_gate_tests {
             .find("p.branch_txs.is_empty()")
             .expect("the SSP must refuse an RGB envelope it has no branch to resolve against");
         let call = code
-            .find("validate_pending_token(")
+            .find("validate_pending_token_ex(")
             .expect("the pre-pay validator is still called");
         assert!(
             guard < call,
@@ -1380,5 +1388,45 @@ mod p3_prepay_gate_tests {
             msg.contains("ROOT") && msg.contains("unilateral exit"),
             "and name the two ways the owner can still be paid"
         );
+    }
+
+    /// **[P3] THE GATE PROPER: a coloured child is now VERIFIED, not merely refused.**
+    ///
+    /// A child's consignment resolves against `colored_child_txids()` — the root ladder, every
+    /// intermediate spine segment, then its own two rungs — never against `branch_txs`, which it does
+    /// not have. That list was always derivable from `child_tesr_bundle` (the transfer message has
+    /// carried it all along); nothing surfaced it, so the SSP could only decline.
+    ///
+    /// The refusal must therefore now fire ONLY when there is neither chain. Keeping it on
+    /// `branch_txs.is_empty()` alone would decline every coloured child forever — a correct-but-dead
+    /// gate, which is the failure mode that looks like success.
+    #[test]
+    fn a_coloured_child_is_verified_against_its_own_chain_not_declined() {
+        let src = include_str!("ssp.rs");
+        let at = src.find("p.branch_txs.is_empty()").expect("guard");
+        let line_end = src[at..].find('\n').map(|e| at + e).unwrap_or(src.len());
+        let guard_line = &src[at..line_end];
+        assert!(
+            guard_line.contains("p.child_witness_txids.is_empty()"),
+            "the refusal must require BOTH chains absent, or a coloured child — which now carries \
+             its own witness chain — is declined forever: {guard_line}"
+        );
+        // …and the child's chain must actually reach the validator.
+        let code = code_of_prepay(src);
+        assert!(
+            code.contains("&p.child_witness_txids"),
+            "the child's witness chain must be PASSED to the validator; surfacing it and then not \
+             using it is the same dead gate with more code"
+        );
+    }
+
+    fn code_of_prepay(src: &str) -> String {
+        let at = src.find("let asset_amount = d.asset_amount").expect("the RGB invoice branch");
+        src[at..]
+            .lines()
+            .take_while(|l| !l.contains("covered = covered.saturating_add"))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

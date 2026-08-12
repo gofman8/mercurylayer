@@ -434,6 +434,16 @@ pub struct PendingTransferInfo {
     pub funding_vout: u32,
     /// The un-broadcast exit branch (raw tx hex, root-first) the consignment resolves against.
     pub branch_txs: Vec<String>,
+    /// **[P3] A COLOURED CHILD's own witness chain**, root→leaf, when this transfer conveys one.
+    ///
+    /// A child has no `branch_txs`: its consignment resolves against `colored_child_txids()` — the
+    /// root ladder, every intermediate spine segment, then its own two rungs. That list is derivable
+    /// from `child_tesr_bundle`, which the transfer message already carries, but nothing surfaced it,
+    /// so the SSP's pre-pay RGB gate had nothing to resolve against and could only refuse.
+    ///
+    /// Empty for the flat lane and for a PLAIN child — the distinction is "is there a coloured child
+    /// chain here", not "is this a child".
+    pub child_witness_txids: Vec<String>,
     /// Pre-pay ladder census (LIGHTNING.md): `true` iff this coin is safe to accept-before-paying.
     ///
     /// It is `true` ONLY when a binding actually ran and passed — there is no "trivially ok" shape any
@@ -968,6 +978,17 @@ pub async fn peek_pending_transfers(
                 funding_txid,
                 funding_vout,
                 branch_txs: transfer_msg.branch_txs.clone(),
+                // [P3] Derived from the bundle the message already carries. Best-effort by design:
+                // a bundle that will not parse, or is plain, yields an EMPTY list — and an empty
+                // list is what the SSP refuses on, so a malformed child cannot become a payable one
+                // by failing to describe itself.
+                child_witness_txids: transfer_msg
+                    .child_tesr_bundle
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<crate::tesr::ChildTesrBundle>(j).ok())
+                    .filter(|cb| cb.is_colored())
+                    .and_then(|cb| cb.colored_child_txids().ok())
+                    .unwrap_or_default(),
                 ladder_census_ok,
             });
         }

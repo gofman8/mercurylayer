@@ -3132,6 +3132,7 @@ mod transfer_cancel_client_tests {
             funding_txid: "f".repeat(64),
             funding_vout: 0,
             branch_txs: vec![],
+            child_witness_txids: vec![],
             ladder_census_ok: true,
         }
     }

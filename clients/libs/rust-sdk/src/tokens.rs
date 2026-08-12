@@ -4330,7 +4330,7 @@ impl UtexoWallet {
                 tip.sp_out_value
             )
         })?;
-        let mut piece_sats: Vec<u64> = vec![TOKEN_PIECE_SATS; n_pay];
+        let piece_sats: Vec<u64> = vec![TOKEN_PIECE_SATS; n_pay];
         let spent = TOKEN_PIECE_SATS
             .checked_mul(n_pay as u64)
             .ok_or_else(|| anyhow!("piece sizing overflowed"))?;
@@ -5777,9 +5777,35 @@ impl UtexoWallet {
         funding_txid: &str,
         funding_vout: u32,
     ) -> Result<(String, u64)> {
+        self.validate_pending_token_ex(consignment_env, branch_txs, &[], funding_txid, funding_vout)
+            .await
+    }
+
+    /// **[P3] As above, with an explicit witness chain for a COLOURED CHILD.**
+    ///
+    /// The flat lane resolves a consignment against its exit BRANCH. A coloured child has no branch:
+    /// its witnesses are `colored_child_txids()` — the root ladder, every intermediate spine segment,
+    /// then its own two rungs — and that list now reaches the SSP on `PendingTransferInfo`.
+    ///
+    /// When `child_witness_txids` is non-empty it REPLACES the branch, because the two describe
+    /// different chains and mixing them would resolve a child's consignment against a stranger's
+    /// transactions. Empty means "no coloured child here", and the caller refuses rather than paying
+    /// on an unverifiable envelope.
+    pub async fn validate_pending_token_ex(
+        &self,
+        consignment_env: &str,
+        branch_txs: &[String],
+        child_witness_txids: &[String],
+        funding_txid: &str,
+        funding_vout: u32,
+    ) -> Result<(String, u64)> {
         let env: ConsignmentEnvelope = serde_json::from_str(consignment_env)
             .map_err(|e| anyhow!("malformed consignment envelope: {e}"))?;
-        let txids = branch_witness_txids(branch_txs)?;
+        let txids = if child_witness_txids.is_empty() {
+            branch_witness_txids(branch_txs)?
+        } else {
+            child_witness_txids.to_vec()
+        };
         let mut rgb = self.rgb().await?;
         let w = rgb.as_mut().ok_or_else(|| anyhow!("RGB engine not configured"))?;
         verify_consignment_assignment(w, &env, &txids, funding_txid, funding_vout)
