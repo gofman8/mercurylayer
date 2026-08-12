@@ -24102,3 +24102,93 @@ mod s4_colored_spine_batch_tests {
         );
     }
 }
+
+/// [S5] The N-deep walks, and the bound that is economic rather than structural.
+#[cfg(test)]
+mod s5_ndeep_seal_walk_tests {
+    fn src_of(marker: &str, end_marker: &str) -> String {
+        let s = include_str!("tesr.rs");
+        let at = s.find(marker).expect("exists");
+        let end = s[at..].find(end_marker).map(|e| at + e).unwrap_or(s.len());
+        s[at..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+    fn txids() -> String {
+        src_of("pub fn colored_child_txids(", "\n    /// **The seal schedule")
+    }
+    fn seals() -> String {
+        src_of("pub fn colored_child_seals(", "\n    /// The LEAF consignment")
+    }
+
+    /// **What S5 actually unblocks.** A spine batch's pieces sit one segment deeper than the root
+    /// split's, so `build_colored_child_retransfer` — which goes through `colored_child_seals` —
+    /// refused EVERY spine-minted piece while that function rejected any `ancestors`. Both walks now
+    /// traverse them.
+    #[test]
+    fn both_walks_traverse_intermediate_segments() {
+        assert!(
+            txids().contains("for (i, seg) in self.ancestors.iter().enumerate()"),
+            "the witness walk must cover the intermediate segments"
+        );
+        assert!(
+            seals().contains("for (i, seg) in self.ancestors.iter().enumerate()"),
+            "and so must the seal walk, or the two are different lengths"
+        );
+        assert!(
+            !txids().contains("a coloured child must be depth-1"),
+            "the structural depth-1 refusal is gone from the witness walk"
+        );
+    }
+
+    /// A SPINE segment is one tier at role `Spine` with the LEVEL as its rung. Without the level,
+    /// two levels over one funding chain derive the same blinding — they share statechain id, role,
+    /// index AND csv — and collapse to one `BundleId`.
+    #[test]
+    fn a_spine_segment_is_sealed_by_role_and_level() {
+        let f = seals();
+        assert!(f.contains("TierRole::Spine, 0, i as u32"), "role Spine, rung = the level: {f}");
+        assert!(
+            f.contains("TierRole::ChildExtension") && f.contains("TierRole::ChildState"),
+            "and a two-tier segment keeps the child roles"
+        );
+    }
+
+    /// The parent's `SP` is NOT sealed at the leaf's `sp_vout` once ancestors exist — it is spent by
+    /// the FIRST intermediate segment. The wrong vout there is the nastiest possible bug: it exists,
+    /// so nothing errors, and the receiver simply cannot open the seal.
+    #[test]
+    fn the_parents_sp_is_sealed_where_the_next_hop_spends_it() {
+        let f = seals();
+        assert!(f.contains("match self.ancestors.first()"), "depth-aware SP vout: {f}");
+        assert!(f.contains("Some(first) => first.funding_vout"), "the first segment's funding vout");
+        assert!(f.contains("None => self.sp_vout"), "and the leaf's own at depth 1");
+    }
+
+    /// The two walks are read as PARALLEL ARRAYS by the receiver. A disagreement does not error
+    /// there — it pairs a tier with another tier's seal. Cross-checked here, where it can still say
+    /// why.
+    #[test]
+    fn the_two_walks_are_cross_checked_for_length_and_order() {
+        let f = seals();
+        assert!(f.contains("if seals.len() != want.len()"), "length");
+        assert!(f.contains("if txid != &want[k]"), "and order, entry by entry");
+        assert!(
+            f.contains("parallel arrays"),
+            "and the refusal must say WHY a mismatch is dangerous rather than just that it happened"
+        );
+    }
+
+    /// **The bound is economic, and that distinction is the point.** The walks are N-deep because a
+    /// spine-minted piece must be VERIFIABLE. Adoption stays at 1 because the carrier and piece
+    /// FLOORS are derived from the depth — a depth-2 piece walks more transactions to exit, so
+    /// adopting it against the depth-1 floor admits a piece that cannot fund its own exit.
+    #[test]
+    fn adoption_is_bounded_separately_from_verifiability() {
+        assert_eq!(super::MAX_COLORED_ADOPT_DEPTH, 1);
+        let f = seals();
+        assert!(f.contains("MAX_COLORED_ADOPT_DEPTH"), "enforced at the shared chokepoint");
+        assert!(
+            f.contains("could not fund its own exit"),
+            "and the refusal must name the economic reason, not just the number"
+        );
+    }
+}
