@@ -3648,8 +3648,19 @@ pub fn change_leg_role(lane: SplitLane) -> SplitLegRole {
         // the two-rung piece ladder (1482) — admitted, then unbuildable, with the parent already
         // terminal and the failure unrecoverable.
         //
-        // The flip belongs with **S4** (`build_colored_spine_batch`), which is what actually makes a
-        // coloured change leg a tip. S2's `build_colored_spine_cap` is landed and waiting for it.
+        // **CORRECTION, after S4 landed.** I first wrote that this flip "belongs with S4". It does
+        // not, and the distinction is the useful part: `SplitLane::Colored` denotes
+        // `cosign_colored_in_ladder_split` — the ROOT coloured split — whereas S4 built the SPINE
+        // BATCH's coloured SP (`build_colored_spine_batch_sp`), whose change leg is already carved
+        // and floored as a tip. Landing S4 therefore changed nothing about THIS arm, and flipping it
+        // on the strength of "S4 is done" would have re-created the exact defect above.
+        //
+        // The remaining precondition is specific and small: **`build_colored_in_ladder_split` must
+        // give its change leg a ONE-RUNG cap** instead of the extension+state pair it builds today.
+        // The tier already exists — S2's `build_colored_spine_cap` is precisely it — so this is
+        // assembly rather than design: carve the change leg at `colored_spine_tip_floor`, build one
+        // cap for it, journal it as a tip leg. The flip lands in THAT commit and is wrong in any
+        // earlier one.
         SplitLane::PlainChild | SplitLane::Colored => SplitLegRole::Piece,
     }
 }
