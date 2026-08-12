@@ -5541,6 +5541,36 @@ async fn spine_batch_split_ex(
                  transitions for an allocation this tip does not hold — use `spine_batch_split`."
             ));
         }
+        // **[S4b] BOTH COLOURED — AND THAT IS NOT ENOUGH TO PROCEED.**
+        //
+        // S4 built the coloured `SP` (`build_colored_spine_batch_sp`) and this entry point, and the
+        // arm above correctly refuses an uncoloured `SP` over a coloured tip. What neither covers is
+        // what happens BELOW `SP`: every leg is still constructed by `establish_child_journalled` /
+        // `establish_spine_tip_journalled` — the PLAIN builders — and each resulting bundle is
+        // written with `rgb: None`. That is an UNCOLOURED tier over `SP.out[j]`, which is the
+        // allocation's new home. It is precisely the construction the arm above exists to prevent,
+        // one level further down, and it would BURN the allocation rather than refuse.
+        //
+        // Nothing calls this today (`spine_batch_split_colored` has no callers in the repo), so the
+        // hole is latent rather than live — which is exactly when it is cheapest to close and
+        // easiest to forget. Refusing here converts "silently destroys the allocation" into a named
+        // refusal, and is a no-op for every path that exists.
+        //
+        // To LIFT this, the coloured legs have to be built: per-payee `ext_child`/`state_child` with
+        // consignments and seals rooted at `SP.out[j]`, a coloured cap for the next tip, the
+        // conservation checks over the allocation, `ColoredTip`/RGB halves on the persisted records,
+        // and the leaf-consignment pre-flight the ROOT split already runs. That is the rest of S4,
+        // not a flag.
+        (true, true) => {
+            return Err(anyhow::anyhow!(
+                "the COLOURED spine batch is not implemented below `SP`. `build_colored_spine_batch_sp` \
+                 builds the coloured split state, but every leg under it is still built by the PLAIN \
+                 `establish_child_journalled` / `establish_spine_tip_journalled` and persisted with \
+                 `rgb: None` — an UNCOLOURED tier over `SP.out[j]`, the outpoint the allocation is \
+                 booked at, which DESTROYS it. Refusing rather than burning the allocation. Pay from \
+                 the ROOT carrier (`build_colored_in_ladder_split`) until the coloured legs exist."
+            ));
+        }
         _ => {}
     }
     // The record is this wallet's own write and has no counterparty; re-checking it here costs one
