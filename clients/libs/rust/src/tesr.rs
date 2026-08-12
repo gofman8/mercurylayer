@@ -2557,6 +2557,332 @@ pub fn build_colored_spine_batch_sp(
     })
 }
 
+/// **[S4b] Co-sign a COLOURED SPINE BATCH** — the tip-parented sibling of
+/// [`cosign_colored_in_ladder_split`], and the half S4 shipped without.
+///
+/// Same `1 + 2N` co-signature shape, same journal, same terminalize-after-write-ahead ordering. Two
+/// structural differences, and both are about WHO the parent is:
+///
+/// * **The terminalized slot is the TIP's**, not the root coin's. `SP_{i+1}` consumes the tip's last
+///   budget slot and out-races the tip's own cap `C_i` over the shared outpoint `SP_i.out[K]` at
+///   [`SPINE_CSV`] — so the cap is disclosed as a SUPERSEDED rival, exactly as the root lane
+///   discloses the parent's retained `S_0`.
+/// * **The root bundle is untouched.** A batch does not install a new current state on the root
+///   coin; it appends one more INTERMEDIATE segment. So every child's `parent` stays `tip.parent`
+///   and this level joins `ancestors` — which is what makes the receiver's N-deep walk
+///   ([`ChildTesrBundle::colored_child_txids`]) reach `SP_{i+1}` at all. Getting this wrong does not
+///   fail loudly: the child would carry a shorter chain than the one its consignment commits to and
+///   no receiver could resolve it.
+///
+/// The segment's single tier IS `SP_{i+1}` (a spine segment has `extension: None`), because that is
+/// the transaction which creates the outpoints this level's legs sit on.
+///
+/// ⚠️ **Not reachable yet.** `spine_batch_split_ex` still refuses the coloured lane, and no SDK path
+/// selects a coloured tip as a carrier. This is the second of three landings — builder, co-sign,
+/// dispatch — kept inert between them on purpose.
+pub async fn cosign_colored_spine_batch(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    tip_coin: &mut Coin,
+    tip: &SpineTipBundle,
+    draft: ColoredSplitDraft,
+    child_coins: &mut [Coin],
+) -> Result<(Vec<ChildTesrBundle>, Option<SpineTipBundle>)> {
+    let rgb_half = tip
+        .rgb
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("cosign_colored_spine_batch on a PLAIN spine tip"))?;
+    if draft.parent_statechain_id != tip.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch draft is for {} but the tip is {}",
+            draft.parent_statechain_id,
+            tip.statechain_id
+        ));
+    }
+    if draft.contract_id != rgb_half.contract_id {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch draft names contract {} but the tip carries {}",
+            draft.contract_id,
+            rgb_half.contract_id
+        ));
+    }
+    if draft.children.len() != child_coins.len() {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch draft has {} legs but {} coins were supplied",
+            draft.children.len(),
+            child_coins.len()
+        ));
+    }
+    // The allocation is conserved, re-checked against the LIVE tip record rather than the draft's
+    // own copy — the draft is built where the RGB engine lives and consumed where the network does.
+    let leg_rgb: u64 = draft.children.iter().map(|c| c.rgb_amount).sum();
+    if leg_rgb != rgb_half.amount {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch ALLOCATION conservation: the legs sum to {leg_rgb} but the tip \
+             holds {} — refusing to mint or burn an allocation",
+            rgb_half.amount
+        ));
+    }
+    let parent_sid = tip_coin
+        .statechain_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("spine tip coin has no statechain_id"))?;
+    if parent_sid != tip.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch tip coin is {parent_sid} but the tip record is {}",
+            tip.statechain_id
+        ));
+    }
+    // The tip's own record must be self-consistent BEFORE anything irreversible: its cap is the
+    // rival `SP_{i+1}` has to beat, and a tip whose cap does not bind is a tip whose supersession
+    // cannot be proved to any receiver.
+    tip.validate().map_err(|e| {
+        anyhow::anyhow!(
+            "coloured spine batch refused: the tip record for {parent_sid} is not self-consistent \
+             ({e}). Nothing has been co-signed and the tip's cap is unaffected."
+        )
+    })?;
+    // [P0-2]/[P0-3] THE DEPTH AND LENGTH CAPS, measured on the chain this batch actually mints: the
+    // root's own exit chain plus one tier per intermediate segment already walked, plus this one.
+    let depth = tip.ancestors.len() as u32 + 1;
+    enforce_split_depth_cap(
+        cc,
+        tip.parent.params,
+        depth,
+        tip.parent.exit_tiers().len() + tip.ancestors.len() + 1,
+    )
+    .await?;
+
+    let child_sids = draft
+        .children
+        .iter()
+        .zip(child_coins.iter())
+        .map(|(cd, child_coin)| {
+            let child_sid = child_coin
+                .statechain_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("spine batch leg coin has no statechain_id"))?;
+            if child_sid != cd.statechain_id {
+                return Err(anyhow::anyhow!(
+                    "coloured spine batch leg coin is {child_sid} but the draft's leg is {}",
+                    cd.statechain_id
+                ));
+            }
+            Ok(child_sid)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // [B4] WRITE AHEAD, THEN TERMINALIZE — same reasoning as the root lane, and the same journal
+    // shape so one recovery reader serves both. The `op_id` is keyed on the TIP, which is what makes
+    // two batches over two different levels distinguishable.
+    let mut journal = SplitJournalRecord {
+        op_id: format!("spine_batch_split:{parent_sid}:{}", draft.sp_txid),
+        lane: "colored_spine_batch".to_string(),
+        stage: SplitStage::Planned,
+        terminalized_statechain_id: parent_sid.clone(),
+        parent: tip.parent.clone(),
+        parent_statechain_id: tip.parent_statechain_id.clone(),
+        ancestors: tip.ancestors.clone(),
+        parent_flat_backups: tip.parent_flat_backups.clone(),
+        children: draft
+            .children
+            .iter()
+            .zip(child_sids.iter())
+            .map(|(cd, sid)| SplitJournalChild {
+                statechain_id: sid.clone(),
+                owner_exit_address: cd.owner_exit_address.clone(),
+                value: cd.sp_out_value,
+                sp_vout: cd.sp_vout,
+                extension: None,
+                state: None,
+                rgb: Some(ColoredChild {
+                    contract_id: draft.contract_id.clone(),
+                    amount: cd.rgb_amount,
+                    consignments: match &cd.extension {
+                        Some(x) => vec![x.consignment.clone(), cd.state.consignment.clone()],
+                        None => vec![cd.state.consignment.clone()],
+                    },
+                }),
+                pending_extension: cd.extension.as_ref().map(|x| PendingTier {
+                    txid: x.txid.clone(),
+                    tx_hex: x.tx_hex.clone(),
+                    prev_value: cd.sp_out_value,
+                    out_value: x.payload_value,
+                    csv: cd.csv_e,
+                    payload_vout: x.payload_vout,
+                }),
+                pending_state: Some(PendingTier {
+                    txid: cd.state.txid.clone(),
+                    tx_hex: cd.state.tx_hex.clone(),
+                    prev_value: match &cd.extension {
+                        Some(x) => x.payload_value,
+                        None => cd.sp_out_value,
+                    },
+                    out_value: cd.state.payload_value,
+                    csv: cd.csv_d,
+                    payload_vout: cd.state.payload_vout,
+                }),
+                role: if cd.extension.is_some() {
+                    SplitLegRole::Piece
+                } else {
+                    SplitLegRole::SpineTip
+                },
+                recipient_address: None,
+                conveyance: ConveyanceStage::Pending,
+                conveyance_x1: None,
+                latch_batch_id: None,
+            })
+            .collect(),
+        child_ext_csv: draft.children[0].csv_e,
+        child_state_csv: draft.children[0].csv_d,
+        fee_rate: draft.fee_rate,
+        network: draft.network.clone(),
+        sp_txid: draft.sp_txid.clone(),
+    };
+    journal_write(cc, wallet_name, &journal).await?;
+
+    crate::lightning_latch::set_spend_budget(cc, wallet_name, &parent_sid, 1).await?;
+    crash_point("after_colored_spine_batch_terminalize");
+    let sp_signed = cosign_tier(
+        cc,
+        tip_coin,
+        draft.sp_tx_hex.clone(),
+        draft.parent_prev_value,
+        &draft.network,
+    )
+    .await?;
+
+    // THIS LEVEL, as an intermediate segment. `extension: None` IS the spine shape — one tier,
+    // `SP_{i+1}`, re-anchored on the segment's own funding outpoint — and the tip's retired cap is
+    // disclosed as the superseded rival it now is.
+    let this_segment = ChildSegment {
+        statechain_id: parent_sid.clone(),
+        funding_vout: tip.sp_vout,
+        extension: None,
+        state: TesrTier {
+            txid: draft.sp_txid.clone(),
+            signed_tx: sp_signed,
+            out_value: draft.sp_total,
+            csv: Some(draft.sp_csv),
+            payload_vout: draft.children[0].sp_vout,
+        },
+        superseded_states: {
+            let mut v = tip.superseded_caps.clone();
+            v.push(tip.cap.clone());
+            v
+        },
+        superseded_extensions: vec![],
+    };
+    let mut ancestors = tip.ancestors.clone();
+    ancestors.push(this_segment);
+
+    journal.ancestors = ancestors.clone();
+    journal.stage = SplitStage::Signed;
+    journal_write(cc, wallet_name, &journal).await?;
+    crash_point("after_colored_spine_batch_sp_sign");
+
+    let mut bundles = Vec::with_capacity(draft.children.len());
+    let mut next_tip: Option<SpineTipBundle> = None;
+    for (j, (cd, child_coin)) in draft.children.iter().zip(child_coins.iter_mut()).enumerate() {
+        let mut child_extension: Option<TesrTier> = None;
+        if let Some(x) = cd.extension.as_ref() {
+            let x_signed =
+                cosign_tier(cc, child_coin, x.tx_hex.clone(), cd.sp_out_value, &draft.network)
+                    .await?;
+            let tier = TesrTier {
+                txid: x.txid.clone(),
+                signed_tx: x_signed,
+                out_value: x.payload_value,
+                csv: Some(cd.csv_e),
+                payload_vout: x.payload_vout,
+            };
+            journal.children[j].extension = Some(tier.clone());
+            journal_write(cc, wallet_name, &journal).await?;
+            crash_point("after_colored_spine_batch_child_extension");
+            child_extension = Some(tier);
+        }
+        let s_signed = cosign_tier(
+            cc,
+            child_coin,
+            cd.state.tx_hex.clone(),
+            match cd.extension.as_ref() {
+                Some(x) => x.payload_value,
+                None => cd.sp_out_value,
+            },
+            &draft.network,
+        )
+        .await?;
+        let child_state = TesrTier {
+            txid: cd.state.txid.clone(),
+            signed_tx: s_signed,
+            out_value: cd.state.payload_value,
+            csv: Some(cd.csv_d),
+            payload_vout: cd.state.payload_vout,
+        };
+        journal.children[j].state = Some(child_state.clone());
+        journal_write(cc, wallet_name, &journal).await?;
+        crash_point("after_colored_spine_batch_child_state");
+
+        // The change leg: the NEXT level's tip, one level deeper than this one.
+        let Some(child_extension) = child_extension else {
+            if next_tip.is_some() {
+                return Err(anyhow::anyhow!(
+                    "a coloured spine batch produced TWO change tips ({} is the second)",
+                    child_sids[j]
+                ));
+            }
+            let built = SpineTipBundle {
+                parent: tip.parent.clone(),
+                parent_statechain_id: tip.parent_statechain_id.clone(),
+                // Every segment walked so far, including the one this batch just minted — this is
+                // what makes the next level's exit reach the outpoint its cap sits on.
+                ancestors: ancestors.clone(),
+                sp_vout: cd.sp_vout,
+                sp_out_value: cd.sp_out_value,
+                statechain_id: child_sids[j].clone(),
+                owner_exit_address: cd.owner_exit_address.clone(),
+                cap: child_state,
+                superseded_caps: vec![],
+                parent_flat_backups: tip.parent_flat_backups.clone(),
+                rgb: Some(ColoredTip {
+                    contract_id: rgb_half.contract_id.clone(),
+                    amount: cd.rgb_amount,
+                    consignment: cd.state.consignment.clone(),
+                }),
+            };
+            built.validate()?;
+            next_tip = Some(built);
+            continue;
+        };
+        bundles.push(ChildTesrBundle {
+            // The ROOT bundle, untouched — a batch appends a segment, it does not install a new
+            // current state on the root coin.
+            parent: tip.parent.clone(),
+            parent_statechain_id: tip.parent_statechain_id.clone(),
+            sp_vout: cd.sp_vout,
+            child_statechain_id: child_sids[j].clone(),
+            child_owner_exit_address: cd.owner_exit_address.clone(),
+            child_extension,
+            child_state,
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+            ancestors: ancestors.clone(),
+            rgb: Some(ColoredChild {
+                contract_id: rgb_half.contract_id.clone(),
+                amount: cd.rgb_amount,
+                consignments: vec![
+                    cd.extension.as_ref().expect("piece has an extension").consignment.clone(),
+                    cd.state.consignment.clone(),
+                ],
+            }),
+            parent_flat_backups: tip.parent_flat_backups.clone(),
+        });
+    }
+    journal.stage = SplitStage::Committed;
+    journal_write(cc, wallet_name, &journal).await?;
+    Ok((bundles, next_tip))
+}
+
 /// **[CR-D] Blind-co-sign a coloured de-trigger** — the network half of [`build_colored_detrigger`].
 ///
 /// One `cosign_tier` round-trip, the same as the plain path; the SE never learns anything is
@@ -24323,6 +24649,88 @@ mod crd_colored_detrigger_tests {
         assert!(
             build.contains("bundle.m"),
             "the renewal epoch must separate de-triggers across re-anchor generations"
+        );
+    }
+}
+
+/// [S4b] The coloured spine batch's CO-SIGN: the two things that fail QUIETLY.
+///
+/// Both are about who the parent is. A batch appends an intermediate segment; it does not install a
+/// new current state on the root coin. Get either wrong and nothing throws — the child simply
+/// carries a shorter (or wrong) witness chain than its consignment commits to, and no receiver can
+/// resolve it. That is a defect discovered by a stranger's failed claim, which is the worst place.
+#[cfg(test)]
+mod s4b_colored_spine_batch_cosign_tests {
+    /// CODE ONLY. This function's own comments discuss `ancestors`, `tip.parent` and the superseded
+    /// cap by name, so a raw substring search matches the prose explaining the rule instead of the
+    /// code obeying it — the trap that has now caught three assertions in this file.
+    fn cosign_code() -> String {
+        let s = include_str!("tesr.rs");
+        let at = s.find("pub async fn cosign_colored_spine_batch(").expect("exists");
+        let end = s[at..].find("\n/// **[CR-D]").map(|e| at + e).unwrap_or(s.len());
+        s[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The root bundle is handed to the children UNCHANGED. The root lane clones the parent and
+    /// installs `SP` as its current state; doing that here would rewrite the root coin's ladder for
+    /// a transaction that does not spend the root coin's outpoint at all.
+    #[test]
+    fn the_children_carry_the_root_bundle_untouched() {
+        let code = cosign_code();
+        assert!(
+            code.contains("parent: tip.parent.clone()"),
+            "a batch's children must carry the ROOT bundle as-is; this level belongs in `ancestors`"
+        );
+        assert!(
+            !code.contains("parent_seg.levels[last].state = TesrTier"),
+            "the batch is installing a new current state on the ROOT bundle — that is the ROOT \
+             lane's move. `SP_{{i+1}}` spends the TIP's funding outpoint, not the root coin's, so \
+             rewriting the root's ladder describes a chain that does not exist"
+        );
+    }
+
+    /// This level joins `ancestors`, and the tip's retired cap is disclosed as the superseded rival
+    /// `SP_{i+1}` beat. Without the append the child's walk stops one segment short of the
+    /// transaction that creates the outpoint its own ladder sits on.
+    #[test]
+    fn this_level_is_appended_as_a_segment_and_the_cap_is_disclosed() {
+        let code = cosign_code();
+        assert!(
+            code.contains("ancestors.push(this_segment)"),
+            "the batch must APPEND its own level to the tip's ancestors — a child whose walk omits \
+             `SP_{{i+1}}` carries a chain shorter than the one its consignment commits to, and no \
+             receiver's resolver can complete it"
+        );
+        assert!(
+            code.contains("ancestors: ancestors.clone()"),
+            "and the appended list is what the children (and the next tip) must carry"
+        );
+        assert!(
+            code.contains("v.push(tip.cap.clone())"),
+            "the tip's retired cap must be disclosed as a SUPERSEDED rival: it and `SP_{{i+1}}` \
+             spend the same outpoint, and a receiver that cannot see the loser cannot check that it \
+             loses"
+        );
+        assert!(
+            code.contains("extension: None"),
+            "a spine segment is ONE tier — an extension here would make the receiver's walk expect \
+             a transaction that was never built"
+        );
+    }
+
+    /// The terminalized slot is the TIP's own. Terminalizing the root coin instead would end the
+    /// carrier's whole payment life on a batch that only spends one of its outputs.
+    #[test]
+    fn the_terminalized_slot_is_the_tips() {
+        let code = cosign_code();
+        assert!(
+            code.contains("set_spend_budget(cc, wallet_name, &parent_sid, 1)")
+                && code.contains("let parent_sid = tip_coin"),
+            "`parent_sid` must be the TIP's statechain id, and it is the slot terminalized"
         );
     }
 }
