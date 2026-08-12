@@ -1625,6 +1625,67 @@ mod ctesr_tests {
         }
     }
 
+    /// **[G4] The coloured RE-ANCHOR / DE-TRIGGER is not a separate size model.**
+    ///
+    /// The scope doc carried `112 + 43` (155 vB) as an estimate for it and asked for a measured
+    /// constant instead. The measurement says something better than a new constant: there is no new
+    /// constant. `build_colored_detrigger` builds ONE payload output and sizes it with
+    /// `colored_tier_out_value`, which is `colored_tier_out_total(.., 1, ..)` — so a de-trigger IS
+    /// an ordinary one-payload coloured tier and its vsize is the one already measured through the
+    /// production finaliser above.
+    ///
+    /// That matters because the estimate was **13 vB short**: at 2 sat/vB a tier sized on 155 vB
+    /// commits 310 sat against a transaction that measures 168 vB, i.e. 1.845 sat/vB — under the
+    /// target, and on the one transaction whose whole job is to be relayable when the owner needs to
+    /// walk away from a live ladder.
+    #[test]
+    fn the_coloured_detrigger_is_a_measured_one_payload_tier_not_a_112_plus_43_estimate() {
+        let measured = finalised_vsize(&tier_shape(1));
+        assert_eq!(
+            colored_tier_vbytes(1),
+            measured,
+            "the de-trigger rides the one-payload coloured model, so that model must be the \
+             measured one"
+        );
+        assert_ne!(
+            measured, 155,
+            "`112 + 43` is not the size of a coloured de-trigger — the estimate this pins against"
+        );
+        assert_eq!(measured, 168);
+        // …and the fee that follows from it clears the target rate, which the estimate did not.
+        let rate = 2.0;
+        assert_eq!(colored_committed_fee(1, rate), measured * 2);
+        let estimated_fee = (155.0 * rate).ceil() as u64;
+        assert!(
+            (estimated_fee as f64) < measured as f64 * rate,
+            "the 112+43 estimate would under-pay: {estimated_fee} sat over {measured} vB is \
+             {:.3} sat/vB",
+            estimated_fee as f64 / measured as f64
+        );
+    }
+
+    /// The builder really is on that model — pinned in the code, because "it uses the one-payload
+    /// helper" is the whole reason the size above applies to it.
+    #[test]
+    fn the_detrigger_builder_sizes_with_the_one_payload_helper() {
+        let src = include_str!("tesr.rs");
+        let at = src.find("pub fn build_colored_detrigger(").expect("exists");
+        let body: String = src[at..at + src[at..].find("\n/// ").unwrap_or(4000)]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("colored_tier_out_value("),
+            "the de-trigger must size with the ONE-payload coloured helper — a bespoke estimate here \
+             is what G4 exists to remove"
+        );
+        assert!(
+            !body.contains("112"),
+            "no hand-rolled vsize estimate in the de-trigger builder"
+        );
+    }
+
     /// §3.4, as corrected by [D4] **on both halves**: a coloured tier is an uncoloured tier plus ONE
     /// `opret` output and nothing else, so the coloured fee is exactly the uncoloured fee for one
     /// MORE output — no residue.
