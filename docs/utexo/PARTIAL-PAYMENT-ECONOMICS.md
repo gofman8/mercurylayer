@@ -538,14 +538,29 @@ tier. Recommend landing CATS-B first and taking this as a separate, argued chang
   per spine level — and because each level is a **fresh** statechain, the cap is per-level, not
   global. But retry budget collapses: 31 failed attempts survive at K = 1, only 2 at K = 20.
   Mint slots lazily per child, or make `take_derived_tokens` recoverable.
-- **The watchtower cannot express the trigger.** `WatchEntry` has exactly one trigger field,
-  `deadline_block` (`clients/libs/rust-sdk/src/watchtower.rs:44-59`), and `watch_pass` evaluates one
-  predicate, `tip + margin < deadline_block` (`:176-198`). CATS's race starts when the **sender**
-  confirms `SP_i` — an event at no fixed height. The tower returns `Idle`, documented as "a positive
-  observation: nothing needed doing" (`:164-166`), for the whole 1 440-block window. **This is the
-  repo's silent-degradation shape and it must be fixed before CATS ships**: add
-  `{ watch_txid, csv_blocks, push_txs }`, subscribe to the outpoint, and add a `Blind` state so an
-  unevaluable entry never reports `Idle`.
+- ~~**The watchtower cannot express the trigger.**~~ **CLOSED [S7].** The three items this bullet
+  demanded are built: `WatchTrigger { watch_txid, watch_vout, csv_blocks, push_txs }` expresses the
+  event, `watch_pass` evaluates it against the outpoint (`outpoint_spent`) alongside the height
+  predicate and acts when **either** fires, and `WatchState::Blind` means an entry the pass could
+  not *evaluate* never averages into a green `Idle`.
+
+  Closing it surfaced a second, larger defect in the same place, which is the part worth
+  remembering: **`export_watch_bundle` was not emitting leaf entries at all.** A split child is a
+  `ctesr-` row and a spine tip a `SPINE_TIP_KEY_PREFIX` row; the export looked only for `tesr-`
+  (ladder) and `branch-` (flat) rows, so for a leaf both reads came back empty and it took the
+  `continue` written for a flat deposit — a coin with on-chain funding that no ancestor can race,
+  i.e. the exact opposite of a leaf. Every leaf in the wallet was silently absent from every
+  exported bundle, and the export still returned `Ok`. The in-process tower (`auto_exit_due`) covers
+  leaves, which is what hid it: **delegating to a third-party tower protected the parents and left
+  the children unwatched.** So the trigger type existing was never sufficient — nothing was reaching
+  it.
+
+  A leaf now arms **both** predicates, because it genuinely has both: `deadline_block = L_k −
+  head_start` (its clock is the *parent's* lowest flat-backup rung — a rung belonging to the
+  splitter) and the event (an ancestor spending `F`). `head_start` comes from the **bound** chain, so
+  a depth-N leaf is charged all N spliced spine levels, and via the same `exit_wait_blocks` call
+  `auto_exit_due` uses — the delegated tower and the owner's own tower cannot drift apart. Every
+  unbuildable entry aborts the export by name rather than being dropped from it.
 - **Minimum parent value** for a K-batch: `1 396K + 1 310` sat (K=1 → 2 706; K=10 → 15 270; K=20 →
   29 230). Below it, K falls back. Coloured carriers at `TOKEN_CARRIER_SATS = 17 384` support
   K ≤ 4 and must be re-sized at issue.

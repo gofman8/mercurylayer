@@ -702,7 +702,7 @@ written verdict is already in hand; what it revealed is W1.
 | **S4** | `build_colored_spine_batch` / `cosign_colored_spine_batch` | S2 | `refuse_uncolored_over_colored_tip` at `:4646` replaced by a lane fork; a coloured tip batched twice in-crate; census `= 2` per slot asserted | 3–5 d |
 | **S5** | **N-deep coloured seal schedule — gates receiver adoption AND every re-transfer of every piece the spine mints.** N-deep `colored_child_txids` / `colored_child_seals`; resolve `consignments.len() == tiers.len()` for intermediate segments; enforce `m = 0` on spine segments. Touched sites include `build_colored_child_retransfer` (`tesr.rs:6363`), which calls `colored_child_seals` and therefore refuses every spine-minted piece until this lands (§1.4) | S4 | A receiver adopts and books a piece at spine depth 2; a depth-2 piece is **re-transferred**; a hand-crafted bundle with a mislabelled segment gets a **named** refusal and `assert_not_an_unrelated_refusal` passes | **2–3 wk** (was 6–9 d; re-banded because the sender-side re-transfer path is inside its blast radius) |
 | **S6** | Crash-recovery replay for a coloured tip leg (`SplitJournalRecord::spine_tip`, `resume_in_ladder_split`) | S4 | A fault-injected crash between co-sign and conveyance resumes; a test asserts no phantom rival is ever co-signed over `SP.out[K]` | 3–5 d, low confidence |
-| **S7** | Booking / health / watchtower / `auto_exit` head-start over an N-level chain | S5 | `WatchEntry` expresses "the sender confirmed `SP_i`", or the gap is closed by name (`PARTIAL-PAYMENT-ECONOMICS.md` §4.7 calls the current shape the repo's silent-degradation shape) | 3 d+ |
+| **S7** ✅ | Booking / health / watchtower / `auto_exit` head-start over an N-level chain | S5 | **DONE.** The trigger type already existed; the real defect was that `export_watch_bundle` emitted **no leaf entry at all** (a `ctesr-`/spine-tip row is neither `tesr-` nor `branch-`, so every leaf took the flat-deposit `continue` and a delegated tower silently watched none of them). A leaf now arms both predicates, with `head_start` over the **bound** N-level chain via the same `exit_wait_blocks` call `auto_exit_due` uses | 3 d+ |
 | **S8** | **Reconcile two latency models that disagree by +1 block per tier**, and re-derive cost: `tesr_exit_wait_blocks` (`config.rs:196-207`) charges nothing for the per-level parent confirmation while `exit_wait_blocks` (`lib/src/transfer/receiver.rs:807-810`) sums `csv + 1` and is what `max_exit_txs` derives from (§1.6; same disagreement class as `DECISIONS.md:205-211`). Plus `4 + d` for spine levels, 211 vB coloured, floors, and W1's per-level bump confirmation | W1, WP5 | One test derives txs, vBytes **and wait** from measured transactions at depths 0..3 under **both** models and fails if they disagree. Note this moves a receiver-side admission rule (`max_exit_txs`), so budget test churn | 4 d + churn |
 | **S9** | Live-stack E2Es: a coloured carrier making two sequential payments; a receiver claiming at depth 2; a crash-recovery replay | S5–S7 | Green on the live stack, on the **G3** profile | 5 d+ |
 
@@ -915,9 +915,12 @@ and unable to book the allocation, because `accept_colored_ladder` / `accept_col
   Ten minutes of work; not spent.
 * **UNVERIFIED** — whether the plain in-ladder lane's identical missing horizon pre-flight has ever
   fired in practice. The code path is the same for both lanes; if it has, R1 is independently urgent.
-* **UNVERIFIED** — the watchtower story for a coloured spine (`PARTIAL-PAYMENT-ECONOMICS.md` §4.7
-  says `WatchEntry` cannot express "the sender confirmed `SP_i`"). `watchtower.rs` was not read; if
-  that is open, S7 is bigger than 3 days.
+* ~~**UNVERIFIED** — the watchtower story for a coloured spine.~~ **VERIFIED, and it was worse than
+  §4.7 said.** `watchtower.rs` has since been read. The trigger type (`WatchTrigger`), the outpoint
+  predicate and the `Blind` state all existed already — but `export_watch_bundle` emitted **no leaf
+  entry at all**, because a `ctesr-`/spine-tip row is neither the `tesr-` row nor the `branch-` row
+  it looks for, so every leaf took the flat-deposit `continue`. Expressing the trigger was never the
+  binding constraint; nothing was reaching it. Fixed under S7 — see §4.7.
 * **UNVERIFIED** — whether `verify_bundle_ex`'s 445 lines are genuinely free of `mercuryrustlib`-only
   dependencies beyond the bitcoin re-export. Its `use` line pulls only
   `electrum_client::bitcoin::{…}` and its doc asserts purity, but the body was not audited. Budget a

@@ -84,6 +84,72 @@ pub struct WatchTrigger {
     pub push_txs: Vec<String>,
 }
 
+/// **[S7] The bundle entry for a SPLIT LEAF** — an adopted split child (`ctesr-`) or a spine tip.
+///
+/// A leaf is the one coin kind that needs BOTH of [`watch_pass`]'s predicates, which is why it gets
+/// its own constructor rather than falling into either lane above:
+///
+/// * **The height.** A leaf carries no flat backup of its own. Its clock is the ABSOLUTE height
+///   `L_k = min(nLockTime)` over its PARENT's flat backups — a rung belonging to the splitter, i.e.
+///   to the adversary. So unlike a laddered parent (whose idle ladder never ages, and which is
+///   therefore exported with `deadline_block: u32::MAX`), a leaf genuinely does have a height.
+/// * **The event.** That height is when the race is LOST, not when it starts. The walk itself is a
+///   chain of RELATIVE timelocks that must be *started* `head_start` blocks earlier, and it can also
+///   be started for us at any moment by an ancestor spending `F`. Waiting for the height alone is
+///   too late by construction.
+///
+/// `deadline_block` is therefore `L_k − head_start`: the last height at which STARTING the walk
+/// still finishes it in time. That is the identical quantity `auto_exit_due` compares against
+/// in-process, computed by the identical call, so the delegated tower and the owner's own tower
+/// cannot drift apart — the whole reason S8 existed.
+///
+/// **`head_start` is where the N-level chain shows up.** `chain` is the BOUND chain
+/// (`child_exit_chain_bound` / `spine_tip_exit_chain_bound`), which splices every intermediate
+/// spine segment root→leaf, so a depth-N leaf is charged all N levels and not just its own two
+/// tiers. Passing the DECLARED chain here would let a sender hand the tower a schedule of their
+/// choosing — see `child_exit_chain`'s own warning.
+///
+/// Keyless like everything else here: the chain is fully signed and pays only the owner, and
+/// `backup_tx` is `None` because a leaf has no absolute-locktime sweep — its exit IS the chain.
+pub(crate) fn leaf_watch_entry(
+    statechain_id: &str,
+    what: &str,
+    token_carrier: bool,
+    chain: &[(String, Option<u16>)],
+    epoch_deadline: u32,
+    f_txid: &str,
+    f_vout: u32,
+) -> Result<WatchEntry> {
+    // Fails CLOSED, like every other read in the export: an entry we cannot build must abort the
+    // bundle, never be quietly dropped from it. A leaf with no chain has no walk to protect it.
+    if chain.is_empty() {
+        return Err(anyhow!(
+            "refusing to export a watch bundle that silently omits {statechain_id}: its {what} row \
+             has an EMPTY exit chain, so there is nothing a watchtower could broadcast for it"
+        ));
+    }
+    let csvs: Vec<Option<u16>> = chain.iter().map(|(_, csv)| *csv).collect();
+    let head_start = mercurylib::transfer::receiver::exit_wait_blocks(&csvs);
+    let txs: Vec<String> = chain.iter().map(|(tx, _)| tx.clone()).collect();
+    Ok(WatchEntry {
+        statechain_id: statechain_id.to_string(),
+        token_carrier,
+        // `saturating_sub`: a leaf whose head start already exceeds its deadline is PAST due, and
+        // `0` makes both predicates fire on the next pass. Wrapping here would produce ~4 billion
+        // and mark the most urgent coin in the wallet as the least.
+        deadline_block: epoch_deadline.saturating_sub(head_start),
+        branch_txs: txs.clone(),
+        backup_tx: None,
+        backup_locktime: None,
+        trigger: Some(WatchTrigger {
+            watch_txid: f_txid.to_string(),
+            watch_vout: f_vout,
+            csv_blocks: head_start,
+            push_txs: txs,
+        }),
+    })
+}
+
 /// One watched coin: everything needed to protect it, nothing needed to steal it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WatchEntry {
@@ -136,6 +202,42 @@ impl UtexoWallet {
             std::collections::HashSet::new()
         };
 
+        // [S7] THE LEAF ROWS, read ONCE, before the coin loop.
+        //
+        // A split child lives under `ctesr-<id>` and a spine tip under `SPINE_TIP_KEY_PREFIX`.
+        // Neither is a `tesr-` row and neither has a `branch-` row, so BOTH reads in the loop below
+        // come back empty for a leaf and it took the `continue` written for a flat deposit — a coin
+        // with on-chain funding that no ancestor can race. A leaf is the exact opposite of that: its
+        // funding `SP.out[j]` is un-broadcast, its deadline belongs to the splitter, and it is the
+        // deepest walk in the wallet.
+        //
+        // So every leaf was SILENTLY ABSENT from every exported bundle. The in-process tower
+        // (`auto_exit_due`) covers them, which is what hid this: delegating to a third-party tower
+        // protected the parents and left the children unwatched, and the export still reported
+        // success. That is the same silent omission the `read_exit_branch` comment below fails
+        // CLOSED against, and it is the shape `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 names.
+        //
+        // `?`: an unreadable backup store must not be read as "this wallet holds no leaves".
+        let leaf_rows: std::collections::HashMap<String, (&'static str, String)> =
+            mercuryrustlib::sqlite_manager::get_all_backup_txs(
+                &self.inner.cc.pool,
+                &self.inner.config.wallet_name,
+            )
+            .await?
+            .into_iter()
+            .filter_map(|(k, json)| {
+                // Matches `auto_exit_due`'s dispatch exactly. `strip_prefix("ctesr-")` is safe
+                // against the reclaim rows: `CHILD_RECLAIM_KEY_PREFIX` is deliberately not a
+                // `ctesr-` prefix precisely so these scanners cannot pick them up.
+                if let Some(cid) = k.strip_prefix("ctesr-") {
+                    Some((cid.to_string(), ("adopted split child", json)))
+                } else {
+                    k.strip_prefix(mercuryrustlib::tesr::SPINE_TIP_KEY_PREFIX)
+                        .map(|tid| (tid.to_string(), ("spine tip", json)))
+                }
+            })
+            .collect();
+
         let mut entries = Vec::new();
         for coin in record
             .coins
@@ -143,6 +245,12 @@ impl UtexoWallet {
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
         {
             let Some(id) = coin.statechain_id.clone() else { continue };
+            // [S7] The leaf lane, taken BEFORE the branch/ladder reads so a leaf is described by the
+            // row that actually governs it and can never be emitted twice.
+            if let Some((what, json)) = leaf_rows.get(&id) {
+                entries.push(self.leaf_entry(&id, what, json, coin, &carriers)?);
+                continue;
+            }
             // F4: propagate a storage failure. `unwrap_or_default()` here turned an unreadable
             // wallet DB into "no exit branch", i.e. into the flat-coin case — the coin was then
             // silently DROPPED from the bundle and the watchtower it was handed to never watched
@@ -249,6 +357,62 @@ impl UtexoWallet {
             wallet_name: self.inner.config.wallet_name.clone(),
             entries,
         })?)
+    }
+
+    /// [S7] Parse one leaf row and turn it into its [`WatchEntry`]. Every failure is an `Err` — the
+    /// export must abort rather than hand a tower a bundle that is quietly short an entry.
+    fn leaf_entry(
+        &self,
+        id: &str,
+        what: &str,
+        json: &str,
+        coin: &mercurylib::wallet::Coin,
+        carriers: &std::collections::HashSet<String>,
+    ) -> Result<WatchEntry> {
+        use mercuryrustlib::tesr::{
+            child_exit_chain_bound, epoch_deadline_from_flat_backups, spine_tip_exit_chain_bound,
+            ChildTesrBundle, SpineTipBundle,
+        };
+
+        let fail = |stage: &str, e: String| {
+            anyhow!(
+                "refusing to export a watch bundle that silently omits {id} ({what}): {stage} ({e})"
+            )
+        };
+        // [B1] The chain must be the BOUND one. This value is used to compute a DEADLINE, which is
+        // exactly the use `child_exit_chain`'s doc forbids for the declared timelocks — on a
+        // conveyed leaf they are attacker-supplied serde, and a sender who declares `csv: 1` on a
+        // tier the SE co-signed at 2 124 would otherwise shrink the head start to nothing and move
+        // the moment their victim's tower defends the coin.
+        let (chain, backups, f_txid, f_vout) = if what == "spine tip" {
+            let tip: SpineTipBundle =
+                serde_json::from_str(json).map_err(|e| fail("its stored row will not parse", e.to_string()))?;
+            let chain = spine_tip_exit_chain_bound(&tip)
+                .map_err(|e| fail("its exit chain's timelocks could not be bound to the signatures enforcing them", e.to_string()))?;
+            let (t, v) = (tip.parent.f_txid.clone(), tip.parent.f_vout);
+            (chain, tip.parent_flat_backups, t, v)
+        } else {
+            let cb: ChildTesrBundle =
+                serde_json::from_str(json).map_err(|e| fail("its stored row will not parse", e.to_string()))?;
+            let chain = child_exit_chain_bound(&cb)
+                .map_err(|e| fail("its exit chain's timelocks could not be bound to the signatures enforcing them", e.to_string()))?;
+            let (t, v) = (cb.parent.f_txid.clone(), cb.parent.f_vout);
+            (chain, cb.parent_flat_backups, t, v)
+        };
+        // [audit-17] `L_k` READ OFF THE SIGNED BACKUPS. The minimum nLockTime over the parent's
+        // conveyed, signature-verified, census-counted flat backups IS `L_k` exactly — no `k` needs
+        // conveying and no `L_0 + initlock` recomputation can be too late by `k·interval`.
+        let deadline = epoch_deadline_from_flat_backups(&backups)
+            .map_err(|e| fail("its exit-race deadline could not be computed", e.to_string()))?;
+        leaf_watch_entry(
+            id,
+            what,
+            crate::wallet::is_token_carrier(coin, carriers),
+            &chain,
+            deadline,
+            &f_txid,
+            f_vout,
+        )
     }
 }
 
@@ -383,6 +547,115 @@ fn tolerable_rebroadcast(msg: &str) -> bool {
     ["already in block chain", "already in utxo set", "txn-already-known", "already in mempool", "already have transaction"]
         .iter()
         .any(|needle| m.contains(needle))
+}
+
+/// **[S7] The leaf entry: the head start must grow with the chain, and both predicates must be set.**
+#[cfg(test)]
+mod s7_leaf_watch_entry_tests {
+    use super::*;
+
+    /// An N-level chain. The hex is never parsed by [`leaf_watch_entry`] (binding already happened
+    /// upstream, in `leaf_entry`), so a label is enough to prove ORDER is preserved.
+    fn chain(csvs: &[u16]) -> Vec<(String, Option<u16>)> {
+        let mut v = vec![("74".to_string(), None)]; // the trigger: no CSV
+        v.extend(csvs.iter().enumerate().map(|(i, c)| (format!("{i:02x}"), Some(*c))));
+        v
+    }
+
+    #[test]
+    fn head_start_is_exit_wait_blocks_over_the_whole_chain_and_grows_with_depth() {
+        let deadline = 1_000_000;
+        let shallow = chain(&[720, 1440]);
+        let deep = chain(&[720, 0, 720, 0, 720, 1440]); // two spliced spine levels
+
+        let a = leaf_watch_entry("a", "adopted split child", false, &shallow, deadline, "f", 0)
+            .expect("shallow");
+        let b = leaf_watch_entry("b", "adopted split child", false, &deep, deadline, "f", 0)
+            .expect("deep");
+
+        let hs = |e: &WatchEntry| e.trigger.as_ref().unwrap().csv_blocks;
+        // The head start is exactly what the shared function says, per S8: Σ(csv) + one block per
+        // tier for its parent to CONFIRM. Recomputing it here as a bare Σ(csv) is the under-count
+        // this whole line of work removed, so the assertion calls the same function the gate does.
+        let csvs: Vec<Option<u16>> = deep.iter().map(|(_, c)| *c).collect();
+        assert_eq!(hs(&b), mercurylib::transfer::receiver::exit_wait_blocks(&csvs));
+        assert!(
+            hs(&b) > hs(&a),
+            "a DEEPER leaf must be given a LONGER head start — if the spliced spine segments were \
+             dropped the two would be equal and the deep leaf would start its walk far too late \
+             ({} vs {})",
+            hs(&b),
+            hs(&a)
+        );
+        // ...and the head start is what is subtracted, so the deeper leaf is due EARLIER.
+        assert_eq!(b.deadline_block, deadline - hs(&b));
+        assert!(b.deadline_block < a.deadline_block);
+    }
+
+    #[test]
+    fn both_predicates_are_armed_and_no_backup_is_ever_exported() {
+        let e = leaf_watch_entry("c", "spine tip", true, &chain(&[720, 1440]), 900_000, "abcd", 3)
+            .expect("entry");
+        // The height predicate is REAL for a leaf — unlike a laddered parent, which is exported at
+        // u32::MAX precisely to disable it. A leaf exported that way would be watched only for the
+        // event and would sleep through its own deadline.
+        assert_ne!(e.deadline_block, u32::MAX);
+        assert!(e.deadline_block < 900_000);
+        let t = e.trigger.as_ref().expect("a leaf's race also starts on an EVENT, not only a height");
+        assert_eq!((t.watch_txid.as_str(), t.watch_vout), ("abcd", 3));
+        // Same list either way: whichever predicate fires, the tower broadcasts the same signed
+        // chain, and `watch_pass` preferring `push_txs` when both fire is then a no-op.
+        assert_eq!(t.push_txs, e.branch_txs);
+        // Structural denial of the token-destroying sweep, and correct for a plain leaf too: a leaf
+        // has no absolute-locktime backup at all — its exit IS the chain.
+        assert!(e.backup_tx.is_none() && e.backup_locktime.is_none());
+    }
+
+    #[test]
+    fn a_leaf_past_its_own_head_start_is_due_now_rather_than_in_four_billion_blocks() {
+        let e = leaf_watch_entry("d", "adopted split child", false, &chain(&[720, 1440]), 10, "f", 0)
+            .expect("entry");
+        assert_eq!(e.deadline_block, 0, "saturating, not wrapping");
+    }
+
+    /// **The regression this whole item is about is an OMISSION**, and no test of `leaf_watch_entry`
+    /// can catch one: the helper is never called, so it never gets to be wrong. The defect was
+    /// exactly that shape for as long as leaves have existed — the export ran, returned `Ok`, and
+    /// the bundle was simply short every leaf in the wallet.
+    ///
+    /// Exercising the real export needs a wallet DB with an adopted child in it, which is an E2E on
+    /// the live stack (S9). Until then this pins the two structural facts that make the omission
+    /// impossible: the leaf lane EXISTS, and it is taken BEFORE the flat-coin `continue` that used
+    /// to swallow leaves. Single identifiers only — a phrase would be re-wrapped by rustfmt and this
+    /// would then pin nothing while still passing.
+    #[test]
+    fn the_export_consults_the_leaf_rows_before_the_flat_coin_shortcut() {
+        let src = include_str!("watchtower.rs");
+        let body = src
+            .split_once("pub async fn export_watch_bundle")
+            .expect("export_watch_bundle exists")
+            .1;
+        // CALL forms, not bare identifiers: the comments in this function discuss both reads by
+        // name, and a bare `read_exit_branch` needle matches the prose above the leaf block rather
+        // than the call below it — which is how this assertion first failed against correct code.
+        let leaf = body.find("leaf_rows.get(").expect(
+            "export_watch_bundle no longer reads the leaf rows — every adopted split child and \
+             spine tip is silently absent from the exported bundle, and a delegated watchtower is \
+             not watching them",
+        );
+        let flat = body.find("self.read_exit_branch(").expect("the flat/branch lane exists");
+        assert!(
+            leaf < flat,
+            "the leaf lane must be taken BEFORE the branch/ladder reads: a leaf has neither row, so \
+             reaching them first puts it back on the flat-deposit `continue` that dropped it"
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_aborts_the_export_instead_of_dropping_the_coin() {
+        let err = leaf_watch_entry("e", "spine tip", false, &[], 1000, "f", 0).unwrap_err();
+        assert!(err.to_string().contains("silently omits e"), "{err}");
+    }
 }
 
 #[cfg(test)]
