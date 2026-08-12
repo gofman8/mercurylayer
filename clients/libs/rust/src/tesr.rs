@@ -845,6 +845,27 @@ impl SpineTipBundle {
     /// The cap's CSV band is `[d_floor, d0]` and deliberately **not** `[0, 0]`: the cap is the
     /// sender's slow exit leg, and it is precisely what the next batch's `SP` at [`SPINE_CSV`] has
     /// to out-race.
+    /// **[S3] The tip's coloured witness chain**, root→leaf: the parent segment's ladder, every
+    /// intermediate spine segment, then the tip's own single cap. The sibling of
+    /// [`ChildTesrBundle::colored_child_txids`], and it differs in exactly one way that matters —
+    /// **a tip contributes ONE txid, not two.** Emitting a phantom extension here would send the
+    /// resolver hunting a witness that was never built; omitting the cap would leave the allocation's
+    /// final hop unproven.
+    pub fn colored_tip_txids(&self) -> Result<Vec<String>> {
+        if !self.is_colored() {
+            return Err(anyhow::anyhow!("this spine tip is PLAIN — it has no coloured witness chain"));
+        }
+        let mut v = self.parent.ladder_txids();
+        for seg in self.ancestors.iter() {
+            if let Some(ext) = seg.extension.as_ref() {
+                v.push(ext.txid.clone());
+            }
+            v.push(seg.state.txid.clone());
+        }
+        v.push(self.cap.txid.clone());
+        Ok(v)
+    }
+
     pub fn validate(&self) -> Result<()> {
         use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
 
@@ -3143,6 +3164,55 @@ pub fn build_colored_in_ladder_split(
             ));
         }
 
+        // ---- [S3 — CORRECTED] A CHANGE TIP IS ONE CAP, AND MUST BE **BUILT** AS ONE. -------------
+        //
+        // S3 landed the tip's SHAPE everywhere it is described — `extension: None` on the draft, the
+        // tip floor, `role: SpineTip` in the journal, one co-signature instead of two — and nowhere
+        // it is CONSTRUCTED. The loop below went on building both rungs and the draft simply dropped
+        // the extension, so the cap still spent `xc`'s payload output: a transaction that is no
+        // longer part of the chain. Its consignment therefore committed to `xc` as a witness, and
+        // the receiver's four-txid chain (`T -> X_m -> SP -> cap`) could not resolve it.
+        //
+        // Nothing in-process could see it. The unit tests assert `extension.is_none()`, which was
+        // true; the guard test pins the source line `if c.is_change_tip { None } else { .. }`, which
+        // is the very line that made it *look* done. Only RGB validation over the real witness chain
+        // disagreed — sdk77, live: `public witness 557a4e10.. is not known to the resolver`.
+        //
+        // `build_colored_spine_cap` is S2's builder for exactly this shape and takes `SP.out[j]`
+        // directly, which is what makes the cap's prevout — and therefore its taproot sighash and
+        // its consignment's witness set — the real one. `spine_level = 0`: this is the ROOT split's
+        // tip, the first level of the spine, and `colored_child_seals` walks later segments as
+        // `(Spine, 0, i)` with `i` the level.
+        if c.is_change_tip {
+            let cap = build_colored_spine_cap(
+                rgb,
+                &rgb_half.contract_id,
+                &c.statechain_id,
+                &sp.txid,
+                out.vout,
+                out.value,
+                &out.script_pubkey_hex,
+                &c.owner_exit_address,
+                c.rgb_amount,
+                0,
+                csv_d,
+                &bundle.network,
+                bundle.fee_rate,
+            )?;
+            child_drafts.push(ColoredSplitChildDraft {
+                statechain_id: c.statechain_id.clone(),
+                owner_exit_address: c.owner_exit_address.clone(),
+                sp_vout: out.vout,
+                sp_out_value: out.value,
+                rgb_amount: c.rgb_amount,
+                csv_e,
+                csv_d,
+                extension: None,
+                state: cap,
+            });
+            continue;
+        }
+
         // Child extension: spends SP.out[j], stays under the CHILD's aggregate.
         let x_value = colored_tier_out_value(out.value, bundle.fee_rate).ok_or_else(|| {
             anyhow::anyhow!(
@@ -3213,7 +3283,9 @@ pub fn build_colored_in_ladder_split(
             csv_e,
             csv_d,
             // [S3] `None` marks a CHANGE TIP: one cap over `SP.out[j]`, no extension between.
-            extension: if c.is_change_tip { None } else { Some(draft_of(xc)) },
+            // A PAYEE always has both rungs; the change tip took the one-cap branch above and
+            // never reaches here.
+            extension: Some(draft_of(xc)),
             state: draft_of(sc),
         });
     }
@@ -3254,7 +3326,7 @@ pub async fn cosign_colored_in_ladder_split(
     bundle: &TesrBundle,
     draft: ColoredSplitDraft,
     child_coins: &mut [Coin],
-) -> Result<Vec<ChildTesrBundle>> {
+) -> Result<(Vec<ChildTesrBundle>, Option<SpineTipBundle>)> {
     let rgb_half = bundle
         .rgb
         .clone()
@@ -3530,6 +3602,8 @@ pub async fn cosign_colored_in_ladder_split(
     crash_point("after_colored_inladder_sp_sign");
 
     let mut bundles = Vec::with_capacity(draft.children.len());
+    // [S3] The sender's CHANGE leg, which is a tip rather than a conveyable child.
+    let mut tip: Option<SpineTipBundle> = None;
     for (j, (cd, child_coin)) in draft.children.iter().zip(child_coins.iter_mut()).enumerate() {
         // Per TIER, not per child, and for the same reason the plain lane journals per tier: a
         // re-run of a co-sign that already happened pushes the child's `num_sigs` past its census
@@ -3592,6 +3666,50 @@ pub async fn cosign_colored_in_ladder_split(
         // It is journalled as a `SpineTipBundle` instead — the same place the PLAIN lane puts its
         // change leg — which is why `SplitJournalChild::role` was set to `SpineTip` above.
         let Some(child_extension) = child_extension else {
+            // [S3 — CORRECTED] …but "not conveyed" is not "not recorded". This arm used to be a bare
+            // `continue`, so the sender's own change leg was co-signed, journalled — and then
+            // dropped on the floor: no `spinetip-` row, nothing for `exit_spine_tip_pass` or the
+            // watchtower to find, and the caller left indexing `bundles[n_pay]` for a bundle that no
+            // longer existed. The comment above says the tip "is journalled as a `SpineTipBundle`
+            // instead"; nothing built one.
+            //
+            // `rgb: Some(ColoredTip)` is what makes it the COLOURED tip: without the cap's
+            // consignment, `colored_exit_move` has nowhere to move the allocation on exit and the
+            // change is sats-only — the allocation would be stranded on an outpoint no wallet can
+            // spend.
+            if tip.is_some() {
+                return Err(anyhow::anyhow!(
+                    "a coloured split produced TWO change tips ({} is the second) — a split has one \
+                     change leg and the journal's roles disagree with the draft's shapes",
+                    child_sids[j]
+                ));
+            }
+            let built = SpineTipBundle {
+                parent: parent_seg.clone(),
+                parent_statechain_id: parent_sid.clone(),
+                // Depth-1: the ROOT coloured split, so `SP` is the parent segment's own current
+                // state and there is no intermediate segment to walk.
+                ancestors: vec![],
+                sp_vout: cd.sp_vout,
+                // `SP.out[K]`'s value, not the cap's output — the next batch carves its payloads out
+                // of this number.
+                sp_out_value: cd.sp_out_value,
+                statechain_id: child_sids[j].clone(),
+                owner_exit_address: cd.owner_exit_address.clone(),
+                cap: child_state,
+                superseded_caps: vec![],
+                parent_flat_backups: parent_backups.clone(),
+                rgb: Some(ColoredTip {
+                    contract_id: rgb_half.contract_id.clone(),
+                    amount: cd.rgb_amount,
+                    consignment: cd.state.consignment.clone(),
+                }),
+            };
+            // Validated while it is still only a value belonging to the function that built it —
+            // same reasoning as the plain lane: the caller books coins against this before the
+            // persist door would otherwise catch a mis-shaped tip.
+            built.validate()?;
+            tip = Some(built);
             continue;
         };
         let Some(x_draft) = cd.extension.as_ref() else {
@@ -3646,7 +3764,7 @@ pub async fn cosign_colored_in_ladder_split(
     // lane's, and it is a strict improvement on nothing on disk at all.
     journal.stage = SplitStage::Committed;
     journal_write(cc, wallet_name, &journal).await?;
-    Ok(bundles)
+    Ok((bundles, tip))
 }
 
 // =================================================================================================
@@ -13516,9 +13634,20 @@ mod spine_tip_tests {
             let at = src.find("pub fn build_colored_in_ladder_split(").expect("builder");
             &src[at..at + src[at..].find("\n/// ").unwrap_or(4000)]
         };
+        // **PIN THE CONSTRUCTION, NOT THE DESCRIPTION.** This assertion used to read
+        // `builder.contains("if c.is_change_tip { None } else { Some(draft_of(xc)) }")` — the line
+        // that DROPS the extension from the draft. It passed while the builder still built both
+        // rungs and left the cap spending the extension's payload output, so the cap's consignment
+        // committed to a witness that is not in the tip's four-transaction chain. The absence of an
+        // extension in a struct field is a description of the shape; what matters is that the cap is
+        // BUILT over `SP.out[j]`. Caught only by live RGB validation (sdk77), never in-process.
         assert!(
-            builder.contains("if c.is_change_tip { None } else { Some(draft_of(xc)) }"),
-            "the change leg must have NO extension — that absence IS the tip shape"
+            builder.contains("if c.is_change_tip {") && builder.contains("build_colored_spine_cap("),
+            "the change leg must be BUILT as one cap over `SP.out[j]` via `build_colored_spine_cap`, \
+             not carved as a two-rung piece whose extension is then dropped from the draft. Dropping \
+             it leaves the cap spending a transaction that is not in the chain, and its consignment \
+             commits to that phantom witness — `PermanentlyInvalid` at the receiver's resolver, which \
+             no in-process test can see"
         );
         assert!(
             builder.contains("colored_spine_tip_floor(bundle.fee_rate"),

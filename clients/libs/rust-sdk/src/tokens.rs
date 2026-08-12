@@ -2370,6 +2370,52 @@ impl UtexoWallet {
         })
     }
 
+    /// **[S3] `colored_child_health` for the sender's own CHANGE TIP.**
+    ///
+    /// A tip is not a child and is not stored as one — `spinetip-`, one cap, no payee — so the child
+    /// call cannot reach it. Same three questions though: does the leaf consignment validate against
+    /// this tip's OWN un-broadcast witness chain, what amount does it assign, and over which
+    /// witnesses. The witness list is `colored_tip_txids`, which contributes ONE txid for the cap
+    /// where a child contributes an extension and a state.
+    pub async fn colored_tip_health(
+        &self,
+        statechain_id: &str,
+    ) -> Result<(String, u64, Vec<String>, Option<String>)> {
+        let tip = mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("statechain id {statechain_id} is not a persisted spine tip"))?;
+        let rgb_half = tip
+            .rgb
+            .clone()
+            .ok_or_else(|| anyhow!("spine tip {statechain_id} is PLAIN"))?;
+        let txids = tip.colored_tip_txids()?;
+        let cap = tip.cap.clone();
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        tokio::task::block_in_place(|| -> Result<(String, u64, Vec<String>, Option<String>)> {
+            let (verdict, detail, contract) =
+                w.validate_offchain_chain_info(&rgb_half.consignment, &txids)?;
+            if verdict != ValidationVerdict::Valid {
+                return Err(anyhow!(
+                    "the coloured spine tip {statechain_id} does not validate off-chain \
+                     ({verdict:?}): {}",
+                    detail.unwrap_or_default()
+                ));
+            }
+            let assigned = w.accept_offchain_amount(
+                &rgb_half.consignment,
+                &txids,
+                &cap.txid,
+                cap.payload_vout,
+            )?;
+            Ok((contract.unwrap_or_else(|| rgb_half.contract_id.clone()), assigned, txids, detail))
+        })
+    }
+
     /// **[CTES-R] The on-chain survival proof of a COLOURED CHILD's unilateral exit.** The
     /// child-lane sibling of [`Self::colored_exit_proof`] — the EMPTY off-chain witness set is the
     /// whole assertion, so `Valid` is reachable only once every tier that ever carried the
@@ -3822,10 +3868,19 @@ impl UtexoWallet {
                     let (verdict, detail, contract) =
                         w.validate_offchain_chain_info(&cd.state.consignment, &txids)?;
                     if verdict != ValidationVerdict::Valid {
+                        // [S3] NAME THE LEG. A payee and the sender's change tip have different
+                        // ladder shapes — two rungs versus one cap — and therefore different
+                        // witness chains, so "which leg" is the first thing anyone debugging this
+                        // needs and the message used to withhold it. `extension: None` IS the tip.
+                        let leg = if cd.extension.is_none() {
+                            "the sender's CHANGE TIP (one cap over SP.out[j], no extension)"
+                        } else {
+                            "a PAYEE piece (extension + state over SP.out[j])"
+                        };
                         return Err(anyhow!(
-                            "refusing the coloured in-ladder split of {carrier_id}: child {}'s \
-                             leaf consignment does not validate against its own chain \
-                             ({verdict:?}): {}",
+                            "refusing the coloured in-ladder split of {carrier_id}: child {} — \
+                             {leg} — has a leaf consignment that does not validate against its own \
+                             chain ({verdict:?}) over witnesses {txids:?}: {}",
                             cd.statechain_id,
                             detail.unwrap_or_default()
                         ));
@@ -3863,7 +3918,7 @@ impl UtexoWallet {
         let sp_txid = draft.sp_txid.clone();
 
         // ---- PHASE 2 — network only: 1 + 2N blind SE co-signs, then the handover. ----------------
-        let bundles = mercuryrustlib::tesr::cosign_colored_in_ladder_split(
+        let (bundles, change_tip) = mercuryrustlib::tesr::cosign_colored_in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &mut carrier,
@@ -3920,13 +3975,30 @@ impl UtexoWallet {
             )
             .await?;
         }
+        // [S3 — CORRECTED] THE CHANGE IS A TIP, SO PERSIST IT AS ONE.
+        //
+        // This read `persist_child(&bundles[n_pay])`, which was correct while every leg was a
+        // two-rung child. Once S3 made the change leg a one-cap SPINE TIP it stopped being a
+        // `ChildTesrBundle` at all, so `bundles` holds only the payees and the index panicked —
+        // out of bounds on the very call that saves the sender's own money. A `spinetip-` row is
+        // also what `exit_spine_tip_pass`, the watchtower and the next batch's funding lookup all
+        // read, so writing it under `ctesr-` would have been wrong in a quieter way.
         if token_change > 0 {
-            mercuryrustlib::tesr::persist_child(
+            let tip = change_tip.ok_or_else(|| {
+                anyhow!(
+                    "the coloured split kept {token_change} of the allocation as change but produced                      no spine tip to hold it — refusing to continue, because the change would have                      no persisted exit and the allocation would be stranded on an un-broadcast                      outpoint"
+                )
+            })?;
+            mercuryrustlib::tesr::persist_spine_tip(
                 &self.inner.cc,
                 &self.inner.config.wallet_name,
-                &bundles[n_pay],
+                &tip,
             )
             .await?;
+        } else if change_tip.is_some() {
+            return Err(anyhow!(
+                "the coloured split produced a change tip while keeping NO change — the draft's leg                  shapes and the amounts disagree"
+            ));
         }
 
         // ---- RGB bookkeeping: the carrier's `F` is spent, the change lives at SP.out[change]. ----

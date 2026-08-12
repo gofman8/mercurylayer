@@ -279,24 +279,60 @@ pub async fn execute() -> Result<()> {
         .filter_map(|c| c.statechain_id.clone())
         .find(|sid| *sid != carrier_sid && *sid != piece_sid)
         .ok_or(anyhow!("alice has no confirmed change child after the split"))?;
-    let change_cb = mercuryrustlib::tesr::load_child(&cc, "sdk77_alice", &change_sid)
-        .await?
-        .ok_or(anyhow!("alice's change child has no ctesr- bundle"))?;
-    assert!(change_cb.is_colored(), "the change child must be COLOURED");
-    assert_eq!(
-        change_cb.rgb.as_ref().unwrap().amount,
-        SUPPLY - PAY,
-        "the change child must carry the remaining allocation"
+    // [S3] THE CHANGE IS A SPINE TIP, NOT A CHILD — `spinetip-`, not `ctesr-`.
+    //
+    // This used to load a `ChildTesrBundle`. A tip is the sender's OWN leg: one cap over
+    // `SP.out[K]`, no extension, no payee, and it becomes the next batch's funding outpoint. It is
+    // deliberately keyed apart from `ctesr-`, because everything keyed `ctesr-` is read as a
+    // conveyable leaf that arrived from somebody else — the flat-lane licence, the carrier exit
+    // allowlist and the tower's child loop all treat it that way. A tip stored under `ctesr-` would
+    // be read as a two-rung child and dereference a `child_extension` it does not have.
+    //
+    // Asserting the KEY and not just the contents is the point: while the builder still carved the
+    // change as a piece, this test passed against a `ctesr-` row, and the shape the protocol
+    // specifies was never exercised.
+    assert!(
+        mercuryrustlib::tesr::load_child(&cc, "sdk77_alice", &change_sid).await?.is_none(),
+        "the change leg must NOT be stored as a conveyable `ctesr-` child — it is the sender's own          one-cap tip"
     );
-    let (_, change_assigned, _, _) = alice.colored_child_health(&change_sid).await?;
+    let change_tip = mercuryrustlib::tesr::load_spine_tip(&cc, "sdk77_alice", &change_sid)
+        .await?
+        .ok_or(anyhow!("alice's change has no spinetip- bundle"))?;
+    let change_rgb = change_tip
+        .rgb
+        .as_ref()
+        .ok_or(anyhow!("the change tip must be COLOURED — without the cap's consignment the                         allocation has nowhere to move on exit"))?;
+    assert_eq!(
+        change_rgb.amount,
+        SUPPLY - PAY,
+        "the change tip must carry the remaining allocation"
+    );
+    // ONE cap, spending `SP.out[K]` DIRECTLY. This is the assertion that the builder actually
+    // BUILDS the tip shape rather than carving two rungs and dropping one from the record: a cap
+    // rooted anywhere else commits to a witness outside the tip's four-transaction chain, and the
+    // consignment fails to resolve at the receiver.
+    {
+        use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+        let raw = hex::decode(&change_tip.cap.signed_tx)?;
+        let cap: Transaction = deserialize(&raw)?;
+        assert_eq!(cap.input.len(), 1, "a cap spends exactly one outpoint");
+        assert_eq!(
+            cap.input[0].previous_output.txid.to_string(),
+            change_tip.parent.current().state.txid,
+            "the cap must spend SP DIRECTLY — not an extension's payload output"
+        );
+        assert_eq!(cap.input[0].previous_output.vout, change_tip.sp_vout);
+    }
+    let (_, change_assigned, _, _) = alice.colored_tip_health(&change_sid).await?;
     assert_eq!(
         change_assigned,
         SUPPLY - PAY,
-        "alice's change child must validate off-chain and assign her the remainder"
+        "alice's change tip must validate off-chain and assign her the remainder"
     );
     println!(
-        "SDK77 - (1) alice retains {alice_left} of {asset_id} as a COLOURED change child \
-         ({change_sid}); the spent carrier outpoint holds nothing"
+        "SDK77 - (1) alice retains {alice_left} of {asset_id} as a COLOURED change TIP \
+         ({change_sid}) — one cap over SP.out[K], keyed `spinetip-` and never conveyed; the spent \
+         carrier outpoint holds nothing"
     );
 
     // ---- 3. ADOPTION: bob claims the coloured child. ----------------------------------------------
