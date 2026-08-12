@@ -5118,13 +5118,89 @@ pub async fn spine_batch_split(
     change_leg: ChangeLeg,
     conveyance: &[(String, String)],
 ) -> Result<InLadderSplitOutput> {
+    spine_batch_split_ex(cc, wallet_name, tip_coin, tip, children, change_leg, conveyance, None)
+        .await
+}
+
+/// **[S4] The COLOURED spine batch** — [`spine_batch_split`] over a tip that carries an allocation.
+///
+/// The `SP` is built by the caller through [`build_colored_spine_batch_sp`] and passed in already
+/// coloured. It cannot be built here: this function is `async` and the RGB engine's resolver is
+/// `!Sync`, so holding it across these awaits would stop the whole future being `Send`. Same
+/// two-phase split as every other coloured path in this module.
+///
+/// Everything else — the write-ahead journal, the terminalization ordering, the per-leg census — is
+/// the plain lane's, unchanged. A coloured batch differs from a plain one in exactly one place: the
+/// transaction it co-signs carries RGB state transitions.
+#[allow(clippy::too_many_arguments)]
+pub async fn spine_batch_split_colored(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    tip_coin: &mut Coin,
+    tip: &SpineTipBundle,
+    children: &mut [(Coin, String, u64)],
+    change_leg: ChangeLeg,
+    conveyance: &[(String, String)],
+    colored_sp: &ColoredTierDraft,
+) -> Result<InLadderSplitOutput> {
+    spine_batch_split_ex(
+        cc,
+        wallet_name,
+        tip_coin,
+        tip,
+        children,
+        change_leg,
+        conveyance,
+        Some(colored_sp),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spine_batch_split_ex(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    tip_coin: &mut Coin,
+    tip: &SpineTipBundle,
+    children: &mut [(Coin, String, u64)],
+    change_leg: ChangeLeg,
+    conveyance: &[(String, String)],
+    colored_sp: Option<&ColoredTierDraft>,
+) -> Result<InLadderSplitOutput> {
     // ---- STRUCTURE, STRICTLY BEFORE VALUE, AND ALL OF IT BEFORE ANYTHING IS SIGNED --------------
     //
     // The ordering is the one this file has lost four times (see `mod linked`). Here it is also what
     // makes the numbers below meaningful: `tip.validate()` is the only thing that proves
     // `sp_out_value` is the value of the outpoint the cap's SIGNATURE names, and every amount in this
     // batch is carved out of that number.
-    refuse_uncolored_over_colored_tip(tip, "spine_batch_split")?;
+    // ── [S4] LANE FORK, replacing the blanket refusal. ───────────────────────────────────────────
+    //
+    // This used to be `refuse_uncolored_over_colored_tip`, and its reasoning was right: building an
+    // UNCOLOURED split state over `SP.out[K]` — the outpoint the allocation is booked at — destroys
+    // it. What has changed is that the coloured `SP` now exists (`build_colored_spine_batch_sp`), so
+    // the answer for a coloured tip is a different transaction rather than a refusal.
+    //
+    // Both mismatches are refused, and each names the lane that IS correct. Getting either wrong is
+    // irreversible: a coloured tip down the plain path burns the allocation, and a plain tip handed a
+    // coloured `SP` would co-sign a transaction carrying transitions for an asset it does not hold.
+    match (tip.is_colored(), colored_sp.is_some()) {
+        (true, false) => {
+            return Err(anyhow::anyhow!(
+                "spine_batch_split: this SPINE TIP carries an RGB allocation (CTES-R), so its batch \
+                 must be built with `build_colored_spine_batch_sp` and driven through \
+                 `spine_batch_split_colored`. Building an UNCOLOURED split state over its funding \
+                 outpoint `SP.out[K]` — the outpoint the allocation is booked at — would destroy it."
+            ));
+        }
+        (false, true) => {
+            return Err(anyhow::anyhow!(
+                "spine_batch_split_colored: this spine tip is PLAIN but a coloured SP was supplied. \
+                 Co-signing it would commit an irreversible SE slot to a transaction carrying RGB \
+                 transitions for an allocation this tip does not hold — use `spine_batch_split`."
+            ));
+        }
+        _ => {}
+    }
     // The record is this wallet's own write and has no counterparty; re-checking it here costs one
     // parse and is the difference between building a batch over a proven outpoint and building it
     // over a serde field. A tip that fails this cannot be batched — but it is also not lost: the
@@ -5272,15 +5348,33 @@ pub async fn spine_batch_split(
                 .map(|a| (a, *v))
         })
         .collect::<Result<_>>()?;
-    let sp = mercurylib::tesr::build_split_state_from(
-        &fund_txid,
-        fund_vout,
-        tip.sp_out_value,
-        &payees,
-        &network,
-        SPINE_CSV,
-        fee_rate,
-    )?;
+    // ONE `SP`, from whichever lane. The plain builder is unchanged and still uses
+    // `build_split_state_from` (never `build_split_state`, which hard-codes its input vout to 0);
+    // the coloured one was built by the caller and is used VERBATIM — rebuilding it here would
+    // derive a second transition over the same outpoint and the two would collide.
+    let (sp_txid, sp_payload_vout, sp_tx_hex) = match colored_sp {
+        Some(c) => (c.txid.clone(), c.payload_vout, c.tx_hex.clone()),
+        None => {
+            // THE GUARD SITS HERE NOW, immediately above the uncoloured builder, rather than at the
+            // top of the function. The lane fork above already refuses a coloured tip with no
+            // coloured SP — but `uncoloured_builder_census` flagged the rearrangement, and it was
+            // right to: a fork is a fork, while THIS is the one line that decides whether an
+            // RGB-unaware transaction is built over a sealed outpoint. Keeping the original guard
+            // function as the single point of truth, adjacent to the call it protects, is stronger
+            // than the arrangement it replaces and keeps the census meaningful.
+            refuse_uncolored_over_colored_tip(tip, "spine_batch_split")?;
+            let sp = mercurylib::tesr::build_split_state_from(
+                &fund_txid,
+                fund_vout,
+                tip.sp_out_value,
+                &payees,
+                &network,
+                SPINE_CSV,
+                fee_rate,
+            )?;
+            (sp.txid, sp.payload_vout, sp.tx_hex)
+        }
+    };
 
     let tip_sid = tip.statechain_id.clone();
 
@@ -5309,7 +5403,7 @@ pub async fn spine_batch_split(
         .collect::<Result<Vec<_>>>()?;
     let recipients = resolve_conveyance_plan(&legs, conveyance, &network)?;
     let mut journal = SplitJournalRecord {
-        op_id: format!("spine_batch:{tip_sid}:{}", sp.txid),
+        op_id: format!("spine_batch:{tip_sid}:{}", sp_txid),
         lane: "spine_batch".to_string(),
         stage: SplitStage::Planned,
         terminalized_statechain_id: tip_sid.clone(),
@@ -5326,7 +5420,7 @@ pub async fn spine_batch_split(
                 statechain_id: sid.clone(),
                 owner_exit_address: recipient.clone(),
                 value: children[j].2,
-                sp_vout: sp.payload_vout + j as u32,
+                sp_vout: sp_payload_vout + j as u32,
                 extension: None,
                 state: None,
                 // PLAIN lane — `refuse_uncolored_over_colored_tip` above is what makes that true.
@@ -5344,10 +5438,10 @@ pub async fn spine_batch_split(
         child_state_csv: p.state_csv(0),
         fee_rate,
         network: network.clone(),
-        sp_txid: sp.txid.clone(),
+        sp_txid: sp_txid.clone(),
     };
     // [K>1 prerequisite 1] Same check, same reason, one level further up the spine.
-    journal.validate_plan(n, sp.payload_vout, total, change_leg)?;
+    journal.validate_plan(n, sp_payload_vout, total, change_leg)?;
     journal_write(cc, wallet_name, &journal).await?;
 
     crate::lightning_latch::set_spend_budget(cc, wallet_name, &tip_sid, 1).await?;
@@ -5355,18 +5449,18 @@ pub async fn spine_batch_split(
     // Co-signed under the TIP's aggregate: `SP_i.out[K]` pays this slot's key, and its value is the
     // one `validate()` proved against the funding transaction.
     let sp_signed =
-        cosign_tier(cc, tip_coin, sp.tx_hex.clone(), tip.sp_out_value, &network).await?;
+        cosign_tier(cc, tip_coin, sp_tx_hex.clone(), tip.sp_out_value, &network).await?;
 
     // THE SPINE SEGMENT, as every leg of this batch will convey it — assembled by `spine_segment`,
     // which is the ONE definition of that shape and is what this lane's tests exercise.
     let spine_seg = spine_segment(
         tip,
         TesrTier {
-            txid: sp.txid.clone(),
+            txid: sp_txid.clone(),
             signed_tx: sp_signed,
             out_value: total,
             csv: Some(SPINE_CSV),
-            payload_vout: sp.payload_vout,
+            payload_vout: sp_payload_vout,
         },
     );
     journal.ancestors.push(spine_seg.clone());
@@ -13733,7 +13827,11 @@ mod spine_tip_tests {
             let at = src.find(marker).unwrap_or_else(|| panic!("{marker} not found"));
             &src[at..at + src[at..].find("\n}\n").expect("function ends")]
         };
-        let batch = cut("\npub async fn spine_batch_split(");
+        // [S4] Re-pointed at `_ex`, which now holds the body: `spine_batch_split` became a thin
+        // delegate when the coloured lane was forked in. Re-pointing rather than deleting — the
+        // properties below are exactly as load-bearing as before, and a census that silently cut a
+        // three-line delegate would have asserted them against nothing.
+        let batch = cut("\nasync fn spine_batch_split_ex(");
         assert!(
             batch.contains("mercurylib::tesr::build_split_state_from(")
                 && !batch.contains("mercurylib::tesr::build_split_state("),
@@ -20288,7 +20386,8 @@ mod exit_chain_length_cap_tests {
         // ---- BUILD — the other three call sites all pass the parent's real tier count ------------
         for (f, expected) in [
             ("\npub async fn in_ladder_split(", "bundle.exit_tiers().len()"),
-            ("\npub async fn spine_batch_split(", "tip.parent.exit_tiers().len()"),
+            // [S4] same re-point: the body moved to `_ex`.
+            ("\nasync fn spine_batch_split_ex(", "tip.parent.exit_tiers().len()"),
             ("\npub async fn child_in_ladder_split(", "cb.parent.exit_tiers().len()"),
         ] {
             assert!(cut(f).contains(expected), "{f} must pass {expected} to the depth/length cap");
