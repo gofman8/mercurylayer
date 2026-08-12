@@ -1967,6 +1967,174 @@ pub fn build_colored_receiver_state(
     })
 }
 
+/// **[CR-D / D29] A COLOURED DE-TRIGGER — the coloured on-chain re-anchor.**
+///
+/// D1 assumed the coloured re-anchor meant "colour the refresh transaction", and that is **not
+/// buildable**: `refresh` routes through `withdraw`, an RGB-unaware builder that refuses carriers one
+/// level up. D29 took a different route after the three-design menu (CR-A/B/C) turned out not to be
+/// exhaustive.
+///
+/// **CR-D needs no RGB rival over `F` at all.** A de-trigger is a FRESH spend of `T`'s payload output
+/// with the relative timelock disabled — so the re-anchor is `T` (already co-signed and part of the
+/// ladder) followed by this: **two transactions, zero CSV wait, no SE change**, and it reuses
+/// `TierRole::Detrigger`, a tag allocated since the plain de-trigger shipped.
+///
+/// Why that matters for the asset rather than just the sats: the plain de-trigger pays the owner
+/// through an RGB-*unaware* transaction, so using it on a carrier moves the sats and BURNS the
+/// allocation. This one carries a valid state transition on its payload output, which is what makes
+/// a coloured carrier renewable at all — without it a coloured coin has no renewal primitive and its
+/// life ends in a forced exit (the gap D30 cites when it keeps `colored_ladder` off).
+///
+/// Engine-only and synchronous, exactly like [`build_colored_receiver_state`]: it co-signs nothing.
+/// The RGB engine's resolver is `!Sync`, so the build must not straddle an `await` — hence the same
+/// two-phase split the rest of the coloured lane uses.
+pub fn build_colored_detrigger(
+    rgb: &mercury_rgb::RgbWallet,
+    bundle: &TesrBundle,
+    to_address: &str,
+) -> Result<ColoredStateDraft> {
+    use crate::rgb::{build_colored_tier, colored_tier_out_value, ColoredTierSpec, TierRole};
+
+    if !bundle.is_colored() {
+        return Err(anyhow::anyhow!(
+            "build_colored_detrigger: this coin's ladder is PLAIN — use `cosign_detrigger`, whose \
+             uncoloured builder is correct for it"
+        ));
+    }
+    let _ = bundle.colored_tier_seals()?;
+    let rgb_half = bundle.rgb.as_ref().expect("is_colored");
+    refuse_outstanding_conveyance(bundle, "build_colored_detrigger")?;
+
+    // The de-trigger spends the TRIGGER's payload output — not an extension's. On a coloured ladder
+    // the trigger carries its opret at index 0, which is exactly why `build_detrigger`'s hardcoded
+    // `UNCOLORED_PAYLOAD_VOUT` would name an OP_RETURN and produce a dead transaction that still
+    // burns an irreversible SE co-sign (`cosign_detrigger` refuses coloured bundles for this
+    // reason). Reading `payload_vout` off the tier is what makes the coloured shape work.
+    let trigger = bundle.trigger.clone();
+    let (parent_value, parent_spk) =
+        tier_payload_prevout(&trigger, "coloured de-trigger parent")?;
+    let out_value = colored_tier_out_value(parent_value, bundle.fee_rate).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the coloured trigger ({parent_value} sat) cannot carry a de-trigger at {} sat/vB",
+            bundle.fee_rate
+        )
+    })?;
+    let payee = mercurylib::tesr::payee_address(to_address, &bundle.network)?;
+
+    // **The seal must not collide with the trigger's own transition.** Both hang off the same
+    // statechain id, and a de-trigger is not a state — it is its own role, which is what separates
+    // them. `rung` carries the renewal epoch so that de-triggering twice across a coin's life (once
+    // per re-anchor generation) never derives one blinding twice: two transitions sharing a blinding
+    // collapse to one `BundleId` and rgb-lib then resolves it by a hash lottery, leaving the loser's
+    // consignment unvalidatable.
+    let seal =
+        colored_tier_seal(&bundle.statechain_id, TierRole::Detrigger, 0, bundle.m, None);
+
+    let tier = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &trigger.txid,
+            prev_vout: trigger.payload_vout,
+            prev_value: parent_value,
+            prev_spk_hex: &parent_spk,
+            // TIMELOCK DISABLED — the whole point. Every pre-signed extension needs `E >= E_floor`
+            // confirmations, so a de-trigger with no wait confirms first and kills the stale ladder.
+            sequence: mercurylib::tesr::TRIGGER_SEQUENCE.0,
+            payloads: &[(payee.clone(), out_value, rgb_half.amount)],
+            network: &bundle.network,
+            fee_rate: bundle.fee_rate,
+            nonce: Some(seal.rung as u64),
+        },
+        &seal,
+    )?;
+
+    Ok(ColoredStateDraft {
+        statechain_id: bundle.statechain_id.clone(),
+        payee,
+        // A de-trigger has NO relative timelock. `csv: 0` records that fact rather than a schedule
+        // position, and the co-signer below re-checks the built transaction actually carries
+        // `TRIGGER_SEQUENCE` — a draft that claims 0 while carrying a real CSV would be a slow
+        // de-trigger, i.e. one that loses the race it exists to win.
+        csv: 0,
+        parent_txid: trigger.txid,
+        parent_vout: trigger.payload_vout,
+        parent_value,
+        tier: ColoredTierDraft {
+            tx_hex: tier.tx_hex,
+            txid: tier.txid,
+            payload_vout: tier.payloads[0].vout,
+            payload_value: tier.payloads[0].value,
+            payload_spk_hex: tier.payloads[0].script_pubkey_hex.clone(),
+            consignment: tier.consignment,
+        },
+    })
+}
+
+/// **[CR-D] Blind-co-sign a coloured de-trigger** — the network half of [`build_colored_detrigger`].
+///
+/// One `cosign_tier` round-trip, the same as the plain path; the SE never learns anything is
+/// coloured. Everything the draft asserts is RE-CHECKED here against the bundle the caller actually
+/// holds, because the draft is built where the engine lives and consumed where the network does — a
+/// mismatch is a refusal, never a rebuild.
+pub async fn cosign_colored_detrigger(
+    cc: &ClientConfig,
+    coin: &mut Coin,
+    bundle: &TesrBundle,
+    draft: ColoredStateDraft,
+    to_address: &str,
+) -> Result<String> {
+    if !bundle.is_colored() {
+        return Err(anyhow::anyhow!("cosign_colored_detrigger on a PLAIN ladder"));
+    }
+    if draft.statechain_id != bundle.statechain_id {
+        return Err(anyhow::anyhow!(
+            "coloured de-trigger draft is for {} but the bundle is {}",
+            draft.statechain_id,
+            bundle.statechain_id
+        ));
+    }
+    let want_payee = mercurylib::tesr::payee_address(to_address, &bundle.network)?;
+    if draft.payee != want_payee {
+        return Err(anyhow::anyhow!(
+            "coloured de-trigger draft pays {} but this call asked for {want_payee}",
+            draft.payee
+        ));
+    }
+    // It must spend THE TRIGGER, at the trigger's own payload vout. A draft naming anything else is
+    // not a de-trigger, and co-signing it would spend an irreversible SE slot on the wrong outpoint.
+    if draft.parent_txid != bundle.trigger.txid || draft.parent_vout != bundle.trigger.payload_vout {
+        return Err(anyhow::anyhow!(
+            "coloured de-trigger draft spends {}:{} but this coin's trigger payload is {}:{}",
+            draft.parent_txid,
+            draft.parent_vout,
+            bundle.trigger.txid,
+            bundle.trigger.payload_vout
+        ));
+    }
+    // And it must carry NO relative timelock. A de-trigger that has to wait loses to the pre-signed
+    // extensions it exists to outrun, which turns the co-op path into a slower version of the hostile
+    // one — silently, since the transaction is otherwise valid.
+    {
+        use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+        let raw = hex::decode(&draft.tier.tx_hex)
+            .map_err(|e| anyhow::anyhow!("coloured de-trigger hex does not decode: {e}"))?;
+        let tx: Transaction = deserialize(&raw)
+            .map_err(|e| anyhow::anyhow!("coloured de-trigger does not parse: {e}"))?;
+        if tx.input.len() != 1 || tx.input[0].sequence != mercurylib::tesr::TRIGGER_SEQUENCE {
+            return Err(anyhow::anyhow!(
+                "a de-trigger must disable its relative timelock (nSequence {:#x}), but this draft \
+                 carries {:#x} — it would have to WAIT, and a de-trigger that waits loses to the \
+                 pre-signed extensions it exists to outrun",
+                mercurylib::tesr::TRIGGER_SEQUENCE.0,
+                tx.input.first().map(|i| i.sequence.0).unwrap_or_default()
+            ));
+        }
+    }
+
+    cosign_tier(cc, coin, draft.tier.tx_hex.clone(), draft.parent_value, &bundle.network).await
+}
+
 /// Blind-co-sign a [`ColoredStateDraft`] and return the AUGMENTED bundle to convey — the coloured
 /// sibling of [`presign_receiver_state`]'s co-sign half. Exactly one `cosign_tier` round-trip, the
 /// same as the plain path; the SE never learns that anything is coloured.
@@ -23109,6 +23277,98 @@ mod bump_wiring_tests {
         assert!(
             err.contains("refusing to price a fee child against a guess"),
             "say why it refuses rather than defaulting: {err}"
+        );
+    }
+}
+
+/// [CR-D / D29] The coloured de-trigger's shape rules, pinned in source.
+#[cfg(test)]
+mod crd_colored_detrigger_tests {
+    /// The two CR-D functions, comments stripped.
+    fn src_of(name: &str) -> String {
+        let src = include_str!("tesr.rs");
+        let at = src.find(name).expect("function exists");
+        let end = src[at..]
+            .find("\n/// ")
+            .map(|e| at + e)
+            .unwrap_or(src.len());
+        src[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The property that makes it a de-trigger at all.** Every pre-signed extension needs
+    /// `E >= E_floor` confirmations; a de-trigger wins by having no wait. Build it with a real CSV
+    /// and it becomes a slower version of the hostile path — silently, since the transaction is
+    /// otherwise perfectly valid.
+    #[test]
+    fn the_timelock_is_disabled_at_build_and_re_checked_at_co_sign() {
+        let build = src_of("pub fn build_colored_detrigger(");
+        assert!(
+            build.contains("sequence: mercurylib::tesr::TRIGGER_SEQUENCE.0"),
+            "the builder must disable the relative timelock"
+        );
+        let cosign = src_of("pub async fn cosign_colored_detrigger(");
+        assert!(
+            cosign.contains("!= mercurylib::tesr::TRIGGER_SEQUENCE"),
+            "the co-signer must RE-CHECK it against the built transaction — a draft is produced \
+             where the engine lives and consumed where the network does, so its claims are not \
+             evidence"
+        );
+    }
+
+    /// It must spend the TRIGGER's payload output, read off the tier rather than assumed.
+    ///
+    /// This is the specific thing the PLAIN builder gets wrong on a coloured coin: a coloured
+    /// trigger carries its opret at index 0, so `build_detrigger`'s hardcoded
+    /// `UNCOLORED_PAYLOAD_VOUT` names an OP_RETURN and yields a dead transaction that still burns an
+    /// irreversible SE co-sign.
+    #[test]
+    fn it_spends_the_triggers_payload_vout_not_a_hardcoded_index() {
+        let build = src_of("pub fn build_colored_detrigger(");
+        assert!(build.contains("prev_vout: trigger.payload_vout"), "read the vout off the tier");
+        assert!(
+            !build.contains("UNCOLORED_PAYLOAD_VOUT"),
+            "the uncoloured constant is exactly the bug this function exists to avoid"
+        );
+        let cosign = src_of("pub async fn cosign_colored_detrigger(");
+        assert!(
+            cosign.contains("bundle.trigger.payload_vout"),
+            "the co-signer must confirm the draft spends this coin's trigger, not some other outpoint"
+        );
+    }
+
+    /// A plain ladder must be sent to the plain builder, and a coloured one must never reach it.
+    /// Both directions, because either mistake destroys something: the plain builder burns the
+    /// allocation, and this one has no coloured material to work with.
+    #[test]
+    fn the_two_lanes_refuse_each_others_bundles() {
+        let build = src_of("pub fn build_colored_detrigger(");
+        assert!(
+            build.contains("if !bundle.is_colored()"),
+            "the coloured builder must refuse a PLAIN bundle by name"
+        );
+        let plain = src_of("pub async fn cosign_detrigger(");
+        assert!(
+            plain.contains("refuse_uncolored_over_colored(bundle, \"cosign_detrigger\")"),
+            "and the plain path must keep refusing COLOURED bundles — that guard is why a coloured \
+             carrier was never silently de-triggered through the uncoloured builder"
+        );
+    }
+
+    /// The seal must use the de-trigger's own role, or it collides with the trigger's transition
+    /// over the same statechain id — and two transitions sharing a blinding collapse to one
+    /// `BundleId`, after which rgb-lib resolves the rival by a hash lottery and the loser's
+    /// consignment can never be validated.
+    #[test]
+    fn the_seal_uses_the_detrigger_role_and_the_renewal_epoch() {
+        let build = src_of("pub fn build_colored_detrigger(");
+        assert!(build.contains("TierRole::Detrigger"), "its own role, not State");
+        assert!(
+            build.contains("bundle.m"),
+            "the renewal epoch must separate de-triggers across re-anchor generations"
         );
     }
 }
