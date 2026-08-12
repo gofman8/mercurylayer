@@ -759,6 +759,18 @@ pub enum TierRole {
     ChildExtension,
     /// CHILD STATE — a split child's owner state, spending its child extension's payload output.
     ChildState,
+    /// **SPINE tier `SP_i` — [S1]** an intermediate split state on the CATS-B spine, at
+    /// `SPINE_CSV = 0`, whose payload outputs fund the next spine level and whose tip carries the
+    /// batch's remaining value.
+    ///
+    /// Distinct from [`TierRole::SplitState`] and NOT a renaming of it: a spine tier is re-spent by
+    /// the NEXT batch at the same CSV, so two spine levels over one funding chain would otherwise
+    /// derive the same seal — the exact `BundleId` collapse the blinding scheme exists to prevent.
+    /// `tier_index` carries the spine level `i`, which is what separates them.
+    ///
+    /// Allocated by S1 ahead of the coloured spine builders (S2–S4) so the tag is fixed before any
+    /// coin is minted against it. **Never renumber** — see [`Self::tag`].
+    Spine,
 }
 
 impl TierRole {
@@ -777,6 +789,9 @@ impl TierRole {
             TierRole::Combine => 0x09,
             TierRole::ChildExtension => 0x0A,
             TierRole::ChildState => 0x0B,
+            // [S1] 0x0C — the next free tag. `0x01..=0x0B` were in use, so this extends the space
+            // rather than disturbing any coin already in flight.
+            TierRole::Spine => 0x0C,
         }
     }
 }
