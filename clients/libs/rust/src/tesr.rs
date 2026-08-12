@@ -2331,27 +2331,29 @@ pub fn build_colored_spine_cap(
 ///
 /// Engine-only and synchronous. Returns the unsigned coloured `SP`; the caller journals it and
 /// co-signs it exactly as the plain batch does.
-pub fn build_colored_spine_batch_sp(
+fn build_colored_spine_batch_sp_full(
     rgb: &mercury_rgb::RgbWallet,
     tip: &SpineTipBundle,
-    children: &[ColoredSplitChildSpec],
-    change_agg_address: &str,
-    change_rgb_amount: u64,
+    payees: &[ColoredSplitChildSpec],
+    change: &ColoredSplitChildSpec,
     spine_level: u32,
-) -> Result<ColoredTierDraft> {
+) -> Result<(crate::rgb::ColoredTier, u64)> {
+    let children = payees;
+    let change_agg_address = change.agg_address.as_str();
+    let change_rgb_amount = change.rgb_amount;
     use crate::rgb::{
         build_colored_tier, colored_tier_out_total, ColoredTierSpec, TierRole,
     };
 
     if !tip.is_colored() {
         return Err(anyhow::anyhow!(
-            "build_colored_spine_batch_sp: this spine tip is PLAIN — `spine_batch_split` is correct \
+            "build_colored_spine_batch: this spine tip is PLAIN — `spine_batch_split` is correct \
              for it, and building a coloured SP over a plain tip would attach an allocation the tip \
              does not hold"
         ));
     }
     let rgb_half = tip.rgb.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("build_colored_spine_batch_sp: coloured tip carries no RGB half")
+        anyhow::anyhow!("build_colored_spine_batch: coloured tip carries no RGB half")
     })?;
     tip.validate().map_err(|e| {
         anyhow::anyhow!(
@@ -2448,14 +2450,110 @@ pub fn build_colored_spine_batch_sp(
         },
         &sp_seal,
     )?;
+    Ok((sp, change_sats))
+}
+
+/// **[S4b] The COLOURED spine batch, whole: `SP_{i+1}` over the tip's funding outpoint, and every
+/// leg beneath it genuinely coloured.**
+///
+/// This is what S4 was missing. S4 built the coloured `SP` and an entry point, but below `SP` the
+/// batch went on using the PLAIN leg builders and persisted every record with `rgb: None` — an
+/// uncoloured tier over `SP.out[j]`, which after the batch is exactly where the allocation lives.
+/// That does not fail; it BURNS. (Nothing called it, so the hole was latent — see the `(true, true)`
+/// refusal in `spine_batch_split_ex`, which this function exists to let someone eventually lift.)
+///
+/// Geometrically the batch is the ROOT split with one substitution: `SP` is rooted at the tip's
+/// funding outpoint `SP_i.out[K]` instead of `X_m`'s payload output, and it out-races the tip's own
+/// cap at [`SPINE_CSV`]. Everything below is identical, which is why both lanes now call the one
+/// [`build_colored_split_legs`] — two copies of that loop is two places for the shapes to drift, and
+/// the drift is invisible until an allocation is gone.
+///
+/// `children` is payees-then-change, and the LAST entry must be the change tip (`is_change_tip`),
+/// the same convention [`build_colored_in_ladder_split`] uses. It becomes the next level's tip.
+pub fn build_colored_spine_batch(
+    rgb: &mercury_rgb::RgbWallet,
+    tip: &SpineTipBundle,
+    children: &[ColoredSplitChildSpec],
+    spine_level: u32,
+) -> Result<ColoredSplitDraft> {
+    let Some((change, payees)) = children.split_last() else {
+        return Err(anyhow::anyhow!(
+            "a coloured spine batch needs at least a change leg — an empty batch would terminalize              the tip and leave the allocation nowhere"
+        ));
+    };
+    if !change.is_change_tip {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch: the LAST leg must be the change tip (`is_change_tip`). Position              is a convention, and a convention that decides a leg's floor and ladder shape is one              that gets violated silently — so it is declared and checked, never inferred"
+        ));
+    }
+    if payees.iter().any(|c| c.is_change_tip) {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch: a PAYEE is marked `is_change_tip` — a batch has exactly one              change leg and it is the last"
+        ));
+    }
+    let (sp, _change_sats) = build_colored_spine_batch_sp_full(rgb, tip, payees, change, spine_level)?;
+    if sp.payloads.len() != children.len() {
+        return Err(anyhow::anyhow!(
+            "the coloured spine batch state carries {} payload outputs, expected {}",
+            sp.payloads.len(),
+            children.len()
+        ));
+    }
+    let rgb_half = tip.rgb.as_ref().expect("checked by build_colored_spine_batch_sp_full");
+    let p = tip.parent.params;
+    let (fund_txid, fund_vout) = tip.funding_outpoint();
+    let (prev_value, _) = tier_payload_prevout(tip.funding_tier(), "coloured spine batch parent")?;
+    let child_drafts = build_colored_split_legs(
+        rgb,
+        &rgb_half.contract_id,
+        &sp,
+        children,
+        p.ext_csv(0),
+        p.state_csv(0),
+        &tip.parent.network,
+        tip.parent.fee_rate,
+    )?;
+    Ok(ColoredSplitDraft {
+        // The TIP is the parent of this batch, not the root coin — its slot is the one that gets
+        // terminalized when `SP_{i+1}` is co-signed.
+        parent_statechain_id: tip.statechain_id.clone(),
+        contract_id: rgb_half.contract_id.clone(),
+        network: tip.parent.network.clone(),
+        fee_rate: tip.parent.fee_rate,
+        sp_csv: SPINE_CSV,
+        sp_txid: sp.txid,
+        sp_tx_hex: sp.tx_hex,
+        sp_consignment: sp.consignment,
+        sp_total: sp.payloads.iter().map(|o| o.value).sum(),
+        parent_prev_txid: fund_txid,
+        parent_prev_vout: fund_vout,
+        parent_prev_value: prev_value,
+        children: child_drafts,
+    })
+}
+
+/// The coloured spine batch's `SP` alone. A thin delegate over [`build_colored_spine_batch`] so the
+/// conservation laws and floors live in exactly one place — this used to be the whole builder, and
+/// its `ColoredTierDraft` return is what made the legs unbuildable: it carries `payloads[0]` and
+/// discards every other leg's outpoint.
+pub fn build_colored_spine_batch_sp(
+    rgb: &mercury_rgb::RgbWallet,
+    tip: &SpineTipBundle,
+    children: &[ColoredSplitChildSpec],
+    spine_level: u32,
+) -> Result<ColoredTierDraft> {
+    let draft = build_colored_spine_batch(rgb, tip, children, spine_level)?;
+    let first = draft.children.first().ok_or_else(|| {
+        anyhow::anyhow!("coloured spine batch produced no legs")
+    })?;
     Ok(ColoredTierDraft {
-        tx_hex: sp.tx_hex,
-        txid: sp.txid,
-        // vout 0 is the first payee; the change leg is the LAST payload. Callers index by position.
-        payload_vout: sp.payloads[0].vout,
-        payload_value: sp.payloads[0].value,
-        payload_spk_hex: sp.payloads[0].script_pubkey_hex.clone(),
-        consignment: sp.consignment,
+        tx_hex: draft.sp_tx_hex,
+        txid: draft.sp_txid,
+        // vout 0 is the first leg; the change is the LAST payload. Callers index by position.
+        payload_vout: first.sp_vout,
+        payload_value: first.sp_out_value,
+        payload_spk_hex: String::new(),
+        consignment: draft.sp_consignment,
     })
 }
 
@@ -2986,6 +3084,175 @@ pub struct ColoredSplitDraft {
     pub children: Vec<ColoredSplitChildDraft>,
 }
 
+/// **[S4b] The legs of a coloured split, shared by BOTH lanes that carve them.**
+///
+/// Below `SP` the two coloured lanes are the same construction: a ROOT split
+/// ([`build_colored_in_ladder_split`]) and a SPINE BATCH ([`build_colored_spine_batch`]) differ only
+/// in where `SP` is rooted — over `X_m`'s payload output, or over the tip's funding outpoint
+/// `SP_i.out[K]`. Every leg beneath it is identical: a payee gets `ext_child` + `state_child`, the
+/// sender's change gets ONE cap.
+///
+/// Factored out rather than copied, because the batch lane shipped without legs at all
+/// (`spine_batch_split_ex` built them with the PLAIN builders and persisted `rgb: None`, an
+/// uncoloured tier over the outpoint the allocation is booked at). A second copy of this loop is a
+/// second place for the shapes to drift apart, and the drift is silent until an allocation burns.
+#[allow(clippy::too_many_arguments)]
+fn build_colored_split_legs(
+    rgb: &mercury_rgb::RgbWallet,
+    contract_id: &str,
+    sp: &crate::rgb::ColoredTier,
+    children: &[ColoredSplitChildSpec],
+    csv_e: u16,
+    csv_d: u16,
+    network: &str,
+    fee_rate: f64,
+) -> Result<Vec<ColoredSplitChildDraft>> {
+    use crate::rgb::{build_colored_tier, colored_tier_out_value, ColoredTierSpec, TierRole};
+    let n = children.len();
+    let mut child_drafts = Vec::with_capacity(n);
+    for (j, c) in children.iter().enumerate() {
+        // The child's vout is READ from the builder's returned payload list, never assumed: a
+        // coloured tier carries the opret at index 0 and shifts every payload by one.
+        let out = &sp.payloads[j];
+        if out.value != c.sats {
+            return Err(anyhow::anyhow!(
+                "coloured split child {} was built at {} sat but asked for {}",
+                c.statechain_id,
+                out.value,
+                c.sats
+            ));
+        }
+
+        // ---- [S3 — CORRECTED] A CHANGE TIP IS ONE CAP, AND MUST BE **BUILT** AS ONE. -------------
+        //
+        // S3 landed the tip's SHAPE everywhere it is described — `extension: None` on the draft, the
+        // tip floor, `role: SpineTip` in the journal, one co-signature instead of two — and nowhere
+        // it is CONSTRUCTED. The loop below went on building both rungs and the draft simply dropped
+        // the extension, so the cap still spent `xc`'s payload output: a transaction that is no
+        // longer part of the chain. Its consignment therefore committed to `xc` as a witness, and
+        // the receiver's four-txid chain (`T -> X_m -> SP -> cap`) could not resolve it.
+        //
+        // Nothing in-process could see it. The unit tests assert `extension.is_none()`, which was
+        // true; the guard test pins the source line `if c.is_change_tip { None } else { .. }`, which
+        // is the very line that made it *look* done. Only RGB validation over the real witness chain
+        // disagreed — sdk77, live: `public witness 557a4e10.. is not known to the resolver`.
+        //
+        // `build_colored_spine_cap` is S2's builder for exactly this shape and takes `SP.out[j]`
+        // directly, which is what makes the cap's prevout — and therefore its taproot sighash and
+        // its consignment's witness set — the real one. `spine_level = 0`: this is the ROOT split's
+        // tip, the first level of the spine, and `colored_child_seals` walks later segments as
+        // `(Spine, 0, i)` with `i` the level.
+        if c.is_change_tip {
+            let cap = build_colored_spine_cap(
+                rgb,
+                contract_id,
+                &c.statechain_id,
+                &sp.txid,
+                out.vout,
+                out.value,
+                &out.script_pubkey_hex,
+                &c.owner_exit_address,
+                c.rgb_amount,
+                0,
+                csv_d,
+                network,
+                fee_rate,
+            )?;
+            child_drafts.push(ColoredSplitChildDraft {
+                statechain_id: c.statechain_id.clone(),
+                owner_exit_address: c.owner_exit_address.clone(),
+                sp_vout: out.vout,
+                sp_out_value: out.value,
+                rgb_amount: c.rgb_amount,
+                csv_e,
+                csv_d,
+                extension: None,
+                state: cap,
+            });
+            continue;
+        }
+
+        // Child extension: spends SP.out[j], stays under the CHILD's aggregate.
+        let x_value = colored_tier_out_value(out.value, fee_rate).ok_or_else(|| {
+            anyhow::anyhow!(
+                "coloured split child {} ({} sat) cannot carry an extension",
+                c.statechain_id,
+                out.value
+            )
+        })?;
+        let x_seal =
+            colored_tier_seal(&c.statechain_id, TierRole::ChildExtension, 0, 0, Some(csv_e));
+        let xc = build_colored_tier(
+            rgb,
+            &ColoredTierSpec {
+                contract_id: contract_id,
+                prev_txid: &sp.txid,
+                prev_vout: out.vout,
+                prev_value: out.value,
+                prev_spk_hex: &out.script_pubkey_hex,
+                sequence: mercurylib::tesr::csv_blocks(csv_e).0,
+                payloads: &[(c.agg_address.clone(), x_value, c.rgb_amount)],
+                network: network,
+                fee_rate: fee_rate,
+                nonce: Some(x_seal.rung as u64),
+            },
+            &x_seal,
+        )?;
+
+        // Child state: spends the child extension's payload output, pays the RECIPIENT.
+        let s_value = colored_tier_out_value(xc.payloads[0].value, fee_rate)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "coloured split child {}'s extension cannot carry a state",
+                    c.statechain_id
+                )
+            })?;
+        let s_seal = colored_tier_seal(&c.statechain_id, TierRole::ChildState, 0, 0, Some(csv_d));
+        let sc = build_colored_tier(
+            rgb,
+            &ColoredTierSpec {
+                contract_id: contract_id,
+                prev_txid: &xc.txid,
+                prev_vout: xc.payloads[0].vout,
+                prev_value: xc.payloads[0].value,
+                prev_spk_hex: &xc.payloads[0].script_pubkey_hex,
+                sequence: mercurylib::tesr::csv_blocks(csv_d).0,
+                payloads: &[(c.owner_exit_address.clone(), s_value, c.rgb_amount)],
+                network: network,
+                fee_rate: fee_rate,
+                nonce: Some(s_seal.rung as u64),
+            },
+            &s_seal,
+        )?;
+
+        let draft_of = |t: crate::rgb::ColoredTier| ColoredTierDraft {
+            tx_hex: t.tx_hex,
+            txid: t.txid,
+            payload_vout: t.payloads[0].vout,
+            payload_value: t.payloads[0].value,
+            payload_spk_hex: t.payloads[0].script_pubkey_hex.clone(),
+            consignment: t.consignment,
+        };
+        child_drafts.push(ColoredSplitChildDraft {
+            statechain_id: c.statechain_id.clone(),
+            owner_exit_address: c.owner_exit_address.clone(),
+            sp_vout: out.vout,
+            sp_out_value: out.value,
+            rgb_amount: c.rgb_amount,
+            csv_e,
+            csv_d,
+            // [S3] `None` marks a CHANGE TIP: one cap over `SP.out[j]`, no extension between.
+            // A PAYEE always has both rungs; the change tip took the one-cap branch above and
+            // never reaches here.
+            extension: Some(draft_of(xc)),
+            state: draft_of(sc),
+        });
+    }
+
+    Ok(child_drafts)
+}
+
+
 /// **Build a COLOURED in-ladder split.** Engine-only, synchronous, co-signs NOTHING — the
 /// `!Sync`-resolver rule that governs every other coloured builder in this module.
 ///
@@ -3148,147 +3415,19 @@ pub fn build_colored_in_ladder_split(
     }
 
     // ---- Per child: a headless COLOURED ladder off SP.out[j]. ----------------------------------
+    // [S4b] Shared with the SPINE BATCH lane — see `build_colored_split_legs`.
     let csv_e = p.ext_csv(0);
     let csv_d = p.state_csv(0);
-    let mut child_drafts = Vec::with_capacity(n);
-    for (j, c) in children.iter().enumerate() {
-        // The child's vout is READ from the builder's returned payload list, never assumed: a
-        // coloured tier carries the opret at index 0 and shifts every payload by one.
-        let out = &sp.payloads[j];
-        if out.value != c.sats {
-            return Err(anyhow::anyhow!(
-                "coloured split child {} was built at {} sat but asked for {}",
-                c.statechain_id,
-                out.value,
-                c.sats
-            ));
-        }
-
-        // ---- [S3 — CORRECTED] A CHANGE TIP IS ONE CAP, AND MUST BE **BUILT** AS ONE. -------------
-        //
-        // S3 landed the tip's SHAPE everywhere it is described — `extension: None` on the draft, the
-        // tip floor, `role: SpineTip` in the journal, one co-signature instead of two — and nowhere
-        // it is CONSTRUCTED. The loop below went on building both rungs and the draft simply dropped
-        // the extension, so the cap still spent `xc`'s payload output: a transaction that is no
-        // longer part of the chain. Its consignment therefore committed to `xc` as a witness, and
-        // the receiver's four-txid chain (`T -> X_m -> SP -> cap`) could not resolve it.
-        //
-        // Nothing in-process could see it. The unit tests assert `extension.is_none()`, which was
-        // true; the guard test pins the source line `if c.is_change_tip { None } else { .. }`, which
-        // is the very line that made it *look* done. Only RGB validation over the real witness chain
-        // disagreed — sdk77, live: `public witness 557a4e10.. is not known to the resolver`.
-        //
-        // `build_colored_spine_cap` is S2's builder for exactly this shape and takes `SP.out[j]`
-        // directly, which is what makes the cap's prevout — and therefore its taproot sighash and
-        // its consignment's witness set — the real one. `spine_level = 0`: this is the ROOT split's
-        // tip, the first level of the spine, and `colored_child_seals` walks later segments as
-        // `(Spine, 0, i)` with `i` the level.
-        if c.is_change_tip {
-            let cap = build_colored_spine_cap(
-                rgb,
-                &rgb_half.contract_id,
-                &c.statechain_id,
-                &sp.txid,
-                out.vout,
-                out.value,
-                &out.script_pubkey_hex,
-                &c.owner_exit_address,
-                c.rgb_amount,
-                0,
-                csv_d,
-                &bundle.network,
-                bundle.fee_rate,
-            )?;
-            child_drafts.push(ColoredSplitChildDraft {
-                statechain_id: c.statechain_id.clone(),
-                owner_exit_address: c.owner_exit_address.clone(),
-                sp_vout: out.vout,
-                sp_out_value: out.value,
-                rgb_amount: c.rgb_amount,
-                csv_e,
-                csv_d,
-                extension: None,
-                state: cap,
-            });
-            continue;
-        }
-
-        // Child extension: spends SP.out[j], stays under the CHILD's aggregate.
-        let x_value = colored_tier_out_value(out.value, bundle.fee_rate).ok_or_else(|| {
-            anyhow::anyhow!(
-                "coloured split child {} ({} sat) cannot carry an extension",
-                c.statechain_id,
-                out.value
-            )
-        })?;
-        let x_seal =
-            colored_tier_seal(&c.statechain_id, TierRole::ChildExtension, 0, 0, Some(csv_e));
-        let xc = build_colored_tier(
-            rgb,
-            &ColoredTierSpec {
-                contract_id: &rgb_half.contract_id,
-                prev_txid: &sp.txid,
-                prev_vout: out.vout,
-                prev_value: out.value,
-                prev_spk_hex: &out.script_pubkey_hex,
-                sequence: mercurylib::tesr::csv_blocks(csv_e).0,
-                payloads: &[(c.agg_address.clone(), x_value, c.rgb_amount)],
-                network: &bundle.network,
-                fee_rate: bundle.fee_rate,
-                nonce: Some(x_seal.rung as u64),
-            },
-            &x_seal,
-        )?;
-
-        // Child state: spends the child extension's payload output, pays the RECIPIENT.
-        let s_value = colored_tier_out_value(xc.payloads[0].value, bundle.fee_rate)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "coloured split child {}'s extension cannot carry a state",
-                    c.statechain_id
-                )
-            })?;
-        let s_seal = colored_tier_seal(&c.statechain_id, TierRole::ChildState, 0, 0, Some(csv_d));
-        let sc = build_colored_tier(
-            rgb,
-            &ColoredTierSpec {
-                contract_id: &rgb_half.contract_id,
-                prev_txid: &xc.txid,
-                prev_vout: xc.payloads[0].vout,
-                prev_value: xc.payloads[0].value,
-                prev_spk_hex: &xc.payloads[0].script_pubkey_hex,
-                sequence: mercurylib::tesr::csv_blocks(csv_d).0,
-                payloads: &[(c.owner_exit_address.clone(), s_value, c.rgb_amount)],
-                network: &bundle.network,
-                fee_rate: bundle.fee_rate,
-                nonce: Some(s_seal.rung as u64),
-            },
-            &s_seal,
-        )?;
-
-        let draft_of = |t: crate::rgb::ColoredTier| ColoredTierDraft {
-            tx_hex: t.tx_hex,
-            txid: t.txid,
-            payload_vout: t.payloads[0].vout,
-            payload_value: t.payloads[0].value,
-            payload_spk_hex: t.payloads[0].script_pubkey_hex.clone(),
-            consignment: t.consignment,
-        };
-        child_drafts.push(ColoredSplitChildDraft {
-            statechain_id: c.statechain_id.clone(),
-            owner_exit_address: c.owner_exit_address.clone(),
-            sp_vout: out.vout,
-            sp_out_value: out.value,
-            rgb_amount: c.rgb_amount,
-            csv_e,
-            csv_d,
-            // [S3] `None` marks a CHANGE TIP: one cap over `SP.out[j]`, no extension between.
-            // A PAYEE always has both rungs; the change tip took the one-cap branch above and
-            // never reaches here.
-            extension: Some(draft_of(xc)),
-            state: draft_of(sc),
-        });
-    }
+    let child_drafts = build_colored_split_legs(
+        rgb,
+        &rgb_half.contract_id,
+        &sp,
+        children,
+        csv_e,
+        csv_d,
+        &bundle.network,
+        bundle.fee_rate,
+    )?;
 
     Ok(ColoredSplitDraft {
         parent_statechain_id: bundle.statechain_id.clone(),
@@ -13671,8 +13810,16 @@ mod spine_tip_tests {
         // committed to a witness that is not in the tip's four-transaction chain. The absence of an
         // extension in a struct field is a description of the shape; what matters is that the cap is
         // BUILT over `SP.out[j]`. Caught only by live RGB validation (sdk77), never in-process.
+        // [S4b] The cap construction moved WITH the code, as this test's own history demands: the
+        // leg loop is now `build_colored_split_legs`, shared by the ROOT split and the SPINE BATCH,
+        // so pinning it inside `build_colored_in_ladder_split` would pin an empty region and pass
+        // vacuously — the exact failure mode the assertion below was written to end.
+        let legs = {
+            let at = src.find("fn build_colored_split_legs(").expect("shared leg builder");
+            &src[at..at + src[at..].find("\n/// ").unwrap_or(9000)]
+        };
         assert!(
-            builder.contains("if c.is_change_tip {") && builder.contains("build_colored_spine_cap("),
+            legs.contains("if c.is_change_tip {") && legs.contains("build_colored_spine_cap("),
             "the change leg must be BUILT as one cap over `SP.out[j]` via `build_colored_spine_cap`, \
              not carved as a two-rung piece whose extension is then dropped from the draft. Dropping \
              it leaves the cap spending a transaction that is not in the chain, and its consignment \
@@ -24185,9 +24332,60 @@ mod crd_colored_detrigger_tests {
 mod s4_colored_spine_batch_tests {
     fn src() -> String {
         let s = include_str!("tesr.rs");
-        let at = s.find("pub fn build_colored_spine_batch_sp(").expect("exists");
+        // [S4b] The span now covers all THREE functions the batch is built from — the validation
+        // helper, the whole-batch builder, and the SP-only delegate. It used to start at
+        // `build_colored_spine_batch_sp`, which is now a thin delegate: pinning only that would have
+        // pinned a function containing none of the rules these tests assert, and every one of them
+        // would have gone vacuous while still passing.
+        let at = s.find("fn build_colored_spine_batch_sp_full(").expect("exists");
         let end = s[at..].find("\n/// **[CR-D]").map(|e| at + e).unwrap_or(s.len());
         s[at..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// **[S4b] THE LEGS. The whole point of the item, and the thing S4 shipped without.**
+    ///
+    /// S4 built the coloured `SP` and stopped. Below it, `spine_batch_split_ex` used the PLAIN
+    /// `establish_child_journalled` / `establish_spine_tip_journalled` and persisted `rgb: None` —
+    /// an uncoloured tier over `SP.out[j]`, which after the batch is where the allocation lives.
+    /// That does not refuse; it BURNS.
+    ///
+    /// So the assertion is not "a builder exists" but "the batch and the ROOT split carve their legs
+    /// with the SAME code". A second copy of that loop is a second place for the two shapes to drift,
+    /// and the drift is invisible until an allocation is gone — which is exactly how this item was
+    /// missed the first time.
+    #[test]
+    fn the_batch_carves_its_legs_with_the_same_builder_as_the_root_split() {
+        let batch = src();
+        assert!(
+            batch.contains("build_colored_split_legs("),
+            "the coloured spine batch must build its legs with the SHARED coloured leg builder. \
+             Anything else means legs that are not coloured — `rgb: None` over the outpoint the \
+             allocation is booked at, which destroys it rather than refusing.\n\n{batch}"
+        );
+        // …and the shared builder is the one the ROOT split uses, or "shared" is a name and not a fact.
+        let s = include_str!("tesr.rs");
+        let root = {
+            let at = s.find("pub fn build_colored_in_ladder_split(").expect("root split");
+            &s[at..at + s[at..].find("\n/// ").unwrap_or(9000)]
+        };
+        assert!(
+            root.contains("build_colored_split_legs("),
+            "the ROOT split no longer uses the shared leg builder, so the batch's `shared` loop is \
+             now a private copy and the two lanes can drift apart silently"
+        );
+    }
+
+    /// The change leg is DECLARED, never inferred from position — and the builder checks it. A batch
+    /// whose last leg is not the tip would carve the sender's change as a two-rung piece, which is
+    /// the S3 defect one lane over.
+    #[test]
+    fn the_last_leg_must_be_declared_the_change_tip() {
+        let batch = src();
+        assert!(
+            batch.contains("is_change_tip") && batch.contains("split_last()"),
+            "the batch must split its children as payees-then-change and REFUSE a last leg that is \
+             not declared `is_change_tip`\n\n{batch}"
+        );
     }
 
     /// **The reason this function exists rather than reusing the root lane's.** Every spine level
