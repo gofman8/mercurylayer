@@ -553,9 +553,28 @@ and bump on the owner's behalf. Its exposure is bounded and worth stating exactl
 holds **no coin keys**, so compromising it costs the operator's fee float and **cannot touch a user's
 coin** — a materially smaller claim than "keyless", and materially larger than nothing. It carries an
 operational duty in exchange: the float must be refilled, and **a tower that runs dry fails at exactly
-the moment it is needed**. A suggested rail is an onboarding-prepaid fee bond sized to ~2 spike bumps
-(~2 × 152 vB × 50 sat/vB ≈ 15 000 sats, operator-carried and priced into the onboarding fee). This
-variant is offered so the choice is informed; it is **not** assumed by any other part of this
+the moment it is needed**. **[FUNDING RAIL — and the unit it must be sized in is NOT sats.]** A bond of "~2 spike bumps
+(~2 × 152 vB × 50 sat/vB ≈ 15 000 sats)" is the obvious sizing and it is not the binding one.
+
+A fee child is v3 and spends two things: the stuck tier's P2A anchor, and a funding UTXO. Under TRUC
+(BIP-431) a v3 transaction may have at most **one** unconfirmed ancestor — and the tier is already
+it. So a second rescue funded from the *unconfirmed change of the first* has two unconfirmed ancestor
+chains and is refused at any price. **Measured, not argued**
+(`clients/libs/rust/tests/live_tower_float.rs`): the chained attempt returns
+`TRUC-violation, tx <txid> would have too many ancestors`, while the same tier funded from a second
+CONFIRMED output is accepted.
+
+**Therefore a tower's simultaneous-rescue capacity is the number of CONFIRMED fee UTXOs it holds,
+each large enough for one bump — not its balance.** A float of 1 000 000 sats in ONE output rescues
+exactly one tier per confirmation window however many coins it watches; a tower sized only in sats
+reads as solvent and is not, which is the D31 failure wearing a reassuring number. The rail therefore
+reports in both units (`tower_float::Solvency`), names which one failed, and gives the matching
+remedy — short on sats means add money, short on capacity means SPLIT what you already hold, and the
+two are not interchangeable. `tower_float::plan_float` distinguishes a float that needs a top-up from
+one that needs only re-shaping, because the latter is fixable for free and an operator told to "top
+up" will spend money and remain uncovered.
+
+This variant is offered so the choice is informed; it is **not** assumed by any other part of this
 specification.
 
 **[Amendment, TES-fixable #4]** Independently of who funds it, `watch_pass` must be package-aware

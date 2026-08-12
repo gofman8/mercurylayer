@@ -1590,33 +1590,58 @@ impl UtexoWallet {
     /// a trait object living for the whole pass, which is the opposite of what D31's bounded exposure
     /// asks for.
     ///
-    /// `Ok(None)` = no fee source configured = **cannot bump**, which is the default. A malformed
-    /// one is `Err`, not `None`: an operator who configured a fee wallet and got silence would
-    /// reasonably believe their coins are covered.
+    /// ## The funding UTXO is SELECTED, not configured
+    ///
+    /// The first version of this took `funding_outpoint` and `funding_value` from config. That is
+    /// wrong in a way that only shows up in production: **the outpoint is spent by the first bump**,
+    /// so the config is stale from then on and every later rescue fails on a missing input — the
+    /// tower works exactly once and then silently cannot pay, which is the failure D31 names.
+    ///
+    /// The fee ADDRESS is derived from the key instead, the float is read from the chain, and a
+    /// suitable confirmed UTXO is chosen per rescue. Change returns to the same address, so the float
+    /// is self-maintaining.
+    ///
+    /// `Ok(None)` = no fee source configured = **cannot bump**, the default. A malformed one is
+    /// `Err`, not `None`: an operator who configured a fee wallet and got silence would reasonably
+    /// believe their coins are covered.
     fn fee_bump_parts(
         &self,
     ) -> anyhow::Result<Option<(mercuryrustlib::tesr::P2trKeySpendBumpSigner, FeeBumpParts)>> {
         let Some(cfg) = self.inner.config.fee_bump.as_ref() else {
             return Ok(None);
         };
-        let (txid, vout) = cfg
-            .funding_outpoint
-            .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("fee_bump.funding_outpoint must be `txid:vout`"))?;
-        let outpoint = bitcoin::OutPoint {
-            txid: txid.parse().map_err(|e| anyhow::anyhow!("fee_bump funding txid: {e}"))?,
-            vout: vout.parse().map_err(|e| anyhow::anyhow!("fee_bump funding vout: {e}"))?,
-        };
         let sk_bytes = hex::decode(&cfg.funding_secret_key_hex)
             .map_err(|e| anyhow::anyhow!("fee_bump.funding_secret_key_hex is not hex: {e}"))?;
         let sk = secp256k1_zkp::SecretKey::from_slice(&sk_bytes)
             .map_err(|e| anyhow::anyhow!("fee_bump.funding_secret_key_hex is not a key: {e}"))?;
-        let change: bitcoin::Address = cfg
-            .change_address
-            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
-            .map_err(|e| anyhow::anyhow!("fee_bump.change_address: {e}"))?
-            .require_network(self.inner.config.network)
-            .map_err(|e| anyhow::anyhow!("fee_bump.change_address is for the wrong network: {e}"))?;
+
+        // The float address IS the key's P2TR key-spend address. Deriving it rather than configuring
+        // it removes a way for the two to disagree — a mismatched pair would read the wrong float and
+        // then fail to sign what it selected.
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let kp = secp256k1_zkp::KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _) = secp256k1_zkp::XOnlyPublicKey::from_keypair(&kp);
+        let xonly = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&xonly.serialize())
+            .map_err(|e| anyhow::anyhow!("fee key is not a usable x-only pubkey: {e}"))?;
+        let fee_addr = bitcoin::Address::p2tr(
+            &bitcoin::secp256k1::Secp256k1::new(),
+            xonly,
+            None,
+            self.inner.config.network,
+        );
+        let spk = fee_addr.script_pubkey();
+
+        let float = mercuryrustlib::tower_float::TowerFloat::read(
+            &self.inner.cc.electrum_client,
+            spk.as_script(),
+        )?;
+        // Pessimistic, and deliberately so: size the requirement on the whole package at the target
+        // rate. A tier that turns out cheaper simply leaves change.
+        let needed = mercuryrustlib::tower_float::bump_cost_sats(
+            cfg.target_fee_rate,
+            TYPICAL_TIER_VSIZE,
+        );
+        let funding = float.select_funding(needed, spk.clone())?;
 
         let signer = mercuryrustlib::tesr::P2trKeySpendBumpSigner::new(sk);
         let parts = FeeBumpParts {
@@ -1625,15 +1650,70 @@ impl UtexoWallet {
                 cfg.core_rpc_user.clone(),
                 cfg.core_rpc_password.clone(),
             ),
-            funding: mercurylib::wallet::p2a_fee_child::FundingInput {
-                outpoint,
-                value: cfg.funding_value,
-                script_pubkey: change.script_pubkey(),
-            },
-            change_script_pubkey: change.script_pubkey(),
+            funding,
+            change_script_pubkey: spk,
             target_fee_rate: cfg.target_fee_rate,
         };
         Ok(Some((signer, parts)))
+    }
+
+    /// **[D31] Is the fee float able to cover every coin this wallet defends?**
+    ///
+    /// Answers in BOTH units, because the interesting case passes one and fails the other: a float
+    /// with plenty of sats in ONE utxo can fund exactly one simultaneous rescue, since a v3 fee child
+    /// may have only one unconfirmed ancestor and the stuck tier is already it (measured —
+    /// `live_tower_float.rs`).
+    ///
+    /// `Ok(None)` when no fee source is configured: a keyless wallet is not "underfunded", it is
+    /// out of scope, and conflating the two would nag every ordinary user about a float they were
+    /// never meant to have.
+    pub async fn fee_float_solvency(
+        &self,
+    ) -> anyhow::Result<Option<mercuryrustlib::tower_float::Solvency>> {
+        let Some(cfg) = self.inner.config.fee_bump.as_ref() else {
+            return Ok(None);
+        };
+        let sk_bytes = hex::decode(&cfg.funding_secret_key_hex)
+            .map_err(|e| anyhow::anyhow!("fee_bump.funding_secret_key_hex is not hex: {e}"))?;
+        let sk = secp256k1_zkp::SecretKey::from_slice(&sk_bytes)
+            .map_err(|e| anyhow::anyhow!("fee_bump.funding_secret_key_hex is not a key: {e}"))?;
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let kp = secp256k1_zkp::KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _) = secp256k1_zkp::XOnlyPublicKey::from_keypair(&kp);
+        let xonly = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&xonly.serialize())
+            .map_err(|e| anyhow::anyhow!("fee key is not a usable x-only pubkey: {e}"))?;
+        let spk = bitcoin::Address::p2tr(
+            &bitcoin::secp256k1::Secp256k1::new(),
+            xonly,
+            None,
+            self.inner.config.network,
+        )
+        .script_pubkey();
+
+        let float = mercuryrustlib::tower_float::TowerFloat::read(
+            &self.inner.cc.electrum_client,
+            spk.as_script(),
+        )?;
+        // Obligations = the coins this wallet would actually have to defend, i.e. those carrying a
+        // ladder. Counting every coin would overstate the float a tower needs and send an operator
+        // shopping for sats they do not require.
+        let obligations = self.laddered_coin_count().await;
+        Ok(Some(float.assess(obligations, cfg.target_fee_rate, TYPICAL_TIER_VSIZE)))
+    }
+
+    /// Coins with a `tesr-` bundle — the ones a bump could ever be needed for.
+    async fn laddered_coin_count(&self) -> usize {
+        let Ok(rows) = mercuryrustlib::sqlite_manager::get_all_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+        )
+        .await
+        else {
+            // An unreadable DB must not report ZERO obligations — that is the answer that makes an
+            // empty float look adequate.
+            return usize::MAX;
+        };
+        rows.iter().filter(|(k, _)| k.starts_with("tesr-")).count()
     }
 
     async fn has_offchain_funding_row(&self, statechain_id: &str) -> bool {
@@ -4380,6 +4460,13 @@ mod rgb_stage0_claim_laddering_tests {
         );
     }
 }
+
+/// A TES-R tier's virtual size, used to SIZE a float before any particular tier is in hand.
+///
+/// 141 vB is the measured figure from the WP1 spike. It is an estimate by necessity — the float has
+/// to be sized before a spike, not during one — and it is used only for budgeting; the actual child
+/// is priced against the actual tier.
+const TYPICAL_TIER_VSIZE: u64 = 141;
 
 /// The non-borrowing half of a [`mercuryrustlib::tesr::BumpCapability`], so a caller can hold the
 /// signer on its own stack and assemble the capability at the point of use.

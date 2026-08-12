@@ -436,3 +436,10 @@
 #   Re-check if this pattern is ever copied into non-test code: there, "no endpoint configured"
 #   silently becoming "nothing to do" is exactly the shape that loses a coin.
 1	clients/libs/rust/tests/live_p2a_package_rescue.rs	ok-question	let url = std::env::var("CORE_RPC_URL").ok()?;
+#
+#
+# [D31 rail] The tower-float TRUC measurement's opt-in gate — same shape and same reasoning as the
+# `live_p2a_package_rescue.rs` entry above: absent CORE_RPC_URL -> None -> the test SKIPS, and the
+# skip prints that the TRUC capacity bound was NOT measured, so a green run cannot be read as having
+# verified it. Test harness, not a protection path.
+1	clients/libs/rust/tests/live_tower_float.rs	ok-question	let url = std::env::var("CORE_RPC_URL").ok()?;

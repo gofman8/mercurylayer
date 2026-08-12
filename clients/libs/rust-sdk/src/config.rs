@@ -283,16 +283,17 @@ pub struct FeeBumpConfig {
     pub core_rpc_url: String,
     pub core_rpc_user: String,
     pub core_rpc_password: String,
-    /// The funding UTXO, as `txid:vout`.
-    pub funding_outpoint: String,
-    pub funding_value: u64,
-    /// Hex secret key controlling `funding_outpoint`, which must be a P2TR key-spend output.
-    /// **A fee key, never a coin key.**
+    /// Hex secret key for the FEE WALLET — a P2TR key-spend address whose UTXOs are the float.
+    /// **A fee key, never a coin key**, and that separation is the whole of D31's bounded exposure:
+    /// compromising it costs the float and cannot touch a user's coin.
+    ///
+    /// The float address is DERIVED from this key, and every bump both spends from it and returns
+    /// its change to it, so the float is self-maintaining.
     pub funding_secret_key_hex: String,
-    /// Where the child's change goes — normally back to the fee wallet.
-    pub change_address: String,
     /// The package feerate to lift a stuck tier to.
     pub target_fee_rate: f64,
+    /// Bumps of headroom to hold per watched coin when planning the float (§5.13 suggests ~2).
+    pub reserve_bumps_per_coin: u64,
 }
 
 impl SdkConfig {
