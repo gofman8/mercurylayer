@@ -3555,8 +3555,8 @@ fn build_colored_split_legs(
                 prev_spk_hex: &out.script_pubkey_hex,
                 sequence: mercurylib::tesr::csv_blocks(csv_e).0,
                 payloads: &[(c.agg_address.clone(), x_value, c.rgb_amount)],
-                network: network,
-                fee_rate: fee_rate,
+                network,
+                fee_rate,
                 nonce: Some(x_seal.rung as u64),
             },
             &x_seal,
@@ -3581,8 +3581,8 @@ fn build_colored_split_legs(
                 prev_spk_hex: &xc.payloads[0].script_pubkey_hex,
                 sequence: mercurylib::tesr::csv_blocks(csv_d).0,
                 payloads: &[(c.owner_exit_address.clone(), s_value, c.rgb_amount)],
-                network: network,
-                fee_rate: fee_rate,
+                network,
+                fee_rate,
                 nonce: Some(s_seal.rung as u64),
             },
             &s_seal,
@@ -3804,7 +3804,7 @@ pub fn build_colored_in_ladder_split(
         sp_total: total,
         parent_prev_txid: x_m.txid,
         parent_prev_vout: x_m.payload_vout,
-        parent_prev_value: parent_prev_value,
+        parent_prev_value,
         children: child_drafts,
     })
 }
@@ -4605,7 +4605,15 @@ impl SplitJournalChild {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SplitJournalRecord {
     pub op_id: String,
-    /// `"in_ladder_split"` (root parent) or `"child_in_ladder_split"` (a received child).
+    /// Which builder wrote this record: `"in_ladder_split"` (root parent), `"child_in_ladder_split"`
+    /// (a received child), `"colored_in_ladder_split"` (the coloured root) or
+    /// `"colored_spine_batch"` (the coloured batch over a spine tip, [S4b]).
+    ///
+    /// The record SHAPE is deliberately identical across all four, so one reader recovers them all —
+    /// `piece_bundle` and `spine_tip` are lane-agnostic and read `ancestors` + the per-leg `rgb`,
+    /// which is what lets a DEPTH-2 coloured batch replay without an RGB engine or the SE. This
+    /// field is a label for diagnosis, not a dispatch key; if it ever becomes one, the reader stops
+    /// being able to recover a lane it has not been taught about.
     pub lane: String,
     pub stage: SplitStage,
     /// The coin this split terminalizes — the root parent, or the child being re-split.
@@ -24708,6 +24716,176 @@ mod crd_colored_detrigger_tests {
             build.contains("bundle.m"),
             "the renewal epoch must separate de-triggers across re-anchor generations"
         );
+    }
+}
+
+/// **[S9] CRASH-RECOVERY REPLAY of a COLOURED SPINE BATCH.**
+///
+/// The third of S9's three scenarios, and the one the journal exists for. A batch terminalizes the
+/// tip and then spends `1 + 2N` irreversible SE slots on transactions an RGB engine phase has
+/// already discarded — "sign it again" is not wasteful, it is impossible. So the record on disk must
+/// be able to rebuild every artifact WITHOUT the engine and WITHOUT the SE.
+///
+/// The batch reuses the same `SplitJournalRecord` as the two older lanes on purpose, so one reader
+/// serves all three. These pin that the reuse actually holds for a DEPTH-2 record — the shape only
+/// the batch produces — because the two reconstructors read `self.ancestors` and the per-leg `rgb`,
+/// and a lane that failed to populate either would rebuild a coin whose witness chain is short by a
+/// segment or stripped of its allocation. Both rebuild silently and both are unclaimable.
+#[cfg(test)]
+mod s9_colored_batch_replay_tests {
+    use super::*;
+
+    /// A `Signed` batch record: one payee piece and the sender's next tip, over ONE intermediate
+    /// spine segment — i.e. exactly what `cosign_colored_spine_batch` writes at depth 2.
+    fn batch_record() -> SplitJournalRecord {
+        let p = mercurylib::tesr::TesrParams::regtest();
+        let parent = super::verify_tests::sample_bundle();
+        let lvl = parent.levels[0].clone();
+        let seg = ChildSegment {
+            statechain_id: "tip-level-0".into(),
+            funding_vout: 1,
+            // A SPINE segment is ONE tier: `SP_1`.
+            extension: None,
+            state: TesrTier { csv: Some(SPINE_CSV), ..lvl.state.clone() },
+            superseded_states: vec![lvl.state.clone()],
+            superseded_extensions: vec![],
+        };
+        let tier = |csv: u16| TesrTier { csv: Some(csv), ..lvl.state.clone() };
+        SplitJournalRecord {
+            op_id: "spine_batch_split:tip-level-0:sp1".into(),
+            lane: "colored_spine_batch".into(),
+            stage: SplitStage::Signed,
+            terminalized_statechain_id: "tip-level-0".into(),
+            parent,
+            parent_statechain_id: "root".into(),
+            ancestors: vec![seg],
+            parent_flat_backups: vec![],
+            children: vec![
+                SplitJournalChild {
+                    statechain_id: "payee".into(),
+                    owner_exit_address: "bcrt1qpayee".into(),
+                    value: 3_066,
+                    sp_vout: 0,
+                    extension: Some(tier(p.ext_csv(0))),
+                    state: Some(tier(p.state_csv(0))),
+                    rgb: Some(ColoredChild {
+                        contract_id: "rgb:contract".into(),
+                        amount: 200,
+                        consignments: vec!["ext-cons".into(), "state-cons".into()],
+                    }),
+                    pending_extension: None,
+                    pending_state: None,
+                    role: SplitLegRole::Piece,
+                    recipient_address: None,
+                    conveyance: ConveyanceStage::Pending,
+                    conveyance_x1: None,
+                    latch_batch_id: None,
+                },
+                SplitJournalChild {
+                    statechain_id: "next-tip".into(),
+                    owner_exit_address: "bcrt1qchange".into(),
+                    value: 8_948,
+                    sp_vout: 1,
+                    extension: None,
+                    state: Some(tier(p.state_csv(0))),
+                    rgb: Some(ColoredChild {
+                        contract_id: "rgb:contract".into(),
+                        amount: 550,
+                        // A TIP's list is its cap ALONE.
+                        consignments: vec!["cap-cons".into()],
+                    }),
+                    pending_extension: None,
+                    pending_state: None,
+                    role: SplitLegRole::SpineTip,
+                    recipient_address: None,
+                    conveyance: ConveyanceStage::Pending,
+                    conveyance_x1: None,
+                    latch_batch_id: None,
+                },
+            ],
+            child_ext_csv: p.ext_csv(0),
+            child_state_csv: p.state_csv(0),
+            fee_rate: 2.0,
+            network: "regtest".into(),
+            sp_txid: "sp1".into(),
+        }
+    }
+
+    /// The payee piece rebuilds AT DEPTH 2 and COLOURED. Losing the segment would leave the child's
+    /// walk one transaction short of the `SP_1` that creates the outpoint its own ladder sits on;
+    /// losing the `rgb` half would rebuild it as a plain coin and strand the allocation.
+    #[test]
+    fn a_crashed_batch_rebuilds_its_payee_at_depth_2_with_its_allocation() {
+        let cb = batch_record().piece_bundle(0).expect("the payee piece rebuilds from the journal");
+        assert_eq!(
+            cb.ancestors.len(),
+            1,
+            "a batch-minted piece is DEPTH 2 — the intermediate segment must survive the replay, or \
+             the rebuilt child's witness chain is short by the transaction that funds it"
+        );
+        assert!(cb.ancestors[0].extension.is_none(), "a spine segment is ONE tier");
+        assert_eq!(
+            cb.ancestors[0].superseded_states.len(),
+            1,
+            "the tip's retired cap must survive too — a receiver that cannot see the loser cannot \
+             check that it loses"
+        );
+        let rgb = cb.rgb.as_ref().expect("the rebuilt piece must still be COLOURED");
+        assert_eq!(rgb.amount, 200);
+        assert_eq!(rgb.consignments.len(), 2, "a PIECE's list is extension-then-state");
+        // The root bundle is carried as-is: a batch appends a segment, it does not rewrite the root.
+        assert_eq!(cb.parent_statechain_id, "root");
+    }
+
+    /// The change leg rebuilds as the sender's NEXT TIP — one cap, its own allocation, and the same
+    /// segment list. Rebuilding it as a `ctesr-` child instead would route the sender's own change
+    /// through leaf handling, which is the mis-classing the separate record exists to prevent.
+    #[test]
+    fn a_crashed_batch_rebuilds_its_change_as_the_next_tip() {
+        let rec = batch_record();
+        let tip = rec.spine_tip(1).expect("the change leg rebuilds as a tip");
+        assert_eq!(tip.statechain_id, "next-tip");
+        assert_eq!(tip.sp_out_value, 8_948, "the next batch carves its payloads out of this number");
+        assert_eq!(
+            tip.ancestors.len(),
+            1,
+            "the next tip descends through this batch's own segment"
+        );
+        let rgb = tip.rgb.as_ref().expect("the rebuilt tip must still be COLOURED");
+        assert_eq!(rgb.amount, 550);
+        // …and the two reconstructors refuse each other's legs, so a replay cannot cross them.
+        assert!(
+            rec.piece_bundle(1).is_err(),
+            "the tip leg must NOT rebuild as a conveyable child bundle"
+        );
+        assert!(
+            rec.spine_tip(0).is_err(),
+            "the payee leg must NOT rebuild as the sender's tip"
+        );
+    }
+
+    /// Every leg of the batch is reachable from the record alone — the property the whole
+    /// write-ahead ordering buys, and the reason a crash after terminalization is survivable.
+    #[test]
+    fn the_whole_batch_is_reconstructible_from_the_record_alone() {
+        let rec = batch_record();
+        // `bundles()` maps EVERY leg through `piece_bundle`, so on a batch (which always has a tip)
+        // it must refuse rather than silently hand back a short list.
+        assert!(
+            rec.bundles().is_err(),
+            "a batch record always carries a tip leg, so the all-pieces reconstructor must refuse \
+             it by name rather than return only the payees"
+        );
+        let pieces: Vec<_> = (0..rec.children.len())
+            .filter(|j| rec.children[*j].role == SplitLegRole::Piece)
+            .map(|j| rec.piece_bundle(j).expect("piece"))
+            .collect();
+        let tips: Vec<_> = (0..rec.children.len())
+            .filter(|j| rec.children[*j].role == SplitLegRole::SpineTip)
+            .map(|j| rec.spine_tip(j).expect("tip"))
+            .collect();
+        assert_eq!(pieces.len() + tips.len(), rec.children.len(), "no leg is unreachable");
+        assert_eq!(tips.len(), 1, "a batch leaves exactly one tip");
     }
 }
 
