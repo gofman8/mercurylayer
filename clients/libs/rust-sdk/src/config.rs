@@ -389,3 +389,68 @@ impl SdkConfig {
         }
     }
 }
+
+/// **[G3 / D7] Every network profile must be able to finish an exit inside its own epoch.**
+///
+/// `initlock` is the height a deposit's flat backup chain starts at, i.e. the width of one funding
+/// epoch. A coin's unilateral exit is a walk of relative timelocks that takes
+/// `tesr_exit_wait_blocks` blocks. If the walk is longer than the epoch, the coin can never be
+/// parked across an epoch boundary — `verify_conveyed_child`'s horizon pre-flight refuses it — and
+/// **every in-ladder split on that profile is refused, permanently and for every user.**
+///
+/// That is not hypothetical: this scope item exists because the mainnet schedule was in exactly that
+/// state at the only configured `initlock`. The relationship is between two numbers that live in
+/// different files and are edited by different concerns — a fee/timelock schedule and a deployment
+/// config — which is precisely the shape that drifts silently.
+///
+/// The assertion is per-profile and includes the depth the protocol actually admits, so a schedule
+/// change that quietly eats the headroom fails here rather than in a user's refused payment.
+#[cfg(test)]
+mod g3_every_profile_can_finish_its_exit {
+    use super::*;
+
+    #[test]
+    fn initlock_covers_the_exit_walk_on_every_network() {
+        for net in ["mainnet", "testnet", "testnet3", "testnet4", "signet", "regtest"] {
+            let (initlock, _interval) = mercurylib::tesr::TesrParams::flat_ladder_params(net)
+                .unwrap_or_else(|| panic!("{net} has no compiled flat-ladder profile"));
+            let p = mercurylib::tesr::TesrParams::for_network_checked(net)
+                .unwrap_or_else(|| panic!("{net} has no compiled TesrParams — no silent default"));
+            let base = tesr_exit_wait_blocks(&p, 0);
+            assert!(
+                initlock as u32 >= base,
+                "{net}: initlock {initlock} is shorter than a DEPTH-0 exit walk ({base} blocks). \
+                 No coin on this profile could finish its exit inside one funding epoch, so every \
+                 in-ladder split would be refused by the horizon pre-flight — for every user, \
+                 permanently. The schedule and the deployment config have drifted apart."
+            );
+            // …and there must be room for at least one level of splitting, or the ladder is a
+            // single-payment instrument on this profile.
+            let d1 = tesr_exit_wait_blocks(&p, 1);
+            assert!(
+                initlock as u32 >= d1,
+                "{net}: initlock {initlock} cannot fit a DEPTH-1 exit ({d1} blocks) — the profile \
+                 admits a ladder but not a payment out of one"
+            );
+        }
+    }
+
+    /// The headroom is stated, not merely non-negative: the depth cap is derived from it, so it is
+    /// worth seeing the number move when a schedule changes.
+    #[test]
+    fn the_admitted_depth_is_reported_per_profile() {
+        for net in ["mainnet", "regtest"] {
+            let (initlock, _) = mercurylib::tesr::TesrParams::flat_ladder_params(net).unwrap();
+            let p = mercurylib::tesr::TesrParams::for_network_checked(net).unwrap();
+            let mut d = 0u32;
+            while d < 200 && tesr_exit_wait_blocks(&p, d + 1) <= initlock as u32 {
+                d += 1;
+            }
+            assert!(
+                d >= 1,
+                "{net} admits no split depth at all (initlock {initlock})"
+            );
+            println!("G3 {net}: initlock {initlock} admits child depth up to {d}");
+        }
+    }
+}
