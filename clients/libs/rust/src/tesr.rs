@@ -6028,12 +6028,12 @@ async fn spine_batch_split_ex(
         // not a flag.
         (true, true) => {
             return Err(anyhow::anyhow!(
-                "the COLOURED spine batch is not implemented below `SP`. `build_colored_spine_batch_sp` \
-                 builds the coloured split state, but every leg under it is still built by the PLAIN \
-                 `establish_child_journalled` / `establish_spine_tip_journalled` and persisted with \
-                 `rgb: None` — an UNCOLOURED tier over `SP.out[j]`, the outpoint the allocation is \
-                 booked at, which DESTROYS it. Refusing rather than burning the allocation. Pay from \
-                 the ROOT carrier (`build_colored_in_ladder_split`) until the coloured legs exist."
+                "a COLOURED spine batch must not be driven through the PLAIN batch driver. This \
+                 function builds every leg with `establish_child_journalled` / \
+                 `establish_spine_tip_journalled` and persists them with `rgb: None` — an UNCOLOURED \
+                 tier over `SP.out[j]`, the outpoint the allocation is booked at, which DESTROYS it \
+                 rather than refusing. The coloured lane has its own pair: \
+                 `build_colored_spine_batch` + `cosign_colored_spine_batch`."
             ));
         }
         _ => {}

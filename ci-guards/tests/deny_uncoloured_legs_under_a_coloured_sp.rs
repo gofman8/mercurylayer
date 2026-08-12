@@ -16,9 +16,13 @@
 //! exactly when this is cheapest to close and easiest to forget. The refusal is a no-op for every
 //! path that exists today.
 //!
-//! **This guard retires itself.** It asserts the refusal is present *while* no coloured leg builder
-//! exists. Build one and this test tells you, by name, to remove the refusal along with it — so the
-//! guard cannot become the thing that blocks the feature it is protecting.
+//! **The refusal is now PERMANENT, not a placeholder.** When this guard was written the coloured
+//! legs did not exist anywhere and the refusal stood in for them. They exist now
+//! (`build_colored_spine_batch` + `cosign_colored_spine_batch`), and they are a SEPARATE pair rather
+//! than a coloured mode of this driver — because a coloured leg is a pre-built, pre-coloured
+//! transaction that the co-sign signs, not something `establish_*_journalled` can mint from the SE.
+//! So this refusal keeps its job for good: it is the sign at the fork saying the plain driver is the
+//! wrong road, and the assertion below now also checks it NAMES the right one.
 
 use std::path::PathBuf;
 
@@ -30,44 +34,35 @@ fn tesr_src() -> String {
     std::fs::read_to_string(&p).expect("tesr.rs is readable")
 }
 
-/// Does a builder that constructs COLOURED legs for a spine batch exist yet?
-///
-/// The marker is a function whose name says so. Deliberately a name test and not a behaviour test:
-/// the point is to notice when the capability arrives, and the person who adds it is the person who
-/// should delete the refusal.
-fn coloured_leg_builder_exists(src: &str) -> bool {
-    ["fn establish_colored_child_journalled(", "fn establish_colored_spine_tip_journalled("]
-        .iter()
-        .any(|needle| src.contains(needle))
-}
-
 #[test]
-fn the_coloured_batch_refuses_until_its_legs_are_actually_coloured() {
+fn the_plain_batch_driver_refuses_a_coloured_batch_and_names_the_right_one() {
     let src = tesr_src();
     let body = {
         let at = src.find("\nasync fn spine_batch_split_ex(").expect("spine_batch_split_ex exists");
         &src[at..at + src[at..].find("\n/// ").unwrap_or(9000)]
     };
 
-    if coloured_leg_builder_exists(&src) {
-        // The capability landed. Now the refusal is the bug.
-        assert!(
-            !body.contains("the COLOURED spine batch is not implemented below `SP`"),
-            "a coloured leg builder now exists, so the `(true, true)` refusal in \
-             `spine_batch_split_ex` is stale and is blocking the feature it was protecting — delete \
-             it in the same commit that lands the legs, and replace this guard with one that pins \
-             the legs are genuinely coloured (an `rgb: Some(..)` on every persisted record)"
-        );
-        return;
-    }
-
     assert!(
-        body.contains("the COLOURED spine batch is not implemented below `SP`"),
+        body.contains("a COLOURED spine batch must not be driven through the PLAIN batch driver"),
         "`spine_batch_split_ex` accepts a coloured tip + coloured `SP` and then builds every leg \
          with the PLAIN `establish_child_journalled` / `establish_spine_tip_journalled`, persisting \
          each with `rgb: None`. An uncoloured tier over `SP.out[j]` — where the allocation is booked \
-         after the batch — DESTROYS it. Until a coloured leg builder exists, this combination must \
-         be REFUSED by name rather than silently burning the allocation."
+         after the batch — DESTROYS it rather than refusing. This combination must be refused by \
+         name."
+    );
+    // A refusal that does not say where to go instead is how someone concludes the feature is
+    // missing and writes a second, worse version of it.
+    assert!(
+        body.contains("cosign_colored_spine_batch"),
+        "the refusal must NAME the coloured pair, or the next reader concludes the coloured batch \
+         does not exist — which is exactly what the original refusal (correctly, at the time) said, \
+         and it is no longer true"
+    );
+    // The coloured pair really is there.
+    assert!(
+        src.contains("pub fn build_colored_spine_batch(")
+            && src.contains("pub async fn cosign_colored_spine_batch("),
+        "the refusal points at a coloured pair that does not exist"
     );
     // …and the refusal must be reachable: a coloured tip has to survive the two mismatch arms to
     // reach it, so those must still be the ones checking the OTHER two combinations.

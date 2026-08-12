@@ -3654,8 +3654,43 @@ impl UtexoWallet {
             &self.inner.config.wallet_name,
             &carrier_id,
         )
-        .await?
-        .ok_or_else(|| anyhow!("carrier {carrier_id} has no TES-R ladder to split in-ladder"))?;
+        .await?;
+        // [S4b] A COLOURED TIP IS A CARRIER, AND ITS SPLIT IS A DIFFERENT CONSTRUCT.
+        //
+        // `carrier_is_colored` now routes a coloured spine tip here (it used to answer `false` and
+        // send it down the plain lane, which would have spent `SP.out[K]` uncoloured and destroyed
+        // the allocation). This engine splits a ROOT carrier: it reads a `tesr-` ladder and builds
+        // `SP` over `X_m`'s payload output. A tip has neither — its `SP_{i+1}` sits over the tip's
+        // own funding outpoint and out-races the tip's cap — so it needs
+        // `build_colored_spine_batch` + `cosign_colored_spine_batch`, which exist.
+        //
+        // What does NOT exist yet is this driver's batch sibling (the child-slot minting, conveyance
+        // and RGB re-booking around them). Until it does, the honest answer is a refusal that names
+        // the shape and the reason, not a generic "no TES-R ladder" — which reads as data loss and
+        // is the sort of message that gets someone to reach for a lane that would burn the coin.
+        let bundle = match bundle {
+            Some(b) => b,
+            None => {
+                let tip = mercuryrustlib::tesr::load_spine_tip(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &carrier_id,
+                )
+                .await?;
+                return Err(match tip {
+                    Some(t) if t.is_colored() => anyhow!(
+                        "carrier {carrier_id} is a COLOURED SPINE TIP — the change leg of an earlier \
+                         coloured split, holding {} of its contract. Paying from it is a coloured \
+                         spine BATCH (`build_colored_spine_batch` + `cosign_colored_spine_batch`), \
+                         not a root split, and this driver's batch sibling is not built yet. The \
+                         allocation is safe and exitable: `unilateral_exit` walks the tip's chain \
+                         and settles it on chain.",
+                        t.rgb.as_ref().map(|r| r.amount).unwrap_or_default()
+                    ),
+                    _ => anyhow!("carrier {carrier_id} has no TES-R ladder to split in-ladder"),
+                });
+            }
+        };
         let rgb_half = bundle
             .rgb
             .clone()
@@ -4051,7 +4086,7 @@ impl UtexoWallet {
     /// `Err`, never `false` — "I could not tell which lane this coin is on" must not be answered
     /// with the lane that spends its funding output.
     async fn carrier_is_colored(&self, carrier_id: &str) -> Result<bool> {
-        Ok(mercuryrustlib::tesr::load(
+        let root = mercuryrustlib::tesr::load(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             carrier_id,
@@ -4062,9 +4097,36 @@ impl UtexoWallet {
                 "cannot tell whether carrier {carrier_id} holds a coloured ladder ({e}) — refusing \
                  the token transfer rather than guessing which lane is safe"
             )
+        })?;
+        if let Some(b) = root {
+            return Ok(b.is_colored());
+        }
+        // [S4b] …AND A COLOURED SPINE TIP IS A COLOURED CARRIER.
+        //
+        // This asked only for a `tesr-` row, so the sender's own change from a coloured split —
+        // which is a `spinetip-` row (S3) — answered `false`. That is not a missing feature, it is
+        // the WRONG LANE: both callers use this to fork, and `false` sends a coin whose allocation
+        // sits at `SP.out[K]` down the plain path, which spends that outpoint uncoloured and
+        // destroys the allocation. The coin is reachable — the change tip is registered with the RGB
+        // engine, so carrier selection can and does pick it for a second payment.
+        //
+        // Fail CLOSED on the read for the same reason as above: "I could not tell" must never be
+        // answered with the lane that spends the funding output.
+        Ok(mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            carrier_id,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "cannot tell whether carrier {carrier_id} is a coloured spine tip ({e}) — refusing \
+                 the token transfer rather than guessing which lane is safe"
+            )
         })?
-        .is_some_and(|b| b.is_colored()))
+        .is_some_and(|t| t.is_colored()))
     }
+
 
     /// **[CTES-R MIGRATION] The coloured ROOT floor every carrier of this wallet is measured against.**
     ///
@@ -5248,6 +5310,65 @@ impl UtexoWallet {
 /// Like its sibling in `mercuryrustlib::tesr`, this is a grep over this module's own source rather
 /// than a behavioural test, and for the same reason: the hazard is a NEW route added later, which no
 /// behavioural test anticipates.
+/// [S4b] **The lane fork, and the refusal behind it.**
+///
+/// A coloured spine tip is the sender's own change from a coloured split, and it is a CARRIER: the
+/// change is registered with the RGB engine, so selection picks it for a second payment. The fork
+/// that decides coloured-vs-plain read only the `tesr-` row, so a tip answered `false` and went down
+/// the plain lane — which spends `SP.out[K]` uncoloured and destroys the allocation sitting on it.
+///
+/// These pin the two halves of the fix over CODE with comments stripped: the detector consults the
+/// tip row, and the coloured engine refuses a tip by NAME rather than with a generic "no ladder"
+/// message that reads like data loss.
+#[cfg(test)]
+mod s4b_lane_fork_tests {
+    fn code_of(needle: &str) -> String {
+        let s = include_str!("tokens.rs");
+        let at = s.find(needle).unwrap_or_else(|| panic!("{needle} exists"));
+        let end = s[at..].find("\n    /// ").map(|e| at + e).unwrap_or(s.len());
+        s[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_lane_fork_recognises_a_coloured_spine_tip() {
+        let code = code_of("async fn carrier_is_colored(");
+        assert!(
+            code.contains("load_spine_tip("),
+            "`carrier_is_colored` must consult the `spinetip-` row too. A coloured tip answering \
+             `false` does not mean 'unsupported' — it means the coin is routed to the PLAIN lane, \
+             which spends the outpoint its allocation is booked at and burns it"
+        );
+        assert!(
+            code.contains("is_some_and(|t| t.is_colored())"),
+            "and the tip must be reported coloured only when it actually carries an allocation"
+        );
+    }
+
+    #[test]
+    fn the_coloured_engine_refuses_a_tip_carrier_by_name() {
+        let code = code_of("async fn colored_in_ladder_pay(");
+        assert!(
+            code.contains("COLOURED SPINE TIP"),
+            "the coloured engine now RECEIVES tip carriers (the fork sends them here), and it splits \
+             ROOT carriers. It must say so by name — a generic 'no TES-R ladder' reads as data loss"
+        );
+        assert!(
+            code.contains("cosign_colored_spine_batch"),
+            "the refusal must name the construct that does apply, or the reader concludes the \
+             coloured batch does not exist"
+        );
+        assert!(
+            code.contains("unilateral_exit"),
+            "and it must say the allocation is still recoverable — a refusal that leaves the owner \
+             believing their tokens are stuck is a support incident, not a safety measure"
+        );
+    }
+}
+
 #[cfg(test)]
 mod retired_split_lane_census {
     /// The primitives that spend a carrier's `F` directly.
