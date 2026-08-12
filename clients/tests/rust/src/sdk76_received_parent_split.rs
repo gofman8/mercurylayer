@@ -224,6 +224,67 @@ pub async fn execute() -> Result<()> {
         "the child bundle must convey the parent's whole flat backup chain — the receiver counts it"
     );
 
+    // ---- 4b. [S7] THE DELEGATED TOWER MUST ACTUALLY COVER THIS CHILD. ----------------------------
+    //
+    // Carol now holds the one coin shape the keyless bundle used to drop on the floor. A `ctesr-`
+    // row is neither the `tesr-` row nor the `branch-` row `export_watch_bundle` looks for, so both
+    // its reads came back empty and the child took the `continue` written for a FLAT DEPOSIT — a
+    // coin with on-chain funding that no ancestor can race, which is the exact opposite of this one.
+    // The export still returned `Ok`, and the in-process tower covers children, so the only
+    // observable symptom was that a THIRD-PARTY tower silently watched none of them.
+    //
+    // Asserted here rather than in a test of its own because carol is already in the state, and
+    // because the defect was an OMISSION: sdk72's C6 pins the refusal path, and nothing anywhere
+    // pinned that a coin which SHOULD be in the bundle is.
+    let bundle: mercury_utexo_sdk::watchtower::WatchBundle =
+        serde_json::from_str(&carol.export_watch_bundle().await?)?;
+    let leaf = bundle
+        .entries
+        .iter()
+        .find(|e| e.statechain_id == carol_child_sid)
+        .ok_or_else(|| {
+            anyhow!(
+                "[S7] carol's adopted child {carol_child_sid} is ABSENT from her own exported watch \
+                 bundle ({} entries) — a delegated watchtower would not be watching it at all, and \
+                 the export reported success",
+                bundle.entries.len()
+            )
+        })?;
+    // Both predicates, because a leaf's race has both. A laddered PARENT is exported at u32::MAX to
+    // disable the height one (an idle ladder never ages); a leaf exported that way would sleep
+    // through its own deadline, since its clock is the parent's lowest flat-backup rung — a rung
+    // belonging to the splitter.
+    let trig = leaf.trigger.as_ref().ok_or_else(|| {
+        anyhow!("[S7] the child's race also starts on an EVENT (an ancestor spending F), unarmed")
+    })?;
+    assert_eq!(trig.watch_txid, cb.parent.f_txid, "[S7] the watched outpoint is the parent's F");
+    assert_eq!(trig.watch_vout, cb.parent.f_vout);
+    assert_ne!(leaf.deadline_block, u32::MAX, "[S7] a leaf's height predicate must be REAL");
+    assert!(!trig.push_txs.is_empty(), "[S7] nothing to broadcast is nothing to protect");
+    // The head start must be the whole BOUND chain, so the tower starts the walk early enough to
+    // finish it — and it must be the number `auto_exit_due` uses, or the two towers disagree.
+    let bound = mercuryrustlib::tesr::child_exit_chain_bound(&cb)?;
+    let csvs: Vec<Option<u16>> = bound.iter().map(|(_, c)| *c).collect();
+    assert_eq!(
+        trig.csv_blocks,
+        mercurylib::transfer::receiver::exit_wait_blocks(&csvs),
+        "[S7] the head start must be exit_wait_blocks over the BOUND chain — the same call the \
+         in-process tower makes"
+    );
+    assert!(
+        leaf.backup_tx.is_none(),
+        "[S7] a leaf has no absolute-locktime sweep; its exit IS the chain"
+    );
+    println!(
+        "SDK76 - [S7] carol's child IS in her watch bundle: deadline {} (head start {} over {} \
+         bound tiers), trigger {}:{}",
+        leaf.deadline_block,
+        trig.csv_blocks,
+        bound.len(),
+        trig.watch_txid,
+        trig.watch_vout
+    );
+
     // ---- 5. THE NEGATIVE CONTROL. The same bundle, censused at the OLD constant, must REJECT. -----
     // Without this the test would still pass if `verify_child_bundle` stopped censusing the ancestor
     // segment at all, which would be a far worse bug than the one being fixed.

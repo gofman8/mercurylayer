@@ -338,7 +338,26 @@ pub async fn set_spend_budget(statechain_entity: &State<StateChainEntity>, paylo
             // the operator reading this is the one who has to tell them apart.
             let why: Option<String> = match client
                 .post(&format!("{}/sig_budget", enclave.url))
-                .json(&json!({ "statechain_id": statechain_id, "sig_budget": payload.0.remaining }))
+                // **`budget`, NOT `payload.0.remaining`.** The two enforcers of this rule count the
+                // same thing and must be handed the same quantity. `remaining` is RELATIVE ("one
+                // more co-signature from here"); `set_sig_budget` turns it into the ABSOLUTE
+                // `count_finalized_signatures + remaining` and stores that, because the enclave's
+                // check is `sig_count >= sig_budget` against its own LIFETIME count
+                // (`lockbox/src/server.cpp:145-151`).
+                //
+                // Mirroring the relative value made the enclave read "this coin may never exceed 1
+                // co-signature in its life". Every coin arriving at a split has more than that — a
+                // deposit that has been laddered already co-signed its trigger, extension and state
+                // — so the enclave refused the split co-signature that the coordinator, holding the
+                // correct absolute budget, was about to allow.
+                //
+                // The failure is worse than a refusal. Both budgets are monotone ratchets and the
+                // coordinator's write lands FIRST, so by the time the enclave refuses, the coin is
+                // terminal at the coordinator and pinned at 1 in the enclave, where nothing can
+                // raise it again. The split never happens and the coin is exit-only, permanently.
+                // Measured on the live stack: coordinator `{"sig_budget":7,"finalized":6}` against
+                // the enclave's `{"sig_budget":1,"sig_count":6}` — the same 6, two different budgets.
+                .json(&json!({ "statechain_id": statechain_id, "sig_budget": budget }))
                 .send()
                 .await
             {
