@@ -425,28 +425,14 @@ pub async fn execute() -> Result<()> {
     // The piece dave receives sits one level DEEPER than bob's: its walk is
     // `T -> X_0 -> SP_0 -> SP_1 -> ext_child -> state_child`, with `SP_1` the intermediate segment.
     // That is S9's "receiver claiming at depth 2".
-    // ⚠️ **OPEN DEFECT — run with `SDK77_DEPTH2=1`.** The batch itself works: alice's second payment
-    // is built, co-signed, conveyed and lands in dave's mailbox (verified live). What fails is the
-    // RECEIVER's conservation check on the intermediate segment:
+    // [S4b / S9] The depth-2 lane, and the defect it exposed.
     //
-    //   ancestor 0 state (the intermediate spine SP): Σ over its payload outputs is 11842, but its
-    //   funding of 12504 at 2 sat/vB requires exactly 12014
-    //
-    // 12504 − 12014 = 490 = committed_fee(2) + P2A(240), so the receiver expects the TWO payload
-    // outputs the segment actually has. The builder produced 11842, i.e. it charged
-    // committed_fee(4). The batch's `SP` is being sized against a payload count larger than the one
-    // it builds — an off-by-N in the fee schedule, not a structural error, and it means every
-    // batch-minted piece is refused by every receiver.
-    //
-    // Gated rather than left red: the rest of sdk77 is green and load-bearing for the depth-1 lane,
-    // and a permanently failing test stops being read. The numbers above are the whole diagnosis.
-    if std::env::var("SDK77_DEPTH2").ok().as_deref() != Some("1") {
-        println!(
-            "SDK77 - (3c/3d) SKIPPED the depth-2 spine batch: set SDK77_DEPTH2=1 to run it. The \
-             batch builds, co-signs and conveys; the receiver refuses the intermediate segment's \
-             payload sum (11842 vs the required 12014) — see the comment above."
-        );
-    } else {
+    // This was gated behind an env flag while one bug stood between the batch and the receiver, and
+    // the bug turned out to be in the RECEIVER, not the batch: `verify_child_bundle`'s ancestor
+    // conservation used `tier_out_value` — the PLAIN, SINGLE-payload formula — against a COLOURED,
+    // MULTI-payload `SP`. Σ 11 842 against an "expected" 12 014 from a 12 504 funding at 2 sat/vB;
+    // the 172-sat gap is exactly the opret plus the second payload output. It refused every honest
+    // batch-minted piece.
     let dave = colored_wallet("sdk77_dave").await?;
     let dave_address = dave.get_utexo_address().await?;
     const PAY2: u64 = 200;
@@ -581,8 +567,6 @@ pub async fn execute() -> Result<()> {
          intermediate segment SP_1",
         dave_txids.len()
     );
-
-    }
 
     // ---- 4. OFF-CHAIN RE-TRANSFER: bob -> carol, whole, coloured. --------------------------------
     // Only possible because adoption opened `ext_child`'s payload seal. Without it this is where a

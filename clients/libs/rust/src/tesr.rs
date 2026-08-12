@@ -11824,7 +11824,7 @@ pub fn verify_child_bundle(
         // is FOR; a count law would refuse every honest split. Σ bounds the implied fee regardless of
         // how the value is divided, which is the property that matters here.
         {
-            let payload_sum: u64 = st_tx
+            let payloads: Vec<u64> = st_tx
                 .output
                 .iter()
                 .filter(|o| {
@@ -11832,15 +11832,36 @@ pub fn verify_child_bundle(
                         && !o.script_pubkey.is_op_return()
                 })
                 .map(|o| o.value)
-                .sum();
-            let expected = mercurylib::tesr::tier_out_value(st_prev_value, cb.parent.fee_rate)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "ancestor {i} state: its funding value {st_prev_value} cannot carry a tier at \
-                         {} sat/vB — the segment is unfundable as declared",
-                        cb.parent.fee_rate
-                    )
-                })?;
+                .collect();
+            let payload_sum: u64 = payloads.iter().sum();
+            // **THE LAW MUST BE THE ONE THIS TIER IS ACTUALLY BUILT UNDER.** Two axes, and this used
+            // a single-payload PLAIN formula (`tier_out_value`) on both:
+            //
+            //  * COUNT. The comment above says it — `SP` hosts the level below, so N payload outputs
+            //    are what it is FOR. `tier_out_value` is `tier_out_total(.., 1, ..)`, so every
+            //    segment with more than one child was measured against a one-output budget.
+            //  * COLOUR. A coloured tier carries an opret commitment, which costs vBytes a plain one
+            //    does not. Charging the plain schedule to a coloured segment under-counts the fee it
+            //    is entitled to commit.
+            //
+            // Both errors point the same way — expect MORE value than the tier can legitimately
+            // carry — so the check refused honest material rather than admitting dishonest material.
+            // Measured live on the first coloured spine batch: Σ 11 842 against an "expected" 12 014
+            // from a 12 504 funding at 2 sat/vB, a 172-sat gap that is exactly the opret plus the
+            // second payload output. Every batch-minted piece was refused by every receiver.
+            let n_payload = payloads.len().max(1);
+            let expected = if cb.is_colored() {
+                crate::rgb::colored_tier_out_total(st_prev_value, n_payload, cb.parent.fee_rate)
+            } else {
+                mercurylib::tesr::tier_out_total(st_prev_value, n_payload, cb.parent.fee_rate)
+            }
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ancestor {i} state: its funding value {st_prev_value} cannot carry a \
+                     {n_payload}-payload tier at {} sat/vB — the segment is unfundable as declared",
+                    cb.parent.fee_rate
+                )
+            })?;
             if payload_sum != expected {
                 return Err(anyhow::anyhow!(
                     "ancestor {i} state (the intermediate spine SP): Σ over its payload outputs is \
