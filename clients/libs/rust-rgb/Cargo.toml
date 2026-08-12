@@ -9,6 +9,8 @@ description = "Bridge between Mercury Layer (statechains) and rgb-lib for issuin
 # this bridge only ever exchanges *strings* (base64 PSBTs, hex txids, base64 consignments) with the
 # Mercury side - no Bitcoin types cross the boundary.
 [dependencies]
+# [P2] Deriving a distinct, reproducible blinding per payload output.
+sha2 = "0.10"
 # rgb-lib is our statechain fork at gofman8/rgb-lib (branch feat/spark), PINNED BY REVISION.
 #
 # This used to be `path = "../../../../utexo-rgb-lib"`. A path dependency makes rgb-lib edits take
@@ -27,6 +29,6 @@ description = "Bridge between Mercury Layer (statechains) and rgb-lib for issuin
 # committed by accident:
 #   [patch."https://github.com/gofman8/rgb-lib"]
 #   rgb-lib = { path = "../../../../utexo-rgb-lib" }
-rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "38e344e06628703f9c92017c5cb732b716c8ffc0", default-features = false, features = ["electrum"] }
+rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "ae8439e6824a4593891ee8c71fd87b0024e46ae9", default-features = false, features = ["electrum"] }
 anyhow = "1.0"
 base64 = "0.22"

@@ -233,12 +233,18 @@ pub(crate) fn refuse_colored_multi_payee(payees: usize) -> Result<()> {
     }
     Err(anyhow!(
         "coloured K > 1 refused: this batch pays {payees} recipients out of ONE coloured carrier, \
-         and a coloured split state gives all {payees} payload outputs the SAME seal blinding \
-         (`build_colored_tier` derives one `seal.blinding()` for the whole output map). A concealed \
-         seal commits to (method, txid, vout, blinding), so each payee could de-conceal every other \
-         payee's seal and allocation in {payees} tries — concealment across the batch would be worth \
-         zero bits. Per-output blinding is a separate change; until it lands, pay coloured recipients \
-         one per carrier (`transfer_tokens`). Nothing has been co-signed and the carrier is untouched."
+         and the coloured lane conveys its pieces SERIALLY after the carrier is already terminal \
+         (one `convey_child_bundle` per payee, each `?`). A failure at recipient j therefore aborts \
+         with pieces j..{payees} never handed over — and this lane journals no `recipient_address`, \
+         so the resume driver reports those legs unactionable rather than re-conveying them. The \
+         sender holds their slots' keys and no route to the recipients: the value is stranded, \
+         permanently, after the carrier has been spent. Pay coloured recipients one per carrier \
+         (`transfer_tokens`). Nothing has been co-signed and the carrier is untouched.\n\n\
+         [P2] The SEAL-PRIVACY gate this refusal used to name is CLOSED: every payload output now \
+         gets its own blinding (`AssetColoringInfo::output_blinding`, rgb-lib ae8439e), so a payee \
+         can no longer de-conceal a sibling's seal. That was one prerequisite of several — see \
+         `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 — and idempotent re-conveyance is the one that still \
+         loses money."
     ))
 }
 
@@ -6422,8 +6428,24 @@ mod colored_k_gt_1_tests {
 
         let e = refuse_colored_multi_payee(2).unwrap_err().to_string();
         assert!(e.contains("coloured K > 1 refused"), "refused BY NAME: {e}");
-        assert!(e.contains("SAME seal blinding"), "the refusal must state the reason: {e}");
-        assert!(e.contains("build_colored_tier"), "…and name the code it is a property of: {e}");
+        // [P2] The reason MOVED, and the assertion moves with it. The seal-privacy gate this
+        // refusal was written for is closed (per-output blinding, rgb-lib ae8439e). What still
+        // stands is the money-losing one: serial conveyance after the carrier is terminal, with no
+        // journalled recipient to resume from. Asserting the OLD reason would have kept this test
+        // green while the refusal explained something that is no longer true.
+        assert!(
+            e.contains("SERIALLY") && e.contains("stranded"),
+            "the refusal must state the reason that ACTUALLY still stands: {e}"
+        );
+        assert!(
+            e.contains("convey_child_bundle"),
+            "…and name the code it is a property of: {e}"
+        );
+        assert!(
+            e.contains("CLOSED"),
+            "and it must record that the seal-privacy prerequisite is done, or the next reader \
+             re-solves a solved problem: {e}"
+        );
         assert!(
             e.contains("transfer_tokens"),
             "a refusal that removes a capability must name the route that still works: {e}"
@@ -6433,9 +6455,11 @@ mod colored_k_gt_1_tests {
             "the carrier must be stated untouched — this fires before the split: {e}"
         );
 
-        // The count in the message is the caller's K, not a constant.
+        // The count in the message is the caller's K, not a constant. ("in K tries" belonged to the
+        // seal-privacy phrasing and went with it; the surviving K-dependent phrase is the range of
+        // pieces a mid-conveyance failure strands.)
         let e19 = refuse_colored_multi_payee(19).unwrap_err().to_string();
-        assert!(e19.contains("19 recipients") && e19.contains("in 19 tries"), "{e19}");
+        assert!(e19.contains("19 recipients") && e19.contains("j..19"), "{e19}");
     }
 
     /// **THE ENGINE IS WHERE IT IS REFUSED**, so no route reaches a shared-blinding batch by another

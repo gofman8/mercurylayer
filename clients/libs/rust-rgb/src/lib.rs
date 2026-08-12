@@ -63,6 +63,28 @@ pub enum ValidationVerdict {
     Unresolved,
 }
 
+
+/// **[P2] A distinct, DETERMINISTIC blinding per payload output.**
+///
+/// A seal's blinding conceals it. Sharing one across a transaction's payload outputs makes the
+/// concealment collective: a recipient who learns the secret for their own leg de-conceals every
+/// sibling. rgb-lib's `new_random_vout` would separate them but destroys byte-for-byte rebuild on a
+/// retry, which the un-broadcast statechain lane depends on — a rebuilt tier with a different seal
+/// is a different transaction, and the co-signature no longer matches.
+///
+/// So the per-vout value is derived from the operation's own blinding and the vout: distinct for
+/// every output, identical across reruns of the same operation, and revealing nothing about a
+/// sibling without the base secret.
+fn per_output_blinding(base: u64, vout: u32) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"utexo/p2/per-output-blinding/v1");
+    h.update(base.to_be_bytes());
+    h.update(vout.to_be_bytes());
+    let d = h.finalize();
+    u64::from_be_bytes(d[..8].try_into().expect("32-byte digest"))
+}
+
 impl ValidationVerdict {
     /// Map one `ValidateConsignmentResult` (`valid` + `error` tag) onto this enum.
     ///
@@ -473,6 +495,19 @@ impl RgbWallet {
             asset_info_map: HashMap::from([(
                 contract,
                 AssetColoringInfo {
+                    // [P2] ONE SECRET PER PAYLOAD SEAL. `static_blinding` applies a single value to
+                    // every output, so in a multi-payload transaction each recipient can de-conceal
+                    // every sibling seal with the secret they legitimately learn for their own leg —
+                    // reading who else was paid, and how much, out of a batch they were entitled to
+                    // one leg of.
+                    //
+                    // Derived, not random: the transaction must rebuild byte-for-byte on a retry, so
+                    // each vout's blinding is a deterministic function of the shared blinding and
+                    // the vout. Distinct per output, reproducible across runs.
+                    output_blinding: output_map
+                        .keys()
+                        .map(|vout| (*vout, per_output_blinding(blinding, *vout)))
+                        .collect(),
                     output_map,
                     blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
@@ -581,6 +616,19 @@ impl RgbWallet {
             asset_info_map: HashMap::from([(
                 contract,
                 AssetColoringInfo {
+                    // [P2] ONE SECRET PER PAYLOAD SEAL. `static_blinding` applies a single value to
+                    // every output, so in a multi-payload transaction each recipient can de-conceal
+                    // every sibling seal with the secret they legitimately learn for their own leg —
+                    // reading who else was paid, and how much, out of a batch they were entitled to
+                    // one leg of.
+                    //
+                    // Derived, not random: the transaction must rebuild byte-for-byte on a retry, so
+                    // each vout's blinding is a deterministic function of the shared blinding and
+                    // the vout. Distinct per output, reproducible across runs.
+                    output_blinding: output_map
+                        .keys()
+                        .map(|vout| (*vout, per_output_blinding(blinding, *vout)))
+                        .collect(),
                     output_map,
                     blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
@@ -632,6 +680,10 @@ impl RgbWallet {
                     output_map: HashMap::new(),
                     blinded_map,
                     static_blinding: Some(blinding),
+                    // [P2] No witness-vout seals on this lane — every beneficiary is a BLINDED seal
+                    // the receiver produced with `blind_receive`, already concealed under a secret
+                    // only they hold. There is nothing here for a per-output blinding to separate.
+                    output_blinding: HashMap::new(),
                 },
             )]),
             static_blinding: Some(blinding),
