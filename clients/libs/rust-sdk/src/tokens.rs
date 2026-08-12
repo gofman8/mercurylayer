@@ -3357,6 +3357,39 @@ impl UtexoWallet {
                 se_hash: None,
             });
         }
+        // [S4b] …and it may be a coloured SPINE TIP: the shape a carrier takes from its SECOND
+        // payment onward, because the change of a coloured split is a one-cap tip (S3). The comment
+        // on the CHILD arm directly above states this hazard exactly, and the tip is the third shape
+        // it applies to — no `tesr-` row, so the root fork misses it and it falls into the RETIRED
+        // lane below, which spends `SP.out[K]` with an RGB-unaware transaction and destroys the
+        // allocation booked there. Measured: without this arm the second payment out of a coloured
+        // carrier was refused as "not laddered YET" by the retirement gate, because a tip reads as
+        // un-laddered to every check that asks only for a `tesr-` row.
+        if mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "cannot tell whether carrier {carrier_id} is a coloured spine tip ({e}) — refusing \
+                 the token transfer rather than guessing which lane is safe"
+            )
+        })?
+        .is_some_and(|t| t.is_colored())
+        {
+            return self
+                .colored_in_ladder_transfer(
+                    asset_id,
+                    receiver_address,
+                    token_amount,
+                    carrier,
+                    carrier_amount,
+                    latch,
+                )
+                .await;
+        }
         // Everything below is the RETIRED lane: one `create_colored_split_tx` over the carrier's
         // funding output `F`. Gated as a whole first, then still interlocked per coin — the
         // interlock is the fail-closed backstop if the read above ever disagrees with the load below.
@@ -3677,18 +3710,18 @@ impl UtexoWallet {
                     &carrier_id,
                 )
                 .await?;
-                return Err(match tip {
-                    Some(t) if t.is_colored() => anyhow!(
-                        "carrier {carrier_id} is a COLOURED SPINE TIP — the change leg of an earlier \
-                         coloured split, holding {} of its contract. Paying from it is a coloured \
-                         spine BATCH (`build_colored_spine_batch` + `cosign_colored_spine_batch`), \
-                         not a root split, and this driver's batch sibling is not built yet. The \
-                         allocation is safe and exitable: `unilateral_exit` walks the tip's chain \
-                         and settles it on chain.",
-                        t.rgb.as_ref().map(|r| r.amount).unwrap_or_default()
-                    ),
-                    _ => anyhow!("carrier {carrier_id} has no TES-R ladder to split in-ladder"),
-                });
+                // A COLOURED SPINE TIP is the carrier's shape from its SECOND payment onward, and
+                // it routes to the batch — `SP_{i+1}` over the tip's own funding outpoint, not `SP`
+                // over `X_m`'s payload. Dispatching here rather than at the entry point keeps the
+                // rule where every coloured send already funnels through.
+                if tip.as_ref().is_some_and(|t| t.is_colored()) {
+                    return self
+                        .colored_spine_batch_pay(asset_id, carrier, carrier_amount, payouts)
+                        .await;
+                }
+                return Err(anyhow!(
+                    "carrier {carrier_id} has no TES-R ladder to split in-ladder"
+                ));
             }
         };
         let rgb_half = bundle
@@ -4082,6 +4115,328 @@ impl UtexoWallet {
         Ok(piece_sids.into_iter().zip(piece_sats).collect())
     }
 
+    /// **[S4b] Pay from a COLOURED SPINE TIP — the second and every later payment of a carrier.**
+    ///
+    /// [`Self::colored_in_ladder_pay`]'s sibling. The first payment out of a coloured carrier splits
+    /// the ROOT: `SP` over `X_m`'s payload output. It leaves the change as a one-cap TIP (S3), and
+    /// from then on the carrier IS that tip — so every later payment is a spine BATCH: `SP_{i+1}`
+    /// over the tip's own funding outpoint, out-racing the tip's cap at `SPINE_CSV`.
+    ///
+    /// Everything below `SP` is the same construction, which is why the two share
+    /// `build_colored_split_legs`. What differs here:
+    ///
+    /// * the sizing budget comes from the tip's slot (`sp_out_value`), not `X_m`'s payload;
+    /// * the change leg is the NEXT tip, persisted under `spinetip-`, one level deeper;
+    /// * the spent tip's coin is booked WITHDRAWN — that is what disarms this wallet's tower, which
+    ///   would otherwise go on driving the tip's now-superseded cap against the children's
+    ///   `SP_{i+1}` and destroy their allocation.
+    async fn colored_spine_batch_pay(
+        &self,
+        asset_id: &str,
+        mut carrier: mercurylib::wallet::Coin,
+        carrier_amount: u64,
+        payouts: &[(String, u64)],
+    ) -> Result<Vec<(String, u64)>> {
+        use mercuryrustlib::tesr::{ColoredSplitChildSpec, COLORED_LADDER_DUST};
+
+        if payouts.is_empty() {
+            return Err(anyhow!("a coloured spine batch needs at least one payout"));
+        }
+        // Same door, same reason as the root lane: one `seal.blinding()` covers every payload, so
+        // payee j de-conceals every sibling seal in K tries. Refused at the engine, not the entry.
+        refuse_colored_multi_payee(payouts.len())?;
+        let network = self.inner.config.network.to_string();
+        let carrier_id = carrier
+            .statechain_id
+            .clone()
+            .ok_or_else(|| anyhow!("carrier coin without statechain id"))?;
+        let tip = mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &carrier_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("carrier {carrier_id} is not a persisted spine tip"))?;
+        let rgb_half = tip
+            .rgb
+            .clone()
+            .ok_or_else(|| anyhow!("spine tip {carrier_id} is PLAIN"))?;
+        if rgb_half.contract_id != asset_id {
+            return Err(anyhow!(
+                "spine tip {carrier_id} carries contract {} but this transfer is for {asset_id}",
+                rgb_half.contract_id
+            ));
+        }
+        if rgb_half.amount != carrier_amount {
+            return Err(anyhow!(
+                "spine tip {carrier_id} declares {} of {asset_id} but the engine has {} booked on \
+                 its funding output — refusing to split on a disagreement",
+                rgb_half.amount,
+                carrier_amount
+            ));
+        }
+        let token_out: u64 = payouts.iter().map(|(_, a)| *a).sum();
+        if payouts.iter().any(|(_, a)| *a == 0) {
+            return Err(anyhow!("a coloured spine batch payout of 0 would carve an empty leg"));
+        }
+        if token_out == 0 || token_out > rgb_half.amount {
+            return Err(anyhow!(
+                "cannot send {token_out} of {asset_id}: the tip holds {}",
+                rgb_half.amount
+            ));
+        }
+        let token_change = rgb_half.amount - token_out;
+        // A batch ALWAYS leaves a tip. Spending a tip to zero would end the carrier's payment life
+        // with no funding outpoint for the next level, so the whole-allocation case is the ROOT
+        // lane's `build_colored_receiver_state` (convey the tip whole), not a batch.
+        if token_change == 0 {
+            return Err(anyhow!(
+                "a coloured spine batch must leave a change tip, but this payout is the tip's whole \
+                 {token_out} of {asset_id}. To move it all, convey the tip whole rather than \
+                 batching it — a batch with no change leaves no funding outpoint for the next \
+                 payment"
+            ));
+        }
+
+        let n_pay = payouts.len();
+        let n_children = n_pay + 1;
+        let fee_rate = tip.parent.fee_rate;
+        let total = mercuryrustlib::rgb::colored_tier_out_total(
+            tip.sp_out_value,
+            n_children,
+            fee_rate,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "the tip's slot ({} sat) cannot carry a coloured {n_children}-output batch at \
+                 {fee_rate} sat/vB",
+                tip.sp_out_value
+            )
+        })?;
+        let mut piece_sats: Vec<u64> = vec![TOKEN_PIECE_SATS; n_pay];
+        let spent = TOKEN_PIECE_SATS
+            .checked_mul(n_pay as u64)
+            .ok_or_else(|| anyhow!("piece sizing overflowed"))?;
+        if spent >= total {
+            return Err(anyhow!(
+                "spine tip {carrier_id} is too small for a coloured batch into {n_pay} piece(s) + \
+                 change: its slot affords {total} sat and the pieces alone are {spent}"
+            ));
+        }
+        let change_sats = total - spent;
+        // BOTH floors, per leg, and the larger binds — identical reasoning to the root lane. The
+        // change leg is a TIP here by construction (a batch's change always is), so it takes the
+        // one-rung floor, which sits below the piece floor; one shared number could only carry the
+        // tip's cheaper shape by applying it to every payee too.
+        let backup_floor = crate::transfer::min_split_output(
+            crate::transfer::backup_fee_rate(&self.inner.cc).await?,
+        );
+        let piece_floor = backup_floor.max(
+            mercuryrustlib::tesr::SplitLegRole::Piece
+                .colored_min_value(fee_rate, COLORED_LADDER_DUST),
+        );
+        let change_floor = backup_floor.max(
+            mercuryrustlib::tesr::SplitLegRole::SpineTip
+                .colored_min_value(fee_rate, COLORED_LADDER_DUST),
+        );
+        let too_small: Vec<u64> = piece_sats.iter().copied().filter(|s| *s < piece_floor).collect();
+        if !too_small.is_empty() {
+            return Err(anyhow!(
+                "coloured spine batch needs every PIECE >= {piece_floor} sat at {fee_rate} sat/vB; \
+                 these do not: {too_small:?}"
+            ));
+        }
+        if change_sats < change_floor {
+            return Err(anyhow!(
+                "coloured spine batch needs the CHANGE TIP >= {change_floor} sat at {fee_rate} \
+                 sat/vB (it is {change_sats}) — a batch that cannot leave a viable tip ends the \
+                 carrier's payment life"
+            ));
+        }
+
+        let mut slot_tokens = self.take_derived_tokens(&carrier_id, n_children).await?;
+        let mut child_coins: Vec<mercurylib::wallet::Coin> = Vec::with_capacity(n_children);
+        for sats in piece_sats.iter().copied() {
+            child_coins.push(self.create_child_slot(&slot_tokens.remove(0), sats).await?);
+        }
+        child_coins.push(self.create_child_slot(&slot_tokens.remove(0), change_sats).await?);
+        let child_sids: Vec<String> = child_coins
+            .iter()
+            .map(|c| c.statechain_id.clone().ok_or_else(|| anyhow!("child slot has no statechain id")))
+            .collect::<Result<_>>()?;
+
+        let mut specs: Vec<ColoredSplitChildSpec> = Vec::with_capacity(n_children);
+        for (j, (receiver_address, amount)) in payouts.iter().enumerate() {
+            specs.push(ColoredSplitChildSpec {
+                statechain_id: child_sids[j].clone(),
+                agg_address: child_coins[j]
+                    .aggregated_address
+                    .clone()
+                    .ok_or_else(|| anyhow!("piece child slot has no aggregate address"))?,
+                owner_exit_address: mercurylib::tesr::payee_address(receiver_address, &network)?,
+                sats: piece_sats[j],
+                rgb_amount: *amount,
+                is_change_tip: false,
+            });
+        }
+        {
+            let c = &child_coins[n_pay];
+            specs.push(ColoredSplitChildSpec {
+                statechain_id: child_sids[n_pay].clone(),
+                agg_address: c
+                    .aggregated_address
+                    .clone()
+                    .ok_or_else(|| anyhow!("change slot has no aggregate address"))?,
+                owner_exit_address: mercurylib::transaction::get_user_backup_address(
+                    c,
+                    network.clone(),
+                )?,
+                sats: change_sats,
+                rgb_amount: token_change,
+                is_change_tip: true,
+            });
+        }
+
+        // The spine LEVEL: one deeper than every segment already walked. It is what separates this
+        // batch's seals from the previous level's — two levels over one funding chain share
+        // `(statechain_id, role, tier_index)`, and colliding blindings collapse to one `BundleId`.
+        let spine_level = tip.ancestors.len() as u32 + 1;
+        let draft = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+            tokio::task::block_in_place(|| -> Result<_> {
+                let draft =
+                    mercuryrustlib::tesr::build_colored_spine_batch(w, &tip, &specs, spine_level)?;
+                // Same pre-flight as the root lane: PROVE each leg's consignment resolves against
+                // its own witness chain BEFORE the tip is terminalized. The chain is the root
+                // ladder, every intermediate segment, this batch's `SP`, then the leg's own tiers.
+                let mut base = tip.parent.ladder_txids();
+                for seg in tip.ancestors.iter() {
+                    if let Some(x) = seg.extension.as_ref() {
+                        base.push(x.txid.clone());
+                    }
+                    base.push(seg.state.txid.clone());
+                }
+                base.push(draft.sp_txid.clone());
+                for cd in draft.children.iter() {
+                    let mut txids = base.clone();
+                    if let Some(x) = cd.extension.as_ref() {
+                        txids.push(x.txid.clone());
+                    }
+                    txids.push(cd.state.txid.clone());
+                    let (verdict, detail, contract) =
+                        w.validate_offchain_chain_info(&cd.state.consignment, &txids)?;
+                    if verdict != ValidationVerdict::Valid {
+                        let leg = if cd.extension.is_none() {
+                            "the sender's CHANGE TIP (one cap over SP.out[j])"
+                        } else {
+                            "a PAYEE piece (extension + state over SP.out[j])"
+                        };
+                        return Err(anyhow!(
+                            "refusing the coloured spine batch of {carrier_id}: leg {} — {leg} — \
+                             has a consignment that does not validate against its own chain \
+                             ({verdict:?}) over witnesses {txids:?}: {}",
+                            cd.statechain_id,
+                            detail.unwrap_or_default()
+                        ));
+                    }
+                    if contract.as_deref() != Some(rgb_half.contract_id.as_str()) {
+                        return Err(anyhow!(
+                            "refusing the coloured spine batch of {carrier_id}: leg {}'s \
+                             consignment is for contract {contract:?}, not the tip's {}",
+                            cd.statechain_id,
+                            rgb_half.contract_id
+                        ));
+                    }
+                }
+                Ok(draft)
+            })?
+        };
+        let sp_txid = draft.sp_txid.clone();
+        let change_sp_vout = draft.children[n_pay].sp_vout;
+
+        let (bundles, next_tip) = mercuryrustlib::tesr::cosign_colored_spine_batch(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &mut carrier,
+            &tip,
+            draft,
+            &mut child_coins,
+        )
+        .await?;
+
+        // The NEXT tip first, then convey — the ordering the root lane argues for and for the same
+        // reason: every tier is already co-signed and the old tip is terminal, so a conveyance that
+        // failed here would abort with the change record unwritten, destroying the only record of
+        // this wallet's remaining allocation.
+        let next_tip = next_tip.ok_or_else(|| {
+            anyhow!(
+                "the coloured spine batch of {carrier_id} produced no change tip — refusing to \
+                 convey, because this wallet's remaining {token_change} of {asset_id} would have \
+                 no persisted exit"
+            )
+        })?;
+        let next_tip_sid = next_tip.statechain_id.clone();
+        mercuryrustlib::tesr::persist_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &next_tip,
+        )
+        .await?;
+
+        for (j, (receiver_address, _)) in payouts.iter().enumerate() {
+            mercuryrustlib::tesr::convey_child_bundle(
+                &self.inner.cc,
+                receiver_address,
+                &child_coins[j],
+                &bundles[j],
+                None,
+            )
+            .await?;
+        }
+
+        // RGB re-booking: the tip's funding outpoint is spent by `SP_{i+1}`, and the change now
+        // lives at `SP_{i+1}.out[K']`.
+        let tip_op = {
+            let (txid, vout) = tip.funding_outpoint();
+            format!("{txid}:{vout}")
+        };
+        {
+            let rgb = self.rgb().await?;
+            let w = rgb.as_ref().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+            let contract = rgb_half.contract_id.clone();
+            let sp = sp_txid.clone();
+            let ops = vec![tip_op];
+            tokio::task::block_in_place(|| -> Result<()> {
+                w.register_statechain(
+                    &sp,
+                    change_sp_vout,
+                    change_sats,
+                    &contract,
+                    token_change,
+                    &ops,
+                )?;
+                Ok(())
+            })?;
+        }
+
+        // Booking the spent tip WITHDRAWN is what DISARMS this wallet's tower. Its child loop gates
+        // on the coin's durable status, and the old tip's cap now rivals `SP_{i+1}` over the shared
+        // outpoint — an armed tower would broadcast the cap and destroy the allocation it just paid
+        // away.
+        let piece_sids: Vec<String> = child_sids[..n_pay].to_vec();
+        self.book_inladder_split_coins_opt(
+            &carrier_id,
+            &sp_txid,
+            &piece_sids,
+            CoinStatus::WITHDRAWN,
+            Some((next_tip_sid, change_sats, change_sp_vout)),
+        )
+        .await?;
+
+        Ok(piece_sids.into_iter().zip(piece_sats).collect())
+    }
+
     /// Does this carrier hold a COLOURED (CTES-R) ladder? Fail CLOSED: an unreadable row is an
     /// `Err`, never `false` — "I could not tell which lane this coin is on" must not be answered
     /// with the lane that spends its funding output.
@@ -4176,7 +4531,23 @@ impl UtexoWallet {
             .statechain_id
             .clone()
             .ok_or_else(|| anyhow!("carrier coin without statechain id at the retirement gate"))?;
-        let has_ladder = mercuryrustlib::tesr::load(
+        // [S4b] A COLOURED SPINE TIP IS LADDERED. `has_ladder` decides whether the retirement gate
+        // treats a carrier as "waiting for its ladder" (refuse, it will get one) or "can never have
+        // one" (open the migration hatch). A tip has a ladder — a cap over an un-broadcast outpoint,
+        // descending from the root's — but no `tesr-` row, so this read called it un-laddered and
+        // the gate refused a payment that is perfectly well-formed.
+        let has_tip_ladder = mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            &sid,
+        )
+        .await
+        .map_err(|e| {
+            anyhow!("cannot read the spine-tip row of carrier {sid} ({e}) — refusing to classify it")
+        })?
+        .is_some();
+        let has_ladder = has_tip_ladder
+            || mercuryrustlib::tesr::load(
             &self.inner.cc,
             &self.inner.config.wallet_name,
             &sid,
@@ -5349,22 +5720,48 @@ mod s4b_lane_fork_tests {
     }
 
     #[test]
-    fn the_coloured_engine_refuses_a_tip_carrier_by_name() {
+    fn a_tip_carrier_is_dispatched_to_the_batch_not_split_as_a_root() {
         let code = code_of("async fn colored_in_ladder_pay(");
         assert!(
-            code.contains("COLOURED SPINE TIP"),
-            "the coloured engine now RECEIVES tip carriers (the fork sends them here), and it splits \
-             ROOT carriers. It must say so by name — a generic 'no TES-R ladder' reads as data loss"
+            code.contains("colored_spine_batch_pay("),
+            "the coloured engine RECEIVES tip carriers (the fork sends them here) and it splits ROOT \
+             carriers — `SP` over `X_m`'s payload. A tip's `SP_{{i+1}}` sits over its own funding \
+             outpoint, so it must be dispatched to the batch driver, not split as a root"
+        );
+    }
+
+    /// A batch always leaves a tip. Spending one to zero would end the carrier's payment life with
+    /// no funding outpoint for the next level — the whole-allocation move is conveying the tip.
+    #[test]
+    fn the_batch_refuses_to_spend_its_tip_to_zero() {
+        let code = code_of("async fn colored_spine_batch_pay(");
+        assert!(
+            code.contains("token_change == 0"),
+            "a batch with no change leaves no funding outpoint for the next payment"
         );
         assert!(
-            code.contains("cosign_colored_spine_batch"),
-            "the refusal must name the construct that does apply, or the reader concludes the \
-             coloured batch does not exist"
+            code.contains("SplitLegRole::SpineTip") && code.contains("SplitLegRole::Piece"),
+            "both floors apply per leg: the change is a TIP (one rung) and the payees are PIECES \
+             (two), and one shared number could only carry the tip's cheaper shape by applying it \
+             to every payee too"
+        );
+    }
+
+    /// The spent tip's cap RIVALS the batch's `SP_{i+1}` over the same outpoint. Booking the coin
+    /// WITHDRAWN is what stops this wallet's own tower broadcasting that cap and destroying the
+    /// allocation it just paid away.
+    #[test]
+    fn the_spent_tip_is_booked_withdrawn_which_disarms_our_own_tower() {
+        let code = code_of("async fn colored_spine_batch_pay(");
+        assert!(
+            code.contains("CoinStatus::WITHDRAWN"),
+            "the spent tip must be booked WITHDRAWN — the tower's child loop gates on the coin's \
+             durable status, and an armed tower would race the children with the tip's cap"
         );
         assert!(
-            code.contains("unilateral_exit"),
-            "and it must say the allocation is still recoverable — a refusal that leaves the owner \
-             believing their tokens are stuck is a support incident, not a safety measure"
+            code.contains("persist_spine_tip(") ,
+            "and the NEXT tip must be persisted before any conveyance, or a failed hand-over aborts \
+             with this wallet's remaining allocation unrecorded"
         );
     }
 }

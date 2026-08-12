@@ -2366,8 +2366,42 @@ fn build_colored_spine_batch_sp_full(
     // N payees + the change leg, which stays with the sender and becomes the NEXT tip.
     let n = children.len() + 1;
     let (fund_txid, fund_vout) = tip.funding_outpoint();
-    let (prev_value, prev_spk) =
-        tier_payload_prevout(tip.funding_tier(), "coloured spine batch parent")?;
+    // **READ THE FUNDING OUTPUT ITSELF, not the funding tier's declared payload fields.**
+    //
+    // `tier_payload_prevout` pairs a tier's `out_value` with its `payload_vout`, which is right for
+    // a single-payload tier and WRONG for an `SP`: a split state's `out_value` is the TOTAL across
+    // every leg and its `payload_vout` names only the first. Asking it for the tip's prevout
+    // compared 15 570 (the whole split) against the 3 066 sitting at the first payee's vout, and the
+    // batch refused a perfectly well-formed tip. Measured live on sdk77's second payment.
+    //
+    // `sp_out_value` is the field that exists for exactly this — "the value of the outpoint the
+    // cap's SIGNATURE names" — and the script comes from the funding transaction itself. Both are
+    // safe to trust here because `tip.validate()` above has already bound the cap's signature to
+    // this outpoint.
+    let prev_value = tip.sp_out_value;
+    let prev_spk = {
+        use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+        let funding_tx: Transaction = deserialize(&hex::decode(&tip.funding_tier().signed_tx)?)
+            .map_err(|e| {
+                anyhow::anyhow!("coloured spine batch: the tip's funding SP does not parse ({e})")
+            })?;
+        let out = funding_tx.output.get(fund_vout as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "coloured spine batch: the tip names funding vout {fund_vout} but its funding \
+                 transaction has {} outputs",
+                funding_tx.output.len()
+            )
+        })?;
+        if out.value != prev_value {
+            return Err(anyhow::anyhow!(
+                "coloured spine batch: the tip declares its slot at {prev_value} sat but \
+                 {fund_txid}:{fund_vout} holds {} — the batch's whole payload arithmetic is carved \
+                 out of this number",
+                out.value
+            ));
+        }
+        hex::encode(out.script_pubkey.as_bytes())
+    };
 
     // ---- Conservation law 1: SATS. -------------------------------------------------------------
     let total = colored_tier_out_total(prev_value, n, tip.parent.fee_rate).ok_or_else(|| {
@@ -2502,7 +2536,10 @@ pub fn build_colored_spine_batch(
     let rgb_half = tip.rgb.as_ref().expect("checked by build_colored_spine_batch_sp_full");
     let p = tip.parent.params;
     let (fund_txid, fund_vout) = tip.funding_outpoint();
-    let (prev_value, _) = tier_payload_prevout(tip.funding_tier(), "coloured spine batch parent")?;
+    // Same reason as inside `build_colored_spine_batch_sp_full`: an `SP`'s `out_value` is the TOTAL
+    // across its legs and its `payload_vout` names only the first, so `tier_payload_prevout` is the
+    // wrong reader for a tip's slot. `sp_out_value` is the value the cap's signature commits to.
+    let prev_value = tip.sp_out_value;
     let child_drafts = build_colored_split_legs(
         rgb,
         &rgb_half.contract_id,
