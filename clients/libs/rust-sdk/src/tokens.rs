@@ -117,7 +117,7 @@ pub const TOKEN_PIECE_SATS: u64 = 3_066;
 /// On the CTES-R lane the change of a coloured split is a depth-1 COLOURED CHILD, and three guards
 /// in `mercuryrustlib::tesr` each independently refuse to carve a second piece out of it:
 /// `refuse_uncolored_over_colored_child` (an uncoloured tier over a sealed output burns the
-/// allocation), `ChildTesrBundle::colored_child_txids` (a coloured child must be depth-1 — a
+/// allocation), `ChildTesrBundle::colored_child_txids` (MAX_COLORED_ADOPT_DEPTH — a
 /// coloured grandchild has no derivable seal schedule), and `colored_in_ladder_pay` itself, which
 /// loads a ROOT `tesr-` bundle and a child has none. So the CTES-R depth is **1**, not 5, and no
 /// amount of extra sats buys a sixth — or a second — send on that lane.
@@ -5652,7 +5652,7 @@ mod piece_floor_tests {
         for guard in [
             "pub fn refuse_uncolored_over_colored_child(",
             "pub fn colored_child_txids(",
-            "a coloured child must be depth-1",
+            "MAX_COLORED_ADOPT_DEPTH",
         ] {
             assert!(
                 tesr_src.contains(guard),

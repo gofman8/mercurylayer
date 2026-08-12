@@ -468,15 +468,27 @@ impl ChildTesrBundle {
         if !self.is_colored() {
             return Err(anyhow::anyhow!("this child is PLAIN — it has no coloured witness chain"));
         }
-        if !self.ancestors.is_empty() {
-            return Err(anyhow::anyhow!(
-                "a coloured child must be depth-1 (found {} intermediate segments) — coloured \
-                 child-level split does not exist, so a multi-level coloured child has no \
-                 derivable seal schedule",
-                self.ancestors.len()
-            ));
-        }
+        // ── [S5] N-DEEP. The depth-1 refusal is gone; the walk is now explicit. ─────────────────
+        //
+        // It used to refuse any `ancestors`, on the true-at-the-time grounds that no coloured
+        // grandchild could be built. The coloured SPINE mints exactly that: every batch leaves a tip
+        // whose next batch's pieces sit one level deeper, so a spine-minted piece at depth `d` has
+        // `d` intermediate segments and this list must cover them.
+        //
+        // Order is leaf-ward and must match `colored_child_seals` element for element — the two are
+        // read as parallel arrays by the receiver's resolver, so a length or order disagreement
+        // silently pairs a tier with another tier's seal.
         let mut v = self.parent.ladder_txids();
+        for (i, seg) in self.ancestors.iter().enumerate() {
+            // A SPINE segment is ONE tier (`extension: None`); a two-tier segment contributes both.
+            // Derived from the segment's own shape rather than assumed, because that shape is what
+            // decides how many seals the sibling function must emit.
+            if let Some(ext) = seg.extension.as_ref() {
+                v.push(ext.txid.clone());
+            }
+            let _ = i;
+            v.push(seg.state.txid.clone());
+        }
         v.push(self.child_extension.txid.clone());
         v.push(self.child_state.txid.clone());
         Ok(v)
@@ -508,7 +520,21 @@ impl ChildTesrBundle {
     ///    opens child `j`'s assignment and no other.
     pub fn colored_child_seals(&self) -> Result<Vec<(String, u32, u64)>> {
         use crate::rgb::TierRole;
-        let _ = self.colored_child_txids()?;
+        let want = self.colored_child_txids()?;
+        // [S5] The walks above are N-deep; ADOPTION is not, and the difference is economic. See
+        // `MAX_COLORED_ADOPT_DEPTH`: the carrier's floor is derived from the depth, so a deeper
+        // piece adopted against the depth-1 floor could not fund its own exit.
+        if self.ancestors.len() > MAX_COLORED_ADOPT_DEPTH {
+            return Err(anyhow::anyhow!(
+                "this coloured child sits at depth {} but this build adopts at most \
+                 {MAX_COLORED_ADOPT_DEPTH}. The seal schedule for it IS derivable — S5 made these \
+                 walks N-deep — but the carrier and piece FLOORS are derived from the depth, and a \
+                 deeper piece adopted against the depth-1 floor could not fund its own exit. Raising \
+                 this means re-deriving `CTESR_CARRIER_SEND_DEPTH`, the piece floor and the carrier \
+                 floor together.",
+                self.ancestors.len()
+            ));
+        }
         let p = &self.parent;
         if p.levels.len() != 1 {
             return Err(anyhow::anyhow!(
@@ -520,7 +546,7 @@ impl ChildTesrBundle {
         let ext = &p.current().extension;
         let sp = &p.current().state;
         let csid = &self.child_statechain_id;
-        Ok(vec![
+        let mut seals: Vec<(String, u32, u64)> = vec![
             (
                 p.trigger.txid.clone(),
                 p.trigger.payload_vout,
@@ -533,29 +559,138 @@ impl ChildTesrBundle {
             ),
             (
                 sp.txid.clone(),
-                // THIS child's payload output of the shared split transition.
-                self.sp_vout,
+                // ── [S5] WHICH PAYLOAD OF `SP` IS SEALED HERE ────────────────────────────────────
+                //
+                // At depth 1 it is THIS child's own `sp_vout`, as before. At depth > 1 the parent's
+                // `SP` is not spent by the leaf at all — it is spent by the FIRST intermediate
+                // segment, at that segment's `funding_vout`. Using `self.sp_vout` there would seal
+                // the wrong output of the right transaction: a vout that exists, so nothing errors,
+                // and a seal the receiver's resolver simply cannot open.
+                match self.ancestors.first() {
+                    Some(first) => first.funding_vout,
+                    None => self.sp_vout,
+                },
                 colored_tier_seal(psid, TierRole::SplitState, 0, p.m, sp.csv).blinding(),
             ),
-            (
-                self.child_extension.txid.clone(),
-                self.child_extension.payload_vout,
-                colored_tier_seal(csid, TierRole::ChildExtension, 0, 0, self.child_extension.csv)
-                    .blinding(),
-            ),
-            (
-                self.child_state.txid.clone(),
-                self.child_state.payload_vout,
-                colored_tier_seal(csid, TierRole::ChildState, 0, 0, self.child_state.csv)
-                    .blinding(),
-            ),
-        ])
+        ];
+
+        // ── [S5] THE INTERMEDIATE SEGMENTS, in the SAME leaf-ward order as `colored_child_txids`. ──
+        //
+        // Each segment's seal is taken at the payload the NEXT thing spends — the next segment's
+        // `funding_vout`, or the leaf's `sp_vout` for the last one. That is what makes the schedule
+        // a chain rather than a list of independently-plausible entries.
+        for (i, seg) in self.ancestors.iter().enumerate() {
+            let ssid = &seg.statechain_id;
+            match seg.extension.as_ref() {
+                // A TWO-TIER segment: its own extension then its own state, both under the
+                // SEGMENT's statechain id.
+                Some(ext) => {
+                    seals.push((
+                        ext.txid.clone(),
+                        ext.payload_vout,
+                        colored_tier_seal(ssid, TierRole::ChildExtension, 0, 0, ext.csv).blinding(),
+                    ));
+                    seals.push((
+                        seg.state.txid.clone(),
+                        next_funding_vout(self, i),
+                        colored_tier_seal(ssid, TierRole::ChildState, 0, 0, seg.state.csv)
+                            .blinding(),
+                    ));
+                }
+                // A [CATS] SPINE segment: ONE tier, and it is a SPINE tier — role `Spine`, rung =
+                // the level `i`. This is the whole reason S1 allocated that tag: every spine level
+                // sits at the SAME CSV over one funding chain, so without the level two levels
+                // derive one blinding, collapse to a single `BundleId`, and rgb-lib resolves the
+                // rival by a hash lottery — leaving the loser's consignment unvalidatable.
+                None => {
+                    // `m = 0` on a spine segment, enforced rather than assumed: a spine tier belongs
+                    // to no renewal epoch (an un-broadcast coin never renews mid-spine), and a
+                    // non-zero `m` here would be a second, silent source of separation that the
+                    // sender could vary and the receiver could not reproduce.
+                    seals.push((
+                        seg.state.txid.clone(),
+                        next_funding_vout(self, i),
+                        colored_tier_seal(ssid, TierRole::Spine, 0, i as u32, seg.state.csv)
+                            .blinding(),
+                    ));
+                }
+            }
+        }
+
+        seals.push((
+            self.child_extension.txid.clone(),
+            self.child_extension.payload_vout,
+            colored_tier_seal(csid, TierRole::ChildExtension, 0, 0, self.child_extension.csv)
+                .blinding(),
+        ));
+        seals.push((
+            self.child_state.txid.clone(),
+            self.child_state.payload_vout,
+            colored_tier_seal(csid, TierRole::ChildState, 0, 0, self.child_state.csv).blinding(),
+        ));
+
+        // ── THE PARALLEL-ARRAY INVARIANT, checked rather than trusted. ─────────────────────────────
+        //
+        // The receiver reads `colored_child_txids()` and this list as parallel arrays. A length or
+        // order disagreement does not error there — it pairs tier *k* with tier *k'*'s seal, and the
+        // failure surfaces as "this consignment does not validate", miles from its cause. Two
+        // functions walking the same structure separately is exactly how they drift, so the walk is
+        // cross-checked here, at the one place that can still say why.
+        if seals.len() != want.len() {
+            return Err(anyhow::anyhow!(
+                "coloured seal schedule has {} entries for {} witness txids — the two walks of this \
+                 child's chain disagree, and a receiver reads them as parallel arrays",
+                seals.len(),
+                want.len()
+            ));
+        }
+        for (k, (txid, _, _)) in seals.iter().enumerate() {
+            if txid != &want[k] {
+                return Err(anyhow::anyhow!(
+                    "coloured seal schedule entry {k} is for {txid} but the witness walk has {} \
+                     there — the two orders disagree",
+                    want[k]
+                ));
+            }
+        }
+        Ok(seals)
     }
 
     /// The LEAF consignment — the proof for the child's own final state, the one a receiver
     /// validates and books against.
     pub fn leaf_consignment(&self) -> Option<&String> {
         self.rgb.as_ref().and_then(|r| r.consignments.last())
+    }
+}
+
+/// **[S5] The deepest coloured child this build will ADOPT — an economic bound, not a structural one.**
+///
+/// S5 made the seal and witness walks N-deep, because a coloured spine mints pieces at increasing
+/// depth and a receiver must be able to verify them. That is a statement about what can be
+/// *verified*. It is NOT a statement about what may be *accepted*, and conflating the two is how the
+/// depth-1 refusal's removal nearly widened a surface silently.
+///
+/// The carrier's floor is derived FROM the depth: `CTESR_CARRIER_SEND_DEPTH = 1` puts the CTES-R
+/// carrier at 6_362 sat (`tokens.rs`), because a depth-1 piece's exit is `T + X_0 + SP` over the
+/// piece plus the child floor. A depth-2 piece walks more transactions, costs more to exit, and
+/// therefore needs a HIGHER floor — so adopting one against the depth-1 floor would admit a piece
+/// whose own exit it cannot fund.
+///
+/// So the bound stays at 1 until those floors are re-derived, and it is enforced by name rather than
+/// left implicit in a removed refusal. Raising it means: re-derive `CTESR_CARRIER_SEND_DEPTH`, the
+/// piece floor and the carrier floor together, in one commit, with the economics doc updated.
+pub const MAX_COLORED_ADOPT_DEPTH: usize = 1;
+
+/// [S5] Which payload of `ancestors[i].state` the next hop spends: the following segment's own
+/// `funding_vout`, or — for the last segment — the leaf child's `sp_vout`.
+///
+/// Split out so the two walks (`colored_child_txids` and `colored_child_seals`) cannot disagree
+/// about it by re-deriving it separately, which is the drift the cross-check at the end of the seal
+/// walk exists to catch.
+fn next_funding_vout(cb: &ChildTesrBundle, i: usize) -> u32 {
+    match cb.ancestors.get(i + 1) {
+        Some(next) => next.funding_vout,
+        None => cb.sp_vout,
     }
 }
 
