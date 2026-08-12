@@ -1,5 +1,25 @@
 # SPEC-ROADMAP — what must be true before a normative Utexo specification can be written
 
+> **TIMELINE RE-COST 2026-08-11 — `COLOURED-SPINE-REANCHOR-SCOPE.md` §4.1.**
+>
+> **11–21 engineer-weeks** of build (was 19–27), **12–22 weeks to a full v1 draft** (was 20–27).
+> Re-checked line by line against the tree rather than adjusted on paper. What moved:
+>
+> * **S0** (the intermediate-`SP` fee law — a live theft path) and **R0** (census attestation) are
+>   DONE and verified, the latter live against the deployed coordinator.
+> * **W1**, previously the largest item at 3–5 wk *and* the one holding the spec date, is DONE:
+>   the package route, the P2A anchor spender and the v3 fee child are built and a stuck tier is
+>   rescued through repo code; the funding question is decided (**D31**) and the tower float rail
+>   is built with its capacity bound measured. **§6 and §15 are writable now** — that was the
+>   sentence this re-cost turns.
+> * The **plain** spine landed after the scope was written (CATS-B), so the coloured spine now
+>   rides on tested scaffolding; S6, the "least grounded number" in the scope, is de-risked.
+>
+> Still open and still governing the date: **S5** (largest item), **CR-D** (designed, unbuilt),
+> **P4** (unbounded on an owner question), and **D21**, which is referenced as a gate but has
+> never been recorded as a decision.
+
+
 Status: working document, 2026-08-10. **Amended 2026-08-10 by a second, gap-fill survey round — see
 §0.** Verified against `feat/spark` @ `280ed88` (the first round ran at `a9187e9` / `29bac98`; the
 gap-fill round re-verified at `280ed88`). Every claim carries a `file:line`. Claims I could not

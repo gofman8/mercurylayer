@@ -130,8 +130,11 @@ whose long pole is the receiver's N-deep seal/witness walk — which also gates 
 every piece the spine mints (§1.4); **(iv)** build CR-D, and run G2 only to decide whether CR-A's
 single-transaction form is also available.
 
-**Re-cost: 19–27 engineer-weeks single-threaded, 12–17 calendar weeks with two tracks**, re-costing
-the roadmap at **20–27 weeks to a full protocol v1 draft, +2–3 to publication**. The movement from
+**Re-cost (2026-08-11, §4.1): 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two
+tracks**, re-costing the roadmap at **12–22 weeks to a full protocol v1 draft, +2–3 to publication**.
+*(The 19–27 / 20–27 figures below were the previous pass; they are superseded by §4.1, which
+re-checked every line against the tree. S0, R0 and W1 are done, and the plain spine landed in the
+meantime.)* The movement from
 the original 14–20 is itemised in §4: +3–5 for W1 (previously zero), +0.5–1 for S0 and R0
 (previously not present), +1–2 from re-banding S5, less the re-anchor branch narrowing now that CR-D
 replaces the CR-B/CR-C fork. **The single largest risk is BLOCKER 1** — a live theft path in shipped
@@ -753,6 +756,52 @@ protocol cannot state that a coin is unilaterally exitable above 2 sat/vB, and �
 written. If G2 fails and only CR-D ships, the total lands near the low end; if W1's funding question
 turns out to need a protocol change (a prepaid tower bond, `PROTOCOL.md:525`), it lands past the high
 end.
+
+### 4.1 RE-COST 2026-08-11 — measured against the tree, not against the plan
+
+Every line below was re-checked in code. The headline moves from **19–27 engineer-weeks to 11–21**,
+and the reason is not optimism: two whole blocks were built and verified, and a third turned out to
+be resting on scaffolding that landed after this document was written.
+
+| Block | Was | **Now** | Evidence |
+|---|---|---|---|
+| **S0** intermediate-`SP` fee law | part of 1–2 wk | **0 — DONE** | Σ-payload law in `verify_conveyed_child`'s ancestor loop; the starving-slot attack test refuses by name (D26 half 1) |
+| **R0** census attestation wiring | part of 1–2 wk | **0 — DONE** | `verify_sig_count_attestation` wired both sides, coordinator deployed, verified live at `sig_count=2` (D8-CLOSE) |
+| **W1** fee-bump remedy | **3–5 wk** | **0.5–1 wk** | (a) `core_rpc::submit_package` exists; (b)+(c) `p2a_fee_child` builds the v3 anchor-spending child; (d) **decided** (D31) *and* built — the tower float rail, with its capacity bound measured (`live_tower_float.rs`). A tier under the floor is rescued through repo code, which was W1's own acceptance criterion. Remainder is hardening + an E2E on a raised-floor node |
+| Gates G2/G3/G4 | 0.5–1 wk | 0.5–1 wk | unchanged; G2 is now an optimisation question (D29), not a product selector |
+| **S1–S9** coloured spine | 7–11 wk | **5–8 wk** | **The plain spine landed in the meantime (CATS-B).** `spine_batch_split`, `persist_spine_tip`/`load_spine_tip`, `establish_spine_tip_journalled`, `watch_spine_tip_pass`, `exit_spine_tip_pass`, `spine_segment`, `colored_spine_tip_floor` and a large adversarial test body all exist. The COLOURED half is still gated — `refuse_uncolored_over_colored_tip` is live at `spine_batch_split:4661` and `TierRole::Spine` is unallocated — so S1–S5 stand, but **S6 is materially de-risked**: the journal and replay this document called "the least grounded number" are built and tested on the plain lane |
+| **Phase 2** re-anchor | 3–8 wk | **2.5–3 wk** (CR-D) | D29 selected CR-D; `+3–5` for CR-A only if G2 is pursued and passes. No builder exists yet (`colored_detrigger`: 0 hits) |
+| Phase 3 P1+P2+P5 | 2–3 wk | 2–3 wk | unchanged, unstarted |
+| Phase 3 P3 (LN) | 0 or 1.5–2 wk | 0 or 1.5–2 wk | **still blocked on D21, which is still not a recorded decision** — it appears in §6 as an open question and nowhere in `DECISIONS.md` |
+| Phase 3 P4 (clients) | 0 / 2–3 wk / unbounded | unchanged | `wasm/Cargo.toml` still depends on `mercurylib` only, while `verify_bundle` lives in `mercuryrustlib` |
+
+**Total: 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two tracks.**
+
+### What this does to the spec date
+
+The old figure was **20–27 weeks to a v1 draft**, and this document named the reason plainly: *"the
+single largest driver of the increase is W1, which is not overlappable with drafting — until it
+exists, the protocol cannot state that a coin is unilaterally exitable above 2 sat/vB, and §6 and §15
+cannot be written."*
+
+**W1 exists.** §6 and §15 are writable now, and the fee-spike limit they must state is settled and
+normative (D31: the owner funds it, a keyless tower cannot, and the spec says so). Drafting therefore
+overlaps the remaining build instead of queueing behind it.
+
+**Re-cost: 12–22 weeks to a full protocol v1 draft, +2–3 to publication.**
+
+The remaining gates on the *document* are §5/§6/§10/§11, which need the coloured spine and CR-D — so
+the draft date is now governed by S1–S9 and Phase 2, not by an unresolved design question. The
+largest single item is **S5** (2–3 wk, unchanged: the receiver's N-deep seal walk, which is also a
+sender-side gate). The largest *unbounded* one is **P4**, and it is unbounded on an owner question —
+does `clients/libs/web` have an out-of-repo consumer? — not on engineering.
+
+### The three things that would move this number again
+
+1. **S5 needing the `consignments.len() == tiers.len()` invariant to change shape.** Costed at the
+   top of its band already; if it also forces a wire-format revision the band moves.
+2. **P4 turning out to have an out-of-repo web consumer.** Owner question, one answer, unbounded tail.
+3. **D21.** Until it is recorded, P3 is a 2-week coin-flip sitting in the middle of the estimate.
 
 ### Which items can blow up, and why
 
