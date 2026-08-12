@@ -4104,6 +4104,44 @@ impl UtexoWallet {
             }
         };
 
+        // [P3 / F7] JOURNAL THE LATCH BEFORE CONVEYING IT.
+        //
+        // `SplitJournalChild::latch_batch_id`'s own doc says why it is durable: "a latched piece
+        // conveyed without its batch is a piece the receiver may adopt before the preimage lands."
+        // The resume driver already reads it and hands it to `open_child_conveyance` — the coloured
+        // lane simply never wrote it, so a crash between creating the latch and conveying would
+        // leave a batch-locked piece whose batch nothing on disk knows about, and the resume would
+        // re-convey it UNLATCHED.
+        //
+        // Written between the two, which is the only window where it helps: the latch exists (so
+        // there is something to record) and the hand-over has not happened (so the record still
+        // changes the outcome). Fails the whole call if it cannot be stored — conveying a latched
+        // piece we cannot describe is the failure this is here to prevent.
+        if let Some(batch) = latch_batch.as_ref() {
+            let op_id = mercuryrustlib::tesr::split_op_id(&bundles[0]);
+            let mut rec = mercuryrustlib::tesr::journal_find(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &op_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "the coloured split of {carrier_id} is co-signed and latched, but its journal \
+                     record {op_id} is missing — refusing to convey a latched piece whose batch \
+                     nothing on disk records, because a resume would then re-convey it UNLATCHED \
+                     and the recipient could adopt it before the preimage lands"
+                )
+            })?;
+            rec.children[0].latch_batch_id = Some(batch.clone());
+            mercuryrustlib::tesr::journal_write(
+                &self.inner.cc,
+                &self.inner.config.wallet_name,
+                &rec,
+            )
+            .await?;
+        }
+
         // Convey each piece to its recipient's mailbox (auth = the piece slot we still own), then
         // keep the change as an exitable, re-transferable self-claim.
         for (j, (receiver_address, _)) in payouts.iter().enumerate() {
@@ -5820,6 +5858,36 @@ mod s4b_lane_fork_tests {
             "both floors apply per leg: the change is a TIP (one rung) and the payees are PIECES \
              (two), and one shared number could only carry the tip's cheaper shape by applying it \
              to every payee too"
+        );
+    }
+
+    /// [P3 / F7] The latch is DURABLE before it is conveyed.
+    ///
+    /// `SplitJournalChild::latch_batch_id` exists because a latched piece conveyed without its batch
+    /// is a piece the receiver may adopt before the preimage lands. The resume driver already reads
+    /// it; the coloured lane never wrote it, so a crash between creating the latch and conveying
+    /// would have left a batch-locked piece whose batch nothing on disk knew about — and the resume
+    /// would re-convey it UNLATCHED.
+    #[test]
+    fn the_coloured_latch_is_journalled_before_the_conveyance() {
+        let code = code_of("async fn colored_in_ladder_pay_latched(");
+        let write = code
+            .find("latch_batch_id = Some(")
+            .expect("the coloured lane must record its latch in the split journal");
+        let convey = code
+            .find("convey_child_bundle(")
+            .expect("the conveyance is still there");
+        assert!(
+            write < convey,
+            "the latch must be on disk BEFORE the hand-over — recording it afterwards leaves the \
+             exact window the field exists to close"
+        );
+        let create = code
+            .find("create_external_hash_latch(")
+            .expect("the latch is created here");
+        assert!(
+            create < write,
+            "and it can only be recorded once it exists"
         );
     }
 
