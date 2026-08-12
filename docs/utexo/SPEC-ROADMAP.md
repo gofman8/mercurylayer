@@ -3,6 +3,10 @@
 > **TIMELINE RE-COST 2026-08-11 — `COLOURED-SPINE-REANCHOR-SCOPE.md` §4.1.**
 >
 > **11–21 engineer-weeks** of build (was 19–27), **12–22 weeks to a full v1 draft** (was 20–27).
+> **In agent sessions (§4.2): ≈6–9 to build, ~2–4 more to draft** — of which 2–4 are the
+> non-compressing kind (live-stack E2Es, regtest cycles, the external rgb-lib fork).
+> **D21 = BUILD RGB-over-Lightning. D33 = `clients/libs/web` has no consumer, so P4 closes at zero
+> and the flip's client story is already complete.**
 > Re-checked line by line against the tree rather than adjusted on paper. What moved:
 >
 > * **S0** (the intermediate-`SP` fee law — a live theft path) and **R0** (census attestation) are

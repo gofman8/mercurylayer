@@ -131,7 +131,7 @@ every piece the spine mints (§1.4); **(iv)** build CR-D, and run G2 only to dec
 single-transaction form is also available.
 
 **Re-cost (2026-08-11, §4.1): 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two
-tracks**, re-costing the roadmap at **12–22 weeks to a full protocol v1 draft, +2–3 to publication**.
+tracks — or, in the unit this work is actually done in, ≈6–9 AGENT SESSIONS (§4.2)**, re-costing the roadmap at **12–22 weeks to a full protocol v1 draft, +2–3 to publication**.
 *(The 19–27 / 20–27 figures below were the previous pass; they are superseded by §4.1, which
 re-checked every line against the tree. S0, R0 and W1 are done, and the plain spine landed in the
 meantime.)* The movement from
@@ -802,6 +802,56 @@ does `clients/libs/web` have an out-of-repo consumer? — not on engineering.
    top of its band already; if it also forces a wire-format revision the band moves.
 2. **P4 turning out to have an out-of-repo web consumer.** Owner question, one answer, unbounded tail.
 3. **D21.** Until it is recorded, P3 is a 2-week coin-flip sitting in the middle of the estimate.
+
+### 4.2 RE-ESTIMATE IN AGENT SESSIONS (2026-08-11) — and where the compression stops
+
+Engineer-weeks are the wrong unit for how this work is actually being done. Re-expressed in **agent
+sessions** (Claude Code, ultracode, Opus 5 Fast), calibrated on **measured throughput from the
+session that produced this section** rather than on a conversion factor.
+
+**The calibration point.** One session closed: S0, R0, all of W1 (package route, P2A spender, v3 fee
+child, live rescue, tower float rail), CR-D + its wiring, P1, P5, S1, S2, audit Tiers 1–3, RGB
+Stage 0, the build-infra fix, a coordinator deploy, and seven decisions (D26–D33). Against this
+document's own estimates that is **≈12 engineer-weeks in one session**, at 644 green tests and clippy
+clean throughout.
+
+That is the honest number, and it comes with an honest caveat: **most of those items had scaffolding
+that already existed** — W1's `build_colored_tier`, CR-D's whole spec type, S2's seal machinery. The
+compression is real but it is partly a selection effect, because the items reached first were the
+ones whose foundations were already in the tree.
+
+| Remaining block | Engineer-weeks | **Agent sessions** | What sets the floor |
+|---|---|---|---|
+| S4 coloured spine batch | 3–5 d | **~0.5** | Pure in-repo code against a landed cap builder |
+| S3 (rides with S4) | 0.5 d | — | One line, gated by its own guard test |
+| **S5** N-deep seal walk | 2–3 wk | **1–2** | The wire format and an exact-equality census; the item this document says "has the smell" |
+| S6 crash replay | 3–5 d | **~0.5** | Plain-lane journal exists and is tested |
+| S7/S8 booking + latency reconcile | ~1 wk | **~0.5** | Arithmetic and test churn |
+| **S9 live E2Es** | 5 d+ | **1–2** | ⚠ **Does not compress** — bounded by regtest cycles, docker, confirmations |
+| **CR-D** | — | **DONE** | Landed this session |
+| **P2** per-output blinding | 1–1.5 wk | **1** | ⚠ Different repo (`utexo-rgb-lib`), and splits one field doing two jobs |
+| **P3** LN (**D21: build**) | 1.5–2 wk | **1** | SSP pre-pay RGB gate + F7 journal |
+| **P4** clients (**D33: none**) | — | **0** | Closed at zero |
+| G2/G3/G4 | 0.5–1 wk | **~0.5** | ⚠ Measurement against the live stack |
+
+**Total: ~6–9 agent sessions**, of which **2–4 are the non-compressing kind** — live-stack E2Es,
+regtest cycles, and the external rgb-lib fork.
+
+**Spec draft: ~2–4 sessions after the spine lands**, since §5/§10/§11 are the only gated sections and
+§6/§15 became writable when W1 shipped.
+
+### What does NOT compress, and why it is worth stating
+
+1. **Live-stack E2Es.** A regtest lifecycle takes the wall-clock it takes; mining blocks and waiting
+   for confirmations is not parallelisable by thinking faster. S9 and G2–G4 are bounded by this.
+2. **The external fork.** P2 lives in `utexo-rgb-lib`, which has its own build, its own tests and a
+   rev-bump that has to propagate.
+3. **Owner decisions.** Zero engineering time and unbounded calendar time. D21 and D33 were both
+   answered on the day they were asked and each removed ~1 session of ambiguity; the three open
+   questions in §6 have the same shape.
+4. **Anything where the failure mode is silent.** S5 is the example: its cost is not typing, it is
+   the adversarial tests that prove a mislabelled segment is refused BY NAME. This session spent more
+   turns proving CR-D and S2 correct than writing them, and that ratio is the right one.
 
 ### Which items can blow up, and why
 

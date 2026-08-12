@@ -621,6 +621,50 @@ spec is drafted, so §10 states the losses rather than a reader discovering them
 
 ---
 
+## D21 — RGB over Lightning: **BUILD IT** (owner, 2026-08-11)
+
+The question the scope doc carried unanswered since it was written, and the reason **P3** sat in the
+middle of the estimate as a coin-flip. Decided: **build it.** RGB assets traverse Lightning in v1.
+
+**What that actually costs**, from `COLOURED-SPINE-REANCHOR-SCOPE.md` P3 — the plumbing is the easy
+half and is already there (`convey_child_bundle(.., batch_id)`; the plain lane already passes it).
+The real work is two things:
+
+1. **An SSP pre-pay RGB gate over a coloured child's off-chain witness chain.** Today
+   `validate_pending_token` resolves only `branch_txs` + `BackupTx.rgb_consignment`, so an SSP asked
+   to pay against a coloured child cannot verify the allocation it is paying for. Without this the
+   operator pays first and discovers second — the shape P0-2 and C-9 already fixed on the other
+   lanes.
+2. **An F7 journal for the coloured lane**, so a latched coloured send resumes after a crash rather
+   than stranding a payment mid-latch.
+
+**Consequence for the spec:** §P3's "or exclude it by name" branch is gone. The document must now
+describe RGB-over-Lightning as a supported capability, which means its trust statement (what an SSP
+verifies before paying) has to be written rather than deferred.
+
+---
+
+## D33 — `clients/libs/web` has **no external consumer**: leave it fail-closed (owner, 2026-08-11)
+
+**P4's unbounded tail is closed at zero.** The scope doc found no in-repo consumer, and I re-verified
+that today: the only references are its own test harness (`clients/tests/web/package.json`). The owner
+confirms there is no out-of-repo consumer either.
+
+**So no client port is required for the `colored_ladder` flip.** The two legacy clients
+(`clients/libs/nodejs`, `clients/libs/web`) stay **fail-closed** on a laddered coin, which is the
+correct behaviour and already shipped: neither can run `verify_bundle`, and refusing is right —
+falling through to the flat census would let a padded ladder pass.
+
+This matters more than a schedule line. The *product* SDK (`clients/libs/nodejs-utexo`) is a
+JSON-lines client over the Rust daemon and was never affected, so **the flip's client story is
+already complete**: every client that can receive a coin either verifies the ladder properly (Rust,
+and the daemon-backed JS SDK) or refuses it by name.
+
+**D30 is amended accordingly:** of its three prerequisites, the client port is now **satisfied**, and
+the remaining gate on `colored_ladder = true` is the coloured spine + CR-D wiring alone.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB
