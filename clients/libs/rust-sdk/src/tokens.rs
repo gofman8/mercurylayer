@@ -3772,6 +3772,8 @@ impl UtexoWallet {
                 owner_exit_address: mercurylib::tesr::payee_address(receiver_address, &network)?,
                 sats: piece_sats[j],
                 rgb_amount: *amount,
+                // A PAYEE — two coloured rungs, floored at `colored_child_floor`.
+                is_change_tip: false,
             });
         }
         if token_change > 0 {
@@ -3788,6 +3790,10 @@ impl UtexoWallet {
                 )?,
                 sats: change_sats,
                 rgb_amount: token_change,
+                // [S3] THE SENDER'S CHANGE — a one-rung SPINE TIP. Declared here rather than
+                // inferred from being last: position is a convention, and a convention that decides
+                // a leg's floor and ladder shape is one that eventually gets violated silently.
+                is_change_tip: true,
             });
         }
 
@@ -3801,13 +3807,18 @@ impl UtexoWallet {
                 for cd in draft.children.iter() {
                     // The witness list the RECEIVER will resolve against — `ChildTesrBundle::
                     // colored_child_txids` for the bundle this draft is about to become.
-                    let txids = vec![
+                    // [S3] A CHANGE TIP's witness chain has no extension — it is one cap over
+                    // `SP.out[j]`. Including a phantom txid would make the receiver's resolver look
+                    // for a witness that was never built.
+                    let mut txids = vec![
                         bundle.trigger.txid.clone(),
                         x_m.txid.clone(),
                         draft.sp_txid.clone(),
-                        cd.extension.txid.clone(),
-                        cd.state.txid.clone(),
                     ];
+                    if let Some(x) = cd.extension.as_ref() {
+                        txids.push(x.txid.clone());
+                    }
+                    txids.push(cd.state.txid.clone());
                     let (verdict, detail, contract) =
                         w.validate_offchain_chain_info(&cd.state.consignment, &txids)?;
                     if verdict != ValidationVerdict::Valid {

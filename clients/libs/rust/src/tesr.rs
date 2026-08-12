@@ -2782,6 +2782,15 @@ pub struct ColoredSplitChildSpec {
     /// The child's share of the ALLOCATION. May be 0 for a sats-only child, but `Σ rgb_amount`
     /// across all children must equal the parent's whole allocation — no mint, no burn.
     pub rgb_amount: u64,
+    /// **[S3] Is this the SENDER'S CHANGE leg?** A change leg is a one-rung SPINE TIP — one cap
+    /// directly over `SP.out[j]` — while a payee is a two-rung PIECE. Declared by the caller rather
+    /// than inferred from position, because "the last one" is a convention and a convention that
+    /// decides a coin's shape is a convention that will eventually be violated silently.
+    ///
+    /// The two shapes have different FLOORS (`colored_spine_tip_floor` vs `colored_child_floor`) and
+    /// different ladders, so getting this wrong either strands the leg below its floor or builds a
+    /// ladder nothing can spend — both after the parent is terminal.
+    pub is_change_tip: bool,
 }
 
 /// One child of a built-but-unsigned coloured split.
@@ -2794,7 +2803,10 @@ pub struct ColoredSplitChildDraft {
     pub rgb_amount: u64,
     pub csv_e: u16,
     pub csv_d: u16,
-    pub extension: ColoredTierDraft,
+    /// `None` for a CHANGE TIP: a tip is one cap over `SP.out[j]` with no extension between them.
+    /// That absence is the shape, not a missing field — `state` holds the cap.
+    pub extension: Option<ColoredTierDraft>,
+    /// The payee's final state, or — when [`Self::extension`] is `None` — the tip's CAP.
     pub state: ColoredTierDraft,
 }
 
@@ -2923,14 +2935,20 @@ pub fn build_colored_in_ladder_split(
     }
 
     // ---- Conservation law 3: CHILD VIABILITY. --------------------------------------------------
-    let child_floor = colored_child_floor(bundle.fee_rate, COLORED_LADDER_DUST);
+    // [S3] THE FLOOR IS PER LEG SHAPE. A payee funds two coloured rungs; a CHANGE TIP funds one
+    // cap. Using the payee floor for a tip refuses viable change legs; using the tip floor for a
+    // payee strands one below the value its own ladder needs — and both are discovered only after
+    // the parent has been terminalized.
+    let piece_floor = colored_child_floor(bundle.fee_rate, COLORED_LADDER_DUST);
+    let tip_floor = colored_spine_tip_floor(bundle.fee_rate, COLORED_LADDER_DUST);
     for c in children {
-        if c.sats < child_floor {
+        let (floor, shape) =
+            if c.is_change_tip { (tip_floor, "one-rung CHANGE TIP") } else { (piece_floor, "COLOURED child ladder") };
+        if c.sats < floor {
             return Err(anyhow::anyhow!(
-                "coloured split child {} would hold {} sat but a COLOURED child ladder needs at \
-                 least {child_floor} sat at {} sat/vB — refusing before any SE co-sign, because an \
-                 SP whose output cannot fund its own ladder strands the value under a terminalized \
-                 parent",
+                "coloured split leg {} would hold {} sat but a {shape} needs at least {floor} sat \
+                 at {} sat/vB — refusing before any SE co-sign, because an SP whose output cannot \
+                 fund its own ladder strands the value under a terminalized parent",
                 c.statechain_id,
                 c.sats,
                 bundle.fee_rate
@@ -3059,7 +3077,8 @@ pub fn build_colored_in_ladder_split(
             rgb_amount: c.rgb_amount,
             csv_e,
             csv_d,
-            extension: draft_of(xc),
+            // [S3] `None` marks a CHANGE TIP: one cap over `SP.out[j]`, no extension between.
+            extension: if c.is_change_tip { None } else { Some(draft_of(xc)) },
             state: draft_of(sc),
         });
     }
@@ -3284,32 +3303,45 @@ pub async fn cosign_colored_in_ladder_split(
                 sp_vout: cd.sp_vout,
                 extension: None,
                 state: None,
+                // [S3] TWO SHAPES, and the journal must record which one this leg IS. A tip's
+                // consignment list is its cap alone; a piece's is extension-then-state, in exit
+                // order. A tip journalled as a piece would have `verify_child_bundle` expect a rung
+                // that does not exist and refuse every adoption of it.
                 rgb: Some(ColoredChild {
                     contract_id: draft.contract_id.clone(),
                     amount: cd.rgb_amount,
-                    consignments: vec![
-                        cd.extension.consignment.clone(),
-                        cd.state.consignment.clone(),
-                    ],
+                    consignments: match &cd.extension {
+                        Some(x) => vec![x.consignment.clone(), cd.state.consignment.clone()],
+                        None => vec![cd.state.consignment.clone()],
+                    },
                 }),
-                pending_extension: Some(PendingTier {
-                    txid: cd.extension.txid.clone(),
-                    tx_hex: cd.extension.tx_hex.clone(),
+                pending_extension: cd.extension.as_ref().map(|x| PendingTier {
+                    txid: x.txid.clone(),
+                    tx_hex: x.tx_hex.clone(),
                     prev_value: cd.sp_out_value,
-                    out_value: cd.extension.payload_value,
+                    out_value: x.payload_value,
                     csv: cd.csv_e,
-                    payload_vout: cd.extension.payload_vout,
+                    payload_vout: x.payload_vout,
                 }),
                 pending_state: Some(PendingTier {
                     txid: cd.state.txid.clone(),
                     tx_hex: cd.state.tx_hex.clone(),
-                    prev_value: cd.extension.payload_value,
+                    // A tip's cap spends `SP.out[j]` DIRECTLY; a piece's state spends its
+                    // extension's payload. Getting this wrong mis-states the value the taproot
+                    // sighash commits to, and the co-signature would be valid for nothing.
+                    prev_value: match &cd.extension {
+                        Some(x) => x.payload_value,
+                        None => cd.sp_out_value,
+                    },
                     out_value: cd.state.payload_value,
                     csv: cd.csv_d,
                     payload_vout: cd.state.payload_vout,
                 }),
-                // The coloured lane carves N two-tier children and no spine tip.
-                role: SplitLegRole::Piece,
+                role: if cd.extension.is_some() {
+                    SplitLegRole::Piece
+                } else {
+                    SplitLegRole::SpineTip
+                },
                 // [K>1 prerequisite 2] The coloured lane conveys its pieces itself and is explicitly
                 // OUT OF SCOPE for K > 1 (one `seal.blinding()` covers every payload, so payee *j*
                 // de-conceals every sibling seal in K tries). It journals no recipient, and the
@@ -3367,30 +3399,38 @@ pub async fn cosign_colored_in_ladder_split(
         // Per TIER, not per child, and for the same reason the plain lane journals per tier: a
         // re-run of a co-sign that already happened pushes the child's `num_sigs` past its census
         // (`baseline + 2 + superseded`) and no receiver can ever adopt it.
-        let x_signed = cosign_tier(
-            cc,
-            child_coin,
-            cd.extension.tx_hex.clone(),
-            cd.sp_out_value,
-            &draft.network,
-        )
-        .await?;
-        let child_extension = TesrTier {
-            txid: cd.extension.txid.clone(),
-            signed_tx: x_signed,
-            out_value: cd.extension.payload_value,
-            csv: Some(cd.csv_e),
-            payload_vout: cd.extension.payload_vout,
-        };
-        journal.children[j].extension = Some(child_extension.clone());
-        journal_write(cc, wallet_name, &journal).await?;
-        crash_point("after_colored_inladder_child_extension");
+        // [S3] A CHANGE TIP HAS NO EXTENSION — one cap over `SP.out[j]`, and that is the whole
+        // difference between the two leg shapes. Co-signing a phantom extension for it would spend
+        // an irreversible SE slot on a transaction with no prevout, and push the leg's `num_sigs`
+        // past a census that expects one tier.
+        let mut child_extension: Option<TesrTier> = None;
+        if let Some(x) = cd.extension.as_ref() {
+            let x_signed =
+                cosign_tier(cc, child_coin, x.tx_hex.clone(), cd.sp_out_value, &draft.network)
+                    .await?;
+            let tier = TesrTier {
+                txid: x.txid.clone(),
+                signed_tx: x_signed,
+                out_value: x.payload_value,
+                csv: Some(cd.csv_e),
+                payload_vout: x.payload_vout,
+            };
+            journal.children[j].extension = Some(tier.clone());
+            journal_write(cc, wallet_name, &journal).await?;
+            crash_point("after_colored_inladder_child_extension");
+            child_extension = Some(tier);
+        }
 
         let s_signed = cosign_tier(
             cc,
             child_coin,
             cd.state.tx_hex.clone(),
-            cd.extension.payload_value,
+            // The cap of a tip spends `SP.out[j]` directly; a piece's state spends its extension's
+            // payload. This value IS what the taproot sighash commits to.
+            match cd.extension.as_ref() {
+                Some(x) => x.payload_value,
+                None => cd.sp_out_value,
+            },
             &draft.network,
         )
         .await?;
@@ -3405,6 +3445,29 @@ pub async fn cosign_colored_in_ladder_split(
         journal_write(cc, wallet_name, &journal).await?;
         crash_point("after_colored_inladder_child_state");
 
+        // ── [S3] A CHANGE TIP IS NOT CONVEYED. ───────────────────────────────────────────────────
+        //
+        // This is the design point the whole change turned on, and getting it wrong would have been
+        // expensive. A tip is the SENDER'S OWN leg — it stays here and becomes the next batch's
+        // funding outpoint — so it has no recipient and never enters a `ChildTesrBundle`. Forcing it
+        // into one would have meant making `child_extension` optional on a CONVEYED WIRE FORMAT whose
+        // own doc-comment warns that a defaulted field is downgrade surface, i.e. dragging S5's
+        // territory into this commit for a leg that is never sent anywhere.
+        //
+        // It is journalled as a `SpineTipBundle` instead — the same place the PLAIN lane puts its
+        // change leg — which is why `SplitJournalChild::role` was set to `SpineTip` above.
+        let Some(child_extension) = child_extension else {
+            continue;
+        };
+        let Some(x_draft) = cd.extension.as_ref() else {
+            // Unreachable given the line above, and stated rather than `unwrap`ped: the two fields
+            // must agree, and a future edit that desynchronises them should say so here.
+            return Err(anyhow::anyhow!(
+                "coloured split leg {} has a co-signed extension but no extension draft — the \
+                 journal and the draft disagree about this leg's shape",
+                child_sids[j]
+            ));
+        };
         bundles.push(ChildTesrBundle {
             parent: parent_seg.clone(),
             parent_statechain_id: parent_sid.clone(),
@@ -3420,7 +3483,7 @@ pub async fn cosign_colored_in_ladder_split(
                 contract_id: draft.contract_id.clone(),
                 amount: cd.rgb_amount,
                 consignments: vec![
-                    cd.extension.consignment.clone(),
+                    x_draft.consignment.clone(),
                     cd.state.consignment.clone(),
                 ],
             }),
@@ -3634,34 +3697,23 @@ pub enum SplitLane {
 pub fn change_leg_role(lane: SplitLane) -> SplitLegRole {
     match lane {
         SplitLane::PlainRoot | SplitLane::SpineBatch => SplitLegRole::SpineTip,
-        // [S3 — ATTEMPTED, REVERTED 2026-08-11.] The plan pairs S3 with S2. I landed S2's cap builder
-        // and journal path, flipped this, and `the_leg_role_selects_the_floor_and_the_piece_floor_
-        // never_falls` failed. It was RIGHT, and its own comment says why: the flip must move "in the
-        // same commit as the builder it describes and no earlier: flipped early, the wallet admits a
-        // change leg it then cannot build a ladder for, AFTER `set_spend_budget` has terminalized the
-        // parent."
+        // [S3 — LANDED, on the third attempt, once its real precondition held.]
         //
-        // That is precisely what would have happened. `build_colored_in_ladder_split` carves EVERY
-        // leg as a two-tier PIECE (`pending_extension` + `pending_state`, `role: Piece`); no coloured
-        // caller produces a one-tier tip. Flipping this changes only the FLOOR used at carve time, so
-        // the change leg would be sized at the one-rung `colored_spine_tip_floor` (906) and then need
-        // the two-rung piece ladder (1482) — admitted, then unbuildable, with the parent already
-        // terminal and the failure unrecoverable.
+        // Twice refused before this: once because `build_colored_in_ladder_split` still carved every
+        // leg as a two-tier PIECE (caught by `the_leg_role_selects_the_floor_and_the_piece_floor_
+        // never_falls`, whose own comment had predicted the failure), and once because "S4 is done"
+        // looked like the trigger and was not — S4 built the SPINE BATCH's SP, a different lane.
         //
-        // **CORRECTION, after S4 landed.** I first wrote that this flip "belongs with S4". It does
-        // not, and the distinction is the useful part: `SplitLane::Colored` denotes
-        // `cosign_colored_in_ladder_split` — the ROOT coloured split — whereas S4 built the SPINE
-        // BATCH's coloured SP (`build_colored_spine_batch_sp`), whose change leg is already carved
-        // and floored as a tip. Landing S4 therefore changed nothing about THIS arm, and flipping it
-        // on the strength of "S4 is done" would have re-created the exact defect above.
+        // What actually had to be true, and now is: the ROOT coloured split gives its change leg a
+        // ONE-RUNG cap (`is_change_tip` on the spec, `extension: None` on the draft), floors it at
+        // `colored_spine_tip_floor` rather than the piece floor, journals it with
+        // `role: SplitLegRole::SpineTip`, and does NOT convey it — a tip is the sender's own leg and
+        // becomes the next batch's funding outpoint.
         //
-        // The remaining precondition is specific and small: **`build_colored_in_ladder_split` must
-        // give its change leg a ONE-RUNG cap** instead of the extension+state pair it builds today.
-        // The tier already exists — S2's `build_colored_spine_cap` is precisely it — so this is
-        // assembly rather than design: carve the change leg at `colored_spine_tip_floor`, build one
-        // cap for it, journal it as a tip leg. The flip lands in THAT commit and is wrong in any
-        // earlier one.
-        SplitLane::PlainChild | SplitLane::Colored => SplitLegRole::Piece,
+        // So the floor this function reports and the ladder the builder constructs are the same
+        // shape again, which is the invariant this function exists to hold.
+        SplitLane::Colored => SplitLegRole::SpineTip,
+        SplitLane::PlainChild => SplitLegRole::Piece,
     }
 }
 
@@ -3913,16 +3965,38 @@ impl SplitJournalRecord {
         // Fail CLOSED on a shape this commit does not build. A COLOURED tip needs its cap's
         // consignment (`ColoredTip`), which only the coloured builder can produce; fabricating the
         // record without it would hand `colored_exit_move` a `None` and re-open F1 by another door.
-        if c.rgb.is_some() {
-            return Err(anyhow::anyhow!(
-                "journalled leg {} is a COLOURED spine tip, which no builder produces yet — the \
-                 coloured lane still carves its change as a two-tier piece",
-                c.statechain_id
-            ));
-        }
+        // [S3] A COLOURED tip is buildable now — `build_colored_in_ladder_split` carves its change
+        // leg as one cap and journals the cap's consignment. What must NOT happen is fabricating the
+        // record without that consignment: `colored_exit_move` would get a `None` and the tip's
+        // allocation would have nowhere to move on exit (F1, by another door).
         let cap = c.state.clone().ok_or_else(|| {
             anyhow::anyhow!("journalled spine tip {} has no co-signed cap yet", c.statechain_id)
         })?;
+        let colored_tip = match c.rgb.as_ref() {
+            None => None,
+            Some(rgb) => {
+                let consignment = rgb.consignments.first().cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "journalled COLOURED spine tip {} carries no consignment for its cap — \
+                         refusing to build a record whose allocation could not move on exit",
+                        c.statechain_id
+                    )
+                })?;
+                if rgb.consignments.len() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "journalled COLOURED spine tip {} carries {} consignments; a tip is ONE cap \
+                         and therefore exactly one",
+                        c.statechain_id,
+                        rgb.consignments.len()
+                    ));
+                }
+                Some(ColoredTip {
+                    contract_id: rgb.contract_id.clone(),
+                    amount: rgb.amount,
+                    consignment,
+                })
+            }
+        };
         Ok(SpineTipBundle {
             parent: self.parent.clone(),
             parent_statechain_id: self.parent_statechain_id.clone(),
@@ -3934,7 +4008,7 @@ impl SplitJournalRecord {
             cap,
             superseded_caps: vec![],
             parent_flat_backups: self.parent_flat_backups.clone(),
-            rgb: None,
+            rgb: colored_tip,
         })
     }
 
@@ -13287,10 +13361,37 @@ mod spine_tip_tests {
             SplitLegRole::Piece,
             "`child_in_ladder_split` still sends every leg through `establish_child`"
         );
+        // [S3] FLIPPED, and the assertion moves in the same commit as the builder it describes —
+        // which is what this test demanded twice and got twice. The coloured root split now carves
+        // its change leg as a ONE-RUNG tip.
         assert_eq!(
             change_leg_role(SplitLane::Colored),
-            SplitLegRole::Piece,
-            "`cosign_colored_in_ladder_split` still builds two coloured rungs for its change"
+            SplitLegRole::SpineTip,
+            "`build_colored_in_ladder_split` gives its change leg ONE cap; the floor must say so"
+        );
+        // …and this is what stops the flip passing vacuously. A role is only meaningful if the
+        // BUILDER really produces that shape, so pin the three places the tip shape lives. Without
+        // these, someone could flip the role back and forth and this test would follow it.
+        let src = include_str!("tesr.rs");
+        let builder = {
+            let at = src.find("pub fn build_colored_in_ladder_split(").expect("builder");
+            &src[at..at + src[at..].find("\n/// ").unwrap_or(4000)]
+        };
+        assert!(
+            builder.contains("if c.is_change_tip { None } else { Some(draft_of(xc)) }"),
+            "the change leg must have NO extension — that absence IS the tip shape"
+        );
+        assert!(
+            builder.contains("colored_spine_tip_floor(bundle.fee_rate"),
+            "and it must be floored at the ONE-rung floor, not the piece floor"
+        );
+        let cosign = {
+            let at = src.find("pub async fn cosign_colored_in_ladder_split(").expect("cosign");
+            &src[at..at + src[at..].find("\n/// ").unwrap_or(9000)]
+        };
+        assert!(
+            cosign.contains("SplitLegRole::SpineTip"),
+            "and the journal must record the leg AS a tip, or the resume path rebuilds a piece"
         );
     }
 
