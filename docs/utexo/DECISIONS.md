@@ -591,6 +591,36 @@ has no `submitpackage`**, so any bumping path needs a Bitcoin Core RPC endpoint 
 
 ---
 
+## D32 — What `colored_ladder = true` silently REMOVES, inventoried before §10 is drafted (P5)
+
+**Recorded 2026-08-11.** D30 sequenced the flip behind CR-D and two client ports. This is the other
+half of that decision: the flip is not purely additive, and the capabilities it takes away have never
+been written down anywhere a reader of the spec would find them.
+
+Two capabilities disappear the moment the coloured lane becomes normative, because both live in the
+legacy coloured-SPLIT lane that CTES-R retires:
+
+| Capability | Where it lives today | What replaces it |
+|---|---|---|
+| **Coloured multi-carrier combine** — paying one invoice from N carriers at once | `create_colored_combine_tx`, reached through the multi-carrier combine | **Nothing.** The coloured in-ladder split is single-parent; N carriers must be spent as N payments |
+| **Coloured leaf consolidation** — merging dust-sized coloured leaves back into one carrier | same lane | **Nothing.** Coloured leaves accumulate, and `PARTIAL-PAYMENT-ECONOMICS.md` already caps a carrier at one coloured partial payment |
+
+**Why this belongs in the record rather than in a release note.** Both feed `V_min` — the smallest
+economically viable coin — which D3 is still settling. Losing consolidation means coloured dust is
+permanent, so the floor that makes a piece worth creating rises; and losing multi-carrier combine
+means a payment larger than any single carrier needs N separate payments, each with its own exit
+cost. A `V_min` derived without these terms would be optimistic in a direction users feel.
+
+**They are also the reason the MIGRATION HATCH exists** (`SdkConfig::colored_ladder` docs): retiring
+the legacy lane outright would strand every carrier CTES-R cannot serve, so
+`tokens::migration_hatch_verdict` keeps the RGB-aware legacy lane open for exactly that class. The
+hatch bounds the damage; it does not restore either capability.
+
+**No code change.** This is an inventory item: it must appear in `DECISIONS.md` before §10 of the
+spec is drafted, so §10 states the losses rather than a reader discovering them.
+
+---
+
 ## Newly open — created by D1
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB
