@@ -3602,15 +3602,12 @@ impl UtexoWallet {
         carrier_amount: u64,
         latch: ColoredLatch,
     ) -> Result<ColoredTransferOut> {
-        if !matches!(latch, ColoredLatch::None) {
-            return Err(anyhow!(
-                "a Lightning-latched colored transfer is not yet wired to the CTES-R in-ladder \
-                 lane — refusing rather than silently paying over the retired split lane"
-            ));
-        }
+        // [P3] The latch is now WIRED on this lane (it used to be refused outright, which made a
+        // coloured carrier unable to take part in a Lightning swap at all). `SePreimage` also has to
+        // report the SE's hash back to the caller, so it is captured rather than dropped.
         let payouts = [(receiver_address.to_string(), token_amount)];
-        let pieces = self
-            .colored_in_ladder_pay(asset_id, carrier, carrier_amount, &payouts)
+        let (pieces, batch_id, se_hash) = self
+            .colored_in_ladder_pay_latched(asset_id, carrier, carrier_amount, &payouts, latch)
             .await?;
         let (piece_sid, piece_sats) = pieces
             .into_iter()
@@ -3627,8 +3624,11 @@ impl UtexoWallet {
                 used_split: true,
             },
             piece_id: piece_sid,
-            batch_id: None,
-            se_hash: None,
+            // [P3] The latch artifacts REACH THE CALLER now. They were hardcoded `None` while this
+            // lane refused every latched send; returning `None` after actually creating a latch
+            // would batch-lock the coin and leave nobody holding the hash to pay it with.
+            batch_id,
+            se_hash,
         })
     }
 
@@ -3662,10 +3662,35 @@ impl UtexoWallet {
     async fn colored_in_ladder_pay(
         &self,
         asset_id: &str,
-        mut carrier: mercurylib::wallet::Coin,
+        carrier: mercurylib::wallet::Coin,
         carrier_amount: u64,
         payouts: &[(String, u64)],
     ) -> Result<Vec<(String, u64)>> {
+        self.colored_in_ladder_pay_latched(asset_id, carrier, carrier_amount, payouts, ColoredLatch::None)
+            .await
+            .map(|(pieces, _, _)| pieces)
+    }
+
+    /// [P3] As above, with an optional Lightning LATCH on the conveyed piece.
+    ///
+    /// The latch is created on the PIECE — the coin the recipient will claim — and its `batch_id` is
+    /// handed to `convey_child_bundle`, exactly as the plain lane does
+    /// (`transfer.rs`, the `Some(batch)` arm). Until this existed the coloured CTES-R lane passed
+    /// `None` unconditionally and `colored_in_ladder_transfer` refused every latched send, so a
+    /// coloured carrier could not participate in a Lightning swap at all.
+    ///
+    /// ORDER. The latch is created AFTER the split (the piece must exist to be latched) and BEFORE
+    /// the conveyance (the recipient must receive material that is already batch-locked, or they
+    /// could claim it without the preimage). That is the same ordering the plain lane uses and the
+    /// reason the conveyance is the last step of the split, not the first step of the latch.
+    async fn colored_in_ladder_pay_latched(
+        &self,
+        asset_id: &str,
+        mut carrier: mercurylib::wallet::Coin,
+        carrier_amount: u64,
+        payouts: &[(String, u64)],
+        latch: ColoredLatch,
+    ) -> Result<(Vec<(String, u64)>, Option<String>, Option<String>)> {
         use mercuryrustlib::tesr::{ColoredSplitChildSpec, COLORED_LADDER_DUST};
 
         if payouts.is_empty() {
@@ -3715,9 +3740,24 @@ impl UtexoWallet {
                 // over `X_m`'s payload. Dispatching here rather than at the entry point keeps the
                 // rule where every coloured send already funnels through.
                 if tip.as_ref().is_some_and(|t| t.is_colored()) {
+                    // [P3] The batch lane has no latch wiring of its own yet. Refuse a LATCHED send
+                    // over it by name rather than dropping the latch silently — a Lightning swap
+                    // whose coin was never batch-locked lets the recipient claim without the
+                    // preimage, i.e. take the coin and the payment.
+                    if !matches!(latch, ColoredLatch::None) {
+                        return Err(anyhow!(
+                            "a Lightning-latched send from a coloured SPINE TIP is not wired yet. \
+                             The root lane is (`colored_in_ladder_pay_latched`); the batch lane \
+                             would have to create the latch on its piece and pass the batch id to \
+                             `convey_child_bundle` the same way. Refusing rather than conveying an \
+                             UNLATCHED piece into a swap — the recipient could then claim without \
+                             the preimage and keep the payment too."
+                        ));
+                    }
                     return self
                         .colored_spine_batch_pay(asset_id, carrier, carrier_amount, payouts)
-                        .await;
+                        .await
+                        .map(|pieces| (pieces, None, None));
                 }
                 return Err(anyhow!(
                     "carrier {carrier_id} has no TES-R ladder to split in-ladder"
@@ -4031,6 +4071,39 @@ impl UtexoWallet {
             )
         })?;
 
+        // [P3] THE LATCH, if this is a Lightning swap. Created on the PIECE and after the split —
+        // the coin must exist before it can be batch-locked — and BEFORE the conveyance, so the
+        // recipient never holds claimable material that is not yet locked.
+        //
+        // `refuse_colored_multi_payee` bounds this lane to ONE payee, so one latch covers the send;
+        // a K > 1 latch would need one batch per piece and is refused upstream, not here.
+        let (latch_batch, se_hash): (Option<String>, Option<String>) = match &latch {
+            ColoredLatch::None => (None, None),
+            ColoredLatch::ExternalHash(hash) => (
+                Some(
+                    mercuryrustlib::lightning_latch::create_external_hash_latch(
+                        &self.inner.cc,
+                        &self.inner.config.wallet_name,
+                        &child_sids[0],
+                        hash,
+                    )
+                    .await?,
+                ),
+                None,
+            ),
+            ColoredLatch::SePreimage => {
+                // The SE's hash is what the caller turns into an invoice, so it must come BACK —
+                // dropping it would latch the coin and leave nobody able to pay it.
+                let pre = mercuryrustlib::lightning_latch::create_pre_image(
+                    &self.inner.cc,
+                    &self.inner.config.wallet_name,
+                    &child_sids[0],
+                )
+                .await?;
+                (Some(pre.batch_id), Some(pre.hash))
+            }
+        };
+
         // Convey each piece to its recipient's mailbox (auth = the piece slot we still own), then
         // keep the change as an exitable, re-transferable self-claim.
         for (j, (receiver_address, _)) in payouts.iter().enumerate() {
@@ -4039,7 +4112,7 @@ impl UtexoWallet {
                 receiver_address,
                 &child_coins[j],
                 &bundles[j],
-                None,
+                latch_batch.clone(),
             )
             .await?;
         }
@@ -4112,7 +4185,7 @@ impl UtexoWallet {
         )
         .await?;
 
-        Ok(piece_sids.into_iter().zip(piece_sats).collect())
+        Ok((piece_sids.into_iter().zip(piece_sats).collect(), latch_batch, se_hash))
     }
 
     /// **[S4b] Pay from a COLOURED SPINE TIP — the second and every later payment of a carrier.**
@@ -5721,7 +5794,10 @@ mod s4b_lane_fork_tests {
 
     #[test]
     fn a_tip_carrier_is_dispatched_to_the_batch_not_split_as_a_root() {
-        let code = code_of("async fn colored_in_ladder_pay(");
+        // [P3] Follows the BODY: `colored_in_ladder_pay` is now a thin delegate and the engine
+        // lives in `colored_in_ladder_pay_latched`. Pinning the delegate would pin four lines and
+        // pass vacuously — which is how this failed when the split landed.
+        let code = code_of("async fn colored_in_ladder_pay_latched(");
         assert!(
             code.contains("colored_spine_batch_pay("),
             "the coloured engine RECEIVES tip carriers (the fork sends them here) and it splits ROOT \
@@ -6303,7 +6379,7 @@ mod colored_k_gt_1_tests {
     #[test]
     fn the_refusal_sits_in_the_engine_ahead_of_every_read_and_every_co_sign() {
         let src = include_str!("tokens.rs");
-        let at = src.find("\n    async fn colored_in_ladder_pay(").expect("the engine");
+        let at = src.find("\n    async fn colored_in_ladder_pay_latched(").expect("the engine");
         let body = &src[at..at + src[at..].find("\n    }\n").expect("function ends")];
         let guard = body
             .find("refuse_colored_multi_payee(payouts.len())")
@@ -6324,15 +6400,28 @@ mod colored_k_gt_1_tests {
                 );
             }
         }
-        // And the only call site that can hand it more than one payout is the batch lane; the other
-        // two pass a one-element list. All three go through the engine, so none can dodge the guard.
-        // (The needle is assembled at runtime so this assertion does not count ITSELF.)
-        let call = format!(".colored_in_ladder_pay{}", "(asset_id");
+        // And the only call site that can hand it more than one payout is the batch lane; the others
+        // pass a one-element list. Every route goes through the engine, so none can dodge the guard.
+        //
+        // [P3] BOTH NAMES. The engine was split into `colored_in_ladder_pay` (a thin delegate, kept
+        // for the unlatched callers) and `colored_in_ladder_pay_latched` (the body, which the
+        // Lightning lane calls directly). Counting only the old name would have silently stopped
+        // covering the latched route — the one that hands a coin to a swap. Counting the pair keeps
+        // the question this assertion asks ("has a new way in appeared?") the same question.
+        //
+        // (The needles are assembled at runtime so this assertion does not count ITSELF.)
+        let plain = format!(".colored_in_ladder_pay{}", "(asset_id");
+        let latched = format!(".colored_in_ladder_pay_latched{}", "(asset_id");
+        // No subtraction: the `(` in each needle already stops `..._pay(` matching `..._pay_latched(`.
+        let n_plain = src.matches(plain.as_str()).count();
+        let n_latched = src.matches(latched.as_str()).count();
         assert_eq!(
-            src.matches(call.as_str()).count(),
-            3,
-            "three call sites (transfer_tokens, multi-carrier, batch_transfer_tokens) — a fourth \
-             needs re-checking against this guard"
+            (n_plain, n_latched),
+            (2, 2),
+            "expected 2 calls to the delegate (multi-carrier, batch_transfer_tokens) and 2 to the \
+             engine (the delegate itself, and the CTES-R transfer entry which passes a latch). A \
+             new one needs re-checking against this guard — it is the refusal that keeps a \
+             shared-blinding K > 1 batch unreachable"
         );
     }
 }

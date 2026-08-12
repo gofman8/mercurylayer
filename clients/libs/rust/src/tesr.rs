@@ -3646,7 +3646,7 @@ pub fn build_colored_in_ladder_split(
     children: &[ColoredSplitChildSpec],
 ) -> Result<ColoredSplitDraft> {
     use crate::rgb::{
-        build_colored_tier, colored_tier_out_total, colored_tier_out_value, ColoredTierSpec,
+        build_colored_tier, colored_tier_out_total, ColoredTierSpec,
         TierRole,
     };
 
