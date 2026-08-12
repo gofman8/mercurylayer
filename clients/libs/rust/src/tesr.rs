@@ -2154,6 +2154,155 @@ pub fn build_colored_spine_cap(
     })
 }
 
+/// **[S4] A COLOURED SPINE BATCH's `SP`** — the batch's split state over the TIP's funding outpoint.
+///
+/// This is the coloured sibling of the `SP` that `spine_batch_split` builds, and it is what makes a
+/// coloured carrier's SECOND payment as cheap as its first: the batch re-spends the tip's own
+/// `SP.out[K]` and leaves another tip, so the sender's coin keeps one shape forever instead of
+/// growing a rung per payment.
+///
+/// Structurally identical to the root lane's coloured split
+/// ([`build_colored_in_ladder_split`]) with one difference that decides everything: the parent is the
+/// **tip's funding outpoint**, not an extension's payload. The tip is already at `SPINE_CSV`, and the
+/// new `SP` sits at `SPINE_CSV` too — which is exactly why the seal must carry the LEVEL.
+///
+/// **The seal is `TierRole::Spine` with `rung = spine_level`, and that is the load-bearing part.**
+/// Two spine levels over one funding chain share `(statechain_id, role, tier_index)` AND their CSV,
+/// so without the level they derive the same blinding. Colliding blindings collapse to one
+/// `BundleId`; rgb-lib then resolves the rival by a hash lottery uncorrelated with recency, and the
+/// loser's consignment embeds the winner's witness so **no branch a receiver tries will validate**.
+/// The whole spine is a chain of same-CSV tiers, so this is not a corner case — it is the norm.
+///
+/// Engine-only and synchronous. Returns the unsigned coloured `SP`; the caller journals it and
+/// co-signs it exactly as the plain batch does.
+pub fn build_colored_spine_batch_sp(
+    rgb: &mercury_rgb::RgbWallet,
+    tip: &SpineTipBundle,
+    children: &[ColoredSplitChildSpec],
+    change_agg_address: &str,
+    change_rgb_amount: u64,
+    spine_level: u32,
+) -> Result<ColoredTierDraft> {
+    use crate::rgb::{
+        build_colored_tier, colored_tier_out_total, ColoredTierSpec, TierRole,
+    };
+
+    if !tip.is_colored() {
+        return Err(anyhow::anyhow!(
+            "build_colored_spine_batch_sp: this spine tip is PLAIN — `spine_batch_split` is correct \
+             for it, and building a coloured SP over a plain tip would attach an allocation the tip \
+             does not hold"
+        ));
+    }
+    let rgb_half = tip.rgb.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("build_colored_spine_batch_sp: coloured tip carries no RGB half")
+    })?;
+    tip.validate().map_err(|e| {
+        anyhow::anyhow!(
+            "coloured spine batch refused: the tip record for {} is not self-consistent ({e}). \
+             Nothing has been co-signed and the tip's own cap is unaffected.",
+            tip.statechain_id
+        )
+    })?;
+
+    // N payees + the change leg, which stays with the sender and becomes the NEXT tip.
+    let n = children.len() + 1;
+    let (fund_txid, fund_vout) = tip.funding_outpoint();
+    let (prev_value, prev_spk) =
+        tier_payload_prevout(tip.funding_tier(), "coloured spine batch parent")?;
+
+    // ---- Conservation law 1: SATS. -------------------------------------------------------------
+    let total = colored_tier_out_total(prev_value, n, tip.parent.fee_rate).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the tip's slot ({prev_value} sat) cannot carry a coloured {n}-output batch at {} sat/vB",
+            tip.parent.fee_rate
+        )
+    })?;
+    let payee_sats: u64 = children.iter().map(|c| c.sats).sum();
+    let change_sats = total.checked_sub(payee_sats).ok_or_else(|| {
+        anyhow::anyhow!(
+            "coloured spine batch: payees claim {payee_sats} sat but the tip's slot affords only \
+             {total} sat across {n} coloured outputs — the change leg would be negative"
+        )
+    })?;
+
+    // ---- Conservation law 2: THE ALLOCATION. Σ payees + change == the tip's whole holding. ------
+    let payee_rgb: u64 = children.iter().map(|c| c.rgb_amount).sum();
+    let rgb_total = payee_rgb.checked_add(change_rgb_amount).ok_or_else(|| {
+        anyhow::anyhow!("coloured spine batch: allocation arithmetic overflows")
+    })?;
+    if rgb_total != rgb_half.amount {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch ALLOCATION conservation: payees + change sum to {rgb_total} but \
+             the tip holds {} — refusing to mint or burn an allocation",
+            rgb_half.amount
+        ));
+    }
+
+    // ---- Conservation law 3: EVERY LEG MUST FUND ITS OWN LADDER. --------------------------------
+    //
+    // Two floors, and they differ because the two legs have different SHAPES: a payee is a two-rung
+    // PIECE, the change leg is a one-rung TIP. Checked before any co-sign, because an `SP` whose
+    // output cannot fund its own ladder strands that value under a parent this batch is about to
+    // terminalize — and terminalization is irreversible.
+    let piece_floor = colored_child_floor(tip.parent.fee_rate, COLORED_LADDER_DUST);
+    for c in children {
+        if c.sats < piece_floor {
+            return Err(anyhow::anyhow!(
+                "coloured spine batch payee {} would hold {} sat but a COLOURED piece ladder needs \
+                 at least {piece_floor} sat at {} sat/vB",
+                c.statechain_id,
+                c.sats,
+                tip.parent.fee_rate
+            ));
+        }
+    }
+    let tip_floor = colored_spine_tip_floor(tip.parent.fee_rate, COLORED_LADDER_DUST);
+    if change_sats < tip_floor {
+        return Err(anyhow::anyhow!(
+            "coloured spine batch: the change leg would hold {change_sats} sat but the NEXT tip's \
+             one-rung cap needs at least {tip_floor} sat at {} sat/vB — a batch that cannot leave a \
+             viable tip ends the carrier's payment life",
+            tip.parent.fee_rate
+        ));
+    }
+
+    // ---- The SP itself: payees first, change last (it becomes the next tip's funding output). ----
+    let sp_seal =
+        colored_tier_seal(&tip.statechain_id, TierRole::Spine, 0, spine_level, Some(SPINE_CSV));
+    let mut payloads: Vec<(String, u64, u64)> = children
+        .iter()
+        .map(|c| (c.agg_address.clone(), c.sats, c.rgb_amount))
+        .collect();
+    payloads.push((change_agg_address.to_string(), change_sats, change_rgb_amount));
+
+    let sp = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id: &rgb_half.contract_id,
+            prev_txid: &fund_txid,
+            prev_vout: fund_vout,
+            prev_value,
+            prev_spk_hex: &prev_spk,
+            sequence: mercurylib::tesr::csv_blocks(SPINE_CSV).0,
+            payloads: &payloads,
+            network: &tip.parent.network,
+            fee_rate: tip.parent.fee_rate,
+            nonce: Some(sp_seal.rung as u64),
+        },
+        &sp_seal,
+    )?;
+    Ok(ColoredTierDraft {
+        tx_hex: sp.tx_hex,
+        txid: sp.txid,
+        // vout 0 is the first payee; the change leg is the LAST payload. Callers index by position.
+        payload_vout: sp.payloads[0].vout,
+        payload_value: sp.payloads[0].value,
+        payload_spk_hex: sp.payloads[0].script_pubkey_hex.clone(),
+        consignment: sp.consignment,
+    })
+}
+
 /// **[CR-D] Blind-co-sign a coloured de-trigger** — the network half of [`build_colored_detrigger`].
 ///
 /// One `cosign_tier` round-trip, the same as the plain path; the SE never learns anything is
@@ -23518,6 +23667,88 @@ mod crd_colored_detrigger_tests {
         assert!(
             build.contains("bundle.m"),
             "the renewal epoch must separate de-triggers across re-anchor generations"
+        );
+    }
+}
+
+/// [S4] The coloured spine batch's conservation and seal rules.
+#[cfg(test)]
+mod s4_colored_spine_batch_tests {
+    fn src() -> String {
+        let s = include_str!("tesr.rs");
+        let at = s.find("pub fn build_colored_spine_batch_sp(").expect("exists");
+        let end = s[at..].find("\n/// **[CR-D]").map(|e| at + e).unwrap_or(s.len());
+        s[at..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// **The reason this function exists rather than reusing the root lane's.** Every spine level
+    /// sits at the SAME CSV over one funding chain, so `(statechain_id, role, tier_index, csv)` is
+    /// identical level to level. Only the LEVEL separates them. Colliding blindings collapse to one
+    /// `BundleId`, rgb-lib resolves the rival by a hash lottery, and the loser's consignment embeds
+    /// the winner's witness — so no branch a receiver tries will validate.
+    #[test]
+    fn the_sp_seal_carries_the_spine_level_or_every_level_collides() {
+        let f = src();
+        assert!(f.contains("TierRole::Spine"), "a spine SP is not a SplitState");
+        assert!(
+            f.contains("colored_tier_seal(&tip.statechain_id, TierRole::Spine, 0, spine_level"),
+            "the level must be the seal's rung — it is the only thing that differs between levels"
+        );
+        assert!(f.contains("Some(SPINE_CSV)"), "and the CSV is the spine's, not a piece schedule's");
+    }
+
+    /// Both conservation laws, and the allocation one must count the CHANGE leg too — a batch that
+    /// conserved only across payees would silently burn the sender's own remaining allocation.
+    #[test]
+    fn both_conservation_laws_include_the_change_leg() {
+        let f = src();
+        assert!(f.contains("change_sats"), "sats: the change leg is derived, not assumed");
+        assert!(
+            f.contains("payee_rgb.checked_add(change_rgb_amount)"),
+            "allocation: Σ payees + change must equal the tip's whole holding"
+        );
+        assert!(
+            f.contains("refusing to mint or burn an allocation"),
+            "and the refusal must say what it is protecting"
+        );
+    }
+
+    /// **Two floors, because the two legs have different SHAPES.** A payee is a two-rung piece; the
+    /// change leg is a one-rung tip. Using one floor for both either strands a payee (too low) or
+    /// refuses viable batches (too high).
+    #[test]
+    fn the_payee_floor_and_the_tip_floor_are_different_and_both_checked() {
+        let f = src();
+        assert!(f.contains("colored_child_floor("), "payees need the two-rung piece floor");
+        assert!(f.contains("colored_spine_tip_floor("), "the change leg needs the one-rung tip floor");
+        assert!(
+            f.contains("ends the carrier's payment life"),
+            "and a change leg below its floor must say what it costs: no next tip, no next payment"
+        );
+    }
+
+    /// Checked BEFORE any co-sign. An SP whose output cannot fund its own ladder strands that value
+    /// under a parent the batch is about to terminalize, and terminalization is irreversible.
+    #[test]
+    fn viability_is_proved_before_anything_is_signed() {
+        let f = src();
+        let floors = f.find("colored_child_floor(").expect("floor check");
+        let build = f.find("build_colored_tier(").expect("the build");
+        assert!(floors < build, "floors must be proved before the tier is built, let alone signed");
+    }
+
+    /// A plain tip must never reach this builder — it would attach an allocation the tip does not
+    /// hold.
+    #[test]
+    fn a_plain_tip_is_refused_by_name() {
+        let f = src();
+        assert!(f.contains("if !tip.is_colored()"), "{f}");
+        // Substring kept to ONE source line: rustfmt wraps these messages, so a phrase that reads
+        // contiguously in the rendered error may not exist contiguously in the file. Third time this
+        // has bitten a source pin in this session.
+        assert!(
+            f.contains("`spine_batch_split` is correct"),
+            "and it must point at the right lane"
         );
     }
 }
