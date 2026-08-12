@@ -2071,6 +2071,89 @@ pub fn build_colored_detrigger(
     })
 }
 
+/// **[S2] The COLOURED SPINE-TIP CAP** — one coloured state rooted directly at `SP.out[K]`.
+///
+/// A spine tip's cap is a single tier: no extension between it and `SP`, which is what makes a tip a
+/// tip rather than a piece. This is its coloured form — the cap carries the whole REMAINING
+/// allocation, so the change leg keeps the asset instead of the split moving it nowhere.
+///
+/// Until this existed, `establish_spine_tip_journalled` refused a coloured tip by name: *"no builder
+/// produces one yet, and a cap co-signed without its RGB transition would move the allocation
+/// nowhere."* That refusal was right — a cap co-signed as PLAIN over a coloured `SP.out[K]` burns an
+/// irreversible SE slot on a transaction that carries no transition, so the tip's allocation would
+/// simply cease to be assigned anywhere a receiver could book.
+///
+/// Engine-only and synchronous, like every other coloured builder here: the RGB resolver is `!Sync`,
+/// so building must not straddle an `await`.
+///
+/// **Role `Spine`, not `State`.** A tip is re-spent by the NEXT batch at the same CSV, so a cap
+/// sealed as a state would collide with the state the next level derives over the same
+/// `(statechain_id, role, index)` — and colliding blindings collapse to one `BundleId`, after which
+/// rgb-lib resolves the rival by a hash lottery and the loser's consignment never validates. S1
+/// allocated `TierRole::Spine = 0x0C` for exactly this.
+pub fn build_colored_spine_cap(
+    rgb: &mercury_rgb::RgbWallet,
+    contract_id: &str,
+    tip_statechain_id: &str,
+    sp_txid: &str,
+    sp_vout: u32,
+    sp_value: u64,
+    sp_spk_hex: &str,
+    owner_exit_address: &str,
+    remaining_amount: u64,
+    spine_level: u32,
+    csv_d: u16,
+    network: &str,
+    fee_rate: f64,
+) -> Result<ColoredTierDraft> {
+    use crate::rgb::{build_colored_tier, colored_tier_out_value, ColoredTierSpec, TierRole};
+
+    if remaining_amount == 0 {
+        return Err(anyhow::anyhow!(
+            "a coloured spine cap must carry the tip's REMAINING allocation, but it was given 0 — a \
+             zero-amount cap is a plain cap wearing an opret, and the allocation it should have \
+             carried would be assigned nowhere"
+        ));
+    }
+    let out_value = colored_tier_out_value(sp_value, fee_rate).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the spine tip's slot ({sp_value} sat) cannot carry a coloured cap at {fee_rate} sat/vB \
+             — see `colored_spine_tip_floor`, which is the value this slot had to clear when it was \
+             carved"
+        )
+    })?;
+    let payee = mercurylib::tesr::payee_address(owner_exit_address, network)?;
+
+    // `rung = spine_level` is what separates one level's cap from the next's. Two levels over one
+    // funding chain share `(statechain_id, role, tier_index)`; only the level tells them apart.
+    let seal = colored_tier_seal(tip_statechain_id, TierRole::Spine, 0, spine_level, Some(csv_d));
+
+    let tier = build_colored_tier(
+        rgb,
+        &ColoredTierSpec {
+            contract_id,
+            prev_txid: sp_txid,
+            prev_vout: sp_vout,
+            prev_value: sp_value,
+            prev_spk_hex: sp_spk_hex,
+            sequence: mercurylib::tesr::csv_blocks(csv_d).0,
+            payloads: &[(payee, out_value, remaining_amount)],
+            network,
+            fee_rate,
+            nonce: Some(seal.rung as u64),
+        },
+        &seal,
+    )?;
+    Ok(ColoredTierDraft {
+        tx_hex: tier.tx_hex,
+        txid: tier.txid,
+        payload_vout: tier.payloads[0].vout,
+        payload_value: tier.payloads[0].value,
+        payload_spk_hex: tier.payloads[0].script_pubkey_hex.clone(),
+        consignment: tier.consignment,
+    })
+}
+
 /// **[CR-D] Blind-co-sign a coloured de-trigger** — the network half of [`build_colored_detrigger`].
 ///
 /// One `cosign_tier` round-trip, the same as the plain path; the SE never learns anything is
@@ -3402,6 +3485,22 @@ pub enum SplitLane {
 pub fn change_leg_role(lane: SplitLane) -> SplitLegRole {
     match lane {
         SplitLane::PlainRoot | SplitLane::SpineBatch => SplitLegRole::SpineTip,
+        // [S3 — ATTEMPTED, REVERTED 2026-08-11.] The plan pairs S3 with S2. I landed S2's cap builder
+        // and journal path, flipped this, and `the_leg_role_selects_the_floor_and_the_piece_floor_
+        // never_falls` failed. It was RIGHT, and its own comment says why: the flip must move "in the
+        // same commit as the builder it describes and no earlier: flipped early, the wallet admits a
+        // change leg it then cannot build a ladder for, AFTER `set_spend_budget` has terminalized the
+        // parent."
+        //
+        // That is precisely what would have happened. `build_colored_in_ladder_split` carves EVERY
+        // leg as a two-tier PIECE (`pending_extension` + `pending_state`, `role: Piece`); no coloured
+        // caller produces a one-tier tip. Flipping this changes only the FLOOR used at carve time, so
+        // the change leg would be sized at the one-rung `colored_spine_tip_floor` (906) and then need
+        // the two-rung piece ladder (1482) — admitted, then unbuildable, with the parent already
+        // terminal and the failure unrecoverable.
+        //
+        // The flip belongs with **S4** (`build_colored_spine_batch`), which is what actually makes a
+        // coloured change leg a tip. S2's `build_colored_spine_cap` is landed and waiting for it.
         SplitLane::PlainChild | SplitLane::Colored => SplitLegRole::Piece,
     }
 }
@@ -4135,13 +4234,63 @@ async fn establish_spine_tip_journalled(
             rec.children[j].statechain_id
         ));
     }
-    if rec.children[j].pending_state.is_some() || rec.children[j].rgb.is_some() {
+    // ── [S2] A COLOURED TIP IS NOW BUILDABLE — but only from PRE-BUILT material. ─────────────────
+    //
+    // This used to refuse every coloured tip, and the reason was sound: a cap co-signed as PLAIN
+    // over a coloured `SP.out[K]` burns an irreversible SE slot on a transaction carrying no RGB
+    // transition, so the tip's allocation would be assigned nowhere a receiver could book.
+    //
+    // `build_colored_spine_cap` produces that transition now. What this function still must NOT do
+    // is build it: the RGB engine's resolver is `!Sync` and this path is `async`, so the coloured
+    // cap is built by the caller (which holds the engine) and arrives here as a `pending_state` to
+    // be co-signed. A coloured tip with NO pre-built cap is therefore still refused — not because
+    // the builder is missing, but because this is the wrong place to call it.
+    if rec.children[j].rgb.is_some() && rec.children[j].pending_state.is_none() {
         return Err(anyhow::anyhow!(
-            "in-ladder split {}: leg {j} ({}) is a COLOURED spine tip — no builder produces one \
-             yet, and a cap co-signed without its RGB transition would move the allocation nowhere",
+            "in-ladder split {}: leg {j} ({}) is a COLOURED spine tip with no pre-built cap. The \
+             cap must be built by the caller through `build_colored_spine_cap` (the RGB engine is \
+             `!Sync` and cannot be held across this function's awaits) and journalled as \
+             `pending_state`; co-signing a PLAIN cap here would spend an irreversible SE slot on a \
+             transaction that moves the allocation nowhere.",
             rec.op_id,
             rec.children[j].statechain_id
         ));
+    }
+    // A PLAIN tip must not arrive carrying a pending cap: the plain builder below would ignore it and
+    // co-sign its own, leaving a journalled tier nothing ever spends.
+    if rec.children[j].rgb.is_none() && rec.children[j].pending_state.is_some() {
+        return Err(anyhow::anyhow!(
+            "in-ladder split {}: leg {j} ({}) is a PLAIN spine tip yet carries a pending cap. The \
+             plain path builds its own, so that tier would be journalled and never spent — refusing \
+             rather than silently discarding co-signable material.",
+            rec.op_id,
+            rec.children[j].statechain_id
+        ));
+    }
+
+    // The COLOURED cap: co-sign exactly what the caller pre-built, never a rebuild. A rebuild here
+    // would derive a second transition over the same outpoint and the two would collide.
+    if let Some(pending) = rec.children[j].pending_state.clone() {
+        let signed = cosign_tier(
+            cc,
+            tip_coin,
+            pending.tx_hex.clone(),
+            pending.prev_value,
+            &rec.network.clone(),
+        )
+        .await?;
+        let tier = TesrTier {
+            txid: pending.txid,
+            signed_tx: signed,
+            out_value: pending.out_value,
+            csv: Some(pending.csv),
+            payload_vout: pending.payload_vout,
+        };
+        rec.children[j].state = Some(tier.clone());
+        rec.children[j].pending_state = None;
+        journal_write(cc, wallet_name, rec).await?;
+        crash_point("after_inladder_spine_tip_cap");
+        return Ok(tier);
     }
 
     // Already co-signed by an earlier attempt: reuse it. Re-signing would spend a second census slot
