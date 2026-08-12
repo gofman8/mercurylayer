@@ -489,6 +489,33 @@ impl SspService {
                 let env = p.rgb_consignment.as_deref().ok_or_else(|| {
                     anyhow!("latched coin {sid} carries no RGB consignment — refusing to pay an RGB invoice")
                 })?;
+                // **[P3] AN ENVELOPE WITH NO BRANCH TO RESOLVE IT AGAINST CANNOT BE VERIFIED.**
+                //
+                // `validate_pending_token` resolves the consignment against `branch_txs` — the FLAT
+                // lane's un-broadcast exit branch. A coloured split CHILD has no such branch: its
+                // witness chain is `colored_child_txids()`, an N-deep walk through the root ladder
+                // and every intermediate spine segment, and nothing in this message carries it.
+                //
+                // Today an empty witness set makes the resolver fail, so this lane already refuses —
+                // by accident. That is not a property to rest an IRREVERSIBLE Lightning payment on:
+                // a resolver that ever became lenient about an unknown witness would turn this into
+                // a pay-out hole silently, with nothing in this file objecting. State the boundary
+                // instead, and state it BEFORE the call.
+                //
+                // This is P3's safety half. Lifting it means giving the SSP the child's own witness
+                // chain and validating against that — the coloured pre-pay gate proper, which does
+                // not exist yet. Until then a coloured child cannot be LN-latched, and the honest
+                // failure is a named refusal rather than an RGB error nobody can act on.
+                if p.branch_txs.is_empty() {
+                    return Err(anyhow!(
+                        "latched coin {sid} carries an RGB consignment but no exit branch to resolve \
+                         it against — this is the shape of a coloured SPLIT CHILD, whose witness \
+                         chain is its own N-deep walk (`colored_child_txids`) and is not carried \
+                         here. The SSP cannot verify the allocation before paying, and a Lightning \
+                         payment is irreversible, so it refuses. Latch a coloured carrier at the \
+                         ROOT, or pay this child on-chain after its unilateral exit."
+                    ));
+                }
                 let (contract_id, booked) = self
                     .wallet
                     .validate_pending_token(env, &p.branch_txs, &p.funding_txid, p.funding_vout)
@@ -1302,5 +1329,56 @@ mod swap_tests {
         // but if one of them isn't ours, reject wholesale
         let ids2 = vec!["a".to_string(), "c".to_string()];
         assert!(check_latched_coins(&ids2, &pending, 1).is_err());
+    }
+}
+
+
+/// [P3] The SSP's pre-pay RGB gate, and the boundary it now states out loud.
+#[cfg(test)]
+mod p3_prepay_gate_tests {
+    /// The refusal must sit BEFORE `validate_pending_token`, not rely on it.
+    ///
+    /// An irreversible payment may not depend on a downstream resolver happening to fail. This pins
+    /// the order — and pins it over CODE with comments stripped, because the comment above the check
+    /// names `validate_pending_token` and `branch_txs` and would satisfy a naive substring search on
+    /// its own.
+    #[test]
+    fn an_unverifiable_coloured_envelope_is_refused_before_the_validator_runs() {
+        let src = include_str!("ssp.rs");
+        let at = src.find("let asset_amount = d.asset_amount").expect("the RGB invoice branch");
+        let code: String = src[at..]
+            .lines()
+            .take_while(|l| !l.contains("covered = covered.saturating_add"))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let guard = code
+            .find("p.branch_txs.is_empty()")
+            .expect("the SSP must refuse an RGB envelope it has no branch to resolve against");
+        let call = code
+            .find("validate_pending_token(")
+            .expect("the pre-pay validator is still called");
+        assert!(
+            guard < call,
+            "the refusal must come BEFORE `validate_pending_token` — relying on the resolver to \
+             fail makes an irreversible Lightning payment depend on a downstream implementation \
+             detail, and a resolver that ever became lenient would open a pay-out hole with nothing \
+             in this file objecting"
+        );
+    }
+
+    /// The refusal has to say what it is and what to do instead — a bare "validation failed" on a
+    /// payment path is a support ticket, not an answer.
+    #[test]
+    fn the_refusal_names_the_shape_and_the_way_around_it() {
+        let src = include_str!("ssp.rs");
+        let at = src.find("p.branch_txs.is_empty()").expect("guard");
+        let msg = &src[at..at + 900];
+        assert!(msg.contains("coloured SPLIT CHILD"), "name the shape");
+        assert!(msg.contains("colored_child_txids"), "name what would verify it");
+        assert!(
+            msg.contains("ROOT") && msg.contains("unilateral exit"),
+            "and name the two ways the owner can still be paid"
+        );
     }
 }
