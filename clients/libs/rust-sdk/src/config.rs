@@ -211,6 +211,37 @@ pub fn tesr_exit_wait_blocks(p: &mercurylib::tesr::TesrParams, child_depth: u32)
     // and waits nothing; the child's own ladder is a fresh extension and a fresh state.
     let per_level = u32::from(p.ext_csv(0)) + u32::from(mercuryrustlib::tesr::SPINE_CSV);
     let tail = u32::from(p.ext_csv(0)) + u32::from(p.state_csv(0));
+    let csv_total = child_depth * per_level + tail;
+
+    // ── [S8] THE PER-TIER CONFIRMATION, which this model used to omit. ───────────────────────────
+    //
+    // Two models computed this wait and disagreed by exactly one block per tier. `exit_wait_blocks`
+    // (`lib/src/transfer/receiver.rs`) sums `csv + 1`; this one summed `csv` alone. The `+1` is not
+    // padding: a tier's RELATIVE timelock starts counting from its parent's CONFIRMATION, so before
+    // tier *k* can even begin waiting its `csv`, tier *k−1* must confirm. The walk is sequential by
+    // construction, so every tier costs its own confirmation.
+    //
+    // **This model was the wrong one, and wrong in the dangerous direction.** Under-counting the
+    // exit wait makes a coin look like it can finish its walk before a deadline it cannot actually
+    // meet — and this figure feeds `auto_exit_due`'s scheduling and the cost model. Over-counting
+    // would merely exit early; under-counting loses the race.
+    //
+    // Expressed as `+ tesr_exit_txs(child_depth)` rather than as a re-derived count, because that
+    // function already IS the number of transactions in the walk (`3 + 2d`) and the identity
+    // `Σ(csv_k + 1) == Σ csv_k + |tiers|` is exactly what the two models were disagreeing about.
+    // One definition of "how many tiers", used by both terms.
+    csv_total + tesr_exit_txs(child_depth)
+}
+
+/// The walk's relative timelocks ALONE, with no confirmation budget — the figure
+/// [`tesr_exit_wait_blocks`] adds `tesr_exit_txs` to.
+///
+/// Split out because the two are genuinely different questions and conflating them is what produced
+/// the [S8] disagreement: "how long are the locks" is a property of the schedule, while "how long
+/// until I am out" also pays for every parent confirmation along the way.
+pub fn tesr_exit_csv_total(p: &mercurylib::tesr::TesrParams, child_depth: u32) -> u32 {
+    let per_level = u32::from(p.ext_csv(0)) + u32::from(mercuryrustlib::tesr::SPINE_CSV);
+    let tail = u32::from(p.ext_csv(0)) + u32::from(p.state_csv(0));
     child_depth * per_level + tail
 }
 

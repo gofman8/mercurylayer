@@ -371,14 +371,33 @@ fn exit_cost_scaling_model() {
     let tail_wait = u32::from(main.ext_csv(0)) + u32::from(main.state_csv(0));
     assert_eq!(per_level_wait, 720, "X_m 720 + SP 0, per split level (was 2124 at SP = D0 − δ)");
     assert_eq!(tail_wait, 2_160, "the child's own ext 720 + state 1440 — NOT a spine, unchanged");
+    // [S8] TWO TERMS, PINNED SEPARATELY. `wait_blocks` is the locks PLUS one confirmation per tier,
+    // because a tier's relative timelock starts counting from its parent's CONFIRMATION: before
+    // tier k can begin waiting its csv, tier k−1 must confirm. This model used to sum the locks
+    // alone and disagreed with `exit_wait_blocks` (the receiver's admission gate) by exactly one
+    // block per tier — and it was the wrong one, in the direction that loses races: under-counting
+    // makes a coin look able to finish a walk it cannot.
     for depth in 0..=8u32 {
         let e = tesr_exit_estimate(&main, depth);
-        assert_eq!(e.wait_blocks, depth * per_level_wait + tail_wait, "depth {depth}");
+        let csv_only = depth * per_level_wait + tail_wait;
+        assert_eq!(
+            crate::config::tesr_exit_csv_total(&main, depth),
+            csv_only,
+            "depth {depth}: the locks alone"
+        );
+        assert_eq!(
+            e.wait_blocks,
+            csv_only + tesr_exit_txs(depth),
+            "depth {depth}: locks + one confirmation per tier"
+        );
         assert!(e.wait_blocks > 0, "no depth exits instantly — the old model said every one did");
     }
-    // The headline numbers of PARTIAL-PAYMENT-ECONOMICS §4.4, re-derived rather than copied.
-    assert_eq!(tesr_exit_estimate(&main, 1).wait_blocks, 2_880); // 20 days (was 4_284 / 29.75 days)
-    assert_eq!(tesr_exit_estimate(&main, 100).wait_blocks, 74_160); // 1.41 years (was 4.08)
+    // The headline numbers of PARTIAL-PAYMENT-ECONOMICS §4.4, re-derived rather than copied, and now
+    // including the per-tier confirmations the earlier figures omitted (+3 at depth 0, +5 at depth 1,
+    // +203 at depth 100 — a 0.1–0.3% correction, but upward, which is the safe direction).
+    assert_eq!(tesr_exit_estimate(&main, 0).wait_blocks, 2_163); // was 2_160
+    assert_eq!(tesr_exit_estimate(&main, 1).wait_blocks, 2_885); // 20 days; was 2_880
+    assert_eq!(tesr_exit_estimate(&main, 100).wait_blocks, 74_363); // 1.41 years; was 74_160
     // The whole point, stated as a ratio: depth is 66% cheaper in LATENCY than it was, and the
     // saving is entirely in the term that compounds.
     assert_eq!(2_124 - per_level_wait, 1_404, "the saving per level is exactly the old SP timelock");
@@ -388,13 +407,17 @@ fn exit_cost_scaling_model() {
     // Latency is a property of the SCHEDULE, not of TES-R: the regtest schedule gives the same
     // shape with its own constants, so this model tracks whichever profile a wallet runs.
     let reg = TesrParams::regtest();
+    // [S8] Same identity as mainnet: the locks, plus one confirmation per tier.
     assert_eq!(
         tesr_exit_estimate(&reg, 1).wait_blocks,
         u32::from(reg.ext_csv(0)) * 2
             + u32::from(mercuryrustlib::tesr::SPINE_CSV)
             + u32::from(reg.state_csv(0))
+            + tesr_exit_txs(1)
     );
-    assert_eq!(tesr_exit_estimate(&reg, 1).wait_blocks, 48); // was 66, before SP became a spine
+    // [S8] 48 locks + 5 confirmations. Was 48 when this model omitted the confirmations, and 66
+    // before SP became a spine tier.
+    assert_eq!(tesr_exit_estimate(&reg, 1).wait_blocks, 53);
     // Size does NOT depend on the schedule — the tiers are the same transactions either way.
     assert_eq!(tesr_exit_estimate(&reg, 4).total_vbytes, tesr_exit_estimate(&main, 4).total_vbytes);
 
@@ -515,11 +538,15 @@ fn auto_exit_margin_is_derived_from_the_walk() {
     // mainnet schedule fit a 1_000-block epoch. Only re-parameterising does.
     let main_walk = tesr_exit_estimate(&TesrParams::mainnet(), AUTO_EXIT_MODELLED_DEPTH).wait_blocks;
     let reg_walk = tesr_exit_estimate(&TesrParams::regtest(), AUTO_EXIT_MODELLED_DEPTH).wait_blocks;
-    assert_eq!((main_walk, reg_walk), (2_880, 48));
+    // [S8] +5 each: the walk at depth 1 is 5 transactions, and each costs a confirmation before the
+    // next tier's relative lock can start. The numbers moved UP, which is the direction that makes a
+    // deadline harder to meet — so the two lines below, which measure the off-chain life left after
+    // the walk, get correspondingly tighter. That is the correction being honest rather than kind.
+    assert_eq!((main_walk, reg_walk), (2_885, 53));
     // mainnet SE `lockheight_init` = 10_000 (server/src/server_config.rs:82) + mainnet schedule.
-    assert_eq!(10_000 - main_walk - mainnet, 5_000, "blocks of off-chain life left on mainnet");
+    assert_eq!(10_000 - main_walk - mainnet, 4_995, "blocks of off-chain life left on mainnet");
     // deployed SE `lockheight_init` = 1_000 (server/Settings.toml:2) + regtest schedule.
-    assert_eq!(1_000 - reg_walk - deployed, 92, "…and on the deployed profile");
+    assert_eq!(1_000 - reg_walk - deployed, 87, "…and on the deployed profile");
     assert!(
         main_walk > 1_000,
         "the mainnet SCHEDULE cannot be run under the deployed 1_000-block lockheight_init: the \
