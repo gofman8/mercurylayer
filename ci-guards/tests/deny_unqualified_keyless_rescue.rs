@@ -99,15 +99,25 @@ fn the_watchtower_module_carries_the_same_limit() {
 #[test]
 fn the_trust_model_qualifies_its_offline_coverage_claim() {
     let tm = flat(&read("docs/utexo/TRUST-MODEL.md"));
-    let at = tm.find("keyless delegation to n towers covers offline periods").expect(
-        "TRUST-MODEL.md B4 must still make its offline-coverage claim — if this moved, re-point the \
-         guard rather than deleting it",
+    // RE-POINTED (not deleted, per this guard's own instruction). The D40/A.2 documentation pass
+    // rewrote B4 to say something STRONGER: keyless delegation covers the *reactive* clock ONLY,
+    // because a laddered watch entry exports `deadline_block: u32::MAX`. The old phrasing
+    // ("covers offline periods except during a fee spike") conceded less. What must not be lost is
+    // the inline qualification, which is the half a reader quotes.
+    let at = tm.find("keyless delegation to n towers covers").expect(
+        "TRUST-MODEL.md B4 must still make its keyless-delegation coverage claim — if this moved, \
+         re-point the guard rather than deleting it",
     );
-    let window = &tm[at..(at + 400).min(tm.len())];
+    let window = &tm[at..(at + 700).min(tm.len())];
     assert!(
-        window.contains("except during a fee spike") && window.contains("cannot fee-bump"),
-        "B4's offline-coverage claim must carry the fee-spike exception INLINE. A qualification \
-         stated only elsewhere does not reach the reader of this row, and this row is the one people \
-         quote."
+        window.contains("cannot fee-bump"),
+        "B4's coverage claim must carry the D31 fee-bump exception INLINE. A qualification stated \
+         only elsewhere does not reach the reader of this row, and this row is the one people quote."
+    );
+    assert!(
+        window.contains("reactive") || window.contains("fee spike"),
+        "B4 must say WHAT the keyless delegate does not cover — either the fee-spike case or (the \
+         stronger, current form) that it covers the reactive clock only. An unqualified \"covers\" \
+         is the sentence this guard exists to prevent."
     );
 }

@@ -1,10 +1,15 @@
 # Partial-payment economics — what a real payment costs, and what to build
 
 > **Status: PARTLY SHIPPED.** Numbers are derived from constants read at `feat/spark` and cited
-> `file:line`; §3.0 lists defects that existed independent of which design shipped, and most are now
-> closed. **The "nothing in §4 exists in code yet" this line used to carry is false** — see the
-> build-status block at the head of §4, which is authoritative: change 1 (the spine tier) is landed
-> and change 2's VERIFIER half is landed with its producer deliberately gated off.
+> `file:line`; §3.0 lists defects that existed independent of which design shipped, and **all six
+> are now closed at HEAD** — each row carries the symbol that closed it. **The "nothing in §4 exists
+> in code yet" this line used to carry is false** — see the build-status block at the head of §4,
+> which is authoritative: change 1 (the spine tier) is landed and change 2 is landed in both halves.
+>
+> **§1 and §2 are the PRE-CATS baseline and are kept as the "before" half of §6's comparison.** The
+> live builders sign `SP` at `SPINE_CSV = 0` and give the plain root's change leg a one-rung spine
+> tip, so every 2 124-blocks-per-level figure below describes the design that was measured, not the
+> one that ships. Each such block is labelled where it appears.
 >
 > **Read the ⚠️ CORRECTION inside §4.5 before implementing anything from §4.5** — it voids that
 > section's stated safety argument, and the code now carries an executable disproof of it.
@@ -69,18 +74,34 @@ exit.
 Two structural properties are worse than the fee:
 
 **Depth grows by +1 per payment and never resets.** `child_in_ladder_split`
-(`clients/libs/rust/src/tesr.rs:2508`) pushes the entire preceding segment into `ancestors`
-(`:2609-2612`). There is no cap anywhere, and no reset: a child cannot be refreshed — `refresh()`
-routes to `withdraw()`, which routes any `ctesr-` coin to `unilateral_exit` because `SP.out[j]` is
-un-broadcast and there is no confirmed outpoint to co-operatively spend
-(`clients/libs/rust-sdk/src/wallet.rs:1856-1878`), and `refresh` hard-refuses any RGB carrier
-outright (`clients/libs/rust-sdk/src/refresh.rs:152-157`).
+(`clients/libs/rust/src/tesr.rs`) pushes the entire preceding segment into `ancestors`. When this
+was written there was no cap anywhere; **there are two now** — `max_split_depth` and `max_exit_txs`
+(`lib/src/transfer/receiver.rs`), enforced build-side by `enforce_split_depth_cap_shaped`
+(`clients/libs/rust/src/tesr.rs`) and receive-side by `check_exit_headroom` — and on mainnet they
+admit **depth 10 and a 23-transaction exit chain**. What still does not happen is a **reset**: a
+child cannot be re-anchored, because `refresh()` routes a `ctesr-` coin through `withdraw()` to
+`unilateral_exit` — `SP.out[j]` is un-broadcast, so there is no confirmed outpoint to co-operatively
+spend. What did land is **renewal, not re-anchor**: `renew_child` / `renew_child_auto` rebuild both
+leaf tiers in place over the same `SP.out[j]`, resetting the state rung to `state_csv(0)` = 1440
+"for zero on-chain bytes and no depth" (`child_supersede_csv`'s own refusal text). The coloured lane
+is no longer a dead end either: `refresh` still refuses a carrier, but it now names
+`colored_reanchor` (CR-D, `clients/libs/rust-sdk/src/refresh.rs`) instead of leaving no route.
 
 **BIP-68 relative timelocks are sequential**, so exit latency compounds:
 
 ```
 WAIT(d) = 2124·d + 2160 blocks        [T 0 | X_m 720 | SP 1404 | (d−1)×(720+1404) | ext 720 | state 1440]
 ```
+
+> Two corrections to that line, both from the code that now implements the rule.
+> **(a) It omits one block per transaction.** A tier's relative lock only starts counting once its
+> parent confirms, so the real figure is `Σ csv + one confirmation each` — `exit_wait_blocks`
+> (`lib/src/transfer/receiver.rs`), whose doc comment names this formula and this section as the
+> thing it corrects. Add `3 + 2d`.
+> **(b) The `SP 1404` term is the pre-CATS shape.** The live builders sign `SP` at `SPINE_CSV = 0`
+> (`in_ladder_split`, `child_in_ladder_split`, `spine_batch_split`), so a two-tier level costs
+> `720 + 0 + 2 = 722` blocks and a depth-1 leaf's whole walk is **2 885** blocks, not 4 284. The
+> `2124·d` figure below is retained as the measured baseline, not as a live number.
 
 d = 1 → 4 284 blocks (29.8 days). d = 100 → 214 560 blocks = **4.08 years**. And it is
 **contagious**: the piece child inherits the identical ancestor chain, so the *recipient* of the
@@ -95,14 +116,30 @@ wallet inflicts it on itself and its payees by spending normally.
 (`clients/libs/rust/src/tesr.rs:2515`, guard at `:348`); `colored_child_txids` refuses any child with
 non-empty `ancestors` (`:243-256`); `colored_in_ladder_pay` only loads a ROOT `tesr-` bundle
 (`clients/libs/rust-sdk/src/tokens.rs:3388-3397`). After one coloured partial payment the RGB change
-is a depth-1 coloured child that can be moved only **whole** or exited. `CARRIER_SEND_DEPTH = 5` and
-`TOKEN_CARRIER_SATS = 17 384` (`clients/libs/rust-sdk/src/tokens.rs:113,126`) still size carriers for
-five sends — a stale assumption from the retired flat-split lane. On the live CTES-R in-ladder lane
-the real depth is **1**.
+is a depth-1 coloured child that can be moved only **whole** or exited.
+
+> **Both halves of this section have moved.** The one-payment cap **no longer holds** — see the
+> build-status block at the head of §4: the refusals that enforced it are gone, `colored_child_txids`
+> and `colored_child_seals` now walk `ancestors` N deep [S5], and the coloured root split gives its
+> change leg a one-rung spine tip [S3]. And the stale constant is gone with it: the global
+> `CARRIER_SEND_DEPTH = 5` was replaced by two named lanes — `LEGACY_CARRIER_SEND_DEPTH = 5` and
+> `CTESR_CARRIER_SEND_DEPTH = 1` (`clients/libs/rust-sdk/src/tokens.rs`) — with
+> `TOKEN_CARRIER_SATS = 17 384` documented as the LEGACY lane's sizing (the max of the two;
+> the CTES-R lane needs 6 362), so the number is now a stated over-provision rather than a
+> mis-stated assumption.
 
 ---
 
 ## 2. The baseline cost curve
+
+> **Labelled superseded baseline — kept, not corrected.** These rows are the design as measured
+> before CATS landed, and they are the "before" half of §6's comparison; the *sats* and *vbytes*
+> columns still hold at HEAD, two other columns do not. (i) **Latency**: `SP` is signed at
+> `SPINE_CSV = 0` now, so a two-tier level costs 722 blocks rather than 2 124 and a depth-1 leaf
+> waits 2 885. (ii) **Reach**: the N = 100 and N = 1000 rows are no longer buildable at all —
+> `enforce_split_depth_cap_shaped` refuses past **depth 10** and past a **23-transaction** exit
+> chain on mainnet (`max_split_depth` / `max_exit_txs`, 68 / 139 on regtest). They are the cost of a
+> tree the protocol now declines to mint, which is the point they were written to make.
 
 Loss of total exitable value, locked reserve, depth and exit cost after N partial payments. Reserve
 equals burn: every sat is committed fee + P2A parked in an un-broadcast tier, recoverable only by
@@ -146,9 +183,21 @@ total loss, not a slow one, and it is the dominant term — an order of magnitud
 
 ## 3. Recommendation
 
-### 3.0 Ship these first — they are defects today, under every design
+### 3.0 Ship these first — defects under every design (all six now CLOSED)
 
-None of these depend on which design wins. Two are exploitable now.
+None of these depend on which design wins. Two were exploitable when this was written.
+
+> **STATUS AT HEAD: all six are CLOSED.** The table is kept as the record of what was wrong and why
+> — the fixes are named against it, and each names the symbol that closes it, not a line number.
+>
+> | # | closed by |
+> |---|---|
+> | P0-1 | `check_exit_headroom` (`lib/src/transfer/receiver.rs`), called from the conveyed-child verifier in `clients/libs/rust/src/tesr.rs`; every input receiver-derived (CSVs off the signed `nSequence`, epoch off the validated flat chain). E2E `clients/tests/rust/src/sdk82_exit_headroom_gate.rs`. |
+> | P0-2 | `max_split_depth` + the build-side `enforce_split_depth_cap_shaped`, derived from the live schedule and the SE's live `initlock` — mainnet **depth 10**. Its companion `max_exit_txs` adds the length cap the latency rule cannot see (**23 txs** mainnet), because a spine tier costs one block and a whole transaction. |
+> | P0-3 | `SplitJournalRecord` under `splitjrnl-` + `resume_in_ladder_split`: the whole plan is durable **before** the parent's budget is consumed, and each tier's signature is journalled the instant it exists. |
+> | P0-4 | `quote_transfer` now runs the executor's own planner and preflight ([B2]) — `fee_sats` and the per-leg `SplitFloors` come from the same `split_preflight` the executor obeys, so `fundable` is what the executor will do rather than an estimate. `split_fee_reserve`'s clamp survives only on the un-laddered plain-split lane. |
+> | P0-5 | `auto_exit_margin_blocks` is DERIVED — `auto_exit_margin_blocks_for(k_max, interval, depth)` = **2 120** mainnet / **860** regtest — and the exit model is now `293·d + 375` vB over `3 + 2d` sequential transactions (`exit_cost_scaling_model`, `clients/libs/rust-sdk/src/invalidation_model.rs`), with the wait taken per-coin from the coin's own chain. |
+> | P0-6 | The global `CARRIER_SEND_DEPTH` is gone; both lanes are named and sized (§1.3). |
 
 | # | defect | where | consequence |
 |---|---|---|---|
@@ -192,7 +241,7 @@ Per payment, plain (coloured in brackets):
 
 | | per payment | vs baseline |
 |---|---:|---|
-| baseline (today) | 2 046 (2 390) | — |
+| baseline (pre-CATS) | 2 046 (2 390) | — |
 | CATS, K=1 | 1 556 (1 814) | −24% |
 | CATS-B, K=10 | 1 115 (1 296) | −45% |
 | CATS-B, K=20 | 1 091 (1 267) | −47% |
@@ -230,7 +279,12 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > **1** of the three in §4.1, plus **V3** of §4.5, and it is the one that removes the rung
 > consumption: `§1.3`'s "coloured carriers get exactly ONE partial payment, ever" **no longer holds**
 > — the refusals that enforced it are deleted, and the per-level exit latency falls from 2 124 blocks
-> to 720 (mainnet depth 1: 4 284 → 2 880 blocks; depth 100: 4.08 → 1.41 years).
+> to 722 (`720 + SPINE_CSV + one confirmation each`; mainnet depth 1: 4 284 → **2 885** blocks, the
+> figure `exit_wait_blocks` and the `max_exit_txs` derivation both use). **Depth 100 is not the other
+> end of that comparison any more**: `enforce_split_depth_cap_shaped` refuses past depth 10 and past
+> a 23-transaction exit chain on mainnet, so the deepest admissible two-tier leaf now waits ~9 383
+> blocks (65 days) rather than 4.08 years, and the 1.41-year figure this line used to quote describes
+> a coin the protocol declines to mint.
 >
 > **V1, V2, V4 and V5 are also BUILT.** V1/V2 landed together with the shape DERIVATION the
 > CORRECTION block below demands (the `None` branch requires the surviving tier to spend the
@@ -290,9 +344,23 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > one mints a leaf whose exit does not fit the epoch.
 >
 > Still to build: the **whole-coin handover of a tip** (D3 of the phase-1 plan — promote it to an
-> ordinary two-tier child, census `0 + 2 + 1`), which is refused by name today; and the **coloured**
-> spine (§4.5 RGB items 1–3), where `cosign_colored_in_ladder_split` still carves a two-tier change
-> and `refuse_uncolored_over_colored_tip` keeps a coloured tip out of the batch builder.
+> ordinary two-tier child, census `0 + 2 + 1`), which is refused by name today; and the **coloured
+> spine BATCH**. The coloured half has moved a long way since this paragraph was first written and
+> the remainder is now specific: §4.5's RGB item 1 is landed (`TierRole::Spine = 0x0C`), item 2 is
+> landed ([S5] — `colored_child_txids` and `colored_child_seals` both walk `ancestors`, charging a
+> spine segment one tier and a two-tier segment two), and the coloured ROOT split's change leg is a
+> one-rung coloured tip ([S3] — `change_leg_role(SplitLane::Colored)` reports `SpineTip`, floored at
+> `colored_spine_tip_floor`), so `cosign_colored_in_ladder_split` no longer carves a two-tier change.
+> `refuse_uncolored_over_colored_tip` is no longer a blanket refusal either: `spine_batch_split_ex`
+> forks by lane and a coloured tip has a coloured `SP` to be built with (`build_colored_spine_batch`,
+> `cosign_colored_spine_batch`). What is still refused, deliberately and by name, is the
+> **both-coloured** arm [S4b]: every leg below `SP` is still constructed by the plain
+> `establish_child_journalled` / `establish_spine_tip_journalled` and persisted with `rgb: None`,
+> which would burn the allocation rather than refuse it. Lifting it means building the coloured legs
+> — per-payee `ext_child`/`state_child` with consignments and seals rooted at `SP.out[j]`, a coloured
+> cap for the next tip, and the conservation checks over the allocation. **§4.5's RGB item 3
+> (per-output blinding) is still open**: `colored_tier_seal` takes `(sid, role, level, m‖csv)` and
+> nothing child-specific, so the batch-concealment argument below stands unchanged.
 
 ### 4.0 What cannot be delivered, and why
 
@@ -338,9 +406,13 @@ Three changes of substance versus the live `in_ladder_split`:
 2. **The change gets no extension.** The extension exists to reset the state budget by renewal; on
    the spine every payment already lands the change on a virgin outpoint at a virgin `D0`, so the
    rung is dead weight. That missing rung is the 490 sat and the 720 blocks CATS saves per level.
-   (It is dead weight **today** too: `renew`/`rollover` take `&mut TesrBundle`
-   (`clients/libs/rust/src/tesr.rs:3235,3265`) and there is no `ChildTesrBundle` analogue — a split
-   child's extension can never be renewed. Both designs give the change exactly 36 whole-coin hops.)
+   (This was argued as dead weight **today** too, on the grounds that `renew`/`rollover` take
+   `&mut TesrBundle` and no `ChildTesrBundle` analogue existed, so a split child's extension could
+   never be renewed and both designs gave the change exactly 36 whole-coin hops. **That premise is
+   gone**: `renew_child` is the analogue, it rebuilds both leaf tiers in place, and the budget is now
+   36 hops × 16 epochs. The argument for dropping the CHANGE leg's extension survives anyway, and on
+   its own stronger footing — the spine lands every payment's change on a virgin outpoint at a virgin
+   `D0`, so the change leg never needs the rung the renewal path exists to step down.)
 3. **K+1 payloads, not 2.** `build_split_state` and `committed_fee_for_outputs` are already N-ary.
 
 `C_i` is disclosed as superseded. The sender's coin is always "a slot with one cap over its funding
@@ -379,8 +451,11 @@ Per batch of K pieces:
 The SE receives a sighash and a prevout amount. `cosign_tier` is issued **once** for `SP` regardless
 of K (`:2095`, outside the child loop). nSequence lives inside the transaction and is invisible to
 it. The SE never learns K, the denominations, the colour, or that a spine exists rather than a
-2-way split. **Zero server diff, zero enclave diff, no new endpoint, no new cryptography** — which
-matters given the SGX/lockbox lane divergence: nothing here lands on the signing lane at all.
+2-way split. **Zero server diff, zero enclave diff, no new endpoint, no new cryptography** — nothing
+here lands on the signing lane at all, so which signing implementation is deployed does not enter
+the argument. (This line used to justify itself by "the SGX/lockbox lane divergence". Do not carry
+that framing forward: the deployed signer is the lockbox, and a hazard about a lane that is not the
+shipping lane is the kind of claim that discredits the rest of the section.)
 
 ### 4.4 Unilateral exit at every hop
 
@@ -406,8 +481,19 @@ PAYEE of a piece in batch i: [T, X_m, SP_1..SP_i, ext_child, state_child]
 
 Every piece in a batch exits at the same depth regardless of when it was paid.
 
-**This does not bound depth — it makes each level cheap.** `s` still grows without limit, and the
-only depth reset remains the root re-anchor, which a split tree does not have (§7).
+**This makes each level cheap; it does not RESET depth.** The only depth reset remains the root
+re-anchor, which a split tree does not have (§7).
+
+> **Correction — `s` no longer "grows without limit".** That was true of the latency rule alone, and
+> it is exactly the hole [P0-3] was built to close: a spine tier costs one block of latency and a
+> whole transaction, so an all-spine chain of thousands of tiers passes `check_exit_headroom` and is
+> still unusable. `max_exit_txs` prices it in transactions instead — `3 + 2·max_split_depth`, i.e.
+> **23 on mainnet** (139 on regtest) — and `enforce_split_depth_cap_shaped` evaluates it **above** the
+> latency rule's early return, charging each level by its real shape (`SplitLevelShape`). A sender's
+> tip walks `s + 3` transactions and a payee's piece `i + 4`, so the cap admits about **20 spine
+> levels** on mainnet, not an unbounded number. That bound is on the CHAIN, not on one tier: an
+> `SP`'s width is still a free parameter, and a v3/TRUC tier above 10 000 vB never relays — a
+> separate, still-open finding.
 
 ### 4.5 The verifier and census changes — all security-critical
 
@@ -517,27 +603,44 @@ Hang the piece's state tier **directly** off `SP.out[j]` and drop its extension.
 plain / 576 coloured **and 720 blocks** per piece, taking the batched floor from 1 066 to 576 and
 the payee's wait to `i + 2 160`.
 
-The cost is the piece's renewal rung. That rung is unreachable today (no child rollover exists), so
-this is not a capability trade **now** — but it forecloses ever adding child renewal without a new
-tier. Recommend landing CATS-B first and taking this as a separate, argued change.
+The cost is the piece's renewal rung — and **that cost is now real, which it was not when this
+section was written.** The original argument was "the rung is unreachable today (no child rollover
+exists), so this is not a capability trade *now*, only a foreclosure of one later". Child renewal
+has since landed: `renew_child` / `renew_child_auto` rebuild the leaf's extension and state in place
+over the same `SP.out[j]`, taking the leaf's transfer budget from 36 hops to 36 hops × 16 epochs per
+depth level. Dropping the piece's extension forfeits a live capability, so the trade is now
+**490 sat and 720 blocks per piece against 15 further renewal epochs**. Recommend landing CATS-B
+first and taking this as a separate, argued change — with that price named.
 
 ### 4.7 Prerequisites that gate K > 1
 
-- **P0-3** (crash-safe carve) must land first. The unrecoverable window is `2K + 2` SE round-trips
-  wide: at K = 20 that is an 8.6× increase in independent failure points that destroy the whole coin.
-- **Idempotent re-conveyance.** `in_ladder_pay_many` conveys the K pieces **serially**
-  (`clients/libs/rust-sdk/src/transfer.rs:1352-1370`) after the parent is already terminal. A failure
-  at recipient *j* loses bundles *j..K−1* permanently — the sender owns those slots' keys but has no
-  tier hex and never will.
-- **Coin selection must not eat its own inventory.** `plan_with_floor` sorts split candidates
-  ascending and takes `.first()` (`clients/libs/rust-sdk/src/select.rs:86-131`), so a forecast miss
-  splits the smallest **piece**, not the spine tip — deepening a payee and minting a stranded crumb.
-  `Candidate` needs an `is_inventory` flag.
+**All five are now CLOSED.** Each is kept with the reason it was a gate, because that reason is what
+the fix has to keep being true.
+
+- ~~**P0-3** (crash-safe carve) must land first.~~ **CLOSED.** The unrecoverable window was `2K + 2`
+  SE round-trips wide: at K = 20 an 8.6× increase in independent failure points that destroy the
+  whole coin. `SplitJournalRecord` (`splitjrnl-`) is written complete **before** the parent's budget
+  is touched, each tier's signature is journalled the instant it exists, and
+  `resume_in_ladder_split` co-signs exactly the tiers still `None` — checking the journalled leg
+  ROLE bidirectionally, so a `Piece` can never be resumed into a one-rung tip or the reverse.
+- ~~**Idempotent re-conveyance.**~~ **CLOSED.** `in_ladder_pay_many` still conveys the K pieces
+  serially after the parent is terminal, but each leg now carries a `ConveyanceStage` advanced only
+  forward and journalled **before** the network call it describes — so "the call never happened" and
+  "the call happened and the answer was lost" are distinguishable (by `conveyance_x1`) instead of
+  being one indistinguishable loss of bundles *j..K−1*.
+- ~~**Coin selection must not eat its own inventory.**~~ **CLOSED.** `Candidate` carries
+  `is_inventory` and `plan_with_floor` sorts on `(!is_inventory, amount_sats)`
+  (`clients/libs/rust-sdk/src/select.rs`), so every inventory candidate outranks every non-inventory
+  one regardless of size — a forecast miss splits the spine tip, not the smallest piece.
 - **Derived-slot budget.** `max_derived_tokens_per_statechain = 64`
-  (`server/src/server_config.rs:103`), counted over lifetime issuance including spent rows. K ≤ 63
-  per spine level — and because each level is a **fresh** statechain, the cap is per-level, not
-  global. But retry budget collapses: 31 failed attempts survive at K = 1, only 2 at K = 20.
-  Mint slots lazily per child, or make `take_derived_tokens` recoverable.
+  (`server/src/server_config.rs`), counted over lifetime issuance **including spent rows**
+  (`count_derived_tokens` is `SELECT COUNT(*) … WHERE derived_from = $1`). K ≤ 63 per spine level —
+  `DERIVED_SLOTS_PER_STATECHAIN = 64`, `MAX_BATCH_RECIPIENTS = 63`, refused up-front by
+  `refuse_oversized_slot_batch` — and because each level is a **fresh** statechain, the cap is
+  per-level, not global. The retry-budget collapse (31 spare attempts at K = 1, 2 at K = 20) is
+  **CLOSED** the second way this bullet asked for: `take_derived_tokens` spends leftover vouchers
+  from an earlier attempt first and persists the pool *before* handing any out, so a failed attempt
+  costs the parent's lifetime allowance nothing.
 - ~~**The watchtower cannot express the trigger.**~~ **CLOSED [S7].** The three items this bullet
   demanded are built: `WatchTrigger { watch_txid, watch_vout, csv_blocks, push_txs }` expresses the
   event, `watch_pass` evaluates it against the outpoint (`outpoint_spent`) alongside the height
@@ -649,8 +752,10 @@ signature.** Three independent breaks, all in shipped code:
    the reclaimed coin's `sig_count`, so a later `verify_bundle` bricks re-transfer") and
    `clients/libs/rust-sdk/src/ssp.rs:1201-1212` ("Re-transfer stays orphan-bricked until a
    `refresh()` re-anchor"). One stalled leg bricks **all K′** of the user's outgoing coins; recovery
-   is K′ on-chain re-anchors; and for **coloured** coins there is no recovery at all
-   (`clients/libs/rust-sdk/src/refresh.rs:152-157`). Worse, the SSP then holds a co-signed `S'` at
+   is K′ on-chain re-anchors; and for **coloured** coins recovery arrived only with CR-D
+   (`colored_reanchor`, `clients/libs/rust-sdk/src/refresh.rs`) and only for a coin whose ladder is
+   itself coloured — when this was written there was none at all, and for an allocation on a plain
+   ladder there still is none. Worse, the SSP then holds a co-signed `S'` at
    `csv − δ` while the user's retained `S` sits at `csv` — the SSP's rival matures **first**. The
    tree states the bar (`ssp.rs:1206-1208`): "the SSP holds the broadcastable `S'` and is trusted not
    to race it." That is operator trust, not atomicity.
@@ -693,13 +798,20 @@ identical to burned, since it is recoverable only by broadcasting.
 
 | | per payment | setup delta | locked after N | exit @ N=10 | exit @ N=100 | exit @ N=1000 |
 |---|---:|---:|---:|---|---|---|
-| **baseline (today)** | 2 046 | 0 | 1 470 + 2 046N | 23 tx / 3 305 vB / 162 d | 203 tx / 29 675 vB / **4.08 yr** | 2 003 tx / 293 375 vB / **40.4 yr** |
+| **baseline (pre-CATS)** | 2 046 | 0 | 1 470 + 2 046N | 23 tx / 3 305 vB / 162 d | 203 tx / 29 675 vB / **4.08 yr** | 2 003 tx / 293 375 vB / **40.4 yr** |
 | **CATS, K=1** | 1 556 | **0** | 1 470 + 1 556N | 13 tx / 2 055 vB / **15.1 d** | 103 tx / 17 175 vB / **15.7 d** | 1 003 tx / 168 375 vB / **21.9 d** |
 | **CATS-B, K=10** | 1 115 | 0 | 1 470 + 1 115N | 4 tx / 930 vB / **15.0 d** | 13 tx / 5 925 vB / **15.0 d** | 103 tx / 55 875 vB / **15.7 d** |
 | **CATS-B, K=20** | 1 091 | 0 | 1 470 + 1 091N | 4 tx / 1 360 vB / **15.0 d** | 8 tx / 5 300 vB / **15.0 d** | 53 tx / 49 625 vB / **15.3 d** |
 | **CATS-B K=20 + lean leaf** | 601 | 0 | 1 470 + 601N | same | same | same, payee −720 blk |
 | *DFO (rejected)* | 0 on-grid / `E[u/2]` off-grid | **1 066N − 86, recurring 9.2×/yr** | 1 384 + 1 066N | 5 tx / 1 012 vB / 29.8 d | *unreachable — tree is terminal* | — |
 | *DENOM-SWAP (rejected)* | 0 on-lattice / `E[b/2]` off | K onboarding tokens + 11·43·r vB | K · 1 800 (flat) | 3 tx / 375 vB / 14.75 d | same | same |
+
+> **The N = 100 and N = 1000 columns are now bounded by a rule none of these rows model.** The
+> exit-chain length cap admits 23 transactions on mainnet, so `CATS, K=1` at N = 100 (103 txs) and
+> every N = 1000 row are refused at build time by `enforce_split_depth_cap_shaped` — the payment
+> forces a batch instead. What the columns still show correctly is the *ordering*: the cap binds K=1
+> at ~20 payments and K=20 at ~400, which is the same ratio the table reports in latency and fees.
+> The rows are the cost model, not an admissibility claim.
 
 Coloured per payment: baseline **2 390** (capped at N=1); CATS K=1 **1 814**; CATS-B K=10 **1 296**;
 K=20 **1 267** — and, unlike the baseline, **repeatable**.
@@ -728,8 +840,9 @@ further under batching, with 147 734 sat (14.8%) of reserve versus the baseline'
 Be explicit; none of this is fixed by CATS, batching, denominations, or swaps.
 
 **The ~69-day root epoch survives untouched.** The depositor holds a flat backup maturing at
-`H_deposit + lockheight_init` (default 10 000 blocks ≈ 69.4 days,
-`server/src/server_config.rs:82`; the mainnet compose profile uses 50 000 ≈ 347 days). `T` is
+`H_deposit + lockheight_init` — **10 000 blocks ≈ 69.4 days on every mainnet-schedule network**
+(`TesrParams::flat_ladder_params`: `bitcoin`/`testnet`/`signet` = 10 000/100, regtest = 1 000/10;
+`docker-compose-main.yml` sets `LOCKHEIGHT_INIT: 10000`). `T` is
 un-timelocked and spends `F`, so strictly the obligation is that **`T` confirm before the earliest
 live flat-backup locktime** — once `T` confirms, `F` is spent and every flat backup is dead, and the
 remainder of the chain is relative-only with no absolute deadline.
@@ -747,8 +860,14 @@ there.**
 
 To actually move it you would need one of:
 
-- **Raise `lockheight_init`** (the compose profile's 50 000 already does). Cheap, but it lengthens
-  the depositor's clawback window and therefore the trust window. This is a policy dial, not a fix.
+- **Raise `lockheight_init`.** It lengthens the depositor's clawback window and therefore the trust
+  window — and since [D8(f)] it is **no longer a per-deployment dial**: clients compile in
+  `TesrParams::flat_ladder_params(network)` and refuse any coordinator whose `initlock`/`interval`
+  disagree, and the coordinator itself **panics at boot** rather than serve a mismatched pair
+  (`server/src/server_config.rs`). Changing it is a protocol change shipped on both sides at once,
+  not a compose edit. (A "mainnet profile of 50 000" appears in earlier drafts of this document and
+  in `SUBECONOMIC-FINALITY.md`; no such profile exists, and a coordinator configured that way would
+  refuse to start.)
 - **A co-operative de-trigger for terminal trees** — the SE co-signing a fresh spend of `F` after the
   tree is terminal. Requires raising the spend budget on a terminalized statechain *and* a protocol
   for invalidating every live child with its holder's consent. Hard; not designed.
@@ -760,19 +879,34 @@ To actually move it you would need one of:
 
 - **The payee-borne 980 sat** (1 152 coloured) per received piece. Only the lean-leaf variant (§4.6)
   touches it, halving it to 490. Batching and the spine do not.
-- **Depth still grows without bound.** CATS makes each level cost one tx and one block; batching
-  divides the level count by K. Neither bounds it.
-- **A child can never be refreshed or re-anchored** (`clients/libs/rust-sdk/src/wallet.rs:1856-1878`).
-  The error string at `clients/libs/rust/src/tesr.rs:2671-2674` ("exit or re-anchor it instead of
-  re-sending") instructs the user to do something the code refuses, and should be corrected to name
-  unilateral exit as the only route.
-- **A coloured carrier cannot be re-anchored at all** (`clients/libs/rust-sdk/src/refresh.rs:152-157`).
-  Every coloured coin therefore dies at its root epoch and must be moved off-carrier first. This is
-  the single biggest remaining blocker to the RGB half and is untouched by everything above.
-- **The 36-hop CSV budget.** A child survives `(1440−144)/36 = 36` whole-coin handovers
-  (`clients/libs/rust/src/tesr.rs:2664-2678`), with no renewal path. `CoinInfo`
-  (`clients/libs/rust-sdk/src/types.rs:142-151`) exposes no `hops_remaining`, so no wallet can warn a
-  user that a received coin is one hop from being exit-only.
+- **Depth still never RESETS** — but it is no longer unbounded, and neither CATS nor batching is what
+  bounds it. `enforce_split_depth_cap_shaped` refuses past `max_split_depth` (10 on mainnet) and past
+  `max_exit_txs` (23 transactions), the latter evaluated above the latency rule precisely because a
+  spine level is cheap in blocks and not in transactions. CATS makes each level cost one tx and one
+  block; batching divides the level count by K; the cap is what turns "unbounded" into "priced".
+- **A child can never be RE-ANCHORED** — `refresh()` routes a `ctesr-` coin through `withdraw` to
+  `unilateral_exit`, because `SP.out[j]` is un-broadcast and there is no confirmed outpoint to
+  co-operatively spend. **It can now be RENEWED**, which is the part this bullet used to get wrong:
+  `renew_child` / `renew_child_auto` rebuild `child_extension` + `child_state` in place over the
+  same `SP.out[j]` — +2 co-signatures, +2 superseded entries, census unchanged — for zero on-chain
+  bytes and no depth. The refusal string now names it (`child_supersede_csv`: "RENEW IT:
+  `renew_child` …"), so it no longer instructs the user to do something the code refuses.
+- **A coloured carrier CAN be re-anchored, if its ladder is coloured.** CR-D landed:
+  `colored_reanchor` (`clients/libs/rust-sdk/src/refresh.rs`) broadcasts the trigger if it is not
+  already on chain and then a co-signed **coloured de-trigger** carrying a valid state transition —
+  two transactions, no SE change. What remains dead is the crossed pair, and both lanes refuse it by
+  name: a coloured carrier down the plain `refresh` (which would destroy the allocation) and an RGB
+  allocation sitting on a **plain** ladder, which CR-D cannot help with — a coloured de-trigger needs
+  coloured material to build from, so such a coin must be moved off-carrier first. That residue, not
+  the whole coloured lane, is what dies at its root epoch.
+- **The 36-hop CSV budget, now renewable.** A child survives `(1440−144)/36 = 36` whole-coin
+  handovers per epoch (`child_supersede_csv`), and `renew_child_auto` steps the extension one rung
+  down and resets the state to `state_csv(0)`, so the budget is **36 hops × 16 epochs**
+  (`m_max + 1`) per depth level rather than 36 and then never again. A leaf that has itself made a
+  partial payment is TERMINAL at the SE and cannot renew — `renew_child` refuses that by name,
+  pre-flight, before burning a co-signature. `CoinInfo` (`clients/libs/rust-sdk/src/types.rs`) still
+  exposes no `hops_remaining` (no such field exists anywhere in the tree), so no wallet can warn a
+  user that a received coin is one hop from needing a renewal it may not be entitled to.
 - **Nothing is offline.** Every payment needs an authenticated derived-token draw and SE co-signs.
   CATS-B buys depth, latency and fees — not availability.
 
@@ -780,14 +914,14 @@ To actually move it you would need one of:
 
 ## 8. Build order
 
-| phase | content | gates |
-|---|---|---|
-| **0** | P0-1 … P0-6 (§3.0) | none — these are live defects; P0-1 and P0-3 are exploitable |
-| **1** | CATS spine, plain lane, K = 1: V1–V5 (§4.5) + watchtower event trigger (§4.7) | Phase 0; adversarial E2E on **sender-declared segment shape**, not the race check |
-| **2** | Batching K > 1 on the spine tier (plain) | crash-safe carve, idempotent re-conveyance, `is_inventory` in `Candidate`, lazy slot minting |
-| **2b** | Coloured spine: `TierRole::Spine`, N-deep seal schedule, **per-output blinding** | Phase 2; until blinding lands, coloured K > 1 only for mutually-known payees |
-| **3** | Opt-in self-carve inventory (Mode B) for fixed-amount books | utilisation gate `> 0.685K + 0.315` enforced in the planner |
-| **4** | Lean leaf (§4.6) — separate, argued decision | forecloses child renewal |
+| phase | content | gates | status |
+|---|---|---|---|
+| **0** | P0-1 … P0-6 (§3.0) | none — these were live defects; P0-1 and P0-3 were exploitable | **DONE** — all six, §3.0 |
+| **1** | CATS spine, plain lane, K = 1: V1–V5 (§4.5) + watchtower event trigger (§4.7) | Phase 0; adversarial E2E on **sender-declared segment shape**, not the race check | **DONE** — §4 build status |
+| **2** | Batching K > 1 on the spine tier (plain) | crash-safe carve, idempotent re-conveyance, `is_inventory` in `Candidate`, lazy slot minting | **DONE** — all four gates closed (§4.7); `spine_batch_split` |
+| **2b** | Coloured spine: `TierRole::Spine`, N-deep seal schedule, **per-output blinding** | Phase 2; until blinding lands, coloured K > 1 only for mutually-known payees | **PART** — role + seal schedule + coloured change tip landed; the both-coloured batch arm refuses [S4b] and **blinding is open** |
+| **3** | Opt-in self-carve inventory (Mode B) for fixed-amount books | utilisation gate `> 0.685K + 0.315` enforced in the planner | open |
+| **4** | Lean leaf (§4.6) — separate, argued decision | forecloses child renewal — and child renewal now EXISTS (`renew_child`), so this is a live capability to forfeit, not a theoretical one | open, and **more expensive than when it was written** |
 
 Everything before Phase 3 is unconditional. Phase 3 is the only place denominations appear, it is
 opt-in, and it is **not** gated on an SSP swap — which cannot be built safely until the

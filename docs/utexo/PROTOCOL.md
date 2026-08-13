@@ -115,7 +115,7 @@ shipped protocol is the last column.)*
 |---|---|---|---|---|---|
 | Idle on-chain footprint | 5,840 vB/coin-yr (112 vB per ~7d) | **0** | Refresh per round or lose funds | Per-factory ladder txs (~monthly, amortized /N) | **0** |
 | Renewal mechanism | On-chain re-anchor per coin | Off-chain re-sign with operator group (`renew_leaf`) | On-chain round through ASP | New factory before dying period | **Off-chain**: DW lower-CSV extension re-sign; self-split rollover at epoch exhaustion |
-| What invalidates old state | Consensus (absolute locktime ordering) + enclave refusal | **1-of-n operator honest key deletion** (trust) | Round expiry (consensus) | Decrementing nSequence DW (~64 updates then exhaustion) | **Consensus** (lower-CSV wins the trigger output; old epochs' parents unconfirmable) + enclave refusal as defense-in-depth |
+| What invalidates old state | Consensus (absolute locktime ordering) + enclave refusal | **1-of-n operator honest key deletion** (trust) | Round expiry (consensus) | Decrementing nSequence DW (~64 updates then exhaustion) | **Consensus** (lower-CSV wins the trigger output; old epochs' parents unconfirmable) + the receiver's exact-equality census over the enclave's attested `sig_count` as defense-in-depth (§5.5) |
 | Missed-liveness outcome | Raceable after window; never confiscated | Safe (operator renews); trust-dependent | **CONFISCATION** — funds sweep to server after expiry | **CONFISCATION** — "the LSP can simply claim the entire UTXO" after the dying period (delvingbitcoin 1143) | Raceable **only after** a public on-chain trigger + ≥144-block CSV notice; **never confiscated** — no output ever pays the operator by timeout |
 | Operator liquidity | None | SSP denomination-swap pools | Round liquidity fronted per refresh | LSP leaf liquidity ("1/(N+1) of its funds") | **None** (fee-sized outlays only; §7.4) |
 | Exact amounts | Native split/combine | Fixed denominations + SSP swaps | Fixed by round | Fixed by leaf | **Native split/combine preserved** |
@@ -159,7 +159,9 @@ Three candidates, six adversarial reviews. Verdict logic:
   victim = theft) and one with none ("no fatal under the stated requirements"). We judge both claimed
   FATALs as **serious-but-answerable**: the griefing FATAL is defanged by the cooperative de-trigger
   (§5.8) that the TES draft missed and the Grove review supplied — grief cost collapses from
-  forced-settlement (~828 vB + days) to one 111-vB co-op re-anchor; the offline-theft FATAL is
+  forced-settlement (~828 vB + days) to one 125-vB co-op de-trigger (the verdict stands; its
+  "griefing is economically losing" *pricing* did not survive re-derivation — §5.8);
+  the offline-theft FATAL is
   precisely the race class the hard constraints *explicitly tolerate* ("a race you can lose while
   unwatched is tolerable iff towers are cheap+delegatable"), and TES gives strictly more notice
   (≥144 blocks of public on-chain alarm) than any competitor's silent maturity. Every FIXABLE finding
@@ -197,8 +199,16 @@ F  (on-chain, value v)
                    S_k: [v3, input nSequence = CSV Δ_k = D0 − k·δ], pays owner k
 ```
 
-**Constants (shipped defaults, all served via `/info/config` and — [Amendment, TES-fixable #7] —
-published in the SE's signed nostr record so a receiver can detect a per-victim parameter split):**
+**Constants (shipped defaults). [Shipped correction — the PUBLICATION half of TES-fixable #7 is not
+built, and something stronger does its job.]** `/info/config` serves only `initlock`, `interval`,
+`batchtimeout` and `version` (`server/src/endpoints/utils.rs`), and the NIP-100 nostr record carries the
+flat `timelock` plus fee/status metadata (`server/src/main.rs`) — **neither publishes the tier schedule.**
+What actually defends a receiver against a per-victim parameter split is receiver-side, and does not
+depend on the SE publishing anything: a schedule that travels on an artifact is data, never a yardstick.
+`cap_schedule` measures every conveyed `TesrParams` against the receiver's OWN network preset field by
+field and refuses by name on the first disagreement ("`d0` = 24 where `bitcoin` says 1440"), and
+`TesrParams::flat_ladder_params` is the single authority for the flat pair — the coordinator refuses to
+boot against an env that disagrees with it (ci-guard `deny_flat_ladder_config_drift`).
 
 | Parameter | Value | Meaning |
 |---|---|---|
@@ -226,8 +236,8 @@ arithmetic) is deleted **for laddered coins**.
 **[Shipped correction]** it is *not* deleted wholesale: the un-laddered shape (RGB carriers, §5.10;
 sub-coins over un-broadcast funding, B0) still rests on the signed-once **absolute-locktime** backup,
 so it still has a root deadline and still needs materialization before it. `auto_exit_due` and
-`exit_deadline_block` therefore **survive, scoped to that shape** (`SdkConfig::auto_exit`, default on,
-margin 288 blocks), and are exercised live by sdk34 (carrier watchtower materializes before the
+`exit_deadline_block` therefore **survive, scoped to that shape** (`SdkConfig::auto_exit`, default on),
+and are exercised live by sdk34 (carrier watchtower materializes before the
 deadline) and sdk32 (the residual clawback window on an un-laddered carrier). A laddered coin has no
 deadline for them to act on.
 
@@ -238,9 +248,11 @@ Every pre-signed tx (T, X, S, SP, CB) is **nVersion=3 (TRUC)** and carries:
    fee_committed) so the base case relays and confirms standalone — restoring the self-funding
    property the signed-once backup chain always had, and removing the chicken-and-egg the review
    found in the all-zero-fee draft; and
-2. a **240-sat P2A anchor** (OP_1 0x4e73, anyone-can-spend) so any party — owner, keyless tower,
-   operator — attaches a live-rate fee child (~152 vB: 41 P2A-in + 57.5 funding-in + 43 change + 10.5)
-   during spikes.
+2. a **240-sat P2A anchor** (OP_1 0x4e73, anyone-can-spend) so the owner — or an operator's funded
+   tower on their behalf, but **not** a keyless one (§5.13) — attaches a live-rate fee child during
+   spikes. **[Shipped]** that child is **153 vB** (11 base + 41 P2A-in + 58 funding-in + 43 change),
+   `estimate_child_vsize`, and the estimate was measured against a real signed child on regtest
+   (153 estimated, 153 actual) rather than modelled.
 
 TRUC's 1P1C topology + sibling eviction gives pinning resistance (each tier confirms before the next
 is valid, so no long vulnerable chains); v3+P2A is relay *policy*, not consensus — the
@@ -306,6 +318,19 @@ pre-TES-R on-chain auto-refresh with **zero on-chain bytes**:
    both co-signs are gated by the *same* preimage/latch — no half-renewed extension is observable to
    the SSP before payment settles.
 
+**[Shipped correction — steps 1 and 3 are DESIGN, not running code; step 2 is what ships.]** There is
+no `/renew/init` route anywhere in the tree, and no `total_sigs` column, field or counter machine:
+`mercuryrustlib::tesr::renew` is exactly two `cosign_tier` calls over the ordinary
+`/sign/first` + `/sign/second` pair, and `m` and `k` are fields of the client's own bundle, advanced
+locally. So the SE-side renewal gate — the challenge-nonce binding and the "refuse unless the state
+counter is genuinely within 2δ of the floor" refusal — **is specified here and unenforced**; a coordinator
+that wanted to burn a victim's epochs is not stopped by a server-side check today. The counts the SE does
+publish are two, and both are load-bearing elsewhere: the lockbox's **lifetime `sig_count`** (attested
+`utexo/sig_count/v2`, served through `GET /info/statechain/<id>` as `num_sigs`), which is the right-hand
+side of the receiver's census (§5.11); and the per-node `sig_budget`/terminality receipt at
+`GET /statechain/spend_budget/<id>`, which the enclave itself re-checks before consuming a secnonce. The
+design in steps 1 and 3 stands — it is the code that is behind it (O-1).
+
 **Why old state dies at the consensus level, not by enclave promise**: X_{m+1} strictly undercuts
 every older extension in the CSV race for T.out[0]; every pre-renewal state hangs on an extension
 that can now never confirm. This is Decker-Wattenhofer replace-by-lower-timelock at one dedicated
@@ -313,7 +338,20 @@ tier — renewal replaces horizontally, tree depth stays constant across all epo
 (accepted from review): "consensus-dead" is *race-conditional* — the newest extension must win a
 ≥36-block-edge race after a public trigger. That is strictly stronger than the baseline's post-window
 position and categorically stronger than Spark's key-deletion promise, but it is a race, not an
-axiom. Enclave single-active-state refusal remains the second, independent layer.
+axiom.
+
+**[Shipped correction — there is no "enclave single-active-state refusal", and this document used to
+call it the second independent layer.]** The enclave does not track which state is current and cannot
+refuse a rival one; it *must* co-sign rivals, because that is what a renewal IS (a lower-CSV extension
+over the same outpoint). What the enclave enforces is two different things, both real and neither of them
+a rival defence: **one signature per secnonce** — the sealed secnonce is loaded and consumed in the same
+row-locked transaction, and a second partial signature over a different challenge finds it NULL and is
+refused (`lockbox/src/server.cpp`) — which is a MuSig2 nonce-reuse *key-leak* defence; and a per-coin
+**`sig_budget` vs lifetime `sig_count`** check, run before the secnonce is consumed, which is what makes
+terminalization (and the refusal of renewal on terminal nodes, §5.10 rule 2) enforceable rather than
+promised. The genuine second layer over the consensus race is **the receiver's exact-equality census**
+over that attested `sig_count` (§5.11): an undisclosed rival state cannot be hidden, because it shows up
+as a count the disclosed tiers cannot account for.
 
 **[Shipped] evidence**: **sdk51** — someone else spends F (a prior owner racing a stale state, or a
 griefer); the owner runs only `defend_ladders()` and the strictly-lowest-CSV current state matures
@@ -328,7 +366,7 @@ then a unilateral exit through the whole deep chain. **sdk42** — the full ladd
 The TES draft forced an on-chain compaction after epoch exhaustion. TES-R instead performs an
 **off-chain self-split rollover**: at m = 15 the owner (SDK, automatic, inside a transfer) co-signs a
 1-in-1-out self-split SP_roll consuming the current state slot, whose child resting output hosts fresh
-extension + state tiers (fresh 576-hop budget). Cost: zero on-chain; +2 pre-signed txs (~248 vB) of
+extension + state tiers (fresh 576-hop budget). Cost: zero on-chain; +2 pre-signed txs (250 vB) of
 *contingent* exit weight and +1 depth level. The parent is terminalized — frozen forever (see §5.10).
 
 **Compaction becomes an optional depth-capping policy, not a liveness requirement.** Default SDK
@@ -363,7 +401,7 @@ the operator absorbs the difference.
 | Hacked SE alone | e_n (1 of 2-of-2) | Nothing signs; can only refuse (freeze ≠ seize) | Unilateral tree pre-signed, needs nobody | **Honest, unconditionally** | None |
 | Hacked SE + past owner w/ retained pre-rotation share (**B1**) | Full key of F | Fresh no-timelock spend, private relay | Race with pre-signed material; blindness blocks target selection; public counter receipts attribute | **Adversary favored — byte-identical to the pre-TES-R B1**, the statechain trust unit, unchanged in kind and mitigations | Enclave deletion + attestation ops; settled coins immune |
 | Hacked SE + thief, coin received PRE-hack, untouched | e_n only | Cannot produce owner's partial | 2-of-2 arithmetic | **Honest, unconditionally** (REQ-3 core case) | None |
-| Trigger griefer (any past owner, anonymous) | T | Broadcast T to force cost | **Co-op de-trigger: 111 vB, coin fully restored (§5.8)** | **Honest**; attacker pays ~276 vB to cost the victim ~111 vB | SE alive; else falls to row 1 |
+| Trigger griefer (any past owner, anonymous) | T | Broadcast T to force cost | **Co-op de-trigger: 125 vB, coin fully restored (§5.8)** | **Honest** on the coin (nothing is stolen), but **not "economically losing" for the attacker**: at the committed rate he pays 0 and the coin pays ~980 sats in fees + anchors (§5.8) | SE alive; else falls to row 1 |
 | Malicious/buggy tower | Bundle (all pre-signed, pays owner only) | Broadcast early / not act | — | **Honest** (early = settles to owner; inaction = no tower) | — |
 | Mempool pinner | — | Pin packages | TRUC 1P1C + sibling eviction + committed base fee + P2A | **Honest** | Standard fee-bumping |
 
@@ -391,24 +429,37 @@ price of deleting the rent, and answer it with cheap, prefunded, redundant tower
 T's output pays the coin's own aggregate (A + public tweak). A fresh cooperative co-sign has **no
 timelock**, and no pre-signed extension is valid before CSV E_m ≥ 144 blocks. Therefore, on any
 hostile trigger: owner (or SDK automatically) + SE **key-path-spend T.out[0] immediately into a fresh
-funding output F′** and rebuild T′/X′_0/S′_0 — one ~111-vB tx, confirmed unopposed inside the
-≥144-block window during which no adversary tx is valid. For token carriers the de-trigger is a
-colored self-transition (~155 vB, tapret). Consequences:
+funding output F′** and rebuild T′/X′_0/S′_0 — one tier-shaped v3 tx, confirmed unopposed inside the
+≥144-block window during which no adversary tx is valid. **[Shipped correction — the size.]**
+`build_detrigger` emits a *tier*, anchor and all (`build_tier_tx`, payload out + 240-sat P2A), so it is
+**125 vB** (`TIER_VBYTES`, measured), not the 111 vB of a bare 1-in-1-out co-op spend; the coloured
+variant is a coloured self-transition at **168 vB** (`COLORED_TIER_VBYTES` — an `opret`, not a tapret,
+and exactly one P2TR output wider than the plain tier). Consequences:
 
-- **Trigger griefing collapses from FATAL to priced nuisance**: attacker pays ~276 vB (T + fee child)
-  to force the victim a ~111-vB co-op re-anchor. The victim keeps off-chain-ness, the coin's ladder
-  resets fresh, and the grief is fee-attributable on-chain even though T itself is anonymous.
-  Damage:cost ratio ≈ 0.4 — griefing is economically losing.
-  > **[D35] This ratio is stated for a lane where voiding the tree yields the attacker NOTHING**, and
-  > that premise is what makes "losing" the right word. It holds only while every spend of `F` a prior
-  > owner still holds is PLAIN. A retained *coloured* backup would turn the same ~112-vB spend from
-  > destruction into capture of the whole allocation, at which point this ratio describes the wrong
-  > quantity entirely. §5.10 rule 6 is what keeps the premise true.
-- **Mass-grief saturation** (residual, quantified): 1M simultaneous triggers force ~111M vB of co-op
-  responses within a ~144-block grace ≈ 77% of block space for a day — strained but survivable, and
-  the attacker burns ~2.5× more. Beyond ~1M/day the response degrades to prioritized fee auction on
-  the highest-value coins. If the SE is *simultaneously* dead, de-trigger is unavailable and rows 1–3
-  apply per coin. This correlated scenario is the design's worst case and is stated as residual risk
+- **Trigger griefing collapses from FATAL to priced nuisance**: the victim answers with one 125-vB
+  de-trigger, keeps off-chain-ness, the coin's ladder resets fresh, and the grief is fee-attributable
+  on-chain even though T itself is anonymous.
+  > **[Corrected] "Damage:cost ratio ≈ 0.4 — griefing is economically losing" was a vB ratio
+  > (111 ÷ 276) and it does not survive being priced in sats.** Both transactions pay out of the
+  > **coin**: a tier's fee is committed at signing (`tier_out_value` = prev − committed_fee − P2A), and
+  > that is as true of the hostile T as of the de-trigger. At or below the committed 2 sat/vB the
+  > attacker broadcasts a transaction he already holds and pays **nothing at all**, while the coin loses
+  > 2 × (250-sat committed fee + 240-sat anchor) ≈ **980 sats**. The attacker begins paying only above
+  > the committed rate, where T no longer relays on its own and needs a CPFP child he must fund — but at
+  > that same rate the victim's de-trigger is itself a stuck tier needing an **owner**-funded child
+  > (§5.13). So griefing is not "economically losing"; it is **cheap-to-free, and bounded**: the damage
+  > is fee-sized sats out of the coin, never the coin, and the ladder is restored.
+  > **[D35] This whole calculus is stated for a lane where voiding the tree yields the attacker
+  > NOTHING**, and that premise is what keeps the damage fee-sized. It holds only while every spend of
+  > `F` a prior owner still holds is PLAIN. A retained *coloured* backup would turn the same ~112-vB
+  > spend from destruction into capture of the whole allocation, at which point every number above
+  > describes the wrong quantity entirely. §5.10 rule 6 is what keeps the premise true.
+- **Mass-grief saturation** (residual, quantified): 1M simultaneous triggers force ~125M vB of co-op
+  responses within a ~144-block grace ≈ **87%** of a day's block space (144M vB) — strained but
+  survivable. The triggers themselves are another ~125M vB of block space, but per the correction above
+  the attacker does not *pay* for that at the committed rate: those fees come out of the victims' coins.
+  Beyond ~1M/day the response degrades to prioritized fee auction on the highest-value coins. If the SE
+  is *simultaneously* dead, de-trigger is unavailable and rows 1–3 apply per coin. This correlated scenario is the design's worst case and is stated as residual risk
   R-1 (§6).
 - The de-trigger requires SE liveness — it is a UX/cost shield, never a safety dependency (the
   unilateral tree always exists).
@@ -416,16 +467,24 @@ colored self-transition (~155 vB, tapret). Consequences:
 **[Shipped]** built by `mercurylib::tesr::build_detrigger` / co-signed by `cosign_detrigger`, and
 proven end-to-end by **sdk40 PART 2**: a griefer broadcasts T′, the owner's fresh no-timelock spend of
 T′.out[0] confirms immediately, and X′ can never confirm afterwards even past E blocks. The colored
-(~155 vB tapret) variant and the mass-grief prioritization policy (R-1 / O-6) are not test-covered.
+(168-vB `opret`) variant and the mass-grief prioritization policy (R-1 / O-6) are not test-covered.
 
 ### 5.9 Exit costs
 
 - **Cooperative** (normal path): 1 fresh co-signed tx ≈ 111 vB, instant, batchable — unchanged.
-- **Unilateral, flat coin**: 3 pre-signed txs (T+X+S ≈ 372 vB, self-relaying via committed fees) +
-  0–3 P2A children (~152 vB each) in spikes → **372–828 vB**; wait = E_m + Δ_k sequential, worst
+- **Unilateral, flat coin**: 3 pre-signed txs (T+X+S = **375 vB**, self-relaying via committed fees) +
+  0–3 P2A children (153 vB each) in spikes → **375–834 vB**; wait = E_m + Δ_k sequential, worst
   2,160 blocks (~15 days) fresh, decreasing 36 blocks per hop/renewal. [Amendment: the draft's "1–3
   children" corrected — with committed fees the base case is 0 children; in a spike all 3.]
-- **Unilateral, depth-d sub-coin**: 3 + 2d txs ≈ 124·(3+2d) vB; worst wait ≤ (d+1)·2,160 blocks —
+  **[Corrected — the 372/828 this line used to carry were built on a 124-vB tier.]** The signed tier is
+  **125 vB**, measured through the production finaliser: the 124-vB model assumed a 64-byte
+  `SIGHASH_DEFAULT` witness, while TES-R hashes with `TapSighashType::All` and therefore carries the
+  explicit `0x01` sighash byte. At 2 sat/vB that model committed 248 sat to a transaction that relays at
+  125 vB — 1.984 sat/vB — i.e. it silently broke the one property the committed fee exists for. Every
+  figure derived from it moved with it.
+- **Unilateral, depth-d sub-coin**: 3 + 2d txs = **293·d + 375 vB** (`tesr_exit_vbytes`: T, X and the
+  final state at 125 each, and per level an `SP` — the only rung with two payload outputs, 125 + 43 —
+  plus one 125-vB extension); worst wait ≤ (d+1)·2,160 blocks —
   depth-3 ≈ 60 days. This is the honest cost of relative timelocks (Spark shares the class).
   Mitigations: cooperative exit covers the normal case; default depth cap 3; optional per-level
   geometrically shrinking E0/D0 schedules (floor 144) bound total worst wait < 2×2,160 ≈ 30 days at
@@ -504,10 +563,23 @@ RGB suites (`rgb*`, `ta*`, `tb*`) run over the shipped protocol unchanged.
 
 Derived from public data; any deviation = reject: (R3′) F on-chain, unspent, pays A. (R4′) T spends F,
 no timelock; tier outputs pay A + the public H_tag tweaks; current extension has nSequence exactly
-E0 − m·δE and the new state exactly D0 − (k+1)·δ against the SE's **publicly-served counters**, with
-headroom ≥ receiver policy. (R5′) SE signature count == exact expected tree size (counters endpoint) —
-any hidden extra co-signed state/extension shows as a count mismatch, same linchpin as R5 in the
-pre-TES-R receiver set. (R6′/R7′) per-level branch validation + Σ-inputs terminal ancestors, now
+E0 − m·δE and the new state exactly D0 − (k+1)·δ, with headroom ≥ receiver policy. **[Shipped
+correction — the yardstick is NOT the SE's.]** This document used to say those bands are checked
+"against the SE's publicly-served counters"; no endpoint serves m or k (§5.5). The authority is the
+receiver's OWN network preset, and a conveyed schedule that disagrees with it is refused field by field
+(`cap_schedule`) rather than honoured — which is the stronger property, because it holds even against a
+coordinator that lies. Rival separation is enforced with the same discipline: **[D14]** the margin a
+superseded tier must clear is read off the LIVE rival's structural position (`RivalKind::margin` — δ for
+a state, δE for an extension; 36 blocks each on mainnet), never off which conveyed list the superseded
+tier arrived in. (R5′) SE signature count == exact expected tree size — `verify_bundle_bound` enforces
+the exact equality **`se_num_sigs == flat_backups + tiers + superseded`**, where `se_num_sigs` is the
+lockbox's attested lifetime `sig_count`; any hidden extra co-signed state/extension shows as a count
+mismatch, same linchpin as R5 in the pre-TES-R receiver set. The census only proves anything if that
+count is the ENCLAVE's, so it is not taken on the coordinator's word: `/info/statechain` must carry an
+`utexo/sig_count/v2` attestation over `(statechain_id, num_sigs, sig_budget, nonce)`, verified against
+the **chain-anchored** `enclave_public_key` (the one already bound to the tx0 output) rather than
+against a served key, and an unattested or unverifiable count is refused outright.
+(R6′/R7′) per-level branch validation + Σ-inputs terminal ancestors, now
 including the terminal-freeze check for colored ancestry. (R8) RGB consignment client-validated,
 un-broadcast witnesses allowed.
 All txs v3, committed-fee + single P2A, Σout = Σin − fee. **[Amendment, TES-fixable #6]**:
@@ -525,9 +597,10 @@ claim-time validation DoS pricing.
 increments by exactly the tier count, `verify_bundle` accepts the true count and rejects a hidden extra
 signature), **sdk47** (R′ across a transfer), **sdk54** (adversarial `verify_bundle`), **sdk55**
 (backup-chain adversarial), **sdk58** (11 adversarial in-ladder-split cases). The census generalizes to
-N hops for first-class children (`se_num_sigs == flat_backups + Σ conveyed_tiers`): each hop discloses
-exactly one superseded state, so an undisclosed rival shows up as a count mismatch — **sdk60**,
-**sdk17**.
+N hops for first-class children, per segment and with the same three terms
+(`child_num_sigs == CHILD_V2_BASELINE + tiers + superseded`, and `CHILD_V2_BASELINE = 0` because a
+derived child slot never ran `create_tx1` and so has no flat backup): each hop discloses exactly one
+superseded state, so an undisclosed rival shows up as a count mismatch — **sdk60**, **sdk17**.
 
 ### 5.12 Lightning latch **[Shipped — it is a HODL-invoice latch]**
 
@@ -560,14 +633,29 @@ children. **[D31] WHAT A KEYLESS TOWER CANNOT DO — normative.** A keyless towe
 broadcast the pre-signed tiers **at their committed fee**. It **cannot fee-bump them.** A CPFP child
 spending the P2A anchor requires an input the tower does not hold and a signature it cannot make, so
 if the mempool's floor rises above a tier's committed rate, a keyless tower has no action available:
-`min relay fee not met, 200 < 423` is a refusal it cannot answer. This is a **stated limit of the
-protocol, not an implementation gap** — an implementer must not read "delegable, keyless watching"
-as implying spike-time rescue.
+the tier is refused outright at `sendrawtransaction` and that refusal is one it cannot answer. This is a
+**stated limit of the protocol, not an implementation gap** — an implementer must not read "delegable,
+keyless watching" as implying spike-time rescue.
 
-Nor does the anyone-can-spend anchor supply one. Rescuing a 240-sat anchor was measured to need a
-**180 330-sat child** (WP1) — about **900×** the anchor's value — so while anyone *may* bump it,
-nobody without a stake in the coin has a reason to. "Anyone-can-spend" is a permission, not an
-incentive.
+> **[Corrected] the refusal this document used to quote — `min relay fee not met, 200 < 423` — is not a
+> TES-R tier's.** It is WP1's, produced on an isolated node with a lab-forced 3 sat/vB floor against a
+> *synthetic* 141-vB transaction carrying a 200-sat fee (1.42 sat/vB). A real tier is 125 vB
+> (`TIER_VBYTES`) committing 250 sats at 2 sat/vB, so under that same 3 sat/vB floor it reads
+> **`min relay fee not met, 250 < 375`**. The shape of the claim is unchanged and the limit is real —
+> only the numbers were borrowed from a different transaction. (The one live quote below,
+> `min relay fee not met, 6 < 13`, IS this repo's own code against a real node and stays.)
+
+Nor does the anyone-can-spend anchor supply a rescuer. **[Corrected] the "~900×" that used to stand here
+was three errors stacked**, and it is worth replacing rather than softening because the conclusion is
+sound and the arithmetic was not. WP1's child paid 180,330 sats, but (a) 180,330 ÷ 240 is 751×, not 900×;
+(b) the 900 came from 180,330 ÷ **200** — the ratio to the *parent's fee*, a different quantity; and
+(c) 180,330 was the funding wallet's chosen overpay, not a requirement: at that run's own 3 sat/vB floor
+the 318-vB package needed 954 sats total and the parent had already committed 200, so the child's
+required fee was **754 sats**. The honest reason no stranger bumps is **structural, not a ratio**: the
+child's change must clear `CHILD_CHANGE_DUST = 330` while the anchor is worth `P2A_VALUE = 240`, so an
+anchor-only child can never produce a legal change output at any fee rate — and the only builder in the
+tree hardcodes two inputs (anchor + the owner's funding UTXO), so it cannot be constructed with repo code
+at all. "Anyone-can-spend" is a permission, and there is no shape in which it is an incentive.
 
 **[D31] WHO BUMPS, THEN: the owner.** The party that funds a CPFP package is the **coin owner**, from
 their own wallet — the only party holding both a spendable UTXO and a motive. The consequence is
@@ -580,7 +668,7 @@ holds **no coin keys**, so compromising it costs the operator's fee float and **
 coin** — a materially smaller claim than "keyless", and materially larger than nothing. It carries an
 operational duty in exchange: the float must be refilled, and **a tower that runs dry fails at exactly
 the moment it is needed**. **[FUNDING RAIL — and the unit it must be sized in is NOT sats.]** A bond of "~2 spike bumps
-(~2 × 152 vB × 50 sat/vB ≈ 15 000 sats)" is the obvious sizing and it is not the binding one.
+(~2 × 153 vB × 50 sat/vB ≈ 15 300 sats)" is the obvious sizing and it is not the binding one.
 
 A fee child is v3 and spends two things: the stuck tier's P2A anchor, and a funding UTXO. Under TRUC
 (BIP-431) a v3 transaction may have at most **one** unconfirmed ancestor — and the tier is already
@@ -631,14 +719,19 @@ clear by retrying") instead of as one more retryable failure indistinguishable f
 The anchor is located by matching the P2A script, never by a guessed vout, because a coloured tier
 carries an extra `opret` and a hardcoded index would spend the payload output instead.
 
-What remains genuinely unbuilt is the tower's FUNDING RAIL (the prepaid fee bond of the optional
-funded-tower variant); the keyless default still walks the tiers with per-tx
-`transaction_broadcast_raw` and attaches no P2A fee child — the committed fee of §5.3 carries each
-tier at ordinary rates, but the amendment above is a specification, not shipped code, and no test
-exercises spike-time fee bumping (§9). Note that under **D31** this gap is narrower than it looks for
-the DEFAULT tower: a keyless tower would not bump even if the code existed, so what is missing is the
-**owner's** package path (`#123`), which additionally needs a Bitcoin Core RPC endpoint the SDK does
-not have — electrum exposes no `submitpackage`.
+**What remains genuinely unbuilt, stated against the paragraph above rather than around it.** The
+owner's package path is NOT on this list any more: it is built, wired into both broadcast loops, and
+verified live. Two things are left. (1) The **prepaid fee BOND** of the optional funded-tower variant —
+its actuarial sizing and the operator-signed per-bump refund/rebate rail (O-5). `tower_float::Solvency`
+and `plan_float` already answer *how much, in how many outputs*; nobody has priced the bond or built the
+rebate. (2) **No E2E suite test exercises spike-time bumping.** The two tests that do
+(`live_p2a_package_rescue.rs`, `live_tower_float.rs`) are node-gated: they need a Bitcoin Core RPC
+endpoint and skip — loudly, printing why — without one, so a green suite run is not evidence the rescue
+works. Separately, and by design rather than as a gap: the keyless default still walks the tiers with
+per-tx `transaction_broadcast_raw` and attaches no P2A fee child. Under **D31** that is the correct
+behaviour, not a missing feature — a keyless tower has no funding input to spend and would not bump even
+if the code were reachable from it; what it now does instead is *say so* (see the stated-limit refusal
+above) rather than retry forever.
 
 ---
 
@@ -654,17 +747,19 @@ deadline-free. Off-chain transitions: 576 hops per depth level, rollover is off-
 count is **unlimited without any mandatory chain touch**; the default depth-3
 compaction policy is an optional optimization costing 112 vB per ~2,300 transfers ≈ 0.05 vB/transfer,
 executed by the SDK/operator inside `transfer()` and priced into that transfer's fee — the user never
-acts personally. *Residual*: a hostile ex-owner can force a coin one 111-vB co-op re-anchor at ~2.5×
-their own cost (R-2 below) — footprint scales with activity OR adversary spend, with the adversary
-side bounded and economically losing.
+acts personally. *Residual*: a hostile ex-owner can force a coin one 125-vB co-op de-trigger — and per
+the correction in §5.8 that costs the attacker **nothing** at the committed rate, so footprint scales
+with activity OR adversary spite. What is bounded is the damage, not the attacker: ~980 sats of fees and
+anchors out of the coin per grief, and the coin fully restored.
 
 **REQ 2 — no/low operator liquidity: MET.** No round liquidity (nothing expires), no denomination
 pools (exact-amount Σ-conserving split/combine preserved verbatim), no leaf stock (all value is the
 user's own coin). Operator money is fee-sized only: tower fee bonds (prepaid, priced into onboarding)
 and P2A bump children. *Asterisk (accepted from review)*: contingent tower fee capital under a
 correlated grief wave is real — ~$17/coin defended at 30 sat/vB; a 100k-coin wave ≈ $1.7M fronted.
-Mitigated by committed base fees (base case needs no child), the de-trigger (defense is 111 vB co-op,
-not 552 vB unilateral), and the prepaid bond rail; it is capital-at-cost, never custody or principal.
+Mitigated by committed base fees (base case needs no child), the de-trigger (defense is one 125-vB
+co-op tier, not a 375-vB unilateral walk), and the prepaid bond rail (still unbuilt, O-5); it is
+capital-at-cost, never custody or principal.
 
 **REQ 3 — non-custody under operator hack: MET; unchanged in kind, improved in notice.** Pre-hack
 coins left untouched are unconditionally safe: every spend path needs both 2-of-2 shares; the hacked
@@ -686,7 +781,8 @@ coordinator (the other REQ4 gap) does not ship. Exit-time RGB disclosure unchang
 - **R-1 Correlated SE-death + mass trigger grief**: with the SE dead, de-trigger is unavailable and
   every triggered coin fights per-tier races; defense capacity saturates around ~10⁵–10⁶
   simultaneous triggers/day, beyond which small coins are not worth defending at spike rates. Never
-  confiscation; bounded by the attacker paying ~2.5× the defender per coin. (No 7-day exit stampede of
+  confiscation; bounded in *damage* (fee-sized sats per coin, §5.8) — **not** by the attacker's own
+  spend, which is zero at the committed rate. (No 7-day exit stampede of
   the pre-TES-R kind exists, though — untriggered coins idle safely under a dead SE forever.)
 - **R-2 No unconditional no-watch window**: a received coin must be watched (delegated, keyless,
   prepaid) from the moment of receipt, forever. Alarm-driven with ≥1 day notice, but a downgrade in
@@ -703,28 +799,33 @@ coordinator (the other REQ4 gap) does not ship. Exit-time RGB disclosure unchang
   child (§5.13), so this risk is currently carried, not mitigated.
 - **R-5 Deep-DAG unilateral latency**: depth-3 worst ≈ 60 days (coop exit instant); geometric
   schedules cap it ≈ 30 days at reduced budgets (O-4).
-- **R-6 Enclave counter machine {level, m, k} is safety-relevant** for receiver verification; needs
-  the INV-23/24-grade formal spec before ship (O-1).
+- **R-6 The enclave counter machine {level, m, k} does not exist**, and the design assumes it. What is
+  attested today is a single lifetime `sig_count` per coin plus its budget; every structural expectation
+  (which epoch, which level, how many tiers should exist) is reconstructed by the receiver from the
+  bundle and its own preset. That is sound for the census — a total is exactly what an exact-equality
+  count needs — but it means the safety-relevant state machine is still unspecified and unbuilt (O-1).
 
 ---
 
 ## 7. Footprint economics
 
-Primitives: P2TR in 57.5 / out 43 / overhead 10.5 / P2A out 13 vB; tier tx 124 vB; fee child 152 vB;
-solo compaction 112 vB. All corrected figures from the economics review adopted (the draft's 58-vB
-batched claim and 0.04 vB/transfer are **rejected**; no output netting exists).
+Primitives: P2TR in 57.5 / out 43 / overhead 10.5 / P2A out 13 vB; **tier tx 125 vB** (measured through
+the production finaliser; the 124 this table used to carry was the `SIGHASH_DEFAULT` witness model —
+see §5.9), coloured tier **168 vB** (= 125 + one 43-vB `opret` output, exactly); **fee child 153 vB**
+(measured); solo compaction 112 vB. All corrected figures from the economics review adopted (the draft's
+58-vB batched claim and 0.04 vB/transfer are **rejected**; no output netting exists).
 
 **7.1 Per coin** (the Baseline column is the pre-TES-R design of §2–§3)
 | | Baseline (pre-TES-R) | TES-R (shipped) |
 |---|---|---|
 | Idle coin | 5,840 vB/yr | **0 vB/yr** |
 | Active, 10 tx/day, default depth-3 policy | 5,840 vB/yr (rent dominates) | 3,650 hops/yr ÷ ~2,300/compaction ≈ 1.6 × 112 ≈ **~180 vB/yr** (≈0.05 vB/transfer) |
-| Active, no-compaction policy | n/a | **0 vB/yr** on-chain; +~248 vB contingent exit weight per 576 hops (~0.43 vB/hop, paid only if exiting unilaterally) |
+| Active, no-compaction policy | n/a | **0 vB/yr** on-chain; +250 vB contingent exit weight per 576 hops (~0.43 vB/hop, paid only if exiting unilaterally) |
 
 **7.2 System, 1M-vB blocks, 52,560 blocks/yr, 10% of coins active at 10 tx/day (aggressive):**
 - **1M coins**: idle 900k → 0; active 100k × ~180 ≈ 18M vB/yr ≈ **342 vB/block ≈ 0.034%** of block
   space (baseline: 111,111 vB/block ≈ 11.1% — a **~320× reduction**). Plus churn: 20%/yr
-  deposit+exit at ~111 + ~372–828 vB adds ~0.2–0.4% — present in every design including Spark.
+  deposit+exit at ~111 + 375–834 vB adds ~0.2–0.4% — present in every design including Spark.
 - **10M coins**: ≈ **0.34%** (+ churn) — vs the baseline's physically impossible 111%.
   **100M coins ≈ 3.4%** — the "hundreds of millions TVL" target is reachable if value concentrates
   realistically.
@@ -738,10 +839,11 @@ batched claim and 0.04 vB/transfer are **rejected**; no output netting exists).
 - Per-transfer fee: carries the amortized compaction share (≈0.05 vB) + committed-fee top-ups +
   renewal (0 vB, 2 co-signs). Users never see or perform a maintenance action.
 - Grief insurance: a small per-transfer tower-insurance component funds de-trigger re-anchors
-  (~111 vB each, damage:attacker-cost ≈ 0.4).
+  (125 vB each; and it must be priced as insurance against a **free** attack, not against one that
+  loses money — §5.8).
 
 **7.4 Tower economics**: monitoring is cheap and delegable (above); the priced item is contingent
-defense capital (R-1), bounded per coin (≤ 3 × 152 vB × spike rate) and prefunded via the bond. A
+defense capital (R-1), bounded per coin (≤ 3 × 153 vB × spike rate) and prefunded via the bond. A
 tower's worst action remains harmless (everything it holds pays only the owner).
 
 ---
@@ -780,11 +882,20 @@ of the avoided baseline rent.
 Salvaged ideas: P2A-on-everything, tower-executed maintenance (made off-chain), conveyed-locktimes
 (moot for laddered coins — they have no calendar deadlines to convey. **[Shipped correction]** audit
 [17] therefore does *not* close by deletion: it survives on the un-laddered shape, absorbed by the
-`auto_exit_margin_blocks` default of 288 blocks (≥ k_max·interval + 144), not solved.)
+`auto_exit_margin_blocks` default, not solved. **[Corrected — the 288-block literal this document used
+to quote is superseded.]** 288 = `k_max·interval + 144` spent a **single** confirmation window on a walk
+that lands `3 + 2d` transactions one after another, each of which must confirm before the next tier's
+relative lock even starts counting. The shipped default is DERIVED, not chosen —
+`auto_exit_margin_blocks_for(k_max, interval, d) = k_max·interval + (3 + 2d)·144` — which at
+`k_max = 14`, `d = 1` is **2,120 blocks on mainnet** (interval 100) and **860 on regtest** (interval 10).
+The walk's own `Σ csv` is deliberately NOT in it: `auto_exit_due` takes that head start per coin, off the
+coin's own chain, and subtracts it before comparing.)
 
 ### 8.3 TES as drafted — AMENDED, not adopted verbatim
 Accepted and folded: renewal-auth replay fix; committed-fee restoration; package-aware funded towers;
-latch-gated renewal; depth cap + DoS pricing; nostr-published constants; batch coordinator dropped;
+latch-gated renewal; depth cap + DoS pricing; nostr-published constants (folded as design; the
+publication half is still unbuilt and the receiver-side yardstick supersedes it — §5.2); batch
+coordinator dropped;
 compaction arithmetic corrected (103 not 58 vB); exit-cost disclosure corrected (828 vB / 3 children
 worst); forced rollover before the floor; RGB colored-extension deleted in favor of terminal-freeze;
 mandatory compaction replaced by off-chain rollover; co-op de-trigger added. Rejected findings: the
@@ -800,19 +911,29 @@ any alternative).
 `deposit_protocol_version` / `UTEXO_PROTOCOL_DEFAULT` escape hatch is deleted, and no test pins the old
 lane. The per-test migration record lives in git history and `history/MIGRATION.md`.)*
 
-**Phase 0 — ship, no behavior change** — *DONE*: server: generalized counters {level, m, k, total_sigs},
+**Phase 0 — ship, no behavior change** — *PARTLY DONE (SDK yes, server no — see the outcome)*: server:
+generalized counters {level, m, k, total_sigs},
 `POST /renew/init` (challenge-nonce rail), config + nostr record; SDK: TES-R builders in
 `transaction.rs` (CSV tiers, v3, committed fee + P2A, public H_tag tweaks), the TES-R watch bundle +
 package-aware `watch_pass` with fee wallet, R′ receiver checks behind a version tag in the transfer
 message (receivers handle both ladder types during migration). Enclave: **cryptographically
 unchanged** (blind MuSig2 + one-shot nonces suffice); only the counter state machine needs the
 INV-23/24-grade spec (O-1) — no SGX rebuild required for launch, decoupling from mainnet-audit [13].
-*Outcome*: shipped, with two deltas. (a) The transfer-message version tag that let receivers handle
-both ladder types is gone with the escape hatch — receivers now dispatch on the coin's **shape**
-(laddered vs un-laddered), not on a protocol number. (b) **`watch_pass` is NOT package-aware**: it
-broadcasts tier by tier with `transaction_broadcast_raw` and attaches no P2A fee child, so
-TES-fixable #4 (§5.13) is *specified but unimplemented*. It is adequate at ordinary fee rates
-(committed fees make each tier self-relaying) and is the known gap under a sustained spike (R-4).
+*Outcome*: the SDK half shipped; the SERVER half of this phase did not, and the *DONE* above overstated
+it. Three deltas. (a) The transfer-message version tag that let receivers handle both ladder types is
+gone with the escape hatch — receivers now dispatch on the coin's **shape** (laddered vs un-laddered),
+not on a protocol number. (b) **The server line never landed.** There are zero occurrences of
+`total_sigs` in the tree, no `POST /renew/init` route, no {level, m, k} counter machine, and no column or
+migration for any of them; `/info/config` and the nostr record publish the flat parameters, not the tier
+schedule (§5.2, §5.5). What ships in their place is the lockbox's attested lifetime `sig_count` plus the
+`spend_budget` terminality receipt — enough for the receiver's census, not the counter machine O-1 is
+about. (c) **`watch_pass` package-awareness is no longer the gap it was.** The 1P1C path exists
+(`build_p2a_fee_child` + `core_rpc::submit_package`), both broadcast loops escalate through it when a fee
+source is supplied (`watch_pass_with_bump` / `exit_pass_with_bump`), and it is verified live. The plain
+keyless `watch_pass` still broadcasts tier by tier with `transaction_broadcast_raw` and attaches no
+child — deliberately, per **D31** — and reports a fee-stuck tier as a stated limit. What is still open
+under a sustained spike (R-4) is therefore narrower than "unimplemented": it is that the default tower is
+keyless, and a keyless tower cannot bump at any level of implementation.
 
 **Phase 1 — new deposits are TES-R** — *DONE, and now unconditional*: `claim()` co-signs T for every
 fresh **confirmed root** coin (same B5 onboarding-window semantics as the old tx1 moment). The two
@@ -856,21 +977,26 @@ today:
 | Lightning both directions on the ladder (HODL latch) | **sdk63**, **sdk64**, **sdk67**; sdk65 non-exact; sdk66/sdk68 failure paths; sdk53 latch guard |
 | Concurrency / DAG invariants | chaos22 |
 
-Not covered by any live test, and honestly open: **package-relay tower defense** and P2A fee-child
-attachment under a real fee spike (§5.3 / §5.13 — not merely untested, *unimplemented*: no
-`submitpackage` caller exists), the **colored** de-trigger variant (§5.8), and mass-grief
-prioritization (R-1 / O-6). Those remain design-level claims. The earlier plan's "mixed-protocol
-estates" item is void: no mixed estate can exist.
+Not covered by any test in this suite, and honestly open: **package-relay tower defense** and P2A
+fee-child attachment under a real fee spike. That one is no longer *unimplemented* —
+`mercuryrustlib::core_rpc::submit_package` is the caller, `build_p2a_fee_child` builds and prices the
+child, and both broadcast loops escalate through them (§5.13) — but the only tests that exercise it
+(`live_p2a_package_rescue.rs`, `live_tower_float.rs`) require a Bitcoin Core RPC endpoint and skip
+without one, so nothing here proves it. Also open: the **colored** de-trigger variant (§5.8), the
+funded-tower fee BOND (O-5), and mass-grief prioritization (R-1 / O-6). Those remain design-level
+claims. The earlier plan's "mixed-protocol estates" item is void: no mixed estate can exist.
 
 ---
 
 ## 10. Open problems & future work
 
-- **O-1 (blocking, STILL OPEN)**: formal spec + audit of the enclave counter machine {level, m, k} —
-  receivers verify tree shape against it; a missed interleaving is a double-spend. INV-23/24-grade
-  treatment before mainnet. *Partially de-risked in practice*: the census is exercised adversarially by
-  sdk54/sdk55/sdk58 and across hops by sdk46/47/60/17, and retry-idempotence of the counter by sdk56 —
-  but no formal spec exists, so this stays blocking.
+- **O-1 (blocking, STILL OPEN — and unbuilt, not merely unspecified)**: formal spec + audit of the
+  enclave counter machine {level, m, k}. There is no such machine in the tree today (§5.5): the enclave
+  keeps one lifetime `sig_count` and a `sig_budget`, and every structural expectation is reconstructed
+  receiver-side. A missed interleaving is a double-spend, so this needs INV-23/24-grade treatment before
+  mainnet. *Partially de-risked in practice*: the census is exercised adversarially by sdk54/sdk55/sdk58
+  and across hops by sdk46/47/60/17, and retry-idempotence of the count by sdk56 — but neither the spec
+  nor the machine exists, so this stays blocking.
 - **O-2 (blocking dial)**: δ/δE vs sustained mainnet congestion — quantify head-start survival
   against 2023–24 spike history; δ=36 is the shipped default (`TesrParams::mainnet()`, arithmetic
   pinned by sdk44), with the budget table of §5.2 as the trade space. The congestion study itself is
@@ -892,8 +1018,9 @@ estates" item is void: no mixed estate can exist.
   interactive MuSig2 coordinator stays dead); pre-signed T′ against the template before broadcast is
   mandatory if revived.
 - **O-9 [new, from the migration]**: `child_in_ladder_pay` splits a child through a depth-2 `ancestors`
-  chain (§5.4). The N-hop census generalizes, but the interaction of *depth* with the hard depth cap of
-  §5.11 and with the min_child_value floor (D1) at each level is only exercised to depth 2 (sdk17,
+  chain (§5.4). The N-hop census generalizes, but the interaction of *depth* with the **derived** depth
+  cap of §5.11 (`max_split_depth` — there is no literal to compare against, and the number moves with the
+  network profile) and with the min_child_value floor (D1) at each level is only exercised to depth 2 (sdk17,
   sdk60). Deeper child chains need their own adversarial pass before they are relied on.
 - **Covenant future work**: **CTV** would let one on-chain output commit to the whole T/X/S tree (and
   make factories safe — no signer cohort to collude, deleting B1-F — reviving Grove-style shared-UTXO
@@ -911,8 +1038,14 @@ laddered coin (§5.12), **D4** a unilaterally-exiting child booked `WITHDRAWING`
 draft's claims were over-stated and are corrected in place rather than deleted: the calendar machinery
 (and audit [17]) survives on the un-laddered shape (§5.2, §5.10.3/4, §8.2, §9 Phase 3), the latch is a
 HODL-invoice latch and its piece stays terminalized (§5.12), children are first-class rather than
-exit-only (§5.4), and TES-fixable #4 (package-aware tower broadcast) is **specified but unimplemented**
-(§5.13, §9 Phase 0) — the one place this document describes something that does not yet exist in code.*
+exit-only (§5.4), and TES-fixable #4 (package-aware tower broadcast) **is now built and wired**
+(§5.13, §9 Phase 0) — the owner-funded 1P1C path exists, escalates from both broadcast loops, and is
+verified live against a node; only the funded-tower fee BOND (O-5) is still specification.
+
+The places where this document still describes something that does not exist in code are named where
+they bite, not hidden here: the renewal RAIL of §5.5 steps 1 and 3 (no `/renew/init`, no `total_sigs`,
+no {level, m, k} machine — O-1), and the publication of the tier schedule by the SE (§5.2). Both are
+design that stands; the code is what is behind.*
 
 *Adversarial findings ledger: TES review-1 FATAL#1 defanged (§5.8), FATAL#2 accepted-as-tolerated
 (§5.7); TES review-1 fixables 1–7 folded; TES review-2 corrections (compaction 103 vB, exit 828 vB,

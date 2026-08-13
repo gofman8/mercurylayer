@@ -18,8 +18,14 @@
 > and the exit-cost and carrier-depletion arithmetic — are expected to be **deleted**, not migrated.
 >
 > Reaching one coin type also requires porting `verify_bundle` to wasm/JS and Kotlin: the nodejs and
-> web clients currently *refuse* any laddered coin, so every coin laddered is one they cannot
-> receive. Background: [COLORED-FORWARDING.md](COLORED-FORWARDING.md).
+> web clients refuse any transfer that *declares* a ladder, so every coin laddered is one they cannot
+> receive. Note what that gate keys on — three SENDER-supplied fields (`protocol_version >= 2`,
+> `tesr_ladder`, `child_tesr_bundle`; `transfer_receive.js`) — so it is a refusal of DECLARED
+> ladders, not a structural one, and the flat path it falls through to is the un-laddered
+> `num_sigs == backups.length` check against a coordinator-supplied `interval` (the very input the
+> Rust side stopped trusting — `TesrParams::flat_ladder_params` is compiled in, §2.4). Those clients
+> are therefore not an exempt population; they are the un-defended one until the port lands.
+> Background: [COLORED-FORWARDING.md](COLORED-FORWARDING.md).
 
 Normative specification of the Utexo system built on Mercury Layer statechains with RGB
 assets and a single statechain entity (SE). Requirements are labelled **REQ-n**, invariants
@@ -54,8 +60,10 @@ Normative TES-R references: [PROTOCOL.md](PROTOCOL.md) (tiers, renewal, terminal
 - **Owner** — a wallet holding one key share of a coin. Can spend only with the SE; can always
   exit unilaterally without it.
 - **SE (statechain entity)** — server + lockbox holding the other key share of every coin. Blind
-  MuSig2 co-signer: never sees amounts/addresses. Enforces single-active-state, spend budgets,
-  epochs. Cannot move funds alone; cannot block a unilateral exit.
+  MuSig2 co-signer: never sees amounts/addresses. Enforces single-use, spend budgets, epoch
+  deadlines, the pending-transfer lock (REQ-36) and one signature per server nonce (INV-23) — it
+  does NOT and cannot adjudicate rival states, because it blind-signs 32-byte hashes and never
+  learns what it signed (INV-6). Cannot move funds alone; cannot block a unilateral exit.
 - **SSP** — an application-level party (owner + Lightning node) bridging Mercury↔Lightning. Not
   trusted with custody: swaps are atomic (§8).
 - **Issuer** — any owner that issues an RGB asset. No privileged runtime role beyond holding the
@@ -63,8 +71,12 @@ Normative TES-R references: [PROTOCOL.md](PROTOCOL.md) (tiers, renewal, terminal
 
 **REQ-1** The SE MUST NOT be able to move a coin's funds without the owner's co-signature (2-of-2).
 **REQ-2** An owner MUST be able to exit to L1 without any SE cooperation (pre-signed material only).
-**REQ-3** Trust reduces to: *the SE is honest about refusing conflicting/expired state*, plus a
-liveness duty on the owner (or a delegated tower) that differs by coin shape — an **un-laddered**
+**REQ-3** Trust reduces to: *the SE refuses to co-sign past a terminal budget, a passed epoch, a
+single-use spend or an open transfer, and reports its co-signature count honestly* — and that count
+is no longer taken on trust: it arrives under the enclave's `utexo/sig_count/v2` signature, verified
+against the CHAIN-ANCHORED enclave key the receiver already bound to `tx0`, over a nonce the
+receiver itself chose (§3.3, REQ-38). Plus a liveness duty on the owner (or a delegated tower) that
+differs by coin shape — an **un-laddered**
 coin must be exited before its backup locktime floor / epoch deadline; a **laddered** coin has no
 deadline at all, but its defender must react within the CSV edge once someone publicly broadcasts
 the trigger (§9.5, INV-28). No custody rests on the SE in either case, and nothing ever expires to
@@ -112,7 +124,13 @@ Each coin has ≥1 pre-signed backup tx paying the owner's address, at absolute 
 transfer hands the new owner a backup one `interval` lower.
 
 **INV-5** For any coin, the current owner's latest backup locktime is strictly lower than every
-previous owner's backup locktime (current owner wins the exit race).
+previous owner's backup locktime (current owner wins the exit race), and each hop decrements by
+EXACTLY `interval`. `initlock`/`interval` are **compiled in per network**
+(`TesrParams::flat_ladder_params`: 10 000/100 on mainnet, testnet and signet; 1 000/10 on regtest —
+100 hops of capacity either way). The coordinator's own copy is a cross-check only: `info_config`
+REFUSES the call outright if the two disagree. Taking `interval` from the coordinator would let the
+coordinator define the defence, and deriving it from the conveyed chain is circular — a padded chain
+of uniform `interval/2` hops validates against itself, which is the padding INV-5 exists to stop.
 
 For an **un-laddered** coin this chain IS the exit material, and it is a finite budget (`initlock`
 blocks, spent by each transfer and by wall-clock time). When it nears the floor the coin must be
@@ -133,10 +151,15 @@ For each sub-coin, its structural ancestors (the split/combine parents) are stor
 Above the funding UTXO `F` sits a pre-signed, **un-broadcast** tier tree (PROTOCOL.md §5.2): a
 **trigger** `T` (spends `F`, no timelock, signed once at deposit detection), **extensions**
 `X_0…X_m` (mutually exclusive spends of `T.out[0]`, input nSequence = relative-CSV `E0 − m·δE`), and
-**states** `S_0…S_k` — or split states `SP` (§6.1) — on `X_m.out[0]` (nSequence = CSV `D0 − k·δ`)
-paying the current owner's own seed-derived key. Every tier is nVersion=3 (TRUC), carries a
-committed fee (`committed_fee(rate)` over `TIER_VBYTES = 124`) so it relays standalone, and a
-240-sat P2A anchor for live-rate fee-bumping.
+**states** `S_0…S_k` on `X_m.out[0]` (nSequence = CSV `D0 − k·δ`) paying the current owner's own
+seed-derived key. A split state `SP` (§6.1) is a state tier too, but it is a SPINE tier: it is
+pinned at `SPINE_CSV = 0`, which is how it out-races the `S_0` it replaces over the same output —
+and the builders refuse the split outright unless that `S_0` sits strictly above it (`s0_csv <=
+SPINE_CSV` is a hard refusal, `tesr.rs`). Every tier is nVersion=3 (TRUC), carries a committed fee
+(`committed_fee(rate)` over `TIER_VBYTES = 125` — the MEASURED signed vsize; the earlier 124
+modelled a 64-byte `SIGHASH_DEFAULT` witness, and TES-R signs `SIGHASH_ALL`, so every tier carries
+the explicit 65th byte [D4]) so it relays standalone, and a 240-sat P2A anchor for live-rate
+fee-bumping.
 
 **INV-27 (idle coins never age)** No tier is on-chain, and a BIP-112 relative lock does not tick
 until its parent confirms, so nothing anywhere matures until someone broadcasts `T`. An idle
@@ -144,8 +167,11 @@ laddered coin — and an idle split DAG — therefore has no calendar deadline a
 Verified by `sdk30` (a) (300 blocks mined, exit chain byte-identical, `F` unspent) and `sdk40`.
 **INV-28 (lower CSV wins)** Every transfer and every renewal co-signs a state (extension) at a
 strictly LOWER CSV than the one it supersedes, so the current owner's tier matures first and each
-superseded tier's parent becomes unconfirmable — invalidation at the CONSENSUS level, with the SE's
-single-active-state refusal (INV-6) as a second, independent layer. Verified by `sdk40` PART 2
+superseded tier's parent becomes unconfirmable — invalidation at the CONSENSUS level. There is no
+second, independent SE-side layer under it: a blind co-signer cannot tell a rival state from a
+renewal, and the code does not try (INV-6). What actually stands beside consensus is the receiver's
+census (REQ-38) — every co-signature the SE ever issued must be accounted for, against an
+enclave-ATTESTED count — plus the pending-transfer lock (REQ-36). Verified by `sdk40` PART 2
 (a stale ladder is defeated by a cooperative de-trigger) / PART 3 (a renewed extension supersedes
 the old one at consensus level), `sdk41`, `sdk51`.
 
@@ -181,8 +207,16 @@ SE (owner-encrypted); the SE never deserializes `TransferMsg`.
 (ERR-1).
 **REQ-6** `sign/first` MUST reject if `epoch_deadline` is set and the SE clock ≥ it (ERR-2).
 **REQ-7** `sign/first` MUST reject if `sig_budget` is set and finalized signatures ≥ budget (ERR-3).
-**INV-6** The SE co-signs at most one *chain* of spends per coin (no second conflicting first-round
-nonce is issued for a coin whose challenge is already set) — the single-active-state rule.
+**INV-6 (there is no single-active-state rule)** The SE does NOT refuse a second, conflicting state
+for a coin that is within its budget, epoch and transfer lock: `sign/first` re-serves a pending
+nonce while its challenge is NULL and otherwise issues a FRESH one, gated only by REQ-5/6/7 and
+REQ-36 (`server/src/endpoints/sign.rs`). It could not do otherwise — it blind-signs a 32-byte
+sighash and never learns that a tier is a tier (§3.2), so "conflicting" is not a predicate it can
+evaluate. What IS enforced per coin is one signature per server nonce (INV-23, a key-leak defence,
+not a rival defence), serialisation of concurrent `sign/first` calls, and the terminality gates
+above. Rival prevention lives at consensus (INV-28) and in the receiver's census (REQ-38). Any
+document that cites an SE single-active-state refusal as a second independent layer is describing a
+mechanism this system does not have.
 **REQ-36 (pending-transfer lock)** While a transfer of a coin is OPEN — conveyed, not yet completed
 by the receiver, not yet expired at `batch_timeout` — `sign/first` and `sign/second` MUST refuse
 every co-signature for that coin, and `/transfer/sender` MUST refuse to re-address an open transfer
@@ -208,8 +242,19 @@ and each one increments the public `num_sigs` the receiver's census reads (REQ-3
 - `POST /transfer/receiver` — rotates the SE key share to the new owner; **REQ-9** after this the
   previous owner's share MUST be unusable.
 - `POST /transfer/unlock` — releases a batch-locked coin (owner or SE side).
-- `GET /info/statechain/<statechain_id>` → `{num_sigs, aggregate_pubkey, …}` — the public
-  co-signature counter every receiver's census (REQ-38) is checked against.
+- `GET /info/statechain/<statechain_id>?attestation_nonce=<32B hex>` → `{num_sigs,
+  aggregate_pubkey, sig_budget, has_sig_budget, sig_count_attestation,
+  sig_count_attestation_pubkey, enclave_public_key, …}` — the counter every receiver's census
+  (REQ-38) is checked against. It is **attested, not asserted**: the count AND the budget travel in
+  one enclave signature over `sha256("utexo/sig_count/v2" ‖ statechain_id ‖ u32_be(num_sigs) ‖
+  u8(has_budget) ‖ u32_be(budget) ‖ nonce32)`, verified against the chain-anchored
+  `enclave_public_key` the receiver already bound to `tx0` — never against the served
+  `attestation_pubkey`, which the coordinator chooses — and over a nonce the CALLER generated, so a
+  genuine older attestation cannot be replayed. A missing attestation, a mismatched key, or a
+  `has_sig_budget` the enclave cannot state is REFUSED, not defaulted (`get_statechain_info`,
+  `verify_sig_count_attestation`; there is no phased rollout, D23). Without it a coordinator that
+  under-reported `num_sigs` by `k` would hide `k` co-signed rival states while the exact-equality
+  census still balanced.
 
 ### 3.4 Withdraw
 - `POST /withdraw/...` — SE co-signs a fresh direct spend to an L1 address (cooperative exit).
@@ -285,10 +330,13 @@ funding UTXO `F` are INVARIANT across the rotation — that is what keeps the pr
 valid for the new owner while locking the old one out (`sdk41`).
 
 **Laddered lane (Model A).** A whole-coin handover of a laddered coin additionally conveys the
-ladder (`tesr_ladder`): the sender co-signs the receiver-paying state `S'` one δ BELOW its own
-retained state (so the receiver out-races it, INV-28) and discloses the state it supersedes. The
-receiver runs `verify_bundle` — the census (REQ-38) — and rejects unless the final state pays the
-RECEIVER's own seed-derived key. `sdk47`, `sdk49`.
+ladder (`tesr_ladder`): the sender co-signs the receiver-paying state `S'` one δ BELOW the LOWEST
+rival over the current extension's payload output — its own live state, every disclosed superseded
+state and every still-outstanding conveyed state, not merely its own retained one
+(`next_rival_state_csv`; at the `d_floor` the call REFUSES and the coin must be renewed, rolled over
+or re-anchored) — so the receiver out-races all of them (INV-28), and discloses the state it
+supersedes. The receiver runs `verify_bundle` — the census (REQ-38) — and rejects unless the final
+state pays the RECEIVER's own seed-derived key. `sdk47`, `sdk49`.
 
 `TransferMsg.protocol_version` is a **message-shape tag, not a protocol version of the system**
 (there is one protocol): `0` = branch/backup message (un-laddered), `2` = a conveyed TES-R ladder,
@@ -303,9 +351,15 @@ BOTH shapes); and the co-signature count reconciles — `num_sigs == backups` on
 shape, the census (REQ-38) on the laddered one.
 **REQ-17 (G1)** For a branch-carrying (sub-coin) transfer, the receiver MUST verify every
 `terminal_parents` ancestor is terminal at the SE (`GET spend_budget`, `terminal==true`) and
-reject otherwise (ERR-7).
+reject otherwise (ERR-7). That endpoint is the COORDINATOR's own answer, computed from its Postgres;
+this un-laddered lane still rests on it (`verify_terminal_parents`). On the laddered/child lane it
+has been DEMOTED: terminality is derived from the enclave-signed `(num_sigs, sig_budget)` payload
+(`budget exists ∧ num_sigs ≥ budget`, `attested_terminal`), and the coordinator's answer is kept
+only as a cross-check that REFUSES on disagreement — the two stores hold the same absolute quantity,
+so a mismatch means one was written behind the other's back.
 **REQ-38 (census)** A receiver of a laddered coin, or of a split child (§6.3), MUST reject unless
-the SE's public co-signature count equals EXACTLY the tiers it was shown:
+the SE's ATTESTED co-signature count (§3.3 — an unattested count MUST be refused, since the census
+rests entirely on it) equals EXACTLY the tiers it was shown:
 `se_num_sigs == flat_backups + Σ conveyed tiers + Σ disclosed superseded tiers`, summed over every hop
 of the conveyed ancestor chain (N-hop for a re-transferred child). Each disclosed superseded tier
 MUST be parsed, linked to the ladder, signature-checked, and carry a strictly HIGHER CSV than the
@@ -326,15 +380,17 @@ reverse does **not** hold: since audit [29] the planner also returns `Insufficie
 remainder can only be minted as an unviable piece (no split candidate covers
 `remainder + fee_reserve + min_split_output`, where `min_split_output = 330` (dust) `+` the sub-coin's
 own backup fee at the live rate = `330 + ceil(112 · fee_rate)`; the planner also requires
-`remainder ≥ min_split_output` so the minted piece can fund its own backup — `select.rs:114-121`).
+`remainder ≥ min_split_output` so the minted piece can fund its own backup —
+`select::plan_with_floor`, `transfer::min_split_output`).
 See [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) GRN-REQ-5 (whose fee arithmetic describes the
 un-laddered/colored split; the in-ladder split has its own model, §6.1).
 
 **Executor floor (laddered parent).** `min_split_output` is the PLANNER's floor. When the chosen
 parent is laddered, the in-ladder executor applies a second, strictly larger floor and the larger of
 the two binds: a child funds its OWN extension + state tier before it can clear dust, so
-`min_child_value = 2·(committed_fee(rate) + 240) + 330` — **1306 sat** at the default 2 sat/vB
-committed rate, versus the old 442. Both the piece and the change MUST clear
+`min_child_value = 2·(committed_fee(rate) + 240) + 330` — **1310 sat** at the default 2 sat/vB
+committed rate (`2·(250 + 240) + 330`; the superseded 1306 priced a 124-vB tier, before [D4]
+measured 125), versus the old 442. Both the piece and the change MUST clear
 `max(min_split_output, min_child_value)` or the split is refused UP-FRONT (ERR-16). Up-front is
 load-bearing: `establish_child` runs AFTER the parent's spend budget is consumed and `SP` is
 co-signed, so admitting a child below the floor terminalized the parent and THEN failed, stranding
@@ -347,9 +403,10 @@ it to unilateral-exit-only. (Defect found and fixed during this migration; it al
 
 ### 6.1 In-ladder split (laddered coins)
 A non-exact payment out of a laddered coin is an **in-ladder split** (`in_ladder_pay`; `transfer()`
-routes here automatically). `SP` is a STATE tier spending `X_m.out[0]` — a DESCENDANT of the
-trigger, never a rival for `F` — carrying one resting output per child plus the P2A anchor; each
-child then hosts its own extension + state tiers (`establish_child`). The parent is terminalized
+routes here automatically). `SP` is a SPINE state tier spending `X_m.out[0]` at `SPINE_CSV = 0` — a
+DESCENDANT of the trigger, never a rival for `F`, and strictly below the `S_0` it replaces on that
+output — carrying one resting output per child plus the P2A anchor; each child then hosts its own
+extension + state tiers (`establish_child`). The parent is terminalized
 before the co-sign and its superseded state disclosed for the receiver's census (REQ-38).
 
 **REQ-39 (in-ladder split)** A laddered coin MUST NOT be split as plain BTC: a prior owner's
@@ -542,8 +599,11 @@ exit_deadline_block}`.
 **Scope (stated honestly).** `estimate_exit_cost` measures the UN-LADDERED material only — the
 stored branch plus the latest absolute-locktime backup — and it is also what feeds the calendar
 deadline used by REQ-33. It does NOT yet account for a laddered coin's tier chain, whose cost and
-wait are structural instead: 3 pre-signed tiers ≈ 372 vB (plus up to 3 P2A fee children in a spike)
-and a sequential `E_m + Δ_k` CSV wait, +2 tiers and one more CSV level per depth (PROTOCOL.md §5.9).
+wait are structural instead: 3 pre-signed tiers = 375 vB (3 × `TIER_VBYTES` 125, plus up to 3 P2A
+fee children in a spike) and a sequential `E_m + Δ_k` CSV wait; each split level adds 2 tiers
+(293 vB — an `SP` with two payload outputs, plus an extension) and ONE extension CSV, because the
+`SP` itself is a spine tier at CSV 0 and waits only for its parent to confirm
+(`config::tesr_exit_vbytes` / `tesr_exit_wait_blocks`, PROTOCOL.md §5.9).
 A laddered coin has no calendar deadline at all (INV-27), so `exit_deadline_block` is `None` for it.
 
 ### 9.4 Refresh (cooperative on-chain re-anchor)
@@ -563,7 +623,7 @@ COOPERATIVE (it needs the SE); if the SE is gone the owner exits unilaterally (�
 fee is drawn from the coin (single-input, blind SE), so the user-pays variant yields `amount − fee`.
 `refresh_sponsored` reimburses that fee OFF-CHAIN from a funded sponsor; because the rebate is a
 non-exact payment out of the sponsor's own (laddered) coin it is minted by an in-ladder split, so
-the rebate MUST be sized to `max(fee + dust, min_child_value)` — 1306 sat at 2 sat/vB, not the old
+the rebate MUST be sized to `max(fee + dust, min_child_value)` — 1310 sat at 2 sat/vB, not the old
 442. Sizing it into that dead window made every sponsored refresh fail AFTER the user had already
 paid the on-chain fee (defect found and fixed during this migration). The operator absorbs the
 difference; the user ends ≥ whole. `sdk30` (a)/(c), `sdk38` (a broke sponsor loses boundedly).
@@ -590,9 +650,15 @@ Two passes, one per shape.
 **Calendar pass (un-laddered).** `auto_exit_due(margin)` protects any owned coin with a branch that
 is within `margin` blocks of its deposit-anchored exit-race deadline (§9.3), before an ancestor can
 broadcast a stale backup. The background watcher MUST run it each poll when `SdkConfig::auto_exit`
-is set (default), with `auto_exit_margin_blocks` (default 288 ≈ 2 days — sized to absorb the
-audit-[17] `k·interval` gap plus congestion/reorg slack). A laddered coin has no such deadline and
-is not its subject.
+is set (default), with `auto_exit_margin_blocks` — **derived, never chosen**:
+`k_max·interval + tesr_exit_txs(d)·144`, i.e. **860** blocks on regtest (`14·10 + 5·144`) and
+**2 120** on mainnet (`14·100 + 5·144`), because the exit walk lands `3 + 2d` transactions ONE AFTER
+ANOTHER and each must confirm before the next tier's relative lock starts counting
+(`config::auto_exit_margin_blocks_for`). The superseded literal was 288 (≈ 2 days): one
+confirmation window for a whole walk, against a `k·interval` gap that on mainnet alone is 1 400
+blocks. The walk's own `Σ csv` is deliberately NOT folded in here — `auto_exit_due` takes that head
+start per coin, off the coin's own chain. A laddered coin has no such deadline and is not its
+subject.
 
 **Alarm pass (laddered).** `defend_ladders()` is event-driven, not calendar-driven: it is a no-op
 while the coin sits un-broadcast (nothing ages), and reacts when someone ELSE spends the coin's
@@ -721,8 +787,10 @@ spendable balance would let a right-holder inflate a receiver's balance out of n
   consumed: `in-ladder split refused — the piece falls short` / `… the change falls short` / `… both
   legs fall short`, naming each leg's own floor. The two legs are floored independently
   (`SplitFloors { piece, change }`): a piece always funds two rungs, the change funds whatever
-  `change_leg_role()` says the builders give it — two today, ONE (`min_spine_tip_value`, 820 sat
-  plain / 906 coloured) once CATS change 2 lands.
+  `change_leg_role()` says THAT LANE's builder gives it. At HEAD that is ONE rung
+  (`min_spine_tip_value` = 820 sat plain / `colored_spine_tip_floor` = 906 coloured, at 2 sat/vB) on
+  the plain-root, spine-batch AND coloured lanes — CATS change 2 has landed on all three — and two
+  rungs only on the plain-CHILD lane, where the change is still carved as a `Piece`.
 
 ---
 
@@ -827,16 +895,21 @@ Findings from the adversarial review that are **documented assumptions**, not co
   INV-20's count check defeats omission; full defence against *substitution* of terminal decoys relies
   on the receiver holding the fully-signed branch and being able to exit immediately (win the race for
   the on-chain root). Honest senders always set each node terminal. On the laddered shape this is
-  replaced by the census (REQ-38), which binds to the SE's counter rather than to named ids.
+  replaced by the census (REQ-38), which binds to the SE's enclave-ATTESTED counter (§3.3) rather
+  than to named ids — and the attesting key is held by the same party the receiver is being
+  protected from, so what the attestation closes is the gap between what the enclave signed and what
+  the client reads, not operator collusion.
 - **Batch atomicity.** `transfer_many` / `batch_transfer_tokens` hand off pieces independently; there
   is no all-or-nothing guarantee across recipients. A dropped hand-off leaves that piece reclaimable
   by the sender (the split parent is terminal, so no double-spend), but the batch is not atomic.
   This is the only remaining `transfer_many` caveat: its laddered-parent routing is fixed (REQ-27).
 - **Perpetual watching.** A laddered coin's unconditional no-watch window is gone: nothing ages while
   un-broadcast (INV-27), but once a hostile trigger IS broadcast the defence is a race the owner (or
-  a tower) must enter within the CSV edge. No theft tx can become valid until ≥144 blocks after a
-  PUBLICLY visible on-chain trigger, and nothing ever expires to the operator, but the trade is real
-  and deliberate: alarm-driven perpetual watching in exchange for zero idle rent (PROTOCOL.md §5.7).
+  a tower) must enter within the CSV edge. No theft tx can become valid until at least
+  `e_floor + d_floor` blocks after a PUBLICLY visible on-chain trigger — **288** on the mainnet
+  schedule (144 + 144, `TesrParams::mainnet`), and every rung's confirmation on top — and nothing
+  ever expires to the operator, but the trade is real and deliberate: alarm-driven perpetual
+  watching in exchange for zero idle rent (PROTOCOL.md §5.7).
 - **Amount width.** Coin sats are booked as `u32` (`utxo.value as u32`, `coin_status.rs`); a single
   coin above ~42.9 BTC would truncate. Out of range for the intended per-coin sizes; not guarded.
 - **Mint concurrency.** `mint_tokens` isolates the freshly-minted allocation by a before/after snapshot
@@ -856,10 +929,18 @@ Findings from the adversarial review that are **documented assumptions**, not co
 > pre-payment recipient/amount gate, `ssp.rs`), the split-locktime exit-race inversion (H5 — branch
 > txs are now locktime-free, INV-4), branch-conflict masking (H1 — `reject_non_tree_branch`,
 > `transfer_receiver.rs`), token-carrier destruction (H2 — carrier excluded from plain-BTC split,
-> `transfer.rs`), and the mnemonic-only-backup durability gap (H3 — recovery bundle). Two caveats
-> remain before mainnet: the **SGX lockbox must be rebuilt and redeployed** for the enclave-side
-> single-use secnonce to take effect, and the **full E2E suite (regtest + lockbox + RLN) must be re-run
-> and the result re-reviewed**. See [REVIEW.md](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass).
+> `transfer.rs`), and the mnemonic-only-backup durability gap (H3 — recovery bundle).
+>
+> The caveat this note used to carry — "the **SGX lockbox** must be rebuilt and redeployed for the
+> enclave-side single-use secnonce to take effect" — is closed in code, and was mis-stated besides:
+> the lockbox is a plain C++ service, not an SGX enclave, and it is the lane that runs. It has had
+> the atomic consume since P0-1 (`load_and_consume_secnonce`, `lockbox/src/db_manager.cpp`, called
+> from `server.cpp`), and `9cfe48f` applied the same consume to the SGX enclave lane
+> (`enclave/App/database/db_manager.cpp`, `statechain/sign.cpp`), which had silently never had it.
+> The coordinator-side challenge binding (INV-23 / ERR-12, `server/src/endpoints/sign.rs`) is a
+> third, independent stop and needs no enclave rebuild at all. One caveat remains: the **full E2E
+> suite (regtest + lockbox + RLN) must be re-run and the result re-reviewed**.
+> See [REVIEW.md](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass).
 
 Unit tests live in `clients/libs/rust-sdk/src/*` (`#[cfg(test)]`); E2E dispatch via
 `SDK_E2E`/`RGB_E2E` in `clients/tests/rust`; upstream Mercury suite runs by default.

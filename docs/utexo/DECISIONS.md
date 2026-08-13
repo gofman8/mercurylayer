@@ -1,7 +1,10 @@
 # DECISIONS — the Mercury Utexo specification
 
-Status: open record, started 2026-08-10. One entry per decision from
-[`SPEC-ROADMAP.md`](SPEC-ROADMAP.md) §2. **Four of twenty-one are taken.**
+Status: open record, started 2026-08-10. It began as one entry per decision from
+[`SPEC-ROADMAP.md`](SPEC-ROADMAP.md) §2, of which four were taken on day one (D0, D7, D1, D2 — the
+order is deliberate, not numeric). **All twenty-one roadmap decisions D0–D20 are now taken, and the
+record continues past them to D40**: everything from D21 on is a decision the roadmap did not
+contain, forced by the answers given to the ones that did.
 
 Each entry states what was decided, what it *binds* (the document sections and code sites that may
 no longer drift from it), and what it **pulls into scope** — because three of the first four
@@ -98,7 +101,7 @@ around any of it:**
 
 | Prerequisite | State today |
 |---|---|
-| **Coloured on-chain re-anchor** | **Does not exist.** `refresh` refuses carriers (`clients/libs/rust-sdk/src/refresh.rs:150`) while `build_colored_child_retransfer` errors at the CSV floor telling the user to "re-anchor it" (`clients/libs/rust/src/tesr.rs:6370-6375`) — naming a primitive with no implementation. A coloured coin therefore has **no renewal primitive**: its life is bounded and terminates in a forced exit. This is the largest single item and it is a *design* gap, not a coding one. |
+| ~~**Coloured on-chain re-anchor**~~ | **CLOSED 2026-08-12 (`b79b525`).** Was: `refresh` refused carriers outright while `build_colored_child_retransfer` errored at the CSV floor telling the user to "re-anchor it" — naming a primitive with no implementation, so a coloured coin had **no renewal primitive** and its life was bounded, ending in a forced exit. D29 chose the design (CR-D, a coloured de-trigger) and it is now built: `build_colored_detrigger` + `cosign_colored_detrigger` (`clients/libs/rust/src/tesr.rs`) under `TierRole::Detrigger`, driven by `UtexoWallet::colored_reanchor` (`clients/libs/rust-sdk/src/refresh.rs`). The carrier refusal no longer refuses — it **dispatches**: a coloured carrier is pointed at `colored_reanchor`, a plain one keeps the old refusal, and each arm names why. Both directions are load-bearing: sending a coloured carrier through the RGB-unaware `withdraw` burns the asset, and sending a plain one to CR-D finds no coloured material to build from. |
 | **One payee, one payment, forever** | `CTESR_CARRIER_SEND_DEPTH = 1` (`tokens.rs:131`) plus `refuse_colored_multi_payee` (`tokens.rs:230`, `:3600`) plus the depth-1 refusal in `colored_child_txids` (`tesr.rs:467-471`). Three independent live guards. A carrier pays once, to one payee. |
 | **JS and web clients cannot receive a laddered coin at all** | `clients/libs/nodejs/transfer_receive.js:184`, `clients/libs/web/transfer_receive.js:224` fail closed on any laddered coin. Flipping the default makes **every** RGB coin unreceivable on both clients until `verify_bundle` is ported to wasm/JS and Kotlin. |
 | ~~**rgb-lib is an uncommitted filesystem path**~~ | **CLOSED 2026-08-11 (`6b2e662`).** Was: a relative path, with four symbols mercury called existing in no commit, so HEAD did not build from a clean clone. Now pinned by revision — `rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "38e344e0…" }`, `rev` not `branch` because a branch moves. Verified: `Cargo.lock` records the git source, no `path = "../../../.."` remains in any manifest, and both `-p mercury-rgb` and `-p rust` build against it. |
@@ -165,13 +168,13 @@ here is the answer, and the consequence where it is not obvious.
 | **D3** | Renewal and rollover are **caller-driven primitives**. Normative end-of-life rule: at `d_floor` the coin is terminal — exit unilaterally, or re-anchor cooperatively. Compaction REQUIRED at the depth cap, threshold left to implementations. Publish `V_min(d, r)` as a table over fee rate; name sub-economic finality as a limitation. | This makes `PROTOCOL.md:295` and `:348` **wrong**, not merely undocumented — they claim renewal and rollover run automatically inside `transfer()`, and there are zero call sites. WP7 deletes those claims rather than building to them. |
 | **D5** | Tier rate is a **per-network constant, receiver-enforced by equality**; the tolerance band is retained for flat backups with a normative width; publish both. | **Gated on the P2A spike (WP1).** If a tier cannot be reliably fee-bumped through its anchor above 2 sat/vB, equality is unsound as stated and this decision reopens. Do not draft §12's fee clauses before the spike reports. |
 | **D6** | **Re-derive the exit-cost model from measured vsizes** at depths 0..3 through the production finaliser; change the receiver admission rule; re-pin every test; regenerate all doc figures from the constant. | Sequenced **after D7**. This is not documentation regeneration — `max_exit_txs` is an admission rule, so re-deriving changes *which conveyed bundles a receiver admits*. Budget the test churn. |
-| **D8** | **Enumerated trust assumption**, published alongside R1–R9: `num_sigs`, the `statechain_id ↔ aggregate` binding, mailbox availability and ordering, tip service if proxied. SE-signed counts named as the closure path. | **VERIFIED 2026-08-10 — answer is NO, and it is theft-class.** `sig_count` travels as a bare JSON integer with no signature, MAC, attestation, freshness token or id-echo at any hop. The enclave — the only trusted crypto core — never reads or signs the count; it is pure host/DB state (`lockbox/src/enclave.cpp:139-204`, `db_manager.cpp:465-474`). The coordinator does `response["sig_count"].as_u64().unwrap()` and re-emits it (`server/src/endpoints/transfer_receiver.rs:67`); the client trusts it as the census RHS with no independent cross-check (`clients/libs/rust/src/tesr.rs:9093`). A coordinator that **under-reports** by k hides k co-signed rival states — the exact-equality census balances and the receiver (or an LN SSP paying an irreversible leg) accepts a coin the sender can still reclaim. This is exactly the defect the census exists to stop, resting entirely on coordinator honesty. Closure = SE-attested counts = enclave work = **excluded scope**, so the spec STATES the assumption; it does not close it. Full write-up: [`notes/D8-SIGCOUNT-AUTH.md`](notes/D8-SIGCOUNT-AUTH.md). Runner-up theft-class row: the coordinator-computed `terminal` flag. Also schedules the `aggregate_xonly` backfill for pre-0009 rows, which nothing owned. |
+| **D8** | **Enumerated trust assumption**, published alongside R1–R9: `num_sigs`, the `statechain_id ↔ aggregate` binding, mailbox availability and ordering, tip service if proxied. SE-signed counts named as the closure path. | **VERIFIED 2026-08-10 — answer is NO, and it is theft-class.** `sig_count` travels as a bare JSON integer with no signature, MAC, attestation, freshness token or id-echo at any hop. The enclave — the only trusted crypto core — never reads or signs the count; it is pure host/DB state (`lockbox/src/enclave.cpp:139-204`, `db_manager.cpp:465-474`). The coordinator does `response["sig_count"].as_u64().unwrap()` and re-emits it (`server/src/endpoints/transfer_receiver.rs:67`); the client trusts it as the census RHS with no independent cross-check (`clients/libs/rust/src/tesr.rs:9093`). A coordinator that **under-reports** by k hides k co-signed rival states — the exact-equality census balances and the receiver (or an LN SSP paying an irreversible leg) accepts a coin the sender can still reclaim. This is exactly the defect the census exists to stop, resting entirely on coordinator honesty. **The "excluded scope, so state it rather than close it" verdict recorded here was overtaken the next day and is retained only as the diagnosis that motivated the fix** — D22 lifted the SE scope rule, and the count is now CLOSED on the Rust lane, not merely enumerated: `get_statechain_info` (`clients/libs/rust/src/utils.rs`) sends a per-request random 32-byte nonce and **refuses** any response lacking a `utexo/sig_count/v2` signature over `(statechain_id, num_sigs, sig_budget, nonce)`, verified by `verify_sig_count_attestation` against the **chain-anchored** `enclave_public_key` — not against the served attestation key, which would accept a coordinator signing with a key of its own. `has_sig_budget: None` is refused rather than defaulted. See D22 (D8-CLOSE), D28 (the budget ratchet) and D40.2 (consuming it at the acceptance decision). **Both JS clients still compare `statechainInfo.num_sigs` unattested** (`nodejs/transfer_receive.js`, `web/transfer_receive.js`) — that half is open and is stated as a named limitation by D39.3. Full write-up: [`notes/D8-SIGCOUNT-AUTH.md`](notes/D8-SIGCOUNT-AUTH.md), which carries the same superseded verdict. Runner-up theft-class row: the coordinator-computed `terminal` flag — closed by D40.2. Also schedules the `aggregate_xonly` backfill for pre-0009 rows, which nothing owned. |
 | **D9** | **Freeze the current serde shape** as the normative wire format. Specify field by field; make absent-vs-null explicit and REQUIRED-to-reject wherever absence is currently free; write the ancestry disclosure-completeness rule. | The disclosure rule is not optional detail: a receiver cannot check that an ancestor split state's outputs do not exceed its funding without knowing what it is entitled to be shown. Pairs with WP3b. |
 | **D10** | **Commission the analysis** in week 1 alongside the P2A spike. | Still not answered — deliberately. If the retained checks (INV-5 rejecting duplicates and inversions) already cover what blinding-commitment verification would, accepting it is honest and cheap. If not, it is an excluded-scope collision and must surface in week 1, not week 6. |
 | **D11** | **Fix the encodings before freezing.** Add bech32/checksum and a version tag to the invoice; decide explicitly whether coin type 0 on testnet/signet is deliberate or a defect. | Freezing an unchecksummed, unversioned payment request in a v1 spec cannot be walked back, and field-typo losses in the wild are the predictable result. Also in WP6b: `decode_transfer_address` **panics** on a short-but-valid Bech32m payload. |
 | **D12** | **Retire the absolute deadline once `T` confirms** — and mandate the handoff to `defend_ladders` **in the same clause**, or the walk strands mid-chain. Publish the δ budget. | Mandating a deferral *policy* is implementation; mandating the *bound* is not. Without the published budget an implementer reads `δ = 36` as slack and batches broadcasts into it. |
 | **D13** | **Port the near-deadline defence to plain leaves** and specify it as REQUIRED of a conformant wallet. | **Re-priced by evidence, see below.** No longer the "port of existing, tested code" the roadmap assumed. |
-| **D14** | **Relational margin law**: `sup.csv ≥ live_csv + δ`, receiver-enforced. Schedule-grid membership named as v2, with the `SPINE_CSV` exception recorded as the reason it is not free. | Additive-safe: a later strengthening to the grid form retracts nothing. Implementation is WP3c. |
+| **D14** | **Relational margin law**: `sup.csv ≥ live_csv + δ`, receiver-enforced. Schedule-grid membership named as v2, with the `SPINE_CSV` exception recorded as the reason it is not free. | Additive-safe: a later strengthening to the grid form retracts nothing. **Superseded twice, and both are downstream in this document.** The single-δ form written here is replaced by D38's per-kind law (`δ` for a state, `δE` for an extension), because on regtest `δE = 3` and `δ = 6`, so one δ breaks every honest renewal. And it is no longer scheduled work: it **landed at `77807e1`** — `RivalKind::margin` in `clients/libs/rust/src/tesr.rs` refuses `sup.csv < live.csv + margin`, with the kind taken structurally from the LIVE rival by position parity at all five `LiveRival::read` sites, plus a preset census asserting `d_floor ≥ δ` and `e_floor ≥ δE` and a CI guard (`ci-guards/tests/deny_sender_declared_margin.rs`). |
 | **D15** | **Claim-time finality** with the current windows, plus the outstanding sender obligation. `key_updated`-tied lock lifetime named as v2. | Deciding it is what stops the spec either omitting payment finality entirely or accidentally committing to "payments are reversible for one hour". |
 | **D16** | **MUST-reject unknown-higher `protocol_version`** (fails closed; needs a coordinated flag day) and **4 is the floor** — delete the legacy v3 branch. | (d) is the surviving theft half of audit C-14, and it changes what a child **is** — which is why §Children cannot be written without it. Also in scope: the uniffi FFI silently strips `protocol_version`, `tesr_ladder` and `child_tesr_bundle` in both directions, so "which client profiles are conformant" is part of this decision. |
 | **D17** | **Wall-clock windows published as configuration** with the failure mode named (adequate for a non-normative appendix); enforce `latch_expiry < CLTV deadline` before LN is ever normative. Terminalization carve-out decided separately as WP11 (1–2 days). | See D21 below — D1's answer changed this one's surroundings. |
@@ -362,10 +365,15 @@ Three details worth keeping:
   to disagree, and the one that got it wrong would report an unrelayable tier as relayable — exactly
   the hole being closed. The fee comes from the parsed transaction and the prevout map, never from a
   declared `out_value`, which is attacker-supplied on a conveyed bundle.
-* **The P2A anchor is deliberately NOT counted.** Package relay via `submitpackage` would rescue an
-  underpaying tier, but this tree has no `submitpackage` caller yet (its own open item), so crediting
-  the anchor would credit a rescue nobody can perform. The check is conservative in exactly one
-  direction: it may refuse a bundle a future build could broadcast, which costs a retry, not a coin.
+* **The P2A anchor is deliberately NOT counted.** `LiveRival::read` takes the fee as
+  `value_in − value_out` off the parsed transaction, and the anchor is one of those outputs, so its
+  240 sats are never credited to the tier's rate. The reason given when this landed — "this tree has
+  no `submitpackage` caller yet" — **expired with D31/#123**, which built one (`core_rpc.rs`). The
+  exclusion is still right, for a better reason: a package rescue needs a `BumpCapability` the holder
+  supplies, holding an owner-funded UTXO and a signer, and **a verifier cannot assume the party it is
+  judging has one** — its absence is precisely the keyless case. Crediting the anchor would credit a
+  rescue the bundle's holder may be unable to perform. The check stays conservative in exactly one
+  direction: it may refuse a bundle a funded holder could broadcast, which costs a retry, not a coin.
 * **It is redundant on honest ladders, and that is the point.** The value laws already hold every
   live tier at the committed rate (2 sat/vB, twice the floor), so the whole suite stayed green when
   the check landed — 589 tests. The redundancy is what converts "a future tier without a value law
@@ -500,6 +508,11 @@ relay-aware supersession race (D26, both halves), each with an attack test. **BL
 fee-bump workstream) is now the largest**, and its open question is priced in
 `notes/CPFP-WHO-FUNDS-IT.md`.
 
+*(Both have since closed. W1's open question — who funds the child — was answered by D31, and the
+path was then built: `core_rpc.rs`, `build_p2a_fee_child`, and `watch_pass_with_bump` /
+`exit_pass_with_bump`. CR-D itself landed at `b79b525`. What this decision still leaves open is the
+optimisation question it names above — whether CR-A's one-transaction form is also available.)*
+
 ---
 
 ## D30 — `colored_ladder` stays `false` until CR-D and the client ports land (D1's flip, re-gated)
@@ -512,14 +525,16 @@ own three prerequisites was re-checked today and is still absent:
 
 | prerequisite | state today |
 |---|---|
-| a coloured on-chain re-anchor | **not built.** D29 chose the design (CR-D, a coloured de-trigger); no builder exists. Without it a coloured coin has **no renewal primitive at all** — its life is bounded and ends in a forced exit. |
-| JS and web clients receiving a laddered coin | **still fail closed** (`nodejs/transfer_receive.js`, `web/transfer_receive.js`): neither can run `verify_bundle`, and both refuse rather than fall through to the flat census — which is the correct refusal, and which makes every RGB coin unreceivable on those clients the moment the default flips. |
+| a coloured on-chain re-anchor | ~~not built~~ — **BUILT 2026-08-12 (`b79b525`)**, after this table was written. `build_colored_detrigger` + `cosign_colored_detrigger` implement D29's CR-D, and `colored_reanchor` drives them; the carrier check now dispatches to it instead of refusing. A coloured coin has a renewal primitive. |
+| JS and web clients receiving a laddered coin | **still fail closed** (`nodejs/transfer_receive.js`, `web/transfer_receive.js`): neither can run `verify_bundle`, and both refuse rather than fall through to the flat census. That is still the shipped behaviour and it is still the correct refusal — but it is **no longer a prerequisite**: D33 established there is no external consumer of `clients/libs/web`, and the product SDK (`clients/libs/nodejs-utexo`) is a JSON-lines client over the Rust daemon that was never affected. This row is **satisfied**, per the amendment recorded at the end of D33. |
 | Lightning on the coloured child lane | **refused by name** (`refuse_colored_multi_payee`, and the depth-1 cap). |
 
-**So flipping today would ship coins that cannot be renewed, cannot be received by two of the four
-clients, and cannot use Lightning.** The decision is not reversed — it is sequenced behind CR-D and
-the two client ports, which is where the re-cost in `COLOURED-SPINE-REANCHOR-SCOPE.md` §4 already
-puts them.
+**As written on 2026-08-11 that read: flipping today would ship coins that cannot be renewed, cannot
+be received by two of the four clients, and cannot use Lightning.** Two of those three have since
+gone: CR-D shipped (`b79b525`) and the client row was closed at zero by D33. **What remains of this
+gate is the coloured spine wiring and Lightning on the coloured child lane** (`tokens.rs:3397`,
+"a Lightning-latched colored transfer is not yet wired to the CTES-R child lane"), which D21 decided
+to build. The decision was never reversed — it was sequenced, and the sequence has largely run.
 
 **What DID land in the meantime**, so the gate is smaller than it was: the plain-spine theft that
 BLOCKER 1 named is closed and exercised (D26 both halves), terminality is SE-attested (D28), the flat
@@ -558,15 +573,30 @@ keep.
 
 ### The measured facts this rests on (WP1)
 
-| | measured |
-|---|---|
-| a tier alone, under the relay floor | `min relay fee not met, 200 < 423` — **refused** |
-| the same tier as a 1P1C package | `"package_msg": "success"` |
-| child fee required | **180 330 sats** to rescue a 240-sat anchor |
+**Read the units before quoting these.** The WP1 run was made on an isolated node with the floor
+forced to **3 sat/vB** (`-minrelaytxfee=0.00003`), above the protocol's committed 2.0, on a
+**synthetic 141-vB** transaction — not on a TES-R tier, which is **125 vB** (`lib/src/tesr.rs:76`)
+and pays **250** at the committed rate.
 
-That ratio — roughly **900×** the anchor's value — is why no disinterested third party bumps it. The
-P2A output is anyone-can-spend, but "anyone *can*" is not "someone *will*": there is no fee revenue
-in it for a stranger, so the only parties with an incentive are the owner and a tower the owner pays.
+| | measured, and against what |
+|---|---|
+| a tier alone, under the relay floor | `min relay fee not met, 200 < 423` — **refused**. `423 = 141 vB × 3 sat/vB`; the 200 is 1.42 sat/vB. **A real tier under the same forced floor reads `250 < 375`.** The refusal is the protocol property; these two numbers are the lab's. |
+| the same tier as a 1P1C package | `"package_msg": "success"` — this is the load-bearing result, and it is rate-independent |
+| child fee paid in the run | **180 330 sats**, against a **754-sat requirement** (318 vB package × 3 sat/vB = 954, less the parent's 200). A ~239× overpay chosen by the funding wallet, not a derived cost — Core's own `maxfeerate` guard tripped on it. |
+
+**The "~900×" ratio that used to sit here was wrong, and it is quoted in other documents.** Its
+source (`notes/CPFP-WHO-FUNDS-IT.md`) computes 180,330 / **200** — the ratio to the *parent's fee* —
+and this record re-based it onto the 240-sat **anchor**, which gives 751×, while also borrowing the
+240 from a *different* run (§2's parent carried a placeholder output; the literal `51024e73` anchor
+was exercised separately). And 180,330 is not derivable from the repo's own fee law at any legal
+shape: `TRUC_MAX_CHILD_VSIZE = 1_000` caps the child, so that fee implies >180 sat/vB.
+
+**What the corrected numbers do not change is the decision.** A rescue costs a real outlay by
+whoever performs it, and it returns a 240-sat anchor — `CHILD_CHANGE_DUST = 330`
+(`lib/src/wallet/p2a_fee_child.rs`) means the child's change must clear 330, so recovering the anchor
+never pays for itself. The P2A output is anyone-can-spend, but "anyone *can*" is not "someone
+*will*": there is no fee revenue in it for a stranger, so the only parties with an incentive are the
+owner and a tower the owner pays.
 
 ### Normative consequences (this is the part that changes documents, per D19)
 
@@ -584,10 +614,21 @@ in it for a stranger, so the only parties with an incentive are the owner and a 
 
 ### What this unblocks and what it does not
 
-`#123` (a `submitpackage`-capable broadcast path) now has an answer to *who calls it* — the owner's
-wallet — and the client code is the same either way. It remains blocked on infrastructure: **electrum
-has no `submitpackage`**, so any bumping path needs a Bitcoin Core RPC endpoint the SDK does not have
-(WP1 §4). (A) does not remove that; it settles the design question sitting on top of it.
+`#123` (a `submitpackage`-capable broadcast path) got an answer to *who calls it* — the owner's
+wallet — and **it has since been built.** The infrastructure objection recorded here (**electrum has
+no `submitpackage`**, so any bumping path needs a Bitcoin Core RPC endpoint the SDK does not have,
+WP1 §4) is **no longer true of the tree**: `clients/libs/rust/src/core_rpc.rs` is a minimal Core RPC
+route existing for exactly that one call, `mercurylib::wallet::p2a_fee_child::build_p2a_fee_child`
+builds the 2-input child (input 0 the anchor with an empty witness, input 1 the owner's funding
+UTXO), and `watch_pass_with_bump` / `exit_pass_with_bump` wire it into both broadcast loops.
+
+**The shape it landed in is D31 itself, not a general capability.** `BumpCapability` is an explicit
+optional argument rather than ambient config, so `watch_pass(electrum, bundle)` keeps its signature
+and its keyless meaning, and **its absence is the keyless case** — a tower cannot acquire the ability
+to bump by accident. `SdkConfig::core_rpc` is `None` unless the operator sets it. `FeeBumpConfig`
+holds a fee-wallet key and nothing else, which is exactly the bounded exposure clause below.
+The electrum limitation stands as a *fact*; what is gone is the claim that nothing in this repo can
+call `submitpackage`.
 
 ---
 
@@ -661,11 +702,17 @@ already complete**: every client that can receive a coin either verifies the lad
 and the daemon-backed JS SDK) or refuses it by name.
 
 **D30 is amended accordingly:** of its three prerequisites, the client port is now **satisfied**, and
-the remaining gate on `colored_ladder = true` is the coloured spine + CR-D wiring alone.
+the remaining gate on `colored_ladder = true` is the coloured spine + CR-D wiring alone. *(Update:
+the CR-D half of that landed at `b79b525` on 2026-08-12 — see the D30 table above. The gate is the
+coloured spine wiring, plus the coloured LN lane D21 committed to building.)*
 
 ---
 
 ## Newly open — created by D1
+
+**This section is ANSWERED, and kept because it records what D1 opened.** D21 was decided by the
+owner on 2026-08-11 — **build it** — in the entry above. Read the question below as the statement of
+what D1 created, not as a live item.
 
 **D21 — RGB over Lightning: build it, or exclude it by name?** Under the roadmap's recommended RGB
 scope-out this disappeared at zero cost: coloured LN is already refused by name on the surviving lane
@@ -676,13 +723,14 @@ Not decidable until WP11 closes D17's terminalization carve-out.
 
 ## Re-costing
 
-## Re-costing
-
 The roadmap's 12–16 weeks described a full protocol v1 with RGB and Lightning as non-normative
 appendices and the CATS-B shape frozen as-is. D0, D1 and D2 together describe a larger deliverable.
 The estimate is **withdrawn pending a re-cost**, which needs the coloured-spine and coloured-re-anchor
 items scoped first — those are design work of unknown depth, and a number produced before they are
 scoped would be a guess presented as a plan.
+
+*(Of the two, the coloured re-anchor is no longer unscoped: D29 chose CR-D and it shipped at
+`b79b525`. The coloured spine is still the item the re-cost waits on.)*
 
 ---
 
@@ -893,9 +941,16 @@ spends the same parent outpoint). On regtest `δE = 3` and `δ = 6`, so a single
 honest regtest renewal. Mainnet is immune only because `δ = δE = 36` — the same coincidence that hid
 the structural-kind hole.
 
-*Code consequence.* `LiveRival` carries no kind; the fix adds one at its two construction points and
-threads it to the relational check, with a named error distinct from the existing strict-inequality
-refusal. `DECISIONS.md`'s D14 row (the single-δ form) is superseded by this. Schedule-grid membership
+*Code consequence — **DONE, at `77807e1`**.* Written as future work ("`LiveRival` carries no kind;
+the fix adds one at its two construction points"), it has landed, and larger than scoped: `RivalKind`
+is a field on `LiveRival`, supplied by the caller at **five** `LiveRival::read` sites — never parsed
+out of a conveyed field — from position parity in the tier vector, so an odd index is an extension.
+`RivalKind::margin` returns `δ` or `δE` from the preset, the relational check refuses
+`sup.csv < live.csv + margin` with its own named error ("*a one-block lead is not a margin; it is the
+rounding error a reorg or a slow relay erases*"), the preset census asserts `d_floor ≥ δ` and
+`e_floor ≥ δE` (`clients/libs/rust/src/tesr.rs`), and `ci-guards/tests/deny_sender_declared_margin.rs`
+pins both the structural keying and the census. `DECISIONS.md`'s D14 row (the single-δ form) is
+superseded by this. Schedule-grid membership
 stays v2 — `SPINE_CSV = 0` is outside any grid by construction.
 
 ---
@@ -1013,9 +1068,14 @@ only what was chosen.
 not unbounded — it is **unevaluated**. The function exists, the inputs exist, nobody calls it.
 `min_child_value = (committed_fee(2.0) + P2A)·2 + dust = 1,310` is `V_min` at the hardcoded 2.0
 sat/vB and correct at **no other rate**: `r* = 2.01` for a floor-value piece, and a depth-1
-10,000-sat piece goes under water somewhere between 5 and 10 sat/vB. What is genuinely unbounded is
-**aggregate** exposure: nothing counts how many sub-economic pieces exist, and the marginal cost of
-voiding each further one is zero.
+10,000-sat piece goes under water somewhere between 5 and 10 sat/vB. ~~What is genuinely unbounded is
+**aggregate** exposure.~~ **Corrected by D40.3 below, and the correction matters because "unbounded"
+is the word a reviewer checks.** The aggregate is **constructible and UNEVALUATED, not unbounded**:
+each piece's loss is capped by its own `V < V_min`, so the loss set
+`Σ V_i · 1[V_i < V_min(d_i, r)]` is monotone in `r` and **saturates** at the piece lane's total
+value. What survives from the sentence above is the real defect — nothing counts how many
+sub-economic pieces exist, and the marginal cost of voiding each further one is zero. Also read `r`
+as the **mempool floor sustained across the whole walk**, not a fee estimate.
 
 *What the payee wears.* Anyone holding a piece below `V_min(d, r_live)` loses it entire, to the party
 who split it, with no malice required. On the coloured lane it is worse: the allocation is not

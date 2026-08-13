@@ -42,9 +42,11 @@ marked **UNVERIFIED** and are not smoothed over.
 > **Independently corroborated:** the unbuilt fee-bump remedy was confirmed the same day by a live
 > measurement on Core 30.2.0 (`notes/WP1-TRUC-P2A-SPIKE.md`): TRUC admits **two** in-flight tiers and
 > refuses the third (`TRUC-violation … would have too many ancestors`), package-CPFP rescue **does**
-> work, and **no `submitpackage` caller exists anywhere in this tree** (verified independently:
+> work, and **no `submitpackage` caller existed anywhere in this tree** (verified independently:
 > `grep -rn 'submitpackage|submit_package' --include='*.rs'` = 0 hits; 63 `transaction_broadcast_raw`
-> call sites under `clients/` + `lib/`, all electrum).
+> call sites under `clients/` + `lib/`, all electrum). *That grep no longer returns zero — W1 built
+> `mercuryrustlib::core_rpc::submit_package` and the P2A fee child on top of exactly this
+> measurement.*
 
 Purpose: D1 (`docs/utexo/DECISIONS.md:88-114`) chose CTES-R as the normative RGB lane and flips
 `SdkConfig::colored_ladder` to `true` (`clients/libs/rust-sdk/src/config.rs:283`, `:312`, both
@@ -72,9 +74,16 @@ them and produces the number that un-withdraws it.
 >     transaction that cannot enter a mempool. Recorded as D26 (both halves).
 >
 > The verdict below still names BLOCKER 1 as "the single largest risk"; that sentence is now
-> historical. **BLOCKER 2 (W1, the fee-bump workstream) is unchanged and is now the largest** — its
-> open design question, "who funds the bump", is analysed and priced in
-> `notes/CPFP-WHO-FUNDS-IT.md` and awaits an owner decision.
+> historical.
+>
+> **BLOCKER 2 IS ALSO CLOSED.** It was the largest for one further step — its open design question,
+> "who funds the bump", priced in `notes/CPFP-WHO-FUNDS-IT.md` — and then it was answered and built.
+> **D31** took option (A), owner-funded, with the funded tower as a documented deployment option;
+> all four parts of W1 exist in the tree (`core_rpc::submit_package`,
+> `p2a_fee_child::build_p2a_fee_child`, `tower_float.rs`), and `live_p2a_package_rescue.rs` rescues
+> an under-paying tier through repo code rather than a hand-run `bitcoin-cli` — W1's own acceptance
+> criterion. **Neither of this document's two blockers is open.** What §1.5 and §3's W1 row describe
+> as unbuilt is the state they were written in; the landed state is recorded in §4.1.
 
 **BLOCKER 1 — a theft path in the plain spine, live today (§1.8).** The intermediate spine `SP` — the
 tier this whole document is about — is the single transaction in `verify_child_bundle` with **neither
@@ -108,9 +117,9 @@ than a research problem — far more of it already exists in the tree than D1's 
 requires no `enclave/` or `lockbox/` change. But it buys **less than the original draft claimed**:
 depth grows by exactly +1 per spine batch and never resets (`tesr.rs:4746-4749`, `:5003-5006`), and
 the exit-chain length cap is enforced with a hardcoded two-tier per-level shape
-(`exit_cap_shapes`, `tesr.rs:5080-5089`), so a coloured root carrier gets `max_exit_txs − 4`
-sequential batches — **19 on a mainnet schedule at `lockheight_init = 10 000`** — and is then refused
-while the tip is still whole (§1.6). The re-anchor is therefore not a follow-on to the spine: **it is
+(`exit_cap_shapes`), so a coloured root carrier gets `max_exit_txs − 4`
+sequential batches — **19 on the mainnet schedule at `lockheight_init = 10 000`, which is the
+deployed profile** — and is then refused while the tip is still whole (§1.6). The re-anchor is therefore not a follow-on to the spine: **it is
 what makes the spine's slots renewable**, and it bounds a coloured carrier in payments as well as in
 days.
 
@@ -128,17 +137,22 @@ The shortest honest path: **(i)** fix S0 and wire R0 (the built-but-uncalled cen
 **(ii)** start W1, the package/anchor/fee-child workstream, in parallel; **(iii)** build the spine,
 whose long pole is the receiver's N-deep seal/witness walk — which also gates every re-transfer of
 every piece the spine mints (§1.4); **(iv)** build CR-D, and run G2 only to decide whether CR-A's
-single-transaction form is also available.
+single-transaction form is also available. **Steps (i), (ii) and (iv) are done** (§4.1); the path
+that remains is (iii), and S5 inside it.
 
 **Re-cost (2026-08-11, §4.1): 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two
 tracks — or, in the unit this work is actually done in, ≈6–9 AGENT SESSIONS (§4.2)**, re-costing the roadmap at **12–22 weeks to a full protocol v1 draft, +2–3 to publication**.
 *(The 19–27 / 20–27 figures below were the previous pass; they are superseded by §4.1, which
 re-checked every line against the tree. S0, R0 and W1 are done, and the plain spine landed in the
-meantime.)* The movement from
+meantime. **§4.1's own 11–21 is now a superseded baseline too** — CR-D, P2, P3, P5, G3, G4 and the
+S1–S4b/S7/S9 stretch have since landed and P4 went to zero on D33, leaving ≈6–9 engineer-weeks /
+≈2.5–3.5 agent sessions of open work: S5, S6, S8's remaining half, P1 and G2.)* The movement from
 the original 14–20 is itemised in §4: +3–5 for W1 (previously zero), +0.5–1 for S0 and R0
 (previously not present), +1–2 from re-banding S5, less the re-anchor branch narrowing now that CR-D
-replaces the CR-B/CR-C fork. **The single largest risk is BLOCKER 1** — a live theft path in shipped
-code — followed by W1's unresolved "who funds the bump".
+replaces the CR-B/CR-C fork. ~~**The single largest risk is BLOCKER 1** — a live theft path in
+shipped code — followed by W1's unresolved "who funds the bump".~~ **Both blockers are closed
+(§0.1). The single largest remaining risk is S5**, the receiver's N-deep seal/witness walk, which is
+also a sender-side gate on every re-transfer of every piece the spine mints.
 
 ---
 
@@ -258,7 +272,9 @@ checks it, and the seal rung packs `m` (`:1419-1428`).
 The original draft made two claims here. One is true and is BLOCKER 2. The other was false and is
 withdrawn.
 
-**TRUE, and unbuilt (W1).** Every tier's fee is frozen at `committed_fee_rate = 2.0` for both presets
+**TRUE, and unbuilt AT THE TIME OF WRITING (W1).** The four bullets below are the problem statement
+W1 was built from; each is now closed, and the landed shape is in §4.1's W1 row. They are kept
+because the design still turns on *why* each one was load-bearing. Every tier's fee is frozen at `committed_fee_rate = 2.0` for both presets
 (`lib/src/tesr.rs:210`, `:215`), baked in at signing. Above 2 sat/vB a tier does not relay standalone
 (`lib/src/tesr.rs:85-88`), leaving the P2A anchor as the only remedy — and **the remedy has no
 implementation anywhere in this tree**:
@@ -293,16 +309,19 @@ valid, so no long vulnerable chains"* is **false for exactly the spine**, and `D
 already records that §6 must be rewritten.
 
 Consequence for costing: a coloured spine exit is executable at ≤ 2 sat/vB and **not executable above
-it**, today — and it stays that way until W1 is built. W1 does not gate the spine's *design*; it
-gates the published exit-cost headline and the product claim that every coin stays unilaterally
-exitable.
+it** on the tier alone — the rescue is the P2A package, not the tier. W1 never gated the spine's
+*design*; it gated the published exit-cost headline and the product claim that every coin stays
+unilaterally exitable. **W1 has since shipped**, so the rescue path exists in repo code and the
+headline is writable — bounded by what D31 actually promises: the owner funds the bump, a keyless
+tower cannot, and during a fee spike the defence is the owner being online.
 
 The coloured economics are already thin, which is why this matters rather than being an edge case. A
 coloured leaf walking its own two rungs loses 1 152 sat of a 3 066-sat piece (37.6%), leaving a
 **1 914-sat** owner output; generously accounted (leaf's own two rungs only, ~152 vB v3 CPFP child
 per `SUBECONOMIC-FINALITY.md:55-58`), the external-sats break-even for exiting it is ≈ **3.3
-sat/vB**. **UNVERIFIED**: that 152 vB is a cited figure, not a measurement — no anchor spender exists,
-so no measured number exists.
+sat/vB**. **STILL UNVERIFIED, but now measurable**: that 152 vB is a cited figure, not a
+measurement. It was unmeasurable when written because no anchor spender existed; W1 has since built
+one, and `p2a_fee_child::estimate_child_vsize` is the function that should replace the citation.
 
 ### 1.6 Numbers
 
@@ -320,35 +339,49 @@ through the production finaliser (`rgb.rs:910-926`). `colored_tier_vbytes(n) = 1
 * **Depth cap — and it binds, which the original draft's §1.7 denied.** A spine level costs one
   block of latency and a whole transaction, so the *latency* rule never refuses it; the **length**
   cap does. `enforce_exit_chain_length` measures with `exit_cap_shapes`, whose `per_level` is
-  hardcoded `SplitLevelShape::TwoTier` (`tesr.rs:5080-5089`) — so `max_exit_txs` is computed as if
+  hardcoded `SplitLevelShape::TwoTier` — so `max_exit_txs` is computed as if
   every level were two-tier even when the chain is all spine. A spine leaf's real chain is `4 + d`
   transactions, hence **`d ≤ max_exit_txs − 4`**.
   * Mainnet at `lockheight_init = 10 000`: `base_wait = 1+721+1+721+1441 = 2 885`; `TwoTier` is
-    `[ext_csv(0), SPINE_CSV]` = `[720, 0]` (`tesr.rs:5062-5067`), i.e. 722 blocks; so
+    `[ext_csv(0), SPINE_CSV]` = `[720, 0]` (`SplitLevelShape::csvs`), i.e. 722 blocks; so
     `max_split_depth = 1 + (10 000 − 2 885)/722 = 10` and `max_exit_txs = 23` ⟹ **d ≤ 19**. This
-    reproduces `lib/src/transfer/receiver.rs:890-899` exactly — both of its figures check out.
-  * Deployed profile at `lockheight_init = 1 000` on the regtest schedule: `base_wait = 53`,
+    reproduces `mercurylib::transfer::receiver::max_exit_txs`'s own doc-comment exactly — both of
+    its figures check out — and `honest_spine_batch_pieces_and_tips_are_admitted_up_to_batch_nineteen`
+    pins the consequence: batch 19's piece is the last that fits, batch 20's is 24 transactions and
+    is refused.
+  * Regtest profile at `lockheight_init = 1 000` on the regtest schedule: `base_wait = 53`,
     `TwoTier` = 14, `max_split_depth = 68`, `max_exit_txs = 139` ⟹ **d ≤ 135**, whose TRUC stall
-    alone (~68 blocks) exceeds the entire regtest state schedule (`DECISIONS.md:73-77`).
-  * **But the mainnet epoch is configured nowhere.** The only `lockheight_init` in the tree is
-    **1 000** (`server/Settings.toml:2`), and `network = "testnet"` resolves to the **regtest**
-    `TesrParams` because `for_network` has no testnet arm (`lib/src/tesr.rs:219-225`). On mainnet
-    params at `initlock = 1 000` the base chain alone costs 2 885 blocks — nearly 3× the epoch — so
-    `max_split_depth` returns 0, `max_exit_txs` floors at 3, and **every in-ladder split, spine or
-    not, is refused before depth is even considered**. So "d ≤ 19" presumes an epoch no file sets.
-    **G3/D7 must land before any depth number is publishable**, and G3's gate must assert
-    `initlock ≥ exit_wait_blocks(base)` for each profile, not merely that every network string
-    resolves without a silent default.
-* **Latency — and the repo carries two models that disagree.** `tesr_exit_wait_blocks`
-  (`config.rs:196-207`) has been re-derived for the spine: `per_level = ext_csv(0) + SPINE_CSV =
-  720 + 0`, giving `720d + 2160`. It charges **nothing** for the one block per level the parent needs
-  to confirm. But `exit_wait_blocks` (`lib/src/transfer/receiver.rs:807-810`) sums `csv + 1` per
-  transaction and **does** charge it — and it is the model `max_exit_txs` and the whole depth cap are
-  derived from. The two are off by one block per tier. That is S8's real job: not "re-derive the cost
-  model" but **reconcile two live models that disagree**, one of which is a receiver-side admission
-  rule. `DECISIONS.md:205-211` already records the same class of disagreement for the watchtower
-  head-start. Under TRUC the practical floor is ~1 block per 2 consecutive zero-CSV tiers, or 1 per
-  tier if the anchor slot is spent on a fee bump (§1.5).
+    alone (~68 blocks) exceeds the entire regtest state schedule (`DECISIONS.md:73-77`). **This is
+    no longer the deployed profile** — see the next bullet.
+  * **The mainnet epoch is now configured, and it is the DEPLOYED one.** *(Superseded problem
+    statement, kept because it is what G3/D7 were built to fix: this document was written when the
+    only `lockheight_init` in the tree was **1 000** and `network = "testnet"` fell through to the
+    **regtest** `TesrParams`, so mainnet params at `initlock = 1 000` gave `max_split_depth = 0`,
+    `max_exit_txs = 3`, and every in-ladder split refused before depth was considered — "d ≤ 19"
+    presumed an epoch no file set.)* **Both halves are closed at HEAD.** D25 makes
+    `testnet`/`testnet3`/`testnet4`/`signet` run the **mainnet** schedule
+    (`TesrParams::testnet() = Self::mainnet()`), `for_network_checked` names every network and
+    returns `None` rather than guessing, and `server/Settings.toml` now reads
+    `network = "testnet"` with **`lockheight_init = 10 000`** / `lh_decrement = 100` — matching
+    `flat_ladder_params_const`'s compiled `(10_000, 100)` for that network, which
+    `server_config.rs` refuses to boot against a mismatch of. **So the deployed profile IS the
+    mainnet schedule at a 10 000-block epoch**, and every mainnet figure in this section is the
+    deployed one: `max_split_depth = 10`, `max_exit_txs = 23`, **d ≤ 19** spine batches.
+* **Latency — the two models that disagreed have been reconciled; the half S8 still owns is the
+  spine's transaction COUNT.** *(Before: `tesr_exit_wait_blocks` gave `720d + 2160` and charged
+  **nothing** for the one block per level the parent needs to confirm, while
+  `exit_wait_blocks` (`mercurylib::transfer::receiver`) summed `csv + 1` per transaction and **did**
+  charge it — and it is the model `max_exit_txs` and the whole depth cap derive from. The two were
+  off by one block per tier, one of them a receiver-side admission rule.)* **After:**
+  `tesr_exit_wait_blocks` now returns `csv_total + tesr_exit_txs(d)`, i.e. **`722d + 2163`** on the
+  mainnet schedule, and the code carries the reasoning under an `[S8]` heading — *"a tier's RELATIVE
+  timelock starts counting from its parent's CONFIRMATION"*, and under-counting was *"wrong in the
+  dangerous direction"* because this figure feeds `auto_exit_due`. `tesr_exit_csv_total` was split
+  out so the locks-only question keeps its own name. **What is still open under S8** is the other
+  term: `tesr_exit_txs(d) = 3 + 2d` still charges every level as two-tier, so a spine's real `4 + d`
+  is over-counted in the SDK cost model (next bullet). `DECISIONS.md:205-211` records the same class
+  of disagreement for the watchtower head-start. Under TRUC the practical floor is ~1 block per 2
+  consecutive zero-CSV tiers, or 1 per tier if the anchor slot is spent on a fee bump (§1.5).
 * **Cost model over-counts a spine level in both lanes.** `tesr_exit_txs(d) = 3 + 2d`
   (`config.rs:166`) charges every level as two-tier; the truth for a spine is `4 + d`
   (`CATS-B-PHASE1-PLAN.md:486`). Over-counting refuses depth and inflates the auto-exit margin, so it
@@ -362,8 +395,9 @@ through the production finaliser (`rgb.rs:910-926`). `colored_tier_vbytes(n) = 1
 structural property"*: the change of a coloured split is persisted as a depth-1 **child** and three
 independent guards refuse to carve a second piece out of it (`tesr.rs:571`, `:467-471`,
 `tokens.rs:117-123`). The spine changes what the change **is**: a tip, not a child. So it raises the
-cap on the sender side from **one** payment to **`max_exit_txs − 4`** payments — 19 on a mainnet
-schedule at `lockheight_init = 10 000`, 135 on the regtest schedule actually deployed (§1.6).
+cap on the sender side from **one** payment to **`max_exit_txs − 4`** payments — **19** on the
+mainnet schedule at `lockheight_init = 10 000`, which is the schedule and the epoch the coordinator
+actually ships (135 on regtest, §1.6).
 
 It does **not** lift the cap. The original draft said the spine lifts it "completely — batch 1 and
 batch 1000 built by the same function". That is false: `spine_batch_split` rebuilds `levels` from
@@ -379,8 +413,8 @@ days, which makes CR-C materially worse than §2.3's original framing.
 It does not lift the cap on the receiver side either. After the spine lands, the honest end state of
 a coloured coin is:
 
-* **Sender / root carrier** — up to `max_exit_txs − 4` partial payments (19 mainnet at
-  `initlock = 10 000`, 135 on the deployed regtest schedule), then refused; and bounded independently
+* **Sender / root carrier** — up to `max_exit_txs − 4` partial payments (**19** on the deployed
+  mainnet schedule at `initlock = 10 000`, 135 on regtest), then refused; and bounded independently
   by the absolute epoch deadline (§2.4), whichever binds first.
 * **Received piece (leaf)** — re-transferable **whole** ~36 times via
   `build_colored_child_retransfer` (`tesr.rs:6350`, δ=36 from d0=1440 to d_floor=144), then terminal.
@@ -611,6 +645,9 @@ owner's retained `T'` — but incurs it once rather than across a 15-day walk. T
 and is index-agnostic (`clients/libs/rust/src/coin_status.rs:33-46`). `cosign_detrigger` has **zero
 callers anywhere in the tree**, so the driver is new work either way.
 **Cost: 2.5–3 wk. Strictly dominates CR-B. Removes most of CR-C's motivation.**
+**BUILT (D29):** `build_colored_detrigger` + `cosign_colored_detrigger` in
+`clients/libs/rust/src/tesr.rs`, driven by `UtexoWallet::colored_reanchor`. The estimate above is
+what it was costed at, not what it took; §4.2 records the actual.
 
 **CR-B — exit-and-redeposit. Superseded by CR-D; retained for the record.** Walk the coloured ladder on chain (`T`, `X_m`,
 `S_k`: 3 coloured tiers, 504 vB — this is sdk75, already proven, and `colored_exit_move` already
@@ -625,10 +662,10 @@ in 2 transactions and 0 blocks; there is no axis on which this wins.
 
 **CR-C — build nothing; make the bound explicit and enforced.** Accept that a coloured coin is
 bounded on **two** axes, not one: by the absolute flat-backup horizon `L0 = H_deposit + initlock`
-(1 000 blocks ≈ 6.9 days on the deployed profile, `server/Settings.toml:2-3`) **and by
-`max_exit_txs − 4` spine batches** — 19 on a mainnet schedule at `initlock = 10 000`, 135 on the
-deployed regtest one (§1.6, `tesr.rs:5003-5006`, `:5080-5089`). The original draft priced only the
-first. Build the two things that convert a silent loss into a clean refusal: the sender-side
+(**10 000 blocks ≈ 69.4 days** on the deployed profile — `server/Settings.toml:2-3` reads
+`lockheight_init = 10 000` / `lh_decrement = 100` against `network = "testnet"`, which D25 runs on
+the mainnet schedule) **and by `max_exit_txs − 4` spine batches** — **19** there, 135 on regtest
+(§1.6, `enforce_exit_chain_length` / `exit_cap_shapes`). The original draft priced only the first. Build the two things that convert a silent loss into a clean refusal: the sender-side
 pre-flight (§3, R1) and a coloured near-deadline force-exit. Write **both** limitations into §10/§12
 rather than around them.
 **Cost: 1.5–2 weeks. Honest and cheap, but with the payment bound now stated it makes D1's "a real
@@ -644,7 +681,7 @@ never touches the flat-backup chain. Three budgets, and renewal refills one:
 |---|---|---|
 | state rungs | `d0=1440, δ=36, d_floor=144` ⟹ 36 hops/epoch | yes |
 | extension rungs | `e0=720, δE=36, m_max=15` ⟹ 15 renewals, then `needs_rollover` — and **coloured rollover does not exist** (`tesr.rs:7033`, `:1351-1362`, `:9172`) | partially, then terminal |
-| **absolute clock** `L_k = H_deposit + initlock − k·interval` (`epoch_deadline_from_flat_backups`, `tesr.rs:5607`) | 1 000 blocks ≈ 6.9 days deployed | **no — renewal cannot reach it at all** |
+| **absolute clock** `L_k = H_deposit + initlock − k·interval` (`epoch_deadline_from_flat_backups`) | **10 000 blocks ≈ 69.4 days** deployed (`server/Settings.toml:2`; the 1 000-block ≈ 6.9-day figure this row used to carry was the regtest epoch, and it is not what ships) | **no — renewal cannot reach it at all** |
 
 Only an on-chain spend of `F` changes an on-chain fact. Nothing calls `renew_colored_ladder`
 automatically — its only non-library caller is
@@ -665,10 +702,17 @@ now normative. The missing sender pre-flight is **lane-independent** — `in_lad
 but the irrecoverability is coloured-only, because `refresh` refuses carriers. Hence R1 runs
 regardless of branch.
 
-One more door that looks closed and is not: `cosign_detrigger` refuses coloured outright
-(`tesr.rs:7376`) and has no callers. **A coloured coin today has no cooperative primitive of any
-kind** — but that refusal is a hard-coded payload vout, not a design limit, and lifting it for the
-coloured lane is the whole of CR-D (§2.3).
+One more door that looked closed and was not: `cosign_detrigger` refuses coloured outright and has
+no callers, so at the time of writing **a coloured coin had no cooperative primitive of any kind**.
+That refusal was a hard-coded payload vout, not a design limit, and lifting it for the coloured lane
+was the whole of CR-D (§2.3). **CR-D has since shipped** (D29): `build_colored_detrigger` and
+`cosign_colored_detrigger` exist in `clients/libs/rust/src/tesr.rs`, and the SDK entry point is
+`UtexoWallet::colored_reanchor` (`clients/libs/rust-sdk/src/refresh.rs`), which broadcasts the
+coin's own trigger if it is not already in a mempool and then the coloured de-trigger. The plain
+`reanchor` path now **dispatches** on colour instead of refusing every carrier it recognises: a
+coloured carrier is told to call `colored_reanchor`, a plain carrier is told CR-D cannot help it.
+So a coloured coin now has exactly one cooperative primitive, and a plain RGB carrier still has
+none.
 
 ---
 
@@ -681,11 +725,11 @@ Gates are observable — a test that goes green, a measured number, a written ve
 
 | # | Item | Gate | Band |
 |---|---|---|---|
-| **S0** | **BLOCKER — the intermediate-`SP` committed-fee law** (§1.8). Add the Σ + payload-count law to the ancestor `state` in `verify_child_bundle`, colour-branched per `tesr.rs:8866-8874`; fix the ancestor EXTENSION's colour-blind Σ law at `:9468` in the same commit | An adversarial test: a co-signed spine segment committing a 1-sat fee is refused **by name**, and `assert_not_an_unrelated_refusal` passes. A second test builds a coloured two-tier ancestor segment that verifies (today that shape is unreachable) | 4–6 d |
-| **R0** | **BLOCKER-adjacent — wire the census attestation** (§5 item 1). `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs:236`) is built and live-verified but has **no client caller**; the census still consumes a bare integer at `tesr.rs:9093`. Call it on the receive/claim path and in `verify_conveyed_child`'s ancestor pass; decide the `Option` policy (**fail-closed for coloured**); add the replay/freshness binding `DECISIONS.md:241` names | A test that a coordinator under-reporting `num_sigs` is refused at claim; a test that a missing attestation is refused when `colored_ladder = true`. **Hard prerequisite of the flag** | 2–4 d |
-| **W1** | **BLOCKER — build the fee-bump remedy** (§1.5). Four parts: (a) a **package-capable node route** — electrum has no `submitpackage`, so this is a new transport (Core RPC or a proxy), not a flag; (b) a **P2A anchor spender** — no builder constructs a `TxIn` on a P2A outpoint today; (c) a **v3 fee child** — `lib/src/wallet/cpfp_tx.rs` is v2 and `input_vout`-pinned (`:66`, `:110`), so a rewrite; (d) an **owner decision on who funds the bump** for a keyless tower, under TRUC's one-child and 1000-vB limits | An under-paying v3 tier is rescued **through this repo's own code path**, on a node with `minrelayfee` above 2 sat/vB — not through a hand-run `bitcoin-cli`. (d) is design, and is the reason the band has a tail | **3–5 wk**, (d) unresolved |
+| **S0** ✅ | **DONE (D26 half 1).** The Σ + payload-count law is live in `verify_conveyed_child`'s ancestor loop and refuses by name — *"ancestor {i} state (the intermediate spine SP): Σ over its payload outputs is …"*. **BLOCKER — the intermediate-`SP` committed-fee law** (§1.8). Add the Σ + payload-count law to the ancestor `state` in `verify_child_bundle`, colour-branched per `tesr.rs:8866-8874`; fix the ancestor EXTENSION's colour-blind Σ law at `:9468` in the same commit | An adversarial test: a co-signed spine segment committing a 1-sat fee is refused **by name**, and `assert_not_an_unrelated_refusal` passes. A second test builds a coloured two-tier ancestor segment that verifies (today that shape is unreachable) | 4–6 d |
+| **R0** ✅ | **DONE (D8-CLOSE).** `verify_sig_count_attestation` now has a client caller outside `lib/` — `clients/libs/rust/src/utils.rs`, whose comment names the attack the two-value disagreement closes — and `deny_unattested_terminality` pins the call site so it cannot be dropped. **BLOCKER-adjacent — wire the census attestation** (§5 item 1). `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs`) was built and live-verified but had **no client caller**; the census still consumes a bare integer at `tesr.rs:9093`. Call it on the receive/claim path and in `verify_conveyed_child`'s ancestor pass; decide the `Option` policy (**fail-closed for coloured**); add the replay/freshness binding `DECISIONS.md:241` names | A test that a coordinator under-reporting `num_sigs` is refused at claim; a test that a missing attestation is refused when `colored_ladder = true`. **Hard prerequisite of the flag** | 2–4 d |
+| **W1** ✅ | **DONE, all four parts** — (a) `mercuryrustlib::core_rpc::submit_package`; (b)+(c) `mercurylib::wallet::p2a_fee_child::build_p2a_fee_child`, a v3 child spending the P2A outpoint; (d) **decided by D31** (owner-funded; the funded tower is a documented option) and built as the tower float rail (`clients/libs/rust/src/tower_float.rs`), with `live_p2a_package_rescue.rs` rescuing an under-paying tier through repo code — W1's own acceptance criterion. Remainder is hardening. **BLOCKER — build the fee-bump remedy** (§1.5). Four parts: (a) a **package-capable node route** — electrum has no `submitpackage`, so this is a new transport (Core RPC or a proxy), not a flag; (b) a **P2A anchor spender** — no builder constructs a `TxIn` on a P2A outpoint today; (c) a **v3 fee child** — `lib/src/wallet/cpfp_tx.rs` is v2 and `input_vout`-pinned (`:66`, `:110`), so a rewrite; (d) an **owner decision on who funds the bump** for a keyless tower, under TRUC's one-child and 1000-vB limits | An under-paying v3 tier is rescued **through this repo's own code path**, on a node with `minrelayfee` above 2 sat/vB — not through a hand-run `bitcoin-cli`. (d) is design, and is the reason the band has a tail | **3–5 wk**, (d) unresolved |
 | **G2** | **RGB rival-colouring spike over `F`** — now an **optimisation** gate, not a product gate. Colour a second transition spending `F` while the ladder's trigger consumes that Opout as Tentative, **in a second process**; mine it; check `select_valid_witness`; validate the new ladder's leaf consignment at a receiver | Pass ⟹ CR-A (1 tx). Fail ⟹ CR-D (2 txs, 0 CSV). Either way Phase 2 ships | 2–3 d |
-| **G3** ✅ | **D7 profile reconciliation** | **DONE.** `for_network_checked` gives every network string an explicit profile with no silent default (D7/D25), and `g3_every_profile_can_finish_its_exit` now asserts the load-bearing half: `initlock ≥ tesr_exit_wait_blocks(profile, 0)` **and** `≥ depth 1`, for all six profiles. Below it, the horizon pre-flight refuses **every** in-ladder split on that profile, permanently and for every user — the state this item says the mainnet schedule was once in. **The deployed depth cap is now MEASURED, and it is not the assumed one: mainnet `initlock = 10 000` admits child depth up to `d = 10`, not the `d ≤ 19` this document guessed** (regtest: 68) | 3–5 d |
+| **G3** ✅ | **D7 profile reconciliation** | **DONE.** `for_network_checked` gives every network string an explicit profile with no silent default (D7/D25), and `g3_every_profile_can_finish_its_exit` now asserts the load-bearing half: `initlock ≥ tesr_exit_wait_blocks(profile, 0)` **and** `≥ depth 1`, for all six profiles. Below it, the horizon pre-flight refuses **every** in-ladder split on that profile, permanently and for every user — the state this item says the mainnet schedule was once in. **Both caps are now MEASURED, and they are two different quantities — an earlier note here reported them as a correction of one by the other, which they are not.** `max_split_depth` on mainnet at `initlock = 10 000` is **10** (regtest: 68) — the deepest TWO-TIER child the latency rule blesses, and exactly the number §1.6 derives. The cap on SPINE batches is the LENGTH cap built from it: `max_exit_txs = 3 + 2·10 = 23`, and a spine leaf's chain is `4 + d`, so **d ≤ 19** stands, pinned by `honest_spine_batch_pieces_and_tips_are_admitted_up_to_batch_nineteen` (*"batch 19 is the last one that fits"*; batch 20's piece is 24 transactions and is refused, while its tip at 23 keeps its exit so the sender is never stranded) | 3–5 d |
 | **G4** ✅ | **Measure the coloured re-anchor / de-trigger vsize** | **DONE, and the answer is better than a new constant: there is no new constant.** `build_colored_detrigger` builds ONE payload output and sizes it with `colored_tier_out_value` = `colored_tier_out_total(.., 1, ..)`, so a de-trigger IS an ordinary one-payload coloured tier and rides the vsize already measured through the production finaliser: **168 vB**. The `112 + 43` estimate was **13 vB short** — at 2 sat/vB it commits 310 sat against a 168-vB transaction, 1.845 sat/vB, under target on the one transaction whose job is to relay when the owner must walk away from a live ladder. Pinned by `the_coloured_detrigger_is_a_measured_one_payload_tier_not_a_112_plus_43_estimate` | 1 d |
 
 **G1 is deleted.** It was scoped as a spike, and the spike ran: `notes/WP1-TRUC-P2A-SPIKE.md`
@@ -704,7 +748,7 @@ written verdict is already in hand; what it revealed is W1.
 | **S5** | **N-deep coloured seal schedule — gates receiver adoption AND every re-transfer of every piece the spine mints.** N-deep `colored_child_txids` / `colored_child_seals`; resolve `consignments.len() == tiers.len()` for intermediate segments; enforce `m = 0` on spine segments. Touched sites include `build_colored_child_retransfer` (`tesr.rs:6363`), which calls `colored_child_seals` and therefore refuses every spine-minted piece until this lands (§1.4) | S4 | A receiver adopts and books a piece at spine depth 2; a depth-2 piece is **re-transferred**; a hand-crafted bundle with a mislabelled segment gets a **named** refusal and `assert_not_an_unrelated_refusal` passes | **2–3 wk** (was 6–9 d; re-banded because the sender-side re-transfer path is inside its blast radius) |
 | **S6** | Crash-recovery replay for a coloured tip leg (`SplitJournalRecord::spine_tip`, `resume_in_ladder_split`) | S4 | A fault-injected crash between co-sign and conveyance resumes; a test asserts no phantom rival is ever co-signed over `SP.out[K]` | 3–5 d, low confidence |
 | **S7** ✅ | Booking / health / watchtower / `auto_exit` head-start over an N-level chain | S5 | **DONE.** The trigger type already existed; the real defect was that `export_watch_bundle` emitted **no leaf entry at all** (a `ctesr-`/spine-tip row is neither `tesr-` nor `branch-`, so every leaf took the flat-deposit `continue` and a delegated tower silently watched none of them). A leaf now arms both predicates, with `head_start` over the **bound** N-level chain via the same `exit_wait_blocks` call `auto_exit_due` uses | 3 d+ |
-| **S8** | **Reconcile two latency models that disagree by +1 block per tier**, and re-derive cost: `tesr_exit_wait_blocks` (`config.rs:196-207`) charges nothing for the per-level parent confirmation while `exit_wait_blocks` (`lib/src/transfer/receiver.rs:807-810`) sums `csv + 1` and is what `max_exit_txs` derives from (§1.6; same disagreement class as `DECISIONS.md:205-211`). Plus `4 + d` for spine levels, 211 vB coloured, floors, and W1's per-level bump confirmation | W1, WP5 | One test derives txs, vBytes **and wait** from measured transactions at depths 0..3 under **both** models and fails if they disagree. Note this moves a receiver-side admission rule (`max_exit_txs`), so budget test churn | 4 d + churn |
+| **S8** ⚠️ **HALF** | **The model reconciliation is DONE; the spine's transaction COUNT is not.** `tesr_exit_wait_blocks` now returns `csv_total + tesr_exit_txs(d)` — it charges the per-level parent confirmation, agrees with `exit_wait_blocks`'s `csv + 1` per tier, and carries the `[S8]` reasoning in place; `tesr_exit_csv_total` splits out the locks-only question. **Still open:** `tesr_exit_txs(d) = 3 + 2d` charges every level as two-tier, so a spine's real `4 + d` is over-counted (§1.6), plus 211 vB coloured, floors, and W1's per-level bump confirmation | W1, WP5 | One test derives txs, vBytes **and wait** from measured transactions at depths 0..3 under **both** models and fails if they disagree. Note this moves a receiver-side admission rule (`max_exit_txs`), so budget test churn | 4 d + churn |
 | **S9** ✅ | Live-stack E2Es: a coloured carrier making two sequential payments; a receiver claiming at depth 2; a crash-recovery replay | S5–S7, **S4b** | Green on the live stack, on the **G3** profile. **All three scenarios covered.** Live on the stack (sdk77, ungated): a coloured carrier making two sequential payments, and a receiver claiming at depth 2 — a 6-tier chain (`T → X_0 → SP_0 → SP_1 → ext_child → state_child`) validating through the intermediate segment. The crash-recovery replay is `s9_colored_batch_replay_tests`: a `Signed` depth-2 batch record rebuilds its payee (depth 2, coloured, with the retired cap disclosed) and its next tip (one cap, its own allocation) from the record ALONE — no RGB engine, no SE — and the two reconstructors refuse each other's legs, so a replay cannot cross them | 5 d+ |
 
 ### Phase 2 — the re-anchor (CR-D is the baseline; G2 decides whether CR-A replaces it)
@@ -725,8 +769,8 @@ written verdict is already in hand; what it revealed is W1.
 | **P1** | WP6(i) receiver-side refusal: a conveyed transfer bearing both a plain ladder and an off-chain-commitment envelope is rejected (today sender-side only, `wallet.rs:866`; `transfer_receiver.rs:885`, `:967` persist `rgb_consignment` with no cross-check) | Adversarial test through `validate_encrypted_message` | 2–3 d |
 | **P2** ✅ **shipped** | Per-output blinding in the rgb-lib fork + rev bump; lift `refuse_colored_multi_payee` | **DONE and CONSUMED.** rgb-lib `ae8439e` adds `AssetColoringInfo::output_blinding` (per-vout, falls back **per output** to `static_blinding`, then random); pushed, and `clients/libs/rust-rgb/Cargo.toml` is bumped `38e344e → ae8439e`. The bridge derives each vout's blinding as `H("utexo/p2/per-output-blinding/v1" ‖ base ‖ vout)` — distinct per output and REPRODUCIBLE across reruns, because `new_random_vout` would separate the legs while destroying the byte-for-byte rebuild the un-broadcast lane depends on. **The lift is deliberately NOT taken:** the refusal named seal privacy, and that gate is now closed, but `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 lists others and one still loses money — the coloured lane conveys serially after the carrier is terminal and journals no `recipient_address`, so a failure at recipient *j* strands *j..K* permanently. The refusal now states THAT, and records that the privacy prerequisite is done so nobody re-solves it | 1–1.5 wk |
 | **P3** ✅ | LN, D21 = build | **DONE.** The CTES-R lane is LN-latchable (latch created on the piece, after the split and before the conveyance; SE hash returned so an invoice can be made); the batch lane refuses a latched send **by name** rather than conveying an unlatched piece into a swap; the latch is journalled into `latch_batch_id` between creating it and conveying it (F7); and **the pre-pay gate proper is built**. It needed NO wire-format change — `child_tesr_bundle` was already conveyed, so the child's `colored_child_txids()` is derivable at the receiver; `PendingTransferInfo::child_witness_txids` now surfaces it and `validate_pending_token_ex` resolves the consignment against it instead of the flat lane's `branch_txs`, which a child does not have. The refusal now fires only when NEITHER chain is present | 1.5–2 wk |
-| **P4** | JS/web/Kotlin. **Smaller than D1's table says on JS, larger on Kotlin.** The *product* SDK (`clients/libs/nodejs-utexo`) is a JSON-lines client over the Rust daemon and is unaffected (`clients/apps/web-wallet/server.js:22`); the fail-closed guards bite only the legacy `clients/libs/nodejs` (consumer: `clients/apps/nodejs/index.js:140`) and `clients/libs/web` (**no in-repo consumer found**). Kotlin's `FFITransferMsg` has no field for laddered material at all and refuses rather than truncates (`lib/src/unifii_interface.rs:55-81`) | Owner decision first: does `clients/libs/web` have an out-of-repo consumer? | 0, 2–3 wk, or unbounded — see §4 |
-| **P5** | Inventory the two capabilities the flip silently removes (coloured multi-carrier combine, coloured leaf consolidation) into D3's `V_min` work | They appear in DECISIONS.md before §10 is drafted | 1 d |
+| **P4** | JS/web/Kotlin. **Smaller than D1's table says on JS, larger on Kotlin.** The *product* SDK (`clients/libs/nodejs-utexo`) is a JSON-lines client over the Rust daemon and is unaffected (`clients/apps/web-wallet/server.js:22`); the fail-closed guards bite only the legacy `clients/libs/nodejs` (consumer: `clients/apps/nodejs/index.js:140`) and `clients/libs/web` (**no in-repo consumer found**). Kotlin's `FFITransferMsg` has no field for laddered material at all and refuses rather than truncates (`lib/src/unifii_interface.rs:55-81`) | **Owner answered — D33 (`DECISIONS.md`): `clients/libs/web` has no external consumer; leave it fail-closed.** The unbounded tail is closed and the item is 0 | **0** (was 0, 2–3 wk, or unbounded) |
+| **P5** ✅ | Inventory the two capabilities the flip silently removes (coloured multi-carrier combine, coloured leaf consolidation) into D3's `V_min` work | **DONE — D32** records both, names `V_min` as what they feed, and notes the migration hatch bounds the damage without restoring either. The gate was "they appear in DECISIONS.md before §10 is drafted"; they do | 1 d |
 
 ---
 
@@ -770,13 +814,19 @@ be resting on scaffolding that landed after this document was written.
 | **R0** census attestation wiring | part of 1–2 wk | **0 — DONE** | `verify_sig_count_attestation` wired both sides, coordinator deployed, verified live at `sig_count=2` (D8-CLOSE) |
 | **W1** fee-bump remedy | **3–5 wk** | **0.5–1 wk** | (a) `core_rpc::submit_package` exists; (b)+(c) `p2a_fee_child` builds the v3 anchor-spending child; (d) **decided** (D31) *and* built — the tower float rail, with its capacity bound measured (`live_tower_float.rs`). A tier under the floor is rescued through repo code, which was W1's own acceptance criterion. Remainder is hardening + an E2E on a raised-floor node |
 | Gates G2/G3/G4 | 0.5–1 wk | 0.5–1 wk | unchanged; G2 is now an optimisation question (D29), not a product selector |
-| **S1–S9** coloured spine | 7–11 wk | **5–8 wk** | **The plain spine landed in the meantime (CATS-B).** `spine_batch_split`, `persist_spine_tip`/`load_spine_tip`, `establish_spine_tip_journalled`, `watch_spine_tip_pass`, `exit_spine_tip_pass`, `spine_segment`, `colored_spine_tip_floor` and a large adversarial test body all exist. The COLOURED half is still gated — `refuse_uncolored_over_colored_tip` is live at `spine_batch_split:4661` and `TierRole::Spine` is unallocated — so S1–S5 stand, but **S6 is materially de-risked**: the journal and replay this document called "the least grounded number" are built and tested on the plain lane |
-| **Phase 2** re-anchor | 3–8 wk | **2.5–3 wk** (CR-D) | D29 selected CR-D; `+3–5` for CR-A only if G2 is pursued and passes. No builder exists yet (`colored_detrigger`: 0 hits) |
+| **S1–S9** coloured spine | 7–11 wk | **5–8 wk** | **The plain spine landed in the meantime (CATS-B).** `spine_batch_split`, `persist_spine_tip`/`load_spine_tip`, `establish_spine_tip_journalled`, `watch_spine_tip_pass`, `exit_spine_tip_pass`, `spine_segment`, `colored_spine_tip_floor` and a large adversarial test body all exist. *(This row used to read "the COLOURED half is still gated — `TierRole::Spine` is unallocated". That is false at HEAD.)* **The coloured half has largely landed too:** `TierRole::Spine => 0x0C` is allocated (S1), the coloured cap builder and journal tip variant exist (S2/S3), and `build_colored_spine_batch` / `cosign_colored_spine_batch` / `colored_spine_batch_pay` ship with a CI guard against uncoloured legs under a coloured `SP` (S4/S4b) — with S7 and S9 marked done in §3. **What remains of the spine is S5, S6 and S8's open half**, i.e. ≈3–4.5 wk on §3's own bands, and **S6 is materially de-risked**: the journal and replay this document called "the least grounded number" are built and tested on the plain lane |
+| **Phase 2** re-anchor | 3–8 wk | **0 — CR-D DONE** | D29 selected CR-D and it has since landed: `build_colored_detrigger` + `cosign_colored_detrigger` (`clients/libs/rust/src/tesr.rs`), driven by `UtexoWallet::colored_reanchor`, with the plain `reanchor` path now dispatching on colour instead of refusing every carrier. *(The "no builder exists — `colored_detrigger`: 0 hits" line this row used to carry was true when §4.1 was written and is false at HEAD.)* `+3–5` for CR-A only if G2 is pursued and passes |
 | Phase 3 P1+P2+P5 | 2–3 wk | 2–3 wk | unchanged, unstarted |
-| Phase 3 P3 (LN) | 0 or 1.5–2 wk | 0 or 1.5–2 wk | **still blocked on D21, which is still not a recorded decision** — it appears in §6 as an open question and nowhere in `DECISIONS.md` |
-| Phase 3 P4 (clients) | 0 / 2–3 wk / unbounded | unchanged | `wasm/Cargo.toml` still depends on `mercurylib` only, while `verify_bundle` lives in `mercuryrustlib` |
+| Phase 3 P3 (LN) | 0 or 1.5–2 wk | **0 — DONE** | **D21 is a recorded decision — "RGB over Lightning: BUILD IT" (`DECISIONS.md`, owner, 2026-08-11).** *(This row previously read "still blocked on D21, which is still not a recorded decision"; that was true when written and is false at HEAD.)* The build followed — see §3's P3 row |
+| Phase 3 P4 (clients) | 0 / 2–3 wk / unbounded | **0 — closed** | **D33: `clients/libs/web` has no external consumer; leave it fail-closed.** The open owner question that made this unbounded is answered. `wasm/Cargo.toml` still depends on `mercurylib` only while `verify_bundle` lives in `mercuryrustlib` — the port is still not takeable, it is simply no longer required |
 
 **Total: 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two tracks.**
+
+⚠️ **That total is already a superseded baseline.** Since §4.1 was written, W1, CR-D, P2, P3, P5,
+G3, G4 and the S1–S4b/S7/S9 stretch of the spine have all landed, and P4 went to zero on D33.
+Summing only the rows still open, on these same bands: **≈6–9 engineer-weeks** — G2 (0.5–1 wk),
+the remaining spine (S5, S6, S8's open half, ≈3–4.5 wk) and P1 (2–3 d). §4.2 restates the same
+remainder in the unit the work is actually done in.
 
 ### What this does to the spec date
 
@@ -792,17 +842,23 @@ overlaps the remaining build instead of queueing behind it.
 **Re-cost: 12–22 weeks to a full protocol v1 draft, +2–3 to publication.**
 
 The remaining gates on the *document* are §5/§6/§10/§11, which need the coloured spine and CR-D — so
-the draft date is now governed by S1–S9 and Phase 2, not by an unresolved design question. The
-largest single item is **S5** (2–3 wk, unchanged: the receiver's N-deep seal walk, which is also a
-sender-side gate). The largest *unbounded* one is **P4**, and it is unbounded on an owner question —
-does `clients/libs/web` have an out-of-repo consumer? — not on engineering.
+the draft date is now governed by S1–S9, not by an unresolved design question. **CR-D has since
+shipped, so Phase 2 is off the critical path entirely**, and the draft date is governed by what is
+left of the spine. The largest single item is **S5** (2–3 wk, unchanged: the receiver's N-deep seal
+walk, which is also a sender-side gate). ~~The largest *unbounded* one is **P4**, and it is
+unbounded on an owner question — does `clients/libs/web` have an out-of-repo consumer?~~ **D33
+answered that: no external consumer, leave it fail-closed. There is no unbounded item left.**
 
 ### The three things that would move this number again
 
 1. **S5 needing the `consignments.len() == tiers.len()` invariant to change shape.** Costed at the
    top of its band already; if it also forces a wire-format revision the band moves.
-2. **P4 turning out to have an out-of-repo web consumer.** Owner question, one answer, unbounded tail.
-3. **D21.** Until it is recorded, P3 is a 2-week coin-flip sitting in the middle of the estimate.
+2. ~~**P4 turning out to have an out-of-repo web consumer.**~~ **Closed by D33 — there is none.**
+   The unbounded tail this list existed to flag is gone.
+3. ~~**D21.**~~ **Recorded — D21: build it.** P3 is no longer a coin-flip in the middle of the
+   estimate; it is built (§3).
+
+So of the three things that could have moved this number, **two are closed and only S5 remains.**
 
 ### 4.2 RE-ESTIMATE IN AGENT SESSIONS (2026-08-11) — and where the compression stops
 
@@ -823,20 +879,24 @@ ones whose foundations were already in the tree.
 
 | Remaining block | Engineer-weeks | **Agent sessions** | What sets the floor |
 |---|---|---|---|
-| S4 coloured spine batch | 3–5 d | **~0.5** | Pure in-repo code against a landed cap builder |
-| S3 (rides with S4) | 0.5 d | — | One line, gated by its own guard test |
+| S4 / S4b coloured spine batch | 3–5 d | **DONE** | Builders, SDK driver and the uncoloured-legs CI guard all landed |
+| S3 (rode with S4) | 0.5 d | **DONE** | One line, gated by its own guard test |
 | **S5** N-deep seal walk | 2–3 wk | **1–2** | The wire format and an exact-equality census; the item this document says "has the smell" |
 | S6 crash replay | 3–5 d | **~0.5** | Plain-lane journal exists and is tested |
-| S7/S8 booking + latency reconcile | ~1 wk | **~0.5** | Arithmetic and test churn |
-| **S9 live E2Es** | 5 d+ | **1–2** | ⚠ **Does not compress** — bounded by regtest cycles, docker, confirmations |
+| S7 booking | — | **DONE** | The leaf now arms both predicates (§3) |
+| S8 latency reconcile | ~1 wk | **~0.5** | Model halves agree; the open half is the spine's `4 + d` transaction count. Arithmetic and test churn |
+| **S9 live E2Es** | 5 d+ | **DONE** | Green on the live stack (sdk77, ungated) — this was the row that "does not compress", and it is spent |
 | **CR-D** | — | **DONE** | Landed this session |
-| **P2** per-output blinding | 1–1.5 wk | **1** | ⚠ Different repo (`utexo-rgb-lib`), and splits one field doing two jobs |
-| **P3** LN (**D21: build**) | 1.5–2 wk | **1** | SSP pre-pay RGB gate + F7 journal |
+| **P2** per-output blinding | 1–1.5 wk | **DONE** | Fork bumped; the lift deliberately not taken (§3) |
+| **P3** LN (**D21: build**) | 1.5–2 wk | **DONE** | SSP pre-pay RGB gate + F7 journal |
 | **P4** clients (**D33: none**) | — | **0** | Closed at zero |
-| G2/G3/G4 | 0.5–1 wk | **~0.5** | ⚠ Measurement against the live stack |
+| P1 receiver-side WP6(i) refusal | 2–3 d | **~0.5** | Adversarial test through `validate_encrypted_message` |
+| G2 | 2–3 d | **~0.5** | ⚠ Measurement against the live stack. G3/G4 are **DONE** |
 
-**Total: ~6–9 agent sessions**, of which **2–4 are the non-compressing kind** — live-stack E2Es,
-regtest cycles, and the external rgb-lib fork.
+**Total: ~2.5–3.5 agent sessions of work still open** — S5, S6, S8's remaining half, P1 and G2.
+*(The "~6–9 agent sessions" this table originally totalled was the figure before S4/S4b, S7, S9,
+P2, P3, G3 and G4 landed; it is kept as the baseline the compression is measured against.)* The
+non-compressing kind still in front: **G2**, bounded by regtest cycles.
 
 **Spec draft: ~2–4 sessions after the spine lands**, since §5/§10/§11 are the only gated sections and
 §6/§15 became writable when W1 shipped.
@@ -844,7 +904,8 @@ regtest cycles, and the external rgb-lib fork.
 ### What does NOT compress, and why it is worth stating
 
 1. **Live-stack E2Es.** A regtest lifecycle takes the wall-clock it takes; mining blocks and waiting
-   for confirmations is not parallelisable by thinking faster. S9 and G2–G4 are bounded by this.
+   for confirmations is not parallelisable by thinking faster. S9 and G2–G4 were bounded by this;
+   S9, G3 and G4 are spent, and **G2 is the one that remains.**
 2. **The external fork.** P2 lives in `utexo-rgb-lib`, which has its own build, its own tests and a
    rev-bump that has to propagate.
 3. **Owner decisions.** Zero engineering time and unbounded calendar time. D21 and D33 were both
@@ -871,12 +932,15 @@ prevent (`tesr.rs:3134-3146`) — and "only ever after a crash" is precisely whe
 silent-degradation defects live. `resume_in_ladder_split` was not read in full; **3–5 days is the
 least grounded number in this document.**
 
-**W1 — the largest unbanded item in the plan, and it contains an open design question.** Who funds a
-bump, from which UTXO, under TRUC's one-child and 1000-vB limits, and what stops a third party
-pinning an anyone-can-spend anchor, is open design nobody has started (`SPEC-ROADMAP.md:161-175`,
-`notes/WP1-TRUC-P2A-SPIKE.md:109-113`). Parts (a)–(c) are ordinary engineering against named sites;
-(d) may need a protocol change. Treating this as a spike — which the original plan did — is what put
-a zero next to the item §0 calls a blocker.
+**W1 — was the largest unbanded item in the plan, and it contained an open design question. Both
+are closed.** Who funds a bump, from which UTXO, under TRUC's one-child and 1000-vB limits, and what
+stops a third party pinning an anyone-can-spend anchor, was open design nobody had started
+(`SPEC-ROADMAP.md:161-175`, `notes/WP1-TRUC-P2A-SPIKE.md:109-113`). Parts (a)–(c) were ordinary
+engineering against named sites and are built; (d) was answered by **D31** — owner-funded, with the
+funded tower a documented deployment option, and the spec now says plainly that a keyless tower
+cannot bump. **The lesson survives the item:** treating this as a spike — which the original plan
+did — is what put a zero next to the thing §0 calls a blocker, and it is the failure mode to watch
+for on S5.
 
 **G2 — a fail no longer changes the product.** With CR-D on the table a G2 failure costs one extra
 transaction and one confirmation, not 4× bytes and 15 days (CR-B) or a bounded-life coin (CR-C). This
@@ -944,21 +1008,23 @@ path only in which bytes it hashes, and
 Three places where an SE-shaped answer bears on this work. **Both of the first two were stated wrong
 in the original draft and are corrected here.**
 
-1. **The census attestation is BUILT and live-verified — and wired to nothing. This is R0, not an
-   owner decision.** The original draft called it an unbuilt owner decision; both halves were wrong.
+1. **The census attestation is BUILT, live-verified — and now WIRED. This was R0, not an owner
+   decision.** The original draft called it an unbuilt owner decision; both halves were wrong.
    Commit `f7b7aac` ("D8-CLOSE verified END TO END against the running enclave") landed
    `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs:236`), the lockbox signs
    `sha256("utexo/sig_count/v1" ‖ statechain_id ‖ u32_be(num_sigs) ‖ nonce32)`, the coordinator
    forwards `attestation` / `attestation_pubkey` verbatim
    (`server/src/endpoints/transfer_receiver.rs:107-108`, `:128-129`), and
    `lib/tests/live_sig_count_attestation.rs` pins a captured live signature that **verifies at
-   count=2 and fails at count=1**. But `grep -rn verify_sig_count_attestation` finds **no caller
-   outside `lib/`**, both fields are `Option<String>` whose doc-comment explicitly defers the
-   accept/reject policy to *"a verifier"* (`receiver.rs:103-113`), and the census at `tesr.rs:9093`
-   still consumes the bare integer. A coordinator under-reporting by *k* still hides *k* co-signed
-   rival states and the exact-equality census still balances. Since D1 makes every RGB coin depend on
-   this term, the flag must not flip with it unwired. **2–4 days of plumbing, fail-closed for
-   coloured. Hard prerequisite, tracked as R0 in §3.**
+   count=2 and fails at count=1**. The gap this item named was that `grep -rn
+   verify_sig_count_attestation` found **no caller outside `lib/`**, both fields being
+   `Option<String>` whose doc-comment defers the accept/reject policy to *"a verifier"*, while the
+   census still consumed the bare integer — so a coordinator under-reporting by *k* hid *k*
+   co-signed rival states and the exact-equality census still balanced. **That is closed.** The
+   client calls it from `clients/libs/rust/src/utils.rs`, where the comment states the attack the
+   two-value comparison refuses, and `ci-guards/tests/deny_unattested_terminality.rs` pins the call
+   site so a later edit cannot quietly drop it. **Was 2–4 days of plumbing; done, and no longer a
+   prerequisite standing between the flag and the flip.**
 2. **The absolute clock is NOT replaceable by an SE attestation. This was a false lead and is
    withdrawn.** The original draft suggested that resting the census on SE-attested per-slot state
    would stop the absolute clock binding and make CR-A/B/C optional. It would not. The clock is not a
@@ -994,26 +1060,36 @@ in the original draft and are corrected here.**
    The product claim is now stated rather than assumed: the protocol does **not** promise
    spike-time rescue, a keyless tower **cannot** fee-bump, and during a spike the defence is the
    owner being online. Written normatively into `PROTOCOL.md` §5.13 and `TRUST-MODEL.md` B4.
-2. **Confirm CR-D as the Phase-2 baseline.** G2 no longer selects the product (§2.2/§2.3): CR-D
-   builds without it, in 2 transactions and zero CSV wait. The question is only whether to spend the
-   2–3 days on G2 at all, to find out whether CR-A's one-transaction form is additionally available.
-   Recommended: yes, but after CR-D ships, not before it starts.
-3. **Does `clients/libs/web` have an out-of-repo consumer?** No in-repo consumer was found (the
-   `web/` React app's `package.json` carries only react/react-dom/cra-template). If there is none,
-   P4 shrinks to `clients/libs/nodejs` + `clients/apps/nodejs` and drops substantially in priority.
-4. **D21 — RGB over Lightning: build it or exclude it by name?** P3 is 0 or 1.5–2 weeks entirely on
-   this answer.
+2. ~~**Confirm CR-D as the Phase-2 baseline.**~~ **ANSWERED 2026-08-11 — D29**, and built. G2 no
+   longer selects the product (§2.2/§2.3): CR-D builds without it, in 2 transactions and zero CSV
+   wait, and it has since landed (`build_colored_detrigger` / `cosign_colored_detrigger` /
+   `colored_reanchor`). The only question left is whether to spend the 2–3 days on G2 at all, to
+   find out whether CR-A's one-transaction form is *additionally* available. Recommended: yes, and
+   now genuinely optional.
+3. ~~**Does `clients/libs/web` have an out-of-repo consumer?**~~ **ANSWERED 2026-08-11 — D33: no.**
+   Leave it fail-closed. No in-repo consumer was found either (the `web/` React app's
+   `package.json` carries only react/react-dom/cra-template). P4's unbounded tail is closed and the
+   item is costed at zero.
+4. ~~**D21 — RGB over Lightning: build it or exclude it by name?**~~ **ANSWERED 2026-08-11 — D21:
+   BUILD IT**, and P3 has since shipped (§3). The 0-or-2-week coin-flip sitting in the middle of the
+   estimate is resolved.
 5. **Does the coloured leaf get renewal, or is exit-only within one epoch normative?** A received
    coloured piece can never be split, renewed, combined or re-anchored (§1.7). The spine does not fix
    this. Either coloured leaf renewal is built (a separate ~2-week unit) or §10 states the
    limitation.
 6. **Are the two silently-removed capabilities** — coloured multi-carrier combine and coloured leaf
    consolidation (§1.7) — **accepted losses?** They are not in D1's table and D3's `V_min` work will
-   hit them.
-7. **Is a coloured spine's zero-bit concealment an accepted loss, or does P2 move in front of S4?**
-   A depth-`d` payee can derive the sender's change-leg allocation at every level (§1.7). Today's
-   K=1 leak is accepted at `tokens.rs:208-218` for the one-level case only; the spine makes it
-   transitive over the carrier's whole payment history.
+   hit them. **Inventoried by D32**, which records both, names `V_min` as what they feed, and
+   requires them in `DECISIONS.md` before §10 is drafted — so P5's gate is met. The *acceptance*
+   is still an owner call; what is closed is that a reader can no longer discover the losses by
+   accident.
+7. **Is a coloured spine's zero-bit concealment an accepted loss?** A depth-`d` payee can derive the
+   sender's change-leg allocation at every level (§1.7). Today's K=1 leak is accepted at
+   `tokens.rs:208-218` for the one-level case only; the spine makes it transitive over the carrier's
+   whole payment history. The "or does P2 move in front of S4" half is settled by events: **P2
+   shipped** (§3) and the fork now derives a distinct blinding per output. It does not close this
+   question — every per-output blinding is still a pure function of material the payee holds, so
+   derivation, not attack, remains the leak — but the ordering question is gone.
 
 *(The original question 7 — "strike `DECISIONS.md:104`" — is withdrawn: that row was already struck,
 `~~rgb-lib is an uncommitted filesystem path~~ | CLOSED 2026-08-11 (6b2e662)`. The consequence stated
