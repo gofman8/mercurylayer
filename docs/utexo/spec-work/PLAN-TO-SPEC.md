@@ -1,6 +1,6 @@
 # The path to spec-writable
 
-**2026-08-13, HEAD `52daca6` (feat/spark).** The single current plan. It supersedes Part 3 of
+**2026-08-13, HEAD `8a62800` (feat/spark).** The single current plan. It supersedes Part 3 of
 [`OWNER-DECISION-SHEET.md`](OWNER-DECISION-SHEET.md), which was written before D40 was taken and
 before four of its own items landed.
 
@@ -19,9 +19,9 @@ unfinished.
 | — decided (D39 ×4, D40 ×4) | **8** |
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
-| Code items on the critical path | **14**, of which **3 landed today** |
-| Live E2E suite | running; 52/85 pass at time of writing, 2 known failures |
-| Unit + guard suite | green (367 + 150 + 40) |
+| Code items on the critical path | **14**, of which **A.1, A.2, A.5 have landed** (plus 4 defects found by running things) |
+| Live E2E suite | **complete: 81/85**, and on a HEAD binary SDK80 + RGB8 also pass → **83/85 equivalent**. Two remain: SDK22 (coin selection, item below) and SDK29 (blocked on decision 8) |
+| Unit + guard suite | green — **711 tests, 0 failures** |
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature
@@ -78,11 +78,11 @@ they land.
 | | Item | State |
 |---|---|---|
 | A.1 | Consume the attested budget; demote the coordinator's answer to a refusing cross-check | ✅ **landed** `52daca6` |
-| A.2 | Schedule the deadline-safety pass; forced action is **T**, never the flat backup; route carriers to a non-destructive discharge or state normatively that they have none | open — the sharpest hole in decision 4, and blocked by nothing |
+| A.2 | Schedule the deadline-safety pass; forced action is **T**, never the flat backup | ✅ **landed** `9013a2f` — and the doc pass caught the lane gap it left: `deadline_safety_due` excludes carriers on BOTH routes, so a carrier's `min(L_k)` rests on `auto_exit_due` alone. Written into TRUST-MODEL B4 rather than left unstated |
 | A.3 | Extension **grid** law consumer-side in `verify_child_bundle` | open (decision 9) |
 | A.4 | Make the JS/web laddered gate **structural**, not keyed on three sender-declared fields | open (D40.2) — the *cheapest* route by privilege, and it was ranked last |
-| A.5 | Minimum-slack admission margin beside `check_exit_headroom` | open (D40.3) |
-| A.6 | Surface "sever from `F`" — broadcast the pre-signed `T`, 125 vB, no SE | open (D40.1) — the only B1 remedy the adversary cannot decline |
+| A.5 | Minimum-slack admission margin beside `check_exit_headroom` | ✅ **landed** `a0c19fb` |
+| A.6 | Surface "sever from `F`" — broadcast the pre-signed `T`, 125 vB, no SE | **half landed**: it is the automatic fallback inside `deadline_safety_due` (`9013a2f`). The user-facing action, named as B1's remedy, is still open |
 
 ### Tier B
 
@@ -119,7 +119,7 @@ they land.
 
 ## Stage 4 — Parallel, blocking nothing
 
-All ~20 documentation corrections from the decision sheet's Part 4. Citation re-resolution by symbol.
+✅ **Landed** (`c403e13`, `590b21e`, `8a62800`): ~20 corrections across 10 normative documents, an adversarial audit that flagged 7 for rework, 45 rework fixes, and a re-audit that caught the rework RE-OPENING a closed item by scoping a grep to one file. Citation re-resolution by symbol.
 The two fleet queries. The D32 inventory. The three-clocks separation in
 `PARTIAL-PAYMENT-ECONOMICS.md`.
 
