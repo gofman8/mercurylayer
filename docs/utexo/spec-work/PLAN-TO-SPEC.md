@@ -19,9 +19,9 @@ unfinished.
 | — decided (D39 ×4, D40 ×4) | **8** |
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
-| Code items on the critical path | **14** → **11 landed** (all six Tier A + B.1, B.2, B.3, B.4, B.7). B.8 is **proven not buildable as specified** (D41). **B.5 and B.6 are gated on decisions 5 and 10, which are not taken.** |
+| Code items on the critical path | **14** → **13 landed** (all six Tier A + B.1–B.5, B.7). B.8 is **proven not buildable as specified** (D41). B.6 is **demoted to an optimisation** by D45's measurement. |
 | Live E2E suite | **84/86.** SDK22 is FIXED (12 breaches → 0) and `sdk86` is new and green. One remains: SDK29 (blocked on decision 8) |
-| Unit + guard suite | green — **741 tests, 0 failures** |
+| Unit + guard suite | green — **749 tests, 0 failures** |
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature
@@ -108,7 +108,7 @@ they land.
 | B.2 | ~~`deny_unknown_fields`; absence is a typed refusal~~ | ✅ **landed** — `protocol_version` required (its default SELECTED a lane), unknown fields refused |
 | B.3 | ~~Exact-set `protocol_version` dispatch; delete the v3 arm~~ | ✅ **landed** |
 | B.4 | ~~Pin the wire error codes; fix the Kotlin bindings~~ | ✅ **landed** — all three variants pinned, and `TransferCancelledError` added to both Kotlin trees |
-| B.5 | Wire `BumpCapability` through the child/spine lanes and the de-trigger | **UNBLOCKED (D44), priced, not yet landed.** The rate raise was applied as a probe and every floor measured (table in D44); the owner then confirmed the +30% on `TOKEN_PIECE_SATS`/`TOKEN_CARRIER_SATS` that the decision sheet had missed. Patch kept at `scratchpad/D44-rate-raise.patch`. Lands as ONE commit with the wiring and the superseded-de-trigger census term, then a full live suite run. |
+| B.5 | ~~Wire `BumpCapability` through the child/spine lanes and the de-trigger~~ | ✅ **LANDED (D44).** Rate + wiring in one commit; 8 live E2Es green at the new floors. The ROOT lane already escalated; the gap was CHILD and SPINE-TIP, which broadcast raw with NO escalation. `chain_with_prevouts` recovers each tier's prevout by OUTPOINT so those lanes can be priced. **The de-trigger half is deliberately NOT in it** — the census constraint binds the LIVE-RATE de-trigger, which is still unbuilt; the P2A child added here is owner-signed and consumes no slot. |
 | B.6 | Conflict-aware rescue pricing; stop greedily broadcasting the successor | **UNBLOCKED and DEMOTED (D45).** The anchor slot is an auction, measured: it cannot be downgraded and the owner always reclaims by out-bidding. B.6 saves fees in a rare case rather than closing a hole. |
 | B.7 | ~~Claim-path ordering: validate before counting~~ | ✅ **landed** |
 | B.8 | ~~Head anchor on `validate_backup_chain_v2`~~ | **NOT BUILDABLE as specified — see D41.** `h_deposit` is the tip when the backup was built, which precedes `tx0`'s confirmation, so a receiver can derive only an UPPER bound and truncation moves the value DOWN. Needs `h_deposit` in the `utexo/sig_count/v2` attestation. `k` stays unpublished. |
