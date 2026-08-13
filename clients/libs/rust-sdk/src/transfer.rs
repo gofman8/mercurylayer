@@ -1222,6 +1222,34 @@ impl UtexoWallet {
         // before the child is terminalized, or a failed hand-over here is as unrecoverable as one at
         // K = 20.
         let conveyance = vec![(piece_sid.clone(), recipient_address.to_string())];
+        // **[A2 / sdk80] DISARM THIS WALLET'S OWN WATCHTOWER BEFORE THE SE CO-SIGNS.**
+        //
+        // `defend_ladders`' child loop keys L1 on an ALLOWLIST — it broadcasts only for a coin whose
+        // status reads CONFIRMED — and it reads that status FROM THE WALLET DB on every pass. These
+        // in-ladder lanes wrote the status LAST, after every conveyance. So between the SE
+        // co-signing the superseding split state and the booking at the end of this function, a pass
+        // landing in that window read a stale CONFIRMED, was admitted, and broadcast the retained
+        // state over the very outpoint the recipients' new state depends on. **The sender's own
+        // tower destroying the payment the sender just made.**
+        //
+        // `execute_ex`, `child_retransfer` and `cosign_colored_child_retransfer` were given the
+        // durable arm-down when A2 landed; the four in-ladder lanes were not. sdk80 measured the
+        // window OPEN in 1 of 1 samples.
+        //
+        // Hoisted here, ahead of the co-sign, because the co-sign is the first step that can produce
+        // material for anybody else. Deliberately NOT restored on failure: a co-sign that errors is
+        // ambiguous about whether the SE signed, and the safe direction is the recipient's.
+        self.set_coin_status(child_statechain_id, CoinStatus::IN_TRANSFER)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "refusing the in-ladder split of {}: the parent could not be durably marked \
+                     IN_TRANSFER before the co-sign ({e}). Proceeding would leave this wallet's \
+                     watchtower armed with a state that rivals the one the recipients are about to \
+                     hold over the same output. Nothing has been co-signed.",
+                    child_statechain_id
+                )
+            })?;
         let bundles = mercuryrustlib::tesr::child_in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1366,6 +1394,34 @@ impl UtexoWallet {
                 (c.statechain_id.clone().unwrap_or_default(), address.clone())
             })
             .collect();
+        // **[A2 / sdk80] DISARM THIS WALLET'S OWN WATCHTOWER BEFORE THE SE CO-SIGNS.**
+        //
+        // `defend_ladders`' child loop keys L1 on an ALLOWLIST — it broadcasts only for a coin whose
+        // status reads CONFIRMED — and it reads that status FROM THE WALLET DB on every pass. These
+        // in-ladder lanes wrote the status LAST, after every conveyance. So between the SE
+        // co-signing the superseding split state and the booking at the end of this function, a pass
+        // landing in that window read a stale CONFIRMED, was admitted, and broadcast the retained
+        // state over the very outpoint the recipients' new state depends on. **The sender's own
+        // tower destroying the payment the sender just made.**
+        //
+        // `execute_ex`, `child_retransfer` and `cosign_colored_child_retransfer` were given the
+        // durable arm-down when A2 landed; the four in-ladder lanes were not. sdk80 measured the
+        // window OPEN in 1 of 1 samples.
+        //
+        // Hoisted here, ahead of the co-sign, because the co-sign is the first step that can produce
+        // material for anybody else. Deliberately NOT restored on failure: a co-sign that errors is
+        // ambiguous about whether the SE signed, and the safe direction is the recipient's.
+        self.set_coin_status(child_statechain_id, CoinStatus::IN_TRANSFER)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "refusing the in-ladder split of {}: the parent could not be durably marked \
+                     IN_TRANSFER before the co-sign ({e}). Proceeding would leave this wallet's \
+                     watchtower armed with a state that rivals the one the recipients are about to \
+                     hold over the same output. Nothing has been co-signed.",
+                    child_statechain_id
+                )
+            })?;
         let bundles = mercuryrustlib::tesr::child_in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1521,6 +1577,34 @@ impl UtexoWallet {
         };
         // [CATS change 2] The change leg is LAST and is built as a one-cap SPINE TIP — one rung, not
         // two, which is exactly the shape `split_output_floors` just admitted it at.
+        // **[A2 / sdk80] DISARM THIS WALLET'S OWN WATCHTOWER BEFORE THE SE CO-SIGNS.**
+        //
+        // `defend_ladders`' child loop keys L1 on an ALLOWLIST — it broadcasts only for a coin whose
+        // status reads CONFIRMED — and it reads that status FROM THE WALLET DB on every pass. These
+        // in-ladder lanes wrote the status LAST, after every conveyance. So between the SE
+        // co-signing the superseding split state and the booking at the end of this function, a pass
+        // landing in that window read a stale CONFIRMED, was admitted, and broadcast the retained
+        // state over the very outpoint the recipients' new state depends on. **The sender's own
+        // tower destroying the payment the sender just made.**
+        //
+        // `execute_ex`, `child_retransfer` and `cosign_colored_child_retransfer` were given the
+        // durable arm-down when A2 landed; the four in-ladder lanes were not. sdk80 measured the
+        // window OPEN in 1 of 1 samples.
+        //
+        // Hoisted here, ahead of the co-sign, because the co-sign is the first step that can produce
+        // material for anybody else. Deliberately NOT restored on failure: a co-sign that errors is
+        // ambiguous about whether the SE signed, and the safe direction is the recipient's.
+        self.set_coin_status(parent_statechain_id, CoinStatus::IN_TRANSFER)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "refusing the in-ladder split of {}: the parent could not be durably marked \
+                     IN_TRANSFER before the co-sign ({e}). Proceeding would leave this wallet's \
+                     watchtower armed with a state that rivals the one the recipients are about to \
+                     hold over the same output. Nothing has been co-signed.",
+                    parent_statechain_id
+                )
+            })?;
         let split = mercuryrustlib::tesr::in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -1801,6 +1885,34 @@ impl UtexoWallet {
             .collect();
         // [CATS change 2] The change leg is LAST (pushed after every recipient above) and becomes the
         // one-cap spine tip; the N recipients' pieces are unchanged two-tier children.
+        // **[A2 / sdk80] DISARM THIS WALLET'S OWN WATCHTOWER BEFORE THE SE CO-SIGNS.**
+        //
+        // `defend_ladders`' child loop keys L1 on an ALLOWLIST — it broadcasts only for a coin whose
+        // status reads CONFIRMED — and it reads that status FROM THE WALLET DB on every pass. These
+        // in-ladder lanes wrote the status LAST, after every conveyance. So between the SE
+        // co-signing the superseding split state and the booking at the end of this function, a pass
+        // landing in that window read a stale CONFIRMED, was admitted, and broadcast the retained
+        // state over the very outpoint the recipients' new state depends on. **The sender's own
+        // tower destroying the payment the sender just made.**
+        //
+        // `execute_ex`, `child_retransfer` and `cosign_colored_child_retransfer` were given the
+        // durable arm-down when A2 landed; the four in-ladder lanes were not. sdk80 measured the
+        // window OPEN in 1 of 1 samples.
+        //
+        // Hoisted here, ahead of the co-sign, because the co-sign is the first step that can produce
+        // material for anybody else. Deliberately NOT restored on failure: a co-sign that errors is
+        // ambiguous about whether the SE signed, and the safe direction is the recipient's.
+        self.set_coin_status(parent_statechain_id, CoinStatus::IN_TRANSFER)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "refusing the in-ladder split of {}: the parent could not be durably marked \
+                     IN_TRANSFER before the co-sign ({e}). Proceeding would leave this wallet's \
+                     watchtower armed with a state that rivals the one the recipients are about to \
+                     hold over the same output. Nothing has been co-signed.",
+                    parent_statechain_id
+                )
+            })?;
         let split = mercuryrustlib::tesr::in_ladder_split(
             &self.inner.cc,
             &self.inner.config.wallet_name,
