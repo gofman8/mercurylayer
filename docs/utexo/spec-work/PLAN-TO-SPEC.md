@@ -89,18 +89,18 @@ they land.
 | | Item | From |
 |---|---|---|
 | B.1 | ONE shape-aware exit-cost model; every consumer reads it | D38/D6 |
-| B.2 | `deny_unknown_fields` on the three wire structs; no `serde(default)` on wire; absence is a typed refusal | D38/D9 |
-| B.3 | Exact-set `protocol_version` dispatch `{0, 2, 4}`; delete the v3 arm | D38/D16 |
+| B.2 | ~~`deny_unknown_fields`; absence is a typed refusal~~ | ✅ **landed** — `protocol_version` required (its default SELECTED a lane), unknown fields refused |
+| B.3 | ~~Exact-set `protocol_version` dispatch; delete the v3 arm~~ | ✅ **landed** |
 | B.4 | Pin the wire error codes with explicit `serde(rename)`; regenerate the Kotlin bindings | D38/D18 — a Kotlin client cannot deserialize the shipped 410 today |
 | B.5 | Wire `BumpCapability` through the child/spine lanes and the de-trigger | decision 5 |
 | B.6 | Conflict-aware rescue pricing; stop greedily broadcasting the successor | decision 10 |
-| B.7 | Claim-path ordering: validate before counting | decision 7 |
-| B.8 | Head anchor on `validate_backup_chain_v2` (max conveyed nLockTime == `h_deposit + initlock`) | D40.1 — **gates publishing the prior-owner count `k` at all** |
+| B.7 | ~~Claim-path ordering: validate before counting~~ | ✅ **landed** |
+| B.8 | ~~Head anchor on `validate_backup_chain_v2`~~ | **NOT BUILDABLE as specified — see D41.** `h_deposit` is the tip when the backup was built, which precedes `tx0`'s confirmation, so a receiver can derive only an UPPER bound and truncation moves the value DOWN. Needs `h_deposit` in the `utexo/sig_count/v2` attestation. `k` stays unpublished. |
 
 ### Ordering constraints that genuinely bind
 
 - **Stage 0.1 → decision 8 → any coloured-lane prose.** Not negotiable; the decision is unanswerable without the measurement.
-- **B.8 → publishing `k`.** Without the head anchor `k` is forgeable downward, and a safety signal that lies is worse than none.
+- **B.8 → publishing `k`** — and B.8 itself now depends on adding `h_deposit` to the enclave attestation (D41), because no chain fact bounds it from below. `k` stays unpublished; the B1 disclosure does not need it.
 - **Decision 5's live-rate de-trigger must ship with the superseded-de-trigger census term IN THE SAME COMMIT**, or a failed rescue bricks conveyability. This repo has hit that silent-degradation shape three times.
 - **A.2 is blocked by nothing** and is the sharpest open hole in its row.
 - The CO-1 *pinning* chain (confidential `t2` → lockbox host split → pinned SE identity) is **explicitly not in scope** under D40.2, which chose the 1-day fix plus naming the real closure. It is roadmap, not plan.

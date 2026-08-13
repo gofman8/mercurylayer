@@ -1251,3 +1251,39 @@ sat/vB" means a floor *sustained* there across the whole walk, which is a materi
 
 **Decided:** land the items that must exist before their section can be written honestly, then draft.
 Slowest to first prose; fastest to prose that survives review.
+
+## D41 — B.8 (the flat-chain head anchor) is NOT receiver-derivable; `k` stays unpublished
+
+**Investigated 2026-08-13 while executing D40.1's gate. The specified fix cannot be built as
+written, and that is a sharper reason to withhold `k` than "not done yet".**
+
+D40.1 made publishing the prior-owner count `k` conditional on first closing a forgery hole:
+`validate_backup_chain_v2` enforces only *pairwise* decrement, so a sender can truncate the HIGH end
+of the chain, buy one extra co-signature per dropped rung, disclose it in `superseded_states`, and
+leave the census balancing exactly — while a receiver reads a one-element chain as "structurally
+B1-immune". The proposed anchor was: **max conveyed `nLockTime` must equal `h_deposit + initlock`.**
+
+**`h_deposit` is not derivable by a receiver.** The first backup's locktime is
+`block_height + initlock` where `block_height` is the tip **at the moment the deposit backup was
+built** (`lib/src/transaction.rs`, the `qt_backup_tx == 0` arm) — which is *before* `tx0` is funded
+and confirmed. So for a receiver holding `tx0` at confirmation height `H`:
+
+    h_deposit ≤ H   ⟹   max_locktime ≤ H + initlock
+
+That is an **upper** bound. Truncating the head makes `max_locktime` *smaller*, so an upper bound
+cannot detect it. No chain fact forces `h_deposit ≥ anything`: the depositor may wait arbitrarily
+long between opening the address and funding it. The existing `LocktimeTooLow`/`LocktimeTooHigh`
+checks bound the CURRENT owner's rung against the tip, not the head of the chain.
+
+**So the anchor needs `h_deposit` from somewhere, and the only holder is the coordinator** — the
+party the count is meant to inform on. Taking it on the coordinator's word makes `k` forgeable in
+exactly the direction that matters (downward, toward "safe").
+
+**The real path is the attestation rail that already exists.** `h_deposit` is per-coin, immutable
+after deposit, and known inside the enclave's own record; adding it to the `utexo/sig_count/v2`
+payload would make the anchor checkable with no new trust. That is the same rail D40.2 consumes for
+terminality and it is where this belongs — not a second mechanism.
+
+**Until then `k` is NOT published**, per D40.1. The B1 disclosure stands on the T remedy
+(`sever_from_f`) and on the honest statement that the exposure is unbounded, neither of which needs a
+count.
