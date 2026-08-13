@@ -1287,3 +1287,44 @@ terminality and it is where this belongs — not a second mechanism.
 **Until then `k` is NOT published**, per D40.1. The B1 disclosure stands on the T remedy
 (`sever_from_f`) and on the honest statement that the exposure is unbounded, neither of which needs a
 count.
+
+## D42 — What Tier B could not land without an owner call (2026-08-13)
+
+Eleven of the fourteen critical-path code items have landed. Three have not, and the reasons are
+different in kind — worth separating, because "not done" and "cannot be done as specified" and
+"needs a decision" are three different states and only one of them is work.
+
+### B.8 — **cannot be built as specified.** See [D41](#d41).
+
+`h_deposit` is not receiver-derivable, so the head anchor needs the enclave attestation extended. `k`
+stays unpublished; the B1 disclosure does not depend on it.
+
+### B.5 — **needs decision 5**, and not for the plumbing
+
+Threading `BumpCapability` through the child and spine lanes is mechanical. The rest of decision 5's
+recommendation is not: it raises `committed_fee_rate` from **2.0 to 3.0**, which re-prices *every*
+floor in the system and every piece already in circulation. `min_child_value` is
+`(committed_fee(r) + P2A)·2 + dust`; at 2.0 that is 1,310 and at 3.0 it is 1,610, so every existing
+piece between those values becomes un-splittable and the coloured floors move with it.
+
+That is an owner call about user impact, not an engineering choice, and landing the plumbing without
+it would ship half a decision — the half that looks like progress.
+
+**One part of decision 5 must not be split off even if the rest waits:** the live-rate de-trigger has
+to ship in the SAME COMMIT as the superseded-de-trigger census term, or a failed rescue bricks
+conveyability. This repository has hit that silent-degradation shape three times.
+
+### B.6 — **needs decision 10**
+
+Conflict-aware rescue pricing and the greedy-successor fix both change what a wallet broadcasts and
+when. The adversarial pass also corrected the framing: post-D14 **fees cannot buy CSV maturity**, so
+this lane costs latency, not coins — and selling it as closing a theft channel is the overclaim a
+reviewer catches. What it is worth deciding is the pinning sub-clause, alone.
+
+---
+
+**So the honest state of Stage 2 is 11 landed, 1 impossible-as-written, 2 awaiting decisions.** No
+further code on the critical path can be written correctly without an owner answering decisions 5 and
+10 — and decision 8 for the coloured chapter, whose blocking measurement (Stage 0.1) is now DONE and
+came back clean: `sdk75` and `sdk77` both pass on HEAD, so P2 did not break coloured-ladder
+spendability.
