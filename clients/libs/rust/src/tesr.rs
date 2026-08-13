@@ -7239,33 +7239,89 @@ async fn attested_terminal(
     // `get_statechain_info` has already refused `None` here, so `Some` is the only shape that
     // reaches this point — but state the refusal rather than unwrapping, because "cannot say" must
     // never resolve to "not terminal", which is the permissive direction.
-    let terminal = match (info.has_sig_budget, info.sig_budget) {
-        (Some(true), Some(budget)) => info.num_sigs >= budget,
-        (Some(false), _) => false,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "{what} ({statechain_id}) served no attested spend budget, so the enclave cannot say \
-                 whether it is terminal. Refusing rather than reading silence as `not terminal` — \
-                 that is the permissive direction, and terminality is what stops this parent being \
-                 spent out from under the child being claimed."
-            ))
-        }
-    };
+    let terminal = terminal_from_attested(
+        info.has_sig_budget,
+        info.sig_budget,
+        info.num_sigs,
+        what,
+        statechain_id,
+    )?;
     // The coordinator's answer, as a CROSS-CHECK only.
     let (_, _, coordinator_says) =
         crate::lightning_latch::get_spend_budget(cc, statechain_id).await?;
-    if coordinator_says != terminal {
+    cross_check_terminality(
+        terminal,
+        coordinator_says,
+        info.num_sigs,
+        info.sig_budget,
+        what,
+        statechain_id,
+    )?;
+    Ok(terminal)
+}
+
+/// **[D14] THE SUPERSESSION MARGIN LAW, as one function.**
+///
+/// A disclosed (superseded) tier is only genuinely dead if the live tier over the same outpoint wins
+/// their race with certainty. "Certainty" is not a one-block lead — that is the rounding error a
+/// reorg or a slow relay erases — so the superseded tier must sit at least the propagation budget
+/// ABOVE the live one: `δ` for a state, `δE` for an extension, taken from the LIVE rival's kind.
+///
+/// It is a function rather than an inline comparison because the boundary is where the shipped
+/// presets differ, and the boundary is not reachable on mainnet. See
+/// `the_regtest_preset_clears_the_spine_margin_with_exactly_zero_slack`.
+pub(crate) fn clears_supersession_margin(sup_csv: u32, live_csv: u32, margin: u32) -> bool {
+    sup_csv >= live_csv.saturating_add(margin)
+}
+
+/// [A.1] The DECISION half of [`attested_terminal`], split out from the network half so it can be
+/// tested. Terminality is derived from two ATTESTED fields and nothing else.
+///
+/// The shape that matters is the `_` arm: "the enclave did not say" must never resolve to "not
+/// terminal". That is the permissive direction, and terminality is the property that stops a parent
+/// being spent out from under the child being claimed — so silence has to be a refusal.
+pub(crate) fn terminal_from_attested(
+    has_sig_budget: Option<bool>,
+    sig_budget: Option<u32>,
+    num_sigs: u32,
+    what: &str,
+    statechain_id: &str,
+) -> Result<bool> {
+    match (has_sig_budget, sig_budget) {
+        (Some(true), Some(budget)) => Ok(num_sigs >= budget),
+        (Some(false), _) => Ok(false),
+        _ => Err(anyhow::anyhow!(
+            "{what} ({statechain_id}) served no attested spend budget, so the enclave cannot say \
+             whether it is terminal. Refusing rather than reading silence as `not terminal` — \
+             that is the permissive direction, and terminality is what stops this parent being \
+             spent out from under the child being claimed."
+        )),
+    }
+}
+
+/// [A.1] The CROSS-CHECK half. The coordinator's `/statechain/spend_budget` is not a second opinion
+/// to be preferred or averaged — it is a tripwire. Both stores hold the same absolute quantity, so
+/// any disagreement means one of them was written behind the other's back, and a receiver that
+/// silently took the attested side would throw away the only signal that this happened.
+pub(crate) fn cross_check_terminality(
+    attested: bool,
+    coordinator_says: bool,
+    num_sigs: u32,
+    sig_budget: Option<u32>,
+    what: &str,
+    statechain_id: &str,
+) -> Result<()> {
+    if coordinator_says != attested {
         return Err(anyhow::anyhow!(
-            "{what} ({statechain_id}): the enclave's ATTESTED facts say terminal={terminal} \
-             (num_sigs={}, budget={:?}) but the coordinator's own record says terminal={coordinator_says}. \
-             The two stores hold the same absolute quantity, so a disagreement means one has been \
-             written behind the other's back. Refusing — the attested side is authoritative, and a \
-             receiver that silently preferred it would lose the only signal that the other was edited.",
-            info.num_sigs,
-            info.sig_budget
+            "{what} ({statechain_id}): the enclave's ATTESTED facts say terminal={attested} \
+             (num_sigs={num_sigs}, budget={sig_budget:?}) but the coordinator's own record says \
+             terminal={coordinator_says}. The two stores hold the same absolute quantity, so a \
+             disagreement means one has been written behind the other's back. Refusing — the \
+             attested side is authoritative, and a receiver that silently preferred it would lose \
+             the only signal that the other was edited."
         ));
     }
-    Ok(terminal)
+    Ok(())
 }
 
 /// Fetch the authoritative inputs a split-child receiver needs and run [`verify_child_bundle`] — the
@@ -10761,7 +10817,7 @@ fn verify_superseded_segment(
             // `[e_floor, e0]` is a strict subset of `[d_floor, d0]`, so mis-declaring only TIGHTENS
             // it. A margin moves the other way.
             let margin = live.kind.margin(p);
-            if sup.csv < live.csv.saturating_add(margin) {
+            if !clears_supersession_margin(sup.csv, live.csv, margin) {
                 return Err(anyhow::anyhow!(
                     "superseded {} {} has CSV {}, but the live {} over the same outpoint is at {} \
                      and the {} propagation budget is {} — the disclosed tier must sit at or above \
@@ -24863,7 +24919,7 @@ mod live_rival_relayability_tests {
         let relay = body.find("if !live.relayable {").expect("the relayability refusal exists");
         // [D14] The race check is now the MARGIN comparison, not the old one-block strict inequality.
         let csv = body
-            .find("if sup.csv < live.csv.saturating_add(margin) {")
+            .find("if !clears_supersession_margin(sup.csv, live.csv, margin) {")
             .expect("the CSV race check exists");
         assert!(
             relay < csv,
@@ -25763,5 +25819,198 @@ mod d35_flat_backup_lane_tests {
         assert!(reject(verify_flat_backup_lane(&colored(), &[b.clone()])).contains("tx_n 3"));
         b.tx = "deadbeef".into();
         assert!(reject(verify_flat_backup_lane(&colored(), &[b])).contains("tx_n 3"));
+    }
+}
+
+/// **[Stage 3 / A.1] A MALICIOUS COORDINATOR ON THE TERMINALITY PATH.**
+///
+/// This is one of the three negative tests the spec plan recorded as *not existing*. Terminality is
+/// the property that stops a parent being spent out from under the child being claimed, and A.1
+/// moved its source from the coordinator's word to the enclave's signature. Nothing measured that
+/// the derivation actually refuses the shapes it must.
+///
+/// The refusals are asymmetric on purpose, and the asymmetry is the whole design:
+///
+/// * a coordinator that **omits** the budget must be refused, not read as "not terminal" — silence
+///   resolving to the permissive answer is how the D8 hole worked;
+/// * a coordinator that **disagrees** with the attestation must be refused in BOTH directions, even
+///   the direction where the coordinator is more conservative than the enclave. A disagreement means
+///   one store was written behind the other's back, and preferring the attested side silently would
+///   discard the only evidence that it happened.
+#[cfg(test)]
+mod malicious_coordinator_terminality_tests {
+    use super::{cross_check_terminality, terminal_from_attested};
+
+    fn refusal(r: anyhow::Result<impl std::fmt::Debug>) -> String {
+        match r {
+            Ok(v) => panic!("expected a refusal, got {v:?}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// SILENCE IS NOT "NOT TERMINAL". A coordinator that serves no budget cannot be believed either
+    /// way — the enclave has not spoken.
+    #[test]
+    fn an_omitted_budget_is_refused_not_defaulted() {
+        // Nothing said at all.
+        let e = refusal(terminal_from_attested(None, None, 7, "parent", "sid"));
+        assert!(e.contains("cannot say"), "{e}");
+        assert!(e.contains("permissive direction"), "{e}");
+        // "has a budget" with no number — the half-stated shape, which is the one a coordinator
+        // would actually forge: it looks answered.
+        let e = refusal(terminal_from_attested(Some(true), None, 7, "parent", "sid"));
+        assert!(e.contains("cannot say"), "{e}");
+        // …and a budget with no `has_sig_budget` is equally unanswered.
+        let e = refusal(terminal_from_attested(None, Some(3), 7, "parent", "sid"));
+        assert!(e.contains("cannot say"), "{e}");
+    }
+
+    /// THE DERIVATION ITSELF. `num_sigs >= budget`, at the boundary — one under is NOT terminal, and
+    /// exactly at the budget IS. An off-by-one here is a parent that can still be signed while a
+    /// receiver believes it cannot.
+    #[test]
+    fn terminality_is_the_attested_count_against_the_attested_budget() {
+        let t = |num_sigs, budget| {
+            terminal_from_attested(Some(true), Some(budget), num_sigs, "parent", "sid").unwrap()
+        };
+        assert!(!t(2, 3), "one signature under the budget is NOT terminal");
+        assert!(t(3, 3), "at the budget the coin is terminal");
+        assert!(t(4, 3), "over the budget is terminal (the SE refuses further signing)");
+        // An enclave that says "no budget enforced" is a definite NOT-terminal — the one shape where
+        // absence of a number is an answer, because `has_sig_budget: Some(false)` IS the statement.
+        assert!(!terminal_from_attested(Some(false), None, 99, "parent", "sid").unwrap());
+    }
+
+    /// THE TRIPWIRE, IN BOTH DIRECTIONS. This is the test the plan asked for by name.
+    #[test]
+    fn a_coordinator_that_disagrees_with_the_enclave_is_refused_either_way() {
+        // The dangerous direction: the enclave says the parent is terminal (its budget is spent, so
+        // it can no longer be signed away from the child), and the coordinator says it is NOT.
+        let e = refusal(cross_check_terminality(true, false, 3, Some(3), "parent", "sid"));
+        assert!(e.contains("terminal=true"), "{e}");
+        assert!(e.contains("record says terminal=false"), "{e}");
+        assert!(e.contains("behind the other's back"), "{e}");
+
+        // The direction a receiver might be tempted to wave through, because the coordinator is
+        // being MORE conservative than the enclave. It is refused too: the disagreement is the
+        // signal, not the direction of it.
+        let e = refusal(cross_check_terminality(false, true, 1, Some(3), "parent", "sid"));
+        assert!(e.contains("terminal=false"), "{e}");
+        assert!(e.contains("record says terminal=true"), "{e}");
+
+        // Agreement passes, in both states — otherwise the check would be a refusal of everything.
+        cross_check_terminality(true, true, 3, Some(3), "parent", "sid").unwrap();
+        cross_check_terminality(false, false, 1, Some(3), "parent", "sid").unwrap();
+    }
+
+    /// NON-VACUITY: the refusal must NAME the coin and the role, because `verify_conveyed_child`
+    /// runs this over the parent AND every ancestor — a message that does not say which one leaves
+    /// the receiver unable to act on it.
+    #[test]
+    fn the_refusal_names_which_coin_disagreed() {
+        let e = refusal(cross_check_terminality(true, false, 3, Some(3), "ancestor 2", "abc123"));
+        assert!(e.contains("ancestor 2"), "{e}");
+        assert!(e.contains("abc123"), "{e}");
+        let e = refusal(terminal_from_attested(None, None, 0, "ancestor 2", "abc123"));
+        assert!(e.contains("ancestor 2"), "{e}");
+        assert!(e.contains("abc123"), "{e}");
+    }
+}
+
+/// **[Stage 3 / D14] THE ZERO-SLACK EDGE, WHICH ONLY REGTEST REACHES.**
+///
+/// `every_preset_can_satisfy_its_own_supersession_margin` checks each shipped preset can satisfy the
+/// margin *at all* (`d_floor >= δ`, `e_floor >= δE`). It does not check what happens AT the
+/// inequality, and the two presets sit in very different places relative to it:
+///
+/// | preset  | cap at | live `SP` at | margin `δ` | required | slack |
+/// |---------|--------|--------------|-----------|----------|-------|
+/// | mainnet | 144    | 0            | 36        | 36       | 108   |
+/// | regtest | 6      | 0            | 6         | 6        | **0** |
+///
+/// So a CATS spine cap at the regtest floor clears by EXACTLY nothing. Every off-by-one in the
+/// comparison — `>` for `>=`, a `+1` of defensive padding, a margin read from the superseded tier
+/// instead of the live one — is invisible on mainnet and refuses every honest bundle on regtest.
+/// This is the exact trap D14's own preset census was written to flag, and a mainnet-only test walks
+/// straight past it.
+///
+/// It also pins the direction of the CSV scale, which reads backwards until you have said it once: a
+/// LOWER CSV is a SOONER spend, so the disclosed tier must sit at a HIGHER number to be certain of
+/// losing.
+#[cfg(test)]
+mod zero_slack_supersession_tests {
+    use super::{clears_supersession_margin, RivalKind};
+    use mercurylib::tesr::TesrParams;
+
+    /// THE EDGE ITSELF, driven through the same function the verifier calls.
+    #[test]
+    fn the_regtest_preset_clears_the_spine_margin_with_exactly_zero_slack() {
+        let r = TesrParams::regtest();
+        let margin = RivalKind::State.margin(&r);
+        let live = u32::from(super::SPINE_CSV); // an `SP` is live at CSV 0
+        let cap = u32::from(r.d_floor);
+
+        // Exactly at the boundary: admitted.
+        assert!(
+            clears_supersession_margin(cap, live, margin),
+            "regtest cap at d_floor {cap} must clear a margin of {margin} over an SP live at \
+             {live} — it clears by exactly zero, and refusing here refuses every honest CATS bundle \
+             on this preset"
+        );
+        // One block under: refused. Without this half the assertion above passes for a law that
+        // admits everything.
+        assert!(
+            !clears_supersession_margin(cap - 1, live, margin),
+            "one block under the floor must be REFUSED — a one-block lead is the rounding error a \
+             reorg erases, not a margin"
+        );
+        // …and the slack really is zero on this preset, so the case above is the boundary and not
+        // some comfortable interior point that happens to pass.
+        assert_eq!(
+            cap,
+            live + margin,
+            "regtest no longer sits AT the boundary (cap {cap}, required {}). The zero-slack case \
+             this test exists for has moved; re-derive it rather than deleting it.",
+            live + margin
+        );
+    }
+
+    /// THE CONTRAST, stated as an assertion rather than a comment: mainnet cannot reach the edge, so
+    /// a mainnet-only test cannot be evidence for the boundary being right.
+    #[test]
+    fn mainnet_cannot_reach_the_edge_this_test_exists_for() {
+        let m = TesrParams::mainnet();
+        let margin = RivalKind::State.margin(&m);
+        let live = u32::from(super::SPINE_CSV);
+        let cap = u32::from(m.d_floor);
+        assert!(
+            cap > live + margin,
+            "mainnet cap {cap} is no longer strictly above its requirement {} — if mainnet has \
+             become the zero-slack preset too, the regtest test above is no longer the only witness \
+             and this one should say so",
+            live + margin
+        );
+        assert_eq!(cap - (live + margin), 108, "mainnet's slack is 144 - 36");
+    }
+
+    /// THE PER-KIND MARGIN AT THE EDGE. Regtest is the preset where `δ != δE` (6 vs 3), so an
+    /// EXTENSION at its own floor has slack while a STATE at the spine boundary does not — and
+    /// reading the margin off the wrong kind moves the boundary by three blocks in the permissive
+    /// direction.
+    #[test]
+    fn the_two_kinds_do_not_share_a_boundary_on_regtest() {
+        let r = TesrParams::regtest();
+        let state = RivalKind::State.margin(&r);
+        let ext = RivalKind::Extension.margin(&r);
+        assert_ne!(state, ext, "regtest no longer distinguishes δ from δE");
+        let live = u32::from(super::SPINE_CSV);
+        let cap = u32::from(r.d_floor);
+        // The bug the structural-kind rule prevents: charging a STATE rival the EXTENSION budget.
+        assert!(
+            clears_supersession_margin(cap - 1, live, ext),
+            "sanity: the cheaper δE budget WOULD admit the tier the δ budget refuses — that gap is \
+             exactly what a sender-declared kind would buy"
+        );
+        assert!(!clears_supersession_margin(cap - 1, live, state));
     }
 }

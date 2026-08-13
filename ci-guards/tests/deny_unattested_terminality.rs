@@ -40,13 +40,16 @@ fn code_only(src: &str) -> String {
 fn item_body<'a>(code: &'a str, sig: &str) -> &'a str {
     let at = code.find(sig).unwrap_or_else(|| panic!("`{sig}` is gone"));
     let rest = &code[at + sig.len()..];
-    let end = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn ", "\npub struct ", "\nimpl "]
+    // `pub(crate) fn` must be in this list: without it, `terminal_from_attested`'s window runs on
+    // past `cross_check_terminality` and every assertion below could be satisfied by the WRONG
+    // function's text — a scan window that overshoots is the same lie as one that includes itself.
+    let end = ["\npub async fn ", "\npub(crate) fn ", "\npub fn ", "\nasync fn ", "\nfn ", "\npub struct ", "\nimpl "]
         .iter()
         .filter_map(|m| rest.find(m))
         .min()
         .unwrap_or(rest.len());
     let body = &code[at..at + sig.len() + end];
-    assert!(body.len() > 400, "`{sig}`'s body scanned to {} bytes — that is not a function", body.len());
+    assert!(body.len() > 300, "`{sig}`'s body scanned to {} bytes — that is not a function", body.len());
     body
 }
 
@@ -55,23 +58,39 @@ fn tesr() -> String {
 }
 
 /// THE DERIVATION, read off the code: terminality is a function of the ATTESTED fields.
+///
+/// [Stage 3] The decision moved out of `attested_terminal` into `terminal_from_attested` so a test
+/// could drive a malicious coordinator through it without a network. The guard follows it, and
+/// additionally pins that `attested_terminal` still CALLS the extracted pieces — a split whose
+/// halves are correct but unwired is the same hole with more code.
 #[test]
 fn terminality_is_derived_from_the_attested_budget() {
     let code = tesr();
-    let body = item_body(&code, "async fn attested_terminal(");
+    let wiring = item_body(&code, "async fn attested_terminal(");
+    assert!(
+        wiring.contains("terminal_from_attested(") && wiring.contains("cross_check_terminality("),
+        "`attested_terminal` no longer calls both halves of the rule. Extracting them and then not \
+         calling one is the original hole with extra steps:\n\n{wiring}"
+    );
+    let body = item_body(&code, "pub(crate) fn terminal_from_attested(");
 
     assert!(
-        body.contains("info.num_sigs >= budget"),
+        body.contains("num_sigs >= budget"),
         "terminality is no longer `num_sigs >= budget` over the attested payload:\n\n{body}"
     );
     assert!(
-        body.contains("(Some(true), Some(budget))") && body.contains("(Some(false), _) => false"),
+        body.contains("(Some(true), Some(budget))") && body.contains("(Some(false), _) => Ok(false)"),
         "the two attested shapes are no longer distinguished. `Some(false)` is the enclave saying \
          `no budget`; it is not the same as a missing field:\n\n{body}"
     );
     // "Cannot say" must never resolve to "not terminal" — that is the permissive direction.
+    // Pinned as the ARM producing an Err, not as the keyword `return`: the same refusal written as
+    // a match-arm expression is the same rule, and a guard that fails on the rewrite is pinning
+    // spelling. The BEHAVIOUR is exercised by
+    // `tesr::malicious_coordinator_terminality_tests::an_omitted_budget_is_refused_not_defaulted`,
+    // which drives all three unanswered shapes through the real function.
     assert!(
-        body.contains("return Err(") && body.contains("cannot say"),
+        body.contains("_ => Err(") && body.contains("cannot say"),
         "a missing attested budget no longer REFUSES. Reading silence as `not terminal` is the \
          permissive direction, and terminality is what stops a parent being spent out from under \
          the child being claimed:\n\n{body}"
@@ -83,16 +102,18 @@ fn terminality_is_derived_from_the_attested_budget() {
 #[test]
 fn the_coordinator_answer_is_a_cross_check_that_refuses() {
     let code = tesr();
-    let body = item_body(&code, "async fn attested_terminal(");
+    // The fetch stays in the wiring; the comparison moved into `cross_check_terminality`.
+    let wiring = item_body(&code, "async fn attested_terminal(");
+    let body = item_body(&code, "pub(crate) fn cross_check_terminality(");
 
     assert!(
-        body.contains("coordinator_says != terminal"),
+        body.contains("coordinator_says != attested"),
         "the coordinator's answer is no longer compared against the attested derivation. Dropping \
          the comparison loses the only signal that one of the two stores was written behind the \
          other's back:\n\n{body}"
     );
     assert!(
-        body.contains("get_spend_budget(cc, statechain_id)"),
+        wiring.contains("get_spend_budget(cc, statechain_id)"),
         "the cross-check no longer fetches the coordinator's record at all:\n\n{body}"
     );
 }

@@ -54,10 +54,22 @@ fn the_margin_is_the_propagation_budget_and_comes_from_the_live_rival() {
          `sup.kind` — which conveyed list the tier arrived in — the sender chooses their own margin, \
          and on regtest (δ=6, δE=3) that halves it."
     );
+    // [Stage 3] The comparison moved out of the loop into a named function so the ZERO-SLACK
+    // boundary could be driven by a test — regtest clears it by exactly nothing (d_floor 6 = SP 0 +
+    // δ 6) while mainnet clears by 108, so every off-by-one here is invisible on mainnet and
+    // refuses every honest bundle on regtest. Both halves are pinned: the CALL at the site, and the
+    // RELATION inside the function. Pinning only the call would let the function be inverted.
     assert!(
-        code.contains("if sup.csv < live.csv.saturating_add(margin) {"),
-        "the relational check is no longer `sup.csv >= live.csv + margin`. A strict inequality \
-         (`sup.csv > live.csv`) is a ONE-BLOCK lead, which is not a propagation budget."
+        code.contains("if !clears_supersession_margin(sup.csv, live.csv, margin) {"),
+        "the supersession site no longer calls `clears_supersession_margin`. Inlining the \
+         comparison again takes the boundary back out of reach of a test."
+    );
+    assert!(
+        code.contains("sup_csv >= live_csv.saturating_add(margin)"),
+        "`clears_supersession_margin`'s relation is no longer `sup_csv >= live_csv + margin`. A \
+         strict inequality (`sup.csv > live.csv`) is a ONE-BLOCK lead, which is not a propagation \
+         budget; and `>` in place of `>=` refuses every honest bundle on the regtest preset, where \
+         the cap clears by exactly zero."
     );
     // The old rule must be gone, not merely shadowed — leaving it would let a later reader restore it
     // as "the simpler equivalent".
