@@ -10425,9 +10425,42 @@ pub fn verify_bundle_bound(
 /// capable of being broadcast at all (`relayable`). The second was an assumption discharged at a
 /// distance by the value laws on live tiers, joined to its use site by a comment. `implied_fee` and
 /// `vsize` are carried so the refusal can state the arithmetic instead of asserting a verdict.
+/// **[D14] Which schedule a live tier belongs to — STRUCTURAL, never sender-declared.**
+///
+/// The supersession margin is `δ` for a state and `δE` for an extension, and those differ on any
+/// preset where the two propagation budgets differ (regtest: 6 vs 3). A margin selected by a field
+/// the sender fills in is not a margin at all — the adversary picks which branch they are judged on
+/// — so this is read off the LIVE rival's position in the tree, exactly as the CSV-band check reads
+/// its kind off position parity, and never off which conveyed list a superseded tier arrived in.
+///
+/// Mainnet is immune to getting this wrong only because `δ = δE = 36` there, which is the same
+/// coincidence that hid the hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RivalKind {
+    Extension,
+    State,
+}
+
+impl RivalKind {
+    /// The propagation budget a superseded tier must clear to be certain of losing to this live one.
+    fn margin(self, p: &mercurylib::tesr::TesrParams) -> u32 {
+        match self {
+            RivalKind::Extension => p.delta_e as u32,
+            RivalKind::State => p.delta as u32,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            RivalKind::Extension => "extension",
+            RivalKind::State => "state",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LiveRival {
     csv: u32,
+    kind: RivalKind,
     relayable: bool,
     implied_fee: u64,
     vsize: u64,
@@ -10444,10 +10477,14 @@ impl LiveRival {
     /// Values come from the PARSED transaction and the prevout map, never from a declared
     /// `out_value` field: on a conveyed bundle those are attacker-supplied, and a tier that claims a
     /// healthy fee it does not pay is the whole attack.
+    ///
+    /// `kind` is supplied by the CALLER from the tier's position in the tree — never parsed out of a
+    /// conveyed field. See [`RivalKind`].
     fn read(
         tx: &electrum_client::bitcoin::Transaction,
         prevout_value_of: &std::collections::HashMap<(electrum_client::bitcoin::Txid, u32), u64>,
         what: &str,
+        kind: RivalKind,
     ) -> Result<Self> {
         let op = tx.input[0].previous_output;
         let value_in = *prevout_value_of
@@ -10465,6 +10502,7 @@ impl LiveRival {
         let vsize = tx.vsize() as u64;
         Ok(LiveRival {
             csv: tx.input[0].sequence.0 & 0xFFFF,
+            kind,
             relayable: mercurylib::tesr::tier_is_relayable(implied_fee, vsize),
             implied_fee,
             vsize,
@@ -10631,10 +10669,35 @@ fn verify_superseded_segment(
             // Directly contends with a live tier over the SAME outpoint — it MUST lose the race, or it
             // could mature first and steal. (This is [S-1/S-2]: extensions and states alike, against the
             // live tier spending the same outpoint, never a global final_csv.)
-            if sup.csv <= live.csv {
+            //
+            // **[D14] The separation is the PROPAGATION BUDGET, not one block.** Strict inequality
+            // says only "the superseded tier matures later"; the race is decided by relay and
+            // confirmation, and this design already carries a name for how much of that it must
+            // tolerate — `δ` for a state, `δE` for an extension. A one-block lead is not a budget,
+            // it is a rounding error, and on a preset where the two budgets differ (regtest 6 vs 3)
+            // the difference is real rather than notional.
+            //
+            // The kind is taken from the LIVE rival, STRUCTURALLY (see `RivalKind`). Keying it on
+            // `sup.kind` — which list the superseded tier arrived in — would be a margin the sender
+            // selects: file a superseded STATE under `superseded_extensions` and buy `δE` instead of
+            // `δ`. The existing CSV-band check is immune to that mis-declaration only because
+            // `[e_floor, e0]` is a strict subset of `[d_floor, d0]`, so mis-declaring only TIGHTENS
+            // it. A margin moves the other way.
+            let margin = live.kind.margin(p);
+            if sup.csv < live.csv.saturating_add(margin) {
                 return Err(anyhow::anyhow!(
-                    "superseded {} {} has CSV {} <= the live tier's {} over the same outpoint — it could out-race the owner",
-                    sup.kind, sup.j, sup.csv, live.csv
+                    "superseded {} {} has CSV {}, but the live {} over the same outpoint is at {} \
+                     and the {} propagation budget is {} — the disclosed tier must sit at or above \
+                     {} to be certain of losing that race. A one-block lead is not a margin; it is \
+                     the rounding error a reorg or a slow relay erases.",
+                    sup.kind,
+                    sup.j,
+                    sup.csv,
+                    live.kind.name(),
+                    live.csv,
+                    live.kind.name(),
+                    margin,
+                    live.csv.saturating_add(margin)
                 ));
             }
             dead[idx] = true;
@@ -11288,7 +11351,14 @@ fn verify_bundle_ex(
         let op = txs[i].input[0].previous_output;
         live_by_outpoint.insert(
             (op.txid, op.vout),
-            LiveRival::read(&txs[i], &prevout_value_of, &format!("live exit tier {i}"))?,
+            // [D14] Kind by POSITION PARITY, the same structural rule the CSV-band check uses:
+            // `[trigger, ext0, state0, ext1, state1, ...]`, so an odd index is an extension.
+            LiveRival::read(
+                &txs[i],
+                &prevout_value_of,
+                &format!("live exit tier {i}"),
+                if i % 2 == 1 { RivalKind::Extension } else { RivalKind::State },
+            )?,
         );
     }
     // [C-2] Every LIVE exit tier's txid, so a superseded list cannot re-declare one of them (or repeat
@@ -12005,14 +12075,22 @@ pub fn verify_child_bundle(
             let first_over_funding = ext_parsed.as_ref().map(|(t, _, _)| t).unwrap_or(&st_tx);
             live.insert(
                 (fund_txid, seg.funding_vout),
-                LiveRival::read(first_over_funding, &prevouts, "the segment tier over its funding outpoint")?,
+                // [D14] On a two-tier segment this is the EXTENSION; on a spine segment it is the
+                // lone state `SP`. `ext_parsed` is the structural discriminator — the segment's own
+                // shape — not anything the sender declared about it.
+                LiveRival::read(
+                    first_over_funding,
+                    &prevouts,
+                    "the segment tier over its funding outpoint",
+                    if ext_parsed.is_some() { RivalKind::Extension } else { RivalKind::State },
+                )?,
             );
             let mut live_ids: std::collections::HashSet<electrum_client::bitcoin::Txid> =
                 std::collections::HashSet::from([st_tx.txid()]);
             if let Some((ext_tx, payload_vout, _)) = &ext_parsed {
                 live.insert(
                     (ext_tx.txid(), *payload_vout),
-                    LiveRival::read(&st_tx, &prevouts, "the segment's live state")?,
+                    LiveRival::read(&st_tx, &prevouts, "the segment's live state", RivalKind::State)?,
                 );
                 live_ids.insert(ext_tx.txid());
             }
@@ -12391,11 +12469,11 @@ pub fn verify_child_bundle(
         // tier it describes, or a rival would be raced against the wrong live CSV (CTESR-GATE §3.2).
         child_live.insert(
             (sp_txid, cb.sp_vout),
-            LiveRival::read(&ext_tx, &child_prevouts, "the child's live extension")?,
+            LiveRival::read(&ext_tx, &child_prevouts, "the child's live extension", RivalKind::Extension)?,
         );
         child_live.insert(
             (ext_tx.txid(), cb.child_extension.payload_vout),
-            LiveRival::read(&st_tx, &child_prevouts, "the child's live state")?,
+            LiveRival::read(&st_tx, &child_prevouts, "the child's live state", RivalKind::State)?,
         );
         let child_live_ids: std::collections::HashSet<_Txid> =
             [ext_tx.txid(), st_tx.txid()].into_iter().collect();
@@ -13322,6 +13400,60 @@ mod verify_tests {
                  {SPINE_CSV}"
             );
         }
+    }
+
+    /// **[D14] EVERY SHIPPED PRESET MUST BE ABLE TO SATISFY ITS OWN SUPERSESSION MARGIN.**
+    ///
+    /// The margin law refuses a superseded tier unless it sits at least `δ` (state) or `δE`
+    /// (extension) above the live rival over the same outpoint. The tightest case in the tree is the
+    /// SPINE: `SP` is live at `SPINE_CSV = 0`, and the caps it retires sit at `d_floor` — so the law
+    /// is satisfiable there only while `d_floor >= δ`. A future schedule with a smaller floor would
+    /// make the receiver refuse honest CATS bundles, and it would do so at claim time, on the payee's
+    /// side, with the sender already committed.
+    ///
+    /// This is a preset-shaped landmine rather than a code defect, which is exactly the kind that
+    /// ships: both shipped presets clear it today (mainnet 144 ≥ 36, regtest 6 ≥ 6 — the regtest one
+    /// with NO slack at all), so nothing would fail until someone tuned a number.
+    #[test]
+    fn every_preset_can_satisfy_its_own_supersession_margin() {
+        for (name, p) in [
+            ("mainnet", mercurylib::tesr::TesrParams::mainnet()),
+            ("regtest", mercurylib::tesr::TesrParams::regtest()),
+        ] {
+            assert!(
+                p.d_floor >= p.delta,
+                "{name}: d_floor {} < δ {} — a spine cap at the floor could not clear the margin \
+                 over an `SP` live at {SPINE_CSV}, so every honest CATS bundle would be refused",
+                p.d_floor,
+                p.delta
+            );
+            assert!(
+                p.e_floor >= p.delta_e,
+                "{name}: e_floor {} < δE {} — an extension at its floor could not clear the margin \
+                 over the live extension it supersedes",
+                p.e_floor,
+                p.delta_e
+            );
+            // The honest renewal case, which is where a single-δ law would have broken regtest: a
+            // renewal supersedes an extension while the replacement spends the SAME parent outpoint,
+            // so the separation it produces is EXACTLY δE. If the law demanded δ instead, and δ > δE,
+            // every honest extension renewal on this preset would be refused.
+            assert!(
+                p.delta_e <= p.e0,
+                "{name}: δE {} exceeds e0 {} — the first renewal could not be built at all",
+                p.delta_e,
+                p.e0
+            );
+        }
+        // …and the two budgets really are different on at least one shipped preset, so the per-kind
+        // form is load-bearing rather than decorative. Mainnet's δ == δE is the coincidence that hid
+        // the sender-declared-kind hole; regtest is where it shows.
+        let r = mercurylib::tesr::TesrParams::regtest();
+        assert_ne!(
+            r.delta, r.delta_e,
+            "regtest no longer distinguishes δ from δE — the per-kind margin is now untested, and \
+             the structural-kind rule it protects has nothing left to demonstrate it"
+        );
     }
 
     /// The coloured-rung price and the three-rung floor, pinned as arithmetic rather than prose.
@@ -23198,9 +23330,24 @@ mod leaf_renewal_tests {
         bad.child_state = tier(&s_tx, Some(p.state_csv(0)), sc.payload_vout);
         f.child_num_sigs = 4; // the SE really did issue two more
         let e = verify(&bad, &f).expect_err("an equal-CSV renewal must be refused by the receiver");
+        let msg = e.to_string();
         assert!(
-            e.to_string().contains("out-race"),
-            "…and refused for the race reason, which is what makes it unrecoverable: {e}"
+            msg.contains("race"),
+            "…and refused for the RACE reason, which is what makes it unrecoverable — a count or \
+             parse refusal would be recoverable by rebuilding: {e}"
+        );
+        // **[D14] It is now the MARGIN law that refuses this, not the old one-block strict
+        // inequality.** The numbers are pinned, not the wording: the refusal must name the CSV the
+        // live extension actually sits at and the CSV the disclosed one would have to reach. Those
+        // are facts about the tree; the sentence around them is prose I wrote, and a pin on prose
+        // passes while the construction is wrong.
+        let live_csv = p.ext_csv(0) as u32;
+        let required = live_csv + p.delta_e as u32;
+        assert!(
+            msg.contains(&live_csv.to_string()) && msg.contains(&required.to_string()),
+            "the refusal must state where the live tier is ({live_csv}) and where the superseded one \
+             would have to be ({required} = live + δE). Without both, a reader cannot tell a margin \
+             refusal from the old strict-inequality one: {e}"
         );
     }
 
@@ -24603,13 +24750,30 @@ mod live_rival_relayability_tests {
         let at = src
             .find("fn verify_superseded_segment(")
             .expect("verify_superseded_segment exists");
-        let body = &src[at..];
+        // **BOUND THE SEARCH TO THE FUNCTION.** `&src[at..]` ran to end-of-file, which is how this
+        // test survived [D14] changing the very line it pins: the old `if sup.csv <= live.csv {`
+        // vanished from production and `find` matched the string literal in THIS TEST'S OWN SOURCE,
+        // a few thousand lines below. It passed, and it was pinning nothing. A source-scanning test
+        // whose window includes itself can never fail.
+        let end = src[at..].find("\n/// ").expect("the item is followed by another");
+        let body = &src[at..at + end];
         let relay = body.find("if !live.relayable {").expect("the relayability refusal exists");
-        let csv = body.find("if sup.csv <= live.csv {").expect("the CSV race check exists");
+        // [D14] The race check is now the MARGIN comparison, not the old one-block strict inequality.
+        let csv = body
+            .find("if sup.csv < live.csv.saturating_add(margin) {")
+            .expect("the CSV race check exists");
         assert!(
             relay < csv,
             "the relayability refusal must precede the CSV race check — otherwise a superseded tier \
              is retired on the strength of a race its rival can never enter"
+        );
+        // Non-vacuity, now that we know how this test can lie: the window must be a real function
+        // body, not the whole file and not an empty slice.
+        assert!(
+            body.len() > 2_000 && !body.contains("fn relayability_is_checked_before_the_csv_race"),
+            "the scan window is {} bytes and {} contain this test — it is not the function body",
+            body.len(),
+            if body.contains("fn relayability_is_checked_before_the_csv_race") { "does" } else { "does not" }
         );
     }
 }
