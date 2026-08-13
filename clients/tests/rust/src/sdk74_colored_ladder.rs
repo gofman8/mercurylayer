@@ -512,8 +512,18 @@ pub async fn execute() -> Result<()> {
         rivals.len() >= 3 && rivals.iter().min() != rivals.last()
     };
     while !live_is_not_minimum(&rivals) {
+        // **[D14] Step by δE, not by 1.** This loop used to walk the extension CSV down one block at
+        // a time to manufacture the txid ordering it needs. That produces OFF-GRID renewals — 12, 11,
+        // 10 … on a schedule whose only legal extension values are `e0 − m·δE` — and, since D14, a
+        // receiver refuses them: the separation between the superseded extension and its live
+        // replacement would be ONE BLOCK, below the δE propagation budget the design says a race
+        // needs. The bundle this loop built could no longer be claimed, which is the correct outcome
+        // and made the test fail for the right reason.
+        //
+        // Stepping by δE is what an honest renewal does (`ext_csv(m)`), and it still reaches the
+        // rival condition: regtest walks 12 → 9 → 6 → 3 (`e_floor`), which is three renewals.
         csv_e = csv_e
-            .checked_sub(1)
+            .checked_sub(params.delta_e)
             .filter(|c| *c >= params.e_floor)
             .ok_or(anyhow!("ran out of extension CSV headroom before the rival condition held"))?;
         let m = alice.renew_colored_ladder_with(&carrier_sid, csv_e, params.state_csv(0)).await?;

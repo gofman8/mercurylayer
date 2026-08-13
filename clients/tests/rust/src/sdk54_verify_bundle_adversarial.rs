@@ -279,7 +279,7 @@ pub async fn execute() -> Result<()> {
             se + 1,
             1,
             "ATTACK D' (a genuinely co-signed rival state that TIES the live state's CSV)",
-            "could out-race the owner",
+            "race",
         )?;
     }
 
@@ -322,7 +322,7 @@ pub async fn execute() -> Result<()> {
             se + 1,
             1,
             "ATTACK E' (a genuinely co-signed rival EXTENSION that ties the live extension's CSV)",
-            "could out-race the owner",
+            "race",
         )?;
     }
 

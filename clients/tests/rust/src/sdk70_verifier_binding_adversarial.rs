@@ -732,7 +732,7 @@ pub async fn execute() -> Result<()> {
                 &receiver,
             ),
             "D4 (a genuinely co-signed rival child state at the LIVE state's CSV — raced through the keyed census map)",
-            "could out-race the owner",
+            "race",
         )?;
     }
 

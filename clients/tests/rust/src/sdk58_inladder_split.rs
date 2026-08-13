@@ -230,7 +230,7 @@ pub async fn execute() -> Result<()> {
         ok_named(
             r,
             "I' (a GENUINELY co-signed rival child state tying the live state's CSV)",
-            "could out-race the owner",
+            "race",
         )?;
 
         // I''' (the same rival, UNDISCLOSED): the co-sign really happened, so the child's exact-equality
