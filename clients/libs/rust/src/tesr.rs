@@ -7207,11 +7207,74 @@ pub fn epoch_deadline_from_flat_backups(
 }
 
 
+/// **[D40.2] Is this coin TERMINAL, according to the ENCLAVE rather than the coordinator?**
+///
+/// Terminality is what stops a parent being spent again out from under a conveyed child, so it is a
+/// load-bearing input to the receiver's acceptance decision — and it was being taken from
+/// `GET /statechain/spend_budget`, an endpoint the coordinator computes **entirely from its own
+/// Postgres**. A repo-wide grep for `has_sig_budget` in `clients/` returned exactly one site: the
+/// attested budget was verified inside `get_statechain_info` and then read by **no acceptance
+/// decision at all**. One unattested `terminal: true` retires a whole parent tree.
+///
+/// The facts are already in hand and already signed. `get_statechain_info` verifies
+/// `utexo/sig_count/v2` over `(statechain_id, num_sigs, sig_budget, nonce)` against the
+/// CHAIN-ANCHORED enclave key, and refuses a `has_sig_budget: None` rather than defaulting it. So
+/// terminality is simply `budget exists && num_sigs >= budget`, computed from the signed payload.
+///
+/// The coordinator's own answer is kept, DEMOTED to a cross-check that refuses on disagreement.
+/// Both sides hold the same ABSOLUTE quantity — `set_sig_budget` stores
+/// `count_finalized_signatures + remaining` and the mirror sends that same value — so the numbers
+/// really are comparable, and a mismatch means one of the two stores has been written behind the
+/// other's back. That is worth refusing on rather than silently preferring either.
+///
+/// **This does not close CO-1.** The enclave key material and the counter it attests are held by the
+/// same party the receiver is being protected from; see D40.2. What it closes is the gap between
+/// what the enclave signed and what the client actually read.
+async fn attested_terminal(
+    cc: &ClientConfig,
+    info: &mercurylib::transfer::receiver::StatechainInfoResponsePayload,
+    what: &str,
+    statechain_id: &str,
+) -> Result<bool> {
+    // `get_statechain_info` has already refused `None` here, so `Some` is the only shape that
+    // reaches this point — but state the refusal rather than unwrapping, because "cannot say" must
+    // never resolve to "not terminal", which is the permissive direction.
+    let terminal = match (info.has_sig_budget, info.sig_budget) {
+        (Some(true), Some(budget)) => info.num_sigs >= budget,
+        (Some(false), _) => false,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "{what} ({statechain_id}) served no attested spend budget, so the enclave cannot say \
+                 whether it is terminal. Refusing rather than reading silence as `not terminal` — \
+                 that is the permissive direction, and terminality is what stops this parent being \
+                 spent out from under the child being claimed."
+            ))
+        }
+    };
+    // The coordinator's answer, as a CROSS-CHECK only.
+    let (_, _, coordinator_says) =
+        crate::lightning_latch::get_spend_budget(cc, statechain_id).await?;
+    if coordinator_says != terminal {
+        return Err(anyhow::anyhow!(
+            "{what} ({statechain_id}): the enclave's ATTESTED facts say terminal={terminal} \
+             (num_sigs={}, budget={:?}) but the coordinator's own record says terminal={coordinator_says}. \
+             The two stores hold the same absolute quantity, so a disagreement means one has been \
+             written behind the other's back. Refusing — the attested side is authoritative, and a \
+             receiver that silently preferred it would lose the only signal that the other was edited.",
+            info.num_sigs,
+            info.sig_budget
+        ));
+    }
+    Ok(terminal)
+}
+
 /// Fetch the authoritative inputs a split-child receiver needs and run [`verify_child_bundle`] — the
-/// verify-ONLY core (no persistence). Reads `F.spk` from chain, the parent+child
-/// `num_sigs`/`aggregate_pubkey` from `/info/statechain`, and both terminality flags from
-/// `/statechain/spend_budget` (fail-closed), and checks the child pays `receiver_backup_address`
-/// (Model A). Returns the child's exit value on success. Used by claim()'s validation pass.
+/// verify-ONLY core (no persistence). Reads `F.spk` from chain and the parent+child
+/// `num_sigs`/`aggregate_pubkey`/terminality from `/info/statechain`, where the count and budget
+/// arrive under the enclave's `utexo/sig_count/v2` signature ([`attested_terminal`]; the
+/// coordinator's `/statechain/spend_budget` is a cross-check, not the source), and checks the child
+/// pays `receiver_backup_address` (Model A). Returns the child's exit value on success. Used by
+/// claim()'s validation pass.
 pub async fn verify_conveyed_child(
     cc: &ClientConfig,
     receiver_backup_address: &str,
@@ -7484,6 +7547,8 @@ pub async fn verify_conveyed_child(
             )
         })?;
 
+    // (see `attested_terminal` — terminality is derived from the enclave's signature, not asked of
+    // the coordinator)
     let p_info = crate::utils::get_statechain_info(&cb.parent_statechain_id, cc)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no statechain info for parent sid"))?;
@@ -7491,19 +7556,19 @@ pub async fn verify_conveyed_child(
         .await?
         .ok_or_else(|| anyhow::anyhow!("no statechain info for child sid"))?;
 
-    // Only the PARENT's terminality is fetched: the child's census is made durable by the handover the
+    // Only the PARENT's terminality is used: the child's census is made durable by the handover the
     // receiver completes in this same claim, not by terminality (see verify_child_bundle's [F2]).
-    let (_, _, parent_terminal) =
-        crate::lightning_latch::get_spend_budget(cc, &cb.parent_statechain_id).await?;
+    let parent_terminal =
+        attested_terminal(cc, &p_info, "the parent", &cb.parent_statechain_id).await?;
 
     // Each INTERMEDIATE segment is an ancestor (not handed over here), so it must be terminal and its
-    // census must balance — fetch the SE's authoritative facts for each, in root→leaf order.
+    // census must balance — take the SE's ATTESTED facts for each, in root→leaf order.
     let mut ancestor_facts: Vec<AncestorFacts> = Vec::with_capacity(cb.ancestors.len());
     for seg in cb.ancestors.iter() {
         let info = crate::utils::get_statechain_info(&seg.statechain_id, cc)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no statechain info for ancestor {}", seg.statechain_id))?;
-        let (_, _, terminal) = crate::lightning_latch::get_spend_budget(cc, &seg.statechain_id).await?;
+        let terminal = attested_terminal(cc, &info, "an ancestor segment", &seg.statechain_id).await?;
         ancestor_facts.push(AncestorFacts {
             num_sigs: info.num_sigs,
             aggregate_pubkey: info.aggregate_pubkey.clone(),
