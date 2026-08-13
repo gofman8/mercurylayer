@@ -1371,6 +1371,67 @@ mod transfer_signature_tests {
         secp.sign_schnorr(&m, sender)
     }
 
+    /// **[B.8 / D41] THE TRUNCATION GAP, EXECUTED RATHER THAN ARGUED.**
+    ///
+    /// `ladder_decrements_by_interval` is a PAIRWISE rule, and this is what that costs: **every
+    /// suffix of an honest ladder satisfies it exactly as well as the whole ladder does.** Nothing
+    /// in the rule relates a chain to where it began, so dropping rungs off the HEAD is invisible
+    /// to it.
+    ///
+    /// That is the whole of B.8. A sender truncates the head, buys one extra co-signature per
+    /// dropped rung, discloses those in `superseded_states`, and the receiver's exact-equality
+    /// census (`se_num_sigs == flat_backups + tiers + superseded`) still balances — while the
+    /// receiver reads the short chain as a coin with few prior owners.
+    ///
+    /// The other checks in [`validate_backup_chain_v2`] do not close it either, and the reason is
+    /// worth stating because it is counter-intuitive:
+    /// [`verify_if_locktime_is_reasonable_tx_version_and_output_size`] bounds each locktime ABOVE
+    /// (`<= tip + lockheight_init`). Truncating the head moves the chain's maximum DOWN. An upper
+    /// bound cannot detect a value moving down.
+    ///
+    /// This test asserts the gap so that it is a MEASURED property rather than a claim in a
+    /// decision record — and so that whoever closes it has something that goes green.
+    #[test]
+    fn every_suffix_of_an_honest_ladder_passes_the_pairwise_rule() {
+        use super::ladder_decrements_by_interval as ok;
+        const INTERVAL: u32 = 100;
+        // An honest five-rung chain: L_0 = 10_000 down to L_4 = 9_600.
+        let honest: Vec<u32> = (0..5).map(|k| 10_000 - k * INTERVAL).collect();
+        assert_eq!(honest, vec![10_000, 9_900, 9_800, 9_700, 9_600]);
+
+        let pairwise_ok = |chain: &[u32]| chain.windows(2).all(|w| ok(w[0], w[1], INTERVAL));
+        assert!(pairwise_ok(&honest), "the honest chain must pass — otherwise this proves nothing");
+
+        // EVERY suffix passes too. Each one is the same coin with prior owners hidden.
+        for drop in 1..honest.len() {
+            let truncated = &honest[drop..];
+            assert!(
+                pairwise_ok(truncated),
+                "a chain truncated by {drop} rung(s) is accepted by the pairwise rule: {truncated:?}"
+            );
+        }
+
+        // …and the shortest truncation is a ONE-element chain, which the rule accepts vacuously —
+        // the shape a receiver reads as "structurally B1-immune".
+        assert!(
+            pairwise_ok(&honest[4..]),
+            "a one-element chain has no adjacent pair, so the pairwise rule is vacuously satisfied"
+        );
+
+        // THE FIX, stated as the arithmetic it needs: an anchored head distinguishes them, and
+        // nothing available to a receiver today supplies `L_0`. `max(chain)` is the quantity an
+        // anchor would pin.
+        let l0_honest = *honest.iter().max().unwrap();
+        for drop in 1..honest.len() {
+            let l0_seen = *honest[drop..].iter().max().unwrap();
+            assert!(
+                l0_seen < l0_honest,
+                "truncation always LOWERS the observable head ({l0_seen} < {l0_honest}), which is \
+                 exactly why an upper bound on locktimes cannot catch it"
+            );
+        }
+    }
+
     // Receiver check R5 (TRUST-MODEL §2): the backup ladder must decrement by EXACTLY the SE's
     // interval per hop — a wrong gap (hidden intermediate owner / forged spacing) or a
     // non-decreasing ladder is rejected, the latter without underflow-panicking.
