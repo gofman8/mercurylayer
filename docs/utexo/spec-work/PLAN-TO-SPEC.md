@@ -20,7 +20,7 @@ unfinished.
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **13 landed** (all six Tier A + B.1–B.5, B.7). B.8 is **proven not buildable as specified** (D41). B.6 is **demoted to an optimisation** by D45's measurement. |
-| Live E2E suite | **87/87.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
+| Live E2E suite | **88/88.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
 | Unit + guard suite | green — **756 tests, 0 failures** |
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
@@ -125,7 +125,7 @@ they land.
 
 ## Stage 3 — Verification before any completeness claim
 
-**Status: everything except the carrier variants is DONE.** All three negative tests exist and pass
+**Status: COMPLETE.** All three negative tests exist and pass
 live, the zero-slack test exists, `sdk30(a)` is replaced by `sdk86`, and D48's fresh-mint rule has an
 attack test that asserts its own non-vacuity.
 
@@ -159,8 +159,13 @@ attack test that asserts its own non-vacuity.
   carrier appears in the SEVERED list and in NO re-anchor result, `F` is spent by **this coin's own
   trigger** (a re-anchor spends `F` too — only the spender's txid tells them apart), and the
   allocation survives. A sats-only version of this test would have passed for the outcome that
-  destroys the asset. Remaining: the carrier variant of the ALLOCATION/headroom bound (`sdk82`'s
-  shape).
+  destroys the asset.
+- ✅ **DONE — the carrier variant of the ALLOCATION/headroom bound (`sdk88`).** The gate is
+  colour-blind by design, but that is a claim about the code and the two lanes differ in both inputs
+  it reads: a coloured child's chain is FIVE tiers, not three, and every tier is dearer. Measured:
+  needs 66 blocks over 5 tiers (48 of relative timelock) against 30 remaining — refused, short by 36,
+  with a control on a fresh epoch proving it is not a gate that refuses everything, and **nothing
+  booked and no child adopted**, which is what makes it the allocation bound rather than a sats one.
 - ✅ **DONE — `sdk30(a)` replaced as INV-27's evidence by `sdk86`.** `sdk30(a)` idles a k=0 deposit
   and can only witness the CSV half. `sdk86` reads BOTH clocks on the same coin across two whole-coin
   hops and measures what D36 said was unpublished: `L0 1389 -> L1 1379 -> L2 1369`, exactly
@@ -200,8 +205,8 @@ Not nothing, and this is the part worth acting on while the rest proceeds:
 **Nothing is blocking.** Stage 0 is complete except 0.4 (an external dependency — it needs a
 deployed fleet, and regtest has no coins that mean anything). All ten decisions are taken. Tier A and
 Tier B are landed except B.8, which is proven not buildable as specified (D41), and B.6, which D45's
-measurement demoted to an optimisation. Stage 3 is complete except the coloured lane's own deadline
-and allocation variants. Stage 4 landed.
+measurement demoted to an optimisation. Stage 3 is COMPLETE — the coloured lane's own
+deadline (`sdk87`) and allocation (`sdk88`) variants both landed and pass live. Stage 4 landed.
 
 **What is left is writing.**
 

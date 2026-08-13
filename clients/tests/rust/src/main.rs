@@ -101,6 +101,7 @@ pub mod sdk84_leaf_renewal;
 pub mod sdk85_transfer_cancel;
 pub mod sdk86_received_coin_ages;
 pub mod sdk87_carrier_deadline;
+pub mod sdk88_carrier_headroom;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -526,6 +527,13 @@ async fn main() -> Result<()> {
     // SEVERED by its own pre-signed T, never re-anchored, with its allocation intact.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("87") {
         sdk87_carrier_deadline::execute().await?;
+        return Ok(());
+    }
+
+    // [Stage 3] The CARRIER variant of the exit-headroom bound: on the coloured lane the thing lost
+    // is an ASSET, so the refusal must leave NOTHING booked.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("88") {
+        sdk88_carrier_headroom::execute().await?;
         return Ok(());
     }
 
