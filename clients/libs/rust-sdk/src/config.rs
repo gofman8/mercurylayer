@@ -169,10 +169,45 @@ pub struct SdkConfig {
 /// confirmation budget the previous `auto_exit_margin_blocks` literal already spent one of.
 pub const BLOCKS_PER_DAY: u32 = 144;
 
-/// Transactions a unilateral exit must confirm, **in sequence**, for a coin at in-ladder split
-/// depth `d`: `T`, `X_m` and the final state, plus one `SP` and one extension per split level.
+/// **[D38/D6] Which SHAPE a split level has.** The exit cost is not a function of depth alone.
+///
+/// A two-tier level is `SP` + an extension; a CATS-B **spine** level is `SP` alone, because the tip
+/// is one cap over `SP.out[K]` with no extension between them. So the same depth costs `2d` rungs on
+/// one lane and `d` on the other, and a model that assumes one of them is wrong about the other.
+///
+/// `tesr_exit_wait_blocks` has always known this — its `per_level` is `ext_csv(0) + SPINE_CSV`. The
+/// COUNT and the VSIZE did not, which is how one design ended up with two exit models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitShape {
+    /// `SP` + extension per level — the shape every level has on the ordinary child lane, and the
+    /// **conservative** one: `3 + 2d ≥ d + 4` for all `d ≥ 1`.
+    TwoTier,
+    /// `SP` alone per level — a CATS-B spine.
+    Spine,
+}
+
+/// Transactions a unilateral exit must confirm, **in sequence**, for a coin at in-ladder split depth
+/// `d` of the given shape.
+///
+/// `TwoTier`: `T`, `X_m`, the final state, plus `SP` + extension per level → `3 + 2d`.
+/// `Spine`:   the same three, plus `SP` alone per level → `4 + d` (the tip's cap is the final rung).
+pub const fn tesr_exit_txs_for(shape: ExitShape, child_depth: u32) -> u32 {
+    match shape {
+        ExitShape::TwoTier => 3 + 2 * child_depth,
+        ExitShape::Spine => 4 + child_depth,
+    }
+}
+
+/// The **conservative** count — `TwoTier`, unconditionally.
+///
+/// **Every safety MARGIN must use this one**, and that is not laziness: over-counting a margin makes
+/// a watchtower act EARLIER, which is the safe direction, while a shape-aware margin that guessed
+/// `Spine` for a coin that is actually two-tier would act LATE. `3 + 2d ≥ d + 4` for all `d ≥ 1`, so
+/// this dominates. Callers publishing ECONOMICS — a footprint figure, a cost table — must use
+/// [`tesr_exit_txs_for`] with the shape they are describing, because there over-counting is simply
+/// a wrong number.
 pub const fn tesr_exit_txs(child_depth: u32) -> u32 {
-    3 + 2 * child_depth
+    tesr_exit_txs_for(ExitShape::TwoTier, child_depth)
 }
 
 /// Signed vsize of that whole walk, derived from the MEASURED tier vsizes
@@ -452,5 +487,40 @@ mod g3_every_profile_can_finish_its_exit {
             );
             println!("G3 {net}: initlock {initlock} admits child depth up to {d}");
         }
+    }
+}
+
+/// [D38/D6] ONE exit-cost model, shape-aware, with the safe direction stated.
+#[cfg(test)]
+mod exit_shape_model_tests {
+    use super::{tesr_exit_txs, tesr_exit_txs_for, ExitShape};
+
+    /// The two shapes genuinely differ, and the default is the CONSERVATIVE one. A margin that
+    /// guessed `Spine` for a two-tier coin would act LATE, which is the unsafe direction.
+    #[test]
+    fn the_default_dominates_the_spine_shape_at_every_depth() {
+        for d in 0u32..=10 {
+            let two = tesr_exit_txs_for(ExitShape::TwoTier, d);
+            let spine = tesr_exit_txs_for(ExitShape::Spine, d);
+            assert_eq!(tesr_exit_txs(d), two, "the bare name must stay the conservative shape");
+            assert!(
+                two >= spine || d == 0,
+                "depth {d}: two-tier {two} must dominate spine {spine}, or a margin using the \
+                 default could act late on a spine coin"
+            );
+        }
+        // …and they are not the same function: at depth 0 both are the bare walk plus the tip rung,
+        // but they diverge immediately and the gap grows.
+        assert_eq!(tesr_exit_txs_for(ExitShape::TwoTier, 1), 5);
+        assert_eq!(tesr_exit_txs_for(ExitShape::Spine, 1), 5);
+        assert_eq!(tesr_exit_txs_for(ExitShape::TwoTier, 10), 23);
+        assert_eq!(tesr_exit_txs_for(ExitShape::Spine, 10), 14);
+    }
+
+    /// The mainnet depth cap is 10 and a depth-10 two-tier walk is 23 transactions — the figure the
+    /// spec publishes. Pinned here so a shape refactor cannot move it silently.
+    #[test]
+    fn the_published_depth_ten_figure_is_the_two_tier_walk() {
+        assert_eq!(tesr_exit_txs(10), 23, "the published mainnet depth-10 walk is 23 transactions");
     }
 }
