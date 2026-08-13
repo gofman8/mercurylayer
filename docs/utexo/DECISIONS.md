@@ -683,3 +683,95 @@ appendices and the CATS-B shape frozen as-is. D0, D1 and D2 together describe a 
 The estimate is **withdrawn pending a re-cost**, which needs the coloured-spine and coloured-re-anchor
 items scoped first — those are design work of unknown depth, and a number produced before they are
 scoped would be a guess presented as a plan.
+
+---
+
+## D34 — The receiver PROVES the enclave holds the share it is about to depend on (closes CO-1)
+
+**Decided:** fix, by proof of possession at claim time.
+
+The soundness hunt found that `aggregate_pubkey`, `x1_pub` and `server_public_key` are plain
+coordinator Postgres columns served over `/info/statechain` and `get_new_key_info`, and that nothing
+anywhere proves the enclave knows the discrete log of the share the receiver is about to depend on.
+`verify_bundle_bound` tests **the coordinator's own column** against the chain key — so a coordinator
+that lies about the column passes its own check. Combined with a colluding sender (who chooses
+`user_public_key`, enabling the rogue-key decomposition `U := D − E_sid`), this mints an
+attacker-controlled output that passes the entire acceptance path.
+
+This is NOT the sender-alone threat model, which is genuinely blocked. It is the coordinator+sender
+one, and the corpus already concedes that *no adversarial test in the repo models a malicious
+coordinator — every one models a malicious sender*.
+
+**The rule.** At claim, after the keyupdate commits, the receiver sends a fresh 32-byte nonce `ρ`;
+the enclave signs `(domain-tag ‖ sid ‖ ρ)` with its **new** share `e′` and returns `(P, σ)`. The
+receiver REQUIRES that `σ` verifies under `P` **and** that `o2·G + P` equals the taproot internal key
+of `F` read from the chain. `o2` is fresh per transfer and unknown to the sender, so a forger must
+sign under `A_D − O2` without knowing a discrete log.
+
+One check collapses the whole substitution class at once — wrong `aggregate_xonly`, wrong `x1_pub`,
+wrong `server_public_key`. It needs a new enclave endpoint; that cost is accepted.
+
+**Consequence for the spec.** §7 and §17 may not claim receiver admission soundness against the
+operator trust domain until this ships. Until then the honest statement is that admission rests on
+the coordinator being truthful about the aggregate.
+
+## D35 — On a COLOURED bundle every flat backup MUST be plain (closes RGB-1; corrects P1)
+
+**Decided:** the permitted backup shape is a function of the DECLARED LANE, not the union of two
+lanes' shapes.
+
+RGB-1 (HIGH): a flat backup may legally carry an RGB transition and **nothing binds its assignment**.
+`validate_backup_chain_v2` checks signature, sequence, locktime shape, reconstruction and INV-5 only;
+`verify_if_locktime_is_reasonable_tx_version_and_output_size` admits `op_return_outputs <= 1`;
+`reconstruct_transaction` copies `tx_n.output` verbatim so it constrains nothing; and
+`verify_colored_shape` iterates `bundle.exit_tiers()` only. So the sender's hop-backup is an
+undetectable allocation-theft primitive, and it also undermines the economic-security argument that a
+prior owner's spend of `F` is unprofitable griefing.
+
+**The rule.** Where `is_colored()`, every conveyed flat backup MUST be plain: refuse by name any
+backup carrying an OP_RETURN, in the predicate that already runs over every flat backup, and make
+that refusal part of the R′ acceptance set alongside `verify_colored_shape`. One predicate, fails
+closed.
+
+**The permissive shape STAYS for the un-laddered carrier lane**, where a coloured backup is the
+legitimate exit material.
+
+**This corrects P1, which is a DESIGN defect and not a code defect.** P1 as implemented refuses *a
+plain ladder carrying an RGB consignment* — the inverse of the sound rule — and therefore breaks the
+uncolourable carrier: `sdk78` shows a real 250-unit spend that does not land at the far end. The live
+failure and the design hunt found the same boundary from opposite sides. Under the authority order
+(design normative, code follows) the rule is corrected here first; the code follows.
+
+## D36 — Publish the REAL maintenance cadence; retract INV-27 as written (T-1/T-2)
+
+**Decided:** correct the claim.
+
+The real on-chain maintenance cadence is set by the **flat ladder**, not by the CSV hop budget, and
+**INV-27 is false for every RECEIVED laddered coin** — the absolute flat-backup ladder is retained
+under TES-R. The advertised footprint economics omits the binding constraint, and T-4 adds that the
+split window is consumed 100 blocks per whole-coin hop as well as one per block, is unpublished, and
+is invisible to every client.
+
+The headline figure gets worse. That is the correct trade: a specification whose central economic
+claim a reviewer can disprove in an afternoon has no authority, and every other claim in it inherits
+the doubt.
+
+**Also required (T-4).** Compute the sender's depth cap from the REMAINING window rather than the
+constant — replace `let epoch_blocks = info.initlock;` with `epoch_deadline_from_flat_backups(parent)
+− tip`, so the builder and the payee's `check_exit_headroom` measure the same quantity, and run it
+BEFORE `set_spend_budget` terminalizes the parent. This is the same unification already performed for
+`head_start`.
+
+## D37 — The named-limitations section is built by an explicit classification pass
+
+**Decided:** a second pass, forcing every residual into exactly one of three buckets.
+
+The soundness hunt returned **zero** accepted residuals while its own frame lists **33** known ones;
+every survivor was classified as fixable. That is not credible, and it is the one gap that would make
+a soundness claim promotional rather than honest.
+
+Each of the 33 known residuals plus the 11 surviving flaws is classified as exactly one of:
+**mitigated** (say how), **bounded-and-accepted** (state the bound), or **genuinely open** (state the
+exposure). The result is the specification's named-limitations section.
+
+**A design is sound when its failure modes are enumerated and survivable, not when it has none.**
