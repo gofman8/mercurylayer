@@ -20,8 +20,8 @@ unfinished.
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **13 landed** (all six Tier A + B.1–B.5, B.7). B.8 is **proven not buildable as specified** (D41). B.6 is **demoted to an optimisation** by D45's measurement. |
-| Live E2E suite | **84/86.** SDK22 is FIXED (12 breaches → 0) and `sdk86` is new and green. One remains: SDK29 (blocked on decision 8) |
-| Unit + guard suite | green — **749 tests, 0 failures** |
+| Live E2E suite | **86/86.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
+| Unit + guard suite | green — **753 tests, 0 failures** |
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature
@@ -125,6 +125,10 @@ they land.
 
 ## Stage 3 — Verification before any completeness claim
 
+**Status: everything except the carrier variants is DONE.** All three negative tests exist and pass
+live, the zero-slack test exists, `sdk30(a)` is replaced by `sdk86`, and D48's fresh-mint rule has an
+attack test that asserts its own non-vacuity.
+
 - ✅ **DONE — a malicious coordinator on the terminality path.** `attested_terminal` split into
   `terminal_from_attested` + `cross_check_terminality` so the decision is reachable without a
   network; four tests drive the omitted budget (all three unanswered shapes), the `num_sigs >=
@@ -188,7 +192,15 @@ Not nothing, and this is the part worth acting on while the rest proceeds:
 
 ## The honest summary
 
-**Genuinely blocking:** Stage 0 in full; decision 8; Tier A.
+**Nothing is blocking.** Stage 0 is complete except 0.4 (an external dependency — it needs a
+deployed fleet, and regtest has no coins that mean anything). All ten decisions are taken. Tier A and
+Tier B are landed except B.8, which is proven not buildable as specified (D41), and B.6, which D45's
+measurement demoted to an optimisation. Stage 3 is complete except the coloured lane's own deadline
+and allocation variants. Stage 4 landed.
+
+**What is left is writing.**
+
+**Previously (superseded):** Stage 0 in full; decision 8; Tier A.
 
 **Stage 3 is now complete except the carrier variants.** All three negative tests exist and pass
 live; the zero-slack test exists; `sdk30(a)` is replaced. What remains in Stage 3 is the coloured
