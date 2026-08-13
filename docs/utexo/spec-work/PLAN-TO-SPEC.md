@@ -19,7 +19,7 @@ unfinished.
 | — decided (D39 ×4, D40 ×4) | **8** |
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
-| Code items on the critical path | **14** → **13 landed** (all six Tier A + B.1–B.5, B.7). B.8 is **proven not buildable as specified** (D41). B.6 is **demoted to an optimisation** by D45's measurement. |
+| Code items on the critical path | **14** → **12 landed** (all six Tier A, plus B.1–B.5 and B.7 — six of the eight Tier B). The other two are RESOLVED but not built: B.8 is **proven not buildable as specified** (D41) and B.6 is **demoted to an optimisation** by D45's measurement. |
 | Live E2E suite | **88/88.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
 | Unit + guard suite | green — **756 tests, 0 failures** |
 
@@ -209,7 +209,7 @@ anything. They are constructible (D40.3) and remain UNEVALUATED until there is a
 | | |
 |---|---|
 | Owner decisions | **10 of 10 taken** |
-| Critical-path code | **13 of 14 landed**; B.8 proven not buildable as specified (D41), B.6 demoted to an optimisation (D45) |
+| Critical-path code | **12 of 14 landed** (6 Tier A + B.1–B.5, B.7). The other two are resolved, not built: B.8 proven not buildable as specified (D41), B.6 demoted to an optimisation (D45) |
 | Live E2E suite | **88/88** |
 | Unit + guard suite | **756, 0 failures** |
 
