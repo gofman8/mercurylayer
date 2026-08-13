@@ -1,6 +1,6 @@
 # The path to spec-writable
 
-**2026-08-13, HEAD `8a62800` (feat/spark).** The single current plan. It supersedes Part 3 of
+**2026-08-13, HEAD `cbad7f6`+ (feat/spark).** The single current plan. It supersedes Part 3 of
 [`OWNER-DECISION-SHEET.md`](OWNER-DECISION-SHEET.md), which was written before D40 was taken and
 before four of its own items landed.
 
@@ -19,7 +19,7 @@ unfinished.
 | — decided (D39 ×4, D40 ×4) | **8** |
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
-| Code items on the critical path | **14**, of which **all six Tier A have landed** (plus 5 defects found by running things) |
+| Code items on the critical path | **14** → **11 landed** (all six Tier A + B.1, B.2, B.3, B.4, B.7). B.8 is **proven not buildable as specified** (D41). **B.5 and B.6 are gated on decisions 5 and 10, which are not taken.** |
 | Live E2E suite | **complete: 81/85**, and on a HEAD binary SDK80 + RGB8 also pass → **83/85 equivalent**. Two remain: SDK22 (coin selection, item below) and SDK29 (blocked on decision 8) |
 | Unit + guard suite | green — **711 tests, 0 failures** |
 
@@ -88,12 +88,12 @@ they land.
 
 | | Item | From |
 |---|---|---|
-| B.1 | ONE shape-aware exit-cost model; every consumer reads it | D38/D6 |
+| B.1 | ~~ONE shape-aware exit-cost model~~ | ✅ **landed** — `ExitShape`; the margin deliberately keeps the conservative shape, because over-counting a margin is the SAFE direction |
 | B.2 | ~~`deny_unknown_fields`; absence is a typed refusal~~ | ✅ **landed** — `protocol_version` required (its default SELECTED a lane), unknown fields refused |
 | B.3 | ~~Exact-set `protocol_version` dispatch; delete the v3 arm~~ | ✅ **landed** |
-| B.4 | Pin the wire error codes with explicit `serde(rename)`; regenerate the Kotlin bindings | D38/D18 — a Kotlin client cannot deserialize the shipped 410 today |
-| B.5 | Wire `BumpCapability` through the child/spine lanes and the de-trigger | decision 5 |
-| B.6 | Conflict-aware rescue pricing; stop greedily broadcasting the successor | decision 10 |
+| B.4 | ~~Pin the wire error codes; fix the Kotlin bindings~~ | ✅ **landed** — all three variants pinned, and `TransferCancelledError` added to both Kotlin trees |
+| B.5 | Wire `BumpCapability` through the child/spine lanes and the de-trigger | **BLOCKED on decision 5.** Its recommendation includes `committed_fee_rate` 2.0 → 3.0, which re-prices every floor and every piece in circulation — an owner call with real user impact, not a mechanical port. |
+| B.6 | Conflict-aware rescue pricing; stop greedily broadcasting the successor | **BLOCKED on decision 10.** |
 | B.7 | ~~Claim-path ordering: validate before counting~~ | ✅ **landed** |
 | B.8 | ~~Head anchor on `validate_backup_chain_v2`~~ | **NOT BUILDABLE as specified — see D41.** `h_deposit` is the tip when the backup was built, which precedes `tx0`'s confirmation, so a receiver can derive only an UPPER bound and truncation moves the value DOWN. Needs `h_deposit` in the `utexo/sig_count/v2` attestation. `k` stays unpublished. |
 
