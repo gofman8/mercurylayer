@@ -3817,6 +3817,8 @@ enum class TransferReceiverError {
     STATECOIN_BATCH_LOCKED_ERROR,
 	@SerialName("ExpiredBatchTimeError")
     EXPIRED_BATCH_TIME_ERROR,
+	@SerialName("TransferCancelledError")
+    TRANSFER_CANCELLED_ERROR,
     ;
 
     companion object

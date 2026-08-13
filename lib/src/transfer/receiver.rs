@@ -25,10 +25,22 @@ pub struct TransferReceiverRequestPayload {
     pub auth_sig: String,
 }
 
+/// **[D38/D18] The wire error vocabulary. These strings ARE the interface.**
+///
+/// Four client profiles across five sites compare them as literals — `clients/libs/nodejs`,
+/// `clients/libs/web`, and both generated Kotlin trees — and three other specs' conformance tables
+/// point at `ERR-n` entries that index into them. Prose is not an interface; this enum is.
+///
+/// So every variant carries an explicit `serde(rename)` **equal to its own identifier**. That looks
+/// redundant and is not: without it the wire value is a by-product of the Rust name, and a future
+/// identifier rename — a refactor nobody would think to call a protocol change — silently moves the
+/// interface. With it, the two are separable, and changing the wire value becomes a deliberate act.
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(uniffi::Enum))]
 pub enum TransferReceiverError {
+    #[serde(rename = "StatecoinBatchLockedError")]
     StatecoinBatchLockedError,
+    #[serde(rename = "ExpiredBatchTimeError")]
     ExpiredBatchTimeError,
     /// The transfer this recipient is trying to claim was CANCELLED (see
     /// `crate::transfer::cancel`). Returned with HTTP 410 and only to a caller that proved it holds
@@ -38,6 +50,7 @@ pub enum TransferReceiverError {
     /// silent "nothing arrived" the client's `println!` + `continue` loop produces for every other
     /// mailbox miss — a cancelled payment that looks like an idle mailbox is the exact
     /// silent-degradation shape a recipient must never be shown.
+    #[serde(rename = "TransferCancelledError")]
     TransferCancelledError,
 }
 
