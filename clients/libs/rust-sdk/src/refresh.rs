@@ -455,6 +455,90 @@ impl UtexoWallet {
         Ok(refreshed)
     }
 
+    /// **[D40 / A.2] DEADLINE SAFETY — the half of maintenance that is not an economics choice.**
+    ///
+    /// A whole laddered coin carries exactly one absolute clock: `min(L_k)` over its flat backup
+    /// chain, held by its PRIOR OWNERS. When that height passes, any ancestor's matured rung spends
+    /// `F` and takes the coin. Nothing in the tree stops it — the tiers are all *relative*-timelocked
+    /// below `F`, so they cannot out-race a transaction that is simply valid now.
+    ///
+    /// **That is a safety property, and it was behind an economics flag.** `auto_refresh_due` does two
+    /// unrelated jobs: routine background re-anchoring (an economics choice — B4 folds the re-anchor
+    /// cost into `transfer` and pays it on demand, so a running wallet should NOT silently shrink a
+    /// balance in the background) and this deadline defence. Both sat behind
+    /// `auto_refresh && background_auto_refresh`, and the second is off by default. So on a default
+    /// wallet the routine pass was correctly disabled and the deadline defence went with it.
+    ///
+    /// `auto_exit_due` does not cover this clock: it protects sub-coins and materialises carriers.
+    /// The whole-coin `L_k` deadline had no scheduled defender at all.
+    ///
+    /// # Two remedies, in order, because the first one needs the counterparty
+    ///
+    /// 1. **Re-anchor** (cooperative, cheap, keeps the coin off-chain). One ~112-vB transaction; the
+    ///    coin comes back with a fresh chain and `k = 0` prior owners.
+    /// 2. **Sever from `F`** (unilateral, no counterparty) — broadcast the already-co-signed trigger.
+    ///    `T` is un-timelocked and spends `F`, so it wins against every retained rung *by being valid
+    ///    first*, and it needs no SE, no coordinator and no wait.
+    ///
+    /// The order matters and so does the fallback. Re-anchoring requires one fresh SE co-signature,
+    /// and the party that would most like this coin's deadline to pass is the same party being asked
+    /// to sign — see D40.1. A defence that can be declined by its adversary is not a defence, so when
+    /// the cooperative route fails the pass takes the unilateral one rather than reporting a clean
+    /// pass over an undefended coin.
+    ///
+    /// Severing costs the coin its off-chain life and starts the CSV walk. That is a real cost, and
+    /// it is paid only when the alternative is losing the coin outright.
+    ///
+    /// Returns `(re_anchored, severed)`. Carriers are excluded on both routes — a plain re-anchor
+    /// and a plain trigger both destroy an RGB allocation; their protection is `auto_exit_due`.
+    pub async fn deadline_safety_due(
+        &self,
+        margin_blocks: u32,
+    ) -> Result<(Vec<RefreshResult>, Vec<String>)> {
+        let re_anchored = match self.auto_refresh_due(margin_blocks).await {
+            Ok(v) => v,
+            // BLIND is not "nothing was due". If the carrier set is unreadable the cooperative route
+            // refuses (correctly — it cannot tell which coins a plain re-anchor would destroy), and
+            // the unilateral route below is equally unable to tell. Propagate rather than sever
+            // blindly: broadcasting a plain trigger over an unknown carrier destroys its allocation,
+            // which is a worse outcome than the deadline this pass exists to beat.
+            Err(e) => {
+                return Err(anyhow!(
+                    "deadline safety: BLIND — {e}. Neither remedy is safe while this wallet cannot                      tell a token carrier from a plain coin."
+                ))
+            }
+        };
+        // Whatever the cooperative route could not save is still near its deadline. Re-read rather
+        // than inferring from the failure list: `reanchor` may have partially succeeded, and a coin
+        // it moved is no longer at risk under its OLD id.
+        use electrum_client::ElectrumApi;
+        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
+        let carriers = self.unspendable_as_btc_outpoints().await?;
+        let record = self.record().await?;
+        let still_due: Vec<String> = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| !crate::wallet::is_token_carrier(c, &carriers))
+            .filter(|c| coin_near_final(c, tip, margin_blocks))
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        drop(record);
+
+        let mut severed = Vec::new();
+        for id in still_due {
+            // `unilateral_exit` broadcasts the trigger when `F` is still unspent, which IS the sever,
+            // and then walks whatever has matured. It is idempotent per block.
+            match self.unilateral_exit(Some(vec![id.clone()]), None).await {
+                Ok(statuses) if !statuses.is_empty() => severed.push(id),
+                // A coin that cannot be severed either is genuinely stuck; the fault surfaces through
+                // the watchtower channel rather than aborting the pass over one coin.
+                _ => continue,
+            }
+        }
+        Ok((re_anchored, severed))
+    }
+
     /// Pre-spend auto-refresh hook (see [`Self::auto_refresh_due`]): when `auto_refresh` is enabled,
     /// re-anchor any near-final coin before a transfer selects it, then WAIT for the fresh coins to
     /// confirm so the spend can use them. This is what makes an aging coin transparent to the caller

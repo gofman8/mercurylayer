@@ -1845,13 +1845,32 @@ impl UtexoWallet {
         tokio::spawn(async move {
             loop {
                 let _ = wallet.claim().await;
-                // Routine background re-anchoring is OFF by default (B4 economics): refresh is folded
-                // into `transfer` and paid on-demand as part of the payment fee, so a running wallet
-                // never silently shrinks a balance in the background. Only run it here if the operator
-                // explicitly opted in. Deadline safety for idle wallets is the `auto_exit` pass below.
+                // **[D40 / A.2] DEADLINE SAFETY IS UNCONDITIONAL. Routine re-anchoring is not.**
+                //
+                // These are two different jobs and they used to share one flag. Routine background
+                // re-anchoring is an ECONOMICS choice — B4 folds the re-anchor cost into `transfer`
+                // and pays it on demand, so a running wallet must not silently shrink a balance in
+                // the background — and it stays opt-in. But a whole laddered coin carries one
+                // absolute clock, `min(L_k)` over its flat chain, held by its PRIOR OWNERS; when
+                // that height passes, any ancestor's matured rung spends `F` and takes the coin.
+                //
+                // That is a SAFETY property, and it sat behind the economics flag. The comment here
+                // used to say "deadline safety for idle wallets is the `auto_exit` pass below" —
+                // that is false: `auto_exit_due` protects sub-coins and materialises carriers. The
+                // whole-coin clock had no scheduled defender at all on a default wallet.
+                //
+                // `deadline_safety_due` tries the cooperative re-anchor first and SEVERS FROM `F`
+                // (broadcasts the already-co-signed trigger) when that fails — because the party
+                // most interested in this deadline passing is the same party asked to co-sign the
+                // re-anchor, and a defence its adversary can decline is not a defence (D40.1).
                 if wallet.inner.config.auto_refresh && wallet.inner.config.background_auto_refresh {
                     let _ = wallet
                         .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
+                        .await;
+                } else {
+                    // Not opted into routine maintenance — run the safety half alone.
+                    let _ = wallet
+                        .deadline_safety_due(wallet.inner.config.auto_refresh_margin_blocks)
                         .await;
                 }
                 // [F2] TES-R ladder defence. UNCONDITIONAL — there is no opt-in and no config flag,
