@@ -12603,6 +12603,55 @@ pub fn verify_child_bundle(
         )?;
     }
 
+    // ── [D48 / R13 option B] A FRESH MINT MUST BE MINTED AT THE HEAD. ─────────────────────────────
+    //
+    // The grid law above stops a sender picking a rung BETWEEN two honest ones. It does not stop
+    // them picking an honest rung far DOWN the ladder: `e_c = e0 − 10·δE`, perfectly on-grid,
+    // admitted by the band, and the payee receives a leaf with 10 renewals already spent that it
+    // never got the use of.
+    //
+    // A fresh mint has no history, so it has nothing to disclose: `child_superseded_states` and
+    // `child_superseded_extensions` are both empty. A RENEWED leaf discloses superseded EXTENSIONS;
+    // a RE-TRANSFERRED one discloses superseded STATES. That discrimination is EXACT rather than
+    // heuristic, and this is the whole reason option (B) is expressible at all: the exact-equality
+    // census means a sender cannot omit a superseded tier to disguise a used leaf as a fresh one —
+    // the omission shows up as `num_sigs` mismatch, which is checked before this.
+    //
+    // So on the one shape where the honest values are KNOWN — no history, therefore no renewals and
+    // no hops spent — require them exactly, rather than admitting the whole band.
+    //
+    // [D48 (C) REJECTED, and this is not it.] There is deliberately NO floor on a re-transferred
+    // leaf's `d_c`: `child_supersede_csv` lets an honest FINAL hop convey `d_c = d_floor`, and that
+    // leaf is not dead — `renew_child` resets it for zero on-chain bytes. A floor would strand
+    // honest coins for a harm the remedy already undoes.
+    if cb.child_superseded_states.is_empty() && cb.child_superseded_extensions.is_empty() {
+        // The SIGNED values, from the same `nSequence` the two blocks above bound the declared
+        // fields against — never `TesrTier::csv`, which is a plain serde field on conveyed material.
+        let p = cb.parent.params;
+        let e_c = ext_tx.input[0].sequence.0 as u16;
+        let d_c = st_tx.input[0].sequence.0 as u16;
+        {
+            if e_c != p.e0 {
+                return Err(anyhow::anyhow!(
+                    "[D48] this child discloses NO superseded tiers, so it is a FRESH MINT — but its                      extension CSV is {e_c}, not the schedule head e0 {}. A fresh child has spent no                      renewals, so anything below the head is budget the sender took before handing                      it over: {} of the {} renewals on this level are already gone. (A renewed leaf                      would disclose superseded EXTENSIONS and a re-transferred one superseded                      STATES; disclosing neither is what makes this case exact.)",
+                    p.e0,
+                    (p.e0.saturating_sub(e_c)) / p.delta_e.max(1),
+                    p.e0.saturating_sub(p.e_floor) / p.delta_e.max(1),
+                ));
+            }
+        }
+        {
+            if d_c != p.d0 {
+                return Err(anyhow::anyhow!(
+                    "[D48] this child discloses NO superseded tiers, so it is a FRESH MINT — but its                      state CSV is {d_c}, not the schedule head d0 {}. A fresh child has taken no                      hops, so anything below the head is hop budget the sender spent before handing                      it over: {} of {} gone.",
+                    p.d0,
+                    (p.d0.saturating_sub(d_c)) / p.delta.max(1),
+                    p.d0.saturating_sub(p.d_floor) / p.delta.max(1),
+                ));
+            }
+        }
+    }
+
     // MODEL A: the final child state must pay the RECEIVER's own key.
     let recv_spk = Address::from_str(receiver_backup_address)
         .map_err(|_| anyhow::anyhow!("bad receiver backup address"))?
@@ -16521,6 +16570,12 @@ mod skim_leaf_attack_tests {
         /// **The original probe.** The extension forwards a fraction and routes the rest to a second
         /// output paying the sender, taking a plausible fee on the way. `Σ payload outputs` comes up
         /// short of the law's expected total.
+        /// **[D48] A STALE FRESH MINT.** Every value honest, every signature real, the CSV
+        /// perfectly ON-GRID — and three renewal rungs already spent before the payee ever sees it.
+        /// The grid law cannot see this: `e0 − 3·δE` is exactly what an honest third renewal emits.
+        /// What gives it away is that the bundle discloses NO superseded tiers, so there was no
+        /// renewal to have spent them on.
+        StaleFreshMint,
         ExtensionGreedy,
         /// The same theft, sized so that `Σ payload outputs` STILL equals the expected total — the
         /// attacker pays the committed fee and simply moves the value between two payload outputs.
@@ -16632,8 +16687,14 @@ mod skim_leaf_attack_tests {
             let c = &self.child;
 
             // ---- hop 1: the child extension ------------------------------------------------------
+            // [D48] `ext_csv(1)` is ON the grid — the first honest renewal rung — so only the
+            // fresh-mint equality can refuse it.
+            let ext_csv = match skim {
+                Skim::StaleFreshMint => p.ext_csv(1),
+                _ => p.ext_csv(0),
+            };
             let xc = mercurylib::tesr::build_extension(
-                &sp_txid, slot, &c.address, NET, p.ext_csv(0), self.rate,
+                &sp_txid, slot, &c.address, NET, ext_csv, self.rate,
             )
             .expect("child extension");
             let honest_forward = xc.out_value; // slot − one rung, what an honest tier pays on
@@ -16661,7 +16722,7 @@ mod skim_leaf_attack_tests {
                     });
                     forwarded
                 }
-                Skim::None | Skim::StateHop => honest_forward,
+                Skim::None | Skim::StateHop | Skim::StaleFreshMint => honest_forward,
             };
             // The blind SE co-signs the tampered distribution exactly as it co-signs an honest one.
             let xc_tx = cosign(&xc_tx, slot, &c.spk, &c.kp);
@@ -16693,7 +16754,7 @@ mod skim_leaf_attack_tests {
                 sp_vout: 0,
                 child_statechain_id: "child-sid".into(),
                 child_owner_exit_address: self.receiver.address.clone(),
-                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_extension: tier(&xc_tx, Some(ext_csv), xc.payload_vout),
                 child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
                 child_superseded_states: vec![],
                 child_superseded_extensions: vec![],
@@ -16806,6 +16867,53 @@ mod skim_leaf_attack_tests {
     /// 1 000 sat forward, with the remainder going to a second output back to the sender.
     /// `child_state` then pays the receiver 510 sat and declares `out_value: 510` truthfully. Before
     /// `4e165e6` this returned `Ok(())` and the receiver was credited 198 530 for a coin worth 510.
+    /// **[D48 / R13 option B] A STALE FRESH MINT IS REFUSED — the attack the grid law cannot see.**
+    ///
+    /// The grid law (option A) stops a sender picking a rung BETWEEN two honest ones. It does not
+    /// stop them picking an honest rung far DOWN the ladder: `e0 − 3·δE` is exactly what a third
+    /// renewal emits, so every band check and every grid check passes.
+    ///
+    /// What gives it away is disclosure. A fresh child has no history and therefore nothing to
+    /// disclose; a RENEWED leaf discloses superseded extensions and a RE-TRANSFERRED one superseded
+    /// states. So a bundle claiming three renewals' worth of spent budget while disclosing none is
+    /// self-contradictory — and the sender cannot fix it by omitting a superseded tier, because the
+    /// exact-equality census counts them.
+    ///
+    /// Every value here is honest, every signature real, and the CSV is on the grid. Only the
+    /// fresh-mint equality refuses it.
+    #[test]
+    fn a_stale_fresh_mint_is_refused_even_though_its_csv_is_on_the_grid() {
+        let rig = rig();
+        let honest = rig.child_bundle(Skim::None);
+        let facts = rig.facts();
+        verify(&honest, &facts).expect("the control: a fresh mint AT THE HEAD is accepted");
+
+        let stale = rig.child_bundle(Skim::StaleFreshMint);
+        // NON-VACUITY: the CSV really is on the grid, so the grid law cannot be what refuses it.
+        let p = stale.parent.params;
+        let ext_csv = parse(&stale.child_extension.signed_tx).input[0].sequence.0 as u16;
+        assert!(
+            p.is_on_ext_grid(ext_csv),
+            "the probe must sit ON the grid ({ext_csv}), or this test is re-proving option (A)"
+        );
+        assert_ne!(ext_csv, p.e0, "…and BELOW the head, or there is nothing to refuse");
+        assert!(
+            stale.child_superseded_states.is_empty()
+                && stale.child_superseded_extensions.is_empty(),
+            "the probe must disclose NO superseded tiers — that is what makes it a fresh mint"
+        );
+
+        let msg = verify(&stale, &facts)
+            .expect_err("[D48] a fresh mint below the schedule head must be REFUSED")
+            .to_string();
+        assert!(msg.contains("[D48]"), "refused by the fresh-mint rule, not incidentally: {msg}");
+        assert!(msg.contains("FRESH MINT"), "{msg}");
+        assert!(
+            msg.contains("renewals on this level are already gone"),
+            "the refusal must quantify what the payee lost, not merely say no: {msg}"
+        );
+    }
+
     #[test]
     fn a_skimming_child_extension_is_refused() {
         let rig = rig();

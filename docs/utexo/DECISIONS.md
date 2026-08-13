@@ -1569,10 +1569,22 @@ admitted by every band check — hands over a leaf that can **never renew**: 36 
 own test caught it admitting `SPINE_CSV = 0` on mainnet (`1440 % 36 == 0`), which is why both grids
 carry the floor bound.
 
-**(B) remains:** require `m == 0` and `d_c == d0` on a FRESH MINT, discriminated by the
-exact-equality census count — a fresh child expects 2, a renewed leaf discloses superseded
-EXTENSIONS, a re-transferred leaf discloses superseded STATES. The discrimination is exact precisely
-because a sender cannot omit a superseded tier without failing the census.
+**(B) is LANDED** — `verify_child_bundle` requires `e_c == e0` and `d_c == d0` on a FRESH MINT,
+discriminated by disclosure: a fresh child has no history so it discloses nothing, a renewed leaf
+discloses superseded EXTENSIONS, a re-transferred leaf discloses superseded STATES. The
+discrimination is exact precisely because a sender cannot omit a superseded tier without failing the
+exact-equality census, which is checked first. The refusal QUANTIFIES the loss ("*n* of *N* renewals
+on this level are already gone") rather than merely refusing.
+
+The attack it closes is the one the grid law cannot see: `e0 − k·δE` is exactly what an honest *k*-th
+renewal emits, so a stale mint passes every band check and every grid check. Only "you claim *k*
+renewals' worth of spent budget while disclosing none" catches it.
+
+Verified by `a_stale_fresh_mint_is_refused_even_though_its_csv_is_on_the_grid` — which asserts, as
+non-vacuity, that the probe's CSV really is on the grid and really is below the head, so the test
+cannot be re-proving option (A). Live: SDK59, 84, 17, 81, 41, 74, 77, 22 all green, covering fresh
+mints, renewals, depth-2 chains, recovery and chaos — the rule does not false-positive on any honest
+shape.
 
 **(C) a minimum `d_c` on re-transfer is REJECTED.** `child_supersede_csv` lets an honest final hop
 convey `d_c = 144`, and that leaf is not dead: `renew_child` resets it to 1440 for zero on-chain
