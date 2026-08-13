@@ -1278,6 +1278,15 @@ Slowest to first prose; fastest to prose that survives review.
 
 ## D41 — B.8 (the flat-chain head anchor) is NOT receiver-derivable; `k` stays unpublished
 
+> ## ⚠️ SUPERSEDED BY D49. THE PREMISE BELOW IS WRONG.
+> **There is no truncation hole.** The census already refuses it, and D41's error is one line:
+> *"buy one extra co-signature per dropped rung, disclose those in `superseded_states`, and the
+> census STILL BALANCES"* — buying a co-signature moves the LEFT-hand side too. See [D49] for the
+> arithmetic and the verification. The reasoning below about `h_deposit` not being receiver-derivable
+> is **still correct**; it is simply an answer to a question that did not need asking. Kept because a
+> retracted decision is more useful than a deleted one — and because the `h_deposit` derivation is
+> the reason nobody should reach for that anchor for some other purpose either.
+
 **Investigated 2026-08-13 while executing D40.1's gate. The specified fix cannot be built as
 written, and that is a sharper reason to withhold `k` than "not done yet".**
 
@@ -1595,3 +1604,65 @@ floored `d_c` is **36 of 576 hops = 6.25%**, not the 100% the first pass claimed
 **(D) declare-and-verify** hands the payee a knob with no principled setting — D19's polling-interval
 shape. **(E) pricing the piece against its budget** deletes the sub-economic lane the design was
 selected to open, and bills the wrong party.
+
+
+## D49 — B.8 is NOT A DEFECT: the census already refuses head truncation (supersedes D41)
+
+**Investigated 2026-08-13 while preparing to BUILD the fix.** The right answer turned out to be that
+there is nothing to build, and finding that cost less than building the wrong thing would have.
+
+### The arithmetic
+
+Write `N` for the SE's attested `sig_count`, `F` for the conveyed flat-backup length, `T` for the
+live tiers, `S` for the disclosed superseded entries, `H` for hidden co-signatures. By construction
+`N = F + T + S + H` with `H ≥ 0`, and the receiver requires `N == F + T + S` **exactly**
+(`verify_bundle_ex`, `clients/libs/rust/src/tesr.rs`).
+
+| attacker move | Δ`N` | Δ`F + T + S` | net |
+|---|---|---|---|
+| drop `k` head rungs | 0 | −`k` | **rejected, short by exactly `k`** |
+| buy a co-signature and hide it | +1 | 0 | rejected |
+| **buy a co-signature and disclose it as superseded** | **+1** | **+1** | **no credit** |
+
+Closing a deficit of `k` would require `H = −k`. D41 proposed exactly the third row as the attack and
+counted only its right-hand column.
+
+### The three facts it rests on, each verified against source rather than accepted
+
+* **Every disclosed superseded entry is a REAL co-signature.** `verify_superseded_segment` runs
+  `verify_tier_cosigned(tx, value, &agg_spk)` per entry, and `seen_txids` — seeded from the live
+  tier set — dedupes across the live tiers AND both superseded lists, so nothing can be counted twice.
+* **`sig_count` is MONOTONE.** `lockbox/src/db_manager.cpp` contains exactly two mutations, both
+  `UPDATE generated_public_key SET sig_count = sig_count + 1`. There is no decrement.
+* **A flat rung cannot be laundered into `superseded_states`.** It carries `nSequence == 0`
+  (`verify_transaction_sequence`), and a superseded entry's CSV must lie in `[d_floor, d0]` — 144 on
+  mainnet, 6 on regtest — so `0` is refused by name. Independently, a flat rung spends `F`, which is
+  never a key in the live-outpoint map, so it roots in no contention and is refused as an orphan.
+
+### And the census runs on every path
+
+`prepay_flat_census` and the `protocol_version >= 2` claim arm both call `verify_bundle_bound` with a
+length `validate_backup_chain_v2` has just validated; the `< 2` arm compares `num_sigs` against that
+length with **no absorber term at all**; `verify_conveyed_child` uses the re-derived
+`parent_backups.len()`. There is no lane where a flat chain is structurally validated and its length
+is not met against an attested count.
+
+### What this changes
+
+* **B.8 is retired as NOT A DEFECT**, not as "not buildable". Nothing is owed.
+* **`L_0` must not be built.** Even if a hole existed, the lockbox cannot verify `L_0` — a repo-wide
+  search of `lockbox/` and `enclave/` for locktime/height terms returns nothing, and the only
+  per-signature input is a 133-byte blinded MuSig session with no transaction in it. An attested
+  `L_0` would be an unverified client assertion made immutable, and set-once binds the FIRST writer —
+  the depositor, who is the very party who would mount the truncation.
+* **D40.1's gating of `k` rested on this premise.** Whether to publish `k` is now an open owner call
+  on its own merits, not a consequence of an unclosed hole. It is NOT reopened here.
+
+### The lesson, because it is the third of its kind today
+
+I wrote a test to demonstrate the hole and it passed, which I took as confirmation. It exercised
+`validate_backup_chain_v2` **in isolation** — a structural validator, which correctly accepts any
+suffix of a valid ladder because a suffix IS structurally valid. **A test that exercises one
+validator in isolation measures the harness, not the system.** The test is retained, with its framing
+corrected and the census identity added, as
+`the_pairwise_rule_accepts_suffixes_and_the_census_is_what_refuses_them`.

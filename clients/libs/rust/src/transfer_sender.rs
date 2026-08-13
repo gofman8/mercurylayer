@@ -3204,6 +3204,8 @@ mod transfer_cancel_client_tests {
             branch_txs: vec![],
             child_witness_txids: vec![],
             ladder_census_ok: true,
+            // `None` iff the census passed — the invariant the field's own doc states.
+            ladder_census_refusal: None,
         }
     }
 

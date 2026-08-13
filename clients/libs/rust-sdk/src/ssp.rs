@@ -456,8 +456,15 @@ impl SspService {
                 .find(|p| &p.statechain_id == sid)
                 .ok_or_else(|| anyhow!("latched coin {sid} not in the pending set"))?;
             if !p.ladder_census_ok {
+                // The REASON, not a disjunction of everything that could have gone wrong. The gate
+                // is unchanged — it still fails closed — but an operator who is refused a payment
+                // needs to know which check refused it, and a six-way "or" is not that.
+                let why = p.ladder_census_refusal.as_deref().unwrap_or(
+                    "no reason recorded — the census refused without reporting which check failed, \
+                     which is itself a defect",
+                );
                 return Err(anyhow!(
-                    "latched coin {sid} failed the pre-pay ladder census (un-laddered or below the pre-pay protocol-version floor, hidden state / num_sigs mismatch, coin or owner-exit binding failure, dead funding output, or unreadable) — refusing to pay"
+                    "latched coin {sid} failed the pre-pay ladder census — refusing to pay. {why}"
                 ));
             }
         }

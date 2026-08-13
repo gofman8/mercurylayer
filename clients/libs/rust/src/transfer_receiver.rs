@@ -463,6 +463,18 @@ pub struct PendingTransferInfo {
     /// malformed ladder/child bundle, a funding UTXO that is off-chain/spent/unconfirmed, an
     /// exit address that is not ours, or an unreadable enclave sig-count / coordinator aggregate.
     pub ladder_census_ok: bool,
+    /// **WHY the census refused, when it did.** `None` iff `ladder_census_ok`.
+    ///
+    /// The two census arms below used to collapse their `Err` with `Err(_) => false` and
+    /// `.is_ok()`, so a refusal reached the SSP as a bare boolean and its operator was handed a
+    /// six-way disjunction — "un-laddered or below the version floor or hidden state or binding
+    /// failure or dead funding output or unreadable" — with no way to tell which. That is precisely
+    /// the shape this repo refuses everywhere else: a fail-closed gate that cannot say why is a gate
+    /// nobody can operate, and it turns a five-minute diagnosis into a bisect.
+    ///
+    /// Carrying the reason changes NO decision. The gate still fails closed on any error; this is
+    /// the sentence that goes with it.
+    pub ladder_census_refusal: Option<String>,
 }
 
 /// **[D38/D16] `protocol_version` is a message-SHAPE selector, not an ordinal.**
@@ -969,10 +981,18 @@ pub async fn peek_pending_transfers(
                 .and_then(|c| {
                     mercurylib::transaction::get_user_backup_address(c, wallet.network.clone()).ok()
                 });
-            let (ladder_census_ok, child_amount) =
+            let (ladder_census_ok, child_amount, ladder_census_refusal) =
                 match (&transfer_msg.child_tesr_bundle, my_backup.as_deref()) {
                     // No derivable owner key ⟹ nothing to bind the exit to ⟹ refuse.
-                    (_, None) => (false, None),
+                    (_, None) => (
+                        false,
+                        None,
+                        Some(
+                            "no owner backup address is derivable for this auth key, so the ladder's \
+                             exit cannot be bound to us"
+                                .to_string(),
+                        ),
+                    ),
                     (Some(cb_json), Some(bk)) => {
                         match prepay_child_census(
                             client_config,
@@ -986,27 +1006,27 @@ pub async fn peek_pending_transfers(
                         {
                             // The child value may override the branch-derived `amount` ONLY here, i.e.
                             // only once the bundle has been bound to the latched sid and censused.
-                            std::result::Result::Ok(v) => (true, Some(v)),
-                            Err(_) => (false, None),
+                            std::result::Result::Ok(v) => (true, Some(v), None),
+                            Err(e) => (false, None, Some(format!("child census: {e:#}"))),
                         }
                     }
-                    (None, Some(bk)) => (
-                        prepay_flat_census(
-                            client_config,
-                            &wallet.network,
-                            bk,
-                            &transfer_msg,
-                            &funding_txid,
-                            funding_vout,
-                            onchain_tx0.as_ref(),
-                            &groups,
-                            &info_config,
-                            blockheight,
-                        )
-                        .await
-                        .is_ok(),
-                        None,
-                    ),
+                    (None, Some(bk)) => match prepay_flat_census(
+                        client_config,
+                        &wallet.network,
+                        bk,
+                        &transfer_msg,
+                        &funding_txid,
+                        funding_vout,
+                        onchain_tx0.as_ref(),
+                        &groups,
+                        &info_config,
+                        blockheight,
+                    )
+                    .await
+                    {
+                        std::result::Result::Ok(()) => (true, None, None),
+                        Err(e) => (false, None, Some(format!("flat census: {e:#}"))),
+                    },
                 };
             let amount = child_amount.unwrap_or(amount);
             out.push(PendingTransferInfo {
@@ -1030,6 +1050,7 @@ pub async fn peek_pending_transfers(
                     .and_then(|cb| cb.colored_child_txids().ok())
                     .unwrap_or_default(),
                 ladder_census_ok,
+                ladder_census_refusal,
             });
         }
     }
