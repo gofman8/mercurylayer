@@ -7326,7 +7326,7 @@ pub fn epoch_deadline_from_flat_backups(
 /// **This does not close CO-1.** The enclave key material and the counter it attests are held by the
 /// same party the receiver is being protected from; see D40.2. What it closes is the gap between
 /// what the enclave signed and what the client actually read.
-async fn attested_terminal(
+pub(crate) async fn attested_terminal(
     cc: &ClientConfig,
     info: &mercurylib::transfer::receiver::StatechainInfoResponsePayload,
     what: &str,

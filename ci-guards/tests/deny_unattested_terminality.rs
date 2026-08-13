@@ -144,6 +144,80 @@ fn no_verifier_reads_terminality_from_the_unattested_endpoint() {
     );
 }
 
+/// **[D54] …AND THE CENSUS COVERS EVERY FILE THAT REACHES A VERIFIER, NOT ONE FUNCTION.**
+///
+/// The test above reads `verify_conveyed_child`, in `tesr.rs`, and nothing else. Its own module
+/// header says the hole was live "on both the claim path and the SSP's pre-pay census" — and
+/// `verify_terminal_parents`, in a DIFFERENT FILE, was still reading
+///
+/// ```ignore
+/// let terminal = v.get("terminal").and_then(|t| t.as_bool()).unwrap_or(false);
+/// ```
+///
+/// straight off `GET /statechain/spend_budget/{id}`, with two verifier call sites: `claim()` and the
+/// SSP pre-payment gate that authorises an irreversible Lightning leg. That is the lane a DEFAULT
+/// wallet uses — `colored_ladder` ships false, so branch-funded sub-coins are what wallets receive.
+///
+/// **A guard scoped to one function certified a property of the whole receiver.** It stayed green
+/// for as long as the hole existed, and it named the very lane it could not see.
+///
+/// So this census is over FILES: no file that reaches a verifier may parse a `terminal` field out of
+/// an HTTP body. The attested derivation and its deliberate cross-check both live behind
+/// `attested_terminal`, which is the one place allowed to consult the coordinator's copy.
+#[test]
+fn no_file_that_reaches_a_verifier_parses_terminality_out_of_an_http_body() {
+    const REACHES_A_VERIFIER: [&str; 3] = [
+        "clients/libs/rust/src/transfer_receiver.rs",
+        "clients/libs/rust/src/tesr.rs",
+        "clients/libs/rust-sdk/src/tokens.rs",
+    ];
+    // The shape of the defect: pulling `terminal` out of a deserialised response.
+    const RAW_READS: [&str; 3] = [
+        "\"terminal\").and_then",
+        "get(\"terminal\")",
+        "/statechain/spend_budget/",
+    ];
+    let mut offenders = Vec::new();
+    for f in REACHES_A_VERIFIER {
+        let code = code_only(&read(f));
+        for needle in RAW_READS {
+            if code.contains(needle) {
+                offenders.push(format!("{f}: contains `{needle}`"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a file on a verifier path reads terminality out of an HTTP body again. That endpoint is \
+         the coordinator's own Postgres with no enclave signature, and one `terminal: true` from it \
+         retires a whole parent tree — accepted by `claim()` AND paid out over by the SSP pre-pay \
+         gate. Route it through `attested_terminal`, which derives terminality from the enclave's \
+         signed `num_sigs`/`sig_budget` and keeps the coordinator's answer as a CROSS-CHECK \
+         only.\n\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// NON-VACUITY for the file census. A scan over a list of files is the exact shape that goes
+/// vacuous when a path is renamed — the file simply stops existing and the loop finds nothing.
+#[test]
+fn the_file_census_reads_real_files_and_would_catch_the_original_defect() {
+    for f in [
+        "clients/libs/rust/src/transfer_receiver.rs",
+        "clients/libs/rust/src/tesr.rs",
+        "clients/libs/rust-sdk/src/tokens.rs",
+    ] {
+        let code = code_only(&read(f));
+        assert!(code.len() > 10_000, "{f} scanned to {} bytes — that is not the file", code.len());
+    }
+    // The literal the defect was written in, as it stood before D54.
+    let defect = r#"let terminal = v.get("terminal").and_then(|t| t.as_bool()).unwrap_or(false);"#;
+    assert!(
+        defect.contains(r##"get("terminal")"##),
+        "the detector no longer recognises the shape it exists to catch"
+    );
+}
+
 /// NON-VACUITY: the attested fields the derivation depends on must still be verified upstream, and
 /// the refusal for a missing one must still be there. Without this, the census above could pass over
 /// a payload nobody checked.

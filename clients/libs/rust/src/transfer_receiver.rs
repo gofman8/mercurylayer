@@ -1179,24 +1179,49 @@ async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String
             required_ancestors
         ));
     }
-    let client = client_config.get_reqwest_client()?;
+    // ═══ [D54] TERMINALITY IS AN ATTESTED FACT ON THIS LANE TOO ═══
+    //
+    // This loop used to `GET /statechain/spend_budget/{id}` and read `terminal` as a plain bool:
+    //
+    //     let terminal = v.get("terminal").and_then(|t| t.as_bool()).unwrap_or(false);
+    //
+    // That is the COORDINATOR's own Postgres, unsigned. A coordinator answering `terminal: true`
+    // for a parent with budget remaining gets a branch-funded sub-coin accepted whose ancestor is
+    // still double-spendable — which is the entire property this function exists to establish.
+    //
+    // [D8-CLOSE] closed exactly this hole for the CHILD-BUNDLE lane (`verify_conveyed_child` →
+    // `attested_terminal`), and the guard that certifies it closed reads only that one function in
+    // one other file, so it never saw this call site. The hole survived on the lane a DEFAULT wallet
+    // actually uses: `SdkConfig::colored_ladder` ships false ([D30]), so plain branch-funded
+    // sub-coins are what wallets receive. And this function has TWO verifier call sites — `claim()`
+    // and the SSP's pre-payment `trusted` gate, the one that authorises an irreversible Lightning
+    // leg over an unverified premise.
+    //
+    // `attested_terminal` derives terminality from the enclave-signed `num_sigs`/`sig_budget` pair
+    // (fetched under a per-request nonce by `get_statechain_info`, which REFUSES an unattested
+    // answer) and keeps the coordinator's bool as a CROSS-CHECK: a disagreement means one store was
+    // written behind the other's back, and that is a refusal rather than a preference.
+    //
+    // RESIDUAL, stated rather than implied: `get_statechain_info` verifies the attestation against
+    // the served `enclave_public_key`, and binding THAT key to the chain is a separate caller step
+    // (`validate_tx0_output_pubkey`), which the claim path does for the coin being claimed and
+    // neither path does for a PARENT. So this closes "the coordinator asserts terminality" and does
+    // NOT close "the coordinator serves its own enclave key for a parent". See D54.
     for parent_id in parents {
-        let url = format!(
-            "{}/statechain/spend_budget/{}",
-            client_config.statechain_entity, parent_id
-        );
-        let resp = client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "could not query terminal state of parent {parent_id}: {}",
-                resp.status()
-            ));
-        }
-        let v: serde_json::Value = resp.json().await?;
-        let terminal = v.get("terminal").and_then(|t| t.as_bool()).unwrap_or(false);
+        let info = crate::utils::get_statechain_info(parent_id, client_config)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "structural parent {parent_id} is unknown to the SE — refusing the sub-coin.                      A parent that cannot be found cannot be proved terminal, and 'not found' must                      not read as 'nothing to check'."
+                )
+            })?;
+        let terminal =
+            crate::tesr::attested_terminal(client_config, &info, "structural parent", parent_id)
+                .await?;
         if !terminal {
             return Err(anyhow!(
-                "structural parent {parent_id} is NOT terminal at the SE — rejecting sub-coin (the sender could still double-spend it)"
+                "structural parent {parent_id} is NOT terminal — rejecting sub-coin (the sender                  could still double-spend it). This is the ENCLAVE's attested answer                  (num_sigs {} against its signed budget), not the coordinator's record.",
+                info.num_sigs
             ));
         }
     }

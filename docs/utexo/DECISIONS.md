@@ -1925,3 +1925,78 @@ I re-derived the depth-10 figure earlier in this same session and reported it as
 derivation was arithmetically correct and measured **the wrong rule** — the same wrong rule the
 original had. Two independent derivations agreeing means nothing when both read the same premise.
 **Check which gate actually admits, not whether the arithmetic reproduces.**
+
+---
+
+## D54 — Terminality was an unattested integer on the lane a default wallet uses
+
+**Status:** FIXED IN CODE + GUARD. **Date:** 2026-08-14. **Class:** false security claim / theft.
+**Found by:** the pre-spec adversarial review's own verifier, ranked Tier 1.
+
+### The hole
+
+`verify_terminal_parents` (`clients/libs/rust/src/transfer_receiver.rs`) established the property that
+a branch-funded sub-coin's structural ancestors are terminal — i.e. that the sender cannot still
+double-spend them — like this:
+
+```rust
+let url = format!("{}/statechain/spend_budget/{}", client_config.statechain_entity, parent_id);
+let v: serde_json::Value = resp.json().await?;
+let terminal = v.get("terminal").and_then(|t| t.as_bool()).unwrap_or(false);
+```
+
+That is the COORDINATOR's own Postgres, unsigned. One `terminal: true` retires a whole parent tree.
+
+It has **two** call sites, and both are verifiers: `claim()`, and the SSP's pre-payment `trusted`
+gate — the gate that authorises an irreversible Lightning leg. And it is the lane a default wallet
+uses: `SdkConfig::colored_ladder` ships false ([D30]), so plain branch-funded sub-coins are what
+wallets receive.
+
+### Why it survived D8-CLOSE, which was supposed to close exactly this
+
+[D8-CLOSE] built the attested reader and repointed the CHILD-BUNDLE lane
+(`verify_conveyed_child` → `attested_terminal`). The guard written to certify it —
+`deny_unattested_terminality::no_verifier_reads_terminality_from_the_unattested_endpoint` — reads
+**one function in one file**:
+
+```rust
+let body = item_body(&tesr(), "pub async fn verify_conveyed_child(");
+assert!(!body.contains("get_spend_budget("), …);
+```
+
+`verify_terminal_parents` is in a different file, so the guard never saw it. **A guard scoped to one
+function certified a property of the whole receiver, and stayed green for as long as the hole
+existed.** Its own module header names the lane it could not see — *"on both the claim path and the
+SSP's pre-pay census"* — which is the sentence that should have made someone widen it.
+
+### The fix
+
+* `verify_terminal_parents` now calls `attested_terminal`: terminality is derived from the enclave's
+  signed `num_sigs`/`sig_budget` pair (fetched by `get_statechain_info` under a per-request nonce,
+  which REFUSES an unattested answer), with the coordinator's bool kept as a **cross-check** — a
+  disagreement is a refusal, not a preference, because it means one store was written behind the
+  other's back.
+* A parent unknown to the SE is now a refusal rather than a fall-through: "not found" must not read
+  as "nothing to check".
+* The guard is widened from one function to a **file census**: no file that reaches a verifier may
+  parse a `terminal` field out of an HTTP body. Verified by mutation — reintroducing the raw read
+  turns it red.
+
+### RESIDUAL, stated rather than implied
+
+`get_statechain_info` verifies the attestation against the **served** `enclave_public_key`. Binding
+that key to the chain is a separate caller step (`validate_tx0_output_pubkey`), which has exactly one
+call site repo-wide — the claim path, for the coin being claimed. Neither path binds it for a
+**parent**. So D54 closes *"the coordinator asserts terminality"* and does NOT close *"the
+coordinator serves its own enclave key for a parent"*. Closing that needs each parent's tx0 at the
+verifier, which is a further change and is not made here.
+
+**Do not write "terminality comes from the enclave signature" unqualified in the spec.** Write it
+with this residual.
+
+### The lesson
+
+This is the third time this session that a **pin on a description passed while the construction was
+wrong** — and the first time the description was a *guard*. A guard is a test, and a test scoped
+narrower than the property it names is worse than no test: it converts an open hole into a closed
+finding. When a guard's own prose names a lane, the guard must read that lane.
