@@ -1,0 +1,679 @@
+{
+  "summary": "Adversarially hunt for flaws in the Utexo protocol DESIGN (not the code), to ground a soundness argument",
+  "agentCount": 15,
+  "logs": [],
+  "result": {
+    "frame": {
+      "adversaries": [
+        {
+          "name": "Prior owner of THIS coin (same or older epoch)",
+          "controls": "Every piece of pre-signed material they were ever handed and never surrendered: the no-timelock trigger T (TRIGGER_SEQUENCE = 0xFFFFFFFD, lock_time 0 — broadcastable the instant F confirms), every extension X_{m'}, every state S_j they held, and on the whole-coin lane the flat backup chain over F with decrementing absolute nLockTimes. Their own wallet.db copy. Timing: they choose when to broadcast, and can CPFP from their own wallet (D31: the owner is the normative funder). They can broadcast T purely to grief.",
+          "cannot": "Produce any NEW co-signature under A: the handover rotates the SE share (sender_share+SE_old == receiver_share+SE_new == A) and re-points the auth key, so the lockout is permanent (R9, sdk60). Win the CSV race from behind: the current state is minted at strictly-lower CSV (replace-by-lower-timelock), and every stale extension's parent becomes unconfirmable once X_{m} spends T.out[0] (sdk40 PART 2). Hide a co-signed rival from the receiver: the exact-equality census se_num_sigs == flat_backups + tiers + superseded now reads an ENCLAVE-ATTESTED count (utexo/sig_count/v2, verified at clients/libs/rust/src/utils.rs:143-200, fail-closed when absent). Re-declare a live tier as superseded (slot uniqueness over live ∪ superseded, HashSet<Txid>). CONDITIONAL, not absolute: the race is only lost by them if a defender acts inside the window and the tier can relay — D26's LiveRival check exists precisely because the 'it can never confirm' proof presumed relayability. And with δ enforced only as sup.csv > live_csv (D14 half b, tesr.rs:8422-8428) their edge can be collapsed from 36 blocks to ONE."
+        },
+        {
+          "name": "Prior owner of an ANCESTOR / the splitter who minted your piece",
+          "controls": "The parent's flat backup chain. Its lowest rung L_k = L_0 − k·interval spends F directly for ONE 112-vB transaction (BACKUP_TX_SIZE, lib/src/transaction.rs:116) and pays them the whole coin — and the lowest rung belongs to the parent's LAST owner, i.e. exactly the splitter. One backup voids the entire tree, so the marginal cost of voiding each additional piece is exactly ZERO. They also hold a broadcastable T, and the child bundle they conveyed hands the payee proof of this (ChildTesrBundle::parent_flat_backups).",
+          "cannot": "Co-sign anything further over the parent: set_spend_budget makes it terminal, the ratchet may only lower (WHERE sig_budget IS NULL OR sig_budget > $1), sign/first returns 410 and the enclave now refuses independently before the secnonce is consumed (D28). Mint a rival to a child they have already handed over (the handover rotated the share). BUT they provably CAN void a sub-economic piece and no operator can stop them: the backups are ALREADY signed, valid Bitcoin transactions, held locally since deposit — 'no operator can un-sign them' (SUBECONOMIC-FINALITY §3.1). This needs no malice: the backup is cheaper than their own ladder walk at every fee rate, by 6× to 265×, so an ordinary sender exiting for their own reasons voids every sub-economic piece they ever paid. This is a finality limit and it is the SENDER'S FREE OPTION, not a payee liveness cost."
+        },
+        {
+          "name": "Current owner / the paying sender at conveyance time",
+          "controls": "Every serde field of the conveyed bundle (TesrTier::csv, out_value, parent.fee_rate, parent.params, segment shape, protocol_version); which pieces to mint and at what value; when to convey; POST /transfer/cancel until the receiver claims; and — because a v3 conveyance carries no handover — potentially the child's auth key and SE share AFTER the payee has booked the payment.",
+          "cannot": "Substitute a decoy funding UTXO or a decoy sid (verify_bundle_bound binds sid, (f_txid,f_vout), f_value, agg_address→on-chain key, and the coordinator's UNIQUE per-sid aggregate — 'the one value in the whole acceptance path that is not restatable by the sender'). Declare a soft CSV (bind_declared_csv reads the signed nSequence under BIP-68 and REFUSES on disagreement; bit-22 time-denominated locks are refused, never counted as zero). Shorten the exit walk by dropping an ancestor segment (each tier is linked to the outpoint above it — structurally pinned, not declared). Pad the flat-backup vector (INV-5 exact-interval decrement, no duplicates, no inversion). Pad superseded_* with junk (every entry parsed, txid-bound, ladder-linked, co-sign-verified, CSV-bounded, and proven transitively dead). Skim value out of the tier chain: since 37d8bba the trigger's payload is bound to f_out.value from chain, and every tier below to the one above by Σ-payload law with an anchor/opret/extra-output residual pin. STILL CAN, and these are open: declare a forged fee_rate on both SYNCHRONOUS verifiers (GAP A/GAP B — a ladder built and declared at 2662 sat/vB satisfies the trigger law against the real F and delivers 1030 sat of a 1,000,000-sat coin); mint value out of nothing in an ancestor split state; declare wide params to relax the [e_floor,e0]/[d_floor,d0] bounds; choose sup.csv = live_csv + 1; convey at protocol_version 3 so the receiver books a payment while the sender keeps both the child auth key and the SE share; mint a piece below V_min(d, r_live)."
+        },
+        {
+          "name": "Receiver / payee",
+          "controls": "Whether and when to claim. Their own indexer, config, margins, and stress-rate policy. In the SSP case, sight of every value.",
+          "cannot": "Claim twice, or claim after cancellation (latch_claim is mutual exclusion between claim and cancel across an irreversible enclave keyupdate). Reverse a claim — keyupdate is irreversible and sig_count is monotonic in the enclave and cannot be decremented. Rob the sender: a transfer is a one-way handover, and until the claim completes the coin is still the sender's (cancellable by re-send/cancel, tm01). NOTE the asymmetry the corpus insists on: the receiver is not the party the model defends against — B8 states there is NO in-protocol payment atomicity; a plain transfer is a gift, not an escrow. Delivery-vs-payment needs the Lightning latch or an invoice."
+        },
+        {
+          "name": "The blind SE enclave (lockbox) alone",
+          "controls": "One share e_n of the per-coin 2-of-2 MuSig2 key. Refusal to co-sign. The monotonic sig_count and the sig_budget ratchet. The attestation key. It sees statechain ids, auth pubkeys, deposit-token ids, single_use/epoch_deadline/budget flags, signature counts, transfer timing and the caller's endpoint.",
+          "cannot": "Steal: it never holds a full key; every spend needs the owner's partial (2-of-2 arithmetic — not test-observable, it is an arithmetic property). Forge exit material after the fact: the tiers/backups are already signed and in the owner's hands. See ANY value: SignFirstRequestPayload is {statechain_id, signed_statechain_id}; PartialSignatureRequestPayload carries an opaque session; DepositMsg1 carries no amount; there is NO amount column in the server database or any migration; /info/config serves only {initlock, interval, batchtimeout, version}. So it cannot distinguish a flat backup from a tier, a piece from change, or a 1310-sat coin from 1 BTC — which is why every value fix in the corpus is receiver-side and why 'the SE enforces a viability floor' is named as a WRONG proposal. Un-terminate a node: the budget ratchet is one SQL statement, and a raise is refused 409. Produce a second partial from a replayed sign/second: the enclave atomically nulls the secnonce on the first partial. Freeze ≠ seize: refusal only blocks the cooperative paths; the unilateral tree is pre-signed and SE-independent (sdk50, sdk45)."
+        },
+        {
+          "name": "The coordinator (API server + Postgres), acting alone and malicious",
+          "controls": "The encrypted transfer mailbox (availability, ordering, deletion, and since POST /transfer/cancel a sender-initiated cancellation). The statechain_id ↔ aggregate_xonly binding (migration 0009). x1_pub. The pending-transfer lock (OPEN_TRANSFER_WINDOW_SQL, spliced into both sign gates). Both sign gates. The claim latch. Batch atomicity. The coordinator-side mirror of the spend budget. Forwarding of enclave replies. It is co-located with the SSP and the blind SE as ONE operator trust domain.",
+          "cannot": "Under-report num_sigs or the budget any more — this WAS the theft-class D8(a) hole (a coordinator under-reporting by k hides k co-signed rival states while the exact-equality census still balances). It is closed: the count and budget travel under ONE enclave BIP-340 signature over sha256(\"utexo/sig_count/v2\" || sid || u32_be(count) || u8(has_budget) || u32_be(budget) || nonce32), verified against the CHAIN-ANCHORED enclave_public_key (not the served attestation pubkey), and an absent or half-stated attestation is REFUSED rather than recorded (D23: no phased rollout). CAN STILL DO, UNDETECTABLY — the corpus states 'nothing in the protocol detects a violation of 2, 3, 5, 6 or 8': serve a wrong or NULL aggregate_xonly (NULL downgrades any coin to the un-laddered lane; a wrong one, combined with the rogue-key decomposition U := D − E_sid where the sender chooses user_public_key, makes an attacker-controlled output pass validate_tx0_output_pubkey); serve a wrong x1_pub, which drives the enclave to rotate by the wrong tweak and BRICKS the coin for everyone; drop the pending-transfer lock so a still-owner sender co-signs a rival while a conveyed receiver holds claimable material; skip either sign gate; break batch atomicity. Also: no adversarial test in the repo models a malicious coordinator — every one models a malicious sender."
+        },
+        {
+          "name": "SE + a past owner with a retained pre-rotation share (B1) — the statechain trust unit",
+          "controls": "Together, the full key of F. A fresh, no-timelock spend via private relay.",
+          "cannot": "Be defended against by any timelock — a fresh signature needs no backup. Be disproven: any proof of erasure attests one instance of the data and nothing prevents a copy having been made before the proof; verifying a negative over an adversary's storage is impossible from outside. What DOES bound it: blindness means the SE cannot identify which coin to steal without the colluding old owner; collusion leaves publicly-queryable evidence (terminal receipts, attested counts); post-hack theft against a WATCHED laddered coin now requires a public on-chain trigger plus ≥144 blocks of notice rather than a minutes-scale mempool race; and a coin received PRE-hack and left untouched is unconditionally safe (the hacked SE holds only post-rotation e_n). Byte-identical in kind to the pre-TES-R B1 and to full-operator collusion in Spark. Splitting the SE across N operators was explicitly rejected: it shrinks B1 only if ≥1 operator is honest, at the price of N-way liveness for every co-sign and an N-fold blindness/collusion surface."
+        },
+        {
+          "name": "Watchtower — delegated, keyless (default) or funded (optional variant)",
+          "controls": "The pre-signed bundle it was handed, its own indexer connection, and the decision of when (or whether) to broadcast. It learns the watched coins' exit transactions — amounts and addresses. A funded variant additionally holds a hot fee float.",
+          "cannot": "Redirect funds: the bundle carries ZERO key material by construction (sdk45 serialises it and asserts absence of mnemonic/seckey/secret/private/privkey/xpriv; unit bundle_roundtrip_and_carrier_has_no_backup for the un-laddered type). Destroy tokens: a carrier's bundle entry structurally contains no backup tx, only the materialising branch, and a carrier is never laddered. Conflict with another tower: all towers hold the SAME pre-signed transactions, so a second broadcast is idempotent — redundancy is pure upside. Its worst action is to broadcast EARLY, which settles the owner's coin TO THE OWNER (costing only off-chain-ness), or not to act (identical to running no tower). AND — this is normative, D31, not an implementation gap — a keyless tower CANNOT FEE-BUMP a stuck tier: a CPFP child spending the P2A anchor needs an input it does not hold and a signature it cannot make, so 'min relay fee not met, 200 < 423' is a refusal it has no action against. The anyone-can-spend anchor supplies no substitute: rescuing a 240-sat anchor was measured to need a 180,330-sat child — ~900× the anchor's value — so 'anyone can' is a permission, not an incentive. A funded tower holds no coin keys (compromise costs the operator's float, never a user's coin) but its simultaneous-rescue capacity is the number of CONFIRMED fee UTXOs it holds, NOT its balance, because TRUC allows a v3 tx at most one unconfirmed ancestor and the tier is already it."
+        },
+        {
+          "name": "Miner / mempool adversary / third-party pinner",
+          "controls": "Block inclusion and ordering; reorgs up to their hashrate; relay-policy behaviour; congestion. Can occupy an unconfirmed spine tier's single TRUC child slot for 240 sat.",
+          "cannot": "Forge a signature, make an immature CSV tier valid, or confiscate — nothing in TES-R ever pays the operator by timeout, so missed liveness is never confiscation-by-design. Pin long vulnerable chains: TRUC 1P1C topology plus sibling eviction plus the committed base fee bound the exposure, and the exit walk is submitted SEQUENTIALLY with a break at the first rejection. PROVABLY CAN, and this is the sharpest structural exposure: outlast the δ = 36 (~6 h) head start with sustained congestion, converting the CSV edge into a pure fee race that a fixed-fee, un-bumpable pre-signed tier cannot win (R-4, currently CARRIED not mitigated). Reorg deeper than confirmation_target (2 regtest / 3 mainnet), undoing the very facts R3/R6 checked. Occupying the spine's single child slot is latency grief, not theft, bounded by the exit-length cap. Note the mutual exclusion: on a spine, SP_{i+1} at CSV 0 occupies the one unconfirmed-child slot, so the fee-bump remedy and the shape that most needs it cannot coexist."
+        },
+        {
+          "name": "RGB counterparty — consignment sender, issuer, or proxy",
+          "controls": "Consignment contents in transit (proxy sees asset, amounts, history); issuance policy (issuer); consignment relay availability.",
+          "cannot": "Forge token rules, amounts or history: the receiver's own wallet client-validates the full consignment against the Bitcoin anchors, and the amount booked is what the consignment assigns to the receiver's outpoint under the cryptographically-derived contract id (R8, rgb12/rgb13 are the negative tests). Freeze a holder's assets: client-validated assets have no enforcement point — there is deliberately no freeze. Steal via the proxy: validation is local, so a dead proxy delays and nothing more (claims retry idempotently). RESIDUAL: the anchoring of that history to Bitcoin resolves through the wallet's own electrum indexer and inherits B3. And the value-conservation sweep explicitly did NOT audit the colour half — whether a consignment actually assigns what the bundle claims (tokens::verify_consignment_assignment, validate_pending_token) is unswept; 'a coloured ladder's ASSET value has its own conservation question that this sweep did not ask.'"
+        },
+        {
+          "name": "Lightning SSP",
+          "controls": "Quotes, routing, when to settle or cancel the HODL invoice, and — in the PAY direction, after pre-pay validation — a BROADCASTABLE receiver-paying state S'. In RECEIVE it fronts its own coin. It is co-located with the coordinator and blind SE as one operator trust domain, and unlike the SE it is an SDK client with its own wallet and Electrum backend, so it SEES every value.",
+          "cannot": "Rob the user in RECEIVE: the SSP owns the coin throughout its risk window, the inbound HTLC is HELD before release, and the receiver's claim gate and the SSP's get_preimage are bound to the SAME latch expiry set shorter than the payer's HODL HTLC — either the receiver completes in-window or both fail and the payer is refunded (sdk25, sdk24). RECEIVE needs no operator trust for safety. Be robbed by the user in PAY: before the irreversible LN leg it runs the full verify_bundle census against the ENCLAVE-AUTHORITATIVE sig_count (not the coordinator DB), so a hidden lower-CSV S* inflates the count past the disclosed ladder and it refuses to pay. TRUSTED FOR, not verified: not broadcasting S' on a rolled-back swap (the existing statechain operator bar — get_msg_addr must stay servable so the census can run, so the exposure is structural). OPEN: nothing binds statechain_transfer.batch_id to lightning_latch.batch_id (C-8); unlock_by_preimage performs NO expiry check while validate_batch refuses the matching claim as expired, so the SSP can pay, unlock, and be unable to claim; and the latch clock is never bound to the HTLC's CLTV — DecodedInvoice carries amt/hash/asset only and a grep for cltv in the SDK returns nothing."
+        }
+      ],
+      "security_goals": [
+        {
+          "id": "G1",
+          "property": "VALUE CONSERVATION — for every tier on every acceptance path, Σ(payload outputs) == tier_out_total(prev, n_payload, rate) where prev is the PARSED value of the output that tier spends, the residual is exactly one P2A anchor of P2A_VALUE plus at most one zero-value opret and nothing else, the chain is anchored hop-by-hop back to f_out.value read from chain, and the yardstick (fee_rate, params) is receiver-derived.",
+          "kind": "safety",
+          "violated_means": "The number a receiver BOOKS is not the number the exit chain can DELIVER. Concretely: a trigger paying A 1,500 out of a 198,530-sat F with 197,030 to a key the attacker keeps, while the receiver books the full funding value; or a ladder declared at 2,662 sat/vB that satisfies the trigger law against the real F and delivers 1,030 sat of a 1,000,000-sat coin. On the child lane the direction inverts — the amount comes from the un-broadcast SP.out[j], so INFLATION is the attack and an SSP pays an irreversible Lightning leg against fiction. A fix that bounds only one direction closes half the class."
+        },
+        {
+          "id": "G2",
+          "property": "NO UNDISCLOSED SPENDING PATH — no co-signature under the coin's aggregate A exists that the receiver was not shown. Enforced as THREE conjoined obligations, never as the equation alone: (a) exact-equality total se_num_sigs == flat_backups + tiers + superseded against an enclave-ATTESTED count; (b) a per-item validation battery on every superseded entry (parse, txid-bind, ladder-link, co-sign-verify, CSV-bound, prove transitively dead by direct contention plus fixpoint); (c) slot uniqueness over the UNION of live and disclosed tiers.",
+          "kind": "safety",
+          "violated_means": "A sender retains a co-signed rival state the receiver never counted, and can broadcast it later. The repo has been bitten twice by treating the census as arithmetic: [S1] junk padding, and [C-2] where a GENUINE tier disclosed twice inflates `expected` by one for free while passing parse, linkage, signature and race checks unchanged. Note the exact scope: this property is 'no undisclosed spending path signed under A exists' — it is NOT 'the receiver cannot be defrauded'. The census bounds spending PATHS, not VALUE; G1 carries the value claim."
+        },
+        {
+          "id": "G3",
+          "property": "OLD STATE DIES / NO DOUBLE-SPEND — every superseded state is disclosed and provably out-raced at the consensus level: the live state carries a strictly-lower CSV over the same outpoint (replace-by-lower-timelock at one dedicated tier, Decker-Wattenhofer style), the newest extension strictly undercuts every older one for T.out[0] so every pre-renewal state hangs on a parent that can never confirm, and — since D26 — the live rival must be RELAYABLE for the maturity argument to count.",
+          "kind": "safety",
+          "violated_means": "Two conflicting states are simultaneously live and the older one can win. The corpus is explicit that this is race-conditional, not axiomatic: 'consensus-dead is race-conditional — the newest extension must win a ≥36-block-edge race after a public trigger. That is a race, not an axiom.' D26 half 2 exists because the supersession proof previously PRESUMED relayability: co-sign an SP at ~1 sat over 211 vB and the victims' lower-CSV tiers are unrelayable by construction, losing a race the verifier believes they win."
+        },
+        {
+          "id": "G4",
+          "property": "EXIT AVAILABILITY — the current owner can always reach L1 using only pre-signed material, with no counterparty, no SE call and no key held by anyone else, within a bounded wait: E_m + Δ_k ≤ 2,160 blocks (~15 days) flat, decreasing 36 blocks per hop; 3 + 2d transactions at depth d.",
+          "kind": "liveness",
+          "violated_means": "Freeze becomes seizure. Concretely it fails in four measured ways today: (i) FEE — above the hardcoded committed_fee_rate = 2.0 sat/vB every tier needs an external CPFP child, and NO CODE PATH IN THIS REPOSITORY CAN SPEND A P2A ANCHOR (exit_child_pass broadcasts raw and stops at the first refusal; create_cpfp_tx rejects any tx with more than one output and every tier has at least two; electrum exposes no submitpackage). (ii) VALUE — below V_min(d,r) the walk costs more than the piece is worth. (iii) DEPTH — worst wait ≤ (d+1)·2,160; depth-3 ≈ 60 days by the doc's model. (iv) COLOUR — a coloured coin has NO renewal primitive at all today, so its life is bounded and terminates in a forced exit."
+        },
+        {
+          "id": "G5",
+          "property": "ALLOCATION INTEGRITY (RGB) — the allocation the receiver client-validated is the one that settles on chain. Enforced by the terminal-freeze invariant: RGB transitions anchor ONLY in signed-once transactions; plain T/X/S never host anchors and are token-destroying if used on a carrier; a colored tx only ever spends outputs of TERMINALIZED structure, and the SE refuses renewal on terminal nodes — so no superseded colored witness exists anywhere.",
+          "kind": "safety",
+          "violated_means": "An RGB allocation is destroyed or double-assigned. A plain tier spend of a carrier destroys the allocation outright — which is why sdk52 (a carrier is NEVER laddered while a plain coin in the same wallet is) is the invariant everything else in §5.10 rests on, and why the claim() laddering hole that would have destroyed an allocation on a materialised carrier had to be closed. Also violated if the anti-collision property fails: rival tiers over one outpoint sharing a blinding collapse their BundleIds into an arbitrary hash lottery."
+        },
+        {
+          "id": "G6",
+          "property": "FINALITY — a completed claim is irreversible: the enclave keyupdate cannot be undone, sig_count is monotonic and cannot be decremented, latch_claim is mutual exclusion between claim and cancel, and recipient_key_was_cancelled refuses reuse of a cancelled recipient key.",
+          "kind": "safety",
+          "violated_means": "A payment a receiver has booked is reversed. The live boundary is that finality is at CLAIM, not at conveyance: a non-batch transfer's lock lives one hour off updated_at and a batched one until MAX(lightning_latch.expires_at), so a conveyed-but-unclaimed transfer IS reversible for that window — and peek_pending_transfers already presents such transfers to the SSP as if received. Chain finality is additionally modulo a reorg deeper than confirmation_target (2 regtest / 3 mainnet), which undoes the very facts R3/R6 checked."
+        },
+        {
+          "id": "G7",
+          "property": "NON-CUSTODY UNDER OPERATOR COMPROMISE (REQ-3) — a hacked operator may steal FUTURE deposits and FUTURE state transitions, but pre-hack state left untouched is absolutely safe. Every spend path needs both 2-of-2 shares; the hacked SE holds only post-rotation e_n; renewal requires the current owner's partial, so the SE alone cannot mint a lower-CSV extension; the unilateral tree is pre-signed at all times.",
+          "kind": "safety",
+          "violated_means": "A coin the user received before the compromise and never touched can be taken. This is the requirement that KILLED the Grove factory architecture: a Sybil-originated factory lets the operator fresh-spend F_root via private relay and confiscate all 64 coins in one confirmation, including received-and-untouched ones, with no race the victims can enter. The only surviving path to violation is B1 (SE + a past owner's retained pre-rotation share)."
+        },
+        {
+          "id": "G8",
+          "property": "NO CONFISCATION BY DESIGN — nothing expires, nothing sweeps to the operator, no output ever pays the operator by timeout. Missed liveness costs a race, never a forfeiture.",
+          "kind": "safety",
+          "violated_means": "The system becomes Ark or SuperScalar — 'funds sweep to server after expiry', 'the LSP can simply claim the entire UTXO after the dying period'. Both are disqualified outright by the hard constraints. Loss under TES-R must require a REAL adversary winning a telegraphed public race (≥144 blocks of on-chain alarm after a visible trigger spends F) while every tower slept. The one place this property is under pressure is the sub-economic leaf: below V_min it is not confiscated by the operator, but it IS forfeit at min(L_k) to the party who split it — i.e. exactly the adversary."
+        },
+        {
+          "id": "G9",
+          "property": "SE BLINDNESS (REQ-4) — the SE signs only 32-byte sighashes; a colored sighash is byte-indistinguishable from a plain one; consignments stay P2P (ECIES via relay); renewal, rollover and de-trigger sign either sats-structure or owner-built colored self-transitions the SE never parses. Exit-time RGB disclosure is acceptable.",
+          "kind": "safety",
+          "violated_means": "The operator learns RGB contents in-system, breaking a hard requirement. Blindness is also LOAD-BEARING for B1's mitigation (the SE cannot identify which coin to steal without a colluding old owner) and it is what makes every operator-side value fix impossible — this is the reason 'the SE refuses to co-sign a piece below a viability floor' is named as a WRONG proposal that must not be re-proposed. Blindness covers CONTENT, not traffic: the SE still learns sids, auth pubkeys, counts, flags, transfer timing and the caller's IP, and can correlate deposits to exits by amount at the chain boundary."
+        },
+        {
+          "id": "G10",
+          "property": "AUTHORIZATION INTEGRITY — only the coin's CURRENT owner authorizes an irreversible operation, and each authorization is single-use and endpoint-bound: the owner signs sha256(nonce ‖ endpoint), consumed atomically on first valid use within a 5-minute window. The receiver additionally verifies R1 (the sender's Schnorr signature binding tx0_txid ‖ vout ‖ new_user_pubkey) and R2 (the new share + new server share combine to the coin's on-chain aggregate).",
+          "kind": "safety",
+          "violated_means": "A stale or replayed authorization moves a coin, or a handover message not authorized by the coin's owner is accepted (replay-to-another-receiver, wrong-outpoint, forged-by-non-owner — all pinned in unit::transfer_signature_tests). Live scope limit: the single-use nonce is deployed on only THREE endpoints (/withdraw/complete, /statechain/spend_budget, /transfer/cancel); every other mutating endpoint takes the static, replayable sha256(statechain_id) signature."
+        },
+        {
+          "id": "G11",
+          "property": "ADMISSION SOUNDNESS — a receiver never admits a coin whose exit provably cannot complete. Every term of an admission requirement must be RECEIVER-DERIVED (backend, own config, or read from a signature the receiver verified against chain data it fetched itself); a serde field is 'not admissible'. Enforced today in TIME (check_exit_headroom: Σ(csv_i + 1) ≤ epoch_expiry_height − tip) and in STRUCTURE (the derived max_split_depth cap, enforce_split_depth_cap_shaped).",
+          "kind": "safety",
+          "violated_means": "A gate computes its own requirement from a number the sender chose — a defect shape that has appeared THREE times already (C-1 the disclosed tier count, the flat-conveyance classifier, B1 the TesrTier::csv serde field). The uncovered dimension is VALUE: check_exit_headroom takes no value argument at all, so nothing checks that an exit is WORTH doing. min_child_value = 1,310 sat is not a floor that ignores economics — it IS V_min evaluated at the hardcoded committed_fee_rate = 2.0, exactly correct at 2.0 sat/vB and at no other rate."
+        },
+        {
+          "id": "G12",
+          "property": "ZERO IDLE COST / NO CALENDAR AGEING (the property the whole architecture exists to buy) — all three tiers are un-broadcast, T carries no timelock, and BIP-112 CSV does not tick until the parent confirms, so nothing anywhere matures until someone broadcasts T. An idle coin — and an entire idle split/combine DAG — never ages: 0 vB of rent, no deadline, no forced materialisation.",
+          "kind": "liveness",
+          "violated_means": "The block-space wall returns: 112 vB per coin per ~1,008 blocks = 5,840 vB/coin-year, which is 11.1% of all Bitcoin block space at 1M coins and physically impossible (111%) at 10M. Prefunding it costs ~$292/coin for five idle years, exceeding the entire value of most retail coins. This property holds ONLY for laddered coins: the un-laddered shape (RGB carriers, B0 sub-coins) keeps its absolute-locktime root deadline, and a LEAF's clock is the parent's lowest flat-backup rung — a height belonging to the splitter."
+        }
+      ],
+      "assumptions": [
+        {
+          "id": "A1",
+          "assumption": "FEE MARKET — the market rate stays at or below the committed 2.0 sat/vB long enough for each tier to relay standalone and confirm inside its δ = 36-block (~6 h) head start; and where it does not, SOMEONE can attach a ~152-vB v3 CPFP child to the tier's 240-sat P2A anchor and submit it as a 1P1C package.",
+          "if_false": "Two independent failures compound. (i) The CSV edge degrades into a pure fee race that a pre-signed, fixed-fee, un-bumpable tier cannot win (R-4, explicitly CARRIED not mitigated). (ii) The remedy does not exist: no builder anywhere in this tree constructs a TxIn on a P2A outpoint, create_cpfp_tx is pinned to input_vout = 0 and version: 2 (a v2 tx may not spend an unconfirmed v3 output at all), and all 63 broadcast sites are electrum, which has no submitpackage — so the payee's tiers sit at their committed rate until the market falls back, inside a window bounded by epoch_expiry_height, after which the sender's 112-vB backup takes everything. D31 renames rather than closes the gap: the normative funder is the OWNER, so the guarantee during a spike is 'the owner is online' — precisely the case a watchtower exists for. A piece minted at the admission floor is unrecoverable if the fee rate rises by ONE HALF OF ONE PERCENT (break-even r* = 2.01)."
+        },
+        {
+          "id": "A2",
+          "assumption": "CHAIN LIVENESS AND RELAY POLICY — blocks are produced; nVersion=3/TRUC, P2A anchors, 1P1C topology and sibling eviction are honoured by relay; and no reorg is deeper than confirmation_target (2 regtest, 3 mainnet).",
+          "if_false": "v3/P2A/1P1C are relay POLICY, not consensus (O-7) — a Core policy change can make an entire pre-signed tree un-relayable, and the documented fallback is direct miner submission, the same bet Lightning anchors make. TRUC's one-unconfirmed-ancestor rule already bites in production: a second rescue funded from the unconfirmed change of the first is refused at ANY price ('TRUC-violation, tx would have too many ancestors'), and on a spine SP_{i+1} at CSV 0 occupies the single child slot, making the fee-bump remedy and the shape that most needs it mutually exclusive. A deeper reorg undoes the very facts R3/R6 checked, so receiver acceptance is final only modulo it. Core's TRUC/BIP-431 constants and sibling-eviction semantics appear NOWHERE in this tree — UNVERIFIED throughout."
+        },
+        {
+          "id": "A3",
+          "assumption": "SE (ENCLAVE) BEHAVIOUR — the enclave deletes or overwrites the previous owner's key share at every transfer; the MuSig2 secnonce is genuinely one-shot; the sig_budget ratchet only ever lowers; and the attestation is produced by the key chain-anchored through tx0.",
+          "if_false": "This is T-SE-1 / B1, the irreducible statechain trust unit. If the SE keeps old shares and colludes with a previous owner they can fresh-co-sign an immediate spend, and NO TIMELOCK PROTECTS — a fresh signature needs no backup. It cannot be verified: any proof of erasure attests one instance of the data, and nothing prevents a copy having been made before the proof. If the secnonce were reusable, key-share extraction follows. If the budget could be raised, an attestation saying '1 of 1, terminal' would be true when issued and worthless a block later, and terminality would not be a property at all. There is NO client-facing attestation of the enclave itself today, so 'the share lives in an enclave' is an operational claim the user trusts, not verifies — and production runs the plain-C++ lockbox container, not SGX."
+        },
+        {
+          "id": "A4",
+          "assumption": "COORDINATOR HONESTY for the facts only it holds — the statechain_id ↔ aggregate_xonly binding, x1_pub, mailbox availability/ordering/non-deletion, the pending-transfer lock, both sign gates, batch atomicity, and the two-clock invariant 'no authorization expires before the latest claim it protects'.",
+          "if_false": "The enumeration is TWELVE items and the corpus states that nothing in the protocol DETECTS a violation of five of the surviving ones. A NULL aggregate downgrades any coin to the un-laddered lane (BindingRefusal::NoCoordinatorAggregate is the only cause a caller may read as 'this coin legitimately has no ladder', so a coordinator answering NULL controls that licence). A wrong aggregate, combined with the rogue-key decomposition U := D − E_sid where the SENDER chooses user_public_key, makes any attacker-controlled output pass validate_tx0_output_pubkey. A wrong x1_pub bricks the coin for everyone — worse than an under-reported count. Dropping the pending-transfer lock lets a still-owner sender co-sign a rival while a conveyed receiver holds claimable material. Mailbox withholding, deletion and reordering were NEVER SURVEYED in either round — still open, UNVERIFIED. And every adversarial test in the repo models a malicious sender; none models a malicious coordinator. The one item that IS closed is num_sigs + budget, now attested."
+        },
+        {
+          "id": "A5",
+          "assumption": "RGB VALIDITY — client-side consignment validation is sound and complete, the contract id is cryptographically derived, and the anchoring of that history to Bitcoin resolves correctly through the wallet's own indexer.",
+          "if_false": "R8 collapses and a forged consignment books a wrong asset or amount — the receiver has no other authority, since no proxy, SE or issuer is trusted for token rules, amounts or history. Two named gaps sit under this: the value-conservation sweep explicitly did NOT audit whether a consignment assigns what the bundle claims (verify_consignment_assignment / validate_pending_token), and the rgb-lib adversarial suite for deep un-broadcast witness chains (depth and DoS bounds) is O-3, still missing. Terminal-freeze removes superseded-witness ambiguity, but the un-broadcast-witness validation is now being exercised over much deeper chains than before."
+        },
+        {
+          "id": "A6",
+          "assumption": "OWNER OR DELEGATE AVAILABILITY — someone (the owner's process, a cron, a third party, or several) is awake within the CSV window once a laddered coin's trigger is broadcast, and inside the margin before an un-laddered coin's or a leaf's absolute deadline.",
+          "if_false": "This is B4, and it is delegable and redundant but NOT removable — timelock security is DEFINED by acting before maturity. On the laddered shape the requirement is REACTIVE (no calendar date; the alarm is a public on-chain trigger with ≥1 day of notice). On the un-laddered shape and on every LEAF it is a CALENDAR deadline, and the leaf's clock is min(L_k) over the PARENT's flat backups — a height belonging to the splitter. The corpus documents the three-level asymmetry: reactive covers both lanes; near-deadline force-exit is gated to COLOURED children only (D13); delegated export historically emitted no leaf entries at all, so 'delegating to a third-party tower protected the parents and left the children unwatched'. The exchange the design deliberately made is that the pre-TES-R unconditional ~7-day no-watch window is gone: a received coin must be watched from the moment of receipt, FOREVER (R-2)."
+        },
+        {
+          "id": "A7",
+          "assumption": "THE USER'S CHAIN VIEW — the electrum indexer honestly reports tip height, outpoint spent/unspent status, confirmation counts, fee-rate estimates, and delivers broadcasts.",
+          "if_false": "This is B3, the same SPV-level assumption as every light wallet, made explicit. A lying indexer could under-report the tip so a stale backup looks immature (delaying an exit past a deadline), report a spent root as unspent (R3/R6 pass on false data), hide a hostile mempool spend, under-report the fee rate so a deadline exit under-bids, or silently drop broadcasts. It could not steal by itself — it can only blind and delay; funds move only via signatures it does not have. Worse in practice: the dev defaults are PLAINTEXT (http:// SE, tcp:// electrum, rpc:// RGB proxy), and an on-path attacker over plaintext is strictly stronger than a lying indexer — it can tamper with unauthenticated info/config responses. The remedy is architectural (own node/electrs, multiple towers on distinct indexers), not protocol."
+        },
+        {
+          "id": "A8",
+          "assumption": "PARAMETER PROVENANCE — the CSV schedule (TesrParams) and the flat-ladder parameters (initlock/interval) are compiled into the client per network and are NOT coordinator-served, so a hostile SE cannot widen or narrow a coin's race window by lying in info/config.",
+          "if_false": "The coordinator would DEFINE the defence. This was live: interval is the yardstick INV-5 measures every flat hop against, and it used to arrive from /info/config. The tempting fix — derive it from the conveyed chain — is CIRCULAR: a padded chain with uniform I/2 decrements derives I/2 and validates against itself, accepting exactly the padding INV-5 exists to stop. Writing D27 exposed that three of four config sources in the repo disagreed with the table and with each other. The residual: cb.parent.params is STILL a sender-declared serde field supplying the per-tier [e_floor,e0]/[d_floor,d0] sanity bounds, so a sender declaring wide params relaxes its own bounds check (recorded, not fixed — a wider bound admits a tier whose real CSV is then counted in full). The cost of the fix, stated plainly: a config typo is no longer a quiet protocol weakening, it is a fleet-wide outage."
+        },
+        {
+          "id": "A9",
+          "assumption": "LOCAL STATE DURABILITY — the owner retains wallet.db (including tesr-* / ctesr-* / branch-* / parents-* / spine-tip rows and every crash journal) plus, for token wallets, the entire rgb_data_dir with its plaintext rgb.mnemonic seed and stash.",
+          "if_false": "B7: loss of local state is loss of funds, and the mnemonic alone is NOT a backup. The SE is blind and cannot re-serve per-coin exit material — that is the privacy design, not an oversight. export_recovery_bundle snapshots all of it under wallet_lock so the snapshot cannot be torn, but it deliberately does NOT embed rgb_data_dir. Two residuals: the bundle's version: 1 is written and never read on import, and whether journal replay on wallet open is REQUIRED is undecided."
+        },
+        {
+          "id": "A10",
+          "assumption": "SINGLE LIVE INSTANCE PER WALLET — exactly one process holds a given wallet.db at a time.",
+          "if_false": "B9: the wallet-record lock is in-process only. Two processes or devices on one wallet.db — or a restored recovery bundle running beside a live original — can broadcast stale state against each other and corrupt the DB. No cross-process or cross-device coordination exists, and the blind SE cannot arbitrate. Bundle restore is disaster recovery, not device sync."
+        },
+        {
+          "id": "A11",
+          "assumption": "THE RETAINED CHECKS SUBSUME THE UNVERIFIED BLINDED-MuSig COMMITMENTS on the laddered lane — i.e. INV-5's exact-interval decrement plus the rest of validate_backup_chain_v2 cover whatever verify_blinded_musig_scheme would have caught.",
+          "if_false": "D10, and it is UNANALYSED — the corpus says 'commission the analysis'. validate_backup_chain_v2 is documented in-source as validate_signature_scheme MINUS the tx_n-keyed statechain_info lookup and its blinded-MuSig verification, 'which cannot run for a laddered coin: the SE indexes statechain_info per CO-SIGN, and a laddered coin's tiers consume co-sign slots'. Note the one thing that keeps the two lanes' residuals from composing into a hole: the legacy < 2 arm runs the FULL legacy verifier INCLUDING the blinded-MuSig check the >= 2 path cannot run."
+        },
+        {
+          "id": "A12",
+          "assumption": "CLIENT CONFORMANCE — every client that can receive a coin either verifies the ladder properly or refuses it by name; and a decoder rejects a version it does not implement.",
+          "if_false": "Today's rule is 'process as the highest version I know, ignore what I do not understand' — EVERY protocol_version comparison in the repo is one-sided (>= 2, >= 3, >= 4) with no upper bound and no unknown-version reject arm anywhere, so a message declaring version 99 takes every >= arm exactly as a version-4 message would, with unknown fields serde-defaulted. That is the one rule a security-relevant version selector must not have, because a v5 adding a REQUIRED check is silently downgraded by every v4 receiver. The FLOOR is worse: it is 3, not 4, and the SENDER picks — a v3 conveyance carries neither the key handover nor the transfer signature, so a malicious payer gets a receiver who books the payment as received while retaining both the child auth key and the SE share. The uniffi FFI performs the downgrade itself, hardcoding protocol_version: 0, tesr_ladder: None, child_tesr_bundle: None in BOTH directions."
+        }
+      ],
+      "known_residuals": [
+        "B1 — SE share deletion / SE + old-owner collusion (T-SE-1). The irreducible statechain trust unit; a fresh co-signature needs no backup so no timelock reaches it, and erasure cannot be proven from outside. Byte-identical in kind to the pre-TES-R design and to full-operator collusion in Spark. Mitigations only: the enclave, blindness (target selection needs the colluder), public audit trail, and the current owner's race head start.",
+        "B2 — Ancestor-id substitution, un-laddered lane only. The terminal-ancestor ids conveyed with an exit branch are not cryptographically bound to the branch's outpoints (the SE is blind and cannot attest the mapping); the Σ-inputs count defeats OMISSION but not SUBSTITUTION by a sender who controls other terminal coins. An independent review rates this CRITICAL. It is deliberately NOT being patched, because the code containing it is scheduled for deletion rather than hardening. The ladder is structurally exempt (verify_child_bundle derives A_parent from the fetched on-chain F.spk; a substituted id fails on the key, not on a name).",
+        "B3 — Indexer honesty and liveness. Plus the transport residual: dev defaults are plaintext on all four channels (SE, electrum, RGB proxy, SSP), and an on-path attacker over plaintext is strictly stronger than a lying indexer. tor_proxy covers SE HTTP only; the electrum connection is direct.",
+        "B4 + D31 — Deadline liveness, and the fee-bump gap it now contains. A keyless tower can watch F and broadcast pre-signed tiers at their committed fee but CANNOT fee-bump them: a CPFP child needs an input it does not hold and a signature it cannot make. Stated as a limit of the protocol, not an implementation gap. Measured: a tier alone under the relay floor is refused ('min relay fee not met, 200 < 423'); rescuing a 240-sat anchor needs a 180,330-sat child, ~900x its value, so no disinterested third party will. The guarantee during a spike therefore degrades to 'the owner is online' — precisely the case a watchtower exists to remove. The funded-tower variant's capacity is CONFIRMED fee UTXOs, not sats, and 'a tower that runs dry fails at exactly the moment it is needed'.",
+        "B5 — Onboarding window. The first backup (tx1) is co-signed only when the SE first SEES the funding tx, so the window from funding broadcast to that co-sign cannot be closed by ordering alone; an SE that dies inside it strands the funding in the 2-of-2.",
+        "B6 — Audit [17] residual, un-laddered lane only: the deposit-anchored deadline is late by k·interval for parents transferred k times pre-split. Absorbed by the auto_exit margin (≥ k_max·interval + 144), not solved. A laddered coin has no absolute deadline to be late about.",
+        "B7 — Loss of local state is loss of funds; the mnemonic alone is NOT a backup. Now covers the ladder too. Token wallets additionally need the whole rgb_data_dir including a PLAINTEXT rgb.mnemonic, which the recovery bundle deliberately does not embed.",
+        "B8 — No payment atomicity. A plain transfer is a gift, not an escrow; in-protocol delivery-versus-payment needs a shared arbiter. Use the Lightning latch or invoices.",
+        "B9 — Single live instance per wallet; the record lock is in-process only, and two processes on one wallet.db can broadcast stale state against each other and corrupt it.",
+        "B10 — Split/combine commit ordering. The parent's spend budget is set terminal BEFORE the child signatures and backups are durably persisted, so a crash in that window strands the parent as exit-only. The ordering cannot be reversed (the budget is the monotonic SE-side guard against an INV-19 fork), and the reviewer's proposed 'persist nonces and replay sign/second' fix is UNSOUND — the enclave nulls the secnonce on the first partial signature, so a replay returns an error, never the original partial.",
+        "SUB-ECONOMIC FINALITY — the sender's free option, and NOTHING IN THAT DOCUMENT IS BUILT. A split child has no flat backup (CHILD_V2_BASELINE = 0); the sender retains one that spends F for 112 vB and pays them the whole coin, 6x to 265x cheaper than the payee's 293d + 375 vB walk, cheaper than the sender's OWN ladder at every fee rate, with ZERO marginal cost per additional piece voided. min_child_value = 1,310 sat IS V_min evaluated at the hardcoded committed_fee_rate = 2.0 and is exactly correct at no other rate: at 20 sat/vB a depth-10 piece admitted at 1,310 costs 124,870 to defend. A depth-1 10,000-sat piece — the modal payment in the design's own simulation — goes under water between 5 and 10 sat/vB. Break-even r* for a floor-value piece is 2.01 sat/vB. The receiver-side viability gate, the sender-side symmetric refusal, the corrected booked value, and the P2A spender are all unbuilt.",
+        "C-2 — NO CODE PATH IN THIS REPOSITORY CAN SPEND A P2A ANCHOR. exit_child_pass broadcasts each tier raw and stops at the first refusal, never building a child; create_cpfp_tx rejects any transaction with more than one output and every tier has at least two. So the 240-sat anchor on every tier is pure overhead today and the whole V_min band is unreachable in either direction — the pessimistic case is that the payee cannot pay at any price.",
+        "C-1 — Admission is evaluated ONCE, at claim; the exit happens weeks later at a rate nobody knows. No admission check can reach backwards. A bigger margin shifts the threshold without changing that it is evaluated at the wrong time.",
+        "D14 half (b) — THE δ MARGIN LAW IS UNENFORCED. The only relational constraint a receiver applies is sup.csv > live_csv, so a patched sender can present S_old at 145 and the receiver-paying S' at 144 — both inside the honest band — collapsing the designed 36-block (~6 h) race window to ONE BLOCK. δ is enforced exclusively by the honest builder, client-side; the SE is blind and cannot constrain a chosen CSV.",
+        "D16 — protocol_version has no ceiling and the floor is 3, not 4. Version 99 takes every >= arm as version 4 would. A v3 child conveyance carries neither the key handover nor the recipient-binding transfer signature, so the receiver books the payment as received while the sender retains the child auth key and the SE share; one hour later the pending lock lapses and the sender can co-sign a rival. The uniffi FFI strips protocol_version, tesr_ladder and child_tesr_bundle in both directions, performing the downgrade itself and failing closed with a MISLEADING reason.",
+        "D17 — The Lightning latch clock is never bound to the HTLC's CLTV. The RECEIVE safety argument is 'the latch expires BEFORE the payer's HODL HTLC', and nothing in the code establishes or checks that relation: the 3000 s latch is justified against the 3600 s BOLT11 INVOICE expiry, which bounds when the invoice may be paid, not the held HTLC's block deadline — a quantity this repo never reads. unlock_by_preimage performs NO expiry check while validate_batch refuses the matching claim as expired, so the SSP can pay, unlock, and be unable to claim. Also unbound: statechain_transfer.batch_id to lightning_latch.batch_id (C-8). And the two PAY lanes make OPPOSITE terminalization choices with one argument between them.",
+        "D8 residuals 2, 3, 5, 6, 8 — the coordinator surface that remains unauthenticated and, per the corpus, UNDETECTABLE: the statechain_id ↔ aggregate_xonly binding (a NULL downgrades any coin to the un-laddered lane; a wrong one meets the rogue-key decomposition U := D − E_sid), x1_pub (a wrong value bricks the coin for everyone), the pending-transfer lock, both sign gates, and batch atomicity. Item (1), num_sigs, IS now closed by the utexo/sig_count/v2 enclave attestation, which also carries the budget under the same signature. No adversarial test in the repo models a malicious coordinator.",
+        "D10 — The blinded-MuSig residual on the laddered lane. The backup chain's blinding commitments are NOT verified for a laddered coin, because the SE indexes statechain_info per co-sign and a laddered coin's tiers consume co-sign slots. Whether the retained checks (INV-5) cover what it would have caught is UNANALYSED.",
+        "GAP A / GAP B — the fee_rate yardstick is unbound on BOTH synchronous verifiers. 2ad2b2d pinned it in verify_conveyed_child only; both tripwire tests still pass, i.e. still holes. The trigger-to-F anchor does NOT close them: a ladder built AND declared at 2,662 sat/vB satisfies the trigger law against the real F and still delivers 1,030 sat of a 1,000,000-sat coin.",
+        "gap_an_ancestor_split_state_may_mint_value_out_of_nothing — an ancestor segment's split state is not held to a Σ law. Plus: the COMBINE lane (multi-input tiers) was never swept at all.",
+        "V10 / V11 — arithmetic residuals on attacker-reachable paths. Coin::amount is u32, so every receive-path booking truncates above ~42.95 BTC (a 43 BTC deposit books as ~0.05 BTC). And `let fee = tx0_output.value - total_output_value` runs BEFORE anything about the transaction is verified, over a sender-supplied backup tx: outputs exceeding the funding output underflow (wrapping in release, panic in debug/test).",
+        "D11 — Interop encodings. decode_transfer_address PANICS on a short-but-valid Bech32m payload, reachable from validate_address whose entire job is judging attacker- or typo-supplied input. Only two HRPs exist (ml, tml), so testnet, signet and regtest are indistinguishable and a signet address validates against a regtest wallet — a wrong-chain send with no client-side guard. The invoice has no checksum, its version field is written and never read, and a SystemTime failure defaults now to 0 so EVERY invoice becomes un-expired.",
+        "COLOURED-LANE RESIDUALS — a coloured coin has NO renewal primitive at all today (D30): its life is bounded and terminates in a forced exit, which is why colored_ladder stays false. Per-output blinding is derived once per tier, so with K > 1 a payee de-conceals every sibling seal in K tries — concealment across a batch is worth zero bits; coloured K > 1 is restricted to batches whose payees already know each other. sdk32 records a measured coloured value LOSS (a carrier idle past its own deposit horizon fails the ancestor census on an expired flat backup; the test was reordered to avoid triggering it and still prints SUCCESS). D32 inventories what colored_ladder = true silently REMOVES: coloured multi-carrier combine and coloured leaf consolidation, both replaced by nothing, both feeding V_min upward.",
+        "R-1 — Correlated SE-death plus mass trigger grief. With the SE dead, the cooperative de-trigger is unavailable and every triggered coin fights per-tier races; defence capacity saturates around 10^5–10^6 simultaneous triggers/day, beyond which small coins are not worth defending at spike rates. Never confiscation, and the attacker pays ~2.5x the defender per coin, but this is the design's stated worst case. The mass-grief prioritisation policy (O-6) and the COLOURED de-trigger variant are not test-covered.",
+        "R-2 — No unconditional no-watch window. A received coin must be watched — delegated, keyless, prepaid — from the moment of receipt, FOREVER. Alarm-driven with ≥1 day of notice, but a deliberate downgrade in kind from the pre-TES-R first-window guarantee.",
+        "R-5 — Deep-DAG unilateral latency: depth-3 worst ≈ 60 days by the doc's model (the code's own model implies ≈30, and the three cost/latency models in the tree disagree — D6). Geometric per-level schedules would cap it at ~30 days at reduced hop budgets; shipped as a dial, default off (O-4).",
+        "CATS-B's liveness trade — the payee's on-chain warning before a steal confirms collapses from ~4.07 years to ~15.7 days. Under a FINALITY reading that is not merely 'a normal L2 assumption': it is the window in which a sub-economic payee, who by construction will NOT spend V_min > V to defend, must nonetheless be watching. CATS makes the sender's free option faster to exercise while leaving it free.",
+        "MAILBOX AVAILABILITY AND CENSORSHIP — still open, UNVERIFIED. No survey in either round examined withholding, deletion or reordering of the coordinator-held encrypted transfer messages, nor the sender-initiated POST /transfer/cancel path's interaction with them.",
+        "MIGRATION FAMILY — every security-semantic migration is an additive column whose DEFAULT reproduces the PRE-FEATURE semantics for existing rows (0002 single_use false, 0003 epoch_deadline NULL, 0005 sig_budget NULL, 0007 derived_from NULL, 0008 partial_sig_issued, 0009 aggregate_xonly). So upgrading a live coordinator silently grandfathers every existing coin into the weaker rules, and for 0009 that is permanent un-ladderability. There are no down migrations, no schema-version gate on request handling, and no capability discovery — protocol evolution today is a flag day.",
+        "SPINE / TRUC RESIDUALS — a third party can occupy an unconfirmed spine tier's single TRUC child slot for 240 sat, and the pre-signed successor (fixed fee, un-bumpable, no anchor spender) cannot out-bid it. Latency, not theft, bounded by the exit-length cap. Zero live evidence exists for any of it: the test harness always mines before the next tier is broadcast, so the permitted 1-ancestor case has never been exercised, the forbidden 2-ancestor rejection string is unknown to this codebase, consecutive zero-CSV tiers have never been relayed, and no P2A anchor has ever been spent.",
+        "PROTOCOL.md §5.13's package-aware watch_pass (TES-fixable #4) is SPECIFIED BUT UNIMPLEMENTED for the default tower — 'the one place this document describes something that does not yet exist in code'. The owner-side package path exists and has been verified live end-to-end through repo code, but it needs a Bitcoin Core RPC endpoint the SDK does not have.",
+        "DOC-vs-CODE claims the corpus itself flags as WRONG rather than merely undocumented: PROTOCOL.md's 'the SDK runs renewal inside transfer()' and 'rollover runs unattended inside transfer()' — renew_auto/rollover_auto have ZERO SDK call sites; the 'default SDK policy: solo compaction at depth > 3' has no code (zero occurrences of compact in the SDK), and the ~180 vB/yr footprint economics is DERIVED from it; and PROTOCOL.md §5.7's 'a split state undercutting by ≥36' describes the pre-CATS shape. Compaction is REQUIRED at the depth cap, not optional — only the threshold is policy.",
+        "O-1 (formal spec of the enclave counter machine) is listed as BLOCKING and still open in PROTOCOL.md §10, but D4 round 2 collapsed it: exact-equality on the TOTAL is a sound proof with two named trust premises (P3 the true count — now earned via attestation; P1 the sid↔aggregate binding — still supplied by the coordinator). The remaining work is a deletion and a restatement, plus one adversarial test conveying a child over an ALREADY-TRIGGERED parent, where verify_conveyed_child rests its liveness claim on a comment rather than a check."
+      ]
+    },
+    "total_candidates": 35,
+    "survived": 11,
+    "refuted": 24,
+    "flaws": [
+      {
+        "id": "VE-1",
+        "title": "Split-tree per-epoch materialisation is an uncharged on-chain rent",
+        "survives": true,
+        "corrected_severity": "MEDIUM",
+        "goal_threatened": "Not G12 or the architecture-selection rationale. What is actually threatened is spec consistency: PROTOCOL.md §7.1/§7.2/§5.7-row-3/§6-REQ-1 contradict TRUST-MODEL.md's own header block and PARTIAL-PAYMENT-ECONOMICS.md §7, and §7.2's system figure understates the modal coin by roughly an order of magnitude.",
+        "refutation": "Three of the four load-bearing claims fail.\n\n(1) THE OBLIGATION IS ONE TRANSACTION, NOT A WALK. PARTIAL-PAYMENT-ECONOMICS §7's own first paragraph states the rule the finding then ignores: 'strictly the obligation is that T confirm before the earliest live flat-backup locktime — once T confirms, F is spent and every flat backup is dead, and the remainder of the chain is relative-only with no absolute deadline.' T is 125 vB, carries TRIGGER_SEQUENCE = 0xFFFFFFFD (no timelock), is self-funded from the coin at c, and is in every holder's hands from the moment of claim (child_exit_chain splices it root→leaf). So the MANDATORY chain touch that discharges the epoch is ~125 vB, and it is discharged ONCE per tree — after it there is no absolute clock anywhere in the structure to recur. The 793-vB walk plus two re-deposits the finding costs is the price of REALISING value and of returning to a dormant off-chain state; that is a holder choice and an exit cost every design in §3's table pays, Spark included. Calling it 'recurring rent' is the error.\n\n(2) THE HEADLINE NUMBER USES THE WRONG EPOCH. The finding computes 5.256 epochs/year from lockheight_init = 10000 (server/src/server_config.rs:82, the server default), while PARTIAL-PAYMENT §7 and SUBECONOMIC A-1 both record that the mainnet compose profile ships 50000 (~347 days) → ~1.05 epochs/year. The finding's own design_fix concedes the floor is then ~380 vB/coin-yr. Against the 5,840 vB/coin-yr that §2 names as 'the block-space wall', 380 is a ~15× win — the selection argument survives, and 'reproduces the block-space wall the architecture was selected to delete' is false. The 1.0%/10% system figures inherit the same 5× error.\n\n(3) IT IS NOT UNPUBLISHED, AND THE FIX IS NOT NEW. PARTIAL-PAYMENT-ECONOMICS §7 ('What does NOT improve') is a normative section that states the epoch obligation, that a terminal tree has no re-anchor at all, that the only route is full materialisation followed by a fresh deposit, and lists all three ways to move it — including the cooperative de-trigger for terminal trees, already labelled 'Hard; not designed'. TRUST-MODEL.md's header block names the root epoch as one of exactly TWO boundaries that 'do NOT go away'. Fix items (1)-partial and (3) are therefore already on the record; item (3) must not be promoted to a required redesign.\n\nWHAT DOES SURVIVE, and why this is not fully refuted: the mechanism is real (PARENT_V2_BASELINE = 1 — a laddered coin retains its flat-backup chain; epoch_deadline_from_flat_backups returns min(L_k); set_spend_budget(parent,1) is consumed by SP so no de-trigger and no reanchor exist for a terminal root), and PROTOCOL.md §7.1 'Idle coin | 0 vB/yr', §7.2's 0.034%/0.34%/3.4%, §5.7 row 3's 'no calendar deadline exists', and §6 REQ-1's caveat scoping the deadline to the un-laddered shape are all inconsistent with the two documents above. At the DEPLOYED epoch the split-tree term is ~0.7% of block space at 1M coins against §7.2's 0.034% — material for the '100M coins ≈ 3.4%' claim. That is a defect in the selection argument's supporting table, not in the architecture.",
+        "corrected_design_fix": "Documentation and one new dial; no protocol change. (a) Add a 'split tree' row to PROTOCOL.md §7.1 and a split-tree term to §7.2, computed at the DEPLOYED lockheight_init (50000), stating the per-holder floor (own tail tiers + one re-deposit) as irreducible and placing the 5,840 baseline beside it. (b) Reconcile §5.7 row 3, §6 REQ-1's caveat and TRUST-MODEL B4 with TRUST-MODEL's header block and PARTIAL-PAYMENT §7: a laddered coin's absolute clock is the retained flat-backup chain over F, not the tier chain — 'no calendar deadline' is true of the tiers and false of the coin. (c) The finding's one genuinely new contribution: record lockheight_init as pricing FOUR opposed things, not the two SUBECONOMIC A-1 already names — add the materialisation-frequency/footprint term to that note. (d) Leave the cooperative terminal-tree re-anchor exactly where PARTIAL-PAYMENT §7 and COLOURED-SPINE-REANCHOR-SCOPE already put it: an open, unbuilt design item, not a required fix. (e) Separately VERIFY (do not assume): leaves are covered by auto_exit_due arming deadline_block = L_k − head_start (PARTIAL-PAYMENT §4.7, events.rs:57), but background_auto_refresh defaults OFF on the reasoning that 'a laddered coin has no floor to approach'; confirm a laddered ROOT coin's own min(L_k) has an automatic action.",
+        "is_accepted_residual": false
+      },
+      {
+        "id": "T-1",
+        "title": "INV-27 is false for every RECEIVED laddered coin: the absolute flat-backup ladder is retained under TES-R",
+        "survives": true,
+        "corrected_severity": "HIGH",
+        "is_accepted_residual": false,
+        "goal_threatened": "G4 (exit availability), G8 (loss requires winning a telegraphed public race), G12 (zero idle cost) — but NOT G11 on the whole-coin lane, see refutation",
+        "refutation": "NOT REFUTED — the mechanism is real and is corroborated by the corpus in five independent places, so I could not break it. But three of its premises are wrong in ways that change the severity and the fix, and one of them changes the finding's status from 'undiscovered break' to 'spec text lagging a taken decision'.\n\nWHAT SURVIVES. Confirmed in code: `transfer_sender.rs:165` calls `create_backup_tx_to_receiver` on EVERY hop including laddered ones; `create_backup_tx_to_receiver` passes the tx1 locktime into `calculate_block_height` (lib/src/transaction.rs:153-168), giving L_k = h_dep + initlock − interval·k; D27 pins mainnet at 10 000/100 and prints '100 hops' as the capacity. The flat backups and T spend the SAME outpoint F. So a prior owner's retained rung L_{k−1} is a real, un-revocable, no-CSV spend of F. The corpus says so itself: `lib/src/transfer/receiver.rs:~690` ('Exactly ONE absolute clock exists anywhere in the structure: the FLAT backup chain over F… held by the coin's previous owners, and they spend the very outpoint the trigger T spends'); ADMISSION-INPUTS.md §3; COLOURED-SPINE §2.4 ('absolute clock … no — renewal cannot reach it at all') and §5 item 2 ('Only an on-chain spend of F resets the clock'); `invalidation_model.rs::wall_clock_vs_hop_budget`; and `tesr.rs:21092` naming 'the flat lane's own (still missing) headroom rule'. INV-27 as WORDED ('An idle laddered coin — and an idle split DAG — therefore has no calendar deadline and costs 0 vB of rent') is therefore false for k ≥ 1, and SPEC §9.3/§9.4/§9.5 and TRUST-MODEL §5:267-268 all switch off defences by citing it verbatim. That is a genuine normative defect.\n\nWHAT DOES NOT SURVIVE.\n(1) THE FIX IS ON THE WRONG SIDE OF THE GATE. T is un-timelocked, so ONE confirmed spend of F before L_{k−1} kills every flat backup permanently — the defender does not need to complete an exit walk. `lib/src/transfer/receiver.rs:700-708` states this explicitly and uses it to draw the admission/watchtower line: 'a holder who force-exits the instant the deadline nears is safe with a single block of headroom. That is the WATCHTOWER's rule (auto_exit_due), not an ADMISSION rule.' T-1's proposed admission rule (`L_{k−1} − tip ≥ auto_exit_margin + one re-anchor confirmation budget`) would refuse honest, perfectly safe whole-coin transfers. The leaf lane needs an admission gate because a leaf has no un-timelocked escape; a whole coin does.\n(2) THE VICTIM IS NOT BLIND OR DEFENCELESS IN THE WINDOW. By INV-5 his own rung matures `interval` blocks BEFORE the first hostile rung, and the WHOLE conveyed chain is in his hands, so the hostile deadline is receiver-derivable from signed material as min(L) + interval (INV-5's exact-decrement check is what makes the +interval sound). This is the same derivation the leaf lane already runs at `wallet.rs:2373` via `epoch_deadline_from_flat_backups`. The exposure is a missing pass, not a missing input. Also: the window is at minimum interval+1 ≈ 101 blocks and typically the epoch remainder; the '110 blocks after 8 hops' figure is the worst case, not the typical one.\n(3) THE DECISION HAS ALREADY BEEN TAKEN. DECISIONS.md D12 (decided 2026-08-10): 'Retire the absolute deadline once T confirms — and mandate the handoff to defend_ladders in the same clause. Publish the δ budget.' Its rationale states the finding almost word for word: 'A laddered coin runs on TWO clocks: an ABSOLUTE one (a prior owner's flat-backup nLockTime over F, deadline H_deposit + initlock) and a RELATIVE one (the CSV walk below T). Spending F retires the first permanently.' So this is SPEC.md/PROTOCOL.md text that has not been reconciled with a decision already on the register, plus one genuinely uncovered shape (the ROOT laddered coin: `auto_exit_due_inner` skips it on `read_exit_branch(..) Ok(b) if b.is_empty() => continue`, and the D13 loop iterates only `ctesr-` child/tip rows). That is HIGH, not CRITICAL.\n(4) Fix item (iii), 'turn background_auto_refresh back on', collides with the reason it is off (an idle wallet silently shrinking) and with refresh being SE-dependent — a laddered coin under a dead SE cannot re-anchor at all, so re-anchor cannot be the sole conformance rule.",
+        "corrected_design_fix": "(1) SCOPE INV-27 TO THE TIER CHAIN, in SPEC §2.6 and PROTOCOL §5.2, and retract the three claims derived from the coin-wide reading: SPEC §9.3 ('exit_deadline_block is None for it'), §9.4 ('no calendar deadline to reset'), §9.5 ('A laddered coin has no such deadline and is not its subject'), PROTOCOL §5.2 ('the whole audit-[17]/B6 class is deleted for laddered coins'), TRUST-MODEL §5:267 ('no floor to approach — it never ages'). Replace with D12's two-clock statement.\n(2) WRITE D12'S DECIDED RULE NORMATIVELY AND EXTEND IT TO THE ROOT LADDERED SHAPE — the one shape no pass covers today. Conformance rule: while F is unspent, a laddered coin's deadline is the SECOND-lowest rung of its own conveyed backup chain, i.e. `epoch_deadline_from_flat_backups(own chain) + interval` (INV-5's exact decrement is what licenses the +interval); the deadline is retired permanently the moment F is spent, with the handoff to `defend_ladders` mandated in the same clause.\n(3) THE REQUIRED ACTION IS ONE CONFIRMED SPEND OF F, not a completed walk: cooperative `refresh` (112 vB) where the SE is alive, the co-op de-trigger where applicable, unilateral `T` otherwise. Do NOT add an admission-side headroom rule to the whole-coin lane — receiver.rs:700-708 already argues correctly why the leaf's gate does not generalise.\n(4) Expose the derived deadline (and the remaining hop/calendar budget) on `CoinInfo`, which today carries neither, and price the per-epoch re-anchor in §7 (that is T-2).\n(5) Keep T-1's option (b) as the strategic answer — retire the flat chain on laddered hops once the census rests on the now-built SE attestation (R0) — but note it is a census-model change with its own soundness pass, colliding with `PARENT_V2_BASELINE >= 1` at four sites (COLOURED-SPINE §5 item 2), not a text edit. Until it ships, (1)–(4) are mandatory."
+      },
+      {
+        "id": "T-2",
+        "title": "The real on-chain maintenance cadence is set by the flat ladder, not the CSV hop budget — §7's footprint economics omits the binding constraint",
+        "survives": true,
+        "corrected_severity": "HIGH",
+        "is_accepted_residual": false,
+        "goal_threatened": "G12 (zero idle cost) and REQ-1's 'MET' verdict in §6; also §3's 'Idle on-chain footprint: 0' comparison cell",
+        "refutation": "NOT REFUTED — the identity and the arithmetic check out, and §7 genuinely has no term for the flat ladder. But the framing ('no reviewer reading the corpus can discover the cadence') is wrong, and two of the numbers need qualifying.\n\nWHAT SURVIVES. The budget identity `interval·k + (tip − h_dep) < initlock` is exactly right: the receiver refuses on `lock_time <= current_blockheight` (lib/src/transfer/receiver.rs:665) and L_k is deposit-anchored via `calculate_block_height`. The re-anchor is the only reset, it is a 112-vB on-chain spend, and the SDK performs it automatically inside `transfer()` (REQ-32). PROTOCOL §7.1 publishes 0 vB/yr idle and ~180 vB/yr at 10 tx/day, computed purely over the tier chain ÷ a 2 300-hop compaction budget, with no flat-ladder term anywhere in §7. §6's 'REQ-1: MET' and §3's 'Idle on-chain footprint: 0' rest on that omission. The C-90 parallel is fair and uncomfortable: at ~589 vB/coin-yr idle the rent is the same O(coins × time/initlock) shape §8.2 rejects, postponed by exactly the ratio initlock was raised. That is a first-order defect in the document that justifies the architecture.\n\nWHAT DOES NOT SURVIVE.\n(1) 'THE FOOTPRINT MODEL HAS NO TERM FOR THE FLAT LADDER AT ALL, SO NO REVIEWER CAN DISCOVER THE CADENCE' is false. D27 publishes the 100-hop capacity in a table with the caption 'the documented 100-hop capacity'. `clients/libs/rust-sdk/src/invalidation_model.rs::wall_clock_vs_hop_budget` encodes and TESTS `horizon_days(k) = (initlock − k·interval)/144`, asserts 69.4 days at k = 0 on mainnet, asserts each hop costs exactly interval/144 days, and asserts 'The full 100-hop budget consumes the entire horizon'. PARTIAL-PAYMENT-ECONOMICS §7 states 'The ~69-day root epoch survives untouched' and 'One on-chain re-anchor per tree per epoch is unavoidable', and explicitly calls raising `lockheight_init` 'a policy dial, not a fix'. SPEC-ROADMAP D12 option (i)(a) already says the answer 'changes PROTOCOL.md:619's footprint economics and appears in no user-facing doc'. So the defect is narrower and more embarrassing than claimed: §7 was never reconciled with material the corpus already holds and tests.\n(2) THE HEADLINE NUMBER IS ONE POINT ON A CURVE, PRESENTED AS THE ANSWER. 4 700 vB/coin-yr is the 10 tx/day row — §7.1's own aggressive case — for a SINGLE coin sustained at that rate for a year. The same identity gives ~1 000 vB/coin-yr at 1 tx/day and ~589 idle. Publishing 'the rent is ~4 700' would be as misleading as publishing 0.\n(3) THE ~589 IDLE FIGURE APPLIES ONLY TO k ≥ 1. A never-transferred deposit has no prior owner and genuinely pays 0 vB. That is why sdk30(a) is not evidence in either direction, as T-2 correctly notes for INV-27 but not for the rent table.\n(4) THE '23× TIGHTER' COMPARISON CONFLATES TWO DIFFERENT BOUNDS. The flat ladder bounds HOPS-and-CALENDAR jointly (one budget, two consumers); the depth/rollover cap bounds exit-walk LENGTH. They are not substitutes and should not be divided into each other. The rollover cap of 4 is real (`every_root_ladder_the_latency_rule_allows_is_admitted_by_the_length_cap`: 1 + 4·2 163 = 8 653 fits, a 5th level does not), so §6's 'hop count is unlimited without any mandatory chain touch' is independently false — but for a different reason than the flat ladder.",
+        "corrected_design_fix": "(1) Add to §7.1 a MAINTENANCE CADENCE row derived from the single identity `interval·k + age < initlock`, stated in §5.2 beside the corrected INV-27, with the denominator `min(flat-ladder budget, TES-R hop budget × rollover cap)` and the numerator the 112-vB re-anchor. Publish it as a CURVE over activity (idle / 1 tx-day / 10 tx-day) and SPLIT BY SHAPE (k = 0 never-transferred vs k ≥ 1 received), because those two rows have genuinely different answers and collapsing them is what produced both the 0 and the 4 700.\n(2) Re-run §7.2's block-space table and §3's 'Idle on-chain footprint' cell on that denominator, and re-state the comparison against §2's baseline honestly as an `initlock/interval`-parameterised postponement so it is directly comparable with the C-90 rejection in §8.2. ~589 vB/coin-yr idle is a ~10× win worth claiming; 0 is not defensible while the flat chain is retained.\n(3) Correct §6's 'hop count is unlimited without any mandatory chain touch' — the epoch-derived rollover cap (4 root levels on mainnet) bounds it independently of the flat ladder.\n(4) Expose the budget on `CoinInfo` (`hops_remaining`, `blocks_to_deadline`) — PARTIAL-PAYMENT-ECONOMICS §7 already flags its absence as the reason 'no wallet can warn a user that a received coin is one hop from being exit-only'.\n(5) Note explicitly that this row goes to 0 if and only if T-1's option (b) ships (census re-based on the SE attestation, flat chain retired on laddered hops). That is the strongest argument for sequencing (b), and it belongs in §7 rather than only in COLOURED-SPINE §5."
+      },
+      {
+        "id": "T-4",
+        "title": "The split window is consumed 100 blocks per whole-coin hop as well as 1 per block, is unpublished, is invisible to every client, and has no reset for a split tree",
+        "survives": true,
+        "corrected_severity": "HIGH",
+        "is_accepted_residual": false,
+        "goal_threatened": "G11 (admission soundness — two authorities for one quantity, loss falling on the party that already paid a co-signature); G4 and G12 partially, as inherited from T-1/T-2 rather than independently",
+        "refutation": "NOT REFUTED on its load-bearing half — the sender/receiver asymmetry is confirmed in code and is a genuine admission-soundness defect. Two of the three sub-claims in the title over-reach.\n\nWHAT SURVIVES, AND IT IS THE IMPORTANT PART. `enforce_split_depth_cap_shaped` (clients/libs/rust/src/tesr.rs:6681) sets `let epoch_blocks = info.initlock;` — the FULL 10 000-block epoch — while `check_exit_headroom` at the payee uses `epoch_expiry_height = min(L_k)` over the parent's conveyed flat backups (lib/src/transfer/receiver.rs:751-768, called from tesr.rs:7479). Two rules deciding one quantity from different authorities, with the sender's the permissive one and the loss falling on the party who already consumed a co-signature and terminalized the parent. This is exactly the defect shape ADMISSION-INPUTS.md was written to prevent ('a gate computing its own admission requirement from a number the sender chose' — here, from a constant that ignores the coin's own history). The arithmetic is verified against the code's own tests: base wait 2 885 ('T 1 + X 721 + SP 1 + ext 721 + state 1441'), a two-tier level 722, `max_split_depth` = 10, a depth-10 walk 9 383 blocks (`exit_chain_length_cap_tests`). So `100·k + age ≤ 7 115` for depth 1 is right, and a depth-10 leaf really is mintable only in the first ~4 days of a never-transferred mainnet coin's life. The deadline really is inherited from the sender's deposit height and hop count, quantities the payee learns only after they are spent.\n\nWHAT DOES NOT SURVIVE.\n(1) 'UNPUBLISHED' AND 'NO RESET' ARE ALREADY PUBLISHED, JUST NOT IN PROTOCOL.md. PARTIAL-PAYMENT-ECONOMICS §7 states the obligation head-on — 'The ~69-day root epoch survives untouched', 'One on-chain re-anchor per tree per epoch is unavoidable — and for a split tree it is not one transaction', 'A child can never be refreshed or re-anchored', and the missing `hops_remaining` on `CoinInfo` verbatim — and CATS-B was chosen precisely to make that re-anchor affordable (8 txs / 15 days vs the baseline's 203 txs / 4.08 years). SPEC-ROADMAP D13 already records 'None of this appears in any normative document'. The defect is that PROTOCOL §5.4 / CHILDREN.md were never reconciled with an economics annex the corpus already treats as authoritative.\n(2) THE RUNTIME HALF IS BUILT, NOT MISSING. D13(a) was decided AND landed: `wallet.rs` now reads '[D13] BOTH LANES, NOT ONLY COLOURED. This loop used to gate on is_colored() and drop every plain child and plain tip', and it derives the deadline with `epoch_deadline_from_flat_backups` minus `exit_wait_blocks`. The finding describes this as current behaviour, which is correct — so it is not part of the defect.\n(3) 'ON DAY 6.2' IS THE AGGRESSIVE ROW, NOT THE GENERAL CASE. At 1 tx/day the same identity gives ~29 days into a ~69-day epoch. The right way to publish it is 'the last ~42% of every epoch is unsplittable at depth 1, and the fraction grows with hop rate', not a single day count.\n(4) 'REQ-1 AND REQ-2 CANNOT BOTH BE SATISFIED ON THE SAME COIN' IS TOO STRONG. They are satisfied simultaneously WITHIN one epoch; what the design cannot do is carry a split tree ACROSS an epoch boundary without one materialisation — which PARTIAL-PAYMENT-ECONOMICS §7 already names as unavoidable and prices.",
+        "corrected_design_fix": "(1) THE LOAD-BEARING FIX: compute the sender's depth cap from the REMAINING window, not the constant. Replace `let epoch_blocks = info.initlock;` (tesr.rs:6681) with `epoch_deadline_from_flat_backups(parent chain) − tip`, so the builder and the payee's `check_exit_headroom` measure the same quantity — the same unification `wallet.rs` already performed for `head_start` by calling `exit_wait_blocks` at both sites. Run it BEFORE `set_spend_budget` terminalizes the parent, per the ordering rule D1 established for `min_child_value`. Note this must be an EXPLICIT epoch argument, not a second `info_config` read, so the two sides cannot drift.\n(2) State the leaf epoch deadline normatively in PROTOCOL §5.4/§5.9 and CHILDREN.md — `deadline = min(L_k)` over the parent's flat backups, `split_window(d) = min(L_k) − tip − exit_wait(d)` — with the budget identity `interval·k + age < initlock` beside it, and cite PARTIAL-PAYMENT-ECONOMICS §7 as the pricing rather than re-deriving it.\n(3) Expose `split_window`, `hops_remaining` and `blocks_to_deadline` on `CoinInfo` (none exists today), so a wallet refuses or re-anchors instead of discovering the wall at a payee.\n(4) In §6, re-verify REQ-1 PER COIN SHAPE and state the epoch-boundary limitation plainly: a split tree owes one materialisation per epoch, priced in §7. Do NOT restate this as 'REQ-1 and REQ-2 are jointly unsatisfiable'.\n(5) Drop the finding's item (4): SPEC-ROADMAP already requires publishing `V_min(d, r)` together with the leaf epoch deadline, so it is a scheduling item rather than a new rule."
+      },
+      {
+        "id": "CO-1",
+        "title": "Coordinator + sender collusion mints an attacker-controlled \"coin\" that passes the acceptance path — the sid↔aggregate binding is an unauthenticated coordinator column",
+        "survives": true,
+        "is_accepted_residual": false,
+        "goal_threatened": "Receiver admission soundness (a receiver books value that no chain output can deliver). NOT the sender-alone threat model — sender-alone is genuinely blocked.",
+        "scenario": "Confirmed reachable: `aggregate_pubkey` (server/src/database/transfer_receiver.rs:83-91), `x1_pub`, and `server_public_key` (server/src/endpoints/transfer_receiver.rs:633-646) are all plain coordinator Postgres columns served over `/info/statechain` and `get_new_key_info`. Nothing anywhere proves the enclave knows the discrete log of the share the receiver is about to depend on. `verify_bundle_bound` (tesr.rs:10397-10408) tests the coordinator's own column against the chain key, so a coordinator that lies about the column passes its own check.",
+        "refutation": "The finding SURVIVES on mechanism but three of its load-bearing claims are wrong and the severity must come down.\n\n(1) THE TITLE IS WRONG ABOUT THE ATTESTATION. In the scenario the coordinator serves the TRUE `enclave_public_key` for sid_Z and a GENUINE attestation signed by e_Z. The D8-CLOSE attestation is never defeated and is not part of the attack. Worse for the finding's framing: post-D8-CLOSE a coordinator can no longer lie about `enclave_public_key` at all — `verify_sig_count_attestation` (lib/src/transfer/receiver.rs:276-287) compares the coordinator's DB column against the pubkey the LOCKBOX itself returns, and refuses on disagreement. Those are two different sources. So the claim that 'the attestation's trust anchor is supplied by the adversary' is false; the attack rests solely on `aggregate_pubkey`/`x1_pub`/`server_public_key`.\n\n(2) IT IS NOT UNDISCOVERED. SPEC-ROADMAP D8 round 2 enumerates it verbatim as items (1)(2)(3), quotes the exact rogue-key decomposition U := D − E_sid, records 'Nothing in the protocol detects a violation of 1, 2, 3, 5, 6 or 8', and closes with the explicit note: 'Binding num_sigs to an SE signature does NOT cover the aggregate. That is a second, separate binding.' DECISIONS.md D8 is the decision to STATE the assumption. This is a published, decided trust assumption, not a hole the corpus is unaware of.\n\n(3) IT ADDS NO ADVERSARY AND NO WORSE OUTCOME. The collusion set {SE, sender} and the victim outcome (receiver books value, receives nothing, attacker keeps their own 1 BTC) are identical to B1 / PROTOCOL §5.7's 'Hacked SE + past owner' row — an explicitly accepted irreducible residual. Capital requirement is the same. TRUST-MODEL §3 defines the 'SE' as 'an API server + database + enclave(s)', one trust unit, so the coordinator is inside it.\n\nWHAT GENUINELY SURVIVES, and it is real: D28's own premise is that the coordinator is 'the party the receiver is being protected FROM' and that the enclave is a separate, stronger witness; B1's mitigation column makes the same split ('the enclave narrows it'). Under that split — an attacker with coordinator DB/API control who cannot break the enclave — B1 is unavailable but this attack is. So the decision to leave D8(2)/(3) as a stated assumption is inconsistent with the split the design has already started building, and the fix is cheap.",
+        "corrected_severity": "high",
+        "corrected_design_fix": "Take the PROOF OF POSSESSION half of the proposed fix; drop the second half.\n\nSOUND AND SUFFICIENT: at claim time the receiver sends a fresh 32-byte nonce ρ; after the keyupdate commits, the enclave signs (domain tag ‖ sid ‖ ρ) with its NEW share e′ and returns (P, σ). The receiver requires σ to verify under P AND o2·G + P == the taproot internal key of F read from the chain. o2 is fresh per transfer and unknown to the sender, so a forger must sign under A_D − O2 with no discrete log. This one check collapses the whole substitution class simultaneously — wrong `aggregate_xonly`, wrong `x1_pub`, wrong `server_public_key`, and rogue-U — and it binds sid to the on-chain key without any new coordinator column being trusted.\n\nDROP AS REDUNDANT: making the aggregate an enclave fact (passing `user_public_key` into `/get_public_key`, folding A into a v3 attestation digest) buys nothing once the PoP exists — the PoP already binds sid ↔ on-chain key ↔ the enclave's live share — while adding a deposit-route change, a new enclave-held value the enclave cannot verify, and a v3 attestation migration. Keep `aggregate_xonly` exactly where it is, as a D27-pattern cross-check.\n\nSTATE THE LIMIT: the PoP does not help if the enclave itself is compromised; that case stays B1 and must be said so, or the fix will be over-read.\n\nDOCUMENTATION: add the coordinator row to TRUST-MODEL's B-table. Note TRUST-MODEL is already stale on this page — §3 still says 'there is no client-facing attestation today', which D8-CLOSE has falsified — so the sync is owed regardless."
+      },
+      {
+        "id": "CO-3",
+        "title": "The attested count and budget are plaintext rows in an operator-administered Postgres — a signature over untrusted state",
+        "survives": true,
+        "is_accepted_residual": false,
+        "goal_threatened": "The census's right-hand side, and therefore admission soundness for a receiver or a pre-paying SSP that treats the attestation as authoritative.",
+        "scenario": "Confirmed. `sig_count INTEGER DEFAULT 0` / `sig_budget INTEGER` are plain columns (db_manager.cpp:83-87, :119-130); `attest_sig_count` signs a digest the caller assembles from a plain DB read, decrypting only the keypair (enclave.cpp:280-338); the lockbox DB is an operator-run postgres container on a plain volume (docker-compose-lockbox.yml). Production runs lockbox with no SGX (D22), so there is no sealed monotonic state and no rollback resistance. `UPDATE ... SET sig_count = sig_count - 1` absorbs one hidden co-signed rival state and the receiver now holds a VALID signature affirming the wrong number.",
+        "refutation": "SURVIVES, but two of its claims are overstated and the severity comes down.\n\n(1) 'RELOCATED, NOT CLOSED' / 'SURVIVES VERBATIM' IS UNFAIR. Before D8-CLOSE the under-report was an in-flight edit of a JSON integer inside the coordinator process — per-request, targeted, stateless, requiring only application-layer control, leaving nothing behind. After it, the attacker must obtain WRITE access to the SE's own persistent store, the tamper is durable, the coin's count is permanently skewed (every later legitimate co-sign re-increments from the wrong base), and the coordinator process alone can no longer do it. That is a genuine reduction in attack surface and a genuine change in required privilege, not a rename.\n\n(2) THE ADVERSARY ALREADY OWNS AN EQUIVALENT RESIDUAL. The attack needs {operator with lockbox-DB write, colluding current owner}. That is the same collusion set as B1, with the same victim outcome (a receiver books value and can be raced out of it). B1 is accepted as irreducible. So the marginal security loss over what the model already concedes is small — the finding's real weight is that D8(a) is listed as CLOSED when a load-bearing assumption behind it is unstated.\n\n(3) PART (1) OF THE PROPOSED FIX DOES NOT WORK ON ITS OWN. Folding (count, budget, epoch) into the sealed blob does not stop a rollback: an operator who restores the whole ROW from a backup gets the old sealed blob, and the same long-lived seed (enclave.cpp:270-276, one boot-time seed) decrypts it. The finding is right that part (2) — a rollback-resistant monotonic anchor — is the load-bearing half, and right that it is unavailable in the shipping lockbox.\n\nWhat survives cleanly: the corpus's assumption inventory speaks about enclave BEHAVIOUR (erasure, one-shot secnonce, ratchet direction) and never about enclave STATE INTEGRITY, and that missing assumption is load-bearing for the only theft-class row the corpus records as closed.",
+        "corrected_severity": "medium",
+        "corrected_design_fix": "Mostly a specification correction, plus one cheap detection mechanism that needs no trusted hardware.\n\n(1) SPLIT THE D8(a) CLAIM HONESTLY. Record D8(a) as closing the TRANSPORT half — the coordinator can no longer alter the count in flight, and can no longer substitute the enclave key either (verify_sig_count_attestation cross-checks it against the lockbox's own reply). Record the STATE half as open, with an explicit named assumption beside T-SE-1: 'the operator does not write to, restore, or roll back the SE's persistent counter state.' Say plainly that on lockbox (no SGX, D22) this assumption has the same strength as T-SE-1 itself.\n\n(2) ADD DETECTION, NOT PREVENTION — this is D8's own option (c) and it is buildable today. Have the enclave maintain an append-only hash chain over increments, h_n = H(h_{n-1} ‖ sid ‖ n), and publish h_n inside the attestation digest (a v3 field). Owners record the head they last saw. A rollback then produces a head that no owner holding a prior receipt can match, converting a silent decrement into an attributable, exhibitable one. This costs one column and one hash per co-sign and does not require sealing or SGX.\n\n(3) DO NOT ship sealed-counter-only (proposed part 1) and call it closed — without rollback resistance it changes the attack from one SQL statement to one row restore, which is not a security boundary. If SGX is ever revived, then require a monotonic anchor and fail-closed attestation as normative for any SE claiming D28's property."
+      },
+      {
+        "id": "SM-1",
+        "title": "The census counts SIGHASHES but accepts only SIGNED TRANSACTIONS as disclosure — one lost co-sign reply permanently bricks a coin",
+        "survives": true,
+        "corrected_severity": "medium",
+        "goal_threatened": "Not G8 or G4. Nothing is confiscated and the exit walk is unchanged — the pre-signed tier chain is intact and the value is recoverable unilaterally. What is lost is the coin's COOPERATIVE/off-chain life, which is exactly B10's already-named damage class, extended from one operation to one coin. State it against that, not against the no-confiscation goal.",
+        "scenario": "Reachable as described, with two corrections: (a) the deficit does not compound — a later co-sign adds +1 to BOTH sides of the census, so the coin stays exactly one slot short, not two; (b) the leaf is not only un-conveyable, it also poisons descendants, because verify_conveyed_child re-runs the census over every ancestor's num_sigs (tesr.rs:11955), so a split of the bricked leaf is refused too.",
+        "refutation": "The window is real and I could not close it: the lockbox cache is keyed on `session_key` (server.cpp:105-115), the session is a function of (aggnonce, msg, keyagg) and the client's own nonce lives only in the local `Coin` binding inside cosign_tier, so the re-serve genuinely cannot survive a process restart. But three of the claim's supports fail. (1) The design already carries the named terminal state the finding says is absent — `SplitStage::Stranded` is documented verbatim as \"the irreducible window: the SE consumed the budget but this process never recorded the co-signature ... Recorded — never silently dropped — so the wallet can SAY so instead of looking idle\" (tesr.rs:4318-4322), and `split_is_retryable` already consults the SE fail-closed before re-running a Planned record (tesr.rs:5449-5459). The gap is that the renewal and cancel-reclaim lanes do not inherit that discipline, not that the design lacks the concept. (2) The claimed goals are wrong: no funds are at risk, so this is B10's family (cooperative path lost, value exits), not a confiscation or a bounded-exit failure. (3) The proposed 'real fix' — make the disclosure unit the sighash — rests on a FALSE premise and must not be built. The SE never receives the sighash: `PartialSignatureRequestPayload` carries only {statechain_id, negate_seckey, session, signed_statechain_id, server_pub_nonce} (lib/src/transaction.rs:44-50), and `enclave::partial_signature` is handed the serialized MuSig2 session, from which the message is not recoverable. So 'the SE already sees every sighash it signs, so attesting the multiset costs zero blindness' is false; a client-supplied sighash register would be forgeable and would DESTROY the census rather than strengthen it. A session-multiset variant is constructible, but it requires the sender to disclose the per-tier aggnonce and it requires the disclosure-uniqueness check (today keyed on txid — `superseded_dedup`'s \"disclosed more than once\") to be re-keyed on session, because a deterministic rebuild after exactly this crash produces the IDENTICAL transaction twice. So the finding's own fix (2) does not even repair the finding's own scenario as specified.",
+        "corrected_design_fix": "Adopt fix (1) only, and note that the finding is right that it needs no secnonce persistence: `cosign_tier_request` produces partial.client_partial_sig BEFORE sign/second, so the durable record is {sid, encoded_unsigned_tx, msg, encoded_session, client_partial_sig, output_pubkey} and carries no nonce-reuse hazard. Three additions the finding misses. (a) The idempotent re-serve must be normative at EVERY gate in front of it, not only at the lockbox: the coordinator's sign/second re-checks `finalized >= budget` and returns 410 with no cache (server/src/endpoints/sign.rs:293-299), so today a replay of the budget-CONSUMING signature — the one B10 is about — is refused before it ever reaches the lockbox cache, and the in-process [KEYSTONE] retry loop fails there too. (b) Add a census SELF-CHECK at wallet open: fetch the attested (count, budget) per sid and compare against the local bundle's `expected`; report DEGRADED, never idle. The predicate already exists — verify_bundle rejects an undercount as well as an overcount (`rejects_undercount`) — so this is wiring, not new logic. (c) Give the renewal and cancel-reclaim lanes the Stranded state and the pre-flight SE consult that the split lane already has. Reject fix (2).",
+        "is_accepted_residual": false
+      },
+      {
+        "id": "SM-2",
+        "title": "Residual B10 is parked as irreducible on a premise the protocol itself now falsifies",
+        "survives": true,
+        "corrected_severity": "low",
+        "goal_threatened": "Documentation integrity only. No protocol goal is threatened, and the row does not in fact close the residual as unfixable.",
+        "scenario": "The sentence is genuinely false about the specified signing round: the lockbox checks the (statechain_id, session) cache BEFORE the secnonce consume and returns the original partial verbatim, with the budget check placed after it on purpose (server.cpp:105-131), and the client's [KEYSTONE] retry loop rests entirely on that (tesr.rs:13850-13863).",
+        "refutation": "True but materially overstated, and its concrete claim is currently wrong. (1) The harm argument — 'a residual whose stated reason is false is a residual nobody ever re-opens' — is refuted by the rest of the same row, which the finding does not quote: B10's mitigation column already names the correct fix and its status, 'a future durable prepare/commit (persist the assembled signed tx before terminalizing, replay locally) would restore the cooperative path — deliberately not shipped as a half-mechanism'. An implementer reading the row does not conclude the recovery is impossible; they conclude it is unbuilt, which is exactly right. (2) The finding's concrete assertion — 'resending the identical sign/second returns the same partial and the split completes' — is FALSE as the system is specified. The coordinator's sign/second re-runs the terminality gates ahead of the lockbox and returns 410 Gone when `finalized >= budget` (server/src/endpoints/sign.rs:255-299), with no idempotency cache of its own. For the budget-consuming co-signature, which is precisely B10's case, the replay is refused before it can reach the cache. So B10's conclusion happens to be correct today for the case it describes, even though the reason it gives is wrong. That is a smaller defect than 'two normative statements contradict each other, and the false one closes a residual'. (3) The finding correctly keeps the ORDERING half as irreducible; I confirmed the argument (a second co-signature over a terminal node is the INV-19 fork).",
+        "corrected_design_fix": "A wording correction plus one normative addition, not a redesign. Delete the 'persisting nonces buys nothing' sentence and record instead: (i) the client never persists a secnonce — only {msg, session, its own partial, the unsigned tx}; (ii) the SE-side session-keyed idempotent re-serve is a normative part of the signing round; (iii) THEREFORE every gate that sits in front of the SE and can refuse a co-signature — the coordinator's single-use, spend-budget, epoch-deadline and pending-transfer checks — MUST be cache-aware, i.e. must serve an already-served session rather than refuse it, exactly as the lockbox's budget check already does. Without (iii) the keystone is defeated at the coordinator and B10's recovery really is unavailable. Keep 'the budget must precede the co-signature' as the boundary with tokens.rs's two-branch argument. Keep the insert_raw_backup_txs DELETE+INSERT atomicity MUST — it is already SPEC-ROADMAP §14(ii).",
+        "is_accepted_residual": false
+      },
+      {
+        "id": "SM-5",
+        "title": "The sig-count attestation authenticates the wire, not the storage — monotonicity is an undeclared durability requirement, and a rollback is undetectable",
+        "survives": true,
+        "corrected_severity": "medium",
+        "goal_threatened": "The conditional part of D28/D8-CLOSE: 'terminality is SE-enforced and SE-attested' holds only if the counter store is fresh. Not covered by B1 (key-share erasure / collusion) or B7 (client-side loss), so it is genuinely unlisted.",
+        "scenario": "Reachable, but narrower than stated — see the three mitigations below.",
+        "refutation": "The core observation holds and I could not refute it: the digest is assembled host-side from plain SQL reads of `signature_count` and `get_sig_budget` (server.cpp:466-575), `enclave::attest_sig_count` Schnorr-signs a caller-supplied `message32` and holds no counter, no budget and no history (enclave.cpp:299-338), the nonce is documented as anti-replay only, and no participant persists a high-water mark. A3 states monotonicity as behaviour, and no document states a durability or anti-rollback requirement. But three mitigations the finding misses shrink it from high to medium. (a) THE BUDGET IS STORED TWICE, INDEPENDENTLY — the coordinator keeps its own `deposit::get_sig_budget` and its own `count_finalized_signatures` and gates sign/second on them (server/src/endpoints/sign.rs:106-115, :283-299) in addition to the lockbox's. A restore of one store alone does NOT produce the INV-19 fork; both must roll back together. Only the census-hiding half survives a lockbox-only restore. (b) THE CENSUS ALREADY REJECTS AN UNDERCOUNT, not just an overcount (`rejects_undercount`: verify_bundle(&b, 2, 0).is_err()), so any current owner who re-verifies their own bundle detects a rollback below their own disclosed set. The missing piece is only cross-session persistence of the last attested pair — the predicate exists. (c) A ROLLBACK SPANNING ANY TRANSFER IS LOUD, NOT SILENT: keyupdate rotates the coin's server share, so a restore reverts `enclave_public_key` and the aggregate no longer reconstructs the on-chain tx0 output, which `validate_tx0_output_pubkey` catches. Only a window containing co-signatures but no transfers is silent. Separately, the host/enclave framing has little purchase on the shipping deployment: the lockbox is a plain process with no SGX separation, so 'the host builds the digest' is not a boundary crossing there — the operator's storage is the boundary, which is exactly the finding's real point and should be stated that way.",
+        "corrected_design_fix": "Adopt (iii); reject (i) and (ii). (iii) is right and cheap: state normatively that the SE's counter and budget store MUST be crash-durable and MUST NEVER be restored to an earlier state; that a restore is a fleet-wide security event requiring re-verification rather than routine recovery; and that a client SHOULD persist the highest attested (count, budget) it has ever seen per sid and refuse any lower one. Add the corollary the finding does not draw: because the budget lives in two independent stores, the spec should REQUIRE that both be consulted and that a disagreement between coordinator and SE counts be treated as a rollback signal — that is free detection the deployment already has and does not use. Reject (ii): a sealed monotone counter does not solve this. Sealing provides confidentiality and integrity, not FRESHNESS — SGX rollback protection is the known-hard case, and in the shipping lockbox deployment there is no enclave separation for a sealed counter to live behind. Reject (i) for now: chained attestations require a publication channel and an append-only log the design does not have, and the corpus has already settled against published state (TRUST-MODEL:119-123, compiled-in constants, against PROTOCOL's nostr claim). Revisit (i) only if a public audit log is adopted for other reasons.",
+        "is_accepted_residual": false
+      },
+      {
+        "id": "RGB-1",
+        "title": "A flat backup may legally carry an RGB transition, and nothing binds its assignment — the sender's hop-backup is an undetectable allocation-theft primitive",
+        "survives": true,
+        "goal_threatened": "Allocation integrity on the CTES-R coloured laddered lane, and — the part that actually matters — the corpus's economic-security argument that a prior owner's spend of F is unprofitable griefing",
+        "scenario": "Reachable as described on the coloured laddered lane, with corrections. Verified: (1) the coloured whole-coin hop exists (`cosign_colored_receiver_state`, tesr.rs:2059 `build_colored_receiver_state`) and `create_backup_transactions` runs unconditionally after it (transfer_sender.rs:1289) — the honest builder is `new_transaction` (plain, :1427), but a malicious sender is free to substitute a coloured build. (2) The receiver's flat-backup validator does not look: `validate_backup_chain_v2` runs signature / sequence / locktime-shape / reconstruction / INV-5 only, and `verify_if_locktime_is_reasonable_tx_version_and_output_size` (receiver.rs:637-673) admits `op_return_outputs <= 1`. `reconstruct_transaction` (:1031) is a canonical-serialisation check that copies `tx_n.output` verbatim, so it constrains nothing. (3) `verify_colored_shape` (tesr.rs:11344) iterates `bundle.exit_tiers()` only; `accept_colored_ladder` validates against `ladder_txids()` only. A grep for opret inspection outside those two sites returns nothing. So a coloured flat backup passes every receiver check.",
+        "refutation": "Three of the finding's load-bearing claims are wrong, and they change both the fix and the severity.\n\n(a) PROPOSED FIX (b) IS ALREADY IMPLEMENTED, so the legacy half of the finding is refuted. On the un-laddered carrier lane the sender DOES convey the coloured backup's consignment (`rgb_consignment` + `rgb_blinding` on the backup row) and the receiver runs `verify_consignment_assignment(w, &env, &txids, &txid, vout)` where `(txid, vout)` are read from the RECEIVER'S OWN coin record (tokens.rs:5700-5750), then re-checks `received == booked` after `accept_ladder`, with a `PERMANENT-INVALID` sentinel on mismatch. It is explicitly the same predicate the SSP pre-payment gate runs (`validate_pending_token`). \"The receiver never sees that consignment at all\" is false.\n\n(b) THE INCREMENTAL VICTIM LOSS IS ZERO. INV-5 (`ladder_decrements_by_interval`) makes the current owner's backup the LOWEST locktime in the chain, so the poisoned backup at L_1 can only fire in a window where the same holder is already past their own epoch expiry — the window in which any prior owner's PLAIN backup takes the coin anyway (`epoch_deadline_from_flat_backups`, `check_exit_headroom`). Bob's loss is total in both cases. What changes is the ATTACKER's payoff, from 0 (destruction) to the whole allocation (capture), for ~250 sat, patiently and invisibly. That is why the finding still matters: PROTOCOL.md §5.8's \"damage:cost ratio ~0.4 — griefing is economically losing\" and the whole mass-grief costing assume the prior owner gains nothing by voiding the tree. On a coloured coin with a coloured backup that assumption is false.\n\n(c) THE SELF-INFLICTED HALF IS ALREADY CLOSED. \"if Bob ever uses it, he executes the theft himself\" is not reachable: `unilateral_exit` opens for exactly one class — a carrier whose ladder is COLOURED — and drives `tesr::exit_pass` over the tier chain, with a fail-closed refusal at the flat fallback (CTESR-GATE.md §4.1, wallet.rs `colored_ladder_sids`); `refuse_uncolored_over_colored{,_child,_tip}` guard the split/rollover/detrigger lanes and `withdraw`/`refresh` refuse carriers outright. Bob is never routed to his flat backup.\n\n(d) DETECTION EXISTS AFTER THE FACT, on all three lanes: `f_spender` → `WatchState::Void { spender, detail }` (tesr.rs:1299, :9826, :9925) fires when F is spent by anything other than this coin's trigger and carries the spender txid, with a unit test asserting the txid is retained \"so the owner can see who took it\". It cannot distinguish destruction from capture, which is exactly what fix (a) would make unnecessary.\n\n(e) REACHABILITY CAVEAT: `SdkConfig::colored_ladder` ships **false** (config.rs:357, :388), so no coin is minted into this shape today. This is a spec gap to close before the flag flips, not a live exposure.",
+        "corrected_severity": "HIGH",
+        "corrected_design_fix": "Keep (a) and (c); drop (b) as already-built.\n\n(a) Make the permitted backup shape a function of the DECLARED LANE rather than the union of two lanes' shapes. On a bundle where `is_colored()`, every flat backup MUST be plain: refuse by name any conveyed backup carrying an OP_RETURN, in the same predicate that already runs on every flat backup, and make that refusal part of the R' acceptance set alongside `verify_colored_shape`. This is one predicate and it fails closed. Note that the permissive `op_return_outputs <= 1` must STAY for the un-laddered carrier lane, where the coloured backup is the transfer vehicle — which is precisely the point: one validator currently serves two lanes with opposite requirements, and the union is the surface.\n\n(c) State the invariant in PROTOCOL.md §5.10: every SE co-signed spend of a coloured coin's funding outpoint F is either (i) plain, and therefore an acknowledged allocation-destroying spend that no exit path may recommend, or (ii) coloured, receiver-assigned, and verified as such by the receiver's own `verify_consignment_assignment`. An unverified opret on a spend of F is a refusal, not a third category.\n\nAlso correct the economic text this exposes: PROTOCOL.md §5.8's griefing-is-losing argument and TRUST-MODEL's residual-risk framing are stated for a lane where voiding the tree yields the attacker nothing. Either (a) restores that premise for the coloured lane, or the premise must be restated. Do NOT adopt RGB-2's alternative of colouring every retained rung so a broadcast is a transfer — that generalises this attack rather than closing it.",
+        "is_accepted_residual": false
+      },
+      {
+        "id": "RGB-2",
+        "title": "The coloured lane's economic security is denominated in carrier sats while the loss is denominated in asset value, and the plain flat backup is a BURN rather than a transfer",
+        "survives": true,
+        "goal_threatened": "Completeness of the normative economic model for the coloured lane — the payee's exposure, not the attacker's payoff",
+        "scenario": "The mechanism is real and already catalogued: the sender's retained 112-vB flat backup over F pays them the whole carrier, costs 6x-265x less than the payee's `293d + 375` vB walk, voids the entire tree in one transaction with zero marginal cost per additional voided piece, and needs no malice. On a coloured tree the voided pieces are not merely stranded — the allocation is closed by an RGB-unaware witness and is destroyed. Every floor in the tree (`min_child_value`, `colored_child_floor`, `colored_spine_tip_floor`, `V_min(d,r)`) is pure fee arithmetic with no asset term.",
+        "refutation": "The mechanism is not new and most of the proposed fix is already the corpus's own scoped work. What survives is one sentence that is genuinely missing.\n\n(a) ALREADY A NORMATIVE, CATALOGUED FINDING. SUBECONOMIC-FINALITY.md is listed in README.md as a normative finding; its own header says \"Nothing in this document is built.\" It states the 112-vB-vs-walk asymmetry, the 6x-265x figure, the zero marginal cost, \"It needs no malice\", and — decisively — the finding's own fix (a): \"Accepting that a piece is a claim, not a bearer instrument — the design choice... what is not defensible is failing to say it.\" SPEC-ROADMAP.md already carries \"Publish V_min(d, r) together with the leaf epoch deadline, or not at all.\" The sats half is fully covered.\n\n(b) THE STRUCTURAL FIX (c) IS ALREADY THE CORPUS'S CR-D. COLOURED-SPINE-REANCHOR-SCOPE.md §2.3 identifies the on-chain coloured de-trigger re-anchor as buildable-and-unbuilt, ranks it as strictly dominating CR-B, and §5 item 2 explains why nothing short of an on-chain spend of F resets the absolute clock. Worse, (c)'s FIRST alternative — \"colour every retained rung so that broadcasting one is a TRANSFER\" — is the RGB-1 attack surface generalised, and must be struck.\n\n(c) THE WORKED SCENARIO IS WRONG AS WRITTEN. A coloured in-ladder split leaves the sender's CHANGE allocation on the same tree, so Alice broadcasting her flat backup destroys her own retained 50,000 units alongside Bob's. \"Alice's decision was purely a sats decision\" holds only when the sender retains no allocation at all. The scenario is repairable, but as stated it is not rational for the actor it describes.\n\n(d) \"ABANDONING A COLOURED PIECE DESTROYS AN ASSET\" OVERSTATES. Abandonment destroys nothing by itself: the cooperative SE-co-signed exit (~111 vB) and onward transfer both remain, and destruction requires a prior owner to actually spend F. The correct statement is the corpus's own: below V_min the piece is a claim, not a bearer instrument.\n\n(e) G8 IS NOT FALSIFIED. It bounds the ATTACKER'S GAIN, and that gain is correctly sats-denominated — the flat backup recovers the whole carrier including the sats paid away, so it IS a transfer on the sats side. What is uncovered is the VICTIM'S EXPOSURE, which no sats floor bounds. \"The attacker gains what the victim loses\" was never the design's bound; it is the analyst's paraphrase.\n\nSurviving core, and it is one sentence: nowhere in the corpus is it stated that on the coloured lane an allocation's economic security is bounded by the sats of the carrier it rides and by the sats cost of defending that carrier. SUBECONOMIC-FINALITY.md explicitly waves colour off (\"Colour is irrelevant to this finding — the top-up dominates the rung\"), which is true of the ARITHMETIC and misleading about the CONSEQUENCE.",
+        "corrected_severity": "MEDIUM",
+        "corrected_design_fix": "(a) Add the missing normative statement, and only that, to TRUST-MODEL.md and PROTOCOL.md §5.10: on the coloured lane the economic security of an allocation is bounded by the SATS value of its carrier and by the sats cost of defending it — not by the asset's value — so a carrier must be minted with sats commensurate with what it will carry, and this is a user-visible property of the instrument. Amend SUBECONOMIC-FINALITY.md's \"Colour is irrelevant to this finding\" to say that it is irrelevant to the arithmetic and load-bearing for the consequence: on the plain lane the voided piece's sats are recovered by the sender; on the coloured lane the allocation is destroyed and nobody acquires it.\n\n(b) Make the asset-aware admission gate a DISCLOSURE, not a refusal. Surface to the payee, before claiming, the sats cost of defending the piece at their own stress fee rate and the fact that the cheapest destruction of the allocation costs the holder of rung L_k about 112 vB. A hard receiver-side refusal keyed on the receiver's fee estimator would refuse honest payments during any spike and would move the payer/payee liveness failure to the worst possible moment; the corpus's own C-2 analysis (the payee cannot fee-bump a tier at all today) shows the refusal would fire constantly.\n\n(c) Reference CR-D (COLOURED-SPINE-REANCHOR-SCOPE §2.3) as the structural remedy rather than proposing a new one, and strike \"colour every retained rung\" — that is RGB-1's attack, not a fix.",
+        "is_accepted_residual": false
+      }
+    ],
+    "accepted_residuals": []
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Frame"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Hunt"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Refute"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "frame",
+      "phaseIndex": 1,
+      "phaseTitle": "Frame",
+      "agentId": "af1133d4629496676",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786600989477,
+      "queuedAt": 1786600987913,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786601455431,
+      "tokens": 227395,
+      "toolCalls": 33,
+      "durationMs": 465954,
+      "resultPreview": "{\"adversaries\":[{\"name\":\"Prior owner of THIS coin (same or older epoch)\",\"controls\":\"Every piece of pre-signed material they were ever handed and never surrendered: the no-timelock trigger T (TRIGGER_SEQUENCE = 0xFFFFFFFD, lock_time 0 — broadcastable the instant F confirms), every extension X_{m'}, every state S_j they held, and on the whole-coin lane the flat backup chain over F with decrementing…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "hunt:value",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "a9ac6f06cac5a2c0f",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601459389,
+      "queuedAt": 1786601457282,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602364570,
+      "tokens": 169801,
+      "toolCalls": 34,
+      "durationMs": 905181,
+      "resultPreview": "{\"findings\":[{\"id\":\"VE-1\",\"title\":\"The split tree's mandatory per-epoch materialisation is a recurring on-chain rent the footprint economics never charge — at scale it reproduces the block-space wall the architecture was selected to delete\",\"goal_threatened\":\"G12 (zero idle cost / no calendar ageing), and through it the architecture-selection rationale in PROTOCOL.md §2/§4; secondarily G4 (exit av…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "hunt:timing",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "a6e802bf8e16e9e2e",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601459886,
+      "queuedAt": 1786601457282,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602499371,
+      "tokens": 218100,
+      "toolCalls": 48,
+      "durationMs": 1039485,
+      "resultPreview": "{\"findings\":[{\"id\":\"T-1\",\"title\":\"INV-27 is false for every RECEIVED laddered coin: the absolute flat-backup ladder is retained under TES-R, and the design switches off every calendar defence on the strength of the claim that it isn't\",\"goal_threatened\":\"G4 (exit availability), G11 (admission soundness — the TIME dimension on the whole-coin lane), G12 (zero idle cost / no calendar ageing), G8 (los…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "hunt:crypto",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "a01f408e2f7049c3f",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601459143,
+      "queuedAt": 1786601457282,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602443245,
+      "tokens": 180632,
+      "toolCalls": 48,
+      "durationMs": 984102,
+      "resultPreview": "{\"findings\":[{\"id\":\"CRY-1\",\"title\":\"The anti-theft census counts SE participations and calls them signatures — but the design's own crypto note says a blind Schnorr signer can be made to yield more signatures than participations, and BOTH prescribed countermeasures are absent on the laddered lane\",\"goal_threatened\":\"G2 (no undisclosed spending path), and G3 through it — a state that never entered …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "hunt:trust",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "ac63df9a958793b3e",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601459025,
+      "queuedAt": 1786601457282,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602283310,
+      "tokens": 168109,
+      "toolCalls": 37,
+      "durationMs": 824285,
+      "resultPreview": "{\"findings\":[{\"id\":\"CO-1\",\"title\":\"Coordinator + sender collusion mints a wholly attacker-controlled \\\"coin\\\" that passes R1–R5, verify_bundle_bound AND the new enclave attestation — the attestation's \\\"chain-anchored\\\" verifying key is anchored only through a value the sender chooses\",\"goal_threatened\":\"G2 (no undisclosed spending path — here EVERY spending path is undisclosed), G1 (value conserv…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "hunt:recovery",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "a772c285e579b94f2",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601460091,
+      "queuedAt": 1786601457282,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602253237,
+      "tokens": 175655,
+      "toolCalls": 54,
+      "durationMs": 793146,
+      "resultPreview": "{\"findings\":[{\"id\":\"SM-1\",\"title\":\"The census counts SIGHASHES but accepts only SIGNED TRANSACTIONS as disclosure — one lost co-sign reply permanently bricks a coin, with no adversary present\",\"goal_threatened\":\"G2 is achieved, but at the cost of G8 (no confiscation by design; missed liveness costs a race, never a forfeiture) and G4 (bounded exit). A pure liveness fault — a dropped TCP reply — con…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "hunt:rgb",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "a9358dda512f89193",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601459585,
+      "queuedAt": 1786601457282,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602327415,
+      "tokens": 188444,
+      "toolCalls": 42,
+      "durationMs": 867829,
+      "resultPreview": "{\"findings\":[{\"id\":\"RGB-1\",\"title\":\"A flat backup may legally carry an RGB transition, and nothing binds its assignment — the sender's hop-backup is an undetectable allocation-theft primitive\",\"goal_threatened\":\"G5 (allocation integrity); secondarily G2, because the theft consumes a co-sign slot the census already expects and therefore leaves the census balanced\",\"scenario\":\"Alice holds a CTES-R c…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "hunt:concurrency",
+      "phaseIndex": 2,
+      "phaseTitle": "Hunt",
+      "agentId": "a0db3b422fab6a716",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786601460016,
+      "queuedAt": 1786601457283,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602389959,
+      "tokens": 192312,
+      "toolCalls": 47,
+      "durationMs": 929943,
+      "resultPreview": "{\"findings\":[{\"id\":\"CM-1\",\"title\":\"The census→handover critical section is protected by a coordinator-held wall-clock mutex, while the operation it protects has no deadline at all\",\"goal_threatened\":\"G2 (no undisclosed spending path), G3 (old state dies), G6 (finality)\",\"scenario\":\"Alice in-ladder-splits a 1,000,000-sat root and conveys a 250,000-sat child to Bob at protocol_version 4. Per CHILDRE…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "refute:recovery",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "a9243542112a60239",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602256422,
+      "queuedAt": 1786602254798,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602941354,
+      "tokens": 158473,
+      "toolCalls": 35,
+      "durationMs": 684931,
+      "resultPreview": "{\"findings\":[{\"id\":\"SM-1\",\"title\":\"The census counts SIGHASHES but accepts only SIGNED TRANSACTIONS as disclosure — one lost co-sign reply permanently bricks a coin\",\"survives\":true,\"corrected_severity\":\"medium\",\"goal_threatened\":\"Not G8 or G4. Nothing is confiscated and the exit walk is unchanged — the pre-signed tier chain is intact and the value is recoverable unilaterally. What is lost is the …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "refute:trust",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "a35e802006da9b66c",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602286716,
+      "queuedAt": 1786602284910,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786602967518,
+      "tokens": 152352,
+      "toolCalls": 38,
+      "durationMs": 680802,
+      "resultPreview": "{\"findings\":[{\"id\":\"CO-1\",\"title\":\"Coordinator + sender collusion mints an attacker-controlled \\\"coin\\\" that passes the acceptance path — the sid↔aggregate binding is an unauthenticated coordinator column\",\"survives\":true,\"is_accepted_residual\":false,\"goal_threatened\":\"Receiver admission soundness (a receiver books value that no chain output can deliver). NOT the sender-alone threat model — sender…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 11,
+      "label": "refute:rgb",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "a14883ac8bf859c51",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602330772,
+      "queuedAt": 1786602329027,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786603157328,
+      "tokens": 184895,
+      "toolCalls": 60,
+      "durationMs": 826556,
+      "resultPreview": "{\"findings\":[{\"id\":\"RGB-1\",\"title\":\"A flat backup may legally carry an RGB transition, and nothing binds its assignment — the sender's hop-backup is an undetectable allocation-theft primitive\",\"survives\":true,\"goal_threatened\":\"Allocation integrity on the CTES-R coloured laddered lane, and — the part that actually matters — the corpus's economic-security argument that a prior owner's spend of F is…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 12,
+      "label": "refute:value",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "a21e953337966ed77",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602368148,
+      "queuedAt": 1786602366215,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786603084045,
+      "tokens": 212464,
+      "toolCalls": 24,
+      "durationMs": 715897,
+      "resultPreview": "{\"findings\":[{\"id\":\"VE-1\",\"title\":\"Split-tree per-epoch materialisation is an uncharged on-chain rent\",\"survives\":true,\"corrected_severity\":\"MEDIUM\",\"goal_threatened\":\"Not G12 or the architecture-selection rationale. What is actually threatened is spec consistency: PROTOCOL.md §7.1/§7.2/§5.7-row-3/§6-REQ-1 contradict TRUST-MODEL.md's own header block and PARTIAL-PAYMENT-ECONOMICS.md §7, and §7.2's…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 13,
+      "label": "refute:concurrency",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "a756eb7fc3d201f8f",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602393363,
+      "queuedAt": 1786602391550,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786603174316,
+      "tokens": 158813,
+      "toolCalls": 46,
+      "durationMs": 780953,
+      "resultPreview": "{\"findings\":[{\"id\":\"CM-1\",\"title\":\"The census→handover critical section is protected by a coordinator-held wall-clock mutex, while the operation it protects has no deadline at all\",\"survives\":false,\"is_accepted_residual\":true,\"goal_threatened\":\"G2/G3/G6 — threatened only inside the already-published post-expiry window; not a new exposure\",\"scenario\":\"Verified reachable in code (validate_encrypted_…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 14,
+      "label": "refute:crypto",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "a416c27abd176069c",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602447034,
+      "queuedAt": 1786602445249,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786603074107,
+      "tokens": 159761,
+      "toolCalls": 37,
+      "durationMs": 627073,
+      "resultPreview": "{\"findings\":[{\"id\":\"CRY-1\",\"title\":\"Census counts SE participations; blind-Schnorr ROS lets one participation yield >1 signature, and both blind_musig.md countermeasures are absent on the laddered lane\",\"survives\":false,\"goal_threatened\":\"G2/G3 — claimed, but not reachable\",\"scenario\":\"Attacker opens ℓ concurrent blind-signing sessions under one aggregate key, solves ROS, mints an undisclosed lowe…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 15,
+      "label": "refute:timing",
+      "phaseIndex": 3,
+      "phaseTitle": "Refute",
+      "agentId": "aae06243c6572e114",
+      "model": "claude-opus-5",
+      "state": "done",
+      "startedAt": 1786602502688,
+      "queuedAt": 1786602500949,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "**READ ONLY.** Do not build, do not run tests, do not modify files. A live E2E sweep is using the\nbuild tree. Use grep/ripgrep and file reads only.\n\n**YOU ARE ANALYSING A DESIGN, NOT AN IMPLEMENTATION.** The owner has decided the specification\ndescribes the protocol as it SHOULD be; where the code disagrees with a sound design, the CODE is\nwhat changes. So:\n  * an implementation bug is only intere…",
+      "lastProgressAt": 1786603428994,
+      "tokens": 192016,
+      "toolCalls": 53,
+      "durationMs": 926306,
+      "resultPreview": "{\"findings\":[{\"id\":\"T-1\",\"title\":\"INV-27 is false for every RECEIVED laddered coin: the absolute flat-backup ladder is retained under TES-R\",\"survives\":true,\"corrected_severity\":\"HIGH\",\"is_accepted_residual\":false,\"goal_threatened\":\"G4 (exit availability), G8 (loss requires winning a telegraphed public race), G12 (zero idle cost) — but NOT G11 on the whole-coin lane, see refutation\",\"refutation\":\"…"
+    }
+  ],
+  "totalTokens": 2739222,
+  "totalToolCalls": 636
+}
