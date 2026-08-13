@@ -187,6 +187,27 @@ const processEncryptedMessage = async (clientConfig, electrumClient, db, coin, e
     // laddered coin could pad backups to match num_sigs and later broadcast a lower-CSV state to take
     // the coin back. Refuse rather than mis-verify. (Receive laddered coins with the Rust SDK until the
     // ladder verifier is ported.)
+    // [D40.2 / A.4] THE GATE IS STRUCTURAL. It used to key on three fields the SENDER fills in
+    // (`protocol_version`, `tesr_ladder`, `child_tesr_bundle`), so a sender declaring version 0 with
+    // both fields omitted fell straight through to the bare `num_sigs == backups.length` census
+    // below — against an integer this client never authenticates. That is the identical shape the
+    // Rust receiver had to close with MIN_PREPAY_PROTOCOL_VERSION, and it made these clients the
+    // CHEAPEST route in the whole trust model: a plain HTTP-response edit, no seed, no DB write.
+    //
+    // The coordinator-served `statechainInfo` is not sender-controlled, so it is where the check
+    // belongs. An `attestation` field means the enclave signs `utexo/sig_count/v2` over
+    // (statechain_id, num_sigs, sig_budget, nonce) — i.e. this deployment runs laddered coins and
+    // the count below is only as good as a signature THIS CLIENT CANNOT VERIFY. Refuse.
+    //
+    // This does not make the client conformant; it makes it fail closed for a reason it can check.
+    // The real fix is porting the attestation verification (D40.2), and until it lands these clients
+    // are non-conformant receivers by design rather than by accident.
+    if (statechainInfo.sig_count_attestation !== undefined && statechainInfo.sig_count_attestation !== null) {
+        throw new Error("This coordinator attests sig_count (utexo/sig_count/v2) and this client cannot verify that attestation — refusing (fail-closed). The flat census below trusts num_sigs, so an unverified attestation makes it worthless. Receive with the Rust SDK.");
+    }
+    // The sender-declared fields are still refused, because an HONEST sender shipping ladder material
+    // to a client that cannot read it should get a refusal that names the reason. This is a
+    // usability check, not the security one above.
     if (transferMsg.protocol_version >= 2 ||
         (transferMsg.tesr_ladder !== undefined && transferMsg.tesr_ladder !== null) ||
         (transferMsg.child_tesr_bundle !== undefined && transferMsg.child_tesr_bundle !== null)) {
