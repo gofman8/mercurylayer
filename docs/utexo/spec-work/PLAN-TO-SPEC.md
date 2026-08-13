@@ -20,8 +20,8 @@ unfinished.
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **13 landed** (all six Tier A + B.1–B.5, B.7). B.8 is **proven not buildable as specified** (D41). B.6 is **demoted to an optimisation** by D45's measurement. |
-| Live E2E suite | **86/86.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
-| Unit + guard suite | green — **753 tests, 0 failures** |
+| Live E2E suite | **87/87.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
+| Unit + guard suite | green — **756 tests, 0 failures** |
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature
@@ -154,8 +154,13 @@ attack test that asserts its own non-vacuity.
   `clears_supersession_margin`, and three tests pin the boundary: regtest clears by **exactly zero**
   (cap `d_floor` 6 = `SP` 0 + δ 6) while mainnet clears by 108, so every off-by-one here is invisible
   on mainnet and refuses every honest bundle on regtest.
-- The **carrier variant** of every deadline and allocation test. The coloured lane is where three
-  separate bounds turned out to be sat-denominated descriptions of a victim who loses an asset.
+- ✅ **DONE — the carrier variant of the DEADLINE bound (`sdk87`).** It is the live exercise of D46,
+  which until now had only a CI guard, and it asserts the distinction rather than the event: the
+  carrier appears in the SEVERED list and in NO re-anchor result, `F` is spent by **this coin's own
+  trigger** (a re-anchor spends `F` too — only the spender's txid tells them apart), and the
+  allocation survives. A sats-only version of this test would have passed for the outcome that
+  destroys the asset. Remaining: the carrier variant of the ALLOCATION/headroom bound (`sdk82`'s
+  shape).
 - ✅ **DONE — `sdk30(a)` replaced as INV-27's evidence by `sdk86`.** `sdk30(a)` idles a k=0 deposit
   and can only witness the CSV half. `sdk86` reads BOTH clocks on the same coin across two whole-coin
   hops and measures what D36 said was unpublished: `L0 1389 -> L1 1379 -> L2 1369`, exactly

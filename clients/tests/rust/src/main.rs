@@ -100,6 +100,7 @@ pub mod sdk83_leaf_combine;
 pub mod sdk84_leaf_renewal;
 pub mod sdk85_transfer_cancel;
 pub mod sdk86_received_coin_ages;
+pub mod sdk87_carrier_deadline;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -518,6 +519,13 @@ async fn main() -> Result<()> {
     // that one idles a k=0 deposit and structurally cannot witness the case where INV-27 is false.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("86") {
         sdk86_received_coin_ages::execute().await?;
+        return Ok(());
+    }
+
+    // [D46 / Stage 3] The CARRIER variant of the deadline pass: a carrier near its deadline must be
+    // SEVERED by its own pre-signed T, never re-anchored, with its allocation intact.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("87") {
+        sdk87_carrier_deadline::execute().await?;
         return Ok(());
     }
 
