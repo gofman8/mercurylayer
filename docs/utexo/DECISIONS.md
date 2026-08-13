@@ -791,3 +791,209 @@ Each of the 33 known residuals plus the 11 surviving flaws is classified as exac
 exposure). The result is the specification's named-limitations section.
 
 **A design is sound when its failure modes are enumerated and survivable, not when it has none.**
+
+## D38 — The six remaining D3–D20 rows, RE-DERIVED design-first (D6, D9, D14, D16, D18, D20)
+
+**These six were left open because their recorded recommendations are DESCRIPTIVE** — each ends in
+some form of "specify what the code does". Under the authority order the specification states the
+design **as it should be**, and where design and code disagree the CODE changes. So the descriptive
+recommendations are not usable as answers, and each is re-derived below from the adversary model and
+the security goals. Where the re-derivation lands on the same place the description did, that is
+recorded as a result rather than assumed; where it does not, the code follows.
+
+Backward compatibility is not a constraint (D23), which removes the "wire break" objection that had
+been doing most of the work in three of these six.
+
+---
+
+### D6 — ONE exit-cost model, shape-aware, read by every consumer
+
+**Question.** How does a party decide that a coin's unilateral exit fits inside the epoch it
+inherits, and what number does the design publish?
+
+**What the goals force.** The deciding quantity is the exit walk's total relative wait,
+`Σ(csv_i + 1)` over the tiers **actually in the chain being conveyed**. A model that is not the
+actual shape errs in one of two directions and both are defects: under-counting admits a coin whose
+exit cannot finish before `min(L_k)` (safety), over-counting refuses honest coins and starts
+defensive exits earlier than they are needed (liveness, and on-chain footprint the design's "idle
+coins pay 0 vB" claim is measured against). **"Conservative" is not a defence when the goal is
+liveness** — it is the same error with a friendlier sign.
+
+**Decided.** There is exactly ONE exit-cost function. It is shape-aware, it reads the signed
+`nSequence` rather than assuming a schedule, and every consumer reads that one — the receiver's
+admission gate, the watchtower's auto-exit margin, and the published economics alike. **Two models
+of one quantity is the defect, independent of which direction the second one errs.**
+
+*Code consequence.* The admission gate already satisfies this (`exit_wait_blocks` = `Σ(csv+1)`,
+`max_exit_txs` splices each level's real `SplitLevelShape`). The published model does not:
+`tesr_exit_txs`/`_vbytes`/`_wait_blocks` assume the two-tier shape at every level (`3 + 2d`) where a
+CATS-B spine level is one tier (`d + 4`), and they feed `auto_exit_margin_blocks_for` and the
+invalidation economics. Make them shape-aware or delete them and route their consumers through the
+admission function. Measured figures the spec publishes from it: mainnet depth cap **10** (not the
+phantom 8 and not 19); depth-10 = **9,383 blocks ≈ 65.2 days, 23 transactions**.
+
+*What NOT to do.* Do not delete the pre-CATS baseline rows in `PARTIAL-PAYMENT-ECONOMICS.md` — they
+are the "before" half of a labelled before/after. Label them; deleting them makes the multi-year exit
+read as current.
+
+---
+
+### D9 — On the wire, absence is a refusal; there is no default
+
+**Question.** What is the acceptance discipline for a conveyed message?
+
+**What the goals force.** The message body is **unauthenticated**. `verify_transfer_signature`'s
+preimage is `(tx0_txid, tx0_vout, new_user_pubkey)` and nothing else — no site in `lib/`, `clients/`
+or `server/` ever signs the body. So every field arrives from the adversary, and each accepted value
+must be either (i) **derived** from an authenticated source (the chain, the SE, the receiver's own
+record), or (ii) **refused**. `#[serde(default)]` on a wire struct is a third category that the
+adversary model has no room for: it converts the sender's *omission* into a positive claim the
+receiver then asserts on their behalf. An unrecognised field is the same failure in the other
+direction — a payload the receiver does not understand, accepted anyway.
+
+**Decided.** Wire structs are `deny_unknown_fields`. No `#[serde(default)]` on any wire struct: an
+absent field is a typed refusal naming the field, unless the design states a derivation for it, in
+which case the derivation is normative and the field is not read at all. **Local persistence records
+are not wire** — `SpineTipBundle` and `SplitJournalChild` keep their defaults and the spec says so
+explicitly, or an independent implementer builds to twelve fields that never cross.
+
+The three frozen payloads are `TransferMsg`, `TesrBundle`, `ChildTesrBundle`.
+
+**And the ancestry disclosure rule is TWO rules, not one.** The branch lane refuses on a COUNT
+(Σ structural inputs, each named and proven terminal at the SE); the child lane has no count at all
+(root-anchored to on-chain `F`, `ancestor_facts` length equality, contiguous walk, per-segment SE
+facts). Merging them in the spec produces a rule neither lane implements.
+
+*Code consequence.* Five `serde(default)` fields on `TransferMsg` and thirteen across the three wire
+structs become required-or-derived; `deny_unknown_fields` appears zero times in the tree today (once,
+as a comment) and must appear on all three.
+
+---
+
+### D14 — The supersession margin is the propagation budget, and the kind is STRUCTURAL
+
+**Question.** How much CSV separation must a disclosed superseded tier carry over the live one?
+
+**What the goals force.** The race is decided by relay and confirmation, not by arithmetic. The
+design already carries a name for the propagation budget — `δ` for states, `δE` for extensions — so
+any separation smaller than that budget is a margin the design itself says can be crossed. The
+shipped relation is strict inequality (`sup.csv > live.csv`), i.e. **one block**, which is not a
+budget. And a margin selected by a field the sender fills in is not a margin at all: the adversary
+chooses which branch they are judged on.
+
+**Decided.** A superseded **state** must satisfy `sup.csv ≥ live.csv + δ`; a superseded **extension**
+`sup.csv ≥ live.csv + δE`. **The kind is taken from the LIVE rival, structurally** (position parity),
+never from which conveyed list the superseded tier arrived in. Presets must satisfy `d_floor ≥ δ` and
+`e_floor ≥ δE`, checked by the preset census, or the law refuses honest bundles on some future
+schedule.
+
+**Why the per-kind form and not a single δ.** An honest extension renewal produces exactly `δE` of
+separation by construction (`renew` supersedes into `superseded_extensions` while the replacement
+spends the same parent outpoint). On regtest `δE = 3` and `δ = 6`, so a single-δ law breaks **every**
+honest regtest renewal. Mainnet is immune only because `δ = δE = 36` — the same coincidence that hid
+the structural-kind hole.
+
+*Code consequence.* `LiveRival` carries no kind; the fix adds one at its two construction points and
+threads it to the relational check, with a named error distinct from the existing strict-inequality
+refusal. `DECISIONS.md`'s D14 row (the single-δ form) is superseded by this. Schedule-grid membership
+stays v2 — `SPINE_CSV = 0` is outside any grid by construction.
+
+---
+
+### D16 — `protocol_version` is a message-SHAPE selector; ordering it is a category error
+
+**Question.** What does the version tag mean, and what must a receiver do with a value it does not
+know?
+
+**What the goals force.** A tag exists so a receiver can refuse a payload it does not understand.
+Comparing it with `≥` asserts the opposite: that an unknown FUTURE value is safely processed by
+TODAY's rules. Nothing establishes that, and the three values in play are not generations of one
+shape — `0` is the un-laddered carrier lane, `2` is a root-ladder conveyance, `4` is a child
+conveyance carrying key handover. They are three different message shapes that happen to be numbered.
+**The code already shows the seam**: `MIN_PREPAY_CHILD_PROTOCOL_VERSION = 3` is a floor over a set
+that contains no 3.
+
+**Decided.** The admissible set is exact: `{0, 2, 4}`. Anything else is refused by name. The numeric
+ordering carries no meaning and the spec says so in terms, so that no implementer reads a floor as a
+compatibility promise. The v3 dispatch arm is deleted — it branches on a shape nothing emits, and it
+early-returns before the `/transfer/receiver` key handover.
+
+*Code consequence.* Replace the `<`/`≥` floors with exact-set membership at the nine receive-path
+sites; delete `transfer_receiver.rs`'s v3 arm; the child gate becomes "shape 4", not "≥ 3". The
+uniffi FFI that silently strips `protocol_version`, `tesr_ladder` and `child_tesr_bundle` then fails
+CLOSED (a stripped tag is not in the set) instead of downgrading silently — which is the whole point
+of exact-set dispatch and is why it is not merely a stylistic tightening.
+
+*Scoping note for §7.* "No ceiling exists" is true of the **Rust receive path only**. Both JS clients
+refuse everything `≥ 2`, so they are ceiling-conformant by accident while refusing the entire laddered
+space. The justification for the ceiling is that there are no independent implementations to
+coordinate with and the two in-repo non-Rust receivers already fail closed — **not** D23, which
+explicitly carves `protocol_version` floors and ceilings OUT of its scope.
+
+---
+
+### D18 — ONE error vocabulary, and it is the wire `code`
+
+**Question.** Is the error code part of the conformance surface?
+
+**What the goals force.** It already is, in fact: three specs' conformance tables target `ERR-n`, and
+four client profiles across five sites branch on the wire string. A surface with two parallel
+vocabularies — `ERR-n` in prose, PascalCase on the wire — is not a surface, because a conformant
+implementation cannot tell which one it is being tested against. Prose is not an interface.
+
+**Decided.** There is ONE normative vocabulary and it is the **wire `code` field**. `ERR-n` becomes an
+index INTO it, not a parallel taxonomy, and the traceability tables point at codes. The wire strings
+are pinned explicitly (`#[serde(rename = "…")]`) so that a future Rust identifier rename cannot move
+the wire value — the identifier and the interface stop being the same thing. Casing stays PascalCase:
+compatibility is not a constraint, so this is a free choice, and PascalCase is what four profiles
+already parse. Changing it buys nothing and costs five sites.
+
+**A missing variant is a conformance failure, not a binding detail.** The generated Kotlin bindings
+enumerate only two of the three variants — `TransferCancelledError` is absent — so a Kotlin client
+meeting the shipped 410 cannot deserialize the body at all, and the one variant whose job is to stop
+a cancelled payment looking like an idle mailbox is invisible on that profile. Regenerating the
+bindings is part of this decision, not downstream of it.
+
+*Correction to the evidence.* `ERR-11` is NOT missing — it is defined at `SPEC.md:765` under §13 and
+normatively referenced three times. §11's list skips it because the entry lives with its requirement.
+
+---
+
+### D20 — Capability discovery is by required-field PRESENCE on the artefact being relied on
+
+**Question.** How does a client establish that the coordinator can do the thing it is about to depend
+on?
+
+**What the goals force.** A feature list, an advertised version, or any other self-description is a
+**claim by the party being defended against**. The coordinator is in the adversary model; its
+statements about itself are not evidence. The only sound evidence is the artefact the client is about
+to rely on, checked at the point of use.
+
+**Decided.** Capability discovery is by REQUIRED-FIELD PRESENCE on that artefact, checked where it is
+used, refusing by name. A client MUST NOT infer a coordinator capability from any advertised
+identifier or feature list. Extension is by additive OPTIONAL request parameters and additive
+OPTIONAL response fields. **An optional field's absence MUST be a typed cause established from
+positive evidence**: a consumer MUST NOT read "could not ask" or "no record" as "the coordinator says
+absent", and MUST NOT default absence to a permissive value.
+
+Two worked examples belong in the spec verbatim, because each is a mistake that actually shipped:
+`has_sig_budget` `None`-vs-`Some(false)`, and the three-way split where only a *positively reported*
+absence licenses the flat lane.
+
+`/info/config`'s `version` is informational and MUST NOT drive any compatibility decision;
+`batchtimeout` is advisory; `initlock`/`interval` are a CROSS-CHECK the client refuses to proceed past
+on mismatch — they are compiled in (D27), never sourced from the wire. Leaving them sourced would
+reopen the exact hole D27 closed, since `interval` is the yardstick INV-5 measures every flat-backup
+hop against.
+
+*What must NOT be written.* "Pre-0009 coins are permanently un-ladderable and REFUSED" — unqualified,
+that strands 8,155 live rows the code conveys fine on the flat lane under
+`PermanentLicence::LegacyNoAggregate`. Un-ladderable, yes; unconveyable, no.
+
+---
+
+**Five of the six require code changes.** They are design decisions, and under the authority order the
+code follows: D6 (one shape-aware exit-cost model), D9 (`deny_unknown_fields`, no wire defaults), D14
+(per-kind structural margin + preset census), D16 (exact-set dispatch, delete the v3 arm), D18 (pinned
+wire codes + regenerated Kotlin bindings). D20 is the one the code already implements — recorded as a
+verified result, not assumed.
