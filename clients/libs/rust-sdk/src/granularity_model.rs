@@ -12,7 +12,7 @@
 //! - [`crate::transfer::split_fee_reserve`] — the split miner-fee reserve clamp,
 //! - [`crate::select::plan`] / [`crate::select::exact_subset`] — payment planning: exact
 //!   subsets, whole-coins-then-split, typed insufficiency,
-//! - [`crate::tokens::TOKEN_PIECE_SATS`] — the packaging of a token piece (3_054 sats: the
+//! - [`crate::tokens::TOKEN_PIECE_SATS`] — the packaging of a token piece (**4_074** sats [D44]: the
 //!   COLOURED root-ladder floor at twice the committed tier fee rate; derived, not chosen),
 //! - [`crate::types::ExitCostEstimate::fee_sats_at`] — ceil fee arithmetic (INV-17).
 //!
@@ -277,9 +277,10 @@ fn plan_paths_matrix() {
 // EFFECTIVE minimum carrier is therefore governed by the full split_amounts rule:
 //   min carrier = TOKEN_PIECE_SATS + reserve(min 300) + change(min 330).
 //
-// RE-DERIVED, not weakened: `TOKEN_PIECE_SATS` moved 1_500 → 3_066 (it is now the COLOURED root
+// RE-DERIVED, not weakened: `TOKEN_PIECE_SATS` moved 1_500 → 3_066 → **4_074** [D44] (it is now the COLOURED root
 // ladder floor at twice the committed fee rate — see `tokens::token_piece_sats_is_the_coloured_root_floor`;
-// [D4] corrected it 3_054 → 3_066 when the coloured tier's measured signed vsize went 167 → 168 vB),
+// [D4] corrected it 3_054 → 3_066 when the coloured tier's measured signed vsize went 167 → 168 vB;
+// [D44] then took it to 4_074 when the committed rate went 2.0 → 3.0),
 // so the identity that used to read 2_130 now reads 3_696, and the two boundary probes move with
 // it. The SHAPE of every assertion below is unchanged, and each bound is written as an expression
 // in `TOKEN_PIECE_SATS` so the next move of the constant cannot leave a stale literal behind.
@@ -364,10 +365,11 @@ fn raw_units_precision_model() {
 // `ExitCostEstimate::fee_sats_at` (types.rs:138-140, INV-17 ceil arithmetic).
 //
 // A token piece's backup tx (112 vB measured) sweeps its packaging minus the fee. The sats zero
-// out exactly when ceil(112·rate) ≥ TOKEN_PIECE_SATS. RE-DERIVED for the new packaging (3_066,
+// out exactly when ceil(112·rate) ≥ TOKEN_PIECE_SATS. RE-DERIVED for the new packaging (**4_074** [D44],
 // the coloured root-ladder floor at twice the committed rate): at integer feerates the threshold
-// is 28 sat/vB, because 112·27 = 3_024 < 3_066 < 3_136 = 112·28. It was 14 sat/vB at the legacy
-// 1_500 — the bigger piece is exactly twice as resistant to packaging dust, which is a direct
+// is **37** sat/vB [D44], because 112·36 = 4_032 < 4_074 ≤ 4_144 = 112·37. It was 28 at 3_066 and
+// 14 sat/vB at the legacy 1_500 — the bigger piece is ~2.6× as resistant to packaging dust, which is
+// a direct
 // consequence of the size change and is asserted below rather than assumed. Above the threshold
 // the sweep is economically dust — but ONLY the packaging: the token allocation is untouched (the
 // colored split txs are the RGB witnesses; the allocation settles on-chain when they confirm,

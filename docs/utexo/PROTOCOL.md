@@ -479,9 +479,16 @@ funding output F′** and rebuild T′/X′_0/S′_0 — one tier-shaped v3 tx, 
 variant is a coloured self-transition at **168 vB** (`COLORED_TIER_VBYTES` — an `opret`, not a tapret,
 and exactly one P2TR output wider than the plain tier). Consequences:
 
-- **Trigger griefing collapses from FATAL to priced nuisance**: the victim answers with one 125-vB
-  de-trigger, keeps off-chain-ness, the coin's ladder resets fresh, and the grief is fee-attributable
-  on-chain even though T itself is anonymous.
+- **Trigger griefing is SURVIVABLE — the victim's value always comes out**: it answers with one
+  125-vB de-trigger, and the grief is fee-attributable on-chain even though T itself is anonymous.
+  > **[D57] "collapses from FATAL to priced nuisance", "keeps off-chain-ness" and "the coin's ladder
+  > resets fresh" are RETRACTED as unproven claims.** They rest on the de-trigger spending into a
+  > fresh funding output `F′` and rebuilding `T′/X′_0/S′_0` — and `cosign_detrigger`, the co-signer
+  > that would do it, has **zero callers repo-wide**. `sdk40` PART 2 proves only the consensus half
+  > (the stale `X′` dies); it calls `cosign_tier` and sends to an external address, so what it
+  > demonstrates is an ON-CHAIN exit, which is the outcome "collapses from FATAL" says is avoided.
+  > Restoring the sentence needs the wiring plus an E2E that lands `F′` and a rebuilt ladder. See
+  > §5.8.
   > **[Corrected] "Damage:cost ratio ≈ 0.4 — griefing is economically losing" was a vB ratio
   > (111 ÷ 276) and it does not survive being priced in sats.** Both transactions pay out of the
   > **coin**: a tier's fee is committed at signing (`tier_out_value` = prev − committed_fee − P2A), and
@@ -507,10 +514,27 @@ and exactly one P2TR output wider than the plain tier). Consequences:
 - The de-trigger requires SE liveness — it is a UX/cost shield, never a safety dependency (the
   unilateral tree always exists).
 
-**[Shipped]** built by `mercurylib::tesr::build_detrigger` / co-signed by `cosign_detrigger`, and
-proven end-to-end by **sdk40 PART 2**: a griefer broadcasts T′, the owner's fresh no-timelock spend of
-T′.out[0] confirms immediately, and X′ can never confirm afterwards even past E blocks. The colored
-(168-vB `opret`) variant and the mass-grief prioritization policy (R-1 / O-6) are not test-covered.
+**[Shipped — [D57] SCOPED to the half that is actually proven.]** Built by
+`mercurylib::tesr::build_detrigger`. **sdk40 PART 2 proves the CONSENSUS half**: a griefer broadcasts
+T′, the owner's fresh no-timelock spend of `T′.out[0]` confirms immediately, and X′ can never confirm
+afterwards even past E blocks.
+
+> It does **not** prove the restoration half, and this paragraph used to claim it did — "co-signed by
+> `cosign_detrigger`, and proven end-to-end". sdk40 PART 2 calls `cosign_tier`, not
+> `cosign_detrigger`, and its destination is `bitcoin_core::getnewaddress()` — an **external wallet
+> address**, not a fresh funding output `F′`. So the claims above it that *the de-trigger spends "into
+> a fresh funding output F′ and rebuilds T′/X′_0/S′_0"*, that the victim *"keeps off-chain-ness, the
+> coin's ladder resets fresh"*, and — resting on those — that *"trigger griefing collapses from FATAL
+> to priced nuisance"* are **UNTESTED**. `cosign_detrigger` has zero callers repo-wide; only the
+> coloured twin is wired.
+>
+> What is proven is that the grief is **survivable**: the value comes out. What is not proven is that
+> it is **cheap** — the coin going on-chain is the outcome the FATAL-downgrade says it avoids. Until
+> `cosign_detrigger` is wired and an E2E lands F′ plus a rebuilt ladder, the specification must say
+> "the owner can always spend out, on-chain" and not "the ladder resets fresh".
+
+The colored (168-vB `opret`) variant and the mass-grief prioritization policy (R-1 / O-6) are not
+test-covered either.
 
 ### 5.9 Exit costs
 
@@ -687,11 +711,25 @@ directly.
 
 ### 5.13 Watchtowers (the keyless TES-R watch bundle)
 
-{trigger, newest extension, newest state or SP chain, per-tier CSV schedule, fee-child templates} —
-all pre-signed, pays only the owner, zero key material (REQ-34 preserved). `watch_pass` becomes a
-small state machine: monitor F (one outpoint subscription) → on hostile trigger, request co-op
-de-trigger via the owner's SDK if reachable, else broadcast X at +E_m, state/SP at +Δ, attaching P2A
-children. **[D31] WHAT A KEYLESS TOWER CANNOT DO — normative.** A keyless tower can watch `F`, and can
+{trigger, newest extension, newest state or SP chain, per-tier CSV schedule} — all pre-signed, pays
+only the owner, zero key material (REQ-34 preserved). `watch_pass` becomes a small state machine:
+monitor F (one outpoint subscription) → on hostile trigger, broadcast X at +E_m and state/SP at +Δ.
+
+> **[D57] THREE CORRECTIONS, 2026-08-14 — this paragraph described a tower that was never built.**
+>
+> * **"fee-child templates"** was listed here and again under TES-fixable #4. No such field exists:
+>   `TesrBundle` has none, and `WatchEntry` carries only `branch_txs`, `backup_tx`, `backup_locktime`,
+>   `deadline_block`, `trigger`. It **cannot** exist — a fee child needs a funding input the keyless
+>   tower does not hold, which is [D31]'s entire point. Removed rather than annotated: a bundle field
+>   that cannot exist is not a spec detail, it is a wrong one.
+> * **"attaching P2A children"** contradicted this section's own closing paragraph, which says the
+>   keyless default "attaches no P2A fee child" and that under D31 *that is the correct behaviour, not
+>   a missing feature*. Removed.
+> * **"request co-op de-trigger via the owner's SDK if reachable"** is not a code path.
+>   `watch_pass` → `watch_pass_seen` branches only `Idle` / trigger-matched / `Void`, and
+>   `cosign_detrigger` has **zero callers repo-wide** — only the COLOURED twin
+>   (`cosign_colored_detrigger`) is wired, and only from `colored_reanchor`. Removed; if it is ever
+>   wanted it is a feature to build, not a behaviour to describe. **[D31] WHAT A KEYLESS TOWER CANNOT DO — normative.** A keyless tower can watch `F`, and can
 broadcast the pre-signed tiers **at their committed fee**. It **cannot fee-bump them.** A CPFP child
 spending the P2A anchor requires an input the tower does not hold and a signature it cannot make, so
 if the mempool's floor rises above a tier's committed rate, a keyless tower has no action available:
@@ -758,9 +796,17 @@ up" will spend money and remain uncovered.
 This variant is offered so the choice is informed; it is **not** assumed by any other part of this
 specification.
 
-**[Amendment, TES-fixable #4]** Independently of who funds it, `watch_pass` must be package-aware
-(`submitpackage`, not per-tx `transaction_broadcast_raw`) and the bundle carries fee-child templates.
-Multiple towers compose idempotently.
+**[Amendment, TES-fixable #4 — [D57] RESCOPED. As written this was a normative `must` the code
+deliberately violates, and a specification cannot ship both it and the D31 paragraph below.]**
+A **funded** tower's `watch_pass` MUST be package-aware (`submitpackage`, not per-tx
+`transaction_broadcast_raw`). A **keyless** tower MUST NOT be: it has no funding input to spend, so a
+package it could build would be a 1-parent-0-child package, i.e. the same broadcast with more moving
+parts. The bundle carries **no** fee-child templates on either variant — see [D57] above. Multiple
+towers compose idempotently on both.
+
+Under the authority order the CODE is right here and the `must` was wrong: `transaction_broadcast_raw`
+on the keyless default is the behaviour [D31] specifies, and the package path exists and is wired for
+the funded variant.
 
 **[Shipped]** **sdk45** is the evidence for the two properties this section rests on: the watch bundle
 carries **no key material**, and a **second independent tower is idempotent** (both explicitly

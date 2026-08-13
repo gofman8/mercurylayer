@@ -1704,7 +1704,8 @@ pub async fn establish(
 /// The smallest funding value `F` that can carry a full COLOURED three-tier ladder.
 ///
 /// **This must be checked BEFORE the first `cosign_tier`, and it is the first thing that bites.** A
-/// coloured rung costs `colored_committed_fee(1, rate) + P2A_VALUE` — 576 sat at 2 sat/vB versus 490
+/// coloured rung costs `colored_committed_fee(1, rate) + P2A_VALUE` — 744 vs 615 at the shipped
+/// 3 sat/vB ([D44]); 576 sat at 2 sat/vB versus 490
 /// uncoloured ([D4]-corrected on both halves; was 574 vs 488 when both vsize models understated the
 /// explicit `SIGHASH_ALL` byte), because the RGB `opret` output serialises to exactly
 /// `P2TR_OUT_VBYTES` (43 B) and the
@@ -3445,7 +3446,8 @@ pub fn colored_child_floor(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
 
 /// **[CATS change 2 / V5] The coloured sibling of `mercurylib::tesr::min_spine_tip_value`** — the
 /// smallest `SP` output that can carry a COLOURED spine tip: ONE coloured rung plus a final output
-/// that still clears dust. **906** sat at 2 sat/vB, against 1 482 for a coloured piece.
+/// that still clears dust. **906** sat at the old 2 sat/vB, against 1 482 for a coloured piece; at
+/// the shipped 3 sat/vB ([D44]) those are **1 275** and **1 818**.
 ///
 /// Same warning as the plain one: this is the CHANGE leg's floor and nothing else. A coloured PIECE
 /// still builds two rungs and still needs [`colored_child_floor`].

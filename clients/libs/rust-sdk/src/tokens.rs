@@ -151,7 +151,8 @@ pub(crate) const CTESR_CARRIER_SEND_DEPTH: u64 = 1;
 /// 300 sat below a 30_000-sat parent.
 const LEGACY_SPLIT_RESERVE_FLOOR: u64 = 300;
 /// The tail the LEGACY lane's last change must land on: `min_split_output(TIER_COMMITTED_FEE_RATE)`
-/// = `DUST_LIMIT + 112 vB of backup at 2 sat/vB` = `330 + 224`. Not expressible as a `const fn` (the
+/// = `DUST_LIMIT + 112 vB of backup at the committed rate` = `330 + ceil(112·3)` = **666**
+/// ([D44]; it read `330 + 224` at the old 2 sat/vB rate). Not expressible as a `const fn` (the
 /// rate is an `f64`), so [`carrier_supports_the_full_send_depth`] recomputes it from the REAL
 /// `min_split_output` and fails if it ever moves.
 const LEGACY_CARRIER_TAIL: u64 = 666;
@@ -4749,7 +4750,7 @@ impl UtexoWallet {
 
     /// **[CTES-R MIGRATION] The coloured ROOT floor every carrier of this wallet is measured against.**
     ///
-    /// `TesrParams::committed_fee_rate` is a PROTOCOL constant per network — 2.0 on mainnet and on
+    /// `TesrParams::committed_fee_rate` is a PROTOCOL constant per network — **3.0** [D44] on mainnet and on
     /// regtest alike, pinned by [`token_piece_sats_is_the_coloured_root_floor`] — not the live
     /// mempool rate. That is what makes "below the floor" a PERMANENT fact about a coin rather than a
     /// temporary one: a funding output's value never changes either, so a carrier under this number

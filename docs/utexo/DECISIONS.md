@@ -2084,3 +2084,68 @@ correct and is what the payee has always enforced. `in_ladder_split`'s cap check
 still leaves the parent whole.
 
 Live: sdk17, 58, 29, 82, 36, 74, 75, 77, 78 all green.
+
+---
+
+## D56 — Every floor test froze the rate, so D44 broke none of them
+
+**Status:** FIXED (one test added, fixtures relabelled). **Date:** 2026-08-14.
+
+Every floor test in `clients/libs/rust-sdk/src/transfer.rs` opens `let backup_rate = 2.0;`. That is
+legitimate — the identity they assert (*one floor, one source*) holds at any rate, and fixing one
+keeps the arithmetic legible. But it means **not one of them could fail when the SHIPPED rate moved**,
+and [D44] moved it 2.0 → 3.0 with the whole suite green. The stale numbers were found by reading,
+twice, months apart.
+
+`the_shipped_schedule_floors_are_what_the_code_derives` reads `TesrParams` and asserts what the floors
+ARE (`min_child_value` 1 560, `min_split_output` 666, laddered piece floor 1 560, on both presets). It
+is the only test in that module a schedule change is supposed to break — and its message says the fix
+is to re-derive every number, not to update the literal.
+
+Also re-derived, all of them prose that stated a floor "at 2 sat/vB" as if current:
+`LEGACY_CARRIER_TAIL` (`330 + 224` → `330 + ceil(112·3)` = 666), `colored_root_floor`'s "2.0 on
+mainnet and on regtest alike" → 3.0, `granularity_model`'s packaging figures (3_054/3_066 → 4_074;
+packaging-dust threshold 28 → **37** sat/vB, and "exactly twice as resistant" → ~2.6×), plus four
+illustration sites now marked with both the old rate and the shipped one.
+
+**The lesson:** a fixture rate and a shipped rate look identical in a test. If no test reads the
+preset, the preset is unpinned however many tests there are.
+
+---
+
+## D57 — `PROTOCOL.md` §5.13 described a tower that was never built, and §5.8 cited a test that proves the other half
+
+**Status:** DOCUMENTATION CORRECTED. **Date:** 2026-08-14. No code change: the code was right.
+
+### §5.13 — four claims, all retracted
+
+* **"fee-child templates"** in the bundle: no such field exists (`TesrBundle` has none; `WatchEntry`
+  carries `branch_txs`, `backup_tx`, `backup_locktime`, `deadline_block`, `trigger`) and it **cannot**
+  — a fee child needs a funding input a keyless tower does not hold, which is [D31]'s whole point.
+* **"attaching P2A children"** contradicted this same section's closing paragraph ("attaches no P2A
+  fee child … under D31 that is the correct behaviour, not a missing feature").
+* **"request co-op de-trigger via the owner's SDK if reachable"** is not a code path: `watch_pass_seen`
+  branches only `Idle` / trigger-matched / `Void`, and `cosign_detrigger` has zero callers.
+* **A normative `must`** — *"`watch_pass` must be package-aware (`submitpackage`, not per-tx
+  `transaction_broadcast_raw`)"* — that the code deliberately violates on the keyless default, which
+  the D31 paragraph below it calls correct. **A specification cannot ship both.** Rescoped: the
+  FUNDED tower MUST be package-aware; the KEYLESS one MUST NOT, because a package it could build
+  would be 1-parent-0-child — the same broadcast with more moving parts.
+
+### §5.8 — the de-trigger's restoration half is untested
+
+*"co-signed by `cosign_detrigger`, and proven end-to-end by sdk40 PART 2"* is false in both halves:
+sdk40 PART 2 calls `cosign_tier`, and its destination is `bitcoin_core::getnewaddress()` — an external
+wallet address, not a fresh `F′`.
+
+So *"the de-trigger spends into a fresh funding output F′ and rebuilds T′/X′_0/S′_0"*, *"keeps
+off-chain-ness, the coin's ladder resets fresh"*, and — resting on those — **"trigger griefing
+collapses from FATAL to priced nuisance"** are RETRACTED at both the summary (§5.8 consequences) and
+the detail. What sdk40 proves is that the grief is **survivable**: the value comes out. What it
+demonstrates is an ON-CHAIN exit, which is the outcome the retracted sentence claims is avoided.
+
+Restoring the sentence needs `cosign_detrigger` wired plus an E2E landing `F′` and a rebuilt ladder.
+
+**The lesson:** a "[Shipped]" tag plus a test name reads as verified. Both were present here and the
+test exercised a different function, to a different destination, proving the half the claim does not
+rest on.

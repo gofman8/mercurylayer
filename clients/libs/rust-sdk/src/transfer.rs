@@ -282,7 +282,8 @@ impl UtexoWallet {
     ///
     /// [B3] FAIL CLOSED. A bundle read that FAILS propagates. It must never be read as "no ladder":
     /// `Unladdered` is both the cheaper cost model (the ~300-sat split reserve instead of the ~2 536-sat
-    /// in-ladder cost) and the LOWER floor (554 instead of 1 310 at 2 sat/vB), so a swallowed DB error
+    /// in-ladder cost) and the LOWER floor (554 instead of 1 310 at the OLD 2 sat/vB rate; 666 / 1 560
+    /// at the shipped 3.0 — [D44]), so a swallowed DB error
     /// would quote an unfundable payment as fundable and route a laddered coin at un-laddered prices —
     /// exactly the silent-degradation shape.
     pub(crate) async fn parent_shape(&self, statechain_id: &str) -> Result<ParentShape> {
@@ -3226,7 +3227,8 @@ pub(crate) fn signed_tier_txid(signed_tx_hex: &str) -> Result<String> {
 ///   piece child   — extension + state   980   2 × (committed_fee(r) + P2A)
 ///   change child  — extension + state   980   2 × (committed_fee(r) + P2A)
 ///                                     -----
-///                                      2 536  at r = 2.0 sat/vB
+///                                      2 536  at r = 2.0 sat/vB  [D44: the rate ships at 3.0;
+///                                                              this row is the ILLUSTRATION's rate]
 /// ```
 ///
 /// This is the GROSS figure: it deliberately does not take the −490 credit the economics ledger
@@ -3821,8 +3823,53 @@ mod split_math_tests {
         total + mercurylib::tesr::committed_fee_for_outputs(2, rate) + mercurylib::tesr::P2A_VALUE
     }
 
+    /// **[D56] THE SHIPPED RATE'S FLOORS, so a schedule change cannot pass silently.**
+    ///
+    /// Every other floor test in this module fixes `rate = 2.0` as a FIXTURE — correct, because the
+    /// identity they assert (one floor, one source) holds at any rate. But that means none of them
+    /// can fail when the SHIPPED rate moves, and [D44] moved it 2.0 → 3.0 without a single one going
+    /// red. The stale numbers were found by reading, twice, months apart.
+    ///
+    /// This test reads `TesrParams` and asserts what the floors ARE. It is the only one here that a
+    /// schedule change is supposed to break — and when it does, the fix is to re-derive every number
+    /// it prints, not to update the literal.
+    #[test]
+    fn the_shipped_schedule_floors_are_what_the_code_derives() {
+        for (name, p) in [
+            ("mainnet", mercurylib::tesr::TesrParams::mainnet()),
+            ("regtest", mercurylib::tesr::TesrParams::regtest()),
+        ] {
+            let rate = p.committed_fee_rate;
+            assert_eq!(rate, 3.0, "[D44] {name} ships a 3 sat/vB committed rate");
+            assert_eq!(
+                mercurylib::tesr::min_child_value(rate, DUST_LIMIT),
+                1_560,
+                "[D44] {name}: min_child_value is (ceil(125·3) + 240)·2 + 330. If this fires, the \
+                 committed rate moved and EVERY floor, piece size and carrier size derived from it \
+                 must be re-derived — see DECISIONS D44/D50 for what that costs the pieces already \
+                 in circulation"
+            );
+            assert_eq!(
+                min_split_output(rate),
+                666,
+                "{name}: min_split_output is dust 330 + a 112-vB backup at the committed rate"
+            );
+            let root = ParentShape::Root { fee_rate: rate, split_source_value: 0 };
+            assert_eq!(
+                split_output_floors(rate, root).piece,
+                1_560,
+                "{name}: the laddered PIECE floor is min_child_value — the larger of the two binds"
+            );
+        }
+    }
+
     // [B2] ONE FLOOR, ONE SOURCE — asserted as an identity, not as two numbers that happen to match.
     // Every floor in this file now comes from `split_output_floor`; nothing re-derives one.
+    //
+    // [D56] `2.0` here is a FIXTURE, not the shipped rate (which is 3.0 — see
+    // `the_shipped_schedule_floors_are_what_the_code_derives`). The identity holds at any rate, so
+    // fixing one keeps the arithmetic legible; it also means this test cannot notice a schedule
+    // change, which is why the test above exists.
     #[test]
     fn every_floor_comes_from_split_output_floors() {
         let backup_rate = 2.0;
@@ -3838,7 +3885,7 @@ mod split_math_tests {
                 lane: None,
             }
         );
-        assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
+        assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at the FIXTURE rate of 2 sat/vB [D56]");
 
         // A laddered parent raises the PIECE to `min_child_value`, on either lane — the payee's leaf
         // is two-tier everywhere and that is the floor that must never fall.
@@ -4366,7 +4413,8 @@ mod split_math_tests {
     /// four terms shows up as a failure with the arithmetic in front of it.
     ///
     /// The linear shape is the substance, not decoration: `1 396` per recipient is
-    /// `1 310` (the piece's two rungs + dust) + `86` (43 vB of extra payload at 2 sat/vB), and the
+    /// `1 310` (the piece's two rungs + dust) + `86` (43 vB of extra payload at 2 sat/vB) — both at the
+    /// OLD rate; at the shipped 3.0 the terms are `1 560` and `129` ([D44]) — and the
     /// constant `1 310` is the tip's `820` + `250` of base tier fee + the `240` anchor. Anything that
     /// made the per-recipient term super-linear would mean an extra payee costs a whole new `SP`,
     /// which is precisely the economics K > 1 exists to avoid.
