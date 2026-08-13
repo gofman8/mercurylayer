@@ -997,3 +997,76 @@ code follows: D6 (one shape-aware exit-cost model), D9 (`deny_unknown_fields`, n
 (per-kind structural margin + preset census), D16 (exact-set dispatch, delete the v3 arm), D18 (pinned
 wire codes + regenerated Kotlin bindings). D20 is the one the code already implements — recorded as a
 verified result, not assumed.
+
+## D39 — Owner calls, batch 1 of the residual classification (2026-08-13)
+
+Four of the eighteen owner judgement calls the classification pass surfaced. Each is recorded with
+the bound that was attached when it was put, so a later reader can see what was accepted rather than
+only what was chosen.
+
+### D39.1 — Sub-economic finality: publish `r*(V,d)`, keep the fixed floor
+
+**Decided:** no code. `min_child_value` stays a constant, and the named limitation is the
+**`r*(V,d)` table plus the sentence that the aggregate is uncounted**.
+
+*The bound, as accepted.* `V_min(d,r)` is a closed form the tree already carries, so the failure is
+not unbounded — it is **unevaluated**. The function exists, the inputs exist, nobody calls it.
+`min_child_value = (committed_fee(2.0) + P2A)·2 + dust = 1,310` is `V_min` at the hardcoded 2.0
+sat/vB and correct at **no other rate**: `r* = 2.01` for a floor-value piece, and a depth-1
+10,000-sat piece goes under water somewhere between 5 and 10 sat/vB. What is genuinely unbounded is
+**aggregate** exposure: nothing counts how many sub-economic pieces exist, and the marginal cost of
+voiding each further one is zero.
+
+*What the payee wears.* Anyone holding a piece below `V_min(d, r_live)` loses it entire, to the party
+who split it, with no malice required. On the coloured lane it is worse: the allocation is not
+recovered by the splitter, it is **destroyed**.
+
+### D39.2 — The coloured lane's sats-vs-asset mismatch: name it; issuers size carriers
+
+**Decided:** policy, no code. The specification states the mismatch and the destruction-not-capture
+asymmetry explicitly, and carrier sizing becomes an **issuer obligation**.
+
+*The bound, as accepted.* There is none, and the sentence appears in no document today.
+`TOKEN_PIECE_SATS = 3,066` is the coloured root floor at 2× head-room and is **independent of the
+asset carried**; `colored_child_floor` and `colored_spine_tip_floor` are pure fee arithmetic. So an
+allocation's security is denominated in its carrier's SATS while the loss is denominated in ASSET
+value, and the two are unrelated.
+
+*Why this one is not covered by G8's attacker-gain bound.* On the plain lane a voided piece's sats
+are recovered by the sender, so "the attacker gains at most X" describes the victim's exposure. On the
+coloured lane the allocation is closed by an RGB-unaware witness and **destroyed** — nobody acquires
+what the payee loses — so no attacker-gain bound describes it at all. Trigger: any prior owner of an
+ancestor broadcasting their retained flat rung over `F`, ~224 sat at 2 sat/vB, voiding the tree in
+ONE transaction with zero marginal cost per additional piece.
+
+### D39.3 — Plaintext transport and the JS client gap: name both, ship as-is
+
+**Decided:** no code. Both halves become named limitations.
+
+*The bound, as accepted.* Absent for the transport half — the delay figures (`δ = 36`,
+`epoch_expiry_height`) bound the DELAY, not the loss. Shipping defaults are plaintext on every hop
+(`http://` SE, `tcp://` electrum, `rpc://` RGB proxy, plaintext SSP) and `tor_proxy` covers the SE's
+HTTP only.
+
+*The part the limitation must state, because it is not what a reader would assume.* **D27 and
+D8-CLOSE are Rust-SDK-only.** Both shipped JS clients take `initlock` and `interval` verbatim from
+`/info/config` with no cross-check and pass that `interval` straight into `validateSignatureScheme`,
+and compare `statechainInfo.num_sigs` unattested. So on **two of three shipped clients the wire still
+defines INV-5** — precisely the tamper D27 exists to remove — and the census RHS is unauthenticated.
+There is also a receive-side denial primitive: an `estimate_fee` the attacker controls makes
+`verify_transaction_signature` refuse every honest backup chain by `FeeTooLow`/`FeeTooHigh`.
+
+This means the published trust model must say, in terms, that two of three shipped clients do not
+enforce an invariant the specification declares normative. That is the cost of this call and it is
+accepted knowingly.
+
+### D39.4 — Mailbox availability and censorship: SURVEY IT NOW
+
+**Decided:** survey it before §7 is written. It is the one adversary surface with **no round of
+analysis behind it**, and it sits in the section whose credibility IS the adversary model.
+
+*What the classification pass already corrected, and the survey must not re-break.* The attribution.
+Coordinator-alone reduces to **denial**: a cancel still requires a single-use, endpoint-bound Schnorr
+signature under the SENDER's auth key, which the coordinator cannot forge, and the re-conveyance to a
+second payee is the sender's act with the sender as beneficiary. **The loss arm requires coordinator
++ sender collusion — the same adversary as CO-1.**
