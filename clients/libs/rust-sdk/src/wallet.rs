@@ -3605,7 +3605,20 @@ impl UtexoWallet {
                 mercuryrustlib::tesr::load_child(&self.inner.cc, &self.inner.config.wallet_name, &id).await?
             {
                 let progress =
-                    mercuryrustlib::tesr::exit_child_pass(&self.inner.cc.electrum_client, &cb)?;
+                    // [B.5/D44] Same capability the root lane uses. The child lane had NO
+                    // escalation at all — it broadcast raw — so a fee-stuck child tier died at the
+                    // rate it was signed at, on the lane where the payee holds the coin.
+                    match self.fee_bump_parts()?.as_ref() {
+                        Some((signer, parts)) => mercuryrustlib::tesr::exit_child_pass_with_bump(
+                            &self.inner.cc.electrum_client,
+                            &cb,
+                            &parts.with(signer),
+                        )?,
+                        None => mercuryrustlib::tesr::exit_child_pass(
+                            &self.inner.cc.electrum_client,
+                            &cb,
+                        )?,
+                    };
                 let done = progress.complete;
                 if done {
                     self.register_exit_tip_best_effort(&id).await;
@@ -3635,7 +3648,19 @@ impl UtexoWallet {
                     .await?
             {
                 let progress =
-                    mercuryrustlib::tesr::exit_spine_tip_pass(&self.inner.cc.electrum_client, &tip)?;
+                    match self.fee_bump_parts()?.as_ref() {
+                        Some((signer, parts)) => {
+                            mercuryrustlib::tesr::exit_spine_tip_pass_with_bump(
+                                &self.inner.cc.electrum_client,
+                                &tip,
+                                &parts.with(signer),
+                            )?
+                        }
+                        None => mercuryrustlib::tesr::exit_spine_tip_pass(
+                            &self.inner.cc.electrum_client,
+                            &tip,
+                        )?,
+                    };
                 let done = progress.complete;
                 if done {
                     self.register_exit_tip_best_effort(&id).await;

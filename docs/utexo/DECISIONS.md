@@ -1437,8 +1437,36 @@ head-room. The head-room is a safety property and trading it for a stable number
 "unclaimable by construction" trap the piece constant was derived to escape — a piece that meets a
 drifted rate but can no longer carry its own root ladder. The probe's values are the shipping values.
 
-**Still owed before it lands:** the `BumpCapability` wiring (B.5), the superseded-de-trigger census
-term in the SAME commit, and a full live E2E run — the E2Es fund carriers from `TOKEN_CARRIER_SATS`.
+### LANDED, 2026-08-13
+
+The rate and the wiring shipped together. Live: SDK40, 50, 59, 75, 77, 32, 69, 86 all green at the
+new floors — both coloured lanes and the carrier tests whose funding moved.
+
+**What B.5 actually needed.** The ROOT lane already escalated (that landed with #123/#125). The gap
+was the CHILD and SPINE-TIP lanes, which called `transaction_broadcast_raw` directly and had **no
+escalation at all** — a fee-stuck tier there died at the rate it was signed at, on the lanes where a
+payee holds the coin. Both now go through `broadcast_tier`, so the cheap path is still tried first
+and an ordinary tier costs nothing extra.
+
+They could not before because `broadcast_tier` needs each tier's PREVOUT VALUE to price the fee
+child, and only the root lane threaded it. `chain_with_prevouts` recovers it instead of storing it:
+the chain is sequential, so tier 0 spends `f_value` and tier *i* spends the output of tier *i−1*
+named by its own input outpoint. Matched by OUTPOINT, never by index — a coloured tier carries an
+extra `opret` and a spine `SP` carries K payload outputs, so the index differs by shape, and an
+assumed index would price the wrong output.
+
+**The census term is NOT owed by this commit.** The ordering constraint binds the LIVE-RATE
+de-trigger, which co-signs a rival spend of `T`'s output and must therefore be disclosed and counted.
+That is not what shipped: `cosign_detrigger` still builds at `bundle.fee_rate`, and the P2A fee child
+this commit adds is signed by the OWNER's key, not the SE's — it consumes no signature slot and adds
+no census term. The live-rate de-trigger remains unbuilt, and its constraint remains binding on
+whoever builds it.
+
+**Also fixed, and worth more than the raise.** The 21 derivation pins were literals — `490`, `576`,
+`198_530`, `1_310`. That is what turned one constant change into sixteen mystery failures across
+three modules. Every one is now an EXPRESSION in the rate (`committed_fee(rate) + P2A_VALUE`,
+`F_VALUE - 3 * rung`, `EXTRA_OUT_FEE`), so the next schedule change fails in the one place that
+defines the number rather than in sixteen places that copied it.
 
 ## D45 — TRUC slot contention is a PRICE, not a DoS — publish the measurement (decision 10)
 

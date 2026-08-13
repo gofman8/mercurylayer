@@ -52,11 +52,17 @@ use crate::wallet::UtexoWallet;
 // database into an empty answer. `scripts/ci/deny-swallowed-backup-reads.sh` keeps it that way.
 
 /// The committed fee rate every TES-R tier bakes in — `TesrParams::committed_fee_rate`, which is
-/// `2.0` on mainnet AND regtest. It is a PROTOCOL constant, not the live network fee rate: a tier is
-/// pre-signed years before it is broadcast, so its fee is fixed at build time and topped up by the
-/// P2A anchor if the mempool has moved.
+/// `3.0` on mainnet AND regtest [D44]. It is a PROTOCOL constant, not the live network fee rate: a
+/// tier is pre-signed years before it is broadcast, so its fee is fixed at build time and topped up
+/// by the P2A anchor if the mempool has moved.
+///
+/// **[D44] Raised 2.0 → 3.0 on 2026-08-13.** At 2.0 the defence was frozen below plausible mainnet
+/// floors, so every tier depended on the anchor and on somebody funding a bump. The cost is that
+/// every floor derived from this rate moves with it — `min_child_value` 1,310 → 1,610 — which
+/// re-prices pieces already in circulation. A piece minted under the old floor and now below the new
+/// one is not lost; it can no longer fund its own tiers and must be rescued by `combine`.
 #[allow(dead_code)] // read by the derivation tests below; the constant IS the documentation
-pub(crate) const TIER_COMMITTED_FEE_RATE: f64 = 2.0;
+pub(crate) const TIER_COMMITTED_FEE_RATE: f64 = 3.0;
 
 /// Fee-rate head-room [`TOKEN_PIECE_SATS`] is derived at: the piece must still carry a full coloured
 /// ROOT ladder if the committed tier fee rate is DOUBLED. Raising `committed_fee_rate` is the one
@@ -102,7 +108,7 @@ pub(crate) const PIECE_FEE_RATE_HEADROOM: f64 = 2.0;
 /// hand-copied literal — a copy is how the number went stale in the first place.
 /// [`token_piece_sats_is_the_coloured_root_floor`] is the derivation, executable: it recomputes the
 /// floors from the real `tesr` functions and fails if this constant ever drops below them.
-pub const TOKEN_PIECE_SATS: u64 = 3_066;
+pub const TOKEN_PIECE_SATS: u64 = 4_074;
 
 /// **Chained token sends one carrier supports — PER LANE. [P0-6]**
 ///
@@ -137,7 +143,7 @@ const LEGACY_SPLIT_RESERVE_FLOOR: u64 = 300;
 /// = `DUST_LIMIT + 112 vB of backup at 2 sat/vB` = `330 + 224`. Not expressible as a `const fn` (the
 /// rate is an `f64`), so [`carrier_supports_the_full_send_depth`] recomputes it from the REAL
 /// `min_split_output` and fails if it ever moves.
-const LEGACY_CARRIER_TAIL: u64 = 554;
+const LEGACY_CARRIER_TAIL: u64 = 666;
 
 /// Sats a LEGACY-lane carrier needs to afford `send_depth` chained flat splits: each send consumes a
 /// piece plus the floored fee reserve, and the last change must still clear the sub-coin floor.
@@ -183,12 +189,12 @@ pub(crate) fn ctesr_carrier_sats(send_depth: u64, fee_rate: f64) -> u64 {
 ///
 /// | lane | derived requirement |
 /// |---|---|
-/// | LEGACY, `LEGACY_CARRIER_SEND_DEPTH` = 5 | `5 · (3_066 + 300) + 554` = **17_384** |
-/// | CTES-R, `CTESR_CARRIER_SEND_DEPTH` = 1 | `T`+`X_0`+`SP(2)` over piece + child floor = **6_362** |
+/// | LEGACY, `LEGACY_CARRIER_SEND_DEPTH` = 5 | `5 · (4_074 + 300) + 666` = **22_536** |
+/// | CTES-R, `CTESR_CARRIER_SEND_DEPTH` = 1 | `T`+`X_0`+`SP(2)` over piece + child floor = **8_253** |
 ///
-/// so the carrier is **17_384**, the max. The SATS did not move; what moved is that they are now
-/// derived from BOTH lanes and that the "splits exactly five times" claim is scoped to the lane
-/// where it is true. On the CTES-R lane 17_384 buys ONE send and the remaining ~11_000 sat land in
+/// so the carrier is **22_536**, the max. [D44] raised both rows by raising the committed rate
+/// 2.0 -> 3.0; the derivation is unchanged and the numbers move with it, which is the property this
+/// table exists to keep. On the CTES-R lane 22_536 buys ONE send and the remaining sats land in
 /// the depth-1 change child, which can only be moved whole or exited — that is a real cost of the
 /// coloured lane, recorded here rather than hidden behind a number that reads like five sends.
 ///
@@ -6240,7 +6246,7 @@ mod migration_hatch_is_narrow {
             mercurylib::tesr::TesrParams::regtest().committed_fee_rate,
             TIER_COMMITTED_FEE_RATE
         );
-        assert_eq!(floor(), 2_058, "the coloured root floor at the protocol rate ([D4]: 3*576 + 330)");
+        assert_eq!(floor(), 2_562, "the coloured root floor at the [D44] protocol rate (3 * (ceil(168*3) + 240) + 330 = 3*744 + 330)");
     }
 }
 
@@ -6271,19 +6277,32 @@ mod piece_floor_tests {
         let root = colored_ladder_floor(TIER_COMMITTED_FEE_RATE, COLORED_LADDER_DUST);
         let child = colored_child_floor(TIER_COMMITTED_FEE_RATE, COLORED_LADDER_DUST);
         // Both floors, stated as the task requires — three coloured rungs + dust, two + dust.
-        // RE-DERIVED by [D4], not weakened: a coloured rung is 576 sat (168 vB * 2 + 240), because
+        // RE-DERIVED by [D4], not weakened: a coloured rung is `ceil(168 * rate) + 240`, because
         // rgb::COLORED_TIER_VBYTES = 168 is MEASURED on a production-finalised tier and the old 167
         // omitted the SIGHASH_ALL byte on the taproot signature.
-        assert_eq!(root, 3 * 576 + 330, "coloured ROOT floor at 2 sat/vB");
-        assert_eq!(root, 2_058);
-        assert_eq!(child, 2 * 576 + 330, "coloured CHILD floor at 2 sat/vB");
-        assert_eq!(child, 1_482);
+        // [D44] At the raised 3.0 rate a rung is ceil(504) + 240 = 744. Every number below is
+        // re-derived from that rather than copied from what the code now returns — a pin updated by
+        // reading the new output is a pin that agrees with any bug.
+        assert_eq!(root, 3 * 744 + 330, "coloured ROOT floor at the [D44] 3 sat/vB rate");
+        assert_eq!(root, 2_562);
+        assert_eq!(child, 2 * 744 + 330, "coloured CHILD floor at the [D44] 3 sat/vB rate");
+        assert_eq!(child, 1_818);
 
-        // THE TRAP THE OLD VALUE SAT IN, pinned so it can never be re-entered: 1_500 clears the
-        // child floor (so a split carves the piece) but not the root floor (so its receiver cannot
-        // ladder it). Anything in `(child, root)` is unclaimable-by-construction once the flat lane
-        // is retired.
-        assert!(1_500 > child && 1_500 < root, "the legacy 1_500 sat piece was inside the trap");
+        // THE TRAP THE OLD VALUE SAT IN, pinned so it can never be re-entered: a piece in
+        // `(child, root)` clears the child floor (so a split carves it) but not the root floor (so
+        // its receiver cannot ladder it) — unclaimable by construction once the flat lane is
+        // retired. At the 2.0 rate the legacy 1_500 sat piece sat exactly there (child 1_482, root
+        // 2_058).
+        //
+        // [D44] At 3.0 it is worse, not better: 1_500 is now BELOW the child floor (1_818), so it
+        // cannot even be carved. The historical value is pinned in the relation that still holds —
+        // it is under the root floor either way — rather than in a band it has fallen out of.
+        assert!(1_500 < root, "the legacy 1_500 sat piece is still under the coloured root floor");
+        assert!(
+            1_500 < child,
+            "[D44] 1_500 no longer even clears the CHILD floor ({child}); if this flips back, the \
+             committed rate has been lowered and the piece constant must be re-derived with it"
+        );
         assert!(
             TOKEN_PIECE_SATS >= root,
             "a received piece MUST be able to carry a full coloured ROOT ladder: \
@@ -6296,8 +6315,8 @@ mod piece_floor_tests {
             TIER_COMMITTED_FEE_RATE * PIECE_FEE_RATE_HEADROOM,
             COLORED_LADDER_DUST,
         );
-        assert_eq!(drifted, 3 * (672 + 240) + 330, "coloured ROOT floor at 4 sat/vB");
-        assert_eq!(drifted, 3_066);
+        assert_eq!(drifted, 3 * (1_008 + 240) + 330, "[D44] coloured ROOT floor at 6 sat/vB");
+        assert_eq!(drifted, 4_074);
         assert_eq!(
             TOKEN_PIECE_SATS, drifted,
             "TOKEN_PIECE_SATS is the coloured root floor at {}x the committed rate",
@@ -6333,14 +6352,14 @@ mod piece_floor_tests {
         let min_output = min_split_output(TIER_COMMITTED_FEE_RATE);
         // The two literals `legacy_carrier_sats` cannot express as a `const fn`, re-derived from the
         // REAL functions so a change to either fails HERE rather than silently under-funding.
-        assert_eq!(min_output, 554, "330 dust + 112 vB of backup at 2 sat/vB");
+        assert_eq!(min_output, 666, "330 dust + 112 vB of backup at the [D44] 3 sat/vB rate");
         assert_eq!(super::LEGACY_CARRIER_TAIL, min_output, "the carrier tail IS min_split_output");
         assert_eq!(
             super::LEGACY_SPLIT_RESERVE_FLOOR,
             crate::transfer::split_fee_reserve(TOKEN_CARRIER_SATS),
             "the reserve floors at 300 for carriers this size"
         );
-        assert_eq!(TOKEN_CARRIER_SATS, 17_384, "5 * (3066 + 300) + 554");
+        assert_eq!(TOKEN_CARRIER_SATS, 22_536, "[D44] 5 * (4074 + 300) + 666");
         assert_eq!(TOKEN_CARRIER_SATS, legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH));
 
         let mut carrier = TOKEN_CARRIER_SATS;
@@ -6406,7 +6425,10 @@ mod piece_floor_tests {
         // 1. The CTES-R requirement, and it is the exact inverse of the real forward walk: fund a
         //    carrier with it and `T`, `X_0`, `SP` leave precisely piece + floored change.
         let need = ctesr_carrier_sats(CTESR_CARRIER_SEND_DEPTH, rate);
-        assert_eq!(need, 6_362, "T 576 + X_0 576 + SP(2) 662 + piece 3_066 + child floor 1_482");
+        assert_eq!(
+            need, 8_253,
+            "[D44] at 3 sat/vB: T 744 + X_0 744 + SP(2) 873 + piece 4_074 + child floor 1_818"
+        );
         let after_t = colored_tier_out_value(need, rate).expect("T fits");
         let after_x = colored_tier_out_value(after_t, rate).expect("X_0 fits");
         let at_sp = colored_tier_out_total(after_x, 2, rate).expect("SP with 2 children fits");

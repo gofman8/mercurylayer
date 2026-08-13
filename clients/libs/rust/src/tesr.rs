@@ -1335,6 +1335,58 @@ fn watch_spine_tip_pass_seen(
     Ok(WatchState::Acted { ids, failures, blind: vec![] })
 }
 
+/// **[B.5 / D44] The value chain behind a pre-signed exit sequence, so every lane can fee-bump.**
+///
+/// `broadcast_tier` needs each tier's PREVOUT VALUE to price its fee child (`prevout − Σout` is the
+/// tier's committed fee). The root lane has that value threaded through `exit_pass_ex`; the CHILD
+/// and SPINE-TIP lanes never did, so they broadcast raw with `transaction_broadcast_raw` and had no
+/// escalation at all. A tier under the floor simply failed there, forever, at whatever rate it was
+/// signed at — which is precisely the shape [D31] calls a stated limit and [D44] raised the
+/// committed rate to make rarer.
+///
+/// The chain is sequential and each tier spends the previous one, so the values are RECOVERABLE
+/// rather than needing to be stored: tier 0 spends `f_value`, and tier i spends the output of tier
+/// i−1 named by its own input outpoint. Matching by OUTPOINT rather than assuming index 0 is
+/// load-bearing — a coloured tier carries an extra `opret` and a spine `SP` carries K payload
+/// outputs, so the index differs by shape.
+fn chain_with_prevouts(
+    chain: &[(String, Option<u16>)],
+    f_value: u64,
+) -> Result<Vec<(Vec<u8>, String, u64)>> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let mut out: Vec<(Vec<u8>, String, u64)> = Vec::with_capacity(chain.len());
+    let mut seen: std::collections::HashMap<(String, u32), u64> = std::collections::HashMap::new();
+    for (i, (signed, _csv)) in chain.iter().enumerate() {
+        let raw = hex::decode(signed)
+            .map_err(|e| anyhow::anyhow!("exit chain tier {i} carries unusable signed tx hex: {e}"))?;
+        let tx: Transaction = deserialize(&raw)
+            .map_err(|e| anyhow::anyhow!("exit chain tier {i} did not deserialize: {e}"))?;
+        let txid = tx.txid().to_string();
+        let prev = &tx.input[0].previous_output;
+        let key = (prev.txid.to_string(), prev.vout);
+        let prevout_value = if i == 0 {
+            f_value
+        } else {
+            // A tier whose input is NOT one of the outputs above is not part of this chain. Refuse
+            // rather than guessing a value: a wrong prevout produces a wrong fee, and a fee child
+            // built on a wrong fee is refused by the node in a way that reads as "the rescue does
+            // not work".
+            *seen.get(&key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "exit chain tier {i} ({txid}) spends {}:{} , which no earlier tier in this \
+                     chain produced — its prevout value cannot be derived, so it cannot be priced",
+                    prev.txid, prev.vout
+                )
+            })?
+        };
+        for (v, o) in tx.output.iter().enumerate() {
+            seen.insert((txid.clone(), v as u32), o.value);
+        }
+        out.push((raw, txid, prevout_value));
+    }
+    Ok(out)
+}
+
 /// **Owner-initiated unilateral exit of a SPINE TIP.** Broadcasts the tip's full pre-co-signed chain
 /// in order, each tier once its relative-CSV is met, stopping at the first not-yet-mature one.
 /// Keyless and idempotent, exactly like [`exit_child_pass`]; **`Err` = blind**.
@@ -1342,23 +1394,37 @@ pub fn exit_spine_tip_pass(
     electrum: &electrum_client::Client,
     tip: &SpineTipBundle,
 ) -> Result<ExitProgress> {
-    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    exit_spine_tip_pass_ex(electrum, tip, None)
+}
+
+/// [B.5] `exit_spine_tip_pass` with a fee-bump capability. Same keyless meaning when `bump` is
+/// `None`; with one, a fee-stuck tip tier escalates to a 1P1C package instead of dying at the floor.
+pub fn exit_spine_tip_pass_with_bump(
+    electrum: &electrum_client::Client,
+    tip: &SpineTipBundle,
+    bump: &BumpCapability,
+) -> Result<ExitProgress> {
+    exit_spine_tip_pass_ex(electrum, tip, Some(bump))
+}
+
+fn exit_spine_tip_pass_ex(
+    electrum: &electrum_client::Client,
+    tip: &SpineTipBundle,
+    bump: Option<&BumpCapability>,
+) -> Result<ExitProgress> {
     let mut broadcast = Vec::new();
     let mut stalled = None;
-    for (signed, _csv) in spine_tip_exit_chain(tip) {
-        let raw = hex::decode(&signed)
-            .map_err(|e| anyhow::anyhow!("spine-tip exit chain carries unusable signed tx hex: {e}"))?;
-        let txid = deserialize::<Transaction>(&raw)
-            .map_err(|e| anyhow::anyhow!("spine-tip exit chain tx did not deserialize: {e}"))?
-            .txid()
-            .to_string();
+    for (raw, txid, prevout_value) in
+        chain_with_prevouts(&spine_tip_exit_chain(tip), tip.parent.f_value)?
+    {
         if tx_known(electrum, &txid)? {
             continue;
         }
-        match electrum.transaction_broadcast_raw(&raw) {
-            Ok(_) => broadcast.push(txid),
-            Err(e) => {
-                stalled = Some(format!("{txid}: {e}"));
+        match broadcast_tier(electrum, &raw, &txid, prevout_value, bump) {
+            TierBroadcast::Plain => broadcast.push(txid),
+            TierBroadcast::Bumped { .. } => broadcast.push(txid),
+            TierBroadcast::Stuck { detail } => {
+                stalled = Some(detail);
                 break;
             }
         }
@@ -7095,27 +7161,40 @@ pub fn child_exit_chain(cb: &ChildTesrBundle) -> Vec<(String, Option<u16>)> {
 /// backend that could not be read, or stored child material that could not be decoded, is never
 /// reported as an ordinary "nothing broadcast this pass, keep waiting".
 pub fn exit_child_pass(electrum: &electrum_client::Client, cb: &ChildTesrBundle) -> Result<ExitProgress> {
+    exit_child_pass_ex(electrum, cb, None)
+}
+
+/// [B.5] `exit_child_pass` with a fee-bump capability. Identical keyless meaning when `bump` is
+/// `None`; with one, a fee-stuck child tier escalates to a 1P1C package rather than failing at the
+/// rate it was signed at.
+pub fn exit_child_pass_with_bump(
+    electrum: &electrum_client::Client,
+    cb: &ChildTesrBundle,
+    bump: &BumpCapability,
+) -> Result<ExitProgress> {
+    exit_child_pass_ex(electrum, cb, Some(bump))
+}
+
+fn exit_child_pass_ex(
+    electrum: &electrum_client::Client,
+    cb: &ChildTesrBundle,
+    bump: Option<&BumpCapability>,
+) -> Result<ExitProgress> {
     let mut broadcast = Vec::new();
     let mut stalled = None;
-    for (signed, _csv) in child_exit_chain(cb) {
-        let raw = hex::decode(&signed)
-            .map_err(|e| anyhow::anyhow!("child exit chain carries unusable signed tx hex: {e}"))?;
-        // Derive the txid to skip already-known tiers without re-broadcasting.
-        let txid = {
-            use electrum_client::bitcoin::{consensus::deserialize, Transaction};
-            deserialize::<Transaction>(&raw)
-                .map_err(|e| anyhow::anyhow!("child exit chain tx did not deserialize: {e}"))?
-                .txid()
-                .to_string()
-        };
+    for (raw, txid, prevout_value) in chain_with_prevouts(&child_exit_chain(cb), cb.parent.f_value)?
+    {
         if tx_known(electrum, &txid)? {
             continue;
         }
-        match electrum.transaction_broadcast_raw(&raw) {
-            Ok(_) => broadcast.push(txid),
-            Err(e) => {
+        // [B.5] Through the SEAM, not `transaction_broadcast_raw`. The cheap path is still tried
+        // first, so an ordinary tier costs nothing extra; what changes is that a tier refused for
+        // FEE — not for an unmet CSV — now has a route other than "retry next block forever".
+        match broadcast_tier(electrum, &raw, &txid, prevout_value, bump) {
+            TierBroadcast::Plain | TierBroadcast::Bumped { .. } => broadcast.push(txid),
+            TierBroadcast::Stuck { detail } => {
                 // CSV not met / parent unconfirmed — retry next pass, but SAY SO.
-                stalled = Some(format!("{txid}: {e}"));
+                stalled = Some(detail);
                 break;
             }
         }
@@ -16705,14 +16784,17 @@ mod skim_leaf_attack_tests {
         let rig = rig();
         let cb = rig.child_bundle(Skim::None);
         // The arithmetic the tests below break, stated first so a schedule change shows up here and
-        // not as a mystery failure three tests down. A plain rung at 2 sat/vB is 490 sat.
+        // not as a mystery failure three tests down. [D44] The rung is DERIVED here rather than
+        // written out: the 490 that used to be a literal became 615 with the committed rate, and a
+        // literal is what turned one constant change into sixteen mystery failures.
+        let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
         let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
         let slot = sp.output[0].value;
-        assert_eq!(slot, 198_530, "the child's slot on SP");
-        assert_eq!(cb.child_extension.out_value, slot - 490, "the extension forwards one rung less");
+        assert_eq!(slot, F_VALUE - 3 * rung, "the child's slot on SP");
+        assert_eq!(cb.child_extension.out_value, slot - rung, "the extension forwards one rung less");
         assert_eq!(
             cb.child_state.out_value,
-            slot - 2 * 490,
+            slot - 2 * rung,
             "and the state pays the receiver one rung less again"
         );
         verify(&cb, &rig.facts()).expect("an honest, fully co-signed child bundle must be ACCEPTED");
@@ -16731,7 +16813,11 @@ mod skim_leaf_attack_tests {
 
         // The theft is real and everything else about the bundle is honest.
         assert_eq!(cb.child_extension.out_value, 1_000, "only 1 000 sat is forwarded");
-        assert_eq!(cb.child_state.out_value, 510, "…so 510 sat is all the payee can ever reach");
+        assert_eq!(
+            cb.child_state.out_value,
+            1_000 - (mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE),
+            "…so one rung less is all the payee can ever reach"
+        );
         let ext: Transaction = parse(&cb.child_extension.signed_tx);
         assert_eq!(ext.output.len(), 3, "payload + P2A anchor + the sender's second output");
         assert_eq!(
@@ -16900,7 +16986,12 @@ mod skim_root_attack_tests {
     const NUM_SIGS: u32 = FLAT_BACKUPS + 3;
 
     /// One plain rung at the committed 2 sat/vB: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
-    const RUNG: u64 = 490;
+    const RUNG: u64 = 615; // [D44] ceil(125 * 3.0) + 240
+    /// [D44] What the attacker's EXTRA output costs in fee: one P2TR output is 43 vB, so the skim
+    /// is short by `ceil(43 * rate)` — 86 at the old 2.0 rate, 129 at 3.0. Named because every
+    /// "carried" figure below is `honest − this`, and writing those out as literals is what turned
+    /// one constant change into sixteen mystery failures.
+    const EXTRA_OUT_FEE: u64 = 129;
 
     /// A party holding BOTH halves of an aggregate key — what a blind co-sign is equivalent to.
     struct Holder {
@@ -16975,7 +17066,7 @@ mod skim_root_attack_tests {
     /// that can carry a ladder puts the owner's final state on exactly `DUST_LIMIT`, so the bundle is
     /// relayable and the only thing wrong with it is the theft these tests are about. 1 310 out of
     /// 200 000 is no less a skim than 1 000 was.
-    const TOKEN_FORWARD: u64 = 1_310;
+    const TOKEN_FORWARD: u64 = 1_560; // [D44] min_child_value at 3.0
     /// What the EXTRA-OUTPUT variant takes. It comes out of the committed fee rather than out of the
     /// payload, so the tier stays consensus-valid (outputs still below the input) and would really
     /// relay — which is what makes that variant worth refusing rather than shrugging at.
@@ -17254,8 +17345,8 @@ mod skim_root_attack_tests {
         let x: Transaction = parse(&b.levels[0].extension.signed_tx);
         assert_eq!(x.output.len(), 3, "payload + P2A anchor + the attacker's second output");
         assert_eq!(x.output[2].script_pubkey, rig.attacker.spk, "the skim pays the ATTACKER");
-        assert_eq!(b.levels[0].extension.out_value, TOKEN_FORWARD, "only 1 310 sat is forwarded");
-        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "…so the owner reaches 820");
+        assert_eq!(b.levels[0].extension.out_value, TOKEN_FORWARD, "only 1 560 sat is forwarded [D44]");
+        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "…so the owner reaches 945 [D44]");
         assert_eq!(
             x.output[b.levels[0].extension.payload_vout as usize].value,
             b.levels[0].extension.out_value,
@@ -17266,14 +17357,14 @@ mod skim_root_attack_tests {
         let msg = verify_root(&b).expect_err("a skimming extension must be REFUSED").to_string();
         // Σ = 1 000 forwarded + 197 934 diverted = 198 934, against an expected 199 020: short by
         // exactly the extra output's own fee.
-        assert_conservation_refusal(&msg, 1, F_VALUE - RUNG, 198_934);
+        assert_conservation_refusal(&msg, 1, F_VALUE - RUNG, F_VALUE - 2 * RUNG - EXTRA_OUT_FEE);
 
         // The same refusal on the path a receiver and a pre-paying SSP actually call — the bound
         // entry point binds `f_value` to the chain and then delegates to the same law.
         let bound = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority())
             .expect_err("the bound acceptance path must refuse it too")
             .to_string();
-        assert_conservation_refusal(&bound, 1, F_VALUE - RUNG, 198_934);
+        assert_conservation_refusal(&bound, 1, F_VALUE - RUNG, F_VALUE - 2 * RUNG - EXTRA_OUT_FEE);
     }
 
     /// **The same skim on the final tier.** `X_0` is entirely honest; `S_0` pays the owner 1 000 sat
@@ -17301,7 +17392,7 @@ mod skim_root_attack_tests {
 
         let msg = verify_root(&b).expect_err("a skimming owner state must be REFUSED").to_string();
         // Funded with 199 020; Σ = 1 000 + 197 444 = 198 444 against an expected 198 530.
-        assert_conservation_refusal(&msg, 2, F_VALUE - 2 * RUNG, 198_444);
+        assert_conservation_refusal(&msg, 2, F_VALUE - 2 * RUNG, F_VALUE - 3 * RUNG - EXTRA_OUT_FEE);
     }
 
     /// **The extra-output variant, which is what summing is FOR.** The extension's payload output is
@@ -17398,8 +17489,8 @@ mod skim_root_attack_tests {
             "Σ over the payload outputs is EXACTLY what the law expects"
         );
         assert_eq!(x.output[2].script_pubkey, rig.attacker.spk);
-        assert_eq!(x.output[2].value, F_VALUE - 2 * RUNG - TOKEN_FORWARD, "197 710 to the attacker");
-        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "820 reaches the owner");
+        assert_eq!(x.output[2].value, F_VALUE - 2 * RUNG - TOKEN_FORWARD, "197 210 to the attacker [D44]");
+        assert_eq!(b.levels[0].state.out_value, TOKEN_FORWARD - RUNG, "945 reaches the owner [D44]");
         assert_still_genuinely_cosigned(&b, &rig);
 
         let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
@@ -17445,8 +17536,17 @@ mod skim_root_attack_tests {
         let t: Transaction = parse(&b.trigger.signed_tx);
         assert_eq!(t.output.len(), 3);
         assert_eq!(t.output[2].script_pubkey, rig.attacker.spk);
-        assert_eq!(b.trigger.out_value, TOKEN_FORWARD, "the trigger forwards 1 310 of a 200 000 coin");
-        assert_eq!(t.output[2].value, 198_114, "…and 198 114 goes to the attacker");
+        assert_eq!(b.trigger.out_value, TOKEN_FORWARD, "the trigger forwards 1 560 of a 200 000 coin [D44]");
+        assert_eq!(
+            t.output[2].value,
+            F_VALUE
+                - TOKEN_FORWARD
+                - (mercurylib::tesr::committed_fee_for_outputs(2, rig.rate)
+                    + mercurylib::tesr::P2A_VALUE),
+            "…and the remainder goes to the attacker. [D44] DERIVED: the skimming trigger has an \
+             EXTRA output, so its committed fee is the 2-payload one, not the 1-payload rung — the \
+             old 198_114 literal hid that distinction"
+        );
         assert_eq!(
             b.levels[0].state.out_value,
             TOKEN_FORWARD - 2 * RUNG,
@@ -17472,11 +17572,11 @@ mod skim_root_attack_tests {
             "the refusal must name the CHAIN's funding value, got: {msg}"
         );
         assert!(
-            msg.contains("payload outputs carry 199424"),
+            msg.contains(&format!("payload outputs carry {}", F_VALUE - RUNG - EXTRA_OUT_FEE)),
             "…and what the trigger's outputs actually carry, got: {msg}"
         );
         assert!(
-            msg.contains("expected exactly 199510"),
+            msg.contains(&format!("expected exactly {}", F_VALUE - RUNG)),
             "…and what one rung off the real F would have been, got: {msg}"
         );
         assert!(
@@ -17487,7 +17587,7 @@ mod skim_root_attack_tests {
 
         // Same refusal through the private entry point when the chain fact is supplied.
         let direct = verify_root(&b).expect_err("…and directly").to_string();
-        assert!(direct.contains("payload outputs carry 199424"));
+        assert!(direct.contains(&format!("payload outputs carry {}", F_VALUE - RUNG - EXTRA_OUT_FEE)));
 
         // THE RESIDUE, pinned deliberately: with NO chain fact there is no anchor, and this bundle is
         // internally perfect. `verify_bundle` is for re-checking a ladder you built yourself; it is
@@ -17569,9 +17669,9 @@ mod forged_yardstick_attack_tests {
 
     /// The rate every shipped preset builds at, on every network — `TesrParams::mainnet()` and
     /// `::regtest()` both carry `committed_fee_rate: 2.0`. This is the yardstick the attack replaces.
-    const HONEST_RATE: f64 = 2.0;
+    const HONEST_RATE: f64 = 3.0; // [D44]
     /// One plain rung at the honest rate: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
-    const HONEST_RUNG: u64 = 490;
+    const HONEST_RUNG: u64 = 615; // [D44] ceil(125 * 3.0) + 240
 
     /// **The forged yardstick, root lane.** Chosen so three rungs consume 99.897 % of the coin and
     /// the builders still succeed: `committed_fee(2662) = 332 750`, rung = `332 990`, and
@@ -17943,8 +18043,8 @@ mod forged_yardstick_attack_tests {
     fn the_forged_yardstick_solves_the_conservation_equality_for_any_forward() {
         let prev = F_VALUE;
 
-        // The honest law, for scale: one rung, 490 sat, 0.049 % of the coin.
-        assert_eq!(mercurylib::tesr::committed_fee(HONEST_RATE), 250);
+        // The honest law, for scale: one rung, 615 sat at the [D44] rate, 0.06 % of the coin.
+        assert_eq!(mercurylib::tesr::committed_fee(HONEST_RATE), 375);
         assert_eq!(
             mercurylib::tesr::tier_out_value(prev, HONEST_RATE),
             Some(prev - HONEST_RUNG)
@@ -17996,20 +18096,20 @@ mod forged_yardstick_attack_tests {
     }
 
     /// The two per-rung prices this module trades on, pinned so a schedule change surfaces here
-    /// rather than as a mystery three tests down. A rung is 490 sat plain at the committed
-    /// 2 sat/vB; the coloured tier carries one whole extra P2TR-sized output (the opret) and costs
-    /// 576.
+    /// rather than as a mystery three tests down. [D44] A rung is 615 sat plain at the committed
+    /// 3 sat/vB; the coloured tier carries one whole extra P2TR-sized output (the opret) and costs
+    /// 744.
     #[test]
     fn the_rung_prices_this_attack_inflates() {
         assert_eq!(
             mercurylib::tesr::committed_fee(HONEST_RATE) + mercurylib::tesr::P2A_VALUE,
             HONEST_RUNG,
-            "a plain rung at 2 sat/vB is 125 vB * 2 + 240"
+            "[D44] a plain rung at 3 sat/vB is 125 vB * 3 + 240"
         );
         assert_eq!(
             crate::rgb::colored_committed_fee(1, HONEST_RATE) + mercurylib::tesr::P2A_VALUE,
-            576,
-            "a coloured rung at 2 sat/vB is 168 vB * 2 + 240 — one extra P2TR-sized output"
+            744,
+            "[D44] a coloured rung at 3 sat/vB is 168 vB * 3 + 240 — one extra P2TR-sized output"
         );
         // And the forged ones, which is what the ladders below are built at.
         assert_eq!(
@@ -19015,18 +19115,20 @@ mod wrong_payee_attack_tests {
         let (cb, facts) = rig.build(true, Payee::Honest);
 
         // The arithmetic every attack below leaves UNTOUCHED, stated once so a schedule change surfaces
-        // here rather than as a mystery three tests down. A plain rung at 2 sat/vB is 490 sat.
+        // here rather than as a mystery three tests down. [D44] DERIVED, not a literal.
+        let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
         let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
-        assert_eq!(sp.output[0].value, 198_530, "the ancestor segment's slot on SP");
+        assert_eq!(sp.output[0].value, F_VALUE - 3 * rung, "the ancestor segment's slot on SP");
         assert_eq!(sp.output[0].script_pubkey, rig.ancestor.spk, "…and it pays A_ancestor");
         let xa: Transaction = parse(&cb.ancestors[0].extension.as_ref().unwrap().signed_tx);
-        assert_eq!(xa.output[0].value, 198_530 - 490, "the ancestor extension forwards one rung less");
+        let slot = F_VALUE - 3 * rung;
+        assert_eq!(xa.output[0].value, slot - rung, "the ancestor extension forwards one rung less");
         assert_eq!(xa.output[0].script_pubkey, rig.ancestor.spk, "…to its OWN aggregate");
         let csp: Transaction = parse(&cb.ancestors[0].state.signed_tx);
-        assert_eq!(csp.output[0].value, 198_530 - 2 * 490, "the leaf's slot on CSP");
+        assert_eq!(csp.output[0].value, slot - 2 * rung, "the leaf's slot on CSP");
         assert_eq!(csp.output[0].script_pubkey, rig.child.spk, "…paying A_child");
-        assert_eq!(cb.child_extension.out_value, 198_530 - 3 * 490);
-        assert_eq!(cb.child_state.out_value, 198_530 - 4 * 490);
+        assert_eq!(cb.child_extension.out_value, slot - 3 * rung);
+        assert_eq!(cb.child_state.out_value, slot - 4 * rung);
 
         verify(&cb, &facts).expect("an honest, fully co-signed two-deep child bundle must be ACCEPTED");
     }
@@ -19038,8 +19140,10 @@ mod wrong_payee_attack_tests {
         let rig = rig();
         let (cb, facts) = rig.build(false, Payee::Honest);
         assert!(cb.ancestors.is_empty(), "depth 1: SP funds the leaf directly");
-        assert_eq!(cb.child_extension.out_value, 198_530 - 490);
-        assert_eq!(cb.child_state.out_value, 198_530 - 2 * 490);
+        let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
+        let slot = F_VALUE - 3 * rung;
+        assert_eq!(cb.child_extension.out_value, slot - rung);
+        assert_eq!(cb.child_state.out_value, slot - 2 * rung);
         verify(&cb, &facts).expect("an honest depth-1 child bundle must be ACCEPTED");
     }
 
@@ -20591,7 +20695,7 @@ mod dust_poisoned_tier_attack_tests {
         let rig = rig();
         let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
         let slot = mercurylib::tesr::min_child_value(rig.rate, DUST);
-        assert_eq!(slot, 1_310);
+        assert_eq!(slot, 1_560); // [D44] 2 * (ceil(125*3) + 240) + 330
 
         // A root ladder sized so that `SP`'s single slot is EXACTLY the child floor.
         let f_value = slot + 3 * rung;
@@ -20625,7 +20729,7 @@ mod dust_poisoned_tier_attack_tests {
     fn an_honest_minimum_spine_tip_lands_on_exactly_the_floor_and_is_accepted() {
         let rig = rig();
         let floor = mercurylib::tesr::min_spine_tip_value(rig.rate, DUST);
-        assert_eq!(floor, 820);
+        assert_eq!(floor, 945); // [D44] (ceil(125*3) + 240) + 330
 
         let t = tip(&rig, floor, |_| {});
         assert_eq!(t.cap.out_value, DUST, "the minimum tip's cap IS the floor");
@@ -20649,7 +20753,7 @@ mod dust_poisoned_tier_attack_tests {
         let rig = rig();
         let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
         let floor = 3 * rung + DUST;
-        assert_eq!(floor, 1_800);
+        assert_eq!(floor, 2_175); // [D44] 3 * (ceil(125*3) + 240) + 330
 
         let root = rig.root_ladder(floor, |_, _| {});
         assert_eq!(root.bundle.current().state.out_value, DUST);
@@ -20770,7 +20874,7 @@ mod dust_poisoned_tier_attack_tests {
     fn a_coloured_ladder_at_its_floor_is_accepted_and_the_zero_value_opret_is_exempt() {
         let rig = rig();
         let floor = colored_ladder_floor(rig.rate, COLORED_LADDER_DUST);
-        assert_eq!(floor, 2_058);
+        assert_eq!(floor, 2_562); // [D44] 3 * (ceil(168*3) + 240) + 330
 
         let b = colored_ladder(&rig, floor);
         let s = parse(&b.current().state.signed_tx);

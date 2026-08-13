@@ -285,11 +285,11 @@ fn plan_paths_matrix() {
 // in `TOKEN_PIECE_SATS` so the next move of the constant cannot leave a stale literal behind.
 #[test]
 fn token_split_bounds_model() {
-    assert_eq!(TOKEN_PIECE_SATS, 3_066, "coloured-root-floor packaging of a token piece");
+    assert_eq!(TOKEN_PIECE_SATS, 4_074, "[D44] coloured-root-floor packaging at the 3 sat/vB rate");
 
     // The min-carrier identity, as an expression rather than a copied literal.
     let min_carrier = TOKEN_PIECE_SATS + 300 + DUST_LIMIT;
-    assert_eq!(min_carrier, 3_696, "the min-carrier identity: 3066 + 300 + 330");
+    assert_eq!(min_carrier, 4_704, "[D44] the min-carrier identity: 4074 + 300 + 330");
 
     // Both floors pinned: reserve at its 300 floor for carriers this small (3_696/100 = 36 < 300).
     assert_eq!(split_fee_reserve(min_carrier), 300);
@@ -301,15 +301,15 @@ fn token_split_bounds_model() {
     assert_eq!(
         split_amounts(min_carrier, TOKEN_PIECE_SATS).ok(),
         Some((DUST_LIMIT, 300)),
-        "3696 is the EXACT minimum carrier: change lands on the 330 dust floor"
+        "[D44] 4704 is the EXACT minimum carrier: change lands on the 330 dust floor"
     );
 
     // The tokens.rs early guard alone ("carrier coin too small") fires at the FIT bound:
-    // carrier ≤ TOKEN_PIECE_SATS + 300 = 3_366. split_amounts subsumes it.
-    assert_eq!(TOKEN_PIECE_SATS + 300, 3_366);
+    // carrier ≤ TOKEN_PIECE_SATS + 300 = 4_374 [D44]. split_amounts subsumes it.
+    assert_eq!(TOKEN_PIECE_SATS + 300, 4_374);
     assert!(
         split_amounts(TOKEN_PIECE_SATS + 300, TOKEN_PIECE_SATS).is_err(),
-        "3066 + 300 == 3366: no fit"
+        "4074 + 300 == 4374: no fit"
     );
 }
 
@@ -387,13 +387,15 @@ fn token_packaging_exit_economics() {
     };
 
     // Exact ceil arithmetic on both sides of the threshold.
-    assert_eq!(piece_backup.fee_sats_at(27.0), 3_024);
-    assert_eq!(piece_backup.fee_sats_at(28.0), 3_136);
+    assert_eq!(piece_backup.fee_sats_at(36.0), 4_032);
+    assert_eq!(piece_backup.fee_sats_at(37.0), 4_144);
 
-    // The packaging-dust threshold: net sats at 27 sat/vB = 42; negative (zeroed out) at 28.
-    assert!(TOKEN_PIECE_SATS > piece_backup.fee_sats_at(27.0), "27 sat/vB: 42 sats net remain");
-    assert!(TOKEN_PIECE_SATS < piece_backup.fee_sats_at(28.0), "28 sat/vB: sweep zeroes out");
-    assert_eq!(TOKEN_PIECE_SATS - piece_backup.fee_sats_at(27.0), 42);
+    // The packaging-dust threshold, RE-DERIVED at the [D44] piece size: net sats at 36 sat/vB = 42;
+    // negative (zeroed out) at 37. The bigger piece survives a HIGHER mempool before packaging eats
+    // it — 27 -> 36 sat/vB — which is the one user-visible benefit of the raise.
+    assert!(TOKEN_PIECE_SATS > piece_backup.fee_sats_at(36.0), "36 sat/vB: 42 sats net remain");
+    assert!(TOKEN_PIECE_SATS < piece_backup.fee_sats_at(37.0), "37 sat/vB: sweep zeroes out");
+    assert_eq!(TOKEN_PIECE_SATS - piece_backup.fee_sats_at(36.0), 42);
 
     // The threshold is the ceil-inverse of the packaging size, so it must be RE-DERIVED whenever
     // TOKEN_PIECE_SATS moves. Pinned as the search itself, so a future move of the constant fails
@@ -401,8 +403,10 @@ fn token_packaging_exit_economics() {
     let threshold = (1..=100u64)
         .find(|r| piece_backup.fee_sats_at(*r as f64) >= TOKEN_PIECE_SATS)
         .expect("a packaging-dust threshold must exist below 100 sat/vB");
-    assert_eq!(threshold, 28, "packaging-dust threshold for a {TOKEN_PIECE_SATS}-sat piece");
-    // The legacy 1_500-sat piece dusted at 14 sat/vB; the derived piece doubles that headroom.
+    assert_eq!(threshold, 37, "[D44] packaging-dust threshold for a {TOKEN_PIECE_SATS}-sat piece");
+    // The legacy 1_500-sat piece dusted at 14 sat/vB. [D44] took the derived piece from 28 to 37,
+    // so the raise buys 2.6x the legacy head-room rather than 2x — the one user-visible BENEFIT of
+    // a bigger piece, stated beside its cost.
     assert_eq!(
         (1..=100u64).find(|r| piece_backup.fee_sats_at(*r as f64) >= 1_500),
         Some(14),

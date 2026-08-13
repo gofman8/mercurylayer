@@ -253,12 +253,12 @@ impl TesrParams {
     /// Mainnet defaults (PROTOCOL.md §5.2): 36-block (~6 h) head starts, ~17 extension epochs, forced
     /// rollover at m=15, 2 sat/vB committed fee.
     pub fn mainnet() -> Self {
-        Self { d0: 1440, delta: 36, d_floor: 144, e0: 720, delta_e: 36, e_floor: 144, m_max: 15, committed_fee_rate: 2.0 }
+        Self { d0: 1440, delta: 36, d_floor: 144, e0: 720, delta_e: 36, e_floor: 144, m_max: 15, committed_fee_rate: 3.0 }
     }
 
     /// Test-scale schedule for regtest (fast to mine a full lifecycle).
     pub fn regtest() -> Self {
-        Self { d0: 24, delta: 6, d_floor: 6, e0: 12, delta_e: 3, e_floor: 3, m_max: 2, committed_fee_rate: 2.0 }
+        Self { d0: 24, delta: 6, d_floor: 6, e0: 12, delta_e: 3, e_floor: 3, m_max: 2, committed_fee_rate: 3.0 }
     }
 
     /// **[D25] The schedule for the public test networks — testnet and signet: the MAINNET one.**
