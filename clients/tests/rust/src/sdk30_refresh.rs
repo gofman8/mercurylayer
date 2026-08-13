@@ -312,11 +312,17 @@ pub async fn execute() -> Result<()> {
         mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate,
         330,
     );
-    assert_eq!(min_payable, 1_310, "the minimum payable in-ladder child at 2 sat/vB");
+    // [D44] The rate moved 2.0 -> 3.0, so the floor moved with it: a rung is
+    // ceil(125 * 3) + 240 = 615, and two rungs plus a spendable final output is 1 560.
+    assert_eq!(min_payable, 1_560, "the minimum payable in-ladder child at the [D44] 3 sat/vB rate");
     assert_eq!(
         min_payable,
-        2 * (mercurylib::tesr::committed_fee(2.0) + mercurylib::tesr::P2A_VALUE) + 330,
-        "two committed rungs plus a spendable final output"
+        2 * (mercurylib::tesr::committed_fee(
+            mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate
+        ) + mercurylib::tesr::P2A_VALUE)
+            + 330,
+        "two committed rungs plus a spendable final output — the RATE is read from the preset, not \
+         written out, so the next schedule change fails in `TesrParams` rather than here"
     );
     assert_eq!(
         sp.rebate_sats, min_payable,

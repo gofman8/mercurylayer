@@ -17,7 +17,14 @@ use electrum_client::ElectrumApi;
 use crate::sdk40_tesr_consensus::deposit_coin;
 
 const NETWORK: &str = "regtest";
-const FEE_RATE: f64 = 2.0;
+/// **[D44] DERIVED, not written down.** This sized the child at a hard-coded 2.0 while the LADDER
+/// was built at the preset's committed rate, so when D44 moved that rate to 3.0 the child came out
+/// 125 sat too large (`ceil(125*3) - ceil(125*2)`) and the split's own conservation law refused it:
+/// "child values sum to 98280 but must equal 98155". A test that writes down a rate the system reads
+/// from a preset is a test that breaks on every schedule change, one release after the change.
+fn fee_rate() -> f64 {
+    mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate
+}
 
 async fn num_sigs(cc: &mercuryrustlib::client_config::ClientConfig, sid: &str) -> Result<u32> {
     Ok(mercuryrustlib::utils::get_statechain_info(sid, cc).await?.ok_or(anyhow!("no info"))?.num_sigs)
@@ -46,7 +53,7 @@ pub async fn execute() -> Result<()> {
 
     // --- Create the child statechain coin FIRST so SP can pay its aggregate A_child. ----------------
     let x_m = bundle.current().extension.clone();
-    let child_value = mercurylib::tesr::tier_out_total(x_m.out_value, 1, FEE_RATE).ok_or(anyhow!("fee too high"))?;
+    let child_value = mercurylib::tesr::tier_out_total(x_m.out_value, 1, fee_rate()).ok_or(anyhow!("fee too high"))?;
     let child_token = prepaid_token(&cc).await?;
     let child_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(&cc, wallet, &child_token, u32::try_from(child_value)?).await?;
     let child = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet).await?

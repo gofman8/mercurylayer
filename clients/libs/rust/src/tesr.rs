@@ -17093,7 +17093,9 @@ mod skim_root_attack_tests {
     const FLAT_BACKUPS: u32 = 1;
     const NUM_SIGS: u32 = FLAT_BACKUPS + 3;
 
-    /// One plain rung at the committed 2 sat/vB: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
+    /// One plain rung AT THIS FIXTURE'S RATE of 2 sat/vB: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
+    /// (The SHIPPED committed rate is 3.0 since [D44] — this fixture passes its rate explicitly, so it
+    /// is testing the function, not the preset.)
     const RUNG: u64 = 615; // [D44] ceil(125 * 3.0) + 240
     /// [D44] What the attacker's EXTRA output costs in fee: one P2TR output is 43 vB, so the skim
     /// is short by `ceil(43 * rate)` — 86 at the old 2.0 rate, 129 at 3.0. Named because every
@@ -17778,7 +17780,8 @@ mod forged_yardstick_attack_tests {
     /// The rate every shipped preset builds at, on every network — `TesrParams::mainnet()` and
     /// `::regtest()` both carry `committed_fee_rate: 2.0`. This is the yardstick the attack replaces.
     const HONEST_RATE: f64 = 3.0; // [D44]
-    /// One plain rung at the honest rate: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
+    /// One plain rung at THIS FIXTURE'S honest rate of 2 sat/vB: `committed_fee(2.0) + P2A_VALUE`
+    /// = 250 + 240. The shipped committed rate is 3.0 since [D44]; this fixture supplies its own.
     const HONEST_RUNG: u64 = 615; // [D44] ceil(125 * 3.0) + 240
 
     /// **The forged yardstick, root lane.** Chosen so three rungs consume 99.897 % of the coin and
@@ -18862,7 +18865,8 @@ mod wrong_payee_attack_tests {
     ///                             └─ S_c ─ pays the receiver   196 570
     /// ```
     ///
-    /// Each arrow is one 490-sat rung (`committed_fee(2.0) + P2A_VALUE` = 250 + 240) at the regtest
+    /// Each arrow is one 490-sat rung (`committed_fee(2.0) + P2A_VALUE` = 250 + 240) at THIS FIXTURE'S
+    /// 2 sat/vB — the shipped rate is 3.0 since [D44], giving 615; this fixture supplies its own. At the regtest
     /// committed rate. Depth 1 omits the ancestor segment: `SP.out[0]` funds `X_c` directly.
     impl Rig {
         fn build(&self, with_ancestor: bool, tamper: Payee) -> (ChildTesrBundle, Facts) {
