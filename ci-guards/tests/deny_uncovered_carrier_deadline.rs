@@ -46,18 +46,71 @@ fn body(code: &str, sig: &str) -> String {
 fn the_unilateral_deadline_route_covers_carriers() {
     let code = code_only(&read("clients/libs/rust-sdk/src/refresh.rs"));
     let b = body(&code, "pub async fn deadline_safety_due(");
+    // [D51] The ORIGINAL form of this assertion pinned the absence of ONE literal spelling of the
+    // filter. The pre-spec review named it correctly as the description-pin shape: an
+    // `if is_token_carrier(c, &carriers) { continue }`, or the same closure with a different
+    // binding, re-introduces the exclusion and the guard still passes. It now names every spelling
+    // that would exclude carriers from the set this route acts on, and the check is scoped to the
+    // `still_due` binding rather than the whole function — `auto_refresh_due`'s own (correct)
+    // exclusion is called from in here and must not trip it.
+    let still_due = b
+        .split_once("let still_due:")
+        .and_then(|(_, rest)| rest.split_once(".collect();"))
+        .map(|(head, _)| head.to_string())
+        .unwrap_or_else(|| {
+            panic!("the `still_due` binding is gone from `deadline_safety_due` — this guard is \
+                    reading the wrong thing and must be re-pointed before it can mean anything:\n\n{b}")
+        });
     assert!(
-        !b.contains(".filter(|c| !crate::wallet::is_token_carrier(c, &carriers))"),
-        "`deadline_safety_due` filters token carriers OUT of its unilateral route again. That leaves \
-         the carrier lane with ZERO automatic deadline coverage — the one lane where the loss is an \
-         ASSET — resting on `auto_exit_due` alone. The forced action here is the coin's OWN \
-         pre-signed `T`, which does not move the allocation:\n\n{b}"
+        !still_due.contains("is_token_carrier"),
+        "`deadline_safety_due` filters token carriers OUT of the set its unilateral route acts on. \
+         The forced action here is the coin's OWN pre-signed `T`, which carries the coin's own state \
+         and does not move the allocation, so a carrier belongs in this set — a carrier that cannot \
+         take it is refused BY `unilateral_exit`, on the merits, and [D51] reports that refusal. \
+         Excluding it here hides the coin instead:\n\n{still_due}"
     );
     // …and it still SEVERES rather than re-anchoring. A carrier re-anchored is a carrier destroyed.
     assert!(
         b.contains("unilateral_exit("),
         "the forced action is no longer `unilateral_exit`. If this route ever re-anchors instead, it \
          destroys exactly the allocations it was extended to protect:\n\n{b}"
+    );
+}
+
+/// **[D51] AND THE PASS MAY NOT RETURN `Ok` OVER A COIN IT DID NOT DEFEND.**
+///
+/// This is the half that was missing while the guard above was green. Carriers WERE included in the
+/// set — the assertion above held — and the `unilateral_exit` refusal for a non-coloured carrier then
+/// landed on a bare `_ => continue`, so the pass reported success over an undefended coin while the
+/// operator line promised those same carriers "will be SEVERED". Inclusion without reporting is not
+/// coverage.
+#[test]
+fn the_deadline_pass_reports_every_coin_it_could_not_defend() {
+    let code = code_only(&read("clients/libs/rust-sdk/src/refresh.rs"));
+    let b = body(&code, "pub async fn deadline_safety_due(");
+    assert!(
+        b.contains("undefended"),
+        "`deadline_safety_due` no longer collects the coins it failed to defend. Without that list \
+         a refusal from `unilateral_exit` — the DEFAULT outcome for every carrier, since \
+         `colored_ladder` ships false — is indistinguishable from a quiet pass:\n\n{b}"
+    );
+    assert!(
+        b.contains("Err(e) => undefended.push"),
+        "the `Err` arm no longer records its reason. `_ => continue` over an Err about a coin inside \
+         its deadline margin is the silent-degradation shape this repo has been bitten by three \
+         times — the failure looks like idle:\n\n{b}"
+    );
+    assert!(
+        b.contains("ExitDeadlineApproaching"),
+        "the undefended coins are no longer announced on the event channel, which is the only \
+         signal a caller that discards the return value (the background loop does exactly that) can \
+         ever see:\n\n{b}"
+    );
+    assert!(
+        b.contains("return Err(anyhow!(") && b.contains("could NOT defend them"),
+        "the pass no longer RETURNS an error when it left a coin undefended. `Ok` from this pass is \
+         read as \"this wallet is protected\" — by `note_watchtower_ok` and by every direct caller — \
+         so returning it over an undefended coin is a false green on a safety pass:\n\n{b}"
     );
 }
 

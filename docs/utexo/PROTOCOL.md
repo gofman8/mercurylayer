@@ -231,9 +231,18 @@ Because rollover (§5.6) is off-chain, even conservative δ only trades exit wei
 
 **The core property**: all three tiers are un-broadcast; BIP-112 CSV ticks only after the parent
 confirms; T has no timelock. So **nothing anywhere matures until someone broadcasts T on-chain**. An
-idle coin — and an entire idle split/combine DAG — never ages. No calendar deadlines, no refresh rent,
-no root-deadline materializations. The whole audit-[17]/B6 class (deposit-anchored deadline
-arithmetic) is deleted **for laddered coins**.
+idle coin — and an entire idle split/combine DAG — never ages **on the CSV side**: no refresh rent, no
+root-deadline materializations.
+
+**[D36 correction, 2026-08-14 — this paragraph used to end "No calendar deadlines … deleted for
+laddered coins", and that is FALSE of every RECEIVED laddered coin.]** The ladder is not the coin's
+only pre-signed material: the FLAT BACKUP CHAIN is retained, and it carries an absolute locktime which
+each whole-coin hop shortens by `interval`. A coin that has been received `k` times therefore sits on
+`min(L_k)` — a real, finite, approaching calendar height held by its PRIOR OWNERS — whatever its
+ladder is doing. `SDK_E2E=86` measures exactly this: the tip advances toward that height and each hop
+spends `interval` of it. What TES-R deletes is the CSV-side ageing; what survives is `min(L_k)`, and
+`TRUST-MODEL.md` B4(ii) and `SPEC.md` §1 have said so since D36. The audit-[17]/B6 class is therefore
+NARROWED, not deleted.
 
 **[Shipped correction]** it is *not* deleted wholesale: the un-laddered shape (RGB carriers, §5.10;
 sub-coins over un-broadcast funding, B0) still rests on the signed-once **absolute-locktime** backup,
@@ -420,7 +429,7 @@ the operator absorbs the difference.
 |---|---|---|---|---|---|
 | Previous owner, same epoch | T, X_m, stale S_j | Broadcast T; at +E_m broadcast X_m; wait Δ_j | Tower sees F spent (loud, on-chain); **preferred: co-op de-trigger (§5.8)**; else broadcast S_k at +Δ_k | **Honest**, ≥36-block (~6 h) CSV edge per tier + fee race | ≥1 tower reacting within a window that opens with ≥E_m + Δ_k ≥ 288 blocks (~2 days) of total notice |
 | Previous owner, old epoch m′ | T, X_{m′}, old states | Broadcast T; wait E_{m′} | Co-op de-trigger, or broadcast X_m at +E_m — every epoch-m′ state's parent becomes unconfirmable | **Honest**, edge 36·(m−m′) ≥ 36 blocks | Tower awake within the edge, after ≥E_m ≥ 144 blocks of prior notice |
-| Ancestor's past owner vs my sub-coin | Root chain + stale S_j at some level | Confirm T, X; broadcast stale S_j before my SP | Tower broadcasts SP at Δ_{k+1} (undercuts by ≥36); per-tier repeat | **Honest**, per-tier ≥36-block edge; **no calendar deadline exists** (the pre-TES-R [17]/B6 class deleted) | Per-tier reaction; ≥144 blocks notice before ANY hostile tx is final |
+| Ancestor's past owner vs my sub-coin | Root chain + stale S_j at some level | Confirm T, X; broadcast stale S_j before my SP | Tower broadcasts SP at Δ_{k+1} (undercuts by ≥36); per-tier repeat | **Honest**, per-tier ≥36-block edge. **[D36] A CALENDAR DEADLINE DOES EXIST**: the coin still sits on `min(L_k)`, the retained flat-backup height held by its prior owners | Per-tier reaction; ≥144 blocks notice before ANY hostile tx is final — but only until `min(L_k)` |
 | Hacked SE alone | e_n (1 of 2-of-2) | Nothing signs; can only refuse (freeze ≠ seize) | Unilateral tree pre-signed, needs nobody | **Honest, unconditionally** | None |
 | Hacked SE + past owner w/ retained pre-rotation share (**B1**) | Full key of F | Fresh no-timelock spend, private relay | Race with pre-signed material; blindness blocks target selection; public counter receipts attribute | **Adversary favored — byte-identical to the pre-TES-R B1**, the statechain trust unit, unchanged in kind and mitigations | Enclave deletion + attestation ops; settled coins immune |
 | Hacked SE + thief, coin received PRE-hack, untouched | e_n only | Cannot produce owner's partial | 2-of-2 arithmetic | **Honest, unconditionally** (REQ-3 core case) | None |
@@ -434,8 +443,19 @@ state dies at consensus); the honest defence's pre-signed material — **sdk50**
 through the full tier chain) and **sdk45** (the keyless bundle drives it with no key material);
 adversarial rejection of forged/hidden structure — **sdk58** (11 cases), **sdk54**, **sdk55**. Rows 4–6
 (hacked SE) are arithmetic properties of 2-of-2, not test-observable beyond the co-sign gates
-(**sdk56/sdk57**, retry-idempotence and owner-share binding). Row 3's "no calendar deadline exists"
-holds for a **laddered** sub-coin; the un-laddered shape keeps its root deadline (§5.10.4).
+(**sdk56/sdk57**, retry-idempotence and owner-share binding).
+
+**[D36 correction, 2026-08-14.]** This paragraph used to read *"Row 3's 'no calendar deadline exists'
+holds for a **laddered** sub-coin; the un-laddered shape keeps its root deadline"* — which REAFFIRMED
+the error above rather than catching it, and split the world along the wrong axis. The distinction is
+not laddered/un-laddered: **every coin that has been RECEIVED keeps `min(L_k)`**, because the flat
+backup chain is retained alongside the ladder and each hop shortens its absolute locktime by
+`interval`. Laddering removes the CSV-side ageing and nothing else. `SDK_E2E=86` is the measurement;
+`TRUST-MODEL.md` B4(ii) is the trust-model statement; `SPEC.md` §1 carries it in the specification.
+
+**Why this mattered enough to correct rather than annotate:** an implementer reading the row as
+written would omit `deadline_safety_due` entirely — it is the ONLY scheduled defence of `min(L_k)` on
+a laddered coin — on the strength of a sentence saying the deadline does not exist.
 
 **The traded property, stated plainly**: the pre-TES-R design's unconditional ~7-day no-watch window
 is exchanged for *perpetual but alarm-driven* watching. No theft tx can become valid until ≥144 blocks
@@ -939,9 +959,11 @@ frozen fees, no forward market); (k+1)× enclave share blast radius on an unatte
 useful as a bridge: TES-R migration is a single re-anchor per coin (§9), self-funding within one week
 of the avoided baseline rent.
 Salvaged ideas: P2A-on-everything, tower-executed maintenance (made off-chain), conveyed-locktimes
-(moot for laddered coins — they have no calendar deadlines to convey. **[Shipped correction]** audit
-[17] therefore does *not* close by deletion: it survives on the un-laddered shape, absorbed by the
-`auto_exit_margin_blocks` default, not solved. **[Corrected — the 288-block literal this document used
+(**[D36] NOT moot** — this used to read "moot for laddered coins, they have no calendar deadlines to
+convey", and a laddered coin that has been received keeps `min(L_k)` from its retained flat backup
+chain. Audit [17] therefore does *not* close by deletion, and not only on the un-laddered shape: it
+survives on every received coin, absorbed by the `auto_exit_margin_blocks` default and by
+`deadline_safety_due`, not solved. **[Corrected — the 288-block literal this document used
 to quote is superseded.]** 288 = `k_max·interval + 144` spent a **single** confirmation window on a walk
 that lands `3 + 2d` transactions one after another, each of which must confirm before the next tier's
 relative lock even starts counting. The shipped default is DERIVED, not chosen —
