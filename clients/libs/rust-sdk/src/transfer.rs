@@ -891,24 +891,12 @@ impl UtexoWallet {
         let mut piece_addrs: Vec<String> = Vec::with_capacity(recipients.len());
         for (_, amount) in recipients {
             let tk = slot_tokens.remove(0);
-            let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &tk,
-                u32::try_from(*amount)?,
-            )
-            .await?;
+            let addr = self.create_child_slot_addr(&tk, *amount).await?;
             outputs.push((addr.clone(), *amount));
             piece_addrs.push(addr);
         }
         let change_tk = slot_tokens.remove(0);
-        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &change_tk,
-            u32::try_from(change_sats)?,
-        )
-        .await?;
+        let change_addr = self.create_child_slot_addr(&change_tk, change_sats).await?;
         outputs.push((change_addr.clone(), change_sats));
 
         // Terminal-guard the carrier (one split), then co-sign the un-broadcast split.
@@ -1093,21 +1081,9 @@ impl UtexoWallet {
         // their tokens are free SE-minted vouchers against the parent — never the paid pool.
         let mut slot_tokens = self.take_derived_tokens(statechain_id, 2).await?;
         let token_a = slot_tokens.remove(0);
-        let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &token_a,
-            u32::try_from(piece_sats)?,
-        )
-        .await?;
+        let piece_addr = self.create_child_slot_addr(&token_a, piece_sats).await?;
         let token_b = slot_tokens.remove(0);
-        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &token_b,
-            u32::try_from(change_sats)?,
-        )
-        .await?;
+        let change_addr = self.create_child_slot_addr(&token_b, change_sats).await?;
 
         // Build + blind-MuSig2 co-sign the un-broadcast split tx (plain BTC: no coloring step).
         // The split IS the child's exit branch and is now locktime-FREE (INV-4 / review H5), so it
@@ -2433,7 +2409,28 @@ impl UtexoWallet {
 
     /// Create one SE-registered child slot funded by a derived token, returning its `Coin` (with
     /// statechain_id + auth). The slot's aggregate is what `SP.out[j]` pays in the in-ladder split.
-    pub(crate) async fn create_child_slot(&self, token_id: &str, amount_sats: u64) -> Result<Coin> {
+    /// **The ONLY way a derived-slot voucher may be turned into a deposit address.**
+    ///
+    /// The address half of [`Self::create_child_slot`], split out because four call sites need the
+    /// address rather than the `Coin` and were reaching past it to
+    /// `deposit::get_deposit_bitcoin_address` directly. That bypass is not cosmetic: a voucher spent
+    /// at the SE and left in the durable pool is handed out again by the next
+    /// [`Self::take_derived_tokens`] — which mints nothing, because the pool looks full — and every
+    /// slot creation after it fails `Token already spent` until the dead id has failed
+    /// [`SLOT_VOUCHER_FAILURE_LIMIT`] times. Poisoned vouchers sit at the FRONT of the pool, so they
+    /// are handed out first, every time.
+    ///
+    /// Measured on the live stack: one RGB token-piece payment left two dead ids behind and the
+    /// wallet's next split died on the first of them (sdk16, sdk37, sdk39; sdk21's SSP paid its
+    /// Lightning invoice and then claimed nothing, for the same reason one hop back).
+    ///
+    /// So the pairing is enforced here rather than remembered at each site: spend → consume, error →
+    /// fail-and-count. There is no third caller shape.
+    pub(crate) async fn create_child_slot_addr(
+        &self,
+        token_id: &str,
+        amount_sats: u64,
+    ) -> Result<String> {
         let addr = match mercuryrustlib::deposit::get_deposit_bitcoin_address(
             &self.inner.cc,
             &self.inner.config.wallet_name,
@@ -2454,6 +2451,11 @@ impl UtexoWallet {
         // Spent: `deposit/init` consumed the token, so it must leave the pool or a later batch would
         // hand out a dead id.
         self.consume_slot_voucher(token_id).await?;
+        Ok(addr)
+    }
+
+    pub(crate) async fn create_child_slot(&self, token_id: &str, amount_sats: u64) -> Result<Coin> {
+        let addr = self.create_child_slot_addr(token_id, amount_sats).await?;
         self.record()
             .await?
             .coins

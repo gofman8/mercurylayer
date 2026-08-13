@@ -329,13 +329,7 @@ impl UtexoWallet {
                 .take_derived_tokens(statechain_id, 1)
                 .await?
                 .remove(0);
-            let fresh_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &slot_token,
-                u32::try_from(amount_out)?,
-            )
-            .await?;
+            let fresh_addr = self.create_child_slot_addr(&slot_token, amount_out).await?;
             let after_dep = self.record().await?;
             let new_statechain_id = after_dep
                 .coins

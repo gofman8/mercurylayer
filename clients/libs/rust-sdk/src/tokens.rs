@@ -3483,21 +3483,9 @@ impl UtexoWallet {
         // colored split re-houses the carrier's value, no new on-chain onboarding).
         let mut slot_tokens = self.take_derived_tokens(&carrier_id, 2).await?;
         let token_a = slot_tokens.remove(0);
-        let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &token_a,
-            u32::try_from(TOKEN_PIECE_SATS)?,
-        )
-        .await?;
+        let piece_addr = self.create_child_slot_addr(&token_a, TOKEN_PIECE_SATS).await?;
         let token_b = slot_tokens.remove(0);
-        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &token_b,
-            u32::try_from(change_sats)?,
-        )
-        .await?;
+        let change_addr = self.create_child_slot_addr(&token_b, change_sats).await?;
 
         // Colored split: piece carries the exact token amount; change keeps the rest (or is a
         // plain sats output when the transfer consumes the full allocation).
@@ -5224,21 +5212,9 @@ impl UtexoWallet {
             .ok_or_else(|| anyhow!("selected carrier without statechain id"))?;
         let mut slot_tokens = self.take_derived_tokens(&voucher_parent, 2).await?;
         let token_a = slot_tokens.remove(0);
-        let piece_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &token_a,
-            u32::try_from(TOKEN_PIECE_SATS)?,
-        )
-        .await?;
+        let piece_addr = self.create_child_slot_addr(&token_a, TOKEN_PIECE_SATS).await?;
         let token_b = slot_tokens.remove(0);
-        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &token_b,
-            u32::try_from(change_sats)?,
-        )
-        .await?;
+        let change_addr = self.create_child_slot_addr(&token_b, change_sats).await?;
 
         // 4. Make EVERY input carrier terminal at the SE before co-signing the combine — so none can
         //    be double-spent to invalidate the branch (the receiver independently verifies this).
@@ -5511,24 +5487,12 @@ impl UtexoWallet {
         let mut piece_addrs: Vec<String> = Vec::with_capacity(n);
         for (_, amount) in transfers {
             let tk = slot_tokens.remove(0);
-            let addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-                &tk,
-                u32::try_from(TOKEN_PIECE_SATS)?,
-            )
-            .await?;
+            let addr = self.create_child_slot_addr(&tk, TOKEN_PIECE_SATS).await?;
             splits.push((addr.clone(), TOKEN_PIECE_SATS, *amount));
             piece_addrs.push(addr);
         }
         let change_tk = slot_tokens.remove(0);
-        let change_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &change_tk,
-            u32::try_from(change_sats)?,
-        )
-        .await?;
+        let change_addr = self.create_child_slot_addr(&change_tk, change_sats).await?;
         splits.push((change_addr.clone(), change_sats, token_change));
 
         let parent_backups = self.carrier_spend_generation(&carrier_id).await?;
