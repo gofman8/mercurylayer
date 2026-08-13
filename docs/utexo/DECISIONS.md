@@ -1070,3 +1070,101 @@ Coordinator-alone reduces to **denial**: a cancel still requires a single-use, e
 signature under the SENDER's auth key, which the coordinator cannot forge, and the re-conveyance to a
 second payee is the sender's act with the sender as beneficiary. **The loss arm requires coordinator
 + sender collusion — the same adversary as CO-1.**
+
+## D40 — Owner calls, batch 2: the four that block WRITING (2026-08-13)
+
+Taken against the adversarially-verified decision sheet
+([`spec-work/OWNER-DECISION-SHEET.md`](spec-work/OWNER-DECISION-SHEET.md)), in which **all fourteen**
+first-pass answers came back `NEEDS_CORRECTION`. Where the refutation moved the answer, that is
+recorded here rather than in the sheet alone, because the correction is the part worth keeping.
+
+### D40.1 — B1: publish it corrected, and ship the one remedy the adversary cannot decline
+
+**Decided:** state B1 as **unbounded and custodial-equivalent against a retaining operator**, delete
+the four false mitigations, and surface **"sever from `F`"** — broadcast the already-co-signed `T`
+(125 vB, `lock_time 0`, no SE, no counterparty, no wait) — as a first-class user action.
+
+*What the refutation killed.* The re-anchor defence recorded in the first pass. `refresh`/`reanchor`
+is **cooperative** — its own doc says so — and it routes through `withdraw`, needing one fresh SE
+co-signature. **The B1 adversary IS the operator.** The recommendation was "ask the attacker to sign
+the transaction that destroys its own attack", and refusal is already blessed as non-theft. A
+value threshold θ fails for two more reasons: it caps a *coin* while a victim holds *n* of them, and
+the field it gates on (`amount`) is **chosen by the sender**, so a hostile sender conveys a large
+payment as many sub-θ pieces.
+
+*What survives, and it is new.* A **duration** bound. B1 exposure ends the moment the holder
+broadcasts `T`: every historical `(o_i, e_i)` pair is dead thereafter. It bounds time and adversary
+class rather than value, and it is the only action here that does not need the adversary's help.
+
+*The four mitigations being deleted*, each refutable in about one grep: "the SE is blind to which
+coins are valuable" (the operator's own migration-0009 column says otherwise); "≥144 blocks of
+notice" (`F` is key-path P2TR with `merkle_root = None`, and the attack never broadcasts `T`);
+"pre-hack untouched coins are unconditionally safe" (circular — its proof is T-SE-1 restated); and
+"collusion leaves publicly-queryable evidence".
+
+**NOT decided here:** publishing the prior-owner count `k`. It is gated on first closing a forgery
+hole — `validate_backup_chain_v2` enforces only *pairwise* decrement, with nothing anchoring the head
+of the chain to `h_deposit + initlock`, so a sender truncates the high end, buys one extra co-sign per
+dropped rung, discloses it in `superseded_states`, and the census still balances. A receiver can be
+shown a one-element chain and conclude "structurally B1-immune". **A safety signal that can be forged
+downward is worse than no signal**, so `k` waits on the head anchor.
+
+### D40.2 — CO-1 / O-1 / CO-3 are ONE defect: consume what is attested, close the JS lane, name the real closure
+
+**Decided:** the ~1-day fix, now — plus the honest statement of what it does not close.
+
+1. Derive terminality on both acceptance paths from the **attested** `has_sig_budget &&
+   num_sigs >= sig_budget`; delete the unattested `get_spend_budget` reads; keep the coordinator's
+   answer as a **raw-quantity** cross-check that refuses on disagreement (both sides hold the same
+   absolute value, so the quantities really are comparable and the stronger check is available).
+2. Make the JS/web laddered gate **structural**, not keyed on three sender-declared fields.
+3. **Name** a second, independently administered SE write domain as the only construction that
+   actually closes this, and gate it on a second **legal entity** — it is meaningless otherwise.
+
+*The structural finding.* O-1, CO-1 and CO-3 are not three faces of one anchor; they are **one
+defect** — the enclave key material and the counter it attests are both held by the party the receiver
+is being protected from. Grading them independently triple-counts it. **Publish one row, cite it three
+times.**
+
+*The live hole this closes.* `verify_conveyed_child` fetches the attested payload and then reads
+terminality from an **unattested** coordinator endpoint computed entirely from the coordinator's own
+Postgres. A repo-wide grep for `has_sig_budget` in `clients/` returns exactly one site: the attested
+budget is verified and then **never read by any acceptance decision**. One unattested `terminal: true`
+kills a whole parent tree, on both the pre-pay and claim paths.
+
+*Rejected, with the argument recorded so it is not re-proposed.* An external anchor over
+`(sid, n, h_n)`. This row's attack is **under**-reporting, and the receiver's rule would be a *floor*
+against an adversary who writes the floor: anchor `n=5` while the true count is 7, serve 5, check
+5 ≥ 5, pass. Tightening to equality does not save it — `h_n` is a hash over per-coin session keys no
+receiver can recompute. It also costs a per-coin activity oracle in a design whose SE deliberately
+sees nothing.
+
+*Also corrected:* the victim-count figure. `max_derived_tokens_per_statechain = 64` is a **per-parent
+lifetime** cap over spent and unspent rows, not a per-level fan-out — so the binding count is ~64, not
+the published 76,335, which was three orders of magnitude out **in the alarming direction**.
+
+### D40.3 — C-1: a minimum-slack admission margin
+
+**Decided:** refuse a conveyed child whose `check_exit_headroom` slack is below a margin proportional
+to its own walk, and publish the normative sentence that goes with it.
+
+*Why this and not a stress rate.* **Every input is already receiver-derived.** That is precisely what
+disqualifies the stress-priced alternative, which would add a `stress_fee_rate` nobody can derive to
+the trust base — and at stress = 20, depth 10 the minimum admissible piece becomes ~125,330 sat,
+killing the entire simulated payment range to insure a marginal exposure the pass priced at **67 sat**.
+
+*The defect being closed.* `check_exit_headroom` admits at **slack == 0**, and a test pins that case.
+The slack is the piece's entire tolerance for confirmation variance, fee stall and reorg across a
+2,885-block walk — and **the sender chooses it by choosing when to convey**. The margin removes that
+free lever. Cost: late-in-epoch conveyances are refused, forcing a re-anchor — a liveness cost, in the
+direction `ADMISSION-INPUTS.md` already names as the safe one.
+
+*Two corrections to the record.* The aggregate is **constructible and UNEVALUATED**, not unbounded:
+the loss set `Σ V_i · 1[V_i < V_min(d_i, r)]` is monotone in `r` and **saturates** at the piece lane's
+total value. And `r` is the **mempool floor**, not a fee estimate — "under water between 5 and 10
+sat/vB" means a floor *sustained* there across the whole walk, which is a materially different claim.
+
+### D40.4 — Sequencing: Tier A code first, then draft
+
+**Decided:** land the items that must exist before their section can be written honestly, then draft.
+Slowest to first prose; fastest to prose that survives review.
