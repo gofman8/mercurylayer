@@ -111,6 +111,41 @@ pub async fn get_backup_txs(pool: &Pool<Sqlite>, wallet_name: &str, statechain_i
     Ok(backup_txs)
 }
 
+/// **`Ok(None)` = the row genuinely does not exist; `Err` = the database could not be read.**
+///
+/// [`get_backup_txs`] reports BOTH through `Err`, and the bare `sqlx` error is deliberately left
+/// undecorated so this distinction survives (see the note there). But "undecorated" also means a
+/// caller that bare-`?`s it hands the user a **database implementation detail** — literally
+/// *"no rows returned by a query that expected to return at least one row"* — in place of a refusal.
+///
+/// That is not cosmetic. A coin with no flat backup rows is an ORDINARY, EXPECTED shape on this
+/// protocol: a split child's funding output was never deposited (`CHILD_V2_BASELINE == 0`), and a
+/// spine tip's is `SP.out[K]`, un-broadcast. Routing one of those to the flat sender is a real
+/// condition that deserves a named refusal — and until it had one, `chaos22`'s oracle correctly
+/// classified nine of them as UNCLASSIFIED breaches, because an error it cannot recognise is exactly
+/// what a routing regression looks like.
+///
+/// Callers that want "absent means empty" must say so by matching `Ok(None)`; they may never reach
+/// that conclusion from an `Err`, which carries no information about whether the row exists.
+pub async fn try_get_backup_txs(
+    pool: &Pool<Sqlite>,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Option<Vec<BackupTx>>> {
+    match get_backup_txs(pool, wallet_name, statechain_id).await {
+        Ok(rows) => Ok(Some(rows)),
+        Err(e) => {
+            let missing = matches!(e.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::RowNotFound))
+                || e.to_string().contains("Statechain id not found");
+            if missing {
+                Ok(None)
+            } else {
+                Err(anyhow!("backup rows for '{statechain_id}' could not be read: {e}"))
+            }
+        }
+    }
+}
+
 /// Every backup row for a wallet as `(statechain_id_key, raw_txs_json)`, including the pseudo-keys
 /// `branch-<id>` (off-chain exit branch) and `parents-<id>` (terminal-ancestor list). Used to
 /// export a full recovery bundle: this exit material lives ONLY on the owner's disk and the SE

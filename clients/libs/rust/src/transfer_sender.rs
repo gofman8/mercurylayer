@@ -26,7 +26,23 @@ pub async fn create_backup_transactions(
 
     let mut coin_list: Vec<&mut Coin> = Vec::new();
 
-    let backup_transactions = get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
+    // A coin with NO flat backup rows is an expected shape, not a database failure: a split child's
+    // funding output was never deposited and a spine tip's is un-broadcast, so neither ever acquired
+    // one. Routing such a coin to the FLAT sender is a real condition and it gets a named refusal
+    // here — before this, the bare `?` handed the caller sqlx's own sentence, which `chaos22`'s
+    // oracle could only class as an unclassified breach.
+    let backup_transactions =
+        crate::sqlite_manager::try_get_backup_txs(&client_config.pool, &wallet.name, &statechain_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "statechain id {statechain_id} has no flat backup rows, so it cannot be conveyed \
+                     on the flat lane. A split child or a spine tip never has them — its exit \
+                     material is its own bundle (`ctesr-`/`spinetip-`), and it is conveyed by the \
+                     child lane. If this is a root coin, its backup chain is missing and the coin \
+                     must be restored from a recovery bundle before it can be sent."
+                )
+            })?;
 
     // Get coins that already have a backup transaction
     for coin in wallet.coins.iter_mut() {
@@ -129,8 +145,18 @@ pub async fn create_backup_transactions(
 
     let mut new_backup_transactions = Vec::new();
 
-    // create backup transaction for every coin
-    let backup_transactions = get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
+    // create backup transaction for every coin. Same absence-vs-failure rule as the caller above:
+    // `new_tx_n` is derived from this length, so reading a failed read as "zero rows" would restart
+    // the ladder at tx_n 0 and collide with every existing hop.
+    let backup_transactions =
+        crate::sqlite_manager::try_get_backup_txs(&client_config.pool, &wallet.name, &statechain_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "statechain id {statechain_id} has no flat backup rows to extend — refusing to \
+                     start a new backup chain at tx_n 0 over a coin that should already have one"
+                )
+            })?;
 
     let mut new_tx_n = backup_transactions.len() as u32;
 
