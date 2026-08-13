@@ -41,13 +41,29 @@ be skipped and most expensive to skip.**
 | 0.3 | **Re-resolve every code citation by SYMBOL** | **Partly done** — the Stage 4 pass introduced zero new line-number citations and replaced the ones it touched with symbols; the re-audit found more still standing in SPEC-ROADMAP (D19/§4a, WP3a, WP3b, §7) which the follow-up commit fixed. A full corpus sweep is still owed. |
 | 0.4 | **Evaluate the two closed forms** | **BLOCKED — needs a live fleet.** Both queries are over deployed coins; regtest has none that mean anything. This is an external dependency, not unfinished work: the forms are constructible (D40.3) and remain UNEVALUATED until there is a fleet to evaluate them against. |
 
-**Believed done but NOT verified** — each must be re-graded or re-tested before it appears in prose:
+**Believed done but NOT verified** — ✅ **all five are now resolved.** Each was re-checked against
+the tree rather than re-read:
 
-- D34's "closes CO-1" — it does not, as deployed.
-- D28's "what a receiver can check" row — attested a budget that, until today, no acceptance decision read.
-- PROTOCOL.md §7 Phase 0's "DONE: generalized counters {level, m, k, total_sigs}, POST /renew/init" — `total_sigs` has **zero** occurrences in `server/`, `lockbox/` or `lib/`; no `/renew` route exists.
-- INV-27's evidence pin `sdk30(a)` — it idles a k=0 deposit and structurally cannot witness the case where INV-27 is false.
-- ~~`live_p2a_package_rescue.rs`'s doc comment — claims to drive a seam its body never enters.~~ ✅ **CLOSED** — the file now carries `the_seam_tries_cheap_first_rescues_with_a_capability_and_names_the_limit_without_one`, which drives `broadcast_tier` itself.
+- ~~D34's "closes CO-1"~~ — **corrected.** The heading claimed a closure D40.2 had already superseded.
+  D34 closes the ROGUE-KEY half; CO-1's residue is structural and proof of possession cannot touch it,
+  because a proof made with the enclave's key proves independence to exactly the extent that key is
+  independent — which is the question. The heading no longer claims it and the reason is recorded in
+  place.
+- ~~D28's "what a receiver can check" row~~ — **now true, and dated.** It was true about the
+  attestation and false about the system until A.1: the budget was signed, verified, and read by no
+  acceptance decision. The row now says so and cites the four tests that exercise the consumer.
+- ~~PROTOCOL.md §7 Phase 0's "DONE"~~ — **already corrected by the Stage 4 pass**, and re-verified
+  here: `total_sigs` still has **zero** occurrences in `server/`, `lockbox/`, `lib/` and `clients/`,
+  and no `/renew` route exists. §7 names all three deltas including "the server line never landed".
+  This entry was stale.
+- ~~INV-27's evidence pin `sdk30(a)`~~ — **replaced by `sdk86`** (above).
+- ~~`live_p2a_package_rescue.rs`'s doc comment~~ — **closed**; the file now drives `broadcast_tier`
+  itself.
+
+Also re-checked and **stale**: Stage 4's note that INV-6 is "published as a numbered invariant with a
+coverage claim for a refusal that does not exist in the tree". INV-6 is now stated as the NEGATIVE
+invariant it is ("there is no single-active-state rule") and carries **no** coverage row — the
+correction had already landed.
 
 ---
 
@@ -152,9 +168,10 @@ The two fleet queries. The D32 inventory. The three-clocks separation in
 `PARTIAL-PAYMENT-ECONOMICS.md`.
 
 **Worth doing early despite blocking nothing**, because the spec will otherwise inherit refuted
-sentences: PROTOCOL.md's four self-contradictions in one file, §7 Phase 0's DONE-but-absent counter
-machine, and INV-6 — published as a **numbered invariant with a coverage claim** for a refusal that
-does not exist in the tree.
+sentences. Two of the three named here are **already done**: §7 Phase 0's DONE-but-absent counter
+machine now names all three deltas, and INV-6 is stated as the negative invariant it is with no
+coverage row. What remains is PROTOCOL.md's four self-contradictions in one file — and those are
+**decision 5's subject**, so they are gated rather than merely unfinished.
 
 ---
 

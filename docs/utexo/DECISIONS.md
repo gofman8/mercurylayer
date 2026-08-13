@@ -453,6 +453,14 @@ notion of a budget, so it could not attest that the count was **final**.
 | who refuses the co-sign | coordinator | coordinator **and** enclave (`410`, before the secnonce is consumed) |
 | what a receiver can check | the coordinator's word | a BIP-340 signature by the coin's chain-anchored key |
 
+> **This row was true about the ATTESTATION and false about the SYSTEM until A.1 landed** (`52daca6`,
+> 2026-08-13). The budget was signed, verified, and then read by no acceptance decision — a repo-wide
+> grep for `has_sig_budget` in `clients/` returned one site, the verification itself. "What a receiver
+> can check" is only a security property once a receiver checks it. `attested_terminal` now derives
+> terminality from the attested payload and demotes the coordinator's answer to a refusing
+> cross-check; `terminal_from_attested` / `cross_check_terminality` are exercised by four tests
+> (`tesr::malicious_coordinator_terminality_tests`) including disagreement in BOTH directions.
+
 **The ratchet is the security content.** `set_sig_budget` may create a budget or **lower** it, never
 raise it — enforced in one SQL statement (`WHERE sig_budget IS NULL OR sig_budget > $1`) so the
 database decides it rather than a read-then-write that two concurrent callers could assemble a raise
@@ -757,7 +765,14 @@ scoped would be a guess presented as a plan.
 
 ---
 
-## D34 — The receiver PROVES the enclave holds the share it is about to depend on (closes CO-1)
+## D34 — The receiver PROVES the enclave holds the share it is about to depend on
+
+> **The heading used to end "(closes CO-1)". It does not, and [D40.2](#d402--co-1--o-1--co-3-are-one-defect-consume-what-is-attested-close-the-js-lane-name-the-real-closure)
+> is why.** D34 closes the ROGUE-KEY half — a coordinator that lies about `aggregate_pubkey` no
+> longer passes its own check. CO-1's residue is structural and proof of possession cannot touch it:
+> the enclave key material and the counter it attests are held by the party the receiver is being
+> protected from, so a proof made with that key proves possession to exactly the extent that key is
+> independent — which is the question. D40.2 records the real closure and the one-row merge.
 
 **Decided:** fix, by proof of possession at claim time.
 
