@@ -58,6 +58,10 @@ const ELECTRUM_URL: &str = "127.0.0.1:50001";
 const RGB_PROXY: &str = "rpc://127.0.0.1:3000/json-rpc";
 const NETWORK: &str = "regtest";
 const ISSUED: u64 = 1000;
+/// **THIS FIXTURE'S rate, not the protocol's.** The shipped committed rate is 3.0 since [D44]
+/// (`TesrParams::for_network`). This test builds its own tiers at 2.0 and checks them against 2.0,
+/// which is self-consistent and fine — but anything that must agree with a ladder the SDK built
+/// must read the rate from the preset instead (see `sdk58`/`sdk70`, which broke by mixing the two).
 const FEE_RATE: f64 = 2.0;
 const CSV_D: u16 = 36;
 /// The retired global `TOKEN_BLINDING`. Used ONLY by part E, as the negative control.

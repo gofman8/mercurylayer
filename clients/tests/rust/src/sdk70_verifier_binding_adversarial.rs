@@ -44,7 +44,15 @@ use mercuryrustlib::{
 use crate::sdk40_tesr_consensus::deposit_coin;
 
 const NETWORK: &str = "regtest";
-const FEE_RATE: f64 = 2.0;
+/// **[D44] The COIN's committed rate, read from the preset — not written down.**
+///
+/// Line 535 sizes a child off `x_m.out_value`, which belongs to a ladder the SDK built at the
+/// PRESET's rate. Writing 2.0 here made the two disagree the moment D44 moved the preset to 3.0, and
+/// the split's own conservation law refused the result: "child values sum to 98280 but must equal
+/// 98155". Anything that must agree with a preset-built ladder has to come from the preset.
+fn fee_rate() -> f64 {
+    mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate
+}
 
 async fn num_sigs(cc: &ClientConfig, sid: &str) -> Result<u32> {
     Ok(mercuryrustlib::utils::get_statechain_info(sid, cc).await?.ok_or(anyhow!("no info"))?.num_sigs)
@@ -223,7 +231,7 @@ pub async fn execute() -> Result<()> {
             &bundle.agg_address,
             NETWORK,
             csv_e,
-            FEE_RATE,
+            fee_rate(),
         )?;
         a.trigger = TesrTier {
             txid: t_txid,
@@ -276,7 +284,7 @@ pub async fn execute() -> Result<()> {
             &bundle.agg_address,
             NETWORK,
             bundle.current().extension.csv.ok_or(anyhow!("no ext csv"))?,
-            FEE_RATE,
+            fee_rate(),
         );
         match e {
             Err(mercurylib::error::MercuryError::FeeTooHigh) => {
@@ -532,7 +540,7 @@ pub async fn execute() -> Result<()> {
     let pbundle = mercuryrustlib::tesr::establish_auto(&cc, &mut parent, &parent_exit, NETWORK).await?;
 
     let x_m = pbundle.current().extension.clone();
-    let child_value = mercurylib::tesr::tier_out_total(x_m.out_value, 1, FEE_RATE)
+    let child_value = mercurylib::tesr::tier_out_total(x_m.out_value, 1, fee_rate())
         .ok_or(anyhow!("committed fee too high for one child"))?;
     let child_token = prepaid_token(&cc).await?;
     let child_addr = mercuryrustlib::deposit::get_deposit_bitcoin_address(

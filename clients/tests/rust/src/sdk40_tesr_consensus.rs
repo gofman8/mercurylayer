@@ -28,6 +28,10 @@ use mercuryrustlib::{client_config::ClientConfig, Coin, CoinStatus};
 use crate::{bitcoin_core, electrs};
 
 const NETWORK: &str = "regtest";
+/// **THIS FIXTURE'S rate, not the protocol's.** The shipped committed rate is 3.0 since [D44]
+/// (`TesrParams::for_network`). This test builds its own tiers at 2.0 and checks them against 2.0,
+/// which is self-consistent and fine — but anything that must agree with a ladder the SDK built
+/// must read the rate from the preset instead (see `sdk58`/`sdk70`, which broke by mixing the two).
 const FEE_RATE: f64 = 2.0;
 const COIN_SAT: u32 = 100_000;
 // Test-scale CSV constants (mainnet uses E0=720, D0=1440). Small so a full lifecycle mines fast.

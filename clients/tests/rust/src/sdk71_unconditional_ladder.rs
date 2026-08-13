@@ -460,19 +460,34 @@ pub async fn execute() -> Result<()> {
         .into_iter()
         .find(|c| c.statechain_id.as_deref() == Some(plain_sid.as_str()) && c.duplicate_index == 0)
         .ok_or(anyhow!("plain coin vanished"))?;
-    let other_vout = {
-        use electrum_client::ElectrumApi;
-        let txid_str = plain_coin.utxo_txid.clone().ok_or(anyhow!("plain coin has no funding txid"))?;
-        let txid: electrum_client::bitcoin::Txid = txid_str.parse()?;
-        let tx0 = cc.electrum_client.transaction_get(&txid)?;
-        let n = tx0.output.len() as u32;
-        if n < 2 {
-            return Err(anyhow!("the funding tx has a single output; cannot build the mismatch case"));
-        }
-        (plain_coin.utxo_vout.ok_or(anyhow!("plain coin has no vout"))? + 1) % n
+    // THE MISMATCH: an outpoint that is valid but is NOT THIS COIN'S.
+    //
+    // This used to bump the vout within the coin's own funding tx, which needed that tx to have a
+    // second output — i.e. it depended on bitcoind's coin selection happening to produce change. It
+    // does not always, and then the test aborted with "the funding tx has a single output; cannot
+    // build the mismatch case" — a SETUP failure wearing the costume of a result.
+    //
+    // Another coin's funding outpoint is a mismatch by construction, always available (this wallet
+    // has several coins by now), and closer to the real shape: the sender declares an outpoint that
+    // belongs to something else.
+    let mismatched = {
+        let others: Vec<_> = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk71_alice")
+            .await?
+            .coins
+            .into_iter()
+            .filter(|c| {
+                c.utxo_txid.is_some() && c.utxo_txid != plain_coin.utxo_txid
+            })
+            .collect();
+        let donor = others.first().ok_or(anyhow!(
+            "no second funded coin to borrow an outpoint from — this wallet should hold several by \
+             now; the mismatch case needs one outpoint that is not this coin's"
+        ))?;
+        let mut m = plain_coin.clone();
+        m.utxo_txid = donor.utxo_txid.clone();
+        m.utxo_vout = donor.utxo_vout;
+        m
     };
-    let mut mismatched = plain_coin.clone();
-    mismatched.utxo_vout = Some(other_vout);
     let err = mercuryrustlib::transfer_sender::assert_flat_conveyance_is_legitimate(
         &cc, "sdk71_alice", &plain_sid, &mismatched, "regtest",
     )

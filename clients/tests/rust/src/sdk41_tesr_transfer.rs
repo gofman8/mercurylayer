@@ -27,6 +27,10 @@ use crate::bitcoin_core;
 use crate::sdk40_tesr_consensus::{broadcast, deposit_coin, is_outpoint_spent, mine, tx_exists, wait_for_address};
 
 const NETWORK: &str = "regtest";
+/// **THIS FIXTURE'S rate, not the protocol's.** The shipped committed rate is 3.0 since [D44]
+/// (`TesrParams::for_network`). This test builds its own tiers at 2.0 and checks them against 2.0,
+/// which is self-consistent and fine — but anything that must agree with a ladder the SDK built
+/// must read the rate from the preset instead (see `sdk58`/`sdk70`, which broke by mixing the two).
 const FEE_RATE: f64 = 2.0;
 const CSV_E: u16 = 4;
 const CSV_D: u16 = 6;
