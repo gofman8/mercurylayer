@@ -6,16 +6,18 @@
 //! ("its ladder is not COLOURED"), and `withdraw` refuses it as a carrier. For a carrier that is
 //! merely WAITING for its ladder that is right — a later `claim()` colours it and it moves. For a
 //! carrier that can never be coloured it is a life sentence, and the largest class of those is every
-//! **pre-flip 1_500-sat token piece**: above the coloured CHILD floor (1_478, so a split carved it)
-//! and below the coloured ROOT floor (2_052, so its receiver can never ladder it). Raising
-//! `TOKEN_PIECE_SATS` to 3_054 protects new pieces; it does nothing for the ones in circulation.
+//! **pre-flip 1_500-sat token piece**: at the 2 sat/vB committed rate it sat above the coloured
+//! CHILD floor (1_478, so a split carved it) and below the coloured ROOT floor (2_052, so its
+//! receiver could never ladder it). [D44] raised the committed rate to 3 sat/vB and both floors with
+//! it (child 1_818, root 2_562), so 1_500 is now below BOTH — it cannot even be carved. Raising
+//! `TOKEN_PIECE_SATS` protects new pieces; it does nothing for the ones in circulation.
 //!
-//! This test starts from coins of exactly that shape — three carriers funded with **1_500 sats**,
-//! the legacy piece size — on a wallet with the flip ON, and proves they are neither stranded nor
-//! rescued by weakening anything.
+//! This test starts from coins of exactly that shape — [`N_CARRIERS`] carriers funded with
+//! **1_500 sats**, the legacy piece size — on a wallet with the flip ON, and proves they are neither
+//! stranded nor rescued by weakening anything.
 //!
-//! (a) THE TRAP IS REAL, MEASURED. Each carrier is strictly between the two coloured floors, both
-//!     read from `mercuryrustlib::tesr` rather than copied, and after repeated `claim()` passes NONE
+//! (a) THE TRAP IS REAL, MEASURED. Each carrier is below the coloured ROOT floor — read from
+//!     `mercuryrustlib::tesr` rather than copied — and after repeated `claim()` passes NONE
 //!     of them has a ladder row of any kind — `build_colored_ladder`'s pre-flight refuses them, and
 //!     it refuses on a comparison between two numbers neither side can ever move.
 //!
@@ -51,7 +53,7 @@
 //!     migration class — yet for four reproductions it could not be coloured. Size was the wrong
 //!     question for the whole class.
 //!
-//! (d) HONESTLY REFUSED, WITHOUT DESTROYING THE ALLOCATION. alice's 1_146-sat change carrier is
+//! (d) HONESTLY REFUSED, WITHOUT DESTROYING THE ALLOCATION. alice's 1_626-sat change carrier is
 //!     itself in the class. A named `unilateral_exit` on it used to return
 //!     `ExitStatus{complete:true}`; [D2] that was a false green, on two counts. `ExitStatus::complete`
 //!     is documented as "branch (if any) and backup both broadcast", and the backup is deliberately
@@ -75,6 +77,23 @@
 //!     ladder and is spent onward, assertion (c)), and the exit-everything default still excludes
 //!     every carrier including the one this test exits by name.
 //!
+//! # [D44] WHY FOUR CARRIERS AND NOT THREE — the escape bar, and what raising the rate cost
+//!
+//! The hatch pays out over `transfer_tokens_combine`, which carves the receiver a piece of the
+//! CURRENT [`PIECE`] size and leaves the sender the change. So escaping the legacy class costs
+//! `TOKEN_PIECE_SATS + fee_reserve + min_split_output` of AGGREGATED carrier value, and [D44] moved
+//! that bar from `3_066 + 300 + 666` = **4_032** to `4_074 + 300 + 666` = **5_040**. Three 1_500-sat
+//! carriers (4_500) cleared the old bar and do not clear the new one; four (6_000) do.
+//!
+//! That is a real cost of [D44] and it is stated rather than engineered away: a holder whose ENTIRE
+//! legacy holding sits between 4_032 and 5_040 sat could escape before the rate rise and cannot now.
+//! The alternative — sizing the hatch's payout down to the bare root floor so three carriers still
+//! fit — was rejected, because it hands the RECEIVER a piece with no rate head-room: if the
+//! committed rate moves between the send and bob's `claim()`, bob's piece is un-colourable and bob,
+//! who did nothing, inherits the stranding. The head-room exists precisely to survive that window,
+//! so the hatch pays a HEALTHY piece or it does not pay. What it costs to reach that bar is the
+//! number above.
+//!
 //! Run: SDK_E2E=78 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
 use std::str::FromStr;
@@ -92,6 +111,10 @@ use crate::bitcoin_core;
 const LEGACY_PIECE: u64 = 1_500;
 /// The piece a payment carves TODAY, from the SDK rather than copied.
 const PIECE: u64 = mercury_utexo_sdk::tokens::TOKEN_PIECE_SATS;
+/// How many legacy carriers alice starts with. Four, not three: see the escape-bar section of the
+/// module comment — `PIECE + reserve + min_split_output` is 5_040 at the [D44] rate, and three
+/// 1_500-sat carriers hold 4_500. This is the smallest count that can still pay.
+const N_CARRIERS: usize = 4;
 
 const SUPPLY: u64 = 100;
 const MINT: u64 = 100;
@@ -181,11 +204,24 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let (child_floor, root_floor) = floors();
 
-    // The premise of the whole test, stated before anything is built: 1_500 sits in the trap.
+    // The premise of the whole test, stated before anything is built: the legacy 1_500-sat piece
+    // cannot carry a coloured ROOT ladder, so its receiver could never ladder it.
+    //
+    // [D44] At the OLD 2.0 rate it sat strictly BETWEEN the two floors (child 1_482, root 2_058) and
+    // that gap was the stranding class. Raising the committed rate to 3.0 moved both floors up
+    // (child 1_818, root 2_562), so 1_500 is now below BOTH — it cannot even be CARVED as a coloured
+    // child. That is strictly worse for the legacy piece, not better, and the test says so rather
+    // than asserting a band the constant has fallen out of.
     assert!(
-        LEGACY_PIECE > child_floor && LEGACY_PIECE < root_floor,
-        "the legacy 1_500-sat piece must sit between the coloured CHILD floor ({child_floor}) and \
-         the coloured ROOT floor ({root_floor}) — that gap IS the stranding class"
+        LEGACY_PIECE < root_floor,
+        "the legacy 1_500-sat piece must be unable to carry a coloured ROOT ladder (floor \
+         {root_floor}) — that inability IS the stranding class this test is about"
+    );
+    assert!(
+        LEGACY_PIECE < child_floor,
+        "[D44] at the 3 sat/vB rate 1_500 no longer clears even the coloured CHILD floor \
+         ({child_floor}). If this ever flips back, the committed rate has been lowered and every \
+         floor in this test must be re-derived with it"
     );
     assert!(
         PIECE >= root_floor,
@@ -230,30 +266,38 @@ pub async fn execute() -> Result<()> {
 
     let core = bitcoin_core::getnewaddress()?;
     let rgb_fund = alice.get_token_funding_address().await?;
-    bitcoin_core::sendtoaddress(400_000, &rgb_fund)?;
+    // DERIVED, not a magic number. `issue_inflatable_token_sized` calls
+    // `create_utxos(inflation.len() + 2, TOKEN_CARRIER_SATS * 4, ..)` — one colourable UTXO per
+    // allocation plus a spare — and each on-chain mint needs room of its own. With [D53]'s fourth
+    // carrier the issuance alone wants 5 x 90_144 = 450_720 sat, which is why the old flat 400_000
+    // failed with rgb-lib's `Insufficient allocations` the moment N_CARRIERS went from 3 to 4. A
+    // literal here is a trap for the next person who changes the carrier count.
+    let rgb_funding =
+        (N_CARRIERS as u32 + 3) * mercury_utexo_sdk::tokens::TOKEN_CARRIER_SATS as u32 * 4;
+    bitcoin_core::sendtoaddress(rgb_funding, &rgb_fund)?;
     mine_synced(&cc, &core, 3)?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     println!(
-        "SDK78 - (1) setup done: alice/bob/carol up with colored_ladder=ON, 400000 sat funded to \
+        "SDK78 - (1) setup done: alice/bob/carol up with colored_ladder=ON, {rgb_funding} sat funded to \
          alice's RGB address, floors measured child {child_floor} < legacy {LEGACY_PIECE} < root \
          {root_floor} (today's piece {PIECE})"
     );
 
-    // ---- 1. THREE PRE-FLIP CARRIERS: 1_500 sats each, one asset. --------------------------------
+    // ---- 1. N_CARRIERS PRE-FLIP CARRIERS: 1_500 sats each, one asset. ---------------------------
     //
     // An IFA, because the class has to be reproduced on SEVERAL carriers of the SAME asset: a coin
     // below the root floor is below `TOKEN_PIECE_SATS + reserve` too, so a single-carrier split can
     // never fund a payment out of one — combining them is the only spend such coins have ever had,
     // before the flip as after it. `*_sized` is what makes a legacy-sized carrier constructible; the
     // default issuance path still funds at `TOKEN_CARRIER_SATS`.
-    add_tokens(&cc, &alice, 6).await?;
+    add_tokens(&cc, &alice, 2 * N_CARRIERS).await?;
     let asset_id = alice
         .issue_inflatable_token_sized(
             "ULEG",
             "Legacy Piece",
             0,
             SUPPLY,
-            vec![MINT, MINT],
+            vec![MINT; N_CARRIERS - 1],
             LEGACY_PIECE,
         )
         .await?;
@@ -273,7 +317,7 @@ pub async fn execute() -> Result<()> {
         })
     };
     let mut mint_res = Ok(());
-    for _ in 0..2 {
+    for _ in 0..N_CARRIERS - 1 {
         match alice.mint_tokens_sized(&asset_id, vec![MINT], LEGACY_PIECE).await {
             Ok((_, minted)) => assert_eq!(minted, MINT),
             Err(e) => {
@@ -286,9 +330,11 @@ pub async fn execute() -> Result<()> {
     let _ = miner.join();
     mint_res?;
     mine_synced(&cc, &core, 2)?;
+    let all_units = SUPPLY + (N_CARRIERS as u64 - 1) * MINT;
     println!(
-        "SDK78 - (1) two on-chain mints of {MINT} each settled onto {LEGACY_PIECE}-sat carriers \
-         (background miner stopped); polling up to 90 claim passes for three confirmed carriers"
+        "SDK78 - (1) {} on-chain mints of {MINT} each settled onto {LEGACY_PIECE}-sat carriers \
+         (background miner stopped); polling up to 90 claim passes for {N_CARRIERS} confirmed carriers",
+        N_CARRIERS - 1
     );
 
     let mut legacy_sids: Vec<String> = Vec::new();
@@ -296,33 +342,31 @@ pub async fn execute() -> Result<()> {
         mine_synced(&cc, &core, 1)?;
         alice.claim().await?;
         legacy_sids = coins_of_size(&cc, "sdk78_alice", LEGACY_PIECE).await?;
-        if legacy_sids.len() >= 3 && token_balance(&alice, &asset_id).await? == SUPPLY + 2 * MINT {
+        if legacy_sids.len() >= N_CARRIERS && token_balance(&alice, &asset_id).await? == all_units {
             break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     assert_eq!(
         legacy_sids.len(),
-        3,
-        "three {LEGACY_PIECE}-sat carriers must have confirmed (found {legacy_sids:?})"
+        N_CARRIERS,
+        "{N_CARRIERS} {LEGACY_PIECE}-sat carriers must have confirmed (found {legacy_sids:?})"
     );
     assert_eq!(
         token_balance(&alice, &asset_id).await?,
-        SUPPLY + 2 * MINT,
-        "all {} units must be settled across the three legacy carriers",
-        SUPPLY + 2 * MINT
+        all_units,
+        "all {all_units} units must be settled across the {N_CARRIERS} legacy carriers"
     );
     println!(
-        "SDK78 - (1) three {LEGACY_PIECE}-sat carriers CONFIRMED {legacy_sids:?} holding all {} \
-         units of {asset_id}",
-        SUPPLY + 2 * MINT
+        "SDK78 - (1) {N_CARRIERS} {LEGACY_PIECE}-sat carriers CONFIRMED {legacy_sids:?} holding all \
+         {all_units} units of {asset_id}"
     );
 
     // ---- 2. (a) THE TRAP, MEASURED: not one of them can ever be coloured. -----------------------
     //
     // Ten further claim passes, so "no ladder" is a refusal rather than a race. The refusal is
-    // `build_colored_ladder`'s pre-flight and it is arithmetic: 1_500 < 2_052 at the PROTOCOL
-    // committed fee rate, and neither number can move.
+    // `build_colored_ladder`'s pre-flight and it is arithmetic: 1_500 is below the coloured ROOT
+    // floor at the PROTOCOL committed fee rate, and neither number can move.
     for _ in 0..10 {
         alice.claim().await?;
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -337,24 +381,25 @@ pub async fn execute() -> Result<()> {
         );
     }
     println!(
-        "SDK78 - (a) three {LEGACY_PIECE}-sat carriers, all in the trap: child floor {child_floor} \
-         < {LEGACY_PIECE} < root floor {root_floor}, and none of them has any ladder row after 10 \
-         claim passes"
+        "SDK78 - (a) {N_CARRIERS} {LEGACY_PIECE}-sat carriers, all in the trap: {LEGACY_PIECE} is \
+         below the child floor {child_floor} and the root floor {root_floor}, and none of them has \
+         any ladder row after 10 claim passes"
     );
 
-    // ---- 3. (b) SPENDABLE: the migration hatch pays 250 across all three. ------------------------
+    // ---- 3. (b) SPENDABLE: the migration hatch pays 250 across all of them. ---------------------
     //
     // No single carrier holds 250, so this is the COMBINE route — one `create_colored_combine_tx`
-    // spending all three funding outputs. With the flip on that route is the retired lane, and the
+    // spending every funding output. With the flip on that route is the retired lane, and the
     // ONLY reason it runs is that every input is permanently below the root floor and holds no
     // ladder, i.e. no trigger exists or can ever exist to rival the spend.
     add_tokens(&cc, &bob, 3).await?;
     let bob_bg = bob.start_background();
     let out = alice.transfer_tokens(&asset_id, &bob_address, PAY).await.map_err(|e| {
         anyhow!(
-            "the flip STRANDED the legacy carriers: paying {PAY} of {asset_id} across three \
-             {LEGACY_PIECE}-sat carriers was refused ({e}). Every carrier must retain at least one \
-             safe way out."
+            "the flip STRANDED the legacy carriers: paying {PAY} of {asset_id} across \
+             {N_CARRIERS} {LEGACY_PIECE}-sat carriers was refused ({e}). Every carrier must retain \
+             at least one safe way out. If the refusal is about SATS, the escape bar moved: it is \
+             `PIECE ({PIECE}) + reserve + min_split_output`, see the module comment."
         )
     })?;
     assert!(out.used_split, "a combine pays over a split, not a whole-coin handover");
@@ -364,9 +409,9 @@ pub async fn execute() -> Result<()> {
         "the piece the hatch pays out must carry the CURRENT piece size"
     );
     println!(
-        "SDK78 - (b) migration hatch COMBINE returned: {PAY} of {asset_id} sent to bob over three \
-         {LEGACY_PIECE}-sat inputs, used_split={}, piece {piece_sid} at {} sat; polling up to 90 \
-         claim passes for bob to book it",
+        "SDK78 - (b) migration hatch COMBINE returned: {PAY} of {asset_id} sent to bob over \
+         {N_CARRIERS} {LEGACY_PIECE}-sat inputs, used_split={}, piece {piece_sid} at {} sat; polling \
+         up to 90 claim passes for bob to book it",
         out.used_split, out.coins[0].amount_sats
     );
 
@@ -384,16 +429,18 @@ pub async fn execute() -> Result<()> {
     );
     assert_eq!(
         token_balance(&alice, &asset_id).await?,
-        SUPPLY + 2 * MINT - PAY,
+        all_units - PAY,
         "alice keeps the token change"
     );
     println!(
-        "SDK78 - (b) SPENDABLE: {PAY} of {asset_id} paid to bob across all three legacy carriers \
-         through the migration hatch; piece {piece_sid} carries {PIECE} sat"
+        "SDK78 - (b) SPENDABLE: {PAY} of {asset_id} paid to bob across all {N_CARRIERS} legacy \
+         carriers through the migration hatch; piece {piece_sid} carries {PIECE} sat"
     );
 
     // ---- 4. alice's change is ITSELF in the class, and that is the coin to exit. ----------------
-    let change_sats = 3 * LEGACY_PIECE - PIECE - 300; // combine reserve floors at 300 for this size
+    // The combine's own arithmetic, re-derived here rather than pinned: piece + reserve out of the
+    // aggregate, and the reserve floors at 300 for carriers this size.
+    let change_sats = N_CARRIERS as u64 * LEGACY_PIECE - PIECE - 300;
     let change_sid = coins_of_size(&cc, "sdk78_alice", change_sats)
         .await?
         .into_iter()
@@ -512,7 +559,7 @@ pub async fn execute() -> Result<()> {
 
     // THE SURVIVAL PROOF, and it is the read-only stock probe, never a balance (E7 measured
     // `get_asset_balance` reporting a full settled balance over a stock at zero).
-    let change_units = SUPPLY + 2 * MINT - PAY;
+    let change_units = all_units - PAY;
     let mut probe = alice.probe_carrier_funding(&change_sid, &asset_id, change_units).await;
     for _ in 0..20 {
         if probe.is_ok() {
@@ -637,7 +684,7 @@ pub async fn execute() -> Result<()> {
     // (c.2) THE SPEND, and this is the assertion that replaced the one that could not fail. bob
     // conveys the piece he was PAID onward to carol — a real transfer of a real allocation out of
     // the receiver's wallet — and carol books all of it. Nothing here is bob's own issuance: every
-    // unit came out of the three 1_500-sat legacy carriers, through the migration hatch, through
+    // unit came out of the four 1_500-sat legacy carriers, through the migration hatch, through
     // the legacy receive path, and out the other side.
     let carol_address = carol.get_utexo_address().await?;
     let before = tip(&cc)?;
@@ -704,7 +751,7 @@ pub async fn execute() -> Result<()> {
     );
 
     println!(
-        "SDK78 - PASS: with the flip ON, three PRE-FLIP {LEGACY_PIECE}-sat carriers were (a) proved \
+        "SDK78 - PASS: with the flip ON, {N_CARRIERS} PRE-FLIP {LEGACY_PIECE}-sat carriers were (a) proved \
          un-colourable, (b) SPENT across the migration hatch, (d) the residue REFUSED an exit it \
          cannot perform and then MATERIALISED over the route that refusal names, with the \
          allocation intact and the plain sweep never broadcast, and (c) the piece paid out was \

@@ -1,5 +1,15 @@
 # SPEC-ROADMAP — what must be true before a normative Utexo specification can be written
 
+> ⚠️ **[D53] CORRECTION, 2026-08-14 — the depth cap in this document is STALE.**
+> Every statement here of `max_split_depth = 10` / **23 transactions** (mainnet) or
+> `max_split_depth = 68` / **139 transactions** (regtest) was measured against the BARE latency rule
+> `exit_wait_blocks <= epoch`. The rule a conveyed child is actually ADMITTED by adds
+> `exit_slack_margin`, so the shipped caps are **depth 8 / 19 transactions** (mainnet) and
+> **depth 54 / 111 transactions** (regtest). Depths 9 and 10 were unadoptable at every tip. The
+> 9 383-block / 65.2-day figure remains correct as the WAIT of a depth-10 walk — it is not the cap.
+> Read `DECISIONS.md` D53 before carrying any depth figure from this document into the spec.
+
+
 > **TIMELINE RE-COST 2026-08-11 — `COLOURED-SPINE-REANCHOR-SCOPE.md` §4.1.**
 >
 > **11–21 engineer-weeks** of build (was 19–27), **12–22 weeks to a full v1 draft** (was 20–27).

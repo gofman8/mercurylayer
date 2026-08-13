@@ -489,8 +489,27 @@ impl UtexoWallet {
     /// Severing costs the coin its off-chain life and starts the CSV walk. That is a real cost, and
     /// it is paid only when the alternative is losing the coin outright.
     ///
-    /// Returns `(re_anchored, severed)`. Carriers are excluded on both routes — a plain re-anchor
-    /// and a plain trigger both destroy an RGB allocation; their protection is `auto_exit_due`.
+    /// Returns `(re_anchored, severed)`. Carriers are excluded from the COOPERATIVE route — a plain
+    /// re-anchor destroys an RGB allocation — but [D46] includes them in the UNILATERAL one, where
+    /// the pre-signed `T` carries the coin's own state instead of re-aggregating it.
+    ///
+    /// # `Ok` means DEFENDED, and only the coloured lane can be [D51]
+    ///
+    /// The unilateral route runs through `unilateral_exit`, which refuses a carrier whose ladder is
+    /// not COLOURED — and `SdkConfig::colored_ladder` **ships false** ([D30]), so on the default
+    /// configuration that is EVERY carrier. The refusal used to land on a `_ => continue` and the
+    /// pass returned a clean `Ok` over a coin it had not defended, while the operator line above
+    /// promised those same coins "will be SEVERED". That is the silent-degradation shape this repo
+    /// has been bitten by three times: **the failure looked like idle**.
+    ///
+    /// So a coin this pass could not defend is now reported three ways — an `ExitDeadlineApproaching`
+    /// event, a named stdout line, and an `Err` return carrying the whole list. The work is still
+    /// done first (the other coins' deadlines are time-critical and must not be cancelled by one
+    /// undefendable carrier), exactly as `unilateral_exit`'s own `blind` list does it; the counts of
+    /// what WAS saved travel in the error text so nothing is lost by the `Err`.
+    ///
+    /// This does not give the flat carrier lane a remedy — there is none, and inventing one is what
+    /// CTES-R is for. It stops the wallet from claiming it has one.
     pub async fn deadline_safety_due(
         &self,
         margin_blocks: u32,
@@ -546,24 +565,68 @@ impl UtexoWallet {
             .filter(|c| coin_near_final(c, tip, margin_blocks))
             .count();
         if carrier_count > 0 {
+            // [D51] "will be SEVERED" is a PREDICTION, and it was wrong for every carrier on the
+            // shipped default config. Say what will be ATTEMPTED; the outcome is reported per coin
+            // below, where it is known rather than assumed.
             println!(
                 "deadline safety: {carrier_count} token carrier(s) within {margin_blocks} blocks of \
-                 their floor will be SEVERED (pre-signed T), not re-anchored — a plain re-anchor \
-                 would destroy the allocation"
+                 their floor will be offered the SEVER route (pre-signed T), never a re-anchor — a \
+                 plain re-anchor would destroy the allocation. A carrier whose ladder is not \
+                 COLOURED has no sever to offer and will be reported UNDEFENDED below"
             );
         }
+        // The near-final coin's own deadline height, for the event emitted when it cannot be
+        // defended. Read before `record` is dropped.
+        let due_locktime: std::collections::HashMap<String, u32> = record
+            .coins
+            .iter()
+            .filter_map(|c| Some((c.statechain_id.clone()?, c.locktime?)))
+            .collect();
         drop(record);
 
         let mut severed = Vec::new();
+        // [D51] Coins this pass could NOT defend. Collected rather than propagated immediately —
+        // same contract as `unilateral_exit`'s `blind` list: the OTHER coins' deadlines are
+        // time-critical and must not be cancelled by one undefendable carrier. But the pass must not
+        // return `Ok` either, because `Ok` here is read as "this wallet is protected".
+        let mut undefended: Vec<String> = Vec::new();
         for id in still_due {
             // `unilateral_exit` broadcasts the trigger when `F` is still unspent, which IS the sever,
             // and then walks whatever has matured. It is idempotent per block.
             match self.unilateral_exit(Some(vec![id.clone()]), None).await {
                 Ok(statuses) if !statuses.is_empty() => severed.push(id),
-                // A coin that cannot be severed either is genuinely stuck; the fault surfaces through
-                // the watchtower channel rather than aborting the pass over one coin.
-                _ => continue,
+                // [D51] Both of the remaining arms used to be one `_ => continue`. They are the
+                // failure, not the absence of one: this coin is inside `margin_blocks` of its floor
+                // and the pass just failed to move it.
+                Ok(_) => undefended.push(format!(
+                    "{id} (the unilateral route reported no exit status at all — it neither severed \
+                     nor said why)"
+                )),
+                Err(e) => undefended.push(format!("{id} ({e})")),
             }
+        }
+        if !undefended.is_empty() {
+            for entry in undefended.iter() {
+                let id = entry.split_whitespace().next().unwrap_or(entry).to_string();
+                println!("deadline safety: UNDEFENDED — {entry}");
+                let _ = self.inner.events_tx.send(WalletEvent::ExitDeadlineApproaching {
+                    deadline_block: due_locktime.get(&id).copied().unwrap_or(tip),
+                    statechain_id: id,
+                    tip,
+                });
+            }
+            return Err(anyhow!(
+                "deadline safety: {} coin(s) are within {margin_blocks} blocks of their floor and \
+                 this pass could NOT defend them (it DID re-anchor {} and sever {} others, which \
+                 stand). The commonest cause is a token carrier whose ladder is not COLOURED — \
+                 `SdkConfig::colored_ladder` ships false, and a plain trigger would destroy the \
+                 allocation, so no sever exists for it. Returning Err rather than Ok because Ok from \
+                 this pass is read as \"this wallet is protected\":\n  {}",
+                undefended.len(),
+                re_anchored.len(),
+                severed.len(),
+                undefended.join("\n  ")
+            ));
         }
         Ok((re_anchored, severed))
     }

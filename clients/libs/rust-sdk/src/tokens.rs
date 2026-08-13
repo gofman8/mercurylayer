@@ -58,9 +58,18 @@ use crate::wallet::UtexoWallet;
 ///
 /// **[D44] Raised 2.0 → 3.0 on 2026-08-13.** At 2.0 the defence was frozen below plausible mainnet
 /// floors, so every tier depended on the anchor and on somebody funding a bump. The cost is that
-/// every floor derived from this rate moves with it — `min_child_value` 1,310 → 1,610 — which
-/// re-prices pieces already in circulation. A piece minted under the old floor and now below the new
-/// one is not lost; it can no longer fund its own tiers and must be rescued by `combine`.
+/// every floor derived from this rate moves with it — `min_child_value` 1,310 → **1,560**
+/// (`(ceil(125·3) + 240)·2 + 330`) — which re-prices pieces already in circulation. A piece minted
+/// under the old floor and now below the new one cannot fund its own tiers.
+///
+/// **[D50] What that costs the pieces already in circulation, measured rather than asserted.** Such
+/// a piece is rescued by `combine`, which is the migration hatch's payout route — but `combine` has
+/// a bar of its own and this rate raised THAT too: it carves the receiver a full
+/// [`TOKEN_PIECE_SATS`], so escaping costs `TOKEN_PIECE_SATS + fee_reserve + min_split_output` of
+/// AGGREGATED carrier value, which moved from 4_032 to **5_040**. A holder whose entire legacy
+/// holding sits between those two numbers could escape before this change and cannot now. That is
+/// the real price of the raise; `SDK_E2E=78` is where it is measured, and its module comment argues
+/// why the hatch pays a piece WITH head-room rather than sizing the payout down to fit.
 #[allow(dead_code)] // read by the derivation tests below; the constant IS the documentation
 pub(crate) const TIER_COMMITTED_FEE_RATE: f64 = 3.0;
 
@@ -80,23 +89,25 @@ pub(crate) const PIECE_FEE_RATE_HEADROOM: f64 = 2.0;
 /// `colored_committed_fee(1, rate) + P2A_VALUE` = `ceil(rgb::colored_tier_vbytes(1) * rate) + 240`,
 /// which is dearer than a plain rung by the opret's `P2TR_OUT_VBYTES * rate` PLUS the 1 vB of the
 /// explicit `SIGHASH_ALL` byte ([D4]). So, at the protocol committed rate of
-/// [`TIER_COMMITTED_FEE_RATE`] = 2 sat/vB:
+/// [`TIER_COMMITTED_FEE_RATE`] = 3 sat/vB ([D44]; a coloured rung is `ceil(168·3) + 240` = 744):
 ///
 /// | floor | tiers | value |
 /// |---|---|---|
-/// | coloured ROOT ladder (`tesr::colored_ladder_floor`) | `T`, `X_0`, `S_0` | `3·576 + 330` = **2_058** |
-/// | coloured CHILD ladder (`tesr::colored_child_floor`) | `ext_child`, `state_child` | `2·576 + 330` = **1_482** |
+/// | coloured ROOT ladder (`tesr::colored_ladder_floor`) | `T`, `X_0`, `S_0` | `3·744 + 330` = **2_562** |
+/// | coloured CHILD ladder (`tesr::colored_child_floor`) | `ext_child`, `state_child` | `2·744 + 330` = **1_818** |
 ///
-/// The legacy value was **1_500**, which sits between the two — and that gap was a trap, not a
-/// margin. A 1_500-sat piece clears the CHILD floor, so a coloured in-ladder split will happily
-/// carve one; it does NOT clear the ROOT floor, so the moment its receiver claims it as a coin of
-/// its own the colouring is refused and the piece falls back to the flat lane. Retiring the flat
-/// lane with `TOKEN_PIECE_SATS = 1_500` would therefore strand every received piece.
+/// The legacy value was **1_500**. At the OLD 2 sat/vB rate it sat BETWEEN the two floors (child
+/// 1_482, root 2_058), and that gap was a trap, not a margin: a 1_500-sat piece cleared the CHILD
+/// floor, so a coloured in-ladder split would happily carve one, but it did not clear the ROOT
+/// floor, so the moment its receiver claimed it as a coin of its own the colouring was refused and
+/// the piece fell back to the flat lane. [D44] moved BOTH floors above it, so 1_500 no longer clears
+/// even the child floor — it cannot be carved at all. Either way, retiring the flat lane with
+/// `TOKEN_PIECE_SATS = 1_500` would strand every received piece.
 ///
 /// The value below is the coloured ROOT floor computed at
-/// `TIER_COMMITTED_FEE_RATE * PIECE_FEE_RATE_HEADROOM` = 4 sat/vB:
-/// `3 · (ceil(168 · 4.0) + 240) + 330` = `3 · (672 + 240) + 330` = **3_066**.
-/// It clears the coloured root floor at 2 sat/vB with 1_008 sat of head-room, and still clears it
+/// `TIER_COMMITTED_FEE_RATE * PIECE_FEE_RATE_HEADROOM` = 6 sat/vB:
+/// `3 · (ceil(168 · 6.0) + 240) + 330` = `3 · (1_008 + 240) + 330` = **4_074**.
+/// It clears the coloured root floor at 3 sat/vB with 1_512 sat of head-room, and still clears it
 /// exactly if the committed rate ever doubles.
 ///
 /// **[D4] moved this number 3_054 → 3_066.** The coloured tier's true signed vsize is 168 vB, not
@@ -204,30 +215,42 @@ pub(crate) fn ctesr_carrier_sats(send_depth: u64, fee_rate: f64) -> u64 {
 /// above from the REAL coloured sizing functions and fails if either lane outgrows this constant.
 pub const TOKEN_CARRIER_SATS: u64 = legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH);
 
-/// **[K>1] COLOURED K > 1 IS REFUSED BY NAME. The plain lane only.**
+/// **[K>1] COLOURED K > 1 IS REFUSED BY NAME — on the CTES-R lane, because ITS hand-overs cannot be
+/// resumed.**
 ///
-/// One `SP` may carry K payee payloads on the PLAIN lane. On the COLOURED lane it may not, and the
-/// reason is not that the builder cannot do it — [`mercuryrustlib::tesr::build_colored_in_ladder_split`]
-/// is already N-ary. It is that a coloured `SP`'s K payloads share ONE seal blinding.
+/// One `SP` may carry K payee payloads on the PLAIN lane. On the CTES-R COLOURED lane it may not,
+/// and the reason is not that the builder cannot do it — [`mercuryrustlib::tesr::build_colored_in_ladder_split`]
+/// is already N-ary.
 ///
-/// `mercuryrustlib::rgb::build_colored_tier` derives a single `let blinding = seal.blinding()`
-/// (`clients/libs/rust/src/rgb.rs:1245`) and passes it once for an `output_map` covering every
-/// payload; `mercuryrustlib::tesr::colored_tier_seal` takes the parent statechain id, the role, `m`
-/// and the CSV — nothing child-specific. A concealed seal commits to `(method, txid, vout, blinding)`,
-/// so a payee who holds their own piece knows `B`, knows the witness txid, and can enumerate the
-/// vouts: **K tries de-conceal every sibling seal in the batch**.
+/// # [D52] Read the reason below, not the one this comment used to give
 ///
-/// At K = 1 that leaks the sender's own change seal to the one payee already transacting with them —
-/// a cost this lane has always paid and §4.5 accepts. At K > 1 it makes mutually unrelated payees and
-/// their exact allocations linkable to each other, which is not a cost anybody agreed to and cannot
-/// be undone once the consignment is out. It is not theft — a seal is not spendable without the key —
-/// but concealment across a coloured batch is worth **zero bits**, and a privacy property that is
-/// silently zero is worse than one that is absent.
+/// This comment argued the refusal from SEAL PRIVACY: one blinding covering K payloads, so a payee
+/// could enumerate the vouts and de-conceal every sibling seal. **That gate is CLOSED** — every
+/// payload output now gets its own blinding (`AssetColoringInfo::output_blinding`, rgb-lib
+/// `ae8439e`), as the refusal's own message has said since it landed. The prose was left behind and
+/// for a while it was the only rationale a reader saw.
 ///
-/// The fix is per-output blinding (§4.5 item 3), which is a change to the coloured tier builder, its
-/// seal derivation and the receiver's resolution — a separate commit with its own anti-collision
-/// argument (rival tiers over one outpoint must not share a blinding or their `BundleId`s collapse).
-/// Until it lands the capability is refused rather than shipped un-private.
+/// It is not a harmless staleness. Read as the reason, it makes the refusal look like a property of
+/// SHARED BLINDING — and the legacy lane's `create_colored_split_tx` also takes a single
+/// `blinding: u64` for an `output_map` covering every payee, so the "consistent" conclusion is to
+/// refuse K > 1 there too. That conclusion is wrong and it deletes a working, live capability
+/// (`SDK_E2E=9`) on the DEFAULT config.
+///
+/// # The reason that actually holds
+///
+/// The CTES-R lane conveys its pieces SERIALLY, after the carrier is already terminal — one
+/// `convey_child_bundle` per payee, each `?` — and it journals no `recipient_address`. A failure at
+/// payee j therefore aborts with pieces j..K never handed over, the resume driver reports those legs
+/// unactionable rather than re-conveying them, and the sender is left holding those slots' keys with
+/// no route to the recipients. The value is stranded permanently, after the carrier has been spent.
+///
+/// The legacy lane does NOT share this: [`BatchPiece`] journals `recipient`, `addr` and a per-piece
+/// completion flag at the F7 commit point BEFORE any hand-over, so `recover_structural_spends`
+/// re-conveys exactly the legs that did not land. Same shared blinding, different failure mode — and
+/// the failure mode is what the refusal is about.
+///
+/// The fix for the CTES-R lane is therefore idempotent conveyance (journal `recipient_address`, make
+/// `convey_child_bundle` resumable), NOT per-output blinding, which has already landed.
 ///
 /// ⚠️ **This removes a capability, and there is no fallback within one carrier.** A coloured carrier
 /// is split exactly once (`SP` terminalizes it, and the change is a depth-1 coloured child no guard
@@ -5538,6 +5561,20 @@ impl UtexoWallet {
         }
         // Everything below is the RETIRED lane: one `create_colored_split_tx` over the carrier's
         // funding output `F`. Gated as a whole, then still interlocked per coin.
+        //
+        // **[D52] K > 1 IS NOT REFUSED HERE, and that is deliberate — this lane does not have the
+        // defect.** [`refuse_colored_multi_payee`] guards the CTES-R lane because its N hand-overs
+        // are SERIAL, run after the carrier is already terminal, and journal no `recipient_address`:
+        // a failure at payee j strands pieces j..K with the sender holding their keys and no route
+        // to the recipients. This lane's hand-overs are journalled per piece — [`BatchPiece`] holds
+        // `recipient`, `addr` and a per-piece completion flag, written at the F7 COMMIT POINT below
+        // BEFORE any hand-over — so `recover_structural_spends` re-conveys exactly the legs that did
+        // not land. The stranding the refusal exists to prevent cannot happen here.
+        //
+        // Do not "make the lanes consistent" by adding the refusal: it would delete a working
+        // capability (a live 2-payee batch, `SDK_E2E=9`) on the DEFAULT config, since
+        // `SdkConfig::colored_ladder` ships false ([D30]) and this is the lane a default wallet
+        // takes. Consistency is owed to the MECHANISM, and the mechanisms differ.
         self.refuse_legacy_colored_split_lane(
             "an N-recipient batch",
             std::slice::from_ref(&carrier),

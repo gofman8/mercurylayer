@@ -21,7 +21,25 @@ unfinished.
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **12 landed** (all six Tier A, plus B.1–B.5 and B.7 — six of the eight Tier B). The other two are RESOLVED but not built: B.8 is **NOT A DEFECT** — the census already refuses head truncation (D49, superseding D41) and B.6 is **demoted to an optimisation** by D45's measurement. |
 | Live E2E suite | **88/88.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
-| Unit + guard suite | green — **756 tests, 0 failures** |
+| Unit + guard suite | green — **722 tests, 0 failures**, measured 2026-08-14 |
+
+> **The 756 in this row was never verifiable.** When it was written `cargo test -p mercuryrustlib
+> --lib` did not COMPILE (a `cfg(test)` constructor missing `ladder_census_refusal`), and that is
+> the largest crate in the count — so the number could not have been produced by running the
+> suite. `cargo build -p mercuryrustlib` succeeded and the E2E dispatcher is a `cargo run`
+> binary, so the live suite stayed green over it. The compile break is fixed and the count below
+> is measured, per crate, on 2026-08-14:
+>
+> | crate | tests |
+> |---|---|
+> | `mercuryrustlib --lib` | 377 |
+> | `mercury-utexo-sdk --lib` | 152 |
+> | `mercurylib --lib` | 111 |
+> | `ci-guards` | 82 |
+> | **total** | **722** |
+>
+> Stage 0's own header — *"nothing downstream is trustworthy until these run"* — applied to this
+> row, and it was the row asserting they had.
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature

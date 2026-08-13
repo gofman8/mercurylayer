@@ -1,5 +1,15 @@
 # Sub-economic finality — the sender's free option over a piece too small to defend
 
+> ⚠️ **[D53] CORRECTION, 2026-08-14 — the depth cap in this document is STALE.**
+> Every statement here of `max_split_depth = 10` / **23 transactions** (mainnet) or
+> `max_split_depth = 68` / **139 transactions** (regtest) was measured against the BARE latency rule
+> `exit_wait_blocks <= epoch`. The rule a conveyed child is actually ADMITTED by adds
+> `exit_slack_margin`, so the shipped caps are **depth 8 / 19 transactions** (mainnet) and
+> **depth 54 / 111 transactions** (regtest). Depths 9 and 10 were unadoptable at every tip. The
+> 9 383-block / 65.2-day figure remains correct as the WAIT of a depth-10 walk — it is not the cap.
+> Read `DECISIONS.md` D53 before carrying any depth figure from this document into the spec.
+
+
 > **Status:** normative finding, re-verified at `feat/spark` `a0c19fb`. The gap is live. Section 6
 > ranks what to build.
 >

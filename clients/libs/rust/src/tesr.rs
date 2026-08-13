@@ -6797,7 +6797,24 @@ fn split_cap_decision(
     let exit_txs = parent_exit_tiers + level_tiers + 2;
     enforce_exit_chain_length("in-ladder split", exit_txs, p, epoch_blocks)?;
 
-    let required = mercurylib::transfer::receiver::exit_wait_blocks(&chain);
+    // ═══ [D53] THE SAME RULE THE RECEIVER ADMITS BY, MARGIN INCLUDED ═══
+    //
+    // This used to compare the BARE `exit_wait_blocks(&chain)` against the epoch while the receiver's
+    // admission gate — `verify_conveyed_child` → `check_exit_headroom_with_margin`, [D40.3] — adds
+    // `exit_slack_margin`. A build side more permissive than the receive side is not a loose check:
+    // it MINTS CHILDREN NO RECEIVER WILL ADOPT, after the parent has been terminalized and the piece
+    // booked away. `enforce_split_depth_cap_shaped`'s own doc named that harm; the arithmetic did not
+    // honour it.
+    //
+    // On the mainnet schedule the bare rule admitted depth 9 (8 661 ≤ 10 000) and depth 10
+    // (9 383 ≤ 10 000). With the margin those need 10 826 and 11 728 blocks of headroom, and the
+    // receiver's `available = epoch_expiry_height - tip` can never exceed `initlock` = 10 000 — so
+    // both were UNADOPTABLE AT EVERY TIP, and the build side signed them off.
+    //
+    // `the_build_side_never_admits_what_the_receive_side_refuses` in `lib` pins the two rules
+    // together so they cannot drift apart again.
+    let margin = mercurylib::transfer::receiver::exit_slack_margin(&chain);
+    let required = mercurylib::transfer::receiver::exit_wait_blocks(&chain) + margin;
     if required <= epoch_blocks {
         return Ok(());
     }
@@ -21491,7 +21508,9 @@ mod dust_poisoned_tier_attack_tests {
 mod exit_chain_length_cap_tests {
     use super::*;
     use mercurylib::tesr::TesrParams;
-    use mercurylib::transfer::receiver::{check_exit_headroom, exit_wait_blocks, max_split_depth};
+    use mercurylib::transfer::receiver::{
+        check_exit_headroom, check_exit_headroom_with_margin, exit_wait_blocks, max_split_depth,
+    };
 
     /// Deployed epoch lengths. Mainnet is `server_config.rs`'s default; regtest is `Settings.toml`.
     const MAINNET_EPOCH: u32 = 10_000;
@@ -21550,7 +21569,14 @@ mod exit_chain_length_cap_tests {
             .to_string();
         assert!(e.contains("exit-chain length cap"), "must refuse by name, got: {e}");
         assert!(e.contains("7120"), "the refusal must state the measured length, got: {e}");
-        assert!(e.contains("23"), "…and the cap it broke, got: {e}");
+        // [D53] The cap is COMPUTED, never restated: it moved 23 -> 19 when the build side started
+        // admitting by the same margin the receiver does, and a literal here would have gone stale
+        // silently — which is exactly how the 23 got published in four documents.
+        let live_cap = cap(p, MAINNET_EPOCH);
+        assert!(
+            e.contains(&live_cap.to_string()),
+            "…and the cap it broke ({live_cap}), got: {e}"
+        );
     }
 
     /// The same attack expressed as a real `ChildTesrBundle` walking the ADMISSION lane's own
@@ -21574,11 +21600,14 @@ mod exit_chain_length_cap_tests {
 
         // The length cap does not.
         let p = TesrParams::regtest();
-        assert_eq!(cap(p, REGTEST_EPOCH), 139);
+        // [D53] 139 -> 111: the build side now admits by the receiver's margin, so the cap is the
+        // depth that survives `check_exit_headroom_with_margin`, not the bare wait.
+        let live_cap = cap(p, REGTEST_EPOCH);
+        assert_eq!(live_cap, 111, "[D53] regtest caps at 3 + 2·54 transactions");
         let e = enforce_exit_chain_length("conveyed child", chain.len(), p, REGTEST_EPOCH)
             .expect_err("a 905-transaction child exit walk must be refused at admission")
             .to_string();
-        assert!(e.contains("905") && e.contains("139"), "got: {e}");
+        assert!(e.contains("905") && e.contains(&live_cap.to_string()), "got: {e}");
     }
 
     /// The BUILD side refuses the same shape before it is minted — measured the way
@@ -21589,13 +21618,19 @@ mod exit_chain_length_cap_tests {
         let p = TesrParams::mainnet();
         let build_txs = |spine_levels: usize| 3 + spine_levels + 2;
 
-        // Batch 19 mints a leaf under 18 spine ancestors plus this batch's own: 23 transactions.
-        assert_eq!(build_txs(19), 24);
-        enforce_exit_chain_length("in-ladder split", build_txs(18), p, MAINNET_EPOCH)
-            .expect("batch 19's leaf is exactly 23 transactions and must still be buildable");
-        let e = enforce_exit_chain_length("in-ladder split", build_txs(19), p, MAINNET_EPOCH)
-            .expect_err("batch 20's leaf is 24 transactions and must be refused BEFORE minting")
-            .to_string();
+        // [D53] The boundary is DERIVED from the live cap rather than written down, so it tracks the
+        // schedule instead of going stale with it. At the shipped cap of 19 transactions the last
+        // buildable batch is 15 (its leaf sits under 14 spine ancestors plus its own).
+        let live_cap = cap(p, MAINNET_EPOCH);
+        let last_ok = live_cap - 5; // spine levels whose leaf is exactly `live_cap` transactions
+        assert_eq!(build_txs(last_ok as usize), live_cap as usize);
+        assert_eq!(build_txs(last_ok as usize + 1), live_cap as usize + 1);
+        enforce_exit_chain_length("in-ladder split", build_txs(last_ok as usize), p, MAINNET_EPOCH)
+            .expect("the last batch on the cap must still be buildable");
+        let e =
+            enforce_exit_chain_length("in-ladder split", build_txs(last_ok as usize + 1), p, MAINNET_EPOCH)
+                .expect_err("one batch past the cap must be refused BEFORE minting")
+                .to_string();
         assert!(e.contains("in-ladder split"), "the refusing lane must be named, got: {e}");
 
         // And the latency rule would have waved batch 20 — and batch 7 000 — straight through.
@@ -21609,43 +21644,64 @@ mod exit_chain_length_cap_tests {
     // STEP 2 — EVERY SHAPE THE BUILDERS HONESTLY PRODUCE MUST STILL BE ADMITTED.
     // =============================================================================================
 
-    /// **The boundary the cap is DERIVED from.** The deepest two-tier child the latency rule admits
-    /// on mainnet is depth 10; its walk is `3 + 2·10 = 23` transactions; the cap is 23; and it is
-    /// ADMITTED. The two bounds meet exactly, which is why the predicate must be `>` and not `>=`.
+    /// **The boundary the cap is DERIVED from — [D53], re-derived against the ADMISSION rule.**
+    ///
+    /// This test used to read: *"the deepest two-tier child the latency rule admits on mainnet is
+    /// depth 10 … the two bounds meet exactly"*. They did not meet. The latency rule it measured is
+    /// the BARE `exit_wait_blocks`; the rule a conveyed child is admitted by is
+    /// `check_exit_headroom_with_margin`, which adds `exit_slack_margin`. Depths 9 and 10 passed the
+    /// first and can never pass the second — `available = epoch_expiry − tip ≤ initlock` — so the
+    /// build side was signing off children that no receiver could ever adopt, after terminalizing
+    /// the parent. The shipped boundary is depth **8**, 19 transactions.
     #[test]
     fn the_deepest_two_tier_child_the_latency_rule_admits_lands_exactly_on_the_cap() {
         let p = TesrParams::mainnet();
         let per_level = SplitLevelShape::TwoTier.csvs(p);
         assert_eq!(exit_wait_blocks(&base(p)), 2_885, "T 1 + X 721 + SP 1 + ext 721 + state 1441");
         assert_eq!(exit_wait_blocks(&per_level), 722, "a two-tier level pays full price");
-        assert_eq!(max_split_depth(&base(p), &per_level, MAINNET_EPOCH), 10);
-        assert_eq!(cap(p, MAINNET_EPOCH), 23, "3 + 2·10 — the same rule, counted in transactions");
+        let depth = max_split_depth(&base(p), &per_level, MAINNET_EPOCH);
+        assert_eq!(depth, 8, "[D53] the ADMISSION rule tops out at depth 8, not 10");
+        assert_eq!(cap(p, MAINNET_EPOCH), 19, "3 + 2·8 — the same rule, counted in transactions");
 
-        // Depth 10 fits in BOTH units, and is accepted by both.
-        let d10 = two_tier_chain(p, 10);
-        assert_eq!(d10.len(), 23);
-        assert_eq!(exit_wait_blocks(&d10), 9_383);
-        check_exit_headroom(&d10, 0, MAINNET_EPOCH).expect("depth 10 fits the epoch in blocks");
-        enforce_exit_chain_length("conveyed child", d10.len(), p, MAINNET_EPOCH)
+        // The cap depth fits in BOTH units and is accepted by the gate that actually admits.
+        let deepest = two_tier_chain(p, depth);
+        assert_eq!(deepest.len(), 19);
+        assert_eq!(exit_wait_blocks(&deepest), 7_939);
+        check_exit_headroom_with_margin(&deepest, 0, MAINNET_EPOCH)
+            .expect("the deepest admissible child must clear the gate WITH its margin");
+        enforce_exit_chain_length("conveyed child", deepest.len(), p, MAINNET_EPOCH)
             .expect("the deepest honest two-tier child must be ADMITTED, exactly at the cap");
 
         // One transaction more is refused — `>` and not `>=` is what makes the line fall here.
-        enforce_exit_chain_length("conveyed child", 24, p, MAINNET_EPOCH)
-            .expect_err("24 transactions is over the cap");
+        enforce_exit_chain_length("conveyed child", 20, p, MAINNET_EPOCH)
+            .expect_err("20 transactions is over the cap");
 
-        // Depth 11 is over BOTH bounds, so nothing honest lives past the line.
+        // THE DEFECT, preserved as a measurement: depth 9 and depth 10 pass the BARE latency rule
+        // and are refused by the rule that admits. Nothing honest may live in that gap.
+        for d in [9u32, 10] {
+            let over = two_tier_chain(p, d);
+            check_exit_headroom(&over, 0, MAINNET_EPOCH)
+                .unwrap_or_else(|e| panic!("depth {d} passes the BARE latency rule: {e}"));
+            check_exit_headroom_with_margin(&over, 0, MAINNET_EPOCH).expect_err(
+                "…and is refused by the rule the receiver admits with — the gap D53 closed",
+            );
+            enforce_exit_chain_length("conveyed child", over.len(), p, MAINNET_EPOCH)
+                .expect_err("so the length cap must refuse it too");
+        }
+
+        // Depth 11 is over every bound, so nothing honest lives past the line.
         let d11 = two_tier_chain(p, 11);
         assert_eq!(d11.len(), 25);
         assert_eq!(exit_wait_blocks(&d11), 10_105);
         check_exit_headroom(&d11, 0, MAINNET_EPOCH)
-            .expect_err("depth 11 already fails the latency rule — the cap refuses nothing new");
+            .expect_err("depth 11 already fails even the bare latency rule");
     }
 
     /// Every honest spine-batch shape, in both units. A piece from batch `i` is `i + 4` transactions
     /// and the tip minted beside it is `i + 3` — always exactly one shorter, which is why the tip
     /// needs no call site of its own and can never be the binding constraint.
     #[test]
-    fn honest_spine_batch_pieces_and_tips_are_admitted_up_to_batch_nineteen() {
+    fn honest_spine_batch_pieces_and_tips_are_admitted_up_to_the_cap() {
         let p = TesrParams::mainnet();
         let piece_txs = |i: usize| i + 4;
         let tip_txs = |i: usize| i + 3;
@@ -21653,7 +21709,12 @@ mod exit_chain_length_cap_tests {
         assert_eq!(piece_txs(1), 5, "batch 1 is a plain root split: T, X, SP, ext, state");
         assert_eq!(tip_txs(1), 4, "T, X, SP, cap");
 
-        for i in 1..=19 {
+        // [D53] DERIVED from the live cap: the last admissible batch is the one whose piece is
+        // exactly `cap` transactions. It was 19 and is now 15; a literal here would have gone stale.
+        let live_cap = cap(p, MAINNET_EPOCH) as usize;
+        let last = live_cap - 4;
+        assert_eq!(last, 15, "[D53] batch 15's piece is the 19-transaction boundary");
+        for i in 1..=last {
             enforce_exit_chain_length("conveyed child", piece_txs(i), p, MAINNET_EPOCH)
                 .unwrap_or_else(|e| panic!("batch {i}'s piece is honest and must be admitted: {e}"));
             enforce_exit_chain_length("spine tip", tip_txs(i), p, MAINNET_EPOCH)
@@ -21664,12 +21725,12 @@ mod exit_chain_length_cap_tests {
                 "the tip is ALWAYS exactly one transaction shorter than the leaf minted with it"
             );
         }
-        assert_eq!(piece_txs(19), 23, "batch 19 is the last one that fits");
-        enforce_exit_chain_length("conveyed child", piece_txs(20), p, MAINNET_EPOCH)
-            .expect_err("batch 20's piece is 24 transactions — refused");
-        // The tip minted by batch 20 is still 23, so the sender's own change leg stays exitable
-        // even in the batch that can no longer mint pieces. That asymmetry is deliberate.
-        enforce_exit_chain_length("spine tip", tip_txs(20), p, MAINNET_EPOCH)
+        assert_eq!(piece_txs(last), live_cap, "the last batch's piece lands exactly on the cap");
+        enforce_exit_chain_length("conveyed child", piece_txs(last + 1), p, MAINNET_EPOCH)
+            .expect_err("one batch past the cap mints a piece one transaction too long — refused");
+        // The tip minted by that batch is still exactly `cap`, so the sender's own change leg stays
+        // exitable even in the batch that can no longer mint pieces. That asymmetry is deliberate.
+        enforce_exit_chain_length("spine tip", tip_txs(last + 1), p, MAINNET_EPOCH)
             .expect("the tip at the cap keeps its exit — refusing it would strand the sender");
     }
 
@@ -21726,8 +21787,10 @@ mod exit_chain_length_cap_tests {
     fn the_regtest_cap_leaves_every_shape_the_e2es_build_untouched() {
         let p = TesrParams::regtest();
         assert_eq!(exit_wait_blocks(&base(p)), 53);
-        assert_eq!(max_split_depth(&base(p), &SplitLevelShape::TwoTier.csvs(p), REGTEST_EPOCH), 68);
-        assert_eq!(cap(p, REGTEST_EPOCH), 139);
+        // [D53] 68 -> 54 and 139 -> 111. The point of this test is the HEADROOM over real E2E
+        // traffic, and it is untouched: the deepest shape any E2E builds is 7 transactions.
+        assert_eq!(max_split_depth(&base(p), &SplitLevelShape::TwoTier.csvs(p), REGTEST_EPOCH), 54);
+        assert_eq!(cap(p, REGTEST_EPOCH), 111);
         for txs in [3usize, 4, 5, 6, 7, 9] {
             enforce_exit_chain_length("conveyed child", txs, p, REGTEST_EPOCH)
                 .unwrap_or_else(|e| panic!("{txs} transactions is ordinary regtest traffic: {e}"));
@@ -22072,8 +22135,10 @@ mod cap_params_provenance_tests {
     fn the_conveyed_schedule_is_a_six_fold_lever_on_the_cap() {
         let honest = max_exit_txs(TesrParams::mainnet(), MAINNET_EPOCH);
         let forged = max_exit_txs(TesrParams::regtest(), MAINNET_EPOCH);
-        assert_eq!(honest, 23, "the mainnet schedule caps a mainnet epoch at 23 transactions");
-        assert_eq!(forged, 1425, "…the regtest schedule, on the SAME epoch, at 1425");
+        // [D53] 23 -> 19 and 1425 -> 1139: both sides now measure with the receiver's margin. The
+        // LEVER is what this test is about and it is untouched — the ratio got larger, not smaller.
+        assert_eq!(honest, 19, "the mainnet schedule caps a mainnet epoch at 19 transactions");
+        assert_eq!(forged, 1139, "…the regtest schedule, on the SAME epoch, at 1139");
         assert!(forged > honest * 6, "a conveyed schedule moves the cap by more than 6x");
     }
 
@@ -22084,19 +22149,19 @@ mod cap_params_provenance_tests {
     fn the_conveyed_schedule_buys_a_chain_the_victims_own_receivers_refuse() {
         let e = enforce_exit_chain_length(
             "conveyed child",
-            24,
+            20,
             TesrParams::for_network(MAINNET),
             MAINNET_EPOCH,
         )
-        .expect_err("a 24-transaction walk is over the mainnet cap and must be refused at admission")
+        .expect_err("a 20-transaction walk is over the mainnet cap and must be refused at admission")
         .to_string();
         assert!(e.contains("exit-chain length cap"), "refused by name, got: {e}");
-        assert!(e.contains("24") && e.contains("23"), "naming both numbers, got: {e}");
+        assert!(e.contains("20") && e.contains("19"), "naming both numbers, got: {e}");
 
-        // …and the honest boundary is untouched: 23 is the deepest shape the builders legitimately
-        // produce and it must still be ADMITTED, or this cap refuses real traffic.
-        enforce_exit_chain_length("conveyed child", 23, TesrParams::for_network(MAINNET), MAINNET_EPOCH)
-            .expect("23 is exactly the cap and must be admitted");
+        // …and the honest boundary is untouched: [D53] 19 is the deepest shape the builders
+        // legitimately produce and it must still be ADMITTED, or this cap refuses real traffic.
+        enforce_exit_chain_length("conveyed child", 19, TesrParams::for_network(MAINNET), MAINNET_EPOCH)
+            .expect("19 is exactly the cap and must be admitted");
     }
 
     // =============================================================================================
@@ -22104,27 +22169,27 @@ mod cap_params_provenance_tests {
     // =============================================================================================
 
     /// **THE ATTACK, RUN.** A mainnet wallet, a bundle conveying the regtest schedule, and a split
-    /// that would mint a 24-transaction leaf. The builder must refuse it — it is the number the test
-    /// above just proved every receiver rejects.
+    /// that would mint a 20-transaction leaf — [D53] one past the shipped cap of 19. The builder
+    /// must refuse it; it is the number the test above just proved every receiver rejects.
     ///
     /// Note which side is asserted: NOT "the sender's bundle is rejected" (a sender is free to send
     /// whatever it likes) but "the victim does not BUILD over the cap its own payees enforce".
     #[test]
     fn a_conveyed_schedule_cannot_inflate_the_builders_own_cap() {
         let forged = TesrParams::regtest();
-        let levels = spine_levels(24);
+        let levels = spine_levels(20);
 
         let p = cap_schedule(MAINNET, forged)
             .unwrap_or_else(|_| TesrParams::for_network(MAINNET));
         let e = split_cap_decision(p, &levels, ONE_LEVEL_PARENT, MAINNET_EPOCH)
             .expect_err(
-                "THE DEFECT: the conveyed regtest schedule raises the BUILD cap to 139 while every \
-                 receiver caps at 23, so the builder mints a 24-transaction leaf nobody will adopt \
+                "THE DEFECT: the conveyed regtest schedule raises the BUILD cap to 111 while every \
+                 receiver caps at 19, so the builder mints a 20-transaction leaf nobody will adopt \
                  — after the parent has already been terminalized",
             )
             .to_string();
         assert!(e.contains("exit-chain length cap"), "refused on LENGTH, got: {e}");
-        assert!(e.contains("24") && e.contains("23"), "naming the measured walk and the cap: {e}");
+        assert!(e.contains("20") && e.contains("19"), "naming the measured walk and the cap: {e}");
     }
 
     /// **THE GENERAL PROPERTY.** For every network the wallet can be on and every schedule a sender
@@ -22182,10 +22247,11 @@ mod cap_params_provenance_tests {
                 .unwrap_or_else(|e| panic!("{network}: the wallet's own preset must be accepted: {e}"));
             assert_eq!(p, honest, "{network}: and it must be the schedule that is used");
         }
-        // The mainnet-max shape: 23 transactions, the boundary `check_exit_chain_length` admits.
+        // The mainnet-max shape: [D53] 19 transactions, the boundary `check_exit_chain_length`
+        // admits now that the build side measures with the receiver's margin.
         let p = cap_schedule(MAINNET, TesrParams::mainnet()).expect("honest");
-        split_cap_decision(p, &spine_levels(23), ONE_LEVEL_PARENT, MAINNET_EPOCH)
-            .expect("23 transactions is exactly the cap and must still BUILD");
+        split_cap_decision(p, &spine_levels(19), ONE_LEVEL_PARENT, MAINNET_EPOCH)
+            .expect("19 transactions is exactly the cap and must still BUILD");
     }
 
     /// **EVERY KNOB, NOT JUST THE LOUD ONE.** The two shipped presets differ in all eight fields, so

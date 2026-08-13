@@ -958,17 +958,43 @@ pub fn check_exit_headroom_with_margin(
 /// `per_level` is what ONE further split level adds (that level's extension and split state). Returns
 /// the deepest child whose exit still fits in an `epoch_blocks`-long funding epoch — `0` when even a
 /// depth-1 child does not fit, in which case no in-ladder split is admissible at all.
+///
+/// # [D53] "Fits" means what the RECEIVER admits, margin included
+///
+/// This used to close-form the answer as `1 + (epoch - base_wait) / level_wait`, i.e. against the
+/// BARE [`exit_wait_blocks`]. But the gate a conveyed child is actually admitted by is
+/// [`check_exit_headroom_with_margin`], which adds [`exit_slack_margin`] — so the closed form
+/// reported depths that every receiver refuses, and the builder that trusted it minted children
+/// nobody could adopt after terminalizing their parent.
+///
+/// [`exit_slack_margin`] is `(required / 4).max(required / tiers)`, which depends on the WHOLE
+/// chain, so there is no closed form; the answer is searched instead. Both inputs to
+/// [`exit_wait_blocks`] and [`exit_slack_margin`] are order-independent sums, so appending the
+/// per-level tiers is equivalent to splicing them at their real position.
+///
+/// The search is bounded: each level adds at least one tier and therefore at least one block of
+/// wait, so it terminates in at most `epoch_blocks` iterations, and `level_wait == 0` — a level that
+/// adds no tiers at all — is still answered directly.
 pub fn max_split_depth(base: &[Option<u16>], per_level: &[Option<u16>], epoch_blocks: u32) -> u32 {
-    let base_wait = exit_wait_blocks(base);
-    if base_wait > epoch_blocks {
+    let admits = |csvs: &[Option<u16>]| -> bool {
+        exit_wait_blocks(csvs) + exit_slack_margin(csvs) <= epoch_blocks
+    };
+    if !admits(base) {
         return 0;
     }
-    let level_wait = exit_wait_blocks(per_level);
-    if level_wait == 0 {
+    if per_level.is_empty() || exit_wait_blocks(per_level) == 0 {
         // No level cost means no bound from this rule; the caller's other guards still apply.
         return u32::MAX;
     }
-    1 + (epoch_blocks - base_wait) / level_wait
+    let mut chain = base.to_vec();
+    let mut depth = 1;
+    loop {
+        chain.extend_from_slice(per_level);
+        if !admits(&chain) {
+            return depth;
+        }
+        depth += 1;
+    }
 }
 
 /// **[P0-3] THE EXIT-CHAIN LENGTH CAP** — the most transactions one unilateral exit may require.
@@ -999,14 +1025,27 @@ pub fn max_split_depth(base: &[Option<u16>], per_level: &[Option<u16>], epoch_bl
 /// plus the leaf's own two — i.e. `tesr_exit_txs(d) = 3 + 2d`, the count the SDK's invalidation model
 /// already uses.
 ///
-/// * **Mainnet** (`lockheight_init = 10 000`, `E0 = 720`, `D0 = 1440`): `max_split_depth = 10`,
-///   so the cap is **23 transactions**.
-/// * **Regtest** (`lockheight_init = 1 000`, `E0 = 12`, `D0 = 24`): `max_split_depth = 68`,
-///   so the cap is **139 transactions**.
+/// * **Mainnet** (`lockheight_init = 10 000`, `E0 = 720`, `D0 = 1440`): `max_split_depth = 8`,
+///   so the cap is **19 transactions**.
+/// * **Regtest** (`lockheight_init = 1 000`, `E0 = 12`, `D0 = 24`): `max_split_depth = 54`,
+///   so the cap is **111 transactions**.
 ///
-/// By construction this refuses NOTHING the latency rule admits on a two-tier chain — the two bounds
-/// meet exactly at depth 10 / 23 transactions on mainnet — and it is what turns a spine level from
-/// free into priced.
+/// # [D53] These numbers were 10 / 23 and 68 / 139, and the reconciliation was false
+///
+/// This paragraph used to read: *"By construction this refuses NOTHING the latency rule admits on a
+/// two-tier chain — the two bounds meet exactly at depth 10 / 23 transactions on mainnet."* They did
+/// not meet. The "latency rule" measured here was the BARE [`exit_wait_blocks`]; the rule a conveyed
+/// child is ADMITTED by is [`check_exit_headroom_with_margin`], which adds [`exit_slack_margin`].
+///
+/// On mainnet, depth 9 needs 10 826 blocks with the margin and depth 10 needs 11 728, while a
+/// receiver's `available = epoch_expiry_height − tip` can never exceed `initlock` = 10 000. Both were
+/// therefore **unadoptable at every tip** — and the build side, reading the bare rule, signed them
+/// off and minted them, after terminalizing the parent. `max_split_depth` now searches against the
+/// admission rule, so the two bounds genuinely do meet, and
+/// `the_build_side_never_admits_what_the_receive_side_refuses` proves it at every depth on both
+/// presets rather than asserting it in prose.
+///
+/// What the cap still does, unchanged: it turns a spine level from free into priced.
 ///
 /// # The worst-case weight it implies
 ///
@@ -1676,18 +1715,44 @@ mod transfer_signature_tests {
         assert!(super::check_exit_headroom(&mainnet_chain(2), 0, d1).is_err());
     }
 
+    /// **[D53] The cap is what the RECEIVER admits, and the receiver adds a margin.**
+    ///
+    /// This test pinned the BARE rule (`exit_wait_blocks <= epoch`) and reported depth 3 on the
+    /// PRE-CATS fixture. The gate a conveyed child is really admitted by is
+    /// `check_exit_headroom_with_margin`, so the cap is whatever survives WITH `exit_slack_margin`.
+    /// Every number below is recomputed from the functions rather than restated.
     #[test]
     fn depth_cap_is_derived_from_the_schedule_and_the_epoch() {
         let base = mainnet_chain(1);
         let per_level = vec![Some(720u16), Some(1404)];
-        // Mainnet, lockheight_init = 10 000: depth 3 fits (10 541), depth 4 does not (12 667).
         let cap = super::max_split_depth(&base, &per_level, 10_000);
-        assert_eq!(cap, 3, "mainnet admits at most a depth-3 child");
-        assert!(super::exit_wait_blocks(&mainnet_chain(cap)) <= 10_000);
+
+        // THE PROPERTY, not the number: the cap is the last depth the ADMISSION gate accepts, and
+        // the next one is refused by it. Stated against `check_exit_headroom_with_margin` at a tip
+        // of 0 against a 10 000-block epoch — the most generous window that can ever exist, since
+        // `available = epoch_expiry - tip` and `epoch_expiry - tip <= initlock` by construction.
         assert!(
-            super::exit_wait_blocks(&mainnet_chain(cap + 1)) > 10_000,
-            "the cap must be the LAST depth that fits"
+            super::check_exit_headroom_with_margin(&mainnet_chain(cap), 0, 10_000).is_ok(),
+            "the cap itself must be admissible at the most generous possible tip"
         );
+        assert!(
+            super::check_exit_headroom_with_margin(&mainnet_chain(cap + 1), 0, 10_000).is_err(),
+            "the cap must be the LAST depth the admission gate accepts"
+        );
+
+        // And the number that property yields on this fixture, so a silent shift is visible.
+        assert_eq!(cap, 2, "[D53] with the margin the PRE-CATS fixture admits depth 2, not 3");
+
+        // WHY it moved: depth 3's bare wait fits and its margin does not. This is the whole defect
+        // in two numbers — a build side reading the first admits what a receiver reading the sum
+        // refuses, and mints a child nobody can adopt after terminalizing its parent.
+        let d3 = mainnet_chain(3);
+        assert!(super::exit_wait_blocks(&d3) <= 10_000, "the BARE rule admitted depth 3");
+        assert!(
+            super::exit_wait_blocks(&d3) + super::exit_slack_margin(&d3) > 10_000,
+            "and the ADMISSION rule refuses it — this gap is what D53 closed"
+        );
+
         // The task's figure: WAIT(4) = 10 656 > 10 000 even before confirmations.
         assert_eq!(super::exit_csv_total(&mainnet_chain(4)), 10_656);
 
@@ -1695,11 +1760,77 @@ mod transfer_signature_tests {
         let rt_base = vec![None, Some(12u16), Some(18), Some(12), Some(24)];
         let rt_level = vec![Some(12u16), Some(18)];
         assert_eq!(super::exit_wait_blocks(&rt_base), 66 + 5);
-        assert_eq!(super::max_split_depth(&rt_base, &rt_level, 1_000), 30);
+        let rt_cap = super::max_split_depth(&rt_base, &rt_level, 1_000);
+        let rt_chain = |d: u32| {
+            let mut c = rt_base.clone();
+            for _ in 1..d {
+                c.extend_from_slice(&rt_level);
+            }
+            c
+        };
+        assert!(super::check_exit_headroom_with_margin(&rt_chain(rt_cap), 0, 1_000).is_ok());
+        assert!(super::check_exit_headroom_with_margin(&rt_chain(rt_cap + 1), 0, 1_000).is_err());
+        assert_eq!(rt_cap, 23, "[D53] regtest admits depth 23 with the margin, not 30");
 
         // An epoch too short for even a depth-1 child admits NOTHING (fail closed).
-        assert_eq!(super::max_split_depth(&base, &per_level, 4_288), 0);
-        assert_eq!(super::max_split_depth(&base, &per_level, 4_289), 1);
+        let d1 = mainnet_chain(1);
+        let d1_needed = super::exit_wait_blocks(&d1) + super::exit_slack_margin(&d1);
+        assert_eq!(super::max_split_depth(&base, &per_level, d1_needed - 1), 0);
+        assert_eq!(super::max_split_depth(&base, &per_level, d1_needed), 1);
+    }
+
+    /// **[D53] THE BUILD SIDE MAY NEVER ADMIT WHAT THE RECEIVE SIDE REFUSES.**
+    ///
+    /// The defect this pins was live: `split_cap_decision` compared the BARE `exit_wait_blocks`
+    /// against the epoch, `verify_conveyed_child` adds `exit_slack_margin`, and nothing held the two
+    /// together. The consequence is not a loose check — the parent is TERMINALIZED before the child
+    /// is conveyed, so a child the builder approves and the receiver refuses is a stranded piece and
+    /// a real loss.
+    ///
+    /// Stated as a property over every depth on both presets, at the most generous tip that can
+    /// exist, so it holds for any schedule rather than for the two numbers that happen to ship.
+    #[test]
+    fn the_build_side_never_admits_what_the_receive_side_refuses() {
+        for (name, base, per_level, epoch) in [
+            ("mainnet", mainnet_chain(1), vec![Some(720u16), Some(1404)], 10_000u32),
+            (
+                "regtest",
+                vec![None, Some(12u16), Some(18), Some(12), Some(24)],
+                vec![Some(12u16), Some(18)],
+                1_000,
+            ),
+        ] {
+            let cap = super::max_split_depth(&base, &per_level, epoch);
+            let mut chain = base.clone();
+            for depth in 1..=cap + 3 {
+                if depth > 1 {
+                    chain.extend_from_slice(&per_level);
+                }
+                // What the BUILDER now decides (`split_cap_decision`'s rule, restated here because
+                // it lives in another crate — the E2E-side guard checks the call itself).
+                let build_admits =
+                    super::exit_wait_blocks(&chain) + super::exit_slack_margin(&chain) <= epoch;
+                // What the RECEIVER decides, at the most generous tip that can ever occur.
+                let receive_admits =
+                    super::check_exit_headroom_with_margin(&chain, 0, epoch).is_ok();
+                assert!(
+                    !(build_admits && !receive_admits),
+                    "{name} depth {depth}: the build side admits a chain the receive side refuses.                      That mints a child no receiver will adopt, AFTER the parent is terminal — the                      piece is stranded and the loss is real. wait {} + margin {} vs epoch {epoch}",
+                    super::exit_wait_blocks(&chain),
+                    super::exit_slack_margin(&chain)
+                );
+                assert_eq!(
+                    build_admits, receive_admits,
+                    "{name} depth {depth}: the two gates disagree in the other direction too — the                      builder must not refuse what a receiver would take"
+                );
+                // …and `max_split_depth` must be exactly the boundary between them.
+                assert_eq!(
+                    build_admits,
+                    depth <= cap,
+                    "{name} depth {depth}: max_split_depth reported {cap}, which is not where                      admission actually changes"
+                );
+            }
+        }
     }
 
     #[test]

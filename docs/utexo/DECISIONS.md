@@ -927,6 +927,15 @@ invalidation economics. Make them shape-aware or delete them and route their con
 admission function. Measured figures the spec publishes from it: mainnet depth cap **10** (not the
 phantom 8 and not 19); depth-10 = **9,383 blocks ≈ 65.2 days, 23 transactions**.
 
+> **[D53] SUPERSEDED, 2026-08-14.** The depth cap is **8**, not 10, and the walk is **19**
+> transactions, not 23. The figure above was measured against the BARE latency rule
+> (`exit_wait_blocks <= epoch`); the rule a conveyed child is admitted by adds `exit_slack_margin`.
+> Depth 9 and depth 10 need 10 826 and 11 728 blocks of headroom against an epoch of 10 000, so they
+> were never adoptable at any tip — and the number was arrived at, published in five documents, and
+> independently "re-derived" twice, including by me, because every derivation used the same wrong
+> rule. The 9 383-block / 65.2-day figure is still correct **as the wait of a depth-10 walk**; it is
+> not the cap. See D53.
+
 *What NOT to do.* Do not delete the pre-CATS baseline rows in `PARTIAL-PAYMENT-ECONOMICS.md` — they
 are the "before" half of a labelled before/after. Label them; deleting them makes the multi-year exit
 read as current.
@@ -1376,9 +1385,20 @@ split journal to carry `recipient_address`; neither exists. Under this decision 
 test is rewritten to assert the refusal by name. A test that pins a refusal is coverage; a test left
 red against an unbuilt feature is a standing invitation to build it by accident.
 
-**What the spec says.** One payee per carrier per payment. Issuers size carriers to the asset value
-they intend to move — the same answer already taken for carrier granularity — and a payment to two
-payees uses two carriers. The limitation is named rather than worked around.
+**What the spec says.** One payee per carrier per payment, **on the CTES-R coloured lane**. Issuers
+size carriers to the asset value they intend to move — the same answer already taken for carrier
+granularity — and a payment to two payees uses two carriers. The limitation is named rather than
+worked around.
+
+> **[D52] SCOPE, added 2026-08-14 after the pre-spec review.** Written unqualified, the sentence
+> above is false of the build a default wallet runs. `SdkConfig::colored_ladder` ships false ([D30]),
+> so `batch_transfer_tokens` takes the LEGACY lane, which pays N payees out of one carrier and is
+> exercised live and green by `SDK_E2E=9`. K=1 is a property of the CTES-R lane and of the reason it
+> holds there — non-resumable serial conveyance — which the legacy lane does not share, because
+> `BatchPiece` journals `recipient` per piece and `recover_structural_spends` re-conveys the legs
+> that did not land. The spec must state K=1 **per lane**, with the mechanism, or a reader will
+> conclude the lanes are inconsistent and "fix" the wrong one. See D52 for how close that came to
+> happening.
 
 **What this does NOT decide.** The coloured spine and coloured re-anchor stay scoped-but-unbuilt
 (16–21 weeks, `COLOURED-SPINE-REANCHOR-SCOPE.md`). K=1 is a statement about batching, not about the
@@ -1666,3 +1686,242 @@ suffix of a valid ladder because a suffix IS structurally valid. **A test that e
 validator in isolation measures the harness, not the system.** The test is retained, with its framing
 corrected and the census identity added, as
 `the_pairwise_rule_accepts_suffixes_and_the_census_is_what_refuses_them`.
+
+---
+
+## D50 — What [D44] cost the pieces already in circulation: the hatch's escape bar, 4_032 → 5_040
+
+**Status:** RECORDED (a measured consequence of D44, not a new choice). **Date:** 2026-08-14.
+**Found by:** `SDK_E2E=78` failing on the rerun, with a refusal from the code rather than from a pin.
+
+### What happened
+
+D44 raised `committed_fee_rate` 2.0 → 3.0. The accompanying note said a piece minted under the old
+floor "must be rescued by `combine`". That sentence was **not checked**, and it is where the cost
+hides: `combine` is the migration hatch's payout route, and it has a bar of its own that this same
+rate raised.
+
+`transfer_tokens_combine` carves the receiver a piece of the CURRENT `TOKEN_PIECE_SATS` and leaves
+the sender the change, so escaping the legacy class costs
+
+    TOKEN_PIECE_SATS + fee_reserve + min_split_output
+
+of **aggregated** carrier value — `3_066 + 300 + 666` = **4_032** before D44, `4_074 + 300 + 666` =
+**5_040** after. sdk78 builds exactly the stranded class (three 1_500-sat pre-flip carriers, 4_500
+sat) and that holding cleared the old bar and does not clear the new one. The refusal is honest and
+fail-closed — no value was destroyed and nothing was silently mis-sized — but a holder whose ENTIRE
+legacy holding sits in [4_032, 5_040) could escape before the raise and cannot now.
+
+### The alternative, and why it was rejected
+
+The obvious fix is to size the hatch's payout down to the bare coloured ROOT floor (2_562) instead of
+to `TOKEN_PIECE_SATS`. That would drop the escape bar to 3_528 — **lower than it was before D44** —
+and three 1_500-sat carriers would fit again.
+
+It is rejected because it moves the stranding onto someone who did nothing. `TOKEN_PIECE_SATS`
+carries `PIECE_FEE_RATE_HEADROOM` = 2× precisely so a piece survives a committed-rate rise between
+being carved and being claimed; a piece minted AT the floor has none. The hatch's whole point is that
+its output is healthier than its input — bob claims his piece, `claim()` ladders it, and he is out of
+the legacy class for good (sdk78 (c) asserts exactly this: bob's piece gets a COLOURED ladder and is
+spent onward to carol). Paying a floor-sized piece would hand bob a coin that a later rate move
+strands, converting alice's stuck value into bob's stuck value.
+
+**So: the hatch pays a HEALTHY piece or it does not pay.** The cost of reaching that bar is stated
+rather than engineered away.
+
+### What this changes
+
+* No code change. sdk78 now starts from **four** 1_500-sat carriers (6_000 sat), the smallest holding
+  that still clears the bar, and its module comment carries this derivation.
+* D44's note in `TIER_COMMITTED_FEE_RATE` is corrected: "rescued by `combine`" now states the bar and
+  points here. The same comment's `min_child_value` figure was **wrong** — 1,310 → **1,560**, not
+  1,610 (`(ceil(125·3) + 240)·2 + 330`).
+* The stale 2-sat/vB derivation on `TOKEN_PIECE_SATS` (floors 2_058/1_482, value 3_066, and the
+  "1_500 sits between the two floors" story) is re-derived at 3 sat/vB: floors 2_562/1_818, value
+  4_074, and 1_500 now sits below BOTH.
+
+### The lesson
+
+D44's own rationale contained the mitigation ("rescued by `combine`") and the mitigation was
+untested. **A cost note that names an escape route has not been checked until the route has been
+run** — an E2E was the only thing that could have caught this, and it is what did.
+
+---
+
+## D51 — The deadline pass may not return `Ok` over a coin it did not defend
+
+**Status:** FIXED IN CODE. **Date:** 2026-08-14. **Found by:** the pre-spec adversarial review.
+
+### The defect
+
+[D46] extended `deadline_safety_due` to token carriers: excluded from the cooperative re-anchor (it
+would destroy the allocation), included in the unilateral sever, which broadcasts the coin's own
+pre-signed `T`. The construction extended it **only to the coloured lane**.
+
+`unilateral_exit` refuses a carrier whose ladder is not COLOURED, and `SdkConfig::colored_ladder`
+ships false ([D30]) — so on the shipped default configuration that is EVERY carrier. The refusal
+landed on a `_ => continue`:
+
+```rust
+match self.unilateral_exit(Some(vec![id.clone()]), None).await {
+    Ok(statuses) if !statuses.is_empty() => severed.push(id),
+    _ => continue,          // <- an Err about an undefended coin, discarded
+}
+```
+
+The coin appeared in neither return vector, nothing was emitted, and the pass returned a clean `Ok`.
+Meanwhile the operator line above it printed that those same carriers "**will be SEVERED**". Three
+things had to line up to hide it, and they did: the message asserts an action rather than reporting
+one, the filter is not laddered-gated (so un-laddered carriers reach the refusal too), and the only
+live test — `SDK_E2E=87` — sets `colored_ladder = true` explicitly, so it measures the one lane that
+works.
+
+This is the **silent-degradation class** by name: *the failure looked like idle.*
+
+### What changed, and what deliberately did not
+
+* Both non-severing arms are now recorded, not swallowed: an `Err` carries its reason, and an
+  `Ok(empty)` is reported as "reported no exit status at all".
+* Each is announced three ways — an `ExitDeadlineApproaching` event, a named stdout line, and an
+  `Err` return listing every undefended coin. The counts of what WAS re-anchored and severed travel
+  in the error text, so the `Err` loses nothing.
+* The work still completes before the `Err` — the other coins' deadlines are time-critical, exactly
+  as `unilateral_exit`'s own `blind` list is handled.
+* The operator message now states what will be ATTEMPTED and says a non-coloured carrier will be
+  reported UNDEFENDED.
+* The rustdoc, which still read "Carriers are excluded on both routes … their protection is
+  `auto_exit_due`" — contradicting both D46 and the body directly beneath it — now describes what
+  the function does.
+
+**NOT changed: the flat carrier lane still has no unilateral remedy.** There is none to give; a plain
+trigger destroys the allocation, and building the coloured one is what CTES-R is. `auto_exit_due`
+still covers the *branch* deadline (it materialises received carriers), but it skips a branch-free
+carrier as "verified no clawback risk", so the **flat-backup** deadline for such a carrier genuinely
+has no automatic defender. That gap is now VISIBLE instead of silent. Closing it needs CTES-R.
+
+### The lesson
+
+D46 was decided, implemented, tested and recorded — and the test opted out of the shipped default, so
+the decision was true only where nobody shipped. **When a feature is gated by a flag that ships off,
+a test that sets the flag on measures the feature, not the product.**
+
+---
+
+## D52 — The K=1 rationale was stale, and the stale version nearly deleted a working capability
+
+**Status:** DOCUMENTATION CORRECTED; no behaviour change. **Date:** 2026-08-14.
+
+### What was wrong
+
+`refuse_colored_multi_payee`'s doc-comment argued K=1 from SEAL PRIVACY: `build_colored_tier` derives
+one blinding for an `output_map` covering every payload, so a payee who holds a piece can enumerate
+the vouts and de-conceal every sibling seal.
+
+**That gate has been closed for some time.** Per-output blinding landed
+(`AssetColoringInfo::output_blinding`, rgb-lib `ae8439e`), and the refusal's own runtime message says
+so. Only the prose above it was left behind — and the prose is what a reader, or a spec author, sees
+first.
+
+### Why a stale rationale is not a harmless staleness
+
+Read as the reason, it makes the refusal a property of **shared blinding**. The legacy lane's
+`create_colored_split_tx` also takes a single `blinding: u64` for an `output_map` covering every
+payee. The consistent-looking conclusion is therefore "refuse K > 1 on the legacy lane too" — which
+deletes a live, green, DEFAULT-configuration capability (`SDK_E2E=9`, two payees out of one carrier).
+
+I reached that conclusion and wrote the patch before checking the mechanism. What stopped it was
+reading the refusal's own error text, which contradicted the comment sitting above it.
+
+### The reason that actually holds
+
+The CTES-R lane conveys pieces **serially, after the carrier is terminal**, one `convey_child_bundle`
+per payee, each `?`, and journals no `recipient_address`. A failure at payee j strands pieces j..K
+permanently. The legacy lane journals `recipient` and a per-piece completion flag in `BatchPiece` at
+the F7 commit point, before any hand-over, so `recover_structural_spends` re-conveys exactly the legs
+that did not land.
+
+Same shared blinding; different failure mode. **The failure mode is what the refusal is about**, so
+the fix for CTES-R is idempotent conveyance, not per-output blinding — which has already landed.
+
+### The lesson, which is the session's recurring one in a new costume
+
+A pin on a DESCRIPTION passes while the CONSTRUCTION is wrong. Here the description was a
+doc-comment, the construction was correct, and acting on the description would have **broken working
+code to match a stale explanation**. Before extending a guard to a second call site, re-derive why
+the guard exists at the first one.
+
+---
+
+## D53 — The build side admitted split depths no receiver could ever adopt; the mainnet cap is 8, not 10
+
+**Status:** FIXED IN CODE + TESTS + DOCS. **Date:** 2026-08-14.
+**Found by:** the pre-spec adversarial review; ranked by its own verifier as the most consequential
+item across all five reports. **Class:** money loss (stranded piece after the parent is terminal).
+
+### The two rules that were never held together
+
+| side | function | rule |
+|---|---|---|
+| BUILD | `split_cap_decision` (`clients/libs/rust/src/tesr.rs`) | `exit_wait_blocks(chain) <= epoch_blocks` |
+| ADMIT | `verify_conveyed_child` → `check_exit_headroom_with_margin` | `exit_wait_blocks(chain) + exit_slack_margin(chain) <= available` |
+
+`exit_slack_margin` is `(required / 4).max(required / tiers)`, added by [D40.3] because admitting at
+zero slack hands over a coin whose exit is feasible only if all 3–23 of its transactions confirm in
+the very next block. The builder never learned about it.
+
+### What that admitted, on the shipped mainnet schedule
+
+Base 2 885 blocks, 722 per two-tier level:
+
+| d | wait | tiers | margin | required | vs epoch 10 000 |
+|---|---|---|---|---|---|
+| 8 | 7 939 | 19 | 1 984 | 9 923 | admissible |
+| 9 | 8 661 | 21 | 2 165 | 10 826 | **never, at any tip** |
+| 10 | 9 383 | 23 | 2 345 | 11 728 | **never, at any tip** |
+
+`available = epoch_expiry_height − tip`, and `epoch_expiry_height − tip ≤ initlock = 10 000` by
+construction, so 9 and 10 are refused unconditionally. `split_cap_decision` built both (`9 383 ≤
+10 000`) and `enforce_exit_chain_length` allowed 23 transactions.
+
+**The harm is not a loose check.** The parent is TERMINALIZED before the child is conveyed, so a
+child the builder approves and the receiver refuses is value the sender has already spent away and
+the payee will not take. `enforce_split_depth_cap_shaped`'s own doc named this exact harm — *"a build
+side that under-counted it would mint children no receiver would adopt, after the parent is
+terminal"* — while the arithmetic beneath it did the thing the sentence forbids.
+
+### The fix
+
+* `split_cap_decision` admits by `exit_wait_blocks + exit_slack_margin`, the receiver's rule.
+* `max_split_depth` no longer close-forms `1 + (epoch − base)/level` against the bare wait — the
+  margin depends on the whole chain, so it searches. Both its inputs are order-independent sums, so
+  appending per-level tiers is equivalent to splicing them at their real position.
+* **`the_build_side_never_admits_what_the_receive_side_refuses`** pins the two gates together at
+  every depth on both presets. This is the test that did not exist, and its absence is why nine other
+  tests could pin the wrong number and stay green.
+
+### Numbers that MOVE — every prior statement of them is superseded
+
+| | was | is |
+|---|---|---|
+| mainnet `max_split_depth` | 10 | **8** |
+| mainnet `max_exit_txs` | 23 | **19** |
+| regtest `max_split_depth` | 68 | **54** |
+| regtest `max_exit_txs` | 139 | **111** |
+| regtest schedule forged onto a mainnet epoch | 1 425 | **1 139** |
+
+Still correct, and not the cap: **9 383 blocks ≈ 65.2 days** is the WAIT of a depth-10 walk. The
+deepest walk that ships is depth 8 — 7 939 blocks ≈ 55.1 days, 19 transactions.
+
+### What is NOT fixed here
+
+`epoch_blocks` is still `info.initlock` on the build side, i.e. the most generous window that can
+ever exist, while the receiver measures `epoch_expiry_height − tip`. That is [D36]'s **T-4** and it
+remains open: a coin conveyed late in its epoch can still be built for and refused. D53 closes the
+margin half, which is the half that made depths 9 and 10 unreachable *even at a fresh epoch*.
+
+### The lesson
+
+I re-derived the depth-10 figure earlier in this same session and reported it as verified. The
+derivation was arithmetically correct and measured **the wrong rule** — the same wrong rule the
+original had. Two independent derivations agreeing means nothing when both read the same premise.
+**Check which gate actually admits, not whether the arithmetic reproduces.**

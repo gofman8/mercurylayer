@@ -1,5 +1,15 @@
 # Partial-payment economics — what a real payment costs, and what to build
 
+> ⚠️ **[D53] CORRECTION, 2026-08-14 — the depth cap in this document is STALE.**
+> Every statement here of `max_split_depth = 10` / **23 transactions** (mainnet) or
+> `max_split_depth = 68` / **139 transactions** (regtest) was measured against the BARE latency rule
+> `exit_wait_blocks <= epoch`. The rule a conveyed child is actually ADMITTED by adds
+> `exit_slack_margin`, so the shipped caps are **depth 8 / 19 transactions** (mainnet) and
+> **depth 54 / 111 transactions** (regtest). Depths 9 and 10 were unadoptable at every tip. The
+> 9 383-block / 65.2-day figure remains correct as the WAIT of a depth-10 walk — it is not the cap.
+> Read `DECISIONS.md` D53 before carrying any depth figure from this document into the spec.
+
+
 > **Status: PARTLY SHIPPED.** Numbers are derived from constants read at `feat/spark` and cited
 > `file:line`; §3.0 lists defects that existed independent of which design shipped, and **all six
 > are now closed at HEAD** — each row carries the symbol that closed it. **The "nothing in §4 exists

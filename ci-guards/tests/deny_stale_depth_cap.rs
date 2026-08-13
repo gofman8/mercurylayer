@@ -1,0 +1,122 @@
+//! **[D53] A document may not publish the superseded depth cap without saying it is superseded.**
+//!
+//! The mainnet split-depth cap was published as **10 / 23 transactions** in five documents, carried
+//! into `DECISIONS.md` as a measured figure, and independently "re-derived" twice — including once
+//! by me, in the session that later found it wrong. Every derivation agreed because every derivation
+//! read the same premise: the BARE latency rule `exit_wait_blocks <= epoch`.
+//!
+//! The rule a conveyed child is actually ADMITTED by is `check_exit_headroom_with_margin`, which
+//! adds `exit_slack_margin`. Under it the caps are **8 / 19** (mainnet) and **54 / 111** (regtest);
+//! depths 9 and 10 need more headroom than an epoch can ever offer, so the build side was minting
+//! children no receiver could adopt — after terminalizing the parent.
+//!
+//! # What this guard is, and what it is not
+//!
+//! It is NOT a re-derivation. The arithmetic lives in `mercurylib`, and
+//! `the_build_side_never_admits_what_the_receive_side_refuses` is what holds the two gates together;
+//! this crate deliberately has no dependencies, so a guard here cannot recompute a cap and must not
+//! pretend to.
+//!
+//! It is a **staleness tripwire**: a document may state the old numbers only in the company of a
+//! marker saying they are superseded. That is enough to stop the specific failure that happened —
+//! a reader lifting `23` out of a scoping document into the specification — without freezing prose
+//! that legitimately records what the old baseline was.
+//!
+//! If the schedule changes and 19/111 become stale in turn, this guard goes stale with them. That is
+//! why it names D53 rather than the numbers alone: the next person to move the cap has to come here.
+
+use std::path::PathBuf;
+
+/// Documents that feed the specification. A dated audit may quote whatever it observed.
+const CHECKED: [&str; 9] = [
+    "docs/utexo/SPEC.md",
+    "docs/utexo/PROTOCOL.md",
+    "docs/utexo/CHILDREN.md",
+    "docs/utexo/LIGHTNING.md",
+    "docs/utexo/TRUST-MODEL.md",
+    "docs/utexo/ADMISSION-INPUTS.md",
+    "docs/utexo/DECISIONS.md",
+    "docs/utexo/SPEC-ROADMAP.md",
+    "docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md",
+];
+
+/// Spellings of the superseded cap. Each is specific enough that an unrelated `23` cannot trip it.
+const STALE: [&str; 6] = [
+    "max_split_depth = 10",
+    "max_split_depth = 68",
+    "23 transactions",
+    "139 transactions",
+    "depth 10 / 23",
+    "depth cap **10**",
+];
+
+/// The marker that makes a stale number legible as history rather than as fact.
+const SUPERSEDED_MARKER: &str = "D53";
+
+fn read(rel: &str) -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{rel} is readable: {e}"))
+}
+
+/// THE RULE. A document that states the old cap must also carry the D53 marker.
+#[test]
+fn a_document_stating_the_superseded_depth_cap_must_say_it_is_superseded() {
+    let mut offenders: Vec<String> = Vec::new();
+    for doc in CHECKED {
+        let src = read(doc);
+        let hits: Vec<&str> = STALE.iter().copied().filter(|s| src.contains(s)).collect();
+        if !hits.is_empty() && !src.contains(SUPERSEDED_MARKER) {
+            offenders.push(format!("{doc}: states {hits:?} with no D53 marker"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these documents publish the SUPERSEDED split-depth cap as if it were current. The shipped \
+         caps are depth 8 / 19 transactions (mainnet) and depth 54 / 111 (regtest) — the old 10/23 \
+         and 68/139 were measured against the bare latency rule, not the rule that admits, and \
+         depths 9 and 10 were unadoptable at every tip. Either correct the number or mark it as \
+         superseded by citing D53.\n\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The four scoping documents that carried the number are bannered rather than rewritten — their
+/// old figures are the "before" half of a labelled before/after and deleting them would falsify the
+/// record. This pins the banner so a later edit cannot quietly drop it.
+#[test]
+fn the_scoping_documents_that_carried_the_number_still_carry_the_correction() {
+    for doc in [
+        "docs/utexo/COLOURED-SPINE-REANCHOR-SCOPE.md",
+        "docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md",
+        "docs/utexo/SPEC-ROADMAP.md",
+        "docs/utexo/SUBECONOMIC-FINALITY.md",
+    ] {
+        let src = read(doc);
+        assert!(
+            src.contains("[D53] CORRECTION"),
+            "{doc} lost its D53 correction banner. It publishes depth figures that were measured \
+             against the wrong admission rule; without the banner a reader lifts them into the spec, \
+             which is exactly how 23 got into five documents."
+        );
+    }
+}
+
+/// NON-VACUITY. A guard that cannot fail is a census of nothing — the failure mode this repo has hit
+/// with every source-scanning test at least once.
+#[test]
+fn the_detector_would_catch_a_bare_restatement() {
+    let stale_doc = "The mainnet cap is 23 transactions and that is final.";
+    assert!(
+        STALE.iter().any(|s| stale_doc.contains(s)),
+        "the detector no longer recognises the superseded cap"
+    );
+    assert!(
+        !stale_doc.contains(SUPERSEDED_MARKER),
+        "…and a bare restatement carries no marker, so the rule above would fire on it"
+    );
+    let corrected = "The cap was 23 transactions before D53 corrected it to 19.";
+    assert!(
+        corrected.contains(SUPERSEDED_MARKER),
+        "a properly-marked historical statement must pass"
+    );
+}
