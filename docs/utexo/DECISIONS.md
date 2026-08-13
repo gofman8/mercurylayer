@@ -1982,17 +1982,46 @@ SSP's pre-pay census"* — which is the sentence that should have made someone w
   parse a `terminal` field out of an HTTP body. Verified by mutation — reintroducing the raw read
   turns it red.
 
-### RESIDUAL, stated rather than implied
+### RESIDUAL — and why it is STRUCTURAL, not a missing call
 
-`get_statechain_info` verifies the attestation against the **served** `enclave_public_key`. Binding
-that key to the chain is a separate caller step (`validate_tx0_output_pubkey`), which has exactly one
-call site repo-wide — the claim path, for the coin being claimed. Neither path binds it for a
-**parent**. So D54 closes *"the coordinator asserts terminality"* and does NOT close *"the
-coordinator serves its own enclave key for a parent"*. Closing that needs each parent's tx0 at the
-verifier, which is a further change and is not made here.
+`get_statechain_info` verifies the attestation against the **served** `enclave_public_key`. So a
+coordinator that serves its own key AND signs with it produces a self-consistent triple, and D54's
+check passes. The question is what could bind that key honestly for a PARENT.
 
-**Do not write "terminality comes from the enclave signature" unqualified in the spec.** Write it
-with this residual.
+**The review proposed `validate_tx0_output_pubkey`. That remedy is unsound, and this codebase already
+rejected it in writing** — see `ladder_binding_precheck`'s "Rejected alternatives":
+
+> `validate_tx0_output_pubkey` tests `enclave_pubkey(sid) + transfer_msg.user_public_key ==
+> tx0.out[vout]` — and **the sender chooses `user_public_key`**, so the rogue-key decomposition
+> `U := D − E_sid` makes ANY attacker-controlled output `D` pass.
+
+The authority that *does* bind is `ladder_binding_precheck`: the coordinator's per-sid
+`aggregate_pubkey` must be the key controlling `F` **read from the chain**. That is "the one value in
+the whole acceptance path that is not restatable by the sender".
+
+**It cannot be applied to a structural parent, and the reason is the design.** A branch-funded
+sub-coin's parents are precisely the coins whose outputs the un-broadcast branch spends. At depth 1
+the parent is the on-chain root and the binding is available; at depth ≥ 2 the parent's funding output
+is `SP.out[j]`, deliberately **un-broadcast**, so there is no chain to read `F.spk` from.
+
+And a binding applied only where it is available is worse than none here, for the reason that same
+doc-comment gives about a different fallback: **the attacker picks the depth**, so he picks whether
+the check runs. That hands him the trigger. So no partial check is added.
+
+### What this means for the specification — write this, not a stronger sentence
+
+* On the **child-bundle** lane, terminality is enclave-attested AND the bundle is chain-bound
+  (`verify_bundle_bound` against `aggregate_pubkey` vs on-chain `F`).
+* On the **branch-funded** lane, terminality is now enclave-attested and cross-checked against the
+  coordinator's record — but for an ancestor whose funding is un-broadcast, the enclave key itself
+  rests on the coordinator's word. A coordinator that is a *separate trust domain from the enclave*
+  (which is the deployment: `mercury-server` and `lockbox` are distinct processes) can therefore
+  still forge a parent's terminality at depth ≥ 2, without the lockbox's cooperation.
+
+**This is NOT the same as CO-1.** CO-1 says the enclave and the counter are held by the party the
+receiver is protected from; here the point is narrower and worse — the *coordinator alone* suffices.
+It is recorded as **`TRUST-MODEL.md` B11** so the spec states a bound it can defend rather than one
+it would like.
 
 ### The lesson
 
@@ -2000,3 +2029,58 @@ This is the third time this session that a **pin on a description passed while t
 wrong** — and the first time the description was a *guard*. A guard is a test, and a test scoped
 narrower than the property it names is worse than no test: it converts an open hole into a closed
 finding. When a guard's own prose names a lane, the guard must read that lane.
+
+---
+
+## D55 — [D36 T-4] closed: the builder measures the REMAINING window, not a fresh epoch
+
+**Status:** FIXED IN CODE. **Date:** 2026-08-14. This is the other half of [D53].
+
+### What was wrong
+
+`enforce_split_depth_cap_shaped` opened with
+
+```rust
+let epoch_blocks = info.initlock;
+```
+
+— the length of a **fresh** epoch, i.e. the most generous window that can ever exist. The payee's
+gate measures `available = epoch_expiry_height − tip`, which equals `initlock` only at the instant the
+coin is funded and is strictly smaller ever after: every whole-coin hop spends `interval` of it and
+every mined block spends one.
+
+So the builder was optimistic **by exactly the age of the coin**, and D53's fix — making both sides
+apply `exit_slack_margin` — left that second divergence standing. D36 named it as *"also required
+(T-4)"* and it had not been done.
+
+### The fix
+
+The window is now `epoch_deadline_from_flat_backups(parent_backups) − tip`, clamped by `initlock`
+(a coordinator that served an absurd `lockheight_init` must not be able to widen it, and a deadline
+further out than one epoch would mean the backup chain disagrees with the epoch length). It is
+derived in ONE place so the two sides cannot drift per call site — which is the property
+`the_build_side_never_admits_what_the_receive_side_refuses` asserts, now true of the live path and
+not only of the arithmetic.
+
+### The mistake worth recording, because a test caught it and reasoning did not
+
+The first implementation looked the backups up by `(wallet_name, parent_sid)`. That is correct for a
+wallet splitting its own root — and **wrong for every conveyed child**: a wallet holding a child has
+never held the root, so the query returned no rows and every grandchild split was refused outright.
+
+`SDK_E2E=17` failed on the first run with exactly that message. The parent's flat chain already
+travels WITH the bundle — `ChildTesrBundle::parent_flat_backups`, `SpineTipBundle::parent_flat_backups`
+— because the child's own receiver needs it to balance the census. So the backups are now **handed
+in** rather than looked up, which also makes them the same authority `verify_conveyed_child` reads.
+
+**A local lookup and a conveyed fact are not interchangeable, and which one a lane has is not
+guessable from the call site.** The E2E was the only thing that distinguished them.
+
+### Consequence
+
+The cap is now **tip-dependent**: the same coin admits a shallower split as its epoch ages, which is
+correct and is what the payee has always enforced. `in_ladder_split`'s cap check moved BELOW the
+`parent_backups` fetch — still strictly before the write-ahead and `set_spend_budget`, so a refusal
+still leaves the parent whole.
+
+Live: sdk17, 58, 29, 82, 36, 74, 75, 77, 78 all green.

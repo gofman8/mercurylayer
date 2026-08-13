@@ -2748,8 +2748,11 @@ pub async fn cosign_colored_spine_batch(
     // [P0-2]/[P0-3] THE DEPTH AND LENGTH CAPS, measured on the chain this batch actually mints: the
     // root's own exit chain plus one tier per intermediate segment already walked, plus this one.
     let depth = tip.ancestors.len() as u32 + 1;
+    // [D36 T-4] The window is the ROOT's: a spine tip has no flat backup chain of its own, and the
+    // epoch every leg's exit must fit inside is the one the root coin was funded into.
     enforce_split_depth_cap(
         cc,
+        &tip.parent_flat_backups,
         tip.parent.params,
         depth,
         tip.parent.exit_tiers().len() + tip.ancestors.len() + 1,
@@ -4005,7 +4008,8 @@ pub async fn cosign_colored_in_ladder_split(
     //
     // Checked BEFORE anything irreversible: the parent is terminalized further down, and a refusal
     // here leaves the carrier whole, spendable and re-transferable.
-    enforce_split_depth_cap(cc, bundle.params, 1, bundle.exit_tiers().len()).await?;
+    enforce_split_depth_cap(cc, &parent_backups, bundle.params, 1, bundle.exit_tiers().len())
+        .await?;
 
     // Every child coin is matched to its draft child BEFORE anything irreversible happens. This used
     // to be checked inside the co-signing loop, i.e. after the parent had been terminalized: a
@@ -5688,7 +5692,6 @@ pub async fn in_ladder_split(
     // is too short for even one level — check rather than assume. [P0-3] The parent's REAL tier count
     // goes with it: a rolled-over ladder is `1 + 2·levels.len()` transactions, and the children's
     // exit walks inherit every one of them.
-    enforce_split_depth_cap(cc, p, 1, bundle.exit_tiers().len()).await?;
     // Value conservation — no mint, no burn (build_split_state re-checks, but fail early with context).
     let total = mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
         .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?;
@@ -5752,6 +5755,15 @@ pub async fn in_ladder_split(
             parent_backups.len(),
         ));
     }
+    // [P0-2] A root split mints depth-1 children. Normally admissible, but not if the REMAINING
+    // window is too short for even one level — check rather than assume. [P0-3] The parent's REAL
+    // tier count goes with it: a rolled-over ladder is `1 + 2·levels.len()` transactions, and the
+    // children's exit walks inherit every one of them.
+    //
+    // [D36 T-4] This sits BELOW the `parent_backups` fetch, not above it, because the cap now
+    // measures the window those backups define. Still strictly before anything irreversible: the
+    // write-ahead and `set_spend_budget` are below, so a refusal here leaves the parent whole.
+    enforce_split_depth_cap(cc, &parent_backups, p, 1, bundle.exit_tiers().len()).await?;
 
     // [P0-3] WRITE AHEAD, THEN TERMINALIZE. Everything below `set_spend_budget` produces material the
     // SE will never re-issue; if this record is not on disk first, a crash anywhere in the rest of
@@ -6251,7 +6263,15 @@ async fn spine_batch_split_ex(
     let mut levels: Vec<SplitLevelShape> =
         tip.ancestors.iter().map(SplitLevelShape::of).collect();
     levels.push(SplitLevelShape::Spine);
-    enforce_split_depth_cap_shaped(cc, p, &levels, tip.parent.exit_tiers().len()).await?;
+    // [D36 T-4] as above: the ROOT's remaining window, not the tip's own rows.
+    enforce_split_depth_cap_shaped(
+        cc,
+        &tip.parent_flat_backups,
+        p,
+        &levels,
+        tip.parent.exit_tiers().len(),
+    )
+    .await?;
 
     // [D1] The parent's flat backup chain travels with the tip (it was conveyed into the record when
     // the tip was carved) and is what every piece's receiver counts. A record short of the deposit
@@ -6537,6 +6557,7 @@ pub async fn load(cc: &ClientConfig, wallet_name: &str, statechain_id: &str) -> 
 /// `new_depth` is the depth of the child the split is about to create (a root split child is 1).
 async fn enforce_split_depth_cap(
     cc: &ClientConfig,
+    parent_backups: &[mercurylib::wallet::BackupTx],
     p: mercurylib::tesr::TesrParams,
     new_depth: u32,
     parent_exit_tiers: usize,
@@ -6545,7 +6566,7 @@ async fn enforce_split_depth_cap(
     // this signature has always assumed. Stated as data now rather than baked into the body, because
     // the spine lane's levels are NOT that shape and the difference is a real block count.
     let levels = vec![SplitLevelShape::TwoTier; new_depth.saturating_sub(1) as usize];
-    enforce_split_depth_cap_shaped(cc, p, &levels, parent_exit_tiers).await
+    enforce_split_depth_cap_shaped(cc, parent_backups, p, &levels, parent_exit_tiers).await
 }
 
 /// **[CATS spine batch] The tiers ONE intermediate segment adds to a leaf's unilateral-exit walk.**
@@ -6732,6 +6753,7 @@ pub fn enforce_exit_chain_length(
 /// under-counted it would mint children no receiver would adopt, after the parent is terminal.
 async fn enforce_split_depth_cap_shaped(
     cc: &ClientConfig,
+    parent_backups: &[mercurylib::wallet::BackupTx],
     p: mercurylib::tesr::TesrParams,
     levels: &[SplitLevelShape],
     parent_exit_tiers: usize,
@@ -6744,7 +6766,50 @@ async fn enforce_split_depth_cap_shaped(
              than minting a child that may be unmaterialisable"
         )
     })?;
-    let epoch_blocks = info.initlock;
+    // ═══ [D36 T-4 / D55] THE REMAINING WINDOW, NOT THE CONSTANT ═══
+    //
+    // This used to be `let epoch_blocks = info.initlock;` — the length of a FRESH epoch, i.e. the
+    // most generous window that can ever exist. The payee's gate measures
+    // `available = epoch_expiry_height - tip`, which is that number only at the instant the coin is
+    // funded and strictly smaller ever after: every whole-coin hop spends `interval` of it and every
+    // mined block spends one.
+    //
+    // So the builder was optimistic by exactly the age of the coin. [D53] closed the MARGIN half of
+    // the same divergence; this is the other half D36 named as "also required (T-4)", and together
+    // they are what makes `the_build_side_never_admits_what_the_receive_side_refuses` true of the
+    // live path and not only of the arithmetic.
+    //
+    // Derived in ONE place, from the parent's OWN flat backup chain — the same authority
+    // `verify_conveyed_child` reads — so the two sides cannot drift apart per call site. `min` with
+    // `initlock` is not belt-and-braces: a coordinator that served an absurd `lockheight_init` must
+    // not be able to widen this, and a deadline further out than one epoch would mean the backup
+    // chain disagrees with the epoch length.
+    //
+    // The backups are HANDED IN rather than looked up, and that is load-bearing. A first attempt
+    // fetched them by `(wallet_name, parent_sid)` and sdk17 caught it immediately: a wallet that
+    // holds a CONVEYED CHILD has never held the root, so the query returned no rows and every
+    // grandchild split was refused. The parent's flat chain travels WITH the bundle
+    // (`ChildTesrBundle::parent_flat_backups`, `SpineTipBundle::parent_flat_backups`) precisely
+    // because the child's own receiver needs it to balance the census — so it is the same authority
+    // `verify_conveyed_child` reads, which is what makes the two sides measure one quantity.
+    let deadline = epoch_deadline_from_flat_backups(parent_backups).map_err(|e| {
+        anyhow::anyhow!(
+            "in-ladder split refused: the parent's epoch deadline is not establishable ({e}), so \
+             the window this child's exit must fit inside is unknown. Refusing rather than falling \
+             back to the full epoch — that fallback is what let the builder mint children the payee \
+             refuses [D36 T-4]."
+        )
+    })?;
+    let tip = {
+        use electrum_client::ElectrumApi;
+        cc.electrum_client.block_headers_subscribe_raw().map_err(|e| {
+            anyhow::anyhow!(
+                "in-ladder split refused: the chain tip could not be read ({e}), so the REMAINING \
+                 window cannot be measured."
+            )
+        })?.height as u32
+    };
+    let epoch_blocks = deadline.saturating_sub(tip).min(info.initlock);
     // [C-1] WHOSE SCHEDULE. `p` arrived from the CONVEYED artifact at every one of this function's
     // four call sites; the admission sites cap with `TesrParams::for_network`. Which one wins is
     // decided in exactly one place, so the two sides cannot drift apart call site by call site.
@@ -7803,8 +7868,16 @@ pub async fn child_in_ladder_split(
     // segment into `ancestors`, so every grandchild lands one level deeper. Checked BEFORE anything
     // irreversible (the child's terminalization is two statements below): a refusal here leaves the
     // child whole, spendable and re-transferable.
-    enforce_split_depth_cap(cc, p, cb.ancestors.len() as u32 + 2, cb.parent.exit_tiers().len())
-        .await?;
+    // [D36 T-4] A child has no flat backup chain — `ctesr-` rows are its bundle, not a backup
+    // ladder — so the epoch its grandchildren's exits must fit inside is the ROOT's.
+    enforce_split_depth_cap(
+        cc,
+        &cb.parent_flat_backups,
+        p,
+        cb.ancestors.len() as u32 + 2,
+        cb.parent.exit_tiers().len(),
+    )
+    .await?;
     let old_csv = cb
         .child_state
         .csv
