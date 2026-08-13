@@ -69,16 +69,16 @@ correction had already landed.
 
 ## Stage 1 — Decisions still to take
 
-Four of the ten consolidated decisions were taken by D40; **four more (4, 5, 8, 10) were taken on
-2026-08-13 as D43–D46**. **Two remain — 7 and 9 — and neither blocks writing.**
+**ALL TEN are now taken.** Four by D40; four more (4, 5, 8, 10) on 2026-08-13 as D43–D46; the last
+two (7 and 9) the same day as D47 and D48. Stage 1 is complete.
 
 | # | Decision | Blocks writing? | Note |
 |---|---|---|---|
 | ~~**8**~~ | ✅ **DECIDED (D43): K=1 per carrier.** `sdk29` is rewritten to assert the refusal. Original text: **The coloured lane's shape** — seal derivation, renewal scope, and whether coloured K>1 is built or refused | **YES** | Gated on Stage 0.1. Also the home of the `refuse_colored_multi_payee` question the suite surfaced: build idempotent coloured conveyance (journal `recipient_address`, make `convey_child_bundle` resumable) so K>1 works, or ship K=1-per-carrier and rewrite sdk29 to assert the refusal. **sdk29 fails today for exactly this reason** — it is not a bug, it is an undecided design question with a test attached. |
 | ~~4~~ | ✅ **DECIDED (D46: extend `deadline_safety_due` to carriers).** R-2 / T-1 — the unwatched calendar deadline on whole laddered coins | no | Blocks the section being *true*. The carrier lane has **zero** automatic deadline coverage. |
 | ~~5~~ | ✅ **DECIDED (D44: raise to 3.0 AND wire BumpCapability; B.5 ships with the census term).** R-1 / R3 / D31 — the defence is fee-frozen at 2.0 sat/vB and two of three lanes cannot bump | no | Blocks §5.13 being true; that file currently contradicts itself four times. |
-| 7 | D10 — the census's distinctness premise | no | One ordering change (validate before counting). |
-| 9 | R13 — conveyed child CSVs: admitted band or derived value | no | Changes what §Children's CSV law *says*. |
+| ~~7~~ | ✅ **DECIDED (D47: theorem + shape obligation in §3).** D10 — the census's distinctness premise | no | One ordering change (validate before counting). |
+| ~~9~~ | ✅ **DECIDED (D48: grid law (LANDED) + fresh-mint equality; no d_c floor).** R13 — conveyed child CSVs: admitted band or derived value | no | Changes what §Children's CSV law *says*. |
 | ~~10~~ | ✅ **DECIDED (D45: publish the measurement, no code; B.6 demoted to an optimisation).** TRUC slot contention — who may take a tier's single child slot | no | Latency, not coins: post-D14 fees cannot buy CSV maturity. **Now MEASURED** (`a_third_party_can_only_take_the_anchor_slot_by_paying_more`): the slot is an auction — it cannot be downgraded, a successful squat raises the feerate, the owner reclaims by out-bidding. The decision is now about pricing the reclaim, not about whether the exit survives. |
 
 ---

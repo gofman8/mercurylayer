@@ -1526,3 +1526,60 @@ locktime is finite, mining moves the tip toward it, and each whole-coin hop spen
 
 Nothing surfaces that calendar to a user today, which is why the automatic pass — not an API field —
 is the answer for the lane that can lose an asset.
+
+## D47 — A11 becomes a CENSUS COMPLETENESS theorem; premise four is a shape obligation (decision 7)
+
+**Decided:** promote, and discharge the distinctness premise in §3 rather than with a new check.
+
+The census `se_num_sigs == flat_backups + tiers + superseded` is exact equality, and its soundness
+rests on **A11**: every co-signature the SE issued for this coin is accounted for by exactly one
+disclosed tier. Published as a bare assumption, that is the load-bearing sentence a reviewer stops
+at.
+
+It is a theorem with four premises: A3; no CO-1; blind-signing concurrency of 1 per key; and
+**pairwise distinctness** of the things being counted. The first three are already stated. The fourth
+is the one that could silently stop holding.
+
+**Discharged by a shape obligation, not by a runtime check.** A flat backup is nVersion 2,
+nSequence 0, a height nLockTime above tip, exactly one non-`OP_RETURN` output. A tier is nVersion 3,
+nLockTime 0, exactly one 240-sat anchor, a CSV inside its bound band, and provably unconfirmable if
+superseded. Those rules already exist and are already enforced — what was missing is the statement
+that they carry a **CENSUS** obligation and not only a relay/race one.
+
+That is exactly where a future change would break A11: someone relaxes a shape rule for a good
+relay-side reason, and the two categories stop being distinguishable, and the census silently starts
+counting one thing as another. Saying so costs nothing and puts the warning where the change happens.
+
+**Rejected:** SE-side co-sign indexing (a per-coin activity oracle in a design whose SE deliberately
+sees nothing) and a runtime distinctness check (it would re-derive, at every claim, a property the
+shapes already guarantee — paying forever for a premise that is structurally true).
+
+## D48 — R13: the extension GRID law (A) plus fresh-mint equality (B); no `d_c` floor (decision 9)
+
+**Decided:** A and B. C, D and E rejected, with the reasons kept so they are not re-proposed.
+
+**The first pass aimed at the wrong parameter, and the re-derivation is the decision.** The band's
+lower edge is not the lever. `child_renewal_epoch` derives `m = (e0 − e_c)/δ_E` with EXACT
+divisibility, so a sender who mints `e_c = 719` — one block below the head, cosmetically generous,
+admitted by every band check — hands over a leaf that can **never renew**: 36 hops instead of 576, a
+**93.75% loss**. The receiver's band had no grid check at all.
+
+**(A) is LANDED** — `is_on_ext_grid` / `is_on_state_grid` run consumer-side in `verify_child_bundle`'s
+`[F4]` block on every conveyance, no branch, so it cannot be dodged on a re-transfer. The predicate's
+own test caught it admitting `SPINE_CSV = 0` on mainnet (`1440 % 36 == 0`), which is why both grids
+carry the floor bound.
+
+**(B) remains:** require `m == 0` and `d_c == d0` on a FRESH MINT, discriminated by the
+exact-equality census count — a fresh child expects 2, a renewed leaf discloses superseded
+EXTENSIONS, a re-transferred leaf discloses superseded STATES. The discrimination is exact precisely
+because a sender cannot omit a superseded tier without failing the census.
+
+**(C) a minimum `d_c` on re-transfer is REJECTED.** `child_supersede_csv` lets an honest final hop
+convey `d_c = 144`, and that leaf is not dead: `renew_child` resets it to 1440 for zero on-chain
+bytes and zero depth (`sdk84`), and `child_in_ladder_split` mints grandchildren at a fresh 576-hop
+schedule. A floor strands honest coins for a harm both remedies already undo. The honest cost of a
+floored `d_c` is **36 of 576 hops = 6.25%**, not the 100% the first pass claimed.
+
+**(D) declare-and-verify** hands the payee a knob with no principled setting — D19's polling-interval
+shape. **(E) pricing the piece against its budget** deletes the sub-economic lane the design was
+selected to open, and bills the wrong party.
