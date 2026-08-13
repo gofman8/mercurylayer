@@ -768,24 +768,26 @@ pub async fn execute() -> Result<()> {
     assert!(r_fwd.used_split, "[D43] a partial pay out of a tip carves a piece");
     assert_eq!(r_fwd.coins.len(), 1, "one payee, one piece");
     let bob_total = PAY_BOB + second_pay;
-    // **THE MONEY IS THE CHILDREN, so that is what this waits on.** The old shape waited on the
-    // SETTLED BALANCE, which summed correctly when the second allocation arrived as a whole-child
-    // forward. It does NOT sum when the second arrives as a piece carved from a SPINE TIP: both
-    // children are adopted (the accept log says "already adopted" for both) and both carry their
-    // allocation, but `get_asset_balance` still reports only the first.
+    // **[#152] THE SUM IS ASSERTED AGAIN, and this is what the fix bought.**
     //
-    // That is recorded as an open observation rather than asserted away — see task #152. It is a
-    // QUERY discrepancy, not a loss: the assertions below read each child's own consignment, which
-    // is the authority, and they are what a receiver's safety actually rests on.
-    let mut bob_kids = Vec::new();
-    for _ in 0..60 {
-        bob.claim().await?;
-        bob_kids = colored_children_of(&cc, "sdk29_bob", &asset_p2).await?;
-        if bob_kids.len() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    // This waited on the settled balance, which summed a second receive arriving as a whole-child
+    // forward but NOT one carved from a SPINE TIP: both children adopted, both carrying their
+    // allocation, one balance. `get_asset_balance` is chain-anchored and every allocation here is
+    // deliberately un-broadcast, so what it can settle depended on the SHAPE the allocation arrived
+    // in — which is not a property a balance should have.
+    //
+    // `get_token_balances` now takes the off-chain half from the wallet's OWN adopted material
+    // (carriers, `ctesr-` children, `spinetip-` tips), so the shape stops mattering. The per-child
+    // assertions below stay: they read each consignment directly, which is the authority the sum is
+    // only a convenience over.
+    wait_token_balance(&bob, &asset_p2, bob_total).await?;
+    assert_eq!(
+        token_balance(&bob, &asset_p2).await?,
+        bob_total,
+        "[#152] second receive must SUM: {PAY_BOB} + {second_pay} = {bob_total}, whether the second \
+         arrived as a whole-child forward or as a piece carved from a spine tip"
+    );
+    let bob_kids = colored_children_of(&cc, "sdk29_bob", &asset_p2).await?;
     assert_eq!(bob_kids.len(), 2, "bob holds TWO coloured children of the same asset");
     let mut bob_amounts: Vec<u64> =
         bob_kids.iter().map(|(_, cb)| cb.rgb.as_ref().unwrap().amount).collect();

@@ -1332,23 +1332,92 @@ impl UtexoWallet {
         if self.inner.config.rgb_data_dir.is_none() || self.inner.config.rgb_proxy_url.is_none() {
             return Ok(vec![]);
         }
+        // [#152] The LEDGER first, computed before the RGB engine is borrowed (it needs the wallet
+        // DB, which the engine's `block_in_place` closure cannot await inside).
+        let ledger = self.ledger_token_balances().await?;
         let mut rgb = self.rgb().await?;
         let w = rgb.as_mut().unwrap();
         tokio::task::block_in_place(|| -> Result<Vec<TokenBalance>> {
             let mut out = Vec::new();
             for (asset_id, ticker, name, precision) in w.list_assets()? {
                 let (settled, future, _spendable) = w.balance(&asset_id)?;
+                // **[#152] THE OFF-CHAIN MATERIAL IS THE LEDGER'S, NOT THE ENGINE'S.**
+                //
+                // `get_asset_balance` is chain-anchored: it settles an allocation when its witness
+                // is mined. Every allocation in this design is deliberately UN-BROADCAST, so what
+                // the engine can settle depends on the SHAPE the allocation arrived in — and a
+                // second receive carved from a spine tip was not being counted at all, while the
+                // same allocation arriving as a whole-child forward was. Two adopted children, both
+                // carrying their consignment, one balance.
+                //
+                // The authority is the wallet's own adopted material: root carriers, `ctesr-`
+                // children and `spinetip-` tips, each read from the bundle whose consignment the
+                // receiver already validated. That is what a receiver's safety rests on, so it is
+                // what the balance reports.
+                let led = ledger.get(&asset_id).copied().unwrap_or(0);
                 out.push(TokenBalance {
                     asset_id,
                     ticker: Some(ticker),
                     name: Some(name),
                     precision,
-                    balance: settled,
-                    total: future,
+                    balance: led.max(settled),
+                    total: future.max(led),
                 });
             }
             Ok(out)
         })
+    }
+
+    /// **[#152] Every raw unit this wallet holds, per contract, from its OWN records.**
+    ///
+    /// Sums the three shapes a coloured allocation can live in — a root CARRIER (`tesr-`), an
+    /// adopted CHILD (`ctesr-`) and a spine TIP (`spinetip-`) — over confirmed, non-duplicate coins.
+    /// Every amount comes from the bundle's `rgb` half, which is the consignment-derived figure the
+    /// receiver validated at claim; none of it is a sender-declared number.
+    ///
+    /// This is deliberately NOT a second opinion to be averaged with the RGB engine's. It is the
+    /// off-chain half of the truth, which a chain-anchored `get_asset_balance` structurally cannot
+    /// see, and it is combined with `max` so that on-chain material the ledger does not track (an
+    /// exited allocation now living on a plain UTXO) is still reported.
+    pub async fn ledger_token_balances(&self) -> Result<std::collections::HashMap<String, u64>> {
+        use std::collections::HashMap;
+        let name = &self.inner.config.wallet_name;
+        let cc = &self.inner.cc;
+        let record = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, name).await?;
+        let sids: Vec<String> = record
+            .coins
+            .iter()
+            .filter(|c| {
+                c.status == mercurylib::wallet::CoinStatus::CONFIRMED && c.duplicate_index == 0
+            })
+            .filter_map(|c| c.statechain_id.clone())
+            .collect();
+        drop(record);
+
+        let mut out: HashMap<String, u64> = HashMap::new();
+        for sid in sids {
+            // Probed in the same order as `parent_shape`: tip (narrowest key), child, root. A coin
+            // is exactly one of the three, so the first hit is the answer and there is no
+            // double-counting to guard against.
+            if let Some(t) = mercuryrustlib::tesr::load_spine_tip(cc, name, &sid).await? {
+                if let Some(r) = t.rgb.as_ref() {
+                    *out.entry(r.contract_id.clone()).or_default() += r.amount;
+                }
+                continue;
+            }
+            if let Some(cb) = mercuryrustlib::tesr::load_child(cc, name, &sid).await? {
+                if let Some(r) = cb.rgb.as_ref() {
+                    *out.entry(r.contract_id.clone()).or_default() += r.amount;
+                }
+                continue;
+            }
+            if let Some(b) = mercuryrustlib::tesr::load(cc, name, &sid).await? {
+                if let Some(r) = b.rgb.as_ref() {
+                    *out.entry(r.contract_id.clone()).or_default() += r.amount;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Outpoints (`"txid:vout"`) of every coin that currently carries an RGB token allocation.
