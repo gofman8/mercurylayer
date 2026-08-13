@@ -1457,8 +1457,28 @@ mod transfer_signature_tests {
     // asserted here so a schedule change that silently breaks the invariant is caught.
     // ---------------------------------------------------------------------------------------
 
-    /// The exit chain of a depth-`d` in-ladder split child on the mainnet schedule:
+    /// The **PRE-CATS** exit chain of a depth-`d` in-ladder split child on the mainnet schedule:
     /// `T (none) | X_m 720 | SP 1404 | (d−1)×(720, 1404) | ext_child 720 | state_child 1440`.
+    ///
+    /// ⚠️ **THIS IS NOT THE SHAPE THE BUILDERS SIGN TODAY, and the label is load-bearing.** The live
+    /// builders (`in_ladder_split`, `child_in_ladder_split`, `spine_batch_split`) sign `SP` at
+    /// `SPINE_CSV = 0`, not at a state rung — so the CURRENT depth-1 mainnet chain is
+    /// `[None, 720, 0, 720, 1440]`, 2 880 blocks of timelock rather than 4 284. `sdk88` measures
+    /// exactly that shape live on regtest (`[None, 12, 0, 12, 24]`).
+    ///
+    /// It is retained DELIBERATELY [D31], for two reasons:
+    ///   * it is the "before" half of the labelled before/after in
+    ///     `docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.2, and deleting it makes the multi-year exit
+    ///     read as current;
+    ///   * every test below that uses it is a MARGIN test, and `3 + 2d ≥ d + 4` — over-counting a
+    ///     margin makes a watchtower act EARLIER, which is the safe direction. A margin fixture is
+    ///     the one place a conservative shape is correct.
+    ///
+    /// **Do not read a live figure off this function.** Economics and any published WAIT(d) must use
+    /// `tesr_exit_wait_blocks` (`clients/libs/rust-sdk/src/config.rs`), which is shape-aware and
+    /// yields `720·d + 2160 + (3 + 2d)` — the source of the published depth-10 figure of 9 383
+    /// blocks. This comment previously described this fixture as "the exit chain … on the mainnet
+    /// schedule" full stop, which is how a spec author would have published 2124·d as current.
     fn mainnet_chain(d: u32) -> Vec<Option<u16>> {
         let mut v = vec![None, Some(720), Some(1404)];
         for _ in 1..d {
@@ -1470,16 +1490,19 @@ mod transfer_signature_tests {
         v
     }
 
+    /// Pins the PRE-CATS baseline, not a live figure — see [`mainnet_chain`]. The live shape is
+    /// `720·d + 2160` (`tesr_exit_wait_blocks`); this asserts the "before" half of the labelled
+    /// comparison in `PARTIAL-PAYMENT-ECONOMICS.md` §1.2 so that half cannot drift either.
     #[test]
-    fn exit_wait_matches_the_measured_schedule() {
-        // §1.2: WAIT(d) = 2124·d + 2160 blocks of timelock, over 3 + 2d transactions.
+    fn exit_wait_matches_the_pre_cats_baseline() {
+        // §1.2 baseline: WAIT(d) = 2124·d + 2160 blocks of timelock, over 3 + 2d transactions.
         for d in 1..=5u32 {
             let chain = mainnet_chain(d);
             assert_eq!(chain.len() as u32, 3 + 2 * d, "d={d}: 3 + 2d exit transactions");
             assert_eq!(
                 super::exit_csv_total(&chain),
                 2124 * d + 2160,
-                "d={d}: the documented WAIT(d) timelock total"
+                "d={d}: the pre-CATS baseline WAIT(d) timelock total"
             );
             // Plus one confirmation per transaction — a CSV cannot start before its parent confirms.
             assert_eq!(super::exit_wait_blocks(&chain), 2124 * d + 2160 + (3 + 2 * d));
