@@ -200,6 +200,33 @@ Not nothing, and this is the part worth acting on while the rest proceeds:
 
 ---
 
+## THE PLAN IS COMPLETE — 2026-08-13
+
+Every item is landed and verified except **Stage 0.4**, which is an external dependency, not
+unfinished work: both closed forms are queries over DEPLOYED coins and regtest has none that mean
+anything. They are constructible (D40.3) and remain UNEVALUATED until there is a fleet.
+
+| | |
+|---|---|
+| Owner decisions | **10 of 10 taken** |
+| Critical-path code | **13 of 14 landed**; B.8 proven not buildable as specified (D41), B.6 demoted to an optimisation (D45) |
+| Live E2E suite | **88/88** |
+| Unit + guard suite | **756, 0 failures** |
+
+**Three things landed AFTER the decisions were taken and change what the spec should say.** All
+three were found by measuring rather than reasoning, and all three are recorded with their numbers:
+
+1. **The anchor slot is an auction, not a race** (D45). An under-paying squat is refused; an
+   over-paying one RAISES the tier's feerate at the attacker's expense; the owner reclaims by
+   out-bidding. TRUC contention is a price, not a DoS.
+2. **K = 1 bounds the payees of one PAYMENT, not the payments of one carrier** (D43, measured by
+   `sdk29`'s rewrite). The sender's change lands on a coloured spine tip, and that tip is payable
+   again. A much weaker limitation than the decision was taken under.
+3. **INV-27 is true of the CSV side only** (`sdk86`). The flat calendar is real, finite, and spent by
+   HOPS as well as by blocks — `interval` per whole-coin hop, 100 hops on either preset.
+
+**What is left is writing.**
+
 ## The honest summary
 
 **Nothing is blocking.** Stage 0 is complete except 0.4 (an external dependency — it needs a
