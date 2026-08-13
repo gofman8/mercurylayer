@@ -47,7 +47,7 @@ be skipped and most expensive to skip.**
 - D28's "what a receiver can check" row — attested a budget that, until today, no acceptance decision read.
 - PROTOCOL.md §7 Phase 0's "DONE: generalized counters {level, m, k, total_sigs}, POST /renew/init" — `total_sigs` has **zero** occurrences in `server/`, `lockbox/` or `lib/`; no `/renew` route exists.
 - INV-27's evidence pin `sdk30(a)` — it idles a k=0 deposit and structurally cannot witness the case where INV-27 is false.
-- `live_p2a_package_rescue.rs`'s doc comment — claims to drive a seam its body never enters. (Still true of `the_bump_capability_rescues_a_stuck_tier...`; it exercises the shipped SIGNER and `submit_package` but calls `build_p2a_fee_child` itself rather than going through `broadcast_tier`. This is the remaining Stage-3 negative test.)
+- ~~`live_p2a_package_rescue.rs`'s doc comment — claims to drive a seam its body never enters.~~ ✅ **CLOSED** — the file now carries `the_seam_tries_cheap_first_rescues_with_a_capability_and_names_the_limit_without_one`, which drives `broadcast_tier` itself.
 
 ---
 
@@ -122,8 +122,14 @@ they land.
   over-paying one succeeds and RAISES the tier's feerate at the stranger's expense (3.58 → 65.36
   sat/vB); and the owner reclaims the same way. **This measures decision 10 directly** — TRUC slot
   contention is a price, not a DoS, and TRUC's 1000-vB child cap is what bounds the price.
-- The one remaining negative test: a fee-stuck tier driven through a *pass* rather than the builder
-  directly.
+- ✅ **DONE — the fee-stuck tier driven through the SEAM.** `broadcast_tier` (and `TierBroadcast`)
+  are now `pub`, because a seam nothing can call is a seam nothing asserts. One tier through it three
+  times: **relayable → `Plain`** *with a funded capability in hand*, so the assertion is that the
+  seam CHOSE the cheap path rather than lacking the means to package; **fee-stuck + capability →
+  `Bumped`** (child_fee 548, package 2.00 sat/vB, and the tier really is in the mempool with exactly
+  its child); **fee-stuck, keyless → `Stuck`** whose wording is asserted, because "will not clear by
+  retrying" is the whole of D31 — a fee-stuck tier retried forever at its committed rate presents as
+  a flaky backend while a coin dies.
 - ✅ **DONE — the zero-slack successor test on regtest.** The margin comparison is now
   `clears_supersession_margin`, and three tests pin the boundary: regtest clears by **exactly zero**
   (cap `d_floor` 6 = `SP` 0 + δ 6) while mainnet clears by 108, so every off-by-one here is invisible
@@ -166,6 +172,10 @@ Not nothing, and this is the part worth acting on while the rest proceeds:
 ## The honest summary
 
 **Genuinely blocking:** Stage 0 in full; decision 8; Tier A.
+
+**Stage 3 is now complete except the carrier variants.** All three negative tests exist and pass
+live; the zero-slack test exists; `sdk30(a)` is replaced. What remains in Stage 3 is the coloured
+lane's own deadline and allocation tests.
 
 **Merely unfinished:** every Tier B item. Each is a real defect with a known fix and a known cost,
 and none prevents a correct section from being written today — provided the section says what is

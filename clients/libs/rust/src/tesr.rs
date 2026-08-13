@@ -9781,8 +9781,13 @@ fn p2a_vout_of(tx: &electrum_client::bitcoin::Transaction) -> Option<u32> {
 }
 
 /// What happened to one tier.
+///
+/// **`pub` deliberately** [Stage 3]: this and [`broadcast_tier`] are the SEAM that `exit_pass` and
+/// `watch_pass` go through, and until now no test could reach either — the live rescue test drove
+/// `build_p2a_fee_child` + `submit_package` directly and its doc comment claimed to exercise a seam
+/// its body never entered. A seam nothing can call is a seam nothing asserts.
 #[derive(Debug)]
-enum TierBroadcast {
+pub enum TierBroadcast {
     /// Relayed on its own; no package needed.
     Plain,
     /// Refused alone, then accepted as a 1P1C package.
@@ -9796,7 +9801,7 @@ enum TierBroadcast {
 /// Order matters: the plain broadcast is tried FIRST, always. Most tiers relay at their committed
 /// rate and a package would spend the owner's sats to achieve the same result. The rescue is for the
 /// case where the cheap path has already failed.
-fn broadcast_tier(
+pub fn broadcast_tier(
     electrum: &electrum_client::Client,
     tier_raw: &[u8],
     tier_txid: &str,

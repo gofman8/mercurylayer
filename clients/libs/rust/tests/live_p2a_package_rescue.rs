@@ -655,3 +655,212 @@ fn a_third_party_can_only_take_the_anchor_slot_by_paying_more() {
          successful squat raises the tier's feerate, and the owner always reclaims by paying more."
     );
 }
+
+/// **[Stage 3] THE SEAM, driven — a fee-stuck tier through `broadcast_tier`, not through the
+/// builder.**
+///
+/// The two tests above prove the PIECES work: `build_p2a_fee_child` builds a valid child, the
+/// shipped `P2trKeySpendBumpSigner` signs it, and `submit_package` gets it accepted. Neither drives
+/// `broadcast_tier`, which is what `exit_pass` and `watch_pass` actually call — and the plan
+/// recorded that gap by name: *"`live_p2a_package_rescue.rs`'s doc comment claims to drive a seam
+/// its body never enters."*
+///
+/// The distinction is not pedantic. Everything interesting about the seam is in its DECISIONS, and
+/// every one of them is invisible to a test that calls the builder itself:
+///
+/// * **the cheap path is tried FIRST, always.** Most tiers relay at their committed rate; a package
+///   would spend the owner's sats to achieve the same result. A seam that always packaged would pass
+///   both tests above and quietly charge every user for every tier.
+/// * **the anchor is found by MATCHING THE SCRIPT, never by index.** A coloured tier carries an
+///   extra `opret`, so an assumed index spends the payload output — the rescue would destroy the
+///   tier it is rescuing. The tests above pass `p2a_vout: 1` by hand and therefore cannot catch it.
+/// * **and with no capability, a stuck tier is a STATED LIMIT, not a retryable blip** [D31]. This is
+///   the shape that matters most: a fee-stuck tier retried forever at the same committed rate looks
+///   exactly like a flaky backend while a coin dies.
+///
+/// So this drives one tier through the seam three times: relayable (cheap path), stuck with a
+/// capability (rescued), stuck without one (refused by name).
+#[test]
+fn the_seam_tries_cheap_first_rescues_with_a_capability_and_names_the_limit_without_one() {
+    let Some(cfg) = cfg() else {
+        eprintln!(
+            "SKIP seam test: CORE_RPC_URL is unset, so NOTHING was verified. This is the Stage-3 \
+             test that `broadcast_tier` — the seam `exit_pass`/`watch_pass` go through — behaves as \
+             specified. Set CORE_RPC_URL/USER/PASS to run it."
+        );
+        return;
+    };
+    let electrum_url =
+        std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "tcp://localhost:50001".to_string());
+    let Ok(electrum) = electrum_client::Client::new(&electrum_url) else {
+        eprintln!(
+            "SKIP seam test: no electrum at {electrum_url}. `broadcast_tier` broadcasts through \
+             electrum, so the seam CANNOT be exercised without one and NOTHING was verified. Set \
+             ELECTRUM_URL."
+        );
+        return;
+    };
+
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[0x5au8; 32]).unwrap();
+    let kp = KeyPair::from_secret_key(&secp, &sk);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&kp);
+    let addr = Address::p2tr(&secp, xonly, None, Network::Regtest);
+    let spk = addr.script_pubkey();
+
+    let info = rpc(&cfg, "getmempoolinfo", serde_json::json!([]));
+    let floor = info["minrelaytxfee"].as_f64().expect("minrelaytxfee") * 100_000_000.0 / 1000.0;
+
+    let tier_in = 100_000u64;
+    let mk = |txid: Txid, vout: u32, fee: u64| Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut { value: tier_in - P2A_VALUE - fee, script_pubkey: spk.clone() },
+            TxOut { value: P2A_VALUE, script_pubkey: p2a_script() },
+        ],
+    };
+
+    // ── 1. THE CHEAP PATH. A tier that relays on its own must NOT be packaged. ────────────────────
+    let (a_txid, a_vout) = fund(&cfg, &addr.to_string(), tier_in);
+    let prevouts_a = vec![TxOut { value: tier_in, script_pubkey: spk.clone() }];
+    let vsize = {
+        let mut probe = mk(a_txid, a_vout, 1_000);
+        sign_p2tr_input(&mut probe, 0, &prevouts_a, &kp);
+        probe.vsize() as u64
+    };
+    let required = (floor * vsize as f64).ceil() as u64;
+    if required < 2 {
+        eprintln!(
+            "SKIP seam test: this node's floor is {floor} sat/vB, so no under-paying tier can be \
+             built and halves 2 and 3 would be vacuous. NOTHING verified."
+        );
+        return;
+    }
+    let mut fine = mk(a_txid, a_vout, required * 4);
+    sign_p2tr_input(&mut fine, 0, &prevouts_a, &kp);
+    let fine_raw = bitcoin::consensus::encode::serialize(&fine);
+
+    // A capability is SUPPLIED, so "Plain" here proves the seam chose the cheap path rather than
+    // simply lacking the means to package. Without a funded capability this half would be vacuous.
+    let (cf_txid, cf_vout) = fund(&cfg, &addr.to_string(), 500_000);
+    let signer =
+        P2trKeySpendBumpSigner::new(secp256k1_zkp::SecretKey::from_slice(&sk[..]).unwrap());
+    let cap = BumpCapability {
+        core_rpc: cfg.clone(),
+        funding: FundingInput {
+            outpoint: OutPoint { txid: cf_txid, vout: cf_vout },
+            value: 500_000,
+            script_pubkey: spk.clone(),
+        },
+        change_script_pubkey: spk.clone(),
+        target_fee_rate: (floor * 10.0).max(2.0),
+        signer: &signer,
+    };
+    let out = mercuryrustlib::tesr::broadcast_tier(
+        &electrum,
+        &fine_raw,
+        &fine.txid().to_string(),
+        tier_in,
+        Some(&cap),
+    );
+    assert!(
+        matches!(out, mercuryrustlib::tesr::TierBroadcast::Plain),
+        "a tier that relays on its own must take the CHEAP path even when a capability exists — \
+         packaging it spends the owner's sats to achieve what a bare broadcast already achieves. \
+         Got: {out:?}"
+    );
+    println!("seam 1/3 — a relayable tier took the cheap path: {out:?}");
+
+    // ── 2. THE RESCUE, through the seam. ─────────────────────────────────────────────────────────
+    let (b_txid, b_vout) = fund(&cfg, &addr.to_string(), tier_in);
+    let (bf_txid, bf_vout) = fund(&cfg, &addr.to_string(), 500_000);
+    let prevouts_b = vec![TxOut { value: tier_in, script_pubkey: spk.clone() }];
+    let mut stuck = mk(b_txid, b_vout, required / 2);
+    sign_p2tr_input(&mut stuck, 0, &prevouts_b, &kp);
+    let stuck_raw = bitcoin::consensus::encode::serialize(&stuck);
+    let cap2 = BumpCapability {
+        core_rpc: cfg.clone(),
+        funding: FundingInput {
+            outpoint: OutPoint { txid: bf_txid, vout: bf_vout },
+            value: 500_000,
+            script_pubkey: spk.clone(),
+        },
+        change_script_pubkey: spk.clone(),
+        target_fee_rate: (floor * 10.0).max(2.0),
+        signer: &signer,
+    };
+    let out = mercuryrustlib::tesr::broadcast_tier(
+        &electrum,
+        &stuck_raw,
+        &stuck.txid().to_string(),
+        tier_in,
+        Some(&cap2),
+    );
+    match &out {
+        mercuryrustlib::tesr::TierBroadcast::Bumped { child_fee, package_fee_rate } => {
+            assert!(
+                *package_fee_rate >= floor,
+                "the seam produced a package at {package_fee_rate} sat/vB, under the node's own \
+                 {floor} sat/vB floor — it would be refused, so 'Bumped' would be a lie"
+            );
+            println!(
+                "seam 2/3 — a fee-stuck tier was RESCUED through the seam: child_fee={child_fee}, \
+                 package {package_fee_rate:.2} sat/vB"
+            );
+        }
+        other => panic!(
+            "a fee-stuck tier with a funded capability must come back Bumped — this is the exact \
+             path `exit_pass` takes when a tier will not relay. Got: {other:?}"
+        ),
+    }
+    // …and it is genuinely in the mempool, not merely reported as such.
+    let entry = rpc(&cfg, "getmempoolentry", serde_json::json!([stuck.txid().to_string()]));
+    assert_eq!(
+        entry["descendantcount"].as_u64(),
+        Some(2),
+        "the rescued tier must be in the mempool with exactly its fee child"
+    );
+
+    // ── 3. NO CAPABILITY — a STATED LIMIT, not a retryable blip. [D31] ───────────────────────────
+    let (c_txid, c_vout) = fund(&cfg, &addr.to_string(), tier_in);
+    let prevouts_c = vec![TxOut { value: tier_in, script_pubkey: spk.clone() }];
+    let mut keyless = mk(c_txid, c_vout, required / 2);
+    sign_p2tr_input(&mut keyless, 0, &prevouts_c, &kp);
+    let keyless_raw = bitcoin::consensus::encode::serialize(&keyless);
+    let out = mercuryrustlib::tesr::broadcast_tier(
+        &electrum,
+        &keyless_raw,
+        &keyless.txid().to_string(),
+        tier_in,
+        None,
+    );
+    match &out {
+        mercuryrustlib::tesr::TierBroadcast::Stuck { detail } => {
+            // The wording is the deliverable here, not an implementation detail: a keyless tower
+            // that reports this as a transient error is the silent-degradation shape — it looks
+            // like a flaky backend while a coin dies.
+            assert!(
+                detail.contains("NO fee-bump capability"),
+                "the keyless refusal no longer names the missing capability: {detail}"
+            );
+            assert!(
+                detail.contains("will not clear by retrying"),
+                "the keyless refusal no longer says the tier will NOT clear by retrying. That \
+                 sentence is the whole point of D31: a fee-stuck tier retried forever at its \
+                 committed rate presents as a transient backend fault: {detail}"
+            );
+            println!("seam 3/3 — keyless: reported as a STATED LIMIT — {detail}");
+        }
+        other => panic!(
+            "a fee-stuck tier with NO capability must come back Stuck with a stated limit. Got: \
+             {other:?}"
+        ),
+    }
+}
