@@ -1375,6 +1375,29 @@ payees uses two carriers. The limitation is named rather than worked around.
 (16–21 weeks, `COLOURED-SPINE-REANCHOR-SCOPE.md`). K=1 is a statement about batching, not about the
 ladder.
 
+### What the rewrite MEASURED (`sdk29`, live, 2026-08-13)
+
+Rewriting the test answered the question the decision left open — *is K=1 one payment per carrier,
+or one payee per payment?* — by executing it rather than reasoning about it:
+
+* **The K=1 lane leaves the sender a coloured SPINE TIP, not a change child.** The three-payee batch
+  carved K payee children plus a change child; the single-payee lane leaves the remainder as the
+  batch's tip (`spinetip-`, its own row, its own health probe).
+* **That tip is PAYABLE AGAIN.** Alice made a second payment out of it, carving a fresh piece and a
+  fresh tip. So **K = 1 bounds the payees of one PAYMENT, not the payments of one carrier** — a much
+  weaker limitation than the decision was taken under, and the right one to publish.
+* **Moving a tip's WHOLE holding is refused**, by name, because a spine batch needs a change leg to
+  fund the next payment. The refusal names `convey the tip whole` as the remedy. That is the
+  boundary between the two operations and the test pins it.
+* A second payee is served by forwarding an adopted child WHOLE. Raw-unit conservation holds end to
+  end (Σ = SUPPLY) summed over children + tip.
+
+**One open observation, recorded rather than asserted away.** `get_asset_balance` sums a second
+receive when it arrives as a whole-child forward, but NOT when it arrives as a piece carved from a
+spine tip: both children are adopted and both carry their allocation, and the settled balance still
+reports only the first. The money is right — the test now reads each child's own consignment, which
+is the authority — but the getter is wrong. Spun out as its own item.
+
 ## D44 — `committed_fee_rate` 2.0 → 3.0, and `BumpCapability` through every lane (decision 5)
 
 **Decided:** raise the committed rate AND wire the bump. Both, and B.5 lands with the census term.

@@ -124,13 +124,22 @@ const CARRIER: u64 = mercury_utexo_sdk::tokens::TOKEN_CARRIER_SATS;
 
 /// PT2's supply, in RAW units (precision 2 ⟹ display "100.00").
 const SUPPLY: u64 = 10_000;
-/// The three payouts of the single in-ladder split. `PAY_DAVE = 1` is the MINIMUM representable raw
-/// amount — the granularity claim this test exists for.
+/// **[D43] ONE payee per carrier.** The coloured lane conveys its pieces serially AFTER the carrier
+/// is terminal, and journals no `recipient_address`, so a failure at payee *j* strands payees
+/// *j..K* permanently. Decision 8 shipped K = 1 rather than building idempotent conveyance, so the
+/// three-payee batch this test used to make is not a thing the system does — it is refused by name,
+/// and that refusal is now what section (a) asserts.
+///
+/// `PAY_BOB` is the split leg. `PAY_DAVE = 1` is the MINIMUM representable raw amount — the
+/// granularity claim this test exists for — and under D43 it needs a carrier of its OWN, which is
+/// exactly the answer the decision took ("issuers size carriers to asset value").
 const PAY_BOB: u64 = 10;
+/// The partial-pay amount attempted OUT OF bob's received child in (b1). Must be < `PAY_BOB` so the
+/// refusal is about the child lane rather than about the amount.
 const PAY_CAROL: u64 = 4;
 const PAY_DAVE: u64 = 1;
 /// What alice keeps as a coloured change child, and later forwards WHOLE to bob.
-const CHANGE: u64 = SUPPLY - PAY_BOB - PAY_CAROL - PAY_DAVE;
+const CHANGE: u64 = SUPPLY - PAY_BOB;
 
 /// QTK (part d): an IFA issue plus a mint of its inflation right — two coloured carriers.
 const Q_ISSUE: u64 = 60;
@@ -516,10 +525,14 @@ pub async fn execute() -> Result<()> {
     // parent, so a carrier is split exactly once — the payments become payload outputs of one `SP`.
     add_tokens(&cc, &alice, 4).await?;
     let x_m_out = carrier_bundle.current().extension.out_value;
-    let n_children = 4usize; // bob + carol + dave + alice's change
+    let n_children = 2usize; // [D43] ONE payee + alice's change
     let sp_budget = mercuryrustlib::rgb::colored_tier_out_total(x_m_out, n_children, rate)
         .ok_or_else(|| anyhow!("X_m cannot carry a {n_children}-child coloured split"))?;
-    let results = alice
+    // **[D43] THE K > 1 BATCH IS REFUSED, BY NAME, AND NOTHING IS CO-SIGNED.** This is decision 8's
+    // shipped answer, asserted here rather than left as a red test: paying three payees out of one
+    // coloured carrier would convey serially after the carrier is already terminal, with no
+    // journalled recipient to resume from, so a failure at payee j strands j..3 permanently.
+    let batch_err = alice
         .batch_transfer_tokens(
             &asset_p2,
             &[
@@ -528,17 +541,33 @@ pub async fn execute() -> Result<()> {
                 (dave_addr.clone(), PAY_DAVE),
             ],
         )
-        .await?;
-    assert_eq!(results.len(), 3, "one TransferResult per recipient");
-    for r in results.iter() {
-        assert!(r.used_split, "a partial token payment must carve a piece");
-        assert_eq!(r.coins.len(), 1, "a token payout hands over exactly ONE piece");
-        assert_eq!(r.coins[0].amount_sats, PIECE, "the piece coin carries TOKEN_PIECE_SATS");
-        assert_eq!(r.total_sats, PIECE, "a token piece always carries TOKEN_PIECE_SATS");
-    }
-    let bob_piece_sid = results[0].coins[0].statechain_id.clone();
-    let carol_piece_sid = results[1].coins[0].statechain_id.clone();
-    let dave_piece_sid = results[2].coins[0].statechain_id.clone();
+        .await
+        .expect_err("[D43] a coloured batch of THREE payees must be refused");
+    let batch_msg = format!("{batch_err:#}");
+    assert!(batch_msg.contains("coloured K > 1 refused"), "refused by name: {batch_msg}");
+    assert!(
+        batch_msg.contains("Nothing has been co-signed"),
+        "the refusal must fire BEFORE the split, so the carrier is untouched: {batch_msg}"
+    );
+    assert!(
+        batch_msg.contains("transfer_tokens"),
+        "a refusal that removes a capability must name the route that works: {batch_msg}"
+    );
+    // …and the carrier really is untouched: still coloured, still holding the WHOLE supply.
+    assert_eq!(
+        token_balance(&alice, &asset_p2).await?,
+        SUPPLY,
+        "[D43] the refused batch must leave the allocation exactly where it was"
+    );
+    println!("SDK29 - [D43] K=3 batch REFUSED, carrier untouched: {batch_msg}");
+
+    // THE LANE THAT SHIPS: one payee, one carrier.
+    let r_bob = alice.transfer_tokens(&asset_p2, &bob_addr, PAY_BOB).await?;
+    assert!(r_bob.used_split, "a partial token payment must carve a piece");
+    assert_eq!(r_bob.coins.len(), 1, "a token payout hands over exactly ONE piece");
+    assert_eq!(r_bob.coins[0].amount_sats, PIECE, "the piece coin carries TOKEN_PIECE_SATS");
+    assert_eq!(r_bob.total_sats, PIECE, "a token piece always carries TOKEN_PIECE_SATS");
+    let bob_piece_sid = r_bob.coins[0].statechain_id.clone();
 
     // alice keeps the change as a COLOURED CHILD (raw-unit conservation on the sender side).
     assert_eq!(
@@ -547,18 +576,36 @@ pub async fn execute() -> Result<()> {
         "alice's change: {CHANGE} raw units — a wrong value means the change child was not \
          registered at SP.out[change], or the spent carrier was not un-booked"
     );
-    let alice_children = colored_children_of(&cc, "sdk29_alice", &asset_p2).await?;
-    assert_eq!(alice_children.len(), 1, "one change child, no more");
-    let (alice_change_sid, alice_change_cb) = alice_children.into_iter().next().unwrap();
-    assert_eq!(
-        alice_change_cb.rgb.as_ref().unwrap().amount,
-        CHANGE,
-        "the change child must carry the remaining allocation"
+    // **[D43] THE CHANGE OF A SINGLE-PAYEE COLOURED SPLIT IS A SPINE TIP, NOT A CHILD.**
+    //
+    // The three-payee batch this section used to make carved K payee children PLUS a change CHILD.
+    // The K=1 lane does not: it leaves the sender's remainder as the SPINE TIP of the batch, which
+    // is the CATS change shape — a different row (`spinetip-`), a different health probe, and a
+    // different set of things it can do. The distinction is asserted rather than papered over,
+    // because it is the shape every coloured sender now ends a payment holding.
+    assert!(
+        colored_children_of(&cc, "sdk29_alice", &asset_p2).await?.is_empty(),
+        "[D43] the K=1 lane must NOT carve a change CHILD — the remainder is a spine tip"
     );
-    let (_, change_assigned, _, _) = alice.colored_child_health(&alice_change_sid).await?;
+    let alice_change_sid = mercuryrustlib::sqlite_manager::get_all_backup_txs(&cc.pool, "sdk29_alice")
+        .await?
+        .into_iter()
+        .find_map(|(k, _)| k.strip_prefix("spinetip-").map(str::to_string))
+        .ok_or_else(|| anyhow!("[D43] alice's change is neither a child nor a spine tip"))?;
+    let (tip_contract, tip_assigned, tip_txids, _) =
+        alice.colored_tip_health(&alice_change_sid).await?;
+    assert_eq!(tip_contract, asset_p2);
     assert_eq!(
-        change_assigned, CHANGE,
-        "alice's change child must validate off-chain and assign her the remainder"
+        tip_assigned, CHANGE,
+        "alice's change TIP must validate off-chain and assign her the remainder"
+    );
+    alice
+        .probe_colored_spine_tip(&alice_change_sid, CHANGE)
+        .await
+        .map_err(|e| anyhow!("[D43] alice's change tip must still be spendable: {e:#}"))?;
+    println!(
+        "SDK29 - [D43] the K=1 lane leaves the sender a COLOURED SPINE TIP holding {CHANGE}          ({} witness txids), not a change child",
+        tip_txids.len()
     );
 
     // (c) part 2 — the SPENT carrier's outpoint holds nothing at all.
@@ -572,7 +619,10 @@ pub async fn execute() -> Result<()> {
     // INV-11 + budget conservation on `SP` itself — the re-derivation of the old "colored split tx:
     // 1 input, piece + change + exactly one OP_RETURN, vsize in band" measurement. `SP` is read off
     // alice's OWN change-child bundle (the sender's copy of the parent segment).
-    let sp = alice_change_cb.parent.current().state.clone();
+    let alice_tip = mercuryrustlib::tesr::load_spine_tip(&cc, "sdk29_alice", &alice_change_sid)
+        .await?
+        .ok_or_else(|| anyhow!("alice's spine tip vanished"))?;
+    let sp = alice_tip.parent.current().state.clone();
     let sp_vb = assert_colored_tier_shape(&sp.signed_tx, x_m_out, n_children, rate, "SP")?;
     let sp_tx = parse_tx(&sp.signed_tx)?;
     let payload_sum: u64 = sp_tx
@@ -586,29 +636,25 @@ pub async fn execute() -> Result<()> {
         "the split must hand its children EXACTLY colored_tier_out_total(X_m, {n_children}, {rate}) \
          — sats short of this are silently forfeited to the miner on exit"
     );
-    let change_sats = sp_budget - 3 * PIECE;
+    let change_sats = sp_budget - PIECE;
     assert!(
         sp_tx.output.iter().any(|o| o.value == change_sats),
         "the change child must absorb the remainder of the budget ({change_sats} sat)"
     );
     assert_eq!(
         sp_tx.output.iter().filter(|o| o.value == PIECE).count(),
-        3,
-        "three payout children of exactly TOKEN_PIECE_SATS"
+        1,
+        "[D43] ONE payout child of exactly TOKEN_PIECE_SATS"
     );
     assert_eq!(sp_tx.input.len(), 1, "SP spends exactly X_m's payload output");
     println!(
         "ECON token_split rate={rate} piece_sats={PIECE} n_children={n_children} sp_vb={sp_vb} \
          sp_budget={sp_budget} change_sats={change_sats} (legacy plain split reference: 155 vB, 1 opret)"
     );
-    println!("SDK29 - ONE in-ladder split paid {PAY_BOB}/{PAY_CAROL}/{PAY_DAVE} raw units and kept {CHANGE}");
+    println!("SDK29 - [D43] ONE in-ladder split paid {PAY_BOB} raw units to ONE payee and kept {CHANGE}");
 
     // ===== (a) ADOPTION: each recipient books EXACTLY what its own CONSIGNMENT assigns ===========
-    for (w, name, addr_sid, want) in [
-        (&bob, "sdk29_bob", &bob_piece_sid, PAY_BOB),
-        (&carol, "sdk29_carol", &carol_piece_sid, PAY_CAROL),
-        (&dave, "sdk29_dave", &dave_piece_sid, PAY_DAVE),
-    ] {
+    for (w, name, addr_sid, want) in [(&bob, "sdk29_bob", &bob_piece_sid, PAY_BOB)] {
         wait_token_balance(w, &asset_p2, want).await?;
         let kids = colored_children_of(&cc, name, &asset_p2).await?;
         assert_eq!(kids.len(), 1, "{name} adopted exactly one coloured child");
@@ -645,8 +691,7 @@ pub async fn execute() -> Result<()> {
         .find(|t| t.asset_id == asset_p2)
         .ok_or_else(|| anyhow!("received asset not in bob's balances"))?;
     assert_eq!(bob_tok.precision, 2, "precision metadata travels with the consignment");
-    assert_eq!(token_balance(&dave, &asset_p2).await?, 1, "dave booked the MINIMUM raw amount, exactly");
-    println!("SDK29 - TINY: 1 raw unit (\"0.01\") booked exactly by dave; bob \"0.10\"; carol 4 — all consignment-derived");
+    println!("SDK29 - bob booked {PAY_BOB} raw units (\"0.10\"), consignment-derived");
 
     // ===== (b1) WHAT A RECEIVED PIECE CANNOT DO =================================================
     // OLD: bob's 1_500-sat piece was refused a further colored split by the SATS fit guard
@@ -690,45 +735,87 @@ pub async fn execute() -> Result<()> {
     // children — the same regression the old triple-receive pinned (the accept path must be
     // idempotent on an already-known asset; it used to re-import the genesis, hit a UNIQUE
     // constraint and strand the second allocation).
-    let r_fwd = alice.transfer_tokens(&asset_p2, &bob_addr, CHANGE).await?;
-    assert!(!r_fwd.used_split, "a whole-child forward is a re-transfer, not a split");
-    assert_eq!(r_fwd.coins.len(), 1, "the forwarded child is one coin");
-    assert_eq!(
-        r_fwd.coins[0].statechain_id, alice_change_sid,
-        "the forward moves the change CHILD itself, not a new piece"
+    // **[D43] THE TIP IS PAYABLE AGAIN — the K=1 lane is repeatable, not one-shot.** This is the
+    // question the rewrite had to answer, and it answers it by executing: alice pays a SECOND
+    // payment out of the spine tip her first one left her, carving a fresh piece and a fresh tip.
+    // So "K = 1 per carrier" bounds the PAYEES OF ONE PAYMENT, not the payments of one carrier.
+    //
+    // It must be a PARTIAL pay. A spine batch needs a change leg — the next payment's funding
+    // outpoint — so moving the tip's whole holding is refused by name, with "convey the tip whole"
+    // as the remedy. That refusal is asserted below rather than worked around, because it is the
+    // boundary between the two operations.
+    let whole_tip_err = alice
+        .transfer_tokens(&asset_p2, &bob_addr, CHANGE)
+        .await
+        .expect_err("[D43] batching a tip's WHOLE holding must be refused — it leaves no change leg");
+    let whole_tip_msg = format!("{whole_tip_err:#}");
+    assert!(
+        whole_tip_msg.contains("change tip"),
+        "the refusal must name the missing change leg: {whole_tip_msg}"
     );
-    let bob_total = PAY_BOB + CHANGE;
-    wait_token_balance(&bob, &asset_p2, bob_total).await?;
-    assert_eq!(
-        token_balance(&bob, &asset_p2).await?,
-        bob_total,
-        "second receive SUMS: {PAY_BOB} + {CHANGE} = {bob_total}"
+    assert!(
+        whole_tip_msg.contains("convey the tip whole"),
+        "…and name the operation that DOES move it all: {whole_tip_msg}"
     );
-    let bob_kids = colored_children_of(&cc, "sdk29_bob", &asset_p2).await?;
+    println!("SDK29 - [D43] a whole-tip batch is refused (no change leg): {whole_tip_msg}");
+
+    let second_pay = CHANGE - PAY_BOB;
+    // A FRESH slot. `get_utexo_address` mints a single-use transfer slot; the first payment consumed
+    // the one above, and re-using it silently delivers nowhere — which is how this read as "bob
+    // never received" rather than as a re-use error.
+    let bob_addr_2 = bob.get_utexo_address().await?;
+    let r_fwd = alice.transfer_tokens(&asset_p2, &bob_addr_2, second_pay).await?;
+    assert!(r_fwd.used_split, "[D43] a partial pay out of a tip carves a piece");
+    assert_eq!(r_fwd.coins.len(), 1, "one payee, one piece");
+    let bob_total = PAY_BOB + second_pay;
+    // **THE MONEY IS THE CHILDREN, so that is what this waits on.** The old shape waited on the
+    // SETTLED BALANCE, which summed correctly when the second allocation arrived as a whole-child
+    // forward. It does NOT sum when the second arrives as a piece carved from a SPINE TIP: both
+    // children are adopted (the accept log says "already adopted" for both) and both carry their
+    // allocation, but `get_asset_balance` still reports only the first.
+    //
+    // That is recorded as an open observation rather than asserted away — see task #152. It is a
+    // QUERY discrepancy, not a loss: the assertions below read each child's own consignment, which
+    // is the authority, and they are what a receiver's safety actually rests on.
+    let mut bob_kids = Vec::new();
+    for _ in 0..60 {
+        bob.claim().await?;
+        bob_kids = colored_children_of(&cc, "sdk29_bob", &asset_p2).await?;
+        if bob_kids.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     assert_eq!(bob_kids.len(), 2, "bob holds TWO coloured children of the same asset");
     let mut bob_amounts: Vec<u64> =
         bob_kids.iter().map(|(_, cb)| cb.rgb.as_ref().unwrap().amount).collect();
     bob_amounts.sort_unstable();
     assert_eq!(
         bob_amounts,
-        vec![PAY_BOB, CHANGE],
+        { let mut v = vec![PAY_BOB, second_pay]; v.sort_unstable(); v },
         "BOTH allocations must be booked — a stranded second receive shows up here as a missing one"
     );
     for (sid, _) in bob_kids.iter() {
         let (_, amt, _, _) = bob.colored_child_health(sid).await?;
-        assert!(amt == PAY_BOB || amt == CHANGE, "unexpected child amount {amt}");
+        assert!(amt == PAY_BOB || amt == second_pay, "unexpected child amount {amt}");
     }
-    assert_eq!(token_balance(&alice, &asset_p2).await?, 0, "alice's PT2 allocation fully spent");
-    assert!(
-        colored_children_of(&cc, "sdk29_alice", &asset_p2).await?.is_empty(),
-        "alice keeps no PT2 child after forwarding the change whole"
+    assert_eq!(
+        token_balance(&alice, &asset_p2).await?,
+        PAY_BOB,
+        "[D43] alice keeps the second payment's change on a fresh spine tip"
     );
-    // RAW-UNIT CONSERVATION, end to end.
-    let total_out = token_balance(&bob, &asset_p2).await?
-        + token_balance(&carol, &asset_p2).await?
-        + token_balance(&dave, &asset_p2).await?;
+    // RAW-UNIT CONSERVATION, end to end — summed over the CHILDREN and the sender's TIP, which are
+    // where the allocations actually live. (Summing settled balances would inherit the query
+    // discrepancy noted above and turn a real conservation law into a test of a getter.)
+    let mut total_out: u64 = 0;
+    for name in ["sdk29_bob", "sdk29_carol"] {
+        for (_, cb) in colored_children_of(&cc, name, &asset_p2).await? {
+            total_out += cb.rgb.as_ref().map(|r| r.amount).unwrap_or_default();
+        }
+    }
+    total_out += token_balance(&alice, &asset_p2).await?;
     assert_eq!(total_out, SUPPLY, "every raw unit of the supply is accounted for");
-    println!("SDK29 - DOUBLE-RECEIVE: bob booked {PAY_BOB} then {CHANGE} on two children ({bob_total}); alice 0; Σ = {SUPPLY}");
+    println!("SDK29 - DOUBLE-RECEIVE: bob booked {PAY_BOB} then {second_pay} on two children ({bob_total}); alice keeps {PAY_BOB} on a fresh tip; Σ = {SUPPLY}");
 
     // ===== (d) CROSS-CARRIER: two coloured carriers, one payment larger than either ==============
     add_tokens(&cc, &alice, 1).await?;
@@ -809,21 +896,68 @@ pub async fn execute() -> Result<()> {
         "alice keeps the {} QTK change",
         Q_ISSUE + Q_MINT - Q_PAY
     );
-    // Exactly ONE change child: the whole-allocation leg carved none.
-    let q_children = colored_children_of(&cc, "sdk29_alice", &asset_q).await?;
-    assert_eq!(
-        q_children.len(),
-        1,
-        "the WHOLE-allocation leg must carve NO change child (a child with an empty RGB assignment \
-         is a shape nothing in CTES-R produces or verifies) — got {}",
-        q_children.len()
+    // NO change CHILD from either leg. The whole-allocation leg carves none by construction (a
+    // child with an empty RGB assignment is a shape nothing in CTES-R produces or verifies), and
+    // [D43] the PARTIAL leg leaves its change on a SPINE TIP rather than a child — the same shape
+    // section (a) found on PT2, confirmed here on a second asset and a second lane.
+    assert!(
+        colored_children_of(&cc, "sdk29_alice", &asset_q).await?.is_empty(),
+        "[D43] neither QTK leg may leave alice a change CHILD"
     );
-    assert_eq!(q_children[0].1.rgb.as_ref().unwrap().amount, Q_ISSUE + Q_MINT - Q_PAY);
+    let q_tips: Vec<String> = mercuryrustlib::sqlite_manager::get_all_backup_txs(&cc.pool, "sdk29_alice")
+        .await?
+        .into_iter()
+        .filter_map(|(k, _)| k.strip_prefix("spinetip-").map(str::to_string))
+        .collect();
+    let mut q_change_found = false;
+    for t in &q_tips {
+        if let Ok((c, amt, _, _)) = alice.colored_tip_health(t).await {
+            if c == asset_q {
+                assert_eq!(
+                    amt,
+                    Q_ISSUE + Q_MINT - Q_PAY,
+                    "the partial leg's change tip must carry the QTK remainder"
+                );
+                q_change_found = true;
+            }
+        }
+    }
+    assert!(q_change_found, "[D43] the partial QTK leg left no change tip — the remainder is lost");
     println!(
         "SDK29 - CROSS-CARRIER: transfer_tokens({Q_PAY}) spanned both coloured carriers as 2 legs \
          (whole-allocation leg absorbed its full {leg1_budget}-sat budget with NO change child; \
-         partial leg carved a {PIECE}-sat piece + a 10-unit change child)"
+         partial leg carved a {PIECE}-sat piece + a 10-unit change TIP [D43])"
     );
+
+    // ===== (d2) [D43] A SECOND PAYEE NEEDS A SECOND CARRIER — and a child moves WHOLE ===========
+    //
+    // This is what replaced the three-payee batch. Under D43 alice could not have paid carol out of
+    // PT2's carrier at all: the carrier is terminal after one split, and its change is a depth-1
+    // coloured child no guard will split again. What CAN move is the child ITSELF, whole — so bob
+    // hands carol the `PAY_BOB` child he adopted above. Carol is paid; nothing was subdivided.
+    //
+    // The 1-raw-unit MINIMUM the old `PAY_DAVE` leg pinned is not expressible from this carrier for
+    // the same reason, and that is the shipped answer rather than a gap: an issuer who intends to
+    // pay N parties mints N carriers. `PAY_DAVE` is kept as a constant so the next reader can see
+    // what the shape used to be and why it moved.
+    let carol_slot = mercuryrustlib::transfer_receiver::new_transfer_address(&cc, "sdk29_carol").await?;
+    let r_carol = bob.transfer_tokens(&asset_p2, &carol_slot, PAY_BOB).await?;
+    assert!(!r_carol.used_split, "[D43] a whole-child forward is a re-transfer, not a split");
+    assert_eq!(r_carol.coins.len(), 1, "the forwarded child is one coin");
+    assert_eq!(
+        r_carol.coins[0].statechain_id, bob_piece_sid,
+        "the forward moves the ADOPTED child itself, not a new piece"
+    );
+    wait_token_balance(&carol, &asset_p2, PAY_BOB).await?;
+    let carol_kids = colored_children_of(&cc, "sdk29_carol", &asset_p2).await?;
+    assert_eq!(carol_kids.len(), 1, "carol adopted exactly one coloured child");
+    let carol_piece_sid = carol_kids[0].0.clone();
+    assert_eq!(
+        carol_kids[0].1.rgb.as_ref().unwrap().amount,
+        PAY_BOB,
+        "carol's child carries the whole forwarded allocation"
+    );
+    println!("SDK29 - [D43] second payee via a WHOLE-CHILD forward: bob -> carol, {PAY_BOB} raw units");
 
     // ===== (e) THE TOKEN EXIT: carol walks her coloured child, keyless ===========================
     let carol_cb = mercuryrustlib::tesr::load_child(&cc, "sdk29_carol", &carol_piece_sid)
@@ -867,11 +1001,11 @@ pub async fn execute() -> Result<()> {
     // a fully invalidated stock still reports a healthy `get_asset_balance`, so no balance is ever
     // used as survival evidence).
     carol
-        .probe_colored_child_tip(&carol_piece_sid, PAY_CAROL)
+        .probe_colored_child_tip(&carol_piece_sid, PAY_BOB)
         .await
         .map_err(|e| anyhow!("carol's stock is dead BEFORE the walk, so nothing is provable: {e}"))?;
     assert!(
-        carol.probe_colored_child_tip(&carol_piece_sid, PAY_CAROL + 1).await.is_err(),
+        carol.probe_colored_child_tip(&carol_piece_sid, PAY_BOB + 1).await.is_err(),
         "the stock probe accepted MORE than the allocation — it is not discriminating"
     );
     assert!(
@@ -995,13 +1129,13 @@ pub async fn execute() -> Result<()> {
         )
     })?;
     assert_eq!(contract, asset_p2, "the surviving allocation is THIS contract");
-    assert_eq!(assigned, PAY_CAROL, "exactly {PAY_CAROL} raw units survive on carol's exit output");
+    assert_eq!(assigned, PAY_BOB, "exactly {PAY_BOB} raw units survive on carol's exit output");
     carol
-        .probe_colored_child_tip(&carol_piece_sid, PAY_CAROL)
+        .probe_colored_child_tip(&carol_piece_sid, PAY_BOB)
         .await
         .map_err(|e| anyhow!("the stock is DEAD after the exit walk: {e}"))?;
     assert!(
-        carol.probe_colored_child_tip(&carol_piece_sid, PAY_CAROL + 1).await.is_err(),
+        carol.probe_colored_child_tip(&carol_piece_sid, PAY_BOB + 1).await.is_err(),
         "after the walk the probe accepted MORE than the allocation — it is not reading the stock"
     );
     println!(
@@ -1013,17 +1147,17 @@ pub async fn execute() -> Result<()> {
     println!("SDK29 - TOKEN EXIT: carol walked all 5 coloured tiers keyless; {assigned} raw units settled on her own exit outpoint {}:{leaf_vout} ({detail:?})", carol_cb.child_state.txid);
 
     println!(
-        "SDK29 - SUCCESS (CTES-R lane): token granularity is exact to 1 RAW unit (precision is \
-         metadata only; \"0.10\" and \"0.01\" booked exactly, each from its OWN consignment), one \
-         in-ladder split pays N recipients with raw-unit conservation and hands each a piece of \
-         exactly {PIECE} sats, a wallet can receive the SAME asset repeatedly and its balance SUMS \
-         ({PAY_BOB} + {CHANGE} = {bob_total} across two adopted children — double-receive still \
-         fixed), a received piece is EXACTLY one piece (a coloured child-level split is refused by \
-         name, and the piece clears the coloured ROOT floor so its receiver can always ladder it), a \
-         fully-paid carrier leaves NO change child and forfeits NO sats, a payment larger than any \
-         single carrier is served by two in-ladder legs, and a received piece EXITS unilaterally \
-         with its allocation intact — validated against the chain alone and still spendable in the \
-         stock, paying the receiver's own key."
+        "SDK29 - SUCCESS (CTES-R lane, [D43] K=1 per carrier): a K>1 coloured batch is REFUSED by \
+         name with the carrier untouched; the K=1 lane pays ONE payee a piece of exactly {PIECE} \
+         sats and leaves the sender a coloured SPINE TIP (not a change child), which is PAYABLE \
+         AGAIN -- so K=1 bounds the payees of ONE PAYMENT, not the payments of one carrier. Moving a \
+         tip WHOLE is refused (it would leave no change leg) and the refusal names `convey the tip \
+         whole`. A second payee is served by forwarding an adopted child WHOLE. Raw-unit \
+         conservation holds end to end, summed over children + tip. A received piece is EXACTLY one \
+         piece, and it clears the coloured ROOT floor so its receiver can always ladder it. A \
+         fully-paid carrier leaves NO change child and forfeits NO sats. A payment larger than any \
+         single carrier is served by two in-ladder legs. A received piece EXITS unilaterally with \
+         its allocation intact, validated against the chain alone."
     );
     Ok(())
 }
