@@ -605,7 +605,29 @@ pub async fn execute() -> Result<()> {
     // assertion that only passes if the receiver's seals were really opened: to build its own `S''`
     // bob must colour a transition spending `X_m`'s payload output, and that outpoint's seal is an
     // INTERNAL seal of the chain it was handed, not the output that pays it.
-    let tip = chain_height(&cc)?;
+    // **What "entirely off-chain" actually means, measured directly.**
+    //
+    // This used to be `chain_height(&cc)? == tip` around the hop. That is not a statement about the
+    // hop: this regtest is SHARED with the RLN harness, which mines, so the assertion measured
+    // whether anybody mined during a window bounded by a 40-iteration polling loop. It failed on an
+    // EMPTY block — coinbase only, no transaction — which says nothing about whether the transfer
+    // touched the chain.
+    //
+    // The property the section is about is that the carrier's funding output `F` is never spent: no
+    // tier reached the chain, so the whole hop lived off it. That is what the sibling tests assert
+    // (sdk32, sdk69) and it is immune to who else is mining.
+    let f_is_unspent = |b: &mercuryrustlib::tesr::TesrBundle| -> Result<bool> {
+        use electrum_client::ElectrumApi;
+        let f_txid: electrum_client::bitcoin::Txid = b.f_txid.parse()?;
+        let tx0 = cc.electrum_client.transaction_get(&f_txid)?;
+        let spk = &tx0.output[b.f_vout as usize].script_pubkey;
+        Ok(cc
+            .electrum_client
+            .script_list_unspent(spk)?
+            .iter()
+            .any(|u| u.tx_hash == f_txid && u.tx_pos as u32 == b.f_vout))
+    };
+    assert!(f_is_unspent(&renewed)?, "F must be unspent going into the hop, or this measures nothing");
     let mut bob_events2 = bob.subscribe();
     alice.transfer_colored_carrier(&carrier_sid, &bob_address).await?;
     let mut waited = 0;
@@ -621,10 +643,12 @@ pub async fn execute() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     let _ = drain(&mut bob_events2);
-    assert_eq!(
-        chain_height(&cc)?,
-        tip,
-        "the whole hop must be OFF-CHAIN — not one block was needed"
+    assert!(
+        f_is_unspent(&renewed)?,
+        "the whole hop must be OFF-CHAIN — the carrier's funding output {}:{} was spent, so a tier \
+         reached the chain",
+        renewed.f_txid,
+        renewed.f_vout
     );
     assert!(
         alice.get_token_balances().await?.iter().all(|b| b.asset_id != asset_id || b.balance == 0),
@@ -675,7 +699,12 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    assert_eq!(chain_height(&cc)?, tip, "hop 2 must be OFF-CHAIN too — still not one block");
+    // Same correction as hop 1: measure that `F` was never spent, not that nobody mined. The carrier's
+    // funding output is unchanged across both hops — that is the whole claim — so `renewed` names it.
+    assert!(
+        f_is_unspent(&renewed)?,
+        "hop 2 must be OFF-CHAIN too — the carrier's funding output was spent"
+    );
     assert!(
         bob.get_token_balances().await?.iter().all(|b| b.asset_id != asset_id || b.balance == 0),
         "bob must no longer hold the asset he conveyed"
