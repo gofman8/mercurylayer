@@ -170,6 +170,11 @@ pub struct TransferQuote {
     pub fundable: bool,
     /// statechain_ids of coins whose value is below their renewal fee (stuck unless combined).
     pub stuck_coins: Vec<String>,
+    /// [#145] statechain_ids excluded because this wallet holds NO exit material for them on any
+    /// lane — no TES-R bundle and no flat backup chain. Distinct from `stuck_coins`: those have a
+    /// fee problem that combining rescues, these are missing the material itself and combining does
+    /// not. Their value is NOT counted in `fundable`.
+    pub no_exit_material_coins: Vec<String>,
     pub note: String,
 }
 

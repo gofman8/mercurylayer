@@ -192,7 +192,90 @@ fn payment_coins(
     (usable, stuck)
 }
 
+/// The spendable set, after [`payment_coins`]' *eligibility* filter has been narrowed by a
+/// *capability* one. See [`UtexoWallet::spendable_payment_coins`].
+pub(crate) struct SpendableCoins {
+    /// What a payment may actually plan over.
+    pub usable: Vec<Coin>,
+    /// Value at or below its own renewal fee — rescuable by combining.
+    pub stuck: Vec<String>,
+    /// **No exit material on any lane.** Not rescuable by combining, and not a fee problem.
+    pub no_exit_material: Vec<String>,
+}
+
 impl UtexoWallet {
+    /// **[#145] EXIT MATERIAL, BY LANE — the proof that a coin can be spent at all.**
+    ///
+    /// Every other filter in [`payment_coins`] asks whether a coin is ELIGIBLE: confirmed, not a
+    /// duplicate, not an RGB carrier, worth more than its own renewal. None of them asks whether the
+    /// wallet holds the material to *exit or convey* it, and that is a separate question with a
+    /// separate answer:
+    ///
+    /// * a laddered coin's material is its bundle — a `tesr-` root, a `ctesr-` child, or a
+    ///   `spinetip-` tip. Any of the three is a complete unilateral exit.
+    /// * an UN-laddered coin's material is its flat backup chain.
+    /// * a coin with neither is a slot the SE knows about, that this wallet holds a key for, and
+    ///   that it can neither exit nor hand on. Most often a derived child slot whose split failed
+    ///   after the slot was minted.
+    ///
+    /// That third shape was being OFFERED to coin selection, and the failure arrived at the far end
+    /// of the payment: `transfer_sender` reached for the flat backup rows, found none, and refused.
+    /// `chaos22`'s oracle could only class the result as an unclassified breach — the wallet had
+    /// balance, the planner promised it, and the send died. The remedy belongs here, upstream: the
+    /// coin is never offered, so a *different* coin funds the payment and the user never meets the
+    /// refusal at all.
+    ///
+    /// **Fail closed** ([B3]): a read that FAILS propagates. Reading a failed read as "no material"
+    /// would silently retire a perfectly good coin from the wallet's spendable balance, which is the
+    /// same silent-degradation shape pointed the other way.
+    pub(crate) async fn has_exit_material(&self, statechain_id: &str) -> Result<bool> {
+        // The three laddered shapes each ARE exit material; `parent_shape` already probes all three
+        // (and fails closed), so re-deriving the probe here would be a second definition to drift.
+        if !matches!(self.parent_shape(statechain_id).await?, ParentShape::Unladdered) {
+            return Ok(true);
+        }
+        // `try_get_backup_txs` is the absence-vs-failure split: `Ok(None)` is a genuinely empty
+        // slot, `Err` is a database that could not answer. Only the first is a verdict.
+        let rows = mercuryrustlib::sqlite_manager::try_get_backup_txs(
+            &self.inner.cc.pool,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?;
+        Ok(rows.map_or(false, |v| !v.is_empty()))
+    }
+
+    /// **[B2/#145] THE spendable set** — the one both `quote_transfer` and `transfer` plan over.
+    ///
+    /// [`payment_coins`] is the synchronous half (it sees only the wallet record); this adds the
+    /// half that needs the database. Keeping them in one function is the [B2] property: `fundable`
+    /// is computed over this set and the plan is executed over this set, so a coin excluded here
+    /// cannot reappear in the executor.
+    pub(crate) async fn spendable_payment_coins(
+        &self,
+        coins: &[Coin],
+        carriers: &std::collections::HashSet<String>,
+        refresh_fee: u64,
+    ) -> Result<SpendableCoins> {
+        let (eligible, stuck) = payment_coins(coins, carriers, refresh_fee);
+        let mut usable = Vec::with_capacity(eligible.len());
+        let mut no_exit_material = Vec::new();
+        for c in eligible {
+            let Some(id) = c.statechain_id.clone() else {
+                // No statechain id at all: nothing to look material up by, and nothing the SE would
+                // co-sign either. Not this filter's business — leave the shape as it was found.
+                usable.push(c);
+                continue;
+            };
+            if self.has_exit_material(&id).await? {
+                usable.push(c);
+            } else {
+                no_exit_material.push(id);
+            }
+        }
+        Ok(SpendableCoins { usable, stuck, no_exit_material })
+    }
+
     /// [B2] Resolve how a coin is laddered — the ONE resolution that fixes both the split route and
     /// the split floor. `transfer` dispatches on it and `quote_transfer` quotes on it, so neither can
     /// pick a route the other did not.
@@ -374,7 +457,11 @@ impl UtexoWallet {
         // a non-exact payment that selects a child routes to `child_in_ladder_pay` below.
         let backup_rate = backup_fee_rate(&self.inner.cc).await?;
         let refresh_fee = (BACKUP_TX_VBYTES as f64 * backup_rate).ceil() as u64;
-        let (spendable, _stuck) = payment_coins(&record.coins, &carriers, refresh_fee);
+        // [#145] …and the SAME exit-material filter. A slot with no material on any lane is not
+        // spendable, however healthy its row looks; offering it here is what put an unclassified
+        // breach at the far end of `chaos22`'s send.
+        let set = self.spendable_payment_coins(&record.coins, &carriers, refresh_fee).await?;
+        let spendable = set.usable;
         let planned = self.plan_payment(&spendable, amount_sats).await?;
 
         // An in-ladder split payment (laddered coin) is conveyed directly to the recipient inside
@@ -394,6 +481,22 @@ impl UtexoWallet {
                             choice.preflight.floors.describe()
                         ));
                     }
+                }
+                // [#145] Do not report a wallet as short of funds while silently withholding the
+                // reason some of its balance was not counted. A slot with no exit material is not
+                // a fee problem and combining does not rescue it, so it needs its own sentence.
+                if !set.no_exit_material.is_empty() {
+                    return Err(anyhow!(
+                        "cannot send {amount_sats} sat from {} spendable sat: {} coin(s) were \
+                         EXCLUDED because this wallet holds no exit material for them on any lane \
+                         — no TES-R bundle and no flat backup rows, so they can neither be exited \
+                         unilaterally nor conveyed. Combining does not rescue them (the material is \
+                         missing, not the value); restore from a recovery bundle if it exists \
+                         elsewhere, otherwise they are spendable only cooperatively: {:?}",
+                        available,
+                        set.no_exit_material.len(),
+                        set.no_exit_material
+                    ));
                 }
                 return Err(SdkError::InsufficientBalance {
                     requested_sats: amount_sats,
@@ -616,7 +719,12 @@ impl UtexoWallet {
 
         // [B2] The SAME coin set `transfer` will plan over. A coin at/below its own renewal fee
         // cannot self-refresh and is reported for rescue-by-combine instead.
-        let (usable, stuck_coins) = payment_coins(&record.coins, &carriers, refresh_fee);
+        // [#145] …including its exit-material filter, so `fundable` counts only coins the executor
+        // could actually spend. Quoting over a coin `transfer` will refuse is the exact
+        // quote-disagrees-with-executor bug [B2] exists to make inexpressible.
+        let set = self.spendable_payment_coins(&record.coins, &carriers, refresh_fee).await?;
+        let (usable, stuck_coins, no_exit_material) =
+            (set.usable, set.stuck, set.no_exit_material);
         let amt = |c: &Coin| c.amount.unwrap_or_default() as u64;
         let usable_total: u64 = usable.iter().map(amt).sum();
 
@@ -688,11 +796,29 @@ impl UtexoWallet {
         // `fundable` now means what the caller reads it as: the executor will accept this payment.
         let fundable =
             usable_total >= amount_sats.saturating_add(total_fee_sats) && split_admissible;
+        // [#145] Two exclusions with two different remedies, so two different sentences. Folding
+        // them into one count would tell a user to combine coins that combining cannot rescue.
+        let excluded = format!(
+            "{}{}",
+            if stuck_coins.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} stuck coin(s) — combine to rescue)", stuck_coins.len())
+            },
+            if no_exit_material.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} coin(s) have NO exit material on any lane — not rescuable by combining; \
+                     restore from a recovery bundle or spend cooperatively)",
+                    no_exit_material.len()
+                )
+            }
+        );
         let note = if !fundable {
             format!(
-                "not fundable from non-stuck coins: usable {usable_total} vs need {} — {split_note}{}",
+                "not fundable from non-stuck coins: usable {usable_total} vs need {} — {split_note}{excluded}",
                 amount_sats.saturating_add(total_fee_sats),
-                if stuck_coins.is_empty() { String::new() } else { format!(" ({} stuck coin(s) — combine to rescue)", stuck_coins.len()) }
             )
         } else if renewal_due {
             format!("{split_note}; includes a renewal (re-anchor) fee — a coin this send uses is due for refresh")
@@ -707,6 +833,7 @@ impl UtexoWallet {
             total_fee_sats,
             fundable,
             stuck_coins,
+            no_exit_material_coins: no_exit_material,
             note,
         })
     }
@@ -796,6 +923,20 @@ impl UtexoWallet {
             let floors = split_output_floors(backup_rate, shape);
             match shape {
                 ParentShape::Unladdered => {
+                    // [#145] `Unladdered` is reached by three consecutive absences, so it must be
+                    // PROVEN before it is acted on: an un-laddered coin's exit is its flat backup
+                    // chain, and a slot with no chain is not un-laddered, it is un-exitable. The
+                    // plain-split route below hands it to the flat sender, which refuses at the far
+                    // end of the payment. Reject it here, with its own reason, and try the next
+                    // candidate.
+                    if !self.has_exit_material(&id).await? {
+                        rejected.push(format!(
+                            "{id} ({parent_sats} sat): NO exit material on any lane — no TES-R \
+                             bundle and no flat backup rows. It cannot be exited unilaterally or \
+                             conveyed, so it is not a candidate (combining does not rescue it)"
+                        ));
+                        continue;
+                    }
                     let need = total + split_fee_reserve(parent_sats) + floors.change;
                     if parent_sats > need {
                         chosen = Some((id, ManyRoute::PlainSplit));
@@ -999,6 +1140,11 @@ impl UtexoWallet {
                 .await?
                 .is_none()
             {
+                // [#145] Same proof obligation as the batch lane: `split_coin` on this id routes to
+                // the flat sender, which needs a backup chain that a materialless slot does not have.
+                if !self.has_exit_material(&id).await? {
+                    continue;
+                }
                 chosen = Some(id);
                 break;
             }

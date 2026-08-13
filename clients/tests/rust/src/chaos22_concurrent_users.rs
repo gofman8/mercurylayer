@@ -163,6 +163,14 @@ pub fn classify(err: &anyhow::Error) -> Class {
         //  * a child too small to split into a viable piece + change (each grandchild must fund its own
         //    two tiers and clear dust). The refusal happens BEFORE anything is co-signed.
         ("leaves no change", "split-fit"),
+        //  * [#145] a SPINE TIP cannot be handed over WHOLE: that is a key handover plus a
+        //    `spinetip-` conveyance, and the conveyance builder is not landed. This is a NAMED,
+        //    recorded limitation of the tip lane, not a defect — and the tip is not stranded by it
+        //    (pay FROM it with a spine batch, or exit it unilaterally). It is classified only
+        //    because the refusal is by name, from `execute_ex`: the shape that must stay a BREACH is
+        //    a tip reaching the flat lane and dying on the ABSENCE of backup rows, which is what
+        //    this run measured 12 times.
+        ("is a spine tip", "tip-not-conveyable"),
         // Concurrency refusals — the system CORRECTLY refusing a racing action, not a bug:
         //  * another task spent/transferred the coin first, so it is no longer CONFIRMED. Refusing to
         //    exit a WITHDRAWN parent is the [B1] guard doing its job (exiting it would invalidate the
@@ -659,11 +667,23 @@ async fn run_user(
                     // `transfer_sender::execute` cannot move it — it goes through `child_retransfer`
                     // (a fresh lower-CSV state + the replaced state disclosed). `wallet.transfer`
                     // dispatches on exactly that, so route children through it.
+                    // [#145] …and a SPINE TIP is the same case, for the same reason. This arm named
+                    // only children because tips did not exist when it was written; a tip has no
+                    // flat backup chain either, so `execute` cannot move it. Routing it through
+                    // `wallet.transfer` gets the dispatch — which refuses a whole-tip handover by
+                    // name, because the spine-tip conveyance builder is not landed. A NAMED refusal
+                    // is the correct outcome here and the classifier knows it; what was wrong was
+                    // reaching the flat lane at all and dying on an absence.
                     let is_child = mercuryrustlib::tesr::load_child(cc, name, &id)
                         .await
                         .ok()
                         .flatten()
-                        .is_some();
+                        .is_some()
+                        || mercuryrustlib::tesr::load_spine_tip(cc, name, &id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some();
                     let r = if is_child {
                         me.wallet.transfer(&to_addr, c.amount_sats).await.map(|_| ())
                     } else {

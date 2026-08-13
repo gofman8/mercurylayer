@@ -31,19 +31,25 @@ pub async fn create_backup_transactions(
     // one. Routing such a coin to the FLAT sender is a real condition and it gets a named refusal
     // here — before this, the bare `?` handed the caller sqlx's own sentence, which `chaos22`'s
     // oracle could only class as an unclassified breach.
+    //
+    // [#145] The message below used to say the caller's own dispatch had already routed away every
+    // shape that legitimately lacks rows. That was TRUE OF ONE CALLER. `execute` is public and
+    // `chaos22`'s `respend` calls it directly, so tips arrived here anyway and the sentence was
+    // simply false — it named a guard the caller did not run. The tip refusal now lives in
+    // `execute_ex` itself, which is what makes the residue below genuinely residual.
     let backup_transactions =
         crate::sqlite_manager::try_get_backup_txs(&client_config.pool, &wallet.name, &statechain_id)
             .await?
             .ok_or_else(|| {
                 anyhow!(
                     "statechain id {statechain_id} has NO EXIT MATERIAL: no flat backup rows, and \
-                     the caller's own dispatch already routed away every shape that legitimately \
-                     lacks them (a `ctesr-` child goes to `child_retransfer`, a `spinetip-` row is \
-                     refused by name). So this is a slot the SE knows about that this wallet cannot \
-                     exit from and cannot convey on any lane — most often a derived child slot whose \
-                     split failed after the slot was created. It must not have been offered to coin \
-                     selection. Restore it from a recovery bundle if its material exists elsewhere; \
-                     otherwise it is spendable only cooperatively."
+                     every shape that legitimately lacks them has already been routed away — a \
+                     `spinetip-` row is refused by name in `execute_ex` above, and a `ctesr-` child \
+                     goes to `child_retransfer`. So this is a slot the SE knows about that this \
+                     wallet cannot exit from and cannot convey on any lane — most often a derived \
+                     child slot whose split failed after the slot was created. It must not have been \
+                     offered to coin selection. Restore it from a recovery bundle if its material \
+                     exists elsewhere; otherwise it is spendable only cooperatively."
                 )
             })?;
 
@@ -1055,6 +1061,41 @@ async fn execute_ex(
     let coin = coin.unwrap().clone();
 
     let statechain_id = coin.statechain_id.as_ref().unwrap().clone();
+
+    // **[CATS change 2 / #145] A SPINE TIP IS REFUSED HERE, by name, whoever the caller is.**
+    //
+    // This refusal already existed — in ONE caller, `UtexoWallet::transfer`'s handover loop. That is
+    // not where it belongs. `execute` is public, `chaos22`'s `respend` action calls it directly, and
+    // a direct caller has no dispatch to route the tip away: the tip walked straight into the flat
+    // lane, whose classifier LICENSES it (`PermanentLicence::FundingNotOnChain` — a tip's funding
+    // `SP.out[K]` is un-broadcast, exactly like a `ctesr-` child's, and the licence exists to stop a
+    // laddered coin being conveyed flat by accident).
+    //
+    // What stopped the conveyance was an ABSENCE: the tip has no flat backup rows, so
+    // `create_backup_transactions` failed further down. That is refusal by accident, and it read to
+    // `chaos22`'s oracle as an unclassified breach rather than a known limitation. Worse, it is one
+    // missing guard away from being a money loss instead of an error — a flat conveyance would hand
+    // the recipient a signed-once backup chain over an outpoint that does not exist on chain and
+    // never will, i.e. a coin with no working exit, with no error on either side.
+    //
+    // Handing a tip over is a key handover PLUS a `spinetip-` conveyance, and that builder is not
+    // landed. So the honest answer is a named refusal, sited where the danger is.
+    //
+    // The coin is untouched: still unilaterally exitable, and its cap already pays this wallet's key.
+    if crate::tesr::load_spine_tip(client_config, wallet_name, &statechain_id)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!(
+            "statechain id {statechain_id} is a SPINE TIP (the change leg of an earlier in-ladder \
+             payment). Handing it over whole is a spine-tip conveyance, whose builder is not \
+             landed. Refusing rather than conveying it on the flat lane, which would give the \
+             recipient a backup chain over an un-broadcast funding output — a coin with no exit. \
+             Pay FROM it instead (a spine batch carves a piece for the recipient and keeps the \
+             change as the next tip), or exit it unilaterally."
+        ));
+    }
+
     let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap().clone();
 
     let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
