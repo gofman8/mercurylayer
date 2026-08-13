@@ -12258,6 +12258,20 @@ pub fn verify_child_bundle(
         if csv < p.e_floor || csv > p.e0 {
             return Err(anyhow::anyhow!("child extension CSV {csv} outside [{},{}]", p.e_floor, p.e0));
         }
+        // **[D38/R13] AND ON THE GRID, not merely in the band.** An honest renewal steps by exactly
+        // `δE`, so `e0 − m·δE` (or the floor clamp) are the only values any builder in this design
+        // emits. Admitting anything in the band admits a state the specification does not define,
+        // chosen by the SENDER at 1-block granularity where the design's own granularity is `δE` —
+        // and CSV granularity is what the D14 supersession margin is denominated in.
+        if !p.is_on_ext_grid(csv) {
+            return Err(anyhow::anyhow!(
+                "child extension CSV {csv} is inside [{},{}] but OFF the schedule's grid (e0 {} \
+                 stepping by δE {}). No honest renewal produces it: `ext_csv` emits e0 − m·δE or the \
+                 floor. A value between two rungs is a state this design does not define, and the \
+                 sender chose it.",
+                p.e_floor, p.e0, p.e0, p.delta_e
+            ));
+        }
         // [B1] the declared field is the signed one, or the bundle is refused.
         mercurylib::transfer::receiver::bind_declared_csv(
             0,
@@ -12427,6 +12441,18 @@ pub fn verify_child_bundle(
         let (csv, p) = (seq as u16, cb.parent.params);
         if csv < p.d_floor || csv > p.d0 {
             return Err(anyhow::anyhow!("child state CSV {csv} outside [{},{}]", p.d_floor, p.d0));
+        }
+        // **[D38/R13] AND ON THE GRID.** Same law as the extension above, stepping by `δ`. Note the
+        // child STATE is never a spine tier — `SPINE_CSV = 0` is a distinct kind with its own exact
+        // band, checked elsewhere — so this grid genuinely applies to every value that reaches here.
+        if !p.is_on_state_grid(csv) {
+            return Err(anyhow::anyhow!(
+                "child state CSV {csv} is inside [{},{}] but OFF the schedule's grid (d0 {} stepping \
+                 by δ {}). No honest hop produces it: `state_csv` emits d0 − k·δ or the floor. A \
+                 value between two rungs is a state this design does not define, and the sender \
+                 chose it.",
+                p.d_floor, p.d0, p.d0, p.delta
+            ));
         }
         // [B1] the declared field is the signed one, or the bundle is refused.
         mercurylib::transfer::receiver::bind_declared_csv(

@@ -381,6 +381,37 @@ impl TesrParams {
         self.e0.saturating_sub(m.saturating_mul(self.delta_e)).max(self.e_floor)
     }
 
+    /// **[D38/R13] Is `csv` a value this schedule can actually PRODUCE for an extension?**
+    ///
+    /// The band `[e_floor, e0]` is not the set of legal extension CSVs — the GRID is. An honest
+    /// renewal steps by exactly `δE` ([`Self::ext_csv`]), so `e0 − m·δE` and the floor clamp are the
+    /// only values any builder in this design emits. A receiver that admits anything in the band
+    /// admits states the specification does not define, chosen by the sender at 1-block granularity
+    /// where the design's own granularity is `δE`.
+    ///
+    /// The floor is on the grid by fiat, because `ext_csv` clamps there: a schedule whose floor is
+    /// not itself a grid point still produces the floor, and refusing it would refuse the last
+    /// honest renewal.
+    /// **The floor bound is part of the predicate, not a separate check the caller must remember.**
+    /// Without it this is only a modular-arithmetic test, and `SPINE_CSV = 0` passes it on mainnet
+    /// (`1440 % 36 == 0`) — so a caller using the grid alone would admit an un-timelocked state on
+    /// the ordinary lane. A predicate named "is this legal" must answer that question completely.
+    pub fn is_on_ext_grid(&self, csv: u16) -> bool {
+        csv >= self.e_floor
+            && csv <= self.e0
+            && (csv == self.e_floor || (self.e0 - csv) % self.delta_e == 0)
+    }
+
+    /// The state-tier twin of [`Self::is_on_ext_grid`] — `d0 − k·δ`, or the floor clamp.
+    ///
+    /// **`SPINE_CSV = 0` is deliberately NOT on this grid** and must never be tested against it: a
+    /// split state is a distinct tier kind with its own exact band, not a state walked to zero.
+    pub fn is_on_state_grid(&self, csv: u16) -> bool {
+        csv >= self.d_floor
+            && csv <= self.d0
+            && (csv == self.d_floor || (self.d0 - csv) % self.delta == 0)
+    }
+
     /// True once the NEXT state (`k+1`) would fall below the floor — renew before spending again.
     pub fn needs_renewal(&self, k: u16) -> bool {
         self.d0.saturating_sub(k.saturating_add(1).saturating_mul(self.delta)) < self.d_floor
@@ -1313,5 +1344,65 @@ mod tests {
         assert_eq!(tx.output.len(), 2);
         assert_eq!(tx.output[1].value, P2A_VALUE);
         assert_eq!(tx.output[1].script_pubkey.as_bytes(), &[0x51, 0x02, 0x4e, 0x73]);
+    }
+}
+
+#[cfg(test)]
+mod grid_law_tests {
+    use super::TesrParams;
+
+    /// **[D38/R13] The grid is the set of values the schedule can PRODUCE; the band is wider.**
+    #[test]
+    fn the_grid_admits_what_the_builders_emit_and_refuses_what_they_cannot() {
+        for (name, p) in [("mainnet", TesrParams::mainnet()), ("regtest", TesrParams::regtest())] {
+            // Every value a builder emits is on its grid, at every renewal epoch it can reach.
+            for m in 0u16..40 {
+                let e = p.ext_csv(m);
+                assert!(p.is_on_ext_grid(e), "{name}: ext_csv({m}) = {e} is off its own grid");
+                let d = p.state_csv(m);
+                assert!(p.is_on_state_grid(d), "{name}: state_csv({m}) = {d} is off its own grid");
+            }
+            // …and a value strictly between two rungs is refused, which is the whole point: it sits
+            // INSIDE the band, so the band check admits it.
+            let between = p.e0 - 1;
+            if p.delta_e > 1 && between > p.e_floor {
+                assert!(between >= p.e_floor && between <= p.e0, "{name}: the probe must be in-band");
+                assert!(
+                    !p.is_on_ext_grid(between),
+                    "{name}: e0-1 = {between} is in-band and must be OFF the grid (δE {})",
+                    p.delta_e
+                );
+            }
+            let between_d = p.d0 - 1;
+            if p.delta > 1 && between_d > p.d_floor {
+                assert!(
+                    !p.is_on_state_grid(between_d),
+                    "{name}: d0-1 = {between_d} is in-band and must be OFF the grid (δ {})",
+                    p.delta
+                );
+            }
+        }
+    }
+
+    /// The floor is admitted by fiat, because `ext_csv`/`state_csv` CLAMP there. A schedule whose
+    /// floor is not itself a grid point still produces the floor, and refusing it would refuse the
+    /// last honest renewal — the one a coin at its end of life depends on.
+    #[test]
+    fn the_floor_clamp_is_on_the_grid_even_when_the_arithmetic_disagrees() {
+        let p = TesrParams { d0: 100, delta: 30, d_floor: 7, e0: 100, delta_e: 30, e_floor: 7, m_max: 3, committed_fee_rate: 2.0 };
+        assert_ne!((p.e0 - p.e_floor) % p.delta_e, 0, "the probe schedule must have an off-grid floor");
+        assert!(p.is_on_ext_grid(p.e_floor), "the floor clamp must be admitted");
+        assert!(p.is_on_state_grid(p.d_floor), "the floor clamp must be admitted");
+        assert_eq!(p.ext_csv(u16::MAX), p.e_floor, "…and it really is what the builder emits");
+    }
+
+    /// `SPINE_CSV = 0` must NOT be admitted by the state grid — a split state is its own kind with an
+    /// exact band, not a state walked to zero. Admitting it here would let the grid law be used to
+    /// justify a zero-CSV state on the ordinary lane.
+    #[test]
+    fn zero_is_not_a_state_grid_point() {
+        for p in [TesrParams::mainnet(), TesrParams::regtest()] {
+            assert!(!p.is_on_state_grid(0), "0 must be off the state grid (d_floor {})", p.d_floor);
+        }
     }
 }
