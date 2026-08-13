@@ -38,8 +38,8 @@ be skipped and most expensive to skip.**
 |---|---|---|
 | 0.1 | ~~sdk75, sdk77, sdk29 against HEAD~~ | ✅ **DONE. sdk75 and sdk77 PASS on HEAD**, so P2 did **not** break coloured-ladder spendability — the one world that would have forced a repair cycle before decision 8. sdk29 still refuses (coloured K>1, decision 8's own question). Remaining sub-question: whether P2 bought any privacy, which the adversarial pass argues it did not (`extract_received_assignments` books by vout with `known_concealed: None`). |
 | 0.2 | ~~Re-run the E2E suite on a binary built from HEAD~~ | ✅ **DONE for the four that failed**: SDK80 and RGB8 PASS on HEAD; SDK22 and SDK29 remain, both diagnosed. A full 85-test re-run on the current HEAD is still owed after Tier B lands. |
-| 0.3 | **Re-resolve every code citation in the corpus, by SYMBOL not by line** | `77807e1` moved every `tesr.rs` line above ~10450 by 70–190. Citations by line number are already wrong and will keep going wrong. |
-| 0.4 | **Evaluate the two closed forms nobody has run** | `Σ V_i · 1[V_i < V_min(d_i, r)]` over the live fleet (C-1's aggregate — *bounded and unevaluated*, which is the whole point of D40.3) and the fleet-wide footprint curve for §7.2. Both are queryable today. Publishing §7 without them repeats the error this pass just caught. |
+| 0.3 | **Re-resolve every code citation by SYMBOL** | **Partly done** — the Stage 4 pass introduced zero new line-number citations and replaced the ones it touched with symbols; the re-audit found more still standing in SPEC-ROADMAP (D19/§4a, WP3a, WP3b, §7) which the follow-up commit fixed. A full corpus sweep is still owed. |
+| 0.4 | **Evaluate the two closed forms** | **BLOCKED — needs a live fleet.** Both queries are over deployed coins; regtest has none that mean anything. This is an external dependency, not unfinished work: the forms are constructible (D40.3) and remain UNEVALUATED until there is a fleet to evaluate them against. |
 
 **Believed done but NOT verified** — each must be re-graded or re-tested before it appears in prose:
 
@@ -113,7 +113,7 @@ they land.
 - The zero-CSV successor test **on regtest**, where `d_floor >= δ` clears with *zero slack* (6 ≥ 6) while mainnet clears at 144 ≥ 36. A mainnet-only test is the exact trap D14's own preset census was written to flag.
 - The **carrier variant** of every deadline and allocation test. The coloured lane is where three separate bounds turned out to be sat-denominated descriptions of a victim who loses an asset.
 - Replace `sdk30(a)` as INV-27's evidence.
-- A CI guard that no client reads `num_sigs` except through the attested reader — today the single-reader property is a convention, and A.1 is what made it worth pinning.
+- ✅ **DONE** — a CI guard that no client reads `num_sigs` except through the attested reader. The property was a convention; A.1 (terminality derived from the attested budget) is what made losing it reintroduce the D8 hole one field over.
 
 ---
 
