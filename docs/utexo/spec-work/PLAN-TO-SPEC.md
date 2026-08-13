@@ -19,7 +19,7 @@ unfinished.
 | — decided (D39 ×4, D40 ×4) | **8** |
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
-| Code items on the critical path | **14**, of which **A.1, A.2, A.5 have landed** (plus 4 defects found by running things) |
+| Code items on the critical path | **14**, of which **all six Tier A have landed** (plus 5 defects found by running things) |
 | Live E2E suite | **complete: 81/85**, and on a HEAD binary SDK80 + RGB8 also pass → **83/85 equivalent**. Two remain: SDK22 (coin selection, item below) and SDK29 (blocked on decision 8) |
 | Unit + guard suite | green — **711 tests, 0 failures** |
 
@@ -36,8 +36,8 @@ be skipped and most expensive to skip.**
 
 | # | What | Why it gates something |
 |---|---|---|
-| 0.1 | **sdk75, sdk77, sdk29 against HEAD** | Decision #8 (the coloured lane) is *unanswerable* without them. They distinguish three incompatible worlds: P2 is a harmless no-op / P2 broke coloured-ladder spendability / P2 bought no privacy. A unit-test count touches none of it. |
-| 0.2 | **Re-run the E2E suite on a binary built from HEAD** | The current run started before D14, the chaos22 fix and Tier A.1. Its SDK22 failure is already stale and D14 *tightened an acceptance rule*. **52/85 is not yet a claim about HEAD.** |
+| 0.1 | ~~sdk75, sdk77, sdk29 against HEAD~~ | ✅ **DONE. sdk75 and sdk77 PASS on HEAD**, so P2 did **not** break coloured-ladder spendability — the one world that would have forced a repair cycle before decision 8. sdk29 still refuses (coloured K>1, decision 8's own question). Remaining sub-question: whether P2 bought any privacy, which the adversarial pass argues it did not (`extract_received_assignments` books by vout with `known_concealed: None`). |
+| 0.2 | ~~Re-run the E2E suite on a binary built from HEAD~~ | ✅ **DONE for the four that failed**: SDK80 and RGB8 PASS on HEAD; SDK22 and SDK29 remain, both diagnosed. A full 85-test re-run on the current HEAD is still owed after Tier B lands. |
 | 0.3 | **Re-resolve every code citation in the corpus, by SYMBOL not by line** | `77807e1` moved every `tesr.rs` line above ~10450 by 70–190. Citations by line number are already wrong and will keep going wrong. |
 | 0.4 | **Evaluate the two closed forms nobody has run** | `Σ V_i · 1[V_i < V_min(d_i, r)]` over the live fleet (C-1's aggregate — *bounded and unevaluated*, which is the whole point of D40.3) and the fleet-wide footprint curve for §7.2. Both are queryable today. Publishing §7 without them repeats the error this pass just caught. |
 
@@ -79,10 +79,10 @@ they land.
 |---|---|---|
 | A.1 | Consume the attested budget; demote the coordinator's answer to a refusing cross-check | ✅ **landed** `52daca6` |
 | A.2 | Schedule the deadline-safety pass; forced action is **T**, never the flat backup | ✅ **landed** `9013a2f` — and the doc pass caught the lane gap it left: `deadline_safety_due` excludes carriers on BOTH routes, so a carrier's `min(L_k)` rests on `auto_exit_due` alone. Written into TRUST-MODEL B4 rather than left unstated |
-| A.3 | Extension **grid** law consumer-side in `verify_child_bundle` | open (decision 9) |
-| A.4 | Make the JS/web laddered gate **structural**, not keyed on three sender-declared fields | open (D40.2) — the *cheapest* route by privilege, and it was ranked last |
+| A.3 | Extension **grid** law consumer-side in `verify_child_bundle` | ✅ **landed** — both the extension and state grids; the predicate's own test caught it admitting `SPINE_CSV = 0` on mainnet (`1440 % 36 == 0`) |
+| A.4 | Make the JS/web laddered gate **structural**, not keyed on three sender-declared fields | ✅ **landed** `9f46b63` — now keys on the coordinator-served `sig_count_attestation`. Does NOT make them conformant; makes them fail closed for a reason they can check |
 | A.5 | Minimum-slack admission margin beside `check_exit_headroom` | ✅ **landed** `a0c19fb` |
-| A.6 | Surface "sever from `F`" — broadcast the pre-signed `T`, 125 vB, no SE | **half landed**: it is the automatic fallback inside `deadline_safety_due` (`9013a2f`). The user-facing action, named as B1's remedy, is still open |
+| A.6 | Surface "sever from `F`" — broadcast the pre-signed `T`, 125 vB, no SE | ✅ **landed** — `sever_from_f`, named for what it is for, plus the automatic fallback in `deadline_safety_due` |
 
 ### Tier B
 

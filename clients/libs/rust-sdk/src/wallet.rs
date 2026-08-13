@@ -3374,6 +3374,47 @@ impl UtexoWallet {
         }
     }
 
+    /// **[D40.1] SEVER THIS COIN FROM `F` — the one B1 remedy the adversary cannot decline.**
+    ///
+    /// # What B1 is
+    ///
+    /// The statechain's irreducible trust unit. At every transfer the operator's enclave generates a
+    /// fresh share and the old pair `(o_i, e_i)` is supposed to be destroyed. If it is retained, the
+    /// operator holds a full key-path spend of `F` for every coin with at least one prior owner —
+    /// and can take it **offline**, with no SE session, so no census, no attestation, no rate limit
+    /// and no audit log sees anything. There is no value bound on this: not per coin, not per victim,
+    /// not in aggregate. It is custodial-equivalent against a retaining operator.
+    ///
+    /// # Why this, and not a re-anchor
+    ///
+    /// Re-anchoring also clears the prior owners — and it needs one fresh SE co-signature. **The
+    /// party being defended against is the party asked to sign**, and refusing to co-sign is already
+    /// blessed as non-theft. A defence its adversary can decline is not a defence.
+    ///
+    /// Broadcasting the trigger needs nobody. `T` is already co-signed, carries `lock_time 0` and no
+    /// relative timelock, spends `F` directly, and is 125 vB. It therefore beats every retained rung
+    /// **by being valid first** rather than by winning a race. The moment it confirms, every
+    /// historical `(o_i, e_i)` for this coin is dead: they authorise a spend of an output that no
+    /// longer exists.
+    ///
+    /// That is a DURATION bound, not a value bound — it ends the exposure rather than capping it —
+    /// and it is the only one available.
+    ///
+    /// # What it costs
+    ///
+    /// The coin's off-chain life. `T` on chain starts the CSV walk, so from here the coin exits on
+    /// the ladder's schedule instead of transferring instantly, and undoing it needs the SE. Pay
+    /// this when the alternative is losing the coin, not routinely.
+    ///
+    /// Mechanically this is [`Self::unilateral_exit`] on one coin — the exit pass broadcasts `T`
+    /// first when `F` is unspent, which IS the sever — surfaced under the name of what it is for, so
+    /// that a holder acting on the B1 disclosure has an action to take rather than a paragraph to
+    /// read. It is also what [`Self::deadline_safety_due`] falls back to when the cooperative
+    /// re-anchor is refused.
+    pub async fn sever_from_f(&self, statechain_id: &str) -> Result<Vec<crate::types::ExitStatus>> {
+        self.unilateral_exit(Some(vec![statechain_id.to_string()]), None).await
+    }
+
     pub async fn unilateral_exit(
         &self,
         statechain_ids: Option<Vec<String>>,
