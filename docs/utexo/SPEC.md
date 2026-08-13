@@ -207,6 +207,38 @@ rollover). No SE endpoint is added for this — renewal is ordinary blind co-sig
 All endpoints are HTTP JSON on the Mercury server. Encrypted transfer messages are opaque to the
 SE (owner-encrypted); the SE never deserializes `TransferMsg`.
 
+### 3.0 CENSUS COMPLETENESS, and the shape obligation that discharges it [D47]
+
+The receiver's anti-theft census is an EXACT equality —
+`se_num_sigs == flat_backups + tiers + superseded` — and its soundness rests on **A11**: every
+co-signature the SE issued for this coin is accounted for by exactly one disclosed item. A11 is not
+an assumption; it is a **theorem with four premises**:
+
+1. **A3** (the SE signs only what a valid request asks it to sign);
+2. **no CO-1** (the enclave's key material and the counter it attests are not both held by the party
+   the receiver is being protected from). **Of the four, this is the one that is NOT discharged**:
+   it is published as an accepted bound in the named-limitations section rather than proved here,
+   and a theorem whose unmet premise is buried is worse than an assumption stated plainly;
+3. **blind-signing concurrency is 1 per key** (serialised `sign/first`, one signature per server
+   nonce, INV-23);
+4. **the counted categories are PAIRWISE DISTINCT** — no object can be counted as a flat backup and
+   as a tier, or as two tiers.
+
+**Premise 4 is discharged by SHAPE, not by a runtime check.** A flat backup is nVersion 2,
+nSequence 0, a height `nLockTime` above tip, exactly one non-`OP_RETURN` output. A tier is
+nVersion 3, `nLockTime` 0, exactly one 240-sat P2A anchor, a CSV inside its bound band, and provably
+unconfirmable once superseded. No transaction satisfies both descriptions, so the categories cannot
+overlap and nothing can be double-counted.
+
+**Those rules therefore carry a CENSUS obligation and not only a relay/race one.** This is the whole
+point of stating it here: every one of them already exists for a transport reason, and the failure
+mode is that a future change relaxes one for a perfectly good relay-side reason, the two categories
+stop being distinguishable, and the census silently begins counting one thing as another. A change
+to any shape rule above MUST be re-checked against premise 4.
+
+A runtime distinctness check is deliberately NOT specified: it would re-derive at every claim a
+property the shapes already guarantee, paying forever for a premise that is structurally true.
+
 ### 3.1 Deposit / keygen
 - `POST /deposit/init` `{token_id, auth_key, ...}` → `{server_pubkey, statechain_id, ...}`.
   Registers a new coin key-share. **REQ-4** MUST require a valid deposit token.
