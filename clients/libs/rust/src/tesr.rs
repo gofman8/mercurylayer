@@ -11419,6 +11419,93 @@ fn verify_colored_shape(bundle: &TesrBundle) -> Result<()> {
     Ok(())
 }
 
+/// **[D35 / RGB-1] The permitted FLAT-BACKUP shape is a function of the DECLARED LANE.**
+///
+/// The sibling of [`verify_colored_shape`], and the other half of the R′ acceptance set: that one
+/// runs over `bundle.exit_tiers()`, this one runs over the flat backup chain that travels beside it.
+/// Neither had anything to say about the other's transactions, and the union of the two lanes'
+/// permitted shapes was the surface.
+///
+/// # What the union admitted
+///
+/// `verify_if_locktime_is_reasonable_tx_version_and_output_size` admits `op_return_outputs <= 1` on
+/// every flat backup, because on the **un-laddered carrier lane** the coloured backup IS the exit
+/// material — that permission is correct and must stay. But the same validator serves a coin whose
+/// exit is a COLOURED ladder, where a flat backup is a *hop* backup and nothing binds an opret on
+/// it to anybody. `reconstruct_transaction` copies `tx_n.output` verbatim, so it constrains nothing.
+/// A prior owner who retains a coloured backup over `F` holds a transaction that spends the coin's
+/// funding outpoint AND re-assigns the allocation to themselves — invisible to every check the
+/// receiver runs, for the price of one 112-vB spend.
+///
+/// That also breaks the economic argument the corpus leans on elsewhere: "a prior owner's spend of
+/// `F` voids the tree and gains them nothing" is only true while their retained backup is PLAIN. A
+/// coloured one turns griefing into capture.
+///
+/// # The rule
+///
+/// | conveyed ladder | opret in a flat backup | `rgb_consignment` on a row | verdict |
+/// |---|---|---|---|
+/// | COLOURED   | yes | — | **refused** — an unbound re-assignment of the allocation over `F` |
+/// | COLOURED   | no | yes | fine — the coin's own carrier envelope, bound to the RECEIVER'S outpoint by `verify_consignment_assignment` |
+/// | plain      | yes or set | — | **refused** — a plain ladder's tiers carry no transition, so its exit BURNS the allocation |
+/// | plain      | no | no | plain sats |
+/// | none       | anything | anything | not this function's business — the un-laddered carrier lane, where a coloured backup is the transfer vehicle |
+///
+/// The COLOURED row is the correction. The shape it now admits — a coloured ladder whose carrier
+/// envelope rides on a flat row — is the one an uncolourable legacy piece reaches the moment
+/// `accept_ladder` colours it, and it is a legitimate coin: the allocation lives on tiers that each
+/// carry a valid transition, and the envelope is what lets the next receiver verify the assignment.
+/// Refusing it (the previous rule) refused the whole rescue lane at its last hop.
+///
+/// Deliberately keyed on `is_colored()` and NOT on the message's own claims: the lane is read from
+/// the structure the receiver is being asked to accept.
+pub fn verify_flat_backup_lane(
+    bundle: &TesrBundle,
+    backups: &[mercurylib::wallet::BackupTx],
+) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    let colored = bundle.is_colored();
+    for b in backups.iter() {
+        let raw = hex::decode(&b.tx)
+            .map_err(|_| anyhow::anyhow!("flat backup tx_n {}: hex does not decode", b.tx_n))?;
+        let tx: Transaction = deserialize(&raw)
+            .map_err(|_| anyhow::anyhow!("flat backup tx_n {}: tx does not parse", b.tx_n))?;
+        if tx.output.iter().any(|o| o.script_pubkey.is_op_return()) {
+            return if colored {
+                Err(anyhow::anyhow!(
+                    "refusing a COLOURED ladder whose flat backup tx_n {} carries an OP_RETURN. On \
+                     this lane the allocation lives on the tiers, and a flat backup is a hop backup \
+                     over the funding outpoint that any prior owner may still hold. Nothing binds \
+                     that commitment's assignment to anyone, so accepting it would hand every \
+                     ancestor a spend of `F` that RE-ASSIGNS the allocation to themselves instead \
+                     of merely voiding it. Only the un-laddered carrier lane may convey a coloured \
+                     backup.",
+                    b.tx_n
+                ))
+            } else {
+                Err(anyhow::anyhow!(
+                    "refusing a PLAIN ladder whose flat backup tx_n {} carries an OP_RETURN. A \
+                     plain ladder's tiers carry no RGB state transition, so exiting through them \
+                     would move the sats and permanently BURN the allocation. A coin that \
+                     legitimately holds both is COLOURED.",
+                    b.tx_n
+                ))
+            };
+        }
+        if !colored && b.rgb_consignment.is_some() {
+            return Err(anyhow::anyhow!(
+                "refusing a PLAIN ladder that also carries an RGB consignment (on backup tx_n {}). \
+                 A plain ladder's tiers carry no RGB state transition, so exiting through them \
+                 would move the sats and permanently BURN the allocation. These two payloads \
+                 describe incompatible coins; a coin that legitimately holds both is COLOURED, and \
+                 a coloured ladder is a different shape admitted by its own verifier.",
+                b.tx_n
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// [in-ladder split] The x-only taproot key (hex) of a v1 taproot scriptPubKey, or an error if `spk`
 /// is not `OP_1 <32-byte push>`.
 fn taproot_key_hex(spk: &[u8]) -> Result<String> {
@@ -25279,5 +25366,135 @@ mod s6_coloured_tip_replay_tests {
             "the cap must be on disk BEFORE the crash window, or a crash there loses a co-signature \
              that can never be regenerated"
         );
+    }
+}
+
+/// [D35 / RGB-1] The five lane × flat-backup shapes, and which two cannot be legitimate.
+#[cfg(test)]
+mod d35_flat_backup_lane_tests {
+    use super::verify_tests::sample_bundle;
+    use super::*;
+    use electrum_client::bitcoin::{
+        absolute::LockTime, consensus::serialize, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxOut, Witness,
+    };
+
+    /// A flat backup transaction, optionally carrying the opret commitment output. The value law is
+    /// not what is under test here — the SHAPE is — so the outputs are minimal, and the scripts are
+    /// spelled in hex so the assertion does not depend on any script-builder API: `0014…` is a
+    /// P2WPKH spendable output, `6a20…` is `OP_RETURN <32-byte push>`.
+    fn backup_tx(with_opret: bool) -> String {
+        let mut output = vec![TxOut {
+            value: 10_000,
+            script_pubkey: ScriptBuf::from_hex("0014000102030405060708090a0b0c0d0e0f10111213")
+                .unwrap(),
+        }];
+        if with_opret {
+            output.push(TxOut {
+                value: 0,
+                script_pubkey: ScriptBuf::from_hex(&format!("6a20{}", "aa".repeat(32))).unwrap(),
+            });
+        }
+        let tx = Transaction {
+            version: 2,
+            lock_time: LockTime::from_height(1_000).unwrap(),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(0),
+                witness: Witness::new(),
+            }],
+            output,
+        };
+        hex::encode(serialize(&tx))
+    }
+
+    fn backup(tx_n: u32, with_opret: bool, consignment: Option<&str>) -> mercurylib::wallet::BackupTx {
+        mercurylib::wallet::BackupTx {
+            tx_n,
+            tx: backup_tx(with_opret),
+            client_public_nonce: String::new(),
+            server_public_nonce: String::new(),
+            client_public_key: String::new(),
+            server_public_key: String::new(),
+            blinding_factor: String::new(),
+            rgb_consignment: consignment.map(|c| c.to_string()),
+            rgb_blinding: None,
+        }
+    }
+
+    fn colored() -> TesrBundle {
+        let mut b = sample_bundle();
+        b.rgb = Some(ColoredLadder {
+            contract_id: "rgb:contract".into(),
+            amount: 250,
+            consignments: vec![],
+        });
+        b
+    }
+
+    fn reject(r: Result<()>) -> String {
+        r.expect_err("must be refused").to_string()
+    }
+
+    /// **THE DEFECT (RGB-1).** A coloured coin's flat backups are HOP backups over `F`, and any
+    /// ancestor may still hold one. An opret on such a transaction commits to an assignment nothing
+    /// verifies, so a prior owner's 112-vB spend of `F` stops being griefing (they gain nothing) and
+    /// becomes capture (they take the allocation). The refusal must name the row.
+    #[test]
+    fn a_coloured_ladder_refuses_a_flat_backup_carrying_an_opret() {
+        let backups = vec![backup(0, false, None), backup(1, true, None), backup(2, false, None)];
+        let msg = reject(verify_flat_backup_lane(&colored(), &backups));
+        assert!(msg.contains("COLOURED"), "{msg}");
+        assert!(msg.contains("tx_n 1"), "must name the offending row, not just the message: {msg}");
+        assert!(msg.contains("RE-ASSIGNS"), "must say what an ancestor GAINS, not just that it is odd: {msg}");
+    }
+
+    /// **THE CORRECTION (D35), and the regression the old rule caused.** A coloured ladder whose
+    /// carrier envelope rides on a flat row is a legitimate coin — the tiers each carry a valid
+    /// transition, and the envelope is what lets the next receiver run
+    /// `verify_consignment_assignment` against its OWN outpoint. This is the exact shape an
+    /// uncolourable legacy piece reaches once `accept_ladder` colours it (sdk78), and refusing it
+    /// refused the rescue lane at its final hop.
+    #[test]
+    fn a_coloured_ladder_admits_the_carrier_envelope_on_a_plain_backup() {
+        let backups = vec![backup(0, false, Some("envelope")), backup(1, false, None)];
+        assert!(verify_flat_backup_lane(&colored(), &backups).is_ok());
+    }
+
+    /// The plain lane keeps BOTH refusals: its tiers carry no transition, so anything RGB on the
+    /// message describes a coin whose exit destroys the allocation.
+    #[test]
+    fn a_plain_ladder_refuses_rgb_material_in_either_form() {
+        let by_envelope = reject(verify_flat_backup_lane(
+            &sample_bundle(),
+            &[backup(0, false, None), backup(1, false, Some("envelope"))],
+        ));
+        assert!(by_envelope.contains("PLAIN") && by_envelope.contains("BURN"), "{by_envelope}");
+        assert!(by_envelope.contains("tx_n 1"), "{by_envelope}");
+
+        let by_opret = reject(verify_flat_backup_lane(&sample_bundle(), &[backup(0, true, None)]));
+        assert!(by_opret.contains("PLAIN") && by_opret.contains("BURN"), "{by_opret}");
+    }
+
+    /// Plain sats on either lane pass, and an empty chain is vacuous here (its own emptiness check
+    /// lives in `validate_backup_chain_v2`, which must stay the one place that owns it).
+    #[test]
+    fn plain_backups_pass_on_both_lanes() {
+        let clean = vec![backup(0, false, None), backup(1, false, None)];
+        assert!(verify_flat_backup_lane(&sample_bundle(), &clean).is_ok());
+        assert!(verify_flat_backup_lane(&colored(), &clean).is_ok());
+        assert!(verify_flat_backup_lane(&colored(), &[]).is_ok());
+    }
+
+    /// A row whose `tx` does not parse is a refusal, not a skip. The predicate reads every backup's
+    /// outputs, so "could not read it" must never resolve to "nothing to see".
+    #[test]
+    fn an_unparseable_backup_is_refused_rather_than_skipped() {
+        let mut b = backup(3, false, None);
+        b.tx = "not-hex".into();
+        assert!(reject(verify_flat_backup_lane(&colored(), &[b.clone()])).contains("tx_n 3"));
+        b.tx = "deadbeef".into();
+        assert!(reject(verify_flat_backup_lane(&colored(), &[b])).contains("tx_n 3"));
     }
 }

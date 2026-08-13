@@ -190,6 +190,28 @@ async fn child_sid(cc: &ClientConfig, wallet_name: &str, exclude: &[&str]) -> Re
     Ok(None)
 }
 
+/// The sid of the one `spinetip-` row in `wallet_name` — the SENDER'S OWN CHANGE leg.
+///
+/// **This is not a stylistic sibling of [`child_sid`]; it is the whole distinction.** A CATS-B split
+/// writes the payee's piece under `ctesr-` and the sender's change under `spinetip-`, because the two
+/// are different shapes with different readers: a `ctesr-` row is a conveyable leaf with two tiers
+/// and a payee, a `spinetip-` row is one cap over `SP.out[K]` paying this wallet's own key. Asking
+/// `load_child` about the change leg returns `None`, and a test that read that as "alice has no
+/// change" would report a missing coin rather than a mis-keyed lookup.
+async fn tip_sid(cc: &ClientConfig, wallet_name: &str, exclude: &[&str]) -> Result<Option<String>> {
+    let coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet_name).await?.coins;
+    for c in coins.iter().filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0) {
+        let Some(sid) = c.statechain_id.clone() else { continue };
+        if exclude.contains(&sid.as_str()) {
+            continue;
+        }
+        if mercuryrustlib::tesr::load_spine_tip(cc, wallet_name, &sid).await?.is_some() {
+            return Ok(Some(sid));
+        }
+    }
+    Ok(None)
+}
+
 pub async fn execute() -> Result<()> {
     // The CTES-R default (`colored_ladder` ON). That is the point of the test: an idle COLOURED
     // ladder never ages, and every rung of it is RGB-aware — so "what happens to tokens left alone
@@ -304,12 +326,20 @@ pub async fn execute() -> Result<()> {
         "bob's received child {bob_piece} carries a PLAIN chain — an RGB-unaware tier over his piece \
          would destroy the {PAY} units he was just paid"
     );
-    let alice_change = child_sid(&cc, "sdk32_alice", &[&carrier_id, &bob_piece]).await?
-        .ok_or_else(|| anyhow!("alice has no confirmed change child after the split"))?;
-    let change_cb = mercuryrustlib::tesr::load_child(&cc, "sdk32_alice", &alice_change).await?
-        .ok_or_else(|| anyhow!("alice's change child has no ctesr- bundle"))?;
-    assert!(change_cb.is_colored(), "alice's own change child must be COLOURED too");
-    println!("SDK32 - (1) COOPERATIVE SEND works: alice→bob {PAY} (balances {}/{PAY}); bob's piece is COLOURED CHILD {bob_piece}, alice's change is COLOURED CHILD {alice_change}", SUPPLY - PAY);
+    let alice_change = tip_sid(&cc, "sdk32_alice", &[&carrier_id, &bob_piece]).await?
+        .ok_or_else(|| anyhow!("alice has no confirmed change SPINE TIP after the split"))?;
+    let change_tip = mercuryrustlib::tesr::load_spine_tip(&cc, "sdk32_alice", &alice_change).await?
+        .ok_or_else(|| anyhow!("alice's change leg has no spinetip- record"))?;
+    assert!(change_tip.is_colored(), "alice's own change tip must be COLOURED too");
+    // …and it must be a TIP, not a leaf. If the change leg were ever written under `ctesr-` it would
+    // be handed to every reader that treats such a row as someone else's coin that arrived here.
+    assert!(
+        mercuryrustlib::tesr::load_child(&cc, "sdk32_alice", &alice_change).await?.is_none(),
+        "alice's own change leg is keyed `ctesr-` — the payee-leaf key. It is her change, and the \
+         flat-lane licence, the carrier exit allowlist and the tower's child loop all read that key \
+         as a coin that arrived from someone else"
+    );
+    println!("SDK32 - (1) COOPERATIVE SEND works: alice→bob {PAY} (balances {}/{PAY}); bob's piece is COLOURED CHILD {bob_piece}, alice's change is her own COLOURED SPINE TIP {alice_change}", SUPPLY - PAY);
 
     // ===== 2. DO NOTHING FOR A "YEAR" ===========================================================
     let tip_yr = mine_and_sync(&cc, &core, initlock + 500)?;
@@ -318,9 +348,9 @@ pub async fn execute() -> Result<()> {
 
     // ----- (A) the ISSUER's side: not lost, and it did not age ----------------------------------
     assert_eq!(token_balance(&alice, &asset).await?, SUPPLY - PAY, "alice's tokens are NOT lost after long inactivity");
-    let change_cb = mercuryrustlib::tesr::load_child(&cc, "sdk32_alice", &alice_change).await?
-        .ok_or_else(|| anyhow!("idling DESTROYED alice's change bundle after {} blocks", initlock + 500))?;
-    assert!(change_cb.is_colored(), "idling must not un-colour alice's change child");
+    let change_tip = mercuryrustlib::tesr::load_spine_tip(&cc, "sdk32_alice", &alice_change).await?
+        .ok_or_else(|| anyhow!("idling DESTROYED alice's change tip after {} blocks", initlock + 500))?;
+    assert!(change_tip.is_colored(), "idling must not un-colour alice's change tip");
     // An idle coloured ladder pays 0 vB of rent: not one tier reached the chain, so `F` is untouched
     // and the whole walk is still available. This is the CTES-R form of "an idle coin never ages".
     assert!(
@@ -328,7 +358,7 @@ pub async fn execute() -> Result<()> {
         "the carrier's funding {f_txid}:{f_vout} was spent while BOTH wallets sat IDLE — an idle \
          ladder must never broadcast a tier"
     );
-    let alice_chain = mercuryrustlib::tesr::child_exit_chain(&change_cb);
+    let alice_chain = mercuryrustlib::tesr::spine_tip_exit_chain(&change_tip);
     for (hex_tx, _) in alice_chain.iter() {
         let tx: electrum_client::bitcoin::Transaction =
             electrum_client::bitcoin::consensus::deserialize(&hex::decode(hex_tx)?)?;
@@ -337,14 +367,14 @@ pub async fn execute() -> Result<()> {
     // …and the RGB half survived the year. `get_asset_balance` is deliberately NOT the evidence (E7
     // measured it reporting a full settled balance over a dead stock): this is the read-only,
     // stock-level `color_psbt` probe CTESR-GATE §3.3 mandates, and it discriminates.
-    let (a_contract, a_assigned, _, _) = alice.colored_child_health(&alice_change).await
-        .map_err(|e| anyhow!("alice's coloured change did not survive {} idle blocks: {e}", initlock + 500))?;
+    let (a_contract, a_assigned, _, _) = alice.colored_tip_health(&alice_change).await
+        .map_err(|e| anyhow!("alice's coloured change tip did not survive {} idle blocks: {e}", initlock + 500))?;
     assert_eq!(a_contract, asset, "the surviving allocation is THIS contract");
     assert_eq!(a_assigned, SUPPLY - PAY, "the whole change allocation must still be assigned");
-    alice.probe_colored_child_tip(&alice_change, SUPPLY - PAY).await
+    alice.probe_colored_spine_tip(&alice_change, SUPPLY - PAY).await
         .map_err(|e| anyhow!("alice's stock is DEAD after {} idle blocks: {e}", initlock + 500))?;
     assert!(
-        alice.probe_colored_child_tip(&alice_change, SUPPLY - PAY + 1).await.is_err(),
+        alice.probe_colored_spine_tip(&alice_change, SUPPLY - PAY + 1).await.is_err(),
         "the stock probe accepted MORE than the allocation — it is not discriminating, so its \
          success proves nothing"
     );

@@ -742,6 +742,22 @@ uncolourable carrier: `sdk78` shows a real 250-unit spend that does not land at 
 failure and the design hunt found the same boundary from opposite sides. Under the authority order
 (design normative, code follows) the rule is corrected here first; the code follows.
 
+**[Landed 2026-08-13.] The code now follows.** `verify_flat_backup_lane`
+(`clients/libs/rust/src/tesr.rs`) states the lane rule from the structure it reads — `is_colored()`
+off the bundle, `is_op_return()` off every backup transaction — and both R′ acceptance paths run it
+(the claim path and `prepay_flat_census`, the one that authorises an irreversible Lightning leg). The
+union-keyed predicate is DELETED, not bypassed. Normative text: PROTOCOL.md §5.10 rule 6, plus the
+correction to §5.8's griefing-is-losing premise, which was stated for a lane where voiding the tree
+yields the attacker nothing.
+
+Two things worth keeping. **The old refusal message asserted "PLAIN TES-R ladder" while never reading
+`is_colored()`** — it told the user the lane it had not checked, which is the same
+description-versus-construction shape as the S3/S4 holes. And the P1 correction was verified the only
+way it could be: `sdk78` failed at *"a spend that does not land at the far end is not a spend"* with
+bob's piece confirmed COLOURED three log lines earlier, and passes now with carol booking all 250
+units. 5 unit tests + `ci-guards/tests/deny_colored_backup_on_a_colored_ladder.rs` (negative-tested:
+2 of 4 assertions go red on a mutated construction).
+
 ## D36 — Publish the REAL maintenance cadence; retract INV-27 as written (T-1/T-2)
 
 **Decided:** correct the claim.

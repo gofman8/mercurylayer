@@ -238,7 +238,10 @@ pub async fn execute() -> Result<()> {
         alice.get_balance().await?.available_sats, change_sats,
         "alice keeps exactly SP.out[2] as her change"
     );
-    // Her change is itself a first-class child, exitable on its own.
+    // Her change is itself a first-class SPINE TIP, exitable on its own. It is deliberately NOT a
+    // `ctesr-` child: a payee's piece is a conveyable leaf (two tiers, someone else's key), her
+    // change is one cap over `SP.out[K]` paying her own — and everything keyed `ctesr-` is read as a
+    // coin that arrived from elsewhere.
     let alice_change_sid = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk69_alice")
         .await?
         .coins
@@ -249,9 +252,18 @@ pub async fn execute() -> Result<()> {
         })
         .and_then(|c| c.statechain_id.clone())
         .ok_or(anyhow!("alice booked no change coin"))?;
+    let alice_tip = mercuryrustlib::tesr::load_spine_tip(&cc, "sdk69_alice", &alice_change_sid)
+        .await?
+        .ok_or(anyhow!("alice's change has no spinetip- record — it is not exitable on its own"))?;
+    assert_eq!(
+        alice_tip.sp_vout, 2,
+        "the tip must be funded by SP.out[K], the LAST payload output — the change leg is last by \
+         construction, and a tip pointing anywhere else would be racing a payee's piece"
+    );
     assert!(
-        mercuryrustlib::tesr::load_child(&cc, "sdk69_alice", &alice_change_sid).await?.is_some(),
-        "alice's change is an exitable child claim"
+        mercuryrustlib::tesr::load_child(&cc, "sdk69_alice", &alice_change_sid).await?.is_none(),
+        "alice's own change leg is keyed `ctesr-`, the payee-leaf key — the flat-lane licence, the \
+         carrier exit allowlist and the tower's child loop all read that key as someone else's coin"
     );
     // The batch appears in payment history (an in-ladder piece never goes through transfer_sender).
     let transfers = alice.get_transfers().await?;

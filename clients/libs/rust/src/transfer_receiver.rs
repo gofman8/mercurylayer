@@ -540,6 +540,13 @@ async fn prepay_flat_census(
     let bundle: crate::tesr::TesrBundle = serde_json::from_str(ladder_json)
         .map_err(|e| anyhow!("pre-pay census: malformed TES-R ladder: {e}"))?;
 
+    // [D35 / RGB-1] THE FLAT-BACKUP LANE RULE, on the payer's side of the same acceptance set. The
+    // claim path runs this too; the pre-pay path must, because it is the one authorising an
+    // IRREVERSIBLE Lightning leg — and the shape it guards against (a coloured backup a prior owner
+    // still holds over `F`) leaves the payer holding a coin whose allocation an ancestor can take.
+    crate::tesr::verify_flat_backup_lane(&bundle, backup_group)
+        .map_err(|e| anyhow!("pre-pay census: {e}"))?;
+
     // [D2] MODEL-A OWNER-EXIT BINDING. `verify_bundle_bound` binds the ladder to the COIN but is
     // structurally incapable of checking WHO the ladder exits to — `owner_exit_address` is not derivable
     // from the funding output or the coordinator record. So a sender can convey a ladder that is
@@ -1142,31 +1149,6 @@ async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String
     Ok(())
 }
 
-/// **[P1 / WP6(i)]** The `tx_n` of the first backup row carrying an RGB envelope on a message that
-/// ALSO conveys a ladder — the combination that cannot be legitimate.
-///
-/// Pure, so the rule can be tested against all four shapes without a coordinator. Which shapes are
-/// legitimate is the part worth stating, because getting it wrong in the other direction would refuse
-/// every coloured coin:
-///
-/// | ladder | backup `rgb_consignment` | verdict |
-/// |---|---|---|
-/// | none | none | plain sats — fine |
-/// | none | some | an RGB CARRIER on the flat lane (`rgb.rs`, `tokens.rs`) — fine, and the shape the
-/// |      |      | shipping default produces |
-/// | some | none | a laddered coin, plain OR **coloured** — fine. A coloured ladder's consignments
-/// |      |      | travel in `TesrBundle.rgb.consignments`, NOT here; `create_backup_transactions`
-/// |      |      | never writes this field on any laddered path |
-/// | some | some | **refused** — a plain ladder's tiers carry no RGB transition, so its exit burns
-/// |      |      | the allocation |
-fn first_rgb_envelope_on_a_laddered_message(
-    tesr_ladder: Option<&String>,
-    backups: &[mercurylib::wallet::BackupTx],
-) -> Option<u32> {
-    tesr_ladder?;
-    backups.iter().find(|b| b.rgb_consignment.is_some()).map(|b| b.tx_n)
-}
-
 async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, enc_message: &str, network: &str, wallet_name: &str, info_config: &InfoConfig, blockheight: u32) -> Result<()> {
 
     let client_auth_key = coin.auth_privkey.clone();
@@ -1307,43 +1289,33 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
         ));
     }
 
-    // ── [P1 / WP6(i)] A PLAIN LADDER AND AN RGB CONSIGNMENT CANNOT BOTH BE LEGITIMATE ─────────────
+    // ── [P1 / WP6(i), corrected by D35] THE FLAT-BACKUP SHAPE IS A FUNCTION OF THE DECLARED LANE ──
     //
-    // A conveyed message carrying a `tesr_ladder` describes a coin whose exit is that ladder's tiers.
-    // A `rgb_consignment` on a backup row says an RGB allocation lives on this coin. **The plain
-    // ladder's tiers carry no RGB state transition**, so exiting through them moves the sats and
-    // BURNS the asset — permanently, with no later pass able to recover it. The two payloads describe
-    // incompatible coins, and a sender shipping both is either confused or arranging exactly that.
+    // A conveyed message carrying a `tesr_ladder` describes a coin whose exit is that ladder's tiers,
+    // and the flat backups beside it are HOP backups over the funding outpoint. What may legitimately
+    // ride on those rows depends on which ladder it is, and the two answers are opposite:
     //
-    // This is the conveyance-path sibling of the `claim()` laddering hole (RGB Stage 0). Both come
-    // from one root: RGB material and ladder material travel in the same message with nothing
-    // requiring them to agree. Stage 0 closed it on the receiving wallet's OWN coins; this closes it
-    // on what arrives from a stranger.
+    //   * a PLAIN ladder's tiers carry no RGB state transition, so exiting through them moves the
+    //     sats and BURNS any allocation on the coin — RGB material on such a message is refused;
+    //   * a COLOURED ladder's tiers each carry a valid transition, so the coin legitimately holds
+    //     both. Its carrier envelope (`rgb_consignment`) is exactly what lets the next receiver bind
+    //     the assignment to its OWN outpoint. What must be refused there instead is an OP_RETURN in
+    //     a flat backup transaction: nothing binds that commitment's assignment, so it hands every
+    //     ancestor a spend of `F` that re-assigns the allocation rather than merely voiding it.
     //
-    // **The refusal was sender-side only** — and a sender that declines to build this shape protects
-    // nobody from a sender that does not. This path persisted `rgb_consignment` straight through with
-    // no cross-check, so the receiver adopted the coin and found out when its exit destroyed the
-    // allocation.
-    //
-    // The COLOURED ladder is the legitimate way to hold both, and it is not this shape: its tiers
-    // each carry a valid transition, which is the entire point of CTES-R. It is admitted by
-    // `verify_colored_shape` and is untouched here.
-    if transfer_msg.tesr_ladder.is_some() {
-        if let Some(bad) = first_rgb_envelope_on_a_laddered_message(
-            transfer_msg.tesr_ladder.as_ref(),
-            &transfer_msg.backup_transactions,
-        ) {
-            return Err(anyhow::anyhow!(
-                "refusing conveyance of {}: it carries a PLAIN TES-R ladder and also an RGB \
-                 consignment (on backup tx_n {}). A plain ladder's tiers carry no RGB state \
-                 transition, so exiting through them would move the sats and permanently BURN the \
-                 allocation. These two payloads describe incompatible coins; a coin that legitimately \
-                 holds both is COLOURED, and a coloured ladder is a different shape admitted by its \
-                 own verifier.",
-                transfer_msg.statechain_id,
-                bad
-            ));
-        }
+    // **The check used to be the union of the two**, keyed on "a ladder is present" and asserting
+    // PLAIN in its prose without ever reading `is_colored()`. It therefore missed the coloured lane's
+    // real defect (RGB-1) and refused the coloured lane's legitimate shape — which is the last hop of
+    // the uncolourable-carrier rescue, where `accept_ladder` colours a legacy piece that still
+    // carries its envelope. `verify_flat_backup_lane` states both rules from the lane it reads off
+    // the structure. A message with no ladder at all is the un-laddered carrier lane and is not this
+    // function's business: there the coloured backup IS the transfer vehicle.
+    if let Some(ladder) = transfer_msg.tesr_ladder.as_ref() {
+        let bundle: crate::tesr::TesrBundle = serde_json::from_str(ladder)
+            .map_err(|e| anyhow::anyhow!("malformed TES-R ladder: {e}"))?;
+        crate::tesr::verify_flat_backup_lane(&bundle, &transfer_msg.backup_transactions).map_err(
+            |e| anyhow::anyhow!("refusing conveyance of {}: {e}", transfer_msg.statechain_id),
+        )?;
     }
 
     let grouped_backup_transactions = split_backup_transactions(&transfer_msg.backup_transactions)?;
@@ -2477,62 +2449,3 @@ mod poll_cancellation_reporting_tests {
     }
 }
 
-/// [P1 / WP6(i)] The four ladder × RGB-envelope shapes, and which one cannot be legitimate.
-#[cfg(test)]
-mod p1_ladder_envelope_tests {
-    use super::first_rgb_envelope_on_a_laddered_message;
-    use mercurylib::wallet::BackupTx;
-
-    fn backup(tx_n: u32, consignment: Option<&str>) -> BackupTx {
-        BackupTx {
-            tx_n,
-            tx: String::new(),
-            client_public_nonce: String::new(),
-            server_public_nonce: String::new(),
-            client_public_key: String::new(),
-            server_public_key: String::new(),
-            blinding_factor: String::new(),
-            rgb_consignment: consignment.map(|c| c.to_string()),
-            rgb_blinding: None,
-        }
-    }
-    fn ladder() -> Option<String> {
-        Some("{\"a-bundle\":true}".to_string())
-    }
-
-    /// The refusal, and the `tx_n` it names — a message with several backups must point at the
-    /// offending one rather than say "somewhere in here".
-    #[test]
-    fn a_ladder_plus_an_rgb_envelope_is_refused_and_names_the_row() {
-        let backups = vec![backup(0, None), backup(1, Some("envelope")), backup(2, None)];
-        assert_eq!(
-            first_rgb_envelope_on_a_laddered_message(ladder().as_ref(), &backups),
-            Some(1)
-        );
-    }
-
-    /// **THE REGRESSION THIS MUST NOT CAUSE.** A coloured ladder is the legitimate way to hold sats
-    /// and an allocation together — it is the entire point of CTES-R. Its consignments travel in
-    /// `TesrBundle.rgb.consignments`, NOT on backup rows, and `create_backup_transactions` never
-    /// writes that field on any laddered path. So a laddered message with clean backups must PASS,
-    /// coloured or plain, or every coloured coin becomes unclaimable.
-    #[test]
-    fn a_laddered_message_with_no_envelope_on_its_backups_is_admitted() {
-        let backups = vec![backup(0, None), backup(1, None)];
-        assert_eq!(first_rgb_envelope_on_a_laddered_message(ladder().as_ref(), &backups), None);
-    }
-
-    /// An RGB CARRIER on the flat lane — envelope, no ladder — is the shape the shipping default
-    /// produces (`colored_ladder` is false, D30). Refusing it would break ordinary token receives.
-    #[test]
-    fn an_unladdered_carrier_carrying_an_envelope_is_admitted() {
-        let backups = vec![backup(0, Some("envelope"))];
-        assert_eq!(first_rgb_envelope_on_a_laddered_message(None, &backups), None);
-    }
-
-    #[test]
-    fn plain_sats_are_admitted() {
-        assert_eq!(first_rgb_envelope_on_a_laddered_message(None, &[backup(0, None)]), None);
-        assert_eq!(first_rgb_envelope_on_a_laddered_message(ladder().as_ref(), &[]), None);
-    }
-}

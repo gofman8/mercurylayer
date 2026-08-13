@@ -399,6 +399,11 @@ colored self-transition (~155 vB, tapret). Consequences:
   to force the victim a ~111-vB co-op re-anchor. The victim keeps off-chain-ness, the coin's ladder
   resets fresh, and the grief is fee-attributable on-chain even though T itself is anonymous.
   Damage:cost ratio ≈ 0.4 — griefing is economically losing.
+  > **[D35] This ratio is stated for a lane where voiding the tree yields the attacker NOTHING**, and
+  > that premise is what makes "losing" the right word. It holds only while every spend of `F` a prior
+  > owner still holds is PLAIN. A retained *coloured* backup would turn the same ~112-vB spend from
+  > destruction into capture of the whole allocation, at which point this ratio describes the wrong
+  > quantity entirely. §5.10 rule 6 is what keeps the premise true.
 - **Mass-grief saturation** (residual, quantified): 1M simultaneous triggers force ~111M vB of co-op
   responses within a ~144-block grace ≈ 77% of block space for a day — strained but survivable, and
   the attacker burns ~2.5× more. Beyond ~1M/day the response degrades to prioritized fee auction on
@@ -467,6 +472,27 @@ signed-once rule and forked into either 54-fold budget collapse or Spark-grade e
    renewal/rollover/de-trigger sign sats-structure or owner-built colored self-transitions the SE
    never parses; consignments stay P2P (ECIES via relay). No batch coordinator exists at launch, so
    the coordinator-sees-carriers concern from review is moot.
+6. **[D35] Every SE co-signed spend of a coloured coin's `F` is one of exactly two things** — there is
+   no third category, and "an opret nobody verified" is a refusal rather than a shape:
+   (i) **PLAIN**, and therefore an acknowledged allocation-destroying spend that **no exit path may
+   recommend** (this is what the retained flat backups of a coloured coin are, and why they are
+   omitted from carrier watch bundles); or
+   (ii) **COLOURED and receiver-assigned**, verified as such by the receiver's own
+   `verify_consignment_assignment` against an outpoint read from the RECEIVER'S own coin record.
+   The consequence is a lane rule, because the permitted backup shape is a function of the DECLARED
+   lane and not of the union of two lanes' shapes: **on a coloured bundle every conveyed flat backup
+   MUST be plain** — any OP_RETURN on one is refused by name, in the same predicate that runs over
+   every flat backup, as part of the R′ set (§5.11) alongside the tier colour-shape check. The
+   permissive `op_return_outputs <= 1` STAYS for the **un-laddered carrier lane**, where the coloured
+   backup is the legitimate exit material; that is precisely the point, since one validator was
+   serving two lanes with opposite requirements. Without this, a prior owner's retained coloured
+   backup is an *undetectable allocation-theft primitive* — it spends `F` and re-assigns the
+   allocation to themselves, invisible to every other receiver check — and it also falsifies §5.8's
+   griefing-is-losing premise.
+   **[Shipped]** `verify_flat_backup_lane` (`clients/libs/rust/src/tesr.rs`), run on BOTH acceptance
+   paths (claim and the SSP pre-pay census); guarded by
+   `ci-guards/tests/deny_colored_backup_on_a_colored_ladder.rs`; the legitimate coloured-ladder-plus-
+   envelope shape it admits is exercised live by **sdk78** (c.2).
 
 **[Shipped] evidence**: **sdk52** pins rule 1, the invariant everything else here rests on — in one
 wallet the plain coin carries a ladder and the token carrier carries **none**, and an off-chain RGB

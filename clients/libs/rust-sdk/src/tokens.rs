@@ -2512,6 +2512,57 @@ impl UtexoWallet {
         })
     }
 
+    /// **[CATS-B] The §3.3 read-only STOCK probe at a coloured SPINE TIP's cap.**
+    ///
+    /// The third lane of the same probe, and the one that had no sibling: [`Self::probe_colored_tip`]
+    /// reads a ROOT ladder's final state and [`Self::probe_colored_child_tip`] a conveyed leaf's
+    /// `child_state`, but the SENDER'S OWN CHANGE leg is neither. It is a one-rung cap over
+    /// `SP.out[K]`, persisted under `spinetip-` precisely because reading it as either of the other
+    /// two concludes something positive and wrong about it.
+    ///
+    /// Same contract as the siblings: `color_psbt`, never `color_psbt_and_consume`, so nothing is
+    /// consumed; `Ok(())` means `amount` of the tip's contract is still spendable out of the cap's
+    /// payload output. This is what a test must assert on a change leg, because `get_asset_balance`
+    /// reports a full settled balance over a stock at zero (E7).
+    pub async fn probe_colored_spine_tip(&self, statechain_id: &str, amount: u64) -> Result<()> {
+        let tip = mercuryrustlib::tesr::load_spine_tip(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("statechain id {statechain_id} is not a persisted spine tip"))?;
+        let rgb_half = tip
+            .rgb
+            .clone()
+            .ok_or_else(|| anyhow!("spine tip {statechain_id} is PLAIN"))?;
+        let cap = tip.cap.clone();
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&hex::decode(&cap.signed_tx)?)?;
+        let out = tx
+            .output
+            .get(cap.payload_vout as usize)
+            .ok_or_else(|| anyhow!("the tip's cap has no output at its declared payload vout"))?;
+        let spk_hex = hex::encode(out.script_pubkey.as_bytes());
+        let payee = tip.owner_exit_address.clone();
+        let network = tip.parent.network.clone();
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        tokio::task::block_in_place(|| {
+            mercuryrustlib::rgb::probe_allocation(
+                w,
+                &rgb_half.contract_id,
+                &cap.txid,
+                cap.payload_vout,
+                out.value,
+                &spk_hex,
+                &payee,
+                &network,
+                amount,
+            )
+        })
+    }
+
     /// **[CTES-R] Register the EXIT TIP with the RGB engine once a coloured walk has completed.**
     ///
     /// After a unilateral exit the allocation physically lives on the last tier's payload output —
