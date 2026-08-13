@@ -1392,6 +1392,49 @@ and now below the new one is not lost, but it can no longer fund its own tiers a
 the superseded-de-trigger census term. A failed rescue that leaves the census short bricks
 conveyability, and this repo has hit that silent-degradation shape three times.
 
+### The cost, MEASURED rather than estimated (2026-08-13)
+
+The raise was applied end-to-end as a probe, driven to the point where every derived floor was
+re-computed independently and checked against what the code produced. Then reverted, because D44's
+own ordering rule forbids landing it without the wiring and the census term. The patch is kept.
+
+**Every floor, re-derived at 3.0** (a plain rung is `ceil(125·r) + 240`, a coloured rung
+`ceil(168·r) + 240`):
+
+| | at 2.0 | at 3.0 |
+|---|---|---|
+| plain rung | 490 | **615** |
+| coloured rung | 576 | **744** |
+| `min_child_value` | 1,310 | **1,560** |
+| `min_spine_tip_value` | 820 | **945** |
+| plain root-ladder floor | 1,800 | **2,175** |
+| coloured ROOT floor | 2,058 | **2,562** |
+| coloured CHILD floor | 1,482 | **1,818** |
+| `min_split_output` | 554 | **666** |
+
+**Two corrections to what the decision was taken on.**
+
+1. `min_child_value` lands on **1,560**, not the 1,610 the decision sheet estimated. Slightly cheaper
+   than advertised.
+2. **`TOKEN_PIECE_SATS` moves 3,066 → 4,074, and `TOKEN_CARRIER_SATS` 17,384 → 22,536 (+30%).** This
+   was NOT in the decision sheet and is the largest user-visible cost. It is not optional: the piece
+   constant is defined as the coloured root floor at `PIECE_FEE_RATE_HEADROOM` (2×) the committed
+   rate, so raising the rate raises the piece — and the head-room is a safety property (a piece must
+   still be able to ladder if the rate drifts). Keeping the piece at 3,066 would mean cutting the
+   head-room to ~1.34×, which trades a safety margin for a stable number. Not taken.
+
+**The one benefit, also measured.** A 4,074-sat piece survives packaging up to **37 sat/vB** before
+the sweep zeroes out, against 28 at the old size — 2.6× the legacy 1,500-sat piece's head-room rather
+than 2×.
+
+**Blast radius:** 3 constants, 2 derived constants, and 21 derivation pins across `tokens.rs`,
+`granularity_model.rs` and `tesr.rs`. Every pin re-derived from the arithmetic, never copied from the
+new output — a pin updated by reading what the code now says agrees with any bug. The arithmetic is
+coherent across all 21, which is itself evidence the change is right rather than papered over.
+
+**Still owed before it lands:** the `BumpCapability` wiring (B.5), the superseded-de-trigger census
+term in the SAME commit, and a full live E2E run — the E2Es fund carriers from `TOKEN_CARRIER_SATS`.
+
 ## D45 — TRUC slot contention is a PRICE, not a DoS — publish the measurement (decision 10)
 
 **Decided:** publish, no code. B.6 is demoted to an optimisation.
