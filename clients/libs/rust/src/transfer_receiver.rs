@@ -465,22 +465,53 @@ pub struct PendingTransferInfo {
     pub ladder_census_ok: bool,
 }
 
-/// [D1/R4] The MINIMUM `protocol_version` accepted on the flat lane — by the PRE-PAY census AND, since
-/// [R4], by the CLAIM path (`validate_encrypted_message`), which previously had no floor at all and so
-/// let a sub-floor declaration select the legacy count check instead of the bound verifier.
-/// `protocol_version`
-/// is a SENDER-DECLARED field of the transfer message: the wallet can decrypt the message, which proves
-/// it is addressed here, but proves NOTHING about the fields inside. Anything below this is a rejection
-/// — never a pass — because the [C-1] coin binding only exists on the `>= 2` shape, so a lower declared
-/// version is indistinguishable from "skip the binding". (The audit's C-14 recommends the same floor on
-/// the receive path.)
-pub(crate) const MIN_PREPAY_PROTOCOL_VERSION: u32 = 2;
+/// **[D38/D16] `protocol_version` is a message-SHAPE selector, not an ordinal.**
+///
+/// The three values in play are not generations of one shape. `0` is the un-laddered carrier lane,
+/// `2` is a root-ladder conveyance, `4` is a child conveyance carrying key handover. They are three
+/// different message SHAPES that happen to be numbered, and comparing them with `>=` asserts
+/// something nothing establishes: that an unknown FUTURE value is safely processed by TODAY's rules.
+///
+/// The code already showed the seam. `MIN_PREPAY_CHILD_PROTOCOL_VERSION` was **3** — a floor over a
+/// set that contains no 3 — because 3 was a legacy shape that has now been deleted.
+///
+/// So membership is EXACT. Anything outside the set is refused by name, and the numeric ordering
+/// carries no meaning: no implementer may read a floor as a compatibility promise.
+///
+/// This also makes the uniffi FFI, which silently strips `protocol_version`, `tesr_ladder` and
+/// `child_tesr_bundle`, fail CLOSED — a stripped tag is not in the set — instead of silently
+/// downgrading to the un-laddered census. That is the point of exact-set dispatch and is why it is
+/// not merely a stylistic tightening.
+pub(crate) const ADMISSIBLE_PROTOCOL_VERSIONS: [u32; 3] = [0, 2, 4];
 
-/// [D1/R4] The minimum `protocol_version` for a CHILD conveyance, enforced on BOTH the pre-pay census
-/// and (since [R4]) the claim path: 3 is the legacy exit-only in-ladder
-/// child, 4 adds the key handover. A `child_tesr_bundle` attached to a message declaring anything lower
-/// is a version/payload mismatch and is refused rather than censused.
-pub(crate) const MIN_PREPAY_CHILD_PROTOCOL_VERSION: u32 = 3;
+/// The shape a LADDERED conveyance declares. Anything that carries a `tesr_ladder` must be this.
+pub(crate) const SHAPE_ROOT_LADDER: u32 = 2;
+
+/// The shape a CHILD conveyance declares — the only one carrying key-handover material. The legacy
+/// exit-only child (3) is deleted, so this is now an exact value rather than a floor.
+pub(crate) const SHAPE_CHILD: u32 = 4;
+
+/// Refuse any `protocol_version` outside [`ADMISSIBLE_PROTOCOL_VERSIONS`], by name.
+pub(crate) fn admissible_shape(v: u32) -> Result<()> {
+    if !ADMISSIBLE_PROTOCOL_VERSIONS.contains(&v) {
+        return Err(anyhow::anyhow!(
+            "transfer message declares protocol_version {v}, which is not one of the admissible \
+             message shapes {ADMISSIBLE_PROTOCOL_VERSIONS:?}. This field selects a SHAPE, not a \
+             generation: 0 is the un-laddered carrier lane, 2 a root-ladder conveyance, 4 a child \
+             conveyance with key handover. Its numeric ordering carries no meaning, so an unknown \
+             value cannot be 'at least' anything — it is refused."
+        ));
+    }
+    Ok(())
+}
+
+/// Retained under its old name so the two census sites keep reading as before; it is now the exact
+/// root-ladder shape rather than a floor.
+pub(crate) const MIN_PREPAY_PROTOCOL_VERSION: u32 = SHAPE_ROOT_LADDER;
+
+/// Retained under its old name; now the exact child shape. **It used to be 3, a floor over a set
+/// containing no 3** — the clearest evidence that this field was never an ordinal.
+pub(crate) const MIN_PREPAY_CHILD_PROTOCOL_VERSION: u32 = SHAPE_CHILD;
 
 /// [D1/D2] PRE-PAY census of a FLAT (TES-R) laddered conveyance, for a party that is about to make an
 /// IRREVERSIBLE payment against it (the SSP) and has NOT claimed the coin.
@@ -506,9 +537,11 @@ async fn prepay_flat_census(
     // `else if protocol_version >= 2` arm and let the final `else` report `ladder_census_ok = true`,
     // so an attacker declaring `protocol_version = 0` skipped the binding entirely and still cleared
     // the gate that authorises an irreversible Lightning leg.
+    // [D38/D16] Exact-set first: an unrecognised shape must never reach a comparison.
+    admissible_shape(transfer_msg.protocol_version)?;
     if transfer_msg.protocol_version < MIN_PREPAY_PROTOCOL_VERSION {
         return Err(anyhow!(
-            "pre-pay census: conveyance declares protocol_version {} but this path accepts only >= {} — refusing (an unrecognised version must never bypass the [C-1] coin binding)",
+            "pre-pay census: conveyance declares protocol_version {} but this path accepts only the root-ladder shape {} — refusing (an unrecognised version must never bypass the [C-1] coin binding)",
             transfer_msg.protocol_version,
             MIN_PREPAY_PROTOCOL_VERSION
         ));
@@ -1279,6 +1312,12 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
     // `verify_blinded_musig_scheme` demands per-`tx_n` SE blinding data for every entry). The floor
     // that WOULD be load-bearing — the one guarding the ladder binding — is enforced below by the
     // `>= 2` arm itself, which requires the ladder to be present and bound.
+    // **[D38/D16] EXACT-SET DISPATCH, before any shape-specific rule.** An unrecognised
+    // `protocol_version` is refused outright rather than compared with `>=` — see
+    // `admissible_shape`. This is what makes the uniffi FFI's silent stripping of the tag fail
+    // CLOSED instead of downgrading a laddered conveyance to the un-laddered census.
+    admissible_shape(transfer_msg.protocol_version)?;
+
     if transfer_msg.protocol_version < MIN_PREPAY_PROTOCOL_VERSION
         && transfer_msg.tesr_ladder.is_some()
     {
@@ -1435,6 +1474,42 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
                 cap_authority,
                 info_config.initlock,
             )?;
+            // **[D38/D10 — B.7] VALIDATE BEFORE YOU COUNT.**
+            //
+            // The census is exact equality, `se_num_sigs == flat_backups + tiers + superseded`, and
+            // the `flat_backups` term was `transfer_msg.backup_transactions.len()` — the length of a
+            // vector the SENDER wrote, taken before anything had checked its structure. The
+            // structural validation ran ~50 lines later, inside the per-group loop.
+            //
+            // INV-5 is what makes that length unforgeable: `ladder_decrements_by_interval` requires
+            // consecutive locktimes to fall by EXACTLY `interval`, so a duplicate decrements by 0 and
+            // an inserted filler by something else. Counting first means counting a vector that has
+            // not yet met INV-5, and a padded vector inflates `expected` by one per padded entry —
+            // absorbing a hidden co-signed rival state while the census still balances exactly.
+            //
+            // The pre-pay census already had this order and says so in its own comment. This is the
+            // claim path catching up: the count now comes from a chain that has PASSED.
+            mercurylib::transfer::receiver::validate_backup_chain_v2(
+                &transfer_msg.backup_transactions,
+                &tx0_hex,
+                blockheight,
+                client_config.fee_rate_tolerance,
+                // Same clamp the later per-group validation applies; computed here because the
+                // count now happens before that binding exists.
+                if info_config.fee_rate_sats_per_byte > client_config.max_fee_rate {
+                    client_config.max_fee_rate
+                } else {
+                    info_config.fee_rate_sats_per_byte
+                },
+                info_config.initlock,
+                info_config.interval,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "the conveyed backup chain is not structurally valid, so its length cannot be \
+                     counted into the census: {e:?}"
+                )
+            })?;
             crate::tesr::verify_bundle_bound(
                 &bundle,
                 statechain_info.num_sigs,
@@ -1566,39 +1641,6 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
             txid: sp_txid.clone(),
             vout: cb.sp_vout,
         };
-
-        if transfer_msg.protocol_version < 4 {
-            // LEGACY (v3) — no handover material was conveyed. Adopt exit-only, exactly as before.
-            crate::tesr::persist_child(client_config, wallet_name, &cb).await?;
-            if let std::result::Result::Ok(signed) =
-                mercurylib::transfer::receiver::sign_message(&cb.child_statechain_id, coin)
-            {
-                let _ = unlock_statecoin(client_config, &cb.child_statechain_id, &signed, &coin.auth_pubkey).await;
-            }
-            let net = match network.to_ascii_lowercase().as_str() {
-                "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
-                "testnet" => bitcoin::Network::Testnet,
-                "signet" => bitcoin::Network::Signet,
-                _ => bitcoin::Network::Regtest,
-            };
-            let child_agg_address = bitcoin::Address::from_script(&sp_out.script_pubkey, net)
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            coin.statechain_id = Some(cb.child_statechain_id.clone());
-            coin.aggregated_address = Some(child_agg_address);
-            coin.utxo_txid = Some(sp_txid.clone());
-            coin.utxo_vout = Some(cb.sp_vout);
-            coin.amount = Some(sp_out.value as u32);
-            coin.status = CoinStatus::CONFIRMED;
-            activities.push(Activity {
-                utxo: sp_txid,
-                amount: sp_out.value as u32,
-                action: "Receive".to_string(),
-                date: Utc::now().to_rfc3339(),
-            });
-            transfer_receive_result.statechain_id = Some(cb.child_statechain_id.clone());
-            return Ok(transfer_receive_result);
-        }
 
         // The SE's blinding factor for THIS child slot (x1_pub), needed to validate t1 and derive t2.
         let statechain_info =
@@ -2449,3 +2491,41 @@ mod poll_cancellation_reporting_tests {
     }
 }
 
+
+/// [D38/D16] `protocol_version` is a SHAPE selector, and the code's own history proves it.
+#[cfg(test)]
+mod exact_shape_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn the_admissible_set_is_exact_and_unknown_values_are_refused() {
+        for v in ADMISSIBLE_PROTOCOL_VERSIONS {
+            assert!(admissible_shape(v).is_ok(), "shape {v} must be admissible");
+        }
+        // 3 is the deleted legacy child. It must now be REFUSED — and it is the value the old
+        // child "floor" was set to, over a set that never contained it.
+        for v in [1u32, 3, 5, 99, u32::MAX] {
+            let e = admissible_shape(v).expect_err("unknown shape must be refused");
+            assert!(e.to_string().contains(&v.to_string()), "the refusal must name the value: {e}");
+            assert!(
+                e.to_string().contains("SHAPE") || e.to_string().contains("shape"),
+                "the refusal must say WHY — an ordinal reading is the error being prevented: {e}"
+            );
+        }
+    }
+
+    /// The floors are now exact shapes. If either drifts back to a value outside the admissible set,
+    /// the comparison it feeds becomes unreachable or vacuous.
+    #[test]
+    fn the_named_shapes_are_inside_the_admissible_set() {
+        assert!(ADMISSIBLE_PROTOCOL_VERSIONS.contains(&SHAPE_ROOT_LADDER));
+        assert!(ADMISSIBLE_PROTOCOL_VERSIONS.contains(&SHAPE_CHILD));
+        assert_eq!(MIN_PREPAY_PROTOCOL_VERSION, SHAPE_ROOT_LADDER);
+        assert_eq!(MIN_PREPAY_CHILD_PROTOCOL_VERSION, SHAPE_CHILD);
+        // The seam that revealed the category error: the child gate used to be 3.
+        assert!(
+            !ADMISSIBLE_PROTOCOL_VERSIONS.contains(&3),
+            "3 was a floor over a set containing no 3; if 3 is admissible again this test is stale"
+        );
+    }
+}
