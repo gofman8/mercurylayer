@@ -100,8 +100,11 @@ WAIT(d) = 2124·d + 2160 blocks        [T 0 | X_m 720 | SP 1404 | (d−1)×(720+
 > thing it corrects. Add `3 + 2d`.
 > **(b) The `SP 1404` term is the pre-CATS shape.** The live builders sign `SP` at `SPINE_CSV = 0`
 > (`in_ladder_split`, `child_in_ladder_split`, `spine_batch_split`), so a two-tier level costs
-> `720 + 0 + 2 = 722` blocks and a depth-1 leaf's whole walk is **2 885** blocks, not 4 284. The
-> `2124·d` figure below is retained as the measured baseline, not as a live number.
+> `720 + 0 + 2 = 722` blocks and a depth-1 leaf's whole walk is **2 885** blocks. Quote both ends of
+> that comparison under the SAME convention or the difference is off by five: pre-CATS depth 1 is
+> **4 284** blocks of relative timelock and **4 289** once (a) is applied (`lib/src/transfer/receiver.rs`
+> writes it as `4 284 + 5`); post-CATS it is **2 880** and **2 885**. The `2124·d` figure below is
+> retained as the measured baseline, not as a live number.
 
 d = 1 → 4 284 blocks (29.8 days). d = 100 → 214 560 blocks = **4.08 years**. And it is
 **contagious**: the piece child inherits the identical ancestor chain, so the *recipient* of the
@@ -279,8 +282,14 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > **1** of the three in §4.1, plus **V3** of §4.5, and it is the one that removes the rung
 > consumption: `§1.3`'s "coloured carriers get exactly ONE partial payment, ever" **no longer holds**
 > — the refusals that enforced it are deleted, and the per-level exit latency falls from 2 124 blocks
-> to 722 (`720 + SPINE_CSV + one confirmation each`; mainnet depth 1: 4 284 → **2 885** blocks, the
-> figure `exit_wait_blocks` and the `max_exit_txs` derivation both use). **Depth 100 is not the other
+> to 722 (`720 + SPINE_CSV + one confirmation each`). Mainnet depth 1 falls **4 289 → 2 885** blocks
+> charging each of the five transactions the block its parent needs to confirm — the convention
+> `exit_wait_blocks` and the `max_exit_txs` derivation both use — or **4 284 → 2 880** counting
+> relative timelocks alone, which is the pair `clients/libs/rust-sdk/src/config.rs`'s exit-latency
+> model quotes. The two differ by exactly `3 + 2d`; a "4 284 → 2 885" pair takes one end from each
+> and overstates the saving by five blocks. (§4.4's walk below is a third accounting again — it
+> charges a confirmation only on the zero-CSV spine tiers, which is why the payee line reads
+> `i + 2 880` — and it says so in its own block.) **Depth 100 is not the other
 > end of that comparison any more**: `enforce_split_depth_cap_shaped` refuses past depth 10 and past
 > a 23-transaction exit chain on mainnet, so the deepest admissible two-tier leaf now waits ~9 383
 > blocks (65 days) rather than 4.08 years, and the 1.41-year figure this line used to quote describes
@@ -344,8 +353,14 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > one mints a leaf whose exit does not fit the epoch.
 >
 > Still to build: the **whole-coin handover of a tip** (D3 of the phase-1 plan — promote it to an
-> ordinary two-tier child, census `0 + 2 + 1`), which is refused by name today; and the **coloured
-> spine BATCH**. The coloured half has moved a long way since this paragraph was first written and
+> ordinary two-tier child, census `0 + 2 + 1`), which is refused by name today; and, on the coloured
+> lane, **§4.5's RGB item 3 (per-output blinding)**. **The coloured spine BATCH is no longer on this
+> list** — this sentence named it and HEAD has overtaken that: `colored_spine_batch_pay`
+> (`clients/libs/rust-sdk/src/tokens.rs`) drives `build_colored_spine_batch` +
+> `cosign_colored_spine_batch` and runs the root lane's consignment pre-flight over every leg before
+> the tip is terminalized, and the coloured send router dispatches a coloured spine tip to it ("a
+> COLOURED SPINE TIP is the carrier's shape from its SECOND payment onward, and it routes to the
+> batch"). The coloured half has moved a long way since this paragraph was first written and
 > the remainder is now specific: §4.5's RGB item 1 is landed (`TierRole::Spine = 0x0C`), item 2 is
 > landed ([S5] — `colored_child_txids` and `colored_child_seals` both walk `ancestors`, charging a
 > spine segment one tier and a two-tier segment two), and the coloured ROOT split's change leg is a
@@ -353,12 +368,16 @@ prerequisites — see §4.5, it is **not** free as previously assumed.
 > `colored_spine_tip_floor`), so `cosign_colored_in_ladder_split` no longer carves a two-tier change.
 > `refuse_uncolored_over_colored_tip` is no longer a blanket refusal either: `spine_batch_split_ex`
 > forks by lane and a coloured tip has a coloured `SP` to be built with (`build_colored_spine_batch`,
-> `cosign_colored_spine_batch`). What is still refused, deliberately and by name, is the
-> **both-coloured** arm [S4b]: every leg below `SP` is still constructed by the plain
-> `establish_child_journalled` / `establish_spine_tip_journalled` and persisted with `rgb: None`,
-> which would burn the allocation rather than refuse it. Lifting it means building the coloured legs
-> — per-payee `ext_child`/`state_child` with consignments and seals rooted at `SP.out[j]`, a coloured
-> cap for the next tip, and the conservation checks over the allocation. **§4.5's RGB item 3
+> `cosign_colored_spine_batch`). The coloured legs exist too, and are the SAME loop the coloured root
+> split uses (`build_colored_split_legs`, shared deliberately so the two shapes cannot drift): per-payee
+> `ext_child`/`state_child` with consignments and seals rooted at `SP.out[j]`, and one coloured cap
+> for the next tip. What is still refused, deliberately and by name, is the **both-coloured** arm
+> [S4b] of the **PLAIN** driver `spine_batch_split_colored` — that entry point builds every leg with
+> `establish_child_journalled` / `establish_spine_tip_journalled` and persists `rgb: None`, an
+> uncoloured tier over the outpoint the allocation is booked at, so it would burn the allocation
+> rather than refuse. It has no callers in the repo (the coloured lane is the pair above), so that
+> arm is a permanent lane guard against a latent hole, not a missing capability — CI pins it
+> (`ci-guards/tests/deny_uncoloured_legs_under_a_coloured_sp.rs`). **§4.5's RGB item 3
 > (per-output blinding) is still open**: `colored_tier_seal` takes `(sid, role, level, m‖csv)` and
 > nothing child-specific, so the batch-concealment argument below stands unchanged.
 
@@ -485,7 +504,10 @@ Every piece in a batch exits at the same depth regardless of when it was paid.
 re-anchor, which a split tree does not have (§7).
 
 > **Correction — `s` no longer "grows without limit".** That was true of the latency rule alone, and
-> it is exactly the hole [P0-3] was built to close: a spine tier costs one block of latency and a
+> it is exactly the hole `max_exit_txs` was built to close — the cap the code labels **[P0-3]** under
+> its own numbering (`enforce_exit_chain_length`, "THE LENGTH GATE"), which in **this document's**
+> §3.0 numbering is the second half of **P0-2**; §3.0's P0-3 is the split journal, and the two
+> numberings do not line up. A spine tier costs one block of latency and a
 > whole transaction, so an all-spine chain of thousands of tiers passes `check_exit_headroom` and is
 > still unusable. `max_exit_txs` prices it in transactions instead — `3 + 2·max_split_depth`, i.e.
 > **23 on mainnet** (139 on regtest) — and `enforce_split_depth_cap_shaped` evaluates it **above** the
@@ -808,8 +830,12 @@ identical to burned, since it is recoverable only by broadcasting.
 
 > **The N = 100 and N = 1000 columns are now bounded by a rule none of these rows model.** The
 > exit-chain length cap admits 23 transactions on mainnet, so `CATS, K=1` at N = 100 (103 txs) and
-> every N = 1000 row are refused at build time by `enforce_split_depth_cap_shaped` — the payment
-> forces a batch instead. What the columns still show correctly is the *ordering*: the cap binds K=1
+> the N = 1000 entry of **every baseline/CATS row** (2 003, 1 003, 103 and 53 txs) are refused at
+> build time by `enforce_split_depth_cap_shaped` — the payment forces a batch instead. The two
+> *rejected*-alternative rows are not covered by that claim and must not be read as if they were:
+> DENOM-SWAP's exit is a flat 3 tx / 375 vB at every N, comfortably inside the cap (it is rejected
+> for the reasons in §5.2, not by this rule), and DFO has no N = 1000 entry to refuse. What the
+> columns still show correctly is the *ordering*: the cap binds K=1
 > at ~20 payments and K=20 at ~400, which is the same ratio the table reports in latency and fees.
 > The rows are the cost model, not an admissibility claim.
 
@@ -865,9 +891,17 @@ To actually move it you would need one of:
   `TesrParams::flat_ladder_params(network)` and refuse any coordinator whose `initlock`/`interval`
   disagree, and the coordinator itself **panics at boot** rather than serve a mismatched pair
   (`server/src/server_config.rs`). Changing it is a protocol change shipped on both sides at once,
-  not a compose edit. (A "mainnet profile of 50 000" appears in earlier drafts of this document and
-  in `SUBECONOMIC-FINALITY.md`; no such profile exists, and a coordinator configured that way would
-  refuse to start.)
+  not a compose edit. (Earlier drafts of this document cited a **"mainnet profile of 50 000"** as a
+  live dial, and that was TRUE when written: `docker-compose-main.yml` carried `LOCKHEIGHT_INIT:
+  50000` / `LH_DECREMENT: 6` until D8(f) — commit **9f5ce80**, "D27/D8(f): compile in the flat
+  ladder" — aligned it to the compiled-in **10 000/100**. `server_config.rs`'s own D8(f) comment
+  keeps the record: *"This check found three disagreeing configs when it was written:
+  `docker-compose-main.yml` (50000/6), `docker-compose-test.yml` (1100/1) and this repo's
+  `Settings.toml`"*. What changed is not that the profile never existed but that it is no longer
+  reachable: a coordinator configured 50 000/6 today panics at boot. That is a superseded deployment
+  baseline, not a drafting error. `SUBECONOMIC-FINALITY.md`'s 50 000 is a different thing again and
+  is **correct**: a row of an A-1 sensitivity table its own lead-in labels *"design space, not
+  deployment"*, with **10 000 (shipped)** bolded two rows above it.)
 - **A co-operative de-trigger for terminal trees** — the SE co-signing a fresh spend of `F` after the
   tree is terminal. Requires raising the spend budget on a terminalized statechain *and* a protocol
   for invalidating every live child with its holder's consent. Hard; not designed.
@@ -919,7 +953,7 @@ To actually move it you would need one of:
 | **0** | P0-1 … P0-6 (§3.0) | none — these were live defects; P0-1 and P0-3 were exploitable | **DONE** — all six, §3.0 |
 | **1** | CATS spine, plain lane, K = 1: V1–V5 (§4.5) + watchtower event trigger (§4.7) | Phase 0; adversarial E2E on **sender-declared segment shape**, not the race check | **DONE** — §4 build status |
 | **2** | Batching K > 1 on the spine tier (plain) | crash-safe carve, idempotent re-conveyance, `is_inventory` in `Candidate`, lazy slot minting | **DONE** — all four gates closed (§4.7); `spine_batch_split` |
-| **2b** | Coloured spine: `TierRole::Spine`, N-deep seal schedule, **per-output blinding** | Phase 2; until blinding lands, coloured K > 1 only for mutually-known payees | **PART** — role + seal schedule + coloured change tip landed; the both-coloured batch arm refuses [S4b] and **blinding is open** |
+| **2b** | Coloured spine: `TierRole::Spine`, N-deep seal schedule, **per-output blinding** | Phase 2; until blinding lands, coloured K > 1 only for mutually-known payees | **PART** — role, seal schedule, coloured change tip and the coloured BATCH itself (`colored_spine_batch_pay` → `build_colored_spine_batch` / `cosign_colored_spine_batch`) all landed; what is open is **blinding**. The [S4b] both-coloured refusal is in the PLAIN driver `spine_batch_split_colored` (no callers) and is a lane guard, not the missing batch |
 | **3** | Opt-in self-carve inventory (Mode B) for fixed-amount books | utilisation gate `> 0.685K + 0.315` enforced in the planner | open |
 | **4** | Lean leaf (§4.6) — separate, argued decision | forecloses child renewal — and child renewal now EXISTS (`renew_child`), so this is a live capability to forfeit, not a theoretical one | open, and **more expensive than when it was written** |
 

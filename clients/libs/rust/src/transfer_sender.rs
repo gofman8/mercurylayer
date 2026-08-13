@@ -36,11 +36,14 @@ pub async fn create_backup_transactions(
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "statechain id {statechain_id} has no flat backup rows, so it cannot be conveyed \
-                     on the flat lane. A split child or a spine tip never has them — its exit \
-                     material is its own bundle (`ctesr-`/`spinetip-`), and it is conveyed by the \
-                     child lane. If this is a root coin, its backup chain is missing and the coin \
-                     must be restored from a recovery bundle before it can be sent."
+                    "statechain id {statechain_id} has NO EXIT MATERIAL: no flat backup rows, and \
+                     the caller's own dispatch already routed away every shape that legitimately \
+                     lacks them (a `ctesr-` child goes to `child_retransfer`, a `spinetip-` row is \
+                     refused by name). So this is a slot the SE knows about that this wallet cannot \
+                     exit from and cannot convey on any lane — most often a derived child slot whose \
+                     split failed after the slot was created. It must not have been offered to coin \
+                     selection. Restore it from a recovery bundle if its material exists elsewhere; \
+                     otherwise it is spendable only cooperatively."
                 )
             })?;
 

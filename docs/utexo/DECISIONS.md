@@ -4,7 +4,12 @@ Status: open record, started 2026-08-10. It began as one entry per decision from
 [`SPEC-ROADMAP.md`](SPEC-ROADMAP.md) §2, of which four were taken on day one (D0, D7, D1, D2 — the
 order is deliberate, not numeric). **All twenty-one roadmap decisions D0–D20 are now taken, and the
 record continues past them to D40**: everything from D21 on is a decision the roadmap did not
-contain, forced by the answers given to the ones that did.
+contain, forced by the answers given to the ones that did. **Twenty of the twenty-one have an entry
+here; D4 does not, and that is deliberate** — it was answered in round 2 in
+[`SPEC-ROADMAP.md`](SPEC-ROADMAP.md) §D4 ("*the proof HOLDS … D4 collapses to a deletion plus a
+restatement*") and merged there into D8 ("*D4 and D8 are therefore one decision, not two*"), so its
+residual is carried by the D8 row below rather than by an entry of its own. D4 appears in this file
+only where that merge shows through, as the rejected `{level, m, k}` counter machine.
 
 Each entry states what was decided, what it *binds* (the document sections and code sites that may
 no longer drift from it), and what it **pulls into scope** — because three of the first four
@@ -532,8 +537,9 @@ own three prerequisites was re-checked today and is still absent:
 **As written on 2026-08-11 that read: flipping today would ship coins that cannot be renewed, cannot
 be received by two of the four clients, and cannot use Lightning.** Two of those three have since
 gone: CR-D shipped (`b79b525`) and the client row was closed at zero by D33. **What remains of this
-gate is the coloured spine wiring and Lightning on the coloured child lane** (`tokens.rs:3397`,
-"a Lightning-latched colored transfer is not yet wired to the CTES-R child lane"), which D21 decided
+gate is the coloured spine wiring and Lightning on the coloured child lane** — the `ColoredLatch::None`
+refusal in the coloured-child arm of `colored_transfer` (`clients/libs/rust-sdk/src/tokens.rs`):
+"a Lightning-latched colored transfer is not yet wired to the CTES-R child lane" — which D21 decided
 to build. The decision was never reversed — it was sequenced, and the sequence has largely run.
 
 **What DID land in the meantime**, so the gate is smaller than it was: the plain-spine theft that
@@ -575,21 +581,33 @@ keep.
 
 **Read the units before quoting these.** The WP1 run was made on an isolated node with the floor
 forced to **3 sat/vB** (`-minrelaytxfee=0.00003`), above the protocol's committed 2.0, on a
-**synthetic 141-vB** transaction — not on a TES-R tier, which is **125 vB** (`lib/src/tesr.rs:76`)
-and pays **250** at the committed rate.
+**synthetic 141-vB** transaction — not on a TES-R tier, which is **125 vB** (`TIER_VBYTES` in
+`lib/src/tesr.rs`, derived byte for byte in its doc comment and pinned against a production-finalised
+transaction by `the_uncoloured_fee_matches_a_measured_signed_tier`) and pays **250** at the committed
+rate.
 
 | | measured, and against what |
 |---|---|
 | a tier alone, under the relay floor | `min relay fee not met, 200 < 423` — **refused**. `423 = 141 vB × 3 sat/vB`; the 200 is 1.42 sat/vB. **A real tier under the same forced floor reads `250 < 375`.** The refusal is the protocol property; these two numbers are the lab's. |
 | the same tier as a 1P1C package | `"package_msg": "success"` — this is the load-bearing result, and it is rate-independent |
-| child fee paid in the run | **180 330 sats**, against a **754-sat requirement** (318 vB package × 3 sat/vB = 954, less the parent's 200). A ~239× overpay chosen by the funding wallet, not a derived cost — Core's own `maxfeerate` guard tripped on it. |
+| child fee paid in the run | **180 330 sats**, against a **754-sat requirement** (318 vB package × 3 sat/vB = 954, less the parent's 200). A ~239× overpay **chosen by the funding wallet, not a derived cost**: WP1 §2's own log puts the child at **177 vB**, i.e. **~1 019 sat/vB** on the child alone, lifting the package to the recorded 5.68 sat/vB against a 3 sat/vB floor. *(A `maxfeerate` clause stood here and was wrong: WP1's `maxfeerate` trip belongs to a **different transaction** — the separately-built literal-`51024e73` broadcast in "What this run did NOT establish" item 1. §2's package records no such trip, and at ~1 019 sat/vB it is far under Core's 10 000 sat/vB default, so it could not have tripped. The "chosen, not derived" reading rests on the 754-vs-180 330 arithmetic alone, which is enough.)* |
 
 **The "~900×" ratio that used to sit here was wrong, and it is quoted in other documents.** Its
 source (`notes/CPFP-WHO-FUNDS-IT.md`) computes 180,330 / **200** — the ratio to the *parent's fee* —
 and this record re-based it onto the 240-sat **anchor**, which gives 751×, while also borrowing the
 240 from a *different* run (§2's parent carried a placeholder output; the literal `51024e73` anchor
-was exercised separately). And 180,330 is not derivable from the repo's own fee law at any legal
-shape: `TRUC_MAX_CHILD_VSIZE = 1_000` caps the child, so that fee implies >180 sat/vB.
+was exercised separately). **And 180,330 is not a cost this repo's fee law imposes — it is a target a
+caller asks for.** `build_p2a_fee_child` (`lib/src/wallet/p2a_fee_child.rs`) derives the whole figure
+from the rate handed to it — `required_total = ceil(target_fee_rate × package_vsize)`, less the
+parent's already-committed fee — and **nothing bounds that rate** beyond `is_finite() && > 0.0`, so
+the number *is* reachable: over the 278-vB package formed by a 125-vB tier and this builder's fixed
+**153-vB** child (`estimate_child_vsize`, measured 153 estimated / 153 actual on regtest), a
+180,330-sat child fee is a target of **~650 sat/vB**, ~325× the committed 2.0. An earlier form of
+this paragraph called the figure "not derivable at any legal shape" on the strength of
+`TRUC_MAX_CHILD_VSIZE = 1_000`; that constant caps **vsize, not rate**, and all it establishes is a
+floor — no legal v3 child can be larger than 1 000 vB, so that fee is at least 180.33 sat/vB on the
+child however the child is shaped. The supportable claim is the weaker and sufficient one: a fee of
+this size is a **choice of target**, not a number the fee law hands you.
 
 **What the corrected numbers do not change is the decision.** A rescue costs a real outlay by
 whoever performs it, and it returns a 240-sat anchor — `CHILD_CHANGE_DUST = 330`
@@ -625,8 +643,13 @@ UTXO), and `watch_pass_with_bump` / `exit_pass_with_bump` wire it into both broa
 **The shape it landed in is D31 itself, not a general capability.** `BumpCapability` is an explicit
 optional argument rather than ambient config, so `watch_pass(electrum, bundle)` keeps its signature
 and its keyless meaning, and **its absence is the keyless case** — a tower cannot acquire the ability
-to bump by accident. `SdkConfig::core_rpc` is `None` unless the operator sets it. `FeeBumpConfig`
-holds a fee-wallet key and nothing else, which is exactly the bounded exposure clause below.
+to bump by accident. `SdkConfig::fee_bump` is `Option<FeeBumpConfig>` and is `None` in every
+constructor unless the operator sets it (`clients/libs/rust-sdk/src/config.rs`). That config holds
+the Core RPC route (url, user, password), a `target_fee_rate` and a `reserve_bumps_per_coin`
+alongside `funding_secret_key_hex` — and what that key is, the field's own doc comment states:
+**"A fee key, never a coin key, and that separation is the whole of D31's bounded exposure"**,
+compromise costing the float and not a user's coin. That is the bounded-exposure clause of
+consequence 3 above, held as a type rather than as prose.
 The electrum limitation stands as a *fact*; what is gone is the claim that nothing in this repo can
 call `submitpackage`.
 

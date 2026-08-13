@@ -76,14 +76,21 @@ them and produces the number that un-withdraws it.
 > The verdict below still names BLOCKER 1 as "the single largest risk"; that sentence is now
 > historical.
 >
-> **BLOCKER 2 IS ALSO CLOSED.** It was the largest for one further step — its open design question,
-> "who funds the bump", priced in `notes/CPFP-WHO-FUNDS-IT.md` — and then it was answered and built.
-> **D31** took option (A), owner-funded, with the funded tower as a documented deployment option;
-> all four parts of W1 exist in the tree (`core_rpc::submit_package`,
-> `p2a_fee_child::build_p2a_fee_child`, `tower_float.rs`), and `live_p2a_package_rescue.rs` rescues
-> an under-paying tier through repo code rather than a hand-run `bitcoin-cli` — W1's own acceptance
-> criterion. **Neither of this document's two blockers is open.** What §1.5 and §3's W1 row describe
-> as unbuilt is the state they were written in; the landed state is recorded in §4.1.
+> **BLOCKER 2 IS ANSWERED AND BUILT; ITS ACCEPTANCE RUN IS NOT YET OBSERVED.** It was the largest
+> for one further step — its open design question, "who funds the bump", priced in
+> `notes/CPFP-WHO-FUNDS-IT.md` — and then it was answered and built. **D31** took option (A),
+> owner-funded, with the funded tower as a documented deployment option; all four parts of W1 exist
+> in the tree (`core_rpc::submit_package`, `p2a_fee_child::build_p2a_fee_child`, `tower_float.rs`),
+> and W1's own acceptance criterion is **written as a test** — `live_p2a_package_rescue.rs` builds an
+> under-paying v3 parent, proves the node refuses it alone, and rescues it through repo code rather
+> than a hand-run `bitcoin-cli`. **What is not evidenced is that it has been seen green:** the test
+> needs `CORE_RPC_URL` and it skips loudly when the node's `minrelaytxfee` leaves no room to build an
+> under-paying parent — *"Start bitcoind with a higher -minrelaytxfee to exercise the rescue. NOTHING
+> was verified"* — and §4.1's W1 row still books that raised-floor E2E, with hardening, at 0.5–1 wk.
+> So: **neither blocker is open as a design question or as a missing code path**, and BLOCKER 1 is
+> closed outright (its attack test refuses by name, above); BLOCKER 2's remainder is a measurement on
+> a configured node, not engineering. What §1.5 and §3's W1 row describe as unbuilt is the state they
+> were written in; the landed state is recorded in §4.1.
 
 **BLOCKER 1 — a theft path in the plain spine, live today (§1.8).** The intermediate spine `SP` — the
 tier this whole document is about — is the single transaction in `verify_child_bundle` with **neither
@@ -137,20 +144,27 @@ The shortest honest path: **(i)** fix S0 and wire R0 (the built-but-uncalled cen
 **(ii)** start W1, the package/anchor/fee-child workstream, in parallel; **(iii)** build the spine,
 whose long pole is the receiver's N-deep seal/witness walk — which also gates every re-transfer of
 every piece the spine mints (§1.4); **(iv)** build CR-D, and run G2 only to decide whether CR-A's
-single-transaction form is also available. **Steps (i), (ii) and (iv) are done** (§4.1); the path
-that remains is (iii), and S5 inside it.
+single-transaction form is also available. **Steps (i) and (iv) are done, and (ii) is built with its
+acceptance E2E still unrun on a raised-floor node** (§0.1, §4.1); the path that remains is (iii), and
+S5 inside it.
 
 **Re-cost (2026-08-11, §4.1): 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two
 tracks — or, in the unit this work is actually done in, ≈6–9 AGENT SESSIONS (§4.2)**, re-costing the roadmap at **12–22 weeks to a full protocol v1 draft, +2–3 to publication**.
 *(The 19–27 / 20–27 figures below were the previous pass; they are superseded by §4.1, which
-re-checked every line against the tree. S0, R0 and W1 are done, and the plain spine landed in the
-meantime. **§4.1's own 11–21 is now a superseded baseline too** — CR-D, P2, P3, P5, G3, G4 and the
-S1–S4b/S7/S9 stretch have since landed and P4 went to zero on D33, leaving ≈6–9 engineer-weeks /
-≈2.5–3.5 agent sessions of open work: S5, S6, S8's remaining half, P1 and G2.)* The movement from
+re-checked every line against the tree. S0 and R0 are done, W1's four parts are built (its rescue
+E2E unrun — §0.1), and the plain spine landed in the meantime. **§4.1's own 11–21 is now a superseded baseline too** — CR-D, P2, P3, P5, G3, G4 and the
+S1–S4b/S7/S9 stretch have since landed, P1 shipped as corrected by D35, and P4 went to zero on D33,
+leaving **≈4.5–6.5 engineer-weeks** of open work: S5, S6, S8's remaining half, G2, and W1's remaining
+hardening plus its raised-floor E2E. That total is the sum of §4.1's own surviving rows on §3's own
+bands — 17–24 d of spine, 2–3 d of G2, 2.5–5 d of W1 remainder, 0–1 d for P1's residual call-path
+test = 21.5–33 d — and it deliberately does **not** carry P1, P2 or P5, all of which have landed.
+§4.2 restates the open build items as **~2.5–3.5 agent sessions**; the W1 E2E is node-bound rather
+than typing-bound and has no session row.)* The movement from
 the original 14–20 is itemised in §4: +3–5 for W1 (previously zero), +0.5–1 for S0 and R0
 (previously not present), +1–2 from re-banding S5, less the re-anchor branch narrowing now that CR-D
 replaces the CR-B/CR-C fork. ~~**The single largest risk is BLOCKER 1** — a live theft path in
-shipped code — followed by W1's unresolved "who funds the bump".~~ **Both blockers are closed
+shipped code — followed by W1's unresolved "who funds the bump".~~ **BLOCKER 1 is closed outright and
+BLOCKER 2 is closed as a design question and as a code path, with only its raised-floor E2E unrun
 (§0.1). The single largest remaining risk is S5**, the receiver's N-deep seal/witness walk, which is
 also a sender-side gate on every re-transfer of every piece the spine mints.
 
@@ -358,7 +372,14 @@ through the production finaliser (`rgb.rs:910-926`). `colored_tier_vbytes(n) = 1
     only `lockheight_init` in the tree was **1 000** and `network = "testnet"` fell through to the
     **regtest** `TesrParams`, so mainnet params at `initlock = 1 000` gave `max_split_depth = 0`,
     `max_exit_txs = 3`, and every in-ladder split refused before depth was considered — "d ≤ 19"
-    presumed an epoch no file set.)* **Both halves are closed at HEAD.** D25 makes
+    presumed an epoch no file set. The requirement that statement carried, and the reason the
+    obvious weaker gate would not have been enough: **G3's gate must assert
+    `initlock ≥ exit_wait_blocks(base)` for each profile, not merely that every network string
+    resolves without a silent default** — a profile can name itself cleanly, resolve to a real
+    `TesrParams`, and still be unable to finish a depth-0 exit inside one epoch, in which case the
+    horizon pre-flight refuses every in-ladder split on it, permanently and for every user. That is
+    the assertion `g3_every_profile_can_finish_its_exit` makes, over all six profiles and at depth 1
+    as well as depth 0 — see §3's G3 row.)* **Both halves are closed at HEAD.** D25 makes
     `testnet`/`testnet3`/`testnet4`/`signet` run the **mainnet** schedule
     (`TesrParams::testnet() = Self::mainnet()`), `for_network_checked` names every network and
     returns `None` rather than guessing, and `server/Settings.toml` now reads
@@ -727,7 +748,7 @@ Gates are observable — a test that goes green, a measured number, a written ve
 |---|---|---|---|
 | **S0** ✅ | **DONE (D26 half 1).** The Σ + payload-count law is live in `verify_conveyed_child`'s ancestor loop and refuses by name — *"ancestor {i} state (the intermediate spine SP): Σ over its payload outputs is …"*. **BLOCKER — the intermediate-`SP` committed-fee law** (§1.8). Add the Σ + payload-count law to the ancestor `state` in `verify_child_bundle`, colour-branched per `tesr.rs:8866-8874`; fix the ancestor EXTENSION's colour-blind Σ law at `:9468` in the same commit | An adversarial test: a co-signed spine segment committing a 1-sat fee is refused **by name**, and `assert_not_an_unrelated_refusal` passes. A second test builds a coloured two-tier ancestor segment that verifies (today that shape is unreachable) | 4–6 d |
 | **R0** ✅ | **DONE (D8-CLOSE).** `verify_sig_count_attestation` now has a client caller outside `lib/` — `clients/libs/rust/src/utils.rs`, whose comment names the attack the two-value disagreement closes — and `deny_unattested_terminality` pins the call site so it cannot be dropped. **BLOCKER-adjacent — wire the census attestation** (§5 item 1). `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs`) was built and live-verified but had **no client caller**; the census still consumes a bare integer at `tesr.rs:9093`. Call it on the receive/claim path and in `verify_conveyed_child`'s ancestor pass; decide the `Option` policy (**fail-closed for coloured**); add the replay/freshness binding `DECISIONS.md:241` names | A test that a coordinator under-reporting `num_sigs` is refused at claim; a test that a missing attestation is refused when `colored_ladder = true`. **Hard prerequisite of the flag** | 2–4 d |
-| **W1** ✅ | **DONE, all four parts** — (a) `mercuryrustlib::core_rpc::submit_package`; (b)+(c) `mercurylib::wallet::p2a_fee_child::build_p2a_fee_child`, a v3 child spending the P2A outpoint; (d) **decided by D31** (owner-funded; the funded tower is a documented option) and built as the tower float rail (`clients/libs/rust/src/tower_float.rs`), with `live_p2a_package_rescue.rs` rescuing an under-paying tier through repo code — W1's own acceptance criterion. Remainder is hardening. **BLOCKER — build the fee-bump remedy** (§1.5). Four parts: (a) a **package-capable node route** — electrum has no `submitpackage`, so this is a new transport (Core RPC or a proxy), not a flag; (b) a **P2A anchor spender** — no builder constructs a `TxIn` on a P2A outpoint today; (c) a **v3 fee child** — `lib/src/wallet/cpfp_tx.rs` is v2 and `input_vout`-pinned (`:66`, `:110`), so a rewrite; (d) an **owner decision on who funds the bump** for a keyless tower, under TRUC's one-child and 1000-vB limits | An under-paying v3 tier is rescued **through this repo's own code path**, on a node with `minrelayfee` above 2 sat/vB — not through a hand-run `bitcoin-cli`. (d) is design, and is the reason the band has a tail | **3–5 wk**, (d) unresolved |
+| **W1** ✅ **BUILT — acceptance run not yet observed** | **All four parts exist** — (a) `mercuryrustlib::core_rpc::submit_package`; (b)+(c) `mercurylib::wallet::p2a_fee_child::build_p2a_fee_child`, a v3 child spending the P2A outpoint; (d) **decided by D31** (owner-funded; the funded tower is a documented option) and built as the tower float rail (`clients/libs/rust/src/tower_float.rs`). W1's acceptance criterion is **written** as `live_p2a_package_rescue.rs`, which rescues an under-paying tier through repo code rather than a hand-run `bitcoin-cli` — but it needs `CORE_RPC_URL` and it **skips loudly** when the node's `minrelaytxfee` is too low to build an under-paying parent (*"Start bitcoind with a higher -minrelaytxfee to exercise the rescue. NOTHING was verified"*), so the rescue is **unrun on a raised-floor node**. Remainder is that E2E plus hardening. **BLOCKER — build the fee-bump remedy** (§1.5). Four parts: (a) a **package-capable node route** — electrum has no `submitpackage`, so this is a new transport (Core RPC or a proxy), not a flag; (b) a **P2A anchor spender** — no builder constructs a `TxIn` on a P2A outpoint today; (c) a **v3 fee child** — `lib/src/wallet/cpfp_tx.rs` is v2 and `input_vout`-pinned (`:66`, `:110`), so a rewrite; (d) an **owner decision on who funds the bump** for a keyless tower, under TRUC's one-child and 1000-vB limits | An under-paying v3 tier is rescued **through this repo's own code path**, on a node with `minrelayfee` above 2 sat/vB — not through a hand-run `bitcoin-cli`. (d) is design, and is the reason the band has a tail | **3–5 wk**, (d) unresolved |
 | **G2** | **RGB rival-colouring spike over `F`** — now an **optimisation** gate, not a product gate. Colour a second transition spending `F` while the ladder's trigger consumes that Opout as Tentative, **in a second process**; mine it; check `select_valid_witness`; validate the new ladder's leaf consignment at a receiver | Pass ⟹ CR-A (1 tx). Fail ⟹ CR-D (2 txs, 0 CSV). Either way Phase 2 ships | 2–3 d |
 | **G3** ✅ | **D7 profile reconciliation** | **DONE.** `for_network_checked` gives every network string an explicit profile with no silent default (D7/D25), and `g3_every_profile_can_finish_its_exit` now asserts the load-bearing half: `initlock ≥ tesr_exit_wait_blocks(profile, 0)` **and** `≥ depth 1`, for all six profiles. Below it, the horizon pre-flight refuses **every** in-ladder split on that profile, permanently and for every user — the state this item says the mainnet schedule was once in. **Both caps are now MEASURED, and they are two different quantities — an earlier note here reported them as a correction of one by the other, which they are not.** `max_split_depth` on mainnet at `initlock = 10 000` is **10** (regtest: 68) — the deepest TWO-TIER child the latency rule blesses, and exactly the number §1.6 derives. The cap on SPINE batches is the LENGTH cap built from it: `max_exit_txs = 3 + 2·10 = 23`, and a spine leaf's chain is `4 + d`, so **d ≤ 19** stands, pinned by `honest_spine_batch_pieces_and_tips_are_admitted_up_to_batch_nineteen` (*"batch 19 is the last one that fits"*; batch 20's piece is 24 transactions and is refused, while its tip at 23 keeps its exit so the sender is never stranded) | 3–5 d |
 | **G4** ✅ | **Measure the coloured re-anchor / de-trigger vsize** | **DONE, and the answer is better than a new constant: there is no new constant.** `build_colored_detrigger` builds ONE payload output and sizes it with `colored_tier_out_value` = `colored_tier_out_total(.., 1, ..)`, so a de-trigger IS an ordinary one-payload coloured tier and rides the vsize already measured through the production finaliser: **168 vB**. The `112 + 43` estimate was **13 vB short** — at 2 sat/vB it commits 310 sat against a 168-vB transaction, 1.845 sat/vB, under target on the one transaction whose job is to relay when the owner must walk away from a live ladder. Pinned by `the_coloured_detrigger_is_a_measured_one_payload_tier_not_a_112_plus_43_estimate` | 1 d |
@@ -766,7 +787,7 @@ written verdict is already in hand; what it revealed is W1.
 
 | # | Item | Gate | Band |
 |---|---|---|---|
-| **P1** | WP6(i) receiver-side refusal: a conveyed transfer bearing both a plain ladder and an off-chain-commitment envelope is rejected (today sender-side only, `wallet.rs:866`; `transfer_receiver.rs:885`, `:967` persist `rgb_consignment` with no cross-check) | Adversarial test through `validate_encrypted_message` | 2–3 d |
+| **P1** ✅ | WP6(i) receiver-side refusal: a conveyed transfer bearing both a plain ladder and an off-chain-commitment envelope is rejected (**was** sender-side only, `wallet.rs:866`; `transfer_receiver.rs:885`, `:967` persisted `rgb_consignment` with no cross-check) | **DONE, and corrected by D35.** `validate_encrypted_message` calls `crate::tesr::verify_flat_backup_lane` on every conveyed message that carries a ladder; a PLAIN ladder with an `rgb_consignment` on any flat row, or with an OP_RETURN in any flat backup, is refused **by name** (*"a plain ladder's tiers carry no RGB state transition, so exiting through them would move the sats and permanently BURN the allocation"*). D35 is the half this row did not anticipate: the first cut keyed on "a ladder is present" and enforced the **union** of the two lanes' shapes, which both missed the coloured lane's real defect (an unbound opret on a coloured coin's hop backup = capture, not griefing) and refused the coloured rescue lane at its last hop. The rule is now read off `is_colored()`, pinned by `d35_flat_backup_lane_tests` and by `ci-guards/tests/deny_colored_backup_on_a_colored_ladder.rs`, which asserts against **comment-stripped source**. Residual: the adversarial test is one level below this row's literal gate — it drives `verify_flat_backup_lane`, not `validate_encrypted_message` end to end | 2–3 d — **spent** |
 | **P2** ✅ **shipped** | Per-output blinding in the rgb-lib fork + rev bump; lift `refuse_colored_multi_payee` | **DONE and CONSUMED.** rgb-lib `ae8439e` adds `AssetColoringInfo::output_blinding` (per-vout, falls back **per output** to `static_blinding`, then random); pushed, and `clients/libs/rust-rgb/Cargo.toml` is bumped `38e344e → ae8439e`. The bridge derives each vout's blinding as `H("utexo/p2/per-output-blinding/v1" ‖ base ‖ vout)` — distinct per output and REPRODUCIBLE across reruns, because `new_random_vout` would separate the legs while destroying the byte-for-byte rebuild the un-broadcast lane depends on. **The lift is deliberately NOT taken:** the refusal named seal privacy, and that gate is now closed, but `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 lists others and one still loses money — the coloured lane conveys serially after the carrier is terminal and journals no `recipient_address`, so a failure at recipient *j* strands *j..K* permanently. The refusal now states THAT, and records that the privacy prerequisite is done so nobody re-solves it | 1–1.5 wk |
 | **P3** ✅ | LN, D21 = build | **DONE.** The CTES-R lane is LN-latchable (latch created on the piece, after the split and before the conveyance; SE hash returned so an invoice can be made); the batch lane refuses a latched send **by name** rather than conveying an unlatched piece into a swap; the latch is journalled into `latch_batch_id` between creating it and conveying it (F7); and **the pre-pay gate proper is built**. It needed NO wire-format change — `child_tesr_bundle` was already conveyed, so the child's `colored_child_txids()` is derivable at the receiver; `PendingTransferInfo::child_witness_txids` now surfaces it and `validate_pending_token_ex` resolves the consignment against it instead of the flat lane's `branch_txs`, which a child does not have. The refusal now fires only when NEITHER chain is present | 1.5–2 wk |
 | **P4** | JS/web/Kotlin. **Smaller than D1's table says on JS, larger on Kotlin.** The *product* SDK (`clients/libs/nodejs-utexo`) is a JSON-lines client over the Rust daemon and is unaffected (`clients/apps/web-wallet/server.js:22`); the fail-closed guards bite only the legacy `clients/libs/nodejs` (consumer: `clients/apps/nodejs/index.js:140`) and `clients/libs/web` (**no in-repo consumer found**). Kotlin's `FFITransferMsg` has no field for laddered material at all and refuses rather than truncates (`lib/src/unifii_interface.rs:55-81`) | **Owner answered — D33 (`DECISIONS.md`): `clients/libs/web` has no external consumer; leave it fail-closed.** The unbounded tail is closed and the item is 0 | **0** (was 0, 2–3 wk, or unbounded) |
@@ -812,21 +833,38 @@ be resting on scaffolding that landed after this document was written.
 |---|---|---|---|
 | **S0** intermediate-`SP` fee law | part of 1–2 wk | **0 — DONE** | Σ-payload law in `verify_conveyed_child`'s ancestor loop; the starving-slot attack test refuses by name (D26 half 1) |
 | **R0** census attestation wiring | part of 1–2 wk | **0 — DONE** | `verify_sig_count_attestation` wired both sides, coordinator deployed, verified live at `sig_count=2` (D8-CLOSE) |
-| **W1** fee-bump remedy | **3–5 wk** | **0.5–1 wk** | (a) `core_rpc::submit_package` exists; (b)+(c) `p2a_fee_child` builds the v3 anchor-spending child; (d) **decided** (D31) *and* built — the tower float rail, with its capacity bound measured (`live_tower_float.rs`). A tier under the floor is rescued through repo code, which was W1's own acceptance criterion. Remainder is hardening + an E2E on a raised-floor node |
-| Gates G2/G3/G4 | 0.5–1 wk | 0.5–1 wk | unchanged; G2 is now an optimisation question (D29), not a product selector |
-| **S1–S9** coloured spine | 7–11 wk | **5–8 wk** | **The plain spine landed in the meantime (CATS-B).** `spine_batch_split`, `persist_spine_tip`/`load_spine_tip`, `establish_spine_tip_journalled`, `watch_spine_tip_pass`, `exit_spine_tip_pass`, `spine_segment`, `colored_spine_tip_floor` and a large adversarial test body all exist. *(This row used to read "the COLOURED half is still gated — `TierRole::Spine` is unallocated". That is false at HEAD.)* **The coloured half has largely landed too:** `TierRole::Spine => 0x0C` is allocated (S1), the coloured cap builder and journal tip variant exist (S2/S3), and `build_colored_spine_batch` / `cosign_colored_spine_batch` / `colored_spine_batch_pay` ship with a CI guard against uncoloured legs under a coloured `SP` (S4/S4b) — with S7 and S9 marked done in §3. **What remains of the spine is S5, S6 and S8's open half**, i.e. ≈3–4.5 wk on §3's own bands, and **S6 is materially de-risked**: the journal and replay this document called "the least grounded number" are built and tested on the plain lane |
+| **W1** fee-bump remedy | **3–5 wk** | **0.5–1 wk** | (a) `core_rpc::submit_package` exists; (b)+(c) `p2a_fee_child` builds the v3 anchor-spending child; (d) **decided** (D31) *and* built — the tower float rail, with its capacity bound measured (`live_tower_float.rs`). The acceptance criterion — a tier under the floor rescued through repo code — is **written as `live_p2a_package_rescue.rs` and not yet observed green**: it skips, printing *"NOTHING was verified"*, unless the node runs a raised `-minrelaytxfee`. Remainder is that E2E + hardening |
+| Gates G2/G3/G4 | 0.5–1 wk | **G2 only, 2–3 d** | G3 and G4 have since landed with their own pinning tests (`g3_every_profile_can_finish_its_exit`, `the_coloured_detrigger_is_a_measured_one_payload_tier_not_a_112_plus_43_estimate`), so what is left of this row is G2 at §3's own band of 2–3 d — and G2 is now an optimisation question (D29), not a product selector. *(The `0.5–1 wk` in the "Now" column was the three gates together; it is kept in the "Was" column as the baseline.)* |
+| **S1–S9** coloured spine | 7–11 wk | **5–8 wk** | **The plain spine landed in the meantime (CATS-B).** `spine_batch_split`, `persist_spine_tip`/`load_spine_tip`, `establish_spine_tip_journalled`, `watch_spine_tip_pass`, `exit_spine_tip_pass`, `spine_segment`, `colored_spine_tip_floor` and a large adversarial test body all exist. *(This row used to read "the COLOURED half is still gated — `TierRole::Spine` is unallocated". That is false at HEAD.)* **The coloured half has largely landed too:** `TierRole::Spine => 0x0C` is allocated (S1), the coloured cap builder and journal tip variant exist (S2/S3), and `build_colored_spine_batch` / `cosign_colored_spine_batch` / `colored_spine_batch_pay` ship with a CI guard against uncoloured legs under a coloured `SP` (S4/S4b) — with S7 and S9 marked done in §3. **What remains of the spine is S5, S6 and S8's open half** — on §3's own bands that is S5 2–3 wk (10–15 d) + S6 3–5 d + S8's open half within its 4 d + churn = **17–24 d, i.e. ≈3.5–5 wk** (an earlier line here totalled the same three rows at "≈3–4.5 wk"; the bands did not change, the addition did) — and **S6 is materially de-risked**: the journal and replay this document called "the least grounded number" are built and tested on the plain lane |
 | **Phase 2** re-anchor | 3–8 wk | **0 — CR-D DONE** | D29 selected CR-D and it has since landed: `build_colored_detrigger` + `cosign_colored_detrigger` (`clients/libs/rust/src/tesr.rs`), driven by `UtexoWallet::colored_reanchor`, with the plain `reanchor` path now dispatching on colour instead of refusing every carrier. *(The "no builder exists — `colored_detrigger`: 0 hits" line this row used to carry was true when §4.1 was written and is false at HEAD.)* `+3–5` for CR-A only if G2 is pursued and passes |
-| Phase 3 P1+P2+P5 | 2–3 wk | 2–3 wk | unchanged, unstarted |
+| Phase 3 P1 + P2 + P5 *(this row read `2–3 wk / unchanged, unstarted`)* | 2–3 wk for the three | **0–1 d — all three have landed** | **All three are done, and the "unstarted" this row carried was stale for every one of them.** P2: rgb-lib `ae8439e` adds per-output blinding and `clients/libs/rust-rgb/Cargo.toml` is bumped to it — the fork half is consumed, and the `refuse_colored_multi_payee` lift is deliberately not taken for a *different* reason (§3). P5: **D32** records both silently-removed capabilities against `V_min`. P1: `validate_encrypted_message` now calls `verify_flat_backup_lane`, refusing a plain ladder that carries RGB material by name (D35, §3) — the residual is a call-path test rather than the check itself, hence 0–1 d, not 2–3 |
 | Phase 3 P3 (LN) | 0 or 1.5–2 wk | **0 — DONE** | **D21 is a recorded decision — "RGB over Lightning: BUILD IT" (`DECISIONS.md`, owner, 2026-08-11).** *(This row previously read "still blocked on D21, which is still not a recorded decision"; that was true when written and is false at HEAD.)* The build followed — see §3's P3 row |
 | Phase 3 P4 (clients) | 0 / 2–3 wk / unbounded | **0 — closed** | **D33: `clients/libs/web` has no external consumer; leave it fail-closed.** The open owner question that made this unbounded is answered. `wasm/Cargo.toml` still depends on `mercurylib` only while `verify_bundle` lives in `mercuryrustlib` — the port is still not takeable, it is simply no longer required |
 
 **Total: 11–21 engineer-weeks single-threaded, ≈7–13 calendar weeks with two tracks.**
 
-⚠️ **That total is already a superseded baseline.** Since §4.1 was written, W1, CR-D, P2, P3, P5,
-G3, G4 and the S1–S4b/S7/S9 stretch of the spine have all landed, and P4 went to zero on D33.
-Summing only the rows still open, on these same bands: **≈6–9 engineer-weeks** — G2 (0.5–1 wk),
-the remaining spine (S5, S6, S8's open half, ≈3–4.5 wk) and P1 (2–3 d). §4.2 restates the same
-remainder in the unit the work is actually done in.
+⚠️ **That total is already a superseded baseline.** Since §4.1 was written, CR-D, P1, P2, P3, P5,
+G3, G4 and the S1–S4b/S7/S9 stretch of the spine have all landed, W1's four parts were built, and P4
+went to zero on D33. Summing only the rows still open, on these same bands, in days so the addition
+is checkable:
+
+| still open | band | days |
+|---|---|---|
+| S5 N-deep seal walk | 2–3 wk | 10–15 |
+| S6 crash replay | 3–5 d | 3–5 |
+| S8's open half (the spine's `4 + d` transaction count) | 4 d + churn | 4 (carried at the full band; the reconciled half is spent, so 4 is an upper bound at both ends) |
+| G2 rival-colouring spike | 2–3 d | 2–3 |
+| W1 remainder — hardening + the raised-floor E2E | 0.5–1 wk | 2.5–5 |
+| P1's residual — a refusal test driving `validate_encrypted_message` itself | — | 0–1 |
+| **total** | | **21.5–33 d = ≈4.5–6.5 engineer-weeks** |
+
+*(An earlier line here read "**≈6–9 engineer-weeks**" over an itemisation of G2 + the spine + P1 that
+adds to 3.9–6.1 wk. The gap was this table's `P1+P2+P5 | 2–3 wk | unchanged, unstarted` row, left
+unstruck: the total counted all three, the itemisation counted only P1 — and in fact none of the
+three was still open. Both figures are now derived from the same rows: the itemisation gains W1's
+remainder, which it had silently dropped, and the total loses P2, P5 and P1's build.)* §4.2 restates
+the open build items in the unit the work is actually done in; the W1 E2E is bounded by a node
+configuration rather than by typing, so it carries no session row.
 
 ### What this does to the spec date
 
@@ -866,8 +904,9 @@ Engineer-weeks are the wrong unit for how this work is actually being done. Re-e
 sessions** (Claude Code, ultracode, Opus 5 Fast), calibrated on **measured throughput from the
 session that produced this section** rather than on a conversion factor.
 
-**The calibration point.** One session closed: S0, R0, all of W1 (package route, P2A spender, v3 fee
-child, live rescue, tower float rail), CR-D + its wiring, P1, P5, S1, S2, audit Tiers 1–3, RGB
+**The calibration point.** One session closed: S0, R0, all four parts of W1 (package route, P2A
+spender, v3 fee child, tower float rail, plus the rescue's acceptance test — written, not yet run on
+a raised-floor node, §0.1), CR-D + its wiring, P1, P5, S1, S2, audit Tiers 1–3, RGB
 Stage 0, the build-infra fix, a coordinator deploy, and seven decisions (D26–D33). Against this
 document's own estimates that is **≈12 engineer-weeks in one session**, at 644 green tests and clippy
 clean throughout.
@@ -890,13 +929,20 @@ ones whose foundations were already in the tree.
 | **P2** per-output blinding | 1–1.5 wk | **DONE** | Fork bumped; the lift deliberately not taken (§3) |
 | **P3** LN (**D21: build**) | 1.5–2 wk | **DONE** | SSP pre-pay RGB gate + F7 journal |
 | **P4** clients (**D33: none**) | — | **0** | Closed at zero |
-| P1 receiver-side WP6(i) refusal | 2–3 d | **~0.5** | Adversarial test through `validate_encrypted_message` |
+| P1 receiver-side WP6(i) refusal | 2–3 d | **DONE** | `verify_flat_backup_lane`, called from `validate_encrypted_message`, corrected by D35 and pinned against comment-stripped source (§3) |
 | G2 | 2–3 d | **~0.5** | ⚠ Measurement against the live stack. G3/G4 are **DONE** |
 
-**Total: ~2.5–3.5 agent sessions of work still open** — S5, S6, S8's remaining half, P1 and G2.
-*(The "~6–9 agent sessions" this table originally totalled was the figure before S4/S4b, S7, S9,
-P2, P3, G3 and G4 landed; it is kept as the baseline the compression is measured against.)* The
-non-compressing kind still in front: **G2**, bounded by regtest cycles.
+**Total: ~2.5–3.5 agent sessions of work still open** — S5 (1–2) + S6 (~0.5) + S8's remaining half
+(~0.5) + G2 (~0.5) = **2.5–3.5**, the sum of this table's own surviving rows.
+*(An earlier line printed the same "~2.5–3.5" over a table that still carried **P1 at ~0.5**, i.e.
+over rows summing to 3.0–4.0 — the number was right and its arithmetic was not. What closes the gap
+is that P1 has landed (D35, §3), so the row leaves the sum rather than the sum being rounded down.
+And the "~6–9 agent sessions" this table originally totalled was the figure before S4/S4b, S7, S9,
+P2, P3, G3 and G4 landed; that one is kept as the baseline the compression is measured against.)*
+Not in this table: **W1's remaining hardening and its raised-floor E2E**, which
+§4.1 books at 0.5–1 engineer-week — the E2E is bounded by starting a node with a raised
+`-minrelaytxfee`, not by typing (§0.1). The non-compressing kind still in front: **G2**, bounded by
+regtest cycles, and that same W1 run.
 
 **Spec draft: ~2–4 sessions after the spine lands**, since §5/§10/§11 are the only gated sections and
 §6/§15 became writable when W1 shipped.
@@ -906,8 +952,12 @@ non-compressing kind still in front: **G2**, bounded by regtest cycles.
 1. **Live-stack E2Es.** A regtest lifecycle takes the wall-clock it takes; mining blocks and waiting
    for confirmations is not parallelisable by thinking faster. S9 and G2–G4 were bounded by this;
    S9, G3 and G4 are spent, and **G2 is the one that remains.**
-2. **The external fork.** P2 lives in `utexo-rgb-lib`, which has its own build, its own tests and a
-   rev-bump that has to propagate.
+2. **The external fork — and this one is a SPENT cost, not a forward-looking one.** P2 lived in
+   `utexo-rgb-lib`, which has its own build, its own tests and a rev-bump that has to propagate. It
+   was paid: rgb-lib `ae8439e` carries per-output blinding and `clients/libs/rust-rgb/Cargo.toml` is
+   pinned to that rev (§3, P2). The shape is worth keeping because it recurs — no open item in §3
+   names a fork change, but if S5's `consignments.len() == tiers.len()` resolution turns out to need
+   one, this cost comes back and it is not compressible by thinking faster.
 3. **Owner decisions.** Zero engineering time and unbounded calendar time. D21 and D33 were both
    answered on the day they were asked and each removed ~1 session of ambiguity; the three open
    questions in §6 have the same shape.
@@ -1011,7 +1061,7 @@ in the original draft and are corrected here.**
 1. **The census attestation is BUILT, live-verified — and now WIRED. This was R0, not an owner
    decision.** The original draft called it an unbuilt owner decision; both halves were wrong.
    Commit `f7b7aac` ("D8-CLOSE verified END TO END against the running enclave") landed
-   `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs:236`), the lockbox signs
+   `verify_sig_count_attestation` (`mercurylib::transfer::receiver`), the lockbox signs
    `sha256("utexo/sig_count/v1" ‖ statechain_id ‖ u32_be(num_sigs) ‖ nonce32)`, the coordinator
    forwards `attestation` / `attestation_pubkey` verbatim
    (`server/src/endpoints/transfer_receiver.rs:107-108`, `:128-129`), and

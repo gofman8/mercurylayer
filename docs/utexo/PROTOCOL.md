@@ -115,7 +115,7 @@ shipped protocol is the last column.)*
 |---|---|---|---|---|---|
 | Idle on-chain footprint | 5,840 vB/coin-yr (112 vB per ~7d) | **0** | Refresh per round or lose funds | Per-factory ladder txs (~monthly, amortized /N) | **0** |
 | Renewal mechanism | On-chain re-anchor per coin | Off-chain re-sign with operator group (`renew_leaf`) | On-chain round through ASP | New factory before dying period | **Off-chain**: DW lower-CSV extension re-sign; self-split rollover at epoch exhaustion |
-| What invalidates old state | Consensus (absolute locktime ordering) + enclave refusal | **1-of-n operator honest key deletion** (trust) | Round expiry (consensus) | Decrementing nSequence DW (~64 updates then exhaustion) | **Consensus** (lower-CSV wins the trigger output; old epochs' parents unconfirmable) + the receiver's exact-equality census over the enclave's attested `sig_count` as defense-in-depth (§5.5) |
+| What invalidates old state | Consensus (absolute locktime ordering) + enclave refusal | **1-of-n operator honest key deletion** (trust) | Round expiry (consensus) | Decrementing nSequence DW (~64 updates then exhaustion) | **Consensus** (lower-CSV wins the trigger output; old epochs' parents unconfirmable) + the receiver's exact-equality census over the enclave's attested `sig_count` as defense-in-depth (§5.11) |
 | Missed-liveness outcome | Raceable after window; never confiscated | Safe (operator renews); trust-dependent | **CONFISCATION** — funds sweep to server after expiry | **CONFISCATION** — "the LSP can simply claim the entire UTXO" after the dying period (delvingbitcoin 1143) | Raceable **only after** a public on-chain trigger + ≥144-block CSV notice; **never confiscated** — no output ever pays the operator by timeout |
 | Operator liquidity | None | SSP denomination-swap pools | Round liquidity fronted per refresh | LSP leaf liquidity ("1/(N+1) of its funds") | **None** (fee-sized outlays only; §7.4) |
 | Exact amounts | Native split/combine | Fixed denominations + SSP swaps | Fixed by round | Fixed by leaf | **Native split/combine preserved** |
@@ -159,7 +159,9 @@ Three candidates, six adversarial reviews. Verdict logic:
   victim = theft) and one with none ("no fatal under the stated requirements"). We judge both claimed
   FATALs as **serious-but-answerable**: the griefing FATAL is defanged by the cooperative de-trigger
   (§5.8) that the TES draft missed and the Grove review supplied — grief cost collapses from
-  forced-settlement (~828 vB + days) to one 125-vB co-op de-trigger (the verdict stands; its
+  forced-settlement (**834 vB** worst + days — the ~828 this line used to carry is the TES review-2
+  exit-cost figure recorded in §8.3, 3×124 + 3×152, built on the superseded 124-vB tier; §5.9)
+  to one 125-vB co-op de-trigger (the verdict stands; its
   "griefing is economically losing" *pricing* did not survive re-derivation — §5.8);
   the offline-theft FATAL is
   precisely the race class the hard constraints *explicitly tolerate* ("a race you can lose while
@@ -323,13 +325,34 @@ no `/renew/init` route anywhere in the tree, and no `total_sigs` column, field o
 `mercuryrustlib::tesr::renew` is exactly two `cosign_tier` calls over the ordinary
 `/sign/first` + `/sign/second` pair, and `m` and `k` are fields of the client's own bundle, advanced
 locally. So the SE-side renewal gate — the challenge-nonce binding and the "refuse unless the state
-counter is genuinely within 2δ of the floor" refusal — **is specified here and unenforced**; a coordinator
-that wanted to burn a victim's epochs is not stopped by a server-side check today. The counts the SE does
+counter is genuinely within 2δ of the floor" refusal — **is specified here and unenforced**. What that
+costs is narrower than an epoch-burn lever, and the narrower statement is the true one: `POST /sign/first`
+already returns **401** unless the request carries a schnorr signature by the coin's own auth key
+(`validate_signature`, `server/src/endpoints/sign.rs`), every co-sign still needs the owner's MuSig2
+partial, and `m`/`k` are client-local bundle fields the SE never reads — so no coordinator-side epoch-burn
+lever follows from the missing route. What the missing rail actually costs is **replay**: `/sign/first`
+takes the replayable `signed_statechain_id`, not the single-use endpoint-bound
+`validate_signature_nonce` of audit [15] that `withdraw/complete`,
+`deposit/get_derived_token` and `statechain/spend_budget` already use, so a captured request can be
+re-served. The concurrent-session
+half of that shape is already closed — `acquire_signfirst_lock` fails **closed** with a retryable 503
+rather than proceeding unserialized. The counts the SE does
 publish are two, and both are load-bearing elsewhere: the lockbox's **lifetime `sig_count`** (attested
 `utexo/sig_count/v2`, served through `GET /info/statechain/<id>` as `num_sigs`), which is the right-hand
 side of the receiver's census (§5.11); and the per-node `sig_budget`/terminality receipt at
-`GET /statechain/spend_budget/<id>`, which the enclave itself re-checks before consuming a secnonce. The
-design in steps 1 and 3 stands — it is the code that is behind it (O-1).
+`GET /statechain/spend_budget/<id>`, which the enclave itself re-checks before consuming a secnonce.
+
+**[Correction to the correction — steps 1 and 3 were DECIDED OUT, not deferred.]** An earlier pass closed
+the paragraph above with "the design in steps 1 and 3 stands — it is the code that is behind it (O-1)".
+That verdict is wrong in the direction that promises work nobody intends to do, and two in-repo decision
+records say so: **DECISIONS.md D22** lists per-level SE counters as "the 'build it' option D4 rejected
+partly on scope … re-openable if wanted, though D4's proof means it is no longer *needed*", and
+**SPEC-ROADMAP §6** scopes "the {level, m, k} counter machine and `POST /renew/init`" out
+**unconditionally**, on D4's round-2 proof that a hidden co-sign at **any** level raises the same TOTAL —
+which is exactly what the shipped exact-equality census catches (§5.11). Steps 1 and 3 are therefore kept
+above as the **design of record** for a renewal RAIL that was considered and dropped, not as a machine the
+census depends on; step 2 is the whole of what renewal is. The one piece of step 1 still worth building on
+its own merits is the audit-[15] nonce on `/sign/first` — a replay rail, not a counter machine.
 
 **Why old state dies at the consensus level, not by enclave promise**: X_{m+1} strictly undercuts
 every older extension in the CSV race for T.out[0]; every pre-renewal state hangs on an extension
@@ -562,9 +585,28 @@ RGB suites (`rgb*`, `ta*`, `tb*`) run over the shipped protocol unchanged.
 ### 5.11 Receiver verification at claim (R′ set)
 
 Derived from public data; any deviation = reject: (R3′) F on-chain, unspent, pays A. (R4′) T spends F,
-no timelock; tier outputs pay A + the public H_tag tweaks; current extension has nSequence exactly
-E0 − m·δE and the new state exactly D0 − (k+1)·δ, with headroom ≥ receiver policy. **[Shipped
-correction — the yardstick is NOT the SE's.]** This document used to say those bands are checked
+no timelock; tier outputs pay A + the public H_tag tweaks; every later tier's **signed** nSequence is a
+BIP-68 *block* relative timelock lying inside the band its kind allows — `[e_floor, e0]` for an
+extension, `[d_floor, d0]` for a state, exactly `SPINE_CSV = 0` for a split tip — and the tier's
+**declared** `csv` field is bound to that same signed number (`bind_declared_csv`), so a schedule that
+contradicts the signatures is refused rather than believed; superseded tiers are held to the identical
+band and binding. Headroom ≥ receiver policy.
+
+> **[Corrected — this line used to assert a per-position exactness that nothing checks.]** It required
+> "the current extension at exactly `E0 − m·δE` and the new state at exactly `D0 − (k+1)·δ`".
+> `verify_bundle_ex` (and `verify_child_bundle`, and the superseded loop) check **bands**, never
+> positions, and no receiver can form the exact term: nothing serves `m` or `k` (§5.5) and they are
+> fields of the *sender's own* bundle. The band is not the weaker yardstick it looks like, because its
+> endpoints are not the sender's either — `cap_schedule` runs BEFORE the census on both receive paths
+> and refuses a conveyed `TesrParams` field by field against the receiver's OWN network preset. What the
+> exact position would have added — that the disclosed tiers sit at the epoch indices the coin's history
+> implies, so no undisclosed co-sign hides between them — is carried instead by R5′ below (a hidden
+> co-sign at any level raises the same TOTAL) and by the D14 margin, which is measured off the LIVE
+> rival's structural position rather than off a declared epoch index. The exactness is therefore
+> **withdrawn as a requirement**, not left as a rule the code is behind: per D4 / SPEC-ROADMAP §6 the
+> `{m, k}` machine it would need was scoped out unconditionally (§5.5).
+
+**[Shipped correction — the yardstick is NOT the SE's.]** This document used to say those bands are checked
 "against the SE's publicly-served counters"; no endpoint serves m or k (§5.5). The authority is the
 receiver's OWN network preset, and a conveyed schedule that disagrees with it is refused field by field
 (`cap_schedule`) rather than honoured — which is the stronger property, because it holds even against a
@@ -643,7 +685,12 @@ keyless watching" as implying spike-time rescue.
 > (`TIER_VBYTES`) committing 250 sats at 2 sat/vB, so under that same 3 sat/vB floor it reads
 > **`min relay fee not met, 250 < 375`**. The shape of the claim is unchanged and the limit is real —
 > only the numbers were borrowed from a different transaction. (The one live quote below,
-> `min relay fee not met, 6 < 13`, IS this repo's own code against a real node and stays.)
+> `min relay fee not met, 6 < 13`, stays — but for a narrower reason than "it is the real one". Its
+> numbers are lab numbers too: that run is a **regtest** node at a **0.1 sat/vB** floor against a parent
+> deliberately built under it, and `RESIDUAL-CLASSIFICATION` classes it as the same kind of number as
+> 200 < 423. What is different, and is the whole reason it is quoted, is the *path*: the refusal and the
+> package that answered it went through this repo's own `build_p2a_fee_child` + `submit_package`, which
+> is the WP1 acceptance criterion. **Neither figure is a protocol bound**; both are lab conditions.)
 
 Nor does the anyone-can-spend anchor supply a rescuer. **[Corrected] the "~900×" that used to stand here
 was three errors stacked**, and it is worth replacing rather than softening because the conclusion is
@@ -758,8 +805,11 @@ user's own coin). Operator money is fee-sized only: tower fee bonds (prepaid, pr
 and P2A bump children. *Asterisk (accepted from review)*: contingent tower fee capital under a
 correlated grief wave is real — ~$17/coin defended at 30 sat/vB; a 100k-coin wave ≈ $1.7M fronted.
 Mitigated by committed base fees (base case needs no child), the de-trigger (defense is one 125-vB
-co-op tier, not a 375-vB unilateral walk), and the prepaid bond rail (still unbuilt, O-5); it is
-capital-at-cost, never custody or principal.
+co-op tier, not a **375-vB** pre-signed unilateral walk — *the 552 vB this line carried from the
+original design doc is untraceable: it appears nowhere else in `docs/`, matches neither 3 tiers at
+either tier size nor any tier-plus-children sum in §5.9, and the pass that replaced it could not source
+it; 375 = 3 × `TIER_VBYTES` 125, which is the quantity the sentence is contrasting*), and the prepaid
+bond rail (still unbuilt, O-5); it is capital-at-cost, never custody or principal.
 
 **REQ 3 — non-custody under operator hack: MET; unchanged in kind, improved in notice.** Pre-hack
 coins left untouched are unconditionally safe: every spend path needs both 2-of-2 shares; the hacked
@@ -799,11 +849,20 @@ coordinator (the other REQ4 gap) does not ship. Exit-time RGB disclosure unchang
   child (§5.13), so this risk is currently carried, not mitigated.
 - **R-5 Deep-DAG unilateral latency**: depth-3 worst ≈ 60 days (coop exit instant); geometric
   schedules cap it ≈ 30 days at reduced budgets (O-4).
-- **R-6 The enclave counter machine {level, m, k} does not exist**, and the design assumes it. What is
-  attested today is a single lifetime `sig_count` per coin plus its budget; every structural expectation
-  (which epoch, which level, how many tiers should exist) is reconstructed by the receiver from the
-  bundle and its own preset. That is sound for the census — a total is exactly what an exact-equality
-  count needs — but it means the safety-relevant state machine is still unspecified and unbuilt (O-1).
+- **R-6 The enclave counter machine {level, m, k} does not exist — and is RETIRED BY PROOF, not owed.**
+  What is attested today is a single lifetime `sig_count` per coin plus its budget; every structural
+  expectation (which epoch, which level, how many tiers should exist) is reconstructed by the receiver
+  from the bundle and its own preset. That is sound for the census — a total is exactly what an
+  exact-equality count needs, because a hidden co-sign at **any** level raises the same total (D4's
+  round-2 proof; SPEC-ROADMAP §6 scopes the machine out unconditionally, DECISIONS.md D22 records it as
+  "no longer *needed*"). *An earlier revision of this bullet escalated it to "the safety-relevant state
+  machine is still unspecified and unbuilt"; that was an unevidenced upgrade and is withdrawn.* Two
+  things the proof does **not** cover, and they are the real residual: it is conditional on the two
+  coordinator-trust premises D8 attaches — P3, that `se_num_sigs` is the true count, now earned by the
+  chain-anchored `utexo/sig_count/v2` attestation (§5.11), and **P1, the sid ↔ aggregate-key binding,
+  still coordinator-supplied and unattested** (`ladder_binding_precheck_cause`); and per **D40.2** the
+  key material and the counter it attests are held by the same party, which no counter machine would
+  have fixed. See O-1, restated on those terms.
 
 ---
 
@@ -926,8 +985,12 @@ not on a protocol number. (b) **The server line never landed.** There are zero o
 `total_sigs` in the tree, no `POST /renew/init` route, no {level, m, k} counter machine, and no column or
 migration for any of them; `/info/config` and the nostr record publish the flat parameters, not the tier
 schedule (§5.2, §5.5). What ships in their place is the lockbox's attested lifetime `sig_count` plus the
-`spend_budget` terminality receipt — enough for the receiver's census, not the counter machine O-1 is
-about. (c) **`watch_pass` package-awareness is no longer the gap it was.** The 1P1C path exists
+`spend_budget` terminality receipt — and that is not a shortfall to be made good later: **the phase-0
+server line was subsequently cancelled, not deferred.** D4's round-2 proof retired the counter machine
+and `POST /renew/init` (SPEC-ROADMAP §6, DECISIONS.md D22), and the schedule-publication half was
+superseded by the receiver-side yardstick of §5.2. The residual carried under the O-1 label is the trust
+premise D40.2 names, not this build item.
+(c) **`watch_pass` package-awareness is no longer the gap it was.** The 1P1C path exists
 (`build_p2a_fee_child` + `core_rpc::submit_package`), both broadcast loops escalate through it when a fee
 source is supplied (`watch_pass_with_bump` / `exit_pass_with_bump`), and it is verified live. The plain
 keyless `watch_pass` still broadcasts tier by tier with `transaction_broadcast_raw` and attaches no
@@ -990,13 +1053,28 @@ claims. The earlier plan's "mixed-protocol estates" item is void: no mixed estat
 
 ## 10. Open problems & future work
 
-- **O-1 (blocking, STILL OPEN — and unbuilt, not merely unspecified)**: formal spec + audit of the
-  enclave counter machine {level, m, k}. There is no such machine in the tree today (§5.5): the enclave
-  keeps one lifetime `sig_count` and a `sig_budget`, and every structural expectation is reconstructed
-  receiver-side. A missed interleaving is a double-spend, so this needs INV-23/24-grade treatment before
-  mainnet. *Partially de-risked in practice*: the census is exercised adversarially by sdk54/sdk55/sdk58
-  and across hops by sdk46/47/60/17, and retry-idempotence of the count by sdk56 — but neither the spec
-  nor the machine exists, so this stays blocking.
+- **O-1 — RESTATED. The build item is closed; the trust premise underneath it is what stays open.**
+  ~~*(as it stood: "blocking, STILL OPEN — formal spec + audit of the enclave counter machine
+  {level, m, k} … a missed interleaving is a double-spend, so this needs INV-23/24-grade treatment
+  before mainnet"; and, briefly, "unbuilt, not merely unspecified … so this stays blocking")*~~ — the
+  motivating worry, a missed interleaving, is precisely what the total-count census answers. There is
+  no such machine in the tree (§5.5): the enclave keeps one lifetime `sig_count` and a `sig_budget`, and
+  every structural expectation is reconstructed receiver-side. **D4's round-2 proof holds** — exact
+  equality on the TOTAL detects a hidden co-sign at any level, and decoy-vs-hidden is separated by
+  per-item validation, slot uniqueness over the union of live and disclosed tiers, and root anchoring,
+  not by per-level counters — so SPEC-ROADMAP §6 scopes the machine and `POST /renew/init` out
+  **unconditionally** and DECISIONS.md D22 records the same. Specifying and auditing a machine nobody
+  will build was never the blocking item; it is deleted as one here rather than carried as a debt.
+  *De-risked in practice*: the census is exercised adversarially by sdk54/sdk55/sdk58, across hops by
+  sdk46/47/60/17, and for retry-idempotence of the count by sdk56.
+  **What remains open under this label, per D40.2 (which folds O-1, CO-1 and CO-3 into ONE defect —
+  publish one row, cite it three times):** the enclave key material and the counter it attests are held
+  by the party the receiver is being protected from. The proof must therefore be published *with* its
+  premises — P3 (`se_num_sigs` is the true count) is now **earned** by the chain-anchored
+  `utexo/sig_count/v2` attestation, while **P1 (the sid ↔ aggregate binding) is still coordinator-supplied
+  and unattested**. The only construction that closes it is a second, independently administered SE write
+  domain under a separate legal entity; an external anchor over `(sid, n, h_n)` is rejected with reasons
+  (the attack is *under*-reporting, and the receiver's rule would be a floor written by the adversary).
 - **O-2 (blocking dial)**: δ/δE vs sustained mainnet congestion — quantify head-start survival
   against 2023–24 spike history; δ=36 is the shipped default (`TesrParams::mainnet()`, arithmetic
   pinned by sdk44), with the budget table of §5.2 as the trade space. The congestion study itself is
@@ -1044,8 +1122,13 @@ verified live against a node; only the funded-tower fee BOND (O-5) is still spec
 
 The places where this document still describes something that does not exist in code are named where
 they bite, not hidden here: the renewal RAIL of §5.5 steps 1 and 3 (no `/renew/init`, no `total_sigs`,
-no {level, m, k} machine — O-1), and the publication of the tier schedule by the SE (§5.2). Both are
-design that stands; the code is what is behind.*
+no {level, m, k} machine — O-1), and the publication of the tier schedule by the SE (§5.2). **Neither is
+"design that stands while the code catches up"** — the verdict an earlier correction pass attached here,
+withdrawn: the renewal rail was **decided out** (D4's proof, SPEC-ROADMAP §6, DECISIONS.md D22), and the
+publication half was **superseded** by a receiver-side yardstick that is strictly stronger because it
+holds against a lying coordinator (`cap_schedule` / `TesrParams::flat_ladder_params`, the D27 pattern).
+Both are kept above as design of record — one dropped, one replaced — and the only rail still worth
+building from either is the audit-[15] single-use nonce on `/sign/first`.*
 
 *Adversarial findings ledger: TES review-1 FATAL#1 defanged (§5.8), FATAL#2 accepted-as-tolerated
 (§5.7); TES review-1 fixables 1–7 folded; TES review-2 corrections (compaction 103 vB, exit 828 vB,

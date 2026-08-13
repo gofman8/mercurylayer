@@ -71,8 +71,15 @@ unchanged; the **Class** column now carries the disposition at HEAD.
 Most non-`num_sigs` values are grief because the receiver re-anchors them to on-chain facts (b, c),
 its own electrum (g), or cryptography (h). The two that also deserve synthesis attention beyond (a):
 the coordinator-computed **`terminal` flag (i, theft)** and the coordinator-supplied
-**`initlock`/`interval` (f, theft lever)**. *(Both were subsequently built — §7 and §8. All three
-theft-class rows are closed on the Rust client and none of them is closed on nodejs/web.)*
+**`initlock`/`interval` (f, theft lever)**. *(Both were subsequently built — §7 and §8. The
+disposition per row, since it is not uniform: (a) and (f) are closed on the Rust client and open on
+nodejs/web (§5, §9 item 1). (i) is closed on the **child-bundle lane only** — `verify_conveyed_child`
+derives terminality from the attested pair, while the branch/sub-coin lane's
+`verify_terminal_parents` (`clients/libs/rust/src/transfer_receiver.rs`) still reads the bare
+`terminal` boolean off the unattested `/statechain/spend_budget`, on the claim path and again inside
+the SSP pre-pay value gate (§9 item 2). Row (i) does not arise on nodejs/web at all: `branch_txs`,
+`terminal_parents` and `spend_budget` return zero hits in `clients/libs/nodejs` and
+`clients/libs/web`, so those clients have no branch/sub-coin acceptance path to close.)*
 
 Row (c)'s GRIEF classification is worth stating precisely, because the attestation now rests on it:
 `validate_tx0_output_pubkey` is the point-sum equality `tx0_out == user_public_key + enclave_public_key`
@@ -121,10 +128,15 @@ had to travel under the same signature (§8); and the last line — "not a recom
 ## 4. Cheapest client-side detection available today (NOT BUILT — superseded by §6)
 
 *(Deliberately not built. The attestation landed instead, which is the "only sound fix" this section
-names. The cross-check below did survive in one form: `attested_terminal` keeps the coordinator's
-`finalized`/`terminal` answer as a cross-check that **refuses on disagreement**, on top of the
-attested derivation rather than in place of it. Kept because the reasoning — and the reason two
-mutually-consistent lies defeat it — is what justified paying for the attestation.)*
+names. The cross-check below did survive in one form, and a weaker one than the decision record
+asked for: `attested_terminal` (tesr.rs) keeps the coordinator's **terminality verdict** as a
+cross-check that **refuses on disagreement** (`coordinator_says != terminal`), on top of the attested
+derivation rather than in place of it. It compares that one boolean and nothing else — the
+coordinator's `finalized` and `sig_budget` arrive on the same response and are dropped
+(`let (_, _, coordinator_says) = get_spend_budget(..)`). D40.2 item 1 specified a **raw-quantity**
+cross-check, on the ground that both stores hold the same absolute value; on that point the CODE is
+behind the decision, not the decision behind the code. Kept because the reasoning — and the reason
+two mutually-consistent lies defeat it — is what justified paying for the attestation.)*
 
 Cross-check `num_sigs` (lockbox-sourced, /info/statechain) against `finalized` (coordinator-DB-
 sourced, GET /statechain/spend_budget = `COUNT(*) WHERE partial_sig_issued=true`,
@@ -170,8 +182,14 @@ under-reported count over the wire.
   compares the two sides' **terminality verdicts**, not their raw counts — and it is sound on the
   quantity it compares because both stores hold the same ABSOLUTE budget. The count-timing question
   is untraced and would return if anyone tried to compare `finalized` against `sig_count` directly.)*
-- Whether /statechain/spend_budget is fetched on the FLAT and pre-pay-flat lanes (confirmed only on
-  the child path) — enabling the §4 check on the flat lane may need an extra round-trip.
+- ~~Whether /statechain/spend_budget is fetched on the FLAT and pre-pay-flat lanes (confirmed only on
+  the child path) — enabling the §4 check on the flat lane may need an extra round-trip.~~
+  **RESOLVED — on both lanes, but only for BRANCH-funded coins.** `verify_terminal_parents` issues
+  one `GET /statechain/spend_budget/<id>` per named ancestor, and it is reached from the flat claim
+  path (`validate_encrypted_message`) and from the SSP pre-pay value gate (`peek_pending_transfers`),
+  in both cases only under `funding_from_branch` (§9 item 2). A flat coin funded by an on-chain tx0
+  fetches the endpoint on neither lane, so for that case the original guess holds: the §4 check would
+  have cost an extra round-trip. Moot in effect, since §4 was not built.
 - Whether statechain_id re-creation after unauthenticated DELETE /delete_statechain (server.cpp:413-420;
   does not purge signed_session_cache) is reachable through coordinator flows — lockbox accepts it;
   coordinator behaviour unread. Same for the duplicate-row hazard (no UNIQUE on statechain_id,
