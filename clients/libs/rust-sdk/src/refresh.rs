@@ -515,14 +515,43 @@ impl UtexoWallet {
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let carriers = self.unspendable_as_btc_outpoints().await?;
         let record = self.record().await?;
+        // **[D46] CARRIERS ARE INCLUDED HERE.** They are excluded from the COOPERATIVE route above
+        // for a real reason — a plain re-anchor spends the carrier's outpoint and destroys its RGB
+        // allocation — but excluding them from the unilateral route too left the carrier lane with
+        // ZERO automatic deadline coverage, resting on `auto_exit_due` alone. That is the lane where
+        // the loss is an ASSET rather than sats.
+        //
+        // The forced action is `unilateral_exit`, which broadcasts the pre-signed `T` — a tier of
+        // the coin's OWN ladder, carrying the coin's own state. It does not re-aggregate and it does
+        // not spend the allocation to a stranger's script, so it is safe on a carrier in a way a
+        // re-anchor is not. On a COLOURED ladder every tier carries a valid RGB transition; on a
+        // plain-laddered carrier the ladder is refused at build time (D35's lane rule), so a carrier
+        // that reaches here with a ladder has one that can carry it.
+        //
+        // `sdk86` measured what this protects: the flat backup chain's absolute locktime is real and
+        // finite, mining moves the tip toward it, and each whole-coin hop spends `interval` of it.
+        // INV-27's "idle coins never age" is true of the CSV side only.
         let still_due: Vec<String> = record
             .coins
             .iter()
             .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
-            .filter(|c| !crate::wallet::is_token_carrier(c, &carriers))
             .filter(|c| coin_near_final(c, tip, margin_blocks))
             .filter_map(|c| c.statechain_id.clone())
             .collect();
+        let carrier_count = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter(|c| crate::wallet::is_token_carrier(c, &carriers))
+            .filter(|c| coin_near_final(c, tip, margin_blocks))
+            .count();
+        if carrier_count > 0 {
+            println!(
+                "deadline safety: {carrier_count} token carrier(s) within {margin_blocks} blocks of \
+                 their floor will be SEVERED (pre-signed T), not re-anchored — a plain re-anchor \
+                 would destroy the allocation"
+            );
+        }
         drop(record);
 
         let mut severed = Vec::new();

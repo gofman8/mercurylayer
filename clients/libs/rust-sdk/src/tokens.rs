@@ -227,6 +227,16 @@ pub const TOKEN_CARRIER_SATS: u64 = legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPT
 /// is split exactly once (`SP` terminalizes it, and the change is a depth-1 coloured child no guard
 /// will split again — see [`LEGACY_CARRIER_SEND_DEPTH`]), so "pay them one at a time" means one
 /// CARRIER per recipient, via [`UtexoWallet::transfer_tokens`] or the multi-carrier lane.
+///
+/// **[D43] THIS IS THE SHIPPED DESIGN, not a temporary block.** Decision 8 was taken on 2026-08-13:
+/// K = 1 per carrier ships, and idempotent coloured conveyance (journalling `recipient_address`,
+/// making `convey_child_bundle` resumable) will NOT be built. Issuers size carriers to the asset
+/// value they intend to move — the same answer already taken for carrier granularity — and a payment
+/// to two payees uses two carriers. The specification names the limitation rather than working
+/// around it.
+///
+/// The distinction matters for whoever reads this next: a refusal pending a fix invites the fix, and
+/// this one is not pending anything.
 pub(crate) fn refuse_colored_multi_payee(payees: usize) -> Result<()> {
     if payees <= 1 {
         return Ok(());

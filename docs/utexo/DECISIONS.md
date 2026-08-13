@@ -1352,3 +1352,78 @@ further code on the critical path can be written correctly without an owner answ
 10 — and decision 8 for the coloured chapter, whose blocking measurement (Stage 0.1) is now DONE and
 came back clean: `sdk75` and `sdk77` both pass on HEAD, so P2 did not break coloured-ladder
 spendability.
+
+## D43 — The coloured lane ships K=1 per carrier; `sdk29` asserts the refusal (decision 8)
+
+**Decided:** ship K=1-per-carrier. Do not build idempotent coloured conveyance.
+
+This was the one decision that blocked *writing*, and Stage 0.1 is what made it answerable: `sdk75`
+and `sdk77` pass on HEAD, so P2 did not break coloured-ladder spendability and there is no repair
+cycle standing in front of the choice.
+
+**`sdk29` is not a failing test — it is an undecided design question with a test attached.** It
+exercises a coloured multi-payee batch, which needs `convey_child_bundle` to be resumable and the
+split journal to carry `recipient_address`; neither exists. Under this decision it never will, so the
+test is rewritten to assert the refusal by name. A test that pins a refusal is coverage; a test left
+red against an unbuilt feature is a standing invitation to build it by accident.
+
+**What the spec says.** One payee per carrier per payment. Issuers size carriers to the asset value
+they intend to move — the same answer already taken for carrier granularity — and a payment to two
+payees uses two carriers. The limitation is named rather than worked around.
+
+**What this does NOT decide.** The coloured spine and coloured re-anchor stay scoped-but-unbuilt
+(16–21 weeks, `COLOURED-SPINE-REANCHOR-SCOPE.md`). K=1 is a statement about batching, not about the
+ladder.
+
+## D44 — `committed_fee_rate` 2.0 → 3.0, and `BumpCapability` through every lane (decision 5)
+
+**Decided:** raise the committed rate AND wire the bump. Both, and B.5 lands with the census term.
+
+§5.13 contradicted itself four times because the code says one thing (a defence frozen at 2.0 sat/vB,
+with two of three lanes unable to bump) and the design says another. Under the authority order the
+CODE changes.
+
+**The cost is real and is accepted.** `committed_fee_rate` 2.0 → 3.0 moves `min_child_value` from
+1,310 to 1,610 sat, which re-prices every piece in circulation: a piece minted under the old floor
+and now below the new one is not lost, but it can no longer fund its own tiers and must be rescued by
+`combine`. That is the trade for a defence that can still relay when the floor moves.
+
+**The ordering constraint is not advisory.** The live-rate de-trigger MUST ship in the same commit as
+the superseded-de-trigger census term. A failed rescue that leaves the census short bricks
+conveyability, and this repo has hit that silent-degradation shape three times.
+
+## D45 — TRUC slot contention is a PRICE, not a DoS — publish the measurement (decision 10)
+
+**Decided:** publish, no code. B.6 is demoted to an optimisation.
+
+Measured live rather than argued (`a_third_party_can_only_take_the_anchor_slot_by_paying_more`):
+
+| | |
+|---|---|
+| owner's rescue holds the slot | 3.58 sat/vB |
+| an UNDER-paying squat | **refused** — `new feerate 0.00000895 BTC/kvB <= old feerate 0.00003581` |
+| an OVER-paying squat | succeeds at 65.36 sat/vB — the tier's package feerate goes **up**, at the stranger's expense |
+| the owner reclaims | by out-bidding, same mechanism |
+
+The anyone-can-spend anchor is therefore not a griefing vector on confirmation. The half that would
+have been dangerous — downgrading a well-paying rescue to a cheap child, holding a tier under the
+relay floor indefinitely — is forbidden by the replacement rules. What a squatter buys is the right
+to pay the owner's fees; what it costs the owner is a bid. TRUC's 1000-vB child cap bounds the bid.
+
+**Named in the limitations section with these numbers.** B.6 (conflict-aware rescue pricing) saves
+fees in a rare case rather than closing a hole.
+
+## D46 — `deadline_safety_due` covers CARRIERS (decision 4)
+
+**Decided:** extend the pass. Forced action stays `T`, never the flat backup.
+
+A.2's doc pass surfaced that `deadline_safety_due` excludes carriers on BOTH routes, so an RGB
+carrier's `min(L_k)` rested on `auto_exit_due` alone — and the carrier lane is where the loss is an
+ASSET rather than sats.
+
+`sdk86` measured today that the calendar this protects is real: the flat backup chain's absolute
+locktime is finite, mining moves the tip toward it, and each whole-coin hop spends `interval` of it
+(100 hops on either preset). INV-27's "idle coins never age" is true of the CSV side only.
+
+Nothing surfaces that calendar to a user today, which is why the automatic pass — not an API field —
+is the answer for the lane that can lose an asset.
