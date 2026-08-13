@@ -1432,6 +1432,11 @@ than 2×.
 new output — a pin updated by reading what the code now says agrees with any bug. The arithmetic is
 coherent across all 21, which is itself evidence the change is right rather than papered over.
 
+**CONFIRMED by the owner, 2026-08-13, with the +30% in front of them:** accept it, keep the 2×
+head-room. The head-room is a safety property and trading it for a stable number would re-open the
+"unclaimable by construction" trap the piece constant was derived to escape — a piece that meets a
+drifted rate but can no longer carry its own root ladder. The probe's values are the shipping values.
+
 **Still owed before it lands:** the `BumpCapability` wiring (B.5), the superseded-de-trigger census
 term in the SAME commit, and a full live E2E run — the E2Es fund carriers from `TOKEN_CARRIER_SATS`.
 

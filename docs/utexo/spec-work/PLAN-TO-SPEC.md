@@ -108,8 +108,8 @@ they land.
 | B.2 | ~~`deny_unknown_fields`; absence is a typed refusal~~ | ✅ **landed** — `protocol_version` required (its default SELECTED a lane), unknown fields refused |
 | B.3 | ~~Exact-set `protocol_version` dispatch; delete the v3 arm~~ | ✅ **landed** |
 | B.4 | ~~Pin the wire error codes; fix the Kotlin bindings~~ | ✅ **landed** — all three variants pinned, and `TransferCancelledError` added to both Kotlin trees |
-| B.5 | Wire `BumpCapability` through the child/spine lanes and the de-trigger | **BLOCKED on decision 5.** Its recommendation includes `committed_fee_rate` 2.0 → 3.0, which re-prices every floor and every piece in circulation — an owner call with real user impact, not a mechanical port. |
-| B.6 | Conflict-aware rescue pricing; stop greedily broadcasting the successor | **BLOCKED on decision 10.** |
+| B.5 | Wire `BumpCapability` through the child/spine lanes and the de-trigger | **UNBLOCKED (D44), priced, not yet landed.** The rate raise was applied as a probe and every floor measured (table in D44); the owner then confirmed the +30% on `TOKEN_PIECE_SATS`/`TOKEN_CARRIER_SATS` that the decision sheet had missed. Patch kept at `scratchpad/D44-rate-raise.patch`. Lands as ONE commit with the wiring and the superseded-de-trigger census term, then a full live suite run. |
+| B.6 | Conflict-aware rescue pricing; stop greedily broadcasting the successor | **UNBLOCKED and DEMOTED (D45).** The anchor slot is an auction, measured: it cannot be downgraded and the owner always reclaims by out-bidding. B.6 saves fees in a rare case rather than closing a hole. |
 | B.7 | ~~Claim-path ordering: validate before counting~~ | ✅ **landed** |
 | B.8 | ~~Head anchor on `validate_backup_chain_v2`~~ | **NOT BUILDABLE as specified — see D41.** `h_deposit` is the tip when the backup was built, which precedes `tx0`'s confirmation, so a receiver can derive only an UPPER bound and truncation moves the value DOWN. Needs `h_deposit` in the `utexo/sig_count/v2` attestation. `k` stays unpublished. |
 
