@@ -630,8 +630,8 @@ claim-time validation DoS pricing.
 > **[D7/D25] The "hard depth cap of 8" that used to be specified here NEVER EXISTED IN CODE, and has
 > been deleted rather than implemented.** The real cap is *derived*, not a literal:
 > `max_split_depth(base, per_level, epoch_blocks) = 1 + (epoch − base_wait)/level_wait`
-> (`lib/src/transfer/receiver.rs:768-779`), enforced by `enforce_split_depth_cap_shaped`
-> (`clients/libs/rust/src/tesr.rs:5210`). It therefore MOVES WITH THE NETWORK PROFILE, which is the
+> (`max_split_depth`, `lib/src/transfer/receiver.rs`), enforced by
+> `enforce_split_depth_cap_shaped` (`clients/libs/rust/src/tesr.rs`). It therefore MOVES WITH THE NETWORK PROFILE, which is the
 > whole point — and is why the profile itself is now explicit per network rather than falling through
 > to a toy schedule. Publishing a fixed 8 would have contradicted the code on every profile at once.
 

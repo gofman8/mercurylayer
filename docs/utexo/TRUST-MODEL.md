@@ -233,7 +233,7 @@ verify it out-of-band, the relay is not a trust anchor.
   sub-coin exits by its pre-signed branch + backup — so freeze ≠ seize; worst case your coin becomes an
   on-chain exit ticket with a bounded wait. One true boundary: the **onboarding window** — the
   first backup (tx1) is co-signed only when the SE first *sees* the funding tx
-  (`coin_status.rs:75-79`), so the window runs from funding broadcast until that co-sign; an SE
+  (`check_deposit`, `coin_status.rs`), so the window runs from funding broadcast until that co-sign; an SE
   that dies inside it strands the funding in the 2-of-2. Fund only after deposit init succeeds,
   and treat a missing first backup/`DepositConfirmed` as a reason to stop funding further coins
   (deep-dive §5.2).
@@ -484,7 +484,7 @@ fail second — and worth naming because they show where the ordering hazard act
   so `withdraw` routes it to the unilateral exit and marks it `WITHDRAWING`. Such a coin has
   neither a withdrawal tx nor a withdrawal address — its progress is the pre-signed chain, not one
   txid — and treating that as an error made **every** subsequent status poll fail for the life of
-  the coin (`coin_status.rs:154-164`).
+  the coin (`check_withdrawal`, `coin_status.rs`).
 
 Everything not in this table is **verified** — by the receiver's checks (§2), the SE's public
 state (§3), client-side RGB validation (§6), or an E2E named above. If you find a trust

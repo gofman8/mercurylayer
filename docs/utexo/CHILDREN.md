@@ -15,11 +15,11 @@ not an exit-only claim that must be materialized on-chain to re-spend.
   transferable; ARK-SPARK-PARITY.md specifies the off-chain transfer IS the SE key-handover.
 - **SE handover + budget-reopen (rejected, 2 reviews):** trying to terminalize the child then RE-OPEN its
   budget for the receiver is unsound: (a) it fights the **monotonic-budget INV-19 clamp**
-  (`server/src/database/deposit.rs:236-238` — "a budget may only tighten, never loosen … re-open the node
+  (`set_sig_budget`, `server/src/database/deposit.rs` — "a budget may only tighten, never loosen … re-open the node
   for a second, conflicting spend / INV-19 fork"); any reopen is a raw UPDATE resurrecting the fork class
   the clamp prevents. (b) The sender stays the child's owner until the receiver completes, so it can
   re-address the pending-transfer row to an attacker key AFTER the victim accepted (`insert_new_transfer`
-  deletes by `statechain_id` only, `server/src/database/transfer_sender.rs:62`), re-arm, self-complete,
+  deletes by `statechain_id` only, `server/src/database/transfer_sender.rs`), re-arm, self-complete,
   and reopen-to-self → double-spend the child. Binding the reopen to the pending recipient does NOT close
   this (the sender controls that recipient value for the whole window). **Do not build the reopen.**
 

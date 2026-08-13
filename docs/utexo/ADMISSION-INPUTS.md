@@ -1,10 +1,17 @@
 # Admission-gate inputs and their provenance
+> **Citations here are by SYMBOL, deliberately.** Every one of the six line numbers this file
+> originally carried had rotted: at the time of the Stage-0.3 sweep (2026-08-13) the five citations
+> into `tesr.rs` (lines 3288, 3233, 3232, 3220, 3031) all resolved into `cosign_colored_renewal` and
+> `cosign_colored_receiver_state` — functions with no relationship to anything claimed below — and
+> the one into `receiver.rs` (line 684) landed in
+> `verify_if_locktime_is_reasonable_tx_version_and_output_size`. A
+> citation that silently points somewhere else is worse than none: it reads as verified.
 
 > **Status:** normative. Describes what is built, at `feat/spark`.
 
 The exit-headroom gate (`check_exit_headroom`, `lib/src/transfer/receiver.rs`) is the check that
 refuses a conveyed child whose pre-signed exit provably cannot finish before the funding epoch
-expires. It is called once, from `verify_conveyed_child` (`clients/libs/rust/src/tesr.rs:3288`).
+expires. It is called once, from `verify_conveyed_child` (`clients/libs/rust/src/tesr.rs`).
 
 This file exists because the same defect shape has now appeared **three times** — a gate computing
 its own admission requirement from a number the sender chose:
@@ -34,10 +41,10 @@ Three terms, plus the chain's length. Each one below.
 ## 1. `csvs` — the per-tier relative timelocks
 
 **Receiver-derived, from signatures.** `child_exit_chain_bound`
-(`clients/libs/rust/src/tesr.rs:3031`) parses every transaction in the chain and reads its timelock
+(`clients/libs/rust/src/tesr.rs`) parses every transaction in the chain and reads its timelock
 from the signed `nSequence` under BIP-68 — the only copy of that number Bitcoin will ever enforce.
 
-`bind_declared_csv` (`lib/src/transfer/receiver.rs:684`) then compares the signed value against the
+`bind_declared_csv` (`lib/src/transfer/receiver.rs`) then compares the signed value against the
 bundle's declared `TesrTier::csv` and returns `DeclaredCsvMismatch` when they differ, naming the
 tier, both values, and which one is authoritative. The refusal is deliberate rather than a silent
 preference for the signed value: a bundle whose two copies disagree is either forged or corrupt, and
@@ -61,8 +68,8 @@ broadcasts signed transactions, so binding there would only refuse an owner thei
 
 ## 2. `tip` — the chain tip
 
-**Receiver-derived.** `cc.electrum_client.block_headers_subscribe_raw()`
-(`clients/libs/rust/src/tesr.rs:3233`), the receiver's own chain backend. A read failure propagates;
+**Receiver-derived.** `cc.electrum_client.block_headers_subscribe_raw()`, called inside
+`verify_conveyed_child` (`clients/libs/rust/src/tesr.rs`) — the receiver's own chain backend. A read failure propagates;
 it is never defaulted to 0, which would make every epoch look infinitely long.
 
 ## 3. `epoch_expiry_height` — the absolute clock
@@ -76,8 +83,8 @@ The chain arrives inside the bundle (`cb.parent_flat_backups`). Four independent
 resulting number usable:
 
 1. **Every entry is signature-verified under `F`'s key** and its prevout is pinned to
-   `(F.txid, F.vout)` — checked explicitly at `tesr.rs:3220`, because `verify_transaction_signature`
-   alone would accept a backup naming a foreign txid.
+   `(F.txid, F.vout)` — checked explicitly inside `validate_backup_chain_v2`, because
+   `verify_transaction_signature` alone would accept a backup naming a foreign txid.
 2. **`F` itself is fetched from chain by the receiver**, not taken from the bundle.
 3. **INV-5 strict decrement** (`validate_backup_chain_v2`) rejects duplicate padding and chain
    inversion alike.
@@ -86,8 +93,8 @@ resulting number usable:
 
 ### The two operator-supplied bounds, named honestly
 
-`initlock` and `interval` come from `info_config(cc)` — the **operator**, not the receiver
-(`tesr.rs:3232`). They bound the locktime validation: `initlock` caps any entry at
+`initlock` and `interval` come from `info_config(cc)` (`clients/libs/rust/src/utils.rs`) — the
+**operator**, not the receiver. They bound the locktime validation: `initlock` caps any entry at
 `tip + lockheight_init`.
 
 They are not a bypass, and the direction is worth stating rather than asserting. An inflated
