@@ -42,8 +42,10 @@ ladder (§2.6) for every fresh confirmed **root** coin, unconditionally. The
 `deposit_protocol_version` field and the `UTEXO_PROTOCOL_DEFAULT` escape hatch that could opt a
 deposit back into the flat pre-TES-R shape are DELETED. Two coin SHAPES coexist, both current:
 
-- **Laddered** — every plain deposit. Its exit is the relative-CSV tier chain (§9.2); it has no
-  calendar deadline and costs 0 vB of idle rent (INV-27).
+- **Laddered** — every plain deposit. Its exit is the relative-CSV tier chain (§9.2), which costs
+  0 vB of idle rent and never matures while idle (INV-27). It is NOT deadline-free: the flat backup
+  chain is retained, so the coin keeps an absolute-locktime calendar which each whole-coin hop
+  shortens by `interval` [D36]. See INV-27 for the exact scope.
 - **Un-laddered** — an RGB **carrier**, which must NEVER be laddered (a plain tier spend would
   destroy the allocation — terminal-freeze, INV-29), and a split sub-coin whose funding is
   un-broadcast and therefore cannot root a trigger [B0]. These keep the signed-once backup chain
@@ -141,7 +143,8 @@ For a **laddered** coin the backup chain is still built, conveyed and structural
 every transfer — its COUNT is a term in the receiver's census (REQ-38) and INV-5 is the only defence
 against a sender inverting the ladder or padding it with duplicates — but it is not the exit path:
 `unilateral_exit` walks the tier chain and broadcasts NO absolute-locktime backup (`sdk50`), and the
-coin's lifetime is not calendar-bounded (INV-27).
+coin's exit is not calendar-bounded — but the retained chain's own locktime still is, and that is
+what bounds how long the coin may sit un-re-anchored (INV-27, `sdk86`).
 
 ### 2.5 Ancestor record
 For each sub-coin, its structural ancestors (the split/combine parents) are stored under
@@ -161,10 +164,26 @@ modelled a 64-byte `SIGHASH_DEFAULT` witness, and TES-R signs `SIGHASH_ALL`, so 
 the explicit 65th byte [D4]) so it relays standalone, and a 240-sat P2A anchor for live-rate
 fee-bumping.
 
-**INV-27 (idle coins never age)** No tier is on-chain, and a BIP-112 relative lock does not tick
-until its parent confirms, so nothing anywhere matures until someone broadcasts `T`. An idle
-laddered coin — and an idle split DAG — therefore has no calendar deadline and costs 0 vB of rent.
-Verified by `sdk30` (a) (300 blocks mined, exit chain byte-identical, `F` unspent) and `sdk40`.
+**INV-27 (idle coins never age — ON THE CSV SIDE)** No tier is on-chain, and a BIP-112 relative
+lock does not tick until its parent confirms, so no tier anywhere matures until someone broadcasts
+`T`. An idle laddered coin — and an idle split DAG — therefore costs **0 vB of rent** and its exit
+chain is unchanged by the passage of time.
+
+**This is a statement about the tiers, not about the coin** [D36]. A laddered coin also retains its
+flat backup chain, whose locktimes are ABSOLUTE, and that chain is what sets the real maintenance
+cadence. The coin therefore has a finite calendar deadline `L`, consumed from two directions:
+
+| | mainnet | regtest |
+|---|---|---|
+| `L` at deposit | tip + `initlock` = tip + 10 000 | tip + 1 000 |
+| cost per whole-coin hop (`interval`, INV-5) | 100 | 10 |
+| whole-coin hops the ladder affords | 100 | 100 |
+
+Verified by **`sdk86`**, which measures BOTH clocks on the same coin across two hops: after 300 idle
+blocks the received coin's exit chain is byte-identical and `F` unspent (the CSV half), while the
+same coin has lost 300 blocks of calendar and each hop cost exactly `interval` more (the flat half).
+`sdk30` (a) and `sdk40` verify the CSV half only — `sdk30` (a) idles a k=0 deposit, which is
+structurally unable to witness the hop cost.
 **INV-28 (lower CSV wins)** Every transfer and every renewal co-signs a state (extension) at a
 strictly LOWER CSV than the one it supersedes, so the current owner's tier matures first and each
 superseded tier's parent becomes unconfirmable — invalidation at the CONSENSUS level. There is no
@@ -604,15 +623,21 @@ fee children in a spike) and a sequential `E_m + Δ_k` CSV wait; each split leve
 (293 vB — an `SP` with two payload outputs, plus an extension) and ONE extension CSV, because the
 `SP` itself is a spine tier at CSV 0 and waits only for its parent to confirm
 (`config::tesr_exit_vbytes` / `tesr_exit_wait_blocks`, PROTOCOL.md §5.9).
-A laddered coin has no calendar deadline at all (INV-27), so `exit_deadline_block` is `None` for it.
+`exit_deadline_block` is `None` for a laddered coin: it reports the height at which an ANCESTOR
+could race an off-chain sub-coin, and a laddered root has no such ancestor. It is **not** a claim
+that the coin has no calendar at all — the retained flat chain's locktime is a real deadline
+(INV-27, `sdk86`) and no client surfaces it [D36 T-4].
 
 ### 9.4 Refresh (cooperative on-chain re-anchor)
 `refresh(id, fee_rate?)` / `refresh_sponsored(id, sponsor, fee_rate?)`: one SE-co-signed single-input
 spend of the coin's current 2-of-2 outpoint into a FRESH deposit aggregate (a new `statechain_id`,
 same owner; a sub-coin's exit branch is materialized first).
 
-Refresh is **no longer a deadline reset** — a laddered coin has no calendar deadline to reset
-(INV-27). It is the **re-anchor primitive**: the escape hatch that moves a coin out of its current
+Refresh is **no longer a deadline reset for the EXIT** — a laddered coin's exit is the CSV tier
+chain, which never matures while idle (INV-27). It does still reset the coin's flat calendar, by
+minting a fresh chain at `tip + initlock`, which is what makes it the answer for a coin that has
+spent most of its hop budget [D36]. It is the **re-anchor primitive**: the escape hatch that moves a
+coin out of its current
 ladder/branch and permanently kills every exit right rooted at the old outpoint. For an un-laddered
 coin it is still the way to escape the backup-ladder floor without going to L1 (§2.4).
 
@@ -693,9 +718,10 @@ independent tower over the same bundle is harmlessly idempotent), `sdk51` (the i
 > - **Laddered**: relative-CSV replacement — a lower-CSV tier out-races and orphans the one it
 >   supersedes (INV-28), disclosed to the receiver and checked by the census (REQ-38). The
 >   normative treatment is [PROTOCOL.md](PROTOCOL.md) §5.5/§5.7/§5.11. There is no ladder
->   formula, no calendar deadline and no re-anchor rent on this shape (INV-27), so the
->   deposit-anchored deadline arithmetic (including the audit-[17] `k·interval` gap) does not
->   apply to it.
+>   formula and no re-anchor rent on this shape (INV-27), so the deposit-anchored deadline
+>   arithmetic does not govern its EXIT. The retained flat chain still carries an absolute
+>   calendar, and the audit-[17] `k·interval` gap still applies to that chain — `sdk86` measures
+>   the per-hop cost directly.
 > - **Un-laddered**: the absolute-locktime decrementing ladder — the mechanism specified in
 >   [INVALIDATION-SPEC.md](INVALIDATION-SPEC.md) (IVL-REQ/IVL-INV/IVL-ERR numbering), which
 >   remains authoritative FOR THAT SHAPE where it overlaps with the summary below.
@@ -850,7 +876,7 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | REQ-36, ERR-14 (pending-transfer lock) | `sdk49`/`sdk41`/`sdk01` + `sdk58`/`sdk59` (green with the lock live — i.e. the sender pre-sign re-ordering is correct and no honest flow is blocked); `sdk60` (a child conveyed under the lock is claimed and re-transferred). **Gap:** no test drives the adversarial refusal itself (a sender co-signing a rival, or re-addressing, inside the open window) |
 | REQ-37 (ladder establishment) | `sdk48` (auto-established, seed-derived payee, idempotent), `sdk52` (carrier excluded) |
 | REQ-38, ERR-15 (census) | `sdk46` (count formula vs the real SE), `sdk47` (ladder carried across a transfer), `sdk54`/`sdk55` (padding/spoof REJECT), `sdk58` (11 child-bundle attacks REJECT), `sdk56` (retry does not advance the count) |
-| INV-27 (idle coins never age), INV-28 (lower CSV wins) | `sdk30` (a) (300 blocks, chain byte-identical, `F` unspent), `sdk40` PART 2/PART 3, `sdk41`, `sdk51` |
+| INV-27 (idle coins never age — CSV side; the flat calendar does), INV-28 (lower CSV wins) | **`sdk86`** (both clocks on a RECEIVED coin over 2 hops: chain byte-identical + `F` unspent, while `L` loses 300 blocks to mining and `interval` per hop), `sdk30` (a) (CSV half only, k=0 deposit), `sdk40` PART 2/PART 3, `sdk41`, `sdk51` |
 | Off-chain renewal + rollover (§2.6) | `sdk42` (renew → persist → reload), `sdk43` (rollover to a fresh level, then exit the deep chain), `sdk44` (the whole cadence driven from the canonical `TesrParams` schedule via `establish_auto`/`renew_auto`/`rollover_auto`) |
 | REQ-10, ERR-4 | `sdk19` (never paid → preimage withheld, receiver cannot claim), `sdk25` (a receiver who delays past the latch window loses the ability to claim), `sdk64`/`sdk67` (the release path) |
 | REQ-11, REQ-12, ERR-5, REQ-23, INV-14 | `sdk63` (exact pay + SSP pre-pay census), `sdk65` (non-exact pay via a latched in-ladder piece), `unit::ssp::swap_tests::preimage_matches_hash` |

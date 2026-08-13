@@ -20,8 +20,8 @@ unfinished.
 | — remaining, after consolidating 14 rows into 10 decisions | **6** |
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **11 landed** (all six Tier A + B.1, B.2, B.3, B.4, B.7). B.8 is **proven not buildable as specified** (D41). **B.5 and B.6 are gated on decisions 5 and 10, which are not taken.** |
-| Live E2E suite | **complete: 81/85**, and on a HEAD binary SDK80 + RGB8 also pass → **83/85 equivalent**. Two remain: SDK22 (coin selection, item below) and SDK29 (blocked on decision 8) |
-| Unit + guard suite | green — **711 tests, 0 failures** |
+| Live E2E suite | **84/86.** SDK22 is FIXED (12 breaches → 0) and `sdk86` is new and green. One remains: SDK29 (blocked on decision 8) |
+| Unit + guard suite | green — **741 tests, 0 failures** |
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature
@@ -109,10 +109,24 @@ they land.
 
 ## Stage 3 — Verification before any completeness claim
 
-- The three negative tests that **do not exist today**: a malicious coordinator on the terminality path; a fee-stuck tier driven through a *pass* rather than the builder directly; a third-party anchor squat.
-- The zero-CSV successor test **on regtest**, where `d_floor >= δ` clears with *zero slack* (6 ≥ 6) while mainnet clears at 144 ≥ 36. A mainnet-only test is the exact trap D14's own preset census was written to flag.
-- The **carrier variant** of every deadline and allocation test. The coloured lane is where three separate bounds turned out to be sat-denominated descriptions of a victim who loses an asset.
-- Replace `sdk30(a)` as INV-27's evidence.
+- ✅ **DONE — a malicious coordinator on the terminality path.** `attested_terminal` split into
+  `terminal_from_attested` + `cross_check_terminality` so the decision is reachable without a
+  network; four tests drive the omitted budget (all three unanswered shapes), the `num_sigs >=
+  budget` boundary, and disagreement refused in BOTH directions — including the one where the
+  coordinator is the more conservative of the two.
+- The two remaining negative tests: a fee-stuck tier driven through a *pass* rather than the builder
+  directly; a third-party anchor squat.
+- ✅ **DONE — the zero-slack successor test on regtest.** The margin comparison is now
+  `clears_supersession_margin`, and three tests pin the boundary: regtest clears by **exactly zero**
+  (cap `d_floor` 6 = `SP` 0 + δ 6) while mainnet clears by 108, so every off-by-one here is invisible
+  on mainnet and refuses every honest bundle on regtest.
+- The **carrier variant** of every deadline and allocation test. The coloured lane is where three
+  separate bounds turned out to be sat-denominated descriptions of a victim who loses an asset.
+- ✅ **DONE — `sdk30(a)` replaced as INV-27's evidence by `sdk86`.** `sdk30(a)` idles a k=0 deposit
+  and can only witness the CSV half. `sdk86` reads BOTH clocks on the same coin across two whole-coin
+  hops and measures what D36 said was unpublished: `L0 1389 -> L1 1379 -> L2 1369`, exactly
+  `interval` per hop, while 300 idle blocks leave the exit chain byte-identical and take 300 blocks
+  of calendar. SPEC.md's five INV-27 statements now carry that scope.
 - ✅ **DONE** — a CI guard that no client reads `num_sigs` except through the attested reader. The property was a convention; A.1 (terminality derived from the attested budget) is what made losing it reintroduce the D8 hole one field over.
 
 ---

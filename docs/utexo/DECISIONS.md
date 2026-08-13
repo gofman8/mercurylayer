@@ -835,7 +835,16 @@ units. 5 unit tests + `ci-guards/tests/deny_colored_backup_on_a_colored_ladder.r
 
 The real on-chain maintenance cadence is set by the **flat ladder**, not by the CSV hop budget, and
 **INV-27 is false for every RECEIVED laddered coin** — the absolute flat-backup ladder is retained
-under TES-R. The advertised footprint economics omits the binding constraint, and T-4 adds that the
+under TES-R.
+
+**MEASURED, 2026-08-13 (`sdk86`).** Both clocks, on one coin, across two whole-coin hops:
+`L0 = 1389` at deposit (tip 389 + `initlock` 1000), `L1 = 1379` after one hop, `L2 = 1369` after
+two — exactly `interval` per hop, with no block mined for the hop itself. Meanwhile 300 idle blocks
+left the received coin's exit chain byte-identical with `F` unspent, and took 300 blocks of its
+calendar. So the regtest shape affords **100 whole-coin hops** before the calendar is gone (mainnet
+likewise: 10 000 / 100). SPEC.md's five INV-27 statements now carry this scope, and the invariant's
+evidence pin moved from `sdk30` (a) — which idles a **k=0 deposit** and structurally cannot witness
+the hop cost — to `sdk86`. The advertised footprint economics omits the binding constraint, and T-4 adds that the
 split window is consumed 100 blocks per whole-coin hop as well as one per block, is unpublished, and
 is invisible to every client.
 

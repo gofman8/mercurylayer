@@ -99,6 +99,7 @@ pub mod sdk82_exit_headroom_gate;
 pub mod sdk83_leaf_combine;
 pub mod sdk84_leaf_renewal;
 pub mod sdk85_transfer_cancel;
+pub mod sdk86_received_coin_ages;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -509,6 +510,14 @@ async fn main() -> Result<()> {
     // lands with carol — exactly one of them is paid.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("85") {
         sdk85_transfer_cancel::execute().await?;
+        return Ok(());
+    }
+
+    // [D36 / Stage 3] INV-27's real scope: the CSV clock does not tick, the CALENDAR one does, and a
+    // whole-coin hop spends `interval` of it. Replaces `sdk30` (a) as the invariant's evidence —
+    // that one idles a k=0 deposit and structurally cannot witness the case where INV-27 is false.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("86") {
+        sdk86_received_coin_ages::execute().await?;
         return Ok(());
     }
 
