@@ -7539,13 +7539,25 @@ pub async fn verify_conveyed_child(
 
     let exit_csvs: Vec<Option<u16>> =
         child_exit_chain_bound(cb)?.into_iter().map(|(_, csv)| csv).collect();
-    mercurylib::transfer::receiver::check_exit_headroom(&exit_csvs, tip, epoch_expiry_height)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "conveyed child refused at depth {}: {e}",
-                cb.ancestors.len() + 1
-            )
-        })?;
+    // **[D40.3] WITH the minimum-slack margin.** The bare check admits at `slack == 0`, i.e. a coin
+    // whose exit is feasible only if all 3-23 of its transactions confirm in the very next block —
+    // and the SENDER picks that slack by picking when to convey. The margin is derived from the walk
+    // itself (`exit_slack_margin`), so nothing exogenous enters the admission decision.
+    mercurylib::transfer::receiver::check_exit_headroom_with_margin(
+        &exit_csvs,
+        tip,
+        epoch_expiry_height,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "conveyed child refused at depth {}: {e}. The requirement includes a minimum-slack \
+             margin of {} blocks: the walk's own wait is the theoretical minimum (one block per \
+             tier), not a budget, and admitting at zero slack would hand over a coin with no \
+             tolerance for a single slow confirmation. Re-anchor the parent and convey again.",
+            cb.ancestors.len() + 1,
+            mercurylib::transfer::receiver::exit_slack_margin(&exit_csvs)
+        )
+    })?;
 
     // (see `attested_terminal` — terminality is derived from the enclave's signature, not asked of
     // the coordinator)

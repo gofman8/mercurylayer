@@ -878,6 +878,67 @@ pub fn check_exit_headroom(
     Ok(available - required)
 }
 
+/// **[D40.3] The minimum slack a conveyed exit walk must be admitted with.**
+///
+/// [`check_exit_headroom`] admits at `slack == 0`, and a test pins that case. But the slack it
+/// returns is the piece's **entire tolerance** for confirmation variance, fee stall and reorg across
+/// the whole walk — `exit_wait_blocks` charges each tier exactly one block for its parent's
+/// confirmation, which its own doc calls *"the theoretical minimum, not a budget"*. Admitting at zero
+/// means admitting a coin whose exit is feasible only if every one of up to 23 transactions confirms
+/// in the very next block, forever.
+///
+/// Worse, **the sender chooses the slack**, by choosing when to convey. Conveying late in the epoch
+/// is free for them and spends the payee's entire margin.
+///
+/// # Why a fraction of the walk, and not a constant
+///
+/// The margin has to scale with what it protects: a depth-1 walk is 3 transactions and a depth-10
+/// walk is 23, so a flat number is either meaningless at the top or prohibitive at the bottom. And
+/// it must be derived from terms the RECEIVER already holds. That is the whole reason this shape was
+/// chosen over a stress fee rate — a `stress_fee_rate` would add a number nobody can derive to the
+/// trust base, and at stress = 20 / depth 10 it puts the minimum admissible piece above 125,000 sat,
+/// which kills the payment range it was meant to protect.
+///
+/// So: **one quarter of the walk's own required wait, and never less than one tier's worth.** Both
+/// terms come from `csvs`, which the receiver derived from the conveyed chain and bound against its
+/// own preset. Nothing exogenous enters.
+///
+/// The cost is a liveness cost — a late-in-epoch conveyance is refused and the sender must re-anchor
+/// first — and it falls in the direction `ADMISSION-INPUTS.md` already names as the safe one.
+pub fn exit_slack_margin(csvs: &[Option<u16>]) -> u32 {
+    let required = exit_wait_blocks(csvs);
+    let per_tier = if csvs.is_empty() { 0 } else { required / csvs.len() as u32 };
+    (required / 4).max(per_tier)
+}
+
+/// [`check_exit_headroom`] with the [`exit_slack_margin`] applied — **the admission gate**.
+///
+/// Returns the slack REMAINING above the margin, so a caller that wants to report headroom still
+/// gets a number rather than a boolean. The error is the same `ExitHeadroomShortfall`, with
+/// `required` raised to include the margin, so an existing caller's message stays truthful about
+/// what was needed.
+pub fn check_exit_headroom_with_margin(
+    csvs: &[Option<u16>],
+    tip: u32,
+    epoch_expiry_height: u32,
+) -> Result<u32, ExitHeadroomShortfall> {
+    let margin = exit_slack_margin(csvs);
+    let required = exit_wait_blocks(csvs) + margin;
+    let available = epoch_expiry_height.saturating_sub(tip);
+    if available < required {
+        return Err(ExitHeadroomShortfall {
+            tip,
+            epoch_expiry_height,
+            available,
+            required,
+            shortfall: required - available,
+            tiers: csvs.len() as u32,
+            csv_total: exit_csv_total(csvs),
+        });
+    }
+    Ok(available - required)
+}
+
 /// **[P0-2] THE DEPTH CAP**, derived rather than written down.
 ///
 /// `base` is the exit chain of a depth-1 child (`T`, `X_m`, `SP`, `ext_child`, `state_child`) and
@@ -1379,6 +1440,60 @@ mod transfer_signature_tests {
         assert_eq!(super::exit_wait_blocks(&declared), 9);
         assert!(super::check_exit_headroom(&declared, 100_000, 100_010).is_ok());
         assert!(super::check_exit_headroom(&mainnet_chain(1), 100_000, 100_010).is_err());
+    }
+
+    /// **[D40.3] The minimum-slack margin, and the case it exists to refuse.**
+    ///
+    /// The bare gate admits at `slack == 0` — a coin whose exit is feasible only if every one of its
+    /// transactions confirms in the very next block, across a walk of up to 23 of them. And the
+    /// SENDER picks that slack, by picking when to convey.
+    #[test]
+    fn the_slack_margin_refuses_a_zero_tolerance_conveyance() {
+        let chain = mainnet_chain(1);
+        let required = super::exit_wait_blocks(&chain);
+        let margin = super::exit_slack_margin(&chain);
+
+        // Derived from the walk, never a constant: a quarter of its own wait, floored at one tier's.
+        assert_eq!(margin, required / 4, "the margin is a quarter of the walk's own required wait");
+        assert!(margin > 0, "a walk with a real wait must carry a real margin");
+
+        // THE CASE. The bare gate admits exactly at the boundary — that is the defect, and it is
+        // pinned by the test below this one, so the two must disagree here or the margin does nothing.
+        assert_eq!(super::check_exit_headroom(&chain, 100_000, 100_000 + required), Ok(0));
+        assert!(
+            super::check_exit_headroom_with_margin(&chain, 100_000, 100_000 + required).is_err(),
+            "a zero-slack conveyance must now be REFUSED — this is the whole point of D40.3"
+        );
+
+        // …and the refusal states what was actually needed, margin included, so the message stays
+        // truthful rather than reporting the bare wait and looking like an off-by-one.
+        let err = super::check_exit_headroom_with_margin(&chain, 100_000, 100_000 + required)
+            .expect_err("refused");
+        assert_eq!(err.required, required + margin);
+        assert_eq!(err.shortfall, margin);
+
+        // Exactly at the raised bar: admitted. Never over-refuse.
+        assert_eq!(
+            super::check_exit_headroom_with_margin(&chain, 100_000, 100_000 + required + margin),
+            Ok(0)
+        );
+        // A fresh epoch is unaffected — the margin costs a late conveyance, not an ordinary one.
+        assert!(
+            super::check_exit_headroom_with_margin(&chain, 100_000, 100_000 + 10_000).is_ok(),
+            "a full mainnet epoch must still admit a depth-1 child"
+        );
+    }
+
+    /// The margin scales with the walk, which is why it is a fraction rather than a constant: a
+    /// depth-1 walk is 3 transactions and a depth-10 walk is 23. A flat number is either meaningless
+    /// at the top or prohibitive at the bottom.
+    #[test]
+    fn the_slack_margin_scales_with_depth() {
+        let d1 = super::exit_slack_margin(&mainnet_chain(1));
+        let d3 = super::exit_slack_margin(&mainnet_chain(3));
+        assert!(d3 > d1, "a deeper walk must carry a larger margin ({d1} vs {d3})");
+        // Degenerate input must not panic or divide by zero.
+        assert_eq!(super::exit_slack_margin(&[]), 0);
     }
 
     #[test]
