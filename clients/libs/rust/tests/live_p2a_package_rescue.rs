@@ -391,3 +391,267 @@ fn the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_lim
     );
     let _ = tier_raw;
 }
+
+
+
+/// **[Stage 3] THE THIRD-PARTY ANCHOR SQUAT — measured, and it is not what I expected.**
+///
+/// The P2A anchor is `OP_1 <0x4e73>`: **anyone** may spend it. That is the design — a keyless
+/// watchtower, a friend, or a paid service can rescue a stuck tier without holding a key. It is also
+/// the obvious attack surface, because a v3 (TRUC) parent may have at most **ONE** unconfirmed
+/// child. A stranger who takes that slot does not steal anything; the question is whether they can
+/// stop the owner using it.
+///
+/// # I wrote this test expecting a window, and the node disagreed
+///
+/// The first version asserted that a tier entering the mempool ATOMICALLY with its own rescue child
+/// has no squat window — the parent is never public and childless, so nobody can get between them.
+/// That assertion FAILED on the live node: the stranger's child went straight in.
+///
+/// It went in **by replacing the owner's child**, paying more. And that is the whole finding, because
+/// it means the slot is not a race to arrive — it is an auction, governed by the replacement rules:
+///
+/// * a stranger can only take the slot by paying **more** than what is there, so every successful
+///   squat RAISES the package feerate. An attacker's best effort makes the tier *more* likely to
+///   confirm, at their own expense;
+/// * a squat that pays LESS is simply refused, so the slot cannot be downgraded;
+/// * and the owner reclaims it the same way anyone else would — by out-bidding.
+///
+/// **So the anyone-can-spend anchor is not a griefing vector on confirmation.** What a stranger buys
+/// is the right to pay the owner's fees. The residual cost is that the owner may have to bid against
+/// them, which is a price and not a loss — and TRUC's 1000-vB child cap is what keeps that price
+/// bounded rather than letting a squatter pin with bulk.
+#[test]
+fn a_third_party_can_only_take_the_anchor_slot_by_paying_more() {
+    let Some(cfg) = cfg() else {
+        eprintln!(
+            "SKIP anchor-squat: CORE_RPC_URL is unset, so NOTHING was verified. This is the Stage-3 \
+             negative test for third-party anchor contention; a green run without a node proves \
+             nothing. Set CORE_RPC_URL/USER/PASS to run it."
+        );
+        return;
+    };
+
+    let secp = Secp256k1::new();
+    let owner_sk = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+    let owner = KeyPair::from_secret_key(&secp, &owner_sk);
+    let (owner_x, _) = XOnlyPublicKey::from_keypair(&owner);
+    let owner_addr = Address::p2tr(&secp, owner_x, None, Network::Regtest);
+    let owner_spk = owner_addr.script_pubkey();
+
+    // A genuinely separate third party: their own key, their own coins, no relationship to the tier.
+    let squatter_sk = SecretKey::from_slice(&[0x99u8; 32]).unwrap();
+    let squatter = KeyPair::from_secret_key(&secp, &squatter_sk);
+    let (squatter_x, _) = XOnlyPublicKey::from_keypair(&squatter);
+    let squatter_addr = Address::p2tr(&secp, squatter_x, None, Network::Regtest);
+    let squatter_spk = squatter_addr.script_pubkey();
+
+    let info = rpc(&cfg, "getmempoolinfo", serde_json::json!([]));
+    let floor = info["minrelaytxfee"].as_f64().expect("minrelaytxfee") * 100_000_000.0 / 1000.0;
+
+    let tier_in = 100_000u64;
+    let (p_txid, p_vout) = fund(&cfg, &owner_addr.to_string(), tier_in);
+    let (of_txid, of_vout) = fund(&cfg, &owner_addr.to_string(), 500_000);
+    let (sf_txid, sf_vout) = fund(&cfg, &squatter_addr.to_string(), 500_000);
+    let (of2_txid, of2_vout) = fund(&cfg, &owner_addr.to_string(), 500_000);
+
+    let mk_tier = |fee: u64| Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: p_txid, vout: p_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut { value: tier_in - P2A_VALUE - fee, script_pubkey: owner_spk.clone() },
+            TxOut { value: P2A_VALUE, script_pubkey: p2a_script() },
+        ],
+    };
+    let tier_prevouts = vec![TxOut { value: tier_in, script_pubkey: owner_spk.clone() }];
+    let vsize = {
+        let mut probe = mk_tier(1_000);
+        sign_p2tr_input(&mut probe, 0, &tier_prevouts, &owner);
+        probe.vsize() as u64
+    };
+    let required = (floor * vsize as f64).ceil() as u64;
+    if required < 2 {
+        eprintln!(
+            "SKIP anchor-squat: this node's floor is {floor} sat/vB, so no under-paying tier can be \
+             built and the rescue this test contests would not be needed. NOTHING verified."
+        );
+        return;
+    }
+    let under_fee = required / 2;
+    let mut tier = mk_tier(under_fee);
+    sign_p2tr_input(&mut tier, 0, &tier_prevouts, &owner);
+    let tier_txid = tier.txid();
+
+    // A stranger's child: the anchor (witness-free — this is the anyone-can-spend part) plus their
+    // OWN funding so it can pay a real fee. Structurally identical to the owner's rescue; nothing
+    // distinguishes them to the node, which is exactly why the auction is the only mechanism.
+    let squat_prevouts = [
+        TxOut { value: P2A_VALUE, script_pubkey: p2a_script() },
+        TxOut { value: 500_000, script_pubkey: squatter_spk.clone() },
+    ];
+    let mk_squat = |fee: u64| Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint { txid: tier_txid, vout: 1 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: OutPoint { txid: sf_txid, vout: sf_vout },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            },
+        ],
+        output: vec![TxOut {
+            value: P2A_VALUE + 500_000 - fee,
+            script_pubkey: squatter_spk.clone(),
+        }],
+    };
+
+    let try_send = |hex: &str| -> serde_json::Value {
+        let body = serde_json::json!({"jsonrpc":"1.0","id":"t","method":"sendrawtransaction",
+                                      "params":[hex]});
+        let client = reqwest::blocking::Client::new();
+        let r = client.post(&cfg.url).basic_auth(&cfg.user, Some(&cfg.password)).json(&body).send().unwrap();
+        serde_json::from_str::<serde_json::Value>(&r.text().unwrap()).unwrap()
+    };
+    let child_of = |parent: Txid| -> Option<String> {
+        let e = rpc(&cfg, "getmempoolentry", serde_json::json!([parent.to_string()]));
+        e["spentby"].as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).map(String::from)
+    };
+
+    // ── 1. The owner rescues their own tier, atomically. ──────────────────────────────────────────
+    let rescue = build_p2a_fee_child(
+        &StuckParent { txid: tier_txid, p2a_vout: 1, vsize, fee: under_fee },
+        &FundingInput {
+            outpoint: OutPoint { txid: of_txid, vout: of_vout },
+            value: 500_000,
+            script_pubkey: owner_spk.clone(),
+        },
+        owner_spk.clone(),
+        (floor * 10.0).max(2.0),
+    )
+    .expect("the fee child must build");
+    let mut rescue_tx = rescue.tx.clone();
+    sign_p2tr_input(&mut rescue_tx, 1, &rescue.prevouts, &owner);
+    let owner_rate = rescue.child_fee as f64 / rescue_tx.vsize() as f64;
+    let res = submit_package(
+        &cfg,
+        &bitcoin::consensus::encode::serialize_hex(&tier),
+        &bitcoin::consensus::encode::serialize_hex(&rescue_tx),
+    )
+    .expect("the owner's 1P1C package must be accepted");
+    assert!(res.accepted(), "package_msg = {:?}", res.package_msg);
+    assert_eq!(
+        child_of(tier_txid).as_deref(),
+        Some(rescue_tx.txid().to_string().as_str()),
+        "the owner's child must hold the slot before anyone contests it"
+    );
+    println!(
+        "tier {tier_txid} rescued: the owner's child {} holds the slot at {owner_rate:.2} sat/vB",
+        rescue_tx.txid()
+    );
+
+    // ── 2. AN UNDER-PAYING SQUAT IS REFUSED. The slot cannot be DOWNGRADED. ───────────────────────
+    //
+    // This is the half that matters for safety: if a stranger could replace a well-paying rescue
+    // with a cheap child, they could hold the tier below the relay floor for as long as they liked.
+    // The replacement rules forbid it, and this measures that rather than trusting it.
+    let mut cheap = mk_squat((rescue.child_fee / 4).max(1));
+    sign_p2tr_input(&mut cheap, 1, &squat_prevouts, &squatter);
+    let refused = try_send(&bitcoin::consensus::encode::serialize_hex(&cheap));
+    assert!(
+        !refused["error"].is_null(),
+        "A STRANGER DOWNGRADED THE SLOT: a child paying a quarter of the owner's fee replaced it. \
+         Then anyone can hold a tier under the relay floor indefinitely for the price of one cheap \
+         transaction, and the anchor IS a griefing vector on confirmation."
+    );
+    println!(
+        "an under-paying squat is REFUSED: {}",
+        refused["error"]["message"].as_str().unwrap_or_default()
+    );
+    assert_eq!(
+        child_of(tier_txid).as_deref(),
+        Some(rescue_tx.txid().to_string().as_str()),
+        "the owner's child must still hold the slot after the cheap attempt"
+    );
+
+    // ── 3. AN OVER-PAYING SQUAT SUCCEEDS — and that is not an attack. ─────────────────────────────
+    //
+    // The assertion I originally wrote here was that this could not happen. It can. What it costs
+    // the stranger is the fee, and what it does to the tier is make it MORE likely to confirm.
+    let rich_fee = rescue.child_fee.max(1_000) * 10;
+    let mut rich = mk_squat(rich_fee);
+    sign_p2tr_input(&mut rich, 1, &squat_prevouts, &squatter);
+    let took = try_send(&bitcoin::consensus::encode::serialize_hex(&rich));
+    assert!(
+        took["error"].is_null(),
+        "the third party could not take the anchor even by out-paying ({}). If an anyone-can-spend \
+         anchor is not in fact anyone-spendable, the KEYLESS RESCUE this design depends on does not \
+         work either — a worse finding than the squat, and it must not pass silently.",
+        took["error"]["message"].as_str().unwrap_or_default()
+    );
+    let squat_rate = rich_fee as f64 / rich.vsize() as f64;
+    assert!(
+        squat_rate > owner_rate,
+        "the squat replaced the owner's child at {squat_rate:.2} sat/vB, which is NOT above the \
+         owner's {owner_rate:.2} sat/vB. Replacement is supposed to be an auction; if the slot can \
+         change hands without paying more, the safety argument above is void."
+    );
+    assert_eq!(
+        child_of(tier_txid).as_deref(),
+        Some(rich.txid().to_string().as_str()),
+        "the stranger's child must now hold the slot"
+    );
+    println!(
+        "an OVER-paying squat SUCCEEDS: {} at {squat_rate:.2} sat/vB replaced the owner's \
+         {owner_rate:.2} sat/vB. The tier's package feerate went UP, at the stranger's expense.",
+        rich.txid()
+    );
+
+    // ── 4. …AND THE OWNER RECLAIMS IT THE SAME WAY. The cost is a fee, never the coin. ────────────
+    let reclaim = build_p2a_fee_child(
+        &StuckParent { txid: tier_txid, p2a_vout: 1, vsize, fee: under_fee },
+        &FundingInput {
+            outpoint: OutPoint { txid: of2_txid, vout: of2_vout },
+            value: 500_000,
+            script_pubkey: owner_spk.clone(),
+        },
+        owner_spk.clone(),
+        squat_rate * 5.0,
+    )
+    .expect("the reclaim must build");
+    let mut reclaim_tx = reclaim.tx.clone();
+    sign_p2tr_input(&mut reclaim_tx, 1, &reclaim.prevouts, &owner);
+    let won = try_send(&bitcoin::consensus::encode::serialize_hex(&reclaim_tx));
+    assert!(
+        won["error"].is_null(),
+        "the owner could not RECLAIM the slot even by out-bidding ({}). Then a stranger can hold a \
+         tier's only child slot for as long as they keep paying, which IS a DoS on the exit rather \
+         than a price — and decision 10 must say so.",
+        won["error"]["message"].as_str().unwrap_or_default()
+    );
+    assert_eq!(
+        child_of(tier_txid).as_deref(),
+        Some(reclaim_tx.txid().to_string().as_str()),
+        "the owner must hold the slot again"
+    );
+    println!(
+        "the owner RECLAIMS by out-bidding: {} — the squat cost a FEE, not the coin",
+        reclaim_tx.txid()
+    );
+    println!(
+        "ANCHOR SQUAT: the slot is an AUCTION, not a race. It cannot be downgraded, every \
+         successful squat raises the tier's feerate, and the owner always reclaims by paying more."
+    );
+}

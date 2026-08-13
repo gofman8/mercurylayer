@@ -47,7 +47,7 @@ be skipped and most expensive to skip.**
 - D28's "what a receiver can check" row — attested a budget that, until today, no acceptance decision read.
 - PROTOCOL.md §7 Phase 0's "DONE: generalized counters {level, m, k, total_sigs}, POST /renew/init" — `total_sigs` has **zero** occurrences in `server/`, `lockbox/` or `lib/`; no `/renew` route exists.
 - INV-27's evidence pin `sdk30(a)` — it idles a k=0 deposit and structurally cannot witness the case where INV-27 is false.
-- `live_p2a_package_rescue.rs`'s doc comment — claims to drive a seam its body never enters.
+- `live_p2a_package_rescue.rs`'s doc comment — claims to drive a seam its body never enters. (Still true of `the_bump_capability_rescues_a_stuck_tier...`; it exercises the shipped SIGNER and `submit_package` but calls `build_p2a_fee_child` itself rather than going through `broadcast_tier`. This is the remaining Stage-3 negative test.)
 
 ---
 
@@ -63,7 +63,7 @@ Four of the ten consolidated decisions are taken (D40). **Six remain.** Only one
 | 5 | R-1 / R3 / D31 — the defence is fee-frozen at 2.0 sat/vB and two of three lanes cannot bump | no | Blocks §5.13 being true; that file currently contradicts itself four times. |
 | 7 | D10 — the census's distinctness premise | no | One ordering change (validate before counting). |
 | 9 | R13 — conveyed child CSVs: admitted band or derived value | no | Changes what §Children's CSV law *says*. |
-| 10 | TRUC slot contention — who may take a tier's single child slot | no | Latency, not coins: post-D14 fees cannot buy CSV maturity. |
+| 10 | TRUC slot contention — who may take a tier's single child slot | no | Latency, not coins: post-D14 fees cannot buy CSV maturity. **Now MEASURED** (`a_third_party_can_only_take_the_anchor_slot_by_paying_more`): the slot is an auction — it cannot be downgraded, a successful squat raises the feerate, the owner reclaims by out-bidding. The decision is now about pricing the reclaim, not about whether the exit survives. |
 
 ---
 
@@ -114,8 +114,16 @@ they land.
   network; four tests drive the omitted budget (all three unanswered shapes), the `num_sigs >=
   budget` boundary, and disagreement refused in BOTH directions — including the one where the
   coordinator is the more conservative of the two.
-- The two remaining negative tests: a fee-stuck tier driven through a *pass* rather than the builder
-  directly; a third-party anchor squat.
+- ✅ **DONE — the third-party anchor squat**, and it refuted the assertion I wrote first. I expected
+  a package-rescued tier to have no squat window (the parent never public and childless); the node
+  disagreed — the stranger's child went straight in, **by replacing the owner's**. The slot is
+  therefore an AUCTION, not a race, and that is a better answer: an under-paying squat is refused
+  (measured: `new feerate 0.00000895 <= old 0.00003581`), so the slot cannot be downgraded; an
+  over-paying one succeeds and RAISES the tier's feerate at the stranger's expense (3.58 → 65.36
+  sat/vB); and the owner reclaims the same way. **This measures decision 10 directly** — TRUC slot
+  contention is a price, not a DoS, and TRUC's 1000-vB child cap is what bounds the price.
+- The one remaining negative test: a fee-stuck tier driven through a *pass* rather than the builder
+  directly.
 - ✅ **DONE — the zero-slack successor test on regtest.** The margin comparison is now
   `clears_supersession_margin`, and three tests pin the boundary: regtest clears by **exactly zero**
   (cap `d_floor` 6 = `SP` 0 + δ 6) while mainnet clears by 108, so every off-by-one here is invisible
