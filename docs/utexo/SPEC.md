@@ -1,59 +1,100 @@
-# Mercury + RGB Utexo — System Specification
+# Mercury Utexo — Protocol Specification
 
-> ## ⚠️ Direction of travel: ONE COIN TYPE
->
-> This document specifies the system **as built today**, which has two coin shapes — *laddered*
-> (TES-R) and *un-laddered* (RGB carriers and un-broadcast split sub-coins). **That is a transitional
-> state, not the target architecture.** The decided direction is a single coin type; the un-laddered
-> shape is being removed, not kept.
->
-> The mechanism is **CTES-R** — colour every TES-R tier so an RGB carrier can be laddered, retiring
-> terminal-freeze. Its gate passed against the live stack ([CTESR-GATE.md](CTESR-GATE.md)) and its
-> foundation has landed (the `payload_vout` migration, the coloured tier builder, per-tier seal
-> blinding). **The colouring itself is not yet wired.** Until it is, everything below about the
-> un-laddered shape remains accurate as-built.
->
-> So: read two-shape material here as a description of the present, never as the target. Items scoped
-> to the un-laddered shape — its absolute deadlines, backup-chain handover, terminal-parent proofs,
-> and the exit-cost and carrier-depletion arithmetic — are expected to be **deleted**, not migrated.
->
-> Reaching one coin type also requires porting `verify_bundle` to wasm/JS and Kotlin: the nodejs and
-> web clients refuse any transfer that *declares* a ladder, so every coin laddered is one they cannot
-> receive. Note what that gate keys on — three SENDER-supplied fields (`protocol_version >= 2`,
-> `tesr_ladder`, `child_tesr_bundle`; `transfer_receive.js`) — so it is a refusal of DECLARED
-> ladders, not a structural one, and the flat path it falls through to is the un-laddered
-> `num_sigs == backups.length` check against a coordinator-supplied `interval` (the very input the
-> Rust side stopped trusting — `TesrParams::flat_ladder_params` is compiled in, §2.4). Those clients
-> are therefore not an exempt population; they are the un-defended one until the port lands.
-> Background: [COLORED-FORWARDING.md](COLORED-FORWARDING.md).
+**Status: normative draft, 2026-08-14.** Requirements are labelled **REQ-n**, invariants **INV-n**,
+error semantics **ERR-n**; keywords MUST/SHOULD/MAY per RFC 2119. Every labelled statement maps to a
+verifying test in [§12 Traceability](#12-traceability) or is marked UNPROVEN in place.
 
-Normative specification of the Utexo system built on Mercury Layer statechains with RGB
-assets and a single statechain entity (SE). Requirements are labelled **REQ-n**, invariants
-**INV-n**, and error semantics **ERR-n**. Each is mapped to a verifying test in
-[§12 Traceability](#12-traceability). Keywords MUST/SHOULD/MAY per RFC 2119.
+---
 
-Scope: the SE (Mercury server + lockbox), the client libraries (`mercurylib`, `mercuryrustlib`,
-`mercury-rgb`), the wallet SDK (`mercury-utexo-sdk`), the SSP service (`mercury-ssp`), and their
-Bitcoin/RGB/Lightning interactions. Companion docs: [core-concepts](learn/core-concepts.md),
-[invalidation](learn/invalidation.md), [PARITY.md](PARITY.md).
+## 0. How to read this document
 
-**One protocol, two coin shapes.** There is a single protocol: `claim()` establishes a TES-R exit
-ladder (§2.6) for every fresh confirmed **root** coin, unconditionally. The
-`deposit_protocol_version` field and the `UTEXO_PROTOCOL_DEFAULT` escape hatch that could opt a
-deposit back into the flat pre-TES-R shape are DELETED. Two coin SHAPES coexist, both current:
+### 0.1 Authority order — the DESIGN is normative, and the CODE follows
 
-- **Laddered** — every plain deposit. Its exit is the relative-CSV tier chain (§9.2), which costs
-  0 vB of idle rent and never matures while idle (INV-27). It is NOT deadline-free: the flat backup
-  chain is retained, so the coin keeps an absolute-locktime calendar which each whole-coin hop
-  shortens by `interval` [D36]. See INV-27 for the exact scope.
-- **Un-laddered** — an RGB **carrier**, which must NEVER be laddered (a plain tier spend would
+Set by the owner, 2026-08-13, and it inverts the rule this document was started under
+("specify what the code does and delete the aspirational prose").
+
+**Where this specification and the implementation disagree, the implementation is what changes.** A
+divergence is therefore a defect with an owner, not a licence to weaken a sentence here — and not
+something a reader may discover by accident, so every one that is known is listed in §0.4.
+
+Two things follow, and they are the reason the rule is worth stating rather than assuming:
+
+* A section MAY specify behaviour that is not yet built, PROVIDED §0.4 records that it is not. What a
+  section MUST NOT do is describe an unbuilt thing in the present tense.
+* A measurement MAY NOT be overruled by a design statement. Where the design says one thing and a
+  measurement says the design is not achievable — the depth cap of [D53], the payment granularity of
+  [D44], the coloured lane's economics — **the measurement wins and the design changes.** Design
+  authority is over choices, not over arithmetic.
+
+### 0.2 What a normative statement in here rests on
+
+This corpus has repeatedly caught itself publishing claims that were true of a plan, of an older
+commit, or of a document rather than of the system. Three rules, each of which exists because it was
+broken:
+
+1. **Every claim names its evidence, and evidence means a test that RUNS.** A test that asserts a
+   description passes while the construction underneath it is wrong ([D42]); a source scan may assert
+   presence, absence, ordering and window shape but never reachability, binding or behaviour
+   ([D64]) — behaviour is proven by planting the historical defect and running the real checker.
+2. **A measurement carries its date and its target.** "756 tests" named no target set and was
+   therefore neither wrong nor checkable. Test counts in this document say what was counted.
+3. **A rewritten assertion is a NEW assertion and must be run before it is cited** ([D70]).
+
+### 0.3 Scope, and the shapes a coin can have
+
+In scope: the SE (Mercury coordinator + lockbox), the client libraries (`mercurylib`,
+`mercuryrustlib`, `mercury-rgb`), the wallet SDK (`mercury-utexo-sdk`), the SSP service
+(`mercury-ssp`), and their Bitcoin/RGB/Lightning interactions. Companion normative documents:
+[PROTOCOL.md](PROTOCOL.md) (tiers, renewal, terminal-freeze), [CHILDREN.md](CHILDREN.md) (first-class
+split children), [LIGHTNING.md](LIGHTNING.md) (the Lightning latch), [TRUST-MODEL.md](TRUST-MODEL.md)
+(the trust unit and the named residuals).
+
+**There is ONE protocol.** `claim()` establishes a TES-R exit ladder (§2.6) for every fresh confirmed
+**root** coin, unconditionally; the `deposit_protocol_version` field and the `UTEXO_PROTOCOL_DEFAULT`
+escape hatch that could opt a deposit back into the pre-TES-R shape are DELETED.
+
+**The target is ONE COIN SHAPE.** The shipped build has two, and the second is transitional:
+
+- **Laddered** — every plain deposit. Its exit is the relative-CSV tier chain (§9.2): 0 vB of idle
+  rent, and it never matures while idle (INV-27). It is NOT deadline-free — the flat backup chain is
+  retained, so the coin keeps an absolute-locktime calendar which each whole-coin hop shortens by
+  `interval` [D36]. INV-27 states the exact scope.
+- **Un-laddered** — an RGB **carrier** whose ladder has not been coloured (a plain tier spend would
   destroy the allocation — terminal-freeze, INV-29), and a split sub-coin whose funding is
   un-broadcast and therefore cannot root a trigger [B0]. These keep the signed-once backup chain
-  (§2.4) and transfer by backup-chain + branch handover. This path is LOAD-BEARING for RGB tokens.
+  (§2.4) and transfer by backup-chain + branch handover.
 
-Normative TES-R references: [PROTOCOL.md](PROTOCOL.md) (tiers, renewal, terminal-freeze),
-[CHILDREN.md](CHILDREN.md) (first-class split children),
-[LIGHTNING.md](LIGHTNING.md) (the Lightning latch).
+The mechanism that removes the second shape is **CTES-R** — colour every TES-R tier, so a carrier is
+laddered like any other coin and terminal-freeze retires with it. Its gate passed against the live
+stack ([CTESR-GATE.md](CTESR-GATE.md)) and it is BUILT; what it is not is DEFAULT (§0.4, row 1).
+Material scoped to the un-laddered shape — absolute deadlines, backup-chain handover, terminal-parent
+proofs, the carrier-depletion arithmetic — is expected to be **deleted**, not migrated.
+
+### 0.4 Divergence register — where the code does not yet meet this document
+
+Each row is a defect in the CODE by §0.1. A row is removed only when the divergence is closed, never
+when the sentence is softened. Nothing here is a hidden caveat: each is also stated where it bites.
+
+| # | This document specifies | The shipped build does | Consequence, and what closes it |
+|---|---|---|---|
+| **V-1** | one coin shape: every coin, carrier or not, carries a coloured ladder | `SdkConfig::colored_ladder` ships **false** [D30], so a carrier stays un-laddered by default | The un-laddered lane and everything scoped to it stay load-bearing. What gates the flip is not safety but measured economics — [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md): one coloured partial payment per carrier, and a long unilateral exit for the child it produces |
+| **V-2** | every client verifies a conveyed ladder | the nodejs and web clients **refuse** any transfer that DECLARES a ladder, and fall through to the un-laddered `num_sigs == backups.length` check against a coordinator-supplied `interval` | Those clients are the UN-DEFENDED population, not an exempt one — the refusal keys on three SENDER-supplied fields, so it is a refusal of declared ladders, not a structural one. Closed by porting `verify_bundle` to wasm/JS and Kotlin. Background: [COLORED-FORWARDING.md](COLORED-FORWARDING.md) |
+| **V-3** | a receiver derives every value it relies on, or refuses | both synchronous verifiers accept a sender-DECLARED `fee_rate` (GAP A / GAP B) | A ladder built and declared at an extreme rate can satisfy the trigger law against the real funding output while delivering a fraction of the coin's value. Tripwire tests assert the acceptance today rather than the refusal |
+| **V-4** | the `statechain_id ↔ aggregate` binding is attested, like the count | it is coordinator-supplied and unattested (P1) | A coordinator serving NULL downgrades any coin to the un-laddered lane; serving a wrong value is not detectable in-protocol. [D69] closed the COUNT's half of this ([TRUST-MODEL.md](TRUST-MODEL.md) B11); P1 is the half that remains |
+| **V-5** | the two closed forms of [D40.3] are evaluated and published | UNEVALUATED | An external dependency, not unfinished work: both are queries over DEPLOYED coins and regtest has none that mean anything |
+
+### 0.5 What this document does NOT claim
+
+* **No in-protocol payment atomicity for a plain transfer.** A transfer is a one-way handover — a
+  gift, not an escrow (TRUST-MODEL B8). Delivery-versus-payment needs the Lightning latch (§8) or an
+  invoice.
+* **No defence against the statechain trust unit itself** (SE + a past owner with a retained
+  pre-rotation share, TRUST-MODEL B1). A fresh co-signature needs no backup, so no timelock reaches
+  it. What the ladder changes is the notice period, not the possibility.
+* **No claim that a sub-economic piece is final.** An ancestor's lowest backup rung voids an entire
+  tree for the cost of one transaction, and does so whether or not its holder means to
+  ([SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md)). This is the sender's free option, not a payee
+  liveness cost.
 
 ---
 
