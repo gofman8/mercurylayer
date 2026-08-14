@@ -631,7 +631,27 @@ namespace db_manager {
         }
     }
 
-    bool signature_count(const std::string& statechain_id, int& sig_count) {
+    /// **[D76] The count is an OUT-PARAM, so every return path must assign it — and "no such coin"
+    /// must be distinguishable from "zero signatures".**
+    ///
+    /// This function used to return `true` on `result.empty()` (no row for this statechain id) and on
+    /// a NULL `sig_count` column WITHOUT ever assigning `sig_count`. Both callers then read whatever
+    /// happened to be on the stack: the `/signature_count` route declared `int sig_count;`
+    /// uninitialised and ATTESTED the value, and the budget gate compared it against the spend
+    /// budget. An uninitialised read is undefined behaviour, and in the attestation's case it is
+    /// undefined behaviour that gets SIGNED.
+    ///
+    /// This is a correctness fix, not a closed theft path: in practice the stack slot held zero and
+    /// the budget gate initialises its own variable. Stating it that way rather than as a security
+    /// win is the honest description ([D73]).
+    ///
+    /// `found` distinguishes the two "true" cases: query succeeded AND a row with a non-NULL count
+    /// exists (`found = true`), versus query succeeded and there is no such count (`found = false`,
+    /// `sig_count = 0`). A caller that cannot tell them apart cannot fail closed.
+    bool signature_count(const std::string& statechain_id, int& sig_count, bool& found) {
+
+        sig_count = 0;
+        found = false;
 
         auto database_connection_string = getDatabaseConnectionString();
 
@@ -653,10 +673,14 @@ namespace db_manager {
                     auto sig_count_field = result[0]["sig_count"];
                     if (!sig_count_field.is_null()) {
                         sig_count = sig_count_field.as<int>();
+                        found = true;
+                        conn.close();
                         return true;
                     }
                 }
-                
+
+                // No row, or a NULL column. The QUERY succeeded, so this is not an error — but there
+                // is no count, and `found` says so. `sig_count` is already 0 from the prologue.
                 conn.close();
                 return true;
             } else {

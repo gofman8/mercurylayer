@@ -138,8 +138,15 @@ namespace lockbox {
                 }
                 if (has_budget) {
                     int sig_count = 0;
-                    if (!db_manager::signature_count(statechain_id, sig_count)) {
+                    bool count_found = false;
+                    if (!db_manager::signature_count(statechain_id, sig_count, count_found)) {
                         return crow::response(500, "could not read the signature count for this coin; refusing to co-sign");
+                    }
+                    // [D76] A coin that HAS a spend budget but no count row is inconsistent state.
+                    // Reading the absent count as 0 would say "no signatures yet, go ahead" — the
+                    // fail-OPEN reading, on the gate that enforces terminality. Refuse instead.
+                    if (!count_found) {
+                        return crow::response(500, "this coin has a spend budget but no signature count; refusing to co-sign");
                     }
                     if (sig_count >= budget) {
                         crow::json::wvalue exhausted;
@@ -494,13 +501,21 @@ namespace lockbox {
         CROW_ROUTE(app,"/signature_count/<string>")
         ([&seed](const crow::request& req, std::string statechain_id){
 
-            int sig_count;
+            // [D76] INITIALISED, and "no such coin" answered as 404 rather than attested as 0.
+            // This declared `int sig_count;` and `db_manager::signature_count` returned true without
+            // assigning it whenever the row was missing or the column NULL — so the value SIGNED into
+            // the attestation below was an uninitialised stack read.
+            int sig_count = 0;
+            bool count_found = false;
             std::string error_message;
-            bool count_retrieved = db_manager::signature_count(statechain_id, sig_count);
+            bool count_retrieved = db_manager::signature_count(statechain_id, sig_count, count_found);
 
             if (!count_retrieved) {
                 error_message = "Failed to retrieve signature count: " + error_message;
                 return crow::response(500, error_message);
+            }
+            if (!count_found) {
+                return crow::response(404, "no signature count exists for this statechain id");
             }
 
             // [D8] ATTEST THE COUNT. Returning it bare is what let a coordinator under-report it by

@@ -2833,3 +2833,35 @@ predicate composition (both gates are `async` over a live `ClientConfig`, so the
 them); `the_child_lane_gates_check_the_shape_before_parsing_the_bundle` pins presence and ordering,
 which is what a source scan may assert; and honest traffic is proven by RUNNING it — `sdk17`, `sdk59`,
 `sdk60` and `sdk21` green on regtest. 797 workspace tests, 0 failures.
+
+## [D76] The attested count was an uninitialised stack read on two paths
+
+**Decision: `signature_count` assigns its out-param on every return path and reports "no such count"
+explicitly; both callers handle absence rather than reading whatever was on the stack.** Second fix
+landed from [D73]'s amended plans, and the one its adversary called "correct and unconditional".
+
+`db_manager::signature_count(statechain_id, sig_count)` returned `true` — the success signal — on two
+paths WITHOUT ever assigning `sig_count`: when the query found no row, and when the `sig_count`
+column was NULL. Both callers then read an uninitialised `int`:
+
+* `CROW_ROUTE /signature_count/<string>` declared `int sig_count;` and, on those paths, **signed that
+  value into the `utexo/sig_count/v2` attestation.** Undefined behaviour that gets a BIP-340
+  signature over it.
+* the budget gate inside the partial-signature route compared it against the spend budget. That one
+  initialises its own variable, so it read 0 — but by luck of the caller, not by contract.
+
+**Described as what it is** ([D73] made this a rule): an uninitialised-read fix, NOT a closed theft
+path. `sig_count INTEGER DEFAULT 0` means every real coin's row holds 0 rather than NULL, so in
+practice the absent case is "no such statechain id" — and the attestation is over a nonce the caller
+chose, so a stale value cannot be replayed at a victim. What was wrong is that the contract permitted
+a signature over an unassigned variable.
+
+**Now:** `signature_count(id, sig_count, found)` assigns `sig_count = 0` in its prologue and sets
+`found` only when a non-NULL row exists. The attestation route answers **404** for an unknown id
+instead of attesting a fabricated zero. The budget gate refuses with 500 when a coin HAS a budget but
+no count row — reading an absent count as 0 there would mean "no signatures yet, go ahead", the
+fail-OPEN reading on the gate that enforces terminality.
+
+**Verified live, not argued:** container rebuilt and redeployed; an unknown id now answers 404;
+`/attestation_identity` still serves; and the claim path — which calls this on every claim — is green
+on `sdk1`, `sdk17`, `sdk59`.

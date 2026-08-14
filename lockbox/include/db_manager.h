@@ -82,7 +82,10 @@ namespace db_manager {
     // `CREATE TABLE IF NOT EXISTS`. Idempotent; a failure here is fatal at startup by design.
     bool ensure_schema(std::string& error_message);
 
-    bool signature_count(const std::string& statechain_id, int& sig_count);
+    /// **[D76]** Returns `true` when the QUERY succeeded. `found` says whether a non-NULL count
+    /// exists for this statechain id; `sig_count` is assigned on EVERY path (0 when absent), so no
+    /// caller can read it uninitialised — which both callers previously could.
+    bool signature_count(const std::string& statechain_id, int& sig_count, bool& found);
 
     // ── [D8(i)] THE SPEND BUDGET, MIRRORED INTO THE SE ────────────────────────────────────────────
     //
