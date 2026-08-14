@@ -2752,3 +2752,55 @@ Three more of the same shape, all of them SPEC rows describing defects the code 
 **The rule this puts beside [D64]:** a plan is not evidence, and neither is the fact that its author
 read the code. Scope, then attack, then implement the amendment — and when the attacker says a fix
 would refuse honest traffic, that outranks the defect it was meant to close.
+
+## [D74] The specification audited against the code: 344 claims, 31 wrong
+
+**Decision: the specification is corrected in 31 places; where the code is right, the SPEC changed.**
+
+Prompted by the owner reading §14's L-2 and noticing it was false. That row said a splitter's flat
+backup is an unconditional free option over any split piece — "no counter available to a payee". The
+code says otherwise: a piece holder holds the parent's `T` (`ChildTesrBundle::parent` carries the
+chain), `T` spends the same `F` the backup spends, and `T` carries no timelock, so the payee can
+PRE-EMPT across the whole window and one confirmed `T` voids every flat backup permanently. The
+specification had stated a mechanism's EFFECT while omitting the COUNTER-MECHANISM that reverses the
+conclusion — and it read as authoritative.
+
+The owner's diagnosis was that this would not be the only one, because §1 and §14 were assembled from
+`spec-work/SPEC-FOUNDATION.md`, `TRUST-MODEL.md` and `PROTOCOL.md` rather than from the code, and
+those were written months apart. Seven agents then checked every checkable claim against the code,
+each required to open the named symbols before ruling; seven refuters re-read the code and defaulted
+to "the finding is wrong", so a false alarm could not corrupt correct text.
+
+**344 claims checked. 37 contradictions raised, 6 refuted, 31 upheld — 20 wrong, 11 imprecise.**
+
+The five shapes, and the ones that mattered:
+
+* **Omitted counter-mechanism** — L-2 (above), and L-1: the ladder's ≥144-block notice is a property
+  of the LADDER'S path, not a bound on the adversary. `F` is key-path-only (`p2tr(.., None, ..)`), so
+  nothing at consensus forces a spend of `F` to be a trigger; the trust unit signs directly.
+* **Claimed enforcement absent, or present and denied** — §3.0 said "exactly THREE of eight properties
+  are enforced"; at least SEVEN are, and the under-count told maintainers to re-check three rows.
+  A-12 said there is no unknown-version reject arm; `ADMISSIBLE_PROTOCOL_VERSIONS` + `admissible_shape`
+  refuse by name on both acceptance paths — what is live is narrower and now stated exactly.
+  REQ-32 relied on `background_auto_refresh`, which has NO production reader.
+* **Outcome as rule** — §9.5's "two passes, one per shape" and "a laddered coin is not the subject of
+  a deadline pass": `maintenance_plan` runs `DeadlineSafety` unconditionally over laddered coins too.
+* **Scope inflation** — INV-29's "carriers are STRUCTURALLY excluded from laddering": the exclusion is
+  conditional on `colored_ladder`, which ships false. True today, false as a structural claim.
+* **Wrong about the API surface** — there is no `POST /deposit/init` (it is `/deposit/init/pod`);
+  `/withdraw/complete` co-signs NOTHING (it validates a nonce and retires the statechain); the SE
+  holds no `amount` and no `locktime` column in ANY migration, which is G9 as a schema fact.
+
+Two corrections land against work done the same day: §1.1 X-3 and §1.2 G1 still named the forged
+`fee_rate` as a live residual hours after [D72] closed it, with a `§0.4 V-3` pointer to a row that had
+been deleted. And the traceability row for REQ-45 cited `rgb10` PART 2 as the negative control proving
+self-transfer still claims — it is an RGB-layer self-split that never puts a row at `IN_TRANSFER`. The
+row now states both real gaps instead.
+
+New divergence row **V-6**: no network ships a pinned enclave attestation identity, so on the shipped
+defaults EVERY laddering claim refuses and "unconditionally" is conditional on configuration the
+product does not supply.
+
+**The rule:** a specification assembled from other documents inherits their age. Check claims against
+the code, not against the corpus — and have someone try to refute each contradiction before acting on
+it, because 6 of 37 were the auditor's error, not the document's.
