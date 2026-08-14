@@ -67,11 +67,14 @@ throughout; `sdk17` does the partial (non-exact) second hop.
 0. **Block space is saved by payment FREQUENCY, not by payment GRANULARITY — and the split lane can
    invert the claim.** A whole coin is the good case: 1 deposit, unlimited off-chain hops, one
    112-vB re-anchor per ~69 days or 99 hops, one cooperative exit — ~330 vB for ~99 payments against
-   ~10 890 vB on chain. A SPLIT CHILD is the bad case: its funding output is un-broadcast, so it has
-   NO one-transaction cooperative exit, and settling it alone costs `3 + 2d` transactions — 668 vB at
-   depth 1, against ~110 vB had that payment simply been made on chain. **Six times worse.** The
-   saving returns only when pieces circulate off-chain rather than settling, or when siblings settle
-   together (materialise the spine once, then one `combine_leaves` transaction: `3 + 1` instead of
+   ~10 890 vB on chain. A SPLIT CHILD is the bad case, and it is the case a PAYEE is in: its funding
+   output is un-broadcast, so `withdraw` routes it to the unilateral walk and settling it alone costs
+   `3 + 2d` transactions — 668 vB at
+   depth 1, against ~110 vB had that payment simply been made on chain. **Six times worse.** **[D77] `3 + 2d` is not the floor**: a child is NOT terminal and its row already points at
+   `SP.out[j]`, so once the spine confirms the SE can co-sign ONE spend of it — `3 + 1`, with the
+   pre-signed tiers demoted to the unilateral fallback. Nothing takes that route today (a sequencing
+   gap in `withdraw`, not a design constraint). The saving returns when pieces circulate off-chain
+   rather than settling, or when siblings settle together (materialise the spine once, then one `combine_leaves` transaction: `3 + 1` instead of
    `3 + 2k`). Ark's rounds amortise this by construction, at the price of expiry-and-sweep that G8
    forbids; Spark's SSP leaf-swap does it operationally, and **we have the primitive but not the
    sweep**. Until we do, `min_child_value` is the only thing keeping the split lane's block-space

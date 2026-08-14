@@ -1326,9 +1326,15 @@ are stated as limits rather than as things to fix.
 
   | shape | on-chain cost | against |
   |---|---|---|
-  | whole coin, ~99 off-chain hops | 1 deposit + 112-vB re-anchor + 1 cooperative exit ≈ **330 vB** | ~10 890 vB for 99 on-chain payments — **≈33×** |
-  | split child, settled ALONE | `3 + 2d` transactions — **668 vB** at depth 1 | ~110 vB had the payment been made on chain — **6× WORSE** |
-  | k siblings, settled together | spine once + one `combine_leaves` transaction: `3 + 1`, not `3 + 2k` | the saving returns |
+  | whole coin (a ROOT holder), ~99 off-chain hops | 1 deposit + 112-vB re-anchor + 1 cooperative exit ≈ **330 vB** | ~10 890 vB for 99 on-chain payments — **≈33×** |
+  | split child, settled ALONE, as SHIPPED | the pre-signed walk, `3 + 2d` transactions — **668 vB** at depth 1 | ~110 vB had the payment been made on chain — **6× WORSE** |
+  | split child, settled ALONE, floor available ([D77]) | spine + ONE cooperative spend of `SP.out[j]` = **4 txs** | not implemented — `withdraw` routes children to the walk before checking confirmation |
+  | k siblings, settled together | spine once + one `combine_leaves` transaction: **`3 + 1`**, not `3 + 2k` | the saving returns |
+
+  **The 1-tx cooperative exit belongs to a ROOT holder, not to a payee.** A child's funding
+  `SP.out[j]` is un-broadcast, so `withdraw::execute` has no confirmed outpoint to spend and the SDK
+  routes it to the unilateral walk by name. Anyone who RECEIVED a non-exact payment is in the second
+  row, not the first.
 
   A child has **no one-transaction cooperative exit** — its funding output `SP.out[j]` is
   un-broadcast, and the root that could have been spent directly was terminalized by the split. So a

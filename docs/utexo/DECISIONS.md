@@ -2865,3 +2865,53 @@ fail-OPEN reading on the gate that enforces terminality.
 **Verified live, not argued:** container rebuilt and redeployed; an unknown id now answers 404;
 `/attestation_identity` still serves; and the claim path — which calls this on every claim — is green
 on `sdk1`, `sdk17`, `sdk59`.
+
+## [D77] A split child's cooperative exit is `spine + 1`, not `spine + 2` — and nothing takes it
+
+**Finding, from the owner asking how a cooperative exit can be one transaction when the holder has
+only a leaf. It cannot — and the shipped cost is also not the floor.**
+
+The honest correction first: **a payee holding a leaf has no one-transaction exit**, and the code says
+so by name — a child "cannot be COOPERATIVELY withdrawn to an arbitrary on-chain address: its funding
+`SP.out[j]` is un-broadcast, so there is no confirmed outpoint for `withdraw::execute` to spend". So
+the 1-tx cooperative exit belongs to a ROOT holder — someone who deposited and never received a
+partial payment — not to the typical payee. Both the SPEC and the parity doc implied otherwise and are
+corrected.
+
+**But `3 + 2d` is not the floor either.** The cost decomposes as SPINE + PER-CHILD, and the per-child
+term has two prices:
+
+| | one child | k siblings of one `SP` |
+|---|---|---|
+| shipped (pre-signed walk) | 3 + 2 = **5 txs** | 3 + 2k |
+| structurally available | 3 + 1 = **4 txs** | **3 + 1**, via `combine_leaves` |
+
+Two facts make the cheaper column real, and both are in the code rather than in a doc comment:
+
+1. **A child is NOT terminal.** The split terminalizes the PARENT (`set_spend_budget(parent, 1)`,
+   consumed by `SP`); the child keeps a live 2-of-2 with the SE and spendable budget. [R9] states the
+   design intent explicitly — "child terminality deliberately NOT required — the handover, not a
+   freeze, is what makes the census durable".
+2. **The child's row already points at its funding.** The claim path sets
+   `coin.utxo_txid = Some(sp_txid)`.
+
+So once the spine confirms, `SP.out[j]` is an ordinary on-chain UTXO under `A_child`, and the SE can
+co-sign a fresh spend of it in ONE transaction. The pre-signed `ext_child`/`state_child` tiers are
+then what they were always meant to be — the UNILATERAL fallback for when the SE will not cooperate.
+
+**Why the code does not do it, and it is narrower than a design constraint.** `UtexoWallet::withdraw`
+routes on shape BEFORE looking at confirmation: `if load_child(..).is_some() → unilateral exit`. At
+the moment of that call the spine is un-broadcast, so `withdraw::execute` would indeed find nothing —
+the routing is correct for the state it was written against. It is a SEQUENCING gap: nothing tries
+"materialise the spine, wait for confirmation, then cooperatively spend".
+
+**UNVERIFIED, stated rather than assumed** ([D64]): that after `SP` confirms the child's row is picked
+up as CONFIRMED and `withdraw::execute` accepts it is INFERRED from the row pointing at `sp_txid`, not
+demonstrated. The test that would settle it: split, materialise the spine, mine to
+`confirmation_target`, then call the cooperative withdraw and assert ONE transaction settles the child.
+Until that runs, `3 + 1` is a claim about the design, not about the build.
+
+**Why it matters beyond a transaction count.** It changes the economics of every split piece — the
+break-even value drops by roughly a third for a lone child — and it makes the sweep argument stronger
+than [D74] put it: batching does not merely amortise the spine, it replaces two pre-signed tiers per
+leaf with one shared cooperative transaction. `3 + 1` for k siblings, against `3 + 2k`.
