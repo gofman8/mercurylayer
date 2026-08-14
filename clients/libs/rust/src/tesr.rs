@@ -980,7 +980,7 @@ impl SpineTipBundle {
         }
         // [DUST] …and every leg of the cap must be spendable. This record has no Σ law at all — it
         // pins the cap's payload output against the declared `out_value` and stops — so a 1-sat
-        // appended output passes everything above, and a tip funded below `min_spine_tip_value` (820)
+        // appended output passes everything above, and a tip funded below `min_spine_tip_value` (945 at the shipped rate)
         // produces an honest cap paying under the floor. Either way the SENDER'S OWN CHANGE becomes
         // unbroadcastable, and this is the producer's only door: refusing here costs a rebuildable
         // record, refusing later costs the change leg. After the structural pass, per
@@ -4452,8 +4452,8 @@ impl SplitLegRole {
     /// **The floor a leg of THIS role must clear**, plain lane. One number per shape, derived from
     /// the rungs the builder will actually construct for that shape — never one number for both legs.
     ///
-    /// This is the [V5] hazard in one function. `min_spine_tip_value` is 490 sat below
-    /// `min_child_value`; a piece admitted at the tip's floor cannot fund its second rung, and
+    /// This is the [V5] hazard in one function. `min_spine_tip_value` is ONE RUNG below
+    /// `min_child_value` — 615 sat at the shipped 3.0 sat/vB, 490 at the superseded 2.0 ([D44]); a piece admitted at the tip's floor cannot fund its second rung, and
     /// `establish_child` discovers that *after* `set_spend_budget` has terminalized the parent. The
     /// role therefore selects the floor, and the role is not a caller's choice — see
     /// [`change_leg_role`].
@@ -4520,14 +4520,18 @@ pub enum SplitLane {
 /// **An arm may only be flipped in the same commit as its builder, never before it.** The direction
 /// of the error is the whole reason this is a function and not a comment:
 ///
-/// * flipped EARLY (floor 820, builder still two-tier) the payment is ADMITTED, the parent is
-///   terminalized, and `establish_child` then fails to fund the change child's second rung — the
+/// * flipped EARLY (the one-rung floor, builder still two-tier) the payment is ADMITTED, the parent
+///   is terminalized, and `establish_child` then fails to fund the change child's second rung — the
 ///   coin is stranded to unilateral-exit-only. Fails **open**;
-/// * flipped LATE (floor 1 310, builder one-tier) the wallet merely refuses some payments the chain
-///   would carry. Fails **closed**, and visibly.
+/// * flipped LATE (the two-rung floor, builder one-tier) the wallet merely refuses some payments the
+///   chain would carry. Fails **closed**, and visibly.
 ///
 /// The verifier half (V1/V2 + the prevout derivation) admits both shapes, so a lane that is still
-/// `Piece` is safe — the only cost is the 490 sat of change headroom CATS buys back on that lane.
+/// `Piece` is safe — the only cost is the change headroom CATS buys back on that lane, which is one
+/// rung: `min_child_value − min_spine_tip_value` = **615 sat** at the shipped 3.0 sat/vB
+/// (1 560 − 945). **[D56] The floors are RATE EVALUATIONS, so they are named rather than quoted
+/// here** — this comment used to read "820", "1 310" and "490 sat", all three evaluated at the 2.0
+/// rate that has not shipped since [D44], and all three still looking authoritative.
 pub fn change_leg_role(lane: SplitLane) -> SplitLegRole {
     match lane {
         SplitLane::PlainRoot | SplitLane::SpineBatch => SplitLegRole::SpineTip,
@@ -11078,9 +11082,11 @@ fn verify_superseded_segment(
 ///
 /// **`>=`, NOT `>`.** Every floor in this codebase is written as `k · (rung) + dust`, so the honest
 /// MINIMUM of every shape lands on EXACTLY [`mercurylib::tesr::DUST_LIMIT`] — a plain child at
-/// `min_child_value` (1 310 → 820 → **330**), a spine tip at `min_spine_tip_value` (820 → **330**), a
-/// plain root ladder at `3·rung + dust` (1 800 → 1 310 → 820 → **330**), a coloured ladder at
-/// [`colored_ladder_floor`] (2 058 → 1 482 → 906 → **330**). A `>` here refuses every minimum-sized
+/// `min_child_value` (1 560 → 945 → **330**), a spine tip at `min_spine_tip_value` (945 → **330**), a
+/// plain root ladder at `3·rung + dust` (2 175 → 1 560 → 945 → **330**), a coloured ladder at
+/// [`colored_ladder_floor`] (2 562 → 1 818 → 1 074 → **330**) — each walk stepping down by one rung,
+/// 615 plain / 744 coloured, at the shipped `committed_fee_rate = 3.0` ([D44]; the earlier
+/// 1 310/820/1 800/2 058 series was the same walk evaluated at 2.0). A `>` here refuses every minimum-sized
 /// leg in the system — the same wrong-constant-as-ceiling class this file has already paid for. Each
 /// of those four boundaries is pinned as an ACCEPTANCE in `dust_poisoned_tier_attack_tests`.
 ///
