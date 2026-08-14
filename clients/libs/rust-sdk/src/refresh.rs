@@ -176,6 +176,140 @@ impl UtexoWallet {
         Ok(txid.to_string())
     }
 
+    /// **[D68] The PLAIN de-trigger, wired. Collapse a griefed ladder to an immediate on-chain
+    /// exit — two transactions, zero CSV wait.**
+    ///
+    /// `mercuryrustlib::tesr::cosign_detrigger` has existed since TES-R landed and had **zero
+    /// production callers**: only the COLOURED twin was wired, from [`Self::colored_reanchor`]. So
+    /// the plain lane's answer to trigger griefing was a function nobody called, and
+    /// `PROTOCOL.md` §5.8 described a capability that was not reachable.
+    ///
+    /// # What this is for
+    ///
+    /// Someone broadcasts your coin's trigger `T`. You did not choose the moment; `T` is co-signed
+    /// and un-timelocked, so it confirms. Without this, your coin is now walking the CSV ladder on
+    /// the griefer's schedule — up to `d·720 + 2160` blocks on mainnet.
+    ///
+    /// The de-trigger spends `T.out[0]` with **no relative timelock** (`TRIGGER_SEQUENCE`), so it is
+    /// valid immediately and confirms ahead of every pre-signed extension. The moment it does, every
+    /// tier of the old ladder is dead — they all authorise spends of an output that no longer
+    /// exists — and the value is at an address you named.
+    ///
+    /// # What it is NOT — read this before writing it into a spec
+    ///
+    /// On the COLOURED lane the de-trigger's payload output carries the allocation, so the coin can
+    /// be re-laddered from the new outpoint: that one really is a *re-anchor*.
+    ///
+    /// **This one is an EXIT.** It pays a plain address; there is no fresh funding output `F′` and
+    /// no rebuilt `T′/X′_0/S′_0`. `PROTOCOL.md` §5.8 used to claim otherwise — "spends into a fresh
+    /// funding output `F′` and rebuilds …", "keeps off-chain-ness, the coin's ladder resets fresh" —
+    /// and that restoration half is **unbuilt** ([D57] retracted the claim). What ships is the half
+    /// that matters when you are being griefed: **you choose when the coin lands, and you stop
+    /// waiting.** Getting back off-chain is a fresh deposit.
+    ///
+    /// # Cost
+    ///
+    /// Two on-chain transactions (`T` if it is not already in a mempool, then the de-trigger) and
+    /// the coin's off-chain life. Both fees are committed, drawn from the coin's own value.
+    ///
+    /// Returns the de-trigger's txid.
+    pub async fn detrigger_to_owner(
+        &self,
+        statechain_id: &str,
+        to_address: Option<String>,
+    ) -> Result<String> {
+        let bundle = mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("coin {statechain_id} has no TES-R ladder to de-trigger"))?;
+        if bundle.is_colored() {
+            return Err(anyhow!(
+                "coin {statechain_id} has a COLOURED ladder — use `colored_reanchor` (CR-D), whose \
+                 de-trigger carries the RGB transition. This plain de-trigger would spend the \
+                 carrier's payload output with an uncoloured tier and DESTROY the allocation."
+            ));
+        }
+
+        let record = self.record().await?;
+        let mut coin = record
+            .coins
+            .iter()
+            .find(|c| c.statechain_id.as_deref() == Some(statechain_id) && c.duplicate_index == 0)
+            .ok_or_else(|| anyhow!("no coin with statechain id {statechain_id}"))?
+            .clone();
+
+        // Default to this wallet's own backup address — the owner's key, derived locally, never
+        // supplied by a counterparty. An explicit address is accepted because a holder acting under
+        // duress may want the value somewhere else entirely.
+        let dest = match to_address {
+            Some(a) => a,
+            None => mercurylib::transaction::get_user_backup_address(
+                &coin,
+                self.inner.config.network.to_string(),
+            )
+            .map_err(|_| anyhow!("cannot derive this wallet's backup address"))?,
+        };
+
+        let detrigger_hex = mercuryrustlib::tesr::cosign_detrigger(
+            &self.inner.cc,
+            &mut coin,
+            &bundle,
+            &dest,
+        )
+        .await?;
+
+        // ORDER IS LOAD-BEARING, exactly as in `colored_reanchor`: the de-trigger spends the
+        // trigger's payload output, so `T` must be in a mempool first or the de-trigger has a
+        // missing input. De-triggering an ALREADY-triggered coin is the whole point (that IS the
+        // grief case), so a known `T` is skipped rather than re-broadcast — re-broadcasting a known
+        // tx is an error, not a no-op, on some backends.
+        //
+        // [D68] AND THE PRESENCE CHECK IS NOT A CLASSIFIER. `deny_silent_degradation` caught the
+        // first version of this — `if transaction_get(..).is_err() { broadcast }` — and it was
+        // right: `is_err()` folds "the backend says this tx is unknown" together with "the backend
+        // did not answer". Those are different, and the difference bites in the direction that
+        // matters here. A spurious read failure would send us into a broadcast of an ALREADY-known
+        // trigger, whose error would then abort the whole de-trigger with "could not broadcast" —
+        // failing the one operation the owner is performing under grief pressure, because a lookup
+        // blinked.
+        //
+        // So: always ATTEMPT the broadcast (the fail-safe direction — more work, never less
+        // protection), and tolerate the backend telling us it already had it. `is_idempotent_rebroadcast`
+        // is the repo's existing vocabulary for exactly that, and re-using it means a new backend
+        // wording is fixed in one place for every caller.
+        {
+            use electrum_client::ElectrumApi;
+            let raw = hex::decode(&bundle.trigger.signed_tx)
+                .map_err(|e| anyhow!("stored trigger hex does not decode: {e}"))?;
+            if let Err(e) = self.inner.cc.electrum_client.transaction_broadcast_raw(&raw) {
+                let msg = e.to_string();
+                if !crate::wallet::is_idempotent_rebroadcast(&msg) {
+                    return Err(anyhow!(
+                        "could not put the trigger on chain, so the de-trigger has no input to \
+                         spend ({msg}). Nothing has been co-signed yet — the coin is untouched."
+                    ));
+                }
+            }
+        }
+
+        let raw = hex::decode(&detrigger_hex)
+            .map_err(|e| anyhow!("de-trigger hex does not decode: {e}"))?;
+        let txid = {
+            use electrum_client::ElectrumApi;
+            self.inner.cc.electrum_client.transaction_broadcast_raw(&raw).map_err(|e| {
+                anyhow!(
+                    "the de-trigger was co-signed but could not be broadcast ({e}). The SE co-sign \
+                     is already spent, so retry the BROADCAST rather than rebuilding — rebuilding \
+                     would burn a second irreversible slot."
+                )
+            })?
+        };
+        Ok(txid.to_string())
+    }
+
     pub async fn refresh(&self, statechain_id: &str, fee_rate: Option<f64>) -> Result<RefreshResult> {
         self.reanchor(statechain_id, fee_rate).await
     }
@@ -593,7 +727,16 @@ impl UtexoWallet {
         for id in still_due {
             // `unilateral_exit` broadcasts the trigger when `F` is still unspent, which IS the sever,
             // and then walks whatever has matured. It is idempotent per block.
-            match self.unilateral_exit(Some(vec![id.clone()]), None).await {
+            // [D67] Through `sever_from_f`, the NAMED remedy, not `unilateral_exit` directly.
+            //
+            // The two are the same call — `sever_from_f` is `unilateral_exit` on one coin — but the
+            // name is the point. `sever_from_f`'s own doc has always ended "It is also what
+            // `deadline_safety_due` falls back to when the cooperative re-anchor is refused", and
+            // that was FALSE about the symbol: this loop called `unilateral_exit` and the named
+            // remedy had zero callers repo-wide. A holder acting on the B1 disclosure was told to
+            // call a method the automatic path did not use, and a reader tracing the fallback found
+            // it nowhere.
+            match self.sever_from_f(&id).await {
                 Ok(statuses) if !statuses.is_empty() => severed.push(id),
                 // [D51] Both of the remaining arms used to be one `_ => continue`. They are the
                 // failure, not the absence of one: this coin is inside `margin_blocks` of its floor

@@ -265,6 +265,38 @@ pub struct UtexoWallet {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// **[D66] WHICH MAINTENANCE PASSES A BACKGROUND TICK RUNS — as a VALUE, so it can be tested.**
+///
+/// [D58] fixed a real defect: the deadline pass sat in the `else` arm of an economics flag, so a
+/// wallet that OPTED INTO background maintenance lost the sever. [D64] then established that a
+/// source-scanning guard **cannot** hold that fix — `deny_optional_deadline_safety` was defeated by
+///
+/// ```ignore
+/// let _ = cfg.background_auto_refresh && wallet.deadline_safety_due(..).await.is_ok();
+/// ```
+///
+/// which is at brace depth 0, contains `.await`, and short-circuits. Presence and depth are all a
+/// scan can see; **reachability is not expressible in a substring**.
+///
+/// So the decision is lifted out of the control flow and into a return value. The loop executes the
+/// plan; the plan is a pure function of the config; and
+/// [`every_config_still_schedules_the_deadline_pass`] EXECUTES it over the whole config space and
+/// asserts the pass is always present. That is a behavioural proof, not a description of one — the
+/// `&&` mutation above cannot be written against a `Vec` the caller iterates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenancePass {
+    /// Cooperative re-anchor first, then SEVER from `F` for whatever the counterparty declined to
+    /// co-sign. A strict superset of `auto_refresh_due`, which it calls as its route 1.
+    DeadlineSafety,
+}
+
+/// The plan. **`DeadlineSafety` is unconditional and that is the whole point** — it is not gated on
+/// `auto_refresh`, on `background_auto_refresh`, or on anything else. If a future change wants a
+/// pass that IS conditional, add a variant and gate that one; do not put a condition on this.
+pub fn maintenance_plan(_config: &crate::config::SdkConfig) -> Vec<MaintenancePass> {
+    vec![MaintenancePass::DeadlineSafety]
+}
+
 impl UtexoWallet {
     /// Create or load a wallet. Returns the wallet and its mnemonic.
     ///
@@ -1882,11 +1914,22 @@ impl UtexoWallet {
                 // background loop must not abort on it — the next tick should still run — so it is
                 // logged rather than propagated, which is the one thing that makes an undefended coin
                 // visible on a wallet nobody is watching.
-                if let Err(e) = wallet
-                    .deadline_safety_due(wallet.inner.config.auto_refresh_margin_blocks)
-                    .await
-                {
-                    eprintln!("[deadline safety] {e:#}");
+                // [D66] The passes this tick will run are DECIDED as a value first, by
+                // `maintenance_plan`, then executed. A source-scanning guard cannot prove "this runs
+                // on every path" — `&&`, `if`, `match` and an early `return` all defeat it, and an
+                // adversarial pass proved exactly that against the guard that claimed to (D64). A
+                // pure function returning the plan CAN be proved, by executing it over every config.
+                for pass in crate::wallet::maintenance_plan(&wallet.inner.config) {
+                    match pass {
+                        MaintenancePass::DeadlineSafety => {
+                            if let Err(e) = wallet
+                                .deadline_safety_due(wallet.inner.config.auto_refresh_margin_blocks)
+                                .await
+                            {
+                                eprintln!("[deadline safety] {e:#}");
+                            }
+                        }
+                    }
                 }
                 // [F2] TES-R ladder defence. UNCONDITIONAL — there is no opt-in and no config flag,
                 // because there is no wallet that wants an un-defended ladder: if someone broadcasts
@@ -4685,5 +4728,81 @@ mod d13_leaf_gate_tests {
             }
             other => panic!("a COLOURED leaf must emit TokenCarrierMaterialized, not {other:?}"),
         }
+    }
+}
+
+/// **[D66] THE BEHAVIOURAL PROOF that [D58]'s fix holds — the one a source scan cannot give.**
+///
+/// [D64] established the ceiling by defeating seven guards. The defeat that matters here was against
+/// `deny_optional_deadline_safety`: a source scan sees presence and brace depth, so
+/// `let _ = cfg.background_auto_refresh && wallet.deadline_safety_due(..).await.is_ok();` passes it
+/// while restoring the exact defect D58 fixed — a wallet that opts into background maintenance loses
+/// the sever.
+///
+/// This test does not read source. It CALLS `maintenance_plan` over the entire config space that
+/// could plausibly gate a maintenance pass, and asserts the deadline pass is in every plan. The
+/// mutation above cannot be expressed against it: to make the pass conditional you must return a
+/// plan without it, and then this goes red.
+#[cfg(test)]
+mod maintenance_plan_tests {
+    use super::{maintenance_plan, MaintenancePass};
+    use crate::config::SdkConfig;
+
+    /// Every combination of the flags that have EVER gated a maintenance pass, plus the two
+    /// shipped constructors themselves.
+    #[test]
+    fn every_config_still_schedules_the_deadline_pass() {
+        let mut checked = 0usize;
+        for base in [SdkConfig::regtest("d66"), SdkConfig::mainnet("d66", "http://se.invalid", "tcp://electrum.invalid:50001")] {
+            for auto_refresh in [false, true] {
+                for background_auto_refresh in [false, true] {
+                    for auto_exit in [false, true] {
+                        for colored_ladder in [false, true] {
+                            let mut cfg = base.clone();
+                            cfg.auto_refresh = auto_refresh;
+                            cfg.background_auto_refresh = background_auto_refresh;
+                            cfg.auto_exit = auto_exit;
+                            cfg.colored_ladder = colored_ladder;
+                            let plan = maintenance_plan(&cfg);
+                            assert!(
+                                plan.contains(&MaintenancePass::DeadlineSafety),
+                                "[D58/D66] a background tick would NOT run the deadline pass with \
+                                 auto_refresh={auto_refresh}, \
+                                 background_auto_refresh={background_auto_refresh}, \
+                                 auto_exit={auto_exit}, colored_ladder={colored_ladder}.\n\n\
+                                 That is the defect D58 fixed: `deadline_safety_due` is a strict \
+                                 SUPERSET of `auto_refresh_due` (it calls it as route 1 and then \
+                                 severs from `F` for whatever the counterparty declined to sign), so \
+                                 gating it on an ECONOMICS flag means opting into more maintenance \
+                                 buys LESS protection. The whole-coin clock `min(L_k)` is held by \
+                                 the coin's PRIOR OWNERS; when it passes, an ancestor's matured rung \
+                                 spends `F`.\n\n\
+                                 If a genuinely conditional pass is wanted, add a NEW variant and \
+                                 gate that one — do not put a condition on this. plan: {plan:?}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 32, "the config space must actually be swept, not short-circuited");
+    }
+
+    /// NON-VACUITY. A plan that is always the full set would satisfy the rule above no matter what
+    /// the loop does with it, so pin that the ENUM still has a shape a caller must match on — the
+    /// mechanism by which a future conditional pass becomes visible rather than silent.
+    #[test]
+    fn the_plan_is_a_set_a_caller_must_match_on() {
+        let plan = maintenance_plan(&SdkConfig::regtest("d66"));
+        assert_eq!(
+            plan.len(),
+            1,
+            "the plan gained or lost a pass. That is not automatically wrong — but the background \
+             loop matches exhaustively on `MaintenancePass`, so a new variant is a COMPILE error \
+             there until it is handled, which is the property this assertion protects. Update this \
+             count deliberately, in the same commit as the loop arm. plan: {plan:?}"
+        );
+        assert_eq!(plan[0], MaintenancePass::DeadlineSafety);
     }
 }

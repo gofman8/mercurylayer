@@ -2361,3 +2361,109 @@ unit or E2E test that executes the path.
 2. **Three of the seven rewrites were destroyed by an attacker's `git checkout`** — my own
    instruction told them to restore source files that way, and a broad restore took the sibling's
    ci-guards edits with it. Isolate the attacker, or give it a read-only tree.
+
+---
+
+## D65 — The CI constants guard `SPEC-ROADMAP` claimed does not exist (DROPPED)
+
+**Status:** CLAIM DELETED. **Date:** 2026-08-14.
+
+WP4's row claimed *"A constants-consistency script (wired into ci-guards) greps `docs/utexo` for
+`124`, `1306` and the phantom `8` and is green."* A repo-wide search of `ci-guards/`, `scripts/` and
+`.github/` returns nothing. It was also **self-refuting**: it called the script green while naming
+~12 doc sites the constants were stale at — the state a green guard exists to exclude.
+
+Deleted rather than built, because the class IS covered, better, by three guards that each pin ONE
+family against the code instead of one script grepping three literals:
+`deny_flat_ladder_config_drift` (profile pair), `the_shipped_schedule_floors_are_what_the_code_derives`
+([D56], the floors), `deny_stale_depth_cap` ([D53], the depth cap).
+
+---
+
+## D66 — The deadline-pass property is now a VALUE, because a source scan cannot hold it
+
+**Status:** BUILT + TESTED. **Date:** 2026-08-14.
+
+[D58] hoisted the deadline pass out of an `else` arm. [D64] then proved no source-scanning guard can
+hold that fix: `deny_optional_deadline_safety` was defeated by
+
+```rust
+let _ = cfg.background_auto_refresh && wallet.deadline_safety_due(..).await.is_ok();
+```
+
+— brace depth 0, contains `.await`, and short-circuits. **Reachability is not expressible in a
+substring.**
+
+So the decision is lifted out of control flow: `maintenance_plan(&config) -> Vec<MaintenancePass>`,
+the loop executes the plan, and `every_config_still_schedules_the_deadline_pass` **calls** it over all
+32 combinations of the flags that have ever gated a pass. Verified by mutation — making the plan
+conditional turns it red, which is what the scan could not do.
+
+**And the old scan was RETIRED from the real tree, not kept "as a weaker check".** I tried to keep it;
+it immediately reported the corrected architecture as the defect, because its rule is "the call is a
+direct statement of the loop" and the call is now inside a `match` arm of `for pass in plan`. **A
+guard that fires on right code is worse than no guard** — it gets fixed by weakening, every time. The
+predicate survives as a *tested detector* driven over planted shapes; it just no longer decides
+whether the shipped loop is correct.
+
+---
+
+## D67 — `sever_from_f` had zero callers while its own doc said the deadline pass used it
+
+**Status:** WIRED. **Date:** 2026-08-14.
+
+`sever_from_f`'s doc ends *"It is also what `deadline_safety_due` falls back to when the cooperative
+re-anchor is refused."* That was false about the SYMBOL: the pass called `unilateral_exit` directly
+and the named remedy had zero callers repo-wide. A holder acting on the B1 disclosure was told to call
+a method the automatic path did not use, and a reader tracing the fallback found it nowhere.
+
+The pass now routes through `sever_from_f`. The call is identical — `sever_from_f` IS
+`unilateral_exit` on one coin — so this is a naming fix, and naming is the point: it is the name a
+reader, a stack trace and the trust-model row all use. Two guards were widened to accept either
+spelling, so a rename cannot read as a deleted defence.
+
+---
+
+## D68 — `cosign_detrigger` is wired: a griefed plain ladder collapses in two transactions
+
+**Status:** BUILT + LIVE-TESTED (`SDK_E2E=89`). **Date:** 2026-08-14.
+
+`mercuryrustlib::tesr::cosign_detrigger` shipped with TES-R and had **zero production callers** for
+its whole life — only the coloured twin was wired (`colored_reanchor`, CR-D). The plain lane's answer
+to trigger griefing was a function nobody could reach.
+
+`UtexoWallet::detrigger_to_owner` wires it. What `SDK_E2E=89` proves on chain:
+
+* a griefer confirms `T` (real, not simulated — the test broadcasts it as a third party would);
+* the owner's de-trigger spends `T.out[0]` at **no relative timelock**, confirms, and pays an address
+  the OWNER named (the explicit-address form is exercised, because that is what a holder under duress
+  uses);
+* the pre-signed extension is then submitted to the node and **REFUSED** —
+  `bad-txns-inputs-missingorspent`. The old ladder is dead, measured against bitcoind.
+
+### What it is NOT, stated because §5.8 claimed it for months
+
+An **EXIT**, not a re-anchor. There is no `F′` and no rebuilt `T′/X′_0/S′_0` on this lane —
+`detrigger_to_owner` pays a plain address, so getting back off-chain is a fresh deposit. On the
+COLOURED lane the de-trigger's payload output carries the allocation and CR-D really is a re-anchor;
+that asymmetry is now written into both the code and §5.8.
+
+So the spec may say: **the owner chooses when the coin lands, in two transactions with zero CSV wait,
+and every retained tier dies with it.** It may not say "the ladder resets fresh".
+
+### The defect the guards caught in this very change
+
+`deny_silent_degradation` went red on my first version:
+
+```rust
+if self.inner.cc.electrum_client.transaction_get(&txid).is_err() { broadcast(trigger) }
+```
+
+`is_err()` folds "the backend says unknown" together with "the backend did not answer" — and a
+spurious read failure would have driven a broadcast of an ALREADY-known trigger, whose error then
+aborts the whole de-trigger. **A lookup blinking would fail the one operation the owner performs
+under grief pressure.** Now: always attempt the broadcast (more work, never less protection) and
+tolerate `is_idempotent_rebroadcast`.
+
+⚠️ **The coloured twin has the same shape** (`let already = transaction_get(..).is_ok(); if !already
+{ … }`) and the guard's classifier does not match that spelling. Same latent defect, one lane over.

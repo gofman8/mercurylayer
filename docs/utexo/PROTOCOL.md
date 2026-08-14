@@ -530,8 +530,16 @@ afterwards even past E blocks.
 >
 > What is proven is that the grief is **survivable**: the value comes out. What is not proven is that
 > it is **cheap** — the coin going on-chain is the outcome the FATAL-downgrade says it avoids. Until
-> `cosign_detrigger` is wired and an E2E lands F′ plus a rebuilt ladder, the specification must say
-> "the owner can always spend out, on-chain" and not "the ladder resets fresh".
+> **[D68] `cosign_detrigger` IS NOW WIRED** — `UtexoWallet::detrigger_to_owner`, driven end to end by
+> `SDK_E2E=89`: a griefer confirms `T`; the owner answers with a de-trigger spending `T.out[0]` at no
+> relative timelock; it confirms; the value lands at an address the OWNER named; and the pre-signed
+> extension is then submitted to the node and REFUSED — `bad-txns-inputs-missingorspent`. The old
+> ladder is dead, measured against bitcoind rather than inferred.
+>
+> So the specification may now say: **the owner chooses when the coin lands, in two transactions with
+> zero CSV wait, and every retained tier dies with it.** It still may NOT say "the ladder resets
+> fresh" — there is no `F′` and no rebuilt `T′/X′_0/S′_0` on this lane, so getting back off-chain is
+> a fresh deposit. That restoration half remains unbuilt.
 
 The colored (168-vB `opret`) variant and the mass-grief prioritization policy (R-1 / O-6) are not
 test-covered either.

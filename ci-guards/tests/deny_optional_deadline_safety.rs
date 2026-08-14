@@ -356,9 +356,64 @@ fn deadline_pass_is_unconditional(method_src: &str) -> Result<(), String> {
 fn the_background_loop_always_runs_a_deadline_pass() {
     let code = code_only(&read("clients/libs/rust-sdk/src/wallet.rs"));
     let body = method_body(&code, "pub fn start_background(&self)");
-    if let Err(why) = deadline_pass_is_unconditional(body) {
-        panic!("{why}");
-    }
+
+    // ═══ [D66] THIS GUARD NO LONGER CARRIES THE PROPERTY, AND SAYS SO ═══
+    //
+    // [D64] defeated the version of this test that tried to: its rule was "the token appears at
+    // brace-depth 0 of the loop", and
+    //
+    //     let _ = cfg.background_auto_refresh && wallet.deadline_safety_due(..).await.is_ok();
+    //
+    // satisfies it while restoring D58's defect exactly — `&&` short-circuits with no brace to
+    // count. **Reachability is not expressible in a substring**, so no amount of rewriting this
+    // scan can hold the property.
+    //
+    // The property now lives in a VALUE: `maintenance_plan(&config)` returns the passes a tick runs,
+    // the loop executes the plan, and `every_config_still_schedules_the_deadline_pass` CALLS it over
+    // all 32 config combinations. That is a behavioural proof — the `&&` mutation cannot be written
+    // against a `Vec` the caller iterates.
+    //
+    // What is left for a source scan is the WIRING: that the loop still consumes the plan and still
+    // reaches the pass through it. If that breaks, the behavioural test would keep passing while the
+    // loop ignored its result, so this half is worth pinning — but it is the smaller half, and the
+    // name of this test must not be read as more than it is.
+    assert!(
+        body.contains("maintenance_plan("),
+        "`start_background` no longer consumes `maintenance_plan`. The plan is where the property \
+         'a deadline pass runs on every path' is PROVED (by \
+         `every_config_still_schedules_the_deadline_pass`, over all 32 config combinations); if the \
+         loop stops reading it, that proof is about a value nobody uses:\n\n{body}"
+    );
+    assert!(
+        body.contains("MaintenancePass::DeadlineSafety"),
+        "the loop no longer has an arm for `MaintenancePass::DeadlineSafety`. The match is \
+         exhaustive, so a missing arm is a compile error — unless a wildcard was added, which is \
+         what this pins against:\n\n{body}"
+    );
+    assert!(
+        !body.contains("_ =>"),
+        "the loop's match over `MaintenancePass` gained a wildcard arm. Exhaustiveness is the \
+         mechanism that makes a NEW pass a compile error here rather than a silently ignored \
+         variant — a wildcard removes it:\n\n{body}"
+    );
+    assert!(
+        body.contains("deadline_safety_due("),
+        "the `DeadlineSafety` arm no longer calls `deadline_safety_due`:\n\n{body}"
+    );
+
+    // The original scan is NOT applied to the real tree any more, and the reason is worth stating
+    // because I tried to keep it and it immediately contradicted the fix.
+    //
+    // `deadline_pass_is_unconditional` requires the call to sit at brace-depth 0 of the poll loop.
+    // Under [D66] it sits inside a `match` arm of `for pass in maintenance_plan(..)`, at depth 3 —
+    // so the predicate reports the CORRECT architecture as the shipped defect. A guard that fires on
+    // right code is worse than no guard: it is fixed by weakening it, every time, until it means
+    // nothing.
+    //
+    // The predicate is kept and still exercised — by `guard_rejects_every_shape_that_leaves_a_path_
+    // without_a_deadline_pass` and `guard_accepts_the_corrected_shapes`, which drive it over PLANTED
+    // shapes. It remains a tested detector of the crude `if`/`else` forms. It is simply no longer
+    // the thing that decides whether the shipped loop is correct, because [D64] proved it cannot be.
 }
 
 /// NON-VACUITY, and the whole reason this file was rewritten. A guard that cannot say no is
@@ -579,11 +634,20 @@ fn the_cooperative_route_falls_back_to_severing() {
             "the cooperative re-anchor is no longer tried first. It is the cheap remedy and it \
              keeps the coin off-chain; severing costs the coin its off-chain life:\n\n{body}"
         ));
-    let sever = scrubbed.find("self.unilateral_exit(").unwrap_or_else(|| panic!(
-        "there is no unilateral fallback. Re-anchoring needs one fresh SE co-signature, and under \
-         D40.1 the adversary IS the party asked to sign — a defence that can be declined by its \
-         adversary is not a defence:\n\n{body}"
-    ));
+    // [D67] EITHER spelling of the sever. `sever_from_f` IS `unilateral_exit` on one coin — it is
+    // the same call under the name of what it is for — and the pass now routes through the named
+    // remedy so that the doc's "it is also what `deadline_safety_due` falls back to" is true of the
+    // symbol as well as of the behaviour. Accepting only one spelling would make a rename look like
+    // a deleted defence.
+    let sever = scrubbed
+        .find("self.sever_from_f(")
+        .or_else(|| scrubbed.find("self.unilateral_exit("))
+        .unwrap_or_else(|| panic!(
+            "there is no unilateral fallback (neither `self.sever_from_f(` nor \
+             `self.unilateral_exit(`). Re-anchoring needs one fresh SE co-signature, and under \
+             D40.1 the adversary IS the party asked to sign — a defence that can be declined by its \
+             adversary is not a defence:\n\n{body}"
+        ));
     assert!(
         coop < sever,
         "the sever at byte {sever} precedes the cooperative re-anchor at byte {coop}. The order is \

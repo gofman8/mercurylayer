@@ -117,10 +117,13 @@ fn the_unilateral_deadline_route_covers_carriers() {
          Excluding it here hides the coin instead:\n\n{still_due}"
     );
     // …and it still SEVERES rather than re-anchoring. A carrier re-anchored is a carrier destroyed.
+    // [D67] Either spelling of the sever. `sever_from_f` IS `unilateral_exit` on one coin, and the
+    // pass now routes through the NAMED remedy so the doc's "it is also what `deadline_safety_due`
+    // falls back to" is true of the symbol too. What must never appear here is a RE-ANCHOR.
     assert!(
-        b.contains("unilateral_exit("),
-        "the forced action is no longer `unilateral_exit`. If this route ever re-anchors instead, it \
-         destroys exactly the allocations it was extended to protect:\n\n{b}"
+        b.contains("sever_from_f(") || b.contains("unilateral_exit("),
+        "the forced action is neither `sever_from_f` nor `unilateral_exit`. If this route ever \
+         re-anchors instead, it destroys exactly the allocations it was extended to protect:\n\n{b}"
     );
 }
 

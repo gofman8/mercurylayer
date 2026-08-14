@@ -102,6 +102,7 @@ pub mod sdk85_transfer_cancel;
 pub mod sdk86_received_coin_ages;
 pub mod sdk87_carrier_deadline;
 pub mod sdk88_carrier_headroom;
+pub mod sdk89_plain_detrigger;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -534,6 +535,12 @@ async fn main() -> Result<()> {
     // is an ASSET, so the refusal must leave NOTHING booked.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("88") {
         sdk88_carrier_headroom::execute().await?;
+        return Ok(());
+    }
+
+    // [D68] The PLAIN de-trigger, wired at last: `cosign_detrigger` had zero production callers.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("89") {
+        sdk89_plain_detrigger::execute().await?;
         return Ok(());
     }
 
