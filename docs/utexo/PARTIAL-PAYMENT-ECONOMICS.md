@@ -67,6 +67,32 @@ better, and at zero coverage it is better by 6.8×.
 §0.5/§0.7 is unaffected — it is a satoshi quantity, independent of K and of the aggregate block-space
 story. The SSP's ~1 057-sat margin at 3 sat/vB stands.
 
+### 0.3 WHO THE USER IS — the leaf lane is the normal one, and it is the one that loses
+
+**Do not quote the whole-coin economics as representative.** Payments are arbitrary amounts, so every
+non-exact payment is an in-ladder split and the payee receives a CHILD. A ROOT holder is the
+DEPOSITOR, or the rare payee of an exact-amount transfer. **After the first payment, everyone
+downstream is on the leaf lane.**
+
+| who | block space per payment | against ~154 vB on chain |
+|---|---:|---|
+| **leaf, spent onward off-chain** | **0** | this is the product |
+| **leaf, swept** (§0.7) | 58 vB | 0.38× |
+| **leaf, WALKED out — the shipped default** | **250 vB** | **1.62× WORSE** |
+| root holder — depositor only | ~589 vB/yr ⇒ 5.9 at 100 payments/yr | 26× |
+
+The root row is the most flattering number in this document and it describes almost nobody once
+payments start flowing. **For the population that actually exists, the shipped default settles a
+payment for MORE block space than doing it on chain** — 250 vB against 154. That is the sentence to
+lead with, and §0.7's sweep is what changes it: not an optimisation on a winning position, but the
+precondition for the median user's economics being positive at all ([D81]).
+
+**Why the distribution is not what we save** — a batched on-chain payout is nearly free too
+(~44 vB/recipient). What we sell is every payment AFTER the first: on chain another ~154 vB each, off
+chain zero. So the saving is a function of how many times value MOVES before it settles, and the
+design rule follows: **a piece received and immediately cashed out should never have been an
+off-chain split.**
+
 ### 0.4 What the sweep is for — it protects the result, it does not create it
 
 Without a sweep, settlement is 29 800 vB and NOTHING makes the lane win — an on-chain batched payout
