@@ -581,9 +581,12 @@ un-laddered/colored split; the in-ladder split has its own model, §6.1).
 **Executor floor (laddered parent).** `min_split_output` is the PLANNER's floor. When the chosen
 parent is laddered, the in-ladder executor applies a second, strictly larger floor and the larger of
 the two binds: a child funds its OWN extension + state tier before it can clear dust, so
-`min_child_value = 2·(committed_fee(rate) + 240) + 330` — **1310 sat** at the default 2 sat/vB
-committed rate (`2·(250 + 240) + 330`; the superseded 1306 priced a 124-vB tier, before [D4]
-measured 125), versus the old 442. Both the piece and the change MUST clear
+`min_child_value = 2·(committed_fee(rate) + 240) + 330` — **1 560 sat** at the shipped
+`committed_fee_rate = 3.0` ([D44]: `2·(375 + 240) + 330`), versus the old 442. It was 1 310 while the
+committed rate was 2.0, and 1 306 before [D4] measured the tier at 125 vB rather than 124.
+**[D56] The floor is a function of the RATE — quoting one of these numbers without its rate is
+quoting a rate**, which is how the code's own derivation comment went stale in silence: every floor
+test froze `rate = 2.0` as a fixture, so raising the shipped rate broke none of them. Both the piece and the change MUST clear
 `max(min_split_output, min_child_value)` or the split is refused UP-FRONT (ERR-16). Up-front is
 load-bearing: `establish_child` runs AFTER the parent's spend budget is consumed and `SP` is
 co-signed, so admitting a child below the floor terminalized the parent and THEN failed, stranding
@@ -648,6 +651,27 @@ consumed (ERR-16). Verified by `sdk58` (accept + 11 adversarial cases REJECT: ag
 hidden-state, Model-A payee, parent terminality, child-superseded race, count-padding, value-spoof),
 `sdk59` (end-to-end split payment), `sdk04` (the terminalized parent refuses a second spend at both
 the wallet and the SE).
+
+**REQ-47 (split depth) [D53] The build side MUST NOT mint a child the receive side would refuse.**
+A conveyed child is admitted by `check_exit_headroom_with_margin` — the exit walk must fit inside the
+epoch the payee inherits WITH `exit_slack_margin = max(required/4, required/tiers)` of head-room, not
+merely by the bare latency rule `exit_wait_blocks <= epoch`. Both sides MUST evaluate the SAME rule.
+
+The caps that follow are **derived, not chosen**: depth **8** on mainnet (19 transactions to walk),
+depth **54** on regtest (111). They are stated here because the failure they prevent is silent and
+expensive: while the builder used the bare rule and the payee used the margin rule, depths 9 and 10
+were BUILT and were unadoptable at every tip — and since a parent is terminalized before its child is
+conveyed, each such child was a stranded piece with a terminalized parent behind it. Held together by
+`the_build_side_never_admits_what_the_receive_side_refuses`; nine tests pinned the old numbers and
+were green.
+
+**REQ-48 (the payee's clock) [D55]** The window a split is measured against MUST be derived from the
+PARENT's own conveyed backup chain, never from a freshly-read epoch. The builder measuring a fresh
+epoch while the payee measures `epoch_expiry − tip` is [D36]'s T-4, and it admits splits the payee
+cannot use. The parent's flat backups travel with the bundle for exactly this reason — **a local
+lookup and a conveyed fact are not interchangeable**: a wallet holding a conveyed CHILD has never
+held the root, so looking the backups up by `(wallet, parent_sid)` finds nothing (`sdk17` catches
+this immediately).
 
 ### 6.2 Branch split & combine (un-laddered coins, colored splits)
 This is the shape RGB rides (§7) and the only one left for a coin that cannot be laddered.
@@ -875,8 +899,8 @@ COOPERATIVE (it needs the SE); if the SE is gone the owner exits unilaterally (�
 fee is drawn from the coin (single-input, blind SE), so the user-pays variant yields `amount − fee`.
 `refresh_sponsored` reimburses that fee OFF-CHAIN from a funded sponsor; because the rebate is a
 non-exact payment out of the sponsor's own (laddered) coin it is minted by an in-ladder split, so
-the rebate MUST be sized to `max(fee + dust, min_child_value)` — 1310 sat at 2 sat/vB, not the old
-442. Sizing it into that dead window made every sponsored refresh fail AFTER the user had already
+the rebate MUST be sized to `max(fee + dust, min_child_value)` — **1 560 sat** at the shipped 3.0
+([D44]; 1 310 at the superseded 2.0), not the old 442. Sizing it into that dead window made every sponsored refresh fail AFTER the user had already
 paid the on-chain fee (defect found and fixed during this migration). The operator absorbs the
 difference; the user ends ≥ whole. `sdk30` (a)/(c), `sdk38` (a broke sponsor loses boundedly).
 
@@ -1041,7 +1065,8 @@ spendable balance would let a right-holder inflate a receiver's balance out of n
   legs fall short`, naming each leg's own floor. The two legs are floored independently
   (`SplitFloors { piece, change }`): a piece always funds two rungs, the change funds whatever
   `change_leg_role()` says THAT LANE's builder gives it. At HEAD that is ONE rung
-  (`min_spine_tip_value` = 820 sat plain / `colored_spine_tip_floor` = 906 coloured, at 2 sat/vB) on
+  (`min_spine_tip_value` = **945** sat plain / `colored_spine_tip_floor` = **1 074** coloured, at the
+  shipped 3.0 — 820 / 906 at the superseded 2.0; the coloured tier is 168 vB against the plain 125) on
   the plain-root, spine-batch AND coloured lanes — CATS change 2 has landed on all three — and two
   rungs only on the plain-CHILD lane, where the change is still carved as a `Piece`.
 

@@ -26383,3 +26383,22 @@ mod zero_slack_supersession_tests {
         assert!(!clears_supersession_margin(cap - 1, live, state));
     }
 }
+
+#[cfg(test)]
+mod d44_floor_probe {
+    /// **[D44/D56] The SHIPPED floors, evaluated — so the specification quotes a measurement.**
+    ///
+    /// Not a redundant restatement of `the_shipped_schedule_floors_are_what_the_code_derives`: that
+    /// one asserts the derivation reads `TesrParams`. This one pins the NUMBERS the spec publishes,
+    /// so a rate change makes the document's own figures fail rather than go quietly stale — which
+    /// is exactly how 1 310 / 820 / 906 survived D44 in three places.
+    #[test]
+    fn the_numbers_the_specification_publishes_are_the_ones_the_code_computes() {
+        let rate = mercurylib::tesr::TesrParams::mainnet().committed_fee_rate;
+        assert_eq!(rate, 3.0, "the shipped committed fee rate moved; SPEC §5/§6/§9 quote it");
+        let dust = super::COLORED_LADDER_DUST;
+        assert_eq!(mercurylib::tesr::min_child_value(rate, dust), 1_560);
+        assert_eq!(mercurylib::tesr::min_spine_tip_value(rate, dust), 945);
+        assert_eq!(super::colored_spine_tip_floor(rate, dust), 1_074);
+    }
+}
