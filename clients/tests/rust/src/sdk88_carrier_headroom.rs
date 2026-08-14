@@ -12,9 +12,13 @@
 //! of the actual exit chain, so it does not need to know what a tier carries. But "colour-blind" is
 //! a claim about the code, and the two lanes differ in the two inputs the gate reads:
 //!
-//! * the chain is LONGER — a coloured child exits through `T → X_m → SP → ext_child → state_child`,
-//!   five tiers, each needing its own confirmation;
-//! * and every tier is DEARER, so the same sats buy a different shape.
+//! * **[D61] NOT "the chain is LONGER" — that was false and is retracted.** A coloured child exits
+//!   through `T → X_m → SP → ext_child → state_child`, five tiers — and so does a PLAIN one:
+//!   `child_exit_chain` never consults colour, and `sdk82` states the plain depth-1 chain as
+//!   `T 0 | X_m 12 | SP 0 | ext 12 | state 24`, the same five tiers with the same CSVs. The lanes
+//!   differ in ONE input the gate reads, not two;
+//! * every tier is DEARER (168 vB with the opret against 125), so the same sats buy a different
+//!   shape and the FLOORS differ — which is the real difference, and the one this test drives.
 //!
 //! A gate that happened to be right for a plain child's chain and wrong for a coloured one would
 //! pass `sdk82` and lose an asset here. The only way to know is to drive it.
@@ -47,7 +51,9 @@ const SUPPLY: u64 = 5_000;
 const PAY: u64 = 100;
 /// Blocks of epoch left when the doomed payment is claimed. Must be BELOW what a COLOURED child's
 /// five-tier exit needs and above zero, so only the headroom gate can refuse it — the same shape
-/// `sdk82` uses for the plain lane, re-derived for a chain that is two tiers longer.
+/// `sdk82` uses for the plain lane. **[D61]** This comment said "re-derived for a chain that is two
+/// tiers longer"; the chains are the same length (see the module note). What differs is the per-tier
+/// COST, so the value is re-derived for a dearer chain of the same shape.
 const HEADROOM_LEFT: u32 = 30;
 
 async fn wallet(name: &str) -> Result<UtexoWallet> {
@@ -291,7 +297,16 @@ pub async fn execute() -> Result<()> {
         .ok_or_else(|| anyhow!("the control child is gone — its chain is this check's input"))?;
     let chain = mercuryrustlib::tesr::child_exit_chain_bound(&control_child)?;
     let csvs: Vec<Option<u16>> = chain.iter().map(|(_, c)| *c).collect();
-    assert_eq!(csvs.len(), 5, "a coloured child exits through five tiers, not the plain lane's three");
+    // [D61] Five tiers — `T, X_m, SP, ext_child, state_child`. This used to add "not the plain
+    // lane's three", which is FALSE: `child_exit_chain` is colour-blind and the plain depth-1 chain
+    // is the same five. The count is still worth pinning (a shape change would move it) but it is
+    // not evidence of a lane difference, and the spec must not say the coloured chain is longer.
+    assert_eq!(
+        csvs.len(),
+        5,
+        "a depth-1 child exits through five tiers (T, X_m, SP, ext_child, state_child) on EITHER \
+         lane — `child_exit_chain` does not consult colour"
+    );
     let shortfall = mercurylib::transfer::receiver::check_exit_headroom_with_margin(
         &csvs, now, expiry,
     )
@@ -311,7 +326,15 @@ pub async fn execute() -> Result<()> {
         shortfall.available,
         shortfall.shortfall
     );
-    let _ = (&refusal, &split);
+    // [D61] `let _ = (&refusal, &split);` discarded WHICH arm fired, so a run in which the sender
+    // refused and a run in which the receiver did were indistinguishable — and they are different
+    // properties. Report it instead: either is correct here (see the note at `refusal`), but the
+    // reader of a passing log must be able to tell which one this run exercised.
+    println!(
+        "SDK88 - (b) the refusing side on THIS run: sender_refused={}, split_completed={}",
+        refusal.is_some(),
+        split.is_ok()
+    );
 
     println!(
         "SDK88 PASS - [Stage 3] the exit-headroom bound holds on the COLOURED lane: an honest \

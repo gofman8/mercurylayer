@@ -126,6 +126,36 @@ fn ladder_capacity_is_initlock_over_interval() {
         assert_eq!(ladder_capacity(initlock, interval), 100, "both profiles: 100 hops");
         // Floor: hop 100 locks exactly at the co-sign anchor.
         assert_eq!(ladder_locktime(H, initlock, interval, 100), H);
+
+        // ═══ [D62] THE USABLE COUNT IS 99, NOT 100 — and the docs said 100 ═══
+        //
+        // `ladder_capacity` counts DECREMENTS, and hop 100 lands the locktime exactly on `H`, the
+        // co-sign anchor. The receiver's own rule is
+        //
+        //     if lock_time.to_consensus_u32() <= current_blockheight { refuse }
+        //
+        // — note `<=`, not `<`. A coin is co-signed at `H` and every subsequent block advances the
+        // tip, so by the time hop 100 could be offered the tip is at or past `H` and its backup is
+        // refused. Hop 99 is the last one a receiver will take.
+        //
+        // The error is in the SAFE direction (a wallet that believes 100 finds the 100th refused,
+        // rather than believing 99 and losing one), which is exactly why it survived: nothing fails
+        // when a bound is quoted one too generous. It is asserted here so the spec quotes the
+        // number a receiver will actually honour.
+        let tip_at_hop_100 = H; // the tip cannot be below the anchor when the 100th hop is offered
+        assert!(
+            ladder_locktime(H, initlock, interval, 100) <= tip_at_hop_100,
+            "hop 100's locktime must be at or below the anchor, which is what makes it unusable"
+        );
+        assert!(
+            ladder_locktime(H, initlock, interval, 99) > tip_at_hop_100,
+            "hop 99 must still be strictly above the anchor — it is the last USABLE hop"
+        );
+        assert_eq!(
+            ladder_capacity(initlock, interval) - 1,
+            99,
+            "[D62] usable hops = capacity - 1 = 99 on both presets"
+        );
         // Beyond capacity: no guard — one interval BELOW the anchor, returned Ok.
         assert_eq!(ladder_locktime(H, initlock, interval, 101), H - interval);
     }

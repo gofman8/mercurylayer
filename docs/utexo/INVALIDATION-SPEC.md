@@ -104,7 +104,7 @@ Defaults are set in server/src/server_config.rs:69-70. Clients obtain the live v
   `interval` SHOULD divide `initlock` exactly; if it does not, the unusable remainder
   `initlock mod interval` is dead ladder headroom. Derived quantities:
   - **ladder capacity** = `floor(initlock / interval)` ownership hops before the ladder floor
-    reaches the co-sign tip (100 hops in both profiles);
+    reaches the co-sign tip — **100 decrements, of which 99 are usable [D62]**: hop 100 lands exactly on the anchor and the receiver's `lock_time <= tip` refuses it;
   - **exclusive-window width** = `interval` blocks (§2, IVL-INV-3).
 - **IVL-REQ-3 (sizing trade-offs)** `initlock` bounds the *worst-case unilateral-exit wait* and the
   current owner's *maximum stale-backup exposure horizon*; at ~144 blocks/day the deployed profile

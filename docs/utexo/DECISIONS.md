@@ -1551,7 +1551,7 @@ ASSET rather than sats.
 
 `sdk86` measured today that the calendar this protects is real: the flat backup chain's absolute
 locktime is finite, mining moves the tip toward it, and each whole-coin hop spends `interval` of it
-(100 hops on either preset). INV-27's "idle coins never age" is true of the CSV side only.
+(100 decrements on either preset, **99 usable** — see [D62]). INV-27's "idle coins never age" is true of the CSV side only.
 
 Nothing surfaces that calendar to a user today, which is why the automatic pass — not an API field —
 is the answer for the lane that can lose an asset.
@@ -2227,3 +2227,67 @@ census now covers it.
 
 **The lesson, which is this session's in one more costume:** a guard whose set is hand-maintained
 polices what someone remembered, not what exists. Derive the set, then pin the derivation.
+
+---
+
+## D61 — Four tests and two comments that measured something other than their name
+
+**Status:** FIXED. **Date:** 2026-08-14. All found by the pre-spec review's Tier 5/6.
+
+* **`sdk88`: "a coloured child exits through five tiers, not the plain lane's three."** The plain
+  depth-1 chain is `T | X_m | SP | ext | state` — the **same five**, with the same CSVs, as `sdk82`
+  states. `child_exit_chain` never consults colour. The lanes differ in per-tier COST, not chain
+  length, and the module header's "the chain is LONGER" went with it. **Do not write "the coloured
+  exit chain is longer" in the spec.** Its `let _ = (&refusal, &split);` also discarded which arm
+  fired, making a sender-refusal run and a receiver-refusal run indistinguishable in the log; both
+  are now reported.
+* **`sdk87` (d) "THE ALLOCATION SURVIVED"** asserted two readers of the *same persisted row*:
+  `colored_carriers` resolves `tesr::load(..).rgb.amount`, and `token_balance` sums that same row via
+  `ledger_token_balances`. Nothing in the sever path rewrites it, so both held for every outcome
+  including a destroyed allocation. It now re-reads the **RGB engine's own allocation set** after the
+  sever and asserts the units total `SUPPLY` and no longer sit at the spent funding outpoint.
+* **`live_p2a_package_rescue`**: a test named
+  `the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_limit` contained
+  **zero** `broadcast_tier` calls — the seam test below it makes five. Renamed to
+  `the_bump_primitives_sign_and_submit_against_a_real_node`, which is what it does.
+* …and that file's header promised *"It skips, loudly … so a green run cannot be mistaken for a
+  verified rescue."* Under a plain `cargo test`, `eprintln!` is captured and the target reports
+  `ok. 4 passed … 0.00s`. **`REQUIRE_LIVE_NODE=1` now turns every skip into a `panic!`** — verified:
+  4 pass without it, 4 fail with it and no node.
+* **`change_leg_role`'s doc**: "the other **two** lanes still report `Piece`". Three lanes report
+  `SpineTip` (`PlainRoot | SpineBatch`, and `Colored` on its own arm) and **one** reports `Piece`.
+  The comment was written when only `PlainRoot` had flipped and the `Colored` arm's own landing note
+  was added beneath it without updating the count. `SPEC.md` §12 ERR-16 was the correct half.
+* **`ADMISSION-INPUTS.md`'s residual** — *"A sender declaring wide params relaxes its own bounds
+  check"* — is **CLOSED on every shipping acceptance path** (`cap_schedule` runs at both receiver
+  sites and in `verify_conveyed_child`; `schedule_disagreement` compares all seven integral fields
+  plus the fee rate). Deleted rather than re-scoped.
+
+---
+
+## D62 — The ladder's usable hop count is 99, not 100
+
+**Status:** FIXED (test + four documents). **Date:** 2026-08-14.
+
+`ladder_capacity = initlock / interval` = 100 on both presets, and four documents published "100
+hops". That counts **decrements**. Hop 100 lands the locktime exactly on the co-sign anchor `H`, and
+the receiver's rule is `if lock_time <= current_blockheight { refuse }` — note `<=`. The tip is at or
+past `H` by the time a 100th hop could be offered, so **hop 99 is the last one a receiver will take**.
+
+The error is in the safe direction, which is exactly why it survived: nothing fails when a bound is
+quoted one too generous. `ladder_capacity_is_initlock_over_interval` now asserts the boundary from
+both sides so the spec can quote the number a receiver honours.
+
+---
+
+## D63 — A guard that went red once under concurrency, for a reason that was not the property
+
+**Status:** FIXED. **Date:** 2026-08-14.
+
+`deny_silent_degradation` built every scratch tree at a deterministic `temp_dir()` path with a
+`remove_dir_all` at the top of each loop, so two concurrent `cargo test` invocations raced on one
+directory and one saw a tree the other had just deleted. It went red once under exactly that.
+
+Not a defect in the guarded property — and worth fixing precisely for that reason: **a spurious red
+trains readers to re-run rather than to read, and a guard nobody believes is a guard nobody has.**
+Paths now carry the PID and a monotonic counter.

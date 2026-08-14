@@ -60,6 +60,27 @@ fn run(root: &Path) -> (i32, String) {
     run_with(root, None)
 }
 
+/// **[D63] A per-process, per-call scratch path.**
+///
+/// Every scratch dir in this file was a DETERMINISTIC shared path under `temp_dir()`, with a
+/// `remove_dir_all` at the top of each loop. Two concurrent `cargo test` invocations therefore raced
+/// on the same directory, and one of them saw a tree that the other had just deleted underneath it —
+/// this test went RED once under exactly that and passes in isolation.
+///
+/// It was never a defect in the guarded property, which is precisely why it is worth fixing: a
+/// spurious red trains readers to re-run rather than to read, and a guard nobody believes is a guard
+/// nobody has. The PID plus a monotonic counter is enough — the paths only need to be unique between
+/// concurrent processes and between calls within one.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "ci-guard-sd-{}-{}-{tag}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 #[test]
 fn script_and_allowlist_are_present_and_executable() {
     let script = script();
@@ -168,10 +189,7 @@ fn guard_catches_every_covered_spelling() {
 
     for dir in ["clients/libs", "lib", "server/src"] {
         for (label, offender) in planted {
-            let tmp = std::env::temp_dir().join(format!(
-                "ci-guard-sd-{}-{label}",
-                dir.replace('/', "_")
-            ));
+            let tmp = scratch(&format!("{}-{label}", dir.replace('/', "_")));
             let _ = std::fs::remove_dir_all(&tmp);
             let nested = tmp.join(dir).join("deep");
             std::fs::create_dir_all(&nested).unwrap();
@@ -212,7 +230,7 @@ fn guard_catches_every_covered_spelling() {
 /// depends on).
 #[test]
 fn guard_catches_a_swallow_several_lines_below_its_await() {
-    let tmp = std::env::temp_dir().join("ci-guard-sd-multiline");
+    let tmp = scratch("multiline");
     let _ = std::fs::remove_dir_all(&tmp);
     let dir = tmp.join("clients/libs/rust-sdk/src");
     std::fs::create_dir_all(&dir).unwrap();
@@ -264,7 +282,7 @@ fn guard_catches_a_swallow_several_lines_below_its_await() {
 /// line is a swallow again, however close it sits to an assert.
 #[test]
 fn the_assert_exemption_stops_at_the_assertions_closing_paren() {
-    let tmp = std::env::temp_dir().join("ci-guard-sd-assert-scope");
+    let tmp = scratch("assert-scope");
     let _ = std::fs::remove_dir_all(&tmp);
     let dir = tmp.join("lib");
     std::fs::create_dir_all(&dir).unwrap();

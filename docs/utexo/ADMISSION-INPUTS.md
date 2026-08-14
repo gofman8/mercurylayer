@@ -119,7 +119,15 @@ outright. The number of terms in the sum is thus as unforgeable as the sum itsel
 
 It is **not** an input to the requirement any more — that is now `Σ(signed nSequence + 1)` — but it
 is the source of the per-tier `[e_floor, e0]` / `[d_floor, d0]` sanity bounds in `verify_bundle_ex`
-and `verify_child_bundle`. A sender declaring wide params relaxes its own bounds check.
+and `verify_child_bundle`.
+
+**[D61] The residual this section used to record — *"A sender declaring wide params relaxes its own
+bounds check"* — is CLOSED, on every shipping acceptance path, and is deleted rather than re-scoped.**
+`cap_schedule` runs on all three: the root/flat receiver (twice, in `transfer_receiver`) and the child
+receiver (`verify_conveyed_child`), and its own comment states the property — *"the conveyed schedule
+is BOUND rather than merely unused"*. `schedule_disagreement` compares all seven integral fields plus
+`committed_fee_rate`, so a sender cannot declare anything the receiver did not already agree to. The
+one reading that said the root path was unbound was wrong.
 
 This is not a gate bypass: a wider bound only admits a tier whose real CSV is then counted **in
 full**, which makes the requirement larger, not smaller. It is recorded here rather than fixed

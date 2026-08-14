@@ -248,14 +248,43 @@ pub async fn execute() -> Result<()> {
     bitcoin_core::generatetoaddress(2, &core)?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     alice.claim().await?;
+    // [D61] THE EVIDENCE HAD TO CHANGE. This section asserted two things that are the SAME READ:
+    // `colored_carriers` resolves `tesr::load(..).rgb.amount`, and `token_balance` →
+    // `get_token_balances` → `ledger_token_balances` sums that same persisted bundle row. Nothing in
+    // the sever path rewrites it, so both held for every outcome — including one that destroyed the
+    // allocation on chain. Two readers of one row are one assertion wearing a disguise.
+    //
+    // The independent authority is the RGB ENGINE's own allocation set, which section (a) already
+    // consults to prove the coin is a carrier at all. Re-reading it AFTER the sever asks the engine
+    // where the units actually live now, and the trigger is confirmed on chain by this point (b/c
+    // proved F was spent by it), so the answer reflects the sever rather than the pre-state.
+    let allocations_after = alice.list_token_allocations(&asset).await?;
+    let total_after: u64 = allocations_after.iter().map(|(_, amt)| *amt).sum();
+    assert_eq!(
+        total_after, SUPPLY,
+        "[D46/D61] after the sever the RGB engine accounts for {total_after} units of {asset}, not \
+         {SUPPLY}. This is the engine's own allocation set, NOT the bundle row the wallet persisted \
+         — the whole point of forcing `T` rather than a re-anchor is that the allocation rides the \
+         coin's own ladder, and if the engine cannot find it, the unilateral route is as unsafe on a \
+         carrier as the cooperative one. Allocations: {allocations_after:?}"
+    );
+    assert!(
+        !allocations_after
+            .iter()
+            .any(|(op, _)| op == &format!("{f_txid}:{f_vout}")),
+        "[D61] the allocation is still recorded at the carrier's ORIGINAL funding outpoint \
+         {f_txid}:{f_vout}, which the trigger has now spent. If the engine still points there, the \
+         sever moved the sats and left the asset behind — the exact loss (d) exists to exclude. \
+         Allocations: {allocations_after:?}"
+    );
+
+    // …and the wallet's own view must AGREE with the engine. Kept as a second, weaker check: it is
+    // the number a user sees, and a divergence between it and the engine is its own defect.
     let after = colored_carriers(&cc, ALICE, &asset).await?;
     assert!(
         after.iter().any(|(sid, b)| sid == &carrier_sid
             && b.rgb.as_ref().is_some_and(|r| r.amount == SUPPLY)),
-        "[D46] the carrier's bundle no longer resolves to {SUPPLY} units of {asset} after the \
-         sever. The whole point of forcing `T` rather than a re-anchor is that the allocation rides \
-         the coin's own ladder — if it does not survive here, the unilateral route is as unsafe on a \
-         carrier as the cooperative one."
+        "[D46] the carrier's bundle no longer resolves to {SUPPLY} units of {asset} after the sever"
     );
     assert_eq!(
         token_balance(&alice, &asset).await?,

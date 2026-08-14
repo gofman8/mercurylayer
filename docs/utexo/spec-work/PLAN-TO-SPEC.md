@@ -245,7 +245,7 @@ three were found by measuring rather than reasoning, and all three are recorded 
    `sdk29`'s rewrite). The sender's change lands on a coloured spine tip, and that tip is payable
    again. A much weaker limitation than the decision was taken under.
 3. **INV-27 is true of the CSV side only** (`sdk86`). The flat calendar is real, finite, and spent by
-   HOPS as well as by blocks — `interval` per whole-coin hop, 100 hops on either preset.
+   HOPS as well as by blocks — `interval` per whole-coin hop. **[D62] The capacity is 100 decrements but only 99 are USABLE**: hop 100 lands the locktime exactly on the co-sign anchor `H`, and the receiver refuses `lock_time <= tip` (note `<=`), so by the time it could be offered the tip is at or past `H`. Pinned by `ladder_capacity_is_initlock_over_interval`.
 
 **What is left is writing.**
 

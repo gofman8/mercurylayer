@@ -129,7 +129,7 @@ transfer hands the new owner a backup one `interval` lower.
 previous owner's backup locktime (current owner wins the exit race), and each hop decrements by
 EXACTLY `interval`. `initlock`/`interval` are **compiled in per network**
 (`TesrParams::flat_ladder_params`: 10 000/100 on mainnet, testnet and signet; 1 000/10 on regtest —
-100 hops of capacity either way). The coordinator's own copy is a cross-check only: `info_config`
+100 decrements of capacity either way, of which **99 are usable** — hop 100 lands on the co-sign anchor and the receiver's `lock_time <= tip` rule refuses it [D62]). The coordinator's own copy is a cross-check only: `info_config`
 REFUSES the call outright if the two disagree. Taking `interval` from the coordinator would let the
 coordinator define the defence, and deriving it from the conveyed chain is circular — a padded chain
 of uniform `interval/2` hops validates against itself, which is the padding INV-5 exists to stop.

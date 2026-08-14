@@ -12,9 +12,22 @@
 //! REFUSES it alone, then rescues it with `mercurylib::wallet::p2a_fee_child::build_p2a_fee_child`
 //! and `mercuryrustlib::core_rpc::submit_package` — repo code for both halves.
 //!
-//! **It skips, loudly, when there is no node.** A test that silently passes without exercising
-//! anything is worse than no test: this one prints why it skipped, so a green run cannot be mistaken
-//! for a verified rescue.
+//! # [D61] What "skips loudly" really means here — the header used to overstate it
+//!
+//! This said *"It skips, loudly … so a green run cannot be mistaken for a verified rescue."* Under a
+//! plain `cargo test` that is FALSE: `eprintln!` is captured, the target reports
+//! `test result: ok. N passed … finished in 0.00s`, and the skip notice is discarded with the rest of
+//! the output. A green run could be — and was — mistaken for exactly that.
+//!
+//! Two things make the sentence true now:
+//!
+//! * **`REQUIRE_LIVE_NODE=1` turns every skip into a `panic!`.** CI (and anyone verifying an
+//!   acceptance criterion) sets it, and a missing node is then a RED test rather than a quiet pass.
+//! * without it the skips remain skips, because a developer running the whole workspace should not
+//!   need a Bitcoin Core to see the rest of the suite go green — but the header no longer claims the
+//!   skip is visible when it is not.
+//!
+//! Run: set `CORE_RPC_URL`/`USER`/`PASS`, and add `REQUIRE_LIVE_NODE=1` if a skip must be a failure.
 //!
 //! Run: `CORE_RPC_URL=http://127.0.0.1:18443 CORE_RPC_USER=user CORE_RPC_PASS=password \
 //!       cargo test -p mercuryrustlib --test live_p2a_package_rescue -- --nocapture`
@@ -106,13 +119,28 @@ fn sign_p2tr_input(tx: &mut Transaction, index: usize, prevouts: &[TxOut], kp: &
     tx.input[index].witness = w;
 }
 
+/// **[D61] A skip is a FAILURE when the caller demanded the live lane.**
+///
+/// `eprintln!` is captured by `cargo test`, so an un-run acceptance criterion is indistinguishable
+/// from a passing one. `REQUIRE_LIVE_NODE=1` is how a caller says "this run must actually exercise
+/// it" — and then a skip panics instead of returning quietly.
+fn skip_or_panic(why: &str) {
+    if std::env::var("REQUIRE_LIVE_NODE").as_deref() == Ok("1") {
+        panic!(
+            "REQUIRE_LIVE_NODE=1 was set, so this test must EXERCISE the live path — but it would \
+             have skipped: {why}"
+        );
+    }
+    eprintln!("SKIP live_p2a_package_rescue: {why}");
+}
+
 #[test]
 fn an_underpaying_v3_tier_is_rescued_through_this_repos_own_code() {
     let Some(cfg) = cfg() else {
-        eprintln!(
-            "SKIP live_p2a_package_rescue: CORE_RPC_URL is unset, so NOTHING was verified. This \
-             test is the WP1 acceptance criterion (a rescue through repo code, not bitcoin-cli); a \
-             green run without it proves nothing. Set CORE_RPC_URL/USER/PASS to run it."
+        skip_or_panic(
+            "CORE_RPC_URL is unset, so NOTHING was verified. This test is the WP1 acceptance \
+             criterion (a rescue through repo code, not bitcoin-cli); a green run without it proves \
+             nothing. Set CORE_RPC_URL/USER/PASS to run it.",
         );
         return;
     };
@@ -171,9 +199,9 @@ fn an_underpaying_v3_tier_is_rescued_through_this_repos_own_code() {
 
     let required_at_floor = (floor_sat_per_vb * measured_vsize as f64).ceil() as u64;
     if required_at_floor < 2 {
-        eprintln!(
+        skip_or_panic(&format!(
             "SKIP: this node's minrelaytxfee is {floor_sat_per_vb} sat/vB, so a {measured_vsize} vB              tier needs only {required_at_floor} sat to clear it and no under-paying parent can be              built. Start bitcoind with a higher -minrelaytxfee to exercise the rescue. NOTHING was              verified."
-        );
+        ));
         return;
     }
     // Comfortably under the floor, so the refusal is unambiguous rather than a rounding accident.
@@ -281,19 +309,22 @@ fn an_underpaying_v3_tier_is_rescued_through_this_repos_own_code() {
 }
 
 
-/// **The wiring, not just the primitive.** [D31 / #123]
+/// **[D61] RENAMED — this test does not call `broadcast_tier`, and its old name said it did.**
 ///
-/// The test above proves the two pieces work. This one proves the SEAM `exit_pass` and `watch_pass`
-/// now go through does: `broadcast_tier` must try the cheap path first, escalate to a package only
-/// when a capability was supplied, and — the part that matters for a keyless tower — report a stuck
-/// tier as a STATED LIMIT rather than a retryable blip when no capability exists.
+/// It was `the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_limit`, and its
+/// docstring claimed to prove what the SEAM (`broadcast_tier`) does: cheap path first, escalate on a
+/// capability, name the limit without one. A grep of its body for `broadcast_tier` returns **zero**.
+/// Those claims are proved by `the_seam_tries_cheap_first_rescues_with_a_capability_and_names_the_limit_without_one`
+/// below, which calls it five times and is the strongest test in this file.
 ///
-/// It drives `P2trKeySpendBumpSigner` + `BumpCapability` end to end against the real node, so a
-/// break in the signer, the anchor-vout lookup or the package submission fails here.
+/// What THIS one actually does — and it is worth keeping — is drive the two PRIMITIVES the seam is
+/// built out of, `P2trKeySpendBumpSigner` and `BumpCapability`, end to end against a real node. A
+/// break in the signer, the anchor-vout lookup or the package submission fails here first, with a
+/// much smaller surface to bisect than the seam test's.
 #[test]
-fn the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_limit() {
+fn the_bump_primitives_sign_and_submit_against_a_real_node() {
     let Some(cfg) = cfg() else {
-        eprintln!("SKIP: CORE_RPC_URL unset — the wiring was NOT exercised.");
+        skip_or_panic("CORE_RPC_URL unset — the wiring was NOT exercised.");
         return;
     };
 
@@ -334,7 +365,7 @@ fn the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_lim
     };
     let required = (floor * vsize as f64).ceil() as u64;
     if required < 2 {
-        eprintln!("SKIP: floor too low to build an under-paying tier. NOTHING verified.");
+        skip_or_panic("floor too low to build an under-paying tier. NOTHING verified.");
         return;
     }
     let mut tier = mk(required / 2);
@@ -424,11 +455,11 @@ fn the_bump_capability_rescues_a_stuck_tier_and_its_absence_is_reported_as_a_lim
 #[test]
 fn a_third_party_can_only_take_the_anchor_slot_by_paying_more() {
     let Some(cfg) = cfg() else {
-        eprintln!(
+        skip_or_panic(&format!(
             "SKIP anchor-squat: CORE_RPC_URL is unset, so NOTHING was verified. This is the Stage-3 \
              negative test for third-party anchor contention; a green run without a node proves \
              nothing. Set CORE_RPC_URL/USER/PASS to run it."
-        );
+        ));
         return;
     };
 
@@ -477,10 +508,10 @@ fn a_third_party_can_only_take_the_anchor_slot_by_paying_more() {
     };
     let required = (floor * vsize as f64).ceil() as u64;
     if required < 2 {
-        eprintln!(
+        skip_or_panic(&format!(
             "SKIP anchor-squat: this node's floor is {floor} sat/vB, so no under-paying tier can be \
              built and the rescue this test contests would not be needed. NOTHING verified."
-        );
+        ));
         return;
     }
     let under_fee = required / 2;
@@ -683,21 +714,21 @@ fn a_third_party_can_only_take_the_anchor_slot_by_paying_more() {
 #[test]
 fn the_seam_tries_cheap_first_rescues_with_a_capability_and_names_the_limit_without_one() {
     let Some(cfg) = cfg() else {
-        eprintln!(
+        skip_or_panic(&format!(
             "SKIP seam test: CORE_RPC_URL is unset, so NOTHING was verified. This is the Stage-3 \
              test that `broadcast_tier` — the seam `exit_pass`/`watch_pass` go through — behaves as \
              specified. Set CORE_RPC_URL/USER/PASS to run it."
-        );
+        ));
         return;
     };
     let electrum_url =
         std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "tcp://localhost:50001".to_string());
     let Ok(electrum) = electrum_client::Client::new(&electrum_url) else {
-        eprintln!(
+        skip_or_panic(&format!(
             "SKIP seam test: no electrum at {electrum_url}. `broadcast_tier` broadcasts through \
              electrum, so the seam CANNOT be exercised without one and NOTHING was verified. Set \
              ELECTRUM_URL."
-        );
+        ));
         return;
     };
 
@@ -737,10 +768,10 @@ fn the_seam_tries_cheap_first_rescues_with_a_capability_and_names_the_limit_with
     };
     let required = (floor * vsize as f64).ceil() as u64;
     if required < 2 {
-        eprintln!(
+        skip_or_panic(&format!(
             "SKIP seam test: this node's floor is {floor} sat/vB, so no under-paying tier can be \
              built and halves 2 and 3 would be vacuous. NOTHING verified."
-        );
+        ));
         return;
     }
     let mut fine = mk(a_txid, a_vout, required * 4);

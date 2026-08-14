@@ -4504,11 +4504,18 @@ pub enum SplitLane {
 /// change leg — so the floor a payment is admitted at and the ladder the builder then constructs can
 /// never be two different shapes.
 ///
-/// * [`SplitLane::PlainRoot`] reports [`SplitLegRole::SpineTip`]: `in_ladder_split` builds the last
-///   leg as ONE cap tier directly over `SP.out[K]` (see `establish_spine_tip_journalled`), so the
-///   change funds one rung and its floor is `min_spine_tip_value`, not `min_child_value`.
-/// * the other two lanes still report [`SplitLegRole::Piece`], because their builders still send
-///   every leg through `establish_child`, which hangs an extension *and* a state off `SP.out[j]`.
+/// * **THREE** lanes report [`SplitLegRole::SpineTip`] — `PlainRoot` and `SpineBatch` share an arm,
+///   and `Colored` has its own: each builds the last leg as ONE cap tier directly over `SP.out[K]`
+///   (see `establish_spine_tip_journalled`), so the change funds one rung and its floor is
+///   `min_spine_tip_value` / `colored_spine_tip_floor`, not `min_child_value`.
+/// * **ONE** lane still reports [`SplitLegRole::Piece`] — `PlainChild` — because its builder still
+///   sends every leg through `establish_child`, which hangs an extension *and* a state off
+///   `SP.out[j]`.
+///
+/// **[D61] This list said "the other TWO lanes still report `Piece`".** It was written when only
+/// `PlainRoot` had flipped, and the `Colored` arm's own landing note (below, "S3 — LANDED, on the
+/// third attempt") was added without updating the count above it. `SPEC.md` §12 ERR-16's three-lane
+/// statement is the correct one; this comment was the stale half of that pair.
 ///
 /// **An arm may only be flipped in the same commit as its builder, never before it.** The direction
 /// of the error is the whole reason this is a function and not a comment:
