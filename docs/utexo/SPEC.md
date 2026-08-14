@@ -1321,6 +1321,23 @@ are stated as limits rather than as things to fix.
 * **The P2A anchor slot is an auction, not a race** — [D45]. An under-paying squat is refused; an
   over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
   a price, not a denial of service.
+* **BLOCK SPACE IS BOUGHT WITH PAYMENT FREQUENCY, NOT WITH PAYMENT GRANULARITY — and in the split
+  lane the claim can INVERT.** State it with the bound or not at all.
+
+  | shape | on-chain cost | against |
+  |---|---|---|
+  | whole coin, ~99 off-chain hops | 1 deposit + 112-vB re-anchor + 1 cooperative exit ≈ **330 vB** | ~10 890 vB for 99 on-chain payments — **≈33×** |
+  | split child, settled ALONE | `3 + 2d` transactions — **668 vB** at depth 1 | ~110 vB had the payment been made on chain — **6× WORSE** |
+  | k siblings, settled together | spine once + one `combine_leaves` transaction: `3 + 1`, not `3 + 2k` | the saving returns |
+
+  A child has **no one-transaction cooperative exit** — its funding output `SP.out[j]` is
+  un-broadcast, and the root that could have been spent directly was terminalized by the split. So a
+  split piece's only route on chain is materialising its ancestor spine, and there is no shortcut to
+  invent. **The design converts payment frequency into block space at a good rate and payment
+  granularity at a bad one.** `min_child_value` (§5.1) is what keeps the second row from being minted
+  in the first place; batching (a sweep that accumulates siblings and settles them with one combine)
+  is what would make it cheap. The primitive exists; the sweep does not (§14.2 L-13).
+
 * **THE ON-CHAIN CADENCE IS REAL, AND IT IS THE FLAT CALENDAR — not the tier chain** ([T-1]/[T-2]).
   This is the number to quote when someone asks what the design saves, because "zero rent" is true of
   the tiers and false of the coin. On the mainnet profile (`initlock = 10 000`, `interval = 100`):
