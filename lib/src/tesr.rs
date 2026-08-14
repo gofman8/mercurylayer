@@ -172,9 +172,18 @@ pub fn min_child_value(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
 /// `D0`, so the rung is dead weight). So it funds ONE rung, not two:
 ///
 /// ```text
-/// min_spine_tip_value = committed_fee + P2A + dust = 250 + 240 + 330 = 820   @ 2 sat/vB
-/// min_child_value     = 2·(committed_fee + P2A) + dust                = 1 310
+/// @ the SHIPPED rate, committed_fee_rate = 3.0 sat/vB ([D44]); committed_fee = 125 vB · 3 = 375
+/// min_spine_tip_value = committed_fee + P2A + dust     = 375 + 240 + 330        =   945
+/// min_child_value     = 2·(committed_fee + P2A) + dust = 2·(375 + 240) + 330    = 1 560
+///
+/// @ 2.0 sat/vB, the rate this comment was written at and the code no longer uses:
+/// min_spine_tip_value = 820      min_child_value = 1 310
 /// ```
+///
+/// **[D56] Both functions take the rate as an ARGUMENT — the numbers above are evaluations, not
+/// constants**, and a reader who lifts one is quoting a rate rather than a floor. That is not a
+/// hypothetical: every floor test froze `rate = 2.0` as a fixture, so raising the shipped rate to
+/// 3.0 broke none of them and this comment went stale in silence.
 ///
 /// ⚠️ **This floor is for the CHANGE leg only.** Applying it to a payee's piece admits a piece that
 /// cannot fund its own two tiers — and it dies inside `establish_child`, i.e. *after* the parent's

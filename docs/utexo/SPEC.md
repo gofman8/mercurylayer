@@ -126,6 +126,71 @@ deadline at all, but its defender must react within the CSV edge once someone pu
 the trigger (§9.5, INV-28). No custody rests on the SE in either case, and nothing ever expires to
 the operator.
 
+
+### 1.1 Adversary model
+
+Eleven adversaries are modelled. The two columns that matter are what each one CONTROLS and what it
+provably cannot do; a full treatment with the mechanism behind each entry is in
+[`spec-work/SPEC-FOUNDATION.md`](spec-work/SPEC-FOUNDATION.md) §1.
+
+| # | Adversary | Provably cannot | Can still do — and this is the residual |
+|---|---|---|---|
+| **X-1** | Prior owner of THIS coin | produce any new co-signature under `A` (the handover rotates the SE share and re-points the auth key); win the CSV race from behind; hide a co-signed rival from the census | broadcast the no-timelock trigger `T` purely to grief, choosing the moment (§9.5) |
+| **X-2** | Prior owner of an ANCESTOR / the splitter | co-sign anything further over the parent (the budget ratchet makes it terminal); mint a rival to a child already handed over | **void a sub-economic piece with ONE 112-vB backup, at zero marginal cost per extra piece, and no operator can stop it** — the transactions are already signed. See §0.5 |
+| **X-3** | The paying sender at conveyance | substitute a decoy funding output or sid; declare a soft CSV; drop an ancestor segment; pad the flat backups or the superseded set; skim value out of the tier chain; widen the schedule ([D27], `cap_schedule`) | declare a forged `fee_rate` on both synchronous verifiers (§0.4 V-3); convey at a version that carries no key handover (A-12) |
+| **X-4** | Receiver / payee | claim twice, claim after cancellation, or reverse a claim (the enclave keyupdate is irreversible and the counter monotonic) | nothing the model defends against — note the asymmetry in §0.5: a transfer is a gift, not an escrow |
+| **X-5** | The blind SE enclave alone | steal (it never holds a full key); see ANY value; forge exit material after the fact; un-terminate a node; produce a second partial from a replayed session | refuse to co-sign — which is a freeze, not a seizure: the unilateral tree is pre-signed and SE-independent |
+| **X-6** | The coordinator alone | under-report `num_sigs` or the budget — closed by the attested count, and by [D69] the verifying key is pinned rather than served | serve a wrong or NULL `aggregate_xonly` (§0.4 V-4); serve a wrong `x1_pub`, which BRICKS the coin for everyone; drop the pending-transfer lock; withhold or reorder the mailbox |
+| **X-7** | **SE + a past owner with a retained pre-rotation share** | — | fresh-co-sign an immediate spend. **No timelock reaches this**: a fresh signature needs no backup. This is the statechain trust unit (TRUST-MODEL B1) and it is irreducible, not a defect |
+| **X-8** | Watchtower (delegated) | move funds — a keyless tower holds no key and broadcasts only the owner's own pre-signed material | fail to act, which costs a race; and a KEYLESS tower cannot fee-bump at all ([D31]) |
+| **X-9** | Miner / mempool adversary / pinner | make a tier invalid | keep it unconfirmed. The P2A anchor slot is an AUCTION, not a race ([D45]): an under-paying squat is refused and an over-paying one raises the tier's effective feerate at the attacker's expense |
+| **X-10** | RGB counterparty (consignment sender, issuer, proxy) | forge a consignment the client validates — client-side validation is the only authority, and no proxy, SE or issuer is trusted for token rules | withhold a consignment (a liveness failure, not a theft) |
+| **X-11** | Lightning SSP | take custody — the swap is atomic (§8) and the pre-payment gate binds recipient and amount | see every value in the swap |
+
+**One thing the model does NOT have: an adversarial test that plays the COORDINATOR.** Every
+adversarial test in this repo plays a malicious sender. X-6's "can still do" column is therefore
+argued, not exercised, except where [D69] and the terminality tests now cover it.
+
+### 1.2 Security goals
+
+Twelve properties. Each states its own scope limit, because a goal stated without its limit is the
+form of claim this corpus keeps having to retract.
+
+| id | kind | property | scope limit — read this with the property |
+|---|---|---|---|
+| **G1** | safety | **VALUE CONSERVATION.** On every acceptance path, Σ(payload outputs) equals the tier total derived from the PARSED value of the output the tier spends; the residual is exactly one P2A anchor plus at most one zero-value opret; the chain is anchored hop by hop back to the funding value read FROM CHAIN | the yardstick must be receiver-derived. Today `fee_rate` is not (§0.4 V-3), and the child lane inverts the direction — there INFLATION is the attack |
+| **G2** | safety | **NO UNDISCLOSED SPENDING PATH.** No co-signature under the coin's aggregate exists that the receiver was not shown. Three conjoined obligations, never the equation alone: (a) exact equality against an ATTESTED count; (b) a per-item battery on every superseded entry; (c) slot uniqueness over the union of live and disclosed tiers | bounds spending PATHS, not VALUE — G1 carries the value claim. Treating it as arithmetic has bitten twice: junk padding, and a genuine tier disclosed twice inflating the expected total for free |
+| **G3** | safety | **OLD STATE DIES.** Every superseded state is disclosed and provably out-raced: the live state carries a strictly-lower CSV over the same outpoint, and every pre-renewal state hangs on a parent that can never confirm | **race-conditional, not axiomatic.** The live rival must also be RELAYABLE ([D26]) — co-signing a rival at a rate that cannot relay loses a race the verifier believes it wins |
+| **G4** | liveness | **EXIT AVAILABILITY.** The current owner can always reach L1 with pre-signed material alone — no counterparty, no SE call, no key held by anyone else — in `3 + 2d` transactions at depth `d` | bounded four ways, all measured: FEE (above the committed 3.0 sat/vB a tier needs a CPFP child, and a keyless tower cannot build one — [D31]); VALUE (below `V_min` the walk costs more than the piece); DEPTH (mainnet cap **8**, 19 transactions — [D53]); COLOUR (a coloured coin's re-anchor is a manual call nothing schedules) |
+| **G5** | safety | **ALLOCATION INTEGRITY (RGB).** The allocation the receiver validated is the one that settles. RGB transitions anchor only in signed-once transactions or coloured tiers; a PLAIN tier spend of a carrier destroys the allocation | rests entirely on a carrier never being laddered plainly. That is why the automatic passes exclude carriers, and why the sever route exists ([D46]) |
+| **G6** | safety | **FINALITY.** A completed claim is irreversible: the keyupdate cannot be undone, the counter is monotonic, and claim/cancel are mutually exclusive | finality is at CLAIM, not at conveyance. A conveyed-but-unclaimed transfer is reversible for the lock window — and is already presented to an SSP as if received |
+| **G7** | safety | **NON-CUSTODY UNDER OPERATOR COMPROMISE.** A hacked operator may take FUTURE deposits and FUTURE transitions; pre-hack state left untouched is safe. Every spend needs both shares, and the hacked SE holds only the post-rotation one | the surviving path is X-7. This is the requirement that disqualified the shared-root factory architecture, where one confirmation confiscates every coin under the root |
+| **G8** | safety | **NO CONFISCATION BY DESIGN.** Nothing expires, nothing sweeps to the operator, no output pays the operator by timeout. Missed liveness costs a race, never a forfeiture | under pressure at exactly one place: the sub-economic leaf is not confiscated by the OPERATOR, but it is forfeit to the party who split it |
+| **G9** | safety | **SE BLINDNESS.** The SE signs 32-byte sighashes; a coloured sighash is byte-indistinguishable from a plain one; consignments stay P2P | covers CONTENT, not traffic — the SE still learns sids, auth keys, counts, flags, timing and the caller's endpoint. Blindness is also why every operator-side value fix is impossible: "the SE refuses to co-sign a piece below a floor" is a WRONG proposal and must not be re-proposed |
+| **G10** | safety | **AUTHORIZATION INTEGRITY.** Only the current owner authorizes an irreversible operation, single-use and endpoint-bound | the single-use nonce is deployed on THREE endpoints; every other mutating endpoint takes a static, replayable signature |
+| **G11** | safety | **ADMISSION SOUNDNESS.** A receiver never admits a coin whose exit provably cannot complete, and every term of an admission test is receiver-derived — a serde field is not admissible | enforced in TIME and in STRUCTURE; the uncovered dimension is VALUE. `min_child_value` is not a floor that ignores economics — it IS `V_min` evaluated at the shipped rate (1 560 sat at 3.0 sat/vB), correct at that rate and no other |
+| **G12** | liveness | **ZERO IDLE COST.** All tiers are un-broadcast, `T` carries no timelock, and CSV does not tick until the parent confirms — so an idle coin, and an entire idle DAG, never ages: 0 vB of rent, no deadline, no forced materialisation | holds for LADDERED coins. The un-laddered shape keeps its absolute-locktime deadline, and a leaf's clock is the parent's lowest backup rung — a height belonging to the splitter |
+
+### 1.3 Assumptions
+
+Every goal above holds only under these. A specification that states goals without stating these
+claims more than it can deliver.
+
+| id | assumption | if false |
+|---|---|---|
+| **A-1** | **FEE MARKET** — the market rate stays at or below the committed **3.0 sat/vB** long enough for each tier to relay and confirm inside its head start; where it does not, someone can attach a ~153-vB v3 child to the tier's 240-sat P2A anchor and submit a 1P1C package | the CSV edge degrades into a fee race a fixed-fee tier cannot win. The remedy is BUILT and live-verified but not universal: it needs a funded UTXO, a signer and a Core RPC endpoint (electrum has no `submitpackage`), so a keyless tower has no move ([D31]) and the child lane has no bump variant |
+| **A-2** | **CHAIN LIVENESS AND RELAY POLICY** — blocks are produced; v3/TRUC, P2A, 1P1C and sibling eviction are honoured; no reorg deeper than `confirmation_target` | v3/P2A/1P1C are relay POLICY, not consensus: a policy change can make a pre-signed tree un-relayable. TRUC's one-ancestor rule already bites — a second rescue funded from the first's unconfirmed change is refused at any price |
+| **A-3** | **ENCLAVE BEHAVIOUR** — old shares are destroyed at every transfer, the secnonce is one-shot, the budget ratchet only lowers, and attestations come from the enclave's pinned identity ([D69]) | this is X-7 / TRUST-MODEL B1 and it cannot be verified: any proof of erasure attests one instance of the data. There is no client-facing attestation of the enclave itself, and production runs the plain-C++ lockbox container, not SGX |
+| **A-4** | **COORDINATOR HONESTY** for the facts only it holds — the sid ↔ aggregate binding, `x1_pub`, mailbox behaviour, the pending-transfer lock, both sign gates, batch atomicity | nothing in the protocol detects a violation of most of these (§0.4 V-4). The one item that IS closed is the count and budget |
+| **A-5** | **RGB VALIDITY** — client-side consignment validation is sound and complete | R8 collapses and a forged consignment books a wrong asset or amount; the receiver has no other authority |
+| **A-6** | **OWNER OR DELEGATE AVAILABILITY** — someone is awake within the CSV window once a trigger is broadcast, and inside the margin before an un-laddered coin's absolute deadline | delegable and redundant, but NOT removable: timelock security is defined by acting before maturity. The pre-TES-R unconditional no-watch window is gone — a received coin is watched from receipt, forever |
+| **A-7** | **THE USER'S CHAIN VIEW** — the indexer honestly reports tip, spentness, confirmations and fee rates, and delivers broadcasts | it can blind and delay but not steal. Worse in practice: the dev defaults are plaintext, and an on-path attacker is strictly stronger than a lying indexer |
+| **A-8** | **PARAMETER PROVENANCE** — the CSV schedule and the flat-ladder parameters are COMPILED IN per network, never coordinator-served | the coordinator would define the defence. The tempting fix — derive the interval from the conveyed chain — is CIRCULAR and accepts exactly the padding it exists to stop. Cost of the fix, stated plainly: a config typo is now a fleet-wide outage rather than a quiet weakening |
+| **A-9** | **LOCAL STATE DURABILITY** — the owner retains `wallet.db` and, for token wallets, the whole RGB data directory | loss of local state is loss of funds, and the mnemonic alone is NOT a backup. The SE is blind and cannot re-serve exit material — that is the privacy design, not an oversight |
+| **A-10** | **SINGLE LIVE INSTANCE PER WALLET** | two processes on one wallet can broadcast stale state against each other. The lock is in-process only and the blind SE cannot arbitrate. Bundle restore is disaster recovery, not device sync |
+| **A-11** | **THE RETAINED CHECKS SUBSUME the unverified blinded-MuSig commitments on the laddered lane** | UNANALYSED — commission the analysis. What keeps the two lanes' residuals from composing is that the legacy arm still runs the full legacy verifier |
+| **A-12** | **CLIENT CONFORMANCE** — every client that can receive a coin either verifies the ladder or refuses it BY NAME, and a decoder rejects a version it does not implement | today every version comparison is one-sided with no unknown-version reject arm, so a message declaring an unknown version takes every arm as the highest known one would. The FLOOR is the worse half: the sender picks it, and a low-version conveyance carries neither the key handover nor the transfer signature |
+
 ---
 
 ## 2. Data model
@@ -929,44 +994,6 @@ spendable balance would let a right-holder inflate a receiver's balance out of n
 
 ---
 
-## 13. Query, utility & invoice API
-
-Client-side conveniences (no new SE state); mirror Spark's query/signing/invoice surface.
-
-**REQ-26** `sign_message_with_identity_key(msg)` MUST produce a BIP340 Schnorr signature over
-`sha256(msg)` under a STABLE identity key (derived at `m/1000h/0h/0h`, unchanged as coins come and
-go); `validate_message_with_identity_key(msg, sig, pubkey)` MUST verify it and reject a tampered
-message.
-**REQ-27** `transfer_many(recipients)` MUST pay each recipient its exact amount from one off-chain
-split (N pieces + change), with the same branch + terminal-parent guarantees as a single transfer
-(REQ-17/REQ-18).
-
-`transfer_many` MUST dispatch on the parent's shape exactly as single-recipient `transfer()` does: a
-laddered ROOT coin through a MULTI-CHILD in-ladder split (one `SP` over `X_m.out[0]` carving N
-recipient children plus change), a received CHILD through the child-level equivalent, and only an
-un-laddered coin through the plain N+1 branch split (§6.2). A plain split of a laddered parent is the
-shape REQ-39 forbids — the split tx and the coin's trigger both spend `F` — so it MUST NOT be built.
-
-> **Was a known divergence, now FIXED.** `transfer_many` used to build the plain split directly on
-> any parent, carrying neither the routing nor the `split_coin` refusal. Harmless when the parent was
-> self-deposited (only the owner holds `T`), but a RECEIVED laddered coin left its previous owner
-> holding a broadcastable no-timelock `T` that could void the split after the pieces were handed
-> over: live [B1]. `sdk69` now proves the fixed shape by executing that attack — the retained trigger
-> is broadcast and spends `F`, and both recipients still exit unilaterally for their exact amounts,
-> because `SP` descends from the trigger instead of racing it. `sdk11` asserts the route as well as
-> the amounts.
-
-**REQ-28** `create_sats_invoice`/`create_tokens_invoice` MUST encode {address, amount, asset?,
-memo?, expiry?} into a `utexoinv1…` string that round-trips through `decode_utexo_invoice`;
-`fulfill_utexo_invoice` MUST reject an expired invoice (ERR-11) and otherwise pay the embedded
-amount/asset to the embedded address.
-**REQ-29** `list_coins`/`get_transfers`/`get_transfer` MUST reflect the wallet's current coins and
-activity; `get_withdrawal_fee_quote` MUST return a positive fee at the electrum-estimated rate.
-**REQ-30** `get_token_l1_address` returns the RGB engine funding address; `query_token_transactions`
-returns the contract's transfer history.
-
-- **ERR-11** `fulfill_utexo_invoice` on an expired invoice → `invoice expired at …`.
-
 ## 12. Traceability
 
 Each requirement/invariant is verified by at least one test. Pure-logic items have unit tests;
@@ -1020,6 +1047,44 @@ protocol items have E2E tests (regtest). See [testing-guide](build/testing-guide
 | INV-25 | honest branches accepted: `sdk29`/`sdk31`/`sdk39`. **Gap:** the value-inflating-branch REJECT (`sdk10`) was retired with no replacement; the laddered analogue is `sdk54`/`sdk58` |
 | INV-26 | `sdk09` (IFA received amount = fungible only) |
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
+
+## 13. Query, utility & invoice API
+
+Client-side conveniences (no new SE state); mirror Spark's query/signing/invoice surface.
+
+**REQ-26** `sign_message_with_identity_key(msg)` MUST produce a BIP340 Schnorr signature over
+`sha256(msg)` under a STABLE identity key (derived at `m/1000h/0h/0h`, unchanged as coins come and
+go); `validate_message_with_identity_key(msg, sig, pubkey)` MUST verify it and reject a tampered
+message.
+**REQ-27** `transfer_many(recipients)` MUST pay each recipient its exact amount from one off-chain
+split (N pieces + change), with the same branch + terminal-parent guarantees as a single transfer
+(REQ-17/REQ-18).
+
+`transfer_many` MUST dispatch on the parent's shape exactly as single-recipient `transfer()` does: a
+laddered ROOT coin through a MULTI-CHILD in-ladder split (one `SP` over `X_m.out[0]` carving N
+recipient children plus change), a received CHILD through the child-level equivalent, and only an
+un-laddered coin through the plain N+1 branch split (§6.2). A plain split of a laddered parent is the
+shape REQ-39 forbids — the split tx and the coin's trigger both spend `F` — so it MUST NOT be built.
+
+> **Was a known divergence, now FIXED.** `transfer_many` used to build the plain split directly on
+> any parent, carrying neither the routing nor the `split_coin` refusal. Harmless when the parent was
+> self-deposited (only the owner holds `T`), but a RECEIVED laddered coin left its previous owner
+> holding a broadcastable no-timelock `T` that could void the split after the pieces were handed
+> over: live [B1]. `sdk69` now proves the fixed shape by executing that attack — the retained trigger
+> is broadcast and spends `F`, and both recipients still exit unilaterally for their exact amounts,
+> because `SP` descends from the trigger instead of racing it. `sdk11` asserts the route as well as
+> the amounts.
+
+**REQ-28** `create_sats_invoice`/`create_tokens_invoice` MUST encode {address, amount, asset?,
+memo?, expiry?} into a `utexoinv1…` string that round-trips through `decode_utexo_invoice`;
+`fulfill_utexo_invoice` MUST reject an expired invoice (ERR-11) and otherwise pay the embedded
+amount/asset to the embedded address.
+**REQ-29** `list_coins`/`get_transfers`/`get_transfer` MUST reflect the wallet's current coins and
+activity; `get_withdrawal_fee_quote` MUST return a positive fee at the electrum-estimated rate.
+**REQ-30** `get_token_l1_address` returns the RGB engine funding address; `query_token_transactions`
+returns the contract's transfer history.
+
+- **ERR-11** `fulfill_utexo_invoice` on an expired invoice → `invoice expired at …`.
 
 ## 14. Known limitations (adversarial review)
 
