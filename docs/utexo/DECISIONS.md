@@ -2804,3 +2804,32 @@ product does not supply.
 **The rule:** a specification assembled from other documents inherits their age. Check claims against
 the code, not against the corpus — and have someone try to refute each contradiction before acting on
 it, because 6 of 37 were the auditor's error, not the document's.
+
+## [D75] The child lane admits exactly one shape — the ordinal gate [D16] forbade, closed
+
+**Decision: both child gates call `admissible_shape` and compare the tag for EQUALITY, inside the
+census that uses it.** First fix landed from [D73]'s amended plans.
+
+[D16] replaced the ordinal `protocol_version` reading with an exact set, and [D74]'s audit found the
+child lane never got it: `prepay_child_census` had no `admissible_shape` call and gated with
+`< MIN_PREPAY_CHILD_PROTOCOL_VERSION`, so every value in `[SHAPE_CHILD, u32::MAX]` cleared it — on the
+path that precedes an irreversible Lightning leg. The claim path was worse in structure: its child
+block ends in `return`, STRICTLY BEFORE `validate_encrypted_message`'s only shape check, so hoisting
+that call would not have covered it.
+
+**Inert at HEAD, and said so rather than dressed up**: an unknown value selects the same arms shape 4
+does, so nothing is stealable today. What was wrong is the reading — a tag that selects a SHAPE
+compared as though it were a LEVEL, which is the defect [D16] exists to prevent and which returns the
+moment a shape 6 is added.
+
+**Placement is the amended part.** The scoping plan wanted the predicates hoisted above the caller's
+lane select in `peek_pending_transfers`; its adversary showed that breaks a working feature, because
+the lane is chosen by payload PRESENCE (`child_tesr_bundle.is_some()`), not by the tag — a shape
+refusal above the select refuses messages the arm never claimed. So each census self-guards, and
+neither arm's safety depends on its caller.
+
+**Evidence, with its scope stated** ([D64]): `the_child_lane_admits_exactly_shape_four` exercises the
+predicate composition (both gates are `async` over a live `ClientConfig`, so the unit cannot drive
+them); `the_child_lane_gates_check_the_shape_before_parsing_the_bundle` pins presence and ordering,
+which is what a source scan may assert; and honest traffic is proven by RUNNING it — `sdk17`, `sdk59`,
+`sdk60` and `sdk21` green on regtest. 797 workspace tests, 0 failures.

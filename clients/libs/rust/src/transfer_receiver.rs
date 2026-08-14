@@ -740,11 +740,23 @@ async fn prepay_child_census(
     transfer_msg: &mercurylib::transfer::TransferMsg,
     cb_json: &str,
 ) -> Result<u64> {
-    if transfer_msg.protocol_version < MIN_PREPAY_CHILD_PROTOCOL_VERSION {
+    // **[D75] EACH CENSUS SELF-GUARDS ITS OWN SHAPE.** This function had NO `admissible_shape` call
+    // and gated with `<`, so every `protocol_version` in `[SHAPE_CHILD, u32::MAX]` cleared it — the
+    // exact ordinal reading [D16] forbids, on the lane that pays an irreversible Lightning leg.
+    //
+    // Inert at HEAD (an unknown value selects the same arms shape 4 does), which is why this is a
+    // correctness fix rather than a patch for a live theft. It is placed HERE, inside the census,
+    // and deliberately NOT before the caller's lane select: the lane is chosen by payload PRESENCE
+    // (`child_tesr_bundle.is_some()`), and hoisting a shape refusal above that select would refuse
+    // messages this arm never claimed to handle.
+    admissible_shape(transfer_msg.protocol_version)?;
+    if transfer_msg.protocol_version != SHAPE_CHILD {
         return Err(anyhow!(
-            "pre-pay census: a child bundle was conveyed under protocol_version {} but child conveyances are >= {} — refusing",
+            "pre-pay census: a child bundle was conveyed under protocol_version {} but the child \
+             shape is exactly {} — refusing. The tag selects a SHAPE, not a level: it is compared \
+             for equality, never for ordering ([D16], [D75]).",
             transfer_msg.protocol_version,
-            MIN_PREPAY_CHILD_PROTOCOL_VERSION
+            SHAPE_CHILD
         ));
     }
     let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
@@ -1291,15 +1303,23 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
     // terminal, child pays THIS coin's key) and skip the backup-chain checks below (there are
     // none to validate).
     if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
-        // [R4] VERSION FLOOR ON THE CLAIM PATH'S CHILD LANE, mirroring `prepay_child_census`. A
-        // `child_tesr_bundle` attached to a message declaring a version below the child floor is a
-        // version/payload mismatch: the sender is asking to be processed by rules that predate the
-        // child lane while shipping child material. Refuse rather than guess.
-        if transfer_msg.protocol_version < MIN_PREPAY_CHILD_PROTOCOL_VERSION {
+        // [R4] SHAPE CHECK ON THE CLAIM PATH'S CHILD LANE, mirroring `prepay_child_census`. A
+        // `child_tesr_bundle` attached to a message declaring any other shape is a version/payload
+        // mismatch: the sender is asking to be processed by rules that predate the child lane while
+        // shipping child material. Refuse rather than guess.
+        //
+        // **[D75] This block ends in `return`, STRICTLY BEFORE this function's own
+        // `admissible_shape` call — so until now the child lane reached no shape check at all, and
+        // the ordinal `<` let every value in `[SHAPE_CHILD, u32::MAX]` through.** The check belongs
+        // here, where the lane is, not at the top: moving it up would not have been equivalent,
+        // because this arm is selected by payload presence rather than by the tag.
+        admissible_shape(transfer_msg.protocol_version)?;
+        if transfer_msg.protocol_version != SHAPE_CHILD {
             return Err(anyhow::anyhow!(
-                "a child bundle was conveyed under protocol_version {} but child conveyances are >= {} — refusing",
+                "a child bundle was conveyed under protocol_version {} but the child shape is \
+                 exactly {} — refusing. The tag selects a SHAPE, not a level ([D16], [D75]).",
                 transfer_msg.protocol_version,
-                MIN_PREPAY_CHILD_PROTOCOL_VERSION
+                SHAPE_CHILD
             ));
         }
         let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)
@@ -2592,6 +2612,69 @@ mod poll_cancellation_reporting_tests {
 #[cfg(test)]
 mod exact_shape_dispatch_tests {
     use super::*;
+
+    /// **[D75] THE CHILD LANE ADMITS EXACTLY ONE SHAPE.**
+    ///
+    /// Both child gates — `prepay_child_census` (the SSP's pre-pay path, which precedes an
+    /// irreversible Lightning leg) and `validate_encrypted_message`'s child block (the claim path) —
+    /// previously had NO `admissible_shape` call and gated with `<`, so every value in
+    /// `[SHAPE_CHILD, u32::MAX]` cleared them. Inert, because an unknown value selected the same arms
+    /// shape 4 does — and exactly the ordinal reading [D16] forbids.
+    ///
+    /// **Scope, stated so this is not mistaken for more than it is** ([D64]): this exercises the
+    /// PREDICATE COMPOSITION the two gates now run, not the gates themselves — both are `async` and
+    /// take a live `ClientConfig`. What proves the composition is actually ON those paths is
+    /// `the_child_lane_gates_check_the_shape_before_parsing_the_bundle` (a presence-and-ordering
+    /// scan, which is what a source scan may assert), and what proves honest traffic still passes is
+    /// the live child suite — `sdk17`, `sdk59`, `sdk60`.
+    #[test]
+    fn the_child_lane_admits_exactly_shape_four() {
+        let gate = |v: u32| -> Result<()> {
+            admissible_shape(v)?;
+            if v != SHAPE_CHILD {
+                return Err(anyhow!("shape {v} is not the child shape {SHAPE_CHILD}"));
+            }
+            Ok(())
+        };
+        assert!(gate(SHAPE_CHILD).is_ok(), "the child shape itself must be admitted");
+        for v in [0u32, 1, 2, 3, 5, 99, u32::MAX] {
+            assert!(
+                gate(v).is_err(),
+                "shape {v} must be refused on the child lane — under the old `<` gate every value \
+                 at or above {SHAPE_CHILD} passed"
+            );
+        }
+        // The two halves refuse for DIFFERENT reasons, and both messages must name the offender.
+        let unknown = gate(99).unwrap_err().to_string();
+        assert!(unknown.contains("99"), "an unknown shape must be named: {unknown}");
+        let known_wrong = gate(SHAPE_ROOT_LADDER).unwrap_err().to_string();
+        assert!(
+            known_wrong.contains("2") && known_wrong.contains(&SHAPE_CHILD.to_string()),
+            "a KNOWN but wrong shape must name both it and the expected one: {known_wrong}"
+        );
+    }
+
+    /// **[D75] …and the check sits AHEAD of the bundle parse on both child gates.**
+    ///
+    /// Presence and ordering only — [D64]'s ceiling. It cannot prove the gates are reachable (the
+    /// live child suite does that); what it stops is the specific regression that existed until now,
+    /// where the claim path's child block `return`ed before the function's only shape check.
+    #[test]
+    fn the_child_lane_gates_check_the_shape_before_parsing_the_bundle() {
+        let src = include_str!("transfer_receiver.rs");
+        for (gate, parse) in [
+            ("pre-pay census: a child bundle was conveyed", "pre-pay census: malformed child TES-R bundle"),
+            ("a child bundle was conveyed under protocol_version", "malformed child TES-R bundle"),
+        ] {
+            let at = src.find(gate).unwrap_or_else(|| panic!("child gate not found: {gate}"));
+            let head = &src[..at];
+            let call = head.rfind("admissible_shape(transfer_msg.protocol_version)")
+                .unwrap_or_else(|| panic!("no admissible_shape ahead of: {gate}"));
+            assert!(call < at, "the shape check must precede the refusal it guards: {gate}");
+            let parsed = src[at..].find(parse).unwrap_or_else(|| panic!("parse site not found: {parse}"));
+            assert!(parsed > 0, "the bundle parse must follow the shape check: {parse}");
+        }
+    }
 
     #[test]
     fn the_admissible_set_is_exact_and_unknown_values_are_refused() {
