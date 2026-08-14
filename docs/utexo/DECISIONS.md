@@ -2957,3 +2957,40 @@ the on-chain baseline is 112 / 155 vB at `INPUT_WITNESS_BYTES = 67`, not the pre
 sweep marginal is unreachable for a tree whose leaves have different owners — which is why
 ACQUISITION, not batching, is the mechanism. **The rule this earns: derived economics do not go into
 a normative document on one derivation.**
+
+## [D79] The SSP sweep, specified: absorb at claim, settle on an option, and never miss a deadline
+
+**Decision: the sweep is a payment-flow mechanism, not a background rescue.** Specified in SPEC §5.3
+(REQ-49…REQ-52) and derived in [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.7.
+
+**The structural fact the whole design turns on: the surplus is INDEPENDENT of the leaf's value.**
+`surplus(m) = 1 230 − 57.75·m` sat — the burn a leaf's own two tiers would destroy, minus one combine
+input. It does not scale with face. Three non-obvious consequences:
+
+* **small leaves are the best business** (same absolute surplus, least capital at risk — 68 % of face
+  at the admission floor against 1 % at 100 000 sat);
+* **there is a natural value CEILING**, because past it the operator takes balance-sheet risk for a
+  return that has stopped growing;
+* **batching is a 4 % optimisation, not the mechanism.** 1 → 10 leaves moves the marginal 112 → 63 vB,
+  ~150 sat against ~1 057. So no whole trees, no majority ownership, no coordination with holdouts —
+  `SP`'s outputs are independent UTXOs and a 9-of-10 sweep captures ~99 % of the saving.
+
+**WHEN to absorb: at `claim()`.** Runway is maximal, the payee is already online, no extra round.
+And the payee gets a strictly better coin — root, depth 0, no inherited deadline, a one-transaction
+cooperative exit.
+
+**WHEN to settle: it is an OPTION, and the risk is asymmetric.** Voluntary path — batch ≥ 10 and
+market ≤ ceiling. Forced path — earliest deadline within `sweep_min_runway`, and this one ignores the
+fee ceiling entirely. Settling early forfeits a few hundred sat; settling late voids the leaf for its
+full face. Every default is biased toward acting early.
+
+**The fairness condition, stated because "silently" invites the opposite:**
+`price_paid ≥ leaf_value − 1 230`, i.e. never below what the payee would realise walking it out
+themselves. Below that floor this stops being a service and becomes a tax on payees who would have
+done better alone. The operator's share is policy and is disclosed in aggregate.
+
+**S1 IS THE GATE, and it is not built.** Everything above rests on [D77]'s cooperative
+`spine + 1` exit, which is still UNVERIFIED, and on `combine_leaves`, which has **zero callers outside
+a test**. One E2E — split, materialise the spine, mine to `confirmation_target`, cooperative withdraw,
+assert ONE transaction — decides whether this is a ~1 057-sat-per-leaf value-recovery business or a
+4 % batching play. Build order in §0.7.6.

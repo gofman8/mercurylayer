@@ -112,6 +112,108 @@ tree whose leaves have different owners, which is exactly why acquisition — no
 mechanism that matters. **Do not re-derive these from prose. Re-derive them from
 `lib/src/tesr.rs`, `lib/src/transaction.rs::sweep_tx_vsize` and `clients/libs/rust-sdk/src/config.rs`.**
 
+### 0.7 THE SWEEP, AS A MECHANISM — when to absorb a leaf, and when to settle it
+
+The sweep is not a rescue service bolted on the side; it is the thing that keeps §0.2 true at
+realistic velocities. This section specifies WHEN it fires. Normative form in `SPEC.md` §5.3.
+
+#### 0.7.1 The one structural fact everything follows from
+
+**The surplus is INDEPENDENT of the leaf's value.**
+
+```
+surplus(m) = BURN − combine_marginal(m) = 1 230 − 57.75·m   sat per leaf
+```
+
+`BURN` is what a leaf's own two pre-signed tiers destroy (2 × 615). It does not scale with face.
+Neither does the combine input. So the SSP earns **the same ~1 057 sat at 3 sat/vB** whether the leaf
+holds 1 560 sat or 1 BTC.
+
+Three consequences, and they are not intuitive:
+
+* **Small leaves are the BEST business, not the worst.** Same absolute surplus, far less capital at
+  risk. At the admission floor the surplus is 68 % of the leaf's entire value; at 100 000 sat it is
+  1 %.
+* **There is a natural VALUE CEILING.** Above some face the SSP is taking balance-sheet risk for a
+  return that has stopped growing. The ceiling is a risk-appetite parameter, not an economic one.
+* **Batching is nearly irrelevant.** Going 1 → 10 leaves moves the marginal 112 → 63 vB, worth ~150
+  sat against a ~1 057-sat surplus. **Absorption is the business; consolidation is a 4 % optimisation.**
+  The SSP therefore needs no whole trees, no majority ownership, and no coordination with holdouts.
+
+#### 0.7.2 WHEN to absorb — at claim, inside the payment flow
+
+The swap belongs in `claim()`, at the moment a payee first sees the leaf. That timing is optimal on
+every axis at once: runway is maximal (the inherited deadline is furthest away), the user is online
+because they are already transacting, and no separate coordination round is needed. The payee receives
+an ordinary root coin and never handles a leaf.
+
+**And a root is strictly better for the payee than the leaf it replaces**, independent of any spread:
+no inherited deadline, depth 0, a one-transaction cooperative exit, and no watchtower duty tied to a
+parent it does not control. That is what makes a silent swap defensible rather than extractive — but
+see the fairness condition in §0.7.5.
+
+#### 0.7.3 The absorption predicate
+
+Absorb a leaf iff ALL hold:
+
+| condition | default | derivation |
+|---|---|---|
+| `market_fee_rate ≤ sweep_max_fee_rate` | **15 sat/vB** | surplus hits zero at 21.3; 15 keeps a ~30 % margin (369 sat/leaf) |
+| `runway_blocks ≥ sweep_min_runway` | **903 blocks** | `e_csv(720) + confirmations(3)` = 723, +25 % safety. Below this the leaf CANNOT be settled and absorbing it buys a liability |
+| `leaf_value ≤ sweep_max_leaf_value` | **100 000 sat** | the value at which a constant ~1 057-sat surplus falls below 1 % of face — past it the SSP adds risk without adding return |
+| `tree_exposure + leaf_value ≤ sweep_max_tree_exposure` | **1 000 000 sat** | `target_batch × max_leaf_value`; bounds loss if one tree's spine cannot be materialised |
+
+#### 0.7.4 WHEN to settle — the SSP holds an option, and should price it as one
+
+Having absorbed, the SSP is not obliged to settle promptly. It holds a **timing option**: settle at
+the cheapest fee window inside the runway. Exercise when EITHER:
+
+* `batch_size ≥ sweep_target_batch` **and** `market ≤ sweep_max_fee_rate` — the voluntary path; or
+* `earliest_deadline − tip ≤ sweep_min_runway` — the **forced** path, and it is unconditional. A leaf
+  that misses its inherited deadline is voided by the parent's flat backup and the loss is the whole
+  face, not the spread.
+
+`sweep_target_batch = 10` captures 94 % of the achievable batching gain; beyond it the curve is flat
+and waiting only adds fee-market and deadline exposure.
+
+**The risk is asymmetric and must be stated that way.** The downside of settling too EARLY is a few
+hundred sat of foregone batching. The downside of settling too LATE is total loss of the leaf. Every
+default above is therefore biased toward acting early, and the forced path ignores the fee ceiling
+entirely — an expensive settlement beats a voided one at every rate.
+
+#### 0.7.5 The fairness condition, stated because "silently" invites the opposite
+
+A silent swap must leave the payee **no worse off than holding the leaf**, measured against the
+leaf's own realisable value:
+
+```
+price_paid ≥ leaf_value − BURN          (what the payee would realise walking it out)
+```
+
+At the floor that means paying at least 330 sat for a 1 560-sat leaf — while the SSP realises 1 387.
+There is ~1 057 sat of surplus to divide, and the split is `sweep_spread_bps`, a policy parameter and
+not a protocol constant. Two obligations follow: the payee is handed a coin that is **strictly better
+in kind** (root, no inherited deadline), and the spread is disclosed in aggregate rather than being
+the mechanism's hidden purpose.
+
+**Do not let the spread exceed the surplus.** A swap priced below `leaf_value − BURN` takes value from
+a payee who would have done better walking, which is the one outcome that turns this from a service
+into a tax.
+
+#### 0.7.6 Game plan — build order, cheapest evidence first
+
+| # | step | why it is first | evidence |
+|---|---|---|---|
+| **S1** | prove `spine + 1` cooperative child exit end to end ([D77], currently UNVERIFIED) | every number in §0.7 rests on it; if a confirmed `SP.out[j]` cannot be cooperatively spent, the whole design collapses to the 250-vB walk | an E2E: split, materialise spine, mine to `confirmation_target`, cooperative withdraw, assert ONE transaction |
+| **S2** | wire `combine_leaves` to a caller — it has **zero** outside a test today | the primitive exists and is unreachable; nothing else can be measured until it is | an E2E consolidating k ≥ 2 leaves of one `SP` |
+| **S3** | the absorption predicate as a PURE function + its parameters | testable without a stack, and it is where a wrong sign silently becomes a policy | unit tests per row of §0.7.3, both directions |
+| **S4** | the swap in `claim()`, behind a default-OFF flag | the payment-flow half; default-off so it ships before it is trusted | an E2E: payee claims, receives a ROOT, SSP holds the leaf |
+| **S5** | the settlement scheduler (voluntary + forced paths) | needs S1–S4; the forced path is the one that must never be skipped | a test that the forced path fires **regardless** of the fee ceiling |
+| **S6** | publish the realised curve from a live fleet | §0.2's break-even is modelled, not measured | measured hops-per-leaf and settlement cost against the model |
+
+**S1 is the gate.** It is a day of work and it decides whether this is a 4 %-margin batching play or a
+~1 057-sat-per-leaf value-recovery business.
+
 ---
 
 ## 1. The correction, stated plainly

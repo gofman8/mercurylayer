@@ -696,6 +696,50 @@ does that — it removes the SILENT failure mode: without it, a lapse upstream s
 value that is not there, and a merchant crediting on the balance over-credits with nothing in the
 log. With it, the same lapse shows up as a coin that fails to arrive.
 
+### 5.3 Sweep at claim — absorbing leaves out of circulation
+
+**A leaf is a worse coin than a root in every respect** — it inherits a deadline it does not control,
+carries depth, has no one-transaction cooperative exit, and burns 1 230 sat of its own value if it is
+ever walked out. The sweep replaces it, at the moment it is first seen, with an ordinary root coin.
+
+Full derivation, parameters and build order in
+[PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.7. Normative requirements:
+
+**REQ-49 (sweep point) The swap MUST happen in `claim()`, not in a background pass.** At claim the
+runway is maximal, the payee is online because they are already transacting, and no extra
+coordination round exists. A payee whose leaf is swept receives a root coin and never handles a leaf.
+It MUST be default-OFF until [D77]'s cooperative exit is demonstrated end to end.
+
+**REQ-50 (absorption predicate) A leaf MUST NOT be absorbed unless ALL of:**
+
+| | default | why |
+|---|---|---|
+| `market_fee_rate ≤ sweep_max_fee_rate` | 15 sat/vB | the surplus `1 230 − 57.75·m` reaches zero at 21.3; above the ceiling the payee is better off walking on prepaid tiers |
+| `runway_blocks ≥ sweep_min_runway` | 903 | `e_csv + confirmations` = 723, +25 %. Below it the leaf CANNOT be settled — absorbing it buys a liability |
+| `leaf_value ≤ sweep_max_leaf_value` | 100 000 sat | the surplus is CONSTANT in face, so past this the operator adds balance-sheet risk without adding return |
+| `tree_exposure + leaf_value ≤ sweep_max_tree_exposure` | 1 000 000 sat | bounds the loss if one tree's spine cannot be materialised |
+
+All four are configuration, not protocol constants. The defaults are derived, not chosen — each cell
+cites its derivation.
+
+**REQ-51 (settlement timing) The holder of absorbed leaves MUST settle when EITHER the batch reaches
+`sweep_target_batch` (default 10) with the market at or under the ceiling, OR the earliest inherited
+deadline comes within `sweep_min_runway` — and the second path MUST ignore the fee ceiling.**
+The risk is asymmetric: settling early forfeits a few hundred sat of batching, settling late voids
+the leaf entirely for its full face. An expensive settlement beats a voided one at every fee rate.
+
+**REQ-52 (fairness) A swap MUST leave the payee no worse off than walking the leaf out:
+`price_paid ≥ leaf_value − 1 230`.** The payee additionally receives a coin that is strictly better in
+kind. A swap priced below that floor takes value from a payee who would have done better alone, which
+is the one outcome that makes this a tax rather than a service. The operator's share
+(`sweep_spread_bps`) is policy and MUST be disclosed in aggregate.
+
+**Why this is worth building at all:** it is not dust rescue. It is what holds §14.3's break-even at
+~0.5 onward payments per recipient instead of ~1.65 — i.e. what keeps the design's block-space claim
+true at realistic payment velocities.
+
+---
+
 ## 6. Off-chain split & combine
 
 ### 6.1 In-ladder split (laddered coins)
