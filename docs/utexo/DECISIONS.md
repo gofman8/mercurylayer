@@ -3070,3 +3070,70 @@ Corrected in SPEC §14.3 and PARTIAL-PAYMENT-ECONOMICS §0.2b, both of which now
 with was flattering. [D74] (stale claims), [D80] (a free sweep) and this are the same failure —
 arithmetic checked, framing not. **Choosing the representative case is part of the claim, and it needs
 the same adversary as the arithmetic.**
+
+---
+
+## [D82] Stop quoting the whole-coin TRANSFER lane — every payment is an arbitrary amount
+
+**Owner ruling, 2026-08-14, verbatim: "no one would transfer the whole coin, again there same
+bullshit, please do not reply me this ever."** This is [D81] recommitted one turn after [D81] was
+written, against a different lane. It is now a standing prohibition, not an observation.
+
+### What was claimed and is now RETRACTED
+
+Asked whether block-space scaling requires the SSP to collapse a fully-owned sub-tree, I answered
+**"No — that's an over-claim"** and offered a second route: the **whole-coin transfer lane**. The
+arithmetic was right and is not in dispute:
+
+* A whole-coin transfer is a key handover on the same `statechain_id`. It mints **no** piece and
+  consumes **no** split depth — it spends one hop of the flat backup chain (`L_k = L_0 − k·interval`,
+  `initlock` 10 000 / `interval` 100 ⇒ 99 usable hops, [D62]).
+* 99 hops per on-chain anchor ⇒ `112 / 99` = **1.13 vB per payment**, ~136× an ordinary 154 vB
+  on-chain payment, with primitives that are shipped and exercised.
+
+**All of that is true and none of it matters, because the lane requires the payment amount to equal
+the coin value exactly.** Payments are arbitrary amounts. An exact-amount payment is the rare
+coincidence, not the mode — the same fact [D81] already recorded. So the lane describes ~nobody, and
+quoting its 1.13 vB/payment as a scaling route is the identical error [D81] named: **a real number
+attached to a fictional population.**
+
+### The consequence — the original claim STANDS
+
+With the whole-coin lane struck, the answer to "is scaling achievable only via collapse?" reverts to
+**yes, on the lane that exists**:
+
+| lane | vB/payment | who is on it |
+|---|---:|---|
+| whole-coin transfer | 1.13 | ~nobody — **do not quote (this decision)** |
+| arbitrary-amount split, pieces settled individually | ~105 | everybody, today — **1.47× on-chain, the cap** |
+| arbitrary-amount split, sub-tree collapsed | 0.44 – 40 | the target, needs a primitive that does not exist |
+
+Every payment is a split; a split emits two pieces where one stood; every piece eventually needs a
+chain slot. **Nothing in the shipped system amortises that, and the ~1.47× cap is real.** The only
+mechanism that breaks it is retiring pieces *un-broadcast* — the collapse — which
+`set_sig_budget`'s monotonic ratchet (`server/src/database/deposit.rs`, "a budget may only TIGHTEN,
+never loosen") currently forbids outright.
+
+### THE STANDING RULE (generalised from [D81] + this)
+
+> **Assume every payment is an arbitrary amount.** Any lane, optimisation, or economic figure whose
+> benefit depends on exact amounts, whole-coin movement, or a holder who never receives a partial
+> payment **describes a population that does not exist and must not be quoted** — not in the spec,
+> not in economics, not in a reply, not as a "second route", not as an upper bound, not in a table
+> even when correctly labelled.
+
+Applies to: whole-coin/root-holder economics ([D81]), the whole-coin transfer lane (this), and any
+denomination scheme that presupposes users already hold the right change. A denomination lane may
+only be quoted with its **re-denomination cost included**, since re-cutting is itself a split.
+
+### The failure mode, now diagnosed three times
+
+[D74] stale claims, [D80] a free sweep, [D81] the root holder, and this. In every case the
+**arithmetic was checked and the population was not**. The correction is procedural, not analytical:
+
+> Before quoting any per-payment figure, name the population it describes and ask whether that
+> population exists. If the answer needs a qualifier ("for users who…", "assuming exact amounts"),
+> **the figure is not a headline and probably not publishable at all.**
+
+An adversary that only checks arithmetic will pass all four of these. The selection of the
+representative case needs its own adversary.
