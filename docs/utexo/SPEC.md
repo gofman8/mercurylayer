@@ -1365,31 +1365,30 @@ are stated as limits rather than as things to fix.
 * **The P2A anchor slot is an auction, not a race** — [D45]. An under-paying squat is refused; an
   over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
   a price, not a denial of service.
-* **THE DESIGN SELLS PAYMENT VELOCITY, NOT PAYMENT GRANULARITY — and there is a case where a plain
-  on-chain payout BEATS it.** Full derivation and the satoshi side in
-  [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0; the normative summary:
+* **THE DESIGN SELLS PAYMENT VELOCITY — and it LOSES to a batched on-chain payout until ~74 % of
+  leaves are swept.** Corrected by [D80]; full derivation in
+  [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.2.
 
-  **The comparison must be against a BATCHED payout.** One-to-many on chain is ONE transaction with
-  `N+1` outputs — ~**44 vB per recipient** at N = 100, not `N ×` a whole transaction. Any ratio
-  derived against "N separate transactions" is measured against an opponent that does not exist.
+  **The comparison must be against a BATCHED payout** — one-to-many on chain is ONE transaction with
+  `N+1` outputs, 4 412 vB for N = 100 (~44 vB per recipient), not `N` transactions.
 
-  One coin split to 100 recipients, all settling, 90 % swept by an SSP:
+  **And the sweep is not free: acquiring a leaf IS an onward hop**, so sweep fraction `s` and hop
+  count `h` are coupled (`h ≥ s`). One coin to 100 recipients, all settling:
 
-  | onward payments per recipient | all on-chain | Utexo | |
+  | sweep fraction | Utexo | all on-chain | |
   |---:|---:|---:|---|
-  | **0** (receive, cash out) | **4 411 vB** | 12 552 vB | **ON-CHAIN wins 2.8×** |
-  | 1 | 19 786 | 12 552 | Utexo 1.6× |
-  | 10 | 158 161 | 12 552 | Utexo **12.6×** |
-  | 50 | 773 161 | 12 552 | Utexo **61.6×** |
+  | **0.00** | 29 800 vB | **4 411 vB** | **ON-CHAIN wins 6.8×** |
+  | 0.70 | 16 396 | 15 191 | on-chain |
+  | **0.74** | 15 627 | 15 807 | crossover |
+  | 1.00 | 10 628 | 19 811 | Utexo **1.87×** |
 
-  **Break-even: 0.53 onward payments per recipient** (1.65 without the sweep). The distribution is
-  not what is saved — a batched payout is nearly free too. What is saved is every payment AFTER the
-  first: on chain ~154 vB each, off chain zero.
+  **The design rule:** a piece received and immediately cashed out should never have been an
+  off-chain split — a batched on-chain payment is strictly cheaper. And the sweep does not optimise a
+  winning position, it CREATES one: below ~74 % coverage the split lane loses on block space.
 
-  **The design rule that follows:** a piece received and immediately cashed out should never have
-  been an off-chain split — it is strictly cheaper as an output of a batched on-chain payment. And
-  the sweep does not create the advantage, it protects it: it roughly halves the circulation a payee
-  must do before the design pays for itself.
+  Note what is NOT affected: the per-leaf VALUE recovery (§5.3, ~1 057 sat at 3 sat/vB) is a satoshi
+  quantity independent of K and of this aggregate. The sweep's commercial case stands even where its
+  block-space case does not.
 
 * **THE ON-CHAIN CADENCE IS REAL, AND IT IS THE FLAT CALENDAR — not the tier chain** ([T-1]/[T-2]).
   This is the number to quote when someone asks what the design saves, because "zero rent" is true of

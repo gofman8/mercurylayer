@@ -2994,3 +2994,50 @@ done better alone. The operator's share is policy and is disclosed in aggregate.
 a test**. One E2E — split, materialise the spine, mine to `confirmation_target`, cooperative withdraw,
 assert ONE transaction — decides whether this is a ~1 057-sat-per-leaf value-recovery business or a
 4 % batching play. Build order in §0.7.6.
+
+## [D80] [D78] was wrong where it mattered most — the sweep is not free, and the lane loses below ~74 % coverage
+
+**Decision: [D78]'s aggregate block-space table is RETRACTED and replaced.** Three adversaries were
+put on it the moment it entered normative text, precisely because it had been derived wrong three
+times already. They found the error that inverts the headline.
+
+**THE ERROR.** For an SSP to hold 90 % of a tree, ninety payees must each have TRANSFERRED their leaf
+to it — **and a transfer is an onward hop.** [D78] put a 90 %-swept figure in the `h = 0` row, giving
+Utexo a sweep for free while charging the on-chain column for none of the hops that produced it.
+Sweep fraction and hop count are COUPLED (`h ≥ s`). Corrected:
+
+| sweep fraction | Utexo | all on-chain | |
+|---:|---:|---:|---|
+| 0.00 | 29 800 vB | **4 411** | **ON-CHAIN 6.8×** |
+| 0.70 | 16 396 | 15 191 | on-chain |
+| **0.74** | 15 627 | 15 807 | crossover |
+| 1.00 | 10 628 | 19 811 | Utexo **1.87×** |
+
+**Crossover at ~74 % sweep coverage, not "0.53 onward payments"; ceiling 1.87×, not an order of
+magnitude.** Below ~74 % a batched on-chain payout is simply better.
+
+**Four more, all confirmed against code:**
+
+* **K = 100 in ONE split is not constructible.** `MAX_BATCH_RECIPIENTS = 63` /
+  `DERIVED_SLOTS_PER_STATECHAIN = 64`, and `refuse_oversized_slot_batch` is the FIRST statement of
+  `transfer_many`. A 100-payee payment is necessarily a chained SPINE BATCH (63 + 37), which no driver
+  chains automatically — and the payees are then NOT equal: batch-2 leaves sit one level deeper, a
+  7-transaction walk and ~720 more blocks of CSV. Magnitude impact is small (+125 vB); the shape claim
+  was wrong.
+* **"Every tier burns 615 sat" is false for the widest tier.** A split state pays
+  `committed_fee_for_outputs`, which grows 43 vB per extra payee. 615 is the ONE-PAYLOAD figure.
+* **4 411 was a truncation** — `sweep_tx_vsize` rounds UP and returns 4 412; the module says why
+  ("a truncated vsize under-pays"). Publishing the truncated value in the one place the document calls
+  "measured" contradicted the function it cited.
+* **The onward payment appeared as three different numbers** — 154, 155 and 153.75 — with the tables
+  computed at 153.75, a size no transaction can have.
+
+**WHAT SURVIVES, and it is the commercially load-bearing half:** the per-leaf value recovery. The
+burn is 1 230 sat, `min_child_value = 1 560 = 1 230 + 330` holds BY CONSTRUCTION (pinned by a unit
+test against `TIER_VBYTES`, not a literal), the surplus `1 230 − 57.75·m` is independent of face, and
+the 21.3 sat/vB crossover is right. [D79]'s sweep policy rests on those and is unaffected.
+
+**The lesson, third time today and now a rule: an independent derivation is not enough — the model's
+FRAMING needs an adversary too.** Both my version and the first independent one got the arithmetic
+right and the accounting wrong, because both priced the sweep as free. Arithmetic can be checked by
+recomputation; framing can only be checked by someone trying to break it.

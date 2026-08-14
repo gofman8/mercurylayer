@@ -40,38 +40,39 @@ A one-to-many payout on Bitcoin is **ONE transaction with N+1 outputs**, not N t
 the on-chain alternative at "N × 155 vB" is inventing an opponent that does not exist, and every
 favourable ratio derived that way is worthless.
 
-### 0.2 The result
+### 0.2 The result — CORRECTED BY [D80], read this and not the first version
 
-One coin split among 100 recipients, every recipient eventually settling on chain, 90 % of leaves
-swept by an SSP (`combine_leaves`) and 10 % walking out individually:
+**The sweep is NOT free, and my first table treated it as if it were.** For an SSP to hold 90 % of a
+tree, 90 payees must each have TRANSFERRED their leaf to it — and a transfer IS an onward hop. Putting
+a swept figure in the `h = 0` row gave Utexo a sweep for nothing while charging the on-chain column
+for none of the hops that produced it. Sweep fraction `s` and hop count `h` are COUPLED: `h ≥ s`.
 
-| onward payments per recipient | ALL ON-CHAIN | UTEXO | verdict |
+One coin to 100 recipients, all settling. Utexo = prefix + tip + `(1−s)·100` walks + one
+`sweep_tx_vsize(100s, 1)`; on-chain = a batched payout + `100s` onward payments:
+
+| sweep fraction `s` | UTEXO | ALL ON-CHAIN | winner |
 |---:|---:|---:|---|
-| **0** — receive, then cash out | **4 411 vB** | 12 552 vB | **ON-CHAIN wins, 2.8×** |
-| 1 | 19 786 | 12 552 | utexo 1.6× |
-| 2 | 35 161 | 12 552 | utexo 2.8× |
-| 10 | 158 161 | 12 552 | utexo **12.6×** |
-| 50 | 773 161 | 12 552 | utexo **61.6×** |
+| **0.00** — nobody hops, nobody sells | 29 800 vB | **4 411 vB** | **ON-CHAIN, 6.8×** |
+| 0.50 | 20 241 | 12 111 | ON-CHAIN |
+| 0.70 | 16 396 | 15 191 | ON-CHAIN |
+| **0.74** | 15 627 | 15 807 | **crossover** |
+| 0.90 | 12 551 | 18 271 | utexo 1.5× |
+| 1.00 | 10 628 | 19 811 | utexo **1.87×** |
 
-**Break-even is 0.53 onward payments per recipient.** The design wins the moment the average payee
-spends their money once, and loses to a batched payout if they never do.
+**The crossover is at ~74 % sweep coverage, not 0.53 hops, and the ceiling is 1.87× — not the order
+of magnitude the first version implied.** Below ~74 % coverage a batched on-chain payout is simply
+better, and at zero coverage it is better by 6.8×.
 
-### 0.3 Why — the distribution is not what we save
-
-The split itself is free off chain, but a batched on-chain payout is nearly free too (44 vB each).
-**What we actually sell is the SECOND payment**: on chain every subsequent hop is another ~154 vB
-transaction; off chain every subsequent hop is **zero**. So the saving is a function of how many
-times value MOVES before it settles, and of nothing else.
-
-Corollary, and it is the design rule: **a piece that is received and immediately cashed out should
-never have been an off-chain split.** It is strictly cheaper as an output of a batched on-chain
-payment. Off-chain splitting earns its keep only where value circulates.
+**What survives, and it is the part that matters commercially:** the PER-LEAF value recovery in
+§0.5/§0.7 is unaffected — it is a satoshi quantity, independent of K and of the aggregate block-space
+story. The SSP's ~1 057-sat margin at 3 sat/vB stands.
 
 ### 0.4 What the sweep is for — it protects the result, it does not create it
 
-Without an SSP sweep, settlement of that same tree is 29 800 vB and break-even rises to **1.65** hops.
-With 90 % swept it is 12 552 vB and **0.53**. **The sweep roughly halves the circulation a payee must
-do before the design pays for itself.** It is not a nicety for rescuing dust; it is what keeps §0.2's
+Without a sweep, settlement is 29 800 vB and NOTHING makes the lane win — an on-chain batched payout
+is better at every hop count, because the walks dominate. With 90 % swept it is 12 551 vB and the lane
+wins 1.5×. **The sweep is not an optimisation on a winning position; it is what creates the winning
+position at all.** It is not a nicety for rescuing dust; it is what keeps §0.2's
 result true at realistic velocities.
 
 ### 0.5 The satoshi side, which is a different quantity and a bigger number

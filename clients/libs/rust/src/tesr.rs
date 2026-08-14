@@ -26467,3 +26467,115 @@ mod d44_floor_probe {
         assert_eq!(super::colored_spine_tip_floor(rate, dust), 1_074);
     }
 }
+
+/// **[D77 / S1] THE COOPERATIVE CHILD EXIT — one transaction instead of the pre-signed tail.**
+///
+/// A split child settles today by broadcasting its two pre-signed tiers (`ext_child`, `state_child`),
+/// which costs 2 transactions, two CSV waits, and — the expensive part — **burns the 1 230 sat those
+/// tiers carved out of the coin at split time** (`2 × (committed_fee(3.0) + P2A_VALUE)`).
+///
+/// None of that is necessary once the spine is on chain. The split terminalizes the PARENT, not the
+/// child ([R9]: "child terminality deliberately NOT required"), so the child keeps a live 2-of-2 with
+/// the SE and spendable budget. Once `SP` confirms, `SP.out[j]` is an ordinary P2TR UTXO under
+/// `A_child` and the SE can co-sign a fresh spend of it — **one transaction, no timelock, no burn.**
+/// The pre-signed tiers stay as the UNILATERAL fallback, which is the role they were designed for.
+///
+/// This is the gate under [D79]'s sweep economics: the SSP's whole margin is `1 230 − 57.75 · market`
+/// sat per leaf, and that margin exists only if this function works.
+///
+/// **What this does NOT do, stated so the fallback is not lost:** it needs the SE. If the SE refuses,
+/// the caller must fall back to `exit_child_pass`, which needs nobody. Cheaper and cooperative is not
+/// a replacement for pre-signed and unilateral — it is the fast path in front of it.
+pub async fn cooperative_child_exit(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    child_statechain_id: &str,
+    to_address: &str,
+    fee_rate_sats_per_vb: f64,
+) -> Result<String> {
+    use electrum_client::bitcoin::{
+        absolute::LockTime, consensus::deserialize, Address, OutPoint, Sequence, Transaction,
+        TxIn, Witness,
+    };
+
+    let cb = load_child(cc, wallet_name, child_statechain_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{child_statechain_id} is not an adopted split child"))?;
+
+    // `SP` is the parent's CURRENT (terminal) state — the tier whose outputs fund the children.
+    let sp_hex = cb.parent.current().state.signed_tx.clone();
+    let sp: Transaction = deserialize(&hex::decode(&sp_hex)?)?;
+    let sp_txid = sp.txid();
+    let vout = cb.sp_vout as usize;
+    let prevout = sp
+        .output
+        .get(vout)
+        .ok_or_else(|| anyhow::anyhow!("SP {sp_txid} has no output {vout} — the child bundle is malformed"))?
+        .clone();
+
+    // THE PRECONDITION, checked rather than assumed. Until `SP` is CONFIRMED there is no outpoint to
+    // spend, which is exactly why `withdraw::execute` refuses a child and the SDK routes it to the
+    // unilateral walk. Refusing here with the reason is what tells a caller to materialise the spine
+    // first, instead of failing later with a storage-shaped error about missing rows.
+    let confirmed = cc
+        .electrum_client
+        .transaction_get(&sp_txid)
+        .map(|_| true)
+        .unwrap_or(false);
+    if !confirmed {
+        return Err(anyhow::anyhow!(
+            "the parent split state {sp_txid} is not on chain, so SP.out[{vout}] does not exist yet \
+             and cannot be co-signed. Materialise the spine first (broadcast T, wait out the \
+             extension CSV, broadcast SP, wait for confirmations) — or take the unilateral route \
+             through `exit_child_pass`, which needs no on-chain parent ([D77])."
+        ));
+    }
+
+    let mut wallet = crate::sqlite_manager::get_wallet(&cc.pool, wallet_name).await?;
+    let network = wallet.network.clone();
+    let coin = wallet
+        .coins
+        .iter_mut()
+        .find(|c| c.statechain_id.as_deref() == Some(child_statechain_id))
+        .ok_or_else(|| anyhow::anyhow!("no coin row for child {child_statechain_id}"))?;
+
+    // Value comes from the CHAIN (the parsed SP output), never from the coin row: the row is a local
+    // belief and this is the number the signature commits to.
+    let out = mercurylib::transaction::create_tx_out(
+        &Coin { amount: Some(prevout.value as u32), ..coin.clone() },
+        fee_rate_sats_per_vb,
+        to_address,
+        net_from_str(&network),
+    )?;
+    let _ = Address::from_str(to_address).map_err(|_| anyhow::anyhow!("bad destination {to_address}"))?;
+
+    let unsigned = Transaction {
+        version: 2,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: sp_txid, vout: cb.sp_vout },
+            script_sig: Default::default(),
+            // No timelock: a FRESH co-signature needs none. That is the whole saving over the
+            // pre-signed tail, whose two tiers each wait out a CSV.
+            sequence: Sequence(0xFFFF_FFFD),
+            witness: Witness::new(),
+        }],
+        output: vec![out],
+    };
+
+    let signed = cosign_tier(
+        cc,
+        coin,
+        hex::encode(electrum_client::bitcoin::consensus::encode::serialize(&unsigned)),
+        prevout.value,
+        &network,
+    )
+    .await?;
+
+    let raw = hex::decode(&signed)?;
+    let txid = cc
+        .electrum_client
+        .transaction_broadcast_raw(&raw)
+        .map_err(|e| anyhow::anyhow!("cooperative child exit built and co-signed but did not broadcast: {e}"))?;
+    Ok(txid.to_string())
+}
