@@ -21,7 +21,7 @@ unfinished.
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **12 landed** (all six Tier A, plus B.1–B.5 and B.7 — six of the eight Tier B). The other two are RESOLVED but not built: B.8 is **NOT A DEFECT** — the census already refuses head truncation (D49, superseding D41) and B.6 is **demoted to an optimisation** by D45's measurement. |
 | Live E2E suite | **88/88.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
-| Unit + guard suite | green — **764 tests, 0 failures** (`--workspace --tests`), measured 2026-08-14 |
+| Unit + guard suite | green — **788 tests, 0 failures** (`--workspace --tests`), measured 2026-08-14 |
 
 > **[CORRECTED 2026-08-14 — my own correction was wrong, and the record says so.]** I wrote here that
 > "the 756 was never verifiable" because `cargo test -p mercuryrustlib --lib` did not compile when it
@@ -35,13 +35,13 @@ unfinished.
 >
 > | target | tests |
 > |---|---|
-> | `cargo test --workspace --tests` | **764** |
+> | `cargo test --workspace --tests` | **788** |
 > | of which `mercuryrustlib --lib` | 377 |
 > | `mercury-utexo-sdk --lib` | 153 |
 > | `mercurylib --lib` | 111 |
-> | `ci-guards` | 85 |
+> | `ci-guards` | 109 |
 >
-> The four `--lib`/guard targets alone are 726; the workspace figure includes the integration targets.
+> The four `--lib`/guard targets alone are 750; the workspace figure includes the integration targets.
 > **Which number a row means is the thing to state** — "756" was neither wrong nor verifiable as
 > written, because it named no target set.
 
