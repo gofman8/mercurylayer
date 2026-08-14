@@ -1086,42 +1086,75 @@ returns the contract's transfer history.
 
 - **ERR-11** `fulfill_utexo_invoice` on an expired invoice → `invoice expired at …`.
 
-## 14. Known limitations (adversarial review)
+## 14. Named limitations
 
-Findings from the adversarial review that are **documented assumptions**, not code changes:
+**A design is sound when its failure modes are enumerated and survivable, not when it has none.** A
+specification that claims no drawbacks loses its authority at the first counter-example, so this
+section is written to be the one a reviewer judges the document by.
 
-- **Blind-SE ancestor binding.** The SE stores no per-`statechain_id` funding outpoint (it is blind),
-  so the receiver cannot cryptographically bind `terminal_parents` ids to specific branch outpoints.
-  INV-20's count check defeats omission; full defence against *substitution* of terminal decoys relies
-  on the receiver holding the fully-signed branch and being able to exit immediately (win the race for
-  the on-chain root). Honest senders always set each node terminal. On the laddered shape this is
-  replaced by the census (REQ-38), which binds to the SE's enclave-ATTESTED counter (§3.3) rather
-  than to named ids — and the attesting key is held by the same party the receiver is being
-  protected from, so what the attestation closes is the gap between what the enclave signed and what
-  the client reads, not operator collusion.
-- **Batch atomicity.** `transfer_many` / `batch_transfer_tokens` hand off pieces independently; there
-  is no all-or-nothing guarantee across recipients. A dropped hand-off leaves that piece reclaimable
-  by the sender (the split parent is terminal, so no double-spend), but the batch is not atomic.
-  This is the only remaining `transfer_many` caveat: its laddered-parent routing is fixed (REQ-27).
-- **Perpetual watching.** A laddered coin's unconditional no-watch window is gone: nothing ages while
-  un-broadcast (INV-27), but once a hostile trigger IS broadcast the defence is a race the owner (or
-  a tower) must enter within the CSV edge. No theft tx can become valid until at least
-  `e_floor + d_floor` blocks after a PUBLICLY visible on-chain trigger — **288** on the mainnet
-  schedule (144 + 144, `TesrParams::mainnet`), and every rung's confirmation on top — and nothing
-  ever expires to the operator, but the trade is real and deliberate: alarm-driven perpetual
-  watching in exchange for zero idle rent (PROTOCOL.md §5.7).
-- **Amount width.** Coin sats are booked as `u32` (`utxo.value as u32`, `coin_status.rs`); a single
-  coin above ~42.9 BTC would truncate. Out of range for the intended per-coin sizes; not guarded.
-- **Mint concurrency.** `mint_tokens` isolates the freshly-minted allocation by a before/after snapshot
-  and does NOT hold the wallet lock across its (minutes-long) on-chain confirmation wait, to avoid
-  blocking the background claim watcher. A concurrent same-asset receive into the *same* wallet during
-  a mint could be misattributed — issuers must not mint and receive the same asset concurrently.
-- **Unilateral-exit fees.** An un-laddered exit broadcasts pre-signed fixed-fee branch/backup txs
-  with no CPFP/RBF fee-bump; in a fee spike it may confirm slowly. The decrementing-locktime ladder
-  (INV-5) still guarantees the latest state wins the race. A laddered exit is better off but not
-  immune: each tier is v3/TRUC, carries a committed fee so the base case relays standalone, and
-  exposes a 240-sat P2A anchor anyone can attach a live-rate fee child to — so the fee-bump path
-  exists, but a tower must be funded to use it.
+Each entry says what it threatens, what it does NOT threaten, and what would close it. Nothing here
+is a surprise found elsewhere in the document: §0.4 lists the divergences between this document and
+the build, §0.5 the three things the design does not claim, and §1.2's goal table carries each goal's
+scope limit inline.
+
+### 14.1 Irreducible — these do not have a fix, and a future version will not close them
+
+| # | Limitation | Why it cannot be closed |
+|---|---|---|
+| **L-1** | **The statechain trust unit** (X-7): the SE together with a past owner holding a retained pre-rotation share can fresh-co-sign an immediate spend | a fresh signature needs no backup, so no timelock reaches it; and erasure cannot be proven — any proof attests one instance of the data. What the ladder changes is the NOTICE: post-compromise theft against a watched laddered coin needs a public on-chain trigger and ≥144 blocks, not a mempool race. A coin received before the compromise and left untouched is unconditionally safe |
+| **L-2** | **Sub-economic finality**: an ancestor's lowest backup rung voids an entire subtree for the cost of one 112-vB transaction, at zero marginal cost per extra piece | those transactions are already signed and in the splitter's hands; no operator can un-sign them. It needs no malice — the backup is cheaper than the splitter's own ladder walk at every fee rate, so an ordinary exit voids every sub-economic piece they ever paid. This is the SENDER'S FREE OPTION, not a payee liveness cost ([SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md)) |
+| **L-3** | **No operator-side value rule is possible**: the SE cannot refuse to co-sign a piece below a viability floor | it is blind (G9) — it signs 32-byte hashes and cannot tell a tier from a backup or a 1 500-sat coin from a whole bitcoin. Every value defence is therefore receiver-side. "The SE enforces a floor" is a WRONG proposal and is recorded here so it is not re-proposed |
+| **L-4** | **No in-protocol payment atomicity for a plain transfer** | a transfer is a one-way handover. Delivery-versus-payment needs the Lightning latch (§8) or an invoice |
+| **L-5** | **Perpetual watching** replaces the pre-TES-R unconditional no-watch window | this is the trade the architecture exists to make: 0 vB of idle rent (G12) in exchange for a REACTIVE duty. Nothing ages while un-broadcast, but once a hostile trigger is public the defence is a race the owner or a tower must enter. On the mainnet schedule no theft transaction can become valid until `e_floor + d_floor` = **288** blocks after that public trigger, and nothing ever expires to the operator |
+
+### 14.2 Open, with a known fix and a named owner
+
+| # | Limitation | Threatens | What closes it |
+|---|---|---|---|
+| **L-6** | **Declared `fee_rate`** — both synchronous verifiers accept the sender's number (§0.4 V-3, GAP A / GAP B) | G1. A ladder declared at an extreme rate satisfies the tier law against the real funding output while delivering a fraction of the coin | derive the rate receiver-side, as `cap_schedule` already does for the CSV schedule ([D27]). The tripwire tests assert today's acceptance and will fail when it is fixed — that is their job |
+| **L-7** | **The sid ↔ aggregate binding is an unauthenticated coordinator column** (CO-1, §0.4 V-4) | G2/G11 for a coin whose acceptance path consults it. A NULL downgrades any coin to the un-laddered lane; a wrong value combines with the rogue-key decomposition (the SENDER picks `user_public_key`) to make an attacker-chosen output pass | attest the binding as the count now is ([D69] closed the count's half). Note the fix that does NOT work and was rejected in writing: `validate_tx0_output_pubkey` cannot serve, for the rogue-key reason above |
+| **L-8** | **The attested counter is a plaintext row in an operator-run database** (CO-3 and SM-5, ONE defect filed twice — do not price it twice) | the census's right-hand side. The attestation authenticates the WIRE, not the STORAGE: production runs the lockbox container with no sealed monotonic state, so one `UPDATE … sig_count = sig_count − 1` absorbs a hidden rival and the receiver holds a VALID signature affirming the wrong number | two cheap parts, neither needing trusted hardware: (a) an append-only hash chain `h_n = H(h_{n−1} ‖ sid ‖ n)` published inside the attestation, so a rollback produces a head no owner's receipt matches — attributable rather than silent; (b) a two-store cross-check (coordinator count vs SE count), which is free detection the deployment already has and does not use. Until then the honest statement is: D8(a) closed the transport half; the STATE half is an assumption beside L-1 |
+| **L-9** | **One lost co-sign reply strands a coin's off-chain life** (SM-1) | NOT G4 or G8 — nothing is confiscated and the value is recoverable unilaterally. What is lost is the coin's cooperative life: the census counts sighashes but accepts only signed transactions as disclosure, so the coin stays exactly one slot short (it does not compound) and descendants inherit the refusal | persist `{sid, unsigned tx, msg, session, own partial}` and make the idempotent re-serve normative at EVERY gate in front of the SE, not only at the lockbox; plus a census self-check at wallet open that reports DEGRADED rather than idle |
+| **L-10** | **A flat backup may legally carry an RGB transition, and nothing binds its assignment** (RGB-1) | G5 on the un-laddered lane | the coloured lane removes the flat backup's role entirely — this closes with §0.4 V-1, which is another reason that row is the one to close first |
+| **L-11** | **The coloured lane's economics are denominated in carrier sats while the loss is denominated in ASSET value** (RGB-2), and a plain flat backup over a carrier is a BURN rather than a transfer | G5 | admission floors that price the asset, not the carrier. Today the mitigation is structural: the automatic passes never re-anchor a carrier, they SEVER it ([D46]) |
+| **L-12** | **The version selector has no unknown-version reject arm, and the sender picks the floor** (A-12) | G10 and, through it, payment finality: a conveyance at a version carrying neither the key handover nor the transfer signature lets a payer keep the child auth key while the payee books the payment | a two-sided version check and a floor the RECEIVER sets. The FFI performs the downgrade itself today, hard-coding the pre-ladder fields in both directions |
+| **L-13** | **Split-tree per-epoch materialisation is an uncharged on-chain rent** (VE-1) | the footprint economics of §7, not a safety goal | price it, or bound the tree shape that can be minted |
+| **L-14** | **Batch atomicity**: `transfer_many` / `batch_transfer_tokens` hand off pieces independently | no all-or-nothing across recipients. A dropped hand-off leaves that piece reclaimable by the sender — the split parent is terminal, so there is no double-spend | an atomic multi-piece hand-off. This is the only remaining `transfer_many` caveat; its laddered-parent routing is fixed (REQ-27) |
+| **L-15** | **Unilateral-exit fees** — an un-laddered exit broadcasts fixed-fee transactions with no bump | G4 under a fee spike | the package path is BUILT and live-verified but needs a funded UTXO, a signer and a Core RPC endpoint, so a keyless tower cannot use it ([D31]) and the child lane has no bump variant at all |
+| **L-16** | **Blind-SE ancestor binding** — the SE stores no per-sid funding outpoint, so a receiver cannot bind `terminal_parents` ids to specific outpoints | the un-laddered lane's defence against SUBSTITUTION of terminal decoys (omission is defeated by the count check) | superseded on the laddered shape by the census, which binds to the attested counter rather than to named ids. Closes with §0.4 V-1 |
+| **L-17** | **Amount width** — coin sats are booked as `u32`; a single coin above ~42.9 BTC would truncate | nothing at the intended per-coin sizes; it is not guarded | widen the type |
+| **L-18** | **Mint concurrency** — `mint_tokens` isolates the fresh allocation by a before/after snapshot and deliberately does not hold the wallet lock across its on-chain wait | a concurrent same-asset receive into the SAME wallet during a mint could be misattributed | issuers must not mint and receive the same asset concurrently |
+
+### 14.3 Measured limits — true of the design, not defects in it
+
+These are consequences of arithmetic. Under §0.1 a measurement overrules a design statement, so they
+are stated as limits rather than as things to fix.
+
+* **Split depth is capped at 8 on mainnet (19 transactions)**, 54 on regtest (111) — [D53]. Deeper
+  children are unadoptable at every tip, and the build side refuses to mint what the receive side
+  would refuse.
+* **Hop capacity is 100 decrements, of which 99 are USABLE** — [D62]. Hop 100 lands the locktime
+  exactly on the co-sign anchor, and the receiver refuses `lock_time <= tip`.
+* **K = 1 bounds the payees of one coloured PAYMENT, not the payments of one carrier** — [D43]. The
+  sender's change lands on a spine tip, and that tip is payable again.
+* **The P2A anchor slot is an auction, not a race** — [D45]. An under-paying squat is refused; an
+  over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
+  a price, not a denial of service.
+* **The floors are rate-evaluations, not constants.** At the shipped `committed_fee_rate = 3.0`:
+  plain rung 615, coloured rung 744, `min_child_value` 1 560, `min_spine_tip_value` 945, plain root
+  floor 2 175, coloured ROOT 2 562, coloured CHILD 1 818 ([D44]). Quoting one without its rate is
+  quoting a rate.
+
+### 14.4 Closed — recorded so they are not re-raised
+
+| was | closed by |
+|---|---|
+| the sig-count TRANSPORT half (a coordinator under-reporting `num_sigs`) | [D8-CLOSE] — attested count and budget in one signature over a caller-chosen nonce |
+| terminality read from an unsigned coordinator boolean | [D54] — routed through the attested budget, with a file-census guard |
+| **the attestation verified against a key that has no chain anchor for deep ancestors** (TRUST-MODEL B11) | [D69] — one pinned enclave identity; resolution pin → config → REFUSE |
+| T-4: the split window measured against a FRESH epoch by the builder and the REMAINING one by the payee | [D55] — derived from the parent's own conveyed backup chain |
+| B.8: census head truncation | [D49] — not a defect; the census already refuses it |
+| the depth cap published as 10 / 23 | [D53] — it was measured against the bare latency rule, not the rule that admits |
 
 > **P0 remediation status (2026-07-05 review).** The second adversarial review's six P0 blockers are
 > now **FIXED on `feat/spark`** and verifiable in code: the enclave/challenge nonce-reuse crypto break
@@ -1138,8 +1171,10 @@ Findings from the adversarial review that are **documented assumptions**, not co
 > from `server.cpp`), and `9cfe48f` applied the same consume to the SGX enclave lane
 > (`enclave/App/database/db_manager.cpp`, `statechain/sign.cpp`), which had silently never had it.
 > The coordinator-side challenge binding (INV-23 / ERR-12, `server/src/endpoints/sign.rs`) is a
-> third, independent stop and needs no enclave rebuild at all. One caveat remains: the **full E2E
-> suite (regtest + lockbox + RLN) must be re-run and the result re-reviewed**.
+> third, independent stop and needs no enclave rebuild at all. **That last caveat is now discharged:**
+> the full E2E suite (regtest + lockbox + RLN) was re-run on 2026-08-14 — 85 tests, 84 green; the one
+> failure was a stale pre-[D69] `mercury-ssp` BINARY, not a protocol defect, and it passed once
+> rebuilt. Workspace unit + guard tests: **794, 0 failures** (`cargo test --workspace --tests`).
 > See [REVIEW.md](REVIEW.md#second-adversarial-review-2026-07-05--full-protocol-production-readiness-pass).
 
 Unit tests live in `clients/libs/rust-sdk/src/*` (`#[cfg(test)]`); E2E dispatch via
