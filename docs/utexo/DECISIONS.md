@@ -2291,3 +2291,73 @@ directory and one saw a tree the other had just deleted. It went red once under 
 Not a defect in the guarded property — and worth fixing precisely for that reason: **a spurious red
 trains readers to re-run rather than to read, and a guard nobody believes is a guard nobody has.**
 Paths now carry the PID and a monotonic counter.
+
+---
+
+## D64 — Source-scanning guards cannot express reachability, and all seven rewrites were defeated
+
+**Status:** ONE systemic fix landed; the CEILING is now stated. **Date:** 2026-08-14.
+**Method:** seven guards rewritten by one agent each to pin the property rather than the description,
+then seven INDEPENDENT adversaries told to defeat the rewrite. **Verdict: 7 of 7 DEFEATED**, every
+one with a mutation applied to the real tree and the real test binary re-run.
+
+This is the most important result of the review, and it is not "the rewrites were bad" — each one
+does catch the mutation it was written for. It is that **the technique has a ceiling**.
+
+### The defeats, because the specifics are the argument
+
+| guard | the mutation that survives |
+|---|---|
+| `deny_armed_tower_during_conveyance` | the arm-down wrapped in `if std::env::var("…").is_ok() { … }` — present, durable, refusing, correctly ordered, and **never executed** |
+| `deny_selection_without_exit_material` | one added conjunct: `… .is_some() && !force_send` (or `&& false`). The `return Err(` is still there; the refusal is dead |
+| `deny_chain_anchored_token_balance` | `t.parent.rgb.as_ref()` for `t.rgb.as_ref()` — compiles (same field names), accumulation byte-identical, reports the parent's PRE-SPLIT allocation |
+| `deny_uncoloured_legs_under_a_coloured_sp` | `println!( // was: return Err(anyhow::anyhow!(` — **the mutation the guard prints in its own header**, satisfied by the annotation |
+| `deny_optional_deadline_safety` | `let _ = cfg.background_auto_refresh && wallet.deadline_safety_due(..).await.is_ok();` — brace-depth 0, and short-circuits. **The exact defect D58 fixed, restored** |
+| `deny_unqualified_keyless_rescue` | the `PROTOCOL.md` half was never scoped: move the normative paragraph to an appendix that says "earlier drafts said…" and the whole-file `contains` is satisfied |
+| `deny_sender_declared_ladder_gate` | the JS refusal re-subordinated to a **sender-declared** field: `if (transferMsg.protocol_version >= 2) { throw … }` |
+
+### The one systemic defect, fixed everywhere
+
+Eleven guards stripped comments with `l.trim_start().starts_with("//")` — **whole-line only**. A
+TRAILING comment survives, and a trailing comment is enough to satisfy any substring pin. All eleven
+now share a `strip_comments` that tracks string literals and cuts at the first `//` outside one.
+Verified by replaying the attacker's exact mutation: the guard goes from 3 passed to **2 failed**.
+
+### THE RULE, which is what a specification can rely on
+
+A source-scanning guard may assert:
+
+* **presence** — this symbol/call exists here;
+* **absence** — this known-bad spelling does not appear;
+* **ordering** — this byte position precedes that one;
+* **shape** — this window terminates on a real symbol and does not overshoot.
+
+It may **NOT** assert, and must not be documented as asserting:
+
+* **reachability** — that a statement runs on every path (`&&`, `if`, `match`, an early `return`, or
+  a caller that never calls it all defeat this);
+* **binding** — that a value came from the source the reader assumes;
+* **behaviour** — that a refusal refuses, as opposed to that a `return Err(` token is present.
+
+**The only pattern in this repo that proves behaviour is plant-and-run**: `deny_rgb_witness_apis`,
+`deny_swallowed_backup_reads` and `deny_silent_degradation` write the historical defect into a scratch
+tree, run the real checker, and assert the exit code. Everything a guard cannot express belongs in a
+unit or E2E test that executes the path.
+
+### What this changes
+
+* No guard header may claim its property is "enforced" when what it pins is presence or ordering.
+  The seven above are strict improvements and are kept — with their limits stated in-file.
+* Where a behavioural property matters, the guard points at the test that executes it.
+* **`deny_optional_deadline_safety`'s defeat is the one to act on first**: it restores D58's defect
+  and a source-scan cannot stop it. The property "the deadline pass runs on every path" needs a
+  behavioural test.
+
+### Two operational lessons
+
+1. **An adversary is worth more than a rewrite.** The seven rewrites cost as much as the seven
+   attacks and produced less: the attacks are what found the ceiling. Any future guard work should
+   budget the adversary first.
+2. **Three of the seven rewrites were destroyed by an attacker's `git checkout`** — my own
+   instruction told them to restore source files that way, and a broad restore took the sibling's
+   ci-guards edits with it. Isolate the attacker, or give it a read-only tree.

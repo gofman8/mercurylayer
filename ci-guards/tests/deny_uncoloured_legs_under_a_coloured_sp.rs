@@ -71,6 +71,53 @@
 
 use std::path::PathBuf;
 
+/// **[D64] Strip whole-line AND TRAILING `//` comments.**
+///
+/// Every stripper in this crate filtered only `l.trim_start().starts_with("//")`, so a TRAILING
+/// comment survived — and a trailing comment is enough to defeat any substring pin in the file. An
+/// adversarial pass proved it on the real tree with the mutation a guard printed in its own header:
+///
+/// ```ignore
+/// println!( // was: return Err(anyhow::anyhow!(
+///     "a COLOURED spine batch must not be driven through the PLAIN batch driver. …"
+/// );
+/// ```
+///
+/// The refusal is gone, the message is intact, and `arm.contains("return Err(")` is satisfied by the
+/// ANNOTATION. The guard stayed green.
+///
+/// `//` inside a string literal must not be treated as a comment (URLs, `"http://…"`, and the
+/// `"//"` in this very doc), so the scan tracks `"` and escapes.
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let b = line.as_bytes();
+        let (mut i, mut in_str, mut esc, mut cut) = (0usize, false, false, line.len());
+        while i + 1 <= b.len() {
+            let c = b[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else if c == b'"' {
+                in_str = true;
+            } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(line[..cut].trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+
 fn tesr_src() -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -83,10 +130,7 @@ fn tesr_src() -> String {
 /// in the comment that sits directly inside the arm — every identifier and most of the message text
 /// appears there too — so a guard that reads raw source is pinning the commentary, not the code.
 fn code_only(src: &str) -> String {
-    src.lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    strip_comments(src)
 }
 
 /// The block that opens at the first `{` at or after `from`, through ITS matching `}`.
@@ -189,7 +233,7 @@ fn violations(raw: &str) -> Vec<String> {
         ),
     ] {
         let arm = slice(lane_fork, pat, pat);
-        if !arm.contains("a COLOURED spine batch must not be driven through") {
+        if !arm.contains("return Err(") {
             v.push(format!("REFUSAL_{pat}: {why}:\n\n{arm}"));
         }
     }
@@ -273,7 +317,8 @@ fn guard_catches_the_mutations_it_was_written_for() {
     /// Replace the first occurrence of `from` that follows `anchor`, once.
     fn mutate(src: &str, anchor: &str, from: &str, to: &str) -> String {
         let a = src.find(anchor).unwrap_or_else(|| panic!("anchor `{anchor}` not found"));
-        let at = a + src[a..].find(from).unwrap_or_else(|| panic!("`{from}` not found after `{anchor}`"));
+        let at =
+            a + src[a..].find(from).unwrap_or_else(|| panic!("`{from}` not found after `{anchor}`"));
         format!("{}{}{}", &src[..at], to, &src[at + from.len()..])
     }
 
@@ -304,7 +349,12 @@ fn guard_catches_the_mutations_it_was_written_for() {
         // The pair it points at is withdrawn from the public surface.
         (
             "the_coloured_pair_is_no_longer_public",
-            mutate(&src, "\n/// **[S4b] The COLOURED spine batch", "pub fn build_colored_spine_batch(", "fn build_colored_spine_batch("),
+            mutate(
+                &src,
+                "\n/// **[S4b] The COLOURED spine batch",
+                "pub fn build_colored_spine_batch(",
+                "fn build_colored_spine_batch(",
+            ),
             "COLOURED_PAIR_EXISTS",
         ),
         // ORDERING: a leg established before the lane fork is reached.

@@ -19,13 +19,60 @@
 
 use std::path::PathBuf;
 
+/// **[D64] Strip whole-line AND TRAILING `//` comments.**
+///
+/// Every stripper in this crate filtered only `l.trim_start().starts_with("//")`, so a TRAILING
+/// comment survived — and a trailing comment is enough to defeat any substring pin in the file. An
+/// adversarial pass proved it on the real tree with the mutation a guard printed in its own header:
+///
+/// ```ignore
+/// println!( // was: return Err(anyhow::anyhow!(
+///     "a COLOURED spine batch must not be driven through the PLAIN batch driver. …"
+/// );
+/// ```
+///
+/// The refusal is gone, the message is intact, and `arm.contains("return Err(")` is satisfied by the
+/// ANNOTATION. The guard stayed green.
+///
+/// `//` inside a string literal must not be treated as a comment (URLs, `"http://…"`, and the
+/// `"//"` in this very doc), so the scan tracks `"` and escapes.
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let b = line.as_bytes();
+        let (mut i, mut in_str, mut esc, mut cut) = (0usize, false, false, line.len());
+        while i + 1 <= b.len() {
+            let c = b[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else if c == b'"' {
+                in_str = true;
+            } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(line[..cut].trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+
 fn read(rel: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(rel);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{rel} is readable: {e}"))
 }
 
 fn code_only(src: &str) -> String {
-    src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    strip_comments(src)
 }
 
 fn body(code: &str, sig: &str) -> String {
