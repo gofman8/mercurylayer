@@ -2710,3 +2710,45 @@ cast and PANICKING the verifier on the claim path) was already closed by checked
 fix, so `honest_root_ladder_is_accepted` and `honest_child_bundle_is_accepted_and_its_booking_gap_is_two_rungs`
 must keep passing — and the live claim path must keep working, which is verified by running it rather
 than by argument.
+
+## [D73] Eight fixes scoped, eight refuted — and one of them was a remedy this specification recommended
+
+**Decision: implement none of the eight plans as written.** Each adversary produced an amendment;
+those are the inputs to implementation, not the plans.
+
+Eight agents scoped the open limitations L-7…L-18 against the code. Eight independent adversaries,
+each instructed to default to "unsound" under uncertainty, then attacked them. **All eight plans were
+found unsound. SIX of the eight would have REFUSED HONEST TRAFFIC** — the failure direction this
+corpus cares about most, and the one that looks like a security improvement while it happens.
+
+This is [D64]'s result in a new place: seven guards rewritten, seven defeated. The rate is not the
+interesting part. The interesting part is that in both rounds the plans were produced by agents that
+had read the code, and were still wrong in ways only a second reading found.
+
+**The finding that matters beyond this batch: L-8's remedy — which THIS SPECIFICATION prescribed —
+does not work.** The row recommended an append-only chain `h_n = H(h_{n−1} ‖ sid ‖ n)` published
+inside the attestation, on the argument that a rollback then yields a head no owner's receipt
+matches. It does not: `h_n` is a pure function of `(sid, n)` given a fixed `h_0`, so an operator who
+rolls `sig_count` back and re-advances regenerates the identical head. Nothing contradicts anything.
+The chain must commit to per-round data the owner witnessed — the round's session bytes — before it
+detects a thing. Corrected in place.
+
+Three more of the same shape, all of them SPEC rows describing defects the code has already closed:
+
+* **L-12** — two thirds already closed by [D16] (`ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]`, shape 3
+  deleted, the FFI now REFUSES a laddered outbound instead of truncating). The "floor is 3, so a
+  conveyance carries neither handover nor signature" theft path and "the FFI downgrades in BOTH
+  directions" are both FALSE at HEAD. What IS live is narrower and real: `prepay_child_census`
+  carries no shape check and gates with `<`, so every value in `[4, u32::MAX]` clears it, and
+  `validate_encrypted_message`'s child block returns BEFORE that function's only `admissible_shape`
+  call. Inert today, because v99 selects the same arms v4 does — but it is exactly the ordinal
+  reading [D16] forbids.
+* **L-15** — the exit half is done (`exit_child_pass_with_bump`, `exit_spine_tip_pass_with_bump`, both
+  wired). The gap is the WATCH half, which the row does not mention.
+* **L-10** — and here the SCOPING agent was the wrong one: it proposed retiring the row as closed by
+  `verify_flat_backup_lane`, and its adversary showed the verdict is INVERTED, because that check
+  runs only when a ladder is present while L-10 is scoped to the UN-laddered lane.
+
+**The rule this puts beside [D64]:** a plan is not evidence, and neither is the fact that its author
+read the code. Scope, then attack, then implement the amendment — and when the attacker says a fix
+would refuse honest traffic, that outranks the defect it was meant to close.
