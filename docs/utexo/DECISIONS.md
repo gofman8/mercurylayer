@@ -3041,3 +3041,32 @@ the 21.3 sat/vB crossover is right. [D79]'s sweep policy rests on those and is u
 FRAMING needs an adversary too.** Both my version and the first independent one got the arithmetic
 right and the accounting wrong, because both priced the sweep as free. Arithmetic can be checked by
 recomputation; framing can only be checked by someone trying to break it.
+
+## [D81] Stop quoting the whole-coin economics — the real user holds a LEAF
+
+**Owner, 2026-08-14, on being shown a per-user table led by the root-holder figure: "no one would
+hold the whole coin, it's bullshit."** He is right, and a day of framing rested on it.
+
+Payments are arbitrary amounts, so every non-exact payment is an in-ladder split and the recipient
+gets a CHILD. A root holder is the DEPOSITOR, or the rare payee of an exact-amount transfer. **After
+the first payment, everyone downstream is on the leaf lane.** The representative number is therefore:
+
+| who | block space per payment | against ~154 vB on chain |
+|---|---:|---|
+| leaf, spent onward off-chain | **0** | this is the product |
+| leaf, swept ([D79]) | 58 vB | 0.38× |
+| **leaf, WALKED out — the shipped default** | **250 vB** | **1.62× WORSE** |
+| root holder — depositor only | 5.9 vB at 100 payments/yr | 26× — **do not quote as typical** |
+
+**The conclusion this forces, and it is the honest headline:** on the shipped default, settling a
+payment costs MORE block space than making it on chain, for the users who actually exist. [D79]'s
+sweep is not an optimisation on a winning position — it is a PRECONDITION for the median user's
+economics being positive at all. That reading is consistent with [D80]'s aggregate result (the lane
+loses below ~74 % sweep coverage) and it is the per-user statement of the same fact.
+
+Corrected in SPEC §14.3 and PARTIAL-PAYMENT-ECONOMICS §0.2b, both of which now lead with the leaf.
+
+**The pattern, third time in one day:** the model was right and the SELECTION of which row to lead
+with was flattering. [D74] (stale claims), [D80] (a free sweep) and this are the same failure —
+arithmetic checked, framing not. **Choosing the representative case is part of the claim, and it needs
+the same adversary as the arithmetic.**

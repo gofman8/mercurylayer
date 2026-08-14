@@ -1390,6 +1390,24 @@ are stated as limits rather than as things to fix.
   quantity independent of K and of this aggregate. The sweep's commercial case stands even where its
   block-space case does not.
 
+* **PER-PAYMENT COST BY LANE — and the LEAF lane is the normal one.** Payments are arbitrary amounts,
+  so every non-exact payment is an in-ladder split and the recipient receives a CHILD. A root holder
+  is the DEPOSITOR, or the rare payee of an exact-amount transfer. **After the first payment,
+  everyone downstream holds a leaf.**
+
+  | who | block space per payment | against ~154 vB on chain |
+  |---|---:|---|
+  | **leaf, spent onward off-chain** | **0** | this is the product |
+  | **leaf, swept by an SSP** (§5.3) | 58 vB | 0.38× |
+  | **leaf, WALKED out — the shipped default** | 250 vB | **1.62× WORSE** |
+  | root holder — the depositor ONLY | ~589 vB/yr ⇒ 5.9 at 100 payments/yr | 26× |
+
+  **The root row MUST NOT be quoted as the typical case.** It is the most flattering number in the
+  model and it describes a population that barely exists once payments start flowing. The honest
+  headline is the row above it: **on the shipped default, settling a payment costs MORE block space
+  than making it on chain.** §5.3's sweep is what changes that — which is why it is not an
+  optimisation but a precondition for the median user's economics.
+
 * **THE ON-CHAIN CADENCE IS REAL, AND IT IS THE FLAT CALENDAR — not the tier chain** ([T-1]/[T-2]).
   This is the number to quote when someone asks what the design saves, because "zero rent" is true of
   the tiers and false of the coin. On the mainnet profile (`initlock = 10 000`, `interval = 100`):
