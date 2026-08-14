@@ -168,7 +168,7 @@ form of claim this corpus keeps having to retract.
 | **G9** | safety | **SE BLINDNESS.** The SE signs 32-byte sighashes; a coloured sighash is byte-indistinguishable from a plain one; consignments stay P2P | covers CONTENT, not traffic — the SE still learns sids, auth keys, counts, flags, timing and the caller's endpoint. Blindness is also why every operator-side value fix is impossible: "the SE refuses to co-sign a piece below a floor" is a WRONG proposal and must not be re-proposed |
 | **G10** | safety | **AUTHORIZATION INTEGRITY.** Only the current owner authorizes an irreversible operation, single-use and endpoint-bound | the single-use nonce is deployed on THREE endpoints; every other mutating endpoint takes a static, replayable signature |
 | **G11** | safety | **ADMISSION SOUNDNESS.** A receiver never admits a coin whose exit provably cannot complete, and every term of an admission test is receiver-derived — a serde field is not admissible | enforced in TIME and in STRUCTURE; the uncovered dimension is VALUE. `min_child_value` is not a floor that ignores economics — it IS `V_min` evaluated at the shipped rate (1 560 sat at 3.0 sat/vB), correct at that rate and no other |
-| **G12** | liveness | **ZERO IDLE COST.** All tiers are un-broadcast, `T` carries no timelock, and CSV does not tick until the parent confirms — so an idle coin, and an entire idle DAG, never ages: 0 vB of rent, no deadline, no forced materialisation | holds for LADDERED coins. The un-laddered shape keeps its absolute-locktime deadline, and a leaf's clock is the parent's lowest backup rung — a height belonging to the splitter |
+| **G12** | liveness | **ZERO IDLE COST ON THE CSV SIDE.** All tiers are un-broadcast, `T` carries no timelock, and CSV does not tick until the parent confirms — so the TIER CHAIN adds 0 vB of rent and no deadline, however long the coin or the DAG sits idle | **this is NOT "the coin never touches the chain", and reading it that way is the [T-1] error.** A laddered coin RETAINS its flat backup chain, whose locktimes are ABSOLUTE and do age — so the flat calendar, not the CSV hop budget, is what sets the real maintenance cadence ([T-2]). See §14.3's cadence entry for the measured numbers. A leaf is worse: its clock is the parent's lowest backup rung, a height belonging to the splitter |
 
 ### 1.3 Assumptions
 
@@ -1182,7 +1182,7 @@ scope limit inline.
 | # | Limitation | Why it cannot be closed |
 |---|---|---|
 | **L-1** | **The statechain trust unit** (X-7): the SE together with a past owner holding a retained pre-rotation share can fresh-co-sign an immediate spend | a fresh signature needs no backup, so no timelock reaches it; and erasure cannot be proven — any proof attests one instance of the data. What the ladder changes is the NOTICE: post-compromise theft against a watched laddered coin needs a public on-chain trigger and ≥144 blocks, not a mempool race. A coin received before the compromise and left untouched is unconditionally safe |
-| **L-2** | **Sub-economic finality**: an ancestor's lowest backup rung voids an entire subtree for the cost of one 112-vB transaction, at zero marginal cost per extra piece | those transactions are already signed and in the splitter's hands; no operator can un-sign them. It needs no malice — the backup is cheaper than the splitter's own ladder walk at every fee rate, so an ordinary exit voids every sub-economic piece they ever paid. This is the SENDER'S FREE OPTION, not a payee liveness cost ([SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md)) |
+| **L-2** | **Sub-economic finality**: a piece whose value is below the cost of defending it is forfeit to the party who split it | **NOT an unconditional option — state the counter, or the row is wrong.** The splitter holds the parent's lowest flat backup, one 112-vB transaction spending `F` that pays them the whole coin and voids the entire subtree at zero marginal cost per extra piece. But the piece holder holds `T` (it travels in `ChildTesrBundle.parent`), `T` also spends `F`, and `T` carries NO timelock — `TRIGGER_SEQUENCE` disables the relative lock and the builder sets no absolute one. So `T` is valid the instant `F` confirms while the backup is valid only at `L_k`: the payee can PRE-EMPT for the whole window, not merely race at the end, and one confirmed `T` kills every flat backup permanently. **A payee who acts keeps their money, always.** What is irreducible is that acting costs the walk (`3 + 2d` transactions, `293d + 375` vB), so below break-even the defence costs more than the piece — and only THERE is the splitter's backup free. The residual is an economic viability bound on small pieces, not a theft option over large ones ([SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md)) |
 | **L-3** | **No operator-side value rule is possible**: the SE cannot refuse to co-sign a piece below a viability floor | it is blind (G9) — it signs 32-byte hashes and cannot tell a tier from a backup or a 1 500-sat coin from a whole bitcoin. Every value defence is therefore receiver-side. "The SE enforces a floor" is a WRONG proposal and is recorded here so it is not re-proposed |
 | **L-4** | **No in-protocol payment atomicity for a plain transfer** | a transfer is a one-way handover. Delivery-versus-payment needs the Lightning latch (§8) or an invoice |
 | **L-5** | **Perpetual watching** replaces the pre-TES-R unconditional no-watch window | this is the trade the architecture exists to make: 0 vB of idle rent (G12) in exchange for a REACTIVE duty. Nothing ages while un-broadcast, but once a hostile trigger is public the defence is a race the owner or a tower must enter. On the mainnet schedule no theft transaction can become valid until `e_floor + d_floor` = **288** blocks after that public trigger, and nothing ever expires to the operator |
@@ -1219,6 +1219,24 @@ are stated as limits rather than as things to fix.
 * **The P2A anchor slot is an auction, not a race** — [D45]. An under-paying squat is refused; an
   over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
   a price, not a denial of service.
+* **THE ON-CHAIN CADENCE IS REAL, AND IT IS THE FLAT CALENDAR — not the tier chain** ([T-1]/[T-2]).
+  This is the number to quote when someone asks what the design saves, because "zero rent" is true of
+  the tiers and false of the coin. On the mainnet profile (`initlock = 10 000`, `interval = 100`):
+
+  | | |
+  |---|---|
+  | a coin's calendar runway from a fresh anchor | **10 000 blocks ≈ 69 days** |
+  | what each whole-coin hop costs of it | **100 blocks** — so 100 decrements, **99 usable** ([D62]) |
+  | what one re-anchor costs | **one 112-vB transaction** |
+  | so one on-chain transaction buys | **min(99 off-chain payments, 69 days)**, whichever binds first |
+  | amortised | **≈ 1.13 vB per payment**, against ~110 vB for a plain on-chain payment — **≈ 97×** |
+  | idle rent | **≈ 589 vB per coin-year**, against ≈ 5 840 pre-TES-R — **≈ 10×**, not ∞ |
+
+  A SPLIT PIECE does not get its own 10 000 blocks: it inherits what remains of the parent's, which
+  is why its exit deadline is a height the splitter owns (L-2, §14.1). And each hop spends calendar
+  whether or not time passes, so a coin transferred 99 times must be re-anchored no matter how young
+  it is.
+
 * **The floors are rate-evaluations, not constants.** At the shipped `committed_fee_rate = 3.0`:
   plain rung 615, coloured rung 744, `min_child_value` 1 560, `min_spine_tip_value` 945, plain root
   floor 2 175, coloured ROOT 2 562, coloured CHILD 1 818 ([D44]). Quoting one without its rate is
