@@ -27,6 +27,14 @@ pub struct ClientConfig {
     pub tor_proxy: Option<String>,
     /// Confirmation target
     pub max_fee_rate: f64,
+    /// **[D69] The enclave attestation identity to verify terminality against.**
+    ///
+    /// Used ONLY where this build has no compiled-in pin for the network
+    /// (`mercurylib::tesr::TesrParams::attestation_identity_const`). Where a pin exists it wins and a
+    /// mismatching value here is a REFUSAL, not an override — see
+    /// `TesrParams::attestation_identity`. Read the value from the enclave's
+    /// `GET /attestation_identity`.
+    pub attestation_identity: Option<String>,
 }
 
 fn check_and_set_settings() -> String {
@@ -41,6 +49,11 @@ fn check_and_set_settings() -> String {
 impl ClientConfig {
     /// Programmatic constructor for SDK embedders (no Settings.toml). Creates the sqlite
     /// database if missing and runs this crate's migrations.
+    ///
+    /// `attestation_identity` is the [D69] enclave attestation identity pin. `None` falls back to
+    /// `UTEXO_ATTESTATION_IDENTITY`; if neither is set and this build has no compiled-in pin, every
+    /// laddering claim REFUSES. That is the correct direction to fail — the alternative is trusting
+    /// the key the coordinator serves alongside the signature it is meant to check.
     pub async fn from_params(
         statechain_entity: String,
         electrum_server: String,
@@ -48,6 +61,7 @@ impl ClientConfig {
         network: Network,
         database_file: String,
         confirmation_target: u32,
+        attestation_identity: Option<String>,
     ) -> Result<Self> {
         if !Sqlite::database_exists(&database_file).await.unwrap_or(false) {
             Sqlite::create_database(&database_file).await?;
@@ -68,6 +82,10 @@ impl ClientConfig {
             pool,
             tor_proxy: None,
             max_fee_rate: 1.0,
+            // [D69] The embedder's explicit pin wins; the environment is the fallback so an
+            // existing harness that exports UTEXO_ATTESTATION_IDENTITY keeps working unchanged.
+            attestation_identity: attestation_identity
+                .or_else(|| std::env::var("UTEXO_ATTESTATION_IDENTITY").ok()),
         })
     }
 
@@ -88,6 +106,13 @@ impl ClientConfig {
         let database_file = settings.get_string("database_file").unwrap();
         let confirmation_target = settings.get_int("confirmation_target").unwrap() as u32;
         let max_fee_rate = settings.get_int("max_fee_rate").unwrap() as f64;
+
+        // [D69] Optional in the file; the environment wins so a CI run can point at a freshly
+        // seeded lockbox without rewriting Settings.toml. Neither is a fallback for a compiled-in
+        // pin — `TesrParams::attestation_identity` refuses a mismatch rather than preferring one.
+        let attestation_identity = std::env::var("UTEXO_ATTESTATION_IDENTITY")
+            .ok()
+            .or_else(|| settings.get_string("attestation_identity").ok());
 
         let tor_proxy = match settings.get_string("tor_proxy") {
             Ok(proxy) => Some(proxy.to_string()),
@@ -133,7 +158,8 @@ impl ClientConfig {
             confirmation_target,
             pool,
             tor_proxy,
-            max_fee_rate
+            max_fee_rate,
+            attestation_identity,
         }
     }
 

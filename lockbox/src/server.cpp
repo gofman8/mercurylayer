@@ -463,6 +463,34 @@ namespace lockbox {
                 return crow::response{result};
         });
 
+        // ═══ [D69] PUBLISH THE ATTESTATION IDENTITY, so a client can PIN it ═══
+        //
+        // Read-only, no secret leaves: the x-only PUBLIC half of the enclave's long-term attestation
+        // key. An operator curls this once and compiles the value into the client
+        // (`lib/src/tesr.rs::attestation_identity_const`).
+        //
+        // The route exists so that the pinning step is a documented operation rather than folklore,
+        // and so a regtest/CI wallet — which faces a lockbox with a freshly generated seed and can
+        // have no compiled-in pin — has one defined place to read it from.
+        //
+        // ⚠️ Serving it here does NOT make it a trust anchor. A client that fetched this key at
+        // verification time and then verified against it would be checking a signature against a key
+        // from the same party in the same conversation, which proves nothing. It is an anchor only
+        // once it is pinned OUT OF BAND, which is the whole point of D69 option (a).
+        CROW_ROUTE(app,"/attestation_identity")
+        ([&seed](){
+            crow::json::wvalue result;
+            try {
+                unsigned char xonly[32];
+                enclave::attestation_identity_pubkey(seed.data(), xonly);
+                result["attestation_identity_pubkey"] = utils::key_to_string(xonly, sizeof(xonly));
+                result["domain"] = "utexo/attestation-identity/v1";
+            } catch (std::exception const &e) {
+                return crow::response(500, std::string("Failed to derive the attestation identity: ") + e.what());
+            }
+            return crow::response{result};
+        });
+
         CROW_ROUTE(app,"/signature_count/<string>")
         ([&seed](const crow::request& req, std::string statechain_id){
 
@@ -533,16 +561,10 @@ namespace lockbox {
                     return crow::response(400, "nonce must decode to exactly 32 bytes");
                 }
 
-                auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-                auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
-                encrypted_secnonce.reset();
-
-                bool data_loaded = db_manager::load_generated_key_data(
-                    statechain_id, encrypted_keypair, encrypted_secnonce, nullptr, 0, error_message);
-
-                if (!data_loaded) {
-                    return crow::response(500, "Failed to load key data for attestation: " + error_message);
-                }
+                // [D69] The coin's own keypair is NO LONGER LOADED for this. The attestation is
+                // signed by the enclave's long-term identity key, which is why the load below is
+                // gone: nothing about the signature depends on which coin is being attested any
+                // more, only the PREIMAGE does. See `enclave::attestation_identity_pubkey`.
 
                 // Build the digest. `sig_count` is serialised big-endian and fixed-width so the
                 // preimage is unambiguous — a length-varying decimal string would let two different
@@ -567,7 +589,7 @@ namespace lockbox {
                 SHA256(preimage.data(), preimage.size(), digest);
 
                 try {
-                    auto att = enclave::attest_sig_count(seed.data(), encrypted_keypair.get(), digest);
+                    auto att = enclave::attest_sig_count_identity(seed.data(), digest);
                     result["attestation"] = utils::key_to_string(att.signature, sizeof(att.signature));
                     result["attestation_pubkey"] = utils::key_to_string(att.xonly_pubkey, sizeof(att.xonly_pubkey));
                     result["attestation_nonce"] = nonce_str;

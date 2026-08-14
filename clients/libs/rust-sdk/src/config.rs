@@ -116,6 +116,25 @@ pub struct SdkConfig {
     /// Setting it back to `false` re-enables the legacy lane for that wallet; the per-coin interlock
     /// (`refuse_if_colored_ladder`) still stops any single coin from carrying both.
     pub colored_ladder: bool,
+    /// **[D69] The enclave attestation identity this wallet verifies sig-count attestations against.**
+    ///
+    /// The census's right-hand side (`num_sigs`, and the budget that says whether another
+    /// co-signature can ever be issued) arrives under an enclave signature. The key that signature
+    /// is checked against must NOT be one the coordinator serves alongside it, and for a depth-≥2
+    /// in-ladder-split ancestor there is no chain anchor to use instead — its funding output is
+    /// deliberately un-broadcast. So the client pins one long-term identity per enclave
+    /// (`TRUST-MODEL` B11).
+    ///
+    /// Resolution is **compiled-in pin → this field → REFUSE**. A build with a compiled-in pin
+    /// ignores nothing and tolerates nothing: a value here that disagrees with it is an error, not
+    /// an override. `None` with no compiled-in pin means every laddering claim refuses — which is
+    /// the correct direction to fail, not a bug to work around by trusting the served key.
+    ///
+    /// **Why this field exists at all:** an SDK embedder has no `Settings.toml`, so before it the
+    /// only way to pin was the `UTEXO_ATTESTATION_IDENTITY` environment variable — still honoured
+    /// when this is `None`, so existing harnesses keep working. Read the value from the enclave's
+    /// `GET /attestation_identity`.
+    pub attestation_identity: Option<String>,
 }
 
 /// THERE IS ONE PROTOCOL. Every fresh confirmed root coin is laddered (TES-R) by `claim()` — the
@@ -390,6 +409,11 @@ impl SdkConfig {
                 AUTO_EXIT_MODELLED_DEPTH,
             ),
             colored_ladder: false,
+            // [D69] `None` falls back to UTEXO_ATTESTATION_IDENTITY, which is how the repo's E2E
+            // harness pins the local lockbox. There is no default value here on purpose: a wrong
+            // pin and no pin both refuse, and a hard-coded one would be wrong on every stack but
+            // the machine it was written on.
+            attestation_identity: None,
         }
     }
 
@@ -421,6 +445,9 @@ impl SdkConfig {
                 AUTO_EXIT_MODELLED_DEPTH,
             ),
             colored_ladder: false,
+            // [D69] Mainnet ships no compiled-in pin yet either, so an operator MUST set this (or
+            // the environment variable) — see `TesrParams::attestation_identity_const`.
+            attestation_identity: None,
         }
     }
 }

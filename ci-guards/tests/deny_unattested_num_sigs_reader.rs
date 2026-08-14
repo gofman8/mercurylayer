@@ -121,13 +121,96 @@ fn the_single_reader_still_verifies_and_still_refuses() {
         code.contains("NO enclave \\\n") || code.contains("with NO enclave"),
         "the unattested branch no longer refuses by name"
     );
-    // …and the verifying key must be the CHAIN-ANCHORED one, not the served attestation pubkey —
-    // verifying against a key the coordinator also supplies proves nothing.
+    // …and the verifying key must be the PINNED enclave identity.
+    //
+    // **[D69] This assertion used to read `code.contains("&response.enclave_public_key")`** — the
+    // coin's own chain-anchored server key. Sound for a coin that is ON CHAIN, and a depth-≥2
+    // in-ladder-split ancestor's funding output is deliberately un-broadcast, so for those ancestors
+    // the "anchor" was a field of the same response as the signature. `TRUST-MODEL` B11.
     assert!(
-        code.contains("&response.enclave_public_key"),
-        "the attestation is no longer verified against the chain-anchored `enclave_public_key`. \
-         Verifying against the SERVED attestation pubkey instead would accept a coordinator signing \
-         with a key of its own, which is precisely the attack."
+        code.contains("TesrParams::attestation_identity("),
+        "`get_statechain_info` no longer resolves the PINNED enclave attestation identity. Every \
+         other candidate for the verifying key is served by the coordinator in the same response as \
+         the signature, which proves nothing — and for a deep in-ladder-split ancestor there is no \
+         chain anchor to fall back to, by design ([D69], TRUST-MODEL B11)."
+    );
+}
+
+/// **[D69] THE PIN MAY NOT COME FROM THE RESPONSE.** The whole point is that the verifying key is
+/// independent of the party being checked; a call site that recovers "convenience" by passing a
+/// served field re-opens B11 in one line, and it would look entirely reasonable in review.
+///
+/// This is an ABSENCE assertion over the argument list — the shape [D64] says a source scan may
+/// make. It cannot prove the resolver's OUTPUT is what flows in (that would be a binding claim);
+/// `the_single_reader_still_verifies_and_still_refuses` above pins the resolver's presence, and the
+/// live suite exercises the path in both directions.
+#[test]
+fn no_call_site_verifies_against_a_key_the_coordinator_served() {
+    const CRATES: [&str; 2] = ["clients/libs/rust/src", "clients/libs/rust-sdk/src"];
+    // Served fields. Any of these reaching the verifier means the coordinator chose its own checker.
+    const SERVED: [&str; 4] = [
+        "response.enclave_public_key",
+        "response.sig_count_attestation_pubkey",
+        "info.enclave_public_key",
+        "info.sig_count_attestation_pubkey",
+    ];
+    let mut hits: Vec<String> = Vec::new();
+    for dir in CRATES {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(dir);
+        for entry in std::fs::read_dir(&base).expect("crate src is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().map_or(true, |e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let src = code_only(&std::fs::read_to_string(&path).expect("readable"));
+            // The window is the call expression: from the callee to the closing `);`. A served field
+            // anywhere else in the file (logging it, storing it) is not this defect.
+            let mut rest = src.as_str();
+            while let Some(at) = rest.find("verify_sig_count_attestation(") {
+                let tail = &rest[at..];
+                let end = tail.find(");").map(|e| e + 2).unwrap_or(tail.len());
+                let call = &tail[..end];
+                for served in SERVED {
+                    if call.contains(served) {
+                        hits.push(format!("{dir}/{name}: passes `{served}`"));
+                    }
+                }
+                rest = &tail[end..];
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "these call sites verify the enclave's sig-count attestation against a key the COORDINATOR \
+         SERVED in the same response as the signature. That is not a check — the signer picks the \
+         verifier. Pass the pinned identity from `TesrParams::attestation_identity` ([D69], \
+         TRUST-MODEL B11):\n{}",
+        hits.join("\n")
+    );
+}
+
+/// NON-VACUITY, by construction rather than by assertion: the detector is run against the code as
+/// it stood BEFORE [D69], which is the defect this guard exists to keep out.
+#[test]
+fn the_detector_catches_the_pre_d69_call_site() {
+    let historical = "\
+        let ok = verify_sig_count_attestation(\n\
+            &statechain_id,\n\
+            response.num_sigs,\n\
+            budget,\n\
+            &nonce_hex,\n\
+            &att,\n\
+            &att_pubkey,\n\
+            &response.enclave_public_key,\n\
+        );\n";
+    let src = code_only(historical);
+    let at = src.find("verify_sig_count_attestation(").expect("callee is found");
+    let tail = &src[at..];
+    let end = tail.find(");").map(|e| e + 2).unwrap_or(tail.len());
+    assert!(
+        tail[..end].contains("response.enclave_public_key"),
+        "the window no longer captures the argument list, so the rule above is a census of nothing"
     );
 }
 

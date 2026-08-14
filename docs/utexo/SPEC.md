@@ -76,8 +76,9 @@ Normative TES-R references: [PROTOCOL.md](PROTOCOL.md) (tiers, renewal, terminal
 **REQ-3** Trust reduces to: *the SE refuses to co-sign past a terminal budget, a passed epoch, a
 single-use spend or an open transfer, and reports its co-signature count honestly* — and that count
 is no longer taken on trust: it arrives under the enclave's `utexo/sig_count/v2` signature, verified
-against the CHAIN-ANCHORED enclave key the receiver already bound to `tx0`, over a nonce the
-receiver itself chose (§3.3, REQ-38). Plus a liveness duty on the owner (or a delegated tower) that
+against the **PINNED enclave attestation identity** ([D69] — not the chain-anchored per-coin key this
+clause used to name, because a deep in-ladder-split ancestor has no chain anchor by design), over a
+nonce the receiver itself chose (§3.3, REQ-38). Plus a liveness duty on the owner (or a delegated tower) that
 differs by coin shape — an **un-laddered**
 coin must be exited before its backup locktime floor / epoch deadline; a **laddered** coin has no
 deadline at all, but its defender must react within the CSV edge once someone publicly broadcasts
@@ -323,10 +324,20 @@ and each one increments the public `num_sigs` the receiver's census reads (REQ-3
   sig_count_attestation_pubkey, enclave_public_key, …}` — the counter every receiver's census
   (REQ-38) is checked against. It is **attested, not asserted**: the count AND the budget travel in
   one enclave signature over `sha256("utexo/sig_count/v2" ‖ statechain_id ‖ u32_be(num_sigs) ‖
-  u8(has_budget) ‖ u32_be(budget) ‖ nonce32)`, verified against the chain-anchored
-  `enclave_public_key` the receiver already bound to `tx0` — never against the served
-  `attestation_pubkey`, which the coordinator chooses — and over a nonce the CALLER generated, so a
-  genuine older attestation cannot be replayed. A missing attestation, a mismatched key, or a
+  u8(has_budget) ‖ u32_be(budget) ‖ nonce32)`, verified against the **PINNED enclave attestation
+  identity** — never against the served `attestation_pubkey`, which the coordinator chooses — and
+  over a nonce the CALLER generated, so a genuine older attestation cannot be replayed.
+
+  > **[D69] The verifying key is pinned, not chain-anchored, and the difference is the whole point.**
+  > This clause used to read "verified against the chain-anchored `enclave_public_key` the receiver
+  > already bound to `tx0`". True for a coin that IS on chain — and a depth-≥2 in-ladder-split
+  > ancestor's funding output is **deliberately un-broadcast**, so for those ancestors there was
+  > nothing to bind to and the verifying key arrived in the same response as the signature. The
+  > enclave now signs every attestation with one long-term identity
+  > (`utexo/attestation-identity/v1`, published at `GET /attestation_identity`) and the client pins
+  > it, so the check is independent of the coordinator's word AND of whether the coin is on chain —
+  > it holds at every split depth. Resolution is **pin → config → refuse**: a compiled-in pin is not
+  > overridable, and "neither" is a refusal, never a fallback to the served key. A missing attestation, a mismatched key, or a
   `has_sig_budget` the enclave cannot state is REFUSED, not defaulted (`get_statechain_info`,
   `verify_sig_count_attestation`; there is no phased rollout, D23). Without it a coordinator that
   under-reported `num_sigs` by `k` would hide `k` co-signed rival states while the exact-equality

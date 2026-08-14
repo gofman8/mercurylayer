@@ -58,6 +58,13 @@ fn cfg_from_params(p: &Value) -> Result<SdkConfig> {
     if let Some(v) = p.get("poll_interval_secs").and_then(|v| v.as_u64()) {
         cfg.poll_interval_secs = v;
     }
+    // [D69] The enclave attestation identity pin. Absent here it falls back to
+    // UTEXO_ATTESTATION_IDENTITY in the daemon's environment, and absent both (with no compiled-in
+    // pin) every laddering claim refuses — so a browser wallet driving this daemon fails closed
+    // rather than trusting whatever key the coordinator serves with its own attestation.
+    if let Some(v) = p.get("attestation_identity").and_then(|v| v.as_str()) {
+        cfg.attestation_identity = Some(v.to_string());
+    }
     Ok(cfg)
 }
 

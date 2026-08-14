@@ -285,6 +285,14 @@ pub const FLAT_LADDER_UNREADABLE: &str = "ladder-unreadable";
 /// an electrum fault and a genuinely un-broadcast `F` are indistinguishable at the lookup, so the
 /// permanent spelling is written only on positive evidence and this transient one otherwise.
 pub const FLAT_FUNDING_UNRESOLVABLE: &str = "funding-unresolvable";
+/// **[D69] No enclave attestation identity is pinned or configured for this network.**
+///
+/// PERMANENT for this build+configuration, and it licenses NOTHING. Without a key to verify the
+/// enclave's attestation against, terminality cannot be established at all — and accepting the key
+/// the coordinator serves beside its own signature is precisely the hole D69 closed (TRUST-MODEL
+/// B11). Distinct from `coordinator-unavailable` on purpose: that one says "retry later", and
+/// retrying a missing configuration forever is how a permanent fault wears a transient label.
+pub const FLAT_ATTESTATION_UNPINNED: &str = "attestation-identity-unpinned";
 /// The coin's ladder could not be bound for a reason that is NOT the legacy no-aggregate case — a
 /// non-taproot funding output, a scriptPubKey that would not decode, or a coordinator aggregate that
 /// does not control `F` (a decoy-shaped coin). Never a licence: only

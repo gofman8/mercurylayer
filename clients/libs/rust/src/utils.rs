@@ -168,6 +168,22 @@ pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConf
                     ));
                 }
             };
+            // ═══ [D69] THE VERIFYING KEY COMES FROM THE PIN, NOT FROM THIS RESPONSE ═══
+            //
+            // It used to be `&response.enclave_public_key` — a value the coordinator just sent, in
+            // the same body as the signature it verifies. For a coin whose funding output is on
+            // chain that was fine: the receiver binds that key to tx0 elsewhere. A deep
+            // in-ladder-split ancestor's funding is deliberately UN-BROADCAST, so no such binding
+            // exists, and for those ancestors the check reduced to "the coordinator signed with the
+            // key the coordinator named" — TRUST-MODEL B11.
+            //
+            // Resolution fails CLOSED: no pin and no configured identity is an error, never a
+            // fallback to the served key.
+            let pinned = mercurylib::tesr::TesrParams::attestation_identity(
+                &client_config.network.to_string(),
+                client_config.attestation_identity.as_deref(),
+            )
+            .map_err(|why| anyhow::anyhow!("{why}"))?;
             mercurylib::transfer::receiver::verify_sig_count_attestation(
                 statechain_id,
                 response.num_sigs,
@@ -175,7 +191,7 @@ pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConf
                 &nonce_hex,
                 sig,
                 pk,
-                &response.enclave_public_key,
+                &pinned,
             )
             .map_err(|e| {
                 anyhow::anyhow!(

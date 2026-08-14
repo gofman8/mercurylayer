@@ -1,6 +1,9 @@
 #include <assert.h>
 #include "enclave.h"
 #include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <vector>
+#include <string>
 #include <stdexcept>
 #include <string.h>
 #include "utils.h"
@@ -334,6 +337,111 @@ namespace enclave {
 
         secp256k1_context_destroy(ctx);
 
+        return response;
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    // [D69] THE ENCLAVE'S LONG-TERM ATTESTATION IDENTITY
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    //
+    // See `enclave.h` for why this exists (TRUST-MODEL B11). In one line: an attestation signed by
+    // the COIN's key can only be verified by someone who knows that coin's key, and the sole honest
+    // way to learn it is the on-chain funding output — which a deep in-ladder-split ancestor
+    // deliberately does not have.
+    //
+    // Derivation, and every part of it is load-bearing:
+    //
+    //   * DOMAIN SEPARATION. The seed already produces per-coin sealing keys; hashing it with a
+    //     distinct ASCII tag means this key cannot collide with, or be substituted for, any other
+    //     use of the same secret.
+    //   * VERSION IN THE TAG. `/v1` so a future rotation is a different derivation rather than a
+    //     silent change of meaning under the same name.
+    //   * COUNTER RETRY. A SHA-256 output is not guaranteed to be a valid secp256k1 scalar (it can
+    //     be zero or >= n). The probability is ~2^-128, so this loop will not run twice in the life
+    //     of the universe — but "will not happen" is not "cannot happen", and a keypair_create
+    //     failure here would be an unhandled throw at boot.
+    static void derive_identity_keypair(unsigned char* seed, secp256k1_context* ctx,
+                                        secp256k1_keypair* out) {
+        const std::string domain = "utexo/attestation-identity/v1";
+        for (unsigned int counter = 0; counter < 256; ++counter) {
+            std::vector<unsigned char> preimage(domain.begin(), domain.end());
+            preimage.insert(preimage.end(), seed, seed + 32);
+            preimage.push_back(static_cast<unsigned char>(counter));
+
+            unsigned char sk[32];
+            SHA256(preimage.data(), preimage.size(), sk);
+
+            if (secp256k1_keypair_create(ctx, out, sk) == 1) {
+                memset(sk, 0, sizeof(sk));
+                return;
+            }
+            memset(sk, 0, sizeof(sk));
+        }
+        throw std::runtime_error(
+            "could not derive the attestation identity key from the seed after 256 attempts — this "
+            "is cryptographically impossible with a real seed, so the seed is almost certainly not "
+            "what this build thinks it is");
+    }
+
+    void attestation_identity_pubkey(unsigned char* seed, unsigned char* xonly_pubkey_out32) {
+        secp256k1_context* ctx =
+            secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        secp256k1_keypair kp;
+        try {
+            derive_identity_keypair(seed, ctx, &kp);
+        } catch (...) {
+            secp256k1_context_destroy(ctx);
+            throw;
+        }
+        secp256k1_xonly_pubkey xonly;
+        int ok = secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp);
+        assert(ok);
+        ok = secp256k1_xonly_pubkey_serialize(ctx, xonly_pubkey_out32, &xonly);
+        assert(ok);
+        memset(&kp, 0, sizeof(kp));
+        secp256k1_context_destroy(ctx);
+    }
+
+    SigCountAttestationResponse attest_sig_count_identity(
+        unsigned char* seed,
+        const unsigned char* message32) {
+
+        SigCountAttestationResponse response;
+        memset(response.signature, 0, sizeof(response.signature));
+        memset(response.xonly_pubkey, 0, sizeof(response.xonly_pubkey));
+
+        secp256k1_context* ctx =
+            secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        secp256k1_keypair kp;
+        try {
+            derive_identity_keypair(seed, ctx, &kp);
+        } catch (...) {
+            secp256k1_context_destroy(ctx);
+            throw;
+        }
+
+        // Auxiliary randomness, per BIP-340. Not optional: this key signs every attestation the
+        // enclave ever makes, so a deterministic-nonce failure would be worse here than anywhere
+        // else in the process.
+        unsigned char auxiliary_rand[32];
+        if (RAND_bytes(auxiliary_rand, sizeof(auxiliary_rand)) != 1) {
+            memset(&kp, 0, sizeof(kp));
+            secp256k1_context_destroy(ctx);
+            throw std::runtime_error("Failed to generate random bytes");
+        }
+
+        int ok = secp256k1_schnorrsig_sign32(ctx, response.signature, message32, &kp, auxiliary_rand);
+        assert(ok);
+
+        secp256k1_xonly_pubkey xonly;
+        ok = secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &kp);
+        assert(ok);
+        ok = secp256k1_xonly_pubkey_serialize(ctx, response.xonly_pubkey, &xonly);
+        assert(ok);
+
+        memset(&kp, 0, sizeof(kp));
+        secp256k1_context_destroy(ctx);
         return response;
     }
 

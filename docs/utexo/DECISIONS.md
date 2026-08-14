@@ -2467,3 +2467,159 @@ tolerate `is_idempotent_rebroadcast`.
 
 ⚠️ **The coloured twin has the same shape** (`let already = transaction_get(..).is_ok(); if !already
 { … }`) and the guard's classifier does not match that spelling. Same latent defect, one lane over.
+
+---
+
+## D69 — B11 CLOSED: the enclave gets a long-term attestation identity, pinned by the client
+
+**Status:** BUILT (enclave + client + tests), LIVE-VERIFIED. **Date:** 2026-08-14.
+**Option chosen:** (a) pin in the client. **Supersedes** `TRUST-MODEL` B11, which described the hole.
+
+### The hole, in one sentence
+
+Terminality is established from an enclave signature; a signature is worth only the key that verifies
+it; and that key was the COIN's server key, whose sole honest anchor is the on-chain funding output —
+which a depth-≥2 in-ladder-split ancestor **deliberately does not have**. The verifier's own parameter
+was named `chain_anchored_enclave_pubkey`, so the design always knew what it needed; for deep
+ancestors it simply was not there, and the key arrived in the same HTTP body as the signature it was
+meant to check.
+
+### The fix
+
+The enclave now signs **every** attestation with one long-term identity key, derived from the seed it
+already manages:
+
+```
+K_att = SHA256("utexo/attestation-identity/v1" || seed || u8(counter))   // counter retried to a valid scalar
+```
+
+`GET /attestation_identity` publishes its x-only public half. The client verifies against a **pinned**
+value, so the check no longer depends on the coordinator's word or on whether the coin is on chain —
+**it works at every split depth.**
+
+**This is not a new secret.** Every per-coin keypair is already sealed under the same seed, so the
+seed was already the single point of compromise. The identity key concentrates nothing new.
+
+### Resolution order, which IS the security property
+
+1. **compiled-in pin** (`TesrParams::attestation_identity_const`) — and where one exists it is **not
+   overridable**: a configured value that disagrees is a REFUSAL. A pin a config file can override is
+   a default, and overriding it re-opens B11 in full.
+2. **configured value** — accepted only where this build has no pin, i.e. on a network whose enclave
+   it does not know.
+3. **neither ⇒ REFUSE.** Never a fallback to the served key: that is precisely the state B11 names.
+
+Today every network returns `None`, because **no enclave has been provisioned for any public
+network**. That is the honest state and it is why (3) is a refusal. A regtest/CI lockbox generates its
+own seed, so its identity is per-environment and must be supplied — `UTEXO_ATTESTATION_IDENTITY` or
+`attestation_identity` in the settings, read from the route above.
+
+### Verified live, both directions
+
+* **without a pin**: laddering refuses and the coin stays flat — no coin was accepted on an
+  unverifiable attestation;
+* **with the pin**: `SDK_E2E=1` green end to end, and the endpoint's key matches the
+  `attestation_pubkey` the `/signature_count` route now returns.
+
+### The defect this change introduced, and the guard-shaped lesson
+
+The first version classified the refusal as `coordinator-unavailable` — **TRANSIENT**. A missing
+configuration is permanent, and telling an operator to "retry after the next claim()" for a value that
+will never appear on its own is the silent-degradation shape one level up: *a permanent fault wearing
+a transient label*. There is now a distinct `attestation-identity-unpinned` reason, classified by
+re-running the resolver rather than by matching on a message, and it licenses nothing (the flat-lane
+licence list is a whitelist, so a new spelling is refused by construction).
+
+### What this costs — the trade-off taken with eyes open
+
+**Rotation is a client release.** A compromised identity key cannot be replaced until users upgrade,
+and a second operator needs a second entry. Accepted for now because there is no deployed public
+enclave and no second operator; the successor is option (b) — an on-chain anchor with a rotation
+chain — and this constant becomes its genesis entry. Nothing about (a) blocks (b) later.
+
+### What is still NOT closed
+
+CO-1: the enclave itself. If the enclave is malicious it can attest anything, and that is the trust
+anchor the whole design rests on. D69 closes the narrower and worse case — **the coordinator ALONE**,
+a separate process from the lockbox, forging a deep ancestor's terminality without the enclave's
+cooperation.
+
+### D69 addendum — WHERE the pin lives, and the run that proved the answer
+
+The decision above says "the client pins it". *Which* client object holds it turned out to matter,
+and the first attempt got it wrong in a way that only a live run could show.
+
+There are two configuration lanes:
+
+* `ClientConfig::load()` reads `Settings.toml` — the `mercuryrustlib` lane the repo's own tools use.
+* `ClientConfig::from_params()` takes explicit arguments and reads **no file at all** — the lane an
+  SDK embedder uses, because an embedder has no `Settings.toml`. `UtexoWallet::initialize` goes
+  through it.
+
+The pin was first plumbed into `load()` only, with `from_params` falling back to the
+`UTEXO_ATTESTATION_IDENTITY` environment variable. Recording it in the harness's
+`regtest.Settings.toml` therefore looked like it pinned an E2E run and **did not**: with the
+variable unset, `SDK_E2E=1` refused to ladder (recorded skip reason `coordinator-unavailable`,
+because the resolver that classifies the skip reads the OTHER config object and resolved fine). An
+embedder had no way to pin at all except by rebuilding with a compiled-in constant.
+
+So `SdkConfig::attestation_identity` now exists, `from_params` takes it explicitly, and the
+environment variable is the fallback rather than the only mechanism. The sdk-daemon accepts it as an
+`initialize` parameter, so a browser wallet driving the daemon can be pinned too. Resolution order is
+unchanged and is the whole point: **compiled-in pin → configured value → REFUSE**.
+
+**Two lessons, both about evidence rather than design.**
+
+1. **A pin recorded in a file that the lane never reads is worse than no pin**, because it reads as
+   protection in review. The comment in `regtest.Settings.toml` now says which lane it serves and
+   states the measurement that showed it.
+2. **`SDK 21` failed the post-D69 suite for a reason that had nothing to do with the protocol.** It
+   spawns `target/debug/mercury-ssp` as a separate process, and that binary was built *before* D69 —
+   so it still verified attestations against the coordinator-served per-coin key while the enclave
+   had switched to signing with its identity. A stale sibling binary is invisible to `cargo run` on
+   the test crate: it rebuilds the test, not the daemon the test spawns. **When a protocol change
+   crosses a process boundary, rebuild every binary in the boundary before reading the results.** The
+   same run also carried a `target/debug/rust` predating the skip-reason classifier — which is why
+   the refusal above surfaced under the wrong (transient) label.
+
+## [D70] The RGB engine's allocation set does not follow a broadcast tier — and that is not a defect
+
+**Decision: the evidence that a coloured sever preserved the allocation is the VALIDATED CONSIGNMENT
+CHAIN, not the engine's allocation set. No code change; `sdk87` section (d) was rewritten and the
+measured engine behaviour pinned in both directions.**
+
+[D61] rewrote sdk87(d) because its two assertions turned out to be two readers of one persisted row.
+The replacement asked rgb-lib's own allocation set where the units live after the sever, and
+asserted they had LEFT the funding outpoint the trigger spent. That assertion **never passed** — it
+was written and committed without being run (`4afc34b`; the three green runs of sdk87 all predate
+it). Measured now: deterministic failure, 3 for 3, all `SUPPLY` units still reported at `F` after `T`
+confirmed.
+
+An explicit `refresh()` of the engine before the read was implemented and measured too. It changed
+nothing, and was **reverted rather than kept** — a no-op that looks like a fix is worse than the
+absence of one.
+
+**Why the engine cannot answer this question.** A CTES-R tier is coloured with `color_psbt` and
+broadcast through the electrum client. rgb-lib never issued that transfer, so it holds no transfer
+row to settle; and `T.out[0]` pays the SE-aggregate key, which is not an outpoint this wallet owns,
+so there is nowhere for the engine to move the allocation TO. The engine learns where the units went
+when the walk completes and the leaf consignment — the one paying the owner's own key — is accepted,
+which is many CSV blocks after a sever. Nothing is lost in the meantime: the proof travels in the
+bundle.
+
+**What sdk87(d) asserts now**, via `colored_ladder_health` (the fork's
+`validate_consignment_offchain_chain` over the ladder's own consignments and tier witnesses — it
+reads neither the persisted `rgb.amount` row nor the engine's allocations, so it can disagree with
+both):
+
+* the chain still validates after `T` is on chain — a sever does not break the proof;
+* it assigns exactly `SUPPLY` to the ladder's final state;
+* for the carrier's contract, and starting at the trigger that was actually broadcast;
+* and the engine still accounts for the units (it may not know WHERE, but it must not LOSE them),
+  still at the spent funding outpoint — pinned so a future change in either direction is noticed
+  rather than absorbed.
+
+**The lesson, which is the session's recurring one in a new place:** a rewritten assertion is a NEW
+assertion. [D61] corrected a real defect in the evidence and introduced an unrun claim in the same
+edit; it survived because the test around it was green for other reasons. **Run the test you just
+rewrote, on the tree you just changed, before the commit that claims it.**

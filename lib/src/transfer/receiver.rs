@@ -254,10 +254,11 @@ pub fn verify_transfer_signature(new_user_pubkey: &str, tx0_outpoint: &TxOutpoin
 /// co-signed rival states: the census still balanced exactly, and the receiver accepted a coin the
 /// sender could still reclaim. Theft, resting on coordinator honesty alone.
 ///
-/// **The verifying key must be the chain-anchored one.** `attestation_pubkey` as served is just a
-/// field the coordinator could fill with a key it controls; pass the `enclave_public_key` this
-/// receiver has already bound to the on-chain tx0 output via [`validate_tx0_output_pubkey`], and
-/// this function refuses if the two disagree. That is what makes the attestation mean anything.
+/// **The verifying key must be the PINNED one.** `attestation_pubkey` as served is just a field the
+/// coordinator could fill with a key it controls; pass the enclave attestation identity the client
+/// pinned (`TesrParams::attestation_identity`), and this function refuses if the two disagree. That
+/// is what makes the attestation mean anything. Pinning is what an earlier design got wrong — see
+/// the [D69] note below, and do not re-introduce a per-coin, coordinator-served anchor.
 ///
 /// `nonce_hex` must be the 32-byte challenge THIS caller generated for THIS request. Without it a
 /// coordinator could replay a genuine attestation captured when the count was legitimately lower.
@@ -271,6 +272,16 @@ pub fn verify_transfer_signature(new_user_pubkey: &str, tx0_outpoint: &TxOutpoin
 /// says how many co-signatures exist, and only the count PLUS the budget says whether another can
 /// ever be issued — which is what a receiver relying on terminality actually needs. Two separate
 /// attestations could be mixed across time, pairing a fresh count with a stale budget.
+/// **[D69] The verifying key is the PINNED ENCLAVE IDENTITY, not anything served in this response.**
+///
+/// The last parameter was `chain_anchored_enclave_pubkey`, and the name was the design: the coin's
+/// own server key, which the receiver had already bound to the on-chain tx0 output. That is sound
+/// for a coin that IS on chain — and a deep in-ladder-split ancestor's funding output is
+/// deliberately un-broadcast, so for those ancestors there was no anchor and the verifying key
+/// arrived alongside the signature it was meant to check. That is `TRUST-MODEL` B11.
+///
+/// One long-term identity per enclave, pinned by the client, removes the dependency on the coin's
+/// chain presence entirely — so this check now works at every split depth.
 pub fn verify_sig_count_attestation(
     statechain_id: &str,
     num_sigs: u32,
@@ -278,7 +289,7 @@ pub fn verify_sig_count_attestation(
     nonce_hex: &str,
     attestation_hex: &str,
     attestation_pubkey_hex: &str,
-    chain_anchored_enclave_pubkey: &str,
+    pinned_enclave_identity: &str,
 ) -> Result<(), MercuryError> {
     // The lockbox emits every key it serialises through `key_to_string`, which PREFIXES "0x"
     // (lockbox/src/utils.cpp:56-62). `from_str` does not accept that, so strip it here rather than
@@ -286,14 +297,22 @@ pub fn verify_sig_count_attestation(
     // live endpoint — the unit tests generated their own hex and so could not have caught it.
     let strip0x = |s: &str| s.strip_prefix("0x").unwrap_or(s).to_string();
 
-    // 1. The signer must be the key already bound to the on-chain tx0 output. `enclave_public_key`
-    //    is a 33-byte compressed key; the attestation carries its 32-byte x-only half.
-    let anchored = PublicKey::from_str(&strip0x(chain_anchored_enclave_pubkey))
-        .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
-    let (anchored_xonly, _) = anchored.x_only_public_key();
+    // 1. [D69] The signer must be THE PINNED ENCLAVE IDENTITY. The pin is 32-byte x-only (that is
+    //    what `/attestation_identity` serves and what a client compiles in); a 33-byte compressed
+    //    key is still accepted so an operator who pinned the longer form is not silently refused.
+    let strip = strip0x(pinned_enclave_identity);
+    let pinned_xonly = match XOnlyPublicKey::from_str(&strip) {
+        Ok(x) => x,
+        Err(_) => {
+            PublicKey::from_str(&strip)
+                .map_err(|_| MercuryError::SigCountAttestationInvalid)?
+                .x_only_public_key()
+                .0
+        }
+    };
     let claimed_xonly = XOnlyPublicKey::from_str(&strip0x(attestation_pubkey_hex))
         .map_err(|_| MercuryError::SigCountAttestationInvalid)?;
-    if anchored_xonly != claimed_xonly {
+    if pinned_xonly != claimed_xonly {
         // The coordinator signed with a key of its own choosing. That is the attack this check is
         // for, so it is a refusal, not a warning.
         return Err(MercuryError::SigCountAttestationInvalid);

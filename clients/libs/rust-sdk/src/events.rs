@@ -165,6 +165,12 @@ pub enum LadderSkipReason {
     /// The coordinator could not be reached (or returned no record) this pass, so bindability is
     /// unknown. TRANSIENT: the next pass retries.
     CoordinatorUnavailable,
+    /// **[D69]** No enclave attestation identity is pinned in this build or configured for this
+    /// network, so no attestation can be verified and terminality cannot be established.
+    /// **PERMANENT** for this build+configuration — retrying changes nothing — and it licenses
+    /// NOTHING. Kept distinct from [`Self::CoordinatorUnavailable`] because that one tells the
+    /// operator to wait, and waiting for a configuration value to appear is not a plan.
+    AttestationIdentityUnpinned,
     /// The ladder could not be bound for a reason that is NOT the pre-0009 legacy case: the funding
     /// output is not v1 taproot, its scriptPubKey would not decode, or the coordinator's aggregate
     /// does not control `F` (a decoy-shaped coin). Distinct from [`Self::NotBindable`] on purpose —
@@ -200,6 +206,9 @@ impl LadderSkipReason {
             Self::FundingUnresolvable => mercuryrustlib::transfer_sender::FLAT_FUNDING_UNRESOLVABLE,
             Self::NotBindable => mercuryrustlib::transfer_sender::FLAT_NOT_BINDABLE,
             Self::CoordinatorUnavailable => mercuryrustlib::transfer_sender::FLAT_COORDINATOR_UNAVAILABLE,
+            Self::AttestationIdentityUnpinned => {
+                mercuryrustlib::transfer_sender::FLAT_ATTESTATION_UNPINNED
+            }
             Self::BindingUnresolved => mercuryrustlib::transfer_sender::FLAT_BINDING_UNRESOLVED,
             Self::EstablishFailed => mercuryrustlib::transfer_sender::FLAT_ESTABLISH_FAILED,
             Self::DuplicateDeposit => mercuryrustlib::transfer_sender::FLAT_DUPLICATE_DEPOSIT,
@@ -219,6 +228,7 @@ impl LadderSkipReason {
             LadderSkipReason::FundingUnresolvable,
             LadderSkipReason::NotBindable,
             LadderSkipReason::CoordinatorUnavailable,
+            LadderSkipReason::AttestationIdentityUnpinned,
             LadderSkipReason::BindingUnresolved,
             LadderSkipReason::EstablishFailed,
             LadderSkipReason::DuplicateDeposit,

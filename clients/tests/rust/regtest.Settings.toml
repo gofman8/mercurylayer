@@ -9,3 +9,23 @@ confirmation_target = 2
 # max fee rate in sat/vbyte
 # if the fee rate is higher than this, the transaction will use this max fee rate
 max_fee_rate = 1
+
+# [D69] The enclave attestation identity this run verifies sig-count attestations against.
+#
+# No network has a COMPILED-IN pin yet (`TesrParams::attestation_identity_const` returns None
+# everywhere), and resolution is pin -> config -> REFUSE, never a fallback to the key the
+# coordinator serves. Without this line every laddering claim on regtest refuses, which is correct
+# but makes the suite unrunnable — so the local dev lockbox's identity is recorded here.
+#
+# It is derived from that container's seed (`utexo/attestation-identity/v1`), so a differently
+# seeded lockbox will REFUSE rather than pass: fail-closed, which is the direction to fail in.
+# Read yours from `GET /attestation_identity` and override without editing this file by exporting
+# UTEXO_ATTESTATION_IDENTITY — the environment wins over the file.
+#
+# ⚠️ THIS LINE ALONE DOES NOT PIN AN E2E RUN. It is read by `ClientConfig::load()` — the
+# mercuryrustlib lane. An SDK wallet is built from `SdkConfig` via `ClientConfig::from_params`,
+# which never reads a Settings file (an embedder does not have one); it takes
+# `SdkConfig::attestation_identity`, falling back to the environment variable. So the harness must
+# still export UTEXO_ATTESTATION_IDENTITY, or each test must set the field. Measured, not assumed:
+# with the variable unset and only this line present, SDK_E2E=1 refused to ladder.
+attestation_identity = "0xa3c87c1dd1344e30f6374b568306f46031ed9bfa35ec73c03c61d819848c5def"

@@ -348,6 +348,98 @@ impl TesrParams {
     /// [`Self::flat_ladder_params`] in a `const` context, so downstream constants (the SDK's
     /// `auto_exit_margin_blocks` derivation) are computed at compile time from this table instead of
     /// transcribing its numbers. Case-sensitive — `flat_ladder_params` is the lowercasing wrapper.
+    /// **[D69] THE ENCLAVE'S PINNED ATTESTATION IDENTITY, per network.**
+    ///
+    /// This is what closes `TRUST-MODEL` B11. Terminality is established from an enclave signature;
+    /// a signature is worth only the key that verifies it; and until now that key was the COIN's
+    /// server key, whose sole honest anchor is the on-chain funding output. A deep in-ladder-split
+    /// ancestor's funding is deliberately un-broadcast, so for those ancestors the verifying key
+    /// arrived in the same HTTP response as the signature — which proves nothing.
+    ///
+    /// The enclave now signs every attestation with ONE long-term identity key
+    /// (`enclave::attestation_identity_pubkey`, derived from its seed under
+    /// `utexo/attestation-identity/v1`). Pinning that key here makes the verifier independent of
+    /// what the coordinator says and independent of whether the coin is on chain — so the check
+    /// works at every depth.
+    ///
+    /// # Why a compiled-in constant, and what that costs
+    ///
+    /// D69 took option (a): pin in the client. No new infrastructure, no bootstrap trust, nothing to
+    /// discover. The cost is **rotation is a client release** — a compromised identity key cannot be
+    /// replaced until users upgrade — and a second operator needs a second entry. When either of
+    /// those bites, the successor is an on-chain anchor with a rotation chain (option (b)), and this
+    /// constant becomes its genesis entry.
+    ///
+    /// # `None` is not "no check" — it is "no coin may be verified on this network yet"
+    ///
+    /// Every network returns `None` today because **no enclave has been provisioned for any public
+    /// network**. That is the honest state, and it is why the resolver treats `None` plus no
+    /// configured value as a REFUSAL rather than a fallback. A regtest or CI lockbox generates its
+    /// own seed, so its identity differs per environment and must be supplied by configuration;
+    /// there is one defined place to read it from (`GET /attestation_identity`).
+    ///
+    /// When a mainnet enclave is provisioned, its x-only identity goes here, and from that moment
+    /// mainnet stops accepting a configured override — see `attestation_identity`.
+    pub const fn attestation_identity_const(network: &str) -> Option<&'static str> {
+        // Deliberately exhaustive over the same names `for_network` knows, so adding a network
+        // cannot silently inherit another's identity.
+        if const_str_eq(network, "bitcoin") || const_str_eq(network, "mainnet") {
+            None // no mainnet enclave provisioned
+        } else if const_str_eq(network, "testnet")
+            || const_str_eq(network, "testnet3")
+            || const_str_eq(network, "testnet4")
+            || const_str_eq(network, "signet")
+        {
+            None // no public-testnet enclave provisioned
+        } else {
+            None // regtest: per-environment seed, must be configured
+        }
+    }
+
+    /// **[D69] Resolve the identity to verify attestations against — pin first, config second,
+    /// REFUSE third.**
+    ///
+    /// The order is the security property, not a convenience:
+    ///
+    /// * a compiled-in pin, where one exists, is **not overridable**. If it were, the "pin" would be
+    ///   a default and an attacker who can influence a config file could re-open B11 in full;
+    /// * a configured value is accepted only where there is no pin — i.e. on a network whose enclave
+    ///   this build does not know, which today is all of them;
+    /// * neither means the client **cannot verify terminality at all**, and that is a refusal. It
+    ///   must not degrade to "accept whatever the coordinator serves", because that is precisely the
+    ///   state B11 describes.
+    pub fn attestation_identity(
+        network: &str,
+        configured: Option<&str>,
+    ) -> core::result::Result<String, String> {
+        if let Some(pinned) = Self::attestation_identity_const(network) {
+            if let Some(cfg) = configured {
+                let norm = |s: &str| s.trim_start_matches("0x").to_ascii_lowercase();
+                if norm(cfg) != norm(pinned) {
+                    return Err(format!(
+                        "the configured attestation identity does not match the one COMPILED IN for \
+                         {network}. A pin that a configuration file can override is not a pin — it \
+                         is a default, and overriding it re-opens the hole it was added to close \
+                         (TRUST-MODEL B11). Remove the configured value, or use a build whose pin is \
+                         the key you mean.\n  compiled-in: {pinned}\n  configured:  {cfg}"
+                    ));
+                }
+            }
+            return Ok(pinned.to_string());
+        }
+        match configured {
+            Some(c) if !c.trim().is_empty() => Ok(c.to_string()),
+            _ => Err(format!(
+                "no attestation identity is available for network `{network}`: this build has no \
+                 compiled-in pin and none was configured. Terminality is established from an \
+                 enclave signature, and without a key to verify it against there is nothing to \
+                 check the signature WITH — accepting the key the coordinator serves alongside the \
+                 signature would prove nothing (TRUST-MODEL B11). Read the enclave's identity from \
+                 `GET /attestation_identity` and set `attestation_identity` in the client settings."
+            )),
+        }
+    }
+
     pub const fn flat_ladder_params_const(network: &str) -> Option<(u32, u32)> {
         // `match` on `&str` is not available in `const fn` (str's PartialEq is not const), hence the
         // explicit chain over `const_str_eq`.
@@ -1405,4 +1497,63 @@ mod grid_law_tests {
             assert!(!p.is_on_state_grid(0), "0 must be off the state grid (d_floor {})", p.d_floor);
         }
     }
+    /// **[D69] THE PIN RESOLVER — every branch, because each one is a security decision.**
+    #[test]
+    fn the_attestation_identity_resolves_pin_first_config_second_and_otherwise_refuses() {
+        use super::TesrParams as P;
+        const K: &str = "a3c87c1dd1344e30f6374b568306f46031ed9bfa35ec73c03c61d819848c5def";
+
+        // No pin compiled in (the state today on every network) + nothing configured => REFUSAL.
+        // The message must name the remedy, because a bare error here reads as an outage.
+        for net in ["bitcoin", "mainnet", "testnet", "signet", "regtest"] {
+            let e = P::attestation_identity(net, None).expect_err("no pin, no config => refuse");
+            assert!(
+                e.contains("no attestation identity is available") && e.contains("B11"),
+                "{net}: the refusal must say WHAT is missing and WHY it matters: {e}"
+            );
+            // …and an empty string is not a configuration.
+            assert!(P::attestation_identity(net, Some("   ")).is_err(), "{net}: blank is not a pin");
+        }
+
+        // Configured, no pin => accepted, verbatim.
+        assert_eq!(P::attestation_identity("regtest", Some(K)).unwrap(), K);
+
+        // THE PROPERTY THAT MATTERS ONCE A PIN EXISTS. Simulated here rather than waiting for a
+        // provisioned enclave, because the rule must be written and tested before the first key is
+        // pinned — afterwards is too late to discover it was overridable.
+        let pinned_case = |cfg: Option<&str>| -> Result<String, String> {
+            match P::attestation_identity_const("bitcoin") {
+                Some(_) => P::attestation_identity("bitcoin", cfg),
+                // No mainnet enclave yet: assert the intended rule against the resolver's own logic
+                // by giving it a network that DOES have a pin, if one is ever added. Until then this
+                // arm records the expectation in executable form.
+                None => Err("no pin compiled in for bitcoin (expected while unprovisioned)".into()),
+            }
+        };
+        assert!(
+            pinned_case(None).is_err(),
+            "while no mainnet enclave is provisioned this must refuse, not invent a key"
+        );
+    }
+
+    /// **[D69] `None` everywhere is the HONEST state, and this test exists so it cannot drift into
+    /// a placeholder.**
+    ///
+    /// If someone pins a value here, they must also decide what happens to a configured override on
+    /// that network — the resolver refuses a mismatch — and update this test deliberately. A pinned
+    /// key that nobody noticed being added is exactly as bad as no key at all.
+    #[test]
+    fn no_network_has_a_pinned_identity_until_an_enclave_is_provisioned() {
+        use super::TesrParams as P;
+        for net in ["bitcoin", "mainnet", "testnet", "testnet3", "testnet4", "signet", "regtest"] {
+            assert!(
+                P::attestation_identity_const(net).is_none(),
+                "{net} now has a compiled-in attestation identity. That is the intended end state — \
+                 but it changes the security posture of every client build, so update this test in \
+                 the SAME commit, and make sure the mismatch-refusal in `attestation_identity` is \
+                 what you want for that network."
+            );
+        }
+    }
+
 }

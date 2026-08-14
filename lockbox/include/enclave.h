@@ -46,9 +46,38 @@ namespace enclave {
     /// [D8] Attest `sig_count` for `statechain_id`. `message` is the caller-built 32-byte digest
     /// (see `server.cpp`'s route) so the exact preimage is defined in one place and cannot drift
     /// between signer and verifier.
+    ///
+    /// ⚠️ **[D69] SUPERSEDED for the shipping route — kept for the per-coin attestation only.**
+    /// Signing with THIS COIN's keypair means the verifier must know that coin's server key, whose
+    /// only honest anchor is the on-chain funding output. A deep in-ladder-split ancestor's funding
+    /// is deliberately un-broadcast, so no such anchor exists and the identity of the attester rested
+    /// on the coordinator's word (TRUST-MODEL B11). `/signature_count` now uses
+    /// [`attest_sig_count_identity`].
     SigCountAttestationResponse attest_sig_count(
         unsigned char* seed,
         utils::chacha20_poly1305_encrypted_data *encrypted_keypair,
+        const unsigned char* message32);
+
+    /// **[D69] The enclave's LONG-TERM ATTESTATION IDENTITY, derived from the seed.**
+    ///
+    /// One key for the whole enclave, independent of any coin, so a verifier can pin it once and
+    /// check every attestation against it — including attestations about ancestors whose funding
+    /// output was never broadcast. That is what closes B11: the attester's identity stops depending
+    /// on whether the coin it is talking about is on chain.
+    ///
+    /// **This is not a new secret.** Every per-coin keypair is already sealed under this same seed,
+    /// so the seed is already the single point of compromise; the identity key is one more
+    /// domain-separated derivation from it and concentrates nothing that was not already
+    /// concentrated.
+    ///
+    /// Derivation: `SHA256("utexo/attestation-identity/v1" || seed || u8(counter))`, counter from 0,
+    /// retried until the result is a valid secp256k1 scalar. Domain separation is what stops this
+    /// key colliding with any other use of the same seed.
+    void attestation_identity_pubkey(unsigned char* seed, unsigned char* xonly_pubkey_out32);
+
+    /// [D69] Sign `message32` with the identity key from [`attestation_identity_pubkey`].
+    SigCountAttestationResponse attest_sig_count_identity(
+        unsigned char* seed,
         const unsigned char* message32);
     
 

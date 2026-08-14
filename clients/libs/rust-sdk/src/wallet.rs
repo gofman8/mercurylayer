@@ -320,6 +320,7 @@ impl UtexoWallet {
             config.network,
             config.database_file.clone(),
             config.confirmation_target,
+            config.attestation_identity.clone(),
         )
         .await?;
 
@@ -409,6 +410,7 @@ impl UtexoWallet {
             config.network,
             config.database_file.clone(),
             config.confirmation_target,
+            config.attestation_identity.clone(),
         )
         .await?;
 
@@ -1164,7 +1166,19 @@ impl UtexoWallet {
                     // be read back as "flat is fine for this coin", so the conveyance path treats
                     // this record as a REFUSAL, not a licence.
                     _ => {
-                        self.note_flat(&sid, 0, LadderSkipReason::CoordinatorUnavailable).await?;
+                        // [D69] CLASSIFY, don't fold. `get_statechain_info` now also fails when this
+                        // build has no pinned enclave attestation identity and none is configured —
+                        // a PERMANENT local fault that `coordinator-unavailable` would mislabel as
+                        // "retry later". Re-resolving the pin decides which it is, by asking the
+                        // same function rather than matching on a message.
+                        let reason = match mercurylib::tesr::TesrParams::attestation_identity(
+                            &self.inner.cc.network.to_string(),
+                            self.inner.cc.attestation_identity.as_deref(),
+                        ) {
+                            Ok(_) => LadderSkipReason::CoordinatorUnavailable,
+                            Err(_) => LadderSkipReason::AttestationIdentityUnpinned,
+                        };
+                        self.note_flat(&sid, 0, reason).await?;
                         continue;
                     }
                 };

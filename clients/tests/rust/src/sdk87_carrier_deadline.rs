@@ -254,28 +254,72 @@ pub async fn execute() -> Result<()> {
     // the sever path rewrites it, so both held for every outcome — including one that destroyed the
     // allocation on chain. Two readers of one row are one assertion wearing a disguise.
     //
-    // The independent authority is the RGB ENGINE's own allocation set, which section (a) already
-    // consults to prove the coin is a carrier at all. Re-reading it AFTER the sever asks the engine
-    // where the units actually live now, and the trigger is confirmed on chain by this point (b/c
-    // proved F was spent by it), so the answer reflects the sever rather than the pre-state.
+    // The independent authority is the CONSIGNMENT CHAIN, validated by rgb-lib against the tier
+    // witnesses — `colored_ladder_health` runs the fork's `validate_consignment_offchain_chain`
+    // over the ladder's own consignments and returns the amount the FINAL state is assigned. It
+    // reads neither the persisted `rgb.amount` row nor the engine's allocation set, so it can
+    // disagree with both; that is what makes it evidence.
+    //
+    // ## [D70] WHY NOT the engine's allocation set — measured, not assumed
+    //
+    // The D61 rewrite reached for `list_token_allocations` and asserted the allocation had LEFT the
+    // spent funding outpoint. It never passed: three runs, deterministic, still reporting all
+    // {SUPPLY} units at `F` after `T` confirmed. Adding an explicit `refresh()` of the engine
+    // before the read did not change it either (measured, then reverted rather than kept as a
+    // no-op).
+    //
+    // The reason is structural, and it is not a defect: a CTES-R tier is coloured with `color_psbt`
+    // and broadcast through the electrum client. rgb-lib never issued that transfer, holds no
+    // transfer row for it, and `T.out[0]` pays the SE-aggregate key rather than an outpoint this
+    // wallet owns — so there is nothing for a sync to settle and nowhere for the engine to move the
+    // allocation TO. The engine learns where the units went when the walk completes and the
+    // consignment for the owner-keyed leaf is accepted, which is many CSV blocks after a sever.
+    //
+    // So the honest assertion is not "the engine moved the units" (the product does not claim it)
+    // but "the proof that the units move with this ladder still validates, on chain, after the
+    // sever" — which is the property that distinguishes a survived allocation from a destroyed one.
+    let (health_contract, assigned_to_final, tier_txids, _detail) =
+        alice.colored_ladder_health(&carrier_sid).await.map_err(|e| {
+            anyhow!(
+                "[D46/D70] after the sever the carrier's coloured ladder no longer validates \
+                 off-chain: {e:#}. The sever broadcasts `T` precisely BECAUSE every tier is an RGB \
+                 witness; if the chain of consignments stops validating once `T` is on chain, the \
+                 unilateral route is as unsafe on a carrier as the cooperative one."
+            )
+        })?;
+    assert_eq!(
+        assigned_to_final, SUPPLY,
+        "[D46/D70] the validated consignment chain assigns {assigned_to_final} units to the \
+         ladder's final state, not {SUPPLY}. This is rgb-lib's verdict over the tier witnesses, not \
+         the wallet's persisted row — if it disagrees with the supply, the sever moved the sats and \
+         left the asset behind, which is the exact loss (d) exists to exclude."
+    );
+    assert_eq!(
+        health_contract, asset,
+        "[D70] the ladder validates, but for contract {health_contract} rather than the carrier's \
+         asset {asset}"
+    );
+    assert!(
+        tier_txids.first().is_some_and(|t| t == &trigger_txid),
+        "[D70] the validated chain does not start at the trigger {trigger_txid} that was actually \
+         broadcast (tiers: {tier_txids:?}) — then it is proving something about a different ladder"
+    );
+    // The measured engine behaviour, asserted so a future change in either direction is noticed
+    // rather than absorbed: the units are still accounted for, and still at `F`.
     let allocations_after = alice.list_token_allocations(&asset).await?;
     let total_after: u64 = allocations_after.iter().map(|(_, amt)| *amt).sum();
     assert_eq!(
         total_after, SUPPLY,
         "[D46/D61] after the sever the RGB engine accounts for {total_after} units of {asset}, not \
-         {SUPPLY}. This is the engine's own allocation set, NOT the bundle row the wallet persisted \
-         — the whole point of forcing `T` rather than a re-anchor is that the allocation rides the \
-         coin's own ladder, and if the engine cannot find it, the unilateral route is as unsafe on a \
-         carrier as the cooperative one. Allocations: {allocations_after:?}"
+         {SUPPLY}. Wherever the engine believes they live, it must not LOSE them. Allocations: \
+         {allocations_after:?}"
     );
-    assert!(
-        !allocations_after
-            .iter()
-            .any(|(op, _)| op == &format!("{f_txid}:{f_vout}")),
-        "[D61] the allocation is still recorded at the carrier's ORIGINAL funding outpoint \
-         {f_txid}:{f_vout}, which the trigger has now spent. If the engine still points there, the \
-         sever moved the sats and left the asset behind — the exact loss (d) exists to exclude. \
-         Allocations: {allocations_after:?}"
+    println!(
+        "SDK87 - (d) the consignment chain still validates after the sever: {SUPPLY} units of \
+         {asset} assigned to the ladder's final state, chain starting at the broadcast trigger. \
+         [D70] the engine's own allocation set still reports them at the SPENT funding outpoint \
+         {f_txid}:{f_vout} — expected, and not a loss: a tier is not an rgb-lib transfer, so there \
+         is nothing for it to settle until the walk completes and the leaf consignment is accepted."
     );
 
     // …and the wallet's own view must AGREE with the engine. Kept as a second, weaker check: it is
