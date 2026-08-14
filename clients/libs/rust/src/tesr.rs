@@ -11264,6 +11264,39 @@ fn verify_bundle_ex(
     let agg_spk = spk_of(&bundle.agg_address)?;
     let owner_spk = spk_of(&bundle.owner_exit_address)?;
 
+    // **[D72] THE YARDSTICK IS THE RECEIVER'S, NOT THE SENDER'S — GAP A, closed.**
+    //
+    // Every value law below measures the tier chain against `bundle.fee_rate`, and that field is a
+    // serde field the SENDER fills in. Nothing bound it here: `verify_bundle_bound` binds the
+    // statechain id, the funding outpoint, `f_value`, the aggregate address and the coordinator's
+    // recorded aggregate — and not the rate. So a ladder declaring an extreme rate is internally
+    // perfect, fully co-signed, structurally identical to an honest one, and hands the owner a
+    // fraction of the coin while the receiver books the on-chain funding value.
+    //
+    // The rate is not a negotiable per-coin quantity: it is a SCHEDULE PARAMETER, compiled into
+    // every client per network (`TesrParams::for_network`), and every honest ladder is built at
+    // exactly that value. So the check is equality against the receiver's own preset, and it runs
+    // BEFORE any value law — a forged rate must be refused as a forged rate, not discovered
+    // downstream as an arithmetic mismatch whose message points at the wrong thing.
+    //
+    // Note which constant this is NOT: `max_fee_rate` is 1.0 on the regtest profile, BELOW the rate
+    // every honest ladder carries, so using it as a ceiling would refuse all legitimate traffic. The
+    // first draft of the child-lane check used the wrong one.
+    {
+        let want = mercurylib::tesr::TesrParams::for_network(&bundle.network).committed_fee_rate;
+        if (bundle.fee_rate - want).abs() > 1e-9 {
+            return Err(anyhow::anyhow!(
+                "the conveyed ladder declares fee_rate {} but this receiver's {} preset builds and \
+                 measures ladders at {} — refusing. The declared rate is the yardstick every value \
+                 law below uses, so a sender who picks it decides how much of the coin the owner's \
+                 exit chain actually delivers ([D72], SPEC §0.4 V-3).",
+                bundle.fee_rate,
+                bundle.network,
+                want
+            ));
+        }
+    }
+
     let tiers = bundle.exit_tiers(); // [trigger, ext0, state0, ext1, state1, ...]
     if tiers.len() < 3 || (tiers.len() - 1) % 2 != 0 {
         return Err(anyhow::anyhow!("malformed ladder: expected trigger + N*(extension,state)"));
@@ -18391,7 +18424,7 @@ mod forged_yardstick_attack_tests {
     /// claim path BOOKS (`SP.out[j]`, the slot) and what the child's exit chain can DELIVER is
     /// exactly two rungs — 980 sat. `VALUE-CONSERVATION-SWEEP.md` §8 downgrades that gap from theft
     /// to "a bounded convention"; this test is where the word *bounded* is checked, and
-    /// `gap_a_forged_yardstick_child_is_still_accepted_by_the_sync_verifier` is where it stops being
+    /// `a_forged_yardstick_child_is_refused_by_the_synchronous_verifier` is where it stops being
     /// true.
     #[test]
     fn honest_child_bundle_is_accepted_and_its_booking_gap_is_two_rungs() {
@@ -18416,7 +18449,7 @@ mod forged_yardstick_attack_tests {
 
     /// **One `f64`, and the same bytes go from refused to accepted.**
     ///
-    /// Identical signed transactions to `gap_a_forged_yardstick_root_ladder_is_still_accepted` —
+    /// Identical signed transactions to `a_forged_yardstick_root_ladder_is_refused_by_the_receivers_own_preset` —
     /// same txids, same witnesses, same outputs — with `fee_rate` put back to the honest 2.0. The
     /// value law now refuses every tier, naming the value it was funded with and what its payload
     /// outputs carry. Which is to say: the tiers ARE skimming; the verifier can see it perfectly
@@ -18519,11 +18552,24 @@ mod forged_yardstick_attack_tests {
         assert_not_an_unrelated_refusal(&msg);
     }
 
-    // ── 4. THE HOLES, AS THEY STAND TODAY ──────────────────────────────────────────────────────
+    // ── 4. THE HOLES — ALL THREE CLOSED [D72] ──────────────────────────────────────────────────
     //
-    // The three tests below assert what the SYNCHRONOUS verifiers do today, and what they do today is
-    // accept a theft. They are tripwires, not endorsements: each fails the moment the hole is closed
-    // and tells you how to flip it.
+    // These three tests were TRIPWIRES: each asserted that the synchronous verifiers accepted a
+    // theft, and each was written to fail the moment its hole closed, with the flip instructions in
+    // its own message. All three have now fired and been flipped, so they are attack tests.
+    //
+    //  * **GAP A** — the root lane had no yardstick binding at all and the claim path called it
+    //    directly. Closed by binding `bundle.fee_rate` to `TesrParams::for_network(..)` at the top of
+    //    `verify_bundle_ex`, ahead of every value law.
+    //  * **GAP B** — the child lane's binding existed only in the async wrapper. Closed by the SAME
+    //    line rather than a second copy: `verify_child_bundle` re-verifies its embedded parent
+    //    through `verify_bundle_ex`, and that re-verification is pinned by its own guard.
+    //  * **GAP C** — an absurd `f64` rate saturated the cast and panicked the verifier. Closed
+    //    earlier by checked arithmetic; the test now asserts the refusal.
+    //
+    // The controls that make these meaningful are §2's: `honest_root_ladder_is_accepted` and
+    // `honest_child_bundle_is_accepted_and_its_booking_gap_is_two_rungs` must keep passing, because a
+    // binding that refuses the attack by refusing everything is not a fix.
 
     /// **GAP A — the root lane has no yardstick binding at all, and the claim path calls it
     /// directly.**
@@ -18551,7 +18597,7 @@ mod forged_yardstick_attack_tests {
     /// before any value law. Honest bundles pass with equality — `the_receivers_yardstick_is_a_per_
     /// network_constant` above is the proof that they do.
     #[test]
-    fn gap_a_forged_yardstick_root_ladder_is_still_accepted() {
+    fn a_forged_yardstick_root_ladder_is_refused_by_the_receivers_own_preset() {
         let rig = rig();
         let b = rig.ladder(FORGED_RATE, FORGED_RATE);
 
@@ -18597,19 +18643,26 @@ mod forged_yardstick_attack_tests {
             "outputs stay below the input, so the tier is consensus-valid and would really confirm"
         );
 
-        let r = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority());
+        // **[D72] GAP A IS CLOSED, and this is now the attack test rather than the tripwire.**
+        // The refusal must name the DECLARED RATE — not an arithmetic mismatch downstream, which
+        // would point a reader at the value law and away from the forged yardstick that caused it.
+        let msg = verify_bundle_bound(&b, NUM_SIGS, FLAT_BACKUPS, &rig.authority())
+            .expect_err("a ladder declaring a rate this receiver does not build at must be refused")
+            .to_string();
         assert!(
-            r.is_ok(),
-            "GAP A HAS BEEN CLOSED — this tripwire has done its job. The root lane now binds \
-             `fee_rate` to the receiver's own preset ({:?}); flip this test to `expect_err`, assert \
-             the refusal names the declared rate, and strike GAP A from the module doc comment.",
-            r.as_ref().err()
+            msg.contains(&FORGED_RATE.to_string()) && msg.contains(&HONEST_RATE.to_string()),
+            "the refusal must name BOTH the declared rate and the receiver's own, got: {msg}"
         );
-        // …and through the other two root entry points, so no caller is accidentally safe.
-        assert!(verify_root(&b).is_ok(), "GAP A: `verify_bundle_ex` accepts it");
         assert!(
-            verify_bundle(&b, NUM_SIGS, FLAT_BACKUPS).is_ok(),
-            "GAP A: the public `verify_bundle` wrapper accepts it"
+            msg.contains("fee_rate"),
+            "…and the field it refused on, got: {msg}"
+        );
+        // …and through the other two root entry points, so no caller is accidentally safe. This is
+        // the half GAP B was about: a property that holds at one wrapper is not a property.
+        assert!(verify_root(&b).is_err(), "`verify_bundle_ex` must refuse it too");
+        assert!(
+            verify_bundle(&b, NUM_SIGS, FLAT_BACKUPS).is_err(),
+            "the public `verify_bundle` wrapper must refuse it too"
         );
     }
 
@@ -18633,7 +18686,7 @@ mod forged_yardstick_attack_tests {
     /// `cb.parent.fee_rate` — belt and braces with the async check rather than instead of it, so the
     /// property holds for every caller of the verifier rather than for one caller of one wrapper.
     #[test]
-    fn gap_a_forged_yardstick_child_is_still_accepted_by_the_sync_verifier() {
+    fn a_forged_yardstick_child_is_refused_by_the_synchronous_verifier() {
         let rig = rig();
         let cb = rig.child_bundle(FORGED_CHILD_RATE, FORGED_CHILD_RATE);
 
@@ -18660,13 +18713,19 @@ mod forged_yardstick_attack_tests {
             assert_eq!(tx.output[t.payload_vout as usize].value, t.out_value);
         }
 
-        let r = verify_child(&rig, &cb);
+        // **[D72] GAP B IS CLOSED — and by construction rather than by a second copy of the check.**
+        // `verify_child_bundle` re-verifies its embedded parent through `verify_bundle_ex`, which is
+        // where the binding now lives, so `cb.parent.fee_rate` — the same field every child rung is
+        // measured against — is bound for EVERY caller of the synchronous verifier, not just for
+        // `verify_conveyed_child`'s one wrapper. That re-verification is itself pinned by a guard
+        // (`the child verifier no longer re-verifies its embedded parent through verify_bundle_ex`),
+        // so this is a structural property, not a coincidence of call order.
+        let msg = verify_child(&rig, &cb)
+            .expect_err("a child measured against a forged yardstick must be refused")
+            .to_string();
         assert!(
-            r.is_ok(),
-            "GAP B HAS BEEN CLOSED — this tripwire has done its job. `verify_child_bundle` now binds \
-             `cb.parent.fee_rate` itself rather than relying on `verify_conveyed_child` ({:?}); flip \
-             this test to `expect_err` and strike GAP B from the module doc comment.",
-            r.as_ref().err()
+            msg.contains(&FORGED_CHILD_RATE.to_string()),
+            "the refusal must name the declared rate, got: {msg}"
         );
     }
 

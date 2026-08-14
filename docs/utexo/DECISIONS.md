@@ -2666,3 +2666,47 @@ and can spend — `IN_MEMPOOL` / `UNCONFIRMED` / `CONFIRMED` / `WITHDRAWING`. It
 **Not claimed:** no probe was built against a deliberately duplicating coordinator. The verdict rests
 on the honest re-serve taking the identical path plus the two observed refusals; a driven test would
 be worth having alongside the guard.
+
+## [D72] The yardstick is the receiver's — the declared `fee_rate` is bound (GAP A / GAP B closed)
+
+**Decision: `bundle.fee_rate` MUST equal the receiver's own compiled-in
+`TesrParams::for_network(..).committed_fee_rate`, checked at the top of `verify_bundle_ex` before any
+value law.** SPEC §0.4 row V-3 and §14's L-6 are struck; the tripwires that documented the holes are
+now attack tests.
+
+**The defect.** Every value law in the ladder verifiers measures the tier chain against
+`bundle.fee_rate` — and that is a serde field the SENDER fills in. Nothing bound it:
+`verify_bundle_bound` binds the statechain id, the funding outpoint, `f_value`, the aggregate address
+and the coordinator's recorded aggregate, and not the rate. So a ladder declaring an extreme rate is
+internally perfect, fully co-signed, structurally indistinguishable from an honest one, and delivers
+a fraction of the coin — while the receiver books the ON-CHAIN funding value and the wallet displays
+it. The unit rig makes it concrete: 2 662 sat/vB over a 1 000 000-sat coin leaves the owner's exit
+chain able to deliver **1 030 sat**, with 99.897 % going to miners.
+
+**And the flat backups are not the fallback they look like.** `T` is un-timelocked and spends `F`;
+every prior owner retains a co-signed copy [B1]. The moment one is broadcast, every flat backup —
+which all also spend `F` — is void. The theft and the destruction of the slow path are one
+transaction.
+
+**Why equality against a compiled-in constant is the right shape.** The rate is not a negotiable
+per-coin quantity; it is a SCHEDULE PARAMETER, compiled into every client per network, and every
+honest ladder is built at exactly that value ([D7]/[D25]/[D27]'s parameter-provenance rule — A-8).
+The check therefore runs BEFORE the value laws: a forged rate must be refused AS a forged rate, not
+discovered downstream as an arithmetic mismatch whose message points at the wrong thing.
+
+**Not `max_fee_rate`.** That constant is 1.0 on the regtest profile — BELOW the rate every honest
+ladder carries — so using it as a ceiling would refuse all legitimate traffic. The first draft of the
+child-lane binding used the wrong one, and the unit test that pins this distinction is why it did not
+happen twice.
+
+**GAP B closed by construction, not by a second copy of the check.** `verify_child_bundle`
+re-verifies its embedded parent through `verify_bundle_ex`, and `cb.parent.fee_rate` is the same
+field every child rung is measured against — so the binding covers every caller of the synchronous
+verifier rather than one caller of one wrapper. That re-verification is itself pinned by a guard, so
+this is structural rather than a coincidence of call order. **GAP C** (an absurd `f64` saturating the
+cast and PANICKING the verifier on the claim path) was already closed by checked arithmetic.
+
+**The controls are the point.** A binding that refuses the attack by refusing everything is not a
+fix, so `honest_root_ladder_is_accepted` and `honest_child_bundle_is_accepted_and_its_booking_gap_is_two_rungs`
+must keep passing — and the live claim path must keep working, which is verified by running it rather
+than by argument.
