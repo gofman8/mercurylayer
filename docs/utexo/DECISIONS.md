@@ -2623,3 +2623,46 @@ both):
 assertion. [D61] corrected a real defect in the evidence and introduced an unrun claim in the same
 edit; it survived because the test around it was green for other reasons. **Run the test you just
 rewrote, on the tree you just changed, before the commit that claims it.**
+
+## [D71] A replayed conveyance is refused by NAME, and the balance counts coins rather than rows
+
+**Decision: adopt both recommendations of the mailbox survey.** They are one defect seen from two
+ends, and fixing either alone leaves the system with a protection it cannot state.
+
+**The finding.** A duplicated ciphertext takes the same path as an honest re-serve: the first copy
+consumes the `INITIALISED` slot, the second falls to the branch that MINTS a slot by cloning the keys
+of a coin with the same auth key — so every check binding the message to the coin passes. What
+refuses it is `validate_tx0_output_pubkey`, because the completed handover rotated the SE's share and
+the sender's `user_public_key` no longer reconstructs the on-chain output. Observed live, twice in
+one run.
+
+That is a CONSEQUENCE, not a rule. **A protection that holds only because an unrelated subsystem
+rotates a key is not a protection a specification can state** — and the child lane had already
+refused this by name since [D3], with a comment claiming it "mirrors the flat-transfer pattern where
+a re-received coin fails validation". The comment described an outcome as though it were a rule; the
+root lane had no such check at all.
+
+**And the failure would have been silent.** `compute_balance_excluding` summed coin ROWS, skipping
+only duplicates by index, never deduping by `statechain_id`. Two rows for one coin would have
+double-counted into `available_sats`, so a merchant crediting on `get_balance` over-credits with
+nothing in the log — the silent-degradation shape this repo keeps finding.
+
+**What landed** (REQ-45, REQ-46; SPEC §5.2):
+
+1. The root lane refuses an already-adopted `statechain_id` by name, before validation.
+2. The balance is a function of distinct ids.
+
+**The predicate's narrowness is the whole care.** "Already adopted" is a row this wallet still holds
+and can spend — `IN_MEMPOOL` / `UNCONFIRMED` / `CONFIRMED` / `WITHDRAWING`. It excludes:
+
+* `TRANSFERRED` / `WITHDRAWN` / `INVALIDATED` / `DUPLICATED` — sending a coin away and receiving it
+  back later is legitimate and leaves exactly such a row;
+* **`IN_TRANSFER`, which is the case a careless predicate gets wrong.** In a SELF-transfer the
+  sender's own row sits at `IN_TRANSFER` under the very id the receiving slot is about to adopt, in
+  the same wallet. The first version of this guard included that status and would have broken a
+  working feature to stop a replay; `RGB_E2E=10` PART 2 is the test that says so, and it was run
+  before this was committed rather than after.
+
+**Not claimed:** no probe was built against a deliberately duplicating coordinator. The verdict rests
+on the honest re-serve taking the identical path plus the two observed refusals; a driven test would
+be worth having alongside the guard.

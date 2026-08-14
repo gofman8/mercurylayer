@@ -1235,6 +1235,56 @@ async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, e
 
     let transfer_msg = mercurylib::transfer::receiver::decrypt_transfer_msg(enc_message, &client_auth_key)?;
 
+    // **[D71 / M-4] ALREADY ADOPTED — refuse a replayed conveyance BY NAME.**
+    //
+    // The mailbox read is non-destructive, so a claimed coin's message keeps being re-served, and a
+    // coordinator can duplicate a ciphertext at will. A duplicate takes the same path as an honest
+    // re-serve: the first copy consumes the INITIALISED slot, the second mints a slot by CLONING the
+    // keys of a coin with the same auth key — so every check that binds the message to the coin
+    // passes. What refuses it today is `validate_tx0_output_pubkey`, because the completed handover
+    // rotated the SE's share and `S + E' != tx0.out.key`. That is a CONSEQUENCE, not a rule: the
+    // protection is a side effect of an unrelated subsystem, and a specification cannot state it.
+    //
+    // The child lane has refused this by name since [D3] ("split child … already adopted"); the root
+    // lane is the one that never did. Same rule, same lane, stated where it belongs.
+    //
+    // **The predicate is ADOPTED-AND-SPENDABLE, and its narrowness is the whole care here.**
+    //
+    //  * `TRANSFERRED` / `WITHDRAWN` / `INVALIDATED` / `DUPLICATED` are NOT adoption — refusing on
+    //    those would break the legitimate round trip (send a coin away, receive it back later),
+    //    which leaves exactly such a row behind.
+    //  * `IN_TRANSFER` is NOT adoption either, and this is the case a careless predicate gets wrong:
+    //    in a SELF-TRANSFER the sender's own row sits at `IN_TRANSFER` under the very id the
+    //    receiving slot is about to adopt, in the same wallet (rgb10 PART 2 does this). Refusing
+    //    there would break a working feature to stop a replay.
+    //  * `WITHDRAWING` IS adoption: the wallet holds the coin and is exiting it on chain.
+    // `Ok` is shadowed in this module, so the path is spelled out.
+    if let std::result::Result::Ok(existing) =
+        crate::sqlite_manager::get_wallet(&client_config.pool, wallet_name).await
+    {
+        let live = existing.coins.iter().any(|c| {
+            c.statechain_id.as_deref() == Some(transfer_msg.statechain_id.as_str())
+                && matches!(
+                    c.status,
+                    CoinStatus::IN_MEMPOOL
+                        | CoinStatus::UNCONFIRMED
+                        | CoinStatus::CONFIRMED
+                        | CoinStatus::WITHDRAWING
+                )
+        });
+        if live {
+            return Err(anyhow::anyhow!(
+                "statechain id {} is already adopted by this wallet — refusing this conveyance as a \
+                 replay. The mailbox read is non-destructive and a duplicated message would \
+                 otherwise mint a second row for one coin; the balance would then be summed over \
+                 rows that describe the same coin twice. If this is a coin you genuinely re-received \
+                 after transferring it away, or a self-transfer whose sending row is IN_TRANSFER, \
+                 this refusal does not fire — neither status counts as adoption.",
+                transfer_msg.statechain_id
+            ));
+        }
+    }
+
     // [in-ladder split] A split-child payment carries the child's exit bundle (and, from
     // `protocol_version >= 4`, the key-handover material) but NO backup ladder. Verify the bundle
     // against authoritative on-chain + SE values (verify_child_bundle: parent F on-chain, parent+child

@@ -4050,12 +4050,33 @@ pub(crate) fn compute_balance_excluding(
     carriers: &std::collections::HashSet<String>,
 ) -> Balance {
     let mut b = Balance::default();
+    // **[D71 / M-4] The balance is a function of DISTINCT STATECHAIN IDS, not of rows.**
+    //
+    // A coin is identified by its statechain id; a second live row carrying the same id is the same
+    // coin counted twice, and summing rows turns that into spendable-looking value. The mailbox
+    // survey found the path: a duplicated ciphertext takes the same route as an honest re-serve, and
+    // what refuses it today is `validate_tx0_output_pubkey` failing because the completed handover
+    // rotated the SE's share — i.e. an unrelated subsystem's side effect, not a rule. If that
+    // incidental protection ever lapsed, the failure here would be SILENT: a merchant crediting on
+    // `get_balance` would over-credit, with nothing in the log.
+    //
+    // Deduping here does not make the replay safe — `claim()` refuses it by name now, which is the
+    // actual fix. It removes the SILENT half, so a defect upstream shows up as a coin that fails to
+    // arrive rather than as money that is not there.
+    let mut counted: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for c in &record.coins {
         if c.duplicate_index != 0 {
             continue;
         }
         if coin_outpoint(c).map_or(false, |o| carriers.contains(&o)) {
             continue;
+        }
+        // Only ids are deduped. A row with no id yet (INITIALISED, no tx0) contributes to no bucket
+        // below anyway, and must not collapse other such rows into one.
+        if let Some(sid) = c.statechain_id.as_deref() {
+            if !counted.insert(sid) {
+                continue;
+            }
         }
         let sats = c.amount.unwrap_or_default() as u64;
         match c.status {

@@ -592,6 +592,42 @@ it to unilateral-exit-only. (Defect found and fixed during this migration; it al
 
 ---
 
+### 5.2 The transfer mailbox
+
+A conveyance travels as an ECIES ciphertext in a coordinator-held mailbox, addressed to the
+receiver's auth key. The coordinator is therefore in the path of every payment, and the specification
+must say exactly what that buys it. Surveyed adversary by adversary in
+[`spec-work/MAILBOX-SURVEY.md`](spec-work/MAILBOX-SURVEY.md); the results:
+
+| | class | coordinator acting ALONE can | verdict |
+|---|---|---|---|
+| **M-1** | withholding | delay a conveyance indefinitely | **denial only** — the read is non-destructive, so a later poll still gets the message. One escalation is worth naming: withholding past the coin's epoch expiry converts a delay into a PERMANENT failure, because admission requires the exit walk to fit inside the epoch the payee inherits |
+| **M-2** | deletion | destroy the message | **denial only.** The coin stays the sender's. The LOSS arm — "the sender then re-conveys to a second payee" — is NOT coordinator-alone: the cancel that frees the coin needs a single-use, endpoint-bound signature under the SENDER's auth key. Coordinator + sender, the same adversary as L-7 |
+| **M-3** | reordering | serve messages in any order | **no ordering dependence.** A message is bound to a coin by KEYS, not by mailbox position: the ciphertext is ECIES to the auth key and the transfer signature commits to `(tx0_txid, tx0_vout, new_user_pubkey)`. A misrouted message fails validation and the loop moves on, costing a wasted pass |
+| **M-4** | duplication / replay | serve one ciphertext twice | **refused — and since [D71] refused BY NAME.** See below |
+| **M-5** | cross-addressed injection | serve a message addressed to someone else | **fail-closed** — ECIES decryption fails under this coin's auth key. Nothing further is relied on |
+| **M-6** | serve-then-renege around an irreversible leg | serve a valid message to a pre-pay census and then withhold at claim time | **real loss, Lightning lane only.** See §8 |
+
+**REQ-45 [D71] A receiver MUST refuse a conveyance of a `statechain_id` it has already adopted, by
+name.** "Already adopted" means a coin row this wallet still holds and can spend
+(`IN_MEMPOOL`/`UNCONFIRMED`/`CONFIRMED`/`WITHDRAWING`). It deliberately does NOT include
+`TRANSFERRED` — sending a coin away and receiving it back later is legitimate — nor `IN_TRANSFER`,
+which is the sender's own row during a SELF-transfer, where the receiving slot in the same wallet
+must still be able to adopt.
+
+The reason this is a requirement and not an observation: a duplicate takes the same path as an honest
+re-serve, and every check that binds the message to the coin passes. What refused it before [D71] was
+`validate_tx0_output_pubkey` failing because the completed handover had rotated the SE's share — a
+CONSEQUENCE of an unrelated subsystem, not a rule. The child lane had refused by name since [D3]; the
+root lane is the one that never did. **A protection that holds only because something else rotates a
+key is not a protection a specification can state.**
+
+**REQ-46 [D71] A wallet's balance MUST be a function of DISTINCT statechain ids, not of rows.** A
+second live row under one id is one coin counted twice. This does not make a replay safe — REQ-45
+does that — it removes the SILENT failure mode: without it, a lapse upstream shows up as spendable
+value that is not there, and a merchant crediting on the balance over-credits with nothing in the
+log. With it, the same lapse shows up as a coin that fails to arrive.
+
 ## 6. Off-chain split & combine
 
 ### 6.1 In-ladder split (laddered coins)
@@ -703,7 +739,24 @@ not a sender-claimed id.
 ## 8. Lightning swaps (SSP)
 
 Both directions work on the laddered lane, via a HODL-invoice latch
-([LIGHTNING.md](LIGHTNING.md)). Each direction has an EXACT lane (the wallet already holds, or can
+([LIGHTNING.md](LIGHTNING.md)).
+
+> **[M-6] On the Lightning lane, coordinator liveness between the pre-pay census and the completed
+> claim is a payment-SAFETY dependency, not a liveness one.** This is a stronger statement than the
+> trust model makes anywhere else, and it is the one the mailbox survey adds.
+>
+> The lane runs census → pay → claim. The census reads a conveyed message; the payment is an
+> IRREVERSIBLE Lightning leg; the claim comes after. A coordinator that serves a valid message to the
+> census and then withholds, alters, or refuses at claim time leaves the payer out the full invoice
+> amount — **acting alone**, with no sender and no key. Everywhere else in this document a
+> coordinator acting alone can only deny; here it can take.
+>
+> The shape is not specific to the mailbox — refusing `/transfer/receiver` does the same — so it is
+> stated as a property of the lane rather than of the transport. The failure text already exists and
+> has fired on the live stack ("paid the Lightning invoice … but claimed 0 transfers"), which is what
+> makes the window observed rather than theoretical.
+
+Each direction has an EXACT lane (the wallet already holds, or can
 mint, a coin of the exact size — the whole coin is latch-transferred) and a NON-EXACT lane (the coin
 is split IN-LADDER and the latched PIECE is conveyed, §6.1).
 
