@@ -2915,3 +2915,45 @@ Until that runs, `3 + 1` is a claim about the design, not about the build.
 break-even value drops by roughly a third for a lone child — and it makes the sweep argument stronger
 than [D74] put it: batching does not merely amortise the spine, it replaces two pre-signed tiers per
 leaf with one shared cooperative transaction. `3 + 1` for k siblings, against `3 + 2k`.
+
+## [D78] The central economic claim, measured: this design sells payment VELOCITY
+
+**Decision: the block-space claim is stated as a break-even in PAYMENT VELOCITY, with the case we
+LOSE stated first.** Written into [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0 as
+the document's opening section, summarised normatively in SPEC §14.3, and superseding the figures
+[D74] and my own earlier tables carried.
+
+**The comparison was being made against an opponent that does not exist.** A one-to-many payout on
+Bitcoin is ONE transaction with `N+1` outputs — ~44 vB per recipient at N = 100. Every favourable
+ratio derived against "N separate on-chain transactions" is worthless, including several I published
+earlier today.
+
+**Measured** (one coin to 100 recipients, all settling, 90 % swept, 10 % walking):
+
+| onward payments per recipient | all on-chain | Utexo |
+|---:|---:|---:|
+| 0 | **4 411 vB — ON-CHAIN WINS 2.8×** | 12 552 vB |
+| 1 | 19 786 | 12 552 (1.6×) |
+| 10 | 158 161 | 12 552 (**12.6×**) |
+| 50 | 773 161 | 12 552 (**61.6×**) |
+
+**Break-even 0.53 hops** with the sweep, **1.65** without it. So: the design wins the moment the
+average payee spends once, and loses to a batched payout if they never do. The saving is not the
+distribution — it is every payment after the first.
+
+**Two independent quantities, and the value one is larger.** Each pre-signed tier burns 615 sat
+(`committed_fee(3.0)` + `P2A_VALUE`), so a leaf's two tiers burn 1 230 — and `min_child_value` = 1 560
+is DEFINED as that plus dust, which is why a minimum leaf walked out realises exactly 330 sat. A
+combine never broadcasts those tiers, so the SSP's margin is `1 230 − 57.75 × market` per leaf: ~1 057
+sat at 3 sat/vB, zero at **21.3**. An inverse-fee-market business — it should stop buying when fees
+are high. And batching is a rounding error against it (~160 sat of ~1 057), so an SSP profits on a
+SINGLE leaf and needs no whole trees: `SP`'s outputs are independent UTXOs, so 9 of 10 captures 99 %
+of the saving and the holdout is untouched.
+
+**Provenance, recorded because this section was wrong three times before it was right.** Each error
+was caught by an independent agent reading code rather than prose: the shared prefix is `375 + 43K`,
+not a flat 375 (`tesr_exit_vbytes`'s `3 × TIER` counts the leaf's OWN final state, which is private);
+the on-chain baseline is 112 / 155 vB at `INPUT_WITNESS_BYTES = 67`, not the pre-[D4] 111; and the
+sweep marginal is unreachable for a tree whose leaves have different owners — which is why
+ACQUISITION, not batching, is the mechanism. **The rule this earns: derived economics do not go into
+a normative document on one derivation.**

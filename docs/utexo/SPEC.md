@@ -1321,28 +1321,31 @@ are stated as limits rather than as things to fix.
 * **The P2A anchor slot is an auction, not a race** — [D45]. An under-paying squat is refused; an
   over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
   a price, not a denial of service.
-* **BLOCK SPACE IS BOUGHT WITH PAYMENT FREQUENCY, NOT WITH PAYMENT GRANULARITY — and in the split
-  lane the claim can INVERT.** State it with the bound or not at all.
+* **THE DESIGN SELLS PAYMENT VELOCITY, NOT PAYMENT GRANULARITY — and there is a case where a plain
+  on-chain payout BEATS it.** Full derivation and the satoshi side in
+  [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0; the normative summary:
 
-  | shape | on-chain cost | against |
-  |---|---|---|
-  | whole coin (a ROOT holder), ~99 off-chain hops | 1 deposit + 112-vB re-anchor + 1 cooperative exit ≈ **330 vB** | ~10 890 vB for 99 on-chain payments — **≈33×** |
-  | split child, settled ALONE, as SHIPPED | the pre-signed walk, `3 + 2d` transactions — **668 vB** at depth 1 | ~110 vB had the payment been made on chain — **6× WORSE** |
-  | split child, settled ALONE, floor available ([D77]) | spine + ONE cooperative spend of `SP.out[j]` = **4 txs** | not implemented — `withdraw` routes children to the walk before checking confirmation |
-  | k siblings, settled together | spine once + one `combine_leaves` transaction: **`3 + 1`**, not `3 + 2k` | the saving returns |
+  **The comparison must be against a BATCHED payout.** One-to-many on chain is ONE transaction with
+  `N+1` outputs — ~**44 vB per recipient** at N = 100, not `N ×` a whole transaction. Any ratio
+  derived against "N separate transactions" is measured against an opponent that does not exist.
 
-  **The 1-tx cooperative exit belongs to a ROOT holder, not to a payee.** A child's funding
-  `SP.out[j]` is un-broadcast, so `withdraw::execute` has no confirmed outpoint to spend and the SDK
-  routes it to the unilateral walk by name. Anyone who RECEIVED a non-exact payment is in the second
-  row, not the first.
+  One coin split to 100 recipients, all settling, 90 % swept by an SSP:
 
-  A child has **no one-transaction cooperative exit** — its funding output `SP.out[j]` is
-  un-broadcast, and the root that could have been spent directly was terminalized by the split. So a
-  split piece's only route on chain is materialising its ancestor spine, and there is no shortcut to
-  invent. **The design converts payment frequency into block space at a good rate and payment
-  granularity at a bad one.** `min_child_value` (§5.1) is what keeps the second row from being minted
-  in the first place; batching (a sweep that accumulates siblings and settles them with one combine)
-  is what would make it cheap. The primitive exists; the sweep does not (§14.2 L-13).
+  | onward payments per recipient | all on-chain | Utexo | |
+  |---:|---:|---:|---|
+  | **0** (receive, cash out) | **4 411 vB** | 12 552 vB | **ON-CHAIN wins 2.8×** |
+  | 1 | 19 786 | 12 552 | Utexo 1.6× |
+  | 10 | 158 161 | 12 552 | Utexo **12.6×** |
+  | 50 | 773 161 | 12 552 | Utexo **61.6×** |
+
+  **Break-even: 0.53 onward payments per recipient** (1.65 without the sweep). The distribution is
+  not what is saved — a batched payout is nearly free too. What is saved is every payment AFTER the
+  first: on chain ~154 vB each, off chain zero.
+
+  **The design rule that follows:** a piece received and immediately cashed out should never have
+  been an off-chain split — it is strictly cheaper as an output of a batched on-chain payment. And
+  the sweep does not create the advantage, it protects it: it roughly halves the circulation a payee
+  must do before the design pays for itself.
 
 * **THE ON-CHAIN CADENCE IS REAL, AND IT IS THE FLAT CALENDAR — not the tier chain** ([T-1]/[T-2]).
   This is the number to quote when someone asks what the design saves, because "zero rent" is true of

@@ -26,6 +26,94 @@
 
 ---
 
+## 0. THE CENTRAL RESULT — this design sells payment VELOCITY, not payment granularity
+
+**Everything else in this document is a detail of this one claim, and the claim has a side on which
+we LOSE. State both sides or the number is marketing.**
+
+Measured against the honest alternative — not against a strawman.
+
+### 0.1 The comparison people get wrong
+
+A one-to-many payout on Bitcoin is **ONE transaction with N+1 outputs**, not N transactions. Paying
+100 recipients on chain costs **4 411 vB — about 44 vB per recipient.** Any comparison that prices
+the on-chain alternative at "N × 155 vB" is inventing an opponent that does not exist, and every
+favourable ratio derived that way is worthless.
+
+### 0.2 The result
+
+One coin split among 100 recipients, every recipient eventually settling on chain, 90 % of leaves
+swept by an SSP (`combine_leaves`) and 10 % walking out individually:
+
+| onward payments per recipient | ALL ON-CHAIN | UTEXO | verdict |
+|---:|---:|---:|---|
+| **0** — receive, then cash out | **4 411 vB** | 12 552 vB | **ON-CHAIN wins, 2.8×** |
+| 1 | 19 786 | 12 552 | utexo 1.6× |
+| 2 | 35 161 | 12 552 | utexo 2.8× |
+| 10 | 158 161 | 12 552 | utexo **12.6×** |
+| 50 | 773 161 | 12 552 | utexo **61.6×** |
+
+**Break-even is 0.53 onward payments per recipient.** The design wins the moment the average payee
+spends their money once, and loses to a batched payout if they never do.
+
+### 0.3 Why — the distribution is not what we save
+
+The split itself is free off chain, but a batched on-chain payout is nearly free too (44 vB each).
+**What we actually sell is the SECOND payment**: on chain every subsequent hop is another ~154 vB
+transaction; off chain every subsequent hop is **zero**. So the saving is a function of how many
+times value MOVES before it settles, and of nothing else.
+
+Corollary, and it is the design rule: **a piece that is received and immediately cashed out should
+never have been an off-chain split.** It is strictly cheaper as an output of a batched on-chain
+payment. Off-chain splitting earns its keep only where value circulates.
+
+### 0.4 What the sweep is for — it protects the result, it does not create it
+
+Without an SSP sweep, settlement of that same tree is 29 800 vB and break-even rises to **1.65** hops.
+With 90 % swept it is 12 552 vB and **0.53**. **The sweep roughly halves the circulation a payee must
+do before the design pays for itself.** It is not a nicety for rescuing dust; it is what keeps §0.2's
+result true at realistic velocities.
+
+### 0.5 The satoshi side, which is a different quantity and a bigger number
+
+Block space and VALUE are not the same saving, and the value one is larger.
+
+Every pre-signed tier permanently burns `committed_fee(3.0) + P2A_VALUE` = **615 sat**, carved out of
+the coin at split time. A leaf's own two tiers burn **1 230 sat** — and `min_child_value` = **1 560**
+is DEFINED as exactly that plus dust, so a minimum-sized leaf walked out realises precisely the
+330-sat dust limit. A combine spends `SP.out[j]` directly and never broadcasts those tiers, so the
+1 230 sat is never burned:
+
+| leaf face | walked out | via combine @ 3 sat/vB |
+|---:|---:|---:|
+| 1 560 | 330 — **21 %** | 1 387 — **89 %** |
+| 5 000 | 3 770 — 75 % | 4 827 — 97 % |
+| 20 000 | 18 770 — 94 % | 19 827 — 99 % |
+
+**The SSP's margin is therefore `1 230 − 57.75 × market` sat per leaf** — about 1 057 sat at
+3 sat/vB, 653 at 10, and **zero at 21.3 sat/vB**, above which the prepaid committed rate is the
+better deal and holders should simply walk. It is an INVERSE-fee-market business: it earns most when
+fees are low, and should stop buying when they are high.
+
+Note what this makes irrelevant: batching moves the per-leaf cost 112 → 58 vB, worth ~160 sat at
+3 sat/vB against a ~1 057-sat margin. **Skipping the burn is ~96 % of the value; consolidation is a
+rounding error.** An SSP profits on a SINGLE leaf and needs neither whole trees nor majority
+ownership — `SP`'s outputs are independent UTXOs, so a sweep of 9 of 10 leaves captures 99 % of the
+available saving and the holdout is simply untouched.
+
+### 0.6 Provenance, because this section has been wrong three times
+
+The figures above are the SECOND derivation. The first was wrong in three ways, each caught by an
+independent agent reading the code rather than the docs: the shared prefix is `T + X_m + SP` =
+`375 + 43K` vB and NOT a flat 375 (`tesr_exit_vbytes`'s `3 × TIER` counts the leaf's own final state,
+which is private); the on-chain baseline is 112 vB (1-in-1-out) or 155 (1-in-2-out) at
+`INPUT_WITNESS_BYTES = 67`, not the pre-[D4] 111; and the sweep marginal is unreachable for a payment
+tree whose leaves have different owners, which is exactly why acquisition — not batching — is the
+mechanism that matters. **Do not re-derive these from prose. Re-derive them from
+`lib/src/tesr.rs`, `lib/src/transaction.rs::sweep_tx_vsize` and `clients/libs/rust-sdk/src/config.rs`.**
+
+---
+
 ## 1. The correction, stated plainly
 
 Utexo has been described — in [README.md](README.md), in [PARITY.md](PARITY.md), in the pitch — as
