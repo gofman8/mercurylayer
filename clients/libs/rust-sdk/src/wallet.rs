@@ -1863,15 +1863,30 @@ impl UtexoWallet {
                 // (broadcasts the already-co-signed trigger) when that fails — because the party
                 // most interested in this deadline passing is the same party asked to co-sign the
                 // re-anchor, and a defence its adversary can decline is not a defence (D40.1).
-                if wallet.inner.config.auto_refresh && wallet.inner.config.background_auto_refresh {
-                    let _ = wallet
-                        .auto_refresh_due(wallet.inner.config.auto_refresh_margin_blocks)
-                        .await;
-                } else {
-                    // Not opted into routine maintenance — run the safety half alone.
-                    let _ = wallet
-                        .deadline_safety_due(wallet.inner.config.auto_refresh_margin_blocks)
-                        .await;
+                // ═══ [D58] THE DEADLINE PASS RUNS ON EVERY PATH, NOT JUST THE `else` ═══
+                //
+                // This was an `if routine-maintenance { auto_refresh_due } else { deadline_safety_due }`,
+                // so a wallet that OPTED INTO background maintenance got the COOPERATIVE half alone
+                // and LOST THE SEVER. Enabling more maintenance bought less protection — the exact
+                // inversion of what the flag reads as.
+                //
+                // `deadline_safety_due` is not the poor relation of `auto_refresh_due`: it CALLS it
+                // first (the cooperative re-anchor is its route 1) and then severs whatever the
+                // counterparty declined to co-sign. Running it unconditionally is therefore a strict
+                // superset of the old `if` arm, not a duplicate pass — and it is what D40.1 requires,
+                // because the party most interested in this deadline passing is the same party being
+                // asked to co-sign the re-anchor.
+                //
+                // The `Err` is REPORTED, not discarded ([D51]): the pass now returns `Err` listing
+                // every coin it could not defend, and `let _ =` here is what threw that away. A
+                // background loop must not abort on it — the next tick should still run — so it is
+                // logged rather than propagated, which is the one thing that makes an undefended coin
+                // visible on a wallet nobody is watching.
+                if let Err(e) = wallet
+                    .deadline_safety_due(wallet.inner.config.auto_refresh_margin_blocks)
+                    .await
+                {
+                    eprintln!("[deadline safety] {e:#}");
                 }
                 // [F2] TES-R ladder defence. UNCONDITIONAL — there is no opt-in and no config flag,
                 // because there is no wallet that wants an un-defended ladder: if someone broadcasts

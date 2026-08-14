@@ -21,25 +21,29 @@ unfinished.
 | Spec decisions re-derived design-first (D38) | 6, of which **5 require code**; 1 landed |
 | Code items on the critical path | **14** → **12 landed** (all six Tier A, plus B.1–B.5 and B.7 — six of the eight Tier B). The other two are RESOLVED but not built: B.8 is **NOT A DEFECT** — the census already refuses head truncation (D49, superseding D41) and B.6 is **demoted to an optimisation** by D45's measurement. |
 | Live E2E suite | **88/88.** SDK22 fixed (12 breaches → 0), `sdk86` new and green, and SDK29 green under D43 — the last red test in the suite |
-| Unit + guard suite | green — **726 tests, 0 failures**, measured 2026-08-14 |
+| Unit + guard suite | green — **764 tests, 0 failures** (`--workspace --tests`), measured 2026-08-14 |
 
-> **The 756 in this row was never verifiable.** When it was written `cargo test -p mercuryrustlib
-> --lib` did not COMPILE (a `cfg(test)` constructor missing `ladder_census_refusal`), and that is
-> the largest crate in the count — so the number could not have been produced by running the
-> suite. `cargo build -p mercuryrustlib` succeeded and the E2E dispatcher is a `cargo run`
-> binary, so the live suite stayed green over it. The compile break is fixed and the count below
-> is measured, per crate, on 2026-08-14:
+> **[CORRECTED 2026-08-14 — my own correction was wrong, and the record says so.]** I wrote here that
+> "the 756 was never verifiable" because `cargo test -p mercuryrustlib --lib` did not compile when it
+> was written. **That is false at every commit.** The `ladder_census_refusal` field and its
+> `cfg(test)` initializer landed together in `02b1084` (both present: `git show
+> 02b1084:…/transfer_receiver.rs` and `…/transfer_sender.rs`). What the auditor caught was a
+> transient mid-edit state in my working tree, and I promoted it to a claim about history without
+> checking the commit — the exact failure mode this whole review is about, committed by the reviewer.
 >
-> | crate | tests |
+> Measured 2026-08-14 on HEAD, by target:
+>
+> | target | tests |
 > |---|---|
-> | `mercuryrustlib --lib` | 377 |
+> | `cargo test --workspace --tests` | **764** |
+> | of which `mercuryrustlib --lib` | 377 |
 > | `mercury-utexo-sdk --lib` | 153 |
 > | `mercurylib --lib` | 111 |
 > | `ci-guards` | 85 |
-> | **total** | **726** |
 >
-> Stage 0's own header — *"nothing downstream is trustworthy until these run"* — applied to this
-> row, and it was the row asserting they had.
+> The four `--lib`/guard targets alone are 726; the workspace figure includes the integration targets.
+> **Which number a row means is the thing to state** — "756" was neither wrong nor verifiable as
+> written, because it named no target set.
 
 **Three things are decided and done:** D35 (the flat-backup lane rule), D14 (the supersession
 margin, keyed structurally), and D40.2's first half (terminality read from the enclave's signature

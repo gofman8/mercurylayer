@@ -107,7 +107,7 @@ around any of it:**
 | Prerequisite | State today |
 |---|---|
 | ~~**Coloured on-chain re-anchor**~~ | **CLOSED 2026-08-12 (`b79b525`).** Was: `refresh` refused carriers outright while `build_colored_child_retransfer` errored at the CSV floor telling the user to "re-anchor it" — naming a primitive with no implementation, so a coloured coin had **no renewal primitive** and its life was bounded, ending in a forced exit. D29 chose the design (CR-D, a coloured de-trigger) and it is now built: `build_colored_detrigger` + `cosign_colored_detrigger` (`clients/libs/rust/src/tesr.rs`) under `TierRole::Detrigger`, driven by `UtexoWallet::colored_reanchor` (`clients/libs/rust-sdk/src/refresh.rs`). The carrier refusal no longer refuses — it **dispatches**: a coloured carrier is pointed at `colored_reanchor`, a plain one keeps the old refusal, and each arm names why. Both directions are load-bearing: sending a coloured carrier through the RGB-unaware `withdraw` burns the asset, and sending a plain one to CR-D finds no coloured material to build from. |
-| **One payee, one payment, forever** | `CTESR_CARRIER_SEND_DEPTH = 1` (`tokens.rs:131`) plus `refuse_colored_multi_payee` (`tokens.rs:230`, `:3600`) plus the depth-1 refusal in `colored_child_txids` (`tesr.rs:467-471`). Three independent live guards. A carrier pays once, to one payee. |
+| **One payee, one payment, forever** | **[D43/D52 — CORRECTED, and the original was wrong three ways.]** `CTESR_CARRIER_SEND_DEPTH = 1`, `refuse_colored_multi_payee` and the depth-1 refusal in `colored_child_txids` are real guards, but **none of them is on the lane a default wallet runs**: `SdkConfig::regtest`/`::mainnet` both ship `colored_ladder: false`, so `batch_transfer_tokens` takes the LEGACY lane, which pays N payees out of one carrier and is exercised live and green by `SDK_E2E=9`. "Three independent live guards" was true of the CTES-R lane only. Second, D43's own measurement contradicts "a carrier pays once": the K=1 lane leaves a SPINE TIP that is **payable again** — K=1 bounds the payees of one PAYMENT, not the payments of one carrier. Third, the line citations had rotted (`refuse_colored_multi_payee` is not at `:230`, and its call sites are not at `:3600`), which is why they are gone: cite the SYMBOL. |
 | **JS and web clients cannot receive a laddered coin at all** | `clients/libs/nodejs/transfer_receive.js:184`, `clients/libs/web/transfer_receive.js:224` fail closed on any laddered coin. Flipping the default makes **every** RGB coin unreceivable on both clients until `verify_bundle` is ported to wasm/JS and Kotlin. |
 | ~~**rgb-lib is an uncommitted filesystem path**~~ | **CLOSED 2026-08-11 (`6b2e662`).** Was: a relative path, with four symbols mercury called existing in no commit, so HEAD did not build from a clean clone. Now pinned by revision — `rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "38e344e0…" }`, `rev` not `branch` because a branch moves. Verified: `Cargo.lock` records the git source, no `path = "../../../.."` remains in any manifest, and both `-p mercury-rgb` and `-p rust` build against it. |
 | **Lightning is not wired to the coloured child lane** | `tokens.rs:3292-3295` refuses it by name. Under the scope-out this vanished at zero cost; under this decision it must be built or the LN appendix must say RGB-over-LN does not work. |
@@ -2149,3 +2149,81 @@ Restoring the sentence needs `cosign_detrigger` wired plus an E2E landing `F′`
 **The lesson:** a "[Shipped]" tag plus a test name reads as verified. Both were present here and the
 test exercised a different function, to a different destination, proving the half the claim does not
 rest on.
+
+---
+
+## D58 — Opting into background maintenance LOST the sever
+
+**Status:** FIXED IN CODE. **Date:** 2026-08-14.
+
+`UtexoWallet::start_background` ran
+
+```rust
+if auto_refresh && background_auto_refresh { auto_refresh_due(..) } else { deadline_safety_due(..) }
+```
+
+`deadline_safety_due` is not the poor relation of `auto_refresh_due` — it **calls** it (the
+cooperative re-anchor is its route 1) and then severs whatever the counterparty declined to co-sign.
+So the `else` arm was the strict superset, and a wallet that **opted into** routine background
+maintenance got the cooperative half alone. **Enabling more maintenance bought less protection** —
+the exact inversion of what the flag reads as.
+
+It is now called unconditionally, and its `Err` — which [D51] made it return, listing every coin it
+could not defend — is logged rather than discarded by `let _ =`.
+
+**`SPEC-FOUNDATION.md` had already diagnosed this precisely and prescribed the exact fix** ("the
+correction is to hoist `deadline_safety_due` out of the `else` rather than to soften the word"), in a
+paragraph that also notes the code comment above the branch asserts "DEADLINE SAFETY IS
+UNCONDITIONAL". It sat undone while a ci-guard named
+`the_background_loop_always_runs_a_deadline_pass` stayed green over it.
+
+**The lesson:** a correct diagnosis in a working document is not a fix, and a guard named for the
+property is not the property. Both were present here for as long as the defect was.
+
+---
+
+## D59 — SPEC §3.0 attached its shape warning to two rules nothing enforces
+
+**Status:** DOCUMENTATION CORRECTED. **Date:** 2026-08-14.
+
+§3.0 discharged premise 4 by listing eight shape properties and warning that "a change to any shape
+rule above MUST be re-checked against premise 4". Of the eight, **three** are enforced on an
+acceptance path — flat `nVersion 2`, flat `payment_outputs != 1`, and tier `bind_single_p2a_anchor`
+— and the two the prose leaned on hardest, tier `nVersion 3` and tier `nLockTime 0`, are enforced by
+**nothing**: they are set by the builders and read only by `assert_eq!` fixtures. A repo-wide search
+for a production `version != 3` returns no hits.
+
+The separation that actually holds is `payment_outputs != 1` against the anchor rule: a flat backup
+has one payment output and no anchor; a tier carries a payload output **plus** a 240-sat anchor. §3.0
+now states which three a verifier checks and marks the rest as builder conventions, so the warning
+points at rules a test would actually catch.
+
+---
+
+## D60 — The line-citation census was a hand-list, and it omitted a third of the corpus
+
+**Status:** FIXED (guard + README). **Date:** 2026-08-14.
+
+`deny_line_number_citations_in_normative_docs::NORMATIVE` was a hand-list of seven.
+`docs/utexo/README.md` labels ten documents `*Normative.*`, and the three the list omitted —
+`GRANULARITY-SPEC.md` (**134** citations), `SUBECONOMIC-FINALITY.md` (**83**), `INVALIDATION-SPEC.md`
+(**64**) — held **281** line citations between them. Two sampled at random were both rotted.
+
+The set is now **derived from the README's labels**, so adding a doc to the normative set enrols it
+automatically. The 281 are grandfathered as **ratchets that may only go down** — fixing them in one
+pass would be 281 chances to introduce a new wrong citation.
+
+### The gap the non-vacuity test found, which the rules themselves could not
+
+Both existing rules pass with a BROKEN derivation: the strict rule skips whatever is grandfathered,
+and the ratchet reads `GRANDFATHERED` directly. So `the_derivation_actually_finds_every_normative_document`
+pins the derivation's OUTPUT by name — and it failed on the first run: **`TRUST-MODEL.md` was not in
+the derived set**, because its README bullet said only *"Auditors."*.
+
+That is not a parser bug. `SPEC.md` and `PROTOCOL.md` both defer to TRUST-MODEL for what is trusted,
+and [D54]'s residual bound is stated nowhere else but its B11 row. **A document the specification
+defers to is normative whatever its reader-audience note says**, so the README was corrected and the
+census now covers it.
+
+**The lesson, which is this session's in one more costume:** a guard whose set is hand-maintained
+polices what someone remembered, not what exists. Derive the set, then pin the derivation.

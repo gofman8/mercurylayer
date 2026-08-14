@@ -107,7 +107,11 @@ off-chain, whole or split); **Lightning both directions** on the ladder via a HO
 - [SPEC.md](SPEC.md) — system specification (REQ / INV / ERR) across SE, client libs, SDK and SSP,
   with per-item traceability to tests. *Normative.*
 - [TRUST-MODEL.md](TRUST-MODEL.md) — party-by-party matrix: what is verified (with file and test) vs
-  trusted, and the boundaries no protocol change removes. *Auditors.*
+  trusted, and the boundaries no protocol change removes. *Normative; auditors start here.*
+  ([D60] This entry said only *Auditors.* and was therefore outside the line-citation census, which
+  derives its set from these labels — while `SPEC.md` and `PROTOCOL.md` both defer to it for what is
+  trusted, and D54's residual bound is stated nowhere else but its B11 row. A document the
+  specification defers to is normative whatever the reader-audience note says.)
 - [INVALIDATION-SPEC.md](INVALIDATION-SPEC.md) — normative `IVL-*` for old-state invalidation and the
   un-laddered shape's absolute-locktime machinery and duties. *Normative.*
 - [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) — normative `GRN-*` for partial amounts: split bounds,

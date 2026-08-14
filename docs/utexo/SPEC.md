@@ -224,11 +224,36 @@ an assumption; it is a **theorem with four premises**:
 4. **the counted categories are PAIRWISE DISTINCT** — no object can be counted as a flat backup and
    as a tier, or as two tiers.
 
-**Premise 4 is discharged by SHAPE, not by a runtime check.** A flat backup is nVersion 2,
-nSequence 0, a height `nLockTime` above tip, exactly one non-`OP_RETURN` output. A tier is
-nVersion 3, `nLockTime` 0, exactly one 240-sat P2A anchor, a CSV inside its bound band, and provably
-unconfirmable once superseded. No transaction satisfies both descriptions, so the categories cannot
-overlap and nothing can be double-counted.
+**Premise 4 is discharged by SHAPE, not by a runtime check** — and the specification must be exact
+about WHICH parts of the shape a verifier tests, because a warning attached to a rule nobody checks
+protects nothing.
+
+A flat backup is nVersion 2, nSequence 0, a height `nLockTime` above tip, exactly one
+non-`OP_RETURN` output. A tier is nVersion 3, `nLockTime` 0, exactly one 240-sat P2A anchor, a CSV
+inside its bound band, and provably unconfirmable once superseded. No transaction satisfies both
+descriptions, so the categories cannot overlap and nothing can be double-counted.
+
+**[D59] Of those eight properties, exactly THREE are enforced on an acceptance path, and they are
+sufficient. The other five are builder conventions.**
+
+| property | enforced by | where |
+|---|---|---|
+| flat: nVersion **2** | `if tx_n.version != 2 { … }` | `lib/src/transfer/receiver.rs`, flat validation |
+| flat: exactly one non-`OP_RETURN` output | `if payment_outputs != 1 { … }` | same |
+| tier: exactly one 240-sat P2A anchor | `bind_single_p2a_anchor` | `clients/libs/rust/src/tesr.rs` |
+| tier: nVersion **3** | **NOTHING.** Set by the builders (`lib/src/tesr.rs`); read only by `assert_eq!` fixtures. A repo-wide search for a production `version != 3` returns nothing | — |
+| tier: `nLockTime` **0** | **NOTHING** on the tier side (INV-4 is a build-time invariant) | — |
+
+**The separation that actually holds is `payment_outputs != 1` against the anchor rule**: a flat
+backup has exactly one payment output and no anchor; a tier carries a payload output **plus** a
+240-sat P2A anchor, so it fails the flat side's output test and passes the anchor rule, and neither
+can be mistaken for the other. That is what discharges premise 4.
+
+⚠️ **The consequence for the warning below.** It used to read "a change to any shape rule above MUST
+be re-checked against premise 4", which reads as though all eight were load-bearing. Two of them —
+tier nVersion 3 and tier `nLockTime` 0 — could be relaxed today with nothing in the tree failing.
+Re-check against premise 4 means re-check against the THREE rows marked enforced; changing a builder
+convention is a change to what this document DESCRIBES, and it will not be caught by a test.
 
 **Those rules therefore carry a CENSUS obligation and not only a relay/race one.** This is the whole
 point of stating it here: every one of them already exists for a transport reason, and the failure

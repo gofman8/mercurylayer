@@ -23,23 +23,66 @@
 
 use std::path::PathBuf;
 
-/// The documents that become the specification. Working documents are deliberately absent — see the
-/// module comment.
-const NORMATIVE: [&str; 7] = [
-    "docs/utexo/SPEC.md",
-    "docs/utexo/PROTOCOL.md",
-    "docs/utexo/CHILDREN.md",
-    "docs/utexo/LIGHTNING.md",
-    "docs/utexo/TRUST-MODEL.md",
-    "docs/utexo/ADMISSION-INPUTS.md",
-    "docs/utexo/DECISIONS.md",
-];
+/// **[D60] The normative set is DERIVED FROM `README.md`, not hand-listed.**
+///
+/// It used to be a hand-list of seven. `docs/utexo/README.md` labels **ten** documents
+/// `*Normative.*`, and the three the list omitted — `GRANULARITY-SPEC.md`, `SUBECONOMIC-FINALITY.md`
+/// and `INVALIDATION-SPEC.md` — held **281** line citations between them. Two sampled at random were
+/// both rotted: *"`token_carrier_outpoints` is empty (tokens.rs:364-385)"* (the symbol is ~1 000
+/// lines away; 362-368 is a doc block) and *"`plan()` is greedy largest-first (select.rs:89-112)"*
+/// (`pub fn plan(` is at `:101`; line 89 is inside a different function's subset-sum loop).
+///
+/// A hand-list is a second place to remember something, and it silently omitted a third of the
+/// corpus it claimed to police. Reading the README means **adding a doc to the normative set enrols
+/// it automatically** — the census cannot drift from the label any more.
+fn normative_docs() -> Vec<String> {
+    let readme = read("docs/utexo/README.md");
+    let mut out = Vec::new();
+    // A README entry is a markdown link followed, within its bullet, by the literal `*Normative`.
+    // Bullets can wrap, so scan per-bullet rather than per-line.
+    for bullet in readme.split("\n- ") {
+        if !bullet.contains("*Normative") {
+            continue;
+        }
+        if let Some(open) = bullet.find("](") {
+            let rest = &bullet[open + 2..];
+            if let Some(close) = rest.find(')') {
+                let target = &rest[..close];
+                if target.ends_with(".md") && !target.contains('/') {
+                    out.push(format!("docs/utexo/{target}"));
+                }
+            }
+        }
+    }
+    // DECISIONS.md is normative by use — everything else cites it as the authority — but the README
+    // files it under records rather than specs, so it is added explicitly.
+    out.push("docs/utexo/DECISIONS.md".to_string());
+    out.sort();
+    out.dedup();
+    assert!(
+        out.len() >= 8,
+        "the README-derived normative set collapsed to {} entries. That is the failure mode this \
+         function exists to prevent — a census that quietly stops censusing. Either the README's \
+         `*Normative.*` labels moved, or its bullet format changed: {out:?}",
+        out.len()
+    );
+    out
+}
 
 /// `DECISIONS.md` and `LIGHTNING.md` are records of decisions and of an external fork's API surface
 /// respectively; both legitimately quote a position AT THE TIME. They are held to the weaker rule:
 /// no NEW line citations, measured against the count when this guard was written.
-const GRANDFATHERED: [(&str, usize); 2] =
-    [("docs/utexo/DECISIONS.md", 31), ("docs/utexo/LIGHTNING.md", 16)];
+const GRANDFATHERED: [(&str, usize); 5] = [
+    ("docs/utexo/DECISIONS.md", 31),
+    ("docs/utexo/LIGHTNING.md", 16),
+    // [D60] The three the hand-list omitted. These are RATCHETS, not exemptions: the counts are what
+    // was there when the census was widened to see them, and they may only go DOWN. Fixing 281
+    // citations in one pass would be 281 chances to introduce a new wrong one, so they are frozen
+    // where they stand and re-symbolised as each document is next edited for its own reasons.
+    ("docs/utexo/GRANULARITY-SPEC.md", 134),
+    ("docs/utexo/SUBECONOMIC-FINALITY.md", 83),
+    ("docs/utexo/INVALIDATION-SPEC.md", 64),
+];
 
 fn read(rel: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(rel);
@@ -74,11 +117,11 @@ fn line_citations(src: &str) -> Vec<String> {
 #[test]
 fn no_normative_document_cites_code_by_line_number() {
     let mut offenders: Vec<String> = Vec::new();
-    for doc in NORMATIVE {
+    for doc in normative_docs() {
         if GRANDFATHERED.iter().any(|(g, _)| *g == doc) {
             continue;
         }
-        for c in line_citations(&read(doc)) {
+        for c in line_citations(&read(&doc)) {
             offenders.push(format!("{doc}: {c}"));
         }
     }
@@ -92,7 +135,7 @@ fn no_normative_document_cites_code_by_line_number() {
     );
 }
 
-/// THE WEAKER RULE for the two records: no NEW line citations. A decision record may legitimately
+/// THE WEAKER RULE for the grandfathered set: no NEW line citations. A decision record may legitimately
 /// quote a position as it stood when the decision was taken; it may not accumulate more.
 #[test]
 fn the_grandfathered_records_do_not_accumulate_more() {
@@ -132,4 +175,54 @@ fn the_detector_finds_a_line_citation_and_ignores_prose() {
         line_citations("in tesr.rs: the ladder is built here").is_empty(),
         "the detector flags prose after a filename — `foo.rs: the` is a sentence, not a citation"
     );
+}
+
+/// **[D60] NON-VACUITY FOR THE DERIVATION ITSELF.**
+///
+/// The two rules above both pass with a BROKEN derivation: the strict rule skips whatever is
+/// grandfathered, and the ratchet reads `GRANDFATHERED` directly rather than the derived set. So a
+/// `normative_docs()` that returned only `DECISIONS.md` would leave this file green — which is the
+/// exact shape of defect that put 281 citations outside the census in the first place.
+///
+/// This test pins the derivation's OUTPUT: the three documents the old hand-list omitted must be in
+/// it, by name, and so must the seven it had.
+#[test]
+fn the_derivation_actually_finds_every_normative_document() {
+    let docs = normative_docs();
+    for must in [
+        // the three the hand-list omitted — the whole point of D60
+        "docs/utexo/GRANULARITY-SPEC.md",
+        "docs/utexo/SUBECONOMIC-FINALITY.md",
+        "docs/utexo/INVALIDATION-SPEC.md",
+        // and the ones it already had, so widening cannot silently narrow
+        "docs/utexo/SPEC.md",
+        "docs/utexo/PROTOCOL.md",
+        "docs/utexo/CHILDREN.md",
+        "docs/utexo/LIGHTNING.md",
+        "docs/utexo/TRUST-MODEL.md",
+        "docs/utexo/ADMISSION-INPUTS.md",
+        "docs/utexo/DECISIONS.md",
+    ] {
+        assert!(
+            docs.iter().any(|d| d == must),
+            "`normative_docs()` no longer yields {must}. It is derived from `docs/utexo/README.md`'s \
+             `*Normative.*` labels, so either the label was removed from that entry or the README's \
+             bullet format changed and the parser stopped seeing it. A census that quietly stops \
+             censusing is the defect this guard exists to prevent.\n\nderived: {docs:?}"
+        );
+    }
+}
+
+/// And the grandfathered ratchets must name documents that are actually IN the census — otherwise a
+/// ratchet is a promise about a file nobody checks.
+#[test]
+fn every_grandfathered_document_is_in_the_derived_set() {
+    let docs = normative_docs();
+    for (g, _) in GRANDFATHERED {
+        assert!(
+            docs.iter().any(|d| d == g),
+            "{g} carries a grandfathered citation budget but is NOT in the derived normative set, so \
+             the budget polices nothing.\n\nderived: {docs:?}"
+        );
+    }
 }

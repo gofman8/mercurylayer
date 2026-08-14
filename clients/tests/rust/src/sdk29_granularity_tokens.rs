@@ -1,9 +1,13 @@
 //! E2E (granularity, RGB tokens): partial token amounts down to 1 RAW UNIT, the token exit of a
 //! received piece, the fully-spent-carrier transition, and what a RECEIVED piece can and cannot do.
 //!
-//! **MIGRATED TO THE COLOURED (CTES-R) LANE.** `SdkConfig::colored_ladder` now defaults ON, so a
-//! token carrier is laddered (`T -> X_m -> S_0`, every tier carrying a real RGB state transition)
-//! and the legacy `create_colored_split_tx` lane is RETIRED
+//! **MIGRATED TO THE COLOURED (CTES-R) LANE — which this test OPTS INTO, because it is not the
+//! default.** [D30/D52] `SdkConfig::colored_ladder` ships **false** in both `SdkConfig::regtest` and
+//! `SdkConfig::mainnet`; this header used to say it "now defaults ON", and that false premise is
+//! what made the explicit `cfg.colored_ladder = true;` below look like belt-and-braces instead of
+//! the thing that selects the lane. On the CTES-R lane a token carrier is laddered
+//! (`T -> X_m -> S_0`, every tier carrying a real RGB state transition) and the legacy
+//! `create_colored_split_tx` lane is RETIRED
 //! (`UtexoWallet::refuse_legacy_colored_split_lane`). The observable consequences, each of which
 //! this test had to be re-derived against rather than patched:
 //!
@@ -419,8 +423,8 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    // `colored_ladder` is the DEFAULT now; set it explicitly anyway so this test states the lane it
-    // is about rather than inheriting it.
+    // [D52] `colored_ladder` is NOT the default — it ships false. This line is what puts the test on
+    // the CTES-R lane; without it every assertion below would measure the legacy lane instead.
     let open = |name: &str| {
         let mut cfg = SdkConfig::regtest(name);
         cfg.colored_ladder = true;
