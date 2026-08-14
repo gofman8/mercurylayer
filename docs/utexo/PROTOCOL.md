@@ -671,8 +671,17 @@ lockbox's attested lifetime `sig_count`; any hidden extra co-signed state/extens
 mismatch, same linchpin as R5 in the pre-TES-R receiver set. The census only proves anything if that
 count is the ENCLAVE's, so it is not taken on the coordinator's word: `/info/statechain` must carry an
 `utexo/sig_count/v2` attestation over `(statechain_id, num_sigs, sig_budget, nonce)`, verified against
-the **chain-anchored** `enclave_public_key` (the one already bound to the tx0 output) rather than
-against a served key, and an unattested or unverifiable count is refused outright.
+the **PINNED enclave attestation identity** rather than against any key served in the same response,
+and an unattested or unverifiable count is refused outright.
+
+> **[D69]** This clause read "the chain-anchored `enclave_public_key` (the one already bound to the
+> tx0 output)". That anchor does not exist for the coins that need it most: a depth-≥2 in-ladder-split
+> ancestor's funding output is deliberately **un-broadcast**, so there was nothing on chain to bind to
+> and the verifying key arrived alongside the signature (TRUST-MODEL B11). The enclave now signs every
+> attestation with one long-term identity (`utexo/attestation-identity/v1`, served at
+> `GET /attestation_identity`) which the client pins: **compiled-in pin → configured value → REFUSE**,
+> never a fallback to the served key. The check is now independent of whether the coin is on chain, so
+> it holds at every split depth.
 (R6′/R7′) per-level branch validation + Σ-inputs terminal ancestors, now
 including the terminal-freeze check for colored ancestry. (R8) RGB consignment client-validated,
 un-broadcast witnesses allowed.
@@ -933,7 +942,7 @@ coordinator (the other REQ4 gap) does not ship. Exit-time RGB disclosure unchang
   machine is still unspecified and unbuilt"; that was an unevidenced upgrade and is withdrawn.* Two
   things the proof does **not** cover, and they are the real residual: it is conditional on the two
   coordinator-trust premises D8 attaches — P3, that `se_num_sigs` is the true count, now earned by the
-  chain-anchored `utexo/sig_count/v2` attestation (§5.11), and **P1, the sid ↔ aggregate-key binding,
+  **pinned-identity** `utexo/sig_count/v2` attestation ([D69]; §5.11), and **P1, the sid ↔ aggregate-key binding,
   still coordinator-supplied and unattested** (`ladder_binding_precheck_cause`); and per **D40.2** the
   key material and the counter it attests are held by the same party, which no counter machine would
   have fixed. See O-1, restated on those terms.
@@ -1146,8 +1155,9 @@ claims. The earlier plan's "mixed-protocol estates" item is void: no mixed estat
   **What remains open under this label, per D40.2 (which folds O-1, CO-1 and CO-3 into ONE defect —
   publish one row, cite it three times):** the enclave key material and the counter it attests are held
   by the party the receiver is being protected from. The proof must therefore be published *with* its
-  premises — P3 (`se_num_sigs` is the true count) is now **earned** by the chain-anchored
-  `utexo/sig_count/v2` attestation, while **P1 (the sid ↔ aggregate binding) is still coordinator-supplied
+  premises — P3 (`se_num_sigs` is the true count) is now **earned** by the **pinned-identity**
+  `utexo/sig_count/v2` attestation ([D69] — pinned, not chain-anchored: a deep in-ladder-split ancestor
+  has no chain anchor by design), while **P1 (the sid ↔ aggregate binding) is still coordinator-supplied
   and unattested**. The only construction that closes it is a second, independently administered SE write
   domain under a separate legal entity; an external anchor over `(sid, n, h_n)` is rejected with reasons
   (the attack is *under*-reporting, and the receiver's rule would be a floor written by the adversary).

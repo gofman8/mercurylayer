@@ -451,7 +451,7 @@ notion of a budget, so it could not attest that the count was **final**.
 |---|---|---|
 | where the budget lives | coordinator Postgres | coordinator **and** enclave |
 | who refuses the co-sign | coordinator | coordinator **and** enclave (`410`, before the secnonce is consumed) |
-| what a receiver can check | the coordinator's word | a BIP-340 signature by the coin's chain-anchored key |
+| what a receiver can check | the coordinator's word | a BIP-340 signature by the coin's chain-anchored key — **superseded by [D69]: by the PINNED enclave identity**, because a deep in-ladder-split ancestor has no chain anchor |
 
 > **This row was true about the ATTESTATION and false about the SYSTEM until A.1 landed** (`52daca6`,
 > 2026-08-13). The budget was signed, verified, and then read by no acceptance decision — a repo-wide

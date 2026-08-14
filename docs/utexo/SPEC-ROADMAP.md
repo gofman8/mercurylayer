@@ -1,5 +1,14 @@
 # SPEC-ROADMAP — what must be true before a normative Utexo specification can be written
 
+> ⚠️ **[D69] CORRECTION, 2026-08-14 — every "chain-anchored" reading of the sig-count attestation in
+> this document is SUPERSEDED.** Rounds 2 and 3 record that the client verifies the
+> `utexo/sig_count/v2` attestation against the coin's chain-anchored `enclave_public_key`. True when
+> observed; wrong as a design. A depth-≥2 in-ladder-split ancestor's funding output is deliberately
+> un-broadcast, so for exactly the coins the check protects there is no chain anchor and the verifying
+> key travelled in the same response as the signature (TRUST-MODEL B11). The enclave now signs with one
+> pinned long-term identity (`utexo/attestation-identity/v1`); resolution is pin → config → REFUSE.
+> The round-3 verdict "P3 IS earned" still holds — it is earned by a stronger anchor than the one named.
+
 > ⚠️ **[D53] CORRECTION, 2026-08-14 — the depth cap in this document is STALE.**
 > Every statement here of `max_split_depth = 10` / **23 transactions** (mainnet) or
 > `max_split_depth = 68` / **139 transactions** (regtest) was measured against the BARE latency rule
