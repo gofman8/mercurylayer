@@ -1,6 +1,6 @@
 //! E2E (SDK_E2E=40) — **TES-R consensus core** on the live SE + real bitcoind.
 //!
-//! Validates the load-bearing claims of `docs/utexo/current/PROTOCOL.md` against real Bitcoin consensus,
+//! Validates the load-bearing claims of `docs/utexo/spec/PROTOCOL.md` against real Bitcoin consensus,
 //! co-signed by the *unchanged* blind SE (proving the "enclave cryptographically unchanged" claim —
 //! it blind-signs v3 + relative-timelock + P2A sighashes exactly as it signs un-laddered backups):
 //!

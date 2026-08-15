@@ -28,17 +28,15 @@
 use std::path::PathBuf;
 
 /// Documents that feed the specification. A dated audit may quote whatever it observed.
-// 2026-08-15: ADMISSION-INPUTS and SPEC-ROADMAP were retired with the rest of the point-in-time and
-// folded-feature docs. They are dropped from the list, not stubbed — a guard that reads a file which
-// no longer exists fails for the wrong reason and teaches a reader to ignore it.
-const CHECKED: [&str; 7] = [
-    "docs/utexo/current/SPEC.md",
-    "docs/utexo/current/PROTOCOL.md",
-    "docs/utexo/current/CHILDREN.md",
-    "docs/utexo/current/LIGHTNING.md",
-    "docs/utexo/current/TRUST-MODEL.md",
-    "docs/utexo/history/DECISIONS.md",
-    "docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md",
+// Every normative document. A guard that reads a file which no longer exists fails for the wrong
+// reason and teaches a reader to ignore it, so this list holds exactly what is on disk.
+const CHECKED: [&str; 6] = [
+    "docs/utexo/spec/SPEC.md",
+    "docs/utexo/spec/PROTOCOL.md",
+    "docs/utexo/spec/CHILDREN.md",
+    "docs/utexo/spec/LIGHTNING.md",
+    "docs/utexo/spec/TRUST-MODEL.md",
+    "docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md",
 ];
 
 /// Spellings of the superseded cap. Each is specific enough that an unrelated `23` cannot trip it.
@@ -93,7 +91,7 @@ fn a_document_stating_the_superseded_depth_cap_must_say_it_is_superseded() {
 /// against what the document SAYS rather than what it confesses.
 #[test]
 fn the_cost_document_publishes_the_current_depth_cap_and_not_the_superseded_one() {
-    let doc = "docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md";
+    let doc = "docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md";
     let src = read(doc);
     assert!(
         src.contains("depth-8") || src.contains("max_split_depth = 8") || src.contains("depth 8"),

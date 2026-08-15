@@ -3220,7 +3220,7 @@ pub(crate) fn signed_tier_txid(signed_tx_hex: &str) -> Result<String> {
 /// The commonly-quoted figure counted only the `SP` tier and omitted the two children the split
 /// creates — each of which gets its OWN extension and state rung, every rung burning
 /// `committed_fee + P2A_VALUE`. Measured as loss of exitable value across the tree
-/// (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md` §1.1):
+/// (`docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md` §1.1):
 ///
 /// ```text
 ///   SP split tier (2 payload outputs)   576   committed_fee_for_outputs(2, r) + P2A

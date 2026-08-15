@@ -25,7 +25,7 @@ fn read(rel: &str) -> String {
 /// THE STATEMENT EXISTS, and names all four premises.
 #[test]
 fn the_census_completeness_theorem_is_stated_with_its_four_premises() {
-    let spec = read("docs/utexo/current/SPEC.md");
+    let spec = read("docs/utexo/spec/SPEC.md");
     assert!(
         spec.contains("CENSUS COMPLETENESS"),
         "SPEC.md no longer states the census-completeness theorem. A11 published as a bare \
@@ -49,7 +49,7 @@ fn the_census_completeness_theorem_is_stated_with_its_four_premises() {
 /// THE OBLIGATION IS ATTACHED TO THE SHAPES, which is the part that has to survive.
 #[test]
 fn the_shape_rules_are_stated_to_carry_a_census_obligation() {
-    let spec = read("docs/utexo/current/SPEC.md");
+    let spec = read("docs/utexo/spec/SPEC.md");
     assert!(
         spec.contains("CENSUS obligation and not only a relay/race one"),
         "the shape rules no longer state that they carry a CENSUS obligation. That sentence is the \
@@ -70,7 +70,7 @@ fn the_shape_rules_are_stated_to_carry_a_census_obligation() {
 /// thing to add later; the reason not to must outlive whoever decided it.
 #[test]
 fn the_runtime_check_stays_explicitly_rejected() {
-    let spec = read("docs/utexo/current/SPEC.md");
+    let spec = read("docs/utexo/spec/SPEC.md");
     assert!(
         spec.contains("runtime distinctness check is deliberately NOT specified"),
         "the rejection of a runtime distinctness check is gone from SPEC.md. It is the obvious \

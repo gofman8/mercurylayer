@@ -1726,7 +1726,7 @@ async fn process_encrypted_message(client_config: &ClientConfig, coin: &mut Coin
     // `protocol_version >= 4` carries the STANDARD key handover, so the receiver COMPLETES it here: the
     // SE rotates its share leaving the child aggregate `A_child` INVARIANT (the pre-signed child ladder
     // stays valid) and re-points auth to this wallet, which permanently locks the sender out. That makes
-    // the child a FIRST-CLASS coin, not merely an exitable claim (docs/utexo/current/CHILDREN.md).
+    // the child a FIRST-CLASS coin, not merely an exitable claim (docs/utexo/spec/CHILDREN.md).
     // Version 3 is the legacy no-handover conveyance and is still adopted exit-only.
     if let Some(cb_json) = &transfer_msg.child_tesr_bundle {
         let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(cb_json)

@@ -1,6 +1,6 @@
 //! TES-R (Trigger / Extension / State) transaction tier builders for Mercury Utexo.
 //!
-//! See `docs/utexo/current/PROTOCOL.md`. A coin's funding UTXO `F` (P2TR of the aggregate key `A`) rests
+//! See `docs/utexo/spec/PROTOCOL.md`. A coin's funding UTXO `F` (P2TR of the aggregate key `A`) rests
 //! on-chain; above it hangs a pre-signed, **un-broadcast** tree of three tiers, all v3 (TRUC) with a
 //! P2A anchor for fee-bumping:
 //!
@@ -224,7 +224,7 @@ pub const fn const_str_eq(a: &str, b: &str) -> bool {
 
 /// Protocol parameters for the TES-R ladder — the relative-timelock schedule the wallet uses to size
 /// each tier and to decide when to renew or roll over. Mainnet defaults are from
-/// `docs/utexo/current/PROTOCOL.md` §5.2.
+/// `docs/utexo/spec/PROTOCOL.md` §5.2.
 ///
 /// **These are compiled in per network ([`Self::for_network`], D7/D25) and NOT taken from the SE.**
 /// The CSV schedule is the mild half: getting it "wrong" costs exit-wait length and renewal cadence,

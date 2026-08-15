@@ -92,7 +92,7 @@ fn window<'a>(hay: &'a str, start: &str, end: &str, what: &str) -> Result<&'a st
 
 #[test]
 fn the_protocol_spec_states_that_a_keyless_tower_cannot_fee_bump() {
-    let spec = flat(&read("docs/utexo/current/PROTOCOL.md"));
+    let spec = flat(&read("docs/utexo/spec/PROTOCOL.md"));
     assert!(
         spec.contains("cannot fee-bump"),
         "PROTOCOL.md must state plainly that a keyless tower CANNOT fee-bump (D19/D31). Without it, \
@@ -113,7 +113,7 @@ fn the_protocol_spec_states_that_a_keyless_tower_cannot_fee_bump() {
 /// hold a small funded fee wallet", which states the opposite — that every tower has one.
 #[test]
 fn the_funded_tower_is_offered_not_assumed() {
-    let spec = read("docs/utexo/current/PROTOCOL.md");
+    let spec = read("docs/utexo/spec/PROTOCOL.md");
     let flat_spec = flat(&spec);
     assert!(
         !flat_spec.contains("towers hold a small funded fee wallet"),
@@ -366,7 +366,7 @@ fn b4_violations(src: &str) -> Vec<String> {
 /// qualification, which is the half a reader quotes.
 #[test]
 fn the_trust_model_qualifies_its_offline_coverage_claim() {
-    let violations = b4_violations(&read("docs/utexo/current/TRUST-MODEL.md"));
+    let violations = b4_violations(&read("docs/utexo/spec/TRUST-MODEL.md"));
     assert!(violations.is_empty(), "{}", violations.join("\n\n"));
 }
 
@@ -388,7 +388,7 @@ fn the_b4_terminator_is_a_real_symbol() {
 /// Non-vacuity for B4, plus proof the window is no longer length-based.
 #[test]
 fn b4_guard_rejects_its_mutations_and_tolerates_reflow() {
-    let real = read("docs/utexo/current/TRUST-MODEL.md");
+    let real = read("docs/utexo/spec/TRUST-MODEL.md");
     assert!(b4_violations(&real).is_empty(), "B4 must be clean before mutating it");
 
     // M1 — the qualification is dropped from the row.

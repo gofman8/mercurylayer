@@ -37,7 +37,7 @@ pub async fn execute() -> Result<()> {
     //
     // `SdkConfig::colored_ladder` defaults to **false** (2c351c6), and that default is a shipping
     // decision, not a doubt about the lane: what keeps it off is the measured economics of the lane
-    // it switches on (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md` — one coloured partial payment per
+    // it switches on (`docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md` — one coloured partial payment per
     // carrier, ever). A test of the lane must therefore ENABLE the lane; inheriting it from the
     // default would make this test a test of the default instead. The default is pinned, in the
     // direction it actually has, by sdk74 and sdk75.

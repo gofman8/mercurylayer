@@ -72,7 +72,7 @@ pub struct SdkConfig {
     ///
     /// **Default `false`** (commit 2c351c6). The retirement argument below is what makes ON *safe*;
     /// what stopped it from being the default is the measured economics of the lane it switches on
-    /// — `docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
+    /// — `docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
     /// and a 4_284-block unilateral exit for the child it produces. Both constructors below ship
     /// `false`; the doc used to say "true" and the code has said `false` since 2c351c6.
     ///
@@ -152,7 +152,7 @@ pub struct SdkConfig {
 /// pre-signed exit chain valid) and the sender is locked out. It can be paid onward off-chain — whole
 /// via `child_retransfer`, or split via `child_in_ladder_pay` — each hop co-signing a fresh lower-CSV
 /// state and disclosing the one it replaces for the receiver's census
-/// (`docs/utexo/current/CHILDREN.md`; sdk60 two hops, sdk17 a partial second hop).
+/// (`docs/utexo/spec/CHILDREN.md`; sdk60 two hops, sdk17 a partial second hop).
 ///
 /// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
 ///   * an **RGB carrier** must never be laddered *with a PLAIN ladder* (an uncoloured tier spend
@@ -173,7 +173,7 @@ pub struct SdkConfig {
 //
 // These live here, in a non-test module, because `auto_exit_margin_blocks` is DERIVED from them and
 // a default cannot be derived from a `#[cfg(test)]` model. `invalidation_model.rs` pins them against
-// the schedule constants; `docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md` §2 is the measured source.
+// the schedule constants; `docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md` §2 is the measured source.
 //
 // The walk a depth-`d` coin must complete, leaf-ward, and what each rung costs:
 //

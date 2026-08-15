@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 /// **[D60] The normative set is DERIVED FROM `README.md`, not hand-listed.**
 ///
-/// It used to be a hand-list of seven. `docs/utexo/current/README.md` labels **ten** documents
+/// It used to be a hand-list of seven. `docs/utexo/spec/README.md` labels **ten** documents
 /// `*Normative.*`, and the three the list omitted — `GRANULARITY-SPEC.md`, `SUBECONOMIC-FINALITY.md`
 /// and `INVALIDATION-SPEC.md` — held **281** line citations between them. Two sampled at random were
 /// both rotted: *"`token_carrier_outpoints` is empty (tokens.rs:364-385)"* (the symbol is ~1 000
@@ -36,7 +36,7 @@ use std::path::PathBuf;
 /// corpus it claimed to police. Reading the README means **adding a doc to the normative set enrols
 /// it automatically** — the census cannot drift from the label any more.
 fn normative_docs() -> Vec<String> {
-    let readme = read("docs/utexo/current/README.md");
+    let readme = read("docs/utexo/spec/README.md");
     let mut out = Vec::new();
     // A README entry is a markdown link followed, within its bullet, by the literal `*Normative`.
     // Bullets can wrap, so scan per-bullet rather than per-line.
@@ -49,14 +49,14 @@ fn normative_docs() -> Vec<String> {
             if let Some(close) = rest.find(')') {
                 let target = &rest[..close];
                 if target.ends_with(".md") && !target.contains('/') {
-                    out.push(format!("docs/utexo/current/{target}"));
+                    out.push(format!("docs/utexo/spec/{target}"));
                 }
             }
         }
     }
     // The decision record lives in `docs/utexo/history/` and is deliberately NOT in this set: it is
     // an archive of positions as they stood, so a rule against quoting a position is the wrong shape
-    // for it. Every NORMATIVE document is in `docs/utexo/current/` and is held to the strict rule.
+    // for it. Every NORMATIVE document is in `docs/utexo/spec/` and is held to the strict rule.
     
     out.sort();
     out.dedup();
@@ -66,7 +66,7 @@ fn normative_docs() -> Vec<String> {
          function exists to prevent — a census that quietly stops censusing. Either the README's \
          `*Normative.*` labels moved, or its bullet format changed: {out:?}\n\n\
          (the floor is 6 DELIBERATELY. The owner retired the point-in-time, \
-         `docs/utexo/current/` holds exactly six normative documents -- SPEC, PROTOCOL, CHILDREN, \
+         `docs/utexo/spec/` holds exactly six normative documents -- SPEC, PROTOCOL, CHILDREN, \
          LIGHTNING, TRUST-MODEL and PARTIAL-PAYMENT-ECONOMICS -- plus a README that indexes them and \
          is not itself normative. Six is the whole set, not a sample. Lowering a non-vacuity floor is \
          exactly the move this assertion exists to make loud, so it is stated here rather than done \
@@ -94,7 +94,7 @@ const GRANDFATHERED: [(&str, usize); 1] = [
     // Nothing is grandfathered any more. The clean documents in `current/` carry ZERO line-number
     // citations between them, so the strict rule applies to all of them without exception -- which is
     // what the ratchets were always converging towards.
-    ("docs/utexo/current/LIGHTNING.md", 0),
+    ("docs/utexo/spec/LIGHTNING.md", 0),
     // [D60]'s three ratchets (GRANULARITY-SPEC 134, SUBECONOMIC-FINALITY 83, INVALIDATION-SPEC 64)
     // are GONE — those documents were retired on 2026-08-15, taking 281 un-symbolised citations with
     // them. The ratchets existed because fixing 281 citations in one pass was 281 chances to
@@ -213,16 +213,16 @@ fn the_derivation_actually_finds_every_normative_document() {
         // removed from this list rather than left to fail, and PARTIAL-PAYMENT-ECONOMICS takes their
         // place: SPEC §5.4 now defers to it for every per-payment figure, so the same argument that
         // made TRUST-MODEL normative ("a document the specification defers to is normative") applies.
-        "docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md",
-        "docs/utexo/current/SPEC.md",
-        "docs/utexo/current/PROTOCOL.md",
-        "docs/utexo/current/CHILDREN.md",
-        "docs/utexo/current/LIGHTNING.md",
-        "docs/utexo/current/TRUST-MODEL.md",
+        "docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md",
+        "docs/utexo/spec/SPEC.md",
+        "docs/utexo/spec/PROTOCOL.md",
+        "docs/utexo/spec/CHILDREN.md",
+        "docs/utexo/spec/LIGHTNING.md",
+        "docs/utexo/spec/TRUST-MODEL.md",
     ] {
         assert!(
             docs.iter().any(|d| d == must),
-            "`normative_docs()` no longer yields {must}. It is derived from `docs/utexo/current/README.md`'s \
+            "`normative_docs()` no longer yields {must}. It is derived from `docs/utexo/spec/README.md`'s \
              `*Normative.*` labels, so either the label was removed from that entry or the README's \
              bullet format changed and the parser stopped seeing it. A census that quietly stops \
              censusing is the defect this guard exists to prevent.\n\nderived: {docs:?}"

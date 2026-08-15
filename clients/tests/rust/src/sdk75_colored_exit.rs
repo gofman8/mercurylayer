@@ -501,7 +501,7 @@ pub async fn execute() -> Result<()> {
     // Note what that does NOT say about this test. Everything above this line is alice, running with
     // the lane explicitly ON, carrying an RGB allocation through a full unilateral exit — the lane
     // is SOUND, and that is proved, not defaulted. What keeps it opt-in is the measured economics of
-    // what it switches on (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md`), which is a product decision
+    // what it switches on (`docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md`), which is a product decision
     // and is exactly what this pin stops from moving silently.
     assert!(
         !SdkConfig::regtest("default-probe").colored_ladder,
