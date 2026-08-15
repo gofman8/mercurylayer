@@ -846,10 +846,15 @@ disclosure non-lying: [D84] — BIP-341 commits the prevout amount, so a false v
 that does not verify against the real UTXO.
 
 **REQ-58 (what the predicate MUST NOT do).** It MUST NOT ask whether `F` exists, is funded, or is
-unspent. **The SE has no chain access** — `lockbox/vcpkg.json` declares crow, openssl and cpr and no
-Bitcoin library — and any design that needs it to is unsound ([D83]). Form (c) needs only the output
-vector of a transaction the SE verified byte-for-byte; form (b) needs only facts the SE authored
-about a root **the holder verified themselves while online**.
+unspent — **not because the SE is incapable of looking, but because nothing it learned by looking
+would be trustworthy to an offline holder.** The SE runs in an operator-controlled container on an
+operator-controlled network (it already makes outbound HTTPS calls via `cpr`,
+`lockbox/src/hashicorp_api_key_manager.cpp:17`), so an operator-chosen chain endpoint reduces "the SE
+verified it" to "the SSP says so" — the [D54] failure mode. See [D83]'s corrected rationale.
+
+Form (c) needs only the output vector of a transaction the SE verified byte-for-byte; form (b) needs
+only facts the SE authored about a root **the holder verified themselves while online**. Neither asks
+the SE for knowledge it cannot honestly hold.
 
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
 raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same

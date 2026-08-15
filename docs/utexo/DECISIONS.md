@@ -3152,14 +3152,30 @@ specified is the rescue assembled from their surviving parts. **Nothing in it is
 
 ### The retraction, first
 
-**You cannot hand an offline holder a leaf on a new tree.** This is a boundary, not a missing check.
-Verifying a leaf requires reading its root `F` from the chain — value, scriptPubKey, and *unspent*
-(`clients/libs/rust/src/tesr.rs:7514`, which fetches `F` via electrum and fails if absent). An offline
-holder cannot do that, and **the SE cannot do it for them: `lockbox/vcpkg.json` declares crow, openssl
-and cpr and no Bitcoin library.** So no party can certify that a successor tree exists, is funded and
-is unspent at the moment the predecessor is destroyed. All three designs died on exactly this, in
-three disguises. **Any future proposal to "carry an offline holder onto a new tree" must first answer:
-who checks that the new root exists?**
+**You cannot hand an offline holder a leaf on a new tree.** Verifying a leaf requires reading its root
+`F` from the chain — value, scriptPubKey, and *unspent* (`clients/libs/rust/src/tesr.rs:7514`, which
+fetches `F` via electrum and fails if absent). An offline holder cannot do that, and **no party can do
+it for them in a way the holder can rely on.** All three designs died on exactly this, in three
+disguises. **Any future proposal to "carry an offline holder onto a new tree" must first answer: who
+checks that the new root exists, and why should the holder believe them?**
+
+> ⚠️ **RATIONALE CORRECTED 2026-08-15 — the first version of this decision was wrong.** It argued the
+> SE *cannot* reach the chain, citing `lockbox/vcpkg.json` (crow, openssl, cpr — no Bitcoin library).
+> **That is a capability claim and it is false:** the SE is not network-isolated. It already makes
+> outbound HTTPS calls via `cpr` (`lockbox/src/hashicorp_api_key_manager.cpp:17,66`), so it could be
+> pointed at an esplora-style endpoint tomorrow.
+>
+> **The real barrier is TRUST, not capability.** The SE runs in an SSP-operated container on an
+> SSP-controlled network, so any chain endpoint it queried would be operator-chosen. "The SE checked
+> that the successor root exists" would then be worth exactly what "the SSP says so" is worth — which
+> is the [D54] failure mode precisely: a security property sourced from the party it constrains.
+> A holder who is offline cannot distinguish an honest lookup from a fabricated one.
+>
+> This narrowing matters because it names what would actually lift the restriction: not a library, but
+> **a source of existence/unspentness knowledge the holder trusts without trusting the operator.**
+> Under re-verification (`wf_0113ef06-44f`), together with the construction that may dissolve the
+> question entirely — making the successor root an **output of the collapse transaction itself**, so
+> that its existence follows from the SE's own signature rather than from any lookup.
 
 What replaces it is better: absentees are paid **on chain, in the collapse transaction itself**, at
 one 43-vB P2TR output each. The payout and the death of the old position are the same transaction, so
