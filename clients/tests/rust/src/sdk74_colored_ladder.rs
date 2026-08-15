@@ -125,7 +125,7 @@ pub async fn execute() -> Result<()> {
     // The pin below is the same pin, aimed at the truth: `colored_ladder` ships **false** (2c351c6).
     // The lane is SOUND — that is what alice proves in this very test — but it is not the default,
     // because of the measured economics of what it switches on
-    // (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
+    // (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
     // and a 4_284-block unilateral exit for the child it produces). Keeping the pin means the
     // shipping default still cannot move without a test saying so; alice and bob opt IN explicitly,
     // ten lines up and down, so what this test proves about the lane is untouched by it.

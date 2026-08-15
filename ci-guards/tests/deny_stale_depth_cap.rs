@@ -32,13 +32,13 @@ use std::path::PathBuf;
 // folded-feature docs. They are dropped from the list, not stubbed — a guard that reads a file which
 // no longer exists fails for the wrong reason and teaches a reader to ignore it.
 const CHECKED: [&str; 7] = [
-    "docs/utexo/SPEC.md",
-    "docs/utexo/PROTOCOL.md",
-    "docs/utexo/CHILDREN.md",
-    "docs/utexo/LIGHTNING.md",
-    "docs/utexo/TRUST-MODEL.md",
-    "docs/utexo/DECISIONS.md",
-    "docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md",
+    "docs/utexo/current/SPEC.md",
+    "docs/utexo/current/PROTOCOL.md",
+    "docs/utexo/current/CHILDREN.md",
+    "docs/utexo/current/LIGHTNING.md",
+    "docs/utexo/current/TRUST-MODEL.md",
+    "docs/utexo/history/DECISIONS.md",
+    "docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md",
 ];
 
 /// Spellings of the superseded cap. Each is specific enough that an unrelated `23` cannot trip it.
@@ -83,19 +83,30 @@ fn a_document_stating_the_superseded_depth_cap_must_say_it_is_superseded() {
 
 /// The four scoping documents that carried the number are bannered rather than rewritten — their
 /// old figures are the "before" half of a labelled before/after and deleting them would falsify the
-/// record. This pins the banner so a later edit cannot quietly drop it.
+/// record. The present-state form of that protection: the document must publish the CURRENT cap and
+/// never the superseded one.
+///
+/// The banner it used to pin was a before/after record — the exact shape the clean documents in
+/// `current/` exist to be free of. Deleting the assertion with it would have been wrong: the hazard
+/// is real (this document publishes per-depth cost figures, and a reader who lifts a stale one into
+/// the spec is how the superseded number reached five documents). So the check is kept and restated
+/// against what the document SAYS rather than what it confesses.
 #[test]
-fn the_scoping_documents_that_carried_the_number_still_carry_the_correction() {
-    // 2026-08-15: three of the four scoping documents were retired. The correction banner they were
-    // pinned for survives in the one that remains, and in [D53] itself; the retired ones took their
-    // before/after records with them, which is the intended outcome of retiring them.
-    for doc in ["docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md"] {
-        let src = read(doc);
+fn the_cost_document_publishes_the_current_depth_cap_and_not_the_superseded_one() {
+    let doc = "docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md";
+    let src = read(doc);
+    assert!(
+        src.contains("depth-8") || src.contains("max_split_depth = 8") || src.contains("depth 8"),
+        "{doc} publishes per-depth cost figures but never names the mainnet cap of 8. A reader \
+         cannot tell which depths are reachable, which is how a figure measured at an unreachable \
+         depth gets lifted into the specification."
+    );
+    for stale in STALE {
         assert!(
-            src.contains("[D53] CORRECTION"),
-            "{doc} lost its D53 correction banner. It publishes depth figures that were measured \
-             against the wrong admission rule; without the banner a reader lifts them into the spec, \
-             which is exactly how 23 got into five documents."
+            !src.contains(stale),
+            "{doc} states the superseded cap (`{stale}`). Its cost figures are per-depth, so a \
+             superseded cap here is not a stale sentence — it is a price list for depths the \
+             admission rule refuses."
         );
     }
 }

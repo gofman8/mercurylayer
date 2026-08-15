@@ -2205,7 +2205,7 @@ points at rules a test would actually catch.
 **Status:** FIXED (guard + README). **Date:** 2026-08-14.
 
 `deny_line_number_citations_in_normative_docs::NORMATIVE` was a hand-list of seven.
-`docs/utexo/README.md` labels ten documents `*Normative.*`, and the three the list omitted —
+`docs/utexo/current/README.md` labels ten documents `*Normative.*`, and the three the list omitted —
 GRANULARITY-SPEC (retired 2026-08-15) (**134** citations), SUBECONOMIC-FINALITY (retired 2026-08-15) (**83**), INVALIDATION-SPEC (retired 2026-08-15)
 (**64**) — held **281** line citations between them. Two sampled at random were both rotted.
 

@@ -15,7 +15,7 @@
 //! (The complementary threat — a sender who pre-signed a stale STATE *before* transferring, then
 //! races the receiver — is defeated by the same decrementing-CSV mechanic proven in sdk40 Part 3;
 //! carrying it end-to-end THROUGH the pre-TES-R receiver additionally needs the receiver R′ upgrade,
-//! which is why sdk40's finding `num_sigs is not correct` fires — see docs/utexo/PROTOCOL.md §5.11.)
+//! which is why sdk40's finding `num_sigs is not correct` fires — see docs/utexo/current/PROTOCOL.md §5.11.)
 //!
 //! Run with SDK_E2E=41 (needs the regtest + Mercury lockbox stack, Core 28+).
 

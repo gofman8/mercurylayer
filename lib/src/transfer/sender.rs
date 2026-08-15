@@ -117,7 +117,7 @@ pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin
 /// share, leaving the child aggregate `A_child` INVARIANT (so the pre-signed child ladder stays valid)
 /// while the sender's auth key is rotated out and it is permanently locked out of the child. That is
 /// what makes a received child a FIRST-CLASS coin rather than an exit-only claim
-/// (`docs/utexo/CHILDREN.md`).
+/// (`docs/utexo/current/CHILDREN.md`).
 ///
 /// The message also sets `child_tesr_bundle` (JSON `ChildTesrBundle`) and `protocol_version = 4`; the
 /// receiver's claim() detects that field and runs `verify_child_bundle` (census + parent terminality)

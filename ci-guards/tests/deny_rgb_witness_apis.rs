@@ -1,6 +1,6 @@
 //! The `update_witnesses` / `upsert_witness` deny-list, enforced rather than conventional.
 //!
-//! E7 (docs/utexo/CTESR-GATE.md 2.3) reproduced, against the live regtest stack, that a single
+//! E7 (the CTES-R gate report (retired)) reproduced, against the live regtest stack, that a single
 //! `update_witnesses` call with the plain blockchain resolver permanently and silently archived
 //! every rung of a deliberately un-broadcast colored ladder: `succeeded=2`, `failed={}`, no error,
 //! and `get_asset_balance` unchanged at the full settled amount. The rgb-lib fork now guards the

@@ -119,7 +119,7 @@ pub async fn execute() -> Result<()> {
     // [CTES-R] The COLOURED lane is asked for BY NAME, on both wallets.
     //
     // `SdkConfig::colored_ladder` defaults to **false** (2c351c6): what keeps the lane off by
-    // default is its measured economics (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`), not any doubt
+    // default is its measured economics (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md`), not any doubt
     // about its soundness. This test is about the multi-carrier PAYMENT shape on that lane, so it
     // enables the lane rather than inheriting it — a test that asserted the default would be
     // testing the shipping decision instead. The default itself is pinned by sdk74/sdk75.

@@ -153,7 +153,7 @@ pub async fn execute() -> Result<()> {
     // [CTES-R] The COLOURED lane is asked for BY NAME, on every wallet in this test.
     //
     // `SdkConfig::colored_ladder` ships **false** (2c351c6) — the lane is sound (sdk74/sdk75) but
-    // its measured economics keep it opt-in (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`). Every
+    // its measured economics keep it opt-in (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md`). Every
     // theft this test drives is SPECIFIC to that lane: `S_0` vs `SP`, `S` vs `S'`, and the child
     // re-transfer are all rival COLOURED states over one `X_m` payload output, and none of them
     // exists on the flat lane. So the lane is enabled here rather than inherited — with it off,

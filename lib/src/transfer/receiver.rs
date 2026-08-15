@@ -1534,7 +1534,7 @@ mod transfer_signature_tests {
 
     // ---------------------------------------------------------------------------------------
     // [P0-1 / P0-2] Exit-headroom admission. The numbers below are re-derived from the mainnet
-    // schedule in `docs/utexo/PROTOCOL.md` §5.2 (D0 1440, δ 36, d_floor 144, E0 720, δE 36,
+    // schedule in `docs/utexo/current/PROTOCOL.md` §5.2 (D0 1440, δ 36, d_floor 144, E0 720, δE 36,
     // e_floor 144) and `lockheight_init = 10 000` (`server/src/server_config.rs:82`) — they are
     // asserted here so a schedule change that silently breaks the invariant is caught.
     // ---------------------------------------------------------------------------------------
@@ -1550,7 +1550,7 @@ mod transfer_signature_tests {
     ///
     /// It is retained DELIBERATELY [D31], for two reasons:
     ///   * it is the "before" half of the labelled before/after in
-    ///     `docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.2, and deleting it makes the multi-year exit
+    ///     `docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md` §1.2, and deleting it makes the multi-year exit
     ///     read as current;
     ///   * every test below that uses it is a MARGIN test, and `3 + 2d ≥ d + 4` — over-counting a
     ///     margin makes a watchtower act EARLIER, which is the safe direction. A margin fixture is

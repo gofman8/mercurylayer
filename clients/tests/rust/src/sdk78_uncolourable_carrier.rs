@@ -246,7 +246,7 @@ pub async fn execute() -> Result<()> {
     //
     // It used to read the flag off the DEFAULT and assert the default was ON. The default ships
     // **false** (2c351c6) — the lane is sound (sdk74/sdk75) but its economics keep it opt-in
-    // (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md`). So the three wallets opt in by name and the
+    // (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md`). So the three wallets opt in by name and the
     // assertion below checks the thing that is actually load-bearing here: that every wallet in
     // this test IS running the lane, which is what makes the trap reachable at all. Nothing about
     // the stranding class, the floors or the hatch changes — 1_500 sits between the same two

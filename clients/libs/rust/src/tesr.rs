@@ -3746,7 +3746,7 @@ pub fn build_colored_in_ladder_split(
     //
     // This lane is the one the rung budget hurt most: a coloured carrier never renews, so
     // `s0_csv − δ` gave it exactly ONE partial payment in its whole life
-    // (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.3).
+    // (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md` §1.3).
     if s0_csv <= SPINE_CSV {
         return Err(anyhow::anyhow!(
             "this carrier's live state has CSV {s0_csv}, which does not exceed the spine CSV \
@@ -6956,7 +6956,7 @@ pub const CHILD_V2_BASELINE: u32 = 0;
 /// What this REPLACES is `s0_csv − δ`, which consumed one state rung per split and produced the
 /// defect that made the whole design uneconomic: a coin could be partially paid from only as many
 /// times as it had rungs left, and a coloured carrier — which never renews — exactly **once, ever**
-/// (`docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md` §1.3). At zero a split consumes no rung at all, and
+/// (`docs/utexo/current/PARTIAL-PAYMENT-ECONOMICS.md` §1.3). At zero a split consumes no rung at all, and
 /// the SP contributes one block (its parent's confirmation) to the exit walk instead of ~2 124.
 ///
 /// The liveness trade this buys into is real and is stated in §4.8, not hidden: zero-CSV tiers
@@ -8613,7 +8613,7 @@ pub async fn cosign_colored_child_retransfer(
 /// STANDARD key-handover material (`transfer_signature` + blinded `t1`). The `child_coin` is the
 /// sender-owned piece slot whose `signed_statechain_id` authorises the post. The receiver picks it up
 /// in claim(), runs [`verify_child_bundle`] and then COMPLETES the handover, so the child becomes a
-/// first-class coin and the sender is locked out (`docs/utexo/CHILDREN.md`).
+/// first-class coin and the sender is locked out (`docs/utexo/current/CHILDREN.md`).
 pub async fn convey_child_bundle(
     cc: &ClientConfig,
     recipient_address: &str,
