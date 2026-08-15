@@ -3159,23 +3159,59 @@ it for them in a way the holder can rely on.** All three designs died on exactly
 disguises. **Any future proposal to "carry an offline holder onto a new tree" must first answer: who
 checks that the new root exists, and why should the holder believe them?**
 
-> ⚠️ **RATIONALE CORRECTED 2026-08-15 — the first version of this decision was wrong.** It argued the
-> SE *cannot* reach the chain, citing `lockbox/vcpkg.json` (crow, openssl, cpr — no Bitcoin library).
-> **That is a capability claim and it is false:** the SE is not network-isolated. It already makes
-> outbound HTTPS calls via `cpr` (`lockbox/src/hashicorp_api_key_manager.cpp:17,66`), so it could be
-> pointed at an esplora-style endpoint tomorrow.
+> ⚠️ **RATIONALE REPLACED TWICE. This is the third and it is the durable one.**
 >
-> **The real barrier is TRUST, not capability.** The SE runs in an SSP-operated container on an
-> SSP-controlled network, so any chain endpoint it queried would be operator-chosen. "The SE checked
-> that the successor root exists" would then be worth exactly what "the SSP says so" is worth — which
-> is the [D54] failure mode precisely: a security property sourced from the party it constrains.
-> A holder who is offline cannot distinguish an honest lookup from a fabricated one.
+> **v1 was wrong.** It argued the SE *cannot* reach the chain, citing `lockbox/vcpkg.json` (crow,
+> openssl, cpr — no Bitcoin library). That is a **capability** claim and it is false: the SE already
+> makes outbound HTTPS via `cpr` (`lockbox/src/hashicorp_api_key_manager.cpp:17,66`).
 >
-> This narrowing matters because it names what would actually lift the restriction: not a library, but
-> **a source of existence/unspentness knowledge the holder trusts without trusting the operator.**
-> Under re-verification (`wf_0113ef06-44f`), together with the construction that may dissolve the
-> question entirely — making the successor root an **output of the collapse transaction itself**, so
-> that its existence follows from the SE's own signature rather than from any lookup.
+> **v2 was true but weak.** "The barrier is trust, not capability" — the SE runs in an operator
+> container on an operator network, so any endpoint it queried is operator-chosen and "the SE verified
+> it" reduces to "the SSP says so" ([D54]'s failure mode). True, but it names only the *weakest*
+> barrier, and so reads as an invitation: *give the SE a trust-minimised oracle and the restriction
+> lifts.* **It does not lift.**
+>
+> **v3 — existence was never the binding constraint.** Grant that it is solved perfectly. Make the
+> successor root `C.vout[0]`, so its existence follows from the SE's own signature with no lookup and
+> no oracle at all. That construction genuinely works, for existence. **Three barriers remain, and the
+> first survives a perfect oracle:**
+>
+> **(1) OWNERSHIP — structural, not epistemic. This is why the retraction is permanent.**
+> Ownership moves by a key rotation only the *receiver* can drive: `calculate_t2` returns
+> `−k_receiver + t1` (`lib/src/transfer/receiver.rs:1288`), with `t1` minted per-transfer, applied by
+> the SE as `s_new = s_old + t2 − x1`. **`t1` does not exist until the migration is built, so `t2`
+> cannot be pre-computed, and the SE never learns `k_receiver`.** For an offline holder there are
+> exactly two outcomes: the SSP completes the rotation — **the SSP owns the leaf** — or the holder
+> surrendered the key in advance — **the SSP owns the leaf**. Both are custody. No oracle touches this.
+> And the tell is already in the tree: a leaf adopted without the key handover **is**
+> `protocol_version = 3`, which this codebase **deliberately deleted** —
+> `ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]` (`clients/libs/rust/src/transfer_receiver.rs:497`) and
+> *"`3` — DELETED. It was the exit-only in-ladder child, adopted without the key handover"*
+> (`lib/src/transfer/mod.rs:127`). **Any future proposal here must state in those words that it
+> reinstates v3.**
+>
+> **(2) DATA AVAILABILITY — and this is what makes form (c) categorically different, not merely
+> cheaper.** A payout requires the holder to store **zero bytes**: their seed derives the key, the UTXO
+> is on chain, Bitcoin is the enforcer. A migrated leaf requires them to hold `T`, `X`, `SP`, `ext`,
+> `state`, ancestors and flat backups (`ChildTesrBundle`, `clients/libs/rust/src/tesr.rs:341`) — which
+> they never received, **because they were offline**. The only holder of those bytes is the party that
+> profits from withholding them, and no rule of Bitcoin compels publication. Every mitigation merely
+> relocates the trust. **The construction converts an outcome guaranteed by Bitcoin into an outcome
+> guaranteed by whoever stores a blob.**
+>
+> **(3) RUNWAY is a HEIGHT fact, and the SE has no clock.** A leaf is worth its face only if its exit
+> walk fits inside its root's epoch — enforced from the live tip and `epoch_expiry_height`, the lowest
+> locktime of the root's flat chain. **At grant time the successor's flat backups do not exist yet.**
+> So even a perfectly-existing successor admits a complete, SE-invisible theft: place every absentee on
+> it, let `C` confirm, then mint a flat backup at a locktime shorter than the ~2 885-block exit walk and
+> spend the root. Every predicate returns true throughout. This is the same hole REQ-64 had to invent a
+> heightless ratchet to avoid.
+>
+> **Nothing is retracted.** The re-verification proposed withdrawing an objection to
+> existence-by-construction based on [D87] re-grantability. **D83 never contained that objection** —
+> checked before acting. Recorded because it is the failure mode this project keeps meeting from the
+> other side: *an argument attacked into existence.* Verify a claim is IN the document before
+> retracting it.
 
 What replaces it is better: absentees are paid **on chain, in the collapse transaction itself**, at
 one 43-vB P2TR output each. The payout and the death of the old position are the same transaction, so

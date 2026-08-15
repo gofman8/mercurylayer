@@ -856,6 +856,17 @@ Form (c) needs only the output vector of a transaction the SE verified byte-for-
 only facts the SE authored about a root **the holder verified themselves while online**. Neither asks
 the SE for knowledge it cannot honestly hold.
 
+**And existence is not the binding constraint anyway** ([D83] v3). Even granting a perfect existence
+oracle — e.g. making the successor root `C.vout[0]`, so it exists by the SE's own signature — an
+offline holder still cannot be migrated, for a reason no oracle touches: **ownership moves by a key
+rotation only the receiver can drive.** `calculate_t2` returns `−k_receiver + t1`
+(`lib/src/transfer/receiver.rs:1288`) with `t1` minted per-transfer, so `t2` cannot be pre-computed and
+the SE never learns `k_receiver`. Offline, either the SSP completes the rotation or the holder
+surrendered the key in advance — **both are custody**. A leaf adopted without the handover simply *is*
+`protocol_version = 3`, which this codebase deleted on purpose
+(`ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]`, `clients/libs/rust/src/transfer_receiver.rs:497`).
+**Any proposal to revive offline succession MUST say in those words that it reinstates v3.**
+
 **REQ-64 (THE FREEZE IS TWO-PHASE, AND THE ANNOUNCED BOUNDARY IS THE ENFORCED ONE).**
 A first draft of this section made `H_f` a published *height* and the freeze a consequence of the SSP
 choosing to stop conveying. That is wrong twice over and both defects are fixed here:
