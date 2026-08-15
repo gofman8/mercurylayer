@@ -3316,6 +3316,14 @@ watchtowers observe the boundary **without asking the SSP**. `H_f` is demoted to
 | **any state update** (pay, split, re-transfer, renew) | at that moment | **the announcement** — publicly attested |
 | **migrate + release** (stay off-chain rather than be cashed out) | during R1–R3 | the announcement |
 
+**Defect 3, found one question later — a conveyed-but-unreleased migration is a DOUBLE PAYMENT.**
+R1 protects the holder, R2 protects the SSP, and the spec named neither. If the SSP conveys a
+replacement and the holder never claims or releases, the old leaf is still in the frontier, so REQ-56
+forces `C` to pay them on chain *as well as* the leaf they already hold on `B`. Fixed as REQ-66: before
+announcing, the SSP must obtain the release or cancel and reclaim the conveyance (`apply_cancel`,
+`reclaim_cancelled_conveyance`, both extant). Note the direction again — **the holder is never at risk
+either way**; the exposure is entirely the operator's, which is why the ordering can be left to them.
+
 **The general lesson, and it is the fourth instance:** the spec was written to describe the honest
 path and did not ask *what the user can observe*. [D54] was a security property sourced from the party
 it constrains; this is a **deadline** sourced from the party it constrains. Both are the same error —

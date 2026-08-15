@@ -890,6 +890,20 @@ From that record onward the SE MUST:
 `H_f` is retained as an advisory UX hint published at R0 ("we intend to announce at about this
 height"). **The enforced, publicly observable boundary is the announcement.**
 
+**REQ-66 (a conveyed-but-unreleased migration is a DOUBLE PAYMENT — the SSP MUST clear it).**
+R1 and R2 protect different parties and MUST happen in that order: **migration protects the holder**
+(they hold and have verified the replacement before giving anything up), **release protects the SSP**
+(without it the old leaf is still in the frontier, so REQ-56 forces `C` to pay them on chain *as well
+as* the leaf they already hold on `B`).
+
+So a migration that is conveyed and then neither claimed nor released is a leaf the SSP pays for
+twice. Before `announce_freeze` the SSP MUST therefore, for every outstanding migration, either
+obtain the release or **cancel the conveyance and reclaim it** (`apply_cancel`,
+`server/src/database/transfer_cancel.rs:131`; `reclaim_cancelled_conveyance`,
+`clients/libs/rust/src/tesr.rs:9276`). A round announced with unresolved conveyances is an
+operator-funded overpayment, not a protocol fault — **the holder is never at risk in either
+direction**, which is why the ordering is safe to leave to the operator.
+
 **REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
 `establish_leaf` from the witnessed `state_child.vout[0]`, which is **the payee's key** — conveyance
 builds the child's tiers to the receiver's address. So a payee who was paid and **never claimed at
