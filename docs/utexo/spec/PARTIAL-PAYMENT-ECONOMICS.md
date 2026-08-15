@@ -213,7 +213,7 @@ is still exitable but can never make another partial payment. Worked at V = 1 00
 nominal delivered, 811 800 exitable, **185 610 sat (18.56 % of the deposit) burned**, and the
 survivor is a **3 570-sat** depth-90 coin worth **2 590** on exit.
 
-Spine-tip floors are lower — exitable at **945**, splittable at **2 706** (coloured 3 050) — so the
+Spine-tip floors are lower — exitable at **945**; the splittable floor is not a publishable literal (see below) — so the
 reach extends to ~94 payments at K = 1 and further under batching, with 147 734 sat (14.8 %) of
 reserve.
 
@@ -561,7 +561,7 @@ Two named lane refusals, both current:
   `ci-guards/tests/deny_uncoloured_legs_under_a_coloured_sp.rs`.
 * Carrier sizing is two named lanes: `LEGACY_CARRIER_SEND_DEPTH = 5` and
   `CTESR_CARRIER_SEND_DEPTH = 1` (`clients/libs/rust-sdk/src/tokens.rs`), with
-  `TOKEN_CARRIER_SATS = 17 384` sized for the LEGACY lane (the max of the two; the CTES-R lane needs
+  `TOKEN_CARRIER_SATS = 22 536` sized for the LEGACY lane (the max of the two; the CTES-R lane needs
   6 362) — a stated over-provision.
 
 ### 7.5 What the blind SE signs
@@ -768,8 +768,15 @@ Each item is a live property, stated with the reason it must keep being true.
   i.e. the exact opposite of a leaf — while still returning `Ok`. The in-process tower
   (`auto_exit_due`) covers leaves, which is what hides it: delegating to a third-party tower can
   protect the parents and leave the children unwatched.
-- **Minimum parent value** for a K-batch: `1 396K + 1 560` sat (K=1 → 2 706; K=10 → 15 270;
-  K=20 → 29 230). Below it, K falls back. Coloured carriers at `TOKEN_CARRIER_SATS = 17 384` support
+- **Minimum parent value** for a K-batch: `K · floors.piece + floors.change`, where
+  `split_output_floors` takes each leg as `max(min_split_output(backup_rate), lane_floor(committed_rate))`.
+  **This is deliberately not quoted as a number.** It is a function of TWO independent rates — the
+  committed rate the tiers are signed at, and the backup fee rate read from the live network
+  (`min_split_output` = `DUST_LIMIT + ceil(BACKUP_TX_VBYTES · backup_rate)`) — combined through a
+  `max`. No literal is correct across configurations, and every literal previously published here
+  was an evaluation at one particular pair of rates. Evaluate `split_output_floors` for the rates
+  you are running. (K=10 → 15 270;
+  K=20 → 29 230). Below it, K falls back. Coloured carriers at `TOKEN_CARRIER_SATS = 22 536` support
   K ≤ 4 and must be re-sized at issue.
 
 ---
