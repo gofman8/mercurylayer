@@ -103,6 +103,7 @@ pub mod sdk86_received_coin_ages;
 pub mod sdk87_carrier_deadline;
 pub mod sdk88_carrier_headroom;
 pub mod sdk89_plain_detrigger;
+pub mod sdk90_transfer_window_lapse;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -541,6 +542,12 @@ async fn main() -> Result<()> {
     // [D68] The PLAIN de-trigger, wired at last: `cosign_detrigger` had zero production callers.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("89") {
         sdk89_plain_detrigger::execute().await?;
+        return Ok(());
+    }
+
+    // [D85 / SPEC REQ-61] The open-transfer window, MEASURED — the first live evidence for §5.4.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("90") {
+        sdk90_transfer_window_lapse::execute().await?;
         return Ok(());
     }
 
