@@ -3,6 +3,9 @@ name = "ci-guards"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Repo invariants enforced as tests (no dependencies, always cheap to run)"
+description = "Repo invariants enforced as tests. The guards themselves stay dependency-free and cheap; the sighash vector emitter is the one exception and is gated behind its own feature so a plain `cargo test -p ci-guards` never pays for it."
 
 [dependencies]
+
+[dev-dependencies]
+bitcoin = { version = "0.32", features = ["serde"] }

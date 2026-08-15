@@ -45,7 +45,8 @@ set(LOCKBOX_SOURCES
     src/filesystem_key_manager.cpp
     src/enclave.cpp
     src/monocypher.c
-    src/db_manager.cpp)
+    src/db_manager.cpp
+    src/tx.cpp)
 
 if(WITH_GOOGLE_KMS)
     list(APPEND LOCKBOX_SOURCES src/google_key_manager.cpp)
