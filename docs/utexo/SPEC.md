@@ -924,6 +924,35 @@ obtain the release or **cancel the conveyance and reclaim it** (`apply_cancel`,
 operator-funded overpayment, not a protocol fault — **the holder is never at risk in either
 direction**, which is why the ordering is safe to leave to the operator.
 
+**REQ-67 (THE ABSENTEE'S PROTECTION MUST BE CRYPTOGRAPHIC, NOT THE SE PREDICATE ALONE).**
+REQ-56 says the SE refuses a collapse that does not pay every unreleased leaf, and §5.4 justified
+putting the rule there because "the SE's co-signature is the only refusal that binds" ([D54]'s lesson).
+**That justification is incomplete and must not be relied on alone.** In production the lockbox and the
+coordinator are the **same operator**, and the lockbox is a plain container, not an attested enclave —
+so REQ-56 is a rule enforced by software the SSP controls. For an ONLINE holder this is harmless: they
+verified their successor leaf themselves and hold its key share. **For an ABSENTEE it is the whole of
+their protection, and it is the [D54] shape again — one level up.**
+
+The consequence is concrete: once `C` confirms, every tier beneath `F` is dead, so an absentee who was
+not paid has **no recourse at all**. Their only remedy is to act *before* `C` confirms.
+
+So the absentee's protection MUST rest on something the operator cannot alter:
+
+1. **A watchtower MUST check pending collapses.** `C` is public from the moment it is broadcast. A
+   tower holding a `WatchBundle` for a leaf MUST, on seeing any spend of its root's `F`, check whether
+   an output pays its holder's `exit_key` at ≥ the leaf's funding value, and if not **broadcast `T`
+   immediately** — which invalidates `C` (both spend `F`) and preserves the whole tree. This needs no
+   key (`T` is pre-signed) and no trust in the operator.
+2. **The `WatchBundle` MUST therefore carry `exit_key` and `funding_value`**, so the check is
+   self-contained.
+3. **Wallet defaults MUST run this**, and the product docs MUST say plainly that an absentee's
+   protection is their tower, not the operator's good behaviour.
+
+With the tower, the SE predicate becomes what it should be — **the mechanism that makes the honest
+path cheap and the dishonest path detectable-and-defeatable**, rather than the sole thing standing
+between an absent user and their money. Without it, form (c) is custodial in substance for anyone who
+is not watching. **State this in those words wherever the round's trust model is described.**
+
 **REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
 `establish_leaf` from the witnessed `state_child.vout[0]`, which is **the payee's key** — conveyance
 builds the child's tiers to the receiver's address. So a payee who was paid and **never claimed at
