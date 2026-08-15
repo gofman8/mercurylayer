@@ -798,7 +798,7 @@ root, so a round both retires and re-funds in one transaction — there is no se
 | **R1** | MIGRATE — for each responding holder, an ordinary in-ladder split on `B` conveying a leaf of **identical funding value**. The holder runs the **complete existing verifier unchanged** (`verify_conveyed_child` → `verify_child_bundle`, `f_spender` against a **confirmed** `F_B`, `cap_schedule`, `check_exit_headroom_with_margin`, `attested_terminal`, Model A, value conservation both ways) and takes first-class ownership. *This is not a new mechanism. It is a payment.* | the holder, fully, **with no new trust** |
 | **R2** | RELEASE — `POST /release {sid, nonce32, sig}`, BIP-340 under the leaf's latch key over `tagged("utexo/leaf_release/v1", sid‖nonce32)`. Monotone, never cleared, single-use nonce. **A consent record, not a spending authorisation** | the SE |
 | **R3** | MANDATE HARVEST (optional) — form (b) holders migrated under SE enforcement | the SE |
-| **R4** | FREEZE — the SSP posts `announce_freeze` (REQ-64). From that instant the frontier can no longer GROW: the SE refuses new establishments under `A`, while releases and migrations *away* from `A` still work. Late arrivals join the payout set | **everyone**, from the attestation |
+| **R4** | NOTICE — the SSP publishes its intent to discharge. **Advisory only: nothing stops, nothing is ratcheted.** Wallets seeing it SHOULD prefer migrating over paying from `A`, so honest traffic drains voluntarily. Late arrivals join the payout set | everyone |
 | **R5** | BUILD `C` — one input, one output per undischarged leaf, plus the future root and a CPFP handle | — |
 | **R6** | GRANT — `POST /collapse_grant {root_sid, disclosure(C)}`; the SE runs REQ-56, sets `frozen` **prospectively**, issues the partial signature | the SE, from state it authored |
 | **R7** | BROADCAST — **one transaction** retires `A`, pays every undischarged holder in full at their own key, and funds the next root | the chain |
@@ -867,39 +867,48 @@ surrendered the key in advance — **both are custody**. A leaf adopted without 
 (`ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]`, `clients/libs/rust/src/transfer_receiver.rs:497`).
 **Any proposal to revive offline succession MUST say in those words that it reinstates v3.**
 
-**REQ-64 (THE FREEZE IS TWO-PHASE, AND THE ANNOUNCED BOUNDARY IS THE ENFORCED ONE).**
-A first draft of this section made `H_f` a published *height* and the freeze a consequence of the SSP
-choosing to stop conveying. That is wrong twice over and both defects are fixed here:
+**REQ-64 (THE ROUND MUST NEVER SUSPEND SERVICE — the frontier is allowed to move).**
+Two earlier drafts of this rule were wrong in opposite directions, and the second was worse.
 
-* **The announced deadline was not the real deadline.** `frozen` is set at R6, when the SSP posts the
-  grant — a moment no holder can observe. A user's true cutoff must never be a moment only the
-  operator knows.
-* **The frontier could move under `C`.** Between `H_f` and the grant, a holder could still split their
-  own leaf: co-signatures are live until the freeze, `establish_leaf` registers the new node, and
-  REQ-56 recomputes the frontier at grant time — so the grant is refused and `C` must be rebuilt.
-  Repeated, the round never completes. This is a **liveness** defect, not a theft one (the predicate
-  fails closed and nobody is under-paid), but R4's original "nothing is ratcheted yet" was false.
+*Draft 1* let `frozen` be set only at the grant, so a holder's real cutoff was a moment only the
+operator could see. *Draft 2* fixed that with an `announce_freeze` ratchet that stopped new
+establishments under the root — **and thereby stopped every holder on that tree from paying anyone,
+for an unbounded window, with no escape and no deadline.** That converts an operator inconvenience
+(rebuilding `C`) into a **user-facing outage**, and an SSP that announces and then stalls — through
+malice or a crash — freezes an entire tree until its epoch runs out. **Trading user outage for
+operator convenience is always the wrong direction.** Both drafts are withdrawn.
 
-The fix needs **no trusted clock**, which matters because the SE has no trustworthy source of chain
-height ([D83], corrected rationale — an operator-chosen endpoint is worth what the operator's word is
-worth). Instead the boundary is a **monotone one-way ratchet**, exactly parallel to `sig_budget`:
+**The rule: there is no establishment freeze. Holders keep transacting normally, right up to the
+instant the grant is issued.** The only freeze is the one REQ-56 already performs *atomically inside*
+`collapse_grant` — the frontier is recomputed and `frozen` is set in the same call, so no leaf can
+appear between the check and the ratchet.
 
-```
-POST /announce_freeze { root_sid }        -- monotone, never cleared, idempotent
-```
+**If the frontier moved since `C` was built, the grant is REFUSED and the SSP rebuilds `C`.** That is
+the whole cost, and it falls on the operator, never on a user. Compare REQ-66: the same principle.
 
-From that record onward the SE MUST:
-1. **REFUSE `establish_leaf` under that root** — the frontier can never grow again, so the set `C`
-   must pay is fixed the moment it is announced;
-2. **CONTINUE to accept `/release` and migrations AWAY from the root** — announcing must not strand
-   anyone who is mid-migration;
-3. **REFUSE `collapse_grant` unless the root is announce-frozen** — so a grant can never precede the
-   public notice;
-4. **carry `announce_frozen` in its attestation**, so any holder or watchtower can observe the
-   boundary without asking the SSP.
+**REQ-64a (the round provably terminates).** The obvious worry is a rebuild loop — an adversary
+splitting repeatedly so the frontier never settles. It cannot run forever: derived slots are a
+**per-parent LIFETIME allowance** (`count_derived_tokens`, `server/src/database/deposit.rs:193` —
+*"spent tokens included, deliberately … else a parent could mint, consume, and re-mint free slots
+forever"*), and depth is capped. So the total number of establishments possible beneath a root is
+**bounded before the round begins**, and the frontier can only move finitely many times. Each move
+also costs the mover four SE co-signatures and real fees. **Termination is structural, not
+economic** — the economics merely make griefing pointless as well as futile.
 
-`H_f` is retained as an advisory UX hint published at R0 ("we intend to announce at about this
-height"). **The enforced, publicly observable boundary is the announcement.**
+**REQ-64b (a refused co-signature MUST say why).** When `collapse_grant` has already frozen a root,
+subsequent co-signature refusals under it MUST be distinguishable from any other failure and MUST name
+the successor root, so a wallet retries on `B` instead of surfacing an error. A user whose payment
+lands just after a grant experiences **a clean refusal and a retry** — never a loss, never a silent
+failure. This is why the unobservable-instant objection of draft 1 does not survive: it only mattered
+because draft 1's failure mode was ambiguous.
+
+**REQ-64c (exit is NEVER suspended).** At every moment of a round — before the notice, during it,
+after the grant, after the collapse confirms — any holder can broadcast `T` and walk their own exit.
+`T` is fully pre-signed, carries no timelock, and needs **no SE, no coordinator, and no SSP**
+(`WatchBundle` carries "only fully-signed transactions and public metadata",
+`clients/libs/rust-sdk/src/watchtower.rs:189`). **No holder is ever trapped, including one whose leaf
+is near its epoch deadline** — which is the case that makes an outage unacceptable rather than merely
+annoying.
 
 **REQ-66 (a conveyed-but-unreleased migration is a DOUBLE PAYMENT — the SSP MUST clear it).**
 R1 and R2 protect different parties and MUST happen in that order: **migration protects the holder**

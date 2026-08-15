@@ -3360,6 +3360,34 @@ announcing, the SSP must obtain the release or cancel and reclaim the conveyance
 `reclaim_cancelled_conveyance`, both extant). Note the direction again — **the holder is never at risk
 either way**; the exposure is entirely the operator's, which is why the ordering can be left to them.
 
+**Defect 4 — AND IT WAS MY OWN FIX. [D91]'s `announce_freeze` created a user-facing OUTAGE.**
+Owner, immediately: *"this means that after announcement and till deadline there's no new state
+transitions/coin splits possible? so system doesn't work at this time for those who have coins which
+about to expire?"* **Yes — exactly that, and it is worse than the defect it repaired.** Stopping new
+establishments under a root stops every holder on that tree from paying anyone, for a window nothing
+bounds, with no escape. An SSP that announces and then stalls — malice or a crash — freezes the tree
+until its epoch runs out. **I converted an operator inconvenience (rebuild `C`) into a denial of
+service on honest users.**
+
+**Withdrawn. REQ-64 is now the opposite rule: the round MUST NEVER SUSPEND SERVICE.** No establishment
+freeze; holders transact right up to the grant; the only freeze is the one REQ-56 already performs
+atomically inside `collapse_grant`. If the frontier moved, the grant is refused and **the SSP rebuilds
+`C`** — the cost falls on the operator, never a user.
+
+**And the freeze was never needed, because the round provably terminates without it.** Derived slots
+are a **per-parent LIFETIME allowance** (`count_derived_tokens`, `server/src/database/deposit.rs:193`:
+*"spent tokens included, deliberately … else a parent could mint, consume, and re-mint free slots
+forever"*), and depth is capped — so the number of establishments possible beneath a root is bounded
+before the round starts, and the frontier can move only finitely many times. **Termination is
+structural.** [D91]'s defect 2 was real but its remedy was reaching for a lock where a bound already
+existed.
+
+Two riders make the no-freeze rule safe: a post-grant refusal MUST name the successor root so wallets
+retry rather than error (REQ-64b) — which is why draft 1's unobservable instant no longer matters,
+since the failure is now a clean retry rather than an ambiguous error; and **exit is never suspended
+at any point in a round** (REQ-64c), `T` being pre-signed and needing no SE, coordinator or SSP. That
+last one is what makes the near-deadline case safe rather than merely tolerable.
+
 **The general lesson, and it is the fourth instance:** the spec was written to describe the honest
 path and did not ask *what the user can observe*. [D54] was a security property sourced from the party
 it constrains; this is a **deadline** sourced from the party it constrains. Both are the same error —
