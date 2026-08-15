@@ -3392,3 +3392,49 @@ last one is what makes the near-deadline case safe rather than merely tolerable.
 path and did not ask *what the user can observe*. [D54] was a security property sourced from the party
 it constrains; this is a **deadline** sourced from the party it constrains. Both are the same error —
 **if a rule binds a user, the user must be able to see it fire.**
+
+## [D92] MEASURED: the one-hour window is the only server-side gate, and a bypassing payer gets a session once it lapses
+
+**`SDK_E2E=91`, live regtest stack, 2026-08-15.** The first observation of this; it had been argued
+in [D85] and asserted nowhere.
+
+```
+[a] raw /sign/first INSIDE  the window -> HTTP 409  "coin has an open transfer …"
+[b] transfer row aged 2h past updated_at (1 row)
+[c] raw /sign/first OUTSIDE the window -> HTTP 200  {"server_pubnonce":"0x02ec1163…"}
+```
+
+**What was done.** Alice conveys a coin whole to Bob; Bob never claims. Alice then POSTs
+`/sign/first` **directly to the coordinator**, bypassing her own client, authenticating with her own
+`signed_statechain_id` — which she legitimately still holds, because the handover has not completed.
+Nothing is forged. The "attack" is: use your own credential, skip your own software.
+
+**Why it took two prior tests to see.** `sdk90` tried this through the client twice and measured the
+CLIENT twice — first the wallet's coin lookup, then [D145]'s sender-side outstanding-conveyance
+refusal. Both are local, both are the payer's own code, and **a payer who wants to cheat runs
+neither.** That is why `sdk90`'s green run concluded nothing about the server, and said so.
+
+**The finding.** The coordinator's `has_open_transfer` gate is real and fires correctly (409) while
+the window is open. **Once the hard-coded `INTERVAL '1 hour'` lapses it issues the session.** So the
+window is not one defence among several on this path — with the client bypassed, it is the ONLY one,
+and it is a wall-clock timer that expires whether or not the payee has claimed.
+
+**SCOPE — do not report this as more than it is.** A `sign/first` session is the FIRST LINK of the
+chain `has_open_transfer`'s own comment describes, not a completed theft: `sign/second` and a
+broadcast race against the payee's strictly-lower-CSV state still stand between it and money moving.
+In this run Bob claimed his 120,000-sat coin intact. What is now measured is that the first link is
+reachable; the remaining links are not tested and must not be assumed either way.
+
+**Consequence for the spec.** [D85] / SPEC REQ-61's owner latch is no longer justified by argument —
+`latch_key := xonly(state_child.vout[0].spk)` binds every subsequent co-signature to the PAYEE's key,
+which is a fact about ownership rather than about elapsed time, and it is the only proposed mechanism
+that closes this. `EXPECT_LATCH=1` is wired into both tests and turns the recording into an assertion
+the day it ships. **Until then the honest statement in any trust write-up is: a conveyed-but-unclaimed
+coin is protected server-side by a one-hour timer, and by client-side gates the adversary chooses
+whether to run.**
+
+**Method note worth keeping.** Both tests assert on the HTTP STATUS, not the message prose, precisely
+so a reworded refusal cannot silently turn a measurement into a tautology — and `sdk91` refuses to
+report anything if it sees `401`, because an unauthenticated probe measures the auth check and never
+reaches the gate. Three drafts of this experiment measured the wrong thing; the guard against a fourth
+is in the test itself.

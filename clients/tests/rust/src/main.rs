@@ -104,6 +104,7 @@ pub mod sdk87_carrier_deadline;
 pub mod sdk88_carrier_headroom;
 pub mod sdk89_plain_detrigger;
 pub mod sdk90_transfer_window_lapse;
+pub mod sdk91_malicious_payer_window;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -548,6 +549,12 @@ async fn main() -> Result<()> {
     // [D85 / SPEC REQ-61] The open-transfer window, MEASURED — the first live evidence for §5.4.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("90") {
         sdk90_transfer_window_lapse::execute().await?;
+        return Ok(());
+    }
+
+    // [D85 / REQ-61] The malicious payer: bypass the client, probe the coordinator's window directly.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("91") {
+        sdk91_malicious_payer_window::execute().await?;
         return Ok(());
     }
 
