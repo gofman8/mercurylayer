@@ -735,6 +735,16 @@ true at realistic payment velocities.
 > **Status: DESIGN, not built.** Every claim in this section is grounded in a source scan, which by
 > this project's evidence rule (§0.2) establishes presence, absence and ordering — **never
 > reachability, binding or behaviour**. Nothing here has been plant-and-run.
+> **The cryptographic prerequisite is verified present.** SE-side witness binding needs a *blinded*
+> `nonce_process` matching the blinded partial-sign the lockbox already calls, so the SE can
+> reconstruct a signing session from a disclosed transaction and byte-compare it. The pinned fork
+> exports `secp256k1_blinded_musig_nonce_process_without_keyaggcoeff(ctx, session, aggnonce, msg32,
+> aggregate_pubkey, adaptor, blinding_factor, tweak32)`, verified in the built lockbox image. `msg32`
+> is where the BIP-341 sighash of the disclosed transaction goes, which fixes what a disclosure must
+> carry: the aggregate nonce, the aggregate pubkey, the blinding factor, the output tweak, and enough
+> of the transaction to recompute the sighash. `deny_blinded_session_prerequisite_drift` pins the fork
+> and the API family so this cannot change unnoticed.
+>
 > The enforcement point is empty today: `disclosure` and `prevout_value` occur 83× in the client and
 > **0× in `lockbox/`**, so the SE would presently co-sign a collapse that pays out nobody.
 
