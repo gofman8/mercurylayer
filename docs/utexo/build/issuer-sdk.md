@@ -1,31 +1,37 @@
 # Issuer SDK guide
 
-Token issuance is part of `UtexoWallet` (any wallet can be an issuer — RGB has no privileged
-issuer role beyond holding the contract's issuance rights).
-
-> **The coin your asset lives on is deliberately un-laddered.** Every plain BTC deposit is laddered
-> at claim with TES-R (trigger → extension → state, relative CSV, pre-signed and un-broadcast — see
-> [getting started §4](getting-started.md)). An RGB **carrier** never is: a plain tier spend would
-> sweep the carrier's sats and destroy the allocation, so `claim()` explicitly skips carriers when it
-> establishes ladders (terminal-freeze, [PROTOCOL.md §5.10](../PROTOCOL.md) rule 1, pinned by
-> `sdk52`: in one wallet the plain coin carries a ladder, the carrier carries none). A carrier keeps
-> the **signed-once backup** and moves by colored split + backup-chain handover. That is the current,
-> load-bearing shape for RGB — not a legacy lane — and it is why the calendar in
-> [Over time](#over-time-what-you-and-your-holders-actually-have-to-watch) applies to tokens while
-> plain laddered coins have no deadline at all.
+Token issuance is part of `UtexoWallet`. Any wallet can be an issuer — RGB has no privileged issuer
+role beyond holding the contract's issuance rights.
 
 Token calls need RGB configured (`rgb_proxy_url` + `rgb_data_dir`), otherwise you get
 `SdkError::TokensNotConfigured`. `SdkConfig::regtest(name)` fills both in; `SdkConfig::mainnet(…)`
 leaves them `None` for you to set.
+
+> **The coin your asset lives on is un-laddered on the shipped configuration.** Every plain BTC
+> deposit is laddered at claim — trigger → extension → state, relative CSV, pre-signed and
+> un-broadcast (see [getting started §4](getting-started.md)). An RGB **carrier** is not: a plain
+> tier spend is sats-only and would destroy the allocation, so `claim()` leaves carriers off the
+> plain ladder (terminal freeze, [PROTOCOL.md](../spec/PROTOCOL.md) §5.10). `SdkConfig::colored_ladder`
+> — the flag that would give a carrier a *coloured* ladder instead — ships **false** in both
+> constructors, so on the defaults a carrier keeps the **flat signed-once backup** and moves by
+> colored split plus backup-chain handover. That is the load-bearing shape for assets, and it is why
+> the whole of [Over time](#over-time-what-you-and-your-holders-actually-watch) is about absolute
+> locktimes: a carrier has no CSV tier chain, so its exit is not calendar-free the way a laddered
+> coin's is.
+>
+> The exclusion is *conditional, not structural*: with `colored_ladder = true` a single-allocation
+> carrier reaches `build_colored_ladder_auto` and is laddered, coloured. That lane is exercised by
+> `sdk02`, `sdk29`, `sdk31`, `sdk32` and `sdk34`, each of which asks for it by name. The shipped
+> default is what `sdk09`, `sdk36`, `sdk39` and `sdk52` run.
 
 ## Launch a token (NIA — fixed supply)
 
 ```rust
 let (issuer, _) = UtexoWallet::initialize(SdkConfig::regtest("issuer"), None).await?;
 
-// 1. Fund the RGB engine (one-time): issuance needs a colorable UTXO + witness fees.
-let fund = issuer.get_token_funding_address().await?;
-// send ~100k sats to `fund` and confirm…  (sdk52 sends 100k; sdk09 sends 500k because it also mints)
+// 1. Fund the RGB engine (one-time): issuance needs colorable UTXOs + witness fees.
+let fund = issuer.get_token_funding_address().await?;   // get_token_l1_address is an alias
+// send sats to `fund` and confirm…
 
 // 2. The carrier occupies a statechain slot like any deposit — it consumes one deposit token.
 issuer.add_prepaid_token(&token_id).await;   // or handle SdkError::TokenPaymentRequired and retry
@@ -35,18 +41,43 @@ let asset_id = issuer.issue_token("DEMO", "Demo Token", /*precision*/ 2, /*suppl
 println!("token id: {asset_id}");   // rgb:…  — share this as the token identifier
 ```
 
-One on-chain transaction total: the colored deposit that binds the supply to a carrier coin funded
-with 10,000 sats. After it confirms — `claim()`, or the `DepositConfirmed` watcher event — the entire
-supply transacts off-chain (`sdk02`).
+**How much to send to the funding address.** The engine sizes every colorable UTXO it makes at
+`TOKEN_CARRIER_SATS × 4`. An NIA issuance makes one; an IFA makes `inflation_amounts.len() + 2` —
+one per allocation (the fungible supply and each inflation right, since `max_allocations_per_utxo`
+is 1) plus a spare for the fund and witness transactions. Everything left over pays for those
+transactions. On regtest the live flows use 100 000 sats for a plain NIA issuance (`sdk02`,
+`sdk52`), 500 000 when a mint follows (`sdk09`) and 600 000 for repeated distribution (`sdk39`).
+
+Two on-chain transactions get an asset onto a statechain: the engine's colorable-UTXO creation, and
+the colored deposit that binds the supply to the carrier. After that confirms — `claim()`, or the
+`DepositConfirmed` watcher event — the entire supply transacts off-chain (`sdk02`).
+
+### The carrier is 22 536 sats, and that number is derived
+
+`TOKEN_CARRIER_SATS` = `legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH)` =
+`5 · (TOKEN_PIECE_SATS + 300) + 666` = **22 536**. Each flat send consumes one
+`TOKEN_PIECE_SATS`-sized piece plus a floored fee reserve, and the last change must still clear the
+sub-coin floor `min_split_output` (666 sat at the committed 3 sat/vB). So a stock carrier affords
+**five chained sends** on the shipped flat lane. On the coloured lane the same 22 536 buys exactly
+**one** send, with the rest landing in a depth-1 change child that can only be moved whole or
+exited — a real cost of that lane, not a rounding.
+
+`issue_token_sized`, `issue_inflatable_token_sized` and `mint_tokens_sized` take the carrier's sats
+as an argument. They exist to reproduce and migrate **under-sized** carriers — a carrier funded
+below the coloured root floor can never be laddered, and the migration hatch that serves that class
+needs a way to construct it — not as a knob for ordinary issuance.
 
 Two practical consequences of the carrier being a special coin:
 
-- **Its sats are not spendable BTC.** Carrier value is excluded from `available_sats` /
-  `pending_sats` / `in_transfer_sats` and surfaces only through `balance.tokens`, because a plain-BTC
-  spend of that outpoint would destroy the allocation. Budget the 10,000 sats as part of the asset,
-  not as change. (`sdk09` counts confirmed coins rather than sats for exactly this reason.)
-- **It never gets a ladder**, so no `LadderEstablished` event fires for it and there is nothing to
-  renew or roll over.
+- **Its sats are not spendable BTC.** Carrier value is excluded from `Balance::available_sats` /
+  `pending_sats` / `in_transfer_sats` and surfaces only through `Balance::tokens`, because a
+  plain-BTC spend of that outpoint would destroy the allocation. Budget the 22 536 sats as part of
+  the asset, not as change. (`sdk09` counts confirmed coins rather than sats for exactly this
+  reason.)
+- **It gets no plain ladder**, so no `LadderEstablished` event fires for it. `claim()` records
+  `LadderSkipReason::RgbCarrier` instead, readable back through `ladder_skip_reason` /
+  `flat_only_coins` — with `may_still_be_transferred == true`, because that reason is structural and
+  the coin still moves on the flat lane.
 
 ## Inflatable supply (IFA): mint and burn
 
@@ -54,20 +85,25 @@ Two practical consequences of the carrier being a special coin:
 // 1000 units now, plus a 500-unit inflation right reserved for later.
 let asset = issuer.issue_inflatable_token("IFT", "Inflatable Token", 0, 1_000, vec![500]).await?;
 
-// Realize the inflation right. This IS on-chain — inflation is a contract state transition, there is
-// no off-chain variant: one inflate tx in the RGB engine, then the minted supply is bound to a FRESH
-// carrier coin (another colored deposit). mint_tokens waits for the inflate to confirm, so the chain
-// must be advancing (on regtest: run a miner).
+// Realize the inflation right. This IS on-chain — inflation is a contract state transition and
+// there is no off-chain variant: one inflate tx in the RGB engine, then the minted supply is bound
+// to a FRESH carrier coin (another colored deposit). mint_tokens waits for the inflate to confirm,
+// so the chain must be advancing (on regtest: run a miner).
 let (inflate_txid, minted) = issuer.mint_tokens(&asset, vec![500]).await?;   // minted == 500
 
-// Burn engine-held (free) balance — also on-chain. Supply already bound to a statechain carrier must
-// be exited back into the engine first.
+// Burn engine-held (free) balance — also on-chain. Supply already bound to a statechain carrier
+// must be exited back into the engine first.
 let burn_txid = issuer.burn_tokens(&asset, 100).await?;
 ```
 
+IFA issuance creates one colorable UTXO per allocation — the fungible supply and each inflation
+right — before issuing (SPEC REQ-19), and binding the supply consumes only the fungible allocation,
+never the reserved right (INV-12). `mint_tokens` snapshots the allocation set *before* inflating and
+binds only what is new, so a mint can never consume already-bound supply (REQ-20).
+
 An NIA has no post-issuance mint: its supply is fixed by the contract at issuance. Issue an IFA if
-you need inflation, and declare the inflation rights up front — holders can read them off the
-contract. Issue → mint → distribute is verified end to end by `sdk09`.
+you need inflation, and declare the rights up front — holders read them off the contract. Issue →
+mint → distribute is verified end to end by `sdk09`.
 
 After a mint you hold the asset across **two carriers**. That is normal; distribution handles it
 (see combine, below).
@@ -85,32 +121,43 @@ let results = issuer
     .await?;
 ```
 
-What a distribution actually does: the carrier is terminalized at the SE (one final co-signature),
+What a distribution does: every input carrier is terminalized at the SE (one final co-signature),
 the colored split is co-signed once, and each piece becomes a fresh sub-coin carrying
-`TOKEN_PIECE_SATS = 1_500` sats of packaging plus the exact token amount as payload. Each piece gets
-its **own fresh signed-once backup at the full initial locktime** — the ladder mechanics never enter
-this path, which is why an issuer can keep distributing indefinitely no matter how long the carrier
-has been sitting still. Holders receive, validate the consignment client-side, and re-transfer with
-the standard wallet SDK; there is no issuer involvement after issuance.
+`TOKEN_PIECE_SATS` = **4 074** sats of packaging plus the exact token amount as payload. Each piece
+gets its **own fresh signed-once backup at the full initial locktime** — no ladder mechanics enter
+this path, which is why an issuer keeps distributing no matter how long the carrier has been
+sitting. Holders receive, validate the consignment client-side, and re-transfer with the standard
+wallet SDK; there is no issuer involvement after issuance.
 
-Slots for the piece and the change are **derived** from the carrier (free SE vouchers) — distributing
-does not burn paid onboarding tokens the way issuance does.
+**Why 4 074 and not a round number.** The piece is a coin like any other: its receiver claims it,
+and if the carrier is coloured that claim wants a coloured root ladder. A coloured rung costs
+`ceil(colored_tier_vbytes(1) · rate) + P2A` = 744 sat at the committed 3 sat/vB, so a coloured root
+ladder floor is `3 · 744 + 330` = 2 562 and a coloured child floor `2 · 744 + 330` = 1 818.
+`TOKEN_PIECE_SATS` is derived above the *root* floor with head-room for the committed rate doubling,
+because a piece's sats are fixed the moment it is carved while the floor is not. Do not round it.
+
+Slots for the pieces and the change are **derived** from the carrier — free SE vouchers — so
+distributing does not burn paid onboarding tokens the way issuance does. The coordinator issues at
+most `max_derived_tokens_per_statechain` of them per parent, counted over the parent's lifetime with
+spent rows included (default 64), which bounds how many recipients one carrier can ever serve.
 
 If no single carrier holds the amount — the normal case after a mint — the SDK **combines** several
-carriers of the asset into one SE-co-signed colored combine tx (N inputs → exact piece + change).
-The receiver then validates the multi-input branch and requires **all N input carriers** to be
-terminal (`sdk31`).
+carriers of the same asset into one SE-co-signed colored combine tx (N inputs → exact piece +
+change), largest allocation first. The receiver then validates the multi-input branch and requires
+**all N input carriers** to be terminal — one terminal ancestor per structural input, enforced by
+`transfer_receiver::verify_terminal_parents` (`sdk31`). Token conservation across the whole
+operation is INV-13: `Σ recipient amounts + change = Σ allocations of the combined inputs`.
 
 A distribution is refused **before** anything is co-signed rather than stranding the carrier:
 
-- the carrier must cover `1_500 + fee reserve` (the reserve is 1% of carrier value, clamped to
-  300–2,000 sats);
-- both outputs (piece and change) must stay above the minimum viable output at the *live* feerate — a
-  sub-coin has to be able to fund its own backup. At high feerates the transfer errors out with the
-  carrier untouched.
+- the carrier must cover `TOKEN_PIECE_SATS + fee reserve`, where the reserve is 1 % of carrier value
+  clamped to 300–2 000 sats;
+- both outputs must stay above `min_split_output` at the *live* backup feerate — a sub-coin has to
+  be able to fund its own backup. At high feerates the transfer errors out with the carrier
+  untouched.
 
 Token amounts are **raw u64 units**; `precision` is contract metadata the SDK never scales
-(`sdk29`). `transfer_tokens(&asset, &addr, 5_000)` on a precision-2 asset moves 5,000 raw units =
+(`sdk29`). `transfer_tokens(&asset, &addr, 5_000)` on a precision-2 asset moves 5 000 raw units =
 50.00 display units.
 
 ## Query
@@ -121,76 +168,116 @@ let balances = issuer.get_token_balances().await?;
 
 let txs = issuer.query_token_transactions(&asset_id).await?;
 // [{ kind, status, amount, txid }]
+
+let where_it_sits = issuer.list_token_allocations(&asset_id).await?;
+// [(outpoint, amount)] — the actual per-carrier bindings
 ```
+
+Prefer `list_token_allocations` when the question is "is the allocation still on the coin I think it
+is?". A balance is an aggregate computed from rgb-lib's tables and stays confidently wrong if the
+stock has been invalidated underneath it; the allocation list is the per-outpoint truth.
 
 ## Semantics vs Spark's issuer SDK
 
 | Spark | Here | Note |
 |---|---|---|
-| `createToken(isFreezable, maxSupply…)` | `issue_token` (NIA) / `issue_inflatable_token` (IFA) | metadata immutable — same as Spark; NIA supply fixed at issuance, IFA declares its inflation rights up front |
-| `mintTokens` | `mint_tokens` | **shipped** for IFA: on-chain inflate + bind to a fresh carrier; an NIA has nothing to realize (`sdk09`) |
+| `createToken(isFreezable, maxSupply…)` | `issue_token` (NIA) / `issue_inflatable_token` (IFA) | metadata immutable, as in Spark; NIA supply fixed at issuance, IFA declares its inflation rights up front |
+| `mintTokens` | `mint_tokens` | IFA only: on-chain inflate + bind to a fresh carrier (`sdk09`); an NIA declares no inflation right, so it has nothing to realize |
 | `burnTokens` | `burn_tokens` | on-chain, engine-held balance only; statechain-bound supply must exit first |
 | `transferTokens` | `transfer_tokens` | colored off-chain split + backup-chain handover |
 | `batchTransferTokens` | `batch_transfer_tokens` | one colored split, N pieces + change (`sdk09`) |
 | `freezeTokens` | **intentionally absent** | client-validated assets have no consensus-meaningful freeze; see [tokens](../learn/tokens.md) |
 | `getIssuerTokenBalance` | `get_token_balances` | |
+| `getTokenL1Address` | `get_token_l1_address` | alias of `get_token_funding_address` |
 | token id `btkn1…` | `rgb:…` contract id | |
 
 ## Trust properties for holders
 
 - **Supply is bounded by the contract.** You cannot inflate an NIA at all, and an IFA only up to the
-  inflation rights declared at issuance — both are visible to every holder from the contract itself.
-- **Transfers validate client-side from consignments.** The SE never vouches for token state; a
-  receiver books the amount under the consignment's *verified* contract id.
+  inflation rights declared at issuance — both visible to every holder from the contract itself.
+- **Transfers validate client-side from consignments.** The SE never vouches for token state. A
+  receiver books the amount the consignment assigns to its *own* witness outpoint, treating the
+  envelope's stated amount only as a cross-checked hint (REQ-21), and books it under the
+  consignment's cryptographically-verified contract id rather than a sender-claimed one (REQ-22).
+- **No superseded colored witness exists anywhere in the system.** A colored tx only ever spends
+  outputs of terminalized structure — terminalization precedes the colored co-sign and the SE
+  refuses renewal on a terminal node — so no ancestor of an RGB anchor is ever re-signed.
 - **Plain sweeps of a carrier are refused, not silently destructive.** `withdraw` and
   `unilateral_exit` exclude carriers from their defaults and hard-error if a carrier is named
-  explicitly ("carries an RGB allocation…"). `refresh` (the on-chain re-anchor) likewise rejects a
-  coin holding an allocation, and the maintenance refresh pass skips carriers.
-- **A received piece exits without the SE.** Token exit means **materializing the branch**:
-  broadcasting the stored branch rows settles the RGB anchors on-chain and the allocation becomes an
-  ordinary on-chain RGB holding, spendable with any rgb-lib wallet. This works at depth — a piece two
-  colored splits deep materializes by broadcasting its branch root-first (`sdk39`). Onward movement
-  of the *settled* allocation still needs the SE; no colored unilateral path is shipped.
+  explicitly. `refresh` (the on-chain re-anchor) likewise rejects a coin holding an allocation, and
+  the maintenance refresh pass skips carriers.
+- **A received piece SETTLES without the SE.** Token exit means **materializing the branch**:
+  broadcasting the stored `branch-<id>` rows, which for a carrier *are* the un-broadcast coloured
+  split/combine transactions — the RGB witnesses that carved the allocation. Landing them root-first
+  settles the allocation on a confirmed outpoint and spends the shared root, with no SE involved. It
+  works at depth: a piece two colored splits deep materializes by broadcasting `[split1, split2]`
+  root-first (`sdk39`). The automatic route is `auto_exit_due`, which broadcasts the branch and only
+  the branch — never the plain backup, which would sweep the sats and destroy the allocation.
+  **Materializing settles the asset; it does not exit the coin.** The sats stay on the 2-of-2
+  outpoint, so moving them onward still needs the SE, and no coloured unilateral path ships on the
+  default lane. `unilateral_exit` refuses this class by name and points at the two routes that do
+  exist rather than returning a `complete` `ExitStatus` that would be a false green.
+  (`materialise_carrier` is the manual call, and it is deliberately narrow: it serves only a carrier
+  for which no coloured ladder can ever be built, so that a carrier which could still be laddered
+  waits for its ladder instead of being settled early.)
 
-## Over time: what you (and your holders) actually have to watch
+## Over time: what you (and your holders) actually watch
 
-Tokens are never lost by inactivity — `sdk32` idles the chain a "year" past every deployed horizon
-and everything below still holds. But because carriers are un-laddered, calendars still exist here,
-unlike for plain BTC coins:
+Tokens are never lost by inactivity: `sdk32` idles the chain a "year" past every deployed horizon
+and the stock still validates the full allocation afterwards. Read its lane label, though — `sdk32`
+asks for `colored_ladder = true`, so it measures the *coloured* form of that claim. The shipped
+default's carrier shape is the one `sdk52` pins (plain coin laddered, carrier not) and `sdk39` exits.
 
-**Your issued/minted carrier is flat** (funded on-chain, no ancestor above it). It has no ladder to
-age on — `sdk32` asserts `tesr::load → None` at issuance *and* after `initlock + 500` idle blocks — no
-ancestor that could claw it back, and therefore no deadline duty at all: `auto_exit_due` inspects it
-and correctly skips it. It does carry its one signed-once deposit backup, maturing at
-`deposit_height + initlock` (~7 days on the deployed profile), but that maturity does not gate
-distribution: a colored split never touches a ladder and mints fresh full-locktime backups for its
-outputs. The one standing limitation is cooperative-only movement — a plain unilateral exit is
-refused, so an issued carrier's supply stays anchored where it is until the SE co-signs a colored
-spend.
+A calendar exists here — but not *only* here. A plain laddered coin also keeps an absolute flat
+backup chain and therefore a `min(L_k)` its prior owners hold; what an un-laddered carrier lacks is
+the CSV tier chain that makes the *exit* calendar-free. So the difference is the remedy available,
+not the existence of a deadline.
 
-**A holder's received piece is a sub-coin carrier** — doubly un-laddered: a carrier
-(terminal-freeze) *and* a split sub-coin whose funding is un-broadcast, which cannot root a trigger.
-It can be materialized SE-free at any time while the shared root is unspent. It does have a root
-deadline: past it, the *sender's* signed-once backup matures and a malicious sender could sweep the
-shared funding. Holders using this SDK are protected by default — the `auto_exit_due` watchtower
-(`SdkConfig::auto_exit`, run by `start_background`) materializes the carrier as the deadline nears,
-branch-only, emitting `WalletEvent::TokenCarrierMaterialized` (SPEC REQ-33, `sdk34`). The duty is
-delegable keyless via `export_watch_bundle` (`sdk45`): the exported bundle carries **no key
-material**, a second independent tower is idempotent, and a carrier entry is exported *without* its
-backup tx — a delegated tower can only ever materialize the branch, never sweep and destroy the
-allocation.
+**Your issued or minted carrier is flat**: funded on chain, with no ancestor above it. It has no
+ladder to age on and no ancestor that could claw it back, so it carries no deadline duty at all —
+`auto_exit_due` inspects it and correctly skips it. It does hold its one signed-once deposit backup,
+maturing at `deposit_height + initlock` (10 000 blocks on the mainnet, testnet and signet profile;
+1 000 on regtest), but that maturity does not gate distribution: a colored split never touches a
+ladder and mints fresh full-locktime backups for its outputs. The standing limitation is
+cooperative-only movement — a plain unilateral exit is refused, so an issued carrier's supply stays
+where it is until the SE co-signs a colored spend.
+
+**A holder's received piece is a sub-coin carrier** — doubly un-laddered: a carrier (terminal
+freeze) *and* a split sub-coin whose funding is un-broadcast, which cannot root a trigger. It can be
+materialized SE-free at any time while the shared root is unspent. It does have a root deadline:
+past it, the *sender's* signed-once backup matures and a malicious sender could sweep the shared
+funding. Holders using this SDK are protected by default — the `auto_exit_due` watchtower
+(`SdkConfig::auto_exit`, run by `start_background`) materializes the carrier as the deadline nears —
+broadcasting **only** the stored exit branch, never the sats-sweeping backup — and emits
+`WalletEvent::TokenCarrierMaterialized` (SPEC REQ-33). An issued/flat carrier has no exit branch, so
+the pass verifies that and skips it. `sdk34` is the E2E for the duty, and it runs with
+`colored_ladder = true`: there a received piece is a coloured child with no `branch-` row at all, so
+the same duty is discharged by walking its pre-signed tier chain instead. The duty and the event are
+the same; the action is what the lane decides.
+
+The duty is delegable, keyless, via `export_watch_bundle` (`sdk45`). The exported bundle carries
+**no key material**, a second independent tower is idempotent, and a `WatchEntry` with
+`token_carrier: true` is exported *without* its `backup_tx` — a delegated tower can only ever
+materialize the branch, never sweep and destroy the allocation. The export fails closed for a token
+wallet whose carriers cannot be enumerated, because a carrier mis-exported as plain would hand the
+tower a token-destroying backup.
 
 **Advice worth putting in your holder docs:** hold, combine, or materialize — never "refresh before
-your locktime expires" (refresh does not apply to carriers) and never a plain unilateral exit. Also
-warn that a lone 1,500-sat received piece is below the carrier floor and cannot be re-sent on its own
-until it is combined with another piece of the same asset.
+your locktime expires" (refresh does not apply to carriers) and never a plain unilateral exit. Warn
+too that a lone piece can be below the bar to move on its own: escaping a carrier costs
+`TOKEN_PIECE_SATS + fee_reserve + min_split_output` = **5 040 sats** of aggregated carrier value, so
+a holding under that must be combined with another piece of the same asset first.
 
 ## Where next
 
-- [Wallet SDK guide](wallet-sdk.md) — every holder-side operation with examples.
-- [Tokens on RGB](../learn/tokens.md) — the conceptual model, freeze rationale, exit behaviour.
+- [Wallet SDK guide](wallet-sdk.md) — every holder-side operation, with examples.
+- [API reference](api-reference.md) — the full surface.
+- [Tokens on RGB](../learn/tokens.md) — the conceptual model, the freeze rationale, exit behaviour.
 - [Granularity deep dive](../learn/granularity-deep-dive.md) — colored splits, raw units vs
-  precision, the 1,500-sat piece, exits at depth.
-- [PROTOCOL.md §5.10](../PROTOCOL.md) — RGB integration and the terminal-freeze rules normatively.
+  precision, the piece floor, exits at depth.
+- [SPEC.md](../spec/SPEC.md) §7 — tokens normatively: REQ-19…22, INV-12, INV-13, INV-29.
+- [PROTOCOL.md](../spec/PROTOCOL.md) §5.10 — RGB integration and the terminal-freeze rules.
+- [PARTIAL-PAYMENT-ECONOMICS.md](../spec/PARTIAL-PAYMENT-ECONOMICS.md) — what the coloured lane
+  costs, measured.
 - [Testing guide](testing-guide.md) — running the token E2Es (`sdk02`, `sdk09`, `sdk29`, `sdk31`,
-  `sdk32`, `sdk34`, `sdk39`, `sdk52`).
+  `sdk32`, `sdk34`, `sdk36`, `sdk39`, `sdk52`, `sdk78`).

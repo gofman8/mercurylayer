@@ -489,7 +489,7 @@ needed for custody**, by construction:
   sponsor errors while the user keeps the refreshed amount−fee coin). A sponsor paying from a
   laddered coin rebates via an **in-ladder split**, whose child must fund its own extension and
   state tier before clearing dust — `min_child_value` = `2·(committed_fee + P2A) + dust` =
-  2·(250 + 240) + 330 = **1,310 sat** at the default 2 sat/vB. The sponsor rebates
+  2·(375 + 240) + 330 = **1,560 sat** at the shipped 3 sat/vB. The sponsor rebates
   `max(fee_sats + DUST_LIMIT, min_child_value)` and absorbs the difference, so the user still ends
   ≥ whole.
 - **SSP** (Lightning): swaps work in **both directions on the ladder** via the HODL latch and are

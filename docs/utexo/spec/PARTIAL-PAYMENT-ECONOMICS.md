@@ -181,11 +181,11 @@ colored_committed_fee(n,r)      = ceil((168 + 43(n−1))·r)         clients/lib
 P2A_VALUE                       = 240                             lib/src/tesr.rs
 rung  = committed_fee + P2A     = 490 plain / 576 coloured        (r = 2.0)
                                 = 615 plain                       (r = 3.0)
-min_child_value(2.0, 330)       = 2·490 + 330 = 1 310             lib/src/tesr.rs
+min_child_value(2.0, 330)       = 2·490 + 330 = 1 560             lib/src/tesr.rs
 min_child_value(3.0, 330)       = 2·615 + 330 = 1 560             — the finest mintable piece
 colored_child_floor(2.0, 330)   = 2·576 + 330 = 1 482             clients/libs/rust/src/tesr.rs
-min_spine_tip_value             = rung + dust = 820 / 906 coloured
-mainnet params = { d0 1440, δ 36, d_floor 144, e0 720, δE 36, e_floor 144, m_max 15, rate 2.0 }
+min_spine_tip_value             = rung + dust = 945 / 1 074 coloured
+mainnet params = { d0 1440, δ 36, d_floor 144, e0 720, δE 36, e_floor 144, m_max 15, rate 3.0 }
                                                                   lib/src/tesr.rs
 ```
 
@@ -207,13 +207,13 @@ un-laddered plain-split lane, where the quote is still an estimate and not a pla
 ### 2.2 The splittability tail
 
 Splitting requires the change to fund two floored children: `c ≥ piece + 2 376`, absolute minimum
-`c ≥ 2·1 310 + 1 066 = 3 686` plain (4 202 coloured). In the dead zone `1 310 ≤ c < 3 686` the change
+`c ≥ 2·1 560 + 1 066 = 3 686` plain (4 202 coloured). In the dead zone `1 560 ≤ c < 3 686` the change
 is still exitable but can never make another partial payment. Worked at V = 1 000 000 and
 10 000/payment, two-tier change: `c_N = 999 510 − 11 066N`, so **payment 91 is refused** — 900 000
 nominal delivered, 811 800 exitable, **185 610 sat (18.56 % of the deposit) burned**, and the
 survivor is a **3 570-sat** depth-90 coin worth **2 590** on exit.
 
-Spine-tip floors are lower — exitable at **820**, splittable at **2 706** (coloured 3 050) — so the
+Spine-tip floors are lower — exitable at **945**, splittable at **2 706** (coloured 3 050) — so the
 reach extends to ~94 payments at K = 1 and further under batching, with 147 734 sat (14.8 %) of
 reserve.
 
@@ -505,7 +505,7 @@ sender's own final leg); 1440 is the safe default.
 `establish_spine_tip_journalled` — ONE state tier at `p.state_csv(0)` directly over `SP.out[K]`, no
 extension — returning it as a `SpineTipBundle` for `persist_spine_tip` rather than as a `ctesr-`
 child. `change_leg_role()` is per-LANE and reports `SpineTip` for `SplitLane::PlainRoot` and for
-`SplitLane::Colored`, so the 820-sat change floor is live on both and the Freeze-Lemma bound is
+`SplitLane::Colored`, so the 945-sat change floor is live on both and the Freeze-Lemma bound is
 attained: a payment adds one transaction to the sender's exit chain, not two.
 
 A tip is not a coin any other builder can take: it has no `tesr-` row, so `in_ladder_pay` cannot load
@@ -630,7 +630,7 @@ piece against 15 further renewal epochs**, and it is a separate, argued decision
 | V2 | the ancestor expectation `CHILD_V2_BASELINE + 2 + seg_superseded_ok` derives the `2` from the **disclosed tier count** | `clients/libs/rust/src/tesr.rs` | without it every spine bundle is rejected outright; the literal `2` against a one-tier bundle is a free census slot, and that mismatch fails *open* — V1 and V2 are one change |
 | V3 | a **SPINE tier kind** with CSV bounds `[0, 0]`, alongside state and extension | `clients/libs/rust/src/tesr.rs`, live and superseded paths | must be a new KIND, never a widened state range — see below |
 | V4 | `SpineTipBundle` under `SPINE_TIP_KEY_PREFIX` | `clients/libs/rust/src/tesr.rs` | `withdraw` routes anything keyed `ctesr-` to unilateral exit; the tip must not be mistaken for a leaf |
-| V5 | `split_output_floors` → `SplitFloors { piece, change }`, `min_spine_tip_value` = 820 plain / 906 coloured, per-leg refusal text | `clients/libs/rust-sdk/src/transfer.rs` | one number can only reach 820 by lowering the PIECE's floor too, which mints a child that cannot fund its second rung and dies after the parent is terminal |
+| V5 | `split_output_floors` → `SplitFloors { piece, change }`, `min_spine_tip_value` = 945 plain / 1 074 coloured, per-leg refusal text | `clients/libs/rust-sdk/src/transfer.rs` | one number can only reach the change floor by lowering the PIECE's floor too, which mints a child that cannot fund its second rung and dies after the parent is terminal |
 
 ### 8.1 What makes segment shape DERIVED, not declared
 
@@ -768,7 +768,7 @@ Each item is a live property, stated with the reason it must keep being true.
   i.e. the exact opposite of a leaf — while still returning `Ok`. The in-process tower
   (`auto_exit_due`) covers leaves, which is what hides it: delegating to a third-party tower can
   protect the parents and leave the children unwatched.
-- **Minimum parent value** for a K-batch: `1 396K + 1 310` sat (K=1 → 2 706; K=10 → 15 270;
+- **Minimum parent value** for a K-batch: `1 396K + 1 560` sat (K=1 → 2 706; K=10 → 15 270;
   K=20 → 29 230). Below it, K falls back. Coloured carriers at `TOKEN_CARRIER_SATS = 17 384` support
   K ≤ 4 and must be re-sized at issue.
 
@@ -792,9 +792,9 @@ no flat backup (`CHILD_V2_BASELINE = 0`); the sender keeps one that spends `F` f
 `293d + 375` vB walk, cheaper than the sender's *own* ladder at every fee rate, and with **zero
 marginal cost** per additional piece voided. So an ordinary sender exiting for their own reasons
 voids every sub-economic piece they ever paid, and the admission floor does not protect anyone:
-`min_child_value` = 1 310 sat **is** the break-even function evaluated at the hardcoded
+`min_child_value` = 1 560 sat **is** the break-even function evaluated at the hardcoded
 `committed_fee_rate = 2.0` (`lib/src/tesr.rs`) and at no other rate. At 20 sat/vB a depth-8 piece
-admitted at 1 310 costs far more than its face to defend. The spine shrinks the `d` term and leaves
+admitted at 1 560 costs far more than its face to defend. The spine shrinks the `d` term and leaves
 the option free, and shortens the window in which the payee could notice. See TRUST-MODEL.md.
 
 ---

@@ -37,7 +37,7 @@ design**:
   nLockTimes** and move by backup-chain handover. This shape is load-bearing for RGB.
 
 Also shipped: **any amount** via the in-ladder split (a state tier spending `X_m.out[0]`, a
-descendant of the trigger — admission floor `min_child_value` = 1310 sat at 2 sat/vB); **first-class
+descendant of the trigger — admission floor `min_child_value` = 1 560 sat at the shipped 3 sat/vB); **first-class
 received children** (the claim completes the SE key handover, so a received piece pays onward
 off-chain, whole or split); **Lightning both directions** on the ladder via a HODL-invoice latch.
 

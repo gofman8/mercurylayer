@@ -159,7 +159,7 @@ F  (on-chain, value v)
 | Worst flat unilateral wait | E0 + D0 = 2,160 blocks ≈ **15 days**, decreasing 36 blocks/hop | |
 
 These are `TesrParams::mainnet()` in `lib/src/tesr.rs` verbatim (d0 1440 / δ 36 / d_floor 144,
-e0 720 / δE 36 / e_floor 144, m_max 15, committed fee 2 sat/vB); a `TesrParams::regtest()` preset
+e0 720 / δE 36 / e_floor 144, m_max 15, committed fee 3 sat/vB); a `TesrParams::regtest()` preset
 (24/6/6, 12/3/3, m_max 2) exists only so a full lifecycle fits in a test's mining budget. `sdk44`
 pins the schedule arithmetic (`state_csv` / `ext_csv` / `needs_renewal` / `needs_rollover`).
 
@@ -205,7 +205,7 @@ carrier). A laddered coin has no such deadline for them to act on — it has `mi
 
 Every pre-signed tx (T, X, S, SP, CB) is **nVersion=3 (TRUC)** and carries:
 
-1. a **small committed fee** drawn from the coin (target ~2 sat/vB at signing; Σout = Σin −
+1. a **small committed fee** drawn from the coin (target 3 sat/vB at signing; Σout = Σin −
    fee_committed) so the base case relays and confirms standalone — the same self-funding property the
    signed-once backup chain has; and
 2. a **240-sat P2A anchor** (OP_1 0x4e73, anyone-can-spend) so the owner — or an operator's funded
@@ -238,8 +238,7 @@ payment), with the bundle/backup-chain adversarial cases in **sdk54** / **sdk55*
 
 **Admission floor.** A child is not a bare output: `establish_child` hangs the child's OWN extension +
 state tiers off `SP.out[j]`, each burning committed fee + P2A, and the final state output must still
-clear dust. The floor is `mercurylib::tesr::min_child_value(fee_rate, dust)` — **1306 sat at
-2 sat/vB** — and it is checked **before** the parent is terminalized, so a piece too small to establish
+clear dust. The floor is `mercurylib::tesr::min_child_value(fee_rate, dust)` — **1 560 sat at the shipped 3 sat/vB** — and it is checked **before** the parent is terminalized, so a piece too small to establish
 never strands its parent to unilateral-exit-only.
 
 **Received children are FIRST-CLASS** (`CHILDREN.md`). The child claim completes the standard SE key
@@ -399,7 +398,7 @@ and exactly one P2TR output wider than the plain tier). Consequences:
   125-vB de-trigger, and the grief is fee-attributable on-chain even though T itself is anonymous.
 - **Griefing is NOT economically losing for the attacker.** Both transactions pay out of the **coin**:
   a tier's fee is committed at signing (`tier_out_value` = prev − committed_fee − P2A), and that is as
-  true of the hostile T as of the de-trigger. At or below the committed 2 sat/vB the attacker
+  true of the hostile T as of the de-trigger. At or below the committed 3 sat/vB the attacker
   broadcasts a transaction he already holds and pays **nothing at all**, while the coin loses
   2 × (250-sat committed fee + 240-sat anchor) ≈ **980 sats**. The attacker begins paying only above the
   committed rate, where T no longer relays on its own and needs a CPFP child he must fund — but at that
@@ -612,7 +611,7 @@ the protocol, not an implementation gap** — an implementer must not read "dele
 as implying spike-time rescue.
 
 Illustrative refusals are **lab numbers, not protocol bounds**. A real tier is 125 vB (`TIER_VBYTES`)
-committing 250 sats at 2 sat/vB, so under a 3 sat/vB floor it reads `min relay fee not met, 250 < 375`.
+committing 375 sats at the shipped 3 sat/vB, so under a 4 sat/vB floor it reads `min relay fee not met, 375 < 500`.
 The one live quote below — `min relay fee not met, 6 < 13` — comes from a **regtest** node at a
 **0.1 sat/vB** floor against a parent deliberately built under it; what makes it worth quoting is the
 *path*, not the numbers.
