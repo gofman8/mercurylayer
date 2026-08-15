@@ -3276,3 +3276,47 @@ PAYER is impossible.** The one adjacent buildable thing is DELEGATED PAY — an 
 a specific payee key and maximum, and the SE later enforces it from the witnessed transactions, with
 the amount still arbitrary. It covers **standing and recurring payments only and must not be sold as
 offline sending** (SPEC REQ-62).
+
+## [D91] The freeze is two-phase, and the ANNOUNCED boundary is the enforced one
+
+Found by the owner asking the plainest possible question of the freshly-written §5.4: *"when do users
+need to come online? can they do state updates later till round is finished?"* Answering it precisely
+exposed two defects in the text committed one hour earlier.
+
+**Defect 1 — the announced deadline was not the real deadline.** `frozen` was set at **R6**, when the
+SSP posts the grant. `H_f` was published at R0 but bound only the SSP's own conveyancing. So a
+holder's true cutoff for every state update was *whenever the operator happened to POST the grant* — a
+moment no holder can observe. **A user-visible deadline must be the enforced one.**
+
+**Defect 2 — the frontier could move under `C`.** Between `H_f` and the grant, co-signatures were
+still live, so a holder could split their own leaf; `establish_leaf` registers the new node; REQ-56
+recomputes the frontier at grant time; the grant is refused and `C` must be rebuilt. Repeated, the
+round never completes. R4's "**No deadlock; nothing is ratcheted yet**" was false as written.
+
+Note the shape: defect 2 is **liveness, not theft** — the predicate fails closed and nobody is
+under-paid. That is the right failure direction, and it is why this was a design gap rather than a
+vulnerability. It is still a gap: a round that cannot complete is a design that does not work.
+
+**THE FIX, and why it needs no clock.** The obvious repair — "the SE enforces the freeze at height
+`H_f`" — is unavailable, because [D83]'s corrected rationale says the SE has no *trustworthy* source
+of chain height: an operator-chosen endpoint is worth what the operator's word is worth. So the
+boundary is instead a **monotone one-way ratchet**, structurally identical to `sig_budget`:
+`POST /announce_freeze {root_sid}`, never cleared, which immediately stops the frontier GROWING
+(no new `establish_leaf` under that root) while still permitting `/release` and migrations *away*, and
+without which no grant may be issued. It is carried in the SE's attestation, so holders and
+watchtowers observe the boundary **without asking the SSP**. `H_f` is demoted to an advisory hint.
+
+**The resulting answer to the owner's question, now true of the spec:**
+
+| to… | online? | deadline |
+|---|---|---|
+| **receive** a payment | never | none |
+| **be paid out** if absent | never | none — REQ-65: even a never-claimed payee is in the frontier |
+| **claim** (first-class ownership) | one action | the announcement, on their tree |
+| **any state update** (pay, split, re-transfer, renew) | at that moment | **the announcement** — publicly attested |
+| **migrate + release** (stay off-chain rather than be cashed out) | during R1–R3 | the announcement |
+
+**The general lesson, and it is the fourth instance:** the spec was written to describe the honest
+path and did not ask *what the user can observe*. [D54] was a security property sourced from the party
+it constrains; this is a **deadline** sourced from the party it constrains. Both are the same error —
+**if a rule binds a user, the user must be able to see it fire.**

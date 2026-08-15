@@ -798,7 +798,7 @@ root, so a round both retires and re-funds in one transaction — there is no se
 | **R1** | MIGRATE — for each responding holder, an ordinary in-ladder split on `B` conveying a leaf of **identical funding value**. The holder runs the **complete existing verifier unchanged** (`verify_conveyed_child` → `verify_child_bundle`, `f_spender` against a **confirmed** `F_B`, `cap_schedule`, `check_exit_headroom_with_margin`, `attested_terminal`, Model A, value conservation both ways) and takes first-class ownership. *This is not a new mechanism. It is a payment.* | the holder, fully, **with no new trust** |
 | **R2** | RELEASE — `POST /release {sid, nonce32, sig}`, BIP-340 under the leaf's latch key over `tagged("utexo/leaf_release/v1", sid‖nonce32)`. Monotone, never cleared, single-use nonce. **A consent record, not a spending authorisation** | the SE |
 | **R3** | MANDATE HARVEST (optional) — form (b) holders migrated under SE enforcement | the SE |
-| **R4** | FREEZE — at `H_f` conveyance on `A` stops. Late arrivals simply join the payout set. **No deadlock; nothing is ratcheted yet** | — |
+| **R4** | FREEZE — the SSP posts `announce_freeze` (REQ-64). From that instant the frontier can no longer GROW: the SE refuses new establishments under `A`, while releases and migrations *away* from `A` still work. Late arrivals join the payout set | **everyone**, from the attestation |
 | **R5** | BUILD `C` — one input, one output per undischarged leaf, plus the future root and a CPFP handle | — |
 | **R6** | GRANT — `POST /collapse_grant {root_sid, disclosure(C)}`; the SE runs REQ-56, sets `frozen` **prospectively**, issues the partial signature | the SE, from state it authored |
 | **R7** | BROADCAST — **one transaction** retires `A`, pays every undischarged holder in full at their own key, and funds the next root | the chain |
@@ -855,6 +855,46 @@ verified it" to "the SSP says so" — the [D54] failure mode. See [D83]'s correc
 Form (c) needs only the output vector of a transaction the SE verified byte-for-byte; form (b) needs
 only facts the SE authored about a root **the holder verified themselves while online**. Neither asks
 the SE for knowledge it cannot honestly hold.
+
+**REQ-64 (THE FREEZE IS TWO-PHASE, AND THE ANNOUNCED BOUNDARY IS THE ENFORCED ONE).**
+A first draft of this section made `H_f` a published *height* and the freeze a consequence of the SSP
+choosing to stop conveying. That is wrong twice over and both defects are fixed here:
+
+* **The announced deadline was not the real deadline.** `frozen` is set at R6, when the SSP posts the
+  grant — a moment no holder can observe. A user's true cutoff must never be a moment only the
+  operator knows.
+* **The frontier could move under `C`.** Between `H_f` and the grant, a holder could still split their
+  own leaf: co-signatures are live until the freeze, `establish_leaf` registers the new node, and
+  REQ-56 recomputes the frontier at grant time — so the grant is refused and `C` must be rebuilt.
+  Repeated, the round never completes. This is a **liveness** defect, not a theft one (the predicate
+  fails closed and nobody is under-paid), but R4's original "nothing is ratcheted yet" was false.
+
+The fix needs **no trusted clock**, which matters because the SE has no trustworthy source of chain
+height ([D83], corrected rationale — an operator-chosen endpoint is worth what the operator's word is
+worth). Instead the boundary is a **monotone one-way ratchet**, exactly parallel to `sig_budget`:
+
+```
+POST /announce_freeze { root_sid }        -- monotone, never cleared, idempotent
+```
+
+From that record onward the SE MUST:
+1. **REFUSE `establish_leaf` under that root** — the frontier can never grow again, so the set `C`
+   must pay is fixed the moment it is announced;
+2. **CONTINUE to accept `/release` and migrations AWAY from the root** — announcing must not strand
+   anyone who is mid-migration;
+3. **REFUSE `collapse_grant` unless the root is announce-frozen** — so a grant can never precede the
+   public notice;
+4. **carry `announce_frozen` in its attestation**, so any holder or watchtower can observe the
+   boundary without asking the SSP.
+
+`H_f` is retained as an advisory UX hint published at R0 ("we intend to announce at about this
+height"). **The enforced, publicly observable boundary is the announcement.**
+
+**REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
+`establish_leaf` from the witnessed `state_child.vout[0]`, which is **the payee's key** — conveyance
+builds the child's tiers to the receiver's address. So a payee who was paid and **never claimed at
+all** is nonetheless in the frontier, and REQ-56 forces `C` to pay them their full funding value at
+their own key. Claiming is required to *spend*, never to *be paid*.
 
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
 raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same
