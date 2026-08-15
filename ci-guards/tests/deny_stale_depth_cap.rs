@@ -28,15 +28,16 @@
 use std::path::PathBuf;
 
 /// Documents that feed the specification. A dated audit may quote whatever it observed.
-const CHECKED: [&str; 9] = [
+// 2026-08-15: ADMISSION-INPUTS and SPEC-ROADMAP were retired with the rest of the point-in-time and
+// folded-feature docs. They are dropped from the list, not stubbed — a guard that reads a file which
+// no longer exists fails for the wrong reason and teaches a reader to ignore it.
+const CHECKED: [&str; 7] = [
     "docs/utexo/SPEC.md",
     "docs/utexo/PROTOCOL.md",
     "docs/utexo/CHILDREN.md",
     "docs/utexo/LIGHTNING.md",
     "docs/utexo/TRUST-MODEL.md",
-    "docs/utexo/ADMISSION-INPUTS.md",
     "docs/utexo/DECISIONS.md",
-    "docs/utexo/SPEC-ROADMAP.md",
     "docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md",
 ];
 
@@ -85,12 +86,10 @@ fn a_document_stating_the_superseded_depth_cap_must_say_it_is_superseded() {
 /// record. This pins the banner so a later edit cannot quietly drop it.
 #[test]
 fn the_scoping_documents_that_carried_the_number_still_carry_the_correction() {
-    for doc in [
-        "docs/utexo/COLOURED-SPINE-REANCHOR-SCOPE.md",
-        "docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md",
-        "docs/utexo/SPEC-ROADMAP.md",
-        "docs/utexo/SUBECONOMIC-FINALITY.md",
-    ] {
+    // 2026-08-15: three of the four scoping documents were retired. The correction banner they were
+    // pinned for survives in the one that remains, and in [D53] itself; the retired ones took their
+    // before/after records with them, which is the intended outcome of retiring them.
+    for doc in ["docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md"] {
         let src = read(doc);
         assert!(
             src.contains("[D53] CORRECTION"),

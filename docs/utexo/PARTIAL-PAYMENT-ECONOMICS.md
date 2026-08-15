@@ -307,7 +307,7 @@ payout instead of a migration, free and unattributable.
 
 ## 1. The correction, stated plainly
 
-Utexo has been described — in [README.md](README.md), in [PARITY.md](PARITY.md), in the pitch — as
+Utexo has been described — in [README.md](README.md), in PARITY (retired 2026-08-15), in the pitch — as
 transacting **"off-chain, instantly, at no per-payment on-chain cost — any amount"**. That sentence
 is true only for an **exact-subset handover**: a payment whose amount happens to equal a coin the
 sender already holds, moved whole by replacing its state tier over the same outpoint. That case is
@@ -849,7 +849,7 @@ the one part of this paragraph that held up.
 >    A genuine two-tier segment's state spends `ext.out[0]`, so it cannot be re-labelled. This is
 >    the single load-bearing check, and it is *derived from a signature*: the outpoint is committed
 >    by the taproot `SIGHASH_ALL` sighash, so it cannot be repointed without invalidating the SE's
->    own signature. Per `ADMISSION-INPUTS.md`, that makes shape **derived**, not **declared** — the
+>    own signature. Per ADMISSION-INPUTS (retired 2026-08-15), that makes shape **derived**, not **declared** — the
 >    `Option` becomes a cross-checked declaration that must agree, never the source of truth.
 > 2. **The `[0,0]` CSV pin** stays exactly disjoint from `[e_floor, e0]`. Note `[144,720]` is a
 >    strict *subset* of `[144,1440]`, so extension-vs-state was **never** CSV-separable; only the
@@ -1009,7 +1009,7 @@ sub-economic payees will rationally abandon. The `Δ_cap` parameter is the dial:
 > piece admitted at 1 310 costs **124 870** to defend. CATS shrinks the `d` term (§6) but leaves the
 > option free and, per the table above, shortens the window in which the payee could notice.
 > The band, the three enforcement buckets, and the ranked fixes are in
-> [SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md).
+> SUBECONOMIC-FINALITY (retired 2026-08-15).
 
 ---
 
@@ -1188,7 +1188,7 @@ To actually move it you would need one of:
   `docker-compose-main.yml` (50000/6), `docker-compose-test.yml` (1100/1) and this repo's
   `Settings.toml`"*. What changed is not that the profile never existed but that it is no longer
   reachable: a coordinator configured 50 000/6 today panics at boot. That is a superseded deployment
-  baseline, not a drafting error. `SUBECONOMIC-FINALITY.md`'s 50 000 is a different thing again and
+  baseline, not a drafting error. SUBECONOMIC-FINALITY (retired 2026-08-15)'s 50 000 is a different thing again and
   is **correct**: a row of an A-1 sensitivity table its own lead-in labels *"design space, not
   deployment"*, with **10 000 (shipped)** bolded two rows above it.)
 - **A co-operative de-trigger for terminal trees** — the SE co-signing a fresh spend of `F` after the

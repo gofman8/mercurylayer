@@ -47,22 +47,10 @@ off-chain, whole or split); **Lightning both directions** on the ladder via a HO
 
 ## Start here
 
-- **Evaluating the protocol** → [learn/tldr.md](learn/tldr.md) →
-  [learn/core-concepts.md](learn/core-concepts.md) → [learn/invalidation.md](learn/invalidation.md)
-  → [PROTOCOL.md](PROTOCOL.md) → [PARITY.md](PARITY.md) +
-  [ARK-SPARK-PARITY.md](ARK-SPARK-PARITY.md).
 - **Building on the SDK** → [build/getting-started.md](build/getting-started.md) →
   [build/wallet-sdk.md](build/wallet-sdk.md) → [build/api-reference.md](build/api-reference.md) →
   [build/testing-guide.md](build/testing-guide.md); tokens in
   [build/issuer-sdk.md](build/issuer-sdk.md).
-- **Auditing security** → [TRUST-MODEL.md](TRUST-MODEL.md) → [PROTOCOL.md](PROTOCOL.md) §5 (races,
-  de-trigger, exit costs) → [CHILDREN.md](CHILDREN.md) + [LIGHTNING.md](LIGHTNING.md) →
-  [SPEC.md](SPEC.md) / [INVALIDATION-SPEC.md](INVALIDATION-SPEC.md) /
-  [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) → [REVIEW.md](REVIEW.md) +
-  [AUDIT-2026-07.md](AUDIT-2026-07.md) → [build/testing-guide.md](build/testing-guide.md).
-
-## Learn — conceptual prose, no code required
-
 - [tldr.md](learn/tldr.md) — the whole system on one page. *Anyone.*
 - [core-concepts.md](learn/core-concepts.md) — the tour: SE, the TES-R ladder, the two coin shapes,
   in-ladder splits, first-class children, verification at claim, exits. *Start of the learn path.*
@@ -106,64 +94,14 @@ off-chain, whole or split); **Lightning both directions** on the ladder via a HO
   failure and rollback, and the one case that stays terminalized. *Normative.*
 - [SPEC.md](SPEC.md) — system specification (REQ / INV / ERR) across SE, client libs, SDK and SSP,
   with per-item traceability to tests. *Normative.*
+- [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) — the cost model: what a payment
+  costs off-chain and on, the leaf lane (never the whole-coin lane, [D82]), and §0.8's discharge-round
+  footprint that SPEC §5.4 cites. *Normative — SPEC defers to it for every per-payment figure.*
+- [DECISIONS.md](DECISIONS.md) — every design decision with its evidence, its retractions and the
+  reasoning that survived them. *Normative — the authority every other document cites.*
 - [TRUST-MODEL.md](TRUST-MODEL.md) — party-by-party matrix: what is verified (with file and test) vs
   trusted, and the boundaries no protocol change removes. *Normative; auditors start here.*
   ([D60] This entry said only *Auditors.* and was therefore outside the line-citation census, which
   derives its set from these labels — while `SPEC.md` and `PROTOCOL.md` both defer to it for what is
   trusted, and D54's residual bound is stated nowhere else but its B11 row. A document the
   specification defers to is normative whatever the reader-audience note says.)
-- [INVALIDATION-SPEC.md](INVALIDATION-SPEC.md) — normative `IVL-*` for old-state invalidation and the
-  un-laddered shape's absolute-locktime machinery and duties. *Normative.*
-- [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md) — normative `GRN-*` for partial amounts: split bounds,
-  floors, raw token units, error semantics. *Normative.*
-- [ADMISSION-INPUTS.md](ADMISSION-INPUTS.md) — every input to the exit-headroom gate and who supplies
-  it: backend, config, operator, signature, or declared. Written because the "gate computes its
-  requirement from a sender-chosen number" defect appeared three times. *Normative; read before
-  adding any admission check.*
-- [SUBECONOMIC-FINALITY.md](SUBECONOMIC-FINALITY.md) — the break-even band `V_min(d, r)` below which a
-  split piece costs more to defend than it is worth, against a sender whose flat backup voids it for
-  one 112-vB transaction; what the blind SE can and cannot enforce, and where the receiver-side
-  viability gate belongs. *Normative finding; not yet built.*
-- [PARITY.md](PARITY.md) — Spark ↔ Mercury+RGB feature matrix, every row citing the live test.
-  *Evaluators.*
-- [ARK-SPARK-PARITY.md](ARK-SPARK-PARITY.md) — our off-chain transfer mapped against Ark out-of-round
-  (Arkade) and Spark, including the honest single-SE trust difference. *Evaluators.*
-- [RGB-TEST-PARITY.md](RGB-TEST-PARITY.md) — how the upstream RGB suites map onto RGB running over a
-  statechain coin. *RGB integrators.*
-
-## Reviews & status
-
-- [REVIEW.md](REVIEW.md) — two adversarial security reviews: SE co-signing crypto and value rules,
-  then a whole-protocol production-readiness pass. *Auditors.*
-- [AUDIT-2026-07.md](AUDIT-2026-07.md) — the July 2026 mainnet audit: findings, ratings and
-  remediation status, kept as written with a status refresh for the unified protocol. *Auditors.*
-- [PLAN.md](PLAN.md) — the build plan and key design decisions; done, with the shipped end state
-  stated up front. *Contributors.*
-- [PROGRESS.md](PROGRESS.md) — the running work log; the status block is current, the log beneath it
-  is historical. *Contributors.*
-
-## Research
-
-Condensed study notes and pricing models. *Researchers and designers.*
-
-- [protocol-notes.md](research/protocol-notes.md) — Spark's core protocol distilled, each bullet
-  mapped to what our shipped protocol does instead.
-- [sdk-notes.md](research/sdk-notes.md) — Spark's SDK surface and docs sitemap, with our shipped
-  equivalents and where the two surfaces genuinely diverge.
-- [invalidation-economics.md](research/invalidation-economics.md) — what it costs to enter, hold,
-  transact and leave, across feerate, tree depth, coin size and time.
-- [granularity-economics.md](research/granularity-economics.md) — the price of exact amounts:
-  unpayable-amount map, carrier depletion, token breakevens, colored exit at depth.
-- [RGB-BANK-VALIDATION.md](research/RGB-BANK-VALIDATION.md) — (Russian) adversarial validation of the
-  batched shared-UTXO "RGB bank" concept against the pinned rgb-consensus line.
-
-## History
-
-`history/` is a **historical record, kept for the reasoning — not a description of current design.**
-Both files open with a status block saying what actually shipped; read [PROTOCOL.md](PROTOCOL.md)
-for the live protocol.
-
-- [MIGRATION.md](history/MIGRATION.md) — the plan and adversarial reasoning behind removing the
-  pre-TES-R design and making TES-R the only path. **Executed.**
-- [SPLIT-FINDINGS.md](history/SPLIT-FINDINGS.md) — the split-transfer review audit trail: the B1
-  theft vector, the census holes, the child-bundle FATALs. **All closed or superseded.**

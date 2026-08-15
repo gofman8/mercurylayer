@@ -60,10 +60,15 @@ fn normative_docs() -> Vec<String> {
     out.sort();
     out.dedup();
     assert!(
-        out.len() >= 8,
+        out.len() >= 7,
         "the README-derived normative set collapsed to {} entries. That is the failure mode this \
          function exists to prevent — a census that quietly stops censusing. Either the README's \
-         `*Normative.*` labels moved, or its bullet format changed: {out:?}",
+         `*Normative.*` labels moved, or its bullet format changed: {out:?}\n\n\
+         (2026-08-15: the floor was lowered 8 -> 7 DELIBERATELY. The owner retired the point-in-time, \
+         parity and folded-feature specs; INVALIDATION-SPEC, GRANULARITY-SPEC, ADMISSION-INPUTS and \
+         SUBECONOMIC-FINALITY left the set, and PARTIAL-PAYMENT-ECONOMICS joined it. Lowering a \
+         non-vacuity floor is exactly the move this assertion is meant to make loud, so it is \
+         recorded here rather than done quietly.)",
         out.len()
     );
     out
@@ -72,16 +77,26 @@ fn normative_docs() -> Vec<String> {
 /// `DECISIONS.md` and `LIGHTNING.md` are records of decisions and of an external fork's API surface
 /// respectively; both legitimately quote a position AT THE TIME. They are held to the weaker rule:
 /// no NEW line citations, measured against the count when this guard was written.
-const GRANDFATHERED: [(&str, usize); 5] = [
-    ("docs/utexo/DECISIONS.md", 31),
+const GRANDFATHERED: [(&str, usize); 3] = [
+    // 2026-08-15: PARTIAL-PAYMENT-ECONOMICS joined the normative set on the day the retirements
+    // happened, bringing 68 pre-existing line citations with it. Same treatment as [D60]'s three: a
+    // RATCHET at the count found, not an exemption. It may only go DOWN, and it should, as the
+    // document is next edited for its own reasons. Symbolising 68 in one pass would be 68 chances
+    // to introduce a wrong one — the reasoning that created the original ratchets, unchanged.
+    ("docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md", 68),
+    // 2026-08-15: raised 31 -> 36, DELIBERATELY, as this guard's own message instructs. The five new
+    // positional quotes are the evidence for [D83] v3, [D91] and REQ-64/66 — `calculate_t2`'s
+    // rotation, `count_derived_tokens`' lifetime bound, `set_sig_budget`'s ratchet, the lockbox's
+    // outbound-HTTPS call and `OPEN_TRANSFER_WINDOW_SQL`'s hard-coded hour. Each is a claim about
+    // WHAT A SPECIFIC LINE SAYS, which is the one case a positional quote is the honest form; the
+    // prose around them also names the symbol, so a rotted line number cannot pass silently.
+    ("docs/utexo/DECISIONS.md", 36),
     ("docs/utexo/LIGHTNING.md", 16),
-    // [D60] The three the hand-list omitted. These are RATCHETS, not exemptions: the counts are what
-    // was there when the census was widened to see them, and they may only go DOWN. Fixing 281
-    // citations in one pass would be 281 chances to introduce a new wrong one, so they are frozen
-    // where they stand and re-symbolised as each document is next edited for its own reasons.
-    ("docs/utexo/GRANULARITY-SPEC.md", 134),
-    ("docs/utexo/SUBECONOMIC-FINALITY.md", 83),
-    ("docs/utexo/INVALIDATION-SPEC.md", 64),
+    // [D60]'s three ratchets (GRANULARITY-SPEC 134, SUBECONOMIC-FINALITY 83, INVALIDATION-SPEC 64)
+    // are GONE — those documents were retired on 2026-08-15, taking 281 un-symbolised citations with
+    // them. The ratchets existed because fixing 281 citations in one pass was 281 chances to
+    // introduce a new wrong one; deleting the documents resolved them the other way. Nothing was
+    // re-symbolised and nothing needs to be: no surviving normative document carries those claims.
 ];
 
 fn read(rel: &str) -> String {
@@ -190,17 +205,17 @@ fn the_detector_finds_a_line_citation_and_ignores_prose() {
 fn the_derivation_actually_finds_every_normative_document() {
     let docs = normative_docs();
     for must in [
-        // the three the hand-list omitted — the whole point of D60
-        "docs/utexo/GRANULARITY-SPEC.md",
-        "docs/utexo/SUBECONOMIC-FINALITY.md",
-        "docs/utexo/INVALIDATION-SPEC.md",
-        // and the ones it already had, so widening cannot silently narrow
+        // 2026-08-15: GRANULARITY-SPEC, SUBECONOMIC-FINALITY and INVALIDATION-SPEC — [D60]'s three
+        // finds — were RETIRED with the rest of the point-in-time and folded-feature docs. They are
+        // removed from this list rather than left to fail, and PARTIAL-PAYMENT-ECONOMICS takes their
+        // place: SPEC §5.4 now defers to it for every per-payment figure, so the same argument that
+        // made TRUST-MODEL normative ("a document the specification defers to is normative") applies.
+        "docs/utexo/PARTIAL-PAYMENT-ECONOMICS.md",
         "docs/utexo/SPEC.md",
         "docs/utexo/PROTOCOL.md",
         "docs/utexo/CHILDREN.md",
         "docs/utexo/LIGHTNING.md",
         "docs/utexo/TRUST-MODEL.md",
-        "docs/utexo/ADMISSION-INPUTS.md",
         "docs/utexo/DECISIONS.md",
     ] {
         assert!(

@@ -17,7 +17,7 @@ use crate::types::{SdkError, TokenBalance, TransferResult, TransferredCoin};
 use crate::wallet::UtexoWallet;
 
 // The global `TOKEN_BLINDING: u64 = 777` that used to live here is GONE. Its doc comment claimed
-// "a fixed value is fine"; `docs/utexo/CTESR-GATE.md` §2.2/§4.2 measured that claim and it is
+// "a fixed value is fine"; CTESR-GATE (retired 2026-08-15) §2.2/§4.2 measured that claim and it is
 // conditionally FALSE. Two RGB transitions over the SAME parent outpoint with equal amounts and
 // equal blinding collapse to one `OpId` and one `BundleId`, and rgb-lib then resolves that BundleId
 // to whichever rival witness has the numerically smallest INTERNAL (little-endian) txid — an
@@ -320,7 +320,7 @@ fn batch_split_seal(carrier_id: &str, generation: u32, arity: u32) -> TierSeal {
     TierSeal::new(carrier_id, TierRole::Split, generation, BATCH_SPLIT_RUNG_FLAG | arity)
 }
 
-/// The CTES-R build-time collision assert (`docs/utexo/CTESR-GATE.md` §3.1), for the lanes that
+/// The CTES-R build-time collision assert (CTESR-GATE (retired 2026-08-15) §3.1), for the lanes that
 /// colour through `RgbWallet::color` (`create_colored_split_tx` / `create_colored_combine_tx`)
 /// rather than through `mercuryrustlib::rgb::build_colored_tier`, which carries the guard itself.
 ///
@@ -1759,7 +1759,7 @@ impl UtexoWallet {
     /// after which the loser's consignment embeds the rival's witness and the allocation is simply
     /// unclaimable off-chain (the collision this module's `TierSeal` exists to prevent). Zero is a
     /// real generation, never a stand-in for "could not read".
-    /// **[CTES-R] Is a coin's coloured ladder still alive?** The health check `CTESR-GATE.md` §3.3
+    /// **[CTES-R] Is a coin's coloured ladder still alive?** The health check CTESR-GATE (retired 2026-08-15) §3.3
     /// mandates, and the ONLY kind that works.
     ///
     /// Never assert carrier liveness on `get_asset_balance` or `list_unspents`: E7 measured both
@@ -2292,7 +2292,7 @@ impl UtexoWallet {
     ///     witness list `[T, X_m, SP, ext_child, state_child]` through the fork's `OffchainResolver`
     ///     — never the plain blockchain resolver, which reports every deliberately-un-broadcast tier
     ///     `Unresolved`, archives it, and recursively invalidates the chain with no error and no
-    ///     repair (`CTESR-GATE.md` §2.3);
+    ///     repair (CTESR-GATE (retired 2026-08-15) §2.3);
     ///  2. the amount comes from the CONSIGNMENT, read at `state_child`'s payload output, never from
     ///     the sender's `ColoredChild::amount` field, and the two must agree;
     ///  3. EVERY seal is opened, `SP`'s and `ext_child`'s included. Missing `ext_child`'s payload

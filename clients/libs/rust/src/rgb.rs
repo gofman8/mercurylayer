@@ -137,7 +137,7 @@ pub async fn create_colored_backup_tx(
     // present (so the recipient is at vout 1), but appends it last for non-taproot recipients
     // (recipient stays at vout 0) - so compute it, don't assume.
     //
-    // ⚠️ Hardened per `docs/utexo/CTESR-GATE.md` §4.3. The previous derivation
+    // ⚠️ Hardened per CTESR-GATE (retired 2026-08-15) §4.3. The previous derivation
     // (`position(|o| !o.script_pubkey.is_op_return()).unwrap_or(0)`) was correct only *by accident*
     // for the one-payload case: it returns the wrong vout for any tx with a second non-opret output
     // (a P2A anchor, a change output, a multi-payload split), and its `unwrap_or(0)` turned "there
@@ -714,7 +714,7 @@ fn tx_nlocktime(tx_hex: &str) -> Result<u32> {
 // =================================================================================================
 // CTES-R — per-tier seal blinding, and the coloured tier builder
 //
-// Gate decision: `docs/utexo/CTESR-GATE.md` §3.1 (blinding), §3.4 (fee), §3.5 (builder), §4.3
+// Gate decision: CTESR-GATE (retired 2026-08-15) §3.1 (blinding), §3.4 (fee), §3.5 (builder), §4.3
 // (hardened vout derivation). Nothing here is wired into the live TES-R ladder — this is the
 // unit-level foundation the "colour a live T over a real F" commit is built on.
 // =================================================================================================
@@ -805,7 +805,7 @@ impl TierRole {
 /// that BundleId to whichever rival witness has the numerically smallest **internal** (LE) txid — an
 /// arbitrary hash lottery uncorrelated with recency. The loser's consignment embeds the rival's
 /// witness and **no branch the receiver can try will validate**
-/// (`docs/utexo/CTESR-GATE.md` §2.2). The single global `TOKEN_BLINDING = 777` armed exactly that.
+/// (CTESR-GATE (retired 2026-08-15) §2.2). The single global `TOKEN_BLINDING = 777` armed exactly that.
 ///
 /// **The uniqueness obligation.** Uniqueness must hold over the whole
 /// `(parent outpoint, role, index)` space: two tiers sharing a parent output must NEVER share a
@@ -876,7 +876,7 @@ fn is_p2a(script_pubkey: &ScriptBuf) -> bool {
 /// The PAYLOAD (value-carrying) output indices of a coloured transaction, in ascending vout order:
 /// every output that is **neither** the RGB `opret` commitment **nor** the P2A anchor.
 ///
-/// `docs/utexo/CTESR-GATE.md` §3.5/§4.3: the P2A anchor script is *not* an OP_RETURN
+/// CTESR-GATE (retired 2026-08-15) §3.5/§4.3: the P2A anchor script is *not* an OP_RETURN
 /// (`is_op_return = false`, `is_v1_p2tr = false`, `is_witness_program = true`), so the older
 /// `!is_op_return` filter counts it as a payload — observed tripping `create_colored_split_tx`'s own
 /// `output_vouts.len() != splits.len()` guard at both n=1 and n=3. Callers must still assert the
@@ -942,7 +942,7 @@ pub fn colored_tier_vbytes(n_payload: usize) -> u64 {
 
 /// The committed fee a **coloured** tier must bake in: `⌈colored_tier_vbytes(n_payload) · rate⌉`.
 ///
-/// `docs/utexo/CTESR-GATE.md` §3.4, corrected by [D4]. Two separate costs over the uncoloured tier:
+/// CTESR-GATE (retired 2026-08-15) §3.4, corrected by [D4]. Two separate costs over the uncoloured tier:
 ///
 /// 1. the RGB `opret` output serialises to exactly 43 bytes, which is exactly `P2TR_OUT_VBYTES`, so
 ///    the coloured tier is one whole extra P2TR output wide — that part was already right;
@@ -1092,7 +1092,7 @@ fn tier_out_spk(address: &str, network: &str) -> Result<ScriptBuf> {
 /// **[CTES-R] The §3.3 stock probe: is `amount` of `contract_id` still spendable out of
 /// `(txid, vout)`?**
 ///
-/// The health check `docs/utexo/CTESR-GATE.md` §3.3 mandates and the only one that works. It builds
+/// The health check CTESR-GATE (retired 2026-08-15) §3.3 mandates and the only one that works. It builds
 /// a throwaway one-input, one-output spend of the outpoint and hands it to
 /// [`mercury_rgb::RgbWallet::probe_spendable`], which runs rgb-lib's **read-only** `color_psbt`:
 /// nothing is consumed, no transfer row is written, no witness is resolved, and the coin is
@@ -1158,7 +1158,7 @@ const PROBE_BLINDING: u64 = 0;
 
 /// **Build and colour ONE TES-R tier**, returning EXPLICIT payload vouts.
 ///
-/// This is the CTES-R tier builder mandated by `docs/utexo/CTESR-GATE.md` §3.5. It deliberately does
+/// This is the CTES-R tier builder mandated by CTESR-GATE (retired 2026-08-15) §3.5. It deliberately does
 /// **not** reuse [`create_colored_split_tx`]: that function's `!is_op_return` vout filter counts the
 /// P2A anchor as a payload and trips its own length guard (observed at n=1 and n=3).
 ///
@@ -1429,7 +1429,7 @@ mod ctesr_tests {
     // per-role blinding-uniqueness assertions below, so a role missing here is a role whose seals
     // were never proved distinct from anyone else's. `ChildExtension`/`ChildState` arrived with the
     // coloured in-ladder split and were absent from this list, which is exactly the shape of hole
-    // that ships a seal collision (`docs/utexo/CTESR-GATE.md` §2.2).
+    // that ships a seal collision (CTESR-GATE (retired 2026-08-15) §2.2).
     const ROLES: [TierRole; 11] = [
         TierRole::Funding,
         TierRole::Trigger,

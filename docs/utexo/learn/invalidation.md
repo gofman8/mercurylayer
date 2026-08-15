@@ -3,8 +3,8 @@
 > Short comparison page. For the full explainer — lifecycle walkthroughs, over-time behaviour,
 > failure scenarios, UX, and FAQ — see [invalidation-deep-dive.md](invalidation-deep-dive.md);
 > the shipped ladder is specified in [PROTOCOL.md](../PROTOCOL.md) (§5.2–§5.9), the normative
-> requirements in [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md), and the pricing in
-> [invalidation-economics.md](../research/invalidation-economics.md).
+> requirements in INVALIDATION-SPEC (retired 2026-08-15), and the pricing in
+> invalidation-economics (retired 2026-08-15).
 
 How do you stop a previous owner (or a malicious current owner) from using old off-chain state?
 Every L2 answers differently. This page compares the designs we reviewed — Spark, Ark (and
@@ -192,7 +192,7 @@ any piece + change, chainable to depth, each piece a full coin. The mechanics di
 
 Granularity is strictly better than both comparators in every shape. Exact bounds, token packaging
 and pricing: the granularity pack — [deep dive](granularity-deep-dive.md),
-[GRANULARITY-SPEC](../GRANULARITY-SPEC.md), [economics](../research/granularity-economics.md).
+GRANULARITY-SPEC, economics.
 
 ## Unilateral exit economics
 
@@ -205,7 +205,7 @@ and pricing: the granularity pack — [deep dive](granularity-deep-dive.md),
 
 Fees at other rates: multiply the vsize column (e.g. depth-1 un-laddered = 534 sats @2 sat/vB,
 8,010 @30). Recorded and modelled figures, with the USD tables and the fee-spike analysis, are in
-[invalidation-economics.md](../research/invalidation-economics.md). The laddered exit is driven live
+invalidation-economics (retired 2026-08-15). The laddered exit is driven live
 by `sdk50` (the flat tier walk) and `sdk58`/`sdk59` (in-ladder split children); the un-laddered
 depth exit by `sdk39` (depth-2 colored branch, allocation preserved).
 

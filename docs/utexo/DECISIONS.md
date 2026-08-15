@@ -1,12 +1,12 @@
 # DECISIONS — the Mercury Utexo specification
 
 Status: open record, started 2026-08-10. It began as one entry per decision from
-[`SPEC-ROADMAP.md`](SPEC-ROADMAP.md) §2, of which four were taken on day one (D0, D7, D1, D2 — the
+SPEC-ROADMAP (retired 2026-08-15) §2, of which four were taken on day one (D0, D7, D1, D2 — the
 order is deliberate, not numeric). **All twenty-one roadmap decisions D0–D20 are now taken, and the
 record continues past them to D40**: everything from D21 on is a decision the roadmap did not
 contain, forced by the answers given to the ones that did. **Twenty of the twenty-one have an entry
 here; D4 does not, and that is deliberate** — it was answered in round 2 in
-[`SPEC-ROADMAP.md`](SPEC-ROADMAP.md) §D4 ("*the proof HOLDS … D4 collapses to a deletion plus a
+SPEC-ROADMAP (retired 2026-08-15) §D4 ("*the proof HOLDS … D4 collapses to a deletion plus a
 restatement*") and merged there into D8 ("*D4 and D8 are therefore one decision, not two*"), so its
 residual is carried by the D8 row below rather than by an entry of its own. D4 appears in this file
 only where that merge shows through, as the rejected `{level, m, k}` counter machine.
@@ -27,7 +27,7 @@ verifier's refusal set, the wire format, and the receiver's admission rules.
 
 This rule exists because the previous corpus went comprehensively stale in about two weeks — CATS-B
 change 2, leaf combine, leaf renewal, `POST /transfer/cancel` and the re-anchor `Void` change all
-landed inside the window its own surveys audited (`SPEC-ROADMAP.md` D0). A three-month specification
+landed inside the window its own surveys audited (SPEC-ROADMAP (retired 2026-08-15) D0). A three-month specification
 written against that rate of change does not converge. The exception path is not "ask first"; it is
 "land both halves together".
 
@@ -43,7 +43,7 @@ cryptographic constructions, the SE contract, deposit/onboarding, authorization,
 liveness and the watchtower obligation, cooperative exit, durability and recovery, and the interop
 encodings. Not published in parts.
 
-**Binds:** the spec's own table of contents (`SPEC-ROADMAP.md` §5). No section may be dropped to
+**Binds:** the spec's own table of contents (SPEC-ROADMAP (retired 2026-08-15) §5). No section may be dropped to
 make a date.
 
 **Consequence, stated plainly:** nothing is externally reviewable until all of it is ready. The
@@ -54,7 +54,7 @@ now contains.
 
 **Also pulled in:** four subsystems still have **zero** survey passes — cryptographic constructions,
 the SE (lockbox) contract, deposit/onboarding and authorization, and the confirmation/reorg half of
-the chain model (`SPEC-ROADMAP.md` §4b). Under a ladder-only v1 those were out of scope. Under this
+the chain model (SPEC-ROADMAP (retired 2026-08-15) §4b). Under a ladder-only v1 those were out of scope. Under this
 decision they are all in, and they must be surveyed before their sections can be drafted.
 
 ---
@@ -165,7 +165,7 @@ the CSV-separated rungs (`T→X`, `X→S`, `SP→ext`) and **never** to `SP_i �
 
 ## D3–D20 — the remaining sixteen, taken 2026-08-10
 
-All follow the roadmap's recommendation. Full context for each is in `SPEC-ROADMAP.md` §2; recorded
+All follow the roadmap's recommendation. Full context for each is in SPEC-ROADMAP (retired 2026-08-15) §2; recorded
 here is the answer, and the consequence where it is not obvious.
 
 | # | Decided | Note |
@@ -173,7 +173,7 @@ here is the answer, and the consequence where it is not obvious.
 | **D3** | Renewal and rollover are **caller-driven primitives**. Normative end-of-life rule: at `d_floor` the coin is terminal — exit unilaterally, or re-anchor cooperatively. Compaction REQUIRED at the depth cap, threshold left to implementations. Publish `V_min(d, r)` as a table over fee rate; name sub-economic finality as a limitation. | This makes `PROTOCOL.md:295` and `:348` **wrong**, not merely undocumented — they claim renewal and rollover run automatically inside `transfer()`, and there are zero call sites. WP7 deletes those claims rather than building to them. |
 | **D5** | Tier rate is a **per-network constant, receiver-enforced by equality**; the tolerance band is retained for flat backups with a normative width; publish both. | **Gated on the P2A spike (WP1).** If a tier cannot be reliably fee-bumped through its anchor above 2 sat/vB, equality is unsound as stated and this decision reopens. Do not draft §12's fee clauses before the spike reports. |
 | **D6** | **Re-derive the exit-cost model from measured vsizes** at depths 0..3 through the production finaliser; change the receiver admission rule; re-pin every test; regenerate all doc figures from the constant. | Sequenced **after D7**. This is not documentation regeneration — `max_exit_txs` is an admission rule, so re-deriving changes *which conveyed bundles a receiver admits*. Budget the test churn. |
-| **D8** | **Enumerated trust assumption**, published alongside R1–R9: `num_sigs`, the `statechain_id ↔ aggregate` binding, mailbox availability and ordering, tip service if proxied. SE-signed counts named as the closure path. | **VERIFIED 2026-08-10 — answer is NO, and it is theft-class.** `sig_count` travels as a bare JSON integer with no signature, MAC, attestation, freshness token or id-echo at any hop. The enclave — the only trusted crypto core — never reads or signs the count; it is pure host/DB state (`lockbox/src/enclave.cpp:139-204`, `db_manager.cpp:465-474`). The coordinator does `response["sig_count"].as_u64().unwrap()` and re-emits it (`server/src/endpoints/transfer_receiver.rs:67`); the client trusts it as the census RHS with no independent cross-check (`clients/libs/rust/src/tesr.rs:9093`). A coordinator that **under-reports** by k hides k co-signed rival states — the exact-equality census balances and the receiver (or an LN SSP paying an irreversible leg) accepts a coin the sender can still reclaim. This is exactly the defect the census exists to stop, resting entirely on coordinator honesty. **The "excluded scope, so state it rather than close it" verdict recorded here was overtaken the next day and is retained only as the diagnosis that motivated the fix** — D22 lifted the SE scope rule, and the count is now CLOSED on the Rust lane, not merely enumerated: `get_statechain_info` (`clients/libs/rust/src/utils.rs`) sends a per-request random 32-byte nonce and **refuses** any response lacking a `utexo/sig_count/v2` signature over `(statechain_id, num_sigs, sig_budget, nonce)`, verified by `verify_sig_count_attestation` against the **chain-anchored** `enclave_public_key` — not against the served attestation key, which would accept a coordinator signing with a key of its own. `has_sig_budget: None` is refused rather than defaulted. See D22 (D8-CLOSE), D28 (the budget ratchet) and D40.2 (consuming it at the acceptance decision). **Both JS clients still compare `statechainInfo.num_sigs` unattested** (`nodejs/transfer_receive.js`, `web/transfer_receive.js`) — that half is open and is stated as a named limitation by D39.3. Full write-up: [`notes/D8-SIGCOUNT-AUTH.md`](notes/D8-SIGCOUNT-AUTH.md), which carries the same superseded verdict. Runner-up theft-class row: the coordinator-computed `terminal` flag — closed by D40.2. Also schedules the `aggregate_xonly` backfill for pre-0009 rows, which nothing owned. |
+| **D8** | **Enumerated trust assumption**, published alongside R1–R9: `num_sigs`, the `statechain_id ↔ aggregate` binding, mailbox availability and ordering, tip service if proxied. SE-signed counts named as the closure path. | **VERIFIED 2026-08-10 — answer is NO, and it is theft-class.** `sig_count` travels as a bare JSON integer with no signature, MAC, attestation, freshness token or id-echo at any hop. The enclave — the only trusted crypto core — never reads or signs the count; it is pure host/DB state (`lockbox/src/enclave.cpp:139-204`, `db_manager.cpp:465-474`). The coordinator does `response["sig_count"].as_u64().unwrap()` and re-emits it (`server/src/endpoints/transfer_receiver.rs:67`); the client trusts it as the census RHS with no independent cross-check (`clients/libs/rust/src/tesr.rs:9093`). A coordinator that **under-reports** by k hides k co-signed rival states — the exact-equality census balances and the receiver (or an LN SSP paying an irreversible leg) accepts a coin the sender can still reclaim. This is exactly the defect the census exists to stop, resting entirely on coordinator honesty. **The "excluded scope, so state it rather than close it" verdict recorded here was overtaken the next day and is retained only as the diagnosis that motivated the fix** — D22 lifted the SE scope rule, and the count is now CLOSED on the Rust lane, not merely enumerated: `get_statechain_info` (`clients/libs/rust/src/utils.rs`) sends a per-request random 32-byte nonce and **refuses** any response lacking a `utexo/sig_count/v2` signature over `(statechain_id, num_sigs, sig_budget, nonce)`, verified by `verify_sig_count_attestation` against the **chain-anchored** `enclave_public_key` — not against the served attestation key, which would accept a coordinator signing with a key of its own. `has_sig_budget: None` is refused rather than defaulted. See D22 (D8-CLOSE), D28 (the budget ratchet) and D40.2 (consuming it at the acceptance decision). **Both JS clients still compare `statechainInfo.num_sigs` unattested** (`nodejs/transfer_receive.js`, `web/transfer_receive.js`) — that half is open and is stated as a named limitation by D39.3. Full write-up: D8-SIGCOUNT-AUTH (retired 2026-08-15), which carries the same superseded verdict. Runner-up theft-class row: the coordinator-computed `terminal` flag — closed by D40.2. Also schedules the `aggregate_xonly` backfill for pre-0009 rows, which nothing owned. |
 | **D9** | **Freeze the current serde shape** as the normative wire format. Specify field by field; make absent-vs-null explicit and REQUIRED-to-reject wherever absence is currently free; write the ancestry disclosure-completeness rule. | The disclosure rule is not optional detail: a receiver cannot check that an ancestor split state's outputs do not exceed its funding without knowing what it is entitled to be shown. Pairs with WP3b. |
 | **D10** | **Commission the analysis** in week 1 alongside the P2A spike. | Still not answered — deliberately. If the retained checks (INV-5 rejecting duplicates and inversions) already cover what blinding-commitment verification would, accepting it is honest and cheap. If not, it is an excluded-scope collision and must surface in week 1, not week 6. |
 | **D11** | **Fix the encodings before freezing.** Add bech32/checksum and a version tag to the invoice; decide explicitly whether coin type 0 on testnet/signet is deliberate or a defect. | Freezing an unchecksummed, unversioned payment request in a v1 spec cannot be walked back, and field-typo losses in the wild are the predictable result. Also in WP6b: `decode_transfer_address` **panics** on a short-but-valid Bech32m payload. |
@@ -291,7 +291,7 @@ past; it is not licence to make the specification version-blind.
 and D8 all call "the only complete fix" **cannot run** — measured: 0 of 8,155 NULL rows are
 backfillable, because migration 0009 added `user_public_key` and `aggregate_xonly` in one statement
 so the rows that lack one lack both, and the coordinator stores no chain data to recover the
-aggregate from (`notes/AGGREGATE-XONLY-BACKFILL.md`).
+aggregate from (AGGREGATE-XONLY-BACKFILL (retired 2026-08-15)).
 
 **The fact that decided it: new coins are never affected.** Every post-0009 deposit records both
 values, which is why the populated counts are identical (3,793 / 3,793). This is a legacy-data
@@ -326,7 +326,7 @@ coordinator will be refused. Those coins are expendable.
 (`server/Settings.toml`), which silently ran the regtest schedule and therefore admitted a
 **139-transaction exit chain** — ~135 consecutive zero-CSV spine tiers, whose TRUC relay stall
 (~68 blocks at two in flight) exceeds the entire toy state schedule
-(`notes/WP1-TRUC-P2A-SPIKE.md`). On the mainnet schedule that combination does not arise.
+(WP1-TRUC-P2A-SPIKE (retired 2026-08-15)). On the mainnet schedule that combination does not arise.
 
 ---
 
@@ -500,7 +500,7 @@ neighbouring pair; a co-sign attempt on that coin → **410**, while a no-budget
 
 ## D29 — The coloured re-anchor is **CR-D, a coloured de-trigger** (closes the CR-A/B/C spike)
 
-**Decided 2026-08-11** on the evidence in `COLOURED-SPINE-REANCHOR-SCOPE.md` §2.
+**Decided 2026-08-11** on the evidence in COLOURED-SPINE-REANCHOR-SCOPE (retired 2026-08-15) §2.
 
 The question as originally posed — "which of CR-A/CR-B/CR-C, or an SE-assisted variant?" — had a
 false premise. D1 assumed the coloured re-anchor means "colour the refresh transaction", and that is
@@ -519,7 +519,7 @@ one-transaction form is *also* available. Build CR-D; run G2 as an optimisation 
 BLOCKER 1, a live theft path in the plain spine. That is closed — the Σ-payload law on `SP` and the
 relay-aware supersession race (D26, both halves), each with an attack test. **BLOCKER 2 (W1, the
 fee-bump workstream) is now the largest**, and its open question is priced in
-`notes/CPFP-WHO-FUNDS-IT.md`.
+CPFP-WHO-FUNDS-IT (retired 2026-08-15).
 
 *(Both have since closed. W1's open question — who funds the child — was answered by D31, and the
 path was then built: `core_rpc.rs`, `build_p2a_fee_child`, and `watch_pass_with_bump` /
@@ -559,7 +559,7 @@ destroyed an RGB allocation on a materialised carrier is closed (RGB Stage 0).
 
 ## D31 — Fee-bumping is **owner-funded** (A); the **funded tower** (B) is a documented deployment option
 
-**Decided by the owner 2026-08-11**, on `notes/CPFP-WHO-FUNDS-IT.md`. Options (C) third-party fee
+**Decided by the owner 2026-08-11**, on CPFP-WHO-FUNDS-IT (retired 2026-08-15). Options (C) third-party fee
 service and (D) raising `committed_fee_rate` are **not** taken.
 
 ### What was actually decided
@@ -601,7 +601,7 @@ rate.
 | child fee paid in the run | **180 330 sats**, against a **754-sat requirement** (318 vB package × 3 sat/vB = 954, less the parent's 200). A ~239× overpay **chosen by the funding wallet, not a derived cost**: WP1 §2's own log puts the child at **177 vB**, i.e. **~1 019 sat/vB** on the child alone, lifting the package to the recorded 5.68 sat/vB against a 3 sat/vB floor. *(A `maxfeerate` clause stood here and was wrong: WP1's `maxfeerate` trip belongs to a **different transaction** — the separately-built literal-`51024e73` broadcast in "What this run did NOT establish" item 1. §2's package records no such trip, and at ~1 019 sat/vB it is far under Core's 10 000 sat/vB default, so it could not have tripped. The "chosen, not derived" reading rests on the 754-vs-180 330 arithmetic alone, which is enough.)* |
 
 **The "~900×" ratio that used to sit here was wrong, and it is quoted in other documents.** Its
-source (`notes/CPFP-WHO-FUNDS-IT.md`) computes 180,330 / **200** — the ratio to the *parent's fee* —
+source (CPFP-WHO-FUNDS-IT (retired 2026-08-15)) computes 180,330 / **200** — the ratio to the *parent's fee* —
 and this record re-based it onto the 240-sat **anchor**, which gives 751×, while also borrowing the
 240 from a *different* run (§2's parent carried a placeholder output; the literal `51024e73` anchor
 was exercised separately). **And 180,330 is not a cost this repo's fee law imposes — it is a target a
@@ -698,7 +698,7 @@ spec is drafted, so §10 states the losses rather than a reader discovering them
 The question the scope doc carried unanswered since it was written, and the reason **P3** sat in the
 middle of the estimate as a coin-flip. Decided: **build it.** RGB assets traverse Lightning in v1.
 
-**What that actually costs**, from `COLOURED-SPINE-REANCHOR-SCOPE.md` P3 — the plumbing is the easy
+**What that actually costs**, from COLOURED-SPINE-REANCHOR-SCOPE (retired 2026-08-15) P3 — the plumbing is the easy
 half and is already there (`convey_child_bundle(.., batch_id)`; the plain lane already passes it).
 The real work is two things:
 
@@ -1273,7 +1273,7 @@ killing the entire simulated payment range to insure a marginal exposure the pas
 The slack is the piece's entire tolerance for confirmation variance, fee stall and reorg across a
 2,885-block walk — and **the sender chooses it by choosing when to convey**. The margin removes that
 free lever. Cost: late-in-epoch conveyances are refused, forcing a re-anchor — a liveness cost, in the
-direction `ADMISSION-INPUTS.md` already names as the safe one.
+direction ADMISSION-INPUTS (retired 2026-08-15) already names as the safe one.
 
 *Two corrections to the record.* The aggregate is **constructible and UNEVALUATED**, not unbounded:
 the loss set `Σ V_i · 1[V_i < V_min(d_i, r)]` is monotone in `r` and **saturates** at the piece lane's
@@ -1401,7 +1401,7 @@ worked around.
 > happening.
 
 **What this does NOT decide.** The coloured spine and coloured re-anchor stay scoped-but-unbuilt
-(16–21 weeks, `COLOURED-SPINE-REANCHOR-SCOPE.md`). K=1 is a statement about batching, not about the
+(16–21 weeks, COLOURED-SPINE-REANCHOR-SCOPE (retired 2026-08-15)). K=1 is a statement about batching, not about the
 ladder.
 
 ### What the rewrite MEASURED (`sdk29`, live, 2026-08-13)
@@ -2206,7 +2206,7 @@ points at rules a test would actually catch.
 
 `deny_line_number_citations_in_normative_docs::NORMATIVE` was a hand-list of seven.
 `docs/utexo/README.md` labels ten documents `*Normative.*`, and the three the list omitted —
-`GRANULARITY-SPEC.md` (**134** citations), `SUBECONOMIC-FINALITY.md` (**83**), `INVALIDATION-SPEC.md`
+GRANULARITY-SPEC (retired 2026-08-15) (**134** citations), SUBECONOMIC-FINALITY (retired 2026-08-15) (**83**), INVALIDATION-SPEC (retired 2026-08-15)
 (**64**) — held **281** line citations between them. Two sampled at random were both rotted.
 
 The set is now **derived from the README's labels**, so adding a doc to the normative set enrols it
@@ -2258,7 +2258,7 @@ polices what someone remembered, not what exists. Derive the set, then pin the d
   `SpineTip` (`PlainRoot | SpineBatch`, and `Colored` on its own arm) and **one** reports `Piece`.
   The comment was written when only `PlainRoot` had flipped and the `Colored` arm's own landing note
   was added beneath it without updating the count. `SPEC.md` §12 ERR-16 was the correct half.
-* **`ADMISSION-INPUTS.md`'s residual** — *"A sender declaring wide params relaxes its own bounds
+* **ADMISSION-INPUTS (retired 2026-08-15)'s residual** — *"A sender declaring wide params relaxes its own bounds
   check"* — is **CLOSED on every shipping acceptance path** (`cap_schedule` runs at both receiver
   sites and in `verify_conveyed_child`; `schedule_disagreement` compares all seven integral fields
   plus the fee rate). Deleted rather than re-scoped.
@@ -3274,7 +3274,7 @@ the payee offline for 48 hours (well past the one-hour window), have the PAYER a
 A free, anonymous, prepaid detonator held by every bundle holder was the proximate cause of death in
 all three candidate designs. Tiers must be committed **below** the mempool floor so they cannot relay
 standalone, and relay only as TRUC 1P1C packages — measured in-tree already
-(`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`: a v3 parent at ~1 sat/vB rejected alone, accepted as a
+(WP1-TRUC-P2A-SPIKE (retired 2026-08-15): a v3 parent at ~1 sat/vB rejected alone, accepted as a
 package with both transactions inheriting one effective feerate). **Cost, stated:** an exiter then
 needs outside funds, and `create_cpfp_tx` must first be fixed to price the *package* rather than the
 child alone. That is an existing condition surfaced, not a new one — at any market rate above 3 sat/vB

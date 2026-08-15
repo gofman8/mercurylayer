@@ -24,7 +24,7 @@
 > coloured **de-trigger** whose relative lock is disabled: two txs, zero CSV wait, no SE change).
 > A coloured coin therefore no longer has a bounded life ending in a forced exit.
 >
-> Mechanism and status: [CTESR-GATE.md](CTESR-GATE.md). Colouring is **wired but default-OFF**
+> Mechanism and status: CTESR-GATE (retired 2026-08-15). Colouring is **wired but default-OFF**
 > (`SdkConfig::colored_ladder = false` on both presets): the claim path builds and co-signs a
 > coloured ladder when it is on (`build_colored_ladder_auto` / `cosign_colored_ladder`), the coloured
 > in-ladder split pays from it, CR-D re-anchors it, and `defend_ladders` watches it. Everything below
@@ -38,8 +38,8 @@ the residual boundaries that no protocol change can remove. Companion explainers
 *why a timeout at all*), [exits.md](learn/exits.md), [tokens.md](learn/tokens.md); normative
 requirements in [SPEC.md](SPEC.md), [PROTOCOL.md](PROTOCOL.md) (the TES-R ladder),
 [CHILDREN.md](CHILDREN.md) (first-class split children),
-[INVALIDATION-SPEC.md](INVALIDATION-SPEC.md), [GRANULARITY-SPEC.md](GRANULARITY-SPEC.md);
-adversarial findings in [AUDIT-2026-07.md](AUDIT-2026-07.md).
+INVALIDATION-SPEC (retired 2026-08-15), GRANULARITY-SPEC (retired 2026-08-15);
+adversarial findings in AUDIT-2026-07 (retired 2026-08-15).
 
 The one-line summary: **nothing here asks the user to trust a counterparty. The trust that
 remains is confined to (a) one well-known statechain assumption about the SE, (b) the user's own

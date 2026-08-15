@@ -3,7 +3,7 @@
 //!
 //! A statechain coin's decrementing-`nLockTime` ladder is a finite budget: `initlock` blocks of
 //! headroom, spent by BOTH hops (`interval` per transfer) and wall-clock time (~144 blocks/day) —
-//! see [INVALIDATION-SPEC.md](../../../docs/utexo/INVALIDATION-SPEC.md). When it nears the floor the
+//! see INVALIDATION-SPEC (retired 2026-08-15). When it nears the floor the
 //! coin becomes un-transferable (the receiver rejects a backup whose locktime is at/below the tip,
 //! `MercuryError::LocktimeTooLow`) and must be moved to L1. There is deliberately no off-chain
 //! renewal (a split-to-self resets a *leaf* ladder but not the tree's root deadline). `refresh` is

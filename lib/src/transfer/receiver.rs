@@ -459,7 +459,7 @@ pub fn ladder_decrements_by_interval(prev_lock_time: u32, current_lock_time: u32
 /// RESIDUAL: the backup chain's blinded-MuSig commitments are not verified for a laddered coin (the
 /// tiers are, via `verify_bundle`'s signature check). Closing it needs the SE's `tx_n` ↔ co-sign
 /// indexing to distinguish tier co-signs from backup co-signs — tracked in
-/// `docs/utexo/history/SPLIT-FINDINGS.md`.
+/// SPLIT-FINDINGS (retired 2026-08-15).
 pub fn validate_backup_chain_v2(
     backup_transactions: &Vec<BackupTx>,
     tx0_hex: &str,
@@ -936,7 +936,7 @@ pub fn check_exit_headroom(
 /// own preset. Nothing exogenous enters.
 ///
 /// The cost is a liveness cost — a late-in-epoch conveyance is refused and the sender must re-anchor
-/// first — and it falls in the direction `ADMISSION-INPUTS.md` already names as the safe one.
+/// first — and it falls in the direction ADMISSION-INPUTS (retired 2026-08-15) already names as the safe one.
 pub fn exit_slack_margin(csvs: &[Option<u16>]) -> u32 {
     let required = exit_wait_blocks(csvs);
     let per_tier = if csvs.is_empty() { 0 } else { required / csvs.len() as u32 };

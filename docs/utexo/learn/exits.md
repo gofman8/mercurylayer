@@ -10,9 +10,9 @@
 >
 > The **un-laddered** shape — RGB carriers and split sub-coins whose funding tx is un-broadcast — keeps
 > the older signed-once backup with an **absolute** locktime, and therefore keeps a root deadline. The
-> deadline arithmetic and pricing in [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) §6,
+> deadline arithmetic and pricing in INVALIDATION-SPEC (retired 2026-08-15) §6,
 > [invalidation-deep-dive.md](invalidation-deep-dive.md) and
-> [invalidation-economics.md](../research/invalidation-economics.md) describe **that shape** (and the
+> invalidation-economics (retired 2026-08-15) describe **that shape** (and the
 > pre-migration baseline they were written against) — not the laddered one.
 >
 > Token-carrier coins exit differently again — both plain paths refuse them (an RGB-unaware sweep
@@ -21,7 +21,7 @@
 > emitting `TokenCarrierMaterialized`), so token pieces still get automated deadline protection
 > (SPEC §9.5 / REQ-33, `sdk34`); an issued/flat carrier has no ancestor and is left untouched. See
 > [tokens.md "Exits with tokens"](tokens.md#exits-with-tokens) and
-> [GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md) GRN-INV-14.
+> GRANULARITY-SPEC (retired 2026-08-15) GRN-INV-14.
 
 ## Deposits
 
@@ -120,7 +120,7 @@ split/combine txs from the on-chain root down to the coin's funding output, cons
 *decrementing absolute* scheme. Every previous owner's backup unlocks *later* than yours, so you have a
 window in which only you can claim. This shape, and only this shape, carries a genuine calendar duty —
 act (materialize, or move the coin) before the root deadline, per
-[INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) §6 — and it is exactly the shape `auto_exit_due` was
+INVALIDATION-SPEC (retired 2026-08-15) §6 — and it is exactly the shape `auto_exit_due` was
 built to cover on your behalf.
 
 One guard worth knowing: `unilateral_exit` refuses a coin that is not `CONFIRMED` — a parent already

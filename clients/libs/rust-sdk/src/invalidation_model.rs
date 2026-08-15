@@ -1,5 +1,5 @@
 //! Executable model of the old-state invalidation mechanism — the executable companion of
-//! `docs/utexo/INVALIDATION-SPEC.md`.
+//! INVALIDATION-SPEC (retired 2026-08-15).
 //!
 //! Pure logic only: no network, no DB, no running stack. Wherever a callable pure function
 //! exists these tests call the REAL one:
@@ -202,7 +202,7 @@ fn exclusive_window_width_is_interval() {
     }
 }
 
-// OPEN audit item [17] (docs/utexo/AUDIT-2026-07.md), encoded as executable knowledge.
+// OPEN audit item [17] (AUDIT-2026-07 (retired 2026-08-15)), encoded as executable knowledge.
 //
 // For an off-chain sub-coin the exit branch is locktime-free; safety requires broadcasting it
 // before the EARLIEST ancestor stale backup matures. The implemented deadline

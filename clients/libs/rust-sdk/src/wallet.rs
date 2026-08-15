@@ -3962,7 +3962,7 @@ impl UtexoWallet {
 /// That residual is OPEN audit item [17]. The invalidation model
 /// (`invalidation_model.rs::deposit_anchored_deadline_exactness_domain`) calls this function
 /// directly, so a k-aware fix here fails that test loudly and forces the [17] documentation
-/// (test + INVALIDATION-SPEC.md §6) to be updated in the same change.
+/// (test + INVALIDATION-SPEC (retired 2026-08-15) §6) to be updated in the same change.
 pub(crate) fn deposit_anchored_deadline(h_deposit: u32, initlock: u32) -> u32 {
     h_deposit + initlock
 }

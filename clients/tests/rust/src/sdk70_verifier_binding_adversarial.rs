@@ -5,7 +5,7 @@
 //!
 //! **A — `payload_vout` (CTES-R commit 1).** Colouring a tier puts the opret at index 0 and shifts
 //! every ladder vout by one, so every chaining site now reads an explicit `payload_vout` accessor
-//! instead of a literal `0`. The gate experiment (E1, `docs/utexo/CTESR-GATE.md` §2.1a′) predicted
+//! instead of a literal `0`. The gate experiment (E1, CTESR-GATE (retired 2026-08-15) §2.1a′) predicted
 //! there is **no silent-loss path** because every site cross-checks the index against transaction
 //! CONTENT. That prediction is what this part proves, by breaking it: for each migrated site a bundle
 //! declaring the WRONG `payload_vout` must be REJECTED with a NAMED error — never accepted, never a

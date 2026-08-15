@@ -256,10 +256,10 @@ correct renewal / rollover thresholds.
 The SDK crate also carries two executable **models** — pure companions to the specs, calling the
 real production functions wherever a callable pure one exists:
 
-* `invalidation_model.rs` ↔ [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) — the un-laddered shape's
+* `invalidation_model.rs` ↔ INVALIDATION-SPEC (retired 2026-08-15) — the un-laddered shape's
   backup-locktime ladder (`mercurylib::transaction::calculate_block_height`), split fee reserve and
   admission guard, payment planning, deposit-anchored deadlines.
-* `granularity_model.rs` ↔ [GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md) — exact subsets, the split
+* `granularity_model.rs` ↔ GRANULARITY-SPEC (retired 2026-08-15) — exact subsets, the split
   floor, the fixed 1500-sat token piece, ceil fee arithmetic.
 
 ## Adversarial coverage map (mirrors Spark)

@@ -264,7 +264,7 @@ pub struct TesrBundle {
     /// Renewal counter at the current (deepest) level.
     pub m: u32,
     /// SUPERSEDED states — every owner-paying state the SE co-signed that a later renewal/rollover/
-    /// transfer replaced. Kept for FULL-DISCLOSURE counting (history/MIGRATION.md): the SE counts their
+    /// transfer replaced. Kept for FULL-DISCLOSURE counting (MIGRATION (retired 2026-08-15)): the SE counts their
     /// co-signs, so verify_bundle must see them or num_sigs won't balance; and the current state must
     /// be at a strictly LOWER CSV than every one of these (it matures first, so a retained stale state
     /// loses the race). Not part of the exit chain.
@@ -512,7 +512,7 @@ impl ChildTesrBundle {
     ///    RIVAL transitions over the same `X_m` payload output; deriving `SP` with `TierRole::State`
     ///    would hand it `S_0`'s blinding, the two would collapse to one `OpId`, and rgb-lib would
     ///    keep whichever witness has the smaller internal txid — an arbitrary hash lottery
-    ///    (`docs/utexo/CTESR-GATE.md` §2.2). This is why [`TesrBundle::colored_tier_seals`] cannot
+    ///    (CTESR-GATE (retired 2026-08-15) §2.2). This is why [`TesrBundle::colored_tier_seals`] cannot
     ///    be reused for a split parent: it hard-codes `State` for the current state.
     /// 2. Every child of one split shares `SP`'s *blinding* (one transition, one seal identity) and
     ///    is separated only by `sp_vout`. That is sound — an RGB seal is `(vout, blinding)` — and it
@@ -1477,7 +1477,7 @@ pub struct ChildSegment {
     /// ⚠️ **This field is a CROSS-CHECKED DECLARATION, never the source of truth.** The verifier
     /// DERIVES the shape from the outpoint `state` actually spends — an outpoint committed by the
     /// taproot `SIGHASH_ALL` sighash and therefore inseparable from the SE's own signature (see the
-    /// `None` branch of the ancestor loop in [`verify_child_bundle`], and `ADMISSION-INPUTS.md`).
+    /// `None` branch of the ancestor loop in [`verify_child_bundle`], and ADMISSION-INPUTS (retired 2026-08-15)).
     /// A two-tier segment re-labelled `None` is refused because its `state` spends its extension's
     /// payload output rather than the funding outpoint, and the re-label cannot be repaired without
     /// invalidating a signature the sender cannot forge.
@@ -1553,7 +1553,7 @@ impl TesrBundle {
     /// consignment of this ladder must be resolved against. NEVER resolve a coloured ladder with the
     /// plain blockchain resolver: each tier is deliberately un-broadcast, the indexer reports it
     /// `Unresolved`, and rgb-lib maps that to `Archived`, silently and irreversibly invalidating the
-    /// whole chain (`docs/utexo/CTESR-GATE.md` §2.3/§3.3).
+    /// whole chain (CTESR-GATE (retired 2026-08-15) §2.3/§3.3).
     pub fn ladder_txids(&self) -> Vec<String> {
         self.exit_tiers().iter().map(|t| t.txid.clone()).collect()
     }
@@ -1615,7 +1615,7 @@ impl TesrBundle {
 /// over `T`'s payload output, a transfer replaces `S_k` over `X_m`'s — and two rivals sharing a
 /// blinding collapse to one `OpId`/`BundleId`, after which rgb-lib keeps whichever witness has the
 /// numerically smallest INTERNAL txid (an arbitrary hash lottery) and the loser's consignment is
-/// unvalidatable by anyone (`docs/utexo/CTESR-GATE.md` §2.2). So the derivation must separate rivals,
+/// unvalidatable by anyone (CTESR-GATE (retired 2026-08-15) §2.2). So the derivation must separate rivals,
 /// and the receiver must reproduce it exactly from what the transfer message already carries.
 ///
 /// The inputs, and why each one is available to both sides:
@@ -1709,7 +1709,7 @@ pub async fn establish(
 /// uncoloured ([D4]-corrected on both halves; was 574 vs 488 when both vsize models understated the
 /// explicit `SIGHASH_ALL` byte), because the RGB `opret` output serialises to exactly
 /// `P2TR_OUT_VBYTES` (43 B) and the
-/// fee is `committed_fee_for_outputs(n_payload + 1, rate)` (`docs/utexo/CTESR-GATE.md` §3.4). Three
+/// fee is `committed_fee_for_outputs(n_payload + 1, rate)` (CTESR-GATE (retired 2026-08-15) §3.4). Three
 /// rungs plus a final state output that still clears dust is the floor.
 ///
 /// Discovering this at rung 3 instead would be unrecoverable: `T` and `X_0` would already have burned
@@ -1784,7 +1784,7 @@ pub struct ColoredLadderDraft {
 /// Rival tiers over one parent output are separated by the per-tier [`crate::rgb::TierSeal`]
 /// blinding, and `build_colored_tier` asserts at build time that each consignment carries its own
 /// tier's witness — so a derivation collision fails HERE, loudly, rather than at a receiver that can
-/// only report "not known to the resolver" (`docs/utexo/CTESR-GATE.md` §3.1).
+/// only report "not known to the resolver" (CTESR-GATE (retired 2026-08-15) §3.1).
 ///
 /// `f_spk_hex` is `tx0.output[f_vout].script_pubkey` read from the chain — the prevout rgb-lib needs
 /// to know which allocation is being spent, and the value the trigger's sighash commits to.
@@ -8303,7 +8303,7 @@ pub struct ColoredChildStateDraft {
 /// `S'_child` is a RIVAL of the child's current state over the SAME outpoint. They are separated by
 /// the seal rung, which folds in the CSV — and the new CSV is strictly lower by construction
 /// (`cur − δ`), so the seals cannot collide (equal rung ⟹ equal blinding ⟹ one `OpId` and a hash
-/// lottery, `docs/utexo/CTESR-GATE.md` §2.2).
+/// lottery, CTESR-GATE (retired 2026-08-15) §2.2).
 pub fn build_colored_child_retransfer(
     rgb: &mercury_rgb::RgbWallet,
     cb: &ChildTesrBundle,
@@ -9184,7 +9184,7 @@ pub fn apply_reclaim(bundle: &mut TesrBundle, replacement: TesrTier) -> Result<(
     Ok(())
 }
 
-/// Model A (history/MIGRATION.md §"receiver ladder adoption"): while still owning the coin, pre-sign the
+/// Model A (MIGRATION (retired 2026-08-15) §"receiver ladder adoption"): while still owning the coin, pre-sign the
 /// RECEIVER-paying state `S'` so the receiver gets a complete, verifiable exit chain paying THEM.
 /// `S'` spends the deepest extension's output, pays the recipient's derived P2TR (from a Mercury
 /// transfer address), and carries CSV `= current_state_csv − δ` (one lower, so it matures before the
@@ -11247,7 +11247,7 @@ fn bind_opret_count(
 /// The obvious-looking third option — "`None` means fall back to `bundle.f_value`" — is the thing
 /// this parameter exists to prevent. `bundle.f_value` is a serde field; measuring the trigger
 /// against it proves the sender was self-consistent and nothing more, while producing a check that
-/// *reads* like an anchor. Per `docs/utexo/ADMISSION-INPUTS.md`, being present in a struct the
+/// *reads* like an anchor. Per ADMISSION-INPUTS (retired 2026-08-15), being present in a struct the
 /// sender sent is not provenance, and a term with no provenance must be left out of the calculation
 /// rather than dressed up. So the type makes each caller state which of the two it has.
 fn verify_bundle_ex(
@@ -11474,7 +11474,7 @@ fn verify_bundle_ex(
     // this direction and only in this direction, because a *higher* declared rate makes the expected
     // forward value SMALLER, and a tier forwarding less than its own declared schedule demands is
     // exactly what the equality refuses. It is pinned properly by `bind_declared_csv`'s sibling
-    // problem — see `docs/utexo/VALUE-CONSERVATION-SWEEP.md` for the remaining `fee_rate` item.
+    // problem — see VALUE-CONSERVATION-SWEEP (retired 2026-08-15) for the remaining `fee_rate` item.
     //
     //
     // **AND THE CHAIN IS THE FIRST RUNG.** The loop below used to start at `i = 1`, which left the
@@ -12124,7 +12124,7 @@ pub fn verify_child_bundle(
         //      outpoint is committed by the taproot SIGHASH_ALL sighash, so it is derived from the
         //      SE's signature and cannot be repointed without invalidating it — the `Option` is a
         //      cross-checked declaration that must AGREE, never the source of truth
-        //      (`docs/utexo/ADMISSION-INPUTS.md`: a serde field is not provenance).
+        //      (ADMISSION-INPUTS (retired 2026-08-15): a serde field is not provenance).
         //  (2) THE `[0,0]` CSV PIN stays exactly as it is. Note that `[e_floor,e0] = [144,720]` is a
         //      strict SUBSET of `[d_floor,d0] = [144,1440]`, so extension-vs-state was NEVER
         //      CSV-separable; only the spine's `[0,0]` is disjoint from both. Widening the lone
@@ -13887,7 +13887,7 @@ mod verify_tests {
     }
 
     /// The coloured-rung price and the three-rung floor, pinned as arithmetic rather than prose.
-    /// `docs/utexo/CTESR-GATE.md` §3.4 as corrected by [D4]: a coloured tier is one whole extra
+    /// CTESR-GATE (retired 2026-08-15) §3.4 as corrected by [D4]: a coloured tier is one whole extra
     /// P2TR output wide (the opret serialises to exactly `P2TR_OUT_VBYTES`) and nothing else, so a
     /// coloured rung is `ceil(crate::rgb::colored_tier_vbytes(1) * rate) + P2A_VALUE` and an
     /// uncoloured one is `ceil(mercurylib::tesr::TIER_VBYTES * rate) + P2A_VALUE`, with
@@ -16594,7 +16594,7 @@ mod split_journal_tests {
 
 /// # THE SKIM-LEAF ATTACK, BUILT AND RUN
 ///
-/// Every fix in `docs/utexo/VALUE-CONSERVATION-SWEEP.md` was landed against HONEST traffic: sdk 1, 2,
+/// Every fix in VALUE-CONSERVATION-SWEEP (retired 2026-08-15) was landed against HONEST traffic: sdk 1, 2,
 /// 11, 17, 58, 59, 74, 75, 76 and 77 all show that a well-formed bundle still passes. Not one of them
 /// constructs the theft and asserts the refusal, and the probe that originally proved the defect
 /// (`4e165e6`) was temporary and is gone. §8 of that document names this as the single most valuable
@@ -17171,7 +17171,7 @@ mod skim_leaf_attack_tests {
 ///
 /// The sibling of `skim_leaf_attack_tests` on the WHOLE-COIN lane. `deed25c` added a per-tier
 /// conservation law to `verify_bundle_ex` — the root ladder's `T → X_m → S_k` — and, like every other
-/// commit in the `docs/utexo/VALUE-CONSERVATION-SWEEP.md` series, it was validated only by showing
+/// commit in the VALUE-CONSERVATION-SWEEP (retired 2026-08-15) series, it was validated only by showing
 /// that honest traffic still passes. §8 of that document names the missing half: *"No test proves the
 /// attacks are now refused."* This module builds them.
 ///
@@ -17930,7 +17930,7 @@ mod forged_yardstick_attack_tests {
     const FORGED_RUNG: u64 = 332_990;
 
     /// **The forged yardstick, child lane.** The sweep document's own number
-    /// (`VALUE-CONSERVATION-SWEEP.md` V5: *"Declare `fee_rate: 700.0` … each rung consumes
+    /// (VALUE-CONSERVATION-SWEEP (retired 2026-08-15) V5: *"Declare `fee_rate: 700.0` … each rung consumes
     /// `committed_fee(700) + 240` = 87 740"*). The child chain is five tiers deep — `T`, `X_0`, `SP`,
     /// then the child's own extension and state — so the rung has to be small enough that five of
     /// them fit.
@@ -18070,7 +18070,7 @@ mod forged_yardstick_attack_tests {
                 superseded_extensions: vec![],
                 conveyed_states: vec![],
                 // HONEST — the receiver's own preset. A forged schedule is a different attack
-                // (VALUE-CONSERVATION-SWEEP.md §4, "the `params` schedule as an attack surface");
+                // (VALUE-CONSERVATION-SWEEP (retired 2026-08-15) §4, "the `params` schedule as an attack surface");
                 // keeping it honest here is what makes the fee rate the only variable.
                 params: p,
                 rgb: None,
@@ -18428,7 +18428,7 @@ mod forged_yardstick_attack_tests {
 
     /// The child-lane control: an honest conveyed child is accepted, and the gap between what the
     /// claim path BOOKS (`SP.out[j]`, the slot) and what the child's exit chain can DELIVER is
-    /// exactly two rungs — 980 sat. `VALUE-CONSERVATION-SWEEP.md` §8 downgrades that gap from theft
+    /// exactly two rungs — 980 sat. VALUE-CONSERVATION-SWEEP (retired 2026-08-15) §8 downgrades that gap from theft
     /// to "a bounded convention"; this test is where the word *bounded* is checked, and
     /// `a_forged_yardstick_child_is_refused_by_the_synchronous_verifier` is where it stops being
     /// true.
@@ -18744,7 +18744,7 @@ mod forged_yardstick_attack_tests {
     /// straight from `rung_forward` inside `verify_bundle_ex`, on a field a sender fills in, so it is
     /// a remote denial of service on the claim path and on the SSP pre-pay path.
     ///
-    /// This is `VALUE-CONSERVATION-SWEEP.md` V5's "secondary, same site" item, which is still open:
+    /// This is VALUE-CONSERVATION-SWEEP (retired 2026-08-15) V5's "secondary, same site" item, which is still open:
     /// the document asks for `checked_add` and a rejection of non-finite / `<= 0` rates *in addition
     /// to* the binding, "because the arithmetic is public API".
     ///
@@ -18778,7 +18778,7 @@ mod forged_yardstick_attack_tests {
 /// The third sibling of `skim_leaf_attack_tests` and `skim_root_attack_tests`, over the property those
 /// two do NOT touch: **where a tier pays**, as opposed to how much it forwards.
 ///
-/// `docs/utexo/VALUE-CONSERVATION-SWEEP.md` §1 states the class in one line — *"A signature over a tier
+/// VALUE-CONSERVATION-SWEEP (retired 2026-08-15) §1 states the class in one line — *"A signature over a tier
 /// binds that tier's INPUT amount and nothing else"* — and then names four independent properties, of
 /// which the FIRST is `payload_out(tx).script_pubkey == the aggregate it is supposed to pay`. V2(b)
 /// records that the ancestor loop had no such check at all: `ext0 = seg.extension.payload_out(&ext_tx,…)`
@@ -19715,7 +19715,7 @@ mod wrong_payee_attack_tests {
     ///
     /// Measured corroboration that the unrelayability is real, not theoretical: a v3 tier below the
     /// mempool floor is refused with `min relay fee not met`
-    /// (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`), package-CPFP would rescue it, and no
+    /// (WP1-TRUC-P2A-SPIKE (retired 2026-08-15)), package-CPFP would rescue it, and no
     /// `submitpackage` caller exists in this tree.
     #[test]
     fn an_ancestor_split_state_committing_a_ruinous_fee_is_refused() {

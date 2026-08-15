@@ -8,7 +8,7 @@
 > type; the un-laddered shape is being removed, not kept.
 >
 > The mechanism is **CTES-R** — colour every tier so an RGB carrier can be laddered, retiring
-> terminal-freeze. Its gate passed against the live stack ([CTESR-GATE.md](CTESR-GATE.md)) and its
+> terminal-freeze. Its gate passed against the live stack (CTESR-GATE (retired 2026-08-15)) and its
 > foundation has landed (the `payload_vout` migration, the coloured tier builder, per-tier seal
 > blinding). **The colouring itself is not yet wired.** Until it is, everything below about the
 > un-laddered shape remains accurate as-built.
@@ -18,7 +18,7 @@
 >
 > Reaching one coin type also requires porting `verify_bundle` to wasm/JS and Kotlin: the nodejs and
 > web clients currently *refuse* any laddered coin. Background:
-> [COLORED-FORWARDING.md](COLORED-FORWARDING.md).
+> COLORED-FORWARDING (retired 2026-08-15).
 
 **Status: SHIPPED — this is the protocol.** TES-R is not a proposal or a lane any more: `claim()`
 establishes a trigger/extension/state ladder for **every fresh confirmed ROOT coin, unconditionally**.
@@ -1053,7 +1053,7 @@ any alternative).
 
 *(Historical plan, kept intact; outcomes annotated. The migration is done: there is one protocol, the
 `deposit_protocol_version` / `UTEXO_PROTOCOL_DEFAULT` escape hatch is deleted, and no test pins the old
-lane. The per-test migration record lives in git history and `history/MIGRATION.md`.)*
+lane. The per-test migration record lives in git history and MIGRATION (retired 2026-08-15).)*
 
 **Phase 0 — ship, no behavior change** — *PARTLY DONE (SDK yes, server no — see the outcome)*: server:
 generalized counters {level, m, k, total_sigs},

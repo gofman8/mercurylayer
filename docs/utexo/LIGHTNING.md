@@ -7,7 +7,7 @@
 > is a single coin type. When CTES-R colours the tiers, the colored LN lane moves onto the ladder too
 > and the "rides an un-laddered coin by design" note below stops being true.
 >
-> Status: gate passed ([CTESR-GATE.md](CTESR-GATE.md)), foundation landed, **colouring not yet
+> Status: gate passed (CTESR-GATE (retired 2026-08-15)), foundation landed, **colouring not yet
 > wired** — so the description below is accurate as-built.
 
 **Normative.** This is how Lightning works: both directions, exact and non-exact amounts, running on

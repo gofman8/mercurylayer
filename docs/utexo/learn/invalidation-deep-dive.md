@@ -5,11 +5,11 @@ over days and weeks, and what it feels like to hold, receive, and exit a coin. T
 long-form explainer; the short comparison is [invalidation.md](invalidation.md), the shipped
 ladder is specified in [PROTOCOL.md](../PROTOCOL.md) (TES-R) and
 [CHILDREN.md](../CHILDREN.md) (first-class split children), the normative requirements for the
-un-laddered coin shape live in [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md), fee/size tables in
-[invalidation-economics.md](../research/invalidation-economics.md), and exit mechanics in
+un-laddered coin shape live in INVALIDATION-SPEC (retired 2026-08-15), fee/size tables in
+invalidation-economics (retired 2026-08-15), and exit mechanics in
 [exits.md](exits.md). Audience: developers, integrators, and researchers who have not read the
 code. Every number below comes from the code paths and tests cited; where behaviour is an open
-item we say so rather than round it off — see [AUDIT-2026-07.md](../AUDIT-2026-07.md) and
+item we say so rather than round it off — see AUDIT-2026-07 (retired 2026-08-15) and
 PROTOCOL.md §6's residual-risk list. Who trusts whom — and what is verified instead of trusted —
 is mapped party-by-party in [TRUST-MODEL.md](../TRUST-MODEL.md).
 
@@ -36,7 +36,7 @@ leftover:
 Almost every mechanic below exists in both shapes but in a different key. Each one is labelled.
 
 Terminology follows the
-[INVALIDATION-SPEC.md §0 table](../INVALIDATION-SPEC.md#0-scope-terminology-relationship-to-specmd);
+[INVALIDATION-SPEC (retired 2026-08-15) §0 table](../INVALIDATION-SPEC (retired 2026-08-15)#0-scope-terminology-relationship-to-specmd);
 the words used most: a **flat coin**'s funding output is on-chain, a **sub-coin**'s funding tx is
 pre-signed but un-broadcast (*materializing* the branch broadcasts it, turning the sub-coin flat),
 and a **child** is the piece minted by an in-ladder split.
@@ -586,7 +586,7 @@ defaults**: the SDK ships `auto_exit_margin_blocks = 288` (~2 days), which on th
 profile covers `M ≤ 14` pre-split hops plus a day of confirmation/congestion/reorg slack; a tower on
 the 10,000/100 defaults profile covering the same `M` would need `≥ 1,544`. If no bound on `M` is
 justifiable, fall back to eager broadcast (normative: IVL-REQ-16 in
-[INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md)).
+INVALIDATION-SPEC (retired 2026-08-15)).
 
 ## 5. Real-world situations
 
@@ -956,7 +956,7 @@ safe indefinitely for the first, and safe precisely up to that height for the se
    `leaf_locktime + interval` (that formula is the bug audit [10] fixed).
 
 The normative version of these rules is **IVL-REQ-16** in
-[INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md); the bundle format is PROTOCOL.md §5.13.
+INVALIDATION-SPEC (retired 2026-08-15); the bundle format is PROTOCOL.md §5.13.
 
 **Time-to-money, per flow:**
 
@@ -1158,13 +1158,13 @@ everything you hold. Towers are keyless and idempotent, so the real answer is to
 
 Further reading: the shipped ladder in [PROTOCOL.md](../PROTOCOL.md) and
 [CHILDREN.md](../CHILDREN.md); Lightning over the ladder in [LIGHTNING.md](../LIGHTNING.md);
-normative un-laddered requirements in [INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md); fee/size
+normative un-laddered requirements in INVALIDATION-SPEC (retired 2026-08-15); fee/size
 tables and feerate scenarios in
-[invalidation-economics.md](../research/invalidation-economics.md); the short comparison in
+invalidation-economics (retired 2026-08-15); the short comparison in
 [invalidation.md](invalidation.md); partial amounts in
 [granularity-deep-dive.md](granularity-deep-dive.md); exit mechanics in [exits.md](exits.md);
 system spec [SPEC.md](../SPEC.md) (REQ-16/18/25, INV-4/20/23/24/25, ERR-1/2/3/7/12); trust map in
-[TRUST-MODEL.md](../TRUST-MODEL.md); audit trail in [AUDIT-2026-07.md](../AUDIT-2026-07.md).
+[TRUST-MODEL.md](../TRUST-MODEL.md); audit trail in AUDIT-2026-07 (retired 2026-08-15).
 
 Test evidence cited on this page: `sdk12`, `sdk15`, `sdk16`, `sdk17`, `sdk30`, `sdk32`, `sdk34`,
 `sdk38`, `sdk39`, `sdk40`, `sdk41`, `sdk42`, `sdk43`, `sdk44`, `sdk45`, `sdk46`, `sdk47`, `sdk50`,

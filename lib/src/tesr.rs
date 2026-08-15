@@ -115,7 +115,7 @@ pub const MIN_RELAY_FEE_RATE_SATS_PER_VB: f64 = 1.0;
 /// enters the race*. So "the superseded tier has a higher CSV, therefore it loses" is only true if
 /// the live tier can actually be sent — which is a fee question, not a timelock question.
 ///
-/// Measured, not assumed (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`): a v3 tier under the floor is
+/// Measured, not assumed (WP1-TRUC-P2A-SPIKE (retired 2026-08-15)): a v3 tier under the floor is
 /// refused outright at `sendrawtransaction`.
 ///
 /// **Deliberately ignores the P2A anchor**, and that is the conservative direction. Every tier
@@ -284,7 +284,7 @@ impl TesrParams {
     /// This also removes the combination D7 flagged as the sharper problem: on the toy schedule the
     /// deployed profile admitted a **139-transaction** exit chain, ~135 of them consecutive zero-CSV
     /// spine tiers, whose TRUC relay stall (~68 blocks at two in flight) exceeded the entire state
-    /// schedule (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`). On the mainnet schedule it does not arise.
+    /// schedule (WP1-TRUC-P2A-SPIKE (retired 2026-08-15)). On the mainnet schedule it does not arise.
     ///
     /// **This is a deliberate compatibility break** (D23): a receiver derives its accepted CSV band
     /// from its own preset, so ladders built against the deployed testnet coordinator by an older
@@ -561,7 +561,7 @@ pub fn build_tier_tx(
 ///
 /// It is `0` today because a tier is `[payload…, P2A]`. Under CTES-R a coloured tier is
 /// `[opret, payload…, P2A]` (the fork sets `opreturn_first = true` whenever any output is P2TR, and
-/// the P2A anchor is *not* P2TR — see `docs/utexo/CTESR-GATE.md` §2.1(a)), so every payload shifts by
+/// the P2A anchor is *not* P2TR — see CTESR-GATE (retired 2026-08-15) §2.1(a)), so every payload shifts by
 /// one. Routing every site through this one name is what makes wiring colouring a change of ONE
 /// value instead of an audit of a dozen literals.
 ///
@@ -599,7 +599,7 @@ fn encode(tx: &Transaction, payload_vout: u32) -> Result<TierTx, MercuryError> {
 
 /// The scriptPubKey a TES-R tier output should pay for `address` on `network`. Two forms, mirroring
 /// `create_tx_out` exactly so a state tier can pay a transfer recipient (Model A,
-/// `docs/utexo/history/MIGRATION.md`):
+/// MIGRATION (retired 2026-08-15)):
 /// - a **Mercury transfer address** (`utexoinv…`/`tml…` HRP) → the recipient's DERIVED
 ///   `P2TR(recipient_user_pubkey)`, so the sender can pre-sign the receiver-paying state `S'`;
 /// - a plain bech32(m) address → itself.
@@ -767,7 +767,7 @@ pub fn tier_out_total(prev_value: u64, n_payload: usize, fee_rate_sats_per_vb: f
 /// rival, but the parent's own retained STATE over `X_m.out[0]` becomes one. A child spending `SP.out[j]`
 /// is only safe if it verifies the PARENT's full-disclosure census (parent num_sigs == parent's disclosed
 /// tiers), which is only meaningful if the parent is terminalized AND that terminality is enforced at
-/// co-sign time. See `docs/utexo/history/SPLIT-FINDINGS.md` — that census currently rests on server/enclave
+/// co-sign time. See SPLIT-FINDINGS (retired 2026-08-15) — that census currently rests on server/enclave
 /// guarantees that do not hold (the enclave has NO notion of terminality; sign/second must re-check the
 /// gates — fixed 9d63f15). `build_trigger` is the ONLY builder that touches `f_txid/f_vout`.
 ///

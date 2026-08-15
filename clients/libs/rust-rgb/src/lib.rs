@@ -112,7 +112,7 @@ impl ValidationVerdict {
 /// The witness txid of every bundle carried by `consignment_base64`, in the consignment's own
 /// bundle order.
 ///
-/// This is the read side of the CTES-R **build-time collision assert** (`docs/utexo/CTESR-GATE.md`
+/// This is the read side of the CTES-R **build-time collision assert** (CTESR-GATE (retired 2026-08-15)
 /// §3.1). Two RGB transitions over the SAME parent outpoint with the same amounts and the same seal
 /// blinding collapse to one `OpId` and one `BundleId` (`TransitionBundle::commit_encode` commits
 /// only the `input_map`); rgb-lib then resolves that one BundleId to whichever rival witness has the
@@ -459,7 +459,7 @@ impl RgbWallet {
         Ok(())
     }
 
-    /// **[CTES-R] The read-only STOCK probe of `docs/utexo/CTESR-GATE.md` §3.3.** Can `output_map`
+    /// **[CTES-R] The read-only STOCK probe of CTESR-GATE (retired 2026-08-15) §3.3.** Can `output_map`
     /// still be spent, right now, out of the outpoints `psbt_base64` spends?
     ///
     /// This is the ONLY health check the gate sanctions, and the reason is measured, not stylistic:
@@ -596,7 +596,7 @@ impl RgbWallet {
     ///
     /// The nonce lands in the RGB transition (`transition_builder.set_nonce`) and therefore
     /// independently separates the `OpId` **and** the `BundleId` of two transitions over the same
-    /// parent outpoint — the belt-and-braces half of `docs/utexo/CTESR-GATE.md` §3.1. It is a
+    /// parent outpoint — the belt-and-braces half of CTESR-GATE (retired 2026-08-15) §3.1. It is a
     /// *second* separation, never a substitute: rival tiers must already carry distinct seal
     /// blindings (see `mercuryrustlib::rgb::TierSeal`), because the blinding is what the receiver
     /// re-derives. Pass `None` for the historical behaviour (`u64::MAX`, rgb-lib's default).

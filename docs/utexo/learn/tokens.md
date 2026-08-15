@@ -87,7 +87,7 @@ shipped). The `auto_exit_due` watchtower now does this **automatically** for a r
 nearing its clawback deadline (branch-only, emitting `TokenCarrierMaterialized`), so you no longer
 have to materialize by hand to stay safe (SPEC §9.5 / REQ-33, `sdk34`). Step-by-step:
 [granularity deep dive §5.6](granularity-deep-dive.md); normative:
-[GRANULARITY-SPEC](../GRANULARITY-SPEC.md) GRN-REQ-14 / GRN-INV-14.
+GRANULARITY-SPEC GRN-REQ-14 / GRN-INV-14.
 
 ## Tokens over time — holding, and doing nothing
 

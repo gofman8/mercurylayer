@@ -11,7 +11,7 @@
 //! ```
 //!
 //! — and the ONLY way it enters a mempool is as a 1P1C package with a child that pays for both.
-//! That was measured, not assumed (`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`).
+//! That was measured, not assumed (WP1-TRUC-P2A-SPIKE (retired 2026-08-15)).
 //!
 //! `cpfp_tx.rs` cannot do this job and is not a starting point: it is **v2** (`version: 2`), pinned
 //! to `input_vout = 0`, and it spends the coin's own backup output — which needs the coin key. This

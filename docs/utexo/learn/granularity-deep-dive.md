@@ -3,17 +3,17 @@
 How a system whose on-chain unit is an indivisible UTXO lets you send 0.1 BTC from a 1-BTC coin,
 or 0.1 of a token from a 1.0 allocation — without touching the chain, without a third party, and
 without the operator ever learning an amount. This page is the long-form explainer; the normative
-requirements live in [GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md) (GRN-REQ/GRN-INV/GRN-ERR), the
+requirements live in GRANULARITY-SPEC (retired 2026-08-15) (GRN-REQ/GRN-INV/GRN-ERR), the
 transfer basics in [transfers.md](transfers.md), token basics in [tokens.md](tokens.md), the
 invalidation machinery this rides on in
 [invalidation-deep-dive.md](invalidation-deep-dive.md) and
-[INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md) (IVL-*), fee/size tables in
-[invalidation-economics.md](../research/invalidation-economics.md), and the granularity-specific
+INVALIDATION-SPEC (retired 2026-08-15) (IVL-*), fee/size tables in
+invalidation-economics (retired 2026-08-15), and the granularity-specific
 pricing (unpayable-amounts map, carrier depletion, token breakevens, colored exit at depth) in
-[granularity-economics.md](../research/granularity-economics.md). Audience: technical readers
+granularity-economics (retired 2026-08-15). Audience: technical readers
 who have not read the code. Every number is computed from constants and measurements cited in
 those documents or verified in the code paths named inline; open limitations are stated, not
-rounded off ([AUDIT-2026-07.md](../AUDIT-2026-07.md)).
+rounded off (AUDIT-2026-07 (retired 2026-08-15)).
 
 Contents: [the problem](#1-the-problem-utxos-dont-come-in-the-amount-you-owe)
 · [mechanics](#2-mechanics-with-real-numbers)
@@ -211,7 +211,7 @@ rejected (ERR-8). The contract id is taken from the validated consignment, never
 re-send from**: 1,500 sats is below the 2,130-sat minimum carrier of §5.3, so a `transfer_tokens`
 drawing on a received piece always fails with *"carrier coin too small (1500 sats) for a token
 split"* — SDK token rails are one-hop today (§6, §7 FAQ,
-[granularity-economics §3](../research/granularity-economics.md)). Alice holds 90 units on an
+granularity-economics §3). Alice holds 90 units on an
 8,200-sat change carrier; one un-broadcast tx and zero on-chain footprint.
 
 ### 2c. Paying three people at once: width beats depth
@@ -361,7 +361,7 @@ the public `unilateral_exit()`; `sdk59` exits a received **child**; `sdk17` exit
 grandchild.
 
 **On the un-laddered lane, cost grows 155 vB per level**
-([economics §3b](../research/invalidation-economics.md), depths 0–4):
+(economics §3b, depths 0–4):
 
 | Depth | Txs | Total vB | Fee @1 sat/vB | @10 | @100 |
 |---|---|---|---|---|---|
@@ -374,7 +374,7 @@ grandchild.
 colored token branch carries one OP_RETURN per hop: **198 vB/hop** instead of 155 (measured,
 `SDK_E2E=29`: colored split = 198 vB) — depth-1 = 310 vB, depth-2 = 508 vB (measured, and exercised
 end-to-end by `SDK_E2E=39`), depth-4 ≈ 904 vB;
-[granularity-economics §6](../research/granularity-economics.md).)
+granularity-economics §6.)
 
 **On the ladder, cost grows ~248 vB per level** — every tier is the same ~124 vB, so a depth-*d*
 child needs `3 + 2d` of them ([PROTOCOL.md §6](../PROTOCOL.md)), plus 0–3 P2A fee children
@@ -414,9 +414,9 @@ Mercury software needed to validate it. Two precision points, honestly:
 **The 1,500-sat economics at high feerates.** At 100 sat/vB, confirming the piece's 112-vB backup
 costs ~11,200 sats — ~7.5× the 1,500 sats it carries, over 8× the ~1,388 it actually recovers —
 and a CPFP from a 1,388-sat output cannot fund it (the child alone would need ~22,000 sats,
-[economics §3b](../research/invalidation-economics.md)). The sats are economically dust in a
+economics §3b). The sats are economically dust in a
 spike; the breakeven feerates are tabulated in
-[granularity-economics §3](../research/granularity-economics.md). That is by design: a token exit
+granularity-economics §3. That is by design: a token exit
 is about the **asset**, not the packaging — the branch (whose reserve was pre-committed) settles
 the allocation whatever the fee market does to the 1,500 sats.
 
@@ -495,12 +495,12 @@ both — it takes whichever lane its parent's shape selects (§2c), and therefor
 |---|---|---|
 | Split-output dust floor | **330 sats** | P2TR dust: a sub-330 split output makes the branch non-standard/unrelayable — the sub-coins would be stranded with no exit (audit [9]; enforced **sender-side** in the planner, the split guard and the PSBT builder; receiver-side branch validation checks linkage/locktime/conservation/scripts, *not* output standardness — a hostile non-SDK sender could still hand over a stranded branch, a known gap) |
 | Smallest **mintable** un-laddered piece | **≈ 442 sats** (`330 + backup fee`, at 1 sat/vB) | 330 is only the split-output floor; the piece's own backup (112 vB) must sweep above dust after its fee, so a 330-sat piece can't back itself. The split guard enforces `min_split_output(fee_rate) = 330 + ceil(112·fee_rate)` on both outputs *before* the parent is made terminal (fixed), so a `[330, 442)` piece is refused cleanly with the coin untouched — never stranded. Pinned by unit `granularity_model::backup_fee_floor_is_the_true_mintable_minimum` and minted live by `sdk29`, which splits a freed sub-coin at exactly `330 + ceil(112·r)` (the E2E that first measured it, sdk28, is retired) |
-| Smallest splittable un-laddered coin | **960 sats** | `330 (piece) + 300 (reserve floor) + 330 (change)`; at exactly 960 the only admissible piece is 330 (change lands exactly on the floor); at 959 every split is refused. The planner is 1 sat stricter: `transfer()` demands a 961-sat coin where a manual `split_coin` accepts 960 ([granularity-economics §2](../research/granularity-economics.md)) |
+| Smallest splittable un-laddered coin | **960 sats** | `330 (piece) + 300 (reserve floor) + 330 (change)`; at exactly 960 the only admissible piece is 330 (change lands exactly on the floor); at 959 every split is refused. The planner is 1 sat stricter: `transfer()` demands a 961-sat coin where a manual `split_coin` accepts 960 (granularity-economics §2) |
 | Smallest **in-ladder child** | **1,306 sats** (at the deployed 2 sat/vB committed rate) | `min_child_value(rate, dust) = 2·(committed_fee + P2A) + dust = 2·(248 + 240) + 330`: a child funds its OWN extension and state tier before its final output can clear dust. **D1, fixed:** the admission guard used the un-laddered 442 floor, so a child in `[442, 1306)` was admitted, the parent was terminalized, and `establish_child` *then* failed with `FeeTooHigh` — stranding the parent to unilateral-exit-only. Both floors now apply, the larger binds, and both are checked before the parent's spend budget is consumed. Same floor at child level (§5.1). Pinned by `sdk30` (a sponsored rebate sized at `max(fee + dust, min_child_value)` states the 1,306 identity) and exercised by `sdk58`/`sdk59`/`sdk17` |
 | Smallest **in-ladder splittable coin** | **~2,612 sats + one tier fee** | two children at 1,306 plus the split state's own `committed_fee_for_outputs(2) + P2A` (574 at 2 sat/vB) taken off `X_m.out[0]`. Below that, `in_ladder_pay` refuses up-front with the parent fully spendable |
 | Smallest token send | **1 raw unit** | amounts are u64 units; rgb-lib conserves them exactly; sub-unit resolution does not exist (that is what `precision` display-scaling is for) |
-| Smallest token-capable carrier | **~2,242 sats** (at 1 sat/vB) | `1,500 (piece) + 300 (reserve) + 442 (change, backup-fee floor)`. The fit guard ("carrier coin too small") fires at ≤ 1,800; the backup-fee floor then requires the change to clear ~442, refusing the whole [1,801, 2,242) band up-front (the dust-only derivation gives 2,130; the enforced floor is 2,242 and rises with feerate) |
-| Smallest exit-viable coin | **≈ 442 sats** | the backup output must clear dust after its fee ([economics §5](../research/invalidation-economics.md)) |
+| Smallest token-capable carrier | **~2,242 sats** (at 1 sat/vB) | `1,500 (piece) + 300 (reserve) + 442 (change, backup-fee floor)`. The fit guard ("carrier coin too small") fires at ≤ 1,800; the backup-fee floor then requires the change to clear ~442, refusing the whole 1,801, 2,242) band up-front (the dust-only derivation gives 2,130; the enforced floor is 2,242 and rises with feerate) |
+| Smallest exit-viable coin | **≈ 442 sats** | the backup output must clear dust after its fee ([economics §5) |
 
 Above its lane's mint floor, resolution is exactly **1 sat** — un-laddered, any piece in
 `[330 + backup_fee, parent − reserve − 330]` (the 330 dust floor bounds the split output; the
@@ -516,8 +516,8 @@ Two paths still check late, honestly: a boundary-sized parent on `transfer_many`
 or a token carrier of 1,801–2,129 sats (the row above), passes the SDK guard and is only
 refused by the PSBT builder's dust floor *after* the terminal-guard has pinned the parent to a
 single remaining co-signature — recoverable (that one co-sign funds a corrected retry) but
-irreversible ([GRANULARITY-SPEC](../GRANULARITY-SPEC.md) GRN-REQ-8 note / GRN-INV-6 / §11.7;
-[granularity-economics §2](../research/granularity-economics.md) "boundary hazard").
+irreversible (GRANULARITY-SPEC GRN-REQ-8 note / GRN-INV-6 / §11.7;
+granularity-economics §2 "boundary hazard").
 
 ### 5.4 Sending your entire balance vs almost your entire balance
 
@@ -534,7 +534,7 @@ level**). **Outcome:** the user sees "insufficient balance" *despite*
 having more than the amount — which *usually* means no composition of coins can pay this exactly,
 and occasionally is planner conservatism: the greedy pass explores one largest-first ordering and
 is 1 sat stricter than `split_coin` at every boundary, so some fundable targets are refused
-(worked examples in [granularity-economics §2](../research/granularity-economics.md)). Pay a
+(worked examples in granularity-economics §2). Pay a
 slightly different amount, use the whole coins, or compose manually — with `in_ladder_pay` on a
 laddered coin, `split_coin` + `transfer` on an un-laddered one (`split_coin` refuses a laddered
 parent, so it is not the general escape hatch it once was).
@@ -544,8 +544,8 @@ parent, so it is not the general escape hatch it once was).
 Each piece is a full coin: its own ladder, its own future exit. With no shipped plain-BTC combine,
 offboarding N coins costs **N withdraw txs** (~111–140 vB each) cooperatively, or N tier chains
 (un-laddered: N branch-plus-backup chains) unilaterally — fragmentation is a real, linear cost
-([economics §3a](../research/invalidation-economics.md); the
-daily-sweep bill is worked in [granularity-economics §4](../research/granularity-economics.md)).
+(economics §3a; the
+daily-sweep bill is worked in granularity-economics §4).
 What to do today: *spend pieces onward* (exact-subset selection actively consumes odd coins at
 zero cost, and received children are first-class so they can be paid on whole or split again, §5.1),
 consolidate periodically via withdraw-to-one-address + redeposit (**N withdraw txs
@@ -621,8 +621,8 @@ is not E2E-covered** — the anchor is present and standard-relayed, the rescue 
 
 Full arithmetic and the deadline interaction:
 [invalidation-deep-dive §5.4](invalidation-deep-dive.md#54-fee-spike-10-during-a-unilateral-exit)
-and [economics §3b](../research/invalidation-economics.md); how a sustained 10× feerate world
-moves the granularity floors is [granularity-economics §7](../research/granularity-economics.md).
+and economics §3b; how a sustained 10× feerate world
+moves the granularity floors is granularity-economics §7.
 **Outcome:** un-laddered exits confirm slowly but
 safely if the branch lands before the earliest hostile maturity — broadcast early, not at the
 deadline. Laddered exits have no deadline to beat: they confirm slowly, wait out their CSVs, and
@@ -686,7 +686,7 @@ handed — below the carrier floor (§5.2; sender-side combine across carriers n
 *sending* limit is gone); **received token pieces are terminal at the SDK layer** — 1,500 sats of
 packaging is below the token-carrier floor, so tokens
 you receive can be held or exited but not re-sent off-chain until combine/top-up ships (§2b;
-quantified in [granularity-economics §3/§8](../research/granularity-economics.md)) — note this is a
+quantified in granularity-economics §3/§8) — note this is a
 *token-packaging* limit, not a protocol one: received **sats** pieces are first-class and re-spendable
 (§5.1); fragmentation with no plain-BTC combine (§5.5); a batch is still not atomic across recipients,
 though `transfer_many`'s laddered-parent routing is now fixed (§2c); the split-output
@@ -709,7 +709,7 @@ piece you can actually mint is `330 + backup_fee` ≈ **442 sats at 1 sat/vB** (
 laddered lane the child must additionally fund its own two tiers: **1,306 sats at 2 sat/vB**
 (`min_child_value`). Both floors are enforced up-front, so an under-floor piece is refused cleanly
 (coin untouched), never stranded. A pre-existing tiny coin can still move whole. Above the floor,
-resolution is 1 sat. See [economics §5](../research/invalidation-economics.md).
+resolution is 1 sat. See economics §5.
 
 **Why did my receiver get 3 coins for one payment?** An exact subset of the sender's coins summed
 to your amount, so each was handed over whole (§5.4) — cheaper for everyone than splitting. Sum
@@ -731,7 +731,7 @@ issuer or holder with a fat carrier fans out; receivers hold or exit (settlement
 itself are unaffected, §5.6). No value of the packaging constant fixes this; the fix is combining
 several received pieces (sender-side combine has **shipped**, §5.2 — though it cannot rescue a lone
 1,500-sat piece) or variable/top-up packaging (still open) — the arithmetic is worked in
-[granularity-economics §3/§7](../research/granularity-economics.md).
+granularity-economics §3/§7.
 
 **What if the envelope lies about the token amount?** You book what the *consignment* assigns to
 your outpoint; an envelope that disagrees gets the whole transfer rejected (ERR-8). Lying buys
@@ -798,18 +798,18 @@ instead: the parent coin (terminal), the fee (reserve un-laddered, committed tie
 | Third party in a partial payment | **none** (SE co-signs blind; sees no amounts) | SSP pool required for odd amounts | ASP required, every round | route liquidity required |
 | Cost per partial payment | in-ladder: ~574 sats of committed tier fee + ~248 vB future exit weight (+1 depth). Un-laddered: 300–2,000 sats reserve (splitter) + 155 vB (+1 depth); batch: ~60 vB/piece | swap fee/spread to SSP | share of round tx, every round | routing fees; liquidity opportunity cost |
 | Is the received partial amount re-spendable off-chain? | **yes, first-class** — a received child completes the SE key handover at claim and can be paid on whole (`child_retransfer`) or split again (`child_in_ladder_pay`); `sdk60`, `sdk17`. (Received *token* pieces are the exception, §7) | yes (leaf transfer) | yes (out-of-round transfer) | yes (it is just balance) |
-| Exit implication of receiving a partial amount | in-ladder child: `3 + 2d` tier txs (~620 vB at depth 1), sequential CSV, no deadline. Un-laddered sub-coin: branch (instant) + fresh-ladder backup wait ≈ initlock; cost 112+155·depth vB plain (~198 vB per colored hop, [granularity-economics §6](../research/granularity-economics.md)) | leaf chain broadcast (depth of Spark tree) | your branch of the round tree; **miss the round ⇒ swept** | force-close per channel; amounts not per-payment exitable |
+| Exit implication of receiving a partial amount | in-ladder child: `3 + 2d` tier txs (~620 vB at depth 1), sequential CSV, no deadline. Un-laddered sub-coin: branch (instant) + fresh-ladder backup wait ≈ initlock; cost 112+155·depth vB plain (~198 vB per colored hop, granularity-economics §6) | leaf chain broadcast (depth of Spark tree) | your branch of the round tree; **miss the round ⇒ swept** | force-close per channel; amounts not per-payment exitable |
 | Idle rent while holding a partial amount | **0 vB** laddered (no deadline); un-laddered coins keep their sender's absolute root deadline | 0 | re-mint each round or lose funds | 0 |
 | Operator sees amounts? | **no** (blind) | yes (SSP swaps by denomination) | yes (constructs the round) | no (onion), but channel peers see HTLCs |
 
 Further reading: normative granularity requirements in
-[GRANULARITY-SPEC.md](../GRANULARITY-SPEC.md); transfer and token primers in
+GRANULARITY-SPEC (retired 2026-08-15); transfer and token primers in
 [transfers.md](transfers.md) / [tokens.md](tokens.md); the invalidation machinery in
 [invalidation-deep-dive.md](invalidation-deep-dive.md) and
-[INVALIDATION-SPEC.md](../INVALIDATION-SPEC.md); prices in
-[invalidation-economics.md](../research/invalidation-economics.md) and — granularity-specific
+INVALIDATION-SPEC (retired 2026-08-15); prices in
+invalidation-economics (retired 2026-08-15) and — granularity-specific
 (unpayable-amounts map, carrier depletion, token breakevens, colored exit at depth) —
-[granularity-economics.md](../research/granularity-economics.md); exit flows in
+granularity-economics (retired 2026-08-15); exit flows in
 [exits.md](exits.md); the in-ladder split and the tier fee model in
 [PROTOCOL.md](../PROTOCOL.md) §5.2/§5.4/§5.10 and
 [CHILDREN.md](../CHILDREN.md); system spec [SPEC.md](../SPEC.md)

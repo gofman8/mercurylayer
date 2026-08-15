@@ -1,6 +1,6 @@
 //! **RGB_E2E=15 — the CTES-R coloured tier builder and per-tier seal blinding.**
 //!
-//! Promotes the E1 and E2 gate harnesses (`docs/utexo/CTESR-GATE.md` §2.1, §2.2) into a standing
+//! Promotes the E1 and E2 gate harnesses (CTESR-GATE (retired 2026-08-15) §2.1, §2.2) into a standing
 //! regression test for commit 3. Nothing here is wired into the live TES-R ladder — every
 //! transaction is built, coloured and left **unsigned and un-broadcast**.
 //!
