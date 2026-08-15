@@ -243,6 +243,68 @@ into a tax.
 
 ---
 
+### 0.8 THE DISCHARGE ROUND — the footprint scales with PIECES, not with PAYMENTS
+
+> Costs a design that does not exist (SPEC §5.4). The enforcement point is empty: `disclosure` /
+> `prevout_value` occur 83× in the client and **0× in `lockbox/`**. These are the numbers it *would*
+> cost built, not numbers anything measures.
+
+#### The structural result
+
+A round re-mints **every outstanding leaf** regardless of how many payments produced it, and retires
+the old tree in **one transaction**. So the on-chain footprint is set by
+
+```text
+    footprint  =  (outstanding pieces ÷ 256) × (365 ÷ epoch_days) × (155 + 43·absentees)
+                   └── tree count ──┘          └── rounds/year ──┘   └── one collapse tx ──┘
+```
+
+and **payment volume appears nowhere in it.** 256 is a hard cap, not an assumption: a depth-8 tree has
+`2⁸` leaf slots. Migration consumes the successor tree's slots, so tree count tracks *pieces held*,
+never *payments made*.
+
+This is the whole point, and it is the reversal of the pre-round position: without the round, cost
+scaled with **payments** (and lost); with it, cost scales with **held pieces** (and wins).
+
+#### Worked: 1 M users, 4 000 BTC TVL, 1 M payments/month
+
+12 M payments/yr. Bitcoin supplies 52.56 GvB/yr. On-chain baseline: 1.85 GvB/yr = **3.52 % of the
+entire chain**.
+
+| pieces/user | trees | collapses/yr | 0 % absent | 10 % | 50 % | 100 % |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 3 907 | 20 535 | 0.27 vB | 2.15 | 9.68 | 19.10 |
+| **3** | 11 719 | 61 595 | 0.80 | **6.45** | 29.05 | 57.30 |
+| 10 | 39 063 | 205 315 | 2.65 | 21.49 | 96.82 | 190.99 |
+
+*(vB per payment.)* Central case — 3 pieces/user, 10 % absent — is **77.4 MvB/yr = 0.147 % of Bitcoin
+block space**, about **77 blocks a year**, 24× better than an on-chain payment and 65× better than
+today's shipped 418 vB. The worst cell (10 pieces, nobody ever online) is 4.36 % of the chain and
+**still beats the shipped default**.
+
+#### Payment volume rides free
+
+The same 77.4 MvB carries any of these:
+
+| traffic | vB/payment | footprint |
+|---|---:|---|
+| 1 M/month | 6.45 | 0.147 % of chain |
+| 10 M/month | 0.65 | **unchanged** |
+| 1 B/year | 0.077 | **unchanged** |
+
+#### The two levers
+
+1. **Absentee rate — dominant.** 0.80 → 57.30 vB/payment is a **72× swing**, and it is a product
+   problem (how often wallets check in), not a protocol one.
+2. **Epoch length — linear.** `initlock = 10 000` sets 5.26 rounds/yr; raising it cuts the total
+   proportionally. Depth is a *usability* dial rather than a safety limit, so there is real room —
+   gated on reconciling depth admission against materialisability (SPEC §5.4.5 REQ-63.4).
+
+**Quote the worst case, not the best** (SPEC §5.4.6): exit-key reassignment lets any holder force a
+payout instead of a migration, free and unattributable.
+
+---
+
 ## 1. The correction, stated plainly
 
 Utexo has been described — in [README.md](README.md), in [PARITY.md](PARITY.md), in the pitch — as

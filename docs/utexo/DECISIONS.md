@@ -3137,3 +3137,126 @@ only be quoted with its **re-denomination cost included**, since re-cutting is i
 
 An adversary that only checks arithmetic will pass all four of these. The selection of the
 representative case needs its own adversary.
+
+---
+
+## [D83] The discharge round — and offline SUCCESSION is retracted
+
+**Owner goal, 2026-08-15:** *"design how SSP can make this system to get all coin leafs to exit
+cooperatively for the cheap. new req allow making offline payments for zero of near to zero."*
+
+Specified normatively in [SPEC.md](SPEC.md) §5.4 (REQ-53…63); footprint in
+[PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.8. Designed by a 14-agent adversarial
+run in which **all three candidate designs were scored FATAL by both a thief and a griefer**; what is
+specified is the rescue assembled from their surviving parts. **Nothing in it is plant-and-run.**
+
+### The retraction, first
+
+**You cannot hand an offline holder a leaf on a new tree.** This is a boundary, not a missing check.
+Verifying a leaf requires reading its root `F` from the chain — value, scriptPubKey, and *unspent*
+(`clients/libs/rust/src/tesr.rs:7514`, which fetches `F` via electrum and fails if absent). An offline
+holder cannot do that, and **the SE cannot do it for them: `lockbox/vcpkg.json` declares crow, openssl
+and cpr and no Bitcoin library.** So no party can certify that a successor tree exists, is funded and
+is unspent at the moment the predecessor is destroyed. All three designs died on exactly this, in
+three disguises. **Any future proposal to "carry an offline holder onto a new tree" must first answer:
+who checks that the new root exists?**
+
+What replaces it is better: absentees are paid **on chain, in the collapse transaction itself**, at
+one 43-vB P2TR output each. The payout and the death of the old position are the same transaction, so
+**atomicity is Bitcoin's, not the protocol's** — there is no window and nothing to verify. That also
+retires the earlier "keyless `T` broadcast" fallback, which was a *grief* (the tree unwinds, everyone
+loses) where this *pays the absentee* and the tree still dies in one transaction.
+
+### Why a round at all
+
+[D82] settled that collapse is the only route to block-space scaling. Collapse needs complete
+ownership of a sub-tree, and one holdout forbids it — so opportunistic buy-out can never get there.
+**The round makes complete ownership a scheduled event rather than a negotiation**, and form (c)
+makes holdouts structurally impossible: no holder's signature is required for anything.
+
+### The result that matters
+
+The footprint is `(pieces ÷ 256) × (365 ÷ epoch_days) × (155 + 43·absentees)`. **Payment volume
+appears nowhere in it.** Without the round, cost scaled with payments and lost; with it, cost scales
+with held pieces and wins. At 1 M users / 4 000 BTC / 1 M payments per month: **0.147 % of Bitcoin
+block space, ~77 blocks a year, 6.45 vB/payment** — and the identical footprint carries 1 B
+payments/year at 0.077 vB each.
+
+### Division of responsibility — and why it cannot be otherwise
+
+The SSP does the work (runs rounds, mints trees, conveys, builds and broadcasts `C`, fronts capital).
+**The SE does the enforcement, because its co-signature is the only refusal that binds.** Putting the
+payout check in the SSP would be a rule enforced by the party it constrains — the same shape as [D54],
+where terminality was read as a plain bool off the coordinator's Postgres and was written up as a
+security property for as long as the hole existed.
+
+### Status
+
+**The enforcement point is identified and EMPTY.** `disclosure` / `prevout_value`: 83 occurrences in
+the client, **0 in `lockbox/`**. Today the SE would co-sign a collapse paying out nobody.
+
+## [D84] BIP-341 makes a witnessed SE value-accurate without chain access
+
+The prevout amount is committed into the key-path sighash, so a co-signature request disclosing a
+false value yields a signature that does not verify against the real UTXO. **A witnessed SE therefore
+knows every value in a round-managed tree, correctly, while knowing nothing about existence or
+unspentness.** That distinction is the exact boundary of what the SE may be asked to enforce — it can
+police a payout's amount ([D83] form (c)); it can never police a succession ([D83]'s retraction).
+
+## [D85] The owner latch replaces the one-hour lock, and its key is read from the money
+
+`latch_key := xonly(state_child.vout[0].spk)` — write-once, read from the witnessed transaction, never
+declared, rotated by the same witnessed co-signature that moves the leaf. Every subsequent co-signature
+under that sid requires a fresh BIP-340 by that key. `OPEN_TRANSFER_WINDOW_SQL`
+(`server/src/database/transfer_sender.rs:94`) is demoted to defence in depth **and its comment must say
+which mechanism is now primary** — leaving a stale comment claiming primacy is exactly the class of
+error [D54] was.
+
+This is what delivers the owner's second requirement, and it delivers it **alone**: no round, no
+collapse, no un-blinding. **The decisive experiment is small and must run first** — pay a leaf, leave
+the payee offline for 48 hours (well past the one-hour window), have the PAYER attempt
+`child_retransfer`, and prove the SE refuses. Nothing else in [D83] should be believed before it passes.
+
+## [D86] The trigger must be priced
+
+A free, anonymous, prepaid detonator held by every bundle holder was the proximate cause of death in
+all three candidate designs. Tiers must be committed **below** the mempool floor so they cannot relay
+standalone, and relay only as TRUC 1P1C packages — measured in-tree already
+(`docs/utexo/notes/WP1-TRUC-P2A-SPIKE.md`: a v3 parent at ~1 sat/vB rejected alone, accepted as a
+package with both transactions inheriting one effective feerate). **Cost, stated:** an exiter then
+needs outside funds, and `create_cpfp_tx` must first be fixed to price the *package* rather than the
+child alone. That is an existing condition surfaced, not a new one — at any market rate above 3 sat/vB
+today's prepaid tiers already need a bump.
+
+## [D87] The collapse grant is transaction-bound, re-grantable, and freezes prospectively
+
+It MUST NOT be expressed by raising `sig_budget`, which stays monotone
+(`lockbox/src/db_manager.cpp`, `server/src/database/deposit.rs:237`). Any number of transactions may be
+granted over the same outpoint, each independently predicate-checked — they conflict, at most one
+confirms, and every one of them pays everyone. That removes the RBF trap and the burned-grant attack.
+The freeze is prospective and irreversible; `utexo/sig_count/v2` → **v3** carrying `frozen`, with v2
+deleted outright, because an attestation omitting it would be false the moment a root is frozen.
+
+## [D88] The payout floor is the leaf's FULL FUNDING VALUE, not its exit value
+
+The two tier rungs are never broadcast, so their 1 230-sat burn is never realised. Booking it as SSP
+revenue while calling the payout "not theft" does not survive being said out loud. The absentee comes
+out **strictly ahead of exiting themselves** — a self-exit costs them the burn, their own fees across
+five transactions, and a 2 885-block wait.
+
+## [D89] Scale is MANY ROOTS, not deep trees
+
+`MAX_BATCH_RECIPIENTS = 63`, `DERIVED_SLOTS_PER_STATECHAIN = 64` as a per-parent **lifetime** cap, and
+the WP1-measured TRUC in-flight window of 2 against `SPINE_CSV = 0` together cap a round at ~62 leaves
+per spine level. Per-root economics do not change with the count, so the SSP scales by running more
+roots — which is a capital and operations question, not a protocol one.
+
+## [D90] Offline SENDING is not achievable and the spec says so
+
+One payment is four irreversible SE co-signatures over a transaction that did not exist before the
+payment was decided. It cannot be pre-signed: a pre-signed payment is a fixed-amount payment, and
+[D82] bans fixed amounts as a mechanism. **Offline PAYEE is delivered at zero cost ([D85]); offline
+PAYER is impossible.** The one adjacent buildable thing is DELEGATED PAY — an online holder authorises
+a specific payee key and maximum, and the SE later enforces it from the witnessed transactions, with
+the amount still arbitrary. It covers **standing and recurring payments only and must not be sold as
+offline sending** (SPEC REQ-62).

@@ -698,6 +698,11 @@ log. With it, the same lapse shows up as a coin that fails to arrive.
 
 ### 5.3 Sweep at claim — absorbing leaves out of circulation
 
+> **DEMOTED by §5.4.** The sweep is NOT the settlement path and never was: settling leaves one at a
+> time buys one P2TR input each and cannot beat ~1.5× an ordinary on-chain payment. It survives as an
+> *optimisation inside* the discharge round — it is how a leaf is absorbed cheaply during R1. Read
+> §5.4 first; anything below that reads as "the sweep is what makes the economics work" is superseded.
+
 **A leaf is a worse coin than a root in every respect** — it inherits a deadline it does not control,
 carries depth, has no one-transaction cooperative exit, and burns 1 230 sat of its own value if it is
 ever walked out. The sweep replaces it, at the moment it is first seen, with an ordinary root coin.
@@ -737,6 +742,190 @@ is the one outcome that makes this a tax rather than a service. The operator's s
 **Why this is worth building at all:** it is not dust rescue. It is what holds §14.3's break-even at
 ~0.5 onward payments per recipient instead of ~1.65 — i.e. what keeps the design's block-space claim
 true at realistic payment velocities.
+
+---
+
+### 5.4 The discharge round — how a whole tree is retired for one transaction
+
+> **Status: DESIGN, not built.** Every claim in this section is grounded in a source scan citing
+> `file:line`, which by this project's evidence rule ([D64]) establishes presence, absence and
+> ordering — **never reachability, binding or behaviour**. Nothing here has been plant-and-run.
+> The enforcement point is empty today: `disclosure` and `prevout_value` occur 83× in the client and
+> **0× in `lockbox/`**, so the SE would presently co-sign a collapse that pays out nobody.
+
+#### 5.4.1 Why a round is necessary at all
+
+[D82] establishes that **collapse is the only route to block-space scaling**: materialising any leaf
+requires broadcasting its entire ANCESTOR chain (a leaf's funding `SP.out[j]` is un-broadcast), so
+block space is spent on shared ancestors, and the only way an ancestor chain is never broadcast is
+that **nobody underneath it needs it**. Settling leaves one at a time — the §5.3 sweep, `combine_leaves`,
+any off-chain merge — cannot beat ~1.5× an ordinary on-chain payment, because each still buys one
+P2TR input. Off-chain merging does not escape it either: the merged piece still hangs off `SP`.
+
+Complete ownership of a sub-tree is therefore the whole game, and opportunistic buy-out cannot
+deliver it — **one holdout forbids the collapse**. The round makes complete ownership a scheduled
+event rather than a negotiation. §5.3's sweep is not superseded; it is demoted to an *optimisation
+inside* R1 (it is how a leaf is absorbed cheaply mid-round), and it is no longer the settlement path.
+
+#### 5.4.2 The three discharge forms
+
+A root MUST NOT be spent until **every leaf under it is discharged**. There are exactly three ways,
+and the SSP can always reach full discharge **without any holder's participation**:
+
+| form | who | realised block space | requires |
+|---|---|---|---|
+| **(a) RELEASE** | holder was online, migrated to the successor root, signed a release | **0 vB** | holder online |
+| **(b) MANDATE** | holder pre-authorised, while online, migration onto ONE named already-confirmed root | 0 vB | opt-in, leaves them exit-only until they return |
+| **(c) PAYOUT** | everyone else | **43 vB** (one P2TR output) | **nothing, ever** |
+
+Form (c) is what makes holdouts structurally impossible, and it is the only form both adversaries in
+the design review agreed survives: **the payout and the death of the old position are the same
+transaction**, so atomicity is Bitcoin's, not the protocol's.
+
+#### 5.4.3 The round
+
+**REQ-53 (round eligibility).** A round-managed root MUST have been deposited *and* split by the SSP
+(`k = 0`). A root acquired by transfer carries predecessor flat backups at higher locktimes and MUST
+NOT be round-managed. The SSP MUST run **at least two** roots: one *maturing* (being discharged) and
+one *current* (confirmed, accepting migrations). The collapse transaction's `out[0]` funds a future
+root, so a round both retires and re-funds in one transaction — there is no separate deposit.
+
+**REQ-54 (the sequence).** For maturing root `F_A` and confirmed current root `F_B`:
+
+| | step | verifiable by |
+|---|---|---|
+| **R0** | ANNOUNCE — publish freeze height `H_f` and the per-leaf `(exit_key, funding_value)` set as the SE recorded it, with a `utexo/leaf/v1` attestation | everyone |
+| **R1** | MIGRATE — for each responding holder, an ordinary in-ladder split on `B` conveying a leaf of **identical funding value**. The holder runs the **complete existing verifier unchanged** (`verify_conveyed_child` → `verify_child_bundle`, `f_spender` against a **confirmed** `F_B`, `cap_schedule`, `check_exit_headroom_with_margin`, `attested_terminal`, Model A, value conservation both ways) and takes first-class ownership. *This is not a new mechanism. It is a payment.* | the holder, fully, **with no new trust** |
+| **R2** | RELEASE — `POST /release {sid, nonce32, sig}`, BIP-340 under the leaf's latch key over `tagged("utexo/leaf_release/v1", sid‖nonce32)`. Monotone, never cleared, single-use nonce. **A consent record, not a spending authorisation** | the SE |
+| **R3** | MANDATE HARVEST (optional) — form (b) holders migrated under SE enforcement | the SE |
+| **R4** | FREEZE — at `H_f` conveyance on `A` stops. Late arrivals simply join the payout set. **No deadlock; nothing is ratcheted yet** | — |
+| **R5** | BUILD `C` — one input, one output per undischarged leaf, plus the future root and a CPFP handle | — |
+| **R6** | GRANT — `POST /collapse_grant {root_sid, disclosure(C)}`; the SE runs REQ-56, sets `frozen` **prospectively**, issues the partial signature | the SE, from state it authored |
+| **R7** | BROADCAST — **one transaction** retires `A`, pays every undischarged holder in full at their own key, and funds the next root | the chain |
+| **R8** | GRIEFED BRANCH — if anyone broadcasts `T_A` first, `C` dies and **nothing is lost**; re-run R5–R7 with `C.vin[0] = (T_A.txid, 0)` at `TRIGGER_SEQUENCE`, which confirms 720 blocks ahead of `X_A` | the chain |
+| **R9** | SETTLE — absentees hold ordinary spendable UTXOs at keys their own seeds derive, permanently out of the round machinery | the holder |
+
+```text
+C.vin  = [ (F_A.txid, F_A.vout) ]                     // exactly one input
+C.vout = [ P2TR(A_next)  value f_next                 // out[0]: the future root
+         , P2TR(K_i)     value >= fund_i   ...        // one per UNDISCHARGED leaf
+         , P2TR(ssp_change) ]                         // CPFP handle
+```
+
+**REQ-55 (no third-party input).** `C` MUST have exactly one input. A depositor's signature MUST
+never be required to complete a round — otherwise any depositor can stall every round by going quiet.
+
+**REQ-56 (THE SE PREDICATE — the load-bearing rule).** The SE MUST refuse `collapse_grant` unless,
+for the **frontier** of the root (every node that is not the parent of another), every node not marked
+`released` is paid **its full funding value** to **its own `exit_key`**, in outputs distinct per key:
+
+```python
+def collapse_grant(root_sid, disclosure):
+    T  = tree[root_sid]                          # absent => REFUSE (fail closed)
+    tx = witness_bind(disclosure, disclosure.session)     # INV-W, below
+    REQUIRE len(tx.vin) == 1
+    REQUIRE tx.vin[0].prevout in {(T.fund_txid, T.fund_vout),
+                                  (T.trigger_txid, PAYLOAD_VOUT)}   # R8 branch
+    owed = defaultdict(int)
+    for n in frontier(root_sid):
+        if n.released: continue                  # form (a) / (b)
+        owed[n.exit_key] += n.fund_value         # INV-P: FULL un-burned value
+    used = set()
+    for key, amount in owed.items():             # INV-Q: distinct outputs per key
+        got = sum(o.value for i, o in enumerate(tx.vout)
+                  if i not in used and o.spk == p2tr_spk(key) and not used.add(i))
+        REQUIRE got >= amount
+    T.frozen = True                              # INV-FREEZE: prospective, irreversible
+    return partial_signature(root_sid, disclosure)
+```
+
+**REQ-57 (witness binding, INV-W).** The SE MUST reconstruct the BIP-341 key-path sighash from the
+disclosed transaction and byte-compare the resulting blinded session against the session it was asked
+to sign; on mismatch it MUST return `400` **without consuming the secnonce**. This is what makes the
+disclosure non-lying: [D84] — BIP-341 commits the prevout amount, so a false value yields a signature
+that does not verify against the real UTXO.
+
+**REQ-58 (what the predicate MUST NOT do).** It MUST NOT ask whether `F` exists, is funded, or is
+unspent. **The SE has no chain access** — `lockbox/vcpkg.json` declares crow, openssl and cpr and no
+Bitcoin library — and any design that needs it to is unsound ([D83]). Form (c) needs only the output
+vector of a transaction the SE verified byte-for-byte; form (b) needs only facts the SE authored
+about a root **the holder verified themselves while online**.
+
+**REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
+raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same
+outpoint — each independently predicate-checked — because they conflict and at most one confirms.
+This removes the RBF trap and the burned-grant attack ([D87]).
+
+#### 5.4.4 Absentees
+
+**REQ-60.** An absentee MUST be paid its **full funding value**, not its exit value. The two tier
+rungs are never broadcast, so their 1 230-sat burn is never realised and is not the SSP's to keep
+([D88]).
+
+An absentee is resolved in **exactly one** round and is then permanently out of the round machinery.
+There is no carry, no dormancy fee, no forfeiture, no accumulating liability — which is the concrete
+superiority over a vTXO that expires. They come out **strictly ahead of exiting themselves**: a
+self-exit costs them tier burn, their own miner fees across five transactions, and a 2 885-block wait.
+What they lose is **off-chain status, not satoshis** — a forced exit, not a taking.
+
+Incentives need no coercion: form (a) costs the SSP 0 vB and keeps the holder in the system, form (c)
+costs 43 vB and pushes value out. The SSP chases migrations; holders who want to stay off-chain need
+only appear once per round.
+
+#### 5.4.5 Offline payments
+
+**REQ-61 (offline payee — zero).** A payee MUST NOT need to be online, reachable, or on a clock to be
+paid. The mechanism is the **owner latch**: `latch_key := xonly(state_child.vout[0].spk)`, read from
+the money itself and write-once, after which every co-signature under that sid requires a fresh
+BIP-340 by that key. This replaces the coordinator's one-hour `OPEN_TRANSFER_WINDOW_SQL`
+(`server/src/database/transfer_sender.rs:94`) as the primary defence; the window is demoted to
+defence in depth and its comment MUST say so ([D85], and leaving it as-is is exactly the class of
+error [D54] was).
+
+**REQ-62 (offline payer — NOT ACHIEVABLE, stated so).** One payment is four irreversible SE
+co-signatures over a transaction that did not exist before the payment was decided. It cannot be
+pre-signed, because a pre-signed payment is a fixed-amount payment and [D82] bans fixed amounts as a
+mechanism. **The spec MUST NOT claim offline sending.** The one adjacent buildable thing is
+DELEGATED PAY — a holder, while online, signs
+`utexo/deleg_pay/v1(parent_sid, payee_exit_key, max_value, expiry, nonce32)`, and the SE later enforces
+from the witnessed transactions that the payee leaf pays exactly that key at `value <= max_value`.
+The amount stays arbitrary, so [D82] is respected. **This covers standing and recurring payments
+only. It MUST NOT be sold as offline sending.**
+
+**REQ-63 (the liveness that remains, stated honestly).** Four facts, tightest last:
+1. **Hand-off: zero.** With the latch the payee needs no network, no clock, no deadline.
+2. **First-class ownership: one online action, whenever they like.** Until `/transfer/unlock` +
+   `/transfer/receiver` complete, the payee holds **exit-only** material — claimable, keyless,
+   offline-exitable, but not re-transferable, renewable or splittable. There is no keyless claim
+   delegation; a "claim agent" is a custodian. **This MUST be said in the product docs.**
+3. **The epoch is the real bound.** A leaf carries no flat backup of its own
+   (`CHILD_V2_BASELINE == 0`); its clock is inherited and nothing off-chain moves it. A holder who
+   wants to stay off-chain MUST appear roughly once per round.
+4. **`initlock` is the one real dial nobody used** (`lib/src/tesr.rs:452-467`). Raising mainnet
+   10 000 → 52 560 multiplies parked lifetime by ~5× at zero on-chain cost, but first requires
+   reconciling the gap between depth *admission* (which reads the full `lockheight_init`,
+   `lib/src/transfer/receiver.rs:1128`) and materialisability (which reads the remaining runway,
+   `:997`).
+
+#### 5.4.6 What is NOT resolved
+
+1. **The conveyed flat backup is live until the epoch attestation ships.** Every payee is today
+   conveyed the current owner's signed flat backup (`clients/libs/rust/src/tesr.rs:396`); after `L_k`
+   any one of them can spend `F` and destroy every sibling's leaf. The round shortens the window; it
+   does not close it. The fix is to convey a `utexo/epoch/v1` attestation **instead of** the
+   transactions.
+2. **Exit-key reassignment grief.** Any holder can force form (c) instead of (a), free and
+   unattributable, moving a round from a handful of payouts to all of them. Bounded and priced — but
+   **the economics MUST be quoted at the worst case, not the best**.
+3. **A floor-sized leaf paid out during a fee spike may be economically dead.** Operational rule:
+   prefer migration for small leaves; do not run a round during a spike.
+4. **The grant is one signature that spends everything under a root.** Today no such signature can
+   exist at all. It is the most dangerous new object in the system and MUST be the most heavily
+   plant-and-run tested path.
+5. **SE blindness dies on round-managed trees.** Not a bug — a price, and an owner decision that MUST
+   be recorded before the leaf registry is built. Mitigating fact: in production the lockbox and the
+   coordinator are the **same operator**, so per-signature blinding was protecting a distinction
+   production does not make.
 
 ---
 
