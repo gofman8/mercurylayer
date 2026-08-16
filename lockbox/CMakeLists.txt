@@ -47,7 +47,8 @@ set(LOCKBOX_SOURCES
     src/monocypher.c
     src/db_manager.cpp
     src/tx.cpp
-    src/witness.cpp)
+    src/witness.cpp
+    src/auth.cpp)
 
 if(WITH_GOOGLE_KMS)
     list(APPEND LOCKBOX_SOURCES src/google_key_manager.cpp)
@@ -164,6 +165,17 @@ if(BUILD_LOCKBOX_TESTS)
     add_custom_command(TARGET test_session_rebuild POST_BUILD
         COMMAND test_session_rebuild
         COMMENT "Running the blinded-session reconstruction differential")
+
+    # BIP-340 verification — the SE's FIRST signature check, against vectors signed by the client
+    # (`cargo test -p ci-guards --test emit_bip340_vectors`). Every positive case is paired with a
+    # control that must fail, because a verifier that accepts everything passes positives alone.
+    add_executable(test_bip340 tests/test_bip340.cpp src/auth.cpp src/tx.cpp)
+    target_include_directories(test_bip340 PRIVATE include tests)
+    target_link_libraries(test_bip340 PRIVATE secp256k1_zkp OpenSSL::Crypto)
+    add_test(NAME bip340 COMMAND test_bip340)
+    add_custom_command(TARGET test_bip340 POST_BUILD
+        COMMAND test_bip340
+        COMMENT "Running the BIP-340 verification differential")
 endif()
 
 # Copy Settings.toml after building MercuryLockbox
