@@ -757,13 +757,29 @@ true at realistic payment velocities.
 > that detects the lie. Unit differentials pin the reconstruction against client-generated vectors
 > (4/4 sighash, 3/3 session, each with negative controls).
 >
-> **Two limits, both measured, neither closed.** (1) Binding is **opt-in per request**: an absent
-> disclosure is still served, so a malicious client can simply decline to be bound. (2) The
-> disclosure is built in exactly one place (`calculate_musig_session`, `lib/src/transaction.rs`), so
-> the coloured multi-input path (`get_partial_sig_request_for_colored_tx_multi`) attaches none —
-> **1 of 2** co-signatures bound in the deposit+ladder `sdk92` exercises. Making binding mandatory is
-> a deploy-ordering change, not a code change, and MUST NOT be described as done until every builder
-> attaches a disclosure.
+> **Coverage of the laddered lifecycle is MEASURED: `sdk92` reports 4 bound / 4 co-signatures** —
+> the deposit plus all three tiers, zero refusals. Tier co-signatures are the interesting ones:
+> `cosign_tier_request` hashes over the PARENT tier's output value, not `coin.amount`, so they are
+> where a disclosure that re-derives its prevout silently describes a hash nobody computed. That
+> drift existed and is fixed: prevouts, input index and sighash type are now passed from the hash
+> site (`calculate_musig_session`), so the disclosure and the sighash are one value rather than two
+> that happen to agree. `sdk71` independently exercises the same lane end to end — laddering,
+> conveyance and claim — at **14 bound / 14 co-signatures, 0 refusals** across 7 statechains.
+>
+> **Two limits remain.** (1) Binding is **opt-in per request**: an absent disclosure is still served,
+> so a malicious client can simply decline to be bound. Making it mandatory is a deploy-ordering
+> change that breaks any un-migrated JS/Kotlin client. (2) The **coloured multi-input** path is fixed
+> (it now discloses input `i` against the full prevout set, where it previously claimed index 0 and a
+> single prevout) but **no test exercises it with a disclosure**, so that path is compiled-correct
+> and live-unproven. Neither may be described as done.
+>
+> **A measurement trap worth stating, because it cost a full diagnosis.** `claim()` silently declines
+> to ladder when the SE's attestation identity is unpinned; the reason is *recorded, not raised*
+> (`ladderskip-<sid>` → `{"reason":"attestation-identity-unpinned"}`). An E2E run without
+> `UTEXO_ATTESTATION_IDENTITY` therefore never reaches `cosign_tier_request`, ends at
+> `sig_count == 1`, and reports **1 bound / 1 co-signature** — a ratio that is true, looks like full
+> coverage, and proves nothing about tiers. `sdk92` now refuses to report a ratio from an unladdered
+> coin and prints the recorded reason instead.
 >
 > **The collapse predicate itself is still empty**: there is no leaf registry, no frontier, no
 > `collapse_grant` route, so the SE would presently co-sign a collapse that pays out nobody.
@@ -1573,7 +1589,7 @@ unbuilt sections, and they are marked as such in place.
 | INV-26 | `sdk09` (IFA received amount = fungible only) |
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
 | REQ-49…REQ-52 (§5.3, the sweep) | **NONE — design, not built.** See the status banner in §5.3 |
-| REQ-57 (§5.4, witness binding) | `sdk92` (live: honest bind logged, one-satoshi lie refused BY THE SESSION COMPARE, correct value not refused), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3). **Partial coverage:** opt-in per request, and only `calculate_musig_session` attaches a disclosure — 1 of 2 co-signatures bound in `sdk92`'s ladder |
+| REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE; the same bytes with the correct value not refused), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. **Open:** binding is opt-in per request; the coloured multi-input path is fixed but unexercised |
 | REQ-53…REQ-56, REQ-58…REQ-67 (§5.4, the rest of the round) | **NONE — design, not built.** No leaf registry, no frontier, no `collapse_grant`. See the status banner in §5.4 |
 
 **Suite sizes.** Workspace unit + guard tests: **805**, 0 failures (`cargo test --workspace --tests`).

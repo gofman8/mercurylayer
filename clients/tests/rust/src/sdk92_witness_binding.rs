@@ -253,7 +253,18 @@ pub async fn execute() -> Result<()> {
             .find(|s| !before.contains(s))
         {
             sid = s;
-            break;
+            // Keep claiming until the LADDER exists (or a skip is recorded). A statechain id
+            // appears at deposit-init, well before confirmation and laddering, so breaking on the
+            // id alone stops the test before any tier is ever co-signed.
+            let laddered =
+                mercuryrustlib::tesr::load(&cc, "sdk92_alice", &sid).await?.is_some();
+            let skipped =
+                mercuryrustlib::transfer_sender::read_ladder_skip(&cc, "sdk92_alice", &sid, 0)
+                    .await
+                    .is_some();
+            if laddered || skipped {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -264,8 +275,35 @@ pub async fn execute() -> Result<()> {
              here — and fails for EVERY signature, not intermittently."
         ));
     }
-    println!("SDK92 - [a] PASS: deposit confirmed with a disclosure attached ({})",
-             &sid[..8.min(sid.len())]);
+    println!("SDK92 - [a] deposit confirmed ({})", &sid[..8.min(sid.len())]);
+
+    // THE COIN MUST BE LADDERED, or this test cannot see the lane it exists to cover.
+    //
+    // Tier co-signatures are the ones that go through `cosign_tier_request`, and that is where the
+    // disclosed prevout value has to be the PARENT tier's output rather than `coin.amount`. A run
+    // that only deposits never calls it, ends at `sig_count == 1`, and reports a 1-bound/1-request
+    // ratio that looks like full coverage while proving nothing about tiers.
+    //
+    // Laddering is skipped SILENTLY when the SE's attestation identity is unpinned — the reason is
+    // recorded rather than raised, so the failure surfaces as "no tiers" with no error anywhere.
+    // Read that reason back and say it, instead of quietly measuring the narrow case.
+    if let Some(reason) =
+        mercuryrustlib::transfer_sender::read_ladder_skip(&cc, "sdk92_alice", &sid, 0).await
+    {
+        return Err(anyhow!(
+            "[a] the coin was NOT laddered — recorded reason: {reason:?}. This run never reaches \
+             `cosign_tier_request`, so it measures the deposit lane ONLY and any coverage ratio it \
+             prints is vacuous. If the reason is `attestation-identity-unpinned`, export \
+             UTEXO_ATTESTATION_IDENTITY from `curl -s {lockbox}/attestation_identity` and re-run."
+        ));
+    }
+    if mercuryrustlib::tesr::load(&cc, "sdk92_alice", &sid).await?.is_none() {
+        return Err(anyhow!(
+            "[a] no ladder bundle for {sid} and no recorded skip reason either. The tier lane is \
+             unexercised and unexplained — do not read the coverage ratio below as evidence."
+        ));
+    }
+    println!("SDK92 - [a] PASS: coin laddered, so tier co-signatures were exercised");
 
     // A green deposit is NOT by itself evidence the gate ran: an absent disclosure is served, so a
     // client that failed to serialise one would look exactly like this. Count the SE's own
