@@ -49,6 +49,8 @@
 #include <string>
 #include <vector>
 
+#include "tx.h"
+
 namespace witness {
 
 /// Everything the SE needs to rebuild the session, and nothing secret. Each field is public data the
@@ -97,6 +99,30 @@ BindResult bind(const Disclosure& d,
 bool output_pays_xonly(const std::string& unsigned_tx_hex,
                        uint32_t vout,
                        const std::vector<unsigned char>& xonly);
+
+/// The payload output of a tier, selected STRUCTURALLY.
+///
+/// # Why not `vout[0]`, and why not a supplied index
+///
+/// REQ-61(a): the client's `payload_vout` is ATTACKER-SUPPLIED in every conveyed bundle — the client
+/// code says so itself. A latch key or an exit key read at an index the attacker chooses is a key
+/// the attacker chooses. The spec's earlier `vout[0]` was wrong in the other direction: the anchor
+/// is not always second.
+///
+/// So the SE derives it: the payload is **the unique output whose scriptPubKey is P2TR**. On an
+/// uncoloured tier the only other output is the P2A anchor, whose script is `OP_1 <2-byte>` and so
+/// is not P2TR, leaving exactly one candidate. A transaction without exactly one P2TR output yields
+/// `nullopt`, and the caller MUST refuse rather than pick — a tie broken by position is the same
+/// defect wearing a different hat.
+struct PayloadOutput {
+    uint32_t vout;
+    std::vector<unsigned char> xonly;  // 32 bytes
+    uint64_t value;
+};
+std::optional<PayloadOutput> payload_output(const tx::Transaction& t);
+
+/// Convenience overload for a hex-encoded transaction; `nullopt` also when it does not parse.
+std::optional<PayloadOutput> payload_output(const std::string& unsigned_tx_hex);
 
 }  // namespace witness
 

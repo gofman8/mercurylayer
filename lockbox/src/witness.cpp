@@ -164,6 +164,27 @@ BindResult bind(const Disclosure& d,
     return BindResult::Match;
 }
 
+std::optional<PayloadOutput> payload_output(const tx::Transaction& t) {
+    std::optional<PayloadOutput> found;
+    for (size_t i = 0; i < t.vout.size(); ++i) {
+        const auto key = tx::p2tr_xonly_key(t.vout[i].script_pubkey);
+        if (!key) continue;
+        // A SECOND P2TR output means the payload is ambiguous. Refuse rather than take the first:
+        // choosing by position is exactly the attacker-controlled selection this function exists to
+        // remove, and a coloured tier with several payloads is out of scope here rather than
+        // silently reduced to its first leg.
+        if (found) return std::nullopt;
+        found = PayloadOutput{static_cast<uint32_t>(i), *key, t.vout[i].value};
+    }
+    return found;
+}
+
+std::optional<PayloadOutput> payload_output(const std::string& unsigned_tx_hex) {
+    const auto parsed = tx::parse_hex(unsigned_tx_hex);
+    if (!parsed) return std::nullopt;
+    return payload_output(*parsed);
+}
+
 bool output_pays_xonly(const std::string& unsigned_tx_hex, uint32_t vout,
                        const std::vector<unsigned char>& xonly) {
     const auto parsed = tx::parse_hex(unsigned_tx_hex);

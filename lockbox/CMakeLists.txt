@@ -190,6 +190,18 @@ if(BUILD_LOCKBOX_TESTS)
         COMMAND test_registry
         COMMENT "Running the REQ-56 collapse-predicate tests")
 
+    # txid + structural payload selection, against vectors from bitcoin's own Transaction::txid()
+    # — including a WITNESS-BEARING transaction, the case that separates txid from wtxid.
+    add_executable(test_txid_payload tests/test_txid_payload.cpp src/tx.cpp src/witness.cpp
+                                     src/utils.cpp src/monocypher.c)
+    target_include_directories(test_txid_payload PRIVATE include tests)
+    target_link_libraries(test_txid_payload PRIVATE
+        Crow::Crow tomlplusplus::tomlplusplus secp256k1_zkp OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME txid_payload COMMAND test_txid_payload)
+    add_custom_command(TARGET test_txid_payload POST_BUILD
+        COMMAND test_txid_payload
+        COMMENT "Running the txid + payload-selection differential")
+
     # The registry against a REAL Postgres. Deliberately NOT run POST_BUILD: there is no database
     # during `docker build`, and a test that skips when its dependency is missing is worse than no
     # test — it reports success for something it never ran. Built into the image; run explicitly:

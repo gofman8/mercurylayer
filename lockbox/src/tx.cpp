@@ -133,6 +133,36 @@ bool is_p2tr(const std::vector<unsigned char>& spk) {
     return spk.size() == 34 && spk[0] == 0x51 && spk[1] == 0x20;
 }
 
+std::vector<unsigned char> txid(const Transaction& t) {
+    // The LEGACY serialisation: no segwit marker, no flag, no witness stack. Nothing here strips
+    // witness data, because `parse` never kept any — so the legacy form is what this can produce,
+    // and a future change that started keeping witnesses would have to change this function
+    // deliberately rather than break it by omission.
+    std::vector<unsigned char> ser;
+    put_u32(ser, t.version);
+
+    put_varint(ser, t.vin.size());
+    for (const auto& in : t.vin) {
+        ser.insert(ser.end(), in.prevout.txid, in.prevout.txid + 32);
+        put_u32(ser, in.prevout.vout);
+        put_varint(ser, in.script_sig.size());
+        ser.insert(ser.end(), in.script_sig.begin(), in.script_sig.end());
+        put_u32(ser, in.sequence);
+    }
+
+    put_varint(ser, t.vout.size());
+    for (const auto& out : t.vout) {
+        put_u64(ser, out.value);
+        put_varint(ser, out.script_pubkey.size());
+        ser.insert(ser.end(), out.script_pubkey.begin(), out.script_pubkey.end());
+    }
+
+    put_u32(ser, t.lock_time);
+
+    const auto once = sha256(ser.data(), ser.size());
+    return sha256(once.data(), once.size());
+}
+
 std::optional<std::vector<unsigned char>> p2tr_xonly_key(const std::vector<unsigned char>& spk) {
     if (!is_p2tr(spk)) return std::nullopt;
     return std::vector<unsigned char>(spk.begin() + 2, spk.end());

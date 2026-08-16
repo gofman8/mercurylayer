@@ -115,6 +115,24 @@ bool is_p2tr(const std::vector<unsigned char>& spk);
 /// The 32-byte x-only key inside a P2TR scriptPubKey, or `nullopt` if it is not one.
 std::optional<std::vector<unsigned char>> p2tr_xonly_key(const std::vector<unsigned char>& spk);
 
+/// The transaction id, in the byte order an OUTPOINT carries (NOT the reversed form explorers show).
+///
+/// Two things this gets right that are easy to get wrong:
+///
+///   * **Witness data is not hashed.** `txid` is the double-SHA256 of the LEGACY serialisation;
+///     including the witness yields `wtxid`, a different 32 bytes. This is computed by
+///     re-serialising the PARSED transaction, and the parser discards witness data, so the legacy
+///     form falls out by construction rather than by remembering to strip it.
+///   * **Byte order.** Returned in internal order, because the only consumer is outpoint matching:
+///     a child's tier input names `(SP.txid, j)` in that order. Reversing for display is the
+///     caller's business.
+///
+/// Needed because the leaf registry's parent edge must be SE-AUTHORED. A child's tier spends its
+/// parent's payload output, and only the SE can say which sid it co-signed that parent under — but
+/// only if it computes the parent's id itself. Accepting a parent id from the request would let a
+/// caller graft its leaf onto someone else's tree, and the frontier decides who gets paid.
+std::vector<unsigned char> txid(const Transaction& t);
+
 }  // namespace tx
 
 #endif  // LOCKBOX_TX_H
