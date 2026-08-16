@@ -118,7 +118,10 @@ int main() {
         // still carries it refuses every honest request — and is invisible if the vectors were also
         // generated before stripping, which is how the first version of this test passed while
         // proving the wrong thing.
-        if (!secp256k1_musig_remove_fin_nonce_from_session(secp256k1_context_no_precomp, &session)) {
+        // Blinded symbol: the client's plain-looking `remove_fin_nonce_from_session` is a Rust alias
+        // that links to `..._blinded_musig_remove_fin_nonce_from_session` (zkp.rs:673 `link_name`).
+        if (!secp256k1_blinded_musig_remove_fin_nonce_from_session(secp256k1_context_no_precomp,
+                                                                   &session)) {
             std::printf("  FAIL could not remove the fin nonce\n");
             ++failures;
             continue;

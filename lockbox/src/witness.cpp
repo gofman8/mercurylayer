@@ -134,7 +134,14 @@ BindResult bind(const Disclosure& d,
     // `session.serialize()` rather than from the wire form: both sides carried the fin nonce, agreed
     // perfectly, and proved the wrong thing. Precisely the failure the differential exists to catch,
     // reached by testing against the wrong reference.
-    if (!secp256k1_musig_remove_fin_nonce_from_session(secp256k1_context_no_precomp, &session)) {
+    //
+    // The C symbol is the BLINDED one. The client appears to call a plain `..._musig_remove_...`,
+    // but that Rust name is an alias: `secp256k1-zkp-sys/src/zkp.rs:673` declares it with
+    // `link_name = "rustsecp256k1zkp_v0_8_1_blinded_musig_remove_fin_nonce_from_session"`. There is
+    // one function; only the Rust-side spelling differs. Checked rather than assumed, because
+    // picking the wrong one here would refuse every honest request.
+    if (!secp256k1_blinded_musig_remove_fin_nonce_from_session(secp256k1_context_no_precomp,
+                                                               &session)) {
         return fail(BindResult::Unsupported, "fin nonce could not be removed from the session");
     }
 

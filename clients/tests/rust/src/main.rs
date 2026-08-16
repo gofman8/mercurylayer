@@ -105,6 +105,7 @@ pub mod sdk88_carrier_headroom;
 pub mod sdk89_plain_detrigger;
 pub mod sdk90_transfer_window_lapse;
 pub mod sdk91_malicious_payer_window;
+pub mod sdk92_witness_binding;
 pub mod rln;
 pub mod utils;
 use anyhow::{Result, Ok};
@@ -555,6 +556,12 @@ async fn main() -> Result<()> {
     // [D85 / REQ-61] The malicious payer: bypass the client, probe the coordinator's window directly.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("91") {
         sdk91_malicious_payer_window::execute().await?;
+        return Ok(());
+    }
+
+    // [REQ-57] Witness binding, live: an honest disclosure signs, a tampered one is refused.
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("92") {
+        sdk92_witness_binding::execute().await?;
         return Ok(());
     }
 
