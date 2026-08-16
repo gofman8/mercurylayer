@@ -85,6 +85,73 @@ namespace db_manager {
                 // pre-existing behaviour. A value is a ratchet: see set_sig_budget.
                 "sig_budget INTEGER);");
             txn.exec("ALTER TABLE generated_public_key ADD COLUMN IF NOT EXISTS sig_budget INTEGER;");
+
+            // ── [REQ-56 / REQ-59 / REQ-61 / REQ-65] THE LEAF REGISTRY ────────────────────────────
+            //
+            // Declared HERE, not lazily inside the accessors that use them. That is not a style
+            // preference: `signed_session_cache` is created inside `get_cached_partial_sig` and
+            // `store_partial_sig_and_increment` rather than at boot, and the `sig_budget` ALTER two
+            // lines above exists because that shape already cost one deployment. A table that
+            // appears only when a particular code path runs is a table that is missing exactly when
+            // an unusual path runs first.
+            //
+            // What the SE is allowed to record here is narrow, and the narrowness is the point
+            // (REQ-58): every column below is either something the SE AUTHORED (it signed under this
+            // sid) or something it WITNESSED through binding (a value and a key read out of a
+            // transaction whose sighash it recomputed). Nothing here is a client assertion, because
+            // an offline holder could not trust one.
+            txn.exec(
+                // The SE's own index from a transaction it hashed itself to the sid it signed that
+                // transaction under. This is what makes a parent edge SE-authored rather than
+                // client-asserted: a child's tier spends (SP.txid, j), and only the SE can say which
+                // sid it co-signed SP under.
+                "CREATE TABLE IF NOT EXISTS se_signed_tx ( "
+                "txid BYTEA PRIMARY KEY, "
+                "statechain_id varchar(50) NOT NULL, "
+                "sig_index INTEGER NOT NULL);");
+            txn.exec(
+                "CREATE INDEX IF NOT EXISTS se_signed_tx_sid ON se_signed_tx (statechain_id);");
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_leaf ( "
+                "statechain_id varchar(50) PRIMARY KEY, "
+                // NULL for a node whose parent is the root itself.
+                "parent_statechain_id varchar(50), "
+                "root_statechain_id varchar(50) NOT NULL, "
+                // REQ-60: the FULL funding value, never the exit value. The two tier rungs are never
+                // broadcast, so their burn is never realised and is not the SSP's to keep.
+                "fund_value BIGINT NOT NULL, "
+                // REQ-65: the payee's x-only key, read from the WITNESSED payload output of the
+                // state tier — identified structurally as the unique P2TR output (REQ-61a), never at
+                // a client-supplied index.
+                "exit_key BYTEA NOT NULL, "
+                // REQ-61: write-once. NULL until armed.
+                "latch_key BYTEA, "
+                // Form (a)/(b): monotone, never cleared. A release is a consent record, not a
+                // spending authorisation.
+                "released BOOLEAN NOT NULL DEFAULT false);");
+            txn.exec(
+                "CREATE INDEX IF NOT EXISTS se_leaf_root ON se_leaf (root_statechain_id);");
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_root ( "
+                "root_statechain_id varchar(50) PRIMARY KEY, "
+                // INV-FREEZE: set PROSPECTIVELY and irreversibly, inside collapse_grant, in the same
+                // transaction as the frontier check — so no leaf can appear between the check and
+                // the ratchet (REQ-64).
+                "frozen BOOLEAN NOT NULL DEFAULT false, "
+                // REQ-64b: named so a refused wallet retries on the successor instead of surfacing
+                // an error. The SE cannot authenticate this (it has no chain access, REQ-58), so it
+                // is an operator declaration and MUST be treated by wallets as a retry HINT that
+                // they verify themselves — never as proof.
+                "successor_root varchar(50));");
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_release_nonce ( "
+                "statechain_id varchar(50) NOT NULL, "
+                // R2's single-use nonce. PRIMARY KEY over (sid, nonce) is the replay defence: a
+                // second presentation of the same nonce collides and is refused by the database
+                // rather than by a check someone can forget to write.
+                "nonce BYTEA NOT NULL, "
+                "PRIMARY KEY (statechain_id, nonce));");
+
             txn.commit();
             return true;
         }
@@ -763,6 +830,169 @@ namespace db_manager {
 
             return true;
         } else {
+            return false;
+        }
+    }
+
+    // ── [REQ-56 / REQ-65] THE LEAF REGISTRY ──────────────────────────────────────────────────────
+
+    bool establish_leaf(const std::string& statechain_id,
+                        const std::string& parent_statechain_id,
+                        const std::string& root_statechain_id,
+                        int64_t fund_value,
+                        const std::vector<unsigned char>& exit_key,
+                        std::string& error_message) {
+        // Checked, not asserted: a short key would be stored and later compared against a 32-byte
+        // output key, silently never matching — an obligation that can never be discharged.
+        if (exit_key.size() != 32) {
+            error_message = "exit_key must be 32 bytes";
+            return false;
+        }
+        if (fund_value <= 0) {
+            error_message = "fund_value must be positive";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // ON CONFLICT DO NOTHING: a retried establishment must not add a second row. Two rows
+            // for one leaf would be counted twice by the frontier and `C` would overpay — which is
+            // the operator's loss rather than a holder's, but it is still a wrong answer from a
+            // predicate whose whole job is to be exact.
+            txn.exec_params(
+                "INSERT INTO se_leaf (statechain_id, parent_statechain_id, root_statechain_id, "
+                "fund_value, exit_key) VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (statechain_id) DO NOTHING;",
+                statechain_id,
+                parent_statechain_id.empty() ? pqxx::zview() : pqxx::zview(parent_statechain_id),
+                root_statechain_id,
+                fund_value,
+                pqxx::binarystring(exit_key.data(), exit_key.size()));
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool load_leaves(const std::string& root_statechain_id,
+                     std::vector<registry::Leaf>& out,
+                     std::string& error_message) {
+        out.clear();
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT statechain_id, COALESCE(parent_statechain_id, ''), fund_value, exit_key, "
+                "released FROM se_leaf WHERE root_statechain_id = $1 ORDER BY statechain_id;",
+                root_statechain_id);
+            for (const auto& r : rows) {
+                registry::Leaf l;
+                l.statechain_id = r[0].as<std::string>();
+                l.parent_statechain_id = r[1].as<std::string>();
+                l.fund_value = static_cast<uint64_t>(r[2].as<int64_t>());
+                pqxx::binarystring key(r[3]);
+                l.exit_key.assign(key.data(), key.data() + key.size());
+                l.released = r[4].as<bool>();
+                out.push_back(std::move(l));
+            }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool mark_released(const std::string& statechain_id, std::string& error_message) {
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // Monotone by construction: only ever set to true, never back. A release that could be
+            // revoked would let an operator un-discharge a holder who already gave up their old leaf.
+            txn.exec_params("UPDATE se_leaf SET released = true WHERE statechain_id = $1;",
+                            statechain_id);
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool consume_release_nonce(const std::string& statechain_id,
+                               const std::vector<unsigned char>& nonce,
+                               std::string& error_message) {
+        if (nonce.size() != 32) {
+            error_message = "nonce must be 32 bytes";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // The single-use rule is the PRIMARY KEY, not a SELECT-then-INSERT: a check-then-act
+            // pair races against a concurrent replay of the same nonce, and the whole point of the
+            // nonce is to survive an adversary who retries.
+            auto res = txn.exec_params(
+                "INSERT INTO se_release_nonce (statechain_id, nonce) VALUES ($1, $2) "
+                "ON CONFLICT DO NOTHING;",
+                statechain_id, pqxx::binarystring(nonce.data(), nonce.size()));
+            txn.commit();
+            if (res.affected_rows() == 0) {
+                error_message = "nonce already used for this statechain";
+                return false;
+            }
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool freeze_root(const std::string& root_statechain_id,
+                     const std::string& successor_root,
+                     std::string& error_message) {
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // Irreversible: the UPDATE branch only ever sets frozen = true. There is deliberately no
+            // path that clears it — INV-FREEZE is a ratchet, and a clearable freeze is not one.
+            txn.exec_params(
+                "INSERT INTO se_root (root_statechain_id, frozen, successor_root) "
+                "VALUES ($1, true, $2) "
+                "ON CONFLICT (root_statechain_id) DO UPDATE SET frozen = true, "
+                "successor_root = COALESCE(EXCLUDED.successor_root, se_root.successor_root);",
+                root_statechain_id,
+                successor_root.empty() ? pqxx::zview() : pqxx::zview(successor_root));
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool is_root_frozen(const std::string& root_statechain_id, bool& frozen,
+                        std::string& error_message) {
+        frozen = false;  // assigned on EVERY path: an unknown root is not frozen, and a caller must
+                         // never read an uninitialised value and act on it.
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT frozen FROM se_root WHERE root_statechain_id = $1;", root_statechain_id);
+            if (!rows.empty()) frozen = rows[0][0].as<bool>();
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
             return false;
         }
     }

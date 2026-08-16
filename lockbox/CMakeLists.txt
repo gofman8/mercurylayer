@@ -189,6 +189,16 @@ if(BUILD_LOCKBOX_TESTS)
     add_custom_command(TARGET test_registry POST_BUILD
         COMMAND test_registry
         COMMENT "Running the REQ-56 collapse-predicate tests")
+
+    # The registry against a REAL Postgres. Deliberately NOT run POST_BUILD: there is no database
+    # during `docker build`, and a test that skips when its dependency is missing is worse than no
+    # test — it reports success for something it never ran. Built into the image; run explicitly:
+    #     docker exec mercurylayer-lockbox-1 /app/build/test_registry_db
+    add_executable(test_registry_db tests/test_registry_db.cpp src/registry.cpp src/tx.cpp
+                                    src/db_manager.cpp src/utils.cpp src/monocypher.c)
+    target_include_directories(test_registry_db PRIVATE include tests)
+    target_link_libraries(test_registry_db PRIVATE
+        pqxx tomlplusplus::tomlplusplus secp256k1_zkp OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # Copy Settings.toml after building MercuryLockbox

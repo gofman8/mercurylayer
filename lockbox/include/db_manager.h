@@ -5,6 +5,8 @@
 
 #include <memory>
 #include <string>
+#include <vector>
+#include "registry.h"
 #include "utils.h"
 
 namespace db_manager {
@@ -114,6 +116,52 @@ namespace db_manager {
         std::string& error_message);
 
     bool delete_statechain(const std::string& statechain_id);
+
+    // ── [REQ-56 / REQ-65] THE LEAF REGISTRY ──────────────────────────────────────────────────────
+    //
+    // Everything the SE records here is either AUTHORED by it (it signed under this sid) or
+    // WITNESSED by it (read out of a transaction whose sighash it recomputed and whose session it
+    // byte-compared). Nothing is a client assertion — REQ-58 is not a limitation on the SE's
+    // curiosity, it is the reason an OFFLINE holder can rely on the frontier at all.
+
+    /// Record a leaf at establishment. Idempotent on `statechain_id`: a retried establishment must
+    /// not create a second row, or the frontier would double-count and `C` would overpay.
+    ///
+    /// `exit_key` MUST be 32 bytes. `parent_statechain_id` empty means the parent is the root.
+    bool establish_leaf(const std::string& statechain_id,
+                        const std::string& parent_statechain_id,
+                        const std::string& root_statechain_id,
+                        int64_t fund_value,
+                        const std::vector<unsigned char>& exit_key,
+                        std::string& error_message);
+
+    /// Every leaf recorded under a root. The caller computes the frontier from this
+    /// (`registry::frontier`) rather than the database doing it, so the rule stays testable without
+    /// a live Postgres.
+    bool load_leaves(const std::string& root_statechain_id,
+                     std::vector<registry::Leaf>& out,
+                     std::string& error_message);
+
+    /// Mark a leaf released (form (a)/(b)). MONOTONE: once true it is never cleared, because a
+    /// release that could be revoked would let an operator un-discharge a holder who has already
+    /// given up their old leaf.
+    bool mark_released(const std::string& statechain_id, std::string& error_message);
+
+    /// Consume an R2 nonce. Returns false if this (sid, nonce) has been seen before — the single-use
+    /// rule enforced by a PRIMARY KEY collision rather than by a check that can be forgotten.
+    bool consume_release_nonce(const std::string& statechain_id,
+                               const std::vector<unsigned char>& nonce,
+                               std::string& error_message);
+
+    /// INV-FREEZE: set `frozen` prospectively and irreversibly.
+    bool freeze_root(const std::string& root_statechain_id,
+                     const std::string& successor_root,
+                     std::string& error_message);
+
+    /// `frozen` is assigned on every path (false when the root is unknown), so a caller cannot
+    /// mistake "no row" for "not frozen" by reading an uninitialised variable.
+    bool is_root_frozen(const std::string& root_statechain_id, bool& frozen,
+                        std::string& error_message);
 }
 
 #endif // DB_MANAGER_H
