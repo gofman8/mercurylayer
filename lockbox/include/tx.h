@@ -15,8 +15,12 @@
 // outpoints, version, locktime and sequences all feed the hash, so a lying disclosure yields a
 // different sighash, a different session, and a refusal. It is NOT self-checking for this code's own
 // structural assumptions (which output index is the payload, what a P2TR script looks like), which is
-// why those are asserted separately and why `deny_sighash_differential` compares this implementation
-// against the Rust builders byte-for-byte over every tier shape before anything depends on it.
+// why those are asserted separately and why `tests/test_tx_sighash.cpp` compares this implementation
+// against the Rust builders byte-for-byte over every tier shape before anything depends on it. That
+// differential is a CMake target wired POST_BUILD, so it runs during `cmake --build .` — the only
+// command the Dockerfile issues — and a mismatch fails the image build rather than waiting to be
+// noticed. (This sentence previously named a guard, `deny_sighash_differential`, that was never
+// built. A named-but-absent check is worse than none: it reads as coverage.)
 //
 // SCOPE, deliberately narrow
 // --------------------------
