@@ -38,14 +38,151 @@
 //! Run: `SDK_E2E=92 ML_NETWORK=regtest cargo run` (regtest stack + a lockbox built with witness.cpp)
 
 use anyhow::{anyhow, Result};
+use bitcoin::absolute::LockTime;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::hashes::Hash;
+use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::client_config::ClientConfig;
 use mercurylib::wallet::Coin;
+use secp256k1_zkp::musig::{
+    blinded_musig_pubkey_xonly_tweak_add, new_musig_nonce_pair, BlindingFactor, MusigAggNonce,
+    MusigPubNonce, MusigSecNonce, MusigSession, MusigSessionId,
+};
+use secp256k1_zkp::{Message, PublicKey, Secp256k1, SecretKey};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::bitcoin_core;
 
 const DEPOSIT: u64 = 150_000;
+
+/// How many times the SE has logged a SUCCESSFUL binding.
+///
+/// Needed because "the honest path works" and "the gate never ran" are the same observation from
+/// outside: an absent disclosure is served, so a client that silently failed to serialise one would
+/// still complete a deposit. Counting the SE's own log line is what tells the two apart.
+fn bind_match_count() -> usize {
+    let out = Command::new("docker")
+        .args(["logs", "mercurylayer-lockbox-1"])
+        .output();
+    match out {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s.matches("WITNESS_BIND_MATCH").count()
+        }
+        Err(_) => 0,
+    }
+}
+
+/// A real transaction, the prevout it spends, and the session that transaction genuinely produces.
+///
+/// Every field is derived rather than invented: the prevout script is P2TR over the same blinded
+/// output key the session is built with, and the sighash comes from `bitcoin`'s own BIP-341
+/// implementation. That is the point — the SE must be fed something an honest client could have
+/// sent, so that changing ONE satoshi is the only lie under test.
+struct Honest {
+    unsigned_tx_hex: String,
+    prevout_value: u64,
+    prevout_spk_hex: String,
+    agg_pubkey_hex: String,
+    agg_nonce_hex: String,
+    blinding_hex: String,
+    out_tweak_hex: String,
+    session_hex: String,
+}
+
+fn build_honest(value: u64) -> Result<Honest> {
+    let secp = Secp256k1::new();
+
+    let sk1 = SecretKey::from_slice(&[0x21u8; 32])?;
+    let sk2 = SecretKey::from_slice(&[0x63u8; 32])?;
+    let pk1 = PublicKey::from_secret_key(&secp, &sk1);
+    let pk2 = PublicKey::from_secret_key(&secp, &sk2);
+
+    let id1 = MusigSessionId::assume_unique_per_nonce_gen([0x22u8; 32]);
+    let id2 = MusigSessionId::assume_unique_per_nonce_gen([0x23u8; 32]);
+    let seed_msg = Message::from_slice(&[0x24u8; 32])?;
+    let (_s1, p1): (MusigSecNonce, MusigPubNonce) =
+        new_musig_nonce_pair(&secp, id1, None, Some(sk1), pk1, Some(seed_msg), None)?;
+    let (_s2, p2): (MusigSecNonce, MusigPubNonce) =
+        new_musig_nonce_pair(&secp, id2, None, Some(sk2), pk2, Some(seed_msg), None)?;
+    let aggnonce = MusigAggNonce::new(&secp, &[p1, p2]);
+
+    let blinding = BlindingFactor::from_slice(&[0x2au8; 32])?;
+    let tweak_in = SecretKey::from_slice(&[0x2cu8; 32])?;
+    let (_parity, output_pubkey, out_tweak) =
+        blinded_musig_pubkey_xonly_tweak_add(&secp, &pk1, tweak_in);
+
+    // The prevout is P2TR over the tweaked key — byte-identical to what `calculate_musig_session`
+    // builds for a real tier (`0x51 0x20 || xonly`).
+    let mut spk_bytes = vec![0x51u8, 0x20];
+    spk_bytes.extend_from_slice(&output_pubkey.x_only_public_key().0.serialize());
+    let spk = ScriptBuf::from_bytes(spk_bytes.clone());
+
+    let tx = Transaction {
+        version: 3,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(0xFFFF_FFFD),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut { value: value - 500, script_pubkey: spk.clone() }],
+    };
+
+    let prevouts = vec![TxOut { value, script_pubkey: spk }];
+    let sighash = SighashCache::new(&tx).taproot_key_spend_signature_hash(
+        0,
+        &Prevouts::All(&prevouts),
+        TapSighashType::All,
+    )?;
+
+    let session = MusigSession::new_blinded_without_key_agg_cache(
+        &secp,
+        &output_pubkey,
+        aggnonce,
+        Message::from_slice(sighash.as_byte_array())?,
+        None,
+        &blinding,
+        out_tweak,
+    );
+
+    Ok(Honest {
+        unsigned_tx_hex: serialize_hex(&tx),
+        prevout_value: value,
+        prevout_spk_hex: hex::encode(&spk_bytes),
+        agg_pubkey_hex: hex::encode(output_pubkey.serialize()),
+        agg_nonce_hex: hex::encode(aggnonce.serialize()),
+        blinding_hex: hex::encode(blinding.as_bytes()),
+        out_tweak_hex: hex::encode(out_tweak.as_ref()),
+        // The WIRE form — fin nonce stripped, as `calculate_musig_session` sends it.
+        session_hex: hex::encode(session.remove_fin_nonce_from_session().serialize()),
+    })
+}
+
+/// The disclosure body, with `prevout_values` overridable so the lie is a single field.
+fn disclosure_body(sid: &str, h: &Honest, claimed_value: u64) -> serde_json::Value {
+    serde_json::json!({
+        "statechain_id": sid,
+        "negate_seckey": 0,
+        "session": h.session_hex,
+        "disclosure": {
+            "unsigned_tx": h.unsigned_tx_hex,
+            "input_index": 0,
+            "prevout_values": [claimed_value],
+            "prevout_spks": [h.prevout_spk_hex],
+            "agg_pubkey": h.agg_pubkey_hex,
+            "agg_nonce": h.agg_nonce_hex,
+            "blinding_factor": h.blinding_hex,
+            "out_tweak": h.out_tweak_hex,
+            "hash_type": 1
+        }
+    })
+}
 
 async fn wallet(name: &str) -> Result<UtexoWallet> {
     let (w, _) = UtexoWallet::initialize(SdkConfig::regtest(name), None).await?;
@@ -86,6 +223,7 @@ pub async fn execute() -> Result<()> {
     //
     // Every co-signature in this deposit+ladder now carries a disclosure. If the binding is wrong,
     // laddering fails here — which is the regression this half exists to catch.
+    let binds_before = bind_match_count();
     let alice = wallet("sdk92_alice").await?;
     let before: Vec<String> =
         coins_of(&cc, "sdk92_alice").await?.into_iter().filter_map(|c| c.statechain_id).collect();
@@ -120,6 +258,21 @@ pub async fn execute() -> Result<()> {
     println!("SDK92 - [a] PASS: deposit + ladder completed with disclosures attached ({})",
              &sid[..8.min(sid.len())]);
 
+    // A green deposit is NOT by itself evidence the gate ran: an absent disclosure is served, so a
+    // client that failed to serialise one would look exactly like this. Count the SE's own
+    // successful-bind log lines instead.
+    let binds_after = bind_match_count();
+    if binds_after <= binds_before {
+        return Err(anyhow!(
+            "[a] the deposit succeeded but the SE logged NO successful binding ({binds_before} -> \
+             {binds_after}). Either the client is not attaching the disclosure or the gate is not \
+             reached — in both cases the honest path proves nothing about binding, because an \
+             absent disclosure is served."
+        ));
+    }
+    println!("SDK92 - [a] the SE logged {} successful bindings during the ladder (was {})",
+             binds_after - binds_before, binds_before);
+
     // The coin is laddered, which means the SE co-signed tiers while binding each one.
     let coin = coins_of(&cc, "sdk92_alice")
         .await?
@@ -133,41 +286,53 @@ pub async fn execute() -> Result<()> {
     // Reuse the shape of a real request but corrupt ONE field: the disclosed prevout value, by one
     // satoshi. The SE never checks that field directly — BIP-341 folds it into the sighash, so the
     // lie surfaces as a session mismatch. If this is accepted, the binding is decorative.
-    let bogus = serde_json::json!({
-        "statechain_id": sid,
-        "negate_seckey": 0,
-        "session": "00".repeat(133),
-        "disclosure": {
-            "unsigned_tx": "020000000001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "input_index": 0,
-            "prevout_values": [DEPOSIT + 1],   // the one-satoshi lie
-            "prevout_spks": ["5120".to_string() + &"ab".repeat(32)],
-            "agg_pubkey": "02".to_string() + &"cd".repeat(32),
-            "agg_nonce": "02".to_string() + &"ef".repeat(65),
-            "blinding_factor": "11".repeat(32),
-            "out_tweak": "22".repeat(32),
-            "hash_type": 1
-        }
-    });
+    // The transaction is REAL and the session is the one it genuinely produces. An earlier version of
+    // this test sent garbage hex, was refused by the PARSER, and reported a pass — the refusal was
+    // real but measured the wrong gate entirely. The pair below cannot make that mistake: both
+    // requests are byte-identical apart from one satoshi, so only the amount can explain a
+    // difference in outcome.
+    let honest = build_honest(DEPOSIT)?;
 
-    let (status, body) = raw_partial_signature(&lockbox, bogus).await?;
-    println!("SDK92 - [b] tampered disclosure -> HTTP {status}  {body}");
-    if status == 200 {
+    // (b1) THE LIE.
+    let (lie_status, lie_body) =
+        raw_partial_signature(&lockbox, disclosure_body(&sid, &honest, DEPOSIT + 1)).await?;
+    println!("SDK92 - [b1] value+1 -> HTTP {lie_status}  {lie_body}");
+    if lie_status == 200 {
         return Err(anyhow!(
-            "[b] the SE ACCEPTED a disclosure whose prevout value is one satoshi off. Witness \
-             binding is not enforcing: the session compare either did not run or did not fail, and \
-             every enforcement rule in SPEC §5.4 that rests on it is unsupported."
+            "[b1] the SE ACCEPTED a disclosure whose prevout value is one satoshi off. Witness \
+             binding is not enforcing, and every rule in SPEC §5.4 that rests on it is unsupported."
         ));
     }
-    if !body.contains("witness binding refused") && !body.contains("disclosure") {
+    // The refusal must be the SESSION COMPARE, not the parser and not some unrelated gate.
+    if !lie_body.contains("does not produce the session") {
         return Err(anyhow!(
-            "[b] refused with HTTP {status}, but not by the binding — the request was turned away \
-             for some other reason ({body}), so this step measures that other gate and proves \
-             nothing about witness binding. Fix the probe before reading the result."
+            "[b1] refused with HTTP {lie_status}, but NOT by the session comparison: {lie_body}. \
+             A refusal from the parser or another gate says nothing about whether BIP-341's \
+             commitment to the prevout amount is actually being checked. This is exactly the way \
+             the previous version of this test passed while proving nothing."
         ));
     }
-    println!("SDK92 - [b] PASS: refused BY THE BINDING — a one-satoshi lie changes the sighash, the \
-              session, and the comparison");
+
+    // (b2) THE TRUTH — the positive control that gives (b1) its meaning.
+    //
+    // Identical bytes, correct value. If this were ALSO refused by the binding, (b1) would prove
+    // nothing: a gate that refuses everything is not detecting the lie, it is just broken.
+    let (ok_status, ok_body) =
+        raw_partial_signature(&lockbox, disclosure_body(&sid, &honest, DEPOSIT)).await?;
+    println!("SDK92 - [b2] correct value -> HTTP {ok_status}  {ok_body}");
+    if ok_body.contains("witness binding refused") {
+        return Err(anyhow!(
+            "[b2] the SAME disclosure with the CORRECT prevout value was also refused by the \
+             binding ({ok_body}). The gate refuses honest and dishonest alike, so [b1] measured a \
+             broken comparison rather than a detected lie."
+        ));
+    }
+    println!(
+        "SDK92 - [b] PASS: one satoshi separates refusal from acceptance. The SE never inspects the \
+         amount directly — BIP-341 folds it into the sighash, so the lie surfaces as a session \
+         mismatch. Every larger lie about scripts, outpoints, version, locktime or sequences feeds \
+         the same hash and is caught the same way."
+    );
 
     println!(
         "SDK92 - SCOPE: binding is OPT-IN per request while JS/Kotlin clients migrate, so a caller \

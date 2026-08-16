@@ -4287,6 +4287,7 @@ name = "rust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitcoin 0.30.1",
  "electrum-client 0.18.0",
  "env_logger 0.10.2",
  "hex",
@@ -4296,6 +4297,7 @@ dependencies = [
  "mercuryrustlib",
  "rand 0.8.5",
  "reqwest 0.11.22",
+ "secp256k1-zkp",
  "serde",
  "serde_json",
  "sha2",

@@ -732,9 +732,10 @@ true at realistic payment velocities.
 
 ### 5.4 The discharge round — how a whole tree is retired for one transaction
 
-> **Status: DESIGN, not built.** Every claim in this section is grounded in a source scan, which by
-> this project's evidence rule (§0.2) establishes presence, absence and ordering — **never
-> reachability, binding or behaviour**. Nothing here has been plant-and-run.
+> **Status: ONE REQ BUILT (REQ-57), the rest DESIGN.** Except where a live test is cited below, every
+> claim in this section is grounded in a source scan, which by this project's evidence rule (§0.2)
+> establishes presence, absence and ordering — **never reachability, binding or behaviour**.
+> REQ-57 is the exception: it has been plant-and-run. Nothing else here has.
 > **The cryptographic prerequisite is verified present.** SE-side witness binding needs a *blinded*
 > `nonce_process` matching the blinded partial-sign the lockbox already calls, so the SE can
 > reconstruct a signing session from a disclosed transaction and byte-compare it. The pinned fork
@@ -745,8 +746,27 @@ true at realistic payment velocities.
 > of the transaction to recompute the sighash. `deny_blinded_session_prerequisite_drift` pins the fork
 > and the API family so this cannot change unnoticed.
 >
-> The enforcement point is empty today: `disclosure` and `prevout_value` occur 83× in the client and
-> **0× in `lockbox/`**, so the SE would presently co-sign a collapse that pays out nobody.
+> **REQ-57 (witness binding) is now BUILT and MEASURED — the rest of §5.4 is not.** The SE parses the
+> disclosed transaction, recomputes the BIP-341 key-path sighash, rebuilds the blinded session and
+> byte-compares it (`lockbox/src/witness.cpp`, `lockbox/src/tx.cpp`). Proven on the live stack by
+> `sdk92`, which measures three things rather than asserting them: the SE logged a successful bind
+> during an honest deposit+ladder; a disclosure whose prevout value is **one satoshi** high was
+> refused by the session comparison itself (*"the disclosed transaction does not produce the session
+> being signed"*); and the **same bytes with the correct value were not refused by the binding** —
+> without that third measurement a gate that refuses everything would be indistinguishable from one
+> that detects the lie. Unit differentials pin the reconstruction against client-generated vectors
+> (4/4 sighash, 3/3 session, each with negative controls).
+>
+> **Two limits, both measured, neither closed.** (1) Binding is **opt-in per request**: an absent
+> disclosure is still served, so a malicious client can simply decline to be bound. (2) The
+> disclosure is built in exactly one place (`calculate_musig_session`, `lib/src/transaction.rs`), so
+> the coloured multi-input path (`get_partial_sig_request_for_colored_tx_multi`) attaches none —
+> **1 of 2** co-signatures bound in the deposit+ladder `sdk92` exercises. Making binding mandatory is
+> a deploy-ordering change, not a code change, and MUST NOT be described as done until every builder
+> attaches a disclosure.
+>
+> **The collapse predicate itself is still empty**: there is no leaf registry, no frontier, no
+> `collapse_grant` route, so the SE would presently co-sign a collapse that pays out nobody.
 
 #### 5.4.1 Why a round is necessary at all
 
@@ -1553,7 +1573,8 @@ unbuilt sections, and they are marked as such in place.
 | INV-26 | `sdk09` (IFA received amount = fungible only) |
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
 | REQ-49…REQ-52 (§5.3, the sweep) | **NONE — design, not built.** See the status banner in §5.3 |
-| REQ-53…REQ-67 (§5.4, the discharge round) | **NONE — design, not built.** See the status banner in §5.4 |
+| REQ-57 (§5.4, witness binding) | `sdk92` (live: honest bind logged, one-satoshi lie refused BY THE SESSION COMPARE, correct value not refused), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3). **Partial coverage:** opt-in per request, and only `calculate_musig_session` attaches a disclosure — 1 of 2 co-signatures bound in `sdk92`'s ladder |
+| REQ-53…REQ-56, REQ-58…REQ-67 (§5.4, the rest of the round) | **NONE — design, not built.** No leaf registry, no frontier, no `collapse_grant`. See the status banner in §5.4 |
 
 **Suite sizes.** Workspace unit + guard tests: **794**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.

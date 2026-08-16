@@ -21,3 +21,8 @@ reqwest = { version = "0.11.16", features = ["json"] }
 env_logger = "0.10"
 hex = "0.4.3"
 rand = "0.8"
+# sdk92 builds a REAL transaction and the session that transaction actually produces, so the only
+# difference it feeds the SE is one satoshi of prevout value. Same versions as `lib/Cargo.toml`, so
+# the test and the client agree on sighash and session construction rather than approximating them.
+bitcoin = { version = "0.30.1", features = ["serde", "base64", "rand-std", "std"], default-features = false }
+secp256k1-zkp = { git = "https://github.com/ssantos21/rust-secp256k1-zkp.git", branch = "blinded-musig-scheme", features = [ "rand-std", "bitcoin_hashes", "std" ] }

@@ -135,6 +135,11 @@ namespace lockbox {
                 if (r != witness::BindResult::Match) {
                     return crow::response(400, std::string("witness binding refused: ") + detail);
                 }
+                // Emitted so that "the honest path still works" can be told apart from "the gate never
+                // ran". Both look identical from outside — an absent disclosure is served, so a client
+                // that silently failed to serialise one would produce a GREEN end-to-end test while
+                // binding nothing. sdk92 counts these lines across its honest half and requires > 0.
+                CROW_LOG_INFO << "WITNESS_BIND_MATCH statechain " << statechain_id;
             }
 
             // ── [D8(i)] THE SPEND BUDGET, ENFORCED **HERE**, NOT ONLY AT THE COORDINATOR ──────────
