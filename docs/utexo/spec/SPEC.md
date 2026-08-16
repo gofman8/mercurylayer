@@ -976,10 +976,17 @@ between an absent user and their money. Without it, form (c) is custodial in sub
 is not watching. **State this in those words wherever the round's trust model is described.**
 
 **REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
-`establish_leaf` from the witnessed `state_child.vout[0]`, which is **the payee's key** — conveyance
-builds the child's tiers to the receiver's address. So a payee who was paid and **never claimed at
-all** is nonetheless in the frontier, and REQ-56 forces `C` to pay them their full funding value at
-their own key. Claiming is required to *spend*, never to *be paid*.
+`establish_leaf` from the **witnessed payload output of the state tier** — identified structurally as
+the unique P2TR output, per REQ-61(a), and NOT at a client-supplied index. That key is **the payee's**
+because conveyance builds the child's tiers to the receiver's address. So a payee who was paid and
+**never claimed at all** is nonetheless in the frontier, and REQ-56 forces `C` to pay them their full
+funding value at their own key. Claiming is required to *spend*, never to *be paid*.
+
+The word "witnessed" is load-bearing and is what REQ-57 buys: the SE reads `exit_key` and
+`fund_value` out of a transaction whose sighash it recomputed and whose session it byte-compared, so
+both are facts it verified rather than fields a client asserted. Recording either from an unbound
+request would make the whole frontier an operator declaration, which is exactly what REQ-67 says the
+absentee cannot be asked to trust.
 
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
 raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same
@@ -1004,11 +1011,44 @@ only appear once per round.
 #### 5.4.5 Offline payments
 
 **REQ-61 (offline payee — zero).** A payee MUST NOT need to be online, reachable, or on a clock to be
-paid. The mechanism is the **owner latch**: `latch_key := xonly(state_child.vout[0].spk)`, read from
-the money itself and write-once, after which every co-signature under that sid requires a fresh
-BIP-340 by that key. The latch is the primary defence; the coordinator's one-hour
-`OPEN_TRANSFER_WINDOW_SQL` (`server/src/database/transfer_sender.rs`) is defence in depth only, and
-its comment MUST say so.
+paid. The mechanism is the **owner latch**: a key read from the money itself, write-once, after which
+co-signatures under that sid require a fresh BIP-340 by that key. The latch is the primary defence;
+the coordinator's one-hour `OPEN_TRANSFER_WINDOW_SQL` (`server/src/database/transfer_sender.rs`) is
+defence in depth only, and its comment MUST say so.
+
+Three corrections to earlier drafts of this requirement, each forced by a MEASURED fact about the
+code. All three were wrong in ways that would have produced a latch that looks right and protects
+nobody.
+
+**(a) The latch key MUST be derived STRUCTURALLY, never at a client-supplied index.** An earlier
+draft said `latch_key := xonly(state_child.vout[0].spk)`. The code has no such constant: the payload
+output is reached through `TesrTier::payload_vout`, and that field is **attacker-supplied in every
+conveyed bundle** — the file says so itself (`clients/libs/rust/src/tesr.rs`, at the one place the
+index is turned into an output). A latch read at an index the attacker chooses is a latch whose key
+the attacker chooses. The SE MUST instead identify the payload output by a structural property it can
+check alone: **the unique output whose scriptPubKey is P2TR** (`OP_1 <32-byte>`). On an uncoloured
+tier the only other output is the P2A anchor, whose script is `OP_1 <2-byte>` and therefore not P2TR,
+so the payload output is unique and the index is derived rather than trusted. If a tier does not have
+exactly one P2TR output, the SE MUST refuse rather than pick one.
+
+**(b) The latch CANNOT bind every co-signature under the sid — it binds from establishment onward.**
+As written ("every co-signature under that sid") the rule is unsatisfiable: a leaf's tiers are
+co-signed by the **PAYER**, under the CHILD's sid, before the payee holds anything
+(`cosign_tier` over `child_coins` in the conveyance builder, `clients/libs/rust/src/tesr.rs`). The
+payee's key does not exist in the protocol at that moment, so it cannot have signed. The latch MUST
+therefore be armed at establishment and enforced on every co-signature **after** the establishing
+set, and the spec MUST state the exempt count rather than leaving it to an implementer to discover
+that the obvious reading bricks conveyance.
+
+**(c) This requires a capability the SE has never had.** `secp256k1_schnorrsig_verify` — and any
+other verify — returns **zero hits anywhere under `lockbox/`** (measured). The lockbox signs; it has
+never checked a signature, and all of its routes are unauthenticated. REQ-61 and R2 both therefore
+depend on NEW SE code, not on wiring up something already present. There is also **no BIP-340
+tagged-hash helper anywhere in `lib/`, `server/` or `clients/libs/`** (measured: no `sha256t`,
+`hash_newtype`, `tag_engine` or `impl Tag for`; every existing domain separation is a plain SHA-256
+prefix), so `tagged("utexo/leaf_release/v1", …)` in R2 is a primitive to be built and pinned by a
+differential against BIP-340 test vectors — not a call to an existing function. Any plan that costs
+REQ-61 as "add a check" is mis-costed.
 
 **REQ-62 (offline payer — NOT ACHIEVABLE, stated so).** One payment is four irreversible SE
 co-signatures over a transaction that did not exist before the payment was decided. It cannot be
