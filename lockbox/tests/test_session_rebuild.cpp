@@ -114,6 +114,16 @@ int main() {
             continue;
         }
 
+        // The client sends the session with the fin nonce REMOVED. Comparing against a session that
+        // still carries it refuses every honest request — and is invisible if the vectors were also
+        // generated before stripping, which is how the first version of this test passed while
+        // proving the wrong thing.
+        if (!secp256k1_musig_remove_fin_nonce_from_session(secp256k1_context_no_precomp, &session)) {
+            std::printf("  FAIL could not remove the fin nonce\n");
+            ++failures;
+            continue;
+        }
+
         const auto* got = reinterpret_cast<const unsigned char*>(&session);
         if (std::memcmp(got, want.data(), 133) == 0) {
             std::printf("  ok   session matches the client byte-for-byte\n");

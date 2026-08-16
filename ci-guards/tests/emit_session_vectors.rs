@@ -84,7 +84,11 @@ fn one_vector(seed: u8) -> (String, String, String, String, String, String) {
         hex(&sighash),
         hex(blinding.as_bytes()),
         hex(out_tweak.as_ref()),
-        hex(&session.serialize()),
+        // THE WIRE FORM. `calculate_musig_session` sends
+        // `remove_fin_nonce_from_session().serialize()`, not the raw session — so this is what the SE
+        // must reproduce. Emitting the raw session here is what made the first version of this test
+        // agree with itself and prove nothing.
+        hex(&session.remove_fin_nonce_from_session().serialize()),
     )
 }
 

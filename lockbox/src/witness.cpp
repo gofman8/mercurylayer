@@ -123,7 +123,22 @@ BindResult bind(const Disclosure& d,
         return fail(BindResult::Unsupported, "session could not be rebuilt from the disclosure");
     }
 
-    // ---- 4. byte-compare -------------------------------------------------------------------------
+    // ---- 4. STRIP THE FIN NONCE, because that is what is actually on the wire --------------------
+    //
+    // The client does NOT send the session it built. It sends
+    // `session.remove_fin_nonce_from_session().serialize()` — the fin nonce is removed first. So a
+    // freshly-built session and the 133 bytes in the request differ, and comparing them directly
+    // refuses every honest request.
+    //
+    // This was missed by the first differential because the vectors were generated from
+    // `session.serialize()` rather than from the wire form: both sides carried the fin nonce, agreed
+    // perfectly, and proved the wrong thing. Precisely the failure the differential exists to catch,
+    // reached by testing against the wrong reference.
+    if (!secp256k1_musig_remove_fin_nonce_from_session(secp256k1_context_no_precomp, &session)) {
+        return fail(BindResult::Unsupported, "fin nonce could not be removed from the session");
+    }
+
+    // ---- 5. byte-compare -------------------------------------------------------------------------
     //
     // `secp256k1_musig_session` is an opaque 133-byte blob in this fork, which is exactly the length
     // the route accepts, so the comparison is over the whole object. A constant-time compare is used

@@ -47,6 +47,43 @@ pub struct PartialSignatureRequestPayload {
     pub session: String,
     pub signed_statechain_id: String,
     pub server_pub_nonce: String,
+    /// [REQ-57] What the SE needs to verify WHAT it is signing, instead of signing blind.
+    ///
+    /// The SE reparses this transaction, recomputes the BIP-341 sighash itself, rebuilds the blinded
+    /// session from it, and byte-compares against `session`. A disclosure that does not reproduce
+    /// `session` is refused — so nothing here is believed, only checked.
+    ///
+    /// `Option` because binding is opt-in per request while clients migrate: the nodejs, web and
+    /// Kotlin clients do not build one yet, and a required field would break them on deploy. The
+    /// coordinator forwards the payload wholesale, so populating this is the whole client change.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub disclosure: Option<SigningDisclosure>,
+}
+
+/// The public inputs to a blinded MuSig2 session, plus the transaction they were derived from.
+///
+/// Every field is public data the client already holds; none of it helps anyone forge a signature.
+/// It is exactly what `secp256k1_blinded_musig_nonce_process_without_keyaggcoeff` consumes, which is
+/// what lets the SE reach the same 133 bytes independently.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct SigningDisclosure {
+    /// The unsigned transaction, serialized. The SE parses it; it does not take our word for it.
+    pub unsigned_tx: String,
+    pub input_index: u32,
+    /// One per input, in input order — BIP-341 hashes EVERY input's amount and script, so a partial
+    /// list cannot produce the right sighash.
+    pub prevout_values: Vec<u64>,
+    pub prevout_spks: Vec<String>,
+    /// The TWEAKED output key, not the untweaked aggregate: it is what the session is built over.
+    pub agg_pubkey: String,
+    pub agg_nonce: String,
+    pub blinding_factor: String,
+    pub out_tweak: String,
+    /// The tiers sign at `TapSighashType::All` (0x01). Sent explicitly rather than assumed, because a
+    /// binding built against the wrong hash type refuses every honest signature — which looks
+    /// exactly like a working security control.
+    pub hash_type: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -639,12 +676,39 @@ pub fn calculate_musig_session(
     let statechain_id = coin.statechain_id.as_ref().unwrap();
     let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
 
+    // [REQ-57] The disclosure the SE verifies against. Every field is public and already committed
+    // to by `session`, so sending it reveals nothing and lets the SE check rather than trust.
+    //
+    // The prevout is the coin's own funding output — a P2TR over the aggregate key, which is what
+    // every tier spends. `input_index` is 0 because a tier has exactly one input.
+    let input_amount = coin.amount.unwrap() as u64;
+    // The funding output is P2TR over the TWEAKED key: `OP_1 <32-byte x-only>`. Built from the key
+    // directly rather than via `Address`, which would need a `Network` this function is not given —
+    // and the script is network-independent, so routing through an address would add a parameter
+    // without adding information.
+    let mut input_spk = vec![0x51u8, 0x20];
+    input_spk.extend_from_slice(&output_pubkey.x_only_public_key().0.serialize());
+    let disclosure = SigningDisclosure {
+        unsigned_tx: encoded_unsigned_tx.clone(),
+        input_index: 0,
+        prevout_values: vec![input_amount],
+        prevout_spks: vec![hex::encode(&input_spk)],
+        agg_pubkey: hex::encode(output_pubkey.serialize()),
+        agg_nonce: hex::encode(aggnonce.serialize()),
+        blinding_factor: hex::encode(blinding_factor.as_bytes()),
+        out_tweak: hex::encode(out_tweak32.as_ref()),
+        // The tiers sign at SIGHASH_ALL. Sent explicitly: a binding built against the wrong hash type
+        // refuses every honest signature while looking like a working control.
+        hash_type: TapSighashType::All as u8,
+    };
+
     let payload = PartialSignatureRequestPayload {
         statechain_id: statechain_id.to_string(),
         negate_seckey,
         session: hex::encode(blinded_session.serialize()),
         signed_statechain_id: signed_statechain_id.to_string(),
         server_pub_nonce: server_pubnonce_hex,
+        disclosure: Some(disclosure),
     };
 
     let client_partial_sig_hex = hex::encode(client_partial_sig.serialize());
