@@ -836,6 +836,63 @@ namespace db_manager {
 
     // ── [REQ-56 / REQ-65] THE LEAF REGISTRY ──────────────────────────────────────────────────────
 
+    bool record_signed_tx(const std::vector<unsigned char>& txid,
+                          const std::string& statechain_id,
+                          int sig_index,
+                          std::string& error_message) {
+        if (txid.size() != 32) {
+            error_message = "txid must be 32 bytes";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // DO NOTHING rather than DO UPDATE: the first sid to be recorded for a txid wins. The
+            // retry path re-presents the same transaction under the same sid, so the conflict is
+            // benign; but if two DIFFERENT sids ever claimed one txid, silently overwriting would
+            // let the second rewrite an edge the first already established.
+            txn.exec_params(
+                "INSERT INTO se_signed_tx (txid, statechain_id, sig_index) VALUES ($1, $2, $3) "
+                "ON CONFLICT (txid) DO NOTHING;",
+                pqxx::binarystring(txid.data(), txid.size()), statechain_id, sig_index);
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool signed_tx_owner(const std::vector<unsigned char>& txid,
+                         std::string& statechain_id,
+                         bool& found,
+                         std::string& error_message) {
+        found = false;          // assigned on EVERY path
+        statechain_id.clear();
+        if (txid.size() != 32) {
+            error_message = "txid must be 32 bytes";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT statechain_id FROM se_signed_tx WHERE txid = $1;",
+                pqxx::binarystring(txid.data(), txid.size()));
+            if (!rows.empty()) {
+                statechain_id = rows[0][0].as<std::string>();
+                found = true;
+            }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     bool establish_leaf(const std::string& statechain_id,
                         const std::string& parent_statechain_id,
                         const std::string& root_statechain_id,

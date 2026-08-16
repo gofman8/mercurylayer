@@ -124,6 +124,49 @@ namespace db_manager {
     // byte-compared). Nothing is a client assertion — REQ-58 is not a limitation on the SE's
     // curiosity, it is the reason an OFFLINE holder can rely on the frontier at all.
 
+    /// Record that the SE co-signed `txid` under `statechain_id`.
+    ///
+    /// Called ONLY from the bound branch of `generate_partial_signature` — an unbound co-signature
+    /// records nothing, so this index is exactly as trustworthy as the binding that produced it.
+    ///
+    /// # READ THIS BEFORE RESOLVING A PARENT EDGE THROUGH THIS TABLE
+    ///
+    /// The mapping is **txid → the FIRST sid that presented a valid binding for it**. That is NOT
+    /// "the sid whose coin this transaction is a tier of", and the difference is not academic:
+    /// binding proves a disclosure reproduces the session being signed, which says nothing about
+    /// whether the transaction belongs to that coin.
+    ///
+    /// MEASURED, on the live stack: an sdk92 run produced 5 binds and 5 rows. Four were real tiers;
+    /// the fifth was a SYNTHETIC transaction built by the test itself (`build_honest`,
+    /// `clients/tests/rust/src/sdk92_witness_binding.rs`) — never a tier, never broadcast — and it
+    /// was indexed anyway, because it bound. Any caller can therefore index arbitrary bytes under
+    /// its own sid.
+    ///
+    /// Combined with first-writer-wins below, resolving a child's `(SP.txid, j)` through this table
+    /// would let whoever registers a txid FIRST own that edge — and in a conveyance the PAYER builds
+    /// the payee's child tiers, so the payer knows those txids before anyone else. The frontier
+    /// decides who gets paid in a collapse (REQ-56), so an edge is not a bookkeeping detail.
+    ///
+    /// This table is safe as an audit trail of what the SE signed. It is NOT yet safe as an
+    /// authority on parenthood. See the open question filed against REQ-56 before building on it.
+    ///
+    /// Idempotent on `txid`: a retried signing round re-presents the same transaction, and the
+    /// retry-safety cache deliberately re-serves it. A second row would be a second claim about the
+    /// same bytes.
+    bool record_signed_tx(const std::vector<unsigned char>& txid,
+                          const std::string& statechain_id,
+                          int sig_index,
+                          std::string& error_message);
+
+    /// The sid the SE co-signed `txid` under, or false when it has never signed it.
+    ///
+    /// `found` is assigned on every path, so a caller cannot read an uninitialised value and treat
+    /// an unknown transaction as belonging to some sid.
+    bool signed_tx_owner(const std::vector<unsigned char>& txid,
+                         std::string& statechain_id,
+                         bool& found,
+                         std::string& error_message);
+
     /// Record a leaf at establishment. Idempotent on `statechain_id`: a retried establishment must
     /// not create a second row, or the frontier would double-count and `C` would overpay.
     ///

@@ -140,6 +140,39 @@ namespace lockbox {
                 // that silently failed to serialise one would produce a GREEN end-to-end test while
                 // binding nothing. sdk92 counts these lines across its honest half and requires > 0.
                 CROW_LOG_INFO << "WITNESS_BIND_MATCH statechain " << statechain_id;
+
+                // ── [REQ-56] THE SE'S OWN INDEX, WRITTEN ONLY WHEN BOUND ─────────────────────────
+                //
+                // A child's tier spends `(SP.txid, j)`. Resolving that outpoint to a sid is what
+                // makes the registry's parent edge SE-AUTHORED instead of client-asserted, and an
+                // asserted edge would let a caller graft its leaf onto someone else's tree — the
+                // frontier decides who gets paid.
+                //
+                // Placed INSIDE the match branch deliberately. Recording an unbound co-signature
+                // would index a transaction the SE never verified, making the tree look
+                // authoritative while resting on the caller's word. The tree is therefore exactly
+                // as trustworthy as the binding that produced it, never more.
+                //
+                // A failure here does NOT refuse the signature: the co-signature is a separate
+                // obligation, already earned by the checks above, and dropping it because a
+                // bookkeeping write failed would turn a database hiccup into a stuck coin. The miss
+                // is logged loudly instead — a gap in the index is visible later as a leaf whose
+                // parent cannot be resolved, which the predicate refuses on (SetError::ParentNotInSet).
+                const auto parsed_disclosure = tx::parse_hex(disclosure->unsigned_tx_hex);
+                if (parsed_disclosure) {
+                    const auto id = tx::txid(*parsed_disclosure);
+                    std::string rec_err;
+                    if (!db_manager::record_signed_tx(id, statechain_id, 0, rec_err)) {
+                        CROW_LOG_WARNING << "WITNESS_BIND_INDEX_MISS statechain " << statechain_id
+                                         << ": " << rec_err;
+                    }
+                } else {
+                    // Unreachable in practice: `bind` parsed the same hex a moment ago. Logged
+                    // rather than assumed, because "cannot happen" is how an index quietly goes
+                    // incomplete.
+                    CROW_LOG_WARNING << "WITNESS_BIND_INDEX_MISS statechain " << statechain_id
+                                     << ": disclosure re-parse failed after a successful bind";
+                }
             }
 
             // ── [D8(i)] THE SPEND BUDGET, ENFORCED **HERE**, NOT ONLY AT THE COORDINATOR ──────────
