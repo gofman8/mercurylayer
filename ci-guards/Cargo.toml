@@ -9,3 +9,4 @@ description = "Repo invariants enforced as tests. The guards themselves stay dep
 
 [dev-dependencies]
 bitcoin = { version = "0.32", features = ["serde"] }
+secp256k1-zkp = { git = "https://github.com/ssantos21/rust-secp256k1-zkp.git", branch = "blinded-musig-scheme", features = ["rand-std", "bitcoin_hashes", "std"] }

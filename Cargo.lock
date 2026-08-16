@@ -900,6 +900,7 @@ name = "ci-guards"
 version = "0.1.0"
 dependencies = [
  "bitcoin 0.32.10",
+ "secp256k1-zkp",
 ]
 
 [[package]]

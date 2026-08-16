@@ -1,4 +1,5 @@
 #include "server.h"
+#include "../include/witness.h"
 #include <crow.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -90,7 +91,8 @@ namespace lockbox {
         const std::string& statechain_id, 
         int64_t negate_seckey, 
         std::vector<unsigned char>& serialized_session,
-        unsigned char *seed) {
+        unsigned char *seed,
+        const std::optional<witness::Disclosure>& disclosure) {
 
             auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
             auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
@@ -112,6 +114,27 @@ namespace lockbox {
             if (db_manager::get_cached_partial_sig(statechain_id, session_key, cached_partial_sig)) {
                 crow::json::wvalue cached_result({{"partial_sig", cached_partial_sig}});
                 return crow::response{cached_result};
+            }
+
+            // ── [REQ-57] WITNESS BINDING ─────────────────────────────────────────────────────────
+            //
+            // If the caller disclosed the transaction, the SE reproduces the sighash and rebuilds the
+            // blinded session from it, then byte-compares against the 133 bytes it was asked to sign.
+            // A disclosure that does not reproduce the session is refused.
+            //
+            // Placed with the other pre-consumption gates and BEFORE the secnonce is touched, so a
+            // refusal costs the coin nothing and can be retried with a correct disclosure.
+            //
+            // Absent disclosure is NOT refused here: binding is opt-in per request while clients are
+            // migrated. Routes that must have it enforce that themselves — a blanket requirement at
+            // this layer would brick every existing client on deploy.
+            if (disclosure.has_value()) {
+                std::vector<unsigned char> bound_sighash;
+                std::string detail;
+                const auto r = witness::bind(*disclosure, serialized_session, &bound_sighash, &detail);
+                if (r != witness::BindResult::Match) {
+                    return crow::response(400, std::string("witness binding refused: ") + detail);
+                }
             }
 
             // ── [D8(i)] THE SPEND BUDGET, ENFORCED **HERE**, NOT ONLY AT THE COORDINATOR ──────────
@@ -431,7 +454,18 @@ namespace lockbox {
                     return crow::response(400, "Invalid session length. Must be 133 bytes!");
                 }
 
-                return generate_partial_signature(statechain_id, negate_seckey, serialized_session, seed.data());
+                // Optional while clients migrate; strict when present — a disclosure that fails to
+                // parse is refused rather than ignored, because "I could not read it" must never be
+                // treated as "there wasn't one".
+                std::optional<witness::Disclosure> disclosure;
+                if (req_body.count("disclosure") != 0) {
+                    disclosure = witness::parse_disclosure(req.body);
+                    if (!disclosure.has_value()) {
+                        return crow::response(400, "disclosure present but malformed");
+                    }
+                }
+
+                return generate_partial_signature(statechain_id, negate_seckey, serialized_session, seed.data(), disclosure);
         
         });
 
