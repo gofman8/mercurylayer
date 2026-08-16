@@ -530,12 +530,15 @@ pub fn get_musig_session(
         .and_then(|psbt_sighash_type| psbt_sighash_type.taproot_hash_ty().ok())
         .unwrap_or(TapSighashType::All);
 
+    // Bound once and reused for both the sighash and the disclosure, so the two cannot disagree.
+    let prevouts = vec![TxOut {
+        value: input.witness_utxo.as_ref().unwrap().value,
+        script_pubkey: input.witness_utxo.as_ref().unwrap().script_pubkey.clone(),
+    }];
+
     let hash = SighashCache::new(&unsigned_tx).taproot_key_spend_signature_hash(
         vout,
-        &sighash::Prevouts::All(&[TxOut {
-            value: input.witness_utxo.as_ref().unwrap().value,
-            script_pubkey: input.witness_utxo.as_ref().unwrap().script_pubkey.clone(),
-        }]),
+        &sighash::Prevouts::All(&prevouts),
         hash_ty,
     )?;
 
@@ -545,7 +548,10 @@ pub fn get_musig_session(
     let session = calculate_musig_session(
         coin,
         hash,
-        encoded_unsigned_tx)?;
+        encoded_unsigned_tx,
+        &prevouts,
+        vout as u32,
+        hash_ty)?;
 
     Ok(session)
 }
@@ -584,27 +590,46 @@ pub fn get_partial_sig_request_for_colored_tx(
         Address::from_str(&coin.aggregated_address.as_ref().unwrap())?.require_network(network)?;
     let input_scriptpubkey = input_address.script_pubkey();
 
-    let prevout = TxOut {
+    let prevouts = vec![TxOut {
         value: input_amount,
         script_pubkey: input_scriptpubkey,
-    };
+    }];
 
     let hash = SighashCache::new(&unsigned_tx).taproot_key_spend_signature_hash(
         0,
-        &sighash::Prevouts::All(&[prevout]),
+        &sighash::Prevouts::All(&prevouts),
         TapSighashType::All,
     )?;
 
     // Sanity: the internal key recorded in the coin must match the funding output we are spending.
     let _ = input_xonly_pubkey;
 
-    calculate_musig_session(coin, hash, encoded_unsigned_tx)
+    calculate_musig_session(coin, hash, encoded_unsigned_tx, &prevouts, 0, TapSighashType::All)
 }
 
+/// # Why the prevouts are PARAMETERS and not re-derived here
+///
+/// The disclosure must describe exactly what BIP-341 hashed. The first version of this function
+/// rebuilt the prevout from `coin.amount` and the aggregate address, which silently disagreed with
+/// three of its four callers:
+///
+///   * `cosign_tier_request` (`tesr.rs`) hashes over the PARENT tier's output value — its own doc
+///     says "which is not `coin.amount`" — so every tier past the first disclosed a value the
+///     sighash never committed to;
+///   * the multi-input coloured path hashes input `i` against N prevouts, while the disclosure
+///     claimed `input_index: 0` and a single prevout;
+///   * the coloured PSBT path may carry a sighash type other than `All`, which was hard-coded.
+///
+/// Each of those is invisible from inside the SE: it would refuse an honest request and look like a
+/// working control. Passing the same values that produced `hash` makes the two structurally
+/// incapable of drifting, rather than merely equal today.
 pub fn calculate_musig_session(
     coin: &Coin,
     hash: TapSighash,
-    encoded_unsigned_tx: String,) -> core::result::Result<PartialSignatureMsg1, MercuryError>
+    encoded_unsigned_tx: String,
+    prevouts: &[TxOut],
+    input_index: u32,
+    hash_ty: TapSighashType,) -> core::result::Result<PartialSignatureMsg1, MercuryError>
 {
     let secp = Secp256k1::new();
 
@@ -679,27 +704,23 @@ pub fn calculate_musig_session(
     // [REQ-57] The disclosure the SE verifies against. Every field is public and already committed
     // to by `session`, so sending it reveals nothing and lets the SE check rather than trust.
     //
-    // The prevout is the coin's own funding output — a P2TR over the aggregate key, which is what
-    // every tier spends. `input_index` is 0 because a tier has exactly one input.
-    let input_amount = coin.amount.unwrap() as u64;
-    // The funding output is P2TR over the TWEAKED key: `OP_1 <32-byte x-only>`. Built from the key
-    // directly rather than via `Address`, which would need a `Network` this function is not given —
-    // and the script is network-independent, so routing through an address would add a parameter
-    // without adding information.
-    let mut input_spk = vec![0x51u8, 0x20];
-    input_spk.extend_from_slice(&output_pubkey.x_only_public_key().0.serialize());
+    // Every field below is taken from the SAME values that produced `hash` (see the doc comment on
+    // this function for the three drifts that caused). Nothing is re-derived from the coin.
     let disclosure = SigningDisclosure {
         unsigned_tx: encoded_unsigned_tx.clone(),
-        input_index: 0,
-        prevout_values: vec![input_amount],
-        prevout_spks: vec![hex::encode(&input_spk)],
+        input_index,
+        prevout_values: prevouts.iter().map(|p| p.value).collect(),
+        prevout_spks: prevouts
+            .iter()
+            .map(|p| hex::encode(p.script_pubkey.as_bytes()))
+            .collect(),
         agg_pubkey: hex::encode(output_pubkey.serialize()),
         agg_nonce: hex::encode(aggnonce.serialize()),
         blinding_factor: hex::encode(blinding_factor.as_bytes()),
         out_tweak: hex::encode(out_tweak32.as_ref()),
-        // The tiers sign at SIGHASH_ALL. Sent explicitly: a binding built against the wrong hash type
-        // refuses every honest signature while looking like a working control.
-        hash_type: TapSighashType::All as u8,
+        // Sent explicitly, and taken from the caller rather than assumed: a binding built against
+        // the wrong hash type refuses every honest signature while looking like a working control.
+        hash_type: hash_ty as u8,
     };
 
     let payload = PartialSignatureRequestPayload {
@@ -1096,7 +1117,16 @@ pub fn get_partial_sig_request_for_colored_tx_multi(
             &sighash::Prevouts::All(&prevouts),
             TapSighashType::All,
         )?;
-        sessions.push(calculate_musig_session(coin, hash, encoded_unsigned_tx.clone())?);
+        // `i`, not 0: this path signs input `i` against the FULL prevout set. Disclosing index 0 and
+        // a single prevout — as this call did before — describes a hash nobody computed.
+        sessions.push(calculate_musig_session(
+            coin,
+            hash,
+            encoded_unsigned_tx.clone(),
+            &prevouts,
+            i as u32,
+            TapSighashType::All,
+        )?);
     }
     Ok(sessions)
 }

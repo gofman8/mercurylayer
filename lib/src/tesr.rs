@@ -895,15 +895,19 @@ pub fn cosign_tier_request(
 
     let input_address =
         Address::from_str(coin.aggregated_address.as_ref().unwrap())?.require_network(network)?;
-    let prevout = TxOut { value: prevout_value, script_pubkey: input_address.script_pubkey() };
+    // `prevout_value`, NOT `coin.amount` — see this function's doc. The same binding feeds the
+    // sighash and the disclosure, so the SE recomputes the hash this signature was actually made
+    // over. Passing `coin.amount` instead made every tier past the first disclose a value BIP-341
+    // never committed to, which witness binding would refuse as a mismatch.
+    let prevouts = vec![TxOut { value: prevout_value, script_pubkey: input_address.script_pubkey() }];
 
     let hash = SighashCache::new(&unsigned_tx).taproot_key_spend_signature_hash(
         0,
-        &sighash::Prevouts::All(&[prevout]),
+        &sighash::Prevouts::All(&prevouts),
         TapSighashType::All,
     )?;
 
-    calculate_musig_session(coin, hash, encoded_unsigned_tx)
+    calculate_musig_session(coin, hash, encoded_unsigned_tx, &prevouts, 0, TapSighashType::All)
 }
 
 #[cfg(test)]

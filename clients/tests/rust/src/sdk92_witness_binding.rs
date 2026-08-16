@@ -63,7 +63,13 @@ const DEPOSIT: u64 = 150_000;
 /// Needed because "the honest path works" and "the gate never ran" are the same observation from
 /// outside: an absent disclosure is served, so a client that silently failed to serialise one would
 /// still complete a deposit. Counting the SE's own log line is what tells the two apart.
-fn bind_match_count() -> usize {
+/// Returns `(successful binds, co-signature requests)`.
+///
+/// The RATIO is the real measurement. A count of binds > 0 only proves the gate can fire; it says
+/// nothing about how much of a coin's lifecycle is covered. When these two disagree, some signing
+/// path is reaching the SE without a disclosure and is therefore unbound — which is how a partially
+/// wired gate reads as a working one.
+fn bind_stats() -> (usize, usize) {
     let out = Command::new("docker")
         .args(["logs", "mercurylayer-lockbox-1"])
         .output();
@@ -71,9 +77,12 @@ fn bind_match_count() -> usize {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&o.stderr));
-            s.matches("WITNESS_BIND_MATCH").count()
+            (
+                s.matches("WITNESS_BIND_MATCH").count(),
+                s.matches("POST /get_partial_signature").count(),
+            )
         }
-        Err(_) => 0,
+        Err(_) => (0, 0),
     }
 }
 
@@ -223,7 +232,7 @@ pub async fn execute() -> Result<()> {
     //
     // Every co-signature in this deposit+ladder now carries a disclosure. If the binding is wrong,
     // laddering fails here — which is the regression this half exists to catch.
-    let binds_before = bind_match_count();
+    let (binds_before, reqs_before) = bind_stats();
     let alice = wallet("sdk92_alice").await?;
     let before: Vec<String> =
         coins_of(&cc, "sdk92_alice").await?.into_iter().filter_map(|c| c.statechain_id).collect();
@@ -255,14 +264,16 @@ pub async fn execute() -> Result<()> {
              here — and fails for EVERY signature, not intermittently."
         ));
     }
-    println!("SDK92 - [a] PASS: deposit + ladder completed with disclosures attached ({})",
+    println!("SDK92 - [a] PASS: deposit confirmed with a disclosure attached ({})",
              &sid[..8.min(sid.len())]);
 
     // A green deposit is NOT by itself evidence the gate ran: an absent disclosure is served, so a
     // client that failed to serialise one would look exactly like this. Count the SE's own
     // successful-bind log lines instead.
-    let binds_after = bind_match_count();
-    if binds_after <= binds_before {
+    let (binds_after, reqs_after) = bind_stats();
+    let binds = binds_after - binds_before;
+    let reqs = reqs_after - reqs_before;
+    if binds == 0 {
         return Err(anyhow!(
             "[a] the deposit succeeded but the SE logged NO successful binding ({binds_before} -> \
              {binds_after}). Either the client is not attaching the disclosure or the gate is not \
@@ -270,8 +281,20 @@ pub async fn execute() -> Result<()> {
              absent disclosure is served."
         ));
     }
-    println!("SDK92 - [a] the SE logged {} successful bindings during the ladder (was {})",
-             binds_after - binds_before, binds_before);
+    println!("SDK92 - [a] binding coverage: {binds} bound / {reqs} co-signatures");
+    // MEASURED, and a limit on what this half is worth: the coin ends with sig_count == 1, so this
+    // flow makes ONE co-signature and never reaches `cosign_tier_request`. The ratio below is
+    // therefore honest but narrow — it cannot see the TIER lane, which is precisely where the
+    // prevout-value drift lived. Do not read a 1/1 here as "the lifecycle is bound".
+    if binds != reqs {
+        return Err(anyhow!(
+            "[a] only {binds} of {reqs} co-signatures were bound. The unbound ones reached the SE \
+             with NO disclosure and were signed unchecked. A partially wired gate reads as a \
+             working one — every co-signature must carry a disclosure before REQ-57 may be \
+             described as covering the lifecycle. (Known cause class: a builder that does not pass \
+             the prevouts it hashed; see `calculate_musig_session`.)"
+        ));
+    }
 
     // The coin is laddered, which means the SE co-signed tiers while binding each one.
     let coin = coins_of(&cc, "sdk92_alice")

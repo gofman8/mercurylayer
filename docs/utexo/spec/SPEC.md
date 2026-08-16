@@ -1576,7 +1576,7 @@ unbuilt sections, and they are marked as such in place.
 | REQ-57 (§5.4, witness binding) | `sdk92` (live: honest bind logged, one-satoshi lie refused BY THE SESSION COMPARE, correct value not refused), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3). **Partial coverage:** opt-in per request, and only `calculate_musig_session` attaches a disclosure — 1 of 2 co-signatures bound in `sdk92`'s ladder |
 | REQ-53…REQ-56, REQ-58…REQ-67 (§5.4, the rest of the round) | **NONE — design, not built.** No leaf registry, no frontier, no `collapse_grant`. See the status banner in §5.4 |
 
-**Suite sizes.** Workspace unit + guard tests: **794**, 0 failures (`cargo test --workspace --tests`).
+**Suite sizes.** Workspace unit + guard tests: **805**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.
 
 ## 13. Query, utility & invoice API
