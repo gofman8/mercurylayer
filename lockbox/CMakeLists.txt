@@ -48,7 +48,8 @@ set(LOCKBOX_SOURCES
     src/db_manager.cpp
     src/tx.cpp
     src/witness.cpp
-    src/auth.cpp)
+    src/auth.cpp
+    src/registry.cpp)
 
 if(WITH_GOOGLE_KMS)
     list(APPEND LOCKBOX_SOURCES src/google_key_manager.cpp)
@@ -176,6 +177,18 @@ if(BUILD_LOCKBOX_TESTS)
     add_custom_command(TARGET test_bip340 POST_BUILD
         COMMAND test_bip340
         COMMENT "Running the BIP-340 verification differential")
+
+    # REQ-56's predicate. Pure arithmetic over a leaf set, so every case that matters — a fork, a
+    # released sibling, a shared exit key, a one-satoshi shortfall — is reachable here and NONE of
+    # them is reachable cheaply through a live stack. A permissive predicate is silent: the honest
+    # path keeps working and the only symptom is an unpaid absentee with no recourse.
+    add_executable(test_registry tests/test_registry.cpp src/registry.cpp src/tx.cpp)
+    target_include_directories(test_registry PRIVATE include tests)
+    target_link_libraries(test_registry PRIVATE OpenSSL::Crypto)
+    add_test(NAME registry COMMAND test_registry)
+    add_custom_command(TARGET test_registry POST_BUILD
+        COMMAND test_registry
+        COMMENT "Running the REQ-56 collapse-predicate tests")
 endif()
 
 # Copy Settings.toml after building MercuryLockbox
