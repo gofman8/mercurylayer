@@ -1201,6 +1201,215 @@ as offline sending.**
 
 ---
 
+### 5.5 Operator liquidity — what must be funded, when it comes back, what happens when it runs out
+
+> **Status: MIXED, and NOTHING here is measured.** The Lightning legs (§8.1, §8.2) are BUILT and
+> carry live tests; the round (§5.4) and the sweep (§5.3) are DESIGN, so their capital requirement is
+> DERIVED from parameters stated in this document and in
+> [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §4 — no round has ever run and no
+> float has ever been observed. §12 carries a `NONE` row for REQ-69–REQ-73.
+
+> **This section CORRECTS a companion normative document.**
+> [PROTOCOL.md](PROTOCOL.md):96 records the operator-liquidity cell for TES-R as "**None** (fee-sized
+> outlays only)" and :710 grades "**REQ 2 — no/low operator liquidity: MET.** No round liquidity
+> (nothing expires)". That was written before §5.4 existed and is now **stale**: the discharge round
+> reintroduces a genuine round liquidity requirement. It is a much smaller and better-behaved one than
+> the Ark-style requirement PROTOCOL.md was contrasting against — §5.5.4 gives the axis — but it is
+> not zero, and "None" MUST NOT be repeated. Amending PROTOCOL.md §7.4 and its comparison table is a
+> divergence this section opens deliberately rather than hides.
+
+#### 5.5.1 Every site at which the operator funds something
+
+**FLOAT** is capital tied up and later returned — the row names what returns it. **COST** is spent and
+never recovered. **RISK** is capital that can be lost, with the condition. **NONE** means a site that
+looks like it needs operator capital and does not.
+
+| site | kind | what the operator puts up | what returns it | status |
+|---|---|---|---|---|
+| ordinary payment — in-ladder split (§6.1) | **NONE** | — | — | BUILT |
+| deposit (§4), transfer (§5), cooperative withdraw (§9.1) | **NONE** | — | — | BUILT |
+| Lightning **pay** (§8.1) | FLOAT | outbound channel liquidity for the BOLT11 | claiming the latched coin with the preimage (INV-14) | BUILT |
+| Lightning **receive** (§8.2) | FLOAT + COST | a Mercury-side coin, or an in-ladder piece, fronted before the HTLC settles — **plus a 2 000-sat tier reserve per non-exact swap, never recovered** | the HTLC settles (INV-15); the reserve does not come back | BUILT |
+| round **migration**, R1 (§5.4) | FLOAT | unallocated funding value in the **confirmed** current root `F_B` | root `A`'s collapse confirming at R7 | DESIGN |
+| collapse fee + CPFP handle, R5/R7 | COST | one transaction's fee per tree per epoch | nothing | DESIGN |
+| **sweep** absorption (§5.3) | FLOAT + RISK | `price_paid ≥ leaf_value − 1 230` per absorbed leaf | settling the batch (REQ-51); lost if the tree's spine cannot be materialised, which is exactly what `sweep_max_tree_exposure` bounds | DESIGN |
+| `refresh_sponsored` (§9.4) | COST | the off-chain rebate (fee + 330) | nothing | BUILT |
+| CPFP bumps under a fee spike (D31, X-8) | COST | **the owner, not the operator** — a keyless tower cannot bump at all | nothing | BUILT |
+| bootstrap — the first current root, before any collapse has recycled | FLOAT | one cycle's migration capacity | the first collapse's `out[0]` | DESIGN |
+
+Two rows carry the argument. **The first row is the reason this design has a liquidity story worth
+telling**: an ordinary payment redistributes value *inside* a tree, so payment volume enters none of
+the formulas below. **The migration row is the dominant term**, and §5.5.2 derives it.
+
+**The SE funds nothing, anywhere, and that is structural rather than incidental.** It holds a key
+share and never sees an amount (§1); REQ-58 forbids it even to ask whether a funding output exists;
+and the coordinator broadcasts no Bitcoin transaction. Every entry above is the SSP's.
+
+**One row is MEASURED, and it is the one that is live today.** The non-exact Lightning receive path
+oversizes the fronted piece by a fixed reserve — `IN_LADDER_TIER_RESERVE = 2000`
+(`clients/libs/rust-sdk/src/ssp.rs:664`), whose own comment reads "the SSP bears it (its cost of
+fronting a non-exact amount)" — while the reference SSP's fee defaults to **zero**
+(`SSP_FEE_SATS … unwrap_or(0)`, `clients/apps/ssp-server/src/main.rs:110`). So on shipped defaults the
+only liquidity lane that actually runs today loses 2 000 sat per non-exact receive and charges nothing
+for it. That is a product decision, not a protocol defect — but it MUST NOT be mistaken for a lane
+that pays for itself.
+
+#### 5.5.2 The round float, and why the protocol forces it
+
+REQ-54 R1 conveys a migrating holder a leaf of identical funding value on the current root `B`, and
+requires `f_spender` to be checked against a **confirmed** `F_B`. The holder's claim on root `A` is
+thereby released — but that value does not become spendable by the operator until the collapse `C`
+confirms at R7, because `C` is the transaction that retires `A` and pays `out[0]` into the next root.
+
+The ordering *confirmed `B` → migrate → release → collapse `A`* is therefore what creates the float,
+and it is structural: a round cannot migrate holders into a root funded by the very collapse that the
+migration precedes. REQ-53's "there is no separate deposit" describes the STEADY STATE correctly and
+says nothing about the timing mismatch inside a round; this section supplies that half.
+
+Let `μ` be migration participation (the fraction of value that migrates rather than being paid out on
+chain), `W` the round window in days from the first R1 migration to R7 confirming, and `epoch_days`
+the round period. At any instant the fraction of trees mid-round is `W / epoch_days`, and each such
+tree carries `μ` of its value as float:
+
+```text
+    standing float  =  μ · (W / epoch_days) · TVL
+```
+
+**Payment volume does not appear. Neither does the number of payments, nor the number of users.** The
+structural fact that keeps payment volume out of the footprint formula
+([PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §4.1) keeps it out of this one: a round
+re-mints outstanding *pieces*, and pieces track value held, never payments made.
+
+On this document's worked parameters — `initlock = 10 000` ⟹ `epoch_days = 69.4`, 4 000 BTC TVL
+(PARTIAL-PAYMENT-ECONOMICS §4.2):
+
+| `μ` | `W` = 1 d | 3 d | 7 d | 14 d |
+|---:|---:|---:|---:|---:|
+| 50 % | 0.72 % TVL | 2.16 % | 5.04 % | 10.1 % |
+| **90 %** | 1.30 % | 3.89 % | **9.07 %** | 18.1 % |
+| 100 % | 1.44 % | 4.32 % | 10.1 % | 20.2 % |
+
+At the central case — 90 % migrate, a one-week window — the operator stands behind **≈ 9 % of TVL**:
+363 BTC against a 4 000 BTC book.
+
+**Bootstrap is not a separate spike.** Before the first collapse there is no `out[0]` to recycle, so
+the first cycle's capacity is real operator capital — but it is the same quantity as the steady-state
+float, not an addition to it.
+
+#### 5.5.3 The tension this exposes: the absentee lever is bought with liquidity
+
+PARTIAL-PAYMENT-ECONOMICS §4.4 names the absentee rate as the dominant footprint lever — a 72× swing
+between nobody absent and nobody present. The way an operator lowers the absentee rate is by widening
+the window `W` so that more holders come online in time. `W` is the numerator of the float.
+
+**Lowering the on-chain footprint therefore costs liquidity, linearly.** The two levers pull against
+each other, and until this section existed the document described only one of them.
+
+#### 5.5.4 Comparison with Ark
+
+Ark is the closest comparable. **The first draft of this section claimed Ark charges its operator
+capital for every payment. That is false, and the correction is kept in place rather than deleted**,
+because it is the error a reader of this document is most likely to make independently:
+
+> "Ark payments … happen out-of-round and require no liquidity — they simply extend existing
+> transaction trees."
+> — [Second, *Liquidity*](https://second.tech/docs/learn/liquidity)
+
+So both designs make their **native payment path liquidity-free**, and the comparison is between what
+each does with the *periodic* obligation instead.
+
+| | Ark server | UTEXO operator |
+|---|---|---|
+| ordinary in-protocol payment | **no liquidity** — out-of-round, extends an existing tree | **no liquidity** — an in-ladder split moves value inside an existing tree |
+| what DOES consume capital | "Refreshes … Offboarding … Lightning payments" ([Second](https://second.tech/docs/learn/liquidity)) | round migration R1 (§5.4); Lightning both directions (§8); sweep absorption (§5.3) |
+| what the requirement is driven by | refresh cadence × value refreshed | epoch cadence × value migrated — `μ · W / epoch_days · TVL` |
+| how long capital is locked | "Remaining lifetime: How long until the spent VTXO expires and becomes claimable" — ceiling `expiry_delta`, 28–30 d ([Second](https://second.tech/docs/learn/liquidity)) | the round window `W`, an **operator-chosen** parameter, not a consensus timelock |
+| published cost model | `amount × (expiry_delta ÷ 365 days) × opportunity_rate`; worked as 100 000 sat × 5 d ÷ 365 × 5 % ≈ 68 sat ([Second](https://second.tech/docs/learn/liquidity)) | **none — this section is the first** |
+| behaviour on exhaustion | "it will have to cease accepting new payments and will be compelled to wait for the timelocks (4 weeks) … to expire in order to regain liquidity" ([Ark Labs](https://blog.arklabs.xyz/liquidity-requirements/)) | migrations stop; the remaining holders are paid **in full, on chain, by the collapse** (§5.5.5) |
+| dormant funds | expiry exists so capital is not locked forever by dormant users; missing the deadline is confiscating | nothing expires; a dormant holder is an absentee, paid out at the next collapse |
+
+**What survives as a real difference is two things, not five:**
+
+1. **The lock is bounded by an operator choice, not by a consensus timelock.** `W` can be days; Ark's
+   ceiling is `expiry_delta`. This is a smaller edge than it looks — a user who refreshes just before
+   expiry forfeits a VTXO with little remaining lifetime, which is exactly why Second's worked example
+   is 5 days rather than 28.
+2. **Exhaustion is not a payment failure.** This is the one that matters, and it is a consequence of
+   REQ-56 rather than of any liquidity engineering (§5.5.5).
+
+Three fairness notes, all of which cut against this document:
+
+* **Ark's model is measured; ours is not.** Second publishes a metric ("liquidity duration in days" =
+  total sat-days ÷ payment volume), a pricing formula and empirical scenarios measuring a capital
+  stock of **10.13–31.6 days of payment volume**. §5.4 has never run.
+* **That 10–31 day figure is a WORST CASE and MUST be quoted as one.** It assumes every payment routes
+  to Lightning, which does consume Ark liquidity. Quoting it as Ark's ordinary cost would repeat, in
+  the other direction, the error corrected at the top of this section. It is also why Second's research
+  post says liquidity is "driven by payment volume" while Second's own docs say Ark-to-Ark payments
+  need none — the two statements are about different traffic mixes, not a contradiction.
+* **Ark is actively reducing this cost.** Arkade's delegation work keeps VTXOs renewed rather than
+  expiring ([Ark Labs](https://blog.arklabs.xyz/adios-expiry-rethinking-liveness-and-liquidity-in-arkade/));
+  expiry is not removed, but this comparison MUST be re-checked against current Ark rather than against
+  the version quoted here.
+
+#### 5.5.5 Exhaustion degrades to block space, never to loss
+
+If the operator exhausts its float mid-round it stops accepting migrations. The holders it could not
+migrate are simply not migrated: they remain undischarged, and REQ-56 forces the collapse to pay each
+of them their **full funding value at their own exit key**, or the SE refuses to co-sign the collapse
+at all.
+
+So liquidity exhaustion raises that round's absentee count — `155 + 43·absentees` vB — and does
+nothing else. No holder is worse off than if no migration had ever been offered, no payment fails, and
+no round stalls. **This, not the magnitude, is the property worth defending**: where a provider fronts
+funds per payment, illiquidity is a payment failure; here it is a fee.
+
+#### 5.5.6 Normative requirements
+
+**REQ-69 (no per-payment liquidity).** An ordinary payment — an in-ladder split (§6.1) — MUST NOT
+require operator capital. Any mechanism that makes a plain payment depend on operator funds converts
+the model from stock-proportional to flow-proportional, which is the axis §5.5.4 claims as the design's
+advantage, and MUST be specified here before it is built.
+
+**REQ-70 (a round MUST NOT over-commit the current root).** The operator MUST NOT convey migration
+leaves whose total funding value exceeds the unallocated funding value of the confirmed current root
+`F_B`. An over-committed root produces conveyed leaves the tree cannot back. The holder's verifier
+would refuse them (`verify_child_bundle`, value conservation both ways), so the failure is loud rather
+than silent — but the operator MUST NOT create the condition.
+
+**REQ-71 (exhaustion MUST degrade to payout, never to a narrowed obligation).** When float is
+exhausted the operator MUST stop accepting migrations and let the remaining holders be paid on chain by
+the collapse. It MUST NOT narrow, defer, discount or price the payout owed under REQ-56 in order to
+recover liquidity. Un-migrated is a normal outcome, not a failure state.
+
+**REQ-72 (the window is a published parameter).** The operator MUST publish the round window `W` at R0
+alongside the freeze height. `W` is what a wallet needs in order to decide whether it can come online
+in time, and — per §5.5.3 — it is the parameter the operator is most tempted to shorten for its own
+benefit at the holders' expense.
+
+**REQ-73 (liquidity MUST NOT be described as zero).** No normative document may state that this design
+has no operator liquidity requirement. It has one; §5.5.2 gives its form. The defensible claims are
+that it is **stock-proportional rather than flow-proportional**, that it is **bounded by an
+operator-chosen window rather than a consensus timelock**, and that **its exhaustion costs block space
+rather than money**.
+
+#### 5.5.7 What this section does NOT know
+
+* **`W` is unmodelled.** Nothing in this document derives a round window; it is an operating choice,
+  and every figure in §5.5.2 is parametric in it.
+* **`μ` is unmeasured.** Migration participation is a product outcome. The 90 % row is an
+  illustration, not a prediction, and §5.4.6's rule applies — quote the worst case, because exit-key
+  reassignment lets any holder force a payout instead of a migration, free and unattributable.
+* **The Lightning legs are unquantified.** §8.1 and §8.2 are BUILT and INV-14/INV-15 bound their RISK
+  to zero, but this document does not model how much Mercury-side inventory or outbound channel
+  liquidity an operator must hold to serve a given invoice rate. That is a real gap, and it is the one
+  that bites first, because that lane is live today and the round is not.
+* **The sweep's exposure is bounded but not costed.** REQ-50 caps it at `sweep_max_tree_exposure`
+  (1 000 000 sat default); nothing derives what a realistic absorber's standing book would be.
+* **None of the round arithmetic is measured.** §5.4 is not built.
+
+---
+
 ## 6. Off-chain split & combine
 
 ### 6.1 In-ladder split (laddered coins)
@@ -1739,6 +1948,7 @@ unbuilt sections, and they are marked as such in place.
 | REQ-54 R2 (§5.4, `/release`) | **BUILT.** `lockbox/tests/test_release_route.cpp` — 10 checks against live Postgres and real BIP-340, three of them forgeries run BEFORE the honest path: no latch → refused (fails closed), someone else's key → refused, a signature over a DIFFERENT sid → refused (the tag binds it), replayed nonce → refused, fresh nonce → accepted, `released` monotone |
 | REQ-61 (§5.4, the owner latch) | **ARMING BUILT, ENFORCEMENT NOT.** The key is read structurally from the unique P2TR output and stored write-once (`ON CONFLICT DO NOTHING`); a second arming with a different key is a no-op. Measured live: 4 bound co-signatures → exactly 1 `LATCH_ARMED`. **Nothing yet refuses a co-signature for want of a BIP-340 by that key** — and REQ-61(b) must be settled first, since the payer co-signs the payee's tiers before the payee holds anything |
 | REQ-53, REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no freeze at grant time. See the status banner in §5.4 |
+| REQ-69…REQ-73 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written |
 
 **Suite sizes.** Workspace unit + guard tests: **805**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.
@@ -1830,6 +2040,13 @@ are stated as limits rather than as things to fix.
 * **The P2A anchor slot is an auction, not a race.** An under-paying squat is refused; an
   over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
   a price, not a denial of service.
+* **The discharge round has a standing capital requirement of `μ · W / epoch_days · TVL`** — ≈ 9 % of
+  TVL at 90 % migration and a one-week window (§5.5.2). It is stock-proportional, not
+  flow-proportional: payment volume does not enter it. It is a limit rather than a defect because the
+  ordering that produces it (migrate into a CONFIRMED successor root, collapse the predecessor
+  afterwards) is what lets an absentee be paid without broadcasting anything. **Its corollary is a
+  trade this document must not hide:** widening the window `W` lowers the absentee rate, which is the
+  dominant footprint lever, and raises the float linearly (§5.5.3).
 * **THE DESIGN SELLS PAYMENT VELOCITY — and it LOSES to a batched on-chain payout until ~74 % of
   leaves are swept.** Full derivation in
   [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.2.

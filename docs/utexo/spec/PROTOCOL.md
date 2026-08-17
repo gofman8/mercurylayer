@@ -40,9 +40,11 @@ latch), `PARTIAL-PAYMENT-ECONOMICS.md`, `README.md` (index).
    acceptable **iff** (a) footprint scales with *activity*, not time — idle coins cost ~nothing — or is
    heavily amortized/batched, **and** (b) users never act personally: an operator/tower does it, priced
    into onboarding/transaction fees.
-2. **No/low operator liquidity.** No Ark-style round liquidity, no SSP denomination pools, no
-   SuperScalar leaf stock. Native exact-amount split/combine (value conserved from the user's own
-   coin) must survive.
+2. **Low operator liquidity.** No capital per payment, no SSP denomination pools, no SuperScalar leaf
+   stock. Native exact-amount split/combine (value conserved from the user's own coin) must survive.
+   Refinement, added after the discharge round was designed: a **stock-proportional** float bounded by
+   an operator-chosen window is acceptable; a **flow-proportional** one (Ark-style, scaling with
+   payment volume) is not. See [SPEC.md](SPEC.md) §5.5.
 3. **Non-custody under operator hack.** A hacked operator may steal *future* deposits and *future*
    state transitions, but pre-hack state left untouched must be absolutely safe (2-of-2, share
    rotation s+e=const, enclave deletion).
@@ -93,7 +95,7 @@ measuring stick for every number in this design, not a shipped option.
 | Renewal mechanism | On-chain re-anchor per coin | Off-chain re-sign with operator group (`renew_leaf`) | On-chain round through ASP | New factory before dying period | **Off-chain**: DW lower-CSV extension re-sign; self-split rollover at epoch exhaustion |
 | What invalidates old state | Consensus (absolute locktime ordering) + enclave refusal | **1-of-n operator honest key deletion** (trust) | Round expiry (consensus) | Decrementing nSequence DW (~64 updates then exhaustion) | **Consensus** (lower-CSV wins the trigger output; old epochs' parents unconfirmable) + the receiver's exact-equality census over the enclave's attested `sig_count` as defense-in-depth (§5.11) |
 | Missed-liveness outcome | Raceable after window; never confiscated | Safe (operator renews); trust-dependent | **CONFISCATION** — funds sweep to server after expiry | **CONFISCATION** — the LSP can claim the entire UTXO after the dying period | Raceable **only after** a public on-chain trigger + ≥144-block CSV notice; **never confiscated** — no output ever pays the operator by timeout |
-| Operator liquidity | None | SSP denomination-swap pools | Round liquidity fronted per refresh | LSP leaf liquidity | **None** (fee-sized outlays only; §7.4) |
+| Operator liquidity | None | SSP denomination-swap pools | None per Ark↔Ark payment; fronted on **refresh / offboard / LN-out**, locked until the forfeited VTXO expires (≤ `expiry_delta`) | LSP leaf liquidity | None per payment; the discharge round stands behind `μ·W/epoch_days·TVL` (≈9 % of TVL at 90 % migration, 1-week window), locked for an **operator-chosen** window. Exhaustion costs block space, not payments. [SPEC.md](SPEC.md) §5.5 |
 | Exact amounts | Native split/combine | Fixed denominations + SSP swaps | Fixed by round | Fixed by leaf | **Native split/combine preserved** |
 | Operators | 1 (blind SE + enclave) | t-of-n group | 1 ASP | 1 LSP | 1 (blind SE + enclave) |
 | Unilateral exit wait | ≤ ~7 d | Relative timelock wait (2000→ blocks, decrementing) | Before expiry only | O(log N) txs, force-exits sibling subtrees | E+D sequential CSV: ≤15 d flat, decreasing with activity; deeper for sub-coins (§5.9) |
@@ -707,10 +709,25 @@ SDK/operator inside `transfer()` and priced into that transfer's fee — the use
 **nothing** at the committed rate (§5.8), so footprint scales with activity OR adversary spite. What is
 bounded is the damage: ~980 sats of fees and anchors out of the coin per grief, value intact.
 
-**REQ 2 — no/low operator liquidity: MET.** No round liquidity (nothing expires), no denomination
-pools (exact-amount Σ-conserving split/combine preserved verbatim), no leaf stock (all value is the
-user's own coin). Operator money is fee-sized only: tower fee bonds (prepaid, priced into onboarding)
-and P2A bump children. *Asterisk*: contingent tower fee capital under a correlated grief wave is real —
+**REQ 2 — low operator liquidity: MET on the axis that matters, but NOT "none".** This verdict was
+originally written as "no round liquidity (nothing expires)" and that is now **stale**: the discharge
+round ([SPEC.md](SPEC.md) §5.4) introduced a real round liquidity requirement after this section was
+written. The corrected claim, derived in [SPEC.md](SPEC.md) §5.5:
+
+* **No capital per payment.** An ordinary payment is an in-ladder split that redistributes value
+  inside an existing tree, so payment volume enters no formula. **This is parity with Ark, not an
+  advantage over it** — Ark's out-of-round payments are also liquidity-free.
+* **But a standing round float of `μ · W / epoch_days · TVL`** — ≈9 % of TVL at 90 % migration and a
+  one-week window. It is stock-proportional, and bounded by an **operator-chosen** window rather than
+  by a consensus timelock (Ark's ceiling is `expiry_delta`, 28–30 d).
+* **Exhaustion costs block space, not payments.** Unfunded holders are simply not migrated and are
+  paid in full on chain by the collapse (REQ-56), where an Ark server out of liquidity must "cease
+  accepting new payments". This, rather than the magnitude, is the defensible edge.
+
+No denomination pools (exact-amount Σ-conserving split/combine preserved verbatim), no leaf stock (all
+value is the user's own coin). Outside the round, operator money is fee-sized only: tower fee bonds
+(prepaid, priced into onboarding) and P2A bump children.
+*Asterisk*: contingent tower fee capital under a correlated grief wave is real —
 ~$17/coin defended at 30 sat/vB; a 100k-coin wave ≈ $1.7M fronted. Mitigated by committed base fees
 (base case needs no child), the de-trigger (defense is one 125-vB co-op tier, not a **375-vB**
 pre-signed unilateral walk), and the prepaid bond rail (**unbuilt**, O-5); it is capital-at-cost, never
