@@ -1040,15 +1040,39 @@ Two candidate closures, and the difference between them is the whole question:
   server share differs — it cannot make its own coin's aggregate equal anyone else's. This is the
   closure the spec recommends.
 
-**The cost is privacy, and it MUST be stated rather than discovered.** An SE that knows a coin's
-aggregate key knows its funding address, i.e. which on-chain output it is guarding — which today it
-does not. Note the price is **already paid on any bound request**: a disclosure carries
-`agg_pubkey` and the transaction, so every use of REQ-57 reveals both. Deriving the aggregate at
-deposit makes that unconditional instead of per-request, which is a real change for a client that
-declines to disclose. Whether to spend it is an **operator decision, not an implementation detail**,
-and until it is taken the frontier cannot rest on SE-authored parenthood.
+**DECIDED 2026-08-17 by the operator: the lockbox DERIVES it.** Option (b), and the cost turned out
+to be far smaller than first stated — the correction matters enough to record, because the original
+framing would have bought a privacy concession that had already been made.
 
-Anything built in the meantime MUST NOT present the SE's index as authority on parenthood.
+**MEASURED: the coordinator already holds both.** `statechain_data` stores **`aggregate_xonly`
+(UNIQUE)** and **`user_public_key`** (`server/src/database/deposit.rs`). The client already sends its
+key at deposit; the operator already stores the aggregate, which *is* the funding address. So:
+
+* against the **operator** — who runs both the coordinator and the lockbox, and whose lockbox is a
+  plain container rather than an attested enclave (REQ-67) — the additional privacy cost is **zero**;
+* the residual is that the fact moves into a **second** operator-controlled database, widening the
+  blast radius of a lockbox-only breach or backup leak;
+* it becomes a real cost only in a future where the lockbox is run by a **different party or is
+  attested** — which is precisely the deployment in which you would want the SE verifying for itself.
+
+A `NULL` `aggregate_xonly` occurs only for **old clients** (the code says so), and D24 already
+decided legacy pre-0009 coins are ignored.
+
+**DERIVE, never accept.** The lockbox MUST compute the aggregate from the client's public key and its
+own key share, and MUST NOT take an aggregate supplied by the coordinator — the coordinator is
+exactly the party REQ-56's frontier exists to be checked against, so trusting its value would return
+the authority the derivation is meant to establish. The derivation is also self-defending: an
+adversary who declares a VICTIM's client key still gets a **different** aggregate, because its own
+sid's server share differs, so it cannot make its coin's aggregate equal anyone else's.
+
+**Build order, and the test that decides it.** (1) forward `user_public_key` to the lockbox — today
+`/get_public_key` receives only a `statechain_id`; (2) derive and store the aggregate per sid;
+(3) refuse a binding whose `agg_pubkey` differs; (4) **prove it with an adversary presenting a
+VICTIM's tier under its own sid and being refused** — a test exercising only the honest order proves
+nothing here; (5) only then resolve parent edges through the index, and only then wire
+`collapse_grant`.
+
+Until (1)–(4) are done and measured, nothing may present the SE's index as authority on parenthood.
 
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
 raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same

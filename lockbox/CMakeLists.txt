@@ -178,6 +178,16 @@ if(BUILD_LOCKBOX_TESTS)
         COMMAND test_bip340
         COMMENT "Running the BIP-340 verification differential")
 
+    # [REQ-61] Latch enforcement, both directions — a gate that refuses everything bricks every
+    # latched coin and looks identical to a working one in a forgeries-only test.
+    add_executable(test_latch_enforce tests/test_latch_enforce.cpp src/auth.cpp src/tx.cpp)
+    target_include_directories(test_latch_enforce PRIVATE include tests)
+    target_link_libraries(test_latch_enforce PRIVATE secp256k1_zkp OpenSSL::Crypto)
+    add_test(NAME latch_enforce COMMAND test_latch_enforce)
+    add_custom_command(TARGET test_latch_enforce POST_BUILD
+        COMMAND test_latch_enforce
+        COMMENT "Running the REQ-61 latch-enforcement tests")
+
     # REQ-56's predicate. Pure arithmetic over a leaf set, so every case that matters — a fork, a
     # released sibling, a shared exit key, a one-satoshi shortfall — is reachable here and NONE of
     # them is reachable cheaply through a live stack. A permissive predicate is silent: the honest

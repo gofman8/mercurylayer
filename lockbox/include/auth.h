@@ -57,4 +57,26 @@ bool verify_release(const std::vector<unsigned char>& xonly,
                     const std::vector<unsigned char>& nonce32,
                     const std::vector<unsigned char>& sig);
 
+// ── [REQ-61] LATCH ENFORCEMENT ───────────────────────────────────────────────────────────────────
+
+/// The domain tag for a latch authorisation. Distinct from `RELEASE_TAG` so a release can never be
+/// replayed as a co-signature authorisation, or the reverse — that is the entire purpose of a tag.
+inline constexpr const char* LATCH_TAG = "utexo/leaf_latch/v1";
+
+/// The message an owner signs to authorise ONE co-signature: `tagged(LATCH_TAG, sid ‖ session)`.
+///
+/// **The session is in the message on purpose.** A signature that authorised "any co-signature under
+/// this sid" would be a bearer token: capture it once and replay it against a different transaction
+/// forever. Binding the 133-byte session makes the authorisation specific to the exact signing round
+/// it was issued for, and the session is already what witness binding ties to a transaction — so
+/// owner consent, the session, and the transaction are one chain rather than three assertions.
+std::vector<unsigned char> latch_message(const std::string& sid,
+                                         const std::vector<unsigned char>& session);
+
+/// Verify an owner's authorisation for this signing round under the coin's latch key.
+bool verify_latch(const std::vector<unsigned char>& latch_key,
+                  const std::string& sid,
+                  const std::vector<unsigned char>& session,
+                  const std::vector<unsigned char>& sig);
+
 }  // namespace auth

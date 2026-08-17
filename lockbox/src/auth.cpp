@@ -46,4 +46,23 @@ bool verify_release(const std::vector<unsigned char>& xonly,
     return verify_bip340(xonly, release_message(sid, nonce32), sig);
 }
 
+std::vector<unsigned char> latch_message(const std::string& sid,
+                                         const std::vector<unsigned char>& session) {
+    std::vector<unsigned char> preimage;
+    preimage.reserve(sid.size() + session.size());
+    preimage.insert(preimage.end(), sid.begin(), sid.end());
+    preimage.insert(preimage.end(), session.begin(), session.end());
+    return tx::tagged_hash(LATCH_TAG, preimage);
+}
+
+bool verify_latch(const std::vector<unsigned char>& latch_key,
+                  const std::string& sid,
+                  const std::vector<unsigned char>& session,
+                  const std::vector<unsigned char>& sig) {
+    // An empty session would make the message depend on the sid alone, turning a per-round
+    // authorisation into a bearer token for that coin.
+    if (session.empty()) return false;
+    return verify_bip340(latch_key, latch_message(sid, session), sig);
+}
+
 }  // namespace auth

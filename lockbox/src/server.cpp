@@ -93,7 +93,8 @@ namespace lockbox {
         int64_t negate_seckey, 
         std::vector<unsigned char>& serialized_session,
         unsigned char *seed,
-        const std::optional<witness::Disclosure>& disclosure) {
+        const std::optional<witness::Disclosure>& disclosure,
+        const std::optional<std::vector<unsigned char>>& latch_sig) {
 
             auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
             auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
@@ -130,6 +131,51 @@ namespace lockbox {
             // migrated. Routes that must have it enforce that themselves — a blanket requirement at
             // this layer would brick every existing client on deploy.
             //
+            // ── [REQ-61] LATCH ENFORCEMENT ──────────────────────────────────────────────────────
+            //
+            // Once a coin's latch is armed, a co-signature under that sid requires a fresh BIP-340
+            // by the latch key over `tagged(LATCH_TAG, sid || session)`. The session is in the
+            // message so the authorisation is for THIS round only — otherwise it is a bearer token
+            // that can be replayed against any later transaction.
+            //
+            // WHY NO "EXEMPT COUNT" IS NEEDED. REQ-61(b) worried that the payer co-signs the payee's
+            // tiers before the payee holds anything, so "every co-signature" could not mean what it
+            // said. REQ-61(a2) dissolves it: the latch arms only from a tier that hands control
+            // OUTWARD, which is the state tier — the LAST of the ladder. Establishment therefore
+            // completes before the latch binds anything, and no arbitrary exempt count has to be
+            // chosen or maintained.
+            //
+            // DEFAULT OFF. Enforcement refuses any client that does not yet sign, which is every
+            // client today. `UTEXO_ENFORCE_LATCH=1` turns it on; the deploy order is: ship signing
+            // in the clients, confirm every co-signature carries one, then flip. Shipping it on by
+            // default would brick the system on upgrade, which is the same hazard REQ-57's opt-in
+            // binding has and must be sequenced with it.
+            const char* enforce_env = std::getenv("UTEXO_ENFORCE_LATCH");
+            const bool enforce_latch = enforce_env != nullptr && std::string(enforce_env) == "1";
+            if (enforce_latch) {
+                std::vector<unsigned char> latch_key;
+                bool has_latch = false;
+                std::string latch_err;
+                if (!db_manager::get_latch(statechain_id, latch_key, has_latch, latch_err)) {
+                    return crow::response(500, "could not read the owner latch: " + latch_err);
+                }
+                if (has_latch) {
+                    // A latched coin with no authorisation is refused — this is the whole gate.
+                    if (!latch_sig.has_value()) {
+                        return crow::response(
+                            401,
+                            "this coin is latched: a co-signature requires a BIP-340 authorisation "
+                            "by the owner key over tagged(\"utexo/leaf_latch/v1\", sid || session)");
+                    }
+                    if (!auth::verify_latch(latch_key, statechain_id, serialized_session,
+                                            *latch_sig)) {
+                        return crow::response(
+                            401, "owner authorisation does not verify under this coin's latch");
+                    }
+                    CROW_LOG_INFO << "LATCH_AUTHORISED statechain " << statechain_id;
+                }
+            }
+
             // Set only on a successful bind, and consumed only after the signature commits below.
             std::optional<std::vector<unsigned char>> bound_txid;
             std::optional<std::vector<unsigned char>> bound_latch_key;
@@ -580,7 +626,19 @@ namespace lockbox {
                     }
                 }
 
-                return generate_partial_signature(statechain_id, negate_seckey, serialized_session, seed.data(), disclosure);
+                // [REQ-61] The owner's authorisation for THIS signing round. Optional on the wire
+                // while clients migrate; strict when present, for the same reason the disclosure is:
+                // "I could not read it" must never be treated as "there wasn't one".
+                std::optional<std::vector<unsigned char>> latch_sig;
+                if (req_body.count("latch_sig") != 0) {
+                    auto parsed_sig = utils::ParseHex(std::string(req_body["latch_sig"].s()));
+                    if (parsed_sig.size() != 64) {
+                        return crow::response(400, "latch_sig present but not 64 bytes");
+                    }
+                    latch_sig = parsed_sig;
+                }
+
+                return generate_partial_signature(statechain_id, negate_seckey, serialized_session, seed.data(), disclosure, latch_sig);
         
         });
 
