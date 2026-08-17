@@ -103,6 +103,26 @@ arithmetic — is expected to be **deleted**, not migrated.
 > So the order is: close V-6 → flip → migrate the sub-floor carriers → THEN retire licences and
 > delete. Deleting first is what this note exists to prevent.
 
+> **PROGRESS, 2026-08-17.** The flip is APPLIED and the licence retirement is DONE — at the gate,
+> not at the label: `flat_conveyance_licence` no longer calls the RGB-carrier or funding-not-on-chain
+> probes, both are deleted, and their `PermanentLicence` variants with them. Editing only
+> `is_legitimate_flat_reason` would have changed reporting and no gate, which is why both halves were
+> cut. Suite green at 810.
+>
+> **The deletion stops at the producer, and V-6 is why.** `split_coin` is reached from `transfer`
+> through exactly one dispatch arm, `ParentShape::Unladdered`. Once every coin is laddered that arm
+> is unreachable and the whole `branch-` lane — producer, writer, reader, and the backup-chain
+> handover with it — deletes as dead code. But laddering needs a pin, no network ships one, so on the
+> SHIPPED default nothing ladders, the arm is live, and deleting it removes a working path rather
+> than a retired one. The same gate, reached from the other side.
+>
+> What is therefore NOT yet deletable, and must not be deleted before V-6 closes: `split_coin` and
+> its `ensure_exact_coin` caller, the `branch-<id>` writer and reader, and every exit path that reads
+> that row — a sub-coin with no `branch-` row **cannot be exited at all**. Absolute deadlines are a
+> separate case and §0.3's "delete" is wrong for them as written: INV-27 keeps the flat backup chain
+> on a LADDERED coin, so the absolute-locktime calendar survives the flip and is not un-laddered-only
+> material.
+
 ### 0.4 Divergence register — where the code does not yet meet this document
 
 Each row is a defect in the CODE by §0.1. A row is removed only when the divergence is closed, never
