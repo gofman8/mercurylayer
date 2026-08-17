@@ -389,11 +389,34 @@ impl TesrParams {
     ///
     /// When a mainnet enclave is provisioned, its x-only identity goes here, and from that moment
     /// mainnet stops accepting a configured override — see `attestation_identity`.
+    /// **[V-6] The regtest enclave's attestation identity, pinned.**
+    ///
+    /// Not a magic constant and not this machine's key: it is a pure function of the SEED THIS REPO
+    /// COMMITS for its own dev stack (`docker-compose-main.yml`, the `vault-init` payload), under a
+    /// derivation the enclave states in full — `SHA256("utexo/attestation-identity/v1" ‖ seed32 ‖
+    /// counter_u8)` retried until the digest is a valid scalar, then the x-only public key
+    /// (`enclave::derive_identity_keypair`). Anyone running this repo's stack gets this key, so
+    /// pinning it is reproducible rather than local.
+    ///
+    /// `regtest_attestation_identity_is_derivable_from_the_committed_dev_seed` re-derives it in Rust
+    /// and fails if either the seed or this constant moves — the pin cannot rot into a lie without
+    /// the suite saying so.
+    ///
+    /// **Why regtest can be pinned and mainnet cannot.** A pin is only an anchor if it was obtained
+    /// OUT OF BAND — that is the whole of D69. For regtest the out-of-band channel is the repository
+    /// itself: the seed is in the tree, so the key is a fact about the source rather than about a
+    /// running server. Mainnet has no enclave provisioned, so there is no key to pin, and inventing
+    /// one would be worse than leaving it absent: a wrong pin refuses every attestation, and the
+    /// obvious "fix" is to trust the key the coordinator serves — which is exactly the hole D69
+    /// closed. It stays `None` until a mainnet enclave exists and its identity is published.
+    pub const REGTEST_ATTESTATION_IDENTITY: &str =
+        "a3c87c1dd1344e30f6374b568306f46031ed9bfa35ec73c03c61d819848c5def";
+
     pub const fn attestation_identity_const(network: &str) -> Option<&'static str> {
         // Deliberately exhaustive over the same names `for_network` knows, so adding a network
         // cannot silently inherit another's identity.
         if const_str_eq(network, "bitcoin") || const_str_eq(network, "mainnet") {
-            None // no mainnet enclave provisioned
+            None // no mainnet enclave provisioned — see REGTEST_ATTESTATION_IDENTITY's note
         } else if const_str_eq(network, "testnet")
             || const_str_eq(network, "testnet3")
             || const_str_eq(network, "testnet4")
@@ -401,7 +424,7 @@ impl TesrParams {
         {
             None // no public-testnet enclave provisioned
         } else {
-            None // regtest: per-environment seed, must be configured
+            Some(Self::REGTEST_ATTESTATION_IDENTITY)
         }
     }
 
@@ -991,6 +1014,77 @@ mod flat_ladder_params_tests {
 mod tests {
     use super::*;
 
+    /// **[V-6] The regtest pin is DERIVED, and this test is what makes that claim checkable.**
+    ///
+    /// `TesrParams::REGTEST_ATTESTATION_IDENTITY` is a 32-byte literal, and a literal is exactly the
+    /// shape of thing that rots into a lie: the dev seed could move, the enclave's derivation could
+    /// gain a version, and nothing would notice — a wrong pin refuses every attestation, and the
+    /// tempting "fix" is to trust the key the coordinator serves, which is the hole D69 closed.
+    ///
+    /// So re-derive it here from the seed THIS REPO COMMITS (`docker-compose-main.yml`, the
+    /// `vault-init` payload), under the enclave's own stated derivation
+    /// (`enclave::derive_identity_keypair`):
+    ///
+    ///   `sk = SHA256("utexo/attestation-identity/v1" ‖ seed32 ‖ counter_u8)`, counter from 0,
+    ///   retried while the digest is not a valid secp256k1 scalar; identity = x-only pubkey of `sk`.
+    ///
+    /// The counter loop is reproduced rather than assumed to land on 0 — assuming it would make the
+    /// test agree with the constant for the wrong reason on any future seed.
+    #[test]
+    fn regtest_attestation_identity_is_derivable_from_the_committed_dev_seed() {
+        use bitcoin::hashes::{sha256, Hash as _};
+        // The seed this repository ships for its own dev stack. If docker-compose-main.yml changes,
+        // this must change with it — and then the pin must too, which is the point.
+        const DEV_SEED_HEX: &str =
+            "8b10a037120cf37441bd7623da2aa488c21889017ffb4f4d303b9dbcbada5bee";
+        const DOMAIN: &[u8] = b"utexo/attestation-identity/v1";
+
+        let seed = hex::decode(DEV_SEED_HEX).expect("dev seed is hex");
+        assert_eq!(seed.len(), 32, "the enclave hashes exactly 32 seed bytes");
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let mut derived: Option<String> = None;
+        for counter in 0u8..=255 {
+            let mut preimage = DOMAIN.to_vec();
+            preimage.extend_from_slice(&seed);
+            preimage.push(counter);
+            let sk_bytes = sha256::Hash::hash(&preimage).to_byte_array();
+            // A SHA-256 digest is not guaranteed to be a valid scalar; the enclave retries, so so do
+            // we. `from_slice` rejects zero and >= n, which is the same acceptance test.
+            if let Ok(sk) = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes) {
+                let (xonly, _parity) =
+                    bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk).x_only_public_key();
+                derived = Some(hex::encode(xonly.serialize()));
+                break;
+            }
+        }
+        let derived = derived.expect("a valid scalar exists within 256 counters");
+
+        assert_eq!(
+            derived,
+            TesrParams::REGTEST_ATTESTATION_IDENTITY,
+            "the pinned regtest identity is not what this repo's committed dev seed derives. Either \
+             the seed in docker-compose-main.yml moved, or the enclave's derivation changed, or the \
+             constant was edited by hand. A pin that does not match the enclave refuses EVERY \
+             attestation, and the coin then reads as un-laddered for a reason no message explains."
+        );
+
+        // ...and the pin is actually WIRED, for the network it belongs to and no other. A constant
+        // nothing reads would satisfy the check above and protect nothing.
+        assert_eq!(
+            TesrParams::attestation_identity_const("regtest"),
+            Some(TesrParams::REGTEST_ATTESTATION_IDENTITY)
+        );
+        for provisionless in ["bitcoin", "mainnet", "testnet", "testnet3", "testnet4", "signet"] {
+            assert_eq!(
+                TesrParams::attestation_identity_const(provisionless),
+                None,
+                "{provisionless} has no enclave provisioned — pinning a key for it would anchor \
+                 trust to a server that does not exist"
+            );
+        }
+    }
+
     /// A guaranteed-valid regtest P2TR address, derived rather than hardcoded (a bad bech32m literal
     /// would make these tests fail inside spk_from_address and prove nothing).
     fn test_addr() -> String {
@@ -1516,9 +1610,10 @@ mod grid_law_tests {
         use super::TesrParams as P;
         const K: &str = "a3c87c1dd1344e30f6374b568306f46031ed9bfa35ec73c03c61d819848c5def";
 
-        // No pin compiled in (the state today on every network) + nothing configured => REFUSAL.
-        // The message must name the remedy, because a bare error here reads as an outage.
-        for net in ["bitcoin", "mainnet", "testnet", "signet", "regtest"] {
+        // No pin compiled in + nothing configured => REFUSAL. The message must name the remedy,
+        // because a bare error here reads as an outage. **regtest is no longer in this list** — it
+        // has a pin now, which is what the next block checks instead.
+        for net in ["bitcoin", "mainnet", "testnet", "signet"] {
             let e = P::attestation_identity(net, None).expect_err("no pin, no config => refuse");
             assert!(
                 e.contains("no attestation identity is available") && e.contains("B11"),
@@ -1529,7 +1624,32 @@ mod grid_law_tests {
         }
 
         // Configured, no pin => accepted, verbatim.
-        assert_eq!(P::attestation_identity("regtest", Some(K)).unwrap(), K);
+        assert_eq!(P::attestation_identity("testnet", Some(K)).unwrap(), K);
+
+        // **PIN FIRST, and the pinned case is no longer hypothetical.** regtest resolves with NO
+        // configuration at all, because the compiled-in pin is the anchor.
+        assert_eq!(
+            P::attestation_identity("regtest", None).unwrap(),
+            P::REGTEST_ATTESTATION_IDENTITY,
+            "a pinned network must resolve without configuration — that is what pinning is for"
+        );
+        // ...and a configuration that DISAGREES with the pin is REFUSED — it does not silently lose
+        // to the pin, and it certainly does not win. I expected "pin wins" here and the resolver is
+        // stricter than that, correctly: silently ignoring a configured key would leave an operator
+        // believing they had re-pointed the anchor, and a mismatch is far more likely to be a wrong
+        // build than a wrong config. Refusing says so instead of guessing which.
+        const OTHER: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let e = P::attestation_identity("regtest", Some(OTHER))
+            .expect_err("a configured key that contradicts the compiled-in pin must REFUSE");
+        assert!(
+            e.contains("does not match the one COMPILED IN") && e.contains("B11"),
+            "the refusal must name the conflict and the hole it protects: {e}"
+        );
+        // Agreeing configuration is fine — that is a redundant statement of the same anchor.
+        assert_eq!(
+            P::attestation_identity("regtest", Some(P::REGTEST_ATTESTATION_IDENTITY)).unwrap(),
+            P::REGTEST_ATTESTATION_IDENTITY
+        );
 
         // THE PROPERTY THAT MATTERS ONCE A PIN EXISTS. Simulated here rather than waiting for a
         // provisioned enclave, because the rule must be written and tested before the first key is
@@ -1556,15 +1676,27 @@ mod grid_law_tests {
     /// that network — the resolver refuses a mismatch — and update this test deliberately. A pinned
     /// key that nobody noticed being added is exactly as bad as no key at all.
     #[test]
-    fn no_network_has_a_pinned_identity_until_an_enclave_is_provisioned() {
+    fn only_regtest_has_a_pinned_identity_until_more_enclaves_are_provisioned() {
         use super::TesrParams as P;
-        for net in ["bitcoin", "mainnet", "testnet", "testnet3", "testnet4", "signet", "regtest"] {
+        // **[V-6] REGTEST IS NOW PINNED**, and this test changed with it — its predecessor asserted
+        // that NO network had a pin and said, in its own failure text, to update it in the same
+        // commit as the first one landed. This is that update, and the tripwire is kept rather than
+        // deleted: pinning a key changes the security posture of every client build, so each new
+        // network must arrive through a deliberate edit here.
+        assert_eq!(
+            P::attestation_identity_const("regtest"),
+            Some(P::REGTEST_ATTESTATION_IDENTITY),
+            "regtest's pin is the identity derived from the seed this repo commits for its own dev \
+             stack — see `regtest_attestation_identity_is_derivable_from_the_committed_dev_seed`"
+        );
+        for net in ["bitcoin", "mainnet", "testnet", "testnet3", "testnet4", "signet"] {
             assert!(
                 P::attestation_identity_const(net).is_none(),
                 "{net} now has a compiled-in attestation identity. That is the intended end state — \
                  but it changes the security posture of every client build, so update this test in \
                  the SAME commit, and make sure the mismatch-refusal in `attestation_identity` is \
-                 what you want for that network."
+                 what you want for that network. Note `SdkConfig` reads this to decide \
+                 `colored_ladder`, so pinning a network also turns ONE COIN SHAPE on for it."
             );
         }
     }

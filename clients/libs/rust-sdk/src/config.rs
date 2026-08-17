@@ -408,11 +408,17 @@ impl SdkConfig {
                 SE_INTERVAL_DEPLOYED,
                 AUTO_EXIT_MODELLED_DEPTH,
             ),
-            colored_ladder: true,
-            // [D69] `None` falls back to UTEXO_ATTESTATION_IDENTITY, which is how the repo's E2E
-            // harness pins the local lockbox. There is no default value here on purpose: a wrong
-            // pin and no pin both refuse, and a hard-coded one would be wrong on every stack but
-            // the machine it was written on.
+            // **[V-6] COUPLED, not asserted.** `colored_ladder` retires the legacy coloured-split
+            // lane, and the CTES-R lane that replaces it cannot establish a ladder without a pinned
+            // attestation identity. True with no pin is therefore not "the new default", it is a
+            // wallet that refuses token transfers permanently while telling the user to retry. So
+            // read the pin instead of stating a bool: the two can no longer disagree.
+            colored_ladder: mercurylib::tesr::TesrParams::attestation_identity_const("regtest")
+                .is_some(),
+            // [D69] `None` falls back to UTEXO_ATTESTATION_IDENTITY. The compiled-in pin above is
+            // the anchor for the repo's own stack; this field lets an operator running a DIFFERENT
+            // regtest seed override it, and there is no default value on purpose — a wrong pin and
+            // no pin both refuse.
             attestation_identity: None,
         }
     }
@@ -444,9 +450,16 @@ impl SdkConfig {
                 SE_INTERVAL_DEFAULT,
                 AUTO_EXIT_MODELLED_DEPTH,
             ),
-            colored_ladder: true,
-            // [D69] Mainnet ships no compiled-in pin yet either, so an operator MUST set this (or
-            // the environment variable) — see `TesrParams::attestation_identity_const`.
+            // **[V-6] COUPLED — and on mainnet this currently evaluates to FALSE, deliberately.**
+            // No mainnet enclave is provisioned, so no identity exists to pin, and flipping this on
+            // regardless would ship a wallet whose token lane refuses permanently. The moment a
+            // mainnet enclave publishes its identity, pinning it in
+            // `TesrParams::attestation_identity_const` turns this true with no further change —
+            // that is the whole reason it reads the pin rather than stating a literal.
+            colored_ladder: mercurylib::tesr::TesrParams::attestation_identity_const("mainnet")
+                .is_some(),
+            // [D69] Mainnet ships no compiled-in pin yet, so an operator MUST set this (or the
+            // environment variable) — see `TesrParams::attestation_identity_const`.
             attestation_identity: None,
         }
     }
@@ -521,6 +534,7 @@ mod g3_every_profile_can_finish_its_exit {
 #[cfg(test)]
 mod exit_shape_model_tests {
     use super::{tesr_exit_txs, tesr_exit_txs_for, ExitShape};
+    use crate::SdkConfig;
 
     /// The two shapes genuinely differ, and the default is the CONSERVATIVE one. A margin that
     /// guessed `Spine` for a two-tier coin would act LATE, which is the unsafe direction.
@@ -549,5 +563,43 @@ mod exit_shape_model_tests {
     #[test]
     fn the_published_depth_ten_figure_is_the_two_tier_walk() {
         assert_eq!(tesr_exit_txs(10), 23, "the published mainnet depth-10 walk is 23 transactions");
+    }
+
+    /// **[V-6] `colored_ladder` MAY NOT be true on a network with no pinned attestation identity.**
+    ///
+    /// This is the coupling that was measured the hard way: flipping `colored_ladder` retires the
+    /// legacy coloured-split lane, and the CTES-R lane that replaces it establishes ladders through
+    /// `claim()`, which refuses without a pin. A wallet in that state does not degrade — it refuses
+    /// `transfer_tokens` permanently, behind a message that says a later `claim()` will fix it. The
+    /// message is a lie no code can make true, so the configuration must be unreachable instead.
+    ///
+    /// Both constructors now READ the pin rather than stating a bool, so the two cannot disagree.
+    /// This test is what stops someone "simplifying" that back into a literal: hard-code `true` on a
+    /// network with no enclave and this fails, naming the lane that would break.
+    #[test]
+    fn colored_ladder_is_never_on_without_a_pinned_attestation_identity() {
+        for (label, cfg) in [
+            ("regtest", SdkConfig::regtest("w")),
+            ("mainnet", SdkConfig::mainnet("w", "http://se", "tcp://el")),
+        ] {
+            let pinned =
+                mercurylib::tesr::TesrParams::attestation_identity_const(label).is_some();
+            assert_eq!(
+                cfg.colored_ladder, pinned,
+                "{label}: colored_ladder is {} but a compiled-in pin is {}. True-without-a-pin ships                  a wallet whose token lane refuses forever; false-with-a-pin leaves the un-laddered                  shape alive for no reason. Read the pin, do not restate it.",
+                cfg.colored_ladder, pinned
+            );
+        }
+
+        // And the direction that actually matters today, stated on its own so the reason survives:
+        // regtest has an enclave and is ON; mainnet has none and is therefore OFF until one exists.
+        assert!(
+            SdkConfig::regtest("w").colored_ladder,
+            "the repo commits its own dev seed, so regtest HAS an anchor and must run one coin shape"
+        );
+        assert!(
+            !SdkConfig::mainnet("w", "http://se", "tcp://el").colored_ladder,
+            "no mainnet enclave is provisioned, so there is no identity to pin and no way to ladder              — turning this on would ship a permanently refusing token lane. Pin an identity in              `TesrParams::attestation_identity_const` and this flips itself."
+        );
     }
 }
