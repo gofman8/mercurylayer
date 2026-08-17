@@ -66,6 +66,33 @@ stack and it is BUILT; what it is not is DEFAULT (§0.4, row 1). Material scoped
 shape — absolute deadlines, backup-chain handover, terminal-parent proofs, the carrier-depletion
 arithmetic — is expected to be **deleted**, not migrated.
 
+> **CTES-R removes ONE of the second shape's two cases, not both — measured 2026-08-17 by flipping
+> the default and running the lanes.** Colouring a tier cannot broadcast a funding output, so "a
+> split sub-coin whose funding is un-broadcast" survives the flip unchanged. It is the permanent
+> shape of every off-chain child and every change tip, which is what the design exists to produce.
+> Three consequences, each measured rather than reasoned, because a plausible deletion order here
+> strands live coins:
+>
+> * **The flat-lane licence `PermanentLicence::FundingNotOnChain` must NOT be retired.** Its
+>   `branch-` arm is LOAD-BEARING for the plain, non-RGB split sub-coin lane — written when a
+>   receiver adopts an off-chain sub-coin, read when conveying it onward. A counterfactual with the
+>   row removed refuses the coin. Its `ctesr-` arm is defensive (children route to `child_retransfer`
+>   first) and its `spinetip-` arm is dead (tips are refused by name earlier, with a CI guard), so
+>   those two are retirable — but they are the two that look load-bearing, and the one that looks
+>   legacy is the one that carries the lane.
+> * **`FLAT_RGB_CARRIER` GAINS a producer at the flip rather than losing one.** The `was_colored`
+>   error arm is unreachable while `colored_ladder` is false; with it true, a carrier the coloured
+>   builder refuses records the reason. The class is measurably non-empty: every pre-flip
+>   1 560-sat-floor token piece is below both coloured floors and cannot even be carved, and for a
+>   wallet's own booked-but-consignment-less issuance the recorded string is the coin's ONLY licence.
+>   Retiring it strands those coins. They need a value migration, not a deletion.
+> * **`is_legitimate_flat_reason` is not the gate.** It drives the `transferable` flag on
+>   `flat_only_coins`; the decision is made by the `PermanentLicence` variant. Dropping a reason from
+>   the former mis-reports a genuinely transferable child and changes no gate.
+>
+> So the order is: close V-6 → flip → migrate the sub-floor carriers → THEN retire licences and
+> delete. Deleting first is what this note exists to prevent.
+
 ### 0.4 Divergence register — where the code does not yet meet this document
 
 Each row is a defect in the CODE by §0.1. A row is removed only when the divergence is closed, never
@@ -73,7 +100,7 @@ when the sentence is softened. Nothing here is a hidden caveat: each is also sta
 
 | # | This document specifies | The shipped build does | Consequence, and what closes it |
 |---|---|---|---|
-| **V-1** | one coin shape: every coin, carrier or not, carries a coloured ladder | `SdkConfig::colored_ladder` ships **false**, so a carrier stays un-laddered by default | The un-laddered lane and everything scoped to it stay load-bearing. What gates the flip is not safety but measured economics — [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md): one coloured partial payment per carrier, and a long unilateral exit for the child it produces |
+| **V-1** | one coin shape: every coin, carrier or not, carries a coloured ladder | `SdkConfig::colored_ladder` ships **false**, so a carrier stays un-laddered by default | **The gate is V-6, not economics — CORRECTED 2026-08-17, measured by flipping it.** This row used to read "what gates the flip is not safety but measured economics". That is wrong, and the correction is kept rather than replaced because the old sentence invites exactly the change that breaks. Flipping the two literals turns on `colored_ladder` for every wallet, which RETIRES the legacy coloured-split lane (`tokens.rs`, the `if self.inner.config.colored_ladder` gate). A carrier that CAN be coloured is then refused with "a later `claim()` pass will do it" — but `claim()` cannot ladder anything without a pinned attestation identity, and **`TesrParams::attestation_identity_const` returns `None` for EVERY network**, mainnet included (V-6). Measured live on shipped defaults: `transfer_tokens` refuses permanently, wearing a transient error message. **V-1 cannot be closed before V-6.** Economics (one coloured partial payment per carrier, a long unilateral exit for the child) is a real cost but it is not what blocks the flip |
 | **V-2** | every client verifies a conveyed ladder | the nodejs and web clients **refuse** any transfer that DECLARES a ladder, and fall through to the un-laddered `num_sigs == backups.length` check against a coordinator-supplied `interval` | Those clients are the UN-DEFENDED population, not an exempt one — the refusal keys on three SENDER-supplied fields, so it is a refusal of declared ladders, not a structural one. Closed by porting `verify_bundle` to wasm/JS and Kotlin |
 | **V-4** | the `statechain_id ↔ aggregate` binding is attested, like the count | it is coordinator-supplied and unattested | A coordinator serving NULL downgrades any coin to the un-laddered lane; serving a wrong value is not detectable in-protocol. The COUNT's half of this is closed ([TRUST-MODEL.md](TRUST-MODEL.md) B11); the binding is the half that remains |
 | **V-6** | every fresh confirmed root coin is laddered by `claim()` | **no network ships a pinned enclave attestation identity**, so on the shipped defaults EVERY laddering claim refuses and the coin stays flat | `TesrParams::attestation_identity_const` returns `None` for bitcoin/mainnet, testnet/testnet3/testnet4/signet AND regtest; `SdkConfig::regtest` and `SdkConfig::mainnet` both ship `attestation_identity: None`; the only other source is the `UTEXO_ATTESTATION_IDENTITY` environment variable, which an embedder has not set. The pass then records `LadderSkipReason::AttestationIdentityUnpinned` and continues — correctly, since verifying an attestation against a coordinator-served key proves nothing — but the effect is that "unconditionally" is conditional on configuration the product does not supply. Closed by compiling in a pin per network at release, or by an operator setting one |
