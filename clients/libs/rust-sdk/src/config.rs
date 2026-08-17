@@ -408,7 +408,7 @@ impl SdkConfig {
                 SE_INTERVAL_DEPLOYED,
                 AUTO_EXIT_MODELLED_DEPTH,
             ),
-            colored_ladder: false,
+            colored_ladder: true,
             // [D69] `None` falls back to UTEXO_ATTESTATION_IDENTITY, which is how the repo's E2E
             // harness pins the local lockbox. There is no default value here on purpose: a wrong
             // pin and no pin both refuse, and a hard-coded one would be wrong on every stack but
@@ -444,7 +444,7 @@ impl SdkConfig {
                 SE_INTERVAL_DEFAULT,
                 AUTO_EXIT_MODELLED_DEPTH,
             ),
-            colored_ladder: false,
+            colored_ladder: true,
             // [D69] Mainnet ships no compiled-in pin yet either, so an operator MUST set this (or
             // the environment variable) — see `TesrParams::attestation_identity_const`.
             attestation_identity: None,

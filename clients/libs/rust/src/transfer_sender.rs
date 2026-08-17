@@ -360,10 +360,7 @@ pub fn ladder_skip_key(statechain_id: &str, duplicate_index: u32) -> String {
 /// unreadable funding output is not the harmless legacy case), and `ladder-unreadable` is out (the
 /// conveyance path refuses such a coin before it ever reads this record).
 pub fn is_legitimate_flat_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        FLAT_RGB_CARRIER | FLAT_TERMINALIZED_CARRIER | FLAT_FUNDING_NOT_ONCHAIN | FLAT_NOT_BINDABLE
-    )
+    matches!(reason, FLAT_TERMINALIZED_CARRIER | FLAT_NOT_BINDABLE)
 }
 
 /// Is this recorded reason one a LATER `claim()` pass can clear by itself? Drives the remedy named
@@ -494,21 +491,11 @@ pub async fn clear_ladder_skip(
 /// those conditions cannot be spelled as a licence even by accident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermanentLicence {
-    /// The coin carries an RGB allocation — a plain tier spend carries no state transition and would
-    /// DESTROY it (terminal freeze). Proven by a consignment on the coin's own backup row, or by the
-    /// SDK ladder pass positively recording `rgb-carrier` (RGB state is the one authority this crate
-    /// structurally cannot consult itself).
-    RgbCarrier,
     /// The coin is flagged `single_use` — a terminalized/combine carrier, same terminal-freeze rule.
     /// Proven from the COIN's own flag, never from a record: this flag has no production setter
     /// today (its only setters have zero non-test callers), so assuming it would be assuming a state
     /// that does not exist.
     TerminalizedCarrier,
-    /// [B0] The coin's funding `F` is not on chain, so a ladder trigger would have no prevout to
-    /// spend. Proven by exit material that PARSES — a non-empty `branch-<id>` chain, or a
-    /// `ctesr-<id>` child bundle that parses AND names this coin. Never by a failed lookup, and
-    /// never by mere row existence.
-    FundingNotOnChain,
     /// The coordinator has no `aggregate_xonly` on record for the sid (a pre-migration-0009 legacy
     /// coin), so no receiver could bind a ladder built over it. Proven by the coordinator ANSWERING,
     /// this call, with a record whose aggregate is absent —
@@ -577,34 +564,6 @@ fn recorded_flat_reason(rows: &WalletRows, statechain_id: &str) -> Result<Option
         .map(Some)
 }
 
-/// LICENCE 1 — RGB CARRIER, from a consignment on the coin's own backup row or from the SDK's
-/// positive `rgb-carrier` record.
-fn licence_rgb_carrier(
-    rows: &WalletRows,
-    statechain_id: &str,
-    recorded: Option<&str>,
-) -> Result<Option<PermanentLicence>> {
-    if let Some(json) = rows.get(statechain_id) {
-        let txs: Vec<BackupTx> = serde_json::from_str(json).map_err(|e| {
-            anyhow!(
-                "statechain id {statechain_id} has a backup row that could not be parsed ({e}). \
-                 Refusing to convey it on the flat lane — this client cannot tell whether the coin \
-                 is an RGB carrier (legitimately flat) or a coin that lost its exit ladder."
-            )
-        })?;
-        if txs.iter().any(|b| b.rgb_consignment.is_some()) {
-            return Ok(Some(PermanentLicence::RgbCarrier));
-        }
-    }
-    // A booked-but-consignment-less carrier (a fresh issuance) is invisible to this crate, so the
-    // component that CAN read RGB state asserts it for us. This is the one licence a recorded string
-    // can carry on its own, and it is deliberately the narrowest possible acceptance: one exact
-    // spelling, and only that spelling.
-    if recorded == Some(FLAT_RGB_CARRIER) {
-        return Ok(Some(PermanentLicence::RgbCarrier));
-    }
-    Ok(None)
-}
 
 /// LICENCE 2 — TERMINALIZED CARRIER, proven from the coin's own `single_use` flag.
 ///
@@ -619,70 +578,6 @@ fn licence_terminalized_carrier(coin: &Coin) -> Option<PermanentLicence> {
     }
 }
 
-/// LICENCE 3 — [B0] FUNDING NOT ON CHAIN, proven by exit material that PARSES.
-///
-/// A prior round accepted `ctesr-<id>` on row EXISTENCE alone while requiring its `branch-<id>`
-/// sibling to parse — so any row under that key, valid or not, licensed the flat lane. Both must now
-/// parse, and the child bundle must additionally name THIS coin.
-fn licence_funding_not_onchain(
-    rows: &WalletRows,
-    statechain_id: &str,
-) -> Result<Option<PermanentLicence>> {
-    if let Some(json) = rows.get(&format!("branch-{statechain_id}")) {
-        let txs: Vec<BackupTx> = serde_json::from_str(json).map_err(|e| {
-            anyhow!(
-                "statechain id {statechain_id} has an exit-branch row that could not be parsed \
-                 ({e}). Refusing to convey it on the flat lane — its exit material is unreadable, \
-                 so this client cannot tell whether the coin is legitimately un-laddered."
-            )
-        })?;
-        // An EMPTY branch chain proves nothing about `F`; fall through rather than license it.
-        if !txs.is_empty() {
-            return Ok(Some(PermanentLicence::FundingNotOnChain));
-        }
-    }
-    if let Some(json) = rows.get(&format!("ctesr-{statechain_id}")) {
-        let cb: crate::tesr::ChildTesrBundle = serde_json::from_str(json).map_err(|e| {
-            anyhow!(
-                "statechain id {statechain_id} has a split-child bundle row that could not be \
-                 parsed ({e}). Refusing to convey it on the flat lane — a row we cannot read is not \
-                 evidence that the coin's funding is off chain."
-            )
-        })?;
-        if cb.child_statechain_id != statechain_id {
-            return Err(anyhow!(
-                "statechain id {statechain_id} has a split-child bundle row that names a different \
-                 coin ({}). Refusing to convey it on the flat lane — that row is not evidence about \
-                 this coin.",
-                cb.child_statechain_id
-            ));
-        }
-        return Ok(Some(PermanentLicence::FundingNotOnChain));
-    }
-    // [CATS/V4] A SPINE TIP is funded by `SP.out[K]`, which is un-broadcast — the same [B0] fact the
-    // `ctesr-` arm above proves, for the sender's own change leg instead of a received piece. Same
-    // standard of evidence, deliberately: the row must PARSE and must NAME this coin. Existence is
-    // not evidence, and a row about a different coin is not evidence about this one.
-    if let Some(json) = rows.get(&format!("{}{statechain_id}", crate::tesr::SPINE_TIP_KEY_PREFIX)) {
-        let tip: crate::tesr::SpineTipBundle = serde_json::from_str(json).map_err(|e| {
-            anyhow!(
-                "statechain id {statechain_id} has a spine-tip row that could not be parsed ({e}). \
-                 Refusing to convey it on the flat lane — a row we cannot read is not evidence that \
-                 the coin's funding is off chain."
-            )
-        })?;
-        if tip.statechain_id != statechain_id {
-            return Err(anyhow!(
-                "statechain id {statechain_id} has a spine-tip row that names a different coin \
-                 ({}). Refusing to convey it on the flat lane — that row is not evidence about this \
-                 coin.",
-                tip.statechain_id
-            ));
-        }
-        return Ok(Some(PermanentLicence::FundingNotOnChain));
-    }
-    Ok(None)
-}
 
 /// LICENCE 4 — LEGACY NO-AGGREGATE, re-proven LIVE against the coordinator.
 ///
@@ -811,13 +706,27 @@ async fn flat_conveyance_licence(
     let recorded = recorded_flat_reason(&rows, statechain_id)?;
     let recorded = recorded.as_deref();
 
-    if let Some(l) = licence_rgb_carrier(&rows, statechain_id, recorded)? {
-        return Ok(Some(l));
-    }
+    // **[ONE COIN SHAPE] LICENCE 1 AND LICENCE 3 ARE RETIRED.**
+    //
+    // With `colored_ladder` shipping TRUE, a carrier is laddered like any other coin, so
+    // "this coin is an RGB carrier" stops being a reason it may travel without a ladder. Licence 1
+    // is therefore gone, not merely unused: leaving the probe in place would keep licensing every
+    // carrier the coloured builder happens to refuse, which is the opposite of one coin shape.
+    //
+    // Licence 3 (`funding-not-onchain`) goes with it. Its three arms are NOT equivalent and the
+    // retirement is deliberate for each:
+    //   * `branch-` was the plain un-laddered split sub-coin — the shape this change exists to
+    //     remove. Its producer, `ensure_exact_coin` -> `split_coin`, is retired below.
+    //   * `ctesr-` was defensive: `UtexoWallet::transfer` routes a child to `child_retransfer`
+    //     before the flat lane, and a child that reached here died on an absence anyway.
+    //   * `spinetip-` was already dead: `execute_ex` refuses a tip BY NAME before this classifier
+    //     runs, with a CI guard on the ordering.
+    //
+    // What remains is `licence_terminalized_carrier`, which is proven from the coin's own
+    // `single_use` flag rather than from a recorded string, and `licence_legacy_no_aggregate`,
+    // which is re-proven LIVE against the coordinator. Both are evidence about the coin; the two
+    // retired here were evidence about a lane that no longer exists.
     if let Some(l) = licence_terminalized_carrier(coin) {
-        return Ok(Some(l));
-    }
-    if let Some(l) = licence_funding_not_onchain(&rows, statechain_id)? {
         return Ok(Some(l));
     }
 
@@ -2573,12 +2482,7 @@ mod flat_lane_tests {
     /// blip in a token wallet licenses that coin to convey flat forever after.
     #[test]
     fn only_permanent_reasons_license_the_flat_lane() {
-        for permanent in [
-            FLAT_RGB_CARRIER,
-            FLAT_TERMINALIZED_CARRIER,
-            FLAT_FUNDING_NOT_ONCHAIN,
-            FLAT_NOT_BINDABLE,
-        ] {
+        for permanent in [FLAT_TERMINALIZED_CARRIER, FLAT_NOT_BINDABLE] {
             assert!(
                 is_legitimate_flat_reason(permanent),
                 "'{permanent}' is a structural, permanent reason and must keep licensing the flat lane"
@@ -2599,6 +2503,20 @@ mod flat_lane_tests {
                 "[B1] '{transient}' is TRANSIENT — it must never license a flat conveyance"
             );
             assert!(is_transient_flat_reason(transient));
+        }
+        // **[ONE COIN SHAPE] RETIRED — these two used to license, and must not any more.**
+        // `rgb-carrier` licensed a carrier travelling without a ladder; with `colored_ladder`
+        // shipping true a carrier IS laddered, so the reason no longer describes a legitimate shape.
+        // `funding-not-onchain` licensed the un-laddered split sub-coin, whose producer is retired
+        // with it. Both probes are DELETED from the classifier, not merely dropped here — this
+        // predicate never gated anything (it drives `flat_only_coins`' `transferable` flag), so a
+        // change here alone would have been cosmetic. Asserting them in this group is what stops
+        // either creeping back as a licence.
+        for retired in [FLAT_RGB_CARRIER, FLAT_FUNDING_NOT_ONCHAIN] {
+            assert!(
+                !is_legitimate_flat_reason(retired),
+                "'{retired}' was RETIRED with the one-coin-shape flip and must never license again"
+            );
         }
         // Neither a licence nor a deferral: these are refusals with their own remedies.
         for other in [
@@ -2735,25 +2653,6 @@ mod flat_lane_tests {
         assert_eq!(recorded_flat_reason(&rows, "abc").unwrap().as_deref(), Some(FLAT_RGB_CARRIER));
     }
 
-    /// [B0] is proven by exit material that PARSES. A prior round accepted `ctesr-<id>` on row
-    /// EXISTENCE alone while requiring its `branch-<id>` sibling to parse.
-    #[test]
-    fn offchain_funding_needs_material_that_parses_and_names_this_coin() {
-        let row = |k: &str, v: &str| WalletRows(vec![(k.to_string(), v.to_string())]);
-        // Existence is not evidence.
-        assert!(licence_funding_not_onchain(&row("ctesr-abc", "not json"), "abc").is_err());
-        assert!(licence_funding_not_onchain(&row("ctesr-abc", "{}"), "abc").is_err());
-        assert!(licence_funding_not_onchain(&row("branch-abc", "not json"), "abc").is_err());
-        // An EMPTY branch chain proves nothing — no licence, and no error either.
-        assert_eq!(licence_funding_not_onchain(&row("branch-abc", "[]"), "abc").unwrap(), None);
-        // No rows at all: nothing learned here.
-        assert_eq!(licence_funding_not_onchain(&WalletRows(vec![]), "abc").unwrap(), None);
-        // [CATS/V4] The SPINE TIP arm holds itself to the identical standard. `{}` parses as JSON
-        // but not as a `SpineTipBundle`, so it is an error, not a licence.
-        assert!(licence_funding_not_onchain(&row("spinetip-abc", "not json"), "abc").is_err());
-        assert!(licence_funding_not_onchain(&row("spinetip-abc", "{}"), "abc").is_err());
-    }
-
     /// A terminalized carrier must be POSITIVELY proven from the coin, never assumed from a record —
     /// `single_use` is dead in production today (its only setters have no non-test callers).
     #[test]
@@ -2762,12 +2661,9 @@ mod flat_lane_tests {
             "ladderskip-abc".into(),
             format!("{{\"reason\":\"{FLAT_TERMINALIZED_CARRIER}\"}}"),
         )]);
-        // The record alone licenses NOTHING: no carrier probe accepts that spelling...
-        assert_eq!(
-            licence_rgb_carrier(&rows, "abc", Some(FLAT_TERMINALIZED_CARRIER)).unwrap(),
-            None
-        );
-        // ...and the licence comes from the coin's own flag, which no test row can fake.
+        // The record alone licenses NOTHING — and since the RGB-carrier probe was RETIRED with the
+        // one-coin-shape flip, there is no probe left that would read a spelling out of a row at
+        // all. The licence comes from the coin's own flag, which no test row can fake.
         assert_eq!(recorded_flat_reason(&rows, "abc").unwrap().as_deref(), Some(FLAT_TERMINALIZED_CARRIER));
     }
 }
