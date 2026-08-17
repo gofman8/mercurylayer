@@ -65,6 +65,14 @@ SetError validate(const std::vector<Leaf>& nodes) {
     return SetError::Ok;
 }
 
+SetError validate_for_grant(const std::vector<Leaf>& nodes) {
+    // ORDER MATTERS: unknown-root is checked FIRST, so an empty set can never fall through to the
+    // structural checks and come back Ok. `validate({})` is legitimately Ok — an empty set is not
+    // malformed — which is exactly why a grant must not use `validate` alone.
+    if (nodes.empty()) return SetError::UnknownRoot;
+    return validate(nodes);
+}
+
 bool pays_all_owed(const tx::Transaction& t,
                    const std::map<std::string, uint64_t>& obligations,
                    std::string* why) {

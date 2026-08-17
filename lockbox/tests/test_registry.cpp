@@ -220,11 +220,35 @@ int main() {
               "two outputs to the same key are summed");
     }
     {
-        // An empty obligation set is vacuously satisfied — but only when it is genuinely empty,
-        // which `validate` is responsible for distinguishing from a malformed set.
+        // An empty obligation set is vacuously satisfied AS ARITHMETIC — and that is exactly why a
+        // grant must never reach the arithmetic without first asking whether the SE knows the root.
         std::string why;
         check(registry::pays_all_owed(paying({}), {}, &why),
-              "no obligations is vacuously satisfied");
+              "no obligations is vacuously satisfied (arithmetic only)");
+    }
+
+    // ---- THE FAIL-CLOSED GATE: unknown root != owes nothing --------------------------------------
+    //
+    // This is the difference between a safe predicate and one that grants everything. Nothing
+    // populates the registry in production yet, so EVERY root is currently empty; a grant that
+    // treated empty as satisfied would authorise every collapse ever asked of it, paying no one —
+    // the precise outcome REQ-56 exists to prevent, reached through functions that are each
+    // individually correct.
+    {
+        check(registry::validate_for_grant({}) == registry::SetError::UnknownRoot,
+              "an EMPTY leaf set is UnknownRoot for a grant, not Ok");
+        check(registry::validate({}) == registry::SetError::Ok,
+              "...while plain validate() still calls an empty set well-formed — which is why a "
+              "grant must not use it alone");
+
+        std::vector<registry::Leaf> good{leaf("A", "", 1000, 0xa1), leaf("B", "A", 1000, 0xb1)};
+        check(registry::validate_for_grant(good) == registry::SetError::Ok,
+              "a known root with well-formed leaves passes the grant gate");
+
+        // A malformed non-empty set must still be caught by the grant gate, not just by validate.
+        std::vector<registry::Leaf> orphan{leaf("B", "MISSING", 1, 0xb1)};
+        check(registry::validate_for_grant(orphan) == registry::SetError::ParentNotInSet,
+              "the grant gate still refuses a set whose parent is missing");
     }
 
     if (failures) {

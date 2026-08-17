@@ -63,7 +63,26 @@ enum class SetError {
     MissingExitKey,
     BadExitKeyLength,
     ParentNotInSet,
+    /// The SE has NO leaves for this root. Distinct from "this root owes nothing", and conflating
+    /// the two is the most dangerous mistake available here — see `validate_for_grant`.
+    UnknownRoot,
 };
+
+/// The check a `collapse_grant` MUST make before any payment arithmetic: does the SE know this root
+/// at all?
+///
+/// # Why this is separate from `validate`, and why it is the difference between safe and catastrophic
+///
+/// An EMPTY leaf set produces an empty `owed`, and `pays_all_owed` satisfies an empty obligation set
+/// vacuously — correctly, as arithmetic. But "I have no leaves for this root" does not mean "this
+/// root owes nobody". It means **the SE does not know**, and those two must never be conflated:
+/// while nothing populates the registry, EVERY root is empty, so a predicate that treats empty as
+/// satisfied would grant every collapse ever asked of it, paying no one. That is precisely the
+/// outcome REQ-56 exists to prevent, arrived at by a function that is individually correct.
+///
+/// SPEC §5.4 says this in its pseudocode — `T = tree[root_sid]  # absent => REFUSE (fail closed)` —
+/// and the rule is stated here in code so a caller cannot reach the arithmetic without passing it.
+SetError validate_for_grant(const std::vector<Leaf>& nodes);
 
 /// Structural checks on the leaf set itself, before any payment arithmetic.
 ///
