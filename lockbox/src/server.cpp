@@ -167,8 +167,35 @@ namespace lockbox {
                     // by this signature — refusing here would brick any shape the SE does not yet
                     // model, and an un-armed latch fails OPEN in the same way the system behaved
                     // before it existed.
+                    //
+                    // BUT NOT EVERY TIER CARRIES A USABLE KEY, and arming from the wrong one is a
+                    // latent brick. Of the tier builders in `lib/src/tesr.rs`, four pay
+                    // `to_address` — the coin's own AGGREGATE (2-of-2) address — and only the state
+                    // tiers pay `owner_address`, the holder's unilateral backup key. A latch armed
+                    // to the aggregate could never be satisfied: signing under it needs the SE,
+                    // which is the very thing the latch gates. The coin would be bricked the moment
+                    // enforcement went on.
+                    //
+                    // The SE can tell them apart without being told, because it already has the
+                    // prevout: a tier that pays BACK to the key it spends is staying in the 2-of-2,
+                    // and a tier that pays ELSEWHERE is the one handing control to a unilateral
+                    // owner. So arm only when the payload key differs from the input's key.
+                    //
+                    // Measured on the live lane before this guard existed: sdk92's latch armed to
+                    // the backup key correctly — but only because a state tier happened to bind
+                    // first. That is ordering luck, not a property.
                     if (const auto po = witness::payload_output(*parsed_disclosure)) {
-                        bound_latch_key = po->xonly;
+                        const auto prevout_spk =
+                            utils::ParseHex(disclosure->prevout_spks_hex.empty()
+                                                ? std::string()
+                                                : disclosure->prevout_spks_hex[0]);
+                        const auto prevout_key = tx::p2tr_xonly_key(prevout_spk);
+                        if (!prevout_key || *prevout_key != po->xonly) {
+                            bound_latch_key = po->xonly;
+                        } else {
+                            CROW_LOG_INFO << "LATCH_SKIP_AGGREGATE statechain " << statechain_id
+                                          << " (tier pays back to the key it spends)";
+                        }
                     }
                 } else {
                     // Unreachable in practice: `bind` parsed the same hex a moment ago. Logged

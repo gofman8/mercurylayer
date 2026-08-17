@@ -1093,6 +1093,24 @@ tier the only other output is the P2A anchor, whose script is `OP_1 <2-byte>` an
 so the payload output is unique and the index is derived rather than trusted. If a tier does not have
 exactly one P2TR output, the SE MUST refuse rather than pick one.
 
+**(a2) NOT EVERY TIER CARRIES A LATCHABLE KEY, and arming from the wrong one BRICKS the coin.**
+Of the tier builders in `lib/src/tesr.rs`, four pay `to_address` — the coin's own **aggregate**
+(2-of-2) address — and only the state tiers pay `owner_address`, the holder's **unilateral backup
+key**. A latch armed to the aggregate can never be satisfied: signing under it requires the SE,
+which is the very thing the latch gates. Since the latch is write-once, such a coin is
+**permanently unable to be co-signed** the moment enforcement is switched on.
+
+The SE MUST therefore arm only from a tier that hands control OUTWARD, and it can tell without
+being told: **a tier that pays back to the key it spends is staying in the 2-of-2; a tier that pays
+elsewhere is the one handing control to a unilateral owner.** The prevout is already in the
+disclosure, so the rule is `arm iff payload_key != prevout_key` — structural, like REQ-61(a), and
+requiring no client declaration of tier type.
+
+MEASURED on a deposit+ladder: of 4 bound co-signatures, **3 pay back to the aggregate and 1 pays the
+backup key** — and it is the latter that arms. Before this rule existed the latch armed from
+whichever tier bound first and happened to be right by ordering alone; on a run where a trigger
+bound first it would have captured the aggregate key and bricked the coin under enforcement.
+
 **(b) The latch CANNOT bind every co-signature under the sid — it binds from establishment onward.**
 As written ("every co-signature under that sid") the rule is unsatisfiable: a leaf's tiers are
 co-signed by the **PAYER**, under the CHILD's sid, before the payee holds anything
