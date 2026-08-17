@@ -167,6 +167,16 @@ namespace db_manager {
                          bool& found,
                          std::string& error_message);
 
+    // ── [REQ-54 R2] RELEASE ──────────────────────────────────────────────────────────────────────
+
+    /// Record that this leaf's holder has consented to be discharged off-chain. MONOTONE: inserted,
+    /// never deleted, never updated. A release that could be un-said would let an operator move a
+    /// holder into or out of the frontier after the fact.
+    bool record_release(const std::string& statechain_id, std::string& error_message);
+
+    /// `released` is assigned on every path, so an unknown sid can never read as released.
+    bool is_released(const std::string& statechain_id, bool& released, std::string& error_message);
+
     // ── [REQ-61] THE OWNER LATCH ─────────────────────────────────────────────────────────────────
 
     /// Arm the latch for `statechain_id`, WRITE-ONCE. `armed_now` is true only when this call is the

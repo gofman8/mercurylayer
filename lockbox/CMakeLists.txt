@@ -211,6 +211,15 @@ if(BUILD_LOCKBOX_TESTS)
     target_include_directories(test_registry_db PRIVATE include tests)
     target_link_libraries(test_registry_db PRIVATE
         pqxx tomlplusplus::tomlplusplus secp256k1_zkp OpenSSL::SSL OpenSSL::Crypto)
+
+    # [REQ-54 R2] /release, against the real verifier and a real database. Same reasoning: no
+    # Postgres during `docker build`, so this is run explicitly rather than skipped silently.
+    add_executable(test_release_route tests/test_release_route.cpp src/auth.cpp src/tx.cpp
+                                      src/registry.cpp src/db_manager.cpp src/utils.cpp
+                                      src/monocypher.c)
+    target_include_directories(test_release_route PRIVATE include tests)
+    target_link_libraries(test_release_route PRIVATE
+        pqxx tomlplusplus::tomlplusplus secp256k1_zkp OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # Copy Settings.toml after building MercuryLockbox

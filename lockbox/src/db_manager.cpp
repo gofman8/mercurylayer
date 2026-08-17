@@ -158,6 +158,17 @@ namespace db_manager {
                 // xonly(payload output of the tier the SE was asked to sign), read STRUCTURALLY as
                 // the unique P2TR output (REQ-61a) — never at a client-supplied index.
                 "latch_key BYTEA NOT NULL);");
+            // [REQ-54 R2] A leaf's holder consenting to be discharged. Keyed by sid alone for the
+            // same reason as the latch: it is a fact about one coin and needs no tree.
+            //
+            // MONOTONE — inserted, never deleted, never updated. SPEC calls a release "a consent
+            // record, not a spending authorisation": once a holder has said "I have migrated, do not
+            // pay me on chain", a path that could un-say it would let an operator re-add them to the
+            // frontier, or remove them from it, after the fact.
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_released ( "
+                "statechain_id varchar(50) PRIMARY KEY, "
+                "released_at TIMESTAMPTZ NOT NULL DEFAULT now());");
             txn.exec(
                 "CREATE TABLE IF NOT EXISTS se_release_nonce ( "
                 "statechain_id varchar(50) NOT NULL, "
@@ -900,6 +911,40 @@ namespace db_manager {
                 statechain_id = rows[0][0].as<std::string>();
                 found = true;
             }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool record_release(const std::string& statechain_id, std::string& error_message) {
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // Idempotent: a holder who releases twice has consented twice, which is the same fact.
+            txn.exec_params(
+                "INSERT INTO se_released (statechain_id) VALUES ($1) ON CONFLICT DO NOTHING;",
+                statechain_id);
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool is_released(const std::string& statechain_id, bool& released, std::string& error_message) {
+        released = false;  // assigned on every path
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT 1 FROM se_released WHERE statechain_id = $1;", statechain_id);
+            released = !rows.empty();
             txn.commit();
             return true;
         } catch (std::exception const& e) {

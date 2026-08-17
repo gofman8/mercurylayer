@@ -1,4 +1,5 @@
 #include "server.h"
+#include "../include/auth.h"
 #include "../include/witness.h"
 #include <crow.h>
 #include <openssl/rand.h>
@@ -605,6 +606,67 @@ namespace lockbox {
         // verification time and then verified against it would be checking a signature against a key
         // from the same party in the same conversation, which proves nothing. It is an anchor only
         // once it is pinned OUT OF BAND, which is the whole point of D69 option (a).
+        // ── [REQ-54 R2] /release — the SE's FIRST authenticated route ────────────────────────────
+        //
+        // A leaf's holder consents to being discharged off-chain by signing
+        // `tagged("utexo/leaf_release/v1", sid || nonce32)` under the coin's LATCH key — the key
+        // read from the money itself at establishment (REQ-61a), not one the caller names here.
+        //
+        // This is a CONSENT RECORD, not a spending authorisation. It moves the leaf out of what
+        // REQ-56 forces the collapse to pay on chain; it authorises no transaction and moves no
+        // coin. That distinction is why a release is safe to accept from anyone holding the key.
+        //
+        // ORDER IS LOAD-BEARING: verify the signature FIRST (no state changes on a bad one), then
+        // consume the nonce (single-use, enforced by a PRIMARY KEY collision rather than a
+        // check-then-act that races the replay it exists to stop), then record. A burned nonce with
+        // no release is recoverable — the holder retries with a fresh one. The reverse is not.
+        CROW_ROUTE(app, "/release")
+        .methods("POST"_method)([](const crow::request& req) {
+            auto body = crow::json::load(req.body);
+            if (!body) return crow::response(400, "malformed json");
+            if (body.count("statechain_id") == 0 || body.count("nonce") == 0 ||
+                body.count("sig") == 0) {
+                return crow::response(400, "required: statechain_id, nonce, sig");
+            }
+            const std::string statechain_id = body["statechain_id"].s();
+            const auto nonce = utils::ParseHex(std::string(body["nonce"].s()));
+            const auto sig = utils::ParseHex(std::string(body["sig"].s()));
+            if (nonce.size() != 32) return crow::response(400, "nonce must be 32 bytes");
+            if (sig.size() != 64) return crow::response(400, "sig must be 64 bytes");
+
+            // FAIL CLOSED on an unlatched coin. A coin with no latch has no key the SE can hold a
+            // release to, so accepting one would mean accepting an unauthenticated assertion that a
+            // holder has been discharged — exactly the operator declaration REQ-67 says the absentee
+            // cannot be asked to trust.
+            std::vector<unsigned char> latch_key;
+            bool has_latch = false;
+            std::string err;
+            if (!db_manager::get_latch(statechain_id, latch_key, has_latch, err)) {
+                return crow::response(500, "could not read the latch: " + err);
+            }
+            if (!has_latch) {
+                return crow::response(409, "this statechain has no owner latch; nothing can release it");
+            }
+
+            if (!auth::verify_release(latch_key, statechain_id, nonce, sig)) {
+                return crow::response(401, "release signature does not verify under the owner latch");
+            }
+
+            if (!db_manager::consume_release_nonce(statechain_id, nonce, err)) {
+                // Either a replay (the PRIMARY KEY collided) or a database failure. Both refuse: a
+                // replayed release is the thing the nonce exists to stop.
+                return crow::response(409, "release nonce refused: " + err);
+            }
+
+            if (!db_manager::record_release(statechain_id, err)) {
+                return crow::response(500, "release verified but could not be recorded: " + err);
+            }
+
+            CROW_LOG_INFO << "LEAF_RELEASED statechain " << statechain_id;
+            crow::json::wvalue result({{"released", true}});
+            return crow::response{result};
+        });
+
         CROW_ROUTE(app,"/attestation_identity")
         ([&seed](){
             crow::json::wvalue result;
