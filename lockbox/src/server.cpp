@@ -128,6 +128,9 @@ namespace lockbox {
             // Absent disclosure is NOT refused here: binding is opt-in per request while clients are
             // migrated. Routes that must have it enforce that themselves — a blanket requirement at
             // this layer would brick every existing client on deploy.
+            //
+            // Set only on a successful bind, and consumed only after the signature commits below.
+            std::optional<std::vector<unsigned char>> bound_txid;
             if (disclosure.has_value()) {
                 std::vector<unsigned char> bound_sighash;
                 std::string detail;
@@ -141,31 +144,22 @@ namespace lockbox {
                 // binding nothing. sdk92 counts these lines across its honest half and requires > 0.
                 CROW_LOG_INFO << "WITNESS_BIND_MATCH statechain " << statechain_id;
 
-                // ── [REQ-56] THE SE'S OWN INDEX, WRITTEN ONLY WHEN BOUND ─────────────────────────
+                // ── [REQ-56] COMPUTE the txid here; RECORD it only once a signature exists ───────
                 //
-                // A child's tier spends `(SP.txid, j)`. Resolving that outpoint to a sid is what
-                // makes the registry's parent edge SE-AUTHORED instead of client-asserted, and an
-                // asserted edge would let a caller graft its leaf onto someone else's tree — the
-                // frontier decides who gets paid.
+                // Deliberately NOT written yet. An earlier version recorded at this point, which is
+                // before the spend-budget gate (410) and before the secnonce is consumed (400) — so
+                // a request that was ultimately REFUSED still left a permanent row. Measured, not
+                // theorised: sdk92's [b2] probe took a 400 and its row was already committed.
                 //
-                // Placed INSIDE the match branch deliberately. Recording an unbound co-signature
-                // would index a transaction the SE never verified, making the tree look
-                // authoritative while resting on the caller's word. The tree is therefore exactly
-                // as trustworthy as the binding that produced it, never more.
-                //
-                // A failure here does NOT refuse the signature: the co-signature is a separate
-                // obligation, already earned by the checks above, and dropping it because a
-                // bookkeeping write failed would turn a database hiccup into a stuck coin. The miss
-                // is logged loudly instead — a gap in the index is visible later as a leaf whose
-                // parent cannot be resolved, which the predicate refuses on (SetError::ParentNotInSet).
+                // That made the index a free, caller-chosen, permanent write: combined with
+                // `ON CONFLICT (txid) DO NOTHING`, whoever wrote a txid first owned it forever, at
+                // no cost in budget or nonces. The row is now written after
+                // `store_partial_sig_and_increment` commits, so a row means the SE actually produced
+                // and counted a co-signature for these bytes — which costs the caller a real slot on
+                // a coin it controls.
                 const auto parsed_disclosure = tx::parse_hex(disclosure->unsigned_tx_hex);
                 if (parsed_disclosure) {
-                    const auto id = tx::txid(*parsed_disclosure);
-                    std::string rec_err;
-                    if (!db_manager::record_signed_tx(id, statechain_id, 0, rec_err)) {
-                        CROW_LOG_WARNING << "WITNESS_BIND_INDEX_MISS statechain " << statechain_id
-                                         << ": " << rec_err;
-                    }
+                    bound_txid = tx::txid(*parsed_disclosure);
                 } else {
                     // Unreachable in practice: `bind` parsed the same hex a moment ago. Logged
                     // rather than assumed, because "cannot happen" is how an index quietly goes
@@ -274,6 +268,34 @@ namespace lockbox {
                 statechain_id, session_key, partial_sig_hex, store_error);
             if (!stored) {
                 return crow::response(500, "Failed to persist signature count: " + store_error);
+            }
+
+            // ── [REQ-56] THE SE'S OWN INDEX — written only now that a signature EXISTS ───────────
+            //
+            // A child's tier spends `(SP.txid, j)`, and resolving that outpoint to a sid needs a
+            // table only the SE can write. Written here, after `store_partial_sig_and_increment`
+            // commits, so a row means "the SE produced and counted a co-signature over these bytes"
+            // rather than merely "someone presented a self-consistent disclosure". Writing it at the
+            // binding gate instead made the row free: budget and secnonce are checked AFTER that
+            // point, so refused requests were still recorded permanently.
+            //
+            // A failure here does NOT fail the request: the signature is already produced, counted,
+            // and about to be returned. Refusing now would tell the client its co-signature failed
+            // while the count says otherwise — a desync far worse than a missing index row, which
+            // surfaces later as a leaf whose parent will not resolve and which the predicate already
+            // refuses on (SetError::ParentNotInSet).
+            //
+            // WHAT THIS ROW STILL DOES NOT MEAN. Binding proves the disclosed transaction reproduces
+            // the session being signed; the SE never learns the coin's AGGREGATE key (it stores only
+            // its own share), so it cannot check the session belongs to this coin. A row therefore
+            // attests "signed under this sid", NOT "is a tier of this coin". Do not resolve a parent
+            // edge through this table until that gap is closed.
+            if (bound_txid) {
+                std::string rec_err;
+                if (!db_manager::record_signed_tx(*bound_txid, statechain_id, 0, rec_err)) {
+                    CROW_LOG_WARNING << "WITNESS_BIND_INDEX_MISS statechain " << statechain_id
+                                     << ": " << rec_err;
+                }
             }
 
             crow::json::wvalue result({{"partial_sig", partial_sig_hex}});

@@ -766,12 +766,22 @@ true at realistic payment velocities.
 > that happen to agree. `sdk71` independently exercises the same lane end to end — laddering,
 > conveyance and claim — at **14 bound / 14 co-signatures, 0 refusals** across 7 statechains.
 >
-> **Two limits remain.** (1) Binding is **opt-in per request**: an absent disclosure is still served,
-> so a malicious client can simply decline to be bound. Making it mandatory is a deploy-ordering
-> change that breaks any un-migrated JS/Kotlin client. (2) The **coloured multi-input** path is fixed
-> (it now discloses input `i` against the full prevout set, where it previously claimed index 0 and a
-> single prevout) but **no test exercises it with a disclosure**, so that path is compiled-correct
-> and live-unproven. Neither may be described as done.
+> **THE LIMIT THAT MATTERS: binding is a SELF-CONSISTENCY check, not proof of ownership.**
+> `witness::bind` receives no statechain id and no coin key; it rebuilds the session from the
+> `agg_pubkey`, `agg_nonce`, `blinding_factor` and `out_tweak` the CALLER supplied and compares it
+> against the session the CALLER sent. It therefore proves *"this transaction produces the session
+> you asked me to sign"* — which is exactly the anti-blind-signing property it was built for, and
+> what the one-satoshi test measures — but **not** that the transaction is a tier of the named coin.
+> A blind SE cannot prove the latter: it stores only its own key share and never the coin's
+> aggregate key, so it has nothing to compare against. See REQ-65 for the full statement and for what
+> it forbids (no parent edge may be resolved from the SE's index until this is closed).
+>
+> **Two further limits.** (1) Binding is **opt-in per request**: an absent disclosure is still
+> served, so a malicious client can simply decline to be bound. Making it mandatory is a
+> deploy-ordering change that breaks any un-migrated JS/Kotlin client. (2) The **coloured
+> multi-input** path is fixed (it now discloses input `i` against the full prevout set, where it
+> previously claimed index 0 and a single prevout) but **no test exercises it with a disclosure**, so
+> that path is compiled-correct and live-unproven. None of the three may be described as done.
 >
 > **A measurement trap worth stating, because it cost a full diagnosis.** `claim()` silently declines
 > to ladder when the SE's attestation identity is unpinned; the reason is *recorded, not raised*
@@ -982,11 +992,35 @@ because conveyance builds the child's tiers to the receiver's address. So a paye
 **never claimed at all** is nonetheless in the frontier, and REQ-56 forces `C` to pay them their full
 funding value at their own key. Claiming is required to *spend*, never to *be paid*.
 
-The word "witnessed" is load-bearing and is what REQ-57 buys: the SE reads `exit_key` and
-`fund_value` out of a transaction whose sighash it recomputed and whose session it byte-compared, so
-both are facts it verified rather than fields a client asserted. Recording either from an unbound
-request would make the whole frontier an operator declaration, which is exactly what REQ-67 says the
-absentee cannot be asked to trust.
+**What "witnessed" does and does NOT mean — corrected 2026-08-17 after measuring the code.**
+An earlier draft of this paragraph said the SE reads `exit_key` and `fund_value` "out of a
+transaction whose sighash it recomputed and whose session it byte-compared, so both are facts it
+verified rather than fields a client asserted." The first half is true. The conclusion was too
+strong, and the difference matters to exactly the party this requirement protects.
+
+`witness::bind` takes **no statechain id and no coin key**. It rebuilds the session from the
+`agg_pubkey`, `agg_nonce`, `blinding_factor` and `out_tweak` **the caller supplied**, and compares
+against the session the caller sent. So binding establishes one thing: *the disclosed transaction,
+hashed against the disclosed prevouts under the disclosed keys, produces the session you asked me to
+sign.* Every input is the caller's. It is a self-consistency check.
+
+That is genuinely worth having — it is what stops "sign session `S`, which is over this benign
+transaction" when `S` is really over a different one, and `sdk92` measures it with a one-satoshi lie
+that the session comparison refuses. **It does not establish that the transaction is a tier of the
+coin whose sid was named.**
+
+**And a blind SE structurally cannot establish that.** The lockbox stores its own key share
+(`public_key` in `generated_public_key`) and never the coin's AGGREGATE key — that is what blindness
+means here. With no aggregate key it has nothing to compare `agg_pubkey` against. This is a
+consequence of the design, not a missing check, and any proposal to close it MUST say plainly which
+part of the SE's blindness it is giving up.
+
+**Consequences that must not be glossed.** `exit_key` and `fund_value` recorded at establishment are
+witnessed *in the weaker sense*: they come from a transaction the SE bound, not from one it can tie
+to the coin. Until that gap is closed, an entry in the SE's index attests "signed under this sid",
+never "is a tier of this coin" — so a **parent edge MUST NOT be resolved through it**, because
+REQ-56's frontier decides who is paid in a collapse and an absentee has no recourse afterwards
+(REQ-67).
 
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
 raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same
