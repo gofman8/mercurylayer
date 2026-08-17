@@ -1277,9 +1277,9 @@ not of the round machinery.
 
 **One row is MEASURED, and it is the one that is live today.** The non-exact Lightning receive path
 oversizes the fronted piece by a fixed reserve — `IN_LADDER_TIER_RESERVE = 2000`
-(`clients/libs/rust-sdk/src/ssp.rs:664`), whose own comment reads "the SSP bears it (its cost of
+(`IN_LADDER_TIER_RESERVE`, `clients/libs/rust-sdk/src/ssp.rs`), whose own comment reads "the SSP bears it (its cost of
 fronting a non-exact amount)" — while the reference SSP's fee defaults to **zero**
-(`SSP_FEE_SATS … unwrap_or(0)`, `clients/apps/ssp-server/src/main.rs:110`). So on shipped defaults the
+(`SSP_FEE_SATS … unwrap_or(0)`, `clients/apps/ssp-server/src/main.rs`). So on shipped defaults the
 only liquidity lane that actually runs today gives up **at least** 2 000 sat per non-exact receive and
 charges nothing for it — at least, because the split tier's own fee falls on the SSP's change leg on
 top of the reserve. Two refinements, so the number is not repeated more precisely than it is true:
@@ -2011,7 +2011,7 @@ unbuilt sections, and they are marked as such in place.
 | REQ-53, REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no freeze at grant time. See the status banner in §5.4 |
 | REQ-69…REQ-74 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written. **REQ-74 is a live defect rather than a design note**: it records that nothing constrains `f_next`, so REQ-53's "there is no separate deposit" is currently unenforced |
 
-**Suite sizes.** Workspace unit + guard tests: **805**, 0 failures (`cargo test --workspace --tests`).
+**Suite sizes.** Workspace unit + guard tests: **811**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.
 
 ## 13. Query, utility & invoice API
