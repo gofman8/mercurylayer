@@ -1022,6 +1022,34 @@ never "is a tier of this coin" — so a **parent edge MUST NOT be resolved throu
 REQ-56's frontier decides who is paid in a collapse and an absentee has no recourse afterwards
 (REQ-67).
 
+**REQ-68 (closing the gap requires a DEPOSIT-protocol change, and the SE cannot do it alone).**
+The obvious fix — have the SE compare the disclosed `agg_pubkey` against the coin's aggregate key —
+is **not buildable today**, and the reason is structural rather than an oversight: `/get_public_key`
+accepts only a `statechain_id`. The SE mints its own keypair, returns its share, and **never learns
+the client's public key**, so it can neither store nor derive the aggregate. There is nothing to
+compare against.
+
+Two candidate closures, and the difference between them is the whole question:
+
+* **Client asserts the aggregate at deposit.** Insufficient on its own. An adversary can assert a
+  VICTIM's aggregate for its own sid, and nothing detects it — the SE has no way to tell whose
+  aggregate it was handed. First-writer-wins on a uniqueness constraint only moves the race.
+* **Client supplies its OWN public key at deposit; the SE DERIVES the aggregate.** Sound, because
+  the aggregate is then a function of the SE's per-sid key share and the declared client key. An
+  adversary who declares a victim's client key still gets a *different* aggregate, since its sid's
+  server share differs — it cannot make its own coin's aggregate equal anyone else's. This is the
+  closure the spec recommends.
+
+**The cost is privacy, and it MUST be stated rather than discovered.** An SE that knows a coin's
+aggregate key knows its funding address, i.e. which on-chain output it is guarding — which today it
+does not. Note the price is **already paid on any bound request**: a disclosure carries
+`agg_pubkey` and the transaction, so every use of REQ-57 reveals both. Deriving the aggregate at
+deposit makes that unconditional instead of per-request, which is a real change for a client that
+declines to disclose. Whether to spend it is an **operator decision, not an implementation detail**,
+and until it is taken the frontier cannot rest on SE-authored parenthood.
+
+Anything built in the meantime MUST NOT present the SE's index as authority on parenthood.
+
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
 raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same
 outpoint — each independently predicate-checked — because they conflict and at most one confirms.
@@ -1664,7 +1692,9 @@ unbuilt sections, and they are marked as such in place.
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
 | REQ-49…REQ-52 (§5.3, the sweep) | **NONE — design, not built.** See the status banner in §5.3 |
 | REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE; the same bytes with the correct value not refused), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. **Open:** binding is opt-in per request; the coloured multi-input path is fixed but unexercised |
-| REQ-53…REQ-56, REQ-58…REQ-67 (§5.4, the rest of the round) | **NONE — design, not built.** No leaf registry, no frontier, no `collapse_grant`. See the status banner in §5.4 |
+| REQ-56 (§5.4, the predicate + registry) | **PARTIAL.** The decision procedure is built and pinned: `lockbox/tests/test_registry.cpp` (23 checks — fork, released sibling, shared exit key, one-satoshi shortfall, INV-Q). The storage is built and pinned against a live Postgres: `lockbox/tests/test_registry_db.cpp` (26 checks — idempotent establish, monotone release, single-use nonce by PRIMARY KEY, freeze as a ratchet). **NOT built:** nothing populates it in production, and no `collapse_grant` route exists |
+| REQ-68 (§5.4, why parenthood is not yet SE-authored) | **MEASURED, and it is a blocker.** `/get_public_key` takes only a `statechain_id`, so the SE never learns the client's key and cannot derive the coin's aggregate — see REQ-68 for the two candidate closures and the privacy cost of the sound one. Until it is decided, `se_signed_tx` is an audit trail only |
+| REQ-53…REQ-55, REQ-58…REQ-67 (§5.4, the rest of the round) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no `/release`, no latch. See the status banner in §5.4 |
 
 **Suite sizes.** Workspace unit + guard tests: **805**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.
