@@ -171,6 +171,12 @@ pub enum LadderSkipReason {
     /// NOTHING. Kept distinct from [`Self::CoordinatorUnavailable`] because that one tells the
     /// operator to wait, and waiting for a configuration value to appear is not a plan.
     AttestationIdentityUnpinned,
+    /// A pin IS configured and the enclave's attestation does not verify against it. **PERMANENT**
+    /// for this configuration and licenses NOTHING. Split out of [`Self::CoordinatorUnavailable`],
+    /// which used to absorb it because the classifier tested only whether a pin RESOLVES — so a
+    /// present-but-wrong pin was reported as a coordinator outage while the coordinator was
+    /// answering 200.
+    AttestationInvalid,
     /// The ladder could not be bound for a reason that is NOT the pre-0009 legacy case: the funding
     /// output is not v1 taproot, its scriptPubKey would not decode, or the coordinator's aggregate
     /// does not control `F` (a decoy-shaped coin). Distinct from [`Self::NotBindable`] on purpose —
@@ -209,6 +215,7 @@ impl LadderSkipReason {
             Self::AttestationIdentityUnpinned => {
                 mercuryrustlib::transfer_sender::FLAT_ATTESTATION_UNPINNED
             }
+            Self::AttestationInvalid => mercuryrustlib::transfer_sender::FLAT_ATTESTATION_INVALID,
             Self::BindingUnresolved => mercuryrustlib::transfer_sender::FLAT_BINDING_UNRESOLVED,
             Self::EstablishFailed => mercuryrustlib::transfer_sender::FLAT_ESTABLISH_FAILED,
             Self::DuplicateDeposit => mercuryrustlib::transfer_sender::FLAT_DUPLICATE_DEPOSIT,
@@ -229,6 +236,7 @@ impl LadderSkipReason {
             LadderSkipReason::NotBindable,
             LadderSkipReason::CoordinatorUnavailable,
             LadderSkipReason::AttestationIdentityUnpinned,
+            LadderSkipReason::AttestationInvalid,
             LadderSkipReason::BindingUnresolved,
             LadderSkipReason::EstablishFailed,
             LadderSkipReason::DuplicateDeposit,

@@ -21,7 +21,8 @@
 
 namespace lockbox {
 
-    crow::response generate_new_keypair(const std::string& statechain_id,  unsigned char *seed) {
+    crow::response generate_new_keypair(const std::string& statechain_id,  unsigned char *seed,
+                                        const std::optional<std::vector<unsigned char>>& client_pubkey) {
         auto new_key_pair_response = enclave::generate_new_keypair(seed);
 
         std::string error_message;
@@ -38,6 +39,31 @@ namespace lockbox {
         }
 
         std::string server_pubkey_hex = utils::key_to_string(new_key_pair_response.server_pubkey, 33);
+
+        // ── [REQ-68] DERIVE the coin's aggregate here, from the client's key and the share just
+        // minted. Operator decision 2026-08-17: the SE computes it and never accepts one, because
+        // the party that would supply it is the party REQ-56's frontier is checked against.
+        //
+        // Optional while clients migrate. A coin with no stored aggregate simply is not checked
+        // (D24 already ignores legacy coins); refusing here would brick every pre-existing coin and
+        // every un-migrated client on deploy.
+        if (client_pubkey.has_value()) {
+            std::vector<unsigned char> server_pub(
+                new_key_pair_response.server_pubkey,
+                new_key_pair_response.server_pubkey + 33);
+            const auto aggregate = auth::derive_aggregate_xonly(*client_pubkey, server_pub);
+            if (!aggregate) {
+                // The client key did not parse or the arithmetic failed. Refuse the KEYGEN rather
+                // than create a coin the SE can never check — this is the one place where failing
+                // closed costs nothing, because no coin exists yet.
+                return crow::response(400, "client public key is not a valid 33-byte point");
+            }
+            std::string agg_err;
+            if (!db_manager::store_aggregate(statechain_id, *aggregate, agg_err)) {
+                return crow::response(500, "could not store the derived aggregate: " + agg_err);
+            }
+            CROW_LOG_INFO << "AGGREGATE_DERIVED statechain " << statechain_id;
+        }
 
         crow::json::wvalue result({{"server_pubkey", server_pubkey_hex}});
         return crow::response{result};
@@ -186,6 +212,47 @@ namespace lockbox {
                 if (r != witness::BindResult::Match) {
                     return crow::response(400, std::string("witness binding refused: ") + detail);
                 }
+                // ── [REQ-68] IS THIS TRANSACTION EVEN THIS COIN'S? ──────────────────────────────
+                //
+                // Binding proves the disclosure reproduces the session — and every input to that is
+                // the CALLER's, so on its own it says nothing about which coin the transaction
+                // belongs to. This is the check that closes it: the disclosed `agg_pubkey` must be
+                // the aggregate the SE DERIVED for this sid at keygen.
+                //
+                // Without it, `se_signed_tx` records "the first sid that presented a valid binding"
+                // rather than the owner, and a parent edge resolved through it could be claimed by
+                // whoever registers a txid first.
+                //
+                // FAILS OPEN when no aggregate is stored: that means an old client sent no key
+                // (D24 ignores legacy coins), and refusing would brick every pre-existing coin.
+                // Failing open here is safe precisely because the frontier MUST NOT rely on an
+                // unchecked edge — the registry treats an unverified sid as unknown, not as trusted.
+                {
+                    std::vector<unsigned char> stored_agg;
+                    bool has_agg = false;
+                    std::string agg_err;
+                    if (!db_manager::get_aggregate(statechain_id, stored_agg, has_agg, agg_err)) {
+                        return crow::response(500, "could not read the coin's aggregate: " + agg_err);
+                    }
+                    if (has_agg) {
+                        // The disclosure carries the 33-byte compressed tweaked key; its x-only is
+                        // the 32 bytes after the parity prefix.
+                        const auto disclosed = utils::ParseHex(disclosure->agg_pubkey_hex);
+                        if (disclosed.size() != 33) {
+                            return crow::response(400, "disclosure agg_pubkey is not 33 bytes");
+                        }
+                        const std::vector<unsigned char> disclosed_xonly(disclosed.begin() + 1,
+                                                                        disclosed.end());
+                        if (disclosed_xonly != stored_agg) {
+                            CROW_LOG_WARNING << "AGGREGATE_MISMATCH statechain " << statechain_id;
+                            return crow::response(
+                                403,
+                                "the disclosed transaction is not this coin's: agg_pubkey does not "
+                                "match the aggregate derived for this statechain");
+                        }
+                    }
+                }
+
                 // Emitted so that "the honest path still works" can be told apart from "the gate never
                 // ran". Both look identical from outside — an absent disclosure is served, so a client
                 // that silently failed to serialise one would produce a GREEN end-to-end test while
@@ -568,7 +635,17 @@ namespace lockbox {
 
             std::string statechain_id = req_body["statechain_id"].s();
 
-            return generate_new_keypair(statechain_id, seed.data());
+            // [REQ-68] Optional while clients migrate; strict when present.
+            std::optional<std::vector<unsigned char>> client_pubkey;
+            if (req_body.count("user_public_key") != 0) {
+                auto parsed = utils::ParseHex(std::string(req_body["user_public_key"].s()));
+                if (parsed.size() != 33) {
+                    return crow::response(400, "user_public_key must be a 33-byte compressed key");
+                }
+                client_pubkey = parsed;
+            }
+
+            return generate_new_keypair(statechain_id, seed.data(), client_pubkey);
         });
 
         CROW_ROUTE(app, "/get_public_nonce")

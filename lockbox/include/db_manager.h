@@ -167,6 +167,21 @@ namespace db_manager {
                          bool& found,
                          std::string& error_message);
 
+    // ── [REQ-68] THE COIN'S AGGREGATE, AS THE SE DERIVED IT ──────────────────────────────────────
+
+    /// Store the aggregate the SE COMPUTED at keygen. WRITE-ONCE: a re-pointable aggregate would let
+    /// whoever re-points it change which coin a transaction is judged to belong to.
+    bool store_aggregate(const std::string& statechain_id,
+                         const std::vector<unsigned char>& aggregate_xonly,
+                         std::string& error_message);
+
+    /// `found` is assigned on every path. Absent means the client sent no key (old clients — D24),
+    /// and the binding check MUST fail OPEN there rather than brick every pre-existing coin.
+    bool get_aggregate(const std::string& statechain_id,
+                       std::vector<unsigned char>& aggregate_xonly,
+                       bool& found,
+                       std::string& error_message);
+
     // ── [REQ-54 R2] RELEASE ──────────────────────────────────────────────────────────────────────
 
     /// Record that this leaf's holder has consented to be discharged off-chain. MONOTONE: inserted,

@@ -1165,18 +1165,38 @@ impl UtexoWallet {
                     // its own reason, distinct from `NotBindable`: "we could not decide" must never
                     // be read back as "flat is fine for this coin", so the conveyance path treats
                     // this record as a REFUSAL, not a licence.
-                    _ => {
-                        // [D69] CLASSIFY, don't fold. `get_statechain_info` now also fails when this
+                    other => {
+                        // [D69] CLASSIFY, don't fold. `get_statechain_info` also fails when this
                         // build has no pinned enclave attestation identity and none is configured —
                         // a PERMANENT local fault that `coordinator-unavailable` would mislabel as
-                        // "retry later". Re-resolving the pin decides which it is, by asking the
-                        // same function rather than matching on a message.
-                        let reason = match mercurylib::tesr::TesrParams::attestation_identity(
-                            &self.inner.cc.network.to_string(),
-                            self.inner.cc.attestation_identity.as_deref(),
-                        ) {
-                            Ok(_) => LadderSkipReason::CoordinatorUnavailable,
-                            Err(_) => LadderSkipReason::AttestationIdentityUnpinned,
+                        // "retry later".
+                        //
+                        // Re-resolving the pin is NECESSARY but was not SUFFICIENT: it tests whether
+                        // a pin is PRESENT, not whether it is RIGHT. A present-but-wrong pin (the
+                        // wrong network's key, a pasted JSON body instead of the bare x-only key, a
+                        // redeployed enclave) therefore landed on `coordinator-unavailable` while the
+                        // coordinator was answering 200 — the failure is raised AFTER the 200, by the
+                        // attestation check. Measured: exporting the raw
+                        // `/attestation_identity` body reproduces it byte for byte.
+                        //
+                        // So ask the ERROR first, by TYPE rather than by message, and fall back to
+                        // re-resolving the pin only when the cause is not an attestation failure.
+                        let attestation_failed = matches!(&other, Err(e)
+                            if e.downcast_ref::<mercurylib::error::MercuryError>()
+                                .is_some_and(|m| matches!(
+                                    m,
+                                    mercurylib::error::MercuryError::SigCountAttestationInvalid
+                                )));
+                        let reason = if attestation_failed {
+                            LadderSkipReason::AttestationInvalid
+                        } else {
+                            match mercurylib::tesr::TesrParams::attestation_identity(
+                                &self.inner.cc.network.to_string(),
+                                self.inner.cc.attestation_identity.as_deref(),
+                            ) {
+                                Ok(_) => LadderSkipReason::CoordinatorUnavailable,
+                                Err(_) => LadderSkipReason::AttestationIdentityUnpinned,
+                            }
                         };
                         self.note_flat(&sid, 0, reason).await?;
                         continue;

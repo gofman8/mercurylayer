@@ -293,6 +293,18 @@ pub const FLAT_FUNDING_UNRESOLVABLE: &str = "funding-unresolvable";
 /// B11). Distinct from `coordinator-unavailable` on purpose: that one says "retry later", and
 /// retrying a missing configuration forever is how a permanent fault wears a transient label.
 pub const FLAT_ATTESTATION_UNPINNED: &str = "attestation-identity-unpinned";
+/// **A pin IS configured, and the enclave's attestation does not verify against it.**
+///
+/// The sibling of [`FLAT_ATTESTATION_UNPINNED`], and the reason it had to exist. The classifier that
+/// chose between "unpinned" and "coordinator-unavailable" asked only whether a pin RESOLVES, which
+/// tests presence and not validity — so a present-but-wrong pin (the wrong network's key, a copied
+/// JSON body instead of the bare x-only key, a redeployed enclave) fell through to
+/// `coordinator-unavailable`. That reading is doubly wrong: the coordinator answered 200, and the
+/// fault is local and permanent rather than something a retry can clear.
+///
+/// PERMANENT for this configuration, and it licenses NOTHING — an attestation that does not verify
+/// is exactly the case D69 exists to refuse, so it must never be softened into "flat is fine".
+pub const FLAT_ATTESTATION_INVALID: &str = "attestation-invalid";
 /// The coin's ladder could not be bound for a reason that is NOT the legacy no-aggregate case — a
 /// non-taproot funding output, a scriptPubKey that would not decode, or a coordinator aggregate that
 /// does not control `F` (a decoy-shaped coin). Never a licence: only
@@ -2593,6 +2605,8 @@ mod flat_lane_tests {
             FLAT_DUPLICATE_DEPOSIT,
             FLAT_LADDER_UNREADABLE,
             FLAT_BINDING_UNRESOLVED,
+            FLAT_ATTESTATION_UNPINNED,
+            FLAT_ATTESTATION_INVALID,
             "some-future-spelling",
             "",
         ] {
@@ -2601,6 +2615,39 @@ mod flat_lane_tests {
                 "'{other}' must not license a flat conveyance"
             );
         }
+    }
+
+    /// A pin that is PRESENT but WRONG must not be reported as a coordinator outage.
+    ///
+    /// The classifier used to decide between "unpinned" and "coordinator-unavailable" by asking
+    /// whether a pin RESOLVES — presence, not validity. So a wrong pin (the wrong network's key, a
+    /// pasted `/attestation_identity` JSON body instead of the bare x-only key, a redeployed
+    /// enclave) was recorded as `coordinator-unavailable`, i.e. "retry later", while the coordinator
+    /// was answering 200 and the fault was local and permanent. Measured on the live stack: the
+    /// three pin states produce three DIFFERENT reasons, and only the middle one is transient.
+    ///
+    /// This test pins the classification of the spelling, which is what the conveyance path and the
+    /// operator both read. If `attestation-invalid` is ever folded back into either neighbour, the
+    /// distinction this records is lost silently.
+    #[test]
+    fn a_wrong_pin_is_permanent_and_is_not_a_coordinator_outage() {
+        assert_ne!(
+            FLAT_ATTESTATION_INVALID, FLAT_COORDINATOR_UNAVAILABLE,
+            "a wrong pin is a local, permanent fault — it must not wear the 'retry later' spelling"
+        );
+        assert_ne!(
+            FLAT_ATTESTATION_INVALID, FLAT_ATTESTATION_UNPINNED,
+            "'no pin' and 'wrong pin' need different remedies: set one, versus fix the one you set"
+        );
+        assert!(
+            !is_transient_flat_reason(FLAT_ATTESTATION_INVALID),
+            "retrying does not make a wrong pin verify"
+        );
+        assert!(
+            !is_legitimate_flat_reason(FLAT_ATTESTATION_INVALID),
+            "an attestation that does NOT verify is precisely the case D69 exists to refuse; it \
+             must never license a flat conveyance"
+        );
     }
 
     /// Duplicates are keyed apart so a duplicate's record can never overwrite (and thereby excuse)

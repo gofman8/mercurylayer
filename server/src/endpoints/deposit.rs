@@ -391,9 +391,15 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
         }
     }
 
+    // [REQ-68] `user_public_key` is forwarded so the SE can DERIVE the coin's aggregate itself at the
+    // only moment it holds both halves, instead of trusting a caller-supplied `agg_pubkey` later.
+    // Omitted entirely when the client sent nothing, because the lockbox refuses a malformed key
+    // rather than ignoring it — an empty string is malformed, not absent.
     #[derive(Debug, Serialize, Deserialize)]
     pub struct GetPublicKeyRequestPayload {
         statechain_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_public_key: Option<String>,
     }
 
     let statechain_id = uuid::Uuid::new_v4().as_simple().to_string();
@@ -410,11 +416,43 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
 
     let payload = GetPublicKeyRequestPayload {
         statechain_id: statechain_id.clone(),
+        user_public_key: match deposit_msg1.user_public_key.trim() {
+            "" => None,
+            k => Some(k.to_string()),
+        },
     };
 
     let value = match request.json(&payload).send().await {
         Ok(response) => {
-            let text = response.text().await.unwrap();
+            // [REQ-68] A refusal here means the SE could not bind this coin's aggregate. Surface it as
+            // a refusal rather than feeding the error body to the JSON parser, which would panic and
+            // report an unrelated fault.
+            //
+            // The body read propagates rather than defaulting to "": an unreadable reply is "I do not
+            // know whether the SE minted a key", and defaulting turns that into a deposit that looks
+            // like it failed for a reason we can name. Fail closed and say which step was unreadable.
+            let status = response.status();
+            let text = match response.text().await {
+                Ok(t) => t,
+                Err(err) => {
+                    return status::Custom(
+                        Status::InternalServerError,
+                        Json(json!({
+                            "message": format!(
+                                "the enclave replied {} but its body could not be read ({err}); \
+                                 refusing rather than treating an unreadable reply as empty",
+                                status.as_u16()
+                            )
+                        })),
+                    );
+                }
+            };
+            if !status.is_success() {
+                return status::Custom(
+                    Status::from_code(status.as_u16()).unwrap_or(Status::InternalServerError),
+                    Json(json!({ "message": format!("enclave refused key generation: {}", text) })),
+                );
+            }
             text
         },
         Err(err) => {
@@ -422,7 +460,7 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
                 "error": "Internal Server Error",
                 "message": err.to_string()
             });
-        
+
             return status::Custom(Status::InternalServerError, Json(response_body));
         },
     };

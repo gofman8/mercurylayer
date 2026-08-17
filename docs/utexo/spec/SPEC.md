@@ -78,6 +78,7 @@ when the sentence is softened. Nothing here is a hidden caveat: each is also sta
 | **V-4** | the `statechain_id ↔ aggregate` binding is attested, like the count | it is coordinator-supplied and unattested | A coordinator serving NULL downgrades any coin to the un-laddered lane; serving a wrong value is not detectable in-protocol. The COUNT's half of this is closed ([TRUST-MODEL.md](TRUST-MODEL.md) B11); the binding is the half that remains |
 | **V-6** | every fresh confirmed root coin is laddered by `claim()` | **no network ships a pinned enclave attestation identity**, so on the shipped defaults EVERY laddering claim refuses and the coin stays flat | `TesrParams::attestation_identity_const` returns `None` for bitcoin/mainnet, testnet/testnet3/testnet4/signet AND regtest; `SdkConfig::regtest` and `SdkConfig::mainnet` both ship `attestation_identity: None`; the only other source is the `UTEXO_ATTESTATION_IDENTITY` environment variable, which an embedder has not set. The pass then records `LadderSkipReason::AttestationIdentityUnpinned` and continues — correctly, since verifying an attestation against a coordinator-served key proves nothing — but the effect is that "unconditionally" is conditional on configuration the product does not supply. Closed by compiling in a pin per network at release, or by an operator setting one |
 | **V-5** | the two closed forms of the granularity model are evaluated and published | UNEVALUATED | An external dependency, not unfinished work: both are queries over DEPLOYED coins and regtest has none that mean anything |
+| **V-7** | every coin's disclosure is checked against an aggregate the SE derived for itself (REQ-68) | the aggregate is stored ONLY when the client sends `user_public_key` at `/get_public_key`, and the check FAILS OPEN when no aggregate is stored. **MEASURED on the live regtest lockbox: 70 of 14 716 key slots carry one — 99.5 % of coins are unbound** | The unbound set is not merely legacy, it is still GROWING: the coordinator maps an empty `user_public_key` to "omit the field" (`server/src/endpoints/deposit.rs`), and the shipped wasm and Kotlin bindings predate it entirely — so any of them mints a fresh unbound coin on demand, and no later route can bind one (`se_aggregate` is written once, inside `/get_public_key`). What CLOSES it, in order: rebuild the wasm/Kotlin bindings from current `lib/`; then refuse an empty `user_public_key` so the set stops growing and becomes finite; then make the check mandatory. This shares its shape with **V-4** — that row is the coordinator's half of the same binding, this one is the SE's |
 
 ### 0.5 What this document does NOT claim
 
@@ -1072,6 +1073,31 @@ VICTIM's tier under its own sid and being refused** — a test exercising only t
 nothing here; (5) only then resolve parent edges through the index, and only then wire
 `collapse_grant`.
 
+**Steps (1)–(4) are BUILT and RUN.** `sdk92` half (b) is the deciding test: a self-consistent
+disclosure built from keys unrelated to the coin, submitted under the coin's own sid, is refused
+`403 AGGREGATE_MISMATCH`, while the same coin's own tiers are served — measured 4 bound / 4
+co-signatures in the same run. The two gates are shown to be INDEPENDENT rather than one masking the
+other: the same bytes with a one-satoshi lie are refused `400` by REQ-57's session compare, and the
+test fails if (b2) is refused by that compare instead of by the aggregate.
+
+Two properties fell out of the build that were not obvious when it was specified:
+
+* **The aggregate is INVARIANT under `/keyupdate`, so a transfer does not break the binding.** The
+  key-update algebra gives `s2 = s1 + o1 − o2`, hence `o2 + s2 = o1 + s1`; write-once storage is
+  therefore correct rather than merely convenient. Measured two ways: the raw aggregate point is
+  byte-identical either side of a live `/keyupdate`, and a full deposit → transfer → claim →
+  split-transfer → claim → exit run co-signed under the new owner's rotated share with the gate armed
+  (17 binds, 17× 200, 0 mismatches).
+* **REQ-68 is the ENFORCEMENT POINT for that invariance, not a consumer of it.** A `key_update` whose
+  algebra drifted by a single scalar produces a different post-rotation aggregate, and the very next
+  co-signature is refused 403 — demonstrated live by submitting `t2 + 1`. Every transfer E2E is
+  therefore now a regression pin on the key-update algebra.
+
+**What is NOT closed is coverage, and it is the larger half — see V-7.** The check fails open for any
+sid with no stored aggregate, which on the live regtest lockbox is **99.5 % of key slots**, and the
+unbound set still grows because an empty `user_public_key` is treated as absent and the shipped wasm
+and Kotlin bindings cannot send the field at all.
+
 Until (1)–(4) are done and measured, nothing may present the SE's index as authority on parenthood.
 
 **REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
@@ -1241,18 +1267,27 @@ Two rows carry the argument. **The first row is the reason this design has a liq
 telling**: an ordinary payment redistributes value *inside* a tree, so payment volume enters none of
 the formulas below. **The migration row is the dominant term**, and §5.5.2 derives it.
 
-**The SE funds nothing, anywhere, and that is structural rather than incidental.** It holds a key
-share and never sees an amount (§1); REQ-58 forbids it even to ask whether a funding output exists;
-and the coordinator broadcasts no Bitcoin transaction. Every entry above is the SSP's.
+**The SE's CO-SIGNING FUNCTION funds nothing, and that is structural rather than incidental.** It
+holds one share of a 2-of-2 and broadcasts no Bitcoin transaction, so no capital can flow through it.
+Every entry above is the SSP's. Do not overstate this into "the SE never sees an amount": REQ-56's
+predicate reads `fund_value` and output values directly, and REQ-58 is careful to say the SE is
+forbidden to consult the chain **"not because the SE is incapable of looking"** but because what it
+learned would not be trustworthy to an offline holder. Blindness is a property of the signing lane,
+not of the round machinery.
 
 **One row is MEASURED, and it is the one that is live today.** The non-exact Lightning receive path
 oversizes the fronted piece by a fixed reserve — `IN_LADDER_TIER_RESERVE = 2000`
 (`clients/libs/rust-sdk/src/ssp.rs:664`), whose own comment reads "the SSP bears it (its cost of
 fronting a non-exact amount)" — while the reference SSP's fee defaults to **zero**
 (`SSP_FEE_SATS … unwrap_or(0)`, `clients/apps/ssp-server/src/main.rs:110`). So on shipped defaults the
-only liquidity lane that actually runs today loses 2 000 sat per non-exact receive and charges nothing
-for it. That is a product decision, not a protocol defect — but it MUST NOT be mistaken for a lane
-that pays for itself.
+only liquidity lane that actually runs today gives up **at least** 2 000 sat per non-exact receive and
+charges nothing for it — at least, because the split tier's own fee falls on the SSP's change leg on
+top of the reserve. Two refinements, so the number is not repeated more precisely than it is true:
+1 230 of the 2 000 is the piece's own two prepaid rungs rather than a transfer to the receiver, and
+what the receiver actually realises depends on route (walking the piece out returns ~770 of it;
+combining, paying onward, or being paid out by a collapse under REQ-56 returns the whole 2 000). What
+is not route-dependent is the SSP side: it never comes back. That is a product decision, not a
+protocol defect — but it MUST NOT be mistaken for a lane that pays for itself.
 
 #### 5.5.2 The round float, and why the protocol forces it
 
@@ -1294,7 +1329,9 @@ At the central case — 90 % migrate, a one-week window — the operator stands 
 
 **Bootstrap is not a separate spike.** Before the first collapse there is no `out[0]` to recycle, so
 the first cycle's capacity is real operator capital — but it is the same quantity as the steady-state
-float, not an addition to it.
+float, not an addition to it. Precisely: the standing float is what the operator must hold at ALL
+times, and bootstrap is the first instance of it rather than a one-off on top. Growing the book still
+costs capital at the same ratio, because the formula is proportional to TVL.
 
 #### 5.5.3 The tension this exposes: the absentee lever is bought with liquidity
 
@@ -1393,6 +1430,19 @@ that it is **stock-proportional rather than flow-proportional**, that it is **bo
 operator-chosen window rather than a consensus timelock**, and that **its exhaustion costs block space
 rather than money**.
 
+**REQ-74 (`f_next` MUST be constrained, and today it is not).** REQ-53 claims the cycle self-funds —
+"the collapse transaction's `out[0]` funds a future root, so a round both retires and re-funds in one
+transaction — there is no separate deposit". **Nothing enforces that.** `C.vout` carries
+`P2TR(A_next) value f_next` alongside `P2TR(ssp_change)`, and no requirement anywhere constrains
+`f_next`: an operator may route the whole recovered residue to change and fund the next root from
+somewhere else, or from nothing. REQ-56 does not care — it checks only that undischarged holders are
+paid — so the self-funding property is an intention, not an invariant.
+
+A round MUST therefore either set `f_next` to at least the value it intends to make available for the
+next cycle's migrations, or the document MUST stop describing the cycle as self-funding. This is
+recorded as a requirement rather than a note because the liquidity claim in §5.5.2 rests on the
+recycling: if the residue can leave as change, the standing float is a floor and not an estimate.
+
 #### 5.5.7 What this section does NOT know
 
 * **`W` is unmodelled.** Nothing in this document derives a round window; it is an operating choice,
@@ -1406,6 +1456,16 @@ rather than money**.
   that bites first, because that lane is live today and the round is not.
 * **The sweep's exposure is bounded but not costed.** REQ-50 caps it at `sweep_max_tree_exposure`
   (1 000 000 sat default); nothing derives what a realistic absorber's standing book would be.
+* **A migrated leaf inherits the SUCCESSOR root's REMAINING epoch, not a fresh one**, because R1 is an
+  in-ladder split on a root `B` that is already partway through its own cycle. A piece therefore
+  resides for `epoch_days − W` rather than `epoch_days`, which multiplies the collapse rate — and
+  hence the pinned footprint — by `epoch_days / (epoch_days − W)`. At the central `W = 7 d` that is
+  **1.11**, small enough to be a rounding note and large enough to matter at a wide window. This is
+  DERIVED here and NOT reflected in
+  [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §4.1; it is flagged as an open item for
+  the owner rather than applied as a correction, because the size of the effect depends on `W`, which
+  is itself unmodelled. **An earlier draft of this bullet claimed a 2× understatement; that rested on
+  `W = epoch_days / 2`, which nothing in §5.4 implies.**
 * **None of the round arithmetic is measured.** §5.4 is not built.
 
 ---
@@ -1942,13 +2002,14 @@ unbuilt sections, and they are marked as such in place.
 | INV-26 | `sdk09` (IFA received amount = fungible only) |
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
 | REQ-49…REQ-52 (§5.3, the sweep) | **NONE — design, not built.** See the status banner in §5.3 |
-| REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE; the same bytes with the correct value not refused), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. **Open:** binding is opt-in per request; the coloured multi-input path is fixed but unexercised |
+| REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE — and the test fails if the same bytes with the correct value are refused by that compare rather than by REQ-68's aggregate check, so neither gate can stand in for the other), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. **Open:** binding is opt-in per request; the coloured multi-input path is fixed but unexercised |
 | REQ-56 (§5.4, the predicate + registry) | **PARTIAL.** The decision procedure is built and pinned: `lockbox/tests/test_registry.cpp` (23 checks — fork, released sibling, shared exit key, one-satoshi shortfall, INV-Q). The storage is built and pinned against a live Postgres: `lockbox/tests/test_registry_db.cpp` (26 checks — idempotent establish, monotone release, single-use nonce by PRIMARY KEY, freeze as a ratchet). **NOT built:** nothing populates it in production, and no `collapse_grant` route exists |
 | REQ-68 (§5.4, why parenthood is not yet SE-authored) | **MEASURED, and it is a blocker.** `/get_public_key` takes only a `statechain_id`, so the SE never learns the client's key and cannot derive the coin's aggregate — see REQ-68 for the two candidate closures and the privacy cost of the sound one. Until it is decided, `se_signed_tx` is an audit trail only |
 | REQ-54 R2 (§5.4, `/release`) | **BUILT.** `lockbox/tests/test_release_route.cpp` — 10 checks against live Postgres and real BIP-340, three of them forgeries run BEFORE the honest path: no latch → refused (fails closed), someone else's key → refused, a signature over a DIFFERENT sid → refused (the tag binds it), replayed nonce → refused, fresh nonce → accepted, `released` monotone |
 | REQ-61 (§5.4, the owner latch) | **ARMING BUILT, ENFORCEMENT NOT.** The key is read structurally from the unique P2TR output and stored write-once (`ON CONFLICT DO NOTHING`); a second arming with a different key is a no-op. Measured live: 4 bound co-signatures → exactly 1 `LATCH_ARMED`. **Nothing yet refuses a co-signature for want of a BIP-340 by that key** — and REQ-61(b) must be settled first, since the payer co-signs the payee's tiers before the payee holds anything |
+| REQ-68 (§5.4, the coin binding) | **BUILT and MEASURED, coverage OPEN.** `sdk92` half (b) — a self-consistent disclosure built from keys unrelated to the coin, submitted under the coin's own sid, refused `403 AGGREGATE_MISMATCH` while the coin's own tiers are served in the same run; `lockbox/tests/test_aggregate_derive.cpp` (13 checks, incl. an adversary that cannot match a victim's aggregate); the SE↔client differential in `ci-guards/tests/emit_aggregate_vectors.rs`. Transfer-safety measured separately: the aggregate is invariant under `/keyupdate`, and a drifted `t2` is refused live. **Open: the check FAILS OPEN for 99.5 % of key slots — see V-7** |
 | REQ-53, REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no freeze at grant time. See the status banner in §5.4 |
-| REQ-69…REQ-73 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written |
+| REQ-69…REQ-74 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written. **REQ-74 is a live defect rather than a design note**: it records that nothing constrains `f_next`, so REQ-53's "there is no separate deposit" is currently unenforced |
 
 **Suite sizes.** Workspace unit + guard tests: **805**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.

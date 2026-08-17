@@ -194,13 +194,18 @@ pub async fn get_statechain_info(statechain_id: &str, client_config: &ClientConf
                 &pinned,
             )
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "the enclave's attestation over num_sigs={} for {statechain_id} did NOT verify \
-                     ({e}). This count is the right-hand side of the anti-theft census, so an \
-                     unverified one lets a coordinator hide co-signed rival states while the census \
-                     still balances — refusing rather than proceeding on it.",
-                    response.num_sigs
-                )
+                // TYPED, not stringified. The caller classifies a failed attestation as a PERMANENT
+                // local fault; folding the type away here forced it to guess from a message, which
+                // is exactly what [D69] forbids. `context` keeps the prose and leaves
+                // `MercuryError::SigCountAttestationInvalid` downcastable.
+                anyhow::Error::new(mercurylib::error::MercuryError::SigCountAttestationInvalid)
+                    .context(format!(
+                        "the enclave's attestation over num_sigs={} for {statechain_id} did NOT \
+                         verify ({e}). This count is the right-hand side of the anti-theft census, \
+                         so an unverified one lets a coordinator hide co-signed rival states while \
+                         the census still balances — refusing rather than proceeding on it.",
+                        response.num_sigs
+                    ))
             })?;
         }
         _ => {

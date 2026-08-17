@@ -143,6 +143,19 @@ namespace db_manager {
                 // is an operator declaration and MUST be treated by wallets as a retry HINT that
                 // they verify themselves — never as proof.
                 "successor_root varchar(50));");
+            // [REQ-68] The coin's aggregate key, as the SE DERIVED it — never as anyone supplied it.
+            //
+            // Write-once: an aggregate that could be re-pointed would let whoever re-points it
+            // redirect which coin a transaction is judged to belong to, which is the whole thing
+            // this table exists to fix.
+            //
+            // Absent for a coin means "old client, no key was sent" (D24 ignores legacy coins), and
+            // the binding check MUST fail OPEN there — refusing would brick every pre-existing coin.
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_aggregate ( "
+                "statechain_id varchar(50) PRIMARY KEY, "
+                "aggregate_xonly BYTEA NOT NULL);");
+
             // [REQ-61] The owner latch, keyed by sid ALONE.
             //
             // Deliberately not a column on `se_leaf`: that table needs a root, and which tree a leaf
@@ -909,6 +922,57 @@ namespace db_manager {
                 pqxx::binarystring(txid.data(), txid.size()));
             if (!rows.empty()) {
                 statechain_id = rows[0][0].as<std::string>();
+                found = true;
+            }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool store_aggregate(const std::string& statechain_id,
+                         const std::vector<unsigned char>& aggregate_xonly,
+                         std::string& error_message) {
+        if (aggregate_xonly.size() != 32) {
+            error_message = "aggregate_xonly must be 32 bytes";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // DO NOTHING, never DO UPDATE: write-once. A re-pointable aggregate would let someone
+            // change which coin a transaction is judged to belong to.
+            txn.exec_params(
+                "INSERT INTO se_aggregate (statechain_id, aggregate_xonly) VALUES ($1, $2) "
+                "ON CONFLICT (statechain_id) DO NOTHING;",
+                statechain_id,
+                pqxx::binarystring(aggregate_xonly.data(), aggregate_xonly.size()));
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool get_aggregate(const std::string& statechain_id,
+                       std::vector<unsigned char>& aggregate_xonly,
+                       bool& found,
+                       std::string& error_message) {
+        found = false;  // assigned on every path — an unknown coin must never read as "matches"
+        aggregate_xonly.clear();
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT aggregate_xonly FROM se_aggregate WHERE statechain_id = $1;", statechain_id);
+            if (!rows.empty()) {
+                pqxx::binarystring a(rows[0][0]);
+                aggregate_xonly.assign(a.data(), a.data() + a.size());
                 found = true;
             }
             txn.commit();

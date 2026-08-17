@@ -293,8 +293,18 @@ pub async fn execute() -> Result<()> {
         return Err(anyhow!(
             "[a] the coin was NOT laddered — recorded reason: {reason:?}. This run never reaches \
              `cosign_tier_request`, so it measures the deposit lane ONLY and any coverage ratio it \
-             prints is vacuous. If the reason is `attestation-identity-unpinned`, export \
-             UTEXO_ATTESTATION_IDENTITY from `curl -s {lockbox}/attestation_identity` and re-run."
+             prints is vacuous.\n\
+             \n\
+             BOTH of these reasons mean the same thing here — a client-side attestation pin problem, \
+             NOT a coordinator outage:\n\
+               `attestation-identity-unpinned`  = no pin set at all\n\
+               `coordinator-unavailable`        = a pin IS set but does not verify the served \
+             attestation. The coordinator answered 200; the classifier only checks that a pin is \
+             PRESENT, so a wrong one is mislabelled 'retry later'.\n\
+             \n\
+             Export the BARE x-only key — not the JSON body, which is what produces the second case:\n\
+               export UTEXO_ATTESTATION_IDENTITY=$(curl -s {lockbox}/attestation_identity | \
+             jq -r .attestation_identity_pubkey)"
         ));
     }
     if mercuryrustlib::tesr::load(&cc, "sdk92_alice", &sid).await?.is_none() {
@@ -374,31 +384,61 @@ pub async fn execute() -> Result<()> {
         ));
     }
 
-    // (b2) THE TRUTH — the positive control that gives (b1) its meaning.
+    // (b2) THE SAME BYTES, CORRECT VALUE — and this is REQ-68's decisive case, not a positive
+    // control any more.
     //
-    // Identical bytes, correct value. If this were ALSO refused by the binding, (b1) would prove
-    // nothing: a gate that refuses everything is not detecting the lie, it is just broken.
+    // `honest` is built from fixed keys (0x21.., 0x63..) that have nothing to do with this coin, and
+    // it is submitted under THIS coin's sid. That is precisely the attack REQ-68 exists to stop: a
+    // disclosure that is internally self-consistent, so REQ-57's session compare is satisfied by it,
+    // describing a transaction the caller does not own. Before REQ-68 the SE served this and
+    // recorded SE-authored state (se_signed_tx, se_latch, and in future the leaf registry) derived
+    // from someone else's transaction — which is what would poison REQ-56's collapse predicate.
+    //
+    // So (b2) MUST be refused, and refused by the AGGREGATE check rather than by the session
+    // compare. The two gates catch different faults and the test must not let one stand in for the
+    // other.
     let (ok_status, ok_body) =
         raw_partial_signature(&lockbox, disclosure_body(&sid, &honest, DEPOSIT)).await?;
     println!("SDK92 - [b2] correct value -> HTTP {ok_status}  {ok_body}");
-    if ok_body.contains("witness binding refused") {
+    if ok_status == 200 {
         return Err(anyhow!(
-            "[b2] the SAME disclosure with the CORRECT prevout value was also refused by the \
-             binding ({ok_body}). The gate refuses honest and dishonest alike, so [b1] measured a \
-             broken comparison rather than a detected lie."
+            "[b2] the SE SERVED a self-consistent disclosure describing a transaction built from \
+             keys unrelated to this coin, submitted under this coin's sid. REQ-68 is not enforcing, \
+             so any caller can author SE-side state about a coin it does not own."
         ));
     }
+    if ok_body.contains("witness binding refused") {
+        return Err(anyhow!(
+            "[b2] refused, but by the SESSION COMPARE ({ok_body}) rather than by the aggregate \
+             check. That would mean REQ-57 is masking REQ-68: the same refusal fires whether or not \
+             the coin binding exists, so this test would keep passing after REQ-68 was removed."
+        ));
+    }
+    if !ok_body.contains("not this coin's") {
+        return Err(anyhow!(
+            "[b2] refused with HTTP {ok_status}, but by neither named gate: {ok_body}. A refusal \
+             from the parser or an unrelated check proves nothing about the coin binding."
+        ));
+    }
+
+    // The ACCEPTANCE side of the differential is (a), not (b2): 4 bound / 4 co-signatures over this
+    // coin's OWN tiers. That is what makes (b1) and (b2) detections rather than a gate that refuses
+    // everything — and it is also the only evidence that the SE's own derivation of the aggregate
+    // (combine -> TapTweak -> tweak-add -> x-only) reproduces the client's `output_pubkey` bit for
+    // bit. A single bit of disagreement would have refused all four.
     println!(
-        "SDK92 - [b] PASS: one satoshi separates refusal from acceptance. The SE never inspects the \
-         amount directly — BIP-341 folds it into the sighash, so the lie surfaces as a session \
-         mismatch. Every larger lie about scripts, outpoints, version, locktime or sequences feeds \
-         the same hash and is caught the same way."
+        "SDK92 - [b] PASS: two INDEPENDENT gates, each firing on its own fault. A one-satoshi lie is \
+         caught by BIP-341 folding the prevout amount into the sighash (400, session mismatch); a \
+         truthful disclosure of the WRONG COIN is caught by the aggregate the SE derived for itself \
+         at keygen (403). Neither refusal touches this coin's own tiers, which were served \
+         {binds} of {reqs}."
     );
 
     println!(
         "SDK92 - SCOPE: binding is OPT-IN per request while JS/Kotlin clients migrate, so a caller \
-         that omits the disclosure is still served. This proves the gate works when used, NOT that \
-         every signature is bound."
+         that omits the disclosure is still served, and the aggregate check FAILS OPEN for any sid \
+         with no stored aggregate. This proves both gates work when used, NOT that every signature \
+         is bound."
     );
     println!("SDK92 - ALL ASSERTIONS PASSED");
     Ok(())
