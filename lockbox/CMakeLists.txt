@@ -178,6 +178,17 @@ if(BUILD_LOCKBOX_TESTS)
         COMMAND test_bip340
         COMMENT "Running the BIP-340 verification differential")
 
+    # [REQ-68] Aggregate derivation, against vectors from the CLIENT's own path. Includes the
+    # adversary case the operator's decision rests on: declaring a victim's client key must NOT
+    # reproduce the victim's aggregate.
+    add_executable(test_aggregate_derive tests/test_aggregate_derive.cpp src/auth.cpp src/tx.cpp)
+    target_include_directories(test_aggregate_derive PRIVATE include tests)
+    target_link_libraries(test_aggregate_derive PRIVATE secp256k1_zkp OpenSSL::Crypto)
+    add_test(NAME aggregate_derive COMMAND test_aggregate_derive)
+    add_custom_command(TARGET test_aggregate_derive POST_BUILD
+        COMMAND test_aggregate_derive
+        COMMENT "Running the REQ-68 aggregate-derivation differential")
+
     # [REQ-61] Latch enforcement, both directions — a gate that refuses everything bricks every
     # latched coin and looks identical to a working one in a forgeries-only test.
     add_executable(test_latch_enforce tests/test_latch_enforce.cpp src/auth.cpp src/tx.cpp)

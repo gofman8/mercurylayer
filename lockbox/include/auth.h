@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,38 @@ bool verify_release(const std::vector<unsigned char>& xonly,
                     const std::string& sid,
                     const std::vector<unsigned char>& nonce32,
                     const std::vector<unsigned char>& sig);
+
+// ── [REQ-68] THE COIN'S AGGREGATE KEY, DERIVED ───────────────────────────────────────────────────
+
+/// Derive the x-only aggregate key a disclosure's `agg_pubkey` carries, from the CLIENT's public key
+/// and the SE's own key share.
+///
+/// # Why derive rather than accept (operator decision, 2026-08-17)
+///
+/// Without this the SE cannot tell whether a disclosed transaction belongs to the coin whose sid was
+/// named: binding proves a disclosure reproduces the session, and every input to that is the
+/// caller's. Being HANDED the aggregate by the coordinator would not fix it, because the coordinator
+/// is exactly the party REQ-56's frontier exists to be checked against.
+///
+/// Deriving is self-defending. An adversary who declares a VICTIM's client key still gets a
+/// different aggregate, because its own sid's server share differs — it cannot make its coin's
+/// aggregate equal anyone else's. That is proven, not assumed, by
+/// `adversary_cannot_match_a_victims_aggregate` in the vector emitter.
+///
+/// # The chain, which has three places to go wrong
+///
+///   1. `aggregate = client_pubkey + server_pubkey` (EC addition of the two shares)
+///   2. `tweak     = tagged_hash("TapTweak", xonly(aggregate))`  — BIP-341, NO merkle root
+///   3. return      `xonly(aggregate + tweak·G)`
+///
+/// Omitting step 2 returns the untweaked aggregate: a valid-looking 32 bytes that matches nothing a
+/// client ever sends, so the SE would refuse every honest binding while looking like it works.
+///
+/// Both inputs must be 33-byte compressed keys. Returns `nullopt` on any parse or arithmetic
+/// failure — never a partial or approximate answer.
+std::optional<std::vector<unsigned char>> derive_aggregate_xonly(
+    const std::vector<unsigned char>& client_pubkey33,
+    const std::vector<unsigned char>& server_pubkey33);
 
 // ── [REQ-61] LATCH ENFORCEMENT ───────────────────────────────────────────────────────────────────
 
