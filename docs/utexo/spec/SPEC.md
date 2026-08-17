@@ -76,10 +76,20 @@ arithmetic — is expected to be **deleted**, not migrated.
 > * **The flat-lane licence `PermanentLicence::FundingNotOnChain` must NOT be retired.** Its
 >   `branch-` arm is LOAD-BEARING for the plain, non-RGB split sub-coin lane — written when a
 >   receiver adopts an off-chain sub-coin, read when conveying it onward. A counterfactual with the
->   row removed refuses the coin. Its `ctesr-` arm is defensive (children route to `child_retransfer`
->   first) and its `spinetip-` arm is dead (tips are refused by name earlier, with a CI guard), so
->   those two are retirable — but they are the two that look load-bearing, and the one that looks
->   legacy is the one that carries the lane.
+>   row removed refuses the coin; with the row corrupted the error is raised from inside that arm,
+>   which is what proves the arm decides it. Its `ctesr-` arm is defensive (children route to
+>   `child_retransfer` first, and a child that does reach the flat lane dies on an absence rather
+>   than on the licence) and its `spinetip-` arm is dead (tips are refused by name in `execute_ex`
+>   BEFORE the classifier, with a green CI guard) — so those two are retirable. **They are the two
+>   that look load-bearing, and the one that looks legacy is the one carrying the lane.**
+>
+>   The `branch-` shape is not even legacy-only: `ensure_exact_coin` falls back to `split_coin`, and
+>   the SSP's Lightning lane calls it unconditionally, so the lane is still a PRODUCER. A post-flip
+>   run wrote fresh `branch-` rows alongside `ladderskip- = funding-not-onchain`. Open, and not
+>   measured: `split_coin` refuses a laddered parent, so once every coin is laddered the exact-coin
+>   path has no candidate — REQ-42's in-ladder fallback covers that for sats, but the RGB arm of
+>   Lightning pay refuses the in-ladder lane outright, so the coloured exact lane may have no route
+>   left after the flip. That must be measured before the flip ships.
 > * **`FLAT_RGB_CARRIER` GAINS a producer at the flip rather than losing one.** The `was_colored`
 >   error arm is unreachable while `colored_ladder` is false; with it true, a carrier the coloured
 >   builder refuses records the reason. The class is measurably non-empty: every pre-flip
