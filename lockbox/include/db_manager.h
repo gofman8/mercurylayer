@@ -167,6 +167,31 @@ namespace db_manager {
                          bool& found,
                          std::string& error_message);
 
+    // ── [REQ-61] THE OWNER LATCH ─────────────────────────────────────────────────────────────────
+
+    /// Arm the latch for `statechain_id`, WRITE-ONCE. `armed_now` is true only when this call is the
+    /// one that set it; a later call with a different key is a silent no-op, not an overwrite.
+    ///
+    /// The key must be read from the money itself — `witness::payload_output`, the unique P2TR
+    /// output (REQ-61a) — never from a client-supplied index, because a latch read at an index the
+    /// attacker chooses is a latch whose key the attacker chooses.
+    ///
+    /// Why a malicious PAYER cannot latch a payee's leaf to itself: conveyance requires the payer to
+    /// build the child's tiers paying the RECEIVER's address, and the payee's own verifier refuses a
+    /// bundle whose tiers pay anyone else. A payer that latches itself has built a child the payee
+    /// will not accept, so it gains nothing and loses the payment.
+    bool arm_latch(const std::string& statechain_id,
+                   const std::vector<unsigned char>& latch_key,
+                   bool& armed_now,
+                   std::string& error_message);
+
+    /// The latch key for a sid. `found` is assigned on every path, so an UNLATCHED coin can never be
+    /// mistaken for one latched to whatever was already in the caller's buffer.
+    bool get_latch(const std::string& statechain_id,
+                   std::vector<unsigned char>& latch_key,
+                   bool& found,
+                   std::string& error_message);
+
     /// Record a leaf at establishment. Idempotent on `statechain_id`: a retried establishment must
     /// not create a second row, or the frontier would double-count and `C` would overpay.
     ///

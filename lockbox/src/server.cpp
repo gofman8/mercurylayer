@@ -131,6 +131,7 @@ namespace lockbox {
             //
             // Set only on a successful bind, and consumed only after the signature commits below.
             std::optional<std::vector<unsigned char>> bound_txid;
+            std::optional<std::vector<unsigned char>> bound_latch_key;
             if (disclosure.has_value()) {
                 std::vector<unsigned char> bound_sighash;
                 std::string detail;
@@ -160,6 +161,14 @@ namespace lockbox {
                 const auto parsed_disclosure = tx::parse_hex(disclosure->unsigned_tx_hex);
                 if (parsed_disclosure) {
                     bound_txid = tx::txid(*parsed_disclosure);
+                    // [REQ-61] The latch key, read STRUCTURALLY from the money: the unique P2TR
+                    // output. Ambiguous or absent yields nothing and the latch simply is not armed
+                    // by this signature — refusing here would brick any shape the SE does not yet
+                    // model, and an un-armed latch fails OPEN in the same way the system behaved
+                    // before it existed.
+                    if (const auto po = witness::payload_output(*parsed_disclosure)) {
+                        bound_latch_key = po->xonly;
+                    }
                 } else {
                     // Unreachable in practice: `bind` parsed the same hex a moment ago. Logged
                     // rather than assumed, because "cannot happen" is how an index quietly goes
@@ -295,6 +304,24 @@ namespace lockbox {
                 if (!db_manager::record_signed_tx(*bound_txid, statechain_id, 0, rec_err)) {
                     CROW_LOG_WARNING << "WITNESS_BIND_INDEX_MISS statechain " << statechain_id
                                      << ": " << rec_err;
+                }
+            }
+
+            // ── [REQ-61] ARM THE OWNER LATCH, write-once ────────────────────────────────────────
+            //
+            // Armed here for the same reason the index is: only a co-signature that was actually
+            // produced should leave state behind. NOT YET ENFORCED — nothing refuses a later
+            // co-signature for want of a BIP-340 by this key. Arming first is deliberate: it lets
+            // the key be observed on the real lane before anything depends on it, and enforcement
+            // that arrives before the arming is proven correct would refuse honest payments.
+            if (bound_latch_key) {
+                bool armed_now = false;
+                std::string latch_err;
+                if (!db_manager::arm_latch(statechain_id, *bound_latch_key, armed_now, latch_err)) {
+                    CROW_LOG_WARNING << "LATCH_ARM_MISS statechain " << statechain_id << ": "
+                                     << latch_err;
+                } else if (armed_now) {
+                    CROW_LOG_INFO << "LATCH_ARMED statechain " << statechain_id;
                 }
             }
 

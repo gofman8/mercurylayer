@@ -166,8 +166,49 @@ int main() {
               "re-freezing with an empty successor does NOT clear frozen");
     }
 
+    // ---- [REQ-61] the owner latch is WRITE-ONCE --------------------------------------------------
+    //
+    // The property that matters is not "it stores a key" — it is that a SECOND arming with a
+    // DIFFERENT key cannot move it. A latch that can be re-pointed is not a latch, because whoever
+    // re-points it takes the coin.
+    {
+        const std::string lsid = root + "_LATCH";
+        bool armed = false;
+        check(db_manager::arm_latch(lsid, key(0x11), armed, err) && armed,
+              "arming an unlatched sid reports armed_now = true");
+
+        bool armed_again = true;  // deliberately wrong, to catch a path that fails to assign
+        check(db_manager::arm_latch(lsid, key(0x22), armed_again, err) && !armed_again,
+              "a SECOND arming reports armed_now = false");
+
+        std::vector<unsigned char> got;
+        bool found = false;
+        check(db_manager::get_latch(lsid, got, found, err) && found,
+              "the latch reads back as present");
+        check(got == key(0x11),
+              "the latch still holds the FIRST key — a different key did NOT overwrite it");
+
+        // An unlatched sid must not read as latched to whatever was in the buffer.
+        std::vector<unsigned char> stale = key(0xff);
+        bool found2 = true;
+        check(db_manager::get_latch(root + "_NEVER", stale, found2, err) && !found2,
+              "an unlatched sid reports found = false, and the flag is assigned on that path");
+        check(stale.empty(), "and the key buffer is cleared rather than left stale");
+
+        check(!db_manager::arm_latch(root + "_SHORT", std::vector<unsigned char>(31, 0x5), armed, err),
+              "a 31-byte latch key is refused");
+    }
+
     // ---- cleanup ---------------------------------------------------------------------------------
     // The run also purges at the START, so a crash mid-test cannot poison the next run.
+    {
+        try {
+            pqxx::connection conn(db_manager::getDatabaseConnectionString());
+            pqxx::work txn(conn);
+            txn.exec_params("DELETE FROM se_latch WHERE statechain_id LIKE $1;", root + "%");
+            txn.commit();
+        } catch (std::exception const&) {}
+    }
     purge(root);
 
     if (failures) {

@@ -143,6 +143,21 @@ namespace db_manager {
                 // is an operator declaration and MUST be treated by wallets as a retry HINT that
                 // they verify themselves — never as proof.
                 "successor_root varchar(50));");
+            // [REQ-61] The owner latch, keyed by sid ALONE.
+            //
+            // Deliberately not a column on `se_leaf`: that table needs a root, and which tree a leaf
+            // belongs to is exactly the question REQ-68 has parked. The latch does not need it — it
+            // is a fact about one sid and the key read out of that coin's own money — so keeping it
+            // separate lets the latch be built while parenthood waits.
+            //
+            // WRITE-ONCE by construction: armed once, never updated, never cleared. A latch that can
+            // be re-pointed is not a latch, because whoever re-points it takes the coin.
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_latch ( "
+                "statechain_id varchar(50) PRIMARY KEY, "
+                // xonly(payload output of the tier the SE was asked to sign), read STRUCTURALLY as
+                // the unique P2TR output (REQ-61a) — never at a client-supplied index.
+                "latch_key BYTEA NOT NULL);");
             txn.exec(
                 "CREATE TABLE IF NOT EXISTS se_release_nonce ( "
                 "statechain_id varchar(50) NOT NULL, "
@@ -883,6 +898,61 @@ namespace db_manager {
                 pqxx::binarystring(txid.data(), txid.size()));
             if (!rows.empty()) {
                 statechain_id = rows[0][0].as<std::string>();
+                found = true;
+            }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool arm_latch(const std::string& statechain_id,
+                   const std::vector<unsigned char>& latch_key,
+                   bool& armed_now,
+                   std::string& error_message) {
+        armed_now = false;  // assigned on every path
+        if (latch_key.size() != 32) {
+            error_message = "latch_key must be 32 bytes";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            // DO NOTHING, never DO UPDATE. The write-once rule is enforced by the database, not by a
+            // read-then-write that races itself: two concurrent first co-signatures must not both
+            // decide they are the one arming it, and whichever loses must not overwrite.
+            auto res = txn.exec_params(
+                "INSERT INTO se_latch (statechain_id, latch_key) VALUES ($1, $2) "
+                "ON CONFLICT (statechain_id) DO NOTHING;",
+                statechain_id, pqxx::binarystring(latch_key.data(), latch_key.size()));
+            txn.commit();
+            armed_now = res.affected_rows() > 0;
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool get_latch(const std::string& statechain_id,
+                   std::vector<unsigned char>& latch_key,
+                   bool& found,
+                   std::string& error_message) {
+        found = false;  // assigned on every path: an unlatched coin must never read as latched to
+                        // stale bytes left in the caller's buffer.
+        latch_key.clear();
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT latch_key FROM se_latch WHERE statechain_id = $1;", statechain_id);
+            if (!rows.empty()) {
+                pqxx::binarystring k(rows[0][0]);
+                latch_key.assign(k.data(), k.data() + k.size());
                 found = true;
             }
             txn.commit();
