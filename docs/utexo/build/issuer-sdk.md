@@ -7,22 +7,27 @@ Token calls need RGB configured (`rgb_proxy_url` + `rgb_data_dir`), otherwise yo
 `SdkError::TokensNotConfigured`. `SdkConfig::regtest(name)` fills both in; `SdkConfig::mainnet(…)`
 leaves them `None` for you to set.
 
-> **The coin your asset lives on is un-laddered on the shipped configuration.** Every plain BTC
+> **Which shape your carrier gets depends on whether its network has an enclave.** Every plain BTC
 > deposit is laddered at claim — trigger → extension → state, relative CSV, pre-signed and
-> un-broadcast (see [getting started §4](getting-started.md)). An RGB **carrier** is not: a plain
-> tier spend is sats-only and would destroy the allocation, so `claim()` leaves carriers off the
-> plain ladder (terminal freeze, [PROTOCOL.md](../spec/PROTOCOL.md) §5.10). `SdkConfig::colored_ladder`
-> — the flag that would give a carrier a *coloured* ladder instead — ships **false** in both
-> constructors, so on the defaults a carrier keeps the **flat signed-once backup** and moves by
-> colored split plus backup-chain handover. That is the load-bearing shape for assets, and it is why
-> the whole of [Over time](#over-time-what-you-and-your-holders-actually-watch) is about absolute
-> locktimes: a carrier has no CSV tier chain, so its exit is not calendar-free the way a laddered
-> coin's is.
+> un-broadcast (see [getting started §4](getting-started.md)). A plain tier spend over an RGB
+> **carrier** is sats-only and would destroy the allocation (terminal freeze,
+> [PROTOCOL.md](../spec/PROTOCOL.md) §5.10), so the carrier needs a *coloured* ladder or none at all
+> — and that is what `SdkConfig::colored_ladder` decides.
 >
-> The exclusion is *conditional, not structural*: with `colored_ladder = true` a single-allocation
-> carrier reaches `build_colored_ladder_auto` and is laddered, coloured. That lane is exercised by
-> `sdk02`, `sdk29`, `sdk31`, `sdk32` and `sdk34`, each of which asks for it by name. The shipped
-> default is what `sdk09`, `sdk36`, `sdk39` and `sdk52` run.
+> It is no longer a stated bool. Both constructors READ the network's pinned attestation identity
+> (`TesrParams::attestation_identity_const`), because the coloured lane establishes its ladders
+> through `claim()` and `claim()` refuses without a pin: true-without-a-pin would ship a wallet whose
+> token lane refuses forever. So **regtest is on** — a carrier there is laddered like any other coin,
+> coloured, via `build_colored_ladder_auto` — and **mainnet is off**, not as a judgement about the
+> lane but because no mainnet enclave is provisioned yet. Pin one and it flips itself.
+>
+> Where it is off, the carrier keeps the **flat signed-once backup** and moves by colored split plus
+> backup-chain handover. That is why the whole of
+> [Over time](#over-time-what-you-and-your-holders-actually-watch) has so much to say about absolute
+> locktimes: a flat carrier has no CSV tier chain, so its exit is not calendar-free the way a laddered
+> coin's is. `sdk02`, `sdk29`, `sdk31`, `sdk32`, `sdk34`, `sdk74`, `sdk75`, `sdk77` and `sdk78` set
+> the flag by name; `sdk09`, `sdk36`, `sdk39`, `sdk52` and `sdk73` inherit whatever the constructor
+> derives.
 
 ## Launch a token (NIA — fixed supply)
 
@@ -58,9 +63,10 @@ the colored deposit that binds the supply to the carrier. After that confirms �
 `5 · (TOKEN_PIECE_SATS + 300) + 666` = **22 536**. Each flat send consumes one
 `TOKEN_PIECE_SATS`-sized piece plus a floored fee reserve, and the last change must still clear the
 sub-coin floor `min_split_output` (666 sat at the committed 3 sat/vB). So a stock carrier affords
-**five chained sends** on the shipped flat lane. On the coloured lane the same 22 536 buys exactly
-**one** send, with the rest landing in a depth-1 change child that can only be moved whole or
-exited — a real cost of that lane, not a rounding.
+**five chained sends** on the legacy flat lane — the size is derived from that lane's depth, and it
+is kept for the networks still on it. On the coloured lane the same 22 536 buys exactly **one** send,
+with the rest landing in a depth-1 change child that can only be moved whole or exited — a real cost
+of that lane, not a rounding.
 
 `issue_token_sized`, `issue_inflatable_token_sized` and `mint_tokens_sized` take the carrier's sats
 as an argument. They exist to reproduce and migrate **under-sized** carriers — a carrier funded
@@ -74,10 +80,14 @@ Two practical consequences of the carrier being a special coin:
   plain-BTC spend of that outpoint would destroy the allocation. Budget the 22 536 sats as part of
   the asset, not as change. (`sdk09` counts confirmed coins rather than sats for exactly this
   reason.)
-- **It gets no plain ladder**, so no `LadderEstablished` event fires for it. `claim()` records
+- **It never gets a *plain* ladder.** Where `colored_ladder` is on it gets a coloured one and
+  `LadderEstablished` fires; where it is off no ladder event fires at all and `claim()` records
   `LadderSkipReason::RgbCarrier` instead, readable back through `ladder_skip_reason` /
-  `flat_only_coins` — with `may_still_be_transferred == true`, because that reason is structural and
-  the coin still moves on the flat lane.
+  `flat_only_coins`. Read the `may_still_be_transferred` element rather than assuming it: that reason
+  used to license a flat whole-coin conveyance and **no longer does** — the licence was retired with
+  the un-laddered shape, on the ground that "this coin is an RGB carrier" stops being a reason a coin
+  may travel without a ladder once carriers are laddered. Distributing the asset is a colored split
+  (below), not a whole-coin handover, so it is a different question from this one.
 
 ## Inflatable supply (IFA): mint and burn
 
@@ -121,13 +131,22 @@ let results = issuer
     .await?;
 ```
 
-What a distribution does: every input carrier is terminalized at the SE (one final co-signature),
-the colored split is co-signed once, and each piece becomes a fresh sub-coin carrying
-`TOKEN_PIECE_SATS` = **4 074** sats of packaging plus the exact token amount as payload. Each piece
-gets its **own fresh signed-once backup at the full initial locktime** — no ladder mechanics enter
-this path, which is why an issuer keeps distributing no matter how long the carrier has been
-sitting. Holders receive, validate the consignment client-side, and re-transfer with the standard
-wallet SDK; there is no issuer involvement after issuance.
+**Which lane those two calls take is decided by `colored_ladder`, and the rest of this section
+describes the flat one.** Where the flag is on, the carrier is laddered and `transfer_tokens` runs the
+**coloured in-ladder split** instead: a coloured `SP` over `X_m`'s payload output — a descendant of
+the trigger, never a rival for `F` — carving a coloured child per recipient, each with its own
+headless coloured ladder (`sdk02`, `sdk29`, `sdk77`). Two differences worth knowing before you read
+on: there is no combine transaction on that lane (`sdk31` — each carrier's `F` is already spent by
+its own trigger, so paying across carriers is one in-ladder split per carrier), and a received
+coloured child carries no `branch-` row at all, its exit material being the five-tier `ctesr-` chain.
+
+What a distribution does on the **flat** lane: every input carrier is terminalized at the SE (one
+final co-signature), the colored split is co-signed once, and each piece becomes a fresh sub-coin
+carrying `TOKEN_PIECE_SATS` = **4 074** sats of packaging plus the exact token amount as payload.
+Each piece gets its **own fresh signed-once backup at the full initial locktime** — no ladder
+mechanics enter this path, which is why an issuer keeps distributing no matter how long the carrier
+has been sitting. Holders receive, validate the consignment client-side, and re-transfer with the
+standard wallet SDK; there is no issuer involvement after issuance.
 
 **Why 4 074 and not a round number.** The piece is a coin like any other: its receiver claims it,
 and if the carrier is coloured that claim wants a coloured root ladder. A coloured rung costs
@@ -184,7 +203,7 @@ stock has been invalidated underneath it; the allocation list is the per-outpoin
 | `createToken(isFreezable, maxSupply…)` | `issue_token` (NIA) / `issue_inflatable_token` (IFA) | metadata immutable, as in Spark; NIA supply fixed at issuance, IFA declares its inflation rights up front |
 | `mintTokens` | `mint_tokens` | IFA only: on-chain inflate + bind to a fresh carrier (`sdk09`); an NIA declares no inflation right, so it has nothing to realize |
 | `burnTokens` | `burn_tokens` | on-chain, engine-held balance only; statechain-bound supply must exit first |
-| `transferTokens` | `transfer_tokens` | colored off-chain split + backup-chain handover |
+| `transferTokens` | `transfer_tokens` | coloured in-ladder split where `colored_ladder` is on; colored off-chain split + backup-chain handover where it is off |
 | `batchTransferTokens` | `batch_transfer_tokens` | one colored split, N pieces + change (`sdk09`) |
 | `freezeTokens` | **intentionally absent** | client-validated assets have no consensus-meaningful freeze; see [tokens](../learn/tokens.md) |
 | `getIssuerTokenBalance` | `get_token_balances` | |
@@ -214,9 +233,12 @@ stock has been invalidated underneath it; the allocation list is the per-outpoin
   root-first (`sdk39`). The automatic route is `auto_exit_due`, which broadcasts the branch and only
   the branch — never the plain backup, which would sweep the sats and destroy the allocation.
   **Materializing settles the asset; it does not exit the coin.** The sats stay on the 2-of-2
-  outpoint, so moving them onward still needs the SE, and no coloured unilateral path ships on the
-  default lane. `unilateral_exit` refuses this class by name and points at the two routes that do
-  exist rather than returning a `complete` `ExitStatus` that would be a false green.
+  outpoint, so moving them onward still needs the SE. That is the flat lane's ceiling, and it is why
+  the coloured ladder matters: where `colored_ladder` is on the carrier has a real unilateral exit
+  (`sdk75` walks a coloured `T → X_0 → S_0` to confirmation with the allocation intact), and where it
+  is off — a network with no enclave yet — it does not. `unilateral_exit` refuses this class by name
+  and points at the two routes that do exist rather than returning a `complete` `ExitStatus` that
+  would be a false green.
   (`materialise_carrier` is the manual call, and it is deliberately narrow: it serves only a carrier
   for which no coloured ladder can ever be built, so that a carrier which could still be laddered
   waits for its ladder instead of being settled early.)
@@ -225,11 +247,12 @@ stock has been invalidated underneath it; the allocation list is the per-outpoin
 
 Tokens are never lost by inactivity: `sdk32` idles the chain a "year" past every deployed horizon
 and the stock still validates the full allocation afterwards. Read its lane label, though — `sdk32`
-asks for `colored_ladder = true`, so it measures the *coloured* form of that claim. The shipped
-default's carrier shape is the one `sdk52` pins (plain coin laddered, carrier not) and `sdk39` exits.
+asks for `colored_ladder = true`, so it measures the *coloured* form of that claim. The flat carrier
+shape is the one `sdk52` pins (plain coin laddered, carrier not) and `sdk39` exits; that is now the
+shape of a network still waiting for its enclave rather than of the regtest default.
 
 A calendar exists here — but not *only* here. A plain laddered coin also keeps an absolute flat
-backup chain and therefore a `min(L_k)` its prior owners hold; what an un-laddered carrier lacks is
+backup chain and therefore a `min(L_k)` its prior owners hold; what a carrier with no ladder lacks is
 the CSV tier chain that makes the *exit* calendar-free. So the difference is the remedy available,
 not the existence of a deadline.
 
@@ -242,8 +265,11 @@ ladder and mints fresh full-locktime backups for its outputs. The standing limit
 cooperative-only movement — a plain unilateral exit is refused, so an issued carrier's supply stays
 where it is until the SE co-signs a colored spend.
 
-**A holder's received piece is a sub-coin carrier** — doubly un-laddered: a carrier (terminal
-freeze) *and* a split sub-coin whose funding is un-broadcast, which cannot root a trigger. It can be
+**A holder's received piece on the flat lane is a sub-coin carrier** — held off the ladder twice
+over: a carrier (terminal freeze) *and* a split sub-coin whose funding is un-broadcast, which cannot
+root a trigger. That second half is permanent and survives every change to the first: colouring a
+tier cannot broadcast a funding output, so an off-chain sub-coin's funding stays un-broadcast on
+every lane, and its `branch-` rows stay its only way down. It can be
 materialized SE-free at any time while the shared root is unspent. It does have a root deadline:
 past it, the *sender's* signed-once backup matures and a malicious sender could sweep the shared
 funding. Holders using this SDK are protected by default — the `auto_exit_due` watchtower

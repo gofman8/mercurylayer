@@ -126,9 +126,12 @@ async fn finish_or_report_conveyance(
 }
 
 /// Which split route a `transfer_many` parent takes. Chosen by the parent's SHAPE, exactly as
-/// `transfer` chooses between `in_ladder_pay` / `child_in_ladder_pay` / `split_coin`: a parent that
-/// carries a TES-R ladder must never take the plain split ([B1] — a retained, un-timelocked trigger
-/// over the parent's funding `F` would void it and destroy every recipient's piece).
+/// `transfer` chooses between `in_ladder_pay` / `child_in_ladder_pay` / `spine_batch_pay`.
+///
+/// There is no plain-split arm to choose any more. It carried [B1]: a retained, un-timelocked
+/// trigger over the parent's funding `F` could void the split and destroy every recipient's piece,
+/// and the recipients could not detect the exposure. Every route here carves out of the LADDER, so
+/// a retained trigger has nothing to race.
 enum ManyRoute {
     /// Laddered ROOT coin: one split state `SP` over `X_m.out[0]`.
     InLadderRoot,
@@ -278,12 +281,13 @@ impl UtexoWallet {
     /// the split floor. `transfer` dispatches on it and `quote_transfer` quotes on it, so neither can
     /// pick a route the other did not.
     ///
-    /// [B3] FAIL CLOSED. A bundle read that FAILS propagates. It must never be read as "no ladder":
-    /// `Unladdered` is both the cheaper cost model (the ~300-sat split reserve instead of the ~2 536-sat
-    /// in-ladder cost) and the LOWER floor (554 instead of 1 310 at the OLD 2 sat/vB rate; 666 / 1 560
-    /// at the shipped 3.0 — [D44]), so a swallowed DB error
-    /// would quote an unfundable payment as fundable and route a laddered coin at un-laddered prices —
-    /// exactly the silent-degradation shape.
+    /// [B3] FAIL CLOSED. A bundle read that FAILS propagates, and must never be read as "no ladder".
+    /// That mattered doubly when "no ladder" was a LANE: it was the cheaper cost model and the lower
+    /// floor, so a swallowed DB error would quote an unfundable payment as fundable and route a
+    /// laddered coin at un-laddered prices — the silent-degradation shape. The lane is gone and the
+    /// rule is unchanged, because the failure it guards against is the READ, not the route: a coin
+    /// whose bundle could not be read is now refused outright, and refusing on a transient DB fault
+    /// would strand a perfectly good coin just as surely as mispricing it did.
     /// The refusing form: every caller that must ROUTE a coin uses this, because with one coin shape
     /// "no ladder" is not a lane to pick, it is a fault to report.
     pub(crate) async fn parent_shape(&self, statechain_id: &str) -> Result<ParentShape> {
@@ -392,20 +396,28 @@ impl UtexoWallet {
         let network = self.inner.config.network.to_string();
 
         // One shape — and therefore one floor — per candidate, resolved ONCE. A failed read
-        // propagates [B3]: it must not become "un-laddered", the cheapest and lowest-floored answer.
-        let mut shapes: Vec<ParentShape> = Vec::with_capacity(coins.len());
+        // propagates [B3]: it must not become a cheaper shape with a lower floor.
+        //
+        // **The PROBE, not the refusing form** — and the difference is a payment that works. A coin
+        // with no ladder cannot be routed, so it is not a CANDIDATE; but resolving it with
+        // `parent_shape` would propagate that refusal with `?` and abort the whole plan, letting one
+        // unroutable coin veto a payment every other coin in the wallet could fund. Exclude the coin,
+        // not the payment. Read FAILURES still propagate, because `parent_shape_opt` returns `Err`
+        // for those and `None` only for "none of the three".
+        let mut shapes: Vec<Option<ParentShape>> = Vec::with_capacity(coins.len());
         for c in coins {
             let sid = c
                 .statechain_id
                 .clone()
                 .ok_or_else(|| anyhow!("coin without statechain id"))?;
-            shapes.push(self.parent_shape(&sid).await?);
+            shapes.push(self.parent_shape_opt(&sid).await?);
         }
         let planning_floor = shapes
             .iter()
             // The SMALLEST floor either leg of any candidate imposes — this is advisory, and the
             // named coin is re-judged per-leg by `split_preflight_pure`, which BINDS.
-            .map(|s| split_output_floors(backup_rate, *s).planning())
+            .filter_map(|s| *s)
+            .map(|s| split_output_floors(backup_rate, s).planning())
             .min()
             // No candidates: the laddered floor stands in, since `claim()` ladders every fresh root
             // coin unconditionally and the laddered case is therefore the default, not the exception.
@@ -414,6 +426,9 @@ impl UtexoWallet {
         let mut candidates: Vec<Candidate> = coins
             .iter()
             .enumerate()
+            // A coin with no ladder is not routable, so it is not a candidate. `index` stays the
+            // index into `coins`, so the plan still names the right coin after the filter.
+            .filter(|(index, _)| shapes[*index].is_some())
             .map(|(index, c)| Candidate {
                 index,
                 amount_sats: c.amount.unwrap_or_default() as u64,
@@ -422,7 +437,9 @@ impl UtexoWallet {
                 // `spinetip-`/`ctesr-`/`tesr-` rows — and never from `amount_sats`. `shapes` is
                 // built by the same `enumerate` over the same slice, so `shapes[index]` is this
                 // coin.
-                is_inventory: shapes[index].is_inventory(),
+                is_inventory: shapes[index]
+                    .expect("filtered to Some just above")
+                    .is_inventory(),
             })
             .collect();
 
@@ -441,7 +458,9 @@ impl UtexoWallet {
                 .ok_or_else(|| anyhow!("coin without statechain id"))?;
             let preflight = split_preflight_pure(
                 backup_rate,
-                shapes[split],
+                // `split` came from `candidates`, which was filtered to routable coins, so this is
+                // always `Some` — but say so rather than unwrapping silently.
+                shapes[split].expect("a chosen candidate is routable"),
                 coins[split].amount.unwrap_or_default() as u64,
                 piece_sats,
             );
@@ -570,10 +589,13 @@ impl UtexoWallet {
                 drop(spendable);
                 drop(record);
 
-                // A laddered (TES-R) coin cannot be split as plain BTC — a prior owner's no-timelock
-                // trigger could void the split [B1]. `ParentShape` therefore selects the executor as
-                // well as the floor: a received CHILD splits at its own level, a root coin splits
-                // in-ladder off its trigger, and only an un-laddered coin takes the plain split.
+                // A coin cannot be split as plain BTC at all any more — that route is DELETED. The
+                // hazard it carried was [B1]: the plain split spent the same `F` a prior owner's
+                // retained, un-timelocked trigger spends, so that owner could void the split and
+                // destroy the payee's sub-coin, undetectably to the payee. `ParentShape` therefore
+                // selects among THREE in-ladder executors, each carving out of the ladder rather
+                // than racing it: a received CHILD splits at its own level, a root coin splits
+                // in-ladder off its trigger, and a spine tip takes the next batch.
                 match shape {
                     ParentShape::Child { .. } => {
                         let (piece_id, _change_id) = self

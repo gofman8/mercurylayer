@@ -43,7 +43,7 @@ receiver-verification set across a transfer), `sdk01`.
 
 | tag | shape |
 |---|---|
-| `0` | branch + backup-chain message — the un-laddered lane |
+| `0` | branch + backup-chain message — the flat lane |
 | `2` | a conveyed TES-R ladder — a whole laddered coin |
 | `4` | a split-child bundle carrying the key handover (`SHAPE_CHILD`) |
 
@@ -52,10 +52,21 @@ receiver-verification set across a transfer), `sdk01`.
 read as "at least". The child gates — the pre-pay census `prepay_child_census` and the claim path's
 `validate_encrypted_message` — each call it and then require exactly `SHAPE_CHILD`.
 
+Tag `0` is still an admissible *receive* shape, and deliberately: a receiver must keep understanding
+a message a legacy or pre-SDK wallet emits. What has changed is the *send* side. The two licences
+that let an ordinary coin travel flat — `licence_rgb_carrier` (an RGB carrier) and
+`licence_funding_not_onchain` (a sub-coin over un-broadcast funding) — are **retired**, along with
+their `PermanentLicence` variants (`clients/libs/rust/src/transfer_sender.rs`), because a carrier is
+laddered now and the plain split that produced the other is deleted. What still licences a flat
+conveyance is narrower, and each is established from *positive* evidence rather than from a recorded
+string: a `single_use` terminalized carrier (the coin's own flag), a pre-migration-0009 coin the
+coordinator answers about with no aggregate on record (re-proved live, that call), and a wallet
+carrying no ladder artefact of any kind and therefore provably never through the SDK's ladder pass.
+
 Residual, and stated in [CHILDREN.md](../spec/CHILDREN.md): the **sender** declares the tag. The
 uniffi FFI strips `protocol_version`, `tesr_ladder` and `child_tesr_bundle` on its way through, and
 exact-set dispatch is what makes a stripped tag fail **closed** instead of landing silently on the
-un-laddered census. What is missing is a floor the *receiver* sets.
+flat census. What is missing is a floor the *receiver* sets.
 
 ## Whole laddered coin: replace-by-lower-timelock
 
@@ -122,12 +133,18 @@ value that disagrees with it is a refusal, not a preference; otherwise a configu
 otherwise **refuse**, because a client with no key to check the signature against must not degrade
 to accepting the key the coordinator serves alongside it.
 
-Two things to say plainly about the shipped state. `attestation_identity_const` returns `None` for
-**every** network — no enclave is provisioned — so today the identity is always the configured one,
-and the operator obtains it out of band from the enclave's own `GET /attestation_identity`
-(`lockbox/src/server.cpp`, over `enclave::attestation_identity_pubkey`). And an identity is pinned
-rather than chain-anchored because a deep split ancestor's funding output is deliberately
-un-broadcast, so there is nothing on chain to bind to.
+Two things to say plainly about the shipped state. `attestation_identity_const` pins **regtest's**
+identity and returns `None` for mainnet, testnet and signet, where no enclave is provisioned. Regtest
+can be pinned precisely because the out-of-band channel is the repository itself — the dev seed is in
+the tree, so `TesrParams::REGTEST_ATTESTATION_IDENTITY` is a fact about the source rather than about
+whichever server happens to answer, and a unit test re-derives it and fails if either the seed or the
+constant moves. On the other three the identity is the configured one, obtained out of band from the
+enclave's own `GET /attestation_identity` (`lockbox/src/server.cpp`, over
+`enclave::attestation_identity_pubkey`); a mainnet pin is not withheld out of caution but because
+there is no mainnet enclave yet, and a *wrong* pin refuses every attestation while inviting the
+"fix" of trusting the coordinator's served key — the exact hole the pin exists to close. And an
+identity is pinned rather than chain-anchored because a deep split ancestor's funding output is
+deliberately un-broadcast, so there is nothing on chain to bind to.
 
 *Evidence:* `sdk46` (the formula against the real SE counter), `sdk47` (R′ across a transfer),
 `sdk54` (adversarial `verify_bundle`), `sdk55` (backup-chain adversarial), `sdk70` (verifier
@@ -200,7 +217,7 @@ Both are `mercurylib::tesr` functions taking the rate as an **argument**, and
 `TesrParams::mainnet()` ships `committed_fee_rate = 3.0` sat/vB with `TIER_VBYTES = 125`, so
 `committed_fee = 375`. Quoting one of these numbers without its rate is quoting a rate, not a floor.
 
-## One planner, four parent shapes
+## One planner, three parent shapes
 
 `transfer()` and `quote_transfer()` call the same `plan_payment`
 (`clients/libs/rust-sdk/src/transfer.rs`), so a quote saying `fundable: true` followed by an
@@ -212,19 +229,31 @@ it:
 | `Root` | `in_ladder_pay` | `SP` over `X_m.out[0]` |
 | `Child` | `child_in_ladder_pay` | `CSP` over `ext_child.out[0]` |
 | `SpineTip` | `spine_batch_pay` | the next batch `SP_{i+1}` over `SP_i.out[K]` |
-| `Unladdered` | `split_coin` | a plain N+1-output split of the funding outpoint |
+
+**There is no fourth row, and its absence is the point.** `ParentShape::Unladdered` used to sit here,
+routing to `split_coin` — a plain N+1-output split of the funding outpoint. Both are deleted. That
+route spent `F` directly, which is the very output a prior owner's retained, un-timelocked trigger
+also spends, so the prior owner could void the split and destroy the payee's sub-coin and the payee
+had no way to see the exposure ([B1]). The hazard is now closed **by construction**: every remaining
+route carves out of the ladder, so nothing a payment builds competes for `F`. `parent_shape` itself
+became a *refusing* function to match — a coin with no root bundle, no child bundle and no tip is a
+coin to repair, not a shape to route, and it says so and names `ladder_skip_reason` as the place the
+wallet already recorded why. `parent_shape_opt` is the probe form, for the one caller
+(`has_exit_material`) where absence is data rather than a fault.
 
 `parent_shape` probes the **spine tip first**, and that has a consequence worth internalising:
 `in_ladder_pay` gives its change leg `ChangeLeg::LastIsTip`, so after your first partial payment
 your change *is* a spine tip, and the second and every later payment out of it take the
-`spine_batch_pay` arm. The `SpineTip` arm exists so a tip cannot fall through to `Unladdered`, which
-would be simultaneously the cheaper cost model, the lower floor and the route to a plain split of a
-laddered coin — three wrong answers from one missing arm.
+`spine_batch_pay` arm. The `SpineTip` arm was added because a tip carries neither a `tesr-` row nor a
+`ctesr-` row, so before it existed a tip fell through three consecutive absences to `Unladdered` —
+simultaneously the cheaper cost model, the lower floor and the route to a plain split of a coin that
+*is* laddered, three wrong answers from one missing arm. With the fall-through now a refusal rather
+than a lane, the tip arm's job is to answer correctly rather than to prevent a loss.
 
 `transfer_many` (sats) and `batch_transfer_tokens` (assets) carve N recipient pieces plus change in
-a single split, and `transfer_many` dispatches on exactly the same four shapes — `in_ladder_pay_many`,
-`child_in_ladder_pay_many`, `spine_batch_pay_many`, and the plain split for an un-laddered parent.
-Width is far cheaper than
+a single split, and `transfer_many` dispatches on exactly the same three shapes — `in_ladder_pay_many`,
+`child_in_ladder_pay_many` and `spine_batch_pay_many`. `ManyRoute::PlainSplit` is gone with them, so
+that match is exhaustive with no tail. Width is far cheaper than
 paying N people in sequence. A batch is bounded by the derived-slot allowance —
 `DERIVED_SLOTS_PER_STATECHAIN = 64` slots, i.e. `MAX_BATCH_RECIPIENTS = 63` recipients, refused by
 name through `SdkError::BatchTooManyRecipients` — and is **not atomic** across recipients.
@@ -348,10 +377,22 @@ chain with `F` untouched. `sdk44` pins the schedule arithmetic.
 ## Token transfers
 
 `transfer_tokens(asset, address, amount)` is a **coloured** off-chain split — the piece carries
-exactly `amount` of the asset, change keeps the rest — plus the same handover. `SdkConfig::colored_ladder`
-ships **false** (`clients/libs/rust-sdk/src/config.rs`), so a carrier takes the flat signed-once
-backup shape rather than a coloured ladder, and the transfer rides the un-laddered lane. The RGB
-consignment travels in the transfer message and the receiving wallet validates it client-side.
+exactly `amount` of the asset, change keeps the rest — plus the same handover. Which coloured split
+it is follows from `SdkConfig::colored_ladder`, which now **reads the enclave pin** rather than
+stating a bool (`TesrParams::attestation_identity_const(network).is_some()`,
+`clients/libs/rust-sdk/src/config.rs`): where an identity is pinned the carrier holds a coloured
+ladder and the payment is a coloured **in-ladder** split conveying a coloured child (shape `4`). The
+RGB consignment travels in the transfer message and the receiving wallet validates it client-side.
+
+Where none is — mainnet, testnet and signet, because no enclave is provisioned there yet — the
+carrier is not laddered, and the legacy flat coloured split is what would build. Note what it no
+longer *clears*, because it is the same retirement as above seen from the token side: that split's
+piece is a sub-coin over un-broadcast funding, so its conveyance goes through
+`assert_flat_conveyance_is_legitimate`, and the two licences that covered exactly this pair — an RGB
+carrier, and a sub-coin whose `F` is not on chain — are the two that were retired. That function
+holds a single `Ok`, reachable only from a proven licence, so the send refuses **before** the
+conveyance rather than degrading to a censusless lane. Those networks are waiting on an enclave, not
+on a flag.
 
 When no single carrier holds the amount, `colored_combine_transfer` spends N carriers of one asset
 into an exact piece plus change in a single SE-co-signed colored combine (N inputs → 2 outputs);

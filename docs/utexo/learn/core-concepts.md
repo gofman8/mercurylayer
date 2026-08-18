@@ -39,7 +39,9 @@ Two properties an implementer must not design around:
   attestation a client checks — what the enclave key *does* sign is the numbers the census rests on
   (`utexo/sig_count/v2`), and the client verifies that signature against a **pinned attestation
   identity**, never against a key served in the same response. `TesrParams::attestation_identity_const`
-  (`lib/src/tesr.rs`) carries no pin for any network yet, so the identity must be configured
+  (`lib/src/tesr.rs`) pins **regtest's** — a pure function of the dev seed this repo commits, so it is
+  a fact about the source and not about a running server — and returns `None` for mainnet, testnet and
+  signet, where no enclave is provisioned. On those networks the identity must be configured
   (`SdkConfig::attestation_identity`); with neither, the client **refuses** rather than degrading.
 
 ## A coin is a timelock ladder (TES-R)
@@ -151,39 +153,62 @@ owner-supplied fee source. An operator may optionally run a *funded* tower; it s
 keys, and its capacity is the number of **confirmed** fee UTXOs it holds, not its balance (TRUC
 allows one unconfirmed ancestor, so chained rescues are refused at any price).
 
-## One protocol, two coin shapes
+## One protocol, one coin shape — three positions in a ladder
 
-Not every coin is laddered, by design. Nothing selects the shape: it follows from what the coin
-carries, and the transfer message's `protocol_version` reports it to the receiver.
+Every coin is laddered. What differs is *where* a coin sits, and — for a token carrier — what colour
+its rungs are. Nothing selects any of this: it follows from what the coin carries, and the transfer
+message's `protocol_version` reports it to the receiver.
 
-| | **Laddered** | **Un-laddered** |
-|---|---|---|
-| Which coins | every plain BTC deposit | **RGB carriers**; split sub-coins whose funding is un-broadcast |
-| Exit material | `T → X_m → S_k`, relative CSV, un-broadcast | the signed-once backup, absolute nLockTime, plus the branch |
-| A transfer | co-signs a state one δ lower | pre-signs the receiver's backup at `previous − interval` |
-| Ageing | no CSV clock; the retained flat chain still carries `min(L_k)` | absolute locktimes; a received coin has a root deadline |
-| Owner duty while idle | defend `min(L_k)` (`deadline_safety_due`) | materialize the branch before the deadline (`auto_exit_due`, default on) |
+| | **Root** | **Split child** | **Spine tip** |
+|---|---|---|---|
+| Which coins | every confirmed deposit — plain, or coloured if it is a carrier | the payee's leg of an in-ladder split | the sender's change leg of one |
+| Funding | `F`, **on chain** | `SP.out[j]`, **un-broadcast** | `SP.out[K]`, **un-broadcast** |
+| Exit material | `T → X_m → S_k`, relative CSV, un-broadcast | the whole chain back to the parent's `F`: `T → X_m → SP → ext_child → state_child` | the same, capped by ONE tier over `SP.out[K]` |
+| A payment out of it | `in_ladder_pay` — a split state `SP` over `X_m.out[0]` | `child_in_ladder_pay` — the same at the child's own level | `spine_batch_pay` — the next batch `SP_{i+1}` over `SP_i.out[K]`, retiring the previous cap |
+| Ageing | no CSV clock; the retained flat chain still carries `min(L_k)` | no CSV clock; inherits the root's epoch | no CSV clock; inherits the root's epoch |
 
-Why the second shape exists:
+`parent_shape` (`clients/libs/rust-sdk/src/transfer.rs`) is the one resolution of that question, and
+it is a **refusing** function: a coin carrying none of the three is a coin to repair, not a shape to
+route. `parent_shape_opt` is the probe form, for the one caller — `has_exit_material` — where absence
+is data rather than a fault.
 
-- **An RGB carrier is not given a plain ladder.** RGB transitions may anchor only in signed-once
-  transactions, and a plain tier spend is sats-only — it would sweep the carrier and destroy the
-  allocation. This is the *terminal-freeze* rule, and it is load-bearing for tokens. `sdk52` pins it:
-  in one wallet the plain coin carries a ladder and the token carrier carries none, and an off-chain
-  RGB transfer still settles.
-  A **coloured** ladder — every tier carrying a valid RGB state transition — exists behind
-  `SdkConfig::colored_ladder`, which **ships `false`** on both presets. So the shipped default for a
-  carrier is the flat signed-once shape, with the calendar duties that come with it. `sdk74`
-  (establish), `sdk75` (exit), `sdk77` (coloured in-ladder split) exercise the flag turned on;
-  `colored_ladder_health` reports on a coloured carrier, and `LadderSkipReason` names why a given
-  coin fell back.
-- **A split sub-coin over un-broadcast funding cannot root a trigger** — a trigger needs a confirmed
-  prevout, and a v3 tier cannot relay over an unconfirmed parent. This is checked against the chain
-  fail-closed, never inferred.
+Two things about that table are worth spelling out, because each used to be a separate "shape":
+
+- **A carrier is laddered like any other coin — its rungs are just coloured.** RGB transitions may
+  anchor only in signed-once transactions, and a *plain* tier spend is sats-only: it would sweep the
+  carrier and destroy the allocation. That is the *terminal-freeze* rule, it is load-bearing for
+  tokens, and it is why a carrier may never be given a plain ladder. The answer is a **coloured**
+  ladder — every tier carrying its own valid RGB state transition, so the walk *moves* the allocation
+  instead (`sdk74` establish, `sdk75` exit, `sdk77` coloured in-ladder split; `colored_ladder_health`
+  reports on one). `SdkConfig::colored_ladder` selects it by **reading the enclave pin** —
+  `TesrParams::attestation_identity_const(network).is_some()` — rather than stating a bool, because
+  colouring a carrier buys nothing without an identity to verify its terminality against. Regtest is
+  pinned and ships **on**; mainnet is off solely because **no mainnet enclave is provisioned yet**,
+  and pinning a real identity flips it with no other change ([`../spec/SPEC.md`](../spec/SPEC.md)
+  §0.4 rows V-1 and V-6). Where a carrier still falls back, `LadderSkipReason` names why.
+- **A split sub-coin's funding is un-broadcast, and colouring cannot change that.** `SP.out[j]` is an
+  output of a transaction nobody has broadcast, so the sub-coin can never root a **trigger** of its
+  own — a trigger needs a confirmed prevout, and a v3 tier cannot relay over an unconfirmed parent.
+  This is checked against the chain fail-closed, never inferred. Far from a defect, it is the source
+  of the whole property: an un-broadcast funding output costs 0 vB of rent and ages toward nothing.
+  What it means practically is that a child's exit material reaches back through its parent, and that
+  a coloured sub-coin's stored `branch-` rows — the un-broadcast coloured split/combine transactions
+  — are what settle its allocation on chain.
 
 A received carrier's deadline duty is handled by the SDK's watchtower, which materializes the
 coloured branch before the clawback window opens (`materialise_carrier`; `sdk34`, with `sdk32`
 documenting the residual window if nobody acts).
+
+**The shape that is gone is the plain un-laddered one.** `ParentShape::Unladdered`, `split_coin`, the
+plain off-chain split and `ManyRoute::PlainSplit` are deleted, along with the flat-lane licences that
+let an RGB carrier or an un-broadcast-funding sub-coin travel without a ladder
+(`licence_rgb_carrier`, `licence_funding_not_onchain`, and their `PermanentLicence` variants —
+`clients/libs/rust/src/transfer_sender.rs`). That deletion **closes [B1] by construction**: a plain
+split spent the coin's funding output `F` directly, which is the same output a prior owner's
+retained, un-timelocked trigger spends, so that owner could void the split and destroy the payee's
+sub-coin — and the payee could not detect the exposure. There is no longer a route that spends `F`,
+so there is nothing for a retained trigger to race. The in-ladder split, which carves out of
+`X_m.out[0]` and is therefore a *descendant* of the trigger, is the only split there is.
 
 ## Splits, the spine, and children
 
@@ -274,8 +299,9 @@ number that ships.
 
 A transfer is a **key handover** — no block, no fee, sub-second, fully async:
 
-1. the sender co-signs the receiver's new state (laddered) or pre-signs the receiver's backup
-   (un-laddered), and posts an encrypted transfer message through the SE's relay;
+1. the sender co-signs the receiver-paying state `S'` **and** pre-signs the receiver's flat backup at
+   `previous − interval` — every transfer hands over both, which is why the census counts both — then
+   posts an encrypted transfer message through the SE's relay;
 2. the receiver validates everything, then calls the SE, which **rotates its key share** — from that
    moment only receiver + SE can sign, and the sender's share is dead.
 
@@ -331,9 +357,10 @@ Tokens are **RGB assets**: client-validated contracts whose allocations live on 
 The server knows nothing about tokens — validation is done by the receiving wallet against
 cryptographic consignments. Two rules matter at concept level:
 
-- RGB transitions anchor **only in signed-once transactions** — coloured splits and combines, and
-  coloured self-transitions. Plain ladder tiers are sats-only and would destroy an allocation, which
-  is why the shipped default gives a carrier no ladder at all.
+- RGB transitions anchor **only in signed-once transactions** — coloured splits and combines,
+  coloured self-transitions, and coloured *tiers*. Plain ladder tiers are sats-only and would destroy
+  an allocation, which is why a carrier may never be given a **plain** ladder; the ladder it is given
+  instead is a coloured one, wherever an enclave attestation identity is pinned.
 - **Terminal-freeze**: a coloured transaction only ever spends outputs of *terminalized* structure,
   so no ancestor of an RGB anchor is ever re-signed and no superseded coloured witness exists
   anywhere. The corollary is a lane rule enforced by `verify_flat_backup_lane`: on a coloured bundle
@@ -372,13 +399,17 @@ in-ladder child relies on the census plus the key handover instead. See [lightni
   your L1 address, no timelock, no waiting. One exception: a *received in-ladder child* has no
   confirmed outpoint to spend (its funding `SP.out[j]` is un-broadcast), so it routes to the
   unilateral walk instead, whose final state already pays your own key.
-- **Unilateral (SE gone)**: never needs anyone's cooperation. On a **laddered** coin you walk the
-  pre-signed chain tier by tier, waiting out each relative timelock — `T`, then `X`, then `S`, plus
-  the tiers of each split level. On an **un-laddered** coin you broadcast the branch and then the
-  signed-once backup once its absolute locktime passes; your backup unlocks earlier than every
-  previous owner's, so you win the race.
-- **Tokens** exit by **materializing** the coloured branch — both plain paths refuse a carrier, since
-  an RGB-unaware sweep would destroy the allocation.
+- **Unilateral (SE gone)**: never needs anyone's cooperation. You walk the pre-signed chain tier by
+  tier, waiting out each relative timelock — `T`, then `X`, then `S`, plus the tiers of each split
+  level. A **coloured** carrier walks the identical chain, and because every tier is a valid RGB
+  transition the walk moves the allocation to your own key rather than sweeping it away.
+- **A coin carrying only flat material** — a legacy pre-ladder coin, or one whose `claim()` never
+  completed — still has `unilateral_exit`'s last arm: broadcast the branch, then the signed-once
+  backup once its absolute locktime passes. Your backup unlocks earlier than every previous owner's,
+  so you win the race. That arm **refuses a carrier by name**, at the point of no return, because
+  everything it would broadcast is an RGB-unaware spend of `F`.
+- **Tokens with no coloured ladder** exit by **materializing** the coloured branch instead — both
+  plain paths refuse a carrier, since an RGB-unaware sweep would destroy the allocation.
 
 `estimate_exit_cost` prices a specific coin's walk before you commit to it.
 

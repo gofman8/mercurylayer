@@ -17,47 +17,72 @@ branch-verified receiving, and an on-chain settlement path that needs nobody's p
 (materialize the branch — see [Exits with tokens](#exits-with-tokens); it is not the plain one-tx
 sweep sats get).
 
-## The carrier, and why it is not laddered
+## The carrier, and why its ladder is coloured
 
 A coin that holds an RGB allocation is a **carrier**.
 
 `claim()` establishes a TES-R exit ladder — `T` trigger → `X_m` extension → `S_k` state, relative
-CSV, all un-broadcast — for every fresh confirmed **root** coin, once an enclave attestation identity
-is pinned. (No network compiles one in and neither `SdkConfig` constructor supplies one, so on the
-shipped defaults the pass records `LadderSkipReason::AttestationIdentityUnpinned` and leaves the coin
-flat until an operator sets `SdkConfig::attestation_identity` or `UTEXO_ATTESTATION_IDENTITY` —
-[`../spec/SPEC.md`](../spec/SPEC.md) §0.4 row V-6.) A carrier is the exception regardless. A plain
-tier is a **sats-only** spend of the carrier's funding output `F`, so broadcasting one destroys the
-allocation: [`../spec/PROTOCOL.md`](../spec/PROTOCOL.md) §5.10 rule 1 (terminal freeze),
-[`../spec/SPEC.md`](../spec/SPEC.md) INV-29. `sdk52` pins it on the live stack — in one wallet the
-plain coin carries a ladder, the carrier carries none, and an off-chain RGB transfer still settles.
+CSV, all un-broadcast — for every fresh confirmed **root** coin. A carrier is not exempt from that
+any more, but it may never be given a **plain** ladder: a plain tier is a *sats-only* spend of the
+carrier's funding output `F`, so broadcasting one destroys the allocation
+([`../spec/PROTOCOL.md`](../spec/PROTOCOL.md) §5.10 rule 1, terminal freeze;
+[`../spec/SPEC.md`](../spec/SPEC.md) INV-29). What it gets instead is a **coloured** ladder — every
+tier a coloured tier carrying its own RGB state transition (CTES-R) — so that the same walk which
+exits a plain coin *moves* the allocation rather than sweeping it away.
 
-**The exclusion is conditional, and the condition ships off.** The decision site in `claim()` is
-`match (self.inner.config.colored_ladder, one)` (`UtexoWallet::claim`,
-`clients/libs/rust-sdk/src/wallet.rs`), where `one` is the single booked allocation on the carrier's
-outpoint. With `colored_ladder` set *and* exactly one allocation resolved, the carrier reaches
-`mercuryrustlib::tesr::build_colored_ladder_auto` + `cosign_colored_ladder` and **is** laddered —
-with every tier a *coloured* tier carrying its own RGB state transition (CTES-R). Every other case
-records `LadderSkipReason::RgbCarrier` and leaves the coin flat.
+The decision site in `claim()` is `match (self.inner.config.colored_ladder, one)`
+(`UtexoWallet::claim`, `clients/libs/rust-sdk/src/wallet.rs`), where `one` is the single booked
+allocation on the carrier's outpoint. With `colored_ladder` set *and* exactly one allocation resolved,
+the carrier reaches `mercuryrustlib::tesr::build_colored_ladder_auto` + `cosign_colored_ladder` and
+**is** laddered. Every other case records `LadderSkipReason::RgbCarrier` and leaves the coin flat.
 
-`SdkConfig::colored_ladder` ships **`false`** in both `SdkConfig::regtest` and `SdkConfig::mainnet`.
-So on the shipped configuration a carrier is not laddered at all, and takes the flat signed-once
-shape instead:
+**What decides `colored_ladder` is the enclave pin, not a preference.** It is no longer a bool the
+constructors state; both presets compute it as
+`TesrParams::attestation_identity_const(network).is_some()`
+(`clients/libs/rust-sdk/src/config.rs`). The coupling is the point: colouring a carrier retires the
+legacy coloured-split lane for it, and the CTES-R lane that replaces that lane cannot establish
+anything without an identity to verify the enclave's attestation against — so `true` with no pin is
+not a bolder default, it is a wallet whose token lane refuses forever while claiming to be retryable.
+Reading the pin makes the two unable to disagree.
 
-| | Flat carrier (shipped) | Coloured ladder (`colored_ladder = true`) |
+- **regtest is pinned** (`TesrParams::REGTEST_ATTESTATION_IDENTITY`, derived from the dev seed this
+  repository commits, so the key is a fact about the source rather than about a running server), and
+  therefore ships **on**.
+- **mainnet, testnet and signet evaluate false**, for one reason: **no enclave is provisioned there
+  yet**, so there is no identity to pin. Inventing one would be worse than leaving it absent — a wrong
+  pin refuses every attestation, and the obvious "fix" is to trust the key the coordinator serves,
+  which is exactly the hole the pin exists to close. Publishing a real enclave identity and pinning it
+  turns this true with no other change. [`../spec/SPEC.md`](../spec/SPEC.md) §0.4 rows V-1 and V-6.
+
+So the two lanes below are not "shipped vs experimental" — they are "wherever an enclave is
+provisioned" vs "not yet there":
+
+| | Coloured ladder (an enclave identity is pinned) | Flat carrier (none is) |
 |---|---|---|
-| Exit material | the signed-once backup chain ([SPEC §2.4](../spec/SPEC.md)) plus the un-broadcast colored split/combine branch | `T → X_m → S_0`, coloured; a received piece walks five tiers `T → X_m → SP → ext_child → state_child` |
-| Calendar | an **absolute**-locktime deadline anchored at `deposit_height + initlock` | the retained flat chain still carries a calendar; the tier walk itself is relative-CSV |
-| Payment shape | flat colored split over `F` (`create_colored_split_tx`) | coloured in-ladder split (`colored_in_ladder_pay`) |
-| Sends per carrier | `LEGACY_CARRIER_SEND_DEPTH` = **5** chained splits | **1** — the change is a depth-1 coloured child that three named guards refuse to split again |
-| Multi-payee batch | supported (`batch_transfer_tokens`, `sdk09`) | refused by name (`refuse_colored_multi_payee`) |
-| Re-anchor | none — `refresh` refuses a carrier | `colored_reanchor` (coloured de-trigger) |
-| Unilateral exit | none — a plain tier spend would destroy the allocation | the coloured walk moves the allocation to the owner's own key (`sdk74`, `sdk75`) |
+| Exit material | `T → X_m → S_0`, coloured; a received piece walks five tiers `T → X_m → SP → ext_child → state_child` | the signed-once backup chain ([SPEC §2.4](../spec/SPEC.md)) plus the un-broadcast colored split/combine branch |
+| Calendar | the retained flat chain still carries a calendar; the tier walk itself is relative-CSV | an **absolute**-locktime deadline anchored at `deposit_height + initlock` |
+| Payment shape | coloured in-ladder split (`colored_in_ladder_pay`) | flat colored split over `F` (`create_colored_split_tx`) |
+| Sends per carrier | **1** — the change is a depth-1 coloured child that three named guards refuse to split again | `LEGACY_CARRIER_SEND_DEPTH` = **5** chained splits |
+| Multi-payee batch | refused by name (`refuse_colored_multi_payee`) | supported (`batch_transfer_tokens`, `sdk09`) |
+| Re-anchor | `colored_reanchor` (coloured de-trigger) | none — `refresh` refuses a carrier |
+| Unilateral exit | the coloured walk moves the allocation to the owner's own key (`sdk74`, `sdk75`) | none — every pre-signed spend of `F` this wallet holds is RGB-unaware |
 
-Everything below describes the shipped flat shape unless it says otherwise. The coloured lane is
-built and exercised (`sdk74`, `sdk75`, `sdk77`, `sdk87`, `sdk88` each set the flag by name); it is
-not the default, and [`../spec/SPEC.md`](../spec/SPEC.md) §0.4 row V-1 is where that divergence is
-registered.
+The coloured lane is built and exercised end to end (`sdk74` establish, `sdk75` exit, `sdk77`
+coloured in-ladder split, `sdk87` / `sdk88` deadline and headroom).
+
+**Read the right-hand column's payment rows against the licence retirement, because it moved them.**
+That column describes what a carrier still *is* where no identity is pinned, and its exit and
+calendar rows are unchanged. Its *send* rows are not. The licence that used to permit a flat
+carrier's conveyance — `licence_rgb_carrier`, on the reason spelling `rgb-carrier` — is **retired**
+(`clients/libs/rust/src/transfer_sender.rs`), because "this coin is an RGB carrier" has stopped being
+a reason a coin may move without a ladder; and `licence_funding_not_onchain` went with it, which is
+the one that covered the *piece* a flat colored split mints over un-broadcast funding.
+`assert_flat_conveyance_is_legitimate` holds exactly one `Ok` and it is reachable only from a proven
+licence, so with both gone the flat lane's hand-over refuses rather than degrading — the five chained
+sends are what the carrier is still *sized* for (below), not what it can complete today. The reasons
+are still *recorded* so the state is visible; they simply no longer open the gate. That is the sharp
+end of "waiting on an enclave": on an unpinned network a flat carrier is holding and settlement, not
+payment.
 
 ## Where the sats come from — the carrier is sized, not rounded
 
@@ -138,7 +163,7 @@ so the two can never drift apart.
 **Multiple carriers.** If no single carrier holds the amount, `transfer_tokens` spans several, and
 the two lanes span them differently.
 
-On the shipped flat lane it COMBINEs — N carriers → exact piece + change in one SE-co-signed colored
+On the flat lane it COMBINEs — N carriers → exact piece + change in one SE-co-signed colored
 combine tx (`colored_combine_transfer`, over `mercuryrustlib::rgb::create_colored_combine_tx`). Every
 combined carrier is made terminal first, and the receiver validates the multi-input branch requiring
 **all N** input carriers to be terminal: `required_terminal_ancestors` counts one per structural
@@ -181,16 +206,18 @@ A carrier refuses the plain exit operations, and each refusal has a reason:
   ([SPEC §9.1](../spec/SPEC.md)). `sdk02` asserts exactly this: a cooperative sweep of a wallet
   holding a received token coin sweeps **nothing**, and the balance survives intact. (That test runs
   with `colored_ladder` set, but the refusal is lane-independent — `withdraw` never consults the flag.)
-* **`unilateral_exit`** likewise excludes carriers, with one opening: a carrier whose ladder **is
+* **`unilateral_exit`** likewise excludes carriers, with one opening — and on a network whose
+  enclave identity is pinned that opening is now the normal case: a carrier whose ladder **is
   coloured** may walk it, because every tier is then a valid RGB state transition and the walk moves
-  the allocation to the owner's own key. On the shipped flat shape there is no such ladder, so the
-  call refuses.
+  the allocation to the owner's own key. Where no such ladder exists the call refuses, and it refuses
+  *by name* rather than returning `complete` on a walk it did not perform — naming the two routes
+  that do exist, `materialise_carrier` and `transfer_tokens`.
 * **`refresh`** (the cooperative on-chain re-anchor) refuses carriers outright — it routes through
   `withdraw`, which is RGB-unaware, so a plain re-anchor would move the sats and destroy the
   allocation. The coloured counterpart is `colored_reanchor` (broadcast `T`, then co-sign and
   broadcast a coloured de-trigger — two transactions, zero CSV wait, no SE change), and it needs a
-  **coloured ladder** to build from. On the shipped flat shape there is none, so the refusal names
-  that too: move the asset off the coin first.
+  **coloured ladder** to build from. Where there is none, the refusal names that too: move the asset
+  off the coin first.
 
 Token settlement instead means **materializing the coin's branch on-chain**: broadcasting the stored
 `branch-<id>` rows, which for a carrier *are* the un-broadcast coloured split/combine transactions —
@@ -215,20 +242,24 @@ success.
 *"If I issue or receive tokens and then do nothing for a year, do I lose them?"* No. Tokens are never
 lost by inactivity. What differs is what still works, and that depends on how you got them.
 
-**Tokens you issued or minted — a flat carrier, funded on-chain.** It has no ladder to age on
-(terminal freeze keeps it off the T/X/S tiers), and no ancestor above it, so there is no clawback
-risk. What it does have is its signed-once deposit backup, whose absolute locktime matures at
-`deposit_height + initlock` — `TesrParams::flat_ladder_params` compiles that in per network: 10 000
-blocks head start with 100 per hop on mainnet, testnet and signet; 1 000 / 10 on regtest. That
-maturity does not stop you sending: a token transfer is a colored *split*, which never touches a
-ladder, and each sub-coin it mints gets its **own fresh** backup at the full initial locktime
-(`create_tx1(.., tx_n = 1)`). Movement needs the SE — there is no plain unilateral path off a
-carrier — so an issued carrier's tokens stay where they are until the SE co-signs a colored spend.
+**Tokens you issued or minted — a root carrier, funded on-chain.** Terminal freeze keeps it off the
+*plain* T/X/S tiers for good; whether it gets *coloured* ones depends on the enclave pin above. Either
+way it has no ancestor, so there is no clawback risk. What it always keeps is its signed-once deposit
+backup, whose absolute locktime matures at `deposit_height + initlock` —
+`TesrParams::flat_ladder_params` compiles that in per network: 10 000 blocks head start with 100 per
+hop on mainnet, testnet and signet; 1 000 / 10 on regtest. That maturity does not stop you sending: a
+token transfer is a colored *split*, and each sub-coin it mints gets its **own fresh** backup at the
+full initial locktime (`create_tx1(.., tx_n = 1)`). A carrier travelling flat has no unilateral path
+off it at all, and since the licence retirement no flat hand-over either, so its tokens stay put
+until the carrier can be laddered — which is the enclave pin again, not a decision; a coloured
+one can walk its own ladder instead.
 
-**Tokens you received — a sub-coin carrier.** Doubly un-laddered: it is a carrier, *and* a split
-sub-coin whose funding is un-broadcast and therefore cannot root a trigger. Also not lost, and here
-there is an **SE-free** option: the exit branch is locktime-free, so broadcasting it materializes the
-allocation on-chain at any time — as long as the shared root is still unspent.
+**Tokens you received — a sub-coin carrier**, funded by an output of an un-broadcast split. That
+funding is why it can never root a **trigger** of its own — and colouring a tier does not change it,
+because nothing can broadcast a funding output that was never meant to be broadcast. Its exit
+material reaches back through its parent instead. Also not lost, and here there is an **SE-free**
+option: the exit branch is locktime-free, so broadcasting it materializes the allocation on-chain at
+any time — as long as the shared root is still unspent.
 
 That last clause is the whole risk, and it is handled automatically. Past the root deadline the
 *sender's* own retained deposit backup matures. It is an RGB-unaware spend of the very funding output
@@ -292,10 +323,14 @@ of the same asset, or materialize it.
 
 **Summary.** Never lost. Cooperative operations work throughout. A received token's unilateral
 materialization works indefinitely while the shared root is unspent — and the watchtower keeps it
-unspent for you, so even an offline receiver is protected. Note the asymmetry with sats: a plain
-**laddered** coin's exit is a relative CSV on an un-broadcast trigger, so idling costs it nothing,
-while a token carrier keeps a root deadline precisely because terminal freeze holds it off the
-ladder. That is the price of anchoring RGB in signed-once transactions, and it is deliberate.
+unspent for you, so even an offline receiver is protected. The asymmetry with sats is narrower than it
+used to be, and worth stating exactly. Every coin, plain or coloured, has its CSV clock stopped by an
+un-broadcast trigger and still keeps the retained flat chain's `min(L_k)`, so on the *calendar* the
+two are alike. What still differs is the escape hatch: a plain coin's walk is always available,
+whereas a carrier's is available only if its ladder is **coloured** — and where no enclave identity is
+pinned it is not, so materializing the branch is the whole of that carrier's SE-free story. That is
+the residual price of anchoring RGB in signed-once transactions, and it shrinks to nothing on a
+network with a provisioned enclave.
 
 ---
 

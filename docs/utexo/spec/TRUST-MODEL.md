@@ -1,16 +1,33 @@
 # Trust model — who trusts whom, what is verified instead, and what cannot be solved
 
-> ## ⚠️ Direction of travel: ONE COIN TYPE
+> ## ⚠️ Direction of travel: ONE COIN TYPE — arrived, except where no enclave is provisioned
 >
-> The trust boundaries below are stated for both coin shapes as built today — *laddered* (TES-R) and
-> *un-laddered* (RGB carriers and un-broadcast split sub-coins). **That is a transitional state, not
-> the target architecture.** The decided direction is a single coin type; the un-laddered shape is
-> being removed.
+> The trust boundaries below were written for two coin shapes — *laddered* (TES-R) and *un-laddered*
+> (RGB carriers and branch-funded split sub-coins). **The un-laddered SHAPE is now retired as a lane.**
+> An RGB carrier is laddered like any other coin, with every tier carrying a valid RGB state
+> transition (CTES-R); `ParentShape::Unladdered`, the plain off-chain split `split_coin` and every
+> route into them are deleted, and `parent_shape` REFUSES a coin with no ladder rather than routing it.
 >
-> Several residuals recorded here belong to that shape and go away with it — notably **B2**, the
-> terminal-parent proofs that are checked by COUNT rather than cryptographically bound to the branch
-> inputs. An independent review rates that CRITICAL; it is not being patched, because the code that
-> contains it is scheduled for deletion rather than hardening.
+> **Read the residual as narrow, not as absent.** `SdkConfig::colored_ladder` READS the network's
+> compiled-in enclave attestation pin instead of stating a bool, so it is ON where an identity is
+> pinned (regtest) and OFF where none is (mainnet, testnet, signet) — not as a policy choice but
+> because without a pin `claim()` can establish no ladder at all, so the flag on would mean a wallet
+> that refuses token transfers permanently. Mainnet is therefore waiting on an ENCLAVE, not on a
+> decision (`SPEC.md` §0.4 V-6). Two carrier classes also still travel flat: one the coloured builder
+> could not take *this pass* (retried at the next `claim()`), and one for which no coloured ladder can
+> ever be built, which reaches the legacy RGB-aware lane through `tokens::migration_hatch_verdict` —
+> proved read-only, per coin, under the lock that would otherwise build the ladder.
+>
+> **What is NOT retired, and must not be read as retired: un-broadcast funding.** Colouring a tier
+> cannot broadcast a funding output. Every in-ladder split child and every spine-tip change leg still
+> rests on an un-broadcast `SP.out[j]` — that is what the design exists to produce — so every boundary
+> below that turns on "this coin's funding output is not on chain" stands unchanged, B11 among them.
+>
+> Several residuals recorded here belong to the flat BRANCH lane and shrink with it — notably **B2**,
+> the terminal-parent proofs that are checked by COUNT rather than cryptographically bound to the
+> branch inputs. An independent review rates that CRITICAL; it is not being patched, because the code
+> that contains it is scheduled for deletion rather than hardening once the last producers of that
+> lane are gone.
 >
 > Two boundaries that do NOT go away, and should not be read as transitional: the single-SE trust
 > unit itself, and the **root** epoch — **10,000 blocks ≈ 69.4 days** on mainnet/testnet/signet
@@ -24,11 +41,13 @@
 > coloured **de-trigger** whose relative lock is disabled: two txs, zero CSV wait, no SE change).
 > A coloured coin therefore does not have a bounded life ending in a forced exit.
 >
-> Colouring is **wired but default-OFF** (`SdkConfig::colored_ladder = false` on both presets): the
-> claim path builds and co-signs a coloured ladder when it is on (`build_colored_ladder_auto` /
-> `cosign_colored_ladder`), the coloured in-ladder split pays from it, `colored_reanchor` re-anchors
-> it, and `defend_ladders` watches it. Everything below describes the **default** configuration,
-> which is the un-coloured one.
+> Colouring is **wired and default-ON wherever an attestation identity is pinned**
+> (`SdkConfig::colored_ladder` reads `TesrParams::attestation_identity_const`, `lib/src/tesr.rs`, so
+> the two can no longer disagree): the claim path builds and co-signs a coloured ladder
+> (`build_colored_ladder_auto` / `cosign_colored_ladder`), the coloured in-ladder split pays from it,
+> `colored_reanchor` re-anchors it, and `defend_ladders` watches it. Where the pin is absent the flag
+> is off and the flat carrier lane below is what a wallet actually runs — so both descriptions are
+> live, and which one applies is a property of the NETWORK, not of a preference.
 
 Every party a user interacts with — sender, receiver, the statechain entity (SE), the watchtower,
 the Bitcoin indexer, the RGB proxy, operators — and, for each: what flows between them, what the
@@ -46,26 +65,47 @@ laddered coin's root `min(L_k)` clock is defended by the owner's own running wal
 One gap does not fit that summary and is stated in full in §3: between conveyance and claim, the
 server side is held by a **wall-clock one-hour timer**, not by ownership.
 
-### One protocol, two coin shapes
+### One protocol, one coin shape — and the flat residual that is not one
 
 There is exactly **one protocol**. `claim()` establishes a TES-R ladder — trigger `T` → extension
 `X_m` → state `S`, relative CSV, un-broadcast — for every fresh confirmed ROOT coin,
-unconditionally; there is no per-deposit protocol switch. Under that one protocol a coin has one of
-two **shapes**, and both are current:
+unconditionally; there is no per-deposit protocol switch. Under that one protocol:
 
 - **LADDERED** — every plain deposit. Exit is the pre-signed tier chain. The **tiers** never age (no
   absolute locktime, 0 vB of on-chain rent) and renewal is off-chain and unbounded (`sdk43`, `sdk40`
   PART 3). The *coin* still carries one absolute height — `min(L_k)` over its flat backup chain,
   held by its prior owners — which is what `deadline_safety_due` defends (§5, B4). "Never ages" is a
   statement about the ladder, not about the root.
-- **UN-LADDERED** — an RGB **carrier** is deliberately never given a *plain* ladder (a plain tier
-  spend would destroy the allocation — terminal-freeze, PROTOCOL.md §5.10, `sdk52`; with
-  `colored_ladder = true` it gets a COLOURED ladder instead, every tier carrying a valid RGB state
-  transition, and it falls back to this un-laddered shape whenever the coloured lane cannot be taken
-  for that coin — `LadderSkipReason::RgbCarrier`), and a split sub-coin whose
-  funding is un-broadcast has no on-chain outpoint to root a trigger. These keep the signed-once
-  backup and transfer by backup-chain handover. **This lane is load-bearing for tokens**, not a
-  legacy remnant.
+- **LADDERED, AND COLOURED** — an RGB **carrier** is never given a *plain* ladder (a plain tier spend
+  would destroy the allocation — terminal-freeze, PROTOCOL.md §5.10, `sdk52`). It gets a COLOURED one
+  instead, every tier carrying a valid RGB state transition, so laddering MOVES the allocation rather
+  than destroying it (`sdk74` establish/renew/convey, `sdk75` the on-chain unilateral walk). This is
+  the default wherever an attestation identity is pinned, because `colored_ladder` reads that pin.
+- **UN-BROADCAST FUNDING is a property, not a third shape.** A split sub-coin's funding output is
+  un-broadcast, so it has no on-chain outpoint to root a trigger — permanently true, and unaffected by
+  colouring. Such a coin is an in-ladder CHILD carrying its own `ctesr-` bundle, or a `spinetip-` tip;
+  it is not routed down a separate lane.
+
+**One hazard is now CLOSED BY CONSTRUCTION, and it is worth stating rather than deleting.** The plain
+off-chain split spent the coin's funding output `F` directly. A prior owner's retained trigger `T`
+spends the same `F` and carries **no timelock**, so the two were rival spends of one outpoint decided
+by first-seen and fee — the prior owner could void the split and destroy the payee's sub-coin, and the
+payee had no way to detect the exposure before accepting the coin. That is the hazard the code tags
+`[B1]` at its split sites (**not** this document's B1, which is SE + old-owner collusion and is
+untouched by any of this). It used to be answered by a refusal inside `split_coin` and by
+`ParentShape`'s dispatch choosing an in-ladder route for a laddered parent. It is now answered by
+absence: `split_coin`, `ParentShape::Unladdered`, `ManyRoute::PlainSplit` and `ensure_exact_coin`'s
+minting fallback are deleted, so there is no call site left that can pose it. Every split is a STATE
+tier `SP` over `X_m.out[0]` — a **descendant** of `T`, never a rival for `F`.
+
+**The flat residual.** A carrier still falls back to the signed-once backup + branch shape when the
+coloured lane cannot be taken *for that coin* (`LadderSkipReason::RgbCarrier` — allocation not booked
+yet, more than one allocation on the outpoint, RGB state unreadable this pass; retried at the next
+`claim()`), when no coloured ladder can ever be built for it (the sub-floor pre-flip pieces, which
+reach the legacy RGB-aware lane through `tokens::migration_hatch_verdict`), and on any network with no
+pinned enclave identity. That residual is what every "flat lane" / "branch lane" statement below is
+about. It is **load-bearing for those coins**, not a legacy remnant — but it is no longer the shape a
+healthy wallet routes tokens through.
 
 Read §2 with that split in mind: R4/R5 are the backup-chain lane's anti-sender checks; the ladder's
 equivalent is the **R′ census** (`verify_bundle` / `verify_child_bundle` in
@@ -93,14 +133,14 @@ CSV and that every superseded state was disclosed and provably out-raced.
 - **Sender → Receiver** (via the SE's message relay): the transfer message — key-handover
   material (`t1`) plus, by coin shape, either the **TES-R bundle** (the pre-signed tier chain; for
   a split child also its ancestor segment and every superseded state the census must count) or the
-  full **backup-tx chain** with the exit **branch** and terminal-ancestor id list for an
-  un-laddered sub-coin — and (tokens) the RGB consignment.
+  full **backup-tx chain** with the exit **branch** and terminal-ancestor id list for a
+  branch-funded sub-coin on the flat lane — and (tokens) the RGB consignment.
 - **User ↔ SE**: blind MuSig2 co-signing (`sign_first`/`sign_second`), key-share rotation on
   transfer, spend-budget/terminal state, deposit init, the encrypted message relay.
 - **User ↔ Bitcoin (via an electrum indexer)**: tip height, tx/outpoint lookups, history,
   broadcasts.
 - **User → Watchtower**: a keyless bundle — the `TesrBundle` (tier chain) for a laddered coin, the
-  `WatchBundle` (branch + latest backup) for an un-laddered sub-coin. Pre-signed exit material
+  `WatchBundle` (branch + latest backup) for a branch-funded sub-coin. Pre-signed exit material
   only, in both cases (see §5).
 - **User ↔ RGB proxy**: consignment upload/download (token transfers only).
 - **User ↔ operators** (optional): deposit-token server (onboarding), refresh sponsor (fee
@@ -121,14 +161,14 @@ split child):
 | R1 | Sender's Schnorr signature binding the coin's outpoint to the receiver's new pubkey (`tx0_txid ‖ vout ‖ new_user_pubkey`) | handover messages not authorized by the coin's owner | `verify_transfer_signature` (`lib/src/transfer/receiver.rs`, checked for the index-0 backup group) | every successful claim (`sdk01` et al.); reject paths in `unit::transfer_signature_tests` (replay-to-other-receiver, wrong-outpoint, forged-by-non-owner) |
 | R2 | The receiver's NEW share + new server share combine to the coin's on-chain aggregate pubkey (else `IncorrectAggregatedPublicKey`); sender-key/t1 supporting checks | SE or sender handing over key material that doesn't control the coin | `get_new_key_info` (`lib/src/transfer/receiver.rs`); `validate_tx0_output_pubkey`, `validate_t1pub` | every claim (`sdk01` et al.) |
 | R3 | Funding tx0 output pays the expected aggregate (`validate_tx0_output_pubkey`); outpoint **unspent** (all coins). Confirmation is a hard reject only for **exit-branch roots** (unspent **and height > 0** with ≥ `confirmation_target`); a plain coin's claim completes and is booked `UNCONFIRMED` until `coin_status` confirms it | fake or spent funding; a sub-coin branch rooted in an unconfirmed/mempool tx | `verify_tx0_output_is_unspent_and_confirmed` and `validate_branch`'s root checks (both `clients/libs/rust/src/transfer_receiver.rs`) | every claim; `sdk31` (combine root); **the height-0 branch-root path has no dedicated test** |
-| R4 | **Un-laddered lane**: backup-chain locktime in `(tip, tip + initlock]` — rejects `LocktimeTooLow` (an already-raceable floored chain) and `LocktimeTooHigh` (one locked *above* a fresh deposit's, which would overstate your safe window while ancestors' real backups matured). **Laddered lane (R′ census)**: the handed-over state carries the **strictly-lowest CSV**, no hidden lower state exists, and every superseded state is disclosed and provably out-raced | being handed an **already-raceable** coin, a forged over-long chain, or a ladder with a retained lower-CSV state | `validate_signature_scheme` (`lib/src/transfer/receiver.rs`); `verify_bundle` / `verify_child_bundle` (`clients/libs/rust/src/tesr.rs`) | `sdk54`, `sdk46` (census: a malicious sender bypassing his own client's guard is still rejected by the receiver); `sdk47` (a pre-established ladder carried across a transfer — the flat `num_sigs == backup_transactions.len()` equality is replaced by the R′ count equation, the decrementing-ladder structural check still running on both paths); `sdk58` (11 adversarial child-bundle cases REJECT — aggregates, hidden state, Model-A, parent terminality, child-superseded race, count padding, value spoof) |
-| R5 | Signature count at the SE == backup-tx count; backup chain decrements exactly `interval` per hop. On the ladder the same arithmetic is the **census count**: each off-chain hop costs exactly **one** co-signature and discloses exactly **one** superseded state, which the receiver counts (`child_num_sigs == 0 + 2 + 1` at depth 1). **The count is not taken on the coordinator's word**: `get_statechain_info` sends a fresh random 32-byte nonce and refuses any answer that does not carry a `utexo/sig_count/v2` Schnorr signature over (`statechain_id`, `num_sigs`, budget-presence, `sig_budget`, nonce) verified against the **PINNED enclave attestation identity** — one long-term key per enclave, compiled in or configured, resolved pin → config → REFUSE. The coin's chain-anchored `enclave_public_key` cannot serve here: a depth-≥2 in-ladder-split ancestor's funding output is deliberately un-broadcast, so it has no chain anchor (B11). A half-stated or absent budget is refused, not defaulted | hidden intermediate owners; sender keeping extra co-signed states; **a coordinator under-reporting `num_sigs` by k, which hides k co-signed rival states while the exact-equality census still balances** | the un-laddered arm `statechain_info.num_sigs != backup_transactions.len()` and the laddered arm `verify_bundle_bound`, both in `clients/libs/rust/src/transfer_receiver.rs`; `get_statechain_info` (`clients/libs/rust/src/utils.rs`) + `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs`); `ladder_decrements_by_interval` in `validate_signature_scheme` (`lib/src/transfer/receiver.rs`); census counts in `verify_child_bundle` | every claim; interval reject paths in `unit::transfer_signature_tests::ladder_interval_check_rejects_wrong_and_increasing` (wrong gap, equal, increasing — no underflow panic); count-padding rejected in `sdk58`; the per-hop census arithmetic across two hops in `sdk60` (+ `sdk17`, partial second hop); **the backup-chain count-mismatch reject is E2E-implicit only** |
+| R4 | **Flat (branch) lane** — the residual named above, not a shape a coin is routed into: backup-chain locktime in `(tip, tip + initlock]` — rejects `LocktimeTooLow` (an already-raceable floored chain) and `LocktimeTooHigh` (one locked *above* a fresh deposit's, which would overstate your safe window while ancestors' real backups matured). **Laddered lane (R′ census)**: the handed-over state carries the **strictly-lowest CSV**, no hidden lower state exists, and every superseded state is disclosed and provably out-raced | being handed an **already-raceable** coin, a forged over-long chain, or a ladder with a retained lower-CSV state | `validate_signature_scheme` (`lib/src/transfer/receiver.rs`); `verify_bundle` / `verify_child_bundle` (`clients/libs/rust/src/tesr.rs`) | `sdk54`, `sdk46` (census: a malicious sender bypassing his own client's guard is still rejected by the receiver); `sdk47` (a pre-established ladder carried across a transfer — the flat `num_sigs == backup_transactions.len()` equality is replaced by the R′ count equation, the decrementing-ladder structural check still running on both paths); `sdk58` (11 adversarial child-bundle cases REJECT — aggregates, hidden state, Model-A, parent terminality, child-superseded race, count padding, value spoof) |
+| R5 | Signature count at the SE == backup-tx count; backup chain decrements exactly `interval` per hop. On the ladder the same arithmetic is the **census count**: each off-chain hop costs exactly **one** co-signature and discloses exactly **one** superseded state, which the receiver counts (`child_num_sigs == 0 + 2 + 1` at depth 1). **The count is not taken on the coordinator's word**: `get_statechain_info` sends a fresh random 32-byte nonce and refuses any answer that does not carry a `utexo/sig_count/v2` Schnorr signature over (`statechain_id`, `num_sigs`, budget-presence, `sig_budget`, nonce) verified against the **PINNED enclave attestation identity** — one long-term key per enclave, compiled in or configured, resolved pin → config → REFUSE. The coin's chain-anchored `enclave_public_key` cannot serve here: a depth-≥2 in-ladder-split ancestor's funding output is deliberately un-broadcast, so it has no chain anchor (B11). A half-stated or absent budget is refused, not defaulted | hidden intermediate owners; sender keeping extra co-signed states; **a coordinator under-reporting `num_sigs` by k, which hides k co-signed rival states while the exact-equality census still balances** | the flat arm `statechain_info.num_sigs != backup_transactions.len()` and the laddered arm `verify_bundle_bound`, both in `clients/libs/rust/src/transfer_receiver.rs`; `get_statechain_info` (`clients/libs/rust/src/utils.rs`) + `verify_sig_count_attestation` (`lib/src/transfer/receiver.rs`); `ladder_decrements_by_interval` in `validate_signature_scheme` (`lib/src/transfer/receiver.rs`); census counts in `verify_child_bundle` | every claim; interval reject paths in `unit::transfer_signature_tests::ladder_interval_check_rejects_wrong_and_increasing` (wrong gap, equal, increasing — no underflow panic); count-padding rejected in `sdk58`; the per-hop census arithmetic across two hops in `sdk60` (+ `sdk17`, partial second hop); **the backup-chain count-mismatch reject is E2E-implicit only** |
 | R6 | **Branch validation** (sub-coins): every branch tx consensus-valid and connected root→leaf; root input on-chain, unspent, confirmed; every branch locktime ≤ tip (INV-4); value conservation per hop (INV-25); **non-tree branches rejected** (an outpoint consumed twice) | fabricated or double-spending exit branches | `validate_branch`, `reject_non_tree_branch` | `sdk58`, `terminal_parents_tests` |
 | R7 | **Terminal ancestors** (sub-coins): one named ancestor per structural input the branch consumes (Σ inputs, so an N-carrier combine names all N), each reporting `terminal: true` at the SE. **Note the provenance gap on this lane**: that `terminal` flag is read from `GET /statechain/spend_budget`, which the coordinator computes from its own Postgres — unattested. The ladder lane does not ask the coordinator: `attested_terminal` (`clients/libs/rust/src/tesr.rs`) derives terminality from the enclave-signed payload (budget present **and** `num_sigs ≥ budget`), for the parent and every intermediate segment, and keeps the coordinator's answer only as a cross-check that refuses on disagreement | sender double-spending a branch parent via a fresh SE co-signature | `required_terminal_ancestors`, `verify_terminal_parents` (`clients/libs/rust/src/transfer_receiver.rs`) | `sdk58`, `sdk31` VERIFY log |
 | R8 | **RGB consignment** fully client-validated; amount booked = what the consignment assigns to the receiver's outpoint, under the cryptographically-derived contract id | token forgery, wrong-asset or wrong-amount claims — no proxy or issuer is trusted for token *rules or amounts* (chain anchoring resolves through the wallet's indexer and inherits §4/B3) | `accept_incoming_tokens` (REQ-21/22) | `sdk02`, `rgb13` |
 | R9 | **Received split child: the key handover COMPLETES.** The claim rotates the SE share and the auth key, and `A_child` is **invariant** across the rotation (proved by passing the un-broadcast `SP` as the funding tx to `get_new_key_info`), so every pre-signed child tier stays valid and the **sender is permanently locked out**. The child is then first-class: payable onward whole (`child_retransfer`) or split (`child_in_ladder_pay`, a depth-2 `ancestors` chain) | a sender re-spending or re-transferring a child he has already paid away; a "received payment" that is only exit-able | `clients/libs/rust/src/transfer_receiver.rs` (the child claim path); `verify_child_bundle` (`tesr.rs`, child terminality deliberately NOT required — the handover, not a freeze, is what makes the census durable); the coordinator's pending-transfer lock (`locked = true` on `statechain_transfer`, `server/src/database/transfer_sender.rs`) covers the census→completion gap — **but only for as long as that lock's window stays open; see §3, "The conveyance window"** | `sdk60` (alice→bob→carol, the funding outpoint unspent throughout), `sdk17` (partial second hop) |
 
-*Parameter provenance:* the un-laddered lane's window parameters (`initlock`, `interval`) come from
+*Parameter provenance:* the flat lane's window parameters (`initlock`, `interval`) come from
 the SE's `GET /info/config` at claim time, and the fee-sanity baseline comes from the indexer's
 `estimate_fee` — they parameterize the anti-*sender* checks and are themselves covered by the
 §3/§4 trust items, not independently verified. The **ladder's** CSV schedule is *not* SE-served: the
@@ -139,7 +179,7 @@ over → exit — off that schedule alone.
 
 What the receiver **cannot** verify (the honest list):
 
-- **R-a. Ancestor-id substitution (blind-SE caveat, SPEC §14) — un-laddered lane only.** The
+- **R-a. Ancestor-id substitution (blind-SE caveat, SPEC §14) — flat BRANCH lane only.** The
   terminal-ancestor *ids* conveyed with an exit branch are not cryptographically bound to the
   branch's outpoints (the SE is blind and cannot attest to the mapping). The Σ-inputs count check
   defeats *omission* but not *substitution* by a sender who controls other terminal coins.
@@ -244,7 +284,7 @@ arithmetic in Rust and asserts the SQL carries that shape. That is weaker than e
 
 **Cannot do alone** (verified/structural):
 - Steal: it never holds a full key, and every spend needs the owner's share (`sdk01`+every E2E).
-- Forge your exit material after the fact: your tiers (laddered) or backups (un-laddered) are
+- Forge your exit material after the fact: your tiers (laddered) or backups (flat lane) are
   already signed and in your hands.
 - Un-terminate a node: the budget may only TIGHTEN — `POST /statechain/spend_budget` lands in
   `set_sig_budget`, which writes `min(count_finalized + remaining, existing)` server-side
@@ -287,7 +327,7 @@ arithmetic in Rust and asserts the SQL carries that shape. That is weaker than e
 - **T-SE-2: liveness** — refusal to co-sign freezes only the *cooperative* paths. Unilateral exit
   is pre-signed and SE-independent — the SDK walks the TES-R chain (trigger → extension → state) as
   each relative CSV matures with no SE call at all (`sdk50`; `sdk40` PART 1 drives the same chain at
-  the library level, and `sdk45` shows a **keyless** third party can drive it), and an un-laddered
+  the library level, and `sdk45` shows a **keyless** third party can drive it), and a branch-funded
   sub-coin exits by its pre-signed branch + backup — so freeze ≠ seize; worst case your coin becomes an
   on-chain exit ticket with a bounded wait. One true boundary: the **onboarding window** — the
   first backup (tx1) is co-signed only when the SE first *sees* the funding tx
@@ -363,11 +403,13 @@ needed for custody**, by construction:
   - `auto_exit_due` (`auto_exit` default-on) at `auto_exit_margin_blocks`, **derived, not chosen**:
     `k_max·interval + tesr_exit_txs(1)·144` = **2,120 blocks on mainnet** (14·100 + 5·144) and
     **860 on regtest** (14·10 + 5·144), `auto_exit_margin_blocks_for` in
-    `clients/libs/rust-sdk/src/config.rs`. It force-exits plain un-laddered sub-coins and
-    **materializes token carriers** near their deadlines (REQ-33, `sdk34`).
+    `clients/libs/rust-sdk/src/config.rs`. It force-exits plain branch-funded sub-coins and
+    **protects token carriers** near their deadlines (REQ-33, `sdk34`) — by materializing the coloured
+    branch on the flat lane, and, since CTES-R, by driving a received coloured child's pre-signed
+    five-tier walk on the ladder, where no `branch-` row exists to broadcast.
 
   Routine *background* re-anchoring stays **off** by default (`background_auto_refresh = false`):
-  paying rent on an idle coin is an economics choice — on the un-laddered lane refresh is folded into
+  paying rent on an idle coin is an economics choice — on the flat lane refresh is folded into
   `transfer` and paid on demand as part of the payment fee (B4 economics; the `auto_refresh`
   pre-spend hook stays default-on) — so a running wallet never silently shrinks a balance. Note the
   split: that flag governs *maintenance*, never *safety*; the safety half above runs either way.
@@ -375,7 +417,7 @@ needed for custody**, by construction:
   means trusting your own machine to be on **while you hold off-chain coins** (a wallet that is
   entirely offline past deadlines is B4's case — delegate, or exit before going dark).
 - **Keyless delegation** (`sdk45`): everything a watchtower must broadcast is *already
-  fully signed* and *pays only the owner* — in **both** coin shapes.
+  fully signed* and *pays only the owner* — on the ladder and on the flat residual alike.
   - *Laddered*: the persisted `TesrBundle` (`tesr::persist` / `tesr::load`) is the tier chain,
     every tier paying the owner's own key. `tesr::watch_pass(cc, bundle)` runs one iteration from
     that bundle and an electrum connection alone — no wallet, no coin, no SE, no keys. `sdk45`
@@ -383,7 +425,7 @@ needed for custody**, by construction:
     `mnemonic`/`seckey`/`secret`/`private`/`privkey`/`xpriv`, then has the keyless tower defend an
     offline owner against a **hostile trigger** end-to-end. `sdk51` is the same defence run by the
     owner's own pass.
-  - *Un-laddered*: `export_watch_bundle()` emits branch txs, deadlines, and (plain coins only) the
+  - *Flat residual (branch-funded)*: `export_watch_bundle()` emits branch txs, deadlines, and (plain coins only) the
     latest backup tx. **No key-material fields exist on the bundle types at all** (unit-tested,
     `bundle_roundtrip_and_carrier_has_no_backup`). `watch_pass(bundle, electrum, margin)` in
     `rust-sdk/src/watchtower.rs` is the matching keyless pass.
@@ -406,7 +448,7 @@ needed for custody**, by construction:
   (`sdk45`, two independent towers). Redundancy is pure upside; diversity of *indexer
   connections* also hedges §4.
 - **What remains trusted: availability.** *Someone* — your process, your cron, a third party, or
-  several of them — must be awake: inside the margin before an un-laddered coin's absolute
+  several of them — must be awake: inside the margin before a flat coin's absolute
   deadline, **inside `auto_refresh_margin_blocks` of a laddered coin's own `min(L_k)`** (the root
   clock its prior owners hold — reactive is not the whole story, and **no keyless tower covers this
   one**: a laddered entry is exported with `deadline_block: u32::MAX`, which disables the height
@@ -514,12 +556,12 @@ wall-clock timer and by client-side gates the adversary chooses whether to run (
 | # | Boundary | Why it cannot be removed | Mitigation (not proof) |
 |---|---|---|---|
 | B1 | **SE share deletion / SE+old-owner collusion** (T-SE-1) | A blind 2-of-2 co-signer's memory cannot be proven erased from outside | enclave (lockbox); blindness (target selection needs the colluder); public audit trail, incl. the enclave-signed sig count (R5). **No race head start** — the collusive spend is un-timelocked and so is the owner's trigger, so this axis is a symmetric first-seen/fee race, and `fee_bump` ships as `None` (§3). Note that lockbox and coordinator are the same operator (§3) |
-| B2 | **Ancestor-id substitution** (R-a, SPEC §14) — **un-laddered lane only**; on the ladder the ancestor chain is key-derived from the on-chain funding and each segment's own funding output, so there is no id to substitute | For the branch lane, binding ids to outpoints would require the SE to see (un-blind) the transactions | Σ-count check; immediate/automatic materialization closes the window; laddered coins are structurally exempt (`verify_child_bundle` [1]/[2]/[4b], `sdk58`) |
+| B2 | **Ancestor-id substitution** (R-a, SPEC §14) — **flat BRANCH lane only**; on the ladder the ancestor chain is key-derived from the on-chain funding and each segment's own funding output, so there is no id to substitute | For the branch lane, binding ids to outpoints would require the SE to see (un-blind) the transactions | Σ-count check; immediate/automatic materialization closes the window; laddered coins are structurally exempt (`verify_child_bundle` [1]/[2]/[4b], `sdk58`) |
 | B3 | **Indexer honesty & liveness** (§4) | A light client's chain view is whatever its indexer serves | own node; multiple towers on distinct indexers; out-of-band broadcast |
-| B4 | **Deadline liveness** — someone must act inside the margin, and a laddered coin has **two** clocks, not zero. (i) *Reactive*: once someone broadcasts the trigger, a defender must race the tiers per block — the ladder's own tiers carry no calendar date, so an un-triggered coin costs nothing to watch. (ii) *Absolute*: the coin still sits on `min(L_k)`, the flat-backup height held by its PRIOR OWNERS, after which an ancestor's matured rung spends `F` and takes the coin. On the **un-laddered** shape the deposit-anchored deadline is likewise absolute | Timelock security is *defined* by acting before maturity (relative CSV on the ladder, absolute locktime on the flat chain) | all three passes run from the background watcher (**while the wallet process is alive**): `deadline_safety_due` for `min(L_k)` at margin 144 — cooperative re-anchor, else sever from `F` by broadcasting `T` — `defend_ladders()` per new block, unconditional, and `auto_exit_due` at the derived `auto_exit_margin_blocks` (**2,120 mainnet / 860 regtest**, `k_max·interval + tesr_exit_txs(1)·144`). Keyless delegation to N towers covers the *reactive* clock only — a laddered entry exports `deadline_block: u32::MAX` — and it stops at a fee spike: a keyless tower can broadcast the pre-signed tiers at their committed fee but **cannot fee-bump them** (a CPFP child needs an input it does not hold and a signature it cannot make), so above the relay floor the defence falls back to the OWNER being online, or to an operator running the optional funded-tower variant (`FeeBumpConfig`, `fee_bump: None` on both presets). **The carrier lane, precisely:** carriers are excluded from the COOPERATIVE route only (a plain re-anchor spends the carrier's outpoint into a fresh aggregate and destroys the allocation). They are INCLUDED in the unilateral route, because the forced action there is the coin's own pre-signed `T`, which carries its own state and does not re-aggregate. **But that route only reaches a COLOURED ladder** — `unilateral_exit` refuses a carrier whose ladder is not coloured, and `SdkConfig::colored_ladder` ships false, so on the default configuration every carrier is refused and the refusal is correct. So a carrier's `min(L_k)` is covered by `deadline_safety_due` on the CTES-R lane and by `auto_exit_due`'s branch materialisation otherwise — and **a branch-free (issued/flat) carrier on the flat lane has no automatic defence of `min(L_k)` at all**. That is visible rather than silent: the pass reports every coin it could not defend and returns `Err` rather than a clean `Ok`. Closing it, rather than reporting it, needs CTES-R. Routine background re-anchoring stays default-**off**; that flag is maintenance, not safety |
+| B4 | **Deadline liveness** — someone must act inside the margin, and a laddered coin has **two** clocks, not zero. (i) *Reactive*: once someone broadcasts the trigger, a defender must race the tiers per block — the ladder's own tiers carry no calendar date, so an un-triggered coin costs nothing to watch. (ii) *Absolute*: the coin still sits on `min(L_k)`, the flat-backup height held by its PRIOR OWNERS, after which an ancestor's matured rung spends `F` and takes the coin. On a coin with no ladder the deposit-anchored deadline is likewise absolute | Timelock security is *defined* by acting before maturity (relative CSV on the ladder, absolute locktime on the flat chain) | all three passes run from the background watcher (**while the wallet process is alive**): `deadline_safety_due` for `min(L_k)` at margin 144 — cooperative re-anchor, else sever from `F` by broadcasting `T` — `defend_ladders()` per new block, unconditional, and `auto_exit_due` at the derived `auto_exit_margin_blocks` (**2,120 mainnet / 860 regtest**, `k_max·interval + tesr_exit_txs(1)·144`). Keyless delegation to N towers covers the *reactive* clock only — a laddered entry exports `deadline_block: u32::MAX` — and it stops at a fee spike: a keyless tower can broadcast the pre-signed tiers at their committed fee but **cannot fee-bump them** (a CPFP child needs an input it does not hold and a signature it cannot make), so above the relay floor the defence falls back to the OWNER being online, or to an operator running the optional funded-tower variant (`FeeBumpConfig`, `fee_bump: None` on both presets). **The carrier lane, precisely:** carriers are excluded from the COOPERATIVE route only (a plain re-anchor spends the carrier's outpoint into a fresh aggregate and destroys the allocation). They are INCLUDED in the unilateral route, because the forced action there is the coin's own pre-signed `T`, which carries its own state and does not re-aggregate. **But that route only reaches a COLOURED ladder** — `unilateral_exit` refuses a carrier whose ladder is not coloured, and it is right to: broadcasting an RGB-unaware tier burns the asset. What changed is which side of that refusal a carrier lands on. `SdkConfig::colored_ladder` now READS the network's compiled-in enclave attestation pin, so on a pinned network (regtest today) the carrier is coloured, `unilateral_exit` admits it and the defence exists; on a network with no enclave provisioned (mainnet, testnet, signet) there is no pin, no ladder of any kind, and every carrier is still refused — a **provisioning** state, not a chosen default (`SPEC.md` §0.4 V-6). So a carrier's `min(L_k)` is covered by `deadline_safety_due` on the CTES-R lane and by `auto_exit_due`'s branch materialisation otherwise — and **a branch-free (issued/flat) carrier on the flat lane has no automatic defence of `min(L_k)` at all**. That is visible rather than silent: the pass reports every coin it could not defend and returns `Err` rather than a clean `Ok`. Closing it, rather than reporting it, needs CTES-R reaching that coin — which is now a pinned identity plus a carrier the coloured builder can take, not an unbuilt mechanism. Routine background re-anchoring stays default-**off**; that flag is maintenance, not safety |
 | B5 | **Onboarding window** (T-SE-2 tail) | The first backup is co-signed only when the SE first sees the funding tx, so the window (funding broadcast → tx1 co-sign) cannot be closed by ordering alone | fund only after deposit init succeeds; treat a missing first backup / `DepositConfirmed` as a stop-funding signal |
-| B6 | **Un-conveyed ancestor locktimes**: the deposit-anchored deadline is late by `k·interval` for parents transferred k times pre-split, and nothing conveys `k` to a receiver. It bites hardest on the un-laddered lane, where that deadline *is* the exit clock; a laddered coin's tier race is bounded instead by the census (R4/R′), but its `min(L_k)` root clock inherits the same un-conveyed `k` | Ancestor locktimes aren't conveyed to descendants. The true fail-closed bound is the ladder capacity itself (`initlock / interval` = 100 hops), which no margin can absorb — only conveying ancestor locktimes can | margins absorb the assumed span: `k_max = 14` is an **assumption**, carried unchanged into `auto_exit_margin_blocks_for(k_max, interval, d)` (`clients/libs/rust-sdk/src/config.rs`), plus reorg slack and reaction time |
-| B7 | **Loss of local state** — `wallet.db`/bundle loss is loss of funds (mnemonic alone is NOT a backup). This covers the ladder too: a laddered coin's tier chain lives in the same backup rows (`tesr-*` for a whole coin, `ctesr-*` for a split child) alongside the un-laddered lane's exit ladder / `branch-*` / `parents-*`, and `export_recovery_bundle` snapshots all of them. Token wallets additionally require the entire `rgb_data_dir` (its own **plaintext** `rgb.mnemonic` seed + the RGB stash), which the recovery bundle deliberately does NOT embed | The SE is blind and cannot re-serve per-coin exit material; that's the privacy design | `export_recovery_bundle` after every operation (incl. child re-transfers and refreshes) + copy `rgb_data_dir`; watch bundles as partial redundancy; device-at-rest security for the plaintext RGB seed |
+| B6 | **Un-conveyed ancestor locktimes**: the deposit-anchored deadline is late by `k·interval` for parents transferred k times pre-split, and nothing conveys `k` to a receiver. It bites hardest on the flat lane, where that deadline *is* the exit clock; a laddered coin's tier race is bounded instead by the census (R4/R′), but its `min(L_k)` root clock inherits the same un-conveyed `k` | Ancestor locktimes aren't conveyed to descendants. The true fail-closed bound is the ladder capacity itself (`initlock / interval` = 100 hops), which no margin can absorb — only conveying ancestor locktimes can | margins absorb the assumed span: `k_max = 14` is an **assumption**, carried unchanged into `auto_exit_margin_blocks_for(k_max, interval, d)` (`clients/libs/rust-sdk/src/config.rs`), plus reorg slack and reaction time |
+| B7 | **Loss of local state** — `wallet.db`/bundle loss is loss of funds (mnemonic alone is NOT a backup). This covers the ladder too: a laddered coin's tier chain lives in the same backup rows (`tesr-*` for a whole coin, `ctesr-*` for a split child) alongside the flat lane's exit ladder / `branch-*` / `parents-*`, and `export_recovery_bundle` snapshots all of them. Token wallets additionally require the entire `rgb_data_dir` (its own **plaintext** `rgb.mnemonic` seed + the RGB stash), which the recovery bundle deliberately does NOT embed | The SE is blind and cannot re-serve per-coin exit material; that's the privacy design | `export_recovery_bundle` after every operation (incl. child re-transfers and refreshes) + copy `rgb_data_dir`; watch bundles as partial redundancy; device-at-rest security for the plaintext RGB seed |
 | B8 | **Payment atomicity** — a plain transfer is a gift, not an escrow | In-protocol delivery-vs-payment needs a shared arbiter | Lightning latch / invoices for atomic swaps; ordinary commerce risk otherwise |
 | B9 | **Single live instance per wallet** — the wallet-record lock is in-process only; two processes/devices on one `wallet.db` (or a restored bundle beside a live original) can broadcast stale state against each other and corrupt the DB | No cross-process/cross-device coordination exists (and the blind SE cannot arbitrate) | one live instance per wallet; bundle restore is disaster recovery, not device sync |
 | B10 | **Split/combine commit ordering** — a split/combine sets the parent's spend budget to terminal (`set_spend_budget … 1`) BEFORE the child signatures + backups are durably persisted, so a crash or backend fault in that window leaves the parent terminal while the child state is not fully recoverable, forcing a unilateral exit of the parent's *value* (no funds lost — the BTC exits via the latest backup — but the cooperative off-chain path for that operation is gone) | The budget MUST precede the co-signature: it is the SE-side monotonic guard (`set_sig_budget`, `server/src/database/deposit.rs` — an ABSOLUTE budget, clamped to `min(count_finalized + remaining, existing)`) that, with the MuSig2 one-shot secnonce consume, prevents a second conflicting co-signature of a terminal node (INV-19 fork). No reordering is safe. **A "persist the nonces and re-call sign/second on restart" fix is unsound**: the enclave atomically nulls the secnonce on the *first* partial signature (`lockbox/src/server.cpp`), so a replayed `sign/second` returns an error, never the original server partial sig — persisting nonces buys nothing once signing has finalized | unilateral exit recovers the BTC value; a durable prepare/commit (persist the *assembled signed tx* before terminalizing, replay locally) would restore the cooperative path — deliberately not shipped as a half-mechanism (a persist with no tested recovery reader is false comfort) |
@@ -530,10 +572,14 @@ wall-clock timer and by client-side gates the adversary chooses whether to run (
 | Claim | Test |
 |---|---|
 | Receiver rejects a raceable handover even from a guard-bypassing malicious sender | `sdk54`, `sdk46` (R′ census: no hidden lower-CSV state; the current state is strictly lowest), `sdk47` (the same census across a full transfer of a pre-established ladder) |
-| Watch bundle is keyless (no key material); keyless tower defends an offline owner; two independent towers idempotent | `sdk45` (all three), `sdk51` (the owner's own pass, same hostile trigger); unit `bundle_roundtrip_and_carrier_has_no_backup` for the un-laddered bundle type |
+| Watch bundle is keyless (no key material); keyless tower defends an offline owner; two independent towers idempotent | `sdk45` (all three), `sdk51` (the owner's own pass, same hostile trigger); unit `bundle_roundtrip_and_carrier_has_no_backup` for the flat/branch bundle type |
 | Malicious sender's matured stale state fails after materialization; the honest owner's lowest-CSV state wins the race | `sdk51`, `sdk40` (PART 2), `sdk32` (C), `sdk34` (E) |
-| Token carrier auto-materialized before clawback deadline; issued carrier untouched | `sdk34` |
-| An RGB carrier is NEVER laddered (terminal-freeze) while a plain coin in the same wallet is; both shapes coexist in one wallet | `sdk52` |
+| Token carrier protected before its clawback deadline; issued carrier untouched. Now on the COLOURED lane: the action is `auto_exit_due` driving the received child's five-tier pre-signed walk, not a `branch-` broadcast — there is no `branch-` row on that shape | `sdk34` |
+| An RGB carrier is never given a PLAIN ladder (terminal-freeze) while a plain coin in the same wallet is | `sdk52` |
+| A carrier IS laddered — COLOURED: establish, renew against a rival, convey; then walk it out on chain with the allocation intact | `sdk74`, `sdk75` |
+| The CTES-R flip strands no carrier it cannot colour (the migration hatch is narrow and proved per coin) | `sdk78` |
+| A coloured carrier idled a "year" keeps its allocation, and every RGB-unaware route to it is refused by name | `sdk32` |
+| The plain off-chain split is GONE, so a retained trigger has nothing to race in a batch payment | `sdk69` (the case that used to assert the refusal) |
 | A laddered coin's TIERS never age: unbounded **off-chain** ladder renewal, zero on-chain bytes (the coin's root `min(L_k)` clock is a separate matter — B4) | `sdk43`, `sdk40` (PART 3) |
 | Received split child is FIRST-CLASS: handover completes (sender locked out, `A_child` invariant), then paid onward off-chain — whole and split | `sdk60` (alice→bob→carol, funding outpoint unspent throughout), `sdk17` (partial second hop) |
 | In-ladder split child bundle: valid child ACCEPTED, 11 adversarial variants REJECTED (aggregates, hidden state, Model-A, parent terminality, child-superseded race, count padding, value spoof) | `sdk58` |

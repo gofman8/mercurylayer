@@ -25,28 +25,35 @@ URL, so `get_token_no_server` mints them unpriced and `deposit_token_id: None` j
 
 > **Bitcoin Core 28+.** Every ladder tier is a v3/TRUC transaction with a P2A anchor output.
 
-### Pin the enclave attestation identity — or nothing gets a ladder
+### The enclave attestation identity — pinned for regtest, supplied elsewhere
 
 The client verifies the enclave's signature-count attestation against a **pinned** identity, and the
 resolution order is *compiled-in pin → configuration → refuse*. Never the key the coordinator
-serves: verifying an attestation against a key its own counterparty hands you proves nothing. No
-network ships a compiled-in pin (`TesrParams::attestation_identity_const` returns `None` for every
-one of them) and both `SdkConfig` constructors ship `attestation_identity: None`.
+serves: verifying an attestation against a key its own counterparty hands you proves nothing.
 
-So on the bare defaults every laddering claim **refuses**, records
-`LadderSkipReason::AttestationIdentityUnpinned`, and leaves the coin flat. That is the correct
-direction to fail, and it is configuration you must supply. Read the value off your lockbox and pin
-it:
+**Regtest now ships a compiled-in pin** —
+`TesrParams::attestation_identity_const("regtest")` returns
+`TesrParams::REGTEST_ATTESTATION_IDENTITY`, the identity derived from the dev seed this repo commits
+for its own stack. So on the local stack above you need configure nothing, and a compiled-in pin is
+**not overridable**: if you set `SdkConfig::attestation_identity` or `UTEXO_ATTESTATION_IDENTITY` to
+something that disagrees with it, that is an error rather than an override — a pin a config file can
+override is a default, not a pin. Point the SDK at a differently-seeded lockbox and it refuses rather
+than passes, which is the whole point.
 
 ```bash
+# Only needed to check WHICH identity your lockbox has — the value is already compiled in for regtest.
 curl -s http://127.0.0.1:18080/attestation_identity   # -> {"attestation_identity_pubkey":"0x…"}
-export UTEXO_ATTESTATION_IDENTITY=0x…                 # or set SdkConfig::attestation_identity
 ```
 
-`SdkConfig::attestation_identity` is read first and the environment variable is the fallback
-(`ClientConfig::from_params`). A value that disagrees with a compiled-in pin is an error, not an
-override. The identity is derived from the lockbox container's seed, so a differently-seeded lockbox
-refuses rather than passes.
+**Every other network still ships `None`**, because no enclave is provisioned for it yet. There, on
+the bare defaults, every laddering claim **refuses**, records
+`LadderSkipReason::AttestationIdentityUnpinned`, and leaves the coin flat. That is the correct
+direction to fail, and it is configuration you must supply — `SdkConfig::attestation_identity` first,
+the `UTEXO_ATTESTATION_IDENTITY` environment variable as the fallback (`ClientConfig::from_params`).
+
+This pin is also what decides the coin shape for RGB carriers: `SdkConfig::colored_ladder` READS it
+rather than stating a bool (see [§6](#6-coins-with-no-ladder)), so pinning a network's enclave turns
+one coin shape on for it in the same move.
 
 ## 2. Add the SDK
 
@@ -72,9 +79,10 @@ use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
-    // Create (or re-open — pass Some(mnemonic)) a wallet.
-    let mut cfg = SdkConfig::regtest("alice");
-    cfg.attestation_identity = Some(std::env::var("UTEXO_ATTESTATION_IDENTITY")?);
+    // Create (or re-open — pass Some(mnemonic)) a wallet. On regtest the attestation identity is
+    // COMPILED IN, so there is nothing to set here; on a network without a pin, set
+    // cfg.attestation_identity (or export UTEXO_ATTESTATION_IDENTITY) or nothing gets a ladder.
+    let cfg = SdkConfig::regtest("alice");
     let (wallet, mnemonic) = UtexoWallet::initialize(cfg, None).await?;
     println!("seed phrase: {mnemonic}");
     // The mnemonic alone is NOT a backup. Off-chain exit material — the pre-signed tier chain and
@@ -226,30 +234,47 @@ co-signature the SE ever issued on that child is accounted for. `transfer` route
 `child_in_ladder_pay` on its own when the coin it selects is a child. See
 [CHILDREN.md](../spec/CHILDREN.md).
 
-## 6. The other coin shape: un-laddered
+## 6. Coins with no ladder
 
-Not every coin is laddered, by design:
+A coin either carries a ladder — a laddered root, a received child or a spine tip — or it carries
+none, and the second case is a state to repair rather than a lane to route:
 
 | Shape | Which coins | How it transfers |
 |---|---|---|
-| **Laddered** | every plain BTC deposit | co-sign a lower-CSV state; exit walks `T → X_m → S_k` |
-| **Un-laddered** | RGB carriers; split sub-coins whose funding is un-broadcast | signed-once backup with decrementing `nLockTime`; transfer hands over the backup chain |
+| **Laddered** | every plain BTC deposit — and, wherever `colored_ladder` is on, every RGB carrier too | co-sign a lower-CSV state; exit walks `T → X_m → S_k` |
+| **No ladder** | a coin `claim()` declined to ladder (with a recorded `LadderSkipReason`); split sub-coins carved by the legacy coloured lane, whose funding is un-broadcast | signed-once backup with decrementing `nLockTime`; a whole-coin handover of the backup chain, only where the conveyance classifier can prove the coin is legitimately flat |
 
-An **RGB carrier** is not laddered on the shipped configuration: a plain tier spend is sats-only and
-would destroy the allocation (terminal freeze). `SdkConfig::colored_ladder` ships **false** in both
-constructors, so a carrier takes the flat signed-once backup shape and moves by colored split plus
-backup-chain handover. That path is load-bearing for assets. A **split sub-coin** whose funding
-output is still un-broadcast cannot root a trigger, so it keeps the signed-once shape too.
+An **RGB carrier** cannot take a *plain* ladder: a plain tier spend is sats-only and would destroy
+the allocation (terminal freeze). What it can take is a **coloured** one, and
+`SdkConfig::colored_ladder` decides — by reading the network's pinned attestation identity rather
+than stating a bool, because the coloured lane establishes its ladders through `claim()` and
+`claim()` refuses without a pin. Regtest has a pin, so a carrier there is laddered like any other
+coin. Mainnet has none, so a carrier there keeps the flat signed-once backup shape and moves by
+colored split plus backup-chain handover — a lane that is load-bearing for assets on exactly the
+networks still waiting for an enclave.
+
+A **split sub-coin** whose funding output is un-broadcast cannot root a trigger, so it keeps the
+signed-once shape too — and that stays true on every lane, because colouring a tier cannot broadcast
+a funding output. What changed is the *route*: the plain off-chain split that used to carve such
+coins for plain BTC payments is DELETED. It spent the coin's funding output `F` directly, and `F` is
+what a prior owner's retained, un-timelocked trigger also spends — so that owner could void the split
+and destroy the payee's sub-coin, with no way for the payee to detect the exposure. Every payment now
+carves in-ladder, as a **descendant** of the trigger rather than a rival for `F`, and the hazard is
+closed by construction.
 
 `withdraw` and `unilateral_exit` exclude carriers from their sweep-everything defaults and hard-error
 if you name one, rather than silently burning the allocation. Let `auto_exit_due` materialize the
-carrier instead (`WalletEvent::TokenCarrierMaterialized`), or move the asset off the coin first.
+carrier instead (`WalletEvent::TokenCarrierMaterialized`), or move the asset off the coin first;
+where the ladder is coloured, `unilateral_exit` opens and walks it.
 
 An app can always ask which coins are flat: `flat_only_coins()` returns
 `(statechain_id, raw_reason, may_still_be_transferred)` per coin, and `ladder_skip_reason` /
 `ladder_skip_reason_raw` answer for one. The third element is what you act on — `true` means the
-reason is structural and the coin still transfers on the flat lane; `false` means `transfer` will
-refuse it — run `claim()` again, and if the reason persists the coin needs operator attention. A flat
+reason is one the conveyance-time classifier can still prove and the coin transfers on the flat lane;
+`false` means `transfer` will refuse it — run `claim()` again, and if the reason persists the coin
+needs operator attention. That set of `true` reasons narrowed with the un-laddered shape: "this coin
+is an RGB carrier" and "this coin's funding is not on chain" are no longer among them, because a
+carrier is laddered now and the sub-coin the second reason described has no producer left. A flat
 **plain** coin's value is unaffected either way: it stays withdrawable and unilaterally exitable. A
 flat **carrier** does not — both of those refuse it by design (above), and its route out is
 materialization.

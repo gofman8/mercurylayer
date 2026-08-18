@@ -20,6 +20,24 @@ receiver completes the handover and books the child as a normal coin; onward re-
 `child_retransfer`; a received child can itself be split (`child_in_ladder_pay` /
 `child_in_ladder_pay_many`, `clients/libs/rust-sdk/src/transfer.rs`).
 
+**The child is now the ONLY off-chain sub-coin the protocol mints.** The plain off-chain split
+`split_coin` — which produced a sub-coin with a `branch-` exit chain and no ladder — is deleted with
+`ParentShape::Unladdered` and `ManyRoute::PlainSplit`, so every piece a payment carves is a child (or
+a spine tip) with its own `ctesr-` bundle. Two consequences worth stating explicitly, because they
+pull in opposite directions:
+
+- **The child's funding is STILL un-broadcast, and always will be.** `SP.out[j]` is never broadcast
+  until someone exits, which is exactly where the 0 vB of idle rent comes from. Nothing about
+  colouring a tier changes that, and every rule here that depends on it — the ancestor branch
+  conveyed for un-broadcast-funding validation, the pinned attestation identity a depth-≥2 ancestor
+  needs because it has no chain anchor (TRUST-MODEL B11) — stands unchanged.
+- **But "its funding is not on chain" is no longer a LICENCE to convey it flat.**
+  `PermanentLicence::FundingNotOnChain` and its probe are deleted with the lane they described.
+  `UtexoWallet::transfer` routes a child to `child_retransfer` before the flat lane can be reached, so
+  a child arriving at `assert_flat_conveyance_is_legitimate` is now refused rather than licensed — it
+  already died there on an absence (a child has no flat backup rows to convey), so the licence was
+  defensive, and removing it makes the refusal deliberate instead of accidental.
+
 Evidence: **sdk60** (Alice → Bob → Carol, the whole child re-transferred off-chain, funding outpoint
 `F` never spent until Carol's exit), **sdk59** (in-ladder pay, receiver completes the handover),
 **sdk58** (11 adversarial in-ladder-split cases; asserts a plain child stays NON-terminal),
@@ -148,8 +166,9 @@ scoped to children.
   sender-declared field, and a conveyance made at a shape carrying neither the key handover nor the
   transfer signature is a downgrade the receiver does not choose. The uniffi FFI performs that
   downgrade itself, stripping `protocol_version`, `tesr_ladder` and `child_tesr_bundle` — exact-set
-  dispatch is what makes a stripped tag fail CLOSED rather than land silently on the un-laddered
-  census. The fix is a two-sided version check with a floor the RECEIVER sets. See SPEC.md A-12.
+  dispatch is what makes a stripped tag fail CLOSED rather than land silently on the FLAT census
+  (`statechain_info.num_sigs != backup_transactions.len()`, the arm that still serves the flat
+  residual). The fix is a two-sided version check with a floor the RECEIVER sets. See SPEC.md A-12.
 - **The child lane can bump its EXIT but not its WATCH.** `exit_child_pass_with_bump` and
   `exit_spine_tip_pass_with_bump` (`clients/libs/rust/src/tesr.rs`) exist and are wired into
   `unilateral_exit` (`clients/libs/rust-sdk/src/wallet.rs`). The watch half is not:

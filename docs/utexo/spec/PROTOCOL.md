@@ -5,28 +5,62 @@ establishes a trigger/extension/state ladder for **every fresh confirmed ROOT co
 There is no protocol-version field and no escape hatch that opts a deposit into a flat un-laddered
 shape; no test pins any other lane.
 
-**One protocol, two coin SHAPES.** "Un-laddered" is a *shape*, not a legacy lane:
+**One protocol, ONE coin SHAPE.** "Un-laddered" *was* a shape a coin could be routed as. It is not
+one any more:
 
 - **Laddered**: every plain deposit — trigger T → extension X_m → state S, relative CSV, un-broadcast.
-- **Un-laddered**: an **RGB carrier** is deliberately never laddered (a plain tier spend would destroy
-  the allocation — the terminal-freeze rule of §5.10; pinned by `sdk52`), and a **split sub-coin whose
-  funding is un-broadcast** cannot root a trigger (B0 — a trigger over an unconfirmed prevout is
-  unbroadcastable). These keep the signed-once backup and transfer by backup-chain handover. That path
-  is **load-bearing for RGB tokens**, not dead code, and it keeps the calendar machinery (root
-  deadline, `auto_exit_due`) that laddering removes on the CSV side.
+- **Laddered, and coloured**: an **RGB carrier** is laddered like any other coin, every tier carrying
+  a valid RGB state transition (CTES-R, §5.10), so laddering MOVES the allocation instead of
+  destroying it. `SdkConfig::colored_ladder` (`clients/libs/rust-sdk/src/config.rs`) **reads the
+  network's compiled-in enclave attestation pin rather than stating a bool**, so it is ON wherever an
+  identity is pinned — regtest ships one and is ON; mainnet has no enclave provisioned yet, so there
+  is nothing to pin and it stays OFF **until one exists** (§0.4 **V-6** in `SPEC.md`). That coupling
+  is not cosmetic: without a pin `claim()` can establish no ladder at all, and a wallet with the flag
+  on and no pin would refuse token transfers forever behind a message promising a later `claim()` will
+  fix it.
 
-> ### Direction of travel: ONE COIN TYPE
+`ParentShape::Unladdered`, the plain off-chain split `split_coin`, `ManyRoute::PlainSplit`,
+`ensure_exact_coin`'s minting fallback and the daemon's `split_coin` RPC are **DELETED**.
+`parent_shape` (`clients/libs/rust-sdk/src/transfer.rs`) now REFUSES a coin that carries no ladder of
+any kind, because with one shape that is a coin to REPAIR, not a lane to pick; `parent_shape_opt` is
+the probe form, kept for the single caller (`has_exit_material`) where absence is data rather than a
+fault — a coin holding only flat backup rows is still exitable, and erroring there would drop it out
+of the balance.
+
+**What did NOT go away: un-broadcast funding.** Colouring a tier cannot broadcast a funding output.
+Every in-ladder split CHILD and every spine-tip CHANGE LEG still rests on an un-broadcast `SP.out[j]`,
+and that is precisely what the design exists to produce — it is where the 0 vB of idle rent comes
+from. So **B0 stands** (§5.4): `claim()` ladders a coin only when its funding output is a confirmed
+on-chain ROOT, and a sub-coin over un-broadcast funding cannot root a trigger. What changed is what
+such a coin *is*: an in-ladder child carrying its own `ctesr-` bundle, or a `spinetip-` tip — not a
+coin routed down a separate un-laddered lane.
+
+> ### Direction of travel: ONE COIN TYPE — arrived in the code, waiting on provisioning
 >
-> Two coin shapes is a transitional state, not the target architecture. The decided direction is a
-> single coin type; the un-laddered shape is to be removed, not kept.
+> Two coin shapes was a transitional state and the transition is done on the code side. The mechanism
+> is **CTES-R** — colour every tier so an RGB carrier can be laddered, retiring terminal-freeze as the
+> reason a carrier had to stay flat. Its foundation landed first (the `payload_vout` migration, the
+> coloured tier builder, per-tier seal blinding); the colouring is now **wired and default-ON wherever
+> an attestation identity is pinned**, and the routes into the un-laddered shape are deleted rather
+> than merely unused — the variant went before its users, so the compiler, not a reviewer, enumerated
+> them.
 >
-> The mechanism is **CTES-R** — colour every tier so an RGB carrier can be laddered, retiring
-> terminal-freeze. Its foundation has landed (the `payload_vout` migration, the coloured tier builder,
-> per-tier seal blinding). **The colouring itself is not yet wired.** Until it is, everything below
-> about the un-laddered shape is accurate as-built.
+> **What is left is provisioning, not design.** `TesrParams::attestation_identity_const`
+> (`lib/src/tesr.rs`) pins regtest and returns `None` for bitcoin/mainnet and for
+> testnet/testnet3/testnet4/signet, because no enclave is provisioned for them. The moment one
+> publishes its identity and that identity is compiled in, `colored_ladder` flips itself with no other
+> change — that is the whole reason it reads the pin.
 >
-> Reaching one coin type also requires porting `verify_bundle` to wasm/JS and to Kotlin: the nodejs
-> and web clients currently **refuse** any laddered coin.
+> **Two residual populations keep the flat shape alive, and both are narrow.** A carrier the coloured
+> builder cannot take *for that coin* — its allocation is not booked yet, its outpoint holds more than
+> one allocation, or the RGB state could not be read this pass (`LadderSkipReason::RgbCarrier`) —
+> retries on the next `claim()`. A carrier for which no coloured ladder can *ever* be built (every
+> pre-flip sub-floor token piece) reaches the legacy RGB-aware lane through
+> `tokens::migration_hatch_verdict`, proved read-only per coin under the same `wallet_lock` that would
+> build the ladder, so no rival trigger can exist while the hatch is open (**sdk78**).
+>
+> Reaching one coin type on every CLIENT additionally requires porting `verify_bundle` to wasm/JS and
+> to Kotlin: the nodejs and web clients currently **refuse** any laddered coin.
 
 Companion documents: `SPEC.md` (normative specification), `TRUST-MODEL.md` (trust boundaries and
 residual risks), `CHILDREN.md` (first-class received children), `LIGHTNING.md` (the HODL-invoice
@@ -195,13 +229,16 @@ of it. What TES-R deletes is the CSV-side ageing; what survives is `min(L_k)`. `
 and `SPEC.md` §1 carry the same statement, and the un-conveyed-ancestor-locktime residual it leaves
 open is `TRUST-MODEL.md` B6 — narrowed by laddering, not closed by it.
 
-On the **un-laddered** shape (RGB carriers, §5.10; sub-coins over un-broadcast funding, B0) the coin
-rests on the signed-once **absolute-locktime** backup, so it has a root deadline and needs
-materialization before it. `auto_exit_due` and `exit_deadline_block` are scoped to that shape
-(`SdkConfig::auto_exit`, default on), and are exercised live by `sdk34` (carrier watchtower
-materializes before the deadline) and `sdk32` (the residual clawback window on an un-laddered
-carrier). A laddered coin has no such deadline for them to act on — it has `min(L_k)`, defended by
-`deadline_safety_due`.
+A coin that carries **no** ladder rests on the signed-once **absolute-locktime** backup instead, so it
+has a root deadline and needs materialization before it. That population is now narrow and named
+(§5.10 rule 4): a carrier the coloured builder could not take *for that coin*, or one minted before
+the flip and below the coloured root floor. `auto_exit_due` and `exit_deadline_block` are scoped to
+that shape (`SdkConfig::auto_exit`, default on). Both tests that used to exercise it have been
+MIGRATED to the coloured lane and now prove the same duty in its CTES-R form — `sdk34` drives
+`auto_exit_due` to walk a received coloured child's five-tier chain before its deadline (there is no
+`branch-` row on that shape to broadcast), and `sdk32` carries the residual clawback window over a
+coloured carrier idled for a "year". A laddered coin has no root deadline for them to act on — it has
+`min(L_k)`, defended by `deadline_safety_due`.
 
 ### 5.3 Fees
 
@@ -232,11 +269,18 @@ ticks until it confirms. A combine CB carries per-input nSequence = that input's
 per-input); Σ-inputs terminal-ancestor verification (R7) unchanged. Child coins get fresh slots via the
 free derived-token path (REQ-35).
 
-**The in-ladder split is the only split.** A split is a **state tier** (`SP` spending `X_m.out[0]`),
-i.e. a *descendant* of T, never a rival for F. That is what closes the theft vector: a past owner's
-retained no-timelock trigger has nothing to race, because the split does not compete for the funding
-outpoint. Attack-proven by **sdk58** (11 adversarial cases, all REJECT) and **sdk59** (end-to-end split
-payment), with the bundle/backup-chain adversarial cases in **sdk54** / **sdk55**.
+**The in-ladder split is the only split — now by construction, not by policy.** A split is a **state
+tier** (`SP` spending `X_m.out[0]`), i.e. a *descendant* of T, never a rival for F. That is what closes
+the theft vector: a past owner's retained no-timelock trigger has nothing to race, because the split
+does not compete for the funding outpoint. The route that DID compete — the plain off-chain split
+`split_coin`, which spent `F` directly, so a retained trigger could void it and destroy the payee's
+sub-coin with the payee unable to detect the exposure [B1] — is **deleted**, along with
+`ParentShape::Unladdered`, `ManyRoute::PlainSplit` and every dispatch arm that reached them. The hazard
+is not merely refused any more; there is no longer a call site that could pose it. Attack-proven by
+**sdk58** (11 adversarial cases, all REJECT) and **sdk59** (end-to-end split payment), with the
+bundle/backup-chain adversarial cases in **sdk54** / **sdk55**; **sdk69** carries the closed-by-
+construction statement for the multi-recipient batch, where it used to assert the plain split's
+refusal.
 
 **Admission floor.** A child is not a bare output: `establish_child` hangs the child's OWN extension +
 state tiers off `SP.out[j]`, each burning committed fee + P2A, and the final state output must still
@@ -256,9 +300,13 @@ the one exception is the Lightning-latched piece (§5.12), which stays terminali
 
 **B0 — root-only laddering.** `claim()` ladders a coin only when its funding output is a **confirmed
 on-chain root**. A sub-coin whose funding is an un-broadcast split output cannot root a trigger (the
-trigger would have no prevout to spend, and a v3 tier cannot relay over an unconfirmed v2 parent), so
-such a coin travels the un-laddered shape instead — checked fail-closed against electrum, never
-inferred.
+trigger would have no prevout to spend, and a v3 tier cannot relay over an unconfirmed v2 parent) —
+checked fail-closed against electrum, never inferred. **This is permanent, and it is not the retired
+shape.** Colouring a tier cannot broadcast a funding output, so every split child and every spine tip
+keeps un-broadcast funding forever; what such a coin gets instead of a root ladder is its OWN exit
+material, hung off `SP.out[j]` by `establish_child` at split time and persisted as a `ctesr-` child
+bundle (or a `spinetip-` record). It does not travel a separate un-laddered lane — that lane, and the
+plain split that produced coins for it, are deleted.
 
 ### 5.5 Renewal (pure off-chain; the common case)
 
@@ -370,7 +418,7 @@ arithmetic properties of 2-of-2, not test-observable beyond the co-sign gates (*
 retry-idempotence and owner-share binding).
 
 **Row 3, stated precisely, because an implementer can get it backwards.** The distinction is not
-laddered/un-laddered: **every coin that has been RECEIVED keeps `min(L_k)`**, because the flat backup
+whether a coin carries a ladder: **every coin that has been RECEIVED keeps `min(L_k)`**, because the flat backup
 chain is retained alongside the ladder and each hop shortens its absolute locktime by `interval`.
 Laddering removes the CSV-side ageing and nothing else. `deadline_safety_due` is the ONLY scheduled
 defence of `min(L_k)` on a laddered coin and must not be omitted. `SDK_E2E=86` is the measurement;
@@ -480,12 +528,21 @@ into either 54-fold budget collapse or enclave-trust for invalidation. The rule 
    minting fresh receiver pieces — token DAG depth grows per token hop, carrier economics unchanged,
    **including calendar deadlines** (point 4).
 4. **Carrier defense** = materialize the colored branch only (REQ-33 semantics), per-tier CSV head
-   starts as §5.7 row 3. Because rule 1 forbids laddering a carrier at all, a carrier never gains the
-   CSV tiers that would delete its calendar. It keeps the signed-once **absolute-locktime** backup, so
-   a received token carrier **does** still have a root-deadline materialization duty, and REQ-33's
-   `auto_exit_due` machinery is retained for exactly this shape (default on; **sdk34** materializes
-   before the deadline, **sdk32** documents the residual clawback window if nobody does). Only
-   *laddered* coins have no root deadline. This is the price of terminal-freeze and is deliberate.
+   starts as §5.7 row 3. **The premise under this rule has moved, and the rule survives narrowed.** It
+   was written when rule 1 forbade laddering a carrier at all, so a carrier never gained the CSV tiers
+   that would delete its calendar. Under CTES-R it does: wherever `SdkConfig::colored_ladder` is on a
+   carrier gets a COLOURED ladder, its defence is the pre-signed coloured WALK rather than a
+   `branch-` broadcast, and `unilateral_exit` admits exactly the coloured roots and coloured children
+   (`clients/libs/rust-sdk/src/wallet.rs`) — a carrier whose ladder is not coloured is still refused,
+   because broadcasting an RGB-unaware tier is the thing this whole section exists to prevent. What
+   survives unchanged is the case colouring cannot reach: a carrier the coloured builder could not
+   take *for that coin*, or one below the coloured root floor, keeps the signed-once
+   **absolute-locktime** backup and therefore still owes a root-deadline materialization. REQ-33's
+   `auto_exit_due` machinery is retained and was EXTENDED rather than retired — it now drives the
+   coloured children's five-tier walk as well (default on; **sdk34** acts before the deadline on the
+   coloured lane, **sdk32** documents the residual clawback window if nobody does). Only coins with a
+   ladder have no root deadline. This is the price of terminal-freeze **where terminal-freeze still
+   applies**, and it is deliberate.
 5. **SE blindness fully preserved**: a colored sighash is byte-indistinguishable from a plain one;
    renewal/rollover/de-trigger sign sats-structure or owner-built colored self-transitions the SE never
    parses; consignments stay P2P (ECIES via relay). No batch coordinator exists, so a
@@ -501,8 +558,10 @@ into either 54-fold budget collapse or enclave-trust for invalidation. The rule 
    lane and not of the union of two lanes' shapes: **on a coloured bundle every conveyed flat backup
    MUST be plain** — any OP_RETURN on one is refused by name, in the same predicate that runs over every
    flat backup, as part of the R′ set (§5.11) alongside the tier colour-shape check. The permissive
-   `op_return_outputs <= 1` STAYS for the **un-laddered carrier lane**, where the coloured backup is the
-   legitimate exit material; one validator serves two lanes with opposite requirements. Without this, a
+   `op_return_outputs <= 1` STAYS for the **flat (un-coloured-ladder) carrier lane**, where the coloured
+   backup is the legitimate exit material; one validator serves two lanes with opposite requirements.
+   That lane is now the narrow residual of rule 4 rather than the default, and the rule is kept for it
+   rather than deleted with the shape, because the residual still conveys. Without this, a
    prior owner's retained coloured backup is an *undetectable allocation-theft primitive* — it spends
    `F` and re-assigns the allocation to themselves, invisible to every other receiver check — and it
    also falsifies §5.8's griefing premise. Implemented by `verify_flat_backup_lane`
@@ -510,11 +569,18 @@ into either 54-fold budget collapse or enclave-trust for invalidation. The rule 
    guarded by `ci-guards/tests/deny_colored_backup_on_a_colored_ladder.rs`; the legitimate
    coloured-ladder-plus-envelope shape it admits is exercised live by **sdk78** (c.2).
 
-**Evidence**: **sdk52** pins rule 1, the invariant everything else here rests on — in one wallet the
-plain coin carries a ladder and the token carrier carries **none**, and an off-chain RGB transfer still
-settles. **sdk32** pins the terminal-freeze semantics over time (carrier terminal at the SE,
-un-laddered, no fresh co-signed sweep possible) and the residual clawback window of point 4. The RGB
-suites (`rgb*`, `ta*`, `tb*`) run over the protocol unchanged.
+**Evidence**: the invariant everything here rests on is *a carrier is never spent by an RGB-unaware
+tier*, and the evidence for it changed shape with the flip rather than weakening. Before CTES-R the
+only way to guarantee it was to give a carrier no ladder at all — **sdk52** pins that half, a plain
+coin laddered and the token carrier carrying no PLAIN ladder in one wallet, with an off-chain RGB
+transfer still settling. Now it is guaranteed positively: **sdk74** establishes, renews against a
+rival and conveys a coloured ladder; **sdk75** walks one on chain — the first genuine unilateral exit
+of an RGB allocation, previously impossible in principle rather than merely unimplemented;
+**sdk32** carries the same guarantee across a "year" of idleness (every tier of the carrier's ladder
+coloured, `colored_ladder_health` validating the full allocation against the ladder's own un-broadcast
+txids, and each of the three RGB-unaware routes to the carrier asserted refused by name); and
+**sdk78** proves the flip strands nothing it cannot colour. The RGB suites (`rgb*`, `ta*`, `tb*`) run
+over the protocol unchanged.
 
 ### 5.11 Receiver verification at claim (R′ set)
 
@@ -589,8 +655,14 @@ pending-transfer lock's window (the SSP settles on its own schedule), so the tem
 what protects it — the piece is terminalized instead, a permanent lockout. Every other in-ladder child
 is *not* terminalized (§5.4): it is protected by the census plus the key handover.
 
-The one-call Lightning PAY API pays from the ladder directly (it does not mint its input via
-`ensure_exact_coin`, which would refuse every laddered coin — i.e. every coin the protocol produces).
+The one-call Lightning PAY API pays from the ladder directly. `ensure_exact_coin` no longer mints an
+input: the off-chain plain split it fell back to is DELETED with the un-laddered shape — that split
+spent the coin's funding output `F`, which is exactly what a prior owner's retained, un-timelocked
+trigger also spends [B1] — so it now returns an exact CONFIRMED coin if the wallet happens to hold one
+and otherwise refuses. That is not a regression: REQ-42 already requires the one-call pay to fall back
+to the NON-EXACT in-ladder lane precisely when no exact coin can be minted, and that lane carves its
+piece as a DESCENDANT of the trigger rather than a rival for `F`, which is what makes it safe where
+the deleted route was not. The RGB arm of pay has no such fallback — see `LIGHTNING.md` §1.
 
 ### 5.13 Watchtowers (the keyless TES-R watch bundle)
 
@@ -689,8 +761,11 @@ spend and would not bump even if the code were reachable from it; what it does i
 **Evidence**: **sdk45** for the two properties this section rests on — the watch bundle carries **no key
 material**, and a **second independent tower is idempotent** (both explicitly asserted there).
 **sdk51** runs the state machine against a real hostile trigger (and is a no-op while the coin is idle —
-an un-broadcast coin never ages, so there is nothing to defend). The carrier-side counterpart —
-materializing a colored branch before its deadline — is **sdk34** (§5.10 rule 4).
+an un-broadcast coin never ages, so there is nothing to defend). The carrier-side counterpart — acting
+on a received carrier before its deadline — is **sdk34** (§5.10 rule 4), and *what that action is* moved
+with the flip: on the flat residual it is materializing the coloured branch, while on a coloured ladder
+there is no `branch-` row to broadcast at all and the same duty is discharged by walking the child's
+five pre-signed RGB-aware tiers. The duty is unchanged; only its material is.
 
 ---
 
@@ -698,10 +773,11 @@ materializing a colored branch before its deadline — is **sdk34** (§5.10 rule
 
 **REQ 1 — off-chain forever / activity-scaled footprint: MET (per the refinement; near-categorical).**
 Idle **laddered** coins: 0 vB forever — no rent, no root deadlines, no forced materializations (the
-entire 5,840 vB/coin-yr rent class of §2 is absent). An idle **un-laddered** coin (RGB carrier, B0
-sub-coin) also pays 0 vB rent, but it keeps its absolute-locktime root deadline, so a *received*
-carrier still owes one materialization before that deadline (§5.10 rule 4) — activity-scaled, but not
-deadline-free. Off-chain transitions: 576 hops per depth level, rollover is off-chain (sdk43), so hop
+entire 5,840 vB/coin-yr rent class of §2 is absent), and that now includes idle **coloured** ladders —
+a carrier's tiers do not age either. An idle coin with **no** ladder (the narrow residual of §5.10
+rule 4: a carrier the coloured builder could not take, or one below the coloured root floor) also pays
+0 vB rent, but it keeps its absolute-locktime root deadline, so a *received* carrier of that class
+still owes one materialization before that deadline — activity-scaled, but not deadline-free. Off-chain transitions: 576 hops per depth level, rollover is off-chain (sdk43), so hop
 count is **unlimited without any mandatory chain touch**; the default depth-3 compaction policy is an
 optional optimization costing 112 vB per ~2,300 transfers ≈ 0.05 vB/transfer, executed by the
 SDK/operator inside `transfer()` and priced into that transfer's fee — the user never acts personally.
@@ -757,9 +833,9 @@ invalidate an anchor. No batch coordinator ships. Exit-time RGB disclosure uncha
   deadline-driven exit stampede.
 - **R-2 No unconditional no-watch window**: a received coin must be watched (delegated, keyless,
   prepaid) from the moment of receipt, forever. Alarm-driven with ≥1 day notice, accepted deliberately.
-  On the un-laddered shape the duty is *calendar*-driven instead (materialize before the root deadline,
-  §5.10 rule 4) — **sdk32** is the standing record of what happens to a received carrier whose owner
-  never acts.
+  On a coin with no ladder — the narrow residual carrier class of §5.10 rule 4 — the duty is
+  *calendar*-driven instead (materialize before the root deadline) — **sdk32** is the standing record
+  of what happens to a received carrier whose owner never acts.
 - **R-3 B1 unchanged**: the statechain trust unit (enclave share-deletion) remains the floor, as in
   every statechain.
 - **R-4 δ=36 head starts vs sustained congestion**: a fee spike outlasting the head start converts the
@@ -886,7 +962,11 @@ Every item below names a test that exists today.
 | In-ladder split (adversarial + end-to-end) | **sdk58** (11 cases), sdk59 |
 | First-class children (whole / partial onward hop) | **sdk60**, **sdk17** |
 | Retained `min(L_k)` calendar height advances per hop | **SDK_E2E=86** |
-| RGB carrier never laddered; terminal-freeze over time | **sdk52**, sdk32; carrier materialization sdk34 |
+| RGB carrier never given a PLAIN ladder (terminal-freeze, the pre-CTES-R half of §5.10 rule 1) | **sdk52** |
+| Carrier laddered COLOURED: establish, renew against a rival, convey | **sdk74** |
+| Coloured carrier walks out unilaterally, allocation intact on chain | **sdk75** |
+| Coloured carrier idle for a "year"; every RGB-unaware route to it refused; carrier materialization before the deadline | **sdk32**, **sdk34** |
+| The flip strands no carrier it cannot colour (migration hatch, narrow) | **sdk78** |
 | Coloured-ladder flat-backup lane rule | **sdk78** (c.2) + ci-guard `deny_colored_backup_on_a_colored_ladder` |
 | Lightning both directions on the ladder (HODL latch) | **sdk63**, **sdk64**, **sdk67**; sdk65 non-exact; sdk66/sdk68 failure paths; sdk53 latch guard |
 | Concurrency / DAG invariants | chaos22 |
@@ -921,9 +1001,12 @@ Every item below names a test that exists today.
   2023–24 spike history; δ=36 is the shipped default (`TesrParams::mainnet()`, arithmetic pinned by
   sdk44), with the budget table of §5.2 as the trade space. **The congestion study is not done.**
 - **O-3**: rgb-lib adversarial suite for deep un-broadcast witness chains (terminal-freeze removes
-  superseded-witness ambiguity, but depth and DoS bounds need tests). *Status*: the never-laddered
-  carrier rule and terminal-freeze semantics are pinned (sdk52, sdk32) and the `rgb*`/`ta*`/`tb*` suites
-  run over the protocol; the depth/DoS adversarial suite is still missing.
+  superseded-witness ambiguity, but depth and DoS bounds need tests). *Status*: the
+  never-given-a-PLAIN-ladder carrier rule and terminal-freeze semantics are pinned (sdk52, sdk32 — the
+  latter now over a COLOURED ladder) and the `rgb*`/`ta*`/`tb*` suites run over the protocol; the
+  depth/DoS adversarial suite is still missing. **CTES-R makes this item more pressing, not less**: by
+  rule 2 above a coloured ladder puts the whole un-broadcast T/X/SP chain into the consignment as
+  witness txs, so the chains whose depth bounds are untested are now the ones every carrier has.
 - **O-4**: deep-DAG unilateral latency — geometric per-level E0/D0 schedules (worst wait <30 days at any
   depth) vs per-level hop budgets; ship as a dial with a chosen default.
 - **O-5**: tower fee-bond actuarial sizing + refund/receipt rail (operator-signed per-bump rebates,

@@ -16,7 +16,7 @@ Audience: technical readers who have not read the code. Every constant below is 
 defined, and every number is re-derived from those constants rather than transcribed.
 
 Contents: [the problem](#1-the-problem-utxos-dont-come-in-the-amount-you-owe)
-· [the shapes a parent can have](#2-the-four-shapes-a-parent-can-have)
+· [the shapes a parent can have](#2-the-three-shapes-a-parent-can-have)
 · [mechanics with real numbers](#3-mechanics-with-real-numbers)
 · [the floors](#4-the-floors-and-where-each-one-comes-from)
 · [effect on invalidation](#5-what-a-partial-send-does-to-invalidation)
@@ -62,12 +62,12 @@ leaf economics — not root economics — are the ones that describe a user. See
 
 ---
 
-## 2. The four shapes a parent can have
+## 2. The three shapes a parent can have
 
 There is one protocol. `claim()` (`clients/libs/rust-sdk/src/wallet.rs`) establishes a TES-R exit
 ladder — trigger `T` → extension `X_m` → state `S_0`, relative CSV, all un-broadcast — for every
 fresh confirmed **root** coin whose funding `F` is on chain, unconditionally. A partial payment
-therefore runs over whatever shape the selected parent has, and there are exactly four. The type is
+therefore runs over whatever shape the selected parent has, and there are exactly three. The type is
 `ParentShape` (`clients/libs/rust-sdk/src/transfer.rs`), resolved once per candidate by
 `UtexoWallet::parent_shape`, and it selects the executor *and* the floor from the same read.
 
@@ -76,7 +76,15 @@ therefore runs over whatever shape the selected parent has, and there are exactl
 | **`Root`** | a claimed deposit, still whole, `tesr-` row | `in_ladder_pay` | one-rung **spine tip** |
 | **`SpineTip`** | the sender's own change from an earlier in-ladder payment, `spinetip-` row | `spine_batch_pay` | one-rung **spine tip** |
 | **`Child`** | a received piece — somebody's payment to you, `ctesr-` row | `child_in_ladder_pay` | two-tier **piece** |
-| **`Unladdered`** | no ladder: an RGB carrier, or a sub-coin whose funding is an un-broadcast split output | `split_coin` | plain sub-coin |
+
+There is no fourth arm, and the absence is deliberate rather than incidental. With every claimed
+coin laddered, "no ladder of any kind" stopped being a lane to price and became a fault to report:
+`parent_shape` **refuses** such a coin — run `claim()` to ladder it, and read `ladder_skip_reason` if
+that declines — rather than routing it. `parent_shape_opt` is the probe form, kept for the one caller
+where absence is data and not a fault: `has_exit_material`, where a coin carrying only flat backup
+rows can still be exited and erroring would drop a spendable coin out of the wallet's balance. Read
+*failures* propagate in both, because a swallowed DB error that read as "no ladder" is the
+silent-degradation shape this pair exists to prevent.
 
 Three things follow, and they are the shape of the rest of this document.
 
@@ -86,20 +94,35 @@ payment the sender's change **is** a spine tip — and the second and every late
 take the `SpineTip` arm. A wallet that pays twice has spent most of its life on the spine-batch
 lane, not the root lane.
 
-**A laddered coin is never split as plain BTC.** `split_coin` refuses a parent carrying a `tesr-`
-bundle by name. The reason is structural: the trigger `T` carries
-`TRIGGER_SEQUENCE = 0xFFFF_FFFD` (`lib/src/tesr.rs`) — relative lock disabled — and spends `F`
-directly, and every prior owner of a conveyed coin retains a signed copy. A plain split would spend
-the same `F`, so it is a *rival* for the funding outpoint against a transaction with no timelock at
-all, and no timelock schedule out-races that. The in-ladder split is the answer: the split state
-**descends from** `T` instead of racing it.
+**Nothing is split as plain BTC any more, and that is [B1] closed by construction.** The hazard was
+structural: the trigger `T` carries `TRIGGER_SEQUENCE = 0xFFFF_FFFD` (`lib/src/tesr.rs`) — relative
+lock disabled — and spends `F` directly, and every prior owner of a conveyed coin retains a signed
+copy. A plain off-chain split spends that same `F`, so it is a *rival* for the funding outpoint
+against a transaction with no timelock at all; no timelock schedule out-races that, and the payee
+cannot detect the exposure. The old answer was a refusal — `split_coin` declined a parent carrying a
+`tesr-` bundle by name — which held only for as long as every route into it kept asking. The answer
+now is that the transaction cannot be built: `ParentShape::Unladdered`, `split_coin`, the plain
+off-chain split, `ManyRoute::PlainSplit` and `ensure_exact_coin`'s minting fallback are deleted, so
+the rival-spend shape is unconstructible rather than refused. The in-ladder split is what remains,
+and it was always the real answer: the split state **descends from** `T` instead of racing it.
 
-**The un-laddered lane is load-bearing, not leftover.** `SdkConfig::colored_ladder`
-(`clients/libs/rust-sdk/src/config.rs`) ships **`false`** in both constructors, so an RGB carrier
-takes the flat signed-once backup shape and every colored split in §3c and §8 runs on `split_coin`'s
-arithmetic through `create_colored_split_tx` (`clients/libs/rust/src/rgb.rs`). A coloured ladder is
-buildable — `claim()`'s decision site is `match (config.colored_ladder, allocation)` — but it is not
-what ships, and this document says which lane it is describing every time it matters.
+**A carrier is laddered like any other coin — wherever an enclave exists to attest.**
+`SdkConfig::colored_ladder` (`clients/libs/rust-sdk/src/config.rs`) no longer states a bool: both
+constructors READ the compiled-in attestation pin, `TesrParams::attestation_identity_const`
+(`lib/src/tesr.rs`). Regtest pins the repo's own dev enclave, so the flag is **true** there and
+`claim()`'s decision site — `match (config.colored_ladder, allocation)` — gives a carrier a
+**coloured** ladder: every tier carries a real RGB state transition, so laddering *moves* the
+allocation instead of destroying it. Mainnet's const returns `None`, because no mainnet enclave is
+provisioned; the flag is therefore **false** there, and that is not a verdict on the lane but a
+statement that there is nothing to verify an attestation against — without a pin, terminality cannot
+be established at all (**V-6**, and TRUST-MODEL B11 for why accepting the coordinator's own answer
+is not a substitute). Pin a mainnet identity and the flag flips with no other change, which is the
+whole reason it reads the pin rather than restating it;
+`colored_ladder_is_never_on_without_a_pinned_attestation_identity` is the unit test that stops the
+two from drifting apart. §3c and §8 still describe the legacy flat coloured split
+(`create_colored_split_tx`, `clients/libs/rust/src/rgb.rs`), because that is the lane a network with
+no pinned identity still takes — and this document says which lane it is describing every time it
+matters.
 
 ### 2.1 The constants everything is derived from
 
@@ -132,9 +155,11 @@ split_fee_reserve(parent)       = clamp(parent/100, 300, 2000)       clients/lib
 
 **Every floor above is a function of the RATE, and quoting one without its rate is quoting a rate.**
 `min_child_value` and `min_spine_tip_value` take `fee_rate_sats_per_vb` as an argument; the numbers
-in this document are those functions evaluated at the shipped `committed_fee_rate = 3.0`. On the
-un-laddered lane the relevant rate is instead `backup_fee_rate` = `min(SE quote, cc.max_fee_rate)`,
-which moves with the fee market, so `min_split_output` moves with it.
+in this document are those functions evaluated at the shipped `committed_fee_rate = 3.0`.
+`min_split_output` takes a *different* rate — `backup_fee_rate` = `min(SE quote, cc.max_fee_rate)`,
+the rate a sub-coin's own backup will actually be signed at — which moves with the fee market. So
+the bare backup floor moves with the market while the ladder floors, pinned to a protocol constant,
+do not.
 
 ---
 
@@ -271,11 +296,20 @@ TOKEN_PIECE_SATS       = 3 · (ceil(168·6.0) + 240) + 330    = 3 · 1,248 + 330
 that floor if the committed rate ever doubles. `LEGACY_CARRIER_TAIL = 666` is `min_split_output(3.0)`
 — the last change must still be able to fund its own backup. `LEGACY_CARRIER_SEND_DEPTH = 5` chained
 sends; the coloured-ladder lane's `CTESR_CARRIER_SEND_DEPTH` is **1**, structurally, so the carrier
-is sized for the legacy lane and over-provisions the other.
+is sized for the legacy lane and over-provisions the other. Sizing for the max is the fail-closed
+direction — an over-sized carrier parks sats in a change child, an under-sized one is refused at
+spend time with the carrier already terminalized — and where the coloured lane is the one taken,
+22,536 buys one send and the remainder lands in that depth-1 change child, movable only whole or by
+exit. A real cost, stated rather than hidden behind a number that reads like five sends.
 
-On the shipped configuration a carrier is **never laddered** (SPEC INV-29): a plain T/X/S tier spend
-is sats-only and would destroy the allocation, so `claim()` skips carriers and records
-`LadderSkipReason::RgbCarrier`. Everything below is `split_coin`'s arithmetic wearing an RGB hat.
+A carrier is **never given a *plain* ladder** (SPEC INV-29): a plain T/X/S tier spend is sats-only
+and would destroy the allocation. Where an attestation identity is pinned it gets a **coloured** one
+instead (§2) and its first payment is the coloured *in-ladder* split; where none is,
+`claim()` leaves the carrier flat and records `LadderSkipReason::RgbCarrier`. What follows is that
+second lane — the legacy flat coloured split, still what a network with no pinned enclave takes —
+and its arithmetic is the plain split's wearing an RGB hat: `split_fee_reserve` off the top,
+`min_split_output` under both legs, over `create_colored_split_tx` instead of a sats-only
+transaction.
 
 `create_colored_split_tx` builds one SE-co-signed, un-broadcast transaction in which each output
 carries an `(address, sats, rgb_amount)` triple, and rgb-lib inserts exactly one OP_RETURN carrying
@@ -373,8 +407,8 @@ by a refusal inexpressible. Each leg takes the max of:
 | floor | value @ shipped rate | where it comes from |
 |---|---|---|
 | Split-output dust floor | **330** (`DUST_LIMIT`) | the P2TR relay threshold. One number for every script type on purpose: P2WPKH would relay at 294, and a per-script table would reintroduce exactly the sender/receiver floor drift the constant exists to remove. Exempt: the P2A anchor (own threshold 240) and the provably-unspendable opret |
-| Smallest **mintable un-laddered** piece | **`330 + ceil(112·r)`** — 442 @ 1 sat/vB, 666 @ 3 | 330 is only the split *output* floor; the sub-coin's own 112-vB backup must sweep above dust after its fee, so a 330-sat piece cannot back itself. Enforced on both legs by `split_amounts_floored` **before** the parent is made terminal. Pinned by unit `granularity_model::backup_fee_floor_is_the_true_mintable_minimum` |
-| Smallest **splittable un-laddered** coin | **`2·min_split_output + reserve`** — 1,184 @ 1 sat/vB | piece + change must each clear the floor and the reserve comes off the top. `split_fee_reserve` floors at 300 below a 30,000-sat parent |
+| Smallest **viable sub-coin**, on every lane (`min_split_output`) | **`330 + ceil(112·r)`** — 442 @ 1 sat/vB, 666 @ 3 | 330 is only the split *output* floor; the sub-coin's own 112-vB backup must sweep above dust after its fee, so a 330-sat piece cannot back itself. The **universal lower bound**: retiring the un-laddered shape did not retire it, because it is a fact about a backup transaction and not about a ladder. `transfer_many` states it first, before any parent is chosen; the in-ladder routes then raise it per-parent. Enforced on both legs by `split_amounts_floored` **before** the parent is made terminal. Pinned by unit `granularity_model::backup_fee_floor_is_the_true_mintable_minimum` |
+| Smallest coin the **shape-blind planner** will propose splitting | **`2·min_split_output + reserve`** — 1,184 @ 1 sat/vB | piece + change must each clear the floor and `select::plan_with_floor` still deducts `split_fee_reserve` on top. That reserve survives as the planner's *conservatism*, not as a charge: no in-ladder route takes one (the tier's fee is committed inside it), so the bound is strictly stricter than the executor's and re-planning is what recovers a coin it declines |
 | Smallest **in-ladder piece** | **1,560** = `min_child_value(3.0, 330)` = `2·(375+240) + 330` | a payee's piece funds its OWN extension and state rung before its final output can clear dust. `establish_child` runs *after* the parent's budget is consumed, so admitting below this terminalizes the parent and *then* fails |
 | Smallest **spine tip** (sender's change, plain-root / spine-batch / coloured lanes) | **945** = `min_spine_tip_value(3.0, 330)` = `615 + 330` | the tip is one cap tier and no extension |
 | Smallest **in-ladder change on the plain-CHILD lane** | **1,560** | `change_leg_role(SplitLane::PlainChild)` is `Piece`: a child-level split gives BOTH legs two tiers |
@@ -385,8 +419,9 @@ by a refusal inexpressible. Each leg takes the max of:
 | Highest feerate a token split is admitted at (legacy lane) | **33 sat/vB** | the *piece itself* must clear `min_split_output(r)`, and `330 + ceil(112·34) = 4,138` exceeds the fixed 4,074-sat packaging. Above it a token transfer is refused up-front rather than stranding the carrier |
 
 **Above its lane's floor, resolution is exactly 1 sat.** In-ladder, any piece in
-`[1,560, tier_out_total(X_m.out[0], 2, 3.0) − 945]`. Un-laddered, any piece in
-`[min_split_output, parent − reserve − min_split_output]`.
+`[1,560, tier_out_total(X_m.out[0], 2, 3.0) − 945]`. On the flat coloured lane the piece is not a
+free parameter at all — it is `TOKEN_PIECE_SATS` of packaging, and it is the *token* amount that
+carries 1-raw-unit resolution.
 
 **Everything is refused up-front, with the parent untouched.** That is the property worth stating
 loudest, because the alternative is not a failed payment — it is a *stranded coin*. Refusing after
@@ -408,9 +443,10 @@ Two conservatisms worth knowing, both in the safe direction:
 
 ## 5. What a partial send does to invalidation
 
-On the un-laddered lane a split composes entirely out of the machinery in the
-[invalidation deep dive](invalidation-deep-dive.md). On the ladder, consensus-level relative
-timelocks and a disclosure **census** do the same job. Item by item, for both shapes:
+On the flat coloured lane a split composes entirely out of the machinery in the
+[invalidation deep dive](invalidation-deep-dive.md) — absolute locktimes, a locktime-0 branch, the
+receiver's branch walk. On the ladder, consensus-level relative timelocks and a disclosure **census**
+do the same job. Item by item, for both:
 
 **The parent dies, permanently and publicly.** Setting the budget to one more signature and
 spending it on the split makes the parent terminal: the SE will never co-sign it again — not for a
@@ -419,12 +455,13 @@ budgets only tighten, INV-24, so termination cannot be undone through the API). 
 `GET /statechain/spend_budget/<parent>`. Every partial send therefore *consumes* a coin: granularity
 is bought with coin lifecycle, not with trust.
 
-Stated honestly, the budget is a **co-sign** bound, not a **spend** bound. On the un-laddered lane
+Stated honestly, the budget is a **co-sign** bound, not a **spend** bound. On the flat coloured lane
 that gap does not open, because every spend of the parent's funding needs a fresh co-signature. On
-the laddered lane it is closed by geometry instead — `SP` descends from `T` — which is why
-`split_coin` refuses a laddered parent outright rather than relying on the budget.
+the laddered lane it is closed by geometry instead — `SP` descends from `T` — and that is now the
+*only* closure the design relies on: the plain split that used to need refusing (because it raced
+`T` for `F` rather than descending from it) no longer exists to be refused.
 
-**Both legs are new coins one level down.** Un-laddered: piece and change are sub-coins with *fresh*
+**Both legs are new coins one level down.** Flat lane: piece and change are sub-coins with *fresh*
 backup ladders anchored at the split height, sharing one exit branch — the same signed split
 transaction is the last hop of both. In-ladder: the piece gets its own two-tier ladder hung off
 `SP.out[j]` by `establish_child`, the change gets a one-rung cap, and both carry the ancestor chain
@@ -439,7 +476,8 @@ lives inside that window. That is exactly what §7's headroom gate exists to enf
 `auto_exit_due`'s margin is derived from the coin's own bound chain rather than from a constant.
 
 **What the receiver of a piece verifies.** Two check-sets, one per lane, both automatic in `claim()`.
-The un-laddered branch checks (SPEC REQ-16/17, INV-20/25):
+The **branch** checks — what a coin arriving with `branch-` rows is verified by, which is the flat
+coloured lane's piece and any coin conveyed on the flat lane (SPEC REQ-16/17, INV-20/25):
 
 | Check | Defeats |
 |---|---|
@@ -482,7 +520,7 @@ inversion, hidden low-CSV state), `sdk46`/`sdk47` (the census formula against a 
 (a repeated `sign/second` returns the cached partial and does not advance `sig_count`, so a retry
 cannot brick the equation), `sdk60`/`sdk17` (multi-hop).
 
-**The benign co-descendant hazard** (un-laddered lane). After Alice pays Bob from a split, Alice
+**The benign co-descendant hazard** (flat branch lane). After Alice pays Bob from a split, Alice
 (change) and Bob (piece) hold the *same* branch transactions, and either may broadcast them at any
 time. That is harmless: broadcasting the shared branch only materialises both funding outputs on
 chain earlier, and moves no ownership — each output is its own owner's 2-of-2. Receivers must expect
@@ -490,26 +528,27 @@ their sub-coin to become a flat coin without their involvement; the SDK treats a
 rebroadcast as success, and only a *different* transaction spending the branch root is an
 `ExitBranchConflict`.
 
-**Depth grows, and it grows linearly.** Un-laddered, each level adds one branch hop and one more
-300–2,000-sat reserve burned at split time. In-ladder, each **two-tier** level adds `SP` plus an
-extension — 293 vB and one extension CSV — while each **spine** level adds `SP` alone. Nothing else
-compounds: leaf ladders are minted fresh, and a laddered coin has no idle clock to consume. The cost
-of granularity is exit weight, fees and latency — not security.
+**Depth grows, and it grows linearly.** On the flat coloured lane, each level adds one branch hop
+and one more 300–2,000-sat reserve burned at split time. In-ladder, each **two-tier** level adds
+`SP` plus an extension — 293 vB and one extension CSV — while each **spine** level adds `SP` alone.
+Nothing else compounds: leaf ladders are minted fresh, and a laddered coin has no idle clock to
+consume. The cost of granularity is exit weight, fees and latency — not security.
 
 ---
 
 ## 6. What a partial send does to unilateral exit
 
-**An un-laddered piece exits in two moves.** The branch is locktime-free (INV-4), so it broadcasts
-*now* and beats any locktimed stale ancestor backup provided it lands before the earliest ancestor
-maturity; the piece's own backup then waits out its fresh ladder. Value is secured on chain within a
-block and becomes spendable plain BTC after the leaf wait.
+**A piece on the flat branch lane exits in two moves.** The branch is locktime-free (INV-4), so it
+broadcasts *now* and beats any locktimed stale ancestor backup provided it lands before the earliest
+ancestor maturity; the piece's own backup then waits out its fresh ladder. Value is secured on chain
+within a block and becomes spendable plain BTC after the leaf wait.
 
 **A laddered coin or an in-ladder child exits by walking tiers.** Nothing is locktimed against a
 calendar and nothing races: broadcast `T`, then `X_m`, then each `SP`, then the leaf's own
 `ext_child → state_child`, each waiting out its relative CSV after its parent confirms.
 `unilateral_exit` (`clients/libs/rust-sdk/src/wallet.rs`) dispatches on shape with four arms probed
-in order — laddered root, split child, spine tip, un-laddered — and is idempotent and incremental:
+in order — laddered root, split child, spine tip, and a **flat fallback** that broadcasts the coin's
+`branch-` rows and then its latest absolute-locktime backup — and is idempotent and incremental:
 call it once per block until `complete`. A tier whose timelock is unreached is reported as
 `ExitStatus { complete: false, wait_blocks > 0 }`, never as an error (SPEC REQ-25).
 
@@ -588,7 +627,7 @@ the honest default: without a funding UTXO, a signer and a Core RPC endpoint the
 with, so a tier refused for fee reasons is reported as a stated limit rather than retried forever at
 the same rate.
 
-**On the un-laddered lane the reserve is fixed at split time** — `clamp(parent/100, 300, 2000)`,
+**On the flat coloured lane the reserve is fixed at split time** — `clamp(parent/100, 300, 2000)`,
 paid by the splitter out of change, with no RBF and no honest CPFP before the leaf's own backup
 matures (every branch output is a 2-of-2). What CPFP *can* do is lift the package once your leaf
 backup is in the mempool, from that backup's solely-owned output, at spike prices and only if the
@@ -596,12 +635,13 @@ coin is big enough to fund it.
 
 ### 6.4 A token piece's exit is the same broadcast wearing two hats
 
-The coloured split transactions **are** the RGB witness transactions. When the branch confirms the
-opret anchors confirm with it, and the allocation settles as an ordinary on-chain RGB holding at the
-exact partial amount (SPEC INV-16) — seated on the piece outpoint, provable from the consignment to
-any rgb-lib wallet, with no Mercury software needed to validate it. `sdk39` drives this end-to-end at
-depth 2: two successive token transfers build a piece whose exit branch is `[split1, split2]`, and
-broadcasting both root-first materialises the whole chain with the allocation preserved.
+*Flat coloured lane.* The coloured split transactions **are** the RGB witness transactions. When the
+branch confirms the opret anchors confirm with it, and the allocation settles as an ordinary
+on-chain RGB holding at the exact partial amount (SPEC INV-16) — seated on the piece outpoint,
+provable from the consignment to any rgb-lib wallet, with no Mercury software needed to validate it.
+`sdk39` drives this end-to-end at depth 2: two successive token transfers build a piece whose exit
+branch is `[split1, split2]`, and broadcasting both root-first materialises the whole chain with the
+allocation preserved.
 
 Two precision points:
 
@@ -626,8 +666,9 @@ the anchors confirm with it whatever the fee market does to the sats.
 **Carriers are protected from accidental destruction.** Because a plain-BTC spend of a carrier
 outpoint destroys its allocation, every plain sweep in the SDK refuses carriers: `withdraw` and
 `unilateral_exit` exclude them from all-coins defaults and hard-error on an explicitly named carrier
-id (SPEC REQ-44), `split_coin` refuses carrier parents, and balance arithmetic fails closed when RGB
-state is unreadable. The allocation cannot be swept away by a fat-fingered `withdraw()`.
+id (SPEC REQ-44), and balance arithmetic fails closed when RGB state is unreadable. The plain
+off-chain split that once had to refuse carrier parents by name no longer exists to be pointed at
+one. The allocation cannot be swept away by a fat-fingered `withdraw()`.
 
 ---
 
@@ -767,13 +808,17 @@ What exists to fight it:
 * **Consolidate and redeposit** — N withdraws plus one deposit — where a cooperative SE is available.
 
 Deadline bookkeeping is lane-dependent. A laddered *root* has no calendar. A *leaf* inherits its
-splitter's flat-backup deadline, and an un-laddered coin — a token carrier above all — keeps its
-sender's absolute root deadline. A wallet holding either should run `auto_exit_due`, which is on by
-default via `SdkConfig::auto_exit`.
+splitter's flat-backup deadline, and a coin on the flat lane — a carrier on a network with no pinned
+enclave, above all — keeps its sender's absolute root deadline. A wallet holding either should run
+`auto_exit_due`, which is on by default via `SdkConfig::auto_exit`.
 
 ### 8.6 Exiting a token piece during an SE outage
 
-You hold 10 units on a 4,074-sat piece at depth *d*, and the SE stops answering.
+You hold 10 units on a 4,074-sat piece at depth *d*, and the SE stops answering. This walkthrough is
+the **flat coloured lane** — a piece minted where no attestation identity is pinned, so the carrier
+it came from was never laddered. On the coloured-ladder lane the piece is a coloured CHILD instead,
+and its exit is the five-tier walk `T → X_m → SP → ext_child → state_child`, keyless and pre-signed,
+carrying the allocation with it (`unilateral_exit` takes the `ctesr-` arm; `sdk75`).
 
 1. **Nothing is lost by waiting a moment.** Your exit material is already local: the `branch-<id>`
    rows (the fully-signed coloured splits), the consignment, your key share, the plain backup.
@@ -798,10 +843,14 @@ allocation still wants a live SE.
 
 Send the *entire* allocation (`token_amount == carrier_amount`) and the change output's `rgb_amount`
 is 0, so it is left **uncoloured** — a plain BTC sub-coin. The RGB engine marks the old carrier
-outpoint spent; the change coin is ordinary sats: splittable, transferable, withdrawable, with no
-carrier guard applying. It stays **un-laddered**, because its funding is the un-broadcast coloured
-split output and a trigger would have no prevout to spend, so it lives on the `split_coin` lane.
-Carriers are not carriers forever. This is a property of the shipped legacy lane specifically: the
+outpoint spent; the change coin is ordinary sats, transferable and withdrawable, with no
+carrier guard applying. It gets **no ladder**, and that half is permanent: its funding is the
+un-broadcast coloured split output, so a trigger over it would have no prevout to spend (**B0**),
+which is exactly why `claim()`'s ladder pass is root-only. What *has* changed is what that means for
+spending it. The plain off-chain split it used to take is deleted, so `parent_shape` refuses it
+rather than routing it: it is exit material — its `branch-<id>` rows plus its own backup — and a
+whole-coin handover, not a splittable parent. Carriers are not carriers forever. This is a property
+of the legacy lane specifically: the
 coloured-ladder lane consumes the whole of `F` in the trigger before any payment is carved, so a
 spent carrier there leaves no BTC sub-coin at all and `colored_in_ladder_pay` carves no change child
 when the allocation is fully paid out.
@@ -810,10 +859,10 @@ when the allocation is fully paid out.
 
 Covered in §6.3. The short version: **laddered exits have no deadline to beat** — they confirm
 slowly, wait out their CSVs, and can be topped up through the anchor by a party that is not the
-owner. **Un-laddered exits confirm safely only if the branch lands before the earliest hostile
+owner. **Flat-branch exits confirm safely only if the branch lands before the earliest hostile
 maturity**, so broadcast early rather than at the deadline. What a sustained high-fee world moves is
-the *floors*, not the safety: `min_split_output` is `330 + ceil(112·r)`, so the smallest mintable
-un-laddered piece rises linearly with the rate, while the in-ladder floors are pinned to
+the *floors*, not the safety: `min_split_output` is `330 + ceil(112·r)`, so the smallest viable
+sub-coin on any lane rises linearly with the rate, while the in-ladder floors are pinned to
 `committed_fee_rate`, a protocol constant, and do not move with the market at all.
 
 ### 8.9 Invoice flows
@@ -833,7 +882,7 @@ is integral.
 | Party | Learns | Does NOT learn |
 |---|---|---|
 | **SE** | that id `P` was made terminal and co-signed once more; that fresh child slots were initialised; the attested `num_sigs` counters the census reads; message-relay timing | **any amount.** `cosign_tier_request` computes the sighash client-side and `SignFirstRequestPayload` carries a statechain id and a signature over it — the SE sees no transaction, no output, no value, and cannot tell a split tier from a state re-sign or a backup. It never learns K, the denominations, the colour, or that a spine exists rather than a two-way split |
-| **Receiver** | in-ladder: the ancestor chain `F → T → X_m → SP` and every superseded state the census requires, which exposes **your change leg's value**. Un-laddered: the full branch, including your change outputs' values along its path, plus (tokens) the consignment's transition-history subset | your other coins; anything outside their chain's cone |
+| **Receiver** | in-ladder: the ancestor chain `F → T → X_m → SP` and every superseded state the census requires, which exposes **your change leg's value**. Flat branch lane: the full branch, including your change outputs' values along its path, plus (tokens) the consignment's transition-history subset | your other coins; anything outside their chain's cone |
 | **Chain observer** | nothing until someone exits; then the tiers become visible — amounts, the P2A anchors, and (tokens) the opret marking RGB use | who owns which output (fresh 2-of-2 keys); token amounts (RGB state is off-chain, the anchor is a commitment) |
 
 Granularity is invisible to the operator by construction; the necessary trade is that a payee sees
@@ -855,7 +904,8 @@ matters is the consignment's, and it travels owner-encrypted inside the transfer
 refresh, carrier filtering (token carriers never fund plain sends), auto-refresh of any near-final
 coin before selection, exact-subset search, split planning, per-leg preflight with re-planning,
 **lane dispatch** (root → in-ladder split, spine tip → spine batch, received child → child-level
-split, un-laddered → plain split), terminal-guarding, blind co-signing, child or tip establishment,
+split; a coin with no ladder is refused rather than routed), terminal-guarding, blind co-signing,
+child or tip establishment,
 and conveyance or per-coin handover. `transfer_tokens(asset, addr, 10)` likewise. There is no "split"
 button and no protocol switch; the split is an implementation detail of exact amounts.
 
@@ -901,8 +951,9 @@ below the carrier fit guard — though two of them combine and can (§3c, §8.2)
 *token-packaging* limit, not a protocol one, and received **sats** pieces are first-class and
 re-spendable. A batch is not atomic across recipients. Plain-BTC fragmentation has no shipped
 wallet-level combine, only the proven `combine_leaves` primitive. The floors refuse rather than
-strand, but they do refuse: 330 dust, `330 + ceil(112·r)` un-laddered, 1,560 for a piece, 945 for a
-tip. The consignment and branch rows are recovery-bundle material, not seed-derivable. And
+strand, but they do refuse: 330 dust, `330 + ceil(112·r)` for any sub-coin's own backup, 1,560 for a
+piece, 945 for a tip. The consignment and branch rows are recovery-bundle material, not
+seed-derivable. And
 "insufficient balance" sometimes means "no exact composition exists" — or, rarely, planner
 conservatism — not "too poor".
 
@@ -910,8 +961,8 @@ conservatism — not "too poor".
 
 ## 11. FAQ
 
-**Can I send 1 sat?** Not as a minted piece. Un-laddered, the smallest mintable piece is
-`330 + ceil(112·r)` — 442 at 1 sat/vB — because the piece's own backup must sweep above dust after
+**Can I send 1 sat?** Not as a minted piece. No sub-coin on any lane may be smaller than
+`330 + ceil(112·r)` — 442 at 1 sat/vB — because its own backup must sweep above dust after
 its fee. In-ladder, a payee's piece must additionally fund its own two rungs: **1,560** at the
 shipped rate. Both are enforced up-front, so an under-floor piece is refused cleanly with the coin
 untouched, never stranded. A pre-existing tiny coin can still move whole. Above the floor, resolution
@@ -949,13 +1000,14 @@ into one payment.
 **Does splitting reset my clock?** A laddered **root** has no clock: every tier is relative-CSV and
 un-broadcast, so an idle coin never ages and pays no rent. A **leaf** does inherit one — the
 splitter's flat-backup chain over `F` is a real calendar (INV-27), which is what §7's headroom gate
-measures against. On the **un-laddered** lane the *leaf's* clock resets (each sub-coin gets a fresh
-ladder at split height) while the *tree's* does not, since the root deadline `H_deposit + initlock`
-never moves.
+measures against. On the **flat coloured** lane the *leaf's* clock resets (each sub-coin gets a fresh
+backup ladder at split height) while the *tree's* does not, since the root deadline
+`H_deposit + initlock` never moves.
 
 **Why can't I split my carrier's sats as plain BTC?** A plain split carries no RGB commitment, so
-spending the carrier outpoint through it would destroy the allocation. `split_coin` refuses carriers,
-as do `withdraw` and `unilateral_exit`. Sats leave a carrier only inside a coloured split (§8.7).
+spending the carrier outpoint through it would destroy the allocation. There is no plain off-chain
+split left to point at one — `split_coin` is deleted — and `withdraw` and `unilateral_exit` refuse a
+carrier by name. Sats leave a carrier only inside a coloured split (§8.7).
 
 **What is `precision`, and can it change?** A `u8` in the contract metadata, fixed at issuance,
 consulted only by UIs. It cannot change, and no SDK path scales by it.
@@ -964,28 +1016,28 @@ consulted only by UIs. It cannot change, and no SDK path scales by it.
 rgb-lib enforces exact conservation per transition (INV-13). Rounding error is structurally
 impossible.
 
-**Who pays the split fee, and where does it go?** Un-laddered: the splitter, deducted from change at
-split time (`clamp(parent/100, 300, 2000)`), becoming the split transaction's miner fee — burned on
-every exit path, cooperative or unilateral, since both materialise the branch. In-ladder: there is no
-reserve at all. Every tier carries its own committed fee plus a 240-sat anchor, taken off the tier's
-value as it is built — the split tier costs `committed_fee_for_outputs(2, 3.0) + 240` = **744**, a
-payee's two rungs cost `2 · 615` = **1,230**, and the sender's tip one rung, **615**. Same economics
-(spent, not escrowed), charged per pre-signed transaction rather than per split.
+**Who pays the split fee, and where does it go?** Flat coloured lane: the splitter, deducted from
+change at split time (`clamp(parent/100, 300, 2000)`), becoming the split transaction's miner fee —
+burned on every exit path, cooperative or unilateral, since both materialise the branch. In-ladder:
+there is no reserve at all. Every tier carries its own committed fee plus a 240-sat anchor, taken
+off the tier's value as it is built — the split tier costs `committed_fee_for_outputs(2, 3.0) + 240`
+= **744**, a payee's two rungs cost `2 · 615` = **1,230**, and the sender's tip one rung, **615**.
+Same economics (spent, not escrowed), charged per pre-signed transaction rather than per split.
 
 **What happens to dust-level change?** It never exists on any path. The split guards error and the
 planner will not select a coin that would produce one, both before the parent is touched —
-`split_amounts_floored` un-laddered, `inladder_amounts_floored` against per-leg `SplitFloors`
-in-ladder.
+`split_amounts_floored` on the flat coloured lane (and as the executable dust-boundary spec behind
+`split_amounts`), `inladder_amounts_floored` against per-leg `SplitFloors` in-ladder.
 
 **Can one carrier hold two different tokens?** Not in SDK flows: carrier selection, colouring and
 booking all operate on one contract per coin, and issuance and receipt each bind one allocation to a
 fresh outpoint. "One carrier, one asset" is the operative rule.
 
-**Does a split cost me a transfer hop?** No. Un-laddered, hops burn `interval` off a ladder and a
-split mints *fresh* ladders for both sub-coins. In-ladder, hops decrement the state CSV by `δ = 36`
-and a split gives each leg a fresh schedule of its own. What it costs instead: the parent coin (now
-terminal), the fees above, one more level of exit weight and latency, and two coin slots — derived,
-hence free, on the in-ladder path.
+**Does a split cost me a transfer hop?** No. On the flat coloured lane, hops burn `interval` off a
+backup ladder and a split mints *fresh* ladders for both sub-coins. In-ladder, hops decrement the
+state CSV by `δ = 36` and a split gives each leg a fresh schedule of its own. What it costs instead:
+the parent coin (now terminal), the fees above, one more level of exit weight and latency, and two
+coin slots — derived, hence free, on the in-ladder path.
 
 ---
 
@@ -993,7 +1045,7 @@ hence free, on the in-ladder path.
 
 | | **Ours (native off-chain split)** | **Spark (denominations + SSP)** | **Ark (per-round re-mint)** | **Lightning** |
 |---|---|---|---|---|
-| Resolution | 1 sat above the lane's floor (1,560 in-ladder piece, 945 tip, `330 + ceil(112·r)` un-laddered); tokens 1 raw unit | fixed leaf denominations; odd amounts via SSP swap | arbitrary, but only at round re-mint | 1 msat nominal |
+| Resolution | 1 sat above the lane's floor (1,560 in-ladder piece, 945 tip, never below the `330 + ceil(112·r)` backup floor); tokens 1 raw unit | fixed leaf denominations; odd amounts via SSP swap | arbitrary, but only at round re-mint | 1 msat nominal |
 | Amount ceiling per payment | your largest coin (split) or any exact subset | leaf set + SSP pool depth | round capacity | channel capacity / inbound liquidity |
 | Third party in a partial payment | **none** — the SE co-signs blind and sees no amounts | SSP pool required for odd amounts | ASP required, every round | route liquidity required |
 | Cost per partial payment | 744 sat of split tier + 1,230 to the payee's rungs + 615 to the sender's tip; +1 depth for the batch, ~293 vB of future exit weight per two-tier level | swap fee/spread to the SSP | share of the round tx, every round | routing fees; liquidity opportunity cost |
@@ -1030,12 +1082,16 @@ including the sweep coverage at which the lane overtakes a batched on-chain payo
 * **Whole-coin handover of a spine tip is refused by name.** A tip's funding is un-broadcast, so a
   flat conveyance would hand the recipient a coin with no exit. Splitting it (the spine batch) is the
   shipped path.
-* **Most token E2E coverage opts INTO the coloured ladder, which is not the default.** `sdk29`,
-  `sdk31` and `sdk34` set `colored_ladder = true` explicitly. The shipped configuration is `false`,
-  and the shipped-lane coverage is `sdk39` (depth-2 coloured exit end-to-end) plus `rgb16`.
+* **The token E2Es still set `colored_ladder = true` by name, and on regtest that is now
+  belt-and-braces.** `sdk29`, `sdk31`, `sdk34` and the `sdk74`–`sdk79` family opt in explicitly.
+  Since the flag reads the compiled-in attestation pin, regtest ships it **on**, so the line no
+  longer selects the lane there — it documents it. The *legacy* flat coloured lane keeps its own
+  coverage (`sdk39`, `rgb16`), and that is now coverage of the lane a network with **no** pinned
+  enclave takes, not of a shipped default.
 * **The keyless watchtower cannot fee-bump a child tier.** The exit path has bump variants; the watch
   path does not (SPEC §14.2 L-15).
-* **`estimate_exit_cost` measures un-laddered material only.** A laddered coin's cost and wait are
+* **`estimate_exit_cost` measures FLAT material only** — `branch-` rows plus the absolute-locktime
+  backup. A laddered coin's cost and wait are
   structural and come from `tesr_exit_vbytes` / `tesr_exit_wait_blocks` instead, and
   `exit_deadline_block` is `None` for a laddered root — which is *not* a claim that the coin has no
   calendar. The retained flat chain's locktime is a real deadline (INV-27, `sdk86`) and no client

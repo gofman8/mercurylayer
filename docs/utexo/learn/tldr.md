@@ -86,32 +86,52 @@ See [`../spec/CHILDREN.md`](../spec/CHILDREN.md).
 - **Self-custody.** 2-of-2 (you + SE) with a pre-signed exit chain. The SE can never move funds alone
   and can never freeze you out.
 
-## Two coin shapes
+## One shape — and a carrier is no longer the exception
 
-One protocol, two shapes. Which one a coin has is decided by what it carries; the transfer message's
-`protocol_version` reports that shape to the receiver rather than selecting it:
+An **RGB carrier** used to be conveyed on a flat, signed-once lane of its own, because a plain tier
+spend is sats-only and would sweep the carrier out from under its allocation (terminal-freeze,
+[`../spec/PROTOCOL.md`](../spec/PROTOCOL.md) §5.10 rule 1, INV-29 — a rule that has not moved and
+never will). The answer is no longer a second shape but a **coloured** ladder: every tier carries its own
+valid RGB state transition, so the same walk that exits a plain coin *moves* the allocation instead of
+destroying it (`sdk74` establish, `sdk75` exit, `sdk77` coloured in-ladder split).
 
-- **Laddered** — every plain BTC deposit. Trigger → extension → state, relative CSV, un-broadcast.
-- **Un-laddered** — `SdkConfig::colored_ladder` ships **false** on both presets
-  (`SdkConfig::regtest` / `::mainnet`, `clients/libs/rust-sdk/src/config.rs`), so an **RGB carrier**
-  takes the flat signed-once backup shape: a plain tier spend would sweep the sats and destroy the
-  allocation (terminal-freeze, `sdk52`). A **split sub-coin whose funding is un-broadcast** likewise
-  cannot root a trigger. These coins move by backup-chain handover with decrementing absolute
-  locktimes and the calendar duties that come with them (`auto_exit_due`, `exit_deadline_block`;
-  `sdk34` materializes a carrier before its deadline, `sdk32` documents the residual window). They
-  exit by broadcasting their branch root-first — `sdk39` does it for a coloured sub-coin two splits
-  deep. This path is load-bearing for RGB.
+`SdkConfig::colored_ladder` now **reads the enclave pin** rather than stating a bool —
+`TesrParams::attestation_identity_const(network).is_some()`
+(`clients/libs/rust-sdk/src/config.rs`) — because colouring a carrier is worthless without an
+identity to verify its terminality against. Regtest is pinned
+(`TesrParams::REGTEST_ATTESTATION_IDENTITY`, a pure function of the dev seed this repo commits, so it
+is a fact about the source rather than about a running server) and therefore ships **on**. **Mainnet
+is off for one reason only: no mainnet enclave is provisioned**, so there is no identity to pin, and
+inventing one would refuse every attestation. Pinning a real one flips it with no other change — that
+is the whole point of reading the pin. [`../spec/SPEC.md`](../spec/SPEC.md) §0.4 rows V-1 and V-6.
 
-A coloured ladder exists behind the flag (`sdk74` establish, `sdk75` exit, `sdk77` coloured in-ladder
-split), and turning it on is the route to one coin type.
+**What colouring a tier cannot do is broadcast a funding output**, and that fact is permanent. Every
+in-ladder split **child** and every **spine tip** is funded by an output of the un-broadcast `SP`, so
+it can never root a trigger of its own: its exit material is the chain reaching back to its parent's
+confirmed root, and for a coloured one the stored `branch-` rows are the RGB witnesses that settle it
+on chain (`sdk39` settles one two splits deep, broadcasting its branch root-first; `sdk34`
+materializes a carrier before its deadline, `sdk32` documents the residual window). That is not a
+lesser kind of coin — it is where the 0 vB of idle rent comes from.
+
+What *is* gone is the plain **un-laddered lane**: `ParentShape::Unladdered`, `split_coin` and the
+N+1-output plain split of `F` are deleted, and `parent_shape` now refuses a coin carrying no ladder
+instead of routing it. That closes **[B1]** by construction — a plain split spent the very funding
+output `F` that a prior owner's retained, un-timelocked trigger also spends, so that owner could void
+the split and destroy the payee's sub-coin, and the payee had no way to detect the exposure. There is
+no longer a route that spends `F`.
 
 ## Unilateral exit
 
 - **Laddered coin (SE gone):** broadcast `T`, then walk the pre-signed chain **tier by tier**, waiting
   out each relative timelock in turn. Not a single broadcast — `unilateral_exit` (`sdk50`), and
-  `sdk45` drives the same walk from a bundle holding **no key material**.
-- **Un-laddered coin:** broadcast the pre-signed branch and its backup; your locktime is the earliest
-  of all owners', so you win the race.
+  `sdk45` drives the same walk from a bundle holding **no key material**. A **coloured** carrier walks
+  the same way, and the walk moves the allocation to your own key (`sdk75`).
+- **A coin carrying only flat material** — a legacy pre-ladder coin, or one whose `claim()` never
+  completed: broadcast the pre-signed branch and then its backup once the absolute locktime passes.
+  Your locktime is the earliest of all owners', so you win the race. `unilateral_exit` keeps this as
+  its last arm and **refuses outright if the coin is a carrier**, because an RGB-unaware spend would
+  destroy the allocation; a carrier with no coloured ladder settles through `materialise_carrier`
+  instead.
 - **Cooperative exit (normal):** `withdraw` — the SE co-signs a direct spend to your L1 address, one
   transaction, no wait. A received in-ladder child has no confirmed outpoint to spend, so it routes
   to the walk instead.
@@ -158,10 +178,12 @@ Stated here rather than left for a reader to discover:
   200** with a `server_pubnonce` once the row ages past it. `sdk90` shows an honest client is stopped
   by two independent *local* gates first — which a cheating payer does not run. The owner latch that
   would replace the clock is specified and not built.
-- **The enclave attestation identity.** The census is only as good as the key that signs it, and
-  `TesrParams::attestation_identity_const` returns `None` for every network today, so the identity
-  must be configured (`SdkConfig::attestation_identity`) — the client refuses rather than falling back
-  to the key the coordinator serves.
+- **A mainnet enclave attestation identity.** The census is only as good as the key that signs it.
+  `TesrParams::attestation_identity_const` pins **regtest's**, and returns `None` for mainnet, testnet
+  and signet, where no enclave is provisioned — so on those networks the identity must be configured
+  (`SdkConfig::attestation_identity`), and with none the client **refuses** rather than falling back to
+  the key the coordinator serves. This is also what holds `colored_ladder` off there: a carrier's
+  ladder is only worth having if its terminality can be verified.
 
 ## The developer surface
 

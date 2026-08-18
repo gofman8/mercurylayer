@@ -122,18 +122,23 @@ pub async fn execute() -> Result<()> {
     // below. She sets the flag by hand regardless of what the default is, so the control states the
     // lane it is controlling for rather than inheriting it.
     //
-    // The pin below is the same pin, aimed at the truth: `colored_ladder` ships **false** (2c351c6).
-    // The lane is SOUND — that is what alice proves in this very test — but it is not the default,
-    // because of the measured economics of what it switches on
-    // (`docs/utexo/spec/PARTIAL-PAYMENT-ECONOMICS.md`: one coloured partial payment per carrier, ever,
-    // and a 4_284-block unilateral exit for the child it produces). Keeping the pin means the
-    // shipping default still cannot move without a test saying so; alice and bob opt IN explicitly,
-    // ten lines up and down, so what this test proves about the lane is untouched by it.
+    // **[ONE COIN SHAPE] The default MOVED, and this pin moved with it — deliberately.**
+    //
+    // It used to assert `colored_ladder` ships FALSE, on the reasoning that the lane is sound (which
+    // this test proves) but its economics are not. That reasoning was superseded twice: the real
+    // blocker turned out to be V-6, not economics — a flip with no pinned attestation identity
+    // retires the legacy coloured lane while `claim()` cannot ladder anything, so `transfer_tokens`
+    // refuses permanently — and regtest now HAS a pinned identity.
+    //
+    // So the pin is inverted rather than deleted, and it now pins the COUPLING: the default follows
+    // the pin. A network with an identity ships one coin shape; one without ships the legacy lane,
+    // because turning it on there would ship a wallet whose token lane refuses forever.
     assert!(
-        !SdkConfig::regtest("default-probe").colored_ladder,
-        "colored_ladder must ship OFF by default (2c351c6) — the lane is sound (this test proves \
-         it) but its economics are not, so it is opt-in. Flipping the default is a product \
-         decision and must not happen silently."
+        SdkConfig::regtest("default-probe").colored_ladder,
+        "regtest pins an attestation identity, so `colored_ladder` must ship ON there — one coin \
+         shape. If this fails, either the pin was removed or the constructor stopped reading it, \
+         and the two must never disagree (see `colored_ladder_is_never_on_without_a_pinned_\
+         attestation_identity`)."
     );
     let mut carol_cfg = SdkConfig::regtest("sdk74_carol");
     carol_cfg.rgb_data_dir = Some("./rgb-data-sdk74_carol".to_string());

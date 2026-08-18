@@ -156,7 +156,8 @@ pub struct SdkConfig {
 ///
 /// NOT every coin is laddered, and that is BY DESIGN — it is not a leftover of the old protocol:
 ///   * an **RGB carrier** must never be laddered *with a PLAIN ladder* (an uncoloured tier spend
-///     would destroy the allocation). [CTES-R] `SdkConfig::colored_ladder` (default OFF — 2c351c6)
+///     would destroy the allocation). [CTES-R] `SdkConfig::colored_ladder` (ON wherever an
+///     attestation identity is pinned — it READS the pin rather than stating a bool)
 ///     builds it a COLOURED ladder instead — every tier carrying a valid RGB state transition, so
 ///     laddering MOVES the allocation rather than destroying it. A carrier still falls back to the
 ///     flat signed-once backup shape when the coloured lane cannot be taken *for that coin*: its
@@ -165,7 +166,7 @@ pub struct SdkConfig {
 ///     `claim()`, and while they last that carrier cannot be paid from at all — the legacy split
 ///     lane it used to fall back to is retired;
 ///   * a **split sub-coin** whose funding is un-broadcast cannot root a trigger [B0].
-/// Those coins travel the UN-LADDERED lane. It is load-bearing for tokens, not dead code left over
+/// Those coins travel the LEGACY COLOURED lane. It is load-bearing for tokens, not dead code left over
 /// from the pre-TES-R design.
 
 // =================================================================================================

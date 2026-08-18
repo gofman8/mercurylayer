@@ -12,38 +12,52 @@ awake before deadlines — and the third is delegable without custody. One gap d
 summary and is stated in full below: between the moment a payer conveys a coin and the moment the
 payee claims it, the server side is held by a **wall-clock one-hour timer**, not by ownership.
 
-## One protocol, two coin shapes
+## One protocol, one coin shape — and the material that survives it
 
-Read everything below with this split in mind, because several guarantees are enforced by different
-machinery on each shape. There is exactly **one protocol** — `claim()` builds a TES-R ladder for
-every fresh confirmed root coin, unconditionally — but not every coin is laddered:
+Read everything below with two distinctions in mind, because several guarantees are enforced by
+different machinery on each side of them.
 
-- **Laddered** — every plain BTC deposit. The coin is a pre-signed, **un-broadcast** chain of three
-  tiers: **trigger** `T` (no timelock, signed once at deposit) → **extension** `X_m` (relative CSV
-  `E_m`) → **state** `S_k` (relative CSV `Δ_k`), all v3/TRUC with a P2A anchor.
-- **Un-laddered** — an RGB **carrier** is never given a *plain* ladder (a plain tier spend would
-  sweep the sats and destroy the allocation — terminal-freeze, `sdk52`), and a split sub-coin whose
-  funding tx is un-broadcast has no on-chain outpoint to root a trigger. (A `single_use` coin is
-  likewise skipped.) These keep the signed-once backup tx and move by backup-chain handover over a
-  verified exit **branch**. This lane is load-bearing for tokens (`sdk39`, `sdk52`).
+**Every coin is laddered.** `claim()` builds a TES-R ladder for every fresh confirmed root coin: a
+pre-signed, **un-broadcast** chain of three tiers — **trigger** `T` (no timelock, signed once at
+deposit) → **extension** `X_m` (relative CSV `E_m`) → **state** `S_k` (relative CSV `Δ_k`), all
+v3/TRUC with a P2A anchor. An RGB **carrier** is no longer the standing exception: it may never be
+given a *plain* ladder (a plain tier spend is sats-only and would sweep the carrier out from under
+its allocation — terminal-freeze), so it is given a **coloured** one, every tier carrying its own
+valid RGB state transition (`build_colored_tier`, `renew_colored_ladder`, `colored_reanchor`).
+`SdkConfig::colored_ladder` (`clients/libs/rust-sdk/src/config.rs`) selects it by **reading the
+enclave pin** — `TesrParams::attestation_identity_const(network).is_some()` — because a ladder whose
+terminality cannot be verified against a pinned identity is not worth building. Regtest is pinned and
+ships on; **mainnet is off solely because no mainnet enclave is provisioned yet**, and pinning a real
+identity flips it with no other change ([TRUST-MODEL.md](../spec/TRUST-MODEL.md) B11,
+[SPEC.md](../spec/SPEC.md) §0.4 rows V-1 and V-6). Where a carrier does stay flat it is named
+(`LadderSkipReason::RgbCarrier`), and a `single_use` terminalized carrier is likewise skipped.
 
-A coloured ladder for carriers exists in code — `build_colored_tier` builds a tier carrying a valid
-RGB state transition, `renew_colored_ladder` renews one, `colored_reanchor` re-anchors one — but
-**`SdkConfig::colored_ladder` ships `false` on both presets**
-(`clients/libs/rust-sdk/src/config.rs`). Everything below describes that default: a carrier takes the
-flat signed-once backup shape, and a carrier the coloured lane cannot serve falls back to it by name
-(`LadderSkipReason::RgbCarrier`).
+**Un-broadcast funding is permanent, and is not a second shape.** A split sub-coin — a received
+child, a spine tip — is funded by an output of the un-broadcast `SP`, so it has no on-chain outpoint
+to root a **trigger** of its own. Colouring a tier cannot change that; nothing can. Its exit material
+is the chain reaching back to its parent's confirmed `F`, and for a coloured sub-coin the retained
+signed-once backup plus the verified exit **branch** are what settle the allocation on chain
+(`sdk39`). That property is load-bearing for tokens and is where 0 vB of idle rent comes from.
+
+**What is gone is the plain un-laddered lane.** `ParentShape::Unladdered`, `split_coin`, the plain
+off-chain split and `ManyRoute::PlainSplit` are deleted, together with the two flat-lane licences
+that let an ordinary coin travel without a ladder — `licence_rgb_carrier` and
+`licence_funding_not_onchain`, and their `PermanentLicence` variants
+(`clients/libs/rust/src/transfer_sender.rs`). What still licences a flat conveyance is narrower, and
+each is established from *positive* evidence rather than from a recorded string: a `single_use`
+terminalized carrier, a pre-migration-0009 coin the coordinator answers about with no aggregate on
+record, and a wallet carrying no ladder artefact at all.
 
 ## What you trust, exactly
 
 | Property | Guarantee | Mechanism |
 |---|---|---|
 | SE cannot steal | cryptographic | 2-of-2 MuSig2: the SE holds one share, blindly, and never the full key |
-| You can always exit | cryptographic (+ timeliness) | *laddered*: walk the pre-signed tier chain `T → X_m → S_k`, waiting out each relative timelock (`sdk50`; `sdk45` shows a keyless third party can drive it). *Un-laddered*: broadcast the pre-signed branch + latest backup. Neither path calls the SE |
+| You can always exit | cryptographic (+ timeliness) | *laddered*: walk the pre-signed tier chain `T → X_m → S_k`, waiting out each relative timelock (`sdk50`; `sdk45` shows a keyless third party can drive it). *flat material* (a legacy coin, or a carrier awaiting an enclave): broadcast the pre-signed branch + latest backup. Neither path calls the SE |
 | The ladder costs nothing to hold | structural | BIP-68 relative timelocks only start counting once the **parent** confirms, and `T` carries no timelock — so no tier matures until someone broadcasts `T`. The tiers never age: 0 vB of on-chain rent, and renewal is off-chain and unbounded (`sdk43`). This is a statement about the tiers, **not** about the coin's root — see the two clocks below |
-| Current owner wins the exit race | timelock + receiver-verified | *laddered*: replace-by-lower-timelock — each transfer co-signs a fresh state one `δ` **below** the one it replaces, so the new owner's state matures first, and every superseded state is disclosed and counted by the receiver's census. *Un-laddered*: decrementing absolute locktimes on the backup chain — your backup unlocks before any previous owner's |
+| Current owner wins the exit race | timelock + receiver-verified | *laddered*: replace-by-lower-timelock — each transfer co-signs a fresh state one `δ` **below** the one it replaces, so the new owner's state matures first, and every superseded state is disclosed and counted by the receiver's census. *on the flat material every coin also retains*: decrementing absolute locktimes on the backup chain — your backup unlocks before any previous owner's |
 | A received payment is final | cryptographic | the claim completes the SE key-share and auth-key rotation, so the receiver co-owns the coin (or child) and the **sender is permanently locked out** (`sdk60`, `sdk17`) |
-| No double-spend of off-chain state | receiver-verified over an attested count | the enclave checks a per-coin `sig_budget` against its lifetime `sig_count` before consuming a secnonce, and terminality is publicly readable (`GET /statechain/spend_budget/<id>`, `sdk04`). On top of that the *receiver* proves it independently — the ladder census on a laddered coin, terminal-ancestor checks on an un-laddered branch — against a count the **enclave signs**, not one the coordinator asserts |
+| No double-spend of off-chain state | receiver-verified over an attested count | the enclave checks a per-coin `sig_budget` against its lifetime `sig_count` before consuming a secnonce, and terminality is publicly readable (`GET /statechain/spend_budget/<id>`, `sdk04`). On top of that the *receiver* proves it independently — the ladder census on the tier chain, terminal-ancestor checks on a conveyed branch — against a count the **enclave signs**, not one the coordinator asserts |
 | Token correctness | cryptographic | RGB client-side validation — the SE never sees or vouches for token state |
 
 There is **no enclave single-active-state refusal**, and the specification does not claim one. The
@@ -133,9 +147,10 @@ misread the design.
   **severs from `F`** by broadcasting the already-co-signed trigger — `T` carries no timelock, so it
   beats every retained *timelocked* rung by being valid first. `sdk86` measures the height advancing
   and each hop spending `interval` of it.
-- **Un-laddered coins (RGB carriers, un-broadcast-funding sub-coins): the absolute deadline is the
-  whole story.** Materialize or exit before the backup locktime floor. `auto_exit_due` (default on)
-  force-exits plain sub-coins and materializes token carriers near their deadlines (`sdk34`).
+- **Sub-coins over un-broadcast funding, and any carrier still travelling flat: the absolute
+  deadline is the whole story.** They inherit the root's epoch and hold no calendar of their own, so
+  materialize or exit before the backup locktime floor. `auto_exit_due` (default on) force-exits
+  plain sub-coins and materializes token carriers near their deadlines (`sdk34`).
 - **Renewal and rollover are off-chain and unbounded.** A lower-CSV extension replaces `X_m`
   horizontally, and a rollover mints a fresh level — neither touches the chain (`sdk43`).
 - **`refresh` is the re-anchor primitive, not a deadline reset.** It spends one on-chain tx to move a
@@ -168,7 +183,8 @@ stated limits, and both are protocol facts rather than implementation gaps:
   operator running the optional funded-tower variant. `SdkConfig::fee_bump` ships as `None` on both
   presets, so out of the box no wallet bumps anything.
 
-Everything a tower broadcasts is already fully signed and pays only the owner, in both shapes.
+Everything a tower broadcasts is already fully signed and pays only the owner, whichever material
+it is holding.
 `sdk45` serializes the bundle a user would hand a third party and asserts it contains no key material
 at all, then has the keyless tower defend an offline owner end to end, and shows a second independent
 tower is an idempotent re-broadcast. The worst a malicious or buggy tower can do is broadcast
@@ -182,7 +198,7 @@ When a pass cannot tell, it says so rather than concluding "nothing is due":
 
 ## What a receiver verifies
 
-A receiver **verifies, and does not trust**, the sender. Both shapes check the transfer signature
+A receiver **verifies, and does not trust**, the sender. Both message shapes check the transfer signature
 binding the coin to *their* key, that their new share plus the new SE share recombine to the coin's
 on-chain aggregate pubkey, and that the funding output is unspent. Beyond that the shapes diverge.
 
@@ -221,7 +237,8 @@ malicious sender who bypasses
 his own client's guard is still rejected by the receiver; `sdk54` and `sdk55` are the whole-coin and
 backup-chain adversarial suites.
 
-**On an un-laddered sub-coin — the branch** (`clients/libs/rust/src/transfer_receiver.rs`):
+**On a conveyed branch — the flat lane** (`clients/libs/rust/src/transfer_receiver.rs`), which a
+legacy coin and a carrier still travelling flat both take:
 
 1. The **exit branch**: every branch tx is consensus-valid (scripts + signatures verified locally),
    links parent→child, and terminates at an on-chain, unspent, **confirmed** root — a mempool-only
@@ -245,8 +262,9 @@ backup-chain adversarial suites.
 The one honest gap on this lane: the terminal-ancestor *ids* are not cryptographically bound to the
 branch's outpoints (the SE is blind and cannot attest to the mapping), so the count check defeats
 *omission* but not *substitution* by a sender who controls other terminal coins. Settling on-chain
-closes it, and the automatic pass does that near the deadline. Laddered coins are structurally
-exempt — there is no id to substitute (point 4 above).
+closes it, and the automatic pass does that near the deadline. The tier chain is structurally
+exempt — there is no id to substitute (point 4 above) — so retiring the plain un-laddered lane
+shrinks the population this gap applies to rather than closing the gap itself.
 
 ## What you can always do alone
 
@@ -278,7 +296,7 @@ confiscation-by-design.
 They are numbered B1–B11 in [TRUST-MODEL.md §7](../spec/TRUST-MODEL.md); the short list is: SE share
 deletion and SE-plus-old-owner collusion (the irreducible statechain unit — and note it gives **no
 race head start**, since the collusive spend is un-timelocked and so is your own trigger);
-ancestor-id substitution on the un-laddered lane only; indexer honesty; deadline liveness on both
+ancestor-id substitution on the flat lane only; indexer honesty; deadline liveness on both
 clocks; the onboarding window before the first backup is co-signed; un-conveyed ancestor locktimes;
 loss of local state (`wallet.db` and the RGB data directory — the mnemonic alone is not a backup);
 payment atomicity; one live wallet instance per database; split/combine commit ordering; and the

@@ -60,18 +60,28 @@ network and a conveyed one is measured against the receiver's own preset field b
 (`cap_schedule`), which is strictly stronger than publication because it holds against a lying
 coordinator.
 
-**Two exclusions from laddering, both by design and both fail-closed:**
+**Two things this pass will not do, both by design and both fail-closed:**
 
-- an **RGB carrier**. `SdkConfig::colored_ladder` ships **false**
-  (`clients/libs/rust-sdk/src/config.rs`), so a carrier takes the flat signed-once backup shape: a
-  plain tier spend would sweep the sats and destroy the allocation (terminal freeze,
-  [PROTOCOL.md](../spec/PROTOCOL.md) §5.10; `sdk52`);
-- a coin whose funding output is an **un-broadcast split output** — a trigger over it would have no
-  prevout to spend, and a v3 tier cannot relay over an unconfirmed parent.
+- **give an RGB carrier a *plain* ladder.** A plain tier spend is sats-only, so broadcasting one
+  sweeps the sats and destroys the allocation (terminal freeze,
+  [PROTOCOL.md](../spec/PROTOCOL.md) §5.10). The carrier is not excluded from laddering for that
+  reason any more — it gets a **coloured** ladder instead, every tier carrying its own valid RGB state
+  transition. `SdkConfig::colored_ladder` (`clients/libs/rust-sdk/src/config.rs`) selects it by
+  **reading the enclave pin**, `TesrParams::attestation_identity_const(network).is_some()`, because a
+  coloured ladder whose terminality cannot be verified against a pinned identity is not worth
+  building. Regtest is pinned and ships on; mainnet, testnet and signet evaluate false only because
+  **no enclave is provisioned there yet**, and pinning one flips it with no other change
+  ([SPEC.md](../spec/SPEC.md) §0.4 rows V-1 and V-6). Where a carrier does stay flat,
+  `LadderSkipReason` names why;
+- **root a trigger on an un-broadcast funding output.** A coin funded by a split output — an
+  in-ladder child, a spine tip — has no confirmed prevout for a trigger to spend, and a v3 tier
+  cannot relay over an unconfirmed parent. Colouring a tier does not change this and never could:
+  it is the same fact that makes idle rent 0 vB. Such a coin is laddered by the split that created
+  it, whose chain reaches back to the parent's confirmed `F`, not by this pass.
 
 If the carrier set or `F`'s on-chain status cannot be resolved, the pass is skipped and retried: a
-missed ladder is harmless, a laddered carrier is not. Either way the coin keeps its signed-once
-backup and stays exitable. `sdk71` proves the unconditional half on the live stack.
+missed ladder is harmless, a plainly-laddered carrier is not. Either way the coin keeps its
+signed-once backup and stays exitable. `sdk71` proves the unconditional half on the live stack.
 
 Deposit slots consume a **deposit token** (anti-spam / fee mechanism); when payment is required the
 SDK surfaces `SdkError::TokenPaymentRequired` with the details. Slots minted by an SE-co-signed flow
@@ -90,10 +100,12 @@ a refresh re-anchor — are **derived slots** and cost nothing (`deposit/get_der
 coin's funding output to your L1 address. No timelock, one on-chain transaction per coin, ≈ 111 vB.
 The pre-signed ladder is simply abandoned un-broadcast — a cooperative exit never touches it.
 
-Three shapes behave differently:
+Three cases behave differently:
 
-- an **un-laddered sub-coin** is materialized first: the SDK broadcasts its exit branch (branch
-  transactions carry no locktime, so this is instant), then the withdraw spend;
+- a **sub-coin that carries a `branch-` row** — one minted by a colored split or combine — is
+  materialized first: its funding is un-broadcast, so the SDK broadcasts the branch (branch
+  transactions carry no locktime, so this is instant) to give the withdraw spend an on-chain input,
+  then the withdraw spend itself;
 - a **token carrier** is excluded from the withdraw-everything default and **hard-errors** if named,
   because an RGB-unaware sweep destroys the allocation;
 - a received **split child** has no confirmed outpoint to spend at all — its funding `SP.out[j]` is
@@ -120,27 +132,37 @@ signed at deposit or at claim, and each pays the coin's own seed-derived `backup
 nothing left to choose at exit time, which is exactly the property that makes the walk keyless and
 delegable. To land the value somewhere else, exit first and spend the result.
 
-It dispatches on the coin's shape, and the arms are probed **in this order** — the spine tip is a
-shape of its own, and omitting it is not a simplification, because a tip that fell through to the
-flat fallback would get its branch rows and its absolute-locktime backup broadcast, which is
-RGB-unaware:
+It dispatches on where the coin sits in a ladder, and the arms are probed **in this order** — the
+spine tip is a position of its own, and omitting it is not a simplification, because a tip that fell
+through to the flat fallback would get its branch rows and its absolute-locktime backup broadcast,
+which is RGB-unaware:
 
-1. **Laddered** (`exit_pass`) — walk the tier chain: broadcast `T`, then each extension and state as
-   its relative CSV matures. **No absolute-locktime backup is broadcast on this arm.**
+1. **Root** (`exit_pass`) — walk the tier chain: broadcast `T`, then each extension and state as
+   its relative CSV matures. **No absolute-locktime backup is broadcast on this arm.** A carrier
+   whose ladder is **coloured** walks here too, and because every tier is a valid RGB transition the
+   walk moves the allocation to the owner's own key rather than sweeping it away (`sdk75`).
 2. **Split child** (`exit_child_pass`) — the same walk over the full pre-co-signed chain
    `T → X_m → SP → ext_child → state_child`, whose final state already pays this wallet's own key.
    This is also where a cooperative `withdraw` of a child is routed.
 3. **Spine tip** (`exit_spine_tip_pass`) — the sender's own change leg from an in-ladder split,
    walking the one-rung cap over `SP.out[K]` via `next_spine_tip_exit_tier`.
-4. **Un-laddered** — broadcast the exit branch (instant, locktime-free), then the coin's latest
-   pre-signed backup, subject to its **absolute** locktime. Every previous owner's backup unlocks
-   *later* than yours, so you have a window in which only you can claim.
+4. **Flat fallback** — a coin carrying no ladder of any of the three kinds: a legacy pre-ladder coin,
+   or one whose `claim()` never completed. Broadcast the exit branch (instant, locktime-free), then
+   the coin's latest pre-signed backup, subject to its **absolute** locktime. Every previous owner's
+   backup unlocks *later* than yours, so you have a window in which only you can claim. This is a
+   *recovery* arm, not a lane payments are minted into — the plain un-laddered shape that used to
+   feed it is deleted — and it repeats the carrier test at the point of no return, refusing rather
+   than filtering, because a restored-from-mnemonic coin can arrive here with the wallet unable to
+   see that it is holding an asset.
 
 Two refusals are part of the contract. `unilateral_exit` refuses a coin that is not `CONFIRMED` even
 when named explicitly — exiting a parent already consumed by a split would kill the transaction
-funding the receiver's child — and it refuses a token carrier, because the walk would be an
-RGB-unaware spend. A tier whose timelock is unreached is reported as
-`ExitStatus{complete: false, wait_blocks > 0}`, never as an error.
+funding the receiver's child — and it refuses a token carrier **unless its ladder is coloured**,
+because otherwise every pre-signed spend of `F` this wallet holds is RGB-unaware. That refusal names
+the two routes that do exist rather than returning `complete` on a walk it did not perform:
+`materialise_carrier` to settle the allocation on chain, `transfer_tokens` to move it onward. A tier
+whose timelock is unreached is reported as `ExitStatus{complete: false, wait_blocks > 0}`, never as
+an error.
 
 *Evidence:* `sdk50` (the SDK surface, end to end), `sdk40` PART 1 (real consensus rejects each tier
 before its CSV is met and accepts it after), `sdk45` (a keyless tower drives the same walk with no
@@ -176,8 +198,8 @@ How deep a chain can get is **derived, not a literal** (`max_split_depth`,
 transactions to walk; on regtest depth 54, 111 transactions.
 
 `estimate_exit_cost(statechain_id)` reports `{branch_txs, branch_vbytes, backup_vbytes,
-total_vbytes, wait_blocks, exit_deadline_block}` — and its scope is honest: it measures the
-**un-laddered** material only, the stored branch plus the latest absolute-locktime backup, and it is
+total_vbytes, wait_blocks, exit_deadline_block}` — and its scope is honest: it measures the **flat**
+material only, the stored branch plus the latest absolute-locktime backup, and it is
 what feeds the calendar deadline the watchtower acts on. A laddered coin's tier chain is structural
 instead, per the formulas above, and `exit_deadline_block` is `None` for one. That `None` means "no
 ancestor can race this coin off-chain", **not** "this coin has no calendar" — the retained flat
@@ -251,7 +273,7 @@ optional in the way a reader might expect:
 |---|---|---|---|
 | `deadline_safety_due` | **unconditional** — `maintenance_plan` returns it for every config | `auto_refresh_margin_blocks` = 144 | the whole coin's `min(L_k)`: re-anchor cooperatively first, and **sever from `F`** for whatever the counterparty declines to co-sign |
 | `defend_ladders()` | **unconditional**, gated to one pass per new block | — | a hostile trigger; a no-op while `F` is unspent |
-| `auto_exit_due` | `SdkConfig::auto_exit`, default on | `auto_exit_margin_blocks` | un-laddered sub-coins near their deadline, and token-carrier materialization |
+| `auto_exit_due` | `SdkConfig::auto_exit`, default on | `auto_exit_margin_blocks` | sub-coins over un-broadcast funding near their deadline — received leaves and spine tips — and token-carrier materialization |
 
 `auto_exit_margin_blocks` is **derived, never chosen**:
 `auto_exit_margin_blocks_for(k_max, interval, d) = k_max·interval + tesr_exit_txs(d)·144` — **2,120
@@ -272,16 +294,17 @@ is worse than the deadline it exists to beat.
 
 ### Delegation is keyless
 
-Everything a tower must broadcast is already fully signed and pays **only the owner**, in both coin
-shapes.
+Everything a tower must broadcast is already fully signed and pays **only the owner**, whichever
+material it is holding.
 
-- *Laddered*: the persisted `TesrBundle` (`tesr::persist` / `tesr::load`) is the tier chain, every
-  tier paying the owner's own key. `tesr::watch_pass` runs one iteration from that bundle and an
+- *The tier chain*: the persisted `TesrBundle` (`tesr::persist` / `tesr::load`) is every tier, each
+  paying the owner's own key. `tesr::watch_pass` runs one iteration from that bundle and an
   electrum connection alone — no wallet, no coin, no SE, no keys.
-- *Un-laddered*: `export_watch_bundle()` emits branch transactions, deadlines and — **plain coins
-  only** — the latest backup transaction. A carrier's entry structurally omits the backup, which is
-  what denies an RGB-destroying sweep. `watchtower::watch_pass`
-  (`clients/libs/rust-sdk/src/watchtower.rs`) is the matching keyless pass.
+- *The flat material*: `export_watch_bundle()` emits branch transactions, deadlines and — **plain
+  coins only** — the latest backup transaction. A carrier's entry structurally omits the backup,
+  which is what denies an RGB-destroying sweep. `watchtower::watch_pass`
+  (`clients/libs/rust-sdk/src/watchtower.rs`) is the matching keyless pass. Adopted split children
+  and spine tips are read from their own rows, so a leaf is never silently absent from the bundle.
 
 `sdk45` serializes the bundle a user would hand a third party, asserts it contains no key material
 at all, has the keyless tower defend an offline owner against a hostile trigger end to end, and then
@@ -373,10 +396,19 @@ Materialize the branch instead.
 
 ## Exits with tokens
 
-A carrier's ladder-less shape means both plain exit paths refuse it, so a carrier exits by
+Both *plain* exit paths refuse a carrier — a plain tier spend and a plain sweep are both RGB-unaware
+— so how a carrier settles depends on what it holds.
+
+A carrier whose ladder is **coloured** exits by walking it, arm 1 above: every tier is a valid RGB
+state transition, so the walk moves the allocation to the owner's own key (`sdk75`). That is a real
+unilateral exit, needing nobody.
+
+A carrier with **no** coloured ladder — one on a network where no enclave attestation identity is
+pinned, or one funded below the coloured root floor — has no SE-free exit at all, and
+`unilateral_exit` says so rather than reporting a walk it did not perform. What it has instead is
 **materializing** its branch: broadcasting only the chain of pre-signed colored split/combine
 transactions, which settles the RGB allocation on chain and defeats an ancestor's clawback, without
-the sats-sweeping backup.
+the sats-sweeping backup. The sats stay on the live 2-of-2 and still need the SE to move.
 
 `auto_exit_due` does this automatically for a **received** carrier nearing its root deadline, emitting
 `TokenCarrierMaterialized` (`sdk34`). An issued or flat carrier has no exit branch — no ancestor, no
@@ -409,7 +441,7 @@ headroom. See [tokens](tokens.md).
 | `SP` — in-ladder split | laddered | a spine tier at `SPINE_CSV = 0`; each child output then hosts its own extension + state |
 | spine-tip cap | laddered | one rung over `SP.out[K]` |
 | cooperative withdraw / de-trigger | either | none — a fresh co-signed spend |
-| exit branch txs (split/combine) | un-laddered | none — immediately broadcastable |
+| exit branch txs (coloured split/combine) | flat material | none — immediately broadcastable |
 | deposit backup #1 | either | **absolute** `deposit_height + initlock` (mainnet `initlock` = 10,000) |
 | each transfer's new backup | either | previous − `interval` (mainnet 100) |
 

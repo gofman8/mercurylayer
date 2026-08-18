@@ -22,15 +22,40 @@ primitive, no enclave change for the core.
 `sdk53` pins that a **laddered** coin can be latched. `tb04` covers the raw latch primitive;
 `sdk24`/`sdk25` cover the cancel and delayed-claim paths.
 
-The one-call PAY API (`pay_lightning_invoice`) cannot mint an exact laddered coin, so it falls back to
-the non-exact in-ladder lane (`largest_laddered_coin_for_pay` → `pay_lightning_invoice_inladder`,
-`clients/libs/rust-sdk/src/ssp.rs`), the same way `create_receive` does on the receive side.
+**The EXACT sats lane no longer mints its input, and that is now load-bearing.** `ensure_exact_coin`
+used to fall back to the plain off-chain split; that split is DELETED with the un-laddered shape,
+because it spent the coin's funding output `F` directly and a prior owner's retained, un-timelocked
+trigger spends the same `F` ([B1]). So `ensure_exact_coin` returns an exact CONFIRMED coin if the
+wallet happens to hold one and otherwise **refuses**, and the one-call PAY API
+(`pay_lightning_invoice`) falls back to the non-exact in-ladder lane
+(`largest_laddered_coin_for_pay` → `pay_lightning_invoice_inladder`,
+`clients/libs/rust-sdk/src/ssp.rs`), the same way `create_receive` does on the receive side. That is
+REQ-42's fallback doing exactly what it was specified for: the in-ladder lane carves its piece as a
+DESCENDANT of the trigger rather than a rival for `F`, which is what makes it safe where the deleted
+route was not.
 
-**Coin shapes.** Both sats lanes run on **laddered** coins. The colored (RGB) lane rides an
-**un-laddered** carrier: a plain tier spend would destroy the allocation (terminal freeze,
-[PROTOCOL.md](PROTOCOL.md) §5.10, pinned by `sdk52`). Colouring the tiers so that the colored LN lane
-can ride the ladder too is **design, not built** — the un-laddered colored carrier is the shape that
-exists today. See [README.md](README.md) "One protocol, two coin shapes".
+**Coin shapes.** Both sats lanes run on **laddered** coins. Under CTES-R the colored (RGB) lane rides
+a laddered carrier too — a COLOURED ladder, every tier carrying a valid RGB state transition, so a
+tier spend moves the allocation instead of destroying it (terminal freeze,
+[PROTOCOL.md](PROTOCOL.md) §5.10; `sdk52` pins that a carrier is never given a *plain* ladder, `sdk74`
+/ `sdk75` the coloured one). Whether that applies is a property of the NETWORK:
+`SdkConfig::colored_ladder` reads the compiled-in enclave attestation pin, so it is on for regtest and
+off for mainnet/testnet/signet until an enclave is provisioned there (`SPEC.md` §0.4 V-6). Where it is
+off, a carrier keeps the flat signed-once shape and this document's flat-lane statements are the ones
+that apply. See [PROTOCOL.md](PROTOCOL.md), "One protocol, ONE coin SHAPE".
+
+> **The colored PAY lane has a real hole, and the deletions above narrowed rather than caused it.**
+> An RGB Lightning pay reaches the latch through `latch_tokens` → `colored_transfer`
+> (`clients/libs/rust-sdk/src/tokens.rs`), and exactly one fork of that function accepts a latch: a
+> **single coloured ROOT carrier** holding the whole amount, which routes to
+> `colored_in_ladder_transfer` (wired under [P3], returning the batch id and any SE hash to the
+> caller). Every other fork refuses a latched colored send by name — a coloured **CHILD** carrier
+> ("not yet wired to the CTES-R child lane") and a **multi-carrier** payment ("not yet wired to the
+> CTES-R in-ladder lane") — and `pay_lightning_invoice_inladder` refuses outright when the quote
+> carries an `asset_id` ("RGB non-exact in-ladder Lightning pay is not supported yet"). A coloured
+> child is what the change leg of every coloured payment and every received coloured piece IS, so the
+> refusals are not corner cases: a wallet that has made one coloured payment can hold its whole
+> balance in a shape no LN lane will latch. This is the LN lane's to close, not the split lane's.
 
 ## 2. Feasibility — verified against `rgb-lightning-node` `pr-90` (LDK 0.2.2 fork)
 
@@ -207,8 +232,8 @@ un-broadcast.
 
 ## 7. Failure and rollback
 
-On an **un-laddered** coin, `reclaim_lightning_payment` (a self-transfer) returns a fully re-usable
-coin. On a **laddered** coin the naive self-transfer **bricks**: the failed latch already co-signed
+On a coin carrying **no ladder** — the flat carrier residual — `reclaim_lightning_payment` (a
+self-transfer) returns a fully re-usable coin. On a **laddered** coin the naive self-transfer **bricks**: the failed latch already co-signed
 the orphan `S'` (`sig_count` +1), so the reclaim's own presign leaves the disclosed ladder one tier
 short of the enclave `sig_count` and `verify_bundle` rejects. Handled by direction:
 
@@ -234,9 +259,10 @@ coordinator-authoritative count decrement must be tightly scoped so it can never
 enclave terminalization (§10) does **not** help here — terminalizing the latched coin makes rollback
 worse, since the coin's only permitted spend becomes the SSP-paying `S'`.
 
-**Coverage note:** the un-laddered self-transfer branch of `reclaim_lightning_payment` has **no live
-E2E**. Since every plain deposit is laddered, the branch exists only for the un-laddered carrier
-shape. The laddered branch is `sdk68`; the non-exact rollback is `sdk66`.
+**Coverage note:** the flat self-transfer branch of `reclaim_lightning_payment` has **no live
+E2E**. Since every plain deposit is laddered, the branch exists only for the flat carrier residual —
+narrower since the CTES-R flip, and now reachable only on a network with no pinned enclave identity or
+on a carrier the coloured builder cannot take. The laddered branch is `sdk68`; the non-exact rollback is `sdk66`.
 
 ## 8. Trust assumption
 
@@ -285,6 +311,11 @@ Drop-in counterpart in [TRUST-MODEL.md](TRUST-MODEL.md).
    `latch_tokens_se_preimage`, `clients/libs/rust-sdk/src/tokens.rs`, wired into
    `pay_lightning_invoice` and `create_receive`) with the `validate_pending_token` value gate; the LN
    half is exercised by `sdk23`, and a full cross-rail swap is **not built** — it remains a follow-up.
+   **Since CTES-R the bridge's reach is narrower than "the colored lane", and §1 states the shape:**
+   `colored_transfer` accepts a latch only from a single coloured ROOT carrier holding the whole
+   amount. A coloured CHILD carrier and a multi-carrier payment each refuse a latched send by name,
+   and `pay_lightning_invoice_inladder` refuses any quote carrying an `asset_id`. Closing this is LN
+   work — wiring the latch through the coloured child and multi-carrier legs — not split-lane work.
 
 ## 10. Optional hardening (anti-collusion; needs SGX)
 

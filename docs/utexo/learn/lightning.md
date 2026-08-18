@@ -9,11 +9,12 @@ Both directions run **on the TES-R ladder**. `claim()` ladders every fresh confi
 Lightning pays and receives out of those laddered coins — an exact-amount coin is latched whole, any
 other amount goes through an in-ladder split. There is no separate Lightning lane and no protocol
 flag to choose. One configuration caveat is load-bearing here: laddering needs a **pinned enclave
-attestation identity**, no network compiles one in, and neither `SdkConfig` constructor supplies one,
-so an embedder that sets neither `SdkConfig::attestation_identity` nor `UTEXO_ATTESTATION_IDENTITY`
-gets flat coins — and an un-laddered coin is not payable over Lightning at all (see the census
-below). [`../spec/SPEC.md`](../spec/SPEC.md) §0.4 row V-6 registers it. The normative account of the
-latch is [`../spec/LIGHTNING.md`](../spec/LIGHTNING.md).
+attestation identity**. `TesrParams::attestation_identity_const` pins regtest's, and returns `None`
+for mainnet, testnet and signet, where no enclave is provisioned — so on those networks an embedder
+that sets neither `SdkConfig::attestation_identity` nor `UTEXO_ATTESTATION_IDENTITY` gets flat coins,
+and a coin travelling flat is not payable over Lightning at all (see the census below).
+[`../spec/SPEC.md`](../spec/SPEC.md) §0.4 row V-6 registers it. The normative account of the latch is
+[`../spec/LIGHTNING.md`](../spec/LIGHTNING.md).
 
 ## The latch
 
@@ -89,19 +90,24 @@ Real invoices are arbitrary amounts, so each direction has two shapes and the SD
 
 **PAY.** `pay_lightning_invoice` delegates to `pay_lightning_invoice_reclaimable`, which quotes,
 then tries `ensure_exact_coin(amount + fee)`. If that succeeds the whole coin is latched with
-`create_external_hash_latch` and conveyed (`sdk63`). If it cannot mint an exact coin — and it cannot
-split a laddered coin exactly — it falls back to `largest_laddered_coin_for_pay` →
-`pay_lightning_invoice_inladder`, which splits the parent **in-ladder** into a PIECE that pays the
+`create_external_hash_latch` and conveyed (`sdk63`). `ensure_exact_coin` is now purely a *lookup*:
+its minting fallback — split the smallest un-laddered coin — is deleted with the shape it minted, so
+it returns a CONFIRMED coin of exactly that many sats or refuses by name. When it refuses, PAY falls
+back to `largest_laddered_coin_for_pay` → `pay_lightning_invoice_inladder`, which splits the parent
+**in-ladder** into a PIECE that pays the
 SSP and a CHANGE that stays yours, and latches only the piece (`sdk65`). The piece is oversized by
 `IN_LADDER_TIER_RESERVE` = 2 000 sats, because the piece's own exit burns two tier fees before it
 pays anything; the surplus accrues to the piece, and the SSP is priced on what the census reads, not
 on the nominal.
 
 Without that fallback the one-call API would refuse every laddered coin — i.e. every coin
-([SPEC §8.1](../spec/SPEC.md) REQ-42).
+([SPEC §8.1](../spec/SPEC.md) REQ-42). That is not a regression from retiring the minting fallback,
+it is the reason retiring it was safe: the plain split minted an exact coin by spending the parent's
+funding output `F`, which a prior owner's retained, un-timelocked trigger also spends ([B1]), while
+the in-ladder lane carves its piece as a *descendant* of that trigger and has nothing to race.
 
 **RECEIVE.** `create_lightning_invoice` hands the SSP your address; `SspService::create_receive`
-fronts an exact coin when `ensure_exact_coin` can mint one (`sdk64`), and otherwise takes
+fronts an exact coin when `ensure_exact_coin` finds one it already holds (`sdk64`), and otherwise takes
 `largest_laddered_coin` and splits it in-ladder, conveying a piece worth the invoiced amount plus its
 own 2 000-sat tier reserve — which the SSP bears, as its cost of fronting a non-exact amount
 (`sdk67`). The latch there is `InLadderLatch::ClassicMinted`, the SE-minted-preimage flavour.
@@ -168,8 +174,11 @@ PAY is where the trust actually sits, because the Lightning leg is irreversible.
    * **4**, a child conveyance → `verify_conveyed_child`, bound to the *latched* sid, not already
      adopted, over a live on-chain parent root. Its census-bound exit value — never a
      sender-declared field — is what the value gate then prices against.
-   * **0**, the un-laddered carrier lane, and anything outside the set → refused. An un-laddered
-     branch coin is **not payable over Lightning**, and that is intended, not an omission.
+   * **0**, the flat branch + backup-chain lane, and anything outside the set → refused. A coin
+     travelling flat is **not payable over Lightning**, and that is intended, not an omission: there
+     is no census to run on it. With the plain un-laddered shape retired that population is now the
+     residue — legacy coins, and carriers on a network with no enclave attestation identity pinned —
+     rather than a lane the product mints into.
 
    A refusal carries `ladder_census_refusal`, the sentence naming *which* check refused, so an
    operator is not handed a six-way disjunction.
@@ -283,14 +292,22 @@ the coin is a precondition of the SSP taking the Lightning asset.
 
 Four boundaries are worth knowing before building on this, and the first one gates the rest:
 
-* **RGB PAY needs a LADDERED carrier, which the shipped configuration does not produce.** A carrier
-  is deliberately not laddered when `SdkConfig::colored_ladder` is `false` — a plain tier spend would
-  destroy the allocation (terminal freeze, [`../spec/PROTOCOL.md`](../spec/PROTOCOL.md) §5.10, pinned
-  by `sdk52`) — and `transfer_sender` conveys such a coin as `protocol_version` **0**, the
-  un-laddered lane. `prepay_flat_census` refuses that shape at its version floor, so the SSP declines
-  to pay after the carrier has already been conveyed. Reaching the PAY lane therefore means running
-  with `colored_ladder` on, so the carrier holds a coloured ladder and conveys as shape 2. RECEIVE is
-  the SSP's own coin and does not sit behind this gate. See [tokens.md](tokens.md).
+* **RGB PAY needs a LADDERED carrier, so it needs a pinned enclave attestation identity.** A carrier
+  may never hold a *plain* ladder — a plain tier spend would destroy the allocation (terminal freeze,
+  [`../spec/PROTOCOL.md`](../spec/PROTOCOL.md) §5.10) — so what it needs is a **coloured** one, and
+  `SdkConfig::colored_ladder` grants that only where `TesrParams::attestation_identity_const` pins an
+  identity. Where it does (regtest today), the payment is a coloured **in-ladder** split and what the
+  SSP receives is the piece *child*, conveyed by `convey_child_bundle` at `protocol_version = 4` — so
+  the census takes the **4** arm above, `verify_conveyed_child`, which is also the arm the
+  `child_witness_txids` requirement below belongs to. The PAY lane is reachable there. Where no
+  identity is pinned — mainnet, testnet and signet, because no enclave is provisioned there yet — the
+  carrier is not laddered and the send now stops on the **sender's** side: with the flat-lane licences
+  retired there is nothing left for `assert_flat_conveyance_is_legitimate` to prove about a carrier,
+  so it refuses before the coin moves. That is the better half of the same closure — the flat carrier
+  used to be conveyed as `protocol_version` **0** and then refused by `prepay_flat_census` at its
+  version floor, i.e. after it had already left the wallet. The gate is enclave provisioning, not a
+  flag someone forgot to set. RECEIVE is the SSP's own coin and does not sit behind it. See
+  [tokens.md](tokens.md).
 * **Non-exact RGB PAY does not exist.** `pay_lightning_invoice_inladder` refuses an asset quote by
   name.
 * **An envelope with nothing to resolve it against is refused, by name.** The pre-pay gate requires

@@ -198,11 +198,19 @@ live rate. Above ~5 sat/vB every tier must be CPFP'd through its P2A, and TRUC's
 one-unconfirmed-child rule plus the sequential CSVs forbid batching those children. The realised
 top-up from an external funded wallet is the largest number in this document — see §11.
 
-**The quote is the executor's own plan, on the laddered lane.** `quote_transfer` runs the executor's
-planner and preflight, so `fee_sats` and the per-leg `SplitFloors` come from the same
-`split_preflight` the executor obeys and `fundable` is what the executor will do rather than an
-estimate. The `split_fee_reserve` clamp — `clamp(parent/100, 300, 2000)` — survives **only** on the
-un-laddered plain-split lane, where the quote is still an estimate and not a plan.
+**The quote is the executor's own plan, and there is no other lane left for it not to be.**
+`quote_transfer` runs the executor's planner and preflight, so `fee_sats` and the per-leg
+`SplitFloors` come from the same `split_preflight` the executor obeys and `fundable` is what the
+executor will do rather than an estimate. This used to be qualified — "on the laddered lane" — because
+the `split_fee_reserve` clamp, `clamp(parent/100, 300, 2000)`, still priced the un-laddered plain
+split, where the quote was an estimate. **That lane is deleted**: `split_coin`, `ParentShape::Unladdered`
+and `ManyRoute::PlainSplit` are gone, and `parent_shape` refuses a coin with no ladder instead of
+quoting it at the cheaper model — which was the silent-degradation shape [B3] made the resolution
+fail-closed for. The clamp itself survives, and deliberately: it is the arithmetic behind
+`split_amounts_floored`, which is the executable dust-boundary spec the invalidation and granularity
+models are written against, and which sizes the LEGACY coloured split/combine lane
+(`TOKEN_CARRIER_SATS` is derived from it). The BOUNDARY was never un-laddered-only — every split leg
+still has to clear dust and fund what it owes — so what retired is the routing, not the arithmetic.
 
 ### 2.2 The splittability tail
 
@@ -674,6 +682,16 @@ because a missed prefix does not produce an absence — it produces a confident 
 supersession evidence), `colored_child_sids`, `auto_exit_due`, `withdraw`, `unilateral_exit` and
 `register_colored_exit_tip`.
 
+**One of those confident wrong answers is now inexpressible, which is worth recording because it is
+the only one that got fixed by DELETION rather than by co-editing.** `parent_shape` used to return
+`ParentShape::Unladdered` — a POSITIVE verdict reached by three consecutive absences, carrying the
+cheaper cost model, the lower floor and a route to the plain split. The variant is gone with the lane:
+`parent_shape` now REFUSES, and `parent_shape_opt` is the probe form for the one caller
+(`has_exit_material`) where absence is genuinely data. A missed prefix there is still a defect, but its
+worst outcome is a named refusal on a healthy coin instead of a laddered coin priced and routed as an
+un-laddered one. The other seven sites are unchanged: they still enumerate, and still must be
+co-edited.
+
 `register_colored_exit_tip` is the shape this hazard takes: it resolved two record shapes in an
 `if let … else if let … else { None }` chain, so a coloured tip took the trailing `else` and came
 back `Ok(None)` — the answer a PLAIN coin gives, which its caller maps to no event, no fault and no
@@ -897,7 +915,7 @@ hold 0 in total"** while holding the entire deposit.
 Economics, even setting safety aside: with its own recommended binary ladder the ceiling is
 **17.3×** — rows above that exceed the N·36 leaf-hop budget, since a leaf survives exactly
 `(1440−144)/36 = 36` hops (`child_supersede_csv`). With **no leaf return** it is **1.0×** — identical
-to a plain split. And the fan-out **recurs 9.2×/year** (the tree must fully materialise before
+to splitting once per payment, which is what an ordinary in-ladder payment already does. And the fan-out **recurs 9.2×/year** (the tree must fully materialise before
 `H_deposit + initlock`, and materialisation itself consumes most of the epoch), so a 10-leaf lattice
 on a 1M deposit burns **9.72 %/yr regardless of payment count** — a loss for any wallet under ~46
 payments/year.

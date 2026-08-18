@@ -27,7 +27,7 @@ Environment, from `clients/tests/rust`:
 
 ```bash
 export ML_NETWORK=regtest                                     # selects regtest.Settings.toml
-export UTEXO_ATTESTATION_IDENTITY=0x…                         # see below — without it, claim() refuses to ladder
+# UTEXO_ATTESTATION_IDENTITY is no longer required on regtest — the pin is compiled in. See below.
 export RLN_BITCOIND_CONTAINER=rgb-lightning-node-bitcoind-1   # the test faucet (this is also the default)
 # Flows that shell out to the RLN stack (the Lightning group, and chaos22's miner):
 export RLN_REGTEST=/path/to/rgb-lightning-node/regtest.sh
@@ -36,17 +36,27 @@ export COMPOSE_PROJECT_NAME=rgb-lightning-node
 export RLN_BIN=/path/to/rgb-lightning-node/target/debug/rgb-lightning-node   # LN_SMOKE and the LN flows
 ```
 
-> **`UTEXO_ATTESTATION_IDENTITY` is required for the SDK lane.** The client verifies the enclave's
+> **The regtest attestation identity is now COMPILED IN.** The client verifies the enclave's
 > `utexo/sig_count/v2` attestation over `(statechain_id, num_sigs, sig_budget, nonce)` against a
 > pinned identity, and resolution is compiled-in pin → config → **refuse**; it never falls back to
-> the key the coordinator serves. No network has a compiled-in pin
-> (`TesrParams::attestation_identity_const` returns `None` everywhere), so the pin has to be
-> supplied. `regtest.Settings.toml` carries an `attestation_identity` line, but that file is read by
-> `ClientConfig::load` — the `mercuryrustlib` lane. An SDK wallet is built through
-> `ClientConfig::from_params` from `SdkConfig`, which never reads a Settings file and falls back to
-> the environment variable. So the harness must export it (or each test must set
-> `SdkConfig::attestation_identity`). Read the running lockbox's value from
-> `GET /attestation_identity`; a differently seeded lockbox refuses rather than passes.
+> the key the coordinator serves. `TesrParams::attestation_identity_const("regtest")` now returns
+> `REGTEST_ATTESTATION_IDENTITY` — the identity derived from the dev seed this repo commits for its
+> own stack — so the harness no longer has to supply one, and a stack running the committed seed
+> passes without configuration. It still returns `None` for mainnet, testnet, testnet3, testnet4 and
+> signet, where no enclave is provisioned.
+>
+> **A compiled-in pin is not overridable.** Exporting `UTEXO_ATTESTATION_IDENTITY` with a value that
+> disagrees with it is an ERROR, not an override — so a stale export left over from before this
+> landed will fail every laddering claim rather than being ignored. Unset it, or set it to the value
+> `GET /attestation_identity` reports. A differently seeded lockbox still refuses rather than passes,
+> which is the property the pin exists for. (`regtest.Settings.toml` carries an
+> `attestation_identity` line, but that file is read by `ClientConfig::load` — the `mercuryrustlib`
+> lane; an SDK wallet is built through `ClientConfig::from_params` from `SdkConfig`, which never
+> reads a Settings file.)
+>
+> **The pin also decides the coin shape.** `SdkConfig::colored_ladder` READS
+> `attestation_identity_const` rather than stating a bool, so pinning regtest turned the coloured
+> ladder ON for every regtest wallet that does not set the flag itself — see below.
 >
 > **Toolchain.** `clients/tests/rust/rust-toolchain.toml` pins 1.83.0; run with `cargo +stable run`,
 > because `rgb-lib` is edition 2024. `rgb-lib` is a **git** dependency pinned by revision in
@@ -65,8 +75,10 @@ export RLN_BIN=/path/to/rgb-lightning-node/target/debug/rgb-lightning-node   # L
 
 ## What the flows exercise
 
-There is **one protocol**, and it produces two coin **shapes**. Knowing which shape a flow drives
-tells you what its assertions are about. Full treatment in [PROTOCOL.md](../spec/PROTOCOL.md).
+There is **one protocol**, and a flow is either on the laddered lane or on the flat one. Knowing which
+lane a flow drives tells you what its assertions are about — and since `colored_ladder` now reads the
+network's pin, that is decided by the wallet's config rather than by the flow's subject matter. Full
+treatment in [PROTOCOL.md](../spec/PROTOCOL.md).
 
 ### Laddered — every plain BTC deposit
 
@@ -100,28 +112,34 @@ flow:
   (sdk50) — not a single backup broadcast. A keyless watch bundle lets a delegated tower do the same
   for an offline owner (sdk45, sdk51, sdk72 part B).
 
-### Flat — RGB carriers and un-broadcast split sub-coins
+### Flat — the lane a network without an enclave still runs
 
-Not every coin is laddered, by design. `SdkConfig::colored_ladder` ships **false**, so an RGB
-**carrier** takes the flat **signed-once backup** shape: an uncoloured tier spend of `F` would
-destroy the allocation (terminal freeze). A split sub-coin whose funding is un-broadcast likewise
-cannot root a trigger. Both transfer by backup-chain handover with **decrementing absolute
-nLocktimes** — each hop's backup is built one `interval` below the previous, so the current owner's
-backup is always the first to become final and a superseded one is non-final whenever a fresh one is
-spendable.
+A carrier takes the flat **signed-once backup** shape wherever `colored_ladder` is off, because an
+uncoloured tier spend of `F` would destroy the allocation (terminal freeze). A split sub-coin whose
+funding is un-broadcast likewise cannot root a trigger — a fact no amount of colouring changes, since
+colouring a tier cannot broadcast a funding output. Both transfer by backup-chain handover with
+**decrementing absolute nLocktimes** — each hop's backup is built one `interval` below the previous,
+so the current owner's backup is always the first to become final and a superseded one is non-final
+whenever a fresh one is spendable.
 
-This shape is current and load-bearing. The RGB flows that inherit the shipped default ride it
-(sdk09, sdk16, sdk39, sdk52, sdk73), and so does the upstream Mercury suite, which sits below the SDK
-and never calls `claim()`. Its receiver-side guarantee is
-`transfer_receiver::verify_terminal_parents` — one terminal ancestor per structural input.
+This shape is still current and load-bearing on every network without a provisioned enclave, and the
+upstream Mercury suite rides it unconditionally — it sits below the SDK and never calls `claim()`.
+Its receiver-side guarantee is `transfer_receiver::verify_terminal_parents`, one terminal ancestor
+per structural input.
 
-**Which lane a flow is on is a property of its own config, not of the test's subject matter.** The
-coloured ladder (CTES-R) is built and test-covered behind `colored_ladder = true`, and every flow on
-that lane sets the flag by name on every wallet it builds: sdk02, sdk29, sdk31, sdk32, sdk34, sdk74,
-sdk75, sdk77, sdk78, sdk79, sdk87, sdk88, plus RGB_E2E=15/16. A grep for `colored_ladder = true`
-under `clients/tests/rust/src/` is the authoritative list. sdk74 additionally pins the default in the
-direction it actually has — `SdkConfig::regtest(..).colored_ladder` must be false. Refusing the
-combination of a coloured ladder and the legacy coloured split lane is `refuse_if_colored_ladder`.
+**Which lane a flow is on is a property of its own config, not of the test's subject matter — and
+the default underneath it MOVED.** `SdkConfig::regtest(..).colored_ladder` now reads the compiled-in
+regtest pin, so it is **true**, and a flow that does not set the flag inherits the coloured lane.
+Flows that ask for it by name — sdk02, sdk29, sdk31, sdk32, sdk34, sdk74, sdk75, sdk77, sdk78, sdk79,
+sdk87, sdk88 — are unaffected; a grep for `colored_ladder = true` under
+`clients/tests/rust/src/` is the authoritative list. (RGB_E2E=15/16 exercise the coloured tier
+builder directly on a reduced stack and never build an `SdkConfig`, so the flag does not reach them.)
+The RGB flows that *inherit* the default (sdk09,
+sdk16, sdk39, sdk52, sdk73) now inherit the coloured one, and their prose below still describes the
+flat lane they were written against. sdk74 additionally carries a `default-probe` assertion pinning
+`SdkConfig::regtest(..).colored_ladder` to **false**, which the constructor change makes stale —
+these are live-stack flows and are not part of the workspace suite, so nothing re-ran them. Refusing
+the combination of a coloured ladder and the legacy coloured split lane is `refuse_if_colored_ladder`.
 
 ### Non-exact payments — the in-ladder split
 
@@ -207,7 +225,7 @@ mean — a `sign/first` session is the first link of a chain, not a completed th
 | 58 | `sdk58_inladder_split` | `verify_child_bundle` ACCEPTS a real split child — `SP` is a state tier spending `X_m.out[0]`, the parent is terminalized and `S_0` disclosed as superseded, and the child's two-aggregate bundle (ancestors under `A_parent`, child tiers under `A_child`) checks out against chain + `/info/statechain`. Eleven adversarial census cases are REJECTED, including a non-terminal parent and a hidden lower-CSV state |
 | 59 | `sdk59_inladder_pay` | the split is a usable **payment** through `transfer()` / `claim()` / `unilateral_exit()`: `transfer()` auto-routes to it, the piece child pays Bob (Model A) and is conveyed to his mailbox, the change child pays Alice back; Bob adopts via `verify_child_bundle` and exits the child to his own key |
 | 60 | `sdk60_child_firstclass` | a **received** child re-transferred WHOLE off-chain (alice → bob → carol): the claim completes the key handover so `A_child` is invariant and Alice is locked out; `child_retransfer` co-signs a fresh state at a strictly lower CSV and discloses the replaced one; Carol's census counts the child-superseded segment and she exits. Two payments, zero on-chain footprint |
-| 69 | `sdk69_transfer_many_inladder` | `transfer_many` on a LADDERED parent: a plain split is refused, then one `SP` over `X_m.out[0]` carries two recipient children + change + P2A with `F` untouched. The trigger-race attack is then executed for real — alice broadcasts her retained, un-timelocked trigger and spends `F` — and both recipients still exit unilaterally for their exact amounts, because `SP` descends from that trigger instead of racing it |
+| 69 | `sdk69_transfer_many_inladder` | `transfer_many` on a LADDERED parent. It used to call `split_coin` and assert the refusal; with that route DELETED the guarantee became **structural** — a deleted route cannot be taken by a caller who forgets to check — so the flow now proves the positive half: one `SP` over `X_m.out[0]` carries two recipient children + change + P2A with `F` untouched. The trigger-race attack is then executed for real — alice broadcasts her retained, un-timelocked trigger and spends `F` — and both recipients still exit unilaterally for their exact amounts, because `SP` descends from that trigger instead of racing it. That trigger is exactly the [B1] weapon the plain split had no answer to |
 | 76 | `sdk76_received_parent_split` | splitting a RECEIVED laddered coin. The ancestor census's `flat_backups` term must be the parent's real count, not a constant: every whole-coin hop co-signs one more flat backup, so a parent received `k` times carries `1 + k`. Bob's count is asserted from his own backup rows, then he pays carol non-exactly and carol's child must be adoptable. sdk58/59/69 all deposit the parent, so `k = 0` and are blind to this |
 | 80 | `sdk80_plain_child_split_watchtower` | `child_in_ladder_pay_many` conveys every grandchild before writing the child's durable status, and the child's own record is never rewritten — so this wallet's watchtower loop is admitted to drive a superseded state while strangers already hold the bundles that supersede it. The ordering must close that window |
 | 81 | `sdk81_inladder_split_recovery` | an in-ladder split killed by SIGABRT (`UTEXO_CRASH_POINT=after_inladder_sp_sign`) the instant `SP`'s co-signature is journalled — before either child ladder exists — leaves the parent PERMANENTLY terminal at the SE. `recover_in_ladder_splits` replays the write-ahead journal, completes both children, and the original payment still lands |
@@ -247,7 +265,7 @@ Both directions run on the ladder through a **HODL-invoice latch** — see
 | 32 | `sdk32_token_over_time` | tokens are never lost by inactivity, on the coloured lane. The carrier IS laddered and every rung carries a valid RGB state transition (`bundle.is_colored()`, `colored_ladder_health` validating the full allocation against the ladder's own un-broadcast txids). An idle coloured ladder never ages — no tier reaches the chain, `F` stays unspent. The invariant is proved positively rather than by absence: the three RGB-unaware routes to a carrier are each refused by name — plain-BTC coin selection, the uncoloured in-ladder split (`refuse_uncolored_over_colored`), and the flat ladder conveyance |
 | 34 | `sdk34_token_watchtower` | `auto_exit_due` materializes a **received** carrier nearing its clawback deadline so a malicious sender cannot claw the tokens back. On the coloured lane a received piece has **no `branch-` row at all** — its exit material is the five-tier `ctesr-` chain `T → X_m → SP → ext_child → state_child`, and the watchtower drives that through `unilateral_exit` against a deadline head-started by the walk's own Σcsv. An ISSUED carrier has no ancestor (no `branch-`, no `ctesr-` bundle of its own), so no stale backup can race it and it is left untouched at any margin |
 | 39 | `sdk39_depth2_token_exit` | a token piece **two** colored splits deep exits on-chain end-to-end (branch broadcast root-first, on-chain root spent) with the allocation preserved and no SE involvement |
-| 52 | `sdk52_v2_rgb_carrier` | terminal-freeze at the shipped default: in one wallet the plain deposit carries a ladder and the RGB carrier carries none, and an off-chain token transfer still settles 750/250 — the two shapes coexist |
+| 52 | `sdk52_v2_rgb_carrier` | terminal-freeze on the FLAT lane: in one wallet the plain deposit carries a ladder and the RGB carrier carries none, and an off-chain token transfer still settles 750/250 — the two shapes coexist. It sets no `colored_ladder`, so it now inherits the regtest default, which the pin turned ON; the shape it was written to pin is the one a network without an enclave has |
 | 73 | `sdk73_structural_recovery` | a colored split killed by SIGABRT (`UTEXO_CRASH_POINT=after_structural_sign`) the instant the signed material is journalled — the window in which the carrier is already terminal at the SE and its one spending transaction lives only in process memory. The parent restarts from the same database, runs the recovery reader, and completes the ORIGINAL payment |
 | 74 | `sdk74_colored_ladder` | with `colored_ladder` ON, `claim()` builds a ladder whose every tier carries a valid RGB state transition: one `OP_RETURN` per tier at vout 0, payload at vout 1, P2A at vout 2, `payload_vout` threaded from the builder's returned index rather than assumed, each tier chaining through its parent's DECLARED payload vout, and the committed fee exactly `committed_fee_for_outputs(n + 1, rate)`. The plain deposit in the same wallet stays byte-identical |
 | 75 | `sdk75_colored_exit` | the unilateral exit of an RGB allocation: `T → X_0 → S_0` all CONFIRMED (not merely mempool-accepted), each spending its parent's declared payload vout, with the allocation intact at the end — no SE, no counterparty, only blocks |
@@ -308,7 +326,10 @@ state:
     a BREACH. The tip is not stranded by it — pay FROM it with a spine batch, or exit it unilaterally.
 
   The "coin has a ladder and cannot be split as plain BTC" refusal is deliberately left UNCLASSIFIED
-  so a real routing regression still shows up as a breach.
+  so a real routing regression still shows up as a breach. Its producer, `split_coin`, is now
+  deleted, so the string can no longer be emitted at all — leaving it unclassified still costs
+  nothing and still means "if this ever appears, it is a breach". The harness's `split` action was
+  never a plain split anyway: it calls `transfer`, which dispatches on the coin's shape.
 
 ```bash
 # smoke (fast): 5 users, 20s
@@ -414,8 +435,13 @@ anchor, the uncoloured fee matches a measured signed tier, the coloured surcharg
 `OP_RETURN` output, the derived floors track `TIER_VBYTES`, the spine-tip floor is strictly below the
 child floor at every shipped rate, and the `TesrParams` schedule decrements and clamps at its floors
 with correct renewal / rollover thresholds. `attestation_identity` resolution is pinned as pin →
-config → refuse, with a test asserting that no network has a compiled-in pin until an enclave is
-provisioned.
+config → refuse, and `only_regtest_has_a_pinned_identity_until_more_enclaves_are_provisioned` is the
+tripwire on the pin set itself: regtest must equal `REGTEST_ATTESTATION_IDENTITY`, every other
+network must still be `None`. It is kept rather than deleted because pinning a key changes the
+security posture of every client build — and, since `SdkConfig` reads it to decide `colored_ladder`,
+pinning a network also turns one coin shape on for it. The SDK crate's own
+`colored_ladder_is_never_on_without_a_pinned_attestation_identity` asserts the other end of that
+coupling: each constructor's flag must equal whether a pin exists, so the two can never disagree.
 
 The SDK crate also carries two `#[cfg(test)]` **models** — pure companions to the cost and
 granularity write-ups in [learn/](../learn/), calling the real production functions wherever a
@@ -490,7 +516,9 @@ automatically), then the LN smoke, then the upstream suite. It exports `ML_NETWO
 its port is closed, and captures per-test stdout/stderr plus time-sliced docker logs
 (`mercurylayer-mercury-server-1`, `mercurylayer-lockbox-1`, `rgb-lightning-node-electrs-1`) into
 `$LOGDIR` (default `/tmp/utexo_suite_logs`) with a `summary.txt` of PASS/FAIL and durations. `REPO`
-is set at the top of the script; export `UTEXO_ATTESTATION_IDENTITY` before invoking it.
+is set at the top of the script. `UTEXO_ATTESTATION_IDENTITY` no longer has to be exported for
+regtest — the pin is compiled in — and a stale export that disagrees with it now fails every
+laddering claim rather than being ignored, so clear it rather than leaving it set.
 
 ```bash
 ./run_all_suites.sh                                # everything

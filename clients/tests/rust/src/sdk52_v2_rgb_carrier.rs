@@ -1,11 +1,14 @@
-//! E2E (SDK_E2E=52) — **V2DEF-4: RGB terminal-freeze — a carrier is NEVER laddered**.
+//! E2E (SDK_E2E=52) — **RGB terminal-freeze: a carrier is never laddered PLAINLY**.
 //!
-//! The carrier ⊥ ladder invariant (PROTOCOL.md §5.10 rule 1): with V2 default on
-//! a plain BTC deposit auto-establishes a renewable TES-R ladder, but an
-//! RGB **carrier** must NOT — RGB rides the signed-once colored-split model (terminal-frozen, never
-//! renewed); a plain T/X/S spend of a carrier would destroy the allocation. Proven here on the live
-//! stack: in one V2-native + RGB wallet, the plain coin carries a ladder and the token carrier carries
-//! none, and an off-chain RGB transfer still settles (750/250) with V2 on — RGB and V2 coexist.
+//! The carrier ⊥ PLAIN ladder invariant (INV-29). A plain T/X/S spend of a carrier would destroy the
+//! allocation, so the two must never meet — but the way that is honoured CHANGED with one coin
+//! shape. It used to be honoured by absence: the carrier was kept out of the ladder entirely and
+//! rode the signed-once coloured-split model instead. Now it is honoured by COLOUR: `claim()` builds
+//! the carrier a coloured ladder, every tier carrying the allocation, so the carrier is protected by
+//! the same mechanism as every other coin rather than excluded from it.
+//!
+//! Proven here on the live stack: in one wallet the plain coin carries a PLAIN ladder, the carrier
+//! carries a COLOURED one, and an off-chain RGB transfer still settles (750/250).
 //!
 //! Run: SDK_E2E=52 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
@@ -100,15 +103,33 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::load(&cc, "sdk52_alice", &plain_sid).await?.is_some(),
         "the PLAIN BTC coin auto-established a TES-R ladder"
     );
+    // **[ONE COIN SHAPE] The invariant survives; its STATEMENT changed.**
+    //
+    // This used to assert the carrier carries NO ladder. That was the legacy lane's way of honouring
+    // terminal-freeze: since a plain tier spend of a carrier destroys the allocation, the carrier was
+    // kept out of the ladder entirely. With `colored_ladder` shipping on wherever an identity is
+    // pinned, a carrier IS laddered — COLOURED, every tier carrying the allocation — so "no ladder"
+    // is no longer the shape of the guarantee.
+    //
+    // What INV-29 actually forbids is a PLAIN ladder over a carrier, and that is what is asserted
+    // now. Asserting the absence of a ladder here would today be asserting the absence of the very
+    // mechanism that protects the allocation.
     for c in &carriers {
         let sid = c.statechain_id.clone().ok_or(anyhow!("carrier has no sid"))?;
+        let bundle = mercuryrustlib::tesr::load(&cc, "sdk52_alice", &sid)
+            .await?
+            .ok_or_else(|| anyhow!("the RGB carrier {sid} has no ladder at all — with an identity \
+                                    pinned, `claim()` must build it a COLOURED one"))?;
         assert!(
-            mercuryrustlib::tesr::load(&cc, "sdk52_alice", &sid).await?.is_none(),
-            "the RGB carrier {sid} must NOT be laddered (terminal-freeze §5.10 rule 1)"
+            bundle.is_colored(),
+            "the RGB carrier {sid} carries a PLAIN ladder. A plain tier spend of a carrier destroys \
+             the allocation (INV-29 / terminal-freeze), so this is the one combination that must \
+             never exist — it is worse than no ladder, because it looks like protection"
         );
     }
     println!(
-        "SDK52 - carrier ⊥ ladder invariant holds: plain coin laddered, {} carrier(s) un-laddered",
+        "SDK52 - carrier ⊥ PLAIN ladder invariant holds: plain coin laddered plainly, {} carrier(s) \
+         laddered COLOURED",
         carriers.len()
     );
 
