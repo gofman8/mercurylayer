@@ -414,12 +414,32 @@ pub async fn post_deposit(statechain_entity: &State<StateChainEntity>, deposit_m
     let client: reqwest::Client = reqwest::Client::new();
     let request = client.post(&format!("{}/{}", lockbox_endpoint, path));
 
+    // **[V-7] AN EMPTY KEY IS REFUSED, so no request can mint an unbindable coin.**
+    //
+    // This used to map "" to `None` — omit the field — which was the last way to create a coin the
+    // SE cannot bind. Every shipped client sends a real key (all four go through
+    // `create_deposit_msg1`, and the field is present in the Rust lib, both wasm builds and the
+    // Kotlin binding), so the only callers this refuses are hand-crafted ones — exactly the callers
+    // that would have been minting themselves an unchecked coin.
+    //
+    // Refusing here is what makes the unbound set FINITE: it closes at the coins that already exist
+    // rather than growing on demand. The lockbox then fails CLOSED on the ones inside it.
+    let user_public_key = deposit_msg1.user_public_key.trim();
+    if user_public_key.is_empty() {
+        return status::Custom(
+            Status::BadRequest,
+            Json(json!({
+                "message": "user_public_key is required. Without it the enclave cannot derive this \
+                            coin's aggregate, so nothing could later check that a disclosed \
+                            transaction belongs to this coin (REQ-68). Every shipped client sends \
+                            it; a request that omits it is asking for a coin no one can bind."
+            })),
+        );
+    }
+
     let payload = GetPublicKeyRequestPayload {
         statechain_id: statechain_id.clone(),
-        user_public_key: match deposit_msg1.user_public_key.trim() {
-            "" => None,
-            k => Some(k.to_string()),
-        },
+        user_public_key: Some(user_public_key.to_string()),
     };
 
     let value = match request.json(&payload).send().await {

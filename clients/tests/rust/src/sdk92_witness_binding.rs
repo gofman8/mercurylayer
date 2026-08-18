@@ -434,11 +434,50 @@ pub async fn execute() -> Result<()> {
          {binds} of {reqs}."
     );
 
+    // ===== (c) [V-7] A COIN WITH NO STORED AGGREGATE IS REFUSED, NOT SERVED ====================
+    //
+    // The aggregate check used to FAIL OPEN here: no stored aggregate meant "an old client sent no
+    // key", and refusing would have bricked every pre-existing coin. That reasoning expired when the
+    // coordinator started refusing an empty `user_public_key` — the unbound set became finite and
+    // closed instead of growing on demand — so what is left behind this branch is exactly the
+    // pre-0009 population D24 already ignores. Serving them was a hole any caller could aim at by
+    // naming a legacy sid.
+    //
+    // Minted by asking the LOCKBOX directly, without a key: that is the one way left to produce an
+    // aggregate-less sid, and it is precisely the shape the fail-open used to serve.
+    let bare_sid = format!("{:032x}", rand::random::<u128>());
+    let mint = reqwest::Client::new()
+        .post(format!("{lockbox}/get_public_key"))
+        .json(&serde_json::json!({ "statechain_id": bare_sid }))
+        .send()
+        .await?;
+    assert!(mint.status().is_success(), "the lockbox must still mint a keypair without a client key");
+    let (bare_status, bare_body) =
+        raw_partial_signature(&lockbox, disclosure_body(&bare_sid, &honest, DEPOSIT)).await?;
+    println!("SDK92 - [c] no stored aggregate -> HTTP {bare_status}  {bare_body}");
+    if bare_status == 200 {
+        return Err(anyhow!(
+            "[c] a disclosure was SERVED for a coin with no aggregate on record. The check is \
+             failing OPEN, so naming any legacy sid buys an unchecked co-signature (V-7)."
+        ));
+    }
+    if !bare_body.contains("no aggregate on record") {
+        return Err(anyhow!(
+            "[c] refused with HTTP {bare_status}, but not by the aggregate-absent branch: \
+             {bare_body}. A refusal from the parser or another gate would keep passing after V-7 \
+             was reverted."
+        ));
+    }
+    println!(
+        "SDK92 - [c] PASS: the fail-open is CLOSED. An aggregate-less coin cannot buy a co-signature \
+         against a disclosure nobody can check."
+    );
+
     println!(
         "SDK92 - SCOPE: binding is OPT-IN per request while JS/Kotlin clients migrate, so a caller \
-         that omits the disclosure is still served, and the aggregate check FAILS OPEN for any sid \
-         with no stored aggregate. This proves both gates work when used, NOT that every signature \
-         is bound."
+         that omits the disclosure entirely is still served — that residual is #162. What is no \
+         longer true is the aggregate half: a request that DOES carry a disclosure is checked, and \
+         checked against a coin, on every sid."
     );
     println!("SDK92 - ALL ASSERTIONS PASSED");
     Ok(())

@@ -223,10 +223,20 @@ namespace lockbox {
                 // rather than the owner, and a parent edge resolved through it could be claimed by
                 // whoever registers a txid first.
                 //
-                // FAILS OPEN when no aggregate is stored: that means an old client sent no key
-                // (D24 ignores legacy coins), and refusing would brick every pre-existing coin.
-                // Failing open here is safe precisely because the frontier MUST NOT rely on an
-                // unchecked edge — the registry treats an unverified sid as unknown, not as trusted.
+                // **[V-7] FAILS CLOSED.** This used to serve a disclosure for a coin with no stored
+                // aggregate, on the reasoning that an old client sent no key and refusing would
+                // brick every pre-existing coin. Two things changed and the reasoning with them:
+                //
+                //   * the coordinator now REFUSES an empty `user_public_key`, so no request can mint
+                //     an unbindable coin any more — the unbound set is finite and closed, not
+                //     growing;
+                //   * every shipped client already sends the key (Rust, both wasm builds, Kotlin all
+                //     go through `create_deposit_msg1`), so the set is HISTORICAL. My own V-7 note
+                //     claimed the bindings predated the field; measuring the artifacts disproved it.
+                //
+                // What remains behind this branch is exactly the pre-0009 legacy population D24
+                // already decided to ignore. Serving them is not "compatibility", it is a hole any
+                // caller could aim at by naming a legacy sid — so refuse, and say which coin.
                 {
                     std::vector<unsigned char> stored_agg;
                     bool has_agg = false;
@@ -234,7 +244,16 @@ namespace lockbox {
                     if (!db_manager::get_aggregate(statechain_id, stored_agg, has_agg, agg_err)) {
                         return crow::response(500, "could not read the coin's aggregate: " + agg_err);
                     }
-                    if (has_agg) {
+                    if (!has_agg) {
+                        CROW_LOG_WARNING << "AGGREGATE_ABSENT statechain " << statechain_id;
+                        return crow::response(
+                            403,
+                            "this coin has no aggregate on record, so a disclosure about it cannot "
+                            "be checked (REQ-68 / V-7). It predates the binding and is one of the "
+                            "legacy coins D24 ignores; it can still be withdrawn, but it will not be "
+                            "co-signed against an unverifiable disclosure.");
+                    }
+                    {
                         // The disclosure carries the 33-byte compressed tweaked key; its x-only is
                         // the 32 bytes after the parity prefix.
                         const auto disclosed = utils::ParseHex(disclosure->agg_pubkey_hex);
