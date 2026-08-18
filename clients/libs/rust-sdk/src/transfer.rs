@@ -136,8 +136,6 @@ enum ManyRoute {
     InLadderChild,
     /// [CATS spine batch] A SPINE TIP: the next batch, `SP_{i+1}` over the tip's own `SP_i.out[K]`.
     SpineBatch,
-    /// Un-laddered coin (a plain split sub-coin): the N+1-output plain split.
-    PlainSplit,
 }
 
 /// One `TransferResult` per recipient for an in-ladder `transfer_many`: each piece was conveyed
@@ -231,7 +229,7 @@ impl UtexoWallet {
     pub(crate) async fn has_exit_material(&self, statechain_id: &str) -> Result<bool> {
         // The three laddered shapes each ARE exit material; `parent_shape` already probes all three
         // (and fails closed), so re-deriving the probe here would be a second definition to drift.
-        if !matches!(self.parent_shape(statechain_id).await?, ParentShape::Unladdered) {
+        if self.parent_shape_opt(statechain_id).await?.is_some() {
             return Ok(true);
         }
         // `try_get_backup_txs` is the absence-vs-failure split: `Ok(None)` is a genuinely empty
@@ -286,7 +284,27 @@ impl UtexoWallet {
     /// at the shipped 3.0 — [D44]), so a swallowed DB error
     /// would quote an unfundable payment as fundable and route a laddered coin at un-laddered prices —
     /// exactly the silent-degradation shape.
+    /// The refusing form: every caller that must ROUTE a coin uses this, because with one coin shape
+    /// "no ladder" is not a lane to pick, it is a fault to report.
     pub(crate) async fn parent_shape(&self, statechain_id: &str) -> Result<ParentShape> {
+        self.parent_shape_opt(statechain_id).await?.ok_or_else(|| {
+            anyhow!(
+                "statechain id {statechain_id} has no ladder of any kind - no root bundle, no \
+                 split-child bundle, no spine tip. The un-laddered lane it would once have taken is \
+                 RETIRED (one coin shape), so this is a coin to REPAIR rather than a shape to route: \
+                 run claim() to ladder it, and read `ladder_skip_reason` if it refuses. The coin is \
+                 unaffected and still withdrawable."
+            )
+        })
+    }
+
+    /// The PROBE: which of the three laddered shapes is this, if any — without deciding what the
+    /// answer means. Separate from [`Self::parent_shape`] for one caller,
+    /// [`Self::has_exit_material`], where absence of a ladder is NOT a fault: a coin carrying only
+    /// flat backup rows can still be exited, and erroring there would drop a spendable coin out of
+    /// the wallet's balance. Read FAILURES still propagate; only the verdict "none of the three"
+    /// comes back as data.
+    pub(crate) async fn parent_shape_opt(&self, statechain_id: &str) -> Result<Option<ParentShape>> {
         // [CATS/V4] THE SPINE TIP, FIRST — and this arm is why the tip needed a record of its own.
         //
         // A tip has no `tesr-` row and no `ctesr-` row, so before this arm existed it fell through
@@ -307,13 +325,13 @@ impl UtexoWallet {
         )
         .await?
         {
-            return Ok(ParentShape::SpineTip {
+            return Ok(Some(ParentShape::SpineTip {
                 fee_rate: tip.parent.fee_rate,
                 // The next batch's `SP_{i+1}` spends the tip's own funding outpoint `SP_i.out[K]`,
                 // NOT the cap's output — the cap is the tier being replaced, not the one being
                 // extended.
                 split_source_value: tip.sp_out_value,
-            });
+            }));
         }
         if let Some(cb) = mercuryrustlib::tesr::load_child(
             &self.inner.cc,
@@ -322,10 +340,10 @@ impl UtexoWallet {
         )
         .await?
         {
-            return Ok(ParentShape::Child {
+            return Ok(Some(ParentShape::Child {
                 fee_rate: cb.parent.fee_rate,
                 split_source_value: cb.child_extension.out_value,
-            });
+            }));
         }
         if let Some(bundle) = mercuryrustlib::tesr::load(
             &self.inner.cc,
@@ -335,9 +353,23 @@ impl UtexoWallet {
         .await?
         {
             let out_value = bundle.current().extension.out_value;
-            return Ok(ParentShape::Root { fee_rate: bundle.fee_rate, split_source_value: out_value });
+            return Ok(Some(ParentShape::Root {
+                fee_rate: bundle.fee_rate,
+                split_source_value: out_value,
+            }));
         }
-        Ok(ParentShape::Unladdered)
+        // **[ONE COIN SHAPE] THE FALLTHROUGH IS A FAULT, NOT A LANE.**
+        //
+        // This used to return `ParentShape::Unladdered` — a POSITIVE answer arrived at by three
+        // consecutive absences, and the route to `split_coin`. With `colored_ladder` shipping true
+        // wherever an attestation identity is pinned, every claimed coin carries a ladder of some
+        // kind, so reaching here means the coin has NONE: not laddered, not a child, not a tip.
+        //
+        // That is a coin whose `claim()` never completed, or whose rows were lost — and the honest
+        // answer is to say so, not to quietly price it on the cheaper model and route it to a plain
+        // split. The un-laddered lane is retired; a coin that would have needed it is a coin to
+        // repair, and `ladder_skip_reason` is where the wallet already records why.
+        Ok(None)
     }
 
     /// [B2] **THE payment planner.** `quote_transfer` and `transfer` both call this and nothing else,
@@ -561,12 +593,6 @@ impl UtexoWallet {
                             .await?;
                         inladder_piece = Some((piece_id, split_amount));
                         // `ids` = the whole coins (still handed over below); the piece is already conveyed.
-                        (ids, true)
-                    }
-                    ParentShape::Unladdered => {
-                        let (piece_id, _change_id) =
-                            self.split_coin(&split_coin_id, split_amount).await?;
-                        ids.push(piece_id);
                         (ids, true)
                     }
                     // [CATS spine batch] A SPINE TIP takes the SPINE BATCH: `SP_{i+1}` over the tip's
@@ -879,7 +905,11 @@ impl UtexoWallet {
         // terminal — so a doomed batch never pins a carrier's spend budget. This is the floor that
         // holds on EVERY route; the in-ladder routes raise it per-parent below (`min_child_value`).
         let backup_rate = backup_fee_rate(&self.inner.cc).await?;
-        let min_output = split_output_floors(backup_rate, ParentShape::Unladdered).piece;
+        // [ONE COIN SHAPE] The universal lower bound is the BACKUP floor itself — which is precisely
+        // what the retired `Unladdered` arm of `split_output_floors` returned. Asking for it directly
+        // says what it is (dust + a sub-coin's own backup fee) instead of naming a shape that no
+        // longer exists; the in-ladder routes still raise it per-parent below.
+        let min_output = min_split_output(backup_rate);
         if let Some((_, amt)) = recipients.iter().find(|(_, a)| *a < min_output) {
             return Err(anyhow!(
                 "recipient amount {amt} is below the minimum viable piece {min_output} (dust floor + backup fee) — it could not fund its own backup"
@@ -923,32 +953,6 @@ impl UtexoWallet {
             let shape = self.parent_shape(&id).await?;
             let floors = split_output_floors(backup_rate, shape);
             match shape {
-                ParentShape::Unladdered => {
-                    // [#145] `Unladdered` is reached by three consecutive absences, so it must be
-                    // PROVEN before it is acted on: an un-laddered coin's exit is its flat backup
-                    // chain, and a slot with no chain is not un-laddered, it is un-exitable. The
-                    // plain-split route below hands it to the flat sender, which refuses at the far
-                    // end of the payment. Reject it here, with its own reason, and try the next
-                    // candidate.
-                    if !self.has_exit_material(&id).await? {
-                        rejected.push(format!(
-                            "{id} ({parent_sats} sat): NO exit material on any lane — no TES-R \
-                             bundle and no flat backup rows. It cannot be exited unilaterally or \
-                             conveyed, so it is not a candidate (combining does not rescue it)"
-                        ));
-                        continue;
-                    }
-                    let need = total + split_fee_reserve(parent_sats) + floors.change;
-                    if parent_sats > need {
-                        chosen = Some((id, ManyRoute::PlainSplit));
-                        break;
-                    }
-                    rejected.push(format!(
-                        "un-laddered {id} ({parent_sats} sat): too small — needs more than {need} sat \
-                         (total {total} + fee reserve + a {}-sat change)",
-                        floors.change
-                    ));
-                }
                 // [CATS spine batch] A SPINE TIP is a candidate on the same terms as the two older
                 // in-ladder shapes — `spine_batch_split` is N-ary, so one batch pays N recipients
                 // and keeps the change as the next tip, exactly like `in_ladder_pay_many`. Sharing
@@ -1006,97 +1010,13 @@ impl UtexoWallet {
                     self.spine_batch_pay_many(&carrier_id, recipients).await?;
                 return Ok(inladder_many_results(recipients, &piece_sids));
             }
-            ManyRoute::PlainSplit => {}
+            // [ONE COIN SHAPE] `PlainSplit` is gone from `ManyRoute`; every remaining route is
+            // in-ladder and returns above, so this match is exhaustive and there is no tail.
         }
-
-        let record = self.record().await?;
-        let carrier = record
-            .coins
-            .iter()
-            .find(|c| {
-                c.statechain_id.as_deref() == Some(carrier_id.as_str())
-                    && c.status == CoinStatus::CONFIRMED
-                    && c.duplicate_index == 0
-            })
-            .cloned()
-            .ok_or_else(|| anyhow!("selected parent {carrier_id} not found"))?;
-        drop(record);
-        let parent_sats = carrier.amount.unwrap_or_default() as u64;
-        let fee_reserve = split_fee_reserve(parent_sats);
-        let change_sats = parent_sats - total - fee_reserve;
-
-        // One fresh slot per recipient piece + one change slot; build the N+1 plain split. All
-        // N+1 slots are DERIVED from the carrier (one free SE voucher batch, one auth nonce) —
-        // never the paid pool.
-        let mut slot_tokens = self.take_derived_tokens(&carrier_id, recipients.len() + 1).await?;
-        let mut outputs: Vec<(String, u64)> = Vec::with_capacity(recipients.len() + 1);
-        let mut piece_addrs: Vec<String> = Vec::with_capacity(recipients.len());
-        for (_, amount) in recipients {
-            let tk = slot_tokens.remove(0);
-            let addr = self.create_child_slot_addr(&tk, *amount).await?;
-            outputs.push((addr.clone(), *amount));
-            piece_addrs.push(addr);
-        }
-        let change_tk = slot_tokens.remove(0);
-        let change_addr = self.create_child_slot_addr(&change_tk, change_sats).await?;
-        outputs.push((change_addr.clone(), change_sats));
-
-        // Terminal-guard the carrier (one split), then co-sign the un-broadcast split.
-        mercuryrustlib::lightning_latch::set_spend_budget(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            &carrier_id,
-            1,
-        )
-        .await?;
-        let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &carrier_id,
-        )
-        .await
-        .map(|v| v.len() as u32)
-        .unwrap_or(0);
-        let mut carrier_coin = carrier;
-        let signed = self
-            .sign_split_tx(&mut carrier_coin, &outputs, parent_backups + 1)
-            .await?;
-        let tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&hex::decode(&signed)?)?;
-        let txid = tx.txid().to_string();
-
-        // Register all sub-coins (plain split has no OP_RETURN, so vout i = i).
-        let reg: Vec<(String, u32, u64)> = outputs
-            .iter()
-            .enumerate()
-            .map(|(i, (addr, sats))| (addr.clone(), i as u32, *sats))
-            .collect();
-        let ids = self
-            .register_split_subcoins_n(&carrier_id, &signed, &txid, &reg)
-            .await?;
-
-        // Hand each recipient its piece.
-        let mut results = Vec::with_capacity(recipients.len());
-        for (i, (recipient, amount)) in recipients.iter().enumerate() {
-            let piece_id = ids[i].clone();
-            mercuryrustlib::transfer_sender::execute(
-                &self.inner.cc,
-                recipient,
-                &self.inner.config.wallet_name,
-                &piece_id,
-                None,
-                false,
-                None,
-            )
-            .await?;
-            results.push(TransferResult {
-                receiver_address: recipient.clone(),
-                total_sats: *amount,
-                coins: vec![TransferredCoin { statechain_id: piece_id, amount_sats: *amount }],
-                used_split: true,
-            });
-        }
-        Ok(results)
+        // The N+1-output plain split that used to run here is DELETED with the un-laddered shape:
+        // it spent the coin's funding output `F` directly, which is what a prior owner's retained,
+        // un-timelocked trigger also spends [B1]. Every batch route now carves out of the ladder.
+        unreachable!("transfer_many returns from every in-ladder route above")
     }
 
     /// Ensure this wallet holds a CONFIRMED coin of exactly `sats`, minting one via an
@@ -1115,183 +1035,26 @@ impl UtexoWallet {
         }) {
             return Ok(c.statechain_id.clone().unwrap_or_default());
         }
-        // Split the smallest non-token-carrier coin that can cover the piece + fee reserve.
-        // [HF-3 / B1] ...and that is UN-LADDERED. `split_coin` refuses a laddered parent (a prior
-        // owner's retained no-timelock trigger could void the split and destroy the payee's sub-coin),
-        // so picking the smallest coin blindly would hard-fail whenever that coin happens to carry a
-        // ladder — even with a perfectly splittable coin sitting in the wallet. Ladder state lives in
-        // the wallet db, so this filter must be async: collect + sort first, then pick the smallest
-        // splittable one.
-        let mut candidates: Vec<(u64, String)> = record
-            .coins
-            .iter()
-            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
-            .filter(|c| !is_token_carrier(c, &carriers))
-            .filter(|c| {
-                let a = c.amount.unwrap_or_default() as u64;
-                a > sats + split_fee_reserve(a)
-            })
-            .filter_map(|c| c.statechain_id.clone().map(|id| (c.amount.unwrap_or_default() as u64, id)))
-            .collect();
-        candidates.sort_by_key(|(amount, _)| *amount);
-        drop(record);
-        let mut chosen: Option<String> = None;
-        for (_, id) in candidates {
-            if mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &id)
-                .await?
-                .is_none()
-            {
-                // [#145] Same proof obligation as the batch lane: `split_coin` on this id routes to
-                // the flat sender, which needs a backup chain that a materialless slot does not have.
-                if !self.has_exit_material(&id).await? {
-                    continue;
-                }
-                chosen = Some(id);
-                break;
-            }
-        }
-        let parent = chosen.ok_or_else(|| {
-            anyhow!("no splittable coin large enough to mint {sats} sats (coins carrying a TES-R exit ladder cannot be split [B1] — use an exact amount or re-anchor)")
-        })?;
-        let (piece, _change) = self.split_coin(&parent, sats).await?;
-        Ok(piece)
-    }
-
-    /// Split a confirmed coin into (`piece_sats`, remainder) **off-chain**: one SE-co-signed,
-    /// un-broadcast transaction whose outputs are two fresh single-use statechain coins owned by
-    /// this wallet. Returns (piece statechain_id, change statechain_id). Broadcasting the split tx
-    /// later is the unilateral exit for the sub-coins.
-    pub async fn split_coin(&self, statechain_id: &str, piece_sats: u64) -> Result<(String, String)> {
-        let record = self.record().await?;
-        let parent = record
-            .coins
-            .iter()
-            .find(|c| {
-                c.statechain_id.as_deref() == Some(statechain_id)
-                    && c.status == CoinStatus::CONFIRMED
-                    && c.duplicate_index == 0
-            })
-            .cloned()
-            .ok_or_else(|| anyhow!("no confirmed coin with statechain id {statechain_id}"))?;
-        // A plain-BTC split must never consume a token carrier (review H2): its RGB allocation
-        // would be destroyed. Token moves go through the colored-split path instead.
-        let carriers = self.unspendable_as_btc_outpoints().await?;
-        if is_token_carrier(&parent, &carriers) {
-            return Err(anyhow!(
-                "coin {statechain_id} carries an RGB token allocation; splitting it as plain BTC would destroy the token — use a token transfer or pick a different coin"
-            ));
-        }
-        // [B1] NEVER split a coin that carries a TES-R ladder. The trigger `T` has NO timelock
-        // (`TRIGGER_SEQUENCE = 0xFFFF_FFFD`) and is fully co-signed at `establish`, so every prior owner
-        // of a Model-A-conveyed coin retains a broadcastable `T` that spends `F` — and the split tx
-        // spends the SAME `F`. A prior owner can therefore `unilateral_exit` the parent at any time,
-        // consume `F`, and permanently kill this split, voiding the sub-coin its receiver paid for,
-        // while their ladder pays them the full parent value. The race is rigged: `T` is v3/TRUC with a
-        // P2A anchor (fee-bumpable by anyone, forever) vs a v2 split tx with a frozen fee and no RBF
-        // headroom. The receiver cannot detect the exposure: the ladder is not conveyed on the
-        // un-laddered backup-chain route and the SE has never seen it, so their `terminal_parents` check
-        // returns true and means nothing. NOTE the spend-budget does NOT protect here — it bounds FUTURE
-        // co-signs, and `T` was co-signed long before `set_spend_budget` (this is why `transfer.rs`'s "the
-        // branch cannot be double-spent even by a malicious sender" claim does not hold for laddered parents).
-        // The real fix is the IN-LADDER split (PROTOCOL.md §5.4): a split as a STATE tier spending
-        // `X_m.out[0]` is a DESCENDANT of `T`, not a rival for `F`, so a retained trigger has nothing to
-        // race. Until that ships, refuse — a hard error beats silently voiding the receiver's coin.
-        if mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, statechain_id)
-            .await?
-            .is_some()
-        {
-            return Err(anyhow!(
-                "coin {statechain_id} has a TES-R exit ladder and cannot be split: a prior owner may hold a no-timelock trigger over its funding UTXO and could void the split, voiding the receiver's sub-coin [B1]. Use an exact-amount transfer, pick an un-laddered coin, or re-anchor this coin first."
-            ));
-        }
-        let parent_sats = parent.amount.unwrap_or_default() as u64;
-        // Admission guard (fee-reserve fit + backup-fee floor on both outputs) — rejects BEFORE
-        // touching the parent. The floor is the dust limit PLUS each sub-coin's own backup fee at
-        // the rate create_tx1 will use: a piece in [330, 330+backup_fee) would be a valid split
-        // output whose backup is FeeTooLow, and admitting it here (then making the parent terminal)
-        // would strand the parent to unilateral-exit-only. Guarding up-front keeps the parent
-        // spendable on refusal.
-        // [B2] ONE floor, from `split_output_floors` — the same call the quote's
-        // `split_preflight_pure` makes for an `Unladdered` parent (the `tesr::load` above proved this
-        // coin is un-laddered). Un-laddered sub-coins have identical shape, so `binding()` is the
-        // honest reading of two equal legs, not a shortcut past a distinction.
-        let min_output =
-            split_output_floors(backup_fee_rate(&self.inner.cc).await?, ParentShape::Unladdered)
-                .binding();
-        let (change_sats, _fee_reserve) =
-            split_amounts_floored(parent_sats, piece_sats, min_output)?;
-
-        // Two fresh statechain slots owned by this wallet (SE handshake only — no on-chain tx).
-        // Normal coins: sub-coin security is Mercury's decrementing-locktime scheme, with the
-        // split tx as the shared exit branch below the parent's deposit backup. The slots are
-        // DERIVED (they re-house this parent's value, adding no on-chain onboarding surface), so
-        // their tokens are free SE-minted vouchers against the parent — never the paid pool.
-        let mut slot_tokens = self.take_derived_tokens(statechain_id, 2).await?;
-        let token_a = slot_tokens.remove(0);
-        let piece_addr = self.create_child_slot_addr(&token_a, piece_sats).await?;
-        let token_b = slot_tokens.remove(0);
-        let change_addr = self.create_child_slot_addr(&token_b, change_sats).await?;
-
-        // Build + blind-MuSig2 co-sign the un-broadcast split tx (plain BTC: no coloring step).
-        // The split IS the child's exit branch and is now locktime-FREE (INV-4 / review H5), so it
-        // is unconditionally broadcastable and always matures below the parent's deposit-anchored
-        // backup — winning the exit race regardless of tip. `qt_backup_tx` no longer sets the split
-        // locktime (it did, tip-relative, which could invert the race); kept only for signature
-        // shape / withdrawal reuse.
-        let parent_backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            statechain_id,
-        )
-        .await
-        .map(|v| v.len() as u32)
-        .unwrap_or(0);
-        // Make the parent TERMINAL at the SE before co-signing the split: exactly one more
-        // co-signature is allowed (the split itself), so no later withdraw/transfer/backup of the
-        // parent can be signed.
+        // **[ONE COIN SHAPE] THE MINTING FALLBACK IS RETIRED WITH THE SHAPE IT MINTED.**
         //
-        // [HF-5 / B1] SCOPE — this does NOT mean "the branch cannot be double-spent even by a malicious
-        // sender" (the claim that stood here). That holds only under the pre-TES-R premise that EVERY spend
-        // of the parent's funding `F` needs a FRESH SE co-signature. A budget bounds FUTURE co-signs; it
-        // cannot RETRACT one already issued. A laddered parent's trigger `T` was co-signed back at `establish`
-        // — long before this call — carries no timelock, and spends `F` directly, so a retained `T`
-        // double-spends the branch regardless of any budget set here. That is B1. Splitting a laddered
-        // coin is therefore refused up-front in `split_coin`; the real fix is the in-ladder split
-        // (PROTOCOL.md §5.4), where the split is a state tier DESCENDING from `T` rather than a rival for
-        // `F`. Keep this comment honest: the budget is a co-sign bound, not a spend bound.
-        mercuryrustlib::lightning_latch::set_spend_budget(
-            &self.inner.cc,
-            &self.inner.config.wallet_name,
-            statechain_id,
-            1,
-        )
-        .await?;
-        let mut parent = parent;
-        let signed = self
-            .sign_split_tx(
-                &mut parent,
-                &[(piece_addr.clone(), piece_sats), (change_addr.clone(), change_sats)],
-                parent_backups + 1,
-            )
-            .await?;
-        let tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&hex::decode(&signed)?)?;
-        let txid = tx.txid().to_string();
-
-        // Register both sub-coins (coin records + backups + shared branch).
-        let (piece_id, change_id) = self
-            .register_split_subcoins(
-                statechain_id,
-                &signed,
-                &txid,
-                &[
-                    (piece_addr.clone(), 0, piece_sats),
-                    (change_addr.clone(), 1, change_sats),
-                ],
-            )
-            .await?;
-        Ok((piece_id, change_id))
+        // This used to split the smallest UN-LADDERED coin, because `split_coin` refuses a laddered
+        // parent — [B1]: a prior owner's retained, un-timelocked trigger spends the same `F` the
+        // split tx spends, so it can void the split and destroy the payee's sub-coin, and the payee
+        // cannot detect the exposure. With every coin laddered there is no un-laddered parent to
+        // pick, so the fallback could only ever fail; the plain split is gone and so is its search.
+        //
+        // Refusing here is not a regression: REQ-42 requires the one-call Lightning pay to fall back
+        // to the NON-EXACT in-ladder lane precisely when no exact coin can be minted, and that lane
+        // carves its piece as a DESCENDANT of the trigger rather than a rival for `F`, which is what
+        // makes it safe where this was not.
+        Err(anyhow!(
+            "no CONFIRMED coin of exactly {sats} sat, and the off-chain plain split that used to \
+             mint one is RETIRED (one coin shape): it spent the coin's funding output `F` directly, \
+             which a prior owner's retained trigger also spends [B1]. Use the in-ladder lane, which \
+             carves the piece out of the ladder instead."
+        ))
     }
+
 
     /// **In-ladder split payment of a laddered (TES-R) coin** (the B1-safe replacement for the refused
     /// `split_coin` path). The split IS the payment: `SP` is a STATE tier spending `X_m.out[0]` (a
@@ -3301,9 +3064,6 @@ pub(crate) async fn backup_fee_rate(cc: &mercuryrustlib::client_config::ClientCo
 /// the LOWER floor, i.e. the silent-degradation shape that quotes an unfundable payment as fundable.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ParentShape {
-    /// No TES-R ladder: the plain off-chain split (`split_coin`), whose sub-coins carry only their
-    /// own backup tx.
-    Unladdered,
     /// A received in-ladder split CHILD: it re-splits at its OWN level (`child_in_ladder_pay`),
     /// carving `CSP` out of `ext_child.out[0]`.
     Child { fee_rate: f64, split_source_value: u64 },
@@ -3330,7 +3090,6 @@ impl ParentShape {
     /// no ladder and therefore no `min_child_value` floor.
     pub(crate) fn ladder_fee_rate(self) -> Option<f64> {
         match self {
-            ParentShape::Unladdered => None,
             ParentShape::Child { fee_rate, .. }
             | ParentShape::Root { fee_rate, .. }
             | ParentShape::SpineTip { fee_rate, .. } => Some(fee_rate),
@@ -3346,7 +3105,6 @@ impl ParentShape {
     /// judging a batch on `amount` over-states capacity by a whole ladder.
     pub(crate) fn split_source_value(self) -> Option<u64> {
         match self {
-            ParentShape::Unladdered => None,
             ParentShape::Child { split_source_value, .. }
             | ParentShape::Root { split_source_value, .. }
             | ParentShape::SpineTip { split_source_value, .. } => Some(split_source_value),
@@ -3359,7 +3117,6 @@ impl ParentShape {
     /// when the committed fee no longer fits.
     pub(crate) fn split_total(self, n_payload: usize) -> Option<u64> {
         match self {
-            ParentShape::Unladdered => None,
             ParentShape::Child { fee_rate, split_source_value }
             | ParentShape::Root { fee_rate, split_source_value }
             | ParentShape::SpineTip { fee_rate, split_source_value } => {
@@ -3392,7 +3149,6 @@ impl ParentShape {
     /// legible instead of mysterious.
     pub(crate) fn route(self) -> &'static str {
         match self {
-            ParentShape::Unladdered => "plain off-chain split",
             ParentShape::Child { .. } => "child in-ladder split",
             ParentShape::Root { .. } => "in-ladder split",
             ParentShape::SpineTip { .. } => "spine batch",
@@ -3426,14 +3182,15 @@ pub(crate) struct SplitFloors {
 }
 
 impl SplitFloors {
-    /// The floor that binds BOTH legs — the larger. Used where one number is genuinely right: the
-    /// plain un-laddered split (whose two sub-coins have identical shape) and any single-number
-    /// report.
+
+    /// The smallest floor either leg imposes. Used by the shape-BLIND planner, which must never    /// The floor that BINDS admission — the stricter of the two legs. A split is admissible only if
+    /// BOTH its piece and its change clear their own floor, so a single number that stands in for the
+    /// pair must be the maximum; taking the minimum would admit a split whose change leg is stranded.
     pub(crate) fn binding(self) -> u64 {
         self.piece.max(self.change)
     }
 
-    /// The smallest floor either leg imposes. Used by the shape-BLIND planner, which must never
+
     /// refuse a split some coin could actually make; the named coin is then judged per-leg.
     pub(crate) fn planning(self) -> u64 {
         self.piece.min(self.change)
@@ -3489,9 +3246,6 @@ pub(crate) fn split_output_floors(backup_fee_rate: f64, shape: ParentShape) -> S
     // Exhaustive on the SHAPE, so a fourth parent shape is a compile error rather than a fourth
     // silent fall-through to the un-laddered (lower) floor.
     match shape {
-        ParentShape::Unladdered => {
-            SplitFloors { piece: backup_floor, change: backup_floor, lane: None }
-        }
         ParentShape::Root { fee_rate, .. } => {
             laddered(fee_rate, mercuryrustlib::tesr::SplitLane::PlainRoot)
         }
@@ -3677,15 +3431,6 @@ pub(crate) fn split_preflight_pure(
 ) -> SplitPreflight {
     let floors = split_output_floors(backup_rate, shape);
     let (fee_sats, admission) = match shape {
-        ParentShape::Unladdered => (
-            split_fee_reserve(parent_sats),
-            // The plain lane's two sub-coins have IDENTICAL shape (each carries only its own backup
-            // tx), so one number is genuinely right here — and it is the binding one, never the
-            // planning one.
-            split_amounts_floored(parent_sats, piece_sats, floors.binding())
-                .map(|(change, _)| change)
-                .map_err(|e| e.to_string()),
-        ),
         // [CATS spine batch] A SPINE TIP joins the two in-ladder shapes rather than being refused: its
         // split IS the next spine batch (`SP_{i+1}` over `SP_i.out[K]`, `spine_batch_split`), which
         // carves the same two payload outputs out of the same kind of tier and admits them against
@@ -3743,8 +3488,15 @@ pub(crate) struct SplitPreflight {
     pub admission: std::result::Result<u64, String>,
 }
 
+
 /// The split executor's pure admission guard with an explicit per-leg floor: fee reserve + fit
 /// + `min_output` on both sub-coins. Returns `(change_sats, fee_reserve)` when admissible.
+///
+/// [ONE COIN SHAPE] Its live caller (`split_coin`) is deleted with the un-laddered lane; it survives
+/// as the arithmetic behind [`split_amounts`], which the invalidation and granularity model tests
+/// use as the executable dust-boundary spec. The BOUNDARY is not un-laddered-only — every split leg
+/// still has to clear dust and fund what it owes — so this is kept deliberately rather than by
+/// oversight.
 pub(crate) fn split_amounts_floored(
     parent_sats: u64,
     piece_sats: u64,
@@ -3875,16 +3627,10 @@ mod split_math_tests {
         let backup_rate = 2.0;
         let ladder_rate = 2.0;
 
-        // The un-laddered floor IS `min_split_output` — no ladder, no `min_child_value` term. Both
-        // legs, because an un-laddered split's two sub-coins genuinely have the same shape.
-        assert_eq!(
-            split_output_floors(backup_rate, ParentShape::Unladdered),
-            SplitFloors {
-                piece: min_split_output(backup_rate),
-                change: min_split_output(backup_rate),
-                lane: None,
-            }
-        );
+        // [ONE COIN SHAPE] The un-laddered pair is gone with its shape — `split_output_floors` no
+        // longer has an arm that returns `min_split_output` for both legs. The BARE floor still
+        // exists and is still the universal lower bound every laddered floor is `max`ed against, so
+        // it is asserted directly rather than through a `ParentShape` that no longer names it.
         assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at the FIXTURE rate of 2 sat/vB [D56]");
 
         // A laddered parent raises the PIECE to `min_child_value`, on either lane — the payee's leaf
@@ -4053,22 +3799,9 @@ mod split_math_tests {
             .admission
             .is_err());
 
-        // And an UN-LADDERED parent is floored by `min_split_output` alone, from the same function.
-        let parent = 10_000u64;
-        let unladdered_floor = split_output_floors(backup_rate, ParentShape::Unladdered).binding();
-        let pf = split_preflight_pure(backup_rate, ParentShape::Unladdered, parent, unladdered_floor);
-        assert_eq!(pf.floors.binding(), unladdered_floor);
-        assert!(pf.admission.is_ok(), "at its own floor an un-laddered piece is admissible");
-        let plain_under =
-            split_preflight_pure(backup_rate, ParentShape::Unladdered, parent, unladdered_floor - 1)
-                .admission;
-        assert!(plain_under.is_err(), "one sat under the un-laddered floor, refused");
-        assert_eq!(pf.fee_sats, split_fee_reserve(parent), "the plain lane quotes its reserve");
-        assert_eq!(
-            split_preflight_pure(backup_rate, shape, 0, floor).fee_sats,
-            in_ladder_split_cost(ladder_rate),
-            "the in-ladder lane quotes the real in-ladder cost"
-        );
+        // [ONE COIN SHAPE] The un-laddered boundary case is deleted with the lane it priced —
+        // `split_preflight_pure` has no arm for it, because there is no plain split to admit.
+
     }
 
     // [B2] The planner is ADVISORY; the per-coin floor BINDS. `plan_payment` runs
@@ -4078,56 +3811,33 @@ mod split_math_tests {
     // wallet can actually make — agreement bought with a capability regression, which is not a fix.
     #[test]
     fn the_planner_is_advisory_and_the_per_coin_floor_binds() {
+        // [ONE COIN SHAPE] This test used to contrast a LADDERED parent against an UN-LADDERED one —
+        // 1_310 against 554 — and assert the planner quotes the smaller while admission binds on the
+        // larger. With one coin shape there is no cheaper shape to contrast against, so what remains
+        // is the property that actually mattered: the planner's number is ADVISORY and the coin's own
+        // floor is what admits or refuses.
         let backup_rate = 2.0;
         let laddered = ParentShape::Root {
             fee_rate: 2.0,
             split_source_value: source_value_for_total(50_000, 2.0),
         };
-        let plain = ParentShape::Unladdered;
         let laddered_floor = split_output_floors(backup_rate, laddered).binding();
-        let plain_floor = split_output_floors(backup_rate, plain).binding();
-        assert_eq!((plain_floor, laddered_floor), (554, 1_310));
+        assert_eq!(laddered_floor, 1_310);
+        // The bare backup floor still exists and is still strictly lower — which is exactly why a
+        // planner quoting it would be advisory and not binding.
+        assert!(min_split_output(backup_rate) < laddered_floor);
 
-        // The floor `plan_payment` plans at, over a wallet holding one of each.
-        let planning = [laddered_floor, plain_floor].into_iter().min().unwrap();
-        assert_eq!(planning, plain_floor, "the smallest floor any candidate imposes");
-
-        // A 600-sat piece: the un-laddered coin can mint it; the laddered coin cannot.
-        let plain_600 = split_preflight_pure(backup_rate, plain, 10_000, 600).admission;
-        assert!(plain_600.is_ok(), "an un-laddered coin mints a 600-sat piece: {plain_600:?}");
-        let laddered_600 = split_preflight_pure(backup_rate, laddered, 0, 600).admission;
-        assert!(laddered_600.is_err(), "600 is under the in-ladder floor of {laddered_floor}");
-
-        // Planning at the laddered floor would refuse the payment outright; planning at the smallest
-        // candidate floor proposes it, and the binding per-coin preflight then decides.
-        let coins = vec![crate::select::Candidate {
-            index: 0,
-            amount_sats: 10_000,
-            splittable: true,
-            is_inventory: true,
-        }];
-        assert!(matches!(
-            crate::select::plan_with_floor(&coins, 600, planning),
-            crate::select::Plan::WithSplit { .. }
-        ));
-        assert!(matches!(
-            crate::select::plan_with_floor(&coins, 600, laddered_floor),
-            crate::select::Plan::Insufficient { .. }
-        ));
-
-        // And the retry itself: once the coin the planner named is marked un-splittable, the planner
-        // must stop proposing it — this is what makes `plan_payment`'s loop terminate.
-        let exhausted =
-            vec![crate::select::Candidate {
-            index: 0,
-            amount_sats: 10_000,
-            splittable: false,
-            is_inventory: true,
-        }];
-        assert!(matches!(
-            crate::select::plan_with_floor(&exhausted, 600, planning),
-            crate::select::Plan::Insufficient { .. }
-        ));
+        // At its own floor the laddered coin is admissible; one satoshi under, it is not.
+        assert!(split_preflight_pure(backup_rate, laddered, 0, laddered_floor).admission.is_ok());
+        let under = split_preflight_pure(backup_rate, laddered, 0, laddered_floor - 1).admission;
+        assert!(under.is_err(), "the per-coin floor BINDS: {under:?}");
+        // ...and a piece priced at the bare backup floor is refused, because that floor is not this
+        // coin's floor. This is the assertion the old un-laddered contrast was really making.
+        let planned = split_preflight_pure(backup_rate, laddered, 0, min_split_output(backup_rate));
+        assert!(
+            planned.admission.is_err(),
+            "a planner-sized piece must not be admitted on a coin whose own floor is higher"
+        );
     }
 
     // [P0-4] The quote must plan with the floor the executor enforces. The planner used to be run
@@ -4368,11 +4078,10 @@ mod split_math_tests {
         // ladder actually built come apart (hazard 12).
         assert_eq!(tf.lane, Some(mercuryrustlib::tesr::SplitLane::SpineBatch));
         assert_eq!(rf.lane, Some(mercuryrustlib::tesr::SplitLane::PlainRoot));
-        assert_ne!(
-            tf,
-            split_output_floors(backup_rate, ParentShape::Unladdered),
-            "the fall-through answer is the dangerous one and must be distinguishable"
-        );
+        // [ONE COIN SHAPE] The dangerous fall-through this compared against — the un-laddered floor
+        // pair — no longer exists as a shape, so a tip can no longer be mistaken for it. What is
+        // still worth asserting is that a tip is priced on its OWN lane and never on a bare floor.
+        assert!(tf.piece > min_split_output(backup_rate) && tf.change > min_split_output(backup_rate));
         assert_eq!(tip.route(), "spine batch");
         // Its capacity is arithmetic over its FUNDING outpoint (`SP_i.out[K]`), not over the cap.
         assert_eq!(tip.split_total(2), mercurylib::tesr::tier_out_total(100_000, 2, 2.0));
@@ -4448,15 +4157,9 @@ mod split_math_tests {
         let cf = split_output_floors(backup_rate, child);
         assert_eq!((cf.piece, cf.change), (1_310, 1_310));
         assert_eq!(min_batch_source_value(3, child, cf), Some(1_396 * 3 + 1_800));
-        // An un-laddered parent has no in-ladder batch at all.
-        assert_eq!(
-            min_batch_source_value(
-                3,
-                ParentShape::Unladdered,
-                split_output_floors(backup_rate, ParentShape::Unladdered)
-            ),
-            None
-        );
+        // [ONE COIN SHAPE] "An un-laddered parent has no in-ladder batch at all" no longer needs
+        // asserting: there is no un-laddered parent. Every remaining shape HAS a batch, which is the
+        // stronger statement, and the three arms above are now exhaustive over the enum.
     }
 
     /// **[K > 1] THE VALUE-FLOOR REFUSAL FIRES AT THE BOUNDARY, AND NAMES K AND THE SHORTFALL.**

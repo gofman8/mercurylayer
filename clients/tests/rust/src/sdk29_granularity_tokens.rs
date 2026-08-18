@@ -500,15 +500,12 @@ pub async fn execute() -> Result<()> {
     // ===== (c) part 1 — while it CARRIES, the carrier is quarantined and unsplittable ============
     // Unchanged from the flat lane and still true: a plain-BTC split of a carrier would destroy the
     // allocation, and the carrier's sats are not spendable BTC (review H2 / audit [7]/[23]).
-    let err = alice
-        .split_coin(&carrier_sid, 330)
-        .await
-        .expect_err("plain split of a token carrier must be refused");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("carries an RGB token allocation"),
-        "expected the carrier-split refusal, got: {msg}"
-    );
+    // **[ONE COIN SHAPE] The refusal became STRUCTURAL, so there is nothing left to call.**
+    // This used to assert that `split_coin` refuses a carrier with "carries an RGB token
+    // allocation". `split_coin` is DELETED — the plain off-chain split it performed spent the coin's
+    // funding output `F` directly, which is what a retained trigger also spends [B1]. A carrier can
+    // no longer be plain-split because nothing can, which is a stronger guarantee than a refusal
+    // message: a message protects only the callers that go through that function.
     assert_eq!(
         alice.get_balance().await?.available_sats,
         0,
@@ -522,7 +519,7 @@ pub async fn execute() -> Result<()> {
         guard_msg.contains("in_ladder_split"),
         "the PLAIN in-ladder split over a COLOURED ladder must be refused by name, got: {guard_msg:?}"
     );
-    println!("SDK29 - carrier quarantined: plain split refused ({msg}); uncoloured-over-coloured refused ({guard_msg})");
+    println!("SDK29 - carrier quarantined: the plain-split route is DELETED (structural, not a refusal); uncoloured-over-coloured refused ({guard_msg})");
 
     // ===== (a) THE SPLIT: three exact raw amounts + change, in ONE in-ladder split ===============
     // The old test made five successive splits down one carrier's change. `SP` TERMINALIZES its

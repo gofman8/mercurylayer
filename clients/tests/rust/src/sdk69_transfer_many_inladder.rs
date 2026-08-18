@@ -163,17 +163,23 @@ pub async fn execute() -> Result<()> {
     // The retained, un-timelocked trigger — the B1 weapon. Kept aside now, fired in step [4].
     let retained_trigger = bundle.trigger.signed_tx.clone();
     let trigger_txid = bundle.trigger.txid.clone();
-    let plain_split = alice.split_coin(&alice_sid, PAY_BOB).await;
-    let err = plain_split.expect_err("a plain split of a laddered coin must be refused").to_string();
-    assert!(
-        err.contains("B1") && err.contains("cannot be split"),
-        "the refusal must name the hazard, got: {err}"
-    );
+    // **[ONE COIN SHAPE] `split_coin` IS GONE, so [B1] is closed by construction here.**
+    //
+    // This step used to call `alice.split_coin(...)` and assert it refused with "B1 ... cannot be
+    // split". The hazard it named is the whole reason the un-laddered lane was retired: the plain
+    // split spends the same `F` that alice's retained, un-timelocked trigger spends, so a prior
+    // owner could void the split and destroy the payee's sub-coin — and, as the split's own comment
+    // recorded, "the receiver cannot detect the exposure".
+    //
+    // A deleted route cannot be taken by a caller that forgets to check, which is strictly stronger
+    // than a refusal inside one function. What the rest of this test proves is the positive half:
+    // the SAME payment goes through in-ladder, where the piece is a DESCENDANT of the trigger rather
+    // than a rival for `F`, so the weapon kept aside above has nothing to race. It is fired in [4].
     assert_eq!(
         alice.get_balance().await?.available_sats, DEPOSIT,
-        "the refusal is side-effect free — the parent is untouched and still spendable"
+        "precondition: the laddered parent is intact and spendable before the in-ladder payment"
     );
-    println!("SDK69 - [1] alice's {DEPOSIT}-sat coin is LADDERED (F = {f_txid}:{f_vout}); a plain split of it is refused: {err}");
+    println!("SDK69 - [1] alice's {DEPOSIT}-sat coin is LADDERED (F = {f_txid}:{f_vout}); the plain-split route that [B1] made unsafe no longer exists");
 
     // ---- [2] transfer_many pays TWO people out of that laddered parent, in-ladder. --------------
     for _ in 0..3 {

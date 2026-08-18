@@ -247,7 +247,11 @@ fn check_exit_material_proof(sdk: &str) -> Result<(), String> {
              balance:\n\n{body}"
         ));
     }
-    if !body.contains("ParentShape::Unladdered") {
+    // [ONE COIN SHAPE] The short-circuit used to read `ParentShape::Unladdered`; that variant is
+    // deleted with the lane, and the probe is now `parent_shape_opt(..).is_some()`. The PROPERTY is
+    // unchanged and is what this pins: the three laddered shapes ARE exit material, and this
+    // function must ask the one probe rather than re-deriving it.
+    if !body.contains("parent_shape_opt(") {
         return Err(format!(
             "`has_exit_material` no longer short-circuits on the laddered shapes; a bundle IS exit \
              material and re-deriving that probe here would be a second definition to \
@@ -290,27 +294,6 @@ const GATES: &[Gate] = &[
         why: "the SHARED selection filter — the [B2] 'one coin set' both `quote_transfer` and \
               `transfer` plan over. A coin that survives this loop un-probed is a coin the planner \
               promises and the sender cannot spend",
-    },
-    Gate {
-        item: "pub async fn transfer_many(",
-        ends_at: "pub async fn ensure_exact_coin(",
-        polarity: "if !",
-        block_must: &["rejected.push(", "continue;"],
-        else_must: None,
-        route: "ManyRoute::PlainSplit",
-        why: "the BATCH lane builds its own candidate list and never passes through \
-              `spendable_payment_coins`, so it would re-introduce #145 one lane over",
-    },
-    Gate {
-        item: "pub async fn ensure_exact_coin(",
-        ends_at: "pub async fn split_coin(",
-        polarity: "if !",
-        block_must: &["continue;"],
-        else_must: None,
-        route: "self.split_coin(&parent,",
-        why: "`ensure_exact_coin` also builds its own candidate list, and its chosen parent goes \
-              straight to `split_coin`, i.e. to the flat sender that needs the backup chain a \
-              materialless slot does not have",
     },
 ];
 
@@ -530,9 +513,17 @@ fn the_exit_material_proof_reads_absence_not_failure() {
     check_exit_material_proof(&code_only(&read(SDK))).unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// THE UN-LADDERED ROUTES, gated and ordered — see [`check_plain_split_gates`].
+/// THE SHARED SELECTION FILTER, gated and ordered — see [`check_plain_split_gates`].
+///
+/// [ONE COIN SHAPE] This used to cover THREE routes. Two of them — `transfer_many`'s plain-split
+/// candidate arm and `ensure_exact_coin`'s minting fallback — are DELETED with the un-laddered
+/// shape, along with `split_coin` itself, so their gates have no subject left to police. What
+/// survives is the one that was never about plain splits: `spendable_payment_coins`, the [B2] shared
+/// coin set that `quote_transfer` and `transfer` both plan over. A coin surviving that loop un-probed
+/// is still a coin the planner promises and the sender cannot spend, so the gate still earns its
+/// keep — and #145 is still the defect it exists to prevent.
 #[test]
-fn every_plain_split_route_proves_its_material_first() {
+fn the_shared_selection_filter_proves_its_material_first() {
     check_plain_split_gates(&code_only(&read(SDK))).unwrap_or_else(|e| panic!("{e}"));
 }
 
@@ -659,54 +650,8 @@ fn guard_catches_each_mutation_it_was_written_for() {
         "A3: a swallowed `load_spine_tip` read was not caught"
     );
 
-    // A4, THE PROVEN MUTATION. Keep all three call sites; make two of them non-blocking. The old
-    // `proofs >= 3` count: GREEN.
-    let mut non_blocking = mutate_after(
-        &sdk,
-        "pub async fn transfer_many(",
-        "if !self.has_exit_material(&id).await? {",
-        "let _ = self.has_exit_material(&id).await?;\n                    if false {",
-    );
-    non_blocking = mutate_after(
-        &non_blocking,
-        "pub async fn ensure_exact_coin(",
-        "if !self.has_exit_material(&id).await? {",
-        "let _ = self.has_exit_material(&id).await?;\n                if false {",
-    );
-    assert_eq!(
-        non_blocking.matches("self.has_exit_material(").count(),
-        sdk.matches("self.has_exit_material(").count(),
-        "the non-blocking mutation must KEEP the call count — that is the whole point of the case"
-    );
-    assert!(
-        check_plain_split_gates(&non_blocking).is_err(),
-        "A4: three call sites of which two are non-blocking was NOT caught — the guard is back to \
-         counting call sites instead of pinning the gate"
-    );
 
-    // A4: inverted polarity. The gate fires, and admits exactly the coins it exists to exclude.
-    let inverted = mutate_after(
-        &sdk,
-        "pub async fn transfer_many(",
-        "if !self.has_exit_material(&id).await? {",
-        "if self.has_exit_material(&id).await? {",
-    );
-    assert!(
-        check_plain_split_gates(&inverted).is_err(),
-        "A4: an inverted `has_exit_material` gate was not caught"
-    );
 
-    // A4: the gate fires but does not divert — the coin walks on to the plain split anyway.
-    let no_divert = mutate_after(
-        &sdk,
-        "if !self.has_exit_material(&id).await? {",
-        "continue;",
-        "();",
-    );
-    assert!(
-        check_plain_split_gates(&no_divert).is_err(),
-        "A4: a gate whose losing branch does not `continue` was not caught"
-    );
 
     // A4: the selection filter stops recording what it excluded.
     let no_record = mutate_after(
@@ -720,18 +665,11 @@ fn guard_catches_each_mutation_it_was_written_for() {
         "A4: dropping the `else` that records the excluded coins was not caught"
     );
 
-    // A4 ordering: run the plain split BEFORE the proof that is meant to gate it.
-    let out_of_order = mutate_after(
-        &sdk,
-        "pub async fn ensure_exact_coin(",
-        "let mut chosen: Option<String> = None;",
-        "let _early = self.split_coin(&parent, sats).await?;\n        let mut chosen: \
-         Option<String> = None;",
-    );
-    assert!(
-        check_plain_split_gates(&out_of_order).is_err(),
-        "A4: the plain split running BEFORE its proof was not caught — 'first' is not being checked"
-    );
+    // [ONE COIN SHAPE] The ORDERING case is retired with its subject. It ran the plain split before
+    // the proof meant to gate it, inside `ensure_exact_coin` — and both the plain split and that
+    // function's candidate loop are deleted. The ordering RULE still holds for the surviving gate and
+    // is exercised by the cases above; what is gone is a mutation with nothing left to mutate. A
+    // vacuous non-vacuity case is worse than none, which is exactly what `mutate_after` asserts.
 
     // The fail-closed read in `has_exit_material` itself.
     let fetch_one = mutate_after(

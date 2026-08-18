@@ -255,12 +255,6 @@ async fn dispatch(state: &Arc<Mutex<State>>, method: &str, params: &Value) -> Re
                 .transfer(&p("receiver_address")?, pu64("amount_sats")?)
                 .await?,
         )?,
-        "split_coin" => {
-            let (piece, change) = wallet
-                .split_coin(&p("statechain_id")?, pu64("piece_sats")?)
-                .await?;
-            json!({"piece_statechain_id": piece, "change_statechain_id": change})
-        }
         "transfer_tokens" => serde_json::to_value(
             wallet
                 .transfer_tokens(&p("asset_id")?, &p("receiver_address")?, pu64("amount")?)

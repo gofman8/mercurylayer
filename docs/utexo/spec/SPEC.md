@@ -83,13 +83,15 @@ arithmetic — is expected to be **deleted**, not migrated.
 >   BEFORE the classifier, with a green CI guard) — so those two are retirable. **They are the two
 >   that look load-bearing, and the one that looks legacy is the one carrying the lane.**
 >
->   The `branch-` shape is not even legacy-only: `ensure_exact_coin` falls back to `split_coin`, and
->   the SSP's Lightning lane calls it unconditionally, so the lane is still a PRODUCER. A post-flip
->   run wrote fresh `branch-` rows alongside `ladderskip- = funding-not-onchain`. Open, and not
->   measured: `split_coin` refuses a laddered parent, so once every coin is laddered the exact-coin
->   path has no candidate — REQ-42's in-ladder fallback covers that for sats, but the RGB arm of
->   Lightning pay refuses the in-ladder lane outright, so the coloured exact lane may have no route
->   left after the flip. That must be measured before the flip ships.
+>   **RESOLVED by deleting the producer.** That paragraph used to read "the `branch-` shape is not
+>   even legacy-only: `ensure_exact_coin` falls back to `split_coin`, so the lane is still a
+>   PRODUCER". It no longer is. `split_coin` is DELETED, `ensure_exact_coin` refuses instead of
+>   minting, and `ParentShape::Unladdered` is gone from the enum so the compiler — not a reviewer —
+>   found all eight routes into it. The residual flagged here (the coloured exact Lightning lane
+>   losing its last route) is now the stated behaviour rather than an open question: the exact lane
+>   refuses and REQ-42's non-exact in-ladder fallback carries sats. **The RGB arm of Lightning pay
+>   still refuses the in-ladder lane outright, so coloured EXACT pay has no route — that is a real
+>   gap, and it is the LN lane's to close, not the split lane's.**
 > * **`FLAT_RGB_CARRIER` GAINS a producer at the flip rather than losing one.** The `was_colored`
 >   error arm is unreachable while `colored_ladder` is false; with it true, a carrier the coloured
 >   builder refuses records the reason. The class is measurably non-empty: every pre-flip
