@@ -1,2 +1,9 @@
 [toolchain]
-channel = "1.83.0"
+# **[#162] Bumped from 1.83.0.** The pin could no longer build its own dependency tree: a transitive
+# dependency requires `edition2024`, which 1.83 cannot parse ("the package requires the Cargo feature
+# called `edition2024`"). That made the wasm packages UNBUILDABLE at their pinned toolchain — so the
+# shipped artifacts could only ever be as old as the last toolchain that worked, which is why they
+# still carry no `disclosure` field while the shared library has built one for months.
+#
+# Matching the workspace toolchain keeps one Rust version across the repo rather than two that drift.
+channel = "stable"

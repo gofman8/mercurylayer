@@ -720,6 +720,15 @@ namespace lockbox {
                     if (!disclosure.has_value()) {
                         return crow::response(400, "disclosure present but malformed");
                     }
+                } else {
+                    // **[#162] SAY SO WHEN THE GATE DOES NOT RUN.**
+                    //
+                    // Until this line, "the binding passed" and "there was nothing to bind" were the
+                    // same observation from outside: a bound request logs WITNESS_BIND_MATCH and an
+                    // unbound one logs nothing at all, so a coverage ratio counted matches against
+                    // requests and had no way to name WHICH path was unbound. That is the shape that
+                    // let a partially wired gate read as a working one.
+                    CROW_LOG_WARNING << "WITNESS_BIND_ABSENT statechain " << statechain_id;
                 }
 
                 // [REQ-61] The owner's authorisation for THIS signing round. Optional on the wire
