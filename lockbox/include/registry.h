@@ -31,8 +31,17 @@ namespace registry {
 /// (REQ-65) — never from a client assertion, and never at a client-supplied index (REQ-61(a)).
 struct Leaf {
     std::string statechain_id;
-    /// Empty for a node whose parent is the root itself.
-    std::string parent_statechain_id;
+    /// **[REQ-56a] EVERY parent, because a node can genuinely have several.**
+    ///
+    /// Empty for a node whose parent is the root itself. More than one for the child of a COMBINE:
+    /// that transaction spends N coins into M children, so all N have stopped existing and all N
+    /// are parents of each child. Measured on the live lane, where a 4-input migration-hatch
+    /// combine produced exactly this shape.
+    ///
+    /// A single-parent field is not a simplification of this, it is a wrong answer: it marks ONE
+    /// input as spent and leaves the other N-1 looking untouched, so each stays in its own frontier
+    /// and a collapse is required to pay coins whose value already moved into the children.
+    std::vector<std::string> parents;
     /// The FULL funding value (REQ-60), not the exit value: the two tier rungs are never broadcast,
     /// so their burn is never realised and is not the SSP's to keep.
     uint64_t fund_value = 0;

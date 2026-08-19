@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "server.h"
 #include "../include/auth.h"
 #include "../include/witness.h"
@@ -526,12 +527,13 @@ namespace lockbox {
             // co-signature failed while the count says otherwise. A missing observation surfaces
             // later as a leaf the predicate refuses on, which is the safe direction.
             if (bound_txid) {
-                std::string parent_sid;
-                bool parent_found = false;
+                std::vector<std::string> parent_sids;
                 std::string owner_err;
                 if (bound_prevout_txid) {
-                    if (!db_manager::signed_tx_owner(*bound_prevout_txid, parent_sid, parent_found,
-                                                     owner_err)) {
+                    // ALL co-signers of the funding transaction (REQ-56a): a combine spends N coins,
+                    // so this child has N parents and every one of them has stopped existing.
+                    // Taking only the first leaves N-1 coins looking unspent and payable again.
+                    if (!db_manager::signed_tx_owners(*bound_prevout_txid, parent_sids, owner_err)) {
                         CROW_LOG_WARNING << "LEAF_PARENT_MISS statechain " << statechain_id << ": "
                                          << owner_err;
                     }
@@ -546,10 +548,9 @@ namespace lockbox {
                     // the frontier, and `C` is never required to pay it. A holder would be
                     // discharged without being paid, which is the single outcome REQ-56 exists to
                     // make impossible — and REQ-67 leaves them no recourse afterwards.
-                    if (parent_found && parent_sid == statechain_id) {
-                        parent_found = false;
-                        parent_sid.clear();
-                    }
+                    parent_sids.erase(
+                        std::remove(parent_sids.begin(), parent_sids.end(), statechain_id),
+                        parent_sids.end());
                 }
                 const int64_t prevout_value = bound_prevout_value;
                 if (prevout_value > 0) {
@@ -557,8 +558,7 @@ namespace lockbox {
                     if (!db_manager::observe_leaf(statechain_id, prevout_value,
                                                   bound_latch_key ? *bound_latch_key
                                                                   : std::vector<unsigned char>(),
-                                                  parent_found ? parent_sid : std::string(),
-                                                  leaf_err)) {
+                                                  parent_sids, leaf_err)) {
                         CROW_LOG_WARNING << "LEAF_OBSERVE_MISS statechain " << statechain_id << ": "
                                          << leaf_err;
                     }

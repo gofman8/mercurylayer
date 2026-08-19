@@ -161,6 +161,19 @@ namespace db_manager {
                 "released BOOLEAN NOT NULL DEFAULT false);");
             txn.exec(
                 "CREATE INDEX IF NOT EXISTS se_leaf_root ON se_leaf (root_statechain_id);");
+            // [REQ-56a] PARENTHOOD IS MANY-TO-ONE FROM THE CHILD'S SIDE. A combine spends N coins
+            // into M children, so each child has N parents and all N have stopped existing. Held in
+            // its own table because `se_leaf.parent_statechain_id` can hold exactly one, and one is
+            // not a simplification of N here — it is the answer that leaves N-1 coins looking
+            // unspent and payable a second time.
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS se_leaf_parent ( "
+                "child_statechain_id varchar(50) NOT NULL, "
+                "parent_statechain_id varchar(50) NOT NULL, "
+                "PRIMARY KEY (child_statechain_id, parent_statechain_id));");
+            txn.exec(
+                "CREATE INDEX IF NOT EXISTS se_leaf_parent_parent "
+                "ON se_leaf_parent (parent_statechain_id);");
             txn.exec(
                 "CREATE TABLE IF NOT EXISTS se_root ( "
                 "root_statechain_id varchar(50) PRIMARY KEY, "
@@ -1163,6 +1176,16 @@ namespace db_manager {
                 root_statechain_id,
                 fund_value,
                 pqxx::binarystring(exit_key.data(), exit_key.size()));
+            // [REQ-56a] The edge goes in the parent TABLE too. `load_leaves` reads the tree from
+            // there, so an establishment that wrote only the column would produce a set in which
+            // nothing is anyone's parent — every node in the frontier, every node paid, including
+            // the interior ones whose value already moved to their children.
+            if (!parent_statechain_id.empty() && parent_statechain_id != statechain_id) {
+                txn.exec_params(
+                    "INSERT INTO se_leaf_parent (child_statechain_id, parent_statechain_id) "
+                    "VALUES ($1, $2) ON CONFLICT DO NOTHING;",
+                    statechain_id, parent_statechain_id);
+            }
             txn.commit();
             return true;
         } catch (std::exception const& e) {
@@ -1174,7 +1197,7 @@ namespace db_manager {
     bool observe_leaf(const std::string& statechain_id,
                       int64_t prevout_value,
                       const std::vector<unsigned char>& exit_key_or_empty,
-                      const std::string& parent_statechain_id,
+                      const std::vector<std::string>& parent_statechain_ids,
                       std::string& error_message) {
         if (!exit_key_or_empty.empty() && exit_key_or_empty.size() != 32) {
             error_message = "exit_key must be 32 bytes when present";
@@ -1189,8 +1212,14 @@ namespace db_manager {
         // not the parent of another", so a self-parented leaf is its own parent, drops out of the
         // frontier, and `C` is never required to pay it. The caller's tier chain is four
         // transactions of one coin, which is how the live lane produced this row on the first run.
-        const std::string parent =
-            (parent_statechain_id == statechain_id) ? std::string() : parent_statechain_id;
+        std::vector<std::string> parents;
+        for (const auto& p : parent_statechain_ids) {
+            if (!p.empty() && p != statechain_id) parents.push_back(p);
+        }
+        // Deterministic, so the single-parent column below does not depend on caller order.
+        std::sort(parents.begin(), parents.end());
+        parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+        const std::string parent = parents.empty() ? std::string() : parents.front();
         try {
             pqxx::connection conn(getDatabaseConnectionString());
             if (!conn.is_open()) { error_message = "db closed"; return false; }
@@ -1242,6 +1271,14 @@ namespace db_manager {
                     prevout_value,
                     parent.empty() ? pqxx::zview() : pqxx::zview(parent));
             }
+            // Every parent, not just the column's one. `DO NOTHING` because a retried rung
+            // re-presents the same edges and a second row would say nothing new.
+            for (const auto& p : parents) {
+                txn.exec_params(
+                    "INSERT INTO se_leaf_parent (child_statechain_id, parent_statechain_id) "
+                    "VALUES ($1, $2) ON CONFLICT DO NOTHING;",
+                    statechain_id, p);
+            }
             txn.commit();
             return true;
         } catch (std::exception const& e) {
@@ -1265,11 +1302,17 @@ namespace db_manager {
             for (const auto& r : rows) {
                 registry::Leaf l;
                 l.statechain_id = r[0].as<std::string>();
-                l.parent_statechain_id = r[1].as<std::string>();
                 l.fund_value = static_cast<uint64_t>(r[2].as<int64_t>());
                 pqxx::binarystring key(r[3]);
                 l.exit_key.assign(key.data(), key.data() + key.size());
                 l.released = r[4].as<bool>();
+                // EVERY parent (REQ-56a). The single column on `se_leaf` is kept for diagnostics
+                // only; reading the tree from it would reinstate the exact defect this closes.
+                auto prows = txn.exec_params(
+                    "SELECT parent_statechain_id FROM se_leaf_parent "
+                    "WHERE child_statechain_id = $1 ORDER BY parent_statechain_id;",
+                    l.statechain_id);
+                for (const auto& pr : prows) l.parents.push_back(pr[0].as<std::string>());
                 out.push_back(std::move(l));
             }
             txn.commit();

@@ -267,13 +267,13 @@ namespace db_manager {
     /// because a disclosure naming a smaller prevout does not reproduce the session — BIP-341 folds
     /// the prevout amount into the sighash, which is the refusal `sdk92` case (b1) exercises.
     ///
-    /// `parent_statechain_id` is resolved from `signed_tx_owner` of the outpoint this rung spends —
+    /// `parent_statechain_ids` is resolved from `signed_tx_owners` of the outpoint this rung spends —
     /// SE-authored, never client-asserted. Empty when the funding transaction is one the SE never
     /// co-signed, which is exactly what a ROOT looks like from inside the SE.
     bool observe_leaf(const std::string& statechain_id,
                       int64_t prevout_value,
                       const std::vector<unsigned char>& exit_key_or_empty,
-                      const std::string& parent_statechain_id,
+                      const std::vector<std::string>& parent_statechain_ids,
                       std::string& error_message);
 
     /// Every leaf recorded under a root. The caller computes the frontier from this

@@ -46,7 +46,7 @@ registry::Leaf leaf(const std::string& id, const std::string& parent, uint64_t v
                     bool released = false) {
     registry::Leaf l;
     l.statechain_id = id;
-    l.parent_statechain_id = parent;
+    if (!parent.empty()) l.parents.push_back(parent);
     l.fund_value = v;
     l.exit_key = key(k);
     l.released = released;

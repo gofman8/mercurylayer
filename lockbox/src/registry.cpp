@@ -25,8 +25,11 @@ std::vector<Leaf> frontier(const std::vector<Leaf>& nodes) {
     // disappear from its own frontier by accident.
     std::unordered_set<std::string> is_parent;
     for (const auto& n : nodes) {
-        if (!n.parent_statechain_id.empty() && n.parent_statechain_id != n.statechain_id) {
-            is_parent.insert(n.parent_statechain_id);
+        for (const auto& p : n.parents) {
+            // Self-parenthood is ignored rather than trusted: a coin's own tier chain is several
+            // transactions under one sid, so a naive resolver produces it, and a node that is its
+            // own parent would delete itself from its own frontier and never be paid.
+            if (!p.empty() && p != n.statechain_id) is_parent.insert(p);
         }
     }
 
@@ -54,12 +57,16 @@ SetError validate(const std::vector<Leaf>& nodes) {
     for (const auto& n : nodes) {
         if (n.exit_key.empty()) return SetError::MissingExitKey;
         if (n.exit_key.size() != 32) return SetError::BadExitKeyLength;
-        if (!n.parent_statechain_id.empty() &&
-            ids.find(n.parent_statechain_id) == ids.end()) {
-            // The SE's view of this tree is incomplete. A frontier computed from it could mark a
-            // node as a leaf that actually has children, dropping a real obligation — so refuse
-            // rather than decide on partial state.
-            return SetError::ParentNotInSet;
+        for (const auto& p : n.parents) {
+            // EVERY named parent must be present, not merely the first. A combine's child names all
+            // of its inputs, and a set missing even one of them is a set in which that input still
+            // looks unspent — so it would sit in a frontier and be paid for a second time.
+            if (!p.empty() && ids.find(p) == ids.end()) {
+                // The SE's view of this tree is incomplete. A frontier computed from it could mark
+                // a node as a leaf that actually has children, dropping a real obligation — so
+                // refuse rather than decide on partial state.
+                return SetError::ParentNotInSet;
+            }
         }
     }
     return SetError::Ok;

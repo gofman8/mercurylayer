@@ -69,6 +69,12 @@ int main() {
             pqxx::work txn(conn);
             txn.exec_params(
                 "DELETE FROM se_release_nonce WHERE statechain_id LIKE $1;", r + "%");
+            // Parent edges too. A leaked edge from an earlier run makes a node interior that this
+            // run never made interior, so it silently drops out of the frontier — a stale row
+            // deciding the answer, which is how a passing suite hides a real defect.
+            txn.exec_params(
+                "DELETE FROM se_leaf_parent WHERE child_statechain_id LIKE $1 "
+                "   OR parent_statechain_id LIKE $1;", r + "%");
             txn.exec_params("DELETE FROM se_leaf WHERE root_statechain_id = $1;", r);
             txn.exec_params("DELETE FROM se_root WHERE root_statechain_id = $1;", r);
             txn.commit();
@@ -222,7 +228,7 @@ int main() {
         // need a placeholder exit key, and a 32-byte zero key is a well-formed key nobody controls:
         // a collapse could "pay" the leaf into an unspendable output and the predicate would call
         // itself satisfied.
-        check(db_manager::observe_leaf(obs, 150000, {}, "", err),
+        check(db_manager::observe_leaf(obs, 150000, {}, {}, err),
               "a value-only observation succeeds");
         {
             std::vector<registry::Leaf> leaves;
@@ -232,7 +238,7 @@ int main() {
 
         // The key-bearing rung establishes. This is the flat backup in the measured trace: it spends
         // `F` (150_000) and pays the owner's key, so it carries BOTH facts.
-        check(db_manager::observe_leaf(obs, 150000, key(0x6b), "", err),
+        check(db_manager::observe_leaf(obs, 150000, key(0x6b), {}, err),
               "a key-bearing observation establishes the leaf");
         {
             std::vector<registry::Leaf> leaves;
@@ -246,7 +252,7 @@ int main() {
         // THE RULE REQ-60 FORCES. The state tier spends 148_770 and pays the SAME key. Assigning
         // would ratchet the leaf DOWN to the exit value and underpay this holder by 1_845 sats in a
         // collapse — the burn that is never realised because the rungs are never broadcast.
-        check(db_manager::observe_leaf(obs, 148770, key(0x6b), "", err),
+        check(db_manager::observe_leaf(obs, 148770, key(0x6b), {}, err),
               "a later, SMALLER rung is observed");
         {
             std::vector<registry::Leaf> leaves;
@@ -256,7 +262,7 @@ int main() {
         }
 
         // And a LARGER one still raises it, so the rule is a maximum rather than a first-write.
-        check(db_manager::observe_leaf(obs, 151000, key(0x6b), "", err), "a larger rung is observed");
+        check(db_manager::observe_leaf(obs, 151000, key(0x6b), {}, err), "a larger rung is observed");
         {
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(obs, leaves, err), "load after the larger rung");
@@ -266,7 +272,7 @@ int main() {
 
         // The exit key is WRITE-ONCE. A re-pointable payout key is a redirectable payout, and the
         // party able to re-point it is the operator the frontier exists to be checked against.
-        check(db_manager::observe_leaf(obs, 151000, key(0xff), "", err),
+        check(db_manager::observe_leaf(obs, 151000, key(0xff), {}, err),
               "an observation naming a DIFFERENT key succeeds");
         {
             std::vector<registry::Leaf> leaves;
@@ -280,14 +286,15 @@ int main() {
         // under one sid, so resolving a later rung's prevout finds the same coin. A self-parented
         // leaf is the parent of another node (itself), so it drops OUT of the frontier and `C` is
         // never required to pay it — a holder discharged without being paid.
-        check(db_manager::observe_leaf(obs, 151000, key(0x6b), obs, err),
+        check(db_manager::observe_leaf(obs, 151000, key(0x6b), {obs}, err),
               "an observation naming the leaf as its own parent succeeds");
         {
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(obs, leaves, err), "load after the self-parent attempt");
             const auto self_parented =
                 std::count_if(leaves.begin(), leaves.end(), [&](const registry::Leaf& l) {
-                    return l.statechain_id == obs && l.parent_statechain_id == obs;
+                    return l.statechain_id == obs &&
+                           std::find(l.parents.begin(), l.parents.end(), obs) != l.parents.end();
                 });
             check(self_parented == 0, "the leaf is NOT its own parent");
         }
@@ -295,18 +302,52 @@ int main() {
         // A child observed under a known parent inherits the parent's ROOT, so the frontier of a
         // root finds descendants the SE never saw named as belonging to it.
         const std::string kid = root + "_OBSKID";
-        check(db_manager::observe_leaf(kid, 90000, key(0xcd), obs, err), "a child is observed");
+        check(db_manager::observe_leaf(kid, 90000, key(0xcd), {obs}, err), "a child is observed");
         {
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(obs, leaves, err), "load the parent's root");
             check(leaves.size() == 2, "the child joined its PARENT's root, not its own");
         }
 
+        // [REQ-56a] A child of a COMBINE names EVERY input. All of them are parents, so all of them
+        // leave the frontier — and the child stays. Recording one would leave the others looking
+        // unspent, and a collapse would be required to pay coins whose value already moved here.
+        {
+            const std::string p1 = root + "_CIN1";
+            const std::string p2 = root + "_CIN2";
+            const std::string kid2 = root + "_CKID";
+            check(db_manager::observe_leaf(p1, 1500, key(0x11), {}, err), "combine input 1");
+            check(db_manager::observe_leaf(p2, 1500, key(0x22), {p1}, err), "combine input 2");
+            check(db_manager::observe_leaf(kid2, 2700, key(0x33), {p1, p2}, err),
+                  "the child names BOTH inputs");
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(p1, leaves, err), "load the combine's root");
+            const auto kid_it = std::find_if(leaves.begin(), leaves.end(),
+                                             [&](const registry::Leaf& l) {
+                                                 return l.statechain_id == kid2;
+                                             });
+            check(kid_it != leaves.end(), "the child is in the set");
+            check(kid_it != leaves.end() && kid_it->parents.size() == 2,
+                  "the child carries BOTH parents, not one");
+            const auto front = registry::frontier(leaves);
+            const auto in_frontier = [&](const std::string& id) {
+                return std::any_of(front.begin(), front.end(), [&](const registry::Leaf& l) {
+                    return l.statechain_id == id;
+                });
+            };
+            check(!in_frontier(p1), "input 1 left the frontier");
+            check(!in_frontier(p2), "input 2 left the frontier — the defect this closes");
+            check(in_frontier(kid2), "the child is in the frontier");
+            purge(p1);
+            purge(p2);
+            purge(kid2);
+        }
+
         {
             std::vector<unsigned char> shortkey(31, 0xee);
-            check(!db_manager::observe_leaf(root + "_OBSSHORT", 100, shortkey, "", err),
+            check(!db_manager::observe_leaf(root + "_OBSSHORT", 100, shortkey, {}, err),
                   "a 31-byte exit key is refused here too");
-            check(!db_manager::observe_leaf(root + "_OBSZERO", 0, key(0xee), "", err),
+            check(!db_manager::observe_leaf(root + "_OBSZERO", 0, key(0xee), {}, err),
                   "a zero prevout value is refused");
         }
         purge(obs);
