@@ -1592,6 +1592,18 @@ next cycle's migrations, or the document MUST stop describing the cycle as self-
 recorded as a requirement rather than a note because the liquidity claim in §5.5.2 rests on the
 recycling: if the residue can leave as change, the standing float is a floor and not an estimate.
 
+**Choosing between those two is the operator's call, and it cannot be made on an unmeasured
+property. So `collapse_grant` now MEASURES it and enforces the half that is checkable.** The value a
+round recovers is exactly what the RELEASED frontier leaves were worth — they migrated, so they are
+not paid on chain — which is the mirror image of what REQ-56 requires to be paid. When a grant
+request NAMES the next root's key, the SE requires the outputs paying it to carry at least that
+recovered value and refuses otherwise, naming both numbers; a cycle that routes its residue to change
+is not the self-funding cycle REQ-53 describes. When no next root is named the grant still stands —
+every undischarged holder is paid, which is a valid collapse — but the response reports
+`self_funding: false` alongside the recovered amount, and the SE logs it. The property is therefore
+counted on every round rather than assumed on any, which is what makes the §5.5.2 figures checkable
+against what operators actually do.
+
 #### 5.5.7 What this section does NOT know
 
 * **`W` is unmodelled.** Nothing in this document derives a round window; it is an operating choice,
@@ -2216,7 +2228,7 @@ unbuilt sections, and they are marked as such in place.
 | REQ-61 (§5.4, the owner latch) | **ARMING BUILT, ENFORCEMENT NOT.** The key is read structurally from the unique P2TR output and stored write-once (`ON CONFLICT DO NOTHING`); a second arming with a different key is a no-op. Measured live: 4 bound co-signatures → exactly 1 `LATCH_ARMED`. **Nothing yet refuses a co-signature for want of a BIP-340 by that key** — and REQ-61(b) must be settled first, since the payer co-signs the payee's tiers before the payee holds anything |
 | REQ-68 (§5.4, the coin binding) | **BUILT and MEASURED, coverage OPEN.** `sdk92` half (b) — a self-consistent disclosure built from keys unrelated to the coin, submitted under the coin's own sid, refused `403 AGGREGATE_MISMATCH` while the coin's own tiers are served in the same run; `lockbox/tests/test_aggregate_derive.cpp` (13 checks, incl. an adversary that cannot match a victim's aggregate); the SE↔client differential in `ci-guards/tests/emit_aggregate_vectors.rs`. Transfer-safety measured separately: the aggregate is invariant under `/keyupdate`, and a drifted `t2` is refused live. **Open: the check FAILS OPEN for 99.5 % of key slots — see V-7** |
 | REQ-53, REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no freeze at grant time. See the status banner in §5.4 |
-| REQ-69…REQ-74 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written. **REQ-74 is a live defect rather than a design note**: it records that nothing constrains `f_next`, so REQ-53's "there is no separate deposit" is currently unenforced |
+| REQ-69…REQ-74 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written. **REQ-74 now has evidence**: `collapse_grant` computes the recovered value (what the released frontier leaves were worth), enforces `f_next >= recovered` whenever a request names the next root's key, and reports `self_funding: false` with the recovered amount when it does not — measured by `lockbox/tests/collapse_grant_probe.py` (underfunded by ONE satoshi -> 403 naming both numbers; funded in full -> granted with `self_funding: true`; released leaf and no next root -> granted, `recovered: 2000`, `self_funding: false`) |
 
 **Suite sizes.** Workspace unit + guard tests: **812**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.

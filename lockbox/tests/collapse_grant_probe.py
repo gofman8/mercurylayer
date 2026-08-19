@@ -81,3 +81,33 @@ post(build(FUND[0], FUND[1], [(2999,K1),(2000,K2)]), "one satoshi short     ")
 post(build("bb"*32, 0, [(3000,K1),(2000,K2)]), "wrong funding outpoint")
 # (d) omits KID2 entirely -> REFUSE
 post(build(FUND[0], FUND[1], [(3000,K1)]), "omits a leaf          ")
+
+# ── [REQ-74] SELF-FUNDING ────────────────────────────────────────────────────────────────────────
+# Mark KID2 released: it migrated, so it is NOT paid on chain and its 2000 is what the round
+# RECOVERS. REQ-53 says that value funds the next root. These three cases are the difference
+# between a claim and an invariant.
+NEXT = "44" * 32
+subprocess.run(["docker","exec","-i","mercurylayer-db_lockbox-1","psql","-U","postgres","-d","enclave",
+                "-c", f"UPDATE se_leaf SET released = true WHERE statechain_id = '{KID2}'; "
+                      f"DELETE FROM se_root WHERE root_statechain_id LIKE 'cg%';"],
+               capture_output=True)
+
+def post2(txhex, label, extra):
+    body = {"root_statechain_id": ROOT,
+            "disclosure": {"unsigned_tx": txhex, "input_index":0,
+                           "prevout_values":[6000], "prevout_spks":["5120"+"33"*32],
+                           "agg_pubkey":"33"*32, "agg_nonce":"00"*66,
+                           "blinding_factor":"00"*32, "out_tweak":"00"*32, "hash_type":1}}
+    body.update(extra)
+    r = subprocess.run(["curl","-s","-w","\\n%{http_code}","-X","POST","http://localhost:18080/collapse_grant",
+                        "-H","Content-Type: application/json","-d",json.dumps(body)],
+                       capture_output=True, text=True)
+    out = r.stdout.strip().rsplit("\n",1)
+    print(f"{label}: HTTP {out[-1]}  {out[0][:170]}")
+
+# (e) no next root named: still a valid collapse, but the round is NOT self-funding and says so.
+post2(build(FUND[0], FUND[1], [(3000,K1),(3000,"99"*32)]), "released, no next root", {})
+# (f) names a next root, funds it with LESS than recovered -> REFUSE.
+post2(build(FUND[0], FUND[1], [(3000,K1),(1999,NEXT)]), "next root underfunded ", {"next_root_key": NEXT})
+# (g) names a next root and funds it in full -> GRANT, self_funding true.
+post2(build(FUND[0], FUND[1], [(3000,K1),(2000,NEXT)]), "next root funded fully", {"next_root_key": NEXT})

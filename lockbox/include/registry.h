@@ -64,6 +64,16 @@ std::vector<Leaf> frontier(const std::vector<Leaf>& nodes);
 /// transaction paying only one of them is short. Released nodes contribute nothing.
 std::map<std::string, uint64_t> owed(const std::vector<Leaf>& nodes);
 
+/// **[REQ-74] The value the round RECOVERS: unreleased leaves are paid on chain, released ones are
+/// not, so what the released ones were worth is exactly what stays with the operator.**
+///
+/// REQ-53 claims the cycle self-funds — `C.out[0]` funds the next root, so a round retires and
+/// re-funds in one transaction and there is no separate deposit. That claim is precisely the claim
+/// that THIS value ends up in the next root rather than leaving as change. Nothing enforced it,
+/// which is why REQ-74 exists; making it computable is what lets a round be checked against it
+/// instead of described as satisfying it.
+uint64_t released_value(const std::vector<Leaf>& nodes);
+
 /// Why a leaf set cannot be used for a predicate decision. Any of these MUST fail closed: a
 /// malformed set is not a set with zero obligations.
 enum class SetError {

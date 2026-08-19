@@ -1092,12 +1092,63 @@ namespace lockbox {
                 return crow::response(500, "the predicate passed but the freeze failed: " + err);
             }
 
+            // ── [REQ-74] IS THIS ROUND ACTUALLY SELF-FUNDING? ──────────────────────────────────
+            //
+            // REQ-53 says the cycle self-funds: `C.out[0]` funds the next root, so a round retires
+            // and re-funds in one transaction and there is no separate deposit. Nothing enforced
+            // that. The recovered value — what the RELEASED frontier leaves were worth, since they
+            // are the ones not paid on chain — could leave as operator change and the predicate
+            // would not notice, because REQ-56 only asks whether the undischarged were paid.
+            //
+            // REQ-74 offers two ways out: constrain `f_next`, or stop calling the cycle
+            // self-funding. Choosing between them is the operator's call, not this route's — but it
+            // cannot be made on an unmeasured property, and §5.5.2's liquidity figures rest on the
+            // recycling being real. So: when the caller NAMES the next root's key, the SE enforces
+            // that the output paying it carries at least the recovered value, and refuses a round
+            // that claims to be self-funding while routing the residue elsewhere. When the caller
+            // names nothing, the grant still stands — it is a valid collapse, everyone owed is paid
+            // — and both the response and the log say the round was NOT self-funding, so the
+            // property is counted rather than assumed.
+            const uint64_t recovered = registry::released_value(leaves);
+            bool self_funding = false;
+            if (body.count("next_root_key")) {
+                const auto next_key = utils::ParseHex(std::string(body["next_root_key"].s()));
+                if (next_key.size() != 32) {
+                    return crow::response(400, "next_root_key must be a 32-byte x-only key");
+                }
+                uint64_t to_next = 0;
+                for (const auto& o : parsed->vout) {
+                    if (const auto k = tx::p2tr_xonly_key(o.script_pubkey); k && *k == next_key) {
+                        to_next += o.value;
+                    }
+                }
+                if (to_next < recovered) {
+                    CROW_LOG_WARNING << "COLLAPSE_NOT_SELF_FUNDING root " << root_sid << " recovered "
+                                     << recovered << " to_next " << to_next;
+                    return crow::response(
+                        403,
+                        "this round names a next root but does not fund it with what the round "
+                        "recovered (REQ-74): the released leaves were worth " +
+                            std::to_string(recovered) + " and the named key receives " +
+                            std::to_string(to_next) +
+                            ". Refusing — a cycle that routes its residue to change is not the "
+                            "self-funding cycle REQ-53 describes, and §5.5.2's float rests on it.");
+                }
+                self_funding = true;
+            } else if (recovered > 0) {
+                CROW_LOG_WARNING << "COLLAPSE_UNDECLARED_NEXT_ROOT root " << root_sid
+                                 << " recovered " << recovered << " (round is NOT self-funding)";
+            }
+
             CROW_LOG_INFO << "COLLAPSE_GRANTED root " << root_sid << " obligations "
-                          << obligations.size();
+                          << obligations.size() << " recovered " << recovered << " self_funding "
+                          << (self_funding ? 1 : 0);
             crow::json::wvalue result;
             result["granted"] = true;
             result["frozen"] = true;
             result["obligations"] = static_cast<int>(obligations.size());
+            result["recovered"] = static_cast<int64_t>(recovered);
+            result["self_funding"] = self_funding;
             // Stated rather than implied: a caller that treats a verdict as a signature would
             // broadcast an unsigned transaction and lose the round.
             result["partial_sig"] = nullptr;

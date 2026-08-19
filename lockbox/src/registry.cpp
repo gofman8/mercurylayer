@@ -49,6 +49,18 @@ std::map<std::string, uint64_t> owed(const std::vector<Leaf>& nodes) {
     return out;
 }
 
+uint64_t released_value(const std::vector<Leaf>& nodes) {
+    uint64_t total = 0;
+    // The FRONTIER only, and the mirror image of `owed`: together the two partition the frontier's
+    // value into "must be paid on chain" and "recovered by the operator". A released INTERIOR node
+    // is not counted, for the same reason an unreleased one is not owed — its value already moved
+    // to its children.
+    for (const auto& n : frontier(nodes)) {
+        if (n.released) total += n.fund_value;
+    }
+    return total;
+}
+
 const char* describe(SetError e) {
     switch (e) {
         case SetError::Ok: return "ok";
