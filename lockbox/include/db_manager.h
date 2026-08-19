@@ -147,8 +147,13 @@ namespace db_manager {
     /// the payee's child tiers, so the payer knows those txids before anyone else. The frontier
     /// decides who gets paid in a collapse (REQ-56), so an edge is not a bookkeeping detail.
     ///
-    /// This table is safe as an audit trail of what the SE signed. It is NOT yet safe as an
-    /// authority on parenthood. See the open question filed against REQ-56 before building on it.
+    /// **[#157] Now safe as an authority on parenthood — the gap this warned about is closed.**
+    /// The caveat said a row attests "signed under this sid" and not "is a tier of this coin",
+    /// because the SE never learned the coin's aggregate. REQ-68 gave it one: the SE DERIVES the
+    /// aggregate at keygen, stores it write-once, and refuses a disclosure whose `agg_pubkey`
+    /// differs (`sdk92` case (b2), HTTP 403 — a truthful disclosure of the WRONG coin, refused).
+    /// A row therefore now means the SE co-signed a transaction of THIS coin, which is what a
+    /// parent edge needs.
     ///
     /// Idempotent on `txid`: a retried signing round re-presents the same transaction, and the
     /// retry-safety cache deliberately re-serves it. A second row would be a second claim about the
@@ -227,6 +232,38 @@ namespace db_manager {
                         int64_t fund_value,
                         const std::vector<unsigned char>& exit_key,
                         std::string& error_message);
+
+    /// **[#157] OBSERVE a leaf from one witnessed co-signature. The establishment path that runs
+    /// on the live lane, where `establish_leaf` is the all-at-once form the tests use.**
+    ///
+    /// Called once per produced co-signature, because that is the only moment the SE holds verified
+    /// facts about the coin: the disclosure reproduced the session (REQ-57, now mandatory) and its
+    /// `agg_pubkey` matched the aggregate the SE derived at keygen (REQ-68), so the transaction is
+    /// this coin's and its amounts are committed by BIP-341 rather than asserted.
+    ///
+    /// **Why two facts arrive on different rungs, measured rather than assumed.** A 150_000-sat coin
+    /// on regtest shows the SE four co-signatures: the flat backup (prevout 150_000, pays the owner's
+    /// key), the trigger (prevout 150_000, pays back to the aggregate), the extension (prevout
+    /// 149_385, pays back), and the state tier (prevout 148_770, pays the owner's key). So the
+    /// **exit key** appears only on the rungs that hand control onward, and the **full funding
+    /// value** appears only on the rungs that spend `F` itself. Reading both off the state tier would
+    /// have recorded 148_155 as the funding value and underpaid that holder by 1_845 sats in a
+    /// collapse — precisely the burn REQ-60 says is never realised and is not the SSP's to keep.
+    ///
+    /// `fund_value` is therefore the MAXIMUM prevout value ever witnessed under this sid. Monotone,
+    /// so it does not depend on which rung is signed first (an earlier round already learned that
+    /// tier ordering is luck, not a property); and it cannot be driven DOWN by a malicious client,
+    /// because a disclosure naming a smaller prevout does not reproduce the session — BIP-341 folds
+    /// the prevout amount into the sighash, which is the refusal `sdk92` case (b1) exercises.
+    ///
+    /// `parent_statechain_id` is resolved from `signed_tx_owner` of the outpoint this rung spends —
+    /// SE-authored, never client-asserted. Empty when the funding transaction is one the SE never
+    /// co-signed, which is exactly what a ROOT looks like from inside the SE.
+    bool observe_leaf(const std::string& statechain_id,
+                      int64_t prevout_value,
+                      const std::vector<unsigned char>& exit_key_or_empty,
+                      const std::string& parent_statechain_id,
+                      std::string& error_message);
 
     /// Every leaf recorded under a root. The caller computes the frontier from this
     /// (`registry::frontier`) rather than the database doing it, so the rule stays testable without

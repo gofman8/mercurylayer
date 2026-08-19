@@ -205,6 +205,11 @@ namespace lockbox {
             // Set only on a successful bind, and consumed only after the signature commits below.
             std::optional<std::vector<unsigned char>> bound_txid;
             std::optional<std::vector<unsigned char>> bound_latch_key;
+            // [#157] The outpoint THIS rung spends, captured where the parsed transaction is in
+            // scope. Taken from the parsed bytes — the ones whose sighash was recomputed and whose
+            // session was byte-compared — so a caller cannot name one outpoint and sign another.
+            std::optional<std::vector<unsigned char>> bound_prevout_txid;
+            int64_t bound_prevout_value = 0;
             if (disclosure.has_value()) {
                 std::vector<unsigned char> bound_sighash;
                 std::string detail;
@@ -294,6 +299,15 @@ namespace lockbox {
                 const auto parsed_disclosure = tx::parse_hex(disclosure->unsigned_tx_hex);
                 if (parsed_disclosure) {
                     bound_txid = tx::txid(*parsed_disclosure);
+                    if (!parsed_disclosure->vin.empty()) {
+                        const auto& po_in = parsed_disclosure->vin[0].prevout;
+                        bound_prevout_txid =
+                            std::vector<unsigned char>(po_in.txid, po_in.txid + 32);
+                    }
+                    bound_prevout_value =
+                        disclosure->prevout_values.empty()
+                            ? 0
+                            : static_cast<int64_t>(disclosure->prevout_values[0]);
                     // [REQ-61] The latch key, read STRUCTURALLY from the money: the unique P2TR
                     // output. Ambiguous or absent yields nothing and the latch simply is not armed
                     // by this signature — refusing here would brick any shape the SE does not yet
@@ -322,7 +336,33 @@ namespace lockbox {
                                                 ? std::string()
                                                 : disclosure->prevout_spks_hex[0]);
                         const auto prevout_key = tx::p2tr_xonly_key(prevout_spk);
-                        if (!prevout_key || *prevout_key != po->xonly) {
+                        // **[#157] WHAT THIS RUNG ACTUALLY SHOWS THE SE.**
+                        //
+                        // REQ-56 needs two facts per leaf, and REQ-60 says they are NOT the same
+                        // number: `exit_key` (REQ-65, the state tier's payload key) and `fund_value`
+                        // (the FULL funding value, because the tier rungs are never broadcast so
+                        // their burn is never realised). Reading both off ONE rung would silently
+                        // record the exit value as the funding value and underpay every absentee in
+                        // a collapse by the burn — the failure REQ-60 exists to name.
+                        //
+                        // So before wiring `establish_leaf`, log what each rung witnesses: the
+                        // prevout value it spends, the payload value it pays, and whether it hands
+                        // control onward. The tier chain is F -> T -> X -> S, so the funding value
+                        // is visible only at the rung whose prevout IS `F`, while the exit key is
+                        // visible only at the rung that pays elsewhere. This line is what turns that
+                        // reasoning into a measurement.
+                        const uint64_t prevout_value =
+                            disclosure->prevout_values.empty() ? 0 : disclosure->prevout_values[0];
+                        const bool hands_control_on = !prevout_key || *prevout_key != po->xonly;
+                        CROW_LOG_INFO << "LEAF_OBSERVE statechain " << statechain_id
+                                      << " prevout_value=" << prevout_value
+                                      << " payload_value=" << po->value
+                                      << " burn=" << (prevout_value > po->value
+                                                          ? prevout_value - po->value : 0)
+                                      << " hands_control_on=" << (hands_control_on ? 1 : 0)
+                                      << " payload_key="
+                                      << utils::key_to_string(po->xonly.data(), po->xonly.size());
+                        if (hands_control_on) {
                             bound_latch_key = po->xonly;
                         } else {
                             CROW_LOG_INFO << "LATCH_SKIP_AGGREGATE statechain " << statechain_id
@@ -464,6 +504,64 @@ namespace lockbox {
                 if (!db_manager::record_signed_tx(*bound_txid, statechain_id, 0, rec_err)) {
                     CROW_LOG_WARNING << "WITNESS_BIND_INDEX_MISS statechain " << statechain_id
                                      << ": " << rec_err;
+                }
+            }
+
+            // ── [REQ-56/#157] RECORD THE LEAF, from the facts THIS co-signature witnessed ───────
+            //
+            // Same placement and same reason as the index above: only a co-signature that was
+            // actually produced leaves state behind. The two facts REQ-56 needs arrive on different
+            // rungs (see `observe_leaf` for the measurement), so this is called on EVERY bound rung
+            // and the database does the combining — the funding value ratchets UP, the exit key is
+            // written once by the first rung that hands control onward.
+            //
+            // The parent edge is resolved from the outpoint this rung spends, through the SE's own
+            // `se_signed_tx`. That became sound only when REQ-68 landed: before the SE derived the
+            // coin's aggregate, a bound row meant "signed under this sid" rather than "is a tier of
+            // this coin", and resolving parenthood through it would have let a caller graft a leaf
+            // onto a tree it does not belong to.
+            //
+            // A failure here does NOT fail the request, for the same reason the index does not: the
+            // signature is produced and counted, and refusing now would tell the client its
+            // co-signature failed while the count says otherwise. A missing observation surfaces
+            // later as a leaf the predicate refuses on, which is the safe direction.
+            if (bound_txid) {
+                std::string parent_sid;
+                bool parent_found = false;
+                std::string owner_err;
+                if (bound_prevout_txid) {
+                    if (!db_manager::signed_tx_owner(*bound_prevout_txid, parent_sid, parent_found,
+                                                     owner_err)) {
+                        CROW_LOG_WARNING << "LEAF_PARENT_MISS statechain " << statechain_id << ": "
+                                         << owner_err;
+                    }
+                    // **A COIN IS NOT ITS OWN PARENT.** Caught by running this: the first live row
+                    // came back with `parent_statechain_id = statechain_id`, because the tier chain
+                    // `F -> T -> X -> S` is FOUR transactions of ONE coin, and the SE signed each of
+                    // them under that same sid. Resolving the extension's prevout therefore finds
+                    // the trigger — same coin, no parent edge.
+                    //
+                    // Left in, this is not cosmetic. The frontier is "every node that is not the
+                    // parent of another", so a self-parented leaf is its own parent, drops out of
+                    // the frontier, and `C` is never required to pay it. A holder would be
+                    // discharged without being paid, which is the single outcome REQ-56 exists to
+                    // make impossible — and REQ-67 leaves them no recourse afterwards.
+                    if (parent_found && parent_sid == statechain_id) {
+                        parent_found = false;
+                        parent_sid.clear();
+                    }
+                }
+                const int64_t prevout_value = bound_prevout_value;
+                if (prevout_value > 0) {
+                    std::string leaf_err;
+                    if (!db_manager::observe_leaf(statechain_id, prevout_value,
+                                                  bound_latch_key ? *bound_latch_key
+                                                                  : std::vector<unsigned char>(),
+                                                  parent_found ? parent_sid : std::string(),
+                                                  leaf_err)) {
+                        CROW_LOG_WARNING << "LEAF_OBSERVE_MISS statechain " << statechain_id << ": "
+                                         << leaf_err;
+                    }
                 }
             }
 

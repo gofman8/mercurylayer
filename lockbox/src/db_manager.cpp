@@ -1113,6 +1113,85 @@ namespace db_manager {
         }
     }
 
+    bool observe_leaf(const std::string& statechain_id,
+                      int64_t prevout_value,
+                      const std::vector<unsigned char>& exit_key_or_empty,
+                      const std::string& parent_statechain_id,
+                      std::string& error_message) {
+        if (!exit_key_or_empty.empty() && exit_key_or_empty.size() != 32) {
+            error_message = "exit_key must be 32 bytes when present";
+            return false;
+        }
+        if (prevout_value <= 0) {
+            error_message = "prevout_value must be positive";
+            return false;
+        }
+        // **A LEAF IS NEVER ITS OWN PARENT.** Enforced HERE, at the layer that owns the invariant,
+        // and not only in the caller that first produced one: the frontier is "every node that is
+        // not the parent of another", so a self-parented leaf is its own parent, drops out of the
+        // frontier, and `C` is never required to pay it. The caller's tier chain is four
+        // transactions of one coin, which is how the live lane produced this row on the first run.
+        const std::string parent =
+            (parent_statechain_id == statechain_id) ? std::string() : parent_statechain_id;
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+
+            // The root is the far end of the parent chain, resolved INSIDE this transaction so a
+            // concurrent observation cannot leave a leaf pointing at a root that is being rewritten.
+            // A leaf whose parent the SE never co-signed is its own root — which is what a genuine
+            // root looks like from inside the SE, since its funding transaction is the depositor's.
+            std::string root = statechain_id;
+            if (!parent.empty()) {
+                const auto r = txn.exec_params(
+                    "SELECT root_statechain_id FROM se_leaf WHERE statechain_id = $1;", parent);
+                root = r.empty() ? parent : r[0][0].as<std::string>();
+            }
+
+            // exit_key is NOT NULL, so a first observation that carries no key cannot insert one.
+            // A 32-byte ZERO placeholder would be worse than useless: it is a well-formed key that
+            // no one controls, so a collapse could "pay" a leaf into an unspendable output and the
+            // predicate would call it satisfied. Instead the first key-bearing rung inserts, and
+            // value-only rungs before it raise the funding value of a row that already exists.
+            if (!exit_key_or_empty.empty()) {
+                txn.exec_params(
+                    "INSERT INTO se_leaf (statechain_id, parent_statechain_id, root_statechain_id, "
+                    "fund_value, exit_key) VALUES ($1, $2, $3, $4, $5) "
+                    "ON CONFLICT (statechain_id) DO UPDATE SET "
+                    // GREATEST, never assignment: the funding value is the largest prevout this coin
+                    // was ever witnessed spending, and a later rung spends a SMALLER one (the burn).
+                    // Assignment here would ratchet every leaf DOWN to its state tier's value, which
+                    // is the exact underpayment REQ-60 forbids.
+                    "  fund_value = GREATEST(se_leaf.fund_value, EXCLUDED.fund_value), "
+                    // Write-once, like the latch and the aggregate: a re-pointable exit key is a
+                    // redirectable payout, and the party who could re-point it is the operator the
+                    // frontier exists to be checked against.
+                    "  exit_key = COALESCE(se_leaf.exit_key, EXCLUDED.exit_key), "
+                    "  parent_statechain_id = "
+                    "     COALESCE(se_leaf.parent_statechain_id, EXCLUDED.parent_statechain_id);",
+                    statechain_id,
+                    parent.empty() ? pqxx::zview() : pqxx::zview(parent),
+                    root,
+                    prevout_value,
+                    pqxx::binarystring(exit_key_or_empty.data(), exit_key_or_empty.size()));
+            } else {
+                txn.exec_params(
+                    "UPDATE se_leaf SET fund_value = GREATEST(fund_value, $2), "
+                    "  parent_statechain_id = COALESCE(parent_statechain_id, $3) "
+                    "WHERE statechain_id = $1;",
+                    statechain_id,
+                    prevout_value,
+                    parent.empty() ? pqxx::zview() : pqxx::zview(parent));
+            }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     bool load_leaves(const std::string& root_statechain_id,
                      std::vector<registry::Leaf>& out,
                      std::string& error_message) {

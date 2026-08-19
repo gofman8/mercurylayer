@@ -15,6 +15,7 @@
 // comment, and that the single-use nonce is enforced by a constraint rather than by a check that
 // races.
 
+#include <algorithm>
 #include <pqxx/pqxx>
 
 #include <cstdio>
@@ -209,6 +210,109 @@ int main() {
             txn.commit();
         } catch (std::exception const&) {}
     }
+    // ---- [#157] observe_leaf: the establishment path that runs on the LIVE lane ----------------
+    //
+    // `establish_leaf` above takes every fact at once. The signing path never has them at once: a
+    // 150_000-sat coin shows the SE four co-signatures, and the exit key appears only on the rungs
+    // that hand control onward while the full funding value appears only on the rungs that spend
+    // `F`. These cases pin the two rules that difference forces.
+    {
+        const std::string obs = root + "_OBS";
+        // A value-only rung BEFORE any key-bearing rung must not conjure a row. Inserting one would
+        // need a placeholder exit key, and a 32-byte zero key is a well-formed key nobody controls:
+        // a collapse could "pay" the leaf into an unspendable output and the predicate would call
+        // itself satisfied.
+        check(db_manager::observe_leaf(obs, 150000, {}, "", err),
+              "a value-only observation succeeds");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load after value-only observation");
+            check(leaves.empty(), "a value-only observation creates NO row (no placeholder key)");
+        }
+
+        // The key-bearing rung establishes. This is the flat backup in the measured trace: it spends
+        // `F` (150_000) and pays the owner's key, so it carries BOTH facts.
+        check(db_manager::observe_leaf(obs, 150000, key(0x6b), "", err),
+              "a key-bearing observation establishes the leaf");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load after establishment");
+            check(leaves.size() == 1, "exactly one row");
+            check(leaves.size() == 1 && leaves[0].fund_value == 150000,
+                  "fund_value is the funding value");
+            check(leaves.size() == 1 && leaves[0].exit_key == key(0x6b), "exit_key is the payee's");
+        }
+
+        // THE RULE REQ-60 FORCES. The state tier spends 148_770 and pays the SAME key. Assigning
+        // would ratchet the leaf DOWN to the exit value and underpay this holder by 1_845 sats in a
+        // collapse — the burn that is never realised because the rungs are never broadcast.
+        check(db_manager::observe_leaf(obs, 148770, key(0x6b), "", err),
+              "a later, SMALLER rung is observed");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load after the smaller rung");
+            check(leaves.size() == 1 && leaves[0].fund_value == 150000,
+                  "fund_value did NOT ratchet down to the state tier's 148_770 (REQ-60)");
+        }
+
+        // And a LARGER one still raises it, so the rule is a maximum rather than a first-write.
+        check(db_manager::observe_leaf(obs, 151000, key(0x6b), "", err), "a larger rung is observed");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load after the larger rung");
+            check(leaves.size() == 1 && leaves[0].fund_value == 151000,
+                  "fund_value ratcheted UP to the largest prevout witnessed");
+        }
+
+        // The exit key is WRITE-ONCE. A re-pointable payout key is a redirectable payout, and the
+        // party able to re-point it is the operator the frontier exists to be checked against.
+        check(db_manager::observe_leaf(obs, 151000, key(0xff), "", err),
+              "an observation naming a DIFFERENT key succeeds");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load after the re-point attempt");
+            check(leaves.size() == 1 && leaves[0].exit_key == key(0x6b),
+                  "exit_key did NOT move to the second key (write-once)");
+        }
+
+        // A leaf must never be its OWN parent. The live lane produced exactly this row before the
+        // signing path filtered it: the tier chain is four transactions of one coin, all signed
+        // under one sid, so resolving a later rung's prevout finds the same coin. A self-parented
+        // leaf is the parent of another node (itself), so it drops OUT of the frontier and `C` is
+        // never required to pay it — a holder discharged without being paid.
+        check(db_manager::observe_leaf(obs, 151000, key(0x6b), obs, err),
+              "an observation naming the leaf as its own parent succeeds");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load after the self-parent attempt");
+            const auto self_parented =
+                std::count_if(leaves.begin(), leaves.end(), [&](const registry::Leaf& l) {
+                    return l.statechain_id == obs && l.parent_statechain_id == obs;
+                });
+            check(self_parented == 0, "the leaf is NOT its own parent");
+        }
+
+        // A child observed under a known parent inherits the parent's ROOT, so the frontier of a
+        // root finds descendants the SE never saw named as belonging to it.
+        const std::string kid = root + "_OBSKID";
+        check(db_manager::observe_leaf(kid, 90000, key(0xcd), obs, err), "a child is observed");
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(obs, leaves, err), "load the parent's root");
+            check(leaves.size() == 2, "the child joined its PARENT's root, not its own");
+        }
+
+        {
+            std::vector<unsigned char> shortkey(31, 0xee);
+            check(!db_manager::observe_leaf(root + "_OBSSHORT", 100, shortkey, "", err),
+                  "a 31-byte exit key is refused here too");
+            check(!db_manager::observe_leaf(root + "_OBSZERO", 0, key(0xee), "", err),
+                  "a zero prevout value is refused");
+        }
+        purge(obs);
+        purge(kid);
+    }
+
     purge(root);
 
     if (failures) {
