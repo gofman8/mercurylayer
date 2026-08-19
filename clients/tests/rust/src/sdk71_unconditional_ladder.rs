@@ -5,10 +5,12 @@
 //! (RGB carrier / [B0] un-broadcast funding / legacy no-aggregate). Proven here on the live stack:
 //!
 //!   1. a plain deposit is laddered by claim() alone — no `establish` call anywhere in this test;
-//!   2. an RGB carrier is NOT laddered (terminal freeze), and the skip is now SURFACED as
-//!      `WalletEvent::LadderSkipped { reason: RgbCarrier }` instead of being silent;
-//!   3. the carrier still transfers off-chain (colored split), i.e. the flat lane still works for
-//!      the coins that need it;
+//!   2. [#162] an RGB carrier is laddered too, and its ladder is COLOURED — one tier, one
+//!      consignment. It carries no flat-lane record and is never surfaced as `LadderSkipped`;
+//!      this test asserted the opposite (a "terminal freeze" leaving carriers flat) until the
+//!      one-coin-shape flip made that lane nonexistent;
+//!   3. the carrier still transfers off-chain, i.e. the flat lane still works for the coins that
+//!      genuinely need it — now only the migration hatch's sub-floor carriers and [B0] sub-coins;
 //!   4. a laddered coin can NEVER be conveyed at `protocol_version = 0`:
 //!        4a. an unreadable ladder record is refused, not silently degraded to flat (the old code
 //!            folded a DB read error into "no ladder" and the receiver then rejected the message
@@ -191,29 +193,57 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK71 - plain deposit {plain_sid} laddered by claim() alone");
 
-    // ---- 3. The carrier is NOT laddered, and the skip is SURFACED (the UX defect this closes). ---
+    // ---- 3. The carrier is laddered TOO, and its ladder is COLOURED. ---------------------------
+    //
+    // [#162] This section asserted the OPPOSITE until now: that an RGB carrier is left on the flat
+    // lane under a "terminal freeze", recorded as `rgb-carrier` and surfaced as `LadderSkipped`.
+    // One coin shape removed that shape — a carrier is laddered like any other coin, every tier
+    // coloured — so those assertions pinned a lane that no longer exists, and this test kept
+    // passing only because it ran before the flip. They are REPLACED, not deleted: the property
+    // worth pinning is that a carrier now reaches the same place a plain coin does.
     for c in &carriers {
         let sid = c.statechain_id.clone().ok_or(anyhow!("carrier has no sid"))?;
-        assert!(
-            mercuryrustlib::tesr::load(&cc, "sdk71_alice", &sid).await?.is_none(),
-            "the RGB carrier {sid} must NOT be laddered (terminal freeze)"
-        );
+        // The coloured half attaches tier by tier, so poll claim() instead of asserting on the
+        // first pass — a slow attach and a missing one are different failures.
+        let mut colored = None;
+        for _ in 0..40 {
+            if let Some(b) = mercuryrustlib::tesr::load(&cc, "sdk71_alice", &sid).await? {
+                if b.rgb.is_some() {
+                    colored = Some(b);
+                    break;
+                }
+            }
+            alice.claim().await?;
+        }
+        let bundle =
+            colored.unwrap_or_else(|| panic!("the RGB carrier {sid} never got a COLOURED ladder"));
+        let rgb = bundle.rgb.clone().expect("the coloured half was just checked");
         assert_eq!(
-            mercuryrustlib::transfer_sender::read_ladder_skip(&cc, "sdk71_alice", &sid, 0).await.as_deref(),
-            Some(mercuryrustlib::transfer_sender::FLAT_RGB_CARRIER),
-            "the carrier's flat-lane reason must be recorded for the conveyance path"
+            rgb.consignments.len(),
+            bundle.exit_tiers().len(),
+            "carrier {sid}: every tier of a coloured ladder carries a consignment"
+        );
+        // A laddered coin carries no flat-lane record — the same invariant part 2 asserts for the
+        // plain deposit. This is what stops a stale `rgb-carrier` row licensing a flat conveyance
+        // of a coin that now has a perfectly good ladder.
+        assert!(
+            mercuryrustlib::transfer_sender::read_ladder_skip(&cc, "sdk71_alice", &sid, 0).await.is_none(),
+            "a laddered carrier {sid} must carry no flat-lane record"
         );
         assert!(
-            seen.iter().any(|e| matches!(
-                e,
-                WalletEvent::LadderSkipped { statechain_id, reason }
-                    if *statechain_id == sid && *reason == LadderSkipReason::RgbCarrier
-            )),
-            "LadderSkipped{{RgbCarrier}} was not emitted for carrier {sid} — the app would only \
-             discover the coin is flat-only at transfer time"
+            seen.iter().any(|e| matches!(e, WalletEvent::LadderEstablished { statechain_id } if *statechain_id == sid)),
+            "LadderEstablished was not emitted for carrier {sid}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, WalletEvent::LadderSkipped { statechain_id, .. } if *statechain_id == sid)),
+            "carrier {sid} was surfaced as LadderSkipped — under one coin shape a carrier is laddered, \
+             so telling the app it is flat-only is the stale two-shape behaviour"
         );
     }
-    println!("SDK71 - {} carrier(s) left flat, recorded + surfaced as LadderSkipped", carriers.len());
+    println!(
+        "SDK71 - {} carrier(s) laddered with a COLOURED ladder, no flat-lane record, no LadderSkipped",
+        carriers.len()
+    );
 
     // ---- 4a. An unreadable ladder is REFUSED, never silently degraded to the flat lane. ----------
     let tesr_key = format!("tesr-{plain_sid}");
@@ -432,6 +462,13 @@ pub async fn execute() -> Result<()> {
     // 4f. A `ctesr-<id>` row that EXISTS but does not parse. A prior round accepted this key on row
     //     existence alone — while requiring its `branch-` sibling to parse — so any bytes under that
     //     key licensed the flat lane.
+    //
+    //     [#162] The `ctesr-` PROBE is retired (a child is routed to `child_retransfer` before the
+    //     flat lane), so the row is no longer read at all and the refusal now comes from the
+    //     fallback instead. The security property is unchanged and is what this case pins: bytes
+    //     under that key do not license a flat conveyance. The message is asserted too, because
+    //     "refused for the right reason" is the difference between a retired probe and a broken
+    //     one — a coin with no ladder that should have had one is exactly what this coin is.
     mercuryrustlib::sqlite_manager::insert_raw_backup_txs(&cc.pool, "sdk71_alice", &child_key, "not json").await?;
     let err = mercuryrustlib::transfer_sender::execute(
         &cc, &bob_address, "sdk71_alice", &plain_sid, None, false, None,
@@ -443,11 +480,15 @@ pub async fn execute() -> Result<()> {
         panic!("[B3] a ctesr- row that does not parse licensed a flat conveyance (existence is not evidence)")
     });
     assert!(
-        err.contains("split-child bundle row that could not be parsed") && err.contains("Refusing to convey"),
+        err.contains("it should have been laddered by claim()") && err.contains("Refusing to convey"),
         "[B3] unexpected refusal for an unparseable ctesr- row: {err}"
     );
     mercuryrustlib::transfer_sender::delete_raw_backup_row(&cc, "sdk71_alice", &child_key).await?;
-    println!("SDK71 - [B3] unparseable branch- and ctesr- rows both refused (a row is not evidence unless it parses)");
+    println!(
+        "SDK71 - [B3] an unparseable branch- row refused as unreadable evidence; an unparseable \
+         ctesr- row refused by the fallback (its probe is retired, and bytes under a retired key \
+         license nothing)"
+    );
 
     // 4g. `ladder_binding_precheck` failing for a NON-aggregate reason. The classifier used to test
     //     `.is_err()` and license the flat lane on EVERY cause, folding "this funding output is not
@@ -570,44 +611,44 @@ pub async fn execute() -> Result<()> {
     // the transfer in step 6 proves it.
     mercuryrustlib::sqlite_manager::insert_raw_backup_txs(&cc.pool, "sdk71_alice", &tesr_key, &saved).await?;
 
-    // ---- 5. The carrier still TRANSFERS (flat lane intact for the coins that need it). -----------
+    // ---- 5. The carrier still TRANSFERS — on the LADDERED lane, not the flat one. ---------------
     //
     // THE LEGITIMATE CASE MUST KEEP WORKING. Without this the fail-closed rewrite could "pass" by
-    // refusing every coin in the wallet, which would be a worse bug than the one it fixes. Assert it
-    // directly against the classifier first, then end-to-end through a real transfer.
+    // refusing every coin in the wallet, which would be a worse bug than the one it fixes. That
+    // requirement is unchanged; what changed is which lane satisfies it.
+    //
+    // [#162] This section used to assert the carrier was still FLAT-conveyable, that `rgb-carrier`
+    // still licensed the flat lane, and that `flat_only_coins` listed it. One coin shape made all
+    // three false by construction: the carrier is laddered (part 3), and a coin that HAS a ladder
+    // cannot reach the flat classifier at all. The assertions are inverted rather than dropped —
+    // "the carrier is NOT flat-only" is precisely the property the flip was supposed to deliver, and
+    // the end-to-end payment below is what proves the coin is still spendable.
     for c in &carriers {
         let sid = c.statechain_id.clone().ok_or(anyhow!("carrier has no sid"))?;
-        mercuryrustlib::transfer_sender::assert_flat_conveyance_is_legitimate(
-            &cc,
-            "sdk71_alice",
-            &sid,
-            c,
-            "regtest",
-        )
-        .await
-        .map_err(|e| anyhow!("an RGB carrier must still be conveyable flat, but it was refused: {e}"))?;
         assert!(
-            LadderSkipReason::RgbCarrier.permits_flat_conveyance(),
-            "'rgb-carrier' must remain a licence for the flat lane"
+            !LadderSkipReason::RgbCarrier.permits_flat_conveyance(),
+            "'rgb-carrier' must NOT license the flat lane — it was retired with the one-coin-shape flip"
         );
-        // [M3] and the app can see the reason without having caught the event.
+        // [M3] The SDK reports no flat-only reason, because there is none to report.
         assert_eq!(
             alice.ladder_skip_reason(&sid).await,
-            Some(LadderSkipReason::RgbCarrier),
-            "[M3] the SDK accessor must report the carrier's flat-only reason"
+            None,
+            "[M3] a laddered carrier must report no flat-only reason"
         );
     }
     let flat = alice.flat_only_coins().await?;
     for c in &carriers {
         let sid = c.statechain_id.clone().unwrap();
         assert!(
-            flat.iter().any(|(s, r, t)| *s == sid
-                && r == mercuryrustlib::transfer_sender::FLAT_RGB_CARRIER
-                && *t),
-            "[M3] flat_only_coins must list carrier {sid} as still transferable: {flat:?}"
+            !flat.iter().any(|(s, _, _)| *s == sid),
+            "[M3] flat_only_coins must NOT list the laddered carrier {sid}: {flat:?}"
         );
     }
-    println!("SDK71 - the legitimate flat lane still says YES to {} carrier(s)", carriers.len());
+    println!(
+        "SDK71 - {} carrier(s) are not flat-only at all: no recorded reason, absent from \
+         flat_only_coins, and `rgb-carrier` licenses nothing",
+        carriers.len()
+    );
 
     let mut bob_events = bob.subscribe();
     let bob_bg = bob.start_background();
@@ -631,7 +672,7 @@ pub async fn execute() -> Result<()> {
     bob_bg.abort();
     assert_eq!(recv_amount, 250, "bob booked 250 TKN off-chain");
     assert_eq!(alice.get_token_balances().await?[0].balance, 750, "alice keeps 750 change");
-    println!("SDK71 - carrier transferred off-chain (250 TKN) with no ladder involved");
+    println!("SDK71 - carrier paid 250 TKN off-chain over its COLOURED ladder");
 
     // ---- 6. The laddered coin transfers normally, on the R′ path. -------------------------------
     mercuryrustlib::transfer_sender::execute(

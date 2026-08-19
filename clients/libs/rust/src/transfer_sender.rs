@@ -360,7 +360,7 @@ pub fn ladder_skip_key(statechain_id: &str, duplicate_index: u32) -> String {
 /// unreadable funding output is not the harmless legacy case), and `ladder-unreadable` is out (the
 /// conveyance path refuses such a coin before it ever reads this record).
 pub fn is_legitimate_flat_reason(reason: &str) -> bool {
-    matches!(reason, FLAT_TERMINALIZED_CARRIER | FLAT_NOT_BINDABLE)
+    matches!(reason, FLAT_TERMINALIZED_CARRIER | FLAT_FUNDING_NOT_ONCHAIN | FLAT_NOT_BINDABLE)
 }
 
 /// Is this recorded reason one a LATER `claim()` pass can clear by itself? Drives the remedy named
@@ -496,6 +496,27 @@ pub enum PermanentLicence {
     /// today (its only setters have zero non-test callers), so assuming it would be assuming a state
     /// that does not exist.
     TerminalizedCarrier,
+    /// **[#162] An RGB carrier below the coloured ROOT floor — it can NEVER be coloured.**
+    ///
+    /// Distinct from the retired blanket `RgbCarrier` on purpose. That one said "carriers are flat";
+    /// one coin shape made that false, because a carrier IS laddered now. This one says the far
+    /// narrower thing that is still true: this coin's funding value is below a floor no fee rate can
+    /// lower, so it can never carry a coloured ladder and its flatness is permanent rather than
+    /// pending. It is the population `migration_hatch_verdict` keeps spendable.
+    UncolourableCarrier,
+    /// **[B0] The coin's funding tx is one this wallet holds UN-BROADCAST, in its own exit branch.**
+    ///
+    /// [#162] Restored with [`PermanentLicence::UncolourableCarrier`], and for the same reason: the
+    /// retirement's stated premise was that the only producer of this shape was `split_coin`. That
+    /// was wrong. `register_split_subcoins_n` writes a `branch-<sid>` row for every sub-coin of a
+    /// coloured split OR combine, and the migration hatch's combine is a live caller — so the shape
+    /// outlived the producer that was deleted. It is also produced by the LN lane.
+    ///
+    /// A sub-coin funded by an un-broadcast tx has no on-chain `F` to ladder over, so its flatness
+    /// is structural. Unlike the retired probe, this one is proven AGAINST THE COIN: the funding
+    /// txid the coin carries must be the txid of a tx in that branch. See
+    /// [`licence_funding_is_our_own_unbroadcast_tx`].
+    FundingNotOnChain,
     /// The coordinator has no `aggregate_xonly` on record for the sid (a pre-migration-0009 legacy
     /// coin), so no receiver could bind a ladder built over it. Proven by the coordinator ANSWERING,
     /// this call, with a record whose aggregate is absent —
@@ -570,6 +591,126 @@ fn recorded_flat_reason(rows: &WalletRows, statechain_id: &str) -> Result<Option
 /// The recorded `terminalized-carrier` spelling is NOT accepted on its own: `single_use` has no
 /// production setter today, so a record claiming it without the flag is stale or wrong, and this
 /// licence must be positively proven rather than assumed.
+/// LICENCE — **THE MIGRATION HATCH'S CARRIER: an RGB carrier that can NEVER be coloured.**
+///
+/// [#162] Restored after `sdk78` caught its removal as a live regression. One coin shape retired the
+/// blanket `rgb-carrier` licence, and correctly: a carrier IS laddered now, so "it is a carrier" no
+/// longer explains why it has no ladder. But it does not explain it for EVERY carrier — a coin whose
+/// funding value sits below the coloured ROOT floor can never carry a coloured ladder, at any fee
+/// rate, because the comparison is between two numbers neither side can move. The largest such class
+/// is every pre-flip 1_500-sat token piece: below the coloured child floor AND the root floor, so it
+/// cannot even be carved.
+///
+/// Those coins are exactly the population `migration_hatch_verdict` exists to keep spendable. The
+/// hatch's RGB half survived the retirement; its SATS half did not, so a hatch-eligible payment was
+/// built and then refused at conveyance. That is the defect this closes.
+///
+/// PROVEN FROM THE COIN, never from a recorded string — the lesson
+/// [`licence_terminalized_carrier`] already encodes. Two facts, both read from material this wallet
+/// holds: the coin's own backup row carries an `rgb_consignment` (it IS a carrier), and its amount is
+/// below `colored_ladder_floor` (it can never stop being flat). A carrier ABOVE the floor gets
+/// nothing here — it can be coloured, so if it has no ladder that is a coin to repair, which is
+/// precisely the distinction the blanket licence used to blur.
+fn licence_uncolourable_carrier(
+    rows: &WalletRows,
+    statechain_id: &str,
+    coin: &Coin,
+    network: &str,
+) -> Result<Option<PermanentLicence>> {
+    let Some(json) = rows.get(statechain_id) else { return Ok(None) };
+    let txs: Vec<BackupTx> = serde_json::from_str(json).map_err(|e| {
+        anyhow!(
+            "statechain id {statechain_id} has a backup row that could not be parsed ({e}). \
+             Refusing to convey it on the flat lane — this client cannot tell whether the coin is a \
+             sub-floor RGB carrier (legitimately flat, and served by the migration hatch) or a coin \
+             that lost its exit ladder."
+        )
+    })?;
+    if !txs.iter().any(|b| b.rgb_consignment.is_some()) {
+        return Ok(None);
+    }
+    // The COMMITTED rate, not a fetched one. The floor a coin must clear to be colourable is fixed
+    // by the schedule the tier will be signed at, so this decision is local and cannot fail open on
+    // an unreachable coordinator — and a market-rate spike must never turn a colourable coin into a
+    // licensed one.
+    let rate = mercurylib::tesr::TesrParams::for_network(network).committed_fee_rate;
+    let floor = crate::tesr::colored_ladder_floor(rate, crate::tesr::COLORED_LADDER_DUST);
+    let amount = coin.amount.unwrap_or_default() as u64;
+    if amount < floor {
+        return Ok(Some(PermanentLicence::UncolourableCarrier));
+    }
+    Ok(None)
+}
+
+/// LICENCE — **[B0] THE COIN IS FUNDED BY AN UN-BROADCAST TX THIS WALLET HOLDS.**
+///
+/// [#162] Restored after `sdk78`. The retirement reasoned that `branch-`'s only producer,
+/// `ensure_exact_coin` -> `split_coin`, was being deleted in the same change. It is not the only
+/// producer: `register_split_subcoins_n` writes `branch-<sid>` for every sub-coin of a coloured
+/// split or COMBINE, and the migration hatch's multi-carrier combine reaches it. So retiring the
+/// probe stranded the hatch's own outputs one step after the hatch opened for their parents.
+///
+/// **The evidence standard is raised, not merely restored.** The retired probe licensed on a
+/// non-empty `branch-<sid>` row — evidence that SOME exit material exists under this coin's key,
+/// which is one careless write away from being about a different coin. This one decodes the branch
+/// and requires the coin's OWN funding txid to be the txid of a tx inside it. That is the actual
+/// proposition: `F` is a transaction we are holding rather than one the chain has, which is exactly
+/// why it cannot be found on chain and exactly why it carries no ladder.
+///
+/// A row that exists but cannot be read, or one whose txids do not include this coin's funding tx,
+/// is an ERROR and never a licence — the two failure shapes a "does the row exist" probe merges.
+fn licence_funding_is_our_own_unbroadcast_tx(
+    rows: &WalletRows,
+    statechain_id: &str,
+    coin: &Coin,
+) -> Result<Option<PermanentLicence>> {
+    let Some(json) = rows.get(&format!("branch-{statechain_id}")) else { return Ok(None) };
+    let txs: Vec<BackupTx> = serde_json::from_str(json).map_err(|e| {
+        anyhow!(
+            "statechain id {statechain_id} has an exit-branch row that could not be parsed ({e}). \
+             Refusing to convey it on the flat lane — its exit material is unreadable, so this \
+             client cannot tell whether the coin is legitimately un-laddered."
+        )
+    })?;
+    // An EMPTY branch proves nothing about `F`; fall through rather than license it.
+    if txs.is_empty() {
+        return Ok(None);
+    }
+    let Some(funding_txid) = coin.utxo_txid.as_deref() else {
+        return Err(anyhow!(
+            "statechain id {statechain_id} carries an exit branch but no funding outpoint, so this \
+             client cannot check that the branch is about THIS coin. Refusing to convey it on the \
+             flat lane."
+        ));
+    };
+    let mut branch_txids = Vec::with_capacity(txs.len());
+    for b in &txs {
+        let raw = hex::decode(&b.tx).map_err(|e| {
+            anyhow!(
+                "statechain id {statechain_id} has an exit-branch entry that is not hex ({e}). \
+                 Refusing to convey it on the flat lane — unreadable exit material is not evidence \
+                 that the coin's funding is off chain."
+            )
+        })?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).map_err(|e| {
+            anyhow!(
+                "statechain id {statechain_id} has an exit-branch entry that is not a transaction \
+                 ({e}). Refusing to convey it on the flat lane."
+            )
+        })?;
+        branch_txids.push(tx.txid().to_string());
+    }
+    if !branch_txids.iter().any(|t| t == funding_txid) {
+        return Err(anyhow!(
+            "statechain id {statechain_id} has an exit branch that does not contain its own funding \
+             tx {funding_txid} (branch witnesses: {}). Refusing to convey it on the flat lane — a \
+             branch about some other coin is not evidence that THIS coin's funding is off chain.",
+            branch_txids.join(", ")
+        ));
+    }
+    Ok(Some(PermanentLicence::FundingNotOnChain))
+}
+
 fn licence_terminalized_carrier(coin: &Coin) -> Option<PermanentLicence> {
     if coin.single_use {
         Some(PermanentLicence::TerminalizedCarrier)
@@ -706,26 +847,42 @@ async fn flat_conveyance_licence(
     let recorded = recorded_flat_reason(&rows, statechain_id)?;
     let recorded = recorded.as_deref();
 
-    // **[ONE COIN SHAPE] LICENCE 1 AND LICENCE 3 ARE RETIRED.**
+    // [#162] The migration hatch's carrier, proven from the coin. Probed before the legacy-aggregate
+    // arm because it is the specific explanation: a sub-floor carrier is flat for a reason that will
+    // never change, and answering "legacy" for it would be true of the wrong thing.
+    if let Some(l) = licence_uncolourable_carrier(&rows, statechain_id, coin, network)? {
+        return Ok(Some(l));
+    }
+
+    // [#162] [B0] proven from the coin's own funding txid against the branch this wallet holds.
+    if let Some(l) = licence_funding_is_our_own_unbroadcast_tx(&rows, statechain_id, coin)? {
+        return Ok(Some(l));
+    }
+
+    // **[ONE COIN SHAPE] THE BLANKET `rgb-carrier` LICENCE IS RETIRED.**
     //
-    // With `colored_ladder` shipping TRUE, a carrier is laddered like any other coin, so
-    // "this coin is an RGB carrier" stops being a reason it may travel without a ladder. Licence 1
-    // is therefore gone, not merely unused: leaving the probe in place would keep licensing every
-    // carrier the coloured builder happens to refuse, which is the opposite of one coin shape.
+    // With `colored_ladder` shipping TRUE, a carrier is laddered like any other coin, so "this coin
+    // is an RGB carrier" stops being a reason it may travel without a ladder. That probe is gone,
+    // not merely unused: leaving it in place would keep licensing every carrier the coloured builder
+    // happens to refuse, which is the opposite of one coin shape. What replaced it is the far
+    // narrower `licence_uncolourable_carrier` above — a carrier that can NEVER be coloured, proven
+    // by arithmetic against a floor no fee rate can lower.
     //
-    // Licence 3 (`funding-not-onchain`) goes with it. Its three arms are NOT equivalent and the
-    // retirement is deliberate for each:
-    //   * `branch-` was the plain un-laddered split sub-coin — the shape this change exists to
-    //     remove. Its producer, `ensure_exact_coin` -> `split_coin`, is retired below.
+    // **[#162] The `ctesr-` and `spinetip-` arms of the old licence 3 stay retired; its `branch-`
+    // arm did not, and was restored above.** They are NOT equivalent, and treating them as one is
+    // what made the retirement wrong:
+    //   * `branch-` is LIVE. `register_split_subcoins_n` writes it for every sub-coin of a coloured
+    //     split or combine — including the migration hatch's own outputs — and the LN lane produces
+    //     it too. The retirement's premise was that its only producer was the deleted `split_coin`;
+    //     that was false, and `sdk78` caught it one step after the hatch opened.
     //   * `ctesr-` was defensive: `UtexoWallet::transfer` routes a child to `child_retransfer`
     //     before the flat lane, and a child that reached here died on an absence anyway.
     //   * `spinetip-` was already dead: `execute_ex` refuses a tip BY NAME before this classifier
     //     runs, with a CI guard on the ordering.
     //
-    // What remains is `licence_terminalized_carrier`, which is proven from the coin's own
-    // `single_use` flag rather than from a recorded string, and `licence_legacy_no_aggregate`,
-    // which is re-proven LIVE against the coordinator. Both are evidence about the coin; the two
-    // retired here were evidence about a lane that no longer exists.
+    // Every surviving licence is evidence ABOUT THE COIN: `single_use` on the coin itself, an
+    // amount below a fixed floor, a funding txid found in the wallet's own branch, or a coordinator
+    // answer re-proven live. None of them is a recorded string.
     if let Some(l) = licence_terminalized_carrier(coin) {
         return Ok(Some(l));
     }
@@ -2477,12 +2634,108 @@ async fn cancel_with_consent_inner(
 mod flat_lane_tests {
     use super::*;
 
+    /// [#162] The restored [B0] licence, at the boundary the retired probe never checked: the
+    /// branch must be about THIS coin. `sdk78` proved the licence has to exist (the coloured
+    /// combine's own outputs are funded by an un-broadcast tx); these cases prove it cannot be
+    /// satisfied by exit material that merely happens to sit under the coin's key.
+    #[test]
+    fn only_a_branch_holding_the_coin_s_own_funding_tx_licenses_it() {
+        use bitcoin::consensus::serialize;
+        // A real transaction, so the txid is computed rather than asserted.
+        let tx = bitcoin::Transaction {
+            version: 2,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![bitcoin::TxOut {
+                value: 1_500,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let txid = tx.txid().to_string();
+        let branch_row = |hex_tx: &str| {
+            serde_json::to_string(&vec![BackupTx {
+                tx_n: 1,
+                tx: hex_tx.to_string(),
+                client_public_nonce: String::new(),
+                server_public_nonce: String::new(),
+                client_public_key: String::new(),
+                server_public_key: String::new(),
+                blinding_factor: String::new(),
+                rgb_consignment: None,
+                rgb_blinding: None,
+            }])
+            .expect("serialize")
+        };
+        let coin_funded_by = |t: Option<&str>| {
+            let mut c = bare_coin();
+            c.utxo_txid = t.map(|s| s.to_string());
+            c
+        };
+        let rows = |k: &str, v: &str| WalletRows(vec![(k.to_string(), v.to_string())]);
+
+        // THE LICENCE: the branch contains the very tx that funds this coin.
+        assert_eq!(
+            licence_funding_is_our_own_unbroadcast_tx(
+                &rows("branch-abc", &branch_row(&hex::encode(serialize(&tx)))),
+                "abc",
+                &coin_funded_by(Some(&txid)),
+            )
+            .expect("licensed"),
+            Some(PermanentLicence::FundingNotOnChain)
+        );
+
+        // A branch about some OTHER coin is not evidence about this one. The retired probe
+        // licensed this case, because it asked only whether the row was non-empty.
+        let err = licence_funding_is_our_own_unbroadcast_tx(
+            &rows("branch-abc", &branch_row(&hex::encode(serialize(&tx)))),
+            "abc",
+            &coin_funded_by(Some(&"11".repeat(32))),
+        )
+        .expect_err("a branch that does not name this coin must refuse");
+        assert!(
+            err.to_string().contains("does not contain its own funding tx"),
+            "unexpected refusal: {err}"
+        );
+
+        // No branch at all, and an EMPTY branch: no licence, and no error — the coin is explained
+        // by some other probe or by nothing, which is the caller's refusal to make.
+        assert_eq!(
+            licence_funding_is_our_own_unbroadcast_tx(&WalletRows(vec![]), "abc", &coin_funded_by(Some(&txid)))
+                .expect("no row is not an error"),
+            None
+        );
+        assert_eq!(
+            licence_funding_is_our_own_unbroadcast_tx(&rows("branch-abc", "[]"), "abc", &coin_funded_by(Some(&txid)))
+                .expect("an empty branch is not an error"),
+            None
+        );
+
+        // Unreadable material REFUSES — it is not evidence, and it is not absence either.
+        assert!(licence_funding_is_our_own_unbroadcast_tx(
+            &rows("branch-abc", "not json"), "abc", &coin_funded_by(Some(&txid))
+        )
+        .is_err());
+        assert!(licence_funding_is_our_own_unbroadcast_tx(
+            &rows("branch-abc", &branch_row("zz")), "abc", &coin_funded_by(Some(&txid))
+        )
+        .is_err());
+        assert!(licence_funding_is_our_own_unbroadcast_tx(
+            &rows("branch-abc", &branch_row("deadbeef")), "abc", &coin_funded_by(Some(&txid))
+        )
+        .is_err());
+        // A coin with a branch but no funding outpoint cannot be checked against it.
+        assert!(licence_funding_is_our_own_unbroadcast_tx(
+            &rows("branch-abc", &branch_row(&hex::encode(serialize(&tx)))), "abc", &coin_funded_by(None)
+        )
+        .is_err());
+    }
+
     /// [B1] The set of reasons that LICENSE a flat conveyance is exactly the structurally-permanent
     /// ones. A transient reason is a deferral; if one ever creeps back onto this list, a single
     /// blip in a token wallet licenses that coin to convey flat forever after.
     #[test]
     fn only_permanent_reasons_license_the_flat_lane() {
-        for permanent in [FLAT_TERMINALIZED_CARRIER, FLAT_NOT_BINDABLE] {
+        for permanent in [FLAT_TERMINALIZED_CARRIER, FLAT_FUNDING_NOT_ONCHAIN, FLAT_NOT_BINDABLE] {
             assert!(
                 is_legitimate_flat_reason(permanent),
                 "'{permanent}' is a structural, permanent reason and must keep licensing the flat lane"
@@ -2504,15 +2757,18 @@ mod flat_lane_tests {
             );
             assert!(is_transient_flat_reason(transient));
         }
-        // **[ONE COIN SHAPE] RETIRED — these two used to license, and must not any more.**
-        // `rgb-carrier` licensed a carrier travelling without a ladder; with `colored_ladder`
-        // shipping true a carrier IS laddered, so the reason no longer describes a legitimate shape.
-        // `funding-not-onchain` licensed the un-laddered split sub-coin, whose producer is retired
-        // with it. Both probes are DELETED from the classifier, not merely dropped here — this
-        // predicate never gated anything (it drives `flat_only_coins`' `transferable` flag), so a
-        // change here alone would have been cosmetic. Asserting them in this group is what stops
-        // either creeping back as a licence.
-        for retired in [FLAT_RGB_CARRIER, FLAT_FUNDING_NOT_ONCHAIN] {
+        // **[ONE COIN SHAPE] RETIRED — `rgb-carrier` used to license, and must not any more.**
+        // It licensed a carrier travelling without a ladder; with `colored_ladder` shipping true a
+        // carrier IS laddered, so the reason no longer describes a legitimate shape. The probe is
+        // DELETED from the classifier, not merely dropped here — this predicate never gated anything
+        // (it drives `flat_only_coins`' `transferable` flag), so a change here alone would have been
+        // cosmetic. Asserting it in this group is what stops it creeping back as a licence.
+        //
+        // [#162] `funding-not-onchain` was retired ALONGSIDE it and has been put back, because the
+        // premise of that retirement — "its only producer is being deleted" — was false: the
+        // coloured combine writes the same `branch-` material, so the shape outlived the producer.
+        // It is asserted in the licensing group above, not here.
+        for retired in [FLAT_RGB_CARRIER] {
             assert!(
                 !is_legitimate_flat_reason(retired),
                 "'{retired}' was RETIRED with the one-coin-shape flip and must never license again"
@@ -2533,6 +2789,98 @@ mod flat_lane_tests {
                 "'{other}' must not license a flat conveyance"
             );
         }
+    }
+
+    /// **[#162] THE SUB-FLOOR CARRIER KEEPS A LICENCE; THE COLOURABLE ONE DOES NOT.**
+    ///
+    /// `sdk78` caught the removal of this as a live regression: one coin shape retired the blanket
+    /// `rgb-carrier` licence, which was right for carriers that CAN be coloured and wrong for the
+    /// ones that never can. A 1_500-sat pre-flip piece sits below both coloured floors, so its
+    /// flatness is permanent — and the migration hatch exists to keep exactly those spendable.
+    ///
+    /// The boundary is what this pins, in both directions: below the floor licences, at or above it
+    /// does not. A licence that fired for every carrier would re-open the hole; one that fired for
+    /// none strands the coins the hatch serves.
+    /// A `Coin` with nothing asserted about it. Each test sets ONLY the fields its licence reads,
+    /// so a probe that starts consulting a new field fails here rather than passing on a default.
+    fn bare_coin() -> Coin {
+        Coin {
+            index: 0,
+            user_privkey: String::new(),
+            user_pubkey: String::new(),
+            auth_privkey: String::new(),
+            auth_pubkey: String::new(),
+            derivation_path: String::new(),
+            fingerprint: String::new(),
+            address: String::new(),
+            backup_address: String::new(),
+            server_pubkey: None,
+            aggregated_pubkey: None,
+            aggregated_address: None,
+            utxo_txid: None,
+            utxo_vout: None,
+            amount: None,
+            statechain_id: None,
+            signed_statechain_id: None,
+            locktime: None,
+            secret_nonce: None,
+            public_nonce: None,
+            blinding_factor: None,
+            server_public_nonce: None,
+            tx_cpfp: None,
+            tx_withdraw: None,
+            withdrawal_address: None,
+            status: CoinStatus::CONFIRMED,
+            duplicate_index: 0,
+            single_use: false,
+            epoch_deadline: None,
+        }
+    }
+
+    #[test]
+    fn only_a_sub_floor_carrier_is_licensed_as_uncolourable() {
+        let rate = mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate;
+        let floor = crate::tesr::colored_ladder_floor(rate, crate::tesr::COLORED_LADDER_DUST);
+        assert!(floor > 1_500, "the legacy 1_500-sat piece must be BELOW the coloured root floor");
+
+        // A backup row carrying a consignment is what proves "this is a carrier" from the coin's own
+        // material rather than from a recorded string — the same standard `licence_terminalized_
+        // carrier` holds to.
+        let carrier = serde_json::to_string(&vec![BackupTx {
+            tx_n: 1,
+            tx: String::new(),
+            client_public_nonce: String::new(),
+            server_public_nonce: String::new(),
+            client_public_key: String::new(),
+            server_public_key: String::new(),
+            blinding_factor: String::new(),
+            rgb_consignment: Some("deadbeef".to_string()),
+            rgb_blinding: None,
+        }])
+        .unwrap();
+        let rows = WalletRows(vec![
+            ("sub-floor".to_string(), carrier.clone()),
+            ("above-floor".to_string(), carrier),
+        ]);
+
+        let licence = |sid: &str, amount: u64| {
+            let mut coin = bare_coin();
+            coin.amount = Some(amount as u32);
+            licence_uncolourable_carrier(&rows, sid, &coin, "regtest").unwrap()
+        };
+
+        assert_eq!(
+            licence("sub-floor", 1_500),
+            Some(PermanentLicence::UncolourableCarrier),
+            "a carrier below the coloured root floor can NEVER be coloured, so its flatness is \
+             permanent and the migration hatch must be able to convey it"
+        );
+        assert_eq!(
+            licence("above-floor", floor),
+            None,
+            "a carrier AT the floor can be coloured, so a missing ladder is a coin to repair — \
+             licensing it would re-open the blanket carrier hole one coin shape closed"
+        );
     }
 
     /// A pin that is PRESENT but WRONG must not be reported as a coordinator outage.
