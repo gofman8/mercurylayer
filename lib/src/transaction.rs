@@ -53,9 +53,12 @@ pub struct PartialSignatureRequestPayload {
     /// session from it, and byte-compares against `session`. A disclosure that does not reproduce
     /// `session` is refused — so nothing here is believed, only checked.
     ///
-    /// `Option` because binding is opt-in per request while clients migrate: the nodejs, web and
-    /// Kotlin clients do not build one yet, and a required field would break them on deploy. The
-    /// coordinator forwards the payload wholesale, so populating this is the whole client change.
+    /// `Option` on the WIRE ONLY — the SE now REFUSES a request that omits it (`400`, no signature).
+    /// The type stays optional because this struct is also the shape a request is parsed INTO, and a
+    /// missing field must produce the SE's own refusal rather than a deserialisation error that
+    /// says nothing useful. Every client in this tree populates it: each forwards
+    /// `PartialSignatureMsg1::partial_signature_request_payload` wholesale, so it is filled in here
+    /// once, for all of them.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub disclosure: Option<SigningDisclosure>,
 }

@@ -907,12 +907,17 @@ true at realistic payment velocities.
 > aggregate key, so it has nothing to compare against. See REQ-65 for the full statement and for what
 > it forbids (no parent edge may be resolved from the SE's index until this is closed).
 >
-> **Two further limits.** (1) Binding is **opt-in per request**: an absent disclosure is still
-> served, so a malicious client can simply decline to be bound. Making it mandatory is a
-> deploy-ordering change that breaks any un-migrated JS/Kotlin client. (2) The **coloured
-> multi-input** path is fixed (it now discloses input `i` against the full prevout set, where it
-> previously claimed index 0 and a single prevout) but **no test exercises it with a disclosure**, so
-> that path is compiled-correct and live-unproven. None of the three may be described as done.
+> **Both of the further limits are now CLOSED; the aggregate limit above is not.** (1) Binding was
+> opt-in per request, so a malicious client could simply decline to be bound. It is now
+> **mandatory**: a request carrying no disclosure is refused `400` and no signature is produced.
+> What made the flip safe was measuring it rather than assuming it — the SE logs every unbound
+> request by name, and across the live suite that count reached zero while bound requests reached
+> 118. Every client in this tree builds a disclosure without changing a line of client code,
+> because each forwards the signing payload wholesale and the shared library populates it.
+> (2) The **coloured multi-input** path (which discloses input `i` against the full prevout set,
+> where it previously claimed index 0 and a single prevout) is now exercised live: a four-input
+> coloured combine signs every input bound. What remains open is the aggregate limit stated above,
+> tracked as REQ-65 — and REQ-68 closes the part of it a stored aggregate can answer.
 >
 > **A measurement trap worth stating, because it cost a full diagnosis.** `claim()` silently declines
 > to ladder when the SE's attestation identity is unpinned; the reason is *recorded, not raised*
@@ -2190,7 +2195,7 @@ unbuilt sections, and they are marked as such in place.
 | INV-26 | `sdk09` (IFA received amount = fungible only) |
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
 | REQ-49…REQ-52 (§5.3, the sweep) | **NONE — design, not built.** See the status banner in §5.3 |
-| REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE — and the test fails if the same bytes with the correct value are refused by that compare rather than by REQ-68's aggregate check, so neither gate can stand in for the other), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. **Open:** binding is opt-in per request; the coloured multi-input path is fixed but unexercised |
+| REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE — and the test fails if the same bytes with the correct value are refused by that compare rather than by REQ-68's aggregate check, so neither gate can stand in for the other; **and the same request with the disclosure deleted is refused `400`**, which is what makes binding a property of the SE rather than a convention among clients), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `sdk78` (the **coloured multi-input** path: a four-input combine, every input bound), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. Measured across the live suite: **118 bound, 0 unbound, 0 index-miss.** **Open:** nothing in REQ-57 itself — the residual is REQ-65's aggregate question |
 | REQ-56 (§5.4, the predicate + registry) | **PARTIAL.** The decision procedure is built and pinned: `lockbox/tests/test_registry.cpp` (23 checks — fork, released sibling, shared exit key, one-satoshi shortfall, INV-Q). The storage is built and pinned against a live Postgres: `lockbox/tests/test_registry_db.cpp` (26 checks — idempotent establish, monotone release, single-use nonce by PRIMARY KEY, freeze as a ratchet). **NOT built:** nothing populates it in production, and no `collapse_grant` route exists |
 | REQ-68 (§5.4, why parenthood is not yet SE-authored) | **MEASURED, and it is a blocker.** `/get_public_key` takes only a `statechain_id`, so the SE never learns the client's key and cannot derive the coin's aggregate — see REQ-68 for the two candidate closures and the privacy cost of the sound one. Until it is decided, `se_signed_tx` is an audit trail only |
 | REQ-54 R2 (§5.4, `/release`) | **BUILT.** `lockbox/tests/test_release_route.cpp` — 10 checks against live Postgres and real BIP-340, three of them forgeries run BEFORE the honest path: no latch → refused (fails closed), someone else's key → refused, a signature over a DIFFERENT sid → refused (the tag binds it), replayed nonce → refused, fresh nonce → accepted, `released` monotone |

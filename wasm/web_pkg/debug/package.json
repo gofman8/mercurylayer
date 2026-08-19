@@ -1,5 +1,6 @@
 {
   "name": "mercury-wasm",
+  "type": "module",
   "collaborators": [
     "ttrevethan"
   ],
@@ -9,7 +10,7 @@
     "mercury_wasm.js",
     "mercury_wasm.d.ts"
   ],
-  "module": "mercury_wasm.js",
+  "main": "mercury_wasm.js",
   "types": "mercury_wasm.d.ts",
   "sideEffects": [
     "./snippets/*"

@@ -711,24 +711,37 @@ namespace lockbox {
                     return crow::response(400, "Invalid session length. Must be 133 bytes!");
                 }
 
-                // Optional while clients migrate; strict when present — a disclosure that fails to
-                // parse is refused rather than ignored, because "I could not read it" must never be
-                // treated as "there wasn't one".
+                // **[REQ-57 / #162] MANDATORY. The SE does not sign what it has not been shown.**
+                //
+                // This was optional while clients migrated, and the instrumentation added to measure
+                // that migration is what closed it: WITNESS_BIND_ABSENT counted the unbound requests
+                // by name, and across the live suite (the laddered lane, the coloured multi-input
+                // combine, the flat lane) the count reached ZERO while WITNESS_BIND_MATCH reached
+                // 118. Every client in this repo builds a disclosure, because they all forward
+                // `PartialSignatureMsg1::partial_signature_request_payload` wholesale and mercurylib
+                // populates it — the JS clients included.
+                //
+                // An optional security gate is not a security gate: a signer that accepts an unbound
+                // request will sign blind for whoever omits the field, and "all our clients send it"
+                // is a statement about clients, not about what the SE will do. The refusal is what
+                // makes REQ-57 a property of the SE rather than a convention among callers.
+                //
+                // Both failure shapes refuse, and they stay DISTINCT: absent is a caller that has
+                // not been migrated, malformed is a caller that has — one is a deployment fact and
+                // the other is a bug, and merging them would hide whichever is rarer.
                 std::optional<witness::Disclosure> disclosure;
-                if (req_body.count("disclosure") != 0) {
-                    disclosure = witness::parse_disclosure(req.body);
-                    if (!disclosure.has_value()) {
-                        return crow::response(400, "disclosure present but malformed");
-                    }
-                } else {
-                    // **[#162] SAY SO WHEN THE GATE DOES NOT RUN.**
-                    //
-                    // Until this line, "the binding passed" and "there was nothing to bind" were the
-                    // same observation from outside: a bound request logs WITNESS_BIND_MATCH and an
-                    // unbound one logs nothing at all, so a coverage ratio counted matches against
-                    // requests and had no way to name WHICH path was unbound. That is the shape that
-                    // let a partially wired gate read as a working one.
+                if (req_body.count("disclosure") == 0) {
                     CROW_LOG_WARNING << "WITNESS_BIND_ABSENT statechain " << statechain_id;
+                    return crow::response(
+                        400,
+                        "this request carries no witness disclosure, so the SE cannot verify what it "
+                        "would be signing. Refusing to co-sign blind. Rebuild the client against a "
+                        "mercurylib that populates `disclosure` (every in-repo client does) and retry.");
+                }
+                disclosure = witness::parse_disclosure(req.body);
+                if (!disclosure.has_value()) {
+                    CROW_LOG_WARNING << "WITNESS_BIND_MALFORMED statechain " << statechain_id;
+                    return crow::response(400, "disclosure present but malformed");
                 }
 
                 // [REQ-61] The owner's authorisation for THIS signing round. Optional on the wire

@@ -473,11 +473,41 @@ pub async fn execute() -> Result<()> {
          against a disclosure nobody can check."
     );
 
+    // ===== (d) [#162] AN UNBOUND REQUEST IS REFUSED ===========================================
+    //
+    // The residual (c) used to name: binding was OPT-IN, so a caller that simply omitted the field
+    // was served without any check at all. An optional security gate is not a gate — it protects
+    // exactly the callers who chose to be protected, and the attacker is by definition the one who
+    // does not.
+    //
+    // This request is the (a) request with ONE field deleted. Everything else — sid, session,
+    // negate_seckey — is byte-identical to a request the SE served four times in this same run, so
+    // a refusal here cannot be explained by anything except the missing disclosure. That is what
+    // makes this a test of the mandatory rule rather than of the parser.
+    let mut unbound = disclosure_body(&sid, &honest, DEPOSIT);
+    unbound
+        .as_object_mut()
+        .expect("the body is an object")
+        .remove("disclosure")
+        .expect("the (a) body carried a disclosure to remove");
+    let (unbound_status, unbound_body) = raw_partial_signature(&lockbox, unbound).await?;
+    println!("SDK92 - [d] disclosure omitted -> HTTP {unbound_status}  {unbound_body}");
+    if unbound_status == 200 {
+        return Err(anyhow!(
+            "[d] the SE co-signed a request carrying NO disclosure. Binding is still opt-in, which \
+             means REQ-57 protects only the callers who opt in — and an attacker never will."
+        ));
+    }
+    if !unbound_body.contains("Refusing to co-sign blind") {
+        return Err(anyhow!(
+            "[d] refused with HTTP {unbound_status}, but not by the mandatory-binding branch: \
+             {unbound_body}. A refusal from the parser or another gate would keep passing after the \
+             mandatory rule was reverted."
+        ));
+    }
     println!(
-        "SDK92 - SCOPE: binding is OPT-IN per request while JS/Kotlin clients migrate, so a caller \
-         that omits the disclosure entirely is still served — that residual is #162. What is no \
-         longer true is the aggregate half: a request that DOES carry a disclosure is checked, and \
-         checked against a coin, on every sid."
+        "SDK92 - [d] PASS: binding is MANDATORY. The same request the SE served with a disclosure is \
+         refused without one, so REQ-57 is a property of the SE and not a convention among clients."
     );
     println!("SDK92 - ALL ASSERTIONS PASSED");
     Ok(())
