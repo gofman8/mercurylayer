@@ -809,10 +809,17 @@ log. With it, the same lapse shows up as a coin that fails to arrive.
 
 ### 5.3 Sweep at claim — absorbing leaves out of circulation
 
-> **Status: DESIGN, not built.** No `sweep_*` parameter and no absorption path exists in the tree;
-> REQ-49–REQ-52 specify a mechanism whose build order is set out in
-> [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.7. Nothing in this section is
-> plant-and-run, and §12 carries no test row for it.
+> **Status: THE DECISION IS BUILT; THE ABSORPTION IS NOT.** The sweep's arithmetic — the four
+> admission limits (REQ-50), the settlement trigger (REQ-51) and the fairness floor (REQ-52) — is
+> built as pure functions with the derived defaults, and every boundary is pinned by unit tests,
+> including the ones a live stack reaches only by luck. **Nothing calls them.** No absorption path
+> exists, and REQ-49 requires the swap default-OFF until the cooperative exit it depends on is
+> demonstrated end to end, which it has not been.
+>
+> That order is deliberate: shipping the decision without the mechanism leaves an operator unable to
+> absorb, which costs nothing; shipping the mechanism first leaves one holding leaves it cannot
+> settle. Build order for the remainder is in
+> [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.7.
 
 The sweep is an **optimisation inside the discharge round (§5.4)**, not the settlement path: it is
 how a leaf is absorbed cheaply during R1. Settling leaves one at a time buys one P2TR input each and
@@ -2220,7 +2227,7 @@ unbuilt sections, and they are marked as such in place.
 | INV-25 | honest branches accepted: `sdk29`/`sdk31`/`sdk39`. **Gap:** no live value-inflating-branch REJECT; the laddered analogue is `sdk54`/`sdk58` |
 | INV-26 | `sdk09` (IFA received amount = fungible only) |
 | Concurrency / chaos | `chaos22` (N users act in parallel) |
-| REQ-49…REQ-52 (§5.3, the sweep) | **NONE — design, not built.** See the status banner in §5.3 |
+| REQ-49…REQ-52 (§5.3, the sweep) | **PARTIAL — the decision, not the absorption.** 8 unit tests over the pure predicate: the surplus is constant in face and vanishes at the 21.3 sat/vB indifference point; the fairness floor refuses ONE satoshi below walk-out value; all four REQ-50 limits pinned at their boundaries in both directions; a NaN market rate is REFUSED rather than admitted (the polarity that makes an unparseable rate fail closed); an absurd running exposure cannot overflow into looking empty; only the fee refusal is transient; and REQ-51's deadline path settles at an infinite fee rate, because an expensive settlement beats a voided leaf. The marginal vsize is DERIVED from the transaction module's input model and cross-checked against `sweep_tx_vsize`, so the two cannot drift. **No absorption path exists and nothing calls any of it** — see the §5.3 banner |
 | REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE — and the test fails if the same bytes with the correct value are refused by that compare rather than by REQ-68's aggregate check, so neither gate can stand in for the other; **and the same request with the disclosure deleted is refused `400`**, which is what makes binding a property of the SE rather than a convention among clients), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `sdk78` (the **coloured multi-input** path: a four-input combine, every input bound), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. Measured across the live suite: **118 bound, 0 unbound, 0 index-miss.** **Open:** nothing in REQ-57 itself — the residual is REQ-65's aggregate question |
 | REQ-56 (§5.4, the predicate + registry) | **PARTIAL.** The decision procedure is built and pinned: `lockbox/tests/test_registry.cpp` (23 checks — fork, released sibling, shared exit key, one-satoshi shortfall, INV-Q). The storage is built and pinned against a live Postgres: `lockbox/tests/test_registry_db.cpp` (26 checks — idempotent establish, monotone release, single-use nonce by PRIMARY KEY, freeze as a ratchet). **NOT built:** nothing populates it in production, and no `collapse_grant` route exists |
 | REQ-68 (§5.4, why parenthood is not yet SE-authored) | **MEASURED, and it is a blocker.** `/get_public_key` takes only a `statechain_id`, so the SE never learns the client's key and cannot derive the coin's aggregate — see REQ-68 for the two candidate closures and the privacy cost of the sound one. Until it is decided, `se_signed_tx` is an audit trail only |

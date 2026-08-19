@@ -875,7 +875,7 @@ pub const DUST_LIMIT: u64 = 330;
 
 /// Non-witness bytes of one transaction input: 32-byte txid + 4-byte vout + 1-byte empty
 /// scriptSig length + 4-byte sequence. (Standard serialisation.)
-const INPUT_BASE_BYTES: u64 = 41;
+pub(crate) const INPUT_BASE_BYTES: u64 = 41;
 /// Witness bytes of a P2TR **key-path** spend as THIS repo signs it: 1-byte stack-item count +
 /// 1-byte item length + 65-byte signature.
 ///
@@ -890,7 +890,7 @@ const INPUT_BASE_BYTES: u64 = 41;
 /// that have already been co-signed cannot be re-signed, only re-broadcast, so it sticks in the
 /// mempool. `witness_size_ground_truth_tests` measures the real signed transaction rather than
 /// re-deriving this number, so the premise itself is now pinned.
-const INPUT_WITNESS_BYTES: u64 = 67;
+pub(crate) const INPUT_WITNESS_BYTES: u64 = 67;
 /// Non-witness bytes of one P2TR output: 8-byte value + 1-byte script length + 34-byte
 /// `OP_1 <32-byte x-only key>`. (Standard serialisation.)
 const P2TR_OUTPUT_BYTES: u64 = 43;

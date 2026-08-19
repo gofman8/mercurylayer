@@ -5,6 +5,7 @@ pub mod wallet;
 pub mod utils;
 pub mod transaction;
 pub mod tesr;
+pub mod sweep;
 pub mod unifii_interface;
 pub mod error;
 
