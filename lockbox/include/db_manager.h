@@ -274,7 +274,18 @@ namespace db_manager {
                       int64_t prevout_value,
                       const std::vector<unsigned char>& exit_key_or_empty,
                       const std::vector<std::string>& parent_statechain_ids,
+                      const std::vector<unsigned char>& fund_txid_or_empty,
+                      int64_t fund_vout,
                       std::string& error_message);
+
+    /// The outpoint a root's own tiers spend — its funding output — as WITNESSED at co-signing.
+    /// `found` is assigned on every path, so a root whose outpoint the SE never saw cannot be
+    /// mistaken for one whose outpoint happens to be in the caller's buffer.
+    bool leaf_funding_outpoint(const std::string& statechain_id,
+                               std::vector<unsigned char>& txid,
+                               int64_t& vout,
+                               bool& found,
+                               std::string& error_message);
 
     /// Every leaf recorded under a root. The caller computes the frontier from this
     /// (`registry::frontier`) rather than the database doing it, so the rule stays testable without

@@ -211,6 +211,7 @@ namespace lockbox {
             // session was byte-compared — so a caller cannot name one outpoint and sign another.
             std::optional<std::vector<unsigned char>> bound_prevout_txid;
             int64_t bound_prevout_value = 0;
+            int64_t bound_prevout_vout = -1;
             if (disclosure.has_value()) {
                 std::vector<unsigned char> bound_sighash;
                 std::string detail;
@@ -304,6 +305,7 @@ namespace lockbox {
                         const auto& po_in = parsed_disclosure->vin[0].prevout;
                         bound_prevout_txid =
                             std::vector<unsigned char>(po_in.txid, po_in.txid + 32);
+                        bound_prevout_vout = static_cast<int64_t>(po_in.vout);
                     }
                     bound_prevout_value =
                         disclosure->prevout_values.empty()
@@ -558,7 +560,10 @@ namespace lockbox {
                     if (!db_manager::observe_leaf(statechain_id, prevout_value,
                                                   bound_latch_key ? *bound_latch_key
                                                                   : std::vector<unsigned char>(),
-                                                  parent_sids, leaf_err)) {
+                                                  parent_sids,
+                                                  bound_prevout_txid ? *bound_prevout_txid
+                                                                     : std::vector<unsigned char>(),
+                                                  bound_prevout_vout, leaf_err)) {
                         CROW_LOG_WARNING << "LEAF_OBSERVE_MISS statechain " << statechain_id << ": "
                                          << leaf_err;
                     }
@@ -965,6 +970,139 @@ namespace lockbox {
 
             CROW_LOG_INFO << "LEAF_RELEASED statechain " << statechain_id;
             crow::json::wvalue result({{"released", true}});
+            return crow::response{result};
+        });
+
+        // ── [REQ-54 R6 / REQ-56] COLLAPSE GRANT ─────────────────────────────────────────────────
+        //
+        // The only place the frontier is enforced. Everything it needs was authored by the SE
+        // itself: the leaf set it recorded at co-signing, the aggregate it derived at keygen, and
+        // the transaction it re-hashes here. Nothing the caller says about who is owed what is
+        // believed — the caller supplies only the transaction, and the SE checks it against its own
+        // records.
+        //
+        // ORDER IS THE DESIGN. Each step below refuses on its own, and the ordering exists so that
+        // a refusal names the real cause rather than the first thing that happened to look wrong:
+        // an unknown root is not an empty obligation set, a malformed set is not a satisfied one,
+        // and a transaction that pays everyone but spends the wrong outpoint is still not a
+        // collapse of THIS root.
+        //
+        // NOT BUILT HERE: the partial signature. R6 says the SE issues one, and it must be issued
+        // in the same database transaction as the freeze so no leaf can appear between the check
+        // and the ratchet (REQ-64). Wiring a signature to a route that has never been exercised
+        // would be the more dangerous half shipped first, so this route establishes the VERDICT and
+        // the freeze, and refuses to pretend it signed. The signing half is the next increment.
+        CROW_ROUTE(app, "/collapse_grant")
+        .methods("POST"_method)([](const crow::request& req) {
+            auto body = crow::json::load(req.body);
+            if (!body) return crow::response(400, "malformed json");
+            if (body.count("root_statechain_id") == 0 || body.count("disclosure") == 0) {
+                return crow::response(400, "required: root_statechain_id, disclosure");
+            }
+            const std::string root_sid = body["root_statechain_id"].s();
+
+            // 1. THE TRANSACTION, AS THE SE READS IT. The disclosure is parsed from the same bytes
+            //    a signing request would carry, so `C` is a transaction the SE has examined rather
+            //    than a shape the caller described.
+            const auto disclosure = witness::parse_disclosure(req.body);
+            if (!disclosure.has_value()) {
+                return crow::response(400, "disclosure missing or malformed");
+            }
+            const auto parsed = tx::parse_hex(disclosure->unsigned_tx_hex);
+            if (!parsed.has_value()) {
+                return crow::response(400, "the disclosed transaction does not parse");
+            }
+
+            // 2. REQ-55: EXACTLY ONE INPUT. A second input would need a depositor's signature, and
+            //    a round that any depositor can stall by going quiet is not a round.
+            if (parsed->vin.size() != 1) {
+                return crow::response(400, "C must have exactly one input (REQ-55)");
+            }
+
+            // 3. REQ-56: `C` MUST SPEND THIS ROOT'S FUNDING OUTPUT — or, on the griefed branch (R8),
+            //    the trigger's payload output, which is a transaction the SE co-signed under this
+            //    root. Without this a `C` that pays every owed key out of somebody ELSE'S money
+            //    would satisfy the arithmetic and be granted.
+            std::string err;
+            std::vector<unsigned char> fund_txid;
+            int64_t fund_vout = -1;
+            bool have_outpoint = false;
+            if (!db_manager::leaf_funding_outpoint(root_sid, fund_txid, fund_vout, have_outpoint,
+                                                   err)) {
+                return crow::response(500, "could not read the root's funding outpoint: " + err);
+            }
+            const auto& in = parsed->vin[0].prevout;
+            const std::vector<unsigned char> spent_txid(in.txid, in.txid + 32);
+            bool spends_root_funding =
+                have_outpoint && spent_txid == fund_txid &&
+                static_cast<int64_t>(in.vout) == fund_vout;
+            if (!spends_root_funding) {
+                // R8: the trigger has been broadcast, so `C` spends ITS payload output instead. The
+                // SE co-signed that trigger under this root, which is how it can tell the branch
+                // from an unrelated transaction.
+                std::string owner;
+                bool found = false;
+                if (!db_manager::signed_tx_owner(spent_txid, owner, found, err)) {
+                    return crow::response(500, "could not resolve the spent outpoint: " + err);
+                }
+                spends_root_funding = found && owner == root_sid;
+            }
+            if (!spends_root_funding) {
+                return crow::response(
+                    403,
+                    "C does not spend this root's funding output, nor an output of a transaction "
+                    "the SE co-signed under it. Refusing: a collapse of THIS root has to spend THIS "
+                    "root (REQ-56).");
+            }
+
+            // 4. THE LEAF SET. `validate_for_grant` FIRST, because an empty set satisfies an empty
+            //    obligation vacuously — correct arithmetic, catastrophic answer. "I have no leaves
+            //    for this root" means the SE does not know, never "this root owes nobody".
+            std::vector<registry::Leaf> leaves;
+            if (!db_manager::load_leaves(root_sid, leaves, err)) {
+                return crow::response(500, "could not load the root's leaves: " + err);
+            }
+            if (const auto e = registry::validate_for_grant(leaves); e != registry::SetError::Ok) {
+                return crow::response(409,
+                                      std::string("the SE has no usable leaf set for this root: ") +
+                                          registry::describe(e));
+            }
+            if (const auto e = registry::validate(leaves); e != registry::SetError::Ok) {
+                return crow::response(409, std::string("the leaf set is malformed: ") +
+                                               registry::describe(e));
+            }
+
+            // 5. THE PREDICATE. Every unreleased frontier leaf, its FULL funding value, at its OWN
+            //    key, in outputs distinct per key.
+            const auto obligations = registry::owed(leaves);
+            std::string why;
+            if (!registry::pays_all_owed(*parsed, obligations, &why)) {
+                CROW_LOG_WARNING << "COLLAPSE_REFUSED root " << root_sid << ": " << why;
+                return crow::response(403, "C does not pay every unreleased frontier leaf in full: " +
+                                               why);
+            }
+
+            // 6. FREEZE, PROSPECTIVELY (INV-FREEZE / REQ-64). Only after the predicate passed: a
+            //    root frozen by a REFUSED grant would be a denial of service any caller could
+            //    trigger by submitting a transaction that pays nobody.
+            const std::string successor =
+                body.count("successor_root") ? std::string(body["successor_root"].s())
+                                             : std::string();
+            if (!db_manager::freeze_root(root_sid, successor, err)) {
+                return crow::response(500, "the predicate passed but the freeze failed: " + err);
+            }
+
+            CROW_LOG_INFO << "COLLAPSE_GRANTED root " << root_sid << " obligations "
+                          << obligations.size();
+            crow::json::wvalue result;
+            result["granted"] = true;
+            result["frozen"] = true;
+            result["obligations"] = static_cast<int>(obligations.size());
+            // Stated rather than implied: a caller that treats a verdict as a signature would
+            // broadcast an unsigned transaction and lose the round.
+            result["partial_sig"] = nullptr;
+            result["note"] = "predicate satisfied and root frozen; the partial signature is not "
+                             "issued by this build";
             return crow::response{result};
         });
 

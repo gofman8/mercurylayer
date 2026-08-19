@@ -49,6 +49,18 @@ std::map<std::string, uint64_t> owed(const std::vector<Leaf>& nodes) {
     return out;
 }
 
+const char* describe(SetError e) {
+    switch (e) {
+        case SetError::Ok: return "ok";
+        case SetError::DuplicateStatechainId: return "a statechain id appears twice";
+        case SetError::MissingExitKey: return "a leaf has no exit key";
+        case SetError::BadExitKeyLength: return "a leaf's exit key is not 32 bytes";
+        case SetError::ParentNotInSet: return "a leaf names a parent the SE does not have";
+        case SetError::UnknownRoot: return "the SE has no leaves for this root";
+    }
+    return "unknown";
+}
+
 SetError validate(const std::vector<Leaf>& nodes) {
     std::unordered_set<std::string> ids;
     for (const auto& n : nodes) {

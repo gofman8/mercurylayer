@@ -228,7 +228,7 @@ int main() {
         // need a placeholder exit key, and a 32-byte zero key is a well-formed key nobody controls:
         // a collapse could "pay" the leaf into an unspendable output and the predicate would call
         // itself satisfied.
-        check(db_manager::observe_leaf(obs, 150000, {}, {}, err),
+        check(db_manager::observe_leaf(obs, 150000, {}, {}, {}, -1, err),
               "a value-only observation succeeds");
         {
             std::vector<registry::Leaf> leaves;
@@ -238,7 +238,7 @@ int main() {
 
         // The key-bearing rung establishes. This is the flat backup in the measured trace: it spends
         // `F` (150_000) and pays the owner's key, so it carries BOTH facts.
-        check(db_manager::observe_leaf(obs, 150000, key(0x6b), {}, err),
+        check(db_manager::observe_leaf(obs, 150000, key(0x6b), {}, {}, -1, err),
               "a key-bearing observation establishes the leaf");
         {
             std::vector<registry::Leaf> leaves;
@@ -252,7 +252,7 @@ int main() {
         // THE RULE REQ-60 FORCES. The state tier spends 148_770 and pays the SAME key. Assigning
         // would ratchet the leaf DOWN to the exit value and underpay this holder by 1_845 sats in a
         // collapse — the burn that is never realised because the rungs are never broadcast.
-        check(db_manager::observe_leaf(obs, 148770, key(0x6b), {}, err),
+        check(db_manager::observe_leaf(obs, 148770, key(0x6b), {}, {}, -1, err),
               "a later, SMALLER rung is observed");
         {
             std::vector<registry::Leaf> leaves;
@@ -262,7 +262,7 @@ int main() {
         }
 
         // And a LARGER one still raises it, so the rule is a maximum rather than a first-write.
-        check(db_manager::observe_leaf(obs, 151000, key(0x6b), {}, err), "a larger rung is observed");
+        check(db_manager::observe_leaf(obs, 151000, key(0x6b), {}, {}, -1, err), "a larger rung is observed");
         {
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(obs, leaves, err), "load after the larger rung");
@@ -272,7 +272,7 @@ int main() {
 
         // The exit key is WRITE-ONCE. A re-pointable payout key is a redirectable payout, and the
         // party able to re-point it is the operator the frontier exists to be checked against.
-        check(db_manager::observe_leaf(obs, 151000, key(0xff), {}, err),
+        check(db_manager::observe_leaf(obs, 151000, key(0xff), {}, {}, -1, err),
               "an observation naming a DIFFERENT key succeeds");
         {
             std::vector<registry::Leaf> leaves;
@@ -286,7 +286,7 @@ int main() {
         // under one sid, so resolving a later rung's prevout finds the same coin. A self-parented
         // leaf is the parent of another node (itself), so it drops OUT of the frontier and `C` is
         // never required to pay it — a holder discharged without being paid.
-        check(db_manager::observe_leaf(obs, 151000, key(0x6b), {obs}, err),
+        check(db_manager::observe_leaf(obs, 151000, key(0x6b), {obs}, {}, -1, err),
               "an observation naming the leaf as its own parent succeeds");
         {
             std::vector<registry::Leaf> leaves;
@@ -302,7 +302,7 @@ int main() {
         // A child observed under a known parent inherits the parent's ROOT, so the frontier of a
         // root finds descendants the SE never saw named as belonging to it.
         const std::string kid = root + "_OBSKID";
-        check(db_manager::observe_leaf(kid, 90000, key(0xcd), {obs}, err), "a child is observed");
+        check(db_manager::observe_leaf(kid, 90000, key(0xcd), {obs}, {}, -1, err), "a child is observed");
         {
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(obs, leaves, err), "load the parent's root");
@@ -316,9 +316,9 @@ int main() {
             const std::string p1 = root + "_CIN1";
             const std::string p2 = root + "_CIN2";
             const std::string kid2 = root + "_CKID";
-            check(db_manager::observe_leaf(p1, 1500, key(0x11), {}, err), "combine input 1");
-            check(db_manager::observe_leaf(p2, 1500, key(0x22), {p1}, err), "combine input 2");
-            check(db_manager::observe_leaf(kid2, 2700, key(0x33), {p1, p2}, err),
+            check(db_manager::observe_leaf(p1, 1500, key(0x11), {}, {}, -1, err), "combine input 1");
+            check(db_manager::observe_leaf(p2, 1500, key(0x22), {p1}, {}, -1, err), "combine input 2");
+            check(db_manager::observe_leaf(kid2, 2700, key(0x33), {p1, p2}, {}, -1, err),
                   "the child names BOTH inputs");
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(p1, leaves, err), "load the combine's root");
@@ -345,9 +345,9 @@ int main() {
 
         {
             std::vector<unsigned char> shortkey(31, 0xee);
-            check(!db_manager::observe_leaf(root + "_OBSSHORT", 100, shortkey, {}, err),
+            check(!db_manager::observe_leaf(root + "_OBSSHORT", 100, shortkey, {}, {}, -1, err),
                   "a 31-byte exit key is refused here too");
-            check(!db_manager::observe_leaf(root + "_OBSZERO", 0, key(0xee), {}, err),
+            check(!db_manager::observe_leaf(root + "_OBSZERO", 0, key(0xee), {}, {}, -1, err),
                   "a zero prevout value is refused");
         }
         purge(obs);

@@ -158,9 +158,19 @@ namespace db_manager {
                 "latch_key BYTEA, "
                 // Form (a)/(b): monotone, never cleared. A release is a consent record, not a
                 // spending authorisation.
-                "released BOOLEAN NOT NULL DEFAULT false);");
+                "released BOOLEAN NOT NULL DEFAULT false, "
+                // [REQ-56] The outpoint this leaf's own tiers SPEND — i.e. its funding output.
+                // Witnessed, never asserted: it is read from the parsed transaction whose sighash
+                // the SE recomputed. `collapse_grant` needs it for a ROOT, because REQ-56 requires
+                // `C` to spend the root's funding output (or the trigger's payload output) and
+                // "some transaction the operator named" is not that check.
+                "fund_txid BYTEA, "
+                "fund_vout INTEGER);");
             txn.exec(
                 "CREATE INDEX IF NOT EXISTS se_leaf_root ON se_leaf (root_statechain_id);");
+            // Same reason as the composite key above: IF NOT EXISTS is a no-op on a live database.
+            txn.exec("ALTER TABLE se_leaf ADD COLUMN IF NOT EXISTS fund_txid BYTEA;");
+            txn.exec("ALTER TABLE se_leaf ADD COLUMN IF NOT EXISTS fund_vout INTEGER;");
             // [REQ-56a] PARENTHOOD IS MANY-TO-ONE FROM THE CHILD'S SIDE. A combine spends N coins
             // into M children, so each child has N parents and all N have stopped existing. Held in
             // its own table because `se_leaf.parent_statechain_id` can hold exactly one, and one is
@@ -1198,6 +1208,8 @@ namespace db_manager {
                       int64_t prevout_value,
                       const std::vector<unsigned char>& exit_key_or_empty,
                       const std::vector<std::string>& parent_statechain_ids,
+                      const std::vector<unsigned char>& fund_txid_or_empty,
+                      int64_t fund_vout,
                       std::string& error_message) {
         if (!exit_key_or_empty.empty() && exit_key_or_empty.size() != 32) {
             error_message = "exit_key must be 32 bytes when present";
@@ -1244,7 +1256,8 @@ namespace db_manager {
             if (!exit_key_or_empty.empty()) {
                 txn.exec_params(
                     "INSERT INTO se_leaf (statechain_id, parent_statechain_id, root_statechain_id, "
-                    "fund_value, exit_key) VALUES ($1, $2, $3, $4, $5) "
+                    "fund_value, exit_key, fund_txid, fund_vout) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7) "
                     "ON CONFLICT (statechain_id) DO UPDATE SET "
                     // GREATEST, never assignment: the funding value is the largest prevout this coin
                     // was ever witnessed spending, and a later rung spends a SMALLER one (the burn).
@@ -1256,20 +1269,39 @@ namespace db_manager {
                     // frontier exists to be checked against.
                     "  exit_key = COALESCE(se_leaf.exit_key, EXCLUDED.exit_key), "
                     "  parent_statechain_id = "
-                    "     COALESCE(se_leaf.parent_statechain_id, EXCLUDED.parent_statechain_id);",
+                    "     COALESCE(se_leaf.parent_statechain_id, EXCLUDED.parent_statechain_id), "
+                    // The funding outpoint moves WITH the funding value. A later rung spends a
+                    // smaller output, so keeping its outpoint would record an interior tier as the
+                    // coin's funding output — and `collapse_grant` would then accept a `C` that
+                    // spends a tier rather than the root.
+                    "  fund_txid = CASE WHEN EXCLUDED.fund_value > se_leaf.fund_value "
+                    "                   THEN EXCLUDED.fund_txid ELSE se_leaf.fund_txid END, "
+                    "  fund_vout = CASE WHEN EXCLUDED.fund_value > se_leaf.fund_value "
+                    "                   THEN EXCLUDED.fund_vout ELSE se_leaf.fund_vout END;",
                     statechain_id,
                     parent.empty() ? pqxx::zview() : pqxx::zview(parent),
                     root,
                     prevout_value,
-                    pqxx::binarystring(exit_key_or_empty.data(), exit_key_or_empty.size()));
+                    pqxx::binarystring(exit_key_or_empty.data(), exit_key_or_empty.size()),
+                    fund_txid_or_empty.empty()
+                        ? pqxx::binarystring(nullptr, 0)
+                        : pqxx::binarystring(fund_txid_or_empty.data(), fund_txid_or_empty.size()),
+                    fund_vout);
             } else {
                 txn.exec_params(
-                    "UPDATE se_leaf SET fund_value = GREATEST(fund_value, $2), "
+                    "UPDATE se_leaf SET "
+                    "  fund_txid = CASE WHEN $2 > fund_value THEN $4 ELSE fund_txid END, "
+                    "  fund_vout = CASE WHEN $2 > fund_value THEN $5 ELSE fund_vout END, "
+                    "  fund_value = GREATEST(fund_value, $2), "
                     "  parent_statechain_id = COALESCE(parent_statechain_id, $3) "
                     "WHERE statechain_id = $1;",
                     statechain_id,
                     prevout_value,
-                    parent.empty() ? pqxx::zview() : pqxx::zview(parent));
+                    parent.empty() ? pqxx::zview() : pqxx::zview(parent),
+                    fund_txid_or_empty.empty()
+                        ? pqxx::binarystring(nullptr, 0)
+                        : pqxx::binarystring(fund_txid_or_empty.data(), fund_txid_or_empty.size()),
+                    fund_vout);
             }
             // Every parent, not just the column's one. `DO NOTHING` because a retried rung
             // re-presents the same edges and a second row would say nothing new.
@@ -1278,6 +1310,36 @@ namespace db_manager {
                     "INSERT INTO se_leaf_parent (child_statechain_id, parent_statechain_id) "
                     "VALUES ($1, $2) ON CONFLICT DO NOTHING;",
                     statechain_id, p);
+            }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool leaf_funding_outpoint(const std::string& statechain_id,
+                               std::vector<unsigned char>& txid,
+                               int64_t& vout,
+                               bool& found,
+                               std::string& error_message) {
+        found = false;   // assigned on EVERY path
+        txid.clear();
+        vout = -1;
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT fund_txid, fund_vout FROM se_leaf "
+                "WHERE statechain_id = $1 AND fund_txid IS NOT NULL AND fund_vout IS NOT NULL;",
+                statechain_id);
+            if (!rows.empty()) {
+                pqxx::binarystring t(rows[0][0]);
+                txid.assign(t.data(), t.data() + t.size());
+                vout = rows[0][1].as<int64_t>();
+                found = txid.size() == 32;
             }
             txn.commit();
             return true;

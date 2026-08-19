@@ -93,6 +93,10 @@ enum class SetError {
 /// and the rule is stated here in code so a caller cannot reach the arithmetic without passing it.
 SetError validate_for_grant(const std::vector<Leaf>& nodes);
 
+/// A short, stable reason string for a `SetError`. The SSP has to know WHICH leaf set problem it is
+/// looking at to fix a round; a bare "no" makes one un-debuggable.
+const char* describe(SetError e);
+
 /// Structural checks on the leaf set itself, before any payment arithmetic.
 ///
 /// `ParentNotInSet` matters more than it looks: if a node names a parent the SE does not have, the
