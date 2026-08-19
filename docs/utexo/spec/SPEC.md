@@ -1121,6 +1121,20 @@ path cheap and the dishonest path detectable-and-defeatable**, rather than the s
 between an absent user and their money. Without it, form (c) is custodial in substance for anyone who
 is not watching. **State this in those words wherever the round's trust model is described.**
 
+**REQ-56a (a MULTI-INPUT spend has several parents, and the frontier must account for all of
+them).** Measured on the live lane, not derived: the migration hatch's combine spends four carriers
+into two children, and the SE co-signs it once per input — one transaction, four signatures, four
+different sids. A registry that gives each child ONE parent therefore marks one carrier as spent and
+leaves the other three looking untouched, so each stays in its own frontier and a collapse is
+required to pay coins whose value has already moved into the children. That is an **overpay**: the
+operator's loss rather than a holder's, and never a theft — but a wrong answer from the one predicate
+whose entire job is exactness, and at scale it is what makes a round unaffordable.
+
+The SE's index now keeps **every** co-signer of a transaction rather than the first, so the evidence
+survives; which of them a child calls its parent, and how the frontier excludes a node spent by a
+transaction it did not solely fund, is REQ-59's question and is **not yet answered**. Until it is, a
+round MUST NOT be run over a tree containing a multi-input spend.
+
 **REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
 `establish_leaf` from the **witnessed payload output of the state tier** — identified structurally as
 the unique P2TR output, per REQ-61(a), and NOT at a client-supplied index. That key is **the payee's**

@@ -105,12 +105,42 @@ namespace db_manager {
                 // transaction under. This is what makes a parent edge SE-authored rather than
                 // client-asserted: a child's tier spends (SP.txid, j), and only the SE can say which
                 // sid it co-signed SP under.
+                // [#157] KEYED ON (txid, statechain_id), not on txid alone.
+                //
+                // A COMBINE is one transaction co-signed once PER INPUT, under a different sid each
+                // time. Under a txid-only key the first co-signature won and the rest were dropped
+                // by ON CONFLICT — measured on the live lane, where a 4-input migration-hatch
+                // combine left the SE believing the children had ONE parent and the other three
+                // carriers had never been spent at all. Those three then stayed in their own
+                // frontiers, so a collapse would be required to pay coins whose value had already
+                // moved into the children: an overpay, which is the operator's loss rather than a
+                // holder's, but still a wrong answer from a predicate whose whole job is exactness.
+                //
+                // Keeping every co-signer costs one row per input and loses nothing. Which of them
+                // a child calls its parent is the PREDICATE's question, not this table's, and it is
+                // answered in REQ-56 — but it cannot be answered at all from evidence that was
+                // thrown away here.
                 "CREATE TABLE IF NOT EXISTS se_signed_tx ( "
-                "txid BYTEA PRIMARY KEY, "
+                "txid BYTEA NOT NULL, "
                 "statechain_id varchar(50) NOT NULL, "
-                "sig_index INTEGER NOT NULL);");
+                "sig_index INTEGER NOT NULL, "
+                "PRIMARY KEY (txid, statechain_id));");
             txn.exec(
                 "CREATE INDEX IF NOT EXISTS se_signed_tx_sid ON se_signed_tx (statechain_id);");
+            // [#157] `CREATE TABLE IF NOT EXISTS` is a no-op on an existing database, so a
+            // deployment that predates the composite key keeps the txid-only one — and keeps
+            // silently dropping every co-signer of a combine after the first. Widen it in place.
+            // Guarded by the catalog rather than by a swallowed exception, so a failure here is
+            // still an error rather than a shrug.
+            txn.exec(
+                "DO $$ BEGIN "
+                "  IF EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "             WHERE i.indrelid = 'se_signed_tx'::regclass AND i.indisprimary "
+                "               AND i.indnatts = 1) THEN "
+                "    ALTER TABLE se_signed_tx DROP CONSTRAINT se_signed_tx_pkey; "
+                "    ALTER TABLE se_signed_tx ADD PRIMARY KEY (txid, statechain_id); "
+                "  END IF; "
+                "END $$;");
             txn.exec(
                 "CREATE TABLE IF NOT EXISTS se_leaf ( "
                 "statechain_id varchar(50) PRIMARY KEY, "
@@ -893,7 +923,7 @@ namespace db_manager {
             // let the second rewrite an edge the first already established.
             txn.exec_params(
                 "INSERT INTO se_signed_tx (txid, statechain_id, sig_index) VALUES ($1, $2, $3) "
-                "ON CONFLICT (txid) DO NOTHING;",
+                "ON CONFLICT (txid, statechain_id) DO NOTHING;",
                 pqxx::binarystring(txid.data(), txid.size()), statechain_id, sig_index);
             txn.commit();
             return true;
@@ -917,13 +947,41 @@ namespace db_manager {
             pqxx::connection conn(getDatabaseConnectionString());
             if (!conn.is_open()) { error_message = "db closed"; return false; }
             pqxx::work txn(conn);
+            // ORDER BY, because there can now be SEVERAL: a combine is co-signed once per input.
+            // Without it the row returned is whatever the planner yields, so the same child could
+            // be given a different parent on two calls — a registry that answers differently each
+            // time it is asked is worse than one that answers narrowly.
             auto rows = txn.exec_params(
-                "SELECT statechain_id FROM se_signed_tx WHERE txid = $1;",
+                "SELECT statechain_id FROM se_signed_tx WHERE txid = $1 ORDER BY statechain_id;",
                 pqxx::binarystring(txid.data(), txid.size()));
             if (!rows.empty()) {
                 statechain_id = rows[0][0].as<std::string>();
                 found = true;
             }
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
+    bool signed_tx_owners(const std::vector<unsigned char>& txid,
+                          std::vector<std::string>& out,
+                          std::string& error_message) {
+        out.clear();
+        if (txid.size() != 32) {
+            error_message = "txid must be 32 bytes";
+            return false;
+        }
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+            auto rows = txn.exec_params(
+                "SELECT statechain_id FROM se_signed_tx WHERE txid = $1 ORDER BY statechain_id;",
+                pqxx::binarystring(txid.data(), txid.size()));
+            for (const auto& r : rows) out.push_back(r[0].as<std::string>());
             txn.commit();
             return true;
         } catch (std::exception const& e) {

@@ -172,6 +172,17 @@ namespace db_manager {
                          bool& found,
                          std::string& error_message);
 
+    /// **[#157] EVERY sid that co-signed `txid`, ascending — a combine has one per input.**
+    ///
+    /// [`signed_tx_owner`] returns the first of these and is enough while a child is given a single
+    /// parent. This is the accessor a predicate needs to answer the question that ONE parent cannot:
+    /// a 4-input combine spends four coins, and all four have stopped existing. Recording only one
+    /// of them as spent leaves the other three in their own frontiers, so a collapse is required to
+    /// pay coins whose value already moved into the children.
+    bool signed_tx_owners(const std::vector<unsigned char>& txid,
+                          std::vector<std::string>& out,
+                          std::string& error_message);
+
     // ── [REQ-68] THE COIN'S AGGREGATE, AS THE SE DERIVED IT ──────────────────────────────────────
 
     /// Store the aggregate the SE COMPUTED at keygen. WRITE-ONCE: a re-pointable aggregate would let
