@@ -1013,7 +1013,56 @@ splits is clean at the SE, that the census stays balanced when a tree closes, th
 tree closes for `155 + 43·N` — is derived from the predicate's code and has never been exercised
 end to end. §0.2 applies: this is presence and ordering, not behaviour.
 
-#### 5.4.5 What is retired below, and what is not
+#### 5.4.5 Spark's denominated-leaf model — what it costs to adopt, NOT a reason to refuse it
+
+**THE FRAMING OF THIS SUBSECTION WAS WRONG WHEN FIRST WRITTEN, AND THE CORRECTION IS THE POINT.** It
+was recorded as a "negative result: Spark's model does not port". The owner rejected that reasoning in
+one line: *how can you reject Spark's path when it works and ours does not — if we reject it we must
+propose something as good or better.* That standard is correct and it is now binding on this document.
+
+Every reason the first draft gave was a statement about OUR structure being incompatible, not about
+Spark's design being unsound — and our structure is the part that does not work. Rejecting a working
+design for failing to fit a broken one is defending the status quo, not analysing it. Each item below
+is therefore restated as **a price**, with what changing it would take:
+
+Recorded so nobody walks this road twice. Verified against Spark's own source, 2026-08-20.
+
+**What Spark does.** Denominations are literally powers of two **from 1 sat**. A balance is a SET of
+leaves. Paying is greedy EXACT-FIT selection with no remainder and no split. When no exact fit exists
+the wallet SWAPS with the SSP at strictly equal value (`sum(in) == sum(out)`, fee zero), receiving
+leaves the SSP already owns, atomic by adaptor signature. And decisively: **a Spark transfer does not
+create a tree node** — the node id, value, tx and vout are unchanged and only the refund transaction is
+replaced. Depth does not grow with payment history.
+
+**What adopting it would cost us — three prices, none of them a veto:**
+
+1. **Our leaf floor is ~1560 sat, not 1 sat**, because `min_child_value` makes a UTEXO leaf PREPAY ITS
+   OWN EXIT. That is OUR design choice and it is changeable — a leaf that does not prepay its exit
+   would have a floor near theirs, at the cost they already pay (their sub-16 348-sat leaves cannot
+   exit unilaterally). A Spark leaf does not, and Spark concedes the consequence: leaves below ~16 348 sat
+   cannot be unilaterally exited at all. A power-of-two grid starting at our floor spans only
+   multiples of that floor, so essentially every real payment amount is off-grid and carves anyway.
+   **This is our property, not our defect** — our leaf can always exit and theirs cannot — but it is
+   what closes their grid to us.
+2. **Their SSP can mint denominations for free and ours cannot — YET.** Spark's SSP alone may split
+   leaves off-chain through an operator-internal service. Ours has no such privilege because nobody
+   built one, not because one is impossible. Giving the SSP a privileged split is a design option with
+   a price to state, not a closed door. Our swap could therefore only PERMUTE existing denominations, never create
+   the one a payment needs. **The inventory engine their swap runs on does not exist here.**
+3. **Spark did not solve the ancestor drag either.** Their unilateral exit walks the parent chain to
+   the root and broadcasts every ancestor — exactly what `materialise_carrier` does. Their exit cost
+   is dominated by LEAF COUNT rather than depth, which is a different trade, not a solution.
+
+**THE STANDARD THIS SECTION IS NOW HELD TO.** Any proposal to NOT adopt Spark's model must deliver
+partial-holder liquidity that is as good or better, and must say so in those terms. "It does not fit
+our current structure" is not an argument; it is a description of the thing being fixed.
+
+**What survives and is worth building regardless:** carve WIDE, never narrow. Width does not enter the exit-depth
+cap at all, and `combine_leaves` already exists and has been exercised. The realistic gain is about
+**2×**, from spine levels being cheaper — not the ~60× a denomination grid appeared to promise, and it
+needs none of that machinery.
+
+#### 5.4.6 What is retired below, and what is not
 
 | | status | why |
 |---|---|---|
@@ -1897,6 +1946,105 @@ unchosen, and §12 carries a `NONE` row for REQ-69–REQ-73 that applies here un
 ---
 
 ## 6. Off-chain split & combine
+
+### 6.0 Paying ANY amount — the tail, and the dust slot we were not spending
+
+> **OWNER REQUIREMENT, 2026-08-20: a user MUST be able to pay any amount.** A design that quantises
+> payments is a FAIL regardless of its other merits. This section is the answer, and it rests on a
+> Bitcoin policy fact this document had not used.
+
+#### 6.0.1 The physical law
+
+A transaction may carry **at most ONE** output below the dust threshold — Bitcoin Core's
+`MAX_DUST_OUTPUTS_PER_TX = 1`. A transaction that uses that slot must pay **zero fee**, and the dust
+must be spent by the package child. The thresholds: a P2TR output is dust below **330 sat**; a P2A
+anchor is dust below **240**.
+
+**Spark does not evade this. It collides with it and does not check.** Verified against their source:
+denominations are powers of two from 1 sat, the default wallet actively converges to one leaf per
+denomination (so 1-sat leaves are manufactured routinely), a leaf is a REAL output at its exact value
+— their own fixture decodes to a v3 transaction with an **8-sat P2TR output** — and there is no dust
+check anywhere on their tree path. Every Spark transaction carries a **zero-value** P2A anchor, and
+that anchor is itself dust, so the one permitted slot is already spent. Any payload below 330 makes the
+transaction carry two dust outputs and `IsStandardTx` rejects it. Because a branch transaction carries
+every child as a sibling output, **one sub-dust child kills the whole branch** — their optimiser will
+cheerfully request `[1, 1, 2, 4]`, four jointly dead outputs in one transaction.
+
+So Spark bought arbitrary amounts by minting outputs it never intends to broadcast, recycled through
+SSP swaps rather than through exit. Their published 16,348-sat floor is **economic, not physical** — it
+appears in their documentation and in **zero lines of their code**.
+
+#### 6.0.2 What we have that they do not
+
+**Our anchor is FUNDED at `P2A_VALUE = 240`, exactly its own standardness threshold — so it is NOT
+dust, and our dust slot has never been spent.** Every tier we build carries zero dust outputs. That is
+one free sub-dust output per transaction, available to us and not to them.
+
+#### 6.0.3 Four leaf shapes, chosen by value
+
+No denomination grid is introduced: splits stay exact and Σ-conserving, so every amount at or above the
+dust limit is already expressible today.
+
+| value `v` | shape | cost |
+|---|---|---|
+| `v ≥ min_child_value` (1560 at 3.0 sat/vB) | today's two-rung ladder, self-funding | unchanged |
+| `945 ≤ v < 1560` | ONE rung — the spine-tip shape, which already exists | one renewal instead of two |
+| `DUST_LIMIT ≤ v < 945` | depth-0 stub, no ladder; zero-fee v3 with a zero-value anchor, bumped in package | floor is exactly 330 |
+| `1 ≤ v < DUST_LIMIT` | **a TAIL** — carried as the split's single permitted dust output | see below |
+
+A tail forces two things on its split transaction and on nothing else: the anchor must be the FUNDED
+240 kind, so the tail owns the dust slot; and the split's fee must be zero, so it enters the mempool
+only as a package whose child spends the anchor, the tail, and the broadcaster's own fee input.
+
+#### 6.0.4 The release fragment, and why a tail cannot take a sibling hostage
+
+This is the part Spark does not have, and it is what makes sub-dust leaves safe here rather than merely
+possible.
+
+At split time the tail's owner and the SE co-sign a spend of the tail outpoint with
+`SIGHASH_NONE | SIGHASH_ANYONECANPAY` (0x82, valid for a taproot key-path spend), and that signature —
+the **release fragment** — is published to every sibling in the conveyed bundle. Because it commits to
+no outputs, any party who ever needs the split on chain can attach it alongside their own fee input,
+satisfy the ephemeral-dust rule, and keep the tail's satoshis as fee credit.
+
+**Consequence: a tail can never block, hold hostage, or price a sibling's exit.** In Spark a branch
+containing a sub-dust child is dead for everyone in it; here the sibling sweeps the tail and proceeds.
+
+**The security analysis, because a signature committing to no outputs deserves one.**
+
+* **What it authorises.** `ANYONECANPAY` commits to *this* input — its outpoint and its amount — so the
+  fragment cannot be replayed against any other outpoint, including another tail under the same key.
+  `SIGHASH_NONE` lets the spender choose every output. So the fragment is an unconditional licence to
+  spend **one specific outpoint worth at most 329 sat**, and nothing else.
+* **Blast radius.** Bounded by the tail's own value, which the tail's owner surrendered deliberately as
+  the price of riding for free. No other output, coin or tier is reachable with it.
+* **Why sweeping tails is not a business.** At most ONE tail per transaction, value in `[1, 329]`. Any
+  thief must first put the split on chain, which costs roughly 168 vB — about 504 sat at 3.0 sat/vB, and
+  more at any realistic rate. **The maximum prize is strictly less than the minimum cost**, on every
+  fee schedule, so the attack never pays. The one-tail-per-transaction cap is what makes this argument
+  hold, and it MUST be bound in the verifier rather than left as a convention.
+
+**REQ-83 (any amount, and the tail that makes it possible).** A payment of any amount at or above 1 sat
+MUST be expressible. Amounts below `DUST_LIMIT` MUST ride as a tail: at most one per transaction, value
+in `[1, DUST_LIMIT)`, in a transaction carrying the funded 240 anchor at zero fee.
+
+**REQ-84 (a tail MUST carry its release fragment).** No tail may be created without its
+`SIGHASH_NONE|ANYONECANPAY` release fragment being conveyed to every sibling of that split. A tail
+without one is a hostage: it makes the split unbroadcastable and strands every sibling, which is
+precisely Spark's failure and MUST NOT be reproduced. The verifier MUST refuse a bundle whose split
+carries a tail with no fragment.
+
+**REQ-85 (the one-tail cap is load-bearing, not tidiness).** At most one sub-dust output per
+transaction MUST be enforced in the verifier. It is what keeps the maximum sweepable prize below the
+minimum cost of broadcasting, and it is the whole of the economic argument in §6.0.4.
+
+**UNPROVEN.** Nothing here has been built or run. The load-bearing claims — that a funded 240 anchor
+leaves the dust slot genuinely free, that a `[tail, funded anchor]` split relays as a zero-fee package,
+and that the release fragment behaves as analysed — are read from policy source and from our own
+constants. §0.2 applies: presence and ordering, never behaviour. Each needs plant-and-run before this
+section may be relied upon.
+
+
 
 ### 6.1 In-ladder split (laddered coins)
 A non-exact payment out of a laddered coin is an **in-ladder split**. `transfer()` routes on
