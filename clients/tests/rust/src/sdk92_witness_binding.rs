@@ -104,6 +104,13 @@ struct Honest {
 }
 
 fn build_honest(value: u64) -> Result<Honest> {
+    build_honest_spending(value, Txid::all_zeros())
+}
+
+/// [#171] `build_honest`, but spending a CHOSEN outpoint. The attack case needs a disclosure that is
+/// internally consistent — so the SE co-signs it — while naming a transaction the SE co-signed under
+/// SOMEBODY ELSE'S sid, which is what the parent edge is resolved from.
+fn build_honest_spending(value: u64, prevout_txid: Txid) -> Result<Honest> {
     let secp = Secp256k1::new();
 
     let sk1 = SecretKey::from_slice(&[0x21u8; 32])?;
@@ -135,7 +142,7 @@ fn build_honest(value: u64) -> Result<Honest> {
         version: 3,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+            previous_output: OutPoint { txid: prevout_txid, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence(0xFFFF_FFFD),
             witness: Witness::new(),
@@ -509,6 +516,93 @@ pub async fn execute() -> Result<()> {
         "SDK92 - [d] PASS: binding is MANDATORY. The same request the SE served with a disclosure is \
          refused without one, so REQ-57 is a property of the SE and not a convention among clients."
     );
+    // ===== (e) [#171] CAN A CALLER GRAFT ITS LEAF ONTO SOMEBODY ELSE'S? ========================
+    //
+    // The frontier is "every node that is not the parent of another", and `owed` pays only FRONTIER
+    // leaves. So a holder can be removed from the payout set WITHOUT forging their release: give
+    // their leaf a CHILD, and it stops being frontier.
+    //
+    // The parent edge is resolved from `signed_tx_owners(prevout_txid)` — the sid the SE co-signed
+    // that transaction under. The question this case answers is whether anything stops a caller
+    // naming a prevout that belongs to a DIFFERENT coin. The SE cannot look at the chain (REQ-58),
+    // so it cannot check that the outpoint really pays this coin; the disclosure is self-consistent
+    // by construction, because the caller supplies the prevout spk and value it wants hashed.
+    //
+    // The signature produced would be useless — it would not validate against the real output — but
+    // a useless signature that still writes a registry row is exactly the problem: the row is what
+    // the frontier is computed from.
+    let victim_bundle = mercuryrustlib::tesr::load(&cc, "sdk92_alice", &sid)
+        .await?
+        .ok_or(anyhow!("[e] the victim coin has no ladder to borrow a txid from"))?;
+    let victim_txid: Txid = victim_bundle.trigger.txid.parse()?;
+
+    let t2 = mercuryrustlib::deposit::get_token(&cc).await?;
+    alice.add_prepaid_token(&t2.token_id).await;
+    let addr2 = alice.get_deposit_address(DEPOSIT).await?;
+    bitcoin_core::sendtoaddress(u32::try_from(DEPOSIT)?, &addr2)?;
+    bitcoin_core::generatetoaddress(3, &core)?;
+    let mut attacker_sid = String::new();
+    for _ in 0..60 {
+        alice.claim().await?;
+        let coins = coins_of(&cc, "sdk92_alice").await?;
+        if let Some(c) = coins.iter().find(|c| {
+            c.status == mercurylib::wallet::CoinStatus::CONFIRMED
+                && c.duplicate_index == 0
+                && c.statechain_id.as_deref() != Some(sid.as_str())
+        }) {
+            attacker_sid = c.statechain_id.clone().unwrap_or_default();
+            if !attacker_sid.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if attacker_sid.is_empty() {
+        return Err(anyhow!("[e] could not obtain a second coin to attack from"));
+    }
+
+    let graft = build_honest_spending(DEPOSIT, victim_txid)?;
+    let (graft_status, graft_body) =
+        raw_partial_signature(&lockbox, disclosure_body(&attacker_sid, &graft, DEPOSIT)).await?;
+    println!(
+        "SDK92 - [e] GRAFT PROBE: attacker {} signed a tx whose prevout is {}, a transaction the SE \
+         co-signed under victim {} -> HTTP {graft_status}  {graft_body}",
+        &attacker_sid[..8.min(attacker_sid.len())],
+        &victim_bundle.trigger.txid[..16.min(victim_bundle.trigger.txid.len())],
+        &sid[..8.min(sid.len())]
+    );
+    println!(
+        "SDK92 - [e] INSPECT: SELECT statechain_id, parent_statechain_id FROM se_leaf WHERE \
+         statechain_id IN ('{attacker_sid}','{sid}');"
+    );
+    // **THIS PROBE IS INCONCLUSIVE AS BUILT, AND MUST NOT BE READ AS A PASS.**
+    //
+    // `build_honest_spending` derives its aggregate from FIXED test keys, so the disclosure carries
+    // an aggregate belonging to no real coin and REQ-68 refuses it (403) before `observe_leaf` is
+    // ever reached. That is the wrong door: a real attacker signs under the aggregate of a coin it
+    // actually owns, which is public and which it can reproduce.
+    //
+    // What a conclusive probe needs: the attacker's OWN coin keys, so the disclosure passes REQ-68
+    // (agg matches its sid) and REQ-57 (session rebuilt from a self-consistent disclosure, with the
+    // attacker's own prevout spk and value) — while the transaction's INPUT OUTPOINT names a
+    // transaction the SE co-signed under the victim. Neither gate examines the outpoint's ownership,
+    // and REQ-58 forbids the SE from resolving it on chain.
+    //
+    // Until that probe exists, the graft question is OPEN. A 403 here is evidence about REQ-68, not
+    // about the frontier.
+    if graft_status == 403 && graft_body.contains("not this coin's") {
+        println!(
+            "SDK92 - [e] INCONCLUSIVE: refused by REQ-68 (wrong aggregate), so the graft path was \
+             never reached. This is NOT evidence that the frontier is safe — see the comment above \
+             for what a real probe requires."
+        );
+    } else if graft_status == 200 {
+        println!(
+            "SDK92 - [e] the SE CO-SIGNED it. Whether that poisoned the frontier depends on the \
+             registry row — check the query above before concluding either way."
+        );
+    }
+
     println!("SDK92 - ALL ASSERTIONS PASSED");
     Ok(())
 }

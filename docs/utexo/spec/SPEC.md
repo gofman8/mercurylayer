@@ -963,12 +963,64 @@ and the exit-transaction cap is **19**, lowered by D53. An earlier costing of th
 constants MUST be re-derived from the values the code actually carries, and MUST account for rollover
 levels and split levels drawing on the **same** budget.
 
-#### 5.4.4 What is retired below, and what is not
+#### 5.4.4 Consolidation — how a tree actually closes, and why it is not a round
+
+The round had TWO jobs and §5.4.1 named only one. Batching re-anchors was the first. The second was
+making **complete ownership schedulable**: giving the holder of a partial claim a way out that is not
+"broadcast your branch and drag every ancestor on chain with it". Retiring the round without answering
+that leaves a hole, and this subsection is the answer.
+
+**A tree closes when its ROOT OWNER decides to close it, and it costs one transaction.** The mechanism
+is the collapse transaction and its predicate, which are built: `C` spends the root's funding output
+`F`, pays **every unreleased frontier leaf its full funding value at its own exit key**, and pays the
+remainder to the root owner. Leaves whose holders have released are owed nothing. **The payouts come
+out of `F` itself — the tree's own money — so the closer fronts NOTHING.**
+
+Depth is irrelevant to this. The un-broadcast split transactions are simply discarded: nobody has to
+broadcast them, because nobody is in dispute about who owns what. A tree ten levels deep closes in the
+same single transaction as a flat one.
+
+**Why this is not the round, restated because the transaction is the same one.** The round's float came
+from `out[0]`, the successor root, which had to be **confirmed before** holders could migrate onto it.
+Remove the migration and the successor root goes with it, and all three terms of the float —
+participation, window, epoch — have nothing left to multiply. What remains is a single spend of a UTXO
+by its owner, settling with the co-owners who did not sell. **The on-chain footprint is unchanged**
+(`155 + 43·N` for `N` unreleased leaves); what changed is that no capital has to exist in advance.
+
+**REQ-81 (a close is an owner's operation, never a schedule).** Closing a tree MUST be triggered by its
+root owner's decision, never by a calendar, an epoch or a deadline. No holder may be compelled to
+migrate, and a holder who does nothing MUST simply be paid their full funding value when the tree
+closes. There is no window to miss and no absentee penalty; "absentee" ceases to be a category.
+
+**REQ-82 (consolidation requires the ROOT, and this asymmetry MUST be priced).** `C` spends `F`, and
+`F` is a 2-of-2 between the root owner and the SE. `collapse_grant` issues only the SE's half. **A party
+that has bought every leaf but does NOT own the root cannot close the tree** — its only route to chain
+is materialising a branch, the expensive path this section exists to avoid. Therefore:
+
+* an SSP consolidating a tree it created itself (deposited and split, so it holds the root) can always
+  close;
+* an SSP buying leaves in a tree it does NOT own has **no exit but materialisation**, and MUST price
+  that difference into what it pays;
+* buying into a foreign tree SHOULD start with the root, not with the leaves.
+
+**This is REQ-53's substance, and §5.4.5 retires REQ-53 too quickly.** REQ-53 said a round-managed root
+must have been deposited and split by the SSP. Read as "eligibility for a round" that dies with the
+round. Read as "the closer must own the root" it is **load-bearing for the replacement**, and it is
+restated here rather than lost.
+
+**NOT YET RUN.** Every claim in this subsection about behaviour — that discarding the un-broadcast
+splits is clean at the SE, that the census stays balanced when a tree closes, that a partially-bought
+tree closes for `155 + 43·N` — is derived from the predicate's code and has never been exercised
+end to end. §0.2 applies: this is presence and ordering, not behaviour.
+
+#### 5.4.5 What is retired below, and what is not
 
 | | status | why |
 |---|---|---|
-| REQ-53, REQ-54, REQ-55 | **RETIRED** | round eligibility, the R0–R9 sequence, and `C`'s single-input rule describe a transaction that is no longer built |
-| REQ-56, REQ-58 | **RETIRED** | the frontier predicate and its prohibitions govern `collapse_grant`, which has no caller once the round is gone |
+| REQ-54 | **RETIRED** | the R0–R9 sequence describes a scheduled migration that is no longer performed |
+| REQ-53 | **SUBSTANCE SURVIVES (REQ-82)** | "eligibility for a round" dies; "the closer must own the root" is load-bearing for consolidation and is restated in §5.4.4 |
+| REQ-55 | **SURVIVES** | `C` still has exactly one input, for the same reason: a second input would need a depositor's signature, and anyone who can stall a close by going quiet can hold a tree hostage |
+| REQ-56, REQ-58 | **SURVIVE** | the frontier predicate is what makes a CLOSE safe for the holders who did not sell — it is the replacement's core, not the round's leftover. `collapse_grant` keeps its caller; only the trigger changed |
 | REQ-59, REQ-64 | **RETIRED** | grant re-grantability and the no-suspend rule are properties of a round |
 | REQ-65 | **RETIRED** | "an unclaimed payee is still paid" was a property of the collapse; with no collapse, an unclaimed payee simply keeps their coin |
 | REQ-57, REQ-68 | **SURVIVES** | witness binding and the SE's derived aggregate are general SE hardening, built and mandatory, independent of any round |
