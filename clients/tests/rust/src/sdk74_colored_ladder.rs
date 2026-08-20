@@ -99,6 +99,216 @@ fn parse(hex_tx: &str) -> Result<electrum_client::bitcoin::Transaction> {
     Ok(deserialize(&hex::decode(hex_tx)?)?)
 }
 
+/// One completed attempt at section 10's RIVAL condition, on ONE carrier.
+struct RivalRun {
+    /// Every extension that has ever ridden the trigger's payload output, in build order — the LIVE
+    /// one last, the superseded ones before it.
+    rivals: Vec<electrum_client::bitcoin::Txid>,
+    renewals: u32,
+    renewed: mercuryrustlib::tesr::TesrBundle,
+}
+
+/// Renew a coloured carrier down its extension schedule until section 10's RIVAL condition holds:
+/// **at least 3 rivals over one parent output, AND a live extension that is not the internal-txid
+/// minimum.**
+///
+/// `Ok(None)` means ONE thing, and it is not a defect: the schedule ran out before the ordering came
+/// up right. There is no re-roll inside a carrier — every extension txid is fully determined by the
+/// funding outpoint and the `(m, CSV)` rung — so the caller answers `None` with a FRESH carrier.
+/// Every other outcome is an `Err` or a panicking assert, and none of those may ever be retried:
+/// this function must never be the thing that swallows a real bundle collapse.
+async fn renew_until_rivals(
+    alice: &UtexoWallet,
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet: &str,
+    statechain_id: &str,
+) -> Result<Option<RivalRun>> {
+    let bundle = mercuryrustlib::tesr::load(cc, wallet, statechain_id)
+        .await?
+        .ok_or(anyhow!("the carrier {statechain_id} has no ladder to renew"))?;
+    let mut rivals: Vec<electrum_client::bitcoin::Txid> =
+        vec![bundle.current().extension.txid.parse()?];
+    let mut csv_e = bundle.current().extension.csv.ok_or(anyhow!("no ext csv"))?;
+    let mut renewals = 0u32;
+    let params = bundle.params;
+    let live_is_not_minimum = |rivals: &Vec<electrum_client::bitcoin::Txid>| {
+        rivals.len() >= 3 && rivals.iter().min() != rivals.last()
+    };
+    // **FAULT INJECTION, so the re-roll is REACHABLE ON DEMAND rather than only when the hash
+    // lottery obliges.** `SDK74_FORCE_REROLL=n` makes the first `n` carriers report the schedule as
+    // spent, which is the one outcome the caller answers with a fresh carrier.
+    //
+    // Without this the retry is untestable in practice: a carrier misses about 1 time in 12, so a
+    // green run says nothing about whether the re-roll works — five consecutive passes with zero
+    // re-rolls is the ordinary case, not evidence. An unexercised recovery path that reads as a
+    // working one is exactly the failure this whole section exists to detect, and it would be
+    // ironic to ship one here.
+    //
+    // It can only ever CAUSE a re-roll, never suppress one or weaken an assertion: the forced
+    // return is the same `Ok(None)` the real exhaustion takes, so the caller cannot tell them apart
+    // and every assertion downstream is reached identically.
+    // A COUNTDOWN, not a flag: the first `n` carriers report spent and the rest behave normally, so
+    // ONE run exercises the re-roll AND the success that must follow it. A plain flag would force
+    // every attempt and only ever reach the give-up error, leaving the path that actually matters —
+    // recovering onto a fresh carrier — as unproven as it was before.
+    static FORCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    let _ = FORCED.compare_exchange(
+        u32::MAX,
+        std::env::var("SDK74_FORCE_REROLL").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if FORCED
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| if n > 0 { Some(n - 1) } else { None },
+        )
+        .is_ok()
+    {
+        println!(
+            "SDK74 - SDK74_FORCE_REROLL: reporting this carrier's schedule spent, to exercise the \
+             re-roll deliberately"
+        );
+        return Ok(None);
+    }
+    while !live_is_not_minimum(&rivals) {
+        // **[D14] Step by δE, not by 1.** This loop used to walk the extension CSV down one block at
+        // a time to manufacture the txid ordering it needs. That produces OFF-GRID renewals — 12, 11,
+        // 10 … on a schedule whose only legal extension values are `e0 − m·δE` — and, since D14, a
+        // receiver refuses them: the separation between the superseded extension and its live
+        // replacement would be ONE BLOCK, below the δE propagation budget the design says a race
+        // needs. The bundle this loop built could no longer be claimed, which is the correct outcome
+        // and made the test fail for the right reason.
+        //
+        // Stepping by δE is what an honest renewal does (`ext_csv(m)`), and it still reaches the
+        // rival condition: regtest walks 12 → 9 → 6 → 3 (`e_floor`), which is three renewals.
+        csv_e = match csv_e.checked_sub(params.delta_e).filter(|c| *c >= params.e_floor) {
+            Some(c) => c,
+            // Headroom spent. TWO DIFFERENT CAUSES LIVE HERE, and only one of them is worth
+            // re-rolling — so they are separated rather than both answered with a fresh carrier.
+            //
+            // If fewer than 3 rivals were ever built, the SCHEDULE cannot produce the configuration
+            // at all: `rivals.len() >= 3` is unreachable for these params, every carrier will miss
+            // identically, and four re-rolls will burn a few minutes to arrive at an error blaming
+            // a 1-in-20000 hash coincidence for what is a parameter change. Concretely, δE 3 -> 6,
+            // or e_floor 3 -> 4, or e0 12 -> 9 each knock the walk down to <= 2 rungs. That is a
+            // deterministic, permanent condition and it is reported as itself, immediately.
+            //
+            // With 3 or more rivals in hand, the ordering genuinely is a lottery and the caller
+            // re-rolls. Distinguishing the two is the difference between a message that points at
+            // the real cause and one that sends the next reader hunting an rgb-lib defect that is
+            // not there.
+            None if rivals.len() < 3 => {
+                return Err(anyhow!(
+                    "the extension schedule produced only {} rival(s) before reaching the floor, \
+                     so this section's >=3-rival configuration is UNREACHABLE for these params \
+                     (e0/δE/e_floor), not merely unlucky. Re-rolling carriers cannot help: every \
+                     carrier walks the same schedule. Fix the params or the section's premise.",
+                    rivals.len()
+                ))
+            }
+            None => return Ok(None),
+        };
+        let m = alice.renew_colored_ladder_with(statechain_id, csv_e, params.state_csv(0)).await?;
+        renewals += 1;
+        assert_eq!(m, renewals, "each renewal advances the counter the seal rung folds in");
+        let b = mercuryrustlib::tesr::load(cc, wallet, statechain_id)
+            .await?
+            .ok_or(anyhow!("ladder vanished"))?;
+        rivals.push(b.current().extension.txid.parse()?);
+    }
+    let renewed = mercuryrustlib::tesr::load(cc, wallet, statechain_id)
+        .await?
+        .ok_or(anyhow!("ladder vanished"))?;
+    Ok(Some(RivalRun { rivals, renewals, renewed }))
+}
+
+/// Mint a BRAND-NEW coloured carrier — a fresh funding outpoint under a fresh contract, laddered by
+/// `claim()` exactly as section 1 builds the first one — and return `(statechain_id, asset_id)`.
+///
+/// This exists only to RE-ROLL section 10's txid ordering, and it goes all the way back to a fresh
+/// issuance because nothing cheaper would work: the ordering is a function of the funding outpoint
+/// and the `(m, CSV)` rung, so a different outpoint is the only thing that draws a different one.
+async fn mint_colored_carrier(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet: &UtexoWallet,
+    wallet_name: &str,
+    ticker: &str,
+    core: &str,
+) -> Result<(String, String)> {
+    let t = prepaid_token(cc).await?;
+    wallet.add_prepaid_token(&t).await;
+    let fund = wallet.get_token_funding_address().await?;
+    bitcoin_core::sendtoaddress(100_000, &fund)?;
+    bitcoin_core::generatetoaddress(3, core)?;
+    tokio::time::sleep(Duration::from_secs(3)).await; // electrs indexing
+    let t = prepaid_token(cc).await?;
+    wallet.add_prepaid_token(&t).await;
+    let asset_id = wallet.issue_token(ticker, "Coloured Ladder Token", 0, SUPPLY).await?;
+    bitcoin_core::generatetoaddress(3, core)?;
+
+    let mut waited = 0;
+    loop {
+        wallet.claim().await?;
+        if wallet
+            .get_token_balances()
+            .await?
+            .iter()
+            .any(|b| b.asset_id == asset_id && b.balance == SUPPLY)
+        {
+            break;
+        }
+        waited += 1;
+        if waited > 60 {
+            return Err(anyhow!("the re-roll carrier {ticker} did not confirm"));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    // Same extra passes as at establish: the allocation is booked only after the deposit confirms,
+    // and the coloured lane deliberately refuses a carrier whose allocation is not yet BOOKED.
+    for _ in 0..10 {
+        wallet.claim().await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Identified by the CONTRACT its ladder carries, never by elimination: the wallet now holds more
+    // than one carrier, and a re-roll that renewed the spent one would be no re-roll at all. The
+    // same lookup proves the fresh carrier really is COLOURED, which is the shape section 10
+    // measures — a re-roll onto a flat ladder must fail here rather than quietly weaken the section.
+    let coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet_name).await?.coins;
+    for c in coins.iter().filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0) {
+        let Some(sid) = c.statechain_id.clone() else { continue };
+        let Some(b) = mercuryrustlib::tesr::load(cc, wallet_name, &sid).await? else { continue };
+        if b.rgb.as_ref().map(|r| r.contract_id.as_str()) == Some(asset_id.as_str()) {
+            println!(
+                "SDK74 - re-roll carrier {sid} laddered COLOURED under a fresh contract {asset_id}"
+            );
+            return Ok((sid, asset_id));
+        }
+    }
+    // TWO CAUSES AGAIN, and they call for opposite responses. If a CONFIRMED coin holding this
+    // contract exists but carries no coloured ladder, that is a real coloured-lane regression and
+    // must be shouted about. If no such coin ever appeared, the deposit simply had not landed in
+    // time — a timing miss, the very class of flake this change exists to remove, and reporting it
+    // as a coloured-lane defect would point the next reader at something that is not broken.
+    let holds_contract = coins
+        .iter()
+        .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+        .any(|c| c.amount != Some(PLAIN_AMOUNT));
+    if holds_contract {
+        return Err(anyhow!(
+            "the re-roll carrier for {asset_id} CONFIRMED but was never laddered COLOURED — \
+             section 10 measures a coloured ladder, so this is a coloured-lane regression and \
+             must fail loudly rather than be retried"
+        ));
+    }
+    Err(anyhow!(
+        "no CONFIRMED carrier ever appeared for the re-roll contract {asset_id} within the \
+         timeout. This is a TIMING miss on the fresh deposit, not a coloured-lane defect — do not \
+         go looking for one."
+    ))
+}
+
 pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
@@ -167,7 +377,7 @@ pub async fn execute() -> Result<()> {
 
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
-    let asset_id = alice.issue_token("CTES", "Coloured Ladder Token", 0, SUPPLY).await?;
+    let mut asset_id = alice.issue_token("CTES", "Coloured Ladder Token", 0, SUPPLY).await?;
     bitcoin_core::generatetoaddress(3, &core)?;
 
     // No `establish` call anywhere: claim() is the ONLY thing that ladders, coloured or plain.
@@ -209,7 +419,7 @@ pub async fn execute() -> Result<()> {
         .iter()
         .find(|c| c.amount != Some(PLAIN_AMOUNT))
         .ok_or(anyhow!("carrier coin not found"))?;
-    let carrier_sid = carrier.statechain_id.clone().ok_or(anyhow!("carrier has no sid"))?;
+    let mut carrier_sid = carrier.statechain_id.clone().ok_or(anyhow!("carrier has no sid"))?;
     let carrier_op = format!(
         "{}:{}",
         carrier.utxo_txid.clone().unwrap_or_default(),
@@ -509,39 +719,65 @@ pub async fn execute() -> Result<()> {
     // tier happens to be the lottery winner. So renew until BOTH hold: at least 3 rivals exist, and
     // the LIVE extension is deliberately not the internal-txid minimum. Under collapse that is
     // exactly the configuration in which the leaf consignment comes back carrying the wrong witness.
-    let mut rivals: Vec<electrum_client::bitcoin::Txid> = vec![bundle.current().extension.txid.parse()?];
-    let mut csv_e = bundle.current().extension.csv.ok_or(anyhow!("no ext csv"))?;
-    let mut renewals = 0u32;
-    let params = bundle.params;
-    let live_is_not_minimum = |rivals: &Vec<electrum_client::bitcoin::Txid>| {
-        rivals.len() >= 3 && rivals.iter().min() != rivals.last()
+    //
+    // **REACHING that configuration is itself a lottery, so it is RE-ROLLED — never relaxed.**
+    //
+    // One carrier only gets so many tickets. Its extension txids are fully determined by its funding
+    // outpoint and the `(m, CSV)` rung, and the schedule walks 12 → 9 → 6 → 3 (`e_floor`) — four
+    // rivals, with no knob that redraws them. The loop stops at the third rival unless that third
+    // one is the minimum (1 in 3), then at the fourth unless the fourth is the minimum too (1 in 4),
+    // so about 1 carrier in 12 spends the whole schedule without ever reaching the configuration.
+    // The loop below used to report that as a test failure ("ran out of extension CSV headroom"),
+    // which measured the hash lottery rather than the code under test — a run died there on
+    // 2026-08-19 and an immediate re-run, with no code change, passed.
+    //
+    // The answer is a fresh CARRIER, not a weaker condition: a different funding outpoint draws a
+    // fully independent ordering. Up to `RIVAL_ATTEMPTS` carriers are laddered in turn and the first
+    // one that reaches the condition is the one the section runs on, which puts a run's odds of
+    // never getting there at roughly 1 in 20 000.
+    //
+    // Everything that can actually FAIL stays outside this loop and unconditional. `Ok(None)` is
+    // returned for exactly ONE cause — the schedule running out — so a real collapse, a refused
+    // renewal or a miscounted `m` still kills the run on the first attempt; the >=3-rival and
+    // not-the-minimum preconditions are re-asserted below rather than assumed from the loop; and the
+    // decisive assertion (the leaf consignment embeds the LIVE extension and none of the superseded
+    // ones) is reached exactly once, on the carrier that got there.
+    const RIVAL_ATTEMPTS: u32 = 4;
+    let mut attempt = 1u32;
+    let (rivals, renewals, renewed) = loop {
+        match renew_until_rivals(&alice, &cc, "sdk74_alice", &carrier_sid).await? {
+            Some(run) => {
+                println!(
+                    "SDK74 - the rival condition held on carrier {attempt}/{RIVAL_ATTEMPTS} \
+                     ({carrier_sid}) after {} renewal(s)",
+                    run.renewals
+                );
+                break (run.rivals, run.renewals, run.renewed);
+            }
+            None if attempt < RIVAL_ATTEMPTS => {
+                println!(
+                    "SDK74 - carrier {attempt}/{RIVAL_ATTEMPTS} ({carrier_sid}) spent its extension \
+                     schedule with the LIVE extension still the internal-txid minimum — the hash \
+                     lottery, not a collapse. Minting a fresh carrier to re-roll the ordering."
+                );
+                attempt += 1;
+                let ticker = format!("CTES{}", (b'A' + attempt as u8 - 1) as char);
+                let (sid, aid) =
+                    mint_colored_carrier(&cc, &alice, "sdk74_alice", &ticker, &core).await?;
+                carrier_sid = sid;
+                asset_id = aid;
+            }
+            None => {
+                return Err(anyhow!(
+                    "{RIVAL_ATTEMPTS} independent carriers in a row spent their extension schedules \
+                     with the live extension still the internal-txid minimum. One carrier misses \
+                     about 1 time in 12, so {RIVAL_ATTEMPTS} in a row is roughly 1 run in 20000 — at \
+                     that point the likelier explanation is that tier txids stopped being drawn \
+                     independently of each other, not that the lottery went this way four times."
+                ));
+            }
+        }
     };
-    while !live_is_not_minimum(&rivals) {
-        // **[D14] Step by δE, not by 1.** This loop used to walk the extension CSV down one block at
-        // a time to manufacture the txid ordering it needs. That produces OFF-GRID renewals — 12, 11,
-        // 10 … on a schedule whose only legal extension values are `e0 − m·δE` — and, since D14, a
-        // receiver refuses them: the separation between the superseded extension and its live
-        // replacement would be ONE BLOCK, below the δE propagation budget the design says a race
-        // needs. The bundle this loop built could no longer be claimed, which is the correct outcome
-        // and made the test fail for the right reason.
-        //
-        // Stepping by δE is what an honest renewal does (`ext_csv(m)`), and it still reaches the
-        // rival condition: regtest walks 12 → 9 → 6 → 3 (`e_floor`), which is three renewals.
-        csv_e = csv_e
-            .checked_sub(params.delta_e)
-            .filter(|c| *c >= params.e_floor)
-            .ok_or(anyhow!("ran out of extension CSV headroom before the rival condition held"))?;
-        let m = alice.renew_colored_ladder_with(&carrier_sid, csv_e, params.state_csv(0)).await?;
-        renewals += 1;
-        assert_eq!(m, renewals, "each renewal advances the counter the seal rung folds in");
-        let b = mercuryrustlib::tesr::load(&cc, "sdk74_alice", &carrier_sid)
-            .await?
-            .ok_or(anyhow!("ladder vanished"))?;
-        rivals.push(b.current().extension.txid.parse()?);
-    }
-    let renewed = mercuryrustlib::tesr::load(&cc, "sdk74_alice", &carrier_sid)
-        .await?
-        .ok_or(anyhow!("ladder vanished"))?;
     let live_x = renewed.current().extension.clone();
     let min_rival = *rivals.iter().min().unwrap();
     assert!(rivals.len() >= 3, "need >=3 rivals over one parent output, have {}", rivals.len());
@@ -594,8 +830,9 @@ pub async fn execute() -> Result<()> {
     })?;
     assert_eq!(assigned, SUPPLY, "the renewed ladder still carries the whole allocation");
     println!(
-        "SDK74 - {renewals} coloured renewal(s): {} RIVAL extensions over {}:{}; live = {} (internal-txid \
-         minimum is {}, deliberately NOT the live one); leaf consignment embeds the live one and no rival",
+        "SDK74 - {renewals} coloured renewal(s) on carrier {attempt}/{RIVAL_ATTEMPTS}: {} RIVAL \
+         extensions over {}:{}; live = {} (internal-txid minimum is {}, deliberately NOT the live \
+         one); leaf consignment embeds the live one and no rival",
         rivals.len(),
         renewed.trigger.txid,
         renewed.trigger.payload_vout,
