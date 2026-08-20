@@ -868,7 +868,100 @@ true at realistic payment velocities.
 
 ---
 
-### 5.4 The discharge round — how a whole tree is retired for one transaction
+### 5.4 Coin renewal — why there is no round
+
+> **THE DISCHARGE ROUND IS RETIRED. OWNER DECISION, 2026-08-20.** The rule it violated is older than
+> the round: **this protocol MUST NOT require operator liquidity.** Not "less than Ark", not "0.11 %
+> with 900 staggered chains" — none. §5.5 derived a float of ≈ 9 % of TVL and then a way to shrink it;
+> shrinking was the wrong answer. An architecture whose capital requirement must be engineered down is
+> still an architecture with a capital requirement.
+>
+> **Everything below this banner, from REQ-53 to REQ-56, REQ-58, REQ-59, REQ-64 and REQ-65, is RETIRED**
+> — kept in place rather than deleted, per this document's practice of leaving corrections visible.
+> **REQ-57 (witness binding), REQ-60, REQ-61, REQ-62, REQ-63, REQ-66, REQ-67 and REQ-68 SURVIVE**: they
+> are properties of the SE and of the coin, they are built and exercised, and none of them depends on a
+> round existing. Read them as free-standing.
+
+#### 5.4.1 What the round was actually for, and why nothing needs to replace it
+
+The round batched **on-chain re-anchors**. A coin's exit material is ordered by a RELATIVE (BIP-68)
+timelock that must decrease every time a rival state is minted, so the budget is finite; an exhausted
+coin had to be re-anchored, and one collapse transaction retiring a whole tree was cheaper than one
+transaction per coin. The float was the price of the batching: to migrate a holder onto a successor
+root, that root had to be **confirmed first**, so the operator funded it before the old tree paid back.
+
+**That is the ONLY thing the float traces to.** Remove the requirement that a funded successor root
+exist before holders can move, and the operator's capital requirement is not small — it is **zero**.
+There is no window to carry, because there is no root to pre-fund.
+
+And nothing has to replace the batching, because **the budget it was batching does not need on-chain
+work to renew.** Renewal is a re-signing round between the holder and the SE: no broadcast, no funding
+UTXO, no fee input, no operator capital. The coin's timelock resets off-chain. When even that budget is
+spent, the chain is extended by **one transaction of exit depth** rather than re-anchored.
+
+#### 5.4.2 Measured against Spark, including a correction this document owes
+
+**An earlier draft of this section said Spark achieves its lack of expiry through trusted key deletion
+by its operators. That is FALSE, and the correction is kept rather than removed, because it is the
+error most likely to be repeated by anyone comparing the two designs.** Spark uses a decrementing
+relative timelock per transfer — structurally the same primitive as TES-R — and its own documentation
+states that a previous owner *can* broadcast and that the current owner must win the race. Deletion is
+not what protects the current owner, in Spark or here.
+
+What Spark has that this design was not using is the off-chain renewal above, plus a **zero-timelock
+prepend** when the node budget is exhausted, which buys an unbounded reset for one extra transaction of
+exit depth. Their published constants give roughly **330 transfers per depth level**.
+
+**This design's own budget is better: ≈ 576.** So the round was solving a problem this protocol has
+less of than the system it was being compared against.
+
+#### 5.4.3 The requirements that replace it
+
+**REQ-76 (no scheduled on-chain re-anchor).** No coin may require an on-chain transaction on a
+schedule, and no mechanism may require a funded successor output to exist before a holder can act.
+Renewal MUST be off-chain: a re-signing round that resets the relative-timelock budget and moves no
+value. An operator MUST NOT be required to hold capital for the correctness or the liveness of any
+path in this document.
+
+**REQ-77 (exhaustion extends depth; it does not re-anchor).** When a coin's relative-timelock budget is
+spent, the exit chain MUST be extended by prepending a transaction at timelock ZERO rather than by
+moving the coin on chain. The prepend is what makes the extension safe: **it fires ahead of every rival
+state in existence**, all of which carry a non-zero timelock, so after it confirms every prior rival is
+spending an output that no longer exists. **UNPROVEN — this is the claim the whole replacement rests
+on, and it must be plant-and-run before it is relied upon** (§0.2: a source scan establishes presence,
+never behaviour).
+
+**REQ-78 (the retired calendar was also the garbage collector — name what replaces it).** The absolute
+locktime chain did more than mark a deadline: a refresh (REQ-31) permanently invalidated every previous
+owner's backup and every old tier, which is why rival states did not accumulate without bound. Deleting
+the calendar deletes that collection. REQ-77's prepend is the replacement, and any design that adopts
+REQ-76 without answering this has moved the exhaustion problem rather than solved it. The rival set the
+budget is consumed against is **total** — live tier plus every superseded state plus every outstanding
+conveyed state — not merely the live one.
+
+**REQ-79 (quote the SHIPPED depth constants, not the drafted ones).** The mainnet split depth is **8**
+and the exit-transaction cap is **19**, lowered by D53. An earlier costing of this replacement used
+10 and 23 and overstated the transfer budget by roughly six times. Any figure derived from these
+constants MUST be re-derived from the values the code actually carries, and MUST account for rollover
+levels and split levels drawing on the **same** budget.
+
+#### 5.4.4 What is retired below, and what is not
+
+| | status | why |
+|---|---|---|
+| REQ-53, REQ-54, REQ-55 | **RETIRED** | round eligibility, the R0–R9 sequence, and `C`'s single-input rule describe a transaction that is no longer built |
+| REQ-56, REQ-58 | **RETIRED** | the frontier predicate and its prohibitions govern `collapse_grant`, which has no caller once the round is gone |
+| REQ-59, REQ-64 | **RETIRED** | grant re-grantability and the no-suspend rule are properties of a round |
+| REQ-65 | **RETIRED** | "an unclaimed payee is still paid" was a property of the collapse; with no collapse, an unclaimed payee simply keeps their coin |
+| REQ-57, REQ-68 | **SURVIVES** | witness binding and the SE's derived aggregate are general SE hardening, built and mandatory, independent of any round |
+| REQ-60, REQ-61, REQ-62, REQ-63, REQ-66, REQ-67 | **SURVIVES** | full-funding-value accounting, the offline payee/payer statements and the liveness and recourse statements are properties of the coin |
+
+**The built code that now has no caller** — `/collapse_grant`, the frontier predicate, `se_leaf`'s
+registry and its freeze — is NOT deleted by this edit. It is correct, it is tested, and deleting
+working code in the same change that retires its purpose is how a revert becomes impossible. Retiring
+it is a separate, later decision, and it MUST NOT be made on a source scan.
+
+### 5.4 The discharge round — how a whole tree is retired for one transaction [RETIRED — see 5.4.1]
 
 > **Status: ONE REQ BUILT (REQ-57), the rest DESIGN.** Except where a live test is cited below, every
 > claim in this section is grounded in a source scan, which by this project's evidence rule (§0.2)
@@ -1383,7 +1476,37 @@ as offline sending.**
 
 ---
 
-### 5.5 Operator liquidity — what must be funded, when it comes back, what happens when it runs out
+### 5.5 Operator liquidity — ZERO, and what that cost
+
+> **THE REQUIREMENT IS ZERO. OWNER RULE, 2026-08-20.** Everything in this section derived, tabulated
+> and then tried to shrink a float of ≈ 9 % of TVL. **The float is gone, not smaller**, because §5.4
+> retired the only thing that caused it: the requirement that a funded successor root be CONFIRMED
+> before a holder could migrate onto it. With no successor root there is no window, and with no window
+> there is nothing to carry.
+>
+> **This section is RETAINED, not deleted, and it is retained deliberately.** It is the derivation that
+> shows *where* the requirement came from, and it is the record of two errors worth keeping in front of
+> anyone who revisits this: (1) the first draft claimed Ark charges its operator capital per payment,
+> which is false — both designs are liquidity-free on their native path; (2) this document then spent a
+> section reducing 9 % to 0.11 % by tuning `W`, `epoch_days` and a chain count `K`, which was the wrong
+> class of answer to the wrong question.
+>
+> **What survives as normative:** REQ-69 (no per-payment liquidity) and REQ-73 (liquidity must not be
+> described as zero) — with REQ-73 now inverted by REQ-80 below, since it may at last be described as
+> zero and the reason is structural rather than promotional. REQ-70, REQ-71, REQ-72, REQ-74 and REQ-75
+> are **RETIRED**: they govern round windows, migration commitments, `f_next` and a chain count that no
+> longer exist.
+
+**REQ-80 (the zero claim is structural, and MUST be stated with its mechanism, never on its own).**
+This design may be described as requiring no operator liquidity, and unlike the claim REQ-73 was
+written to forbid, the statement is now true. It MUST always be accompanied by the mechanism that makes
+it true — off-chain renewal that moves no value, and depth extension instead of re-anchoring (REQ-76,
+REQ-77) — because "no liquidity" asserted without a mechanism is exactly the marketing claim REQ-73 was
+guarding against. It MUST NOT be extended to the Lightning legs (§8), which consume ordinary channel
+liquidity in both directions and always did; that lane is live, the round never was, and conflating
+them would repeat this section's original error in a new place.
+
+### 5.5 Operator liquidity — the retired derivation [RETIRED — see the banner above]
 
 > **Status: MIXED, and NOTHING here is measured.** The Lightning legs (§8.1, §8.2) are BUILT and
 > carry live tests; the round (§5.4) and the sweep (§5.3) are DESIGN, so their capital requirement is
@@ -1482,6 +1605,44 @@ On this document's worked parameters — `initlock = 10 000` ⟹ `epoch_days = 6
 
 At the central case — 90 % migrate, a one-week window — the operator stands behind **≈ 9 % of TVL**:
 363 BTC against a 4 000 BTC book.
+
+**THE FORMULA IS AN AVERAGE, AND IT ASSUMES SOMETHING THIS DOCUMENT NEVER STATED.** Everything above
+gives the STANDING float — what the operator carries *on average*, across the whole book. It is not
+what the operator must be able to fund at the moment a window opens, and the two differ by an order of
+magnitude at the chain counts REQ-53 actually requires.
+
+Per chain the successor root must be funded **in full** for the entire window: a holder migrates onto a
+confirmed `F_B`, and half a root buys no one a leaf. `W / epoch_days` is that chain's **duty cycle** —
+the fraction of the time its capital is busy — and a duty cycle is not a discount on the amount. The
+saving is REUSE: one buffer serves the next chain once the previous collapse frees it, so a book split
+across `K` independently-scheduled chains with staggered windows needs
+
+```text
+    capital  =  μ · max( W / epoch_days ,  1 / K ) · TVL
+```
+
+where `K` is the number of root-chains whose windows are scheduled independently. Both arms are real:
+
+* **large `K`** (`K ≥ epoch_days / W`) — the duty-cycle arm governs, chains hand the buffer along, and
+  the figure is the standing float tabulated above;
+* **small `K`** — the `1 / K` arm governs, and the requirement is the PEAK: one chain's successor root,
+  funded in full, because at least one is always mid-round. At `K = 1` the requirement is `μ · TVL`.
+  **The float is then not 9 % of TVL, it is 90 %.**
+
+The chain count that makes the tabulated figure reachable is `K_min = ⌈epoch_days / W⌉`:
+
+| `W` | `epoch_days` | standing float | `K_min` |
+|---:|---:|---:|---:|
+| 7 d | 69.4 | 9.07 % | **10** |
+| 4 h | 69.4 | 0.22 % | **417** |
+| 4 h | 138.9 | 0.11 % | **834** |
+
+**REQ-53's two roots are not enough, and must not be read as if they were.** REQ-53 requires one
+maturing root and one current root; that is a statement about round MECHANICS — where migrations land
+while a collapse is pending — and it says nothing about capital. At `K = 2`, on this document's own
+central parameters, the requirement is `μ / 2` = **45 % of TVL**, five times the 9 % tabulated above.
+An operator who reads §5.5.2, runs the REQ-53 minimum, and provisions 9 % is under-capitalised by 5×,
+and discovers it when a window opens and migrations stop.
 
 **Bootstrap is not a separate spike.** Before the first collapse there is no `out[0]` to recycle, so
 the first cycle's capacity is real operator capital — but it is the same quantity as the steady-state
@@ -1611,10 +1772,37 @@ every undischarged holder is paid, which is a valid collapse — but the respons
 counted on every round rather than assumed on any, which is what makes the §5.5.2 figures checkable
 against what operators actually do.
 
+**REQ-75 (the float MUST be quoted as a PAIR, and the chain count MUST be published with it).**
+§5.5.2's standing float is an average that is only reachable at `K ≥ ⌈epoch_days / W⌉` staggered
+root-chains. Quoting it alone understates what an operator must actually hold, by `epoch_days / (W·K)`.
+
+An operator MUST publish `K` alongside `W` (REQ-72), and every statement of the liquidity requirement —
+normative document, operator disclosure or marketing — MUST carry BOTH numbers:
+
+* the **peak**, `μ · TVL / K` — what must be fundable when one chain's window opens, since a successor
+  root cannot be part-funded;
+* the **standing average**, `μ · (W / epoch_days) · TVL` — what is carried across the book over time.
+
+No document may state the standing figure on its own. Where `K < epoch_days / W` the peak governs and
+the standing figure is simply unreachable; the pair makes that visible instead of leaving it to be
+discovered when migrations stop mid-window.
+
+**Windows MUST be staggered, and staggering is a requirement rather than an implementation detail.**
+An operator whose chains open their windows together has an effective `K` of 1 no matter how many
+chains it runs, because the peak is what it must fund — the reuse the formula credits it with never
+happens. Scheduling is therefore load-bearing for the capital claim, and an operator that cannot
+stagger MUST quote `μ · TVL`.
+
+**Neither number has ever been observed.** No round has run, so `K` is not merely unmeasured but
+unchosen, and §12 carries a `NONE` row for REQ-69–REQ-73 that applies here unchanged.
+
 #### 5.5.7 What this section does NOT know
 
 * **`W` is unmodelled.** Nothing in this document derives a round window; it is an operating choice,
   and every figure in §5.5.2 is parametric in it.
+* **`K` is unchosen.** The chain count now carries the whole distance between the peak and the
+  standing average (REQ-75), and this document does not pick one. Until it does, the honest figure to
+  quote is the peak.
 * **`μ` is unmeasured.** Migration participation is a product outcome. The 90 % row is an
   illustration, not a prediction, and §5.4.6's rule applies — quote the worst case, because exit-key
   reassignment lets any holder force a payout instead of a migration, free and unattributable.
