@@ -931,6 +931,24 @@ spending an output that no longer exists. **UNPROVEN — this is the claim the w
 on, and it must be plant-and-run before it is relied upon** (§0.2: a source scan establishes presence,
 never behaviour).
 
+**THE PREPEND IS NOT UNBOUNDED, AND AN EARLIER DRAFT OF THIS REQUIREMENT IMPLIED IT WAS.** Each prepend
+adds one transaction to the exit chain, and the chain is capped: `max_split_depth` and `max_exit_txs`
+derive their bound from exit LATENCY — a chain is admitted only while `exit_wait_blocks +
+exit_slack_margin` still fits the epoch — so depth is limited by how long a unilateral exit may take,
+not by taste. When the cap is reached, prepending STOPS.
+
+**What happens then is a re-anchor, and it is not an exit.** The coin is refreshed: ONE transaction,
+single-input, the fee drawn from the coin, paid by whoever holds it, and the ladder resets completely.
+The coin continues. Nothing is forced on chain, no position is closed, and — the point of this section
+— **no operator capital is involved at any step**. Conflating this with a unilateral exit, as an earlier
+draft's wording invited, is wrong in the direction that matters: a unilateral exit is the disaster path
+and is never the answer to an exhausted budget.
+
+**So the on-chain event is made RARER by REQ-77, not eliminated.** State it that way. The block-space
+argument for this design has never rested on the round: it rests on transfers being free, so the
+amortisation is one re-anchor per many transfers. The round only ever batched that rare re-anchor, and
+it bought the batching with a standing float — the trade §5.5 now rejects.
+
 **REQ-78 (the retired calendar was also the garbage collector — name what replaces it).** The absolute
 locktime chain did more than mark a deadline: a refresh (REQ-31) permanently invalidated every previous
 owner's backup and every old tier, which is why rival states did not accumulate without bound. Deleting
