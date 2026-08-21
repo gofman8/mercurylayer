@@ -1504,8 +1504,40 @@ containing a sub-dust child is dead for everyone in it; here the sibling sweeps 
   fee schedule, so the attack never pays. The one-tail-per-transaction cap is what makes this argument
   hold, and it MUST be bound in the verifier rather than left as a convention.
 
-**REQ-83 (any amount, and the tail that makes it possible).** A payment of any amount at or above 1 sat
-MUST be expressible. Amounts below `DUST_LIMIT` MUST ride as a tail: at most one per transaction, value
+#### 6.0.5 Tails are a SATS-ONLY mechanism — a coloured tail would be a burn switch
+
+**The blast-radius argument in §6.0.4 holds only because a tail's worth is its satoshis. For a coloured
+leaf that is false, and the difference is not a detail — it is the whole safety case.**
+
+An RGB allocation is bound to an OUTPOINT, and the amount of the asset is carried in the consignment,
+not in the output's value. A 329-sat tail can therefore hold an unbounded quantity of an asset. The
+release fragment authorises **anyone** to spend that outpoint to **any** outputs, and spending a sealed
+outpoint without carrying its allocation forward **destroys the allocation**. So for a coloured tail:
+
+* the prize is not ≤329 sat, it is the entire allocation;
+* "maximum prize below minimum cost" collapses — sweeping becomes arbitrarily profitable;
+* and the fragment stops being a courtesy to siblings and becomes a **burn switch anyone may pull**.
+
+**REQ-86 (no coloured tails).** A tail MUST NOT carry an RGB allocation. The verifier MUST refuse a
+split that seals an allocation to a sub-dust output, and MUST refuse to issue a release fragment for
+any outpoint carrying one.
+
+**And RGB does not need tails, which is why this costs nothing.** For a coloured leaf the amount a user
+pays is the ASSET amount, and that is already arbitrary on any carrier — the satoshis are a vessel, not
+the payment. A coloured leaf therefore keeps a carrier at or above `DUST_LIMIT` and expresses any asset
+amount natively, with no grid, no tail and no fragment. The dust floor bounds the VESSEL, never the
+value being sent.
+
+**The same asymmetry applies to the swap.** A value-neutral swap needs a counterparty holding
+interchangeable value; satoshis are fungible and asset allocations are not, so an SSP can only swap
+coloured leaves of the SAME contract from its own inventory of that contract. **The swap is therefore a
+sats-side mechanism**, and coloured payments rely on exact-fit selection and whole-leaf retransfer —
+both of which are built, `cosign_colored_child_retransfer` included. Where no coloured subset fits, the
+fallback is a split, exactly as today.
+
+**REQ-83 (any amount, and the tail that makes it possible).** A SATS payment of any amount at or above 1 sat
+MUST be expressible; a COLOURED payment of any asset amount MUST be expressible on a carrier at or
+above `DUST_LIMIT` (§6.0.5). Amounts below `DUST_LIMIT` MUST ride as a tail: at most one per transaction, value
 in `[1, DUST_LIMIT)`, in a transaction carrying the funded 240 anchor at zero fee.
 
 **REQ-84 (a tail MUST carry its release fragment).** No tail may be created without its
