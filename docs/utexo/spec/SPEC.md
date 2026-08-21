@@ -868,7 +868,32 @@ true at realistic payment velocities.
 
 ---
 
-### 5.4 Coin renewal — why there is no round
+### 5.4 The payment flow — whole leaves, exact fit, swap, and one close
+
+**The shape of this system, stated positively before any of its history.**
+
+* **A balance is a SET of leaves**, not a single coin with a running total.
+* **A payment is a HANDOVER of whole leaves.** `child_retransfer` replaces a leaf's state tier at a
+  strictly lower CSV over the SAME output — node id, funding outpoint and value unchanged. One SE
+  co-signature, **zero new depth, zero on-chain bytes**. This is already built and exercised.
+* **Selection is exact-fit** over the leaf set (`select::exact_subset`, `Plan::Exact`), so an ordinary
+  payment never splits anything.
+* **When no exact subset fits, the wallet SWAPS** with an SSP at strictly equal value — leaves in,
+  leaves the SSP already holds out, no value created or destroyed and no capital at risk. Splitting is
+  the fallback, not the mechanism.
+* **Amounts below the dust limit ride as a TAIL** (§6.0), so any amount from 1 sat is expressible.
+* **A tree CLOSES once**, when its root owner decides: one transaction paying every unreleased leaf its
+  full value out of `F`, at any depth, with the un-broadcast splits simply discarded.
+
+Budget: `(d0 − d_floor)/delta = 36` hops per extension epoch × `m_max + 1 = 16` epochs = **576
+whole-leaf payments** per depth level, renewable off-chain at two co-signatures and zero depth. Spark's
+comparable figure is ~330.
+
+**There is no round, no epoch, no migration window and no absentee.** What follows records why, because
+the round was load-bearing in earlier drafts and its removal is the largest change this document has
+taken.
+
+#### 5.4.0 Coin renewal — why there is no round
 
 > **THE DISCHARGE ROUND IS RETIRED. OWNER DECISION, 2026-08-20.** The rule it violated is older than
 > the round: **this protocol MUST NOT require operator liquidity.** Not "less than Ark", not "0.11 %
@@ -876,11 +901,12 @@ true at realistic payment velocities.
 > shrinking was the wrong answer. An architecture whose capital requirement must be engineered down is
 > still an architecture with a capital requirement.
 >
-> **Everything below this banner, from REQ-53 to REQ-56, REQ-58, REQ-59, REQ-64 and REQ-65, is RETIRED**
-> — kept in place rather than deleted, per this document's practice of leaving corrections visible.
-> **REQ-57 (witness binding), REQ-60, REQ-61, REQ-62, REQ-63, REQ-66, REQ-67 and REQ-68 SURVIVE**: they
-> are properties of the SE and of the coin, they are built and exercised, and none of them depends on a
-> round existing. Read them as free-standing.
+> **REQ-53, REQ-54, REQ-59, REQ-64 and the entire operator-liquidity derivation (REQ-70…REQ-75) are
+> DELETED**, not marked retired — they described a scheduled migration this system does not perform, and
+> leaving them in place was making the document harder to read than the change it recorded.
+> **REQ-55…REQ-58, REQ-60…REQ-63 and REQ-65…REQ-68 SURVIVE** and are reproduced verbatim in §5.4.7:
+> they govern the SE, the close, and what a holder is owed, and none of them needs a round to exist.
+> REQ-53's substance — the closer must own the root — survives as REQ-82.
 
 #### 5.4.1 What the round was actually for, and why nothing needs to replace it
 
@@ -1003,10 +1029,10 @@ is materialising a branch, the expensive path this section exists to avoid. Ther
   that difference into what it pays;
 * buying into a foreign tree SHOULD start with the root, not with the leaves.
 
-**This is REQ-53's substance, and §5.4.5 retires REQ-53 too quickly.** REQ-53 said a round-managed root
-must have been deposited and split by the SSP. Read as "eligibility for a round" that dies with the
-round. Read as "the closer must own the root" it is **load-bearing for the replacement**, and it is
-restated here rather than lost.
+**This was REQ-53's substance, and it is the reason REQ-53 was not simply deleted.** REQ-53 said a
+round-managed root must have been deposited and split by the SSP. Read as "eligibility for a round" it
+dies with the round. Read as "the closer must own the root" it is **load-bearing for the replacement**,
+so it is restated here as REQ-82 rather than lost.
 
 **NOT YET RUN.** Every claim in this subsection about behaviour — that discarding the un-broadcast
 splits is clean at the SE, that the census stays balanced when a tree closes, that a partially-bought
@@ -1062,150 +1088,13 @@ cap at all, and `combine_leaves` already exists and has been exercised. The real
 **2×**, from spine levels being cheaper — not the ~60× a denomination grid appeared to promise, and it
 needs none of that machinery.
 
-#### 5.4.6 What is retired below, and what is not
+#### 5.4.7 Requirements that survive the round's deletion
 
-| | status | why |
-|---|---|---|
-| REQ-54 | **RETIRED** | the R0–R9 sequence describes a scheduled migration that is no longer performed |
-| REQ-53 | **SUBSTANCE SURVIVES (REQ-82)** | "eligibility for a round" dies; "the closer must own the root" is load-bearing for consolidation and is restated in §5.4.4 |
-| REQ-55 | **SURVIVES** | `C` still has exactly one input, for the same reason: a second input would need a depositor's signature, and anyone who can stall a close by going quiet can hold a tree hostage |
-| REQ-56, REQ-58 | **SURVIVE** | the frontier predicate is what makes a CLOSE safe for the holders who did not sell — it is the replacement's core, not the round's leftover. `collapse_grant` keeps its caller; only the trigger changed |
-| REQ-59, REQ-64 | **RETIRED** | grant re-grantability and the no-suspend rule are properties of a round |
-| REQ-65 | **RETIRED** | "an unclaimed payee is still paid" was a property of the collapse; with no collapse, an unclaimed payee simply keeps their coin |
-| REQ-57, REQ-68 | **SURVIVES** | witness binding and the SE's derived aggregate are general SE hardening, built and mandatory, independent of any round |
-| REQ-60, REQ-61, REQ-62, REQ-63, REQ-66, REQ-67 | **SURVIVES** | full-funding-value accounting, the offline payee/payer statements and the liveness and recourse statements are properties of the coin |
-
-**The built code that now has no caller** — `/collapse_grant`, the frontier predicate, `se_leaf`'s
-registry and its freeze — is NOT deleted by this edit. It is correct, it is tested, and deleting
-working code in the same change that retires its purpose is how a revert becomes impossible. Retiring
-it is a separate, later decision, and it MUST NOT be made on a source scan.
-
-### 5.4 The discharge round — how a whole tree is retired for one transaction [RETIRED — see 5.4.1]
-
-> **Status: ONE REQ BUILT (REQ-57), the rest DESIGN.** Except where a live test is cited below, every
-> claim in this section is grounded in a source scan, which by this project's evidence rule (§0.2)
-> establishes presence, absence and ordering — **never reachability, binding or behaviour**.
-> REQ-57 is the exception: it has been plant-and-run. Nothing else here has.
-> **The cryptographic prerequisite is verified present.** SE-side witness binding needs a *blinded*
-> `nonce_process` matching the blinded partial-sign the lockbox already calls, so the SE can
-> reconstruct a signing session from a disclosed transaction and byte-compare it. The pinned fork
-> exports `secp256k1_blinded_musig_nonce_process_without_keyaggcoeff(ctx, session, aggnonce, msg32,
-> aggregate_pubkey, adaptor, blinding_factor, tweak32)`, verified in the built lockbox image. `msg32`
-> is where the BIP-341 sighash of the disclosed transaction goes, which fixes what a disclosure must
-> carry: the aggregate nonce, the aggregate pubkey, the blinding factor, the output tweak, and enough
-> of the transaction to recompute the sighash. `deny_blinded_session_prerequisite_drift` pins the fork
-> and the API family so this cannot change unnoticed.
->
-> **REQ-57 (witness binding) is now BUILT and MEASURED — the rest of §5.4 is not.** The SE parses the
-> disclosed transaction, recomputes the BIP-341 key-path sighash, rebuilds the blinded session and
-> byte-compares it (`lockbox/src/witness.cpp`, `lockbox/src/tx.cpp`). Proven on the live stack by
-> `sdk92`, which measures three things rather than asserting them: the SE logged a successful bind
-> during an honest deposit+ladder; a disclosure whose prevout value is **one satoshi** high was
-> refused by the session comparison itself (*"the disclosed transaction does not produce the session
-> being signed"*); and the **same bytes with the correct value were not refused by the binding** —
-> without that third measurement a gate that refuses everything would be indistinguishable from one
-> that detects the lie. Unit differentials pin the reconstruction against client-generated vectors
-> (4/4 sighash, 3/3 session, each with negative controls).
->
-> **Coverage of the laddered lifecycle is MEASURED: `sdk92` reports 4 bound / 4 co-signatures** —
-> the deposit plus all three tiers, zero refusals. Tier co-signatures are the interesting ones:
-> `cosign_tier_request` hashes over the PARENT tier's output value, not `coin.amount`, so they are
-> where a disclosure that re-derives its prevout silently describes a hash nobody computed. That
-> drift existed and is fixed: prevouts, input index and sighash type are now passed from the hash
-> site (`calculate_musig_session`), so the disclosure and the sighash are one value rather than two
-> that happen to agree. `sdk71` independently exercises the same lane end to end — laddering,
-> conveyance and claim — at **14 bound / 14 co-signatures, 0 refusals** across 7 statechains.
->
-> **THE LIMIT THAT MATTERS: binding is a SELF-CONSISTENCY check, not proof of ownership.**
-> `witness::bind` receives no statechain id and no coin key; it rebuilds the session from the
-> `agg_pubkey`, `agg_nonce`, `blinding_factor` and `out_tweak` the CALLER supplied and compares it
-> against the session the CALLER sent. It therefore proves *"this transaction produces the session
-> you asked me to sign"* — which is exactly the anti-blind-signing property it was built for, and
-> what the one-satoshi test measures — but **not** that the transaction is a tier of the named coin.
-> A blind SE cannot prove the latter: it stores only its own key share and never the coin's
-> aggregate key, so it has nothing to compare against. See REQ-65 for the full statement and for what
-> it forbids (no parent edge may be resolved from the SE's index until this is closed).
->
-> **Both of the further limits are now CLOSED; the aggregate limit above is not.** (1) Binding was
-> opt-in per request, so a malicious client could simply decline to be bound. It is now
-> **mandatory**: a request carrying no disclosure is refused `400` and no signature is produced.
-> What made the flip safe was measuring it rather than assuming it — the SE logs every unbound
-> request by name, and across the live suite that count reached zero while bound requests reached
-> 118. Every client in this tree builds a disclosure without changing a line of client code,
-> because each forwards the signing payload wholesale and the shared library populates it.
-> (2) The **coloured multi-input** path (which discloses input `i` against the full prevout set,
-> where it previously claimed index 0 and a single prevout) is now exercised live: a four-input
-> coloured combine signs every input bound. What remains open is the aggregate limit stated above,
-> tracked as REQ-65 — and REQ-68 closes the part of it a stored aggregate can answer.
->
-> **A measurement trap worth stating, because it cost a full diagnosis.** `claim()` silently declines
-> to ladder when the SE's attestation identity is unpinned; the reason is *recorded, not raised*
-> (`ladderskip-<sid>` → `{"reason":"attestation-identity-unpinned"}`). An E2E run without
-> `UTEXO_ATTESTATION_IDENTITY` therefore never reaches `cosign_tier_request`, ends at
-> `sig_count == 1`, and reports **1 bound / 1 co-signature** — a ratio that is true, looks like full
-> coverage, and proves nothing about tiers. `sdk92` now refuses to report a ratio from an unladdered
-> coin and prints the recorded reason instead.
->
-> **The collapse predicate itself is still empty**: there is no leaf registry, no frontier, no
-> `collapse_grant` route, so the SE would presently co-sign a collapse that pays out nobody.
-
-#### 5.4.1 Why a round is necessary at all
-
-**Collapse is the only route to block-space scaling**: materialising any leaf requires broadcasting
-its entire ANCESTOR chain (a leaf's funding `SP.out[j]` is un-broadcast), so block space is spent on
-shared ancestors, and the only way an ancestor chain is never broadcast is that **nobody underneath
-it needs it**. Settling leaves one at a time — the §5.3 sweep, `combine_leaves`, any off-chain merge
-— cannot beat ~1.5× an ordinary on-chain payment, because each still buys one P2TR input. Off-chain
-merging does not escape it either: the merged piece still hangs off `SP`.
-
-Complete ownership of a sub-tree is therefore the whole game, and opportunistic buy-out cannot
-deliver it — **one holdout forbids the collapse**. The round makes complete ownership a scheduled
-event rather than a negotiation, and §5.3's sweep is an optimisation inside R1 rather than the
-settlement path.
-
-#### 5.4.2 The three discharge forms
-
-A root MUST NOT be spent until **every leaf under it is discharged**. There are exactly three ways,
-and the SSP can always reach full discharge **without any holder's participation**:
-
-| form | who | realised block space | requires |
-|---|---|---|---|
-| **(a) RELEASE** | holder was online, migrated to the successor root, signed a release | **0 vB** | holder online |
-| **(b) MANDATE** | holder pre-authorised, while online, migration onto ONE named already-confirmed root | 0 vB | opt-in, leaves them exit-only until they return |
-| **(c) PAYOUT** | everyone else | **43 vB** (one P2TR output) | **nothing, ever** |
-
-Form (c) is what makes holdouts structurally impossible: **the payout and the death of the old
-position are the same transaction**, so atomicity is Bitcoin's, not the protocol's.
-
-#### 5.4.3 The round
-
-**REQ-53 (round eligibility).** A round-managed root MUST have been deposited *and* split by the SSP
-(`k = 0`). A root acquired by transfer carries predecessor flat backups at higher locktimes and MUST
-NOT be round-managed. The SSP MUST run **at least two** roots: one *maturing* (being discharged) and
-one *current* (confirmed, accepting migrations). The collapse transaction's `out[0]` funds a future
-root, so a round both retires and re-funds in one transaction — there is no separate deposit.
-
-**REQ-54 (the sequence).** For maturing root `F_A` and confirmed current root `F_B`:
-
-| | step | verifiable by |
-|---|---|---|
-| **R0** | ANNOUNCE — publish freeze height `H_f` and the per-leaf `(exit_key, funding_value)` set as the SE recorded it, with a `utexo/leaf/v1` attestation | everyone |
-| **R1** | MIGRATE — for each responding holder, an ordinary in-ladder split on `B` conveying a leaf of **identical funding value**. The holder runs the **complete existing verifier unchanged** (`verify_conveyed_child` → `verify_child_bundle`, `f_spender` against a **confirmed** `F_B`, `cap_schedule`, `check_exit_headroom_with_margin`, `attested_terminal`, Model A, value conservation both ways) and takes first-class ownership. *This is not a new mechanism. It is a payment.* | the holder, fully, **with no new trust** |
-| **R2** | RELEASE — `POST /release {sid, nonce32, sig}`, BIP-340 under the leaf's latch key over `tagged("utexo/leaf_release/v1", sid‖nonce32)`. Monotone, never cleared, single-use nonce. **A consent record, not a spending authorisation** | the SE |
-| **R3** | MANDATE HARVEST (optional) — form (b) holders migrated under SE enforcement | the SE |
-| **R4** | NOTICE — the SSP publishes its intent to discharge. **Advisory only: nothing stops, nothing is ratcheted.** Wallets seeing it SHOULD prefer migrating over paying from `A`, so honest traffic drains voluntarily. Late arrivals join the payout set | everyone |
-| **R5** | BUILD `C` — one input, one output per undischarged leaf, plus the future root and a CPFP handle | — |
-| **R6** | GRANT — `POST /collapse_grant {root_sid, disclosure(C)}`; the SE runs REQ-56, sets `frozen` **prospectively**, issues the partial signature. **BUILT except the signature**: the route enforces one input (REQ-55), that `C` spends this root's own funding output or a transaction the SE co-signed under it, that the leaf set is known and well-formed, and that every unreleased frontier leaf is paid in full at its own key — then freezes. It returns a verdict with `partial_sig: null` and says so, rather than pretending to sign; issuing the signature in the same database transaction as the freeze (REQ-64) is the next increment | the SE, from state it authored |
-| **R7** | BROADCAST — **one transaction** retires `A`, pays every undischarged holder in full at their own key, and funds the next root | the chain |
-| **R8** | GRIEFED BRANCH — if anyone broadcasts `T_A` first, `C` dies and **nothing is lost**; re-run R5–R7 with `C.vin[0] = (T_A.txid, 0)` at `TRIGGER_SEQUENCE`, which confirms 720 blocks ahead of `X_A` | the chain |
-| **R9** | SETTLE — absentees hold ordinary spendable UTXOs at keys their own seeds derive, permanently out of the round machinery | the holder |
-
-```text
-C.vin  = [ (F_A.txid, F_A.vout) ]                     // exactly one input
-C.vout = [ P2TR(A_next)  value f_next                 // out[0]: the future root
-         , P2TR(K_i)     value >= fund_i   ...        // one per UNDISCHARGED leaf
-         , P2TR(ssp_change) ]                         // CPFP handle
-```
+Everything the discharge round introduced has been DELETED — the R0–R9 sequence, round eligibility,
+the grant's re-grantability, the no-suspend rule, and the whole operator-liquidity derivation. What
+follows are the requirements that were written inside that section but are NOT about a round: they
+govern the SE, the close, and what a holder is owed. They are reproduced verbatim, with the word
+"round" now meaning **a close** and "migration" meaning **an ordinary payment**.
 
 **REQ-55 (no third-party input).** `C` MUST have exactly one input. A depositor's signature MUST
 never be required to complete a round — otherwise any depositor can stall every round by going quiet.
@@ -1261,234 +1150,6 @@ the holder surrendered the key in advance — **both are custody**. A leaf adopt
 simply *is* `protocol_version = 3`, which this codebase does not admit
 (`ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]`, `clients/libs/rust/src/transfer_receiver.rs`).
 **Any proposal to revive offline succession MUST say in those words that it reinstates v3.**
-
-**REQ-64 (THE ROUND MUST NEVER SUSPEND SERVICE — the frontier is allowed to move).**
-**There is no establishment freeze. Holders keep transacting normally, right up to the instant the
-grant is issued.** The only freeze is the one REQ-56 performs *atomically inside* `collapse_grant` —
-the frontier is recomputed and `frozen` is set in the same call, so no leaf can appear between the
-check and the ratchet.
-
-**If the frontier moved since `C` was built, the grant is REFUSED and the SSP rebuilds `C`.** That is
-the whole cost, and it falls on the operator, never on a user. A pre-announced ratchet that stopped
-new establishments under the root would instead stop every holder on that tree from paying anyone,
-for an unbounded window, and an SSP that announced and then stalled — through malice or a crash —
-would freeze the tree until its epoch ran out. **Trading user outage for operator convenience is
-always the wrong direction.** Compare REQ-66: the same principle.
-
-**REQ-64a (the round provably terminates).** A rebuild loop — an adversary splitting repeatedly so
-the frontier never settles — cannot run forever: derived slots are a **per-parent LIFETIME
-allowance** (`count_derived_tokens`, `server/src/database/deposit.rs`, which counts spent tokens
-deliberately, else a parent could mint, consume, and re-mint free slots forever), and depth is
-capped. So the total number of establishments possible beneath a root is **bounded before the round
-begins**, and the frontier can only move finitely many times. Each move also costs the mover four SE
-co-signatures and real fees. **Termination is structural, not economic** — the economics merely make
-griefing pointless as well as futile.
-
-**REQ-64b (a refused co-signature MUST say why).** When `collapse_grant` has already frozen a root,
-subsequent co-signature refusals under it MUST be distinguishable from any other failure and MUST name
-the successor root, so a wallet retries on `B` instead of surfacing an error. A user whose payment
-lands just after a grant experiences **a clean refusal and a retry** — never a loss, never a silent
-failure.
-
-**REQ-64c (exit is NEVER suspended).** At every moment of a round — before the notice, during it,
-after the grant, after the collapse confirms — any holder can broadcast `T` and walk their own exit.
-`T` is fully pre-signed, carries no timelock, and needs **no SE, no coordinator, and no SSP**
-(`WatchBundle` carries only fully-signed transactions and public metadata,
-`WatchBundle::export_watch_bundle`, `clients/libs/rust-sdk/src/watchtower.rs`). **No holder is ever
-trapped, including one whose leaf is near its epoch deadline** — which is the case that makes an
-outage unacceptable rather than merely annoying.
-
-**REQ-66 (a conveyed-but-unreleased migration is a DOUBLE PAYMENT — the SSP MUST clear it).**
-R1 and R2 protect different parties and MUST happen in that order: **migration protects the holder**
-(they hold and have verified the replacement before giving anything up), **release protects the SSP**
-(without it the old leaf is still in the frontier, so REQ-56 forces `C` to pay them on chain *as well
-as* the leaf they already hold on `B`).
-
-So a migration that is conveyed and then neither claimed nor released is a leaf the SSP pays for
-twice. Before the round's notice the SSP MUST therefore, for every outstanding migration, either
-obtain the release or **cancel the conveyance and reclaim it** (`apply_cancel`,
-`server/src/database/transfer_cancel.rs`; `reclaim_cancelled_conveyance`,
-`clients/libs/rust/src/tesr.rs`). A round announced with unresolved conveyances is an
-operator-funded overpayment, not a protocol fault — **the holder is never at risk in either
-direction**, which is why the ordering is safe to leave to the operator.
-
-**REQ-67 (THE ABSENTEE'S PROTECTION MUST BE CRYPTOGRAPHIC, NOT THE SE PREDICATE ALONE).**
-REQ-56 says the SE refuses a collapse that does not pay every unreleased leaf. **That is not
-sufficient on its own.** In production the lockbox and the coordinator are the **same operator**, and
-the lockbox is a plain container, not an attested enclave — so REQ-56 is a rule enforced by software
-the SSP controls. For an ONLINE holder this is harmless: they verified their successor leaf
-themselves and hold its key share. **For an ABSENTEE it is the whole of their protection, and it is
-the same shape as trusting an unsigned operator assertion, one level up.**
-
-The consequence is concrete: once `C` confirms, every tier beneath `F` is dead, so an absentee who was
-not paid has **no recourse at all**. Their only remedy is to act *before* `C` confirms.
-
-So the absentee's protection MUST rest on something the operator cannot alter:
-
-1. **A watchtower MUST check pending collapses.** `C` is public from the moment it is broadcast. A
-   tower holding a `WatchBundle` for a leaf MUST, on seeing any spend of its root's `F`, check whether
-   an output pays its holder's `exit_key` at ≥ the leaf's funding value, and if not **broadcast `T`
-   immediately** — which invalidates `C` (both spend `F`) and preserves the whole tree. This needs no
-   key (`T` is pre-signed) and no trust in the operator.
-2. **The `WatchBundle` MUST therefore carry `exit_key` and `funding_value`**, so the check is
-   self-contained.
-3. **Wallet defaults MUST run this**, and the product docs MUST say plainly that an absentee's
-   protection is their tower, not the operator's good behaviour.
-
-With the tower, the SE predicate becomes what it should be — **the mechanism that makes the honest
-path cheap and the dishonest path detectable-and-defeatable**, rather than the sole thing standing
-between an absent user and their money. Without it, form (c) is custodial in substance for anyone who
-is not watching. **State this in those words wherever the round's trust model is described.**
-
-**REQ-56a (a MULTI-INPUT spend has several parents, and the frontier must account for all of
-them).** Measured on the live lane, not derived: the migration hatch's combine spends four carriers
-into two children, and the SE co-signs it once per input — one transaction, four signatures, four
-different sids. A registry that gives each child ONE parent therefore marks one carrier as spent and
-leaves the other three looking untouched, so each stays in its own frontier and a collapse is
-required to pay coins whose value has already moved into the children. That is an **overpay**: the
-operator's loss rather than a holder's, and never a theft — but a wrong answer from the one predicate
-whose entire job is exactness, and at scale it is what makes a round unaffordable.
-
-The SE's index now keeps **every** co-signer of a transaction rather than the first, so the evidence
-survives; which of them a child calls its parent, and how the frontier excludes a node spent by a
-transaction it did not solely fund, is REQ-59's question and is **not yet answered**. Until it is, a
-round MUST NOT be run over a tree containing a multi-input spend.
-
-**REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
-`establish_leaf` from the **witnessed payload output of the state tier** — identified structurally as
-the unique P2TR output, per REQ-61(a), and NOT at a client-supplied index. That key is **the payee's**
-because conveyance builds the child's tiers to the receiver's address. So a payee who was paid and
-**never claimed at all** is nonetheless in the frontier, and REQ-56 forces `C` to pay them their full
-funding value at their own key. Claiming is required to *spend*, never to *be paid*.
-
-**What "witnessed" does and does NOT mean — corrected 2026-08-17 after measuring the code.**
-An earlier draft of this paragraph said the SE reads `exit_key` and `fund_value` "out of a
-transaction whose sighash it recomputed and whose session it byte-compared, so both are facts it
-verified rather than fields a client asserted." The first half is true. The conclusion was too
-strong, and the difference matters to exactly the party this requirement protects.
-
-`witness::bind` takes **no statechain id and no coin key**. It rebuilds the session from the
-`agg_pubkey`, `agg_nonce`, `blinding_factor` and `out_tweak` **the caller supplied**, and compares
-against the session the caller sent. So binding establishes one thing: *the disclosed transaction,
-hashed against the disclosed prevouts under the disclosed keys, produces the session you asked me to
-sign.* Every input is the caller's. It is a self-consistency check.
-
-That is genuinely worth having — it is what stops "sign session `S`, which is over this benign
-transaction" when `S` is really over a different one, and `sdk92` measures it with a one-satoshi lie
-that the session comparison refuses. **It does not establish that the transaction is a tier of the
-coin whose sid was named.**
-
-**And a blind SE structurally cannot establish that.** The lockbox stores its own key share
-(`public_key` in `generated_public_key`) and never the coin's AGGREGATE key — that is what blindness
-means here. With no aggregate key it has nothing to compare `agg_pubkey` against. This is a
-consequence of the design, not a missing check, and any proposal to close it MUST say plainly which
-part of the SE's blindness it is giving up.
-
-**Consequences that must not be glossed.** `exit_key` and `fund_value` recorded at establishment are
-witnessed *in the weaker sense*: they come from a transaction the SE bound, not from one it can tie
-to the coin. Until that gap is closed, an entry in the SE's index attests "signed under this sid",
-never "is a tier of this coin" — so a **parent edge MUST NOT be resolved through it**, because
-REQ-56's frontier decides who is paid in a collapse and an absentee has no recourse afterwards
-(REQ-67).
-
-**REQ-68 (closing the gap requires a DEPOSIT-protocol change, and the SE cannot do it alone).**
-The obvious fix — have the SE compare the disclosed `agg_pubkey` against the coin's aggregate key —
-is **not buildable today**, and the reason is structural rather than an oversight: `/get_public_key`
-accepts only a `statechain_id`. The SE mints its own keypair, returns its share, and **never learns
-the client's public key**, so it can neither store nor derive the aggregate. There is nothing to
-compare against.
-
-Two candidate closures, and the difference between them is the whole question:
-
-* **Client asserts the aggregate at deposit.** Insufficient on its own. An adversary can assert a
-  VICTIM's aggregate for its own sid, and nothing detects it — the SE has no way to tell whose
-  aggregate it was handed. First-writer-wins on a uniqueness constraint only moves the race.
-* **Client supplies its OWN public key at deposit; the SE DERIVES the aggregate.** Sound, because
-  the aggregate is then a function of the SE's per-sid key share and the declared client key. An
-  adversary who declares a victim's client key still gets a *different* aggregate, since its sid's
-  server share differs — it cannot make its own coin's aggregate equal anyone else's. This is the
-  closure the spec recommends.
-
-**DECIDED 2026-08-17 by the operator: the lockbox DERIVES it.** Option (b), and the cost turned out
-to be far smaller than first stated — the correction matters enough to record, because the original
-framing would have bought a privacy concession that had already been made.
-
-**MEASURED: the coordinator already holds both.** `statechain_data` stores **`aggregate_xonly`
-(UNIQUE)** and **`user_public_key`** (`server/src/database/deposit.rs`). The client already sends its
-key at deposit; the operator already stores the aggregate, which *is* the funding address. So:
-
-* against the **operator** — who runs both the coordinator and the lockbox, and whose lockbox is a
-  plain container rather than an attested enclave (REQ-67) — the additional privacy cost is **zero**;
-* the residual is that the fact moves into a **second** operator-controlled database, widening the
-  blast radius of a lockbox-only breach or backup leak;
-* it becomes a real cost only in a future where the lockbox is run by a **different party or is
-  attested** — which is precisely the deployment in which you would want the SE verifying for itself.
-
-A `NULL` `aggregate_xonly` occurs only for **old clients** (the code says so), and D24 already
-decided legacy pre-0009 coins are ignored.
-
-**DERIVE, never accept.** The lockbox MUST compute the aggregate from the client's public key and its
-own key share, and MUST NOT take an aggregate supplied by the coordinator — the coordinator is
-exactly the party REQ-56's frontier exists to be checked against, so trusting its value would return
-the authority the derivation is meant to establish. The derivation is also self-defending: an
-adversary who declares a VICTIM's client key still gets a **different** aggregate, because its own
-sid's server share differs, so it cannot make its coin's aggregate equal anyone else's.
-
-**Build order, and the test that decides it.** (1) forward `user_public_key` to the lockbox — today
-`/get_public_key` receives only a `statechain_id`; (2) derive and store the aggregate per sid;
-(3) refuse a binding whose `agg_pubkey` differs; (4) **prove it with an adversary presenting a
-VICTIM's tier under its own sid and being refused** — a test exercising only the honest order proves
-nothing here; (5) only then resolve parent edges through the index, and only then wire
-`collapse_grant`.
-
-**Steps (1)–(4) are BUILT and RUN.** `sdk92` half (b) is the deciding test: a self-consistent
-disclosure built from keys unrelated to the coin, submitted under the coin's own sid, is refused
-`403 AGGREGATE_MISMATCH`, while the same coin's own tiers are served — measured 4 bound / 4
-co-signatures in the same run. The two gates are shown to be INDEPENDENT rather than one masking the
-other: the same bytes with a one-satoshi lie are refused `400` by REQ-57's session compare, and the
-test fails if (b2) is refused by that compare instead of by the aggregate.
-
-Two properties fell out of the build that were not obvious when it was specified:
-
-* **The aggregate is INVARIANT under `/keyupdate`, so a transfer does not break the binding.** The
-  key-update algebra gives `s2 = s1 + o1 − o2`, hence `o2 + s2 = o1 + s1`; write-once storage is
-  therefore correct rather than merely convenient. Measured two ways: the raw aggregate point is
-  byte-identical either side of a live `/keyupdate`, and a full deposit → transfer → claim →
-  split-transfer → claim → exit run co-signed under the new owner's rotated share with the gate armed
-  (17 binds, 17× 200, 0 mismatches).
-* **REQ-68 is the ENFORCEMENT POINT for that invariance, not a consumer of it.** A `key_update` whose
-  algebra drifted by a single scalar produces a different post-rotation aggregate, and the very next
-  co-signature is refused 403 — demonstrated live by submitting `t2 + 1`. Every transfer E2E is
-  therefore now a regression pin on the key-update algebra.
-
-**What is NOT closed is coverage, and it is the larger half — see V-7.** The check fails open for any
-sid with no stored aggregate, which on the live regtest lockbox is **99.5 % of key slots**, and the
-unbound set still grows because an empty `user_public_key` is treated as absent and the shipped wasm
-and Kotlin bindings cannot send the field at all.
-
-Until (1)–(4) are done and measured, nothing may present the SE's index as authority on parenthood.
-
-**REQ-59 (grant is re-grantable, never a budget loosening).** The grant MUST NOT be expressed by
-raising `sig_budget`, which stays monotone. Any number of transactions MAY be granted over the same
-outpoint — each independently predicate-checked — because they conflict and at most one confirms.
-This removes the RBF trap and the burned-grant attack.
-
-#### 5.4.4 Absentees
-
-**REQ-60.** An absentee MUST be paid its **full funding value**, not its exit value. The two tier
-rungs are never broadcast, so their 1 230-sat burn is never realised and is not the SSP's to keep.
-
-An absentee is resolved in **exactly one** round and is then permanently out of the round machinery.
-There is no carry, no dormancy fee, no forfeiture, no accumulating liability — which is the concrete
-superiority over a vTXO that expires. They come out **strictly ahead of exiting themselves**: a
-self-exit costs them tier burn, their own miner fees across five transactions, and a 2 885-block wait.
-What they lose is **off-chain status, not satoshis** — a forced exit, not a taking.
-
-Incentives need no coercion: form (a) costs the SSP 0 vB and keeps the holder in the system, form (c)
-costs 43 vB and pushes value out. The SSP chases migrations; holders who want to stay off-chain need
-only appear once per round.
-
-#### 5.4.5 Offline payments
 
 **REQ-61 (offline payee — zero).** A payee MUST NOT need to be online, reachable, or on a clock to be
 paid. The mechanism is the **owner latch**: a key read from the money itself, write-once, after which
@@ -1573,377 +1234,196 @@ as offline sending.**
    full `lockheight_init` — `max_exit_txs`, `lib/src/transfer/receiver.rs`) and materialisability
    (which reads the remaining runway, same file).
 
-#### 5.4.6 What is NOT resolved
-
-1. **The conveyed flat backup is live until the epoch attestation ships.** Every payee is today
-   conveyed the current owner's signed flat backup (`ChildTesrBundle::parent_flat_backups`,
-   `clients/libs/rust/src/tesr.rs`); after `L_k` any one of them can spend `F` and destroy every
-   sibling's leaf. The round shortens the window; it does not close it. The fix is to convey a
-   `utexo/epoch/v1` attestation **instead of** the transactions.
-2. **Exit-key reassignment grief.** Any holder can force form (c) instead of (a), free and
-   unattributable, moving a round from a handful of payouts to all of them. Bounded and priced — but
-   **the economics MUST be quoted at the worst case, not the best**.
-3. **A floor-sized leaf paid out during a fee spike may be economically dead.** Operational rule:
-   prefer migration for small leaves; do not run a round during a spike.
-4. **The grant is one signature that spends everything under a root.** Today no such signature can
-   exist at all. It is the most dangerous new object in the system and MUST be the most heavily
-   plant-and-run tested path.
-5. **SE blindness dies on round-managed trees.** Not a bug — a price, and an owner decision that MUST
-   be recorded before the leaf registry is built. Mitigating fact: in production the lockbox and the
-   coordinator are the **same operator**, so per-signature blinding was protecting a distinction
-   production does not make.
-
----
-
-### 5.5 Operator liquidity — ZERO, and what that cost
-
-> **THE REQUIREMENT IS ZERO. OWNER RULE, 2026-08-20.** Everything in this section derived, tabulated
-> and then tried to shrink a float of ≈ 9 % of TVL. **The float is gone, not smaller**, because §5.4
-> retired the only thing that caused it: the requirement that a funded successor root be CONFIRMED
-> before a holder could migrate onto it. With no successor root there is no window, and with no window
-> there is nothing to carry.
->
-> **This section is RETAINED, not deleted, and it is retained deliberately.** It is the derivation that
-> shows *where* the requirement came from, and it is the record of two errors worth keeping in front of
-> anyone who revisits this: (1) the first draft claimed Ark charges its operator capital per payment,
-> which is false — both designs are liquidity-free on their native path; (2) this document then spent a
-> section reducing 9 % to 0.11 % by tuning `W`, `epoch_days` and a chain count `K`, which was the wrong
-> class of answer to the wrong question.
->
-> **What survives as normative:** REQ-69 (no per-payment liquidity) and REQ-73 (liquidity must not be
-> described as zero) — with REQ-73 now inverted by REQ-80 below, since it may at last be described as
-> zero and the reason is structural rather than promotional. REQ-70, REQ-71, REQ-72, REQ-74 and REQ-75
-> are **RETIRED**: they govern round windows, migration commitments, `f_next` and a chain count that no
-> longer exist.
-
-**REQ-80 (the zero claim is structural, and MUST be stated with its mechanism, never on its own).**
-This design may be described as requiring no operator liquidity, and unlike the claim REQ-73 was
-written to forbid, the statement is now true. It MUST always be accompanied by the mechanism that makes
-it true — off-chain renewal that moves no value, and depth extension instead of re-anchoring (REQ-76,
-REQ-77) — because "no liquidity" asserted without a mechanism is exactly the marketing claim REQ-73 was
-guarding against. It MUST NOT be extended to the Lightning legs (§8), which consume ordinary channel
-liquidity in both directions and always did; that lane is live, the round never was, and conflating
-them would repeat this section's original error in a new place.
-
-### 5.5 Operator liquidity — the retired derivation [RETIRED — see the banner above]
-
-> **Status: MIXED, and NOTHING here is measured.** The Lightning legs (§8.1, §8.2) are BUILT and
-> carry live tests; the round (§5.4) and the sweep (§5.3) are DESIGN, so their capital requirement is
-> DERIVED from parameters stated in this document and in
-> [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §4 — no round has ever run and no
-> float has ever been observed. §12 carries a `NONE` row for REQ-69–REQ-73.
-
-> **This section CORRECTS a companion normative document.**
-> [PROTOCOL.md](PROTOCOL.md):96 records the operator-liquidity cell for TES-R as "**None** (fee-sized
-> outlays only)" and :710 grades "**REQ 2 — no/low operator liquidity: MET.** No round liquidity
-> (nothing expires)". That was written before §5.4 existed and is now **stale**: the discharge round
-> reintroduces a genuine round liquidity requirement. It is a much smaller and better-behaved one than
-> the Ark-style requirement PROTOCOL.md was contrasting against — §5.5.4 gives the axis — but it is
-> not zero, and "None" MUST NOT be repeated. Amending PROTOCOL.md §7.4 and its comparison table is a
-> divergence this section opens deliberately rather than hides.
-
-#### 5.5.1 Every site at which the operator funds something
-
-**FLOAT** is capital tied up and later returned — the row names what returns it. **COST** is spent and
-never recovered. **RISK** is capital that can be lost, with the condition. **NONE** means a site that
-looks like it needs operator capital and does not.
-
-| site | kind | what the operator puts up | what returns it | status |
-|---|---|---|---|---|
-| ordinary payment — in-ladder split (§6.1) | **NONE** | — | — | BUILT |
-| deposit (§4), transfer (§5), cooperative withdraw (§9.1) | **NONE** | — | — | BUILT |
-| Lightning **pay** (§8.1) | FLOAT | outbound channel liquidity for the BOLT11 | claiming the latched coin with the preimage (INV-14) | BUILT |
-| Lightning **receive** (§8.2) | FLOAT + COST | a Mercury-side coin, or an in-ladder piece, fronted before the HTLC settles — **plus a 2 000-sat tier reserve per non-exact swap, never recovered** | the HTLC settles (INV-15); the reserve does not come back | BUILT |
-| round **migration**, R1 (§5.4) | FLOAT | unallocated funding value in the **confirmed** current root `F_B` | root `A`'s collapse confirming at R7 | DESIGN |
-| collapse fee + CPFP handle, R5/R7 | COST | one transaction's fee per tree per epoch | nothing | DESIGN |
-| **sweep** absorption (§5.3) | FLOAT + RISK | `price_paid ≥ leaf_value − 1 230` per absorbed leaf | settling the batch (REQ-51); lost if the tree's spine cannot be materialised, which is exactly what `sweep_max_tree_exposure` bounds | DESIGN |
-| `refresh_sponsored` (§9.4) | COST | the off-chain rebate (fee + 330) | nothing | BUILT |
-| CPFP bumps under a fee spike (D31, X-8) | COST | **the owner, not the operator** — a keyless tower cannot bump at all | nothing | BUILT |
-| bootstrap — the first current root, before any collapse has recycled | FLOAT | one cycle's migration capacity | the first collapse's `out[0]` | DESIGN |
-
-Two rows carry the argument. **The first row is the reason this design has a liquidity story worth
-telling**: an ordinary payment redistributes value *inside* a tree, so payment volume enters none of
-the formulas below. **The migration row is the dominant term**, and §5.5.2 derives it.
-
-**The SE's CO-SIGNING FUNCTION funds nothing, and that is structural rather than incidental.** It
-holds one share of a 2-of-2 and broadcasts no Bitcoin transaction, so no capital can flow through it.
-Every entry above is the SSP's. Do not overstate this into "the SE never sees an amount": REQ-56's
-predicate reads `fund_value` and output values directly, and REQ-58 is careful to say the SE is
-forbidden to consult the chain **"not because the SE is incapable of looking"** but because what it
-learned would not be trustworthy to an offline holder. Blindness is a property of the signing lane,
-not of the round machinery.
-
-**One row is MEASURED, and it is the one that is live today.** The non-exact Lightning receive path
-oversizes the fronted piece by a fixed reserve — `IN_LADDER_TIER_RESERVE = 2000`
-(`IN_LADDER_TIER_RESERVE`, `clients/libs/rust-sdk/src/ssp.rs`), whose own comment reads "the SSP bears it (its cost of
-fronting a non-exact amount)" — while the reference SSP's fee defaults to **zero**
-(`SSP_FEE_SATS … unwrap_or(0)`, `clients/apps/ssp-server/src/main.rs`). So on shipped defaults the
-only liquidity lane that actually runs today gives up **at least** 2 000 sat per non-exact receive and
-charges nothing for it — at least, because the split tier's own fee falls on the SSP's change leg on
-top of the reserve. Two refinements, so the number is not repeated more precisely than it is true:
-1 230 of the 2 000 is the piece's own two prepaid rungs rather than a transfer to the receiver, and
-what the receiver actually realises depends on route (walking the piece out returns ~770 of it;
-combining, paying onward, or being paid out by a collapse under REQ-56 returns the whole 2 000). What
-is not route-dependent is the SSP side: it never comes back. That is a product decision, not a
-protocol defect — but it MUST NOT be mistaken for a lane that pays for itself.
-
-#### 5.5.2 The round float, and why the protocol forces it
-
-REQ-54 R1 conveys a migrating holder a leaf of identical funding value on the current root `B`, and
-requires `f_spender` to be checked against a **confirmed** `F_B`. The holder's claim on root `A` is
-thereby released — but that value does not become spendable by the operator until the collapse `C`
-confirms at R7, because `C` is the transaction that retires `A` and pays `out[0]` into the next root.
-
-The ordering *confirmed `B` → migrate → release → collapse `A`* is therefore what creates the float,
-and it is structural: a round cannot migrate holders into a root funded by the very collapse that the
-migration precedes. REQ-53's "there is no separate deposit" describes the STEADY STATE correctly and
-says nothing about the timing mismatch inside a round; this section supplies that half.
-
-Let `μ` be migration participation (the fraction of value that migrates rather than being paid out on
-chain), `W` the round window in days from the first R1 migration to R7 confirming, and `epoch_days`
-the round period. At any instant the fraction of trees mid-round is `W / epoch_days`, and each such
-tree carries `μ` of its value as float:
-
-```text
-    standing float  =  μ · (W / epoch_days) · TVL
-```
-
-**Payment volume does not appear. Neither does the number of payments, nor the number of users.** The
-structural fact that keeps payment volume out of the footprint formula
-([PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §4.1) keeps it out of this one: a round
-re-mints outstanding *pieces*, and pieces track value held, never payments made.
-
-On this document's worked parameters — `initlock = 10 000` ⟹ `epoch_days = 69.4`, 4 000 BTC TVL
-(PARTIAL-PAYMENT-ECONOMICS §4.2):
-
-| `μ` | `W` = 1 d | 3 d | 7 d | 14 d |
-|---:|---:|---:|---:|---:|
-| 50 % | 0.72 % TVL | 2.16 % | 5.04 % | 10.1 % |
-| **90 %** | 1.30 % | 3.89 % | **9.07 %** | 18.1 % |
-| 100 % | 1.44 % | 4.32 % | 10.1 % | 20.2 % |
-
-At the central case — 90 % migrate, a one-week window — the operator stands behind **≈ 9 % of TVL**:
-363 BTC against a 4 000 BTC book.
-
-**THE FORMULA IS AN AVERAGE, AND IT ASSUMES SOMETHING THIS DOCUMENT NEVER STATED.** Everything above
-gives the STANDING float — what the operator carries *on average*, across the whole book. It is not
-what the operator must be able to fund at the moment a window opens, and the two differ by an order of
-magnitude at the chain counts REQ-53 actually requires.
-
-Per chain the successor root must be funded **in full** for the entire window: a holder migrates onto a
-confirmed `F_B`, and half a root buys no one a leaf. `W / epoch_days` is that chain's **duty cycle** —
-the fraction of the time its capital is busy — and a duty cycle is not a discount on the amount. The
-saving is REUSE: one buffer serves the next chain once the previous collapse frees it, so a book split
-across `K` independently-scheduled chains with staggered windows needs
-
-```text
-    capital  =  μ · max( W / epoch_days ,  1 / K ) · TVL
-```
-
-where `K` is the number of root-chains whose windows are scheduled independently. Both arms are real:
-
-* **large `K`** (`K ≥ epoch_days / W`) — the duty-cycle arm governs, chains hand the buffer along, and
-  the figure is the standing float tabulated above;
-* **small `K`** — the `1 / K` arm governs, and the requirement is the PEAK: one chain's successor root,
-  funded in full, because at least one is always mid-round. At `K = 1` the requirement is `μ · TVL`.
-  **The float is then not 9 % of TVL, it is 90 %.**
-
-The chain count that makes the tabulated figure reachable is `K_min = ⌈epoch_days / W⌉`:
-
-| `W` | `epoch_days` | standing float | `K_min` |
-|---:|---:|---:|---:|
-| 7 d | 69.4 | 9.07 % | **10** |
-| 4 h | 69.4 | 0.22 % | **417** |
-| 4 h | 138.9 | 0.11 % | **834** |
-
-**REQ-53's two roots are not enough, and must not be read as if they were.** REQ-53 requires one
-maturing root and one current root; that is a statement about round MECHANICS — where migrations land
-while a collapse is pending — and it says nothing about capital. At `K = 2`, on this document's own
-central parameters, the requirement is `μ / 2` = **45 % of TVL**, five times the 9 % tabulated above.
-An operator who reads §5.5.2, runs the REQ-53 minimum, and provisions 9 % is under-capitalised by 5×,
-and discovers it when a window opens and migrations stop.
-
-**Bootstrap is not a separate spike.** Before the first collapse there is no `out[0]` to recycle, so
-the first cycle's capacity is real operator capital — but it is the same quantity as the steady-state
-float, not an addition to it. Precisely: the standing float is what the operator must hold at ALL
-times, and bootstrap is the first instance of it rather than a one-off on top. Growing the book still
-costs capital at the same ratio, because the formula is proportional to TVL.
-
-#### 5.5.3 The tension this exposes: the absentee lever is bought with liquidity
-
-PARTIAL-PAYMENT-ECONOMICS §4.4 names the absentee rate as the dominant footprint lever — a 72× swing
-between nobody absent and nobody present. The way an operator lowers the absentee rate is by widening
-the window `W` so that more holders come online in time. `W` is the numerator of the float.
-
-**Lowering the on-chain footprint therefore costs liquidity, linearly.** The two levers pull against
-each other, and until this section existed the document described only one of them.
-
-#### 5.5.4 Comparison with Ark
-
-Ark is the closest comparable. **The first draft of this section claimed Ark charges its operator
-capital for every payment. That is false, and the correction is kept in place rather than deleted**,
-because it is the error a reader of this document is most likely to make independently:
-
-> "Ark payments … happen out-of-round and require no liquidity — they simply extend existing
-> transaction trees."
-> — [Second, *Liquidity*](https://second.tech/docs/learn/liquidity)
-
-So both designs make their **native payment path liquidity-free**, and the comparison is between what
-each does with the *periodic* obligation instead.
-
-| | Ark server | UTEXO operator |
-|---|---|---|
-| ordinary in-protocol payment | **no liquidity** — out-of-round, extends an existing tree | **no liquidity** — an in-ladder split moves value inside an existing tree |
-| what DOES consume capital | "Refreshes … Offboarding … Lightning payments" ([Second](https://second.tech/docs/learn/liquidity)) | round migration R1 (§5.4); Lightning both directions (§8); sweep absorption (§5.3) |
-| what the requirement is driven by | refresh cadence × value refreshed | epoch cadence × value migrated — `μ · W / epoch_days · TVL` |
-| how long capital is locked | "Remaining lifetime: How long until the spent VTXO expires and becomes claimable" — ceiling `expiry_delta`, 28–30 d ([Second](https://second.tech/docs/learn/liquidity)) | the round window `W`, an **operator-chosen** parameter, not a consensus timelock |
-| published cost model | `amount × (expiry_delta ÷ 365 days) × opportunity_rate`; worked as 100 000 sat × 5 d ÷ 365 × 5 % ≈ 68 sat ([Second](https://second.tech/docs/learn/liquidity)) | **none — this section is the first** |
-| behaviour on exhaustion | "it will have to cease accepting new payments and will be compelled to wait for the timelocks (4 weeks) … to expire in order to regain liquidity" ([Ark Labs](https://blog.arklabs.xyz/liquidity-requirements/)) | migrations stop; the remaining holders are paid **in full, on chain, by the collapse** (§5.5.5) |
-| dormant funds | expiry exists so capital is not locked forever by dormant users; missing the deadline is confiscating | nothing expires; a dormant holder is an absentee, paid out at the next collapse |
-
-**What survives as a real difference is two things, not five:**
-
-1. **The lock is bounded by an operator choice, not by a consensus timelock.** `W` can be days; Ark's
-   ceiling is `expiry_delta`. This is a smaller edge than it looks — a user who refreshes just before
-   expiry forfeits a VTXO with little remaining lifetime, which is exactly why Second's worked example
-   is 5 days rather than 28.
-2. **Exhaustion is not a payment failure.** This is the one that matters, and it is a consequence of
-   REQ-56 rather than of any liquidity engineering (§5.5.5).
-
-Three fairness notes, all of which cut against this document:
-
-* **Ark's model is measured; ours is not.** Second publishes a metric ("liquidity duration in days" =
-  total sat-days ÷ payment volume), a pricing formula and empirical scenarios measuring a capital
-  stock of **10.13–31.6 days of payment volume**. §5.4 has never run.
-* **That 10–31 day figure is a WORST CASE and MUST be quoted as one.** It assumes every payment routes
-  to Lightning, which does consume Ark liquidity. Quoting it as Ark's ordinary cost would repeat, in
-  the other direction, the error corrected at the top of this section. It is also why Second's research
-  post says liquidity is "driven by payment volume" while Second's own docs say Ark-to-Ark payments
-  need none — the two statements are about different traffic mixes, not a contradiction.
-* **Ark is actively reducing this cost.** Arkade's delegation work keeps VTXOs renewed rather than
-  expiring ([Ark Labs](https://blog.arklabs.xyz/adios-expiry-rethinking-liveness-and-liquidity-in-arkade/));
-  expiry is not removed, but this comparison MUST be re-checked against current Ark rather than against
-  the version quoted here.
-
-#### 5.5.5 Exhaustion degrades to block space, never to loss
-
-If the operator exhausts its float mid-round it stops accepting migrations. The holders it could not
-migrate are simply not migrated: they remain undischarged, and REQ-56 forces the collapse to pay each
-of them their **full funding value at their own exit key**, or the SE refuses to co-sign the collapse
-at all.
-
-So liquidity exhaustion raises that round's absentee count — `155 + 43·absentees` vB — and does
-nothing else. No holder is worse off than if no migration had ever been offered, no payment fails, and
-no round stalls. **This, not the magnitude, is the property worth defending**: where a provider fronts
-funds per payment, illiquidity is a payment failure; here it is a fee.
-
-#### 5.5.6 Normative requirements
-
-**REQ-69 (no per-payment liquidity).** An ordinary payment — an in-ladder split (§6.1) — MUST NOT
-require operator capital. Any mechanism that makes a plain payment depend on operator funds converts
-the model from stock-proportional to flow-proportional, which is the axis §5.5.4 claims as the design's
-advantage, and MUST be specified here before it is built.
-
-**REQ-70 (a round MUST NOT over-commit the current root).** The operator MUST NOT convey migration
-leaves whose total funding value exceeds the unallocated funding value of the confirmed current root
-`F_B`. An over-committed root produces conveyed leaves the tree cannot back. The holder's verifier
-would refuse them (`verify_child_bundle`, value conservation both ways), so the failure is loud rather
-than silent — but the operator MUST NOT create the condition.
-
-**REQ-71 (exhaustion MUST degrade to payout, never to a narrowed obligation).** When float is
-exhausted the operator MUST stop accepting migrations and let the remaining holders be paid on chain by
-the collapse. It MUST NOT narrow, defer, discount or price the payout owed under REQ-56 in order to
-recover liquidity. Un-migrated is a normal outcome, not a failure state.
-
-**REQ-72 (the window is a published parameter).** The operator MUST publish the round window `W` at R0
-alongside the freeze height. `W` is what a wallet needs in order to decide whether it can come online
-in time, and — per §5.5.3 — it is the parameter the operator is most tempted to shorten for its own
-benefit at the holders' expense.
-
-**REQ-73 (liquidity MUST NOT be described as zero).** No normative document may state that this design
-has no operator liquidity requirement. It has one; §5.5.2 gives its form. The defensible claims are
-that it is **stock-proportional rather than flow-proportional**, that it is **bounded by an
-operator-chosen window rather than a consensus timelock**, and that **its exhaustion costs block space
-rather than money**.
-
-**REQ-74 (`f_next` MUST be constrained, and today it is not).** REQ-53 claims the cycle self-funds —
-"the collapse transaction's `out[0]` funds a future root, so a round both retires and re-funds in one
-transaction — there is no separate deposit". **Nothing enforces that.** `C.vout` carries
-`P2TR(A_next) value f_next` alongside `P2TR(ssp_change)`, and no requirement anywhere constrains
-`f_next`: an operator may route the whole recovered residue to change and fund the next root from
-somewhere else, or from nothing. REQ-56 does not care — it checks only that undischarged holders are
-paid — so the self-funding property is an intention, not an invariant.
-
-A round MUST therefore either set `f_next` to at least the value it intends to make available for the
-next cycle's migrations, or the document MUST stop describing the cycle as self-funding. This is
-recorded as a requirement rather than a note because the liquidity claim in §5.5.2 rests on the
-recycling: if the residue can leave as change, the standing float is a floor and not an estimate.
-
-**Choosing between those two is the operator's call, and it cannot be made on an unmeasured
-property. So `collapse_grant` now MEASURES it and enforces the half that is checkable.** The value a
-round recovers is exactly what the RELEASED frontier leaves were worth — they migrated, so they are
-not paid on chain — which is the mirror image of what REQ-56 requires to be paid. When a grant
-request NAMES the next root's key, the SE requires the outputs paying it to carry at least that
-recovered value and refuses otherwise, naming both numbers; a cycle that routes its residue to change
-is not the self-funding cycle REQ-53 describes. When no next root is named the grant still stands —
-every undischarged holder is paid, which is a valid collapse — but the response reports
-`self_funding: false` alongside the recovered amount, and the SE logs it. The property is therefore
-counted on every round rather than assumed on any, which is what makes the §5.5.2 figures checkable
-against what operators actually do.
-
-**REQ-75 (the float MUST be quoted as a PAIR, and the chain count MUST be published with it).**
-§5.5.2's standing float is an average that is only reachable at `K ≥ ⌈epoch_days / W⌉` staggered
-root-chains. Quoting it alone understates what an operator must actually hold, by `epoch_days / (W·K)`.
-
-An operator MUST publish `K` alongside `W` (REQ-72), and every statement of the liquidity requirement —
-normative document, operator disclosure or marketing — MUST carry BOTH numbers:
-
-* the **peak**, `μ · TVL / K` — what must be fundable when one chain's window opens, since a successor
-  root cannot be part-funded;
-* the **standing average**, `μ · (W / epoch_days) · TVL` — what is carried across the book over time.
-
-No document may state the standing figure on its own. Where `K < epoch_days / W` the peak governs and
-the standing figure is simply unreachable; the pair makes that visible instead of leaving it to be
-discovered when migrations stop mid-window.
-
-**Windows MUST be staggered, and staggering is a requirement rather than an implementation detail.**
-An operator whose chains open their windows together has an effective `K` of 1 no matter how many
-chains it runs, because the peak is what it must fund — the reuse the formula credits it with never
-happens. Scheduling is therefore load-bearing for the capital claim, and an operator that cannot
-stagger MUST quote `μ · TVL`.
-
-**Neither number has ever been observed.** No round has run, so `K` is not merely unmeasured but
-unchosen, and §12 carries a `NONE` row for REQ-69–REQ-73 that applies here unchanged.
-
-#### 5.5.7 What this section does NOT know
-
-* **`W` is unmodelled.** Nothing in this document derives a round window; it is an operating choice,
-  and every figure in §5.5.2 is parametric in it.
-* **`K` is unchosen.** The chain count now carries the whole distance between the peak and the
-  standing average (REQ-75), and this document does not pick one. Until it does, the honest figure to
-  quote is the peak.
-* **`μ` is unmeasured.** Migration participation is a product outcome. The 90 % row is an
-  illustration, not a prediction, and §5.4.6's rule applies — quote the worst case, because exit-key
-  reassignment lets any holder force a payout instead of a migration, free and unattributable.
-* **The Lightning legs are unquantified.** §8.1 and §8.2 are BUILT and INV-14/INV-15 bound their RISK
-  to zero, but this document does not model how much Mercury-side inventory or outbound channel
-  liquidity an operator must hold to serve a given invoice rate. That is a real gap, and it is the one
-  that bites first, because that lane is live today and the round is not.
-* **The sweep's exposure is bounded but not costed.** REQ-50 caps it at `sweep_max_tree_exposure`
-  (1 000 000 sat default); nothing derives what a realistic absorber's standing book would be.
-* **A migrated leaf inherits the SUCCESSOR root's REMAINING epoch, not a fresh one**, because R1 is an
-  in-ladder split on a root `B` that is already partway through its own cycle. A piece therefore
-  resides for `epoch_days − W` rather than `epoch_days`, which multiplies the collapse rate — and
-  hence the pinned footprint — by `epoch_days / (epoch_days − W)`. At the central `W = 7 d` that is
-  **1.11**, small enough to be a rounding note and large enough to matter at a wide window. This is
-  DERIVED here and NOT reflected in
-  [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §4.1; it is flagged as an open item for
-  the owner rather than applied as a correction, because the size of the effect depends on `W`, which
-  is itself unmodelled. **An earlier draft of this bullet claimed a 2× understatement; that rested on
-  `W = epoch_days / 2`, which nothing in §5.4 implies.**
-* **None of the round arithmetic is measured.** §5.4 is not built.
-
----
+**REQ-65 (an unclaimed payee is still paid).** A leaf's `exit_key` is recorded by the SE at
+`establish_leaf` from the **witnessed payload output of the state tier** — identified structurally as
+the unique P2TR output, per REQ-61(a), and NOT at a client-supplied index. That key is **the payee's**
+because conveyance builds the child's tiers to the receiver's address. So a payee who was paid and
+**never claimed at all** is nonetheless in the frontier, and REQ-56 forces `C` to pay them their full
+funding value at their own key. Claiming is required to *spend*, never to *be paid*.
+
+**What "witnessed" does and does NOT mean — corrected 2026-08-17 after measuring the code.**
+An earlier draft of this paragraph said the SE reads `exit_key` and `fund_value` "out of a
+transaction whose sighash it recomputed and whose session it byte-compared, so both are facts it
+verified rather than fields a client asserted." The first half is true. The conclusion was too
+strong, and the difference matters to exactly the party this requirement protects.
+
+`witness::bind` takes **no statechain id and no coin key**. It rebuilds the session from the
+`agg_pubkey`, `agg_nonce`, `blinding_factor` and `out_tweak` **the caller supplied**, and compares
+against the session the caller sent. So binding establishes one thing: *the disclosed transaction,
+hashed against the disclosed prevouts under the disclosed keys, produces the session you asked me to
+sign.* Every input is the caller's. It is a self-consistency check.
+
+That is genuinely worth having — it is what stops "sign session `S`, which is over this benign
+transaction" when `S` is really over a different one, and `sdk92` measures it with a one-satoshi lie
+that the session comparison refuses. **It does not establish that the transaction is a tier of the
+coin whose sid was named.**
+
+**And a blind SE structurally cannot establish that.** The lockbox stores its own key share
+(`public_key` in `generated_public_key`) and never the coin's AGGREGATE key — that is what blindness
+means here. With no aggregate key it has nothing to compare `agg_pubkey` against. This is a
+consequence of the design, not a missing check, and any proposal to close it MUST say plainly which
+part of the SE's blindness it is giving up.
+
+**Consequences that must not be glossed.** `exit_key` and `fund_value` recorded at establishment are
+witnessed *in the weaker sense*: they come from a transaction the SE bound, not from one it can tie
+to the coin. Until that gap is closed, an entry in the SE's index attests "signed under this sid",
+never "is a tier of this coin" — so a **parent edge MUST NOT be resolved through it**, because
+REQ-56's frontier decides who is paid in a collapse and an absentee has no recourse afterwards
+(REQ-67).
+
+**REQ-66 (a conveyed-but-unreleased migration is a DOUBLE PAYMENT — the SSP MUST clear it).**
+R1 and R2 protect different parties and MUST happen in that order: **migration protects the holder**
+(they hold and have verified the replacement before giving anything up), **release protects the SSP**
+(without it the old leaf is still in the frontier, so REQ-56 forces `C` to pay them on chain *as well
+as* the leaf they already hold on `B`).
+
+So a migration that is conveyed and then neither claimed nor released is a leaf the SSP pays for
+twice. Before the round's notice the SSP MUST therefore, for every outstanding migration, either
+obtain the release or **cancel the conveyance and reclaim it** (`apply_cancel`,
+`server/src/database/transfer_cancel.rs`; `reclaim_cancelled_conveyance`,
+`clients/libs/rust/src/tesr.rs`). A round announced with unresolved conveyances is an
+operator-funded overpayment, not a protocol fault — **the holder is never at risk in either
+direction**, which is why the ordering is safe to leave to the operator.
+
+**REQ-67 (THE ABSENTEE'S PROTECTION MUST BE CRYPTOGRAPHIC, NOT THE SE PREDICATE ALONE).**
+REQ-56 says the SE refuses a collapse that does not pay every unreleased leaf. **That is not
+sufficient on its own.** In production the lockbox and the coordinator are the **same operator**, and
+the lockbox is a plain container, not an attested enclave — so REQ-56 is a rule enforced by software
+the SSP controls. For an ONLINE holder this is harmless: they verified their successor leaf
+themselves and hold its key share. **For an ABSENTEE it is the whole of their protection, and it is
+the same shape as trusting an unsigned operator assertion, one level up.**
+
+The consequence is concrete: once `C` confirms, every tier beneath `F` is dead, so an absentee who was
+not paid has **no recourse at all**. Their only remedy is to act *before* `C` confirms.
+
+So the absentee's protection MUST rest on something the operator cannot alter:
+
+1. **A watchtower MUST check pending collapses.** `C` is public from the moment it is broadcast. A
+   tower holding a `WatchBundle` for a leaf MUST, on seeing any spend of its root's `F`, check whether
+   an output pays its holder's `exit_key` at ≥ the leaf's funding value, and if not **broadcast `T`
+   immediately** — which invalidates `C` (both spend `F`) and preserves the whole tree. This needs no
+   key (`T` is pre-signed) and no trust in the operator.
+2. **The `WatchBundle` MUST therefore carry `exit_key` and `funding_value`**, so the check is
+   self-contained.
+3. **Wallet defaults MUST run this**, and the product docs MUST say plainly that an absentee's
+   protection is their tower, not the operator's good behaviour.
+
+With the tower, the SE predicate becomes what it should be — **the mechanism that makes the honest
+path cheap and the dishonest path detectable-and-defeatable**, rather than the sole thing standing
+between an absent user and their money. Without it, form (c) is custodial in substance for anyone who
+is not watching. **State this in those words wherever the round's trust model is described.**
+
+**REQ-56a (a MULTI-INPUT spend has several parents, and the frontier must account for all of
+them).** Measured on the live lane, not derived: the migration hatch's combine spends four carriers
+into two children, and the SE co-signs it once per input — one transaction, four signatures, four
+different sids. A registry that gives each child ONE parent therefore marks one carrier as spent and
+leaves the other three looking untouched, so each stays in its own frontier and a collapse is
+required to pay coins whose value has already moved into the children. That is an **overpay**: the
+operator's loss rather than a holder's, and never a theft — but a wrong answer from the one predicate
+whose entire job is exactness, and at scale it is what makes a round unaffordable.
+
+The SE's index now keeps **every** co-signer of a transaction rather than the first, so the evidence
+survives; which of them a child calls its parent, and how the frontier excludes a node spent by a
+transaction it did not solely fund, is an OPEN question against the close and is **not yet answered**. Until it is, a
+round MUST NOT be run over a tree containing a multi-input spend.
+
+**REQ-68 (closing the gap requires a DEPOSIT-protocol change, and the SE cannot do it alone).**
+The obvious fix — have the SE compare the disclosed `agg_pubkey` against the coin's aggregate key —
+is **not buildable today**, and the reason is structural rather than an oversight: `/get_public_key`
+accepts only a `statechain_id`. The SE mints its own keypair, returns its share, and **never learns
+the client's public key**, so it can neither store nor derive the aggregate. There is nothing to
+compare against.
+
+Two candidate closures, and the difference between them is the whole question:
+
+* **Client asserts the aggregate at deposit.** Insufficient on its own. An adversary can assert a
+  VICTIM's aggregate for its own sid, and nothing detects it — the SE has no way to tell whose
+  aggregate it was handed. First-writer-wins on a uniqueness constraint only moves the race.
+* **Client supplies its OWN public key at deposit; the SE DERIVES the aggregate.** Sound, because
+  the aggregate is then a function of the SE's per-sid key share and the declared client key. An
+  adversary who declares a victim's client key still gets a *different* aggregate, since its sid's
+  server share differs — it cannot make its own coin's aggregate equal anyone else's. This is the
+  closure the spec recommends.
+
+**DECIDED 2026-08-17 by the operator: the lockbox DERIVES it.** Option (b), and the cost turned out
+to be far smaller than first stated — the correction matters enough to record, because the original
+framing would have bought a privacy concession that had already been made.
+
+**MEASURED: the coordinator already holds both.** `statechain_data` stores **`aggregate_xonly`
+(UNIQUE)** and **`user_public_key`** (`server/src/database/deposit.rs`). The client already sends its
+key at deposit; the operator already stores the aggregate, which *is* the funding address. So:
+
+* against the **operator** — who runs both the coordinator and the lockbox, and whose lockbox is a
+  plain container rather than an attested enclave (REQ-67) — the additional privacy cost is **zero**;
+* the residual is that the fact moves into a **second** operator-controlled database, widening the
+  blast radius of a lockbox-only breach or backup leak;
+* it becomes a real cost only in a future where the lockbox is run by a **different party or is
+  attested** — which is precisely the deployment in which you would want the SE verifying for itself.
+
+A `NULL` `aggregate_xonly` occurs only for **old clients** (the code says so), and D24 already
+decided legacy pre-0009 coins are ignored.
+
+**DERIVE, never accept.** The lockbox MUST compute the aggregate from the client's public key and its
+own key share, and MUST NOT take an aggregate supplied by the coordinator — the coordinator is
+exactly the party REQ-56's frontier exists to be checked against, so trusting its value would return
+the authority the derivation is meant to establish. The derivation is also self-defending: an
+adversary who declares a VICTIM's client key still gets a **different** aggregate, because its own
+sid's server share differs, so it cannot make its coin's aggregate equal anyone else's.
+
+**Build order, and the test that decides it.** (1) forward `user_public_key` to the lockbox — today
+`/get_public_key` receives only a `statechain_id`; (2) derive and store the aggregate per sid;
+(3) refuse a binding whose `agg_pubkey` differs; (4) **prove it with an adversary presenting a
+VICTIM's tier under its own sid and being refused** — a test exercising only the honest order proves
+nothing here; (5) only then resolve parent edges through the index, and only then wire
+`collapse_grant`.
+
+**Steps (1)–(4) are BUILT and RUN.** `sdk92` half (b) is the deciding test: a self-consistent
+disclosure built from keys unrelated to the coin, submitted under the coin's own sid, is refused
+`403 AGGREGATE_MISMATCH`, while the same coin's own tiers are served — measured 4 bound / 4
+co-signatures in the same run. The two gates are shown to be INDEPENDENT rather than one masking the
+other: the same bytes with a one-satoshi lie are refused `400` by REQ-57's session compare, and the
+test fails if (b2) is refused by that compare instead of by the aggregate.
+
+Two properties fell out of the build that were not obvious when it was specified:
+
+* **The aggregate is INVARIANT under `/keyupdate`, so a transfer does not break the binding.** The
+  key-update algebra gives `s2 = s1 + o1 − o2`, hence `o2 + s2 = o1 + s1`; write-once storage is
+  therefore correct rather than merely convenient. Measured two ways: the raw aggregate point is
+  byte-identical either side of a live `/keyupdate`, and a full deposit → transfer → claim →
+  split-transfer → claim → exit run co-signed under the new owner's rotated share with the gate armed
+  (17 binds, 17× 200, 0 mismatches).
+* **REQ-68 is the ENFORCEMENT POINT for that invariance, not a consumer of it.** A `key_update` whose
+  algebra drifted by a single scalar produces a different post-rotation aggregate, and the very next
+  co-signature is refused 403 — demonstrated live by submitting `t2 + 1`. Every transfer E2E is
+  therefore now a regression pin on the key-update algebra.
+
+**What is NOT closed is coverage, and it is the larger half — see V-7.** The check fails open for any
+sid with no stored aggregate, which on the live regtest lockbox is **99.5 % of key slots**, and the
+unbound set still grows because an empty `user_public_key` is treated as absent and the shipped wasm
+and Kotlin bindings cannot send the field at all.
+
+Until (1)–(4) are done and measured, nothing may present the SE's index as authority on parenthood.
+
+
+### 5.5 Operator liquidity — ZERO
+
+The protocol requires **no operator capital at any point**. The round that demanded it is deleted, and
+with it the successor root that had to be funded before holders could move. There is no window to
+carry because there is nothing to carry it for.
+
+**REQ-80 (the zero claim MUST always carry its mechanism).** This design may be described as requiring
+no operator liquidity. The statement MUST be accompanied by the mechanism that makes it true — a close
+pays every unreleased leaf out of `F` itself, and renewal moves no value — because "no liquidity"
+asserted without a mechanism is a marketing claim rather than a property. It MUST NOT be extended to
+the Lightning legs (§8), which consume ordinary channel liquidity in both directions and always did.
+
+**REQ-69 (no per-payment liquidity).** An ordinary payment MUST NOT consume operator capital. A payment
+that did would make the requirement flow-proportional, which is the axis this design is built to avoid.
+
+**An SSP MAY offer to buy leaves as a SERVICE.** That is a business choice, demand-driven, and the
+protocol works without it: a holder who finds no buyer closes or exits on their own. Nothing in this
+document may depend on it.
+
 
 ## 6. Off-chain split & combine
 
@@ -2637,11 +2117,11 @@ unbuilt sections, and they are marked as such in place.
 | REQ-57 (§5.4, witness binding) | `sdk92` (live: **4 bound / 4 co-signatures** on a laddered coin; one-satoshi lie refused BY THE SESSION COMPARE — and the test fails if the same bytes with the correct value are refused by that compare rather than by REQ-68's aggregate check, so neither gate can stand in for the other; **and the same request with the disclosure deleted is refused `400`**, which is what makes binding a property of the SE rather than a convention among clients), `sdk71` (**14/14, 0 refusals** across laddering + conveyance + claim), `sdk78` (the **coloured multi-input** path: a four-input combine, every input bound), `lockbox/tests/test_tx_sighash.cpp` (4/4), `lockbox/tests/test_session_rebuild.cpp` (3/3), each with negative controls. Measured across the live suite: **118 bound, 0 unbound, 0 index-miss.** **Open:** nothing in REQ-57 itself — the residual is REQ-65's aggregate question |
 | REQ-56 (§5.4, the predicate + registry) | **PARTIAL.** The decision procedure is built and pinned: `lockbox/tests/test_registry.cpp` (23 checks — fork, released sibling, shared exit key, one-satoshi shortfall, INV-Q). The storage is built and pinned against a live Postgres: `lockbox/tests/test_registry_db.cpp` (26 checks — idempotent establish, monotone release, single-use nonce by PRIMARY KEY, freeze as a ratchet). **NOT built:** nothing populates it in production, and no `collapse_grant` route exists |
 | REQ-68 (§5.4, why parenthood is not yet SE-authored) | **MEASURED, and it is a blocker.** `/get_public_key` takes only a `statechain_id`, so the SE never learns the client's key and cannot derive the coin's aggregate — see REQ-68 for the two candidate closures and the privacy cost of the sound one. Until it is decided, `se_signed_tx` is an audit trail only |
-| REQ-54 R2 (§5.4, `/release`) | **BUILT.** `lockbox/tests/test_release_route.cpp` — 10 checks against live Postgres and real BIP-340, three of them forgeries run BEFORE the honest path: no latch → refused (fails closed), someone else's key → refused, a signature over a DIFFERENT sid → refused (the tag binds it), replayed nonce → refused, fresh nonce → accepted, `released` monotone |
+| Release (§5.4, `/release`) | **BUILT.** `lockbox/tests/test_release_route.cpp` — 10 checks against live Postgres and real BIP-340, three of them forgeries run BEFORE the honest path: no latch → refused (fails closed), someone else's key → refused, a signature over a DIFFERENT sid → refused (the tag binds it), replayed nonce → refused, fresh nonce → accepted, `released` monotone |
 | REQ-61 (§5.4, the owner latch) | **ARMING BUILT, ENFORCEMENT NOT.** The key is read structurally from the unique P2TR output and stored write-once (`ON CONFLICT DO NOTHING`); a second arming with a different key is a no-op. Measured live: 4 bound co-signatures → exactly 1 `LATCH_ARMED`. **Nothing yet refuses a co-signature for want of a BIP-340 by that key** — and REQ-61(b) must be settled first, since the payer co-signs the payee's tiers before the payee holds anything |
 | REQ-68 (§5.4, the coin binding) | **BUILT and MEASURED, coverage OPEN.** `sdk92` half (b) — a self-consistent disclosure built from keys unrelated to the coin, submitted under the coin's own sid, refused `403 AGGREGATE_MISMATCH` while the coin's own tiers are served in the same run; `lockbox/tests/test_aggregate_derive.cpp` (13 checks, incl. an adversary that cannot match a victim's aggregate); the SE↔client differential in `ci-guards/tests/emit_aggregate_vectors.rs`. Transfer-safety measured separately: the aggregate is invariant under `/keyupdate`, and a drifted `t2` is refused live. **Open: the check FAILS OPEN for 99.5 % of key slots — see V-7** |
-| REQ-53, REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no freeze at grant time. See the status banner in §5.4 |
-| REQ-69…REQ-74 (§5.5, operator liquidity) | **NONE — design, not built**, and not testable in isolation: REQ-70 and REQ-71 are properties of a round, which does not exist. REQ-69 is the exception in kind — it forbids a dependency rather than requiring a mechanism, so what would evidence it is a guard asserting that no in-ladder split path consults an operator balance. That guard is not written. **REQ-74 now has evidence**: `collapse_grant` computes the recovered value (what the released frontier leaves were worth), enforces `f_next >= recovered` whenever a request names the next root's key, and reports `self_funding: false` with the recovered amount when it does not — measured by `lockbox/tests/collapse_grant_probe.py` (underfunded by ONE satoshi -> 403 naming both numbers; funded in full -> granted with `self_funding: true`; released leaf and no next root -> granted, `recovered: 2000`, `self_funding: false`) |
+| REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **NONE — design, not built.** No frontier population, no `collapse_grant`, no freeze at grant time. See the status banner in §5.4 |
+| REQ-69, REQ-80 (§5.5, operator liquidity is ZERO) | **DESIGN.** The requirement is now that no operator capital exists on any path; there is nothing to measure until a close has been run. REQ-70…REQ-75 were DELETED with the round. |
 
 **Suite sizes.** Workspace unit + guard tests: **812**, 0 failures (`cargo test --workspace --tests`).
 The E2E suite over regtest + lockbox + RLN is **85** tests.
