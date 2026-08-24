@@ -3984,7 +3984,7 @@ dependencies = [
 [[package]]
 name = "rgb-lib"
 version = "0.3.0-beta.6"
-source = "git+https://github.com/gofman8/rgb-lib?rev=ae8439e6824a4593891ee8c71fd87b0024e46ae9#ae8439e6824a4593891ee8c71fd87b0024e46ae9"
+source = "git+https://github.com/gofman8/rgb-lib?rev=9cb958d75695e0c3c543c284b76548a48ff7bd27#9cb958d75695e0c3c543c284b76548a48ff7bd27"
 dependencies = [
  "amplify",
  "base64 0.22.1",
@@ -4025,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "rgb-lib-migration"
 version = "0.3.0-beta.4"
-source = "git+https://github.com/gofman8/rgb-lib?rev=ae8439e6824a4593891ee8c71fd87b0024e46ae9#ae8439e6824a4593891ee8c71fd87b0024e46ae9"
+source = "git+https://github.com/gofman8/rgb-lib?rev=9cb958d75695e0c3c543c284b76548a48ff7bd27#9cb958d75695e0c3c543c284b76548a48ff7bd27"
 dependencies = [
  "sea-orm-migration",
  "tokio",

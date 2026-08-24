@@ -79,6 +79,10 @@ pub async fn create_colored_backup_tx(
     interval: u32,
     blinding: u64,
     blinded: Option<&[(String, u64)]>,
+    // [FOREIGN-REVEALED] `("txid:vout", amount)` naming outpoints the RECEIVER already owns, in the
+    // clear. Same economics as `blinded` — the sender funds no fresh carrier — but on the REVEALED
+    // validator path. Mutually exclusive with `blinded`.
+    revealed: Option<&[(String, u64)]>,
 ) -> Result<ColoredBackupTx> {
     // 1. Generate and commit nonces, then fetch the server's public nonce (sign/first).
     let coin_nonce = mercurylib::transaction::create_and_commit_nonces(coin)?;
@@ -114,7 +118,9 @@ pub async fn create_colored_backup_tx(
     // 3. Color with rgb-lib: assign `rgb_amount` to the pre-coloring output index 0. rgb-lib inserts
     //    the OP_RETURN opret commitment (at index 0, shifting the recipient to index 1) and returns
     //    the modified PSBT plus the consignment.
-    let (colored_psbt_b64, consignment) = if let Some(blinded) = blinded {
+    let (colored_psbt_b64, consignment) = if let Some(revealed) = revealed {
+        rgb.color_revealed_foreign(&unsigned_psbt_b64, contract_id, revealed.to_vec(), blinding)?
+    } else if let Some(blinded) = blinded {
         // statechain->statechain: assign to blinded seals (receiver's statechain UTXO + change to a
         // free statechain UTXO). The tx just spends the statechain UTXO to `to_address` ("to himself")
         // and commits the transition via OP_RETURN; no asset goes to a witness vout of this tx.
@@ -626,6 +632,7 @@ pub async fn refresh_rgb_anchor_self_transfer(
         si.interval,
         blinding,
         blinded,
+        None,
     )
     .await?;
     let new_nlocktime = tx_nlocktime(&colored.signed_tx)?;

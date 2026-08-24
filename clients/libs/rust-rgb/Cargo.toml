@@ -29,6 +29,6 @@ sha2 = "0.10"
 # committed by accident:
 #   [patch."https://github.com/gofman8/rgb-lib"]
 #   rgb-lib = { path = "../../../../utexo-rgb-lib" }
-rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "ae8439e6824a4593891ee8c71fd87b0024e46ae9", default-features = false, features = ["electrum"] }
+rgb-lib = { git = "https://github.com/gofman8/rgb-lib", rev = "9cb958d75695e0c3c543c284b76548a48ff7bd27", default-features = false, features = ["electrum"] }
 anyhow = "1.0"
 base64 = "0.22"

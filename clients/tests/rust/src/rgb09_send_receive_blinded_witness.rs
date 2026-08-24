@@ -216,6 +216,18 @@ pub async fn execute() -> Result<()> {
         (a_recv_id.clone(), A_RECV_AMT),
         (a_change_id.clone(), A_CHANGE_AMT),
     ];
+    // [FOREIGN-REVEALED PROBE] RGB09_REVEALED=1 runs LEG A with the receiver's outpoint named in the
+    // CLEAR instead of concealed. Same economics — the sender funds no carrier — but it takes the
+    // REVEALED validator path. This exists to separate "our blinded_map is broken" from "assigning to
+    // a foreign outpoint is broken", which the abort alone cannot distinguish.
+    let use_revealed = std::env::var("RGB09_REVEALED").as_deref() == Ok("1");
+    let a_revealed: Vec<(String, u64)> = vec![
+        (format!("{recv_seal_txid}:{recv_seal_vout}"), A_RECV_AMT),
+        (format!("{chg_seal_txid}:{chg_seal_vout}"), A_CHANGE_AMT),
+    ];
+    if use_revealed {
+        println!("RGB09 - [LEG A] REVEALED-FOREIGN probe: {:?}", a_revealed);
+    }
     let leg_a = mercuryrustlib::rgb::create_colored_backup_tx(
         &cc,
         &issuer,
@@ -231,7 +243,8 @@ pub async fn execute() -> Result<()> {
         si.initlock,
         si.interval,
         BLINDING,
-        Some(a_blinded.as_slice()),
+        if use_revealed { None } else { Some(a_blinded.as_slice()) },
+        if use_revealed { Some(a_revealed.as_slice()) } else { None },
     ).await?;
     println!("RGB09 - [LEG A] built blinded backup tx {} (NOT broadcast)", leg_a.txid);
     assert!(!is_outpoint_spent(&cc, &txid_r, vout_r), "off-chain: R still UNSPENT before exit");
@@ -246,10 +259,32 @@ pub async fn execute() -> Result<()> {
 
     // Post the consignment to both blinded recipients (keyed by their blinded recipient_id), broadcast
     // the exit, mark R spent, then settle both wallets.
+    if use_revealed {
+        // [FOREIGN-REVEALED] Nothing to post and nothing to reveal: the seal names each party's own
+        // outpoint in the clear, inside the consignment. Both sides accept it directly.
+        let got_recv = tokio::task::block_in_place(|| {
+            receiver.accept_revealed(
+                &leg_a.consignment,
+                &[leg_a.txid.clone()],
+                (recv_seal_txid.clone(), recv_seal_vout),
+            )
+        })?;
+        let got_chg = tokio::task::block_in_place(|| {
+            issuer.accept_revealed(
+                &leg_a.consignment,
+                &[leg_a.txid.clone()],
+                (chg_seal_txid.clone(), chg_seal_vout),
+            )
+        })?;
+        println!("RGB09 - [LEG A] REVEALED accept: receiver got {got_recv}, issuer change {got_chg}");
+        assert_eq!(got_recv, A_RECV_AMT, "receiver must be credited {A_RECV_AMT} on its OWN outpoint");
+        assert_eq!(got_chg, A_CHANGE_AMT, "issuer change must be {A_CHANGE_AMT} on its OWN outpoint");
+    } else {
     tokio::task::block_in_place(|| {
         receiver.post_consignment(&a_recv_id, &leg_a.consignment, &leg_a.txid, leg_a.recipient_vout)?;
         issuer.post_consignment(&a_change_id, &leg_a.consignment, &leg_a.txid, leg_a.recipient_vout)
     })?;
+    }
     let _ = cc.electrum_client.transaction_broadcast_raw(&hex::decode(&leg_a.signed_tx)?)?;
     tokio::task::block_in_place(|| issuer.mark_spent(&[format!("{txid_r}:{vout_r}")]))?;
 
@@ -263,6 +298,14 @@ pub async fn execute() -> Result<()> {
         a_chg_bal = tokio::task::block_in_place(|| issuer.settled_balance(&contract)).unwrap_or(0);
         if a_recv_bal == A_RECV_AMT && a_chg_bal == A_CHANGE_AMT { break; }
         thread::sleep(Duration::from_secs(1));
+    }
+    if use_revealed {
+        println!(
+            "RGB09 - [LEG A] REVEALED-FOREIGN SUCCESS: allocation moved to outpoints both parties \
+             ALREADY owned, the single bitcoin output paid the SENDER, the witness was never \
+             broadcast, and both sides validated and accepted. The sender gifted NO carrier sats."
+        );
+        return Ok(());
     }
     crate::rgb_dump::dump("issuer after LEG A (blinded, change 600)", &mut issuer, &contract);
     crate::rgb_dump::dump("receiver after LEG A (blinded, got 400)", &mut receiver, &contract);

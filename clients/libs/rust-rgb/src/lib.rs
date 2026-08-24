@@ -509,6 +509,7 @@ impl RgbWallet {
                         .map(|vout| (*vout, per_output_blinding(blinding, *vout)))
                         .collect(),
                     output_map,
+                    revealed_map: HashMap::new(),
                     blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
                 },
@@ -630,6 +631,7 @@ impl RgbWallet {
                         .map(|vout| (*vout, per_output_blinding(blinding, *vout)))
                         .collect(),
                     output_map,
+                    revealed_map: HashMap::new(),
                     blinded_map: HashMap::new(),
                     static_blinding: Some(blinding),
                 },
@@ -662,6 +664,53 @@ impl RgbWallet {
     /// transfer where the receiver receives on its own statechain UTXO and change goes to a free
     /// statechain UTXO. Uses the public `color_psbt_and_consume` + the fork's `blinded_map`.
     /// Returns `(colored_psbt_base64, consignment_base64)` - one consignment covering all beneficiaries.
+    /// [FOREIGN-REVEALED] Colour a PSBT assigning to outpoints the RECEIVER already owns, named in
+    /// the clear. Same economics as [`Self::color_blinded`] — no fresh carrier for the sender to fund
+    /// — on the REVEALED validator path the witness lane already exercises green.
+    ///
+    /// `recipients` are `("txid:vout", amount)`. Privacy cost, stated plainly: the sender learns the
+    /// receiver's outpoint. That is the trade for a path that validates.
+    pub fn color_revealed_foreign(
+        &self,
+        psbt_base64: &str,
+        contract_id: &str,
+        recipients: Vec<(String, u64)>,
+        blinding: u64,
+    ) -> Result<(String, String)> {
+        let contract = ContractId::from_str(contract_id)
+            .map_err(|e| anyhow!("invalid contract id: {e}"))?;
+        let mut psbt = RgbPsbt::from_str(psbt_base64).map_err(|e| anyhow!("invalid psbt: {e}"))?;
+        let revealed_map: HashMap<String, u64> = recipients.into_iter().collect();
+        let coloring_info = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                contract,
+                AssetColoringInfo {
+                    output_map: HashMap::new(),
+                    blinded_map: HashMap::new(),
+                    revealed_map,
+                    static_blinding: Some(blinding),
+                    output_blinding: HashMap::new(),
+                },
+            )]),
+            static_blinding: Some(blinding),
+            nonce: None,
+        };
+        let transfers = self.wallet.color_psbt_and_consume(&mut psbt, coloring_info)?;
+        let transfer = transfers
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("color produced no consignment"))?;
+        let dir = unique_tmp("mercury-rgb-color-revealed");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        transfer
+            .save_file(&path)
+            .map_err(|e| anyhow!("could not save consignment: {e}"))?;
+        let bytes = fs::read(&path)?;
+        let _ = fs::remove_dir_all(&dir);
+        Ok((psbt.to_string(), STANDARD.encode(bytes)))
+    }
+
     pub fn color_blinded(
         &self,
         psbt_base64: &str,
@@ -678,6 +727,7 @@ impl RgbWallet {
                 contract,
                 AssetColoringInfo {
                     output_map: HashMap::new(),
+                    revealed_map: HashMap::new(),
                     blinded_map,
                     static_blinding: Some(blinding),
                     // [P2] No witness-vout seals on this lane — every beneficiary is a BLINDED seal
@@ -944,6 +994,40 @@ impl RgbWallet {
     /// it is a one-seal ladder. Doing so is an SDK receive-path change and is deliberately NOT
     /// done inside this bridge; see `RGB_E2E=16`'s module docs for the migration consequence of
     /// leaving it undone.
+    /// [FOREIGN-REVEALED] Accept a consignment whose beneficiary seal is a REVEALED foreign outpoint
+    /// — one this wallet already owns, named in the clear. No seal is revealed because none is
+    /// concealed; `carrier` is `("txid", vout)`, the receiver's own outpoint the transition assigned
+    /// to. Returns the spendable fungible amount received.
+    pub fn accept_revealed(
+        &mut self,
+        consignment_base64: &str,
+        txids: &[String],
+        carrier: (String, u32),
+    ) -> Result<u64> {
+        let bytes = STANDARD
+            .decode(consignment_base64)
+            .map_err(|e| anyhow!("invalid consignment base64: {e}"))?;
+        let dir = unique_tmp("mercury-rgb-accept-revealed");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("consignment");
+        fs::write(&path, &bytes)?;
+        let consignment = rgb_lib::wallet::rust_only::load_transfer(
+            path.to_str().ok_or_else(|| anyhow!("bad temp path"))?,
+        )?;
+        let _ = fs::remove_dir_all(&dir);
+
+        let assignments = self
+            .wallet
+            .accept_offchain_revealed(consignment, txids, carrier)?;
+        Ok(assignments
+            .into_iter()
+            .map(|a| match a {
+                Assignment::Fungible(amt) => amt,
+                Assignment::InflationRight(_) | Assignment::NonFungible | Assignment::Any => 0,
+            })
+            .sum())
+    }
+
     pub fn accept_ladder(
         &mut self,
         consignment_base64: &str,
