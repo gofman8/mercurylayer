@@ -3261,6 +3261,188 @@ impl UtexoWallet {
         Ok(results)
     }
 
+    /// **[FOREIGN-REVEALED] Register a confirmed coin of this wallet as a colorable carrier for
+    /// `asset_id`, so it can be paid ON.**
+    ///
+    /// This is the receiver's ONE-TIME cost under the revealed lane: a coin it already funded becomes
+    /// a target that can receive the asset repeatedly. Idempotent — registering an already-registered
+    /// coin is a no-op. Returns the `"txid:vout"` registered.
+    pub async fn register_token_carrier(&self, asset_id: &str) -> Result<String> {
+        self.register_token_carrier_excluding(asset_id, None).await
+    }
+
+    /// [`Self::register_token_carrier`], skipping `exclude` — used for a payment's CHANGE outpoint,
+    /// which must not be the carrier the transition is spending (that seal is being closed).
+    pub(crate) async fn register_token_carrier_excluding(
+        &self,
+        asset_id: &str,
+        exclude: Option<&str>,
+    ) -> Result<String> {
+        let record = self.record().await?;
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        let allocations = tokio::task::block_in_place(|| w.list_allocations(asset_id))?;
+        for c in record.coins.iter().filter(|c| {
+            c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0
+        }) {
+            let (Some(txid), Some(vout), Some(sats)) = (c.utxo_txid.clone(), c.utxo_vout, c.amount)
+            else {
+                continue;
+            };
+            let op = format!("{txid}:{vout}");
+            if Some(op.as_str()) == exclude {
+                continue;
+            }
+            if allocations.iter().any(|(o, _, _)| *o == op) {
+                return Ok(op);
+            }
+            // rgb_amount = 0: the coin carries no allocation YET; it is a target, not a holding.
+            // Idempotent in practice — re-registering a known outpoint is accepted by the engine.
+            let _ = tokio::task::block_in_place(|| {
+                w.register_statechain(&txid, vout, sats as u64, asset_id, 0, &[])
+            });
+            return Ok(op);
+        }
+        Err(anyhow!(
+            "this wallet has no CONFIRMED coin to register as a carrier for {asset_id}"
+        ))
+    }
+
+    /// **[FOREIGN-REVEALED] The receiver's side: publish an outpoint to be paid ON.**
+    ///
+    /// Ensures this wallet has a colorable coin registered for `asset_id` and returns its
+    /// `"txid:vout"`. A sender pays onto it with [`Self::transfer_tokens_onto`], which moves the
+    /// allocation without funding a carrier for us — so the ~330-sat carrier is a cost this wallet
+    /// bears ONCE, not one the sender bears per payment.
+    ///
+    /// Receiving does not consume the outpoint, so the same one can be published repeatedly until
+    /// this wallet spends it.
+    ///
+    /// **A registered-but-EMPTY carrier does not appear in `list_allocations`** — an allocation list
+    /// lists allocations, and a fresh target has none. So registration state cannot be read back
+    /// from it; this registers idempotently and returns the outpoint it registered.
+    pub async fn token_receive_outpoint(&self, asset_id: &str) -> Result<String> {
+        self.register_token_carrier_excluding(asset_id, None).await
+    }
+
+    /// **[FOREIGN-REVEALED] Pay tokens onto an outpoint the RECEIVER already owns.**
+    ///
+    /// The transition assigns `token_amount` to `receiver_outpoint` and the remainder to this
+    /// wallet's own change outpoint; the single bitcoin output pays THIS wallet. **No carrier sats
+    /// are gifted to the receiver** — the cost that made a $1 token payment cost $0.50.
+    ///
+    /// `receiver_outpoint` is `"txid:vout"`, as published by [`Self::token_receive_outpoint`].
+    /// Returns the base64 consignment and the un-broadcast witness txid; the receiver accepts them
+    /// with [`Self::accept_tokens_on_outpoint`].
+    ///
+    /// COST, STATED: the receiver's outpoint is named in the CLEAR, so this wallet learns it. That
+    /// is the trade for a validator path that works — the concealed form aborts inside RGB's VM.
+    pub async fn transfer_tokens_onto(
+        &self,
+        asset_id: &str,
+        receiver_outpoint: &str,
+        token_amount: u64,
+    ) -> Result<(String, String)> {
+        if receiver_outpoint.split_once(':').is_none() {
+            return Err(anyhow!("receiver_outpoint must be \"txid:vout\", got {receiver_outpoint}"));
+        }
+        let record = self.record().await?;
+        // Find the carrier by ALLOCATION first and map back to a coin, rather than scanning coins and
+        // hoping each is allocated: the engine settles an allocation BEFORE the statechain coin
+        // confirms, so a coin-first scan misses a carrier that is ready by every measure that matters
+        // here. `settled` is still required — an unsettled allocation is not ours to spend yet.
+        let (carrier_sid, carrier_amt, carrier_outpoint) = {
+            let mut rgb = self.rgb().await?;
+            let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+            let allocations = tokio::task::block_in_place(|| w.list_allocations(asset_id))?;
+            let mut found = None;
+            for (op, amt, settled) in allocations.iter() {
+                if !*settled || *amt < token_amount {
+                    continue;
+                }
+                let Some((txid, vout_s)) = op.split_once(':') else { continue };
+                let Ok(vout) = vout_s.parse::<u32>() else { continue };
+                if let Some(c) = record.coins.iter().find(|c| {
+                    c.utxo_txid.as_deref() == Some(txid)
+                        && c.utxo_vout == Some(vout)
+                        && c.duplicate_index == 0
+                        // CONFIRMED only. An allocation settles in the engine BEFORE its statechain
+                        // coin confirms, so without a status check the carrier is "found" and then
+                        // refused deeper down. IN_TRANSFER is deliberately excluded even though the
+                        // signing path accepts it: the SE refuses a co-signature while a transfer is
+                        // open (409), so picking one here trades a clear message for a confusing one.
+                        && c.status == CoinStatus::CONFIRMED
+                }) {
+                    if let Some(sid) = c.statechain_id.clone() {
+                        found = Some((sid, *amt, op.clone()));
+                        break;
+                    }
+                }
+            }
+            found.ok_or_else(|| {
+                anyhow!(
+                    "no settled carrier of {asset_id} that this wallet holds as a statechain coin \
+                     has {token_amount}"
+                )
+            })?
+        };
+
+        // The change cannot land on the carrier being spent — that seal is closed by this very
+        // transition — so it needs a second outpoint this wallet owns.
+        let change = carrier_amt.saturating_sub(token_amount);
+        let mut revealed: Vec<(String, u64)> = vec![(receiver_outpoint.to_string(), token_amount)];
+        if change > 0 {
+            let own = self
+                .register_token_carrier_excluding(asset_id, Some(&carrier_outpoint))
+                .await
+                .map_err(|_| {
+                anyhow!(
+                    "paying {token_amount} of {asset_id} leaves {change} in change, which needs a \
+                     second colorable outpoint this wallet owns; none is available"
+                )
+                })?;
+            revealed.push((own, change));
+        }
+
+        let cc = self.client_config();
+        let rgb = self.rgb().await?;
+        let w = rgb.as_ref().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        let out = mercuryrustlib::rgb::refresh_rgb_anchor_self_transfer(
+            cc,
+            w,
+            &self.inner.config.wallet_name,
+            &carrier_sid,
+            asset_id,
+            carrier_amt,
+            mercuryrustlib::rgb::tier_blinding(&carrier_sid, mercuryrustlib::rgb::TierRole::State, 0, 0),
+            &self.inner.config.network.to_string(),
+            None,
+            Some(revealed.as_slice()),
+        )
+        .await?;
+        Ok((out.rgb_commitment_consignment, out.new_backup_txid))
+    }
+
+    /// **[FOREIGN-REVEALED] The receiver's accept.** Nothing is revealed because nothing is
+    /// concealed: the seal names `carrier_outpoint` in the clear inside the consignment. Returns the
+    /// spendable amount credited.
+    pub async fn accept_tokens_on_outpoint(
+        &self,
+        consignment_base64: &str,
+        witness_txid: &str,
+        carrier_outpoint: &str,
+    ) -> Result<u64> {
+        let (txid, vout) = carrier_outpoint
+            .split_once(':')
+            .ok_or_else(|| anyhow!("carrier_outpoint must be \"txid:vout\""))?;
+        let vout: u32 = vout.parse().map_err(|_| anyhow!("unparseable vout"))?;
+        let mut rgb = self.rgb().await?;
+        let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        tokio::task::block_in_place(|| {
+            w.accept_revealed(consignment_base64, &[witness_txid.to_string()], (txid.to_string(), vout))
+        })
+    }
+
     /// Send `token_amount` of `asset_id` to a statechain address, entirely off-chain: colored
     /// split (exact token piece + change back to this wallet) then branch-carrying key handover
     /// of the piece coin. The receiver's SDK auto-claims, validates the consignment off-chain and

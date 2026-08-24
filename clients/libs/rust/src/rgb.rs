@@ -522,6 +522,10 @@ pub async fn refresh_rgb_anchor_self_transfer(
     blinding: u64,
     network: &str,
     beneficiary: Option<&str>,
+    // [FOREIGN-REVEALED] `("txid:vout", amount)` naming outpoints that ALREADY exist — the receiver's
+    // carrier and the sender's own change coin. The bitcoin output still pays the sender, so the
+    // sender funds NO carrier for the receiver. Mutually exclusive with `beneficiary`.
+    revealed_beneficiaries: Option<&[(String, u64)]>,
 ) -> Result<RgbAnchorRefresh> {
     use crate::sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet};
     use crate::utils::info_config;
@@ -608,6 +612,11 @@ pub async fn refresh_rgb_anchor_self_transfer(
     // the sender. The RGB asset assignment is set by the OP_RETURN: `beneficiary = None` assigns to
     // the self output (anchor self-refresh); `Some(recipient_id)` assigns to a *receiver's*
     // blinded seal (off-chain P2P transfer) - the asset moves, the sats do not.
+    if revealed_beneficiaries.is_some() && beneficiary.is_some() {
+        return Err(anyhow!(
+            "a transition may name EITHER a blinded beneficiary OR revealed outpoints, never both"
+        ));
+    }
     let blinded_vec: Vec<(String, u64)>;
     let blinded = match beneficiary {
         Some(rid) => {
@@ -632,7 +641,7 @@ pub async fn refresh_rgb_anchor_self_transfer(
         si.interval,
         blinding,
         blinded,
-        None,
+        revealed_beneficiaries,
     )
     .await?;
     let new_nlocktime = tx_nlocktime(&colored.signed_tx)?;

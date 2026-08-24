@@ -27,6 +27,7 @@ pub mod rgb13_consignment_integrity;
 pub mod rgb14_metadata_and_ifa_supply;
 pub mod rgb15_colored_tier_builder;
 pub mod rgb16_legacy_lane_uncolourable;
+pub mod sdk93_token_payment_keeps_sats;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
@@ -681,6 +682,11 @@ async fn main() -> Result<()> {
     // test that does not exist. The full-suite runner feeds 21 such numbers, so its green tally was
     // measuring the same ten legacy tests over and over. Reaching this point with a test var SET is
     // therefore never "run the default"; it is "the number you asked for has no handler".
+    // [FOREIGN-REVEALED] A token payment must not cost the sender a carrier (SDK_E2E=93).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("93") {
+        return sdk93_token_payment_keeps_sats::execute().await;
+    }
+
     for var in ["SDK_E2E", "RGB_E2E"] {
         if let std::result::Result::Ok(n) = std::env::var(var) {
             return Err(anyhow::anyhow!(
