@@ -1237,6 +1237,17 @@ namespace db_manager {
             if (!conn.is_open()) { error_message = "db closed"; return false; }
             pqxx::work txn(conn);
 
+            // **[INV-FREEZE] A FROZEN ROOT ACCEPTS NO NEW LEAF, and this is the check that makes the
+            // freeze mean anything.** `is_root_frozen` existed and was called from NOWHERE, so the
+            // flag `collapse_grant` sets was inert: a leaf could still be observed after the frontier
+            // was computed and before `C` confirmed, and that leaf would be owed money by a
+            // transaction already signed without an output for it. The holder would be discharged
+            // without being paid — the single outcome the predicate exists to prevent.
+            //
+            // Checked INSIDE this transaction, against the root this leaf would join, so a leaf
+            // cannot slip in concurrently with the freeze. Fails CLOSED: an unreadable flag refuses,
+            // because "I could not tell whether the tree is closing" is not permission to join it.
+            //
             // The root is the far end of the parent chain, resolved INSIDE this transaction so a
             // concurrent observation cannot leave a leaf pointing at a root that is being rewritten.
             // A leaf whose parent the SE never co-signed is its own root — which is what a genuine
@@ -1246,6 +1257,18 @@ namespace db_manager {
                 const auto r = txn.exec_params(
                     "SELECT root_statechain_id FROM se_leaf WHERE statechain_id = $1;", parent);
                 root = r.empty() ? parent : r[0][0].as<std::string>();
+            }
+
+            {
+                const auto frozen_rows = txn.exec_params(
+                    "SELECT frozen FROM se_root WHERE root_statechain_id = $1;", root);
+                if (!frozen_rows.empty() && frozen_rows[0][0].as<bool>()) {
+                    error_message = "root " + root +
+                                    " is FROZEN: its collapse has been granted, so no new leaf may "
+                                    "join it (INV-FREEZE). A leaf admitted now would be owed value "
+                                    "by a transaction already signed without an output for it.";
+                    return false;
+                }
             }
 
             // exit_key is NOT NULL, so a first observation that carries no key cannot insert one.

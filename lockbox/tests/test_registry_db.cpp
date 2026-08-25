@@ -354,6 +354,51 @@ int main() {
         purge(kid);
     }
 
+    // ---- [INV-FREEZE] A FROZEN ROOT ADMITS NO NEW LEAF -----------------------------------------
+    //
+    // `freeze_root` set a flag that NOTHING read: `is_root_frozen` was defined and called from
+    // nowhere. So a leaf could be observed after `collapse_grant` computed the frontier and before
+    // `C` confirmed — and that leaf would be owed value by a transaction already signed without an
+    // output for it, discharging a holder without paying them. These cases pin the gate.
+    {
+        const std::string froot = root + "_FRZ";
+        const std::string fleaf = froot + "_L1";
+        const std::string flate = froot + "_LATE";
+        purge(froot);
+
+        check(db_manager::observe_leaf(fleaf, 5000, key(0x11), {}, {}, -1, err),
+              "a leaf joins an UNfrozen root");
+        // Freeze the leaf's ACTUAL root. `fleaf` was observed with no parent, so it is its own root
+        // — freezing the cosmetic `froot` string would freeze a tree no leaf belongs to, and the gate
+        // would correctly do nothing. (It did exactly that on the first run of this test.)
+        check(db_manager::freeze_root(fleaf, "", err), "freeze the leaf's own root");
+
+        // THE GATE. Same call that succeeded a moment ago, refused now — and refused for the freeze,
+        // not for some incidental reason, so the message is asserted too.
+        const bool late = db_manager::observe_leaf(flate, 5000, key(0x22), {fleaf}, {}, -1, err);
+        check(!late, "a leaf must NOT join a FROZEN root");
+        check(err.find("FROZEN") != std::string::npos,
+              "the refusal must name the freeze, not fail for an unrelated reason");
+
+        // And the frozen root's EXISTING leaf is untouched — freezing closes the door, it does not
+        // discard what is already inside.
+        {
+            std::vector<registry::Leaf> leaves;
+            check(db_manager::load_leaves(fleaf, leaves, err), "load the frozen root");
+            check(leaves.size() == 1, "the leaf present before the freeze survives it");
+        }
+
+        // A DIFFERENT root is unaffected: the freeze is per-tree, not global. Without this, a gate
+        // that refused everything would pass the case above and stop the whole system.
+        const std::string other = root + "_OTHER";
+        purge(other);
+        check(db_manager::observe_leaf(other, 5000, key(0x33), {}, {}, -1, err),
+              "an unfrozen root still admits leaves while another is frozen");
+        purge(froot);
+        purge(fleaf);
+        purge(other);
+    }
+
     purge(root);
 
     if (failures) {

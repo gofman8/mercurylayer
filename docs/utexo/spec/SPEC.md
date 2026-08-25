@@ -1031,6 +1031,17 @@ participation, window, epoch — have nothing left to multiply. What remains is 
 by its owner, settling with the co-owners who did not sell. **The on-chain footprint is unchanged**
 (`155 + 43·N` for `N` unreleased leaves); what changed is that no capital has to exist in advance.
 
+**INV-FREEZE (the freeze now GATES, and until this it gated nothing). BUILT AND TESTED.** A frozen
+root MUST admit no new leaf. `collapse_grant` set `frozen` and `is_root_frozen` was defined and called
+from **nowhere**, so the flag was inert: a leaf could still be observed after the frontier was computed
+and before `C` confirmed, and that leaf would be owed value by a transaction already signed without an
+output for it — a holder discharged without being paid, the single outcome the predicate exists to
+prevent. `observe_leaf` now checks the freeze **inside its own transaction**, against the root the leaf
+would join, and fails CLOSED: an unreadable flag refuses, because "I could not tell whether the tree is
+closing" is not permission to join it. Pinned by `test_registry_db` (a leaf joins before the freeze and
+is refused after, the refusal NAMES the freeze, the pre-existing leaf survives, and an unfrozen root
+still admits leaves so a gate that refused everything could not pass).
+
 **REQ-81 (a close is an owner's operation, never a schedule).** Closing a tree MUST be triggered by its
 root owner's decision, never by a calendar, an epoch or a deadline. No holder may be compelled to
 migrate, and a holder who does nothing MUST simply be paid their full funding value when the tree
