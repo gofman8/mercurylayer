@@ -557,7 +557,20 @@ pub async fn refresh_rgb_anchor_self_transfer(
     let previous_owner_auth_pubkey = coin.auth_pubkey.clone();
 
     // 3. Prior backup-tx history for X (kept for audit; the new one appends with the next tx_n).
-    let all_backups = get_backup_txs(&client_config.pool, wallet_name, statechain_id).await?;
+    //
+    // ABSENCE IS NOT FAILURE. `get_backup_txs` is `fetch_one`, so a coin with no row yields
+    // `RowNotFound`, and the repo's own convention (see its doc comment, and `tokens::read_backup_rows`)
+    // is that callers DOWNCAST to tell a missing row from a failed read. This path did not, so any coin
+    // without a plain backup chain — a carrier RECEIVED through a coloured split, whose exit material
+    // lives under `branch-<sid>` — died here with "no rows returned by a query that expected to return
+    // at least one row". That is a legitimate shape, not a fault.
+    let all_backups = match get_backup_txs(&client_config.pool, wallet_name, statechain_id).await {
+        Ok(v) => v,
+        Err(e) => match e.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::RowNotFound) => Vec::new(),
+            _ => return Err(e),
+        },
+    };
     let mut coin_backups: Vec<BackupTx> = all_backups
         .into_iter()
         .filter(|b| {
@@ -568,9 +581,17 @@ pub async fn refresh_rgb_anchor_self_transfer(
         .collect();
     coin_backups.sort_by(|a, b| a.tx_n.cmp(&b.tx_n));
     let previous_tx_n = coin_backups.last().map(|b| b.tx_n).unwrap_or(0);
+    // With no prior backup for THIS funding outpoint, the coin's own locktime is the current state's
+    // locktime — which is exactly what the next backup must be built strictly below. A received child
+    // is the ordinary case here: it has a locktime and a branch, just not a plain backup chain.
     let previous_nlocktime = match coin_backups.last() {
         Some(b) => tx_nlocktime(&b.tx)?,
-        None => return Err(anyhow!("no existing backup tx for the coin")),
+        None => coin.locktime.ok_or_else(|| {
+            anyhow!(
+                "coin {statechain_id} has neither a backup tx nor a locktime, so there is no current \
+                 state to build the next one below"
+            )
+        })?,
     };
     let qt_backup_tx = coin_backups.len() as u32;
 

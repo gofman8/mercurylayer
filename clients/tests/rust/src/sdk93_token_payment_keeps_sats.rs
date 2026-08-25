@@ -29,15 +29,23 @@
 //!   2. **A sending wallet needs a spare colorable outpoint.** Change cannot land on the carrier being
 //!      spent — that seal is closed by the transition — so a second coin is required, exactly as an
 //!      on-chain wallet needs a change address.
-//!   3. **WHERE IT STOPS TODAY:** `refresh_rgb_anchor_self_transfer` reads the coin's backup chain
-//!      with `get_backup_txs`, which is `fetch_one` — so "no rows" surfaces as a query FAILURE, not
-//!      an absence. A carrier received through a coloured split is a CHILD whose exit material lives
-//!      under `branch-<sid>`, not in a plain backup chain, so the lookup finds nothing and the call
-//!      dies with "no rows returned by a query that expected to return at least one row".
+//!   3. `refresh_rgb_anchor_self_transfer` read the backup chain with `get_backup_txs`, which is
+//!      `fetch_one` — so "no rows" surfaced as a query FAILURE rather than an absence, against this
+//!      repo's own documented convention. FIXED: absence is now absence.
+//!   4. **WHERE IT STOPS TODAY, and it is structural rather than a missing lookup.** With the
+//!      absence handled, the next thing the path wants is a previous nLockTime to build strictly
+//!      below — and a carrier received through a coloured split **has no locktime at all**. That is
+//!      not an omission: a laddered coin's state is governed by CSV TIERS, and every TES-R tier is
+//!      built at locktime 0. A decrementing flat backup is simply the wrong mechanism for it.
 //!
-//! So the remaining work is making that path accept a received child, not anything about revealed
-//! seals. This test is committed RED on purpose: it is a runnable reproduction of a real gap, which
-//! is worth more than a green test that stops before reaching it.
+//! So the remaining work is NOT "teach this path about children" — it is to build the coloured
+//! payment for a laddered coin on the IN-LADDER path (`build_colored_in_ladder_split` and friends)
+//! with a revealed foreign seal, rather than on the flat-backup path this test drives. Nothing about
+//! revealed seals is in doubt: `rgb09` proves them end to end on a carrier that does have a plain
+//! backup chain.
+//!
+//! This test is committed RED on purpose. A runnable reproduction of a real boundary is worth more
+//! than a green test that stops before reaching it.
 //!
 //! Run: SDK_E2E=93 ML_NETWORK=regtest cargo run --release
 
