@@ -987,17 +987,25 @@ namespace lockbox {
         // and a transaction that pays everyone but spends the wrong outpoint is still not a
         // collapse of THIS root.
         //
-        // NOT BUILT HERE: the partial signature. R6 says the SE issues one, and it must be issued
-        // in the same database transaction as the freeze so no leaf can appear between the check
-        // and the ratchet (REQ-64). Wiring a signature to a route that has never been exercised
-        // would be the more dangerous half shipped first, so this route establishes the VERDICT and
-        // the freeze, and refuses to pretend it signed. The signing half is the next increment.
+        // [#169] THE SIGNATURE IS NOW ISSUED, and issued in the SAME database transaction as the
+        // freeze. Neither half is safe alone: sign first and a leaf can still join a tree whose
+        // collapse is already signed without an output for it; freeze first and a failed signature
+        // seals the tree shut with nothing payable. `freeze_root_and_store_collapse_sig` does both
+        // or neither.
+        //
+        // The session is BOUND to the disclosure exactly as an ordinary co-signature is (REQ-57):
+        // the SE rebuilds the blinded session from the transaction it just checked the predicate
+        // over, and refuses if it does not reproduce the session it was asked to sign. Without that
+        // the predicate would be verified against one transaction while the signature authorised
+        // another — the whole point of the check, defeated at the last step.
         CROW_ROUTE(app, "/collapse_grant")
-        .methods("POST"_method)([](const crow::request& req) {
+        .methods("POST"_method)([&seed](const crow::request& req) {
             auto body = crow::json::load(req.body);
             if (!body) return crow::response(400, "malformed json");
-            if (body.count("root_statechain_id") == 0 || body.count("disclosure") == 0) {
-                return crow::response(400, "required: root_statechain_id, disclosure");
+            if (body.count("root_statechain_id") == 0 || body.count("disclosure") == 0
+                || body.count("session") == 0) {
+                return crow::response(400,
+                                      "required: root_statechain_id, disclosure, session");
             }
             const std::string root_sid = body["root_statechain_id"].s();
 
@@ -1088,9 +1096,6 @@ namespace lockbox {
             const std::string successor =
                 body.count("successor_root") ? std::string(body["successor_root"].s())
                                              : std::string();
-            if (!db_manager::freeze_root(root_sid, successor, err)) {
-                return crow::response(500, "the predicate passed but the freeze failed: " + err);
-            }
 
             // ── [REQ-74] IS THIS ROUND ACTUALLY SELF-FUNDING? ──────────────────────────────────
             //
@@ -1140,20 +1145,77 @@ namespace lockbox {
                                  << " recovered " << recovered << " (round is NOT self-funding)";
             }
 
+
+            // 7. BIND THE SESSION TO THE VERY TRANSACTION THE PREDICATE JUST PASSED (REQ-57).
+            //    Without this the SE would verify the predicate over one transaction and sign
+            //    another — the check defeated at its last step.
+            std::string session_hex = std::string(body["session"].s());
+            if (session_hex.rfind("0x", 0) == 0) session_hex = session_hex.substr(2);
+            std::vector<unsigned char> serialized_session = utils::ParseHex(session_hex);
+            if (serialized_session.size() != 133) {
+                return crow::response(400, "Invalid session length. Must be 133 bytes!");
+            }
+            {
+                std::vector<unsigned char> bound_sighash;
+                std::string detail;
+                if (witness::bind(*disclosure, serialized_session, &bound_sighash, &detail)
+                    != witness::BindResult::Match) {
+                    return crow::response(
+                        400, std::string("the collapse's session does not reproduce the disclosed "
+                                         "transaction: ") + detail);
+                }
+            }
+
+            // 8. PRODUCE THE PARTIAL SIGNATURE. The secnonce is loaded AND consumed atomically, so a
+            //    second grant over a different session cannot reuse it — the MuSig2 nonce-reuse key
+            //    leak, closed here exactly as on the ordinary signing path.
+            const int64_t negate_seckey =
+                body.count("negate_seckey") ? body["negate_seckey"].i() : 0;
+            std::unique_ptr<utils::chacha20_poly1305_encrypted_data> encrypted_keypair;
+            std::unique_ptr<utils::chacha20_poly1305_encrypted_data> encrypted_secnonce;
+            unsigned char serialized_server_pubnonce[66];
+            if (!db_manager::load_and_consume_secnonce(root_sid, encrypted_keypair,
+                                                       encrypted_secnonce,
+                                                       serialized_server_pubnonce,
+                                                       sizeof(serialized_server_pubnonce), err)) {
+                return crow::response(500, "could not load the root's sealed material: " + err);
+            }
+            if (encrypted_keypair == nullptr || encrypted_secnonce == nullptr) {
+                return crow::response(
+                    400, "no unconsumed secnonce for this root — call sign/first for a fresh one "
+                         "before requesting the collapse grant (refusing to reuse a nonce)");
+            }
+            const auto sig = enclave::partial_signature(
+                seed.data(), encrypted_keypair.get(), encrypted_secnonce.get(), (int)negate_seckey,
+                serialized_session.data(), serialized_session.size(), serialized_server_pubnonce);
+            const std::string partial_sig_hex =
+                utils::key_to_string(sig.partial_sig_data, sizeof(sig.partial_sig_data));
+
+            // 9. FREEZE **AND** RECORD THE SIGNATURE, IN ONE TRANSACTION (REQ-64). Both or neither:
+            //    signing without freezing lets a leaf join a tree whose collapse is already signed
+            //    without an output for it; freezing without signing seals the tree with nothing
+            //    payable.
+            const std::string session_key =
+                utils::key_to_string(serialized_session.data(), serialized_session.size());
+            bool newly_signed = false;
+            if (!db_manager::freeze_root_and_store_collapse_sig(
+                    root_sid, successor, session_key, partial_sig_hex, newly_signed, err)) {
+                return crow::response(500, "the predicate passed but freeze+sign failed: " + err);
+            }
+            CROW_LOG_INFO << "COLLAPSE_GRANTED root " << root_sid << " newly_signed "
+                          << (newly_signed ? 1 : 0);
+            crow::json::wvalue result;
+            result["partial_sig"] = partial_sig_hex;
+            result["newly_signed"] = newly_signed;
+            result["frozen"] = true;
+            result["granted"] = true;
+
             CROW_LOG_INFO << "COLLAPSE_GRANTED root " << root_sid << " obligations "
                           << obligations.size() << " recovered " << recovered << " self_funding "
                           << (self_funding ? 1 : 0);
-            crow::json::wvalue result;
-            result["granted"] = true;
-            result["frozen"] = true;
             result["obligations"] = static_cast<int>(obligations.size());
             result["recovered"] = static_cast<int64_t>(recovered);
             result["self_funding"] = self_funding;
-            // Stated rather than implied: a caller that treats a verdict as a signature would
-            // broadcast an unsigned transaction and lose the round.
-            result["partial_sig"] = nullptr;
-            result["note"] = "predicate satisfied and root frozen; the partial signature is not "
-                             "issued by this build";
             return crow::response{result};
         });
 

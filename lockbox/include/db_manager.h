@@ -310,6 +310,24 @@ namespace db_manager {
                      const std::string& successor_root,
                      std::string& error_message);
 
+    /// **[REQ-64] Freeze the root AND record the collapse's partial signature in ONE transaction.**
+    ///
+    /// The freeze and the signature must be atomic. If the signature were stored first, a leaf could
+    /// be observed before the freeze landed and would be owed money by a transaction already signed
+    /// without an output for it. If the freeze were stored first and the signature then failed, the
+    /// tree would be sealed shut with no collapse to show for it — every holder stuck, nothing
+    /// payable. Neither half is safe alone, which is why this is one call and not two.
+    ///
+    /// `newly_signed` reports whether THIS call inserted the signature: a re-grant of the same
+    /// session is idempotent and must not inflate the signature count, exactly as
+    /// `store_partial_sig_and_increment` guarantees for an ordinary co-signature.
+    bool freeze_root_and_store_collapse_sig(const std::string& root_statechain_id,
+                                            const std::string& successor_root,
+                                            const std::string& session_key,
+                                            const std::string& partial_sig,
+                                            bool& newly_signed,
+                                            std::string& error_message);
+
     /// `frozen` is assigned on every path (false when the root is unknown), so a caller cannot
     /// mistake "no row" for "not frozen" by reading an uninitialised variable.
     bool is_root_frozen(const std::string& root_statechain_id, bool& frozen,

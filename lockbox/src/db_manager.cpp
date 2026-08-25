@@ -1479,6 +1479,58 @@ namespace db_manager {
         }
     }
 
+    bool freeze_root_and_store_collapse_sig(const std::string& root_statechain_id,
+                                            const std::string& successor_root,
+                                            const std::string& session_key,
+                                            const std::string& partial_sig,
+                                            bool& newly_signed,
+                                            std::string& error_message) {
+        newly_signed = false;  // assigned on EVERY path: a caller must never read it uninitialised
+                               // and conclude a signature was issued when it was not.
+        try {
+            pqxx::connection conn(getDatabaseConnectionString());
+            if (!conn.is_open()) { error_message = "db closed"; return false; }
+            pqxx::work txn(conn);
+
+            txn.exec(
+                "CREATE TABLE IF NOT EXISTS signed_session_cache ("
+                "statechain_id varchar(50) NOT NULL, "
+                "session_key varchar NOT NULL, "
+                "partial_sig varchar NOT NULL, "
+                "PRIMARY KEY (statechain_id, session_key));");
+
+            // The signature first, the freeze second, BOTH inside one transaction — so the order
+            // within it is invisible to everyone else and neither can be observed without the other.
+            const pqxx::result ins = txn.exec_params(
+                "INSERT INTO signed_session_cache (statechain_id, session_key, partial_sig) "
+                "VALUES ($1, $2, $3) ON CONFLICT (statechain_id, session_key) DO NOTHING;",
+                root_statechain_id, session_key, partial_sig);
+            newly_signed = (ins.affected_rows() == 1);
+            if (newly_signed) {
+                txn.exec_params(
+                    "UPDATE generated_public_key SET sig_count = sig_count + 1 "
+                    "WHERE statechain_id = $1;",
+                    root_statechain_id);
+            }
+
+            // INV-FREEZE: prospective and irreversible. `frozen = true` is never cleared, and an
+            // empty successor must not overwrite one already recorded.
+            txn.exec_params(
+                "INSERT INTO se_root (root_statechain_id, frozen, successor_root) "
+                "VALUES ($1, true, NULLIF($2, '')) "
+                "ON CONFLICT (root_statechain_id) DO UPDATE SET "
+                "  frozen = true, "
+                "  successor_root = COALESCE(NULLIF($2, ''), se_root.successor_root);",
+                root_statechain_id, successor_root);
+
+            txn.commit();
+            return true;
+        } catch (std::exception const& e) {
+            error_message = e.what();
+            return false;
+        }
+    }
+
     bool is_root_frozen(const std::string& root_statechain_id, bool& frozen,
                         std::string& error_message) {
         frozen = false;  // assigned on EVERY path: an unknown root is not frozen, and a caller must

@@ -1042,6 +1042,23 @@ closing" is not permission to join it. Pinned by `test_registry_db` (a leaf join
 is refused after, the refusal NAMES the freeze, the pre-existing leaf survives, and an unfrozen root
 still admits leaves so a gate that refused everything could not pass).
 
+**THE GRANT NOW SIGNS, AND SIGNS ATOMICALLY WITH THE FREEZE (#169). BUILT.** `collapse_grant`
+returned `partial_sig: null` and said so; it now issues the partial signature, and issues it in the
+SAME database transaction that sets `frozen` (`freeze_root_and_store_collapse_sig`). Neither half is
+safe alone: sign first and a leaf may still join a tree whose collapse is already signed without an
+output for it; freeze first and a failed signature seals the tree with nothing payable.
+
+Two properties the route now enforces, both observable from outside via `collapse_grant_probe.py`:
+
+* **The verdict is COMPLETE before anything is signed.** Every refusal — underpayment, wrong funding
+  outpoint, an omitted leaf, a named-but-underfunded next root (REQ-74) — fires `403` on its own gate
+  before the signing step is reached. The probe is a differential: each case differs from the granted
+  one in exactly one respect, so a refusal cannot be explained by anything else.
+* **No signature without a bound session (REQ-57).** The session must reproduce the disclosed
+  transaction, or the grant refuses `400`. Otherwise the SE would verify the predicate over one
+  transaction and sign another — the check defeated at its last step. The secnonce is loaded and
+  consumed atomically, so a second grant over a different session cannot reuse it.
+
 **REQ-81 (a close is an owner's operation, never a schedule).** Closing a tree MUST be triggered by its
 root owner's decision, never by a calendar, an epoch or a deadline. No holder may be compelled to
 migrate, and a holder who does nothing MUST simply be paid their full funding value when the tree

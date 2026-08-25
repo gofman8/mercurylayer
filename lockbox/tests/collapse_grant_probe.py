@@ -12,7 +12,14 @@ observable from outside, over HTTP, against a seeded tree.
 The four cases are a DIFFERENTIAL, not a smoke test. Each differs from the granted case in exactly
 one respect, so a refusal cannot be explained by anything else:
 
-  (a) pays both leaves in full         -> 200, granted, root frozen
+  (a) pays both leaves in full         -> reaches the SESSION gate. Since #169 the route also issues
+                                          the partial signature, so a grant now requires a `session`
+                                          that reproduces the disclosed transaction (REQ-57). This
+                                          probe supplies no real MuSig2 session, so (a) is expected to
+                                          refuse 400 AT THE SESSION GATE — which is itself the
+                                          assertion that matters here: the predicate PASSED (or it
+                                          would have refused 403 first) and no signature is issued
+                                          without a bound session
   (b) one satoshi short for one leaf   -> 403 from the PAYMENT gate, naming the key and the shortfall
   (c) pays everyone, wrong funding tx  -> 403 from the OUTPOINT gate. A `C` that pays every owed key
                                           out of SOMEBODY ELSE'S money still is not a collapse of
@@ -20,8 +27,12 @@ one respect, so a refusal cannot be explained by anything else:
                                           independent rather than one standing in for the other
   (d) omits a leaf entirely            -> 403 from the PAYMENT gate, naming the unpaid key
 
+ORDERING IS THE POINT. The predicate runs BEFORE the session bind, so (b), (c) and (d) still refuse
+with their own 403 rather than being masked by a session failure. If a future edit moved the bind
+earlier, those three would flip to 400 and this probe would say so.
+
 Expected:
-    pays both in full     : HTTP 200
+    pays both in full     : HTTP 400 ... session ...  (predicate passed, signature gated)
     one satoshi short     : HTTP 403 ... is owed 3000 ...
     wrong funding outpoint: HTTP 403 ... does not spend this root's funding output ...
     omits a leaf          : HTTP 403 ... is owed 2000 ...
@@ -62,7 +73,11 @@ subprocess.run(["docker","exec","-i","mercurylayer-db_lockbox-1","psql","-U","po
                capture_output=True)
 
 def post(txhex, label):
+    # A 133-byte PLACEHOLDER session. Cases (b)-(d) never reach the bind — the predicate refuses
+    # first — so a real MuSig2 session is not needed to exercise them, and the granted case reaching
+    # the bind and refusing there is exactly what this probe asserts.
     body = {"root_statechain_id": ROOT,
+            "session": "00"*133,
             "disclosure": {"unsigned_tx": txhex, "input_index":0,
                            "prevout_values":[6000], "prevout_spks":["5120"+"33"*32],
                            "agg_pubkey":"33"*32, "agg_nonce":"00"*66,
@@ -93,7 +108,11 @@ subprocess.run(["docker","exec","-i","mercurylayer-db_lockbox-1","psql","-U","po
                capture_output=True)
 
 def post2(txhex, label, extra):
+    # A 133-byte PLACEHOLDER session. Cases (b)-(d) never reach the bind — the predicate refuses
+    # first — so a real MuSig2 session is not needed to exercise them, and the granted case reaching
+    # the bind and refusing there is exactly what this probe asserts.
     body = {"root_statechain_id": ROOT,
+            "session": "00"*133,
             "disclosure": {"unsigned_tx": txhex, "input_index":0,
                            "prevout_values":[6000], "prevout_spks":["5120"+"33"*32],
                            "agg_pubkey":"33"*32, "agg_nonce":"00"*66,
