@@ -983,11 +983,29 @@ REQ-76 without answering this has moved the exhaustion problem rather than solve
 budget is consumed against is **total** — live tier plus every superseded state plus every outstanding
 conveyed state — not merely the live one.
 
-**REQ-79 (quote the SHIPPED depth constants, not the drafted ones).** The mainnet split depth is **8**
-and the exit-transaction cap is **19**, lowered by D53. An earlier costing of this replacement used
-10 and 23 and overstated the transfer budget by roughly six times. Any figure derived from these
-constants MUST be re-derived from the values the code actually carries, and MUST account for rollover
-levels and split levels drawing on the **same** budget.
+**REQ-79 (quote the SHIPPED depth constants, not the drafted ones). BUILT AND PINNED.** The mainnet
+split depth is **8** and the exit-transaction cap is **19** (`3 + 2·depth`), lowered by D53. An earlier
+costing of this replacement used 10 and 23.
+
+**Both are now DERIVED from the shipped schedule by a test rather than retyped from a draft**
+(`req79_shipped_budget`, two cases: the caps, and the budget). Measured there, on
+`TesrParams::mainnet()` at the shipped `lockheight_init = 10000`:
+
+| quantity | derivation | value |
+|---|---|---|
+| flat hops per extension epoch | `(d0 − d_floor) / delta` = `(1440 − 144) / 36` | **36** |
+| usable extension rungs | `m_max + 1` | **16** |
+| whole-leaf payments per depth level | `36 × 16` | **576** |
+| split depth | `max_split_depth` | **8** |
+| exit-transaction cap | `3 + 2 · 8` | **19** |
+
+**The ~6× overstatement was not in the 576 — it was in multiplying two different axes.** Depth and the
+hop budget are separate quantities: a coin does not get 576 hops *at each of* 8 levels. Depth is spent
+by in-ladder splits AND by rollover levels, from one shared allowance. Any figure quoting them
+together MUST say which axis it is on, and the test asserts they are not multiplied.
+
+A stale constant in a doc comment is how a drafted number gets requoted as measured: `max_exit_txs`
+carried "23 on mainnet" long after D53 made it 19, and that comment is fixed with this requirement.
 
 #### 5.4.4 Consolidation — how a tree actually closes, and why it is not a round
 

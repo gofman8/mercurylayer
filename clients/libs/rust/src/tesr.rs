@@ -6645,7 +6645,12 @@ fn exit_cap_shapes(p: mercurylib::tesr::TesrParams) -> (Vec<Option<u16>>, Vec<Op
     (base, SplitLevelShape::TwoTier.csvs(p))
 }
 
-/// **[P0-3] THE EXIT-CHAIN LENGTH CAP** for a schedule and epoch — 23 on mainnet, 139 on regtest.
+/// **[P0-3] THE EXIT-CHAIN LENGTH CAP** for a schedule and epoch — **19** on mainnet.
+///
+/// [REQ-79] This said "23 on mainnet" until D53 lowered the depth cap to 8, and `3 + 2·depth` is 19.
+/// A stale constant in a doc comment is how a drafted figure gets quoted back as if it were measured
+/// — which is exactly what happened when the round's replacement was costed. `req79_shipped_budget`
+/// now derives both numbers from the shipped schedule so this cannot drift again unnoticed.
 /// Thin, named wrapper over [`mercurylib::transfer::receiver::max_exit_txs`] so every lane in this
 /// file derives the number the same way, from the same two shapes.
 pub fn max_exit_txs(p: mercurylib::tesr::TesrParams, epoch_blocks: u32) -> u32 {
@@ -26578,4 +26583,83 @@ pub async fn cooperative_child_exit(
         .transaction_broadcast_raw(&raw)
         .map_err(|e| anyhow::anyhow!("cooperative child exit built and co-signed but did not broadcast: {e}"))?;
     Ok(txid.to_string())
+}
+
+/// **[REQ-79] The shipped depth constants and the transfer budget DERIVED from them.**
+///
+/// §5.4 quotes a transfer budget, and an earlier costing of the round's replacement used depth 10 /
+/// cap 23 — the DRAFTED numbers — and overstated it by roughly six times. D53 lowered them. This
+/// module exists so the figure in the specification is computed from what the code actually carries
+/// and fails loudly if either drifts, rather than being retyped from a draft.
+#[cfg(test)]
+mod req79_shipped_budget {
+    use super::*;
+
+    /// `server/Settings.toml`: `lockheight_init = 10000`. A fresh epoch is that long, and
+    /// `split_cap_decision` clamps `epoch_blocks` to it.
+    const MAINNET_EPOCH_BLOCKS: u32 = 10_000;
+
+    #[test]
+    fn the_depth_cap_is_eight_and_the_exit_cap_is_nineteen() {
+        let p = mercurylib::tesr::TesrParams::mainnet();
+        let (base, per_level) = exit_cap_shapes(p);
+        let depth = mercurylib::transfer::receiver::max_split_depth(
+            &base,
+            &per_level,
+            MAINNET_EPOCH_BLOCKS,
+        );
+        let cap = mercurylib::transfer::receiver::max_exit_txs(&base, &per_level, MAINNET_EPOCH_BLOCKS);
+
+        // REQ-79 states 8 and 19. If this fails, the SPEC is wrong, not this test — go and fix §5.4
+        // rather than the numbers here, because the whole point is that the document quotes the code.
+        assert_eq!(depth, 8, "mainnet split depth (REQ-79 quotes 8; the drafted figure was 10)");
+        assert_eq!(cap, 19, "mainnet exit-tx cap (REQ-79 quotes 19; the drafted figure was 23)");
+        // The cap is a function of depth, not an independent constant.
+        assert_eq!(cap, 3 + 2 * depth, "the cap is 3 + 2·depth by construction");
+    }
+
+    #[test]
+    fn the_whole_leaf_transfer_budget_is_derived_not_asserted() {
+        let p = mercurylib::tesr::TesrParams::mainnet();
+
+        // The FLAT chain decrements by `delta` per transfer, from `d0` down to `d_floor`.
+        let flat_hops = (p.d0 - p.d_floor) / p.delta;
+        assert_eq!(flat_hops, 36, "(1440 − 144) / 36");
+
+        // The EXTENSION ladder walks `e0` down to `e_floor` by `delta_e`, capped by `m_max`
+        // renewals — so `m_max + 1` rungs are usable.
+        let ext_steps = (p.e0 - p.e_floor) / p.delta_e;
+        assert_eq!(ext_steps, 16, "(720 − 144) / 36");
+        let usable_rungs = p.m_max + 1;
+        assert_eq!(usable_rungs, 16, "m_max = 15 renewals, so 16 rungs");
+        // m_max is what binds, not the arithmetic walk — they coincide here, and a change to either
+        // must not silently widen the budget.
+        assert!(
+            u32::from(usable_rungs) <= u32::from(ext_steps),
+            "m_max must not exceed the rungs the schedule actually has"
+        );
+
+        let whole_leaf_transfers = u32::from(flat_hops) * u32::from(usable_rungs);
+        assert_eq!(
+            whole_leaf_transfers, 576,
+            "whole-leaf payments per depth level, derived from the SHIPPED schedule"
+        );
+
+        // AND THE PART THE FIRST COSTING GOT WRONG. Depth is a SEPARATE, much smaller budget, and it
+        // is shared: every in-ladder split spends a level, and so does every rollover level. The
+        // headline must never multiply the two as if a coin could spend all 576 hops at each of the
+        // 8 levels — that is the ~6× overstatement REQ-79 exists to stop.
+        let (base, per_level) = exit_cap_shapes(p);
+        let depth = mercurylib::transfer::receiver::max_split_depth(
+            &base,
+            &per_level,
+            MAINNET_EPOCH_BLOCKS,
+        );
+        assert_eq!(depth, 8);
+        assert!(
+            depth < whole_leaf_transfers,
+            "depth and hop budget are different quantities on different axes; quoting their product \
+             as a transfer budget is the error this test pins"
+        );
+    }
 }
