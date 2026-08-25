@@ -1536,9 +1536,17 @@ outpoint without carrying its allocation forward **destroys the allocation**. So
 * "maximum prize below minimum cost" collapses — sweeping becomes arbitrarily profitable;
 * and the fragment stops being a courtesy to siblings and becomes a **burn switch anyone may pull**.
 
-**REQ-86 (no coloured tails).** A tail MUST NOT carry an RGB allocation. The verifier MUST refuse a
-split that seals an allocation to a sub-dust output, and MUST refuse to issue a release fragment for
-any outpoint carrying one.
+**REQ-86 (no coloured tails). BUILT AND TESTED.** A tail MUST NOT carry an RGB allocation. The
+verifier refuses a coloured payload under `DUST_LIMIT` (`refuse_coloured_tail`, called on every tier
+in the coloured verification loop; `req86_no_coloured_tails`, three cases including that the offending
+vout is NAMED rather than merely detected).
+
+**It is deliberately redundant today, and that is the requirement rather than an oversight.**
+`refuse_dust_payloads` already forbids EVERY sub-dust payload, so this guard cannot fire yet and the
+prohibition currently holds vacuously. The moment REQ-83 admits tails for sats, that blanket stops
+covering the coloured case — and a prohibition that existed only as a side effect of another rule
+would vanish with it, silently, without anyone editing a line. Naming it now is what keeps it when
+the ground moves.
 
 **And RGB does not need tails, which is why this costs nothing.** For a coloured leaf the amount a user
 pays is the ASSET amount, and that is already arbitrary on any carrier — the satoshis are a vessel, not

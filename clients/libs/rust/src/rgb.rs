@@ -927,6 +927,50 @@ pub fn colored_payload_vouts(tx: &Transaction) -> Vec<u32> {
         .collect()
 }
 
+/// **[REQ-86] A coloured payload may NEVER be sub-dust: a coloured tail is a burn switch.**
+///
+/// §6.0 lets a SATS payment below `DUST_LIMIT` ride as a TAIL — the transaction's one permitted dust
+/// output — made safe by a release fragment: a `SIGHASH_NONE|ANYONECANPAY` spend published to every
+/// sibling so a tail can never hold their exit hostage. The safety argument is arithmetic: the prize
+/// is at most 329 sat and broadcasting the split costs more, so sweeping tails never pays.
+///
+/// **That argument holds only because a tail's worth IS its satoshis, and for a coloured output it is
+/// false.** An RGB allocation is bound to an OUTPOINT and its amount lives in the consignment, not in
+/// the output's value, so a 329-sat tail can carry an unbounded quantity of an asset. A fragment over
+/// it authorises anyone to spend that outpoint anywhere, and spending a sealed outpoint without
+/// carrying the allocation forward DESTROYS it. The prize stops being 329 sat and becomes the whole
+/// allocation; sweeping becomes arbitrarily profitable; and the fragment stops being a courtesy to
+/// siblings and becomes a burn switch anyone may pull.
+///
+/// **Today this is also covered by `refuse_dust_payloads`, which forbids EVERY sub-dust payload — so
+/// the prohibition currently holds vacuously.** That is exactly why it is stated separately here: the
+/// moment REQ-83 admits tails for sats, the blanket rule stops covering the coloured case, and a
+/// guard that only ever existed as a side effect would vanish without anyone editing it.
+///
+/// Returns the offending `(vout, value)` when a coloured payload is under the floor.
+pub fn coloured_sub_dust_payload(tx: &Transaction) -> Option<(u32, u64)> {
+    colored_payload_vouts(tx).into_iter().find_map(|vout| {
+        let o = tx.output.get(vout as usize)?;
+        (o.value < mercurylib::tesr::DUST_LIMIT).then_some((vout, o.value))
+    })
+}
+
+/// [`coloured_sub_dust_payload`] as a refusal, for callers that build or verify a coloured tier.
+pub fn refuse_coloured_tail(tx: &Transaction, what: &str) -> Result<()> {
+    if let Some((vout, value)) = coloured_sub_dust_payload(tx) {
+        return Err(anyhow!(
+            "{what}: coloured payload output {vout} carries {value} sat, under the {}-sat floor \
+             (REQ-86). A sub-dust output holding an RGB allocation is a burn switch: its release \
+             fragment would let anyone spend the outpoint and destroy an allocation of unbounded \
+             size, because an allocation's amount is not its satoshis. Tails are a SATS-ONLY \
+             mechanism; a coloured leaf keeps a carrier at or above the floor and expresses any \
+             asset amount natively.",
+            mercurylib::tesr::DUST_LIMIT
+        ));
+    }
+    Ok(())
+}
+
 /// **The signed virtual size of a one-payload coloured tier — MEASURED, not modelled.**
 ///
 /// Byte for byte, over the shape [`build_colored_tier`] emits and
@@ -1846,3 +1890,60 @@ mod ctesr_tests {
     }
 }
 
+
+#[cfg(test)]
+mod req86_no_coloured_tails {
+    use super::*;
+    use electrum_client::bitcoin::{absolute::LockTime, ScriptBuf, Transaction, TxOut};
+
+    fn tx_with(values: &[u64]) -> Transaction {
+        Transaction {
+            version: 3,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: values
+                .iter()
+                .map(|v| TxOut {
+                    value: *v,
+                    // A bare P2TR-shaped payload: neither OP_RETURN nor P2A, so it counts as coloured
+                    // payload for `colored_payload_vouts`.
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20].into_iter().chain([0u8; 32]).collect()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_coloured_payload_at_or_above_the_floor_is_accepted() {
+        let tx = tx_with(&[mercurylib::tesr::DUST_LIMIT, mercurylib::tesr::DUST_LIMIT + 1_000]);
+        assert!(coloured_sub_dust_payload(&tx).is_none());
+        assert!(refuse_coloured_tail(&tx, "tier").is_ok());
+    }
+
+    #[test]
+    fn a_sub_dust_coloured_payload_is_refused_as_a_burn_switch() {
+        // One satoshi under the floor is enough: the prize is the ALLOCATION, whose size is unrelated
+        // to the output's value, so there is no "small enough to be safe" coloured tail.
+        let tx = tx_with(&[mercurylib::tesr::DUST_LIMIT - 1]);
+        let found = coloured_sub_dust_payload(&tx).expect("a sub-dust coloured payload must be seen");
+        assert_eq!(found, (0, mercurylib::tesr::DUST_LIMIT - 1));
+        let err = refuse_coloured_tail(&tx, "tier").expect_err("it must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("REQ-86"), "the refusal must name the rule: {msg}");
+        assert!(
+            msg.contains("burn switch"),
+            "the refusal must say WHY, not merely that a floor was missed: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_offender_is_reported_by_vout_not_merely_detected() {
+        // A batch tier pays many payloads; naming which one is what makes the refusal actionable.
+        let tx = tx_with(&[
+            mercurylib::tesr::DUST_LIMIT,
+            mercurylib::tesr::DUST_LIMIT,
+            mercurylib::tesr::DUST_LIMIT - 5,
+        ]);
+        assert_eq!(coloured_sub_dust_payload(&tx), Some((2, mercurylib::tesr::DUST_LIMIT - 5)));
+    }
+}

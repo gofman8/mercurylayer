@@ -11642,6 +11642,12 @@ fn verify_bundle_ex(
     for i in 0..txs.len() {
         let what = if i == 0 { "the trigger".to_string() } else { format!("tier {i}") };
         refuse_dust_payloads(&txs[i], &what)?;
+        // [REQ-86] Named separately from the blanket dust rule ABOVE, and deliberately redundant with
+        // it today. `refuse_dust_payloads` forbids every sub-dust payload, so this cannot fire yet —
+        // but the moment REQ-83 admits tails for sats that blanket stops covering the coloured case,
+        // and a prohibition that only ever existed as a side effect would disappear with it. A
+        // coloured tail is a burn switch, not a saving.
+        crate::rgb::refuse_coloured_tail(&txs[i], &what)?;
         bind_single_p2a_anchor(&txs[i], &what)?;
     }
 
