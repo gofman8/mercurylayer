@@ -3261,68 +3261,100 @@ impl UtexoWallet {
         Ok(results)
     }
 
-    /// **[FOREIGN-REVEALED] Register a confirmed coin of this wallet as a colorable carrier for
-    /// `asset_id`, so it can be paid ON.**
-    ///
-    /// This is the receiver's ONE-TIME cost under the revealed lane: a coin it already funded becomes
-    /// a target that can receive the asset repeatedly. Idempotent — registering an already-registered
-    /// coin is a no-op. Returns the `"txid:vout"` registered.
+    /// Register a confirmed coin of this wallet as a colorable carrier for `asset_id`.
+    /// The receiver's one-time-per-carrier cost. Idempotent. Prefer
+    /// [`Self::token_receive_outpoint`], which also decides rotation.
     pub async fn register_token_carrier(&self, asset_id: &str) -> Result<String> {
-        self.register_token_carrier_excluding(asset_id, None).await
+        self.pick_receive_outpoint(asset_id, None, true).await
     }
 
-    /// [`Self::register_token_carrier`], skipping `exclude` — used for a payment's CHANGE outpoint,
-    /// which must not be the carrier the transition is spending (that seal is being closed).
-    pub(crate) async fn register_token_carrier_excluding(
+    /// Choose (and register if needed) an outpoint of ours to be paid on for `asset_id`.
+    ///
+    /// `exclude` is skipped — a payment's CHANGE must not land on the carrier being spent, since that
+    /// seal is closed by the very transition. `rotate` prefers a coin holding NO allocation of this
+    /// asset, so a payment does not pile onto a carrier whose accumulated inbound history would then
+    /// travel onward in a single disclosure.
+    pub(crate) async fn pick_receive_outpoint(
         &self,
         asset_id: &str,
         exclude: Option<&str>,
+        rotate: bool,
     ) -> Result<String> {
         let record = self.record().await?;
         let mut rgb = self.rgb().await?;
         let w = rgb.as_mut().ok_or_else(|| anyhow!("no RGB engine configured"))?;
+        // PER-ASSET. Allocations of a DIFFERENT contract must not make an outpoint look taken or free
+        // for this one — that conflation is what turned a receive target into a cross-asset
+        // identifier for the wallet.
         let allocations = tokio::task::block_in_place(|| w.list_allocations(asset_id))?;
-        for c in record.coins.iter().filter(|c| {
-            c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0
-        }) {
-            let (Some(txid), Some(vout), Some(sats)) = (c.utxo_txid.clone(), c.utxo_vout, c.amount)
-            else {
-                continue;
-            };
-            let op = format!("{txid}:{vout}");
-            if Some(op.as_str()) == exclude {
-                continue;
-            }
-            if allocations.iter().any(|(o, _, _)| *o == op) {
-                return Ok(op);
-            }
-            // rgb_amount = 0: the coin carries no allocation YET; it is a target, not a holding.
-            // Idempotent in practice — re-registering a known outpoint is accepted by the engine.
-            let _ = tokio::task::block_in_place(|| {
-                w.register_statechain(&txid, vout, sats as u64, asset_id, 0, &[])
-            });
-            return Ok(op);
+        let spendable: Vec<(String, u64)> = record
+            .coins
+            .iter()
+            .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+            .filter_map(|c| {
+                let (txid, vout, sats) = (c.utxo_txid.clone()?, c.utxo_vout?, c.amount?);
+                Some((format!("{txid}:{vout}"), sats as u64))
+            })
+            .filter(|(op, _)| Some(op.as_str()) != exclude)
+            .collect();
+        if spendable.is_empty() {
+            return Err(anyhow!(
+                "this wallet has no CONFIRMED coin available as a carrier for {asset_id}"
+            ));
         }
-        Err(anyhow!(
-            "this wallet has no CONFIRMED coin to register as a carrier for {asset_id}"
-        ))
+        let holds = |op: &str| allocations.iter().any(|(o, _, _)| o == op);
+        let chosen = if rotate {
+            spendable.iter().find(|(op, _)| !holds(op)).or_else(|| spendable.first())
+        } else {
+            spendable.iter().find(|(op, _)| holds(op)).or_else(|| spendable.first())
+        };
+        let (op, sats) = chosen.ok_or_else(|| anyhow!("no carrier candidate"))?.clone();
+        if !holds(&op) {
+            let (txid, vout_s) = op.split_once(':').ok_or_else(|| anyhow!("bad outpoint"))?;
+            let vout: u32 = vout_s.parse()?;
+            // rgb_amount = 0: a target, not a holding.
+            let _ = tokio::task::block_in_place(|| {
+                w.register_statechain(txid, vout, sats, asset_id, 0, &[])
+            });
+        }
+        Ok(op)
     }
 
     /// **[FOREIGN-REVEALED] The receiver's side: publish an outpoint to be paid ON.**
     ///
-    /// Ensures this wallet has a colorable coin registered for `asset_id` and returns its
-    /// `"txid:vout"`. A sender pays onto it with [`Self::transfer_tokens_onto`], which moves the
-    /// allocation without funding a carrier for us — so the ~330-sat carrier is a cost this wallet
-    /// bears ONCE, not one the sender bears per payment.
+    /// Returns a `"txid:vout"` of this wallet's own colorable coin. A sender pays onto it with
+    /// [`Self::transfer_tokens_onto`], which moves the allocation without funding a carrier for us.
     ///
-    /// Receiving does not consume the outpoint, so the same one can be published repeatedly until
-    /// this wallet spends it.
+    /// # PRIVACY — read before using, and before reusing an outpoint
     ///
-    /// **A registered-but-EMPTY carrier does not appear in `list_allocations`** — an allocation list
-    /// lists allocations, and a fresh target has none. So registration state cannot be read back
-    /// from it; this registers idempotently and returns the outpoint it registered.
+    /// A revealed seal names this outpoint **in the clear inside the transition**, and RGB
+    /// consignments carry the full ancestry back to genesis with no concealment pass
+    /// (`consign_bundles` reveals every ancestor; rgb-ops still carries `// TODO: Conceal everything
+    /// we do not need`). It is **unconcealable, not merely unconcealed**: the validator resolves each
+    /// spent input via `into_revealed` and fails on a concealed one, and this seal is by construction
+    /// spent by our own onward payment. So the outpoint reaches every future holder of a DESCENDANT
+    /// allocation, permanently.
+    ///
+    /// **This ROTATES by default, and the default is load-bearing.** Receiving does not consume a
+    /// carrier, so reusing one accumulates N inbound allocations on a single outpoint — and one
+    /// onward payment then hands the next holder that carrier's ENTIRE inbound history: every
+    /// sender's ancestry and every amount. Rotation keeps a payment's exposure to that payment.
+    /// [`Self::token_receive_outpoint_reusing`] is the explicit opt-out.
+    ///
+    /// Selection is per-ASSET. An earlier version returned the first confirmed coin regardless of
+    /// asset, publishing ONE outpoint as the receive target for every asset the wallet was ever paid
+    /// in — a cross-asset identifier for the wallet.
     pub async fn token_receive_outpoint(&self, asset_id: &str) -> Result<String> {
-        self.register_token_carrier_excluding(asset_id, None).await
+        self.pick_receive_outpoint(asset_id, None, true).await
+    }
+
+    /// [`Self::token_receive_outpoint`] without rotation.
+    ///
+    /// **Opt in only with the linkability understood:** every payment received here adds an
+    /// allocation to the same outpoint, and one onward spend discloses the whole accumulated inbound
+    /// history — each sender and each amount — to the next holder.
+    pub async fn token_receive_outpoint_reusing(&self, asset_id: &str) -> Result<String> {
+        self.pick_receive_outpoint(asset_id, None, false).await
     }
 
     /// **[FOREIGN-REVEALED] Pay tokens onto an outpoint the RECEIVER already owns.**
@@ -3335,8 +3367,23 @@ impl UtexoWallet {
     /// Returns the base64 consignment and the un-broadcast witness txid; the receiver accepts them
     /// with [`Self::accept_tokens_on_outpoint`].
     ///
-    /// COST, STATED: the receiver's outpoint is named in the CLEAR, so this wallet learns it. That
-    /// is the trade for a validator path that works — the concealed form aborts inside RGB's VM.
+    /// # PRIVACY COST — the earlier statement of this was WRONG and is corrected here
+    ///
+    /// An earlier version said "the receiver's outpoint is named in the clear, so this wallet learns
+    /// it", as if the disclosure ran one way. **It runs BOTH ways, to every counterparty, and it
+    /// propagates.** This transition names the receiver's outpoint AND this wallet's own change
+    /// outpoint, in one consignment handed to the receiver. So the receiver learns our change carrier
+    /// and the exact change; and because the next payment spends that change allocation, this
+    /// transition travels as an ANCESTOR inside the next receiver's consignment — exposing the prior
+    /// receiver's outpoint and amount to every future holder of a descendant allocation. Under the
+    /// concealed lane those ancestor seals would be `SecretSeal`s.
+    ///
+    /// The change target rotates (see [`Self::pick_receive_outpoint`]) precisely so it is not a
+    /// stable identifier for this wallet. With only two colorable coins it can still alternate; a
+    /// wallet that cares should hold more.
+    ///
+    /// This lane exists because the concealed form aborts inside RGB's VM on this stack. It is the
+    /// right choice where that trade is understood, not a drop-in replacement for a private payment.
     pub async fn transfer_tokens_onto(
         &self,
         asset_id: &str,
@@ -3393,7 +3440,7 @@ impl UtexoWallet {
         let mut revealed: Vec<(String, u64)> = vec![(receiver_outpoint.to_string(), token_amount)];
         if change > 0 {
             let own = self
-                .register_token_carrier_excluding(asset_id, Some(&carrier_outpoint))
+                .pick_receive_outpoint(asset_id, Some(&carrier_outpoint), true)
                 .await
                 .map_err(|_| {
                 anyhow!(
