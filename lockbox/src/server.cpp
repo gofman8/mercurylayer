@@ -1146,6 +1146,46 @@ namespace lockbox {
             }
 
 
+            // 6b. [REQ-68 / REQ-82] IS THIS TRANSACTION EVEN THIS ROOT'S?
+            //
+            // The predicate proves `C` pays everyone; the bind proves the session reproduces `C`.
+            // BOTH take every input from the caller, so neither says the transaction belongs to this
+            // root. Without this check a disclosure carrying a FOREIGN aggregate would pass the
+            // predicate, bind self-consistently, CONSUME THIS ROOT'S SECNONCE and be signed — a
+            // signature over material that is not this coin's, and a griefed root that can no longer
+            // sign its own collapse. sdk92 case (b2) closed exactly this on the ordinary signing
+            // path; the grant route bypassed it until now.
+            //
+            // Placed before the secnonce is consumed, so a refusal costs the root nothing.
+            {
+                std::vector<unsigned char> stored_agg;
+                bool has_agg = false;
+                std::string agg_err;
+                if (!db_manager::get_aggregate(root_sid, stored_agg, has_agg, agg_err)) {
+                    return crow::response(500, "could not read the root's aggregate: " + agg_err);
+                }
+                if (!has_agg) {
+                    CROW_LOG_WARNING << "AGGREGATE_ABSENT root " << root_sid;
+                    return crow::response(
+                        403, "this root has no aggregate on record, so a collapse disclosed about it "
+                             "cannot be checked (REQ-68). Refusing to sign against an unverifiable "
+                             "disclosure.");
+                }
+                const auto disclosed = utils::ParseHex(disclosure->agg_pubkey_hex);
+                if (disclosed.size() != 33) {
+                    return crow::response(400, "disclosure agg_pubkey is not 33 bytes");
+                }
+                const std::vector<unsigned char> disclosed_xonly(disclosed.begin() + 1,
+                                                                 disclosed.end());
+                if (disclosed_xonly != stored_agg) {
+                    CROW_LOG_WARNING << "COLLAPSE_WRONG_COIN root " << root_sid;
+                    return crow::response(
+                        403, "the disclosed collapse is not this root's: agg_pubkey does not match "
+                             "the aggregate derived for this statechain (REQ-68). A transaction that "
+                             "pays every owed key is still not a collapse of THIS tree.");
+                }
+            }
+
             // 7. BIND THE SESSION TO THE VERY TRANSACTION THE PREDICATE JUST PASSED (REQ-57).
             //    Without this the SE would verify the predicate over one transaction and sign
             //    another — the check defeated at its last step.

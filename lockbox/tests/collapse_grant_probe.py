@@ -31,8 +31,18 @@ ORDERING IS THE POINT. The predicate runs BEFORE the session bind, so (b), (c) a
 with their own 403 rather than being masked by a session failure. If a future edit moved the bind
 earlier, those three would flip to 400 and this probe would say so.
 
-Expected:
-    pays both in full     : HTTP 400 ... session ...  (predicate passed, signature gated)
+Expected — EIGHT cases, each refusing on its OWN named gate. A differential that collapses to one
+answer is not a differential, and this file has twice caught exactly that: once when REQ-74's check
+sat behind the signature step, and once when a missing aggregate masked every later gate.
+
+    pays both in full     : HTTP 400 ... session ...        (verdict passed, signature gated)
+    one satoshi short     : HTTP 403 ... is owed 3000 ...   (payment gate)
+    wrong funding outpoint: HTTP 403 ... does not spend ... (outpoint gate)
+    omits a leaf          : HTTP 403 ... is owed 2000 ...   (payment gate)
+    released, no next root: HTTP 400 ... session ...        (verdict passed)
+    next root underfunded : HTTP 403 ... (REQ-74) ...       (self-funding gate)
+    next root funded fully: HTTP 400 ... session ...        (verdict passed)
+    pays all, WRONG coin  : HTTP 403 ... (REQ-68) ...       (coin binding, BEFORE the secnonce)
     one satoshi short     : HTTP 403 ... is owed 3000 ...
     wrong funding outpoint: HTTP 403 ... does not spend this root's funding output ...
     omits a leaf          : HTTP 403 ... is owed 2000 ...
@@ -55,6 +65,8 @@ ROOT="cgroot00000000000000000000000001"
 KID1="cgkid10000000000000000000000001"
 KID2="cgkid20000000000000000000000001"
 K1="11"*32; K2="22"*32
+AGG="ab"*32          # the root's stored aggregate (x-only)
+AGG33="02"+AGG     # as a disclosure carries it: 33 bytes, parity prefix + x-only
 FUND=("aa"*32, 0)
 
 sql = f"""
@@ -68,11 +80,16 @@ INSERT INTO se_leaf (statechain_id,parent_statechain_id,root_statechain_id,fund_
 INSERT INTO se_leaf (statechain_id,parent_statechain_id,root_statechain_id,fund_value,exit_key)
  VALUES ('{KID2}','{ROOT}','{ROOT}',2000,decode('{K2}','hex'));
 INSERT INTO se_leaf_parent VALUES ('{KID1}','{ROOT}'),('{KID2}','{ROOT}');
+-- [REQ-68] The root needs a stored aggregate, or the grant refuses before any later gate is
+-- reached and the differential collapses to one answer. Seeding it is what keeps the OTHER gates
+-- observable; the wrong-aggregate case below is what proves this one still bites.
+INSERT INTO se_aggregate (statechain_id, aggregate_xonly) VALUES ('{ROOT}', decode('{AGG}','hex'))
+  ON CONFLICT (statechain_id) DO UPDATE SET aggregate_xonly = EXCLUDED.aggregate_xonly;
 """
 subprocess.run(["docker","exec","-i","mercurylayer-db_lockbox-1","psql","-U","postgres","-d","enclave","-c",sql],
                capture_output=True)
 
-def post(txhex, label):
+def post(txhex, label, agg=AGG33):
     # A 133-byte PLACEHOLDER session. Cases (b)-(d) never reach the bind — the predicate refuses
     # first — so a real MuSig2 session is not needed to exercise them, and the granted case reaching
     # the bind and refusing there is exactly what this probe asserts.
@@ -80,7 +97,7 @@ def post(txhex, label):
             "session": "00"*133,
             "disclosure": {"unsigned_tx": txhex, "input_index":0,
                            "prevout_values":[6000], "prevout_spks":["5120"+"33"*32],
-                           "agg_pubkey":"33"*32, "agg_nonce":"00"*66,
+                           "agg_pubkey": agg, "agg_nonce":"00"*66,
                            "blinding_factor":"00"*32, "out_tweak":"00"*32, "hash_type":1}}
     r = subprocess.run(["curl","-s","-w","\\n%{http_code}","-X","POST","http://localhost:18080/collapse_grant",
                         "-H","Content-Type: application/json","-d",json.dumps(body)],
@@ -107,7 +124,7 @@ subprocess.run(["docker","exec","-i","mercurylayer-db_lockbox-1","psql","-U","po
                       f"DELETE FROM se_root WHERE root_statechain_id LIKE 'cg%';"],
                capture_output=True)
 
-def post2(txhex, label, extra):
+def post2(txhex, label, extra, agg=AGG33):
     # A 133-byte PLACEHOLDER session. Cases (b)-(d) never reach the bind — the predicate refuses
     # first — so a real MuSig2 session is not needed to exercise them, and the granted case reaching
     # the bind and refusing there is exactly what this probe asserts.
@@ -115,7 +132,7 @@ def post2(txhex, label, extra):
             "session": "00"*133,
             "disclosure": {"unsigned_tx": txhex, "input_index":0,
                            "prevout_values":[6000], "prevout_spks":["5120"+"33"*32],
-                           "agg_pubkey":"33"*32, "agg_nonce":"00"*66,
+                           "agg_pubkey": agg, "agg_nonce":"00"*66,
                            "blinding_factor":"00"*32, "out_tweak":"00"*32, "hash_type":1}}
     body.update(extra)
     r = subprocess.run(["curl","-s","-w","\\n%{http_code}","-X","POST","http://localhost:18080/collapse_grant",
@@ -130,3 +147,8 @@ post2(build(FUND[0], FUND[1], [(3000,K1),(3000,"99"*32)]), "released, no next ro
 post2(build(FUND[0], FUND[1], [(3000,K1),(1999,NEXT)]), "next root underfunded ", {"next_root_key": NEXT})
 # (g) names a next root and funds it in full -> GRANT, self_funding true.
 post2(build(FUND[0], FUND[1], [(3000,K1),(2000,NEXT)]), "next root funded fully", {"next_root_key": NEXT})
+
+# (e) [REQ-68 / REQ-82] PAYS EVERYONE, WRONG COIN. Byte-identical to the granted case except the
+#     disclosed aggregate. It must refuse BEFORE the root's secnonce is consumed — otherwise a
+#     stranger could burn a root's nonce and leave it unable to sign its own collapse.
+post(build(FUND[0], FUND[1], [(3000,K1),(2000,K2)]), "pays all, WRONG coin  ", agg="02"+"cd"*32)

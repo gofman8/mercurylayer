@@ -1054,6 +1054,13 @@ Two properties the route now enforces, both observable from outside via `collaps
   outpoint, an omitted leaf, a named-but-underfunded next root (REQ-74) — fires `403` on its own gate
   before the signing step is reached. The probe is a differential: each case differs from the granted
   one in exactly one respect, so a refusal cannot be explained by anything else.
+* **No signature for a transaction that is not this root's (REQ-68).** The predicate proves `C` pays
+  everyone and the bind proves the session reproduces `C` — but both take every input from the caller,
+  so neither says the transaction belongs to this root. The grant now checks the disclosed aggregate
+  against the one the SE derived at keygen, **before the secnonce is consumed**, so a refusal costs the
+  root nothing. Without it a stranger could burn a root's nonce and leave it unable to sign its own
+  collapse. This is REQ-82's teeth: the SE issues only its half, and it issues that half only for the
+  coin it belongs to.
 * **No signature without a bound session (REQ-57).** The session must reproduce the disclosed
   transaction, or the grant refuses `400`. Otherwise the SE would verify the predicate over one
   transaction and sign another — the check defeated at its last step. The secnonce is loaded and
