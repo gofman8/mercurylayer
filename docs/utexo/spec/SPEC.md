@@ -1669,6 +1669,38 @@ The piece floor IS the `SpineTip` boundary, so every amount in `[1, 945)` is sti
 builder is ever consulted. That test is written to FAIL when a lower band is wired up — it already
 did once, for this one, and the update is above. Closing a band cannot pass silently either.
 
+**WHAT THE TWO REMAINING BANDS ACTUALLY REQUIRE, worked out rather than estimated — because the
+last estimate in this section was wrong.**
+
+`Stub` and `Tail` are ONE shape, not two: a **ladderless leaf**, whose claim is `SP.out[j]` itself.
+They differ only in whether that output is above or below the dust threshold, and in the
+transaction-level constraints a sub-dust one forces on `SP` (§6.0.4). Building either is building
+both, which is the good news; the rest is not.
+
+**A ladderless leaf cannot be paid to a child's AGGREGATE address, and that is what makes it a
+different kind of payment rather than a cheaper leaf.** Every leaf today — including the one-rung
+thin piece — receives `SP.out[j]` at a 2-of-2 between the payee and the SE, and exits unilaterally by
+broadcasting a rung the SE has already co-signed. A leaf with NO rung has no such signature, so a
+2-of-2 output would need the SE's cooperation to spend: **an output the holder cannot exit
+unilaterally**, which is the one property this whole design exists to provide. A ladderless leaf must
+therefore pay the payee's **own key**, directly, and hold no SE slot at all.
+
+That is sound — the holder can still force settlement by broadcasting the parent chain `T → X_m → SP`,
+which is exactly the owner's rule that *small leaves need not exit alone* — but it is a payment of a
+different kind, and it lands across four layers rather than in the ladder:
+
+1. the split builder must pay a plain exit key at that slot instead of `child.aggregated_address`, and
+   must NOT create a child coin or SE slot for it;
+2. the journal gains a role that has no `statechain_id` to record;
+3. conveyance carries a claim on an outpoint rather than a coin with a ladder;
+4. the receiver's wallet must book that claim — a pending output realised when `SP` confirms — rather
+   than a statechain coin, which is what every existing claim path expects.
+
+**Neither band is a continuation of the thin-piece work.** The three stages above moved a leaf from
+two rungs to one; these move it from one rung to none, and *none* is where unilateral exit stops
+coming from a pre-signed tier and starts coming from the group's. That is a design change with a
+security property at its centre, and it is recorded here rather than attempted as a fourth stage.
+
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the
 band was nearly free because "the spine-tip shape already exists". The shape did — *only as the
