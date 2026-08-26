@@ -958,9 +958,21 @@ path in this document.
 spent, the exit chain MUST be extended by prepending a transaction at timelock ZERO rather than by
 moving the coin on chain. The prepend is what makes the extension safe: **it fires ahead of every rival
 state in existence**, all of which carry a non-zero timelock, so after it confirms every prior rival is
-spending an output that no longer exists. **UNPROVEN — this is the claim the whole replacement rests
-on, and it must be plant-and-run before it is relied upon** (§0.2: a source scan establishes presence,
-never behaviour).
+spending an output that no longer exists.
+
+**PROVEN — measured against Bitcoin Core 30.2, not reasoned about** (`scripts/prepend_precedence_probe.py`).
+One funding output, three questions, and the claim is exactly the three answers:
+
+| offered to the node | verdict |
+|---|---|
+| RIVAL spend carrying a relative timelock (`nSequence = 10`), as every superseded state does | refused — **`non-BIP68-final`** |
+| PREPEND at no relative lock | **`allowed = true`** |
+| the same RIVAL, after the prepend confirmed | refused — **`missing-inputs`** |
+
+The first two lines are the precedence: a superseded state cannot even enter the mempool while the
+prepend goes straight in. The third is what the precedence BUYS — the rival is now spending an output
+that no longer exists. §0.2 is the reason this had to be run rather than read: "fires ahead of" is a
+statement about what a node does, and no amount of reading policy source settles it.
 
 **THE PREPEND IS NOT UNBOUNDED, AND AN EARLIER DRAFT OF THIS REQUIREMENT IMPLIED IT WAS.** Each prepend
 adds one transaction to the exit chain, and the chain is capped: `max_split_depth` and `max_exit_txs`
@@ -993,8 +1005,10 @@ exempted — the heading is the line a reader quotes.
 **REQ-78 (the retired calendar was also the garbage collector — name what replaces it).** The absolute
 locktime chain did more than mark a deadline: a refresh (REQ-31) permanently invalidated every previous
 owner's backup and every old tier, which is why rival states did not accumulate without bound. Deleting
-the calendar deletes that collection. REQ-77's prepend is the replacement, and any design that adopts
-REQ-76 without answering this has moved the exhaustion problem rather than solved it. The rival set the
+the calendar deletes that collection. REQ-77's prepend is the replacement, **and the third row of REQ-77's
+probe is that replacement working**: once the prepend confirms, every prior rival is refused
+`missing-inputs` — collected, not merely superseded. Any design that adopts REQ-76 without answering
+this has moved the exhaustion problem rather than solved it; this one answers it, measured. The rival set the
 budget is consumed against is **total** — live tier plus every superseded state plus every outstanding
 conveyed state — not merely the live one.
 
