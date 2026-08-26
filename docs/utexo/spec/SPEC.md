@@ -1550,7 +1550,7 @@ dust limit is already expressible today.
 | value `v` | shape | cost |
 |---|---|---|
 | `v ≥ min_child_value` (1560 at 3.0 sat/vB) | today's two-rung ladder, self-funding | unchanged |
-| `945 ≤ v < 1560` | ONE rung — the spine-tip shape, which already exists | one renewal instead of two |
+| `945 ≤ v < 1560` | ONE rung — the spine-tip SHAPE exists; conveying it does not (see below) | one renewal instead of two |
 | `DUST_LIMIT ≤ v < 945` | depth-0 stub, no ladder; zero-fee v3 with a zero-value anchor, bumped in package | floor is exactly 330 |
 | `1 ≤ v < DUST_LIMIT` | **a TAIL** — carried as the split's single permitted dust output | see below |
 
@@ -1588,6 +1588,33 @@ caller reads exactly like a working feature, which is this repository's most rep
 The piece floor IS the `Laddered` boundary, so every amount in `[1, 1560)` is refused before a
 builder is ever consulted. That test is written to FAIL when a lower band is wired up, so closing one
 cannot pass silently either.
+
+**A CORRECTION TO THE ROW ABOVE, found by trying to build it rather than by reading it.** This
+section used to say the `SpineTip` band was nearly free because "the spine-tip shape already exists".
+The shape does exist — and it exists *only as the sender's own change record*, which is never handed
+to anybody. The code says so by name: conveying a tip is refused in `transfer_sender`, in as many
+words, because "handing a tip over is a key handover PLUS a `spinetip-` conveyance, and that builder
+is not landed" — a deliberate named refusal added after `chaos22` found the alternative, which was a
+flat conveyance handing the recipient a backup chain over an outpoint that will never exist. **A coin
+with no exit, with no error on either side.**
+
+So what band 2 needs is not the shape but a CONVEYABLE one-rung child, and that is a wire-format
+change: `ChildTesrBundle` carries `child_extension` as a mandatory tier, and every payment in the
+system is a `ChildTesrBundle`. Making it optional touches **102 non-test call sites across four
+crates**, the receiver's verifier and census among them — and the failure mode of getting it wrong is
+precisely the one the tip refusal was written to prevent. It is a staged change, in the shape this
+repository already learned to use for the V2 child:
+
+1. the leg ROLE gains a third arm, distinguishing *"one rung"* from *"this is the sender's tip"* —
+   two meanings `SplitLegRole::SpineTip` conflates today, and only the second may drive
+   `persist_spine_tip`;
+2. `ChildTesrBundle` admits an absent extension, and the verifier and census learn the one-rung shape;
+3. the builder and the admission floor are switched over together, so a payment is never admitted at
+   a value whose shape no builder emits.
+
+A first pass added stage 1's variant and reverted it the same hour: **five match sites accepted it
+and nothing constructed it**, which is a dead variant reading as progress — the failure this document
+keeps naming. The variant lands with stage 2 or not at all.
 
 #### 6.0.4 The release fragment, and why a tail cannot take a sibling hostage
 
