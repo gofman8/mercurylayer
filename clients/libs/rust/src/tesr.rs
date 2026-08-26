@@ -4551,6 +4551,19 @@ pub enum SplitLegRole {
     Piece,
     /// The sender's change: ONE cap tier directly over `SP.out[K]`, and no extension.
     SpineTip,
+    /// **[REQ-83 / §6.0.3] A PAYEE's piece carrying the tip's ONE-rung shape.**
+    ///
+    /// Same tiers as [`Self::SpineTip`] — one cap directly over `SP.out[j]`, no extension — and so
+    /// the same floor, [`mercurylib::tesr::min_spine_tip_value`]. It exists because `SpineTip`
+    /// carries TWO meanings that only ever coincided by accident: *"one rung"* and *"this leg is the
+    /// sender's new spine tip"*. The second drives `persist_spine_tip` and the
+    /// `(change_leg == LastIsTip) != tip.is_some()` plan check, and a payee's leg must trigger
+    /// neither — it is not the sender's change, and a split has at most one tip.
+    ///
+    /// This is §6.0.3's second leaf band made reachable. What the payee gives up is stated in the
+    /// same table: **one renewal instead of two**. The leaf still exits unaided; it cannot reset its
+    /// budget by extension, so its remedy is a re-anchor, and `plan_child_renewal` says so by name.
+    ThinPiece,
 }
 
 impl SplitLegRole {
@@ -4565,7 +4578,10 @@ impl SplitLegRole {
     pub fn min_value(self, fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
         match self {
             SplitLegRole::Piece => mercurylib::tesr::min_child_value(fee_rate_sats_per_vb, dust_limit),
-            SplitLegRole::SpineTip => {
+            // One rung, so one rung's floor — the SAME number, because it is the SAME shape. Two
+            // roles share it precisely because the difference between them is bookkeeping (whose
+            // leg it is), never structure.
+            SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
                 mercurylib::tesr::min_spine_tip_value(fee_rate_sats_per_vb, dust_limit)
             }
         }
@@ -4575,7 +4591,9 @@ impl SplitLegRole {
     pub fn colored_min_value(self, fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
         match self {
             SplitLegRole::Piece => colored_child_floor(fee_rate_sats_per_vb, dust_limit),
-            SplitLegRole::SpineTip => colored_spine_tip_floor(fee_rate_sats_per_vb, dust_limit),
+            SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
+                colored_spine_tip_floor(fee_rate_sats_per_vb, dust_limit)
+            }
         }
     }
 }
@@ -4850,15 +4868,33 @@ impl SplitJournalRecord {
         // and gets its own persisted record. Refuse rather than fabricate a `ChildTesrBundle`
         // for it (a `ctesr-` row routes to leaf handling, which is exactly the mis-classing
         // the tip's separate record exists to prevent).
-        if c.role != SplitLegRole::Piece {
+        // [REQ-83] Both PAYEE roles are conveyable children; only the sender's TIP is not. The tip
+        // gets its own persisted record, and a `ctesr-` row would route it to leaf handling — the
+        // mis-classing that record exists to prevent.
+        if c.role == SplitLegRole::SpineTip {
             return Err(anyhow::anyhow!(
                 "journalled leg {} is the spine tip, not a conveyable child — it must be \
                  rebuilt as the sender's own tip record, never as a `ctesr-` child bundle",
                 c.statechain_id
             ));
         }
-        let (ext, st) = match (&c.extension, &c.state) {
-            (Some(e), Some(s)) => (e.clone(), s.clone()),
+        // **The ROLE decides how many rungs to expect, and the journal is read against it both
+        // ways.** A `Piece` missing its extension is UNFINISHED; a `ThinPiece` carrying one is
+        // CORRUPTION — the shape contradicts its own record, and conveying it would hand the payee a
+        // rung that races the cap they are meant to exit by. Neither may be quietly reshaped into
+        // the other, which is the whole reason the role is journalled rather than inferred.
+        let (ext, st) = match (c.role, &c.extension, &c.state) {
+            (SplitLegRole::Piece, Some(e), Some(s)) => (Some(e.clone()), s.clone()),
+            (SplitLegRole::ThinPiece, None, Some(s)) => (None, s.clone()),
+            (SplitLegRole::ThinPiece, Some(_), _) => {
+                return Err(anyhow::anyhow!(
+                    "journalled child {} is a THIN piece but carries an extension tier. A thin piece \
+                     has exactly one cap over its funding outpoint; an extension there would be a \
+                     rival for that outpoint at the piece schedule's CSV, out-racing the cap the \
+                     payee exits by. Refusing to convey a record whose shape contradicts itself.",
+                    c.statechain_id
+                ))
+            }
             _ => {
                 return Err(anyhow::anyhow!(
                     "journalled child {} has no complete ladder yet",
@@ -4872,7 +4908,7 @@ impl SplitJournalRecord {
             sp_vout: c.sp_vout,
             child_statechain_id: c.statechain_id.clone(),
             child_owner_exit_address: c.owner_exit_address.clone(),
-            child_extension: Some(ext),
+            child_extension: ext,
             child_state: st,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -4968,7 +5004,12 @@ impl SplitJournalRecord {
     pub fn legs(&self) -> Result<Vec<SplitLeg>> {
         (0..self.children.len())
             .map(|j| match self.children[j].role {
-                SplitLegRole::Piece => self.piece_bundle(j).map(SplitLeg::Piece),
+                // [REQ-83] Both payee shapes convey as a `ctesr-` child; only the sender's tip is
+                // its own kind. `piece_bundle` reads the role again and refuses a record whose rungs
+                // disagree with it, so routing here cannot launder a mis-shaped leg into a bundle.
+                SplitLegRole::Piece | SplitLegRole::ThinPiece => {
+                    self.piece_bundle(j).map(SplitLeg::Piece)
+                }
                 SplitLegRole::SpineTip => self.spine_tip(j).map(SplitLeg::Tip),
             })
             .collect()
@@ -5397,12 +5438,23 @@ async fn establish_spine_tip_journalled(
     j: usize,
 ) -> Result<TesrTier> {
     // The mirror of `establish_child_journalled`'s refusal, and the same discipline: this builder
-    // produces ONE cap and no extension, so a PIECE reaching it would be conveyed to a payee with
-    // half a ladder — a leaf whose census can never balance.
-    if rec.children[j].role != SplitLegRole::SpineTip {
+    // produces ONE cap and no extension, so a two-rung PIECE reaching it would be conveyed to a
+    // payee with half a ladder — a leaf whose census can never balance.
+    //
+    // **[REQ-83] It now serves BOTH one-rung roles, and that it needed no other change is the
+    // finding.** A thin piece is the tip's shape paying a payee instead of the sender: one cap
+    // rooted directly at `SP.out[j]` via `build_state_from`, paying `owner_exit_address` — which on
+    // a piece leg is already the RECIPIENT (`resolve_conveyance_plan` fills it). §6.0.3 said this
+    // band was cheap because "the spine-tip shape already exists"; the shape did, and what did not
+    // was a conveyable one-rung CHILD. With stage 2 landed, the only thing standing between the two
+    // was this role gate.
+    if !matches!(
+        rec.children[j].role,
+        SplitLegRole::SpineTip | SplitLegRole::ThinPiece
+    ) {
         return Err(anyhow::anyhow!(
-            "in-ladder split {}: leg {j} ({}) is a payee's piece, which needs a two-tier ladder — \
-             this builder only produces the spine tip's single cap",
+            "in-ladder split {}: leg {j} ({}) is a two-rung payee's piece, which needs an extension \
+             and a state — this builder only produces a single cap",
             rec.op_id,
             rec.children[j].statechain_id
         ));
@@ -5559,10 +5611,12 @@ pub async fn resume_in_ladder_split(
                     continue;
                 }
             }
-            SplitLegRole::SpineTip => {
+            // [REQ-83] A THIN piece is one rung, exactly like a tip, and the same bidirectional
+            // check applies: an extension on it is corruption, not unfinished work.
+            SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
                 if rec.children[j].extension.is_some() {
                     return Err(anyhow::anyhow!(
-                        "cannot resume in-ladder split {}: leg {j} ({}) is journalled as the SPINE TIP \
+                        "cannot resume in-ladder split {}: leg {j} ({}) is journalled as a ONE-RUNG leg \
                          but carries an extension tier. A spine tip has exactly one cap over its \
                          funding outpoint; an extension there would be a rival for that outpoint at \
                          the piece schedule's CSV, out-racing the tip's own cap. Refusing to replay a \
@@ -5595,7 +5649,10 @@ pub async fn resume_in_ladder_split(
             SplitLegRole::Piece => {
                 establish_child_journalled(cc, wallet_name, coin, rec, j).await?;
             }
-            SplitLegRole::SpineTip => {
+            // [REQ-83] Both ONE-RUNG roles go to the one-rung builder. They differ in who the cap
+            // pays and in whether the result is persisted as the sender's tip — never in structure,
+            // which is why one builder serves both.
+            SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
                 establish_spine_tip_journalled(cc, wallet_name, coin, rec, j).await?;
             }
         }
@@ -5903,8 +5960,22 @@ pub async fn in_ladder_split(
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
                 recipient.clone(),
+                // **[REQ-83] The change leg is chosen by POSITION; a payee's leg by VALUE.**
+                //
+                // The sender's tip is structurally the last leg, and that has not changed. What has
+                // is that a payee's leg is no longer always two-rung: §6.0.3's second band is a leaf
+                // that can fund ONE rung and not two, and `LeafShape` decides which — from the same
+                // floor functions the admission guard and this builder both use, so the shape a
+                // payment is admitted at and the ladder then built cannot be two different answers.
                 if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
                     SplitLegRole::SpineTip
+                } else if mercurylib::tesr::LeafShape::for_value(
+                    children[j].2,
+                    p.committed_fee_rate,
+                    mercurylib::tesr::DUST_LIMIT,
+                ) == mercurylib::tesr::LeafShape::SpineTip
+                {
+                    SplitLegRole::ThinPiece
                 } else {
                     SplitLegRole::Piece
                 },
@@ -6479,8 +6550,22 @@ async fn spine_batch_split_ex(
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("spine batch leg coin has no statechain_id"))?,
                 recipient.clone(),
+                // **[REQ-83] The change leg is chosen by POSITION; a payee's leg by VALUE.**
+                //
+                // The sender's tip is structurally the last leg, and that has not changed. What has
+                // is that a payee's leg is no longer always two-rung: §6.0.3's second band is a leaf
+                // that can fund ONE rung and not two, and `LeafShape` decides which — from the same
+                // floor functions the admission guard and this builder both use, so the shape a
+                // payment is admitted at and the ladder then built cannot be two different answers.
                 if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
                     SplitLegRole::SpineTip
+                } else if mercurylib::tesr::LeafShape::for_value(
+                    children[j].2,
+                    p.committed_fee_rate,
+                    mercurylib::tesr::DUST_LIMIT,
+                ) == mercurylib::tesr::LeafShape::SpineTip
+                {
+                    SplitLegRole::ThinPiece
                 } else {
                     SplitLegRole::Piece
                 },
@@ -13155,7 +13240,14 @@ pub fn verify_child_bundle(
     //     has none — CHILD_V2_BASELINE = 0). A hidden child co-sign would push child_num_sigs above
     //     this ⟹ reject. Key handovers are census-NEUTRAL (the enclave bumps sig_count only when it
     //     signs), so an adopted child counts the same as a conveyed one.
-    let child_expected = child_flat_backups + 2 + child_superseded_ok;
+    // **[REQ-83] The child's OWN rungs, counted — not the literal 2.**
+    //
+    // This was `+ 2` while every child was two-tier, and it is the exact-equality law that catches a
+    // hidden co-signature. Left as a literal it does both possible wrongs at once on a one-rung
+    // leaf: it refuses every honest thin piece, and — if the count were ever loosened to make them
+    // pass — it would admit a hidden rung on one. Derived from the bundle's own shape, it does
+    // neither, and it stays exact for both.
+    let child_expected = child_flat_backups + cb.child_rungs().len() as u32 + child_superseded_ok;
     if child_num_sigs != child_expected {
         return Err(anyhow::anyhow!(
             "child num_sigs mismatch: SE issued {child_num_sigs}, disclosed accounts for {child_expected} — possible hidden child state"
@@ -17222,6 +17314,50 @@ mod skim_leaf_attack_tests {
         }
     }
 
+    /// **[REQ-83] A THIN piece: one rung, spending `SP.out[0]` directly.**
+    ///
+    /// The same rig as [`Rig::child_bundle`] minus the extension — which is the point: a thin piece
+    /// is not a different kind of leaf, it is the same leaf with one rung instead of two, and the
+    /// verifier must apply every law to the rung it HAS.
+    fn thin_child_bundle(rig: &Rig, skim: Skim) -> ChildTesrBundle {
+        let p = rig.params;
+        let (parent, slot) = rig.parent_segment();
+        let sp_txid = parent.current().state.txid.clone();
+        let c = &rig.child;
+
+        // THE ONLY RUNG: a state rooted directly at `SP.out[0]`, paying the receiver's exit key.
+        let sc = mercurylib::tesr::build_state(
+            &sp_txid, slot, &rig.receiver.address, NET, p.state_csv(0), rig.rate,
+        )
+        .expect("thin child state");
+        let mut sc_tx = parse(&sc.tx_hex);
+        if skim == Skim::StateHop {
+            // The SAME theft the two-rung lane's `StateHop` performs, one tier higher up: pay the
+            // receiver a token amount and return the rest to the sender, with `out_value` declared
+            // honestly off this very transaction.
+            let to_receiver = 510u64;
+            let diverted = sc.out_value - to_receiver;
+            sc_tx.output[sc.payload_vout as usize].value = to_receiver;
+            sc_tx.output.push(TxOut { value: diverted, script_pubkey: rig.sender.spk.clone() });
+        }
+        let sc_tx = cosign(&sc_tx, slot, &c.spk, &c.kp);
+
+        ChildTesrBundle {
+            parent,
+            parent_statechain_id: "parent-sid".into(),
+            sp_vout: 0,
+            child_statechain_id: "thin-child-sid".into(),
+            child_owner_exit_address: rig.receiver.address.clone(),
+            child_extension: None,
+            child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
+            child_superseded_states: vec![],
+            child_superseded_extensions: vec![],
+            ancestors: vec![],
+            rgb: None,
+            parent_flat_backups: vec![],
+        }
+    }
+
     fn verify(cb: &ChildTesrBundle, f: &Facts) -> Result<()> {
         verify_child_bundle(
             cb,
@@ -17239,6 +17375,78 @@ mod skim_leaf_attack_tests {
             &[],
             &f.receiver_address,
         )
+    }
+
+    /// **[REQ-83] A ONE-RUNG piece is ACCEPTED, and its census is ONE co-signature.**
+    ///
+    /// The whole of §6.0.3's second band, as a runnable claim. Before this the verifier read
+    /// `child_extension` unconditionally, so a thin piece was not merely refused — it was
+    /// unrepresentable, and every amount in `[min_spine_tip_value, min_child_value)` was unpayable.
+    ///
+    /// The census number is the part worth staring at: **one**, not two. `child_num_sigs` is the
+    /// exact-equality law that catches a hidden co-signature, so a thin piece verified against the
+    /// two-rung count would either refuse every honest one or admit a hidden rung on it.
+    #[test]
+    fn a_thin_one_rung_piece_is_accepted() {
+        let rig = rig();
+        let cb = thin_child_bundle(&rig, Skim::None);
+        assert!(cb.is_thin(), "the fixture must actually build the one-rung shape");
+        assert_eq!(cb.child_rungs().len(), 1, "one rung, and the accessor agrees");
+        let mut f = rig.facts();
+        f.child_num_sigs = 1; // ONE rung ⟹ one co-signature, not two
+        verify(&cb, &f).expect("a well-formed one-rung piece must be accepted");
+    }
+
+    /// **The value law applies to the rung it HAS.** The same theft the two-rung lane performs on
+    /// the state — pay the receiver 510 and return the rest to the sender, declaring `out_value`
+    /// honestly — must be refused on a thin piece too. If it were not, the one-rung shape would be a
+    /// hole cut straight through the conservation law rather than a cheaper leaf.
+    #[test]
+    fn a_thin_piece_may_not_skim_its_only_rung() {
+        let rig = rig();
+        let cb = thin_child_bundle(&rig, Skim::StateHop);
+        let mut f = rig.facts();
+        f.child_num_sigs = 1;
+        let e = verify(&cb, &f).expect_err("a skimming thin piece must be REFUSED").to_string();
+        assert!(
+            e.contains("forwards") || e.contains("payload outputs carry") || e.contains("pays the receiver only"),
+            "the refusal must name the conservation law, not something incidental: {e}"
+        );
+    }
+
+    /// **A thin piece whose state does not spend `SP.out[j]` is refused, and refused for THAT.**
+    ///
+    /// Its cap is its only rung, so the funding outpoint is the one thing it must spend. A verifier
+    /// that let this through would accept a leaf hanging off nothing — present, co-signed, and
+    /// unbroadcastable, while the receiver is credited the funding value.
+    #[test]
+    fn a_thin_piece_must_spend_the_funding_outpoint() {
+        let rig = rig();
+        let mut cb = thin_child_bundle(&rig, Skim::None);
+        // Point the only rung at a different vout of the same SP.
+        let mut st = parse(&cb.child_state.signed_tx);
+        st.input[0].previous_output.vout = 1;
+        cb.child_state.signed_tx = hex::encode(electrum_client::bitcoin::consensus::serialize(&st));
+        cb.child_state.txid = st.txid().to_string();
+        let mut f = rig.facts();
+        f.child_num_sigs = 1;
+        let e = verify(&cb, &f).expect_err("must be REFUSED").to_string();
+        assert!(
+            e.contains("does not spend SP.out"),
+            "the refusal must name the structural cause: {e}"
+        );
+    }
+
+    /// **The two shapes are not interchangeable in the census.** A thin piece presented with the
+    /// TWO-rung count is refused — which is what stops a hidden rung being smuggled onto a leaf that
+    /// discloses one.
+    #[test]
+    fn a_thin_piece_is_refused_against_the_two_rung_census() {
+        let rig = rig();
+        let cb = thin_child_bundle(&rig, Skim::None);
+        let f = rig.facts(); // child_num_sigs = 2, the two-rung count
+        assert_eq!(f.child_num_sigs, 2);
+        verify(&cb, &f).expect_err("a one-rung leaf may not pass a two-rung census");
     }
 
     /// The co-sign that blesses the skim, isolated. `verify_tier_cosigned` must ACCEPT the tampered
@@ -26431,9 +26639,24 @@ mod s6_coloured_tip_replay_tests {
             "an existing cap short-circuits"
         );
         let resume = fn_src("pub async fn resume_in_ladder_split(");
+        // [REQ-83] Both ONE-RUNG roles dispatch to the one-rung builder, so the arm is now a
+        // pattern over the pair. What the assertion is protecting is unchanged and is the reason it
+        // is phrased over the ROLE at all: the driver must never infer the shape from whether an
+        // extension happens to be present, because on this record `extension: None` also means
+        // "not co-signed yet" — and a replay that guessed would co-sign a PHANTOM extension over the
+        // funding outpoint, out-racing the very cap the leg exits by.
         assert!(
-            resume.contains("SplitLegRole::SpineTip =>"),
+            resume.contains("SplitLegRole::SpineTip | SplitLegRole::ThinPiece =>"),
             "and the resume driver dispatches on the journalled ROLE, not on shape guesswork"
+        );
+        // BOTH decisions in this driver are role-scoped: which rungs count as complete, and which
+        // builder finishes the leg. Two `match … .role` blocks, and the extension is only ever read
+        // INSIDE one of them — as a corruption check against the role, never as the thing that
+        // decides the role.
+        assert_eq!(
+            resume.matches("match rec.children[j].role {").count(),
+            2,
+            "completeness and routing must both dispatch on the journalled role"
         );
     }
 

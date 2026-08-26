@@ -3274,8 +3274,20 @@ impl SplitFloors {
 pub(crate) fn split_output_floors(backup_fee_rate: f64, shape: ParentShape) -> SplitFloors {
     let backup_floor = min_split_output(backup_fee_rate);
     let laddered = |rate: f64, lane: mercuryrustlib::tesr::SplitLane| SplitFloors {
+        // **[REQ-83] The piece floor is the ONE-RUNG floor, not the two-rung one.**
+        //
+        // It was `SplitLegRole::Piece` — `min_child_value`, 1 560 at the shipped rate — and that made
+        // every amount in `[1, 1560)` unpayable: the admission guard refused before a builder was
+        // ever consulted. §6.0.3's second band is a leaf that funds ONE rung, the builder now emits
+        // it (`SplitLegRole::ThinPiece`), and the floor that admits a payment must be the floor of
+        // the CHEAPEST shape a payee's leg can take — otherwise the shape exists and is unreachable,
+        // which is exactly the state this repository measured and named.
+        //
+        // The leg's own role still selects what is BUILT, from the same `LeafShape` decision, so a
+        // leg admitted here at 945 is built as a thin piece and a leg at 1 560 as a two-rung one.
+        // One decision, two readers — never two decisions.
         piece: backup_floor
-            .max(mercuryrustlib::tesr::SplitLegRole::Piece.min_value(rate, DUST_LIMIT)),
+            .max(mercuryrustlib::tesr::SplitLegRole::ThinPiece.min_value(rate, DUST_LIMIT)),
         change: backup_floor
             .max(mercuryrustlib::tesr::change_leg_role(lane).min_value(rate, DUST_LIMIT)),
         lane: Some(lane),
@@ -3406,6 +3418,13 @@ fn change_leg_shape_note(lane: mercuryrustlib::tesr::SplitLane) -> &'static str 
         }
         mercuryrustlib::tesr::SplitLegRole::SpineTip => {
             "the change is a one-cap spine tip, so it funds ONE rung, not two"
+        }
+        // [REQ-83] `change_leg_role` never returns this — a thin piece is a PAYEE's shape, and the
+        // sender's change is either a two-tier child or the spine tip. Written as an arm rather than
+        // a catch-all so that if some lane ever does carve its change as one, this text has to be
+        // written deliberately instead of silently borrowing the tip's.
+        mercuryrustlib::tesr::SplitLegRole::ThinPiece => {
+            "the change is a one-rung leg on this lane, so it funds ONE rung, not two"
         }
     }
 }
@@ -3612,26 +3631,25 @@ mod split_math_tests {
         total + mercurylib::tesr::committed_fee_for_outputs(2, rate) + mercurylib::tesr::P2A_VALUE
     }
 
-    /// **[REQ-83] WHERE THE LIVE ADMISSION AND THE FOUR LEAF SHAPES DISAGREE — measured, not
-    /// asserted.**
+    /// **[REQ-83] WHICH LEAF BANDS THE PAYMENT LANE CAN ACTUALLY REACH — measured, not asserted.**
     ///
     /// §6.0.3 names four shapes and REQ-83 promises every amount from 1 sat up is expressible.
-    /// [`mercurylib::tesr::LeafShape`] implements the choice and its own tests prove the four bands
-    /// tile `[1, ∞)` with no gap. **None of that says the PAYMENT LANE can reach them**, and a
-    /// selector with no caller reads exactly like a working feature — the failure mode this repo has
-    /// hit in `sdk74` (a retry path that never ran), in `WITNESS_BIND`, and in the fork's extractor
-    /// (a consignment that validated perfectly and credited zero).
+    /// [`mercurylib::tesr::LeafShape`] implements the choice and its own tests prove the bands tile
+    /// `[1, ∞)` with no gap. **None of that says the PAYMENT LANE can reach them**, and a selector
+    /// with no caller reads exactly like a working feature — the failure this repo has hit in
+    /// `sdk74` (a retry that never ran), in `WITNESS_BIND`, and in the fork's extractor (a
+    /// consignment that validated perfectly and credited zero).
     ///
-    /// So this measures the live guard instead of describing it. The finding, at the shipped rate:
-    /// **the piece floor IS the `Laddered` boundary**, so the payment lane admits the top band and
-    /// only the top band. Every amount in `[1, 1560)` — the tail, stub and spine-tip bands, 1 559
-    /// distinct amounts — is refused before a builder is ever consulted.
+    /// **This test previously found only the top band reachable, and said it was written to FAIL
+    /// when a lower one was wired up. It did, and this is that update.** The `SpineTip` band is now
+    /// reachable: `SplitLegRole::ThinPiece` builds a payee's one-rung leg, and `split_output_floors`
+    /// admits at the one-rung floor. Two bands remain unreachable, and they are named below rather
+    /// than left as an absence.
     ///
-    /// This test is SUPPOSED to fail when a lower band is wired up. When it does, the fix is to move
-    /// the boundary it names to the new lowest admitted shape, not to delete the assertion: what
-    /// makes it worth having is that closing a band cannot pass silently either.
+    /// It is still written to fail when the next band lands. Closing one must not pass silently
+    /// either — the whole point of the pair of tests is that neither direction is invisible.
     #[test]
-    fn the_payment_lane_today_admits_only_the_laddered_band() {
+    fn the_payment_lane_reaches_the_one_rung_band_and_no_lower() {
         use mercurylib::tesr::LeafShape;
         let rate = mercurylib::tesr::TesrParams::mainnet().committed_fee_rate;
         let root = ParentShape::Root { fee_rate: rate, split_source_value: 0 };
@@ -3639,25 +3657,30 @@ mod split_math_tests {
 
         assert_eq!(
             LeafShape::for_value(live_floor, rate, DUST_LIMIT),
-            LeafShape::Laddered,
-            "the live piece floor must sit exactly at the Laddered boundary — if it sits inside a \
-             lower band, a payment is being admitted at a value whose shape no builder emits"
+            LeafShape::SpineTip,
+            "the live piece floor must sit exactly at the boundary of the CHEAPEST shape a builder \
+             emits — above it and a whole band is unreachable, below it and a payment is admitted \
+             at a value whose shape nothing builds"
         );
         assert_eq!(
             LeafShape::for_value(live_floor - 1, rate, DUST_LIMIT),
-            LeafShape::SpineTip,
-            "and one satoshi below it is the next band down, still unreachable"
+            LeafShape::Stub,
+            "and one satoshi below it is the next band down, which no builder emits yet"
         );
 
-        // The three unreachable bands, each with a witness value, so the message names WHAT is
+        // What the lane can now express that it could not: every amount in [945, 1560) at the
+        // shipped rate — 615 distinct amounts that used to be refused before a builder was consulted.
+        for v in [945u64, 1_000, 1_559] {
+            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), LeafShape::SpineTip);
+            assert!(v >= live_floor, "[REQ-83] {v} sat must now be payable");
+        }
+        // …and what it still cannot. Named with a witness value each, so the message says WHAT is
         // refused rather than merely that something is.
         for (v, shape) in [
             (1u64, LeafShape::Tail),
             (329, LeafShape::Tail),
             (330, LeafShape::Stub),
             (944, LeafShape::Stub),
-            (945, LeafShape::SpineTip),
-            (1_559, LeafShape::SpineTip),
         ] {
             assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), shape);
             assert!(
@@ -3706,9 +3729,15 @@ mod split_math_tests {
             );
             let root = ParentShape::Root { fee_rate: rate, split_source_value: 0 };
             assert_eq!(
+                mercurylib::tesr::min_spine_tip_value(rate, DUST_LIMIT),
+                945,
+                "{name}: min_spine_tip_value is ceil(125·3) + 240 + 330"
+            );
+            assert_eq!(
                 split_output_floors(rate, root).piece,
-                1_560,
-                "{name}: the laddered PIECE floor is min_child_value — the larger of the two binds"
+                945,
+                "[REQ-83] {name}: the PIECE floor is min_spine_tip_value — a payee's leg is admitted \
+                 at the ONE-rung floor, and its role then decides whether one rung or two is built"
             );
         }
     }
@@ -3735,11 +3764,14 @@ mod split_math_tests {
         // is two-tier everywhere and that is the floor that must never fall.
         let root = ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 };
         let child = ParentShape::Child { fee_rate: ladder_rate, split_source_value: 0 };
+        // [REQ-83] The piece is admitted at the ONE-rung floor; `min_child_value` is now the floor
+        // of the two-rung shape only, which on the root lane is nobody's leg.
+        assert_eq!(mercurylib::tesr::min_spine_tip_value(ladder_rate, DUST_LIMIT), 820);
         assert_eq!(mercurylib::tesr::min_child_value(ladder_rate, DUST_LIMIT), 1_310);
         assert_eq!(
             split_output_floors(backup_rate, root).piece,
-            1_310,
-            "the larger floor binds"
+            820,
+            "the larger of the backup floor (554) and the one-rung ladder floor (820) binds"
         );
         assert_eq!(
             split_output_floors(backup_rate, child).piece,
@@ -3803,7 +3835,7 @@ mod split_math_tests {
             ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 },
         );
         let floor = floors.piece;
-        assert_eq!(floor, 1_310);
+        assert_eq!(floor, 820, "[REQ-83] the one-rung piece floor");
 
         // A parent whose split total is exactly `piece_floor + change_floor`: the boundary in both
         // directions at once.
@@ -3920,7 +3952,7 @@ mod split_math_tests {
             split_source_value: source_value_for_total(50_000, 2.0),
         };
         let laddered_floor = split_output_floors(backup_rate, laddered).binding();
-        assert_eq!(laddered_floor, 1_310);
+        assert_eq!(laddered_floor, 820, "[REQ-83] the one-rung piece floor");
         // The bare backup floor still exists and is still strictly lower — which is exactly why a
         // planner quoting it would be advisory and not binding.
         assert!(min_split_output(backup_rate) < laddered_floor);
@@ -3953,7 +3985,9 @@ mod split_math_tests {
         .binding();
         assert_eq!(min_split_output(backup_rate), 554, "dust 330 + a 112-vB backup at 2 sat/vB");
         assert_eq!(mercurylib::tesr::min_child_value(committed_rate, DUST_LIMIT), 1_310);
-        assert_eq!(executor_floor, 1_310, "the larger floor binds");
+        // [REQ-83] The executor admits at the ONE-rung floor, so the quote must plan at it too —
+        // the whole point of this test is that the two numbers are the same number.
+        assert_eq!(executor_floor, 820, "the larger of 554 and the one-rung 820 binds");
 
         // A 1 000-sat piece: admitted by the old dust-floor plan, refused by the executor.
         let coins = vec![crate::select::Candidate {
@@ -3963,12 +3997,16 @@ mod split_math_tests {
             is_inventory: true,
         }];
         assert!(
-            matches!(crate::select::plan(&coins, 1_000), crate::select::Plan::WithSplit { .. }),
+            matches!(crate::select::plan(&coins, 500), crate::select::Plan::WithSplit { .. }),
             "the dust-floor planner proposes a piece the executor rejects"
         );
         assert!(
             matches!(
-                crate::select::plan_with_floor(&coins, 1_000, executor_floor),
+                // [REQ-83] 500, not 1 000: the executor floor is now the ONE-rung 820, so a
+                // 1 000-sat piece is genuinely fundable and no longer demonstrates the gap this
+                // test is about. The gap itself is unchanged — a planner running at the bare dust
+                // floor proposes pieces the executor refuses — and 500 sits in it.
+                crate::select::plan_with_floor(&coins, 500, executor_floor),
                 crate::select::Plan::Insufficient { .. }
             ),
             "planning at the executor's floor must not propose a doomed split"
@@ -4040,17 +4078,34 @@ mod split_math_tests {
             ParentShape::Child { fee_rate: 2.0, split_source_value: 0 },
         ] {
             let floors = split_output_floors(backup_rate, shape);
+            // **[REQ-83] INVERTED, and the old assertion was the requirement being violated.** This
+            // read "a payee's piece is always a two-tier child — the conveyed leaf never becomes a
+            // spine", which was true of the builder at the time and made every amount in
+            // `[1, min_child_value)` unpayable. §6.0.3's second band is a payee's leg that funds ONE
+            // rung, `SplitLegRole::ThinPiece` builds it, and the floor that ADMITS a payment must be
+            // the floor of the cheapest shape a payee's leg can take — or the shape exists and is
+            // unreachable, which is the exact state `the_payment_lane_today_admits_only_the_laddered_band`
+            // was written to measure.
             assert_eq!(
                 floors.piece,
-                mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
-                "a payee's piece is always a two-tier child — V1's correction is explicit that the \
-                 conveyed leaf never becomes a spine"
+                mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT),
+                "a payee's piece is admitted at the ONE-rung floor; the leg's own role then decides \
+                 whether one rung or two is built, from the same LeafShape decision"
             );
             let lane = floors.lane.expect("a laddered parent names its lane");
             match mercuryrustlib::tesr::change_leg_role(lane) {
                 mercuryrustlib::tesr::SplitLegRole::Piece => {
-                    assert_eq!(floors.change, floors.piece, "{lane:?}: a two-tier change");
-                    assert_eq!(floors.describe(), "1310", "one number while the legs agree");
+                    // **The change floor is now ABOVE the piece floor on this lane**, which is new
+                    // and is not a defect: this lane still carves its change as a two-tier child,
+                    // and a two-tier leg costs a rung more than a one-rung one. The direction that
+                    // WOULD be a defect is a leg admitted below the floor of the shape built for it.
+                    assert_eq!(
+                        floors.change,
+                        mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
+                        "{lane:?}: a two-tier change"
+                    );
+                    assert!(floors.change > floors.piece);
+                    assert_eq!(floors.describe(), "piece 820, change 1310");
                     assert!(floors.change_note().contains("two-tier"));
                 }
                 mercuryrustlib::tesr::SplitLegRole::SpineTip => {
@@ -4058,9 +4113,14 @@ mod split_math_tests {
                         floors.change,
                         mercurylib::tesr::min_spine_tip_value(2.0, DUST_LIMIT)
                     );
-                    assert!(floors.change < floors.piece);
-                    assert_eq!(floors.describe(), "piece 1310, change 820");
+                    // Both legs are one rung on this lane, so the two floors coincide — and
+                    // `describe()` collapses to one number, which is the honest reduction.
+                    assert_eq!(floors.change, floors.piece);
+                    assert_eq!(floors.describe(), "820", "one number while the legs agree");
                     assert!(floors.change_note().contains("ONE rung"));
+                }
+                mercuryrustlib::tesr::SplitLegRole::ThinPiece => {
+                    unreachable!("`change_leg_role` never carves a payee's shape as the change")
                 }
             }
             // `binding()` and `planning()` are the two honest single-number reductions, and they are
@@ -4102,11 +4162,14 @@ mod split_math_tests {
                 backup_rate,
                 ParentShape::Child { fee_rate: rate, split_source_value: 0 },
             );
-            // THE FLOOR THAT MUST NEVER FALL. A payee's piece is a two-tier child on every lane, so
-            // its floor is `min_child_value` (or the backup-fee floor when that binds) — the exact
-            // expression it had before change 2, on both lanes.
+            // **[REQ-83] THE FLOOR, AND WHY IT MOVED.** This said "a payee's piece is a two-tier
+            // child on every lane, so its floor is `min_child_value`" — true of the builder then,
+            // and the reason every amount below 1 560 was unpayable. A payee's leg now takes the
+            // one-rung shape when that is what its value affords, so admission is at the ONE-rung
+            // floor on both lanes. What must never fall is the tie between the floor a payment is
+            // admitted at and the shape actually built for it, and that tie is `LeafShape`.
             let piece = min_split_output(backup_rate)
-                .max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT));
+                .max(mercurylib::tesr::min_spine_tip_value(rate, DUST_LIMIT));
             assert_eq!(root.piece, piece, "[{rate} sat/vB] the ROOT lane's piece floor moved");
             assert_eq!(child.piece, piece, "[{rate} sat/vB] the CHILD lane's piece floor moved");
             // …and the change leg is the ONLY thing that moved, and only on the lane whose builder
@@ -4117,7 +4180,15 @@ mod split_math_tests {
                     .max(mercurylib::tesr::min_spine_tip_value(rate, DUST_LIMIT)),
                 "[{rate} sat/vB] the root lane's change is a one-cap tip"
             );
-            assert_eq!(child.change, piece, "[{rate} sat/vB] the child lane's change is unmoved");
+            // [REQ-83] The CHILD lane's change is still a two-tier grandchild, so its floor is
+            // `min_child_value` — which is now ABOVE the piece floor rather than equal to it. The
+            // piece moved; the change did not.
+            assert_eq!(
+                child.change,
+                min_split_output(backup_rate)
+                    .max(mercurylib::tesr::min_child_value(rate, DUST_LIMIT)),
+                "[{rate} sat/vB] the child lane's change is unmoved"
+            );
             assert!(root.change <= root.piece, "[{rate} sat/vB] the tip is never the DEARER leg");
             // The planner reduction must not hand the tip's cheaper number to a piece: it is used
             // where refusing too much is the bug, and the per-coin preflight then judges each leg.
@@ -4132,10 +4203,14 @@ mod split_math_tests {
             backup_rate,
             ParentShape::Root { fee_rate: 2.0, split_source_value: 0 },
         );
-        assert_eq!((root.piece, root.change), (1_310, 820));
-        let e = inladder_amounts_floored(root.piece + root.change, root.change, root)
-            .expect_err("a PIECE at the tip's floor cannot fund its second rung");
-        assert!(e.to_string().contains("the piece falls short"), "got: {e}");
+        assert_eq!((root.piece, root.change), (820, 820), "[REQ-83] both legs are one rung on this lane");
+        // [REQ-83] A piece AT this number is now admitted — both legs are one rung on this lane,
+        // so the two floors coincide. One satoshi below still refuses, which is the property that
+        // matters: the floor BINDS, it is simply a different floor.
+        assert!(inladder_amounts_floored(root.piece + root.change, root.change, root).is_ok());
+        let e = inladder_amounts_floored(root.piece + root.change - 1, root.change, root)
+            .expect_err("a piece below the one-rung floor cannot fund even one rung");
+        assert!(e.to_string().contains("falls short"), "got: {e}");
         // …while the CHANGE at that same number is admitted — which is the 490 sat change 2 buys.
         assert_eq!(
             inladder_amounts_floored(root.piece + root.change, root.piece, root).unwrap(),
@@ -4143,14 +4218,25 @@ mod split_math_tests {
         );
         // The pre-flip wallet refused exactly that split. Stated as the capability gained, so a
         // future revert is visible as a loss rather than as a silent tightening.
+        //
+        // [REQ-83] Contrasted against the TWO-RUNG floor explicitly now. It used to contrast against
+        // `root.piece`, which was the two-rung floor at the time; both legs are one rung on this
+        // lane today, so that comparison compares a number with itself and proves nothing.
+        let two_rung_everywhere = SplitFloors {
+            piece: mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
+            change: mercurylib::tesr::min_child_value(2.0, DUST_LIMIT),
+            lane: root.lane,
+        };
+        let refused_before = inladder_amounts_floored(
+            root.piece + root.change,
+            root.piece,
+            two_rung_everywhere,
+        );
         assert!(
-            inladder_amounts_floored(
-                root.piece + root.change,
-                root.piece,
-                SplitFloors { piece: root.piece, change: root.piece, lane: root.lane },
-            )
-            .is_err(),
-            "before change 2 this split was refused for want of 490 sat of change"
+            refused_before.is_err(),
+            "a wallet that floors BOTH legs at the two-rung value refuses this split; the capability \
+             is what the one-rung shapes buy, and stating it this way makes a future revert visible \
+             as a loss rather than as a silent tightening. Got: {refused_before:?}"
         );
     }
 
@@ -4170,7 +4256,7 @@ mod split_math_tests {
         let (tf, rf) = (split_output_floors(backup_rate, tip), split_output_floors(backup_rate, root));
         // The NUMBERS match the root lane — both build a two-tier piece and a one-cap change…
         assert_eq!((tf.piece, tf.change), (rf.piece, rf.change));
-        assert_eq!((tf.piece, tf.change), (1_310, 820));
+        assert_eq!((tf.piece, tf.change), (820, 820), "[REQ-83] both legs are one rung on this lane");
         // …but the LANE is its own, and that is deliberate: the two floors agreeing is a fact about
         // two builders, and a lane that read another lane's answer is exactly how the floor and the
         // ladder actually built come apart (hazard 12).
@@ -4204,15 +4290,24 @@ mod split_math_tests {
             .admission,
             "quote and executor must judge a tip exactly as they judge the coin it came from"
         );
-        // And the floors still BIND on this lane — a piece at the change leg's floor is refused,
-        // which is the [V5] hazard the two numbers exist to keep apart.
-        let e = split_preflight_pure(backup_rate, tip, 0, tf.change)
+        // **[REQ-83] INVERTED. A piece AT the tip floor is now ADMITTED**, because a payee's leg
+        // may take the one-rung shape — which is the whole of §6.0.3's second band. This used to
+        // assert the opposite, and it was the [V5] hazard while a piece was always two rungs: the
+        // two floors had to be kept apart because admitting at the cheaper one meant building a
+        // ladder the leg could not fund. They now coincide on this lane because the two legs have
+        // the same SHAPE, not because the distinction was dropped.
+        assert!(
+            split_preflight_pure(backup_rate, tip, 0, tf.change).admission.is_ok(),
+            "a one-rung piece at the one-rung floor must be admitted"
+        );
+        // …and one satoshi below it is still refused, so the floor still BINDS.
+        let e = split_preflight_pure(backup_rate, tip, 0, tf.change - 1)
             .admission
-            .expect_err("a PIECE at the tip floor cannot fund its second rung");
+            .expect_err("a piece below the one-rung floor cannot fund even one rung");
         assert!(e.contains("the piece falls short"), "got: {e}");
     }
 
-    /// **[K > 1] THE MINIMUM PARENT VALUE FOR A K-BATCH IS `1 396K + 1 310`, AND IT IS DERIVED.**
+    /// **[K > 1] THE MINIMUM PARENT VALUE FOR A K-BATCH IS `906K + 1 310`, AND IT IS DERIVED.**
     ///
     /// The number `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 publishes is pinned here against
     /// [`min_batch_source_value`], which computes it from the real floors and the real
@@ -4226,7 +4321,7 @@ mod split_math_tests {
     /// made the per-recipient term super-linear would mean an extra payee costs a whole new `SP`,
     /// which is precisely the economics K > 1 exists to avoid.
     #[test]
-    fn the_k_batch_minimum_parent_value_is_1396k_plus_1310() {
+    fn the_k_batch_minimum_parent_value_is_906k_plus_1310() {
         let backup_rate = 2.0;
         // Any laddered shape whose CHANGE leg is a one-cap tip: the plain root lane and the spine
         // batch. Both are the lanes a K-batch actually runs on.
@@ -4235,26 +4330,32 @@ mod split_math_tests {
             ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 0 },
         ] {
             let floors = split_output_floors(backup_rate, shape);
-            assert_eq!((floors.piece, floors.change), (1_310, 820), "the two terms of the formula");
+            assert_eq!((floors.piece, floors.change), (820, 820), "[REQ-83] the two terms of the formula");
             for k in 1..=crate::wallet::MAX_BATCH_RECIPIENTS {
                 assert_eq!(
                     min_batch_source_value(k, shape, floors),
-                    Some(1_396 * k as u64 + 1_310),
+                    // [REQ-83] `906K + 1 310` at the 2 sat/vB fixture: K one-rung pieces (820) +
+                    // the change (820) + the P2A anchor (240) + the committed fee for K+1 outputs
+                    // (250 base + 86 per extra leg). It was `1 396K + 1 310` while a piece cost the
+                    // two-rung floor of 1 310 — the K term fell by exactly the rung a payee no
+                    // longer has to fund.
+                    Some(906 * k as u64 + 1_310),
                     "K = {k} on the {} lane",
                     shape.route()
                 );
             }
             // The three published rows, spelled out.
-            assert_eq!(min_batch_source_value(1, shape, floors), Some(2_706));
-            assert_eq!(min_batch_source_value(10, shape, floors), Some(15_270));
-            assert_eq!(min_batch_source_value(20, shape, floors), Some(29_230));
+            assert_eq!(min_batch_source_value(1, shape, floors), Some(2_216));
+            assert_eq!(min_batch_source_value(10, shape, floors), Some(10_370));
+            assert_eq!(min_batch_source_value(20, shape, floors), Some(19_430));
         }
         // The CHILD lane's change is still a two-tier grandchild, so its constant term is the
         // piece's floor, not the tip's — and the function reports THAT rather than the headline.
         let child = ParentShape::Child { fee_rate: 2.0, split_source_value: 0 };
         let cf = split_output_floors(backup_rate, child);
-        assert_eq!((cf.piece, cf.change), (1_310, 1_310));
-        assert_eq!(min_batch_source_value(3, child, cf), Some(1_396 * 3 + 1_800));
+        assert_eq!((cf.piece, cf.change), (820, 1_310), "[REQ-83] a one-rung piece, a two-tier change");
+        // [REQ-83] `906·3` for the one-rung pieces + the two-tier change (1 310) + anchor + fee.
+        assert_eq!(min_batch_source_value(3, child, cf), Some(906 * 3 + 1_800));
         // [ONE COIN SHAPE] "An un-laddered parent has no in-ladder batch at all" no longer needs
         // asserting: there is no un-laddered parent. Every remaining shape HAS a batch, which is the
         // stronger statement, and the three arms above are now exhaustive over the enum.
@@ -4272,7 +4373,7 @@ mod split_math_tests {
         let shape0 = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 0 };
         let floors = split_output_floors(backup_rate, shape0);
         let need = min_batch_source_value(k, shape0, floors).unwrap();
-        assert_eq!(need, 29_230);
+        assert_eq!(need, 906 * k as u64 + 1_310, "[REQ-83] the piece term is the one-rung floor");
 
         // Exactly at the floor: admitted. One sat under: refused. Nothing in between.
         let at = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: need };
@@ -4283,7 +4384,7 @@ mod split_math_tests {
             .expect_err("one sat under the minimum must refuse")
             .to_string();
         assert!(e.contains("20-recipient batch"), "the refusal must name K: {e}");
-        assert!(e.contains("29230"), "the refusal must name the requirement: {e}");
+        assert!(e.contains("19430"), "the refusal must name the requirement: {e}");
         assert!(e.contains("1 sat short"), "the refusal must name the SHORTFALL: {e}");
         assert!(e.contains("sid-under"), "the refusal must name the coin: {e}");
         assert!(
@@ -4293,7 +4394,7 @@ mod split_math_tests {
         // A big shortfall reports the real distance, not a clamped one.
         let tiny = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 3_000 };
         let e = refuse_undersized_batch_parent("sid-tiny", k, tiny, floors).unwrap_err().to_string();
-        assert!(e.contains("26230 sat short"), "got: {e}");
+        assert!(e.contains("16430 sat short"), "got: {e}");
         // …and it stays classifiable by the chaos suite's refusal taxonomy ("piece" -> split-fit),
         // so a legitimate protocol limit hit under load is not reported as an unexplained breach.
         assert!(e.contains("piece"), "got: {e}");
@@ -4303,17 +4404,17 @@ mod split_math_tests {
         refuse_undersized_batch_parent(
             "sid",
             1,
-            ParentShape::Root { fee_rate: 2.0, split_source_value: 2_706 },
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 2_216 },
             one,
         )
-        .expect("2 706 sat is exactly one payee plus a tip");
+        .expect("[REQ-83] 2 216 sat is exactly one one-rung payee plus a tip");
         let e = refuse_undersized_batch_parent(
             "sid",
             1,
-            ParentShape::Root { fee_rate: 2.0, split_source_value: 2_705 },
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 2_215 },
             one,
         )
-        .expect_err("2 705 sat cannot pay one recipient and keep an exitable tip")
+        .expect_err("2 215 sat cannot pay one recipient and keep an exitable tip")
         .to_string();
         assert!(e.contains("1-recipient batch") && e.contains("1 sat short"), "{e}");
     }

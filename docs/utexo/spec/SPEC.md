@@ -1630,7 +1630,7 @@ dust limit is already expressible today.
 | value `v` | shape | cost |
 |---|---|---|
 | `v ≥ min_child_value` (1560 at 3.0 sat/vB) | today's two-rung ladder, self-funding | unchanged |
-| `945 ≤ v < 1560` | ONE rung — the spine-tip SHAPE exists; conveying it does not (see below) | one renewal instead of two |
+| `945 ≤ v < 1560` | ONE rung — **BUILT** (`SplitLegRole::ThinPiece`) | one renewal instead of two |
 | `DUST_LIMIT ≤ v < 945` | depth-0 stub, no ladder; zero-fee v3 with a zero-value anchor, bumped in package | floor is exactly 330 |
 | `1 ≤ v < DUST_LIMIT` | **a TAIL** — carried as the split's single permitted dust output | see below |
 
@@ -1660,41 +1660,67 @@ caller reads exactly like a working feature, which is this repository's most rep
 
 | band | reachable through `transfer()` today |
 |---|---|
-| `Laddered` | **yes** — the piece floor sits exactly at its boundary |
-| `SpineTip` | no |
+| `Laddered` | **yes** |
+| `SpineTip` | **yes** — the piece floor now sits exactly at its boundary |
 | `Stub` | no |
 | `Tail` | no |
 
-The piece floor IS the `Laddered` boundary, so every amount in `[1, 1560)` is refused before a
-builder is ever consulted. That test is written to FAIL when a lower band is wired up, so closing one
-cannot pass silently either.
+The piece floor IS the `SpineTip` boundary, so every amount in `[1, 945)` is still refused before a
+builder is ever consulted. That test is written to FAIL when a lower band is wired up — it already
+did once, for this one, and the update is above. Closing a band cannot pass silently either.
 
-**A CORRECTION TO THE ROW ABOVE, found by trying to build it rather than by reading it.** This
-section used to say the `SpineTip` band was nearly free because "the spine-tip shape already exists".
-The shape does exist — and it exists *only as the sender's own change record*, which is never handed
-to anybody. The code says so by name: conveying a tip is refused in `transfer_sender`, in as many
-words, because "handing a tip over is a key handover PLUS a `spinetip-` conveyance, and that builder
-is not landed" — a deliberate named refusal added after `chaos22` found the alternative, which was a
-flat conveyance handing the recipient a backup chain over an outpoint that will never exist. **A coin
-with no exit, with no error on either side.**
+**THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
+first, because the estimate was wrong in the direction that matters: this section used to say the
+band was nearly free because "the spine-tip shape already exists". The shape did — *only as the
+sender's own change record*, which is never handed to anybody. Conveying a tip is refused in
+`transfer_sender` in as many words, a named refusal added after `chaos22` found the alternative:
+a flat conveyance handing the recipient a backup chain over an outpoint that will never exist. **A
+coin with no exit, with no error on either side.** What the band needed was a CONVEYABLE one-rung
+child, and that is a wire-format change.
 
-So what band 2 needs is not the shape but a CONVEYABLE one-rung child, and that is a wire-format
-change: `ChildTesrBundle` carries `child_extension` as a mandatory tier, and every payment in the
-system is a `ChildTesrBundle`. Making it optional touches **102 non-test call sites across four
-crates**, the receiver's verifier and census among them — and the failure mode of getting it wrong is
-precisely the one the tip refusal was written to prevent. It is a staged change, in the shape this
-repository already learned to use for the V2 child:
+* **Stage 1 — the leg ROLE gains a third arm.** `SplitLegRole::SpineTip` carried two meanings that
+  only ever coincided by accident: *"one rung"* and *"this leg is the sender's new spine tip"*. Only
+  the second may drive `persist_spine_tip` and the `(change_leg == LastIsTip) != tip.is_some()` plan
+  check, and a payee's leg must trigger neither. `ThinPiece` is the first meaning without the second.
+* **Stage 2 — `ChildTesrBundle::child_extension` becomes `Option`.** `None` is a thin piece, whose
+  state is its only rung and spends `SP.out[sp_vout]` directly. **It must never read as "not
+  co-signed yet"**: that conflation is what stage 1 exists to prevent on the journal, where a replay
+  would co-sign a PHANTOM extension over the funding outpoint at the piece schedule's CSV, out-racing
+  the very cap the bundle names as the owner's exit. A verifier has no business inventing a rung, and
+  equally none refusing a shape the design defines.
+* **Stage 3 — the builder and the floor move together.** The leg's role is chosen by VALUE through
+  `LeafShape`, from the same floor functions the admission guard reads, so the shape a payment is
+  admitted at and the ladder then built cannot be two different answers. The piece floor drops from
+  `min_child_value` to `min_spine_tip_value`.
 
-1. the leg ROLE gains a third arm, distinguishing *"one rung"* from *"this is the sender's tip"* —
-   two meanings `SplitLegRole::SpineTip` conflates today, and only the second may drive
-   `persist_spine_tip`;
-2. `ChildTesrBundle` admits an absent extension, and the verifier and census learn the one-rung shape;
-3. the builder and the admission floor are switched over together, so a payment is never admitted at
-   a value whose shape no builder emits.
+**One builder serves both one-rung roles, and that it needed no other change is the finding.** A thin
+piece is the tip's shape paying a payee instead of the sender: one cap rooted at `SP.out[j]` via
+`build_state_from`, paying `owner_exit_address` — which on a piece leg is already the RECIPIENT. The
+only thing standing between the two was a role gate.
+
+**What running it found.** Four tests build a thin piece and put it through the real verifier
+(`a_thin_one_rung_piece_is_accepted` and three adversarial siblings), and the first one failed: the
+child census computed `child_flat_backups + 2 + superseded`, with `2` a literal. That is the
+exact-equality law that catches a hidden co-signature, so left as a literal it does both possible
+wrongs at once — it refuses every honest thin piece, and if the count were ever loosened to let them
+through it would admit a hidden rung on one. It is now derived from the bundle's own rungs and stays
+exact for both shapes. The adversarial three pin that the one-rung shape is not a hole cut through
+the conservation law: a thin piece that skims its only rung, one that does not spend `SP.out[j]`, and
+one presented against the two-rung census are each refused, by name.
+
+**What a thin leaf gives up is exactly what the table prices: one renewal instead of two.** It cannot
+be RENEWED — renewal resets an extension's budget and it has none — nor split further, since it was
+admitted at the one-rung floor precisely because it cannot fund two. Both are refused by name rather
+than defaulted. The renewal refusal matters most: its caller is the background maintenance pass whose
+whole job is keeping leaves alive, and "nothing to do" is the answer that loses a coin. The remedy is
+a re-anchor.
+
+**Measured, at the shipped 3.0 sat/vB rate: 615 amounts that were refused before a builder was ever
+consulted are now payable** — every value in `[945, 1560)`.
 
 A first pass added stage 1's variant and reverted it the same hour: **five match sites accepted it
 and nothing constructed it**, which is a dead variant reading as progress — the failure this document
-keeps naming. The variant lands with stage 2 or not at all.
+keeps naming. It landed with stage 2, as that reversion said it would.
 
 #### 6.0.4 The release fragment, and why a tail cannot take a sibling hostage
 
