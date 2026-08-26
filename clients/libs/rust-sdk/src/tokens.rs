@@ -5369,13 +5369,19 @@ impl UtexoWallet {
                     receiver_address,
                 )?;
                 // PROVE the chain the receiver will be handed resolves, BEFORE the co-sign.
-                let txids = vec![
+                // [REQ-83] The child's own rungs, however many it has. A thin piece contributes
+                // ONE, and naming a tier it does not carry makes the chain unresolvable — the
+                // failure would read as "this consignment does not resolve" rather than "we asked
+                // about a transaction that was never built".
+                let mut txids = vec![
                     cb.parent.trigger.txid.clone(),
                     cb.parent.current().extension.txid.clone(),
                     cb.parent.current().state.txid.clone(),
-                    cb.child_extension.txid.clone(),
-                    draft.tier.txid.clone(),
                 ];
+                if let Some(ext) = cb.child_extension.as_ref() {
+                    txids.push(ext.txid.clone());
+                }
+                txids.push(draft.tier.txid.clone());
                 let (verdict, detail, contract) =
                     w.validate_offchain_chain_info(&draft.tier.consignment, &txids)?;
                 if verdict != ValidationVerdict::Valid {

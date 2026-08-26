@@ -346,7 +346,12 @@ impl UtexoWallet {
         {
             return Ok(Some(ParentShape::Child {
                 fee_rate: cb.parent.fee_rate,
-                split_source_value: cb.child_extension.out_value,
+                // [REQ-83] A THIN piece cannot be split — `child_in_ladder_split` refuses it by name,
+                // because a leaf admitted at the ONE-rung floor cannot fund grandchildren that clear
+                // any floor. Surfacing it here as a zero split source makes the admission guard
+                // refuse with its own arithmetic message; the builder's named refusal is the one a
+                // caller should ever see, and it fires first on every path that reaches it.
+                split_source_value: cb.child_extension.as_ref().map_or(0, |e| e.out_value),
             }));
         }
         if let Some(bundle) = mercuryrustlib::tesr::load(
@@ -1117,7 +1122,12 @@ impl UtexoWallet {
         // child is terminalized BEFORE those are built.
         let shape = ParentShape::Child {
             fee_rate: cb.parent.fee_rate,
-            split_source_value: cb.child_extension.out_value,
+            // [REQ-83] A THIN piece cannot be split — `child_in_ladder_split` refuses it by name,
+                // because a leaf admitted at the ONE-rung floor cannot fund grandchildren that clear
+                // any floor. Surfacing it here as a zero split source makes the admission guard
+                // refuse with its own arithmetic message; the builder's named refusal is the one a
+                // caller should ever see, and it fires first on every path that reaches it.
+                split_source_value: cb.child_extension.as_ref().map_or(0, |e| e.out_value),
         };
         // piece + change == the child's split total (ext_child.out[0] − committed fee for 2).
         let total = shape
@@ -1261,7 +1271,12 @@ impl UtexoWallet {
         // Σpieces + change == the child's split total (ext_child.out[0] − committed fee for N+1).
         let shape = ParentShape::Child {
             fee_rate: cb.parent.fee_rate,
-            split_source_value: cb.child_extension.out_value,
+            // [REQ-83] A THIN piece cannot be split — `child_in_ladder_split` refuses it by name,
+                // because a leaf admitted at the ONE-rung floor cannot fund grandchildren that clear
+                // any floor. Surfacing it here as a zero split source makes the admission guard
+                // refuse with its own arithmetic message; the builder's named refusal is the one a
+                // caller should ever see, and it fires first on every path that reaches it.
+                split_source_value: cb.child_extension.as_ref().map_or(0, |e| e.out_value),
         };
         let total = shape
             .split_total(n + 1)

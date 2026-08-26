@@ -428,7 +428,7 @@ pub async fn execute() -> Result<()> {
         "a leaf is minted at `state_csv(0)` — that is the premise of the whole budget argument"
     );
     assert_eq!(
-        signed_csv(&minted.child_extension)?,
+        signed_csv(minted.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
         p.ext_csv(0),
         "a leaf is minted at `ext_csv(0)`, which is what makes its renewal epoch DERIVABLE"
     );
@@ -439,7 +439,7 @@ pub async fn execute() -> Result<()> {
          leaf carries no `m` field and must never grow one"
     );
     assert_eq!(
-        tier_prevout(&minted.child_extension)?,
+        tier_prevout(minted.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
         leaf_outpoint,
         "the leaf's extension spends SP.out[j] — the outpoint every renewal below rebuilds over"
     );
@@ -475,7 +475,7 @@ pub async fn execute() -> Result<()> {
                 .await?
                 .ok_or_else(|| anyhow!("{from_name} lost the leaf bundle"))?;
             let csv_before = signed_csv(&before.child_state)?;
-            let ext_before = signed_csv(&before.child_extension)?;
+            let ext_before = signed_csv(before.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?;
 
             let to = holder + 1;
             let to_name = holders[to].0.clone();
@@ -520,12 +520,12 @@ pub async fn execute() -> Result<()> {
                 "each whole-coin hop costs exactly one δ off the state rung"
             );
             assert_eq!(
-                signed_csv(&after.child_extension)?,
+                signed_csv(after.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
                 ext_before,
                 "a hop must not move the extension rung — the derived epoch is read off it"
             );
             assert_eq!(
-                tier_prevout(&after.child_extension)?,
+                tier_prevout(after.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
                 leaf_outpoint,
                 "the leaf still hangs off the same SP.out[j] after {hops_done} hop(s)"
             );
@@ -677,7 +677,7 @@ pub async fn execute() -> Result<()> {
         // =========================================================================================
         let before = at_floor;
         let epoch_before = mercuryrustlib::tesr::child_renewal_epoch(&before)?;
-        let ext_before = signed_csv(&before.child_extension)?;
+        let ext_before = signed_csv(before.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?;
         let mut coin = coin_of(&cc, &holder_name, &leaf_sid).await?;
         let (renewed, rollover_due) =
             mercuryrustlib::tesr::renew_child_auto(&cc, &holder_name, &mut coin, &before)
@@ -693,7 +693,7 @@ pub async fn execute() -> Result<()> {
             "[4] a renewal resets the state rung to `state_csv(0)` — that IS the budget coming back"
         );
         // (b) STRICTLY LOWER EXTENSION — the safety property, on the SIGNED nSequence.
-        let ext_after = signed_csv(&renewed.child_extension)?;
+        let ext_after = signed_csv(renewed.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?;
         assert!(
             ext_after < ext_before,
             "[4] the renewed extension (CSV {ext_after}) must mature STRICTLY before the one it \
@@ -712,7 +712,7 @@ pub async fn execute() -> Result<()> {
         );
         // (c) THE SAME OUTPOINT, AND NO DEPTH SPENT.
         assert_eq!(
-            tier_prevout(&renewed.child_extension)?,
+            tier_prevout(renewed.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
             leaf_outpoint,
             "[4] the renewed extension rebuilds over the SAME SP.out[j] — that is what makes it a \
              renewal rather than a new level"
@@ -748,7 +748,7 @@ pub async fn execute() -> Result<()> {
         // (d) ZERO ON-CHAIN BYTES.
         assert!(!tx_known(&cc, &sp_txid)?, "[4] the renewal broadcast nothing: SP is still off-chain");
         assert!(
-            !tx_known(&cc, &renewed.child_extension.txid)?,
+            !tx_known(&cc, &renewed.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid)?,
             "[4] the renewal broadcast nothing: the replacement extension is un-broadcast"
         );
         assert!(outpoint_unspent(&cc, &f_txid, f_vout)?, "[4] the renewal broadcast nothing: F unspent");
@@ -913,7 +913,7 @@ pub async fn execute() -> Result<()> {
                 .await?
                 .ok_or_else(|| anyhow!("the leaf vanished after a refused renewal"))?;
             assert_eq!(
-                unchanged.child_extension.txid, cb.child_extension.txid,
+                unchanged.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid, cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid,
                 "[N1] a refused renewal must leave the stored bundle untouched"
             );
             assert_eq!(
@@ -959,7 +959,7 @@ pub async fn execute() -> Result<()> {
         total_hops + renewals,
         "[8] one superseded state per hop, plus one per renewal"
     );
-    let live_ext_txid = final_cb.child_extension.txid.clone();
+    let live_ext_txid = final_cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid.clone();
     let dead_ext_txids: Vec<String> = final_cb
         .child_superseded_extensions
         .iter()
@@ -973,11 +973,11 @@ pub async fn execute() -> Result<()> {
             "[8] superseded extension {i} rivals the live one over {leaf_outpoint}"
         );
         assert!(
-            signed_csv(t)? > signed_csv(&final_cb.child_extension)?,
+            signed_csv(t)? > signed_csv(final_cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
             "[8] superseded extension {i} (CSV {}) must lose the maturity race to the live one \
              (CSV {})",
             signed_csv(t)?,
-            signed_csv(&final_cb.child_extension)?
+            signed_csv(final_cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?
         );
     }
     let exit_spk = electrum_client::bitcoin::Address::from_str(&final_cb.child_owner_exit_address)?
@@ -995,7 +995,7 @@ pub async fn execute() -> Result<()> {
          starts empty",
         leaf_sid.chars().take(8).collect::<String>(),
         live_ext_txid.chars().take(8).collect::<String>(),
-        signed_csv(&final_cb.child_extension)?,
+        signed_csv(final_cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension"))?,
         dead_ext_txids.len(),
         dead_ext_txids
             .iter()

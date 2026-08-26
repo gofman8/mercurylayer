@@ -2051,9 +2051,21 @@ mod combine_refusal_tests {
         }
         // …and the tail really does spend the leaf's own funding output, so it stays valid for
         // exactly as long as that output is unspent.
+        //
+        // [REQ-83] Phrased over the RUNGS rather than over `child_extension`, because a leaf now has
+        // one of two shapes and the property is the same for both: whatever rungs it carries, the
+        // exit chain is built from the tiers ALREADY SIGNED and stored, never from tiers rebuilt
+        // here. Rebuilding would produce a different txid, and the chain would stop being the one
+        // the SE co-signed — an exit that looks present and cannot be broadcast.
+        let chain_body = cut("\npub fn child_exit_chain(");
         assert!(
-            cut("\npub fn child_exit_chain(").contains("cb.child_extension.signed_tx.clone()"),
-            "the leaf's tail must be the stored, already-signed child extension"
+            chain_body.contains("cb.child_rungs()") && chain_body.contains("t.signed_tx.clone()"),
+            "the leaf's tail must be built from the stored, already-signed child rungs"
+        );
+        assert!(
+            !chain_body.contains("build_extension_from(") && !chain_body.contains("build_state_from("),
+            "the exit chain must never REBUILD a tier: a rebuilt tier has a different txid and is \
+             not the one the SE co-signed"
         );
     }
 }

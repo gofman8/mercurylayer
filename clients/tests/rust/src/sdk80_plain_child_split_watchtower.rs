@@ -317,7 +317,7 @@ pub async fn execute() -> Result<()> {
         "SDK80 - (1) bob holds RECEIVED CHILD {bob_child_sid} ({PAY} sat); its `ctesr-` row names \
          child_state {} as live, over ext_child {}",
         &live_before[..12],
-        &cb0.child_extension.txid[..12]
+        &cb0.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid[..12]
     );
 
     // ---- 2. bob pays TWO recipients out of that child, RACED by a read-only witness. -------------

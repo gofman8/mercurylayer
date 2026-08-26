@@ -143,19 +143,32 @@ fn the_two_budgets_are_not_swapped() {
 }
 
 /// STRUCTURAL AT EVERY CONSTRUCTION POINT. `LiveRival::read` takes the kind from its caller, so the
-/// rule is only as good as the five call sites. Each must derive it from tree position — parity, or
-/// the segment's own shape — and none may read a conveyed field.
+/// rule is only as good as its call sites. Each must derive it from tree position — parity, or the
+/// segment's own shape — and none may read a conveyed field.
 #[test]
 fn every_live_rival_declares_a_structural_kind() {
     let code = code_only(&tesr());
 
-    // Five CALL sites (the definition is `fn read(`, not `LiveRival::read(`).
+    // SIX call sites (the definition is `fn read(`, not `LiveRival::read(`). It was five until
+    // [REQ-83] gave a child two possible shapes: on an ordinary piece the EXTENSION guards
+    // `SP.out[j]` and the state guards the extension's payload, while on a one-rung THIN piece the
+    // state is the only rung and guards the funding outpoint itself. That is a sixth place where the
+    // kind must come from the tree rather than from the sender — and getting it wrong is not
+    // cosmetic mis-labelling, because the kind selects the MARGIN a rival is raced against.
     let sites = code.matches("LiveRival::read(").count();
     assert_eq!(
-        sites, 5,
-        "expected exactly five `LiveRival::read(` call sites, found {sites}. A new one is a new \
+        sites, 6,
+        "expected exactly six `LiveRival::read(` call sites, found {sites}. A new one is a new \
          place that must declare a STRUCTURAL kind; a missing one means this census has lost part \
          of its subject."
+    );
+    // [REQ-83] The thin child's lone rung is a STATE, and it is named as one. If this ever became
+    // `RivalKind::Extension`, a rival for the funding outpoint would be raced against δE instead of
+    // δ — on regtest (δ=6, δE=3) exactly half the margin the design requires.
+    assert!(
+        code.contains("\"the thin child\'s live state\", RivalKind::State"),
+        "the THIN child's only rung must be declared a STATE. It sits in the state band, on the \
+         state grid, and its margin is δ."
     );
     // Root ladder: position parity, the same rule the CSV-band check uses.
     assert!(

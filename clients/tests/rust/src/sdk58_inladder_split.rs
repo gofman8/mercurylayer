@@ -197,9 +197,9 @@ pub async fn execute() -> Result<()> {
     {
         let live_csv = cb.child_state.csv.ok_or(anyhow!("live child state has no CSV"))?;
         let t = mercurylib::tesr::build_state_from(
-            &cb.child_extension.txid,
-            cb.child_extension.payload_vout,
-            cb.child_extension.out_value,
+            &cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid,
+            cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").payload_vout,
+            cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").out_value,
             &other_recv, // the attacker's own key
             NETWORK,
             live_csv, // TIES the live state ⟹ does NOT lose the race
@@ -209,7 +209,7 @@ pub async fn execute() -> Result<()> {
             &cc,
             &mut children[0].0,
             t.tx_hex.clone(),
-            cb.child_extension.out_value,
+            cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").out_value,
             NETWORK,
         )
         .await?;
@@ -318,7 +318,7 @@ pub async fn execute() -> Result<()> {
     use crate::sdk40_tesr_consensus::{broadcast, mine, tx_exists, wait_for_address};
     let mut chain: Vec<(String, Option<u16>)> =
         cb.parent.exit_tiers().iter().map(|t| (t.signed_tx.clone(), t.csv)).collect();
-    chain.push((cb.child_extension.signed_tx.clone(), cb.child_extension.csv));
+    chain.push((cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").signed_tx.clone(), cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").csv));
     chain.push((cb.child_state.signed_tx.clone(), cb.child_state.csv));
     let _ = broadcast(&cc, &chain[0].0)?; // trigger — no timelock, F is on-chain
     for (signed, csv) in &chain[1..] {

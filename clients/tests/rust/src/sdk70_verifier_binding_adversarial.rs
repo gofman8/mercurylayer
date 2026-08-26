@@ -623,7 +623,7 @@ pub async fn execute() -> Result<()> {
     //    ext_child's payload output". This is the `vout != 0` site on the child lane.
     {
         let mut d = cb.clone();
-        d.child_extension.payload_vout = 1;
+        d.child_extension.as_mut().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").payload_vout = 1;
         must_reject_child(
             &d,
             "D1 (child extension payload_vout=1 — the child state no longer chains to it)",
@@ -664,7 +664,7 @@ pub async fn execute() -> Result<()> {
     // ===== D4 — the genuinely KEYED census map, with the map ACTUALLY CONSULTED =====
     //
     // `verify_child_bundle` builds the child segment's race map as
-    //     child_live[(ext_child.txid, cb.child_extension.payload_vout)] = state_child's CSV
+    //     child_live[(ext_child.txid, cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").payload_vout)] = state_child's CSV
     // — the ONE census key derived from a DECLARED field rather than from transaction content
     // (CTESR-GATE §3.2). Nothing above reaches it: a rival has to EXIST for the map to be looked up at
     // all, and no structural tampering can manufacture one, because a disclosed superseded tier is only
@@ -689,9 +689,9 @@ pub async fn execute() -> Result<()> {
     };
     let live_child_csv = cb.child_state.csv.ok_or(anyhow!("live child state has no CSV"))?;
     let rival = mercurylib::tesr::build_state_from(
-        &cb.child_extension.txid,
-        cb.child_extension.payload_vout,
-        cb.child_extension.out_value,
+        &cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid,
+        cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").payload_vout,
+        cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").out_value,
         &attacker_addr,
         NETWORK,
         live_child_csv, // EQUAL to the live state's ⟹ it does not lose the race
@@ -701,7 +701,7 @@ pub async fn execute() -> Result<()> {
         &cc,
         &mut children[0].0,
         rival.tx_hex.clone(),
-        cb.child_extension.out_value,
+        cb.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").out_value,
         NETWORK,
     )
     .await?;
@@ -754,7 +754,7 @@ pub async fn execute() -> Result<()> {
     {
         let mut d = cb.clone();
         d.child_superseded_states.push(rival_tier.clone());
-        d.child_extension.payload_vout = 1;
+        d.child_extension.as_mut().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").payload_vout = 1;
         assert_named_reject(
             mercuryrustlib::tesr::verify_child_bundle(
                 &d,

@@ -349,8 +349,23 @@ pub struct ChildTesrBundle {
     pub child_statechain_id: String,
     /// The child receiver's own exit key (Model A: the final child state must pay THIS).
     pub child_owner_exit_address: String,
-    /// Child ladder: `child_extension` spends `SP.out[sp_vout]`; `child_state` spends its `out[0]`.
-    pub child_extension: TesrTier,
+    /// Child ladder. Two shapes, and the `Option` is which:
+    ///
+    /// * `Some(ext)` — a **two-rung PIECE**: `child_extension` spends `SP.out[sp_vout]` and
+    ///   `child_state` spends its `out[0]`. Every child was this until REQ-83.
+    /// * `None` — a **[REQ-83] one-rung THIN PIECE**: `child_state` is a single cap spending
+    ///   `SP.out[sp_vout]` directly. This is §6.0.3's second leaf band, for a leaf that can afford
+    ///   one rung but not two.
+    ///
+    /// **`None` must never be read as "not co-signed yet".** That conflation is the exact defect
+    /// [`SplitLegRole`] was introduced to prevent on the journal, where an absent extension already
+    /// meant "unfinished": a replay would co-sign a PHANTOM extension over the funding outpoint at
+    /// the piece schedule's CSV, out-racing the cap this very bundle names as the owner's exit. Here
+    /// the bundle is CONVEYED rather than resumed, so there is nothing to finish — but a verifier
+    /// that treated `None` as incomplete would refuse every thin piece, and one that fabricated the
+    /// missing rung would mint that rival. Both are refusals to think about the second shape.
+    #[serde(default)]
+    pub child_extension: Option<TesrTier>,
     pub child_state: TesrTier,
     #[serde(default)]
     pub child_superseded_states: Vec<TesrTier>,
@@ -457,6 +472,88 @@ impl ChildTesrBundle {
         (segment_funding_tier(&self.parent, &self.ancestors).txid.clone(), self.sp_vout)
     }
 
+    /// **[REQ-83] This child's OWN rungs, root-ward first** — the extension when it has one, then
+    /// the state.
+    ///
+    /// The one place the two leaf shapes are distinguished, so every other site can enumerate rungs
+    /// without asking which shape it holds. Deliberately the same idiom `ancestors` already uses for
+    /// a one-tier SPINE segment (`ChildSegment::extension: Option`), because a second way of
+    /// spelling "this segment has one rung" is a second thing to keep in agreement.
+    pub fn child_rungs(&self) -> Vec<&TesrTier> {
+        match self.child_extension.as_ref() {
+            Some(ext) => vec![ext, &self.child_state],
+            None => vec![&self.child_state],
+        }
+    }
+
+    /// **The outpoint this child's STATE spends, and what it is worth.**
+    ///
+    /// `(txid, vout, value)`. On a two-rung PIECE that is the child's own extension payload output.
+    /// On a [REQ-83] one-rung THIN PIECE the state is the only rung, so it spends `SP.out[sp_vout]`
+    /// directly — the same outpoint [`Self::funding_outpoint`] names.
+    ///
+    /// Every caller that rebuilds or replaces a child's state needs this, and each of them used to
+    /// read `child_extension` directly. That read is what makes a thin piece unrepresentable: there
+    /// is no extension to point at, and pointing at the state itself would build a tier spending its
+    /// own output.
+    pub fn child_state_prevout(&self) -> Result<(String, u32, u64)> {
+        let (txid, vout, value, _spk) = self.child_state_prevout_full()?;
+        Ok((txid, vout, value))
+    }
+
+    /// [`Self::child_state_prevout`] with the scriptPubKey as well — `(txid, vout, value, spk_hex)`.
+    ///
+    /// The coloured re-transfer lane needs the script too, and reading it from a second place would
+    /// be a second chance to disagree about which outpoint the state actually spends.
+    ///
+    /// **The stored transaction is checked against the txid the bundle names, on BOTH shapes.** The
+    /// two-rung path gets that from `tier_payload_prevout`; the thin path would not have it for free,
+    /// and a bundle whose `SP` hex hashes to something else would otherwise hand back a value and a
+    /// script belonging to a transaction nobody named.
+    pub fn child_state_prevout_full(&self) -> Result<(String, u32, u64, String)> {
+        if let Some(ext) = self.child_extension.as_ref() {
+            let (value, spk) = linked::tier_payload_prevout(ext, "child state prevout")?;
+            return Ok((ext.txid.clone(), ext.payload_vout, value, spk));
+        }
+        let sp_tier = segment_funding_tier(&self.parent, &self.ancestors);
+        let raw = hex::decode(&sp_tier.signed_tx)
+            .map_err(|_| anyhow::anyhow!("thin piece: its funding tier hex does not decode"))?;
+        let sp: electrum_client::bitcoin::Transaction =
+            electrum_client::bitcoin::consensus::deserialize(&raw)
+                .map_err(|_| anyhow::anyhow!("thin piece: its funding tier does not parse"))?;
+        if sp.txid().to_string() != sp_tier.txid {
+            return Err(anyhow::anyhow!(
+                "thin piece {}: its funding tier hashes to {} but the bundle names {}",
+                self.child_statechain_id,
+                sp.txid(),
+                sp_tier.txid
+            ));
+        }
+        let out = sp.output.get(self.sp_vout as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "thin piece {}: its funding transaction has no output {} to spend",
+                self.child_statechain_id,
+                self.sp_vout
+            )
+        })?;
+        Ok((
+            sp_tier.txid.clone(),
+            self.sp_vout,
+            out.value,
+            hex::encode(out.script_pubkey.as_bytes()),
+        ))
+    }
+
+    /// **[REQ-83] Whether this child is the one-rung THIN shape.**
+    ///
+    /// Named rather than open-coded as `child_extension.is_none()`, because that expression also
+    /// reads as "not co-signed yet" — the conflation [`SplitLegRole`] exists to prevent on the
+    /// journal, and the one that would have a verifier fabricate a rival tier over the funding
+    /// outpoint.
+    pub fn is_thin(&self) -> bool {
+        self.child_extension.is_none()
+    }
+
     /// The FULL off-chain witness list a coloured child's consignments must be resolved against, in
     /// leaf-ward order: the ancestor segment `T, X_m, SP` followed by the child's own two tiers.
     ///
@@ -489,8 +586,12 @@ impl ChildTesrBundle {
             let _ = i;
             v.push(seg.state.txid.clone());
         }
-        v.push(self.child_extension.txid.clone());
-        v.push(self.child_state.txid.clone());
+        // [REQ-83] The child's own rungs, however many it has — the same treatment the ancestor
+        // segments get two lines up. A thin piece contributes ONE, and hard-coding two here would
+        // pair every later tier with the wrong seal.
+        for t in self.child_rungs() {
+            v.push(t.txid.clone());
+        }
         Ok(v)
     }
 
@@ -617,12 +718,16 @@ impl ChildTesrBundle {
             }
         }
 
-        seals.push((
-            self.child_extension.txid.clone(),
-            self.child_extension.payload_vout,
-            colored_tier_seal(csid, TierRole::ChildExtension, 0, 0, self.child_extension.csv)
-                .blinding(),
-        ));
+        // [REQ-83] A seal per RUNG, and a thin piece has one. This list is read as a parallel array
+        // against `colored_child_txids`, so emitting an extension seal for a child that has no
+        // extension pairs every later tier with the wrong seal — silently.
+        if let Some(ext) = self.child_extension.as_ref() {
+            seals.push((
+                ext.txid.clone(),
+                ext.payload_vout,
+                colored_tier_seal(csid, TierRole::ChildExtension, 0, 0, ext.csv).blinding(),
+            ));
+        }
         seals.push((
             self.child_state.txid.clone(),
             self.child_state.payload_vout,
@@ -2969,7 +3074,7 @@ pub async fn cosign_colored_spine_batch(
             sp_vout: cd.sp_vout,
             child_statechain_id: child_sids[j].clone(),
             child_owner_exit_address: cd.owner_exit_address.clone(),
-            child_extension,
+            child_extension: Some(child_extension),
             child_state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -4301,7 +4406,7 @@ pub async fn cosign_colored_in_ladder_split(
             sp_vout: cd.sp_vout,
             child_statechain_id: child_sids[j].clone(),
             child_owner_exit_address: cd.owner_exit_address.clone(),
-            child_extension,
+            child_extension: Some(child_extension),
             child_state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -4767,7 +4872,7 @@ impl SplitJournalRecord {
             sp_vout: c.sp_vout,
             child_statechain_id: c.statechain_id.clone(),
             child_owner_exit_address: c.owner_exit_address.clone(),
-            child_extension: ext,
+            child_extension: Some(ext),
             child_state: st,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -5941,7 +6046,7 @@ pub async fn in_ladder_split(
             sp_vout: child_vout,
             child_statechain_id: child_sid,
             child_owner_exit_address: recipient.clone(),
-            child_extension: ladder.extension,
+            child_extension: Some(ladder.extension),
             child_state: ladder.state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -6492,7 +6597,7 @@ async fn spine_batch_split_ex(
             sp_vout: leg_vout,
             child_statechain_id: leg_sid,
             child_owner_exit_address: recipient.clone(),
-            child_extension: ladder.extension,
+            child_extension: Some(ladder.extension),
             child_state: ladder.state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -7248,8 +7353,10 @@ pub fn child_exit_chain(cb: &ChildTesrBundle) -> Vec<(String, Option<u16>)> {
         }
         chain.push((seg.state.signed_tx.clone(), seg.state.csv));
     }
-    chain.push((cb.child_extension.signed_tx.clone(), cb.child_extension.csv));
-    chain.push((cb.child_state.signed_tx.clone(), cb.child_state.csv));
+    // [REQ-83] However many rungs this child has — one for a thin piece, two for an ordinary one.
+    for t in cb.child_rungs() {
+        chain.push((t.signed_tx.clone(), t.csv));
+    }
     chain
 }
 
@@ -7877,6 +7984,20 @@ pub async fn child_in_ladder_split(
     conveyance: &[(String, String)],
 ) -> Result<Vec<ChildTesrBundle>> {
     refuse_uncolored_over_colored_child(cb, "child_in_ladder_split")?;
+    // **[REQ-83] A THIN piece cannot be split, and refusing here is the honest answer.** Its whole
+    // definition is that it could afford one rung and not two (§6.0.3's second band), so there is no
+    // value in it to carve grandchildren from that could clear any floor — `establish_child` would
+    // discover that AFTER `set_spend_budget` has terminalized this child, i.e. after the coin is
+    // gone. The grandchildren would also have to hang off the thin piece's cap, and that cap is the
+    // owner's exit rather than a split state.
+    let ext = cb.child_extension.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "child {} is a THIN piece (one rung, no extension) and cannot be split further: it was \
+             admitted at the one-rung floor precisely because it cannot fund two. Pay from it whole, \
+             or re-anchor it first.",
+            cb.child_statechain_id
+        )
+    })?;
     let p = cb.parent.params;
     let n = children.len();
     if n == 0 {
@@ -7913,7 +8034,7 @@ pub async fn child_in_ladder_split(
     let csp_csv = SPINE_CSV;
 
     // Value conservation: the grandchildren share the split total exactly (no mint, no burn).
-    let total = mercurylib::tesr::tier_out_total(cb.child_extension.out_value, n, cb.parent.fee_rate)
+    let total = mercurylib::tesr::tier_out_total(ext.out_value, n, cb.parent.fee_rate)
         .ok_or_else(|| anyhow::anyhow!("committed fee too high to split this child into {n}"))?;
     let sum: u64 = children.iter().map(|(_, _, v)| *v).sum();
     if sum != total {
@@ -7933,8 +8054,8 @@ pub async fn child_in_ladder_split(
         })
         .collect::<Result<_>>()?;
     let csp = mercurylib::tesr::build_split_state(
-        &cb.child_extension.txid,
-        cb.child_extension.out_value,
+        &ext.txid,
+        ext.out_value,
         &payees,
         &cb.parent.network,
         csp_csv,
@@ -8016,7 +8137,7 @@ pub async fn child_in_ladder_split(
         cc,
         child_coin,
         csp.tx_hex.clone(),
-        cb.child_extension.out_value,
+        ext.out_value,
         &cb.parent.network,
     )
     .await?;
@@ -8031,7 +8152,7 @@ pub async fn child_in_ladder_split(
         // A received PIECE is strictly two-tier — `ext_child` then `CSP` — so this segment is
         // `Some`. `None` is reserved for the sender's own spine tip, which is never conveyed and
         // never reaches this lane (see `ChildSegment::extension`).
-        extension: Some(cb.child_extension.clone()),
+        extension: Some(ext.clone()),
         state: TesrTier {
             txid: csp.txid.clone(),
             signed_tx: csp_signed,
@@ -8068,7 +8189,7 @@ pub async fn child_in_ladder_split(
             sp_vout: gc_vout,
             child_statechain_id: gc_sid,
             child_owner_exit_address: recipient.clone(),
-            child_extension: ladder.extension,
+            child_extension: Some(ladder.extension),
             child_state: ladder.state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -8130,12 +8251,15 @@ pub async fn child_retransfer(
         .ok_or_else(|| anyhow::anyhow!("child state has no CSV — cannot re-transfer"))?;
     let new_csv = child_supersede_csv(old_csv, &p, "re-transferring this child")?;
 
-    // The new state spends the SAME outpoint as the one it replaces: ext_child.out[0].
+    // The new state spends the SAME outpoint as the one it replaces — `ext_child.out[0]` on an
+    // ordinary piece, and [REQ-83] `SP.out[sp_vout]` on a THIN one, whose cap is its only rung. Read
+    // from one accessor so the two shapes cannot be described differently in the two lanes.
+    let (rt_prev_txid, rt_prev_vout, rt_prev_value) = cb.child_state_prevout()?;
     let payee = mercurylib::tesr::payee_address(recipient_address, &cb.parent.network)?;
     let st = mercurylib::tesr::build_state_from(
-        &cb.child_extension.txid,
-        cb.child_extension.payload_vout,
-        cb.child_extension.out_value,
+        &rt_prev_txid,
+        rt_prev_vout,
+        rt_prev_value,
         &payee,
         &cb.parent.network,
         new_csv,
@@ -8196,7 +8320,7 @@ pub async fn child_retransfer(
         cc,
         child_coin,
         st.tx_hex.clone(),
-        cb.child_extension.out_value,
+        rt_prev_value,
         &cb.parent.network,
     )
     .await?;
@@ -8340,8 +8464,11 @@ pub fn build_colored_child_retransfer(
             )
         })?;
 
-    let (parent_value, parent_spk) =
-        tier_payload_prevout(&cb.child_extension, "coloured child re-transfer parent")?;
+    // [REQ-83] What the child's state spends: its extension's payload output on an ordinary
+    // piece, `SP.out[sp_vout]` on a THIN one. The accessor validates the stored transaction against
+    // the txid the bundle names on BOTH shapes, which is what `tier_payload_prevout` used to give
+    // this lane for free.
+    let (ct_prev_txid, ct_prev_vout, parent_value, parent_spk) = cb.child_state_prevout_full()?;
     let s_value = colored_tier_out_value(parent_value, cb.parent.fee_rate).ok_or_else(|| {
         anyhow::anyhow!(
             "the child extension's payload output ({parent_value} sat) cannot carry another \
@@ -8361,8 +8488,8 @@ pub fn build_colored_child_retransfer(
         rgb,
         &ColoredTierSpec {
             contract_id: &rgb_half.contract_id,
-            prev_txid: &cb.child_extension.txid,
-            prev_vout: cb.child_extension.payload_vout,
+            prev_txid: &ct_prev_txid,
+            prev_vout: ct_prev_vout,
             prev_value: parent_value,
             prev_spk_hex: &parent_spk,
             sequence: mercurylib::tesr::csv_blocks(new_csv).0,
@@ -8378,8 +8505,8 @@ pub fn build_colored_child_retransfer(
         child_statechain_id: cb.child_statechain_id.clone(),
         payee,
         csv: new_csv,
-        parent_txid: cb.child_extension.txid.clone(),
-        parent_vout: cb.child_extension.payload_vout,
+        parent_txid: ct_prev_txid.clone(),
+        parent_vout: ct_prev_vout,
         parent_value,
         rgb_amount: rgb_half.amount,
         tier: ColoredTierDraft {
@@ -8410,6 +8537,9 @@ pub async fn cosign_colored_child_retransfer(
     draft: ColoredChildStateDraft,
     recipient_address: &str,
 ) -> Result<ChildTesrBundle> {
+    // [REQ-83] The same outpoint the draft's builder resolved — read here again from the bundle
+    // rather than trusted from the draft, which is the whole point of this check.
+    let (ct_prev_txid, ct_prev_vout, _ct_prev_value, _ct_prev_spk) = cb.child_state_prevout_full()?;
     let rgb_half = cb
         .rgb
         .clone()
@@ -8436,16 +8566,16 @@ pub async fn cosign_colored_child_retransfer(
             draft.payee
         ));
     }
-    if draft.parent_txid != cb.child_extension.txid
-        || draft.parent_vout != cb.child_extension.payload_vout
+    if draft.parent_txid != ct_prev_txid
+        || draft.parent_vout != ct_prev_vout
     {
         return Err(anyhow::anyhow!(
             "coloured child state draft spends {}:{} but the child extension's payload output is \
              {}:{}",
             draft.parent_txid,
             draft.parent_vout,
-            cb.child_extension.txid,
-            cb.child_extension.payload_vout
+            ct_prev_txid,
+            ct_prev_vout
         ));
     }
     let old_csv = cb
@@ -9431,10 +9561,13 @@ pub async fn reclaim_cancelled_child_conveyance(
         child_supersede_csv(old_csv, &p, &format!("reclaiming cancelled child {child_sid}"))?;
 
     let owner = mercurylib::tesr::payee_address(&rec.owner_exit_address, &cb.parent.network)?;
+    // [REQ-83] The outpoint the cancelled state spent — an extension payload on an ordinary piece,
+    // `SP.out[sp_vout]` on a thin one.
+    let (rc_prev_txid, rc_prev_vout, rc_prev_value) = cb.child_state_prevout()?;
     let st = mercurylib::tesr::build_state_from(
-        &cb.child_extension.txid,
-        cb.child_extension.payload_vout,
-        cb.child_extension.out_value,
+        &rc_prev_txid,
+        rc_prev_vout,
+        rc_prev_value,
         &owner,
         &cb.parent.network,
         new_csv,
@@ -9448,7 +9581,7 @@ pub async fn reclaim_cancelled_child_conveyance(
         cc,
         &mut c,
         st.tx_hex.clone(),
-        cb.child_extension.out_value,
+        rc_prev_value,
         &cb.parent.network,
     )
     .await?;
@@ -12526,50 +12659,6 @@ pub fn verify_child_bundle(
     //     each tier is verified against SP.out[j]'s key, not a sender-filled segment field).
     let child_agg_spk = sp_out.script_pubkey.clone();
 
-    // ext_child spends exactly SP.out[j], co-signed by A_child.
-    let ext_tx: Transaction = deserialize(
-        &hex::decode(&cb.child_extension.signed_tx).map_err(|_| anyhow::anyhow!("bad child ext hex"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
-    let ext_in = ext_tx.input.first().ok_or_else(|| anyhow::anyhow!("child ext has no input"))?;
-    if ext_tx.input.len() != 1 || ext_in.previous_output.txid != sp_txid || ext_in.previous_output.vout != cb.sp_vout {
-        return Err(anyhow::anyhow!("child extension does not spend SP.out[j]"));
-    }
-    verify_tier_cosigned(&ext_tx, sp_out.value, &child_agg_spk)
-        .map_err(|e| anyhow::anyhow!("child extension not co-signed by A_child: {e}"))?;
-    // [F4] child extension CSV: a valid BIP-68 block relative-timelock within the extension schedule.
-    {
-        let seq = ext_tx.input[0].sequence.0;
-        if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
-            return Err(anyhow::anyhow!("child extension: not a BIP-68 block relative-timelock"));
-        }
-        let (csv, p) = (seq as u16, cb.parent.params);
-        if csv < p.e_floor || csv > p.e0 {
-            return Err(anyhow::anyhow!("child extension CSV {csv} outside [{},{}]", p.e_floor, p.e0));
-        }
-        // **[D38/R13] AND ON THE GRID, not merely in the band.** An honest renewal steps by exactly
-        // `δE`, so `e0 − m·δE` (or the floor clamp) are the only values any builder in this design
-        // emits. Admitting anything in the band admits a state the specification does not define,
-        // chosen by the SENDER at 1-block granularity where the design's own granularity is `δE` —
-        // and CSV granularity is what the D14 supersession margin is denominated in.
-        if !p.is_on_ext_grid(csv) {
-            return Err(anyhow::anyhow!(
-                "child extension CSV {csv} is inside [{},{}] but OFF the schedule's grid (e0 {} \
-                 stepping by δE {}). No honest renewal produces it: `ext_csv` emits e0 − m·δE or the \
-                 floor. A value between two rungs is a state this design does not define, and the \
-                 sender chose it.",
-                p.e_floor, p.e0, p.e0, p.delta_e
-            ));
-        }
-        // [B1] the declared field is the signed one, or the bundle is refused.
-        mercurylib::transfer::receiver::bind_declared_csv(
-            0,
-            "child extension",
-            cb.child_extension.csv,
-            Some(csv),
-        )?;
-    }
-
     // ═══ [VALUE-CONSERVATION] EVERY TIER MUST FORWARD ITS FUNDING MINUS EXACTLY ONE RUNG ═══
     //
     // THE DEFECT this closes, demonstrated against this very function rather than argued: a sender
@@ -12634,92 +12723,198 @@ pub fn verify_child_bundle(
     if st_tx.input.is_empty() {
         return Err(anyhow::anyhow!("child state has no input"));
     }
-    // state_child spends ext_child's PAYLOAD output — PIN 1, and the ONLY door to `ext_out0`.
+    // ═══ [REQ-83] TWO LEAF SHAPES, AND THE VERIFIER MUST KNOW BOTH ═══════════════════════════
     //
-    // This binding used to sit ~70 lines above, before `st_tx` was even parsed, and every value check
-    // below it read the payload at the DECLARED `payload_vout`. On a bundle whose vout is tampered
-    // they computed on the P2A anchor and refused on VALUE, shadowing the accurate structural cause
-    // that this very check states (sdk70 D1 pins that message). The fix was a comment saying "all of
-    // them must sit BELOW the structural check" — and then one check was moved and its two
-    // neighbours were left behind. Now the structural check MAKES the value: there is no `ext_out0`
-    // until `link_child` has returned one, so the ordering cannot be got wrong again.
-    let ext_out0 = cb.child_extension.link_child(
-        &ext_tx,
-        &st_tx,
-        "child extension",
-        "child state does not spend ext_child's payload output",
-    )?;
+    // §6.0.3's second band is a leaf that can fund ONE rung and not two. Its state is its only rung
+    // and spends `SP.out[sp_vout]` directly; an ordinary piece's state spends its extension's
+    // payload output. What both shapes must establish is identical and is what the state's
+    // co-signature is checked against: **the value and the key of the outpoint the state spends.**
+    //
+    // Branching here rather than at each check is deliberate. The alternative — treating `None` as
+    // "extension not present yet" and skipping the checks — is the conflation `SplitLegRole` exists
+    // to prevent: on the journal it produced a PHANTOM extension over the funding outpoint at the
+    // piece schedule's CSV, out-racing the very cap the bundle names as the owner's exit. A verifier
+    // has no business inventing a rung, and equally none refusing a shape the design defines.
+    let (st_prev_value, st_prev_spk, ext_signed_csv, ext_tx_opt) =
+    if let Some(ext_rec) = cb.child_extension.as_ref() {
+        // ext_child spends exactly SP.out[j], co-signed by A_child.
+        let ext_tx: Transaction = deserialize(
+            &hex::decode(&ext_rec.signed_tx).map_err(|_| anyhow::anyhow!("bad child ext hex"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
+        let ext_in = ext_tx.input.first().ok_or_else(|| anyhow::anyhow!("child ext has no input"))?;
+        if ext_tx.input.len() != 1 || ext_in.previous_output.txid != sp_txid || ext_in.previous_output.vout != cb.sp_vout {
+            return Err(anyhow::anyhow!("child extension does not spend SP.out[j]"));
+        }
+        verify_tier_cosigned(&ext_tx, sp_out.value, &child_agg_spk)
+            .map_err(|e| anyhow::anyhow!("child extension not co-signed by A_child: {e}"))?;
+        // [F4] child extension CSV: a valid BIP-68 block relative-timelock within the extension schedule.
+        {
+            let seq = ext_tx.input[0].sequence.0;
+            if seq & (1 << 31) != 0 || seq & (1 << 22) != 0 {
+                return Err(anyhow::anyhow!("child extension: not a BIP-68 block relative-timelock"));
+            }
+            let (csv, p) = (seq as u16, cb.parent.params);
+            if csv < p.e_floor || csv > p.e0 {
+                return Err(anyhow::anyhow!("child extension CSV {csv} outside [{},{}]", p.e_floor, p.e0));
+            }
+            // **[D38/R13] AND ON THE GRID, not merely in the band.** An honest renewal steps by exactly
+            // `δE`, so `e0 − m·δE` (or the floor clamp) are the only values any builder in this design
+            // emits. Admitting anything in the band admits a state the specification does not define,
+            // chosen by the SENDER at 1-block granularity where the design's own granularity is `δE` —
+            // and CSV granularity is what the D14 supersession margin is denominated in.
+            if !p.is_on_ext_grid(csv) {
+                return Err(anyhow::anyhow!(
+                    "child extension CSV {csv} is inside [{},{}] but OFF the schedule's grid (e0 {} \
+                     stepping by δE {}). No honest renewal produces it: `ext_csv` emits e0 − m·δE or the \
+                     floor. A value between two rungs is a state this design does not define, and the \
+                     sender chose it.",
+                    p.e_floor, p.e0, p.e0, p.delta_e
+                ));
+            }
+            // [B1] the declared field is the signed one, or the bundle is refused.
+            mercurylib::transfer::receiver::bind_declared_csv(
+                0,
+                "child extension",
+                ext_rec.csv,
+                Some(csv),
+            )?;
+        }
 
-    let expect_ext = rung_forward(sp_out.value, "child extension")?;
-    // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, not just
-    // `out[payload_vout]`: pinning one output leaves a window exactly one committed fee wide for a
-    // second output to carry value out of the chain.
-    let ext_payload_total: u64 = ext_tx
-        .output
-        .iter()
-        .filter(|o| {
-            o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
-                && !o.script_pubkey.is_op_return()
-        })
-        .map(|o| o.value)
-        .sum();
-    if ext_payload_total != expect_ext {
-        return Err(anyhow::anyhow!(
-            "child extension is funded with {} sat but its payload outputs carry {ext_payload_total} \
-             (expected exactly {expect_ext}) — the difference would leave the exit chain",
-            sp_out.value
-        ));
-    }
-    // [DUST] AFTER the Σ law, BEFORE the per-output one is immaterial to correctness but this order
-    // keeps the more specific skim diagnostic first on a tier that is both skimmed and poisoned. The
-    // shape that survives every law on this lane is a ZERO-VALUE appended output: Σ-neutral by
-    // construction, and `out[payload_vout]` is left exactly right.
-    refuse_dust_payloads(&ext_tx, "child extension")?;
-    // [ANCHOR] The anchor bound on this lane too. The OPRET count is NOT bound here: check [7] at the
-    // end of this function runs `verify_colored_child_shape`, which counts oprets on exactly this tier
-    // against the child's own colour, and duplicating it above would shadow its colour-mismatch
-    // diagnostic — the more specific of the two — on every mis-declared bundle.
-    bind_single_p2a_anchor(&ext_tx, "child extension")?;
-    if ext_out0.value() != expect_ext {
-        return Err(anyhow::anyhow!(
-            "child extension is funded with {} sat but forwards only {} to its payload output \
-             (expected exactly {expect_ext} = funding − one rung at {} sat/vB) — {} sat would be \
-             skimmed to another output while the receiver is credited the funding value",
-            sp_out.value,
-            ext_out0.value(),
-            cb.parent.fee_rate,
-            sp_out.value.saturating_sub(ext_out0.value() + (sp_out.value - expect_ext)),
-        ));
-    }
+        // state_child spends ext_child's PAYLOAD output — PIN 1, and the ONLY door to `ext_out0`.
+        //
+        // This binding used to sit ~70 lines above, before `st_tx` was even parsed, and every value check
+        // below it read the payload at the DECLARED `payload_vout`. On a bundle whose vout is tampered
+        // they computed on the P2A anchor and refused on VALUE, shadowing the accurate structural cause
+        // that this very check states (sdk70 D1 pins that message). The fix was a comment saying "all of
+        // them must sit BELOW the structural check" — and then one check was moved and its two
+        // neighbours were left behind. Now the structural check MAKES the value: there is no `ext_out0`
+        // until `link_child` has returned one, so the ordering cannot be got wrong again.
+        let ext_out0 = ext_rec.link_child(
+            &ext_tx,
+            &st_tx,
+            "child extension",
+            "child state does not spend ext_child's payload output",
+        )?;
 
-    // The DECLARED field too, symmetrically with the state's `[value-gate spoof]` check below. The
-    // conservation law above pins the SIGNED value; this pins the field that travels beside it, and
-    // they are different properties. `child_in_ladder_split` later feeds `cb.child_extension
-    // .out_value` to `tier_out_total` and to `cosign_tier` as a prevout amount, so a field that
-    // disagrees with its own transaction makes the receiver's OWN next split sign against a sighash
-    // committing to an amount the transaction does not carry — a signature that verifies against
-    // nothing, discovered only after `set_spend_budget` has terminalized the coin.
-    if ext_out0.value() != cb.child_extension.out_value {
-        return Err(anyhow::anyhow!(
-            "child extension out[{}] carries {} sat but the bundle declares out_value {} — the \
-             declared value is what later splits of this child would compute and sign against",
-            cb.child_extension.payload_vout,
-            ext_out0.value(),
-            cb.child_extension.out_value
-        ));
-    }
-    // WHERE IT PAYS — the leaf's copy of the ancestor check above, and load-bearing for the same
-    // reason: `child_state`'s co-sign is verified against a prevout SYNTHESISED as
-    // `TxOut { value: ext_out0.value, script_pubkey: child_agg_spk }`. If the real payload output
-    // pays another key, the state is signed against a prevout that does not exist — unbroadcastable
-    // forever, while whoever holds the real key sweeps the child once the extension confirms.
-    if ext_out0.script_pubkey() != &child_agg_spk {
-        return Err(anyhow::anyhow!(
-            "child extension's payload output does not pay A_child — the child state below it would \
-             be signed against a prevout that does not exist"
-        ));
-    }
-    verify_tier_cosigned(&st_tx, ext_out0.value(), &child_agg_spk)
+        let expect_ext = rung_forward(sp_out.value, "child extension")?;
+        // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, not just
+        // `out[payload_vout]`: pinning one output leaves a window exactly one committed fee wide for a
+        // second output to carry value out of the chain.
+        let ext_payload_total: u64 = ext_tx
+            .output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum();
+        if ext_payload_total != expect_ext {
+            return Err(anyhow::anyhow!(
+                "child extension is funded with {} sat but its payload outputs carry {ext_payload_total} \
+                 (expected exactly {expect_ext}) — the difference would leave the exit chain",
+                sp_out.value
+            ));
+        }
+        // [DUST] AFTER the Σ law, BEFORE the per-output one is immaterial to correctness but this order
+        // keeps the more specific skim diagnostic first on a tier that is both skimmed and poisoned. The
+        // shape that survives every law on this lane is a ZERO-VALUE appended output: Σ-neutral by
+        // construction, and `out[payload_vout]` is left exactly right.
+        refuse_dust_payloads(&ext_tx, "child extension")?;
+        // [ANCHOR] The anchor bound on this lane too. The OPRET count is NOT bound here: check [7] at the
+        // end of this function runs `verify_colored_child_shape`, which counts oprets on exactly this tier
+        // against the child's own colour, and duplicating it above would shadow its colour-mismatch
+        // diagnostic — the more specific of the two — on every mis-declared bundle.
+        bind_single_p2a_anchor(&ext_tx, "child extension")?;
+        if ext_out0.value() != expect_ext {
+            return Err(anyhow::anyhow!(
+                "child extension is funded with {} sat but forwards only {} to its payload output \
+                 (expected exactly {expect_ext} = funding − one rung at {} sat/vB) — {} sat would be \
+                 skimmed to another output while the receiver is credited the funding value",
+                sp_out.value,
+                ext_out0.value(),
+                cb.parent.fee_rate,
+                sp_out.value.saturating_sub(ext_out0.value() + (sp_out.value - expect_ext)),
+            ));
+        }
+
+        // The DECLARED field too, symmetrically with the state's `[value-gate spoof]` check below. The
+        // conservation law above pins the SIGNED value; this pins the field that travels beside it, and
+        // they are different properties. `child_in_ladder_split` later feeds `cb.child_extension
+        // .out_value` to `tier_out_total` and to `cosign_tier` as a prevout amount, so a field that
+        // disagrees with its own transaction makes the receiver's OWN next split sign against a sighash
+        // committing to an amount the transaction does not carry — a signature that verifies against
+        // nothing, discovered only after `set_spend_budget` has terminalized the coin.
+        if ext_out0.value() != ext_rec.out_value {
+            return Err(anyhow::anyhow!(
+                "child extension out[{}] carries {} sat but the bundle declares out_value {} — the \
+                 declared value is what later splits of this child would compute and sign against",
+                ext_rec.payload_vout,
+                ext_out0.value(),
+                ext_rec.out_value
+            ));
+        }
+        // WHERE IT PAYS — the leaf's copy of the ancestor check above, and load-bearing for the same
+        // reason: `child_state`'s co-sign is verified against a prevout SYNTHESISED as
+        // `TxOut { value: ext_out0.value, script_pubkey: child_agg_spk }`. If the real payload output
+        // pays another key, the state is signed against a prevout that does not exist — unbroadcastable
+        // forever, while whoever holds the real key sweeps the child once the extension confirms.
+        if ext_out0.script_pubkey() != &child_agg_spk {
+            return Err(anyhow::anyhow!(
+                "child extension's payload output does not pay A_child — the child state below it would \
+                 be signed against a prevout that does not exist"
+            ));
+        }
+        let e_csv = ext_tx.input[0].sequence.0 as u16;
+        (ext_out0.value(), ext_out0.script_pubkey().clone(), Some(e_csv), Some(ext_tx))
+    } else {
+        // ── THIN PIECE: the state IS the ladder. ────────────────────────────────────────────────
+        //
+        // Every law the two-rung path applies to the extension applies here to the state, against
+        // `SP.out[sp_vout]` instead: it must spend exactly that outpoint, and it must forward its
+        // funding minus exactly ONE rung with nothing else leaving. The CSV band and grid are
+        // checked below, where they are checked for both shapes — a thin piece's rung is a STATE, so
+        // it belongs to the state schedule, not the extension's.
+        let st_in = st_tx
+            .input
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("thin child state has no input"))?;
+        if st_tx.input.len() != 1
+            || st_in.previous_output.txid != sp_txid
+            || st_in.previous_output.vout != cb.sp_vout
+        {
+            return Err(anyhow::anyhow!(
+                "thin child state does not spend SP.out[{}] — a one-rung piece has no extension to \
+                 hang off, so its cap must spend the funding outpoint itself",
+                cb.sp_vout
+            ));
+        }
+        // THAT NOTHING ELSE LEAVES. Summed over every non-anchor, non-opret output, exactly as the
+        // two-rung path sums the extension's: pinning one output leaves a window one committed fee
+        // wide for a second output to carry value out of the chain, and that is the theft this law
+        // was written for.
+        let expect_thin = rung_forward(sp_out.value, "thin child state")?;
+        let thin_payload_total: u64 = st_tx
+            .output
+            .iter()
+            .filter(|o| {
+                o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                    && !o.script_pubkey.is_op_return()
+            })
+            .map(|o| o.value)
+            .sum();
+        if thin_payload_total != expect_thin {
+            return Err(anyhow::anyhow!(
+                "thin child state forwards {thin_payload_total} sat out of a {} sat funding output, \
+                 but exactly one rung of committed fee leaves {expect_thin}. A one-rung piece \
+                 conserves value under the same law as a two-rung one.",
+                sp_out.value
+            ));
+        }
+        (sp_out.value, child_agg_spk.clone(), None, None)
+    };
+    verify_tier_cosigned(&st_tx, st_prev_value, &st_prev_spk)
         .map_err(|e| anyhow::anyhow!("child state not co-signed by A_child: {e}"))?;
     // [F4] child state CSV: a valid BIP-68 block relative-timelock within the state schedule.
     {
@@ -12777,9 +12972,12 @@ pub fn verify_child_bundle(
         // The SIGNED values, from the same `nSequence` the two blocks above bound the declared
         // fields against — never `TesrTier::csv`, which is a plain serde field on conveyed material.
         let p = cb.parent.params;
-        let e_c = ext_tx.input[0].sequence.0 as u16;
         let d_c = st_tx.input[0].sequence.0 as u16;
-        {
+        // [REQ-83] A THIN piece has no extension, so there is no extension budget it could have
+        // spent and nothing to compare against the head. Its state check below is the whole
+        // fresh-mint test — which is exactly right: one rung, one schedule, one thing to have
+        // spent. Skipping it here is not a weakened check on that shape; there is no such rung.
+        if let Some(e_c) = ext_signed_csv {
             if e_c != p.e0 {
                 return Err(anyhow::anyhow!(
                     "[D48] this child discloses NO superseded tiers, so it is a FRESH MINT — but its                      extension CSV is {e_c}, not the schedule head e0 {}. A fresh child has spent no                      renewals, so anything below the head is budget the sender took before handing                      it over: {} of the {} renewals on this level are already gone. (A renewed leaf                      would disclose superseded EXTENSIONS and a re-transferred one superseded                      STATES; disclosing neither is what makes this case exact.)",
@@ -12839,13 +13037,13 @@ pub fn verify_child_bundle(
     // moving it one tier down works identically — an extension that forwards the full amount and a
     // state that pays the payee 510 while sending the rest to a second output is the same theft with
     // the same receiver-side booking.
-    let expect_state = rung_forward(ext_out0.value(), "child state")?;
+    let expect_state = rung_forward(st_prev_value, "child state")?;
     if st_out0.value() != expect_state {
         return Err(anyhow::anyhow!(
             "child state is funded with {} sat but pays the receiver only {} \
              (expected exactly {expect_state} = funding − one rung at {} sat/vB) — the remainder \
              would leave the receiver's exit chain entirely",
-            ext_out0.value(),
+            st_prev_value,
             st_out0.value(),
             cb.parent.fee_rate,
         ));
@@ -12873,7 +13071,7 @@ pub fn verify_child_bundle(
             "child state is funded with {} sat but its payload outputs carry {st_payload_total} \
              (expected exactly {expect_state}) — a surplus output makes the tier unbroadcastable and \
              strands the child, while the receiver is credited the funding value",
-            ext_out0.value()
+            st_prev_value
         ));
     }
     // [DUST] The last tier before the money is the receiver's. Two shapes reach here past everything
@@ -12898,7 +13096,10 @@ pub fn verify_child_bundle(
         let mut child_prevouts: std::collections::HashMap<(_Txid, u32), u64> =
             std::collections::HashMap::new();
         child_prevouts.insert((sp_txid, cb.sp_vout), sp_out.value);
-        for tx in [&ext_tx, &st_tx] {
+        // [REQ-83] Whichever rungs this child HAS. A thin piece contributes one; iterating a fixed
+        // pair would need a transaction that does not exist, and inventing one here would seed the
+        // rival map with an outpoint no signature covers.
+        for tx in ext_tx_opt.iter().chain(std::iter::once(&st_tx)) {
             let id = tx.txid();
             for (vout, o) in tx.output.iter().enumerate() {
                 child_prevouts.insert((id, vout as u32), o.value);
@@ -12908,16 +13109,36 @@ pub fn verify_child_bundle(
             std::collections::HashMap::new();
         // Same rule as the ancestor segment: the KEYED census map must track the payload vout of the
         // tier it describes, or a rival would be raced against the wrong live CSV (CTESR-GATE §3.2).
-        child_live.insert(
-            (sp_txid, cb.sp_vout),
-            LiveRival::read(&ext_tx, &child_prevouts, "the child's live extension", RivalKind::Extension)?,
-        );
-        child_live.insert(
-            (ext_tx.txid(), cb.child_extension.payload_vout),
-            LiveRival::read(&st_tx, &child_prevouts, "the child's live state", RivalKind::State)?,
-        );
-        let child_live_ids: std::collections::HashSet<_Txid> =
-            [ext_tx.txid(), st_tx.txid()].into_iter().collect();
+        //
+        // [REQ-83] WHICH TIER GUARDS `SP.out[j]` DEPENDS ON THE SHAPE, and getting it wrong is not a
+        // cosmetic mis-labelling: the census races each disclosed rival against the LIVE tier over
+        // the same outpoint, so naming the wrong live tier measures a rival against the wrong CSV.
+        // On an ordinary piece the extension guards the funding outpoint and the state guards the
+        // extension's payload. On a THIN piece the state IS the only rung, so it guards the funding
+        // outpoint and there is no second outpoint to guard.
+        let child_live_ids: std::collections::HashSet<_Txid> = match (
+            ext_tx_opt.as_ref(),
+            cb.child_extension.as_ref(),
+        ) {
+            (Some(ext_tx), Some(ext_rec)) => {
+                child_live.insert(
+                    (sp_txid, cb.sp_vout),
+                    LiveRival::read(ext_tx, &child_prevouts, "the child's live extension", RivalKind::Extension)?,
+                );
+                child_live.insert(
+                    (ext_tx.txid(), ext_rec.payload_vout),
+                    LiveRival::read(&st_tx, &child_prevouts, "the child's live state", RivalKind::State)?,
+                );
+                [ext_tx.txid(), st_tx.txid()].into_iter().collect()
+            }
+            _ => {
+                child_live.insert(
+                    (sp_txid, cb.sp_vout),
+                    LiveRival::read(&st_tx, &child_prevouts, "the thin child's live state", RivalKind::State)?,
+                );
+                [st_tx.txid()].into_iter().collect()
+            }
+        };
         verify_superseded_segment(
             &cb.child_superseded_states,
             &cb.child_superseded_extensions,
@@ -12973,8 +13194,13 @@ fn verify_colored_child_shape(cb: &ChildTesrBundle) -> Result<()> {
         ));
     }
 
-    // Both child tiers, checked for the opret shape either way round.
-    let tiers = [("child_extension", &cb.child_extension), ("child_state", &cb.child_state)];
+    // [REQ-83] Every rung this child HAS, checked for the opret shape either way round — two on an
+    // ordinary piece, one on a thin one.
+    let mut tiers: Vec<(&str, &TesrTier)> = Vec::with_capacity(2);
+    if let Some(ext) = cb.child_extension.as_ref() {
+        tiers.push(("child_extension", ext));
+    }
+    tiers.push(("child_state", &cb.child_state));
     for (name, tier) in tiers {
         let raw = hex::decode(&tier.signed_tx)
             .map_err(|_| anyhow::anyhow!("{name}: hex does not decode"))?;
@@ -13438,7 +13664,7 @@ fn verify_child_bundle() {
                 "hand-rolled index — the escape the type cannot see",
                 r#"
 fn verify_child_bundle() {
-    let out = ext_tx.output[cb.child_extension.payload_vout as usize].clone();
+    let out = ext_tx.output[cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").payload_vout as usize].clone();
 }
 "#,
             ),
@@ -13480,7 +13706,7 @@ fn verify_bundle_ex() {
     if tx.input[0].previous_output.vout != tiers[i - 1].payload_vout {
         return Err(anyhow::anyhow!("no"));
     }
-    live.insert((ext_tx.txid(), cb.child_extension.payload_vout), seq);
+    live.insert((ext_tx.txid(), cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").payload_vout), seq);
 }
 "#;
         let hits = unlinked_payload_reads(body);
@@ -13537,7 +13763,7 @@ mod verify_tests {
             sp_vout: 0,
             child_statechain_id: "child-sid".into(),
             child_owner_exit_address: OWNER.into(),
-            child_extension: lvl.extension,
+            child_extension: Some(lvl.extension),
             child_state: lvl.state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -15803,7 +16029,7 @@ mod spine_tip_tests {
             );
             // Its extension spends THAT output, and its state spends its own extension. Both read
             // off the transactions, which is what the SE's sighash actually commits to.
-            let ext_tx = parse(&piece.child_extension.signed_tx);
+            let ext_tx = parse(&piece.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
             assert_eq!(ext_tx.input[0].previous_output.txid.to_string(), sp.txid);
             assert_eq!(
                 ext_tx.input[0].previous_output.vout,
@@ -15865,7 +16091,7 @@ mod spine_tip_tests {
         // The pieces' own tier txids are all distinct — K names, K coins.
         let leaf_txids: std::collections::HashSet<String> = pieces
             .iter()
-            .flat_map(|c| [c.child_extension.txid.clone(), c.child_state.txid.clone()])
+            .flat_map(|c| [c.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").txid.clone(), c.child_state.txid.clone()])
             .collect();
         assert_eq!(leaf_txids.len(), 2 * K, "K pieces own 2K distinct tiers");
 
@@ -16970,7 +17196,7 @@ mod skim_leaf_attack_tests {
                 sp_vout: 0,
                 child_statechain_id: "child-sid".into(),
                 child_owner_exit_address: self.receiver.address.clone(),
-                child_extension: tier(&xc_tx, Some(ext_csv), xc.payload_vout),
+                child_extension: Some(tier(&xc_tx, Some(ext_csv), xc.payload_vout)),
                 child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
                 child_superseded_states: vec![],
                 child_superseded_extensions: vec![],
@@ -17021,11 +17247,11 @@ mod skim_leaf_attack_tests {
     fn assert_still_genuinely_cosigned(cb: &ChildTesrBundle, rig: &Rig) {
         let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
         let funding = sp.output[cb.sp_vout as usize].value;
-        let ext: Transaction = parse(&cb.child_extension.signed_tx);
+        let ext: Transaction = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         verify_tier_cosigned(&ext, funding, &rig.child.spk)
             .expect("the blind SE really does co-sign this tier — the skim is not a forgery");
         let st: Transaction = parse(&cb.child_state.signed_tx);
-        verify_tier_cosigned(&st, ext.output[cb.child_extension.payload_vout as usize].value, &rig.child.spk)
+        verify_tier_cosigned(&st, ext.output[cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").payload_vout as usize].value, &rig.child.spk)
             .expect("and so is the state below it");
     }
 
@@ -17068,7 +17294,7 @@ mod skim_leaf_attack_tests {
         let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
         let slot = sp.output[0].value;
         assert_eq!(slot, F_VALUE - 3 * rung, "the child's slot on SP");
-        assert_eq!(cb.child_extension.out_value, slot - rung, "the extension forwards one rung less");
+        assert_eq!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, slot - rung, "the extension forwards one rung less");
         assert_eq!(
             cb.child_state.out_value,
             slot - 2 * rung,
@@ -17107,7 +17333,7 @@ mod skim_leaf_attack_tests {
         let stale = rig.child_bundle(Skim::StaleFreshMint);
         // NON-VACUITY: the CSV really is on the grid, so the grid law cannot be what refuses it.
         let p = stale.parent.params;
-        let ext_csv = parse(&stale.child_extension.signed_tx).input[0].sequence.0 as u16;
+        let ext_csv = parse(&stale.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx).input[0].sequence.0 as u16;
         assert!(
             p.is_on_ext_grid(ext_csv),
             "the probe must sit ON the grid ({ext_csv}), or this test is re-proving option (A)"
@@ -17136,21 +17362,21 @@ mod skim_leaf_attack_tests {
         let cb = rig.child_bundle(Skim::ExtensionGreedy);
 
         // The theft is real and everything else about the bundle is honest.
-        assert_eq!(cb.child_extension.out_value, 1_000, "only 1 000 sat is forwarded");
+        assert_eq!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, 1_000, "only 1 000 sat is forwarded");
         assert_eq!(
             cb.child_state.out_value,
             1_000 - (mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE),
             "…so one rung less is all the payee can ever reach"
         );
-        let ext: Transaction = parse(&cb.child_extension.signed_tx);
+        let ext: Transaction = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         assert_eq!(ext.output.len(), 3, "payload + P2A anchor + the sender's second output");
         assert_eq!(
             ext.output[2].script_pubkey, rig.sender.spk,
             "the skimmed value goes back to the SENDER"
         );
         assert_eq!(
-            ext.output[cb.child_extension.payload_vout as usize].value,
-            cb.child_extension.out_value,
+            ext.output[cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").payload_vout as usize].value,
+            cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value,
             "the declared value is HONEST — the lie is in the output vector"
         );
         assert_still_genuinely_cosigned(&cb, &rig);
@@ -17175,7 +17401,7 @@ mod skim_leaf_attack_tests {
         let rig = rig();
         let cb = rig.child_bundle(Skim::ExtensionFeeNeutral);
 
-        let ext: Transaction = parse(&cb.child_extension.signed_tx);
+        let ext: Transaction = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         let payload_total: u64 = ext
             .output
             .iter()
@@ -17193,7 +17419,7 @@ mod skim_leaf_attack_tests {
             "Σ over the payload outputs is EXACTLY what the conservation law expects — the sum \
              check alone cannot see this attack"
         );
-        assert_eq!(cb.child_extension.out_value, 1_000, "yet only 1 000 sat continues down the chain");
+        assert_eq!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, 1_000, "yet only 1 000 sat continues down the chain");
         assert_still_genuinely_cosigned(&cb, &rig);
 
         let e = verify(&cb, &rig.facts()).expect_err("a sum-neutral skim must be REFUSED");
@@ -17218,7 +17444,7 @@ mod skim_leaf_attack_tests {
         let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
         let slot = sp.output[0].value;
         assert_eq!(
-            cb.child_extension.out_value,
+            cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value,
             mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
             "the extension hop is HONEST — the skim is entirely in the state"
         );
@@ -18234,7 +18460,7 @@ mod forged_yardstick_attack_tests {
                 sp_vout: 0,
                 child_statechain_id: CHILD_SID.into(),
                 child_owner_exit_address: self.receiver.address.clone(),
-                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_extension: Some(tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout)),
                 child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
                 child_superseded_states: vec![],
                 child_superseded_extensions: vec![],
@@ -18305,13 +18531,13 @@ mod forged_yardstick_attack_tests {
     fn assert_child_genuinely_cosigned(cb: &ChildTesrBundle, rig: &Rig) {
         let sp = parse(&cb.parent.current().state.signed_tx);
         let funding = sp.output[cb.sp_vout as usize].value;
-        let ext = parse(&cb.child_extension.signed_tx);
+        let ext = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         verify_tier_cosigned(&ext, funding, &rig.child.spk)
             .expect("the child extension really is co-signed by A_child");
         let st = parse(&cb.child_state.signed_tx);
         verify_tier_cosigned(
             &st,
-            ext.output[cb.child_extension.payload_vout as usize].value,
+            ext.output[cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").payload_vout as usize].value,
             &rig.child.spk,
         )
         .expect("and so is the child state below it");
@@ -18791,7 +19017,7 @@ mod forged_yardstick_attack_tests {
         assert_eq!(2 * FORGED_CHILD_RUNG, 175_480);
         assert_child_genuinely_cosigned(&cb, &rig);
         // Every tier is the honest two-output shape; there is nothing structural to catch.
-        for t in [&cb.child_extension, &cb.child_state] {
+        for t in [cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension"), &cb.child_state] {
             let tx = parse(&t.signed_tx);
             assert_eq!(tx.output.len(), 2);
             assert_eq!(tx.output[t.payload_vout as usize].value, t.out_value);
@@ -19328,7 +19554,7 @@ mod wrong_payee_attack_tests {
                 sp_vout: 0,
                 child_statechain_id: "child-sid".into(),
                 child_owner_exit_address: self.receiver.address.clone(),
-                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_extension: Some(tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout)),
                 child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
                 child_superseded_states: vec![],
                 child_superseded_extensions: vec![],
@@ -19481,7 +19707,7 @@ mod wrong_payee_attack_tests {
         let csp: Transaction = parse(&cb.ancestors[0].state.signed_tx);
         assert_eq!(csp.output[0].value, slot - 2 * rung, "the leaf's slot on CSP");
         assert_eq!(csp.output[0].script_pubkey, rig.child.spk, "…paying A_child");
-        assert_eq!(cb.child_extension.out_value, slot - 3 * rung);
+        assert_eq!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, slot - 3 * rung);
         assert_eq!(cb.child_state.out_value, slot - 4 * rung);
 
         verify(&cb, &facts).expect("an honest, fully co-signed two-deep child bundle must be ACCEPTED");
@@ -19496,7 +19722,7 @@ mod wrong_payee_attack_tests {
         assert!(cb.ancestors.is_empty(), "depth 1: SP funds the leaf directly");
         let rung = mercurylib::tesr::committed_fee(rig.rate) + mercurylib::tesr::P2A_VALUE;
         let slot = F_VALUE - 3 * rung;
-        assert_eq!(cb.child_extension.out_value, slot - rung);
+        assert_eq!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, slot - rung);
         assert_eq!(cb.child_state.out_value, slot - 2 * rung);
         verify(&cb, &facts).expect("an honest depth-1 child bundle must be ACCEPTED");
     }
@@ -19616,11 +19842,11 @@ mod wrong_payee_attack_tests {
 
         let sp: Transaction = parse(&cb.parent.current().state.signed_tx);
         let funding = sp.output[0].value;
-        let xc: Transaction = parse(&cb.child_extension.signed_tx);
+        let xc: Transaction = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         let (got, expect) = payload_sum_and_expectation(&xc, funding, rig.rate);
         assert_eq!(got, expect, "the leaf extension conserves exactly");
         assert_eq!(
-            cb.child_extension.out_value, xc.output[0].value,
+            cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, xc.output[0].value,
             "and its declared out_value is the signed one"
         );
         assert_eq!(xc.output[0].script_pubkey, rig.attacker.spk, "but it pays the ATTACKER");
@@ -19643,7 +19869,7 @@ mod wrong_payee_attack_tests {
         );
         assert!(msg.contains("prevout that does not exist"), "…and the consequence, got: {msg}");
         assert_refusal_names_the_payee_not_the_value(&msg);
-        assert_untampered_twin_is_accepted(&rig, false, |b| parse(&b.child_extension.signed_tx), &xc);
+        assert_untampered_twin_is_accepted(&rig, false, |b| parse(&b.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx), &xc);
     }
 
     /// The near-miss, and the reason the check compares whole scriptPubKeys rather than key material.
@@ -19657,7 +19883,7 @@ mod wrong_payee_attack_tests {
         let rig = rig();
         let (cb, facts) = rig.build(false, Payee::LeafExtensionToUntweakedAggregate);
 
-        let xc: Transaction = parse(&cb.child_extension.signed_tx);
+        let xc: Transaction = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         let paid = &xc.output[0].script_pubkey;
         assert_ne!(*paid, rig.child.spk, "the output key is NOT the tweaked aggregate");
         assert_eq!(
@@ -19675,7 +19901,7 @@ mod wrong_payee_attack_tests {
         let msg = e.to_string();
         assert!(msg.contains("child extension") && msg.contains("A_child"), "got: {msg}");
         assert_refusal_names_the_payee_not_the_value(&msg);
-        assert_untampered_twin_is_accepted(&rig, false, |b| parse(&b.child_extension.signed_tx), &xc);
+        assert_untampered_twin_is_accepted(&rig, false, |b| parse(&b.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx), &xc);
     }
 
     /// **A HOLE THIS MODULE FOUND WHILE BUILDING THE ABOVE, PINNED AS A TRIPWIRE.**
@@ -19737,7 +19963,7 @@ mod wrong_payee_attack_tests {
         )
         .expect("child state");
         let sc_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &c.spk, &c.kp);
-        cb.child_extension = tier(&xc_tx, Some(rig.params.ext_csv(0)), xc.payload_vout);
+        cb.child_extension = Some(tier(&xc_tx, Some(rig.params.ext_csv(0)), xc.payload_vout));
         cb.child_state = tier(&sc_tx, Some(rig.params.state_csv(0)), sc.payload_vout);
         facts.ancestors[0].num_sigs = CHILD_V2_BASELINE + 2;
 
@@ -20082,7 +20308,7 @@ mod wrong_payee_attack_tests {
         )
         .expect("child state");
         let sc_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &c.spk, &c.kp);
-        cb.child_extension = tier(&xc_tx, Some(rig.params.ext_csv(0)), xc.payload_vout);
+        cb.child_extension = Some(tier(&xc_tx, Some(rig.params.ext_csv(0)), xc.payload_vout));
         cb.child_state = tier(&sc_tx, Some(rig.params.state_csv(0)), sc.payload_vout);
 
         // THE RE-LABEL: one tier, the extension re-declared as a superseded state.
@@ -20579,7 +20805,7 @@ mod dust_poisoned_tier_attack_tests {
                 sp_vout,
                 child_statechain_id: "child-sid".into(),
                 child_owner_exit_address: self.receiver.address.clone(),
-                child_extension: ext,
+                child_extension: Some(ext),
                 child_state: state,
                 child_superseded_states: vec![],
                 child_superseded_extensions: vec![],
@@ -20714,7 +20940,7 @@ mod dust_poisoned_tier_attack_tests {
         let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, total - 1), |_, _| {});
         // The payee's OWN legs are all comfortably spendable — the poison is entirely on the tier
         // that funds them, which is what makes this invisible to every leaf-lane law.
-        assert!(cb.child_extension.out_value >= DUST && cb.child_state.out_value >= DUST);
+        assert!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value >= DUST && cb.child_state.out_value >= DUST);
 
         // ── the two entry points that must refuse it ──────────────────────────────────────────
         let direct = verify_bundle_ex(&cb.parent, 1 + 3, 1, true, Some(f_value))
@@ -20895,14 +21121,14 @@ mod dust_poisoned_tier_attack_tests {
             }
         });
 
-        let ext = parse(&cb.child_extension.signed_tx);
+        let ext = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         assert_eq!(
             payload_total(&ext),
             mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
             "Σ is untouched — a zero-value output is invisible to a sum"
         );
         assert_eq!(
-            cb.child_extension.out_value,
+            cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value,
             mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
             "…and so is the per-output check: the payload output is exactly right"
         );
@@ -21060,7 +21286,7 @@ mod dust_poisoned_tier_attack_tests {
         let sp_txid = root.final_tx.txid().to_string();
         let cb = rig.child_bundle(&root, 0, vec![], (&sp_txid, 0, slot), |_, _| {});
 
-        assert_eq!(cb.child_extension.out_value, slot - rung);
+        assert_eq!(cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value, slot - rung);
         assert_eq!(cb.child_state.out_value, DUST, "the minimum child's last leg IS the floor");
         rig.verify_child(&cb, f_value, &[])
             .expect("an honest minimum-value child must be ACCEPTED at exactly the floor");
@@ -21410,7 +21636,7 @@ mod dust_poisoned_tier_attack_tests {
                 }
             });
 
-            let ext = parse(&cb.child_extension.signed_tx);
+            let ext = parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
             assert_eq!(anchors(&ext).len(), 2);
             assert_eq!(
                 payload_total(&ext),
@@ -21418,7 +21644,7 @@ mod dust_poisoned_tier_attack_tests {
                 "Σ untouched"
             );
             assert_eq!(
-                cb.child_extension.out_value,
+                cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").out_value,
                 mercurylib::tesr::tier_out_value(slot, rig.rate).unwrap(),
                 "…and the per-output check is untouched: the payload output is exactly right"
             );
@@ -21623,7 +21849,7 @@ mod dust_poisoned_tier_attack_tests {
             });
             assert!(cb.parent.rgb.is_none() && cb.rgb.is_none(), "a wholly PLAIN bundle");
             assert_eq!(oprets(&xa_tx), 1, "the ancestor extension carries an opret…");
-            assert_eq!(oprets(&parse(&cb.child_extension.signed_tx)), 0, "…and nothing else does");
+            assert_eq!(oprets(&parse(&cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx)), 0, "…and nothing else does");
             assert_eq!(anchors(&xa_tx).len(), 1, "one honest anchor, so that is not what refuses it");
 
             let msg = rig
@@ -22284,7 +22510,7 @@ mod exit_chain_length_cap_tests {
             sp_vout: 0,
             child_statechain_id: "child-sid".into(),
             child_owner_exit_address: super::verify_tests::OWNER.into(),
-            child_extension: lvl.extension,
+            child_extension: Some(lvl.extension),
             child_state: lvl.state,
             child_superseded_states: vec![],
             child_superseded_extensions: vec![],
@@ -22629,15 +22855,25 @@ impl std::fmt::Debug for ChildRenewalPlan {
 
 /// The CSV of a leaf's LIVE extension, read off the **signed** nSequence.
 ///
-/// Not `cb.child_extension.csv`. That field travels beside the transaction and is a sender-supplied
+/// Not `cb.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").csv`. That field travels beside the transaction and is a sender-supplied
 /// number; the nSequence is committed by the taproot SIGHASH_ALL sighash that
 /// [`verify_tier_cosigned`] checks, so it cannot be moved without invalidating a signature the
 /// sender cannot forge. The receiver's `[B1]` `bind_declared_csv` makes the two agree on any bundle
 /// that was ever accepted — this reads the one that is provenanced anyway.
 pub fn child_extension_csv(cb: &ChildTesrBundle) -> Result<u16> {
     use electrum_client::bitcoin::{consensus::deserialize, Transaction};
+    // [REQ-83] A THIN piece has no extension, so there is no extension CSV. Refused by name rather
+    // than defaulted: every caller of this uses the answer as a renewal budget, and a fabricated
+    // number would be a budget the coin does not have.
+    let ext = cb.child_extension.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "child {} is a THIN piece (one rung): it has no extension, so it has no extension CSV \
+             and no renewal budget denominated in one",
+            cb.child_statechain_id
+        )
+    })?;
     let tx: Transaction = deserialize(
-        &hex::decode(&cb.child_extension.signed_tx)
+        &hex::decode(&ext.signed_tx)
             .map_err(|_| anyhow::anyhow!("child extension: bad hex"))?,
     )
     .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
@@ -22790,6 +23026,24 @@ pub fn plan_child_renewal(
     // lane does.
     refuse_uncolored_over_colored_child(cb, "renew_child")?;
 
+    // **[REQ-83] A THIN piece cannot be renewed, and this is the cost §6.0.3 prices as "one renewal
+    // instead of two".** Renewal here means building a fresh EXTENSION at a higher CSV and a state
+    // beneath it; a one-rung leaf has no extension rung, and fabricating one over `SP.out[sp_vout]`
+    // would create a rival for the very outpoint its cap spends — the phantom-extension shape the
+    // journal's `SplitLegRole` exists to prevent, arrived at from the other direction.
+    //
+    // Named rather than silently returning an unchanged plan: the caller is a background maintenance
+    // pass whose whole job is keeping leaves alive, and "nothing to do" is exactly the answer that
+    // loses a coin. The remedy for a thin leaf is a re-anchor, not a renewal.
+    let ext_rec = cb.child_extension.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "child {} is a THIN piece (one rung, no extension): it cannot be RENEWED, because \
+             renewal resets an extension's budget and it has none. Re-anchor it instead — that is \
+             the trade §6.0.3 prices for admitting it at the one-rung floor.",
+            cb.child_statechain_id
+        )
+    })?;
+
     let p = cb.parent.params;
 
     // ── THE EPOCH, AND THE EXHAUSTION PATH ────────────────────────────────────────────────────────
@@ -22919,7 +23173,7 @@ pub fn plan_child_renewal(
     // nowhere. Refuse instead of building.
     {
         let live: Transaction = deserialize(
-            &hex::decode(&cb.child_extension.signed_tx)
+            &hex::decode(&ext_rec.signed_tx)
                 .map_err(|_| anyhow::anyhow!("child extension: bad hex"))?,
         )
         .map_err(|_| anyhow::anyhow!("child extension is not a transaction"))?;
@@ -23352,15 +23606,26 @@ pub async fn renew_child(
     // transitively dead beneath it, which is the shape `verify_superseded_segment` already models
     // for the root `renew`.
     let mut next = cb.clone();
-    next.child_superseded_extensions.push(next.child_extension.clone());
+    // The planner refused a THIN piece by name before any co-signature was requested, so an
+    // extension exists here by construction. Unwrapped through a named error rather than `expect`:
+    // if that ordering is ever changed, the failure must say which invariant moved rather than
+    // panic in the middle of a two-co-signature renewal.
+    let replaced_ext = next.child_extension.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "child {} reached renew_child with no extension — plan_child_renewal must refuse a thin \
+             piece before either tier is co-signed",
+            cb.child_statechain_id
+        )
+    })?;
+    next.child_superseded_extensions.push(replaced_ext);
     next.child_superseded_states.push(next.child_state.clone());
-    next.child_extension = TesrTier {
+    next.child_extension = Some(TesrTier {
         txid: plan.extension.txid.clone(),
         signed_tx: x_signed,
         out_value: plan.extension.out_value,
         csv: Some(plan.csv_e_new),
         payload_vout: plan.extension.payload_vout,
-    };
+    });
     next.child_state = TesrTier {
         txid: plan.state.txid.clone(),
         signed_tx: s_signed.clone(),
@@ -23797,7 +24062,7 @@ mod leaf_renewal_tests {
                 sp_vout: 0,
                 child_statechain_id: "child-sid".into(),
                 child_owner_exit_address: self.receiver.address.clone(),
-                child_extension: tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout),
+                child_extension: Some(tier(&xc_tx, Some(p.ext_csv(0)), xc.payload_vout)),
                 child_state: tier(&sc_tx, Some(p.state_csv(0)), sc.payload_vout),
                 child_superseded_states: vec![],
                 child_superseded_extensions: vec![],
@@ -23815,9 +24080,9 @@ mod leaf_renewal_tests {
             let x_tx = cosign(&parse(&plan.extension.tx_hex), plan.funding_value, &c.spk, &c.kp);
             let s_tx = cosign(&parse(&plan.state.tx_hex), plan.extension.out_value, &c.spk, &c.kp);
             let mut next = cb.clone();
-            next.child_superseded_extensions.push(next.child_extension.clone());
+            next.child_superseded_extensions.push(next.child_extension.clone().expect("two-rung fixture"));
             next.child_superseded_states.push(next.child_state.clone());
-            next.child_extension = tier(&x_tx, Some(plan.csv_e_new), plan.extension.payload_vout);
+            next.child_extension = Some(tier(&x_tx, Some(plan.csv_e_new), plan.extension.payload_vout));
             next.child_state = tier(&s_tx, Some(plan.csv_d), plan.state.payload_vout);
             next
         }
@@ -23875,7 +24140,7 @@ mod leaf_renewal_tests {
         let renewed = r.apply(&leaf, &plan);
         assert_eq!(child_renewal_epoch(&renewed).expect("derivable"), 1);
         assert_eq!(
-            renewed.child_extension.csv,
+            renewed.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").csv,
             Some(p.ext_csv(1)),
             "and the extension really did move down one rung"
         );
@@ -23891,7 +24156,7 @@ mod leaf_renewal_tests {
         let p = r.params;
         let mut leaf = r.leaf();
         // A sender lies about the rung its extension sits on. The signed transaction is untouched.
-        leaf.child_extension.csv = Some(p.ext_csv(2));
+        leaf.child_extension.as_mut().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").csv = Some(p.ext_csv(2));
         assert_eq!(
             child_renewal_epoch(&leaf).expect("derivable"),
             0,
@@ -23913,11 +24178,11 @@ mod leaf_renewal_tests {
              it is safe"
         );
         let mut leaf = r.leaf();
-        leaf.child_extension.csv = Some(p.e_floor);
+        leaf.child_extension.as_mut().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").csv = Some(p.e_floor);
         // …and make the signed transaction agree, so this is the clamp and not a declaration lie.
-        let mut tx = parse(&leaf.child_extension.signed_tx);
+        let mut tx = parse(&leaf.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         tx.input[0].sequence = mercurylib::tesr::csv_blocks(p.e_floor);
-        leaf.child_extension.signed_tx = hex::encode(serialize(&tx));
+        leaf.child_extension.as_mut().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx = hex::encode(serialize(&tx));
         let e = child_renewal_epoch(&leaf).expect_err("must refuse");
         assert!(
             e.to_string().contains("child_in_ladder_split"),
@@ -23932,10 +24197,10 @@ mod leaf_renewal_tests {
         let p = r.params;
         let mut leaf = r.leaf();
         let off = p.e0 - 1; // not a multiple of delta_e below e0
-        let mut tx = parse(&leaf.child_extension.signed_tx);
+        let mut tx = parse(&leaf.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         tx.input[0].sequence = mercurylib::tesr::csv_blocks(off);
-        leaf.child_extension.signed_tx = hex::encode(serialize(&tx));
-        leaf.child_extension.csv = Some(off);
+        leaf.child_extension.as_mut().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx = hex::encode(serialize(&tx));
+        leaf.child_extension.as_mut().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").csv = Some(off);
         assert!(child_renewal_epoch(&leaf).is_err(), "an off-grid rung must not be interpreted");
     }
 
@@ -23995,9 +24260,9 @@ mod leaf_renewal_tests {
         .expect("state");
         let s_tx = cosign(&parse(&sc.tx_hex), xc.out_value, &r.child.spk, &r.child.kp);
         let mut bad = leaf.clone();
-        bad.child_superseded_extensions.push(bad.child_extension.clone());
+        bad.child_superseded_extensions.push(bad.child_extension.clone().expect("two-rung fixture"));
         bad.child_superseded_states.push(bad.child_state.clone());
-        bad.child_extension = tier(&x_tx, Some(p.ext_csv(0)), xc.payload_vout);
+        bad.child_extension = Some(tier(&x_tx, Some(p.ext_csv(0)), xc.payload_vout));
         bad.child_state = tier(&s_tx, Some(p.state_csv(0)), sc.payload_vout);
         f.child_num_sigs = 4; // the SE really did issue two more
         let e = verify(&bad, &f).expect_err("an equal-CSV renewal must be refused by the receiver");
@@ -24064,7 +24329,7 @@ mod leaf_renewal_tests {
         let renewed = r.apply(&leaf, &plan);
         assert_eq!(renewed.funding_outpoint(), before, "the SAME SP.out[j]");
         assert_eq!(renewed.ancestors.len(), leaf.ancestors.len(), "depth untouched");
-        let x = parse(&renewed.child_extension.signed_tx);
+        let x = parse(&renewed.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx);
         assert_eq!(x.input[0].previous_output.txid.to_string(), before.0);
         assert_eq!(x.input[0].previous_output.vout, before.1);
     }
@@ -24197,8 +24462,8 @@ mod leaf_renewal_tests {
         let plan = plan_child_renewal(&leaf, p.ext_csv(1), p.state_csv(0)).expect("renewable");
         let renewed = r.apply(&leaf, &plan);
         for (what, hex) in [
-            ("the ORIGINAL extension", &leaf.child_extension.signed_tx),
-            ("the RENEWED extension", &renewed.child_extension.signed_tx),
+            ("the ORIGINAL extension", &leaf.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx),
+            ("the RENEWED extension", &renewed.child_extension.as_ref().expect("this fixture builds a TWO-RUNG piece; a thin one has no extension").signed_tx),
         ] {
             let tx = parse(hex);
             assert_eq!(

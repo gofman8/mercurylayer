@@ -376,7 +376,7 @@ pub async fn execute() -> Result<()> {
         }
         seg.state.csv = Some(1);
     }
-    forged.child_extension.csv = Some(1);
+    forged.child_extension.as_mut().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").csv = Some(1);
     forged.child_state.csv = Some(1);
     // Nothing that is signed has changed: same tier transactions, byte for byte.
     for (a, b) in mercuryrustlib::tesr::child_exit_chain(&forged)
