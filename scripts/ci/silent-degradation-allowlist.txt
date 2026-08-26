@@ -212,11 +212,30 @@
 # backup vector will not split into groups ([R3] — this used to PANIC on attacker-controlled
 # input). Both DROP an unparseable inbound offer rather than surfacing it as a payable pending
 # transfer with invented fields. Fails toward not showing the user a transfer.
-2	clients/libs/rust/src/transfer_receiver.rs	err-continue	Err(_) => continue,
+#
+# [REQ-83] TWO MORE, in `claim_ladderless_deliveries`, judged separately:
+#   (c) a mailbox address we cannot fetch — identical to (a), and it fails toward MORE work: the
+#       alternative is aborting the whole pass because one of the wallet's keys had a bad fetch.
+#   (d) a delivered document that will not PARSE as a `LadderlessLeaf`. This is the one worth
+#       arguing. The blob is attacker-supplied and unauthenticated (see `TransferMsg`'s own header),
+#       so erroring the pass on it would let anyone stop this wallet from claiming ANYTHING by
+#       posting one malformed message to it — a denial of service bought in exchange for a
+#       diagnostic. The claim is skipped, not consumed: the mailbox read is non-destructive, so a
+#       genuine delivery that fails to parse because of a transient truncation is re-served next
+#       pass. What is NOT swallowed here is the message-KIND conflict (a delivery also carrying
+#       hand-over material), which errors out of the whole pass by name — that one is a sender
+#       choosing what they sent after the receiver started reading it, and it is not a parse failure.
+4	clients/libs/rust/src/transfer_receiver.rs	err-continue	Err(_) => continue,
 #
 # A mailbox holds messages for many auth keys; a message this key cannot decrypt is simply not
 # ours. Skipping it is the protocol, not a swallow.
-1	clients/libs/rust/src/transfer_receiver.rs	err-continue	Err(_) => continue, // not addressed to us / undecryptable
+# [REQ-83] A SECOND site with the identical shape and the identical verdict: the ladderless-delivery
+# pass (`claim_ladderless_deliveries`) reads the same mailbox with the same per-auth-key privkeys, and
+# a message it cannot decrypt is a message addressed to somebody else. Continuing is the only correct
+# action, and the mailbox read is NON-DESTRUCTIVE — nothing is consumed by skipping, so a message that
+# genuinely is ours is re-served on the next pass. It also fails toward MORE work, not less: the
+# alternative would be to abort the whole pass on one foreign ciphertext.
+2	clients/libs/rust/src/transfer_receiver.rs	err-continue	Err(_) => continue, // not addressed to us / undecryptable
 #
 # Two sites: the DISPLAYED amount of a pending transfer when tx0 cannot be read on-chain or is
 # not trusted. 0 is the pessimistic value — the SSP's pre-pay value gate (check_latched_coins)

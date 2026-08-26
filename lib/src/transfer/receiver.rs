@@ -1416,6 +1416,7 @@ mod transfer_signature_tests {
             protocol_version: 0,
             tesr_ladder: None,
             child_tesr_bundle: None,
+            ladderless_leaf: None,
         }
     }
 

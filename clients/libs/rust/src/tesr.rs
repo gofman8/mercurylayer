@@ -9463,6 +9463,43 @@ pub async fn open_child_conveyance(
 /// The transfer signature is rebuilt here rather than carried from the first half. It is a purely
 /// LOCAL signature under the child slot's own `user_privkey`, so it does not touch the SE and is
 /// unaffected by the pending-transfer lock the first half armed.
+/// **[REQ-83] Deliver a LADDERLESS claim to its payee.**
+///
+/// The stub's channel, and it is a delivery rather than a hand-over: nothing is rotated, no slot
+/// moves, and the payee already owns the key `SP.out[j]` pays. What they lack is the transaction.
+///
+/// Posted under the SENDER's own statechain id, which is the only auth key the coordinator can check
+/// for this message. That buys nothing about the contents and is not meant to: the receiver verifies
+/// the claim against the chain and the SE's attested facts (`verify_conveyed_stub`) exactly as it
+/// would a leaf that arrived any other way.
+pub async fn convey_ladderless_leaf(
+    cc: &ClientConfig,
+    recipient_address: &str,
+    sender_coin: &Coin,
+    leaf: &LadderlessLeaf,
+) -> Result<()> {
+    let json = serde_json::to_string(leaf)?;
+    let payload = mercurylib::transfer::sender::create_ladderless_conveyance_update_msg(
+        recipient_address,
+        sender_coin,
+        &json,
+    )?;
+    let endpoint = cc.statechain_entity.clone();
+    let client = cc.get_reqwest_client()?;
+    let status = client
+        .post(&format!("{}/transfer/update_msg", endpoint))
+        .json(&payload)
+        .send()
+        .await?
+        .status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "failed to deliver the ladderless claim (update_msg {status})"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn post_child_conveyance(
     cc: &ClientConfig,
     recipient_address: &str,

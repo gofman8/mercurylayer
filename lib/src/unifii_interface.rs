@@ -65,6 +65,7 @@ fn ffi_to_transfer_msg(ffi_msg: FFITransferMsg) -> Result<TransferMsg, MercuryEr
         protocol_version: 0,
         tesr_ladder: None,
         child_tesr_bundle: None,
+        ladderless_leaf: None,
     })
 }
 

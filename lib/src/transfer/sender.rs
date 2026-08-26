@@ -133,6 +133,67 @@ pub fn create_transfer_update_msg(x1: &str, recipient_address: &str, coin: &Coin
 /// `child_coin` is the sender-owned piece child (its `statechain_id` + `signed_statechain_id` authorise
 /// the `update_msg` post, since the sender created that slot at split time); the message is encrypted to
 /// `recipient_address`'s auth key so only the receiver's mailbox can read it.
+/// **[REQ-83] A LADDERLESS claim as a DELIVERY, not a hand-over.**
+///
+/// The mailbox route carries a statechain hand-over: opened with an `x1` against the child's slot and
+/// signed with that child coin's key. A `Stub` has neither — no slot is created for it, because
+/// `SP.out[j]` pays the payee's OWN key. What the payee lacks is not a secret but the TRANSACTION,
+/// so the message carries a document and nothing else.
+///
+/// **`t1` is ZERO and must never be consumed.** It is the blinded handover secret, and there is no
+/// handover here: a `ladderless_leaf` message rotates no key and transfers no slot. Zero rather than
+/// a random value on purpose — a plausible-looking secret is one a receiver might try to use, while
+/// zero cannot be mistaken for one and the receiver refuses the message as a hand-over by shape.
+///
+/// It is posted under the SENDER'S OWN statechain id, because that is the only auth key the
+/// coordinator can check for this message — and the coordinator checks exactly that and stores the
+/// ciphertext. Nothing in the document is believed on that account: the receiver verifies it against
+/// the chain and the SE's attested facts, the same as any conveyed leaf.
+pub fn create_ladderless_conveyance_update_msg(
+    recipient_address: &str,
+    sender_coin: &Coin,
+    ladderless_leaf_json: &str,
+) -> Result<TransferUpdateMsgRequestPayload, MercuryError> {
+    let (_, _, recipient_auth_pubkey) = decode_transfer_address(recipient_address)?;
+    let statechain_id = sender_coin
+        .statechain_id
+        .as_ref()
+        .ok_or(MercuryError::SecpError)?;
+    let signed_statechain_id = sender_coin
+        .signed_statechain_id
+        .as_ref()
+        .ok_or(MercuryError::SecpError)?;
+
+    let transfer_msg = TransferMsg {
+        statechain_id: statechain_id.to_string(),
+        // No outpoint changes hands, so there is nothing for a transfer signature to commit to. The
+        // empty string is refused by `verify_transfer_signature`, which is correct: this message must
+        // never reach the hand-over path.
+        transfer_signature: String::new(),
+        backup_transactions: Vec::new(),
+        t1: [0u8; 32],
+        user_public_key: sender_coin.user_pubkey.clone(),
+        branch_txs: Vec::new(),
+        terminal_parents: Vec::new(),
+        protocol_version: 4,
+        tesr_ladder: None,
+        child_tesr_bundle: None,
+        ladderless_leaf: Some(ladderless_leaf_json.to_string()),
+    };
+
+    let transfer_msg_json_str = serde_json::to_string_pretty(&json!(&transfer_msg))?;
+    let serialized_new_auth_pubkey = &recipient_auth_pubkey.serialize();
+    let encrypted_msg = ecies::encrypt(serialized_new_auth_pubkey, transfer_msg_json_str.as_bytes())
+        .map_err(|_| MercuryError::SecpError)?;
+    let encrypted_msg_hex = hex::encode(&encrypted_msg);
+    Ok(TransferUpdateMsgRequestPayload {
+        statechain_id: statechain_id.to_string(),
+        auth_sig: signed_statechain_id.to_string(),
+        new_user_auth_key: recipient_auth_pubkey.to_string(),
+        enc_transfer_msg: encrypted_msg_hex,
+    })
+}
+
 pub fn create_child_conveyance_update_msg(
     x1: &str,
     recipient_address: &str,
@@ -170,6 +231,7 @@ pub fn create_child_conveyance_update_msg(
         protocol_version: 4,
         tesr_ladder: None,
         child_tesr_bundle: Some(child_tesr_bundle_json.to_string()),
+        ladderless_leaf: None,
     };
 
     let transfer_msg_json_str = serde_json::to_string_pretty(&json!(&transfer_msg))?;
@@ -215,6 +277,7 @@ pub fn create_transfer_update_msg_with_branch(x1: &str, recipient_address: &str,
         protocol_version,
         tesr_ladder,
         child_tesr_bundle: None,
+        ladderless_leaf: None,
     };
 
     let transfer_msg_json = json!(&transfer_msg);

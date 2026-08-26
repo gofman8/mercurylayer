@@ -146,6 +146,18 @@ pub struct TransferMsg {
     /// the message wire-compatible with wallets that predate the field.
     #[serde(default)]
     pub child_tesr_bundle: Option<String>,
+    /// **[REQ-83] A LADDERLESS claim (`Stub`), delivered as a DOCUMENT rather than a hand-over.**
+    ///
+    /// `SP.out[j]` already pays the payee's own key, so there is no secret to hand over and no slot
+    /// to rotate: what the payee lacks is the transaction. A message carrying this and nothing else
+    /// is a delivery, and the receiver MUST treat it as one — `t1` is meaningless on it and must
+    /// never be consumed as a handover secret.
+    ///
+    /// Mutually exclusive with [`Self::child_tesr_bundle`] and [`Self::tesr_ladder`]: a message
+    /// claiming to be both a delivery and a hand-over is a message whose kind the sender chose after
+    /// the receiver started reading it.
+    #[serde(default)]
+    pub ladderless_leaf: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

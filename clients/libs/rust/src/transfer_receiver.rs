@@ -1240,6 +1240,78 @@ async fn verify_terminal_parents(client_config: &ClientConfig, parents: &[String
     Ok(())
 }
 
+/// **[REQ-83] Collect LADDERLESS claims delivered to this wallet.**
+///
+/// Its own pass, and it has to be: every other receive path is per-COIN, and a stub is not a coin —
+/// no slot is created for it and `SP.out[j]` pays the payee's own key. There is no hand-over to
+/// complete, nothing to rotate, and no `coin` to hang the message on. What arrives is a DOCUMENT.
+///
+/// **A message that claims to be both a delivery and a hand-over is refused outright**, rather than
+/// having one arm win. Letting presence-order decide would let a sender choose which kind of message
+/// they sent after the receiver started reading it — and the two kinds are checked by entirely
+/// different rules.
+///
+/// Returns the number of claims newly adopted. Each is verified against the chain and the SE's
+/// attested facts before it is stored; a delivery that does not verify is skipped, not stored, and
+/// the mailbox read is non-destructive so nothing is lost by skipping.
+pub async fn claim_ladderless_deliveries(
+    client_config: &ClientConfig,
+    wallet_name: &str,
+) -> Result<usize> {
+    let wallet = crate::sqlite_manager::get_wallet(&client_config.pool, wallet_name).await?;
+    let mut privkey_by_pubkey: HashMap<String, String> = HashMap::new();
+    for coin in wallet.coins.iter() {
+        privkey_by_pubkey
+            .entry(coin.auth_pubkey.clone())
+            .or_insert_with(|| coin.auth_privkey.clone());
+    }
+
+    let mut adopted = 0usize;
+    let mut seen: HashSet<String> = HashSet::new();
+    for (auth_pubkey, auth_privkey) in privkey_by_pubkey.iter() {
+        let enc_messages = match get_msg_addr(auth_pubkey, client_config).await {
+            std::result::Result::Ok(m) => m,
+            Err(_) => continue,
+        };
+        for enc_message in enc_messages {
+            let msg = match mercurylib::transfer::receiver::decrypt_transfer_msg(
+                &enc_message,
+                auth_privkey,
+            ) {
+                std::result::Result::Ok(m) => m,
+                Err(_) => continue, // not addressed to us / undecryptable
+            };
+            let Some(leaf_json) = msg.ladderless_leaf.as_deref() else {
+                continue; // an ordinary hand-over: not this pass's business
+            };
+            if msg.child_tesr_bundle.is_some() || msg.tesr_ladder.is_some() {
+                return Err(anyhow!(
+                    "a delivered ladderless claim also carries hand-over material. A message is one \
+                     kind or the other, and the two are checked by different rules — refusing rather \
+                     than letting presence-order decide which the sender meant"
+                ));
+            }
+            let leaf: crate::tesr::LadderlessLeaf = match serde_json::from_str(leaf_json) {
+                std::result::Result::Ok(l) => l,
+                Err(_) => continue,
+            };
+            // Deduplicated by the OUTPOINT it claims, because that is what a stub IS. The mailbox is
+            // non-destructive, so the same delivery is re-served on every pass.
+            let key = format!("{}:{}", leaf.parent_statechain_id, leaf.sp_vout);
+            if !seen.insert(key) {
+                continue;
+            }
+            if crate::tesr::adopt_stub_leaf(client_config, wallet_name, &leaf)
+                .await
+                .is_ok()
+            {
+                adopted += 1;
+            }
+        }
+    }
+    Ok(adopted)
+}
+
 async fn validate_encrypted_message(client_config: &ClientConfig, coin: &Coin, enc_message: &str, network: &str, wallet_name: &str, info_config: &InfoConfig, blockheight: u32) -> Result<()> {
 
     let client_auth_key = coin.auth_privkey.clone();

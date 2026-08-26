@@ -1829,18 +1829,27 @@ that split on chain. Folding them in would tell an owner they can spend what the
 them would tell them they were not paid. The read propagates its errors for the same reason the token
 balance does — a failure that came back as zero would say a payment they hold does not exist.
 
-**What remains is the in-protocol DELIVERY channel for a stub, and it is narrower than it sounds.**
-The mailbox route (`/transfer/update_msg`) carries a statechain HAND-OVER: it is opened with an `x1`
-against the child's slot and signed with the child coin's key. A tail has both and travels it
-unchanged. A stub has neither — no slot is created for it — so the route has nothing to sign with.
+**THE STUB'S DELIVERY CHANNEL IS BUILT, as a DELIVERY rather than a hand-over.** The mailbox route
+carries a statechain hand-over — opened with an `x1` against the child's slot, signed with that child
+coin's key. A tail has both and travels it unchanged. A stub has neither, because no slot is created
+for it, so `TransferMsg` gains a `ladderless_leaf` field and the message carries a DOCUMENT: the `SP`
+transaction, which is all the payee lacks since the output already pays their own key.
 
-What a stub's payee needs is not a secret but a DOCUMENT: the `SP` transaction, because the output
-already pays their own key. `adopt_stub_leaf` is that import point and it verifies against the chain
-exactly as the mailbox path does, so a stub handed over by any channel is as safe as one that arrived
-by post. What is missing is only the automatic channel — a bearer-document message kind, which is a
-route the coordinator does not have rather than a property the design lacks.
+Four decisions in it, each a place the kinds could have blurred:
 
-**And it cannot be closed by making a stub coin-backed**, which is the obvious shortcut. A slot would
+* **`t1` is ZERO and must never be consumed.** It is the blinded hand-over secret and there is no
+  hand-over here. Zero rather than a random value on purpose: a plausible-looking secret is one a
+  receiver might try to use, while zero cannot be mistaken for one.
+* **A message claiming to be BOTH a delivery and a hand-over is refused outright**, not resolved by
+  which arm reads first. Presence-order would let a sender choose the kind of message they sent after
+  the receiver started reading it, and the two kinds are checked by entirely different rules.
+* **The receiver's pass is its own**, because every other receive path is per-COIN and a stub is not a
+  coin. It deduplicates by the OUTPOINT the claim names, which is what a stub IS.
+* **Posted under the SENDER'S statechain id**, the only auth key the coordinator can check for such a
+  message — and nothing in the document is believed on that account. The receiver verifies it against
+  the chain and the SE's attested facts exactly as it would any conveyed leaf.
+
+**It could not be closed by making a stub coin-backed**, which is the obvious shortcut. A slot would
 put `SP.out[j]` at an aggregate, and a leg with no pre-signed rung cannot spend an aggregate output
 without the SE — the holder would lose unilateral exit, which is the one property this design exists
 to provide and the same reason §6.0.3's `Stub` row pays a plain key in the first place.

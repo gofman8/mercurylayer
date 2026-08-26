@@ -885,6 +885,18 @@ impl UtexoWallet {
             )
             .await,
         )?;
+        // **[REQ-83] Collect LADDERLESS deliveries in the same pass.** A stub is not a coin, so no
+        // per-coin claim path can see one — it arrives as a document and is adopted on its own.
+        //
+        // Errors PROPAGATE. This pass refuses a message that claims to be both a delivery and a
+        // hand-over, and swallowing that would be swallowing a sender who chose the kind of message
+        // they sent after the receiver started reading it. Individual claims that fail to VERIFY are
+        // already skipped inside, and the mailbox is non-destructive, so nothing is lost by a skip.
+        mercuryrustlib::transfer_receiver::claim_ladderless_deliveries(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+        )
+        .await?;
         // transfer_receiver::execute updates statuses of freshly claimed coins internally; refresh
         // once more so claimed coins show as confirmed.
         mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
