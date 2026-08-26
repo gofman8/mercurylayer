@@ -1720,11 +1720,13 @@ mod grid_law_tests {
 /// feature-flag notice. The same bytes mean opposite things in the two lanes, so the rule stays out
 /// of the tier verifier.
 ///
-/// This is the RULE, deliberately separated from its admission. §6.0's relay claims are UNPROVEN —
-/// that a `[tail, funded anchor]` split really does relay as a zero-fee package has not been run —
-/// so the live verifier still refuses tails outright. Building the rule first means the day
-/// admission is switched on, what is admitted is already specified and tested rather than invented
-/// under pressure.
+/// This is the RULE, deliberately separated from its admission — and the separation has now paid
+/// off. §6.0's relay claims were UNPROVEN when this was written; `scripts/tail_relay_probe.py` has
+/// since asked Bitcoin Core and recorded that our funded-anchor shape is refused for the **FEE**
+/// (`min relay fee not met`) where Spark's zero-value-anchor shape is refused for **DUST**, and that
+/// a `[0-fee tail parent, paying child]` package relays (`package_msg: success`). So what gets
+/// admitted was specified and tested BEFORE the ground moved, rather than invented under pressure
+/// the day it moved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TailVerdict {
     /// No sub-dust output: an ordinary transaction, nothing to judge.
@@ -1775,6 +1777,213 @@ pub fn tail_verdict(outputs: &[(u64, Vec<u8>)], anchor_value: Option<u64>) -> Ta
             TailVerdict::WellFormed { vout, value }
         }
         n => TailVerdict::TooManyTails { count: n },
+    }
+}
+
+/// **[REQ-83 / §6.0.3] The four leaf shapes, chosen by value — and why there are exactly four.**
+///
+/// REQ-83 promises that **a sats payment of any amount at or above 1 sat is expressible**. That
+/// promise is not kept by one mechanism; it is kept by four, each covering a band of value, and it
+/// is kept only if the four bands **tile `[1, ∞)` with no gap and no overlap**. A gap is not a
+/// cosmetic defect — a gap is an amount a user cannot pay, which is precisely the requirement being
+/// violated. So the bands are derived here from the SAME floor functions the builders use, never
+/// restated as literals, and [`leaf_shapes_tile_every_value`] sweeps them.
+///
+/// | band | shape | what funds its exit |
+/// |---|---|---|
+/// | `v ≥ min_child_value` | [`LeafShape::Laddered`] | two rungs, self-funding |
+/// | `min_spine_tip_value ≤ v < min_child_value` | [`LeafShape::SpineTip`] | ONE rung — the tip shape, which already exists |
+/// | `DUST_LIMIT ≤ v < min_spine_tip_value` | [`LeafShape::Stub`] | nothing: depth-0, exits with its group |
+/// | `1 ≤ v < DUST_LIMIT` | [`LeafShape::Tail`] | nothing: the split's one permitted dust output, released by its fragment |
+///
+/// **Read the third and fourth rows against the owner's rule that small leaves need not exit
+/// alone.** Below `min_spine_tip_value` a leaf cannot fund a rung, and the older design's answer was
+/// to refuse the payment. That answer is withdrawn: the leaf is admitted and exits with the group
+/// instead. Quantising the payment to what a leaf can self-fund is the failure mode, not the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafShape {
+    /// Two rungs — extension and state. The only shape that funds its own exit unaided.
+    Laddered,
+    /// One rung, the spine-tip cap. Cheaper than a ladder and already built: this is the shape the
+    /// sender's CHANGE leg has always taken, being applied to a payee's leg for the first time.
+    SpineTip,
+    /// No ladder at all. Above dust, so it is an ordinary spendable output — it simply cannot afford
+    /// a rung of its own and leaves on its group's exit.
+    Stub,
+    /// Below dust: the split's single permitted sub-dust output, carried at zero fee behind a funded
+    /// anchor and released to any sibling by its [`TailVerdict`] fragment.
+    Tail,
+    /// **Zero is not an amount.** Kept as an arm rather than folded into `Tail` so that the one
+    /// genuinely unpayable value is named by the type instead of silently becoming a 0-sat tail.
+    Unpayable,
+}
+
+impl LeafShape {
+    /// Which shape a leaf of `value` takes at this fee rate.
+    ///
+    /// The two upper boundaries are read from [`min_child_value`] and [`min_spine_tip_value`] — the
+    /// same functions the admission guards and the builders call — so the shape a payment is
+    /// admitted at and the ladder that is then built can never be two different answers. That
+    /// divergence is the failure the whole split-floor apparatus exists to prevent.
+    pub fn for_value(value: u64, fee_rate_sats_per_vb: f64, dust_limit: u64) -> LeafShape {
+        if value == 0 {
+            return LeafShape::Unpayable;
+        }
+        if value < dust_limit {
+            return LeafShape::Tail;
+        }
+        if value < min_spine_tip_value(fee_rate_sats_per_vb, dust_limit) {
+            return LeafShape::Stub;
+        }
+        if value < min_child_value(fee_rate_sats_per_vb, dust_limit) {
+            return LeafShape::SpineTip;
+        }
+        LeafShape::Laddered
+    }
+
+    /// How many ladder rungs this shape funds. `0` means the leaf exits with its group.
+    pub fn rungs(self) -> u8 {
+        match self {
+            LeafShape::Laddered => 2,
+            LeafShape::SpineTip => 1,
+            LeafShape::Stub | LeafShape::Tail | LeafShape::Unpayable => 0,
+        }
+    }
+
+    /// Whether a leaf of this shape can be put on chain by its owner ALONE.
+    ///
+    /// False is not a defect: it is the owner's accepted trade (`small leaves need not exit alone`).
+    /// It is exposed so a caller can tell a user what they are buying, never so a caller can refuse
+    /// the payment.
+    pub fn exits_unaided(self) -> bool {
+        self.rungs() > 0
+    }
+}
+
+#[cfg(test)]
+mod req83_leaf_shapes {
+    use super::*;
+
+    /// Rates worth checking: the committed mainnet rate the spec quotes, plus an implausibly cheap
+    /// and an implausibly expensive one. The bands must be well-formed at ALL of them — a design
+    /// that only tiles at 3.0 sat/vB is a design that develops a hole in a fee spike.
+    const RATES: &[f64] = &[0.1, 1.0, 2.0, 3.0, 10.0, 100.0, 1_000.0];
+
+    /// **THE REQUIREMENT ITSELF: no amount at or above 1 sat is unpayable.**
+    ///
+    /// This is REQ-83 restated as an executable claim. It sweeps every value up past the top
+    /// boundary rather than sampling, because the defect this guards against is a one-value gap at a
+    /// boundary — exactly what an off-by-one in any of the three comparisons produces, and exactly
+    /// what sampling misses.
+    #[test]
+    fn no_value_above_zero_is_unpayable() {
+        for &rate in RATES {
+            let top = min_child_value(rate, DUST_LIMIT);
+            for v in 1..=top + 50 {
+                assert_ne!(
+                    LeafShape::for_value(v, rate, DUST_LIMIT),
+                    LeafShape::Unpayable,
+                    "[REQ-83] {v} sat is unpayable at {rate} sat/vB — that is the requirement broken, \
+                     not a rounding detail: it is an amount a user cannot send"
+                );
+            }
+        }
+        assert_eq!(LeafShape::for_value(0, 3.0, DUST_LIMIT), LeafShape::Unpayable, "zero is not an amount");
+    }
+
+    /// **The four bands tile `[1, ∞)` — no gap, no overlap, and each boundary is where the floor
+    /// function says it is.**
+    ///
+    /// The shape is checked against an INDEPENDENTLY computed expectation rather than against
+    /// `for_value`'s own logic, so a boundary moved in the implementation fails here instead of
+    /// being mirrored by the test.
+    #[test]
+    fn the_bands_tile_every_value_at_every_rate() {
+        for &rate in RATES {
+            let (tip, child) = (min_spine_tip_value(rate, DUST_LIMIT), min_child_value(rate, DUST_LIMIT));
+            for v in 1..=child + 50 {
+                let want = if v < DUST_LIMIT {
+                    LeafShape::Tail
+                } else if v < tip {
+                    LeafShape::Stub
+                } else if v < child {
+                    LeafShape::SpineTip
+                } else {
+                    LeafShape::Laddered
+                };
+                assert_eq!(
+                    LeafShape::for_value(v, rate, DUST_LIMIT),
+                    want,
+                    "value {v} at {rate} sat/vB (dust {DUST_LIMIT}, tip {tip}, child {child})"
+                );
+            }
+        }
+    }
+
+    /// **Each boundary is EXCLUSIVE below and INCLUSIVE at — the off-by-one that would matter.**
+    ///
+    /// At `min_child_value` exactly, a leaf funds two rungs; one satoshi less, it does not. A `<=`
+    /// here would hand a leaf a ladder it cannot pay for, which does not fail at admission — it
+    /// fails later, on chain, when the second rung cannot be broadcast.
+    #[test]
+    fn the_boundaries_are_exact() {
+        let rate = 3.0;
+        let (tip, child) = (min_spine_tip_value(rate, DUST_LIMIT), min_child_value(rate, DUST_LIMIT));
+        for (v, want) in [
+            (1, LeafShape::Tail),
+            (DUST_LIMIT - 1, LeafShape::Tail),
+            (DUST_LIMIT, LeafShape::Stub),
+            (tip - 1, LeafShape::Stub),
+            (tip, LeafShape::SpineTip),
+            (child - 1, LeafShape::SpineTip),
+            (child, LeafShape::Laddered),
+        ] {
+            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), want, "at {v} sat");
+        }
+    }
+
+    /// **The bands can never invert, at any rate — which is what keeps all four arms reachable.**
+    ///
+    /// If a fee rate could ever push `min_spine_tip_value` below `DUST_LIMIT`, the `Stub` band would
+    /// be empty and `for_value` would silently stop returning one of its arms. It cannot: both
+    /// floors are `committed_fee + …` over the same dust limit, so the gaps are `dust`, `P2A_VALUE`
+    /// and `committed_fee + P2A_VALUE` — all strictly positive. Pinned rather than argued, because
+    /// the argument depends on the shape of two functions in another part of this file.
+    #[test]
+    fn the_bands_never_invert_at_any_rate() {
+        for &rate in RATES {
+            let (tip, child) = (min_spine_tip_value(rate, DUST_LIMIT), min_child_value(rate, DUST_LIMIT));
+            assert!(1 < DUST_LIMIT, "the tail band must be non-empty");
+            assert!(DUST_LIMIT < tip, "the stub band is empty at {rate} sat/vB: dust {DUST_LIMIT} >= tip {tip}");
+            assert!(tip < child, "the spine-tip band is empty at {rate} sat/vB: tip {tip} >= child {child}");
+        }
+    }
+
+    /// **§6.0.3's published table is what the code computes.** The spec quotes 1560 / 945 / 330 at
+    /// the committed 3.0 sat/vB rate; if the floors move, the table is wrong and a reader is
+    /// misinformed about which amounts cost what.
+    #[test]
+    fn the_published_mainnet_table_holds() {
+        assert_eq!(min_child_value(3.0, DUST_LIMIT), 1_560);
+        assert_eq!(min_spine_tip_value(3.0, DUST_LIMIT), 945);
+        assert_eq!(DUST_LIMIT, 330);
+    }
+
+    /// **A leaf that cannot exit alone is still ADMITTED — the owner's rule, as a test.**
+    ///
+    /// `exits_unaided()` is false for a stub and for a tail, and that is a disclosure to the payer,
+    /// never grounds to refuse the payment. A design that quantised payments up to what a leaf can
+    /// self-fund would pass every other test in this module and still be the failure.
+    #[test]
+    fn small_leaves_are_admitted_even_though_they_cannot_exit_alone() {
+        for (v, rungs) in [(1u64, 0u8), (329, 0), (330, 0), (944, 0), (945, 1), (1_560, 2)] {
+            let shape = LeafShape::for_value(v, 3.0, DUST_LIMIT);
+            assert_ne!(shape, LeafShape::Unpayable, "{v} sat must be payable");
+            assert_eq!(shape.rungs(), rungs, "{v} sat funds {rungs} rung(s)");
+        }
+        assert!(!LeafShape::for_value(200, 3.0, DUST_LIMIT).exits_unaided());
+        assert!(!LeafShape::for_value(500, 3.0, DUST_LIMIT).exits_unaided());
+        assert!(LeafShape::for_value(1_000, 3.0, DUST_LIMIT).exits_unaided());
     }
 }
 

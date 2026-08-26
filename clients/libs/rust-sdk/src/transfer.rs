@@ -3597,6 +3597,67 @@ mod split_math_tests {
         total + mercurylib::tesr::committed_fee_for_outputs(2, rate) + mercurylib::tesr::P2A_VALUE
     }
 
+    /// **[REQ-83] WHERE THE LIVE ADMISSION AND THE FOUR LEAF SHAPES DISAGREE — measured, not
+    /// asserted.**
+    ///
+    /// §6.0.3 names four shapes and REQ-83 promises every amount from 1 sat up is expressible.
+    /// [`mercurylib::tesr::LeafShape`] implements the choice and its own tests prove the four bands
+    /// tile `[1, ∞)` with no gap. **None of that says the PAYMENT LANE can reach them**, and a
+    /// selector with no caller reads exactly like a working feature — the failure mode this repo has
+    /// hit in `sdk74` (a retry path that never ran), in `WITNESS_BIND`, and in the fork's extractor
+    /// (a consignment that validated perfectly and credited zero).
+    ///
+    /// So this measures the live guard instead of describing it. The finding, at the shipped rate:
+    /// **the piece floor IS the `Laddered` boundary**, so the payment lane admits the top band and
+    /// only the top band. Every amount in `[1, 1560)` — the tail, stub and spine-tip bands, 1 559
+    /// distinct amounts — is refused before a builder is ever consulted.
+    ///
+    /// This test is SUPPOSED to fail when a lower band is wired up. When it does, the fix is to move
+    /// the boundary it names to the new lowest admitted shape, not to delete the assertion: what
+    /// makes it worth having is that closing a band cannot pass silently either.
+    #[test]
+    fn the_payment_lane_today_admits_only_the_laddered_band() {
+        use mercurylib::tesr::LeafShape;
+        let rate = mercurylib::tesr::TesrParams::mainnet().committed_fee_rate;
+        let root = ParentShape::Root { fee_rate: rate, split_source_value: 0 };
+        let live_floor = split_output_floors(rate, root).piece;
+
+        assert_eq!(
+            LeafShape::for_value(live_floor, rate, DUST_LIMIT),
+            LeafShape::Laddered,
+            "the live piece floor must sit exactly at the Laddered boundary — if it sits inside a \
+             lower band, a payment is being admitted at a value whose shape no builder emits"
+        );
+        assert_eq!(
+            LeafShape::for_value(live_floor - 1, rate, DUST_LIMIT),
+            LeafShape::SpineTip,
+            "and one satoshi below it is the next band down, still unreachable"
+        );
+
+        // The three unreachable bands, each with a witness value, so the message names WHAT is
+        // refused rather than merely that something is.
+        for (v, shape) in [
+            (1u64, LeafShape::Tail),
+            (329, LeafShape::Tail),
+            (330, LeafShape::Stub),
+            (944, LeafShape::Stub),
+            (945, LeafShape::SpineTip),
+            (1_559, LeafShape::SpineTip),
+        ] {
+            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), shape);
+            assert!(
+                v < live_floor,
+                "[REQ-83] {v} sat is a valid {shape:?} leaf that the payment lane still refuses"
+            );
+        }
+
+        // And the one thing that must NEVER be true, at any floor: admitting an unpayable value.
+        assert_ne!(
+            LeafShape::for_value(live_floor, rate, DUST_LIMIT),
+            LeafShape::Unpayable
+        );
+    }
+
     /// **[D56] THE SHIPPED RATE'S FLOORS, so a schedule change cannot pass silently.**
     ///
     /// Every other floor test in this module fixes `rate = 2.0` as a FIXTURE — correct, because the

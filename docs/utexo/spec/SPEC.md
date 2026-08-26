@@ -1558,6 +1558,37 @@ A tail forces two things on its split transaction and on nothing else: the ancho
 240 kind, so the tail owns the dust slot; and the split's fee must be zero, so it enters the mempool
 only as a package whose child spends the anchor, the tail, and the broadcaster's own fee input.
 
+**THE CHOICE IS BUILT; THREE OF THE FOUR SHAPES ARE NOT REACHABLE YET, AND THAT GAP IS MEASURED
+RATHER THAN DESCRIBED.** `LeafShape::for_value` implements the table above, deriving both upper
+boundaries from `min_child_value` and `min_spine_tip_value` — the same functions the admission guards
+and the builders call, never restated as literals, so the shape a payment is admitted at and the
+ladder then built cannot be two different answers. `req83_leaf_shapes` proves the property REQ-83
+actually needs, which is not that the arms are correct one by one but that **the four bands tile
+`[1, ∞) `with no gap and no overlap**: it sweeps every value up past the top boundary at seven fee
+rates from 0.1 to 1 000 sat/vB, because the defect being guarded against is a one-satoshi hole at a
+boundary and sampling is exactly what misses one. A hole is not a cosmetic defect — a hole is an
+amount a user cannot pay.
+
+The bands also cannot invert at any rate, which is what keeps all four arms reachable: the gaps
+between them are `DUST_LIMIT`, `P2A_VALUE` and `committed_fee + P2A_VALUE`, all strictly positive.
+That is pinned too, because the argument depends on the shape of two functions defined elsewhere.
+
+**What a selector does NOT establish is that the payment lane can reach it** — a selector with no
+caller reads exactly like a working feature, which is this repository's most repeated failure
+(`sdk74`'s retry that never ran; a fork extractor that validated perfectly and credited zero). So
+`the_payment_lane_today_admits_only_the_laddered_band` measures the live guard instead:
+
+| band | reachable through `transfer()` today |
+|---|---|
+| `Laddered` | **yes** — the piece floor sits exactly at its boundary |
+| `SpineTip` | no |
+| `Stub` | no |
+| `Tail` | no |
+
+The piece floor IS the `Laddered` boundary, so every amount in `[1, 1560)` is refused before a
+builder is ever consulted. That test is written to FAIL when a lower band is wired up, so closing one
+cannot pass silently either.
+
 #### 6.0.4 The release fragment, and why a tail cannot take a sibling hostage
 
 This is the part Spark does not have, and it is what makes sub-dust leaves safe here rather than merely
@@ -1697,11 +1728,17 @@ Together with REQ-85's one-tail cap that is the whole safety case: an unconditio
 split carries a tail with no fragment" needs the conveyed bundle to carry fragments, and cannot be
 exercised while tails are not admitted. That is the remaining half, and it lands with the admission.
 
-**Still open:** neither The load-bearing claims — that a funded 240 anchor
-leaves the dust slot genuinely free, that a `[tail, funded anchor]` split relays as a zero-fee package,
-and that the release fragment behaves as analysed — are read from policy source and from our own
-constants. §0.2 applies: presence and ordering, never behaviour. Each needs plant-and-run before this
-section may be relied upon.
+**Still open, stated precisely.** The three load-bearing CLAIMS of this section are settled: that a
+funded 240 anchor leaves the dust slot genuinely free and that a `[tail, funded anchor]` split relays
+as a zero-fee package are both measured by `scripts/tail_relay_probe.py`, and the release fragment's
+behaviour is pinned by `req84_release_fragment`. What remains is not evidence but PLUMBING, and it is
+two things:
+
+1. **the builders for the three lower leaf shapes** — the selector chooses them, no builder emits
+   them, and the table above says so;
+2. **the bundle-level half of REQ-84** — "the verifier MUST refuse a bundle whose split carries a
+   tail with no fragment" needs the conveyed bundle to carry fragments, and cannot be exercised
+   while no lane emits a tail. It lands with the admission, not before.
 
 
 
