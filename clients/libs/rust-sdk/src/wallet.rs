@@ -885,6 +885,28 @@ impl UtexoWallet {
             )
             .await,
         )?;
+        // ── [REQ-49] THE SWEEP DECISION, SITED WHERE THE REQUIREMENT PUTS IT ────────────────────
+        //
+        // *"The swap MUST happen in `claim()`, not in a background pass"* — at claim the runway is
+        // maximal, the payee is online because they are already transacting, and no extra
+        // coordination round exists.
+        //
+        // **And it is OFF, which is also the requirement**: REQ-49 says in as many words that it
+        // MUST stay off until the cooperative exit it depends on is demonstrated end to end, and it
+        // has not been. What this call site buys today is that the decision has a CALLER in the
+        // right place, so switching it on is a flag rather than a redesign — and that the predicate
+        // stops being code nothing reaches, which is this repository's most repeated defect shape.
+        //
+        // The absorption mechanism itself is deliberately absent, in the order
+        // `PARTIAL-PAYMENT-ECONOMICS.md` §0.7 sets out: shipping the decision without the mechanism
+        // leaves an operator unable to absorb, which costs nothing; shipping the mechanism first
+        // leaves one holding leaves it cannot settle.
+        if self.inner.config.sweep_at_claim {
+            return Err(anyhow!(
+                "sweep-at-claim is enabled but the absorption path is not built. [REQ-49] requires                  this OFF until the cooperative exit it depends on is demonstrated end to end;                  turning it on now would leave this wallet holding leaves it cannot settle. The                  decision predicate (`mercurylib::sweep::may_absorb` / `should_settle`) is built and                  tested — what is missing is the swap itself."
+            ));
+        }
+
         // **[REQ-83] Collect LADDERLESS deliveries in the same pass.** A stub is not a coin, so no
         // per-coin claim path can see one — it arrives as a document and is adopted on its own.
         //

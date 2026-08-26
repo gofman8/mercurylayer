@@ -31,6 +31,19 @@ pub struct SdkConfig {
     /// background watcher also refreshes proactively so the pre-spend hook rarely has to wait for the
     /// re-anchor to confirm. Disable for wallets that manage refresh explicitly.
     pub auto_refresh: bool,
+    /// **[REQ-49] Absorb a received LEAF into an ordinary root coin at claim time.**
+    ///
+    /// **Default OFF, and the requirement says so in as many words:** it MUST stay off until the
+    /// cooperative exit it depends on is demonstrated end to end, which has not happened. The flag
+    /// exists so the decision has a caller sited where REQ-49 requires it — *"in `claim()`, not in a
+    /// background pass"*, because at claim the runway is maximal, the payee is online (they are
+    /// already transacting) and no extra coordination round exists.
+    ///
+    /// Turning it on without that demonstration leaves an operator holding leaves it cannot settle,
+    /// which is the failure the build order in `PARTIAL-PAYMENT-ECONOMICS.md` §0.7 is arranged to
+    /// avoid: shipping the decision without the mechanism costs nothing, shipping the mechanism
+    /// first costs a position.
+    pub sweep_at_claim: bool,
     /// Ladder headroom (blocks below the current backup locktime) at or under which `auto_refresh`
     /// re-anchors a coin. Must exceed the SE `interval` so a whole-coin handover still validates;
     /// well under `initlock` so refresh triggers only late in the horizon. Default 144 (~1 day).
@@ -398,6 +411,8 @@ impl SdkConfig {
             deposit_token_id: None,
             poll_interval_secs: 5,
             auto_refresh: true,
+            // [REQ-49] OFF, and it is the requirement rather than a preference.
+            sweep_at_claim: false,
             auto_refresh_margin_blocks: 144,
             background_auto_refresh: false,
             auto_exit: true,
@@ -439,6 +454,7 @@ impl SdkConfig {
             deposit_token_id: None,
             poll_interval_secs: 30,
             auto_refresh: true,
+            sweep_at_claim: false,
             auto_refresh_margin_blocks: 144,
             background_auto_refresh: false,
             auto_exit: true,

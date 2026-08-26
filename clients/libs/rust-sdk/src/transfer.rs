@@ -3694,6 +3694,26 @@ mod split_math_tests {
         total + mercurylib::tesr::committed_fee_for_outputs(2, rate) + mercurylib::tesr::P2A_VALUE
     }
 
+    /// **[REQ-49] The sweep is OFF by default, and that IS the requirement.**
+    ///
+    /// *"It MUST be default-OFF until the cooperative exit it depends on is demonstrated end to
+    /// end"* — so a default of `true` would not be a nicer default, it would be a violation. Pinned
+    /// on the constructor every wallet in this tree uses, because a default is exactly the kind of
+    /// thing that gets flipped for a demo and never flipped back.
+    #[test]
+    fn the_sweep_is_default_off_because_req_49_requires_it() {
+        for cfg in [
+            crate::SdkConfig::regtest("w"),
+            crate::SdkConfig::mainnet("w", "https://se.example", "tcp://el.example:50001"),
+        ] {
+            assert!(
+                !cfg.sweep_at_claim,
+                "[REQ-49] the sweep must be OFF until the cooperative exit it depends on is \
+                 demonstrated end to end"
+            );
+        }
+    }
+
     /// **[REQ-83] WHICH LEAF BANDS THE PAYMENT LANE CAN ACTUALLY REACH — measured, not asserted.**
     ///
     /// §6.0.3 names four shapes and REQ-83 promises every amount from 1 sat up is expressible.
