@@ -1829,9 +1829,21 @@ that split on chain. Folding them in would tell an owner they can spend what the
 them would tell them they were not paid. The read propagates its errors for the same reason the token
 balance does — a failure that came back as zero would say a payment they hold does not exist.
 
-**What remains is the DELIVERY channel for a stub.** A tail travels the ordinary mailbox (coin-backed,
-has a slot). A stub has no mailbox key, and what its payee needs is the `SP` transaction rather than a
-secret — the output already pays their own key — so it is a different channel and not a claim path.
+**What remains is the in-protocol DELIVERY channel for a stub, and it is narrower than it sounds.**
+The mailbox route (`/transfer/update_msg`) carries a statechain HAND-OVER: it is opened with an `x1`
+against the child's slot and signed with the child coin's key. A tail has both and travels it
+unchanged. A stub has neither — no slot is created for it — so the route has nothing to sign with.
+
+What a stub's payee needs is not a secret but a DOCUMENT: the `SP` transaction, because the output
+already pays their own key. `adopt_stub_leaf` is that import point and it verifies against the chain
+exactly as the mailbox path does, so a stub handed over by any channel is as safe as one that arrived
+by post. What is missing is only the automatic channel — a bearer-document message kind, which is a
+route the coordinator does not have rather than a property the design lacks.
+
+**And it cannot be closed by making a stub coin-backed**, which is the obvious shortcut. A slot would
+put `SP.out[j]` at an aggregate, and a leg with no pre-signed rung cannot spend an aggregate output
+without the SE — the holder would lose unilateral exit, which is the one property this design exists
+to provide and the same reason §6.0.3's `Stub` row pays a plain key in the first place.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the
