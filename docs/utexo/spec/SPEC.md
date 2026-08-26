@@ -1094,6 +1094,43 @@ in refusal is a route whose success branch has never run.
    single-leaf: a coin that is its own only leaf, where "collapse" means paying yourself your own
    coin.
 
+**A TREE HAS NOW CLOSED.** `sdk94` runs the whole thing against the live stack: Alice deposits
+100 000, pays Bob 30 000 through an in-ladder split, asks the SE what the tree owes, builds `C`,
+obtains the SE's half, and broadcasts. The tree settled **on chain, in ONE transaction**, with both
+holders paid in full at their own keys — checked per output against the confirmed transaction rather
+than on the total, since a right total to a wrong distribution still discharges somebody unpaid.
+
+**Running it found four defects that reading it never would, and one of them was catastrophic.**
+
+1. **Every payee's leaf was orphaned from its own tree, so a collapse would not have paid them.** A
+   two-tier PIECE is observed twice: the extension rung carries the PARENT EDGE and the full funding
+   value but hands control to nobody, so it has no exit key; the state rung carries the key but
+   spends the coin's OWN extension, so it has no parent. `exit_key` was `NOT NULL`, so the first
+   observation could not insert — and its fallback was an `UPDATE … WHERE statechain_id = $1` that
+   **matched zero rows, committed, and returned success.** Every payee's leaf therefore landed with
+   the wrong root (itself), an underpaid funding value (its exit value, not its funding value — the
+   REQ-60 violation), and a funding outpoint pointing at an interior tier. **Measured: a tree owing
+   two holders 98 026 reported ONE obligation of 68 026.** After the fix: **two obligations,
+   68 026 + 30 000, both at full funding value.** The column is now nullable; NULL means "owed, but
+   the SE does not yet know where to pay them", and `validate` already refuses a set containing one
+   — so a tree with an unfinished leaf cannot be closed at all, which is the safe direction. A zero
+   placeholder would not be: 32 zero bytes are a well-formed key nobody controls.
+2. **`load_and_consume_secnonce` fills its out-parameters only if the caller pre-allocated them,
+   and consumes the sealed secnonce either way.** The collapse route passed two null pointers, so it
+   burned a freshly minted nonce and then reported "no unconsumed secnonce for this root" — a
+   statement about the database, and false. It now refuses BEFORE the read when handed an
+   unallocated buffer: consuming a nonce is not an operation to perform on the way to returning
+   nothing.
+3. **`collapse/first` must mint fresh rather than re-serve a dangling session.** The ordinary route
+   re-serves a stored pubnonce whose challenge is still null, reading that as "sign/first happened,
+   sign/second did not". On a root that has laddered and split, such a row survives whose secnonce
+   the enclave already consumed — the server logged two POSTs and the enclave logged none. Minting
+   is also the safer of the two: reuse means signing two DIFFERENT messages under one secnonce,
+   which is what re-serving a pubnonce into a new session sets up.
+4. **The SE returned the funding txid in internal byte order** under a name every client reads as
+   display order, so a `C` built from the SE's own answer was refused at the outpoint gate — the
+   right rule for the wrong reason.
+
 The first is `POST /collapse_grant`, which forwards whole and returns the SE's status and body
 unchanged — its refusals are six distinct named gates and a client that cannot tell them apart cannot
 act on any of them. The second is `POST /collapse/first`, which mints the nonce exempt from the
@@ -2407,7 +2444,7 @@ unbuilt sections, and they are marked as such in place.
 | Release (§5.4, `/release`) | **BUILT.** `lockbox/tests/test_release_route.cpp` — 10 checks against live Postgres and real BIP-340, three of them forgeries run BEFORE the honest path: no latch → refused (fails closed), someone else's key → refused, a signature over a DIFFERENT sid → refused (the tag binds it), replayed nonce → refused, fresh nonce → accepted, `released` monotone |
 | REQ-61 (§5.4, the owner latch) | **ARMING BUILT, ENFORCEMENT NOT.** The key is read structurally from the unique P2TR output and stored write-once (`ON CONFLICT DO NOTHING`); a second arming with a different key is a no-op. Measured live: 4 bound co-signatures → exactly 1 `LATCH_ARMED`. **Nothing yet refuses a co-signature for want of a BIP-340 by that key** — and REQ-61(b) must be settled first, since the payer co-signs the payee's tiers before the payee holds anything |
 | REQ-68 (§5.4, the coin binding) | **BUILT and MEASURED, coverage OPEN.** `sdk92` half (b) — a self-consistent disclosure built from keys unrelated to the coin, submitted under the coin's own sid, refused `403 AGGREGATE_MISMATCH` while the coin's own tiers are served in the same run; `lockbox/tests/test_aggregate_derive.cpp` (13 checks, incl. an adversary that cannot match a victim's aggregate); the SE↔client differential in `ci-guards/tests/emit_aggregate_vectors.rs`. Transfer-safety measured separately: the aggregate is invariant under `/keyupdate`, and a drifted `t2` is refused live. **Open: the check FAILS OPEN for 99.5 % of key slots — see V-7** |
-| REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **PARTIAL — this row said "NONE" and two of its three claims were false when checked.** *Frontier population:* BUILT and live — `observe_leaf` writes on every bound rung; 116 leaves and 36 parent edges stand in this environment's registry. *`collapse_grant`:* BUILT — the route exists, checks the REQ-68 aggregate BEFORE consuming the secnonce, and refuses 8 probe cases with 6 distinct reasons. *Freeze at grant time:* BUILT — `freeze_root_and_store_collapse_sig` writes the signature and the freeze in ONE transaction, so INV-FREEZE cannot be observed half-applied. **What is genuinely NOT exercised is the ACCEPT path**: `se_root` is empty, no root has ever been frozen, and every measurement above is of a refusal. A route measured only in refusal is a route whose success branch has never run |
+| REQ-55, REQ-58…REQ-60, REQ-62…REQ-67 (§5.4, the rest) | **PARTIAL — this row said "NONE" and two of its three claims were false when checked.** *Frontier population:* BUILT and live — `observe_leaf` writes on every bound rung; 116 leaves and 36 parent edges stand in this environment's registry. *`collapse_grant`:* BUILT — the route exists, checks the REQ-68 aggregate BEFORE consuming the secnonce, and refuses 8 probe cases with 6 distinct reasons. *Freeze at grant time:* BUILT — `freeze_root_and_store_collapse_sig` writes the signature and the freeze in ONE transaction, so INV-FREEZE cannot be observed half-applied. **The ACCEPT path now RUNS** (`sdk94`): a 100 000-sat tree with two unreleased leaves closed on chain in ONE transaction, both holders paid in full at their own keys, root frozen atomically with the signature. Running it exposed four defects reading never would — chief among them that **every payee's leaf was orphaned from its tree**, so a close would have paid the sender's change and not the payee. See §5.4.4 |
 | REQ-69, REQ-80 (§5.5, operator liquidity is ZERO) | **DESIGN.** The requirement is now that no operator capital exists on any path; there is nothing to measure until a close has been run. REQ-70…REQ-75 were DELETED with the round. |
 
 **Suite sizes.** Workspace unit + guard tests: **812**, 0 failures (`cargo test --workspace --tests`).

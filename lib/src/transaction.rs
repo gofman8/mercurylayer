@@ -39,6 +39,60 @@ pub struct PartialSignatureMsg1 {
     pub partial_signature_request_payload: PartialSignatureRequestPayload,
 }
 
+/// **[REQ-56] Ask the SE what a collapse of this root would have to pay.**
+///
+/// The question a closer must ask before it can build `C` at all, and the SE is the only party that
+/// can answer it: it recorded the leaves from the co-signatures it witnessed, it computes the
+/// frontier, and it alone sees which holders have released. Any other source of the obligation set is
+/// a second opinion that can only disagree with the one the predicate will actually use.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct CollapseObligationsRequest {
+    pub root_statechain_id: String,
+    pub statechain_id: String,
+    pub signed_statechain_id: String,
+}
+
+/// One holder's claim: their exit key, and the FULL funding value owed to it (REQ-60 — the two tier
+/// rungs are never broadcast, so their burn is never realised and is not deductible).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct CollapseObligation {
+    pub exit_key: String,
+    pub amount: u64,
+}
+
+/// What a collapse of this root would have to pay, and what it would have to spend.
+///
+/// **An empty `obligations` list is never returned as an answer.** "I have no usable leaf set for
+/// this root" comes back as a refusal, because an empty list reads as *"you owe nobody"* — the one
+/// answer that discharges every holder at once.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct CollapseObligations {
+    pub obligations: Vec<CollapseObligation>,
+    /// Reported, not an error: a closer asking after the freeze should be told the tree is already
+    /// closing rather than handed a refusal that looks like a malformed request.
+    pub frozen: bool,
+    pub have_funding_outpoint: bool,
+    #[serde(default)]
+    pub funding_txid: Option<String>,
+    #[serde(default)]
+    pub funding_vout: Option<u32>,
+}
+
+impl CollapseObligations {
+    /// Total owed to every unreleased frontier leaf — what `C` must pay out before any remainder.
+    pub fn total_owed(&self) -> u64 {
+        self.obligations.iter().map(|o| o.amount).sum()
+    }
+
+    /// The obligations in the `(key, amount)` form [`crate::tesr::build_collapse_tx`] takes.
+    pub fn payouts(&self) -> Vec<(String, u64)> {
+        self.obligations.iter().map(|o| (o.exit_key.clone(), o.amount)).collect()
+    }
+}
+
 /// **[REQ-56 / REQ-82] The request that asks the SE for its half of a COLLAPSE.**
 ///
 /// A collapse is not an ordinary spend and does not travel on the ordinary signing route, because

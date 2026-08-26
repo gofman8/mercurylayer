@@ -224,16 +224,35 @@ int main() {
     // `F`. These cases pin the two rules that difference forces.
     {
         const std::string obs = root + "_OBS";
-        // A value-only rung BEFORE any key-bearing rung must not conjure a row. Inserting one would
-        // need a placeholder exit key, and a 32-byte zero key is a well-formed key nobody controls:
-        // a collapse could "pay" the leaf into an unspendable output and the predicate would call
-        // itself satisfied.
+        // **INVERTED, and the old assertion was the defect.** This used to pin that a value-only
+        // rung creates NO row — correct about placeholder keys, wrong about everything else. The
+        // keyless branch was an `UPDATE ... WHERE statechain_id = $1` that matched nothing when the
+        // row did not exist, committed, and returned true. What it silently discarded was the
+        // observation carrying the PARENT EDGE, the FULL funding value and the real funding
+        // outpoint — so on the live lane every two-tier payee's leaf landed with the wrong root
+        // (itself), an underpaid funding value, and a funding outpoint pointing at an interior tier.
+        // A collapse then paid the sender's change and NOT the payee. Measured: a tree that owed two
+        // holders 98_026 reported ONE obligation of 68_026.
+        //
+        // The row is now created keyless, and being keyless is what keeps it safe: `exit_key` is
+        // NULL rather than a 32-byte zero placeholder — a well-formed key nobody controls, which
+        // would let a collapse "pay" the leaf into an unspendable output with the predicate calling
+        // itself satisfied — and `registry::validate` refuses any set containing it, so the tree
+        // cannot be closed until the SE knows where to pay this holder.
         check(db_manager::observe_leaf(obs, 150000, {}, {}, {}, -1, err),
               "a value-only observation succeeds");
         {
             std::vector<registry::Leaf> leaves;
             check(db_manager::load_leaves(obs, leaves, err), "load after value-only observation");
-            check(leaves.empty(), "a value-only observation creates NO row (no placeholder key)");
+            check(leaves.size() == 1, "a value-only observation DOES create a row — it carries the "
+                                      "parent edge and the funding value, and losing it orphans the leaf");
+            check(leaves.size() == 1 && leaves[0].fund_value == 150000,
+                  "and the row carries the FULL funding value that rung witnessed");
+            check(leaves.size() == 1 && leaves[0].exit_key.empty(),
+                  "with NO exit key — absent, never a zero placeholder");
+            check(registry::validate(leaves) == registry::SetError::MissingExitKey,
+                  "and a set containing a keyless leaf is REFUSED: a tree cannot close while the SE "
+                  "does not know where to pay one of its holders");
         }
 
         // The key-bearing rung establishes. This is the flat backup in the measured trace: it spends

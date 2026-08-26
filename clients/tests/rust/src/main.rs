@@ -28,6 +28,7 @@ pub mod rgb14_metadata_and_ifa_supply;
 pub mod rgb15_colored_tier_builder;
 pub mod rgb16_legacy_lane_uncolourable;
 pub mod sdk93_token_payment_keeps_sats;
+pub mod sdk94_collapse_grant;
 pub mod rgb_dump;
 pub mod sdk01_wallet_flow;
 pub mod sdk02_token_flow;
@@ -683,6 +684,10 @@ async fn main() -> Result<()> {
     // measuring the same ten legacy tests over and over. Reaching this point with a test var SET is
     // therefore never "run the default"; it is "the number you asked for has no handler".
     // [FOREIGN-REVEALED] A token payment must not cost the sender a carrier (SDK_E2E=93).
+    // [REQ-56] A tree actually CLOSES — the collapse's accept path (SDK_E2E=94).
+    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("94") {
+        return sdk94_collapse_grant::execute().await;
+    }
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("93") {
         return sdk93_token_payment_keeps_sats::execute().await;
     }

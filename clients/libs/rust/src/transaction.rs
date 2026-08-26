@@ -161,6 +161,36 @@ pub async fn collapse_first(
     Ok(server_pubnonce_hex)
 }
 
+/// **[REQ-56] Ask the SE what a collapse of this root would have to pay.**
+///
+/// The first call a closer makes. `collapse_grant` refuses a `C` that does not pay every unreleased
+/// frontier leaf its full funding value, and until this route existed there was no way to ask what
+/// that is — a caller could only guess, and every wrong guess costs a refusal. The SE is the only
+/// party that knows: it recorded the leaves from the co-signatures it witnessed, it computes the
+/// frontier, and it alone sees which holders have released.
+pub async fn collapse_obligations(
+    client_config: &ClientConfig,
+    payload: &mercurylib::transaction::CollapseObligationsRequest,
+) -> Result<mercurylib::transaction::CollapseObligations> {
+    let endpoint = client_config.statechain_entity.clone();
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/{}", endpoint, "collapse_obligations"))
+        .json(payload)
+        .send()
+        .await?;
+    let status = response.status();
+    let value = response.text().await?;
+    if status != StatusCode::OK {
+        return Err(anyhow::anyhow!(
+            "collapse_obligations refused ({}): {}",
+            status,
+            se_error_detail(value.as_str())
+        ));
+    }
+    Ok(serde_json::from_str::<mercurylib::transaction::CollapseObligations>(value.as_str())?)
+}
+
 /// **[REQ-56 / REQ-82] Ask the SE for its half of a collapse, and return its answer whole.**
 ///
 /// The SE's refusals are the interesting half of this route — six distinct gates, each naming its own
@@ -186,7 +216,16 @@ pub async fn collapse_grant(
         return Err(anyhow::anyhow!("collapse_grant refused ({}): {}", status, detail));
     }
 
-    Ok(serde_json::from_str::<mercurylib::transaction::CollapseGrantResponse>(value.as_str())?)
+    let mut grant =
+        serde_json::from_str::<mercurylib::transaction::CollapseGrantResponse>(value.as_str())?;
+    // The enclave hex-encodes with a `0x` prefix (the same convention as its pubnonces and txids),
+    // and every consumer here decodes bare hex. Stripped once, at the boundary, rather than at each
+    // use — the prefix reaching `create_signature` surfaces as a bare `HexError` that names neither
+    // the field nor the cause.
+    if let Some(bare) = grant.partial_sig.strip_prefix("0x") {
+        grant.partial_sig = bare.to_string();
+    }
+    Ok(grant)
 }
 
 pub async fn sign_second(client_config: &ClientConfig, partial_sig_request: &PartialSignatureRequestPayload) -> Result<MusigPartialSignature> {

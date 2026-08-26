@@ -153,7 +153,25 @@ namespace db_manager {
                 // REQ-65: the payee's x-only key, read from the WITNESSED payload output of the
                 // state tier — identified structurally as the unique P2TR output (REQ-61a), never at
                 // a client-supplied index.
-                "exit_key BYTEA NOT NULL, "
+                //
+                // **NULLABLE, and this was NOT NULL until a live close proved it could not be.** A
+                // two-tier PIECE is observed twice: the extension rung carries the PARENT EDGE and
+                // the full funding value but hands control to nobody, so it has no key; the state
+                // rung carries the key but spends the coin's OWN extension, so it has no parent.
+                // With the column NOT NULL the first observation could not insert, its `UPDATE`
+                // matched zero rows, and it was discarded reporting success — so every payee's leaf
+                // landed with the WRONG root (itself), an underpaid funding value (its exit value,
+                // not its funding value — the REQ-60 violation), and a funding outpoint pointing at
+                // an interior tier. A collapse would then pay the sender's change and NOT the payee.
+                //
+                // NULL means "owed, but the SE does not yet know where to pay them", and `validate`
+                // already refuses a leaf set containing one (`MissingExitKey`) — so a tree with an
+                // unfinished leaf cannot be closed at all. That is the safe direction: refusing to
+                // close beats closing without paying someone. A zero placeholder would NOT be, which
+                // is why the column is nullable rather than defaulted: 32 zero bytes are a
+                // well-formed key nobody controls, and a collapse could "pay" a leaf into an
+                // unspendable output with the predicate calling it satisfied.
+                "exit_key BYTEA, "
                 // REQ-61: write-once. NULL until armed.
                 "latch_key BYTEA, "
                 // Form (a)/(b): monotone, never cleared. A release is a consent record, not a
@@ -166,6 +184,12 @@ namespace db_manager {
                 // "some transaction the operator named" is not that check.
                 "fund_txid BYTEA, "
                 "fund_vout INTEGER);");
+            // **MIGRATION.** `exit_key` was created NOT NULL, and `CREATE TABLE IF NOT EXISTS` does
+            // nothing to a table that already exists — so a database from before this change would
+            // still reject the keyless observation that carries the parent edge, and keep producing
+            // orphaned, underpaid leaves. Idempotent: dropping a constraint that is already gone is
+            // a no-op.
+            txn.exec("ALTER TABLE se_leaf ALTER COLUMN exit_key DROP NOT NULL;");
             txn.exec(
                 "CREATE INDEX IF NOT EXISTS se_leaf_root ON se_leaf (root_statechain_id);");
             // Same reason as the composite key above: IF NOT EXISTS is a no-op on a live database.
@@ -447,6 +471,25 @@ namespace db_manager {
 
             if (result.empty()) {
                 error_message = "Failed to retrieve keypair. No data found !";
+                return false;
+            }
+
+            // **The caller must have allocated, and a caller that did not is a BUG rather than a
+            // request for less work.** These are in/out parameters: the branches below fill them
+            // only when they already point at something, so a caller passing nulls gets nulls back
+            // — while this function has ALREADY consumed the sealed secnonce. The result is a route
+            // that burns a nonce and then reports that none existed, which is a statement about the
+            // database and is false. `/collapse_grant` shipped exactly that, and the misdirection
+            // cost more to diagnose than the fault.
+            //
+            // Fail LOUD here rather than silently degrade: this is the shape this repository keeps a
+            // red test for, and consuming a nonce is not an operation to perform on the way to
+            // returning nothing.
+            if (encrypted_keypair == nullptr || encrypted_secnonce == nullptr) {
+                error_message =
+                    "load_and_consume_secnonce called with an unallocated out-parameter — the "
+                    "caller must supply owned buffers, or the sealed material is consumed and "
+                    "discarded. Refusing before the read.";
                 return false;
             }
 
@@ -1272,60 +1315,67 @@ namespace db_manager {
             }
 
             // exit_key is NOT NULL, so a first observation that carries no key cannot insert one.
-            // A 32-byte ZERO placeholder would be worse than useless: it is a well-formed key that
-            // no one controls, so a collapse could "pay" a leaf into an unspendable output and the
-            // predicate would call it satisfied. Instead the first key-bearing rung inserts, and
-            // value-only rungs before it raise the funding value of a row that already exists.
-            if (!exit_key_or_empty.empty()) {
-                txn.exec_params(
-                    "INSERT INTO se_leaf (statechain_id, parent_statechain_id, root_statechain_id, "
-                    "fund_value, exit_key, fund_txid, fund_vout) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7) "
-                    "ON CONFLICT (statechain_id) DO UPDATE SET "
-                    // GREATEST, never assignment: the funding value is the largest prevout this coin
-                    // was ever witnessed spending, and a later rung spends a SMALLER one (the burn).
-                    // Assignment here would ratchet every leaf DOWN to its state tier's value, which
-                    // is the exact underpayment REQ-60 forbids.
-                    "  fund_value = GREATEST(se_leaf.fund_value, EXCLUDED.fund_value), "
-                    // Write-once, like the latch and the aggregate: a re-pointable exit key is a
-                    // redirectable payout, and the party who could re-point it is the operator the
-                    // frontier exists to be checked against.
-                    "  exit_key = COALESCE(se_leaf.exit_key, EXCLUDED.exit_key), "
-                    "  parent_statechain_id = "
-                    "     COALESCE(se_leaf.parent_statechain_id, EXCLUDED.parent_statechain_id), "
-                    // The funding outpoint moves WITH the funding value. A later rung spends a
-                    // smaller output, so keeping its outpoint would record an interior tier as the
-                    // coin's funding output — and `collapse_grant` would then accept a `C` that
-                    // spends a tier rather than the root.
-                    "  fund_txid = CASE WHEN EXCLUDED.fund_value > se_leaf.fund_value "
-                    "                   THEN EXCLUDED.fund_txid ELSE se_leaf.fund_txid END, "
-                    "  fund_vout = CASE WHEN EXCLUDED.fund_value > se_leaf.fund_value "
-                    "                   THEN EXCLUDED.fund_vout ELSE se_leaf.fund_vout END;",
-                    statechain_id,
-                    parent.empty() ? pqxx::zview() : pqxx::zview(parent),
-                    root,
-                    prevout_value,
-                    pqxx::binarystring(exit_key_or_empty.data(), exit_key_or_empty.size()),
-                    fund_txid_or_empty.empty()
-                        ? pqxx::binarystring(nullptr, 0)
-                        : pqxx::binarystring(fund_txid_or_empty.data(), fund_txid_or_empty.size()),
-                    fund_vout);
-            } else {
-                txn.exec_params(
-                    "UPDATE se_leaf SET "
-                    "  fund_txid = CASE WHEN $2 > fund_value THEN $4 ELSE fund_txid END, "
-                    "  fund_vout = CASE WHEN $2 > fund_value THEN $5 ELSE fund_vout END, "
-                    "  fund_value = GREATEST(fund_value, $2), "
-                    "  parent_statechain_id = COALESCE(parent_statechain_id, $3) "
-                    "WHERE statechain_id = $1;",
-                    statechain_id,
-                    prevout_value,
-                    parent.empty() ? pqxx::zview() : pqxx::zview(parent),
-                    fund_txid_or_empty.empty()
-                        ? pqxx::binarystring(nullptr, 0)
-                        : pqxx::binarystring(fund_txid_or_empty.data(), fund_txid_or_empty.size()),
-                    fund_vout);
-            }
+            // **ONE upsert for both cases.** There used to be two, and the keyless one was an
+            // `UPDATE ... WHERE statechain_id = $1` that matched NOTHING when the row did not exist
+            // yet — committing, and returning true. That is the silent-degradation shape this repo
+            // has a red test for, in the one place where the failure is a holder who does not get
+            // paid: the observation it discarded was the one carrying the parent edge, the full
+            // funding value and the real funding outpoint.
+            //
+            // Every field is still write-once or monotone, so the order the rungs arrive in cannot
+            // change the answer — which is the property that makes a single upsert correct rather
+            // than merely shorter.
+            txn.exec_params(
+                "INSERT INTO se_leaf (statechain_id, parent_statechain_id, root_statechain_id, "
+                "fund_value, exit_key, fund_txid, fund_vout) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+                "ON CONFLICT (statechain_id) DO UPDATE SET "
+                // GREATEST, never assignment: the funding value is the largest prevout this coin
+                // was ever witnessed spending, and a later rung spends a SMALLER one (the burn).
+                // Assignment here would ratchet every leaf DOWN to its state tier's value, which
+                // is the exact underpayment REQ-60 forbids.
+                "  fund_value = GREATEST(se_leaf.fund_value, EXCLUDED.fund_value), "
+                // Write-once, like the latch and the aggregate: a re-pointable exit key is a
+                // redirectable payout, and the party who could re-point it is the operator the
+                // frontier exists to be checked against.
+                // Tolerant of NULL **and** of a zero-length bytea, because the two are not
+                // distinguishable at the call site here and a plain COALESCE would treat an empty
+                // value as "already written" — pinning the leaf keyless forever and making it
+                // unpayable. Still write-once for any REAL key: once a 32-byte key is stored, no
+                // later rung can move it.
+                "  exit_key = CASE WHEN se_leaf.exit_key IS NULL "
+                "                   OR length(se_leaf.exit_key) = 0 "
+                "                  THEN EXCLUDED.exit_key ELSE se_leaf.exit_key END, "
+                "  parent_statechain_id = "
+                "     COALESCE(se_leaf.parent_statechain_id, EXCLUDED.parent_statechain_id), "
+                // **The root is only ever CORRECTED TOWARD a real parent, never away from one.** A
+                // leaf with no parent is its own root; the moment any rung witnesses a parent, that
+                // parent's tree is the truth and the self-root was a placeholder. Written as a
+                // one-way move so the rungs may arrive in any order: a row that already names a
+                // foreign root keeps it, and a row still pointing at itself adopts the parent's.
+                "  root_statechain_id = CASE "
+                "     WHEN se_leaf.root_statechain_id = se_leaf.statechain_id "
+                "      AND EXCLUDED.root_statechain_id <> EXCLUDED.statechain_id "
+                "     THEN EXCLUDED.root_statechain_id ELSE se_leaf.root_statechain_id END, "
+                // The funding outpoint moves WITH the funding value. A later rung spends a
+                // smaller output, so keeping its outpoint would record an interior tier as the
+                // coin's funding output — and `collapse_grant` would then accept a `C` that
+                // spends a tier rather than the root.
+                "  fund_txid = CASE WHEN EXCLUDED.fund_value > se_leaf.fund_value "
+                "                   THEN EXCLUDED.fund_txid ELSE se_leaf.fund_txid END, "
+                "  fund_vout = CASE WHEN EXCLUDED.fund_value > se_leaf.fund_value "
+                "                   THEN EXCLUDED.fund_vout ELSE se_leaf.fund_vout END;",
+                statechain_id,
+                parent.empty() ? pqxx::zview() : pqxx::zview(parent),
+                root,
+                prevout_value,
+                exit_key_or_empty.empty()
+                    ? pqxx::binarystring(nullptr, 0)
+                    : pqxx::binarystring(exit_key_or_empty.data(), exit_key_or_empty.size()),
+                fund_txid_or_empty.empty()
+                    ? pqxx::binarystring(nullptr, 0)
+                    : pqxx::binarystring(fund_txid_or_empty.data(), fund_txid_or_empty.size()),
+                fund_vout);
             // Every parent, not just the column's one. `DO NOTHING` because a retried rung
             // re-presents the same edges and a second row would say nothing new.
             for (const auto& p : parents) {
@@ -1388,8 +1438,16 @@ namespace db_manager {
                 registry::Leaf l;
                 l.statechain_id = r[0].as<std::string>();
                 l.fund_value = static_cast<uint64_t>(r[2].as<int64_t>());
-                pqxx::binarystring key(r[3]);
-                l.exit_key.assign(key.data(), key.data() + key.size());
+                // NULL-safe: `exit_key` is nullable now, and a leaf observed only by a rung that
+                // hands control to nobody has no key YET. An empty vector is the honest answer —
+                // `registry::validate` refuses a set containing one (`MissingExitKey`), so the tree
+                // cannot be closed until every holder's destination is known. Constructing a
+                // `binarystring` from a NULL field throws, which would turn "this tree is not ready
+                // to close" into a 500.
+                if (!r[3].is_null()) {
+                    pqxx::binarystring key(r[3]);
+                    l.exit_key.assign(key.data(), key.data() + key.size());
+                }
                 l.released = r[4].as<bool>();
                 // EVERY parent (REQ-56a). The single column on `se_leaf` is kept for diagnostics
                 // only; reading the tree from it would reinstate the exact defect this closes.

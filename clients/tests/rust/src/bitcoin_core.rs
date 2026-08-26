@@ -124,3 +124,69 @@ pub fn getnewaddress() -> Result<String> {
 
     execute_bitcoin_command(&bitcoin_command)
 }
+
+/// Broadcast a fully signed transaction. Returns its txid, or the node's own refusal.
+///
+/// The node's reason is propagated verbatim rather than summarised: `min relay fee not met`,
+/// `dust`, `non-BIP68-final` and `missing-inputs` are four completely different findings, and a
+/// caller told only "broadcast failed" learns nothing from any of them.
+pub fn sendrawtransaction(tx_hex: &str) -> Result<String> {
+    // Straight to `bitcoin-cli`, not through `regtest.sh`: that script exposes only
+    // `mine`/`sendtoaddress`/`start`/`stop`, and an unknown subcommand fails with an empty message —
+    // which reads as "the broadcast was rejected" when nothing was ever offered to the node.
+    if rln_script().is_some() {
+        return run(Command::new("docker")
+            .arg("exec").arg("-u").arg("blits")
+            .arg(rln_bitcoind_container())
+            .arg("bitcoin-cli").arg("-regtest")
+            .arg("sendrawtransaction").arg(tx_hex));
+    }
+    execute_bitcoin_command(&format!("cli sendrawtransaction {}", tx_hex))
+}
+
+/// A confirmed transaction as the node sees it — used to check what actually landed ON CHAIN rather
+/// than what we believe we signed.
+pub fn getrawtransaction_verbose(txid: &str) -> Result<serde_json::Value> {
+    let raw = if rln_script().is_some() {
+        run(Command::new("docker")
+            .arg("exec").arg("-u").arg("blits")
+            .arg(rln_bitcoind_container())
+            .arg("bitcoin-cli").arg("-regtest")
+            .arg("getrawtransaction").arg(txid).arg("true"))?
+    } else {
+        execute_bitcoin_command(&format!("cli getrawtransaction {} true", txid))?
+    };
+    Ok(serde_json::from_str(&raw)?)
+}
+
+/// A fresh P2TR address's x-only key, for use as an exit key.
+///
+/// Returned as the 32-byte key rather than the address because that is the form the SE's leaf
+/// registry stores and the form `build_collapse_tx` pays to. Converting at the boundary once beats
+/// carrying two representations of the same key.
+pub fn getnewaddress_p2tr_xonly() -> Result<String> {
+    let addr = if rln_script().is_some() {
+        run(Command::new("docker")
+            .arg("exec").arg("-u").arg("blits")
+            .arg(rln_bitcoind_container())
+            .arg("bitcoin-cli").arg("-regtest").arg("-rpcwallet=miner")
+            .arg("getnewaddress").arg("").arg("bech32m"))?
+    } else {
+        execute_bitcoin_command("cli getnewaddress \"\" bech32m")?
+    };
+    let info = if rln_script().is_some() {
+        run(Command::new("docker")
+            .arg("exec").arg("-u").arg("blits")
+            .arg(rln_bitcoind_container())
+            .arg("bitcoin-cli").arg("-regtest").arg("-rpcwallet=miner")
+            .arg("getaddressinfo").arg(&addr))?
+    } else {
+        execute_bitcoin_command(&format!("cli getaddressinfo {}", addr))?
+    };
+    let v: serde_json::Value = serde_json::from_str(&info)?;
+    let spk = v["scriptPubKey"].as_str().ok_or_else(|| anyhow!("no scriptPubKey for {addr}"))?;
+    if spk.len() != 68 || !spk.starts_with("5120") {
+        return Err(anyhow!("{addr} is not P2TR (scriptPubKey {spk})"));
+    }
+    Ok(spk[4..].to_string())
+}

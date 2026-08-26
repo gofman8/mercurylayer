@@ -998,6 +998,95 @@ namespace lockbox {
         // over, and refuses if it does not reproduce the session it was asked to sign. Without that
         // the predicate would be verified against one transaction while the signature authorised
         // another — the whole point of the check, defeated at the last step.
+        // ── [REQ-56] WHAT A CLOSER HAS TO KNOW BEFORE IT CAN BUILD `C` ──────────────────────────
+        //
+        // `collapse_grant` refuses a `C` that does not pay every unreleased frontier leaf its full
+        // funding value. Until this route existed there was NO WAY TO ASK WHAT THAT IS. A closer had
+        // to already know the SE's leaf set, its frontier, and which holders had released — and the
+        // SE is the only party that knows all three: it recorded the leaves from the co-signatures it
+        // witnessed, and it alone sees `se_released`.
+        //
+        // So a caller could construct a `C` only by guessing, and every wrong guess costs a refusal.
+        // That is not a usability complaint: the obligation set is the SE's own answer to its own
+        // predicate, and any other source of it is a second opinion that can only disagree.
+        //
+        // **Read-only, and it discloses nothing new to this caller.** The frontier of a tree is the
+        // tree its ROOT OWNER built; the exit keys are the ones their own co-signatures armed. The
+        // mercury-server authenticates the request against the root's auth key before it reaches
+        // here, exactly as it does for the grant.
+        //
+        // `frozen` is reported rather than made an error: a closer that asks after the freeze should
+        // be told the tree is already closing, not handed a refusal that looks like a malformed
+        // request.
+        CROW_ROUTE(app, "/collapse_obligations")
+        .methods("POST"_method)([](const crow::request& req) {
+            auto body = crow::json::load(req.body);
+            if (!body || body.count("root_statechain_id") == 0) {
+                return crow::response(400, "required: root_statechain_id");
+            }
+            const std::string root_sid = body["root_statechain_id"].s();
+
+            std::string err;
+            std::vector<registry::Leaf> leaves;
+            if (!db_manager::load_leaves(root_sid, leaves, err)) {
+                return crow::response(500, "could not load the root's leaves: " + err);
+            }
+            // The SAME validation the grant runs, in the SAME order, and reported rather than
+            // silently repaired. "I have no usable leaf set for this root" must never reach a caller
+            // as an empty obligation list: an empty list reads as "you owe nobody", which is the one
+            // answer that discharges every holder at once.
+            if (const auto e = registry::validate_for_grant(leaves); e != registry::SetError::Ok) {
+                return crow::response(409,
+                                      std::string("the SE has no usable leaf set for this root: ") +
+                                          registry::describe(e));
+            }
+            if (const auto e = registry::validate(leaves); e != registry::SetError::Ok) {
+                return crow::response(409, std::string("the leaf set is malformed: ") +
+                                               registry::describe(e));
+            }
+
+            const auto obligations = registry::owed(leaves);
+            std::vector<unsigned char> fund_txid;
+            int64_t fund_vout = -1;
+            bool have_outpoint = false;
+            if (!db_manager::leaf_funding_outpoint(root_sid, fund_txid, fund_vout, have_outpoint,
+                                                   err)) {
+                return crow::response(500, "could not read the root's funding outpoint: " + err);
+            }
+
+            bool frozen = false;
+            if (!db_manager::is_root_frozen(root_sid, frozen, err)) {
+                return crow::response(500, "could not read the root's freeze state: " + err);
+            }
+
+            crow::json::wvalue result;
+            std::vector<crow::json::wvalue> rows;
+            rows.reserve(obligations.size());
+            for (const auto& [key_hex, amount] : obligations) {
+                crow::json::wvalue row;
+                row["exit_key"] = key_hex;
+                row["amount"] = static_cast<int64_t>(amount);
+                rows.push_back(std::move(row));
+            }
+            result["obligations"] = std::move(rows);
+            result["frozen"] = frozen;
+            result["have_funding_outpoint"] = have_outpoint;
+            if (have_outpoint) {
+                // **DISPLAY order, not internal.** The SE stores and compares txids in the order they
+                // appear in a serialized transaction; every txid a client parses — `Txid::from_str`,
+                // a block explorer, `bitcoin-cli` — is the REVERSE of that. Returning the internal
+                // order under the name `funding_txid` is a trap: the client builds a `C` spending a
+                // byte-reversed outpoint and the grant refuses it at the outpoint gate, naming the
+                // right rule for the wrong reason. Caught by running the first honest close, where
+                // the refusal read "C does not spend this root's funding output" about a `C` built
+                // from the SE's own answer.
+                std::vector<unsigned char> display(fund_txid.rbegin(), fund_txid.rend());
+                result["funding_txid"] = utils::key_to_string(display.data(), display.size());
+                result["funding_vout"] = static_cast<int64_t>(fund_vout);
+            }
+            return crow::response{result};
+        });
+
         CROW_ROUTE(app, "/collapse_grant")
         .methods("POST"_method)([&seed](const crow::request& req) {
             auto body = crow::json::load(req.body);
@@ -1211,8 +1300,14 @@ namespace lockbox {
             //    leak, closed here exactly as on the ordinary signing path.
             const int64_t negate_seckey =
                 body.count("negate_seckey") ? body["negate_seckey"].i() : 0;
-            std::unique_ptr<utils::chacha20_poly1305_encrypted_data> encrypted_keypair;
-            std::unique_ptr<utils::chacha20_poly1305_encrypted_data> encrypted_secnonce;
+            // ALLOCATED, not merely declared. `load_and_consume_secnonce` fills these only if they
+            // already point at something; two null pointers come back null, and the route then
+            // reports "no unconsumed secnonce for this root" — a statement about the DATABASE that
+            // is false. Worse, the load CONSUMES the sealed secnonce either way, so every attempt
+            // burned a freshly minted nonce and then denied finding one. Found by running the first
+            // honest close; see the guard now in `load_and_consume_secnonce` itself.
+            auto encrypted_keypair = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
+            auto encrypted_secnonce = std::make_unique<utils::chacha20_poly1305_encrypted_data>();
             unsigned char serialized_server_pubnonce[66];
             if (!db_manager::load_and_consume_secnonce(root_sid, encrypted_keypair,
                                                        encrypted_secnonce,

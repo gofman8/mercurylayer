@@ -150,6 +150,7 @@ async fn main() {
             endpoints::sign::sign_second,
             endpoints::collapse::collapse_first,
             endpoints::collapse::collapse_grant,
+            endpoints::collapse::collapse_obligations,
             endpoints::lightning_latch::get_paymenthash,
             endpoints::lightning_latch::get_batch_statechains,
             endpoints::lightning_latch::post_paymenthash,

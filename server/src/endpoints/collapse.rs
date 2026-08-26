@@ -125,16 +125,19 @@ pub async fn collapse_first(
         Err(e) => return e,
     };
 
-    // A dangling sign/first is re-served rather than minting a second nonce, exactly as on the
-    // ordinary route: two nonces for one coin is the reuse hazard this design refuses everywhere.
-    if let Some(existing) =
-        crate::database::sign::get_server_pubnonce_from_null_challenge(&statechain_entity.pool, &statechain_id).await
-    {
-        return status::Custom(
-            Status::Ok,
-            Json(json!(mercurylib::transaction::SignFirstResponsePayload { server_pubnonce: existing })),
-        );
-    }
+    // **ALWAYS MINT FRESH — deliberately NOT the ordinary route's re-serve, and this was found by
+    // running it.** `sign/first` re-serves a stored pubnonce when a session's challenge is still
+    // null, on the reading that such a row means "sign/first happened, sign/second did not". On a
+    // root that has laddered and split, a null-challenge row survives whose SECNONCE the enclave has
+    // already consumed — so the re-serve handed back a pubnonce with nothing behind it, and both
+    // collapse attempts died at `no unconsumed secnonce for this root` without a single request ever
+    // reaching the enclave. The server log showed two POSTs and the enclave log showed none.
+    //
+    // Minting fresh is also the SAFER of the two, which is what settles it. Reuse means signing two
+    // DIFFERENT messages under the SAME secnonce, and re-serving a pubnonce into a new session is
+    // exactly that setup; minting replaces the sealed secnonce, so the abandoned session simply
+    // becomes uncompletable — the correct outcome for a session nobody finished. The enclave
+    // consumes atomically either way, so at most one signature ever exists per nonce.
 
     let client = reqwest::Client::new();
     let value = match client
@@ -177,6 +180,68 @@ pub async fn collapse_first(
     crate::database::sign::insert_new_signature_data(&statechain_entity.pool, &server_pubnonce_hex, &statechain_id).await;
 
     status::Custom(Status::Ok, Json(json!(response)))
+}
+
+/// **Ask the SE what a collapse of this root would have to pay.**
+///
+/// Read-only, and it discloses nothing to this caller they did not already have: the frontier of a
+/// tree is the tree its root owner built, and the exit keys are the ones their own co-signatures
+/// armed. Authenticated against the ROOT's auth key exactly as the grant is, so it is not a public
+/// window onto anybody's tree.
+#[post("/collapse_obligations", format = "json", data = "<payload>")]
+pub async fn collapse_obligations(
+    statechain_entity: &State<StateChainEntity>,
+    payload: Json<mercurylib::transaction::CollapseObligationsRequest>,
+) -> status::Custom<Json<Value>> {
+    let statechain_entity = statechain_entity.inner();
+    let signer_id = payload.0.statechain_id.clone();
+    let root_id = payload.0.root_statechain_id.clone();
+
+    if !crate::endpoints::utils::validate_signature(
+        &statechain_entity.pool,
+        &payload.0.signed_statechain_id,
+        &signer_id,
+    ).await {
+        return status::Custom(
+            Status::Unauthorized,
+            Json(json!({ "message": "Signature does not match authentication key." })),
+        );
+    }
+
+    let lockbox_endpoint = match enclave_url_for(statechain_entity, &root_id).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(&format!("{}/{}", lockbox_endpoint, "collapse_obligations"))
+        .json(&json!({ "root_statechain_id": root_id }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            return status::Custom(
+                Status::InternalServerError,
+                Json(json!({ "error": "Internal Server Error", "message": err.to_string() })),
+            )
+        }
+    };
+    let code = resp.status().as_u16();
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(err) => {
+            return status::Custom(
+                Status::BadGateway,
+                Json(json!({ "message": format!("could not read the enclave's reply: {}", err) })),
+            )
+        }
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => status::Custom(passthrough_status(code), Json(v)),
+        Err(_) => status::Custom(passthrough_status(code), Json(json!({ "message": text }))),
+    }
 }
 
 /// **Ask the SE for its half of a collapse.** Forwards the request whole and returns the SE's answer
