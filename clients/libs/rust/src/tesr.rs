@@ -1090,7 +1090,7 @@ impl SpineTipBundle {
         // unbroadcastable, and this is the producer's only door: refusing here costs a rebuildable
         // record, refusing later costs the change leg. After the structural pass, per
         // `refuse_dust_payloads`.
-        refuse_dust_payloads(&cap_tx, &format!("spine tip {sid} cap"))?;
+        refuse_dust_payloads(&cap_tx, &format!("spine tip {sid} cap"), false)?;
         // [ANCHOR] + [OPRET] …and both exempt kinds bound, since this record has no Σ law to lean on
         // and NO colour-shape check runs over a cap at all — `verify_colored_shape` walks a
         // `TesrBundle`'s `exit_tiers()` and `validate` never calls it. The opret count is the tip's
@@ -2907,6 +2907,10 @@ pub async fn cosign_colored_spine_batch(
                 sp_vout: cd.sp_vout,
                 extension: None,
                 state: None,
+                // [REQ-84] The COLOURED lane carves no tails: a coloured tail is a burn switch
+                // (§6.0.5), refused by name. `None` here is that prohibition holding, not an
+                // omission.
+                release_fragment: None,
                 rgb: Some(ColoredChild {
                     contract_id: draft.contract_id.clone(),
                     amount: cd.rgb_amount,
@@ -4182,6 +4186,7 @@ pub async fn cosign_colored_in_ladder_split(
             .iter()
             .zip(child_sids.iter())
             .map(|(cd, sid)| SplitJournalChild {
+                release_fragment: None,
                 statechain_id: sid.clone(),
                 owner_exit_address: cd.owner_exit_address.clone(),
                 // The sats at `SP.out[j]` — what the child's extension spends.
@@ -4575,6 +4580,22 @@ pub enum SplitLegRole {
     /// because it funds no transaction of its own. Below dust it is a TAIL, which additionally
     /// constrains `SP` (§6.0.4) and is gated separately.
     Ladderless,
+    /// **[REQ-83 / REQ-84 / §6.0.4] A TAIL — a sub-dust leg, coin-backed, with no rung.**
+    ///
+    /// Like [`Self::Ladderless`] in carrying no tier, and unlike it in every other respect: a tail
+    /// is paid at the child's AGGREGATE address and does have an SE slot.
+    ///
+    /// **Why it must, worked out from the relay rule rather than chosen.** A sub-dust output forces
+    /// its transaction to pay zero fee, and the package child that bumps it is REQUIRED to spend the
+    /// dust (§6.0.1). So whoever broadcasts must already hold authority over the tail — which means
+    /// the release fragment has to exist at SPLIT time, when the payee does not yet exist and only
+    /// the sender is present. The sender can only co-sign it while holding the slot, so the slot is
+    /// not optional.
+    ///
+    /// What a tail is worth follows from the same fact: it is spendable OFF-CHAIN, and if the tree
+    /// ever settles on chain its satoshis are swept as fee credit by whoever broadcasts. §6.0.4 calls
+    /// that the price of riding for free.
+    Tail,
 }
 
 impl SplitLegRole {
@@ -4598,6 +4619,9 @@ impl SplitLegRole {
             // No rung ⟹ no rung to fund. The floor is the output's own spendability and nothing
             // else, which is exactly what §6.0.3 means by "floor is exactly 330".
             SplitLegRole::Ladderless => dust_limit,
+            // [REQ-83] One satoshi. A tail funds nothing at all — not a rung, not a backup, not even
+            // its own transaction's fee — so the only thing it must clear is being a payment.
+            SplitLegRole::Tail => 1,
         }
     }
 
@@ -4613,6 +4637,12 @@ impl SplitLegRole {
             // destroyed by the first spend of it. The floor is stated anyway rather than left to a
             // catch-all, so that admitting one would take a deliberate edit here as well.
             SplitLegRole::Ladderless => dust_limit,
+            // A coloured tail is a BURN SWITCH (§6.0.5): the fragment authorises anyone to spend the
+            // outpoint to any outputs, and spending a sealed outpoint without carrying its
+            // allocation forward destroys it — so the prize stops being ≤329 sat and becomes the
+            // whole allocation. `refuse_coloured_tail` refuses one by name; the floor is stated here
+            // anyway so admitting one would take a deliberate edit in both places.
+            SplitLegRole::Tail => dust_limit,
         }
     }
 }
@@ -4774,6 +4804,10 @@ pub struct SplitJournalChild {
     /// struct has no such guarantee, which is why it carries no default.
     #[serde(default)]
     pub role: SplitLegRole,
+    /// **[REQ-84]** A TAIL leg's release fragment, hex. `None` on every other role, and `None` on a
+    /// tail means the leg is UNFINISHED — the fragment is that leg's only signed material.
+    #[serde(default)]
+    pub release_fragment: Option<String>,
     /// **[K>1 prerequisite 2] THE RECIPIENT'S TRANSFER ADDRESS, journalled at PLAN time.**
     ///
     /// `owner_exit_address` is NOT a substitute and cannot be made into one:
@@ -4873,6 +4907,8 @@ pub enum SplitLeg {
     Piece(ChildTesrBundle),
     /// The sender's own change leg (`spinetip-`).
     Tip(SpineTipBundle),
+    /// **[REQ-83/REQ-84]** A sub-dust TAIL leg and its release fragment.
+    Tail(TailLeaf),
     /// **[REQ-83]** A payee's LADDERLESS claim on `SP.out[j]`. Not a coin: there is nothing to
     /// persist as one, and nothing for the SE to co-sign.
     Ladderless(LadderlessLeaf),
@@ -4940,6 +4976,42 @@ impl SplitJournalRecord {
             // carved. `None` on the two plain lanes, where it always was.
             rgb: c.rgb.clone(),
             parent_flat_backups: self.parent_flat_backups.clone(),
+        })
+    }
+
+    /// **[REQ-84] Rebuild leg `j` as a TAIL, with its release fragment.**
+    ///
+    /// Refuses a record with no fragment rather than producing a leg without one: a tail without a
+    /// fragment cannot be broadcast by anybody and strands every sibling on the split, so handing
+    /// one back as if it were conveyable would move the failure to the receiver.
+    pub fn tail_leaf(&self, j: usize) -> Result<TailLeaf> {
+        let c = self.children.get(j).ok_or_else(|| {
+            anyhow::anyhow!("in-ladder split {} has no leg {j}", self.op_id)
+        })?;
+        if c.role != SplitLegRole::Tail {
+            return Err(anyhow::anyhow!("journalled leg {j} is not a tail"));
+        }
+        if c.extension.is_some() || c.state.is_some() {
+            return Err(anyhow::anyhow!(
+                "journalled leg {j} is a TAIL but carries a tier — a tail has no rung, and that tier \
+                 was signed against an outpoint the leg does not own"
+            ));
+        }
+        let fragment = c.release_fragment.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "journalled leg {j} is a TAIL with no release fragment (REQ-84). Without one the \
+                 split cannot be put on chain by anybody, so every sibling on it is stranded."
+            )
+        })?;
+        Ok(TailLeaf {
+            parent: self.parent.clone(),
+            parent_statechain_id: self.parent_statechain_id.clone(),
+            sp_vout: c.sp_vout,
+            child_statechain_id: c.statechain_id.clone(),
+            child_owner_exit_address: c.owner_exit_address.clone(),
+            ancestors: self.ancestors.clone(),
+            parent_flat_backups: self.parent_flat_backups.clone(),
+            release_fragment: fragment,
         })
     }
 
@@ -5068,6 +5140,11 @@ impl SplitJournalRecord {
                 // [REQ-83] Nothing to co-sign and nothing to persist as a coin — the leg IS the
                 // output, so it is rebuilt as a claim on it.
                 SplitLegRole::Ladderless => self.ladderless_leaf(j).map(SplitLeg::Ladderless),
+                // [REQ-84] A tail rebuilds WITH its fragment. The journal is where that fragment
+                // lives between the co-sign and the conveyance, and a record missing it produces a
+                // leg no receiver will accept — which is the correct outcome, loudly, rather than a
+                // bundle that looks complete and cannot be broadcast.
+                SplitLegRole::Tail => self.tail_leaf(j).map(SplitLeg::Tail),
             })
             .collect()
     }
@@ -5672,6 +5749,22 @@ pub async fn resume_in_ladder_split(
             // co-sign, so there is nothing a replay could finish. A record carrying tiers on one is
             // corruption — the leg's whole definition is that nothing was signed for it — and
             // continuing would convey a leaf whose shape contradicts its own journal.
+            // [REQ-84] A TAIL is complete when `SP` exists AND its fragment has been produced.
+            // The fragment is the leg's only signed material, so a record without one is genuinely
+            // unfinished — not corrupt — and saying so is what lets a replay finish it.
+            SplitLegRole::Tail => {
+                if rec.children[j].extension.is_some() || rec.children[j].state.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "cannot resume in-ladder split {}: leg {j} is journalled as a TAIL but \
+                         carries a tier. A tail has no rung; a tier there was signed against an \
+                         outpoint the leg does not own.",
+                        rec.op_id
+                    ));
+                }
+                if rec.children[j].release_fragment.is_some() {
+                    continue;
+                }
+            }
             SplitLegRole::Ladderless => {
                 if rec.children[j].extension.is_some() || rec.children[j].state.is_some() {
                     return Err(anyhow::anyhow!(
@@ -5731,6 +5824,18 @@ pub async fn resume_in_ladder_split(
             // `continue`, which it always does — kept as an explicit arm so a future change to that
             // pass cannot silently route a ladderless leg into a tier builder.
             SplitLegRole::Ladderless => {}
+            // [REQ-84] A tail's only signed material is its FRAGMENT, and it is produced at plan
+            // time by the party holding the slot. Reaching here means the completeness pass found
+            // none — which cannot be repaired now: the sender may no longer hold the slot, and
+            // fabricating one later would be signing over an outpoint somebody else owns.
+            SplitLegRole::Tail => {
+                return Err(anyhow::anyhow!(
+                    "cannot resume in-ladder split {}: leg {j} is a TAIL with no release fragment. \
+                     The fragment is co-signed at SPLIT time, while the sender still holds the slot; \
+                     there is no later moment at which it can honestly be produced.",
+                    rec.op_id
+                ));
+            }
         }
     }
     rec.stage = SplitStage::Established;
@@ -5961,10 +6066,14 @@ pub async fn in_ladder_split(
     // is admitted through the tail lane rather than this one.
     for (addr, v) in ladderless {
         if *v < mercurylib::tesr::DUST_LIMIT {
+            // A sub-dust leg IS a tail, and a tail must be COIN-BACKED: its release fragment has to
+            // be co-signed while the sender still holds the slot (§6.0.4), and a plain-key claim has
+            // no slot to co-sign with. Refused here rather than silently promoted, because the
+            // caller decided which legs get slots before any voucher was spent.
             return Err(anyhow::anyhow!(
                 "ladderless leg paying {addr} is worth {v} sat, below the {}-sat dust floor. A \
-                 sub-dust claim is a TAIL: it forces SP to carry the funded anchor at ZERO fee and \
-                 to carry at most one such output, and it is admitted through that lane, not this one",
+                 sub-dust leg is a TAIL and must be coin-backed: its release fragment is co-signed \
+                 while the sender holds the slot, and a plain-key claim has no slot",
                 mercurylib::tesr::DUST_LIMIT
             ));
         }
@@ -5973,9 +6082,35 @@ pub async fn in_ladder_split(
     // is too short for even one level — check rather than assume. [P0-3] The parent's REAL tier count
     // goes with it: a rolled-over ladder is `1 + 2·levels.len()` transactions, and the children's
     // exit walks inherit every one of them.
-    // Value conservation — no mint, no burn (build_split_state re-checks, but fail early with context).
-    let total = mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
-        .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?;
+    // [REQ-83] A sub-dust leg makes this a TAIL split, and a tail split pays ZERO fee (§6.0.1) —
+    // so its conservation law is `funding − P2A_VALUE`, not `funding − committed_fee − P2A_VALUE`.
+    // Decided from the LEG VALUES, structurally, never from a caller's flag.
+    let n_tails = children
+        .iter()
+        .map(|(_, _, v)| *v)
+        .chain(ladderless.iter().map(|(_, v)| *v))
+        .filter(|v| *v < mercurylib::tesr::DUST_LIMIT)
+        .count();
+    if n_tails > 1 {
+        // [REQ-85] The one-tail cap, refused before anything is built. It is what keeps the maximum
+        // sweepable prize below the minimum cost of broadcasting, and the transaction would be
+        // non-standard anyway (`MAX_DUST_OUTPUTS_PER_TX = 1`).
+        return Err(anyhow::anyhow!(
+            "this split carries {n_tails} sub-dust legs. Bitcoin permits ONE per transaction, and \
+             the one-tail cap is what keeps sweeping a tail unprofitable (§6.0.4) — pay the others \
+             at or above the {}-sat floor, or in a second split",
+            mercurylib::tesr::DUST_LIMIT
+        ));
+    }
+    // Value conservation — no mint, no burn (the builders re-check, but fail early with context).
+    let total = if n_tails == 1 {
+        x_m.out_value
+            .checked_sub(mercurylib::tesr::P2A_VALUE)
+            .ok_or_else(|| anyhow::anyhow!("funding cannot carry the anchor"))?
+    } else {
+        mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
+            .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?
+    };
     let sum: u64 = children.iter().map(|(_, _, v)| *v).sum::<u64>()
         + ladderless.iter().map(|(_, v)| *v).sum::<u64>();
     if sum != total {
@@ -6023,15 +6158,17 @@ pub async fn in_ladder_split(
                 .aggregated_address
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))?,
-            role: if mercurylib::tesr::LeafShape::for_value(
+            role: match mercurylib::tesr::LeafShape::for_value(
                 *v,
                 p.committed_fee_rate,
                 mercurylib::tesr::DUST_LIMIT,
-            ) == mercurylib::tesr::LeafShape::SpineTip
-            {
-                SplitLegRole::ThinPiece
-            } else {
-                SplitLegRole::Piece
+            ) {
+                mercurylib::tesr::LeafShape::SpineTip => SplitLegRole::ThinPiece,
+                // [REQ-83] Sub-dust: a TAIL. Coin-backed like any other leg here — the fragment
+                // must be co-signed while the sender still holds the slot (§6.0.4), so a tail
+                // cannot be the plain-key ladderless shape.
+                mercurylib::tesr::LeafShape::Tail => SplitLegRole::Tail,
+                _ => SplitLegRole::Piece,
             },
         });
     }
@@ -6064,9 +6201,20 @@ pub async fn in_ladder_split(
     }
     let payees: Vec<(String, u64)> =
         plan.iter().map(|l| (l.payee_address.clone(), l.value)).collect();
-    let sp = mercurylib::tesr::build_split_state(
-        &x_m.txid, x_m.out_value, &payees, &bundle.network, sp_csv, bundle.fee_rate,
-    )?;
+    let sp = if n_tails == 1 {
+        mercurylib::tesr::build_tail_split_state_from(
+            &x_m.txid,
+            mercurylib::tesr::UNCOLORED_PAYLOAD_VOUT,
+            x_m.out_value,
+            &payees,
+            &bundle.network,
+            sp_csv,
+        )?
+    } else {
+        mercurylib::tesr::build_split_state(
+            &x_m.txid, x_m.out_value, &payees, &bundle.network, sp_csv, bundle.fee_rate,
+        )?
+    };
 
     // Terminalize the parent (SP consumes the last budget slot) and co-sign SP under A_parent.
     let parent_sid = parent_coin
@@ -6164,6 +6312,7 @@ pub async fn in_ladder_split(
                 pending_extension: None,
                 pending_state: None,
                 role: *role,
+                release_fragment: None,
                 recipient_address: recipients[j].clone(),
                 conveyance: ConveyanceStage::Pending,
                 conveyance_x1: None,
@@ -6203,6 +6352,43 @@ pub async fn in_ladder_split(
     journal.stage = SplitStage::Signed;
     journal_write(cc, wallet_name, &journal).await?;
     crash_point("after_inladder_sp_sign");
+
+    // ── [REQ-84] THE TAIL'S RELEASE FRAGMENT, produced HERE and nowhere else ─────────────────────
+    //
+    // After `SP` is signed, because the fragment is over an outpoint of `SP` and `SP.txid` is not
+    // final until it is. Before any leg is conveyed, because the sender must still hold the slot:
+    // the fragment is a co-signature under the tail's aggregate, and once the slot is handed over
+    // there is no honest way to produce one.
+    //
+    // Journalled the moment it exists. A tail with no fragment is a HOSTAGE — the package child that
+    // bumps a zero-fee split is required to spend the dust, so nobody can put the split on chain and
+    // every sibling on it is stranded, which is precisely Spark's failure and what REQ-84 forbids.
+    for j in 0..journal.children.len() {
+        if journal.children[j].role != SplitLegRole::Tail {
+            continue;
+        }
+        let vout = journal.children[j].sp_vout;
+        let sid = journal.children[j].statechain_id.clone();
+        let tail_coin = children
+            .iter_mut()
+            .find(|(c, _, _)| c.statechain_id.as_deref() == Some(sid.as_str()))
+            .map(|(c, _, _)| c)
+            .ok_or_else(|| {
+                anyhow::anyhow!("tail leg {sid} has no coin to co-sign its release fragment with")
+            })?;
+        let sp_tx: electrum_client::bitcoin::Transaction =
+            electrum_client::bitcoin::consensus::deserialize(&hex::decode(&parent_seg.current().state.signed_tx)?)?;
+        let prevout = sp_tx
+            .output
+            .get(vout as usize)
+            .ok_or_else(|| anyhow::anyhow!("SP has no output {vout} for the tail leg"))?
+            .clone();
+        let fragment =
+            cosign_release_fragment(cc, tail_coin, &sp.txid, vout, &prevout).await?;
+        journal.children[j].release_fragment = Some(fragment);
+        journal_write(cc, wallet_name, &journal).await?;
+        crash_point("after_inladder_tail_fragment");
+    }
 
     // Each leg: a PIECE gets a headless ladder off SP.out[j] paying its recipient (Model A); the
     // sender's own change gets ONE cap. Dispatched on the journalled role, which was written before
@@ -6750,6 +6936,7 @@ async fn spine_batch_split_ex(
                 pending_extension: None,
                 pending_state: None,
                 role: *role,
+                release_fragment: None,
                 recipient_address: recipients[j].clone(),
                 conveyance: ConveyanceStage::Pending,
                 conveyance_x1: None,
@@ -8348,6 +8535,7 @@ pub async fn child_in_ladder_split(
                 pending_extension: None,
                 pending_state: None,
                 role: *role,
+                release_fragment: None,
                 recipient_address: recipients[j].clone(),
                 conveyance: ConveyanceStage::Pending,
                 conveyance_x1: None,
@@ -11497,7 +11685,64 @@ fn verify_superseded_segment(
 /// `payload_vout` — so there is no index to pin and `mod linked`'s ceremony does not apply to it. It
 /// must still run AFTER the structural pass and after the Σ / count laws of the same tier, or it
 /// shadows their far more specific diagnostics with a generic value message. See the call sites.
-fn refuse_dust_payloads(tx: &electrum_client::bitcoin::Transaction, what: &str) -> Result<()> {
+fn refuse_dust_payloads(
+    tx: &electrum_client::bitcoin::Transaction,
+    what: &str,
+    // **[REQ-83] Whether this tier has ALREADY been proved a tail split by the Σ law above.**
+    //
+    // Passed in rather than re-derived, and that is the whole safety of relaxing this function: the
+    // caller knows the tier's FUNDING value and this function does not, so only the caller can tell
+    // "pays zero fee, carries one sub-dust output, funded anchor" from "someone starved a payload".
+    // A version that decided for itself, from the outputs alone, would let a poisoner pick the law
+    // their tier is judged under — which is exactly the softening the comment above warns about.
+    tail_split: bool,
+) -> Result<()> {
+    // ── [REQ-83] ONE sub-dust payload is legitimate now, and ONLY as a well-formed TAIL ──────────
+    //
+    // This function used to refuse EVERY sub-dust payload, and the comment above records why a first
+    // attempt to relax it was wrong: on a tier a sub-dust output is an ATTACK, and reporting it as
+    // "a well-formed tail, admission pending" softened a security refusal into a feature notice.
+    //
+    // What has changed is not the judgement but the ORDER it can now be made in. `tail_verdict`
+    // decides what a well-formed tail is — exactly one sub-dust output, in a transaction carrying
+    // the FUNDED 240 anchor — and by the time this runs, the Σ law has already applied the ZERO-FEE
+    // conservation to any tier carrying one. So a sub-dust output reaching here has already proved
+    // it belongs to a tail split; anything else failed conservation first, with its own message.
+    //
+    // A poisoner who sets a victim's slot to 1 sat and rebalances the rest to themselves still
+    // passes here — and is caught where it is actually visible: the leg's own value against what the
+    // payee was told they would be paid (`verify_tail_leaf`, `verify_child_bundle`). The dust floor
+    // was never the check that caught that; it only ever caught it by accident.
+    // `tail_verdict` takes `(value, spk)` pairs so it can be unit-tested without a transaction, and
+    // the anchor value it is TOLD is the one it must find funded — passing `None` would ask it to
+    // judge a shape with no anchor at all, which is Spark's and is refused elsewhere.
+    let outs: Vec<(u64, Vec<u8>)> = tx
+        .output
+        .iter()
+        .map(|o| (o.value, o.script_pubkey.as_bytes().to_vec()))
+        .collect();
+    if tail_split {
+        if let mercurylib::tesr::TailVerdict::WellFormed { vout, .. } =
+            mercurylib::tesr::tail_verdict(&outs, Some(mercurylib::tesr::P2A_VALUE))
+        {
+        for (i, o) in tx.output.iter().enumerate() {
+            if i as u32 == vout
+                || o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES
+                || o.script_pubkey.is_op_return()
+            {
+                continue;
+            }
+            if o.value < mercurylib::tesr::DUST_LIMIT {
+                return Err(anyhow::anyhow!(
+                    "{what}: payload output {i} carries {} sat alongside a tail at {vout} — a \
+                     transaction may carry ONE sub-dust output and no more (REQ-85)",
+                    o.value
+                ));
+            }
+            }
+            return Ok(());
+        }
+    }
     for (vout, o) in tx.output.iter().enumerate() {
         if o.script_pubkey.as_bytes() == mercurylib::tesr::P2A_SCRIPT_BYTES
             || o.script_pubkey.is_op_return()
@@ -11867,6 +12112,13 @@ fn verify_bundle_ex(
     // `f_onchain` closes it, and only when the caller actually has a chain fact to close it with —
     // see the parameter's own note. This is `37d8bba`'s child-lane anchor moved down to where both
     // lanes pass through, so a caller inherits it rather than having to remember it.
+        // **[REQ-83] Which tiers are TAIL SPLITS, decided by the Σ law and remembered.**
+        //
+        // The dust-floor pass runs in its own loop below and does not see a tier's FUNDING value, so
+        // it cannot tell "pays zero fee and carries one tail" from "someone starved a payload". The
+        // Σ law can and does; the verdict is carried across rather than re-derived, because a second
+        // derivation from the outputs alone is precisely the one a poisoner could satisfy.
+        let mut tail_split_tiers = vec![false; txs.len()];
     {
         let rung_forward = |prev: u64, n_payload: usize, what: &str| -> Result<u64> {
             let v = if bundle.is_colored() {
@@ -11925,7 +12177,51 @@ fn verify_bundle_ex(
             if n_payload == 0 {
                 return Err(anyhow::anyhow!("{what} has no payload output at all"));
             }
-            let expect = rung_forward(prev_payload, n_payload, &what)?;
+            // **[REQ-83] A TAIL SPLIT CONSERVES DIFFERENTLY, and the discriminator is STRUCTURAL.**
+            //
+            // A sub-dust payload output forces its transaction to pay ZERO fee (§6.0.1), so such a
+            // tier forwards `funding − P2A_VALUE` where every other forwards
+            // `funding − committed_fee − P2A_VALUE`. Read off the OUTPUTS — exactly one payload
+            // below `DUST_LIMIT` — never from a declared flag: a sender who could choose which law
+            // applies could take the committed fee out of the payees and call it a tail.
+            //
+            // [REQ-85] More than one sub-dust payload is refused outright rather than measured. Two
+            // tails make the transaction non-standard (`MAX_DUST_OUTPUTS_PER_TX = 1`) and break the
+            // economic argument that keeps sweeping unprofitable, so there is no law under which
+            // such a tier is well-formed.
+            //
+            // **The discriminator is ZERO FEE, not "has a sub-dust output" — and the difference is a
+            // hole a poisoner would otherwise choose for themselves.** Keyed on the sub-dust output
+            // alone, an attacker who starves ONE payload output would have their tier judged under
+            // the tail law, which forgives the committed fee they just kept. So the test is that the
+            // transaction pays NOTHING: Σ over EVERY output, anchor included, equals its funding.
+            // That is the defining property of the shape (§6.0.1) and a poisoner cannot satisfy it
+            // without giving the fee back.
+            let paid_out: u64 = txs[i].output.iter().map(|o| o.value).sum();
+            let zero_fee = paid_out == prev_payload;
+            let sub_dust = txs[i]
+                .output
+                .iter()
+                .filter(|o| {
+                    o.script_pubkey.as_bytes() != mercurylib::tesr::P2A_SCRIPT_BYTES
+                        && !o.script_pubkey.is_op_return()
+                        && o.value < mercurylib::tesr::DUST_LIMIT
+                })
+                .count();
+            let is_tail_split = zero_fee && sub_dust == 1;
+            tail_split_tiers[i] = is_tail_split;
+            if sub_dust > 1 && zero_fee {
+                return Err(anyhow::anyhow!(
+                    "{what} carries {sub_dust} sub-dust payload outputs. Bitcoin permits ONE per                      transaction, and the one-tail cap is what keeps the maximum sweepable prize                      below the cost of broadcasting (REQ-85) — this tier is non-standard and its                      shape is not one this design defines"
+                ));
+            }
+            let expect = if is_tail_split {
+                prev_payload
+                    .checked_sub(mercurylib::tesr::P2A_VALUE)
+                    .ok_or_else(|| anyhow::anyhow!("{what}: funding cannot carry the anchor"))?
+            } else {
+                rung_forward(prev_payload, n_payload, &what)?
+            };
             // Σ over the payload outputs — which for the single-payload case is just `out[payload_vout]`,
             // and for `SP` is every child's slot. Summing rather than checking one output is what makes
             // an EXTRA output impossible to hide: any sats routed elsewhere make the sum come up short.
@@ -12010,7 +12306,7 @@ fn verify_bundle_ex(
     // check would only ever shadow its far more specific colour message.
     for i in 0..txs.len() {
         let what = if i == 0 { "the trigger".to_string() } else { format!("tier {i}") };
-        refuse_dust_payloads(&txs[i], &what)?;
+        refuse_dust_payloads(&txs[i], &what, tail_split_tiers[i])?;
         // [REQ-86] Named separately from the blanket dust rule ABOVE, and deliberately redundant with
         // it today. `refuse_dust_payloads` forbids every sub-dust payload, so this cannot fire yet —
         // but the moment REQ-83 admits tails for sats that blanket stops covering the coloured case,
@@ -12479,6 +12775,170 @@ pub fn verify_ladderless_leaf(
     Ok(())
 }
 
+/// **[REQ-84] The canonical transaction a release fragment is signed over.**
+///
+/// `SIGHASH_NONE | ANYONECANPAY` commits to this input's outpoint and amount, and to the
+/// transaction's version, locktime and this input's `nSequence` — but to NO outputs. So the fragment
+/// is a licence to spend ONE outpoint to outputs of the sweeper's choosing, and the three fields it
+/// does commit to have to be a CONVENTION: a sweeper who used a different version or sequence would
+/// hold a signature over a message their transaction does not produce.
+///
+/// Fixed here, once, so the signer and every future sweeper cannot disagree. The output vector is
+/// empty because `SIGHASH_NONE` genuinely does not commit to it — an empty vector is the honest
+/// statement of that, and it cannot be mistaken for a commitment.
+pub fn canonical_release_spend(
+    tail_txid: &str,
+    tail_vout: u32,
+) -> Result<electrum_client::bitcoin::Transaction> {
+    use electrum_client::bitcoin::{absolute::LockTime, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, Txid, Witness};
+    let txid = Txid::from_str(tail_txid)
+        .map_err(|_| anyhow::anyhow!("release fragment: {tail_txid} is not a txid"))?;
+    Ok(Transaction {
+        version: 3,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: tail_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![],
+    })
+}
+
+/// **[REQ-83 / REQ-84 / §6.0.4] A TAIL leaf — a sub-dust leg with no rung, and its release fragment.**
+///
+/// Coin-backed, unlike [`LadderlessLeaf`]: `SP.out[sp_vout]` pays the child's AGGREGATE, and the leg
+/// has an SE slot. See [`SplitLegRole::Tail`] for why that is forced rather than chosen — the
+/// fragment must exist at SPLIT time and only the sender is present then.
+///
+/// **The fragment is what makes the tail safe to exist**, and REQ-84 is emphatic about the
+/// direction: a tail WITHOUT one is a hostage. It makes the split unbroadcastable (the package child
+/// must spend the dust and nobody can) and so strands every sibling on it — precisely Spark's
+/// failure, which §6.0.1 measures.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TailLeaf {
+    pub parent: TesrBundle,
+    pub parent_statechain_id: String,
+    pub sp_vout: u32,
+    pub child_statechain_id: String,
+    /// The payee's own exit key. Not where the tail is PAID — that is the aggregate — but where its
+    /// value goes if the payee ever moves it off-chain.
+    pub child_owner_exit_address: String,
+    #[serde(default)]
+    pub ancestors: Vec<ChildSegment>,
+    #[serde(default)]
+    pub parent_flat_backups: Vec<mercurylib::wallet::BackupTx>,
+    /// [REQ-84] The `SIGHASH_NONE | ANYONECANPAY` signature over this tail's outpoint, hex. Conveyed
+    /// to every sibling of the split, which is what lets any of them put it on chain.
+    pub release_fragment: String,
+}
+
+/// **[REQ-83 / REQ-84] Verify a tail leaf — the parent laws, the tail's shape, and its FRAGMENT.**
+///
+/// The third of those is REQ-84's bundle-level half: **the verifier MUST refuse a bundle whose split
+/// carries a tail with no fragment.** Refused here on three distinct grounds, each with its own
+/// message, because they mean different things to whoever is holding the bundle:
+///
+/// * **absent** — the sender never produced one, so this split cannot be broadcast by anybody;
+/// * **unparseable** — something was conveyed but is not a signature;
+/// * **does not verify** — a signature that does not release THIS outpoint under THIS key, which is
+///   the case a careless implementation would pass by checking only that a field is non-empty.
+pub fn verify_tail_leaf(
+    leaf: &TailLeaf,
+    parent_f_onchain_spk_hex: &str,
+    parent_f_onchain_value: u64,
+    parent_num_sigs: u32,
+    parent_flat_backups: u32,
+    parent_aggregate_pubkey: Option<&str>,
+    parent_terminal: bool,
+    ancestor_facts: &[AncestorFacts],
+    declared_value: u64,
+) -> Result<()> {
+    if leaf.parent.rgb.is_some() {
+        // §6.0.5: the fragment authorises ANYONE to spend the outpoint to ANY outputs, and spending
+        // a sealed outpoint without carrying its allocation forward destroys it. For a coloured tail
+        // the prize stops being ≤329 sat and becomes the whole allocation, so the fragment stops
+        // being a courtesy to siblings and becomes a burn switch anyone may pull.
+        return Err(anyhow::anyhow!(
+            "a TAIL cannot descend from a COLOURED parent (REQ-86): its release fragment would be a \
+             burn switch anyone may pull, because the prize is the allocation rather than the ≤329 \
+             sat the safety argument is bounded by"
+        ));
+    }
+
+    let view = ParentSegmentView {
+        parent: &leaf.parent,
+        sp_vout: leaf.sp_vout,
+        ancestors: &leaf.ancestors,
+        colored: false,
+    };
+    let (sp_txid, sp_out, _net) = verify_parent_segment_for_child(
+        view,
+        parent_f_onchain_spk_hex,
+        parent_f_onchain_value,
+        parent_num_sigs,
+        parent_flat_backups,
+        parent_aggregate_pubkey,
+        parent_terminal,
+        ancestor_facts,
+    )?;
+
+    // A TAIL is sub-dust BY DEFINITION. An output at or above the floor conveyed as a tail would be
+    // a leg claiming a shape it does not have — and one that had surrendered its value to a
+    // fragment for nothing.
+    if sp_out.value >= mercurylib::tesr::DUST_LIMIT {
+        return Err(anyhow::anyhow!(
+            "SP.out[{}] carries {} sat, at or above the {}-sat dust floor — that is not a tail, and \
+             conveying it as one surrenders its value to a release fragment for no reason",
+            leaf.sp_vout,
+            sp_out.value,
+            mercurylib::tesr::DUST_LIMIT
+        ));
+    }
+    if sp_out.value == 0 {
+        return Err(anyhow::anyhow!("a zero-value tail is not a payment"));
+    }
+    if sp_out.value != declared_value {
+        return Err(anyhow::anyhow!(
+            "SP.out[{}] carries {} sat but the tail is conveyed as {declared_value}",
+            leaf.sp_vout,
+            sp_out.value
+        ));
+    }
+
+    // ── [REQ-84] THE FRAGMENT ────────────────────────────────────────────────────────────────────
+    if leaf.release_fragment.is_empty() {
+        return Err(anyhow::anyhow!(
+            "this tail carries NO release fragment. A tail without one is a hostage: the package \
+             child that bumps a zero-fee split is required to spend the dust, so nobody can put this \
+             split on chain and every sibling on it is stranded — which is precisely Spark's failure \
+             and what REQ-84 exists to forbid"
+        ));
+    }
+    let raw = hex::decode(&leaf.release_fragment)
+        .map_err(|_| anyhow::anyhow!("this tail's release fragment is not hex"))?;
+    let sig = electrum_client::bitcoin::secp256k1::schnorr::Signature::from_slice(&raw)
+        .map_err(|_| anyhow::anyhow!("this tail's release fragment is not a 64-byte Schnorr signature"))?;
+    // The key is read from the OUTPUT, never from the bundle: a fragment is only a licence if it is
+    // signed by whoever can actually spend the tail, and a sender-supplied key would let a bundle
+    // carry a signature over a key nobody holds.
+    let xonly_hex = taproot_key_hex(sp_out.script_pubkey.as_bytes())?;
+    let xonly = electrum_client::bitcoin::secp256k1::XOnlyPublicKey::from_slice(
+        &hex::decode(&xonly_hex)?,
+    )
+    .map_err(|_| anyhow::anyhow!("SP.out[{}] is not a taproot output", leaf.sp_vout))?;
+    let spend = canonical_release_spend(&sp_txid.to_string(), leaf.sp_vout)?;
+    if !verify_release_fragment(&xonly, &sig, &spend, 0, &sp_out)? {
+        return Err(anyhow::anyhow!(
+            "this tail's release fragment does not release ITS outpoint under ITS key. A fragment \
+             that does not verify is no better than an absent one — the split still cannot be \
+             broadcast — and a check that only asked whether the field was non-empty would pass it"
+        ));
+    }
+    Ok(())
+}
+
 /// **[REQ-83] The parent-side facts a leaf carries, whatever ladder it has — or has none.**
 ///
 /// A borrowed view rather than a bundle, because the ladderless leaf of §6.0.3 is not a
@@ -12757,7 +13217,7 @@ fn verify_parent_segment_for_child(
             // [DUST] …and no leg of it may be unspendable. AFTER the Σ law above, per
             // `refuse_dust_payloads`. This lane has a Σ check and NO payload-count check, so the
             // `(expected − 1, 1)` shape satisfies everything above it exactly.
-            refuse_dust_payloads(&ext_tx, &format!("ancestor {i} extension"))?;
+            refuse_dust_payloads(&ext_tx, &format!("ancestor {i} extension"), false)?;
             // [ANCHOR] + [OPRET] The exempt kinds, bound. This is one of the two lanes the ancestor
             // OPRET GAP lived on: `verify_colored_shape` walks `cb.parent.exit_tiers()` and
             // `verify_colored_child_shape` walks the two CHILD tiers — nothing between them ever
@@ -12860,7 +13320,7 @@ fn verify_parent_segment_for_child(
         // while nothing at all constrains what its OTHER outputs carry. One 1-sat slot here strands
         // every child of this level. Placed after the structural pass and the CSV band, per
         // `refuse_dust_payloads`.
-        refuse_dust_payloads(&st_tx, &format!("ancestor {i} state"))?;
+        refuse_dust_payloads(&st_tx, &format!("ancestor {i} state"), false)?;
         // [D26] **Σ-PAYLOAD LAW ON THE INTERMEDIATE SPINE — the fee bound this tier never had.**
         //
         // Dust, anchor and opret were bound above; the FEE was not. `SP` could commit ~1 sat over
@@ -13250,7 +13710,7 @@ pub fn verify_child_bundle(
         // keeps the more specific skim diagnostic first on a tier that is both skimmed and poisoned. The
         // shape that survives every law on this lane is a ZERO-VALUE appended output: Σ-neutral by
         // construction, and `out[payload_vout]` is left exactly right.
-        refuse_dust_payloads(&ext_tx, "child extension")?;
+        refuse_dust_payloads(&ext_tx, "child extension", false)?;
         // [ANCHOR] The anchor bound on this lane too. The OPRET count is NOT bound here: check [7] at the
         // end of this function runs `verify_colored_child_shape`, which counts oprets on exactly this tier
         // against the child's own colour, and duplicating it above would shadow its colour-mismatch
@@ -13506,7 +13966,7 @@ pub fn verify_child_bundle(
     // [DUST] The last tier before the money is the receiver's. Two shapes reach here past everything
     // above: a zero-value appended output (Σ-neutral), and — with no attacker at all — a child whose
     // slot was below `min_child_value`, whose honest final leg is then simply too small to relay.
-    refuse_dust_payloads(&st_tx, "child state")?;
+    refuse_dust_payloads(&st_tx, "child state", false)?;
     // [ANCHOR] Same on the last tier before the money is the receiver's. Opret count again left to
     // check [7]'s `verify_colored_child_shape`, which already binds it for this tier.
     bind_single_p2a_anchor(&st_tx, "child state")?;
@@ -15219,6 +15679,72 @@ pub async fn cosign_tier(
     Ok(signed_tx)
 }
 
+/// **[REQ-84] Produce a TAIL's release fragment — the SE's half included.**
+///
+/// A `SIGHASH_NONE | ANYONECANPAY` co-signature over the tail's outpoint, published to every sibling
+/// of the split. It is what lets ANY of them put the split on chain: a zero-fee split's package child
+/// is required to spend the dust, and without a licence to do so nobody can, which strands every
+/// sibling on it (REQ-84, and precisely Spark's failure).
+///
+/// **Produced at SPLIT time, by whoever holds the slot — which is the sender.** The payee does not
+/// exist yet, and there is no later moment at which it can honestly be produced: once the slot is
+/// handed over, signing this would be signing over an outpoint somebody else owns.
+///
+/// The hash type is the whole reason this is not `cosign_tier`: that lane signs `SIGHASH_ALL`, which
+/// commits to every output and would make the fragment useless to a sibling who does not yet know
+/// what their sweep looks like — a tail nobody can sweep being exactly the hostage REQ-84 forbids.
+pub async fn cosign_release_fragment(
+    cc: &ClientConfig,
+    tail_coin: &mut Coin,
+    tail_txid: &str,
+    tail_vout: u32,
+    tail_prevout: &electrum_client::bitcoin::TxOut,
+) -> Result<String> {
+    use electrum_client::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+
+    let spend = canonical_release_spend(tail_txid, tail_vout)?;
+    // `Prevouts::One` is required, not a convenience: under ANYONECANPAY the sighash commits to this
+    // input alone, so supplying a full prevout vector would describe a commitment the signature does
+    // not make.
+    let hash = SighashCache::new(&spend)
+        .taproot_key_spend_signature_hash(
+            0,
+            &Prevouts::One(0usize, tail_prevout),
+            TapSighashType::NonePlusAnyoneCanPay,
+        )
+        .map_err(|e| anyhow::anyhow!("release-fragment sighash failed: {e}"))?;
+
+    let coin_nonce = mercurylib::transaction::create_and_commit_nonces(tail_coin)?;
+    tail_coin.secret_nonce = Some(coin_nonce.secret_nonce);
+    tail_coin.public_nonce = Some(coin_nonce.public_nonce);
+    tail_coin.blinding_factor = Some(coin_nonce.blinding_factor);
+    let server_public_nonce =
+        sign_first(cc, &coin_nonce.sign_first_request_payload).await?;
+    tail_coin.server_public_nonce = Some(server_public_nonce);
+
+    let tx_hex = hex::encode(electrum_client::bitcoin::consensus::serialize(&spend));
+    let partial = mercurylib::transaction::calculate_musig_session(
+        tail_coin,
+        hash,
+        tx_hex,
+        std::slice::from_ref(tail_prevout),
+        0,
+        TapSighashType::NonePlusAnyoneCanPay,
+    )?;
+    let server_partial_sig = sign_second(cc, &partial.partial_signature_request_payload).await?;
+    let signature = create_signature(
+        partial.msg,
+        partial.client_partial_sig,
+        hex::encode(server_partial_sig.serialize()),
+        partial.encoded_session,
+        partial.output_pubkey,
+    )?;
+    // The 64-byte Schnorr signature, bare. NOT a `taproot::Signature` with a trailing hash-type byte:
+    // `verify_release_fragment` verifies the raw signature against the sighash, and a 65th byte would
+    // fail to parse there rather than fail to verify — a confusing error for a correct fragment.
+    Ok(signature)
+}
+
 /// **[REQ-56 / REQ-82 / §5.4.4] Close a tree: ask the SE for its half of `C` and return the signed
 /// collapse transaction.**
 ///
@@ -15742,6 +16268,7 @@ mod spine_tip_tests {
             pending_state: None,
             role,
             recipient_address: None,
+            release_fragment: None,
             conveyance: ConveyanceStage::Pending,
             conveyance_x1: None,
             latch_batch_id: None,
@@ -16017,6 +16544,7 @@ mod spine_tip_tests {
             pending_state: None,
             role,
             recipient_address: None,
+            release_fragment: None,
             conveyance: ConveyanceStage::Pending,
             conveyance_x1: None,
             latch_batch_id: None,
@@ -16335,6 +16863,7 @@ mod spine_tip_tests {
             pending_state: None,
             role,
             recipient_address: None,
+            release_fragment: None,
             conveyance: ConveyanceStage::Pending,
             conveyance_x1: None,
             latch_batch_id: None,
@@ -16879,6 +17408,7 @@ mod split_journal_tests {
                     pending_extension: None,
                     pending_state: None,
                     role: SplitLegRole::Piece,
+                    release_fragment: None,
                     recipient_address: None,
                     conveyance: ConveyanceStage::Pending,
                     conveyance_x1: None,
@@ -16895,6 +17425,7 @@ mod split_journal_tests {
                     pending_extension: None,
                     pending_state: None,
                     role: SplitLegRole::Piece,
+                    release_fragment: None,
                     recipient_address: None,
                     conveyance: ConveyanceStage::Pending,
                     conveyance_x1: None,
@@ -17092,6 +17623,7 @@ mod split_journal_tests {
                 pending_extension: None,
                 pending_state: None,
                 role: if j == K { SplitLegRole::SpineTip } else { SplitLegRole::Piece },
+                release_fragment: None,
                 recipient_address: if j == K { None } else { Some(format!("payee{j}")) },
                 conveyance: ConveyanceStage::Pending,
                 conveyance_x1: None,
@@ -17235,6 +17767,9 @@ mod split_journal_tests {
                 // ladderless leg here would mean `legs()` invented a shape the record does not name.
                 SplitLeg::Ladderless(_) => {
                     panic!("leg {j} came back LADDERLESS from a record that journals no such role")
+                }
+                SplitLeg::Tail(_) => {
+                    panic!("leg {j} came back as a TAIL from a record that journals no such role")
                 }
             }
         }
@@ -17636,6 +18171,61 @@ mod skim_leaf_attack_tests {
             (bundle, slot)
         }
 
+        /// **[REQ-83/84] The same segment, but `SP` is a TAIL split: zero fee, funded anchor, one
+        /// sub-dust output at `out[1]`.**
+        ///
+        /// `out[0]` is an ordinary piece paying the child aggregate; `out[1]` is the tail, paying the
+        /// same aggregate a sub-dust amount. Built with the tail builder, so the conservation law is
+        /// the zero-fee one — the fixture is the real shape, not an approximation of it.
+        fn tail_segment(&self, tail_value: u64) -> (TesrBundle, u64) {
+            let p = self.params;
+            let a = &self.parent;
+            let t = mercurylib::tesr::build_trigger(F_TXID, F_VOUT, F_VALUE, &a.address, NET, self.rate)
+                .expect("trigger");
+            let t_tx = cosign(&parse(&t.tx_hex), F_VALUE, &a.spk, &a.kp);
+            let x = mercurylib::tesr::build_extension(
+                &t.txid, t.out_value, &a.address, NET, p.ext_csv(0), self.rate,
+            )
+            .expect("extension");
+            let x_tx = cosign(&parse(&x.tx_hex), t.out_value, &a.spk, &a.kp);
+
+            let piece = x.out_value - mercurylib::tesr::P2A_VALUE - tail_value;
+            let sp = mercurylib::tesr::build_tail_split_state_from(
+                &x.txid,
+                mercurylib::tesr::UNCOLORED_PAYLOAD_VOUT,
+                x.out_value,
+                &[(self.child.address.clone(), piece), (self.child.address.clone(), tail_value)],
+                NET,
+                SPINE_CSV,
+            )
+            .expect("tail split state");
+            let sp_tx = cosign(&parse(&sp.tx_hex), x.out_value, &a.spk, &a.kp);
+
+            let bundle = TesrBundle {
+                version: 1,
+                statechain_id: "parent-sid".into(),
+                network: NET.into(),
+                fee_rate: self.rate,
+                agg_address: a.address.clone(),
+                owner_exit_address: self.sender.address.clone(),
+                f_txid: F_TXID.into(),
+                f_vout: F_VOUT,
+                f_value: F_VALUE,
+                trigger: tier(&t_tx, None, t.payload_vout),
+                levels: vec![TesrLevel {
+                    extension: tier(&x_tx, Some(p.ext_csv(0)), x.payload_vout),
+                    state: tier(&sp_tx, Some(SPINE_CSV), sp.payload_vout),
+                }],
+                m: 0,
+                superseded_states: vec![],
+                superseded_extensions: vec![],
+                conveyed_states: vec![],
+                params: p,
+                rgb: None,
+            };
+            (bundle, tail_value)
+        }
+
         /// The LEAF: `child_extension` over `SP.out[0]`, then `child_state` paying the receiver.
         /// Both tiers really co-signed by `A_child`, with `skim` deciding where (if anywhere) value
         /// is diverted.
@@ -17830,6 +18420,105 @@ mod skim_leaf_attack_tests {
             &[],
             value,
         )
+    }
+
+    /// A tail leaf over `SP.out[1]`, with `fragment` as its release fragment.
+    fn tail_leaf_with(rig: &Rig, tail_value: u64, fragment: String) -> TailLeaf {
+        let (parent, _) = rig.tail_segment(tail_value);
+        TailLeaf {
+            parent,
+            parent_statechain_id: "parent-sid".into(),
+            sp_vout: 1,
+            child_statechain_id: "tail-sid".into(),
+            child_owner_exit_address: rig.receiver.address.clone(),
+            ancestors: vec![],
+            parent_flat_backups: vec![],
+            release_fragment: fragment,
+        }
+    }
+
+    /// An HONEST fragment: the tail's own key signing the canonical release spend.
+    fn honest_fragment(rig: &Rig, leaf: &TailLeaf) -> String {
+        use electrum_client::bitcoin::secp256k1::Secp256k1;
+        let sp: Transaction = parse(&leaf.parent.current().state.signed_tx);
+        let prevout = sp.output[leaf.sp_vout as usize].clone();
+        let spend = canonical_release_spend(&sp.txid().to_string(), leaf.sp_vout).expect("spend");
+        let msg = release_fragment_sighash(&spend, 0, &prevout).expect("sighash");
+        // The tail is paid to the CHILD aggregate in this fixture, and the rig holds that key.
+        let secp = Secp256k1::new();
+        let tweaked = rig.child.kp.tap_tweak(&secp, None).to_inner();
+        hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &tweaked).as_ref())
+    }
+
+    fn verify_tail(leaf: &TailLeaf, f: &Facts, value: u64) -> Result<()> {
+        verify_tail_leaf(
+            leaf, &f.f_spk_hex, F_VALUE, f.parent_num_sigs, f.parent_flat_backups,
+            Some(&f.parent_xonly), true, &[], value,
+        )
+    }
+
+    /// **[REQ-83/84] A TAIL with a valid fragment is accepted — the fourth band's shape.**
+    #[test]
+    fn a_tail_with_its_fragment_is_accepted() {
+        let rig = rig();
+        let mut leaf = tail_leaf_with(&rig, 200, String::new());
+        leaf.release_fragment = honest_fragment(&rig, &leaf);
+        verify_tail(&leaf, &rig.facts(), 200).expect("a well-formed tail with its fragment");
+    }
+
+    /// **[REQ-84] THE BUNDLE-LEVEL RULE: a tail with NO fragment is REFUSED.**
+    ///
+    /// The requirement in its own words — "the verifier MUST refuse a bundle whose split carries a
+    /// tail with no fragment". A tail without one is a hostage: the package child that bumps a
+    /// zero-fee split is required to spend the dust, so nobody can put the split on chain and every
+    /// sibling on it is stranded. That is precisely Spark's failure, which §6.0.1 measures.
+    #[test]
+    fn a_tail_without_a_fragment_is_refused() {
+        let rig = rig();
+        let leaf = tail_leaf_with(&rig, 200, String::new());
+        let e = verify_tail(&leaf, &rig.facts(), 200)
+            .expect_err("REQ-84: a tail with no fragment must be refused")
+            .to_string();
+        assert!(e.contains("NO release fragment") && e.contains("hostage"), "got: {e}");
+    }
+
+    /// **A fragment that does not VERIFY is no better than an absent one** — and this is the case a
+    /// careless implementation passes by checking only that the field is non-empty.
+    #[test]
+    fn a_forged_fragment_is_refused() {
+        use electrum_client::bitcoin::secp256k1::{Secp256k1, SecretKey, KeyPair};
+        let rig = rig();
+        let mut leaf = tail_leaf_with(&rig, 200, String::new());
+        // A perfectly well-formed signature — over the right message, by the WRONG key.
+        let sp: Transaction = parse(&leaf.parent.current().state.signed_tx);
+        let prevout = sp.output[1].clone();
+        let spend = canonical_release_spend(&sp.txid().to_string(), 1).expect("spend");
+        let msg = release_fragment_sighash(&spend, 0, &prevout).expect("sighash");
+        let secp = Secp256k1::new();
+        let stranger = KeyPair::from_secret_key(&secp, &SecretKey::from_slice(&[0x77u8; 32]).unwrap());
+        leaf.release_fragment = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &stranger).as_ref());
+        let e = verify_tail(&leaf, &rig.facts(), 200)
+            .expect_err("a fragment signed by another key must be refused")
+            .to_string();
+        assert!(e.contains("does not release ITS outpoint"), "got: {e}");
+    }
+
+    /// **A leg at or above the dust floor is not a tail**, and conveying one as a tail surrenders its
+    /// value to a release fragment for no reason at all.
+    #[test]
+    fn an_above_dust_leg_conveyed_as_a_tail_is_refused() {
+        let rig = rig();
+        // A genuine tail split — and then the leaf points at `out[0]`, the ORDINARY piece, claiming
+        // it as the tail. The transaction is well-formed; the CLAIM is what is wrong.
+        let mut leaf = tail_leaf_with(&rig, 200, String::new());
+        leaf.sp_vout = 0;
+        leaf.release_fragment = honest_fragment(&rig, &leaf);
+        let sp: Transaction = parse(&leaf.parent.current().state.signed_tx);
+        let piece_value = sp.output[0].value;
+        let e = verify_tail(&leaf, &rig.facts(), piece_value)
+            .expect_err("an above-dust leg is not a tail")
+            .to_string();
+        assert!(e.contains("that is not a tail"), "got: {e}");
     }
 
     /// **[REQ-83] A LADDERLESS leaf is accepted — the third and fourth bands' shape.**
@@ -26710,6 +27399,7 @@ mod s9_colored_batch_replay_tests {
                     pending_extension: None,
                     pending_state: None,
                     role: SplitLegRole::Piece,
+                    release_fragment: None,
                     recipient_address: None,
                     conveyance: ConveyanceStage::Pending,
                     conveyance_x1: None,
@@ -26731,6 +27421,7 @@ mod s9_colored_batch_replay_tests {
                     pending_extension: None,
                     pending_state: None,
                     role: SplitLegRole::SpineTip,
+                    release_fragment: None,
                     recipient_address: None,
                     conveyance: ConveyanceStage::Pending,
                     conveyance_x1: None,

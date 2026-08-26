@@ -1632,7 +1632,7 @@ dust limit is already expressible today.
 | `v ≥ min_child_value` (1560 at 3.0 sat/vB) | today's two-rung ladder, self-funding | unchanged |
 | `945 ≤ v < 1560` | ONE rung — **BUILT** (`SplitLegRole::ThinPiece`) | one renewal instead of two |
 | `DUST_LIMIT ≤ v < 945` | depth-0 stub, no ladder — **BUILT** (`SplitLegRole::Ladderless`) | floor is exactly 330 |
-| `1 ≤ v < DUST_LIMIT` | **a TAIL** — carried as the split's single permitted dust output | see below |
+| `1 ≤ v < DUST_LIMIT` | **a TAIL** — the split's single permitted dust output — **BUILT** | see below |
 
 A tail forces two things on its split transaction and on nothing else: the anchor must be the FUNDED
 240 kind, so the tail owns the dust slot; and the split's fee must be zero, so it enters the mempool
@@ -1662,12 +1662,14 @@ caller reads exactly like a working feature, which is this repository's most rep
 |---|---|
 | `Laddered` | **yes** |
 | `SpineTip` | **yes** |
-| `Stub` | **yes** — the piece floor now sits exactly at its boundary |
-| `Tail` | no — needs a zero-fee `SP` |
+| `Stub` | **yes** |
+| `Tail` | **yes** — the piece floor is now ONE SATOSHI |
 
-The piece floor IS the `Stub` boundary, so every amount in `[1, 330)` is still refused before a
-builder is ever consulted. That test is written to FAIL when a lower band is wired up — it already
-did once, for this one, and the update is above. Closing a band cannot pass silently either.
+**Every band is reachable, and the live admission floor is ONE SATOSHI — which is REQ-83's promise
+stated as a number.** That test began as *"only the `Laddered` band is reachable"* and each band that
+landed rewrote it; it is now a sweep over all four with a witness value each, plus the one value the
+requirement excludes: zero, refused by the floor AND by the shape, two independent refusals so it
+stays out if either moves.
 
 **WHAT THE TWO REMAINING BANDS ACTUALLY REQUIRE, worked out rather than estimated — because the
 last estimate in this section was wrong.**
@@ -1767,9 +1769,38 @@ fee credit by whoever broadcasts. §6.0.4 already says the owner *"surrendered [
 the price of riding for free"* — the correction is only that this makes a tail an off-chain-
 transferable leg rather than an on-chain claim, and therefore a leg that needs a slot.
 
-**What remains on `Tail`:** the coin-backed no-tier leg role, the fragment produced at split time and
-conveyed, REQ-84's bundle-level refusal of a split carrying a tail with no fragment, and the
-receiver booking it. The `Stub` band needs only the last of those.
+**`Tail` IS BUILT, and so is REQ-84's bundle-level half.** `SplitLegRole::Tail` is the coin-backed
+no-tier leg; `cosign_release_fragment` produces the `SIGHASH_NONE | ANYONECANPAY` co-signature after
+`SP` is signed (its outpoint is not final before that) and before any leg is conveyed (the sender must
+still hold the slot), journalling it the moment it exists. `verify_tail_leaf` refuses a tail on three
+distinct grounds, each with its own message because they mean different things to the holder: **no
+fragment** (the sender never produced one, so nobody can broadcast this split), **unparseable**, and
+**does not verify** — the last being the case an implementation that only checked the field was
+non-empty would pass. The key is read from the OUTPUT, never from the bundle: a sender-supplied key
+would let a bundle carry a signature over a key nobody holds.
+
+Two laws had to learn the second shape, and in both the discriminator is the part that matters:
+
+* **the tier conservation law.** A tail split forwards `funding − P2A_VALUE`; every other tier
+  forwards `funding − committed_fee − P2A_VALUE`. The discriminator is **ZERO FEE** — Σ over EVERY
+  output, anchor included, equals the funding — and NOT "carries a sub-dust output". Keyed on the
+  sub-dust output alone, an attacker who starved one payload would have their tier judged under the
+  law that forgives the committed fee they just kept. Caught by the eight dust-poisoning tests going
+  red on the first attempt.
+* **`refuse_dust_payloads`**, the tier lane, which refused every sub-dust payload. It now admits ONE,
+  and only when the caller — which knows the funding value, unlike the function — has already proved
+  the tier a tail split. §6.0's earlier note stands: a version deciding for itself, from the outputs
+  alone, is exactly the softening that lets a poisoner choose the law they are judged under.
+
+**And REQ-86 stopped being redundant, from the direction it did not expect.** `refuse_coloured_tail`
+ran over every tier and flagged the first plain tail as a burn switch: `colored_payload_vouts` names
+every non-anchor output without asking whether the transaction is coloured at all. The discriminator
+is now the RGB commitment itself — no opret, no allocation, nothing coloured to protect. The guard's
+own doc comment predicted it would stop being redundant when tails were admitted; it was right about
+the moment and wrong about which way the redundancy would break.
+
+**What remains across both lower bands: the receiver's claim path.** A `Stub` or `Tail` leg reaches a
+payee as a claim rather than a coin with a ladder, and every existing claim path expects the latter.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the

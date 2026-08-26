@@ -957,6 +957,20 @@ pub fn coloured_sub_dust_payload(tx: &Transaction) -> Option<(u32, u64)> {
 
 /// [`coloured_sub_dust_payload`] as a refusal, for callers that build or verify a coloured tier.
 pub fn refuse_coloured_tail(tx: &Transaction, what: &str) -> Result<()> {
+    // **A tier with no OPRET carries no allocation, so there is nothing coloured to protect.**
+    //
+    // `colored_payload_vouts` names every non-anchor, non-opret output — it does not itself ask
+    // whether the transaction is coloured, because in its own lane that is already known. Called
+    // over EVERY tier, as it is in the bundle verifier, it would flag a plain [REQ-83] TAIL: a
+    // sats-only output with no transition anywhere near it.
+    //
+    // The discriminator is structural and is the RGB commitment itself. It was invisible until tails
+    // were admitted, because until then `refuse_dust_payloads` refused every sub-dust output first —
+    // which is exactly the redundancy this guard's own doc comment predicted would stop being
+    // redundant, arriving from the other direction.
+    if !tx.output.iter().any(|o| o.script_pubkey.is_op_return()) {
+        return Ok(());
+    }
     if let Some((vout, value)) = coloured_sub_dust_payload(tx) {
         return Err(anyhow!(
             "{what}: coloured payload output {vout} carries {value} sat, under the {}-sat floor \
@@ -1897,19 +1911,28 @@ mod req86_no_coloured_tails {
     use electrum_client::bitcoin::{absolute::LockTime, ScriptBuf, Transaction, TxOut};
 
     fn tx_with(values: &[u64]) -> Transaction {
+        let mut output: Vec<TxOut> = values
+            .iter()
+            .map(|v| TxOut {
+                value: *v,
+                // A bare P2TR-shaped payload: neither OP_RETURN nor P2A, so it counts as coloured
+                // payload for `colored_payload_vouts`.
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20].into_iter().chain([0u8; 32]).collect()),
+            })
+            .collect();
+        // **The OPRET, because a COLOURED tier has one.** `refuse_coloured_tail` now uses the RGB
+        // commitment as its structural test for "is this transaction coloured at all" — without it a
+        // plain [REQ-83] tail, which is sats-only and has no transition near it, would be refused as
+        // a burn switch. A fixture with no opret was testing a transaction that is not coloured.
+        output.push(TxOut {
+            value: 0,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]),
+        });
         Transaction {
             version: 3,
             lock_time: LockTime::ZERO,
             input: vec![],
-            output: values
-                .iter()
-                .map(|v| TxOut {
-                    value: *v,
-                    // A bare P2TR-shaped payload: neither OP_RETURN nor P2A, so it counts as coloured
-                    // payload for `colored_payload_vouts`.
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20].into_iter().chain([0u8; 32]).collect()),
-                })
-                .collect(),
+            output,
         }
     }
 

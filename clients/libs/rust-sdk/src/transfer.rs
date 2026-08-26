@@ -2273,6 +2273,10 @@ impl UtexoWallet {
                     // claim is the transaction, which the payee needs a copy of and which any
                     // holder of the parent chain can broadcast.
                     mercuryrustlib::tesr::SplitLeg::Ladderless(_) => {}
+                    // [REQ-84] A TAIL is conveyed with its fragment and held by the payee as an
+                    // off-chain leg. Nothing is persisted here for the same reason as a ladderless
+                    // claim: the sender does not keep it, and it has no ladder to store.
+                    mercuryrustlib::tesr::SplitLeg::Tail(_) => {}
                     mercuryrustlib::tesr::SplitLeg::Tip(tip) => {
                         mercuryrustlib::tesr::persist_spine_tip(cc, &wallet, tip).await?;
                         change = Some((jc.statechain_id.clone(), jc.value, jc.sp_vout));
@@ -3326,7 +3330,15 @@ pub(crate) fn split_output_floors(backup_fee_rate: f64, shape: ParentShape) -> S
         // the output's own spendability and nothing else, which is what §6.0.3 means by "floor is
         // exactly 330". Maxing it against a floor for transactions it does not fund would refuse
         // every stub for the cost of something it never pays.
-        piece: mercuryrustlib::tesr::SplitLegRole::Ladderless.min_value(rate, DUST_LIMIT),
+        // **[REQ-83] ONE SATOSHI.** The cheapest shape a payee's leg can take is a TAIL, which funds
+        // nothing at all — not a rung, not a backup, not even its own transaction's fee — so the
+        // only thing it must clear is being a payment. That is REQ-83's promise stated as a number.
+        //
+        // The builder still binds what admission does not: at most ONE sub-dust leg per split
+        // (REQ-85), refused at the top of `in_ladder_split` and therefore before the parent is
+        // terminalized. Admission permissive, construction binding, refusal early — the same
+        // layering the per-coin floor has always used.
+        piece: mercuryrustlib::tesr::SplitLegRole::Tail.min_value(rate, DUST_LIMIT),
         change: backup_floor
             .max(mercuryrustlib::tesr::change_leg_role(lane).min_value(rate, DUST_LIMIT)),
         lane: Some(lane),
@@ -3470,6 +3482,12 @@ fn change_leg_shape_note(lane: mercuryrustlib::tesr::SplitLane) -> &'static str 
         // mean the wallet could not spend its own remainder off-chain.
         mercuryrustlib::tesr::SplitLegRole::Ladderless => {
             "the change is a ladderless claim on this lane, so it funds no rung at all"
+        }
+        // [REQ-84] Never the change either, and for a sharper reason than the others: a tail's value
+        // is surrendered to its release fragment, so a wallet whose own remainder were a tail would
+        // be giving its change away to whoever broadcasts.
+        mercuryrustlib::tesr::SplitLegRole::Tail => {
+            "the change is a sub-dust tail on this lane, which funds nothing and is swept on exit"
         }
     }
 }
@@ -3694,48 +3712,36 @@ mod split_math_tests {
     /// It is still written to fail when the next band lands. Closing one must not pass silently
     /// either — the whole point of the pair of tests is that neither direction is invisible.
     #[test]
-    fn the_payment_lane_reaches_the_ladderless_band_and_no_lower() {
+    fn the_payment_lane_reaches_every_band_down_to_one_satoshi() {
         use mercurylib::tesr::LeafShape;
         let rate = mercurylib::tesr::TesrParams::mainnet().committed_fee_rate;
         let root = ParentShape::Root { fee_rate: rate, split_source_value: 0 };
         let live_floor = split_output_floors(rate, root).piece;
 
-        assert_eq!(
-            LeafShape::for_value(live_floor, rate, DUST_LIMIT),
-            LeafShape::Stub,
-            "the live piece floor must sit exactly at the boundary of the CHEAPEST shape a builder \
-             emits — above it and a whole band is unreachable, below it and a payment is admitted \
-             at a value whose shape nothing builds"
-        );
-        assert_eq!(
-            LeafShape::for_value(live_floor - 1, rate, DUST_LIMIT),
-            LeafShape::Tail,
-            "and one satoshi below it is the TAIL band, which needs a zero-fee SP and is not built"
-        );
+        // **[REQ-83] THE PROMISE, AS THE LIVE NUMBER.** "A sats payment of any amount at or above
+        // 1 sat MUST be expressible" — the admission floor IS one satoshi.
+        assert_eq!(live_floor, 1, "the payment lane admits down to a single satoshi");
+        assert_eq!(LeafShape::for_value(live_floor, rate, DUST_LIMIT), LeafShape::Tail);
 
-        // Every band a payee's leg can now take, with a witness value each.
+        // Every band, with a witness value each, and each one at or above the live floor. This
+        // sweep is what the three earlier versions of this test were converging on: it began as
+        // "only the Laddered band is reachable", and each band that landed rewrote it.
         for (v, shape) in [
-            (330u64, LeafShape::Stub),
+            (1u64, LeafShape::Tail),
+            (329, LeafShape::Tail),
+            (330, LeafShape::Stub),
             (944, LeafShape::Stub),
             (945, LeafShape::SpineTip),
             (1_559, LeafShape::SpineTip),
             (1_560, LeafShape::Laddered),
         ] {
-            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), shape);
+            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), shape, "at {v} sat");
             assert!(v >= live_floor, "[REQ-83] {v} sat must be payable");
         }
-        // …and the one that is not. A tail is sub-dust, so it forces `SP` itself to pay zero fee
-        // (§6.0.1) — a second tier construction with its own conservation law, which nothing in the
-        // ladder expresses yet.
-        for v in [1u64, 329] {
-            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), LeafShape::Tail);
-            assert!(v < live_floor, "[REQ-83] {v} sat is a TAIL and the payment lane still refuses it");
-        }
-
-        assert_ne!(
-            LeafShape::for_value(live_floor, rate, DUST_LIMIT),
-            LeafShape::Unpayable
-        );
+        // Zero is the one value REQ-83 excludes, and it is excluded by the floor as well as by the
+        // shape — two independent refusals, which is what keeps it out if either moves.
+        assert_eq!(LeafShape::for_value(0, rate, DUST_LIMIT), LeafShape::Unpayable);
+        assert!(0 < live_floor);
     }
 
     /// **[D56] THE SHIPPED RATE'S FLOORS, so a schedule change cannot pass silently.**
@@ -3777,10 +3783,10 @@ mod split_math_tests {
             );
             assert_eq!(
                 split_output_floors(rate, root).piece,
-                DUST_LIMIT,
-                "[REQ-83] {name}: the PIECE floor is the LADDERLESS floor — a payee's leg is admitted \
-                 at the cheapest shape's floor, and its own role then decides whether none, one or \
-                 two rungs are built"
+                1,
+                "[REQ-83] {name}: the PIECE floor is ONE SATOSHI — a payee's leg is admitted at the \
+                 cheapest shape's floor, and its own role then decides whether none, one or two \
+                 rungs are built"
             );
         }
     }
@@ -3816,8 +3822,9 @@ mod split_math_tests {
         // funds no backup transaction, so that floor is a cost it never pays.
         assert_eq!(
             split_output_floors(backup_rate, root).piece,
-            DUST_LIMIT,
-            "the piece floor is the ladderless floor: the output's own spendability, nothing else"
+            1,
+            "[REQ-83] the piece floor is ONE SATOSHI — the cheapest payee shape is a tail, which \
+             funds nothing at all"
         );
         assert_eq!(
             split_output_floors(backup_rate, child).piece,
@@ -3866,8 +3873,8 @@ mod split_math_tests {
             // above; this one asserted a numeric relationship that only held while every leg had a
             // backup to fund.
             assert_eq!(
-                planning, DUST_LIMIT,
-                "[{network}] planning is the cheapest payee shape's floor, which is the ladderless one"
+                planning, 1,
+                "[{network}] planning is the cheapest payee shape's floor, which is the tail's"
             );
         }
     }
@@ -3887,7 +3894,7 @@ mod split_math_tests {
             ParentShape::Root { fee_rate: ladder_rate, split_source_value: 0 },
         );
         let floor = floors.piece;
-        assert_eq!(floor, DUST_LIMIT, "[REQ-83] the ladderless piece floor");
+        assert_eq!(floor, 1, "[REQ-83] the tail piece floor: one satoshi");
 
         // A parent whose split total is exactly `piece_floor + change_floor`: the boundary in both
         // directions at once.
@@ -3907,7 +3914,15 @@ mod split_math_tests {
         // What `in_ladder_pay` does inline, re-run: shape -> split_total(2) -> split_output_floor ->
         // inladder_amounts_floored. What the quote does, via `plan_payment`: `split_preflight_pure`. They must return
         // the same verdict for every piece across the boundary, in BOTH directions.
-        for piece in [floor - 2, floor - 1, floor, floor + 1, floor + 2] {
+        // [REQ-83] Saturating: the piece floor is now ONE satoshi, so `floor - 2` would underflow.
+        // The sweep still crosses the boundary in both directions — 0 is below every floor there is.
+        for piece in [
+            floor.saturating_sub(2),
+            floor.saturating_sub(1),
+            floor,
+            floor + 1,
+            floor + 2,
+        ] {
             let executor = {
                 let t = shape.split_total(2).expect("splittable");
                 let f = split_output_floors(backup_rate, shape);
@@ -3947,7 +3962,7 @@ mod split_math_tests {
         // running at the wrong floor proposes pieces the executor refuses — and it is now the CHANGE
         // leg's floor that binds above it.
         let old_floor = min_split_output(backup_rate);
-        assert!(old_floor > floor, "554 > 330: the backup floor is a cost a ladderless leg never pays");
+        assert!(old_floor > floor, "554 > 1: the backup floor is a cost a tail never pays");
         // [REQ-83] The contrast INVERTED with the floor. A wallet flooring both legs at the bare
         // backup number (554) now REFUSES a piece the real executor admits — 330 is a spendable
         // output and funds nothing, which is exactly what a ladderless leg is. The gap is the same
@@ -4156,8 +4171,8 @@ mod split_math_tests {
             // was written to measure.
             assert_eq!(
                 floors.piece,
-                DUST_LIMIT,
-                "a payee's piece is admitted at the LADDERLESS floor; the leg's own role then decides \
+                1,
+                "a payee's piece is admitted at ONE SATOSHI; the leg's own role then decides \
                  whether one rung or two is built, from the same LeafShape decision"
             );
             let lane = floors.lane.expect("a laddered parent names its lane");
@@ -4173,7 +4188,7 @@ mod split_math_tests {
                         "{lane:?}: a two-tier change"
                     );
                     assert!(floors.change > floors.piece);
-                    assert_eq!(floors.describe(), "piece 330, change 1310");
+                    assert_eq!(floors.describe(), "piece 1, change 1310");
                     assert!(floors.change_note().contains("two-tier"));
                 }
                 mercuryrustlib::tesr::SplitLegRole::SpineTip => {
@@ -4185,11 +4200,12 @@ mod split_math_tests {
                     // the piece is admitted at the ladderless floor, so `describe()` names both —
                     // which is the honest reduction the moment the legs differ.
                     assert!(floors.piece < floors.change);
-                    assert_eq!(floors.describe(), "piece 330, change 820");
+                    assert_eq!(floors.describe(), "piece 1, change 820");
                     assert!(floors.change_note().contains("ONE rung"));
                 }
                 mercuryrustlib::tesr::SplitLegRole::ThinPiece
-                | mercuryrustlib::tesr::SplitLegRole::Ladderless => {
+                | mercuryrustlib::tesr::SplitLegRole::Ladderless
+                | mercuryrustlib::tesr::SplitLegRole::Tail => {
                     unreachable!("`change_leg_role` never carves a payee's shape as the change")
                 }
             }
@@ -4240,7 +4256,7 @@ mod split_math_tests {
             // admitted at and the shape actually built for it, and that tie is `LeafShape`.
             // [REQ-83] The cheapest payee shape is now the LADDERLESS one, which funds neither a
             // rung nor a backup — so the piece floor is dust, flat, at every rate.
-            let piece = DUST_LIMIT;
+            let piece = 1u64;
             assert_eq!(root.piece, piece, "[{rate} sat/vB] the ROOT lane's piece floor moved");
             assert_eq!(child.piece, piece, "[{rate} sat/vB] the CHILD lane's piece floor moved");
             // …and the change leg is the ONLY thing that moved, and only on the lane whose builder
@@ -4278,21 +4294,18 @@ mod split_math_tests {
             backup_rate,
             ParentShape::Root { fee_rate: 2.0, split_source_value: 0 },
         );
-        assert_eq!((root.piece, root.change), (DUST_LIMIT, 820), "[REQ-83] a ladderless piece floor, a one-rung change");
-        // [REQ-83] A piece AT this number is now admitted — both legs are one rung on this lane,
-        // so the two floors coincide. One satoshi below still refuses, which is the property that
-        // matters: the floor BINDS, it is simply a different floor.
-        assert!(inladder_amounts_floored(root.piece + root.change, root.piece, root).is_ok());
-        // One satoshi below the PIECE floor still refuses — the floor BINDS, it is simply a
-        // different, lower floor now that a payee's leg may fund no rung at all.
-        let e = inladder_amounts_floored(root.piece + root.change - 1, root.change, root)
-            .expect_err("a piece below the ladderless floor is not a spendable output at all");
-        assert!(e.to_string().contains("falls short"), "got: {e}");
-        // …while the CHANGE at that same number is admitted — which is the 490 sat change 2 buys.
-        assert_eq!(
-            inladder_amounts_floored(root.piece + root.change, root.piece, root).unwrap(),
-            root.change
-        );
+        assert_eq!((root.piece, root.change), (1, 820), "[REQ-83] a one-satoshi piece floor, a one-rung change");
+        // [REQ-83] Both legs at exactly their own floors is admitted, and the two floors are now
+        // very far apart — one satoshi against 820 — because a payee's leg may fund nothing while
+        // the sender's change always carries a ladder.
+        let both_at_floor = inladder_amounts_floored(root.piece + root.change, root.piece, root);
+        assert!(both_at_floor.is_ok(), "both legs at their own floors: {both_at_floor:?}");
+        assert_eq!(both_at_floor.unwrap(), root.change);
+        // One satoshi less and the CHANGE falls under its floor — the floors still BIND, and it is
+        // now the change leg that binds first.
+        let short = inladder_amounts_floored(root.piece + root.change - 1, root.piece, root)
+            .expect_err("the change falls under its own floor");
+        assert!(short.to_string().contains("falls short"), "got: {short}");
         // The pre-flip wallet refused exactly that split. Stated as the capability gained, so a
         // future revert is visible as a loss rather than as a silent tightening.
         //
@@ -4333,7 +4346,7 @@ mod split_math_tests {
         let (tf, rf) = (split_output_floors(backup_rate, tip), split_output_floors(backup_rate, root));
         // The NUMBERS match the root lane — both build a two-tier piece and a one-cap change…
         assert_eq!((tf.piece, tf.change), (rf.piece, rf.change));
-        assert_eq!((tf.piece, tf.change), (DUST_LIMIT, 820), "[REQ-83] a ladderless piece floor, a one-rung change");
+        assert_eq!((tf.piece, tf.change), (1, 820), "[REQ-83] a one-satoshi piece floor, a one-rung change");
         // …but the LANE is its own, and that is deliberate: the two floors agreeing is a fact about
         // two builders, and a lane that read another lane's answer is exactly how the floor and the
         // ladder actually built come apart (hazard 12).
@@ -4345,7 +4358,7 @@ mod split_math_tests {
         // [REQ-83] The CHANGE still is — the sender's remainder always carries a ladder. The piece
         // no longer is, because the cheapest payee shape funds no backup transaction.
         assert!(tf.change > min_split_output(backup_rate));
-        assert_eq!(tf.piece, DUST_LIMIT);
+        assert_eq!(tf.piece, 1);
         assert_eq!(tip.route(), "spine batch");
         // Its capacity is arithmetic over its FUNDING outpoint (`SP_i.out[K]`), not over the cap.
         assert_eq!(tip.split_total(2), mercurylib::tesr::tier_out_total(100_000, 2, 2.0));
@@ -4389,7 +4402,7 @@ mod split_math_tests {
         assert!(e.contains("the piece falls short"), "got: {e}");
     }
 
-    /// **[K > 1] THE MINIMUM PARENT VALUE FOR A K-BATCH IS `416K + 1 310`, AND IT IS DERIVED.**
+    /// **[K > 1] THE MINIMUM PARENT VALUE FOR A K-BATCH IS `87K + 1 310`, AND IT IS DERIVED.**
     ///
     /// The number `PARTIAL-PAYMENT-ECONOMICS.md` §4.7 publishes is pinned here against
     /// [`min_batch_source_value`], which computes it from the real floors and the real
@@ -4403,7 +4416,7 @@ mod split_math_tests {
     /// made the per-recipient term super-linear would mean an extra payee costs a whole new `SP`,
     /// which is precisely the economics K > 1 exists to avoid.
     #[test]
-    fn the_k_batch_minimum_parent_value_is_416k_plus_1310() {
+    fn the_k_batch_minimum_parent_value_is_87k_plus_1310() {
         let backup_rate = 2.0;
         // Any laddered shape whose CHANGE leg is a one-cap tip: the plain root lane and the spine
         // batch. Both are the lanes a K-batch actually runs on.
@@ -4412,7 +4425,7 @@ mod split_math_tests {
             ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 0 },
         ] {
             let floors = split_output_floors(backup_rate, shape);
-            assert_eq!((floors.piece, floors.change), (DUST_LIMIT, 820), "[REQ-83] the two terms of the formula");
+            assert_eq!((floors.piece, floors.change), (1, 820), "[REQ-83] the two terms of the formula");
             for k in 1..=crate::wallet::MAX_BATCH_RECIPIENTS {
                 assert_eq!(
                     min_batch_source_value(k, shape, floors),
@@ -4421,23 +4434,23 @@ mod split_math_tests {
                     // (250 base + 86 per extra leg). It was `1 396K + 1 310` while a piece cost the
                     // two-rung floor of 1 310 — the K term fell by exactly the rung a payee no
                     // longer has to fund.
-                    Some(416 * k as u64 + 1_310),
+                    Some(87 * k as u64 + 1_310),
                     "K = {k} on the {} lane",
                     shape.route()
                 );
             }
             // The three published rows, spelled out.
-            assert_eq!(min_batch_source_value(1, shape, floors), Some(1_726));
-            assert_eq!(min_batch_source_value(10, shape, floors), Some(5_470));
-            assert_eq!(min_batch_source_value(20, shape, floors), Some(9_630));
+            assert_eq!(min_batch_source_value(1, shape, floors), Some(1_397));
+            assert_eq!(min_batch_source_value(10, shape, floors), Some(2_180));
+            assert_eq!(min_batch_source_value(20, shape, floors), Some(3_050));
         }
         // The CHILD lane's change is still a two-tier grandchild, so its constant term is the
         // piece's floor, not the tip's — and the function reports THAT rather than the headline.
         let child = ParentShape::Child { fee_rate: 2.0, split_source_value: 0 };
         let cf = split_output_floors(backup_rate, child);
-        assert_eq!((cf.piece, cf.change), (DUST_LIMIT, 1_310), "[REQ-83] a ladderless piece floor, a two-tier change");
+        assert_eq!((cf.piece, cf.change), (1, 1_310), "[REQ-83] a one-satoshi piece floor, a two-tier change");
         // [REQ-83] `906·3` for the one-rung pieces + the two-tier change (1 310) + anchor + fee.
-        assert_eq!(min_batch_source_value(3, child, cf), Some(416 * 3 + 1_800));
+        assert_eq!(min_batch_source_value(3, child, cf), Some(87 * 3 + 1_800));
         // [ONE COIN SHAPE] "An un-laddered parent has no in-ladder batch at all" no longer needs
         // asserting: there is no un-laddered parent. Every remaining shape HAS a batch, which is the
         // stronger statement, and the three arms above are now exhaustive over the enum.
@@ -4455,7 +4468,7 @@ mod split_math_tests {
         let shape0 = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 0 };
         let floors = split_output_floors(backup_rate, shape0);
         let need = min_batch_source_value(k, shape0, floors).unwrap();
-        assert_eq!(need, 416 * k as u64 + 1_310, "[REQ-83] the piece term is the ladderless floor");
+        assert_eq!(need, 87 * k as u64 + 1_310, "[REQ-83] the piece term is the one-satoshi floor");
 
         // Exactly at the floor: admitted. One sat under: refused. Nothing in between.
         let at = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: need };
@@ -4466,7 +4479,7 @@ mod split_math_tests {
             .expect_err("one sat under the minimum must refuse")
             .to_string();
         assert!(e.contains("20-recipient batch"), "the refusal must name K: {e}");
-        assert!(e.contains("9630"), "the refusal must name the requirement: {e}");
+        assert!(e.contains("3050"), "the refusal must name the requirement: {e}");
         assert!(e.contains("1 sat short"), "the refusal must name the SHORTFALL: {e}");
         assert!(e.contains("sid-under"), "the refusal must name the coin: {e}");
         assert!(
@@ -4476,7 +4489,7 @@ mod split_math_tests {
         // A big shortfall reports the real distance, not a clamped one.
         let tiny = ParentShape::SpineTip { fee_rate: 2.0, split_source_value: 3_000 };
         let e = refuse_undersized_batch_parent("sid-tiny", k, tiny, floors).unwrap_err().to_string();
-        assert!(e.contains("6630 sat short"), "got: {e}");
+        assert!(e.contains("50 sat short"), "got: {e}");
         // …and it stays classifiable by the chaos suite's refusal taxonomy ("piece" -> split-fit),
         // so a legitimate protocol limit hit under load is not reported as an unexplained breach.
         assert!(e.contains("piece"), "got: {e}");
@@ -4486,17 +4499,17 @@ mod split_math_tests {
         refuse_undersized_batch_parent(
             "sid",
             1,
-            ParentShape::Root { fee_rate: 2.0, split_source_value: 1_726 },
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 1_397 },
             one,
         )
-        .expect("[REQ-83] 1 726 sat is exactly one ladderless payee plus a tip");
+        .expect("[REQ-83] 1 397 sat is exactly one one-satoshi payee plus a tip");
         let e = refuse_undersized_batch_parent(
             "sid",
             1,
-            ParentShape::Root { fee_rate: 2.0, split_source_value: 1_725 },
+            ParentShape::Root { fee_rate: 2.0, split_source_value: 1_396 },
             one,
         )
-        .expect_err("1 725 sat cannot pay one recipient and keep an exitable tip")
+        .expect_err("1 396 sat cannot pay one recipient and keep an exitable tip")
         .to_string();
         assert!(e.contains("1-recipient batch") && e.contains("1 sat short"), "{e}");
     }
