@@ -1947,17 +1947,22 @@ carries a tail with no fragment.
 transaction MUST be enforced in the verifier. It is what keeps the maximum sweepable prize below the
 minimum cost of broadcasting, and it is the whole of the economic argument in §6.0.4.
 
-**REQ-83 and REQ-85: THE RULE IS BUILT AND TESTED; THE ADMISSION IS NOT.** `tail_verdict` decides
-what a well-formed tail is — exactly one sub-dust output, value in `[1, DUST_LIMIT)`, in a
-transaction carrying the FUNDED 240 anchor — and `req83_85_tail_rule` pins it in six cases, including
-that the boundary is exclusive (a payload AT the floor is ordinary, not a tail), that 1 sat is a
-legitimate tail, that the anchor and the opret are never counted as tails, and that TWO tails are
-refused because `329 + 200 > 504` — the moment sweeping starts to pay, which is the whole of REQ-85.
+**REQ-83 and REQ-85: THE RULE IS BUILT, TESTED, AND NOW ADMITTED.** `tail_verdict` decides what a
+well-formed tail is — exactly one sub-dust output, value in `[1, DUST_LIMIT)`, in a transaction
+carrying the FUNDED 240 anchor — and `req83_85_tail_rule` pins it in six cases, including that the
+boundary is exclusive (a payload AT the floor is ordinary, not a tail), that 1 sat is a legitimate
+tail, that the anchor and the opret are never counted as tails, and that TWO tails are refused
+because `329 + 200 > 504` — the moment sweeping starts to pay, which is the whole of REQ-85.
 
-**The live verifier still refuses every sub-dust payload.** That used to be because §6.0's relay
-claims were unproven; they are proven now (the table below), so what holds admission back is the
-builder work named in §6.0.3, not the evidence. Building the rule first means that when admission is
-switched on, what gets admitted is already specified and tested rather than invented under pressure.
+The cap is now enforced in three independent places, which is the shape a load-bearing rule should
+have: `build_tail_split_state_from` refuses to emit a second tail, `in_ladder_split` refuses a plan
+containing one BEFORE the parent is terminalized, and the tier conservation law refuses a tier
+carrying one on the receive side.
+
+**Building the rule first paid off exactly as intended.** When admission was switched on, what got
+admitted was already specified and tested rather than invented under pressure — and the two places
+that had to learn the second shape (§6.0.3) were found by the existing tests going red, not by
+reasoning about what might break.
 
 **And a correction worth keeping: tails belong to the PAYMENT lane, not to tier verification.** A
 first attempt wired the rule into `refuse_dust_payloads`, which verifies TIERS, and eight
@@ -2001,9 +2006,24 @@ and `verify_release_fragment` produce and check the `SIGHASH_NONE | ANYONECANPAY
 Together with REQ-85's one-tail cap that is the whole safety case: an unconditional licence to spend
 **one** outpoint worth at most `DUST_LIMIT − 1`, against roughly 504 sat to broadcast the split.
 
-**What is NOT built is the bundle-level enforcement** — "the verifier MUST refuse a bundle whose
-split carries a tail with no fragment" needs the conveyed bundle to carry fragments, and cannot be
-exercised while tails are not admitted. That is the remaining half, and it lands with the admission.
+**THE BUNDLE-LEVEL HALF IS NOW BUILT TOO.** `verify_tail_leaf` refuses a tail on three distinct
+grounds, each with its own message because they mean different things to whoever holds the bundle:
+the fragment is **absent** (the sender never produced one, so this split cannot be broadcast by
+anybody), **unparseable**, or **does not verify** — the last being the case an implementation that
+only checked the field was non-empty would pass. The key is read from the OUTPUT, never from the
+bundle: a sender-supplied key would let a bundle carry a signature over a key nobody holds.
+
+`cosign_release_fragment` produces it, and WHEN is as load-bearing as what: after `SP` is signed,
+because the fragment is over an outpoint of `SP` and its txid is not final before that; and before any
+leg is conveyed, because the fragment is a co-signature under the tail's aggregate and once the slot
+is handed over there is no honest way to produce one. Journalled the moment it exists, and
+`resume_in_ladder_split` refuses to finish a tail leg that has none rather than fabricating one
+later.
+
+**REQ-83 IS BUILT: every leaf band is reachable and the admission floor is ONE SATOSHI.** The four
+shapes of §6.0.3 are chosen by `LeafShape` from the same floor functions the admission guard reads,
+and `every_value_gets_a_role_that_can_afford_its_own_floor` sweeps six fee rates asserting the
+invariant they all rest on — whatever role a value selects, that value clears the role's own floor.
 
 **Still open, stated precisely.** The three load-bearing CLAIMS of this section are settled: that a
 funded 240 anchor leaves the dust slot genuinely free and that a `[tail, funded anchor]` split relays
