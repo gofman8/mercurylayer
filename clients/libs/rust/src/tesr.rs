@@ -6173,12 +6173,39 @@ pub async fn in_ladder_split(
                 p.committed_fee_rate,
                 mercurylib::tesr::DUST_LIMIT,
             ) {
+                mercurylib::tesr::LeafShape::Laddered => SplitLegRole::Piece,
                 mercurylib::tesr::LeafShape::SpineTip => SplitLegRole::ThinPiece,
                 // [REQ-83] Sub-dust: a TAIL. Coin-backed like any other leg here — the fragment
                 // must be co-signed while the sender still holds the slot (§6.0.4), so a tail
                 // cannot be the plain-key ladderless shape.
                 mercurylib::tesr::LeafShape::Tail => SplitLegRole::Tail,
-                _ => SplitLegRole::Piece,
+                // **EXHAUSTIVE, and these two arms are why.** A `_` here read as `Piece`, and a
+                // Stub-band leg (330..944) would then be given the TWO-rung floor of 1 560 —
+                // discovered by `establish_child` AFTER `set_spend_budget` has terminalized the
+                // parent, i.e. after the coin is gone. That is precisely the failure the whole floor
+                // apparatus exists to prevent, arrived at through a catch-all.
+                //
+                // A Stub has no coin-backed shape at all: it pays the payee's OWN key and holds no
+                // slot, so it must be passed through `ladderless` rather than through `children`.
+                // Refused BY NAME, here, where the parent is still whole.
+                mercurylib::tesr::LeafShape::Stub => {
+                    return Err(anyhow::anyhow!(
+                        "leg paying {} is worth {} sat, in the STUB band [{}, {}) — a stub pays the \
+                         payee's own key and has no SE slot, so it cannot be carried as a coin-backed \
+                         leg. Pass it through the `ladderless` argument instead. Nothing has been \
+                         co-signed and the parent is untouched.",
+                        recipient,
+                        v,
+                        mercurylib::tesr::DUST_LIMIT,
+                        mercurylib::tesr::min_spine_tip_value(
+                            p.committed_fee_rate,
+                            mercurylib::tesr::DUST_LIMIT
+                        ),
+                    ))
+                }
+                mercurylib::tesr::LeafShape::Unpayable => {
+                    return Err(anyhow::anyhow!("leg paying {recipient} is worth 0 sat, which is not a payment"))
+                }
             },
         });
     }
@@ -6904,17 +6931,30 @@ async fn spine_batch_split_ex(
                 // that can fund ONE rung and not two, and `LeafShape` decides which — from the same
                 // floor functions the admission guard and this builder both use, so the shape a
                 // payment is admitted at and the ladder then built cannot be two different answers.
+                //
+                // **EXHAUSTIVE over the shape, for the reason `in_ladder_split` states at length.**
+                // An `else { Piece }` here gives a Stub-band leg the TWO-rung floor and the failure
+                // surfaces after the tip is terminalized. This lane carries no ladderless legs at
+                // all, so both lower bands are refused BY NAME while the coin is still whole.
                 if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
                     SplitLegRole::SpineTip
-                } else if mercurylib::tesr::LeafShape::for_value(
-                    children[j].2,
-                    p.committed_fee_rate,
-                    mercurylib::tesr::DUST_LIMIT,
-                ) == mercurylib::tesr::LeafShape::SpineTip
-                {
-                    SplitLegRole::ThinPiece
                 } else {
-                    SplitLegRole::Piece
+                    match mercurylib::tesr::LeafShape::for_value(
+                        children[j].2,
+                        p.committed_fee_rate,
+                        mercurylib::tesr::DUST_LIMIT,
+                    ) {
+                        mercurylib::tesr::LeafShape::Laddered => SplitLegRole::Piece,
+                        mercurylib::tesr::LeafShape::SpineTip => SplitLegRole::ThinPiece,
+                        shape => {
+                            return Err(anyhow::anyhow!(
+                                "spine-batch leg paying {recipient} is worth {} sat, a {shape:?} \
+                                 leaf. This lane carries no ladderless legs — pay it from the plain \
+                                 root lane, which does. Nothing has been co-signed.",
+                                children[j].2
+                            ))
+                        }
+                    }
                 },
             ))
         })
@@ -17657,6 +17697,44 @@ mod split_journal_tests {
         // …and one that HAS a fragment is storable, so the guard is not simply refusing everything.
         let ok = TailLeaf { release_fragment: "aa".repeat(64), ..leaf };
         assert!(refuse_tail_without_fragment(&ok).is_ok());
+    }
+
+    /// **[REQ-83] A STUB-band value on a COIN-BACKED leg is refused while the parent is still whole.**
+    ///
+    /// The role match used to end in `_ => Piece`, so a leg worth 330..944 was given the TWO-rung
+    /// floor of 1 560 — and `establish_child` discovers that only AFTER `set_spend_budget` has
+    /// terminalized the parent, i.e. after the coin is gone. That is exactly the failure the whole
+    /// floor apparatus exists to prevent, reached through a catch-all.
+    ///
+    /// A stub has no coin-backed shape at all: it pays the payee's own key and holds no slot, so it
+    /// travels the `ladderless` argument. This pins that the match is EXHAUSTIVE — a band with no
+    /// coin-backed shape must be a named refusal, never a fall-through.
+    #[test]
+    fn a_stub_band_value_is_never_silently_given_a_two_rung_floor() {
+        use mercurylib::tesr::{LeafShape, DUST_LIMIT};
+        let rate = mercurylib::tesr::TesrParams::mainnet().committed_fee_rate;
+        // The source is the evidence here: a `_` arm in either role match is the defect itself, and
+        // a value-level test cannot see one — the builders are async and need a live SE.
+        let src = include_str!("tesr.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]").expect("the file has test modules")];
+        for marker in ["LeafShape::Stub => {", "shape => {"] {
+            assert!(
+                prod.contains(marker),
+                "a leg shape with no coin-backed role must be refused BY NAME; `{marker}` is gone"
+            );
+        }
+        assert!(
+            !prod.contains("_ => SplitLegRole::Piece"),
+            "a catch-all arm gives an unhandled band the two-rung floor, and the failure surfaces \
+             after the parent is terminalized"
+        );
+        // …and the band this is about is genuinely between the two coin-backed floors, so it could
+        // not be handled by either.
+        for v in [DUST_LIMIT, 500u64, 944] {
+            assert_eq!(LeafShape::for_value(v, rate, DUST_LIMIT), LeafShape::Stub);
+            assert!(v < mercurylib::tesr::min_spine_tip_value(rate, DUST_LIMIT));
+            assert!(v >= DUST_LIMIT);
+        }
     }
 
     /// **[REQ-83] A ladderless journal leg rebuilds as a CLAIM, not as a bundle.**
