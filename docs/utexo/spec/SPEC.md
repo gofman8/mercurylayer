@@ -948,7 +948,7 @@ less of than the system it was being compared against.
 
 #### 5.4.3 The requirements that replace it
 
-**REQ-76 (no scheduled on-chain re-anchor).** No coin may require an on-chain transaction on a
+**REQ-76 (no scheduled on-chain re-anchor). GUARDED.** No coin may require an on-chain transaction on a
 schedule, and no mechanism may require a funded successor output to exist before a holder can act.
 Renewal MUST be off-chain: a re-signing round that resets the relative-timelock budget and moves no
 value. An operator MUST NOT be required to hold capital for the correctness or the liveness of any
@@ -979,6 +979,16 @@ and is never the answer to an exhausted budget.
 argument for this design has never rested on the round: it rests on transfers being free, so the
 amortisation is one re-anchor per many transfers. The round only ever batched that rare re-anchor, and
 it bought the batching with a standing float — the trade §5.5 now rejects.
+
+**How REQ-76, REQ-80 and REQ-81 are enforced.** All three are PROHIBITIONS, and §0.2's evidence rule
+makes a source scan the right instrument for one: a scan establishes presence, absence and ordering,
+and "this does not exist" is an absence. `deny_round_shaped_mechanisms` holds four of them — the zero
+claim never travels without its mechanism, it is never extended to the Lightning legs, no client path
+names `collapse_grant` (the background maintenance pass is where a calendar would acquire the power to
+close a tree), and no paragraph reintroduces the confirmed-successor ordering that the entire float
+traced to. Two of the four fired on their first run against defects in the GUARDS rather than the
+document, and one fired on the §5.5 heading, which now carries its mechanism rather than being
+exempted — the heading is the line a reader quotes.
 
 **REQ-78 (the retired calendar was also the garbage collector — name what replaces it).** The absolute
 locktime chain did more than mark a deadline: a refresh (REQ-31) permanently invalidated every previous
@@ -1071,7 +1081,7 @@ Two properties the route now enforces, both observable from outside via `collaps
   transaction and sign another — the check defeated at its last step. The secnonce is loaded and
   consumed atomically, so a second grant over a different session cannot reuse it.
 
-**REQ-81 (a close is an owner's operation, never a schedule).** Closing a tree MUST be triggered by its
+**REQ-81 (a close is an owner's operation, never a schedule). GUARDED.** Closing a tree MUST be triggered by its
 root owner's decision, never by a calendar, an epoch or a deadline. No holder may be compelled to
 migrate, and a holder who does nothing MUST simply be paid their full funding value when the tree
 closes. There is no window to miss and no absentee penalty; "absentee" ceases to be a category.
@@ -1463,13 +1473,13 @@ and Kotlin bindings cannot send the field at all.
 Until (1)–(4) are done and measured, nothing may present the SE's index as authority on parenthood.
 
 
-### 5.5 Operator liquidity — ZERO
+### 5.5 Operator liquidity — ZERO, because a close pays out of `F` itself
 
 The protocol requires **no operator capital at any point**. The round that demanded it is deleted, and
 with it the successor root that had to be funded before holders could move. There is no window to
 carry because there is nothing to carry it for.
 
-**REQ-80 (the zero claim MUST always carry its mechanism).** This design may be described as requiring
+**REQ-80 (the zero claim MUST always carry its mechanism). GUARDED.** This design may be described as requiring
 no operator liquidity. The statement MUST be accompanied by the mechanism that makes it true — a close
 pays every unreleased leaf out of `F` itself, and renewal moves no value — because "no liquidity"
 asserted without a mechanism is a marketing claim rather than a property. It MUST NOT be extended to
