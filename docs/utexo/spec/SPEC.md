@@ -1743,13 +1743,33 @@ own floor.** Both sides derive from `LeafShape`, which is why it holds — the s
 "derived from the same function" is an argument and this is a measurement. A disagreement would
 surface after `set_spend_budget` has terminalized the parent, i.e. after the coin is gone.
 
-**What remains is `Tail` alone, and one thing in it is not small:** a sub-dust output on `SP` forces
-`SP` itself to pay ZERO fee (§6.0.1), and every ladder law prices a tier as
-`committed_fee + P2A_VALUE`. A zero-fee `SP` is a second tier construction with its own conservation
-law, relayed only as a package — which the probe proved works, and which nothing in the ladder
-expresses. Also outstanding on that band: the release fragment must be CONVEYED with the split
-(REQ-84's bundle-level half), and the receiver must book a ladderless claim as a pending output
-rather than a statechain coin.
+**`Tail`: THE ZERO-FEE `SP` IS BUILT.** `build_tail_split_state_from` is the second tier
+construction §6.0.1 forces — Σ payload = `funding − P2A_VALUE`, **no committed fee at all**, against
+every other tier's `funding − committed_fee − P2A_VALUE`. Kept a separate builder rather than a flag,
+because folding it in would put two conservation laws behind one signature and every verifier reading
+*"a tier forwards its funding minus exactly one rung"* would have to know which — silently, from a
+parameter it cannot see. The anchor stays FUNDED at 240: that is what buys the dust slot, and it is
+the measured difference from Spark's zero-value one (§6.0.1). Six tests, including **[REQ-85] two
+tails refused AND zero tails refused** — the second being the less obvious half, since a zero-fee
+transaction with nothing sub-dust on it is an ordinary split that forgot to pay and would never
+relay. Also pinned: a 1-sat tail is legitimate, and a 0-sat leg is not.
+
+**A CORRECTION §6.0.4 OWES, found by building it: a tail cannot be a ladderless plain-key claim.**
+The release fragment must exist **at split time** — the package child that bumps a zero-fee `SP` is
+required to spend the dust, so whoever broadcasts must already hold authority over the tail — and at
+split time the payee does not exist yet. Only the SENDER is present. So a tail leg is NOT the `Stub`
+shape: it is a coin-backed leg (an SE slot, an aggregate address, and NO tiers), whose fragment the
+sender and the SE co-sign while the sender still holds the slot.
+
+That also settles what a tail IS worth, which this section stated without drawing the conclusion: it
+is spendable **off-chain**, and if the tree ever settles on chain the tail's satoshis are swept as
+fee credit by whoever broadcasts. §6.0.4 already says the owner *"surrendered [it] deliberately as
+the price of riding for free"* — the correction is only that this makes a tail an off-chain-
+transferable leg rather than an on-chain claim, and therefore a leg that needs a slot.
+
+**What remains on `Tail`:** the coin-backed no-tier leg role, the fragment produced at split time and
+conveyed, REQ-84's bundle-level refusal of a split carrying a tail with no fragment, and the
+receiver booking it. The `Stub` band needs only the last of those.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the

@@ -954,6 +954,79 @@ pub fn build_split_state_from(
     encode(&tx, UNCOLORED_PAYLOAD_VOUT)
 }
 
+/// **[REQ-83 / REQ-85 / §6.0.1] The TAIL-carrying split state — a `SP` that pays ZERO fee.**
+///
+/// A payment below [`DUST_LIMIT`] rides as a **tail**: the transaction's ONE permitted sub-dust
+/// output. Bitcoin allows exactly one (`MAX_DUST_OUTPUTS_PER_TX = 1`), and a transaction that uses
+/// that slot **must pay zero fee** and be relayed as a package whose child spends the dust. Both
+/// halves are measured, not assumed — `scripts/tail_relay_probe.py` records that our funded-anchor
+/// shape is refused standalone for the FEE (`min relay fee not met`) and that a
+/// `[0-fee tail parent, paying child]` package relays (`package_msg: success`).
+///
+/// **The conservation law is DIFFERENT, and that is the whole reason this is a separate builder.**
+/// An ordinary tier forwards `prev − committed_fee − P2A_VALUE`; this one forwards
+/// `prev − P2A_VALUE` and nothing more. Folding it into [`build_split_state_from`] behind a flag
+/// would put two conservation laws behind one signature, and every verifier that reads "a tier
+/// forwards its funding minus exactly one rung" would need to know which — silently, from a
+/// parameter it cannot see.
+///
+/// **The anchor stays FUNDED at [`P2A_VALUE`], and that is what buys the dust slot.** Spark spends
+/// the slot on a zero-value anchor, so any sub-dust payload makes a SECOND dust output and the
+/// transaction is refused as `dust` — which is why one sub-dust child kills a whole branch there
+/// (§6.0.1). A 240-sat anchor sits at its own standardness threshold, is not dust, and leaves the
+/// one permitted slot free for the tail.
+///
+/// **[REQ-85] AT MOST ONE sub-dust output**, refused here rather than left to the verifier: the
+/// one-tail cap is what keeps the maximum sweepable prize below the minimum cost of broadcasting,
+/// and a builder that could emit two would be manufacturing the attack the cap exists to price out.
+pub fn build_tail_split_state_from(
+    prev_txid: &str,
+    prev_vout: u32,
+    prev_out_value: u64,
+    children: &[(String, u64)],
+    network: &str,
+    csv_d: u16,
+) -> Result<TierTx, MercuryError> {
+    if children.is_empty() {
+        return Err(MercuryError::FeeTooHigh);
+    }
+    // [REQ-85] The cap, before anything is built.
+    let sub_dust = children.iter().filter(|(_, v)| *v < DUST_LIMIT).count();
+    if sub_dust != 1 {
+        // ZERO is refused too, and deliberately: a zero-fee transaction with no tail on it is an
+        // ordinary split that simply forgot to pay, and it would never relay. The tail is the ONLY
+        // thing that justifies the zero-fee shape.
+        return Err(MercuryError::FeeTooLow);
+    }
+    if children.iter().any(|(_, v)| *v == 0) {
+        return Err(MercuryError::FeeTooLow);
+    }
+    let txid = Txid::from_str(prev_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
+    // Σ payload = prev − the anchor. No committed fee: this transaction pays none.
+    let available = prev_out_value.checked_sub(P2A_VALUE).ok_or(MercuryError::FeeTooHigh)?;
+    let total: u64 = children.iter().map(|(_, v)| *v).sum();
+    if total != available {
+        return Err(MercuryError::FeeTooHigh);
+    }
+    let mut output = Vec::with_capacity(children.len() + 1);
+    for (address, value) in children {
+        output.push(TxOut { value: *value, script_pubkey: spk_from_address(address, network)? });
+    }
+    output.push(TxOut { value: P2A_VALUE, script_pubkey: p2a_script() });
+    let tx = Transaction {
+        version: 3,
+        lock_time: absolute::LockTime::from_consensus(0),
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: prev_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: csv_blocks(csv_d),
+            witness: Witness::default(),
+        }],
+        output,
+    };
+    encode(&tx, UNCOLORED_PAYLOAD_VOUT)
+}
+
 /// COOPERATIVE DE-TRIGGER: a FRESH spend of `T.out[0]` with the relative-timelock DISABLED (paying
 /// `to_address`). Because it has no CSV wait while every pre-signed extension needs `E ≥ E_floor`
 /// confirmations, it confirms first — collapsing a hostile trigger to a priced nuisance and killing
@@ -1936,6 +2009,112 @@ impl LeafShape {
     /// the payment.
     pub fn exits_unaided(self) -> bool {
         self.rungs() > 0
+    }
+}
+
+#[cfg(test)]
+mod req83_tail_split {
+    use super::*;
+
+    const PREV: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    // A regtest P2TR address, reused for every leg: this module is about VALUES and the dust cap,
+    // and using one address keeps the arithmetic legible.
+    fn addr() -> String {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x31u8; 32]).unwrap();
+        let (xonly, _) = bitcoin::secp256k1::KeyPair::from_secret_key(&secp, &sk).x_only_public_key();
+        bitcoin::Address::p2tr(&secp, xonly, None, bitcoin::Network::Regtest).to_string()
+    }
+
+    fn build(children: &[(String, u64)], prev: u64) -> Result<TierTx, MercuryError> {
+        build_tail_split_state_from(PREV, 0, prev, children, "regtest", 0)
+    }
+
+    fn decode(t: &TierTx) -> Transaction {
+        bitcoin::consensus::encode::deserialize(&hex::decode(&t.tx_hex).unwrap()).unwrap()
+    }
+
+    /// **The shape §6.0.1 requires: ZERO fee, a FUNDED anchor, exactly one sub-dust output.**
+    ///
+    /// Read the fee and the anchor together — they are the same fact. The anchor is 240, its own
+    /// standardness threshold, so it is NOT dust and the transaction's one permitted dust slot is
+    /// left free for the tail. Spark spends that slot on a zero-value anchor, which is why a
+    /// sub-dust child kills a whole branch there.
+    #[test]
+    fn a_tail_split_pays_no_fee_and_keeps_the_anchor_funded() {
+        let prev = 10_000u64;
+        let tail = 200u64;
+        let piece = prev - P2A_VALUE - tail;
+        let t = build(&[(addr(), piece), (addr(), tail)], prev).expect("a well-formed tail split");
+        let tx = decode(&t);
+        let paid_out: u64 = tx.output.iter().map(|o| o.value).sum();
+        assert_eq!(paid_out, prev, "ZERO fee: every satoshi of the funding output is paid out");
+        let anchor = tx
+            .output
+            .iter()
+            .find(|o| o.script_pubkey.as_bytes() == P2A_SCRIPT_BYTES)
+            .expect("the anchor is present");
+        assert_eq!(anchor.value, P2A_VALUE, "the anchor stays FUNDED — that is what buys the slot");
+        assert_eq!(tx.version, 3, "v3/TRUC, so the package child can bump it");
+        let dust: Vec<u64> = tx
+            .output
+            .iter()
+            .filter(|o| o.script_pubkey.as_bytes() != P2A_SCRIPT_BYTES && o.value < DUST_LIMIT)
+            .map(|o| o.value)
+            .collect();
+        assert_eq!(dust, vec![tail], "exactly one sub-dust output, and it is the tail");
+    }
+
+    /// **[REQ-85] TWO tails are refused at BUILD time.**
+    ///
+    /// The one-tail cap carries the whole economic argument of §6.0.4: the maximum sweepable prize
+    /// (one output worth at most `DUST_LIMIT − 1`) stays strictly below the minimum cost of putting
+    /// the split on chain. A builder that could emit two would be manufacturing the attack the cap
+    /// exists to price out — and the transaction would be non-standard anyway.
+    #[test]
+    fn two_tails_are_refused() {
+        let prev = 10_000u64;
+        let piece = prev - P2A_VALUE - 200 - 100;
+        assert!(build(&[(addr(), piece), (addr(), 200), (addr(), 100)], prev).is_err());
+    }
+
+    /// **And ZERO tails are refused too, which is the less obvious half.**
+    ///
+    /// A zero-fee transaction with nothing sub-dust on it is an ordinary split that simply forgot to
+    /// pay: it would never relay, standalone or in a package, and nothing about it needs this shape.
+    /// The tail is the only thing that justifies paying no fee.
+    #[test]
+    fn a_zero_fee_split_with_no_tail_is_refused() {
+        let prev = 10_000u64;
+        assert!(build(&[(addr(), prev - P2A_VALUE)], prev).is_err());
+    }
+
+    /// **Conservation: Σ payload = funding − the anchor, exactly.** Not `− committed_fee −
+    /// P2A_VALUE`, which is every OTHER tier's law. Under-paying is a burn, over-paying does not
+    /// balance, and both are refused rather than rounded.
+    #[test]
+    fn the_conservation_law_is_funding_minus_the_anchor_and_nothing_else() {
+        let prev = 10_000u64;
+        let exact = prev - P2A_VALUE;
+        assert!(build(&[(addr(), exact - 200), (addr(), 200)], prev).is_ok());
+        assert!(build(&[(addr(), exact - 200 - 1), (addr(), 200)], prev).is_err(), "under-pays");
+        assert!(build(&[(addr(), exact - 200 + 1), (addr(), 200)], prev).is_err(), "over-pays");
+    }
+
+    /// **A one-satoshi tail is legitimate.** REQ-83 says every amount at or above 1 sat must be
+    /// expressible, and the bottom of the range is the part that is easy to lose to an off-by-one.
+    #[test]
+    fn one_satoshi_is_a_legitimate_tail() {
+        let prev = 10_000u64;
+        let t = build(&[(addr(), prev - P2A_VALUE - 1), (addr(), 1)], prev).expect("1 sat pays");
+        assert!(decode(&t).output.iter().any(|o| o.value == 1));
+    }
+
+    /// A ZERO-value leg is not a payment and is refused — the one value REQ-83 excludes.
+    #[test]
+    fn a_zero_value_leg_is_refused() {
+        let prev = 10_000u64;
+        assert!(build(&[(addr(), prev - P2A_VALUE), (addr(), 0)], prev).is_err());
     }
 }
 
