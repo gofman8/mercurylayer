@@ -577,6 +577,85 @@ pub fn build_tier_tx(
     }
 }
 
+/// **[REQ-56 / §5.4.4] Build the COLLAPSE transaction `C` that closes a tree.**
+///
+/// `C` spends the root's funding output `F` and pays **every unreleased frontier leaf its full
+/// funding value at its own exit key**, with the remainder to the root owner. Leaves whose holders
+/// have released are owed nothing. The payouts come out of `F` itself — the tree's own money — which
+/// is the whole of REQ-69/REQ-80: **the closer fronts nothing.**
+///
+/// **The fee comes out of the OWNER'S remainder, never out of a payout, and that is not a formatting
+/// choice.** The SE's predicate requires each leaf paid IN FULL; shaving a fee off a payout is
+/// arithmetically identical to underpaying one, which is the exact refusal `collapse_grant` exists to
+/// make — a holder discharged without being paid. So the caller passes `owner_value` already net of
+/// the fee, and `C` is refused here if the outputs do not fit inside `funding_value`.
+///
+/// **Version 2, not 3.** Every TES-R tier is v3/TRUC because it must relay as a package behind an
+/// anchor. `C` is a final settlement transaction that pays its own fee out of the remainder and has
+/// no anchor and no child, so TRUC's topology limits would only constrain it for nothing.
+///
+/// Keys are x-only (32-byte) hex, because that is what the SE's leaf registry stores as a leaf's exit
+/// key and what its predicate compares against. Taking addresses here would mean converting twice and
+/// comparing in a third form.
+pub fn build_collapse_tx(
+    funding_txid: &str,
+    funding_vout: u32,
+    funding_value: u64,
+    payouts: &[(String, u64)],
+    owner_xonly: Option<(String, u64)>,
+) -> Result<TierTx, MercuryError> {
+    let txid = Txid::from_str(funding_txid).map_err(|_| MercuryError::BitcoinHashHexError)?;
+    if payouts.is_empty() {
+        // An empty obligation is satisfied vacuously — correct arithmetic, catastrophic answer. The
+        // SE refuses this upstream (`validate_for_grant`); refusing to BUILD it too means a caller
+        // never gets as far as asking.
+        return Err(MercuryError::TransactionReconstructionError);
+    }
+
+    let spk_of = |xonly_hex: &str| -> Result<ScriptBuf, MercuryError> {
+        let raw = hex::decode(xonly_hex).map_err(|_| MercuryError::BitcoinHashHexError)?;
+        if raw.len() != 32 {
+            return Err(MercuryError::BitcoinHashHexError);
+        }
+        let mut spk = Vec::with_capacity(34);
+        spk.push(0x51);
+        spk.push(0x20);
+        spk.extend_from_slice(&raw);
+        Ok(ScriptBuf::from_bytes(spk))
+    };
+
+    let mut output = Vec::with_capacity(payouts.len() + 1);
+    for (key, value) in payouts {
+        output.push(TxOut { value: *value, script_pubkey: spk_of(key)? });
+    }
+    if let Some((key, value)) = owner_xonly.as_ref() {
+        // A zero-value remainder is simply no output: the fee happened to consume all of it. Emitting
+        // a 0-sat P2TR instead would make `C` non-standard and unbroadcastable, turning a tree that
+        // closes tightly into one that cannot close at all.
+        if *value > 0 {
+            output.push(TxOut { value: *value, script_pubkey: spk_of(key)? });
+        }
+    }
+
+    let total_out: u64 = output.iter().map(|o| o.value).sum();
+    if total_out > funding_value {
+        return Err(MercuryError::FeeTooLow);
+    }
+
+    let tx = Transaction {
+        version: 2,
+        lock_time: absolute::LockTime::from_consensus(0),
+        input: vec![TxIn {
+            previous_output: OutPoint { txid, vout: funding_vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::default(),
+        }],
+        output,
+    };
+    encode(&tx, 0)
+}
+
 /// **THE payload-vout accessor.** The output index at which a tier's PAYLOAD (value-carrying,
 /// P2TR(A)-or-payee) outputs begin. Every chaining site — "the child spends its parent's payload
 /// output", "the tier pays `A` on its payload output", the `live_csv_by_outpoint` census key — must
@@ -1857,6 +1936,112 @@ impl LeafShape {
     /// the payment.
     pub fn exits_unaided(self) -> bool {
         self.rungs() > 0
+    }
+}
+
+#[cfg(test)]
+mod req56_collapse_tx {
+    use super::*;
+
+    const F: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    fn key(b: u8) -> String { hex::encode([b; 32]) }
+
+    fn decode(t: &TierTx) -> bitcoin::Transaction {
+        bitcoin::consensus::encode::deserialize(&hex::decode(&t.tx_hex).unwrap()).unwrap()
+    }
+
+    /// **THE PROPERTY THE SE ACTUALLY CHECKS: every leaf paid its FULL value at its OWN key.**
+    ///
+    /// Asserted per output rather than on the sum. A `C` that pays the right TOTAL to the wrong
+    /// distribution satisfies any sum check and still discharges a holder without paying them, which
+    /// is the one outcome REQ-56 exists to make impossible.
+    #[test]
+    fn every_leaf_is_paid_in_full_at_its_own_key() {
+        let payouts = vec![(key(0xa1), 3_000u64), (key(0xb2), 2_000), (key(0xc3), 1_500)];
+        let t = build_collapse_tx(F, 0, 10_000, &payouts, Some((key(0xff), 3_000))).unwrap();
+        let tx = decode(&t);
+        assert_eq!(tx.output.len(), 4, "three leaves and the owner's remainder");
+        for (i, (k, v)) in payouts.iter().enumerate() {
+            assert_eq!(tx.output[i].value, *v, "leaf {i} must be paid IN FULL");
+            assert_eq!(
+                hex::encode(&tx.output[i].script_pubkey.as_bytes()[2..]),
+                *k,
+                "leaf {i} must be paid at its OWN exit key"
+            );
+            assert_eq!(tx.output[i].script_pubkey.as_bytes()[0], 0x51, "P2TR");
+        }
+        assert_eq!(tx.input.len(), 1, "REQ-55: exactly one input");
+        assert_eq!(tx.input[0].previous_output.txid.to_string(), F, "C must spend THIS root's F");
+    }
+
+    /// **The fee comes out of the OWNER'S remainder, never out of a payout.**
+    ///
+    /// Shaving a fee across the payouts is arithmetically identical to underpaying every leaf, and
+    /// the SE refuses exactly that. This pins that a smaller remainder leaves the payouts untouched.
+    #[test]
+    fn the_fee_is_taken_from_the_remainder_and_the_payouts_do_not_move() {
+        let payouts = vec![(key(0xa1), 3_000u64), (key(0xb2), 2_000)];
+        let full = decode(&build_collapse_tx(F, 0, 10_000, &payouts, Some((key(0xff), 5_000))).unwrap());
+        let feed = decode(&build_collapse_tx(F, 0, 10_000, &payouts, Some((key(0xff), 4_600))).unwrap());
+        assert_eq!(full.output[0].value, feed.output[0].value);
+        assert_eq!(full.output[1].value, feed.output[1].value);
+        assert_eq!(full.output[2].value - feed.output[2].value, 400, "the whole fee came from the owner");
+    }
+
+    /// **A zero remainder emits NO owner output, not a zero-value one.**
+    ///
+    /// A 0-sat P2TR is non-standard, so emitting one would turn a tree that closes tightly into a
+    /// tree that cannot close at all — the failure would appear at broadcast, long after the SE has
+    /// frozen the root and the signature can never be reissued.
+    #[test]
+    fn a_zero_remainder_is_no_output_rather_than_a_zero_output() {
+        let payouts = vec![(key(0xa1), 9_800u64)];
+        let tx = decode(&build_collapse_tx(F, 0, 10_000, &payouts, Some((key(0xff), 0))).unwrap());
+        assert_eq!(tx.output.len(), 1, "no 0-sat output may be emitted");
+        assert!(tx.output.iter().all(|o| o.value > 0));
+    }
+
+    /// **An empty payout set is refused at BUILD time.**
+    ///
+    /// The SE refuses it too (`validate_for_grant`), and for the sharper reason: an empty obligation
+    /// is satisfied vacuously — correct arithmetic, catastrophic answer. Refusing here as well means
+    /// a caller never gets far enough to ask.
+    #[test]
+    fn an_empty_obligation_is_refused_rather_than_satisfied_vacuously() {
+        assert!(build_collapse_tx(F, 0, 10_000, &[], Some((key(0xff), 9_000))).is_err());
+    }
+
+    /// **Paying out more than `F` holds is refused, rather than built and refused later.**
+    #[test]
+    fn outputs_may_not_exceed_the_funding_value() {
+        let payouts = vec![(key(0xa1), 6_000u64), (key(0xb2), 5_000)];
+        assert!(build_collapse_tx(F, 0, 10_000, &payouts, None).is_err());
+        // …and exactly `funding_value` is allowed: a zero-fee C is a caller's problem to broadcast,
+        // not a shape this builder may silently reshape.
+        assert!(build_collapse_tx(F, 0, 11_000, &payouts, None).is_ok());
+    }
+
+    /// **A key that is not 32 bytes is refused, rather than producing a malformed scriptPubKey.**
+    ///
+    /// Left unchecked, a short key yields a `0x51 0x20 <short>` script that is not P2TR at all, and
+    /// the leaf it was meant to pay would be unpayable forever — after the freeze.
+    #[test]
+    fn a_key_that_is_not_x_only_is_refused() {
+        for bad in ["", "ab", &hex::encode([7u8; 33])] {
+            assert!(
+                build_collapse_tx(F, 0, 10_000, &[(bad.to_string(), 1_000)], None).is_err(),
+                "key {bad:?} must be refused"
+            );
+        }
+    }
+
+    /// **Version 2, not the tiers' v3/TRUC.** `C` pays its own fee and has no anchor and no child, so
+    /// TRUC's topology limits would constrain it for nothing.
+    #[test]
+    fn the_collapse_is_a_plain_v2_transaction() {
+        let tx = decode(&build_collapse_tx(F, 0, 10_000, &[(key(0xa1), 9_000)], None).unwrap());
+        assert_eq!(tx.version, 2);
+        assert_eq!(tx.lock_time.to_consensus_u32(), 0);
     }
 }
 

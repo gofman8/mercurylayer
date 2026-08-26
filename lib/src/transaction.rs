@@ -39,6 +39,84 @@ pub struct PartialSignatureMsg1 {
     pub partial_signature_request_payload: PartialSignatureRequestPayload,
 }
 
+/// **[REQ-56 / REQ-82] The request that asks the SE for its half of a COLLAPSE.**
+///
+/// A collapse is not an ordinary spend and does not travel on the ordinary signing route, because
+/// the SE decides it on entirely different grounds: `sign/second` asks *"is this coin still allowed
+/// to spend?"*, while `collapse_grant` asks *"does this transaction pay every unreleased frontier
+/// leaf its full funding value, out of THIS root's own funding output?"*. The second question has no
+/// meaning on the first route and vice versa.
+///
+/// Every field but `root_statechain_id` is the ordinary signing payload, unchanged and forwarded
+/// whole. That is deliberate: the SE rebuilds the blinded session from `disclosure` and byte-compares
+/// it against `session` exactly as it does for any tier (REQ-57), so the collapse gets the same
+/// binding as every other signature rather than a parallel one that could drift from it.
+///
+/// **Why the root's id is carried separately from `statechain_id`.** They are the same value today —
+/// the closer IS the root owner (REQ-82) — and writing them as one field would bake that in. The SE
+/// looks up the leaf set, the funding outpoint, the aggregate and the freeze by ROOT; it consumes the
+/// secnonce and checks the auth signature by the SIGNER. Collapsing the two names would make a future
+/// delegated closer a wire-format change rather than a policy one.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct CollapseGrantRequestPayload {
+    /// The root whose tree is being closed. The SE reads its leaves, funding outpoint, aggregate and
+    /// freeze flag under this id.
+    pub root_statechain_id: String,
+    pub statechain_id: String,
+    pub negate_seckey: u8,
+    pub session: String,
+    pub signed_statechain_id: String,
+    pub server_pub_nonce: String,
+    /// [REQ-57] Same disclosure, same binding, same refusal as every other signature. `Option` on the
+    /// wire only — the SE refuses a request that omits it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub disclosure: Option<SigningDisclosure>,
+}
+
+impl CollapseGrantRequestPayload {
+    /// Wrap an ordinary signing payload as a collapse request for `root_statechain_id`.
+    ///
+    /// Takes the payload by value and moves every field: a version that copied would let the caller
+    /// keep sending the same session down the ordinary route as well, and one secnonce answering two
+    /// routes is the nonce reuse this whole design refuses elsewhere.
+    pub fn for_root(root_statechain_id: String, p: PartialSignatureRequestPayload) -> Self {
+        Self {
+            root_statechain_id,
+            statechain_id: p.statechain_id,
+            negate_seckey: p.negate_seckey,
+            session: p.session,
+            signed_statechain_id: p.signed_statechain_id,
+            server_pub_nonce: p.server_pub_nonce,
+            disclosure: p.disclosure,
+        }
+    }
+}
+
+/// What the SE returns when it grants a collapse.
+///
+/// `granted` is not redundant with the presence of a signature: a caller that reads only
+/// `partial_sig` cannot tell a grant from a refusal that happened to carry a body, and this route's
+/// refusals are the interesting half of its behaviour.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "bindings", derive(uniffi::Record))]
+pub struct CollapseGrantResponse {
+    /// The SE's half of the 2-of-2 over `C`. REQ-82: only ever its half.
+    pub partial_sig: String,
+    /// False on a replay of the SAME session — the grant is idempotent, not repeatable.
+    pub newly_signed: bool,
+    /// The root is frozen from this moment, in the same database transaction that produced the
+    /// signature. INV-FREEZE is a ratchet: no path clears it.
+    pub frozen: bool,
+    pub granted: bool,
+    /// How many unreleased frontier leaves `C` had to pay. Zero would be an empty obligation
+    /// satisfied vacuously, which the SE refuses upstream rather than reports here.
+    pub obligations: i32,
+    /// What the released leaves were worth — REQ-74's self-funding figure.
+    pub recovered: i64,
+    pub self_funding: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "bindings", derive(uniffi::Record))]
 pub struct PartialSignatureRequestPayload {

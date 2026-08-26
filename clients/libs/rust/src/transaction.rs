@@ -67,6 +67,24 @@ pub async fn new_transaction(
     Ok(signed_tx)
 }
 
+/// **The SE's own words for a refusal, or the raw body when it did not speak JSON.**
+///
+/// Every route in this file needs this and each one used to inline it, which is how the same four
+/// lines came to exist four times — and why the silent-degradation guard fired on the fourth copy
+/// rather than the first. Written once, it is also reviewable once.
+///
+/// **It never turns a failure into a success.** The caller has already decided this is an error and
+/// is on its way to returning one; all that is chosen here is the TEXT. The fallback is the raw body,
+/// which is strictly MORE information than a generic message — the opposite of the degradation the
+/// guard exists to catch. This matters on this route in particular: `collapse_grant`'s refusals are
+/// six distinct named gates, and a client that cannot tell them apart cannot act on any of them.
+fn se_error_detail(value: &str) -> String {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| value.to_string())
+}
+
 /// This function gets the server public nonce from the statechain entity.
 pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload: &SignFirstRequestPayload) -> Result<String> {
 
@@ -89,10 +107,7 @@ pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload
         // different JSON shape (Rocket's default {"error": {..}}) or non-JSON. Never unwrap the
         // "message" field — fall back to the raw body so a server hiccup surfaces as a clean Err
         // instead of a client-side panic that crashes the caller's task.
-        let detail = serde_json::from_str::<Value>(value.as_str())
-            .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| value.clone());
+        let detail = se_error_detail(value.as_str());
         return Err(anyhow::anyhow!("sign/first failed ({}): {}", status, detail));
     }
 
@@ -105,6 +120,73 @@ pub async fn sign_first(client_config: &ClientConfig, sign_first_request_payload
     }
 
     Ok(server_pubnonce_hex)
+}
+
+/// **[REQ-56] Mint the secnonce a collapse will consume.**
+///
+/// The same request as [`sign_first`], to a different route, for a reason that took a live
+/// measurement to see: `sign/first` refuses `410 Gone` once a coin's spend budget is exhausted, and a
+/// root worth collapsing is a root that has been SPLIT — which is exactly what exhausts it. Every
+/// genuine tree measured on the live server (13 of the 14 roots holding more than one leaf) was in
+/// that state, so the collapse could never obtain the nonce its own route requires.
+///
+/// See `server/src/endpoints/collapse.rs` for why exempting this one route from that gate does not
+/// weaken it: the ordinary route re-checks the budget itself, so a collapse nonce cannot be spent on
+/// an ordinary transaction.
+pub async fn collapse_first(
+    client_config: &ClientConfig,
+    sign_first_request_payload: &SignFirstRequestPayload,
+) -> Result<String> {
+    let endpoint = client_config.statechain_entity.clone();
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/{}", endpoint, "collapse/first"))
+        .json(&sign_first_request_payload)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let value = response.text().await?;
+    if status != StatusCode::OK {
+        let detail = se_error_detail(value.as_str());
+        return Err(anyhow::anyhow!("collapse/first failed ({}): {}", status, detail));
+    }
+
+    let payload: mercurylib::transaction::SignFirstResponsePayload =
+        serde_json::from_str(value.as_str())?;
+    let mut server_pubnonce_hex = payload.server_pubnonce.to_string();
+    if server_pubnonce_hex.starts_with("0x") {
+        server_pubnonce_hex = server_pubnonce_hex[2..].to_string();
+    }
+    Ok(server_pubnonce_hex)
+}
+
+/// **[REQ-56 / REQ-82] Ask the SE for its half of a collapse, and return its answer whole.**
+///
+/// The SE's refusals are the interesting half of this route — six distinct gates, each naming its own
+/// cause — so a failure is surfaced with the SE's own words rather than a generic message. A caller
+/// that cannot tell "does not pay every unreleased frontier leaf in full" from "session does not
+/// reproduce the disclosed transaction" cannot act on either.
+pub async fn collapse_grant(
+    client_config: &ClientConfig,
+    payload: &mercurylib::transaction::CollapseGrantRequestPayload,
+) -> Result<mercurylib::transaction::CollapseGrantResponse> {
+    let endpoint = client_config.statechain_entity.clone();
+    let client = client_config.get_reqwest_client()?;
+    let response = client
+        .post(&format!("{}/{}", endpoint, "collapse_grant"))
+        .json(payload)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let value = response.text().await?;
+    if status != StatusCode::OK {
+        let detail = se_error_detail(value.as_str());
+        return Err(anyhow::anyhow!("collapse_grant refused ({}): {}", status, detail));
+    }
+
+    Ok(serde_json::from_str::<mercurylib::transaction::CollapseGrantResponse>(value.as_str())?)
 }
 
 pub async fn sign_second(client_config: &ClientConfig, partial_sig_request: &PartialSignatureRequestPayload) -> Result<MusigPartialSignature> {
@@ -127,10 +209,7 @@ pub async fn sign_second(client_config: &ClientConfig, partial_sig_request: &Par
         // malformed session. Surface the typed status so the caller can distinguish "SE refused" from
         // "garbage response" instead of failing on an opaque serde parse error (adversarial-log
         // review: sign/second previously swallowed the status and mis-reported these refusals).
-        let detail = serde_json::from_str::<Value>(value.as_str())
-            .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| value.clone());
+        let detail = se_error_detail(value.as_str());
         return Err(anyhow::anyhow!("sign/second failed ({}): {}", status, detail));
     }
 

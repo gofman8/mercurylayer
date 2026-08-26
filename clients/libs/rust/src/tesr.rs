@@ -14557,6 +14557,73 @@ pub async fn cosign_tier(
     Ok(signed_tx)
 }
 
+/// **[REQ-56 / REQ-82 / §5.4.4] Close a tree: ask the SE for its half of `C` and return the signed
+/// collapse transaction.**
+///
+/// The mirror of [`cosign_tier`], and deliberately so — same nonce commitment, same session, same
+/// disclosure, same aggregation. What differs is only WHICH question the SE is asked: `sign/second`
+/// asks *"is this coin still allowed to spend?"*, while `collapse_grant` asks *"does this transaction
+/// pay every unreleased frontier leaf its full funding value, out of THIS root's own funding
+/// output?"*. Building the collapse on a parallel signing path instead of this one would let the two
+/// drift, and REQ-57's binding is exactly what must not drift.
+///
+/// **This is the caller that did not exist, and its absence is why the SE's accept path had never
+/// run.** `collapse_grant` has been correct and measured for its REFUSALS since #169 — the probe's
+/// eight cases resolve to six distinct gates — but every one of those measurements came from a Python
+/// probe seeding the SE's database directly, because the lockbox listens on a port no client reaches
+/// and no route forwarded to it. A route measured only in refusal is a route whose success branch has
+/// never run.
+///
+/// **No retry loop here, unlike `cosign_tier`, and the difference is not an oversight.** A tier's
+/// `sign/second` is idempotent on the same session (the lockbox caches the partial signature), so
+/// resending is free. A collapse FREEZES the root in the same database transaction that signs it, so
+/// a resend is answered from the same cache with `newly_signed: false` — safe, but no longer a retry
+/// of anything. The caller is told what happened instead of having it retried underneath them.
+pub async fn request_collapse(
+    client_config: &ClientConfig,
+    root_coin: &mut Coin,
+    root_statechain_id: &str,
+    collapse_tx_hex: String,
+    funding_value: u64,
+    network: &str,
+) -> Result<(mercurylib::transaction::CollapseGrantResponse, String)> {
+    let coin_nonce = mercurylib::transaction::create_and_commit_nonces(root_coin)?;
+    root_coin.secret_nonce = Some(coin_nonce.secret_nonce);
+    root_coin.public_nonce = Some(coin_nonce.public_nonce);
+    root_coin.blinding_factor = Some(coin_nonce.blinding_factor);
+
+    // `collapse/first`, NOT `sign/first`: a root worth collapsing has been split, splitting exhausts
+    // its spend budget, and `sign/first` refuses `410 Gone` on an exhausted budget. Measured live —
+    // of the 14 roots holding more than one leaf, every one known to the server was in that state.
+    let server_public_nonce =
+        crate::transaction::collapse_first(client_config, &coin_nonce.sign_first_request_payload)
+            .await?;
+    root_coin.server_public_nonce = Some(server_public_nonce);
+
+    // `funding_value` is the value of `F`, the output `C` spends — not `coin.amount`, for the same
+    // reason a tier's prevout is not the coin's amount. The sighash commits to it, so getting it
+    // wrong produces a session the SE cannot reproduce and a `400` that names the binding rather than
+    // the value, which is a considerably harder thing to debug.
+    let partial =
+        mercurylib::tesr::cosign_tier_request(root_coin, collapse_tx_hex, funding_value, network.to_string())?;
+
+    let payload = mercurylib::transaction::CollapseGrantRequestPayload::for_root(
+        root_statechain_id.to_string(),
+        partial.partial_signature_request_payload,
+    );
+    let grant = crate::transaction::collapse_grant(client_config, &payload).await?;
+
+    let signature = create_signature(
+        partial.msg,
+        partial.client_partial_sig,
+        grant.partial_sig.clone(),
+        partial.encoded_session,
+        partial.output_pubkey,
+    )?;
+    let signed_tx = new_backup_transaction(partial.encoded_unsigned_tx, signature)?;
+    Ok((grant, signed_tx))
+}
+
 /// **F4 — a blind pass must never look like an idle one.**
 ///
 /// These are the regression tests for the external review's finding that the TES-R watch/exit

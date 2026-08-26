@@ -140,10 +140,21 @@ fn the_zero_claim_is_never_extended_to_lightning() {
     }
 }
 
-/// **[REQ-81] Nothing may schedule a close.**
+/// **[REQ-81] Nothing may SCHEDULE a close.**
 ///
-/// Scans the CODE, not the document: the prohibition is about what the system does. A close is
-/// `collapse_grant`, and the guard is that no timer, cron, epoch tick or deadline sweep calls it.
+/// Scans the CODE, not the document: the prohibition is about what the system does.
+///
+/// **This guard was narrowed after it fired on the owner's own caller, and the narrowing is the
+/// point.** It used to refuse the string `collapse_grant` anywhere on a client path. That was a
+/// serviceable proxy while no client could close a tree at all — and it became wrong the moment one
+/// could, because it forbade the very thing REQ-81 requires to EXIST: an owner-initiated close.
+/// A guard that cannot tell "the owner asked" from "a calendar asked" would be satisfied only by
+/// having no close at all, which is not the requirement.
+///
+/// So it now checks the requirement itself: **no function whose name marks it as automatic,
+/// scheduled or periodic may mention a close.** The owner's entry point may; a background pass may
+/// not. That is the line REQ-81 actually draws — "absentee" must never become a category, and it
+/// becomes one exactly when something other than a decision can trigger a discharge.
 #[test]
 fn no_scheduled_trigger_reaches_a_close() {
     const SOURCES: &[&str] = &[
@@ -152,24 +163,81 @@ fn no_scheduled_trigger_reaches_a_close() {
         "clients/libs/rust/src/tesr.rs",
         "clients/libs/rust/src/rgb.rs",
     ];
+    // What marks a function as something other than a decision. `auto`/`renew`/`rollover` are this
+    // repo's own words for its background maintenance pass; the rest are the shapes a scheduler
+    // arrives under.
+    const SCHEDULED: &[&str] = &[
+        "_auto", "auto_", "background", "maintenance", "periodic", "_tick", "sweep_", "on_timer",
+        "cron", "deadline_pass", "watchtower_",
+    ];
+    // The close, in every form a caller could name it.
+    const CLOSE: &[&str] = &["collapse_grant", "request_collapse", "collapse_first"];
+
     for rel in SOURCES {
         let src = read(rel);
+        let mut current_fn: Option<(usize, String)> = None;
+        let mut depth: i32 = 0;
         for (n, line) in src.lines().enumerate() {
             let t = line.trim_start();
-            if t.starts_with("//") || t.starts_with("///") {
+            let is_comment = t.starts_with("//");
+            // Track which function body we are inside, by brace depth. Crude, and sufficient: a
+            // scheduled function's body is what matters and Rust nests it in braces like any other.
+            if !is_comment && depth == 0 {
+                if let Some(idx) = t.find("fn ") {
+                    let name: String = t[idx + 3..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    current_fn = Some((n + 1, name));
+                }
+            }
+            if !is_comment {
+                depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                if depth <= 0 {
+                    depth = 0;
+                    if let Some((_, ref name)) = current_fn {
+                        // A one-line body closes immediately; keep the name until the next `fn`.
+                        let _ = name;
+                    }
+                }
+            }
+            if is_comment {
                 continue;
             }
-            if line.contains("collapse_grant") {
+            let Some((decl_line, ref fname)) = current_fn else { continue };
+            let lower = fname.to_lowercase();
+            if !SCHEDULED.iter().any(|m| lower.contains(m)) {
+                continue;
+            }
+            if let Some(hit) = CLOSE.iter().find(|c| line.contains(**c)) {
                 panic!(
-                    "[REQ-81] {rel}:{} calls or names `collapse_grant` on a client path. A close is \
-                     the root owner's decision, and the client paths here include the background \
-                     maintenance pass — the one place a calendar could acquire the power to close a \
-                     tree and turn 'absentee' back into a category: {line}",
+                    "[REQ-81] {rel}:{} names `{hit}` inside `{fname}` (declared at line {decl_line}), \
+                     whose name marks it as automatic or scheduled. A close is the root owner's \
+                     DECISION. The moment a calendar, an epoch or a maintenance pass can trigger one, \
+                     'absentee' becomes a category again and a holder can be discharged for failing \
+                     to be awake: {line}",
                     n + 1
                 );
             }
         }
     }
+}
+
+/// **[REQ-81] …and the owner's close must actually EXIST.**
+///
+/// The companion to the guard above, and the reason that one had to be narrowed rather than
+/// silenced. REQ-81 is not "no close" — it is "a close, triggered only by its owner". A repository
+/// that satisfied the prohibition by having no owner-initiated close would satisfy it the way an
+/// empty room satisfies a fire code.
+#[test]
+fn the_owner_initiated_close_exists() {
+    let src = read("clients/libs/rust/src/tesr.rs");
+    assert!(
+        src.contains("pub async fn request_collapse("),
+        "[REQ-81] no owner-initiated close exists on the client. The SE has had a working \
+         `collapse_grant` since #169, and for as long as nothing called it the route's ACCEPT path \
+         had never run once — measured only in refusal."
+    );
 }
 
 /// **[REQ-76] No path may require a funded successor output before a holder can act.**

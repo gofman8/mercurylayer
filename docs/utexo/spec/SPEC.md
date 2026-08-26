@@ -1077,6 +1077,49 @@ SAME database transaction that sets `frozen` (`freeze_root_and_store_collapse_si
 safe alone: sign first and a leaf may still join a tree whose collapse is already signed without an
 output for it; freeze first and a failed signature seals the tree with nothing payable.
 
+**AND THE ACCEPT PATH HAD NEVER RUN ONCE — for two reasons, both measured rather than reasoned
+about.** Every measurement of `collapse_grant` above is of a REFUSAL. `se_root` held zero rows, a
+root row is only ever created by the freeze, so no tree had ever been closed. A route measured only
+in refusal is a route whose success branch has never run.
+
+1. **Nothing could call it.** There was no client-side caller and no server route — the lockbox
+   listens on a port no client reaches, so every measurement came from a Python probe seeding the
+   SE's database directly.
+2. **And had there been one, it would have been refused for want of a nonce.** `collapse_grant`
+   consumes a secnonce that only `sign/first` mints, and `sign/first` refuses `410 Gone` once a
+   coin's spend budget is exhausted. **A root worth collapsing is a root that has been SPLIT, and
+   splitting is what exhausts the budget.** Measured on the live server: of the **14** roots holding
+   more than one leaf — the only genuine trees present — **13 are known to the server and every one
+   has an exhausted budget. Not one could have a nonce minted.** The 67 roots that could are
+   single-leaf: a coin that is its own only leaf, where "collapse" means paying yourself your own
+   coin.
+
+The first is `POST /collapse_grant`, which forwards whole and returns the SE's status and body
+unchanged — its refusals are six distinct named gates and a client that cannot tell them apart cannot
+act on any of them. The second is `POST /collapse/first`, which mints the nonce exempt from the
+budget gate. **The exemption is safe for a reason that is checked, not assumed:** the ordinary route
+re-checks the budget itself ([S1]), so a collapse nonce presented to `sign/second` is refused there
+on the same exhausted budget; `collapse_grant` will only spend it on a transaction that pays every
+unreleased leaf in full out of this root's own funding output under this root's own aggregate bound
+to this exact session; and it can happen at most once, because the freeze is written in the same
+transaction as the signature. The collapse's gates are strictly MORE specific than the one skipped.
+Every other gate is kept, the pending-transfer lock included.
+
+`build_collapse_tx` builds `C` and `request_collapse` runs the exchange, mirroring `cosign_tier`
+exactly so REQ-57's binding cannot drift between the two. Seven unit tests pin what the SE actually
+checks — each leaf paid IN FULL at its OWN key (asserted per output, since a right total to a wrong
+distribution passes any sum check and still discharges a holder unpaid), the fee taken from the
+owner's remainder and never shaved off a payout, a zero remainder emitting NO output rather than an
+unbroadcastable 0-sat one, and an empty obligation refused rather than satisfied vacuously.
+
+**REQ-81's guard had to be NARROWED to allow this, and the narrowing is the point.** It refused the
+string `collapse_grant` anywhere on a client path — a serviceable proxy while no client could close a
+tree, and wrong the moment one could, because it forbade the very thing REQ-81 requires to exist. It
+now checks the requirement itself: no function whose name marks it as automatic, scheduled or
+periodic may mention a close, and a companion test asserts the owner's close EXISTS. Verified by
+planting a call to `request_collapse` inside the background renewal pass and watching the guard name
+the function and the line.
+
 Two properties the route now enforces, both observable from outside via `collapse_grant_probe.py`:
 
 * **The verdict is COMPLETE before anything is signed.** Every refusal — underpayment, wrong funding
