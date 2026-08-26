@@ -1644,7 +1644,27 @@ reporting it as "a well-formed tail, admission pending" tells an attacker their 
 softens a security refusal into a feature-flag notice. The same bytes mean opposite things in the two
 lanes.
 
-**REQ-84 and the relay claims remain UNPROVEN.** The release fragment is not built, and neither The load-bearing claims — that a funded 240 anchor
+**THE RELAY CLAIMS ARE NOW PROVEN — measured against Bitcoin Core 30.2, not read from its source.**
+`scripts/tail_relay_probe.py` asks the node and records what it says:
+
+| shape | verdict |
+|---|---|
+| v3 TRUC, FUNDED 240 anchor, 0 fee | refused — **`min relay fee not met`** |
+| v2 legacy, funded 240 anchor, 0 fee | refused — `min relay fee not met` |
+| v3 TRUC, **ZERO-value** anchor (Spark's shape) | refused — **`dust`** |
+| PACKAGE `[0-fee tail parent, paying child]` | **`package_msg: success`** |
+
+Read the first and third rows together, because the difference between them is the entire design.
+**Our shape is refused for the FEE, not for DUST** — the funded 240 anchor sits at its own
+standardness threshold, so it is not dust and the transaction's one permitted dust output is left
+free for the tail. Spark's zero-value anchor IS that one permitted dust output, so a sub-dust payload
+makes a second and the transaction is refused as `dust`. That is why a sub-dust child kills a whole
+branch there, and it is now measured rather than asserted.
+
+And the fourth row is the claim §6.0 actually rests on: a 0-fee parent carrying a tail **relays** when
+its child pays for it.
+
+**REQ-84 remains UNPROVEN and unbuilt.** The release fragment is not built, and neither The load-bearing claims — that a funded 240 anchor
 leaves the dust slot genuinely free, that a `[tail, funded anchor]` split relays as a zero-fee package,
 and that the release fragment behaves as analysed — are read from policy source and from our own
 constants. §0.2 applies: presence and ordering, never behaviour. Each needs plant-and-run before this
