@@ -5930,11 +5930,21 @@ fn resolve_conveyance_plan(
                  carve a batch whose recipient list does not describe it"
             ));
         };
-        if *role != SplitLegRole::Piece {
+        // **What this refuses is the CHANGE leg, and it must name it rather than name everything
+        // else.** It read `!= SplitLegRole::Piece`, which was the same thing while a payee's leg had
+        // exactly one shape — and became wrong the moment [REQ-83] gave payees three. A thin piece
+        // and a tail are conveyed exactly as an ordinary piece is; the sender's tip is the one leg
+        // that is not, because journalling a recipient for it would let a resume hand this wallet's
+        // change to a third party.
+        //
+        // `Ladderless` is refused too, for a different reason worth keeping separate: it has no
+        // statechain id, so it can never be the `sid` matched above — reaching here means a caller
+        // named an empty slot, and that is a mistake rather than a policy.
+        if matches!(*role, SplitLegRole::SpineTip | SplitLegRole::Ladderless) {
             return Err(anyhow::anyhow!(
-                "conveyance plan names slot {sid}, which is this wallet's own SPINE TIP — the \
-                 change leg is not conveyed, and journalling a recipient for it would let a resume \
-                 hand this wallet's change to a third party"
+                "conveyance plan names slot {sid}, which is a {role:?} leg — the change leg is not \
+                 conveyed (journalling a recipient for it would let a resume hand this wallet's \
+                 change to a third party), and a ladderless leg has no slot to convey"
             ));
         }
         // A hand-over needs the recipient's AUTH and encryption keys, which only a statechain
@@ -17830,11 +17840,26 @@ mod split_journal_tests {
 
         let e = resolve_conveyance_plan(&legs, &[("tip".into(), addr_a.clone())], "regtest")
             .expect_err("the sender's own change is not conveyed to anyone");
-        assert!(e.to_string().contains("SPINE TIP"), "got: {e}");
+        // [REQ-83] The refusal names the ROLE now. It used to say "SPINE TIP" because that was the
+        // only leg it could be refusing; with three payee shapes it has to say which one it means.
+        assert!(e.to_string().contains("SpineTip") && e.to_string().contains("change leg"), "got: {e}");
 
         let e = resolve_conveyance_plan(&legs, &[("typo".into(), addr_a.clone())], "regtest")
             .expect_err("an address for a leg that does not exist must be refused, not dropped");
         assert!(e.to_string().contains("not a leg of this split"), "got: {e}");
+
+        // **[REQ-83] EVERY PAYEE SHAPE IS CONVEYABLE — the gate refuses the CHANGE, not everything
+        // that is not a two-rung piece.**
+        //
+        // It read `!= SplitLegRole::Piece`, which was the same thing while a payee's leg had exactly
+        // one shape. With three, that spelling silently made a thin piece and a tail undeliverable:
+        // the split would build, the parent would be terminalized, and the hand-over would then
+        // refuse. Found by wiring the bands rather than by reading the gate.
+        for role in [SplitLegRole::ThinPiece, SplitLegRole::Tail] {
+            let legs = vec![("payee".to_string(), payee_a.clone(), role)];
+            resolve_conveyance_plan(&legs, &[("payee".into(), addr_a.clone())], "regtest")
+                .unwrap_or_else(|e| panic!("a {role:?} leg must be conveyable: {e}"));
+        }
 
         // A BARE bitcoin address passes the payee check by construction (`payee_address` returns a
         // non-HRP address unchanged) and is useless to `convey_child_bundle`, which needs the auth

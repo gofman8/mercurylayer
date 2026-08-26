@@ -1799,8 +1799,18 @@ is now the RGB commitment itself — no opret, no allocation, nothing coloured t
 own doc comment predicted it would stop being redundant when tails were admitted; it was right about
 the moment and wrong about which way the redundancy would break.
 
-**What remains across both lower bands: the receiver's claim path.** A `Stub` or `Tail` leg reaches a
-payee as a claim rather than a coin with a ladder, and every existing claim path expects the latter.
+**A gate found by wiring the bands rather than by reading it.** `resolve_conveyance_plan` refused any
+leg whose role was not `Piece` — the same thing as "refuse the change leg" while a payee had exactly
+one shape, and silently wrong with three: a thin piece and a tail would build, terminalize the parent,
+and then be refused at hand-over. It now names the CHANGE leg, which is what it was always for, and
+every payee shape is conveyable. Pinned in both directions.
+
+**What remains across both lower bands: the receiver's claim path.** A `Tail` reaches a payee through
+the ordinary mailbox — it is coin-backed and has a slot — but a `Stub` does not: it has no
+`statechain_id`, so there is no mailbox key for it. Its payee needs the `SP` transaction rather than a
+secret, since the output already pays their own key, so the channel is a different one. And on both
+bands the wallet must book a CLAIM on an outpoint where every existing path expects a coin with a
+ladder.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the
