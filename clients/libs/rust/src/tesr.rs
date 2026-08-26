@@ -12191,20 +12191,169 @@ fn taproot_key_hex(spk: &[u8]) -> Result<String> {
 /// laddered coin). It must pass the split E2E + an adversarial test suite + an independent review before
 /// HF-1 is removed. Conservative for now: a child that has been renewed/transferred (non-empty child
 /// superseded sets) is REJECTED rather than under-validated — that path is future work.
-pub fn verify_child_bundle(
-    cb: &ChildTesrBundle,
+/// **[REQ-83] The PARENT segment of a child bundle, verified — extracted so a leaf with NO ladder
+/// can be checked against the same parent laws as one with a ladder.**
+///
+/// Returns the funding transaction's txid, the output `SP.out[sp_vout]` this leaf hangs off, and
+/// the network — the three facts every child-side law is measured against.
+///
+/// **This is a pure code MOVE, and the evidence that it is one is the suite.** Every adversarial
+/// test over `verify_child_bundle` — the skim-leaf family, the dust-poisoned tier family, `sdk70`'s
+/// binding cases — exercises this block through its original caller and stayed green across the
+/// extraction. Nothing here was rewritten; the boundary was chosen where the last parent fact is
+/// produced and the first child fact is read.
+/// **[REQ-83 / §6.0.3] A LADDERLESS leaf — the third and fourth leaf bands, which are one shape.**
+///
+/// Its claim IS `SP.out[sp_vout]`, paid to the payee's **own key**. No extension, no state, no child
+/// statechain id, no SE slot.
+///
+/// **Why it must pay a plain key rather than a 2-of-2, which is the whole design of this shape.**
+/// Every other leaf receives `SP.out[j]` at an aggregate between the payee and the SE, and exits
+/// unilaterally by broadcasting a rung the SE has ALREADY co-signed. A leaf with no rung has no such
+/// signature — so a 2-of-2 output would need the SE's cooperation to spend, giving the holder an
+/// output they cannot exit unilaterally. That is the one property this design exists to provide, and
+/// it is not tradeable for a lower floor.
+///
+/// **What the holder gives up, stated plainly:** they cannot move this claim off-chain, and they
+/// realise it only when `SP` confirms. They can always force that themselves by broadcasting
+/// `T → X_m → SP` — expensive alone, free when the group exits together, which is precisely the
+/// owner's rule that *small leaves need not exit alone*. What they do NOT give up is the ability to
+/// be paid at all, which was the alternative.
+///
+/// **`Stub` and `Tail` differ only in the VALUE of that output** — at or above `DUST_LIMIT`, or
+/// below it. Everything structural is shared, which is why one type serves both bands.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LadderlessLeaf {
+    /// The parent segment, exactly as a laddered leaf carries it — the holder needs it to force
+    /// settlement, and the verifier needs it to prove the claim is real.
+    pub parent: TesrBundle,
+    pub parent_statechain_id: String,
+    /// Which `SP` output IS the claim.
+    pub sp_vout: u32,
+    /// The payee's own exit address. `SP.out[sp_vout]` must pay exactly this.
+    pub payee_exit_address: String,
+    #[serde(default)]
+    pub ancestors: Vec<ChildSegment>,
+    #[serde(default)]
+    pub parent_flat_backups: Vec<String>,
+}
+
+impl LadderlessLeaf {
+    fn view(&self) -> ParentSegmentView<'_> {
+        ParentSegmentView {
+            parent: &self.parent,
+            sp_vout: self.sp_vout,
+            ancestors: &self.ancestors,
+            // A coloured ladderless leaf is refused by `verify_ladderless_leaf` before this is read;
+            // see there for why a sealed allocation cannot ride on a claim with no transition.
+            colored: false,
+        }
+    }
+}
+
+/// **[REQ-83] Verify a ladderless leaf: the SAME parent laws, then the one child-side fact there is.**
+///
+/// The parent segment goes through `verify_parent_segment_for_child` unchanged — every census,
+/// terminality and outstanding-record law a laddered leaf gets. What differs is everything after it:
+/// there are no tiers to verify, so the only remaining question is whether `SP.out[sp_vout]` really
+/// pays this payee, and how much.
+///
+/// **A ladderless leaf is refused if it would pay an AGGREGATE rather than the payee's own key**, and
+/// that refusal is the shape's security property rather than a formality: an aggregate output is one
+/// the holder cannot spend without the SE, and this leaf has no pre-signed rung to fall back on.
+pub fn verify_ladderless_leaf(
+    leaf: &LadderlessLeaf,
     parent_f_onchain_spk_hex: &str,
     parent_f_onchain_value: u64,
     parent_num_sigs: u32,
     parent_flat_backups: u32,
     parent_aggregate_pubkey: Option<&str>,
     parent_terminal: bool,
-    child_num_sigs: u32,
-    child_flat_backups: u32,
-    child_aggregate_pubkey: Option<&str>,
     ancestor_facts: &[AncestorFacts],
-    receiver_backup_address: &str,
+    declared_value: u64,
 ) -> Result<()> {
+    // A coloured allocation is SEALED to an outpoint and moves only with a transition. A ladderless
+    // leaf carries no transaction of its own, so there is nowhere to put one — the allocation would
+    // be sealed to an output whose first spend destroys it. Refused by name, first, exactly as every
+    // other plain lane refuses coloured material.
+    if leaf.parent.rgb.is_some() {
+        return Err(anyhow::anyhow!(
+            "a ladderless leaf cannot descend from a COLOURED parent: it carries no transaction, so \
+             an allocation sealed to its outpoint has no transition to move with and the first spend \
+             of that outpoint destroys it (§6.0.5)"
+        ));
+    }
+
+    let (_sp_txid, sp_out, net) = verify_parent_segment_for_child(
+        leaf.view(),
+        parent_f_onchain_spk_hex,
+        parent_f_onchain_value,
+        parent_num_sigs,
+        parent_flat_backups,
+        parent_aggregate_pubkey,
+        parent_terminal,
+        ancestor_facts,
+    )?;
+
+    // THE CLAIM ITSELF. `SP.out[sp_vout]` must pay the payee's own address — compared as a
+    // scriptPubKey, derived from the address rather than the other way round, so a leaf claiming an
+    // output that pays somebody else is refused on the key and not on a spelling of it.
+    let want = electrum_client::bitcoin::Address::from_str(&leaf.payee_exit_address)
+        .map_err(|e| anyhow::anyhow!("ladderless leaf: payee exit address is unusable: {e}"))?
+        .require_network(net)
+        .map_err(|e| anyhow::anyhow!("ladderless leaf: payee exit address is for another network: {e}"))?
+        .script_pubkey();
+    if sp_out.script_pubkey != want {
+        return Err(anyhow::anyhow!(
+            "ladderless leaf: SP.out[{}] does not pay this payee. Its claim IS that output, so an \
+             output paying anyone else — including a 2-of-2 the payee cannot spend alone — is not a \
+             claim at all",
+            leaf.sp_vout
+        ));
+    }
+    if sp_out.value != declared_value {
+        return Err(anyhow::anyhow!(
+            "ladderless leaf: SP.out[{}] carries {} sat but the leaf is conveyed as {declared_value} \
+             — the declared value is what the receiver would be credited",
+            leaf.sp_vout,
+            sp_out.value
+        ));
+    }
+    if sp_out.value == 0 {
+        return Err(anyhow::anyhow!("ladderless leaf: a zero-value claim is not a payment"));
+    }
+    Ok(())
+}
+
+/// **[REQ-83] The parent-side facts a leaf carries, whatever ladder it has — or has none.**
+///
+/// A borrowed view rather than a bundle, because the ladderless leaf of §6.0.3 is not a
+/// [`ChildTesrBundle`]: it has no tiers, no child statechain id and no SE slot. Both kinds present
+/// the same four facts about the segment they hang off, and passing a view is what lets ONE set of
+/// parent laws serve both — the alternative being a second copy of them, which is how the `[S1]`
+/// class comes back.
+#[derive(Clone, Copy)]
+pub struct ParentSegmentView<'a> {
+    pub parent: &'a TesrBundle,
+    pub sp_vout: u32,
+    pub ancestors: &'a [ChildSegment],
+    pub colored: bool,
+}
+
+fn verify_parent_segment_for_child(
+    cb: ParentSegmentView<'_>,
+    parent_f_onchain_spk_hex: &str,
+    parent_f_onchain_value: u64,
+    parent_num_sigs: u32,
+    parent_flat_backups: u32,
+    parent_aggregate_pubkey: Option<&str>,
+    parent_terminal: bool,
+    ancestor_facts: &[AncestorFacts],
+) -> Result<(
+    electrum_client::bitcoin::Txid,
+    electrum_client::bitcoin::TxOut,
+    electrum_client::bitcoin::Network,
+)> {
     // [F2] The two segments are secured DIFFERENTLY, because only one of them is being handed over.
     //
     // PARENT (ancestor segment) — terminality is load-bearing and still REQUIRED. Its census is a
@@ -12599,7 +12748,7 @@ pub fn verify_child_bundle(
             // from a 12 504 funding at 2 sat/vB, a 172-sat gap that is exactly the opret plus the
             // second payload output. Every batch-minted piece was refused by every receiver.
             let n_payload = payloads.len().max(1);
-            let expected = if cb.is_colored() {
+            let expected = if cb.colored {
                 crate::rgb::colored_tier_out_total(st_prev_value, n_payload, cb.parent.fee_rate)
             } else {
                 mercurylib::tesr::tier_out_total(st_prev_value, n_payload, cb.parent.fee_rate)
@@ -12728,6 +12877,44 @@ pub fn verify_child_bundle(
         .output
         .get(cb.sp_vout as usize)
         .ok_or_else(|| anyhow::anyhow!("funding tx has no output {}", cb.sp_vout))?;
+    // Owned, because `sp_out` borrows a transaction local to this function. A clone of one TxOut is
+    // the cost of letting two callers share these laws instead of keeping two copies of them.
+    Ok((sp_txid, sp_out.clone(), net))
+}
+
+pub fn verify_child_bundle(
+    cb: &ChildTesrBundle,
+    parent_f_onchain_spk_hex: &str,
+    parent_f_onchain_value: u64,
+    parent_num_sigs: u32,
+    parent_flat_backups: u32,
+    parent_aggregate_pubkey: Option<&str>,
+    parent_terminal: bool,
+    child_num_sigs: u32,
+    child_flat_backups: u32,
+    child_aggregate_pubkey: Option<&str>,
+    ancestor_facts: &[AncestorFacts],
+    receiver_backup_address: &str,
+) -> Result<()> {
+    use electrum_client::bitcoin::{consensus::deserialize, Address, Transaction};
+
+    // [1]–[5] THE PARENT SEGMENT. Extracted whole so the ladderless leaf of §6.0.3 is measured
+    // against exactly these laws rather than against a second copy of them.
+    let (sp_txid, sp_out, net) = verify_parent_segment_for_child(
+        ParentSegmentView {
+            parent: &cb.parent,
+            sp_vout: cb.sp_vout,
+            ancestors: &cb.ancestors,
+            colored: cb.is_colored(),
+        },
+        parent_f_onchain_spk_hex,
+        parent_f_onchain_value,
+        parent_num_sigs,
+        parent_flat_backups,
+        parent_aggregate_pubkey,
+        parent_terminal,
+        ancestor_facts,
+    )?;
 
     // [5] CHILD AGGREGATE AUTHORITY: A_child := SP.out[j].spk (parsed from SP, not declared). The
     //     server's recorded aggregate for child_sid must be non-NULL and == A_child. SP is un-broadcast
@@ -12736,7 +12923,10 @@ pub fn verify_child_bundle(
     let a_child = taproot_key_hex(sp_out.script_pubkey.as_bytes())?;
     let c_agg = child_aggregate_pubkey
         .ok_or_else(|| anyhow::anyhow!("server recorded no aggregate for child sid (fail-closed)"))?;
-    if tweaked_key_hex(c_agg)? != a_child {
+    // The same tweak the parent segment applied, spelled out here because the closure that carried it
+    // lives inside `verify_parent_segment_for_child` now. Both call `tweaked_p2tr_key_hex`, which is
+    // the point of it being a free function: the two acceptance paths cannot drift.
+    if tweaked_p2tr_key_hex(c_agg, net)? != a_child {
         return Err(anyhow::anyhow!("child sid's server aggregate != SP.out[j] key (decoy child)"));
     }
 
@@ -17160,6 +17350,15 @@ mod skim_leaf_attack_tests {
         /// `T -> X -> SP`, with `SP` a spine split state (CSV = `SPINE_CSV`) funding ONE child slot.
         /// Returns the bundle and the value of that slot.
         fn parent_segment(&self) -> (TesrBundle, u64) {
+            self.parent_segment_paying(&self.child.address.clone())
+        }
+
+        /// The same segment, with `SP.out[0]` paying an ARBITRARY address.
+        ///
+        /// [REQ-83] A ladderless leaf's claim is that output paid to the payee's OWN key, not to a
+        /// child aggregate — so the fixture has to be able to say who it pays. Parameterised rather
+        /// than copied, so the two fixtures cannot drift in the parent half.
+        fn parent_segment_paying(&self, payee: &str) -> (TesrBundle, u64) {
             let p = self.params;
             let a = &self.parent;
 
@@ -17178,7 +17377,7 @@ mod skim_leaf_attack_tests {
             let sp = mercurylib::tesr::build_split_state(
                 &x.txid,
                 x.out_value,
-                &[(self.child.address.clone(), slot)],
+                &[(payee.to_string(), slot)],
                 NET,
                 SPINE_CSV,
                 self.rate,
@@ -17375,6 +17574,101 @@ mod skim_leaf_attack_tests {
             &[],
             &f.receiver_address,
         )
+    }
+
+    /// [REQ-83] A ladderless leaf whose claim is `SP.out[0]`, paid to `payee`.
+    fn ladderless(rig: &Rig, payee: &str) -> (LadderlessLeaf, u64) {
+        let (parent, slot) = rig.parent_segment_paying(payee);
+        (
+            LadderlessLeaf {
+                parent,
+                parent_statechain_id: "parent-sid".into(),
+                sp_vout: 0,
+                payee_exit_address: payee.to_string(),
+                ancestors: vec![],
+                parent_flat_backups: vec![],
+            },
+            slot,
+        )
+    }
+
+    fn verify_ladderless(leaf: &LadderlessLeaf, f: &Facts, value: u64) -> Result<()> {
+        verify_ladderless_leaf(
+            leaf,
+            &f.f_spk_hex,
+            F_VALUE,
+            f.parent_num_sigs,
+            f.parent_flat_backups,
+            Some(&f.parent_xonly),
+            true,
+            &[],
+            value,
+        )
+    }
+
+    /// **[REQ-83] A LADDERLESS leaf is accepted — the third and fourth bands' shape.**
+    ///
+    /// No extension, no state, no child statechain id, no SE slot: the claim IS `SP.out[0]`, paid to
+    /// the payee's own key. The parent segment still goes through every law a laddered leaf's parent
+    /// gets, which is the point of the extraction that made this possible.
+    #[test]
+    fn a_ladderless_leaf_is_accepted() {
+        let rig = rig();
+        let (leaf, slot) = ladderless(&rig, &rig.receiver.address.clone());
+        verify_ladderless(&leaf, &rig.facts(), slot).expect("a well-formed ladderless leaf");
+    }
+
+    /// **It must pay the payee's OWN key — an aggregate output is refused, and that refusal IS the
+    /// design.**
+    ///
+    /// A 2-of-2 output would need the SE's cooperation to spend, and this leaf has no pre-signed rung
+    /// to fall back on. Accepting one would hand the holder an output they cannot exit unilaterally,
+    /// which is the single property the whole design exists to provide.
+    #[test]
+    fn a_ladderless_leaf_may_not_be_paid_to_an_aggregate() {
+        let rig = rig();
+        // SP pays the CHILD AGGREGATE, while the leaf claims the receiver is the payee.
+        let (parent, slot) = rig.parent_segment_paying(&rig.child.address.clone());
+        let leaf = LadderlessLeaf {
+            parent,
+            parent_statechain_id: "parent-sid".into(),
+            sp_vout: 0,
+            payee_exit_address: rig.receiver.address.clone(),
+            ancestors: vec![],
+            parent_flat_backups: vec![],
+        };
+        let e = verify_ladderless(&leaf, &rig.facts(), slot)
+            .expect_err("an aggregate-paid ladderless leaf must be REFUSED")
+            .to_string();
+        assert!(
+            e.contains("does not pay this payee"),
+            "the refusal must name the claim, not something incidental: {e}"
+        );
+    }
+
+    /// **A conveyed value that disagrees with the output is refused** — the declared number is what a
+    /// receiver is credited, so a leaf worth 500 conveyed as 5 000 is a credited amount nothing backs.
+    #[test]
+    fn a_ladderless_leaf_may_not_overstate_its_value() {
+        let rig = rig();
+        let (leaf, slot) = ladderless(&rig, &rig.receiver.address.clone());
+        let e = verify_ladderless(&leaf, &rig.facts(), slot + 1)
+            .expect_err("an overstated ladderless leaf must be REFUSED")
+            .to_string();
+        assert!(e.contains("conveyed as"), "got: {e}");
+    }
+
+    /// **The parent laws still apply in full.** A ladderless leaf is cheap for the PAYEE, never cheap
+    /// on the segment it hangs off: a parent census that does not add up is refused here exactly as
+    /// it is for a laddered leaf, because both go through the same function.
+    #[test]
+    fn a_ladderless_leaf_does_not_escape_the_parent_census() {
+        let rig = rig();
+        let (leaf, slot) = ladderless(&rig, &rig.receiver.address.clone());
+        let mut f = rig.facts();
+        f.parent_num_sigs += 1; // a hidden parent co-signature
+        verify_ladderless(&leaf, &f, slot)
+            .expect_err("a hidden parent co-signature must be refused on this lane too");
     }
 
     /// **[REQ-83] A ONE-RUNG piece is ACCEPTED, and its census is ONE co-signature.**
@@ -25423,13 +25717,32 @@ mod cancelled_conveyance_tests {
     fn the_child_lane_grades_its_parent_with_the_same_verifier() {
         let src = include_str!("tesr.rs");
         let prod = &src[..src.find("\n#[cfg(test)]").expect("the file has test modules")];
+        // [REQ-83] The parent laws moved into `verify_parent_segment_for_child`, so a leaf with NO
+        // ladder can be measured against exactly them rather than against a second copy. The
+        // property is unchanged and is asserted over the pair: the parent is re-verified through
+        // `verify_bundle_ex` in ONE place, and the child verifier reaches it by calling that place.
+        let helper = prod
+            .find("fn verify_parent_segment_for_child(")
+            .expect("the extracted parent-segment verifier exists");
+        let helper_body = &prod[helper..];
+        let helper_end = helper_body.find("\n}\n").map(|e| e + 2).unwrap_or(helper_body.len());
+        assert!(
+            helper_body[..helper_end].contains("verify_bundle_ex(&cb.parent"),
+            "the child lane no longer re-verifies its embedded parent through `verify_bundle_ex` \
+             — the parent census and the outstanding-record refusal have forked"
+        );
+        assert_eq!(
+            prod.matches("verify_bundle_ex(&cb.parent").count(),
+            1,
+            "exactly ONE place may re-verify a child's embedded parent; a second copy is how the \
+             [S1] class comes back"
+        );
         let at = prod.find("pub fn verify_child_bundle(").expect("verify_child_bundle exists");
         let body = &prod[at..];
         let end = body.find("\n}\n").map(|e| e + 2).unwrap_or(body.len());
         assert!(
-            body[..end].contains("verify_bundle_ex(&cb.parent"),
-            "the child verifier no longer re-verifies its embedded parent through `verify_bundle_ex` \
-             — the parent census and the outstanding-record refusal have forked"
+            body[..end].contains("verify_parent_segment_for_child("),
+            "the child verifier must REACH the parent laws, not merely coexist with them"
         );
         assert_eq!(
             prod.matches("fn verify_superseded_segment(").count(),
