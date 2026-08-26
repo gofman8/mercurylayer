@@ -1664,7 +1664,26 @@ branch there, and it is now measured rather than asserted.
 And the fourth row is the claim §6.0 actually rests on: a 0-fee parent carrying a tail **relays** when
 its child pays for it.
 
-**REQ-84 remains UNPROVEN and unbuilt.** The release fragment is not built, and neither The load-bearing claims — that a funded 240 anchor
+**REQ-84: THE FRAGMENT IS BUILT, AND ITS SAFETY ARGUMENT IS A TEST.** `release_fragment_sighash`
+and `verify_release_fragment` produce and check the `SIGHASH_NONE | ANYONECANPAY` signature, and
+`req84_release_fragment` pins the three properties the design rests on:
+
+* **`SIGHASH_NONE` lets any sibling choose their own outputs** — the fragment is published at split
+  time to parties who do not yet know what their sweep looks like, so a fragment that committed to
+  outputs would be useless to them, and a tail nobody can sweep is exactly the hostage REQ-84 forbids;
+* **it cannot be replayed against another outpoint** — `ANYONECANPAY` still commits to this input's
+  outpoint, so the licence covers one outpoint and nothing else, not another tail under the same key,
+  not a sibling vout of the same transaction;
+* **nor against a restated amount** — the input's value is committed too.
+
+Together with REQ-85's one-tail cap that is the whole safety case: an unconditional licence to spend
+**one** outpoint worth at most `DUST_LIMIT − 1`, against roughly 504 sat to broadcast the split.
+
+**What is NOT built is the bundle-level enforcement** — "the verifier MUST refuse a bundle whose
+split carries a tail with no fragment" needs the conveyed bundle to carry fragments, and cannot be
+exercised while tails are not admitted. That is the remaining half, and it lands with the admission.
+
+**Still open:** neither The load-bearing claims — that a funded 240 anchor
 leaves the dust slot genuinely free, that a `[tail, funded anchor]` split relays as a zero-fee package,
 and that the release fragment behaves as analysed — are read from policy source and from our own
 constants. §0.2 applies: presence and ordering, never behaviour. Each needs plant-and-run before this

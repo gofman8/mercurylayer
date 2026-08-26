@@ -26669,3 +26669,188 @@ mod req79_shipped_budget {
         );
     }
 }
+
+/// **[REQ-84] THE RELEASE FRAGMENT — what stops a tail holding its siblings hostage.**
+///
+/// A tail is a sub-dust output, and a transaction carrying one must pay ZERO fee: it enters the
+/// mempool only as a package whose child spends the dust. So whoever needs the split on chain must
+/// be able to spend the tail — otherwise the tail's owner could simply refuse, the split would be
+/// unbroadcastable, and **every sibling leaf in it would be stranded**. That is Spark's failure
+/// (their sub-dust children kill a whole branch) and the thing this design exists not to reproduce.
+///
+/// The fragment is a `SIGHASH_NONE | SIGHASH_ANYONECANPAY` key-path signature over the tail's
+/// outpoint, published to every sibling at split time. Its two flags are exactly the two freedoms a
+/// sibling needs and nothing more:
+///
+/// * `SIGHASH_NONE` — commits to NO outputs, so the sweeper chooses them. Without it the fragment
+///   would only work for one pre-agreed spend, which is no use to a sibling who does not exist yet.
+/// * `ANYONECANPAY` — commits only to THIS input, so the sweeper may add their own fee input.
+///
+/// # The blast radius, which is why this is safe
+///
+/// `ANYONECANPAY` still commits to this input's OUTPOINT and AMOUNT. So a fragment is an
+/// unconditional licence to spend **one specific outpoint worth at most `DUST_LIMIT − 1`**, and
+/// nothing else: it cannot be replayed against another outpoint, including another tail under the
+/// same key. `a_fragment_cannot_be_replayed_against_another_outpoint` is that claim as a test.
+///
+/// Combined with REQ-85's one-tail-per-transaction cap, sweeping tails is never a business: the
+/// maximum prize is 329 sat against roughly 504 sat to broadcast the split at 3 sat/vB.
+pub fn release_fragment_sighash(
+    spend: &electrum_client::bitcoin::Transaction,
+    input_index: usize,
+    tail_prevout: &electrum_client::bitcoin::TxOut,
+) -> Result<electrum_client::bitcoin::secp256k1::Message> {
+    use electrum_client::bitcoin::hashes::Hash;
+    use electrum_client::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+
+    if input_index >= spend.input.len() {
+        return Err(anyhow::anyhow!(
+            "release fragment: input {input_index} is out of range for a {}-input spend",
+            spend.input.len()
+        ));
+    }
+    // `Prevouts::One` is required, not a convenience: under ANYONECANPAY the sighash commits to this
+    // input alone, so supplying the full prevout vector would be describing a commitment the
+    // signature does not make.
+    let sighash = SighashCache::new(spend)
+        .taproot_key_spend_signature_hash(
+            input_index,
+            &Prevouts::One(input_index, tail_prevout),
+            TapSighashType::NonePlusAnyoneCanPay,
+        )
+        .map_err(|e| anyhow::anyhow!("release-fragment sighash failed: {e}"))?;
+    Ok(electrum_client::bitcoin::secp256k1::Message::from_slice(sighash.as_byte_array())?)
+}
+
+/// Verify a release fragment against the outpoint it claims to release.
+///
+/// `Ok(false)` means CHECKED AND INVALID. `Err` means the check could not be performed at all —
+/// an out-of-range input, a sighash that would not compute. The two are kept apart deliberately:
+/// collapsing them into a bare `false` is the silent-degradation shape this repo has a red test for,
+/// and here it would let "I could not verify" read as "this fragment is forged".
+pub fn verify_release_fragment(
+    xonly: &electrum_client::bitcoin::secp256k1::XOnlyPublicKey,
+    sig: &electrum_client::bitcoin::secp256k1::schnorr::Signature,
+    spend: &electrum_client::bitcoin::Transaction,
+    input_index: usize,
+    tail_prevout: &electrum_client::bitcoin::TxOut,
+) -> Result<bool> {
+    let secp = electrum_client::bitcoin::secp256k1::Secp256k1::verification_only();
+    let msg = release_fragment_sighash(spend, input_index, tail_prevout)?;
+    Ok(secp.verify_schnorr(sig, &msg, xonly).is_ok())
+}
+
+#[cfg(test)]
+mod req84_release_fragment {
+    use super::*;
+    use electrum_client::bitcoin::{
+        absolute::LockTime, secp256k1::{KeyPair, Secp256k1, SecretKey}, OutPoint, ScriptBuf,
+        Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
+    use electrum_client::bitcoin::hashes::Hash;
+
+    fn key() -> (KeyPair, electrum_client::bitcoin::secp256k1::XOnlyPublicKey) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x24u8; 32]).unwrap();
+        let kp = KeyPair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        (kp, xonly)
+    }
+
+    fn tail_txout(value: u64) -> TxOut {
+        TxOut { value, script_pubkey: ScriptBuf::new() }
+    }
+
+    fn spend_of(txid: Txid, vout: u32, outs: Vec<TxOut>) -> Transaction {
+        Transaction {
+            version: 3,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid, vout },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: outs,
+        }
+    }
+
+    fn a_txid(b: u8) -> Txid {
+        Txid::from_slice(&[b; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_fragment_verifies_over_the_outpoint_it_releases() {
+        let (kp, xonly) = key();
+        let secp = Secp256k1::new();
+        let prevout = tail_txout(329);
+        let spend = spend_of(a_txid(0xaa), 0, vec![tail_txout(1_000)]);
+        let msg = release_fragment_sighash(&spend, 0, &prevout).expect("sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+        assert!(verify_release_fragment(&xonly, &sig, &spend, 0, &prevout).expect("checkable"));
+    }
+
+    #[test]
+    fn sighash_none_lets_the_sweeper_choose_every_output() {
+        // THE FREEDOM A SIBLING NEEDS. The fragment is published at split time, to parties who do not
+        // yet know what their sweep will look like. If it committed to outputs it would be useless to
+        // them — and a tail that cannot be swept by a sibling is exactly the hostage REQ-84 forbids.
+        let (kp, xonly) = key();
+        let secp = Secp256k1::new();
+        let prevout = tail_txout(329);
+        let signed_over = spend_of(a_txid(0xaa), 0, vec![tail_txout(1_000)]);
+        let msg = release_fragment_sighash(&signed_over, 0, &prevout).expect("sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+
+        // Completely different outputs — a different count, different values.
+        let elsewhere = spend_of(a_txid(0xaa), 0, vec![tail_txout(7), tail_txout(999_999)]);
+        assert!(
+            verify_release_fragment(&xonly, &sig, &elsewhere, 0, &prevout).expect("checkable"),
+            "SIGHASH_NONE must let any sibling spend the tail to outputs of their own choosing"
+        );
+    }
+
+    #[test]
+    fn a_fragment_cannot_be_replayed_against_another_outpoint() {
+        // THE BLAST RADIUS, and the reason the fragment is safe to publish. ANYONECANPAY still
+        // commits to this input's OUTPOINT, so the licence covers one outpoint worth at most
+        // DUST_LIMIT − 1 and nothing else — not another tail, not under the same key.
+        let (kp, xonly) = key();
+        let secp = Secp256k1::new();
+        let prevout = tail_txout(329);
+        let mine = spend_of(a_txid(0xaa), 0, vec![tail_txout(1_000)]);
+        let msg = release_fragment_sighash(&mine, 0, &prevout).expect("sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+
+        let someone_elses = spend_of(a_txid(0xbb), 0, vec![tail_txout(1_000)]);
+        assert!(
+            !verify_release_fragment(&xonly, &sig, &someone_elses, 0, &prevout).expect("checkable"),
+            "a fragment must NOT release a different outpoint — that is the whole safety argument"
+        );
+
+        // Nor a different VOUT of the same transaction.
+        let sibling_vout = spend_of(a_txid(0xaa), 1, vec![tail_txout(1_000)]);
+        assert!(
+            !verify_release_fragment(&xonly, &sig, &sibling_vout, 0, &prevout).expect("checkable"),
+            "a fragment must not release a sibling output of the same transaction"
+        );
+    }
+
+    #[test]
+    fn a_fragment_does_not_survive_a_restated_amount() {
+        // ANYONECANPAY commits to the input's AMOUNT as well as its outpoint, so a fragment cannot be
+        // carried over to a tail of a different value.
+        let (kp, xonly) = key();
+        let secp = Secp256k1::new();
+        let spend = spend_of(a_txid(0xaa), 0, vec![tail_txout(1_000)]);
+        let msg = release_fragment_sighash(&spend, 0, &tail_txout(329)).expect("sighash");
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+        assert!(!verify_release_fragment(&xonly, &sig, &spend, 0, &tail_txout(328)).expect("checkable"));
+    }
+
+    #[test]
+    fn an_out_of_range_input_is_refused_rather_than_panicking() {
+        let spend = spend_of(a_txid(0xaa), 0, vec![tail_txout(1_000)]);
+        assert!(release_fragment_sighash(&spend, 5, &tail_txout(329)).is_err());
+    }
+}
