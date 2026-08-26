@@ -821,10 +821,15 @@ log. With it, the same lapse shows up as a coin that fails to arrive.
 > settle. Build order for the remainder is in
 > [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.7.
 
-The sweep is an **optimisation inside the discharge round (§5.4)**, not the settlement path: it is
-how a leaf is absorbed cheaply during R1. Settling leaves one at a time buys one P2TR input each and
-cannot beat ~1.5× an ordinary on-chain payment, so the sweep does not by itself make the economics
-work — §5.4 is what retires a whole tree for one transaction. Read §5.4 with this section.
+The sweep is an **optimisation, not the settlement path**: it is how a leaf is absorbed cheaply.
+Settling leaves one at a time buys one P2TR input each and cannot beat ~1.5× an ordinary on-chain
+payment, so the sweep does not by itself make the economics work — a CLOSE (§5.4.4) is what retires a
+whole tree for one transaction. Read §5.4 with this section.
+
+**This paragraph said "an optimisation inside the discharge round … during R1" until the round was
+deleted.** The sweep does not depend on a round: absorption happens whenever a leaf is absorbed, and
+the thing that retires a tree cheaply is now a close triggered by its root owner, not a scheduled
+migration.
 
 **A leaf is a worse coin than a root in every respect** — it inherits a deadline it does not control,
 carries depth, has no one-transaction cooperative exit, and burns 1 230 sat of its own value if it is
@@ -2311,13 +2316,14 @@ are stated as limits rather than as things to fix.
 * **The P2A anchor slot is an auction, not a race.** An under-paying squat is refused; an
   over-paying one RAISES the tier's effective feerate at the attacker's expense. TRUC contention is
   a price, not a denial of service.
-* **The discharge round has a standing capital requirement of `μ · W / epoch_days · TVL`** — ≈ 9 % of
-  TVL at 90 % migration and a one-week window (§5.5.2). It is stock-proportional, not
-  flow-proportional: payment volume does not enter it. It is a limit rather than a defect because the
-  ordering that produces it (migrate into a CONFIRMED successor root, collapse the predecessor
-  afterwards) is what lets an absentee be paid without broadcasting anything. **Its corollary is a
-  trade this document must not hide:** widening the window `W` lowers the absentee rate, which is the
-  dominant footprint lever, and raises the float linearly (§5.5.3).
+* **There is NO operator capital requirement (§5.5).** This bullet asserted a standing float of
+  `μ · W / epoch_days · TVL` — ≈ 9 % of TVL — for as long as the discharge round existed. The round
+  is deleted, and the float went with it: it traced to exactly one ordering requirement, that a
+  funded successor root be CONFIRMED before holders could migrate onto it. With no successor root
+  there is no window to carry. A tree now CLOSES when its root owner decides, paying every unreleased
+  leaf out of `F` itself, so the closer fronts nothing. **The figure is kept here, struck through in
+  words rather than deleted, because a summary that silently drops a number readers may have quoted
+  is worse than one that says it was withdrawn.**
 * **THE DESIGN SELLS PAYMENT VELOCITY — and it LOSES to a batched on-chain payout until ~74 % of
   leaves are swept.** Full derivation in
   [PARTIAL-PAYMENT-ECONOMICS.md](PARTIAL-PAYMENT-ECONOMICS.md) §0.2.
