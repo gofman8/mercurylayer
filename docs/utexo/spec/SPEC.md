@@ -1699,7 +1699,31 @@ different kind, and it lands across four layers rather than in the ladder:
 **Neither band is a continuation of the thin-piece work.** The three stages above moved a leaf from
 two rungs to one; these move it from one rung to none, and *none* is where unilateral exit stops
 coming from a pre-signed tier and starts coming from the group's. That is a design change with a
-security property at its centre, and it is recorded here rather than attempted as a fourth stage.
+security property at its centre.
+
+**LAYERS 3 AND 4 OF THAT LIST ARE BUILT: the shape is representable and VERIFIABLE.**
+`LadderlessLeaf` carries the parent segment and names `SP.out[sp_vout]` as the claim;
+`verify_ladderless_leaf` puts it through the same parent laws a laddered leaf gets and then checks
+the one child-side fact there is. Four tests, of which the second is the shape's security property
+rather than a formality: **a ladderless leaf paid to an AGGREGATE is refused**, because that is an
+output its holder could not spend without the SE and it has no pre-signed rung to fall back on.
+
+Sharing the parent laws required extracting them out of `verify_child_bundle` into
+`verify_parent_segment_for_child`, taking a borrowed `ParentSegmentView` rather than a bundle — a
+ladderless leaf has no tiers, no child statechain id and no SE slot, so it is not a `ChildTesrBundle`
+and never will be. **The extraction is a pure code move, and the evidence is the suite**: every
+adversarial test over that function — the skim-leaf family, the dust-poisoned tier family, `sdk70`'s
+binding cases — runs through the extracted block unchanged and stays green. The guard that pinned the
+parent re-verification was updated and strengthened rather than silenced: exactly ONE place may
+re-verify a child's embedded parent, and the child verifier must REACH it.
+
+**What remains for each band, precisely.** Layers 1 and 2 — the split builder paying a plain exit key
+at that slot with no child coin or SE slot, and a journal role with no `statechain_id` to record —
+plus the receiver booking a claim on an outpoint rather than a statechain coin. **`Tail` needs one
+thing more, and it is not small:** a sub-dust output on `SP` forces `SP` itself to pay ZERO fee
+(§6.0.1), and every ladder law prices a tier as `committed_fee + P2A_VALUE`. A zero-fee `SP` is a
+second tier construction with its own conservation law, relayed only as a package — which the probe
+proved works, and which nothing in the ladder currently expresses.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the
