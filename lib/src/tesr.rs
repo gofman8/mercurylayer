@@ -1702,3 +1702,153 @@ mod grid_law_tests {
     }
 
 }
+
+/// **[REQ-83 / REQ-85] What makes a transaction a well-formed TAIL carrier — and what does not.**
+///
+/// A tail is a payment below [`DUST_LIMIT`] riding as the transaction's ONE permitted sub-dust
+/// output. Bitcoin allows exactly one (`MAX_DUST_OUTPUTS_PER_TX = 1`), it must then pay ZERO fee,
+/// and the dust must be spent by the package child.
+///
+/// **We can afford one because our anchor is FUNDED at [`P2A_VALUE`] = 240, its own standardness
+/// threshold — so it is not dust and our slot has never been spent.** Spark spends the same slot on
+/// a zero-value anchor, which is why a sub-dust child kills a whole branch there.
+///
+/// **TAILS BELONG TO THE PAYMENT LANE, NOT TO TIER VERIFICATION.** A first attempt wired this into
+/// `refuse_dust_payloads`, which verifies TIERS — and eight dust-poisoning attack tests failed,
+/// correctly. On a tier a sub-dust output is an ATTACK, and reporting it as "a well-formed tail,
+/// admission pending" tells an attacker their shape is right and softens a security refusal into a
+/// feature-flag notice. The same bytes mean opposite things in the two lanes, so the rule stays out
+/// of the tier verifier.
+///
+/// This is the RULE, deliberately separated from its admission. §6.0's relay claims are UNPROVEN —
+/// that a `[tail, funded anchor]` split really does relay as a zero-fee package has not been run —
+/// so the live verifier still refuses tails outright. Building the rule first means the day
+/// admission is switched on, what is admitted is already specified and tested rather than invented
+/// under pressure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailVerdict {
+    /// No sub-dust output: an ordinary transaction, nothing to judge.
+    NoTail,
+    /// Exactly one sub-dust output, at `vout`, worth `value`, in a transaction shaped as REQ-83
+    /// requires. Well-formed — which is NOT the same as admitted.
+    WellFormed { vout: u32, value: u64 },
+    /// More than one sub-dust output. **[REQ-85] This is the cap that carries the whole economic
+    /// argument**: the maximum sweepable prize must stay below the cost of broadcasting the split.
+    /// One tail is at most 329 sat against ~504 sat to broadcast; two tails and sweeping starts to
+    /// pay. The cap is not tidiness.
+    TooManyTails { count: usize },
+    /// A sub-dust output in a transaction whose anchor is not the FUNDED 240 kind. The funded anchor
+    /// is what leaves the dust slot free for the tail; with a zero-value anchor the transaction has
+    /// two dust outputs and is non-standard — Spark's failure exactly.
+    AnchorNotFunded,
+    /// A sub-dust output of zero value. Not a payment.
+    ZeroValueTail { vout: u32 },
+}
+
+/// Classify a transaction's tail shape from its outputs. `anchor_value` is the value carried by the
+/// P2A anchor, or `None` when the transaction has no anchor.
+///
+/// Pure and total: every transaction gets a verdict, and the caller decides what to do with it.
+pub fn tail_verdict(outputs: &[(u64, Vec<u8>)], anchor_value: Option<u64>) -> TailVerdict {
+    let mut subdust: Vec<(u32, u64)> = Vec::new();
+    for (i, (value, spk)) in outputs.iter().enumerate() {
+        // The anchor and the RGB opret are not payloads and are never tails.
+        if spk.as_slice() == P2A_SCRIPT_BYTES || spk.first() == Some(&0x6a) {
+            continue;
+        }
+        if *value < DUST_LIMIT {
+            subdust.push((i as u32, *value));
+        }
+    }
+    match subdust.len() {
+        0 => TailVerdict::NoTail,
+        1 => {
+            let (vout, value) = subdust[0];
+            if value == 0 {
+                return TailVerdict::ZeroValueTail { vout };
+            }
+            // The funded anchor is the precondition, not a nicety: it is what keeps the transaction
+            // to ONE dust output.
+            if anchor_value != Some(P2A_VALUE) {
+                return TailVerdict::AnchorNotFunded;
+            }
+            TailVerdict::WellFormed { vout, value }
+        }
+        n => TailVerdict::TooManyTails { count: n },
+    }
+}
+
+#[cfg(test)]
+mod req83_85_tail_rule {
+    use super::*;
+
+    fn p2tr() -> Vec<u8> {
+        let mut v = vec![0x51, 0x20];
+        v.extend_from_slice(&[0u8; 32]);
+        v
+    }
+    fn anchor() -> Vec<u8> {
+        P2A_SCRIPT_BYTES.to_vec()
+    }
+    fn opret() -> Vec<u8> {
+        vec![0x6a, 0x02, 0xde, 0xad]
+    }
+
+    #[test]
+    fn an_ordinary_transaction_has_no_tail() {
+        let outs = vec![(DUST_LIMIT, p2tr()), (P2A_VALUE, anchor())];
+        assert_eq!(tail_verdict(&outs, Some(P2A_VALUE)), TailVerdict::NoTail);
+    }
+
+    #[test]
+    fn one_sub_dust_output_with_a_funded_anchor_is_well_formed() {
+        let outs = vec![(DUST_LIMIT, p2tr()), (329, p2tr()), (P2A_VALUE, anchor())];
+        assert_eq!(
+            tail_verdict(&outs, Some(P2A_VALUE)),
+            TailVerdict::WellFormed { vout: 1, value: 329 }
+        );
+        // The boundary is exclusive: DUST_LIMIT itself is an ordinary payload, not a tail.
+        let at_floor = vec![(DUST_LIMIT, p2tr()), (P2A_VALUE, anchor())];
+        assert_eq!(tail_verdict(&at_floor, Some(P2A_VALUE)), TailVerdict::NoTail);
+        // And 1 sat is a legitimate tail — REQ-83 says any amount at or above 1.
+        let one = vec![(1, p2tr()), (P2A_VALUE, anchor())];
+        assert_eq!(
+            tail_verdict(&one, Some(P2A_VALUE)),
+            TailVerdict::WellFormed { vout: 0, value: 1 }
+        );
+    }
+
+    #[test]
+    fn req85_two_tails_are_refused_because_sweeping_would_start_to_pay() {
+        // THE CAP THAT CARRIES THE ECONOMIC ARGUMENT. One tail is at most 329 sat against roughly
+        // 504 sat to broadcast the split at 3 sat/vB, so a thief always loses. Two tails and the
+        // prize can exceed the cost — which is why this is a rule and not tidiness.
+        let outs = vec![(329, p2tr()), (200, p2tr()), (P2A_VALUE, anchor())];
+        assert_eq!(tail_verdict(&outs, Some(P2A_VALUE)), TailVerdict::TooManyTails { count: 2 });
+        assert!(329 + 200 > 504, "two tails can already exceed the cost of broadcasting");
+    }
+
+    #[test]
+    fn a_zero_value_anchor_leaves_no_slot_for_a_tail() {
+        // Spark's exact failure: their anchor is zero-value, so it IS the transaction's one dust
+        // output and any sub-dust payload makes a second one — non-standard, and it kills every
+        // sibling in the branch.
+        let outs = vec![(329, p2tr()), (0, anchor())];
+        assert_eq!(tail_verdict(&outs, Some(0)), TailVerdict::AnchorNotFunded);
+        assert_eq!(tail_verdict(&outs, None), TailVerdict::AnchorNotFunded);
+    }
+
+    #[test]
+    fn a_zero_value_tail_is_not_a_payment() {
+        let outs = vec![(0, p2tr()), (P2A_VALUE, anchor())];
+        assert_eq!(tail_verdict(&outs, Some(P2A_VALUE)), TailVerdict::ZeroValueTail { vout: 0 });
+    }
+
+    #[test]
+    fn the_anchor_and_the_opret_are_never_counted_as_tails() {
+        // Both are sub-dust by value or by kind; counting either would make every ordinary coloured
+        // tier look like a tail carrier and the cap would fire on honest transactions.
+        let outs = vec![(DUST_LIMIT, p2tr()), (P2A_VALUE, anchor()), (0, opret())];
+        assert_eq!(tail_verdict(&outs, Some(P2A_VALUE)), TailVerdict::NoTail);
+    }
+}

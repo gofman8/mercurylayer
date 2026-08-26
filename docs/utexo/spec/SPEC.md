@@ -1626,7 +1626,25 @@ carries a tail with no fragment.
 transaction MUST be enforced in the verifier. It is what keeps the maximum sweepable prize below the
 minimum cost of broadcasting, and it is the whole of the economic argument in §6.0.4.
 
-**UNPROVEN.** Nothing here has been built or run. The load-bearing claims — that a funded 240 anchor
+**REQ-83 and REQ-85: THE RULE IS BUILT AND TESTED; THE ADMISSION IS NOT.** `tail_verdict` decides
+what a well-formed tail is — exactly one sub-dust output, value in `[1, DUST_LIMIT)`, in a
+transaction carrying the FUNDED 240 anchor — and `req83_85_tail_rule` pins it in six cases, including
+that the boundary is exclusive (a payload AT the floor is ordinary, not a tail), that 1 sat is a
+legitimate tail, that the anchor and the opret are never counted as tails, and that TWO tails are
+refused because `329 + 200 > 504` — the moment sweeping starts to pay, which is the whole of REQ-85.
+
+**The live verifier still refuses every sub-dust payload**, because §6.0's relay claims are unproven.
+Building the rule first means that when admission is switched on, what gets admitted is already
+specified and tested rather than invented under pressure.
+
+**And a correction worth keeping: tails belong to the PAYMENT lane, not to tier verification.** A
+first attempt wired the rule into `refuse_dust_payloads`, which verifies TIERS, and eight
+dust-poisoning attack tests failed — correctly. On a tier a sub-dust output is an ATTACK, and
+reporting it as "a well-formed tail, admission pending" tells an attacker their shape is right and
+softens a security refusal into a feature-flag notice. The same bytes mean opposite things in the two
+lanes.
+
+**REQ-84 and the relay claims remain UNPROVEN.** The release fragment is not built, and neither The load-bearing claims — that a funded 240 anchor
 leaves the dust slot genuinely free, that a `[tail, funded anchor]` split relays as a zero-fee package,
 and that the release fragment behaves as analysed — are read from policy source and from our own
 constants. §0.2 applies: presence and ordering, never behaviour. Each needs plant-and-run before this
