@@ -570,6 +570,7 @@ pub async fn execute() -> Result<()> {
         &mut parent,
         &pbundle,
         &mut children,
+        &[],
         mercuryrustlib::tesr::ChangeLeg::None,
         // [K>1 prerequisite 2] No conveyance plan: this test drives the hand-over itself (or does
         // not hand over at all), so the journal records no recipient for the leg and the resume

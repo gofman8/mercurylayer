@@ -4564,6 +4564,17 @@ pub enum SplitLegRole {
     /// same table: **one renewal instead of two**. The leaf still exits unaided; it cannot reset its
     /// budget by extension, so its remedy is a re-anchor, and `plan_child_renewal` says so by name.
     ThinPiece,
+    /// **[REQ-83 / §6.0.3] A LADDERLESS leg — the third and fourth bands, which are one shape.**
+    ///
+    /// NO rung at all. `SP.out[j]` pays the payee's OWN key and IS their claim, so there is no child
+    /// coin, no SE slot and no `statechain_id` to journal. See [`LadderlessLeaf`] for why it must be
+    /// a plain key rather than an aggregate: an aggregate output needs the SE to spend, and a leg
+    /// with no pre-signed rung has nothing to fall back on.
+    ///
+    /// Its floor is [`mercurylib::tesr::DUST_LIMIT`] — the output has no fee of its own to fund,
+    /// because it funds no transaction of its own. Below dust it is a TAIL, which additionally
+    /// constrains `SP` (§6.0.4) and is gated separately.
+    Ladderless,
 }
 
 impl SplitLegRole {
@@ -4584,6 +4595,9 @@ impl SplitLegRole {
             SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
                 mercurylib::tesr::min_spine_tip_value(fee_rate_sats_per_vb, dust_limit)
             }
+            // No rung ⟹ no rung to fund. The floor is the output's own spendability and nothing
+            // else, which is exactly what §6.0.3 means by "floor is exactly 330".
+            SplitLegRole::Ladderless => dust_limit,
         }
     }
 
@@ -4594,6 +4608,11 @@ impl SplitLegRole {
             SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
                 colored_spine_tip_floor(fee_rate_sats_per_vb, dust_limit)
             }
+            // A coloured ladderless leg does not exist — `verify_ladderless_leaf` refuses one by
+            // name, because an allocation sealed to an outpoint with no transition to move with is
+            // destroyed by the first spend of it. The floor is stated anyway rather than left to a
+            // catch-all, so that admitting one would take a deliberate edit here as well.
+            SplitLegRole::Ladderless => dust_limit,
         }
     }
 }
@@ -4854,6 +4873,9 @@ pub enum SplitLeg {
     Piece(ChildTesrBundle),
     /// The sender's own change leg (`spinetip-`).
     Tip(SpineTipBundle),
+    /// **[REQ-83]** A payee's LADDERLESS claim on `SP.out[j]`. Not a coin: there is nothing to
+    /// persist as one, and nothing for the SE to co-sign.
+    Ladderless(LadderlessLeaf),
 }
 
 impl SplitJournalRecord {
@@ -4917,6 +4939,38 @@ impl SplitJournalRecord {
             // record replayed from disk rebuilds a COLOURED child when that is what was
             // carved. `None` on the two plain lanes, where it always was.
             rgb: c.rgb.clone(),
+            parent_flat_backups: self.parent_flat_backups.clone(),
+        })
+    }
+
+    /// **[REQ-83] Rebuild leg `j` as a LADDERLESS claim.**
+    ///
+    /// The mirror of [`Self::piece_bundle`] for a leg with no rung, and the refusals mirror it too:
+    /// a record whose role says ladderless but which carries a tier was signed against an outpoint
+    /// this leg does not own, and conveying it would hand the payee a rung that contradicts its own
+    /// claim. Refuse rather than rebuild around it.
+    pub fn ladderless_leaf(&self, j: usize) -> Result<LadderlessLeaf> {
+        let c = self.children.get(j).ok_or_else(|| {
+            anyhow::anyhow!("in-ladder split {} has no leg {j}", self.op_id)
+        })?;
+        if c.role != SplitLegRole::Ladderless {
+            return Err(anyhow::anyhow!(
+                "journalled leg {j} is not ladderless — it has rungs, and a claim on its funding \
+                 outpoint would ignore every one of them"
+            ));
+        }
+        if c.extension.is_some() || c.state.is_some() {
+            return Err(anyhow::anyhow!(
+                "journalled leg {j} is LADDERLESS but carries a tier. A ladderless leg has no rung; \
+                 a tier there was signed against an outpoint the leg does not own."
+            ));
+        }
+        Ok(LadderlessLeaf {
+            parent: self.parent.clone(),
+            parent_statechain_id: self.parent_statechain_id.clone(),
+            sp_vout: c.sp_vout,
+            payee_exit_address: c.owner_exit_address.clone(),
+            ancestors: self.ancestors.clone(),
             parent_flat_backups: self.parent_flat_backups.clone(),
         })
     }
@@ -5011,6 +5065,9 @@ impl SplitJournalRecord {
                     self.piece_bundle(j).map(SplitLeg::Piece)
                 }
                 SplitLegRole::SpineTip => self.spine_tip(j).map(SplitLeg::Tip),
+                // [REQ-83] Nothing to co-sign and nothing to persist as a coin — the leg IS the
+                // output, so it is rebuilt as a claim on it.
+                SplitLegRole::Ladderless => self.ladderless_leaf(j).map(SplitLeg::Ladderless),
             })
             .collect()
     }
@@ -5611,6 +5668,21 @@ pub async fn resume_in_ladder_split(
                     continue;
                 }
             }
+            // [REQ-83] A LADDERLESS leg is complete the moment `SP` exists: it has no tier to
+            // co-sign, so there is nothing a replay could finish. A record carrying tiers on one is
+            // corruption — the leg's whole definition is that nothing was signed for it — and
+            // continuing would convey a leaf whose shape contradicts its own journal.
+            SplitLegRole::Ladderless => {
+                if rec.children[j].extension.is_some() || rec.children[j].state.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "cannot resume in-ladder split {}: leg {j} is journalled as LADDERLESS but \
+                         carries a tier. A ladderless leg has no rung at all; a tier there was signed \
+                         against an outpoint the leg does not own.",
+                        rec.op_id
+                    ));
+                }
+                continue;
+            }
             // [REQ-83] A THIN piece is one rung, exactly like a tip, and the same bidirectional
             // check applies: an extension on it is corruption, not unfinished work.
             SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
@@ -5655,6 +5727,10 @@ pub async fn resume_in_ladder_split(
             SplitLegRole::SpineTip | SplitLegRole::ThinPiece => {
                 establish_spine_tip_journalled(cc, wallet_name, coin, rec, j).await?;
             }
+            // [REQ-83] Nothing to establish. Reached only if the completeness pass above did not
+            // `continue`, which it always does — kept as an explicit arm so a future change to that
+            // pass cannot silently route a ladderless leg into a tier builder.
+            SplitLegRole::Ladderless => {}
         }
     }
     rec.stage = SplitStage::Established;
@@ -5830,6 +5906,18 @@ pub async fn in_ladder_split(
     parent_coin: &mut Coin,
     bundle: &TesrBundle,
     children: &mut [(Coin, String, u64)],
+    // **[REQ-83] LADDERLESS legs — `(payee exit address, value)`, appended AFTER the coin-backed
+    // ones.**
+    //
+    // Additive rather than folded into `children`, because a ladderless leg has no `Coin` and
+    // never will: no SE slot is created for it, nothing is co-signed for it, and `SP.out[j]` pays
+    // the payee's OWN key. Widening the tuple would have every existing caller construct a coin
+    // that does not exist, which is the shape of lie this signature is refusing to tell.
+    //
+    // Ordering matters and is fixed here: coin-backed legs first, ladderless next, the change leg
+    // last when there is one. `SP.out[j]` and `legs()[j]` index the same leg, and that is what
+    // lets a caller read the two together.
+    ladderless: &[(String, u64)],
     change_leg: ChangeLeg,
     conveyance: &[(String, String)],
 ) -> Result<InLadderSplitOutput> {
@@ -5859,9 +5947,27 @@ pub async fn in_ladder_split(
     }
     let sp_csv = SPINE_CSV;
 
-    let n = children.len();
+    // [REQ-83] Every leg SP will carry: coin-backed children first, then ladderless claims. `n` is
+    // the payload-output count the fee term is priced on, so it must count BOTH — a ladderless leg
+    // is a real output and costs the same 43 vB as any other.
+    let n_coin = children.len();
+    let n = n_coin + ladderless.len();
     if n == 0 {
         return Err(anyhow::anyhow!("in-ladder split needs at least one child"));
+    }
+    // A ladderless leg pays the payee's OWN key, so nothing here can check it against an SE-created
+    // slot the way a coin-backed leg is checked. What CAN be checked is that it is spendable at all:
+    // a claim below the dust floor is a TAIL, which additionally constrains `SP` itself (§6.0.4) and
+    // is admitted through the tail lane rather than this one.
+    for (addr, v) in ladderless {
+        if *v < mercurylib::tesr::DUST_LIMIT {
+            return Err(anyhow::anyhow!(
+                "ladderless leg paying {addr} is worth {v} sat, below the {}-sat dust floor. A \
+                 sub-dust claim is a TAIL: it forces SP to carry the funded anchor at ZERO fee and \
+                 to carry at most one such output, and it is admitted through that lane, not this one",
+                mercurylib::tesr::DUST_LIMIT
+            ));
+        }
     }
     // [P0-2] A root split mints depth-1 children. Normally admissible, but not if the deployed epoch
     // is too short for even one level — check rather than assume. [P0-3] The parent's REAL tier count
@@ -5870,23 +5976,94 @@ pub async fn in_ladder_split(
     // Value conservation — no mint, no burn (build_split_state re-checks, but fail early with context).
     let total = mercurylib::tesr::tier_out_total(x_m.out_value, n, bundle.fee_rate)
         .ok_or_else(|| anyhow::anyhow!("committed fee too high for {n} children"))?;
-    let sum: u64 = children.iter().map(|(_, _, v)| *v).sum();
+    let sum: u64 = children.iter().map(|(_, _, v)| *v).sum::<u64>()
+        + ladderless.iter().map(|(_, v)| *v).sum::<u64>();
     if sum != total {
         return Err(anyhow::anyhow!(
             "child values sum to {sum} but must equal {total} (= X_m.out[0] − committed fee)"
         ));
     }
 
-    // SP pays each child's aggregate address, in order (SP.out[j] == children[j]).
-    let payees: Vec<(String, u64)> = children
-        .iter()
-        .map(|(c, _, v)| {
-            c.aggregated_address
+    // ══ THE LEG ORDER, DECIDED ONCE ═════════════════════════════════════════════════════════════
+    //
+    // `SP.out[j]`, `legs()[j]` and the journal's `children[j]` all index the SAME leg, and that is
+    // what lets a caller read them together. So the order is computed here, in one place, and both
+    // the payee vector and the role vector are derived from it — deriving them separately is exactly
+    // how a depth-2 record came to name a real outpoint belonging to the wrong `SP`.
+    //
+    // **The sender's TIP stays LAST.** `ChangeLeg::LastIsTip` means what it says, and
+    // `persist_spine_tip` and the plan check both read that position. Ladderless legs are therefore
+    // inserted BEFORE it, never appended after.
+    //
+    // **A coin-backed leg is paid at its AGGREGATE address; a ladderless one at the payee's OWN.**
+    // The two are not interchangeable: an aggregate output is spendable only with the SE, which is
+    // fine for a leg carrying a rung the SE already co-signed and is a trap for one that carries
+    // none.
+    struct PlannedLeg {
+        sid: String,
+        recipient: String,
+        value: u64,
+        payee_address: String,
+        role: SplitLegRole,
+    }
+    let tip_index = (change_leg == ChangeLeg::LastIsTip).then(|| n_coin - 1);
+    let mut plan: Vec<PlannedLeg> = Vec::with_capacity(n);
+    for (j, (c, recipient, v)) in children.iter().enumerate() {
+        if tip_index == Some(j) {
+            continue; // the tip is appended last, below
+        }
+        plan.push(PlannedLeg {
+            sid: c
+                .statechain_id
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))
-                .map(|a| (a, *v))
-        })
-        .collect::<Result<_>>()?;
+                .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
+            recipient: recipient.clone(),
+            value: *v,
+            payee_address: c
+                .aggregated_address
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))?,
+            role: if mercurylib::tesr::LeafShape::for_value(
+                *v,
+                p.committed_fee_rate,
+                mercurylib::tesr::DUST_LIMIT,
+            ) == mercurylib::tesr::LeafShape::SpineTip
+            {
+                SplitLegRole::ThinPiece
+            } else {
+                SplitLegRole::Piece
+            },
+        });
+    }
+    for (addr, v) in ladderless {
+        // No sid, and the empty string says so rather than a placeholder that could be looked up.
+        // The ROLE is what every reader dispatches on; the id is never consulted for this leg.
+        plan.push(PlannedLeg {
+            sid: String::new(),
+            recipient: addr.clone(),
+            value: *v,
+            payee_address: addr.clone(),
+            role: SplitLegRole::Ladderless,
+        });
+    }
+    if let Some(j) = tip_index {
+        let (c, recipient, v) = &children[j];
+        plan.push(PlannedLeg {
+            sid: c
+                .statechain_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
+            recipient: recipient.clone(),
+            value: *v,
+            payee_address: c
+                .aggregated_address
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("child coin has no aggregated_address"))?,
+            role: SplitLegRole::SpineTip,
+        });
+    }
+    let payees: Vec<(String, u64)> =
+        plan.iter().map(|l| (l.payee_address.clone(), l.value)).collect();
     let sp = mercurylib::tesr::build_split_state(
         &x_m.txid, x_m.out_value, &payees, &bundle.network, sp_csv, bundle.fee_rate,
     )?;
@@ -5951,37 +6128,8 @@ pub async fn in_ladder_split(
     // indistinguishable from an unfinished piece exactly where nobody is watching (see
     // `SplitLegRole`). Computed here, into the `Planned` record, so it is durable before
     // `set_spend_budget`.
-    let legs: Vec<(String, String, SplitLegRole)> = children
-        .iter()
-        .enumerate()
-        .map(|(j, (c, recipient, _))| {
-            Ok((
-                c.statechain_id
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("child coin has no statechain_id"))?,
-                recipient.clone(),
-                // **[REQ-83] The change leg is chosen by POSITION; a payee's leg by VALUE.**
-                //
-                // The sender's tip is structurally the last leg, and that has not changed. What has
-                // is that a payee's leg is no longer always two-rung: §6.0.3's second band is a leaf
-                // that can fund ONE rung and not two, and `LeafShape` decides which — from the same
-                // floor functions the admission guard and this builder both use, so the shape a
-                // payment is admitted at and the ladder then built cannot be two different answers.
-                if change_leg == ChangeLeg::LastIsTip && j + 1 == n {
-                    SplitLegRole::SpineTip
-                } else if mercurylib::tesr::LeafShape::for_value(
-                    children[j].2,
-                    p.committed_fee_rate,
-                    mercurylib::tesr::DUST_LIMIT,
-                ) == mercurylib::tesr::LeafShape::SpineTip
-                {
-                    SplitLegRole::ThinPiece
-                } else {
-                    SplitLegRole::Piece
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let legs: Vec<(String, String, SplitLegRole)> =
+        plan.iter().map(|l| (l.sid.clone(), l.recipient.clone(), l.role)).collect();
     // [K>1 prerequisite 2] …and so is the RECIPIENT of each piece. See `resolve_conveyance_plan`:
     // an address learned after the parent is terminal is an address the recovery path does not have,
     // and `owner_exit_address` cannot be turned back into one.
@@ -6001,7 +6149,10 @@ pub async fn in_ladder_split(
             .map(|(j, (sid, recipient, role))| SplitJournalChild {
                 statechain_id: sid.clone(),
                 owner_exit_address: recipient.clone(),
-                value: children[j].2,
+                // [REQ-83] From the PLAN, not from `children[j]` — the two no longer index the
+                // same thing once ladderless legs sit between the payees and the tip, and a value
+                // read from the wrong leg is a leg conveyed as worth something it is not.
+                value: plan[j].value,
                 // Child `j` lives at SP's j-th PAYLOAD output, not positional `j` (a coloured SP
                 // carries the opret at index 0 and shifts every child by one).
                 sp_vout: sp.payload_vout + j as u32,
@@ -12234,8 +12385,11 @@ pub struct LadderlessLeaf {
     pub payee_exit_address: String,
     #[serde(default)]
     pub ancestors: Vec<ChildSegment>,
+    /// The parent segment's FLAT backup chain, conveyed for the same reason a laddered leaf conveys
+    /// it: the census over that segment counts it, and the receiver never owned the parent so it
+    /// cannot observe the count itself.
     #[serde(default)]
-    pub parent_flat_backups: Vec<String>,
+    pub parent_flat_backups: Vec<mercurylib::wallet::BackupTx>,
 }
 
 impl LadderlessLeaf {
@@ -15658,11 +15812,11 @@ mod spine_tip_tests {
         assert_eq!(legs.len(), 2, "one leg per journalled child, index-stable");
         let piece = match &legs[0] {
             SplitLeg::Piece(cb) => cb.clone(),
-            SplitLeg::Tip(_) => panic!("leg 0 is the payee's piece"),
+            _ => panic!("leg 0 is the payee's piece"),
         };
         let tip = match &legs[1] {
             SplitLeg::Tip(t) => t.clone(),
-            SplitLeg::Piece(_) => panic!("the CHANGE leg must come back as a spine tip"),
+            _ => panic!("the CHANGE leg must come back as a spine tip"),
         };
         // …and the all-pieces accessor refuses the whole record rather than returning a short vector
         // that would shift every index after the tip.
@@ -15928,11 +16082,11 @@ mod spine_tip_tests {
         let legs = rec.legs().expect("both legs of batch 2 are complete");
         let piece = match &legs[0] {
             SplitLeg::Piece(cb) => cb.clone(),
-            SplitLeg::Tip(_) => panic!("leg 0 is the payee's piece"),
+            _ => panic!("leg 0 is the payee's piece"),
         };
         let next_tip = match &legs[1] {
             SplitLeg::Tip(t) => t.clone(),
-            SplitLeg::Piece(_) => panic!("the CHANGE leg of a batch must come back as a spine tip"),
+            _ => panic!("not a tip"),
         };
 
         // ── (b) THE NEW TIP'S CAP IS AT `state_csv(0)`, OFF THE SIGNATURE ─────────────────────────
@@ -16267,12 +16421,12 @@ mod spine_tip_tests {
             .iter()
             .map(|l| match l {
                 SplitLeg::Piece(cb) => cb.clone(),
-                SplitLeg::Tip(_) => panic!("legs 0..K are the payees' pieces"),
+                _ => panic!("not a piece"),
             })
             .collect();
         let next_tip = match &legs[K] {
             SplitLeg::Tip(t) => t.clone(),
-            SplitLeg::Piece(_) => panic!("the CHANGE leg of a batch must come back as a spine tip"),
+            _ => panic!("not a tip"),
         };
 
         // ── (b) THE TIP KEEPS ITS ONE CAP, AT `state_csv(0)`, OVER `SP.out[K]` ───────────────────
@@ -16633,6 +16787,73 @@ mod split_journal_tests {
             csv: Some(csv),
             payload_vout: 0,
         }
+    }
+
+    /// **[REQ-83] ADMISSION AND CONSTRUCTION CANNOT DISAGREE, at any value or any rate.**
+    ///
+    /// The invariant the whole four-band design rests on, as one sweep: whatever role a leg's VALUE
+    /// selects, that value must clear the role's OWN floor. If it ever did not, a payment would be
+    /// admitted at one shape's floor and built as another — and the discovery would come after
+    /// `set_spend_budget` has terminalized the parent, i.e. after the coin is gone.
+    ///
+    /// Both sides are derived from the same `LeafShape`, which is what makes this hold; the sweep is
+    /// here because "derived from the same function" is an argument and this is a measurement.
+    #[test]
+    fn every_value_gets_a_role_that_can_afford_its_own_floor() {
+        use mercurylib::tesr::{LeafShape, DUST_LIMIT};
+        for &rate in &[0.5f64, 1.0, 2.0, 3.0, 10.0, 100.0] {
+            let top = mercurylib::tesr::min_child_value(rate, DUST_LIMIT);
+            for v in DUST_LIMIT..=top + 20 {
+                let role = match LeafShape::for_value(v, rate, DUST_LIMIT) {
+                    LeafShape::Laddered => SplitLegRole::Piece,
+                    LeafShape::SpineTip => SplitLegRole::ThinPiece,
+                    LeafShape::Stub => SplitLegRole::Ladderless,
+                    LeafShape::Tail | LeafShape::Unpayable => continue,
+                };
+                assert!(
+                    v >= role.min_value(rate, DUST_LIMIT),
+                    "at {rate} sat/vB a {v}-sat leg is built as {role:?}, whose floor is {} — the \
+                     floor it was ADMITTED at and the shape it is BUILT as have come apart",
+                    role.min_value(rate, DUST_LIMIT)
+                );
+            }
+        }
+    }
+
+    /// **[REQ-83] A ladderless journal leg rebuilds as a CLAIM, not as a bundle.**
+    #[test]
+    fn a_ladderless_journal_leg_rebuilds_as_a_claim() {
+        let mut rec = record(SplitStage::Established);
+        rec.children[0].role = SplitLegRole::Ladderless;
+        rec.children[0].statechain_id = String::new();
+        rec.children[0].owner_exit_address = "bcrt1qstubpayee".into();
+
+        let leaf = rec.ladderless_leaf(0).expect("a ladderless leg rebuilds");
+        assert_eq!(leaf.payee_exit_address, "bcrt1qstubpayee");
+        assert_eq!(leaf.sp_vout, rec.children[0].sp_vout, "index-stable against the journal");
+        // …and it is NOT a conveyable child bundle: `piece_bundle` refuses it, so a `ctesr-` row can
+        // never be minted for a leg that has no ladder to put in one.
+        assert!(rec.piece_bundle(0).is_err(), "a ladderless leg is not a child bundle");
+    }
+
+    /// **A ladderless leg carrying a TIER is corruption, and is refused on both doors.**
+    ///
+    /// The leg's whole definition is that nothing was signed for it. A tier there was signed against
+    /// an outpoint the leg does not own, and conveying it would hand the payee a rung contradicting
+    /// their own claim — the same bidirectional check a spine tip gets, for the same reason.
+    #[test]
+    fn a_ladderless_journal_leg_carrying_a_tier_is_refused() {
+        let mut rec = record(SplitStage::Established);
+        rec.children[0].role = SplitLegRole::Ladderless;
+        rec.children[0].state = Some(TesrTier {
+            txid: "aa".repeat(32),
+            signed_tx: String::new(),
+            out_value: 1,
+            csv: Some(1),
+            payload_vout: 0,
+        });
+        let e = rec.ladderless_leaf(0).expect_err("a tier on a ladderless leg is corruption");
+        assert!(e.to_string().contains("carries a tier"), "got: {e}");
     }
 
     fn record(stage: SplitStage) -> SplitJournalRecord {
@@ -17009,6 +17230,11 @@ mod split_journal_tests {
                 SplitLeg::Tip(t) => {
                     assert_eq!(j, K, "the tip is the last leg");
                     assert_eq!(t.statechain_id, format!("leg{K}"));
+                }
+                // [REQ-83] This fixture journals every leg as a two-rung piece plus the tip, so a
+                // ladderless leg here would mean `legs()` invented a shape the record does not name.
+                SplitLeg::Ladderless(_) => {
+                    panic!("leg {j} came back LADDERLESS from a record that journals no such role")
                 }
             }
         }
@@ -25980,7 +26206,7 @@ mod reanchor_void_state_tests {
                 assert!(!spender.is_empty());
                 assert!(detail.contains("flat backup"));
             }
-            other => panic!("expected Void, got {other:?}"),
+            _ => panic!("expected Void"),
         }
     }
 }

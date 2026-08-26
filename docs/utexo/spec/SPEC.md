@@ -1631,7 +1631,7 @@ dust limit is already expressible today.
 |---|---|---|
 | `v ≥ min_child_value` (1560 at 3.0 sat/vB) | today's two-rung ladder, self-funding | unchanged |
 | `945 ≤ v < 1560` | ONE rung — **BUILT** (`SplitLegRole::ThinPiece`) | one renewal instead of two |
-| `DUST_LIMIT ≤ v < 945` | depth-0 stub, no ladder; zero-fee v3 with a zero-value anchor, bumped in package | floor is exactly 330 |
+| `DUST_LIMIT ≤ v < 945` | depth-0 stub, no ladder — **BUILT** (`SplitLegRole::Ladderless`) | floor is exactly 330 |
 | `1 ≤ v < DUST_LIMIT` | **a TAIL** — carried as the split's single permitted dust output | see below |
 
 A tail forces two things on its split transaction and on nothing else: the anchor must be the FUNDED
@@ -1661,11 +1661,11 @@ caller reads exactly like a working feature, which is this repository's most rep
 | band | reachable through `transfer()` today |
 |---|---|
 | `Laddered` | **yes** |
-| `SpineTip` | **yes** — the piece floor now sits exactly at its boundary |
-| `Stub` | no |
-| `Tail` | no |
+| `SpineTip` | **yes** |
+| `Stub` | **yes** — the piece floor now sits exactly at its boundary |
+| `Tail` | no — needs a zero-fee `SP` |
 
-The piece floor IS the `SpineTip` boundary, so every amount in `[1, 945)` is still refused before a
+The piece floor IS the `Stub` boundary, so every amount in `[1, 330)` is still refused before a
 builder is ever consulted. That test is written to FAIL when a lower band is wired up — it already
 did once, for this one, and the update is above. Closing a band cannot pass silently either.
 
@@ -1717,13 +1717,39 @@ binding cases — runs through the extracted block unchanged and stays green. Th
 parent re-verification was updated and strengthened rather than silenced: exactly ONE place may
 re-verify a child's embedded parent, and the child verifier must REACH it.
 
-**What remains for each band, precisely.** Layers 1 and 2 — the split builder paying a plain exit key
-at that slot with no child coin or SE slot, and a journal role with no `statechain_id` to record —
-plus the receiver booking a claim on an outpoint rather than a statechain coin. **`Tail` needs one
-thing more, and it is not small:** a sub-dust output on `SP` forces `SP` itself to pay ZERO fee
-(§6.0.1), and every ladder law prices a tier as `committed_fee + P2A_VALUE`. A zero-fee `SP` is a
-second tier construction with its own conservation law, relayed only as a package — which the probe
-proved works, and which nothing in the ladder currently expresses.
+**THE `Stub` BAND IS BUILT.** `in_ladder_split` takes ladderless legs alongside the coin-backed
+ones; `SP` pays each coin-backed child's AGGREGATE address and each ladderless payee's OWN address.
+A recipient in the `Stub` band never has a derived slot spent on them — the decision is made before
+any voucher is taken, from the same `LeafShape` the admission floor reads. The journal records the
+role with no `statechain_id`, `legs()` rebuilds it as a claim rather than a bundle, and the
+establisher has nothing to do for it.
+
+**The leg ORDER is now decided once, and that mattered.** `SP.out[j]`, `legs()[j]` and the journal's
+`children[j]` index the same leg, which is what lets a caller read them together — so a single plan
+produces the payee vector and the role vector both. The sender's TIP stays LAST (`ChangeLeg::LastIsTip`
+means what it says, and two readers depend on that position), with ladderless legs inserted before
+it rather than appended after.
+
+**And the piece floor is `DUST_LIMIT` flat — not `max(backup_floor, …)`.** The backup floor exists
+because a sub-coin's funding IS its exit branch and it must pay for its own backup transaction. A
+ladderless leg has neither branch nor backup nor rung: its floor is the output's own spendability and
+nothing else, which is what this table means by "floor is exactly 330". Two consequences worth
+stating because both inverted long-standing pins: the payee's floor is now BELOW the sender's change
+floor (the tip used to be the cheaper leg), and it is below the bare backup-fee floor.
+
+`every_value_gets_a_role_that_can_afford_its_own_floor` sweeps every value at six rates and asserts
+the invariant the four bands rest on: **whatever role a value selects, that value clears the role's
+own floor.** Both sides derive from `LeafShape`, which is why it holds — the sweep is there because
+"derived from the same function" is an argument and this is a measurement. A disagreement would
+surface after `set_spend_budget` has terminalized the parent, i.e. after the coin is gone.
+
+**What remains is `Tail` alone, and one thing in it is not small:** a sub-dust output on `SP` forces
+`SP` itself to pay ZERO fee (§6.0.1), and every ladder law prices a tier as
+`committed_fee + P2A_VALUE`. A zero-fee `SP` is a second tier construction with its own conservation
+law, relayed only as a package — which the probe proved works, and which nothing in the ladder
+expresses. Also outstanding on that band: the release fragment must be CONVEYED with the split
+(REQ-84's bundle-level half), and the receiver must book a ladderless claim as a pending output
+rather than a statechain coin.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the
