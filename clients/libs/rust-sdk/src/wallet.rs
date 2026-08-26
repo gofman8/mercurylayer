@@ -591,6 +591,43 @@ impl UtexoWallet {
     }
 
     /// Balance across all coins, including per-asset token balances (when configured).
+    /// **[REQ-83] Every satoshi this wallet holds as a LADDERLESS claim** — stubs and tails.
+    ///
+    /// A stub's value is read from its own `SP` output rather than from a field beside it; a tail's
+    /// likewise. Both were checked against the chain when adopted, and re-reading the transaction
+    /// here means a corrupted record cannot inflate a balance without also failing to parse.
+    pub async fn ladderless_sats(&self) -> Result<u64> {
+        use electrum_client::bitcoin::consensus::deserialize;
+        use electrum_client::bitcoin::Transaction;
+        let wallet = self.inner.config.wallet_name.clone();
+        let mut total = 0u64;
+        for leaf in mercuryrustlib::tesr::load_stubs(&self.inner.cc, &wallet).await? {
+            let sp: Transaction =
+                deserialize(&hex::decode(&leaf.parent.current().state.signed_tx)?)?;
+            total += sp
+                .output
+                .get(leaf.sp_vout as usize)
+                .ok_or_else(|| anyhow!("a stored stub names an output its SP does not have"))?
+                .value;
+        }
+        for (k, json) in
+            mercuryrustlib::sqlite_manager::get_all_backup_txs(&self.inner.cc.pool, &wallet).await?
+        {
+            if !k.starts_with(mercuryrustlib::tesr::TAIL_KEY_PREFIX) {
+                continue;
+            }
+            let leaf: mercuryrustlib::tesr::TailLeaf = serde_json::from_str(&json)?;
+            let sp: Transaction =
+                deserialize(&hex::decode(&leaf.parent.current().state.signed_tx)?)?;
+            total += sp
+                .output
+                .get(leaf.sp_vout as usize)
+                .ok_or_else(|| anyhow!("a stored tail names an output its SP does not have"))?
+                .value;
+        }
+        Ok(total)
+    }
+
     pub async fn get_balance(&self) -> Result<Balance> {
         let record = self.record().await?;
         // Fail CLOSED for token wallets (audit [23]): if RGB state is unavailable we cannot know
@@ -615,6 +652,15 @@ impl UtexoWallet {
         // If the carrier enumeration succeeded but the per-asset balances cannot be read, say so.
         balance.tokens = self.get_token_balances().await.map_err(|e| {
             anyhow!("cannot compute balance: RGB token balances are unavailable ({e}) — reporting an empty token list would tell the owner they hold nothing while a received carrier's clawback deadline keeps running")
+        })?;
+        // **[REQ-83] Ladderless claims are money this wallet holds, and are reported as their own
+        // number.** Propagated rather than swallowed, for the same reason as the two above: a read
+        // failure that came back as zero would tell an owner they were never paid.
+        balance.ladderless_sats = self.ladderless_sats().await.map_err(|e| {
+            anyhow!(
+                "cannot compute balance: ladderless claims are unreadable ({e}) — reporting zero \
+                 would tell the owner a payment they hold does not exist"
+            )
         })?;
         Ok(balance)
     }

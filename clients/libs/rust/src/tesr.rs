@@ -7507,6 +7507,90 @@ pub const CHILD_V2_BASELINE: u32 = 0;
 pub const SPINE_CSV: u16 = 0;
 
 /// Persist a split child bundle under `ctesr-<child_statechain_id>` (replaces any prior).
+/// **[REQ-83] Persistence key for a TAIL leg** — `tail-<statechain_id>`.
+///
+/// Its OWN prefix, not `ctesr-`, for the reason that prefix exists at all: every reader keyed on
+/// `ctesr-` expects a coin with a ladder to walk, and a tail has none. A tail filed under it would be
+/// read as a child whose tiers failed to load — an error where the truth is "there are none".
+pub const TAIL_KEY_PREFIX: &str = "tail-";
+
+/// **[REQ-83] Persistence key for a LADDERLESS (stub) claim** — `stub-<parent sid>:<vout>`.
+///
+/// Keyed by the OUTPOINT rather than by a statechain id, because a stub has none: no SE slot is
+/// created for it and `SP.out[j]` pays the payee's own key. That is the whole shape, and the key
+/// says so rather than inventing an id to file it under.
+pub const STUB_KEY_PREFIX: &str = "stub-";
+
+/// Store a conveyed TAIL leg, keyed by its statechain id.
+/// **[REQ-84] A tail with no fragment must never be STORED, not merely never accepted.**
+///
+/// Separate from the verifier so it can be asserted without a chain: what it protects is the wallet's
+/// own record. A tail on disk with no fragment looks held and is not — nobody could put its split on
+/// chain — and every later reader would treat it as money.
+pub fn refuse_tail_without_fragment(leaf: &TailLeaf) -> Result<()> {
+    if leaf.release_fragment.is_empty() {
+        return Err(anyhow::anyhow!(
+            "refusing to store tail {}: it carries no release fragment, so no party could ever put \
+             its split on chain",
+            leaf.child_statechain_id
+        ));
+    }
+    Ok(())
+}
+
+pub async fn persist_tail(cc: &ClientConfig, wallet_name: &str, leaf: &TailLeaf) -> Result<()> {
+    refuse_tail_without_fragment(leaf)?;
+    let json = serde_json::to_string(leaf)?;
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("{TAIL_KEY_PREFIX}{}", leaf.child_statechain_id),
+        &json,
+    )
+    .await
+}
+
+/// Read a stored TAIL leg. `Ok(None)` is a genuine absence, never a read failure.
+pub async fn load_tail(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    statechain_id: &str,
+) -> Result<Option<TailLeaf>> {
+    let key = format!("{TAIL_KEY_PREFIX}{statechain_id}");
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if k == key {
+            return Ok(Some(serde_json::from_str::<TailLeaf>(&json)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Store a LADDERLESS claim, keyed by the outpoint it IS.
+pub async fn persist_stub(cc: &ClientConfig, wallet_name: &str, leaf: &LadderlessLeaf) -> Result<()> {
+    let json = serde_json::to_string(leaf)?;
+    crate::sqlite_manager::insert_raw_backup_txs(
+        &cc.pool,
+        wallet_name,
+        &format!("{STUB_KEY_PREFIX}{}:{}", leaf.parent_statechain_id, leaf.sp_vout),
+        &json,
+    )
+    .await
+}
+
+/// Every LADDERLESS claim this wallet holds.
+///
+/// Returned as a list rather than looked up one at a time, because a stub has no id a caller could
+/// hold: the wallet learns what it owns by reading what it stored.
+pub async fn load_stubs(cc: &ClientConfig, wallet_name: &str) -> Result<Vec<LadderlessLeaf>> {
+    let mut out = Vec::new();
+    for (k, json) in crate::sqlite_manager::get_all_backup_txs(&cc.pool, wallet_name).await? {
+        if k.starts_with(STUB_KEY_PREFIX) {
+            out.push(serde_json::from_str::<LadderlessLeaf>(&json)?);
+        }
+    }
+    Ok(out)
+}
+
 pub async fn persist_child(cc: &ClientConfig, wallet_name: &str, cb: &ChildTesrBundle) -> Result<()> {
     let json = serde_json::to_string(cb)?;
     crate::sqlite_manager::insert_raw_backup_txs(
@@ -8379,6 +8463,137 @@ pub async fn verify_conveyed_child(
         receiver_backup_address,
     )?;
     Ok(cb.child_state.out_value)
+}
+
+/// **[REQ-83] The parent-side facts a conveyed leaf is judged against, fetched once.**
+///
+/// `(F scriptPubKey hex, F value, parent num_sigs, flat backup count, aggregate, terminal, ancestor
+/// facts)`. Shared by the two ladderless receive paths so they cannot drift from each other — and
+/// deliberately NOT shared with `verify_conveyed_child`, which additionally checks an exit-headroom
+/// walk over the CHILD's own tiers. A leaf with no tiers has no such walk, and pretending otherwise
+/// would either invent a chain or skip a check on the lane that does have one.
+async fn conveyed_parent_facts(
+    cc: &ClientConfig,
+    parent: &TesrBundle,
+    parent_statechain_id: &str,
+    ancestors: &[ChildSegment],
+) -> Result<(String, u64, u32, u32, Option<String>, bool, Vec<AncestorFacts>)> {
+    use electrum_client::bitcoin::Txid;
+    let f_txid =
+        Txid::from_str(&parent.f_txid).map_err(|_| anyhow::anyhow!("bad parent F txid"))?;
+    let f_tx = cc
+        .electrum_client
+        .transaction_get(&f_txid)
+        .map_err(|_| anyhow::anyhow!("parent F {} not found on chain", parent.f_txid))?;
+    let f_out = f_tx
+        .output
+        .get(parent.f_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("parent F has no output {}", parent.f_vout))?;
+    let f_spk_hex = hex::encode(f_out.script_pubkey.as_bytes());
+
+    let info = crate::utils::get_statechain_info(parent_statechain_id, cc)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no statechain info for parent sid"))?;
+    let terminal = attested_terminal(cc, &info, "the parent", parent_statechain_id).await?;
+
+    let mut ancestor_facts: Vec<AncestorFacts> = Vec::with_capacity(ancestors.len());
+    for seg in ancestors {
+        let a = crate::utils::get_statechain_info(&seg.statechain_id, cc)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no statechain info for ancestor {}", seg.statechain_id))?;
+        let t = attested_terminal(cc, &a, "an ancestor segment", &seg.statechain_id).await?;
+        ancestor_facts.push(AncestorFacts {
+            num_sigs: a.num_sigs,
+            aggregate_pubkey: a.aggregate_pubkey.clone(),
+            terminal: t,
+        });
+    }
+    Ok((
+        f_spk_hex,
+        f_out.value,
+        info.num_sigs,
+        0, // filled by the caller from the CONVEYED chain, never from a constant
+        info.aggregate_pubkey.clone(),
+        terminal,
+        ancestor_facts,
+    ))
+}
+
+/// **[REQ-83/84] Verify a conveyed TAIL, against the chain and the SE's attested facts.**
+///
+/// Returns what the receiver is credited. The value comes from `SP.out[sp_vout]` — the transaction —
+/// never from a field beside it, which is what `verify_tail_leaf`'s declared-value check enforces.
+pub async fn verify_conveyed_tail(cc: &ClientConfig, leaf: &TailLeaf) -> Result<u64> {
+    let (f_spk_hex, f_value, num_sigs, _, agg, terminal, ancestors) =
+        conveyed_parent_facts(cc, &leaf.parent, &leaf.parent_statechain_id, &leaf.ancestors).await?;
+    let sp: electrum_client::bitcoin::Transaction = electrum_client::bitcoin::consensus::deserialize(
+        &hex::decode(&leaf.parent.current().state.signed_tx)?,
+    )?;
+    let value = sp
+        .output
+        .get(leaf.sp_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("the conveyed SP has no output {}", leaf.sp_vout))?
+        .value;
+    verify_tail_leaf(
+        leaf,
+        &f_spk_hex,
+        f_value,
+        num_sigs,
+        leaf.parent_flat_backups.len() as u32,
+        agg.as_deref(),
+        terminal,
+        &ancestors,
+        value,
+    )?;
+    Ok(value)
+}
+
+/// [`verify_conveyed_tail`] + store it. The RECEIVER side of a sub-dust payment.
+pub async fn adopt_tail_leaf(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    leaf: &TailLeaf,
+) -> Result<u64> {
+    let value = verify_conveyed_tail(cc, leaf).await?;
+    persist_tail(cc, wallet_name, leaf).await?;
+    Ok(value)
+}
+
+/// **[REQ-83] Verify a conveyed LADDERLESS (stub) claim.**
+pub async fn verify_conveyed_stub(cc: &ClientConfig, leaf: &LadderlessLeaf) -> Result<u64> {
+    let (f_spk_hex, f_value, num_sigs, _, agg, terminal, ancestors) =
+        conveyed_parent_facts(cc, &leaf.parent, &leaf.parent_statechain_id, &leaf.ancestors).await?;
+    let sp: electrum_client::bitcoin::Transaction = electrum_client::bitcoin::consensus::deserialize(
+        &hex::decode(&leaf.parent.current().state.signed_tx)?,
+    )?;
+    let value = sp
+        .output
+        .get(leaf.sp_vout as usize)
+        .ok_or_else(|| anyhow::anyhow!("the conveyed SP has no output {}", leaf.sp_vout))?
+        .value;
+    verify_ladderless_leaf(
+        leaf,
+        &f_spk_hex,
+        f_value,
+        num_sigs,
+        leaf.parent_flat_backups.len() as u32,
+        agg.as_deref(),
+        terminal,
+        &ancestors,
+        value,
+    )?;
+    Ok(value)
+}
+
+/// [`verify_conveyed_stub`] + store it.
+pub async fn adopt_stub_leaf(
+    cc: &ClientConfig,
+    wallet_name: &str,
+    leaf: &LadderlessLeaf,
+) -> Result<u64> {
+    let value = verify_conveyed_stub(cc, leaf).await?;
+    persist_stub(cc, wallet_name, leaf).await?;
+    Ok(value)
 }
 
 /// [`verify_conveyed_child`] + persist the bundle so the receiver can [`exit_child_pass`] it. The
@@ -17357,6 +17572,54 @@ mod split_journal_tests {
                 );
             }
         }
+    }
+
+    /// **[REQ-83] The three leaf kinds are stored under three DISTINCT prefixes, and none is a
+    /// prefix of another.**
+    ///
+    /// Not tidiness. Every reader keyed on `ctesr-` expects a coin with a ladder to walk; a tail or a
+    /// stub filed under it would be read as a child whose tiers failed to load — an error where the
+    /// truth is "there are none". And a prefix that were a prefix of another would make
+    /// `starts_with` scans (which is how stubs are enumerated, having no id to look up by) return
+    /// each other's rows.
+    #[test]
+    fn the_leaf_kinds_do_not_share_a_persistence_prefix() {
+        let keys = [TAIL_KEY_PREFIX, STUB_KEY_PREFIX, SPINE_TIP_KEY_PREFIX, "ctesr-", "branch-"];
+        for (i, a) in keys.iter().enumerate() {
+            for (j, b) in keys.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !a.starts_with(b) && !b.starts_with(a),
+                    "`{a}` and `{b}` overlap — a prefix scan would return the other kind's rows"
+                );
+            }
+        }
+    }
+
+    /// **[REQ-84] A tail with no fragment is refused BEFORE it reaches disk.**
+    ///
+    /// The verifier already refuses one on arrival; this is the wallet's own record, and the two are
+    /// separate on purpose. A tail on disk with no fragment looks held and is not — nobody could put
+    /// its split on chain — and every later reader would count it as money.
+    #[test]
+    fn a_tail_without_a_fragment_is_never_stored() {
+        let leaf = TailLeaf {
+            parent: sample_bundle(),
+            parent_statechain_id: "parent".into(),
+            sp_vout: 1,
+            child_statechain_id: "tail-sid".into(),
+            child_owner_exit_address: "bcrt1qpayee".into(),
+            ancestors: vec![],
+            parent_flat_backups: vec![],
+            release_fragment: String::new(),
+        };
+        let e = refuse_tail_without_fragment(&leaf).expect_err("must refuse").to_string();
+        assert!(e.contains("no release fragment"), "got: {e}");
+        // …and one that HAS a fragment is storable, so the guard is not simply refusing everything.
+        let ok = TailLeaf { release_fragment: "aa".repeat(64), ..leaf };
+        assert!(refuse_tail_without_fragment(&ok).is_ok());
     }
 
     /// **[REQ-83] A ladderless journal leg rebuilds as a CLAIM, not as a bundle.**

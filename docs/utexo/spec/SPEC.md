@@ -1805,12 +1805,33 @@ one shape, and silently wrong with three: a thin piece and a tail would build, t
 and then be refused at hand-over. It now names the CHANGE leg, which is what it was always for, and
 every payee shape is conveyable. Pinned in both directions.
 
-**What remains across both lower bands: the receiver's claim path.** A `Tail` reaches a payee through
-the ordinary mailbox — it is coin-backed and has a slot — but a `Stub` does not: it has no
-`statechain_id`, so there is no mailbox key for it. Its payee needs the `SP` transaction rather than a
-secret, since the output already pays their own key, so the channel is a different one. And on both
-bands the wallet must book a CLAIM on an outpoint where every existing path expects a coin with a
-ladder.
+**THE RECEIVER'S SIDE IS BUILT for both bands.** `verify_conveyed_tail` / `verify_conveyed_stub`
+check a conveyed claim against the chain and the SE's attested facts, and `adopt_tail_leaf` /
+`adopt_stub_leaf` store it. Both read the credited value from `SP.out[sp_vout]` — the transaction —
+never from a field beside it.
+
+Three storage decisions worth stating, because each is a place the shape could have been lost:
+
+* **Its own key prefix, not `ctesr-`.** Every reader keyed on `ctesr-` expects a coin with a ladder to
+  walk; a tail filed under it would be read as a child whose tiers failed to load, an error where the
+  truth is *"there are none"*. Pinned: none of the five prefixes is a prefix of another, which is what
+  keeps the stub scan (there is no id to look up by) from returning another kind's rows.
+* **A stub is keyed by its OUTPOINT**, because it has no statechain id — no slot is created for it and
+  `SP.out[j]` pays the payee's own key. The key says so rather than inventing an id.
+* **[REQ-84] A tail with no fragment is never STORED**, separately from never being accepted. A tail on
+  disk without one looks held and is not — nobody could put its split on chain — and every later
+  reader would count it as money.
+
+**And the balance reports them as their OWN number, not folded into `available_sats`.** They are real
+payments, and they are not spendable the way a coin is: a stub is realised when its parent's `SP`
+confirms, and a tail is spendable off-chain while its satoshis are swept as fee credit by whoever puts
+that split on chain. Folding them in would tell an owner they can spend what they cannot; omitting
+them would tell them they were not paid. The read propagates its errors for the same reason the token
+balance does — a failure that came back as zero would say a payment they hold does not exist.
+
+**What remains is the DELIVERY channel for a stub.** A tail travels the ordinary mailbox (coin-backed,
+has a slot). A stub has no mailbox key, and what its payee needs is the `SP` transaction rather than a
+secret — the output already pays their own key — so it is a different channel and not a claim path.
 
 **THE SECOND BAND IS BUILT, in the three stages this section predicted.** A correction stands
 first, because the estimate was wrong in the direction that matters: this section used to say the

@@ -11,6 +11,16 @@ pub struct Balance {
     pub in_transfer_sats: u64,
     /// RGB asset balances (empty when token support is disabled in config).
     pub tokens: Vec<TokenBalance>,
+    /// **[REQ-83] Sats held as LADDERLESS claims — §6.0.3's `Stub` and `Tail` bands.**
+    ///
+    /// Reported SEPARATELY from `available_sats`, and the separation is the honest part. These are
+    /// real payments this wallet holds, but they are not spendable the way a coin is: a `Stub` is
+    /// realised when its parent's `SP` confirms, and a `Tail` is spendable off-chain while its
+    /// satoshis are swept as fee credit by whoever puts that split on chain (§6.0.4). Folding them
+    /// into `available_sats` would tell an owner they can spend something they cannot; omitting them
+    /// entirely would tell them they were not paid.
+    #[serde(default)]
+    pub ladderless_sats: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
