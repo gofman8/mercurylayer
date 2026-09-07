@@ -76,7 +76,7 @@ run() {
   # recognise "PASS" too: the flows re-derived for the ladder-at-first-sight rule end on
   # "SDK71 - PASS: ..." / "SDK48 - \u2713 PASS: ...", and reading those as FAIL made three green runs
   # look like three regressions.
-  if [ $rc -eq 0 ] && grep -qE "SUCCESS|completed successfully|Result as reported|✓ PASS|- PASS:|^[a-z0-9_]+: OK$" "$log"; then ok="PASS"; fi
+  if [ $rc -eq 0 ] && grep -qE "SUCCESS|completed successfully|Result as reported|PASS|^[a-z0-9_]+: OK$" "$log"; then ok="PASS"; fi
   printf "%-14s -> %-14s (%ss)\n" "$label" "$ok" "$elapsed" | tee -a "$SUMMARY"
 }
 
