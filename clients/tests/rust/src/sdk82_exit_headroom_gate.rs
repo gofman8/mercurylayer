@@ -223,7 +223,20 @@ pub async fn execute() -> Result<()> {
     let admitted = mercuryrustlib::tesr::verify_conveyed_child(&cc, &control_payee, &control_piece_bundle)
         .await
         .map_err(|e| anyhow!("the CONTROL child must be ADMITTED by the receiver's verifier: {e:#}"))?;
-    assert_eq!(admitted, PAY, "the verifier's census-bound exit value is the payment");
+    // The census-bound value is the piece MINUS the child's own two tiers, not the nominal: the
+    // child funds an extension and a state off the piece and each burns `committed_fee(rate) +
+    // P2A_VALUE`. Derived from the conveyed bundle's rate so it stays exact if the constants move.
+    let control_rate = control_piece_bundle.parent.fee_rate;
+    let control_after_x = mercurylib::tesr::tier_out_value(PAY, control_rate)
+        .ok_or_else(|| anyhow!("the {PAY} piece is too small for the child's extension tier"))?;
+    let control_expected = mercurylib::tesr::tier_out_value(control_after_x, control_rate)
+        .ok_or_else(|| anyhow!("the {PAY} piece is too small for the child's state tier"))?;
+    assert!(control_expected < PAY, "each child tier burns a committed fee plus the anchor");
+    assert_eq!(
+        admitted, control_expected,
+        "the verifier's census-bound exit value is the piece's EXIT-REACHABLE value: {PAY} minus \
+         the child's own two tiers"
+    );
     // [B1] The honest child's two copies of every timelock agree, and the requirement read off its
     // SIGNATURES is the live schedule's.
     let bound = mercuryrustlib::tesr::child_exit_chain_bound(&control_piece_bundle)
@@ -372,7 +385,14 @@ pub async fn execute() -> Result<()> {
                 anyhow!("the receiver must ADMIT a child of a coin {} blocks old exactly as it admits a fresh one: {m}", now - born)
             }
         })?;
-    assert_eq!(aged_admitted, PAY, "the aged child's census-bound exit value is the payment");
+    // The SAME derived value as the control's: an aged coin's child is priced exactly like a fresh
+    // one, which is the whole point of this test. Asserting the nominal here would assert the
+    // pre-ladder shape, where a piece kept its full value and was exited by a flat backup.
+    assert_eq!(
+        aged_admitted, control_expected,
+        "the aged child's census-bound exit value is the SAME as the fresh one's: {PAY} minus the \
+         child's own two tiers. Age changes nothing, because there is no epoch to age against"
+    );
     claim_until(&bob, 2 * PAY, "AGED").await?;
     assert!(
         !is_outpoint_spent(&cc, &aged_f_txid, aged_f_vout),

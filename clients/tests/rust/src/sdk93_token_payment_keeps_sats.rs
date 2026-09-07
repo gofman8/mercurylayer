@@ -36,6 +36,10 @@
 //!      absence handled, the next thing the path wants is a previous nLockTime to build strictly
 //!      below — and **no coin has one any more**. `refresh_rgb_anchor_self_transfer` is the
 //!      flat-backup builder: it appends a decrementing absolute-locktime backup to the coin's chain.
+//!      **Measured 2026-09-07: this IS the first refusal, and it now says so by name.** The message
+//!      used to be "neither a backup tx nor a locktime", which described a retired shape and read
+//!      like data loss on a healthy coin; it now names the lane as unbuilt and says the coin is
+//!      untouched. If this test ever stops here with a DIFFERENT error, something earlier regressed.
 //!      That chain is retired for EVERY coin, not only for a received child: a coin's ladder
 //!      `(T, X, S)` is co-signed at first sight of `F` in place of the flat `tx1`, `coin.locktime`
 //!      is `None` for life, and every TES-R tier is built at locktime 0. So the path refuses at

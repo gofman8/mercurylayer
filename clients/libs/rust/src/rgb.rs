@@ -581,15 +581,27 @@ pub async fn refresh_rgb_anchor_self_transfer(
         .collect();
     coin_backups.sort_by(|a, b| a.tx_n.cmp(&b.tx_n));
     let previous_tx_n = coin_backups.last().map(|b| b.tx_n).unwrap_or(0);
-    // With no prior backup for THIS funding outpoint, the coin's own locktime is the current state's
-    // locktime — which is exactly what the next backup must be built strictly below. A received child
-    // is the ordinary case here: it has a locktime and a branch, just not a plain backup chain.
+    // This lane builds the NEXT flat backup strictly below the current one, so it needs a current
+    // absolute locktime to build below. **No coin has one.** The flat backup chain is retired: a
+    // coin's only exit material is its TES-R ladder and `coin.locktime` is `None` for life, so this
+    // arm is now reached by every coin rather than by none, and the lane it serves is unbuildable
+    // as written.
+    //
+    // Refuse by NAME rather than with "neither a backup tx nor a locktime", which described a
+    // retired shape and read like data loss on a perfectly healthy coin. The feature this blocks —
+    // assigning an allocation to an outpoint the receiver ALREADY owns, so a token payment stops
+    // gifting the receiver a fresh carrier — is real and unbuilt; sdk93 is its standing red test.
+    // Building it means giving this path a coloured in-ladder state instead of a flat backup.
     let previous_nlocktime = match coin_backups.last() {
         Some(b) => tx_nlocktime(&b.tx)?,
         None => coin.locktime.ok_or_else(|| {
             anyhow!(
-                "coin {statechain_id} has neither a backup tx nor a locktime, so there is no current \
-                 state to build the next one below"
+                "coin {statechain_id}: the revealed-seal token transfer is NOT BUILT on the laddered \
+                 lane. It builds the next FLAT backup below the coin's current absolute locktime, \
+                 and no coin carries one any more — the ladder is a coin's only exit material. The \
+                 coin is untouched and healthy: nothing has been co-signed, and it can still be \
+                 paid the ordinary way (which mints the receiver a fresh carrier) or exited. \
+                 Building this lane means giving it a coloured in-ladder state instead of a backup."
             )
         })?,
     };

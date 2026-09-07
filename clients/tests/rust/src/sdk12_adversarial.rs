@@ -160,7 +160,22 @@ pub async fn execute() -> Result<()> {
         let Some(cb) = mercuryrustlib::tesr::load_child(&cc, "sdk12_bob", &sid).await? else { continue };
         adopted += 1;
         assert!(cb.parent_flat_backups.is_empty(), "the adopted child {sid} conveys a flat backup beside its ladder");
-        assert_eq!(cb.child_state.out_value, PAY, "the adopted child's exit pays the recipient exactly {PAY}");
+        // The child's exit value is the piece nominal MINUS its own two tiers: `establish_child`
+        // hangs an extension and a state off the piece, and each burns `committed_fee(rate) +
+        // P2A_VALUE`. Derived from the bundle's own fee rate rather than hard-coded, so this stays
+        // exact if the tier constants move. (Asserting `PAY` here asserted the pre-ladder shape,
+        // where a piece was exited by a flat backup and kept its full nominal.)
+        let rate = cb.parent.fee_rate;
+        let after_x = mercurylib::tesr::tier_out_value(PAY, rate)
+            .ok_or_else(|| anyhow!("piece {PAY} too small for the child's extension tier"))?;
+        let expected = mercurylib::tesr::tier_out_value(after_x, rate)
+            .ok_or_else(|| anyhow!("piece {PAY} too small for the child's state tier"))?;
+        assert!(expected < PAY, "each child tier burns a committed fee plus the anchor");
+        assert_eq!(
+            cb.child_state.out_value, expected,
+            "the adopted child's exit pays the recipient its EXIT-REACHABLE value: the {PAY} piece \
+             minus its own two tiers"
+        );
         assert!(c.locktime.is_none(), "the adopted child {sid} carries locktime {:?} — a child exits by RELATIVE CSV only", c.locktime);
         let flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk12_bob", &sid).await?.map(|r| r.len()).unwrap_or(0);
         assert_eq!(flat, 0, "the adopted child {sid} has {flat} flat backup row(s)");
