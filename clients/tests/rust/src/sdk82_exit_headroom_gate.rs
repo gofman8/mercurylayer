@@ -1,26 +1,33 @@
-//! E2E (SDK_E2E=82): **[P0-1]** the exit-headroom admission gate, executed against a live SE.
+//! E2E (SDK_E2E=82): **a conveyed child has NO EPOCH TO RUN OUT OF, and the exit it is measured by
+//! is read from the SIGNED `nSequence` of every tier [B1].**
 //!
-//! THE DEFECT. The only bound a conveyed split child ever had was `lock_time > tip`
-//! (`lib/src/transfer/receiver.rs`, reached from `verify_conveyed_child`). But a child's unilateral
-//! exit is a chain of sequential relative timelocks — `2124·d + 2160` blocks on the mainnet schedule
-//! — while the funding epoch is only `lockheight_init` (10 000) blocks long. So for the last
-//! `WAIT(d)` blocks of EVERY epoch (43% of it at depth 1) a sender could hand a payee a coin that
-//! provably could not be materialised before the sender's own flat backup matures, spends the funding
-//! outpoint `F`, and voids the whole tree. The census balanced, Model A held, the coin was worthless.
+//! THE DEFECT THIS FILE WAS BORN FOR — [P0-1], the exit-headroom gate — was a property of the flat
+//! backup: a child's unilateral exit is a chain of relative timelocks, while the sender's flat
+//! backup matured at an ABSOLUTE height (`H_deposit + lockheight_init`), spent the funding outpoint
+//! `F` and voided the whole tree. For the last `WAIT(d)` blocks of every epoch a payee could be
+//! handed a child that provably could not be materialised, so the receiver had to refuse a child
+//! whose exit did not fit in the epoch that was left. That backup no longer exists: a coin's only
+//! exit material is its TES-R ladder, `coin.locktime` is `None` for life, nothing on the coin ever
+//! matures on its own, and the headroom gate is not consulted. What replaced the epoch as the
+//! admission bound is the split-depth cap measured against `initlock` as a FIXED window — a
+//! property of the child's SHAPE, not of the calendar.
 //!
-//! THE TEST. Alice deposits and ladders a coin, then the chain is mined forward until her coin's flat
-//! backup is only a few dozen blocks from maturing — less than the child's own exit needs. She pays
-//! Bob through the in-ladder split, which succeeds (nothing is wrong with the split itself). Bob's
-//! claim must then REFUSE the child, naming the shortfall, instead of adopting a coin he could never
-//! materialise. A control run on a FRESH epoch proves the gate is not simply refusing everything.
-//!
-//! **[B1] AND THE GATE'S OWN INPUT.** A gate is only as good as the term it computes with, and this
-//! one read `TesrTier::csv` — a plain serde field on the conveyed bundle. The second half of this
-//! test takes the child just refused, rewrites nothing but that field to `1` on every tier (no
-//! signature, no txid and no `nSequence` is touched), and shows two things: run against the DECLARED
-//! chain the gate ADMITS it — the bypass, executed rather than argued — and run against the shipped
-//! verifier it is refused BY NAME, because every timelock is now read from the signed transaction's
-//! `nSequence` and a bundle whose two copies disagree is rejected rather than believed on either.
+//! THE TEST, re-derived onto that rule:
+//!   * **CONTROL.** Alice's fresh laddered coin pays Bob through the in-ladder split; the receiver's
+//!     verifier ADMITS the piece (run over the real conveyed material, before Bob claims it) and
+//!     Bob adopts it. The piece's signed exit chain is the live regtest schedule
+//!     (`T 0 | X_m 12 | SP 0 | ext 12 | state 24`, five tiers, 53 blocks) — read from `nSequence`.
+//!   * **[B1] THE GATE'S OWN INPUT, FORGED.** A `TesrTier` carries its relative timelock twice — as
+//!     the serde field `csv` and inside the signed transaction's `nSequence`, the only copy Bitcoin
+//!     enforces. The same piece with only its declared `csv` fields rewritten to `1` (no signature,
+//!     txid or nSequence touched) is refused BY NAME: every timelock is bound to the signed copy and
+//!     a bundle whose two copies disagree is rejected rather than believed on either.
+//!   * **NO EPOCH.** A second coin is deposited and laddered, then the chain is mined `initlock + 60`
+//!     blocks past it — well past the height at which the old flat backup would have matured and
+//!     the old gate would have refused EVERY child of it. `estimate_exit_cost` reports
+//!     `wait_blocks: 0` and no deadline before the mining, the payment is made AFTER it, the
+//!     verifier admits the piece with no "exit-headroom shortfall", Bob adopts it, and the aged
+//!     coin's `F` is still unspent: nothing matured, because nothing on the coin can.
 //!
 //! Run: SDK_E2E=82 ML_NETWORK=regtest cargo run   (regtest stack up)
 
@@ -31,16 +38,15 @@ use electrum_client::ElectrumApi;
 use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 
 use crate::bitcoin_core;
+use crate::sdk40_tesr_consensus::is_outpoint_spent;
 
 const ALICE: &str = "sdk82_alice";
 const BOB: &str = "sdk82_bob";
 const DEPOSIT: u64 = 100_000;
 const PAY: u64 = 30_000;
-/// Blocks of epoch left when the doomed payment is made. Must be BELOW the regtest depth-1 exit wait
-/// (`T 0 | X_m 12 | SP 0 | ext 12 | state 24` = 48 blocks of timelock + 5 confirmations = 53 — `SP`
-/// is a [CATS] spine tier, so it contributes only its confirmation) and above zero, so the OLD
-/// `lock_time > tip` check still passes and only the new gate can refuse.
-const HEADROOM_LEFT: u32 = 40;
+/// Blocks mined PAST `initlock` before the aged payment. Under the old rule the flat backup matured
+/// AT `initlock`; anything past it is a coin whose every child the old gate refused outright.
+const PAST_EPOCH: u32 = 60;
 
 async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
@@ -52,12 +58,12 @@ async fn wallet(name: &str) -> Result<UtexoWallet> {
     Ok(w)
 }
 
-/// Deposit + ladder one coin for `w`, returning its statechain id.
+/// Deposit + ladder one coin for `w`, returning its statechain id and its funding outpoint.
 async fn laddered_coin(
     w: &UtexoWallet,
     cc: &mercuryrustlib::client_config::ClientConfig,
     name: &str,
-) -> Result<String> {
+) -> Result<(String, String, u32)> {
     let t = prepaid_token(cc).await?;
     w.add_prepaid_token(&t).await;
     let addr = w.get_deposit_address(DEPOSIT).await?;
@@ -76,251 +82,63 @@ async fn laddered_coin(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let sid = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, name)
+    let coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, name)
         .await?
         .coins
-        .iter()
+        .into_iter()
         .find(|c| {
             c.status == mercurylib::wallet::CoinStatus::CONFIRMED
                 && c.duplicate_index == 0
                 && c.amount == Some(DEPOSIT as u32)
         })
-        .and_then(|c| c.statechain_id.clone())
         .ok_or(anyhow!("{name} has no confirmed coin"))?;
+    let sid = coin.statechain_id.clone().ok_or(anyhow!("{name}'s coin has no statechain id"))?;
     assert!(
         mercuryrustlib::tesr::load(cc, name, &sid).await?.is_some(),
         "the coin must be laddered — this test is about the IN-LADDER split"
     );
-    Ok(sid)
-}
-
-/// The height at which this coin's flat backup can spend `F` and void the tree: the LOWEST locktime
-/// of its backup chain (the current owner's, INV-5).
-async fn epoch_expiry(
-    cc: &mercuryrustlib::client_config::ClientConfig,
-    wallet_name: &str,
-    sid: &str,
-) -> Result<u32> {
-    let backups = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, sid).await?;
-    backups
-        .iter()
-        .map(|b| mercurylib::utils::get_blockheight(b).map_err(|e| anyhow!("{e:?}")))
-        .collect::<Result<Vec<u32>>>()?
-        .into_iter()
-        .min()
-        .ok_or_else(|| anyhow!("coin {sid} has no flat backup"))
+    assert!(coin.locktime.is_none(), "a laddered coin has no absolute calendar: locktime must be None");
+    let f_txid = coin.utxo_txid.clone().ok_or(anyhow!("coin has no F txid"))?;
+    let f_vout = coin.utxo_vout.ok_or(anyhow!("coin has no F vout"))?;
+    Ok((sid, f_txid, f_vout))
 }
 
 fn tip(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<u32> {
     Ok(cc.electrum_client.block_headers_subscribe_raw()?.height as u32)
 }
 
-pub async fn execute() -> Result<()> {
-    for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
-        let _ = std::fs::remove_file(f);
-    }
-    let cc = mercuryrustlib::client_config::load().await;
-    let core = bitcoin_core::getnewaddress()?;
-
-    let alice = wallet(ALICE).await?;
-    let bob = wallet(BOB).await?;
-    let bob_address = bob.get_utexo_address().await?;
-
-    // ============================================================================================
-    // CONTROL: a coin in a FRESH epoch pays and is adopted normally. Without this the test below
-    // would pass just as well against a gate that refuses everything.
-    // ============================================================================================
-    let control_sid = laddered_coin(&alice, &cc, ALICE).await?;
-    let expiry = epoch_expiry(&cc, ALICE, &control_sid).await?;
-    let now = tip(&cc)?;
-    println!(
-        "SDK82 - control coin {control_sid}: epoch expires at {expiry}, tip {now} ({} blocks of \
-         headroom)",
-        expiry.saturating_sub(now)
-    );
-    alice
-        .in_ladder_pay(
-            &control_sid,
-            &bob_address,
-            PAY,
-            mercury_utexo_sdk::transfer::InLadderLatch::None,
-        )
-        .await?;
-    let mut waited = 0;
-    loop {
-        bob.claim().await?;
-        if bob.get_balance().await?.available_sats == PAY {
-            break;
-        }
-        waited += 1;
-        if waited > 30 {
-            return Err(anyhow!("the CONTROL payment was not adopted — the gate is over-refusing"));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    println!("SDK82 - control: a full-epoch child was ADOPTED normally ({PAY} sat)");
-
-    // The exit a depth-1 child needs, derived from the live regtest schedule the coins are built
-    // with: `T (no lock) | X_m E0 | SP 0 | ext_child E0 | state_child D0`, one confirmation per
-    // tier. Both halves of this flow are measured against it.
-    //
-    // [CATS] `SP` is a SPINE tier at `SPINE_CSV`, not the state at `D0 − δ`. The window this test
-    // steers into is only `required_wait` blocks wide, so this number is not decoration: when the
-    // spine landed and this still said `state_csv(1)`, the flow mined to a tip chosen for a 71-block
-    // requirement, left 56 blocks, and the gate — correctly — ADMITTED a child that now needs 53.
-    // The test read that as "THE DEFECT IS OPEN". Deriving the constant from the same source the
-    // builders sign is what keeps the failure honest.
-    let required_wait: u32 = {
-        let p = mercurylib::tesr::TesrParams::regtest();
-        mercurylib::transfer::receiver::exit_wait_blocks(&[
-            None,
-            Some(p.ext_csv(0)),
-            Some(mercuryrustlib::tesr::SPINE_CSV),
-            Some(p.ext_csv(0)),
-            Some(p.state_csv(0)),
-        ])
-    };
-    assert_eq!(required_wait, 53, "regtest depth-1 exit: 48 blocks of CSV + 5 confirmations");
-
-    // The SAME predicate the exploit half will be refused by, run over the control child's REAL
-    // conveyed material — so the refusal below is known to be discriminating on headroom rather than
-    // rejecting every conveyed bundle.
-    //
-    // ⚠️ TIMING IS PART OF THE CLAIM, so this runs HERE and not at the end of the flow. The exploit
-    // half drives the chain to within a few dozen blocks of the DOOMED coin's expiry, and the
-    // control coin was deposited first, so its epoch expires EARLIER still: by the time the exploit
-    // window opens the control child is genuinely out of headroom too, and asserting it is not would
-    // be asserting something false. "A full-epoch child is admitted" is a statement about a full
-    // epoch; it is made while there is one.
-    let control_rec = mercuryrustlib::tesr::journal_records_for(&cc, ALICE, &control_sid)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("the control split left no journal record"))?;
-    let alice_coins_at_control = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, ALICE).await?.coins;
-    let control_piece = control_rec
-        .children
-        .iter()
-        .position(|jc| {
-            !alice_coins_at_control.iter().any(|c| {
-                c.statechain_id.as_deref() == Some(jc.statechain_id.as_str())
-                    && mercurylib::transaction::get_user_backup_address(c, "regtest".to_string())
-                        .map(|a| a == jc.owner_exit_address)
-                        .unwrap_or(false)
-            })
-        })
-        .ok_or_else(|| anyhow!("the control split carved no recipient piece"))?;
-    let control_headroom = epoch_expiry(&cc, ALICE, &control_sid).await?.saturating_sub(tip(&cc)?);
-    assert!(
-        control_headroom > required_wait,
-        "the control must be checked while it really has a full epoch ({control_headroom} blocks \
-         left vs an exit needing {required_wait}) or it proves nothing"
-    );
-    // (Already adopted by bob, so the census terms have moved on; only the headroom term is under
-    // test here — it must not be the reason if this one fails.)
-    // [CATS change 2] Rebuild THAT leg as a piece. A root-lane record now also holds the sender's
-    // spine tip, which `bundles()` refuses wholesale — and `piece_bundle` refuses the tip's own index
-    // by name, so this can only ever be the recipient's leaf.
-    let control_piece_bundle = control_rec.piece_bundle(control_piece)?;
-    if let Err(e) = mercuryrustlib::tesr::verify_conveyed_child(
-        &cc,
-        &control_rec.children[control_piece].owner_exit_address,
-        &control_piece_bundle,
-    )
-    .await
-    {
-        assert!(
-            !e.to_string().contains("exit-headroom shortfall"),
-            "the control child, with {control_headroom} blocks of its epoch left and an exit needing \
-             far fewer, must never be refused for headroom: {e}"
-        );
-    }
-    println!(
-        "SDK82 - control: the gate ADMITS it on headroom ({control_headroom} blocks of epoch left)"
-    );
-
-    // ============================================================================================
-    // THE EXPLOIT: the same payment, made when the epoch is nearly over.
-    // ============================================================================================
-    let doomed_sid = laddered_coin(&alice, &cc, ALICE).await?;
-    let expiry = epoch_expiry(&cc, ALICE, &doomed_sid).await?;
-    let now = tip(&cc)?;
-
-    // Make the payment FIRST, while the epoch is still young. Nothing in the split itself is wrong
-    // — that is exactly why the missing gate was exploitable — and doing it now keeps the several
-    // SE round-trips it needs out of the narrow window opened below.
-    alice
-        .in_ladder_pay(
-            &doomed_sid,
-            &bob_address,
-            PAY,
-            mercury_utexo_sdk::transfer::InLadderLatch::None,
-        )
-        .await?;
-    println!(
-        "SDK82 - alice carved a child out of {doomed_sid} (epoch expires at {expiry}, tip {now})"
-    );
-
-    // Now walk the chain to the end of the coin's epoch. ONE bulk mine, then poll electrs; the final
-    // stretch is closed in small steps because the usable window is only `required_wait` blocks wide
-    // and this regtest chain may be mined concurrently by other work.
-    let bulk_target = (expiry - HEADROOM_LEFT).saturating_sub(400);
-    if bulk_target > now {
-        println!("SDK82 - mining {} blocks toward the end of the epoch", bulk_target - now);
-        bitcoin_core::generatetoaddress(bulk_target - now, &core)?;
+/// Mine the chain to `target` in chunks and wait until electrs has indexed it. A pending chunk is
+/// waited out, never re-issued, so a slow index cannot double-mine the stretch.
+async fn mine_to(cc: &mercuryrustlib::client_config::ClientConfig, core: &str, target: u32) -> Result<()> {
+    let mut mined_to = tip(cc)?;
+    while mined_to < target {
+        let step = (target - mined_to).min(200);
+        bitcoin_core::generatetoaddress(step, core)?;
+        mined_to += step;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
     let mut waited = 0;
-    while tip(&cc)? < bulk_target {
+    while tip(cc)? < target {
         waited += 1;
         if waited > 900 {
-            return Err(anyhow!("electrs did not catch up to {bulk_target}"));
+            return Err(anyhow!("electrs did not catch up to {target}"));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let mut steps = 0;
-    // `mined_to` is the height we have ALREADY asked for. Deciding to mine again from a tip that
-    // electrs has not indexed yet would mine the same stretch twice and sail straight past the
-    // window — so a pending mine is waited out, never re-issued.
-    let mut mined_to = 0u32;
-    let headroom = loop {
-        let t = tip(&cc)?;
-        let h = expiry.saturating_sub(t);
-        if h == 0 {
-            return Err(anyhow!(
-                "the epoch expired before the window could be used — this regtest chain is being \
-                 mined concurrently; re-run when it is quiet"
-            ));
-        }
-        if h < required_wait {
-            break h;
-        }
-        if t >= mined_to && h > required_wait + 40 {
-            let want = expiry - (required_wait - 15);
-            mined_to = want;
-            bitcoin_core::generatetoaddress(want - t, &core)?;
-        }
-        steps += 1;
-        if steps > 3_000 {
-            return Err(anyhow!("could not bring the tip into the exit-headroom window"));
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    // The OLD check (`lock_time > tip`) still passes here: the epoch has NOT expired. Only the new
-    // gate can refuse this coin, and it must.
-    println!(
-        "SDK82 - in the window: {headroom} blocks of epoch left (expiry {expiry}), but this child's \
-         exit needs {required_wait}"
-    );
+    Ok(())
+}
 
-    // Bob must REFUSE it. `claim()` swallows a per-message validation failure (other transfers must
-    // still land) and only prints it, so the refusal is read from the receiver's verifier directly,
-    // run over the REAL conveyed material: the piece bundle as rebuilt from the split's journal.
-    let rec = mercuryrustlib::tesr::journal_records_for(&cc, ALICE, &doomed_sid)
+/// The recipient's piece of `sid`'s most recent split — the child that does NOT pay a key of
+/// alice's own wallet — as (payee exit address, rebuilt piece bundle).
+async fn recipient_piece(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    sid: &str,
+) -> Result<(String, mercuryrustlib::tesr::ChildTesrBundle)> {
+    let rec = mercuryrustlib::tesr::journal_records_for(cc, ALICE, sid)
         .await?
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("the doomed split left no journal record"))?;
-    // The piece is the child that does NOT pay a key of alice's own wallet.
+        .ok_or_else(|| anyhow!("the split of {sid} left no journal record"))?;
     let alice_coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, ALICE).await?.coins;
     let piece_idx = rec
         .children
@@ -334,35 +152,100 @@ pub async fn execute() -> Result<()> {
             })
         })
         .ok_or_else(|| anyhow!("the split carved no recipient piece"))?;
+    // [CATS change 2] Rebuild THAT leg as a piece. A root-lane record also holds the sender's spine
+    // tip, which `bundles()` refuses wholesale — and `piece_bundle` refuses the tip's own index by
+    // name, so this can only ever be the recipient's leaf.
     let payee = rec.children[piece_idx].owner_exit_address.clone();
-    let piece_bundle = rec.piece_bundle(piece_idx)?;
-    let err = mercuryrustlib::tesr::verify_conveyed_child(&cc, &payee, &piece_bundle)
-        .await
-        .err()
-        .ok_or_else(|| {
-            anyhow!(
-                "THE DEFECT IS OPEN: the receiver's verifier ACCEPTED a child whose exit cannot \
-                 complete before the funding epoch expires"
-            )
-        })?;
-    let msg = err.to_string();
-    println!("SDK82 - the receiver's verifier REFUSED the child: {msg}");
-    assert!(
-        msg.contains("exit-headroom shortfall"),
-        "the refusal must be the headroom gate, not some unrelated failure: {msg}"
-    );
-    assert!(msg.contains("short by"), "the refusal must state the shortfall in blocks: {msg}");
+    let bundle = rec.piece_bundle(piece_idx)?;
+    Ok((payee, bundle))
+}
+
+/// Poll bob's claim until his balance is exactly `want`.
+async fn claim_until(bob: &UtexoWallet, want: u64, what: &str) -> Result<()> {
+    let mut waited = 0;
+    loop {
+        bob.claim().await?;
+        if bob.get_balance().await?.available_sats == want {
+            return Ok(());
+        }
+        waited += 1;
+        if waited > 30 {
+            return Err(anyhow!("{what}: bob's balance did not reach {want}"));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+pub async fn execute() -> Result<()> {
+    for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
+        let _ = std::fs::remove_file(f);
+    }
+    let cc = mercuryrustlib::client_config::load().await;
+    let core = bitcoin_core::getnewaddress()?;
+
+    let alice = wallet(ALICE).await?;
+    let bob = wallet(BOB).await?;
+    let bob_address = bob.get_utexo_address().await?;
+
+    // The exit a depth-1 child needs, derived from the live regtest schedule the coins are built
+    // with: `T (no lock) | X_m E0 | SP 0 | ext_child E0 | state_child D0`, one confirmation per
+    // tier. [CATS] `SP` is a SPINE tier at `SPINE_CSV`, not a state at `D0 − δ`.
+    let required_wait: u32 = {
+        let p = mercurylib::tesr::TesrParams::regtest();
+        mercurylib::transfer::receiver::exit_wait_blocks(&[
+            None,
+            Some(p.ext_csv(0)),
+            Some(mercuryrustlib::tesr::SPINE_CSV),
+            Some(p.ext_csv(0)),
+            Some(p.state_csv(0)),
+        ])
+    };
+    assert_eq!(required_wait, 53, "regtest depth-1 exit: 48 blocks of CSV + 5 confirmations");
 
     // ============================================================================================
-    // [B1] THE GATE'S OWN INPUT, FORGED — the bypass that made the refusal above optional.
-    //
-    // A `TesrTier` carries its relative timelock TWICE: as the serde field `csv` that travels with
-    // the conveyed bundle, and inside the signed transaction's `nSequence`, which is the only copy
-    // Bitcoin enforces. The gate read the FIELD. So the sender of the very coin just refused had
-    // only to declare `csv: 1` on each tier — touching no signature, no txid and no nSequence — for
-    // the requirement to collapse from the real 53 blocks to 9 and the coin to be admitted.
+    // CONTROL: a fresh coin pays, the verifier admits the piece over its REAL conveyed material,
+    // and bob adopts it. Without this the refusal below could be a verifier that refuses everything.
     // ============================================================================================
-    let mut forged = piece_bundle.clone();
+    let (control_sid, _, _) = laddered_coin(&alice, &cc, ALICE).await?;
+    alice
+        .in_ladder_pay(
+            &control_sid,
+            &bob_address,
+            PAY,
+            mercury_utexo_sdk::transfer::InLadderLatch::None,
+        )
+        .await?;
+    let (control_payee, control_piece_bundle) = recipient_piece(&cc, &control_sid).await?;
+    assert!(
+        control_piece_bundle.parent_flat_backups.is_empty(),
+        "a conveyed child carries NO flat backup beside its ladder (parent_flat_backups must be empty)"
+    );
+    let admitted = mercuryrustlib::tesr::verify_conveyed_child(&cc, &control_payee, &control_piece_bundle)
+        .await
+        .map_err(|e| anyhow!("the CONTROL child must be ADMITTED by the receiver's verifier: {e:#}"))?;
+    assert_eq!(admitted, PAY, "the verifier's census-bound exit value is the payment");
+    // [B1] The honest child's two copies of every timelock agree, and the requirement read off its
+    // SIGNATURES is the live schedule's.
+    let bound = mercuryrustlib::tesr::child_exit_chain_bound(&control_piece_bundle)
+        .map_err(|e| anyhow!("an honest bundle's declared timelocks match its signatures: {e:#}"))?;
+    let bound_csvs: Vec<Option<u16>> = bound.iter().map(|(_, csv)| *csv).collect();
+    assert_eq!(bound.len(), 5, "T | X_m | SP | ext_child | state_child");
+    assert_eq!(
+        mercurylib::transfer::receiver::exit_wait_blocks(&bound_csvs),
+        required_wait,
+        "the SIGNED chain of an honest child is the live regtest schedule"
+    );
+    claim_until(&bob, PAY, "CONTROL").await?;
+    println!(
+        "SDK82 - control: the verifier ADMITTED the child ({admitted} sat, signed exit {required_wait} blocks) and bob adopted it"
+    );
+
+    // ============================================================================================
+    // [B1] THE GATE'S OWN INPUT, FORGED. Rewrite ONLY the declared `csv` field on every tier of the
+    // control piece — no signature, txid or nSequence is touched — so that a verifier reading the
+    // FIELD would see a 9-block exit where the signatures commit to 53.
+    // ============================================================================================
+    let mut forged = control_piece_bundle.clone();
     for lvl in forged.parent.levels.iter_mut() {
         lvl.extension.csv = Some(1);
         lvl.state.csv = Some(1);
@@ -381,57 +264,33 @@ pub async fn execute() -> Result<()> {
     // Nothing that is signed has changed: same tier transactions, byte for byte.
     for (a, b) in mercuryrustlib::tesr::child_exit_chain(&forged)
         .iter()
-        .zip(mercuryrustlib::tesr::child_exit_chain(&piece_bundle).iter())
+        .zip(mercuryrustlib::tesr::child_exit_chain(&control_piece_bundle).iter())
     {
         assert_eq!(a.0, b.0, "the forgery must touch ONLY the declared field");
     }
-
-    // THE COUNTERFACTUAL, run rather than asserted in prose: feed the gate the DECLARED chain — what
-    // it used to read — and watch it admit the coin it had just refused.
     let declared: Vec<Option<u16>> = mercuryrustlib::tesr::child_exit_chain(&forged)
         .into_iter()
         .map(|(_, csv)| csv)
         .collect();
     let declared_required = mercurylib::transfer::receiver::exit_wait_blocks(&declared);
-    let now = tip(&cc)?;
-    if expiry <= now {
-        return Err(anyhow!(
-            "the epoch expired before the B1 counterfactual could be run — this regtest chain is \
-             being mined concurrently; re-run when it is quiet"
-        ));
-    }
     assert!(
         declared_required < required_wait,
-        "the forgery must actually shrink the requirement ({declared_required} vs {required_wait})"
-    );
-    let would_have_passed =
-        mercurylib::transfer::receiver::check_exit_headroom(&declared, now, expiry);
-    assert!(
-        would_have_passed.is_ok(),
-        "COUNTERFACTUAL VACUOUS: with {} blocks of epoch left the declared chain ({declared_required} \
-         blocks) would have been refused anyway, so this run proves nothing about the bypass — \
-         re-run on a quiet chain: {would_have_passed:?}",
-        expiry - now
-    );
-    println!(
-        "SDK82 - [B1] the OLD gate would have ADMITTED this child: declared exit {declared_required} \
-         blocks vs {} of epoch left (the SIGNED exit really needs {required_wait})",
-        expiry - now
+        "the forgery must actually shrink the DECLARED requirement ({declared_required} vs {required_wait})"
     );
 
-    // The receiver now refuses it, and the refusal names the mismatch rather than silently
-    // preferring one of the two values.
-    let err = mercuryrustlib::tesr::verify_conveyed_child(&cc, &payee, &forged)
+    // The receiver refuses it, and the refusal names the mismatch rather than silently preferring
+    // one of the two values.
+    let err = mercuryrustlib::tesr::verify_conveyed_child(&cc, &control_payee, &forged)
         .await
         .err()
         .ok_or_else(|| {
             anyhow!(
                 "B1 IS OPEN: the receiver ACCEPTED a child whose declared timelocks contradict the \
-                 nSequence its own signatures commit to — the headroom gate is bypassable by a \
-                 sender-declared field"
+                 nSequence its own signatures commit to — any bound computed from the declared \
+                 field is bypassable by the sender"
             )
         })?;
-    let msg = err.to_string();
+    let msg = format!("{err:#}");
     println!("SDK82 - [B1] the receiver's verifier REFUSED the forgery: {msg}");
     assert!(
         msg.contains("declared-CSV mismatch"),
@@ -446,61 +305,94 @@ pub async fn execute() -> Result<()> {
         msg.contains("parent level 0 extension"),
         "the refusal must name the tier that lied: {msg}"
     );
-
-    // (The control child's headroom was checked against the live verifier at the top of the flow,
-    // while its epoch was still full — see the note there for why it cannot be re-checked here.)
-
-    // [B1] And the binding is not simply refusing everything: the HONEST control child's two copies
-    // agree, and the requirement read off its signatures is the live schedule's.
-    let bound = mercuryrustlib::tesr::child_exit_chain_bound(&control_piece_bundle)
-        .expect("an honest bundle's declared timelocks match its signatures");
-    let bound_csvs: Vec<Option<u16>> = bound.iter().map(|(_, csv)| *csv).collect();
-    assert_eq!(bound.len(), 5, "T | X_m | SP | ext_child | state_child");
-    assert_eq!(
-        mercurylib::transfer::receiver::exit_wait_blocks(&bound_csvs),
-        required_wait,
-        "the SIGNED chain of an honest child is the live regtest schedule"
-    );
-    // The same forgery on the honest child is refused too — the binding is a property of the
-    // bundle, not of the coin's headroom.
-    let mut forged_control = control_piece_bundle.clone();
-    forged_control.child_state.csv = Some(1);
-    let ctrl_err = mercuryrustlib::tesr::child_exit_chain_bound(&forged_control)
+    // The binding is a property of the bundle, not of the coin: one forged field is enough.
+    let mut forged_one = control_piece_bundle.clone();
+    forged_one.child_state.csv = Some(1);
+    let one_err = mercuryrustlib::tesr::child_exit_chain_bound(&forged_one)
         .err()
-        .ok_or_else(|| anyhow!("B1 IS OPEN on a full-epoch child: the forgery was accepted"))?;
+        .ok_or_else(|| anyhow!("B1 IS OPEN: a single forged `csv` field was accepted by the binding"))?;
     assert!(
-        ctrl_err.to_string().contains("child state"),
-        "the refusal must name the forged tier: {ctrl_err}"
+        one_err.to_string().contains("child state"),
+        "the refusal must name the forged tier: {one_err}"
     );
-    println!(
-        "SDK82 - [B1] the honest control child binds cleanly ({} blocks of signed exit), and the \
-         same one-field forgery on it is refused: {ctrl_err}",
-        mercurylib::transfer::receiver::exit_wait_blocks(&bound_csvs)
-    );
+    println!("SDK82 - [B1] one forged field on the honest child is refused too: {one_err}");
 
-    // And the claim path agrees: bob's balance does not grow.
-    for _ in 0..3 {
-        bob.claim().await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    // ============================================================================================
+    // NO EPOCH: the same payment from a coin aged PAST `initlock`. Under the old rule this coin's
+    // flat backup matured at `H_deposit + initlock`, every child of it was refused for headroom
+    // from `initlock − 53` on, and `F` was spendable by the sender from `initlock` on. Under the
+    // rule nothing on the coin matures: the payment is admitted, adopted, and `F` stays unspent.
+    // ============================================================================================
+    let initlock = mercuryrustlib::utils::info_config(&cc).await?.initlock;
+    let (aged_sid, aged_f_txid, aged_f_vout) = laddered_coin(&alice, &cc, ALICE).await?;
+    let est = alice.estimate_exit_cost(&aged_sid).await?;
     assert_eq!(
-        bob.get_balance().await?.available_sats,
-        PAY,
-        "bob must still hold ONLY the control payment — the doomed child must never be adopted"
+        est.wait_blocks, 0,
+        "a laddered coin's exit has NO wait before it can start: `wait_blocks` must be 0, got {} (a flat backup \
+         would have reported ~{initlock})",
+        est.wait_blocks
+    );
+    assert!(
+        est.exit_deadline_block.is_none(),
+        "a laddered coin has no absolute deadline: exit_deadline_block must be None, got {:?}",
+        est.exit_deadline_block
+    );
+    let born = tip(&cc)?;
+    let target = born + initlock + PAST_EPOCH;
+    println!(
+        "SDK82 - aged coin {aged_sid} laddered at tip {born} (wait_blocks 0, no deadline); mining to {target} \
+         (initlock {initlock} + {PAST_EPOCH})"
+    );
+    mine_to(&cc, &core, target).await?;
+    let now = tip(&cc)?;
+    assert!(now >= born + initlock, "the chain must be past the old epoch: tip {now}, born {born}, initlock {initlock}");
+    assert!(
+        !is_outpoint_spent(&cc, &aged_f_txid, aged_f_vout),
+        "NOTHING MATURED: the aged coin's F must still be unspent after {initlock}+ blocks — there is no flat backup to spend it"
+    );
+
+    alice
+        .in_ladder_pay(
+            &aged_sid,
+            &bob_address,
+            PAY,
+            mercury_utexo_sdk::transfer::InLadderLatch::None,
+        )
+        .await
+        .map_err(|e| anyhow!("the SENDER refused a payment from a coin merely because it is old — there is no epoch: {e:#}"))?;
+    let (aged_payee, aged_piece) = recipient_piece(&cc, &aged_sid).await?;
+    assert!(aged_piece.parent_flat_backups.is_empty(), "no flat backup rides with the aged child either");
+    let aged_admitted = mercuryrustlib::tesr::verify_conveyed_child(&cc, &aged_payee, &aged_piece)
+        .await
+        .map_err(|e| {
+            let m = format!("{e:#}");
+            if m.contains("exit-headroom shortfall") {
+                anyhow!("THE CALENDAR IS BACK: the receiver refused a child of a {}-block-old coin for exit headroom — there is no epoch to run out of: {m}", now - born)
+            } else {
+                anyhow!("the receiver must ADMIT a child of a coin {} blocks old exactly as it admits a fresh one: {m}", now - born)
+            }
+        })?;
+    assert_eq!(aged_admitted, PAY, "the aged child's census-bound exit value is the payment");
+    claim_until(&bob, 2 * PAY, "AGED").await?;
+    assert!(
+        !is_outpoint_spent(&cc, &aged_f_txid, aged_f_vout),
+        "the in-ladder split is off-chain: the aged coin's F is still unspent after the payment"
+    );
+    println!(
+        "SDK82 - NO EPOCH: a child of a coin {} blocks old ({initlock}+{PAST_EPOCH} past its deposit) was ADMITTED and adopted; F unspent",
+        now - born
     );
 
     println!(
-        "SDK82 - SUCCESS [B1]: the headroom requirement is now computed from the SIGNED nSequence of \
-         every tier, so the refusal above cannot be lifted by re-declaring the bundle's `csv` \
-         fields — the forged child is refused by name, and an honest one still binds and is still \
-         admitted."
+        "SDK82 - SUCCESS [B1]: every timelock the receiver measures is read from the SIGNED nSequence \
+         of the tier, so a sender cannot shrink a child's exit by re-declaring the bundle's `csv` \
+         fields — the forged child is refused by name, and an honest one binds and is admitted."
     );
     println!(
-        "SDK82 - SUCCESS [P0-1]: the receiver now refuses a conveyed child whose unilateral exit \
-         cannot complete before the funding epoch expires, naming the shortfall, while an identical \
-         payment in a fresh epoch is adopted normally. The window this closes is the last WAIT(d) \
-         blocks of every epoch — 43% of it at mainnet depth 1 — during which every in-ladder payment \
-         handed the payee a coin that provably could not be materialised."
+        "SDK82 - SUCCESS [NO EPOCH]: a conveyed child has no funding epoch to fit inside. The flat \
+         backup that used to mature at H_deposit + initlock and void the tree does not exist, so a \
+         payment from a coin {initlock}+{PAST_EPOCH} blocks old is admitted exactly like a fresh one, \
+         and the coin's F is never spent by anything that merely aged."
     );
     Ok(())
 }

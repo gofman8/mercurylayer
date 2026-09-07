@@ -10,6 +10,13 @@
 //! C3: attacker latches an UNDERSIZED coin addressed to the SSP -> value < invoice+fee -> REFUSED.
 //! In both cases NO Lightning payment must go out and the merchant invoice must NOT settle.
 //!
+//! On the ONE coin shape: alice's two exact coins are laddered at first sight (3 co-signs each, no
+//! flat backup row, `locktime == None`), and each latched conveyance carries `backup_transactions:
+//! []`. The SSP's pre-pay census (`peek_pending_transfers` → `verify_flat_backup_lane` +
+//! `verify_bundle_bound` with the flat term ZERO) therefore ADMITS C3's coin — `ladder_census_ok`
+//! is true and no census refusal is recorded — so the refusal C3 pins is the VALUE gate alone,
+//! reached only because the census passed over an empty flat vector.
+//!
 //! Requires the deployed `/transfer/batch_statechains` route (P0-2).
 //! Run: SDK_E2E=20 ML_NETWORK=regtest RLN_REGTEST=.../regtest.sh cargo run
 
@@ -92,7 +99,25 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    println!("SDK20 - SSP + attacker(alice) + third-party(bob) ready");
+    // Both coins are laddered at first sight: exactly 3 co-signs, no flat row, no calendar. This is
+    // the shape every latched conveyance below is built from.
+    let alice_coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk20_alice").await?.coins;
+    let mut laddered = 0usize;
+    for c in alice_coins.iter().filter(|c| c.status == mercuryrustlib::CoinStatus::CONFIRMED && c.duplicate_index == 0) {
+        let sid = c.statechain_id.clone().ok_or_else(|| anyhow!("confirmed coin without a statechain id"))?;
+        assert!(
+            mercuryrustlib::tesr::load(&cc, "sdk20_alice", &sid).await?.is_some(),
+            "alice's coin {sid} ({:?} sat) must carry a TES-R ladder — there is no un-laddered lane", c.amount
+        );
+        let n = mercuryrustlib::utils::get_statechain_info(&sid, &cc).await?.ok_or_else(|| anyhow!("no /info/statechain for {sid}"))?.num_sigs;
+        assert_eq!(n, 3, "alice's coin {sid}: a fresh deposit is exactly T + X_0 + S_0 on the enclave (no tx1), got {n}");
+        let flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk20_alice", &sid).await?.map(|r| r.len()).unwrap_or(0);
+        assert_eq!(flat, 0, "alice's coin {sid} has {flat} flat backup row(s); a laddered coin has none");
+        assert!(c.locktime.is_none(), "alice's coin {sid} carries locktime {:?}; a laddered coin has no calendar", c.locktime);
+        laddered += 1;
+    }
+    assert_eq!(laddered, 2, "alice holds exactly her two exact laddered coins");
+    println!("SDK20 - SSP + attacker(alice) + third-party(bob) ready; alice's 2 coins laddered (num_sigs 3, no flat row, no calendar)");
 
     // ---- C2: coin addressed to bob, not the SSP -------------------------------------------------
     let invoice_c2 = merchant_node.ln_invoice(25_000_000, None, 3600).await?;
@@ -164,6 +189,29 @@ pub async fn execute() -> Result<()> {
         "Succeeded",
         "C3: the invoice must NOT have been paid"
     );
+    // The refusal above was the VALUE gate, which sits BEHIND the pre-pay ladder census. Read the
+    // census verdict directly: C3's coin was conveyed with `backup_transactions: []` and a ladder
+    // bound to the coin and exiting to the SSP's key, so the census ADMITS it — a refusal recorded
+    // here would mean C3 never reached the value gate and the "below the required" text above was
+    // reported for a coin the census had already thrown out.
+    let ssp_pending = mercuryrustlib::transfer_receiver::peek_pending_transfers(ssp.wallet.client_config(), ssp.wallet.wallet_name()).await?;
+    let p_c3 = ssp_pending
+        .iter()
+        .find(|p| p.statechain_id == coin_c3)
+        .ok_or_else(|| anyhow!("C3: the latched coin {coin_c3} must be in the SSP's pending set (it was addressed to the SSP)"))?;
+    assert!(
+        p_c3.ladder_census_ok,
+        "C3: the pre-pay ladder census must ADMIT a laddered coin conveyed with an EMPTY flat backup vector; it refused: {:?}",
+        p_c3.ladder_census_refusal
+    );
+    assert!(p_c3.ladder_census_refusal.is_none(), "C3: no census refusal may be recorded for an admitted coin: {:?}", p_c3.ladder_census_refusal);
+    assert_eq!(p_c3.amount, 10_000, "C3: the census-bound value the SSP measured is the coin's real 10000 sat");
+    assert!(p_c3.branch_txs.is_empty(), "C3: a laddered conveyance carries no branch material");
+    assert!(
+        !ssp_pending.iter().any(|p| p.statechain_id == coin_c2),
+        "C2: the coin latched to BOB must NOT appear in the SSP's pending set — being addressed to us is established by decryption"
+    );
+    println!("SDK20 - C3's coin passed the pre-pay ladder census (flat term 0, {} sat bound) and was refused on VALUE alone; C2's coin is not in the SSP's set", p_c3.amount);
 
     // The SSP sent no Lightning money on either attack.
     let (st_c2, _) = ssp.rln.payment(&hash_c2).await.unwrap_or(("None".into(), None));

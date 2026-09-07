@@ -4,6 +4,24 @@ use anyhow::{anyhow, Result};
 use mercurylib::{transfer::sender::{ExternalPaymentHashRequestPayload, PaymentHashRequestPayload, PaymentHashResponsePayload, TransferPreimageRequestPayload, TransferPreimageResponsePayload, UnlockByPreimageRequestPayload}, wallet::CoinStatus};
 use serde::{Deserialize, Serialize};
 
+/// The row of `wallet` to act on for `statechain_id`.
+///
+/// A statechain id can sit on several rows of one wallet (a coin re-received after an earlier hop
+/// keeps its older TRANSFERRED row beside the live one). The rows used to be told apart by
+/// locktime; a coin carries no absolute locktime any more — its ladder is its only exit material —
+/// so the LIVE row (CONFIRMED or IN_TRANSFER) is preferred, and with none the first row is returned
+/// so the caller's own status check names what it found.
+fn coin_row_index(wallet: &mercurylib::wallet::Wallet, statechain_id: &str) -> Option<usize> {
+    let sid = |c: &mercurylib::wallet::Coin| c.statechain_id.as_deref() == Some(statechain_id);
+    wallet
+        .coins
+        .iter()
+        .position(|c| {
+            sid(c) && (c.status == CoinStatus::CONFIRMED || c.status == CoinStatus::IN_TRANSFER)
+        })
+        .or_else(|| wallet.coins.iter().position(sid))
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct CreatePreImageResponse {
     pub hash: String,
@@ -19,10 +37,7 @@ pub async fn create_pre_image(
 
     let mut wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
-    let coin = wallet.coins
-        .iter_mut()
-        .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
-        .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
+    let coin = coin_row_index(&wallet, statechain_id).map(|i| &mut wallet.coins[i]);
 
     if coin.is_none() {
         return Err(anyhow!("No coins associated with this statechain ID were found"));
@@ -36,10 +51,6 @@ pub async fn create_pre_image(
 
     if coin.status != CoinStatus::CONFIRMED && coin.status != CoinStatus::IN_TRANSFER {
         return Err(anyhow::anyhow!("Coin status must be CONFIRMED or IN_TRANSFER to transfer it. The current status is {}", coin.status));
-    }
-
-    if coin.locktime.is_none() {
-        return Err(anyhow::anyhow!("coin.locktime is None"));
     }
 
     let signed_statechain_id = coin.signed_statechain_id.as_ref().unwrap();
@@ -77,10 +88,7 @@ pub async fn confirm_pending_invoice(client_config: &ClientConfig, wallet_name: 
 
     let mut wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
-    let coin = wallet.coins
-        .iter_mut()
-        .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
-        .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
+    let coin = coin_row_index(&wallet, statechain_id).map(|i| &mut wallet.coins[i]);
 
     if coin.is_none() {
         return Err(anyhow!("No coins associated with this statechain ID were found"));
@@ -114,10 +122,7 @@ pub async fn retrieve_pre_image(client_config: &ClientConfig, wallet_name: &str,
 
     let mut wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
-    let coin = wallet.coins
-        .iter_mut()
-        .filter(|tx| tx.statechain_id == Some(statechain_id.to_string())) // Filter coins with the specified statechain_id
-        .min_by_key(|tx| tx.locktime.unwrap_or(u32::MAX)); // Find the one with the lowest locktime
+    let coin = coin_row_index(&wallet, statechain_id).map(|i| &mut wallet.coins[i]);
 
     if coin.is_none() {
         return Err(anyhow!("No coins associated with this statechain ID were found"));
@@ -208,11 +213,8 @@ pub async fn create_external_hash_latch(
     let batch_id = uuid::Uuid::new_v4().to_string();
 
     let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let coin = wallet
-        .coins
-        .iter()
-        .filter(|c| c.statechain_id == Some(statechain_id.to_string()))
-        .min_by_key(|c| c.locktime.unwrap_or(u32::MAX))
+    let coin = coin_row_index(&wallet, statechain_id)
+        .map(|i| &wallet.coins[i])
         .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
 
     if coin.status != CoinStatus::CONFIRMED && coin.status != CoinStatus::IN_TRANSFER {
@@ -274,11 +276,8 @@ pub async fn set_spend_budget(
     remaining: i32,
 ) -> Result<()> {
     let wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
-    let coin = wallet
-        .coins
-        .iter()
-        .filter(|c| c.statechain_id == Some(statechain_id.to_string()))
-        .min_by_key(|c| c.locktime.unwrap_or(u32::MAX))
+    let coin = coin_row_index(&wallet, statechain_id)
+        .map(|i| &wallet.coins[i])
         .ok_or_else(|| anyhow!("No coins associated with this statechain ID were found"))?;
     // Audit [15]: single-use, endpoint-bound owner auth (not the static signed_statechain_id).
     let auth_sig = crate::utils::fresh_auth(client_config, statechain_id, coin, "statechain/spend_budget").await?;

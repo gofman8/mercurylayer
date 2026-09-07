@@ -268,7 +268,7 @@ pub async fn execute() -> Result<()> {
     );
     assert!(
         mercuryrustlib::tesr::load_child(&cc, "sdk69_alice", &alice_change_sid).await?.is_none(),
-        "alice's own change leg is keyed `ctesr-`, the payee-leaf key — the flat-lane licence, the \
+        "alice's own change leg is keyed `ctesr-`, the payee-leaf key — the conveyance lane, the \
          carrier exit allowlist and the tower's child loop all read that key as someone else's coin"
     );
     // The batch appears in payment history (an in-ladder piece never goes through transfer_sender).

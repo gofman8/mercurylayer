@@ -2,15 +2,20 @@
 //!
 //! Every prior TES-R E2E (sdk47/49/50/52) exercised an HONEST sender, so they were all green while the
 //! linchpin was exploitable. This test attacks it directly, against a REAL ladder co-signed by the live
-//! SE.
+//! SE — the one the DEPOSIT established at first mempool sight of F (T, X_0, S_0), loaded from disk,
+//! never re-established.
 //!
-//! The count `expected = flat_backups + tiers + superseded_states + superseded_extensions` is what stops a
-//! sender from hiding a co-signed low-CSV state that pays themselves. If a sender can inflate `expected`
-//! by ONE, they can hold a hidden state, get the receiver to accept, then broadcast it and take the coin
-//! back. Before the fix, `superseded_*` were only `.len()`-counted — never parsed, ladder-linked or
-//! signature-checked — and the CSV race-check skipped `csv: None`. Each attack below made `expected`
-//! match an inflated `num_sigs` and was **ACCEPTED**; all must now be **REJECTED**, while the honest
-//! bundle still verifies.
+//! The count `expected = tiers + superseded_states + superseded_extensions` — with NO flat term: a
+//! laddered coin has no `tx1`, its three deposit co-signs are all tiers, and the receiver passes
+//! `flat_backups = 0` — is what stops a sender from hiding a co-signed low-CSV state that pays
+//! themselves. If a sender can inflate `expected` by ONE, they can hold a hidden state, get the
+//! receiver to accept, then broadcast it and take the coin back. Before the fix, `superseded_*` were
+//! only `.len()`-counted — never parsed, ladder-linked or signature-checked — and the CSV race-check
+//! skipped `csv: None`. Each attack below made `expected` match an inflated `num_sigs` and was
+//! **ACCEPTED**; all must now be **REJECTED**, while the honest bundle still verifies. Two attacks
+//! target the retired flat term itself: a flat term of 1 budgeted against a laddered coin (the old
+//! deposit-`tx1` baseline — exactly one free census slot) and a flat backup CONVEYED beside the
+//! ladder (ATTACK H, `verify_flat_backup_lane`), which the receiver must refuse by name.
 //!
 //! Run with SDK_E2E=54 (needs the regtest + Mercury lockbox stack, Core 28+).
 
@@ -26,7 +31,8 @@ const NETWORK: &str = "regtest";
 /// Assert a tampered bundle is refused, and surface WHY (a reject for the wrong reason is not a pass).
 ///
 /// `se` is the SE's reported `num_sigs`; the third argument is `verify_bundle`'s `flat_backups` term —
-/// the number of signed-once backup transactions conveyed with the coin. `expect` is a substring of
+/// ZERO for every laddered coin (no `tx1` is co-signed at deposit and none at any hop; the receiver
+/// passes 0). It is a parameter here only so the retired baseline can be shown NOT to balance. `expect` is a substring of
 /// the NAMED error the attack targets: a rejection carrying any other message means the check under
 /// test never ran, so the test fails rather than reporting a safety it did not observe.
 fn must_reject(
@@ -57,19 +63,28 @@ pub async fn execute() -> Result<()> {
     env::set_var("ML_NETWORK", "regtest");
     let cc = mercuryrustlib::client_config::load().await;
 
-    // --- A REAL ladder, co-signed by the live SE. -------------------------------------------------
+    // --- A REAL ladder, co-signed by the live SE: the one the DEPOSIT established at sight. --------
+    // Loaded, not re-established — a second ladder over F would be three more irreversible co-signs
+    // the census could never account for.
     let mut alice = deposit_coin(&cc, "sdk54_alice").await?;
     let sid = alice.statechain_id.clone().ok_or(anyhow!("no statechain_id"))?;
-    let exit_addr = crate::bitcoin_core::getnewaddress()?;
-    let bundle = mercuryrustlib::tesr::establish_auto(&cc, &mut alice, &exit_addr, NETWORK).await?;
+    let bundle = mercuryrustlib::tesr::load(&cc, "sdk54_alice", &sid)
+        .await?
+        .ok_or(anyhow!("the deposit must have been laddered at first sight — it has no other exit material"))?;
     let se = mercuryrustlib::utils::get_statechain_info(&sid, &cc)
         .await?
         .ok_or(anyhow!("no statechain_info"))?
         .num_sigs;
+    assert_eq!(se, 3, "a deposited coin's enclave count is exactly its three tiers (T, X_0, S_0) — no tx1");
 
-    // Control: the honest bundle verifies (flat_backups = 1, the deposit tx1).
-    verify_bundle(&bundle, se, 1).map_err(|e| anyhow!("honest bundle must verify, got: {e}"))?;
-    println!("SDK54 - control: honest bundle verifies (num_sigs={se})");
+    // Control: the honest bundle verifies with the flat term 0 (the three co-signs are the tiers).
+    verify_bundle(&bundle, se, 0).map_err(|e| anyhow!("honest bundle must verify, got: {e}"))?;
+    println!("SDK54 - control: honest bundle verifies (num_sigs={se}, flat term 0)");
+
+    // --- ATTACK 0: the RETIRED flat term. A verifier that still budgets one deposit `tx1` hands every
+    // coin one free census slot: at the honest count it refuses every honest coin, and at count+1 it
+    // launders exactly one hidden state. Neither may balance.
+    must_reject(&bundle, se, 1, "ATTACK 0 (a flat term of 1 — the retired deposit tx1 — at the honest count)", "num_sigs mismatch")?;
 
     // --- ATTACK A: pad with a junk entry to absorb ONE hidden co-signed state. ----------------------
     // The sender's real num_sigs is se+1 (one hidden low-CSV state paying themselves). They pad one
@@ -82,7 +97,7 @@ pub async fn execute() -> Result<()> {
         csv: None,
         payload_vout: 0,
     });
-    must_reject(&a, se + 1, 1, "ATTACK A (junk padding: empty signed_tx + csv:None)", "not a transaction")?;
+    must_reject(&a, se + 1, 0, "ATTACK A (junk padding: empty signed_tx + csv:None)", "not a transaction")?;
 
     // --- ATTACK B: a REAL LIVE tier replayed as a superseded state (with csv: None). -----------------
     // Historically this probed the `csv: None` skip in the maturity race-check; since [C-2] the tier is
@@ -96,7 +111,7 @@ pub async fn execute() -> Result<()> {
     must_reject(
         &b,
         se + 1,
-        1,
+        0,
         "ATTACK B (a LIVE tier replayed as superseded — [C-2] dedup)",
         "is disclosed more than once",
     )?;
@@ -120,7 +135,7 @@ pub async fn execute() -> Result<()> {
         };
         c.superseded_states.push(forged);
     }
-    must_reject(&c, se + 1, 1, "ATTACK C (well-formed but never-co-signed tier)", "is not co-signed by A")?;
+    must_reject(&c, se + 1, 0, "ATTACK C (well-formed but never-co-signed tier)", "is not co-signed by A")?;
 
     // --- ATTACK D: the LIVE state replayed as a superseded one. -------------------------------------
     // Same story as B: since [C-2] this is caught by the dedup rather than the maturity race. The race
@@ -131,7 +146,7 @@ pub async fn execute() -> Result<()> {
     must_reject(
         &d,
         se + 1,
-        1,
+        0,
         "ATTACK D (the LIVE state replayed as superseded — [C-2] dedup)",
         "is disclosed more than once",
     )?;
@@ -145,7 +160,7 @@ pub async fn execute() -> Result<()> {
     must_reject(
         &e,
         se + 1,
-        1,
+        0,
         "ATTACK E (the LIVE extension replayed as superseded — [C-2] dedup)",
         "is disclosed more than once",
     )?;
@@ -158,13 +173,13 @@ pub async fn execute() -> Result<()> {
     must_reject(
         &f,
         se + 1,
-        1,
+        0,
         "ATTACK F (the LIVE trigger replayed as superseded — [C-2] dedup)",
         "is disclosed more than once",
     )?;
 
     // --- The honest bundle is still accepted after all of that. -------------------------------------
-    verify_bundle(&bundle, se, 1).map_err(|e| anyhow!("honest bundle must still verify, got: {e}"))?;
+    verify_bundle(&bundle, se, 0).map_err(|e| anyhow!("honest bundle must still verify, got: {e}"))?;
 
     // --- TRANSITIVE-DEATH path (renew supersedes BOTH the extension and the state). ------------------
     // After a renew the old state spends the OLD (superseded) extension's out[0], which no LIVE tier
@@ -176,7 +191,7 @@ pub async fn execute() -> Result<()> {
         .await?
         .ok_or(anyhow!("no statechain_info"))?
         .num_sigs;
-    verify_bundle(&renewed, se_renew, 1)
+    verify_bundle(&renewed, se_renew, 0)
         .map_err(|e| anyhow!("renewed bundle must verify (transitive-death ACCEPT path), got: {e}"))?;
     println!("SDK54 - control: renewed bundle verifies — superseded state over a dead extension ACCEPTED (num_sigs={se_renew})");
 
@@ -191,10 +206,46 @@ pub async fn execute() -> Result<()> {
     must_reject(
         &g,
         se_renew - 1,
-        1,
+        0,
         "ATTACK G (superseded state with no disclosed dead parent)",
         "spends an outpoint outside this ladder",
     )?;
+
+    // --- ATTACK H: a flat backup CONVEYED beside the ladder (`verify_flat_backup_lane`). ------------
+    // The census has no flat term, so the one place a sender could still smuggle a co-sign into a
+    // receiver's arithmetic is the transfer message's `backup_transactions` vector — the vector the
+    // old `flat_backups = 1` baseline was read from. One entry there is a co-sign the census cannot
+    // account for and, matured, a spend of F a prior owner keeps. Every laddered conveyance (claim
+    // path and pre-pay path) runs `verify_flat_backup_lane` on that vector: it must refuse a
+    // non-empty one BY NAME and admit the empty vector the sender actually conveys.
+    {
+        let smuggled = mercurylib::wallet::BackupTx {
+            tx_n: 1,
+            tx: bundle.trigger.signed_tx.clone(),
+            client_public_nonce: String::new(),
+            server_public_nonce: String::new(),
+            client_public_key: String::new(),
+            server_public_key: String::new(),
+            blinding_factor: String::new(),
+            rgb_consignment: None,
+            rgb_blinding: None,
+        };
+        match mercuryrustlib::tesr::verify_flat_backup_lane(&bundle, &[smuggled]) {
+            Ok(()) => return Err(anyhow!("SECURITY: ATTACK H (a flat backup conveyed beside the ladder) was ACCEPTED")),
+            Err(e) => {
+                let msg = e.to_string();
+                let expect = "refusing a plain ladder conveyed with 1 flat backup transaction(s)";
+                if !msg.contains(expect) {
+                    return Err(anyhow!(
+                        "ATTACK H was rejected for the WRONG reason — expected an error containing {expect:?}, got: {msg}"
+                    ));
+                }
+                println!("SDK54 - ATTACK H (a flat backup conveyed beside the ladder) correctly REJECTED: {msg}");
+            }
+        }
+        mercuryrustlib::tesr::verify_flat_backup_lane(&bundle, &[])
+            .map_err(|e| anyhow!("the EMPTY backup vector every laddered conveyance carries must be admitted: {e}"))?;
+    }
 
     // ================= GENUINE RIVALS: the checks the [C-2] dedup would otherwise hide =================
     //
@@ -261,7 +312,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &b2,
             se + 1,
-            1,
+            0,
             "ATTACK B' (a genuinely co-signed rival state declared with csv:None)",
             "no CSV declared",
         )?;
@@ -277,7 +328,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &d2,
             se + 1,
-            1,
+            0,
             "ATTACK D' (a genuinely co-signed rival state that TIES the live state's CSV)",
             "race",
         )?;
@@ -320,7 +371,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &e2,
             se + 1,
-            1,
+            0,
             "ATTACK E' (a genuinely co-signed rival EXTENSION that ties the live extension's CSV)",
             "race",
         )?;
@@ -355,17 +406,17 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &f2,
             se + 1,
-            1,
+            0,
             "ATTACK F' (a genuinely co-signed rival rooted at F — contends with no live tier)",
             "orphan/threat branch",
         )?;
     }
 
     // --- The honest bundle is STILL accepted at its own count after the genuine-rival battery. --------
-    verify_bundle(&bundle, se, 1)
+    verify_bundle(&bundle, se, 0)
         .map_err(|e| anyhow!("honest bundle must still verify after the genuine rivals, got: {e}"))?;
     println!("SDK54 - control: the honest bundle still verifies after the genuine-rival battery");
 
-    println!("SDK54 - ✓ PASS: the count is unpaddable — junk, duplicate-disclosure, never-co-signed and parentless entries are REJECTED, and so are GENUINELY CO-SIGNED rivals: csv:None, a state tying the live CSV, an extension tying the live CSV, and a timelocked rival rooted at F. Honest and renewed bundles verify.");
+    println!("SDK54 - ✓ PASS: the count is unpaddable with the flat term 0 — the retired deposit-tx1 term, a conveyed flat backup, junk, duplicate-disclosure, never-co-signed and parentless entries are REJECTED, and so are GENUINELY CO-SIGNED rivals: csv:None, a state tying the live CSV, an extension tying the live CSV, and a timelocked rival rooted at F. Honest and renewed bundles verify.");
     Ok(())
 }

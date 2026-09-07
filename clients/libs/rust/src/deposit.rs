@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result, Ok};
-use mercurylib::{deposit::{create_deposit_msg1_with_options, create_aggregated_address}, wallet::{Wallet, BackupTx, Coin}, transaction:: get_user_backup_address, utils::get_blockheight};
+use mercurylib::{deposit::{create_deposit_msg1_with_options, create_aggregated_address}, wallet::{Wallet, Coin}};
 
-use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}, transaction::new_transaction, utils::info_config};
+use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}};
 
 pub async fn get_deposit_bitcoin_address(client_config: &ClientConfig, wallet_name: &str, token_id: &str, amount: u32) -> Result<String> {
     get_deposit_bitcoin_address_inner(client_config, wallet_name, token_id, amount, false, None).await
@@ -40,62 +40,6 @@ async fn get_deposit_bitcoin_address_inner(client_config: &ClientConfig, wallet_
     update_wallet(&client_config.pool, &wallet).await?;
 
     Ok(aggregated_public_key.aggregate_address)
-}
-
-// When sending duplicated coins, the tx_n of the backup_tx must be different
-pub async fn create_tx1(client_config: &ClientConfig, coin: &mut Coin, wallet_netwotk: &str, tx_n: u32) -> Result<BackupTx> {
-
-    let to_address = get_user_backup_address(&coin, wallet_netwotk.to_string())?;
-
-    let server_info = info_config(&client_config).await?;
-
-    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate {
-        client_config.max_fee_rate
-    } else {
-        server_info.fee_rate_sats_per_byte
-    };
-
-    let signed_tx = new_transaction(
-        &client_config, 
-        coin, 
-        &to_address, 
-        0, 
-        false, 
-        None, 
-        wallet_netwotk, 
-        fee_rate_sats_per_byte, 
-        server_info.initlock,
-        server_info.interval
-    ).await?;
-
-    if coin.public_nonce.is_none() {
-        return Err(anyhow::anyhow!("coin.public_nonce is None"));
-    }
-
-    if coin.blinding_factor.is_none() {
-        return Err(anyhow::anyhow!("coin.blinding_factor is None"));
-    }
-
-    if coin.statechain_id.is_none() {
-        return Err(anyhow::anyhow!("coin.statechain_id is None"));
-    }
-
-    let backup_tx = BackupTx {
-        tx_n,
-        tx: signed_tx,
-        client_public_nonce: coin.public_nonce.as_ref().unwrap().to_string(),
-        server_public_nonce: coin.server_public_nonce.as_ref().unwrap().to_string(),
-        client_public_key: coin.user_pubkey.clone(),
-        server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
-        blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
-        rgb_consignment: None,
-        rgb_blinding: None,
-    };
-
-    let block_height = Some(get_blockheight(&backup_tx)?);
-    coin.locktime = block_height;
-
-    Ok(backup_tx)
 }
 
 pub async fn init(client_config: &ClientConfig, wallet: &Wallet, token_id: uuid::Uuid, single_use: bool, epoch_deadline: Option<u64>) -> Result<Wallet> {

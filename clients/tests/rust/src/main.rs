@@ -11,16 +11,8 @@ pub mod tb04_simple_lightning_latch;
 pub mod tb05_timelock;
 pub mod tm01_sender_double_spends;
 mod tv01;
-pub mod rgb01_offchain_split;
-pub mod rgb02_combine_transfer;
-pub mod rgb03_offchain_chain;
 pub mod rgb04_single_use;
-pub mod rgb05_combine3;
-pub mod rgb06_dag3;
 pub mod rgb07_epoch;
-pub mod rgb08_wide_combine;
-pub mod rgb09_send_receive_blinded_witness;
-pub mod rgb10_history_and_selftransfer;
 pub mod rgb11_issue_schemas_uda_cfa;
 pub mod rgb12_validate_offchain_negative;
 pub mod rgb13_consignment_integrity;
@@ -88,12 +80,10 @@ pub mod sdk69_transfer_many_inladder;
 pub mod sdk70_verifier_binding_adversarial;
 pub mod sdk71_unconditional_ladder;
 pub mod sdk72_watchtower_failloud;
-pub mod sdk73_structural_recovery;
 pub mod sdk74_colored_ladder;
 pub mod sdk75_colored_exit;
 pub mod sdk76_received_parent_split;
 pub mod sdk77_colored_inladder_split;
-pub mod sdk78_uncolourable_carrier;
 pub mod sdk79_split_watchtower;
 pub mod sdk80_plain_child_split_watchtower;
 pub mod sdk81_inladder_split_recovery;
@@ -227,9 +217,9 @@ async fn main() -> Result<()> {
         sdk32_token_over_time::execute().await?;
         return Ok(());
     }
-    // Token-carrier watchtower (SDK_E2E=34): auto_exit_due now auto-materializes a received token
-    // carrier before its clawback deadline (branch-only), defeating the sender's stale-backup
-    // clawback; issued/flat carriers (no branch) are left untouched.
+    // Token-carrier watchtower (SDK_E2E=34): a RECEIVED token piece has NO calendar deadline — the
+    // sender keeps no flat backup to claw it back with — so `auto_exit_due` finds nothing due and
+    // the piece's only defence is event-driven: `defend_ladders` answers a hostile trigger on `F`.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("34") {
         sdk34_token_watchtower::execute().await?;
         return Ok(());
@@ -389,10 +379,10 @@ async fn main() -> Result<()> {
         sdk70_verifier_binding_adversarial::execute().await?;
         return Ok(());
     }
-    // Unconditional laddering (SDK_E2E=71): claim() ladders a plain deposit with no opt-in; an RGB
-    // carrier is left flat and the skip is surfaced (LadderSkipped); the carrier still transfers;
-    // and a laddered coin can never be conveyed at protocol_version 0 (unreadable ladder / missing
-    // ladder are both refused before any SE co-sign).
+    // Unconditional laddering (SDK_E2E=71): claim() ladders a plain deposit at FIRST SIGHT (while
+    // it is still IN_MEMPOOL, enclave count exactly 3, census `tiers + superseded` with a flat term
+    // of 0, `locktime == None`); an RGB carrier gets a COLOURED ladder; and a coin with no ladder
+    // row cannot be conveyed at all — every `ladderskip-` reason is diagnostic only.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("71") {
         sdk71_unconditional_ladder::execute().await?;
         return Ok(());
@@ -403,13 +393,6 @@ async fn main() -> Result<()> {
     // the default background pass — it used to be spawned by nothing at all).
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("72") {
         sdk72_watchtower_failloud::execute().await?;
-        return Ok(());
-    }
-    // Structural-spend crash recovery (SDK_E2E=73): [F7] a colored split KILLED by SIGABRT between
-    // terminalizing the carrier and persisting the co-signed child is rebuilt from the write-ahead
-    // journal after a restart, and the original payment still completes.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("73") {
-        sdk73_structural_recovery::execute().await?;
         return Ok(());
     }
     // CTES-R colour the ladder (SDK_E2E=74): claim() establishes a COLOURED ladder over an RGB
@@ -428,11 +411,11 @@ async fn main() -> Result<()> {
         sdk75_colored_exit::execute().await?;
         return Ok(());
     }
-    // Split a RECEIVED laddered coin (SDK_E2E=76): the PARENT_V2_BASELINE regression. sdk58/59/69
-    // all DEPOSIT the parent, so the baseline constant is accidentally correct there; this puts one
-    // whole-coin hop in front of the split, so the parent carries 1 + k flat backups, and asserts
-    // the receiver can still ADOPT and EXIT the child — with a negative control proving the old
-    // constant would reject the very same bundle.
+    // Split a RECEIVED laddered coin (SDK_E2E=76): the empty-parent-chain rule. sdk58/59/69 all
+    // DEPOSIT the parent they split; this puts one whole-coin hop in front of the split and asserts
+    // the parent still carries NO flat backup (`parent_flat_backups` must be empty, the census is
+    // `tiers + superseded` with `PARENT_V2_BASELINE == 0`) and the receiver can ADOPT and EXIT the
+    // child — with a negative control proving a conveyed flat backup is refused by name.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("76") {
         sdk76_received_parent_split::execute().await?;
         return Ok(());
@@ -444,14 +427,6 @@ async fn main() -> Result<()> {
     // The plain lanes over both the carrier and the child stay refused.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("77") {
         sdk77_colored_inladder_split::execute().await?;
-        return Ok(());
-    }
-    // [B1] Un-colourable carrier migration (SDK_E2E=78): three PRE-FLIP 1_500-sat carriers on a
-    // wallet with `colored_ladder` ON are proved permanently un-colourable, then SPENT through the
-    // migration hatch, upgraded into a colourable piece at the receiver, and the residue EXITED by
-    // materialisation with the allocation intact and the plain sweep never broadcast.
-    if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("78") {
-        sdk78_uncolourable_carrier::execute().await?;
         return Ok(());
     }
     // [B2] Split watchtower supersession (SDK_E2E=79): after a coloured in-ladder pay the SENDER's
@@ -477,9 +452,10 @@ async fn main() -> Result<()> {
         sdk81_inladder_split_recovery::execute().await?;
         return Ok(());
     }
-    // [P0-1] Exit-headroom admission gate (SDK_E2E=82): a child conveyed near the end of its
-    // funding epoch — whose exit provably cannot finish before the sender's flat backup can spend F
-    // — is REFUSED by the receiver, while the same payment in a fresh epoch is adopted.
+    // No epoch to run out of (SDK_E2E=82): the exit-headroom admission gate was a property of the
+    // sender's flat backup, which no longer exists. A child conveyed from a coin aged past
+    // `initlock` is admitted exactly like a fresh one; what bounds admission is the split-depth cap
+    // measured against `initlock` as a FIXED window, read off the signed `nSequence` of every tier.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("82") {
         sdk82_exit_headroom_gate::execute().await?;
         return Ok(());
@@ -536,8 +512,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // [Stage 3] The CARRIER variant of the exit-headroom bound: on the coloured lane the thing lost
-    // is an ASSET, so the refusal must leave NOTHING booked.
+    // [Stage 3] The CARRIER variant of sdk82: a coloured child has no epoch to fit inside either —
+    // a token payment from a carrier aged past `initlock` is admitted and the allocation booked.
     if std::env::var("SDK_E2E").as_deref() == std::result::Result::Ok("88") {
         sdk88_carrier_headroom::execute().await?;
         return Ok(());
@@ -586,57 +562,15 @@ async fn main() -> Result<()> {
         sdk04_adversarial::execute().await?;
         return Ok(());
     }
-    // Off-chain RGB split via pseudo-Spilman leaves (see docs/rgb_offchain_split_spilman.md). Needs
-    // the RGB proxy + electrum indexer in addition to the Mercury stack. Run with RGB_E2E=1.
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("1") {
-        rgb01_offchain_split::execute().await?;
-        return Ok(());
-    }
-    // Multi-input "combine" off-chain transition (RGB_E2E=2): spend N statechain coins in one
-    // SE-co-signed tx -> recipient + change. See docs/rgb_offchain_split_spilman.md.
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("2") {
-        rgb02_combine_transfer::execute().await?;
-        return Ok(());
-    }
-    // 2-deep off-chain chain (RGB_E2E=3): un-broadcast split -> un-broadcast combine, validated via
-    // validate_offchain_chain over both un-broadcast witnesses. Off-chain DAG depth.
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("3") {
-        rgb03_offchain_chain::execute().await?;
-        return Ok(());
-    }
     // SE single-use probe (RGB_E2E=4): the SE must refuse a 2nd conflicting spend of a node.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("4") {
         rgb04_single_use::execute().await?;
-        return Ok(());
-    }
-    // 3-input combine (RGB_E2E=5): many deposit coins -> one payment + change.
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("5") {
-        rgb05_combine3::execute().await?;
-        return Ok(());
-    }
-    // 3-level off-chain DAG (RGB_E2E=6): split -> combine -> split, all un-broadcast, 3-witness chain.
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("6") {
-        rgb06_dag3::execute().await?;
         return Ok(());
     }
     // Stage 4 epoch deadline (RGB_E2E=7): SE co-signs in the active period, REFUSES a new co-signature
     // past the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE call.
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("7") {
         rgb07_epoch::execute().await?;
-        return Ok(());
-    }
-    // Wide-combine scale test (RGB_E2E=8): a user manufactures N sub-coins (by splitting one coin) and
-    // combines all N in one SE-co-signed tx -> a single payment + change. The combine primitive scales.
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("8") {
-        rgb08_wide_combine::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("9") {
-        rgb09_send_receive_blinded_witness::execute().await?;
-        return Ok(());
-    }
-    if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("10") {
-        rgb10_history_and_selftransfer::execute().await?;
         return Ok(());
     }
     if std::env::var("RGB_E2E").as_deref() == std::result::Result::Ok("11") {

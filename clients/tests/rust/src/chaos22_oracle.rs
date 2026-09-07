@@ -5,11 +5,21 @@
 //!  - NO VALUE CREATED (INV-1/13/25): Σ over users of SE-side sats (available+in_transfer+pending)
 //!    must be <= total deposited D. Value only leaks to fees/reserves and exits (which move it
 //!    on-chain, off the SE ledger) — it can never exceed D unless a bug minted value.
-//!  - NO CHEAT SUCCEEDED (INV-5/18/19): every `chaos_fault` (stale-backup claw-back) was refused,
-//!    and on-chain the coin's funding outpoint was NEVER spent by the cheater's stale backup.
+//!  - NO CHEAT SUCCEEDED (INV-18/19): every `chaos_fault` (a superseded ladder state broadcast as a
+//!    claw-back) was refused, and on-chain the coin's funding outpoint was NEVER spent by the
+//!    cheater's stale tx.
+//!  - NO FLAT BACKUP ANYWHERE: a coin's only exit material is its TES-R ladder. No flat
+//!    absolute-locktime backup is co-signed at deposit (`create_tx1` is gone) or at any hop
+//!    (transfers convey `backup_transactions: []`, and the receiver refuses any conveyed one by
+//!    name), so every LIVE coin must have ZERO flat backup rows. A row is a breach in its own
+//!    right: it is a co-sign the census cannot account for and a matured spend of `F` in a past
+//!    owner's hands.
 //!  - ALL OUTCOMES EXPECTED: no trace event is an unclassified `breach` (an error the classifier
 //!    did not recognise as spec-sanctioned contention). This is the "everything happened as
-//!    expected per spec" guarantee.
+//!    expected per spec" guarantee. Refusals the ladder rule makes BY NAME — a sender refusing a
+//!    coin that "has no exit ladder", a receiver refusing a conveyed "flat backup", the retired
+//!    off-chain branch lanes answering "is retired", an exit refusing a coin with "no exit
+//!    material" — are KNOWN LIMITATIONS, counted separately, not breaches.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,6 +31,9 @@ use crate::chaos22_concurrent_users::Registry;
 pub struct InvariantReport {
     pub ok: u64,
     pub contention: u64,
+    /// Errors the classifier left `unclassified` but that are refusals the ladder rule makes BY
+    /// NAME (see [`known_limitation_tag`]). Reported, never a breach.
+    pub known_limitations: u64,
     pub cheats_total: u64,
     pub cheats_refused: u64,
     pub accounted: u64,
@@ -37,12 +50,42 @@ pub struct InvariantReport {
 impl InvariantReport {
     pub fn summary(&self) -> String {
         format!(
-            "CHAOS22 ORACLE: ok={} contention={} (rate={:.2}) cheats={} (refused={}) accounted={} deficit(fees/reserve/exited)={} | DAG: max_depth={} live_coins={} named_spends={} stuck={} breaches={}",
-            self.ok, self.contention, self.contention_rate, self.cheats_total, self.cheats_refused,
-            self.accounted, self.deficit, self.max_branch_depth, self.live_coins, self.named_spends,
-            self.stuck_coins, self.breaches.len()
+            "CHAOS22 ORACLE: ok={} contention={} (rate={:.2}) known_limitations={} cheats={} (refused={}) accounted={} deficit(fees/reserve/exited)={} | DAG: max_depth={} live_coins={} named_spends={} stuck={} breaches={}",
+            self.ok, self.contention, self.contention_rate, self.known_limitations, self.cheats_total,
+            self.cheats_refused, self.accounted, self.deficit, self.max_branch_depth, self.live_coins,
+            self.named_spends, self.stuck_coins, self.breaches.len()
         )
     }
+}
+
+/// The refusals the ladder rule makes BY NAME, which the run classifier (written for the flat
+/// lane) does not recognise. Each fragment is quoted from the code that raises it:
+///  * `transfer_sender::execute_ex`: "… has no exit ladder and cannot be conveyed …" — a coin
+///    with no `tesr-` row has no exit material and no lane; `claim()` ladders it on a later pass;
+///  * `tesr::verify_flat_backup_lane` / `refuse_conveyed_flat_backups`: "… conveyed with N flat
+///    backup transaction(s) …" — a laddered coin has NO flat backup, so any conveyed one is
+///    refused, and `broadcast_backup_tx` refuses too ("there is no flat backup transaction to
+///    broadcast");
+///  * `register_split_subcoins_n` / `register_combine_subcoins`: "the off-chain branch split /
+///    combine is retired …" — the legacy branch lanes return `Err` unconditionally;
+///  * `unilateral_exit`: "… has no `tesr-<id>` ladder row and therefore no exit material …".
+/// Each is a NAMED, fail-closed refusal of a shape the rule forbids — the correct outcome, not a
+/// bug — so the oracle counts it as a known limitation rather than an unclassified breach.
+fn known_limitation_tag(err: &str) -> Option<&'static str> {
+    let m = err.to_lowercase();
+    if m.contains("has no exit ladder") {
+        return Some("no-exit-ladder");
+    }
+    if m.contains("flat backup") {
+        return Some("flat-backup-refused");
+    }
+    if m.contains("is retired") {
+        return Some("branch-lane-retired");
+    }
+    if m.contains("no exit material") {
+        return Some("no-exit-material");
+    }
+    None
 }
 
 fn spender_of(
@@ -89,6 +132,7 @@ pub async fn run(
     let mut report = InvariantReport {
         ok: 0,
         contention: 0,
+        known_limitations: 0,
         cheats_total: 0,
         cheats_refused: 0,
         accounted: 0,
@@ -120,9 +164,18 @@ pub async fn run(
             "breach" => {
                 let seq = ev.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
                 let err = ev.get("error").and_then(|v| v.as_str()).unwrap_or("?");
-                report
-                    .breaches
-                    .push(format!("seq {seq}: unclassified {action} error: {err}"));
+                // A refusal the ladder rule makes BY NAME is the correct outcome, not a defect: the
+                // run classifier predates the rule, so it lands here as `unclassified` and the
+                // oracle re-reads it. Anything else is exactly what a routing regression looks like.
+                match known_limitation_tag(err) {
+                    Some(tag) => {
+                        report.known_limitations += 1;
+                        println!("CHAOS22 ORACLE: seq {seq}: {action} refused by name ({tag}): {err}");
+                    }
+                    None => report
+                        .breaches
+                        .push(format!("seq {seq}: unclassified {action} error: {err}")),
+                }
             }
             _ => {}
         }
@@ -134,7 +187,7 @@ pub async fn run(
             } else {
                 let seq = ev.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
                 report.breaches.push(format!(
-                    "seq {seq}: CHEAT SUCCEEDED (broadcast old state was accepted!) {}",
+                    "seq {seq}: CHEAT SUCCEEDED (a superseded ladder state was accepted for broadcast!) {}",
                     ev
                 ));
             }
@@ -147,7 +200,7 @@ pub async fn run(
                 if let Some(spender) = spender_of(&ec, o_txid, o_vout) {
                     if spender == stale_txid {
                         report.breaches.push(format!(
-                            "FRAUD: outpoint {o_txid}:{o_vout} was spent by the cheater's stale backup {stale_txid}"
+                            "FRAUD: outpoint {o_txid}:{o_vout} was spent by the cheater's stale state {stale_txid}"
                         ));
                     }
                 }
@@ -203,9 +256,10 @@ pub async fn run(
 
     // --- INVARIANT: NO DOUBLE SPEND — single custody per statechain_id (INV-18/19) ----------------
     // At full quiescence every LIVE (CONFIRMED) coin's statechain_id must be owned by EXACTLY ONE
-    // user. A coin simultaneously live in two wallets is a double-spend / custody split. While here,
-    // detect STUCK coins (a live off-chain sub-coin with NO stored backup AND no exit path = value
-    // that can never be withdrawn = money loss) and a branch-depth proxy (max backup rows).
+    // user. A coin simultaneously live in two wallets is a double-spend / custody split. While here:
+    // NO FLAT BACKUP on any live coin (the ladder rule), STUCK-coin detection (a live off-chain
+    // sub-coin with NO ladder and no exit path = value that can never be withdrawn = money loss),
+    // and a depth proxy read off each coin's own exit chain.
     let mut custody: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
     for u in registry.users.iter() {
         let coins = u.wallet.list_coins().await.unwrap_or_default();
@@ -215,22 +269,40 @@ pub async fn run(
             let Some(id) = c.statechain_id.clone() else { continue };
             report.live_coins += 1;
             custody.entry(id.clone()).or_default().push(u.idx);
-            // Depth proxy + stuck detection, in TES-R terms. A laddered coin's exit is its LADDER,
-            // not a flat backup chain: a root carries a `tesr-` bundle (exit_tiers) and a received
-            // child a `ctesr-` bundle (its ancestors + its own two tiers). A child legitimately has
-            // ZERO flat backup rows (CHILD_V2_BASELINE = 0), so keying "stuck" on an empty backup
-            // list alone would flag every healthy child as money loss.
-            let backups = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, name, &id)
-                .await
-                .unwrap_or_default();
+
+            // THE LADDER RULE, asserted on every live coin: ZERO flat backup rows. A laddered coin
+            // gets none at deposit (the ladder is co-signed at first sight instead of `tx1`) and
+            // none at any hop (the receiver refuses a conveyed one by name and persists an EMPTY
+            // vector); a split child / spine tip never had one (`CHILD_V2_BASELINE = 0`). A row
+            // here is a co-sign the census cannot account for and a matured, RGB-unaware spend of
+            // `F` in a past owner's hands — a breach in its own right, and the assertion that would
+            // fail if `create_tx1` or the per-hop backup ever came back.
+            let flat_rows = match mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, name, &id).await {
+                Ok(Some(rows)) => rows.len(),
+                Ok(None) => 0,
+                Err(e) => {
+                    report.breaches.push(format!(
+                        "UNREADABLE: user {} coin {id}'s backup rows could not be read ({e}) — the flat-backup invariant is unverifiable for it",
+                        u.idx
+                    ));
+                    0
+                }
+            };
+            if flat_rows > 0 {
+                report.breaches.push(format!(
+                    "FLAT BACKUP: user {} holds live coin {id} with {flat_rows} flat backup row(s) — a coin's only exit material is its TES-R ladder; no flat backup is co-signed at deposit or at any hop",
+                    u.idx
+                ));
+            }
+
             // [CATS/V4] THREE record shapes, and the depth of each is READ OFF ITS OWN EXIT CHAIN.
             //
             // Two bugs lived in the two-arm version. First, a wallet holding only a SPINE TIP (the
             // sender's own change leg after a CATS payment — where a paying wallet keeps most of
-            // its balance) matched neither arm, scored `tesr_depth = 0`, and with `backups` legally
-            // empty (`CHILD_V2_BASELINE = 0`) fell into the stuck branch and was reported as
-            // MONEY LOSS. A healthy coin with a complete pre-signed exit, flagged as unrecoverable
-            // — a false breach in the oracle whose whole job is to be believed.
+            // its balance) matched neither arm, scored `tesr_depth = 0`, and fell into the stuck
+            // branch and was reported as MONEY LOSS. A healthy coin with a complete pre-signed exit,
+            // flagged as unrecoverable — a false breach in the oracle whose whole job is to be
+            // believed.
             //
             // Second, `ancestors.len() * 2` counts every ancestor as `[extension, state]`. A SPINE
             // segment has ONE tier, so that over-counts a spine chain and would keep over-counting
@@ -249,15 +321,16 @@ pub async fn run(
                     },
                 },
             };
-            report.max_branch_depth = report.max_branch_depth.max(backups.len() as u64).max(tesr_depth);
-            let has_exit_material = !backups.is_empty() || tesr_depth > 0;
+            report.max_branch_depth = report.max_branch_depth.max(tesr_depth);
+            // Exit material IS the ladder. A flat row is never exit material (it is a breach above).
+            let has_exit_material = tesr_depth > 0;
             if c.off_chain && !has_exit_material {
-                // No backup chain AND no ladder: the coin can only be spent co-operatively; if it
-                // ALSO can't be exited, its value is unrecoverable. Triple-confirm before flagging.
+                // No ladder: the coin can only be spent co-operatively; if it ALSO can't be exited,
+                // its value is unrecoverable. Triple-confirm before flagging.
                 if u.wallet.estimate_exit_cost(&id).await.is_err() {
                     report.stuck_coins += 1;
                     report.breaches.push(format!(
-                        "MONEY LOSS: user {} holds live off-chain sub-coin {} with NO backup chain, NO TES-R ladder and NO exit path (unrecoverable {} sats)",
+                        "MONEY LOSS: user {} holds live off-chain sub-coin {} with NO TES-R ladder (and, by rule, no flat backup) and NO exit path (unrecoverable {} sats)",
                         u.idx, id, c.amount_sats
                     ));
                 }
@@ -279,7 +352,7 @@ pub async fn run(
     // FUNDING OUTPOINT is spent by at most one transaction, and only by a legitimate exit/withdraw —
     // never by two racing settlements. Collect the funding outpoints named by ok/pending exits and
     // ok withdraws; assert each is spent on-chain by at most one tx. (The cheat backstop above already
-    // proves the outpoint was never spent by a STALE backup.)
+    // proves the outpoint was never spent by a STALE state.)
     let mut exit_outpoints: std::collections::HashMap<(String, u32), Vec<String>> =
         std::collections::HashMap::new();
     for ev in &events {
@@ -314,6 +387,7 @@ pub async fn run(
     // --- INVARIANT: NO UX FRICTION — bounded contention + liveness --------------------------------
     // (breach count is already gated to 0 above via unclassified errors.) Under heavy concurrency a
     // fraction of actions legitimately shed load, but if MOST actions fail the system is unusable.
+    // A named ladder-rule refusal is neither progress nor contention; it is reported on its own line.
     let attempts = report.ok + report.contention;
     report.contention_rate = if attempts > 0 {
         report.contention as f64 / attempts as f64

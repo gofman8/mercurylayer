@@ -53,20 +53,19 @@ pub enum WalletEvent {
     /// malicious sender can no longer claw back the shared root. Emitted by `auto_exit_due`; the
     /// plain (RGB-unaware) exit path still refuses carriers, so this is their dedicated protection.
     TokenCarrierMaterialized { statechain_id: String, deadline_block: u32, tip: u32 },
-    /// [D13] A **plain** (non-token) split leaf nearing its clawback deadline was automatically
-    /// force-exited by `auto_exit_due`. A leaf carries no flat backup of its own and its exit walk
-    /// is a chain of relative timelocks, so it must be STARTED `deadline_block` blocks — the
-    /// parent's `min(L_k)` less the walk length — before a prior owner of the parent can void it.
-    /// Distinct from [`Self::TokenCarrierMaterialized`] on purpose: that event says "a token
-    /// allocation was settled"; this one says "a plain sats leaf was driven to L1 to beat its
-    /// deadline", and an integrator that treated the two the same would mis-report a plain coin as a
-    /// token settlement.
+    /// [D13] **RETIRED — never emitted.** A plain split leaf used to be force-exited by
+    /// `auto_exit_due` before the calendar deadline its parent's flat backup chain (`min(L_k)`)
+    /// imposed on it. That chain no longer exists: a leaf's parent carries no flat backup, nothing
+    /// on a coin matures on its own, and a leaf's only defence is event-driven (`defend_ladders`
+    /// answers a hostile trigger on `F`). The variant is kept so an integrator matching on it keeps
+    /// compiling — and so a test can pin that it is NOT emitted (sdk80).
     LeafExitForced { statechain_id: String, deadline_block: u32, tip: u32 },
-    /// A CONFIRMED coin was **left on the flat (un-laddered) lane** by the `claim()` ladder pass, so
-    /// it has no TES-R exit ladder and cannot be conveyed on the R′ path.
+    /// A coin was **left WITHOUT a ladder** by the `claim()` ladder pass, so it has no exit material
+    /// and cannot be conveyed at all — there is no flat lane to fall back to.
     ///
-    /// Laddering is otherwise unconditional, so this is the app's only advance notice that a
-    /// particular coin is flat-only — a review flagged the previous silence as a UX defect, because
+    /// Laddering is otherwise unconditional (at first sight of the funding transaction), so this is
+    /// the app's only advance notice that a particular coin is stuck — a review flagged the previous
+    /// silence as a UX defect, because
     /// the owner discovered it at transfer time (or, worse, never). Some reasons are permanent for
     /// the coin ([`LadderSkipReason::RgbCarrier`], [`LadderSkipReason::FundingNotOnChain`]) and some
     /// clear themselves on a later pass ([`LadderSkipReason::CoordinatorUnavailable`]); the event is
@@ -198,6 +197,20 @@ pub enum LadderSkipReason {
     /// because the conveyance path ALSO refuses such a coin (a ladder we cannot read is not a ladder
     /// we may assume away). The coin stays withdrawable and unilaterally exitable throughout.
     LadderUnreadable,
+    /// The coin HAS a ladder, but a PLAIN one, and the allocation set now says the coin is a
+    /// carrier: tokens were moved onto an outpoint that had already been plain-laddered as a
+    /// deposit. Its trigger is a plain spend of a sealed output, so its exit would BURN the
+    /// allocation, and the plain tiers cannot be unsigned. The coin is exitable (as satoshis only)
+    /// and must not be conveyed as a carrier.
+    ///
+    /// ⚠️ **There is no remedy today, and this variant does not claim one.** `colored_reanchor`
+    /// refuses a plain-laddered coin by name ("use `refresh`"), and `refresh`'s plain re-anchor
+    /// would destroy the allocation it is meant to save — so the allocation on such a coin is
+    /// STRANDED: recoverable only if the coin's counterparty co-operates off this path. Recorded
+    /// and surfaced so the owner learns of it before the exit does, and so the shape is visible to
+    /// whoever closes it. Avoid it by not moving an allocation onto an outpoint that is already
+    /// plain-laddered — under laddering-at-first-sight that is every confirmed plain deposit.
+    PlainLadderOverCarrier,
 }
 
 impl LadderSkipReason {
@@ -220,6 +233,9 @@ impl LadderSkipReason {
             Self::EstablishFailed => mercuryrustlib::transfer_sender::FLAT_ESTABLISH_FAILED,
             Self::DuplicateDeposit => mercuryrustlib::transfer_sender::FLAT_DUPLICATE_DEPOSIT,
             Self::LadderUnreadable => mercuryrustlib::transfer_sender::FLAT_LADDER_UNREADABLE,
+            Self::PlainLadderOverCarrier => {
+                mercuryrustlib::transfer_sender::FLAT_PLAIN_LADDER_OVER_CARRIER
+            }
         }
     }
 
@@ -241,23 +257,16 @@ impl LadderSkipReason {
             LadderSkipReason::EstablishFailed,
             LadderSkipReason::DuplicateDeposit,
             LadderSkipReason::LadderUnreadable,
+            LadderSkipReason::PlainLadderOverCarrier,
         ];
         ALL.iter().copied().find(|r| r.as_str() == s)
     }
 
-    /// Would this reason LICENSE conveying the coin on the flat lane?
-    ///
-    /// Only the structurally-permanent reasons would. A transient reason ("we could not decide this
-    /// pass") must never harden into "flat is fine forever".
-    ///
-    /// ⚠️ **A PREDICTION, not the decision.** The authority is
-    /// [`mercuryrustlib::transfer_sender::assert_flat_conveyance_is_legitimate`], which re-proves
-    /// every licence from live evidence at conveyance time (the `branch-`/`ctesr-` exit material for
-    /// [`Self::FundingNotOnChain`], the coin's own `single_use` flag for
-    /// [`Self::TerminalizedCarrier`], the coordinator's live answer for [`Self::NotBindable`]).
-    /// `false` here is reliable — the classifier is strictly stricter than this predicate — while
-    /// `true` means "the classifier will say yes provided the evidence is still there". This exists
-    /// so an app can warn ahead of a `send`, never so it can skip the classifier.
+    /// Would this reason LICENSE conveying the coin without a ladder? **Never.** There is no flat
+    /// lane: a coin's only exit material is its ladder, and a coin recorded here has none (or, for
+    /// [`Self::PlainLadderOverCarrier`], the wrong kind). The recorded reason is diagnostic — it
+    /// tells the owner what to fix — and this predicate exists only so callers that ask keep
+    /// getting a truthful answer.
     pub fn permits_flat_conveyance(&self) -> bool {
         mercuryrustlib::transfer_sender::is_legitimate_flat_reason(self.as_str())
     }

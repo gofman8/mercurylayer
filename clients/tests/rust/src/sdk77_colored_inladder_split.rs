@@ -284,7 +284,7 @@ pub async fn execute() -> Result<()> {
     // This used to load a `ChildTesrBundle`. A tip is the sender's OWN leg: one cap over
     // `SP.out[K]`, no extension, no payee, and it becomes the next batch's funding outpoint. It is
     // deliberately keyed apart from `ctesr-`, because everything keyed `ctesr-` is read as a
-    // conveyable leaf that arrived from somebody else — the flat-lane licence, the carrier exit
+    // conveyable leaf that arrived from somebody else — the conveyance lane, the carrier exit
     // allowlist and the tower's child loop all treat it that way. A tip stored under `ctesr-` would
     // be read as a two-rung child and dereference a `child_extension` it does not have.
     //

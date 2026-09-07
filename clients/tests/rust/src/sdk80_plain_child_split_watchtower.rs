@@ -2,11 +2,12 @@
 //!
 //! A1 fixed the ordering on `child_retransfer` / `cosign_colored_child_retransfer`; A2 made the
 //! liveness key durable on those two lanes and on `transfer_sender::execute_ex`. Every one of those
-//! moves the coin OUT of CONFIRMED **before** the superseding co-sign.
+//! moves the coin OUT of the live set (`is_live_for_defence`: IN_MEMPOOL, UNCONFIRMED or CONFIRMED)
+//! **before** the superseding co-sign.
 //!
-//! `UtexoWallet::child_in_ladder_pay_many` (clients/libs/rust-sdk/src/transfer.rs:930) — the
+//! `UtexoWallet::child_in_ladder_pay_many` (clients/libs/rust-sdk/src/transfer.rs) — the
 //! `transfer_many` route for a RECEIVED child, and the lane `transfer()` takes for a plain payment
-//! out of a received child — was not changed. Its order is:
+//! out of a received child — used to run in this order:
 //!
 //!   1. `tesr::child_in_ladder_split` — `set_spend_budget(child, 1)` then `cosign_tier(CSP)`.
 //!      `CSP` spends `ext_child`'s payload output, i.e. the SAME outpoint the child's current
@@ -19,16 +20,19 @@
 //! grandchildren as an ANCESTOR and dropped), so this wallet's row goes on naming the superseded
 //! `child_state` as live for the whole call.
 //!
-//! `defend_ladders_inner`'s child loop (clients/libs/rust-sdk/src/wallet.rs:1863-1877) has exactly
-//! ONE filter: `live_sids.contains(cid)` — the coin's DURABLE status. It has no L2 supersession
-//! check at all, and it could not have one here: L2 is keyed on `ChildTesrBundle::
-//! parent_statechain_id` / `parent.current().state.txid`, and a grandchild bundle carries the ROOT
-//! parent's ids unchanged — the child's own terminalization lives in `ancestors`, which L2 never
-//! reads.
+//! `defend_ladders_inner`'s child loop (clients/libs/rust-sdk/src/wallet.rs) has exactly ONE
+//! filter: L1, the coin's DURABLE status read through `is_live_for_defence` (IN_MEMPOOL,
+//! UNCONFIRMED or CONFIRMED). It has no L2 supersession check at all, and it could not have one
+//! here: L2 is keyed on `ChildTesrBundle::parent_statechain_id` / `parent.current().state.txid`,
+//! and a grandchild bundle carries the ROOT parent's ids unchanged — the child's own
+//! terminalization lives in `ancestors`, which L2 never reads. And there is no OTHER pass that
+//! could get there first: a leaf has no flat backup and no height deadline, so the event-driven
+//! child loop is the only thing that ever broadcasts for it.
 //!
-//! So for the whole of step 3 the tower is admitted to drive a state the recipients' chains
-//! supersede. This test measures that window with the same instrument sdk79 used, and with both
-//! halves observed independently of any fix:
+//! So for the whole of step 3 the tower was admitted to drive a state the recipients' chains
+//! supersede, until the lane gained the same durable arm-down (IN_TRANSFER persisted BEFORE the CSP
+//! co-sign) that A2 gave the whole-coin and re-transfer lanes. This test measures that window with
+//! the same instrument sdk79 used, and with both halves observed independently of any fix:
 //!
 //!  * the SE's `num_sigs` for the CHILD — the coordinator's own counter — rising above baseline is
 //!    the CSP co-sign, i.e. the instant a superseding state exists;
@@ -36,12 +40,17 @@
 //!    rising above baseline is a CONVEYANCE having landed, i.e. the instant a third party holds
 //!    rival material. Neither marker is anything this wallet writes.
 //!
-//! A sample where the mailbox has grown AND the wallet DB still reads CONFIRMED for the child is a
+//! A sample where the mailbox has grown AND the wallet DB still reads the child as LIVE is a
 //! watchtower pass that L1 would have admitted while a stranger held the superseding bundle. That
-//! count must be zero. It is not.
+//! count must be zero, and the assertion at the end says so.
 //!
-//! Two further assertions keep the finding from resting on the sampler alone:
+//! Three further assertions keep the finding from resting on the sampler alone:
 //!
+//!  * NO CALENDAR — before the split, `auto_exit_due` at the widest margin there is selects NOTHING
+//!    for the received child, emits no `LeafExitForced`, and broadcasts nothing: a leaf's parent is
+//!    a laddered coin with no flat backup, so no height exists at which its race is lost on its own.
+//!    The event-driven child loop is the ONLY pass that ever broadcasts for it — which is why the
+//!    durable status that loop reads is the whole of the leaf's protection.
 //!  * STRUCTURAL RIVALRY — the state `ctesr-<child>` still names live and the `CSP` the recipients
 //!    depend on are deserialised from their stored hex and shown to spend the SAME outpoint. That
 //!    is what makes an admitted pass a theft rather than noise.
@@ -59,7 +68,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
+use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use mercuryrustlib::client_config::ClientConfig;
 use mercuryrustlib::CoinStatus;
 
@@ -75,6 +84,11 @@ const PAY: u64 = 60_000;
 const PAY_C: u64 = 12_000;
 const PAY_D: u64 = 11_000;
 const PAY_E: u64 = 10_000;
+/// The widest near-deadline margin that cannot overflow `tip + margin` inside `auto_exit_due`. A
+/// laddered coin — root or leaf — has no height deadline, so the pass must select NOTHING at this
+/// margin; a margin this wide is exactly what would have force-exited every leaf under the old
+/// flat-backup calendar.
+const NO_CALENDAR_MARGIN: u32 = u32::MAX / 2;
 
 async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
@@ -84,6 +98,13 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 async fn ladder_wallet(name: &str) -> Result<UtexoWallet> {
     let (w, _) = UtexoWallet::initialize(SdkConfig::regtest(name), None).await?;
     Ok(w)
+}
+
+/// L1, mirrored: the SDK's `wallet::is_live_for_defence` (crate-private) admits a coin to the
+/// child loop while it is IN_MEMPOOL, UNCONFIRMED or CONFIRMED. The witness samples exactly this
+/// predicate so that a lane leaving the child in ANY live status is counted as admitted.
+fn live_for_defence(s: &CoinStatus) -> bool {
+    matches!(s, CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED | CoinStatus::CONFIRMED)
 }
 
 async fn se_num_sigs(cc: &ClientConfig, sid: &str) -> Result<u32> {
@@ -122,8 +143,8 @@ struct Witness {
     post_cosign: Arc<AtomicU32>,
     /// Samples taken after a child bundle had actually reached a recipient's mailbox.
     post_convey: Arc<AtomicU32>,
-    /// Of THOSE, the ones where the wallet DB still read CONFIRMED for the child — a pass L1 admits
-    /// while a stranger holds the superseding bundle.
+    /// Of THOSE, the ones where the wallet DB still read the child as LIVE (`live_for_defence`) —
+    /// a pass L1 admits while a stranger holds the superseding bundle.
     admitted: Arc<AtomicU32>,
 }
 
@@ -175,7 +196,7 @@ fn spawn_witness(
                 me.post_cosign.fetch_add(1, Ordering::SeqCst);
                 if msgs > baseline_msgs {
                     me.post_convey.fetch_add(1, Ordering::SeqCst);
-                    if status == Some(CoinStatus::CONFIRMED) {
+                    if status.as_ref().is_some_and(live_for_defence) {
                         me.admitted.fetch_add(1, Ordering::SeqCst);
                     }
                 }
@@ -238,6 +259,16 @@ fn prevout_of(signed_tx_hex: &str) -> Result<String> {
         .first()
         .ok_or_else(|| anyhow!("tier transaction has no input"))?;
     Ok(format!("{}:{}", i.previous_output.txid, i.previous_output.vout))
+}
+
+/// Is `txid` known to the chain backend at all (mempool or mined)? `false` is only ever read as
+/// "still off-chain / nothing was broadcast" — the same reading step 4's `known` takes.
+fn tx_known(cc: &ClientConfig, txid: &str) -> bool {
+    use electrum_client::bitcoin::Txid;
+    use electrum_client::ElectrumApi;
+    Txid::from_str(txid)
+        .ok()
+        .is_some_and(|t| cc.electrum_client.transaction_get(&t).is_ok())
 }
 
 pub async fn execute() -> Result<()> {
@@ -320,6 +351,60 @@ pub async fn execute() -> Result<()> {
         &cb0.child_extension.as_ref().expect("this E2E builds a TWO-RUNG piece; a thin one would have no extension").txid[..12]
     );
 
+    // ---- 1b. A LEAF HAS NO CALENDAR — the near-deadline pass must select NOTHING for it. --------
+    //
+    // bob's child hangs off a laddered parent with NO flat backup, so no ancestor holds a matured
+    // spend of `F` and there is no height at which the child's race is lost on its own. The leaf
+    // loop that used to force-exit a child ahead of its parent's flat-backup calendar
+    // (`LeafExitForced`) went with that calendar: at the widest margin there is, `auto_exit_due`
+    // must find nothing due, emit no `LeafExitForced`, broadcast nothing, and leave the child
+    // booked exactly as it was. That is what makes step 4's child loop the ONLY pass that ever
+    // broadcasts for this row — and the durable status it reads the whole of the leaf's protection.
+    let mut events = bob.subscribe();
+    let forced = bob.auto_exit_due(NO_CALENDAR_MARGIN).await.map_err(|e| {
+        anyhow!(
+            "(1b) the near-deadline pass reported itself BLIND on bob's wallet instead of finding \
+             nothing due: {e:#}"
+        )
+    })?;
+    assert!(
+        forced.is_empty(),
+        "(1b) the near-deadline pass force-exited {forced:?} at margin {NO_CALENDAR_MARGIN}: a leaf \
+         has no height deadline, so nothing in this wallet can be due at any margin"
+    );
+    while let Ok(ev) = events.try_recv() {
+        assert!(
+            !matches!(ev, WalletEvent::LeafExitForced { .. }),
+            "(1b) a `LeafExitForced` was emitted for a leaf that has no deadline to force against"
+        );
+    }
+    let parent_t = cb0.parent.trigger.txid.clone();
+    let sp_txid = cb0.parent.current().state.txid.clone();
+    assert!(
+        !tx_known(&cc, &parent_t) && !tx_known(&cc, &sp_txid),
+        "(1b) the near-deadline pass must broadcast NOTHING for a leaf: the parent trigger \
+         {parent_t} and SP {sp_txid} must still be off-chain"
+    );
+    assert_eq!(
+        mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk80_bob")
+            .await?
+            .coins
+            .into_iter()
+            .find(|c| c.statechain_id.as_deref() == Some(bob_child_sid.as_str()) && c.duplicate_index == 0)
+            .map(|c| c.status)
+            .ok_or_else(|| anyhow!("bob's child coin vanished after the near-deadline pass"))?,
+        CoinStatus::CONFIRMED,
+        "(1b) a leaf that nothing can schedule must still be booked CONFIRMED after the pass"
+    );
+    println!(
+        "SDK80 - (1b) the near-deadline pass at margin {NO_CALENDAR_MARGIN} selected nothing for \
+         bob's leaf: no height deadline exists, no LeafExitForced was emitted, T {} and SP {} are \
+         still off-chain, and the child is still CONFIRMED — only the event-driven child loop \
+         defends it",
+        &parent_t[..12],
+        &sp_txid[..12]
+    );
+
     // ---- 2. bob pays TWO recipients out of that child, RACED by a read-only witness. -------------
     for _ in 0..4 {
         let t = prepaid_token(&cc).await?;
@@ -358,7 +443,7 @@ pub async fn execute() -> Result<()> {
     println!(
         "SDK80 - (2) call returned: {} piece(s) {piece_sids:?}, change {change_sid}. Witness: \
          {samples} sample(s), {post_cosign} after the CSP co-sign, {post_convey} after a bundle had \
-         reached carol's mailbox, {admitted} of those with bob's child still CONFIRMED on disk",
+         reached carol's mailbox, {admitted} of those with bob's child still LIVE on disk",
         piece_sids.len()
     );
     assert!(
@@ -558,16 +643,13 @@ pub async fn execute() -> Result<()> {
         admitted, 0,
         "THE D1 WINDOW ON `child_in_ladder_pay_many`: in {admitted} of {post_convey} samples a \
          child bundle had already reached a recipient's coordinator mailbox and the SE had already \
-         co-signed the superseding CSP, while bob's wallet DB still read CONFIRMED for child \
-         {bob_child_sid}. That is exactly the join `defend_ladders_inner`'s child loop performs \
-         (clients/libs/rust-sdk/src/wallet.rs:1875 `live_sids.contains(cid)`), and step 4 shows a \
-         CONFIRMED read is sufficient for that loop to broadcast — over the outpoint step 3 shows \
-         the recipients' CSP depends on. `child_in_ladder_pay_many` \
-         (clients/libs/rust-sdk/src/transfer.rs:930) writes the status LAST, after every \
-         `convey_child_bundle`; the same is true of `child_in_ladder_pay` (:820) and of \
-         `in_ladder_pay` (:1068, which conveys before `persist_child` and so has no L2 evidence \
-         either). A2's durable arm-down was applied to `execute_ex`, `child_retransfer` and \
-         `cosign_colored_child_retransfer` — not to these."
+         co-signed the superseding CSP, while bob's wallet DB still read child {bob_child_sid} as \
+         LIVE (IN_MEMPOOL/UNCONFIRMED/CONFIRMED). That is exactly the join `defend_ladders_inner`'s \
+         child loop performs (L1, `is_live_for_defence`), and step 4 shows a live read is \
+         sufficient for that loop to broadcast — over the outpoint step 3 shows the recipients' \
+         CSP depends on. The lane must persist IN_TRANSFER for the child BEFORE the CSP co-sign, \
+         as `execute_ex`, `child_retransfer` and `cosign_colored_child_retransfer` do; a status \
+         written only after the last `convey_child_bundle` reopens this window."
     );
     println!("SDK80 - PASS (no window observed)");
     Ok(())

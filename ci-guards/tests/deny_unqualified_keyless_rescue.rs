@@ -233,14 +233,17 @@ fn the_d31_window_cannot_reach_the_test_module() {
     let raw = read(WATCHTOWER);
     let flat_src = flat(&raw);
     let win = window(&flat_src, D31_HEADING, D31_TERMINATOR, "watchtower.rs D31 section").unwrap();
+    // The demonstration literal is one that exists ONLY in the module's unit tests: the fixture
+    // funding txid `"abcd"` of the leaf watch-entry test. (It used to be a `900_000` deadline
+    // constant; that test went with the leaf height deadline, which no longer exists.)
     assert!(
-        raw.contains("900_000"),
-        "this test is only meaningful while the unrelated `900_000` test constant is still in the \
+        raw.contains("\"abcd\""),
+        "this test is only meaningful while the unrelated `\"abcd\"` test literal is still in the \
          file; if it is gone, the demonstration is stale but the bounding is still correct"
     );
     assert!(
-        !win.contains("900_000"),
-        "the D31 window reaches the `#[cfg(test)]` module. That is how a deadline constant came to \
+        !win.contains("\"abcd\""),
+        "the D31 window reaches the `#[cfg(test)]` module. That is how a test constant came to \
          satisfy a claim about a fee ratio."
     );
     assert!(
@@ -271,11 +274,10 @@ fn guard_rejects_the_mutations_it_was_written_for() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_ne!(m1, real, "M1 did not apply — re-point it at the current wording");
-    assert!(
-        m1.contains("900"),
-        "M1 is only the historical defect if a bare `900` SURVIVES it — that is what the old \
-         `src.contains(\"900\")` was matching, and why it stayed green"
-    );
+    // (The historical defect was that a bare `900` elsewhere in the file — a unit-test deadline
+    // constant — kept the old `src.contains("900")` green after this deletion. That constant is
+    // gone with the leaf height deadline; what remains to demonstrate is that THIS guard reports
+    // the deletion.)
     let v = keyless_limit_violations(&m1);
     assert!(
         v.iter().any(|m| m.contains("no longer says WHY")),

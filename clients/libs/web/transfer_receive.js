@@ -231,7 +231,7 @@ const validateEncryptedMessage = async (clientConfig, coin, encMessage, network,
         // (`protocol_version`, `tesr_ladder`, `child_tesr_bundle`), so a sender declaring version 0 with
         // both fields omitted fell straight through to the bare `num_sigs == backups.length` census
         // below — against an integer this client never authenticates. That is the identical shape the
-        // Rust receiver had to close with MIN_PREPAY_PROTOCOL_VERSION, and it made these clients the
+        // Rust receiver had to close with ADMISSIBLE_PROTOCOL_VERSIONS, and it made these clients the
         // CHEAPEST route in the whole trust model: a plain HTTP-response edit, no seed, no DB write.
         //
         // The coordinator-served `statechainInfo` is not sender-controlled, so it is where the check

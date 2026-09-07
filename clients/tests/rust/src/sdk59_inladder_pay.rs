@@ -2,12 +2,13 @@
 //!
 //! The end-to-end proof that the in-ladder split (sdk58's `verify_child_bundle` core) is a usable
 //! payment through `UtexoWallet::transfer` / `claim` / `unilateral_exit`, NOT just a verifier.
-//! Alice's deposit auto-establishes a TES-R ladder; a
-//! non-exact payment to Bob cannot be split as plain BTC (B1), so `transfer()` runs the
-//! IN-LADDER split: `SP` descends from the trigger, the PIECE child pays Bob (Model A) and is conveyed
-//! to his mailbox, the CHANGE child pays Alice back. Bob's `claim()` adopts the child via
-//! `verify_child_bundle` (parent F on-chain, both sids terminal); Bob then `unilateral_exit`s the child
-//! and the funds land at Bob's own key. Alice keeps the change.
+//! Alice's deposit is laddered by `claim()` at first sight — three co-signs (T, X_0, S_0), no flat
+//! `tx1`, zero backup rows, no locktime, which the test asserts before paying. A non-exact payment
+//! to Bob cannot be split as plain BTC (B1), so `transfer()` runs the IN-LADDER split: `SP`
+//! descends from the trigger, the PIECE child pays Bob (Model A) and is conveyed to his mailbox,
+//! the CHANGE child pays Alice back. Bob's `claim()` adopts the child via `verify_child_bundle`
+//! (parent F on-chain, parent terminal, an EMPTY conveyed parent chain); Bob then
+//! `unilateral_exit`s the child and the funds land at Bob's own key. Alice keeps the change.
 //!
 //! This is the transfer/claim integration the split needed to become the default payment path for a
 //! laddered coin. Run: SDK_E2E=59.
@@ -71,11 +72,36 @@ pub async fn execute() -> Result<()> {
         .find(|c| c.status == mercurylib::wallet::CoinStatus::CONFIRMED && c.duplicate_index == 0)
         .and_then(|c| c.statechain_id.clone())
         .ok_or(anyhow!("alice has no confirmed coin"))?;
-    assert!(
-        mercuryrustlib::tesr::load(&cc, "sdk59_alice", &alice_sid).await?.is_some(),
-        "alice's coin must carry a TES-R ladder for an in-ladder split"
+    let alice_bundle = mercuryrustlib::tesr::load(&cc, "sdk59_alice", &alice_sid)
+        .await?
+        .ok_or(anyhow!("alice's coin must carry a TES-R ladder for an in-ladder split"))?;
+    // THE ROOT'S SHAPE: a ladder and nothing else. No flat tx1 (exactly three co-signs), no backup
+    // rows, no absolute calendar. This is the coin the split below carves from.
+    let alice_ns = mercuryrustlib::utils::get_statechain_info(&alice_sid, &cc)
+        .await?
+        .ok_or(anyhow!("no statechain info for {alice_sid}"))?
+        .num_sigs;
+    assert_eq!(
+        alice_ns, 3,
+        "a laddered deposit costs exactly its three tiers — a fourth co-sign would be the flat tx1 \
+         the rule removed (got {alice_ns})"
     );
-    println!("SDK59 - alice deposited {DEPOSIT} and auto-established a ladder (sid {alice_sid})");
+    assert_eq!(alice_bundle.exit_tiers().len(), 3, "the ladder is T -> X_0 -> S_0");
+    let alice_flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk59_alice", &alice_sid)
+        .await?
+        .map_or(0, |v| v.len());
+    assert_eq!(alice_flat, 0, "a laddered root holds ZERO flat backup rows (got {alice_flat})");
+    let alice_coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk59_alice")
+        .await?
+        .coins
+        .into_iter()
+        .find(|c| c.statechain_id.as_deref() == Some(&alice_sid) && c.duplicate_index == 0)
+        .ok_or(anyhow!("alice's coin row missing"))?;
+    assert!(alice_coin.locktime.is_none(), "a laddered root carries no absolute calendar: locktime is None");
+    println!(
+        "SDK59 - alice deposited {DEPOSIT}; claim() laddered it at first sight (sid {alice_sid}): \
+         num_sigs {alice_ns}, {alice_flat} flat backup rows, locktime None"
+    );
 
     // --- Alice pays Bob a NON-EXACT amount → in-ladder split (piece to Bob, change to Alice). -----
     let r = alice.transfer(&bob_address, PAY).await?;
@@ -104,10 +130,26 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
+    let adopted = mercuryrustlib::tesr::load_child(&cc, "sdk59_bob", &bob_child_sid)
+        .await?
+        .ok_or(anyhow!("bob must have adopted (persisted) the child bundle"))?;
     assert!(
-        mercuryrustlib::tesr::load_child(&cc, "sdk59_bob", &bob_child_sid).await?.is_some(),
-        "bob must have adopted (persisted) the child bundle"
+        adopted.parent_flat_backups.is_empty(),
+        "a child of a laddered parent conveys an EMPTY parent chain — got {} flat backup(s)",
+        adopted.parent_flat_backups.len()
     );
+    // The parent census bob balanced: T, X_0, SP live, S_0 superseded — tiers + superseded, no
+    // flat term.
+    let parent_ns = mercuryrustlib::utils::get_statechain_info(&adopted.parent_statechain_id, &cc)
+        .await?
+        .ok_or(anyhow!("no statechain info for the parent"))?
+        .num_sigs;
+    assert_eq!(
+        parent_ns,
+        (adopted.parent.exit_tiers().len() + adopted.parent.superseded_states.len()) as u32,
+        "the parent census is `num_sigs == tiers + superseded` with a flat term of ZERO"
+    );
+    assert_eq!(parent_ns, alice_ns + 1, "the split cost the parent exactly one co-sign (SP)");
 
     // FIRST-CLASS: bob did not merely book an exit bundle — he COMPLETED the standard key handover,
     // so the SE rotated its share (and bob's auth key) for the child slot. The payoff is structural:

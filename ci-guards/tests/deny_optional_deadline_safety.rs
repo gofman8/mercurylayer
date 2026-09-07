@@ -1,11 +1,53 @@
-//! **[D40 / A.2] The deadline defence is UNCONDITIONAL. Routine re-anchoring is not.**
+//! **[D40 / A.2 → ONE COIN SHAPE] The deadline pass is UNCONDITIONAL. Routine re-anchoring is not.
+//! And a coin with NO absolute clock is never "near final".**
 //!
-//! A whole laddered coin carries exactly one absolute clock: `min(L_k)` over its flat backup chain,
-//! and that chain is held by its PRIOR OWNERS. Every tier below `F` is *relative*-timelocked, so
-//! none of them can out-race a transaction that is simply valid now. When `L_k` passes, any
-//! ancestor's matured rung spends `F` and takes the coin.
+//! # What this guard was written against
 //!
-//! # How it came to be optional
+//! A whole laddered coin used to carry exactly one absolute clock: `min(L_k)` over its flat backup
+//! chain, held by its PRIOR OWNERS. Every tier below `F` is *relative*-timelocked, so none of them
+//! could out-race a transaction that was simply valid now: when `L_k` passed, any ancestor's matured
+//! rung spent `F` and took the coin. `deadline_safety_due` is the pass that defended that clock, and
+//! this file exists because the pass was found behind an economics flag (the history is kept below).
+//!
+//! # What changed: there is no absolute clock on any coin
+//!
+//! Under ONE COIN SHAPE no flat absolute-locktime backup exists. None is co-signed at deposit — the
+//! ladder `T, X_0, S_0` is signed at the FIRST MEMPOOL SIGHTING of the funding transaction instead —
+//! and none at any hop: a transfer conveys `backup_transactions: []` and every receiver refuses a
+//! non-empty vector by name. The receiver books `coin.locktime = None`, `check_deposit` never writes
+//! the field, and nothing afterwards puts a height into it: **`coin.locktime` is `None` for the life
+//! of every coin.** So `coin_near_final` — `c.locktime.map_or(false, …)` — is never true,
+//! `auto_refresh_due` and `deadline_safety_due` select NOTHING, and the calendar this file was named
+//! for has no subject.
+//!
+//! # Why the guard is kept, and what it pins now
+//!
+//! The pass still exists and still runs every tick. Three properties of it are load-bearing
+//! precisely BECAUSE its subject set is empty by construction — nothing about running the code can
+//! reveal a regression in any of them:
+//!
+//! 1. **The polarity of the predicate on `None`.** `coin_near_final` reads an `Option`. The one edit
+//!    that turns "no coin is due" into "EVERY confirmed coin is due now" is treating the absent
+//!    clock as a height — `unwrap_or(0)`, `map_or(true, …)`. Because the pass is unconditional
+//!    (property 2) and its fallback is the SEVER (property 3), that edit broadcasts the trigger of
+//!    every confirmed coin in the wallet on the first background tick, and on a carrier it starts
+//!    the CSV walk of the allocation. `a_coin_with_no_absolute_clock_is_never_near_final` pins the
+//!    CONSTRUCTION — the `None` arm answers `false`, and no unwrap stands between the field and the
+//!    comparison — and its non-vacuity test plants the forged-height shapes against the checker AND
+//!    against the real tree.
+//! 2. **The scheduling wiring.** `start_background` consumes `maintenance_plan` and reaches
+//!    `deadline_safety_due` through the exhaustive `MaintenancePass` match, so the pass cannot be
+//!    parked behind a flag again without a compile error or a wildcard arm — and the economics half
+//!    (`auto_refresh_due`) must never become unconditional in the other direction.
+//! 3. **The shape of the pass.** Cooperative re-anchor first, sever second, the still-due set RE-READ
+//!    between them, and a BLIND carrier set REFUSED rather than severed on a guess. Whatever subject
+//!    the pass ever has again (a future height-keyed `coin_near_final`), that is the order it must
+//!    keep, because the party asked to co-sign the cheap remedy is the party who benefits from its
+//!    refusal (D40.1).
+//!
+//! ---
+//!
+//! # History: how the pass came to be optional
 //!
 //! `auto_refresh_due` did two unrelated jobs under one name:
 //!
@@ -16,14 +58,14 @@
 //!
 //! Both sat behind `auto_refresh && background_auto_refresh`. Turning the economics off turned the
 //! safety off with it, and the comment at the call site asserted the gap was covered elsewhere —
-//! *"deadline safety for idle wallets is the `auto_exit` pass below"* — which is false.
+//! *"deadline safety for idle wallets is the `auto_exit` pass below"* — which was false.
 //! `auto_exit_due` protects sub-coins and materialises carriers; the whole-coin clock had **no
 //! scheduled defender at all** on a default wallet.
 //!
 //! # And why the fallback is load-bearing
 //!
 //! Re-anchoring is COOPERATIVE — one fresh SE co-signature. Under D40.1 the party most interested in
-//! this deadline passing is the operator, i.e. the same party being asked to sign. **A defence its
+//! a deadline passing is the operator, i.e. the same party being asked to sign. **A defence its
 //! adversary can decline is not a defence.** So the pass falls back to severing from `F`: broadcast
 //! the already-co-signed trigger, which is un-timelocked and therefore wins against every retained
 //! rung by being valid first, with no SE and no counterparty.
@@ -66,19 +108,18 @@
 //! configuration on offer was the one with no unilateral fallback, and the guard's name over-claimed
 //! a property nothing checked. Naming a property is not pinning it.
 //!
-//! # What is pinned now
+//! # What is pinned for the wiring
 //!
 //! The property, not a description of it: **a deadline pass runs on EVERY path through the poll
-//! loop.** That is checked structurally — the loop body is delimited by its own matching braces (not
-//! by a byte count and not by a fallback to end-of-text), string literals and trailing comments are
-//! blanked so nothing can be satisfied by TEXT, and `deadline_safety_due` must appear at brace-depth
-//! ZERO of the loop body, i.e. as a statement of the loop itself rather than inside any `if`, `else`
-//! or `match` arm. The complementary half is pinned too, in the opposite direction: `auto_refresh_due`,
-//! if it is scheduled at all, must remain CONDITIONAL, because the economics must never become
-//! unconditional either.
-//!
-//! The source shape this rewrite demands — hoisting `deadline_safety_due` out of the `else` — is
-//! made separately by the orchestrator; this file is the guard that holds it afterwards.
+//! loop.** The crude `if`/`else` forms are detected structurally — the loop body is delimited by its
+//! own matching braces (not by a byte count and not by a fallback to end-of-text), string literals
+//! and trailing comments are blanked so nothing can be satisfied by TEXT, and `deadline_safety_due`
+//! must appear at brace-depth ZERO of the loop body. [D64] then showed that reachability is not
+//! expressible in a substring (`let _ = flag && wallet.deadline_safety_due(..).await.is_ok();`
+//! passes that scan), so on the real tree the property lives in a VALUE — `maintenance_plan` — and
+//! this file pins only that the loop still consumes it (see the first test). The complementary half
+//! is pinned too, in the opposite direction: `auto_refresh_due`, if it is scheduled at all, must
+//! remain CONDITIONAL, because the economics must never become unconditional either.
 
 use std::path::PathBuf;
 
@@ -303,9 +344,11 @@ fn deadline_pass_is_unconditional(method_src: &str) -> Result<(), String> {
     let deadline = sites(body, "deadline_safety_due(");
     if deadline.is_empty() {
         return Err(format!(
-            "the poll loop never calls `deadline_safety_due(`. The whole-coin `L_k` clock then has \
-             NO scheduled defender — `auto_exit_due` protects sub-coins and materialises carriers, \
-             not this:\n\n{body}"
+            "the poll loop never calls `deadline_safety_due(`. Whatever subject the pass ever has \
+             then has NO scheduled defender — `auto_exit_due` protects sub-coins and materialises \
+             carriers, not this — and the pin that keeps the pass HARMLESS on an empty subject \
+             (`a_coin_with_no_absolute_clock_is_never_near_final`) would be guarding a call \
+             nobody makes:\n\n{body}"
         ));
     }
     let unconditional: Vec<usize> = deadline
@@ -697,28 +740,155 @@ fn the_cooperative_route_falls_back_to_severing() {
     );
 }
 
-/// NON-VACUITY: the predicate the whole pass rests on must still be keyed on the coin's own
-/// `locktime`, which is `L_k` — the clock the prior owners hold.
-#[test]
-fn the_deadline_predicate_still_reads_the_flat_chains_clock() {
-    let code = code_only(&read("clients/libs/rust-sdk/src/refresh.rs"));
+/// The body of `coin_near_final`, bounded by the next REAL symbol after this free function — the
+/// test module that follows it. The old window was a fixed 240 bytes, which is the forbidden shape
+/// twice over: it can stop short of the thing being checked, and if the function grows it runs on
+/// into whatever is next.
+fn coin_near_final_body(code: &str) -> &str {
     let at = code.find("fn coin_near_final(").expect("`coin_near_final` is gone");
-    // Bounded by the next REAL symbol after this free function — the test module that follows it.
-    // The old window was a fixed 240 bytes, which is the forbidden shape twice over: it can stop
-    // short of the thing being checked, and if the function grows it runs on into whatever is next.
     let end = code[at..]
         .find("\n#[cfg(test)]")
         .map(|d| at + d)
         .expect("no `#[cfg(test)]` after `coin_near_final` to bound its body");
-    let body = &code[at..end];
-    assert!(
-        body.contains("c.locktime") && body.contains("saturating_sub(tip)"),
-        "`coin_near_final` no longer measures headroom as `locktime - tip`. That quantity IS the \
-         deadline; anything else defends a different clock:\n\n{body}"
+    &code[at..end]
+}
+
+/// THE PREDICATE ON AN ABSENT CLOCK, as a pure function over the text of `coin_near_final`, so the
+/// non-vacuity test can drive it with planted shapes as well as with the real tree.
+///
+/// [ONE COIN SHAPE] `coin.locktime` is `None` for the life of every coin, so this predicate decides
+/// between "no coin is due" and "every confirmed coin is due now" on its `None` arm alone. The pass
+/// it feeds is unconditional and falls back to the SEVER, so the wrong polarity here broadcasts the
+/// trigger of every confirmed coin in the wallet on the first background tick.
+fn absent_clock_is_not_due(fn_src: &str) -> Result<(), String> {
+    let code = scrub(fn_src);
+    if !code.contains("c.locktime") {
+        return Err(format!(
+            "`coin_near_final` no longer reads `c.locktime`. That field is the ONLY place an \
+             absolute clock could live, and it is `None` for every coin; a predicate keyed on \
+             anything else is measuring a clock no coin carries:\n\n{fn_src}"
+        ));
+    }
+    // No unwrap between the field and the comparison: every one of these MANUFACTURES a height for
+    // a coin that has none, and a manufactured `0` is a coin at its floor — due now, severed now.
+    for forged in [
+        "unwrap_or(",
+        "unwrap_or_default(",
+        "unwrap_or_else(",
+        ".unwrap()",
+        ".expect(",
+        "map_or(true",
+        "map_or_else(",
+    ] {
+        if code.contains(forged) {
+            return Err(format!(
+                "`coin_near_final` reads the absent clock through `{forged}`. Under ONE COIN SHAPE \
+                 `coin.locktime` is `None` for every coin, so whatever height this conjures is the \
+                 height of EVERY confirmed coin — with `0` (or `true`) that is every coin at its \
+                 floor, and the unconditional deadline pass severs the whole wallet on its first \
+                 tick:\n\n{fn_src}"
+            ));
+        }
+    }
+    // The `None` arm answers false, in one of the two spellings that say so in the construction.
+    if !(code.contains("map_or(false") || code.contains("is_some_and(")) {
+        return Err(format!(
+            "`coin_near_final`'s `None` arm is not written as `map_or(false, …)` or \
+             `is_some_and(…)`. A coin with no absolute clock is never near final — that must be the \
+             construction, not a comment beside it:\n\n{fn_src}"
+        ));
+    }
+    // ...and, for whatever subject the pass ever has, the headroom is still `locktime − tip`
+    // against `margin_blocks`. Anything else defends a different clock, or has no margin at all.
+    if !(code.contains("saturating_sub(tip)") && code.contains("<= margin_blocks")) {
+        return Err(format!(
+            "`coin_near_final` no longer measures `locktime − tip` against `margin_blocks`; the \
+             pass either fires always or never for any subject it is given:\n\n{fn_src}"
+        ));
+    }
+    Ok(())
+}
+
+/// [ONE COIN SHAPE] A COIN WITH NO ABSOLUTE CLOCK IS NEVER NEAR FINAL. The real predicate, checked
+/// for the construction that makes the empty subject set EMPTY rather than universal.
+#[test]
+fn a_coin_with_no_absolute_clock_is_never_near_final() {
+    let code = code_only(&read("clients/libs/rust-sdk/src/refresh.rs"));
+    absent_clock_is_not_due(coin_near_final_body(&code)).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// NON-VACUITY for the predicate pin: the forged-height shapes must be refused — as planted text and
+/// as mutations of the REAL function — and the shipped shape accepted.
+#[test]
+fn the_predicate_check_rejects_every_forged_clock() {
+    const SHIPPED: &str = "fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {\n    \
+                           c.locktime.map_or(false, |l| l.saturating_sub(tip) <= margin_blocks)\n}\n";
+    assert_eq!(
+        absent_clock_is_not_due(SHIPPED),
+        Ok(()),
+        "the shipped shape must pass, or the rejections below prove nothing"
     );
+
+    let cases: [(&str, &str, &str); 5] = [
+        (
+            // THE ONE THAT SEVERS THE WALLET: the absent clock read as height zero. Every confirmed
+            // coin is then at its floor, and the unconditional pass broadcasts every trigger.
+            "absent_clock_read_as_height_zero",
+            "fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {\n    \
+             c.locktime.unwrap_or(0).saturating_sub(tip) <= margin_blocks\n}\n",
+            "unwrap_or(",
+        ),
+        (
+            // Same outcome, other spelling: the `None` arm answers true.
+            "none_arm_answers_true",
+            "fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {\n    \
+             c.locktime.map_or(true, |l| l.saturating_sub(tip) <= margin_blocks)\n}\n",
+            "map_or(true",
+        ),
+        (
+            // The clock no longer read at all — the predicate measures something no coin carries.
+            "clock_not_read",
+            "fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {\n    \
+             c.amount.map_or(false, |a| a.saturating_sub(tip as u64) <= margin_blocks as u64)\n}\n",
+            "c.locktime",
+        ),
+        (
+            // A `false` in a COMMENT and a `true` in the code. Text is not the construction.
+            "polarity_only_in_a_comment",
+            "fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {\n    \
+             // map_or(false, …): a coin with no clock is never due\n    \
+             c.locktime.map_or(true, |l| l.saturating_sub(tip) <= margin_blocks)\n}\n",
+            "map_or(true",
+        ),
+        (
+            // The margin dropped: for any subject the pass ever has, it fires always or never.
+            "margin_dropped",
+            "fn coin_near_final(c: &Coin, tip: u32, _margin_blocks: u32) -> bool {\n    \
+             c.locktime.map_or(false, |l| l <= tip)\n}\n",
+            "margin_blocks",
+        ),
+    ];
+    for (tag, src, expected) in cases {
+        match absent_clock_is_not_due(src) {
+            Ok(()) => panic!(
+                "the checker ACCEPTED `{tag}`, a predicate that would sever every confirmed coin \
+                 (or defend a clock no coin carries)"
+            ),
+            Err(e) => assert!(
+                e.contains(expected),
+                "`{tag}` was refused for the WRONG reason (expected `{expected}`):\n{e}"
+            ),
+        }
+    }
+
+    // ...and on the REAL function: the single-token mutation that turns "no coin is due" into
+    // "every coin is due" must be caught in the tree, not only in a fixture.
+    let code = code_only(&read("clients/libs/rust-sdk/src/refresh.rs"));
+    let real = coin_near_final_body(&code);
+    let flipped = real.replacen("map_or(false", "map_or(true", 1);
+    assert_ne!(flipped, real, "the real predicate no longer spells its `None` arm `map_or(false` — re-point this mutation");
     assert!(
-        body.contains("<= margin_blocks"),
-        "`coin_near_final` no longer compares that headroom against `margin_blocks`, so the pass \
-         no longer has a margin — it either fires always or never:\n\n{body}"
+        absent_clock_is_not_due(&flipped).is_err(),
+        "flipping the real predicate's `None` arm to `true` was NOT caught"
     );
 }

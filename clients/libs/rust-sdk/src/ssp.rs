@@ -427,9 +427,10 @@ impl SspService {
         // actually RAN before the irreversible Lightning leg — after [D1] there is no coin shape that
         // passes trivially. `peek_pending_transfers` computes `ladder_census_ok` per coin, fail-closed,
         // on one of exactly two lanes, both of which end in a census that must SUCCEED:
-        //   * FLAT TES-R ladder (`protocol_version >= MIN_PREPAY_PROTOCOL_VERSION = 2`) →
+        //   * ROOT TES-R ladder (`protocol_version` in `ADMISSIBLE_PROTOCOL_VERSIONS`) →
         //     `verify_bundle_bound`, which requires
-        //       - the EXACT-EQUALITY count (num_sigs == flat_backups + tiers + disclosed-superseded,
+        //       - the EXACT-EQUALITY count (num_sigs == tiers + disclosed-superseded — there is no
+        //         flat term, a conveyed flat backup is refused by name —
         //         against the enclave-authoritative sig-count), closing the rob-SSP hidden-`S*` vector:
         //         a sender who co-signed a lower-CSV state omitted from the conveyed ladder inflates
         //         num_sigs, the census fails, and we refuse to pay; and
@@ -496,33 +497,25 @@ impl SspService {
                 let env = p.rgb_consignment.as_deref().ok_or_else(|| {
                     anyhow!("latched coin {sid} carries no RGB consignment — refusing to pay an RGB invoice")
                 })?;
-                // **[P3] AN ENVELOPE WITH NO BRANCH TO RESOLVE IT AGAINST CANNOT BE VERIFIED.**
+                // **[P3] AN ENVELOPE WITH NO WITNESS CHAIN TO RESOLVE IT AGAINST CANNOT BE VERIFIED.**
                 //
-                // `validate_pending_token` resolves the consignment against `branch_txs` — the FLAT
-                // lane's un-broadcast exit branch. A coloured split CHILD has no such branch: its
-                // witness chain is `colored_child_txids()`, an N-deep walk through the root ladder
-                // and every intermediate spine segment, and nothing in this message carries it.
-                //
-                // Today an empty witness set makes the resolver fail, so this lane already refuses —
-                // by accident. That is not a property to rest an IRREVERSIBLE Lightning payment on:
-                // a resolver that ever became lenient about an unknown witness would turn this into
-                // a pay-out hole silently, with nothing in this file objecting. State the boundary
-                // instead, and state it BEFORE the call.
-                //
-                // This is P3's safety half. Lifting it means giving the SSP the child's own witness
-                // chain and validating against that — the coloured pre-pay gate proper, which does
-                // not exist yet. Until then a coloured child cannot be LN-latched, and the honest
-                // failure is a named refusal rather than an RGB error nobody can act on.
-                // [P3] A COLOURED CHILD carries its own witness chain, so it IS verifiable now —
-                // the refusal below applies only to an envelope with neither.
+                // A coloured coin's consignment resolves against its OWN tier txids — a ROOT
+                // ladder's `ladder_txids()` or a coloured SPLIT CHILD's `colored_child_txids()` —
+                // which `peek_pending_transfers` derives from the conveyed bundle and surfaces as
+                // `child_witness_txids`, together with the outpoint the consignment assigns to (the
+                // receiver's own final-state payload output, the same one the claim path books).
+                // `branch_txs` is the retired flat lane's exit branch and is only ever non-empty for
+                // a legacy row. An envelope with neither chain is unverifiable, and an irreversible
+                // Lightning payment must not rest on the resolver happening to fail on an unknown
+                // witness: state the boundary, BEFORE the call.
                 if p.branch_txs.is_empty() && p.child_witness_txids.is_empty() {
                     return Err(anyhow!(
-                        "latched coin {sid} carries an RGB consignment but no exit branch to resolve \
-                         it against — this is the shape of a coloured SPLIT CHILD, whose witness \
-                         chain is its own N-deep walk (`colored_child_txids`) and is not carried \
-                         here. The SSP cannot verify the allocation before paying, and a Lightning \
-                         payment is irreversible, so it refuses. Latch a coloured carrier at the \
-                         ROOT, or pay this child on-chain after its unilateral exit."
+                        "latched coin {sid} carries an RGB consignment but no witness chain to resolve \
+                         it against — a coloured ROOT ladder surfaces its tier txids and a coloured \
+                         SPLIT CHILD its `colored_child_txids`; this conveyance surfaced neither, so \
+                         the SSP cannot verify the allocation before paying, and a Lightning payment \
+                         is irreversible, so it refuses. Re-send the coin over a coloured ladder, or \
+                         pay it on-chain after its unilateral exit."
                     ));
                 }
                 let (contract_id, booked) = self
@@ -531,8 +524,8 @@ impl SspService {
                         env,
                         &p.branch_txs,
                         &p.child_witness_txids,
-                        &p.funding_txid,
-                        p.funding_vout,
+                        &p.rgb_assignment_txid,
+                        p.rgb_assignment_vout,
                     )
                     .await
                     .map_err(|e| {
@@ -1388,12 +1381,18 @@ mod p3_prepay_gate_tests {
     fn the_refusal_names_the_shape_and_the_way_around_it() {
         let src = include_str!("ssp.rs");
         let at = src.find("p.branch_txs.is_empty()").expect("guard");
-        let msg = &src[at..at + 900];
-        assert!(msg.contains("coloured SPLIT CHILD"), "name the shape");
-        assert!(msg.contains("colored_child_txids"), "name what would verify it");
+        // Join the message's line continuations before matching. A refusal is wrapped for reading,
+        // and a pin that breaks when a sentence re-wraps tests the formatter, not the message.
+        let msg: String = src[at..at + 1_200]
+            .replace("\\\n", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(msg.contains("coloured SPLIT CHILD"), "name the shape: {msg}");
+        assert!(msg.contains("colored_child_txids"), "name what would verify it: {msg}");
         assert!(
-            msg.contains("ROOT") && msg.contains("unilateral exit"),
-            "and name the two ways the owner can still be paid"
+            msg.contains("coloured ROOT ladder") && msg.contains("unilateral exit"),
+            "and name the shape that DOES carry a chain, plus the way the owner can still be paid: {msg}"
         );
     }
 

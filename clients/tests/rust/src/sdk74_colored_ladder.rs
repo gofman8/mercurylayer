@@ -11,6 +11,13 @@
 //!
 //! What is asserted, and why each one is the assertion that can actually fail:
 //!
+//!   0. BOTH coins are laddered AT FIRST MEMPOOL SIGHT, before any block is mined: the pass that
+//!      books the plain deposit as IN_MEMPOOL leaves a PLAIN `tesr-` row behind it, and the pass
+//!      that books the issuance's carrier leaves a COLOURED one — an issuance books its allocation
+//!      the moment the funding transaction is broadcast, so the coloured `T` is built over an
+//!      UNCONFIRMED `F`. There is no flat `tx1` at sight and no wait for a confirmation: at that
+//!      instant each coin's `num_sigs` is exactly 3, it has zero flat backup rows and
+//!      `locktime == None`. Confirmation then changes nothing (same trigger on disk afterwards);
 //!   1. the carrier's ladder EXISTS and is COLOURED (`TesrBundle::rgb`), while the plain deposit in
 //!      the SAME wallet is laddered exactly as before — `rgb == None`, payload at vout 0, no
 //!      OP_RETURN anywhere. The plain path must be byte-identical;
@@ -30,9 +37,10 @@
 //!      so it is checked as well but is never the evidence;
 //!   6. the allocation is INTACT: the carrier outpoint still holds the full supply and is still
 //!      quarantined from plain-BTC selection. Colouring the ladder must not make `F` look spent;
-//!   7. the CENSUS balances at the value the plain path uses: `num_sigs == flat_backups(1) +
-//!      tiers(3)`, verified by the same bound verifier a receiver runs. Colouring adds ZERO SE
-//!      co-signs — the SE stays blind;
+//!   7. the CENSUS balances at the value the plain path uses: `num_sigs == 3 == flat_backups(0) +
+//!      tiers(3) + superseded(0)`, verified by the same bound verifier a receiver runs with the
+//!      flat term 0 (and refused with a flat term of 1 — no phantom `tx1` may be counted).
+//!      Colouring adds ZERO SE co-signs — the SE stays blind;
 //!   8. NO PLAIN-SPLIT PATH CAN REACH THE CARRIER: its sats are quarantined from plain-BTC
 //!      selection (so no plain split builder can even select it) and the uncoloured in-ladder split
 //!      refuses this bundle by name. This replaces the old "the legacy colored split refuses" probe,
@@ -52,10 +60,14 @@
 //!      second hop is the one that can only pass if the receiver's tier seals were really opened:
 //!      to build its own `S''` bob must colour a transition spending `X_m`'s payload output, which
 //!      is an INTERNAL seal of the chain it was handed, not the output that pays it;
-//!  11. and a wallet that OPTS OUT is unchanged: with `colored_ladder` explicitly off, carol's own
-//!      carrier stays flat (`LadderSkipped { RgbCarrier }`) and still transfers tokens end-to-end on
-//!      the legacy lane. (`colored_ladder` also SHIPS off — alice and bob opt in by name; that
-//!      default is pinned separately, at the top of the test, so it cannot move silently either.)
+//!  11. and a wallet that OPTS OUT gets NO exit material for its carrier, and nothing else: with
+//!      `colored_ladder` explicitly off, carol's own carrier is left un-laddered and recorded
+//!      `rgb-carrier` (`LadderSkipped { RgbCarrier }`), carries ZERO flat backup rows (there is no
+//!      `tx1` to fall back on any more), and a token payment out of it is REFUSED by name — the
+//!      legacy off-chain branch split that used to pay from a flat carrier is RETIRED
+//!      (`register_split_subcoins_n`), so opting out is not a second lane, it is a coin that cannot
+//!      pay or exit until it is coloured. Receiving a coloured ladder is unaffected (§11). The
+//!      regtest default ships ON and is pinned separately, at the top of the test.
 //!
 //! Run: SDK_E2E=74 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
@@ -63,12 +75,114 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use mercury_utexo_sdk::{LadderSkipReason, SdkConfig, UtexoWallet, WalletEvent};
+use mercurylib::wallet::Coin;
 use mercuryrustlib::CoinStatus;
 
 use crate::bitcoin_core;
 
 const PLAIN_AMOUNT: u32 = 123_456;
 const SUPPLY: u64 = 1_000;
+
+/// The number of FLAT backup rows under a coin's bare statechain id. There is no flat backup any
+/// more, so the row is normally ABSENT, and absence is ZERO rows (`try_get_backup_txs` reports it as
+/// `Ok(None)`, distinct from a failed read). A row that exists is counted, so a `tx1` minted at
+/// sight or a conveyed flat backup the receiver booked shows up as 1, never as "not found".
+async fn flat_backup_rows(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet: &str,
+    sid: &str,
+) -> Result<usize> {
+    Ok(mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, wallet, sid)
+        .await
+        .map_err(|e| anyhow!("flat backup rows for {sid} could not be read: {e}"))?
+        .map_or(0, |rows| rows.len()))
+}
+
+/// Poll `claim()` until the coin `pick` selects leaves INITIALISED — i.e. until the pass that BOOKS
+/// it has run — and return it as that pass booked it. The polling is only for electrs's mempool
+/// indexing lag; every assertion made on the result is about the booking pass itself.
+async fn claim_until_sighted(
+    wallet: &UtexoWallet,
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet_name: &str,
+    events: &mut tokio::sync::broadcast::Receiver<WalletEvent>,
+    seen: &mut Vec<WalletEvent>,
+    what: &str,
+    pick: impl Fn(&Coin) -> bool,
+) -> Result<Coin> {
+    for _ in 0..30 {
+        wallet.claim().await?;
+        seen.extend(drain(events));
+        let coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet_name).await?.coins;
+        if let Some(c) = coins
+            .iter()
+            .find(|c| c.duplicate_index == 0 && c.status != CoinStatus::INITIALISED && pick(c))
+        {
+            return Ok(c.clone());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err(anyhow!(
+        "{what} was never sighted: claim() left it INITIALISED for 60s with no block mined. Either \
+         electrs is not serving the mempool, or the deposit path no longer books at first sight."
+    ))
+}
+
+/// The deposit-time property, asserted on a coin as the booking pass left it: its ladder EXISTS
+/// already, its enclave count is exactly the 3 tiers (no `tx1`), it has no flat backup row and no
+/// calendar — and it is still PRE-CONFIRMATION, unless some other miner on this shared regtest
+/// produced `confirmation_target` blocks in the window (reported, not asserted on). Returns the
+/// bundle so the caller can check its lane and, later, that confirmation did not replace it.
+async fn assert_laddered_at_sight(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet_name: &str,
+    coin: &Coin,
+    tip_at_broadcast: usize,
+    what: &str,
+) -> Result<mercuryrustlib::tesr::TesrBundle> {
+    let sid = coin.statechain_id.clone().ok_or(anyhow!("{what} has no statechain_id"))?;
+    let mined_meanwhile = chain_height(cc)?.saturating_sub(tip_at_broadcast) as u32;
+    let bundle = mercuryrustlib::tesr::load(cc, wallet_name, &sid).await?.ok_or(anyhow!(
+        "{what} ({sid}) was booked as {:?} but has NO `tesr-` row: it was not laddered in the pass \
+         that booked it, so at this instant it has no exit material at all",
+        coin.status
+    ))?;
+    match &coin.status {
+        CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED => println!(
+            "SDK74 - {what} ({sid}) sighted as {:?} ({mined_meanwhile} block(s) mined meanwhile) \
+             and laddered in the SAME pass, trigger {}",
+            coin.status, bundle.trigger.txid
+        ),
+        CoinStatus::CONFIRMED if mined_meanwhile >= cc.confirmation_target => println!(
+            "SDK74 - NOTICE: an external miner produced {mined_meanwhile} block(s) between the \
+             broadcast of {what} and its sighting, so it was already CONFIRMED at first sight; the \
+             pre-confirmation half of item 0 could not be observed for it this run"
+        ),
+        other => {
+            return Err(anyhow!(
+                "{what} ({sid}) was booked as {other:?} at first sight with only {mined_meanwhile} \
+                 block(s) mined since broadcast (confirmation_target {}): the deposit path is \
+                 gating on something other than mempool sight",
+                cc.confirmation_target
+            ))
+        }
+    }
+    let info = mercuryrustlib::utils::get_statechain_info(&sid, cc)
+        .await?
+        .ok_or(anyhow!("no statechain info for {sid}"))?;
+    assert_eq!(
+        info.num_sigs, 3,
+        "{what}: num_sigs at first sight must be exactly the 3 tiers (0 flat + 3): a 4 means a \
+         flat tx1 was co-signed at deposit, a 0 means the ladder waited for a confirmation"
+    );
+    assert_eq!(
+        flat_backup_rows(cc, wallet_name, &sid).await?,
+        0,
+        "{what}: a laddered coin carries ZERO flat backup rows at sight"
+    );
+    assert_eq!(coin.locktime, None, "{what}: coin.locktime is None for life — no calendar");
+    Ok(bundle)
+}
 
 async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
@@ -265,8 +379,9 @@ async fn mint_colored_carrier(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    // Same extra passes as at establish: the allocation is booked only after the deposit confirms,
-    // and the coloured lane deliberately refuses a carrier whose allocation is not yet BOOKED.
+    // Same extra passes as at establish: the ladder was built in the pass that sighted the carrier
+    // (an issuance books its allocation at broadcast), so these are an idempotency soak — and a
+    // safety net for a carrier the coloured lane deferred on a transient RGB read.
     for _ in 0..10 {
         wallet.claim().await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -364,24 +479,90 @@ pub async fn execute() -> Result<()> {
     let bob_address = bob.get_utexo_address().await?;
     let mut alice_events = alice.subscribe();
 
-    // ---- 1. One wallet, two coins: a PLAIN deposit and an RGB carrier. --------------------------
+    // ---- 1. One wallet, two coins: a PLAIN deposit and an RGB carrier — each laddered at SIGHT. --
+    //
+    // No `establish` call anywhere: claim() is the ONLY thing that ladders, coloured or plain, and
+    // it does so in the pass that first sees the funding transaction in the mempool. So each coin
+    // is broadcast and claimed BEFORE any block is mined, and the deposit-time property (item 0)
+    // is asserted on the coin exactly as the booking pass left it.
+    let mut seen: Vec<WalletEvent> = Vec::new();
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
     let plain_addr = alice.get_deposit_address(PLAIN_AMOUNT as u64).await?;
+    let tip_at_plain = chain_height(&cc)?;
     bitcoin_core::sendtoaddress(PLAIN_AMOUNT, &plain_addr)?;
     let rgb_fund_addr = alice.get_token_funding_address().await?;
     bitcoin_core::sendtoaddress(100_000, &rgb_fund_addr)?;
+    // 1a. The PLAIN deposit, un-mined: sighted and laddered PLAIN in one pass.
+    let plain_at_sight = claim_until_sighted(
+        &alice,
+        &cc,
+        "sdk74_alice",
+        &mut alice_events,
+        &mut seen,
+        "the plain deposit",
+        |c| c.aggregated_address.as_deref() == Some(plain_addr.as_str()),
+    )
+    .await?;
+    let plain_bundle_at_sight =
+        assert_laddered_at_sight(&cc, "sdk74_alice", &plain_at_sight, tip_at_plain, "the plain deposit")
+            .await?;
+    assert!(
+        !plain_bundle_at_sight.is_colored(),
+        "a plain deposit sighted in the mempool must get a PLAIN ladder"
+    );
     let core = bitcoin_core::getnewaddress()?;
     bitcoin_core::generatetoaddress(3, &core)?;
-    tokio::time::sleep(Duration::from_secs(3)).await; // electrs indexing
+    tokio::time::sleep(Duration::from_secs(3)).await; // electrs indexing (the RGB funding must settle)
 
+    // 1b. The CARRIER, un-mined: an issuance books its allocation the moment the funding tx is
+    // broadcast, so the pass that sights the carrier finds exactly one booked allocation on it and
+    // builds the COLOURED ladder over an UNCONFIRMED `F`. This is also the window in which a
+    // premise failure would be worst: a carrier whose allocation were NOT yet visible would be
+    // read as an ordinary coin and PLAIN-laddered, which is the burn `PlainLadderOverCarrier`
+    // exists to name — so the lane of the ladder at sight is asserted, not just its presence.
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
+    let tip_at_issue = chain_height(&cc)?;
     let mut asset_id = alice.issue_token("CTES", "Coloured Ladder Token", 0, SUPPLY).await?;
+    let carrier_at_sight = claim_until_sighted(
+        &alice,
+        &cc,
+        "sdk74_alice",
+        &mut alice_events,
+        &mut seen,
+        "the issuance's carrier",
+        |c| c.aggregated_address.as_deref() != Some(plain_addr.as_str()),
+    )
+    .await?;
+    let carrier_bundle_at_sight = assert_laddered_at_sight(
+        &cc,
+        "sdk74_alice",
+        &carrier_at_sight,
+        tip_at_issue,
+        "the issuance's carrier",
+    )
+    .await?;
+    assert!(
+        carrier_bundle_at_sight.is_colored(),
+        "the carrier sighted in the mempool got a PLAIN ladder over its sealed funding output — \
+         the allocation was not visible to the booking pass, and a plain trigger over it BURNS the \
+         allocation on exit (the `plain-ladder-over-carrier` hazard)"
+    );
+    assert_eq!(
+        carrier_bundle_at_sight.rgb.as_ref().map(|r| r.contract_id.as_str()),
+        Some(asset_id.as_str()),
+        "the coloured ladder built over the unconfirmed F carries THIS contract"
+    );
+    println!(
+        "SDK74 - the coloured trigger {} was built over the UNCONFIRMED funding output {}:{}",
+        carrier_bundle_at_sight.trigger.txid,
+        carrier_bundle_at_sight.f_txid,
+        carrier_bundle_at_sight.f_vout
+    );
     bitcoin_core::generatetoaddress(3, &core)?;
 
-    // No `establish` call anywhere: claim() is the ONLY thing that ladders, coloured or plain.
-    let mut seen: Vec<WalletEvent> = Vec::new();
+    // Confirm both. The ladders already exist; this loop only waits for the balances to settle.
     let mut waited = 0;
     loop {
         alice.claim().await?;
@@ -396,8 +577,9 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    // One more pass: the carrier's allocation is booked only after the deposit confirms, and the
-    // coloured lane deliberately refuses a carrier whose allocation is not yet BOOKED.
+    // An idempotency soak: a laddered CONFIRMED coin must be left alone by every further pass —
+    // re-establishing would spend three more irreversible co-signs and unbalance the census, which
+    // section 5's exact `num_sigs == 3` would then catch.
     for _ in 0..10 {
         alice.claim().await?;
         seen.extend(drain(&mut alice_events));
@@ -463,6 +645,17 @@ pub async fn execute() -> Result<()> {
     assert_eq!(rgb_half.contract_id, asset_id, "the ladder carries THIS contract");
     assert_eq!(rgb_half.amount, SUPPLY, "the whole allocation rides the ladder");
     assert_eq!(rgb_half.consignments.len(), 3, "one consignment per tier (T, X_0, S_0)");
+    // Confirmation did not replace either ladder: what is on disk now is what the booking pass
+    // co-signed over the un-mined funding outputs.
+    assert_eq!(
+        bundle.trigger.txid, carrier_bundle_at_sight.trigger.txid,
+        "the carrier's coloured trigger on disk after confirmation must be the one built at sight"
+    );
+    assert_eq!(
+        plain_bundle.trigger.txid, plain_bundle_at_sight.trigger.txid,
+        "the plain deposit's trigger on disk after confirmation must be the one built at sight"
+    );
+    assert_eq!(carrier_sid, carrier_at_sight.statechain_id.clone().unwrap_or_default());
     assert!(
         seen.iter().any(|e| matches!(
             e,
@@ -538,15 +731,23 @@ pub async fn execute() -> Result<()> {
 
     // ---- 5. The CENSUS balances at exactly the plain path's value. ------------------------------
     //
-    // Colouring adds ZERO SE co-signs — one input, one sighash, one cosign_tier — so the equation is
-    // `num_sigs == flat_backups(1, the deposit-anchored tx1) + tiers(3) + superseded(0)`. Verified
-    // with the SAME bound verifier a receiver runs, against the coordinator's live count.
+    // Colouring adds ZERO SE co-signs — one input, one sighash, one cosign_tier — and there is no
+    // flat backup on any coin, so the equation is `num_sigs == flat_backups(0) + tiers(3) +
+    // superseded(0) == 3`. Verified with the SAME bound verifier a receiver runs, against the
+    // coordinator's live count, with the flat term 0 — and the count is read AFTER the
+    // idempotency soak above, so a re-establishment at CONFIRMED would show up here as 6.
     let info = mercuryrustlib::utils::get_statechain_info(&carrier_sid, &cc)
         .await?
         .ok_or(anyhow!("no statechain info for the carrier"))?;
     assert_eq!(
-        info.num_sigs, 4,
-        "a coloured ladder must consume exactly 3 co-signs on top of the deposit's tx1"
+        info.num_sigs, 3,
+        "a coloured ladder must consume exactly 3 co-signs and nothing else: no tx1 at deposit, \
+         no re-establishment at confirmation"
+    );
+    assert_eq!(
+        flat_backup_rows(&cc, "sdk74_alice", &carrier_sid).await?,
+        0,
+        "the coloured carrier carries ZERO flat backup rows after confirmation"
     );
     {
         use electrum_client::ElectrumApi;
@@ -560,11 +761,15 @@ pub async fn execute() -> Result<()> {
             &tx0_hex,
             info.aggregate_pubkey.clone(),
         )?;
-        mercuryrustlib::tesr::verify_bundle_bound(&bundle, info.num_sigs, 1, &authority).map_err(
+        mercuryrustlib::tesr::verify_bundle_bound(&bundle, info.num_sigs, 0, &authority).map_err(
             |e| anyhow!("the coloured ladder does not pass the receiver's bound verifier: {e}"),
         )?;
+        assert!(
+            mercuryrustlib::tesr::verify_bundle_bound(&bundle, info.num_sigs, 1, &authority).is_err(),
+            "the flat term is ZERO — a census that still counts a phantom tx1 must not balance"
+        );
     }
-    println!("SDK74 - census balances: num_sigs 4 == 1 flat backup + 3 tiers (colouring adds none)");
+    println!("SDK74 - census balances: num_sigs 3 == 0 flat backups + 3 tiers (colouring adds none)");
 
     // ---- 6. The RGB half: the consignment validates against the UN-BROADCAST ladder. ------------
     //
@@ -983,15 +1188,24 @@ pub async fn execute() -> Result<()> {
             &tx0_hex,
             info.aggregate_pubkey.clone(),
         )?;
-        // 2 flat backups: the deposit's tx1 plus one per hop... one per conveyance that co-signed a
-        // backup to the receiver. Read it from the coin rather than guessing.
-        let flat = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk74_carol", &carrier_sid)
-            .await?
-            .len() as u32;
+        // ZERO flat backups, read from carol's own rows rather than assumed: no tx1 at deposit and
+        // none per hop — a conveyed one is refused by name, so a receiver never books one. The
+        // flat term the verifier is handed is therefore 0, and the census is tiers + superseded.
+        let flat = flat_backup_rows(&cc, "sdk74_carol", &carrier_sid).await? as u32;
+        assert_eq!(
+            flat, 0,
+            "carol must hold ZERO flat backup rows for the conveyed carrier: two hops conveyed \
+             `backup_transactions: []`, and a receiver refuses any that is not empty"
+        );
         mercuryrustlib::tesr::verify_bundle_bound(&carol_bundle, info.num_sigs, flat, &authority)
             .map_err(|e| anyhow!("carol's conveyed coloured ladder fails the bound verifier: {e}"))?;
+        assert_eq!(
+            info.num_sigs as usize,
+            3 + carol_bundle.superseded_states.len() + carol_bundle.superseded_extensions.len(),
+            "after 2 hops + {renewals} renewal(s) the census is exactly tiers + superseded"
+        );
         println!(
-            "SDK74 - census still exact after 2 hops + {renewals} renewal(s): num_sigs {} == {flat} flat \
+            "SDK74 - census still exact after 2 hops + {renewals} renewal(s): num_sigs {} == 0 flat \
              backups + 3 tiers + {} superseded",
             info.num_sigs,
             carol_bundle.superseded_states.len() + carol_bundle.superseded_extensions.len()
@@ -999,11 +1213,16 @@ pub async fn execute() -> Result<()> {
     }
     println!("SDK74 - hop 2 bob -> carol validates: the RECEIVER can continue the ladder, so the seals really were opened");
 
-    // ---- 12. The DEFAULT is unchanged: carol's OWN carrier stays flat, and still pays tokens. ---
+    // ---- 12. OPTING OUT: carol's OWN carrier gets NO exit material, and cannot pay. -------------
     //
     // carol runs with `colored_ladder` OFF and has just RECEIVED a coloured ladder, which is the
     // sharper version of this control: the flag gates ESTABLISHING colour, never accepting it. Her
-    // own freshly-issued carrier must still take the legacy flat lane, unchanged.
+    // own freshly-issued carrier is therefore left UN-laddered — and, since there is no flat `tx1`
+    // any more, that means NO exit material at all: no `tesr-` row AND zero flat backup rows. The
+    // skip is recorded (`rgb-carrier`) and surfaced (`LadderSkipped{RgbCarrier}`) so the owner
+    // knows. The legacy lane that used to pay tokens out of such a flat carrier is RETIRED
+    // (`register_split_subcoins_n` refuses by name), so a payment out of it must be REFUSED rather
+    // than quietly taking a lane that no longer exists.
     let mut carol_events = carol.subscribe();
     let t = prepaid_token(&cc).await?;
     carol.add_prepaid_token(&t).await;
@@ -1052,14 +1271,30 @@ pub async fn execute() -> Result<()> {
     for sid in &carol_carriers {
         assert!(
             mercuryrustlib::tesr::load(&cc, "sdk74_carol", sid).await?.is_none(),
-            "with colored_ladder OFF, a carrier must stay UN-laddered exactly as before"
+            "with colored_ladder OFF, a carrier must stay UN-laddered"
+        );
+        // No flat backup either: `tx1` is not minted at deposit for anyone, opted-out or not. A
+        // row here would mean the deposit path still co-signs a plain spend of the sealed output
+        // — the RGB-unaware exit that burns the allocation when it matures.
+        assert_eq!(
+            flat_backup_rows(&cc, "sdk74_carol", sid).await?,
+            0,
+            "an opted-out carrier has NO exit material: zero flat backup rows as well as no ladder"
         );
         assert_eq!(
             mercuryrustlib::transfer_sender::read_ladder_skip(&cc, "sdk74_carol", sid, 0)
                 .await
                 .as_deref(),
             Some(mercuryrustlib::transfer_sender::FLAT_RGB_CARRIER),
-            "the default path still records the carrier as flat-lane"
+            "the opted-out path records the carrier as `rgb-carrier`"
+        );
+        assert_eq!(
+            mercuryrustlib::utils::get_statechain_info(sid, &cc)
+                .await?
+                .ok_or(anyhow!("no statechain info for carol's carrier {sid}"))?
+                .num_sigs,
+            0,
+            "an opted-out carrier has had NO co-sign at all: no tx1 at sight, no tiers"
         );
     }
     assert!(
@@ -1067,42 +1302,43 @@ pub async fn execute() -> Result<()> {
             e,
             WalletEvent::LadderSkipped { reason, .. } if *reason == LadderSkipReason::RgbCarrier
         )),
-        "the default path still surfaces LadderSkipped{{RgbCarrier}}"
+        "the opted-out path surfaces LadderSkipped{{RgbCarrier}}"
     );
-    // And the legacy lane still pays, so the default really is untouched.
-    let mut bob_events = bob.subscribe();
-    let bob_bg = bob.start_background();
+    // And the legacy lane does NOT pay: it is retired, so a token payment out of an un-laddered
+    // carrier is refused by name instead of minting flat-backed sub-coins that could never exit.
     for _ in 0..2 {
         let t = prepaid_token(&cc).await?;
         carol.add_prepaid_token(&t).await;
     }
-    let r = carol.transfer_tokens(&carol_asset, &bob_address, 250).await?;
-    assert!(r.used_split, "the legacy colored split still runs on the default path");
-    let recv = tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            match bob_events.recv().await {
-                Ok(WalletEvent::TokenTransferClaimed { asset_id: a, amount, .. })
-                    if a == carol_asset =>
-                {
-                    break amount
-                }
-                Ok(_) => continue,
-                Err(e) => panic!("event stream closed: {e}"),
-            }
+    let refusal = match carol.transfer_tokens(&carol_asset, &bob_address, 250).await {
+        Ok(r) => {
+            return Err(anyhow!(
+                "an opted-out, un-laddered carrier PAID 250 CTRL (used_split={}) — the legacy \
+                 off-chain branch split is RETIRED and must refuse, or it mints sub-coins with no \
+                 exit material",
+                r.used_split
+            ))
         }
-    })
-    .await
-    .map_err(|_| anyhow!("bob did not claim carol's token transfer in time"))?;
-    bob_bg.abort();
-    assert_eq!(recv, 250, "bob booked 250 CTRL off-chain on the unchanged default path");
-    println!("SDK74 - default path unchanged: carol's carrier stays flat and still pays 250 CTRL");
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        refusal.contains("retired"),
+        "the opted-out payment must be refused BY NAME as the retired branch split, got: {refusal}"
+    );
+    println!(
+        "SDK74 - opting out yields no second lane: carol's carrier has no ladder, 0 flat rows, \
+         num_sigs 0, is recorded rgb-carrier, and paying from it is refused ({})",
+        refusal.lines().next().unwrap_or("").trim()
+    );
 
     println!(
-        "SDK74 - PASS: a COLOURED ladder is established over an RGB carrier (opret@0, payload@1, \
-         coloured fee, allocation intact, census unchanged), RENEWED against >=3 rivals over one \
-         parent output with the live tier deliberately not the internal-txid minimum, and conveyed \
-         alice -> bob -> carol entirely off-chain with every hop validating; the plain path and the \
-         default (flag-off) path are untouched"
+        "SDK74 - PASS: both coins laddered at FIRST SIGHT (plain over the plain deposit, COLOURED \
+         over the issuance's UNCONFIRMED F; num_sigs 3, 0 flat rows, locktime None at sight), a \
+         COLOURED ladder established over an RGB carrier (opret@0, payload@1, coloured fee, \
+         allocation intact, census 3 == 0 + 3), RENEWED against >=3 rivals over one parent output \
+         with the live tier deliberately not the internal-txid minimum, and conveyed alice -> bob \
+         -> carol entirely off-chain with every hop validating and zero flat backups conveyed; the \
+         plain path is untouched and opting out leaves a carrier with no exit and no lane"
     );
     Ok(())
 }

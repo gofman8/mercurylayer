@@ -6,14 +6,22 @@
 //! funds land at Bob. Bob could only spend S' if it truly pays his key — so this end-to-end exit is
 //! the direct proof that Model A hands the receiver a complete, self-custodial exit chain.
 //!
+//! The ladder Alice conveys is the one THE DEPOSIT signed at first mempool sight (loaded with
+//! `tesr::load`, never re-established). The hop carries NO flat backup — `backup_transactions: []`
+//! is the only admissible shape — so the test also pins what the receiver books: no `<sid>` flat
+//! row, `locktime: None`, and a census that balances with the flat term 0 (`num_sigs == 4 == 3
+//! deposit tiers + the one S' the hop co-signed`, the superseded S_0 disclosed) and does NOT balance
+//! with the retired per-hop-backup baseline.
+//!
 //! Run with SDK_E2E=49 (needs the regtest + Mercury lockbox stack, Core 28+).
 
 use std::{env, fs, process::Command};
 
 use anyhow::{anyhow, Result};
 
-use crate::bitcoin_core;
-use crate::sdk40_tesr_consensus::{broadcast, deposit_coin, is_outpoint_spent, mine, tx_exists, wait_for_address};
+use crate::sdk40_tesr_consensus::{
+    broadcast, deposit_coin, is_outpoint_spent, mine, se_num_sigs, tx_exists, wait_for_address,
+};
 
 const NETWORK: &str = "regtest";
 
@@ -23,15 +31,20 @@ pub async fn execute() -> Result<()> {
     env::set_var("ML_NETWORK", "regtest");
     let cc = mercuryrustlib::client_config::load().await;
 
-    // ---- Alice: V2 coin (establish a ladder), then transfer to Bob. ----
-    let mut alice = deposit_coin(&cc, "sdk49_alice").await?;
+    // ---- Alice: a V2 coin laddered BY THE DEPOSIT at first sight. LOAD it, then transfer to Bob. ----
+    let alice = deposit_coin(&cc, "sdk49_alice").await?;
     let sid = alice.statechain_id.clone().ok_or(anyhow!("no statechain_id"))?;
     let f_txid = alice.utxo_txid.clone().ok_or(anyhow!("no F txid"))?;
     let f_vout = alice.utxo_vout.ok_or(anyhow!("no F vout"))?;
-    let alice_exit = bitcoin_core::getnewaddress()?;
-    let ab = mercuryrustlib::tesr::establish_auto(&cc, &mut alice, &alice_exit, NETWORK).await?;
-    mercuryrustlib::tesr::persist(&cc, "sdk49_alice", &ab).await?;
-    println!("SDK49 - Alice established a ladder; transferring to Bob (Model A pre-signs the Bob-paying state)");
+    let ab = mercuryrustlib::tesr::load(&cc, "sdk49_alice", &sid)
+        .await?
+        .ok_or(anyhow!("the deposit did not persist a ladder for {sid}"))?;
+    assert_eq!(
+        se_num_sigs(&cc, &sid).await?,
+        3,
+        "before the hop the enclave has co-signed exactly T + X_0 + S_0 — no tx1, no second ladder"
+    );
+    println!("SDK49 - Alice's deposit ladder loaded (S_0 csv {:?}); transferring to Bob (Model A pre-signs the Bob-paying state)", ab.current().state.csv);
 
     let bob_wallet = mercuryrustlib::wallet::create_wallet("sdk49_bob", &cc).await?;
     mercuryrustlib::sqlite_manager::insert_wallet(&cc.pool, &bob_wallet).await?;
@@ -57,6 +70,37 @@ pub async fn execute() -> Result<()> {
     assert!(bob_bundle.current().state.csv.unwrap() < ab.current().state.csv.unwrap(), "S' CSV is lower than Alice's");
     println!("SDK49 - Bob adopted the ladder; its state pays Bob (csv {:?}) and is lower than Alice's (csv {:?})",
         bob_bundle.current().state.csv, ab.current().state.csv);
+
+    // ---- The hop conveyed NO flat backup, and Bob booked none. ----
+    // A laddered coin travels as `backup_transactions: []`; the receiver derives F from the bundle,
+    // binds it against the chain, and books no calendar. Any conveyed flat backup is refused by name
+    // (`verify_flat_backup_lane`), so a row here could only mean the sender co-signed one — which the
+    // census below would then fail to account for.
+    assert!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk49_bob", &sid).await?.is_none(),
+        "Bob must hold NO `<sid>` flat backup row: a laddered coin conveys backup_transactions: []"
+    );
+    assert!(
+        bob_coin.locktime.is_none(),
+        "Bob's coin carries no absolute calendar (locktime must be None), got {:?}",
+        bob_coin.locktime
+    );
+    assert_eq!(
+        bob_bundle.superseded_states.len(),
+        1,
+        "Alice's S_0 travels as the ONE disclosed superseded state (S' replaced it)"
+    );
+    // Census on Bob's side: 3 deposit tiers + the single S' the hop co-signed = 4, every one of them
+    // disclosed, flat term 0 — and the retired baseline of one flat backup per hop does NOT balance.
+    let n = se_num_sigs(&cc, &sid).await?;
+    assert_eq!(n, 4, "num_sigs after one Model A hop is 3 (deposit) + 1 (S') — no per-hop flat backup was co-signed");
+    mercuryrustlib::tesr::verify_bundle(&bob_bundle, n, 0)
+        .map_err(|e| anyhow!("Bob's adopted bundle must pass the census with flat term 0: {e}"))?;
+    assert!(
+        mercuryrustlib::tesr::verify_bundle(&bob_bundle, n, 1).is_err(),
+        "the retired per-hop flat-backup baseline must NOT balance: 4 != 1 + 3 tiers + 1 superseded"
+    );
+    println!("SDK49 - the hop conveyed zero flat backups: Bob has no `<sid>` row, no locktime; census {n} == 3 tiers + 1 superseded, flat term 0 ✓");
 
     // ---- Bob unilaterally EXITS the adopted ladder — funds must land at Bob. ----
     let tiers: Vec<(String, Option<u16>)> =

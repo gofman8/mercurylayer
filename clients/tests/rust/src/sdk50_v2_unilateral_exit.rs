@@ -5,8 +5,8 @@
 //! a wallet whose deposit auto-established a ladder calls
 //! `wallet.unilateral_exit()` and the SDK — with no ladder knowledge required by the caller — walks the
 //! TES-R chain (trigger → extension → state) as each relative-CSV matures, reporting `wait_blocks`
-//! between tiers, until the funds land at the wallet's own seed-derived backup address. No
-//! absolute-locktime backup transaction is broadcast.
+//! between tiers, until the funds land at the wallet's own seed-derived backup address. The
+//! ladder is the coin's only exit material; no absolute-locktime backup transaction exists.
 //!
 //! Run with SDK_E2E=50 (needs the regtest + Mercury lockbox stack, Core 28+).
 
@@ -98,6 +98,6 @@ pub async fn execute() -> Result<()> {
     let again = alice.unilateral_exit(Some(vec![sid.clone()]), None).await?;
     assert!(again[0].complete && again[0].wait_blocks == 0, "a completed exit stays complete");
 
-    println!("SDK50 - ✓ PASS: wallet.unilateral_exit() walked the TES-R ladder to completion ({exit_value} sat at the owner's key, F spent, no absolute-locktime backup)");
+    println!("SDK50 - ✓ PASS: wallet.unilateral_exit() walked the TES-R ladder to completion ({exit_value} sat at the owner's key, F spent, the ladder is the only exit material)");
     Ok(())
 }

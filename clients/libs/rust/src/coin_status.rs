@@ -4,19 +4,49 @@ use std::str::FromStr;
 
 use bitcoin::Address;
 use electrum_client::{ElectrumApi, ListUnspentRes};
-use mercurylib::{utils::is_enclave_pubkey_part_of_coin, wallet::{Activity, BackupTx, Coin, CoinStatus}};
+use mercurylib::{utils::is_enclave_pubkey_part_of_coin, wallet::{Activity, Coin, CoinStatus}};
 use anyhow::{anyhow, Result, Ok};
 
-use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet, insert_backup_txs}, deposit::create_tx1};
+use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}};
+
+/// **Who establishes a fresh deposit's exit ladder, and when.**
+///
+/// A coin's ONLY exit material is its TES-R ladder (`T` → `X_0` → `S_0`, all co-signed in advance,
+/// none broadcast). There is no flat absolute-locktime backup any more: the ladder is signed the
+/// moment the funding transaction is first seen in the mempool, in place of the `tx1` that used to
+/// be signed there — the trigger needs nothing but the funding outpoint, its value and the aggregate
+/// key, all of which are known at first sight, and the coordinator never gates a co-sign on
+/// confirmation. So the depositor's exit is `T` from the first moment, and the coin carries no
+/// absolute calendar: nothing in its exit material ever matures on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LadderAtSight {
+    /// Establish a PLAIN ladder inside [`update_coins_ex`], at first sight. The default for callers
+    /// that have no RGB engine (the CLI, the legacy E2E suites): a plain deposit gets its ladder here
+    /// and nowhere else.
+    Plain,
+    /// Establish nothing here. The caller (the SDK's `claim()`) runs its own establish pass over
+    /// every un-laddered `IN_MEMPOOL` / `UNCONFIRMED` / `CONFIRMED` coin immediately after this
+    /// call, choosing a plain or a COLOURED ladder from the coin's booked RGB allocations. That pass
+    /// is inside the same `claim()` call, so the window in which a coin has no exit is the same one
+    /// the flat `tx1` used to have: the deposit is seen and laddered in one pass.
+    Defer,
+}
 
 struct DepositResult {
     activity: Activity,
-    /// None for single-use coins (off-chain RGB tree nodes): they skip the unilateral-exit backup tx,
-    /// so the SE produces exactly one signature (the terminal spend) and single-use is `>=1`.
-    backup_tx: Option<BackupTx>,
+    /// The ladder established at first sight under [`LadderAtSight::Plain`]. `None` under
+    /// [`LadderAtSight::Defer`] and for `single_use` coins (the SE refuses a second co-sign on those,
+    /// so a three-tier ladder is impossible; they never had exit material of their own).
+    ladder: Option<crate::tesr::TesrBundle>,
 }
 
-async fn check_deposit(client_config: &ClientConfig, coin: &mut Coin, wallet_netwotk: &str) -> Result<Option<DepositResult>> {
+async fn check_deposit(
+    client_config: &ClientConfig,
+    coin: &mut Coin,
+    wallet_netwotk: &str,
+    wallet_name: &str,
+    ladder_at_sight: LadderAtSight,
+) -> Result<Option<DepositResult>> {
 
     if coin.statechain_id.is_none() && coin.utxo_txid.is_none() && coin.utxo_vout.is_none() {
         if coin.status != CoinStatus::INITIALISED {
@@ -73,18 +103,59 @@ async fn check_deposit(client_config: &ClientConfig, coin: &mut Coin, wallet_net
         if coin.status != CoinStatus::INITIALISED {
             return Err(anyhow!("The coin with the public key {} is not in the INITIALISED state", coin.user_pubkey.to_string()));
         }
-    
+
         coin.utxo_txid = Some(utxo_txid.to_string());
         coin.utxo_vout = Some(utxo_vout);
-    
+
         coin.status = CoinStatus::IN_MEMPOOL;
 
-        // Single-use coins skip the unilateral-exit backup tx (the tree branch is the exit), so the SE
-        // co-signs only the one terminal spend and single-use enforcement is a clean `>= 1`.
-        let backup_tx = if coin.single_use {
-            None
-        } else {
-            Some(create_tx1(client_config, coin, wallet_netwotk, 1u32).await?)
+        // THE EXIT LADDER, AT FIRST SIGHT. This is the moment the flat `tx1` used to be co-signed;
+        // the ladder takes its place. Nothing here waits for a confirmation: `establish_auto` reads
+        // only the funding outpoint, its value and the aggregate address, and the coordinator's
+        // sign endpoints never look at the chain.
+        //
+        // Idempotent by construction: a ladder row already on disk for this sid (a previous pass
+        // that established it and then failed to write the wallet record) is adopted rather than
+        // re-established — a second establishment would spend three more irreversible co-signs and
+        // leave the census permanently unbalanced.
+        //
+        // `single_use` coins get no ladder, as they got no `tx1`: the SE refuses any second co-sign
+        // on such a coin, so a three-tier ladder cannot exist over it.
+        let ladder = match ladder_at_sight {
+            LadderAtSight::Defer => None,
+            LadderAtSight::Plain if coin.single_use => None,
+            LadderAtSight::Plain => {
+                let statechain_id = coin
+                    .statechain_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("deposit seen for a coin with no statechain id"))?;
+                match crate::tesr::load(client_config, wallet_name, &statechain_id).await? {
+                    Some(existing) => Some(existing),
+                    None => {
+                        let payee = coin.backup_address.clone();
+                        match crate::tesr::establish_auto(client_config, coin, &payee, wallet_netwotk).await {
+                            std::result::Result::Ok(bundle) => Some(bundle),
+                            Err(e) => {
+                                // FAIL CLOSED, AND LEAVE THE COIN WHERE IT WAS. A deposit that is
+                                // visible but has no ladder is a coin with NO EXIT; it must not be
+                                // booked as IN_MEMPOOL (which every liveness allowlist reads as
+                                // "ours to defend") until the ladder exists. The next pass sees the
+                                // same UTXO and tries again.
+                                coin.utxo_txid = None;
+                                coin.utxo_vout = None;
+                                coin.status = CoinStatus::INITIALISED;
+                                return Err(anyhow!(
+                                    "deposit {}:{} for statechain id {statechain_id} was seen in the \
+                                     mempool but its exit ladder could not be established ({e}). The \
+                                     coin is NOT booked until it has a ladder — a deposit without one \
+                                     has no exit material at all. It will be retried on the next pass.",
+                                    utxo.tx_hash, utxo.tx_pos
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         };
 
         let activity_utxo = format!("{}:{}", utxo.tx_hash.to_string(), utxo.tx_pos);
@@ -93,7 +164,7 @@ async fn check_deposit(client_config: &ClientConfig, coin: &mut Coin, wallet_net
 
         deposit_result = Some(DepositResult {
             activity: activity.unwrap(),
-            backup_tx
+            ladder,
         });
     }
 
@@ -263,24 +334,46 @@ async fn check_for_duplicated(client_config: &ClientConfig, existing_coins: &Vec
 
 }
 
+/// [`update_coins_ex`] with [`LadderAtSight::Plain`]: every fresh deposit is laddered here, at first
+/// sight, with a PLAIN ladder. Callers with an RGB engine (the SDK) use [`update_coins_ex`] with
+/// [`LadderAtSight::Defer`] and ladder the coin themselves, plain or coloured, in the same pass.
 pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Result<()> {
-    
+    update_coins_ex(client_config, wallet_name, LadderAtSight::Plain).await
+}
+
+pub async fn update_coins_ex(client_config: &ClientConfig, wallet_name: &str, ladder_at_sight: LadderAtSight) -> Result<()> {
+
     let mut wallet: mercurylib::wallet::Wallet = get_wallet(&client_config.pool, &wallet_name).await?;
 
     let network = wallet.network.clone();
 
+    // A deposit whose ladder could not be established is left INITIALISED and retried next pass;
+    // the OTHER coins' status updates must not be lost to it, so the failures are collected and the
+    // wallet record is still written before they are reported.
+    let mut establish_failures: Vec<String> = Vec::new();
+
     for coin in wallet.coins.iter_mut() {
 
         if coin.status == CoinStatus::INITIALISED || coin.status == CoinStatus::IN_MEMPOOL || coin.status == CoinStatus::UNCONFIRMED {
-        
-            let deposit_result = check_deposit(client_config, coin, &network).await?;
-        
+
+            let deposit_result = match check_deposit(client_config, coin, &network, wallet_name, ladder_at_sight).await {
+                std::result::Result::Ok(r) => r,
+                Err(e) if coin.status == CoinStatus::INITIALISED => {
+                    establish_failures.push(e.to_string());
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
             if deposit_result.is_some() {
                 let deposit_result = deposit_result.unwrap();
                 let activity = deposit_result.activity;
                 wallet.activities.push(activity);
-                if let Some(backup_tx) = deposit_result.backup_tx {
-                    insert_backup_txs(&client_config.pool, &wallet.name, &coin.statechain_id.as_ref().unwrap(), &[backup_tx].to_vec()).await?;
+                // The ladder row is written BEFORE the wallet record, so a crash between the two
+                // leaves a ladder on disk for a coin still INITIALISED — which the next pass adopts
+                // (see `check_deposit`) instead of establishing a second one.
+                if let Some(bundle) = deposit_result.ladder {
+                    crate::tesr::persist(client_config, &wallet.name, &bundle).await?;
                 }
             }
         } else if coin.status == CoinStatus::IN_TRANSFER {
@@ -300,13 +393,13 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
 
     wallet.coins.extend(duplicated_coins);
 
-    // invalidate duplicated coins that were not transferred
+    // invalidate duplicated coins that were not transferred: once the index-0 coin under a
+    // statechain id has been handed over, no duplicate deposit to that address can move any more.
     for i in 0..wallet.coins.len() {
         if wallet.coins[i].status == CoinStatus::DUPLICATED {
-            let is_transferred = (0..wallet.coins.len()).any(|j| 
+            let is_transferred = (0..wallet.coins.len()).any(|j|
                 i != j && // Skip comparing with self
                 wallet.coins[j].statechain_id == wallet.coins[i].statechain_id &&
-                wallet.coins[j].locktime == wallet.coins[i].locktime &&
                 wallet.coins[j].status == CoinStatus::TRANSFERRED
             );
             if is_transferred {
@@ -316,6 +409,14 @@ pub async fn update_coins(client_config: &ClientConfig, wallet_name: &str) -> Re
     }
 
     update_wallet(&client_config.pool, &wallet).await?;
+
+    if !establish_failures.is_empty() {
+        return Err(anyhow!(
+            "{} deposit(s) were seen but could not be laddered this pass and are NOT booked:\n  {}",
+            establish_failures.len(),
+            establish_failures.join("\n  ")
+        ));
+    }
 
     Ok(())
 }

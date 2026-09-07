@@ -264,9 +264,10 @@ fn disclosed_superseded(cb: &ChildTesrBundle) -> u32 {
     (cb.child_superseded_states.len() + cb.child_superseded_extensions.len()) as u32
 }
 
-/// `child_num_sigs == child_flat_backups + 2 live tiers + superseded` — the leaf's EXACT-EQUALITY
-/// census, evaluated exactly as `verify_child_bundle` evaluates it. A derived child slot carries no
-/// flat backup (`CHILD_V2_BASELINE = 0`), so the whole term is `2 + superseded`.
+/// `child_num_sigs == 2 live tiers + superseded` — the leaf's EXACT-EQUALITY census, evaluated
+/// exactly as `verify_child_bundle` evaluates it. No coin at any level of the tree carries a flat
+/// backup (`CHILD_V2_BASELINE = 0`, as is `PARENT_V2_BASELINE`), so the flat term is zero and the
+/// whole census is `2 + superseded`.
 async fn assert_census_balances(cc: &ClientConfig, cb: &ChildTesrBundle, where_: &str) -> Result<u32> {
     let sid = &cb.child_statechain_id;
     let issued = num_sigs(cc, sid).await?;
@@ -417,6 +418,18 @@ pub async fn execute() -> Result<()> {
          deeper one would need `segment_funding_tier`'s convention and is a different test"
     );
     assert!(minted.rgb.is_none(), "a PLAIN leaf — the coloured lane has its own renewal builder");
+    // A leaf conveys NO flat backup and carries NO absolute calendar: its parent is a laddered coin
+    // with no flat backup, so nothing anywhere in its exit material matures on its own. Every
+    // budget argument below is about RELATIVE timelocks only.
+    assert!(
+        minted.parent_flat_backups.is_empty(),
+        "a leaf of a laddered parent conveys an EMPTY parent chain — got {} flat backup(s)",
+        minted.parent_flat_backups.len()
+    );
+    assert!(
+        coin_of(&cc, &holders[0].0, &leaf_sid).await?.locktime.is_none(),
+        "a leaf has no absolute-locktime backup; its coin's locktime must be None"
+    );
 
     // The leaf is minted at the top of the state schedule and the top of the extension schedule.
     let sp_tier = minted.parent.current().state.clone();
@@ -546,6 +559,14 @@ pub async fn execute() -> Result<()> {
                 to_w.get_balance().await?.available_sats,
                 PAY,
                 "{to_name} books the whole leaf"
+            );
+            assert!(
+                after.parent_flat_backups.is_empty(),
+                "hop {hops_done}: the conveyed leaf still carries an EMPTY parent chain"
+            );
+            assert!(
+                coin_of(&cc, &to_name, &leaf_sid).await?.locktime.is_none(),
+                "hop {hops_done}: a received leaf has no absolute calendar; locktime must be None"
             );
             // The last hop of an epoch must land ON the floor — that is what makes the refusal below
             // a refusal about the BUDGET rather than about anything else.

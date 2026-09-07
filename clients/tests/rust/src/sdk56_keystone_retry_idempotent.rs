@@ -4,14 +4,23 @@
 //! increments the SE's `sig_count`. If the sign/second RESPONSE is lost in flight, the count has
 //! advanced but the client holds no tier — and the naive recovery (a fresh sign/first) mints a NEW
 //! secnonce and a NEW co-sign, so `sig_count` runs ahead of the client's disclosed tier set forever.
-//! The receiver census `num_sigs == flat_backups + tiers + superseded` can then never rebalance ⟹ the
-//! coin BRICKS. No attacker needed. This is the last thing gating V2-as-default.
+//! The receiver census `num_sigs == tiers + superseded` (there is no flat term: no `tx1` is ever
+//! co-signed, so a laddered coin's count is its tiers and nothing else) can then never rebalance ⟹
+//! the coin BRICKS. No attacker needed. This is the last thing gating V2-as-default.
 //!
 //! The lockbox now caches the produced partial sig keyed on the session and increments the count
 //! ATOMICALLY with storing it. This test proves the property that makes the count census retry-safe:
 //! re-sending the EXACT SAME sign/second (what a client retry does)
 //!   1. returns the IDENTICAL partial signature (served from cache, not re-signed), and
 //!   2. does NOT advance `sig_count` a second time.
+//!
+//! The fixture is a real deposit, and a deposit is laddered AT FIRST MEMPOOL SIGHT: `deposit_coin`
+//! hands back a coin whose `T`, `X_0`, `S_0` are already co-signed, so the count this test starts
+//! from is EXACTLY 3 — asserted, because a 4 would mean a flat `tx1` is still being co-signed at
+//! deposit and a 0 would mean the ladder waited for a confirmation. The tier this test then co-signs
+//! by hand is a FOURTH signature over `F` (a rival trigger it never discloses): the coin is a
+//! throwaway whose census is deliberately left at 4 sigs against 3 tiers on disk, and it is never
+//! conveyed.
 //!
 //! Before the cache, step 2 would fail: the 2nd sign/second either re-incremented the count (desync ⟹
 //! brick) or hit the consumed secnonce and 400'd (unrecoverable). Run with SDK_E2E=56 (regtest +
@@ -43,7 +52,7 @@ pub async fn execute() -> Result<()> {
     env::set_var("ML_NETWORK", "regtest");
     let cc = mercuryrustlib::client_config::load().await;
 
-    // A real coin co-signable by the live SE.
+    // A real coin co-signable by the live SE — already laddered at first sight (T, X_0, S_0).
     let mut coin = deposit_coin(&cc, "sdk56_owner").await?;
     let sid = coin.statechain_id.clone().ok_or(anyhow!("no statechain_id"))?;
     let f_txid = coin.utxo_txid.clone().ok_or(anyhow!("no utxo_txid"))?;
@@ -54,11 +63,26 @@ pub async fn execute() -> Result<()> {
     // Capture the count BEFORE opening a session. (Reading /info/statechain BETWEEN sign/first and
     // sign/second hits a dangling NULL-challenge row — harmless once the server NULL-challenge fix is
     // deployed, but we read here so this test does not depend on that deploy.)
+    //
+    // The baseline is ABSOLUTE, not just "whatever it was": the deposit-time ladder is the only
+    // thing that has ever been co-signed on this coin, and it is exactly three tiers. There is no
+    // flat term — `create_tx1` is gone — so the count a fresh deposit starts from is 0 + 3.
     let before = num_sigs(&cc, &sid).await?;
     println!("SDK56 - num_sigs before the co-sign: {before}");
+    assert_eq!(
+        before, 3,
+        "a fresh deposit's count must be exactly its deposit-time ladder, T + X_0 + S_0 (0 flat + \
+         3 tiers): a 4 means a flat tx1 is still co-signed at deposit, a 0 means the ladder waited \
+         for a confirmation"
+    );
+    assert!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk56_owner", &sid).await?.is_none(),
+        "the fixture coin must carry NO flat backup row — the three co-signs are tiers, not a tx1"
+    );
 
     // Build ONE tier tx and drive the co-sign flow BY HAND (mirrors tesr::cosign_tier) so we can hold
-    // the exact sign/second payload and replay it — the thing a client retry does.
+    // the exact sign/second payload and replay it — the thing a client retry does. This is a rival
+    // trigger over F, the coin's FOURTH co-sign; it is never persisted or disclosed.
     let t = mercurylib::tesr::build_trigger(&f_txid, f_vout, f_value, &agg, NETWORK, FEE_RATE)?;
 
     let coin_nonce = mercurylib::transaction::create_and_commit_nonces(&mut coin)?;
@@ -79,7 +103,7 @@ pub async fn execute() -> Result<()> {
 
     let partial = mercurylib::tesr::cosign_tier_request(&coin, t.tx_hex.clone(), f_value, NETWORK.to_string())?;
 
-    // First sign/second — the real one. Count advances by exactly 1.
+    // First sign/second — the real one. Count advances by exactly 1: 3 -> 4.
     let sig1 = mercuryrustlib::transaction::sign_second(&cc, &partial.partial_signature_request_payload).await?;
     let after1 = num_sigs(&cc, &sid).await?;
     println!("SDK56 - after 1st sign/second: num_sigs={after1}");
@@ -110,6 +134,6 @@ pub async fn execute() -> Result<()> {
         return Err(anyhow!("KEYSTONE: a 3rd replay was not idempotent (sig or count changed)"));
     }
 
-    println!("SDK56 - ✓ PASS: the signing round is idempotent under retry — identical sig served from cache, num_sigs advanced exactly once across 3 replays. The count census is retry-safe.");
+    println!("SDK56 - ✓ PASS: the signing round is idempotent under retry — from a deposit-time baseline of exactly 3 (0 flat + 3 tiers), an identical sig was served from cache and num_sigs advanced exactly once across 3 replays. The count census is retry-safe.");
     Ok(())
 }

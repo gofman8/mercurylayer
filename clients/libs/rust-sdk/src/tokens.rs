@@ -3556,7 +3556,7 @@ impl UtexoWallet {
         self.recover_structural_spends_locked().await?;
         let banned = journal_stranded_carriers(&self.inner.cc.pool, &self.inner.config.wallet_name)
             .await?;
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let record = self.record().await?;
 
@@ -5119,6 +5119,13 @@ impl UtexoWallet {
     ///
     /// `carriers` is the coins whose `F` this route is about to spend. It is REQUIRED and it is
     /// checked: an empty list proves nothing about any coin and is refused (see the verdict).
+    /// **ALWAYS refuses, and BEFORE any co-sign.** The lane it guards is retired outright: its
+    /// sub-coins were exited by the flat backup chain, which no longer exists, so a child carved
+    /// here has no exit material and the SDK refuses to register it (`register_split_subcoins_n`).
+    /// Refusing at the gate — ahead of `create_colored_split_tx` — is what keeps the refusal from
+    /// costing the carrier an SE co-sign it can never account for in its census. The migration hatch
+    /// ([B1], un-colourable legacy pieces) is closed with the lane; its verdict is kept only to NAME
+    /// the reason precisely for a coloured wallet.
     async fn refuse_legacy_colored_split_lane(
         &self,
         what: &str,
@@ -5130,27 +5137,34 @@ impl UtexoWallet {
                 facts.push(self.carrier_migration_facts(c).await?);
             }
             let floor = self.colored_root_floor();
-            if let Err(why) = migration_hatch_verdict(floor, &facts) {
-                return Err(anyhow!(
-                    "the legacy coloured-split lane is RETIRED on this wallet ({what}): it spends \
-                     the carrier's funding output `F` directly, which is exactly what a CTES-R \
-                     trigger `T` spends with no timelock. {why}"
-                ));
-            }
-            eprintln!(
-                "[CTES-R migration] {what}: no COLOURED ladder can be built for any carrier this \
-                 route would spend, and none of them holds a ladder already — so no trigger `T` \
-                 exists or can be built to rival this spend (carriers: {}; coloured root floor \
-                 {floor} sat). Opening the RGB-aware legacy lane for them: this is the migration \
-                 hatch for carriers CTES-R cannot serve, not the retired lane coming back.",
-                facts
-                    .iter()
-                    .map(|f| format!("{} ({} sat)", f.statechain_id, f.sats))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let why = match migration_hatch_verdict(floor, &facts) {
+                Err(why) => why,
+                Ok(()) => format!(
+                    "Every carrier named here is one CTES-R cannot colour ({}; coloured root floor \
+                     {floor} sat). That used to open a migration hatch onto this lane; the hatch is \
+                     closed with the lane, because a child carved here would have been exited by \
+                     the flat backup chain, which no longer exists — there is no exit material for \
+                     it. Withdraw or unilaterally exit such a carrier instead.",
+                    facts
+                        .iter()
+                        .map(|f| format!("{} ({} sat)", f.statechain_id, f.sats))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            };
+            return Err(anyhow!(
+                "the legacy coloured-split lane is RETIRED on this wallet ({what}): it spends \
+                 the carrier's funding output `F` directly, which is exactly what a CTES-R \
+                 trigger `T` spends with no timelock. {why}"
+            ));
         }
-        Ok(())
+        Err(anyhow!(
+            "the legacy coloured-split lane is RETIRED ({what}): it spends the carrier's funding \
+             output `F` directly and its sub-coins were exited by flat backups, which no longer \
+             exist. A carrier pays only over a COLOURED ladder, and this wallet has `colored_ladder` \
+             off — on a network with no pinned attestation identity no coloured ladder can be \
+             built — so this carrier cannot pay here at all; withdraw or unilaterally exit it."
+        ))
     }
 
     /// **[CTES-R] Pay an amount that spans SEVERAL coloured carriers.**
@@ -5735,7 +5749,7 @@ impl UtexoWallet {
         self.recover_structural_spends_locked().await?;
         let banned = journal_stranded_carriers(&self.inner.cc.pool, &self.inner.config.wallet_name)
             .await?;
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let record = self.record().await?;
 
@@ -6190,9 +6204,9 @@ impl UtexoWallet {
 ///
 /// `mercuryrustlib::rgb::create_colored_split_tx` and `create_colored_combine_tx` are the two
 /// primitives that spend a carrier's FUNDING output `F` directly. That is the lane CTES-R replaces,
-/// and it is a RIVAL of a coloured trigger `T` over the same outpoint. With `colored_ladder` on it
-/// must be unreachable — so every call site must sit behind
-/// [`UtexoWallet::refuse_legacy_colored_split_lane`], which refuses outright when the flag is on.
+/// and it is a RIVAL of a coloured trigger `T` over the same outpoint. The lane is retired outright
+/// — its sub-coins were exited by flat backups, which no longer exist — so every call site must sit
+/// behind [`UtexoWallet::refuse_legacy_colored_split_lane`], which refuses BEFORE any co-sign.
 ///
 /// Like its sibling in `mercuryrustlib::tesr`, this is a grep over this module's own source rather
 /// than a behavioural test, and for the same reason: the hazard is a NEW route added later, which no
@@ -6411,32 +6425,51 @@ mod retired_split_lane_census {
         );
     }
 
-    /// The gate is only worth anything if it actually keys off the flag being flipped. Asserted
-    /// against the source so a future edit that turns it into a no-op fails here rather than in
-    /// production.
+    /// The gate refuses on BOTH sides of the flag, before any co-sign. Asserted against the source
+    /// so a future edit that opens either side (an `Ok(())` path) fails here rather than in
+    /// production — and so the coloured side still NAMES the hatch verdict, which is the reason the
+    /// owner can act on.
     #[test]
-    fn the_gate_refuses_exactly_when_the_coloured_lane_is_on() {
+    fn the_gate_always_refuses_and_names_the_hatch_verdict() {
         let src = include_str!("tokens.rs");
         let start = src
             .find("fn refuse_legacy_colored_split_lane(")
             .expect("the gate exists");
-        let body = &src[start..start + 1_200];
+        let end = src[start..].find("\n    }\n").map(|e| start + e).unwrap_or(src.len());
+        let body = &src[start..end];
         assert!(
             body.contains("if self.inner.config.colored_ladder {"),
-            "the retirement gate no longer keys off `SdkConfig::colored_ladder` — it can no longer \
-             retire anything"
+            "the coloured side of the gate is no longer distinguished — the owner of a coloured \
+             wallet loses the hatch verdict that names WHICH carrier cannot be coloured"
         );
         assert!(
-            body.contains("return Err("),
+            body.contains("return Err(") && body.contains("Err(anyhow!("),
             "the retirement gate no longer REFUSES; a gate that only warns retires nothing"
         );
-        // …and the refusal must still be the DEFAULT answer: the only thing that can turn it into
-        // an `Ok` is `migration_hatch_verdict`, whose narrowness is proved below. A gate that
-        // reached `Ok` by any other route would be a retirement in name only.
+        // `Ok(())` also appears as a match ARM over `migration_hatch_verdict`'s verdict, so pin
+        // what actually matters: the gate never RETURNS `Ok`. Both exits must be refusals.
+        assert!(
+            !body.contains("return Ok("),
+            "the retirement gate has grown an early `Ok` return — the retired lane is reachable \
+             again, and every refusal past this point costs the carrier a co-sign its census \
+             cannot account for"
+        );
+        let tail: Vec<&str> = body
+            .lines()
+            .rev()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && *l != "}" && *l != "))" && *l != ")")
+            .take(1)
+            .collect();
+        assert!(
+            body.trim_end().ends_with("))") && !tail.contains(&"Ok(())"),
+            "the gate's fall-through must be a refusal, not an `Ok(())` — a wallet with \
+             `colored_ladder` off would otherwise walk straight into the retired lane: {tail:?}"
+        );
         assert!(
             body.contains("migration_hatch_verdict("),
-            "the retirement gate opens on something other than `migration_hatch_verdict` — the \
-             hatch is no longer the single, tested reason the retired lane can run"
+            "the coloured side no longer consults `migration_hatch_verdict` — the refusal stops \
+             naming the carrier that would have needed the (closed) hatch"
         );
     }
 }

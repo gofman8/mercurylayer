@@ -161,104 +161,6 @@ pub(crate) struct Inner {
     pub rgb: Mutex<Option<mercury_rgb::RgbWallet>>,
 }
 
-/// [D13] Whether a split child / spine tip may be force-exited by the near-deadline pass.
-#[derive(Debug, PartialEq, Eq)]
-enum LeafSplitGate {
-    /// No open split names this coin — safe to evaluate for a near-deadline exit.
-    Drive,
-    /// The split journal could not be read at all, so no leaf can be vouched for. Blanket blindness
-    /// is recorded once before the loop; each row is dropped without a second message.
-    HoldSilently,
-    /// This coin is mid-split: an open split-journal record names it as terminalized, so its stored
-    /// row is the state that split SUPERSEDES. Driving it would destroy the pieces the split
-    /// already conveyed. Recorded as attention-needed (never idle), never driven.
-    Hold(String),
-}
-
-/// [D13] THE PREDICATE THE PLAIN-LEAF PORT'S SAFETY RESTS ON. A CONFIRMED status is not proof a
-/// leaf is safe to force-exit: a leaf terminalized by its own partial-payment split reads CONFIRMED
-/// with a stale row until the split's conveyance completes, and permanently if it crashed. The
-/// split journal — written at `Planned` strictly before the irreversible co-signature — is the
-/// durable evidence, so a mid-split coin appears here before any piece can be handed out.
-///
-/// `terminalizing`: `None` = the journal was unreadable (blindness over every child); `Some(set)` =
-/// the statechain ids currently mid-split.
-fn leaf_split_gate(
-    terminalizing: &Option<std::collections::HashSet<String>>,
-    cid: &str,
-    what: &str,
-) -> LeafSplitGate {
-    match terminalizing {
-        None => LeafSplitGate::HoldSilently,
-        Some(set) if set.contains(cid) => LeafSplitGate::Hold(format!(
-            "{cid} ({what}) is mid-split — an open split-journal record names it as terminalized, \
-             so its stored row is the state that split SUPERSEDES. Force-exiting it would destroy \
-             the pieces the split already conveyed. Left for the split's own recovery, reported \
-             here so it is not mistaken for idle"
-        )),
-        Some(_) => LeafSplitGate::Drive,
-    }
-}
-
-/// [D13-follow-up] Does this leaf's exit actually pay THIS wallet?
-///
-/// **The cancel-resurrection window.** `child_retransfer` marks the child IN_TRANSFER before its
-/// co-sign and stores the superseding, PAYEE-paying bundle before conveying it. If the conveyance
-/// leg then fails, the coin sits IN_TRANSFER with a row whose `child_owner_exit_address` is the
-/// payee's. A child conveyance opens a real coordinator transfer, so `POST /transfer/cancel` is
-/// reachable for it — and `status_after_cancel` lifts IN_TRANSFER back to CONFIRMED
-/// (`clients/libs/rust/src/transfer_sender.rs:1715-1720`). The repair step does not help:
-/// `reclaim_cancelled_conveyance` loads a `tesr-` bundle and returns `Ok(false)` for a child, which
-/// has none, so the row is never re-pointed at the owner.
-///
-/// A CONFIRMED status therefore does not imply the stored row pays us. Driving one that does not
-/// would force-exit the coin straight into the payee's address — handing away the sender's own
-/// money. This is the guard for that.
-///
-/// **Unrecognised is reported, not silently skipped.** Failing closed here means declining to
-/// defend a coin, which is itself a loss if the address is legitimately ours and merely unknown to
-/// this record. So the caller surfaces it as attention-needed rather than dropping it quietly.
-fn leaf_exit_pays_this_wallet(exit_address: &str, record: &WalletRecord) -> bool {
-    wallet_holds_address(exit_address, wallet_addresses(record).iter().map(|s| s.as_str()))
-}
-
-/// Every address this wallet can be paid at, from its own record.
-fn wallet_addresses(record: &WalletRecord) -> Vec<String> {
-    let mut out = Vec::new();
-    for c in record.coins.iter() {
-        out.push(c.backup_address.clone());
-        out.push(c.address.clone());
-        if let Some(a) = c.aggregated_address.as_ref() {
-            out.push(a.clone());
-        }
-    }
-    out
-}
-
-/// The comparison itself, split out so it is testable without constructing a whole wallet record
-/// (neither `Coin` nor `Wallet` implements `Default`, and a hand-built one would test the fixture
-/// rather than the rule).
-fn wallet_holds_address<'a>(exit_address: &str, mut known: impl Iterator<Item = &'a str>) -> bool {
-    known.any(|a| a == exit_address)
-}
-
-/// [D13] The event a near-deadline force-exit emits, chosen by the coin's kind. A coloured row
-/// settles a token allocation ([`WalletEvent::TokenCarrierMaterialized`]); a plain sats leaf is
-/// driven to L1 to beat its deadline ([`WalletEvent::LeafExitForced`]). Emitting the token event
-/// for a plain coin would mis-report it to any integrator watching the stream.
-fn near_deadline_exit_event(
-    colored: bool,
-    statechain_id: String,
-    deadline_block: u32,
-    tip: u32,
-) -> WalletEvent {
-    if colored {
-        WalletEvent::TokenCarrierMaterialized { statechain_id, deadline_block, tip }
-    } else {
-        WalletEvent::LeafExitForced { statechain_id, deadline_block, tip }
-    }
-}
-
 /// Utexo wallet (Spark-compatible API) on Mercury+RGB. Cheap to clone; all clones share state.
 #[derive(Clone)]
 pub struct UtexoWallet {
@@ -870,7 +772,7 @@ impl UtexoWallet {
         let before = self.record().await?;
         let confirmed_before: Vec<String> = coins_in(&before, CoinStatus::CONFIRMED);
 
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         // `execute_reporting_cancellations` + `fold_receive_outcome`, NOT the raising `execute`.
         // A cancelled incoming transfer used to `?` out right here, before `ClaimResult` was built
@@ -921,7 +823,7 @@ impl UtexoWallet {
         .await?;
         // transfer_receiver::execute updates statuses of freshly claimed coins internally; refresh
         // once more so claimed coins show as confirmed.
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
 
         let after = self.record().await?;
@@ -946,19 +848,21 @@ impl UtexoWallet {
             });
         }
 
-        // Auto-establish the TES-R exit ladder — UNCONDITIONAL: every CONFIRMED coin is laddered
-        // unless it falls in one of the three narrow classes that structurally cannot be
-        // (RGB carrier / [B0] un-broadcast funding / legacy no-aggregate). There is one protocol.
+        // Auto-establish the TES-R exit ladder — UNCONDITIONAL and AT FIRST SIGHT: every coin the
+        // wallet can see on chain or in the mempool (IN_MEMPOOL / UNCONFIRMED / CONFIRMED) is
+        // laddered, plain or coloured, unless it structurally cannot be (an RGB carrier a plain
+        // wallet cannot colour / [B0] un-broadcast funding / legacy no-aggregate). There is one
+        // protocol and the ladder is a coin's ONLY exit material — no flat backup is ever built.
         // The exit payee is the coin's seed-derived `backup_address` (recoverable from the
         // mnemonic), NEVER an out-of-wallet address. Idempotent: a coin that already has a ladder
         // is left alone.
         //
-        // Every skip is now RECORDED (`ladderskip-<sid>` in the wallet DB) and SURFACED
+        // Every skip is RECORDED (`ladderskip-<sid>` in the wallet DB) and SURFACED
         // (`WalletEvent::LadderSkipped`) — a review flagged the previous silence as a UX defect,
-        // since the owner only discovered a flat-only coin at transfer time. The record is also
-        // load-bearing for the conveyance path: `transfer_sender::assert_flat_conveyance_is_legitimate`
-        // reads it back to tell a legitimately-flat coin from an unexplained one, because that crate
-        // cannot see RGB state.
+        // since the owner only discovered an un-laddered coin at transfer time. The record is
+        // DIAGNOSTIC ONLY: a coin without a ladder cannot be conveyed whatever the reason
+        // (`transfer_sender::execute` refuses it by name), so the record exists to make the remedy
+        // visible, not to license anything.
         {
             let mut rec = self.record().await?;
             let network = rec.network.clone();
@@ -976,19 +880,17 @@ impl UtexoWallet {
             )
             .await
             .map_err(|e| anyhow!("could not mark the wallet ladder-managed: {e}"))?;
-            // Terminal-freeze invariant (PROTOCOL.md §5.10, rule 1): RGB rides the signed-once colored
-            // carrier model and is NEVER anchored on the renewable T/X/S ladder — a plain tier spend
-            // would destroy the allocation. So an RGB carrier must not get a ladder. `single_use`
-            // catches terminalized/combine carriers, but a resting issuance/received carrier holding
-            // an allocation need not be single_use, so we also exclude the RGB carrier set. Fail CLOSED
-            // for a token wallet whose RGB state is momentarily unavailable: skip establishing this
-            // pass (leave coins un-laddered) rather than risk laddering a carrier — next claim() retries.
+            // A carrier gets a COLOURED ladder (CTES-R) — every tier carries the allocation forward
+            // — and never a plain one, whose tiers would destroy the allocation on exit. So the
+            // carrier set must be known before anything is laddered. Fail CLOSED for a token wallet
+            // whose RGB state is momentarily unavailable: skip establishing this pass rather than
+            // risk plain-laddering a carrier — the next claim() retries.
             // AUDITED-SWALLOW: fails toward LESS work but MORE safety — `None` means "RGB state
-            // unavailable", and the only thing skipped is ESTABLISHING a ladder. An un-laddered coin
-            // keeps its absolute-locktime backup and stays exitable, whereas laddering a carrier
-            // would destroy its RGB allocation. It is also surfaced (`note_flat` +
-            // `LadderSkipped{RgbStateUnavailable}`) and retried on the next claim(), so it is not
-            // silent. Propagating instead would abort the whole claim pass over a transient blip.
+            // unavailable", and the only thing skipped is ESTABLISHING a ladder. A coin left without
+            // one has NO exit material until the next pass succeeds (there is no flat backup), which
+            // is why the skip is surfaced (`note_flat` + `LadderSkipped{RgbStateUnavailable}`) and
+            // retried on the next claim(). Propagating instead would abort the whole claim pass over
+            // a transient blip.
             let carriers = if self.inner.config.rgb_data_dir.is_some()
                 && self.inner.config.rgb_proxy_url.is_some()
             {
@@ -1024,11 +926,19 @@ impl UtexoWallet {
                 };
             for coin in rec.coins.iter_mut() {
                 let sid = match &coin.statechain_id { Some(s) => s.clone(), None => continue };
-                // A coin that is not CONFIRMED is not "flat-only", it is simply not ready: the
-                // deposit may still be confirming, or the coin is mid-transfer/withdrawing (where a
-                // fresh SE co-sign would inflate `num_sigs` against an open transfer). Not recorded,
-                // not surfaced — nothing has been decided about it.
-                if coin.status != CoinStatus::CONFIRMED {
+                // THE LADDER IS ESTABLISHED AT FIRST SIGHT. `update_coins_ex(.., Defer)` above has
+                // just booked every fresh deposit it saw in the mempool as IN_MEMPOOL with no exit
+                // material yet; this loop gives it its ladder in the SAME pass — plain, or COLOURED
+                // for a carrier whose allocation is already booked (an issuance books its allocation
+                // the moment the funding transaction is broadcast, before it confirms). Nothing
+                // exit-related waits for a confirmation: the trigger needs only the funding outpoint
+                // and the coordinator never gates a co-sign on the chain. A coin that is mid-transfer
+                // or withdrawing is excluded, because a fresh SE co-sign there would inflate
+                // `num_sigs` against an open transfer.
+                if !matches!(
+                    coin.status,
+                    CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED | CoinStatus::CONFIRMED
+                ) {
                     continue;
                 }
                 let dup = coin.duplicate_index;
@@ -1054,10 +964,20 @@ impl UtexoWallet {
                 // `tesr-` row be recorded under a reason that LICENSES flat conveyance. And it is
                 // the cheaper test: an already-laddered coin costs one DB read, not a chain query.
                 match mercuryrustlib::tesr::load(&self.inner.cc, &self.inner.config.wallet_name, &sid).await {
-                    // Already established — idempotent. Drop any stale "left flat" record so it can
-                    // never later excuse a flat conveyance of a coin that now HAS a ladder.
-                    Ok(Some(_)) => {
-                        self.clear_flat_note(&sid).await?;
+                    // Already established — idempotent. Drop any stale skip record so it never
+                    // describes a coin that now HAS a ladder — with one exception, recorded rather
+                    // than cleared: a PLAIN ladder over a coin the allocation set now says is a
+                    // CARRIER. That happens when tokens are moved onto an outpoint that was already
+                    // plain-laddered as a deposit. Its trigger is a plain spend of a sealed output,
+                    // so its exit would BURN the allocation, and it cannot be re-coloured (the
+                    // plain tiers are co-signed and cannot be unsigned). The coloured re-anchor is
+                    // the only remedy, and the owner has to know.
+                    Ok(Some(existing)) => {
+                        if is_token_carrier(coin, &carriers) && !existing.is_colored() {
+                            self.note_flat(&sid, 0, LadderSkipReason::PlainLadderOverCarrier).await?;
+                        } else {
+                            self.clear_flat_note(&sid).await?;
+                        }
                         continue;
                     }
                     Ok(None) => {}
@@ -1108,10 +1028,20 @@ impl UtexoWallet {
                 // later exit BURNS the asset, and propagates silently because the next hop sees a
                 // ladder and flips to `protocol_version = 2`.
                 //
-                // The coin's own backup rows are authoritative at this instant and need no RGB
-                // round-trip: a consignment on any row means the sender conveyed an allocation on this
-                // coin. Checked BEFORE the allocation-set decision precisely because it does not
-                // depend on booking having happened.
+                // WHAT IS AUTHORITATIVE AT THIS INSTANT — and it MOVED. This guard used to read the
+                // coin's own backup rows: a `rgb_consignment` on any row meant the sender had
+                // conveyed an allocation on this coin. A conveyance carries no backup rows any more
+                // (a coin's only exit material is its ladder), and the only writers of that field
+                // were the retired coloured-split lanes, so that read now answers "not a carrier"
+                // for every coin — the guard had gone SILENTLY DEAD, which is this repo's recurring
+                // failure shape and precisely the fail-open it was added to close.
+                //
+                // The conveyed RGB material now rides in the coin's own BUNDLE, so that is what is
+                // read: a `ctesr-` child or a `spinetip-` tip that is COLOURED is a carrier at this
+                // instant, whatever the allocation set has booked so far. (The ROOT case cannot
+                // reach here: a coloured root ladder is loaded above and `continue`s as already
+                // established.) The legacy backup-row read is KEPT after it, because a row written
+                // before the retirement is still authoritative for the coin it describes.
                 //
                 // FAIL CLOSED on an unreadable row, and note that absence and failure are DIFFERENT
                 // here (`get_backup_txs` is `fetch_one`, so a missing row is an `Err`): a coin with no
@@ -1125,6 +1055,39 @@ impl UtexoWallet {
                 // unconditional skip here would permanently deny it the coloured ladder it is
                 // entitled to. This check exists only to catch the coin the set has NOT booked yet.
                 if !is_token_carrier(coin, &carriers) {
+                    // The bundle half, fail-closed on an unreadable row for the same reason as the
+                    // legacy read below: "the database would not answer" must never be read as "no
+                    // allocation", because that reading is exactly how an RGB carrier gets a plain
+                    // ladder co-signed over its sealed funding output.
+                    let colored_bundle = match (
+                        mercuryrustlib::tesr::load_child(
+                            &self.inner.cc,
+                            &self.inner.config.wallet_name,
+                            &sid,
+                        )
+                        .await,
+                        mercuryrustlib::tesr::load_spine_tip(
+                            &self.inner.cc,
+                            &self.inner.config.wallet_name,
+                            &sid,
+                        )
+                        .await,
+                    ) {
+                        (Ok(child), Ok(tip)) => Ok(child.is_some_and(|cb| cb.is_colored())
+                            || tip.is_some_and(|t| t.is_colored())),
+                        _ => Err(()),
+                    };
+                    match colored_bundle {
+                        Ok(true) => {
+                            self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(()) => {
+                            self.note_flat(&sid, 0, LadderSkipReason::RgbStateUnavailable).await?;
+                            continue;
+                        }
+                    }
                     match crate::tokens::read_backup_rows(
                         &self.inner.cc.pool,
                         &self.inner.config.wallet_name,
@@ -1144,15 +1107,16 @@ impl UtexoWallet {
                     }
                 }
 
-                // [CTES-R] THE DECISION SITE. A carrier either gets a COLOURED ladder — every tier
+                // [CTES-R] THE DECISION SITE. A carrier gets a COLOURED ladder — every tier
                 // carrying a valid RGB state transition, so laddering MOVES the allocation instead
-                // of destroying it — or it stays on the flat lane exactly as before.
+                // of destroying it — or it gets nothing this pass and is retried.
                 //
                 // Fail CLOSED in every ambiguous case: the coloured lane is taken ONLY when the
                 // outpoint resolves to exactly ONE booked allocation. Zero (a pending carrier whose
                 // consignment is not booked yet) or more than one (no single-transition tier shape
-                // exists) both fall through to `note_flat(RgbCarrier)` + `continue`, i.e. today's
-                // behaviour, retried next pass.
+                // exists) both fall through to `note_flat(RgbCarrier)` + `continue`. Such a carrier
+                // has NO exit material until a later pass colours it — there is no flat backup to
+                // fall back on — which is exactly why the skip is recorded and surfaced.
                 let mut colored_target: Option<(String, u64)> = None;
                 if is_token_carrier(coin, &carriers) {
                     let one = coin_outpoint(coin).and_then(|o| booked.get(&o).cloned()).flatten();
@@ -1363,21 +1327,19 @@ impl UtexoWallet {
                             self.note_flat(&sid, 0, LadderSkipReason::EstablishFailed).await?;
                         }
                     }
-                    // Leave un-laddered: its tx1 backup still exits, and the next pass retries. The
-                    // owner is told, because a coin that keeps failing here is flat-only in practice.
+                    // Leave un-laddered and retry next pass. The coin has NO exit material until
+                    // that succeeds — there is no flat backup — so the owner is told every time.
                     //
                     // [CTES-R] A CARRIER that could not be coloured — most often because it cannot
-                    // afford three coloured rungs (`colored_ladder_floor`; every existing 1,500-sat
-                    // token piece is in that class) — is recorded as `RgbCarrier`, NOT
-                    // `EstablishFailed`. The distinction is load-bearing: `RgbCarrier` licenses flat
-                    // conveyance, so the carrier keeps working exactly as it does today, whereas
-                    // `EstablishFailed` licenses nothing and would leave it untransferable. The
-                    // coloured attempt refuses BEFORE its first SE co-sign, so nothing was spent.
+                    // afford three coloured rungs (`colored_ladder_floor`) — is recorded as
+                    // `RgbCarrier` rather than `EstablishFailed`, so the reason is visible: such a
+                    // carrier cannot be exited or conveyed until it is re-funded above the floor.
+                    // The coloured attempt refuses BEFORE its first SE co-sign, so nothing was spent.
                     Err(e) => {
                         if was_colored {
                             eprintln!(
-                                "coin {sid}: colouring the ladder failed ({e}); leaving the carrier \
-                                 on the flat lane"
+                                "coin {sid}: colouring the ladder failed ({e}); the carrier has NO \
+                                 exit material until a later pass colours it"
                             );
                             self.note_flat(&sid, 0, LadderSkipReason::RgbCarrier).await?;
                         } else {
@@ -1599,7 +1561,7 @@ impl UtexoWallet {
     /// client layer restores IN_TRANSFER -> CONFIRMED locally, and this reconciles it against the
     /// coordinator so selection, `defend_ladders` and `get_balance` all see a live coin again.
     async fn after_cancel(&self) -> Result<()> {
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let after = self.record().await?;
         let _ = self.inner.events_tx.send(WalletEvent::BalanceUpdate {
@@ -1608,13 +1570,13 @@ impl UtexoWallet {
         Ok(())
     }
 
-    /// Record that a coin was left on the FLAT (un-laddered) lane, and tell the application — but
-    /// only the FIRST time this reason applies. Both halves matter:
-    ///   * the DB record is what `transfer_sender::assert_flat_conveyance_is_legitimate` reads back
-    ///     to tell a legitimately-flat coin (carrier / [B0] / legacy) from an unexplained one, since
-    ///     that crate cannot see RGB state;
-    ///   * the event is the owner's advance notice that the coin is flat-only, instead of finding
-    ///     out at transfer time.
+    /// Record that a coin was left WITHOUT a ladder, and tell the application — but only the FIRST
+    /// time this reason applies. Both halves matter:
+    ///   * the DB record is the durable, on-demand answer to "why can this coin not be conveyed?"
+    ///     (`ladder_skip_reason` / `flat_only_coins`) — diagnostic only, it licenses nothing, since
+    ///     a coin without a ladder has no exit material and `transfer_sender::execute` refuses it;
+    ///   * the event is the owner's advance notice that the coin is stuck, instead of finding out
+    ///     at transfer time.
     /// De-duplicated on the recorded reason so the polling background watcher does not spam it.
     ///
     /// **The write failure is NOT swallowed.** It used to end in `.unwrap_or(false)`, which meant a
@@ -1723,11 +1685,10 @@ impl UtexoWallet {
     }
 
     /// Does this coin carry POSITIVE evidence that its funding `F` is off chain — a `branch-<id>`
-    /// exit chain (flat sub-coin) or a `ctesr-<id>` child bundle (in-ladder split child)? These are
-    /// the same two witnesses `transfer_sender::assert_flat_conveyance_is_legitimate` accepts, so
-    /// the recording side and the conveyance side agree on what "[B0] off-chain" means. A DB error
-    /// reads as "no evidence", which is the conservative answer here: it downgrades a permanent,
-    /// licensing reason to a transient one.
+    /// exit chain (legacy sub-coin) or a `ctesr-<id>` child bundle (in-ladder split child)? Such a
+    /// coin is recorded as [B0] rather than as an establish failure, so the reason shown to the
+    /// owner is the true one; nothing is licensed by it. A DB error reads as "no evidence", which
+    /// is the conservative answer here: it downgrades a permanent reason to a transient one.
     /// **[D31] Turn the configured fee source into a usable bump capability.**
     ///
     /// Returns the SIGNER and the CAPABILITY-BUILDER separately because `BumpCapability` borrows its
@@ -2297,306 +2258,10 @@ impl UtexoWallet {
             }
         }
 
-        // ---- [CTES-R] RECEIVED SPLIT CHILDREN — the ladder-lane form of the loop above -----------
-        //
-        // The loop above gates every carrier on a `branch-<id>` row, and a split child HAS none:
-        // its exit material is the five-tier chain `T -> X_m -> SP -> ext_child -> state_child`
-        // carried in its `ctesr-` bundle. `read_exit_branch` therefore answers VERIFIED-EMPTY for
-        // it, which that loop reads as "issued/flat carrier, no clawback risk" — and for a RECEIVED
-        // piece that is exactly wrong. The sender keeps one pre-signed, RGB-UNAWARE deposit backup
-        // over the very funding output `F` the child's chain roots at; the moment it matures she can
-        // spend `F` and the whole chain underneath it dies. On the flat lane that was a CLAWBACK
-        // (she recovered the tokens); on this lane it only DESTROYS them — but the receiver loses
-        // the allocation either way, and the answer is the same one `sdk34` has always tested:
-        // spend `F` first.
-        //
-        // Two things differ from the flat lane, both forced by the shape of the walk:
-        //
-        //  * THE ACTION is `unilateral_exit`, not a branch broadcast. The child's chain IS its
-        //    branch and every rung of it is RGB-aware; broadcasting any other spend of `F` destroys
-        //    the allocation, which is precisely why the loop above must never be pointed at this
-        //    coin. The walk is resumed by later passes as each relative timelock matures.
-        //  * THE DEADLINE GETS A HEAD START. A flat branch is locktime-0 and lands in one block, so
-        //    `L0` itself was a usable deadline. This walk is a chain of RELATIVE timelocks, so it
-        //    must be STARTED at least `Σ csv` blocks before `L0` or it cannot finish in time. The
-        //    head start is read off the bundle's own chain, never guessed.
-        //
-        // L1 — the same liveness allowlist `defend_ladders` applies: act only for a child this
-        // wallet still holds CONFIRMED. A child conveyed onward belongs to its recipient, and
-        // driving its chain would rival the state they now hold (the D1 class sdk79 pins).
-        //
-        // [D13] COVERS BOTH LANES. This loop once handled only COLOURED children, on the argument
-        // that a plain child was "left to its own change". It was not left to anything — a plain
-        // leaf had NO runtime deadline defence anywhere in the SDK, which under the RGB scope-out
-        // is the whole normative protocol. Coloured and plain leaves have the identical exposure (a
-        // pre-signed relative-timelock walk rooted at a funding output the splitter can still spend
-        // via the parent's flat backup), so both are driven here. The one thing that made covering
-        // plain rows unsafe — a leaf mid-split reading CONFIRMED with a stale row — is closed by the
-        // split-journal guard below.
-        let child_rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-        )
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "near-deadline protection is BLIND on every adopted split child: the child-bundle \
-                 rows could not be read ({e}) — refusing to report a protected wallet from a \
-                 failed read"
-            )
-        })?;
-        // [CATS/V4] Two row shapes, ONE protection. A coloured SPINE TIP is the sender's own change
-        // leg and its allocation sits on the un-broadcast `SP.out[K]` — the identical exposure a
-        // coloured child has to an ancestor's stale-backup clawback, differing only in whose money
-        // it is and in the chain being one tier shorter. Keying this loop on `ctesr-` alone would
-        // leave the sender's own coloured change as the single carrier class in the wallet with no
-        // near-deadline protection at all.
-        enum Row {
-            Child(Box<mercuryrustlib::tesr::ChildTesrBundle>),
-            Tip(Box<mercuryrustlib::tesr::SpineTipBundle>),
-        }
-
-        // [D13] THE SPLIT-JOURNAL GUARD — the one thing that makes covering PLAIN leaves safe.
-        //
-        // A leaf that has been TERMINALIZED by its own partial-payment split reads CONFIRMED, with a
-        // stale `ctesr-`/`spinetip-` row still naming the state its CSP supersedes, for the whole
-        // span from the CSP co-signature until the conveyance completes — and PERMANENTLY after any
-        // error or crash in that span, because `child_in_ladder_split` does NOT park the coin's
-        // status before its irreversible co-sign (unlike `child_retransfer` and `combine`), and
-        // `resume_split_conveyance` repairs only the conveyed pieces, never the terminalized parent.
-        // Force-exiting it here would broadcast `state_child`, rival the CSP over `ext_child.out[0]`,
-        // and DESTROY the grandchild pieces already handed to payees.
-        //
-        // The journal is the durable evidence that closes this: it is written at `Planned` STRICTLY
-        // BEFORE the co-signature, so any coin mid-split appears here before anything can be handed
-        // out. Skip such a coin (report it as attention-needed, never drive it). An unreadable
-        // journal is treated as blindness over EVERY child, never as permission — `journal_open_splits`
-        // already errors on an unparseable row, and here that error must not become "no coin is
-        // mid-split".
-        // `None` = the journal could not be read, i.e. blindness over every child; `Some(set)` = the
-        // set of statechain ids currently mid-split, which must not be driven.
-        let terminalizing: Option<std::collections::HashSet<String>> =
-            match mercuryrustlib::tesr::journal_open_splits(
-                &self.inner.cc,
-                &self.inner.config.wallet_name,
-            )
-            .await
-            {
-                Ok(recs) => {
-                    Some(recs.into_iter().map(|r| r.terminalized_statechain_id).collect())
-                }
-                Err(e) => {
-                    // Fail closed: without the journal we cannot prove any leaf is safe to drive.
-                    blind.push(format!(
-                        "near-deadline protection is BLIND on every adopted split child and spine \
-                         tip: the split journal could not be read ({e}), so a leaf that is \
-                         mid-split — which must NOT be force-exited — cannot be told apart from one \
-                         that is safe to drive"
-                    ));
-                    None
-                }
-            };
-
-        for (key, json) in child_rows.iter() {
-            let (cid, what) = if let Some(cid) = key.strip_prefix("ctesr-") {
-                (cid, "adopted split child")
-            } else if let Some(tid) = key.strip_prefix(mercuryrustlib::tesr::SPINE_TIP_KEY_PREFIX) {
-                (tid, "spine tip")
-            } else {
-                continue;
-            };
-            // L1. Absence from the record, or any status other than CONFIRMED, is a DECIDED answer
-            // ("not ours to drive"), not blindness.
-            let Some(coin) = record.coins.iter().find(|c| {
-                c.duplicate_index == 0 && c.statechain_id.as_deref() == Some(cid)
-            }) else {
-                continue;
-            };
-            if coin.status != CoinStatus::CONFIRMED {
-                continue;
-            }
-            // [D13] MID-SPLIT LEAVES ARE NOT OURS TO DRIVE. A CONFIRMED status here does NOT mean
-            // "safe to force-exit": a leaf terminalized by its own split reads CONFIRMED with a
-            // stale row, and driving it destroys the grandchild pieces its CSP already conveyed.
-            match leaf_split_gate(&terminalizing, cid, what) {
-                LeafSplitGate::Drive => {}
-                // Journal unreadable — blanket blindness already recorded before the loop.
-                LeafSplitGate::HoldSilently => continue,
-                LeafSplitGate::Hold(msg) => {
-                    blind.push(msg);
-                    continue;
-                }
-            }
-            let parsed = if key.starts_with("ctesr-") {
-                serde_json::from_str(json).map(|c| Row::Child(Box::new(c)))
-            } else {
-                serde_json::from_str(json).map(|t| Row::Tip(Box::new(t)))
-            };
-            let parsed = match parsed {
-                Ok(r) => r,
-                // NOT a skip. An unparseable bundle is the one shape where "I could not tell" and
-                // "nothing is due" look identical, and this coin's only protection is here.
-                Err(e) => {
-                    blind.push(format!(
-                        "{cid} ({what}: its stored bundle will not parse ({e}), so its exit-race \
-                         deadline cannot be computed)"
-                    ));
-                    continue;
-                }
-            };
-            // [B1] THE **BOUND** CHAIN, NEVER THE DECLARED ONE.
-            //
-            // `child_exit_chain`'s own doc forbids what this loop used to do: "Anything that
-            // computes a requirement, a deadline or a cap from these timelocks must use
-            // `child_exit_chain_bound`" (`clients/libs/rust/src/tesr.rs:5489-5493`). The `csv` field
-            // is plain serde and, on conveyed material, attacker-supplied. This loop computes a
-            // DEADLINE from it, which is exactly the prohibited use. Binding parses each SIGNED
-            // transaction and reads the timelock out of its `nSequence`, refusing by name if the two
-            // disagree — so a sender cannot hand this tower a schedule of their choosing and move
-            // the moment their victim's coin defends itself.
-            // [D13-follow-up] AND IT MUST PAY US. A CONFIRMED status does not imply the stored row
-            // pays this wallet: a failed child conveyance leaves the coin IN_TRANSFER with a
-            // PAYEE-paying row, and `/transfer/cancel` lifts that back to CONFIRMED. Driving it
-            // would force-exit the sender's own money into the payee's address. Reported, never
-            // silently skipped — a false positive here means declining to defend a coin we DO own,
-            // and that must be visible rather than quiet.
-            //
-            // [#133] THE ROOT CAUSE IS NOW FIXED, AND THIS CHECK STAYS ANYWAY. The cancel path runs
-            // `reclaim_cancelled_child_conveyance` (`rust/src/tesr.rs`), which re-points the row at
-            // the owner and discloses the orphaned co-sign — so a cancellation no longer strands a
-            // payee-paying leaf. This remains because the repair can still FAIL (the SE refuses, the
-            // rung is at the floor, the process dies mid-cancel) and because rows written before it
-            // existed are still on disk. It is the difference between "the fix worked" and "we
-            // assume the fix worked", and it is the one standing between a stranded leaf and paying
-            // a stranger.
-            // CHILDREN ONLY: a spine tip is the sender's own change leg and carries no
-            // `child_owner_exit_address` — there is no conveyance-to-a-payee to be resurrected, so
-            // the window does not exist for it.
-            if let Row::Child(cb) = &parsed {
-                let exit_addr = &cb.child_owner_exit_address;
-                if !leaf_exit_pays_this_wallet(exit_addr, &record) {
-                    blind.push(format!(
-                        "{cid} ({what}): its stored exit pays {exit_addr}, which is not an address \
-                         this wallet holds — refusing to drive it. Either a conveyance to that payee \
-                         was cancelled without the row being re-pointed at the owner (exiting would \
-                         hand them the coin), or this wallet's record is incomplete. Not driven, \
-                         and not treated as idle"
-                    ));
-                    continue;
-                }
-            }
-
-            // [D13] BOTH LANES, NOT ONLY COLOURED. This loop used to gate on `is_colored()` and drop
-            // every plain child and plain tip with `_ => continue`. That left a PLAIN leaf with no
-            // runtime deadline defence anywhere in the SDK — and under the RGB scope-out the plain
-            // lane was to be the whole normative protocol. The exposure is real: a leaf carries no
-            // flat backup of its own, so its clock is the ABSOLUTE height `min(L_k)` of the PARENT's
-            // flat backups (the lowest rung belongs to the splitter — the adversary), and its exit
-            // is a chain of RELATIVE timelocks that must be STARTED `Σ(csv+1)` blocks before that
-            // height. Reacting to F being spent is too late by construction. The only thing that made
-            // covering plain rows unsafe — a mid-split leaf reading CONFIRMED with a stale row — is
-            // handled by the split-journal guard above; everything past it is safe to drive.
-            let chain = match &parsed {
-                Row::Child(cb) => mercuryrustlib::tesr::child_exit_chain_bound(cb),
-                Row::Tip(tip) => mercuryrustlib::tesr::spine_tip_exit_chain_bound(tip),
-            };
-            let chain = match chain {
-                Ok(c) => c,
-                // NOT a skip. A chain whose timelocks cannot be bound to the signatures that
-                // enforce them is a chain whose deadline cannot be computed, and this coin's only
-                // protection is here.
-                Err(e) => {
-                    blind.push(format!(
-                        "{cid} ({what}: its exit chain's timelocks could not be bound to \
-                         the signatures enforcing them ({e}), so no deadline can be derived)"
-                    ));
-                    continue;
-                }
-            };
-            if chain.is_empty() {
-                blind.push(format!(
-                    "{cid} ({what} has an EMPTY exit chain — it has no walk to protect \
-                     it and no deadline can be derived)"
-                ));
-                continue;
-            }
-            // THE HEAD START — every block the walk must sit through before its last tier can
-            // confirm. `exit_wait_blocks`, NOT a hand-rolled sum of the timelocks.
-            //
-            // The previous expression here was `chain.iter().filter_map(|(_, csv)| *csv).sum()`,
-            // and it under-counted twice over: it charged each tier only its own CSV, omitting THE
-            // ONE BLOCK ITS PARENT NEEDS TO CONFIRM, and `filter_map` silently dropped any tier
-            // whose csv is `None` rather than charging it that block. So the head start was short
-            // by at least the tier count, and this loop fired LATE by that many blocks.
-            //
-            // Late is the FAIL-OPEN direction on the one number the whole defence rests on. Worse,
-            // it silently disagreed with `check_exit_headroom` — the claim-time gate that admitted
-            // the coin in the first place, which uses `exit_wait_blocks`
-            // (`lib/src/transfer/receiver.rs:720-722`). Two sites deciding the same quantity two
-            // different ways, with the watchtower on the losing side. Calling the same function is
-            // what makes them provably agree, rather than agreeing by inspection until someone
-            // edits one of them.
-            let csvs: Vec<Option<u16>> = chain.iter().map(|(_, csv)| *csv).collect();
-            let head_start = mercurylib::transfer::receiver::exit_wait_blocks(&csvs);
-            // [audit-17] READ `L_k` OFF THE SIGNED BACKUPS, do not recompute `L_0` from the chain.
-            //
-            // This used to call `deposit_anchored_deadline_of_root_tx`, which finds the deposit's
-            // confirmation height and returns `h_deposit + initlock` — that is `L_0`, the k = 0 case
-            // and the LATEST the ladder can be. The real deadline is `L_k = L_0 − k·interval` for a
-            // parent transferred `k` times before the split, and nothing conveys `k`. So the number
-            // was too LATE by `k·interval`, i.e. fail-open: this coin believed it had more time than
-            // it had, and `AUDIT_17_K_MAX = 14` was a guess at `k` whose own comment called it the
-            // weakest term in the margin.
-            //
-            // `k` never needed conveying. Each backup's nLockTime IS its rung, and the whole chain
-            // is already conveyed, already signature-verified and already count-pinned by the
-            // exact-equality census (see `epoch_deadline_from_flat_backups`). The minimum over it is
-            // `L_k` exactly.
-            //
-            // It is also CHEAPER than what it replaces: two electrum round-trips and an
-            // `/info/config` per coin per pass are gone, and with them a whole class of watchtower
-            // blindness — a pass that could not reach the chain used to report every coin as
-            // undecidable, and now reads a field it already holds.
-            let backups = match &parsed {
-                Row::Child(cb) => &cb.parent_flat_backups,
-                Row::Tip(tip) => &tip.parent_flat_backups,
-            };
-            let deadline = match mercuryrustlib::tesr::epoch_deadline_from_flat_backups(backups) {
-                Ok(d) => d.saturating_sub(head_start),
-                Err(e) => {
-                    blind.push(format!(
-                        "{cid} ({what}: its exit-race deadline could NOT be computed \
-                         ({e}) — it has a pre-signed chain rooted at a funding output an ancestor \
-                         can still spend, so absence of a deadline here means blindness, not safety)"
-                    ));
-                    continue;
-                }
-            };
-            if tip + margin_blocks < deadline {
-                continue; // still comfortably ahead of the head-started deadline
-            }
-            // [D13] Report the RIGHT event for the coin's kind. A coloured row settles a token
-            // allocation (TokenCarrierMaterialized); a plain leaf is driven to L1 to beat its
-            // deadline (LeafExitForced). Emitting the token event for a plain coin would mis-report
-            // it to any integrator watching the stream.
-            let colored = match &parsed {
-                Row::Child(cb) => cb.is_colored(),
-                Row::Tip(tip) => tip.is_colored(),
-            };
-            let _ = self.inner.events_tx.send(near_deadline_exit_event(
-                colored,
-                cid.to_string(),
-                deadline,
-                tip,
-            ));
-            match self.unilateral_exit(Some(vec![cid.to_string()]), None).await {
-                Ok(_) => exited.push(cid.to_string()),
-                Err(e) => blind.push(format!(
-                    "{cid} ({what} is DUE at block {deadline}, tip {tip}, but driving \
-                     its exit walk failed: {e})"
-                )),
-            }
-        }
+        // A split leaf (an adopted child or a spine tip) has NO height deadline: its parent is a
+        // laddered coin with no flat backup, so no ancestor holds a matured spend of `F` that could
+        // race it. Its only exposure is the parent's trigger being broadcast, which is an EVENT the
+        // per-block `defend_ladders` child/tip loops already answer. Nothing to schedule here.
         if !blind.is_empty() {
             // Deliberately an `Err`, not a quiet `Ok(exited)`: `auto_exit_due` maps `Ok` to
             // `note_watchtower_ok`, i.e. to "this wallet's clawback protection ran with full
@@ -2753,7 +2418,7 @@ impl UtexoWallet {
         let live_sids: std::collections::HashSet<String> = record
             .coins
             .iter()
-            .filter(|c| c.duplicate_index == 0 && c.status == CoinStatus::CONFIRMED)
+            .filter(|c| c.duplicate_index == 0 && is_live_for_defence(c))
             .filter_map(|c| c.statechain_id.clone())
             .collect();
         let mut conveyed_parent_states: std::collections::HashMap<String, std::collections::HashSet<String>> =
@@ -2792,11 +2457,15 @@ impl UtexoWallet {
                 continue;
             }
             let Some(id) = c.statechain_id.clone() else { continue };
-            // L1 — LIVENESS ALLOWLIST. Anything that is not CONFIRMED is not provably ours, and
-            // therefore not ours to broadcast. This is a DECIDED answer, not blindness: a wallet
-            // with one pending transfer must not report a permanently blind watchtower, and the
-            // coin is not left undefended — whoever now holds the live state defends it.
-            if c.status != CoinStatus::CONFIRMED {
+            // L1 — LIVENESS ALLOWLIST. A coin that is IN_MEMPOOL, UNCONFIRMED or CONFIRMED and has
+            // a ladder is ours and undefended by anyone else: a deposit-time ladder exists from the
+            // first mempool sighting and must be defended from that block. Anything else — in
+            // transfer, withdrawing, transferred — is not provably ours, and therefore not ours to
+            // broadcast. This is a DECIDED answer, not blindness: a wallet with one pending transfer
+            // must not report a permanently blind watchtower, and the coin is not left undefended —
+            // whoever now holds the live state defends it. (`CoinStatus::CONFIRMED` is one of the
+            // three; the predicate is `is_live_for_defence`.)
+            if !is_live_for_defence(c) {
                 continue;
             }
             let bundle = match mercuryrustlib::tesr::load(
@@ -3267,16 +2936,6 @@ impl UtexoWallet {
         // every deadline consumer (auto_exit_due, export_watch_bundle) skipped it. Fail closed:
         // `read_exit_branch` returns an empty vec ONLY for a verified-absent row.
         let branch = self.read_exit_branch(statechain_id).await?;
-        let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            statechain_id,
-        )
-        .await?;
-        let latest = backups
-            .iter()
-            .max_by_key(|b| b.tx_n)
-            .ok_or_else(|| anyhow!("no backup tx stored for {statechain_id}"))?;
 
         let mut branch_vbytes = 0u64;
         for b in &branch {
@@ -3284,13 +2943,45 @@ impl UtexoWallet {
                 bitcoin::consensus::encode::deserialize(&hex::decode(&b.tx)?)?;
             branch_vbytes += tx.vsize() as u64;
         }
-        let backup_tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
-        let backup_vbytes = backup_tx.vsize() as u64;
 
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
-        let locktime = mercurylib::utils::get_blockheight(latest)?;
-        let wait_blocks = locktime.saturating_sub(tip);
+        // A laddered coin has no flat backup: its exit material is the tier chain, so the vbytes
+        // are the tiers' own and the wait is zero while nothing has been broadcast — an idle ladder
+        // never ages. Only a legacy branch coin still reads a flat backup row here.
+        let (backup_vbytes, wait_blocks) = match mercuryrustlib::tesr::load(
+            &self.inner.cc,
+            &self.inner.config.wallet_name,
+            statechain_id,
+        )
+        .await?
+        {
+            Some(bundle) => {
+                let mut vb = 0u64;
+                for t in bundle.exit_tiers() {
+                    let tx: bitcoin::Transaction =
+                        bitcoin::consensus::encode::deserialize(&hex::decode(&t.signed_tx)?)?;
+                    vb += tx.vsize() as u64;
+                }
+                (vb, 0u32)
+            }
+            None => {
+                let rows = mercuryrustlib::sqlite_manager::try_get_backup_txs(
+                    &self.inner.cc.pool,
+                    &self.inner.config.wallet_name,
+                    statechain_id,
+                )
+                .await?;
+                match rows.and_then(|v| v.into_iter().max_by_key(|b| b.tx_n)) {
+                    Some(latest) => {
+                        let backup_tx: bitcoin::Transaction =
+                            bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
+                        let locktime = mercurylib::utils::get_blockheight(&latest)?;
+                        (backup_tx.vsize() as u64, locktime.saturating_sub(tip))
+                    }
+                    None => (0, 0),
+                }
+            }
+        };
 
         // Safety deadline (off-chain sub-coins only): the earliest height an ANCESTOR could broadcast
         // its stale backup to race you; you MUST broadcast your (locktime-free) branch before it.
@@ -3592,7 +3283,6 @@ impl UtexoWallet {
         statechain_ids: Option<Vec<String>>,
         _to_address: Option<String>,
     ) -> Result<Vec<crate::types::ExitStatus>> {
-        use electrum_client::ElectrumApi;
         let record = self.record().await?;
         // Same carrier guard as withdraw (audit [7]): a unilateral exit broadcasts an RGB-unaware
         // spend, so a carrier coin must be excluded from the exit-everything default and rejected if
@@ -3702,9 +3392,9 @@ impl UtexoWallet {
                         // fix is the in-ladder split, PROTOCOL.md §5.4), but the SDK must not be the weapon,
                         // and it kills the accidental-loss variant where an honest user exits a spent
                         // parent and destroys their own payee's coin.
-                        if c.status != CoinStatus::CONFIRMED {
+                        if !is_live_for_defence(c) {
                             return Err(anyhow!(
-                                "coin {id} is not CONFIRMED (status {}) — it has already been spent/transferred and must not be exited; exiting a withdrawn parent would invalidate the sub-coins funded by its split [B1]",
+                                "coin {id} is not live (status {}) — it has already been spent/transferred and must not be exited; exiting a withdrawn parent would invalidate the sub-coins funded by its split [B1]",
                                 c.status
                             ));
                         }
@@ -3715,14 +3405,13 @@ impl UtexoWallet {
             None => record
                 .coins
                 .iter()
-                .filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0)
+                .filter(|c| is_live_for_defence(c) && c.duplicate_index == 0)
                 // [CTES-R] A carrier is included ONLY if its ladder is coloured; every other
                 // carrier stays excluded from the exit-everything default exactly as before.
                 .filter(|c| !is_token_carrier(c, &carriers) || exitable_carrier(c))
                 .filter_map(|c| c.statechain_id.clone())
                 .collect(),
         };
-        let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let mut statuses = Vec::new();
         for id in ids {
             // [CTES-R MIGRATION / D2] The un-colourable carrier never reaches this loop: it is
@@ -3852,96 +3541,16 @@ impl UtexoWallet {
                 continue;
             }
 
-            // [CTES-R] FAIL CLOSED AT THE FLAT FALLBACK. Everything below broadcasts an RGB-UNAWARE
-            // spend of `F` — the branch tx and the latest absolute-locktime backup. Those are
-            // retained on a coloured coin too (they must be: `tx1` was co-signed at deposit-init and
-            // the census counts it forever), and broadcasting one BURNS the allocation.
-            //
-            // The filters above should make this unreachable for a carrier — but "should" is how
-            // recovery paths lose money. A coin whose `tesr-` row is missing or unreadable after a
-            // restore-from-mnemonic reaches exactly here, and it is precisely the case where the
-            // wallet cannot see that it is holding an asset. So the carrier test is repeated at the
-            // point of no return, as a refusal rather than a filter.
-            if record
-                .coins
-                .iter()
-                .any(|c| c.statechain_id.as_deref() == Some(&id) && is_token_carrier(c, &carriers))
-            {
-                return Err(anyhow!(
-                    "coin {id} carries an RGB allocation but has no coloured (CTES-R) ladder to \
-                     walk; the only remaining exit is an RGB-unaware spend of its funding output, \
-                     which would DESTROY the allocation. Refusing. If this coin was restored from a \
-                     mnemonic, restore its `tesr-{id}` ladder row as well."
-                ));
-            }
-
-            // Materialize the coin's funding first (no locktime on branch txs).
-            let has_branch = self.broadcast_branch_if_any(&id).await?;
-            // Audit [20]: distinguish a genuinely FLAT coin (on-chain funding, legitimately no branch)
-            // from a sub-coin whose exit branch is MISSING (e.g. restored from mnemonic without the
-            // recovery bundle). If there is no branch AND the coin's own funding txid is not on-chain,
-            // the branch is required but absent — broadcasting the leaf backup would fail with an
-            // opaque "missing inputs". Surface an explicit, actionable error instead.
-            if !has_branch {
-                let funding_txid = record
-                    .coins
-                    .iter()
-                    .find(|c| c.statechain_id.as_deref() == Some(&id))
-                    .and_then(|c| c.utxo_txid.clone());
-                if let Some(txid_str) = funding_txid {
-                    if let Ok(txid) = txid_str.parse::<bitcoin::Txid>() {
-                        // AUDITED-SWALLOW: fails toward LOUDER — an unreachable backend classifies
-                        // as "funding not on chain" and produces the explicit "restore the recovery
-                        // bundle" error instead of an opaque `missing inputs` broadcast rejection.
-                        if self.inner.cc.electrum_client.transaction_get(&txid).is_err() {
-                            return Err(anyhow!(
-                                "sub-coin {id} has no stored exit branch (branch-{id} missing) and its funding {txid_str} is un-broadcast — it cannot be exited; restore the recovery bundle (branch-* rows)"
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let backups = mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &id,
-            )
-            .await?;
-            let latest = backups
-                .iter()
-                .max_by_key(|b| b.tx_n)
-                .ok_or_else(|| anyhow!("no backup tx stored for {id}"))?;
-            let locktime = mercurylib::utils::get_blockheight(latest)?;
-            if locktime > tip {
-                statuses.push(crate::types::ExitStatus {
-                    statechain_id: id,
-                    complete: false,
-                    wait_blocks: locktime - tip,
-                });
-                continue;
-            }
-            let tx: bitcoin::Transaction =
-                bitcoin::consensus::encode::deserialize(&hex::decode(&latest.tx)?)?;
-            match self.inner.cc.electrum_client.transaction_broadcast(&tx) {
-                Ok(_) => statuses.push(crate::types::ExitStatus {
-                    statechain_id: id,
-                    complete: true,
-                    wait_blocks: 0,
-                }),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if is_idempotent_rebroadcast(&msg) {
-                        statuses.push(crate::types::ExitStatus {
-                            statechain_id: id,
-                            complete: true,
-                            wait_blocks: 0,
-                        });
-                    } else {
-                        return Err(anyhow!("backup broadcast failed for {id}: {msg}"));
-                    }
-                }
-            }
+            // NO LADDER ROW. A coin's only exit material is its ladder; there is no flat backup to
+            // fall back to. This is reached only by a coin whose `tesr-` row is missing — most often
+            // a restore from a mnemonic without the recovery bundle — and the honest answer is a
+            // named refusal, not a search for material that does not exist.
+            return Err(anyhow!(
+                "coin {id} has no `tesr-{id}` ladder row and therefore no exit material: a coin's \
+                 only exit is its TES-R ladder, and there is no flat backup to fall back to. If this \
+                 coin was restored from a mnemonic, restore its recovery bundle (the `tesr-*` rows) \
+                 as well; if it is a fresh deposit, run claim() so the establish pass ladders it."
+            ));
         }
         Ok(statuses)
     }
@@ -4124,6 +3733,18 @@ fn coin_key(c: &Coin) -> String {
 /// The coin's on-chain outpoint (`"txid:vout"`), matching rgb-lib's allocation outpoint format so a
 /// token-carrier coin can be recognised and kept out of plain-BTC selection/balance (review H2).
 /// `None` when the funding utxo is not yet known.
+/// **L1 — the liveness allowlist.** A coin is ours to defend and to exit while it is `IN_MEMPOOL`,
+/// `UNCONFIRMED` or `CONFIRMED`: its ladder exists from the first mempool sighting of the deposit
+/// (there is no flat backup before it) and nobody else holds rival material for it until a
+/// conveyance opens. Every other status — in transfer, withdrawing, transferred, withdrawn,
+/// invalidated, duplicated — is a DECIDED "not ours to broadcast", never blindness.
+pub(crate) fn is_live_for_defence(c: &Coin) -> bool {
+    matches!(
+        c.status,
+        CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED | CoinStatus::CONFIRMED
+    )
+}
+
 pub(crate) fn coin_outpoint(c: &Coin) -> Option<String> {
     match (c.utxo_txid.as_ref(), c.utxo_vout) {
         (Some(txid), Some(vout)) => Some(format!("{txid}:{vout}")),
@@ -4690,17 +4311,39 @@ mod rgb_stage0_claim_laddering_tests {
             .join("\n")
     }
 
-    /// The guard reads the coin's OWN backup rows, which are authoritative at claim time — not the
+    /// The guard reads the coin's OWN material, which is authoritative at claim time — not the
     /// allocation set, which is populated by `book_incoming_token` AFTER this loop runs. Reading the
     /// set here is precisely the bug: a freshly received carrier is not in it.
     #[test]
-    fn the_guard_reads_backup_rows_not_the_allocation_set() {
+    fn the_guard_reads_the_coins_own_material_not_the_allocation_set() {
         let body = ladder_loop();
-        assert!(body.contains("read_backup_rows("), "must consult the coin's own backup rows");
+        assert!(body.contains("read_backup_rows("), "must still consult legacy backup rows");
         assert!(
             body.contains("rgb_consignment.is_some()"),
-            "a consignment on any row is what marks the coin a carrier at this instant"
+            "a consignment on a LEGACY row still marks the coin a carrier at this instant"
         );
+    }
+
+    /// **THE GUARD MUST NOT BE A DEAD READ.** A conveyance carries no backup rows any more, and the
+    /// only writers of `rgb_consignment` were the retired coloured-split lanes — so the row read
+    /// alone answers "not a carrier" for every coin minted under the rule. The conveyed RGB material
+    /// rides in the coin's own BUNDLE, so the guard must read that too, or it silently stops
+    /// guarding and a coloured child gets a PLAIN ladder co-signed over its sealed output.
+    #[test]
+    fn the_guard_reads_the_conveyed_bundle_because_rows_are_retired() {
+        let body = ladder_loop();
+        assert!(
+            body.contains("load_child(") && body.contains("load_spine_tip("),
+            "the guard must consult the coin's conveyed child / spine-tip bundle — the only place a \
+             conveyed allocation is recorded now that no backup row is ever written"
+        );
+        assert!(
+            body.contains("is_colored()"),
+            "and it is COLOUR that marks the bundle a carrier, not its mere presence"
+        );
+        let scope = body.find("if !is_token_carrier(coin, &carriers)").unwrap();
+        let read = body.find("load_child(").unwrap();
+        assert!(scope < read, "the bundle read is inside the unrecognised-carrier scope too");
     }
 
     /// **THE REGRESSION THIS ALMOST INTRODUCED.** An UNCONDITIONAL skip would have been correct for
@@ -4731,6 +4374,11 @@ mod rgb_stage0_claim_laddering_tests {
         assert!(
             body.contains("Err(_) =>") && body.contains("RgbStateUnavailable"),
             "an unreadable row must skip the coin, under a reason distinct from a real carrier"
+        );
+        assert!(
+            body.contains("Err(()) =>"),
+            "an unreadable BUNDLE must fail closed the same way — 'the database would not answer' \
+             is not 'no allocation'"
         );
         assert!(
             body.contains("Ok(_) => {}"),
@@ -4770,101 +4418,6 @@ impl FeeBumpParts {
     }
 }
 
-#[cfg(test)]
-mod d13_leaf_gate_tests {
-    use super::{wallet_holds_address, leaf_split_gate, near_deadline_exit_event, LeafSplitGate, WalletEvent};
-    use std::collections::HashSet;
-
-    fn set(ids: &[&str]) -> Option<HashSet<String>> {
-        Some(ids.iter().map(|s| s.to_string()).collect())
-    }
-
-    #[test]
-    fn a_coin_named_by_an_open_split_is_never_driven() {
-        // THE BLOCKER the safety probe found: this coin reads CONFIRMED with a stale row, and
-        // driving it would broadcast the state its own split superseded, destroying pieces already
-        // conveyed to payees. It must be held, with a message (not idle), never driven.
-        let gate = leaf_split_gate(&set(&["dead", "beef"]), "beef", "adopted split child");
-        match gate {
-            LeafSplitGate::Hold(msg) => {
-                assert!(msg.contains("mid-split"), "the reason must name why it is held: {msg}");
-                assert!(msg.contains("beef"));
-            }
-            other => panic!("a mid-split coin must be Hold, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_coin_absent_from_every_open_split_is_drivable() {
-        // The whole point of the port: a plain leaf NOT mid-split is now evaluated for exit, where
-        // before it was dropped by the coloured-only gate.
-        assert_eq!(
-            leaf_split_gate(&set(&["dead", "beef"]), "cafe", "adopted split child"),
-            LeafSplitGate::Drive
-        );
-        // And with no open splits at all.
-        assert_eq!(
-            leaf_split_gate(&set(&[]), "cafe", "spine tip"),
-            LeafSplitGate::Drive
-        );
-    }
-
-    #[test]
-    fn an_unreadable_journal_holds_every_coin() {
-        // Fail closed: if we cannot read the journal we cannot prove ANY leaf is safe, so none is
-        // driven. HoldSilently because the blanket blindness is recorded once before the loop.
-        assert_eq!(
-            leaf_split_gate(&None, "cafe", "adopted split child"),
-            LeafSplitGate::HoldSilently
-        );
-        assert_eq!(
-            leaf_split_gate(&None, "beef", "spine tip"),
-            LeafSplitGate::HoldSilently
-        );
-    }
-
-    #[test]
-    fn a_leaf_whose_exit_pays_someone_else_is_not_driven() {
-        // THE CANCEL-RESURRECTION WINDOW. A failed child conveyance leaves a PAYEE-paying row;
-        // /transfer/cancel lifts the coin back to CONFIRMED; reclaim_cancelled_conveyance returns
-        // Ok(false) for a child so the row is never re-pointed. Driving it would force-exit the
-        // sender's own money into the payee's address.
-        let mine = ["bcrt1qmine", "bcrt1qmine_backup"];
-        assert!(!wallet_holds_address("bcrt1qPAYEE", mine.iter().copied()),
-            "a row paying an address we do not hold must NOT be driven");
-        assert!(wallet_holds_address("bcrt1qmine_backup", mine.iter().copied()),
-            "the owner's own backup address is exactly what an honest row pays");
-        assert!(wallet_holds_address("bcrt1qmine", mine.iter().copied()));
-    }
-
-    #[test]
-    fn a_leaf_reports_when_it_declines_rather_than_going_quiet() {
-        // Declining to drive is itself a loss if the address IS ours and merely unknown to this
-        // record, so the caller must surface it. This pins the predicate's shape; the reporting is
-        // asserted by the loop's `blind` push at the call site.
-        let none: [&str; 0] = [];
-        assert!(!wallet_holds_address("anything", none.iter().copied()),
-            "an empty record recognises no address — and must therefore report, not silently skip");
-    }
-
-    #[test]
-    fn a_plain_leaf_reports_a_leaf_exit_a_coloured_one_a_token_settlement() {
-        match near_deadline_exit_event(false, "abc".into(), 100, 90) {
-            WalletEvent::LeafExitForced { statechain_id, deadline_block, tip } => {
-                assert_eq!(statechain_id, "abc");
-                assert_eq!(deadline_block, 100);
-                assert_eq!(tip, 90);
-            }
-            other => panic!("a PLAIN leaf must emit LeafExitForced, not {other:?}"),
-        }
-        match near_deadline_exit_event(true, "xyz".into(), 200, 150) {
-            WalletEvent::TokenCarrierMaterialized { statechain_id, .. } => {
-                assert_eq!(statechain_id, "xyz");
-            }
-            other => panic!("a COLOURED leaf must emit TokenCarrierMaterialized, not {other:?}"),
-        }
-    }
-}
 
 /// **[D66] THE BEHAVIOURAL PROOF that [D58]'s fix holds — the one a source scan cannot give.**
 ///

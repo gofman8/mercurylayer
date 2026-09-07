@@ -502,19 +502,22 @@ impl UtexoWallet {
     }
 
     /// The wallet-maintenance **auto-refresh** pass: re-anchor every confirmed, non-carrier coin
-    /// whose backup ladder is within `margin_blocks` of its floor, so an aging coin is refreshed
-    /// *before* it becomes un-transferable (a whole-coin handover of a floored coin is rejected by
-    /// the receiver, `LocktimeTooLow`) and before it would hand a receiver a sub-coin already past
-    /// its exit-race deadline. Each re-anchor is user-pays (the fee comes from the coin), one
-    /// on-chain tx; the fresh coins confirm asynchronously (via `claim`/the watcher), so this call
-    /// does NOT block on confirmation.
+    /// whose ABSOLUTE clock is within `margin_blocks` of running out.
     ///
-    /// Token CARRIERS are skipped — a plain re-anchor would destroy the RGB allocation; their
-    /// near-deadline protection is [`Self::auto_exit_due`], which *materializes* them instead. A coin
+    /// **No coin has such a clock any more, so the subject set is EMPTY by construction.** A coin's
+    /// only exit material is its TES-R ladder, established at first sight of its funding
+    /// transaction; there is no flat backup chain and `Coin::locktime` is `None` for life, so
+    /// [`coin_near_final`] is `false` for every coin and this pass re-anchors nothing. It is kept,
+    /// wired into the background watcher and the pre-spend hook of `transfer` (both pinned by
+    /// ci-guards), so that a future absolute clock lands in a pass that already has a defender
+    /// rather than in silence. A coin at the END of its ladder's rung budget is a different matter:
+    /// that is handled by rollover (`tesr::rollover_auto`) and, when a rollover is refused, by an
+    /// on-demand cooperative re-anchor ([`Self::reanchor`]) — never by a calendar.
+    ///
+    /// Token CARRIERS are skipped — a plain re-anchor would destroy the RGB allocation. A coin
     /// too small to cover the fee, or already spent by a concurrent pass, is skipped rather than
     /// failing the pass. Returns one [`RefreshResult`] per coin refreshed and emits
-    /// [`WalletEvent::CoinRefreshed`] for each. The background watcher calls this every poll, so in
-    /// practice coins are kept fresh proactively; `transfer` also calls it (and waits) as a safety net.
+    /// [`WalletEvent::CoinRefreshed`] for each.
     ///
     /// **`Ok(vec![])` means "nothing was due", never "I could not tell".** If the carrier set of a
     /// token wallet cannot be enumerated the pass returns `Err` rather than an empty vector: it
@@ -523,7 +526,7 @@ impl UtexoWallet {
     pub async fn auto_refresh_due(&self, margin_blocks: u32) -> Result<Vec<RefreshResult>> {
         use electrum_client::ElectrumApi;
         // Refresh statuses so a just-confirmed re-anchor is not re-refreshed and headrooms are current.
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let tip = self.inner.cc.electrum_client.block_headers_subscribe_raw()?.height as u32;
         let record = self.record().await?;
@@ -591,20 +594,22 @@ impl UtexoWallet {
 
     /// **[D40 / A.2] DEADLINE SAFETY — the half of maintenance that is not an economics choice.**
     ///
-    /// A whole laddered coin carries exactly one absolute clock: `min(L_k)` over its flat backup
-    /// chain, held by its PRIOR OWNERS. When that height passes, any ancestor's matured rung spends
-    /// `F` and takes the coin. Nothing in the tree stops it — the tiers are all *relative*-timelocked
-    /// below `F`, so they cannot out-race a transaction that is simply valid now.
+    /// A whole laddered coin USED TO carry exactly one absolute clock: `min(L_k)` over its flat
+    /// backup chain, held by its PRIOR OWNERS. When that height passed, any ancestor's matured rung
+    /// spent `F` and took the coin, and nothing in the tree could stop it — the tiers are all
+    /// *relative*-timelocked below `F`, so they cannot out-race a transaction that is simply valid
+    /// now. **That chain no longer exists.** A coin's only exit material is its ladder, established
+    /// at first sight of `F`; `Coin::locktime` is `None` for life; nothing on a coin matures on its
+    /// own. The subject set of this pass (`still_due`, via [`coin_near_final`]) is therefore EMPTY
+    /// by construction, and sdk86 measures exactly that: across two hops and hundreds of idle
+    /// blocks a received coin has zero calendar exposure.
     ///
-    /// **That is a safety property, and it was behind an economics flag.** `auto_refresh_due` does two
-    /// unrelated jobs: routine background re-anchoring (an economics choice — B4 folds the re-anchor
-    /// cost into `transfer` and pays it on demand, so a running wallet should NOT silently shrink a
-    /// balance in the background) and this deadline defence. Both sat behind
-    /// `auto_refresh && background_auto_refresh`, and the second is off by default. So on a default
-    /// wallet the routine pass was correctly disabled and the deadline defence went with it.
+    /// The pass's SHAPE is kept and pinned by ci-guards — the wiring from the maintenance plan,
+    /// the carrier enumeration that fails loud, the two remedies in order, the `Err` over an
+    /// undefended coin — so that a future absolute clock lands in a pass that already has a
+    /// scheduled defender rather than in silence. Everything below describes that shape.
     ///
     /// `auto_exit_due` does not cover this clock: it protects sub-coins and materialises carriers.
-    /// The whole-coin `L_k` deadline had no scheduled defender at all.
     ///
     /// # Two remedies, in order, because the first one needs the counterparty
     ///
@@ -681,9 +686,12 @@ impl UtexoWallet {
         // plain-laddered carrier the ladder is refused at build time (D35's lane rule), so a carrier
         // that reaches here with a ladder has one that can carry it.
         //
-        // `sdk86` measured what this protects: the flat backup chain's absolute locktime is real and
-        // finite, mining moves the tip toward it, and each whole-coin hop spends `interval` of it.
-        // INV-27's "idle coins never age" is true of the CSV side only.
+        // There is no absolute locktime to measure against any more: a coin's `locktime` is `None`
+        // for life (the ladder is its only exit material), so `coin_near_final` is false for every
+        // coin and this list is EMPTY by construction. sdk86 now measures exactly that — across two
+        // hops and hundreds of idle blocks a received coin has zero calendar exposure. The pass's
+        // shape is kept (and pinned by ci-guards) so a future absolute clock cannot arrive without a
+        // scheduled defender.
         let still_due: Vec<String> = record
             .coins
             .iter()
@@ -826,10 +834,15 @@ impl UtexoWallet {
     }
 }
 
-/// A coin is "near final" — due for auto-refresh — when its backup-ladder headroom (`locktime −
-/// tip`) has fallen to `margin_blocks` or below. A CONFIRMED coin always has a locktime; one without
-/// (never happens on this path) is treated as not-due. `saturating_sub` makes an already-floored
-/// coin (locktime ≤ tip) report zero headroom, so it is always due.
+/// A coin is "near final" — due for auto-refresh — when the headroom of an ABSOLUTE locktime
+/// (`locktime − tip`) has fallen to `margin_blocks` or below.
+///
+/// **Every coin now answers `false`.** `Coin::locktime` is `None` for life: there is no flat backup
+/// chain, the ladder is a coin's only exit material and its rungs are RELATIVE (CSV) timelocks that
+/// do not run while the ladder is un-broadcast. The predicate is kept, with the polarity pinned by
+/// ci-guards (`None` ⟹ not due; `saturating_sub` would make an already-floored clock report zero
+/// headroom and be due), so that a future absolute clock lands in a pass that already has a
+/// defender rather than in silence.
 fn coin_near_final(c: &Coin, tip: u32, margin_blocks: u32) -> bool {
     c.locktime.map_or(false, |l| l.saturating_sub(tip) <= margin_blocks)
 }

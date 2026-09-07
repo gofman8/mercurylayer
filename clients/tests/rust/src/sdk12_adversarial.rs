@@ -1,15 +1,18 @@
-//! E2E (adversarial): regression tests for the security-review fixes, on **laddered (TES-R) coins**.
+//! E2E (adversarial): regression tests for the security-review fixes, on **laddered (TES-R) coins**
+//! — the ONE coin shape. Every deposit is laddered at first sight (`T`, `X_0`, `S_0`: exactly 3
+//! enclave co-signs, a `tesr-` row, no flat backup row, `locktime == None`); there is no
+//! un-laddered lane and no flat backup chain any more.
 //!
-//! - Part B (value flow out of a laddered coin): a non-exact payment out of one can no longer be
-//!   split as plain BTC [B1], so `transfer()` auto-routes to the IN-LADDER split — `SP` descends
-//!   from the trigger, the PIECE child pays the recipient (Model A) and is conveyed to their
-//!   mailbox, the CHANGE child pays the sender back. The receiver adopts the piece through the
-//!   `verify_child_bundle` census (`branch_txs` empty, `ladder_census_ok`) and is credited the exact
-//!   amount. The plain-BTC branch model — single_use sub-coins plus the receiver's
-//!   `terminal_parents` ancestor guard, which still governs UN-LADDERED coins — does not apply to
-//!   a laddered coin; the full in-ladder payment property (adopt + unilateral exit + funds at the
-//!   receiver's own key) is owned by sdk59 and the adversarial census cases by sdk58, so here this
-//!   is a value-flow smoke check that the payment lands.
+//! - Part B (value flow out of a laddered coin): a non-exact payment out of one is routed to the
+//!   IN-LADDER split — `SP` descends from the trigger, the PIECE child pays the recipient (Model A)
+//!   and is conveyed to their mailbox, the CHANGE child pays the sender back. The receiver adopts
+//!   the piece through the `verify_child_bundle` census and is credited the exact amount; the
+//!   adopted child conveys `parent_flat_backups: []`, has no flat backup row and no calendar. The
+//!   plain-BTC branch model (single_use sub-coins, `terminal_parents`, `branch_txs`) is RETIRED —
+//!   the receiver refuses branch material by name — so nothing here can silently run over it. The
+//!   full in-ladder payment property (adopt + unilateral exit + funds at the receiver's own key) is
+//!   owned by sdk59 and the adversarial census cases by sdk58, so here this is a value-flow smoke
+//!   check that the payment lands with the laddered shape.
 //! - Part C (finding 0, MuSig2 nonce reuse): one /sign/first followed by TWO /sign/second over the
 //!   SAME server nonce but DIFFERENT messages must be refused on the second call. Reusing a secnonce
 //!   over two messages would leak the SE key share and yield two co-signed conflicting spends of one
@@ -28,7 +31,10 @@
 //! migration), and are tested NOWHERE ELSE — they must survive every migration.
 //!
 //! Off-chain double-spend prevention itself is, under TES-R, the parent/change/piece terminality
-//! plus the receiver-side `verify_child_bundle` census (sdk58) and `verify_bundle` (sdk54/sdk55).
+//! plus the receiver-side `verify_child_bundle` census (sdk58) and `verify_bundle` with the flat
+//! term pinned to zero (sdk54; sdk55 for the padding/inversion attacks on it). Part C's contribution
+//! to that census is measured here too: the enclave's attested `num_sigs` moves by exactly one for
+//! the accepted `/sign/second` and by nothing for the refused one.
 //!
 //! Run: SDK_E2E=12 ML_NETWORK=regtest cargo run
 
@@ -37,6 +43,7 @@ use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use std::time::Duration;
 
 use crate::bitcoin_core;
+use crate::sdk40_tesr_consensus::se_num_sigs;
 
 const DEPOSIT: u64 = 60_000;
 const PAY: u64 = 20_000;
@@ -46,6 +53,29 @@ const PROBE: u64 = 30_000;
 async fn prepaid_token(cc: &mercuryrustlib::client_config::ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
     crate::utils::handle_token_response(cc, &token).await
+}
+
+/// The shape of every laddered root coin: a `tesr-` row, exactly `expected_num_sigs` attested
+/// co-signs, no flat backup row under the bare sid, and `locktime == None`.
+async fn assert_laddered_shape(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet_name: &str,
+    sid: &str,
+    expected_num_sigs: u32,
+    what: &str,
+) -> Result<()> {
+    let n = se_num_sigs(cc, sid).await?;
+    assert_eq!(n, expected_num_sigs, "{what}: the enclave count must be exactly {expected_num_sigs} (T, X_0, S_0 — no tx1), got {n}");
+    let flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, wallet_name, sid).await?.map(|r| r.len()).unwrap_or(0);
+    assert_eq!(flat, 0, "{what}: a laddered coin has NO flat backup row, got {flat}");
+    let coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet_name)
+        .await?
+        .coins
+        .into_iter()
+        .find(|c| c.statechain_id.as_deref() == Some(sid) && c.duplicate_index == 0)
+        .ok_or_else(|| anyhow!("{what}: coin {sid} not found in {wallet_name}"))?;
+    assert!(coin.locktime.is_none(), "{what}: a laddered coin has no absolute calendar, got locktime {:?}", coin.locktime);
+    Ok(())
 }
 
 pub async fn execute() -> Result<()> {
@@ -92,7 +122,8 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::load(&cc, "sdk12_alice", &alice_sid).await?.is_some(),
         "alice's coin must carry a TES-R ladder (every root deposit is laddered)"
     );
-    println!("SDK12 - alice funded {DEPOSIT} (ladder established, sid {alice_sid})");
+    assert_laddered_shape(&cc, "sdk12_alice", &alice_sid, 3, "alice's deposit").await?;
+    println!("SDK12 - alice funded {DEPOSIT} (ladder established, sid {alice_sid}, num_sigs 3, no flat row, no calendar)");
 
     // The two split child slots are funded by FREE derived tokens (take_derived_tokens), so no
     // prepaid-token top-up is needed for the split any more.
@@ -119,7 +150,23 @@ pub async fn execute() -> Result<()> {
         PAY,
         "bob got {PAY} (in-ladder split child adopted via the verify_child_bundle census)"
     );
-    println!("SDK12 - Part B: non-exact payment split IN-LADDER; bob credited {PAY} via verify_child_bundle");
+    // THE ADOPTED PIECE'S SHAPE: a child bundle conveying NO flat backup, a coin with no flat row
+    // and no calendar. A child that arrived with a `parent_flat_backups` entry would have been
+    // refused by name before adoption; one booked with a locktime would be a phantom clock.
+    let bob_coins = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk12_bob").await?.coins;
+    let mut adopted = 0usize;
+    for c in bob_coins.iter().filter(|c| c.status == mercuryrustlib::CoinStatus::CONFIRMED) {
+        let Some(sid) = c.statechain_id.clone() else { continue };
+        let Some(cb) = mercuryrustlib::tesr::load_child(&cc, "sdk12_bob", &sid).await? else { continue };
+        adopted += 1;
+        assert!(cb.parent_flat_backups.is_empty(), "the adopted child {sid} conveys a flat backup beside its ladder");
+        assert_eq!(cb.child_state.out_value, PAY, "the adopted child's exit pays the recipient exactly {PAY}");
+        assert!(c.locktime.is_none(), "the adopted child {sid} carries locktime {:?} — a child exits by RELATIVE CSV only", c.locktime);
+        let flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk12_bob", &sid).await?.map(|r| r.len()).unwrap_or(0);
+        assert_eq!(flat, 0, "the adopted child {sid} has {flat} flat backup row(s)");
+    }
+    assert_eq!(adopted, 1, "bob must hold exactly ONE adopted in-ladder child (`ctesr-` row) for the payment");
+    println!("SDK12 - Part B: non-exact payment split IN-LADDER; bob credited {PAY} via verify_child_bundle; child conveys no flat backup, no calendar");
 
     // --- Part C setup: a coin with a LIVE 2-of-2 for the raw MuSig2 probe ------------------------
     // The child bob just adopted is EXIT-ONLY (Model A conveyance: bob holds no SE co-signing key for
@@ -161,7 +208,9 @@ pub async fn execute() -> Result<()> {
         mercuryrustlib::tesr::load(&cc, "sdk12_bob", &victim_sid).await?.is_some(),
         "the nonce-reuse probe must run against a TES-R laddered coin"
     );
-    println!("SDK12 - probe coin {victim_sid} ({PROBE} sat, laddered, live 2-of-2)");
+    // The probe coin's census baseline: exactly the deposit ladder's three co-signs.
+    assert_laddered_shape(&cc, "sdk12_bob", &victim_sid, 3, "bob's probe deposit").await?;
+    println!("SDK12 - probe coin {victim_sid} ({PROBE} sat, laddered, live 2-of-2, num_sigs 3)");
 
     let si = mercuryrustlib::utils::info_config(&cc).await?;
     let mut coin = victim.clone();
@@ -187,6 +236,11 @@ pub async fn execute() -> Result<()> {
     )?;
     let sig_c = mercuryrustlib::transaction::sign_second(&cc, &req_c.partial_signature_request_payload).await;
     assert!(sig_c.is_ok(), "first /sign/second must succeed: {:?}", sig_c.err());
+    // The accepted finalisation is exactly ONE more attested co-sign on top of the ladder's three.
+    assert_eq!(
+        se_num_sigs(&cc, &victim_sid).await?, 4,
+        "the accepted /sign/second must raise the enclave's attested count by exactly one: 3 tiers + 1"
+    );
 
     // Second finalize: DIFFERENT message m_D (spend to addr_d) over the SAME server nonce.
     let req_d = mercurylib::transaction::get_partial_sig_request(
@@ -198,7 +252,13 @@ pub async fn execute() -> Result<()> {
         "SE MUST refuse a 2nd /sign/second reusing one nonce over a different message (finding 0) — got a second partial sig {:?}",
         sig_d.ok()
     );
-    println!("SDK12 - Part C: SE refused the nonce-reuse 2nd /sign/second \u{2713} (finding 0 — no MuSig2 key-share leak)");
+    // ...and the refusal is not counted: the census a future receiver runs sees exactly the
+    // co-signs that happened, so a refused reuse cannot be used to pad or unbalance it.
+    assert_eq!(
+        se_num_sigs(&cc, &victim_sid).await?, 4,
+        "the REFUSED /sign/second must not move the enclave's attested count: still 3 tiers + 1"
+    );
+    println!("SDK12 - Part C: SE refused the nonce-reuse 2nd /sign/second \u{2713} (finding 0 — no MuSig2 key-share leak); num_sigs 4, the refusal uncounted");
 
     // --- Part D (external review finding 1): /transfer/unlock must not accept a bad signature when
     // auth_pub_key is absent. Before the fix, `!is_current_owner && auth_pub_key.is_some() && ...`

@@ -1916,13 +1916,20 @@ mod combine_refusal_tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        // L1 is `is_live_for_defence` (IN_MEMPOOL | UNCONFIRMED | CONFIRMED): a ladder exists from
+        // the first mempool sighting and is defended from that block. The combine's park status is
+        // none of those three, so the interlock holds exactly as it did under CONFIRMED-only.
         let defend = cut("\n    async fn defend_ladders_inner(");
         assert!(
-            defend.contains("c.status != CoinStatus::CONFIRMED")
-                && defend.contains("c.status == CoinStatus::CONFIRMED"),
+            defend.contains("!is_live_for_defence(c)") && defend.contains("is_live_for_defence(c))"),
             "defend_ladders must keep BOTH L1 allowlist filters (the root loop's and `live_sids`, \
              which gates the `ctesr-` leaf loop) — the combine's interlock is exactly those filters"
         );
+        let park_is_outside_l1 = !matches!(
+            COMBINE_PARK_STATUS,
+            CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED | CoinStatus::CONFIRMED
+        );
+        assert!(park_is_outside_l1, "the park status must be outside `is_live_for_defence`");
         let auto = cut("\n    async fn auto_exit_due_inner(");
         assert!(
             auto.contains("c.status == CoinStatus::CONFIRMED"),

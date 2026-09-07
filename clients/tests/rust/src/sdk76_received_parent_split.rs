@@ -1,31 +1,38 @@
-//! E2E (SDK_E2E=76) — **splitting a RECEIVED laddered coin: the child is adoptable**.
+//! E2E (SDK_E2E=76) — **splitting a RECEIVED laddered coin: the child is adoptable with an EMPTY
+//! parent chain.**
 //!
-//! The regression for the `PARENT_V2_BASELINE` defect. `verify_child_bundle`'s ancestor census is
-//! `num_sigs(parent) == flat_backups + tiers + superseded`, and `flat_backups` used to be supplied
-//! by the receiver as the CONSTANT `PARENT_V2_BASELINE = 1`. That constant is the count of a coin
-//! this wallet DEPOSITED. Every whole-coin hop co-signs one more flat backup
-//! (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries `1 + k`
-//! and the census came up exactly `k` short — an in-ladder split of a RECEIVED laddered coin minted
-//! a child that NO receiver could ever adopt, and it did so AFTER terminalizing the parent and
-//! booking the piece WITHDRAWN. Fail-closed, but unrecoverable through any supported path.
+//! A laddered coin carries NO flat backup — not at deposit and not at any hop. Its only exit
+//! material is the ladder `T -> X_0 -> S_0`, co-signed at first sight of the funding transaction,
+//! and every whole-coin hop co-signs exactly ONE receiver-paying state `S'` and demotes the state it
+//! replaces into `superseded_states`. So the receiver's census over a parent segment is exactly
+//! `num_sigs(parent) == tiers + superseded`, with a flat term of ZERO (`PARENT_V2_BASELINE == 0`)
+//! whatever the coin's history, and a conveyed `ChildTesrBundle::parent_flat_backups` vector must
+//! be EMPTY (`refuse_conveyed_flat_backups`).
 //!
-//! Every existing in-ladder-split E2E is structurally blind to this: sdk58, sdk59 and sdk69 all
-//! DEPOSIT the parent, so `k = 0` and the constant is accidentally correct. This test is the one
-//! that puts a hop in front of the split:
+//! This file used to guard the OPPOSITE shape: a deposit co-signed one flat `tx1` and each hop one
+//! more, so a RECEIVED parent carried `1 + k` flat backups and a child of it was adoptable only if
+//! the sender conveyed that whole chain and the receiver counted it. sdk58, sdk59 and sdk69 all
+//! DEPOSIT the parent they split, so this is still the one test that puts a hop in front of the
+//! split — and what it measures is now the empty-chain rule, at every step where the old shape
+//! would have shown up:
 //!
-//!   1. alice deposits and `claim()` ladders the coin — `flat_backups = 1`;
-//!   2. alice transfers the WHOLE coin to bob; bob claims it. Bob's coin is now a RECEIVED laddered
-//!      coin with `flat_backups = 2` — asserted from bob's own backup rows, so the premise of the
-//!      whole test is measured, not assumed;
-//!   3. bob pays carol a NON-EXACT amount, which routes through the in-ladder split. On the old code
-//!      this REFUSED outright ("this coin was RECEIVED rather than deposited by this wallet");
-//!   4. **carol claims and ADOPTS the child** — the property under test;
-//!   5. carol exits the child unilaterally and the sats land at her own key.
+//!   1. alice deposits and `claim()` ladders the coin: `num_sigs == 3` (no flat `tx1`), ZERO
+//!      backup rows, `locktime == None`, and `verify_bundle(.., 3, 0)` accepts it;
+//!   2. alice transfers the WHOLE coin to bob; bob claims it. His coin is a RECEIVED laddered coin
+//!      at `num_sigs == 4` = 3 tiers + 1 superseded (`S_0`), STILL with zero backup rows and no
+//!      locktime — and the same bundle censused with a flat term of 1 is REJECTED;
+//!   3. bob pays carol a NON-EXACT amount, which routes through the in-ladder split;
+//!   4. **carol claims and ADOPTS the child** with `parent_flat_backups.is_empty()`, and the
+//!      parent census she balanced is exactly `exit_tiers + superseded`;
+//!   5. the controls: the REAL receiver path (`verify_conveyed_child`) accepts the adopted bundle;
+//!      the same bundle censused with a flat term of 1 is rejected with the census's own
+//!      "num_sigs mismatch"; and a copy that CONVEYS one flat backup beside its ladder — a prior
+//!      owner's retained spend of `F`, the exact thing the rule removes — is refused BY NAME;
+//!   6. carol exits the child unilaterally and the sats land at her own key.
 //!
-//! Plus the NEGATIVE CONTROL that keeps the test from being vacuous: the very bundle carol adopted
-//! is re-verified with the ancestor `flat_backups` forced back to `PARENT_V2_BASELINE`, and that
-//! MUST be rejected with the census's own "num_sigs mismatch" message. If the control ever passes,
-//! this test has stopped exercising the defect.
+//! Plus [S7]: carol's adopted child is in her exported watch bundle as an EVENT entry — a trigger on
+//! the parent's `F`, `deadline_block == u32::MAX` (a leaf has no calendar: no ancestor holds a
+//! matured spend of `F`), a head start over the BOUND chain, and no absolute-locktime sweep.
 //!
 //! Run: SDK_E2E=76 ML_NETWORK=regtest cargo +stable run
 
@@ -69,6 +76,32 @@ async fn aggregate(
         .aggregate_pubkey)
 }
 
+/// How many flat backup rows the wallet holds for `sid` — ZERO for a laddered coin. An ABSENT row
+/// and an empty row are the same answer here; a row that cannot be read is an error, never a zero.
+async fn flat_rows(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet_name: &str,
+    sid: &str,
+) -> Result<usize> {
+    Ok(mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, wallet_name, sid)
+        .await?
+        .map_or(0, |rows| rows.len()))
+}
+
+/// The `duplicate_index == 0` coin row for `sid`.
+async fn coin_of(
+    cc: &mercuryrustlib::client_config::ClientConfig,
+    wallet_name: &str,
+    sid: &str,
+) -> Result<mercurylib::wallet::Coin> {
+    mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet_name)
+        .await?
+        .coins
+        .into_iter()
+        .find(|c| c.statechain_id.as_deref() == Some(sid) && c.duplicate_index == 0)
+        .ok_or_else(|| anyhow!("{wallet_name} holds no coin {sid}"))
+}
+
 pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
@@ -82,7 +115,15 @@ pub async fn execute() -> Result<()> {
     let bob_address = bob.get_utexo_address().await?;
     let carol_address = carol.get_utexo_address().await?;
 
-    // ---- 1. alice deposits; claim() auto-establishes the ladder. --------------------------------
+    // The constant the census runs on. Pinned here so a drift back to a non-zero baseline fails
+    // this test by name rather than through some downstream mismatch.
+    assert_eq!(
+        mercuryrustlib::tesr::PARENT_V2_BASELINE,
+        0,
+        "a laddered parent's flat-backup census term is ZERO — no tx1 at deposit, no per-hop backup"
+    );
+
+    // ---- 1. alice deposits; claim() establishes the ladder. No flat backup exists anywhere. ------
     let t = prepaid_token(&cc).await?;
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(DEPOSIT).await?;
@@ -108,22 +149,33 @@ pub async fn execute() -> Result<()> {
         .find(|c| c.status == mercurylib::wallet::CoinStatus::CONFIRMED && c.duplicate_index == 0)
         .and_then(|c| c.statechain_id.clone())
         .ok_or(anyhow!("alice has no confirmed coin"))?;
-    assert!(
-        mercuryrustlib::tesr::load(&cc, "sdk76_alice", &alice_sid).await?.is_some(),
-        "alice's coin must be laddered — otherwise this exercises the plain-BTC lane"
-    );
-    let alice_flat =
-        mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk76_alice", &alice_sid)
-            .await?
-            .len();
+    let alice_bundle = mercuryrustlib::tesr::load(&cc, "sdk76_alice", &alice_sid)
+        .await?
+        .ok_or(anyhow!("alice's coin must be laddered — a coin without a ladder has no exit and no lane"))?;
+    let alice_ns = num_sigs(&cc, &alice_sid).await?;
     assert_eq!(
-        alice_flat,
-        mercuryrustlib::tesr::PARENT_V2_BASELINE as usize,
-        "a DEPOSITED laddered coin carries exactly the baseline flat backup — this is the case the \
-         old constant described, and the case sdk58/59/69 all test"
+        alice_ns, 3,
+        "a fresh laddered deposit costs exactly its three tiers T, X_0, S_0 — a fourth co-sign \
+         would be the flat tx1 the rule removed (got {alice_ns})"
+    );
+    assert_eq!(alice_bundle.exit_tiers().len(), 3, "the ladder is T -> X_0 -> S_0");
+    assert!(alice_bundle.superseded_states.is_empty(), "nothing has been superseded yet");
+    mercuryrustlib::tesr::verify_bundle(&alice_bundle, alice_ns, 0)
+        .map_err(|e| anyhow!("alice's deposited ladder failed the census with a flat term of 0: {e}"))?;
+    let alice_flat = flat_rows(&cc, "sdk76_alice", &alice_sid).await?;
+    assert_eq!(
+        alice_flat, 0,
+        "a DEPOSITED laddered coin holds ZERO flat backup rows — the ladder was signed at first \
+         sight in place of tx1 (got {alice_flat})"
+    );
+    let alice_coin = coin_of(&cc, "sdk76_alice", &alice_sid).await?;
+    assert!(
+        alice_coin.locktime.is_none(),
+        "a laddered coin carries no absolute calendar: locktime must be None for life"
     );
     println!(
-        "SDK76 - alice deposited {DEPOSIT} and laddered it (sid {alice_sid}); flat backups = {alice_flat}"
+        "SDK76 - alice deposited {DEPOSIT} and laddered it (sid {alice_sid}); num_sigs {alice_ns} = 3 \
+         tiers, flat backup rows {alice_flat}, locktime None"
     );
 
     // ---- 2. THE HOP the other split E2Es never make: the WHOLE coin moves to bob. ----------------
@@ -150,34 +202,56 @@ pub async fn execute() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
-    assert!(
-        mercuryrustlib::tesr::load(&cc, "sdk76_bob", &bob_sid).await?.is_some(),
-        "bob's received coin must still be laddered"
-    );
-
-    // THE PREMISE, MEASURED. One whole-coin hop == one extra flat backup. If this ever reads 1 the
-    // hop stopped happening and the rest of the test would be testing sdk59 again.
-    let bob_flat = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk76_bob", &bob_sid)
+    let bob_bundle = mercuryrustlib::tesr::load(&cc, "sdk76_bob", &bob_sid)
         .await?
-        .len();
+        .ok_or(anyhow!("bob's received coin must still be laddered"))?;
+
+    // THE PREMISE, MEASURED. One whole-coin hop == ONE co-sign (the receiver-paying S'), and the
+    // replaced S_0 is disclosed as superseded. No flat backup is minted by the hop: bob's flat rows
+    // are still zero and his coin has no locktime. If a hop ever costs two co-signs again, a
+    // per-hop backup is back and this fails here, before the split.
+    let bob_ns = num_sigs(&cc, &bob_sid).await?;
     assert_eq!(
-        bob_flat, alice_flat + 1,
-        "a RECEIVED laddered coin carries 1 + k flat backups after k hops; got {bob_flat} after 1 hop"
+        bob_ns,
+        alice_ns + 1,
+        "a whole-coin hop costs exactly ONE co-sign — the receiver-paying S' — never a flat backup \
+         beside it (got {bob_ns} after one hop from {alice_ns})"
+    );
+    assert_eq!(bob_bundle.exit_tiers().len(), 3, "bob's exit is still T -> X_0 -> S'");
+    assert_eq!(
+        bob_bundle.superseded_states.len(),
+        1,
+        "the S_0 that S' replaced must be disclosed as superseded — it is the co-sign the census \
+         counts for the hop"
+    );
+    mercuryrustlib::tesr::verify_bundle(&bob_bundle, bob_ns, 0)
+        .map_err(|e| anyhow!("bob's RECEIVED ladder failed the census with a flat term of 0: {e}"))?;
+    let bob_at_flat_one = mercuryrustlib::tesr::verify_bundle(&bob_bundle, bob_ns, 1)
+        .expect_err(
+            "bob's ladder censused with a flat term of 1 must be REJECTED: there is no flat \
+             backup for that slot to account for, so accepting it would admit a hidden state",
+        )
+        .to_string();
+    assert!(
+        bob_at_flat_one.contains("num_sigs mismatch"),
+        "the flat-term-1 census must fail on the count itself, got: {bob_at_flat_one}"
+    );
+    let bob_flat = flat_rows(&cc, "sdk76_bob", &bob_sid).await?;
+    assert_eq!(
+        bob_flat, 0,
+        "a RECEIVED laddered coin holds ZERO flat backup rows after a hop — got {bob_flat}"
     );
     assert!(
-        bob_flat as u32 > mercuryrustlib::tesr::PARENT_V2_BASELINE,
-        "the received parent must be OUTSIDE the baseline constant — that gap IS the defect"
+        coin_of(&cc, "sdk76_bob", &bob_sid).await?.locktime.is_none(),
+        "a received laddered coin carries no absolute calendar: locktime must be None"
     );
     println!(
-        "SDK76 - bob RECEIVED the whole coin (sid {bob_sid}); flat backups = {bob_flat} \
-         (baseline constant is {})",
-        mercuryrustlib::tesr::PARENT_V2_BASELINE
+        "SDK76 - bob RECEIVED the whole coin (sid {bob_sid}); num_sigs {alice_ns} -> {bob_ns} (one \
+         co-sign, S_0 superseded), flat backup rows {bob_flat}, locktime None; censused at a flat \
+         term of 1 it is rejected ({bob_at_flat_one})"
     );
 
     // ---- 3. bob splits the RECEIVED coin in-ladder to pay carol. ---------------------------------
-    // On the old code this returned "in-ladder split refused: this coin holds 2 flat backup
-    // transaction(s) but a split child's receiver censuses the ancestor segment at
-    // PARENT_V2_BASELINE = 1"; before THAT it silently minted an unadoptable child.
     let r = bob.transfer(&carol_address, PAY).await?;
     assert!(
         r.used_split,
@@ -186,7 +260,7 @@ pub async fn execute() -> Result<()> {
     assert_eq!(r.total_sats, PAY, "the payment total is the piece amount");
     println!("SDK76 - bob split his RECEIVED laddered coin in-ladder and paid carol {PAY}");
 
-    // ---- 4. THE PROPERTY: carol ADOPTS the child. ------------------------------------------------
+    // ---- 4. THE PROPERTY: carol ADOPTS the child, with an EMPTY parent chain. --------------------
     let mut waited = 0;
     let carol_child_sid = loop {
         carol.claim().await?;
@@ -206,8 +280,7 @@ pub async fn execute() -> Result<()> {
         waited += 1;
         if waited > 60 {
             return Err(anyhow!(
-                "carol could NOT adopt the child of a RECEIVED laddered parent (balance {bal:?}) \
-                 — this is the PARENT_V2_BASELINE regression"
+                "carol could NOT adopt the child of a RECEIVED laddered parent (balance {bal:?})"
             ));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -217,25 +290,42 @@ pub async fn execute() -> Result<()> {
         .ok_or(anyhow!("carol did not persist the adopted child bundle"))?;
     println!("SDK76 - carol ADOPTED the child (sid {carol_child_sid}, {PAY} sat) — the census balanced");
 
-    // The conveyed bundle must carry the parent's REAL chain, not a baseline stand-in.
+    // The conveyed bundle carries NO flat backup chain — there is none to carry.
+    assert!(
+        cb.parent_flat_backups.is_empty(),
+        "a child of a laddered parent conveys an EMPTY parent_flat_backups — got {} entries",
+        cb.parent_flat_backups.len()
+    );
+    // …and the parent census carol balanced is exactly tiers + superseded: T, X_0, SP live, with
+    // S_0 (superseded by the hop) and S' (superseded by the split) disclosed.
+    let p_ns = num_sigs(&cc, &cb.parent_statechain_id).await?;
     assert_eq!(
-        cb.parent_flat_backups.len(),
-        bob_flat,
-        "the child bundle must convey the parent's whole flat backup chain — the receiver counts it"
+        p_ns,
+        (cb.parent.exit_tiers().len() + cb.parent.superseded_states.len()) as u32,
+        "the parent census is `num_sigs == tiers + superseded` with a flat term of ZERO"
+    );
+    assert_eq!(
+        cb.parent.superseded_states.len(),
+        2,
+        "a received-then-split parent discloses exactly two superseded states: S_0 (replaced by \
+         the hop's S') and S' (replaced by the split's SP)"
+    );
+    assert!(
+        coin_of(&cc, "sdk76_carol", &carol_child_sid).await?.locktime.is_none(),
+        "an adopted child has no absolute-locktime backup; locktime must be None"
     );
 
-    // ---- 4b. [S7] THE DELEGATED TOWER MUST ACTUALLY COVER THIS CHILD. ----------------------------
+    // ---- 4b. [S7] THE DELEGATED TOWER MUST COVER THIS CHILD, AS AN EVENT. -----------------------
     //
-    // Carol now holds the one coin shape the keyless bundle used to drop on the floor. A `ctesr-`
-    // row is neither the `tesr-` row nor the `branch-` row `export_watch_bundle` looks for, so both
-    // its reads came back empty and the child took the `continue` written for a FLAT DEPOSIT — a
-    // coin with on-chain funding that no ancestor can race, which is the exact opposite of this one.
-    // The export still returned `Ok`, and the in-process tower covers children, so the only
-    // observable symptom was that a THIRD-PARTY tower silently watched none of them.
+    // A `ctesr-` row is neither the `tesr-` row nor the `branch-` row `export_watch_bundle` looks
+    // for, and it once fell through to the `continue` written for a coin nothing can race. The
+    // export still returned `Ok`, so a THIRD-PARTY tower silently watched none of a wallet's leaves.
     //
-    // Asserted here rather than in a test of its own because carol is already in the state, and
-    // because the defect was an OMISSION: sdk72's C6 pins the refusal path, and nothing anywhere
-    // pinned that a coin which SHOULD be in the bundle is.
+    // What the entry must look like is the second half: a leaf's parent is a laddered coin with NO
+    // flat backup, so no ancestor holds a matured spend of `F` and there is no height at which the
+    // race is lost on its own. Its race starts on an EVENT — somebody spending `F` — so the entry
+    // carries a trigger on `F` and `deadline_block == u32::MAX` (the height predicate permanently
+    // false). A REAL height here would be a calendar the coin does not have.
     let bundle: mercury_utexo_sdk::watchtower::WatchBundle =
         serde_json::from_str(&carol.export_watch_bundle().await?)?;
     let leaf = bundle
@@ -250,44 +340,42 @@ pub async fn execute() -> Result<()> {
                 bundle.entries.len()
             )
         })?;
-    // Both predicates, because a leaf's race has both. A laddered PARENT is exported at u32::MAX to
-    // disable the height one (an idle ladder never ages); a leaf exported that way would sleep
-    // through its own deadline, since its clock is the parent's lowest flat-backup rung — a rung
-    // belonging to the splitter.
     let trig = leaf.trigger.as_ref().ok_or_else(|| {
-        anyhow!("[S7] the child's race also starts on an EVENT (an ancestor spending F), unarmed")
+        anyhow!("[S7] a leaf's race starts on an EVENT (an ancestor spending F); the trigger is unarmed")
     })?;
     assert_eq!(trig.watch_txid, cb.parent.f_txid, "[S7] the watched outpoint is the parent's F");
     assert_eq!(trig.watch_vout, cb.parent.f_vout);
-    assert_ne!(leaf.deadline_block, u32::MAX, "[S7] a leaf's height predicate must be REAL");
+    assert_eq!(
+        leaf.deadline_block,
+        u32::MAX,
+        "[S7] a leaf has NO height deadline: no ancestor holds a matured spend of F, so the height \
+         predicate must be permanently false (got {})",
+        leaf.deadline_block
+    );
     assert!(!trig.push_txs.is_empty(), "[S7] nothing to broadcast is nothing to protect");
     // The head start must be the whole BOUND chain, so the tower starts the walk early enough to
-    // finish it — and it must be the number `auto_exit_due` uses, or the two towers disagree.
+    // finish it — the same call the in-process `defend_ladders` child pass makes.
     let bound = mercuryrustlib::tesr::child_exit_chain_bound(&cb)?;
     let csvs: Vec<Option<u16>> = bound.iter().map(|(_, c)| *c).collect();
     assert_eq!(
         trig.csv_blocks,
         mercurylib::transfer::receiver::exit_wait_blocks(&csvs),
-        "[S7] the head start must be exit_wait_blocks over the BOUND chain — the same call the \
-         in-process tower makes"
+        "[S7] the head start must be exit_wait_blocks over the BOUND chain"
     );
     assert!(
         leaf.backup_tx.is_none(),
         "[S7] a leaf has no absolute-locktime sweep; its exit IS the chain"
     );
     println!(
-        "SDK76 - [S7] carol's child IS in her watch bundle: deadline {} (head start {} over {} \
-         bound tiers), trigger {}:{}",
-        leaf.deadline_block,
+        "SDK76 - [S7] carol's child IS in her watch bundle as an EVENT entry: deadline u32::MAX, head \
+         start {} over {} bound tiers, trigger {}:{}",
         trig.csv_blocks,
         bound.len(),
         trig.watch_txid,
         trig.watch_vout
     );
 
-    // ---- 5. THE NEGATIVE CONTROL. The same bundle, censused at the OLD constant, must REJECT. -----
-    // Without this the test would still pass if `verify_child_bundle` stopped censusing the ancestor
-    // segment at all, which would be a far worse bug than the one being fixed.
+    // ---- 5. THE CONTROLS. --------------------------------------------------------------------
     let f_txid = electrum_client::bitcoin::Txid::from_str(&cb.parent.f_txid)
         .map_err(|_| anyhow!("bad parent f_txid"))?;
     let f_tx = cc.electrum_client.transaction_get(&f_txid).map_err(|_| anyhow!("F not on chain"))?;
@@ -295,42 +383,26 @@ pub async fn execute() -> Result<()> {
         hex::encode(f_tx.output[cb.parent.f_vout as usize].script_pubkey.as_bytes());
     // …and its VALUE, from the same fetched transaction — the anchor the parent's trigger is bound to.
     let f_value_onchain = f_tx.output[cb.parent.f_vout as usize].value;
-    let p_ns = num_sigs(&cc, &cb.parent_statechain_id).await?;
     let p_agg = aggregate(&cc, &cb.parent_statechain_id).await?;
     let c_ns = num_sigs(&cc, &cb.child_statechain_id).await?;
     let c_agg = aggregate(&cc, &cb.child_statechain_id).await?;
     let (_, _, p_term) =
         mercuryrustlib::lightning_latch::get_spend_budget(&cc, &cb.parent_statechain_id).await?;
     let carol_backup_addr = {
-        let coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk76_carol")
-            .await?
-            .coins
-            .iter()
-            .find(|c| c.statechain_id.as_deref() == Some(&carol_child_sid))
-            .cloned()
-            .ok_or(anyhow!("carol's child coin missing"))?;
+        let coin = coin_of(&cc, "sdk76_carol", &carol_child_sid).await?;
         mercurylib::transaction::get_user_backup_address(&coin, "regtest".to_string())?
     };
 
-    // Positive control at the REAL count: the same call carol's claim made.
+    // 5a. Positive control, the REAL receiver path: the very call carol's claim made.
+    let admitted_value = mercuryrustlib::tesr::verify_conveyed_child(&cc, &carol_backup_addr, &cb)
+        .await
+        .map_err(|e| anyhow!("the real receiver path REJECTED the adopted child of a RECEIVED parent: {e}"))?;
+    assert_eq!(
+        admitted_value, cb.child_state.out_value,
+        "the receiver's census-bound exit value is the child state's committed value"
+    );
+    // 5b. Positive control, the pure verifier at the ZERO flat term.
     mercuryrustlib::tesr::verify_child_bundle(
-        &cb,
-        &f_spk_hex,
-        f_value_onchain,
-        p_ns,
-        cb.parent_flat_backups.len() as u32,
-        p_agg.as_deref(),
-        p_term,
-        c_ns,
-        mercuryrustlib::tesr::CHILD_V2_BASELINE,
-        c_agg.as_deref(),
-        &[],
-        &carol_backup_addr,
-    )
-    .map_err(|e| anyhow!("the child of a RECEIVED parent was REJECTED at the real count: {e}"))?;
-
-    // Negative control at the OLD constant.
-    let err = mercuryrustlib::tesr::verify_child_bundle(
         &cb,
         &f_spk_hex,
         f_value_onchain,
@@ -344,19 +416,65 @@ pub async fn execute() -> Result<()> {
         &[],
         &carol_backup_addr,
     )
+    .map_err(|e| anyhow!("the child of a RECEIVED parent was REJECTED at the zero flat term: {e}"))?;
+
+    // 5c. Negative control: the same bundle censused with a flat term of 1 — the old deposit tx1
+    // — must be REJECTED by the PARENT census. Without this the test would still pass if
+    // `verify_child_bundle` stopped censusing the ancestor segment at all.
+    let err = mercuryrustlib::tesr::verify_child_bundle(
+        &cb,
+        &f_spk_hex,
+        f_value_onchain,
+        p_ns,
+        1,
+        p_agg.as_deref(),
+        p_term,
+        c_ns,
+        mercuryrustlib::tesr::CHILD_V2_BASELINE,
+        c_agg.as_deref(),
+        &[],
+        &carol_backup_addr,
+    )
     .expect_err(
-        "SECURITY/REGRESSION: censusing the ancestor segment at PARENT_V2_BASELINE must NOT accept \
-         the child of a RECEIVED parent — if it does, the census is no longer exact",
+        "SECURITY/REGRESSION: censusing the ancestor segment with a flat term of 1 must NOT accept \
+         a child of a laddered parent — no flat backup exists for that slot to account for",
     )
     .to_string();
     assert!(
         err.contains("parent segment/census invalid: num_sigs mismatch"),
-        "the baseline census must fail on the PARENT census specifically, got: {err}"
+        "the flat-term-1 census must fail on the PARENT census specifically, got: {err}"
     );
-    println!(
-        "SDK76 - negative control: the same bundle censused at PARENT_V2_BASELINE is REJECTED \
-         ({err}) — the fix is load-bearing, not cosmetic"
+    println!("SDK76 - negative control: the same bundle censused at a flat term of 1 is REJECTED ({err})");
+
+    // 5d. Negative control: a bundle that CONVEYS a flat backup beside its ladder. The entry is a
+    // prior owner's retained spend of `F` — here, the parent's own trigger, the most realistic
+    // thing a sender could keep — and it must be refused BY NAME by the real receiver path, before
+    // any census is run: a co-sign the census cannot account for, and a spend of the funding
+    // output in someone else's hands.
+    let mut forged = cb.clone();
+    forged.parent_flat_backups.push(mercurylib::wallet::BackupTx {
+        tx_n: 1,
+        tx: cb.parent.trigger.signed_tx.clone(),
+        client_public_nonce: String::new(),
+        server_public_nonce: String::new(),
+        client_public_key: String::new(),
+        server_public_key: String::new(),
+        blinding_factor: String::new(),
+        rgb_consignment: None,
+        rgb_blinding: None,
+    });
+    let err = mercuryrustlib::tesr::verify_conveyed_child(&cc, &carol_backup_addr, &forged)
+        .await
+        .expect_err(
+            "SECURITY: a child bundle conveying a flat backup beside its ladder was ACCEPTED — a \
+             prior owner's retained spend of F would ride along with every adopted child",
+        )
+        .to_string();
+    assert!(
+        err.contains("flat backup transaction(s) beside its ladder"),
+        "a conveyed flat backup must be refused BY NAME (refuse_conveyed_flat_backups), got: {err}"
     );
+    println!("SDK76 - negative control: a conveyed flat backup beside the ladder is REFUSED by name ({err})");
 
     // ---- 6. carol exits the child unilaterally; the sats land at her own key. --------------------
     let mut passes = 0;
@@ -384,11 +502,11 @@ pub async fn execute() -> Result<()> {
 
     println!(
         "SDK76 - ✓ PASS: a RECEIVED (transferred-once) laddered coin was split IN-LADDER and its \
-         child was ADOPTED by the receiver and EXITED for {child_value} sat. The ancestor census now \
-         runs on the parent's REAL conveyed flat-backup count ({bob_flat}), not the \
-         PARENT_V2_BASELINE constant ({}) — which the negative control proves would still reject \
-         this exact bundle.",
-        mercuryrustlib::tesr::PARENT_V2_BASELINE
+         child was ADOPTED by the receiver and EXITED for {child_value} sat. No flat backup existed \
+         at any step (deposit num_sigs 3, hop +1, zero backup rows, locktime None throughout); the \
+         child conveyed an EMPTY parent chain; the ancestor census ran on `tiers + superseded` \
+         with a flat term of 0 — a flat term of 1 is rejected, and a conveyed flat backup is \
+         refused by name."
     );
     Ok(())
 }

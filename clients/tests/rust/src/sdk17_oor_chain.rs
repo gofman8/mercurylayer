@@ -4,6 +4,14 @@
 //! This is our statechain equivalent of chaining out-of-round Ark VTXO transfers and redeeming at the
 //! end, and of Spark's off-chain leaf transfers.
 //!
+//! Hop 2 is the load-bearing one for the split-depth cap: it is a CHILD-LEVEL in-ladder split of a
+//! RECEIVED child. The cap (`enforce_split_depth_cap`) measures the leaf's exit walk against
+//! `initlock` as a FIXED window — a laddered coin has no absolute-locktime backup and therefore no
+//! epoch deadline to read off a parent chain — so a grandchild split on a received child must
+//! SUCCEED, and the grandchild bundle must carry one intermediate `ancestors` segment and an EMPTY
+//! `parent_flat_backups`. Both are asserted; the root itself is asserted to carry no flat backup at
+//! all (`num_sigs == 3`, zero backup rows, `locktime == None`).
+//!
 //! Run: SDK_E2E=17 ML_NETWORK=regtest cargo run
 
 use std::str::FromStr;
@@ -71,7 +79,32 @@ pub async fn execute() -> Result<()> {
         .clone();
     let o_txid = deposit.utxo_txid.clone().unwrap();
     let o_vout = deposit.utxo_vout.unwrap();
-    println!("SDK17 - alice deposited 40k; funding outpoint O = {o_txid}:{o_vout} (the only on-chain tx)");
+    // THE ROOT'S SHAPE: a ladder and nothing else. Three co-signs (T, X_0, S_0), no flat tx1, no
+    // backup rows, no absolute calendar. This is what makes every hop below out-of-round: nothing
+    // in the root's exit material can mature on its own.
+    let root_sid = deposit.statechain_id.clone().ok_or_else(|| anyhow!("deposit has no sid"))?;
+    let root = mercuryrustlib::tesr::load(&cc, "sdk17_alice", &root_sid)
+        .await?
+        .ok_or_else(|| anyhow!("alice's deposit must be laddered — there is no un-laddered lane"))?;
+    let root_ns = mercuryrustlib::utils::get_statechain_info(&root_sid, &cc)
+        .await?
+        .ok_or_else(|| anyhow!("no statechain info for {root_sid}"))?
+        .num_sigs;
+    assert_eq!(
+        root_ns, 3,
+        "a laddered deposit costs exactly its three tiers — a fourth co-sign would be the flat tx1 \
+         the rule removed (got {root_ns})"
+    );
+    assert_eq!(root.exit_tiers().len(), 3, "the root's exit is T -> X_0 -> S_0");
+    let root_flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk17_alice", &root_sid)
+        .await?
+        .map_or(0, |v| v.len());
+    assert_eq!(root_flat, 0, "a laddered root holds ZERO flat backup rows (got {root_flat})");
+    assert!(deposit.locktime.is_none(), "a laddered root carries no absolute calendar: locktime is None");
+    println!(
+        "SDK17 - alice deposited 40k; funding outpoint O = {o_txid}:{o_vout} (the only on-chain tx); \
+         laddered at num_sigs {root_ns}, {root_flat} flat backup rows, locktime None"
+    );
 
     // --- OOR hop 1: alice -> bob (off-chain) ------------------------------------------------------
     for _ in 0..2 { let t = prepaid_token(&cc).await?; alice.add_prepaid_token(&t).await; }
@@ -80,14 +113,34 @@ pub async fn execute() -> Result<()> {
     claim_one(&bob).await?;
     assert_eq!(bob.get_balance().await?.available_sats, 20_000, "bob got 20k off-chain");
     assert!(!is_outpoint_spent(&cc, &o_txid, o_vout), "hop 1 was OUT-OF-ROUND: O still unspent");
-    println!("SDK17 - OOR hop 1: alice -> bob 20k, off-chain (O still unspent) \u{2713}");
+    let bob_child_sid = r1.coins[0].statechain_id.clone();
+    let bob_cb = mercuryrustlib::tesr::load_child(&cc, "sdk17_bob", &bob_child_sid)
+        .await?
+        .ok_or_else(|| anyhow!("bob did not adopt the split child {bob_child_sid}"))?;
+    assert!(
+        bob_cb.parent_flat_backups.is_empty(),
+        "a child of a laddered root conveys an EMPTY parent chain — got {} flat backup(s)",
+        bob_cb.parent_flat_backups.len()
+    );
+    assert!(bob_cb.ancestors.is_empty(), "a root split mints a DEPTH-1 child");
+    println!("SDK17 - OOR hop 1: alice -> bob 20k, off-chain (O still unspent); bob's child conveys an empty parent chain \u{2713}");
 
     // --- OOR hop 2: bob -> carol (off-chain) — bob re-spends his received sub-coin ----------------
     for _ in 0..2 { let t = prepaid_token(&cc).await?; alice.add_prepaid_token(&t).await; }
     // (carol/bob need a spend token too; add to bob's wallet)
     for _ in 0..2 { let t = prepaid_token(&cc).await?; bob.add_prepaid_token(&t).await; }
-    let r2 = bob.transfer(&carol_addr, 10_000).await?;
-    assert!(r2.used_split);
+    // THE DEPTH CAP ON A RECEIVED CHILD. This split used to read the parent's flat backups off the
+    // conveyed bundle to derive an epoch window; with no flat backups anywhere it fails closed
+    // unless the cap measures against `initlock` as a fixed window. A refusal here is the
+    // regression, and it is named as such rather than reported as a generic transfer failure.
+    let r2 = bob.transfer(&carol_addr, 10_000).await.map_err(|e| {
+        anyhow!(
+            "REGRESSION: the child-level in-ladder split of bob's RECEIVED child {bob_child_sid} \
+             was REFUSED — the split-depth cap must measure against `initlock` as a fixed exit \
+             window, not against a parent flat-backup chain that no longer exists: {e:#}"
+        )
+    })?;
+    assert!(r2.used_split, "a 10k payment out of a 20k child must be a CHILD-LEVEL in-ladder split");
     claim_one(&carol).await?;
     assert_eq!(carol.get_balance().await?.available_sats, 10_000, "carol got 10k off-chain");
     assert!(!is_outpoint_spent(&cc, &o_txid, o_vout), "hop 2 was OUT-OF-ROUND: O STILL unspent after two hops");
@@ -95,6 +148,25 @@ pub async fn execute() -> Result<()> {
 
     // --- Only the final unilateral exit touches the chain -----------------------------------------
     let carol_coin = r2.coins[0].statechain_id.clone();
+    // The grandchild is a DEPTH-2 leaf: bob's terminalized child rides along as one intermediate
+    // `ancestors` segment, and — like every level of the tree — it conveys NO flat backup.
+    let carol_cb = mercuryrustlib::tesr::load_child(&cc, "sdk17_carol", &carol_coin)
+        .await?
+        .ok_or_else(|| anyhow!("carol did not adopt the grandchild {carol_coin}"))?;
+    assert_eq!(
+        carol_cb.ancestors.len(),
+        1,
+        "a grandchild carries exactly one intermediate segment (bob's terminalized child)"
+    );
+    assert!(
+        carol_cb.parent_flat_backups.is_empty(),
+        "a depth-2 leaf conveys an EMPTY parent chain — got {} flat backup(s)",
+        carol_cb.parent_flat_backups.len()
+    );
+    assert_eq!(
+        carol_cb.parent_statechain_id, bob_cb.parent_statechain_id,
+        "the grandchild hangs off the same laddered root"
+    );
     // Carol's exit key — the PAYOFF assertion below checks the value actually lands there, which the
     // pre-TES-R version of this test never verified (it only checked that O got spent).
     let carol_exit_key = {

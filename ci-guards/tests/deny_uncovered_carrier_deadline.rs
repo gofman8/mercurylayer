@@ -1,5 +1,5 @@
-//! **[D46 / decision 4] The carrier lane must not be the one lane with no automatic deadline
-//! coverage.**
+//! **[D46 / decision 4 → ONE COIN SHAPE] The carrier lane must not be the one lane with no
+//! automatic deadline coverage — and the pass that provides it now has NO SUBJECT.**
 //!
 //! `deadline_safety_due` has two routes. The COOPERATIVE one (`auto_refresh_due`) excludes token
 //! carriers for a real reason: a plain re-anchor spends the carrier's funding outpoint into a fresh
@@ -7,15 +7,33 @@
 //!
 //! The UNILATERAL route excluded them too — and there the exclusion had no such justification. It
 //! left an RGB carrier's `min(L_k)` resting on `auto_exit_due` alone, in the one lane where the loss
-//! is an ASSET rather than sats.
+//! is an ASSET rather than sats. D46 removed it. The forced action is the sever (`sever_from_f`,
+//! which IS `unilateral_exit` on one coin): it broadcasts the coin's own pre-signed `T`, a tier of
+//! the coin's own ladder carrying the coin's own state — it does not re-aggregate and does not move
+//! the allocation, which is exactly why it is safe on a carrier where a re-anchor is not.
 //!
-//! The forced action is `unilateral_exit`, which broadcasts the coin's own pre-signed `T`. That is a
-//! tier of the coin's own ladder carrying the coin's own state — it does not re-aggregate and does
-//! not move the allocation, which is exactly why it is safe on a carrier where a re-anchor is not.
+//! # What changed: the calendar is gone
 //!
-//! `sdk86` measured the calendar this protects: the flat backup chain's absolute locktime is finite,
-//! mining moves the tip toward it, and each whole-coin hop spends `interval` of it. INV-27's "idle
-//! coins never age" is true of the CSV side only.
+//! `sdk86` measured the clock this pass defended — the flat backup chain's absolute locktime,
+//! finite, spent by `interval` per whole-coin hop. Under ONE COIN SHAPE that chain does not exist:
+//! no flat backup is co-signed at deposit (the ladder `T, X_0, S_0` is signed at the FIRST MEMPOOL
+//! SIGHTING of the funding transaction instead) nor at any hop (a transfer conveys
+//! `backup_transactions: []`), the receiver books `coin.locktime = None`, and nothing afterwards
+//! writes a height into it. So `coin_near_final` is never true and the `still_due` set this file is
+//! about is EMPTY by construction. INV-27's "idle coins never age" is now true of the whole coin,
+//! not of the CSV side only.
+//!
+//! # Why the pins are kept
+//!
+//! The pass still runs on every tick (`deny_optional_deadline_safety` pins the wiring, and pins
+//! that an absent clock is never read as "due now"). The four mistakes this file denies are all of
+//! the silent-degradation species — a carrier filtered OUT of the set the sever acts on, an `Err`
+//! arm collapsed to `continue`, a clean `Ok` over an undefended coin, a BLIND wallet severing on a
+//! guess — and each of them looks exactly like idle. An empty subject is precisely the condition
+//! under which such a regression cannot be noticed by running the code, so the SHAPE of the pass is
+//! pinned here against the day it has a subject again (any future height-keyed `coin_near_final`),
+//! and the cooperative exclusion is pinned so that the one route which CAN destroy a carrier never
+//! regains one.
 
 use std::path::PathBuf;
 
@@ -75,20 +93,36 @@ fn code_only(src: &str) -> String {
     strip_comments(src)
 }
 
+/// The body of the method starting at `sig`, bounded by the next COLUMN-4 item — a real symbol,
+/// never a byte count and never a fallback to end-of-text (a window that overshoots lets the NEXT
+/// method's text satisfy every assertion under it).
 fn body(code: &str, sig: &str) -> String {
     let at = code.find(sig).unwrap_or_else(|| panic!("`{sig}` is gone"));
     let rest = &code[at + sig.len()..];
-    let end = ["\n    pub async fn ", "\n    pub fn ", "\n    async fn ", "\n    fn "]
-        .iter()
-        .filter_map(|m| rest.find(m))
-        .min()
-        .unwrap_or(rest.len());
+    let end = [
+        "\n    pub async fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) async fn ",
+        "\n    pub(crate) fn ",
+        "\n    async fn ",
+        "\n    fn ",
+    ]
+    .iter()
+    .filter_map(|m| rest.find(m))
+    .min()
+    .unwrap_or_else(|| {
+        panic!(
+            "`{sig}` has no following column-4 item to bound its body — refusing to scan to \
+             end-of-file"
+        )
+    });
     let b = code[at..at + sig.len() + end].to_string();
     assert!(b.len() > 500, "`{sig}` scanned to {} bytes — that is not a function body", b.len());
     b
 }
 
-/// THE FIX: the unilateral route does NOT filter carriers out.
+/// THE FIX: the unilateral route does NOT filter carriers out. [ONE COIN SHAPE] The set it acts on
+/// is empty today (no coin has a clock); what is pinned is that a carrier is never REMOVED from it.
 #[test]
 fn the_unilateral_deadline_route_covers_carriers() {
     let code = code_only(&read("clients/libs/rust-sdk/src/refresh.rs"));
@@ -116,7 +150,7 @@ fn the_unilateral_deadline_route_covers_carriers() {
          take it is refused BY `unilateral_exit`, on the merits, and [D51] reports that refusal. \
          Excluding it here hides the coin instead:\n\n{still_due}"
     );
-    // …and it still SEVERES rather than re-anchoring. A carrier re-anchored is a carrier destroyed.
+    // …and it still SEVERS rather than re-anchoring. A carrier re-anchored is a carrier destroyed.
     // [D67] Either spelling of the sever. `sever_from_f` IS `unilateral_exit` on one coin, and the
     // pass now routes through the NAMED remedy so the doc's "it is also what `deadline_safety_due`
     // falls back to" is true of the symbol too. What must never appear here is a RE-ANCHOR.

@@ -131,7 +131,21 @@ pub async fn execute() -> Result<()> {
         .await?
         .ok_or(anyhow!("alice's coin must be laddered (V2)"))?;
     let (f_txid, f_vout) = (bundle.f_txid.clone(), bundle.f_vout);
-    println!("SDK60 - alice deposited {DEPOSIT}; funding outpoint F = {f_txid}:{f_vout} (the only on-chain tx)");
+    // The root's shape: exactly three co-signs (T, X_0, S_0), no flat tx1, no backup rows.
+    let root_ns = num_sigs(&cc, &alice_sid).await?;
+    assert_eq!(
+        root_ns, 3,
+        "a laddered deposit costs exactly its three tiers — a fourth co-sign would be the flat tx1 \
+         the rule removed (got {root_ns})"
+    );
+    assert_eq!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk60_alice", &alice_sid)
+            .await?
+            .map_or(0, |v| v.len()),
+        0,
+        "a laddered root holds ZERO flat backup rows"
+    );
+    println!("SDK60 - alice deposited {DEPOSIT}; funding outpoint F = {f_txid}:{f_vout} (the only on-chain tx); laddered at num_sigs {root_ns}, no flat backup");
 
     // ---- HOP 1: Alice -> Bob, NON-EXACT ⟹ in-ladder split, piece conveyed with the handover. -----
     let r = alice.transfer(&bob_address, PAY).await?;
@@ -140,6 +154,11 @@ pub async fn execute() -> Result<()> {
     let bob_cb = mercuryrustlib::tesr::load_child(&cc, "sdk60_bob", &bob_child_sid)
         .await?
         .ok_or(anyhow!("bob did not adopt the child bundle"))?;
+    assert!(
+        bob_cb.parent_flat_backups.is_empty(),
+        "a child of a laddered parent conveys an EMPTY parent chain — got {} flat backup(s)",
+        bob_cb.parent_flat_backups.len()
+    );
 
     // FIRST-CLASS: the handover completed, so bob co-owns A_child and alice is locked out.
     let bob_coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk60_bob")

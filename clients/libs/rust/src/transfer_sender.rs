@@ -1,265 +1,21 @@
-use std::{cmp::Ordering, str::FromStr};
 
-use crate::{client_config::ClientConfig, deposit::create_tx1, sqlite_manager::{get_backup_txs, get_wallet, update_backup_txs, update_wallet}, transaction::new_transaction, transfer_receiver::PendingTransferInfo, utils::info_config};
+use crate::{client_config::ClientConfig, sqlite_manager::{get_backup_txs, get_wallet, update_wallet}, transfer_receiver::PendingTransferInfo};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use mercurylib::{decode_transfer_address, transfer::sender::{create_transfer_signature, create_transfer_update_msg_with_branch, TransferSenderRequestPayload, TransferSenderResponsePayload}, utils::get_blockheight, wallet::{get_previous_outpoint, Activity, BackupTx, Coin, CoinStatus, Wallet}};
-use electrum_client::ElectrumApi;
-
-pub async fn create_backup_transactions(
-    client_config: &ClientConfig, 
-    recipient_address: &str,
-    wallet: &mut Wallet,
-    statechain_id: &str,
-    duplicated_indexes: Option<Vec<u32>>,
-) -> Result<Vec<BackupTx>> {
-
-    // throw error if duplicated_indexes contains an index that does not exist in wallet.coins
-    // this can be moved to the caller function
-    if duplicated_indexes.is_some() {
-        for index in duplicated_indexes.as_ref().unwrap() {
-            if *index as usize >= wallet.coins.len() {
-                return Err(anyhow!("Index {} does not exist in wallet.coins", index));
-            }
-        }
-    }  
-
-    let mut coin_list: Vec<&mut Coin> = Vec::new();
-
-    // A coin with NO flat backup rows is an expected shape, not a database failure: a split child's
-    // funding output was never deposited and a spine tip's is un-broadcast, so neither ever acquired
-    // one. Routing such a coin to the FLAT sender is a real condition and it gets a named refusal
-    // here — before this, the bare `?` handed the caller sqlx's own sentence, which `chaos22`'s
-    // oracle could only class as an unclassified breach.
-    //
-    // [#145] The message below used to say the caller's own dispatch had already routed away every
-    // shape that legitimately lacks rows. That was TRUE OF ONE CALLER. `execute` is public and
-    // `chaos22`'s `respend` calls it directly, so tips arrived here anyway and the sentence was
-    // simply false — it named a guard the caller did not run. The tip refusal now lives in
-    // `execute_ex` itself, which is what makes the residue below genuinely residual.
-    let backup_transactions =
-        crate::sqlite_manager::try_get_backup_txs(&client_config.pool, &wallet.name, &statechain_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "statechain id {statechain_id} has NO EXIT MATERIAL: no flat backup rows, and \
-                     every shape that legitimately lacks them has already been routed away — a \
-                     `spinetip-` row is refused by name in `execute_ex` above, and a `ctesr-` child \
-                     goes to `child_retransfer`. So this is a slot the SE knows about that this \
-                     wallet cannot exit from and cannot convey on any lane — most often a derived \
-                     child slot whose split failed after the slot was created. It must not have been \
-                     offered to coin selection. Restore it from a recovery bundle if its material \
-                     exists elsewhere; otherwise it is spendable only cooperatively."
-                )
-            })?;
-
-    // Get coins that already have a backup transaction
-    for coin in wallet.coins.iter_mut() {
-        // Check if coin matches any backup transaction and has one of the specified statuses
-        let has_matching_tx = backup_transactions.iter().any(|backup_tx| {
-            if let Ok(tx_outpoint) = get_previous_outpoint(backup_tx) {
-                if let (Some(utxo_txid), Some(utxo_vout)) = (coin.utxo_txid.clone(), coin.utxo_vout) {
-                    (coin.status == CoinStatus::DUPLICATED ||
-                     coin.status == CoinStatus::CONFIRMED ||
-                     coin.status == CoinStatus::IN_TRANSFER) &&
-                    tx_outpoint.txid == utxo_txid &&
-                    tx_outpoint.vout == utxo_vout
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        });
-
-        let mut coin_to_add = false;
-
-        if duplicated_indexes.is_some() {
-            if coin.statechain_id == Some(statechain_id.to_string()) && 
-            (coin.status == CoinStatus::CONFIRMED || coin.status == CoinStatus::IN_TRANSFER) {
-                coin_to_add = true;
-            }
-
-            if coin.statechain_id == Some(statechain_id.to_string()) && coin.status == CoinStatus::DUPLICATED && 
-                duplicated_indexes.is_some() && duplicated_indexes.as_ref().unwrap().contains(&coin.duplicate_index) {
-                coin_to_add = true;
-            }
-        }
-
-        if has_matching_tx || coin_to_add {
-            if coin.locktime.is_none() {
-                return Err(anyhow::anyhow!("coin.locktime is None"));
-            }
-        
-            let block_header = client_config.electrum_client.block_headers_subscribe_raw()?;
-            let current_blockheight = block_header.height as u32;
-        
-            if current_blockheight > coin.locktime.unwrap()  {
-                return Err(anyhow::anyhow!("The coin is expired. Coin locktime is {} and current blockheight is {}", coin.locktime.unwrap(), current_blockheight));
-            }
-
-            coin_list.push(coin);
-        }
-    }
-
-    // The backup transaction for the CONFIRMED coin is created when it is detected in the mempool
-    // So it is exepcted that the coin with duplicate_index == 0 is in the list since it must have at least one backup transaction
-    let coins_with_zero_index = coin_list
-        .iter()
-        .filter(|coin| coin.duplicate_index == 0 && (coin.status == CoinStatus::CONFIRMED || coin.status == CoinStatus::IN_TRANSFER))
-        .collect::<Vec<_>>();
-
-    if coins_with_zero_index.len() != 1 {
-        return Err(anyhow!("There must be at least one coin with duplicate_index == 0"));
-    }
-
-    for coin in coin_list.iter_mut() {
-        if coin.status == CoinStatus::DUPLICATED {
-            let address = bitcoin::Address::from_str(&coin.aggregated_address.as_ref().unwrap())?.require_network(client_config.network)?;
-            let utxo_list =  client_config.electrum_client.script_list_unspent(&address.script_pubkey())?;
-
-            for unspent in utxo_list {
-                if coin.utxo_txid == Some(unspent.tx_hash.to_string()) && coin.utxo_vout == Some(unspent.tx_pos as u32) {
-                    let mut is_confirmed =  false;
-
-                    if unspent.height > 0 {
-                        let block_header = client_config.electrum_client.block_headers_subscribe_raw()?;
-                        let blockheight = block_header.height;
-
-                        let confirmations = blockheight - unspent.height + 1;
-
-                        if confirmations as u32 >= client_config.confirmation_target {
-                            is_confirmed = true;
-                        }
-                    }
-
-                    if !is_confirmed {
-                        return Err(anyhow!("The coin with duplicated index {} has not yet been confirmed. This transfer cannot be performed.", coin.duplicate_index));
-                    }
-
-                    break;
-                }
-            }
-        }
-    }
-
-    // Move the coin with CONFIRMED status to the first position
-    coin_list.sort_by(|a, b| {
-        match (&a.status, &b.status) {
-            (CoinStatus::CONFIRMED, _) => Ordering::Less,
-            (_, CoinStatus::CONFIRMED) => Ordering::Greater,
-            _ => Ordering::Equal,
-        }
-    });
-
-    let mut new_backup_transactions = Vec::new();
-
-    // create backup transaction for every coin. Same absence-vs-failure rule as the caller above:
-    // `new_tx_n` is derived from this length, so reading a failed read as "zero rows" would restart
-    // the ladder at tx_n 0 and collide with every existing hop.
-    let backup_transactions =
-        crate::sqlite_manager::try_get_backup_txs(&client_config.pool, &wallet.name, &statechain_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "statechain id {statechain_id} has no flat backup rows to extend — refusing to \
-                     start a new backup chain at tx_n 0 over a coin that should already have one"
-                )
-            })?;
-
-    let mut new_tx_n = backup_transactions.len() as u32;
-
-    for coin in coin_list {
-
-        let mut filtered_transactions: Vec<BackupTx> = Vec::new();
-
-        for backup_tx in &backup_transactions {
-            if let Ok(tx_outpoint) = get_previous_outpoint(&backup_tx) {
-                if let (Some(utxo_txid), Some(utxo_vout)) = (coin.utxo_txid.clone(), coin.utxo_vout) {
-                    if tx_outpoint.txid == utxo_txid && tx_outpoint.vout == utxo_vout {
-                        filtered_transactions.push(backup_tx.clone());
-                    }
-                }
-            }
-        }
-
-        filtered_transactions.sort_by(|a, b| a.tx_n.cmp(&b.tx_n));
-
-        if filtered_transactions.len() == 0 {
-            new_tx_n = new_tx_n + 1;
-            let bkp_tx1 = create_tx1(client_config, coin, &wallet.network, new_tx_n).await?;
-            filtered_transactions.push(bkp_tx1);
-        }
-
-        let qt_backup_tx = filtered_transactions.len() as u32;
-
-        new_tx_n = new_tx_n + 1;
-
-        let bkp_tx1 = &filtered_transactions[0];
-
-        let signed_tx = create_backup_tx_to_receiver(client_config, coin, bkp_tx1, recipient_address, qt_backup_tx, &wallet.network).await?;
-
-        let backup_tx = BackupTx {
-            tx_n: new_tx_n,
-            tx: signed_tx.clone(),
-            client_public_nonce: coin.public_nonce.as_ref().unwrap().to_string(),
-            server_public_nonce: coin.server_public_nonce.as_ref().unwrap().to_string(),
-            client_public_key: coin.user_pubkey.clone(),
-            server_public_key: coin.server_pubkey.as_ref().unwrap().to_string(),
-            blinding_factor: coin.blinding_factor.as_ref().unwrap().to_string(),
-            rgb_consignment: None,
-            rgb_blinding: None,
-        };
-
-        filtered_transactions.push(backup_tx);
-
-        if coin.duplicate_index == 0 {
-            new_backup_transactions.splice(0..0, filtered_transactions);
-        } else {
-            new_backup_transactions.extend(filtered_transactions);
-        }
-
-        coin.status = CoinStatus::IN_TRANSFER;
-    }
-
-    new_backup_transactions.sort_by(|a, b| a.tx_n.cmp(&b.tx_n));
-
-    Ok(new_backup_transactions)
-}
+use mercurylib::{decode_transfer_address, transfer::sender::{create_transfer_signature, create_transfer_update_msg_with_branch, TransferSenderRequestPayload, TransferSenderResponsePayload}, wallet::{Activity, BackupTx, Coin, CoinStatus, Wallet}};
 
 // =================================================================================================
-// FLAT-LANE BOOKKEEPING — the "one coin type" step.
+// ONE COIN SHAPE, ONE LANE.
 //
-// Laddering is UNCONDITIONAL for every coin the SDK's `claim()` pass can ladder, so a coin WITHOUT a
-// TES-R ladder is an exception that has to be EXPLAINABLE. There are exactly four structurally
-// permanent explanations — the LICENCES (see [`PermanentLicence`]):
-//   * RGB CARRIER — a tier spend carries no state transition and would destroy the allocation
-//     (terminal freeze). Stays flat until CTES-R colouring lands.
-//   * TERMINALIZED CARRIER (`single_use`) — the same terminal-freeze rule reached through the flag.
-//   * [B0] — the coin's funding `F` is not on chain (a split sub-coin), so a trigger has no prevout.
-//   * LEGACY NO-AGGREGATE — the coordinator recorded no `aggregate_xonly` for the sid (pre-0009), so
-//     no receiver could bind a ladder built over it.
-// Anything else conveyed flat is a BUG, and a silent flat conveyance is precisely how a coin would
-// lose its census protection — so it is refused loudly instead (see `assert_flat_conveyance_is_legitimate`).
+// A coin's only exit material is its TES-R ladder, established at first sight of the deposit
+// (`coin_status::check_deposit` or the SDK's establish pass). There is NO flat backup chain: no
+// `tx1` at deposit, no per-hop backup at transfer, and no un-laddered conveyance lane. A coin with
+// no ladder row cannot be conveyed at all — `execute_ex` refuses it by name, because the receiver's
+// census (`se_num_sigs == tiers + superseded`) has no way to account for a coin whose exit material
+// is not a ladder, and because such a coin has no exit for the receiver to inherit.
 //
-// ── HOW THIS IS WRITTEN, AND WHY IT IS WRITTEN THAT WAY ─────────────────────────────────────────
-// THREE successive review rounds each found a NEW fail-open in the classifier, because it was
-// written as "return Ok(()) unless something looks wrong": FLAT_RGB_STATE_UNAVAILABLE licensing the
-// flat lane, a `let ... else` funding fallback, `Ok(None)` from the coordinator, a blanket
-// `ladder_binding_precheck(..).is_err()` that read EVERY error cause as the legacy explanation, and
-// a global scope gate armed by a best-effort write. Every arm was a potential hole, so patching arms
-// one at a time never converged.
-//
-// So the polarity is INVERTED. The classifier computes an `Option<PermanentLicence>` from POSITIVE
-// evidence and nothing else; `assert_flat_conveyance_is_legitimate` contains exactly ONE `Ok(())`
-// statement, reached only by `Some(licence)`. Every other path — every `else`, every `Err`, every
-// `None`, every unparseable row, every unreachable dependency — is a refusal. The property is
-// auditable by counting: `grep -c 'Ok(())'` inside that function must print 1, and
-// `the_classifier_has_exactly_one_ok_return` in the test module below asserts it on the source.
-//
-// The carrier half of the classification needs RGB state, which this crate deliberately does not
-// have. So the SDK's ladder pass RECORDS its decision per coin (`ladderskip-<sid>`), and this crate
-// reads it back — but ONLY as one of several positive witnesses, never as a blanket permission slip.
+// The `ladderskip-<sid>` records below are DIAGNOSTIC: the SDK's establish pass writes why a coin
+// could not be laddered this pass, so the owner can see it. No recorded reason licenses anything.
 // =================================================================================================
 
 /// Wallet-level row written by the SDK's `claim()` ladder pass: "this wallet ladders its coins, so
@@ -311,6 +67,11 @@ pub const FLAT_ATTESTATION_INVALID: &str = "attestation-invalid";
 /// [`crate::tesr::BindingRefusal::NoCoordinatorAggregate`] is the permanent, harmless explanation,
 /// and folding the other causes into it was one of the fail-opens this module now forbids.
 pub const FLAT_BINDING_UNRESOLVED: &str = "binding-unresolved";
+/// The coin has a PLAIN ladder and the allocation set says it is a carrier: tokens were moved onto
+/// an outpoint that was already plain-laddered. Its exit would BURN the allocation and its tiers
+/// cannot be unsigned; the coloured re-anchor is the remedy. Diagnostic — the coin is not skipped,
+/// it is WRONGLY laddered, and the owner must know before the exit does.
+pub const FLAT_PLAIN_LADDER_OVER_CARRIER: &str = "plain-ladder-over-carrier";
 
 /// Stable marker embedded in the refusal raised when the receiver-paying state `S'` could not be
 /// pre-signed AFTER the SE co-sign stage was entered ([M1]). Named so a caller can branch on it
@@ -328,53 +89,22 @@ pub fn ladder_skip_key(statechain_id: &str, duplicate_index: u32) -> String {
     }
 }
 
-/// Does this recorded reason legitimise conveying the coin on the FLAT lane?
+/// Does this recorded reason legitimise conveying the coin WITHOUT a ladder?
 ///
-/// ⚠️ **This is a PREDICTION, not the decision.** The authority is
-/// [`assert_flat_conveyance_is_legitimate`], which re-proves each licence from live evidence — the
-/// `branch-`/`ctesr-` rows for [B0], the coin's own `single_use` flag for a terminalized carrier, the
-/// coordinator's live answer for the legacy no-aggregate case. A recorded string on its own licenses
-/// only [`FLAT_RGB_CARRIER`], because RGB state is the one thing this crate genuinely cannot see and
-/// the recording component positively asserted it. Everything here that returns `true` is "the
-/// classifier will very probably say yes"; it is exported so an app can warn ahead of a `send`.
-///
-/// **Only the STRUCTURALLY PERMANENT reasons predict a yes** — the four explanations named in the
-/// module comment above (RGB carrier, terminalized carrier, [B0] off-chain funding, legacy
-/// no-aggregate). A reason that merely says "this pass could not decide" or "this pass did not
-/// succeed" is a DEFERRAL, and a deferral must never harden into a standing licence.
-///
-/// [B1] `rgb-state-unavailable` used to be on this list and was the worst entry on it. It is written
-/// when a token wallet's RGB state was momentarily unreadable, which makes the pass skip laddering
-/// for that pass and self-heal on the next one — a transient condition, recorded in exactly the
-/// wallets where carriers matter. Accepting it as a licence meant one RGB blip let a coin convey
-/// flat forever after. Refuse instead; the caller runs `claim()` again and the record clears.
-///
-/// `establish-failed` is out for the same reason, and for a second one: `establish_auto` may have
-/// already landed one or more SE co-signs before failing, so the coin's `num_sigs` can be raised
-/// while its bundle was never persisted. Such a coin's flat conveyance is REJECTED by the receiver's
-/// census anyway ("num_sigs is not correct") after the sender's coin is already IN_TRANSFER —
-/// refusing up-front converts that stuck transfer into an actionable error.
-///
-/// `coordinator-unavailable` is out ("we do not know" is not "flat is fine"), `duplicate-deposit` is
-/// out (a duplicate is never the conveyed coin), `binding-unresolved` is out (a decoy-shaped or
-/// unreadable funding output is not the harmless legacy case), and `ladder-unreadable` is out (the
-/// conveyance path refuses such a coin before it ever reads this record).
-pub fn is_legitimate_flat_reason(reason: &str) -> bool {
-    matches!(reason, FLAT_TERMINALIZED_CARRIER | FLAT_FUNDING_NOT_ONCHAIN | FLAT_NOT_BINDABLE)
+/// **Never.** There is no flat lane: a coin's only exit material is its TES-R ladder, established
+/// at first sight of its funding transaction, and `execute` refuses a coin without a `tesr-` row by
+/// name before any SE co-sign. The `ladderskip-<sid>` record a ladder pass writes is DIAGNOSTIC
+/// ONLY — it tells the owner WHY a coin has no ladder (an RGB carrier a plain wallet cannot colour,
+/// a coordinator that could not be reached, an establish that failed part-way, ...) so the remedy is
+/// visible: re-run `claim()`, colour the wallet, or withdraw / exit the coin. Kept as a function so
+/// callers that ask the question keep compiling, and so the answer is visibly "never".
+pub fn is_legitimate_flat_reason(_reason: &str) -> bool {
+    // There is no flat lane. A coin without a ladder cannot be conveyed, whatever the reason it
+    // was left without one; the recorded reason is diagnostic only. Kept as a function so callers
+    // that ask the question keep compiling, and so that the answer is visibly "never".
+    false
 }
 
-/// Is this recorded reason one a LATER `claim()` pass can clear by itself? Drives the remedy named
-/// in the refusal message: a transient reason means "retry after the next claim()", a permanent one
-/// means the coin genuinely cannot be laddered and something else is wrong.
-fn is_transient_flat_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        FLAT_RGB_STATE_UNAVAILABLE
-            | FLAT_COORDINATOR_UNAVAILABLE
-            | FLAT_ESTABLISH_FAILED
-            | FLAT_FUNDING_UNRESOLVABLE
-    )
-}
 
 async fn read_raw_backup_row(client_config: &ClientConfig, wallet_name: &str, key: &str) -> Option<String> {
     crate::sqlite_manager::get_all_backup_txs(&client_config.pool, wallet_name)
@@ -413,18 +143,6 @@ pub async fn is_ladder_managed(client_config: &ClientConfig, wallet_name: &str) 
     read_raw_backup_row(client_config, wallet_name, LADDER_MANAGED_KEY).await.is_some()
 }
 
-/// Every raw backup row of a wallet as `(key, json)`, propagating a DB error instead of swallowing
-/// it. One read serves the whole flat-lane classification below (`ladder-managed`, `branch-<id>`,
-/// `ctesr-<id>`, the coin's own backup row and `ladderskip-<id>`), so the classification cannot see
-/// a half-read DB.
-async fn read_backup_rows(
-    client_config: &ClientConfig,
-    wallet_name: &str,
-) -> Result<Vec<(String, String)>> {
-    crate::sqlite_manager::get_all_backup_txs(&client_config.pool, wallet_name)
-        .await
-        .map_err(|e| anyhow!("could not read wallet {wallet_name}'s backup rows ({e})"))
-}
 
 /// The reason a coin was last left un-laddered, if one was recorded.
 pub async fn read_ladder_skip(
@@ -481,476 +199,6 @@ pub async fn clear_ladder_skip(
         &ladder_skip_key(statechain_id, duplicate_index),
     )
     .await
-}
-
-/// The ONLY things that may license conveying a coin on the FLAT (un-laddered) lane.
-///
-/// Each variant is a **structurally permanent** property, and each is established from POSITIVE
-/// evidence by its own probe below. Nothing transient appears here by construction: there is no
-/// variant for "the coordinator was down", "RGB state was unreadable" or "establish failed", so
-/// those conditions cannot be spelled as a licence even by accident.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PermanentLicence {
-    /// The coin is flagged `single_use` — a terminalized/combine carrier, same terminal-freeze rule.
-    /// Proven from the COIN's own flag, never from a record: this flag has no production setter
-    /// today (its only setters have zero non-test callers), so assuming it would be assuming a state
-    /// that does not exist.
-    TerminalizedCarrier,
-    /// **[#162] An RGB carrier below the coloured ROOT floor — it can NEVER be coloured.**
-    ///
-    /// Distinct from the retired blanket `RgbCarrier` on purpose. That one said "carriers are flat";
-    /// one coin shape made that false, because a carrier IS laddered now. This one says the far
-    /// narrower thing that is still true: this coin's funding value is below a floor no fee rate can
-    /// lower, so it can never carry a coloured ladder and its flatness is permanent rather than
-    /// pending. It is the population `migration_hatch_verdict` keeps spendable.
-    UncolourableCarrier,
-    /// **[B0] The coin's funding tx is one this wallet holds UN-BROADCAST, in its own exit branch.**
-    ///
-    /// [#162] Restored with [`PermanentLicence::UncolourableCarrier`], and for the same reason: the
-    /// retirement's stated premise was that the only producer of this shape was `split_coin`. That
-    /// was wrong. `register_split_subcoins_n` writes a `branch-<sid>` row for every sub-coin of a
-    /// coloured split OR combine, and the migration hatch's combine is a live caller — so the shape
-    /// outlived the producer that was deleted. It is also produced by the LN lane.
-    ///
-    /// A sub-coin funded by an un-broadcast tx has no on-chain `F` to ladder over, so its flatness
-    /// is structural. Unlike the retired probe, this one is proven AGAINST THE COIN: the funding
-    /// txid the coin carries must be the txid of a tx in that branch. See
-    /// [`licence_funding_is_our_own_unbroadcast_tx`].
-    FundingNotOnChain,
-    /// The coordinator has no `aggregate_xonly` on record for the sid (a pre-migration-0009 legacy
-    /// coin), so no receiver could bind a ladder built over it. Proven by the coordinator ANSWERING,
-    /// this call, with a record whose aggregate is absent —
-    /// [`crate::tesr::BindingRefusal::NoCoordinatorAggregate`] and no other cause.
-    LegacyNoAggregate,
-    /// **Wallet scope, not a coin property.** This wallet has provably never been through the SDK
-    /// ladder pass, so it has no laddering invariant to violate and keeps its historical behaviour
-    /// (the shipped Rust CLI and the pre-SDK lib clients never ladder anything; turning every one of
-    /// their transfers into a hard error is a product deprecation decision, not a client-library
-    /// one).
-    ///
-    /// "Provably" is the whole point. The gate used to be "the `ladder-managed` row is missing",
-    /// which made a MISSING row a global off-switch for the entire classifier — and the write that
-    /// arms that row is best-effort, so one failed insert disabled every check below for the life of
-    /// the wallet. It is now [`wallet_is_provably_pre_sdk`]: the wallet must contain NO ladder
-    /// artefact of any kind (`ladder-managed`, `tesr-*`, `ctesr-*`, `ladderskip-*`). A pass that got
-    /// far enough to ladder or classify anything leaves one of those behind, so the gate arms itself
-    /// from the pass's actual work rather than from a single best-effort marker.
-    LegacyPreSdkWallet,
-}
-
-/// A wallet's raw backup rows, read once so the classification cannot see a half-read DB.
-struct WalletRows(Vec<(String, String)>);
-
-impl WalletRows {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
-    }
-    fn has_prefix(&self, prefix: &str) -> bool {
-        self.0.iter().any(|(k, _)| k.starts_with(prefix))
-    }
-}
-
-/// POSITIVE evidence that this wallet has never been through the SDK's `claim()` ladder pass: it
-/// carries no ladder artefact whatsoever. See [`PermanentLicence::LegacyPreSdkWallet`].
-fn wallet_is_provably_pre_sdk(rows: &WalletRows) -> bool {
-    rows.get(LADDER_MANAGED_KEY).is_none()
-        && !rows.has_prefix("tesr-")
-        && !rows.has_prefix("ctesr-")
-        // [CATS/V4] …and a SPINE TIP is a ladder artefact too. This licence is a wallet-wide
-        // off-switch for the entire flat-conveyance classifier, so a missing prefix here does not
-        // merely overlook one row — it hands every coin in the wallet a permanent licence to be
-        // conveyed flat. A wallet whose only artefact was a spine tip (a sender who has made exactly
-        // one CATS payment and holds only its change) would have qualified as "provably never
-        // laddered" while holding a laddered coin.
-        && !rows.has_prefix(crate::tesr::SPINE_TIP_KEY_PREFIX)
-        && !rows.has_prefix("ladderskip-")
-}
-
-/// The SDK ladder pass's recorded verdict for this coin. `Ok(None)` = nothing recorded; a row that
-/// exists but cannot be read is an ERROR, never "nothing recorded".
-fn recorded_flat_reason(rows: &WalletRows, statechain_id: &str) -> Result<Option<String>> {
-    let Some(json) = rows.get(&ladder_skip_key(statechain_id, 0)) else {
-        return Ok(None);
-    };
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string()))
-        .ok_or_else(|| {
-            anyhow!(
-                "statechain id {statechain_id} has no exit ladder and its flat-lane record is \
-                 unreadable. Refusing to convey it on the flat lane. Run claim() to re-decide the \
-                 coin's lane and retry; the coin is unaffected and still withdrawable."
-            )
-        })
-        .map(Some)
-}
-
-
-/// LICENCE 2 — TERMINALIZED CARRIER, proven from the coin's own `single_use` flag.
-///
-/// The recorded `terminalized-carrier` spelling is NOT accepted on its own: `single_use` has no
-/// production setter today, so a record claiming it without the flag is stale or wrong, and this
-/// licence must be positively proven rather than assumed.
-/// LICENCE — **THE MIGRATION HATCH'S CARRIER: an RGB carrier that can NEVER be coloured.**
-///
-/// [#162] Restored after `sdk78` caught its removal as a live regression. One coin shape retired the
-/// blanket `rgb-carrier` licence, and correctly: a carrier IS laddered now, so "it is a carrier" no
-/// longer explains why it has no ladder. But it does not explain it for EVERY carrier — a coin whose
-/// funding value sits below the coloured ROOT floor can never carry a coloured ladder, at any fee
-/// rate, because the comparison is between two numbers neither side can move. The largest such class
-/// is every pre-flip 1_500-sat token piece: below the coloured child floor AND the root floor, so it
-/// cannot even be carved.
-///
-/// Those coins are exactly the population `migration_hatch_verdict` exists to keep spendable. The
-/// hatch's RGB half survived the retirement; its SATS half did not, so a hatch-eligible payment was
-/// built and then refused at conveyance. That is the defect this closes.
-///
-/// PROVEN FROM THE COIN, never from a recorded string — the lesson
-/// [`licence_terminalized_carrier`] already encodes. Two facts, both read from material this wallet
-/// holds: the coin's own backup row carries an `rgb_consignment` (it IS a carrier), and its amount is
-/// below `colored_ladder_floor` (it can never stop being flat). A carrier ABOVE the floor gets
-/// nothing here — it can be coloured, so if it has no ladder that is a coin to repair, which is
-/// precisely the distinction the blanket licence used to blur.
-fn licence_uncolourable_carrier(
-    rows: &WalletRows,
-    statechain_id: &str,
-    coin: &Coin,
-    network: &str,
-) -> Result<Option<PermanentLicence>> {
-    let Some(json) = rows.get(statechain_id) else { return Ok(None) };
-    let txs: Vec<BackupTx> = serde_json::from_str(json).map_err(|e| {
-        anyhow!(
-            "statechain id {statechain_id} has a backup row that could not be parsed ({e}). \
-             Refusing to convey it on the flat lane — this client cannot tell whether the coin is a \
-             sub-floor RGB carrier (legitimately flat, and served by the migration hatch) or a coin \
-             that lost its exit ladder."
-        )
-    })?;
-    if !txs.iter().any(|b| b.rgb_consignment.is_some()) {
-        return Ok(None);
-    }
-    // The COMMITTED rate, not a fetched one. The floor a coin must clear to be colourable is fixed
-    // by the schedule the tier will be signed at, so this decision is local and cannot fail open on
-    // an unreachable coordinator — and a market-rate spike must never turn a colourable coin into a
-    // licensed one.
-    let rate = mercurylib::tesr::TesrParams::for_network(network).committed_fee_rate;
-    let floor = crate::tesr::colored_ladder_floor(rate, crate::tesr::COLORED_LADDER_DUST);
-    let amount = coin.amount.unwrap_or_default() as u64;
-    if amount < floor {
-        return Ok(Some(PermanentLicence::UncolourableCarrier));
-    }
-    Ok(None)
-}
-
-/// LICENCE — **[B0] THE COIN IS FUNDED BY AN UN-BROADCAST TX THIS WALLET HOLDS.**
-///
-/// [#162] Restored after `sdk78`. The retirement reasoned that `branch-`'s only producer,
-/// `ensure_exact_coin` -> `split_coin`, was being deleted in the same change. It is not the only
-/// producer: `register_split_subcoins_n` writes `branch-<sid>` for every sub-coin of a coloured
-/// split or COMBINE, and the migration hatch's multi-carrier combine reaches it. So retiring the
-/// probe stranded the hatch's own outputs one step after the hatch opened for their parents.
-///
-/// **The evidence standard is raised, not merely restored.** The retired probe licensed on a
-/// non-empty `branch-<sid>` row — evidence that SOME exit material exists under this coin's key,
-/// which is one careless write away from being about a different coin. This one decodes the branch
-/// and requires the coin's OWN funding txid to be the txid of a tx inside it. That is the actual
-/// proposition: `F` is a transaction we are holding rather than one the chain has, which is exactly
-/// why it cannot be found on chain and exactly why it carries no ladder.
-///
-/// A row that exists but cannot be read, or one whose txids do not include this coin's funding tx,
-/// is an ERROR and never a licence — the two failure shapes a "does the row exist" probe merges.
-fn licence_funding_is_our_own_unbroadcast_tx(
-    rows: &WalletRows,
-    statechain_id: &str,
-    coin: &Coin,
-) -> Result<Option<PermanentLicence>> {
-    let Some(json) = rows.get(&format!("branch-{statechain_id}")) else { return Ok(None) };
-    let txs: Vec<BackupTx> = serde_json::from_str(json).map_err(|e| {
-        anyhow!(
-            "statechain id {statechain_id} has an exit-branch row that could not be parsed ({e}). \
-             Refusing to convey it on the flat lane — its exit material is unreadable, so this \
-             client cannot tell whether the coin is legitimately un-laddered."
-        )
-    })?;
-    // An EMPTY branch proves nothing about `F`; fall through rather than license it.
-    if txs.is_empty() {
-        return Ok(None);
-    }
-    let Some(funding_txid) = coin.utxo_txid.as_deref() else {
-        return Err(anyhow!(
-            "statechain id {statechain_id} carries an exit branch but no funding outpoint, so this \
-             client cannot check that the branch is about THIS coin. Refusing to convey it on the \
-             flat lane."
-        ));
-    };
-    let mut branch_txids = Vec::with_capacity(txs.len());
-    for b in &txs {
-        let raw = hex::decode(&b.tx).map_err(|e| {
-            anyhow!(
-                "statechain id {statechain_id} has an exit-branch entry that is not hex ({e}). \
-                 Refusing to convey it on the flat lane — unreadable exit material is not evidence \
-                 that the coin's funding is off chain."
-            )
-        })?;
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).map_err(|e| {
-            anyhow!(
-                "statechain id {statechain_id} has an exit-branch entry that is not a transaction \
-                 ({e}). Refusing to convey it on the flat lane."
-            )
-        })?;
-        branch_txids.push(tx.txid().to_string());
-    }
-    if !branch_txids.iter().any(|t| t == funding_txid) {
-        return Err(anyhow!(
-            "statechain id {statechain_id} has an exit branch that does not contain its own funding \
-             tx {funding_txid} (branch witnesses: {}). Refusing to convey it on the flat lane — a \
-             branch about some other coin is not evidence that THIS coin's funding is off chain.",
-            branch_txids.join(", ")
-        ));
-    }
-    Ok(Some(PermanentLicence::FundingNotOnChain))
-}
-
-fn licence_terminalized_carrier(coin: &Coin) -> Option<PermanentLicence> {
-    if coin.single_use {
-        Some(PermanentLicence::TerminalizedCarrier)
-    } else {
-        None
-    }
-}
-
-
-/// LICENCE 4 — LEGACY NO-AGGREGATE, re-proven LIVE against the coordinator.
-///
-/// Two collapses this deliberately undoes:
-///   * `Ok(None)` from `/info/statechain` (HTTP 404 — "no such statechain id") used to license the
-///     flat lane. It is not the legacy case and it is not an answer about the aggregate: the
-///     coordinator is telling us it does not know this coin at all, which for a coin we are about to
-///     transfer is an anomaly, not a permission slip;
-///   * `ladder_binding_precheck(..).is_err()` used to license the flat lane on EVERY error cause, so
-///     an unreadable scriptPubKey, a non-taproot funding output and a decoy-shaped coin all read as
-///     "harmless pre-0009 legacy coin". Only
-///     [`crate::tesr::BindingRefusal::NoCoordinatorAggregate`] means that.
-async fn licence_legacy_no_aggregate(
-    client_config: &ClientConfig,
-    statechain_id: &str,
-    coin: &Coin,
-    network: &str,
-) -> Result<Option<PermanentLicence>> {
-    let Some(txid_str) = coin.utxo_txid.as_ref() else {
-        return Err(anyhow!(
-            "statechain id {statechain_id} has no exit ladder and no funding outpoint on record, so \
-             this client cannot explain why it is un-laddered. Refusing to convey it on the flat \
-             lane. Run claim() and retry."
-        ));
-    };
-    let txid = txid_str.parse::<bitcoin::Txid>().map_err(|e| {
-        anyhow!(
-            "statechain id {statechain_id} has no exit ladder and its funding txid {txid_str} is \
-             unparseable ({e}), so this client cannot explain why it is un-laddered. Refusing to \
-             convey it on the flat lane."
-        )
-    })?;
-    let Some(vout) = coin.utxo_vout else {
-        return Err(anyhow!(
-            "statechain id {statechain_id} has no exit ladder and no funding vout on record, so \
-             this client cannot explain why it is un-laddered. Refusing to convey it on the flat \
-             lane. Run claim() and retry."
-        ));
-    };
-    // An un-broadcast `F` is a LEGITIMATE reason to be flat ([B0]) — but that is licence 3's job,
-    // proven from exit material. A chain backend that cannot answer proves nothing: an electrum
-    // fault and a genuinely-absent tx are indistinguishable here, so both refuse.
-    let tx0 = client_config.electrum_client.transaction_get(&txid).map_err(|e| {
-        anyhow!(
-            "statechain id {statechain_id} has no exit ladder and its funding tx {txid} could not \
-             be read from the chain backend ({e}), so this client cannot decide whether the coin \
-             should have been laddered. Refusing to convey it on the flat lane — retry when the \
-             chain backend is reachable, or run claim() to record the coin's lane. The coin is \
-             unaffected and still withdrawable."
-        )
-    })?;
-    let Some(f_out) = tx0.output.get(vout as usize) else {
-        return Err(anyhow!(
-            "statechain id {statechain_id} has no exit ladder and its funding outpoint \
-             {txid}:{vout} does not exist in that transaction. Refusing to convey it on the flat \
-             lane — this client cannot explain the coin's shape."
-        ));
-    };
-    let f_spk_hex = hex::encode(f_out.script_pubkey.as_bytes());
-
-    let info = match crate::utils::get_statechain_info(statechain_id, client_config).await {
-        Ok(Some(info)) => info,
-        // "We could not ask" — refuse. This is the arm a prior round collapsed with "the
-        // coordinator said there is no aggregate".
-        Ok(None) => {
-            return Err(anyhow!(
-                "statechain id {statechain_id} has no exit ladder and the coordinator has no record \
-                 of it at all, so this client cannot establish that it is a legacy no-aggregate \
-                 coin. Refusing to convey it on the flat lane — that is an anomaly for a coin about \
-                 to be transferred, not a licence. The coin is unaffected and still withdrawable."
-            ))
-        }
-        Err(e) => {
-            return Err(anyhow!(
-                "statechain id {statechain_id} has no exit ladder and the coordinator could not be \
-                 reached to decide whether it should have one ({e}). Refusing to convey it on the \
-                 flat lane — retry when the coordinator is reachable."
-            ))
-        }
-    };
-    match crate::tesr::ladder_binding_precheck_cause(
-        statechain_id,
-        &f_spk_hex,
-        info.aggregate_pubkey.as_deref(),
-        network,
-    ) {
-        // Bindable: the coin SHOULD have been laddered. No licence — the caller refuses.
-        Ok(()) => Ok(None),
-        Err(e) if e.cause == crate::tesr::BindingRefusal::NoCoordinatorAggregate => {
-            Ok(Some(PermanentLicence::LegacyNoAggregate))
-        }
-        Err(e) => Err(anyhow!(
-            "statechain id {statechain_id} has no exit ladder and its ladder binding could not be \
-             established for a reason that is NOT the legacy no-aggregate case ({e}). Refusing to \
-             convey it on the flat lane — only a coordinator that positively reports no aggregate \
-             licenses the flat lane. The coin is unaffected and still withdrawable."
-        )),
-    }
-}
-
-/// Compute the coin's flat-lane licence from POSITIVE evidence, or refuse.
-///
-/// `Ok(Some(licence))` — proven; `Err` — a specific refusal; `Ok(None)` — nothing explains this coin
-/// and the caller raises the generic "it should have been laddered" refusal. There is no fourth
-/// outcome, and no path returns `Ok(Some(..))` without having established the evidence its variant
-/// documents.
-async fn flat_conveyance_licence(
-    client_config: &ClientConfig,
-    wallet_name: &str,
-    statechain_id: &str,
-    coin: &Coin,
-    network: &str,
-) -> Result<Option<PermanentLicence>> {
-    let rows = WalletRows(read_backup_rows(client_config, wallet_name).await.map_err(|e| {
-        anyhow!(
-            "{e}. Refusing to convey statechain id {statechain_id} on the flat lane: without the \
-             wallet's own records this client cannot tell a legitimately-flat coin from one that \
-             lost its exit ladder. The coin is unaffected and still withdrawable."
-        )
-    })?);
-
-    if wallet_is_provably_pre_sdk(&rows) {
-        return Ok(Some(PermanentLicence::LegacyPreSdkWallet));
-    }
-
-    let recorded = recorded_flat_reason(&rows, statechain_id)?;
-    let recorded = recorded.as_deref();
-
-    // [#162] The migration hatch's carrier, proven from the coin. Probed before the legacy-aggregate
-    // arm because it is the specific explanation: a sub-floor carrier is flat for a reason that will
-    // never change, and answering "legacy" for it would be true of the wrong thing.
-    if let Some(l) = licence_uncolourable_carrier(&rows, statechain_id, coin, network)? {
-        return Ok(Some(l));
-    }
-
-    // [#162] [B0] proven from the coin's own funding txid against the branch this wallet holds.
-    if let Some(l) = licence_funding_is_our_own_unbroadcast_tx(&rows, statechain_id, coin)? {
-        return Ok(Some(l));
-    }
-
-    // **[ONE COIN SHAPE] THE BLANKET `rgb-carrier` LICENCE IS RETIRED.**
-    //
-    // With `colored_ladder` shipping TRUE, a carrier is laddered like any other coin, so "this coin
-    // is an RGB carrier" stops being a reason it may travel without a ladder. That probe is gone,
-    // not merely unused: leaving it in place would keep licensing every carrier the coloured builder
-    // happens to refuse, which is the opposite of one coin shape. What replaced it is the far
-    // narrower `licence_uncolourable_carrier` above — a carrier that can NEVER be coloured, proven
-    // by arithmetic against a floor no fee rate can lower.
-    //
-    // **[#162] The `ctesr-` and `spinetip-` arms of the old licence 3 stay retired; its `branch-`
-    // arm did not, and was restored above.** They are NOT equivalent, and treating them as one is
-    // what made the retirement wrong:
-    //   * `branch-` is LIVE. `register_split_subcoins_n` writes it for every sub-coin of a coloured
-    //     split or combine — including the migration hatch's own outputs — and the LN lane produces
-    //     it too. The retirement's premise was that its only producer was the deleted `split_coin`;
-    //     that was false, and `sdk78` caught it one step after the hatch opened.
-    //   * `ctesr-` was defensive: `UtexoWallet::transfer` routes a child to `child_retransfer`
-    //     before the flat lane, and a child that reached here died on an absence anyway.
-    //   * `spinetip-` was already dead: `execute_ex` refuses a tip BY NAME before this classifier
-    //     runs, with a CI guard on the ordering.
-    //
-    // Every surviving licence is evidence ABOUT THE COIN: `single_use` on the coin itself, an
-    // amount below a fixed floor, a funding txid found in the wallet's own branch, or a coordinator
-    // answer re-proven live. None of them is a recorded string.
-    if let Some(l) = licence_terminalized_carrier(coin) {
-        return Ok(Some(l));
-    }
-
-    // A recorded verdict that none of the probes above could corroborate is a REFUSAL, and it is a
-    // better-diagnosed one than the generic fallback: the SDK pass had strictly more information
-    // (RGB state) and still did not record a licence this classifier can prove. The single exception
-    // is `not-bindable`, which licence 4 can still prove LIVE — so that one falls through instead of
-    // short-circuiting. [B1] Nothing here can turn a deferral into permission.
-    if let Some(reason) = recorded {
-        if reason != FLAT_NOT_BINDABLE {
-            let remedy = if is_transient_flat_reason(reason) {
-                "That condition is TRANSIENT: run claim() again and retry the transfer once the \
-                 coin is laddered (or once the pass records a permanent reason)."
-            } else {
-                "Run claim() to re-decide the coin's lane and retry."
-            };
-            return Err(anyhow!(
-                "statechain id {statechain_id} has no exit ladder and the last claim() pass did not \
-                 establish that it may be conveyed flat (recorded reason: {reason}). Refusing to \
-                 convey it on the flat lane — a silent flat conveyance is how a coin loses its \
-                 census protection, and the receiver would reject it anyway. {remedy} The coin is \
-                 unaffected and still withdrawable."
-            ));
-        }
-    }
-
-    licence_legacy_no_aggregate(client_config, statechain_id, coin, network).await
-}
-
-/// Refuse to convey a coin on the FLAT lane unless it is legitimately flat.
-///
-/// Called only when the coin has NO ladder (a coin that HAS one can no longer reach the flat lane at
-/// all — see `execute`).
-///
-/// **THE STRUCTURAL PROPERTY OF THIS FUNCTION: it contains exactly ONE `Ok(())`, and that statement
-/// is reachable only by a positive match on a proven [`PermanentLicence`].** Everything else — every
-/// `else`, every `Err`, every `None`, every unparseable row, every unreachable dependency — refuses.
-/// Three review rounds each found a NEW hole while this was written as "return `Ok(())` unless
-/// something looks wrong", because under that shape every arm is a candidate hole and patching arms
-/// one at a time does not converge. Under this shape a reader verifies the whole property by
-/// counting, and `the_classifier_has_exactly_one_ok_return` below asserts the count on the source.
-///
-/// Consequently: RGB state unreadable, coordinator unreachable, coordinator answering "no such
-/// coin", establish failed, funding unresolvable, DB read error, ladder unreadable — none of these
-/// license anything. They refuse, and the message tells the caller to retry after the next
-/// `claim()`. The coin is never touched by a refusal: it stays withdrawable and unilaterally
-/// exitable.
-pub async fn assert_flat_conveyance_is_legitimate(
-    client_config: &ClientConfig,
-    wallet_name: &str,
-    statechain_id: &str,
-    coin: &Coin,
-    network: &str,
-) -> Result<()> {
-    let licence =
-        flat_conveyance_licence(client_config, wallet_name, statechain_id, coin, network).await?;
-    match licence {
-        // ─── THE ONE AND ONLY SUCCESS RETURN IN THIS FUNCTION. Do not add a second one; the
-        //     unit test below counts them on the source and fails if you do. ───
-        Some(_) => Ok(()),
-        None => Err(anyhow!(
-            "statechain id {statechain_id} is an on-chain, bindable, non-carrier coin with NO exit \
-             ladder — it should have been laddered by claim(). Refusing to convey it on the flat \
-             lane: a silent flat conveyance is how a coin loses its census protection. Run claim() \
-             to establish its ladder and retry."
-        )),
-    }
 }
 
 /// [M1] Everything about conveying a LADDERED coin that can be decided **without any SE co-sign and
@@ -1108,9 +356,17 @@ async fn execute_ex(
         c.status == CoinStatus::DUPLICATED
     });
 
-    if is_coin_duplicated && !force_send {
-        return Err(anyhow::anyhow!("Coin is duplicated. If you want to proceed, use the command '--force, -f' option. \
-        You will no longer be able to move other duplicate coins with the same statechain_id and this will cause PERMANENT LOSS of these duplicate coin funds."));
+    // A duplicate deposit (a second UTXO paid to the same aggregate address) has no exit material
+    // of its own and cannot ride a ladder conveyance: the ladder is rooted at exactly one funding
+    // outpoint, and the receiver's census has no slot for a second one. It used to ride the flat
+    // backup chain under `--force`; that chain no longer exists. Refuse, whatever `force_send` says.
+    let _ = force_send;
+    if is_coin_duplicated || duplicated_indexes.is_some() {
+        return Err(anyhow::anyhow!(
+            "statechain id {statechain_id} has duplicate deposits. A duplicate carries no exit \
+             material and cannot be conveyed with the coin — a ladder is rooted at exactly one \
+             funding outpoint. Withdraw the duplicates cooperatively; the index-0 coin is unaffected."
+        ));
     }
 
     // The second arm was `WITHDRAWING` twice — `X || X` — so this guard only ever fired while a
@@ -1232,15 +488,18 @@ async fn execute_ex(
         }
         _ => {}
     }
+    // A coin with no ladder row has NO EXIT MATERIAL and no lane: there is no flat backup chain to
+    // convey and no census a receiver could balance for it. Refuse before anything irreversible.
+    // The usual cause is an establish pass that has not succeeded yet for this coin; `claim()`
+    // retries it and records why it was skipped (`ladderskip-<sid>`).
     if tesr_bundle.is_none() {
-        assert_flat_conveyance_is_legitimate(
-            client_config,
-            wallet_name,
-            &statechain_id,
-            &coin,
-            &wallet.network,
-        )
-        .await?;
+        return Err(anyhow!(
+            "statechain id {statechain_id} has no exit ladder and cannot be conveyed: a coin's only \
+             exit material is its TES-R ladder, established at first sight of the deposit, and \
+             there is no un-laddered lane. Run claim() so the establish pass ladders it (the \
+             recorded skip reason, if any, says what blocked it), then retry. The coin is \
+             unaffected and still withdrawable cooperatively."
+        ));
     }
 
     // LIGHTNING-LATCHED TES-R TRANSFER — enabled via the HODL-latch pivot (LIGHTNING.md),
@@ -1439,10 +698,19 @@ async fn execute_ex(
             })?;
             (2u32, Some(json))
         }
-        None => (0u32, None),
+        // Refused above, before the arm-down; unreachable by construction.
+        None => {
+            return Err(anyhow!(
+                "statechain id {statechain_id} has no exit ladder and cannot be conveyed"
+            ))
+        }
     };
 
-    let backup_transactions = create_backup_transactions(client_config, recipient_address, &mut wallet, &statechain_id, duplicated_indexes).await?;
+    // A LADDERED COIN CONVEYS NO FLAT BACKUP. The vector is required to be empty by every receiver
+    // (`verify_flat_backup_lane`), and the census the receiver runs is `tiers + superseded` — a
+    // per-hop backup here would be a co-sign the census cannot account for AND a matured spend of
+    // `F` left in this wallet's hands after the coin is gone.
+    let backup_transactions: Vec<BackupTx> = Vec::new();
 
     // Off-chain sub-coins carry an exit branch (stored under "branch-<id>"): fully-signed txs
     // linking the un-broadcast funding tx to an on-chain outpoint. Attach it so the receiver can
@@ -1559,8 +827,6 @@ async fn execute_ex(
         return Err(anyhow::anyhow!("Failed to update transfer message".to_string()));
     }
 
-    update_backup_txs(&client_config.pool, &wallet.name, &coin.statechain_id.as_ref().unwrap(), &backup_transactions).await?;
-
     let date = Utc::now(); // This will get the current date and time in UTC
     let iso_string = date.to_rfc3339(); // Converts the date to an ISO 8601 string
 
@@ -1578,34 +844,6 @@ async fn execute_ex(
     update_wallet(&client_config.pool, &wallet).await?;
 
     Ok(())
-}
-
-async fn create_backup_tx_to_receiver(client_config: &ClientConfig, coin: &mut Coin, bkp_tx1: &BackupTx, recipient_address: &str, qt_backup_tx: u32, network: &str) -> Result<String> {
-
-    let block_height = Some(get_blockheight(bkp_tx1)?);
-
-    let server_info = info_config(&client_config).await?;
-
-    let fee_rate_sats_per_byte = if server_info.fee_rate_sats_per_byte > client_config.max_fee_rate {
-        client_config.max_fee_rate
-    } else {
-        server_info.fee_rate_sats_per_byte
-    };
-
-    let is_withdrawal = false;
-    let signed_tx = new_transaction(
-        client_config, 
-        coin, 
-        recipient_address, 
-        qt_backup_tx, 
-        is_withdrawal, 
-        block_height, 
-        network, 
-        fee_rate_sats_per_byte, 
-        server_info.initlock,
-        server_info.interval).await?;
-
-    Ok(signed_tx)
 }
 
 pub async fn get_new_x1(client_config: &ClientConfig,  statechain_id: &str, signed_statechain_id: &str, recipient_auth_pubkey: &str, batch_id: Option<String>) -> Result<String> {
@@ -2631,392 +1869,6 @@ async fn cancel_with_consent_inner(
 }
 
 #[cfg(test)]
-mod flat_lane_tests {
-    use super::*;
-
-    /// [#162] The restored [B0] licence, at the boundary the retired probe never checked: the
-    /// branch must be about THIS coin. `sdk78` proved the licence has to exist (the coloured
-    /// combine's own outputs are funded by an un-broadcast tx); these cases prove it cannot be
-    /// satisfied by exit material that merely happens to sit under the coin's key.
-    #[test]
-    fn only_a_branch_holding_the_coin_s_own_funding_tx_licenses_it() {
-        use bitcoin::consensus::serialize;
-        // A real transaction, so the txid is computed rather than asserted.
-        let tx = bitcoin::Transaction {
-            version: 2,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![bitcoin::TxOut {
-                value: 1_500,
-                script_pubkey: bitcoin::ScriptBuf::new(),
-            }],
-        };
-        let txid = tx.txid().to_string();
-        let branch_row = |hex_tx: &str| {
-            serde_json::to_string(&vec![BackupTx {
-                tx_n: 1,
-                tx: hex_tx.to_string(),
-                client_public_nonce: String::new(),
-                server_public_nonce: String::new(),
-                client_public_key: String::new(),
-                server_public_key: String::new(),
-                blinding_factor: String::new(),
-                rgb_consignment: None,
-                rgb_blinding: None,
-            }])
-            .expect("serialize")
-        };
-        let coin_funded_by = |t: Option<&str>| {
-            let mut c = bare_coin();
-            c.utxo_txid = t.map(|s| s.to_string());
-            c
-        };
-        let rows = |k: &str, v: &str| WalletRows(vec![(k.to_string(), v.to_string())]);
-
-        // THE LICENCE: the branch contains the very tx that funds this coin.
-        assert_eq!(
-            licence_funding_is_our_own_unbroadcast_tx(
-                &rows("branch-abc", &branch_row(&hex::encode(serialize(&tx)))),
-                "abc",
-                &coin_funded_by(Some(&txid)),
-            )
-            .expect("licensed"),
-            Some(PermanentLicence::FundingNotOnChain)
-        );
-
-        // A branch about some OTHER coin is not evidence about this one. The retired probe
-        // licensed this case, because it asked only whether the row was non-empty.
-        let err = licence_funding_is_our_own_unbroadcast_tx(
-            &rows("branch-abc", &branch_row(&hex::encode(serialize(&tx)))),
-            "abc",
-            &coin_funded_by(Some(&"11".repeat(32))),
-        )
-        .expect_err("a branch that does not name this coin must refuse");
-        assert!(
-            err.to_string().contains("does not contain its own funding tx"),
-            "unexpected refusal: {err}"
-        );
-
-        // No branch at all, and an EMPTY branch: no licence, and no error — the coin is explained
-        // by some other probe or by nothing, which is the caller's refusal to make.
-        assert_eq!(
-            licence_funding_is_our_own_unbroadcast_tx(&WalletRows(vec![]), "abc", &coin_funded_by(Some(&txid)))
-                .expect("no row is not an error"),
-            None
-        );
-        assert_eq!(
-            licence_funding_is_our_own_unbroadcast_tx(&rows("branch-abc", "[]"), "abc", &coin_funded_by(Some(&txid)))
-                .expect("an empty branch is not an error"),
-            None
-        );
-
-        // Unreadable material REFUSES — it is not evidence, and it is not absence either.
-        assert!(licence_funding_is_our_own_unbroadcast_tx(
-            &rows("branch-abc", "not json"), "abc", &coin_funded_by(Some(&txid))
-        )
-        .is_err());
-        assert!(licence_funding_is_our_own_unbroadcast_tx(
-            &rows("branch-abc", &branch_row("zz")), "abc", &coin_funded_by(Some(&txid))
-        )
-        .is_err());
-        assert!(licence_funding_is_our_own_unbroadcast_tx(
-            &rows("branch-abc", &branch_row("deadbeef")), "abc", &coin_funded_by(Some(&txid))
-        )
-        .is_err());
-        // A coin with a branch but no funding outpoint cannot be checked against it.
-        assert!(licence_funding_is_our_own_unbroadcast_tx(
-            &rows("branch-abc", &branch_row(&hex::encode(serialize(&tx)))), "abc", &coin_funded_by(None)
-        )
-        .is_err());
-    }
-
-    /// [B1] The set of reasons that LICENSE a flat conveyance is exactly the structurally-permanent
-    /// ones. A transient reason is a deferral; if one ever creeps back onto this list, a single
-    /// blip in a token wallet licenses that coin to convey flat forever after.
-    #[test]
-    fn only_permanent_reasons_license_the_flat_lane() {
-        for permanent in [FLAT_TERMINALIZED_CARRIER, FLAT_FUNDING_NOT_ONCHAIN, FLAT_NOT_BINDABLE] {
-            assert!(
-                is_legitimate_flat_reason(permanent),
-                "'{permanent}' is a structural, permanent reason and must keep licensing the flat lane"
-            );
-            assert!(
-                !is_transient_flat_reason(permanent),
-                "'{permanent}' must not be classified as transient"
-            );
-        }
-        for transient in [
-            FLAT_RGB_STATE_UNAVAILABLE,
-            FLAT_COORDINATOR_UNAVAILABLE,
-            FLAT_ESTABLISH_FAILED,
-            FLAT_FUNDING_UNRESOLVABLE,
-        ] {
-            assert!(
-                !is_legitimate_flat_reason(transient),
-                "[B1] '{transient}' is TRANSIENT — it must never license a flat conveyance"
-            );
-            assert!(is_transient_flat_reason(transient));
-        }
-        // **[ONE COIN SHAPE] RETIRED — `rgb-carrier` used to license, and must not any more.**
-        // It licensed a carrier travelling without a ladder; with `colored_ladder` shipping true a
-        // carrier IS laddered, so the reason no longer describes a legitimate shape. The probe is
-        // DELETED from the classifier, not merely dropped here — this predicate never gated anything
-        // (it drives `flat_only_coins`' `transferable` flag), so a change here alone would have been
-        // cosmetic. Asserting it in this group is what stops it creeping back as a licence.
-        //
-        // [#162] `funding-not-onchain` was retired ALONGSIDE it and has been put back, because the
-        // premise of that retirement — "its only producer is being deleted" — was false: the
-        // coloured combine writes the same `branch-` material, so the shape outlived the producer.
-        // It is asserted in the licensing group above, not here.
-        for retired in [FLAT_RGB_CARRIER] {
-            assert!(
-                !is_legitimate_flat_reason(retired),
-                "'{retired}' was RETIRED with the one-coin-shape flip and must never license again"
-            );
-        }
-        // Neither a licence nor a deferral: these are refusals with their own remedies.
-        for other in [
-            FLAT_DUPLICATE_DEPOSIT,
-            FLAT_LADDER_UNREADABLE,
-            FLAT_BINDING_UNRESOLVED,
-            FLAT_ATTESTATION_UNPINNED,
-            FLAT_ATTESTATION_INVALID,
-            "some-future-spelling",
-            "",
-        ] {
-            assert!(
-                !is_legitimate_flat_reason(other),
-                "'{other}' must not license a flat conveyance"
-            );
-        }
-    }
-
-    /// **[#162] THE SUB-FLOOR CARRIER KEEPS A LICENCE; THE COLOURABLE ONE DOES NOT.**
-    ///
-    /// `sdk78` caught the removal of this as a live regression: one coin shape retired the blanket
-    /// `rgb-carrier` licence, which was right for carriers that CAN be coloured and wrong for the
-    /// ones that never can. A 1_500-sat pre-flip piece sits below both coloured floors, so its
-    /// flatness is permanent — and the migration hatch exists to keep exactly those spendable.
-    ///
-    /// The boundary is what this pins, in both directions: below the floor licences, at or above it
-    /// does not. A licence that fired for every carrier would re-open the hole; one that fired for
-    /// none strands the coins the hatch serves.
-    /// A `Coin` with nothing asserted about it. Each test sets ONLY the fields its licence reads,
-    /// so a probe that starts consulting a new field fails here rather than passing on a default.
-    fn bare_coin() -> Coin {
-        Coin {
-            index: 0,
-            user_privkey: String::new(),
-            user_pubkey: String::new(),
-            auth_privkey: String::new(),
-            auth_pubkey: String::new(),
-            derivation_path: String::new(),
-            fingerprint: String::new(),
-            address: String::new(),
-            backup_address: String::new(),
-            server_pubkey: None,
-            aggregated_pubkey: None,
-            aggregated_address: None,
-            utxo_txid: None,
-            utxo_vout: None,
-            amount: None,
-            statechain_id: None,
-            signed_statechain_id: None,
-            locktime: None,
-            secret_nonce: None,
-            public_nonce: None,
-            blinding_factor: None,
-            server_public_nonce: None,
-            tx_cpfp: None,
-            tx_withdraw: None,
-            withdrawal_address: None,
-            status: CoinStatus::CONFIRMED,
-            duplicate_index: 0,
-            single_use: false,
-            epoch_deadline: None,
-        }
-    }
-
-    #[test]
-    fn only_a_sub_floor_carrier_is_licensed_as_uncolourable() {
-        let rate = mercurylib::tesr::TesrParams::for_network("regtest").committed_fee_rate;
-        let floor = crate::tesr::colored_ladder_floor(rate, crate::tesr::COLORED_LADDER_DUST);
-        assert!(floor > 1_500, "the legacy 1_500-sat piece must be BELOW the coloured root floor");
-
-        // A backup row carrying a consignment is what proves "this is a carrier" from the coin's own
-        // material rather than from a recorded string — the same standard `licence_terminalized_
-        // carrier` holds to.
-        let carrier = serde_json::to_string(&vec![BackupTx {
-            tx_n: 1,
-            tx: String::new(),
-            client_public_nonce: String::new(),
-            server_public_nonce: String::new(),
-            client_public_key: String::new(),
-            server_public_key: String::new(),
-            blinding_factor: String::new(),
-            rgb_consignment: Some("deadbeef".to_string()),
-            rgb_blinding: None,
-        }])
-        .unwrap();
-        let rows = WalletRows(vec![
-            ("sub-floor".to_string(), carrier.clone()),
-            ("above-floor".to_string(), carrier),
-        ]);
-
-        let licence = |sid: &str, amount: u64| {
-            let mut coin = bare_coin();
-            coin.amount = Some(amount as u32);
-            licence_uncolourable_carrier(&rows, sid, &coin, "regtest").unwrap()
-        };
-
-        assert_eq!(
-            licence("sub-floor", 1_500),
-            Some(PermanentLicence::UncolourableCarrier),
-            "a carrier below the coloured root floor can NEVER be coloured, so its flatness is \
-             permanent and the migration hatch must be able to convey it"
-        );
-        assert_eq!(
-            licence("above-floor", floor),
-            None,
-            "a carrier AT the floor can be coloured, so a missing ladder is a coin to repair — \
-             licensing it would re-open the blanket carrier hole one coin shape closed"
-        );
-    }
-
-    /// A pin that is PRESENT but WRONG must not be reported as a coordinator outage.
-    ///
-    /// The classifier used to decide between "unpinned" and "coordinator-unavailable" by asking
-    /// whether a pin RESOLVES — presence, not validity. So a wrong pin (the wrong network's key, a
-    /// pasted `/attestation_identity` JSON body instead of the bare x-only key, a redeployed
-    /// enclave) was recorded as `coordinator-unavailable`, i.e. "retry later", while the coordinator
-    /// was answering 200 and the fault was local and permanent. Measured on the live stack: the
-    /// three pin states produce three DIFFERENT reasons, and only the middle one is transient.
-    ///
-    /// This test pins the classification of the spelling, which is what the conveyance path and the
-    /// operator both read. If `attestation-invalid` is ever folded back into either neighbour, the
-    /// distinction this records is lost silently.
-    #[test]
-    fn a_wrong_pin_is_permanent_and_is_not_a_coordinator_outage() {
-        assert_ne!(
-            FLAT_ATTESTATION_INVALID, FLAT_COORDINATOR_UNAVAILABLE,
-            "a wrong pin is a local, permanent fault — it must not wear the 'retry later' spelling"
-        );
-        assert_ne!(
-            FLAT_ATTESTATION_INVALID, FLAT_ATTESTATION_UNPINNED,
-            "'no pin' and 'wrong pin' need different remedies: set one, versus fix the one you set"
-        );
-        assert!(
-            !is_transient_flat_reason(FLAT_ATTESTATION_INVALID),
-            "retrying does not make a wrong pin verify"
-        );
-        assert!(
-            !is_legitimate_flat_reason(FLAT_ATTESTATION_INVALID),
-            "an attestation that does NOT verify is precisely the case D69 exists to refuse; it \
-             must never license a flat conveyance"
-        );
-    }
-
-    /// Duplicates are keyed apart so a duplicate's record can never overwrite (and thereby excuse)
-    /// the index-0 coin's — the index-0 coin is the one that owns the sid's ladder.
-    #[test]
-    fn duplicate_records_are_keyed_apart() {
-        assert_eq!(ladder_skip_key("abc", 0), "ladderskip-abc");
-        assert_eq!(ladder_skip_key("abc", 1), "ladderskip-abc#1");
-        assert_ne!(ladder_skip_key("abc", 0), ladder_skip_key("abc", 1));
-    }
-
-    /// **THE STRUCTURAL INVARIANT, asserted on the source itself.**
-    ///
-    /// Three review rounds each found a NEW fail-open in the flat-lane classifier because it was
-    /// written as "return `Ok(())` unless something looks wrong" — under that shape every arm is a
-    /// candidate hole and patching arms one at a time does not converge. The fix was to invert the
-    /// polarity so the function has exactly ONE `Ok(())`, reached only by a positive match on a
-    /// proven [`PermanentLicence`]. That property is verifiable by COUNTING, so this test counts it:
-    /// any future edit that adds a second success return fails here, loudly, with no live stack.
-    #[test]
-    fn the_classifier_has_exactly_one_ok_return() {
-        const SIGNATURE: &str = "pub async fn assert_flat_conveyance_is_legitimate(";
-        let src = include_str!("transfer_sender.rs");
-        let start = src.find(SIGNATURE).expect("the classifier must exist");
-        let rest = &src[start..];
-        // Every brace inside the function is indented, so the first column-0 `}` ends it.
-        let body = &rest[..rest.find("\n}\n").expect("the classifier must be terminated")];
-        let count = body.matches("Ok(())").count();
-        assert_eq!(
-            count, 1,
-            "assert_flat_conveyance_is_legitimate must have EXACTLY ONE `Ok(())` (found {count}). \
-             Every success path has to go through the single `Some(licence) => Ok(())` arm, so that \
-             a reader can verify 'nothing but a proven permanent licence conveys flat' by counting. \
-             If you need a new success case, add a PermanentLicence variant with its own \
-             positive-evidence probe — do not add a return.\n---\n{body}\n---"
-        );
-        // ...and that one arm is the licence match, not some other shape.
-        assert!(
-            body.contains("Some(_) => Ok(())"),
-            "the single success return must be the licence match arm"
-        );
-    }
-
-    /// The wallet-scope gate is armed by POSITIVE evidence of SDK laddering, not by the presence of
-    /// one best-effort marker row. A pass that got far enough to ladder or classify ANYTHING leaves
-    /// an artefact behind, and any one of them arms the classifier — so a failed `ladder-managed`
-    /// insert can no longer act as a global off-switch.
-    #[test]
-    fn a_missing_scope_marker_is_not_a_global_off_switch() {
-        let rows = |pairs: &[(&str, &str)]| {
-            WalletRows(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
-        };
-        // A genuinely pre-SDK wallet: ordinary coin rows only, no ladder artefact anywhere.
-        assert!(wallet_is_provably_pre_sdk(&rows(&[("some-sid", "[]"), ("branch-some-sid", "[]")])));
-        assert!(wallet_is_provably_pre_sdk(&rows(&[])));
-        // Each artefact on its own arms the gate, marker row or not.
-        for artefact in [
-            (LADDER_MANAGED_KEY, "1"),
-            ("tesr-abc", "{}"),
-            ("ctesr-abc", "{}"),
-            // [CATS/V4] A spine tip is a ladder artefact. Without this the one wallet shape that
-            // holds ONLY a tip — a sender whose single CATS payment left it holding the change —
-            // would read as "provably never laddered" and every coin in it would be licensed flat.
-            ("spinetip-abc", "{}"),
-            ("ladderskip-abc", "{}"),
-            ("ladderskip-abc#1", "{}"),
-        ] {
-            assert!(
-                !wallet_is_provably_pre_sdk(&rows(&[("some-sid", "[]"), artefact])),
-                "'{}' is evidence the SDK ladder pass has run — the classifier must stay armed",
-                artefact.0
-            );
-        }
-    }
-
-    /// An unreadable record is an ERROR, never "nothing recorded" — otherwise corrupting one row
-    /// would drop a coin into the no-record fallback and re-open the classifier.
-    #[test]
-    fn an_unreadable_skip_record_is_an_error_not_an_absence() {
-        let rows = WalletRows(vec![("ladderskip-abc".into(), "{\"not\":\"a reason\"}".into())]);
-        let e = recorded_flat_reason(&rows, "abc").expect_err("an unreadable record must refuse");
-        assert!(e.to_string().contains("flat-lane record is unreadable"), "got: {e}");
-        assert!(recorded_flat_reason(&WalletRows(vec![]), "abc").unwrap().is_none());
-        let rows = WalletRows(vec![("ladderskip-abc".into(), "{\"reason\":\"rgb-carrier\"}".into())]);
-        assert_eq!(recorded_flat_reason(&rows, "abc").unwrap().as_deref(), Some(FLAT_RGB_CARRIER));
-    }
-
-    /// A terminalized carrier must be POSITIVELY proven from the coin, never assumed from a record —
-    /// `single_use` is dead in production today (its only setters have no non-test callers).
-    #[test]
-    fn terminalized_carrier_is_proven_from_the_coin_not_a_record() {
-        let rows = WalletRows(vec![(
-            "ladderskip-abc".into(),
-            format!("{{\"reason\":\"{FLAT_TERMINALIZED_CARRIER}\"}}"),
-        )]);
-        // The record alone licenses NOTHING — and since the RGB-carrier probe was RETIRED with the
-        // one-coin-shape flip, there is no probe left that would read a spelling out of a row at
-        // all. The licence comes from the coin's own flag, which no test row can fake.
-        assert_eq!(recorded_flat_reason(&rows, "abc").unwrap().as_deref(), Some(FLAT_TERMINALIZED_CARRIER));
-    }
-}
-
-#[cfg(test)]
 mod transfer_cancel_client_tests {
     use super::*;
     use mercurylib::transfer::cancel::{CancelDecision, TransferCancelResponsePayload};
@@ -3498,6 +2350,8 @@ mod transfer_cancel_client_tests {
             encrypted_transfer_msg: format!("ciphertext-for-{sid}-{key}"),
             amount,
             rgb_consignment: None,
+            rgb_assignment_txid: String::new(),
+            rgb_assignment_vout: 0,
             funding_txid: "f".repeat(64),
             funding_vout: 0,
             branch_txs: vec![],

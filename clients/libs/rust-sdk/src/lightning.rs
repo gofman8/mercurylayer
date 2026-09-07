@@ -37,7 +37,7 @@ impl UtexoWallet {
         statechain_id: Option<String>,
     ) -> Result<LightningSwap> {
         let _guard = self.inner.wallet_lock.lock().await;
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let record = self.record().await?;
         // Never auto-select a token-carrier coin for an LN swap — handing the carrier to the LSP as

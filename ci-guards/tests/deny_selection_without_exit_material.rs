@@ -4,26 +4,38 @@
 //! an RGB carrier, worth more than its own renewal fee. None of them asks the separate question of
 //! whether the wallet can actually *exit or convey* it:
 //!
-//! * a laddered coin's exit material is its bundle (`tesr-` root, `ctesr-` child, `spinetip-` tip);
-//! * an un-laddered coin's is its flat backup chain;
-//! * a coin with **neither** is a slot the SE knows about, that this wallet holds a key for, and
-//!   that it can neither exit unilaterally nor hand on — most often a derived child slot whose split
-//!   failed after the slot was minted.
+//! * a laddered coin's exit material is its bundle (`tesr-` root, `ctesr-` child, `spinetip-` tip),
+//!   and under ONE COIN SHAPE that is the ONLY exit material there is: the ladder is established at
+//!   the first mempool sighting of the deposit, and no flat absolute-locktime backup is ever
+//!   co-signed — not at deposit, not at any hop;
+//! * a coin with **no ladder row** is a slot the SE knows about, that this wallet holds a key for,
+//!   and that it can neither exit unilaterally nor hand on — most often a deposit whose establish
+//!   pass has not yet succeeded (it stays INITIALISED and is retried), or a derived child slot whose
+//!   split failed after the slot was minted.
 //!
-//! That third shape was offered to selection, and the failure surfaced at the FAR END of the
-//! payment: `transfer_sender` reached for the flat backup rows, found none, and refused. `chaos22`'s
-//! oracle could only class it as an unclassified breach — the wallet reported balance, the planner
-//! promised it, and the send died. The remedy is upstream: the coin is never offered, so a different
-//! coin funds the payment and nobody meets the refusal.
+//! That second shape was offered to selection, and the failure surfaced at the FAR END of the
+//! payment. `chaos22`'s oracle could only class it as an unclassified breach — the wallet reported
+//! balance, the planner promised it, and the send died. The remedy is upstream: the coin is never
+//! offered, so a different coin funds the payment and nobody meets the refusal.
 //!
 //! # Why the shape of the check matters more than the check
 //!
-//! `parent_shape` reaches `Unladdered` through THREE CONSECUTIVE ABSENCES — no tip row, no child
-//! row, no root row. This repo has already been bitten once by treating that as a positive answer
-//! (the spine tip fell through all three and was routed as un-laddered, at the wrong floor, to the
-//! [B1]-unsafe plain split). "Un-laddered" is a claim about a coin that still has a flat backup
-//! chain; a coin with no chain either is not un-laddered, it is un-exitable, and the two must not
-//! share a route.
+//! `parent_shape` reaches "no shape" through THREE CONSECUTIVE ABSENCES — no tip row, no child row,
+//! no root row. This repo has already been bitten once by treating that as a positive answer (the
+//! spine tip fell through all three and was routed as un-laddered, at the wrong floor, to the
+//! [B1]-unsafe plain split). There is no un-laddered lane any more, so an absence is not a route:
+//! `transfer_sender::execute_ex` refuses a coin with no ladder row BY NAME ("has no exit ladder and
+//! cannot be conveyed"), before any SE co-sign, and the selection filter must never offer one.
+//!
+//! # What the sender must not do on the way to refusing
+//!
+//! The only co-sign `execute_ex` performs is the receiver-paying state `S'`
+//! (`presign_receiver_state` / `cosign_colored_receiver_state`). It permanently raises the coin's
+//! enclave `num_sigs`, so every refusal in the lane — the spine-tip refusal, the no-ladder refusal —
+//! must sit ABOVE it: a refusal after the co-sign leaves the coin with a count the receiver's census
+//! `se_num_sigs == tiers + superseded` can never balance. The lane co-signs NO flat backup: the old
+//! per-hop `create_backup_transactions` / `create_backup_tx_to_receiver` are deleted, and the
+//! conveyed `backup_transactions` vector is empty by construction.
 //!
 //! # Why this guard was rewritten (the two pins that a mutation survived)
 //!
@@ -32,14 +44,13 @@
 //! guard exists to prevent: a *description* was pinned where a *property* was meant.
 //!
 //! * **A3 — a refusal pinned as a POSITION, not as a refusal.** The old
-//!   `the_flat_sender_refuses_a_spine_tip_itself` found `load_spine_tip(` and
-//!   `create_backup_transactions(` and asserted `refusal < rows`. It never asserted that anything
-//!   was *refused*. Replacing `return Err(anyhow!("statechain id {statechain_id} is a SPINE TIP …"))`
-//!   with a `println!` carrying the identical text left the guard green (5 passed) — and a spine tip
-//!   then walked the flat lane with no error on either side, which is the money-loss shape the
-//!   comment above the refusal describes. Worse, the scan window was `&code[at..]` to END OF FILE, so
-//!   both anchors could have been satisfied by any LATER function's text. A guard whose window
-//!   overshoots is pinning the file, not the function.
+//!   `the_flat_sender_refuses_a_spine_tip_itself` found `load_spine_tip(` and the co-sign and
+//!   asserted `refusal < cosign`. It never asserted that anything was *refused*. Replacing
+//!   `return Err(anyhow!("statechain id {statechain_id} is a SPINE TIP …"))` with a `println!`
+//!   carrying the identical text left the guard green (5 passed) — and a spine tip then walked on
+//!   with no error on either side. Worse, the scan window was `&code[at..]` to END OF FILE, so both
+//!   anchors could have been satisfied by any LATER function's text. A guard whose window overshoots
+//!   is pinning the file, not the function.
 //!
 //! * **A4 — an ordering pinned as a COUNT.** The old
 //!   `every_plain_split_route_proves_its_material_first` asserted `has_exit_material` appeared at
@@ -124,6 +135,21 @@ fn code_only(src: &str) -> String {
 const SDK: &str = "clients/libs/rust-sdk/src/transfer.rs";
 const SENDER: &str = "clients/libs/rust/src/transfer_sender.rs";
 
+/// The item that follows `execute_ex` in `transfer_sender.rs` — the real symbol that terminates its
+/// window (rule 4). Column-anchored, because `get_new_x1(` is also CALLED inside `execute_ex` and a
+/// bare `get_new_x1(` would end the window at the call.
+const SENDER_WINDOW_END: &str = "\npub async fn get_new_x1(";
+
+/// The ONLY co-sign `execute_ex` performs: the receiver-paying state `S'`, on the plain lane and on
+/// the coloured lane. Each raises the coin's enclave `num_sigs`, so every refusal in the lane must
+/// precede BOTH — the guard orders against the earlier of the two.
+const S_PRIME_COSIGNS: [&str; 2] = ["cosign_colored_receiver_state(", "presign_receiver_state("];
+
+/// The deleted flat co-signs. A laddered coin conveys `backup_transactions: []`; a per-hop backup
+/// would be a co-sign the receiver's census `tiers + superseded` cannot account for, and a matured
+/// spend of `F` left in this wallet's hands after the coin is gone.
+const FLAT_COSIGNS: [&str; 2] = ["create_backup_transactions(", "create_backup_tx_to_receiver("];
+
 // ---------------------------------------------------------------------------------------------
 // Window machinery. Rule 4: a window is bounded by two REAL symbols, and a missing one is fatal.
 // ---------------------------------------------------------------------------------------------
@@ -144,10 +170,11 @@ fn item_body<'a>(code: &'a str, start: &str, end: &str) -> Result<&'a str, Strin
     let rest = &code[at..];
     let to = rest.find(end).ok_or_else(|| {
         format!(
-            "the window for `{start}` no longer terminates: `{end}` (the item that follows it) is \
+            "the window for `{start}` no longer terminates: `{}` (the item that follows it) is \
              gone. Refusing to scan to end of file — an unterminated window lets the WRONG \
              function's text satisfy every assertion below it, which is exactly how the spine-tip \
-             refusal pin stayed green while the refusal was a `println!`."
+             refusal pin stayed green while the refusal was a `println!`.",
+            end.trim()
         )
     })?;
     Ok(&rest[..to])
@@ -225,6 +252,36 @@ fn line_head(code: &str, at: usize) -> &str {
     code[start..at].trim_start()
 }
 
+/// A block REFUSES: `return Err` / `bail!` / `Err(anyhow!(` inside it. The message text is not the
+/// property; a `println!` carrying the identical words satisfies a message pin and refuses nothing.
+fn refuses(block: &str) -> bool {
+    block.contains("return Err(") || block.contains("bail!(") || block.contains("Err(anyhow!(")
+}
+
+/// `execute_ex`'s window, bounded by the item that follows it (rule 4).
+fn execute_ex_body(sender: &str) -> Result<&str, String> {
+    item_body(sender, "async fn execute_ex(", SENDER_WINDOW_END)
+}
+
+/// The position of the FIRST `S'` co-sign in `execute_ex`. BOTH lanes' co-signs must be present —
+/// a rename would otherwise make every ordering below vacuously true (rule 2 orders against a real
+/// symbol, never against an absence).
+fn first_cosign(body: &str) -> Result<usize, String> {
+    let mut first = usize::MAX;
+    for needle in S_PRIME_COSIGNS {
+        let at = find_one(
+            body,
+            needle,
+            "`execute_ex` no longer co-signs the receiver-paying state S' through it — this guard \
+             orders every refusal in the lane against that co-sign, so its disappearance makes the \
+             ordering vacuous. Re-derive the lane's first material-producing step; do not drop \
+             the marker",
+        )?;
+        first = first.min(at);
+    }
+    Ok(first)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The properties, as pure functions over source text (rule 5).
 // ---------------------------------------------------------------------------------------------
@@ -239,18 +296,10 @@ fn check_exit_material_proof(sdk: &str) -> Result<(), String> {
         // moment a comment line or an argument was added.
         "pub(crate) async fn spendable_payment_coins(",
     )?;
-    if !body.contains("try_get_backup_txs(") {
-        return Err(format!(
-            "`has_exit_material` no longer uses `try_get_backup_txs`. `get_backup_txs` is a \
-             `fetch_one`, so a MISSING row and a FAILED read are the same value there — and reading \
-             a failed read as 'no material' retires a perfectly good coin from the wallet's \
-             balance:\n\n{body}"
-        ));
-    }
     // [ONE COIN SHAPE] The short-circuit used to read `ParentShape::Unladdered`; that variant is
     // deleted with the lane, and the probe is now `parent_shape_opt(..).is_some()`. The PROPERTY is
-    // unchanged and is what this pins: the three laddered shapes ARE exit material, and this
-    // function must ask the one probe rather than re-deriving it.
+    // unchanged and is what this pins: the three laddered shapes ARE exit material — the ONLY exit
+    // material — and this function must ask the one probe rather than re-deriving it.
     if !body.contains("parent_shape_opt(") {
         return Err(format!(
             "`has_exit_material` no longer short-circuits on the laddered shapes; a bundle IS exit \
@@ -258,12 +307,30 @@ fn check_exit_material_proof(sdk: &str) -> Result<(), String> {
              drift:\n\n{body}"
         ));
     }
+    // IF the function still reads the legacy flat-backup rows as a fallback, it must do so through
+    // `try_get_backup_txs`: `get_backup_txs` is a `fetch_one`, so a MISSING row and a FAILED read are
+    // the same value there — and reading a failed read as 'no material' retires a perfectly good
+    // coin from the wallet's balance. Conditional, because under ONE COIN SHAPE the fallback is a
+    // legacy residue (a coin with rows and no ladder is refused by `execute_ex` anyway) and removing
+    // it outright must not trip this guard — a guard that fires on right code gets weakened, every
+    // time, until it means nothing.
+    let bare_reads = body
+        .match_indices("get_backup_txs(")
+        .filter(|(i, _)| !body[..*i].ends_with("try_"))
+        .count();
+    if bare_reads > 0 {
+        return Err(format!(
+            "`has_exit_material` reads backup rows through `get_backup_txs` ({bare_reads} call(s)). \
+             That is a `fetch_one`, so a MISSING row and a FAILED read are the same value there — \
+             and reading a failed read as 'no material' retires a perfectly good coin from the \
+             wallet's balance. Use `try_get_backup_txs`, or drop the flat-row fallback:\n\n{body}"
+        ));
+    }
     Ok(())
 }
 
-/// One of the three routes that acts on `ParentShape::Unladdered` (or on its flat-sender equivalent)
-/// by handing a coin to a PLAIN split. Each must PROVE the material, with the proof GATING the route
-/// and standing BEFORE it.
+/// The shared selection filter — the one route that decides which coins a payment may take. The
+/// proof must GATE the route and stand BEFORE it.
 struct Gate {
     /// The item this gate lives in.
     item: &'static str,
@@ -297,8 +364,8 @@ const GATES: &[Gate] = &[
     },
 ];
 
-/// THE UN-LADDERED ROUTES. Every place that routes a coin to a PLAIN split proves the material
-/// first — *proves* (the answer decides the branch) and *first* (the proof precedes the route).
+/// THE SELECTION GATE. The one place that decides the spendable set proves the material first —
+/// *proves* (the answer decides the branch) and *first* (the proof precedes the route).
 ///
 /// This replaces the old `proofs >= 3` count. The count could not see the difference between a
 /// blocking probe and `let _ = self.has_exit_material(&id).await?;`, which is precisely the mutation
@@ -344,8 +411,8 @@ fn check_plain_split_gates(sdk: &str) -> Result<(), String> {
                 return Err(format!(
                     "the `has_exit_material` gate in `{}` no longer contains `{must}`; its block \
                      reads:\n{}\n\nA gate whose losing branch does not DIVERT is not a gate — the \
-                     coin walks on to the plain split anyway and the failure resurfaces at the far \
-                     end of the payment as an unclassified breach.",
+                     coin walks on to the sender anyway and the failure resurfaces at the far end \
+                     of the payment as an unclassified breach.",
                     g.item, block.inner
                 ));
             }
@@ -377,7 +444,7 @@ fn check_plain_split_gates(sdk: &str) -> Result<(), String> {
         let route = find_one(
             body,
             g.route,
-            &format!("`{}` no longer takes the plain-split route — re-derive this guard", g.item),
+            &format!("`{}` no longer builds the spendable set here — re-derive this guard", g.item),
         )?;
         if gate >= route {
             return Err(format!(
@@ -396,77 +463,133 @@ fn check_plain_split_gates(sdk: &str) -> Result<(), String> {
 ///
 /// The spine-tip refusal lived in exactly one caller — `UtexoWallet::transfer`'s handover loop.
 /// `transfer_sender::execute` is public, `chaos22`'s `respend` calls it directly, and a direct
-/// caller has no dispatch: the tip walked into the flat lane, whose classifier LICENSES it
-/// (`FundingNotOnChain` — a tip's funding output is un-broadcast, exactly like a `ctesr-` child's).
-/// What stopped the conveyance was an ABSENCE, the missing backup rows.
-///
-/// Refusal-by-absence is one guard away from a money loss: a flat conveyance of a tip hands the
-/// recipient a backup chain over an outpoint that does not exist on chain and never will — a coin
-/// with no exit, with no error on either side.
+/// caller has no dispatch. Handing a tip over whole is a `spinetip-` conveyance whose builder is
+/// not landed; what used to stop it was an ABSENCE (the tip had no flat backup rows), and
+/// refusal-by-absence is one guard away from a money loss.
 ///
 /// So this pins the REFUSAL (a `return Err` inside the probe's own block), not the message — the old
 /// version pinned only the position of the `load_spine_tip(` call, and a `println!` carrying the
-/// identical text satisfied it.
+/// identical text satisfied it. And it pins that the refusal precedes the `S'` co-sign, the only
+/// step in the lane that raises the coin's `num_sigs`.
 fn check_tip_refusal(sender: &str) -> Result<(), String> {
-    let body = item_body(
-        sender,
-        "async fn execute_ex(",
-        // Rule 4. The old window was `&code[at..]` — to end of file.
-        "async fn create_backup_tx_to_receiver(",
-    )?;
+    let body = execute_ex_body(sender)?;
     let probe = find_one(
         body,
         "load_spine_tip(",
         "`execute_ex` no longer refuses a spine tip ITSELF. The refusal must not live only in \
-         `UtexoWallet::transfer`'s dispatch: `execute` is public and a direct caller reaches the \
-         flat lane, which LICENSES an un-broadcast funding output and would convey the tip on a \
-         backup chain the recipient can never exit through",
+         `UtexoWallet::transfer`'s dispatch: `execute` is public and a direct caller would convey \
+         the tip whole, which is a spine-tip conveyance whose builder is not landed",
     )?;
     let block = block_after(body, probe)
         .ok_or_else(|| "the spine-tip probe in `execute_ex` has no `{ … }` block".to_string())?;
 
-    // The probe must FAIL CLOSED. A tip read that is swallowed reads as "not a tip" and routes the
-    // tip flat — the same silent-degradation shape, arriving through the read instead of the branch.
+    // The probe must FAIL CLOSED. A tip read that is swallowed reads as "not a tip" and conveys the
+    // tip — the same silent-degradation shape, arriving through the read instead of the branch.
     let condition = &body[probe..block.open];
     if !condition.contains(".await?") || condition.contains("unwrap_or") || condition.contains(".ok()")
     {
         return Err(format!(
             "the spine-tip probe in `execute_ex` no longer propagates a failed read:\n{condition}\n\
-             \nA swallowed read answers 'not a tip', and a tip conveyed flat is a backup chain over \
-             an outpoint that will never exist on chain."
+             \nA swallowed read answers 'not a tip', and a tip conveyed whole hands the recipient \
+             a ladder over an un-broadcast funding output."
         ));
     }
 
     // THE REFUSAL ITSELF — inside the probe's own block, and expressed as a refusal.
-    let refuses = block.inner.contains("return Err(")
-        || block.inner.contains("bail!(")
-        || block.inner.contains("Err(anyhow!(");
-    if !refuses {
+    if !refuses(block.inner) {
         return Err(format!(
             "the spine-tip branch in `execute_ex` does not REFUSE. Its block reads:\n{}\n\nThis is \
              the pin the old guard did not have: it asserted only that `load_spine_tip(` appeared \
-             before `create_backup_transactions(`, so replacing the `return Err(anyhow!(\"… is a \
-             SPINE TIP …\"))` with a `println!` carrying the identical text left the guard green — \
-             and the tip then walked the flat lane with no error on either side. The message text is \
-             not the property; the `return Err` is.",
+             before the co-sign, so replacing the `return Err(anyhow!(\"… is a SPINE TIP …\"))` \
+             with a `println!` carrying the identical text left the guard green — and the tip then \
+             walked on with no error on either side. The message text is not the property; the \
+             `return Err` is.",
             block.inner
         ));
     }
 
     // ...and it must refuse BEFORE the SE co-signs anything (rule 2 — positions).
-    let rows = find_one(
-        body,
-        "create_backup_transactions(",
-        "`execute_ex` no longer builds the flat backup chain — re-derive this guard",
-    )?;
-    if block.close >= rows {
+    let cosign = first_cosign(body)?;
+    if block.close >= cosign {
         return Err(format!(
-            "the spine-tip refusal (block ends at byte {}) runs at or AFTER \
-             `create_backup_transactions` (byte {rows}). Then the tip is stopped by the ABSENCE of \
-             backup rows rather than by a rule — refusal by accident, which reads to `chaos22`'s \
-             oracle as an unclassified breach, and it leaves the coin with an inflated `num_sigs` \
-             from a co-sign it should never have reached.",
+            "the spine-tip refusal (block ends at byte {}) runs at or AFTER the S' co-sign (byte \
+             {cosign}). Then the tip is refused only after its `num_sigs` has already been raised \
+             by a co-sign it should never have reached — the receiver's census \
+             `se_num_sigs == tiers + superseded` can never balance for that coin again.",
             block.close
+        ));
+    }
+    Ok(())
+}
+
+/// **A COIN WITH NO LADDER ROW IS REFUSED BY NAME, BEFORE THE CO-SIGN.** Under ONE COIN SHAPE there
+/// is no un-laddered lane: a coin whose `tesr::load` answers `None` has NO exit material and no
+/// census a receiver could balance. `execute_ex` must refuse it (a `return Err` inside the
+/// `is_none()` block) and must do so ABOVE the `S'` co-sign — refusing after the co-sign would raise
+/// `num_sigs` on a coin that has no ladder to account for it, bricking it for good.
+fn check_no_ladder_refusal(sender: &str) -> Result<(), String> {
+    let body = execute_ex_body(sender)?;
+    let probe = find_one(
+        body,
+        "if tesr_bundle.is_none()",
+        "`execute_ex` no longer refuses a coin with no ladder row by name. There is no un-laddered \
+         lane: such a coin has no exit material, and conveying it would hand the recipient a coin \
+         with no exit and no census",
+    )?;
+    let block = block_after(body, probe)
+        .ok_or_else(|| "the no-ladder probe in `execute_ex` has no `{ … }` block".to_string())?;
+    if !refuses(block.inner) {
+        return Err(format!(
+            "the no-ladder branch in `execute_ex` does not REFUSE. Its block reads:\n{}\n\nA coin \
+             with no ladder row has no exit material; anything but a `return Err` here conveys it.",
+            block.inner
+        ));
+    }
+    let cosign = first_cosign(body)?;
+    if block.close >= cosign {
+        return Err(format!(
+            "the no-ladder refusal (block ends at byte {}) runs at or AFTER the S' co-sign (byte \
+             {cosign}). A co-sign on a coin with no ladder raises its `num_sigs` with no tier to \
+             account for it — the coin is bricked in the act of being refused.",
+            block.close
+        ));
+    }
+    Ok(())
+}
+
+/// **THE LANE CO-SIGNS NO FLAT BACKUP.** A laddered coin conveys `backup_transactions: []`: the
+/// deposit-time `tx1` and the per-hop `create_backup_tx_to_receiver` are deleted, and every receiver
+/// refuses a non-empty vector by name. A flat co-sign re-appearing here would be a co-sign the
+/// receiver's census cannot account for AND a matured spend of `F` retained by a former owner.
+fn check_no_flat_cosign(sender: &str) -> Result<(), String> {
+    for needle in FLAT_COSIGNS {
+        if let Some(at) = sender.find(needle) {
+            return Err(format!(
+                "`{needle}` is back in transfer_sender.rs (byte {at}). A laddered coin conveys NO \
+                 flat backup — none at deposit, none at any hop — so this co-sign is one the \
+                 receiver's census `tiers + superseded` cannot account for, and the transaction it \
+                 signs is a spend of `F` this wallet keeps after the coin is gone."
+            ));
+        }
+    }
+    let body = execute_ex_body(sender)?;
+    let bind = find_one(
+        body,
+        "let backup_transactions",
+        "`execute_ex` no longer binds the conveyed `backup_transactions` — re-derive this guard \
+         against whatever now fills that field of the transfer message",
+    )?;
+    let stmt_end = body[bind..]
+        .find(';')
+        .map(|d| bind + d)
+        .ok_or_else(|| "the `backup_transactions` binding is not terminated".to_string())?;
+    let stmt = &body[bind..stmt_end];
+    if !(stmt.contains("Vec::new()") || stmt.contains("vec![]")) {
+        return Err(format!(
+            "`execute_ex` conveys a `backup_transactions` vector that is not empty by \
+             construction:\n{stmt}\n\nEvery receiver refuses a non-empty vector \
+             (`verify_flat_backup_lane`), so anything else here is a transfer that cannot be \
+             claimed."
         ));
     }
     Ok(())
@@ -505,9 +628,8 @@ fn payment_coins_has_exactly_one_caller() {
     );
 }
 
-/// THE PROOF EXISTS, and fails closed. `try_get_backup_txs` is the absence-vs-failure split: reading
-/// a FAILED read as "no material" would silently retire a good coin from the spendable balance —
-/// the same silent-degradation shape pointed the other way.
+/// THE PROOF EXISTS, and fails closed. The laddered shapes are the exit material, asked through the
+/// one probe; any residual row read must keep the absence-vs-failure split.
 #[test]
 fn the_exit_material_proof_reads_absence_not_failure() {
     check_exit_material_proof(&code_only(&read(SDK))).unwrap_or_else(|e| panic!("{e}"));
@@ -527,10 +649,23 @@ fn the_shared_selection_filter_proves_its_material_first() {
     check_plain_split_gates(&code_only(&read(SDK))).unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// THE FLAT SENDER REFUSES A TIP ITSELF — see [`check_tip_refusal`].
+/// THE SENDER REFUSES A TIP ITSELF — see [`check_tip_refusal`].
 #[test]
 fn the_flat_sender_refuses_a_spine_tip_itself() {
     check_tip_refusal(&code_only(&read(SENDER))).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// THE SENDER REFUSES A COIN WITH NO LADDER, BY NAME, BEFORE THE CO-SIGN — see
+/// [`check_no_ladder_refusal`].
+#[test]
+fn the_sender_refuses_a_coin_with_no_ladder_before_the_cosign() {
+    check_no_ladder_refusal(&code_only(&read(SENDER))).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// THE SENDER CO-SIGNS NO FLAT BACKUP AND CONVEYS AN EMPTY VECTOR — see [`check_no_flat_cosign`].
+#[test]
+fn the_sender_conveys_no_flat_backup() {
+    check_no_flat_cosign(&code_only(&read(SENDER))).unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// THE REMEDY IS NAMED, and named CORRECTLY. A stuck coin has a fee problem that combining rescues;
@@ -542,7 +677,7 @@ fn the_two_exclusions_keep_two_remedies() {
     assert!(
         sdk.contains("not rescuable by combining"),
         "the quote no longer distinguishes a materialless coin from a stuck one. Combining rescues \
-         a coin whose value is below its renewal fee; it cannot conjure a backup chain."
+         a coin whose value is below its renewal fee; it cannot conjure a ladder."
     );
     let types = read("clients/libs/rust-sdk/src/types.rs");
     assert!(
@@ -559,15 +694,24 @@ fn the_two_exclusions_keep_two_remedies() {
 #[test]
 fn every_scan_window_stops_at_a_real_symbol() {
     let sender = code_only(&read(SENDER));
-    let body = item_body(&sender, "async fn execute_ex(", "async fn create_backup_tx_to_receiver(")
-        .unwrap_or_else(|e| panic!("{e}"));
+    let body = execute_ex_body(&sender).unwrap_or_else(|e| panic!("{e}"));
+    for needle in S_PRIME_COSIGNS {
+        assert!(
+            body.contains(needle),
+            "`execute_ex`'s window no longer contains the S' co-sign `{needle}` — re-derive this \
+             guard"
+        );
+    }
     assert!(
-        body.contains("create_backup_transactions("),
-        "`execute_ex`'s window no longer contains the flat backup build — re-derive this guard"
-    );
-    assert!(
-        !body.contains("async fn create_backup_tx_to_receiver("),
+        !body.contains(SENDER_WINDOW_END),
         "`execute_ex`'s window overshot into the next item"
+    );
+    // The window ends on the item that follows `execute_ex` in the file — which is a real symbol
+    // only if it is still there.
+    assert!(
+        sender.contains(SENDER_WINDOW_END),
+        "`{}` is gone from transfer_sender.rs; the window terminator must be re-pointed",
+        SENDER_WINDOW_END.trim()
     );
 
     let sdk = code_only(&read(SDK));
@@ -599,6 +743,11 @@ fn mutate_after(code: &str, anchor: &str, from: &str, to: &str) -> String {
     format!("{}{tail}", &code[..at])
 }
 
+/// A hoisted `S'` co-sign, in the shape the lane ships — planted ABOVE a refusal to prove the
+/// ordering pins compare positions.
+const HOISTED_COSIGN: &str = "let _early = crate::tesr::presign_receiver_state(client_config, \
+                              &coin, &bundle, recipient_address).await?;\n    ";
+
 /// **A guard that cannot fail is decoration.** Each case below is a mutation an adversarial review
 /// applied (or could apply) to the real tree; the first two are the ones the PREVIOUS version of
 /// this file was proven to survive.
@@ -628,21 +777,20 @@ fn guard_catches_each_mutation_it_was_written_for() {
          overshooting again"
     );
 
-    // A3 ordering: hoist the SE co-sign ABOVE the refusal. The tip is then stopped (if at all) by
-    // the absence of backup rows, after its `num_sigs` has already been raised.
+    // A3 ordering: hoist the S' co-sign ABOVE the spine-tip refusal. The tip is then refused (if at
+    // all) after its `num_sigs` has already been raised.
     let hoisted = mutate_after(
         &sender,
         "async fn execute_ex(",
         "let coin = coin.unwrap().clone();",
-        "let _bkps = create_backup_transactions(client_config, recipient_address, &mut wallet, \
-         &statechain_id, duplicated_indexes).await?;\n    let coin = coin.unwrap().clone();",
+        &format!("{HOISTED_COSIGN}let coin = coin.unwrap().clone();"),
     );
     assert!(
         check_tip_refusal(&hoisted).is_err(),
-        "A3: co-signing the backup chain BEFORE the spine-tip refusal was not caught"
+        "A3: co-signing S' BEFORE the spine-tip refusal was not caught"
     );
 
-    // A3: a swallowed tip read answers "not a tip" and routes the tip flat.
+    // A3: a swallowed tip read answers "not a tip" and conveys the tip.
     let swallowed =
         mutate_after(&sender, "load_spine_tip(", ".await?", ".await.unwrap_or(None)");
     assert!(
@@ -650,8 +798,56 @@ fn guard_catches_each_mutation_it_was_written_for() {
         "A3: a swallowed `load_spine_tip` read was not caught"
     );
 
+    // [ONE COIN SHAPE] The no-ladder refusal demoted to a message. The coin then reaches the S'
+    // co-sign with no ladder to account for it.
+    let no_ladder_printed =
+        mutate_after(&sender, "if tesr_bundle.is_none()", "return Err(anyhow!(", "println!(");
+    assert!(
+        check_no_ladder_refusal(&no_ladder_printed).is_err(),
+        "turning the no-ladder `return Err` into a `println!` with identical text was NOT caught"
+    );
 
+    // [ONE COIN SHAPE] The S' co-sign hoisted ABOVE the no-ladder refusal — but still below the
+    // spine-tip refusal, so ONLY the no-ladder ordering may fire. That is the point: the two pins
+    // are independent positions, not one shared anchor.
+    let cosign_above_no_ladder = mutate_after(
+        &sender,
+        "async fn execute_ex(",
+        "if tesr_bundle.is_none()",
+        &format!("{HOISTED_COSIGN}if tesr_bundle.is_none()"),
+    );
+    assert!(
+        check_no_ladder_refusal(&cosign_above_no_ladder).is_err(),
+        "co-signing S' BEFORE the no-ladder refusal was not caught"
+    );
+    check_tip_refusal(&cosign_above_no_ladder).unwrap_or_else(|e| {
+        panic!("the spine-tip pin fired on a mutation that left its own ordering intact: {e}")
+    });
 
+    // [ONE COIN SHAPE] A flat backup co-sign re-planted in the lane, and a conveyed vector that is
+    // no longer empty by construction. Both are the retired shape coming back.
+    let flat_replanted = mutate_after(
+        &sender,
+        "async fn execute_ex(",
+        "let backup_transactions: Vec<BackupTx> = Vec::new();",
+        "let backup_transactions: Vec<BackupTx> = create_backup_transactions(client_config, \
+         recipient_address, &mut wallet, &statechain_id).await?;",
+    );
+    assert!(
+        check_no_flat_cosign(&flat_replanted).is_err(),
+        "a re-planted `create_backup_transactions(` was not caught"
+    );
+    let flat_filled = mutate_after(
+        &sender,
+        "async fn execute_ex(",
+        "let backup_transactions: Vec<BackupTx> = Vec::new();",
+        "let backup_transactions: Vec<BackupTx> = get_backup_txs(&client_config.pool, \
+         &wallet.name, &statechain_id).await?;",
+    );
+    assert!(
+        check_no_flat_cosign(&flat_filled).is_err(),
+        "a conveyed `backup_transactions` read from the legacy rows was not caught"
+    );
 
     // A4: the selection filter stops recording what it excluded.
     let no_record = mutate_after(
@@ -671,20 +867,37 @@ fn guard_catches_each_mutation_it_was_written_for() {
     // is exercised by the cases above; what is gone is a mutation with nothing left to mutate. A
     // vacuous non-vacuity case is worse than none, which is exactly what `mutate_after` asserts.
 
-    // The fail-closed read in `has_exit_material` itself.
-    let fetch_one = mutate_after(
+    // The fail-closed read in `has_exit_material` itself: the ambiguous `fetch_one` read in place of
+    // the absence-vs-failure split. (Conditional on the flat-row fallback still being present — if
+    // it has been removed, there is nothing to mutate and this case is retired with it.)
+    if sdk.contains("try_get_backup_txs(") {
+        let fetch_one = mutate_after(
+            &sdk,
+            "pub(crate) async fn has_exit_material(",
+            "try_get_backup_txs(",
+            "get_backup_txs(",
+        );
+        assert!(
+            check_exit_material_proof(&fetch_one).is_err(),
+            "reverting the proof to the ambiguous `fetch_one` read was not caught"
+        );
+    }
+    // ...and the one probe removed outright.
+    let no_probe = mutate_after(
         &sdk,
         "pub(crate) async fn has_exit_material(",
-        "try_get_backup_txs(",
-        "get_backup_txs(",
+        "parent_shape_opt(",
+        "parent_shape_gone(",
     );
     assert!(
-        check_exit_material_proof(&fetch_one).is_err(),
-        "reverting the proof to the ambiguous `fetch_one` read was not caught"
+        check_exit_material_proof(&no_probe).is_err(),
+        "dropping the laddered-shape probe from `has_exit_material` was not caught"
     );
 
     // ...and the unmutated tree must still pass, or the cases above prove nothing.
     check_tip_refusal(&sender).unwrap_or_else(|e| panic!("clean tree rejected: {e}"));
+    check_no_ladder_refusal(&sender).unwrap_or_else(|e| panic!("clean tree rejected: {e}"));
+    check_no_flat_cosign(&sender).unwrap_or_else(|e| panic!("clean tree rejected: {e}"));
     check_plain_split_gates(&sdk).unwrap_or_else(|e| panic!("clean tree rejected: {e}"));
     check_exit_material_proof(&sdk).unwrap_or_else(|e| panic!("clean tree rejected: {e}"));
 }

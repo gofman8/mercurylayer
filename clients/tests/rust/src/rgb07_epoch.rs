@@ -1,16 +1,21 @@
-//! E2E (Stage 4 — epoch deadline / bounded exit window): the SE refuses to co-sign any NEW spend of
-//! a coin once its own clock passes the coin's `epoch_deadline`. This makes the design's trust model
-//! real and enforced ("trust = SE honest + exit before the epoch deadline"). The crucial property:
-//! **unilateral exit needs no SE co-signature** — the owner just broadcasts an already-co-signed
-//! branch — so the deadline only bounds when the owner must transact/exit by; funds are never stuck.
+//! E2E (RGB_E2E=7 — the coordinator's `epoch_deadline` gate): the SE refuses to co-sign any NEW
+//! spend of a coin once its own clock passes the coin's `epoch_deadline`. This is a SERVER-side
+//! gate on `sign/first` (`sign.rs`: `now >= epoch_deadline`), independent of how the coin exits.
 //!
-//! Probe:
-//!   A (active):  deposit with a FAR epoch, co-sign a spend  -> SE co-signs OK (active period).
-//!   B (expired): deposit with a NEAR epoch, wait past it, attempt the FIRST co-sign -> SE REFUSES.
-//!                B is fresh (0 finalized signatures), so single-use (>=1) cannot be the cause —
-//!                the refusal uniquely proves epoch enforcement.
-//!   exit:        broadcast A's pre-co-signed branch AFTER B's deadline -> confirms on-chain with no
-//!                further SE call (unilateral exit needs no co-signature).
+//! Re-derived for the ladder rule. The coins here are `single_use` deposits with an epoch
+//! (`get_deposit_bitcoin_address_single_use_epoch`) — the one deposit shape that gets NO TES-R
+//! ladder at first sight (the SE refuses a second co-sign on a single_use coin) and, since
+//! `create_tx1` is gone, no flat backup either. So the shape is pinned first, then the gate:
+//!
+//!   A (active):  deposit with a FAR epoch; assert no ladder / no flat backup / `locktime == None`;
+//!                co-sign one coloured WITHDRAWAL of the whole allocation -> the SE co-signs.
+//!   B (expired): deposit with a NEAR epoch, wait past it, attempt the FIRST co-sign -> the SE
+//!                REFUSES and the refusal names the epoch. B is fresh (0 finalized signatures), so
+//!                single-use (>=1) cannot be the cause — the refusal uniquely proves epoch
+//!                enforcement.
+//!   exit:        broadcast A's already-co-signed withdrawal AFTER B's deadline -> it confirms with
+//!                no further SE call. A pre-signed spend needs no SE cooperation to reach the chain;
+//!                the deadline bounds NEW co-signatures, never the broadcast of old ones.
 //!
 //! Run with RGB_E2E=7. Requires the regtest + Mercury (lockbox) stack.
 
@@ -29,7 +34,6 @@ const NETWORK: &str = "regtest";
 const BLINDING: u64 = 71;
 const ISSUED: u64 = 1000;
 const COIN_SAT: u32 = 60_000;
-const OUT_SAT: u64 = 40_000;
 const EPOCH_FAR: u64 = 3600; // A: comfortably inside the active period when co-signed
 const EPOCH_NEAR: u64 = 5;   // B: short window so it expires during the test
 
@@ -97,6 +101,25 @@ async fn fresh_coin(cc: &ClientConfig, wallet_name: &str, sc_address: &str) -> R
     Ok(coin)
 }
 
+/// The exit-material shape of a `single_use` deposit under the ladder rule: no `tesr-` row, no flat
+/// backup row, no absolute calendar.
+async fn assert_single_use_shape(cc: &ClientConfig, wallet_name: &str, coin: &Coin) -> Result<()> {
+    let sid = coin.statechain_id.clone().ok_or(anyhow!("coin has no statechain id"))?;
+    assert!(coin.single_use, "the probe coin must be a single_use deposit");
+    assert!(
+        mercuryrustlib::tesr::load(cc, wallet_name, &sid).await?.is_none(),
+        "a single_use coin must carry NO TES-R ladder (the SE refuses its second co-sign)"
+    );
+    let flat = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, wallet_name, &sid).await?;
+    assert!(
+        flat.as_ref().map(|v| v.is_empty()).unwrap_or(true),
+        "a deposit must carry NO flat backup row (create_tx1 is gone); found {:?} row(s) for {sid}",
+        flat.map(|v| v.len())
+    );
+    assert!(coin.locktime.is_none(), "no coin carries an absolute calendar: locktime must be None");
+    Ok(())
+}
+
 pub async fn execute() -> Result<()> {
     let _ = Command::new("rm").arg("wallet.db").arg("wallet.db-shm").arg("wallet.db-wal").output();
     let _ = fs::remove_dir_all("./rgb-data7");
@@ -123,15 +146,16 @@ pub async fn execute() -> Result<()> {
     tokio::task::block_in_place(|| {
         issuer.register_statechain(&txid_a, vout_a, COIN_SAT as u64, &contract, ISSUED, &sources)
     })?;
-    println!("RGB07 - A = {txid_a}:{vout_a} holds {ISSUED}, epoch={epoch_a} (now={})", now_unix());
+    assert_single_use_shape(&cc, "rgb07_a", &coin_a).await?;
+    println!("RGB07 - A = {txid_a}:{vout_a} holds {ISSUED}, epoch={epoch_a} (now={}); no ladder, no flat backup, locktime None", now_unix());
 
-    // Co-sign A -> out_a within the active period. The SE must co-sign.
+    // Co-sign A's withdrawal within the active period. The SE must co-sign.
     let si = mercuryrustlib::utils::info_config(&cc).await?;
     let out_a = tokio::task::block_in_place(|| issuer.witness_receive(ISSUED))?;
     let recv_a = tokio::task::block_in_place(|| issuer.address_from_recipient_id(&out_a))?;
-    let spend_a = mercuryrustlib::rgb::create_colored_combine_tx(
-        &cc, &issuer, std::slice::from_mut(&mut coin_a), &contract,
-        &[(recv_a, OUT_SAT, ISSUED)], 1, true, None, NETWORK, si.initlock, si.interval, BLINDING,
+    let spend_a = mercuryrustlib::rgb::create_colored_backup_tx(
+        &cc, &issuer, &mut coin_a, &contract, ISSUED, &recv_a, 0, true, None, NETWORK,
+        si.fee_rate_sats_per_byte, si.initlock, si.interval, BLINDING, None, None,
     ).await;
     assert!(spend_a.is_ok(), "A must co-sign inside the active period: {:?}", spend_a.err());
     let spend_a = spend_a.unwrap();
@@ -143,7 +167,8 @@ pub async fn execute() -> Result<()> {
         Ok(bitcoin_core::sendtoaddress(COIN_SAT, sc)?)
     }).await?;
     let coin_b = fresh_coin(&cc, "rgb07_b", &addr_b_coin).await?;
-    println!("RGB07 - B deposited, epoch={epoch_b}");
+    assert_single_use_shape(&cc, "rgb07_b", &coin_b).await?;
+    println!("RGB07 - B deposited, epoch={epoch_b}; no ladder, no flat backup (0 co-signs so far)");
 
     // Wait until the SE's clock is past B's deadline.
     let target = epoch_b + 2;
@@ -163,12 +188,12 @@ pub async fn execute() -> Result<()> {
     let msg = probe.err().unwrap().to_string();
     assert!(msg.contains("epoch"), "refusal must be the epoch gate (fresh coin can't trip single-use): {msg}");
 
-    // ===== Exit: broadcast A's pre-co-signed branch (no SE call) AFTER B's deadline. =====
+    // ===== Exit: broadcast A's pre-co-signed withdrawal (no SE call) AFTER B's deadline. =====
     let exit_txid = cc.electrum_client.transaction_broadcast_raw(&hex::decode(&spend_a.signed_tx)?)?;
     let core = bitcoin_core::getnewaddress()?;
     let _ = bitcoin_core::generatetoaddress(cc.confirmation_target, &core)?;
-    println!("RGB07 - exited A unilaterally by broadcasting its branch (txid {exit_txid}), no SE co-signature needed \u{2713}");
+    println!("RGB07 - A's pre-co-signed withdrawal broadcast (txid {exit_txid}) with no further SE call \u{2713}");
 
-    println!("RGB07 - SUCCESS: SE enforces the epoch deadline - it co-signs inside the active period, REFUSES a new co-signature past the deadline, and unilateral exit (broadcasting a pre-co-signed branch) needs no SE involvement.");
+    println!("RGB07 - SUCCESS: single_use epoch coins carry no ladder and no flat backup; the SE co-signs inside the active period, REFUSES a new co-signature past the deadline, and an already-co-signed spend reaches the chain without SE involvement.");
     Ok(())
 }

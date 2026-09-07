@@ -1,4 +1,4 @@
-use crate::{client_config::ClientConfig, sqlite_manager::{get_backup_txs, get_wallet, update_wallet}, transaction::new_transaction, utils::info_config};
+use crate::{client_config::ClientConfig, sqlite_manager::{get_wallet, update_wallet}, transaction::new_transaction, utils::info_config};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use electrum_client::ElectrumApi;
@@ -15,32 +15,41 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str, statechain
         return Err(anyhow!("Invalid address"));
     }
 
-    let backup_txs = get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
-    
-    if backup_txs.len() == 0 {
-        return Err(anyhow!("No backup transaction associated with this statechain ID were found"));
-    }
+    // A coin has NO flat backup chain: its exit material is its TES-R ladder, established at
+    // deposit, and a cooperative withdraw does not read it. The withdrawal transaction's locktime
+    // is derived from the current tip alone (`calculate_block_height` with `is_withdrawal`), so the
+    // backup-count argument the tx builder still carries is irrelevant here and is passed as 0.
+    // (This used to refuse "No backup transaction associated with this statechain ID" when the
+    // backup rows were absent — which, since the ladder replaced them, would have been every coin.)
+    let qt_backup_tx: u32 = 0;
 
-    let qt_backup_tx = backup_txs.len() as u32;
-
-    // let new_tx_n = qt_backup_tx + 1;
-
-    // If the user sends to himself, he will have two coins with same statechain_id
-    // In this case, we need to find the one with the lowest locktime
-
-    let coin: Option<&mut mercurylib::wallet::Coin> = match duplicated_index {
-        Some(index) => wallet.coins
-            .iter_mut()
-            .filter(|c| c.statechain_id == Some(statechain_id.to_string())
-                  && c.status == CoinStatus::DUPLICATED
-                  && c.duplicate_index == index)
-            .min_by_key(|c| c.locktime),
-        None => wallet.coins
-            .iter_mut()
-            .filter(|c| c.statechain_id == Some(statechain_id.to_string())
-                    && c.status != CoinStatus::DUPLICATED)
-            .min_by_key(|c| c.locktime) // Find the one with the lowest locktime
+    // A statechain id can sit on several rows of one wallet: a coin sent to oneself, or one
+    // re-received after an earlier hop, keeps its older TRANSFERRED row beside the live one. The
+    // rows used to be told apart by locktime (the newest backup was the lowest). A coin carries no
+    // absolute locktime any more — its ladder is its only exit material — so the LIVE row
+    // (CONFIRMED or IN_TRANSFER) is preferred outright; with none, the first non-duplicate row is
+    // taken so the status check below names what was found.
+    let sid_matches =
+        |c: &mercurylib::wallet::Coin| c.statechain_id.as_deref() == Some(statechain_id);
+    let coin_index: Option<usize> = match duplicated_index {
+        Some(index) => wallet.coins.iter().position(|c| {
+            sid_matches(c) && c.status == CoinStatus::DUPLICATED && c.duplicate_index == index
+        }),
+        None => wallet
+            .coins
+            .iter()
+            .position(|c| {
+                sid_matches(c)
+                    && (c.status == CoinStatus::CONFIRMED || c.status == CoinStatus::IN_TRANSFER)
+            })
+            .or_else(|| {
+                wallet
+                    .coins
+                    .iter()
+                    .position(|c| sid_matches(c) && c.status != CoinStatus::DUPLICATED)
+            }),
     };
+    let coin: Option<&mut mercurylib::wallet::Coin> = coin_index.map(|i| &mut wallet.coins[i]);
 
     if coin.is_none() {
 

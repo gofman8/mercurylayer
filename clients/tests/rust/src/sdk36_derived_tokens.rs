@@ -11,7 +11,7 @@
 //!     the split popped the pool, `deposit/init/pod` would have refused the sentinel with "Token
 //!     ID not found"). The piece is then transferred to bob and claimed — a derived-slot coin is
 //!     an ordinary, fully transferable coin.
-//! (b) REFRESH IS DERIVED TOO: a second flat coin is re-anchored (`refresh`); the fresh slot is
+//! (b) REFRESH IS DERIVED TOO: a second root coin is re-anchored (`refresh`); the fresh slot is
 //!     vouched by the OLD statechain id, the sentinel still untouched, and the refreshed coin
 //!     confirms with the fee-reduced amount.
 //! (c) ONBOARDING STILL CHARGES: `get_deposit_address` (a genuine fresh on-chain slot) pops the

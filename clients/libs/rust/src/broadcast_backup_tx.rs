@@ -16,6 +16,15 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str, statechain
         }
     }
 
+    // A coin's exit is its TES-R ladder; there is no flat backup to broadcast. This legacy entry
+    // point survives only for rows that predate the ladder, and refuses by name for any coin that
+    // has one — broadcasting a flat rung over `F` would race the coin's own trigger.
+    if crate::tesr::load(client_config, wallet_name, statechain_id).await?.is_some() {
+        return Err(anyhow!(
+            "statechain id {statechain_id} exits through its TES-R ladder; there is no flat backup \
+             transaction to broadcast. Use the unilateral exit, which walks the ladder."
+        ));
+    }
     let backup_txs = get_backup_txs(&client_config.pool, &wallet.name, &statechain_id).await?;
     
     // If the user sends to himself, he will have two coins with same statechain_id

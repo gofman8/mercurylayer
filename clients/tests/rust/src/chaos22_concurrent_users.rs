@@ -156,9 +156,8 @@ pub fn classify(err: &anyhow::Error) -> Class {
         // Protocol LIMITS — finite by design, hit legitimately in a long chaos run:
         //  * replace-by-lower-timelock has finite depth. Each onward hop of a child costs one CSV rung
         //    (d0 24 -> 18 -> 12 -> 6 = d_floor on regtest); at the floor the coin must be exited or
-        //    re-anchored rather than re-sent. This is the same finite-budget property the un-laddered
-        //    shape's decrementing absolute-locktime backup chain has, and refusing at the floor is what
-        //    stops a hop from creating a state that cannot out-race the one it replaces.
+        //    re-anchored rather than re-sent. Refusing at the floor is what stops a hop from
+        //    creating a state that cannot out-race the one it replaces.
         ("at the floor", "csv-floor"),
         //  * a child too small to split into a viable piece + change (each grandchild must fund its own
         //    two tiers and clear dust). The refusal happens BEFORE anything is co-signed.
@@ -168,8 +167,8 @@ pub fn classify(err: &anyhow::Error) -> Class {
         //    recorded limitation of the tip lane, not a defect — and the tip is not stranded by it
         //    (pay FROM it with a spine batch, or exit it unilaterally). It is classified only
         //    because the refusal is by name, from `execute_ex`: the shape that must stay a BREACH is
-        //    a tip reaching the flat lane and dying on the ABSENCE of backup rows, which is what
-        //    this run measured 12 times.
+        //    a tip reaching the root lane and dying on the ABSENCE of a `tesr-` ladder, which is
+        //    what this run measured 12 times.
         ("is a spine tip", "tip-not-conveyable"),
         // Concurrency refusals — the system CORRECTLY refusing a racing action, not a bug:
         //  * another task spent/transferred the coin first, so it is no longer CONFIRMED. Refusing to
@@ -265,8 +264,8 @@ async fn refill_tokens(user: &UserHandle, n: usize, bitcoin: &Mutex<()>) {
 pub async fn execute() -> Result<()> {
     // Runs on the TES-R default. The DAG-deepening actions go through the in-ladder split
     // (`in_ladder_pay` for a laddered root, `child_in_ladder_pay` for a received child), and the
-    // clawback cheat broadcasts a SUPERSEDED ladder state instead of a stale absolute-locktime backup
-    // — the laddered-coin vector. The oracle's invariants (value conservation, single custody,
+    // clawback cheat broadcasts a SUPERSEDED ladder state — a coin has no absolute-locktime backup,
+    // so that is the only stale artefact a cheating sender can keep. The oracle's invariants (value conservation, single custody,
     // outpoint single-spender, no stuck coins) are coin-shape-agnostic and unchanged.
     let cfg = Cfg::from_env();
     let _ = std::fs::remove_dir_all(&cfg.run_dir);
@@ -663,17 +662,17 @@ async fn run_user(
                     let permit = sign_sem.acquire().await.unwrap();
                     let cc = me.wallet.client_config();
                     let name = me.wallet.wallet_name();
-                    // A received in-ladder CHILD has no statechain/backup rows, so
+                    // A received in-ladder CHILD has no `tesr-` root ladder, so
                     // `transfer_sender::execute` cannot move it — it goes through `child_retransfer`
                     // (a fresh lower-CSV state + the replaced state disclosed). `wallet.transfer`
                     // dispatches on exactly that, so route children through it.
                     // [#145] …and a SPINE TIP is the same case, for the same reason. This arm named
                     // only children because tips did not exist when it was written; a tip has no
-                    // flat backup chain either, so `execute` cannot move it. Routing it through
+                    // `tesr-` root ladder either, so `execute` cannot move it. Routing it through
                     // `wallet.transfer` gets the dispatch — which refuses a whole-tip handover by
                     // name, because the spine-tip conveyance builder is not landed. A NAMED refusal
                     // is the correct outcome here and the classifier knows it; what was wrong was
-                    // reaching the flat lane at all and dying on an absence.
+                    // reaching the root lane at all and dying on an absence.
                     let is_child = mercuryrustlib::tesr::load_child(cc, name, &id)
                         .await
                         .ok()
@@ -717,9 +716,9 @@ async fn run_user(
                     refill_tokens(&me, 4, &bitcoin).await;
                 }
             }
-            // exit: prefer a deposit-ROOT coin (flat, never split/transferred) — the shallow DAG case.
+            // exit: prefer a deposit-ROOT coin (never split/transferred) — the shallow DAG case.
             // exit_deep: prefer an OFF-CHAIN sub-coin — a valid unilateral exit at a DAG interior/leaf,
-            // which broadcasts the branch chain then the backup. Both record the funding outpoint so
+            // which walks the child's exit chain. Both record the funding outpoint so
             // the oracle can audit on-chain that it was spent by the legit exit (and by nobody else).
             "exit" | "exit_deep" => {
                 let coins = me.wallet.list_coins().await.unwrap_or_default();

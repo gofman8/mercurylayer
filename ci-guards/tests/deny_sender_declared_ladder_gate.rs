@@ -2,9 +2,17 @@
 //! three fields the sender fills in.**
 //!
 //! Neither JS client can verify a TES-R ladder, so both refuse laddered coins and fall through to the
-//! un-laddered census `num_sigs == backup_transactions.length`. That census is sound for an
-//! un-laddered coin and worthless for a laddered one — a laddered coin's tiers each consume a
-//! co-sign slot, so exact equality can only hold if `num_sigs` is under-reported.
+//! flat census `num_sigs == backup_transactions.length`. That census was sound for the un-laddered
+//! coin of the two-shape era and is worthless for a laddered one — a laddered coin's tiers each
+//! consume a co-sign slot, so exact equality can only hold if `num_sigs` is under-reported.
+//!
+//! [ONE COIN SHAPE] There is no un-laddered coin any more. Every coin's ladder `T, X_0, S_0` is
+//! signed at the first mempool sighting of its deposit, so a conformant coordinator reports
+//! `num_sigs >= 3` for every coin; every conformant transfer conveys `backup_transactions: []` under
+//! `protocol_version` 2 or 4 — the Rust receiver admits exactly `ADMISSIBLE_PROTOCOL_VERSIONS =
+//! [2, 4]` and refuses shape 0 by name — so the flat census can never be satisfied by an honest
+//! message. It survives in the JS only as the legacy fall-through, which makes the gate above it MORE
+//! load-bearing, not less: the only message that reaches the census is a fabricated one.
 //!
 //! The gate deciding which world you are in read `protocol_version`, `tesr_ladder` and
 //! `child_tesr_bundle`. **All three are written by the sender.** A sender declaring version 0 with
@@ -13,8 +21,9 @@
 //! CHEAPEST route in the whole trust model, and the corpus had them filed as *exempt* ("they refuse
 //! laddered coins outright").
 //!
-//! It is also the identical shape the Rust receiver already had to close with
-//! `MIN_PREPAY_PROTOCOL_VERSION`: a version floor a sender can duck by declaring a lower version.
+//! It is also the identical shape the Rust receiver had to close — first with a version floor
+//! (`MIN_PREPAY_PROTOCOL_VERSION`, which a sender could duck by declaring a lower version) and now
+//! with the closed set `ADMISSIBLE_PROTOCOL_VERSIONS`, which this file pins on the Rust side too.
 //!
 //! # What replaced it
 //!
@@ -507,6 +516,23 @@ fn the_wire_field_names_are_still_what_the_js_reads() {
 
     let v = wire_key_violations(&read(PAYLOAD), &keys);
     assert!(v.is_empty(), "{PAYLOAD}:\n{}", v.join("\n\n"));
+}
+
+/// [ONE COIN SHAPE] THE PREMISE, pinned on the Rust side. Shape 0 — `protocol_version` 0, no
+/// ladder, a counted flat chain — is not an admissible message shape: the Rust receiver admits
+/// exactly `[2, 4]`. If it ever re-admits 0, the flat census in the JS clients is once again the
+/// census of a conformant transfer and everything this file says about "the only message that
+/// reaches the census is a fabricated one" stops being true — re-read the whole guard then.
+#[test]
+fn the_rust_receiver_admits_no_shape_zero() {
+    const RECEIVER: &str = "clients/libs/rust/src/transfer_receiver.rs";
+    let src = strip_rust(&read(RECEIVER));
+    assert!(
+        src.contains("ADMISSIBLE_PROTOCOL_VERSIONS: [u32; 2] = [2, 4];"),
+        "{RECEIVER} no longer declares `ADMISSIBLE_PROTOCOL_VERSIONS: [u32; 2] = [2, 4];` in CODE. \
+         Either shape 0 (the un-laddered flat chain) is admissible again, or a new shape was added; \
+         both change what the JS flat census is the census OF, and this guard's premise with it."
+    );
 }
 
 /// THE BOUNDS THEMSELVES, asserted rather than assumed.

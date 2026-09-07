@@ -22,12 +22,13 @@
 //! * **[C1] the deadline itself was still computed silently.** F3 was hardened at the SHELL (the
 //!   carrier enumeration) but not at the load-bearing INPUT. `deposit_anchored_exit_deadline` was
 //!   built entirely of `.ok()?`, so an unreachable SE config, an unreadable chain lookup or a
-//!   missing deposit-history entry each produced the same `None` a flat coin produces — and `None`
-//!   means "no deadline", so `auto_exit_due` SKIPPED the coin. The watcher could still conclude
-//!   "nothing is due" from a total inability to tell. PART C drives a REAL uncomputable deadline (a
-//!   branch whose root spends an outpoint that is not on-chain) and proves the coin is reported
-//!   BLIND through the same `WatchtowerBlind` + retained-fault machinery — while a genuinely
-//!   deadline-free flat coin (C1's control) stays quiet.
+//!   missing deposit-history entry each produced the same `None` a branch-free coin produces — and
+//!   `None` means "no deadline", so `auto_exit_due` SKIPPED the coin. The watcher could still
+//!   conclude "nothing is due" from a total inability to tell. PART C drives a REAL uncomputable
+//!   deadline (a branch whose root spends an outpoint that is not on-chain) and proves the coin is
+//!   reported BLIND through the same `WatchtowerBlind` + retained-fault machinery — while a
+//!   genuinely deadline-free coin (C1's control: a fresh deposit, LADDERED at first sight, with no
+//!   flat backup, no locktime and no branch) stays quiet.
 //!
 //! Run: SDK_E2E=72 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 
@@ -300,29 +301,50 @@ pub async fn execute() -> Result<()> {
         .and_then(|c| c.statechain_id.clone())
         .ok_or(anyhow!("C: no confirmed coin"))?;
 
-    // C1. CONTROL — the "genuinely no deadline" shape. A flat on-chain coin has no exit branch, so
-    //     no ancestor can race it. `None` here is a real answer and the pass must stay QUIET; if
-    //     this half regressed into an alert, the fix would be worthless (every wallet would cry
-    //     wolf and the signal would be ignored).
+    // C1. CONTROL — the "genuinely no deadline" shape. A fresh deposit is LADDERED at first sight
+    //     of `F` (there is no flat `tx1` any more): it has no exit branch, so no ancestor can race
+    //     it; it has no flat backup row and no `locktime`, so nothing on it matures on its own. Its
+    //     exit material is the tier chain, and the estimate prices THAT — with `wait_blocks: 0`,
+    //     because an idle ladder never ages. `None` here is a real answer and the pass must stay
+    //     QUIET; if this half regressed into an alert, the fix would be worthless (every wallet
+    //     would cry wolf and the signal would be ignored).
+    let cbundle = mercuryrustlib::tesr::load(&cc, "sdk72_carol", &csid)
+        .await?
+        .ok_or(anyhow!("C1: carol's deposit was not laddered — it has no exit material at all"))?;
+    assert_eq!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk72_carol", &csid)
+            .await?
+            .map_or(0, |rows| rows.len()),
+        0,
+        "C1: a laddered deposit holds ZERO flat backup rows"
+    );
     let est = carol.estimate_exit_cost(&csid).await?;
-    assert_eq!(est.branch_txs, 0, "C1: a fresh deposit is flat — no exit branch");
-    assert!(est.exit_deadline_block.is_none(), "C1: a flat coin has no exit deadline");
+    assert_eq!(est.branch_txs, 0, "C1: a fresh deposit is on-chain-rooted — no exit branch");
+    assert!(est.exit_deadline_block.is_none(), "C1: a laddered coin has no exit deadline");
     assert!(
         !est.deadline_is_unknown(),
-        "C1: a flat coin's absent deadline is SAFE, not blind — it must not be reported as blindness"
+        "C1: a laddered coin's absent deadline is SAFE, not blind — it must not be reported as \
+         blindness: {:?}",
+        est.exit_deadline_blind
+    );
+    assert_eq!(est.wait_blocks, 0, "C1: nothing on a laddered coin matures on its own");
+    assert!(
+        est.backup_vbytes > 0,
+        "C1: the estimate must price the ladder's own tiers ({} of them), not a missing backup row",
+        cbundle.exit_tiers().len()
     );
     let quiet = carol
         .auto_exit_due(288)
         .await
-        .map_err(|e| anyhow!("C1: a wallet of flat coins is genuinely idle, not blind: {e}"))?;
-    assert!(quiet.is_empty(), "C1: nothing is due on a fresh flat deposit");
+        .map_err(|e| anyhow!("C1: a wallet of laddered coins is genuinely idle, not blind: {e}"))?;
+    assert!(quiet.is_empty(), "C1: nothing is due on a fresh laddered deposit");
     assert!(
         !carol.is_watchtower_blind().await,
         "C1: a verified-idle pass retains no fault: {:?}",
         carol.watchtower_faults().await
     );
     let _ = drain(&mut crx);
-    println!("SDK72 - C1 control: a flat coin's absent deadline stays quiet (no false alarm)");
+    println!("SDK72 - C1 control: a laddered coin's absent deadline stays quiet (no false alarm)");
 
     // C2. THE FAULT. Give the coin an exit branch whose ROOT spends a funding outpoint that is not
     //     on-chain — the shape of every real cause (SE config unreachable, electrum down, deposit
@@ -331,26 +353,25 @@ pub async fn execute() -> Result<()> {
     {
         use electrum_client::bitcoin::{consensus, Transaction, Txid};
         use std::str::FromStr;
-        let real = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk72_carol", &csid)
-            .await?;
-        let latest = real
-            .iter()
-            .max_by_key(|b| b.tx_n)
-            .ok_or(anyhow!("C2: no backup tx to build a branch from"))?;
-        let mut tx: Transaction = consensus::deserialize(&hex::decode(&latest.tx)?)?;
+        // There is no backup row to build the branch from (C1 asserted zero), so the well-formed
+        // transaction is the ladder's own signed trigger — the one spend of `F` the coin holds.
+        let mut tx: Transaction =
+            consensus::deserialize(&hex::decode(&cbundle.trigger.signed_tx)?)?;
         // A valid, well-formed transaction (so vsize accounting still works and the failure is
         // ISOLATED to the chain lookup) that spends a funding outpoint nobody has ever seen.
         tx.input[0].previous_output.txid = Txid::from_str(
             "dead00000000000000000000000000000000000000000000000000000000beef",
         )?;
+        // The row's MuSig fields are never read on this path (only `tx` is deserialised and its
+        // root input resolved), so they carry no material — a branch row is a legacy shape here.
         let fake = mercurylib::wallet::BackupTx {
             tx_n: 1,
             tx: hex::encode(consensus::serialize(&tx)),
-            client_public_nonce: latest.client_public_nonce.clone(),
-            server_public_nonce: latest.server_public_nonce.clone(),
-            client_public_key: latest.client_public_key.clone(),
-            server_public_key: latest.server_public_key.clone(),
-            blinding_factor: latest.blinding_factor.clone(),
+            client_public_nonce: String::new(),
+            server_public_nonce: String::new(),
+            client_public_key: String::new(),
+            server_public_key: String::new(),
+            blinding_factor: String::new(),
             rgb_consignment: None,
             rgb_blinding: None,
         };
@@ -369,7 +390,7 @@ pub async fn execute() -> Result<()> {
     assert_eq!(est.branch_txs, 1, "C3: the coin now has an exit branch, so a deadline exists");
     assert_eq!(
         est.exit_deadline_block, None,
-        "C3: same Option value as the flat coin in C1 — proving the old encoding could not tell \
+        "C3: same Option value as the laddered coin in C1 — proving the old encoding could not tell \
          'no deadline' from 'I could not compute one'"
     );
     assert!(
@@ -420,6 +441,15 @@ pub async fn execute() -> Result<()> {
     // C6. The OTHER consumer of the same deadline fails closed too: a keyless watch bundle that
     //     silently omitted this coin would hand a watchtower a bundle that protects nothing, and
     //     the export would still report success.
+    //
+    //     This coin is LADDERED (C1), so the export has a second lane it could take for it — the
+    //     event-trigger entry (`deadline_block: u32::MAX`, watch `F`). `export_watch_bundle` runs
+    //     `estimate_exit_cost` and checks `exit_deadline_blind` BEFORE that lane on purpose: the
+    //     ladder arm needs no backup row any more (the estimate prices the tiers), so nothing in it
+    //     would trip on this coin, and handling laddered coins first would let an UNCOMPUTABLE
+    //     deadline slip into the bundle as a healthy event entry — the silent omission the rule
+    //     exists to prevent, reintroduced by the fix for a different silent omission. This is the
+    //     assertion that pins the order.
     let bundle_out = carol.export_watch_bundle().await;
     assert!(
         bundle_out.is_err(),
@@ -427,8 +457,9 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK72 - C6 export_watch_bundle refused: {}", bundle_out.unwrap_err());
 
-    // C7. RECOVERY — not a one-way latch. Restore the coin to its genuinely branch-free shape; the
-    //     next pass must go quiet again and CLEAR the retained fault.
+    // C7. RECOVERY — not a one-way latch. Restore the coin to its genuinely branch-free shape (an
+    //     empty `branch-` row reads as a verified absence, exactly like no row); the next pass must
+    //     go quiet again and CLEAR the retained fault.
     mercuryrustlib::sqlite_manager::insert_or_update_backup_txs(
         &cc.pool,
         "sdk72_carol",
@@ -439,7 +470,7 @@ pub async fn execute() -> Result<()> {
     let quiet = carol
         .auto_exit_due(288)
         .await
-        .map_err(|e| anyhow!("C7: the pass must succeed once the coin is flat again: {e}"))?;
+        .map_err(|e| anyhow!("C7: the pass must succeed once the coin is branch-free again: {e}"))?;
     assert!(quiet.is_empty(), "C7: nothing due");
     assert!(
         !carol.is_watchtower_blind().await,

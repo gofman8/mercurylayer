@@ -152,9 +152,8 @@ pub async fn execute() -> Result<()> {
         "a resting laddered coin publishes NOTHING — its funding outpoint F must be unspent"
     );
 
-    // Time passes: mine 300 blocks. Under the pre-TES-R design this ate 300 blocks of the coin's
-    // absolute-locktime headroom; under TES-R the tiers are RELATIVE (CSV) and un-broadcast, so the
-    // coin does not age.
+    // Time passes: mine 300 blocks. The tiers are RELATIVE (CSV) and un-broadcast, so the coin
+    // does not age — there is no absolute-locktime backup to run down.
     bitcoin_core::generatetoaddress(300, &core)?;
     // The electrum index can lag bitcoind by a moment; wait for it to see the new tip.
     let mut tip_aged = tip(&cc)?;
@@ -217,7 +216,7 @@ pub async fn execute() -> Result<()> {
     let new_coin = new_coin.ok_or_else(|| anyhow!("refreshed coin did not confirm"))?;
 
     // The re-anchored coin is a full-fledged laddered coin: claim() established its OWN fresh
-    // ladder over the NEW funding outpoint. (There is no "headroom" to restore under TES-R — the old chain is
+    // ladder over the NEW funding outpoint. (There is no "headroom" to restore — the old ladder is
     // simply gone with the old outpoint, and this one starts from scratch.)
     let bundle_new = wait_ladder(&cc, &alice, "sdk30_alice", &res.new_statechain_id).await?;
     assert_ne!(
@@ -236,8 +235,8 @@ pub async fn execute() -> Result<()> {
     );
 
     // The old coin is spent on-chain (WITHDRAWN); the refresh tx is confirmed and spends coin0's
-    // funding outpoint — every exit right rooted at the old F (its trigger/tiers AND its
-    // absolute-locktime backup tx) is now a double-spend of a spent input (dead).
+    // funding outpoint — every exit right rooted at the old F (its trigger and tiers) is now a
+    // double-spend of a spent input (dead).
     let old = coin_by_id(&cc, "sdk30_alice", &id0).await?;
     assert_eq!(old.status, CoinStatus::WITHDRAWN, "the old coin is spent on-chain");
     let rtxid = res.refresh_txid.parse::<electrum_client::bitcoin::Txid>()?;

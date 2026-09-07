@@ -52,23 +52,27 @@
 //! across ten passes her tower never touches it and `S` never reaches the chain — while bob's tower,
 //! driving the same `X_m` output, lands `S'`.
 //!
-//! The fix under test is therefore not a third enumerated lane: `defend_ladders` now keys on
-//! LIVENESS as an ALLOWLIST — it broadcasts only for a coin this wallet still holds CONFIRMED —
-//! which is evidence the tower checks for itself and which every conveyance lane, present or future,
-//! must invalidate to hand value away at all.
+//! The fix under test is therefore not a third enumerated lane: `defend_ladders` keys on LIVENESS
+//! as an ALLOWLIST (L1 = `is_live_for_defence`: it broadcasts only for a coin this wallet still
+//! holds IN_MEMPOOL, UNCONFIRMED or CONFIRMED — a deposit-time ladder exists from the first mempool
+//! sighting and is defended from that block) — which is evidence the tower checks for itself and
+//! which every conveyance lane, present or future, must invalidate to hand value away at all. A
+//! laddered coin has no flat backup and no height deadline, so this event-driven pass is the ONLY
+//! thing that defends it; there is no near-deadline loop to fall back on.
 //!
 //! ## PARTS C AND D — [D1 / A2] the key the filter reads must be DURABLE
 //!
 //! Parts A and B both assert AFTER the conveyance returned, and that is where they stop proving
-//! anything: L1 reads `coin.status` FROM THE WALLET DB, and the whole-coin lane only ever set it in
-//! MEMORY (`create_backup_transactions`), persisting at `update_wallet` — the last statement of
-//! `execute_ex`, long after `transfer/update_msg` handed the recipient a co-signed `S'`. Part C
-//! RACES a real, lethal `defend_ladders` against `transfer_colored_carrier` to close that. Part D
-//! does the same one level down, on the coloured CHILD re-transfer, where the sender's coin stays
-//! CONFIRMED for the entire hop and the `ctesr-` row's CONTENT is what decides what gets broadcast.
-//! Both races are gated on the SE's own `num_sigs` counter — a marker independent of the fix — and
-//! both are backed by a millisecond-resolution witness of the exact join L1 performs. See the long
-//! note above `se_num_sigs` for why each of those three properties is load-bearing.
+//! anything: L1 reads `coin.status` FROM THE WALLET DB, and the whole-coin lane used to set it only
+//! in MEMORY (in the since-deleted per-hop backup builder), persisting at `update_wallet` — the
+//! last statement of `execute_ex`, long after `transfer/update_msg` handed the recipient a
+//! co-signed `S'`. `execute_ex` now persists IN_TRANSFER before any co-sign. Part C RACES a real,
+//! lethal `defend_ladders` against `transfer_colored_carrier` to prove that. Part D does the same
+//! one level down, on the coloured CHILD re-transfer, where the sender's coin stays CONFIRMED for
+//! the entire hop and the `ctesr-` row's CONTENT is what decides what gets broadcast. Both races
+//! are gated on the SE's own `num_sigs` counter — a marker independent of the fix — and both are
+//! backed by a millisecond-resolution witness of the exact join L1 performs. See the long note
+//! above `se_num_sigs` for why each of those three properties is load-bearing.
 //!
 //! Run: SDK_E2E=79 ML_NETWORK=regtest cargo run   (regtest + lockbox + RGB proxy up)
 //! Select parts with SDK79_PARTS (default "abcd"), e.g. SDK79_PARTS=cd for the two race cases.
@@ -95,6 +99,11 @@ const SUPPLY_C: u64 = 800;
 /// while a watchtower pass races that hop.
 const SUPPLY_D: u64 = 1_000;
 const PAY_D: u64 = 250;
+/// The widest near-deadline margin that cannot overflow `tip + margin` inside `auto_exit_due`. A
+/// laddered coin — root or leaf — has no height deadline, so the pass must select NOTHING at this
+/// margin; a margin this wide is exactly what would have force-exited every leaf under the old
+/// flat-backup calendar.
+const NO_CALENDAR_MARGIN: u32 = u32::MAX / 2;
 
 /// Regtest TES-R schedule, read from the protocol rather than copied: `X_0` matures `ext_csv(0)`
 /// blocks after the trigger confirms, and the sender's own `S_0` a further `state_csv(0)` after
@@ -108,6 +117,15 @@ fn sender_exit_blocks() -> u32 {
 async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
     crate::utils::handle_token_response(cc, &token).await
+}
+
+/// L1, mirrored: the SDK's `wallet::is_live_for_defence` (crate-private) admits a coin to
+/// `defend_ladders`, `unilateral_exit` and `export_watch_bundle` while it is IN_MEMPOOL,
+/// UNCONFIRMED or CONFIRMED. Every "the tower must stand down" assertion below is made against
+/// exactly this predicate, so a conveyance that leaves a coin in ANY live status is caught — not
+/// only one that leaves it CONFIRMED.
+fn live_for_defence(s: &CoinStatus) -> bool {
+    matches!(s, CoinStatus::IN_MEMPOOL | CoinStatus::UNCONFIRMED | CoinStatus::CONFIRMED)
 }
 
 fn onchain(cc: &ClientConfig, txid: &str) -> Option<electrum_client::bitcoin::Transaction> {
@@ -555,12 +573,11 @@ async fn part_ab(
          denylist would ALSO have skipped — Part B would then prove nothing. Re-derive this test \
          against whatever status the conveyance now leaves."
     );
-    assert_ne!(
-        alice_status,
-        CoinStatus::CONFIRMED,
-        "a conveyed coin must not still read CONFIRMED — that is the evidence the liveness \
-         allowlist keys on, and if a conveyance ever left it CONFIRMED the tower would be armed \
-         against its own recipient again"
+    assert!(
+        !live_for_defence(&alice_status),
+        "a conveyed coin must not still read LIVE ({alice_status}) — that is the evidence the \
+         liveness allowlist keys on, and if a conveyance ever left it IN_MEMPOOL/UNCONFIRMED/\
+         CONFIRMED the tower would be armed against its own recipient again"
     );
     println!(
         "SDK79 - (B3) alice still holds the whole co-signed chain T -> X_0 -> S(alice) {} for a \
@@ -656,9 +673,9 @@ async fn part_ab(
         "SDK79 - PASS: both routes closed. PART A — an in-ladder split's sender names SP live and \
          her tower will not race the child she funded. PART B — a WHOLE-carrier conveyance leaves \
          the sender holding a complete co-signed chain over a coin that is neither WITHDRAWN nor \
-         WITHDRAWING, and the LIVENESS ALLOWLIST (broadcast only for a coin still held CONFIRMED) \
-         stops her tower from destroying the recipient's allocation without the filter having to \
-         know the lane existed."
+         WITHDRAWING, and the LIVENESS ALLOWLIST (broadcast only for a coin still held \
+         IN_MEMPOOL/UNCONFIRMED/CONFIRMED) stops her tower from destroying the recipient's \
+         allocation without the filter having to know the lane existed."
     );
     Ok(())
 }
@@ -667,18 +684,20 @@ async fn part_ab(
 // PARTS C AND D — [D1 / A2] THE KEY THE FILTER READS MUST BE **DURABLE**
 //
 // Parts A and B established the liveness ALLOWLIST: `defend_ladders` broadcasts only for a coin this
-// wallet still holds CONFIRMED. Both of them assert it AFTER the conveyance has returned, and that
-// is exactly where they stop proving anything — because the filter reads `coin.status` **from the
-// wallet DB**, and until this change the only thing that moved a conveyed coin out of CONFIRMED was
-// `transfer_sender::create_backup_transactions`, which sets the field IN MEMORY on a copy that is
-// not written back until `update_wallet` at the very end of `execute_ex`. So on EVERY whole-coin
-// conveyance — including `transfer_colored_carrier` — there was a live window in which the recipient
-// already held a co-signed, receiver-paying `S'` and a concurrent watchtower pass read a STALE
-// CONFIRMED off disk and was ADMITTED. The filter was keyed on precisely the field that had not yet
-// been written. The child re-transfer lane is the same shape one level down: the sender's child coin
-// stays CONFIRMED for the whole hop (`transfer_colored_child` marks it WITHDRAWN only afterwards),
-// so what the tower broadcasts is decided by the `ctesr-` row's CONTENT — which still named the
-// state being superseded, because the row was written AFTER the conveyance rather than before it.
+// wallet still holds LIVE (`is_live_for_defence`: IN_MEMPOOL, UNCONFIRMED or CONFIRMED). Both of
+// them assert it AFTER the conveyance has returned, and that is exactly where they stop proving
+// anything — because the filter reads `coin.status` **from the wallet DB**, and the whole-coin lane
+// used to move a conveyed coin out of CONFIRMED only IN MEMORY (in the since-deleted per-hop
+// backup builder), on a copy that was not written back until `update_wallet` at the very end of
+// `execute_ex`. So on EVERY whole-coin conveyance — including `transfer_colored_carrier` — there
+// was a live window in which the recipient already held a co-signed, receiver-paying `S'` and a
+// concurrent watchtower pass read a STALE CONFIRMED off disk and was ADMITTED. The filter was keyed
+// on precisely the field that had not yet been written; `execute_ex` now persists IN_TRANSFER
+// before any co-sign. The child re-transfer lane is the same shape one level down: the sender's
+// child coin stays CONFIRMED for the whole hop (`transfer_colored_child` marks it WITHDRAWN only
+// afterwards), so what the tower broadcasts is decided by the `ctesr-` row's CONTENT — which used
+// to name the state being superseded, because the row was written AFTER the conveyance rather
+// than before it.
 //
 // ## HOW THESE TWO PARTS ARE MADE NON-VACUOUS
 //
@@ -703,7 +722,8 @@ async fn part_ab(
 //
 // A second, cheaper witness samples the two facts the filter itself joins — the SE's `num_sigs` and
 // the coin's status AS READ FROM THE WALLET DB — every millisecond throughout the call. A sample
-// showing (superseding state co-signed) AND (disk still says CONFIRMED) IS an admitted watchtower
+// showing (superseding state co-signed) AND (disk still says LIVE — IN_MEMPOOL, UNCONFIRMED or
+// CONFIRMED) IS an admitted watchtower
 // pass, whether or not one happened to run at that microsecond. Its `post_cosign` counter is the
 // non-vacuity guard: if the witness never observed the co-signed window at all, the test says so and
 // fails rather than reporting green.
@@ -731,8 +751,9 @@ struct Witness {
     samples: Arc<AtomicU32>,
     /// Samples taken after the SE showed the superseding co-sign.
     post_cosign: Arc<AtomicU32>,
-    /// Of those, the ones where the WALLET DB still said CONFIRMED — i.e. a watchtower pass that
-    /// would have been admitted while a counterparty could already be handed rival material.
+    /// Of those, the ones where the WALLET DB still said the coin was LIVE (`live_for_defence`) —
+    /// i.e. a watchtower pass that would have been admitted while a counterparty could already be
+    /// handed rival material.
     admitted: Arc<AtomicU32>,
 }
 
@@ -776,7 +797,7 @@ fn spawn_witness(
             me.samples.fetch_add(1, Ordering::SeqCst);
             if ns > baseline_sigs {
                 me.post_cosign.fetch_add(1, Ordering::SeqCst);
-                if status == Some(CoinStatus::CONFIRMED) {
+                if status.as_ref().is_some_and(live_for_defence) {
                     me.admitted.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -1012,7 +1033,8 @@ async fn part_c(
     assert_eq!(
         admitted, 0,
         "THE A2 DEFECT: in {admitted} of {post_cosign} samples the SE had already co-signed the \
-         receiver-paying S' for {carrier_c} while this wallet's DB still read CONFIRMED for it. \
+         receiver-paying S' for {carrier_c} while this wallet's DB still read it as LIVE \
+         (IN_MEMPOOL/UNCONFIRMED/CONFIRMED). \
          That is precisely the join `defend_ladders`' liveness allowlist performs, so each of those \
          samples is a watchtower pass that would have been ADMITTED to broadcast the sender's \
          retained state over the same X_0 output the recipient's S' spends — destroying the whole \
@@ -1042,11 +1064,10 @@ async fn part_c(
         .find(|c| c.statechain_id.as_deref() == Some(carrier_c.as_str()) && c.duplicate_index == 0)
         .map(|c| c.status)
         .ok_or_else(|| anyhow!("alice's conveyed carrier coin vanished"))?;
-    assert_ne!(
-        status,
-        CoinStatus::CONFIRMED,
-        "after the conveyance the coin must not read CONFIRMED on disk — that is the evidence the \
-         allowlist keys on"
+    assert!(
+        !live_for_defence(&status),
+        "after the conveyance the coin must not read LIVE on disk ({status}) — that is the \
+         evidence the allowlist keys on"
     );
     println!(
         "SDK79 - (C3/C4) {post_cosign} post-co-sign samples, ZERO admitted; {passes} concurrent \
@@ -1254,6 +1275,50 @@ async fn part_d(
          PART D stops testing the window it exists for and must be re-derived, not deleted"
     );
 
+    // ---- D2b. A LEAF HAS NO CALENDAR — the near-deadline pass must select NOTHING for it. --------
+    //
+    // The child's parent is a laddered coin with NO flat backup, so no ancestor holds a matured
+    // spend of `F` and there is no height at which this child's race is lost on its own. The leaf
+    // loop that used to force-exit a child ahead of its parent's flat-backup calendar
+    // (`LeafExitForced`) went with that calendar, so `auto_exit_due` at the widest margin there is
+    // must find nothing due, broadcast nothing, and leave the child exactly as booked. The
+    // event-driven child loop D3 races is therefore the ONLY thing that ever defends this coin —
+    // which is what makes the durable liveness key the whole of its protection.
+    let forced = bob.auto_exit_due(NO_CALENDAR_MARGIN).await.map_err(|e| {
+        anyhow!(
+            "(D2b) the near-deadline pass reported itself BLIND on bob's wallet instead of finding \
+             nothing due: {e:#}"
+        )
+    })?;
+    assert!(
+        forced.is_empty(),
+        "(D2b) the near-deadline pass force-exited {forced:?} at margin {NO_CALENDAR_MARGIN}: a \
+         leaf has no height deadline, so nothing in this wallet can be due at any margin"
+    );
+    assert!(
+        onchain(cc, &parent_t).is_none() && onchain(cc, &parent_x).is_none(),
+        "(D2b) the near-deadline pass must broadcast NOTHING for a leaf: the parent trigger \
+         {parent_t} / extension {parent_x} must still be off-chain"
+    );
+    assert_eq!(
+        mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk79_bob")
+            .await?
+            .coins
+            .into_iter()
+            .find(|c| c.statechain_id.as_deref() == Some(piece_sid.as_str()) && c.duplicate_index == 0)
+            .map(|c| c.status)
+            .ok_or_else(|| anyhow!("bob's child coin vanished after the near-deadline pass"))?,
+        CoinStatus::CONFIRMED,
+        "(D2b) a leaf that nothing can schedule must still be booked CONFIRMED after the pass"
+    );
+    println!(
+        "SDK79 - (D2b) the near-deadline pass at margin {NO_CALENDAR_MARGIN} selected nothing for \
+         bob's leaf {piece_sid}: no height deadline exists, T {} and X_m {} are still off-chain, \
+         and the coin is still CONFIRMED — only the event-driven child loop defends it",
+        &parent_t[..12],
+        &parent_x[..12]
+    );
+
     // ---- D3. THE RACE. ---------------------------------------------------------------------------
     let baseline = se_num_sigs(cc, &piece_sid).await?;
     let (witness, wh) = spawn_witness("sdk79_bob", &piece_sid, baseline);
@@ -1291,7 +1356,8 @@ async fn part_d(
     assert_eq!(
         admitted, 0,
         "THE D1 DEFECT ON THE CHILD LANE: in {admitted} of {post_cosign} samples the SE had already \
-         co-signed S'_child for {piece_sid} while bob's DB still read CONFIRMED for the child coin. \
+         co-signed S'_child for {piece_sid} while bob's DB still read the child coin as LIVE \
+         (IN_MEMPOOL/UNCONFIRMED/CONFIRMED). \
          `transfer_colored_child` does not mark it WITHDRAWN until it returns, so every one of those \
          samples is a watchtower pass the allowlist would have ADMITTED — driving a `ctesr-` row \
          over a state that is being superseded, which rivals carol's S'_child over ext_child's \
@@ -1353,7 +1419,10 @@ async fn part_d(
         .find(|c| c.statechain_id.as_deref() == Some(piece_sid.as_str()) && c.duplicate_index == 0)
         .map(|c| c.status)
         .ok_or_else(|| anyhow!("bob's child coin vanished after the hop"))?;
-    assert_ne!(after_status, CoinStatus::CONFIRMED, "the re-transferred child must not read CONFIRMED");
+    assert!(
+        !live_for_defence(&after_status),
+        "the re-transferred child must not read LIVE ({after_status}) — the allowlist would admit it"
+    );
     println!(
         "SDK79 - (D3/D4) {post_cosign} post-co-sign samples, ZERO admitted; {passes} concurrent \
          watchtower passes, none acted; X_m {} absent; bob's row now names carol's S'_child {} live \

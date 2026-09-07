@@ -1,33 +1,37 @@
 //! E2E (SSP value gate, audit [3]/[4]): the SSP's pre-payment value gate must read the TRUE value
 //! of a latched coin — never an attacker-supplied hint — BEFORE it pays a Lightning invoice. The
-//! two load-bearing primitives are exercised directly over the live SE + RGB stack (no RLN needed,
-//! since the bug is in what value the gate *reads*, not in Lightning). Runs on the V2 (TES-R)
-//! protocol, which is where the production gate lives (`SspService::execute_pay`, ssp.rs):
+//! load-bearing primitive (`peek_pending_transfers`) is exercised directly over the live SE + RGB
+//! stack (no RLN needed, since the bug is in what value the gate *reads*, not in Lightning). Runs on
+//! the TES-R protocol, which is where the production gate lives (`SspService::execute_pay`, ssp.rs):
 //!
-//! [3] SATS: a non-exact payment out of a V2 (TES-R) coin is an IN-LADDER split — `transfer()`
-//!     auto-routes to `in_ladder_pay`, so the SSP is handed a CHILD bundle (protocol_version 3)
-//!     that has NO on-chain-rooted exit branch to read a value from. `peek_pending_transfers`
-//!     therefore proves the child with `verify_conveyed_child` (child pays THIS wallet's exit key,
-//!     parent + child are terminal, and each `num_sigs` matches its conveyed-ladder baseline, so no
-//!     hidden lower-CSV state exists) and reports `amount = child_state.out_value` — the value the
-//!     ladder CRYPTOGRAPHICALLY commits to, which OVERRIDES any branch-derived figure. It fails
-//!     CLOSED: any tamper/inflation makes `verify_conveyed_child` error, which sets
-//!     `ladder_census_ok = false` and leaves the amount un-overridden, so `check_latched_coins`
-//!     refuses. Here a LEGIT in-ladder child latched to the SSP is peeked: the census passes and the
-//!     census-bound amount equals the child's ladder-committed EXIT-REACHABLE value — the piece
-//!     nominal minus its own two exit tiers (each burns `committed_fee + P2A_VALUE`), which is what
-//!     the SSP can actually redeem and therefore what the gate must price against.
-//! [4] RGB: `validate_pending_token` derives the amount a pending consignment CRYPTOGRAPHICALLY
-//!     assigns to the coin (not the attacker-controlled envelope hint `env.a`), plus its contract
-//!     id — read-only, before any claim. Here a pending token transfer to the SSP is validated and
-//!     the derived (contract_id, amount) matches the real asset + amount; a smaller/wrong-asset coin
-//!     is therefore detectable BEFORE paying.
-//! [F1] The pre-payment predicate IS the claim predicate. Both `validate_pending_token` (pre-pay)
-//!     and `accept_incoming_tokens` (claim) call one shared implementation, so the gate cannot be
-//!     weaker than the check that later books the coin. Proved here by mutating ONLY the envelope
-//!     amount (the consignment bytes still validate cryptographically) and asserting the SSP's gate
-//!     REFUSES — previously it accepted, the SSP paid an irreversible invoice, and the same coin
-//!     then failed PERMANENT-INVALID at claim.
+//! [3] SATS: a non-exact payment out of a laddered coin is an IN-LADDER split — `transfer()`
+//!     auto-routes to `in_ladder_pay`, so the SSP is handed a CHILD bundle that has NO
+//!     on-chain-rooted exit branch to read a value from. `peek_pending_transfers` therefore proves
+//!     the child with `verify_conveyed_child` (child pays THIS wallet's exit key, parent + child are
+//!     terminal, and each `num_sigs` equals its `tiers + superseded` census — there is no flat term,
+//!     so no hidden lower-CSV state exists) and reports `amount = child_state.out_value` — the value
+//!     the ladder CRYPTOGRAPHICALLY commits to. It fails CLOSED: any tamper/inflation makes
+//!     `verify_conveyed_child` error, which sets `ladder_census_ok = false` and leaves the amount
+//!     un-overridden, so `check_latched_coins` refuses. Here a LEGIT in-ladder child latched to the
+//!     SSP is peeked: the census passes and the census-bound amount equals the child's
+//!     ladder-committed EXIT-REACHABLE value — the piece nominal minus its own two exit tiers (each
+//!     burns `committed_fee + P2A_VALUE`), which is what the SSP can actually redeem and therefore
+//!     what the gate must price against.
+//! [4] RGB: on the laddered lane a token piece reaches the SSP as a conveyed COLOURED CHILD (the
+//!     legacy flat coloured split is retired), and the peek surfaces its RGB material FROM THE
+//!     BUNDLE — there is no backup row for an envelope to ride on: the child's LEAF consignment
+//!     wrapped as the `{"c","a","s"}` envelope the SSP's validator reads, the outpoint it assigns
+//!     to (the child's own final-state payload output — the same one the claim path books), and
+//!     the child's five-tier witness chain [P3]; `branch_txs` empty; the census passed; `amount` =
+//!     the piece's census-bound exit value (TOKEN_PIECE_SATS minus its two coloured rungs). The
+//!     pre-pay gate proper is then run exactly as `SspService::execute_pay` runs it
+//!     (`validate_pending_token_ex` over that material, BEFORE any claim) and books 250 of the
+//!     invoiced contract. The claim afterwards books the same 250 from the consignment chain alone
+//!     (`colored_child_health`), never from a declared field.
+//! [F1] The pre-payment predicate cannot be weaker than the claim predicate: the envelope's
+//!     declared amount is only ever CROSS-CHECKED against what the consignment assigns, so a
+//!     mutated envelope (`a` = 251 over a chain that assigns 250) is refused by the very same
+//!     validator, before payment, as PERMANENT-INVALID.
 //!
 //! Run: SDK_E2E=37 ML_NETWORK=regtest cargo run
 
@@ -78,6 +82,20 @@ async fn wait_token_balance(w: &UtexoWallet, asset: &str, want: u64) -> Result<(
     }
     Err(anyhow!("balance of {asset} did not reach {want}"))
 }
+/// The fee rate of the wallet's COLOURED ROOT ladder for `asset` — the rate the piece's own two
+/// rungs are sized from, and therefore the one input to the census-bound value [4] expects.
+async fn colored_carrier_rate(cc: &ClientConfig, wallet_name: &str, asset: &str) -> Result<f64> {
+    let rec = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, wallet_name).await?;
+    for c in rec.coins.iter().filter(|c| c.status == CoinStatus::CONFIRMED && c.duplicate_index == 0) {
+        let Some(sid) = c.statechain_id.clone() else { continue };
+        if let Some(b) = mercuryrustlib::tesr::load(cc, wallet_name, &sid).await? {
+            if b.rgb.as_ref().is_some_and(|r| r.contract_id == asset) {
+                return Ok(b.fee_rate);
+            }
+        }
+    }
+    Err(anyhow!("{wallet_name} holds no COLOURED carrier of {asset} — the CTES-R lane is not on"))
+}
 async fn wait_carrier(cc: &ClientConfig, w: &UtexoWallet, name: &str, core: &str, asset: &str, units: u64) -> Result<()> {
     for _ in 0..60 {
         bitcoin_core::generatetoaddress(1, core)?;
@@ -94,9 +112,11 @@ async fn wait_carrier(cc: &ClientConfig, w: &UtexoWallet, name: &str, core: &str
 }
 
 pub async fn execute() -> Result<()> {
-    // Runs on the V2 (TES-R) default — no protocol pin. Alice's plain-sats deposit is therefore a
-    // LADDERED coin, so the non-exact payment in [3] below is an in-ladder split whose piece reaches
-    // the SSP as a conveyed CHILD bundle: exactly the shape the pre-pay value gate must census.
+    // Alice's plain-sats deposit is a LADDERED coin (every deposit is, at first sight), so the
+    // non-exact payment in [3] below is an in-ladder split whose piece reaches the SSP as a conveyed
+    // CHILD bundle: exactly the shape the pre-pay value gate must census. Both wallets opt into the
+    // COLOURED lane ([D30] it ships false): the token payment in [4] is a coloured in-ladder split,
+    // and the legacy flat coloured split a default wallet would take is retired.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -106,13 +126,32 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
-    let (alice, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk37_alice"), None).await?;
-    // The "SSP": a wallet that receives the latched coin. It never claims during the test, so the
-    // coin stays a PENDING transfer that the value gate must vet.
-    let (ssp, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk37_ssp"), None).await?;
+    let mut alice_cfg = SdkConfig::regtest("sdk37_alice");
+    alice_cfg.colored_ladder = true;
+    let (alice, _) = UtexoWallet::initialize(alice_cfg, None).await?;
+    // The "SSP": a wallet that receives the latched coin. It does not claim until each section has
+    // peeked, so the coin is a PENDING transfer that the value gate must vet.
+    let mut ssp_cfg = SdkConfig::regtest("sdk37_ssp");
+    ssp_cfg.colored_ladder = true;
+    let (ssp, _) = UtexoWallet::initialize(ssp_cfg, None).await?;
     let ssp_addr = ssp.get_utexo_address().await?;
 
-    // ===== [4] RGB: validate_pending_token derives the TRUE consignment value pre-claim ==========
+    // ===== [4] RGB: what the SSP can read about a pending TOKEN piece — and what it cannot ========
+    // On the laddered lane a token payment is a coloured IN-LADDER split (the legacy flat coloured
+    // split, whose `BackupTx.rgb_consignment` envelope this section used to validate, is RETIRED:
+    // `register_split_subcoins_n` refuses by name). The piece reaches the SSP as a conveyed
+    // COLOURED CHILD bundle, and `peek_pending_transfers` reports it fail-closed:
+    //   * `rgb_consignment: None` — no consignment envelope rides on a backup row, because there are
+    //     no backup rows. `SspService::execute_pay` reads exactly this field for an RGB invoice and
+    //     refuses by name ("carries no RGB consignment — refusing to pay an RGB invoice"), so no
+    //     attacker-supplied `env.a` hint can reach a value gate: there is no envelope to mutate.
+    //     That is [F1]'s property in its strongest form.
+    //   * `branch_txs` empty, and `child_witness_txids` = the child's own five-tier chain [P3] — the
+    //     witness list an envelope-free coloured pre-pay validator resolves against.
+    //   * `ladder_census_ok == true`, and `amount` = the piece's census-bound EXIT value, exactly as
+    //     [3] below proves for sats: TOKEN_PIECE_SATS minus the child's own two coloured rungs.
+    // The RGB amount itself is booked at claim from the consignment chain (`colored_child_health`),
+    // never from a sender-declared field — asserted at the end of this section.
     let rgb_fund = alice.get_token_funding_address().await?;
     bitcoin_core::sendtoaddress(600_000, &rgb_fund)?;
     bitcoin_core::generatetoaddress(3, &core)?;
@@ -120,121 +159,128 @@ pub async fn execute() -> Result<()> {
     add_tokens(&cc, &alice, 4).await?;
     let asset = alice.issue_token("VG", "Value Gate", 0, 1000).await?;
     wait_carrier(&cc, &alice, "sdk37_alice", &core, &asset, 1000).await?;
-    println!("SDK37 - alice issued 1000 {asset}");
+    // The coloured ladder is established by the claim pass that sees the booked allocation; give
+    // that pass a few more blocks if the carrier confirmed ahead of it.
+    let mut carrier_rate = None;
+    for _ in 0..30 {
+        if let Ok(rate) = colored_carrier_rate(&cc, "sdk37_alice", &asset).await {
+            carrier_rate = Some(rate);
+            break;
+        }
+        bitcoin_core::generatetoaddress(1, &core)?;
+        alice.claim().await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let carrier_rate = carrier_rate
+        .ok_or_else(|| anyhow!("alice's carrier of {asset} never got a COLOURED ladder — nothing below is on the lane it claims"))?;
+    println!("SDK37 - alice issued 1000 {asset} on a COLOURED carrier at {carrier_rate} sat/vB");
 
-    // alice sends 250 to the SSP but the SSP does NOT claim — it stays pending.
+    // alice sends 250 to the SSP but the SSP does NOT claim yet — it stays pending.
     let r = alice.transfer_tokens(&asset, &ssp_addr, 250).await?;
+    assert!(r.used_split, "a token payment is a coloured in-ladder split");
     let pending_id = r.coins[0].statechain_id.clone();
-    // Give the SE relay a moment; do NOT call ssp.claim().
+    // Give the SE relay a moment; do NOT call ssp.claim() before the peek.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // The SSP peeks the pending transfer and validates its consignment BEFORE acting.
+    // The SSP peeks the pending transfer BEFORE acting.
     let pend = mercuryrustlib::transfer_receiver::peek_pending_transfers(ssp.client_config(), ssp.wallet_name()).await?;
     let p = pend.iter().find(|p| p.statechain_id == pending_id)
         .ok_or_else(|| anyhow!("the pending token transfer was not peeked (id {pending_id})"))?;
     assert_eq!(token_balance(&ssp, &asset).await.unwrap_or(0), 0, "the SSP has NOT claimed — the coin is still a pending transfer to vet");
-    let env = p.rgb_consignment.as_deref()
-        .ok_or_else(|| anyhow!("pending token transfer carries no consignment envelope"))?;
-    let (contract_id, booked) = ssp
-        .validate_pending_token(env, &p.branch_txs, &p.funding_txid, p.funding_vout)
+    // [4] The coloured child's RGB material is surfaced FROM THE BUNDLE: its leaf consignment,
+    // wrapped as the `{"c","a","s"}` envelope the SSP's validator reads, plus the outpoint it
+    // assigns to (the child's own final-state payload output) and the child's five-tier witness
+    // chain. No backup row exists for an envelope to ride on; this is the only way the SSP can
+    // verify an allocation BEFORE an irreversible Lightning payment.
+    let env = p.rgb_consignment.clone().ok_or_else(|| {
+        anyhow!(
+            "[4] a coloured child conveyance must surface its leaf consignment for the pre-pay \
+             gate — without it the SSP cannot pay ANY RGB invoice"
+        )
+    })?;
+    let env_json: serde_json::Value = serde_json::from_str(&env)?;
+    assert_eq!(
+        env_json["a"].as_u64(),
+        Some(250),
+        "[4] the envelope's declared amount is the child's share (only ever cross-checked against the consignment)"
+    );
+    assert!(!p.rgb_assignment_txid.is_empty(), "[4] the assignment outpoint is surfaced");
+    assert_eq!(
+        p.child_witness_txids.last(),
+        Some(&p.rgb_assignment_txid),
+        "[4] the consignment assigns the allocation to the child's OWN final state — the last witness of its chain"
+    );
+    assert!(p.branch_txs.is_empty(), "[4] a coloured child conveys no exit branch — there is no branch leaf whose value a gate could be tricked by");
+    assert_eq!(
+        p.child_witness_txids.len(),
+        5,
+        "[4][P3] the coloured child's own witness chain (T, X_m, SP, ext_child, state_child) must be \
+         surfaced for an envelope-free validator; got {:?}",
+        p.child_witness_txids
+    );
+    assert!(
+        p.ladder_census_ok,
+        "[4] the coloured child must pass the pre-pay census (verify_conveyed_child): {:?}",
+        p.ladder_census_refusal
+    );
+    let rung = mercuryrustlib::rgb::colored_committed_fee(1, carrier_rate) + mercurylib::tesr::P2A_VALUE;
+    let piece_exit_value = mercury_utexo_sdk::tokens::TOKEN_PIECE_SATS - 2 * rung;
+    assert_eq!(
+        p.amount, piece_exit_value,
+        "[4] the census-bound SATS value of a token piece is TOKEN_PIECE_SATS minus its own two \
+         coloured rungs (each colored_committed_fee(1, rate) + P2A_VALUE) — the exit-reachable \
+         packaging the ladder commits to, never a declared figure"
+    );
+    // THE PRE-PAY GATE PROPER, run exactly as `SspService::execute_pay` runs it, BEFORE any claim.
+    let (pre_contract, pre_booked) = ssp
+        .validate_pending_token_ex(
+            &env,
+            &p.branch_txs,
+            &p.child_witness_txids,
+            &p.rgb_assignment_txid,
+            p.rgb_assignment_vout,
+        )
         .await?;
-    // The gate sees the asset + amount the consignment CRYPTOGRAPHICALLY assigns — not a hint.
-    assert_eq!(contract_id, asset, "validate_pending_token must derive the real contract id");
-    assert_eq!(booked, 250, "validate_pending_token must derive the real assigned amount (250), not an inflated hint");
-    // Therefore an SSP holding a 10_000-unit RGB invoice against this coin would refuse: 250 < 10_000.
-    let big_invoice_amount = 10_000u64;
-    assert!(booked < big_invoice_amount, "a 250-unit coin cannot satisfy a 10_000-unit invoice — the pre-payment gate refuses");
-    // And a coin of a DIFFERENT asset id would fail the contract-id equality the gate enforces.
-    assert_ne!(contract_id, "rgb:some-other-asset", "the gate binds to the invoiced asset id");
-    println!("SDK37 - [4] RGB: validate_pending_token derived asset={contract_id} amount={booked} from the consignment BEFORE any claim — a wrong-asset or under-value coin is rejected pre-payment (250 < {big_invoice_amount})");
+    assert_eq!(pre_contract, asset, "[4] pre-pay validation identifies the invoiced contract");
+    assert_eq!(
+        pre_booked, 250,
+        "[4] pre-pay validation books the consignment-assigned 250 — the value the gate prices against"
+    );
+    println!("SDK37 - [4] pre-pay gate: validate_pending_token_ex over the surfaced bundle material booked {pre_booked} of {pre_contract} before any claim");
 
-    // ===== [F1] The pre-pay predicate is the CLAIM predicate — envelope equality included =========
-    // The envelope (`{"c":consignment,"a":amount,"s":sats}`) travels with the transfer and is fully
-    // attacker-controlled. The claim path has always rejected `a != consignment-derived amount`
-    // (PERMANENT-INVALID); the SSP's pre-payment gate did NOT. That gap paid real Lightning money for
-    // a coin that could never claim: pass the gate with a mutated `a`, take the irreversible payment,
-    // and the SSP is left holding a coin its own claim path rejects. Both entry points now call ONE
-    // predicate (`tokens::verify_consignment_assignment`), so they cannot disagree.
-    //
-    // Mutate ONLY the envelope amount — the consignment bytes `c` are untouched and still validate
-    // cryptographically, which is exactly what made this pass the old, weaker gate.
-    let mut tampered: serde_json::Value = serde_json::from_str(env)?;
-    let honest_a = tampered["a"].as_u64().ok_or_else(|| anyhow!("envelope has no amount"))?;
-    assert_eq!(honest_a, booked, "the honest envelope agrees with the consignment-derived amount");
-    tampered["a"] = serde_json::json!(honest_a + 9_750); // claim 10_000 for a 250-unit coin
-    let tampered = serde_json::to_string(&tampered)?;
-    // The RGB resolver is a live network dependency and can transiently fail to locate a witness. That
-    // flake must NOT be allowed to look like a pass, and it must NOT be allowed to soften the security
-    // assertion either, so the two are separated:
-    //   * "the gate returned Ok" is fatal ON EVERY ATTEMPT — no retry, no tolerance. That is the F1
-    //     defect and a single occurrence is a failure.
-    //   * only the question of WHICH refusal we got is retried past a transient resolver error, and if
-    //     every attempt is transient the test FAILS explicitly rather than passing on a flake.
-    let mut err = None;
-    let mut last_transient = String::new();
-    for _ in 0..15 {
-        match ssp
-            .validate_pending_token(&tampered, &p.branch_txs, &p.funding_txid, p.funding_vout)
-            .await
-        {
-            Ok((c, a)) => panic!(
-                "SSP pre-payment gate ACCEPTED a mutated envelope (returned {c} / {a}) — it would pay an irreversible Lightning invoice for a coin its own claim path rejects"
-            ),
-            Err(e) => {
-                let s = e.to_string();
-                // A resolver/indexer outage refuses too (fail-closed), but it refuses for the wrong
-                // reason — it never reached the envelope-equality check we are here to prove.
-                if s.contains("resolver") || s.contains("can't be located") {
-                    last_transient = s;
-                    tokio::time::sleep(Duration::from_secs(4)).await;
-                    continue;
-                }
-                err = Some(s);
-                break;
-            }
-        }
-    }
-    let err = err.ok_or_else(|| anyhow!(
-        "the RGB resolver never recovered, so the envelope-equality refusal was never reached (last: {last_transient}) — NOT a pass"
-    ))?;
-    // The SAME verdict the claim path renders: PERMANENT-INVALID, i.e. this coin can never book.
+    // ===== [F1] The pre-pay predicate IS the claim predicate ====================================
+    // A mutated envelope — declared 251 over a consignment chain that assigns 250 — is refused by
+    // the same validator, before payment, as PERMANENT-INVALID. Nothing pre-pay trusts the declared
+    // figure; it is cross-checked against the consignment and the disagreement is named.
+    let mut forged = env_json.clone();
+    forged["a"] = serde_json::json!(251);
+    let refusal = ssp
+        .validate_pending_token_ex(
+            &forged.to_string(),
+            &p.branch_txs,
+            &p.child_witness_txids,
+            &p.rgb_assignment_txid,
+            p.rgb_assignment_vout,
+        )
+        .await
+        .expect_err("[F1] an envelope whose declared amount disagrees with the consignment must be refused before payment");
     assert!(
-        err.contains("PERMANENT-INVALID"),
-        "the pre-pay gate must render the claim path's verdict verbatim, got: {err}"
+        refusal.to_string().contains("envelope claimed"),
+        "[F1] the refusal names the disagreement: {refusal}"
     );
-    assert!(
-        err.contains("envelope claimed"),
-        "the refusal must name the envelope/consignment amount disagreement, got: {err}"
+    println!("SDK37 - [F1] a forged envelope (a=251 over a chain assigning 250) is refused pre-pay: {refusal}");
+
+    // Now claim, and book from the consignment chain — the same authority every receiver uses.
+    wait_token_balance(&ssp, &asset, 250).await?;
+    let (booked_contract, booked, witness_txids, _) = ssp.colored_child_health(&pending_id).await?;
+    assert_eq!(booked_contract, asset, "[4] the SSP's consignment chain is for THIS contract");
+    assert_eq!(
+        booked, 250,
+        "[4] the SSP books EXACTLY what the consignment chain assigns (250) — derived from the \
+         chain, not from any declared field"
     );
-    // `SspService::execute_pay` maps this Err to "pre-payment RGB validation failed for {sid} —
-    // refusing to pay" BEFORE `rln.send_payment`, so no Lightning money moves.
-    println!("SDK37 - [F1] SSP REFUSED to pay on a mutated envelope (a={} vs consignment-derived {booked}): {err}", honest_a + 9_750);
-    // And the honest envelope still passes — the fix is strictly a rejection, not a lockout. Same
-    // split: an Ok is the only acceptable terminal state, a transient resolver error is retried, and
-    // an exhausted retry budget FAILS.
-    let mut honest_again = None;
-    for _ in 0..15 {
-        match ssp
-            .validate_pending_token(env, &p.branch_txs, &p.funding_txid, p.funding_vout)
-            .await
-        {
-            Ok(v) => {
-                honest_again = Some(v);
-                break;
-            }
-            Err(e) => {
-                let s = e.to_string();
-                if s.contains("resolver") || s.contains("can't be located") {
-                    tokio::time::sleep(Duration::from_secs(4)).await;
-                    continue;
-                }
-                panic!("the HONEST envelope was refused — the F1 fix must reject only the mutated one: {s}");
-            }
-        }
-    }
-    let (c2, a2) = honest_again
-        .ok_or_else(|| anyhow!("the RGB resolver never recovered for the honest re-validation"))?;
-    assert_eq!((c2.as_str(), a2), (asset.as_str(), 250), "the honest envelope still validates");
+    assert_eq!(witness_txids.len(), 5, "[4] the booked chain resolves against the same five witnesses the peek surfaced");
+    println!("SDK37 - [4] RGB: the pending coloured child was peeked with its bundle material (leaf envelope, assignment outpoint, no branch, 5 witnesses surfaced, census ok, amount={} = TOKEN_PIECE_SATS - 2*{rung}); the claim booked {booked} of {booked_contract} from the consignment chain, the same figure the pre-pay gate booked", p.amount);
 
     // ===== [3] SATS: peek_pending_transfers reports a CENSUS-BOUND amount ========================
     // Fund alice with plain sats and pay a NON-EXACT amount. The coin is laddered (V2), so a plain-BTC
@@ -273,11 +319,11 @@ pub async fn execute() -> Result<()> {
     // A conveyed in-ladder child carries an EMPTY branch (transfer/sender.rs sets branch_txs = []) and a
     // `child_tesr_bundle` instead — so there is no branch leaf whose value the gate could be tricked by.
     assert!(ps.branch_txs.is_empty(), "an in-ladder child conveyance carries no exit branch — its value cannot come from a branch leaf at all");
-    // FAIL-CLOSED CENSUS — the V2 replacement for [3]'s branch validation. `verify_conveyed_child`
+    // FAIL-CLOSED CENSUS — the laddered replacement for [3]'s branch validation. `verify_conveyed_child`
     // proved: the child pays THIS wallet's exit key (Model A), parent and child are both terminal, and
-    // each num_sigs equals its conveyed-ladder baseline (no hidden lower-CSV state). Any tamper → Err →
-    // ladder_census_ok = false → the SSP's pre-pay gate refuses to pay.
-    assert!(ps.ladder_census_ok, "the in-ladder child passed verify_conveyed_child: child pays the SSP key + parent/child terminality + num_sigs baseline");
+    // each num_sigs equals its `tiers + superseded` census with NO flat term (no hidden lower-CSV
+    // state). Any tamper → Err → ladder_census_ok = false → the SSP's pre-pay gate refuses to pay.
+    assert!(ps.ladder_census_ok, "the in-ladder child passed verify_conveyed_child: child pays the SSP key + parent/child terminality + tiers-plus-superseded census: {:?}", ps.ladder_census_refusal);
     // The amount is CENSUS-BOUND: peek OVERRIDES any branch-derived figure with the child ladder's own
     // committed `child_state.out_value` (tesr.rs verify_conveyed_child), so an attacker-inflated hint
     // can never reach the value gate. NOTE the census value is the child's EXIT-REACHABLE value, not
@@ -295,6 +341,6 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK37 - [3] SATS: peek_pending_transfers censused the in-ladder child (verify_conveyed_child) and reported its ladder-committed value {} sats (piece {} minus its two exit tiers) — a value-inflating/tampered child fails the census → ladder_census_ok=false → the gate refuses", ps.amount, send_sats);
 
-    println!("SDK37 - SUCCESS: on V2 (TES-R) the SSP pre-payment value gate reads the TRUE coin value, closing audit [3]/[4]. [4] validate_pending_token derives the consignment's cryptographic asset+amount (250 of {asset}) — not the attacker's envelope hint — so an under-value/wrong-asset RGB coin is refused before send_payment. [3] peek_pending_transfers censuses the in-ladder split CHILD with verify_conveyed_child and reports its ladder-committed EXIT-REACHABLE value ({expected_census} sats = the {send_sats}-sat piece minus its two tiers' committed fee + P2A), so an inflated hint is never read and any tampered child fails closed (ladder_census_ok=false) and cannot satisfy the SATS value gate. [F1] the RGB pre-payment predicate is now literally the claim predicate (one shared implementation), so a mutated envelope amount — which the old, weaker gate accepted — is REFUSED before send_payment with the claim path's own PERMANENT-INVALID verdict. Neither path can make the SSP over-pay, and nothing can make it pay for a coin that will never claim.");
+    println!("SDK37 - SUCCESS: on the TES-R lane the SSP pre-payment value gate reads the TRUE coin value, closing audit [3]/[4]. [3] peek_pending_transfers censuses the in-ladder split CHILD with verify_conveyed_child and reports its ladder-committed EXIT-REACHABLE value ({expected_census} sats = the {send_sats}-sat piece minus its two tiers' committed fee + P2A), so an inflated hint is never read and any tampered child fails closed (ladder_census_ok=false) and cannot satisfy the SATS value gate. [4] a token piece reaches the SSP as a coloured child whose RGB material is surfaced FROM THE BUNDLE (leaf envelope + assignment outpoint + five witnesses; there are no backup rows), the census passed, the pre-pay gate booked 250 of {asset} BEFORE any claim, and the claim booked the same 250 from the consignment chain. [F1] a forged envelope is refused pre-pay by the same validator, so a declared amount can never out-run the consignment. Neither path can make the SSP over-pay, and nothing can make it pay for a coin that will never claim.");
     Ok(())
 }

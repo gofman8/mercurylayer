@@ -38,37 +38,32 @@
 //!     works after the year — bob walks all five tiers `T -> X_m -> SP -> ext_child -> state_child`
 //!     with no SE and no counterparty, and the leaf consignment then validates against the CHAIN
 //!     ALONE for the full amount. A single received piece still cannot be SPLIT again.
-//! (C) The residual DANGER, re-measured on the coloured lane. The sender keeps ONE pre-signed,
-//!     RGB-unaware deposit backup over the same `F`. On the flat lane that was a CLAWBACK — it
-//!     returned the tokens to her. On the coloured lane it recovers nothing: it is RGB-unaware, so
-//!     it can only BURN the allocation (her own retained share included). The receiver's answer is
-//!     unchanged and (B) performs it: spend `F` first. Afterwards that matured backup cannot even
-//!     broadcast.
+//! (C) THE OLD HORIZON IS GONE. The sender used to keep ONE pre-signed, RGB-unaware deposit
+//!     backup over the same `F` with an absolute locktime `L0 = H_deposit + initlock` — on the flat
+//!     lane a CLAWBACK, on the coloured lane a BURN — and this section measured that matured backup
+//!     failing to broadcast after (B)'s walk. There is no such backup any more: the carrier's
+//!     ladder is co-signed at first sight of `F` in place of the flat `tx1`, `coin.locktime` is
+//!     `None` for life, and the sender holds ZERO flat rows. What (C) measures instead is the
+//!     consequence the old horizon used to forbid: AFTER the "year", alice pays carol out of the
+//!     change tip that sat idle the whole time, and carol books exactly what the consignment
+//!     assigns, with an EMPTY parent flat chain. Long inactivity does not block sending — which is
+//!     what the pre-flip test was written to show, and what the coloured-lane rewrite had to stop
+//!     showing.
+//! (D) NO RESIDUAL. After bob's walk the sender still holds no RGB-unaware spend of `F`: zero flat
+//!     rows, no locktime, and the legacy flat-backup broadcast refuses her carrier by name.
 //!
-//! ## ORDERING, AND THE DEFECT THAT FORCED IT — read this before "fixing" the order back
+//! ## ORDERING — why (C) sends AFTER the idle, and why an earlier rewrite could not
 //!
-//! The pre-flip test IDLED FIRST and sent afterwards, to show that "long inactivity does not block
-//! sending". On the coloured lane that sequence is currently BROKEN, and not benignly:
-//!
-//!   * `verify_conveyed_child`'s ANCESTOR CENSUS validates the conveyed parent's flat backup chain
-//!     with `validate_backup_chain_v2`, which rejects a backup whose absolute locktime has already
-//!     passed (`LocktimeTooLow`). A carrier idle past its own deposit horizon (`L0 = H_deposit +
-//!     initlock`) has exactly that.
-//!   * MEASURED on this stack: with `initlock = 1000`, after 1500 idle blocks `alice.transfer_
-//!     tokens(.., 250)` SUCCEEDS on the sender's side, and bob's `claim()` then fails forever with
-//!     `conveyed parent flat backup chain is invalid (SignatureSchemeValidationError) — the ancestor
-//!     census term is unusable`. The sender has terminalized her carrier and the receiver can never
-//!     book the piece.
-//!   * There is no repair: `refresh` refuses a carrier outright (there is no coloured on-chain
-//!     re-anchor, CTESR-GATE §7), so an aged coloured carrier cannot be re-anchored back inside its
-//!     horizon.
-//!
-//! The receiver's refusal is the SAFE direction (an already-matured parent backup means the sender
-//! can burn the piece at will), but the SENDER must refuse first, in pre-flight, instead of
-//! completing a payment nobody can accept. That is a protocol/SDK fix, not a test fix, so this test
-//! does not assert around it: it performs the cooperative send while the carrier is INSIDE its
-//! horizon — which is what the pre-flip test was really exercising — and then idles both sides.
-//! The post-horizon send is reported as a finding, not silently dropped.
+//! The pre-flip test IDLED FIRST and sent afterwards. The coloured-lane rewrite had to reverse
+//! that and recorded why as a KNOWN GAP: `verify_conveyed_child`'s ancestor census validated the
+//! conveyed parent's FLAT backup chain with `validate_backup_chain_v2`, which rejected a rung whose
+//! absolute locktime had passed (`LocktimeTooLow`) — so with `initlock = 1000`, after 1500 idle
+//! blocks a send SUCCEEDED on the sender and bob's `claim()` failed forever, with no repair
+//! (`refresh` refuses a carrier). That census term no longer exists: a child bundle's
+//! `parent_flat_backups` must be EMPTY, a transfer conveys `backup_transactions: []`, and the
+//! receiver refuses anything else by name. The post-horizon send is therefore measured here again,
+//! as (C) — placed BEFORE bob's walk in (B), because adopting a child requires the parent's `F`
+//! unspent and the walk spends it.
 //!
 //! Run: SDK_E2E=32 ML_NETWORK=regtest cargo run
 
@@ -84,6 +79,8 @@ use crate::bitcoin_core;
 
 const SUPPLY: u64 = 1_000;
 const PAY: u64 = 250;
+/// The POST-HORIZON payment of (C), carved out of alice's idle change tip.
+const PAY2: u64 = 100;
 
 async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
@@ -233,7 +230,11 @@ pub async fn execute() -> Result<()> {
     let mut bob_cfg = SdkConfig::regtest("sdk32_bob");
     bob_cfg.colored_ladder = true;
     let (bob, _) = UtexoWallet::initialize(bob_cfg, None).await?;
-    let (carol, _) = UtexoWallet::initialize(SdkConfig::regtest("sdk32_carol"), None).await?;
+    // carol RECEIVES in (C), so she is on the coloured lane too: a coloured child is adopted by a
+    // wallet with an RGB engine and `colored_ladder` on, exactly as bob.
+    let mut carol_cfg = SdkConfig::regtest("sdk32_carol");
+    carol_cfg.colored_ladder = true;
+    let (carol, _) = UtexoWallet::initialize(carol_cfg, None).await?;
     let bob_addr = bob.get_utexo_address().await?;
     let carol_addr = carol.get_utexo_address().await?;
 
@@ -303,12 +304,26 @@ pub async fn execute() -> Result<()> {
         "the FLAT ladder conveyance must refuse a coloured carrier (the receiver would bind the \
          sats without the asset). Got: {flat_convey:?}"
     );
-    let l0 = carrier.locktime.ok_or_else(|| anyhow!("carrier has no deposit-backup locktime"))?;
-    println!("SDK32 - alice issued {SUPPLY} {asset} on carrier {carrier_id}: ladder COLOURED ({tier_count} tiers, {tier_count} RGB transitions), no RGB-UNAWARE route reaches it ({carrier_sats} sat quarantined out of plain-BTC selection, uncoloured in-ladder split refused, flat conveyance refused); deposit-backup locktime L0={l0}, initlock={initlock}");
+    // …and there is no deposit-backup calendar on it at all: no locktime, no flat row. The OLD
+    // horizon `L0 = H_deposit + initlock` used to be read here; it has no source any more.
+    assert_eq!(
+        carrier.locktime, None,
+        "a laddered carrier has no absolute calendar: coin.locktime must be None"
+    );
+    assert_eq!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk32_alice", &carrier_id)
+            .await?
+            .map_or(0, |r| r.len()),
+        0,
+        "the issuer holds ZERO flat backup rows for the carrier — a flat rung would be exactly the \
+         RGB-unaware spend of F this test used to measure as the residual danger"
+    );
+    let tip_at_issue = tip(&cc)?;
+    println!("SDK32 - alice issued {SUPPLY} {asset} on carrier {carrier_id}: ladder COLOURED ({tier_count} tiers, {tier_count} RGB transitions), no RGB-UNAWARE route reaches it ({carrier_sats} sat quarantined out of plain-BTC selection, uncoloured in-ladder split refused, flat conveyance refused); no locktime, no flat row; tip={tip_at_issue}, initlock={initlock}");
 
-    // ===== 1. COOPERATIVE SEND, inside the carrier's horizon ====================================
-    // Deliberately BEFORE the long idle — see the ORDERING note in the module docs: a post-horizon
-    // send currently completes on the sender and can never be booked by the receiver.
+    // ===== 1. COOPERATIVE SEND, before the idle =================================================
+    // The first send. (C) repeats the exercise AFTER the "year", out of the change tip this one
+    // leaves behind — see the ORDERING note in the module docs.
     add_tokens(&cc, &alice, 3).await?;
     let r = alice.transfer_tokens(&asset, &bob_addr, PAY).await?;
     assert!(r.used_split, "a token transfer is an off-chain SPLIT");
@@ -379,6 +394,55 @@ pub async fn execute() -> Result<()> {
          success proves nothing"
     );
     println!("SDK32 - (A) after ~{} idle blocks (tip={tip_yr}) alice still holds {} {asset}; her chain is still entirely off-chain, F is unspent, and her stock still spends exactly {} ({} refused) — an idle allocation simply does not age", initlock + 500, SUPPLY - PAY, SUPPLY - PAY, SUPPLY - PAY + 1);
+
+    // ----- (C) the OLD horizon is gone: a send AFTER the "year" still books ---------------------
+    // Placed BEFORE (B)'s walk: adopting a child requires the parent's `F` unspent, and the walk
+    // spends it. Under the flat chain this send completed on the sender and could never be booked
+    // (the receiver's ancestor census refused the matured rung) — the KNOWN GAP this file used to
+    // carry. With no flat chain there is nothing that aged, and it must simply work.
+    assert!(
+        tip_yr >= tip_at_issue + initlock + 500,
+        "(C) test hygiene: the tip ({tip_yr}) must be past the OLD horizon (issuance tip \
+         {tip_at_issue} + initlock {initlock}), or this section would not be measuring a \
+         post-horizon send"
+    );
+    let carol_slot = carol.get_utexo_address().await?;
+    add_tokens(&cc, &alice, 2).await?;
+    let r2 = alice.transfer_tokens(&asset, &carol_slot, PAY2).await.map_err(|e| anyhow!(
+        "(C) alice could not pay {PAY2} out of a change tip idle for {} blocks — past the OLD \
+         horizon a send used to complete on the sender and fail forever at the receiver's \
+         flat-chain census; with no flat chain it must simply work: {e:#}",
+        initlock + 500
+    ))?;
+    assert!(r2.used_split, "(C) a partial pay out of the tip carves a piece");
+    wait_token_balance(&carol, &asset, PAY2).await.map_err(|e| anyhow!(
+        "(C) carol could not BOOK the post-horizon piece — the receiver refused a child of a \
+         carrier that had sat idle past deposit + initlock, i.e. the KNOWN GAP is back: {e:#}"
+    ))?;
+    let carol_piece = child_sid(&cc, "sdk32_carol", &[]).await?
+        .ok_or_else(|| anyhow!("(C) carol booked the tokens but adopted NO child bundle"))?;
+    let carol_cb = mercuryrustlib::tesr::load_child(&cc, "sdk32_carol", &carol_piece).await?
+        .ok_or_else(|| anyhow!("(C) carol's child bundle vanished"))?;
+    assert!(carol_cb.is_colored(), "(C) carol's post-horizon child must be COLOURED");
+    assert!(
+        carol_cb.parent_flat_backups.is_empty(),
+        "(C) the child bundle must convey an EMPTY parent flat chain — the census term that used to \
+         age is gone; got {}",
+        carol_cb.parent_flat_backups.len()
+    );
+    let (c_contract, c_assigned, _, _) = carol.colored_child_health(&carol_piece).await?;
+    assert_eq!(c_contract, asset, "(C) carol's consignment is for THIS contract");
+    assert_eq!(c_assigned, PAY2, "(C) carol books EXACTLY what the consignment assigns");
+    assert_eq!(
+        token_balance(&alice, &asset).await?,
+        SUPPLY - PAY - PAY2,
+        "(C) alice keeps the remainder on a fresh tip"
+    );
+    assert!(
+        !is_outpoint_spent(&cc, &f_txid, f_vout)?,
+        "(C) a cooperative send publishes nothing — F is still unspent"
+    );
+    println!("SDK32 - (C) POST-HORIZON SEND WORKS: {} blocks after issuance (> initlock {initlock}) alice paid carol {PAY2} out of her idle change tip and carol booked it (child {carol_piece}, empty parent flat chain); alice keeps {}", tip_yr - tip_at_issue, SUPPLY - PAY - PAY2);
 
     // ----- (B) the RECEIVER's side: not lost, and still exitable with no SE ----------------------
     assert_eq!(token_balance(&bob, &asset).await?, PAY, "bob's received tokens are NOT lost after long inactivity");
@@ -469,36 +533,36 @@ pub async fn execute() -> Result<()> {
     );
     println!("SDK32 - (B) UNILATERAL EXIT works after a year: bob walked all 5 RGB-aware tiers in {passes} pass(es) with no SE, spent the shared root, and the leaf consignment now validates against the CHAIN ALONE assigning all {PAY} {asset} — tokens preserved without the SE");
 
-    // ===== (C) the residual sender-backup window, re-measured on the coloured lane ==============
-    let alice_backup = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk32_alice", &carrier_id).await?;
-    let alice_bk = alice_backup.iter().min_by_key(|b| b.tx_n)
-        .ok_or_else(|| anyhow!("alice has no stored backup for the carrier"))?;
-    let alice_bk_tx: electrum_client::bitcoin::Transaction =
-        electrum_client::bitcoin::consensus::deserialize(&hex::decode(&alice_bk.tx)?)?;
-    let alice_bk_lock = mercurylib::utils::get_blockheight(alice_bk).unwrap_or(0);
-    let tip_c = tip(&cc)?;
-    assert!(
-        alice_bk_lock <= tip_c,
-        "the SENDER's carrier backup is not mature (L={alice_bk_lock} > tip={tip_c}) — the window \
-         this section measures never opened, so the refusal below would prove nothing"
+    // ===== (D) NO RESIDUAL: the sender holds no RGB-unaware spend of F ============================
+    // The section that used to sit here measured the sender's ONE retained deposit backup —
+    // matured, RGB-unaware, spending the same `F` — failing to broadcast after bob's walk. There is
+    // no such backup to measure: zero flat rows, no locktime, and the legacy flat-backup broadcast
+    // refuses the carrier BY NAME. The only spends of `F` that exist are the coloured trigger and
+    // the tiers beneath it, which is what bob just walked.
+    assert_eq!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk32_alice", &carrier_id)
+            .await?
+            .map_or(0, |r| r.len()),
+        0,
+        "(D) the sender holds ZERO flat backup rows for the carrier after everything"
     );
     assert_eq!(
-        alice_bk_tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count(), 0,
-        "the sender's retained deposit backup must be the RGB-UNAWARE shape this section is about"
+        coin_of(&cc, "sdk32_alice", &carrier_id).await?.locktime,
+        None,
+        "(D) the sender's carrier has no locktime"
     );
-    assert_eq!(
-        alice_bk_tx.input[0].previous_output.txid.to_string(), f_txid,
-        "the sender's backup must spend the same F bob's walk spent, or it is no rival at all"
-    );
-    let claw = cc.electrum_client.transaction_broadcast_raw(&hex::decode(&alice_bk.tx)?);
+    let legacy_msg = mercuryrustlib::broadcast_backup_tx::execute(&cc, "sdk32_alice", &carrier_id, None, None)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     assert!(
-        claw.is_err(),
-        "the sender's matured, RGB-unaware backup BROADCAST SUCCESSFULLY after bob's walk — F is \
-         already spent by his trigger, so this must fail"
+        legacy_msg.contains("no flat backup transaction to broadcast"),
+        "(D) the legacy flat-backup broadcast must refuse a laddered carrier by name — got: {legacy_msg:?}"
     );
-    assert_eq!(token_balance(&bob, &asset).await?, PAY, "bob still holds all {PAY} after the failed sweep");
-    println!("SDK32 - (C) SENDER-BACKUP WINDOW (residual, re-measured on the coloured lane): alice's ONE retained deposit backup is RGB-UNAWARE (0 opret), matured at {alice_bk_lock} (tip {tip_c}) and spends the very same F — but on this lane it can no longer CLAW THE TOKENS BACK, only burn them, and after bob's walk it cannot even broadcast: {}", claw.err().map(|e| e.to_string().chars().take(100).collect::<String>()).unwrap_or_default());
+    assert_eq!(token_balance(&bob, &asset).await?, PAY, "(D) bob still holds all {PAY}");
+    println!("SDK32 - (D) NO RESIDUAL: the sender holds no flat row and no locktime for the carrier, and the legacy broadcast refuses it by name ({})", legacy_msg.chars().take(100).collect::<String>());
 
-    println!("SDK32 - SUCCESS: tokens are NEVER LOST by inactivity on the CTES-R lane. The carrier is laddered and every rung of that ladder is COLOURED — so it never ages (no tier on chain, F unspent, 0 vB of rent after a 'year'), its stock still spends exactly the allocation, and every RGB-UNAWARE route to it (plain-BTC selection, the uncoloured in-ladder split, the flat conveyance) is refused: the invariant the pre-flip 'must NOT carry a ladder' assertion protected, now proved with the ladder PRESENT. A RECEIVED piece is a coloured CHILD, likewise RGB-aware, which after a 'year' idle still walks all five of its tiers unilaterally — no SE, no counterparty — after which the leaf consignment validates against the chain alone for the full amount. Residual: the sender keeps one RGB-unaware deposit backup over the same F; on this lane it can no longer recover the tokens (only destroy them), and once the receiver has walked it cannot broadcast at all. KNOWN GAP, see the ORDERING note in this file's docs: a send from a carrier already past its deposit horizon completes on the SENDER and can never be booked by the receiver.");
+    println!("SDK32 - SUCCESS: tokens are NEVER LOST by inactivity on the CTES-R lane. The carrier is laddered at first sight of F and every rung of that ladder is COLOURED — so it never ages (no tier on chain, F unspent, 0 vB of rent after a 'year'), its stock still spends exactly the allocation, and every RGB-UNAWARE route to it (plain-BTC selection, the uncoloured in-ladder split, the flat conveyance) is refused: the invariant the pre-flip 'must NOT carry a ladder' assertion protected, now proved with the ladder PRESENT. There is NO calendar on it: no locktime, no flat row, so a send AFTER the 'year' out of the idle change tip books normally with an empty parent flat chain — the KNOWN GAP the coloured-lane rewrite carried is gone with the chain that caused it. A RECEIVED piece is a coloured CHILD, likewise RGB-aware, which after a 'year' idle still walks all five of its tiers unilaterally — no SE, no counterparty — after which the leaf consignment validates against the chain alone for the full amount. And there is no residual: the sender holds no RGB-unaware spend of F at all.");
     Ok(())
 }

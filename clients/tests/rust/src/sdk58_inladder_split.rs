@@ -7,6 +7,13 @@
 //! tiers under A_child = SP.out[0]'s key) is then checked by verify_child_bundle against authoritative
 //! values fetched from chain + /info/statechain — and must ACCEPT.
 //!
+//! The parent's ladder is the one `update_coins` established AT FIRST SIGHT of the deposit
+//! (`LadderAtSight::Plain`, inside `deposit_coin`): a laddered coin has no flat `tx1`, so its
+//! census baseline is `num_sigs == 3` (T, X_0, S_0) with a flat term of ZERO
+//! (`PARENT_V2_BASELINE == 0`). The test asserts that shape before splitting and feeds the zero
+//! term to every `verify_child_bundle` call below; establishing a second ladder here would spend
+//! three more irreversible co-signs and unbalance the census for good.
+//!
 //! This inlines the eventual in_ladder_split sender, so it also validates that flow. Run: SDK_E2E=58.
 
 use std::env;
@@ -44,12 +51,31 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let wallet = "sdk58_alice";
 
-    // --- Parent: deposit + establish (canonical schedule). Capture the pre-ladder baseline count. ---
+    // --- Parent: deposited, and LADDERED AT FIRST SIGHT by `update_coins` inside `deposit_coin`. ---
+    // No flat tx1 exists: the three co-signs on the coin are T, X_0, S_0, and the census baseline
+    // (the flat term) is zero. Loaded, not re-established — a second ladder over F would be three
+    // more irreversible co-signs the census could never account for.
     let mut parent = deposit_coin(&cc, wallet).await?;
     let parent_sid = parent.statechain_id.clone().ok_or(anyhow!("no parent sid"))?;
-    let parent_baseline = num_sigs(&cc, &parent_sid).await?;
-    let owner_exit = crate::bitcoin_core::getnewaddress()?;
-    let bundle = mercuryrustlib::tesr::establish_auto(&cc, &mut parent, &owner_exit, NETWORK).await?;
+    let bundle = mercuryrustlib::tesr::load(&cc, wallet, &parent_sid)
+        .await?
+        .ok_or(anyhow!("the deposit must have been laddered at first sight (LadderAtSight::Plain) — it has no other exit material"))?;
+    let parent_sigs_at_sight = num_sigs(&cc, &parent_sid).await?;
+    assert_eq!(
+        parent_sigs_at_sight, 3,
+        "a laddered deposit costs exactly its three tiers — a fourth co-sign would be the flat tx1 \
+         the rule removed (got {parent_sigs_at_sight})"
+    );
+    assert_eq!(bundle.exit_tiers().len(), 3, "the ladder is T -> X_0 -> S_0");
+    let parent_baseline = mercuryrustlib::tesr::PARENT_V2_BASELINE;
+    assert_eq!(parent_baseline, 0, "a laddered parent's flat-backup census term is ZERO");
+    mercuryrustlib::tesr::verify_bundle(&bundle, parent_sigs_at_sight, parent_baseline)
+        .map_err(|e| anyhow!("the at-sight ladder failed the census with a flat term of 0: {e}"))?;
+    let parent_flat_rows = mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, wallet, &parent_sid)
+        .await?
+        .map_or(0, |v| v.len());
+    assert_eq!(parent_flat_rows, 0, "a laddered parent holds ZERO flat backup rows (got {parent_flat_rows})");
+    assert!(parent.locktime.is_none(), "a laddered parent carries no absolute calendar: locktime is None");
 
     // --- Create the child statechain coin FIRST so SP can pay its aggregate A_child. ----------------
     let x_m = bundle.current().extension.clone();
@@ -60,7 +86,11 @@ pub async fn execute() -> Result<()> {
         .coins.iter().find(|c| c.aggregated_address.as_deref() == Some(&child_addr)).cloned()
         .ok_or(anyhow!("child coin not found"))?;
     let child_sid = child.statechain_id.clone().ok_or(anyhow!("no child sid"))?;
-    let child_baseline = num_sigs(&cc, &child_sid).await?;
+    // A child slot is an SE-registered key with NO on-chain funding: nothing is co-signed for it
+    // until the split, so its flat term is zero and the SE's counter starts at zero.
+    let child_baseline = mercuryrustlib::tesr::CHILD_V2_BASELINE;
+    assert_eq!(child_baseline, 0, "a child slot's flat-backup census term is ZERO");
+    assert_eq!(num_sigs(&cc, &child_sid).await?, 0, "a fresh child slot has no co-sign yet");
 
     // --- Split IN-LADDER via the PRODUCTION sender (promoted from this test's earlier inline logic). -
     let receiver = crate::sdk58_inladder_split::taproot_addr();
@@ -97,7 +127,20 @@ pub async fn execute() -> Result<()> {
     let parent_agg = aggregate(&cc, &parent_sid).await?;
     let child_num_sigs = num_sigs(&cc, &child_sid).await?;
     let child_agg = aggregate(&cc, &child_sid).await?;
-    println!("SDK58 - parent num_sigs={parent_num_sigs} (baseline {parent_baseline}); child num_sigs={child_num_sigs} (baseline {child_baseline})");
+    println!("SDK58 - parent num_sigs={parent_num_sigs} (flat term {parent_baseline}); child num_sigs={child_num_sigs} (flat term {child_baseline})");
+    // The split cost the parent exactly ONE co-sign (SP) on top of its three at-sight tiers, and
+    // the parent census is exactly tiers + superseded: T, X_0, SP live and S_0 disclosed.
+    assert_eq!(
+        parent_num_sigs,
+        parent_sigs_at_sight + 1,
+        "an in-ladder split costs the parent exactly one co-sign (SP)"
+    );
+    assert_eq!(
+        parent_num_sigs,
+        (cb.parent.exit_tiers().len() + cb.parent.superseded_states.len()) as u32,
+        "the parent census is `num_sigs == tiers + superseded` with a flat term of ZERO"
+    );
+    assert!(cb.parent_flat_backups.is_empty(), "a split child conveys an EMPTY parent chain");
 
     // Terminality — the DURABLE guarantee the receiver must query (fail-closed), not just the census.
     let (_, _, parent_terminal) = mercuryrustlib::lightning_latch::get_spend_budget(&cc, &parent_sid).await?;

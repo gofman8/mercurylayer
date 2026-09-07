@@ -1,39 +1,43 @@
-//! E2E (token-carrier watchtower, CTES-R): the `auto_exit_due` watchtower AUTO-PROTECTS a received
-//! token carrier that is nearing its clawback deadline, so an idle receiver cannot lose the
-//! allocation to the sender's stale, RGB-unaware backup of the shared funding output `F`.
+//! E2E (token-carrier watchtower, CTES-R): a RECEIVED token piece has NO calendar deadline, and its
+//! defence is EVENT-DRIVEN — `defend_ladders` answers a hostile trigger on the shared funding
+//! output `F`, and nothing else ever needs to happen.
 //!
-//! **MIGRATED TO THE COLOURED LANE.** On the flat lane a received piece was a sub-coin with a
-//! `branch-<id>` exit chain, and protecting it meant BROADCASTING that branch: one locktime-0
-//! transaction, one block, done. With `colored_ladder` ON a received piece is a COLOURED CHILD —
-//! there is no `branch-` row at all, and `sqlite_manager::get_backup_txs` is a `fetch_one`, which is
-//! why the un-migrated test died on "no rows returned by a query that expected to return at least
-//! one row". Its exit material is the five-tier chain `T -> X_m -> SP -> ext_child -> state_child`
-//! in its `ctesr-` bundle, and every rung of that chain carries an RGB state transition.
+//! **RE-DERIVED — the clawback this test defended against no longer exists.** Two earlier shapes:
 //!
-//! **What the test proved is preserved, and the machinery it proves it about was extended to match**
-//! (`auto_exit_due`, the coloured-children loop):
+//!   * On the flat lane a received piece was a sub-coin with a `branch-<id>` exit chain, and the
+//!     sender kept a pre-signed, RGB-unaware deposit backup over `F` with an absolute locktime
+//!     `L0 = H_deposit + initlock`. An idle receiver lost the allocation the block that backup
+//!     matured, so `auto_exit_due` forced the branch on chain before `L0`.
+//!   * On the coloured lane the piece became a COLOURED CHILD (a `ctesr-` bundle, five RGB-aware
+//!     tiers `T -> X_m -> SP -> ext_child -> state_child`), and this test drove `auto_exit_due` to
+//!     walk it before `L0 - Σ csv` — still against the sender's retained flat backup.
 //!
-//!   * the ACTION is now the pre-signed WALK, driven through `unilateral_exit`, not a branch
-//!     broadcast — broadcasting any RGB-unaware spend of `F` destroys the allocation, which is the
-//!     very thing this watchtower exists to prevent;
-//!   * the DEADLINE gets a HEAD START. A flat branch was locktime-0 and confirmed in one block, so
-//!     `L0 = H_deposit + initlock` was a usable deadline. A walk of RELATIVE timelocks must be
-//!     STARTED at least `Σ csv` blocks before `L0`, and the head start is read off the child's own
-//!     chain rather than guessed.
+//! There is no flat backup any more. A carrier's ladder is co-signed at first sight of `F` in place
+//! of the flat `tx1`; a transfer conveys `backup_transactions: []`; `coin.locktime` is `None` for
+//! life. The sender holds NO absolute-locktime spend of `F` — the only pre-signed spends of `F` in
+//! existence are the coloured trigger `T` and nothing else — so there is no height at which a
+//! received piece becomes claw-back-able, no `L0`, and no head start to compute. `auto_exit_due`
+//! acts on `exit_deadline_block`, which a laddered coin (and its children) never has; the child's
+//! only exposure is the EVENT of `T` reaching the chain, and the per-block `defend_ladders` child
+//! loop is what answers it.
 //!
-//! (A) ISSUED/coloured-root carrier is NOT acted on: it has no ancestor — no `branch-` row and no
-//!     `ctesr-` bundle of its own — so no stale backup can race it, at any margin.
-//! (B) alice sends 250 to bob → bob holds a COLOURED CHILD whose chain roots at alice's carrier
-//!     funding `F`; its effective deadline is `L0 - Σ csv`.
-//! (C) Comfortably ahead of it, the watchtower does NOTHING (the whole chain stays off-chain, `F`
-//!     unspent, 0 vB of rent).
-//! (D) Near it, `auto_exit_due` ACTS: a `TokenCarrierMaterialized` event fires and the watchtower
-//!     drives the walk — pass after pass, mining only what the SDK reports it is waiting for —
-//!     until all five RGB-aware tiers are mined, `F` is spent by `T`, and the leaf consignment
-//!     validates against the CHAIN ALONE for the full 250.
-//! (E) The clawback is DEFEATED: after mining past `L0`, a broadcast of the sender's matured,
-//!     RGB-unaware backup FAILS — the `F` it needs was already spent by the walk. Without the
-//!     watchtower an idle bob would have lost the allocation here.
+//! (A) ISSUED carrier: `auto_exit_due` and `deadline_safety_due` are no-ops at an absurd margin;
+//!     `F` untouched.
+//! (B) alice sends 250 to bob → bob holds a COLOURED CHILD rooted at alice's carrier funding `F`.
+//!     Neither side holds a flat backup row; both coins carry `locktime == None`. `auto_exit_due`
+//!     at an absurd margin does NOT act on the child — there is no height to be due against.
+//! (C) THE OLD HORIZON PASSES WITH NOTHING HAPPENING. Both wallets idle past `H_F + initlock` —
+//!     the block at which the sender's backup used to mature. Every automatic pass on both sides
+//!     (`defend_ladders`, `auto_exit_due`, `deadline_safety_due`) is a no-op, `F` is unspent, all
+//!     five tiers are off-chain: 0 vB of rent, and no clawback to defend against.
+//! (D) A HOSTILE TRIGGER IS ANSWERED. An adversary broadcasts the parent's `T`. Bob only ever calls
+//!     `defend_ladders()`; pass after pass it pushes the next matured tier — a `LadderDefended`
+//!     event fires — until all five RGB-aware tiers are mined, `F` is spent by `T`, and the leaf
+//!     consignment validates against the CHAIN ALONE for the full 250.
+//! (E) THE SENDER HOLDS NO RIVAL. Zero flat rows for the carrier, `locktime == None`, the legacy
+//!     `broadcast_backup_tx` entry point refuses her carrier by name ("no flat backup transaction
+//!     to broadcast"), and every pre-signed spend of `F` her ladder row holds is RGB-aware (one
+//!     OP_RETURN) and rooted at the very trigger bob's chain rides on.
 //!
 //! Run: SDK_E2E=34 ML_NETWORK=regtest cargo run
 
@@ -46,6 +50,12 @@ use mercury_utexo_sdk::{SdkConfig, UtexoWallet, WalletEvent};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
+
+const PAY: u64 = 250;
+/// Far above any height a regtest coin could have been "due" at under the old calendar (`initlock`
+/// is 1 000). Every deadline pass takes the margin as a PARAMETER, so this drives exactly the
+/// branch a real deadline would have driven — and it must select nothing.
+const HUGE_MARGIN: u32 = 1_000_000;
 
 async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
     let token = mercuryrustlib::deposit::get_token(cc).await?;
@@ -131,8 +141,9 @@ fn is_outpoint_spent(cc: &ClientConfig, txid: &str, vout: u32) -> Result<bool> {
     let spk = &tx.output[vout as usize].script_pubkey;
     Ok(!cc.electrum_client.script_list_unspent(spk)?.iter().any(|u| u.tx_hash.to_string() == txid && u.tx_pos as u32 == vout))
 }
-/// Confirmation height of `txid`, read from the history of the address it pays at `vout` — the same
-/// anchor `deposit_anchored_deadline` uses inside the SDK.
+/// Confirmation height of `txid`, read from the history of the address it pays at `vout`. Used
+/// only to locate the OLD horizon `H_F + initlock` — the block the sender's flat backup used to
+/// mature at — so (C) can idle past it.
 fn confirmation_height(cc: &ClientConfig, txid: &str, vout: u32) -> Result<u32> {
     use electrum_client::bitcoin::Txid;
     let t = Txid::from_str(txid)?;
@@ -145,11 +156,14 @@ fn confirmation_height(cc: &ClientConfig, txid: &str, vout: u32) -> Result<u32> 
         .map(|h| h.height as u32)
         .ok_or_else(|| anyhow!("{txid} is not confirmed yet"))
 }
-fn drain_materialized(rx: &mut tokio::sync::broadcast::Receiver<WalletEvent>) -> Vec<String> {
+fn drain_defended(rx: &mut tokio::sync::broadcast::Receiver<WalletEvent>) -> Vec<String> {
     let mut out = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let WalletEvent::TokenCarrierMaterialized { statechain_id, .. } = ev {
-            out.push(statechain_id);
+    loop {
+        match rx.try_recv() {
+            Ok(WalletEvent::LadderDefended { statechain_id, .. }) => out.push(statechain_id),
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
         }
     }
     out
@@ -164,6 +178,22 @@ async fn adopted_child_sid(cc: &ClientConfig, wallet_name: &str) -> Result<Optio
         }
     }
     Ok(None)
+}
+async fn coin_of(cc: &ClientConfig, name: &str, id: &str) -> Result<mercuryrustlib::Coin> {
+    mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, name).await?
+        .coins.into_iter().find(|c| c.statechain_id.as_deref() == Some(id) && c.duplicate_index == 0)
+        .ok_or_else(|| anyhow!("{name} has no coin {id}"))
+}
+/// The flat backup rows stored for `sid` — `None` (no row) and an empty row both count as zero.
+async fn flat_rows(cc: &ClientConfig, name: &str, sid: &str) -> Result<usize> {
+    Ok(mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, name, sid)
+        .await?
+        .map_or(0, |rows| rows.len()))
+}
+fn txid_of(hex_tx: &str) -> Result<String> {
+    let tx: electrum_client::bitcoin::Transaction =
+        electrum_client::bitcoin::consensus::deserialize(&hex::decode(hex_tx)?)?;
+    Ok(tx.txid().to_string())
 }
 
 pub async fn execute() -> Result<()> {
@@ -203,45 +233,77 @@ pub async fn execute() -> Result<()> {
         "this test drives the COLOURED lane; the carrier's ladder is plain, so nothing below is \
          testing what it claims to test"
     );
-    println!("SDK34 - alice issued 1000 {asset} on carrier {carrier_id} (COLOURED ladder); F={f_txid}:{f_vout}, initlock={initlock}");
+    let h_f = confirmation_height(&cc, &f_txid, f_vout)?;
+    let old_horizon = h_f + initlock;
+    println!("SDK34 - alice issued 1000 {asset} on carrier {carrier_id} (COLOURED ladder); F={f_txid}:{f_vout} confirmed at {h_f}; the OLD calendar horizon would have been {old_horizon} (initlock={initlock})");
 
-    // ===== (A) ISSUED carrier is not acted on ==================================================
-    // An issued carrier has no ancestor: no `branch-<id>` chain and no `ctesr-<id>` bundle of its
-    // own, so no stale backup exists that could race it. The watchtower must skip it even at an
-    // absurd margin — the assertion is unchanged from the flat lane, and it still discriminates
-    // (the coloured-children loop keys on `ctesr-` rows, of which alice has none yet).
-    let a = alice.auto_exit_due(1_000_000).await?;
+    // ===== (A) ISSUED carrier is not acted on, at any margin ====================================
+    // An issued carrier has no exit branch, and `auto_exit_due` acts only on a coin with a branch
+    // (the one shape that has an `exit_deadline_block`); `deadline_safety_due` selects on
+    // `coin_near_final`, which reads a `locktime` no laddered coin has. Both must be no-ops even at
+    // an absurd margin — and must say so with `Ok`, not with an `Err` naming the carrier.
+    let a = alice.auto_exit_due(HUGE_MARGIN).await?;
     assert!(
         !a.contains(&carrier_id),
-        "the issued carrier has no ancestor and must NOT be acted on (got {a:?})"
+        "the issued carrier has no exit branch and no deadline, and must NOT be acted on (got {a:?})"
+    );
+    let (re_anchored, severed) = alice.deadline_safety_due(HUGE_MARGIN).await.map_err(|e| {
+        anyhow!("(A) deadline_safety_due must not go blind or report the carrier UNDEFENDED: {e:#}")
+    })?;
+    assert!(
+        re_anchored.is_empty() && severed.is_empty(),
+        "(A) the deadline pass acted on a coin with no calendar (re-anchored {re_anchored:?}, \
+         severed {severed:?})"
     );
     assert!(
         !is_outpoint_spent(&cc, &f_txid, f_vout)?,
         "the watchtower broadcast something over an issued carrier's funding output"
     );
-    println!("SDK34 - (A) issued carrier {carrier_id} is NOT acted on at margin 1_000_000 (no ancestor, no clawback risk) — F untouched");
+    assert_eq!(
+        coin_of(&cc, "sdk34_alice", &carrier_id).await?.locktime,
+        None,
+        "a laddered carrier has no absolute calendar: coin.locktime must be None"
+    );
+    println!("SDK34 - (A) issued carrier {carrier_id} is NOT acted on at margin {HUGE_MARGIN} by either pass (no branch, no locktime) — F untouched");
 
     // ===== (B) set up a RECEIVED coloured child ================================================
     add_tokens(&cc, &alice, 3).await?;
-    let r = alice.transfer_tokens(&asset, &bob_addr, 250).await?;
+    let r = alice.transfer_tokens(&asset, &bob_addr, PAY).await?;
     assert!(r.used_split, "a token transfer is an off-chain split");
-    wait_token_balance(&bob, &asset, 250).await?;
+    wait_token_balance(&bob, &asset, PAY).await?;
     let bob_piece = adopted_child_sid(&cc, "sdk34_bob").await?
         .ok_or_else(|| anyhow!("bob booked the tokens but adopted NO child bundle"))?;
     let bob_cb = mercuryrustlib::tesr::load_child(&cc, "sdk34_bob", &bob_piece).await?
         .ok_or_else(|| anyhow!("bob's child bundle vanished"))?;
     assert!(bob_cb.is_colored(), "bob's received child must be COLOURED — a plain tier over it destroys the 250");
-    // The shape that broke the un-migrated test, asserted rather than assumed: there is NO
-    // `branch-` row on this lane. The walk IS the branch.
+    // There is NO `branch-` row on this lane, and no flat row on EITHER side. The walk IS the exit.
     let all_rows = mercuryrustlib::sqlite_manager::get_all_backup_txs(&cc.pool, "sdk34_bob").await?;
     assert!(
         !all_rows.iter().any(|(k, _)| *k == format!("branch-{bob_piece}")),
         "bob's coloured child unexpectedly has a `branch-` row — this test would then be exercising \
-         the flat lane it was migrated off"
+         the retired flat lane"
     );
     assert!(
         all_rows.iter().any(|(k, _)| *k == format!("ctesr-{bob_piece}")),
         "bob's coloured child has no `ctesr-` bundle — it has no exit material at all"
+    );
+    assert_eq!(
+        flat_rows(&cc, "sdk34_bob", &bob_piece).await?,
+        0,
+        "the receiver of a piece must hold ZERO flat backup rows for it — a conveyed flat backup is \
+         refused by name, and there is none to convey"
+    );
+    assert_eq!(
+        flat_rows(&cc, "sdk34_alice", &carrier_id).await?,
+        0,
+        "the SENDER must hold ZERO flat backup rows for the carrier — a flat rung would be exactly \
+         the matured spend of F this test used to defend against"
+    );
+    assert_eq!(coin_of(&cc, "sdk34_bob", &bob_piece).await?.locktime, None, "bob's piece has no locktime");
+    assert!(
+        bob_cb.parent_flat_backups.is_empty(),
+        "the child bundle must convey an EMPTY parent flat chain — got {}",
+        bob_cb.parent_flat_backups.len()
     );
     let chain = mercuryrustlib::tesr::child_exit_chain(&bob_cb);
     assert_eq!(chain.len(), 5, "a coloured child's chain is T, X_m, SP, ext_child, state_child");
@@ -250,91 +312,99 @@ pub async fn execute() -> Result<()> {
     let root = root_tx.input[0].previous_output;
     assert_eq!(
         (root.txid.to_string(), root.vout), (f_txid.clone(), f_vout),
-        "bob's chain must root at the carrier's own funding output, or it is not racing the \
-         sender's backup at all"
+        "bob's chain must root at the carrier's own funding output"
     );
-    // The effective deadline, computed exactly as the watchtower computes it: the deposit-anchored
-    // `L0` of the funding output the chain roots at, MINUS the relative timelocks the walk must sit
-    // through. A walk started later than this cannot finish before the sender's backup matures.
-    let h_f = confirmation_height(&cc, &f_txid, f_vout)?;
-    let l0 = h_f + initlock;
-    let head_start: u32 = chain.iter().filter_map(|(_, csv)| *csv).map(u32::from).sum();
-    let d = l0 - head_start;
-    let headroom0 = d as i64 - tip(&cc)? as i64;
-    assert!(headroom0 > 100, "bob's child should start well ahead of its deadline (headroom {headroom0})");
-    println!("SDK34 - (B) alice→bob 250 {asset}: bob holds COLOURED CHILD {bob_piece} (no branch row, 5-tier chain rooted at F); L0={l0} (F confirmed at {h_f} + initlock {initlock}), Σcsv head start {head_start} ⟹ effective deadline D={d} (headroom {headroom0})");
-
-    // ===== (C) watchtower does NOTHING while comfortably ahead of D ==============================
-    let none = bob.auto_exit_due(20).await?;
-    assert!(!none.contains(&bob_piece), "far from the deadline, the child must not be driven yet");
+    let trigger_txid = root_tx.txid().to_string();
+    let tier_txids: Vec<String> = chain.iter().map(|(hex_tx, _)| txid_of(hex_tx)).collect::<Result<_>>()?;
+    // No height to be due against: even at an absurd margin the child is left alone.
+    let none = bob.auto_exit_due(HUGE_MARGIN).await?;
+    assert!(
+        !none.contains(&bob_piece),
+        "auto_exit_due acted on the coloured child at margin {HUGE_MARGIN} — it invented a deadline \
+         for a coin that has none (got {none:?})"
+    );
     assert!(!is_outpoint_spent(&cc, &f_txid, f_vout)?, "the chain is still off-chain (F unspent)");
-    for (hex_tx, _) in chain.iter() {
-        let tx: electrum_client::bitcoin::Transaction =
-            electrum_client::bitcoin::consensus::deserialize(&hex::decode(hex_tx)?)?;
-        assert!(onchain(&cc, &tx.txid().to_string()).is_none(), "tier {} reached the chain early", tx.txid());
-    }
-    println!("SDK34 - (C) comfortably ahead of D (headroom {headroom0} > margin 20): watchtower is a no-op, all 5 tiers stay off-chain, 0 vB of rent");
+    println!("SDK34 - (B) alice→bob {PAY} {asset}: bob holds COLOURED CHILD {bob_piece} (no branch row, no flat row on either side, empty parent chain, 5-tier chain rooted at F, trigger {trigger_txid}); auto_exit_due({HUGE_MARGIN}) leaves it alone");
 
-    // ===== (D) near D → the watchtower DRIVES THE WALK ==========================================
-    mine_and_sync(&cc, &core, 100)?;
-    let headroom = d as i64 - tip(&cc)? as i64;
-    assert!(headroom > 0, "still before the deadline when the watchtower fires (headroom {headroom})");
-    let margin = (headroom + 30) as u32; // guarantees tip + margin >= D → due
-    let mut rx = bob.subscribe();
-    // NOTHING below calls `unilateral_exit` directly. Every tier that reaches the chain is put
-    // there by an `auto_exit_due` pass, which is the only way this can be evidence about the
-    // WATCHTOWER rather than about the exit API it happens to call.
-    let tier_txids: Vec<String> = chain
-        .iter()
-        .map(|(hex_tx, _)| -> Result<String> {
-            let tx: electrum_client::bitcoin::Transaction =
-                electrum_client::bitcoin::consensus::deserialize(&hex::decode(hex_tx)?)?;
-            Ok(tx.txid().to_string())
-        })
-        .collect::<Result<_>>()?;
-    let mined_count = |cc: &ClientConfig| tier_txids.iter().filter(|t| onchain(cc, t).is_some()).count();
+    // ===== (C) THE OLD HORIZON PASSES, AND NOTHING HAPPENS ======================================
+    // Under the flat chain this is the block the sender's backup matured at, and an idle receiver
+    // lost the allocation here. Idle both wallets past it and run every automatic pass on both
+    // sides: each must be a verified no-op, `F` must be unspent, every tier off-chain.
+    let target = old_horizon + 20;
+    let now = tip(&cc)?;
+    if now < target {
+        mine_and_sync(&cc, &core, target - now)?;
+    }
+    let tip_c = tip(&cc)?;
+    assert!(tip_c > old_horizon, "(C) the tip ({tip_c}) must be past the old horizon {old_horizon}");
+    alice.claim().await?;
+    bob.claim().await?;
+    let a_def = alice.defend_ladders().await.map_err(|e| anyhow!("(C) alice's defence pass went blind: {e:#}"))?;
+    let b_def = bob.defend_ladders().await.map_err(|e| anyhow!("(C) bob's defence pass went blind: {e:#}"))?;
+    assert!(a_def.is_empty() && b_def.is_empty(), "(C) a defence pass broadcast something with F unspent (alice {a_def:?}, bob {b_def:?})");
+    let a_exit = alice.auto_exit_due(HUGE_MARGIN).await?;
+    let b_exit = bob.auto_exit_due(HUGE_MARGIN).await?;
+    assert!(a_exit.is_empty() && b_exit.is_empty(), "(C) auto_exit_due acted past the old horizon (alice {a_exit:?}, bob {b_exit:?})");
+    let (a_re, a_sev) = alice.deadline_safety_due(HUGE_MARGIN).await.map_err(|e| anyhow!("(C) alice's deadline pass must not go blind or report UNDEFENDED: {e:#}"))?;
+    assert!(a_re.is_empty() && a_sev.is_empty(), "(C) the deadline pass acted past the old horizon (re-anchored {a_re:?}, severed {a_sev:?})");
+    assert!(
+        !is_outpoint_spent(&cc, &f_txid, f_vout)?,
+        "(C) F was spent while both wallets sat idle past the old horizon — something still holds a \
+         matured spend of F"
+    );
+    for t in tier_txids.iter() {
+        assert!(onchain(&cc, t).is_none(), "(C) tier {t} reached the chain while idle — idle coins must cost 0 vB");
+    }
+    assert_eq!(token_balance(&bob, &asset).await?, PAY, "(C) bob still holds all {PAY}");
+    println!("SDK34 - (C) tip {tip_c} > old horizon {old_horizon}: every pass on both sides is a no-op, F unspent, all 5 tiers off-chain — there is no clawback to defend against");
+
+    // ===== (D) a HOSTILE TRIGGER is answered by defend_ladders ==================================
+    // The child's only exposure. An adversary (anyone holding the co-signed `T` — the sender, a
+    // griefer) puts it on chain; from here the CSVs are counting and bob must race. NOTHING below
+    // calls `unilateral_exit` or `auto_exit_due`: every tier that reaches the chain is put there by
+    // a `defend_ladders` pass, which is the only way this is evidence about the WATCHTOWER rather
+    // than about the exit API it happens to call.
     let step = chain.iter().filter_map(|(_, csv)| *csv).max().unwrap_or(1) as u32 + 2;
+    cc.electrum_client.transaction_broadcast_raw(&hex::decode(&chain[0].0)?)
+        .map_err(|e| anyhow!("(D) the adversary could not broadcast the parent's trigger: {e}"))?;
+    mine_synced(&cc, &core, 1)?;
+    assert!(is_outpoint_spent(&cc, &f_txid, f_vout)?, "(D) the hostile trigger must have spent F");
+    // Let the trigger mature past the longest CSV, so every pass below is expected to make progress.
+    mine_synced(&cc, &core, step - 1)?;
+    let mut rx = bob.subscribe();
+    let mined_count = |cc: &ClientConfig| tier_txids.iter().filter(|t| onchain(cc, t).is_some()).count();
+    let mut saw_defended = false;
     let mut passes = 0;
     let mut before = mined_count(&cc);
+    assert_eq!(before, 1, "(D) only the trigger is on chain before the first defence pass");
     loop {
         passes += 1;
-        assert!(passes < 15, "the watchtower-driven walk did not converge ({before}/5 tiers mined)");
-        let acted = bob.auto_exit_due(margin).await?;
-        if passes == 1 {
-            assert!(
-                acted.contains(&bob_piece),
-                "the watchtower must protect the near-deadline COLOURED CHILD (got {acted:?}). On \
-                 this lane the child has no `branch-` row, so a watchtower that only knows how to \
-                 broadcast one reports it as a safe flat coin and leaves the allocation to be \
-                 destroyed."
-            );
-            let mat = drain_materialized(&mut rx);
-            assert!(mat.contains(&bob_piece), "a TokenCarrierMaterialized event must fire for {bob_piece} (got {mat:?})");
+        assert!(passes < 15, "(D) the watchtower-driven walk did not converge ({before}/5 tiers mined)");
+        let acted = bob.defend_ladders().await.map_err(|e| anyhow!(
+            "(D) defend_ladders went BLIND (or reported the child lost) mid-race: {e:#}"
+        ))?;
+        if drain_defended(&mut rx).contains(&bob_piece) {
+            saw_defended = true;
+            assert!(acted.contains(&bob_piece), "(D) a LadderDefended event without the pass reporting the child acted on");
         }
-        // Batch the bulk and sync only the last block: on a long-lived regtest each single-block
-        // `generatetoaddress` RPC costs seconds of wallet bookkeeping, so a per-block `mine_synced`
-        // loop makes this section 100x slower than it needs to be. Same total blocks, same waits
-        // that matter (the indexer only has to be current when the next pass READS the chain).
+        // Batch the bulk and sync only the last block (the indexer only has to be current when the
+        // next pass READS the chain).
         if step > 1 {
             bitcoin_core::generatetoaddress(step - 1, &core)?;
         }
         mine_synced(&cc, &core, 1)?;
         let now = mined_count(&cc);
-        if passes == 1 {
-            // The trigger is out: `F` is spent by an RGB-AWARE transaction. That single fact is
-            // what defeats (E), and it happened on the FIRST watchtower pass.
-            assert!(is_outpoint_spent(&cc, &f_txid, f_vout)?, "the first pass must spend F with the child's trigger");
-        }
         if now == tier_txids.len() {
             break;
         }
         assert!(
             now > before,
-            "pass {passes} made no progress ({now}/5 tiers mined) — the watchtower stopped driving \
-             a DUE child mid-walk, and a half-walked chain is not protection"
+            "(D) pass {passes} made no progress ({now}/5 tiers mined) — the watchtower stopped \
+             answering a hostile trigger mid-walk, and a half-walked chain is not protection"
         );
         before = now;
     }
+    assert!(saw_defended, "(D) defend_ladders must emit LadderDefended for {bob_piece} so wrappers can forward it");
     mine_synced(&cc, &core, 3)?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (hex_tx, _) in chain.iter() {
@@ -365,47 +435,45 @@ pub async fn execute() -> Result<()> {
         "THE ALLOCATION DID NOT SURVIVE the watchtower-driven walk: {e}"
     ))?;
     assert_eq!(proof_contract, asset, "the surviving allocation is THIS contract");
-    assert_eq!(proof_amount, 250, "all 250 units must survive");
-    bob.probe_colored_child_tip(&bob_piece, 250).await
+    assert_eq!(proof_amount, PAY, "all {PAY} units must survive");
+    bob.probe_colored_child_tip(&bob_piece, PAY).await
         .map_err(|e| anyhow!("the stock is DEAD after the walk: {e}"))?;
     assert!(
-        bob.probe_colored_child_tip(&bob_piece, 251).await.is_err(),
+        bob.probe_colored_child_tip(&bob_piece, PAY + 1).await.is_err(),
         "the stock probe accepted MORE than the allocation — it is not reading the stock"
     );
-    println!("SDK34 - (D) near D (headroom {headroom} ≤ margin {margin}): auto_exit_due PROTECTED {bob_piece} (TokenCarrierMaterialized) and drove all 5 RGB-aware tiers on chain over {passes} pass(es); F is spent by the child's trigger and the leaf consignment now validates against the CHAIN ALONE for 250 {asset} — settled on-chain, no SE");
+    println!("SDK34 - (D) a hostile trigger was ANSWERED: defend_ladders alone drove all 5 RGB-aware tiers on chain over {passes} pass(es) (LadderDefended fired); F is spent by the child's trigger and the leaf consignment validates against the CHAIN ALONE for {PAY} {asset}");
 
-    // ===== (E) the clawback is now DEFEATED =====================================================
-    // The sender keeps ONE pre-signed, RGB-UNAWARE backup whose input is the same `F`. Mine past its
-    // absolute locktime and try it: it FAILS, because the walk already spent `F`. Note what changed
-    // with the lane — on the flat lane this backup RECOVERED the tokens for the sender; here it can
-    // only destroy them (it carries no RGB transition), so the receiver's exposure is griefing
-    // rather than theft. The defence, and this test, are the same either way.
-    let alice_backup = mercuryrustlib::sqlite_manager::get_backup_txs(&cc.pool, "sdk34_alice", &carrier_id).await?;
-    let alice_bk = alice_backup.iter().min_by_key(|b| b.tx_n)
-        .ok_or_else(|| anyhow!("alice has no carrier backup"))?;
-    let alice_bk_tx: electrum_client::bitcoin::Transaction =
-        electrum_client::bitcoin::consensus::deserialize(&hex::decode(&alice_bk.tx)?)?;
-    assert_eq!(
-        alice_bk_tx.input[0].previous_output.txid.to_string(), f_txid,
-        "the sender's backup must spend the same F the walk spent, or it is no rival"
-    );
-    assert_eq!(
-        alice_bk_tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count(), 0,
-        "the sender's retained backup must be the RGB-UNAWARE shape this section is about"
-    );
-    let l0_alice = mercurylib::utils::get_blockheight(alice_bk)?;
-    mine_and_sync(&cc, &core, l0_alice.saturating_sub(tip(&cc)?) + 20)?;
-    assert!(tip(&cc)? > l0_alice, "the sender's carrier backup is now mature (tip > L0={l0_alice})");
-    let claw = cc.electrum_client.transaction_broadcast_raw(&hex::decode(&alice_bk.tx)?);
+    // ===== (E) THE SENDER HOLDS NO RIVAL ========================================================
+    // What (E) used to do was mine past the sender's backup locktime and prove the matured backup
+    // could no longer broadcast because the walk had spent `F` first. There is no such backup: the
+    // sender holds no flat row, no locktime, and no RGB-unaware spend of `F` at all.
+    assert_eq!(flat_rows(&cc, "sdk34_alice", &carrier_id).await?, 0, "(E) alice holds no flat backup row for the carrier");
+    assert_eq!(coin_of(&cc, "sdk34_alice", &carrier_id).await?.locktime, None, "(E) alice's carrier has no locktime");
+    let legacy = mercuryrustlib::broadcast_backup_tx::execute(&cc, "sdk34_alice", &carrier_id, None, None).await;
+    let legacy_msg = legacy.err().map(|e| e.to_string()).unwrap_or_default();
     assert!(
-        claw.is_err(),
-        "the sender's stale backup must FAIL to broadcast — the F it needs was already spent by the \
-         watchtower-driven walk"
+        legacy_msg.contains("no flat backup transaction to broadcast"),
+        "(E) the legacy flat-backup broadcast must refuse a laddered carrier BY NAME — got: {legacy_msg:?}"
     );
-    assert!(is_outpoint_spent(&cc, &f_txid, f_vout)?, "F remains spent by bob's trigger, not the sender's backup");
-    assert_eq!(token_balance(&bob, &asset).await?, 250, "bob still holds all 250 after the failed sweep");
-    println!("SDK34 - (E) CLAWBACK DEFEATED: even with its backup mature (tip {} > L0 {l0_alice}) the sender cannot spend F — {} — bob keeps 250; without the watchtower an idle bob would have lost the allocation here", tip(&cc)?, claw.err().map(|e| e.to_string().chars().take(80).collect::<String>()).unwrap_or_default());
+    let alice_row = mercuryrustlib::tesr::load(&cc, "sdk34_alice", &carrier_id).await?
+        .ok_or_else(|| anyhow!("(E) alice's ladder row for the carrier vanished"))?;
+    assert_eq!(
+        alice_row.trigger.txid, trigger_txid,
+        "(E) the only spend of F the sender holds must be the very trigger bob's chain rides on"
+    );
+    for t in alice_row.exit_tiers() {
+        let tx: electrum_client::bitcoin::Transaction =
+            electrum_client::bitcoin::consensus::deserialize(&hex::decode(&t.signed_tx)?)?;
+        assert_eq!(
+            tx.output.iter().filter(|o| o.script_pubkey.is_op_return()).count(), 1,
+            "(E) every pre-signed tier the sender retains must be RGB-AWARE — an RGB-unaware spend of F \
+             is the clawback shape, and none may exist"
+        );
+    }
+    assert_eq!(token_balance(&bob, &asset).await?, PAY, "(E) bob keeps all {PAY}");
+    println!("SDK34 - (E) the sender holds NO rival: 0 flat rows, locktime=None, the legacy broadcast refuses by name ({}), and every tier she retains is RGB-aware and rooted at bob's own trigger", legacy_msg.chars().take(90).collect::<String>());
 
-    println!("SDK34 - SUCCESS: the auto_exit_due watchtower protects RECEIVED carriers on the COLOURED lane. A received piece is now a coloured CHILD with no `branch-` row, so the flat lane's 'broadcast the branch' has been replaced by driving the child's five RGB-aware tiers through unilateral_exit, against a deadline that is head-started by the walk's own Σcsv. Issued carriers (no ancestor, no rival backup) are still left untouched at any margin. The property sdk34 has always asserted is unchanged: an idle receiver is automatically protected — F is spent in time by an RGB-AWARE transaction, the allocation survives on chain, and the sender's stale RGB-unaware backup can never confirm.");
+    println!("SDK34 - SUCCESS: a RECEIVED coloured child has NO calendar. The old horizon (H_F + initlock) passed with every automatic pass on both sides a verified no-op, F unspent and 0 vB spent; the child's only exposure is a hostile trigger, which defend_ladders answered tier by tier until the allocation settled on chain; and the sender holds no RGB-unaware spend of F to claw anything back with.");
     Ok(())
 }

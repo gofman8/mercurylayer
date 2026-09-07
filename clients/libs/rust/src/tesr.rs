@@ -385,28 +385,14 @@ pub struct ChildTesrBundle {
     /// message deserializing byte-identically.
     #[serde(default)]
     pub rgb: Option<ColoredChild>,
-    /// **The parent segment's FLAT (signed-once) backup chain, conveyed.**
-    ///
-    /// The census `verify_child_bundle` runs over the ancestor segment is
-    /// `num_sigs(parent) == flat_backups + tiers + superseded`, and `flat_backups` is a fact about
-    /// the parent's history that the receiver cannot observe: it never owned the parent. It used to
-    /// be supplied as the constant [`PARENT_V2_BASELINE`] (= 1), which is right only for a parent
-    /// this wallet DEPOSITED — every whole-coin hop co-signs one more flat backup
-    /// (`transfer_sender::create_backup_tx_to_receiver`), so a parent received `k` times carries
-    /// `1 + k` and the constant under-counts by exactly `k`.
-    ///
-    /// So the chain is CONVEYED and the receiver counts it itself, exactly as the whole-coin receive
-    /// path does (`transfer_receiver.rs`, `transfer_msg.backup_transactions.len()`). A conveyed count
-    /// is only safe because it is STRUCTURALLY VALIDATED before it is counted
-    /// ([`verify_conveyed_child`] runs `validate_backup_chain_v2` against the parent's on-chain `F`):
-    /// every entry must be a real taproot key-spend of `F` under `A_parent` — i.e. must have consumed
-    /// a real SE co-sign — and INV-5 (`ladder_decrements_by_interval`) forbids duplicate padding and
-    /// ladder inversion. An attacker can therefore not inflate this term to absorb a hidden co-signed
-    /// state; that is the same argument [S2] makes for the whole-coin lane.
-    ///
-    /// `#[serde(default)]` for the usual reason — already-persisted `ctesr-*` rows and in-flight
-    /// mailbox messages keep deserializing. An EMPTY vector is refused by the verifier (a parent
-    /// always carries at least its deposit `tx1`), so the default is fail-closed, not fail-open.
+    /// **Always EMPTY.** A laddered parent has no flat backup chain: none is co-signed at deposit
+    /// (the ladder is signed at first sight instead) and none at any hop. The census the receiver
+    /// runs over the ancestor segment is therefore `num_sigs(parent) == tiers + superseded`, with
+    /// the flat term pinned to zero — and [`verify_conveyed_child`] REFUSES a bundle that conveys
+    /// anything here, because a conveyed flat backup would be a co-sign the census cannot account
+    /// for and a matured spend of `F` in some past owner's hands. The field is kept only so that
+    /// already-persisted rows and in-flight messages keep deserializing; `#[serde(default)]` makes
+    /// the absent case the correct one.
     #[serde(default)]
     pub parent_flat_backups: Vec<mercurylib::wallet::BackupTx>,
 }
@@ -1754,8 +1740,13 @@ pub fn colored_tier_seal(
     crate::rgb::TierSeal::new(statechain_id, role, level, rung)
 }
 
-/// Establish a confirmed coin's TES-R ladder: build + blind-co-sign T → X_0 → S_0 over the funding
-/// UTXO `F`. `coin` must be CONFIRMED with utxo/amount/aggregated_address populated.
+/// Establish a coin's TES-R ladder: build + blind-co-sign T → X_0 → S_0 over the funding UTXO `F`.
+///
+/// `coin` needs only `utxo_txid`/`utxo_vout`/`amount`/`aggregated_address` populated — the moment
+/// the funding transaction is first SEEN, confirmed or not. Nothing here reads the chain and the
+/// coordinator never gates a co-sign on confirmation, which is what lets the ladder be the coin's
+/// exit from its first moment in the mempool. This is the coin's ONLY exit material: there is no
+/// flat absolute-locktime backup before it, beside it, or after it.
 pub async fn establish(
     cc: &ClientConfig,
     coin: &mut Coin,
@@ -2060,25 +2051,18 @@ pub fn build_colored_ladder_auto(
 ///
 /// ## The census, spelled out (it is the thing most likely to be got wrong)
 ///
-/// `verify_bundle_bound` enforces `se_num_sigs == flat_backups + tiers + superseded`. For a coloured
-/// coin every term is IDENTICAL to a plain one:
+/// `verify_bundle_bound` enforces `se_num_sigs == flat_backups + tiers + superseded`, and for every
+/// coin the flat term is ZERO: no flat backup is ever co-signed — not at deposit, where the ladder
+/// itself is signed at first sight of the funding transaction, and not at any hop. So:
 ///
-/// * `flat_backups` STAYS the deposit-anchored chain length. It is tempting to reason "a coloured
-///   coin's flat backup is an RGB-unaware spend of `F`, so a coloured ladder must not carry one" and
-///   pass 0 — but `tx1` was co-signed at deposit-init, before the coin had any RGB on it, and that
-///   co-sign is permanent and un-retractable. Passing 0 makes `expected = 3` against a live
-///   `num_sigs` of 4, and EVERY coloured coin then dies at claim with "num_sigs mismatch". There is
-///   no way to un-count `tx1`.
+/// * `flat_backups` is 0. A coloured coin never had a plain spend of `F` co-signed for it, which is
+///   exactly what makes it safe: there is no RGB-unaware spend of the sealed funding output in any
+///   past owner's hands, ever.
 /// * `tiers` is 3, because colouring adds no co-sign: one input, one sighash, one `cosign_tier`.
 /// * `superseded` is 0 at establish.
 ///
-/// So: deposit `1 = 1 + 0 + 0`; after this call `4 = 1 + 3 + 0`. Balanced, and identical to plain.
-///
-/// The retained flat backups are still a live, allocation-destroying spend of `F` that the owner
-/// holds — they must never be the recommended exit for a coloured coin, and `unilateral_exit`'s
-/// non-laddered fallback must never reach one. That is a SAFETY property of the exit path, not an
-/// arithmetic one, and it is why the coloured coin's other spend lanes are refused (see
-/// [`refuse_uncolored_over_colored`] and the SDK's colored-split interlock).
+/// So: before this call the enclave's count is 0; after it, `3 = 0 + 3 + 0`. Balanced, and
+/// identical to plain.
 pub async fn cosign_colored_ladder(
     cc: &ClientConfig,
     coin: &mut Coin,
@@ -2154,8 +2138,8 @@ pub async fn cosign_colored_ladder(
     };
     // Self-check with the SAME predicate a receiver runs. Colouring shifts every payload vout, so a
     // mis-threaded index would only surface at the far end; catch it here, while the co-signs are
-    // still ours to explain. `flat_backups = 1` (the deposit-anchored tx1) + 3 tiers + 0 superseded.
-    verify_bundle(&bundle, 4, 1).map_err(|e| {
+    // still ours to explain. `flat_backups = 0` (no flat backup exists) + 3 tiers + 0 superseded.
+    verify_bundle(&bundle, 3, 0).map_err(|e| {
         anyhow::anyhow!("the coloured ladder just built does not verify as an exit chain: {e}")
     })?;
     Ok(bundle)
@@ -2854,11 +2838,8 @@ pub async fn cosign_colored_spine_batch(
     // [P0-2]/[P0-3] THE DEPTH AND LENGTH CAPS, measured on the chain this batch actually mints: the
     // root's own exit chain plus one tier per intermediate segment already walked, plus this one.
     let depth = tip.ancestors.len() as u32 + 1;
-    // [D36 T-4] The window is the ROOT's: a spine tip has no flat backup chain of its own, and the
-    // epoch every leg's exit must fit inside is the one the root coin was funded into.
     enforce_split_depth_cap(
         cc,
-        &tip.parent_flat_backups,
         tip.parent.params,
         depth,
         tip.parent.exit_tiers().len() + tip.ancestors.len() + 1,
@@ -4091,24 +4072,10 @@ pub async fn cosign_colored_in_ladder_split(
     // from a failed read), so decorating it at the source breaks absence detection wallet-wide.
     // Decorating it at a call site that treats every failure alike is safe, and is the difference
     // between a diagnosable refusal and a naked "no rows returned by a query".
-    let parent_backups =
-        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "in-ladder split refused: the flat backup rows of parent {parent_sid} in \
-                     wallet {wallet_name} could not be read ({e}) — the child's census cannot be \
-                     balanced without them"
-                )
-            })?;
-    if (parent_backups.len() as u32) < PARENT_V2_BASELINE {
-        return Err(anyhow::anyhow!(
-            "coloured in-ladder split refused: this carrier holds {} flat backup transaction(s), \
-             fewer than the {PARENT_V2_BASELINE} every deposited coin carries — the local backup \
-             record is incomplete and the child's census could not be balanced by any receiver",
-            parent_backups.len(),
-        ));
-    }
+    // A laddered parent has NO flat backup chain; the conveyed field is always empty and the
+    // receiver's census counts the parent's tiers and superseded tiers only.
+    let parent_backups: Vec<mercurylib::wallet::BackupTx> = Vec::new();
+    let _ = wallet_name;
 
     // [P0-2]/[P0-3] THE DEPTH AND LENGTH CAPS. This lane had NEITHER: `cosign_colored_in_ladder_split`
     // was the one builder with no `enforce_split_depth_cap` call, uncovered by construction rather
@@ -4119,7 +4086,7 @@ pub async fn cosign_colored_in_ladder_split(
     //
     // Checked BEFORE anything irreversible: the parent is terminalized further down, and a refusal
     // here leaves the carrier whole, spendable and re-transferable.
-    enforce_split_depth_cap(cc, &parent_backups, bundle.params, 1, bundle.exit_tiers().len())
+    enforce_split_depth_cap(cc, bundle.params, 1, bundle.exit_tiers().len())
         .await?;
 
     // Every child coin is matched to its draft child BEFORE anything irreversible happens. This used
@@ -6274,33 +6241,16 @@ pub async fn in_ladder_split(
     // from a failed read), so decorating it at the source breaks absence detection wallet-wide.
     // Decorating it at a call site that treats every failure alike is safe, and is the difference
     // between a diagnosable refusal and a naked "no rows returned by a query".
-    let parent_backups =
-        crate::sqlite_manager::get_backup_txs(&cc.pool, wallet_name, &parent_sid)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "in-ladder split refused: the flat backup rows of parent {parent_sid} in \
-                     wallet {wallet_name} could not be read ({e}) — the child's census cannot be \
-                     balanced without them"
-                )
-            })?;
-    if (parent_backups.len() as u32) < PARENT_V2_BASELINE {
-        return Err(anyhow::anyhow!(
-            "in-ladder split refused: this coin holds {} flat backup transaction(s), fewer than the \
-             {PARENT_V2_BASELINE} every deposited coin carries — the local backup record is \
-             incomplete and the child's census could not be balanced by any receiver",
-            parent_backups.len(),
-        ));
-    }
-    // [P0-2] A root split mints depth-1 children. Normally admissible, but not if the REMAINING
-    // window is too short for even one level — check rather than assume. [P0-3] The parent's REAL
-    // tier count goes with it: a rolled-over ladder is `1 + 2·levels.len()` transactions, and the
-    // children's exit walks inherit every one of them.
-    //
-    // [D36 T-4] This sits BELOW the `parent_backups` fetch, not above it, because the cap now
-    // measures the window those backups define. Still strictly before anything irreversible: the
-    // write-ahead and `set_spend_budget` are below, so a refusal here leaves the parent whole.
-    enforce_split_depth_cap(cc, &parent_backups, p, 1, bundle.exit_tiers().len()).await?;
+    // A laddered parent has NO flat backup chain; the conveyed field is always empty and the
+    // receiver's census counts the parent's tiers and superseded tiers only.
+    let parent_backups: Vec<mercurylib::wallet::BackupTx> = Vec::new();
+    let _ = (&parent_sid, wallet_name);
+    // [P0-2] A root split mints depth-1 children. Normally admissible, but not if even one level
+    // does not fit the exit window — check rather than assume. [P0-3] The parent's REAL tier count
+    // goes with it: a rolled-over ladder is `1 + 2·levels.len()` transactions, and the children's
+    // exit walks inherit every one of them. Strictly before anything irreversible: the write-ahead
+    // and `set_spend_budget` are below, so a refusal here leaves the parent whole.
+    enforce_split_depth_cap(cc, p, 1, bundle.exit_tiers().len()).await?;
 
     // [P0-3] WRITE AHEAD, THEN TERMINALIZE. Everything below `set_spend_budget` produces material the
     // SE will never re-issue; if this record is not on disk first, a crash anywhere in the rest of
@@ -6826,29 +6776,11 @@ async fn spine_batch_split_ex(
     let mut levels: Vec<SplitLevelShape> =
         tip.ancestors.iter().map(SplitLevelShape::of).collect();
     levels.push(SplitLevelShape::Spine);
-    // [D36 T-4] as above: the ROOT's remaining window, not the tip's own rows.
-    enforce_split_depth_cap_shaped(
-        cc,
-        &tip.parent_flat_backups,
-        p,
-        &levels,
-        tip.parent.exit_tiers().len(),
-    )
-    .await?;
+    enforce_split_depth_cap_shaped(cc, p, &levels, tip.parent.exit_tiers().len()).await?;
 
-    // [D1] The parent's flat backup chain travels with the tip (it was conveyed into the record when
-    // the tip was carved) and is what every piece's receiver counts. A record short of the deposit
-    // baseline could not balance any receiver's census, so refuse while the tip is still whole rather
-    // than mint pieces nobody can adopt.
-    if (tip.parent_flat_backups.len() as u32) < PARENT_V2_BASELINE {
-        return Err(anyhow::anyhow!(
-            "spine batch refused: the tip's record carries {} flat backup transaction(s) for parent \
-             {}, fewer than the {PARENT_V2_BASELINE} every deposited coin carries — no receiver \
-             could balance the pieces' census",
-            tip.parent_flat_backups.len(),
-            tip.parent_statechain_id
-        ));
-    }
+    // A laddered root has no flat backup chain, so a tip record that carries one describes a coin
+    // this protocol no longer mints; refuse while the tip is still whole.
+    refuse_conveyed_flat_backups("spine tip", &tip.parent_flat_backups)?;
 
     // ---- VALUE (only now) -----------------------------------------------------------------------
     // Carved out of `SP_i.out[K]` — the tip's FUNDING value, not the cap's output. The cap is the
@@ -7148,7 +7080,6 @@ pub async fn load(cc: &ClientConfig, wallet_name: &str, statechain_id: &str) -> 
 /// `new_depth` is the depth of the child the split is about to create (a root split child is 1).
 async fn enforce_split_depth_cap(
     cc: &ClientConfig,
-    parent_backups: &[mercurylib::wallet::BackupTx],
     p: mercurylib::tesr::TesrParams,
     new_depth: u32,
     parent_exit_tiers: usize,
@@ -7157,7 +7088,7 @@ async fn enforce_split_depth_cap(
     // this signature has always assumed. Stated as data now rather than baked into the body, because
     // the spine lane's levels are NOT that shape and the difference is a real block count.
     let levels = vec![SplitLevelShape::TwoTier; new_depth.saturating_sub(1) as usize];
-    enforce_split_depth_cap_shaped(cc, parent_backups, p, &levels, parent_exit_tiers).await
+    enforce_split_depth_cap_shaped(cc, p, &levels, parent_exit_tiers).await
 }
 
 /// **[CATS spine batch] The tiers ONE intermediate segment adds to a leaf's unilateral-exit walk.**
@@ -7349,63 +7280,28 @@ pub fn enforce_exit_chain_length(
 /// under-counted it would mint children no receiver would adopt, after the parent is terminal.
 async fn enforce_split_depth_cap_shaped(
     cc: &ClientConfig,
-    parent_backups: &[mercurylib::wallet::BackupTx],
     p: mercurylib::tesr::TesrParams,
     levels: &[SplitLevelShape],
     parent_exit_tiers: usize,
 ) -> Result<()> {
-    // Fail CLOSED: an unreadable epoch is a refusal, not an assumed-generous default.
+    // Fail CLOSED: an unreadable window is a refusal, not an assumed-generous default.
     let info = crate::utils::info_config(cc).await.map_err(|e| {
         anyhow::anyhow!(
-            "in-ladder split refused: the SE's funding-epoch length (`lockheight_init`) could not be \
-             read ({e}), so the exit-latency cap on split depth cannot be evaluated — refusing rather \
-             than minting a child that may be unmaterialisable"
+            "in-ladder split refused: the exit window (`lockheight_init`) could not be read from \
+             the SE ({e}), so the exit-latency cap on split depth cannot be evaluated — refusing \
+             rather than minting a child that may be unmaterialisable"
         )
     })?;
-    // ═══ [D36 T-4 / D55] THE REMAINING WINDOW, NOT THE CONSTANT ═══
+    // ═══ THE EXIT WINDOW IS A CONSTANT, NOT A CALENDAR ═══
     //
-    // This used to be `let epoch_blocks = info.initlock;` — the length of a FRESH epoch, i.e. the
-    // most generous window that can ever exist. The payee's gate measures
-    // `available = epoch_expiry_height - tip`, which is that number only at the instant the coin is
-    // funded and strictly smaller ever after: every whole-coin hop spends `interval` of it and every
-    // mined block spends one.
-    //
-    // So the builder was optimistic by exactly the age of the coin. [D53] closed the MARGIN half of
-    // the same divergence; this is the other half D36 named as "also required (T-4)", and together
-    // they are what makes `the_build_side_never_admits_what_the_receive_side_refuses` true of the
-    // live path and not only of the arithmetic.
-    //
-    // Derived in ONE place, from the parent's OWN flat backup chain — the same authority
-    // `verify_conveyed_child` reads — so the two sides cannot drift apart per call site. `min` with
-    // `initlock` is not belt-and-braces: a coordinator that served an absurd `lockheight_init` must
-    // not be able to widen this, and a deadline further out than one epoch would mean the backup
-    // chain disagrees with the epoch length.
-    //
-    // The backups are HANDED IN rather than looked up, and that is load-bearing. A first attempt
-    // fetched them by `(wallet_name, parent_sid)` and sdk17 caught it immediately: a wallet that
-    // holds a CONVEYED CHILD has never held the root, so the query returned no rows and every
-    // grandchild split was refused. The parent's flat chain travels WITH the bundle
-    // (`ChildTesrBundle::parent_flat_backups`, `SpineTipBundle::parent_flat_backups`) precisely
-    // because the child's own receiver needs it to balance the census — so it is the same authority
-    // `verify_conveyed_child` reads, which is what makes the two sides measure one quantity.
-    let deadline = epoch_deadline_from_flat_backups(parent_backups).map_err(|e| {
-        anyhow::anyhow!(
-            "in-ladder split refused: the parent's epoch deadline is not establishable ({e}), so \
-             the window this child's exit must fit inside is unknown. Refusing rather than falling \
-             back to the full epoch — that fallback is what let the builder mint children the payee \
-             refuses [D36 T-4]."
-        )
-    })?;
-    let tip = {
-        use electrum_client::ElectrumApi;
-        cc.electrum_client.block_headers_subscribe_raw().map_err(|e| {
-            anyhow::anyhow!(
-                "in-ladder split refused: the chain tip could not be read ({e}), so the REMAINING \
-                 window cannot be measured."
-            )
-        })?.height as u32
-    };
-    let epoch_blocks = deadline.saturating_sub(tip).min(info.initlock);
+    // A laddered coin has no absolute-locktime backup and therefore no epoch deadline: nothing in
+    // its exit material matures on its own, so there is no "remaining window" to measure against
+    // the tip. What the cap bounds instead is the LENGTH and LATENCY of the exit walk a leaf would
+    // inherit — how many transactions, and how many blocks of relative timelock — against one fixed
+    // window, `initlock`, the same constant the receiver's `enforce_exit_chain_length` measures
+    // with. That keeps `the_build_side_never_admits_what_the_receive_side_refuses` true of the live
+    // path: both sides read the same number from the same place.
+    let epoch_blocks = info.initlock;
     // [C-1] WHOSE SCHEDULE. `p` arrived from the CONVEYED artifact at every one of this function's
     // four call sites; the admission sites cap with `TesrParams::for_network`. Which one wins is
     // decided in exactly one place, so the two sides cannot drift apart call site by call site.
@@ -7497,29 +7393,37 @@ fn split_cap_decision(
     ))
 }
 
-/// Flat-backup **MINIMUM** of a natively-laddered on-chain PARENT coin. `sig_count` starts at 0
-/// (`generated_public_key DEFAULT 0`); the coin's on-chain deposit confirmation co-signs exactly ONE
-/// signed-once backup tx (`coin_status::check_deposit` → `create_tx1` for a non-single-use coin) before
-/// the ladder is established.
-///
-/// ⚠️ It is a MINIMUM, not the count. This constant used to be fed to `verify_child_bundle` as the
-/// parent's `flat_backups`, on the reasoning that a split-child receiver cannot observe the parent's
-/// history. That was only true for a parent the SENDER had deposited: every whole-coin hop co-signs
-/// one further flat backup (`transfer_sender::create_backup_tx_to_receiver`), so a parent received
-/// `k` times carries `1 + k` and the exact-equality census came up `k` short — an in-ladder split of
-/// a RECEIVED laddered coin produced a child NO receiver could adopt, after the sender had already
-/// terminalized the parent and booked the piece away.
-///
-/// The real count now travels in `ChildTesrBundle::parent_flat_backups` and is re-derived by the
-/// receiver from the validated chain (`verify_conveyed_child`). What remains of this constant is the
-/// floor both sides still check: a conveyed chain SHORTER than this did not come from a deposited
-/// coin and is refused.
-pub const PARENT_V2_BASELINE: u32 = 1;
+/// Flat-backup count of a laddered PARENT coin: **zero**. `sig_count` starts at 0
+/// (`generated_public_key DEFAULT 0`) and the first three co-signs on any coin are its ladder's
+/// `T`, `X_0`, `S_0`, signed at first sight of the deposit. No flat backup is ever co-signed — not
+/// at deposit and not at any hop — so the census over a parent segment is exactly
+/// `num_sigs(parent) == tiers + superseded`. A conveyed `parent_flat_backups` vector must be EMPTY
+/// ([`refuse_conveyed_flat_backups`]).
+pub const PARENT_V2_BASELINE: u32 = 0;
 
-/// Flat-backup baseline of a split **CHILD** slot: it is an SE-registered key that is NEVER funded
-/// on-chain (its funding is the un-broadcast `SP.out[j]`), so `check_deposit`/`create_tx1` never runs
-/// for it and `num_sigs` counts ONLY the two child tiers co-signed at split time. Baseline `0`.
+/// Flat-backup count of a split **CHILD** slot: also `0`. A child slot is an SE-registered key
+/// funded by the un-broadcast `SP.out[j]`; its `num_sigs` counts ONLY the tiers co-signed at split
+/// time.
 pub const CHILD_V2_BASELINE: u32 = 0;
+
+/// A laddered coin conveys NO flat backup, at any level of the tree. Refuse a conveyed vector that
+/// is not empty, by name: a flat backup beside a ladder is a co-sign the census cannot account for
+/// and a matured, RGB-unaware spend of `F` in some past owner's hands.
+pub fn refuse_conveyed_flat_backups(
+    what: &str,
+    backups: &[mercurylib::wallet::BackupTx],
+) -> Result<()> {
+    if !backups.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{what} conveys {} flat backup transaction(s) beside its ladder. A laddered coin has no \
+             flat backup — none is co-signed at deposit (the ladder is signed at first sight \
+             instead) and none at any hop — so a conveyed one is a co-sign the census cannot \
+             account for, and a spend of the funding output that a prior owner would keep. Refusing.",
+            backups.len()
+        ));
+    }
+    Ok(())
+}
 
 /// **[CATS] The relative timelock of a SPLIT STATE (`SP` / `CSP`) — zero, always.**
 ///
@@ -7990,64 +7894,6 @@ pub fn next_child_exit_tier(electrum: &electrum_client::Client, cb: &ChildTesrBu
     }
     Ok(None)
 }
-/// **[audit-17] THE COIN'S TRUE EPOCH DEADLINE, read from signed material instead of recomputed.**
-///
-/// Returns `L_k` — the LOWEST absolute nLockTime across the parent's conveyed flat backups, i.e. the
-/// first height at which the parent's current owner can broadcast a backup that spends `F` and voids
-/// the entire tree. That is the only absolute clock anywhere in the structure; everything below `T`
-/// is relative.
-///
-/// **WHY THIS EXISTS.** The deadline used to be recomputed as `deposit_anchored_deadline` =
-/// `h_deposit + initlock`, which is `L_0` — the k = 0 case, i.e. the LATEST value the ladder can
-/// take. The real one is `L_k = L_0 − k·interval` for a parent transferred `k` times before it was
-/// split, and nothing conveys `k`. The error direction is FAIL-OPEN: the holder believes it has more
-/// time than it has, by `k·interval`. `AUDIT_17_K_MAX = 14` was a guess at `k` and its own comment
-/// called it the weakest term in the margin.
-///
-/// It was never necessary. `k` does not need conveying because the ANSWER is already conveyed: each
-/// backup's own nLockTime IS its rung (`calculate_block_height`, lib/src/transaction.rs), so the
-/// minimum over the chain is `L_k` exactly. This reads a field that is already in hand.
-///
-/// **WHY THE NUMBER CAN BE TRUSTED.** Every entry this reads has already been through
-/// [`verify_conveyed_child`]'s ancestor census before the bundle was persisted: signature-verified
-/// under `F`'s key, prevout-pinned to `(F.txid, F.vout)`, INV-5 exact-decrement-checked, and capped
-/// at `tip + initlock`. Crucially the COUNT is pinned by the exact-equality signature census, so a
-/// sender can neither DROP the low entry to flatter this minimum (the census breaks) nor pad the
-/// chain (a padded entry is a real SE co-signature, which raises `num_sigs` and lowers the minimum
-/// anyway). The locktime is inside the signed transaction, so moving it invalidates the signature.
-///
-/// **FAIL-CLOSED, deliberately.** An empty chain is an error, not "no deadline": a coin with no
-/// disclosed backup is one whose clock cannot be established, and the caller must record blindness
-/// rather than conclude safety. A zero locktime is refused for the same reason — every TES-R tier is
-/// built at locktime 0 (INV-4), so a zero here means tiers were passed where backups belong, and
-/// silently returning 0 would read as "overdue since genesis".
-pub fn epoch_deadline_from_flat_backups(
-    backups: &[mercurylib::wallet::BackupTx],
-) -> Result<u32> {
-    use electrum_client::bitcoin::consensus::deserialize;
-
-    if backups.is_empty() {
-        return Err(anyhow::anyhow!(
-            "no flat backups disclosed, so this coin's epoch deadline cannot be established —              refusing to report a deadline rather than defaulting to one"
-        ));
-    }
-    let mut lowest: Option<u32> = None;
-    for (i, b) in backups.iter().enumerate() {
-        let tx: electrum_client::bitcoin::Transaction = deserialize(
-            &hex::decode(&b.tx)
-                .map_err(|_| anyhow::anyhow!("flat backup {i}: not hex"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("flat backup {i}: not a transaction"))?;
-        let lt = tx.lock_time.to_consensus_u32();
-        if lt == 0 {
-            return Err(anyhow::anyhow!(
-                "flat backup {i} has an absolute locktime of 0. Every TES-R tier is built at                  locktime 0 (INV-4) and every flat backup carries its rung there, so this is a tier                  in the backup list — reporting 0 would read as a deadline already passed"
-            ));
-        }
-        lowest = Some(lowest.map_or(lt, |l: u32| l.min(lt)));
-    }
-    lowest.ok_or_else(|| anyhow::anyhow!("unreachable: non-empty chain yielded no locktime"))
-}
 
 
 /// **[D40.2] Is this coin TERMINAL, according to the ENCLAVE rather than the coordinator?**
@@ -8253,79 +8099,15 @@ pub async fn verify_conveyed_child(
     // down. Do not re-add a second copy here — one law, one site.
     let f_onchain_value = f_out.value;
 
-    // [D1] THE PARENT'S FLAT-BACKUP COUNT, VALIDATED THEN COUNTED — the child-lane analogue of the
-    // whole-coin path's `transfer_msg.backup_transactions.len()` (transfer_receiver.rs [S2]).
-    //
-    // The census term must be the parent's REAL flat-backup count (`1 + k` after `k` whole-coin
-    // hops), which no constant can express; it is conveyed. Conveyed is sender-supplied, so it is
-    // validated to exactly the standard the whole-coin lane holds its own chain to, plus one
-    // strictly stronger binding this lane can afford:
-    //
-    //   * every entry is a taproot key-spend of the ON-CHAIN `F` we just fetched, signature-verified
-    //     under `F.spk`'s key (= `A_parent`, itself bound to the server's recorded parent aggregate
-    //     below) — so each entry cost the attacker a real SE co-sign and cannot pad the count for
-    //     free;
-    //   * INV-5 (`ladder_decrements_by_interval`): consecutive locktimes fall by EXACTLY `interval`,
-    //     which rejects duplicate padding (decrement 0) and chain inversion alike;
-    //   * [stronger than the whole-coin lane] each entry's prevout is pinned to `(F.txid, F.vout)`.
-    //     `verify_transaction_signature` only indexes `tx0.output[prevout.vout]`, so without this a
-    //     backup naming a foreign txid would still verify; here the funding outpoint is a field of
-    //     the bundle already bound to the chain, so there is no reason to leave it loose.
-    //
-    // NOTE ON AGEING, since this is the obvious worry: `validate_backup_chain_v2` refuses a chain
-    // whose locktimes have run out or whose committed fee has fallen below the live rate, and a
-    // laddered coin's flat backups DO age while the ladder itself does not. That does not make this
-    // lane stricter than the alternative: the whole-coin receive path validates the very same
-    // entries at claim time and additionally appends one at `lowest − interval`, so it hits
-    // `LocktimeTooLow` STRICTLY EARLIER than this does. A parent whose flat chain has aged out is
-    // already untransferable as a whole coin; it is not newly unsplittable.
-    let parent_backups = &cb.parent_flat_backups;
-    if (parent_backups.len() as u32) < PARENT_V2_BASELINE {
-        return Err(anyhow::anyhow!(
-            "conveyed child discloses {} parent flat backup transaction(s), fewer than the \
-             {PARENT_V2_BASELINE} every deposited coin carries — the ancestor census cannot be \
-             balanced (fail-closed)",
-            parent_backups.len()
-        ));
-    }
-    // Hoisted out of the block below because BOTH admission rules need it: the flat chain's epoch
-    // terms (`initlock`/`interval`) and the [P0-3] length cap's epoch length. One fetch, one
-    // fail-closed `?` — an SE that cannot be read refuses the adoption rather than defaulting.
+    // A laddered parent has NO flat backup chain. The conveyed field must be empty — a flat backup
+    // beside the ladder would be a co-sign the ancestor census cannot account for, and a matured
+    // spend of `F` in the splitter's hands — and the census over the parent segment is exactly
+    // `num_sigs(parent) == tiers + superseded`.
+    refuse_conveyed_flat_backups("conveyed child", &cb.parent_flat_backups)?;
+    // One fetch, one fail-closed `?` — an SE that cannot be read refuses the adoption rather than
+    // defaulting. `initlock` is the exit window the [P0-3] length cap measures against.
     let info_config = crate::utils::info_config(cc).await?;
-    let (epoch_expiry_height, tip) = {
-        use electrum_client::bitcoin::consensus::{deserialize, serialize};
-        for (i, b) in parent_backups.iter().enumerate() {
-            let tx: electrum_client::bitcoin::Transaction =
-                deserialize(&hex::decode(&b.tx).map_err(|_| {
-                    anyhow::anyhow!("parent flat backup {i}: not hex")
-                })?)
-                .map_err(|_| anyhow::anyhow!("parent flat backup {i}: not a transaction"))?;
-            let inp = tx
-                .input
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("parent flat backup {i}: no input"))?;
-            if tx.input.len() != 1
-                || inp.previous_output.txid != f_txid
-                || inp.previous_output.vout != cb.parent.f_vout
-            {
-                return Err(anyhow::anyhow!(
-                    "parent flat backup {i} does not spend the parent's funding outpoint \
-                     {}:{} — refusing to count it toward the ancestor census",
-                    cb.parent.f_txid,
-                    cb.parent.f_vout
-                ));
-            }
-        }
-        let blockheight = cc
-            .electrum_client
-            .block_headers_subscribe_raw()
-            .map_err(|e| anyhow::anyhow!("cannot read the chain tip: {e}"))?
-            .height as u32;
-        let current_fee_rate = if info_config.fee_rate_sats_per_byte > cc.max_fee_rate {
-            cc.max_fee_rate
-        } else {
-            info_config.fee_rate_sats_per_byte
-        };
+    {
         // ═══ [VALUE-CONSERVATION] IS THE YARDSTICK OURS? ═══
         //
         // The conservation laws in `verify_child_bundle` and `verify_bundle_ex` all compute
@@ -8357,49 +8139,8 @@ pub async fn verify_conveyed_child(
                 cb.parent.fee_rate
             ));
         }
-        // The RETURN VALUE is load-bearing, not a formality: it is the LOWEST locktime of the
-        // validated chain, i.e. the first height at which the parent's current owner (the sender of
-        // this child) can broadcast a flat backup that spends `F` and voids the entire tree. That is
-        // this coin's epoch expiry, and it is the only absolute clock anywhere in the structure.
-        let lowest_locktime = mercurylib::transfer::receiver::validate_backup_chain_v2(
-            parent_backups,
-            &hex::encode(serialize(&f_tx)),
-            blockheight,
-            cc.fee_rate_tolerance,
-            current_fee_rate,
-            info_config.initlock,
-            info_config.interval,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!("conveyed parent flat backup chain is invalid ({e}) — the ancestor census term is unusable")
-        })?;
-        (lowest_locktime, blockheight)
-    };
+    }
 
-    // [P0-1] EXIT-HEADROOM ADMISSION GATE. Until this existed, the only bound on a conveyed child
-    // was `lock_time > tip` inside `validate_backup_chain_v2` above — so a sender could hand over a
-    // coin whose exit provably could not complete inside the epoch it was minted in, and for the
-    // last `WAIT(d)` blocks of every epoch (43% of it at mainnet depth 1) that was every coin they
-    // sent. The census balanced, Model A held, and the coin was worthless.
-    //
-    // The requirement is read off THIS bundle's own exit chain — its real depth (`ancestors`) and the
-    // CSVs actually co-signed into its tiers — so it tracks the live schedule with no constant to go
-    // stale. See `mercurylib::transfer::receiver`'s module note for why the whole chain must fit and
-    // not merely the trigger.
-    //
-    // [B1] EVERY TERM IS RECEIVER-DERIVED. The gate was bypassable for as long as it read the CSVs
-    // from `TesrTier::csv`, a plain serde field on the conveyed bundle: declare `csv: 1` everywhere
-    // and the requirement collapses to a handful of blocks while the chain still enforces thousands.
-    // `child_exit_chain_bound` reads each timelock from the SIGNED transaction's `nSequence` and
-    // refuses any bundle whose declared schedule contradicts its own signatures. The other two terms
-    // were already ours: `tip` comes from this wallet's chain backend, and `epoch_expiry_height` is
-    // the lowest locktime of a flat backup chain just validated against the on-chain `F` — every
-    // entry signature-verified under `F`'s key, prevout-pinned, INV-5 strictly decrementing, capped
-    // at `tip + lockheight_init` by `verify_if_locktime_is_reasonable_tx_version_and_output_size`
-    // (so it cannot be inflated past one epoch) and its COUNT pinned by the exact-equality census
-    // below (so low entries cannot be dropped to raise the minimum). The chain's LENGTH is likewise
-    // not free: `verify_child_bundle` links every tier to its parent's outpoint, so a segment cannot
-    // be omitted to shorten the walk without breaking the funding chain outright.
     // ═══ [P0-3] THE EXIT-CHAIN LENGTH CAP — BEFORE THE STRUCTURAL BIND ═══
     //
     // The headroom gate below is a LATENCY rule, and a SPINE tier costs one block of latency while
@@ -8436,27 +8177,13 @@ pub async fn verify_conveyed_child(
         info_config.initlock,
     )?;
 
-    let exit_csvs: Vec<Option<u16>> =
+    // [B1] The chain's timelocks are BOUND to the signatures enforcing them before anything is
+    // measured from them: a bundle whose declared schedule contradicts its own signatures is refused
+    // here, and the length cap above already measured the same walk. There is no epoch-headroom
+    // gate any more — a laddered coin has no absolute deadline for a walk to fit inside — so the
+    // exit window is the fixed `initlock` that the length cap was measured against.
+    let _exit_csvs: Vec<Option<u16>> =
         child_exit_chain_bound(cb)?.into_iter().map(|(_, csv)| csv).collect();
-    // **[D40.3] WITH the minimum-slack margin.** The bare check admits at `slack == 0`, i.e. a coin
-    // whose exit is feasible only if all 3-23 of its transactions confirm in the very next block —
-    // and the SENDER picks that slack by picking when to convey. The margin is derived from the walk
-    // itself (`exit_slack_margin`), so nothing exogenous enters the admission decision.
-    mercurylib::transfer::receiver::check_exit_headroom_with_margin(
-        &exit_csvs,
-        tip,
-        epoch_expiry_height,
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "conveyed child refused at depth {}: {e}. The requirement includes a minimum-slack \
-             margin of {} blocks: the walk's own wait is the theoretical minimum (one block per \
-             tier), not a budget, and admitting at zero slack would hand over a coin with no \
-             tolerance for a single slow confirmation. Re-anchor the parent and convey again.",
-            cb.ancestors.len() + 1,
-            mercurylib::transfer::receiver::exit_slack_margin(&exit_csvs)
-        )
-    })?;
 
     // (see `attested_terminal` — terminality is derived from the enclave's signature, not asked of
     // the coordinator)
@@ -8492,8 +8219,9 @@ pub async fn verify_conveyed_child(
         &f_spk_hex,
         f_onchain_value,
         p_info.num_sigs,
-        // The REAL count, re-derived from the chain validated above — never the baseline constant.
-        parent_backups.len() as u32,
+        // Zero: a laddered parent has no flat backup, and the conveyed vector was refused above if
+        // it carried any.
+        PARENT_V2_BASELINE,
         p_info.aggregate_pubkey.as_deref(),
         parent_terminal,
         c_info.num_sigs,
@@ -8574,12 +8302,13 @@ pub async fn verify_conveyed_tail(cc: &ClientConfig, leaf: &TailLeaf) -> Result<
         .get(leaf.sp_vout as usize)
         .ok_or_else(|| anyhow::anyhow!("the conveyed SP has no output {}", leaf.sp_vout))?
         .value;
+    refuse_conveyed_flat_backups("conveyed tail", &leaf.parent_flat_backups)?;
     verify_tail_leaf(
         leaf,
         &f_spk_hex,
         f_value,
         num_sigs,
-        leaf.parent_flat_backups.len() as u32,
+        PARENT_V2_BASELINE,
         agg.as_deref(),
         terminal,
         &ancestors,
@@ -8611,12 +8340,13 @@ pub async fn verify_conveyed_stub(cc: &ClientConfig, leaf: &LadderlessLeaf) -> R
         .get(leaf.sp_vout as usize)
         .ok_or_else(|| anyhow::anyhow!("the conveyed SP has no output {}", leaf.sp_vout))?
         .value;
+    refuse_conveyed_flat_backups("conveyed stub", &leaf.parent_flat_backups)?;
     verify_ladderless_leaf(
         leaf,
         &f_spk_hex,
         f_value,
         num_sigs,
-        leaf.parent_flat_backups.len() as u32,
+        PARENT_V2_BASELINE,
         agg.as_deref(),
         terminal,
         &ancestors,
@@ -8695,11 +8425,8 @@ pub async fn child_in_ladder_split(
     // segment into `ancestors`, so every grandchild lands one level deeper. Checked BEFORE anything
     // irreversible (the child's terminalization is two statements below): a refusal here leaves the
     // child whole, spendable and re-transferable.
-    // [D36 T-4] A child has no flat backup chain — `ctesr-` rows are its bundle, not a backup
-    // ladder — so the epoch its grandchildren's exits must fit inside is the ROOT's.
     enforce_split_depth_cap(
         cc,
-        &cb.parent_flat_backups,
         p,
         cb.ancestors.len() as u32 + 2,
         cb.parent.exit_tiers().len(),
@@ -12866,47 +12593,20 @@ pub fn verify_flat_backup_lane(
     bundle: &TesrBundle,
     backups: &[mercurylib::wallet::BackupTx],
 ) -> Result<()> {
-    use electrum_client::bitcoin::{consensus::deserialize, Transaction};
-    let colored = bundle.is_colored();
-    for b in backups.iter() {
-        let raw = hex::decode(&b.tx)
-            .map_err(|_| anyhow::anyhow!("flat backup tx_n {}: hex does not decode", b.tx_n))?;
-        let tx: Transaction = deserialize(&raw)
-            .map_err(|_| anyhow::anyhow!("flat backup tx_n {}: tx does not parse", b.tx_n))?;
-        if tx.output.iter().any(|o| o.script_pubkey.is_op_return()) {
-            return if colored {
-                Err(anyhow::anyhow!(
-                    "refusing a COLOURED ladder whose flat backup tx_n {} carries an OP_RETURN. On \
-                     this lane the allocation lives on the tiers, and a flat backup is a hop backup \
-                     over the funding outpoint that any prior owner may still hold. Nothing binds \
-                     that commitment's assignment to anyone, so accepting it would hand every \
-                     ancestor a spend of `F` that RE-ASSIGNS the allocation to themselves instead \
-                     of merely voiding it. Only the un-laddered carrier lane may convey a coloured \
-                     backup.",
-                    b.tx_n
-                ))
-            } else {
-                Err(anyhow::anyhow!(
-                    "refusing a PLAIN ladder whose flat backup tx_n {} carries an OP_RETURN. A \
-                     plain ladder's tiers carry no RGB state transition, so exiting through them \
-                     would move the sats and permanently BURN the allocation. A coin that \
-                     legitimately holds both is COLOURED.",
-                    b.tx_n
-                ))
-            };
-        }
-        if !colored && b.rgb_consignment.is_some() {
-            return Err(anyhow::anyhow!(
-                "refusing a PLAIN ladder that also carries an RGB consignment (on backup tx_n {}). \
-                 A plain ladder's tiers carry no RGB state transition, so exiting through them \
-                 would move the sats and permanently BURN the allocation. These two payloads \
-                 describe incompatible coins; a coin that legitimately holds both is COLOURED, and \
-                 a coloured ladder is a different shape admitted by its own verifier.",
-                b.tx_n
-            ));
-        }
+    if backups.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let lane = if bundle.is_colored() { "COLOURED" } else { "plain" };
+    Err(anyhow::anyhow!(
+        "refusing a {lane} ladder conveyed with {} flat backup transaction(s). A laddered coin has \
+         NO flat backup: none is co-signed at deposit (the ladder is signed at first sight of the \
+         funding transaction instead) and none at any hop. A conveyed one is a co-sign the census \
+         `se_num_sigs == tiers + superseded` cannot account for, and it is a spend of the funding \
+         output that a prior owner would keep — plain, it BURNS a carrier's allocation the moment \
+         it matures; with an OP_RETURN, it RE-ASSIGNS the allocation to that owner. Neither shape \
+         is admitted.",
+        backups.len()
+    ))
 }
 
 /// [in-ladder split] The x-only taproot key (hex) of a v1 taproot scriptPubKey, or an error if `spk`
@@ -18720,8 +18420,8 @@ mod skim_leaf_attack_tests {
             Facts {
                 f_spk_hex: hex::encode(self.parent.spk.as_bytes()),
                 // The parent's census: one deposit backup + T + X + SP, nothing superseded.
-                parent_num_sigs: 1 + 3,
-                parent_flat_backups: 1,
+                parent_num_sigs: 0 + 3,
+                parent_flat_backups: 0,
                 parent_xonly: self.parent.recorded_xonly.clone(),
                 // A derived child slot has no flat backup (CHILD_V2_BASELINE = 0) — just its two tiers.
                 child_num_sigs: 2,
@@ -19352,7 +19052,7 @@ mod skim_root_attack_tests {
     /// established, then `T`, `X_0` and `S_0` consume one co-sign each. The census is EXACT equality,
     /// so these two constants are not decoration — get either wrong and every test below fails on
     /// `num_sigs mismatch` instead of on the value law.
-    const FLAT_BACKUPS: u32 = 1;
+    const FLAT_BACKUPS: u32 = 0;
     const NUM_SIGS: u32 = FLAT_BACKUPS + 3;
 
     /// One plain rung AT THIS FIXTURE'S RATE of 2 sat/vB: `committed_fee(2.0) + P2A_VALUE` = 250 + 240.
@@ -20036,7 +19736,7 @@ mod forged_yardstick_attack_tests {
 
     /// The census terms. Exact equality, so getting either wrong fails every test on `num_sigs`
     /// instead of on the property under test.
-    const FLAT_BACKUPS: u32 = 1;
+    const FLAT_BACKUPS: u32 = 0;
     const NUM_SIGS: u32 = FLAT_BACKUPS + 3;
 
     /// The rate every shipped preset builds at, on every network — `TesrParams::mainnet()` and
@@ -21385,8 +21085,8 @@ mod wrong_payee_attack_tests {
             let facts = Facts {
                 f_spk_hex: hex::encode(self.parent.spk.as_bytes()),
                 // The root's census: one deposit backup + T + X + SP, nothing superseded.
-                parent_num_sigs: 1 + 3,
-                parent_flat_backups: 1,
+                parent_num_sigs: 0 + 3,
+                parent_flat_backups: 0,
                 parent_xonly: self.parent.recorded_xonly.clone(),
                 child_num_sigs: 2,
                 child_flat_backups: 0,
@@ -25910,8 +25610,8 @@ mod leaf_renewal_tests {
         fn facts(&self) -> Facts {
             Facts {
                 f_spk_hex: hex::encode(self.parent.spk.as_bytes()),
-                parent_num_sigs: 1 + 3,
-                parent_flat_backups: 1,
+                parent_num_sigs: 0 + 3,
+                parent_flat_backups: 0,
                 parent_xonly: self.parent.recorded_xonly.clone(),
                 child_num_sigs: 2,
                 child_flat_backups: 0,
@@ -27124,112 +26824,6 @@ mod cancelled_conveyance_tests {
     }
 }
 
-/// **[audit-17] THE DEADLINE MUST COME FROM THE SIGNED LADDER, NOT FROM `L_0`.**
-///
-/// The defect this pins was FAIL-OPEN — the old derivation returned `h_deposit + initlock`, which is
-/// `L_0`, so a coin whose parent had moved `k` times believed it had `k·interval` more blocks than
-/// it did. These tests assert the new derivation returns `L_k`, that `L_k` is strictly EARLIER than
-/// the old answer for every `k > 0`, and that the failure modes refuse rather than default.
-#[cfg(test)]
-mod audit17_epoch_deadline_tests {
-    use super::epoch_deadline_from_flat_backups;
-    use electrum_client::bitcoin::{absolute::LockTime, consensus::serialize};
-    use electrum_client::bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-    use mercurylib::wallet::BackupTx;
-
-    /// A backup carrying nothing but the locktime under test — that is the only field read.
-    fn backup(locktime: u32, tx_n: u32) -> BackupTx {
-        let tx = Transaction {
-            version: 2,
-            lock_time: LockTime::from_consensus(locktime),
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut { value: 1_000, script_pubkey: ScriptBuf::new() }],
-        };
-        BackupTx { tx_n, tx: hex::encode(serialize(&tx)), client_public_nonce: String::new(),
-                   server_public_nonce: String::new(), client_public_key: String::new(),
-                   server_public_key: String::new(), blinding_factor: String::new(),
-                   rgb_blinding: None, rgb_consignment: None }
-    }
-
-    /// The deployed profile: `initlock` 1 000, `interval` 10 (server/Settings.toml).
-    const INITLOCK: u32 = 1_000;
-    const INTERVAL: u32 = 10;
-    /// A representative co-sign tip, so `L_0 = H + initlock`.
-    const H: u32 = 850_000;
-
-    /// The real ladder: `L_k = L_0 − k·interval`, one entry per hop, lowest LAST.
-    fn ladder(k: u32) -> Vec<BackupTx> {
-        (0..=k).map(|i| backup(H + INITLOCK - i * INTERVAL, i)).collect()
-    }
-
-    #[test]
-    fn the_deadline_is_the_lowest_rung_not_the_first() {
-        for k in 0..=10u32 {
-            let expected = H + INITLOCK - k * INTERVAL;
-            assert_eq!(
-                epoch_deadline_from_flat_backups(&ladder(k)).unwrap(),
-                expected,
-                "a coin transferred {k} time(s) expires at L_{k}, not at L_0"
-            );
-        }
-    }
-
-    #[test]
-    fn it_is_strictly_earlier_than_the_old_l0_answer_for_every_k_above_zero() {
-        // This is the defect, stated as arithmetic. `deposit_anchored_deadline(h, initlock)` was
-        // `h + initlock` for EVERY coin regardless of k — always L_0, always too late.
-        let old_answer = H + INITLOCK;
-        assert_eq!(epoch_deadline_from_flat_backups(&ladder(0)).unwrap(), old_answer,
-                   "at k = 0 the old answer was right, which is why this went unnoticed");
-        for k in 1..=10u32 {
-            let now = epoch_deadline_from_flat_backups(&ladder(k)).unwrap();
-            assert!(now < old_answer, "k = {k} must move the deadline EARLIER, never later");
-            assert_eq!(old_answer - now, k * INTERVAL,
-                       "and by exactly k·interval — the term AUDIT_17_K_MAX was guessing at");
-        }
-        // The margin's guess was 14 hops. A coin at the ladder's capacity (initlock/interval = 100)
-        // was believed 1 000 blocks safer than it was — most of a whole epoch.
-        let at_capacity = epoch_deadline_from_flat_backups(&ladder(100)).unwrap();
-        assert_eq!(old_answer - at_capacity, INITLOCK);
-    }
-
-    #[test]
-    fn order_does_not_matter_because_it_is_a_minimum() {
-        let mut shuffled = ladder(7);
-        shuffled.reverse();
-        assert_eq!(epoch_deadline_from_flat_backups(&shuffled).unwrap(), H + INITLOCK - 7 * INTERVAL);
-    }
-
-    #[test]
-    fn an_empty_chain_refuses_rather_than_reporting_no_deadline() {
-        // "I cannot establish a clock" must never be spelled the same way as "there is no clock".
-        assert!(epoch_deadline_from_flat_backups(&[]).is_err());
-    }
-
-    #[test]
-    fn a_locktime_of_zero_is_refused_because_that_is_a_tier_not_a_backup() {
-        // Every TES-R tier is built at locktime 0 (INV-4). Taking a minimum over a list that
-        // contained one would return 0 — "overdue since genesis" — which is fail-closed by accident
-        // and unreadable by design. Refuse by name instead.
-        let mut with_tier = ladder(3);
-        with_tier.push(backup(0, 99));
-        let msg = epoch_deadline_from_flat_backups(&with_tier).unwrap_err().to_string();
-        assert!(msg.contains("locktime of 0"), "got: {msg}");
-    }
-
-    #[test]
-    fn unparseable_material_refuses_rather_than_being_skipped() {
-        let mut bad = ladder(2);
-        bad[1].tx = "not hex".to_string();
-        assert!(epoch_deadline_from_flat_backups(&bad).is_err());
-    }
-}
-
 /// **[RE-ANCHOR] `Void` IS NOT `Blind`, AND THAT IS THE WHOLE FIX.**
 ///
 /// The watch passes used to gate on one bit — "is `F` spent?" — which conflates our own trigger
@@ -28325,7 +27919,12 @@ mod s6_coloured_tip_replay_tests {
     }
 }
 
-/// [D35 / RGB-1] The five lane × flat-backup shapes, and which two cannot be legitimate.
+/// **A laddered coin conveys NO flat backup — on either lane, in any form.**
+///
+/// `verify_flat_backup_lane` used to sort five lane × payload shapes into legitimate and not. There
+/// is one shape now: the vector is empty. Anything else is a co-sign the census cannot account for
+/// and a matured spend of `F` in a prior owner's hands, and the refusal must say which lane it saw
+/// and how many rows, so the sender learns it is running a lane that no longer exists.
 #[cfg(test)]
 mod d35_flat_backup_lane_tests {
     use super::verify_tests::sample_bundle;
@@ -28335,10 +27934,7 @@ mod d35_flat_backup_lane_tests {
         TxOut, Witness,
     };
 
-    /// A flat backup transaction, optionally carrying the opret commitment output. The value law is
-    /// not what is under test here — the SHAPE is — so the outputs are minimal, and the scripts are
-    /// spelled in hex so the assertion does not depend on any script-builder API: `0014…` is a
-    /// P2WPKH spendable output, `6a20…` is `OP_RETURN <32-byte push>`.
+    /// A flat backup transaction, optionally carrying the opret commitment output.
     fn backup_tx(with_opret: bool) -> String {
         let mut output = vec![TxOut {
             value: 10_000,
@@ -28393,65 +27989,44 @@ mod d35_flat_backup_lane_tests {
         r.expect_err("must be refused").to_string()
     }
 
-    /// **THE DEFECT (RGB-1).** A coloured coin's flat backups are HOP backups over `F`, and any
-    /// ancestor may still hold one. An opret on such a transaction commits to an assignment nothing
-    /// verifies, so a prior owner's 112-vB spend of `F` stops being griefing (they gain nothing) and
-    /// becomes capture (they take the allocation). The refusal must name the row.
+    /// The one admissible shape: nothing conveyed, on either lane.
     #[test]
-    fn a_coloured_ladder_refuses_a_flat_backup_carrying_an_opret() {
-        let backups = vec![backup(0, false, None), backup(1, true, None), backup(2, false, None)];
-        let msg = reject(verify_flat_backup_lane(&colored(), &backups));
-        assert!(msg.contains("COLOURED"), "{msg}");
-        assert!(msg.contains("tx_n 1"), "must name the offending row, not just the message: {msg}");
-        assert!(msg.contains("RE-ASSIGNS"), "must say what an ancestor GAINS, not just that it is odd: {msg}");
-    }
-
-    /// **THE CORRECTION (D35), and the regression the old rule caused.** A coloured ladder whose
-    /// carrier envelope rides on a flat row is a legitimate coin — the tiers each carry a valid
-    /// transition, and the envelope is what lets the next receiver run
-    /// `verify_consignment_assignment` against its OWN outpoint. This is the exact shape an
-    /// uncolourable legacy piece reaches once `accept_ladder` colours it (sdk78), and refusing it
-    /// refused the rescue lane at its final hop.
-    #[test]
-    fn a_coloured_ladder_admits_the_carrier_envelope_on_a_plain_backup() {
-        let backups = vec![backup(0, false, Some("envelope")), backup(1, false, None)];
-        assert!(verify_flat_backup_lane(&colored(), &backups).is_ok());
-    }
-
-    /// The plain lane keeps BOTH refusals: its tiers carry no transition, so anything RGB on the
-    /// message describes a coin whose exit destroys the allocation.
-    #[test]
-    fn a_plain_ladder_refuses_rgb_material_in_either_form() {
-        let by_envelope = reject(verify_flat_backup_lane(
-            &sample_bundle(),
-            &[backup(0, false, None), backup(1, false, Some("envelope"))],
-        ));
-        assert!(by_envelope.contains("PLAIN") && by_envelope.contains("BURN"), "{by_envelope}");
-        assert!(by_envelope.contains("tx_n 1"), "{by_envelope}");
-
-        let by_opret = reject(verify_flat_backup_lane(&sample_bundle(), &[backup(0, true, None)]));
-        assert!(by_opret.contains("PLAIN") && by_opret.contains("BURN"), "{by_opret}");
-    }
-
-    /// Plain sats on either lane pass, and an empty chain is vacuous here (its own emptiness check
-    /// lives in `validate_backup_chain_v2`, which must stay the one place that owns it).
-    #[test]
-    fn plain_backups_pass_on_both_lanes() {
-        let clean = vec![backup(0, false, None), backup(1, false, None)];
-        assert!(verify_flat_backup_lane(&sample_bundle(), &clean).is_ok());
-        assert!(verify_flat_backup_lane(&colored(), &clean).is_ok());
+    fn an_empty_vector_passes_on_both_lanes() {
+        assert!(verify_flat_backup_lane(&sample_bundle(), &[]).is_ok());
         assert!(verify_flat_backup_lane(&colored(), &[]).is_ok());
     }
 
-    /// A row whose `tx` does not parse is a refusal, not a skip. The predicate reads every backup's
-    /// outputs, so "could not read it" must never resolve to "nothing to see".
+    /// A plain flat backup is refused even though it carries nothing RGB: it is a co-sign the
+    /// census cannot account for, and a spend of `F` a prior owner keeps.
     #[test]
-    fn an_unparseable_backup_is_refused_rather_than_skipped() {
+    fn plain_backups_are_refused_on_both_lanes_and_the_refusal_names_the_lane() {
+        let clean = vec![backup(0, false, None), backup(1, false, None)];
+        let plain = reject(verify_flat_backup_lane(&sample_bundle(), &clean));
+        assert!(plain.contains("plain ladder") && plain.contains("2 flat backup"), "{plain}");
+        let coloured = reject(verify_flat_backup_lane(&colored(), &clean));
+        assert!(coloured.contains("COLOURED ladder") && coloured.contains("2 flat backup"), "{coloured}");
+        // The refusal says what a retained backup would DO, in both its shapes.
+        assert!(coloured.contains("BURNS") && coloured.contains("RE-ASSIGNS"), "{coloured}");
+    }
+
+    /// The two shapes the old rule singled out — an opret on a coloured coin's backup (capture) and
+    /// RGB material beside a plain ladder (burn) — are refused with everything else; there is no
+    /// carve-out for "the carrier envelope on a plain row" any more, because there is no row.
+    #[test]
+    fn rgb_material_on_a_flat_backup_is_refused_like_any_other_flat_backup() {
+        assert!(verify_flat_backup_lane(&colored(), &[backup(0, true, None)]).is_err());
+        assert!(verify_flat_backup_lane(&colored(), &[backup(0, false, Some("envelope"))]).is_err());
+        assert!(verify_flat_backup_lane(&sample_bundle(), &[backup(0, true, None)]).is_err());
+        assert!(verify_flat_backup_lane(&sample_bundle(), &[backup(0, false, Some("envelope"))]).is_err());
+    }
+
+    /// The rule reads the vector's LENGTH, never its contents: an unparseable row is refused
+    /// without being parsed, so a malformed backup cannot buy a different outcome.
+    #[test]
+    fn an_unparseable_backup_is_refused_without_being_read() {
         let mut b = backup(3, false, None);
         b.tx = "not-hex".into();
-        assert!(reject(verify_flat_backup_lane(&colored(), &[b.clone()])).contains("tx_n 3"));
-        b.tx = "deadbeef".into();
-        assert!(reject(verify_flat_backup_lane(&colored(), &[b])).contains("tx_n 3"));
+        assert!(reject(verify_flat_backup_lane(&colored(), &[b])).contains("1 flat backup"));
     }
 }
 

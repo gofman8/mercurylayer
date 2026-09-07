@@ -1,15 +1,18 @@
 //! **[A2 / sdk80] Every lane that hands value away must disarm this wallet's own watchtower FIRST.**
 //!
-//! `defend_ladders`' child loop keys L1 on an **allowlist**: it broadcasts a retained state only for
-//! a coin whose status reads `CONFIRMED`, which is this wallet's own record of *"mine, unspent, no
-//! counterparty holds anything over it"*. The allowlist form is deliberate — a lane added tomorrow
-//! parks its coin in SOME non-CONFIRMED status and is refused by default, so nobody can re-arm the
-//! tower against their own recipient by forgetting to extend a denylist.
+//! `defend_ladders` keys L1 on an **allowlist** — `wallet::is_live_for_defence`: it broadcasts a
+//! retained state only for a coin whose status reads `IN_MEMPOOL`, `UNCONFIRMED` or `CONFIRMED`,
+//! which is this wallet's own record of *"mine, unspent, no counterparty holds anything over it"*.
+//! (Three statuses rather than one because a coin's ladder exists from the FIRST MEMPOOL SIGHTING of
+//! its deposit and is defended from that block; there is no flat backup before it.) The allowlist
+//! form is deliberate — a lane added tomorrow parks its coin in SOME status outside the three and is
+//! refused by default, so nobody can re-arm the tower against their own recipient by forgetting to
+//! extend a denylist.
 //!
 //! **But the allowlist is only as good as when the field is written.** The loop re-reads that status
 //! from the wallet DB on every pass. A lane that writes it LAST — after the SE has co-signed the
 //! superseding split state, after the bundle has reached the recipient's mailbox — leaves a window
-//! in which a pass reads a stale `CONFIRMED`, is admitted, and broadcasts the retained state over
+//! in which a pass reads a stale live status, is admitted, and broadcasts the retained state over
 //! the very outpoint the recipients' new state depends on.
 //!
 //! That is the sender's own tower destroying the payment the sender just made. On a coloured coin it
@@ -60,14 +63,21 @@
 //!      A `println!`, a `let _ =`, an `.ok()` or an `unwrap_or` fails this clause even though the
 //!      words are identical;
 //!   4. the arm-down's POSITION is before the position of EVERY call in that lane that can produce
-//!      material for somebody else — the co-sign of the receiver-paying state, the backup co-sign,
-//!      the coordinator open. Each of those markers must itself be present, so a rename cannot make
-//!      the ordering vacuously true.
+//!      material for somebody else — the co-sign of the receiver-paying state `S'`, the coordinator
+//!      open. Each of those markers must itself be present, so a rename cannot make the ordering
+//!      vacuously true;
+//!   5. [ONE COIN SHAPE] the lane contains NO flat backup co-sign. A laddered coin conveys
+//!      `backup_transactions: []` — `create_backup_transactions` / `create_backup_tx_to_receiver`
+//!      are deleted — so a per-hop backup reappearing in any conveying lane is a co-sign the
+//!      receiver's census `tiers + superseded` cannot account for, and a matured spend of `F` this
+//!      wallet would keep after the coin is gone. The old guard ordered the arm-down against that
+//!      co-sign; this one refuses the co-sign outright.
 //!
 //! And every one of those clauses is exercised by `the_audit_rejects_every_mutation_a_prose_pin_
 //! survived`, which replants the deleted arm-down, the moved arm-down, the swallowed arm-down, the
-//! arm-down-in-the-next-function and the arm-down-that-is-only-a-message against synthetic sources
-//! and requires each to be REJECTED — a guard that cannot fail is decoration.
+//! arm-down-in-the-next-function, the arm-down-that-is-only-a-message and the re-planted flat
+//! co-sign against synthetic sources and requires each to be REJECTED — a guard that cannot fail is
+//! decoration.
 
 use std::path::PathBuf;
 
@@ -341,7 +351,14 @@ struct Lane {
     /// Every call in this lane that can produce material for somebody else. Each must be PRESENT
     /// (or the ordering below is vacuous) and each must come AFTER the arm-down.
     conveyance: &'static [&'static str],
+    /// Calls that must NOT appear in the lane at all. [ONE COIN SHAPE] The flat backup co-signs are
+    /// deleted: a laddered coin conveys `backup_transactions: []`, and a per-hop backup co-signed
+    /// here would be both a census breach and a retained matured spend of `F`.
+    forbidden: &'static [&'static str],
 }
+
+/// The deleted per-hop flat co-signs. Forbidden in every conveying lane.
+const FLAT_COSIGNS: &[&str] = &["create_backup_transactions(", "create_backup_tx_to_receiver("];
 
 /// The three whole-coin / whole-child lanes A2 covered. `execute_ex` is the whole-coin hop, where
 /// the loss is the entire coin rather than one piece; the two child lanes are the leaf equivalent.
@@ -353,17 +370,17 @@ const LANES: [Lane; 3] = [
         arm_down: "persist_coin_status(",
         status: "CoinStatus::IN_TRANSFER",
         // `presign_receiver_state` / `cosign_colored_receiver_state` co-sign the receiver-paying
-        // `S'`; `create_backup_transactions` co-signs a backup and raises `num_sigs`; `get_new_x1`
-        // OPENS the transfer at the coordinator, after which the recipient can complete the
-        // handover. `transfer/update_msg` posts the ciphertext and is strictly below `get_new_x1`,
-        // so pinning the open pins it too — and pinning a route string rather than a call symbol is
-        // exactly the sort of prose pin this rewrite exists to remove.
+        // `S'` — the ONLY co-sign in the lane, since a laddered coin conveys no flat backup;
+        // `get_new_x1` OPENS the transfer at the coordinator, after which the recipient can
+        // complete the handover. `transfer/update_msg` posts the ciphertext and is strictly below
+        // `get_new_x1`, so pinning the open pins it too — and pinning a route string rather than a
+        // call symbol is exactly the sort of prose pin this rewrite exists to remove.
         conveyance: &[
             "presign_receiver_state(",
             "cosign_colored_receiver_state(",
-            "create_backup_transactions(",
             "get_new_x1(",
         ],
+        forbidden: FLAT_COSIGNS,
     },
     Lane {
         file: "clients/libs/rust/src/tesr.rs",
@@ -372,6 +389,7 @@ const LANES: [Lane; 3] = [
         arm_down: "persist_coin_status(",
         status: "CoinStatus::IN_TRANSFER",
         conveyance: &["cosign_tier(", "persist_child(", "convey_child_bundle("],
+        forbidden: FLAT_COSIGNS,
     },
     Lane {
         file: "clients/libs/rust/src/tesr.rs",
@@ -380,6 +398,7 @@ const LANES: [Lane; 3] = [
         arm_down: "persist_coin_status(",
         status: "CoinStatus::IN_TRANSFER",
         conveyance: &["cosign_tier(", "persist_child(", "convey_child_bundle("],
+        forbidden: FLAT_COSIGNS,
     },
 ];
 
@@ -403,9 +422,10 @@ fn arm_down_in(src: &Source, lane: &Lane, start: usize, end: usize) -> (Option<u
         };
         if !stmt.contains(lane.status) {
             rejected.push(format!(
-                "  byte {at}: does not write `{}` — L1 is an ALLOWLIST on `CONFIRMED`, so a write \
-                 of any other status is what stands the tower down, and a write that leaves the row \
-                 in the allowlist is not an arm-down at all:\n---\n{stmt}\n---",
+                "  byte {at}: does not write `{}` — L1 is an ALLOWLIST (`is_live_for_defence`: \
+                 IN_MEMPOOL | UNCONFIRMED | CONFIRMED), so a write of a status outside it is what \
+                 stands the tower down, and a write that leaves the row in the allowlist is not an \
+                 arm-down at all:\n---\n{stmt}\n---",
                 lane.status
             ));
             continue;
@@ -424,10 +444,25 @@ fn arm_down_in(src: &Source, lane: &Lane, start: usize, end: usize) -> (Option<u
     (None, rejected)
 }
 
-/// PRESENT, DURABLE, REFUSING, and FIRST. All four, or the lane conveys against an armed tower.
+/// PRESENT, DURABLE, REFUSING, FIRST — and with NO flat co-sign anywhere in the lane. All five, or
+/// the lane conveys against an armed tower (or conveys a backup no receiver will accept).
 fn audit_lane(src: &Source, lane: &Lane) -> Result<(), String> {
     let (start, end) = window(src, lane.signature, lane.terminator)?;
     let fname = lane.signature.trim();
+
+    // [ONE COIN SHAPE] Before anything is ordered: the lane must not co-sign a flat backup at all.
+    for marker in lane.forbidden {
+        if let Some(at) = src.find_code(marker, start).filter(|i| *i < end) {
+            return Err(format!(
+                "{}: `{fname}` co-signs a flat backup through `{marker}` (byte {at}). A laddered \
+                 coin conveys NO flat backup — none at deposit, none at any hop — so this is a \
+                 co-sign the receiver's census `tiers + superseded` cannot account for (the \
+                 transfer is refused on arrival) AND a matured spend of `F` that this wallet keeps \
+                 after the coin is gone. Remove it; do not order the arm-down around it.",
+                lane.file
+            ));
+        }
+    }
 
     let (arm, rejected) = arm_down_in(src, lane, start, end);
 
@@ -466,10 +501,10 @@ fn audit_lane(src: &Source, lane: &Lane) -> Result<(), String> {
             return Err(format!(
                 "{}: in `{fname}` the arm-down (byte {arm}) comes AFTER `{marker}` (byte {at}). \
                  That is the D1 defect verbatim, not a weaker version of the fix: between the \
-                 co-sign and the status write, a `defend_ladders` pass reads a stale CONFIRMED, is \
-                 admitted, and broadcasts the retained state against the one the recipient now \
-                 holds over the same output. The arm-down must be hoisted above every step that can \
-                 produce material for anybody else.",
+                 co-sign and the status write, a `defend_ladders` pass reads a stale live status \
+                 (IN_MEMPOOL/UNCONFIRMED/CONFIRMED), is admitted by L1, and broadcasts the retained \
+                 state against the one the recipient now holds over the same output. The arm-down \
+                 must be hoisted above every step that can produce material for anybody else.",
                 lane.file
             ));
         }
@@ -566,21 +601,25 @@ fn every_in_ladder_cosign_is_preceded_by_a_durable_arm_down() {
     }
 }
 
-/// THE RULE THE ARM-DOWN SERVES must still exist. If the tower stopped keying on `CONFIRMED`, or
-/// stopped re-reading the status per pass, the arm-down would be decorative and the real defence
-/// something else entirely — in which case this census pins the wrong thing and must be re-derived
-/// rather than deleted.
+/// THE RULE THE ARM-DOWN SERVES must still exist. If the tower stopped keying on the liveness
+/// allowlist, or stopped re-reading the status per pass, the arm-down would be decorative and the
+/// real defence something else entirely — in which case this census pins the wrong thing and must
+/// be re-derived rather than deleted.
 ///
 /// Scoped to `defend_ladders_inner`'s own body: `wallet.rs` mentions `CoinStatus::CONFIRMED` in
 /// several unrelated places, so a whole-file `contains` here would survive the loop's L1 filter
 /// being removed outright.
 #[test]
-fn the_tower_still_keys_on_a_confirmed_allowlist() {
+fn the_tower_still_keys_on_the_liveness_allowlist() {
     let src = scan(&read("clients/libs/rust-sdk/src/wallet.rs"));
     let (start, end) = window(&src, "\n    async fn defend_ladders_inner(", "\n    }\n")
         .unwrap_or_else(|e| panic!("{e}"));
 
-    for needle in ["CoinStatus::CONFIRMED", "live_sids"] {
+    // L1 is `is_live_for_defence` — IN_MEMPOOL | UNCONFIRMED | CONFIRMED, because a coin's ladder
+    // exists from the first mempool sighting of its deposit and is defended from that block. The
+    // arm-down parks a conveyed coin at IN_TRANSFER, which is outside all three, so the rule this
+    // file serves is unchanged in substance.
+    for needle in ["is_live_for_defence(c)", "live_sids"] {
         assert!(
             src.find_code(needle, start).is_some_and(|i| i < end),
             "`defend_ladders_inner` no longer references `{needle}` — L1 has changed shape, so the \
@@ -588,6 +627,45 @@ fn the_tower_still_keys_on_a_confirmed_allowlist() {
              Re-derive the census against the new filter."
         );
     }
+
+    // ...and the predicate itself is the three-status allowlist, with IN_TRANSFER outside it. A
+    // predicate that admitted IN_TRANSFER would make every arm-down in this file a no-op; one that
+    // dropped IN_MEMPOOL/UNCONFIRMED would leave a deposit-time ladder undefended for its first
+    // blocks, which is the window the ladder-at-sight rule exists to cover.
+    let (pstart, pend) =
+        window(&src, "\npub(crate) fn is_live_for_defence(", "\n}\n").unwrap_or_else(|e| panic!("{e}"));
+    let predicate = &src.code[pstart..pend];
+    for status in ["CoinStatus::IN_MEMPOOL", "CoinStatus::UNCONFIRMED", "CoinStatus::CONFIRMED"] {
+        assert!(
+            predicate.contains(status),
+            "`is_live_for_defence` no longer admits `{status}`:\n{predicate}"
+        );
+    }
+    assert!(
+        !predicate.contains("CoinStatus::IN_TRANSFER"),
+        "`is_live_for_defence` admits `IN_TRANSFER` — the arm-down this whole file enforces would \
+         then stand the tower down against NOTHING:\n{predicate}"
+    );
+
+    // The same allowlist gates the other two broadcast/export paths, so a conveyed coin is outside
+    // all of them at once.
+    let unilateral = scan(&read("clients/libs/rust-sdk/src/wallet.rs"));
+    let (ustart, uend) = window(&unilateral, "\n    pub async fn unilateral_exit(", "\n    }\n")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        unilateral.find_code("is_live_for_defence(c)", ustart).is_some_and(|i| i < uend),
+        "`unilateral_exit` no longer selects coins through `is_live_for_defence` — an exit path \
+         keyed on a different allowlist can broadcast a retained state for a coin this wallet has \
+         already conveyed"
+    );
+    let tower = scan(&read("clients/libs/rust-sdk/src/watchtower.rs"));
+    let (wstart, wend) = window(&tower, "\n    pub async fn export_watch_bundle(", "\n    }\n")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        tower.find_code("is_live_for_defence(c)", wstart).is_some_and(|i| i < wend),
+        "`export_watch_bundle` no longer selects coins through `is_live_for_defence` — a keyless \
+         tower handed a conveyed coin's ladder would race the recipient with it"
+    );
 }
 
 /// **THE MUTATION, ON THE REAL FILE.** Everything else here plants defects in synthetic sources;
@@ -687,7 +765,8 @@ fn planted_lane() -> Lane {
         terminator: "\n}\n",
         arm_down: "persist_coin_status(",
         status: "CoinStatus::IN_TRANSFER",
-        conveyance: &["create_backup_transactions(", "get_new_x1("],
+        conveyance: &["presign_receiver_state(", "get_new_x1("],
+        forbidden: FLAT_COSIGNS,
     }
 }
 
@@ -714,9 +793,9 @@ const ARM: &str = "\
         })?;
 ";
 
-/// The two steps that produce material for somebody else.
+/// The two steps that produce material for somebody else: the `S'` co-sign and the coordinator open.
 const CONVEY: &str = "\
-    let backups = create_backup_transactions(cc, addr, &mut wallet, &sid).await?;
+    let augmented = presign_receiver_state(cc, &coin, &bundle, addr).await?;
     let x1 = get_new_x1(cc, &sid).await?;
 ";
 
@@ -727,7 +806,7 @@ const TAIL: &str = "\
     Ok(())
 }
 
-async fn create_backup_tx_to_receiver(cc: &ClientConfig) -> Result<String> {
+pub async fn get_new_x1(cc: &ClientConfig, sid: &str) -> Result<String> {
     Ok(String::new())
 }
 ";
@@ -773,8 +852,11 @@ async fn some_other_lane(cc: &ClientConfig) -> Result<()> {
         "    println!(\"persist_coin_status(cc, name, &sid, CoinStatus::IN_TRANSFER) before the conveyance\");\n";
     const WRONG_STATUS: &str =
         "    let previous = persist_coin_status(cc, name, &sid, CoinStatus::CONFIRMED).await?;\n";
+    // [ONE COIN SHAPE] The retired per-hop flat co-sign, back in the lane — arm-down and all.
+    const FLAT_COSIGN: &str =
+        "    let backups = create_backup_transactions(cc, addr, &mut wallet, &sid).await?;\n";
 
-    let cases: [(&str, String, &str); 7] = [
+    let cases: [(&str, String, &str); 8] = [
         (
             // THE PROVEN ONE. The adversarial review deleted this exact block from the real
             // `execute_ex` and the old guard stayed GREEN, 3 passed: `persist_coin_status(` was
@@ -789,7 +871,7 @@ async fn some_other_lane(cc: &ClientConfig) -> Result<()> {
             // assertion at all, despite its failure message claiming "before the conveyance".
             "arm_down_moved_below_the_conveyance",
             lane_source(&[HEAD, CONVEY, ARM, TAIL]),
-            "comes AFTER `create_backup_transactions(`",
+            "comes AFTER `presign_receiver_state(`",
         ),
         (
             // The swallow: same call, same status, same words, no refusal. The coin is conveyed
@@ -827,8 +909,17 @@ async fn some_other_lane(cc: &ClientConfig) -> Result<()> {
             // the guard has to say so rather than pass.
             "the_conveyance_marker_disappeared",
             lane_source(&[HEAD, ARM, CONVEY, TAIL])
-                .replace("create_backup_transactions(", "co_sign_backups("),
-            "no longer calls `create_backup_transactions(`",
+                .replace("presign_receiver_state(", "co_sign_receiver_state("),
+            "no longer calls `presign_receiver_state(`",
+        ),
+        (
+            // [ONE COIN SHAPE] The retired flat co-sign re-planted — correctly BELOW a correct
+            // arm-down, so every ordering clause is satisfied and only the forbidden-call clause
+            // can catch it. A laddered coin conveys no flat backup; this is the census breach the
+            // receiver refuses on arrival, and the retained matured spend of `F` the rule removed.
+            "a_flat_backup_cosign_returned_to_the_lane",
+            lane_source(&[HEAD, ARM, FLAT_COSIGN, CONVEY, TAIL]),
+            "co-signs a flat backup through `create_backup_transactions(`",
         ),
     ];
 

@@ -30,6 +30,13 @@
 //! Every part ends with an HONEST CONTROL that must still PASS — without it a verifier that rejected
 //! everything would pass this suite.
 //!
+//! **The fixture and the census.** The victim ladder is the one the DEPOSIT co-signed at first
+//! mempool sight of F (T, X_0, S_0), loaded from disk, never re-established: a deposited coin's
+//! enclave count is exactly 3 and every co-sign is a tier. The census is `se_num_sigs == tiers +
+//! superseded` with the flat term 0 everywhere below (there is no deposit `tx1`); CONTROL 0 also
+//! pins that the retired flat term of 1 is REFUSED, and the split child of PART D conveys an EMPTY
+//! parent flat chain (`PARENT_V2_BASELINE == 0`, `CHILD_V2_BASELINE == 0`).
+//!
 //! Run with SDK_E2E=70 (needs the regtest + Mercury lockbox stack, Core 28+).
 
 use std::{env, str::FromStr};
@@ -41,7 +48,7 @@ use mercuryrustlib::{
     tesr::{verify_bundle, verify_bundle_bound, CoinAuthority, TesrBundle, TesrTier},
 };
 
-use crate::sdk40_tesr_consensus::deposit_coin;
+use crate::sdk40_tesr_consensus::{deposit_coin, deposit_coin_unladdered};
 
 const NETWORK: &str = "regtest";
 /// **[D44] The COIN's committed rate, read from the preset — not written down.**
@@ -123,11 +130,17 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
 
     // ================= THE VICTIM COIN: a real ladder, co-signed by the live SE. =================
+    // The one the DEPOSIT established at first sight — loaded, not re-established (a second ladder
+    // over F would be three more irreversible co-signs the census could never account for).
     let mut victim = deposit_coin(&cc, "sdk70_alice").await?;
     let victim_sid = victim.statechain_id.clone().ok_or(anyhow!("no victim sid"))?;
-    let victim_exit = crate::bitcoin_core::getnewaddress()?;
-    let bundle = mercuryrustlib::tesr::establish_auto(&cc, &mut victim, &victim_exit, NETWORK).await?;
+    let bundle = mercuryrustlib::tesr::load(&cc, "sdk70_alice", &victim_sid)
+        .await?
+        .ok_or(anyhow!("the deposit must have been laddered at first sight — it has no other exit material"))?;
+    let victim_exit = bundle.owner_exit_address.clone();
+    assert_eq!(victim_exit, victim.backup_address, "the deposit ladder exits to the depositor's own key");
     let se = num_sigs(&cc, &victim_sid).await?;
+    assert_eq!(se, 3, "a deposited coin's enclave count is exactly its three tiers (T, X_0, S_0) — no tx1");
     let victim_agg = aggregate(&cc, &victim_sid).await?;
     let victim_tx0 = tx0_hex_from_chain(&cc, &bundle.f_txid)?;
 
@@ -142,11 +155,21 @@ pub async fn execute() -> Result<()> {
         victim_agg.clone(),
     )?;
 
-    // ---- CONTROL 0: the honest ladder passes BOTH verifiers. ------------------------------------
-    verify_bundle(&bundle, se, 1).map_err(|e| anyhow!("honest bundle must verify (unbound): {e}"))?;
-    verify_bundle_bound(&bundle, se, 1, &authority)
+    // ---- CONTROL 0: the honest ladder passes BOTH verifiers, with the flat term 0. --------------
+    verify_bundle(&bundle, se, 0).map_err(|e| anyhow!("honest bundle must verify (unbound): {e}"))?;
+    verify_bundle_bound(&bundle, se, 0, &authority)
         .map_err(|e| anyhow!("honest bundle must verify (bound to its own coin): {e}"))?;
-    println!("SDK70 - control 0: the honest ladder verifies, bound and unbound (num_sigs={se})");
+    println!("SDK70 - control 0: the honest ladder verifies, bound and unbound (num_sigs={se}, flat term 0)");
+    // ...and the RETIRED flat term (one deposit tx1) does not balance: a verifier still budgeting it
+    // would refuse every honest coin at its true count and launder one hidden state at count+1.
+    must_reject_bound(
+        &bundle,
+        se,
+        1,
+        &authority,
+        "CONTROL 0′ (a flat term of 1 — the retired deposit tx1 — budgeted against a laddered coin)",
+        "num_sigs mismatch",
+    )?;
 
     // ======================= PART A — payload_vout fails CLOSED, per site =======================
 
@@ -158,7 +181,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &a,
             se,
-            1,
+            0,
             "A1 (trigger payload_vout=1 → payload output is the P2A anchor, not A)",
             "trigger does not pay the aggregate key A",
         )?;
@@ -172,7 +195,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &a,
             se,
-            1,
+            0,
             "A2 (trigger payload_vout=9 → out of range)",
             "declared payload_vout 9 is out of range",
         )?;
@@ -186,7 +209,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &a,
             se,
-            1,
+            0,
             "A3 (extension payload_vout=1 → pays the wrong output)",
             "tier 1 pays the wrong output",
         )?;
@@ -201,7 +224,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &a,
             se,
-            1,
+            0,
             "A4 (final state payload_vout=1 → exit leg pays the wrong output)",
             "tier 2 pays the wrong output",
         )?;
@@ -251,7 +274,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &a,
             se,
-            1,
+            0,
             "A5 (child spends out[0] while the parent's payload_vout is 1 — broken linkage)",
             "tier 1 does not spend its parent's payload output",
         )?;
@@ -268,7 +291,7 @@ pub async fn execute() -> Result<()> {
         must_reject(
             &a,
             se,
-            1,
+            0,
             "A6 (restated F value → the trigger's co-sign sighash no longer verifies)",
             "exit tier 0 is not co-signed by A",
         )?;
@@ -296,19 +319,22 @@ pub async fn execute() -> Result<()> {
     }
 
     // ---- CONTROL A: the untouched ladder still verifies after all of that. ----------------------
-    verify_bundle_bound(&bundle, se, 1, &authority)
+    verify_bundle_bound(&bundle, se, 0, &authority)
         .map_err(|e| anyhow!("honest bundle must still verify after PART A: {e}"))?;
     println!("SDK70 - control A: the honest ladder still verifies (a reject-everything verifier would fail here)");
 
     // ============ PART B — [C-1] the decoy ladder: self-consistent, and NOT this coin ============
     //
-    // Mallory holds her own laddered coin. She builds its ladder to exit to ALICE's key, so the
+    // Mallory holds her own coin. She builds its ladder HERSELF to exit to ALICE's key, so the
     // Model-A fund-safety gate (`owner_exit_address == the receiver's own backup address`) passes,
     // and conveys it as if it were the ladder of the coin she is sending Alice — while keeping the
-    // REAL trigger of that coin. Her ladder is entirely genuine: every tier is co-signed, the chain
-    // links, and the tier count balances a `num_sigs` identical to the victim's (both coins have the
-    // same shape). Nothing INSIDE the bundle is wrong. Only the coin it describes is.
-    let mut mallory = deposit_coin(&cc, "sdk70_mallory").await?;
+    // REAL trigger of that coin. Her deposit is booked under `LadderAtSight::Defer` (the SDK-claim
+    // fixture: seen and booked with NO ladder and 0 co-signs) precisely so that the three co-signs
+    // on it are the ones SHE chooses. Her ladder is entirely genuine: every tier is co-signed, the
+    // chain links, and the tier count balances a `num_sigs` identical to the victim's (both coins
+    // have the same shape: three tiers, no flat term). Nothing INSIDE the bundle is wrong. Only the
+    // coin it describes is.
+    let mut mallory = deposit_coin_unladdered(&cc, "sdk70_mallory").await?;
     let mallory_sid = mallory.statechain_id.clone().ok_or(anyhow!("no mallory sid"))?;
     let decoy = mercuryrustlib::tesr::establish_auto(&cc, &mut mallory, &victim_exit, NETWORK).await?;
     let decoy_se = num_sigs(&cc, &mallory_sid).await?;
@@ -323,7 +349,7 @@ pub async fn execute() -> Result<()> {
     assert_ne!(decoy.f_txid, bundle.f_txid, "the decoy is rooted at Mallory's outpoint, not the coin's");
 
     // B0 — THE BUG, demonstrated: the unbound verifier ACCEPTS the decoy at the victim's count.
-    verify_bundle(&decoy, se, 1).map_err(|e| {
+    verify_bundle(&decoy, se, 0).map_err(|e| {
         anyhow!("the decoy must be internally self-consistent for this test to mean anything: {e}")
     })?;
     println!("SDK70 - B0: the UNBOUND verifier accepts the decoy ladder at the victim's num_sigs — this is audit C-1");
@@ -332,7 +358,7 @@ pub async fn execute() -> Result<()> {
     must_reject_bound(
         &decoy,
         se,
-        1,
+        0,
         &authority,
         "B1 (decoy ladder for another statechain id)",
         "the census would balance a different coin",
@@ -345,7 +371,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &d,
             se,
-            1,
+            0,
             &authority,
             "B2 (decoy with the victim's sid — wrong funding outpoint)",
             "the coin's funding outpoint is",
@@ -363,7 +389,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &d,
             se,
-            1,
+            0,
             &authority,
             "B3 (decoy with the victim's sid AND outpoint — wrong aggregate)",
             "aggregate address does not match the coin's on-chain funding key",
@@ -377,7 +403,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &bundle,
             se,
-            1,
+            0,
             &no_agg,
             "B4 (coordinator recorded no aggregate — fail-closed)",
             "recorded no aggregate for statechain id",
@@ -392,7 +418,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &bundle,
             se,
-            1,
+            0,
             &decoy_agg,
             "B5 (coordinator aggregate != the funding output key)",
             "does not match the funding output key",
@@ -409,7 +435,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &bundle,
             se,
-            1,
+            0,
             &bad_spk,
             "B6 (funding spk is not a v1 taproot output)",
             "coin funding output is not a v1 taproot output",
@@ -423,7 +449,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &bundle,
             se,
-            1,
+            0,
             &bad_val,
             "B7 (funding value restated)",
             "the tier sighashes commit to the real value",
@@ -431,7 +457,7 @@ pub async fn execute() -> Result<()> {
     }
 
     // ---- CONTROL B ----
-    verify_bundle_bound(&bundle, se, 1, &authority)
+    verify_bundle_bound(&bundle, se, 0, &authority)
         .map_err(|e| anyhow!("honest bundle must still verify after PART B: {e}"))?;
     println!("SDK70 - control B: the honest ladder still verifies against its own coin");
 
@@ -443,7 +469,7 @@ pub async fn execute() -> Result<()> {
     let mut renewed = bundle.clone();
     mercuryrustlib::tesr::renew_auto(&cc, &mut victim, &mut renewed).await?;
     let se_renew = num_sigs(&cc, &victim_sid).await?;
-    verify_bundle_bound(&renewed, se_renew, 1, &authority)
+    verify_bundle_bound(&renewed, se_renew, 0, &authority)
         .map_err(|e| anyhow!("the renewed bundle must verify (control): {e}"))?;
     println!("SDK70 - control C: the renewed ladder verifies at num_sigs={se_renew} (1 superseded extension + 1 superseded state)");
 
@@ -456,7 +482,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &c,
             se_renew + 1,
-            1,
+            0,
             &authority,
             "C1 (a superseded tier disclosed twice)",
             "is disclosed more than once",
@@ -475,7 +501,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &c,
             se_renew + 1,
-            1,
+            0,
             &authority,
             "C2 (a superseded extension disclosed twice)",
             "is disclosed more than once",
@@ -491,7 +517,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &c,
             se_renew + 1,
-            1,
+            0,
             &authority,
             "C3 (a LIVE tier re-declared as superseded)",
             "is disclosed more than once",
@@ -515,7 +541,7 @@ pub async fn execute() -> Result<()> {
         must_reject_bound(
             &c,
             se_renew,
-            1,
+            0,
             &authority,
             "C4 (live extension payload_vout=1 on a renewed ladder — content-checked payee)",
             "tier 1 pays the wrong output",
@@ -523,7 +549,7 @@ pub async fn execute() -> Result<()> {
     }
 
     // ---- CONTROL C ----
-    verify_bundle_bound(&renewed, se_renew, 1, &authority)
+    verify_bundle_bound(&renewed, se_renew, 0, &authority)
         .map_err(|e| anyhow!("the renewed bundle must still verify after PART C: {e}"))?;
     println!("SDK70 - control C′: the renewed ladder still verifies");
 
@@ -535,9 +561,17 @@ pub async fn execute() -> Result<()> {
     let wallet = "sdk70_split";
     let mut parent = deposit_coin(&cc, wallet).await?;
     let parent_sid = parent.statechain_id.clone().ok_or(anyhow!("no split parent sid"))?;
-    let parent_baseline = num_sigs(&cc, &parent_sid).await?;
-    let parent_exit = crate::bitcoin_core::getnewaddress()?;
-    let pbundle = mercuryrustlib::tesr::establish_auto(&cc, &mut parent, &parent_exit, NETWORK).await?;
+    let pbundle = mercuryrustlib::tesr::load(&cc, wallet, &parent_sid)
+        .await?
+        .ok_or(anyhow!("the split parent must have been laddered at first sight — it has no other exit material"))?;
+    assert_eq!(
+        num_sigs(&cc, &parent_sid).await?,
+        3,
+        "a laddered parent's three co-signs are all tiers — its flat-backup census term is zero"
+    );
+    // The parent's flat term as the child verifier consumes it: the constant the receiver uses.
+    let parent_baseline = mercuryrustlib::tesr::PARENT_V2_BASELINE;
+    assert_eq!(parent_baseline, 0, "a laddered parent's flat-backup census term is ZERO");
 
     let x_m = pbundle.current().extension.clone();
     let child_value = mercurylib::tesr::tier_out_total(x_m.out_value, 1, fee_rate())
@@ -558,7 +592,9 @@ pub async fn execute() -> Result<()> {
         .cloned()
         .ok_or(anyhow!("child slot not found"))?;
     let child_sid = child.statechain_id.clone().ok_or(anyhow!("no child sid"))?;
-    let child_baseline = num_sigs(&cc, &child_sid).await?;
+    assert_eq!(num_sigs(&cc, &child_sid).await?, 0, "a fresh child slot has no co-sign at all");
+    let child_baseline = mercuryrustlib::tesr::CHILD_V2_BASELINE;
+    assert_eq!(child_baseline, 0, "a split child's flat-backup census term is ZERO");
 
     let receiver = crate::sdk58_inladder_split::taproot_addr();
     let mut children = vec![(child.clone(), receiver.clone(), child_value)];
@@ -582,6 +618,10 @@ pub async fn execute() -> Result<()> {
     .into_iter()
     .next()
     .ok_or(anyhow!("in_ladder_split returned no child bundle"))?;
+    assert!(
+        cb.parent_flat_backups.is_empty(),
+        "a split child conveys an EMPTY parent flat chain — a laddered parent has no flat backup"
+    );
 
     let f_txid = electrum_client::bitcoin::Txid::from_str(&pbundle.f_txid).map_err(|_| anyhow!("bad f_txid"))?;
     let f_tx = cc.electrum_client.transaction_get(&f_txid).map_err(|_| anyhow!("F not on chain"))?;

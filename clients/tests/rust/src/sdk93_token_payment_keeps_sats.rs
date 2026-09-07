@@ -34,15 +34,27 @@
 //!      repo's own documented convention. FIXED: absence is now absence.
 //!   4. **WHERE IT STOPS TODAY, and it is structural rather than a missing lookup.** With the
 //!      absence handled, the next thing the path wants is a previous nLockTime to build strictly
-//!      below — and a carrier received through a coloured split **has no locktime at all**. That is
-//!      not an omission: a laddered coin's state is governed by CSV TIERS, and every TES-R tier is
-//!      built at locktime 0. A decrementing flat backup is simply the wrong mechanism for it.
+//!      below — and **no coin has one any more**. `refresh_rgb_anchor_self_transfer` is the
+//!      flat-backup builder: it appends a decrementing absolute-locktime backup to the coin's chain.
+//!      That chain is retired for EVERY coin, not only for a received child: a coin's ladder
+//!      `(T, X, S)` is co-signed at first sight of `F` in place of the flat `tx1`, `coin.locktime`
+//!      is `None` for life, and every TES-R tier is built at locktime 0. So the path refuses at
+//!      "neither a backup tx nor a locktime" for the sending carrier itself — the boundary moved
+//!      from "children only" to "everything", which makes the remaining work unambiguous.
+//!   5. **The receive lane moved too.** Step 2 ("bob receives normally") used to run the legacy flat
+//!      coloured split, which is now refused by name (`register_split_subcoins_n`: "the off-chain
+//!      branch split is retired"). Both wallets therefore run with `colored_ladder = true`, so bob
+//!      receives a coloured CHILD and the test reaches the boundary in 4 instead of dying at step 2.
+//!      A child's allocation sits on an un-broadcast `SP` output, so the carrier lookup at the top
+//!      of `transfer_tokens_onto` (a SETTLED allocation on a CONFIRMED coin) may be the first
+//!      refusal hit; either way the stop is on the flat-backup path, before any satoshi moves, and
+//!      the assertions below are never reached.
 //!
 //! So the remaining work is NOT "teach this path about children" — it is to build the coloured
 //! payment for a laddered coin on the IN-LADDER path (`build_colored_in_ladder_split` and friends)
 //! with a revealed foreign seal, rather than on the flat-backup path this test drives. Nothing about
-//! revealed seals is in doubt: `rgb09` proves them end to end on a carrier that does have a plain
-//! backup chain.
+//! revealed seals is in doubt: `rgb09` proves them end to end — on a carrier that had a plain
+//! backup chain, a shape no SDK wallet produces any more.
 //!
 //! This test is committed RED on purpose. A runnable reproduction of a real boundary is worth more
 //! than a green test that stops before reaching it.
@@ -102,10 +114,14 @@ pub async fn execute() -> Result<()> {
     let cc = mercuryrustlib::client_config::load().await;
     let core = bitcoin_core::getnewaddress()?;
 
+    // Obstacle 5 (header): the legacy flat coloured split a default wallet would take on step 2 is
+    // retired, so both wallets run the CTES-R lane — bob then receives a coloured child.
     let mut a_cfg = SdkConfig::regtest("sdk93_alice");
     a_cfg.rgb_data_dir = Some("./rgb-data-sdk93_alice".to_string());
+    a_cfg.colored_ladder = true;
     let mut b_cfg = SdkConfig::regtest("sdk93_bob");
     b_cfg.rgb_data_dir = Some("./rgb-data-sdk93_bob".to_string());
+    b_cfg.colored_ladder = true;
     let (alice, _) = UtexoWallet::initialize(a_cfg, None).await?;
     let (bob, _) = UtexoWallet::initialize(b_cfg, None).await?;
 
@@ -155,11 +171,12 @@ pub async fn execute() -> Result<()> {
     }
     println!("SDK93 - (1) alice issued {SUPPLY} {asset} and settled the carrier's open transfer");
 
-    // ---- 2. Bob receives normally, so he holds a CLEAN carrier to pay from. ---------------------
+    // ---- 2. Bob receives normally, so he holds a CLEAN piece to pay from. -----------------------
     //
     // Deliberately NOT paying from the issuance carrier: issuance leaves an open transfer on it at
     // the coordinator, and the SE refuses any co-signature while one is open. That is a property of
     // issuance, not of this lane, and a test that fought it would be measuring the wrong thing.
+    // On the coloured lane this arrives as a coloured CHILD of alice's carrier (header, obstacle 5).
     let t = prepaid_token(&cc).await?;
     bob.add_prepaid_token(&t).await;
     let bob_addr = bob.get_utexo_address().await?;

@@ -14,8 +14,20 @@
 //! epoch-deadline gates simply do not fire — so obtaining two conflicting co-signatures of one coin
 //! exercises exactly the code path a gate-ignoring SE would take. The point: two valid conflicting
 //! spends of `F` exist, and only the one that confirms first wins. This is the irreducible single-SE
-//! trust floor that neither the ladder (an absolute-locktime backup chain OR the TES-R CSV tiers),
-//! single_use, nor the terminal/budget query can close (only threshold signing can).
+//! trust floor that neither the ladder (the TES-R CSV tiers — the coin's ONLY exit material; there
+//! is no absolute-locktime backup chain before, beside or after it any more), single_use, nor the
+//! terminal/budget query can close (only threshold signing can).
+//!
+//! The coin is laddered by the SDK's `claim()` at the FIRST MEMPOOL SIGHTING of `F`
+//! (`update_coins_ex(.., Defer)` books it `IN_MEMPOOL`; the same pass's establish loop signs
+//! T → X_0 → S_0). Before mounting the attack this test pins that shape, because it is the premise
+//! the attack is measured against: the coin is `IN_MEMPOOL` AND has its `tesr-<sid>` row, the
+//! enclave count is EXACTLY 3 (no `tx1`), there is no `<sid>` flat row and no `locktime`, and the
+//! exported watch bundle already lists the coin as an event-watch on `F` (liveness allowlist L1 admits
+//! `IN_MEMPOOL`). Confirmation ADOPTS that ladder (`num_sigs` still 3), and the honest census
+//! `verify_bundle(b, 3, 0)` balances. After the two rival co-signs `num_sigs == 5` and that same
+//! census FAILS — which is how a receiver detects the SE's hidden rivals. Detection, not prevention:
+//! on chain the two triggers are a plain race.
 //!
 //! Not to be confused with sdk12, which proves the INVERSE property: the SE cannot double-sign behind
 //! the receiver's back (nonce atomicity). Here the SE is *willing*, and nothing client-side stops it.
@@ -28,6 +40,7 @@ use mercury_utexo_sdk::{SdkConfig, UtexoWallet};
 use mercuryrustlib::{client_config::ClientConfig, CoinStatus};
 
 use crate::bitcoin_core;
+use crate::sdk40_tesr_consensus::{se_num_sigs, wait_for_address};
 
 const NETWORK: &str = "regtest";
 /// The two rival triggers must differ as *transactions*. A txid covers no witness data, so two
@@ -44,9 +57,10 @@ async fn prepaid_token(cc: &ClientConfig) -> Result<String> {
 
 pub async fn execute() -> Result<()> {
     // No protocol pin: this runs on the real TES-R default. The coin below is laddered by
-    // claim() (`tesr::establish_auto`), which is exactly the point — the CSV ladder IS in place, the
-    // coin never ages while idle, and none of that buys the honest owner anything against a freshly
-    // co-signed rival trigger over the same funding UTXO.
+    // claim() in the pass that first sees its funding tx in the mempool, which is exactly the
+    // point — the CSV ladder IS in place from the first moment, the coin never ages while idle, and
+    // none of that buys the honest owner anything against a freshly co-signed rival trigger over the
+    // same funding UTXO.
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
@@ -61,6 +75,55 @@ pub async fn execute() -> Result<()> {
     alice.add_prepaid_token(&t).await;
     let addr = alice.get_deposit_address(40_000).await?;
     bitcoin_core::sendtoaddress(40_000, &addr)?;
+
+    // --- FIRST SIGHT: F is in the mempool, nothing mined. ONE claim() pass books the coin
+    // IN_MEMPOOL and ladders it in the same pass (the SDK lane's counterpart of sdk40's PART 0). ---
+    wait_for_address(&cc, &addr, 40_000).await?;
+    alice.claim().await?;
+    let seen = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk15_alice")
+        .await?
+        .coins
+        .iter()
+        .find(|c| c.amount == Some(40_000) && c.duplicate_index == 0)
+        .cloned()
+        .ok_or_else(|| anyhow!("claim() did not book the 40 000-sat deposit"))?;
+    assert_eq!(
+        seen.status,
+        CoinStatus::IN_MEMPOOL,
+        "F is unconfirmed, so the first pass must book the coin IN_MEMPOOL (got {:?})",
+        seen.status
+    );
+    let sid = seen.statechain_id.clone().ok_or_else(|| anyhow!("booked coin has no statechain_id"))?;
+    let at_sight = mercuryrustlib::tesr::load(&cc, "sdk15_alice", &sid).await?.ok_or_else(|| {
+        anyhow!(
+            "claim() booked {sid} IN_MEMPOOL with no `tesr-{sid}` row — the SDK must ladder a deposit in \
+             the pass that first sees it; a coin without a ladder has no exit material at all"
+        )
+    })?;
+    assert_eq!(at_sight.exit_tiers().len(), 3, "the at-sight ladder is T → X_0 → S_0");
+    assert_eq!(
+        se_num_sigs(&cc, &sid).await?,
+        3,
+        "the enclave count at first sight is EXACTLY the three tiers: no tx1 was co-signed"
+    );
+    assert!(
+        mercuryrustlib::sqlite_manager::try_get_backup_txs(&cc.pool, "sdk15_alice", &sid).await?.is_none(),
+        "no `<sid>` flat backup row exists for a laddered deposit"
+    );
+    assert!(seen.locktime.is_none(), "a laddered coin has no absolute calendar (locktime None), got {:?}", seen.locktime);
+    // L1: the wallet's exported watch bundle covers the coin ALREADY — as an event-watch on F with
+    // no backup and no height — because the liveness allowlist admits IN_MEMPOOL. A tower handed
+    // this bundle now would defend the coin before F has a single confirmation.
+    let wb: mercury_utexo_sdk::WatchBundle = serde_json::from_str(&alice.export_watch_bundle().await?)?;
+    let entry = wb.entries.iter().find(|e| e.statechain_id == sid).ok_or_else(|| {
+        anyhow!("the IN_MEMPOOL coin {sid} is missing from the exported watch bundle — the liveness allowlist must admit a coin from its first mempool sighting")
+    })?;
+    assert!(entry.trigger.is_some(), "the IN_MEMPOOL coin's watch entry is an event-watch on F (it carries a trigger)");
+    assert!(entry.backup_tx.is_none() && entry.backup_locktime.is_none(), "a laddered coin exports NO flat backup");
+    assert_eq!(entry.deadline_block, u32::MAX, "a laddered coin has no height deadline");
+    println!("SDK15 - {sid} seen IN_MEMPOOL and laddered in the same claim() pass: num_sigs=3, no flat row, no locktime, already in the watch bundle");
+
+    // --- Confirm. Confirmation ADOPTS the ladder signed at sight; it does not sign a second one. ---
     bitcoin_core::generatetoaddress(3, &core)?;
     let mut waited = 0;
     while alice.get_balance().await?.available_sats != 40_000 {
@@ -69,33 +132,27 @@ pub async fn execute() -> Result<()> {
         if waited > 60 { return Err(anyhow!("deposit did not confirm")); }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    // Take the confirmed coin once claim() has also established its TES-R ladder (the default).
-    let mut found = None;
-    for _ in 0..15 {
-        let candidate = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk15_alice")
-            .await?
-            .coins
-            .iter()
-            .find(|c| c.status == CoinStatus::CONFIRMED && c.amount == Some(40_000))
-            .cloned();
-        if let Some(c) = candidate {
-            let sid = c.statechain_id.clone().unwrap_or_default();
-            if mercuryrustlib::tesr::load(&cc, "sdk15_alice", &sid).await?.is_some() {
-                found = Some(c);
-                break;
-            }
-        }
-        alice.claim().await?;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-    let coin = found.ok_or_else(|| anyhow!("no confirmed coin carrying a TES-R ladder"))?;
-    let sid = coin.statechain_id.clone().ok_or_else(|| anyhow!("coin has no statechain_id"))?;
-    // The TES-R property is really in force before the attack: the coin IS laddered.
-    assert!(
-        mercuryrustlib::tesr::load(&cc, "sdk15_alice", &sid).await?.is_some(),
-        "the coin must carry a TES-R ladder — the ladder is present and still powerless below"
+    let coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, "sdk15_alice")
+        .await?
+        .coins
+        .iter()
+        .find(|c| c.statechain_id.as_deref() == Some(sid.as_str()) && c.duplicate_index == 0)
+        .cloned()
+        .ok_or_else(|| anyhow!("coin {sid} vanished from the wallet"))?;
+    assert_eq!(coin.status, CoinStatus::CONFIRMED, "F confirmed (got {:?})", coin.status);
+    assert!(coin.locktime.is_none(), "locktime stays None for life, got {:?}", coin.locktime);
+    let ladder = mercuryrustlib::tesr::load(&cc, "sdk15_alice", &sid)
+        .await?
+        .ok_or_else(|| anyhow!("the confirmed coin {sid} lost its ladder row"))?;
+    assert_eq!(
+        ladder.trigger.txid, at_sight.trigger.txid,
+        "confirmation must ADOPT the ladder signed at sight, not establish a second one"
     );
-    println!("SDK15 - funded a normal coin {sid} (SE permits re-signing); its TES-R ladder is established");
+    assert_eq!(se_num_sigs(&cc, &sid).await?, 3, "num_sigs is still exactly 3 after confirmation");
+    // The honest census balances with the flat term 0 — the premise every receiver relies on.
+    mercuryrustlib::tesr::verify_bundle(&ladder, 3, 0)
+        .map_err(|e| anyhow!("the honest deposit ladder must pass the census with flat term 0: {e}"))?;
+    println!("SDK15 - funded a normal coin {sid} (SE permits re-signing); its TES-R ladder is the one signed at sight and its census balances (3 == 3 + 0)");
 
     let f_txid = coin.utxo_txid.clone().ok_or_else(|| anyhow!("no F txid"))?;
     let f_vout = coin.utxo_vout.ok_or_else(|| anyhow!("no F vout"))?;
@@ -126,6 +183,18 @@ pub async fn execute() -> Result<()> {
     assert_ne!(txx.txid(), txy.txid(), "the two fresh co-signs must be distinct transactions");
     println!("SDK15 - the SE produced TWO conflicting fresh TRIGGER co-signs: tx_X {} and tx_Y {} (same input {})",
         txx.txid(), txy.txid(), txx.input[0].previous_output);
+
+    // --- The census SEES them. Every co-sign is counted, and there is no flat term to hide one
+    // behind: the honest ladder discloses 3 tiers against 5 issued, so the exact-equality census a
+    // receiver runs (`verify_bundle`) now REFUSES it. That is detection — a receiver would not accept
+    // this coin — not prevention: on chain the two triggers are still a plain race. ---
+    let n = se_num_sigs(&cc, &sid).await?;
+    assert_eq!(n, 5, "both rival co-signs are counted: 3 tiers + 2 fresh triggers, no tx1 term");
+    assert!(
+        mercuryrustlib::tesr::verify_bundle(&ladder, n, 0).is_err(),
+        "the honest ladder must FAIL the census once the SE has issued co-signs it does not disclose (3 disclosed vs {n} issued)"
+    );
+    println!("SDK15 - census after the attack: {n} issued vs 3 disclosed — verify_bundle refuses the honest bundle (a receiver would detect the hidden rivals)");
 
     // --- On-chain it is a plain race: only the FIRST-seen confirms; the other is rejected ---------
     // Once tx_X is mined the outcome is fee-independent: tx_Y's input simply no longer exists.

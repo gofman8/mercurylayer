@@ -235,15 +235,12 @@ impl UtexoWallet {
         if self.parent_shape_opt(statechain_id).await?.is_some() {
             return Ok(true);
         }
-        // `try_get_backup_txs` is the absence-vs-failure split: `Ok(None)` is a genuinely empty
-        // slot, `Err` is a database that could not answer. Only the first is a verdict.
-        let rows = mercuryrustlib::sqlite_manager::try_get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            statechain_id,
-        )
-        .await?;
-        Ok(rows.map_or(false, |v| !v.is_empty()))
+        // …and there is NOTHING ELSE. A flat backup row is not exit material: `transfer_sender`
+        // refuses a coin without a ladder by name whatever rows it holds, and `unilateral_exit`
+        // has no arm that broadcasts one. Counting a legacy row here would put a coin in the
+        // quote's `fundable` set that the executor then refuses — the exact
+        // quote-disagrees-with-executor bug [B2] exists to make inexpressible.
+        Ok(false)
     }
 
     /// **[B2/#145] THE spendable set** — the one both `quote_transfer` and `transfer` plan over.
@@ -491,7 +488,7 @@ impl UtexoWallet {
         // wallet lock since it (and its confirm-wait) take the lock themselves.
         let _ = self.auto_refresh_before_spend().await?;
         let _guard = self.inner.wallet_lock.lock().await;
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
@@ -782,7 +779,10 @@ impl UtexoWallet {
         let amt = |c: &Coin| c.amount.unwrap_or_default() as u64;
         let usable_total: u64 = usable.iter().map(amt).sum();
 
-        // Renewal is due if any usable coin is within the auto-refresh margin of its ladder floor.
+        // Renewal used to be due when a coin's ABSOLUTE locktime came within the auto-refresh
+        // margin. A coin carries no absolute locktime any more (`locktime` is `None` for life; the
+        // ladder is its only exit material), so this is `false` for every coin and no calendar
+        // renewal fee is ever quoted here. Kept in the shape the guards pin.
         let renewal_due = usable
             .iter()
             .any(|c| c.locktime.map_or(false, |l| l.saturating_sub(tip) <= margin));
@@ -922,7 +922,7 @@ impl UtexoWallet {
         // Auto-refresh near-final coins before the parent is selected (see `transfer`).
         let _ = self.auto_refresh_before_spend().await?;
         let _guard = self.inner.wallet_lock.lock().await;
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
@@ -1050,7 +1050,7 @@ impl UtexoWallet {
     /// off-chain split when needed. Returns its statechain id. (The amount-maker behind
     /// single-coin flows: Lightning swaps, latch transfers.)
     pub async fn ensure_exact_coin(&self, sats: u64) -> Result<String> {
-        mercuryrustlib::coin_status::update_coins(&self.inner.cc, &self.inner.config.wallet_name)
+        mercuryrustlib::coin_status::update_coins_ex(&self.inner.cc, &self.inner.config.wallet_name, mercuryrustlib::coin_status::LadderAtSight::Defer)
             .await?;
         let record = self.record().await?;
         let carriers = self.unspendable_as_btc_outpoints().await?;
@@ -1591,16 +1591,14 @@ impl UtexoWallet {
                 Some((batch_id, hash.to_string()))
             }
             InLadderLatch::ClassicMinted => {
-                // The classic SE latch (`create_pre_image`) sanity-checks `coin.locktime`; a fresh
-                // un-broadcast child slot has none, and the child exits via CSV (not an absolute
-                // locktime), so stamp a placeholder (inherited from the parent) purely to pass it.
-                let placeholder_lock = parent.locktime.or(Some(0));
+                // The child exits via its own relative-CSV ladder; it has no absolute locktime and
+                // none is stamped on it (a placeholder here used to make the deadline passes read a
+                // phantom clock).
                 {
                     let mut record = self.record().await?;
                     for coin in record.coins.iter_mut() {
                         if coin.statechain_id.as_deref() == Some(&piece_sid) {
                             coin.status = CoinStatus::IN_TRANSFER;
-                            coin.locktime = placeholder_lock;
                         }
                     }
                     self.save_record(&record).await?;
@@ -2694,127 +2692,18 @@ impl UtexoWallet {
         split_txid: &str,
         outputs: &[(String, u32, u64)],
     ) -> Result<Vec<String>> {
-        let mut record = self.record().await?;
-        let mut ids: Vec<String> = vec![String::new(); outputs.len()];
-        for coin in record.coins.iter_mut() {
-            let addr = coin.aggregated_address.clone().unwrap_or_default();
-            if coin.status == CoinStatus::INITIALISED {
-                if let Some((i, (_, vout, sats))) =
-                    outputs.iter().enumerate().find(|(_, (a, _, _))| *a == addr)
-                {
-                    coin.utxo_txid = Some(split_txid.to_string());
-                    coin.utxo_vout = Some(*vout);
-                    coin.amount = Some(u32::try_from(*sats)?);
-                    coin.status = CoinStatus::CONFIRMED;
-                    ids[i] = coin.statechain_id.clone().unwrap_or_default();
-                    continue;
-                }
-            }
-            if coin.statechain_id.as_deref() == Some(parent_statechain_id)
-                && coin.duplicate_index == 0
-            {
-                // Parent is terminally spent by the split.
-                coin.status = CoinStatus::WITHDRAWN;
-            }
-        }
-        if ids.iter().any(|i| i.is_empty()) {
-            return Err(anyhow!("split sub-coin registration failed"));
-        }
-
-        // Each sub-coin gets its own first backup tx (exit leaf) + locktime.
-        let network = self.inner.config.network.to_string();
-        let mut sub_backups: Vec<(String, mercurylib::wallet::BackupTx)> = Vec::new();
-        for coin in record.coins.iter_mut() {
-            let id = coin.statechain_id.clone().unwrap_or_default();
-            if ids.contains(&id) && coin.status == CoinStatus::CONFIRMED {
-                let bkp =
-                    mercuryrustlib::deposit::create_tx1(&self.inner.cc, coin, &network, 1).await?;
-                coin.locktime = Some(mercurylib::utils::get_blockheight(&bkp)?);
-                sub_backups.push((id, bkp));
-            }
-        }
-        self.save_record(&record).await?;
-
-        // The exit branch is stored root-first: every un-broadcast tx from an ON-CHAIN outpoint
-        // down to this split. When the parent is itself an off-chain sub-coin it already carries a
-        // branch (its own chain from the on-chain root); inherit that and append this split as the
-        // final hop. Otherwise the branch root's input would be the parent's un-broadcast funding
-        // tx, which the receiver cannot resolve on-chain (validate_branch would fail resolving it).
-        let mut branch_txs: Vec<mercurylib::wallet::BackupTx> =
-            mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("branch-{parent_statechain_id}"),
-            )
-            .await
-            .unwrap_or_default();
-        branch_txs.push(mercurylib::wallet::BackupTx {
-            tx_n: (branch_txs.len() + 1) as u32,
-            tx: signed_split_tx_hex.to_string(),
-            client_public_nonce: String::new(),
-            server_public_nonce: String::new(),
-            client_public_key: String::new(),
-            server_public_key: String::new(),
-            blinding_factor: String::new(),
-            rgb_consignment: None,
-            rgb_blinding: None,
-        });
-        for (id, bkp) in &sub_backups {
-            mercuryrustlib::sqlite_manager::insert_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                id,
-                &vec![bkp.clone()],
-            )
-            .await?;
-            mercuryrustlib::sqlite_manager::insert_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("branch-{id}"),
-                &branch_txs,
-            )
-            .await?;
-        }
-
-        // Record the structural ancestor chain (stored under "parents-<id>", one id per row) so a
-        // future transfer of the sub-coin can prove to its receiver that every ancestor is
-        // terminal at the SE. ancestors = this split's parent plus that parent's own ancestors.
-        let mut ancestors: Vec<String> = vec![parent_statechain_id.to_string()];
-        if let Ok(inherited) = mercuryrustlib::sqlite_manager::get_backup_txs(
-            &self.inner.cc.pool,
-            &self.inner.config.wallet_name,
-            &format!("parents-{parent_statechain_id}"),
-        )
-        .await
-        {
-            ancestors.extend(inherited.iter().map(|b| b.tx.clone()));
-        }
-        let parent_rows: Vec<mercurylib::wallet::BackupTx> = ancestors
-            .iter()
-            .enumerate()
-            .map(|(i, id)| mercurylib::wallet::BackupTx {
-                tx_n: (i + 1) as u32,
-                tx: id.clone(),
-                client_public_nonce: String::new(),
-                server_public_nonce: String::new(),
-                client_public_key: String::new(),
-                server_public_key: String::new(),
-                blinding_factor: String::new(),
-                rgb_consignment: None,
-                rgb_blinding: None,
-            })
-            .collect();
-        for id in &ids {
-            mercuryrustlib::sqlite_manager::insert_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("parents-{id}"),
-                &parent_rows,
-            )
-            .await?;
-        }
-
-        Ok(ids)
+        // RETIRED. This lane gave each sub-coin a flat absolute-locktime backup (`create_tx1`) as
+        // its exit material and an un-broadcast branch to reach the chain. There is no flat backup
+        // any more: a coin's only exit is its TES-R ladder, established at first sight of an
+        // ON-CHAIN funding output, and a piece of a payment is carved by the in-ladder split, whose
+        // children carry headless ladders of their own. Refuse rather than register coins that
+        // would have no exit.
+        let _ = (parent_statechain_id, signed_split_tx_hex, split_txid, outputs);
+        Err(anyhow!(
+            "the off-chain branch split is retired: its sub-coins were exited by flat backups, \
+             which no longer exist. Pay with the in-ladder split (`transfer` / `transfer_tokens` \
+             on a laddered coin) instead."
+        ))
     }
 
     /// Register the sub-coins of a COMBINE (N input carriers → M outputs, e.g. piece + change).
@@ -2834,152 +2723,13 @@ impl UtexoWallet {
         combine_txid: &str,
         outputs: &[(String, u32, u64)],
     ) -> Result<Vec<String>> {
-        let mut record = self.record().await?;
-        let mut ids: Vec<String> = vec![String::new(); outputs.len()];
-        for coin in record.coins.iter_mut() {
-            let addr = coin.aggregated_address.clone().unwrap_or_default();
-            if coin.status == CoinStatus::INITIALISED {
-                if let Some((i, (_, vout, sats))) =
-                    outputs.iter().enumerate().find(|(_, (a, _, _))| *a == addr)
-                {
-                    coin.utxo_txid = Some(combine_txid.to_string());
-                    coin.utxo_vout = Some(*vout);
-                    coin.amount = Some(u32::try_from(*sats)?);
-                    coin.status = CoinStatus::CONFIRMED;
-                    ids[i] = coin.statechain_id.clone().unwrap_or_default();
-                    continue;
-                }
-            }
-            // Every combined input carrier is terminally spent by the combine.
-            if coin.duplicate_index == 0
-                && coin
-                    .statechain_id
-                    .as_deref()
-                    .map_or(false, |sid| parent_ids.iter().any(|p| p == sid))
-            {
-                coin.status = CoinStatus::WITHDRAWN;
-            }
-        }
-        if ids.iter().any(|i| i.is_empty()) {
-            return Err(anyhow!("combine sub-coin registration failed"));
-        }
-
-        // Fresh first backup (exit leaf) per output sub-coin.
-        let network = self.inner.config.network.to_string();
-        let mut sub_backups: Vec<(String, mercurylib::wallet::BackupTx)> = Vec::new();
-        for coin in record.coins.iter_mut() {
-            let id = coin.statechain_id.clone().unwrap_or_default();
-            if ids.contains(&id) && coin.status == CoinStatus::CONFIRMED {
-                let bkp =
-                    mercuryrustlib::deposit::create_tx1(&self.inner.cc, coin, &network, 1).await?;
-                coin.locktime = Some(mercurylib::utils::get_blockheight(&bkp)?);
-                sub_backups.push((id, bkp));
-            }
-        }
-        self.save_record(&record).await?;
-
-        // Merge the input sub-branches (root-first) — rejecting any shared ancestor tx — then append
-        // the combine as the final hop. For flat carriers every sub-branch is empty, so the merged
-        // branch is just [combine].
-        let mut merged_branch: Vec<mercurylib::wallet::BackupTx> = Vec::new();
-        let mut seen_txids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for pid in parent_ids {
-            let sub = mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("branch-{pid}"),
-            )
-            .await
-            .unwrap_or_default();
-            for b in sub {
-                let txid = bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(
-                    &hex::decode(&b.tx)?,
-                )?
-                .txid()
-                .to_string();
-                if !seen_txids.insert(txid) {
-                    return Err(anyhow!(
-                        "combine of carriers sharing a common ancestor is not supported — pick independent carriers"
-                    ));
-                }
-                merged_branch.push(b);
-            }
-        }
-        // Re-number and append the combine tx last (the receiver validates by txid lookup, but keep
-        // tx_n contiguous and root-first for clarity).
-        for (i, b) in merged_branch.iter_mut().enumerate() {
-            b.tx_n = (i + 1) as u32;
-        }
-        merged_branch.push(mercurylib::wallet::BackupTx {
-            tx_n: (merged_branch.len() + 1) as u32,
-            tx: signed_combine_tx_hex.to_string(),
-            client_public_nonce: String::new(),
-            server_public_nonce: String::new(),
-            client_public_key: String::new(),
-            server_public_key: String::new(),
-            blinding_factor: String::new(),
-            rgb_consignment: None,
-            rgb_blinding: None,
-        });
-        for (id, bkp) in &sub_backups {
-            mercuryrustlib::sqlite_manager::insert_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                id,
-                &vec![bkp.clone()],
-            )
-            .await?;
-            mercuryrustlib::sqlite_manager::insert_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("branch-{id}"),
-                &merged_branch,
-            )
-            .await?;
-        }
-
-        // Ancestor list = every input carrier id + that input's own inherited ancestors. Because the
-        // sub-branches are disjoint, these are all distinct, so the count equals the receiver's
-        // required-terminal-ancestor count (Σ inputs across the merged branch).
-        let mut ancestors: Vec<String> = Vec::new();
-        for pid in parent_ids {
-            ancestors.push(pid.clone());
-            if let Ok(inherited) = mercuryrustlib::sqlite_manager::get_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("parents-{pid}"),
-            )
-            .await
-            {
-                ancestors.extend(inherited.iter().map(|b| b.tx.clone()));
-            }
-        }
-        let parent_rows: Vec<mercurylib::wallet::BackupTx> = ancestors
-            .iter()
-            .enumerate()
-            .map(|(i, id)| mercurylib::wallet::BackupTx {
-                tx_n: (i + 1) as u32,
-                tx: id.clone(),
-                client_public_nonce: String::new(),
-                server_public_nonce: String::new(),
-                client_public_key: String::new(),
-                server_public_key: String::new(),
-                blinding_factor: String::new(),
-                rgb_consignment: None,
-                rgb_blinding: None,
-            })
-            .collect();
-        for id in &ids {
-            mercuryrustlib::sqlite_manager::insert_backup_txs(
-                &self.inner.cc.pool,
-                &self.inner.config.wallet_name,
-                &format!("parents-{id}"),
-                &parent_rows,
-            )
-            .await?;
-        }
-
-        Ok(ids)
+        // RETIRED, for the same reason as `register_split_subcoins_n`: a combine's outputs were
+        // exited by flat backups over an un-broadcast branch, and no flat backup exists any more.
+        let _ = (parent_ids, signed_combine_tx_hex, combine_txid, outputs);
+        Err(anyhow!(
+            "the off-chain branch combine is retired: its sub-coins were exited by flat backups, \
+             which no longer exist."
+        ))
     }
 
     /// Blind-MuSig2 co-sign a multi-output spend of `coin` (the plain-BTC split; the RGB-colored

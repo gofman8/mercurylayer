@@ -5,17 +5,32 @@
 //! by me, in the session that later found it wrong. Every derivation agreed because every derivation
 //! read the same premise: the BARE latency rule `exit_wait_blocks <= epoch`.
 //!
-//! The rule a conveyed child is actually ADMITTED by is `check_exit_headroom_with_margin`, which
-//! adds `exit_slack_margin`. Under it the caps are **8 / 19** (mainnet) and **54 / 111** (regtest);
-//! depths 9 and 10 need more headroom than an epoch can ever offer, so the build side was minting
+//! The rule the cap is actually measured by adds `exit_slack_margin`:
+//! `exit_wait_blocks(chain) + exit_slack_margin(chain) <= initlock`. Under it the caps are **8 / 19**
+//! (mainnet, `lockheight_init = 10 000`) and **54 / 111** (regtest, `lockheight_init = 1 000`);
+//! depths 9 and 10 need more headroom than the window can ever offer, so the build side was minting
 //! children no receiver could adopt — after terminalizing the parent.
+//!
+//! # [ONE COIN SHAPE] The window is a CONSTANT, not a calendar
+//!
+//! When D53 was written the right-hand side of that rule was the epoch REMAINING on the parent's
+//! flat backup chain — `epoch_deadline − tip`, at most `initlock` — and the receiver admitted a
+//! conveyed child through `check_exit_headroom_with_margin` over that remaining window. A laddered
+//! coin no longer carries a flat backup (none is co-signed at deposit or at any hop), so it has no
+//! epoch deadline and no "remaining window". `enforce_split_depth_cap` (through
+//! `split_cap_decision`) now measures the leaf's REAL exit walk — length AND latency, margin
+//! included — against `initlock` itself (`epoch_blocks = info.initlock`), the same constant the
+//! receiver's `enforce_exit_chain_length` reads, and `check_exit_headroom_with_margin` has no live
+//! caller. The NUMBERS did not move: the maximum window was always `initlock`, and the caps were
+//! always the depths that fit it. What moved is their derivation — 8 / 19 and 54 / 111 are the caps
+//! at every tip, not merely at a freshly re-anchored one.
 //!
 //! # What this guard is, and what it is not
 //!
-//! It is NOT a re-derivation. The arithmetic lives in `mercurylib`, and
-//! `the_build_side_never_admits_what_the_receive_side_refuses` is what holds the two gates together;
-//! this crate deliberately has no dependencies, so a guard here cannot recompute a cap and must not
-//! pretend to.
+//! It is NOT a re-derivation. The arithmetic lives in `mercurylib` (`max_split_depth`), and
+//! `the_build_side_never_admits_what_the_receive_side_refuses` is what holds the build side and the
+//! receive side together; this crate deliberately has no dependencies, so a guard here cannot
+//! recompute a cap and must not pretend to.
 //!
 //! It is a **staleness tripwire**: a document may state the old numbers only in the company of a
 //! marker saying they are superseded. That is enough to stop the specific failure that happened —
@@ -72,9 +87,10 @@ fn a_document_stating_the_superseded_depth_cap_must_say_it_is_superseded() {
         offenders.is_empty(),
         "these documents publish the SUPERSEDED split-depth cap as if it were current. The shipped \
          caps are depth 8 / 19 transactions (mainnet) and depth 54 / 111 (regtest) — the old 10/23 \
-         and 68/139 were measured against the bare latency rule, not the rule that admits, and \
-         depths 9 and 10 were unadoptable at every tip. Either correct the number or mark it as \
-         superseded by citing D53.\n\n{}",
+         and 68/139 were measured against the bare latency rule, not the margin rule \
+         (`exit_wait_blocks + exit_slack_margin <= initlock`, the FIXED exit window a laddered coin \
+         is measured against), and depths 9 and 10 were unadoptable at every tip. Either correct \
+         the number or mark it as superseded by citing D53.\n\n{}",
         offenders.join("\n")
     );
 }

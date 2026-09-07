@@ -1,35 +1,35 @@
-//! E2E (SDK_E2E=87): **[D46 / Stage 3] THE CARRIER VARIANT of the deadline pass.**
+//! E2E (SDK_E2E=87): **THE CARRIER VARIANT of the deadline pass — it leaves a laddered carrier
+//! ALONE, at any margin, and the RGB-safe sever it used to reach for is still there when the OWNER
+//! asks for it by name.**
 //!
-//! The plan listed "the carrier variant of every deadline and allocation test" as owed, with the
-//! reason: *the coloured lane is where three separate bounds turned out to be sat-denominated
-//! descriptions of a victim who loses an ASSET.* This is that test for the deadline bound, and it is
-//! the live exercise of [D46], which until now had only a CI guard.
+//! # What this test used to measure, and why that is now the wrong answer
 //!
-//! # What D46 changed, and why a carrier needed its own test
+//! [D46] opened `deadline_safety_due`'s UNILATERAL route to token carriers: a carrier within
+//! `margin_blocks` of its calendar floor was SEVERED by its own pre-signed `T` (never re-anchored —
+//! a plain re-anchor spends the carrier's funding outpoint into a fresh aggregate and destroys the
+//! allocation). The floor it measured against was the flat backup chain's absolute nLockTime,
+//! booked on `coin.locktime`. That chain is gone: a carrier's ladder is co-signed at first sight of
+//! `F` in place of the flat `tx1`, `coin.locktime` is `None` for life, and `coin_near_final` — the
+//! predicate both routes of the pass select on — is therefore never true. "Near its deadline" is
+//! not a state a laddered coin can be in.
 //!
-//! `deadline_safety_due` has two routes. The COOPERATIVE one (`auto_refresh_due`) excludes token
-//! carriers, correctly and permanently: a plain re-anchor spends the carrier's funding outpoint into
-//! a fresh aggregate and **destroys its RGB allocation**. The UNILATERAL one excluded them too — and
-//! there the exclusion had no justification. It left the carrier lane with **zero** automatic
-//! deadline coverage, in the one lane where the loss is an asset rather than sats.
+//! So the RIGHT thing for the pass to do to a carrier is NOTHING, and this test now asserts that in
+//! each of the three ways "something" could have happened:
 //!
-//! The forced action is the coin's own pre-signed `T`: a tier of its own ladder, carrying its own
-//! state. It does not re-aggregate and it does not move the allocation, which is precisely why it is
-//! safe on a carrier where a re-anchor is not. **That distinction is what this test measures** — not
-//! that something happened, but that the RIGHT thing happened and the allocation survived it.
-//!
-//! # Structure
-//!
-//! * **(a)** A coloured carrier exists, and the wallet agrees it is one.
-//! * **(b)** `deadline_safety_due` SEVERS it and does NOT re-anchor it. The carrier's id appears in
-//!   the severed list and in no re-anchor result — the two outcomes are asserted separately,
-//!   because "something was done" is exactly the claim that would hide a destroyed allocation.
-//! * **(c)** `F` is spent **by this coin's own trigger**, not by anything else. A re-anchor also
-//!   spends `F`; only the spender's txid tells them apart, and getting that wrong is the whole
-//!   failure mode.
-//! * **(d)** The allocation SURVIVED. The ledger still assigns alice her raw units, and the carrier's
-//!   own bundle still resolves — which is the assertion the sat-denominated version of this test
-//!   could not make.
+//! * **(b) nothing re-anchored, nothing severed, nothing UNDEFENDED.** `deadline_safety_due` at a
+//!   margin a hundred times the regtest `initlock` returns `Ok((vec![], vec![]))`. The `Ok` half
+//!   matters as much as the empty vectors: [D51] made an `Err` from this pass mean "this wallet is
+//!   unprotected", and a carrier it cannot find a floor for must not be reported that way. The
+//!   coin's `locktime` is `None`; its exit estimate has no deadline, no blindness and no wait.
+//!   `auto_exit_due` at the same margin is equally a no-op (an issued carrier has no exit branch).
+//! * **(c) `F` was spent by NOTHING** — not by the trigger, not by a re-anchor. Nothing was
+//!   broadcast: every tier of the ladder is still off-chain.
+//! * **(d) the allocation is untouched**, by the consignment-chain authority (`colored_ladder_health`)
+//!   and by the engine's own allocation set.
+//! * **(e) CONTROL — the sever exists and is RGB-safe.** So that (b) is not "the pass did nothing
+//!   because nothing works": the owner invokes `sever_from_f` by name ([D67]), `F` is spent by THIS
+//!   coin's own trigger and the consignment chain still validates for the whole supply. The remedy
+//!   is event-driven and owner-driven; it is not on a calendar.
 //!
 //! Run: SDK_E2E=87 ML_NETWORK=regtest cargo run   (regtest stack up)
 
@@ -70,11 +70,20 @@ fn outpoint_spender(cc: &ClientConfig, txid: &str, vout: u32) -> Option<String> 
     None
 }
 
+/// The transaction as the CHAIN has it, or `None` if the backend has never heard of it.
+fn onchain(cc: &ClientConfig, txid: &str) -> Option<electrum_client::bitcoin::Transaction> {
+    use electrum_client::bitcoin::Txid;
+    use electrum_client::ElectrumApi;
+    use std::str::FromStr;
+    let t = Txid::from_str(txid).ok()?;
+    cc.electrum_client.transaction_get(&t).ok()
+}
+
 const ALICE: &str = "sdk87_alice";
 const SUPPLY: u64 = 5_000;
-/// Far above any coin's remaining calendar on regtest (`initlock` is 1 000), so every laddered coin
-/// is "due" without mining a thousand blocks. The margin is a PARAMETER of the pass, so driving it
-/// this way exercises the same branch a real deadline would, at a hundredth of the wall-clock.
+/// Far above any height a regtest coin could have been "due" at under the old calendar (`initlock`
+/// is 1 000). The margin is a PARAMETER of the pass, so driving it this way exercises the same
+/// branch a real deadline would have — and that branch must select nothing.
 const HUGE_MARGIN: u32 = 100_000;
 
 async fn wallet(name: &str) -> Result<UtexoWallet> {
@@ -128,13 +137,55 @@ async fn token_balance(w: &UtexoWallet, asset: &str) -> Result<u64> {
         .unwrap_or(0))
 }
 
+/// The independent authority on the allocation: the CONSIGNMENT CHAIN, validated by rgb-lib
+/// against the tier witnesses. [D61]/[D70]: `colored_carriers` and `token_balance` both read the
+/// persisted `rgb.amount` row, so two of them are one assertion in disguise; this reads neither.
+async fn assert_allocation_intact(
+    alice: &UtexoWallet,
+    carrier_sid: &str,
+    asset: &str,
+    trigger_txid: &str,
+    when: &str,
+) -> Result<()> {
+    let (health_contract, assigned_to_final, tier_txids, _detail) =
+        alice.colored_ladder_health(carrier_sid).await.map_err(|e| {
+            anyhow!("{when}: the carrier's coloured ladder no longer validates off-chain: {e:#}")
+        })?;
+    assert_eq!(
+        assigned_to_final, SUPPLY,
+        "{when}: the validated consignment chain assigns {assigned_to_final} units to the ladder's \
+         final state, not {SUPPLY} — the allocation was damaged"
+    );
+    assert_eq!(health_contract, asset, "{when}: the ladder validates for the wrong contract");
+    assert!(
+        tier_txids.first().is_some_and(|t| t == trigger_txid),
+        "{when}: the validated chain does not start at this carrier's trigger {trigger_txid} \
+         (tiers: {tier_txids:?}) — it is proving something about a different ladder"
+    );
+    let allocations = alice.list_token_allocations(asset).await?;
+    let total: u64 = allocations.iter().map(|(_, amt)| *amt).sum();
+    assert_eq!(
+        total, SUPPLY,
+        "{when}: the RGB engine accounts for {total} units of {asset}, not {SUPPLY}: {allocations:?}"
+    );
+    assert_eq!(token_balance(alice, asset).await?, SUPPLY, "{when}: alice's balance must be whole");
+    Ok(())
+}
+
 pub async fn execute() -> Result<()> {
     for f in ["wallet.db", "wallet.db-shm", "wallet.db-wal"] {
         let _ = std::fs::remove_file(f);
     }
+    let _ = std::fs::remove_dir_all("./rgb-data-sdk87_alice");
     let alice = wallet(ALICE).await?;
     let cc = alice.client_config().clone();
     let core = bitcoin_core::getnewaddress()?;
+    let initlock = mercuryrustlib::utils::info_config(&cc).await?.initlock;
+    assert!(
+        HUGE_MARGIN > initlock,
+        "test hygiene: the margin ({HUGE_MARGIN}) must exceed initlock ({initlock}), or 'the pass \
+         selected nothing' would prove nothing"
+    );
 
     // ===== (a) A COLOURED CARRIER =================================================================
     // Fund alice's RGB engine — issuance is the ISSUER's on-chain cost and it is paid from a plain
@@ -146,8 +197,6 @@ pub async fn execute() -> Result<()> {
 
     add_tokens(&cc, &alice, 4).await?;
     let asset = alice.issue_token("CDL", "Carrier Deadline", 0, SUPPLY).await?;
-    // The issuance witness must CONFIRM and the carrier must be claimed before it can be laddered —
-    // mining and claiming in the same loop, exactly as the token E2Es do.
     let mut carriers = Vec::new();
     for _ in 0..120 {
         bitcoin_core::generatetoaddress(1, &core)?;
@@ -173,6 +222,7 @@ pub async fn execute() -> Result<()> {
     let f_txid = carrier.f_txid.clone();
     let f_vout = carrier.f_vout;
     let trigger_txid = carrier.trigger.txid.clone();
+    let tier_txids: Vec<String> = carrier.exit_tiers().iter().map(|t| t.txid.clone()).collect();
     assert!(
         !is_outpoint_spent(&cc, &f_txid, f_vout),
         "a resting carrier publishes nothing — F must be unspent before the pass"
@@ -192,36 +242,109 @@ pub async fn execute() -> Result<()> {
          is not being exercised and (b) would prove nothing"
     );
 
-    // ===== (b) THE PASS SEVERS IT, AND DOES NOT RE-ANCHOR IT ======================================
+    // ===== (b) THE PASS LEAVES IT ALONE — AT ANY MARGIN ===========================================
     //
-    // Two outcomes, asserted separately and in opposite directions. "The pass did something" is the
-    // claim that would hide a destroyed allocation: a re-anchor also acts, also reports success, and
-    // also leaves the coin looking healthy — right up until the asset is gone.
+    // There is no calendar on this coin for a margin to be measured against: `locktime` is `None`,
+    // the exit estimate has no deadline, and `coin_near_final` is never true. So the pass must
+    // select NOTHING, and must say so with `Ok`, not with an `Err` naming the carrier UNDEFENDED.
+    let carrier_coin = mercuryrustlib::sqlite_manager::get_wallet(&cc.pool, ALICE)
+        .await?
+        .coins
+        .into_iter()
+        .find(|c| c.statechain_id.as_deref() == Some(carrier_sid.as_str()) && c.duplicate_index == 0)
+        .ok_or_else(|| anyhow!("alice's carrier coin vanished"))?;
+    assert_eq!(
+        carrier_coin.locktime, None,
+        "a laddered carrier has no absolute calendar: coin.locktime must be None"
+    );
+    let est = alice.estimate_exit_cost(&carrier_sid).await?;
+    assert_eq!(est.branch_txs, 0, "an issued carrier has no exit branch");
+    assert_eq!(est.exit_deadline_block, None, "no exit-race deadline exists for a laddered carrier");
+    assert!(
+        !est.deadline_is_unknown(),
+        "the absent deadline is SAFE, not blind: {:?}",
+        est.exit_deadline_blind
+    );
+    assert_eq!(est.wait_blocks, 0, "nothing on a laddered carrier matures on its own");
+
     let (re_anchored, severed) = alice
         .deadline_safety_due(HUGE_MARGIN)
         .await
-        .map_err(|e| anyhow!("[D46] the deadline pass must not go blind on a carrier: {e:#}"))?;
-
+        .map_err(|e| {
+            anyhow!(
+                "[D51] the deadline pass returned Err on a wallet holding one laddered carrier: \
+                 {e:#}. Err from this pass is read as \"this wallet is unprotected\", and a carrier \
+                 with no calendar floor must not be reported UNDEFENDED — nor may the pass go blind."
+            )
+        })?;
     assert!(
-        !re_anchored.iter().any(|r| r.new_statechain_id == carrier_sid
-            || r.old_statechain_id == carrier_sid),
-        "[D46] THE CARRIER WAS RE-ANCHORED. A plain re-anchor spends the carrier's funding outpoint \
-         into a fresh aggregate and DESTROYS the RGB allocation — this is the outcome the \
-         cooperative route excludes carriers to prevent, and it must never be reachable from this \
-         pass. Got: {re_anchored:?}"
+        re_anchored.is_empty(),
+        "[D46] THE CARRIER WAS RE-ANCHORED at margin {HUGE_MARGIN}. A plain re-anchor spends the \
+         carrier's funding outpoint into a fresh aggregate and DESTROYS the RGB allocation — and \
+         it found a calendar floor on a coin that has none. Got: {re_anchored:?}"
     );
     assert!(
-        severed.contains(&carrier_sid),
-        "[D46] the carrier was NOT severed. Before D46 it was excluded from BOTH routes, which left \
-         the carrier lane with zero automatic deadline coverage — in the one lane where the loss is \
-         an ASSET. Severed: {severed:?}"
+        severed.is_empty(),
+        "the carrier was SEVERED at margin {HUGE_MARGIN}: the pass found a calendar deadline on a \
+         coin that has none and converted a resting carrier into a walking exit for no reason. \
+         Severed: {severed:?}"
     );
-    println!("SDK87 - [D46] the pass SEVERED the carrier and did not re-anchor it: {severed:?}");
+    let acted = alice.auto_exit_due(HUGE_MARGIN).await.map_err(|e| {
+        anyhow!("auto_exit_due must not go blind on an issued carrier: {e:#}")
+    })?;
+    assert!(
+        acted.is_empty(),
+        "auto_exit_due at margin {HUGE_MARGIN} acted on {acted:?}: an issued carrier has no exit \
+         branch and therefore no deadline"
+    );
+    println!(
+        "SDK87 - (b) deadline_safety_due({HUGE_MARGIN}) -> Ok(([], [])) and auto_exit_due -> []: the \
+         laddered carrier has no calendar floor to be near (locktime=None, deadline=None, wait=0)"
+    );
 
-    // ===== (c) F WAS SPENT BY THIS COIN'S OWN TRIGGER =============================================
+    // ===== (c) F WAS SPENT BY NOTHING — AND NOTHING WAS BROADCAST ==================================
     //
-    // A re-anchor spends `F` too. Only the SPENDER tells the two apart, so asking "is F spent?"
-    // would pass for the outcome (b) exists to forbid.
+    // "Is F spent?" cannot tell a sever from a re-anchor; here it must be neither. Every tier of the
+    // ladder is still off-chain.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        outpoint_spender(&cc, &f_txid, f_vout),
+        None,
+        "F {f_txid}:{f_vout} was SPENT by the deadline pass — by the trigger or by a re-anchor, and \
+         neither is a thing a calendar-free coin can be due for"
+    );
+    for t in tier_txids.iter() {
+        assert!(
+            onchain(&cc, t).is_none(),
+            "tier {t} reached the chain — the deadline pass broadcast a tier of a resting carrier"
+        );
+    }
+    println!("SDK87 - (c) F unspent by anything; all {} tiers still off-chain", tier_txids.len());
+
+    // ===== (d) THE ALLOCATION IS UNTOUCHED ========================================================
+    assert_allocation_intact(&alice, &carrier_sid, &asset, &trigger_txid, "(d) after the pass").await?;
+    let after = colored_carriers(&cc, ALICE, &asset).await?;
+    assert!(
+        after.iter().any(|(sid, b)| sid == &carrier_sid
+            && b.rgb.as_ref().is_some_and(|r| r.amount == SUPPLY)),
+        "the carrier's bundle no longer resolves to {SUPPLY} units of {asset} after the pass"
+    );
+    println!("SDK87 - (d) the consignment chain still validates for {SUPPLY} units; nothing moved");
+
+    // ===== (e) CONTROL: THE SEVER EXISTS, AND IT IS RGB-SAFE — WHEN THE OWNER ASKS ===============
+    //
+    // Without this, (b) could be true because nothing works. The remedy [D46] built is still there;
+    // what changed is WHO invokes it and WHY: never a calendar, only an owner (or a hostile trigger
+    // answered by `defend_ladders`). `sever_from_f` is the NAMED remedy ([D67]) and it is
+    // `unilateral_exit` on one coin — the pre-signed `T`, a tier of the coin's OWN ladder carrying
+    // its own state. It does not re-aggregate and it does not move the allocation.
+    let statuses = alice.sever_from_f(&carrier_sid).await.map_err(|e| {
+        anyhow!("sever_from_f refused the owner's own coloured carrier: {e:#}")
+    })?;
+    assert!(
+        !statuses.is_empty(),
+        "sever_from_f reported no exit status at all — it neither severed nor said why"
+    );
     let mut spender = None;
     for _ in 0..30 {
         if let Some(sp) = outpoint_spender(&cc, &f_txid, f_vout) {
@@ -231,115 +354,34 @@ pub async fn execute() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let spender = spender.ok_or_else(|| {
-        anyhow!("[D46] F {f_txid}:{f_vout} was never spent, so nothing was actually severed")
+        anyhow!("(e) F {f_txid}:{f_vout} was never spent, so the owner's sever did nothing")
     })?;
     assert_eq!(
         spender, trigger_txid,
-        "[D46] F was spent by {spender}, which is NOT this coin's own trigger {trigger_txid}. The \
-         forced action must be the coin's OWN pre-signed T — a tier of its own ladder carrying its \
-         own state. Anything else re-aggregates, and on a carrier that is the allocation gone."
+        "(e) F was spent by {spender}, which is NOT this coin's own trigger {trigger_txid}. The \
+         sever must be the coin's OWN pre-signed T; anything else re-aggregates, and on a carrier \
+         that is the allocation gone."
     );
-    println!("SDK87 - F was spent by the carrier's OWN trigger {trigger_txid} — no re-aggregation");
-
-    // ===== (d) THE ALLOCATION SURVIVED ============================================================
-    //
-    // The assertion the sat-denominated version of this test could not make. A sats-only check would
-    // have passed for every outcome above, including the one that destroys the asset.
     bitcoin_core::generatetoaddress(2, &core)?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     alice.claim().await?;
-    // [D61] THE EVIDENCE HAD TO CHANGE. This section asserted two things that are the SAME READ:
-    // `colored_carriers` resolves `tesr::load(..).rgb.amount`, and `token_balance` →
-    // `get_token_balances` → `ledger_token_balances` sums that same persisted bundle row. Nothing in
-    // the sever path rewrites it, so both held for every outcome — including one that destroyed the
-    // allocation on chain. Two readers of one row are one assertion wearing a disguise.
-    //
-    // The independent authority is the CONSIGNMENT CHAIN, validated by rgb-lib against the tier
-    // witnesses — `colored_ladder_health` runs the fork's `validate_consignment_offchain_chain`
-    // over the ladder's own consignments and returns the amount the FINAL state is assigned. It
-    // reads neither the persisted `rgb.amount` row nor the engine's allocation set, so it can
-    // disagree with both; that is what makes it evidence.
-    //
-    // ## [D70] WHY NOT the engine's allocation set — measured, not assumed
-    //
-    // The D61 rewrite reached for `list_token_allocations` and asserted the allocation had LEFT the
-    // spent funding outpoint. It never passed: three runs, deterministic, still reporting all
-    // {SUPPLY} units at `F` after `T` confirmed. Adding an explicit `refresh()` of the engine
-    // before the read did not change it either (measured, then reverted rather than kept as a
-    // no-op).
-    //
-    // The reason is structural, and it is not a defect: a CTES-R tier is coloured with `color_psbt`
-    // and broadcast through the electrum client. rgb-lib never issued that transfer, holds no
-    // transfer row for it, and `T.out[0]` pays the SE-aggregate key rather than an outpoint this
-    // wallet owns — so there is nothing for a sync to settle and nowhere for the engine to move the
-    // allocation TO. The engine learns where the units went when the walk completes and the
-    // consignment for the owner-keyed leaf is accepted, which is many CSV blocks after a sever.
-    //
-    // So the honest assertion is not "the engine moved the units" (the product does not claim it)
-    // but "the proof that the units move with this ladder still validates, on chain, after the
-    // sever" — which is the property that distinguishes a survived allocation from a destroyed one.
-    let (health_contract, assigned_to_final, tier_txids, _detail) =
-        alice.colored_ladder_health(&carrier_sid).await.map_err(|e| {
-            anyhow!(
-                "[D46/D70] after the sever the carrier's coloured ladder no longer validates \
-                 off-chain: {e:#}. The sever broadcasts `T` precisely BECAUSE every tier is an RGB \
-                 witness; if the chain of consignments stops validating once `T` is on chain, the \
-                 unilateral route is as unsafe on a carrier as the cooperative one."
-            )
-        })?;
-    assert_eq!(
-        assigned_to_final, SUPPLY,
-        "[D46/D70] the validated consignment chain assigns {assigned_to_final} units to the \
-         ladder's final state, not {SUPPLY}. This is rgb-lib's verdict over the tier witnesses, not \
-         the wallet's persisted row — if it disagrees with the supply, the sever moved the sats and \
-         left the asset behind, which is the exact loss (d) exists to exclude."
-    );
-    assert_eq!(
-        health_contract, asset,
-        "[D70] the ladder validates, but for contract {health_contract} rather than the carrier's \
-         asset {asset}"
-    );
-    assert!(
-        tier_txids.first().is_some_and(|t| t == &trigger_txid),
-        "[D70] the validated chain does not start at the trigger {trigger_txid} that was actually \
-         broadcast (tiers: {tier_txids:?}) — then it is proving something about a different ladder"
-    );
-    // The measured engine behaviour, asserted so a future change in either direction is noticed
-    // rather than absorbed: the units are still accounted for, and still at `F`.
-    let allocations_after = alice.list_token_allocations(&asset).await?;
-    let total_after: u64 = allocations_after.iter().map(|(_, amt)| *amt).sum();
-    assert_eq!(
-        total_after, SUPPLY,
-        "[D46/D61] after the sever the RGB engine accounts for {total_after} units of {asset}, not \
-         {SUPPLY}. Wherever the engine believes they live, it must not LOSE them. Allocations: \
-         {allocations_after:?}"
-    );
+    // [D70] The engine's allocation set still reports the units at the SPENT funding outpoint after
+    // a sever: a CTES-R tier is not an rgb-lib transfer, so there is nothing for a sync to settle
+    // until the walk completes. Measured, not a loss — the consignment-chain authority is what says
+    // the allocation survived, and it is asserted inside `assert_allocation_intact`.
+    assert_allocation_intact(&alice, &carrier_sid, &asset, &trigger_txid, "(e) after the sever")
+        .await?;
     println!(
-        "SDK87 - (d) the consignment chain still validates after the sever: {SUPPLY} units of \
-         {asset} assigned to the ladder's final state, chain starting at the broadcast trigger. \
-         [D70] the engine's own allocation set still reports them at the SPENT funding outpoint \
-         {f_txid}:{f_vout} — expected, and not a loss: a tier is not an rgb-lib transfer, so there \
-         is nothing for it to settle until the walk completes and the leaf consignment is accepted."
-    );
-
-    // …and the wallet's own view must AGREE with the engine. Kept as a second, weaker check: it is
-    // the number a user sees, and a divergence between it and the engine is its own defect.
-    let after = colored_carriers(&cc, ALICE, &asset).await?;
-    assert!(
-        after.iter().any(|(sid, b)| sid == &carrier_sid
-            && b.rgb.as_ref().is_some_and(|r| r.amount == SUPPLY)),
-        "[D46] the carrier's bundle no longer resolves to {SUPPLY} units of {asset} after the sever"
-    );
-    assert_eq!(
-        token_balance(&alice, &asset).await?,
-        SUPPLY,
-        "[D46] alice's balance must still be {SUPPLY} after the deadline pass severed her carrier"
+        "SDK87 - (e) sever_from_f spent F with the carrier's OWN trigger {trigger_txid}; the \
+         consignment chain still validates for {SUPPLY} units — the remedy is owner-driven, not \
+         calendar-driven"
     );
 
     println!(
-        "SDK87 PASS - [D46] a carrier near its deadline is SEVERED by its own pre-signed T, never \
-         re-anchored, and its allocation survives intact. Before D46 the carrier lane had NO \
-         automatic deadline coverage at all."
+        "SDK87 PASS - a laddered carrier has no calendar: the deadline pass at margin {HUGE_MARGIN} \
+         re-anchors nothing, severs nothing and reports nothing undefended; F stays unspent and \
+         every tier off-chain; the allocation is untouched. The RGB-safe sever still exists and \
+         still preserves the allocation when the owner invokes it by name."
     );
     Ok(())
 }
